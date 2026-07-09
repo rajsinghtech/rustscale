@@ -1,0 +1,255 @@
+//! Tailscale control-plane wire types.
+//!
+//! Ports the JSON wire format of Go's `tailcfg` package. Field names match
+//! Go's `encoding/json` output exactly (Go marshals exported field names
+//! verbatim unless a `json:"name,..."` tag says otherwise). `omitempty`/
+//! `omitzero` are reproduced with `#[serde(default, skip_serializing_if = ...)]`.
+
+#![forbid(unsafe_code)]
+#![allow(non_snake_case)]
+
+mod derpmap;
+mod map;
+mod node;
+mod register;
+
+pub use derpmap::{DERPHomeParams, DERPMap, DERPNode, DERPRegion};
+pub use map::{MapRequest, MapResponse};
+pub use node::{
+    Endpoint, EndpointType, Hostinfo, Location, NetInfo, Node, NodeCapMap, Service,
+    ServiceProto,
+};
+pub use register::{
+    Login, LoginID, RegisterRequest, RegisterResponse, RegisterResponseAuth, User,
+};
+
+pub use rustscale_key::{
+    DiscoPublic as DiscoKey, MachinePublic as MachineKey, NodePublic as NodeKey,
+};
+
+use serde::{Deserialize, Serialize};
+
+/// A tri-state optional boolean matching Go's `opt.Bool` JSON encoding:
+/// `true`, `false`, or `null` (unset). In struct fields it is omitted when
+/// unset, mirroring Go's `omitempty`/`omitzero`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum OptBool {
+    /// The unset/unknown state — serializes to `null` and is omitted in
+    /// `skip_serializing_if` contexts.
+    #[default]
+    Unset,
+    /// An explicit `true`.
+    True,
+    /// An explicit `false`.
+    False,
+}
+
+impl OptBool {
+    /// Construct from a plain `bool`.
+    pub fn new(v: bool) -> Self {
+        if v { Self::True } else { Self::False }
+    }
+
+    /// The underlying `bool` if set, else `None`.
+    pub fn get(self) -> Option<bool> {
+        match self {
+            Self::True => Some(true),
+            Self::False => Some(false),
+            Self::Unset => None,
+        }
+    }
+
+    /// Whether this is the unset state (used by `skip_serializing_if`).
+    pub fn is_unset(&self) -> bool {
+        matches!(*self, Self::Unset)
+    }
+}
+
+impl Serialize for OptBool {
+    fn serialize<S>(&self, s: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::True => s.serialize_bool(true),
+            Self::False => s.serialize_bool(false),
+            Self::Unset => s.serialize_none(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for OptBool {
+    fn deserialize<D>(d: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Vis;
+        impl serde::de::Visitor<'_> for Vis {
+            type Value = OptBool;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a boolean or null")
+            }
+            fn visit_bool<E>(self, v: bool) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(OptBool::new(v))
+            }
+            fn visit_none<E>(self) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(OptBool::Unset)
+            }
+            fn visit_unit<E>(self) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(OptBool::Unset)
+            }
+        }
+        d.deserialize_any(Vis)
+    }
+}
+
+/// A 64-bit control-plane identifier (matches Go's `tailcfg.ID`).
+pub type ID = i64;
+
+/// Identifier for a [`User`].
+pub type UserID = ID;
+/// Identifier for a [`Node`].
+pub type NodeID = ID;
+
+/// A stable, string-form node identifier (matches Go's `tailcfg.StableNodeID`).
+pub type StableNodeID = String;
+
+/// A capability-version integer the client sends to negotiate semantics with
+/// the control plane (matches Go's `tailcfg.CapabilityVersion`).
+pub type CapabilityVersion = i32;
+
+/// A free-form node capability string, typically a URL like
+/// `https://tailscale.com/cap/is-admin` (matches Go's `tailcfg.NodeCapability`).
+pub type NodeCapability = String;
+
+/// A raw encoded JSON value, like Go's `json.RawMessage` but string-backed
+/// (matches Go's `tailcfg.RawMessage`). Serializes as `null` when empty.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RawMessage(pub String);
+
+/// Serde helper: skip a field whose value equals its `Default` (mirrors Go's
+/// `omitempty`/`omitzero` for scalars, strings, Vecs, and Options).
+pub(crate) fn skip_default<T>(v: &T) -> bool
+where
+    T: Default + PartialEq,
+{
+    *v == T::default()
+}
+
+/// Serde helper: skip a key field when it is the all-zero key.
+pub(crate) fn skip_zero_machine(v: &rustscale_key::MachinePublic) -> bool {
+    v.is_zero()
+}
+
+/// Serde helper: skip a disco key field when it is the all-zero key.
+pub(crate) fn skip_zero_disco(v: &rustscale_key::DiscoPublic) -> bool {
+    v.is_zero()
+}
+
+/// Serde helpers for `BTreeMap<i32, V>`: Go marshals `map[int]V` with string
+/// keys, so we serialize/deserialize the integer keys as JSON strings.
+pub mod int_key {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::collections::BTreeMap;
+
+    pub fn serialize<S, V>(m: &BTreeMap<i32, V>, s: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+        V: Serialize,
+    {
+        use serde::ser::SerializeMap;
+        let mut map = s.serialize_map(Some(m.len()))?;
+        for (k, v) in m {
+            map.serialize_entry(&k.to_string(), v)?;
+        }
+        map.end()
+    }
+
+    pub fn deserialize<'de, D, V>(d: D) -> Result<BTreeMap<i32, V>, D::Error>
+    where
+        D: Deserializer<'de>,
+        V: Deserialize<'de>,
+    {
+        let raw: BTreeMap<String, V> = BTreeMap::deserialize(d)?;
+        raw.into_iter()
+            .map(|(k, v)| {
+                k.parse::<i32>()
+                    .map(|k| (k, v))
+                    .map_err(serde::de::Error::custom)
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opt_bool_encodes_true_false_null() {
+        assert_eq!(serde_json::to_string(&OptBool::True).unwrap(), "true");
+        assert_eq!(serde_json::to_string(&OptBool::False).unwrap(), "false");
+        assert_eq!(serde_json::to_string(&OptBool::Unset).unwrap(), "null");
+    }
+
+    #[test]
+    fn opt_bool_decodes_true_false_null() {
+        assert_eq!(
+            serde_json::from_str::<OptBool>("true").unwrap(),
+            OptBool::True
+        );
+        assert_eq!(
+            serde_json::from_str::<OptBool>("false").unwrap(),
+            OptBool::False
+        );
+        assert_eq!(
+            serde_json::from_str::<OptBool>("null").unwrap(),
+            OptBool::Unset
+        );
+        assert!(serde_json::from_str::<OptBool>("\"true\"").is_err());
+    }
+
+    #[test]
+    fn opt_bool_skipped_when_unset_in_struct() {
+        #[derive(Serialize, Deserialize, PartialEq, Debug)]
+        struct Wrap {
+            #[serde(default, skip_serializing_if = "OptBool::is_unset")]
+            flag: OptBool,
+        }
+        let w = Wrap { flag: OptBool::Unset };
+        assert_eq!(serde_json::to_string(&w).unwrap(), "{}");
+        let back: Wrap = serde_json::from_str("{}").unwrap();
+        assert_eq!(back.flag, OptBool::Unset);
+        let set: Wrap = serde_json::from_str("{\"flag\":true}").unwrap();
+        assert_eq!(set.flag, OptBool::True);
+    }
+
+    #[test]
+    fn int_key_map_roundtrips_with_string_keys() {
+        use std::collections::BTreeMap;
+        #[derive(Serialize, Deserialize, PartialEq, Debug)]
+        struct M {
+            #[serde(with = "int_key")]
+            vals: BTreeMap<i32, f64>,
+        }
+        let mut vals = BTreeMap::new();
+        vals.insert(1, 0.5);
+        vals.insert(900, 1.25);
+        let m = M { vals };
+        let j = serde_json::to_string(&m).unwrap();
+        assert!(j.contains("\"1\":0.5"));
+        assert!(j.contains("\"900\":1.25"));
+        let back: M = serde_json::from_str(&j).unwrap();
+        assert_eq!(back, m);
+    }
+}

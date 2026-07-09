@@ -1,0 +1,19 @@
+[package]
+name = "rustscale-tailcfg"
+description = "Tailscale control-plane wire types for rustscale"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rustscale-key = { path = "../key", version = "0.1.0" }
+serde.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

@@ -18,6 +18,19 @@ cites the session that surfaced it.
   `cargo build ... | grep -E "^(error|warning)" | head -40` instead of dumping
   full logs. Now codified in `tools/check.sh` (silent on success, ~50 lines on
   failure). Tell agents to run `tools/check.sh` instead of raw cargo. *(phase-1)*
+- **`tools/check.sh` adopted by later phases.** Phase-3a used
+  `tools/check.sh rustscale-netcheck` and `tools/check.sh` directly — clean,
+  no cargo dumps. Phase-3b also used it for final verification. Keep telling
+  agents to use it. *(phase-3a, phase-3b)*
+- **Hand-rolling Noise IK instead of using the `snow` crate.** The phase-3b
+  agent correctly chose to hand-roll the Noise IK handshake with
+  curve25519-dalek + chacha20poly1305 + blake2 rather than pulling in the
+  `snow` crate, giving full control over the Tailscale protocol-version
+  prologue mixing. This matched the Go implementation's approach. *(phase-3b)*
+- **boringtun `noise::Tunn` wrapping strategy.** The phase-4 agent correctly
+  used boringtun's low-level `Tunn` API (not its device layer) for a
+  transport-agnostic per-peer tunnel, which is exactly what magicsock needs.
+  *(phase-4)*
 
 ## Failed / costly (and the fix)
 
@@ -48,18 +61,77 @@ cites the session that surfaced it.
 - **Import path botches** (`NodeCapMap` referenced from crate root but defined
   in module) → 1 fix cycle. Remind agents to keep module re-exports consistent.
   *(phase-1)*
+- **netcheck.go full read (60K chars)** → the agent read the entire 1759-line
+  file in one shot, then re-read a portion. **Fix**: porting-notes now has a
+  type→line map for netcheck.go. Tell agents to read only the `GetReport` /
+  `Client` / `Report` line ranges. *(phase-3a)*
+- **Cargo registry grepping for crypto crate APIs (~20 bash calls, ~15K chars
+  output)** → the phase-3b agent spent ~20 calls exploring `curve25519-dalek`,
+  `chacha20poly1305`, `blake2`, `hkdf` APIs in `~/.cargo/registry/`, including
+  creating a temp test crate to resolve version compatibility. This was the
+  #1 token sink in the session. **Fix**: porting-notes now documents the exact
+  crate versions, API shapes, and the critical `hkdf`+`blake2` incompatibility
+  gotcha. Tell agents: "For Noise/BLAKE2s/ChaChaPoly, see porting-notes before
+  exploring cargo registry — versions and API patterns are already distilled."
+  *(phase-3b)*
+- **`hkdf` crate doesn't work with `blake2` 0.10** → the agent tried
+  `hkdf::Hkdf::new(Some(salt), ikm)` with blake2 and hit a BufferKind
+  mismatch. Had to hand-roll HMAC-BLAKE2s + HKDF. Cost 2 fix cycles.
+  **Fix**: porting-notes now states "Do not add `hkdf` or `digest` to
+  Cargo.toml — hand-roll HMAC-BLAKE2s" with a reference to the working
+  implementation. *(phase-3b)*
+- **`XChaCha20Poly1305` vs `ChaCha20Poly1305`** → the agent initially used
+  XChaCha20Poly1305 (24-byte nonce) but Go uses standard ChaCha20Poly1305
+  (12-byte all-zero nonce). Cost 1 fix cycle. **Fix**: porting-notes now
+  explicitly states which variant to use. *(phase-3b)*
+- **`direct.go` re-read 3x (24K chars)** → the agent re-read the same Go file
+  three times instead of caching the relevant sections. **Fix**: porting-notes
+  now has a `direct.go` file map. *(phase-3b)*
+- **boringtun docs.rs webfetches (8 fetches, ~160K chars)** → the phase-4
+  agent fetched 8 docs.rs pages for boringtun's `Tunn`, `TunnResult`,
+  `StaticSecret`, `PublicKey`. This was the #1 token sink by far. **Fix**:
+  porting-notes now has the complete boringtun API with code examples. Tell
+  agents: "For boringtun, see porting-notes — do NOT fetch docs.rs."
+  *(phase-4)*
+- **Own test file re-read 12x (~21K chars)** → the phase-4 agent kept
+  re-reading `crates/magicsock/src/tests.rs` in small offset/limit slices
+  while iteratively editing. **Fix**: tell agents to use `grep -n` to find
+  specific test functions/line numbers in their own files instead of
+  re-reading the whole file repeatedly. *(phase-4)*
+- **Repeated clippy cycles (6+ runs, each grepping for different warnings)**
+  → the phase-4 agent ran `cargo clippy` 6+ times, each time filtering for a
+  different lint warning, fixing one, re-running. **Fix**: `tools/clippy-all.sh`
+  now shows ALL warnings grouped by type in one pass. Tell agents to fix all
+  clippy warnings in a single pass, not one-at-a-time. *(phase-4)*
 
 ## Patterns to fold into future phase prompts
 
 1. Include the line: "Before reading Go sources, check `docs/porting-notes.md`
    for already-distilled facts (key formats, crypto_box API, tailcfg.go type
-   map). Only read the specific Go line ranges you still need."
+   map, Noise crypto crates, boringtun API, Go source file maps). Only read
+   the specific Go line ranges you still need."
 2. Include the line: "Run `tools/check.sh` (or `tools/check.sh <crate>`) to
    verify. It is silent on success and prints only ~50 lines on failure — do
    NOT dump full `cargo` output into your context."
 3. For any new external crate, state the exact constructor/entry API up front
-   (by-value vs by-ref, feature flags).
+   (by-value vs by-ref, feature flags). Check porting-notes first — many
+   crates are already documented there (crypto_box, curve25519-dalek,
+   chacha20poly1305, blake2, boringtun).
 4. For any crate mirroring Go wire types, preempt:
    "Add `#![allow(non_snake_case)]` at the crate root since fields mirror
    Go's PascalCase JSON."
 5. Keep phases to one crate-cluster; build the leaf crate first.
+6. Include the line: "Do NOT fetch docs.rs or explore `~/.cargo/registry/`
+   for crate APIs — the APIs for all crates used so far are distilled in
+   `docs/porting-notes.md`. If you need a crate not documented there, ask
+   the orchestrator instead of grepping the registry."
+7. Include the line: "To find a specific function/test in your own files,
+   use `grep -n 'fn name'` instead of re-reading the whole file. Only
+   re-read if you need surrounding context for an edit."
+8. Include the line: "Run `tools/clippy-all.sh <crate>` to see ALL clippy
+   warnings in one pass. Fix them all before re-running — do not fix one
+   warning at a time."
+9. For Noise/control-protocol work, preempt the known gotchas: "Use
+   `ChaCha20Poly1305` (12-byte nonce), NOT `XChaCha20Poly1305`. Do not add
+   `hkdf` or `digest` crates — hand-roll HMAC-BLAKE2s. See
+   `crates/controlclient/src/controlbase.rs` for the working pattern."

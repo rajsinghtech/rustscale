@@ -63,3 +63,11 @@ event-driven) · packet filter (incl. stateful UDP) · subnet routing
 (advertise/accept/forward) · TUN mode (macOS utun, Linux untested) · tsnet
 embed API · C FFI (librustscale) + Python ctypes · bench harness (beats
 tailscaled userspace: p50 ~170us vs 257us, 465–838 vs 384 Mbps).
+
+## Cross-client interop verification
+
+`tools/interop.sh` runs 8 e2e tests against real Go tailscaled (1.98.8,
+userspace mode) on an ephemeral tailnet: dial both directions, MagicDNS
+name resolution, WhoIs identity, direct path (disco vs Go magicsock),
+pinned-DERP relay, DERP→direct upgrade without byte loss, subnet route
+accept. All green 2026-07-09. CI: `interop` job in e2e.yml.

@@ -1937,3 +1937,161 @@ async fn e2e_funnel_not_enabled() {
 
     server.close().await;
 }
+
+/// E2e: SOCKS5 proxy. Node B runs an echo listener on its tailnet IP; node A
+/// starts `listen_socks5` on `127.0.0.1:0`. The test connects to A's proxy with
+/// a hand-rolled SOCKS5 client, CONNECTs to B's tailnet IP, and asserts the
+/// echo roundtrips — proving the proxy dials *through the tailnet*.
+#[tokio::test]
+#[ignore = "requires TS_E2E_AUTHKEY + TS_E2E_TAILNET env vars (run via tools/e2e.sh)"]
+async fn e2e_socks5_proxy() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+    let authkey = std::env::var("TS_E2E_AUTHKEY").expect("TS_E2E_AUTHKEY not set");
+    let _tailnet = std::env::var("TS_E2E_TAILNET").expect("TS_E2E_TAILNET not set");
+    let uid = std::process::id();
+
+    // Node A — runs the SOCKS5 proxy.
+    let mut server_a = Server::builder()
+        .hostname(format!("rustscale-e2e-socks5-a-{uid}"))
+        .auth_key(authkey.clone())
+        .ephemeral(true)
+        .build()
+        .expect("build A");
+    server_a.up().await.expect("up A");
+
+    // Node B — runs the echo backend on its tailnet IP.
+    let mut server_b = Server::builder()
+        .hostname(format!("rustscale-e2e-socks5-b-{uid}"))
+        .auth_key(authkey)
+        .ephemeral(true)
+        .build()
+        .expect("build B");
+    server_b.up().await.expect("up B");
+    let status_b = server_b.status();
+    let ip_b = status_b
+        .tailscale_ips
+        .iter()
+        .find_map(|ip| match ip {
+            IpAddr::V4(v4) => Some(*v4),
+            _ => None,
+        })
+        .expect("B should have an IPv4");
+
+    // B listens for echo on a tailnet port.
+    const ECHO_PORT: u16 = 4343;
+    let mut listener_b = server_b.listen(ECHO_PORT).await.expect("listen B");
+
+    // Wait for B to appear in A's netmap before starting the proxy.
+    wait_for_peer(&server_a, ip_b.into(), "e2e_socks5").await;
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    // A starts the SOCKS5 proxy on an ephemeral loopback port.
+    let mut proxy = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        server_a.listen_socks5("127.0.0.1:0"),
+    )
+    .await
+    .expect("listen_socks5 timed out")
+    .expect("listen_socks5 failed");
+    let proxy_addr = proxy.local_addr();
+    eprintln!("e2e_socks5: proxy listening on {proxy_addr}");
+
+    // Accept B's side and run a simple echo loop in a spawned task.
+    let echo_task = tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream_b =
+            tokio::time::timeout(std::time::Duration::from_secs(60), listener_b.accept())
+                .await
+                .expect("B accept timed out")
+                .expect("B accept failed");
+        let mut buf = [0u8; 256];
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(30), stream_b.read(&mut buf))
+                .await
+            {
+                Ok(Ok(0)) => break,
+                Ok(Err(_)) => break,
+                Ok(Ok(n)) => {
+                    if stream_b.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    // Hand-rolled SOCKS5 client: CONNECT to B's tailnet IP:port.
+    let dest = SocksAddr::Ipv4 {
+        addr: ip_b,
+        port: ECHO_PORT,
+    };
+    let mut client = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        TcpStream::connect(proxy_addr),
+    )
+    .await
+    .expect("connect to proxy timed out")
+    .expect("connect to proxy failed");
+
+    // Greeting: VER=5 NMETHODS=1 METHODS=[no-auth]
+    client
+        .write_all(&[0x05, 0x01, 0x00])
+        .await
+        .expect("greeting write");
+    let mut greply = [0u8; 2];
+    client.read_exact(&mut greply).await.expect("greeting read");
+    assert_eq!(greply, [0x05, 0x00], "greeting rejected");
+
+    // Request: CONNECT to B.
+    let mut req = vec![0x05, 0x01, 0x00];
+    req.extend_from_slice(&dest.marshal().unwrap());
+    client.write_all(&req).await.expect("request write");
+
+    // Reply: VER REPLY RSV <bind-addr>.
+    let mut hdr = [0u8; 4];
+    client
+        .read_exact(&mut hdr)
+        .await
+        .expect("reply header read");
+    assert_eq!(hdr[0], 0x05, "bad reply version");
+    assert_eq!(hdr[1], 0x00, "connect failed reply={:#x}", hdr[1]);
+    // Drain the bind address (IPv4 in our impl).
+    let mut bind_rest = vec![0u8; 4 + 2];
+    client.read_exact(&mut bind_rest).await.expect("bind read");
+
+    // Echo roundtrip through the tailnet via the proxy.
+    let payload = b"socks5-e2e-through-tailnet";
+    client.write_all(payload).await.expect("client write");
+    let mut got = vec![0u8; payload.len()];
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        client.read_exact(&mut got),
+    )
+    .await
+    .expect("echo read timed out")
+    .expect("echo read failed");
+    assert_eq!(&got, payload, "echo mismatch through SOCKS5 proxy");
+
+    // A second exchange to be sure the copy is bidirectional.
+    client.write_all(b"again").await.expect("client write 2");
+    let mut g2 = vec![0u8; 5];
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        client.read_exact(&mut g2),
+    )
+    .await
+    .expect("echo read 2 timed out")
+    .expect("echo read 2 failed");
+    assert_eq!(&g2, b"again");
+
+    // Shut down: close the client so B's echo loop sees EOF and exits.
+    drop(client);
+    proxy.stop().await;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(15), echo_task)
+        .await
+        .expect("echo task did not exit in 15s");
+    server_a.close().await;
+    server_b.close().await;
+}

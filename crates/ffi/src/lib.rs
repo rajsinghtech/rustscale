@@ -626,6 +626,57 @@ pub extern "C" fn ts_serve_tcp(handle: c_int, port: u16, backend_addr: *const c_
 // Listen + Accept
 // ---------------------------------------------------------------------------
 
+/// Start a local SOCKS5 proxy (RFC 1928) bound to `bind_addr` on the OS TCP
+/// stack (e.g. "127.0.0.1:1080", ":1080", or "1080"). Each CONNECT request is
+/// dialed through the tailnet via `Server::dial` (resolving MagicDNS names and
+/// honoring the selected exit node). Only no-auth + CONNECT are supported.
+///
+/// Returns the bound port (non-zero when binding ":0"), or a negative
+/// errno-style code on error. Requires the server to be up in netstack mode.
+/// The proxy task is cleaned up by `ts_close`.
+#[no_mangle]
+pub extern "C" fn ts_listen_socks5(handle: c_int, bind_addr: *const c_char) -> c_int {
+    catch("ts_listen_socks5", || {
+        let Some(addr_s) = cstr_to_string(bind_addr) else {
+            let mut t = table().lock().expect("table poisoned");
+            set_server_error(&mut t, handle, "null bind_addr");
+            return RS_ERR_INVAL;
+        };
+
+        let server_arc = {
+            let t = table().lock().expect("table poisoned");
+            let Some(e) = t.servers.get(&handle) else {
+                return RS_ERR_NOENT;
+            };
+            let Some(arc) = &e.server else {
+                let mut t = table().lock().expect("table poisoned");
+                set_server_error(&mut t, handle, "server not up");
+                return RS_ERR_BUSY;
+            };
+            arc.clone()
+        };
+
+        let result = {
+            let server = server_arc.lock().expect("server mutex poisoned");
+            runtime().block_on(server.listen_socks5(&addr_s))
+        };
+
+        match result {
+            Ok(h) => {
+                // The task is registered in RunningState for ts_close cleanup.
+                // Report the bound port; drop the handle (its task is already
+                // owned by the server, so drop is a no-op).
+                i32::from(h.local_addr().port())
+            }
+            Err(e) => {
+                let mut t = table().lock().expect("table poisoned");
+                set_server_error(&mut t, handle, e.to_string());
+                RS_ERR_UNKNOWN
+            }
+        }
+    })
+}
+
 /// Start listening. `addr` may be ":PORT", "0.0.0.0:PORT", or just "PORT".
 /// `proto` is reserved (only "tcp" supported). Returns a listener handle.
 #[no_mangle]

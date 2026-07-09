@@ -108,6 +108,18 @@ int ts_errmsg(int handle, char *buf, int buflen);
 int ts_listen(int handle, const char *proto, const char *addr);
 
 /**
+ * Start a local SOCKS5 proxy (RFC 1928) bound to `bind_addr` on the OS TCP
+ * stack (e.g. "127.0.0.1:1080", ":1080", or "1080"). Each CONNECT request is
+ * dialed through the tailnet via `Server::dial` (resolving MagicDNS names and
+ * honoring the selected exit node). Only no-auth + CONNECT are supported.
+ *
+ * Returns the bound port (non-zero when binding ":0"), or a negative
+ * errno-style code on error. Requires the server to be up in netstack mode.
+ * The proxy task is cleaned up by `ts_close`.
+ */
+int ts_listen_socks5(int handle, const char *bind_addr);
+
+/**
  * Close a listener handle. Returns 0 on success.
  */
 int ts_listener_close(int listener);

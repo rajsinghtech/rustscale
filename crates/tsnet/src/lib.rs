@@ -31,6 +31,7 @@
 mod acme;
 mod routing;
 mod serve;
+mod socks5;
 mod state;
 mod status;
 mod tls;
@@ -40,6 +41,10 @@ pub use rustscale_health::Warning;
 pub use serve::{
     check_funnel_access, check_funnel_port, FunnelError, HTTPHandler, HostPort, ServeConfig,
     ServeError, TCPPortHandler, WebServerConfig, FUNNEL_PORTS,
+};
+pub use socks5::{
+    spawn_socks5, BoxedStream, CancelToken as Socks5CancelToken, ServerSocksDialer, Socks5Handle,
+    Socks5Server, SocksAddr, SocksDialer, SocksStream,
 };
 pub use state::{PersistedState, StateError};
 pub use status::{PeerInfo, ServerStatus, WhoIsInfo};
@@ -1194,6 +1199,39 @@ impl Server {
         }
     }
 
+    /// Start a local SOCKS5 proxy (RFC 1928) bound to `bind_addr` on the **OS**
+    /// TCP stack (e.g. `"127.0.0.1:1080"`, `":1080"`, or `"1080"`). Each
+    /// CONNECT request is dialed *through the tailnet* via [`Server::dial`]
+    /// (resolving MagicDNS names and honoring the selected exit node).
+    ///
+    /// Only the no-auth method and the CONNECT command are supported; BIND and
+    /// UDP-ASSOCIATE are rejected with command-not-supported. Address types
+    /// IPv4, IPv6, and domain-name are accepted.
+    ///
+    /// The returned [`Socks5Handle`] exposes the bound address (useful for
+    /// `:0`) and a graceful `stop`; the background task is also registered in
+    /// the server's task set so [`Server::close`] aborts it. Requires netstack
+    /// mode (returns [`TsnetError::NotAvailableInTunMode`] in TUN mode).
+    ///
+    /// C-representable: string in, handle + bound-port out (see FFI
+    /// `ts_listen_socks5`).
+    pub async fn listen_socks5(&self, bind_addr: &str) -> Result<Socks5Handle, TsnetError> {
+        let inner = self.inner.as_ref().ok_or(TsnetError::NotUp)?;
+        let netstack = match &inner.data_plane {
+            DataPlane::Netstack(ns) => ns.clone(),
+            DataPlane::Tun => return Err(TsnetError::NotAvailableInTunMode),
+        };
+        let dialer = ServerSocksDialer::new(netstack, inner.resolver.clone(), inner.peers.clone());
+        let mut handle = socks5::spawn_socks5(bind_addr, dialer)
+            .await
+            .map_err(TsnetError::Io)?;
+        // Register the task in the server's set so close() aborts it.
+        if let Some(task) = handle.take_task() {
+            inner.tasks.lock().await.push(task);
+        }
+        Ok(handle)
+    }
+
     /// Look up which peer owns the route for a destination IP (longest-prefix
     /// match). Returns `None` if no route matches or the server is not up.
     ///
@@ -2278,6 +2316,20 @@ fn run_cmd(prog: &str, args: &[&str]) -> Result<(), TsnetError> {
 }
 
 fn resolve_addr(addr: &str, inner: &RunningState) -> Result<SocketAddr, TsnetError> {
+    resolve_addr_with(addr, &inner.resolver, &inner.peers)
+}
+
+/// Resolve `addr` (`ip:port`, `hostname:port`, or `host:port`) to a
+/// [`SocketAddr`] using the shared MagicDNS resolver and the peer list.
+///
+/// Factored out of [`resolve_addr`] so the SOCKS5 production dialer (which
+/// holds clones of the shared refs, not a `&RunningState`) can reuse the exact
+/// same resolution path as [`Server::dial`].
+fn resolve_addr_with(
+    addr: &str,
+    resolver: &RwLock<MagicDnsResolver>,
+    peers: &RwLock<Vec<Node>>,
+) -> Result<SocketAddr, TsnetError> {
     if let Ok(sa) = addr.parse::<SocketAddr>() {
         return Ok(sa);
     }
@@ -2295,7 +2347,7 @@ fn resolve_addr(addr: &str, inner: &RunningState) -> Result<SocketAddr, TsnetErr
     // Resolve via the shared MagicDNS resolver (unified with the DNS
     // responder at 100.100.100.100:53). Handles FQDNs and short hostnames
     // from the netmap. Falls back to StableID matching for completeness.
-    if let Ok(r) = inner.resolver.try_read() {
+    if let Ok(r) = resolver.try_read() {
         if let Some(ip) = r.resolve_first(host) {
             return Ok(SocketAddr::new(ip, port));
         }
@@ -2303,8 +2355,7 @@ fn resolve_addr(addr: &str, inner: &RunningState) -> Result<SocketAddr, TsnetErr
 
     // Fallback: StableID / suffix match against the peer list (used when
     // the resolver snapshot is momentarily unavailable).
-    let peers = inner
-        .peers
+    let peers = peers
         .try_read()
         .map_err(|_| TsnetError::HostnameNotFound(host.to_string()))?;
     let host_lower = host.to_lowercase();

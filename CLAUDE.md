@@ -98,10 +98,13 @@ way to delete that tailnet.** Always clean up tailnets in test teardown.
    differentiator vs Go (no runtime to embed). **Constraint that applies NOW: keep the tsnet
    public API C-representable** — no generics/lifetimes/async in the public surface that can't
    map to a C handle model; prefer opaque handles + plain data structs at the boundary.
-9. **Mobile/constrained targets** — iOS NetworkExtension (<50MB), Android, OpenWrt/musl static;
-   size profiling and feature-gated deps.
-10. **Perf data plane** — UDP GSO/GRO, io_uring TUN+socket path, batched magicsock IO;
-    iperf3 benchmark harness vs tailscaled in CI.
+9. **Perf data plane + hard benchmarks** (moved before mobile per user) — UDP GSO/GRO,
+   io_uring TUN+socket path, batched magicsock IO; iperf3 benchmark harness with HARD
+   numbers rustscale vs tailscaled. Includes **subnet routing** and **Serve** support
+   first, so the comparison covers forwarding and HTTP-serve scenarios, not just
+   node-to-node.
+10. **Mobile/constrained targets** — iOS NetworkExtension (<50MB), Android, OpenWrt/musl static;
+    size profiling and feature-gated deps.
 11. **Serve/Funnel + certs + MagicDNS** — ListenTLS/ListenFunnel, LE certs via control,
     in-netstack DNS resolver.
 12. **SSH server, exit node/subnet routes, Taildrop.**

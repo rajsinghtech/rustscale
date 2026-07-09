@@ -507,30 +507,53 @@ impl Server {
         }
         let our_v4 = first_v4(&tailscale_ips)?;
 
-        // 6. Netcheck to pick a home DERP (fall back to the first region).
+        // 6. Pick home DERP. Prefer the control-assigned HomeDERP from our
+        // own node in the MapResponse — this ensures both nodes in the same
+        // tailnet use the same DERP region. Fall back to netcheck, then to
+        // the first available region.
         let derp_map = map_resp.DERPMap.clone().unwrap_or_default();
         let home_derp = if !derp_map.Regions.is_empty() {
-            match rustscale_netcheck::Prober::default()
-                .run(&derp_map, &rustscale_netcheck::ProberOpts::default())
-                .await
-            {
-                Ok(r) if r.preferred_derp > 0 => r.preferred_derp,
-                _ => derp_map
-                    .Regions
-                    .values()
-                    .find(|r| !r.Avoid)
-                    .or_else(|| derp_map.Regions.values().next())
-                    .map(|r| r.RegionID)
-                    .unwrap_or(0),
+            // Try control-assigned HomeDERP first.
+            let assigned = map_resp
+                .Node
+                .as_ref()
+                .map(|n| n.HomeDERP)
+                .filter(|&d| d > 0);
+            if let Some(d) = assigned {
+                eprintln!("tsnet: using control-assigned home DERP region {d}");
+                d
+            } else {
+                // Fall back to netcheck.
+                match rustscale_netcheck::Prober::default()
+                    .run(&derp_map, &rustscale_netcheck::ProberOpts::default())
+                    .await
+                {
+                    Ok(r) if r.preferred_derp > 0 => r.preferred_derp,
+                    _ => derp_map
+                        .Regions
+                        .values()
+                        .find(|r| !r.Avoid)
+                        .or_else(|| derp_map.Regions.values().next())
+                        .map(|r| r.RegionID)
+                        .unwrap_or(0),
+                }
             }
         } else {
             0
         };
 
         // 7. Connect home DERP.
-        let derp_client = connect_home_derp(&derp_map, home_derp, &state.node_key)
-            .await
-            .ok();
+        eprintln!("tsnet: home DERP region = {home_derp}");
+        let derp_client = match connect_home_derp(&derp_map, home_derp, &state.node_key).await {
+            Ok(c) => {
+                eprintln!("tsnet: DERP connected to region {home_derp}");
+                Some(c)
+            }
+            Err(e) => {
+                eprintln!("tsnet: DERP connection to region {home_derp} failed: {e}");
+                None
+            }
+        };
 
         // 8. Create magicsock.
         let magicsock = Arc::new(
@@ -538,6 +561,8 @@ impl Server {
                 private_key: state.node_key.clone(),
                 disco_key: state.disco_key.clone(),
                 derp_client,
+                derp_map: Some(derp_map.clone()),
+                home_derp_region: home_derp,
                 udp_bind: Some(SocketAddr::from(([0, 0, 0, 0], 0u16))),
             })
             .await?,

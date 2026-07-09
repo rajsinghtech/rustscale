@@ -149,6 +149,10 @@ async fn mock_read_after_close_returns_eof() {
 #[tokio::test]
 #[ignore = "requires root to create a utun device"]
 async fn real_utun_create() {
+    if unsafe { libc::geteuid() } != 0 {
+        eprintln!("real_utun_create: skipped (not root)");
+        return;
+    }
     let dev = create(&TunConfig::default()).expect("create utun");
     assert!(dev.name().starts_with("utun"));
     assert_eq!(dev.mtu(), 1280);

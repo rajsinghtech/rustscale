@@ -18,6 +18,7 @@ thiserror.workspace = true
 tokio.workspace = true
 bytes.workspace = true
 rand.workspace = true
+hex.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true

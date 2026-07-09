@@ -82,6 +82,10 @@ pub struct Endpoint {
     best_addr: Option<(SocketAddr, Instant)>,
     relay: Option<(SocketAddr, u32)>,
     home_derp: i32,
+    /// The DERP region from which the most recent packet from this peer
+    /// arrived. Used for reply routing when HomeDERP is 0 or stale.
+    /// Mirrors Go's `derpRoute` / `setDerpRoute` caching.
+    last_recv_derp_region: i32,
     pending_pings: HashMap<[u8; 12], (Instant, SocketAddr)>,
     call_me_maybe_sent: bool,
 }
@@ -100,6 +104,7 @@ impl Endpoint {
             best_addr: None,
             relay: None,
             home_derp,
+            last_recv_derp_region: 0,
             pending_pings: HashMap::new(),
             call_me_maybe_sent: false,
         }
@@ -130,6 +135,33 @@ impl Endpoint {
         self.home_derp
     }
 
+    /// Update the peer's home DERP region (e.g. on a netmap delta).
+    pub fn set_home_derp(&mut self, region: i32) {
+        self.home_derp = region;
+    }
+
+    /// Record the DERP region from which a packet from this peer arrived.
+    /// Used for reply routing (Go's derpRoute caching).
+    pub fn set_last_recv_derp_region(&mut self, region: i32) {
+        self.last_recv_derp_region = region;
+    }
+
+    /// Pick the DERP region to use for sending to this peer.
+    /// Priority: last-received-region (most reliable) > HomeDERP (netmap) > 0.
+    /// This mirrors Go magicsock's derpRoute: the region a packet arrived on
+    /// is the one we reply on, since the peer is demonstrably listening there.
+    pub fn derp_send_region(&self) -> i32 {
+        if self.last_recv_derp_region > 0 {
+            return self.last_recv_derp_region;
+        }
+        self.home_derp
+    }
+
+    /// Debug accessor for the last-recv DERP region.
+    pub fn last_recv_derp_region_for_debug(&self) -> i32 {
+        self.last_recv_derp_region
+    }
+
     /// Evaluate the best path at time `now`.
     pub fn best_path(&self, now: Instant) -> BestPath {
         if let Some((addr, trusted_until)) = self.best_addr {
@@ -143,9 +175,9 @@ impl Endpoint {
         if let Some((addr, vni)) = self.relay {
             return BestPath::Relay { addr, vni };
         }
-        if self.home_derp > 0 {
+        if self.home_derp > 0 || self.last_recv_derp_region > 0 {
             return BestPath::Derp {
-                region: self.home_derp,
+                region: self.derp_send_region(),
             };
         }
         BestPath::None

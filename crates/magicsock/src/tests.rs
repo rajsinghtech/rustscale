@@ -12,6 +12,7 @@ use rustscale_derp::{
     MAGIC, PROTOCOL_VERSION,
 };
 use rustscale_key::{DiscoPrivate, NodePrivate, NodePublic};
+use rustscale_tailcfg::{DERPMap, DERPNode, DERPRegion};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -202,6 +203,8 @@ async fn derp_data_path_fallback() {
         private_key: a_priv,
         disco_key: DiscoPrivate::generate(),
         derp_client: Some(a_derp),
+        derp_map: None,
+        home_derp_region: 0,
         udp_bind: None,
     })
     .await
@@ -212,6 +215,8 @@ async fn derp_data_path_fallback() {
         private_key: b_priv,
         disco_key: DiscoPrivate::generate(),
         derp_client: Some(b_derp),
+        derp_map: None,
+        home_derp_region: 0,
         udp_bind: None,
     })
     .await
@@ -274,6 +279,8 @@ async fn direct_path_upgrade_over_udp() {
         private_key: a_priv,
         disco_key: DiscoPrivate::generate(),
         derp_client: Some(a_derp),
+        derp_map: None,
+        home_derp_region: 0,
         udp_bind: Some("127.0.0.1:0".parse().unwrap()),
     })
     .await
@@ -284,6 +291,8 @@ async fn direct_path_upgrade_over_udp() {
         private_key: b_priv,
         disco_key: DiscoPrivate::generate(),
         derp_client: Some(b_derp),
+        derp_map: None,
+        home_derp_region: 0,
         udp_bind: Some("127.0.0.1:0".parse().unwrap()),
     })
     .await
@@ -353,6 +362,8 @@ async fn trust_expiry_downgrades_to_derp() {
         private_key: a_priv,
         disco_key: DiscoPrivate::generate(),
         derp_client: Some(a_derp),
+        derp_map: None,
+        home_derp_region: 0,
         udp_bind: Some("127.0.0.1:0".parse().unwrap()),
     })
     .await
@@ -363,6 +374,8 @@ async fn trust_expiry_downgrades_to_derp() {
         private_key: b_priv,
         disco_key: DiscoPrivate::generate(),
         derp_client: Some(b_derp),
+        derp_map: None,
+        home_derp_region: 0,
         udp_bind: Some("127.0.0.1:0".parse().unwrap()),
     })
     .await
@@ -417,6 +430,8 @@ async fn send_unknown_peer_errors() {
         private_key: privk,
         disco_key: DiscoPrivate::generate(),
         derp_client: Some(derp),
+        derp_map: None,
+        home_derp_region: 0,
         udp_bind: None,
     })
     .await
@@ -424,4 +439,190 @@ async fn send_unknown_peer_errors() {
 
     let unknown = NodePrivate::generate().public();
     assert!(a.send(unknown, b"hello").await.is_err());
+}
+
+// ---- Test: multi-region DERP — A lazily connects to B's home region ----
+
+/// Two fake DERP servers in different regions. Node A is homed to region 1,
+/// node B is homed to region 2. A must lazily connect to region 2 to send
+/// WG data to B, and B must lazily connect to region 1 to reply.
+///
+/// Since FakeRelay uses in-process duplex streams (not real TCP), we can't
+/// test lazy TCP connections here. Instead we pre-connect both relays and
+/// pass them as the derp_map with `InsecureForTests`-style config. But
+/// `connect_with_upgrade_dial` needs real TCP, so for this test we inject
+/// pre-connected DerpClients for BOTH regions and verify routing.
+#[tokio::test]
+async fn multi_region_derp_routing() {
+    let relay1 = Arc::new(FakeRelay::new());
+    let relay2 = Arc::new(FakeRelay::new());
+
+    let a_priv = NodePrivate::generate();
+    let b_priv = NodePrivate::generate();
+
+    // A connects to relay1 (region 1, home) and relay2 (region 2, peer's home).
+    let a_derp_home = connect_to_relay(&relay1, a_priv.clone()).await;
+    let a_derp_r2 = connect_to_relay(&relay2, a_priv.clone()).await;
+
+    // B connects to relay2 (region 2, home) and relay1 (region 1, peer's home).
+    let b_derp_home = connect_to_relay(&relay2, b_priv.clone()).await;
+    let b_derp_r1 = connect_to_relay(&relay1, b_priv.clone()).await;
+
+    // Build a DERPMap with two regions (not used for connecting, just for
+    // structural completeness — the connections are pre-injected).
+    let _derp_map = DERPMap {
+        Regions: [
+            (
+                1,
+                DERPRegion {
+                    RegionID: 1,
+                    RegionCode: "r1".into(),
+                    RegionName: "Region 1".into(),
+                    Nodes: Some(vec![DERPNode {
+                        Name: "1a".into(),
+                        RegionID: 1,
+                        HostName: "r1.test".into(),
+                        ..Default::default()
+                    }]),
+                    ..Default::default()
+                },
+            ),
+            (
+                2,
+                DERPRegion {
+                    RegionID: 2,
+                    RegionCode: "r2".into(),
+                    RegionName: "Region 2".into(),
+                    Nodes: Some(vec![DERPNode {
+                        Name: "2a".into(),
+                        RegionID: 2,
+                        HostName: "r2.test".into(),
+                        ..Default::default()
+                    }]),
+                    ..Default::default()
+                },
+            ),
+        ]
+        .into_iter()
+        .collect(),
+        ..Default::default()
+    };
+
+    // Create magicsock A with home region 1. We inject BOTH DERP connections
+    // by first creating with the home client, then manually inserting the
+    // region 2 connection into the DerpManager.
+    let a = Magicsock::new(MagicsockConfig {
+        private_key: a_priv,
+        disco_key: DiscoPrivate::generate(),
+        derp_client: Some(a_derp_home),
+        derp_map: None,
+        home_derp_region: 1,
+        udp_bind: None,
+    })
+    .await
+    .expect("A magicsock");
+
+    // Manually inject region 2 connection into A's DerpManager.
+    {
+        let mut conns = a
+            .inner
+            .derp
+            .connections
+            .write()
+            .expect("derp connections lock poisoned");
+        let io2 = Arc::new(DerpIo::spawn(a_derp_r2));
+        // The DerpManager needs to spawn a recv consumer for this connection.
+        // We can't do that from here, but the DerpIo's internal reader task
+        // feeds a channel. We need to also spawn a consumer.
+        // Actually, let's spawn it here.
+        let tx = a.inner.derp.derp_recv_tx.clone();
+        let io2_clone = io2.clone();
+        tokio::spawn(async move {
+            while let Some((source, data)) = io2_clone.try_recv().await {
+                if tx.send((2, source, data)).await.is_err() {
+                    break;
+                }
+            }
+        });
+        conns.insert(2, io2);
+    }
+
+    // Create magicsock B with home region 2. Similarly inject region 1.
+    let b = Magicsock::new(MagicsockConfig {
+        private_key: b_priv,
+        disco_key: DiscoPrivate::generate(),
+        derp_client: Some(b_derp_home),
+        derp_map: None,
+        home_derp_region: 2,
+        udp_bind: None,
+    })
+    .await
+    .expect("B magicsock");
+
+    {
+        let mut conns = b
+            .inner
+            .derp
+            .connections
+            .write()
+            .expect("derp connections lock poisoned");
+        let io1 = Arc::new(DerpIo::spawn(b_derp_r1));
+        let tx = b.inner.derp.derp_recv_tx.clone();
+        let io1_clone = io1.clone();
+        tokio::spawn(async move {
+            while let Some((source, data)) = io1_clone.try_recv().await {
+                if tx.send((1, source, data)).await.is_err() {
+                    break;
+                }
+            }
+        });
+        conns.insert(1, io1);
+    }
+
+    // Each knows about the other via the netmap, with DIFFERENT home DERP.
+    let b_peer = make_peer(b.node_public(), b.disco_public(), vec![], 2);
+    let a_peer = make_peer(a.node_public(), a.disco_public(), vec![], 1);
+
+    // Give relays time to fully register all clients.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    a.set_netmap(vec![b_peer]).await.expect("A set_netmap");
+    b.set_netmap(vec![a_peer]).await.expect("B set_netmap");
+
+    // A sends a WG datagram to B — A routes to B's home DERP (region 2).
+    let wg_datagram = b"\x00\x01\x02\x03 multi-region wg from A";
+    a.send(b.node_public(), wg_datagram)
+        .await
+        .expect("A send to B via region 2");
+
+    // B should receive the WG datagram (via region 2 relay).
+    let mut got_wg = None;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(500), b.poll_recv()).await {
+            Ok(Ok(d)) => {
+                if d.data == wg_datagram {
+                    got_wg = Some(d);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let received = got_wg.expect("B should receive A's WG datagram via region 2");
+    assert_eq!(received.peer, a.node_public());
+    assert_eq!(received.data, wg_datagram);
+
+    // B sends back to A — B routes to A's home DERP (region 1).
+    let wg_reply = b"\x00\x04\x05\x06 multi-region wg from B";
+    b.send(a.node_public(), wg_reply)
+        .await
+        .expect("B send to A via region 1");
+
+    let received = tokio::time::timeout(Duration::from_secs(5), a.poll_recv())
+        .await
+        .expect("timed out waiting for A recv via region 1")
+        .expect("A poll_recv");
+    assert_eq!(received.peer, b.node_public());
+    assert_eq!(received.data, wg_reply);
 }

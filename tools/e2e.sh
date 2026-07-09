@@ -3,17 +3,19 @@
 # against it, and always delete it afterwards.
 #
 # Auth (either):
-#   TS_ORG_TOKEN                            — pre-minted org token (CI/WIF path)
+#   TS_ORG_TOKEN                            — pre-minted org token (CI/WID path)
 #   TS_ORG_CLIENT_ID + TS_ORG_CLIENT_SECRET — OAuth client creds (local path;
 #                                             `source .secrets/tailscale.env`)
 #
 # The org client is tailnets-scope only, so the child oauthClient creds from the
-# create response are the ONLY way to operate on/delete the tailnet. Capture them
-# before anything else and trap cleanup.
+# create response are the ONLY way to operate on/delete the tailnet. We persist
+# them to .secrets/last-e2e-tailnet.json immediately after create so a killed
+# run can clean up its orphaned tailnet on the next invocation.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 API="${TS_API_BASE_URL:-https://api.tailscale.com}"
+LAST_TAILNET_FILE=".secrets/last-e2e-tailnet.json"
 
 if [[ -z "${TS_ORG_TOKEN:-}" ]]; then
   [[ -n "${TS_ORG_CLIENT_ID:-}" && -n "${TS_ORG_CLIENT_SECRET:-}" ]] || {
@@ -22,6 +24,38 @@ if [[ -z "${TS_ORG_TOKEN:-}" ]]; then
     -d client_id="$TS_ORG_CLIENT_ID" -d client_secret="$TS_ORG_CLIENT_SECRET" | jq -r .access_token)
 fi
 
+# ---------------------------------------------------------------------------
+# Cleanup leftover tailnet from a previous killed run (best-effort).
+# ---------------------------------------------------------------------------
+cleanup_leftover() {
+  if [[ -f "$LAST_TAILNET_FILE" ]]; then
+    local leftover
+    leftover=$(cat "$LAST_TAILNET_FILE" 2>/dev/null || echo "")
+    if [[ -n "$leftover" && "$leftover" != "null" ]]; then
+      local l_dns l_cid l_csec
+      l_dns=$(echo "$leftover" | jq -r .dnsName // empty)
+      l_cid=$(echo "$leftover" | jq -r .clientId // empty)
+      l_csec=$(echo "$leftover" | jq -r .clientSecret // empty)
+      if [[ -n "$l_dns" && -n "$l_cid" && -n "$l_csec" ]]; then
+        echo "cleaning up leftover tailnet: $l_dns" >&2
+        local lt
+        lt=$(curl -fsS -X POST "$API/api/v2/oauth/token" \
+          -d client_id="$l_cid" -d client_secret="$l_csec" 2>/dev/null | jq -r .access_token 2>/dev/null || echo "")
+        if [[ -n "$lt" && "$lt" != "null" ]]; then
+          curl -sS -o /dev/null -X DELETE \
+            "$API/api/v2/tailnet/$l_dns" -H "Authorization: Bearer $lt" >&2 2>/dev/null || true
+          echo "leftover cleanup done" >&2
+        fi
+      fi
+    fi
+    rm -f "$LAST_TAILNET_FILE"
+  fi
+}
+cleanup_leftover
+
+# ---------------------------------------------------------------------------
+# Create a fresh ephemeral tailnet.
+# ---------------------------------------------------------------------------
 NAME="rustscale-e2e-$(date +%s)"
 echo "creating ephemeral tailnet: $NAME" >&2
 CREATED=$(curl -fsS -X POST "$API/api/v2/organizations/-/tailnets" \
@@ -35,18 +69,39 @@ CHILD_CSEC=$(echo "$CREATED" | jq -r .oauthClient.secret)
   echo "create failed: $CREATED" >&2; exit 1; }
 echo "created: $DNS" >&2
 
+# Immediately persist child creds so a killed run can clean up.
+mkdir -p .secrets
+jq -n --arg dns "$DNS" --arg cid "$CHILD_CID" --arg csec "$CHILD_CSEC" \
+  '{dnsName: $dns, clientId: $cid, clientSecret: $csec}' > "$LAST_TAILNET_FILE"
+chmod 600 "$LAST_TAILNET_FILE"
+
 child_token() {
   curl -fsS -X POST "$API/api/v2/oauth/token" \
     -d client_id="$CHILD_CID" -d client_secret="$CHILD_CSEC" | jq -r .access_token
 }
 
+# ---------------------------------------------------------------------------
+# Cleanup: delete the tailnet and remove the persisted creds file.
+# Trap INT, TERM, and EXIT so SIGTERM (e.g. kill from CI) still runs cleanup.
+# ---------------------------------------------------------------------------
+DNS_VAR="$DNS"
+CHILD_CID_VAR="$CHILD_CID"
+CHILD_CSEC_VAR="$CHILD_CSEC"
+
 cleanup() {
-  echo "deleting tailnet: $DNS" >&2
-  T=$(child_token) || { echo "WARN: could not mint child token for cleanup" >&2; return 0; }
-  curl -sS -o /dev/null -w 'delete HTTP %{http_code}\n' -X DELETE \
-    "$API/api/v2/tailnet/$DNS" -H "Authorization: Bearer $T" >&2 || true
+  echo "deleting tailnet: $DNS_VAR" >&2
+  T=$(curl -fsS -X POST "$API/api/v2/oauth/token" \
+    -d client_id="$CHILD_CID_VAR" -d client_secret="$CHILD_CSEC_VAR" 2>/dev/null \
+    | jq -r .access_token 2>/dev/null || echo "")
+  if [[ -n "$T" && "$T" != "null" ]]; then
+    curl -sS -o /dev/null -w 'delete HTTP %{http_code}\n' -X DELETE \
+      "$API/api/v2/tailnet/$DNS_VAR" -H "Authorization: Bearer $T" >&2 || true
+  else
+    echo "WARN: could not mint child token for cleanup" >&2
+  fi
+  rm -f "$LAST_TAILNET_FILE"
 }
-trap cleanup EXIT
+trap cleanup INT TERM EXIT
 
 CHILD_TOKEN=$(child_token)
 

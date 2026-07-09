@@ -284,7 +284,7 @@ async fn e2e_register_only() {
     let _tailnet = std::env::var("TS_E2E_TAILNET").expect("TS_E2E_TAILNET not set");
 
     let mut server = Server::builder()
-        .hostname("rustscale-e2e-register")
+        .hostname(format!("rustscale-e2e-register-{}", std::process::id()))
         .auth_key(authkey)
         .ephemeral(true)
         .build()
@@ -303,16 +303,48 @@ async fn e2e_register_only() {
     server.close().await;
 }
 
+/// Helper: wait for a specific peer IP to appear in a server's netmap.
+/// Hard deadline 90s. On timeout, panics with the full peer list.
+async fn wait_for_peer(server: &Server, target_ip: std::net::IpAddr, label: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    loop {
+        let st = server.status();
+        if st.peers.iter().any(|p| p.ips.contains(&target_ip)) {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            let peers: Vec<String> = st
+                .peers
+                .iter()
+                .map(|p| format!("  {} ips={:?} path={:?}", p.name, p.ips, p.path_class))
+                .collect();
+            let elapsed = 90;
+            panic!(
+                "{label}: peer {target_ip} never appeared in netmap after {elapsed}s\n\
+                 current peers ({}):\n{}",
+                peers.len(),
+                peers.join("\n")
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+}
+
 /// Two-node e2e: spin up two tsnet servers, dial A->B, echo bytes.
+/// Every operation has a hard timeout; no unbounded waits.
 #[tokio::test]
 #[ignore]
 async fn e2e_two_nodes() {
     let authkey = std::env::var("TS_E2E_AUTHKEY").expect("TS_E2E_AUTHKEY not set");
     let _tailnet = std::env::var("TS_E2E_TAILNET").expect("TS_E2E_TAILNET not set");
 
+    // Unique hostname suffix to avoid collisions with stale nodes from
+    // other test suites running in the same ephemeral tailnet.
+    let uid = std::process::id();
+
     // Start server A.
     let mut server_a = Server::builder()
-        .hostname("rustscale-e2e-a")
+        .hostname(format!("rustscale-e2e-a-{uid}"))
         .auth_key(authkey.clone())
         .ephemeral(true)
         .build()
@@ -330,7 +362,7 @@ async fn e2e_two_nodes() {
 
     // Start server B.
     let mut server_b = Server::builder()
-        .hostname("rustscale-e2e-b")
+        .hostname(format!("rustscale-e2e-b-{uid}"))
         .auth_key(authkey)
         .ephemeral(true)
         .build()
@@ -349,53 +381,93 @@ async fn e2e_two_nodes() {
     // B listens on a port.
     let mut listener = server_b.listen(4242).await.expect("listen");
 
-    // Give the nodes a moment to see each other in the netmap.
-    // Wait up to 60s for B to appear in A's netmap (streaming deltas take time).
-    let mut found_peer = false;
-    for _ in 0..120 {
-        let st = server_a.status();
-        if st.peer_count > 0 {
-            found_peer = true;
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    }
-    assert!(found_peer, "A never saw B in its netmap");
+    // Wait for B's specific IP to appear in A's netmap (hard 90s deadline).
+    wait_for_peer(&server_a, ip_b.into(), "e2e_two_nodes").await;
 
-    // A dials B.
+    // Give the WG handshake a moment to complete after the peer appeared.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+    // A dials B. Retry up to 3 times — the WG handshake may not have
+    // completed when the peer first appears in the netmap, causing the
+    // first dial to time out. Each attempt gives the handshake more time.
     let dial_addr = format!("{}:4242", ip_b);
-    let dial_result = tokio::time::timeout(
-        std::time::Duration::from_secs(60),
-        server_a.dial(&dial_addr),
-    )
-    .await;
-    let mut stream_a = dial_result.expect("dial timed out").expect("dial failed");
+    let mut stream_a = None;
+    for attempt in 1..=3 {
+        eprintln!("dial attempt {attempt} to {dial_addr}");
+        let dial_result = tokio::time::timeout(
+            std::time::Duration::from_secs(45),
+            server_a.dial(&dial_addr),
+        )
+        .await;
+        match dial_result {
+            Ok(Ok(s)) => {
+                stream_a = Some(s);
+                break;
+            }
+            Ok(Err(e)) => {
+                eprintln!("dial attempt {attempt} failed: {e}");
+            }
+            Err(_) => {
+                let st = server_a.status();
+                let peers: Vec<String> = st
+                    .peers
+                    .iter()
+                    .map(|p| format!("  {} ips={:?} path={:?}", p.name, p.ips, p.path_class))
+                    .collect();
+                eprintln!(
+                    "dial attempt {attempt} timed out (45s)\nA peers ({}):\n{}",
+                    peers.len(),
+                    peers.join("\n")
+                );
+            }
+        }
+        if attempt < 3 {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+    }
+    let mut stream_a = stream_a.expect("all 3 dial attempts failed");
 
-    // B accepts.
+    // B accepts (hard 30s timeout).
     let accept_result =
         tokio::time::timeout(std::time::Duration::from_secs(30), listener.accept()).await;
     let mut stream_b = accept_result
-        .expect("accept timed out")
+        .expect("accept timed out (30s)")
         .expect("accept failed");
 
-    // A sends, B reads and echoes.
-    tokio::io::AsyncWriteExt::write_all(&mut stream_a, b"hello e2e")
-        .await
-        .expect("A write");
+    // A sends, B reads and echoes. Every I/O has a hard 30s timeout.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        tokio::io::AsyncWriteExt::write_all(&mut stream_a, b"hello e2e"),
+    )
+    .await
+    .expect("A write timed out (30s)")
+    .expect("A write failed");
 
     let mut buf = [0u8; 32];
-    let n = tokio::io::AsyncReadExt::read(&mut stream_b, &mut buf)
-        .await
-        .expect("B read");
+    let n = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        tokio::io::AsyncReadExt::read(&mut stream_b, &mut buf),
+    )
+    .await
+    .expect("B read timed out (30s)")
+    .expect("B read failed");
     assert_eq!(&buf[..n], b"hello e2e");
 
-    tokio::io::AsyncWriteExt::write_all(&mut stream_b, b"world e2e")
-        .await
-        .expect("B write");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        tokio::io::AsyncWriteExt::write_all(&mut stream_b, b"world e2e"),
+    )
+    .await
+    .expect("B write timed out (30s)")
+    .expect("B write failed");
 
-    let n = tokio::io::AsyncReadExt::read(&mut stream_a, &mut buf)
-        .await
-        .expect("A read");
+    let n = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        tokio::io::AsyncReadExt::read(&mut stream_a, &mut buf),
+    )
+    .await
+    .expect("A read timed out (30s)")
+    .expect("A read failed");
     assert_eq!(&buf[..n], b"world e2e");
 
     // Check path (any of derp/direct ok).

@@ -1,13 +1,22 @@
 //! Path-selection engine for rustscale: direct UDP, DERP relay, and peer relay.
 //!
 //! Ports the semantics of Go's `wgengine/magicsock` in simplified form. Owns
-//! UDP sockets (v4+v6), a DERP client for the home region, and per-peer
-//! endpoint state. Disco ping/pong probing discovers direct paths; CallMeMaybe
-//! via DERP punches NAT; DERP is the fallback data path.
+//! UDP sockets (v4+v6), a set of DERP client connections (one per region,
+//! lazily created), and per-peer endpoint state. Disco ping/pong probing
+//! discovers direct paths; CallMeMaybe via DERP punches NAT; DERP is the
+//! fallback data path.
+//!
+//! # Multi-region DERP routing
+//!
+//! Each peer has a `HomeDERP` region (assigned by the control plane). To reach
+//! a peer via DERP, we must send to the **peer's** home DERP region, not our
+//! own. The [`DerpManager`] lazily opens connections to regions on first use
+//! and reuses them thereafter. Recv tasks for all connected regions feed the
+//! same WG/disco demux path.
 //!
 //! # API
 //!
-//! - [`Magicsock::new`] — bind UDP, connect DERP, start background I/O.
+//! - [`Magicsock::new`] — bind UDP, connect home DERP (if provided), start I/O.
 //! - [`Magicsock::set_netmap`] — create/update peer endpoints, start probing.
 //! - [`Magicsock::poll_recv`] — receive the next WG datagram from any peer.
 //! - [`Magicsock::send`] — send a WG datagram to a peer over the best path.
@@ -55,8 +64,17 @@ pub struct MagicsockConfig {
     pub private_key: NodePrivate,
     /// Our disco private key (for NAT-traversal path discovery).
     pub disco_key: DiscoPrivate,
-    /// An already-connected DERP client, if any. `None` means DERP is not used.
+    /// An already-connected DERP client for our home region, if any.
+    /// `None` means DERP is not used (unless `derp_map` is provided for
+    /// lazy connections).
     pub derp_client: Option<DerpClient>,
+    /// The DERPMap for lazy multi-region connections. When provided, magicsock
+    /// can connect to any peer's home DERP region on demand. The home region
+    /// connection from `derp_client` is registered as region `home_derp_region`.
+    pub derp_map: Option<DERPMap>,
+    /// Our home DERP region ID (used to register the pre-connected
+    /// `derp_client`). 0 if unknown.
+    pub home_derp_region: i32,
     /// Optional UDP bind address (`None` = no direct UDP; DERP-only mode).
     pub udp_bind: Option<SocketAddr>,
 }
@@ -77,19 +95,212 @@ pub struct Magicsock {
 
 struct Inner {
     node_public: NodePublic,
+    node_private: NodePrivate,
     disco: DiscoIo,
     udp: Option<Arc<UdpSocket>>,
     local_udp_addrs: Vec<String>,
-    derp: Option<Arc<DerpIo>>,
+    /// Multi-region DERP connection manager.
+    derp: DerpManager,
     endpoints: RwLock<HashMap<NodePublic, Endpoint>>,
     disco_to_peer: RwLock<HashMap<DiscoPublic, NodePublic>>,
     addr_to_peer: RwLock<HashMap<SocketAddr, NodePublic>>,
     wg_send: mpsc::Sender<WgDatagram>,
 }
 
+/// Manages DERP connections across multiple regions.
+///
+/// The home region connection is provided at construction time (from the
+/// pre-connected `DerpClient`). Connections to other regions are created
+/// lazily on first send to a peer whose `HomeDERP` is in that region.
+/// All connections' recv tasks feed the same `wg_send` + disco demux path
+/// via a shared packet channel.
+struct DerpManager {
+    /// region_id -> DerpIo connection.
+    connections: RwLock<HashMap<i32, Arc<DerpIo>>>,
+    /// The DERPMap for looking up region configs when lazily connecting.
+    derp_map: RwLock<Option<DERPMap>>,
+    /// Our node private key (needed to establish new DERP connections).
+    node_private: NodePrivate,
+    /// Our home DERP region (for diagnostics).
+    home_region: i32,
+    /// Channel for DERP recv tasks to forward received packets to the main
+    /// demux loop. Each lazy connection spawns a recv task that sends to
+    /// this channel.
+    derp_recv_tx: mpsc::Sender<(i32, NodePublic, Vec<u8>)>,
+}
+
+impl DerpManager {
+    fn new(
+        home_client: Option<DerpClient>,
+        derp_map: Option<DERPMap>,
+        node_private: NodePrivate,
+        home_region: i32,
+    ) -> (Self, mpsc::Receiver<(i32, NodePublic, Vec<u8>)>) {
+        let (derp_recv_tx, derp_recv_rx) = mpsc::channel(256);
+
+        let mut connections = HashMap::new();
+
+        // Register the pre-connected home region client.
+        if let Some(client) = home_client {
+            let region = if home_region > 0 { home_region } else { 1 };
+            let io = Arc::new(DerpIo::spawn(client));
+            spawn_derp_recv_consumer(region, io.clone(), derp_recv_tx.clone());
+            connections.insert(region, io);
+        }
+
+        let mgr = Self {
+            connections: RwLock::new(connections),
+            derp_map: RwLock::new(derp_map),
+            node_private,
+            home_region,
+            derp_recv_tx,
+        };
+
+        (mgr, derp_recv_rx)
+    }
+
+    /// Get the DerpIo for a region, lazily connecting if needed.
+    /// Returns None if the region is unknown or connection fails.
+    async fn get_or_connect(&self, region_id: i32) -> Option<Arc<DerpIo>> {
+        // Fast path: already connected.
+        {
+            let conns = self
+                .connections
+                .read()
+                .expect("derp connections lock poisoned");
+            if let Some(io) = conns.get(&region_id) {
+                return Some(io.clone());
+            }
+        }
+
+        // Slow path: look up the region config and connect.
+        let derp_map = self
+            .derp_map
+            .read()
+            .expect("derp_map lock poisoned")
+            .clone();
+        let map = derp_map?;
+        let region = map.Regions.get(&region_id)?;
+        let nodes = region.Nodes.as_ref()?;
+        let node = nodes
+            .iter()
+            .find(|n| !n.STUNOnly)
+            .or_else(|| nodes.first())?;
+
+        let port = if node.DERPPort > 0 {
+            node.DERPPort as u16
+        } else {
+            443
+        };
+        let tls_host = node.HostName.clone();
+        let dial_addr = if !node.IPv4.is_empty() && node.IPv4 != "none" {
+            node.IPv4.clone()
+        } else {
+            node.HostName.clone()
+        };
+
+        if debug_enabled() {
+            eprintln!(
+                "DBG derp_connect region={region_id} host={dial_addr}:{port} name={}",
+                region.RegionName
+            );
+        }
+
+        let client = match DerpClient::connect_with_upgrade_dial(
+            &dial_addr,
+            &tls_host,
+            port,
+            true,
+            self.node_private.clone(),
+        )
+        .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                if debug_enabled() {
+                    eprintln!("DBG derp_connect region={region_id} FAILED: {e}");
+                }
+                return None;
+            }
+        };
+
+        if debug_enabled() {
+            eprintln!("DBG derp_connect region={region_id} OK");
+        }
+
+        let io = Arc::new(DerpIo::spawn(client));
+
+        // Insert and spawn recv consumer.
+        {
+            let mut conns = self
+                .connections
+                .write()
+                .expect("derp connections lock poisoned");
+            // Another task may have connected in the meantime; reuse if so.
+            if let Some(existing) = conns.get(&region_id) {
+                return Some(existing.clone());
+            }
+            conns.insert(region_id, io.clone());
+        }
+
+        spawn_derp_recv_consumer(region_id, io.clone(), self.derp_recv_tx.clone());
+
+        Some(io)
+    }
+
+    /// Send a packet to `dst` via the DERP server for `region_id`.
+    async fn send_packet(&self, region_id: i32, dst: NodePublic, data: Vec<u8>) -> bool {
+        // Try to get the connection without awaiting (fast path).
+        let io = {
+            let conns = self
+                .connections
+                .read()
+                .expect("derp connections lock poisoned");
+            conns.get(&region_id).cloned()
+        };
+
+        let io = match io {
+            Some(io) => io,
+            None => match self.get_or_connect(region_id).await {
+                Some(io) => io,
+                None => {
+                    eprintln!(
+                        "magicsock: no DERP connection to region {region_id} for peer, dropping"
+                    );
+                    return false;
+                }
+            },
+        };
+
+        io.send_packet(dst, data).await;
+        true
+    }
+
+    /// The home DERP region ID.
+    fn home_region(&self) -> i32 {
+        self.home_region
+    }
+}
+
+/// Spawn a task that reads from a DerpIo connection and forwards received
+/// packets to the shared derp_recv channel for demux.
+fn spawn_derp_recv_consumer(
+    region_id: i32,
+    io: Arc<DerpIo>,
+    tx: mpsc::Sender<(i32, NodePublic, Vec<u8>)>,
+) {
+    tokio::spawn(async move {
+        while let Some((source, data)) = io.try_recv().await {
+            if tx.send((region_id, source, data)).await.is_err() {
+                break;
+            }
+        }
+    });
+}
+
 impl Magicsock {
-    /// Create a new Magicsock: bind UDP (if configured), start DERP I/O, and
-    /// launch background recv tasks.
+    /// Create a new Magicsock: bind UDP (if configured), connect DERP, and
+    /// launch background I/O tasks.
     pub async fn new(config: MagicsockConfig) -> Result<Self, MagicsockError> {
         let node_public = config.private_key.public();
         let disco = DiscoIo::new(config.disco_key);
@@ -105,11 +316,17 @@ impl Magicsock {
             (None, Vec::new())
         };
 
-        // Start DERP I/O if a client was provided.
-        let derp = config.derp_client.map(|c| Arc::new(DerpIo::spawn(c)));
+        // Create the DERP manager with the home region connection + DERPMap.
+        let (derp, derp_recv_rx) = DerpManager::new(
+            config.derp_client,
+            config.derp_map,
+            config.private_key.clone(),
+            config.home_derp_region,
+        );
 
         let inner = Arc::new(Inner {
             node_public,
+            node_private: config.private_key,
             disco,
             udp,
             local_udp_addrs,
@@ -120,8 +337,8 @@ impl Magicsock {
             wg_send,
         });
 
-        // Launch background recv tasks.
-        spawn_recv_tasks(inner.clone());
+        // Launch background recv tasks (UDP + DERP demux).
+        spawn_recv_tasks(inner.clone(), derp_recv_rx);
 
         Ok(Self {
             inner,
@@ -145,10 +362,10 @@ impl Magicsock {
     }
 
     /// Update the peer set from a netmap. Creates/updates per-peer endpoints,
-    /// starts disco probing, and sends CallMeMaybe via DERP.
+    /// starts disco probing, and sends CallMeMaybe via the peer's home DERP.
     pub async fn set_netmap(&self, peers: Vec<Node>) -> Result<(), MagicsockError> {
         // Phase 1: update endpoint state under the lock.
-        let probe_list: Vec<(NodePublic, DiscoPublic, Vec<SocketAddr>)> = {
+        let probe_list: Vec<(NodePublic, DiscoPublic, Vec<SocketAddr>, i32)> = {
             let mut endpoints = self
                 .inner
                 .endpoints
@@ -175,6 +392,11 @@ impl Magicsock {
                     Endpoint::new(peer.Key.clone(), peer.DiscoKey.clone(), peer.HomeDERP)
                 });
 
+                // Update HomeDERP if it changed.
+                if peer.HomeDERP != ep.home_derp() {
+                    ep.set_home_derp(peer.HomeDERP);
+                }
+
                 ep.set_candidates(candidates.clone());
                 ep.reset_call_me_maybe();
 
@@ -182,13 +404,27 @@ impl Magicsock {
                     d2p.insert(peer.DiscoKey.clone(), peer.Key.clone());
                 }
 
-                probes.push((peer.Key.clone(), peer.DiscoKey.clone(), candidates));
+                probes.push((
+                    peer.Key.clone(),
+                    peer.DiscoKey.clone(),
+                    candidates,
+                    ep.derp_send_region(),
+                ));
+                if debug_enabled() {
+                    eprintln!(
+                        "DBG set_netmap peer={} HomeDERP={} derp_send_region={} last_recv={}",
+                        peer.Name,
+                        peer.HomeDERP,
+                        ep.derp_send_region(),
+                        ep.last_recv_derp_region_for_debug(),
+                    );
+                }
             }
             probes
         };
 
         // Phase 2: send disco pings and CallMeMaybe (async, outside the lock).
-        for (peer_key, peer_disco, candidates) in probe_list {
+        for (peer_key, peer_disco, candidates, derp_region) in probe_list {
             // Send disco Pings to each candidate over UDP.
             if let Some(ref udp) = self.inner.udp {
                 for addr in &candidates {
@@ -214,31 +450,52 @@ impl Magicsock {
                 }
             }
 
-            // Send CallMeMaybe via DERP.
-            if let Some(ref derp) = self.inner.derp {
-                if !peer_disco.is_zero() {
-                    let should = {
-                        let mut endpoints = self
+            // Send CallMeMaybe via the peer's home DERP region.
+            if !peer_disco.is_zero() {
+                let should = {
+                    let mut endpoints = self
+                        .inner
+                        .endpoints
+                        .write()
+                        .expect("endpoints lock poisoned");
+                    endpoints
+                        .get_mut(&peer_key)
+                        .is_some_and(|ep| ep.should_send_call_me_maybe())
+                };
+                if should {
+                    let cmm = Message::CallMeMaybe(CallMeMaybe {
+                        my_number: self
                             .inner
-                            .endpoints
-                            .write()
-                            .expect("endpoints lock poisoned");
-                        endpoints
-                            .get_mut(&peer_key)
-                            .is_some_and(|ep| ep.should_send_call_me_maybe())
-                    };
-                    if should {
-                        let cmm = Message::CallMeMaybe(CallMeMaybe {
-                            my_number: self
-                                .inner
-                                .local_udp_addrs
-                                .iter()
-                                .filter_map(|s| s.parse::<SocketAddr>().ok())
-                                .map(rustscale_disco::AddrPort::from)
-                                .collect(),
-                        });
-                        if let Some(packet) = self.inner.disco.seal(&peer_disco, &cmm) {
-                            derp.send_packet(peer_key, packet).await;
+                            .local_udp_addrs
+                            .iter()
+                            .filter_map(|s| s.parse::<SocketAddr>().ok())
+                            .map(rustscale_disco::AddrPort::from)
+                            .collect(),
+                    });
+                    if let Some(packet) = self.inner.disco.seal(&peer_disco, &cmm) {
+                        if derp_region > 0 {
+                            self.inner
+                                .derp
+                                .send_packet(derp_region, peer_key.clone(), packet)
+                                .await;
+                        } else {
+                            // Fan out CallMeMaybe to all connected DERP regions
+                            // (peer's home DERP is unknown).
+                            let regions: Vec<i32> = {
+                                let conns = self
+                                    .inner
+                                    .derp
+                                    .connections
+                                    .read()
+                                    .expect("derp connections lock poisoned");
+                                conns.keys().copied().collect()
+                            };
+                            for r in regions {
+                                self.inner
+                                    .derp
+                                    .send_packet(r, peer_key.clone(), packet.clone())
+                                    .await;
+                            }
                         }
                     }
                 }
@@ -260,14 +517,17 @@ impl Magicsock {
 
     /// Send a WG datagram to `peer` over the best available path.
     pub async fn send(&self, peer: NodePublic, datagram: &[u8]) -> Result<(), MagicsockError> {
-        let path = {
+        let (path, derp_region) = {
             let endpoints = self
                 .inner
                 .endpoints
                 .read()
                 .expect("endpoints lock poisoned");
             let ep = endpoints.get(&peer).ok_or(MagicsockError::PeerNotFound)?;
-            ep.best_path(std::time::Instant::now())
+            (
+                ep.best_path(std::time::Instant::now()),
+                ep.derp_send_region(),
+            )
         };
 
         match path {
@@ -276,8 +536,7 @@ impl Magicsock {
                     udp.send_to(datagram, addr).await?;
                     return Ok(());
                 }
-                // No UDP socket; fall through to DERP.
-                self.send_via_derp(peer, datagram).await
+                self.send_via_derp(peer, derp_region, datagram).await
             }
             endpoint::BestPath::Relay { addr, vni } => {
                 if let Some(ref udp) = self.inner.udp {
@@ -285,10 +544,11 @@ impl Magicsock {
                     udp.send_to(&framed, addr).await?;
                     return Ok(());
                 }
-                self.send_via_derp(peer, datagram).await
+                self.send_via_derp(peer, derp_region, datagram).await
             }
-            endpoint::BestPath::Derp { .. } => self.send_via_derp(peer, datagram).await,
-            endpoint::BestPath::None => self.send_via_derp(peer, datagram).await,
+            endpoint::BestPath::Derp { .. } | endpoint::BestPath::None => {
+                self.send_via_derp(peer, derp_region, datagram).await
+            }
         }
     }
 
@@ -317,19 +577,99 @@ impl Magicsock {
             .is_some_and(|ep| ep.trusted_direct_addr(std::time::Instant::now()).is_some())
     }
 
-    async fn send_via_derp(&self, peer: NodePublic, datagram: &[u8]) -> Result<(), MagicsockError> {
-        if let Some(ref derp) = self.inner.derp {
-            derp.send_packet(peer, datagram.to_vec()).await;
-            Ok(())
-        } else {
-            Err(MagicsockError::NoPath)
+    /// Send a WG datagram to `peer` via DERP region `region`.
+    /// If `region` is 0 (unknown), fans out to ALL connected DERP regions
+    /// so the peer receives the packet on whichever region it's on.
+    /// Once a reply arrives, `last_recv_derp_region` is set and future
+    /// sends go to that single region.
+    async fn send_via_derp(
+        &self,
+        peer: NodePublic,
+        region: i32,
+        datagram: &[u8],
+    ) -> Result<(), MagicsockError> {
+        if region > 0 {
+            // Known region — send directly.
+            if self
+                .inner
+                .derp
+                .send_packet(region, peer.clone(), datagram.to_vec())
+                .await
+            {
+                if debug_enabled() {
+                    eprintln!(
+                        "DBG derp_send peer={} region={} wg_len={}",
+                        short_key(&peer),
+                        region,
+                        datagram.len()
+                    );
+                }
+                return Ok(());
+            }
+            return Err(MagicsockError::NoPath);
         }
+
+        // Unknown region — fan out to ALL DERP regions (connected + lazily
+        // connected from the DERPMap). This is the bootstrap path: when a
+        // peer's HomeDERP is 0 (not reported by the control plane for
+        // API-only tailnets), we don't know which DERP server the peer is
+        // connected to. Send to all regions so the peer receives the packet
+        // on whichever region it's homed to. Once we get a reply,
+        // `last_recv_derp_region` is set and future sends are targeted.
+        let all_regions: Vec<i32> = {
+            let conns = self
+                .inner
+                .derp
+                .connections
+                .read()
+                .expect("derp connections lock poisoned");
+            let mut regions: Vec<i32> = conns.keys().copied().collect();
+            // Also include regions from the DERPMap that aren't connected yet.
+            if let Some(map) = self
+                .inner
+                .derp
+                .derp_map
+                .read()
+                .expect("derp_map lock poisoned")
+                .as_ref()
+            {
+                for &region_id in map.Regions.keys() {
+                    if !regions.contains(&region_id) {
+                        regions.push(region_id);
+                    }
+                }
+            }
+            regions
+        };
+
+        if debug_enabled() {
+            eprintln!(
+                "DBG derp_fanout peer={} regions={:?} wg_len={}",
+                short_key(&peer),
+                all_regions,
+                datagram.len()
+            );
+        }
+
+        if all_regions.is_empty() {
+            return Err(MagicsockError::NoPath);
+        }
+
+        for r in all_regions {
+            self.inner
+                .derp
+                .send_packet(r, peer.clone(), datagram.to_vec())
+                .await;
+        }
+        Ok(())
     }
 }
 
-/// Launch background UDP and DERP recv tasks. Each task holds an `Arc<Inner>`
-/// clone and dispatches incoming packets to the disco/WG handlers.
-fn spawn_recv_tasks(inner: Arc<Inner>) {
+/// Spawn a DERP recv task that feeds received packets into the WG/disco demux.
+/// This is called for each connection (home + lazy).
+
+/// Launch background UDP recv task + DERP demux task.
+fn spawn_recv_tasks(inner: Arc<Inner>, derp_recv_rx: mpsc::Receiver<(i32, NodePublic, Vec<u8>)>) {
     // UDP recv task.
     if let Some(ref udp) = inner.udp {
         let udp = udp.clone();
@@ -347,16 +687,16 @@ fn spawn_recv_tasks(inner: Arc<Inner>) {
         });
     }
 
-    // DERP recv task.
-    if let Some(ref derp) = inner.derp {
-        let derp = derp.clone();
-        let inner = inner.clone();
-        tokio::spawn(async move {
-            while let Some((source, data)) = derp.try_recv().await {
-                inner.handle_derp_packet(&data, source).await;
-            }
-        });
-    }
+    // DERP demux task: consumes from all DERP region recv consumers and
+    // dispatches to handle_derp_packet. This single task handles packets
+    // from ALL connected regions (home + lazy).
+    let inner2 = inner;
+    tokio::spawn(async move {
+        let mut derp_recv_rx = derp_recv_rx;
+        while let Some((region_id, source, data)) = derp_recv_rx.recv().await {
+            inner2.handle_derp_packet(&data, source, region_id).await;
+        }
+    });
 }
 
 impl Inner {
@@ -368,8 +708,28 @@ impl Inner {
         }
     }
 
-    async fn handle_derp_packet(&self, data: &[u8], source: NodePublic) {
-        if DiscoIo::looks_like_disco(data) {
+    async fn handle_derp_packet(&self, data: &[u8], source: NodePublic, region_id: i32) {
+        // Record the arrival DERP region on the peer's endpoint so future
+        // replies route to this region (Go's derpRoute caching).
+        {
+            let mut endpoints = self.endpoints.write().expect("endpoints lock poisoned");
+            if let Some(ep) = endpoints.get_mut(&source) {
+                ep.set_last_recv_derp_region(region_id);
+            }
+        }
+
+        let is_disco = DiscoIo::looks_like_disco(data);
+        if debug_enabled() {
+            eprintln!(
+                "DBG derp_recv src={} region={} kind={} len={}",
+                short_key(&source),
+                region_id,
+                if is_disco { "disco" } else { "wg" },
+                data.len()
+            );
+        }
+
+        if is_disco {
             self.handle_disco_derp(data, source).await;
         } else {
             // WG datagram via DERP — deliver to caller.
@@ -476,9 +836,19 @@ impl Inner {
             None => return,
         };
 
+        // Look up the peer's DERP send region (last-recv-region > HomeDERP).
+        let derp_region = {
+            let endpoints = self.endpoints.read().expect("endpoints lock poisoned");
+            endpoints
+                .get(&source)
+                .map(|ep| ep.derp_send_region())
+                .unwrap_or(0)
+        };
+
         match msg {
             Message::Ping(ping) => {
-                // Respond with a Pong via DERP.
+                // Respond with a Pong via the peer's DERP region (arrival
+                // region is already recorded by handle_derp_packet).
                 let pong = Message::Pong(Pong {
                     tx_id: ping.tx_id,
                     src: rustscale_disco::AddrPort::new(
@@ -487,9 +857,12 @@ impl Inner {
                     ),
                 });
                 if let Some(reply) = self.disco.seal(&sender_disco, &pong) {
-                    if let Some(ref derp) = self.derp {
-                        derp.send_packet(source, reply).await;
-                    }
+                    let region = if derp_region > 0 {
+                        derp_region
+                    } else {
+                        self.derp.home_region()
+                    };
+                    self.derp.send_packet(region, source, reply).await;
                 }
             }
             Message::Pong(_) => {
@@ -532,6 +905,16 @@ fn random_tx_id() -> [u8; 12] {
     let mut tx = [0u8; 12];
     rand::rngs::OsRng.fill_bytes(&mut tx);
     tx
+}
+
+/// Check if debug tracing is enabled (RUSTSCALE_DEBUG=1).
+fn debug_enabled() -> bool {
+    std::env::var("RUSTSCALE_DEBUG").as_deref() == Ok("1")
+}
+
+/// Short 4-byte hex prefix of a node key for log lines.
+fn short_key(k: &NodePublic) -> String {
+    hex::encode(&k.raw32()[..4])
 }
 
 #[cfg(test)]

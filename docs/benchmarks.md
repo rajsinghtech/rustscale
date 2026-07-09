@@ -139,6 +139,11 @@ target/release/rustscale-bench latency --authkey tskey-... --target 100.64.0.1:5
 | rustscale (after 10d)  | down | 1 | direct | 838.46     | 10s      |
 | tailscaled             | down | 1 | direct | 383.71     | 5s       |
 
+Note: single-run samples on a shared laptop are noisy — independent 10d re-runs
+measured 465–510 Mbps for rustscale throughput (still >tailscaled's 384) while
+latency stayed stable at p50 150–180us. Treat the throughput column as
+indicative until the CI harness produces multi-run medians.
+
 ### Latency
 
 | Tool         | Path   | p50 (us) | p95 (us) | p99 (us) | Count |

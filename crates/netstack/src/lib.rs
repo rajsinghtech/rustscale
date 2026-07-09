@@ -113,11 +113,7 @@ pub struct NetstackStream {
 }
 
 impl NetstackStream {
-    fn new(
-        rx: mpsc::Receiver<Vec<u8>>,
-        tx: mpsc::Sender<Vec<u8>>,
-        notify: Arc<Notify>,
-    ) -> Self {
+    fn new(rx: mpsc::Receiver<Vec<u8>>, tx: mpsc::Sender<Vec<u8>>, notify: Arc<Notify>) -> Self {
         Self {
             rx,
             tx,
@@ -233,7 +229,8 @@ impl Netstack {
         let tx_notify = Arc::new(Notify::new());
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
 
-        let device = LoopbackDevice::new(rx_queue.clone(), tx_queue.clone(), mtu, tx_notify.clone());
+        let device =
+            LoopbackDevice::new(rx_queue.clone(), tx_queue.clone(), mtu, tx_notify.clone());
         tokio::spawn(poll_loop(addr, device, cmd_rx, notify.clone()));
 
         Self {

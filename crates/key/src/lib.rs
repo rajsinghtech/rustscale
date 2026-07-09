@@ -58,8 +58,8 @@ pub(crate) const PRIV_PREFIX: &str = "privkey:";
 /// This is required for NaCl `box` use; WireGuard would clamp internally, but
 /// DERP/box usage demands a clamped scalar. Clamping is idempotent.
 pub(crate) fn clamp25519(b: &mut [u8; KEY_LEN]) {
-    b[0] &= 248;
-    b[31] = (b[31] & 127) | 64;
+    b[0] &= 0xf8;
+    b[31] = (b[31] & 0x7f) | 0x40;
 }
 
 /// Encode a key as `<prefix><hex>` — the typed text form used on the wire.

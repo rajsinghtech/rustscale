@@ -13,7 +13,7 @@ update statuses as phases land.
 | Let's Encrypt certs via control | `ipn/ipnlocal/cert.go` | 🔶 `ControlCertProvider` (cache/refresh/fallback) + `SetDNS` control call done; ACME order client remaining — now e2e-testable (tailnet settings PATCH `httpsEnabled`, see docs/tailnet-testing.md) |
 | WhoIs (peer identity from conn) | `tsnet.Server.WhoIs` | ✅ `Server::whois` + `ts_whois` FFI (UserProfiles from netmap) |
 | Exit node support | LocalBackend/router/magicsock | ⬜ port-5 |
-| Network monitor (netmon) | `net/netmon/` | ⬜ port-3 |
+| Network monitor (netmon) | `net/netmon/` | ✅ port-3 done (AF_ROUTE on macOS, polling fallback; State, ChangeDelta, major/minor change detection, wall-time jump; wired into magicsock link_changed + tsnet endpoint-update push) |
 | Port mapping (NAT-PMP/PCP/UPnP) | `net/portmapper/` | ⬜ port-4 |
 | Health tracking | `health/` | ⬜ port-7 |
 

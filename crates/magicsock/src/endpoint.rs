@@ -232,6 +232,15 @@ impl Endpoint {
         self.pending_pings
             .retain(|_, (sent, _)| now.duration_since(*sent) < max_age);
     }
+
+    /// Reset transient direct-path state after a major link change so disco
+    /// re-probes. Keeps candidates and `home_derp` (from the netmap).
+    pub fn reset_for_link_change(&mut self) {
+        self.best_addr = None;
+        self.pending_pings.clear();
+        self.last_recv_derp_region = 0;
+        self.call_me_maybe_sent = false;
+    }
 }
 
 #[cfg(test)]

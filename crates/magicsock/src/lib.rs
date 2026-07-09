@@ -105,7 +105,7 @@ struct Inner {
     node_public: NodePublic,
     disco: DiscoIo,
     udp: Option<Arc<UdpSocket>>,
-    local_udp_addrs: Vec<String>,
+    local_udp_addrs: RwLock<Vec<String>>,
     /// Multi-region DERP connection manager.
     derp: DerpManager,
     endpoints: RwLock<HashMap<NodePublic, Endpoint>>,
@@ -288,6 +288,20 @@ impl DerpManager {
     fn home_region(&self) -> i32 {
         self.home_region
     }
+
+    /// Close all DERP connections so they reconnect lazily on next use.
+    fn close_all(&self) {
+        let conns: Vec<Arc<DerpIo>> = {
+            let mut conns = self
+                .connections
+                .write()
+                .expect("derp connections lock poisoned");
+            conns.drain().map(|(_, io)| io).collect()
+        };
+        for io in conns {
+            io.close();
+        }
+    }
 }
 
 /// Spawn a task that reads from a DerpIo connection and forwards received
@@ -355,7 +369,7 @@ impl Magicsock {
             node_public,
             disco,
             udp,
-            local_udp_addrs,
+            local_udp_addrs: RwLock::new(local_udp_addrs),
             derp,
             endpoints: RwLock::new(HashMap::new()),
             disco_to_peer: RwLock::new(HashMap::new()),
@@ -383,16 +397,24 @@ impl Magicsock {
     }
 
     /// Our local UDP addresses (for sharing in CallMeMaybe).
-    pub fn local_udp_addrs(&self) -> &[String] {
-        &self.inner.local_udp_addrs
+    pub fn local_udp_addrs(&self) -> Vec<String> {
+        self.inner
+            .local_udp_addrs
+            .read()
+            .expect("local_udp_addrs lock poisoned")
+            .clone()
     }
 
     /// Local interface endpoints (IP:port) to advertise in the MapRequest
     /// `Endpoints` field and in CallMeMaybe. Includes the bound UDP port
     /// paired with each up, non-link-local IPv4 interface address on the
     /// host (plus loopback for same-machine direct paths).
-    pub fn local_endpoints(&self) -> &[String] {
-        &self.inner.local_udp_addrs
+    pub fn local_endpoints(&self) -> Vec<String> {
+        self.inner
+            .local_udp_addrs
+            .read()
+            .expect("local_udp_addrs lock poisoned")
+            .clone()
     }
 
     /// Update the peer set from a netmap. Creates/updates per-peer endpoints,
@@ -503,10 +525,9 @@ impl Magicsock {
                         .is_some_and(endpoint::Endpoint::should_send_call_me_maybe)
                 };
                 if should {
+                    let local_addrs = self.local_udp_addrs();
                     let cmm = Message::CallMeMaybe(CallMeMaybe {
-                        my_number: self
-                            .inner
-                            .local_udp_addrs
+                        my_number: local_addrs
                             .iter()
                             .filter_map(|s| s.parse::<SocketAddr>().ok())
                             .map(rustscale_disco::AddrPort::from)
@@ -603,6 +624,33 @@ impl Magicsock {
             .get(peer)
             .map(|ep| ep.best_path(std::time::Instant::now()).class())
             .unwrap_or_default()
+    }
+
+    /// React to a major link change: re-gather local interface endpoints from
+    /// the bound UDP port, reset all peers' confirmed direct paths (so disco
+    /// re-probes), and close all DERP connections (so they reconnect fresh).
+    pub fn link_changed(&self) {
+        if let Some(ref udp) = self.inner.udp {
+            if let Ok(port) = udp.local_addr().map(|a| a.port()) {
+                let eps = gather_local_endpoints(port);
+                *self
+                    .inner
+                    .local_udp_addrs
+                    .write()
+                    .expect("local_udp_addrs lock poisoned") = eps;
+            }
+        }
+        {
+            let mut endpoints = self
+                .inner
+                .endpoints
+                .write()
+                .expect("endpoints lock poisoned");
+            for ep in endpoints.values_mut() {
+                ep.reset_for_link_change();
+            }
+        }
+        self.inner.derp.close_all();
     }
 
     /// Whether a peer's direct path is still trusted (for testing).

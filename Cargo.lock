@@ -1183,6 +1183,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustscale-netmon"
+version = "0.1.0"
+dependencies = [
+ "if-addrs",
+ "libc",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
 name = "rustscale-netstack"
 version = "0.1.0"
 dependencies = [
@@ -1219,6 +1229,7 @@ dependencies = [
  "rustscale-key",
  "rustscale-magicsock",
  "rustscale-netcheck",
+ "rustscale-netmon",
  "rustscale-netstack",
  "rustscale-tailcfg",
  "rustscale-tun",

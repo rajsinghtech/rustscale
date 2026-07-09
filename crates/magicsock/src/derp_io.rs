@@ -15,10 +15,14 @@ enum DerpCmd {
 ///
 /// Uses `DerpClient::into_split` to separate read and write halves, avoiding
 /// the stream-corruption problem that occurs when `select!` cancels a
-/// `recv()` future mid-read.
+/// `recv()` future mid-read. Stores the reader/writer task handles so
+/// [`DerpIo::close`] can abort them (dropping the socket halves and closing
+/// the connection).
 pub struct DerpIo {
     cmd_tx: mpsc::Sender<DerpCmd>,
     recv_rx: tokio::sync::Mutex<mpsc::Receiver<(NodePublic, Vec<u8>)>>,
+    reader_task: tokio::task::JoinHandle<()>,
+    writer_task: tokio::task::JoinHandle<()>,
 }
 
 impl DerpIo {
@@ -31,7 +35,7 @@ impl DerpIo {
         let (recv_tx, recv_rx) = mpsc::channel(128);
 
         // Writer task: processes send commands.
-        tokio::spawn(async move {
+        let writer_task = tokio::spawn(async move {
             let mut writer = write_half;
             while let Some(cmd) = cmd_rx.recv().await {
                 match cmd {
@@ -56,7 +60,7 @@ impl DerpIo {
         });
 
         // Reader task: reads frames and forwards ReceivedPackets.
-        tokio::spawn(async move {
+        let reader_task = tokio::spawn(async move {
             let mut reader = read_half;
             loop {
                 let mut header = [0u8; rustscale_derp::FRAME_HEADER_LEN];
@@ -92,7 +96,18 @@ impl DerpIo {
         Self {
             cmd_tx,
             recv_rx: tokio::sync::Mutex::new(recv_rx),
+            reader_task,
+            writer_task,
         }
+    }
+
+    /// Abort the reader and writer tasks, closing the DERP connection.
+    /// Aborting drops the half-owned TCP read/write halves, which closes
+    /// the underlying connection. The reader task's `recv_tx` is dropped,
+    /// so the consumer task's `try_recv` returns `None` and it exits.
+    pub fn close(&self) {
+        self.reader_task.abort();
+        self.writer_task.abort();
     }
 
     /// Send a data packet to `dst` via DERP.

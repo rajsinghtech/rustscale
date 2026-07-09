@@ -52,7 +52,7 @@ use rustscale_controlclient::controlhttp;
 use rustscale_derp::DerpClient;
 use rustscale_dns::{upstream_nameservers, DnsResponder, MagicDnsResolver, MAGICDNS_VIP};
 use rustscale_filter::Filter;
-use rustscale_key::{NodePrivate, NodePublic};
+use rustscale_key::{DiscoPrivate, MachinePrivate, MachinePublic, NodePrivate, NodePublic};
 use rustscale_magicsock::{Magicsock, MagicsockConfig, MagicsockError};
 use rustscale_netstack::{Netstack, NetstackError, NetstackStream, DEFAULT_MTU};
 use rustscale_tailcfg::{
@@ -225,6 +225,8 @@ struct RunningState {
     dns_config: Arc<RwLock<Option<DNSConfig>>>,
     /// User profiles keyed by `UserID` (for WhoIs).
     user_profiles: Arc<RwLock<BTreeMap<UserID, UserProfile>>>,
+    /// Network change monitor handle (None if the monitor couldn't start).
+    monitor: Option<rustscale_netmon::MonitorHandle>,
 }
 
 /// Which data plane is wired up: userspace netstack (tsnet listen/dial) or a
@@ -294,6 +296,22 @@ struct Bootstrap {
     dns_config: Arc<RwLock<Option<DNSConfig>>>,
     /// User profiles keyed by UserID.
     user_profiles: Arc<RwLock<BTreeMap<UserID, UserProfile>>>,
+    /// Machine private key (for link-change endpoint updates).
+    machine_key: MachinePrivate,
+    /// Server (control) public key (for link-change endpoint updates).
+    server_pub_key: MachinePublic,
+    /// Disco private key (for link-change endpoint updates).
+    disco_key: DiscoPrivate,
+    /// Control-plane URL (for link-change endpoint updates).
+    control_url: String,
+    /// Hostname (for link-change endpoint updates).
+    hostname: String,
+    /// Advertised subnet routes (for link-change endpoint updates).
+    advertise_routes: Vec<String>,
+    /// Bound UDP port (for link-change endpoint re-gathering).
+    udp_port: u16,
+    /// DERP map (for link-change re-STUN).
+    derp_map: DERPMap,
 }
 
 /// An embedded Tailscale server.
@@ -330,6 +348,20 @@ impl Server {
         ensure_ring_provider();
 
         let b = self.bootstrap().await?;
+
+        let monitor = spawn_link_monitor(
+            b.magicsock.clone(),
+            b.cancel.clone(),
+            b.control_url.clone(),
+            b.machine_key.clone(),
+            b.server_pub_key.clone(),
+            b.node_key.clone(),
+            b.disco_key.clone(),
+            b.udp_port,
+            b.hostname.clone(),
+            b.advertise_routes.clone(),
+            b.derp_map.clone(),
+        );
 
         // Userspace netstack bound to our tailnet IPv4.
         let netstack = Arc::new(Netstack::new(b.our_v4, DEFAULT_MTU));
@@ -394,6 +426,7 @@ impl Server {
             our_fqdn: b.our_fqdn,
             dns_config: b.dns_config,
             user_profiles: b.user_profiles,
+            monitor,
         });
         Ok(())
     }
@@ -415,6 +448,20 @@ impl Server {
         ensure_ring_provider();
 
         let b = self.bootstrap().await?;
+
+        let monitor = spawn_link_monitor(
+            b.magicsock.clone(),
+            b.cancel.clone(),
+            b.control_url.clone(),
+            b.machine_key.clone(),
+            b.server_pub_key.clone(),
+            b.node_key.clone(),
+            b.disco_key.clone(),
+            b.udp_port,
+            b.hostname.clone(),
+            b.advertise_routes.clone(),
+            b.derp_map.clone(),
+        );
 
         // Real TUN device.
         let tun: Arc<dyn Tun> = {
@@ -481,6 +528,7 @@ impl Server {
             our_fqdn: b.our_fqdn,
             dns_config: b.dns_config,
             user_profiles: b.user_profiles,
+            monitor,
         });
         Ok(())
     }
@@ -619,7 +667,7 @@ impl Server {
         let cc2 = ControlClient::new(
             self.config.control_url.clone(),
             state.machine_key.clone(),
-            server_pub_key,
+            server_pub_key.clone(),
             PROTOCOL_VERSION,
         );
         let map_task = tokio::spawn(async move {
@@ -781,6 +829,14 @@ impl Server {
             our_fqdn,
             dns_config,
             user_profiles,
+            machine_key: state.machine_key.clone(),
+            server_pub_key,
+            disco_key: state.disco_key.clone(),
+            control_url: self.config.control_url.clone(),
+            hostname: self.config.hostname.clone(),
+            advertise_routes: self.config.advertise_routes.clone(),
+            udp_port,
+            derp_map,
         })
     }
 
@@ -980,8 +1036,11 @@ impl Server {
 
     /// Shut down the server.
     pub async fn close(&mut self) {
-        if let Some(inner) = self.inner.take() {
+        if let Some(mut inner) = self.inner.take() {
             inner.cancel.cancel();
+            if let Some(m) = inner.monitor.take() {
+                m.shutdown();
+            }
             let mut tasks = inner.tasks.lock().await;
             for task in tasks.drain(..) {
                 task.abort();
@@ -1494,6 +1553,90 @@ fn whois_lookup(
         }
     }
     None
+}
+
+/// Spawn the network change monitor. On a major link change (interface IP
+/// change, up/down transition, or wall-clock time jump), re-gathers local
+/// endpoints, resets peer direct paths, closes DERP connections, re-STUNs,
+/// and pushes a lightweight non-streaming MapRequest to the control plane.
+fn spawn_link_monitor(
+    magicsock: Arc<Magicsock>,
+    cancel: Arc<CancelToken>,
+    control_url: String,
+    machine_key: MachinePrivate,
+    server_pub_key: MachinePublic,
+    node_key: NodePrivate,
+    disco_key: DiscoPrivate,
+    udp_port: u16,
+    hostname: String,
+    advertise_routes: Vec<String>,
+    derp_map: DERPMap,
+) -> Option<rustscale_netmon::MonitorHandle> {
+    let monitor = rustscale_netmon::Monitor::new().ok()?;
+
+    let handle = monitor.start(move |delta| {
+        let magicsock = magicsock.clone();
+        let cancel = cancel.clone();
+        let control_url = control_url.clone();
+        let machine_key = machine_key.clone();
+        let server_pub_key = server_pub_key.clone();
+        let node_key = node_key.clone();
+        let disco_key = disco_key.clone();
+        let hostname = hostname.clone();
+        let advertise_routes = advertise_routes.clone();
+        let derp_map = derp_map.clone();
+        async move {
+            if !delta.major {
+                return;
+            }
+            if cancel.is_cancelled() {
+                return;
+            }
+            eprintln!(
+                "tsnet: major link change detected; re-gathering endpoints + re-STUN (udp_port={udp_port})"
+            );
+
+            magicsock.link_changed();
+
+            let mut eps = magicsock.local_endpoints();
+            if !derp_map.Regions.is_empty() {
+                if let Ok(report) = rustscale_netcheck::Prober
+                    .run(&derp_map, &rustscale_netcheck::ProberOpts::default())
+                    .await
+                {
+                    if let Some(g) = report.global_v4 {
+                        eps.push(g.to_string());
+                    }
+                }
+            }
+
+            let node_pub = node_key.public();
+            let disco_pub = disco_key.public();
+            let req = MapRequest {
+                Version: CAPABILITY_VERSION,
+                KeepAlive: false,
+                NodeKey: node_pub,
+                DiscoKey: disco_pub,
+                Stream: false,
+                OmitPeers: true,
+                Endpoints: eps,
+                Hostinfo: Some(Hostinfo {
+                    OS: std::env::consts::OS.into(),
+                    Hostname: hostname,
+                    RoutableIPs: advertise_routes,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let cc = ControlClient::new(&control_url, machine_key, server_pub_key, PROTOCOL_VERSION);
+            match cc.fetch_map(&req).await {
+                Ok(_) => eprintln!("tsnet: link-change endpoint update sent"),
+                Err(e) => eprintln!("tsnet: link-change endpoint update failed (non-fatal): {e}"),
+            }
+        }
+    });
+
+    Some(handle)
 }
 
 async fn connect_home_derp(

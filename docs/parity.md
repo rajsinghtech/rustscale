@@ -15,7 +15,7 @@ update statuses as phases land.
 | Exit node support | LocalBackend/router/magicsock | ✅ port-5 done (advertise_exit_node builder opt adds 0.0.0.0/0+::/0 to RoutableIPs + filter localNets; Server::set_exit_node/clear_exit_node resolve exit-capable peer via IP/hostname + set RouteTable catch-all; TUN mode --exit-node installs /1 split routes on macOS, best-effort default on Linux; ts_set_exit_node/ts_clear_exit_node FFI; bypass routes for DERP/control in TUN+exit mode still ⬜ known limitation) |
 | Network monitor (netmon) | `net/netmon/` | ✅ port-3 done (AF_ROUTE on macOS, polling fallback; State, ChangeDelta, major/minor change detection, wall-time jump; wired into magicsock link_changed + tsnet endpoint-update push) |
 | Port mapping (NAT-PMP/PCP/UPnP) | `net/portmapper/` | ✅ port-4 done (`crates/portmapper`: Client facade with probe/create/renew/cache lifecycle; PMP/PCP byte-exact packet codec with RFC test vectors; UPnP SSDP M-SEARCH discovery + root-desc XML parse + AddPortMapping/DeletePortMapping/GetExternalIPAddress SOAP; fake IGD tests for all three protocols; magicsock publishes portmap endpoint best-effort alongside local/STUN endpoints; netcheck Report gains portmap capability booleans) |
-| Health tracking | `health/` | ⬜ port-7 |
+| Health tracking | `health/` | ✅ port-7: crates/health Tracker + watchdog, wired control/DERP/certs/netmon, ServerStatus.health + FFI |
 
 ## Tier 2: Production features
 
@@ -23,7 +23,7 @@ update statuses as phases land.
 | --- | --- | --- |
 | Serve/Funnel (ListenFunnel, ServeConfig, TCP fwd, reverse proxy) | `tsnet`, `ipn/serve*` | ✅ port-6 done (ServeConfig serde model: TCPPortHandler/WebServerConfig/HTTPHandler; Server::set_serve_config starts netstack listeners per port; TCP forward via copy_bidirectional; HTTP reverse proxy sets Host/X-Forwarded-For/Tailscale-User-Login/Name from WhoIs; static text handler; TLS-terminate with ControlCertProvider (self-signed fallback); listen_funnel validates port 443/8443/10000 + funnel node attr from netmap, returns typed FunnelError::NotEnabled on API-only tailnets; ts_serve_tcp FFI. Remaining: ingress peer Tailscale-Ingress-Target dispatch, Hostinfo.IngressEnabled advertisement) |
 | Tailscale Services (ListenService, PROXY protocol) | `tsnet.Server.ListenService` | ⬜ |
-| SOCKS5 proxy | `net/socks5/` | ⬜ port-8 |
+| SOCKS5 proxy | `net/socks5/` | ✅ port-8: RFC 1928 CONNECT (v4/domain/v6), dials via shared tsnet resolve path, FFI; e2e green |
 | LocalAPI | `ipn/localapi/` | ⬜ port-9 |
 | Auto-update / ClientVersion | — | ⬜ |
 | Multi-profile/login management | `ipn/ipnlocal/profiles.go` | ⬜ (single profile only) |

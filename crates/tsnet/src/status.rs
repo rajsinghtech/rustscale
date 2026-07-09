@@ -2,6 +2,7 @@
 
 use std::net::IpAddr;
 
+use rustscale_health::Warning;
 use rustscale_key::NodePublic;
 use rustscale_magicsock::PathClass;
 
@@ -33,6 +34,8 @@ pub struct ServerStatus {
     pub hostname: String,
     /// Number of packets dropped by the packet filter.
     pub packet_drops: u64,
+    /// Active health warnings (id, severity, text, since).
+    pub health: Vec<Warning>,
 }
 
 /// Identity of the peer owning a tailnet IP, returned by [`Server::whois`].

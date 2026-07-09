@@ -23,6 +23,7 @@ rustscale-filter = { path = "../filter", version = "0.1.0" }
 rustscale-dns = { path = "../dns", version = "0.1.0" }
 rustscale-netmon = { path = "../netmon", version = "0.1.0" }
 rustscale-portmapper = { path = "../portmapper", version = "0.1.0" }
+rustscale-health = { path = "../health", version = "0.1.0" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

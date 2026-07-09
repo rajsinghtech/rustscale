@@ -62,6 +62,64 @@ fn builder_sets_ephemeral_flag() {
 }
 
 // ---------------------------------------------------------------------------
+// Health → ServerStatus integration tests (not ignored)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn status_empty_health_when_not_up() {
+    let server = Server::builder()
+        .hostname("x")
+        .auth_key("k")
+        .build()
+        .unwrap();
+    let st = server.status();
+    assert!(!st.up);
+    assert!(st.health.is_empty(), "health should be empty when not up");
+}
+
+#[test]
+fn health_warning_appears_in_status() {
+    // We can't construct a full RunningState easily, so test the
+    // health→status wiring directly: a Tracker's current_warnings()
+    // feeds ServerStatus.health, exactly as Server::status() does.
+    let tracker = rustscale_health::Tracker::new();
+    tracker.set_unhealthy(
+        rustscale_health::WARN_DERP_HOME,
+        "derp home region 5 unreachable",
+    );
+    tracker.set_unhealthy(rustscale_health::WARN_CONTROL, "control connection lost");
+
+    let warnings = tracker.current_warnings();
+    let status = ServerStatus {
+        up: true,
+        tailscale_ips: vec![],
+        peer_count: 0,
+        peers: vec![],
+        hostname: "test".into(),
+        packet_drops: 0,
+        health: warnings,
+    };
+
+    assert_eq!(status.health.len(), 2);
+    // High severity (control) should sort before Medium (derp).
+    assert_eq!(status.health[0].id, rustscale_health::WARN_CONTROL);
+    assert_eq!(status.health[0].severity, rustscale_health::Severity::High);
+    assert_eq!(status.health[0].text, "control connection lost");
+    assert_eq!(status.health[1].id, rustscale_health::WARN_DERP_HOME);
+    assert_eq!(
+        status.health[1].severity,
+        rustscale_health::Severity::Medium
+    );
+    assert_eq!(status.health[1].text, "derp home region 5 unreachable");
+
+    // Clearing one warning reduces the count.
+    tracker.set_healthy(rustscale_health::WARN_CONTROL);
+    let cleared = tracker.current_warnings();
+    assert_eq!(cleared.len(), 1);
+    assert_eq!(cleared[0].id, rustscale_health::WARN_DERP_HOME);
+}
+
+// ---------------------------------------------------------------------------
 // Hostname resolution tests (not ignored)
 // ---------------------------------------------------------------------------
 

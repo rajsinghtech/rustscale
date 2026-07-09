@@ -424,6 +424,11 @@ fn status_to_json(st: &rustscale_tsnet::ServerStatus) -> serde_json::Value {
             })
         })
         .collect();
+    let health: Vec<serde_json::Value> = st
+        .health
+        .iter()
+        .map(|w| serde_json::to_value(w).unwrap_or_else(|_| serde_json::json!({"id": w.id})))
+        .collect();
     serde_json::json!({
         "up": st.up,
         "hostname": st.hostname,
@@ -431,6 +436,7 @@ fn status_to_json(st: &rustscale_tsnet::ServerStatus) -> serde_json::Value {
         "peer_count": st.peer_count,
         "peers": peers,
         "packet_drops": st.packet_drops,
+        "health": health,
     })
 }
 

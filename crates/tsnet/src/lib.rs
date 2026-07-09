@@ -36,6 +36,7 @@ mod status;
 mod tls;
 
 pub use routing::{peer_is_exit_capable, RouteTable};
+pub use rustscale_health::Warning;
 pub use serve::{
     check_funnel_access, check_funnel_port, FunnelError, HTTPHandler, HostPort, ServeConfig,
     ServeError, TCPPortHandler, WebServerConfig, FUNNEL_PORTS,
@@ -58,6 +59,10 @@ use rustscale_controlclient::controlhttp;
 use rustscale_derp::DerpClient;
 use rustscale_dns::{upstream_nameservers, DnsResponder, MagicDnsResolver, MAGICDNS_VIP};
 use rustscale_filter::Filter;
+use rustscale_health::{
+    Severity, Tracker, Watchdog, WARN_CERT_FALLBACK, WARN_CONTROL, WARN_DERP_HOME,
+    WARN_NETMON_CHANGE,
+};
 use rustscale_key::{DiscoPrivate, MachinePrivate, MachinePublic, NodePrivate, NodePublic};
 use rustscale_magicsock::{Magicsock, MagicsockConfig, MagicsockError};
 use rustscale_netstack::{Netstack, NetstackError, NetstackStream, DEFAULT_MTU};
@@ -291,6 +296,10 @@ struct RunningState {
     node_key: NodePrivate,
     /// Serve/Funnel runner (None in TUN mode — serve requires netstack).
     serve: Option<Arc<serve::ServeRunner>>,
+    /// Health tracker (shared with all subsystems).
+    health: Tracker,
+    /// Map-poll staleness watchdog (fires if no MapResponse for >3 min).
+    health_watchdog: Watchdog,
 }
 
 /// Which data plane is wired up: userspace netstack (tsnet listen/dial) or a
@@ -400,6 +409,10 @@ struct Bootstrap {
     udp_port: u16,
     /// DERP map (for link-change re-STUN).
     derp_map: DERPMap,
+    /// Health tracker (shared with all subsystems).
+    health: Tracker,
+    /// Map-poll staleness watchdog (fires if no MapResponse for >3 min).
+    health_watchdog: Watchdog,
 }
 
 /// An embedded Tailscale server.
@@ -421,6 +434,13 @@ impl Server {
     /// Whether the server is up.
     pub fn is_up(&self) -> bool {
         self.inner.is_some()
+    }
+
+    /// The shared health tracker, if the server is up. Callers can report
+    /// custom warnable conditions via [`Tracker::set_unhealthy`] using the
+    /// built-in warnable IDs or their own registered codes.
+    pub fn health(&self) -> Option<Tracker> {
+        self.inner.as_ref().map(|i| i.health.clone())
     }
 
     /// Bring the server online in userspace netstack mode (tsnet listen/dial).
@@ -449,6 +469,7 @@ impl Server {
             b.hostname.clone(),
             b.advertise_routes.clone(),
             b.derp_map.clone(),
+            b.health.clone(),
         );
 
         // Userspace netstack bound to our tailnet IPv4.
@@ -481,6 +502,8 @@ impl Server {
             b.dns_config.clone(),
             b.user_profiles.clone(),
             b.cancel.clone(),
+            b.health.clone(),
+            b.health_watchdog.clone(),
         );
 
         // MagicDNS responder: best-effort UDP server at 100.100.100.100:53.
@@ -527,6 +550,8 @@ impl Server {
             server_pub_key: b.server_pub_key,
             node_key: b.node_key,
             serve,
+            health: b.health,
+            health_watchdog: b.health_watchdog,
         });
         Ok(())
     }
@@ -572,6 +597,7 @@ impl Server {
             b.hostname.clone(),
             b.advertise_routes.clone(),
             b.derp_map.clone(),
+            b.health.clone(),
         );
 
         // Real TUN device.
@@ -631,6 +657,8 @@ impl Server {
             b.dns_config.clone(),
             b.user_profiles.clone(),
             b.cancel.clone(),
+            b.health.clone(),
+            b.health_watchdog.clone(),
         );
 
         self.inner = Some(RunningState {
@@ -651,6 +679,8 @@ impl Server {
             server_pub_key: b.server_pub_key,
             node_key: b.node_key,
             serve: None,
+            health: b.health,
+            health_watchdog: b.health_watchdog,
         });
         Ok(())
     }
@@ -668,6 +698,18 @@ impl Server {
         // is enabled. Used for Hostinfo.RoutableIPs, the filter's localNets,
         // and link-change endpoint updates.
         let advertise = self.config.effective_advertise_routes();
+
+        // Health tracker + map-poll staleness watchdog (fires if no
+        // MapResponse for more than 3 minutes).
+        let health = Tracker::new();
+        let health_watchdog = Watchdog::new(
+            health.clone(),
+            WARN_CONTROL,
+            "Control connection",
+            Severity::High,
+            "control connection lost: no map activity for over 3 minutes",
+            std::time::Duration::from_secs(180),
+        );
 
         // 1. Load or generate persistent state.
         let mut state = self.load_or_create_state()?;
@@ -861,10 +903,15 @@ impl Server {
         let derp_client = match connect_home_derp(&derp_map, home_derp, &state.node_key).await {
             Ok(c) => {
                 eprintln!("tsnet: DERP connected to region {home_derp}");
+                health.set_healthy(WARN_DERP_HOME);
                 Some(c)
             }
             Err(e) => {
                 eprintln!("tsnet: DERP connection to region {home_derp} failed: {e}");
+                health.set_unhealthy(
+                    WARN_DERP_HOME,
+                    format!("derp home region {home_derp} unreachable: {e}"),
+                );
                 None
             }
         };
@@ -882,6 +929,7 @@ impl Server {
                 udp_bind: None,
                 udp_socket: Some(udp_socket),
                 portmapper: Some(portmapper),
+                health: Some(health.clone()),
             })
             .await?,
         );
@@ -978,6 +1026,8 @@ impl Server {
             advertise_routes: advertise,
             udp_port,
             derp_map,
+            health,
+            health_watchdog,
         })
     }
 
@@ -991,6 +1041,7 @@ impl Server {
                 peers: vec![],
                 hostname: self.config.hostname.clone(),
                 packet_drops: 0,
+                health: vec![],
             };
         };
         let peers: Vec<PeerInfo> = inner
@@ -1018,6 +1069,7 @@ impl Server {
             peers,
             hostname: self.config.hostname.clone(),
             packet_drops,
+            health: inner.health.current_warnings(),
         }
     }
 
@@ -1046,9 +1098,16 @@ impl Server {
     pub async fn listen_tls(&self, port: u16) -> Result<TlsListener, TsnetError> {
         let inner = self.inner.as_ref().ok_or(TsnetError::NotUp)?;
         let provider = match self.control_cert_provider().await {
-            Ok(p) => p,
+            Ok(p) => {
+                inner.health.set_healthy(WARN_CERT_FALLBACK);
+                p
+            }
             Err(e) => {
                 eprintln!("tsnet: control cert unavailable ({e}); using self-signed");
+                inner.health.set_unhealthy(
+                    WARN_CERT_FALLBACK,
+                    format!("serving self-signed fallback: {e}"),
+                );
                 tls::default_cert_provider(&inner.tailscale_ips)
             }
         };
@@ -1094,11 +1153,10 @@ impl Server {
             CAPABILITY_VERSION,
             PROTOCOL_VERSION,
         ));
-        let prov = Arc::new(ControlCertProvider::new(
-            state_dir,
-            &inner.our_fqdn,
-            fetcher,
-        ));
+        let prov = Arc::new(
+            ControlCertProvider::new(state_dir, &inner.our_fqdn, fetcher)
+                .with_health(inner.health.clone()),
+        );
         prov.refresh().await?;
         Ok(prov)
     }
@@ -1248,9 +1306,16 @@ impl Server {
             .any(|h| h.HTTPS || !h.TerminateTLS.is_empty());
         let cert = if needs_tls {
             match self.control_cert_provider().await {
-                Ok(p) => Some(p),
+                Ok(p) => {
+                    inner.health.set_healthy(WARN_CERT_FALLBACK);
+                    Some(p)
+                }
                 Err(e) => {
                     eprintln!("tsnet: serve cert unavailable ({e}); using self-signed");
+                    inner.health.set_unhealthy(
+                        WARN_CERT_FALLBACK,
+                        format!("serving self-signed fallback: {e}"),
+                    );
                     Some(tls::default_cert_provider(&inner.tailscale_ips))
                 }
             }
@@ -1301,9 +1366,16 @@ impl Server {
 
         // Provision a cert (LE via control, self-signed fallback).
         let provider = match self.control_cert_provider().await {
-            Ok(p) => p,
+            Ok(p) => {
+                inner.health.set_healthy(WARN_CERT_FALLBACK);
+                p
+            }
             Err(e) => {
                 eprintln!("tsnet: funnel cert unavailable ({e}); using self-signed");
+                inner.health.set_unhealthy(
+                    WARN_CERT_FALLBACK,
+                    format!("serving self-signed fallback: {e}"),
+                );
                 tls::default_cert_provider(&inner.tailscale_ips)
             }
         };
@@ -1362,6 +1434,7 @@ impl Server {
                 serve.stop().await;
             }
             inner.cancel.cancel();
+            inner.health_watchdog.stop();
             if let Some(m) = inner.monitor.take() {
                 m.shutdown();
             }
@@ -1621,6 +1694,8 @@ fn spawn_map_update_task(
     dns_config: Arc<RwLock<Option<DNSConfig>>>,
     user_profiles: Arc<RwLock<BTreeMap<UserID, UserProfile>>>,
     cancel: Arc<CancelToken>,
+    health: Tracker,
+    health_watchdog: Watchdog,
 ) -> JoinHandle<()> {
     let mut named_filters: BTreeMap<String, Vec<FilterRule>> = BTreeMap::new();
     tokio::spawn(async move {
@@ -1630,6 +1705,11 @@ fn spawn_map_update_task(
             }
             match map_rx.recv().await {
                 Some(Ok(resp)) => {
+                    // Map activity: feed the staleness watchdog + mark control
+                    // healthy. Even keep-alive messages count as activity.
+                    health_watchdog.feed();
+                    health.set_healthy(WARN_CONTROL);
+
                     if resp.KeepAlive {
                         continue;
                     }
@@ -1713,7 +1793,14 @@ fn spawn_map_update_task(
                         );
                     }
                 }
-                Some(Err(_)) | None => break,
+                Some(Err(e)) => {
+                    health.set_unhealthy(WARN_CONTROL, format!("control connection lost: {e}"));
+                    break;
+                }
+                None => {
+                    health.set_unhealthy(WARN_CONTROL, "control connection lost: stream closed");
+                    break;
+                }
             }
         }
     })
@@ -1895,6 +1982,7 @@ fn spawn_link_monitor(
     hostname: String,
     advertise_routes: Vec<String>,
     derp_map: DERPMap,
+    health: Tracker,
 ) -> Option<rustscale_netmon::MonitorHandle> {
     let monitor = rustscale_netmon::Monitor::new().ok()?;
 
@@ -1909,6 +1997,7 @@ fn spawn_link_monitor(
         let hostname = hostname.clone();
         let advertise_routes = advertise_routes.clone();
         let derp_map = derp_map.clone();
+        let health = health.clone();
         async move {
             if !delta.major {
                 return;
@@ -1919,6 +2008,9 @@ fn spawn_link_monitor(
             eprintln!(
                 "tsnet: major link change detected; re-gathering endpoints + re-STUN (udp_port={udp_port})"
             );
+
+            // Transient health warning while re-probing.
+            health.set_unhealthy(WARN_NETMON_CHANGE, "network changed, re-probing");
 
             magicsock.link_changed();
 
@@ -1954,7 +2046,11 @@ fn spawn_link_monitor(
             };
             let cc = ControlClient::new(&control_url, machine_key, server_pub_key, PROTOCOL_VERSION);
             match cc.fetch_map(&req).await {
-                Ok(_) => eprintln!("tsnet: link-change endpoint update sent"),
+                Ok(_) => {
+                    eprintln!("tsnet: link-change endpoint update sent");
+                    // Endpoints re-published: clear the transient warning.
+                    health.set_healthy(WARN_NETMON_CHANGE);
+                }
                 Err(e) => eprintln!("tsnet: link-change endpoint update failed (non-fatal): {e}"),
             }
         }

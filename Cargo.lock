@@ -1274,6 +1274,7 @@ name = "rustscale-ffi"
 version = "0.1.0"
 dependencies = [
  "cbindgen",
+ "rustscale-health",
  "rustscale-netstack",
  "rustscale-tsnet",
  "serde",
@@ -1287,6 +1288,15 @@ version = "0.1.0"
 dependencies = [
  "rustscale-tailcfg",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "rustscale-health"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "tokio",
 ]
 
 [[package]]
@@ -1312,6 +1322,7 @@ dependencies = [
  "rand",
  "rustscale-derp",
  "rustscale-disco",
+ "rustscale-health",
  "rustscale-key",
  "rustscale-portmapper",
  "rustscale-tailcfg",
@@ -1387,6 +1398,7 @@ dependencies = [
  "rustscale-derp",
  "rustscale-dns",
  "rustscale-filter",
+ "rustscale-health",
  "rustscale-key",
  "rustscale-magicsock",
  "rustscale-netcheck",

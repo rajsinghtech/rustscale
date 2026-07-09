@@ -1,0 +1,15 @@
+[package]
+name = "rustscale-health"
+description = "Health tracking for rustscale: registered warnables, severity, watchdogs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+chrono.workspace = true
+tokio.workspace = true

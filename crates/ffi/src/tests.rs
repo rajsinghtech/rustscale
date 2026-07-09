@@ -41,6 +41,44 @@ fn multiple_servers_coexist() {
 }
 
 // ---------------------------------------------------------------------------
+// status_to_json health array
+// ---------------------------------------------------------------------------
+
+#[test]
+fn status_to_json_includes_health() {
+    let tracker = rustscale_health::Tracker::new();
+    tracker.set_unhealthy(
+        rustscale_health::WARN_DERP_HOME,
+        "derp home region 3 unreachable",
+    );
+    let st = rustscale_tsnet::ServerStatus {
+        up: true,
+        tailscale_ips: vec![],
+        peer_count: 0,
+        peers: vec![],
+        hostname: "h".into(),
+        packet_drops: 0,
+        health: tracker.current_warnings(),
+    };
+    let json = status_to_json(&st);
+    let health = json.get("health").expect("health array present");
+    let arr = health.as_array().expect("health is array");
+    assert_eq!(arr.len(), 1);
+    assert_eq!(
+        arr[0].get("id").and_then(|v| v.as_str()),
+        Some("derp-home-unreachable")
+    );
+    assert_eq!(
+        arr[0].get("text").and_then(|v| v.as_str()),
+        Some("derp home region 3 unreachable")
+    );
+    assert_eq!(
+        arr[0].get("severity").and_then(|v| v.as_str()),
+        Some("Medium")
+    );
+}
+
+// ---------------------------------------------------------------------------
 // ts_set_* error paths
 // ---------------------------------------------------------------------------
 

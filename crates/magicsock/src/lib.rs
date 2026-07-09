@@ -90,6 +90,9 @@ pub struct MagicsockConfig {
     /// local/STUN endpoints. Best-effort: never blocks or fails endpoint
     /// gathering if no portmapper is present.
     pub portmapper: Option<rustscale_portmapper::Client>,
+    /// Optional health tracker. When provided, magicsock reports DERP home
+    /// region connection state (healthy on connect, unhealthy on failure).
+    pub health: Option<rustscale_health::Tracker>,
 }
 
 /// A received WG datagram with its sender identified.
@@ -135,12 +138,14 @@ struct DerpManager {
     derp_map: RwLock<Option<DERPMap>>,
     /// Our node private key (needed to establish new DERP connections).
     node_private: NodePrivate,
-    /// Our home DERP region (for diagnostics).
+    /// Our home DERP region (for diagnostics + health reporting).
     home_region: i32,
     /// Channel for DERP recv tasks to forward received packets to the main
     /// demux loop. Each lazy connection spawns a recv task that sends to
     /// this channel.
     derp_recv_tx: mpsc::Sender<(i32, NodePublic, Vec<u8>)>,
+    /// Optional health tracker for reporting DERP home reachability.
+    health: Option<rustscale_health::Tracker>,
 }
 
 impl DerpManager {
@@ -149,6 +154,7 @@ impl DerpManager {
         derp_map: Option<DERPMap>,
         node_private: NodePrivate,
         home_region: i32,
+        health: Option<rustscale_health::Tracker>,
     ) -> (Self, mpsc::Receiver<(i32, NodePublic, Vec<u8>)>) {
         let (derp_recv_tx, derp_recv_rx) = mpsc::channel(256);
 
@@ -168,6 +174,7 @@ impl DerpManager {
             node_private,
             home_region,
             derp_recv_tx,
+            health,
         };
 
         (mgr, derp_recv_rx)
@@ -234,12 +241,28 @@ impl DerpManager {
                 if debug_enabled() {
                     eprintln!("DBG derp_connect region={region_id} FAILED: {e}");
                 }
+                // Report DERP home unreachability for the home region.
+                if region_id == self.home_region {
+                    if let Some(ref health) = self.health {
+                        health.set_unhealthy(
+                            rustscale_health::WARN_DERP_HOME,
+                            format!("derp home region {region_id} unreachable: {e}"),
+                        );
+                    }
+                }
                 return None;
             }
         };
 
         if debug_enabled() {
             eprintln!("DBG derp_connect region={region_id} OK");
+        }
+
+        // Report DERP home healthy on successful (re)connect.
+        if region_id == self.home_region {
+            if let Some(ref health) = self.health {
+                health.set_healthy(rustscale_health::WARN_DERP_HOME);
+            }
         }
 
         let io = Arc::new(DerpIo::spawn(client));
@@ -370,6 +393,7 @@ impl Magicsock {
             config.derp_map,
             config.private_key.clone(),
             config.home_derp_region,
+            config.health.clone(),
         );
 
         let inner = Arc::new(Inner {

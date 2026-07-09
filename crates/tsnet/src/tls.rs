@@ -384,6 +384,8 @@ pub struct ControlCertProvider {
     domain: String,
     fetcher: Arc<dyn CertFetcher>,
     material: Mutex<Option<CertMaterial>>,
+    /// Optional health tracker for reporting stale-cache fallback.
+    health: Option<rustscale_health::Tracker>,
 }
 
 impl ControlCertProvider {
@@ -399,7 +401,15 @@ impl ControlCertProvider {
             domain: domain.into().trim_end_matches('.').to_string(),
             fetcher,
             material: Mutex::new(None),
+            health: None,
         }
+    }
+
+    /// Attach a health tracker so the provider can report when it serves a
+    /// stale cached cert (fetch failure but cache still valid).
+    pub fn with_health(mut self, health: rustscale_health::Tracker) -> Self {
+        self.health = Some(health);
+        self
     }
 
     /// Load from cache or fetch fresh material. Refreshes when the cached
@@ -426,6 +436,16 @@ impl ControlCertProvider {
                 // have one (stale-but-usable); otherwise propagate the error.
                 if let Some(cached) = self.load_cached()? {
                     if cached.not_after > Utc::now() {
+                        eprintln!(
+                            "tsnet: cert fetch failed ({e}); serving stale cache for {}",
+                            self.domain
+                        );
+                        if let Some(ref health) = self.health {
+                            health.set_unhealthy(
+                                rustscale_health::WARN_CERT_FALLBACK,
+                                format!("serving stale cached cert: {e}"),
+                            );
+                        }
                         *self.material.lock().expect("cert material mutex") = Some(cached);
                         return Ok(());
                     }

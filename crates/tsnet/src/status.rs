@@ -5,19 +5,6 @@ use std::net::IpAddr;
 use rustscale_key::NodePublic;
 use rustscale_magicsock::PathClass;
 
-/// A snapshot of the server's state after `up()` or from `status()`.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Status {
-    /// Our tailscale IP addresses.
-    pub tailscale_ips: Vec<IpAddr>,
-    /// Number of peers in the netmap.
-    pub peer_count: usize,
-    /// Our home DERP region ID (0 = unknown).
-    pub home_derp: i32,
-    /// Whether the server is online.
-    pub online: bool,
-}
-
 /// Information about a single peer in the netmap.
 #[derive(Clone, Debug)]
 pub struct PeerInfo {
@@ -46,4 +33,24 @@ pub struct ServerStatus {
     pub hostname: String,
     /// Number of packets dropped by the packet filter.
     pub packet_drops: u64,
+}
+
+/// Identity of the peer owning a tailnet IP, returned by [`Server::whois`].
+///
+/// C-representable: a plain struct of primitives/`Vec`s, serializable to JSON
+/// for the FFI layer's `ts_whois`.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct WhoIsInfo {
+    /// Whether a peer was found for the queried IP.
+    pub found: bool,
+    /// The peer's MagicDNS FQDN (with trailing dot).
+    pub node_name: String,
+    /// The peer's tailscale IP addresses.
+    pub tailscale_ips: Vec<IpAddr>,
+    /// The owning user's ID (`Node.User`).
+    pub user_id: i64,
+    /// The owning user's login name (from `UserProfile.LoginName`).
+    pub login_name: String,
+    /// The owning user's display name (from `UserProfile.DisplayName`).
+    pub display_name: String,
 }

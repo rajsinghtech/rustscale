@@ -23,10 +23,16 @@ MODEL="${OPENCODE_MODEL:-vercel-ent/zai/glm-5.2}"
 DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 
 CONTINUE=""
-if [[ "${1:-}" == "--continue" ]]; then CONTINUE="$2"; shift 2; fi
-TITLE="${1:?title (or session id with --continue)}"
-PROMPT="${2:?prompt text}"
-DEADLINE="${3:-2400}"   # 40 min default
+if [[ "${1:-}" == "--continue" ]]; then
+  CONTINUE="$2"; shift 2
+  TITLE="$CONTINUE"
+  PROMPT="${1:?prompt text}"
+  DEADLINE="${2:-2400}"
+else
+  TITLE="${1:?title}"
+  PROMPT="${2:?prompt text}"
+  DEADLINE="${3:-2400}"   # 40 min default
+fi
 
 # 0. Ensure server is up.
 if ! curl -sf --max-time 3 "$URL/api/health" >/dev/null 2>&1; then

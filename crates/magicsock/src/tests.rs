@@ -8,13 +8,12 @@
 
 use super::*;
 use rustscale_derp::{
-    decode_frame_header, encode_frame_header, frame_type, DerpClient, Received, FRAME_HEADER_LEN,
-    MAGIC, PROTOCOL_VERSION,
+    decode_frame_header, encode_frame_header, frame_type, DerpClient, FRAME_HEADER_LEN, MAGIC,
+    PROTOCOL_VERSION,
 };
 use rustscale_key::{DiscoPrivate, NodePrivate, NodePublic};
 use rustscale_tailcfg::{DERPMap, DERPNode, DERPRegion};
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -54,7 +53,7 @@ async fn read_frame<R: AsyncRead + Unpin>(
 
 /// Minimal ServerInfo JSON for the handshake (just the version field).
 fn server_info_json() -> Vec<u8> {
-    format!(r#"{{"version":{}}}"#, PROTOCOL_VERSION).into_bytes()
+    format!(r#"{{"version":{PROTOCOL_VERSION}}}"#).into_bytes()
 }
 
 /// Write a DERP frame to an async writer.
@@ -75,10 +74,6 @@ impl FakeRelay {
             server_priv: privk,
             senders: Arc::new(Mutex::new(HashMap::new())),
         }
-    }
-
-    fn public_key(&self) -> NodePublic {
-        self.server_pub.clone()
     }
 
     /// Accept a new client connection and spawn per-client reader/writer tasks.
@@ -242,14 +237,11 @@ async fn derp_data_path_fallback() {
     let mut got_wg = None;
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
     while std::time::Instant::now() < deadline {
-        match tokio::time::timeout(Duration::from_millis(500), b.poll_recv()).await {
-            Ok(Ok(d)) => {
-                if d.data == wg_datagram {
-                    got_wg = Some(d);
-                    break;
-                }
+        if let Ok(Ok(d)) = tokio::time::timeout(Duration::from_millis(500), b.poll_recv()).await {
+            if d.data == wg_datagram {
+                got_wg = Some(d);
+                break;
             }
-            _ => {}
         }
     }
     let received = got_wg.expect("B should receive A's WG datagram");
@@ -407,12 +399,11 @@ async fn trust_expiry_downgrades_to_derp() {
     {
         let mut endpoints = a.inner.endpoints.write().expect("endpoints lock poisoned");
         if let Some(ep) = endpoints.get_mut(&b.node_public()) {
-            let past = std::time::Instant::now() - Duration::from_secs(100);
+            let past = std::time::Instant::now()
+                .checked_sub(Duration::from_secs(100))
+                .unwrap();
             ep.confirm_direct(
-                std::net::SocketAddr::new(
-                    std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
-                    0,
-                ),
+                std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0),
                 past,
             );
         }
@@ -608,14 +599,11 @@ async fn multi_region_derp_routing() {
     let mut got_wg = None;
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while std::time::Instant::now() < deadline {
-        match tokio::time::timeout(Duration::from_millis(500), b.poll_recv()).await {
-            Ok(Ok(d)) => {
-                if d.data == wg_datagram {
-                    got_wg = Some(d);
-                    break;
-                }
+        if let Ok(Ok(d)) = tokio::time::timeout(Duration::from_millis(500), b.poll_recv()).await {
+            if d.data == wg_datagram {
+                got_wg = Some(d);
+                break;
             }
-            _ => {}
         }
     }
     let received = got_wg.expect("B should receive A's WG datagram via region 2");

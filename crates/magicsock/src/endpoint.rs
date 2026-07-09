@@ -14,9 +14,10 @@ use std::time::{Duration, Instant};
 pub const TRUST_BEST_ADDR_DURATION: Duration = Duration::from_secs(15);
 
 /// Path class ranking — lower ordinal = better.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum PathClass {
     /// No usable path.
+    #[default]
     None,
     /// DERP relay fallback.
     Derp,
@@ -26,16 +27,11 @@ pub enum PathClass {
     Direct,
 }
 
-impl Default for PathClass {
-    fn default() -> Self {
-        Self::None
-    }
-}
-
 /// The current best transport path for a peer, evaluated at a point in time.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum BestPath {
     /// No known working path.
+    #[default]
     None,
     /// DERP relay via the given region.
     Derp { region: i32 },
@@ -65,12 +61,6 @@ impl BestPath {
             Self::Direct { addr, .. } | Self::Relay { addr, .. } => Some(*addr),
             _ => None,
         }
-    }
-}
-
-impl Default for BestPath {
-    fn default() -> Self {
-        Self::None
     }
 }
 
@@ -251,7 +241,7 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     fn sa(port: u16) -> SocketAddr {
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port)
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
     }
 
     fn ep() -> Endpoint {

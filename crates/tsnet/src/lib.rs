@@ -35,8 +35,11 @@ mod tls;
 
 pub use routing::RouteTable;
 pub use state::{PersistedState, StateError};
-pub use status::{PeerInfo, ServerStatus};
-pub use tls::{CertProvider, SelfSignedCertProvider, TlsError, TlsListener, TlsStream};
+pub use status::{PeerInfo, ServerStatus, WhoIsInfo};
+pub use tls::{
+    AcmeCertFetcher, CertError, CertFetcher, CertMaterial, CertProvider, ControlCertProvider,
+    SelfSignedCertProvider, TlsError, TlsListener, TlsStream,
+};
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -47,12 +50,14 @@ use std::sync::Arc;
 use rustscale_controlclient::client::{ControlClient, RegisterError, StreamMapError};
 use rustscale_controlclient::controlhttp;
 use rustscale_derp::DerpClient;
+use rustscale_dns::{upstream_nameservers, DnsResponder, MagicDnsResolver, MAGICDNS_VIP};
 use rustscale_filter::Filter;
 use rustscale_key::{NodePrivate, NodePublic};
 use rustscale_magicsock::{Magicsock, MagicsockConfig, MagicsockError};
 use rustscale_netstack::{Netstack, NetstackError, NetstackStream, DEFAULT_MTU};
 use rustscale_tailcfg::{
-    DERPMap, FilterRule, Hostinfo, MapRequest, MapResponse, Node, RegisterRequest,
+    DERPMap, DNSConfig, FilterRule, Hostinfo, MapRequest, MapResponse, Node, RegisterRequest,
+    UserID, UserProfile,
 };
 use rustscale_tun::Tun;
 use rustscale_wg::{WgError, WgTunn};
@@ -207,22 +212,26 @@ struct RunningState {
     tailscale_ips: Vec<IpAddr>,
     magicsock: Arc<Magicsock>,
     data_plane: DataPlane,
-    wg_tunnels: Arc<RwLock<HashMap<NodePublic, Arc<Mutex<WgTunn>>>>>,
     peers: Arc<RwLock<Vec<Node>>>,
     route_table: Arc<RwLock<RouteTable>>,
-    derp_map: Arc<RwLock<Option<DERPMap>>>,
-    home_derp: i32,
     cancel: Arc<CancelToken>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
-    filter: Arc<std::sync::Mutex<Filter>>,
     packet_drops: Arc<AtomicU64>,
+    /// Shared MagicDNS resolver (dial path + DNS responder).
+    resolver: Arc<RwLock<MagicDnsResolver>>,
+    /// Our node's FQDN (with trailing dot), from the netmap.
+    our_fqdn: String,
+    /// DNS config from control (carries `CertDomains` for cert provisioning).
+    dns_config: Arc<RwLock<Option<DNSConfig>>>,
+    /// User profiles keyed by `UserID` (for WhoIs).
+    user_profiles: Arc<RwLock<BTreeMap<UserID, UserProfile>>>,
 }
 
 /// Which data plane is wired up: userspace netstack (tsnet listen/dial) or a
 /// real TUN device (full-client packet routing).
 enum DataPlane {
     Netstack(Arc<Netstack>),
-    Tun(Arc<dyn Tun>),
+    Tun,
 }
 
 /// Configuration for TUN-mode operation ([`Server::up_tun`]).
@@ -230,7 +239,7 @@ enum DataPlane {
 /// In TUN mode the server routes plaintext IP packets between a real OS TUN
 /// device and the WireGuard/magicsock data plane, instead of an in-process
 /// userspace netstack. `listen`/`dial` are unavailable in this mode.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct TunModeConfig {
     /// TUN device parameters (name hint + MTU). On macOS the default name
     /// `"utun"` auto-selects a unit.
@@ -240,15 +249,6 @@ pub struct TunModeConfig {
     /// you must configure the interface and routes yourself (or rely on the
     /// data-plane pump alone for in-process traffic).
     pub apply_routes: bool,
-}
-
-impl Default for TunModeConfig {
-    fn default() -> Self {
-        Self {
-            tun: rustscale_tun::TunConfig::default(),
-            apply_routes: false,
-        }
-    }
 }
 
 /// Simple cancellation token.
@@ -280,14 +280,20 @@ struct Bootstrap {
     wg_tunnels: Arc<RwLock<HashMap<NodePublic, Arc<Mutex<WgTunn>>>>>,
     peers: Arc<RwLock<Vec<Node>>>,
     route_table: Arc<RwLock<RouteTable>>,
-    derp_map: Arc<RwLock<Option<DERPMap>>>,
-    home_derp: i32,
     cancel: Arc<CancelToken>,
     map_rx: mpsc::Receiver<Result<MapResponse, StreamMapError>>,
     map_task: JoinHandle<()>,
     node_key: NodePrivate,
     filter: Arc<std::sync::Mutex<Filter>>,
     packet_drops: Arc<AtomicU64>,
+    /// Shared MagicDNS resolver (dial path + DNS responder).
+    resolver: Arc<RwLock<MagicDnsResolver>>,
+    /// Our node's FQDN (with trailing dot).
+    our_fqdn: String,
+    /// DNS config (carries CertDomains).
+    dns_config: Arc<RwLock<Option<DNSConfig>>>,
+    /// User profiles keyed by UserID.
+    user_profiles: Arc<RwLock<BTreeMap<UserID, UserProfile>>>,
 }
 
 /// An embedded Tailscale server.
@@ -351,22 +357,43 @@ impl Server {
             b.tailscale_ips.clone(),
             self.config.accept_routes,
             self.config.advertise_routes.clone(),
+            b.resolver.clone(),
+            b.dns_config.clone(),
+            b.user_profiles.clone(),
             b.cancel.clone(),
         );
+
+        // MagicDNS responder: best-effort UDP server at 100.100.100.100:53.
+        // Binding to :53 typically requires root and the MagicDNS VIP to be
+        // assigned to an interface; failure is non-fatal (dial still resolves
+        // via the shared resolver). The responder serves A/AAAA for peer
+        // hostnames and forwards the rest upstream.
+        let mut tasks = vec![b.map_task, pump, map_update];
+        let responder = DnsResponder::new(
+            b.resolver.clone(),
+            upstream_nameservers(b.dns_config.read().await.as_ref()),
+            SocketAddr::new(IpAddr::V4(MAGICDNS_VIP), 53),
+        );
+        match responder.spawn().await {
+            Ok(handle) => tasks.push(handle),
+            Err(e) => eprintln!(
+                "tsnet: MagicDNS responder not started ({e}); dial still resolves via netmap"
+            ),
+        }
 
         self.inner = Some(RunningState {
             tailscale_ips: b.tailscale_ips,
             magicsock: b.magicsock,
             data_plane: DataPlane::Netstack(netstack),
-            wg_tunnels: b.wg_tunnels,
             peers: b.peers,
             route_table: b.route_table,
-            derp_map: b.derp_map,
-            home_derp: b.home_derp,
             cancel: b.cancel,
-            tasks: Mutex::new(vec![b.map_task, pump, map_update]),
-            filter: b.filter,
+            tasks: Mutex::new(tasks),
             packet_drops: b.packet_drops,
+            resolver: b.resolver,
+            our_fqdn: b.our_fqdn,
+            dns_config: b.dns_config,
+            user_profiles: b.user_profiles,
         });
         Ok(())
     }
@@ -435,22 +462,25 @@ impl Server {
             b.tailscale_ips.clone(),
             self.config.accept_routes,
             self.config.advertise_routes.clone(),
+            b.resolver.clone(),
+            b.dns_config.clone(),
+            b.user_profiles.clone(),
             b.cancel.clone(),
         );
 
         self.inner = Some(RunningState {
             tailscale_ips: b.tailscale_ips,
             magicsock: b.magicsock,
-            data_plane: DataPlane::Tun(tun),
-            wg_tunnels: b.wg_tunnels,
+            data_plane: DataPlane::Tun,
             peers: b.peers,
             route_table: b.route_table,
-            derp_map: b.derp_map,
-            home_derp: b.home_derp,
             cancel: b.cancel,
             tasks: Mutex::new(vec![b.map_task, pump, map_update]),
-            filter: b.filter,
             packet_drops: b.packet_drops,
+            resolver: b.resolver,
+            our_fqdn: b.our_fqdn,
+            dns_config: b.dns_config,
+            user_profiles: b.user_profiles,
         });
         Ok(())
     }
@@ -614,7 +644,9 @@ impl Server {
         // tailnet use the same DERP region. Fall back to netcheck, then to
         // the first available region.
         let derp_map = map_resp.DERPMap.clone().unwrap_or_default();
-        let home_derp = if !derp_map.Regions.is_empty() {
+        let home_derp = if derp_map.Regions.is_empty() {
+            0
+        } else {
             // Try control-assigned HomeDERP first.
             let assigned = map_resp
                 .Node
@@ -626,7 +658,7 @@ impl Server {
                 d
             } else {
                 // Fall back to netcheck.
-                match rustscale_netcheck::Prober::default()
+                match rustscale_netcheck::Prober
                     .run(&derp_map, &rustscale_netcheck::ProberOpts::default())
                     .await
                 {
@@ -636,12 +668,9 @@ impl Server {
                         .values()
                         .find(|r| !r.Avoid)
                         .or_else(|| derp_map.Regions.values().next())
-                        .map(|r| r.RegionID)
-                        .unwrap_or(0),
+                        .map_or(0, |r| r.RegionID),
                 }
             }
-        } else {
-            0
         };
 
         // 7. Connect home DERP.
@@ -699,7 +728,6 @@ impl Server {
             &peers,
             self.config.accept_routes,
         )));
-        let derp_arc = Arc::new(RwLock::new(map_resp.DERPMap.clone()));
         let cancel = Arc::new(CancelToken::new());
 
         // Build the initial packet filter from the first MapResponse. Add our
@@ -713,6 +741,29 @@ impl Server {
         let filter = Arc::new(std::sync::Mutex::new(filter));
         let packet_drops = Arc::new(AtomicU64::new(0));
 
+        // MagicDNS: build the shared resolver from the first map response.
+        // `Domain` is the tailnet domain (e.g. "tailnet.ts.net"); `DNSConfig`
+        // carries `Proxied` and `CertDomains`; peer `Name`s are FQDNs.
+        let domain = map_resp.Domain.clone();
+        let our_fqdn = map_resp
+            .Node
+            .as_ref()
+            .map(|n| n.Name.clone())
+            .unwrap_or_default();
+        let dns_config = Arc::new(RwLock::new(map_resp.DNSConfig.clone()));
+        let user_profiles = Arc::new(RwLock::new(
+            map_resp
+                .UserProfiles
+                .iter()
+                .map(|p| (p.ID, p.clone()))
+                .collect(),
+        ));
+        let resolver = Arc::new(RwLock::new(MagicDnsResolver::new(
+            peers.clone(),
+            &domain,
+            map_resp.DNSConfig.as_ref(),
+        )));
+
         Ok(Bootstrap {
             tailscale_ips: tailscale_ips.clone(),
             our_v4,
@@ -720,14 +771,16 @@ impl Server {
             wg_tunnels,
             peers: peers_arc,
             route_table,
-            derp_map: derp_arc,
-            home_derp,
             cancel,
             map_rx,
             map_task,
             node_key: state.node_key.clone(),
             filter,
             packet_drops,
+            resolver,
+            our_fqdn,
+            dns_config,
+            user_profiles,
         })
     }
 
@@ -779,24 +832,68 @@ impl Server {
         let inner = self.inner.as_ref().ok_or(TsnetError::NotUp)?;
         match &inner.data_plane {
             DataPlane::Netstack(ns) => Ok(ns.listen(port).await?),
-            DataPlane::Tun(_) => Err(TsnetError::NotAvailableInTunMode),
+            DataPlane::Tun => Err(TsnetError::NotAvailableInTunMode),
         }
     }
 
     /// Listen for incoming TLS connections on `port` (netstack mode only).
     ///
-    /// Uses a self-signed-per-node certificate (generated in-process) by
-    /// default. Callers can supply a custom [`CertProvider`] via
-    /// [`Server::listen_tls_with_provider`] to use a different certificate
-    /// source. **The certificate is self-signed at this stage** — clients must
-    /// skip verification or pin the node's key. Real Let's Encrypt certs via
-    /// the control plane come in a later phase.
+    /// Attempts to use a Let's Encrypt certificate provisioned via the
+    /// control plane ([`Server::control_cert_provider`]); on any error
+    /// (HTTPS not enabled for the tailnet, ACME client unavailable, cache
+    /// miss) it falls back to a self-signed per-node certificate with a
+    /// warning. Call [`Server::control_cert_provider`] directly to observe
+    /// the typed [`CertError`] when you need to distinguish the cases.
     ///
     /// Returns an error in TUN mode.
     pub async fn listen_tls(&self, port: u16) -> Result<TlsListener, TsnetError> {
         let inner = self.inner.as_ref().ok_or(TsnetError::NotUp)?;
-        let provider = tls::default_cert_provider(&inner.tailscale_ips);
+        let provider = match self.control_cert_provider().await {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("tsnet: control cert unavailable ({e}); using self-signed");
+                tls::default_cert_provider(&inner.tailscale_ips)
+            }
+        };
         self.listen_tls_with_provider(port, provider).await
+    }
+
+    /// Build a Let's Encrypt-via-control [`CertProvider`] for this node's
+    /// FQDN, fetching/caching the cert material. Returns a typed
+    /// [`CertError`] when HTTPS certs are not enabled for the tailnet
+    /// ([`CertError::NotEnabled`]) or the ACME client is not yet
+    /// implemented ([`CertError::AcmeClientUnavailable`]); callers can fall
+    /// back to a self-signed cert in those cases.
+    ///
+    /// Requires the server to be up. The cert+key are cached in
+    /// `state_dir` (`<fqdn>.crt.pem` / `<fqdn>.key.pem`) and refreshed when
+    /// within 14 days of expiry.
+    pub async fn control_cert_provider(&self) -> Result<Arc<dyn CertProvider>, CertError> {
+        let inner = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| CertError::CacheInvalid(String::new(), "server not up".into()))?;
+        let cert_domains = inner
+            .dns_config
+            .read()
+            .await
+            .as_ref()
+            .map(|c| c.CertDomains.clone())
+            .unwrap_or_default();
+        let fetcher = Arc::new(AcmeCertFetcher::new(cert_domains));
+        let state_dir = self.config.state_dir.clone().unwrap_or_else(|| {
+            let mut p = std::env::temp_dir();
+            p.push("rustscale-certs");
+            p
+        });
+        let _ = std::fs::create_dir_all(&state_dir);
+        let prov = Arc::new(ControlCertProvider::new(
+            state_dir,
+            &inner.our_fqdn,
+            fetcher,
+        ));
+        prov.refresh()?;
+        Ok(prov)
     }
 
     /// Listen for incoming TLS connections on `port` using a caller-supplied
@@ -814,9 +911,9 @@ impl Server {
         match &inner.data_plane {
             DataPlane::Netstack(ns) => {
                 let listener = ns.listen(port).await?;
-                TlsListener::new(listener, provider).map_err(|e| TsnetError::Tls(e))
+                TlsListener::new(listener, provider).map_err(TsnetError::Tls)
             }
-            DataPlane::Tun(_) => Err(TsnetError::NotAvailableInTunMode),
+            DataPlane::Tun => Err(TsnetError::NotAvailableInTunMode),
         }
     }
 
@@ -828,7 +925,7 @@ impl Server {
         let socket_addr = resolve_addr(addr, inner)?;
         match &inner.data_plane {
             DataPlane::Netstack(ns) => Ok(ns.dial(socket_addr).await?),
-            DataPlane::Tun(_) => Err(TsnetError::NotAvailableInTunMode),
+            DataPlane::Tun => Err(TsnetError::NotAvailableInTunMode),
         }
     }
 
@@ -857,6 +954,28 @@ impl Server {
         rt.entries()
             .map(|(net, prefix, peer)| (format!("{net}/{prefix}"), peer.clone()))
             .collect()
+    }
+
+    /// Look up which peer owns a tailnet IP address ([WhoIs]). Returns the
+    /// peer's MagicDNS name, tailscale IPs, and the owning user's login/
+    /// display name (from `MapResponse.UserProfiles`).
+    ///
+    /// Returns `None` only if the server is not up; if the server is up but
+    /// no peer matches, returns `Some(WhoIsInfo { found: false, .. })`.
+    pub async fn whois(&self, remote_addr: IpAddr) -> Option<WhoIsInfo> {
+        let inner = self.inner.as_ref()?;
+        let peers = inner.peers.read().await;
+        let ups = inner.user_profiles.read().await;
+        Some(
+            whois_lookup(&peers, &ups, remote_addr).unwrap_or_else(|| WhoIsInfo {
+                found: false,
+                node_name: String::new(),
+                tailscale_ips: vec![],
+                user_id: 0,
+                login_name: String::new(),
+                display_name: String::new(),
+            }),
+        )
     }
 
     /// Shut down the server.
@@ -919,7 +1038,7 @@ async fn run_netstack_pump(
         }
 
         tokio::select! {
-            _ = tx_notify.notified() => {}
+            () = tx_notify.notified() => {}
             _ = wg_timer.tick() => {}
             result = magicsock.poll_recv() => {
                 if let Ok(dgram) = result {
@@ -1115,6 +1234,9 @@ fn spawn_map_update_task(
     tailscale_ips: Vec<IpAddr>,
     accept_routes: bool,
     advertise_routes: Vec<String>,
+    resolver: Arc<RwLock<MagicDnsResolver>>,
+    dns_config: Arc<RwLock<Option<DNSConfig>>>,
+    user_profiles: Arc<RwLock<BTreeMap<UserID, UserProfile>>>,
     cancel: Arc<CancelToken>,
 ) -> JoinHandle<()> {
     let mut named_filters: BTreeMap<String, Vec<FilterRule>> = BTreeMap::new();
@@ -1133,7 +1255,7 @@ fn spawn_map_update_task(
                     {
                         let mut peers = peers_arc.write().await;
                         if !resp.Peers.is_empty() {
-                            *peers = resp.Peers.clone();
+                            peers.clone_from(&resp.Peers);
                         }
                         if !resp.PeersChanged.is_empty() {
                             for changed in &resp.PeersChanged {
@@ -1158,6 +1280,29 @@ fn spawn_map_update_task(
                         .write()
                         .await
                         .rebuild_with_opts(&peers, accept_routes);
+
+                    // Refresh the shared MagicDNS resolver with the new peers.
+                    resolver.write().await.set_peers(peers.clone());
+
+                    // Apply DNSConfig delta (None means unchanged).
+                    if let Some(cfg) = &resp.DNSConfig {
+                        dns_config.write().await.clone_from(&resp.DNSConfig);
+                        // `Proxied` may have changed; rebuild the resolver's
+                        // proxied flag from the latest config.
+                        let mut r = resolver.write().await;
+                        // Rebuild from current peers + domain + new config.
+                        let domain = r.domain().to_string();
+                        let cur_peers = peers.clone();
+                        *r = MagicDnsResolver::new(cur_peers, &domain, Some(cfg));
+                    }
+
+                    // Merge UserProfiles delta (add/update; never removed).
+                    if !resp.UserProfiles.is_empty() {
+                        let mut ups = user_profiles.write().await;
+                        for up in &resp.UserProfiles {
+                            ups.insert(up.ID, up.clone());
+                        }
+                    }
 
                     // Create WG tunnels for new peers.
                     let mut tunnels = wg_tunnels.write().await;
@@ -1326,6 +1471,31 @@ fn extract_node_ips(node: &Node) -> Vec<IpAddr> {
         .collect()
 }
 
+/// Pure WhoIs lookup over a peer snapshot + user profiles. Returns `None`
+/// when no peer has `remote_addr` among its `Addresses`. Used by
+/// [`Server::whois`] and unit tests (fake netmap).
+fn whois_lookup(
+    peers: &[Node],
+    user_profiles: &BTreeMap<UserID, UserProfile>,
+    remote_addr: IpAddr,
+) -> Option<WhoIsInfo> {
+    for peer in peers {
+        let ips = extract_node_ips(peer);
+        if ips.contains(&remote_addr) {
+            let up = user_profiles.get(&peer.User);
+            return Some(WhoIsInfo {
+                found: true,
+                node_name: peer.Name.clone(),
+                tailscale_ips: ips,
+                user_id: peer.User,
+                login_name: up.map(|p| p.LoginName.clone()).unwrap_or_default(),
+                display_name: up.map(|p| p.DisplayName.clone()).unwrap_or_default(),
+            });
+        }
+    }
+    None
+}
+
 async fn connect_home_derp(
     derp_map: &DERPMap,
     home_region: i32,
@@ -1487,8 +1657,7 @@ fn run_cmd(prog: &str, args: &[&str]) -> Result<(), TsnetError> {
         .map_err(|e| TsnetError::Builder(format!("spawn {prog}: {e}")))?;
     if !status.success() {
         return Err(TsnetError::Builder(format!(
-            "{prog} {:?} exited with {status}",
-            args
+            "{prog} {args:?} exited with {status}"
         )));
     }
     Ok(())
@@ -1509,6 +1678,17 @@ fn resolve_addr(addr: &str, inner: &RunningState) -> Result<SocketAddr, TsnetErr
         return Ok(SocketAddr::new(ip, port));
     }
 
+    // Resolve via the shared MagicDNS resolver (unified with the DNS
+    // responder at 100.100.100.100:53). Handles FQDNs and short hostnames
+    // from the netmap. Falls back to StableID matching for completeness.
+    if let Ok(r) = inner.resolver.try_read() {
+        if let Some(ip) = r.resolve_first(host) {
+            return Ok(SocketAddr::new(ip, port));
+        }
+    }
+
+    // Fallback: StableID / suffix match against the peer list (used when
+    // the resolver snapshot is momentarily unavailable).
     let peers = inner
         .peers
         .try_read()

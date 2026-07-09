@@ -8,7 +8,10 @@ use std::collections::BTreeMap;
 use rustscale_key::{DiscoPublic, NodePublic};
 
 use crate::deserialize_null_to_default;
-use crate::{skip_default, skip_zero_disco, CapabilityVersion, DERPMap, FilterRule, Node, NodeID};
+use crate::{
+    skip_default, skip_zero_disco, CapabilityVersion, DERPMap, DNSConfig, FilterRule, Node, NodeID,
+    UserProfile,
+};
 
 /// Sent by a client to update its state and/or long-poll network-map updates.
 ///
@@ -94,6 +97,19 @@ pub struct MapResponse {
     /// The tailnet domain name; empty means unchanged.
     #[serde(default, skip_serializing_if = "skip_default")]
     pub Domain: String,
+    /// DNS settings for the client. `None` means unchanged from a prior
+    /// non-nil value. Carries MagicDNS config (`Proxied`), search domains,
+    /// upstream resolvers, and `CertDomains` (non-empty ⇒ HTTPS enabled).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub DNSConfig: Option<DNSConfig>,
+    /// New/updated user profiles of nodes in the network (mapver ≥5).
+    /// Keyed by `UserProfile.ID` to match `Node.User`.
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
+    pub UserProfiles: Vec<UserProfile>,
     /// Firewall rules. `None` = unchanged (field absent); `Some([])` = block
     /// all; `Some([…])` = full replacement of the "base" key.
     #[serde(default, skip_serializing_if = "Option::is_none")]

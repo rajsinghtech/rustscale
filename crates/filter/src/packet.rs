@@ -157,7 +157,8 @@ fn parse_v6(buf: &[u8]) -> Option<PacketInfo> {
                     // Can't parse fragment header — treat as Fragment.
                     break;
                 }
-                let frag_offset = ((buf[offset + 2] as u16) << 5) | (buf[offset + 3] as u16 >> 3);
+                let frag_offset =
+                    (u16::from(buf[offset + 2]) << 5) | (u16::from(buf[offset + 3]) >> 3);
                 if frag_offset != 0 {
                     // Non-first fragment: proto stays as FRAGMENT.
                     break;
@@ -205,14 +206,14 @@ fn fill_transport(info: &mut PacketInfo, proto: u8, transport: &[u8]) {
             }
         }
         ICMP_V4 => {
-            if transport.len() >= 1 {
+            if !transport.is_empty() {
                 let icmp_type = transport[0];
                 info.is_icmp_echo_reply = icmp_type == 0;
                 info.is_icmp_error = ICMP_ERROR_TYPES.contains(&icmp_type);
             }
         }
         ICMP_V6 => {
-            if transport.len() >= 1 {
+            if !transport.is_empty() {
                 let icmp_type = transport[0];
                 // Echo reply = 129 for ICMP_V6.
                 info.is_icmp_echo_reply = icmp_type == 129;

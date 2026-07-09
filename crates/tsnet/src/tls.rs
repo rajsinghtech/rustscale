@@ -175,3 +175,422 @@ pub(crate) fn default_cert_provider(tailscale_ips: &[std::net::IpAddr]) -> Arc<d
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Let's Encrypt certs via the control plane (ControlCertProvider)
+// ---------------------------------------------------------------------------
+
+use std::path::PathBuf;
+use std::sync::Mutex;
+
+use base64::Engine as _;
+use chrono::{DateTime, Duration, Utc};
+
+/// A fetched certificate: PEM-encoded cert chain + key, plus the leaf's
+/// not-after time (for cache/refresh decisions).
+#[derive(Clone, Debug)]
+pub struct CertMaterial {
+    /// PEM cert chain (leaf first), `-----BEGIN CERTIFICATE-----` blocks.
+    pub cert_pem: Vec<u8>,
+    /// PEM private key (PKCS#8).
+    pub key_pem: Vec<u8>,
+    /// Leaf certificate not-after time.
+    pub not_after: DateTime<Utc>,
+}
+
+/// Errors from certificate provisioning.
+#[derive(Debug, thiserror::Error)]
+pub enum CertError {
+    /// The tailnet does not have HTTPS/certs enabled — `DNSConfig.CertDomains`
+    /// does not contain our node's FQDN. A clean, typed signal that LE certs
+    /// are unavailable for this tailnet.
+    #[error("HTTPS certs not enabled for this tailnet (FQDN {0} not in CertDomains)")]
+    NotEnabled(String),
+    /// HTTPS is enabled but the ACME-to-Let's-Encrypt client is not yet
+    /// implemented in rustscale. The control-plane `SetDNS` path is wired;
+    /// the ACME order/finalize step is a follow-up phase.
+    #[error("ACME client not yet implemented (HTTPS enabled for {0}); using self-signed")]
+    AcmeClientUnavailable(String),
+    /// A cached cert exists but is unreadable/invalid.
+    #[error("cached cert for {0} is invalid: {1}")]
+    CacheInvalid(String, String),
+    /// I/O error reading/writing the cert cache.
+    #[error("cert cache io: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+/// How certificate material is fetched. Implementations:
+/// - [`AcmeCertFetcher`] — the real (control-plane-assisted) flow.
+/// - test mocks — for cache/refresh unit tests.
+///
+/// Object-safe (`Send + Sync`) so it can be stored as `Arc<dyn CertFetcher>`.
+pub trait CertFetcher: Send + Sync {
+    /// Fetch cert material for `domain` (the node FQDN without trailing dot).
+    fn fetch(&self, domain: &str) -> Result<CertMaterial, CertError>;
+}
+
+/// A [`CertFetcher`] implementing the control-plane-assisted LE flow as far
+/// as rustscale currently supports it.
+///
+/// **Flow found in Go** (`ipn/ipnlocal/cert.go`): the client speaks ACME
+/// *directly* to Let's Encrypt; control's role is only to publish the ACME
+/// DNS-01 challenge TXT record via `POST /machine/set-dns` (control owns the
+/// `ts.net` DNS zone). A non-empty `MapResponse.DNSConfig.CertDomains` means
+/// the tailnet has HTTPS enabled.
+///
+/// **What rustscale implements**: the `NotEnabled` detection (CertDomains
+/// membership) and the typed `AcmeClientUnavailable` signal when HTTPS *is*
+/// enabled. The `SetDNS` control call is implemented on `ControlClient`.
+/// The full ACME HTTP client (order/authorize/finalize) is a follow-up
+/// phase; until then `listen_tls` falls back to a self-signed cert.
+pub struct AcmeCertFetcher {
+    cert_domains: Vec<String>,
+}
+
+impl AcmeCertFetcher {
+    /// Build from the netmap's `DNSConfig.CertDomains`.
+    pub fn new(cert_domains: Vec<String>) -> Self {
+        Self { cert_domains }
+    }
+
+    fn enabled_for(&self, domain: &str) -> bool {
+        let d = domain.trim_end_matches('.').to_lowercase();
+        self.cert_domains
+            .iter()
+            .any(|c| c.trim_end_matches('.').eq_ignore_ascii_case(&d))
+    }
+}
+
+impl CertFetcher for AcmeCertFetcher {
+    fn fetch(&self, domain: &str) -> Result<CertMaterial, CertError> {
+        if !self.enabled_for(domain) {
+            return Err(CertError::NotEnabled(domain.to_string()));
+        }
+        // The SetDNS control call (ControlClient::set_dns) is wired; the
+        // ACME HTTP order flow is not yet ported. Surface a clean typed
+        // error so listen_tls can fall back to self-signed.
+        Err(CertError::AcmeClientUnavailable(domain.to_string()))
+    }
+}
+
+/// Refresh threshold: refresh when the cached cert expires within this many
+/// days (matches Go's `domainRenewalTimeByExpiry` ~2/3 lifetime, simplified).
+const CERT_REFRESH_THRESHOLD: Duration = Duration::days(14);
+
+/// A [`CertProvider`] backed by Let's Encrypt certs fetched via the control
+/// plane (through a [`CertFetcher`]). Caches cert+key PEM in `state_dir`
+/// (mirroring Go's `certFileStore`: `<domain>.crt.pem` / `<domain>.key.pem`
+/// plus a `<domain>.expiry` sidecar for the cache-validity check) and
+/// refreshes when the cached cert is missing or within
+/// [`CERT_REFRESH_THRESHOLD`] of expiry.
+///
+/// [`CertProvider::cert_chain`] / [`CertProvider::private_key`] return the
+/// cached material; call [`ControlCertProvider::refresh`] (async) first to
+/// populate/refresh it. Both methods are synchronous per the trait, so
+/// refresh is decoupled.
+pub struct ControlCertProvider {
+    state_dir: PathBuf,
+    domain: String,
+    fetcher: Arc<dyn CertFetcher>,
+    material: Mutex<Option<CertMaterial>>,
+}
+
+impl ControlCertProvider {
+    /// Create a new provider. `domain` is the node FQDN (trailing dot
+    /// stripped). Call [`refresh`](Self::refresh) before use.
+    pub fn new(
+        state_dir: PathBuf,
+        domain: impl Into<String>,
+        fetcher: Arc<dyn CertFetcher>,
+    ) -> Self {
+        Self {
+            state_dir,
+            domain: domain.into().trim_end_matches('.').to_string(),
+            fetcher,
+            material: Mutex::new(None),
+        }
+    }
+
+    /// Load from cache or fetch fresh material. Refreshes when the cached
+    /// cert is missing or expires within [`CERT_REFRESH_THRESHOLD`].
+    pub fn refresh(&self) -> Result<(), CertError> {
+        // Try the cache first.
+        if let Some(cached) = self.load_cached()? {
+            let now = Utc::now();
+            if cached.not_after > now + CERT_REFRESH_THRESHOLD {
+                *self.material.lock().expect("cert material mutex") = Some(cached);
+                return Ok(());
+            }
+            // Cached but near expiry — fall through to a fresh fetch.
+        }
+
+        match self.fetcher.fetch(&self.domain) {
+            Ok(mat) => {
+                self.write_cached(&mat)?;
+                *self.material.lock().expect("cert material mutex") = Some(mat);
+                Ok(())
+            }
+            Err(e) => {
+                // On fetch failure, serve a still-valid cached cert if we
+                // have one (stale-but-usable); otherwise propagate the error.
+                if let Some(cached) = self.load_cached()? {
+                    if cached.not_after > Utc::now() {
+                        *self.material.lock().expect("cert material mutex") = Some(cached);
+                        return Ok(());
+                    }
+                }
+                Err(e)
+            }
+        }
+    }
+
+    fn crt_path(&self) -> PathBuf {
+        self.state_dir.join(format!("{}.crt.pem", self.domain))
+    }
+    fn key_path(&self) -> PathBuf {
+        self.state_dir.join(format!("{}.key.pem", self.domain))
+    }
+    fn expiry_path(&self) -> PathBuf {
+        self.state_dir.join(format!("{}.expiry", self.domain))
+    }
+
+    fn load_cached(&self) -> Result<Option<CertMaterial>, CertError> {
+        let crt = std::fs::read(self.crt_path());
+        let key = std::fs::read(self.key_path());
+        let (crt, key) = match (crt, key) {
+            (Ok(c), Ok(k)) => (c, k),
+            (Err(e), _) | (_, Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            (Err(e), _) | (_, Err(e)) => return Err(CertError::Io(e)),
+        };
+        let expiry = std::fs::read_to_string(self.expiry_path())
+            .map_err(|e| CertError::CacheInvalid(self.domain.clone(), e.to_string()))?;
+        let not_after = DateTime::parse_from_rfc3339(expiry.trim())
+            .map_err(|e| CertError::CacheInvalid(self.domain.clone(), e.to_string()))?
+            .with_timezone(&Utc);
+        Ok(Some(CertMaterial {
+            cert_pem: crt,
+            key_pem: key,
+            not_after,
+        }))
+    }
+
+    fn write_cached(&self, mat: &CertMaterial) -> Result<(), CertError> {
+        std::fs::write(self.crt_path(), &mat.cert_pem)?;
+        std::fs::write(self.key_path(), &mat.key_pem)?;
+        std::fs::write(self.expiry_path(), mat.not_after.to_rfc3339())?;
+        Ok(())
+    }
+
+    fn with_material<R>(&self, f: impl Fn(&CertMaterial) -> R) -> R {
+        let guard = self.material.lock().expect("cert material mutex");
+        let mat = guard
+            .as_ref()
+            .expect("ControlCertProvider used before refresh() — call refresh() first");
+        f(mat)
+    }
+}
+
+impl CertProvider for ControlCertProvider {
+    fn cert_chain(&self) -> Vec<CertificateDer<'static>> {
+        self.with_material(|mat| pem_cert_chain_to_der(&mat.cert_pem))
+    }
+    fn private_key(&self) -> PrivateKeyDer<'static> {
+        self.with_material(|mat| {
+            let der = pem_pkcs8_to_der(&mat.key_pem).unwrap_or_default();
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(der))
+        })
+    }
+}
+
+/// Decode all `CERTIFICATE` PEM blocks in `pem` to DER, leaf first.
+fn pem_cert_chain_to_der(pem: &[u8]) -> Vec<CertificateDer<'static>> {
+    let Ok(text) = std::str::from_utf8(pem) else {
+        return vec![];
+    };
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("-----BEGIN CERTIFICATE-----") {
+        let after_begin = &rest[start + "-----BEGIN CERTIFICATE-----".len()..];
+        let Some(end) = after_begin.find("-----END CERTIFICATE-----") else {
+            break;
+        };
+        let b64: String = after_begin[..end]
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        if let Ok(der) = base64::engine::general_purpose::STANDARD.decode(b64) {
+            out.push(CertificateDer::from(der));
+        }
+        rest = &after_begin[end + "-----END CERTIFICATE-----".len()..];
+    }
+    out
+}
+
+/// Decode a PKCS#8 (`PRIVATE KEY`) PEM block to DER.
+fn pem_pkcs8_to_der(pem: &[u8]) -> Option<Vec<u8>> {
+    let text = std::str::from_utf8(pem).ok()?;
+    let begin = "-----BEGIN PRIVATE KEY-----";
+    let end = "-----END PRIVATE KEY-----";
+    let start = text.find(begin)? + begin.len();
+    let stop = text[start..].find(end)? + start;
+    let b64: String = text[start..stop]
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    base64::engine::general_purpose::STANDARD.decode(b64).ok()
+}
+
+#[cfg(test)]
+mod cert_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A fetcher that returns canned material and counts calls.
+    struct MockFetcher {
+        not_after: DateTime<Utc>,
+        calls: AtomicUsize,
+    }
+    impl MockFetcher {
+        fn new(not_after: DateTime<Utc>) -> Self {
+            Self {
+                not_after,
+                calls: AtomicUsize::new(0),
+            }
+        }
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+    impl CertFetcher for MockFetcher {
+        fn fetch(&self, domain: &str) -> Result<CertMaterial, CertError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            // Real PEM (self-signed via rcgen) so the DER parse paths work.
+            let CertifiedKey { cert, key_pair } =
+                rcgen::generate_simple_self_signed(vec![domain.to_string()]).unwrap();
+            let mut cert_pem = String::new();
+            use std::fmt::Write;
+            let der = cert.der();
+            let b64 = base64::engine::general_purpose::STANDARD.encode(der);
+            writeln!(cert_pem, "-----BEGIN CERTIFICATE-----").unwrap();
+            for chunk in b64.as_bytes().chunks(64) {
+                writeln!(cert_pem, "{}", std::str::from_utf8(chunk).unwrap()).unwrap();
+            }
+            writeln!(cert_pem, "-----END CERTIFICATE-----").unwrap();
+            let key_der = key_pair.serialize_der();
+            let mut key_pem = String::new();
+            writeln!(key_pem, "-----BEGIN PRIVATE KEY-----").unwrap();
+            let kb64 = base64::engine::general_purpose::STANDARD.encode(&key_der);
+            for chunk in kb64.as_bytes().chunks(64) {
+                writeln!(key_pem, "{}", std::str::from_utf8(chunk).unwrap()).unwrap();
+            }
+            writeln!(key_pem, "-----END PRIVATE KEY-----").unwrap();
+            Ok(CertMaterial {
+                cert_pem: cert_pem.into_bytes(),
+                key_pem: key_pem.into_bytes(),
+                not_after: self.not_after,
+            })
+        }
+    }
+
+    fn temp_dir() -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let mut p = std::env::temp_dir();
+        p.push(format!("rustscale-cert-test-{}-{}", std::process::id(), n));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[tokio::test]
+    async fn cache_miss_fetches_then_cache_hit_no_fetch() {
+        let dir = temp_dir();
+        let far_future = Utc::now() + Duration::days(90);
+        let fetcher = Arc::new(MockFetcher::new(far_future));
+        let prov = ControlCertProvider::new(dir.clone(), "node.ts.net", fetcher.clone());
+        // No cache → fetch.
+        prov.refresh().expect("refresh");
+        assert_eq!(fetcher.calls(), 1, "should fetch on cache miss");
+        // Cached + far from expiry → no refetch.
+        prov.refresh().expect("refresh 2");
+        assert_eq!(fetcher.calls(), 1, "should NOT refetch on cache hit");
+        // Material parses to a cert chain.
+        assert!(!prov.cert_chain().is_empty());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn refreshes_when_within_threshold() {
+        let dir = temp_dir();
+        let soon = Utc::now() + Duration::days(5); // < 14 day threshold
+        let fetcher = Arc::new(MockFetcher::new(soon));
+        let prov = ControlCertProvider::new(dir.clone(), "node.ts.net", fetcher.clone());
+        prov.refresh().expect("refresh");
+        assert_eq!(fetcher.calls(), 1);
+        // Within threshold → refetch.
+        prov.refresh().expect("refresh 2");
+        assert_eq!(fetcher.calls(), 2, "should refetch within threshold");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn not_enabled_propagates() {
+        let dir = temp_dir();
+        let fetcher = Arc::new(AcmeCertFetcher::new(vec![])); // no cert domains
+        let prov = ControlCertProvider::new(dir.clone(), "node.ts.net", fetcher);
+        let err = prov.refresh().expect_err("should be NotEnabled");
+        assert!(matches!(err, CertError::NotEnabled(_)), "got {err:?}");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn acme_unavailable_when_enabled() {
+        let dir = temp_dir();
+        let fetcher = Arc::new(AcmeCertFetcher::new(vec!["node.ts.net".into()]));
+        let prov = ControlCertProvider::new(dir.clone(), "node.ts.net", fetcher);
+        let err = prov.refresh().expect_err("should be AcmeClientUnavailable");
+        assert!(
+            matches!(err, CertError::AcmeClientUnavailable(_)),
+            "got {err:?}"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn stale_cache_served_on_fetch_failure() {
+        let dir = temp_dir();
+        // First: a valid cached cert written directly.
+        let far_future = Utc::now() + Duration::days(90);
+        let good = MockFetcher::new(far_future);
+        let mat = good.fetch("node.ts.net").unwrap();
+        std::fs::write(dir.join("node.ts.net.crt.pem"), &mat.cert_pem).unwrap();
+        std::fs::write(dir.join("node.ts.net.key.pem"), &mat.key_pem).unwrap();
+        std::fs::write(dir.join("node.ts.net.expiry"), mat.not_after.to_rfc3339()).unwrap();
+        // Now a fetcher that always fails — refresh should serve the stale cache.
+        struct Fail;
+        impl CertFetcher for Fail {
+            fn fetch(&self, _d: &str) -> Result<CertMaterial, CertError> {
+                Err(CertError::NotEnabled("x".into()))
+            }
+        }
+        let prov = ControlCertProvider::new(dir.clone(), "node.ts.net", Arc::new(Fail));
+        prov.refresh().expect("should serve stale cache");
+        assert!(!prov.cert_chain().is_empty());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn pem_cert_chain_to_der_roundtrip() {
+        let CertifiedKey { cert, .. } =
+            rcgen::generate_simple_self_signed(vec!["x".into()]).unwrap();
+        let der = cert.der();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(der);
+        let pem = format!("-----BEGIN CERTIFICATE-----\n{b64}\n-----END CERTIFICATE-----\n");
+        let parsed = pem_cert_chain_to_der(pem.as_bytes());
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].as_ref(), der.as_ref());
+    }
+}

@@ -16,7 +16,9 @@
 //!   `MapResponse` messages (application-level framing within the HTTP body).
 
 use rustscale_key::{MachinePrivate, MachinePublic};
-use rustscale_tailcfg::{MapRequest, MapResponse, RegisterRequest, RegisterResponse};
+use rustscale_tailcfg::{
+    MapRequest, MapResponse, RegisterRequest, RegisterResponse, SetDNSRequest, SetDNSResponse,
+};
 use tokio::sync::mpsc;
 
 use crate::controlbase::{NoiseIo, ProtocolVersion};
@@ -288,6 +290,61 @@ impl ControlClient {
         rx.recv()
             .await
             .ok_or_else(|| StreamMapError::Io(std::io::Error::other("no map response")))?
+    }
+
+    /// Post a [`SetDNSRequest`] to `/machine/set-dns`.
+    ///
+    /// This asks the control plane to publish a DNS record in the tailnet's
+    /// DNS zone. The primary use is answering ACME DNS-01 challenges for
+    /// Let's Encrypt certificate issuance: `Name` is
+    /// `_acme-challenge.<cert-domain>`, `Type` is `"TXT"`, `Value` is the
+    /// challenge record (see Go's `ipn/ipnlocal/cert.go` → `SetDNS`).
+    pub async fn set_dns(&self, req: &SetDNSRequest) -> Result<SetDNSResponse, RegisterError> {
+        let noise_stream = dial_control(
+            &self.host,
+            &self.machine_key,
+            &self.control_key,
+            self.version,
+        )
+        .await?;
+
+        let (conn, stream) = noise_stream.into_parts();
+        let noise_io = NoiseIo::new(conn, stream);
+
+        let (mut h2_send, h2_conn) = establish_h2(noise_io).await?;
+        tokio::spawn(async move {
+            let _ = h2_conn.await;
+        });
+
+        let body = serde_json::to_vec(req)?;
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("/machine/set-dns")
+            .header("content-type", "application/json")
+            .body(())
+            .unwrap();
+
+        let (resp_future, mut send_stream) = h2_send.send_request(request, false)?;
+        send_stream.send_data(bytes::Bytes::from(body), true)?;
+
+        let resp = resp_future.await?;
+        let status = resp.status().as_u16();
+        let mut body = resp.into_body();
+        let data = read_h2_body(&mut body).await?;
+
+        if status != 200 {
+            return Err(RegisterError::HttpStatus(
+                status,
+                String::from_utf8_lossy(&data).to_string(),
+            ));
+        }
+
+        // SetDNSResponse is empty; tolerate an empty body.
+        if data.is_empty() {
+            Ok(SetDNSResponse::default())
+        } else {
+            Ok(serde_json::from_slice(&data)?)
+        }
     }
 }
 

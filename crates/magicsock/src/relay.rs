@@ -118,7 +118,7 @@ impl RelayHandshake {
 
     /// Mark the relay as established at `addr`.
     pub fn establish(&mut self, addr: SocketAddr, now: Instant) {
-        let vni = self.bind_params.as_ref().map(|(v, _, _)| *v).unwrap_or(0);
+        let vni = self.bind_params.as_ref().map_or(0, |(v, _, _)| *v);
         self.phase = RelayPhase::Established;
         self.established = Some((addr, vni, now));
     }

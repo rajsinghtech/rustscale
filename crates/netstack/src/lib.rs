@@ -422,7 +422,7 @@ async fn poll_loop(
         sleep.as_mut().reset(tokio::time::Instant::now() + fallback);
 
         tokio::select! {
-            _ = &mut sleep => {}
+            () = &mut sleep => {}
             () = notify.notified() => {}
             cmd = cmd_rx.recv() => {
                 match cmd {

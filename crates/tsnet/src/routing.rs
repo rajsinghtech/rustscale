@@ -211,7 +211,7 @@ mod tests {
             ID: 1,
             Name: name.into(),
             Key: key.public(),
-            Addresses: cidrs.iter().map(|s| s.to_string()).collect(),
+            Addresses: cidrs.iter().map(std::string::ToString::to_string).collect(),
             ..Default::default()
         }
     }
@@ -221,7 +221,7 @@ mod tests {
             ID: 1,
             Name: "p".into(),
             Key: key,
-            Addresses: cidrs.iter().map(|s| s.to_string()).collect(),
+            Addresses: cidrs.iter().map(std::string::ToString::to_string).collect(),
             ..Default::default()
         }
     }

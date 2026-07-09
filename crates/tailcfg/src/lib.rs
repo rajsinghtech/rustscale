@@ -9,12 +9,14 @@
 #![allow(non_snake_case)]
 
 mod derpmap;
+mod dns;
 mod filter;
 mod map;
 mod node;
 mod register;
 
 pub use derpmap::{DERPHomeParams, DERPMap, DERPNode, DERPRegion};
+pub use dns::{DNSConfig, DNSRecord, Resolver, SetDNSRequest, SetDNSResponse, UserProfile};
 pub use filter::{filter_allow_all, CapGrant, FilterRule, NetPortRange, PeerCapMap, PortRange};
 pub use map::{MapRequest, MapResponse};
 pub use node::{

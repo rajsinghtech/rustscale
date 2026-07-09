@@ -1113,6 +1113,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustscale-dns"
+version = "0.1.0"
+dependencies = [
+ "rustscale-key",
+ "rustscale-tailcfg",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
 name = "rustscale-ffi"
 version = "0.1.0"
 dependencies = [
@@ -1198,10 +1208,13 @@ dependencies = [
 name = "rustscale-tsnet"
 version = "0.1.0"
 dependencies = [
+ "base64",
+ "chrono",
  "rcgen",
  "rustls",
  "rustscale-controlclient",
  "rustscale-derp",
+ "rustscale-dns",
  "rustscale-filter",
  "rustscale-key",
  "rustscale-magicsock",

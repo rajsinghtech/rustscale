@@ -1,8 +1,8 @@
 //! DERP client actor: splits the `DerpClient` stream into read and write
 //! halves for concurrent I/O from separate tasks.
 
-use rustscale_derp::{decode_frame_header, encode_frame_header, frame_type, Received};
-use rustscale_key::{NodePrivate, NodePublic};
+use rustscale_derp::{decode_frame_header, encode_frame_header, frame_type};
+use rustscale_key::NodePublic;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
@@ -19,14 +19,13 @@ enum DerpCmd {
 pub struct DerpIo {
     cmd_tx: mpsc::Sender<DerpCmd>,
     recv_rx: tokio::sync::Mutex<mpsc::Receiver<(NodePublic, Vec<u8>)>>,
-    server_key: NodePublic,
 }
 
 impl DerpIo {
     /// Split a `DerpClient` into reader/writer tasks and return a channel handle.
     pub fn spawn(client: rustscale_derp::DerpClient) -> Self {
         let private_key = client.private_key();
-        let (read_half, write_half, server_key) = client.into_split();
+        let (read_half, write_half, _server_key) = client.into_split();
 
         let (cmd_tx, mut cmd_rx) = mpsc::channel(128);
         let (recv_tx, recv_rx) = mpsc::channel(128);
@@ -93,18 +92,12 @@ impl DerpIo {
         Self {
             cmd_tx,
             recv_rx: tokio::sync::Mutex::new(recv_rx),
-            server_key,
         }
     }
 
     /// Send a data packet to `dst` via DERP.
     pub async fn send_packet(&self, dst: NodePublic, data: Vec<u8>) {
         let _ = self.cmd_tx.send(DerpCmd::SendPacket { dst, data }).await;
-    }
-
-    /// The DERP server's public key.
-    pub fn server_key(&self) -> NodePublic {
-        self.server_key.clone()
     }
 
     /// Try to receive the next packet from DERP (blocks until one is ready).

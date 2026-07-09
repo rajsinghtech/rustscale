@@ -24,7 +24,7 @@ const TEST_DENIED_PROTO: u8 = 127;
 /// Build a FilterRule from src IPs, dst IP+port range, and optional protos.
 fn rule(srcs: &[&str], dsts: &[(&str, u16, u16)], protos: &[i32]) -> FilterRule {
     FilterRule {
-        SrcIPs: srcs.iter().map(|s| s.to_string()).collect(),
+        SrcIPs: srcs.iter().map(std::string::ToString::to_string).collect(),
         DstPorts: dsts
             .iter()
             .map(|(ip, first, last)| WireNetPortRange {
@@ -52,7 +52,7 @@ fn new_test_filter() -> Filter {
         rule(
             &["9.1.1.1", "9.2.2.2"],
             &[("1.2.3.4", 22, 22), ("5.6.7.8", 23, 24)],
-            &[SCTP as i32],
+            &[i32::from(SCTP)],
         ),
         rule(&["8.1.1.1", "8.2.2.2"], &[("5.6.7.8", 27, 28)], &[]),
         rule(&["2.2.2.2"], &[("8.1.1.1", 22, 22)], &[]),
@@ -72,12 +72,12 @@ fn new_test_filter() -> Filter {
         rule(
             &["0.0.0.0/0"],
             &[("0.0.0.0/0", 0, 65535)],
-            &[TEST_ALLOWED_PROTO as i32],
+            &[i32::from(TEST_ALLOWED_PROTO)],
         ),
         rule(
             &["::/0"],
             &[("::/0", 0, 65535)],
-            &[TEST_ALLOWED_PROTO as i32],
+            &[i32::from(TEST_ALLOWED_PROTO)],
         ),
     ];
 
@@ -462,7 +462,7 @@ fn test_matches_from_filter_rules_explicit_protos() {
     let rules = vec![rule(
         &["100.64.1.1"],
         &[("1.2.0.0/16", 22, 22)],
-        &[TCP as i32],
+        &[i32::from(TCP)],
     )];
     let matches = crate::parse::matches_from_filter_rules(&rules).unwrap();
     assert_eq!(matches.len(), 1);

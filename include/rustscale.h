@@ -147,4 +147,14 @@ int ts_status_json(int handle, char *buf, int buflen);
  */
 int ts_up(int handle);
 
+/**
+ * Look up the peer owning a tailnet IP address (WhoIs). `addr` is a string
+ * IP (e.g. `"100.64.0.5"`). Writes a JSON object into `buf`:
+ * `{"found":bool,"node_name":...,"tailscale_ips":[...],"user_id":...,
+ * "login_name":...,"display_name":...}`. Returns bytes written (excluding
+ * the NUL terminator), or a negative errno-style code on error. If no peer
+ * matches (or the server is not up), `found` is `false`.
+ */
+int ts_whois(int handle, const char *addr, char *buf, int buflen);
+
 #endif  /* RUSTSCALE_H */

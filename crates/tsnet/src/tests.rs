@@ -483,9 +483,9 @@ fn make_rig() -> (Arc<Netstack>, Arc<Netstack>, tokio::task::JoinHandle<()>) {
             let did = pump_cycle(&a_t, &b_t, &a_n, &b_n);
             if !did {
                 tokio::select! {
-                    _ = a_tx.notified() => {}
-                    _ = b_tx.notified() => {}
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+                    () = a_tx.notified() => {}
+                    () = b_tx.notified() => {}
+                    () = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
                 }
             }
         }
@@ -727,7 +727,7 @@ fn dangerous_client_config() -> rustls::ClientConfig {
 
 /// Single-node e2e: up() + status() sanity check.
 #[tokio::test]
-#[ignore]
+#[ignore = "requires TS_E2E_AUTHKEY + TS_E2E_TAILNET env vars (run via tools/e2e.sh)"]
 async fn e2e_register_only() {
     let authkey = std::env::var("TS_E2E_AUTHKEY").expect("TS_E2E_AUTHKEY not set");
     let _tailnet = std::env::var("TS_E2E_TAILNET").expect("TS_E2E_TAILNET not set");
@@ -782,7 +782,7 @@ async fn wait_for_peer(server: &Server, target_ip: std::net::IpAddr, label: &str
 /// Two-node e2e: spin up two tsnet servers, dial A->B, echo bytes.
 /// Every operation has a hard timeout; no unbounded waits.
 #[tokio::test]
-#[ignore]
+#[ignore = "requires TS_E2E_AUTHKEY + TS_E2E_TAILNET env vars (run via tools/e2e.sh)"]
 async fn e2e_two_nodes() {
     let authkey = std::env::var("TS_E2E_AUTHKEY").expect("TS_E2E_AUTHKEY not set");
     let _tailnet = std::env::var("TS_E2E_TAILNET").expect("TS_E2E_TAILNET not set");
@@ -839,7 +839,7 @@ async fn e2e_two_nodes() {
     // A dials B. Retry up to 3 times — the WG handshake may not have
     // completed when the peer first appears in the netmap, causing the
     // first dial to time out. Each attempt gives the handshake more time.
-    let dial_addr = format!("{}:4242", ip_b);
+    let dial_addr = format!("{ip_b}:4242");
     let mut stream_a = None;
     for attempt in 1..=3 {
         eprintln!("dial attempt {attempt} to {dial_addr}");
@@ -1016,7 +1016,7 @@ fn find_device_id(hostname_prefix: &str) -> Result<String, String> {
 /// approves it via the API, node B accepts routes, and B's route table must
 /// contain 192.0.2.0/24 -> A.
 #[tokio::test]
-#[ignore]
+#[ignore = "requires TS_E2E_AUTHKEY + TS_E2E_TAILNET env vars (run via tools/e2e.sh)"]
 async fn e2e_subnet_routes() {
     let authkey = std::env::var("TS_E2E_AUTHKEY").expect("TS_E2E_AUTHKEY not set");
     let _tailnet = std::env::var("TS_E2E_TAILNET").expect("TS_E2E_TAILNET not set");
@@ -1107,4 +1107,205 @@ async fn e2e_subnet_routes() {
 
     server_a.close().await;
     server_b.close().await;
+}
+
+// ---------------------------------------------------------------------------
+// WhoIs unit test (fake netmap — no control connection)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn whois_lookup_from_fake_netmap() {
+    use rustscale_tailcfg::UserProfile;
+    let peer = Node {
+        ID: 11,
+        Name: "host-b.tailnet.ts.net.".into(),
+        User: 7,
+        Key: NodePrivate::generate().public(),
+        Addresses: vec!["100.64.0.5/32".into(), "fd7a:115c:a1e0::5/128".into()],
+        ..Default::default()
+    };
+    let peers = vec![peer];
+    let mut ups = std::collections::BTreeMap::new();
+    ups.insert(
+        7,
+        UserProfile {
+            ID: 7,
+            LoginName: "bob@example.com".into(),
+            DisplayName: "Bob".into(),
+            ProfilePicURL: String::new(),
+        },
+    );
+    let ip: IpAddr = "100.64.0.5".parse().unwrap();
+    let info = whois_lookup(&peers, &ups, ip).expect("peer should be found");
+    assert!(info.found);
+    assert_eq!(info.node_name, "host-b.tailnet.ts.net.");
+    assert_eq!(info.user_id, 7);
+    assert_eq!(info.login_name, "bob@example.com");
+    assert_eq!(info.display_name, "Bob");
+    assert!(info.tailscale_ips.contains(&ip));
+
+    // Unknown IP → None.
+    let unknown: IpAddr = "100.64.0.99".parse().unwrap();
+    assert!(whois_lookup(&peers, &ups, unknown).is_none());
+}
+
+// ---------------------------------------------------------------------------
+// E2E: WhoIs + MagicDNS short-name dial + control cert "not enabled"
+// ---------------------------------------------------------------------------
+
+/// Two-node e2e: A does whois(B's IP) and gets B's hostname; A dials B by
+/// MagicDNS short name.
+#[tokio::test]
+#[ignore = "requires TS_E2E_AUTHKEY + TS_E2E_TAILNET env vars (run via tools/e2e.sh)"]
+async fn e2e_whois_and_magicdns_dial() {
+    let authkey = std::env::var("TS_E2E_AUTHKEY").expect("TS_E2E_AUTHKEY not set");
+    let _tailnet = std::env::var("TS_E2E_TAILNET").expect("TS_E2E_TAILNET not set");
+    let uid = std::process::id();
+
+    let mut server_a = Server::builder()
+        .hostname(format!("rustscale-e2e-whois-a-{uid}"))
+        .auth_key(authkey.clone())
+        .ephemeral(true)
+        .build()
+        .expect("build A");
+    server_a.up().await.expect("up A");
+
+    let mut server_b = Server::builder()
+        .hostname(format!("rustscale-e2e-whois-b-{uid}"))
+        .auth_key(authkey)
+        .ephemeral(true)
+        .build()
+        .expect("build B");
+    server_b.up().await.expect("up B");
+    let status_b = server_b.status();
+    let ip_b = status_b
+        .tailscale_ips
+        .iter()
+        .find_map(|ip| match ip {
+            IpAddr::V4(v4) => Some(*v4),
+            _ => None,
+        })
+        .expect("B should have an IPv4");
+
+    // B listens.
+    let mut listener = server_b.listen(4343).await.expect("listen");
+
+    // Wait for B to appear in A's netmap.
+    wait_for_peer(&server_a, ip_b.into(), "e2e_whois").await;
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    // WhoIs: A looks up B's IP → should get B's hostname.
+    let info = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        server_a.whois(ip_b.into()),
+    )
+    .await
+    .expect("whois timed out")
+    .expect("whois returned None (server up?)");
+    assert!(info.found, "whois should find peer for {ip_b}");
+    eprintln!("whois({ip_b}) -> node_name={}", info.node_name);
+    assert!(
+        info.node_name
+            .to_lowercase()
+            .contains(&format!("rustscale-e2e-whois-b-{uid}")),
+        "whois node_name should contain B's hostname, got {}",
+        info.node_name
+    );
+
+    // MagicDNS short-name dial: A dials B by its short hostname (first label
+    // of B's MagicDNS FQDN). The resolver resolves the short name from the
+    // netmap.
+    let short_name = format!("rustscale-e2e-whois-b-{uid}");
+    let dial_addr = format!("{short_name}:4343");
+    let mut stream_a = None;
+    for attempt in 1..=3 {
+        eprintln!("MagicDNS dial attempt {attempt} to {dial_addr}");
+        let r = tokio::time::timeout(
+            std::time::Duration::from_secs(45),
+            server_a.dial(&dial_addr),
+        )
+        .await;
+        match r {
+            Ok(Ok(s)) => {
+                stream_a = Some(s);
+                break;
+            }
+            Ok(Err(e)) => eprintln!("dial attempt {attempt} failed: {e}"),
+            Err(_) => eprintln!("dial attempt {attempt} timed out"),
+        }
+        if attempt < 3 {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+    }
+    let mut stream_a = stream_a.expect("MagicDNS short-name dial failed after 3 attempts");
+
+    // Echo roundtrip to confirm the connection works.
+    let mut stream_b = tokio::time::timeout(std::time::Duration::from_secs(30), listener.accept())
+        .await
+        .expect("accept timed out")
+        .expect("accept failed");
+    tokio::io::AsyncWriteExt::write_all(&mut stream_a, b"magicdns-ok")
+        .await
+        .expect("A write");
+    let mut buf = [0u8; 32];
+    let n = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        tokio::io::AsyncReadExt::read(&mut stream_b, &mut buf),
+    )
+    .await
+    .expect("B read timed out")
+    .expect("B read failed");
+    assert_eq!(&buf[..n], b"magicdns-ok");
+
+    tokio::io::AsyncWriteExt::shutdown(&mut stream_a).await.ok();
+    server_a.close().await;
+    server_b.close().await;
+}
+
+/// E2E: control cert provider on an ephemeral API-only tailnet. These
+/// tailnets do not have HTTPS/certs enabled, so the provider must return a
+/// clean typed `CertError::NotEnabled` (or, if HTTPS happens to be enabled,
+/// `AcmeClientUnavailable`). Either is acceptable; anything else fails.
+#[tokio::test]
+#[ignore = "requires TS_E2E_AUTHKEY + TS_E2E_TAILNET env vars (run via tools/e2e.sh)"]
+async fn e2e_control_cert_not_enabled() {
+    let authkey = std::env::var("TS_E2E_AUTHKEY").expect("TS_E2E_AUTHKEY not set");
+    let _tailnet = std::env::var("TS_E2E_TAILNET").expect("TS_E2E_TAILNET not set");
+    let uid = std::process::id();
+
+    let mut server = Server::builder()
+        .hostname(format!("rustscale-e2e-cert-{uid}"))
+        .auth_key(authkey)
+        .ephemeral(true)
+        .build()
+        .expect("build");
+    server.up().await.expect("up");
+
+    // Give control a moment to deliver DNSConfig.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    let result = server.control_cert_provider().await;
+    match result {
+        Err(CertError::NotEnabled(_)) => {
+            eprintln!("control cert: NotEnabled (expected for API-only tailnet)");
+        }
+        Err(CertError::AcmeClientUnavailable(_)) => {
+            eprintln!("control cert: AcmeClientUnavailable (HTTPS enabled, ACME client pending)");
+        }
+        Err(e) => panic!("expected NotEnabled or AcmeClientUnavailable, got: {e}"),
+        Ok(provider) => {
+            // If a real cert was provisioned, it must produce a non-empty chain.
+            assert!(!provider.cert_chain().is_empty(), "cert chain empty");
+            eprintln!("control cert: real cert provisioned (unexpected for API-only tailnet)");
+        }
+    }
+
+    // listen_tls must still succeed (falls back to self-signed).
+    let tls_listener = server
+        .listen_tls(9443)
+        .await
+        .expect("listen_tls should fall back");
+    eprintln!("listen_tls fell back to self-signed OK");
+    drop(tls_listener);
+    server.close().await;
 }

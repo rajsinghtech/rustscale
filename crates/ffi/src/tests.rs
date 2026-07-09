@@ -363,11 +363,14 @@ fn ffi_e2e_two_nodes_echo() {
     match done_rx.recv_timeout(std::time::Duration::from_secs(180)) {
         Ok(Ok(msg)) => eprintln!("{msg}"),
         Ok(Err(e)) => panic!("{e}"),
-        Err(_) => panic!(
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
             "ffi_e2e_two_nodes_echo: HARD DEADLINE exceeded (180s) — \
              an FFI blocking call hung. Internal timeouts (90s) should have \
              prevented this; investigate which call blocked."
         ),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("ffi_e2e_two_nodes_echo: worker thread panicked")
+        }
     }
 }
 
@@ -461,26 +464,20 @@ fn ffi_e2e_two_nodes_echo_body(authkey: &str) -> Result<String, String> {
 
     // Wait for A to see B's *specific* IP in its netmap (hard 90s deadline).
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
-    let mut found_peer = false;
     loop {
         let mut sbuf = [0u8; 4096];
         let sn = ts_status_json(a, sbuf.as_mut_ptr().cast::<c_char>(), 4096);
         if sn > 0 {
             let sstr = std::str::from_utf8(&sbuf[..sn as usize]).unwrap();
             if let Ok(sv) = serde_json::from_str::<serde_json::Value>(sstr) {
-                let found = sv["peers"]
-                    .as_array()
-                    .map(|peers| {
-                        peers.iter().any(|p| {
-                            p["ips"]
-                                .as_array()
-                                .map(|ips| ips.iter().any(|i| i.as_str() == Some(ip_b)))
-                                .unwrap_or(false)
-                        })
+                let found = sv["peers"].as_array().is_some_and(|peers| {
+                    peers.iter().any(|p| {
+                        p["ips"]
+                            .as_array()
+                            .is_some_and(|ips| ips.iter().any(|i| i.as_str() == Some(ip_b)))
                     })
-                    .unwrap_or(false);
+                });
                 if found {
-                    found_peer = true;
                     break;
                 }
             }
@@ -501,7 +498,6 @@ fn ffi_e2e_two_nodes_echo_body(authkey: &str) -> Result<String, String> {
         }
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
-    assert_or(found_peer, &format!("A never saw B ({ip_b}) in its netmap"))?;
 
     // Give the WG handshake a moment to complete after the peer appeared.
     std::thread::sleep(std::time::Duration::from_secs(3));
@@ -580,12 +576,4 @@ fn ffi_e2e_two_nodes_echo_body(authkey: &str) -> Result<String, String> {
     let _ = ts_close(b);
 
     Ok("ffi_e2e_two_nodes_echo: OK".into())
-}
-
-fn assert_or(cond: bool, msg: &str) -> Result<(), String> {
-    if cond {
-        Ok(())
-    } else {
-        Err(msg.into())
-    }
 }

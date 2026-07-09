@@ -103,7 +103,6 @@ pub struct Magicsock {
 
 struct Inner {
     node_public: NodePublic,
-    node_private: NodePrivate,
     disco: DiscoIo,
     udp: Option<Arc<UdpSocket>>,
     local_udp_addrs: Vec<String>,
@@ -269,15 +268,16 @@ impl DerpManager {
 
         let io = match io {
             Some(io) => io,
-            None => match self.get_or_connect(region_id).await {
-                Some(io) => io,
-                None => {
+            None => {
+                if let Some(io) = self.get_or_connect(region_id).await {
+                    io
+                } else {
                     eprintln!(
                         "magicsock: no DERP connection to region {region_id} for peer, dropping"
                     );
                     return false;
                 }
-            },
+            }
         };
 
         io.send_packet(dst, data).await;
@@ -353,7 +353,6 @@ impl Magicsock {
 
         let inner = Arc::new(Inner {
             node_public,
-            node_private: config.private_key,
             disco,
             udp,
             local_udp_addrs,
@@ -501,7 +500,7 @@ impl Magicsock {
                         .expect("endpoints lock poisoned");
                     endpoints
                         .get_mut(&peer_key)
-                        .is_some_and(|ep| ep.should_send_call_me_maybe())
+                        .is_some_and(endpoint::Endpoint::should_send_call_me_maybe)
                 };
                 if should {
                     let cmm = Message::CallMeMaybe(CallMeMaybe {
@@ -910,8 +909,7 @@ impl Inner {
             let endpoints = self.endpoints.read().expect("endpoints lock poisoned");
             endpoints
                 .get(&source)
-                .map(|ep| ep.derp_send_region())
-                .unwrap_or(0)
+                .map_or(0, endpoint::Endpoint::derp_send_region)
         };
 
         match msg {

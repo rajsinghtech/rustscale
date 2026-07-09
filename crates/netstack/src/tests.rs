@@ -125,9 +125,9 @@ async fn back_to_back_dial_and_echo() {
             let did_work = pump_cycle(&a_tunn_p, &b_tunn_p, &a_net_p, &b_net_p);
             if !did_work {
                 tokio::select! {
-                    _ = a_tx.notified() => {}
-                    _ = b_tx.notified() => {}
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+                    () = a_tx.notified() => {}
+                    () = b_tx.notified() => {}
+                    () = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
                 }
             }
         }
@@ -230,9 +230,9 @@ async fn backpressure_large_transfer_no_loss() {
             let did_work = pump_cycle(&a_tunn_p, &b_tunn_p, &a_net_p, &b_net_p);
             if !did_work {
                 tokio::select! {
-                    _ = a_tx.notified() => {}
-                    _ = b_tx.notified() => {}
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+                    () = a_tx.notified() => {}
+                    () = b_tx.notified() => {}
+                    () = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
                 }
             }
         }
@@ -258,7 +258,7 @@ async fn backpressure_large_transfer_no_loss() {
     // Build a 1 MB payload with a verifiable byte pattern. 1 MB >> the 65 KB
     // TCP send buffer, so the send buffer will fill repeatedly and the
     // backpressure path is exercised on every cycle.
-    const PAYLOAD_SIZE: usize = 1 * 1024 * 1024;
+    const PAYLOAD_SIZE: usize = 1024 * 1024;
     let payload: Vec<u8> = (0..PAYLOAD_SIZE)
         .map(|i| (i % 251) as u8) // prime modulus for a non-trivial pattern
         .collect();
@@ -344,9 +344,9 @@ async fn latency_small_message_round_trip() {
             let did_work = pump_cycle(&a_tunn_p, &b_tunn_p, &a_net_p, &b_net_p);
             if !did_work {
                 tokio::select! {
-                    _ = a_tx.notified() => {}
-                    _ = b_tx.notified() => {}
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+                    () = a_tx.notified() => {}
+                    () = b_tx.notified() => {}
+                    () = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
                 }
             }
         }
@@ -412,14 +412,10 @@ async fn latency_small_message_round_trip() {
     let p95 = rtts[ROUNDS * 95 / 100];
     let p99 = rtts[ROUNDS * 99 / 100];
 
-    eprintln!(
-        "latency_small_message_round_trip: p50={:?} p95={:?} p99={:?}",
-        p50, p95, p99
-    );
+    eprintln!("latency_small_message_round_trip: p50={p50:?} p95={p95:?} p99={p99:?}");
 
     assert!(
         p50 < std::time::Duration::from_millis(20),
-        "p50 latency too high: {:?} (expected < 20ms)",
-        p50
+        "p50 latency too high: {p50:?} (expected < 20ms)"
     );
 }

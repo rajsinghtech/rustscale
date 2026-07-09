@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 use std::ffi::CStr;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::os::raw::{c_char, c_int};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -431,6 +431,60 @@ fn status_to_json(st: &rustscale_tsnet::ServerStatus) -> serde_json::Value {
         "peer_count": st.peer_count,
         "peers": peers,
         "packet_drops": st.packet_drops,
+    })
+}
+
+/// Look up the peer owning a tailnet IP address (WhoIs). `addr` is a string
+/// IP (e.g. `"100.64.0.5"`). Writes a JSON object into `buf`:
+/// `{"found":bool,"node_name":...,"tailscale_ips":[...],"user_id":...,
+/// "login_name":...,"display_name":...}`. Returns bytes written (excluding
+/// the NUL terminator), or a negative errno-style code on error. If no peer
+/// matches (or the server is not up), `found` is `false`.
+#[no_mangle]
+pub extern "C" fn ts_whois(
+    handle: c_int,
+    addr: *const c_char,
+    buf: *mut c_char,
+    buflen: c_int,
+) -> c_int {
+    catch("ts_whois", || {
+        let Some(addr_s) = cstr_to_string(addr) else {
+            return RS_ERR_INVAL;
+        };
+        let ip: IpAddr = if let Ok(ip) = addr_s.trim().parse() {
+            ip
+        } else {
+            let mut t = table().lock().expect("table poisoned");
+            set_server_error(&mut t, handle, format!("invalid addr: {addr_s}"));
+            return RS_ERR_INVAL;
+        };
+
+        // Clone the Arc, release the global lock.
+        let server_arc = {
+            let mut t = table().lock().expect("table poisoned");
+            let Some(e) = t.servers.get_mut(&handle) else {
+                return RS_ERR_NOENT;
+            };
+            if let Some(arc) = &e.server {
+                arc.clone()
+            } else {
+                e.last_error = "server not up".into();
+                return RS_ERR_BUSY;
+            }
+        };
+
+        let info = {
+            let server = server_arc.lock().expect("server mutex poisoned");
+            runtime().block_on(server.whois(ip))
+        };
+        let json = match info {
+            Some(i) => {
+                serde_json::to_value(&i).unwrap_or_else(|_| serde_json::json!({"found":false}))
+            }
+            None => serde_json::json!({"found":false}),
+        };
+        let s = serde_json::to_string(&json).unwrap_or_else(|_| "{\"found\":false}".into());
+        write_to_buf(buf, buflen, &s)
     })
 }
 

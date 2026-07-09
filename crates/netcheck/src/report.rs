@@ -117,8 +117,7 @@ pub fn pick_preferred(region_latency: &BTreeMap<i32, Duration>) -> i32 {
     region_latency
         .iter()
         .min_by_key(|(_, d)| *d)
-        .map(|(rid, _)| *rid)
-        .unwrap_or(0)
+        .map_or(0, |(rid, _)| *rid)
 }
 
 #[cfg(test)]

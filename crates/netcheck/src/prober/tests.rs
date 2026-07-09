@@ -57,19 +57,19 @@ fn map_from_servers(servers: &[(i32, FakeStunServer)]) -> DERPMap {
     let mut regions = BTreeMap::new();
     for (rid, srv) in servers {
         let node = DERPNode {
-            Name: format!("{}a", rid),
+            Name: format!("{rid}a"),
             RegionID: *rid,
-            HostName: format!("derp{}.tailscale.com", rid),
+            HostName: format!("derp{rid}.tailscale.com"),
             STUNTestIP: srv.addr.ip().to_string(),
-            STUNPort: srv.addr.port() as i32,
+            STUNPort: i32::from(srv.addr.port()),
             ..Default::default()
         };
         regions.insert(
             *rid,
             DERPRegion {
                 RegionID: *rid,
-                RegionCode: format!("r{}", rid),
-                RegionName: format!("Region {}", rid),
+                RegionCode: format!("r{rid}"),
+                RegionName: format!("Region {rid}"),
                 Nodes: Some(vec![node]),
                 ..Default::default()
             },
@@ -90,7 +90,7 @@ async fn prober_picks_lowest_latency_region() {
     let fast = FakeStunServer::start(None, Duration::ZERO).await.unwrap();
     let dm = map_from_servers(&[(1, slow), (2, fast)]);
 
-    let prober = Prober::default();
+    let prober = Prober;
     let opts = ProberOpts {
         report_timeout: Duration::from_secs(2),
         probe_timeout: Duration::from_millis(400),
@@ -116,7 +116,7 @@ async fn prober_reports_reflexive_v4_endpoint() {
         .unwrap();
     let dm = map_from_servers(&[(1, srv)]);
 
-    let prober = Prober::default();
+    let prober = Prober;
     let report = prober
         .run(&dm, &ProberOpts::default())
         .await
@@ -139,7 +139,7 @@ async fn prober_detects_mapping_varies_by_dest() {
         .unwrap();
     let dm = map_from_servers(&[(1, srv1), (2, srv2)]);
 
-    let prober = Prober::default();
+    let prober = Prober;
     let report = prober
         .run(&dm, &ProberOpts::default())
         .await
@@ -163,7 +163,7 @@ async fn prober_detects_mapping_consistent_across_dest() {
         .unwrap();
     let dm = map_from_servers(&[(1, srv1), (2, srv2)]);
 
-    let prober = Prober::default();
+    let prober = Prober;
     let report = prober
         .run(&dm, &ProberOpts::default())
         .await
@@ -201,7 +201,7 @@ async fn prober_skips_disabled_stun() {
         ..Default::default()
     };
 
-    let prober = Prober::default();
+    let prober = Prober;
     let err = prober.run(&dm, &ProberOpts::default()).await.unwrap_err();
     assert!(matches!(err, NetcheckError::NoRegions), "{err:?}");
 }
@@ -234,7 +234,7 @@ async fn prober_handles_unreachable_region() {
         ..Default::default()
     };
 
-    let prober = Prober::default();
+    let prober = Prober;
     let opts = ProberOpts {
         report_timeout: Duration::from_millis(800),
         probe_timeout: Duration::from_millis(100),
@@ -254,7 +254,7 @@ async fn prober_sets_os_has_ipv6_when_bindable() {
     let can_bind = UdpSocket::bind("[::1]:0").await.is_ok();
     let srv = FakeStunServer::start(None, Duration::ZERO).await.unwrap();
     let dm = map_from_servers(&[(1, srv)]);
-    let report = Prober::default()
+    let report = Prober
         .run(&dm, &ProberOpts::default())
         .await
         .expect("report");

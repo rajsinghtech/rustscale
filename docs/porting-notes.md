@@ -332,3 +332,181 @@ Key conversion from our types: `NodePrivate::raw32()` / `NodePublic::raw32()`
 **Phase-4 note**: the magicsock agent did NOT read these Go files — it used
 boringtun docs + existing Rust crate APIs. For deeper magicsock porting
 (disco pings, path selection, relay), read the specific line ranges above.
+
+## Control-plane wire protocol (ts2021) — established live in phase 5
+
+Every fact below was verified against the real `controlplane.tailscale.com`
+during phase-5 e2e debugging. Re-read the Go sources only if you need a field
+this summary omits. Source: `control/controlhttp/`, `control/controlbase/`,
+`control/controlclient/direct.go`, `control/ts2021/`.
+
+### Connection setup, in order
+
+1. **Fetch the server's Noise public key over plain TLS** — `GET https://<control>/key?v=<capability_version>`.
+   Response JSON: `{"publicKey":"mkey:...","legacyPublicKey":"mkey:..."}`. Use
+   `publicKey` as the Noise `ControlKey` (the server's *machine* public key).
+   Go: `loadServerPubKeys` in `direct.go:1533`. **This is NOT optional** — if you
+   pass your own machine key as the control key, the server can't decrypt the
+   initiation and closes the connection (EOF).
+
+2. **HTTP/1.1 upgrade to `/ts2021`** — `POST https://<control>/ts2021` with
+   headers `Upgrade: tailscale-control-protocol`, `Connection: upgrade`, and
+   **`X-Tailscale-Handshake: <base64(initiation)>`**. The 101-byte Noise
+   initiation message goes **base64-encoded in the `X-Tailscale-Handshake`
+   request header**, NOT in the POST body and NOT after the 101. Header constant
+   `HandshakeHeaderName = "X-Tailscale-Handshake"` (`controlhttpcommon`). Server
+   replies `101 Switching Protocols` (parse the numeric code from the full
+   status line — `"HTTP/1.1 101 ..."` does not `starts_with("101")`).
+
+3. **Noise handshake response arrives on the upgraded stream** — the 51-byte
+   server response is the first bytes after the `101` headers on the upgraded
+   connection. If your byte-by-byte header reader over-reads past `\r\n\r\n`,
+   prepend those trailing bytes to the Noise response read (Tailscale's Go
+   client drains them from `resp.Body`; we capture them explicitly).
+
+4. **Optional early payload before HTTP/2** — after the Noise handshake, the
+   server MAY send 9 bytes before HTTP/2 begins. If the first 5 bytes are
+   `\xff\xff\xffTS` (`EarlyPayloadMagic`), it's a JSON `EarlyNoise` message with
+   a **4-byte BE** length prefix. Otherwise those 9 bytes are the server's first
+   HTTP/2 frame (SETTINGS) and MUST be prepended back to the stream before h2.
+
+5. **HTTP/2 runs inside the Noise tunnel** — the connection is NOT raw JSON
+   frames. Go's `ts2021.Client` uses `http.Transport` with
+   `SetUnencryptedHTTP2(true)` + a custom `DialTLSContext` returning the Noise
+   `Conn`. In Rust: add the `h2` crate, wrap the Noise record stream in an
+   `AsyncRead+AsyncWrite` adapter (`NoiseIo` in `controlbase.rs` — spawns two
+   pump tasks bridging the duplex ↔ Noise record encrypt/decrypt), then
+   `h2::client::handshake()`. The client sends the standard HTTP/2 preface
+   (`PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n` + SETTINGS).
+
+### Post-handshake record framing (controlbase)
+
+Each Noise record on the wire: `u8 type (4=record) + u16 BE ciphertext-length +
+ChaCha20Poly1305 ciphertext`. `MAX_MESSAGE_SIZE=4096`, `MAX_PLAINTEXT=4077`. The
+12-byte AEAD nonce is BE, incrementing per record. The `NoiseIo` adapter hides
+this from h2 by presenting a raw byte stream.
+
+**tx/rx cipher direction (cost a real-server failure)**: after the IK `Split`,
+Go **client** uses `tx=c1, rx=c2`; Go **server** uses `tx=c2, rx=c1`. If you
+swap both sides consistently your own client/server unit tests pass but the real
+server fails. Match Go's direction exactly.
+
+**Protocol/Capability version = 141** (current as of phase 5). The version is
+mixed into the Noise prologue as `"Tailscale Control Protocol v<version>"`.
+`RegisterRequest.Version` is set to `CurrentCapabilityVersion` (141) right before
+sending (Go sets `1` initially then overrides). The server accepts any version
+in the initiation, but use current to avoid negotiation surprises.
+
+### HTTP/2 requests inside the Noise tunnel
+
+- **Register**: `POST /machine/register` with JSON `RegisterRequest` body →
+  standard HTTP/2 request/response. Response body is JSON `RegisterResponse`.
+  The authkey goes in `Auth: Option<RegisterResponseAuth>{ AuthKey }` — **not**
+  a top-level field. Go: `request.Auth = &tailcfg.RegisterResponseAuth{AuthKey:
+  authKey}` when `authKey != ""` (`direct.go:809`). Also set `NodeKey`,
+  `OldNodeKey` (zero for first register), `Hostinfo`, `Version`, `Timestamp`.
+  `ts2021.AddLBHeader` adds `X-Node-Key`/`X-Old-Node-Key` LB-routing headers.
+
+- **Map poll**: `POST /machine/map` with JSON `MapRequest` body → HTTP/2 `200
+  OK`, then the response body is a stream of **4-byte LE (little-endian)
+  size-prefixed** JSON `MapResponse` messages. This is *application-level*
+  framing within the HTTP/2 response body, not HTTP/2 frame framing. Read loop:
+  `u32 LE length`, then `length` bytes of JSON, repeat until EOF/long-poll close.
+  Utilities: `decode_map_frames` / `encode_map_frame` (`client.rs`).
+
+### MapResponse semantics learned the hard way
+
+- **`PeersChanged` carries the initial peer list, not `Peers`.** The control
+  server sends peers via `PeersChanged` (the delta field) even in the FIRST
+  `MapResponse`; `Peers` (the full list) is often empty. When bootstrapping from
+  the first response you must check `PeersChanged` (fall back to it when `Peers`
+  is empty). Subsequent responses stream deltas via `PeersChanged` + removals via
+  `PeersRemoved`; merge by node key.
+
+- **`KeepAlive` responses must be skipped** (`if resp.KeepAlive { continue; }`)
+  — they carry no peer data and must not be processed as peer updates.
+
+- **Go nil slices/maps marshal as JSON `null`**. Multiple `Vec` and `BTreeMap`
+  fields in `MapResponse`/`Node`/`DERPMap` receive explicit `null` from the
+  server. Rust `Vec<T>`/`BTreeMap` with `#[serde(default)]` only default when the
+  field is *missing*, not on explicit `null` — deserialization fails with
+  `"invalid type: null, expected a sequence"`. Fix: a `deserialize_null_to_default`
+  helper (`Option<T>::deserialize(d)?.unwrap_or_default()`), applied to all
+  server-received Vec/map fields. For `DERPMap.Regions` (int-keyed map) use a
+  combined `deserialize_int_key_null`. `NodeCapMap` values can be `null` too →
+  custom `deserialize_capmap`. And `RawMessage` must accept ANY JSON type
+  (bool/num/null, not just strings) — use `serde_json::Value`, not
+  `#[serde(transparent)]` over `String`.
+
+### DERP relay connection
+
+- **TLS SNI must use the DERP node `HostName`, not its IP.** Connecting TCP to
+  the IP is fine, but the TLS `ServerName` must be the hostname (e.g.
+  `derp1.tailscale.com`) — passing an IP gives `received fatal alert:
+  InternalError`. So `connect_with_upgrade` takes separate TCP-dial-host and
+  TLS-SNI-host params.
+
+## rustls crypto provider (aws-lc-rs vs ring)
+
+`rustls` and `tokio-rustls` default features include `aws_lc_rs`. If you add
+`ring`, both providers compile in and rustls panics at runtime:
+`"Could not automatically determine the process-level CryptoProvider"`. Fix at
+the source:
+```toml
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+```
+Belt-and-suspenders: install the ring provider once via
+`rustls::crypto::ring::default_provider().install_default()` guarded by
+`std::sync::Once`, ignoring the `AlreadyInstalled` error. Called in
+`tsnet::Server::up()`, `controlclient/src/controlhttp.rs`, `derp/src/client.rs`.
+
+## TUN device platform API (`crates/tun`)
+
+Established in phase 6. All needed constants are in the `libc` crate; no
+`unsafe` is needed in our own source *except* the raw syscalls for utun, so the
+`tun` crate sets `#![allow(unsafe_code)]` at the module level (workspace is
+`forbid`).
+
+### macOS — utun
+
+1. `socket(PF_SYSTEM, SOCK_DGRAM, SYSPROTO_CONTROL=2)` → fd.
+2. `CTLIOCGINFO` ioctl with `"com.apple.net.utun_control"` → fills `ctl_info`
+   (gives the 4-byte `ctl_id`).
+3. `connect` with `sockaddr_ctl { sc_id: ctl_id, sc_len, sc_family: AF_SYSTEM,
+   ss_sysaddr: AF_SYS_CONTROL, sc_unit: ifIndex+1, ... }`.
+4. `getsockopt(fd, SYSPROTO_CONTROL=2, UTUN_OPT_IFNAME=2)` → interface name.
+5. Set nonblocking; wrap fd in `tokio::io::AsyncFd`.
+6. **4-byte AF header framing**: reads include it at the front — `buf[3]` is
+   `AF_INET`(2) / `AF_INET6`(30); the actual packet starts at offset 4. Writes
+   must prepend it: `buf[0..3] = 0`, `buf[3] = AF_INET|AF_INET6` chosen from
+   `buf[4] >> 4` (the IP-version nibble of the first packet byte). Callers see
+   plain IP packets — the crate strips/prepends the header internally.
+
+### Linux — `/dev/net/tun`
+
+`open("/dev/net/tun")` + `TUNSETIFF` ioctl with `IFF_TUN | IFF_NO_PI` → plain
+packets, **no AF header**. `ifreq` struct via `libc::ifreq` (union access needs
+`unsafe`). cfg-gated `#[cfg(target_os = "linux")]`; compiles on macOS but is
+untestable there. Use `tokio::io::AsyncFd` for async IO.
+
+### Routing into TUN mode
+
+`Server::up_tun(TunModeConfig)` shares a `bootstrap()` with `up()`, then runs a
+pump racing `tun.read_packet()` (→ longest-prefix route lookup over peer
+`AllowedIPs`/`Addresses` via `RouteTable` → WG encapsulate → magicsock send)
+against `magicsock.poll_recv()` (→ WG decapsulate → TUN write) and a 250ms WG
+timer tick. `RouteTable` is longest-prefix-match; when `AllowedIPs` is empty
+(Go sends `null` → empty after deserialize), fall back to `Addresses`.
+
+## Packet filter (`crates/filter`) — phase 7
+
+Go semantics replicated (see `crates/filter/src/lib.rs`): TCP non-SYN packets
+always pass (only SYN is matched); UDP uses a 512-entry size-based LRU flow
+cache keyed on the *reversed* 5-tuple (outbound records, inbound checks);
+`localNets` prefilter drops packets whose dst IP isn't ours; `PacketFilters`
+deltas keyed by name with a `"base"` default key (`"*"` with None clears all);
+ICMP echo-reply/error always accepted, echo-requests match IPs only; `pre()`
+handles multicast/link-local/fragment/unknown-proto before proto-specific logic.
+For the rule/parse types see `crates/tailcfg/src/filter.rs`
+(`FilterRule`, `NetPortRange`, `CapGrant`).

@@ -103,20 +103,55 @@ cites the session that surfaced it.
   different lint warning, fixing one, re-running. **Fix**: `tools/clippy-all.sh`
   now shows ALL warnings grouped by type in one pass. Tell agents to fix all
   clippy warnings in a single pass, not one-at-a-time. *(phase-4)*
+- **Re-reading its own large files dozens of times (THE #1 sink in phases 5–7)**
+  → `crates/tsnet/src/lib.rs` was re-read 28× (phase 5), **38×** (phase 6), and
+  **53×** (phase 7) — 124K chars in phase 7 alone. Other own files re-read 10–15×
+  each: `controlbase.rs` 11×, `controlhttp.rs` 10×, `filter/lib.rs` 15×,
+  `filter/state.rs` 14×, `filter/tests.rs` 13×, `tun/darwin.rs` 5×. Once an own
+  file exceeds ~300 lines, full re-reads dominate the token budget. **Fix**: tell
+  agents "In your OWN files, NEVER re-read the whole file to find/edit one spot —
+  use `tools/where.sh <pattern> <file>` (prints `grep -n` line numbers) or read a
+  narrow offset/limit window around the target line. Only re-read a whole file
+  once, at the start, to learn its shape." *(phase-5, phase-6, phase-7)*
+- **`tools/clippy-all.sh` can dump 49K chars in one call (phase 7)** → the
+  filter crate had hundreds of unique warning lines; the dedupe is line-level so
+  they all printed in one 48,960-char output. **Fix**: `clippy-all.sh` now caps
+  at 50 unique warning lines with a "(N more…)" note. *(phase-7)*
+- **`sleep N && ps -p PID && tail log` busy-polling a backgrounded build
+  (phase 7)** → 10 calls, 16K chars, each costing a full agent turn. **Fix**: use
+  `tools/wait-build.sh <pid> <logfile> [timeout]` which polls internally and
+  prints only the final log tail + exit code. Or, better, don't background the
+  build — run it foreground with a timeout; the agent can't do useful work while
+  waiting anyway. *(phase-7)*
+- **Cargo-registry / tokio-source grepping for low-level APIs (phase 6)** → the
+  TUN agent read `tokio-1.52.1/src/io/async_fd.rs` (8.5K) and grepped
+  `libc-0.2.186` for utun/syscall constants — same anti-pattern as phase-3b's
+  crypto-registry crawl, now for platform syscalls. **Fix**: porting-notes now
+  distills the macOS utun syscall sequence + the tokio `AsyncFd` API, so future
+  TUN/low-level agents don't grep the registry. *(phase-6)*
+- **Real-server e2e debugging surfaced 8 non-obvious control-plane wire facts
+  (phase 5)** → HTTP/2-over-Noise, the `/key` fetch, initiation-in-`X-Tailscale-
+  Handshake`-header, tx/rx cipher direction, `PeersChanged`-as-initial-list,
+  4-byte-LE map framing, Go-nil→JSON-`null` deserialization, DERP-SNI-must-be-
+  hostname. Each cost a full register/map e2e iteration to rediscover. **Fix**:
+  all distilled into `docs/porting-notes.md` § "Control-plane wire protocol
+  (ts2021)". Future control-plane agents MUST read that section first.
+  *(phase-5)*
 
 ## Patterns to fold into future phase prompts
 
 1. Include the line: "Before reading Go sources, check `docs/porting-notes.md`
    for already-distilled facts (key formats, crypto_box API, tailcfg.go type
-   map, Noise crypto crates, boringtun API, Go source file maps). Only read
-   the specific Go line ranges you still need."
+   map, Noise crypto crates, boringtun API, **control-plane wire protocol
+   (ts2021)**, TUN platform API, rustls provider, Go source file maps). Only
+   read the specific Go line ranges you still need."
 2. Include the line: "Run `tools/check.sh` (or `tools/check.sh <crate>`) to
    verify. It is silent on success and prints only ~50 lines on failure — do
    NOT dump full `cargo` output into your context."
 3. For any new external crate, state the exact constructor/entry API up front
    (by-value vs by-ref, feature flags). Check porting-notes first — many
    crates are already documented there (crypto_box, curve25519-dalek,
-   chacha20poly1305, blake2, boringtun).
+   chacha20poly1305, blake2, boringtun, smoltcp, h2, tokio AsyncFd).
 4. For any crate mirroring Go wire types, preempt:
    "Add `#![allow(non_snake_case)]` at the crate root since fields mirror
    Go's PascalCase JSON."
@@ -126,12 +161,30 @@ cites the session that surfaced it.
    `docs/porting-notes.md`. If you need a crate not documented there, ask
    the orchestrator instead of grepping the registry."
 7. Include the line: "To find a specific function/test in your own files,
-   use `grep -n 'fn name'` instead of re-reading the whole file. Only
-   re-read if you need surrounding context for an edit."
+   use `tools/where.sh <pattern> <file>` (or `grep -n`) instead of re-reading
+   the whole file. Only re-read if you need surrounding context for an edit.
+   NEVER re-read a >300-line file of your own just to locate one function."
 8. Include the line: "Run `tools/clippy-all.sh <crate>` to see ALL clippy
-   warnings in one pass. Fix them all before re-running — do not fix one
-   warning at a time."
+   warnings in one pass (capped at 50 lines). Fix them all before re-running
+   — do not fix one warning at a time."
 9. For Noise/control-protocol work, preempt the known gotchas: "Use
    `ChaCha20Poly1305` (12-byte nonce), NOT `XChaCha20Poly1305`. Do not add
    `hkdf` or `digest` crates — hand-roll HMAC-BLAKE2s. See
-   `crates/controlclient/src/controlbase.rs` for the working pattern."
+   `crates/controlclient/src/controlbase.rs` for the working pattern. **And
+   read `docs/porting-notes.md` § "Control-plane wire protocol (ts2021)"
+   before touching the control plane** — it covers the /key fetch, the
+   X-Tailscale-Handshake header, HTTP/2-over-Noise, tx/rx cipher direction,
+   PeersChanged-as-initial-list, 4-byte-LE map framing, Go-nil→null
+   deserialization, and DERP SNI. Rediscovering these costs 8+ real-server
+   iterations."
+10. For any server-received Go wire struct, preempt: "Go nil slices/maps
+    marshal as JSON `null`; use `deserialize_null_to_default` on all
+    Vec/map fields the server sends (Peers, PeersChanged, Addresses,
+    AllowedIPs, Capabilities, CapMap values, DERPMap.Regions, …). And
+    `RawMessage` must accept any JSON type — use `serde_json::Value`."
+11. For TUN/platform work, preempt: "macOS utun syscall sequence, AF-header
+    framing, and tokio `AsyncFd` are in porting-notes § TUN device platform
+    API. Linux is `/dev/net/tun` + `TUNSETIFF`, no AF header. The `tun`
+    crate sets `#![allow(unsafe_code)]` because workspace forbids it."
+12. For long background builds, do NOT background-then-poll with `sleep`.
+    Either run foreground with a timeout, or use `tools/wait-build.sh`.

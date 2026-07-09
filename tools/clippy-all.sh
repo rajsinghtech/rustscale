@@ -31,9 +31,14 @@ trap 'rm -f "$TMP"' EXIT
 cargo clippy "${PKG[@]}" "${WS[@]}" --all-targets 2>&1 > "$TMP" || true
 
 # Extract unique warning lines, strip ANSI, sort for stable output.
-sed 's/\x1b\[[0-9;]*m//g' "$TMP" \
+# CAP at 50 unique lines — a crate can emit hundreds of unique warnings and
+# dumping them all (49K chars seen in phase 7) wastes the agent's context.
+CAP=50
+WARNINGS=$(sed 's/\x1b\[[0-9;]*m//g' "$TMP" \
   | grep -E '^warning:' \
-  | sort -u
+  | sort -u)
+TOTAL=$(printf '%s\n' "$WARNINGS" | grep -c . || true)
+printf '%s\n' "$WARNINGS" | head -n "$CAP"
 
 # If there were errors, show those too.
 if grep -qE '^error' "$TMP"; then
@@ -41,10 +46,13 @@ if grep -qE '^error' "$TMP"; then
   sed 's/\x1b\[[0-9;]*m//g' "$TMP" | grep -E '^error' | head -30
 fi
 
-# Summary count.
-COUNT=$(sed 's/\x1b\[[0-9;]*m//g' "$TMP" | grep -cE '^warning:' || true)
-if [ "$COUNT" -eq 0 ]; then
+# Summary count (reflects the full unique set, not just what was printed).
+if [ "$TOTAL" -eq 0 ]; then
   echo "clippy: clean"
 else
-  echo "clippy: $COUNT warning(s) (deduplicated)"
+  if [ "$TOTAL" -gt "$CAP" ]; then
+    echo "clippy: $TOTAL unique warning(s) (showing first $CAP; run 'cargo clippy ${PKG[*]:-}${WS[*]:-} --all-targets' for the full list)"
+  else
+    echo "clippy: $TOTAL warning(s) (deduplicated)"
+  fi
 fi

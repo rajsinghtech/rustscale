@@ -107,6 +107,12 @@ Feature-port order (user-specified 2026-07-09):
 Then: mobile/constrained targets, Linux perf (GSO/GRO, io_uring via CI), Taildrop,
 DERP+peer relay server. Standing constraint: tsnet public API stays C-representable.
 
+**Full tiered gap inventory: `docs/parity.md`** (Tier 1 core compat → Tier 5 server-side).
+Update its status column as phases land; agents should consult it for Go source paths.
+Items the execution order above doesn't cover yet (split DNS, Tailscale Services/
+ListenService, multi-profile, netmap disk cache, peer MTU, DNS cache/fallback,
+CapturePcap, captive portal wiring, etc.) get scheduled from that file after port-10.
+
 ## Reference sources (read-only)
 
 - `/Users/rajsingh/Documents/GitHub/tailscale` — the Go implementation. Key dirs:

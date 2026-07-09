@@ -488,6 +488,79 @@ pub extern "C" fn ts_whois(
     })
 }
 
+/// Select an exit node by tailnet IP or MagicDNS hostname. The peer must be
+/// exit-node-capable (AllowedIPs containing 0.0.0.0/0). Returns 0 on success,
+/// a negative errno-style code on error. Requires the server to be up.
+#[no_mangle]
+pub extern "C" fn ts_set_exit_node(handle: c_int, addr: *const c_char) -> c_int {
+    catch("ts_set_exit_node", || {
+        let Some(addr_s) = cstr_to_string(addr) else {
+            return RS_ERR_INVAL;
+        };
+
+        let server_arc = {
+            let mut t = table().lock().expect("table poisoned");
+            let Some(e) = t.servers.get_mut(&handle) else {
+                return RS_ERR_NOENT;
+            };
+            if let Some(arc) = &e.server {
+                arc.clone()
+            } else {
+                e.last_error = "server not up".into();
+                return RS_ERR_BUSY;
+            }
+        };
+
+        let result = {
+            let server = server_arc.lock().expect("server mutex poisoned");
+            runtime().block_on(server.set_exit_node(&addr_s))
+        };
+
+        match result {
+            Ok(()) => RS_OK,
+            Err(e) => {
+                let mut t = table().lock().expect("table poisoned");
+                set_server_error(&mut t, handle, e.to_string());
+                RS_ERR_UNKNOWN
+            }
+        }
+    })
+}
+
+/// Clear the selected exit node. Returns 0 on success, a negative errno-style
+/// code on error. Requires the server to be up.
+#[no_mangle]
+pub extern "C" fn ts_clear_exit_node(handle: c_int) -> c_int {
+    catch("ts_clear_exit_node", || {
+        let server_arc = {
+            let mut t = table().lock().expect("table poisoned");
+            let Some(e) = t.servers.get_mut(&handle) else {
+                return RS_ERR_NOENT;
+            };
+            if let Some(arc) = &e.server {
+                arc.clone()
+            } else {
+                e.last_error = "server not up".into();
+                return RS_ERR_BUSY;
+            }
+        };
+
+        let result = {
+            let server = server_arc.lock().expect("server mutex poisoned");
+            runtime().block_on(server.clear_exit_node())
+        };
+
+        match result {
+            Ok(()) => RS_OK,
+            Err(e) => {
+                let mut t = table().lock().expect("table poisoned");
+                set_server_error(&mut t, handle, e.to_string());
+                RS_ERR_UNKNOWN
+            }
+        }
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Listen + Accept
 // ---------------------------------------------------------------------------

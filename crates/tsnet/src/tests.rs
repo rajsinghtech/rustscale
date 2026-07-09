@@ -295,6 +295,158 @@ fn builder_defaults_no_routes() {
         .unwrap();
     assert!(server.config.advertise_routes.is_empty());
     assert!(!server.config.accept_routes);
+    assert!(!server.config.advertise_exit_node);
+}
+
+/// Builder stores advertise_exit_node flag.
+#[test]
+fn builder_stores_advertise_exit_node() {
+    let server = ServerBuilder::default()
+        .hostname("exit")
+        .auth_key("tskey-x")
+        .advertise_exit_node(true)
+        .build()
+        .unwrap();
+    assert!(server.config.advertise_exit_node);
+    // effective_advertise_routes must include the default routes.
+    let routes = server.config.effective_advertise_routes();
+    assert!(routes.contains(&"0.0.0.0/0".to_string()));
+    assert!(routes.contains(&"::/0".to_string()));
+}
+
+/// Builder with advertise_exit_node=false has no exit routes.
+#[test]
+fn builder_no_exit_node_no_default_routes() {
+    let server = ServerBuilder::default()
+        .hostname("x")
+        .auth_key("k")
+        .advertise_routes(vec!["192.0.2.0/24".into()])
+        .build()
+        .unwrap();
+    let routes = server.config.effective_advertise_routes();
+    assert!(!routes.contains(&"0.0.0.0/0".to_string()));
+    assert_eq!(routes, vec!["192.0.2.0/24"]);
+}
+
+/// effective_advertise_routes avoids duplicate default routes.
+#[test]
+fn effective_routes_no_duplicate_defaults() {
+    let server = ServerBuilder::default()
+        .hostname("x")
+        .auth_key("k")
+        .advertise_routes(vec!["0.0.0.0/0".into(), "192.0.2.0/24".into()])
+        .advertise_exit_node(true)
+        .build()
+        .unwrap();
+    let routes = server.config.effective_advertise_routes();
+    let default_count = routes.iter().filter(|r| *r == "0.0.0.0/0").count();
+    assert_eq!(default_count, 1, "0.0.0.0/0 should appear exactly once");
+    assert!(routes.contains(&"::/0".to_string()));
+    assert!(routes.contains(&"192.0.2.0/24".to_string()));
+}
+
+// ---------------------------------------------------------------------------
+// Exit-node peer resolution (fake netmap — no control connection)
+// ---------------------------------------------------------------------------
+
+fn exit_peer(name: &str, ip: &str, key: NodePublic) -> Node {
+    Node {
+        ID: 1,
+        Name: name.to_string(),
+        Key: key,
+        Addresses: vec![format!("{ip}/32")],
+        AllowedIPs: vec![format!("{ip}/32"), "0.0.0.0/0".into()],
+        ..Default::default()
+    }
+}
+
+fn normal_peer(name: &str, ip: &str, key: NodePublic) -> Node {
+    Node {
+        ID: 2,
+        Name: name.to_string(),
+        Key: key,
+        Addresses: vec![format!("{ip}/32")],
+        AllowedIPs: vec![format!("{ip}/32")],
+        ..Default::default()
+    }
+}
+
+#[test]
+fn resolve_exit_node_by_ip() {
+    let exit_key = NodePrivate::generate();
+    let exit = exit_peer("exit.tailnet.ts.net.", "100.64.0.5", exit_key.public());
+    let peers = vec![exit];
+    let key = resolve_exit_node(&peers, "100.64.0.5").expect("should resolve");
+    assert_eq!(key, exit_key.public());
+}
+
+#[test]
+fn resolve_exit_node_by_fqdn() {
+    let exit_key = NodePrivate::generate();
+    let exit = exit_peer("exit.tailnet.ts.net.", "100.64.0.5", exit_key.public());
+    let peers = vec![exit];
+    let key = resolve_exit_node(&peers, "exit.tailnet.ts.net").expect("should resolve");
+    assert_eq!(key, exit_key.public());
+}
+
+#[test]
+fn resolve_exit_node_by_short_name() {
+    let exit_key = NodePrivate::generate();
+    let exit = exit_peer("exitnode.tailnet.ts.net.", "100.64.0.5", exit_key.public());
+    let peers = vec![exit];
+    let key = resolve_exit_node(&peers, "exitnode").expect("should resolve");
+    assert_eq!(key, exit_key.public());
+}
+
+#[test]
+fn resolve_exit_node_case_insensitive() {
+    let exit_key = NodePrivate::generate();
+    let exit = exit_peer("Exit.tailnet.ts.net.", "100.64.0.5", exit_key.public());
+    let peers = vec![exit];
+    let key = resolve_exit_node(&peers, "EXIT.tailnet.ts.net").expect("should resolve");
+    assert_eq!(key, exit_key.public());
+}
+
+#[test]
+fn resolve_exit_node_not_found_ip() {
+    let exit_key = NodePrivate::generate();
+    let exit = exit_peer("exit.tailnet.ts.net.", "100.64.0.5", exit_key.public());
+    let peers = vec![exit];
+    let err = resolve_exit_node(&peers, "100.64.0.99").unwrap_err();
+    assert!(matches!(err, TsnetError::ExitNodeNotFound(_)));
+}
+
+#[test]
+fn resolve_exit_node_not_found_name() {
+    let exit_key = NodePrivate::generate();
+    let exit = exit_peer("exit.tailnet.ts.net.", "100.64.0.5", exit_key.public());
+    let peers = vec![exit];
+    let err = resolve_exit_node(&peers, "nonexistent").unwrap_err();
+    assert!(matches!(err, TsnetError::ExitNodeNotFound(_)));
+}
+
+#[test]
+fn resolve_exit_node_not_exit_capable() {
+    let key = NodePrivate::generate();
+    let normal = normal_peer("host.tailnet.ts.net.", "100.64.0.6", key.public());
+    let peers = vec![normal];
+    let err = resolve_exit_node(&peers, "100.64.0.6").unwrap_err();
+    assert!(matches!(err, TsnetError::NotExitCapable(_)));
+}
+
+#[test]
+fn resolve_exit_node_prefers_exit_capable_when_multiple_peers() {
+    let exit_key = NodePrivate::generate();
+    let other_key = NodePrivate::generate();
+    let exit = exit_peer("exit.tailnet.ts.net.", "100.64.0.5", exit_key.public());
+    let other = normal_peer("host.tailnet.ts.net.", "100.64.0.6", other_key.public());
+    let peers = vec![other, exit];
+    // Resolving by the exit node's IP should find the exit-capable peer.
+    let key = resolve_exit_node(&peers, "100.64.0.5").expect("should resolve");
+    assert_eq!(key, exit_key.public());
+    // Resolving by the non-exit peer's IP should fail with NotExitCapable.
+    let err = resolve_exit_node(&peers, "100.64.0.6").unwrap_err();
+    assert!(matches!(err, TsnetError::NotExitCapable(_)));
 }
 
 // ---------------------------------------------------------------------------
@@ -1414,4 +1566,147 @@ async fn e2e_acme_cert_issuance() {
     );
 
     std::fs::remove_dir_all(&state_dir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// E2E: exit node advertisement + selection
+// ---------------------------------------------------------------------------
+
+/// E2e exit node: node B advertises itself as an exit node (0.0.0.0/0 +
+/// ::/0 in RoutableIPs), the test approves those routes via the API, node A
+/// selects B as its exit node, and A's routing table resolves a public IP
+/// (8.8.8.8) to peer B.
+///
+/// This test does **not** depend on real internet egress through B — it only
+/// asserts routing-table resolution, which is sufficient for unprivileged CI.
+/// It also verifies that tailnet IPs still route to their owning peers (the
+/// exit default route doesn't shadow more-specific entries).
+#[tokio::test]
+#[ignore = "requires TS_E2E_AUTHKEY + TS_E2E_TAILNET + TS_E2E_API_TOKEN env vars (run via tools/e2e.sh)"]
+async fn e2e_exit_node() {
+    let authkey = std::env::var("TS_E2E_AUTHKEY").expect("TS_E2E_AUTHKEY not set");
+    let _tailnet = std::env::var("TS_E2E_TAILNET").expect("TS_E2E_TAILNET not set");
+    let uid = std::process::id();
+
+    // --- Node B: advertises exit node ---
+    let mut server_b = Server::builder()
+        .hostname(format!("rustscale-e2e-exit-b-{uid}"))
+        .auth_key(authkey.clone())
+        .ephemeral(true)
+        .advertise_exit_node(true)
+        .build()
+        .expect("build B");
+    server_b.up().await.expect("up B");
+    let status_b = server_b.status();
+    assert!(!status_b.tailscale_ips.is_empty(), "B should have IPs");
+    let ip_b = status_b.tailscale_ips[0];
+    eprintln!("B up: ip={ip_b}, advertising exit node");
+
+    // Approve B's exit routes (0.0.0.0/0 + ::/0) via the API.
+    let device_id = {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut found = None;
+        let hostname_prefix = format!("rustscale-e2e-exit-b-{uid}");
+        while std::time::Instant::now() < deadline {
+            match find_device_id(&hostname_prefix) {
+                Ok(id) => {
+                    found = Some(id);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(std::time::Duration::from_secs(2)).await,
+            }
+        }
+        found.expect("B never appeared in device list (30s)")
+    };
+    eprintln!("B device_id={device_id}, approving exit routes...");
+    api_approve_routes(&device_id, &["0.0.0.0/0", "::/0"]).expect("approve exit routes");
+    eprintln!("exit routes approved");
+
+    // --- Node A: selects B as exit node ---
+    let mut server_a = Server::builder()
+        .hostname(format!("rustscale-e2e-exit-a-{uid}"))
+        .auth_key(authkey)
+        .ephemeral(true)
+        .build()
+        .expect("build A");
+    server_a.up().await.expect("up A");
+
+    // Wait for B to appear in A's netmap AND for B's AllowedIPs to contain
+    // 0.0.0.0/0 (after approval, control pushes the updated AllowedIPs).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    loop {
+        let st = server_a.status();
+        if st.peers.iter().any(|p| p.ips.contains(&ip_b)) {
+            // Peer is visible — try selecting B as exit node. If B's
+            // AllowedIPs don't yet contain 0.0.0.0/0, set_exit_node returns
+            // NotExitCapable and we wait for the next map update.
+            match server_a.set_exit_node(&ip_b.to_string()).await {
+                Ok(()) => {
+                    eprintln!("A selected B as exit node");
+                    break;
+                }
+                Err(TsnetError::NotExitCapable(_)) => {
+                    // B's AllowedIPs don't yet contain 0.0.0.0/0 — wait.
+                }
+                Err(e) => panic!("set_exit_node failed unexpectedly: {e}"),
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            let peers: Vec<String> = st
+                .peers
+                .iter()
+                .map(|p| format!("  {} ips={:?}", p.name, p.ips))
+                .collect();
+            panic!(
+                "B's exit routes never appeared in A's netmap (90s)\n\
+                 A peers ({}):\n{}",
+                peers.len(),
+                peers.join("\n")
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
+    // Core assertion: a public IP resolves to peer B via the exit node.
+    let route = server_a.route_lookup(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
+    assert!(
+        route.is_some(),
+        "public IP 8.8.8.8 should route to exit node after set_exit_node"
+    );
+    eprintln!("A route for 8.8.8.8 -> {route:?}");
+
+    // Tailnet IPs still route to their owning peers (more specific than the
+    // exit default route).
+    let route_b = server_a.route_lookup(ip_b);
+    assert!(
+        route_b.is_some(),
+        "B's tailnet IP should still route after exit node selection"
+    );
+
+    // IPv6 public IP also routes to the exit node.
+    let v6_pub: IpAddr = "2001:4860:4860::8888".parse().unwrap();
+    let route_v6 = server_a.route_lookup(v6_pub);
+    assert!(
+        route_v6.is_some(),
+        "IPv6 public IP should route to exit node"
+    );
+
+    // Clear the exit node — public IPs should no longer route.
+    server_a.clear_exit_node().await.expect("clear exit node");
+    assert!(
+        server_a
+            .route_lookup(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)))
+            .is_none(),
+        "public IP should NOT route after clear_exit_node"
+    );
+    eprintln!("A cleared exit node — public IPs no longer route");
+
+    // Verify exit_node() accessor.
+    assert!(
+        server_a.exit_node().await.is_none(),
+        "exit_node should be None after clear"
+    );
+
+    server_a.close().await;
+    server_b.close().await;
 }

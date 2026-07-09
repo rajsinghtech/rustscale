@@ -34,7 +34,7 @@ mod state;
 mod status;
 mod tls;
 
-pub use routing::RouteTable;
+pub use routing::{peer_is_exit_capable, RouteTable};
 pub use state::{PersistedState, StateError};
 pub use status::{PeerInfo, ServerStatus, WhoIsInfo};
 pub use tls::{
@@ -106,6 +106,10 @@ pub enum TsnetError {
     Json(#[from] serde_json::Error),
     #[error("hostname not found in netmap: {0}")]
     HostnameNotFound(String),
+    #[error("exit node not found: {0}")]
+    ExitNodeNotFound(String),
+    #[error("peer is not exit-node-capable (no 0.0.0.0/0 in AllowedIPs): {0}")]
+    NotExitCapable(String),
     #[error("derp error: {0}")]
     Derp(#[from] rustscale_derp::DerpError),
     #[error("netcheck error: {0}")]
@@ -136,6 +140,13 @@ pub struct ServerBuilder {
     /// routing table. When false (default), only tailnet-range IPs
     /// (100.64.0.0/10, fd7a:115c:a1e0::/48) are routed.
     accept_routes: bool,
+    /// Whether to advertise this node as an exit node. When true, `0.0.0.0/0`
+    /// and `::/0` are appended to `RoutableIPs` in `Hostinfo` (mirroring Go's
+    /// `tsaddr.ExitRoutes()`). The tailnet admin must approve the exit routes
+    /// before peers see them in this node's `AllowedIPs`. The filter's
+    /// `localNets` is also extended with the default routes so forwarded
+    /// exit traffic is admitted (same mechanism as subnet routes).
+    advertise_exit_node: bool,
 }
 
 impl ServerBuilder {
@@ -194,6 +205,41 @@ impl ServerBuilder {
     pub fn accept_routes(mut self, accept: bool) -> Self {
         self.accept_routes = accept;
         self
+    }
+
+    /// Set whether to advertise this node as an exit node.
+    ///
+    /// When true, `0.0.0.0/0` and `::/0` are added to `Hostinfo.RoutableIPs`
+    /// (mirroring Go's `tsaddr.ExitRoutes()`). The tailnet admin must approve
+    /// the exit routes (via the API or admin console) before peers see them in
+    /// this node's `AllowedIPs`. The packet filter's `localNets` is also
+    /// extended with the default routes so forwarded exit traffic is admitted
+    /// — consistent with how subnet routes are filtered.
+    ///
+    /// **TUN mode**: forwarded exit traffic flows via the data pump + OS IP
+    /// forwarding, same as subnet routing. The OS must have IP forwarding
+    /// enabled (see [`ServerBuilder::advertise_routes`] for the sysctls).
+    pub fn advertise_exit_node(mut self, on: bool) -> Self {
+        self.advertise_exit_node = on;
+        self
+    }
+
+    /// Compute the effective advertised routes: `advertise_routes` plus the
+    /// exit-node default routes (`0.0.0.0/0`, `::/0`) when
+    /// `advertise_exit_node` is true. Used everywhere `RoutableIPs` is sent to
+    /// control or the filter's `localNets` is built.
+    fn effective_advertise_routes(&self) -> Vec<String> {
+        let mut routes = self.advertise_routes.clone();
+        if self.advertise_exit_node {
+            // Avoid duplicates if the user also manually added the default
+            // routes to advertise_routes.
+            for r in &["0.0.0.0/0", "::/0"] {
+                if !routes.iter().any(|x| x == r) {
+                    routes.push((*r).to_string());
+                }
+            }
+        }
+        routes
     }
 
     /// Validate and construct a [`Server`].
@@ -258,6 +304,30 @@ pub struct TunModeConfig {
     /// you must configure the interface and routes yourself (or rely on the
     /// data-plane pump alone for in-process traffic).
     pub apply_routes: bool,
+    /// If set, select this peer as the exit node at startup. The value is a
+    /// tailnet IP or MagicDNS hostname, resolved against the netmap after the
+    /// first `MapResponse`. The peer must be exit-node-capable (`AllowedIPs`
+    /// containing `0.0.0.0/0`); otherwise `up_tun` returns an error.
+    ///
+    /// When `apply_routes` is also true, OS-level default-route overrides are
+    /// installed so that all non-tailnet traffic enters the TUN device:
+    /// - **macOS**: two `/1` routes (`0.0.0.0/1` + `128.0.0.0/1`) pointing at
+    ///   the utun, which together cover all of IPv4 and are more specific than
+    ///   the default route — mirroring how `tailscaled` overrides the default
+    ///   without deleting it. IPv6 uses `::/1` + `8000::/1`.
+    /// - **Linux**: `ip route add 0.0.0.0/0 dev <tun>` and `::/0 dev <tun>`
+    ///   (best-effort; may conflict with an existing default route).
+    ///
+    /// **Known limitation (TUN + exit node):** magicsock's UDP socket is bound
+    /// to `0.0.0.0` and sends DERP/control/peer-discovery traffic via the OS
+    /// routing table. With `/1` exit routes installed, that traffic enters the
+    /// TUN and would loop back through the exit node. rustscale does **not**
+    /// yet install bypass routes (host routes for DERP/control IPs via the
+    /// physical gateway) like the Go client does. For exit-node usage without
+    /// this limitation, use netstack mode ([`Server::up`] +
+    /// [`Server::set_exit_node`]), which has no loop issue because magicsock
+    /// uses the OS stack directly and the TUN is not in the path.
+    pub exit_node: Option<String>,
 }
 
 /// Simple cancellation token.
@@ -395,7 +465,7 @@ impl Server {
             b.filter.clone(),
             b.tailscale_ips.clone(),
             self.config.accept_routes,
-            self.config.advertise_routes.clone(),
+            b.advertise_routes.clone(),
             b.resolver.clone(),
             b.dns_config.clone(),
             b.user_profiles.clone(),
@@ -459,6 +529,17 @@ impl Server {
 
         let b = self.bootstrap().await?;
 
+        // Resolve and apply the exit node selection from TunModeConfig, if
+        // set. This sets the in-process RouteTable's exit node so the data
+        // pump routes non-tailnet traffic to the exit peer. OS-level
+        // default-route overrides are installed after the TUN is created.
+        if let Some(ref exit) = config.exit_node {
+            let peers = b.peers.read().await;
+            let peer_key = resolve_exit_node(&peers, exit)?;
+            drop(peers);
+            b.route_table.write().await.set_exit_node(peer_key);
+        }
+
         let monitor = spawn_link_monitor(
             b.magicsock.clone(),
             b.cancel.clone(),
@@ -485,6 +566,13 @@ impl Server {
                     if self.config.accept_routes {
                         let rt = b.route_table.read().await;
                         apply_accepted_subnet_routes(dev.name(), &rt)?;
+                    }
+                    // When an exit node is selected, install OS-level
+                    // default-route overrides so all non-tailnet traffic
+                    // enters the TUN. See TunModeConfig::exit_node docs for
+                    // the known loop limitation.
+                    if config.exit_node.is_some() {
+                        apply_exit_node_routes(dev.name())?;
                     }
                 }
                 Arc::new(dev)
@@ -518,7 +606,7 @@ impl Server {
             b.filter.clone(),
             b.tailscale_ips.clone(),
             self.config.accept_routes,
-            self.config.advertise_routes.clone(),
+            b.advertise_routes.clone(),
             b.resolver.clone(),
             b.dns_config.clone(),
             b.user_profiles.clone(),
@@ -554,6 +642,12 @@ impl Server {
     /// tunnels + the routing table. Returns the shared handles plus the
     /// still-open map receiver for the update task.
     async fn bootstrap(&mut self) -> Result<Bootstrap, TsnetError> {
+        // Effective advertised routes: user-specified subnet routes plus the
+        // exit-node default routes (0.0.0.0/0, ::/0) when advertise_exit_node
+        // is enabled. Used for Hostinfo.RoutableIPs, the filter's localNets,
+        // and link-change endpoint updates.
+        let advertise = self.config.effective_advertise_routes();
+
         // 1. Load or generate persistent state.
         let mut state = self.load_or_create_state()?;
         if state.is_zero() {
@@ -595,7 +689,7 @@ impl Server {
             Hostinfo: Some(Hostinfo {
                 OS: std::env::consts::OS.to_string(),
                 Hostname: self.config.hostname.clone(),
-                RoutableIPs: self.config.advertise_routes.clone(),
+                RoutableIPs: advertise.clone(),
                 ..Default::default()
             }),
             Ephemeral: self.config.ephemeral,
@@ -650,7 +744,7 @@ impl Server {
             Hostinfo: Some(Hostinfo {
                 OS: std::env::consts::OS.to_string(),
                 Hostname: self.config.hostname.clone(),
-                RoutableIPs: self.config.advertise_routes.clone(),
+                RoutableIPs: advertise.clone(),
                 ..Default::default()
             }),
             ..Default::default()
@@ -677,7 +771,7 @@ impl Server {
             Hostinfo: Some(Hostinfo {
                 OS: std::env::consts::OS.to_string(),
                 Hostname: self.config.hostname.clone(),
-                RoutableIPs: self.config.advertise_routes.clone(),
+                RoutableIPs: advertise.clone(),
                 ..Default::default()
             }),
             ..Default::default()
@@ -809,8 +903,8 @@ impl Server {
         // destined to those subnets are admitted (needed by subnet routers).
         let (mut filter, _named_filters) =
             build_filter_from_map_response(&map_resp, &tailscale_ips);
-        if !self.config.advertise_routes.is_empty() {
-            filter.add_local_cidrs(&self.config.advertise_routes);
+        if !advertise.is_empty() {
+            filter.add_local_cidrs(&advertise);
         }
         let filter = Arc::new(std::sync::Mutex::new(filter));
         let packet_drops = Arc::new(AtomicU64::new(0));
@@ -860,7 +954,7 @@ impl Server {
             disco_key: state.disco_key.clone(),
             control_url: self.config.control_url.clone(),
             hostname: self.config.hostname.clone(),
-            advertise_routes: self.config.advertise_routes.clone(),
+            advertise_routes: advertise,
             udp_port,
             derp_map,
         })
@@ -1046,6 +1140,44 @@ impl Server {
         rt.entries()
             .map(|(net, prefix, peer)| (format!("{net}/{prefix}"), peer.clone()))
             .collect()
+    }
+
+    /// Select an exit node by tailnet IP or MagicDNS hostname. After this,
+    /// all non-tailnet traffic routes to the selected peer — in netstack mode
+    /// via the in-process `RouteTable`, in TUN mode via the data pump (OS
+    /// default-route overrides must be installed separately, see
+    /// [`TunModeConfig::exit_node`]).
+    ///
+    /// `ip_or_name` may be a tailnet IP (e.g. `"100.64.0.5"`) or a MagicDNS
+    /// hostname (e.g. `"peer"` or `"peer.tailnet.ts.net"`). The peer must be
+    /// exit-node-capable (its `AllowedIPs` must contain `0.0.0.0/0`); otherwise
+    /// returns [`TsnetError::NotExitCapable`]. Returns
+    /// [`TsnetError::ExitNodeNotFound`] if no peer matches.
+    ///
+    /// C-representable: string in, error code out (see FFI `ts_set_exit_node`).
+    pub async fn set_exit_node(&self, ip_or_name: &str) -> Result<(), TsnetError> {
+        let inner = self.inner.as_ref().ok_or(TsnetError::NotUp)?;
+        let peers = inner.peers.read().await;
+        let peer_key = resolve_exit_node(&peers, ip_or_name)?;
+        inner.route_table.write().await.set_exit_node(peer_key);
+        Ok(())
+    }
+
+    /// Clear the selected exit node. After this, non-tailnet destinations no
+    /// longer route through a peer (unless `accept_routes` installed them).
+    ///
+    /// C-representable: no args, error code out (see FFI `ts_clear_exit_node`).
+    pub async fn clear_exit_node(&self) -> Result<(), TsnetError> {
+        let inner = self.inner.as_ref().ok_or(TsnetError::NotUp)?;
+        inner.route_table.write().await.clear_exit_node();
+        Ok(())
+    }
+
+    /// The currently selected exit node's peer key, if any.
+    pub async fn exit_node(&self) -> Option<NodePublic> {
+        let inner = self.inner.as_ref()?;
+        let rt = inner.route_table.read().await;
+        rt.exit_node().cloned()
     }
 
     /// Look up which peer owns a tailnet IP address ([WhoIs]). Returns the
@@ -1805,6 +1937,57 @@ fn apply_accepted_subnet_routes(ifname: &str, rt: &RouteTable) -> Result<(), Tsn
     Ok(())
 }
 
+/// Install OS-level default-route overrides so all non-tailnet traffic enters
+/// the TUN device, enabling exit-node usage in TUN mode. Only called when
+/// `apply_routes` is true and an exit node is selected. Requires root.
+///
+/// **macOS**: installs two `/1` routes per address family
+/// (`0.0.0.0/1` + `128.0.0.0/1` for IPv4, `::/1` + `8000::/1` for IPv6).
+/// Together these cover the entire address space and are more specific than
+/// the default route (`0.0.0.0/0`), so they override it without deleting it —
+/// mirroring how `tailscaled` overrides the default on macOS. The original
+/// default route is preserved for traffic that explicitly avoids the TUN
+/// (though rustscale does not yet install bypass routes for DERP/control;
+/// see `TunModeConfig::exit_node` docs).
+///
+/// **Linux**: best-effort `ip route add 0.0.0.0/0 dev <tun>` and
+/// `::/0 dev <tun>`. This may fail or conflict with an existing default
+/// route; failures are logged but non-fatal.
+fn apply_exit_node_routes(ifname: &str) -> Result<(), TsnetError> {
+    #[cfg(target_os = "macos")]
+    {
+        // IPv4: two /1 routes covering 0.0.0.0 – 255.255.255.255.
+        run_cmd(
+            "route",
+            &["-q", "add", "-net", "0.0.0.0/1", "-interface", ifname],
+        )?;
+        run_cmd(
+            "route",
+            &["-q", "add", "-net", "128.0.0.0/1", "-interface", ifname],
+        )?;
+        // IPv6: two /1 routes covering :: – ffff::.
+        run_cmd(
+            "route",
+            &["-q", "add", "-inet6", "::/1", "-interface", ifname],
+        )?;
+        run_cmd(
+            "route",
+            &["-q", "add", "-inet6", "8000::/1", "-interface", ifname],
+        )?;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // Best-effort: ignore failures (default route may already exist).
+        let _ = run_cmd("ip", &["route", "add", "0.0.0.0/0", "dev", ifname]);
+        let _ = run_cmd("ip", &["-6", "route", "add", "::/0", "dev", ifname]);
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = ifname;
+    }
+    Ok(())
+}
+
 /// Whether a CIDR's network address falls within the tailnet ranges
 /// (100.64.0.0/10 or fd7a:115c:a1e0::/48). Used by `apply_accepted_subnet_routes`
 /// to skip tailnet-range prefixes (handled by the blanket tailnet route).
@@ -1889,6 +2072,64 @@ fn resolve_addr(addr: &str, inner: &RunningState) -> Result<SocketAddr, TsnetErr
     }
 
     Err(TsnetError::HostnameNotFound(host.to_string()))
+}
+
+/// Resolve an exit-node identifier (tailnet IP or MagicDNS hostname) to the
+/// peer's node key, verifying that the peer is exit-node-capable (its
+/// `AllowedIPs` contain `0.0.0.0/0`).
+///
+/// `ip_or_name` may be:
+/// - A tailnet IP (e.g. `"100.64.0.5"`) — matched against peer `Addresses`.
+/// - A MagicDNS hostname / FQDN (e.g. `"peer"` or `"peer.tailnet.ts.net"`) —
+///   matched against peer `Name` (case-insensitive, trailing-dot tolerant).
+///
+/// Returns `Err(ExitNodeNotFound)` if no peer matches, or
+/// `Err(NotExitCapable)` if the peer matches but is not exit-capable.
+/// This is a pure function over a peer snapshot, so it can be unit-tested
+/// with a fake netmap.
+fn resolve_exit_node(peers: &[Node], ip_or_name: &str) -> Result<NodePublic, TsnetError> {
+    // Try IP match first.
+    if let Ok(ip) = ip_or_name.trim().parse::<IpAddr>() {
+        for peer in peers {
+            if peer.Key.is_zero() {
+                continue;
+            }
+            let ips = extract_node_ips(peer);
+            if ips.contains(&ip) {
+                if peer_is_exit_capable(peer) {
+                    return Ok(peer.Key.clone());
+                }
+                return Err(TsnetError::NotExitCapable(peer.Name.clone()));
+            }
+        }
+        return Err(TsnetError::ExitNodeNotFound(ip_or_name.to_string()));
+    }
+
+    // Hostname match (case-insensitive, trailing-dot tolerant).
+    // Supports full FQDN, first-label short name, and suffix match.
+    let host_lower = ip_or_name.to_lowercase();
+    let host_trimmed = host_lower.trim_end_matches('.');
+    for peer in peers {
+        if peer.Key.is_zero() {
+            continue;
+        }
+        let name = peer.Name.to_lowercase();
+        let name_trimmed = name.trim_end_matches('.');
+        // First label of the FQDN (MagicDNS short name).
+        let first_label = name_trimmed.split('.').next().unwrap_or("");
+        if name_trimmed == host_trimmed
+            || first_label == host_trimmed
+            || name_trimmed.ends_with(&format!(".{host_trimmed}"))
+            || peer.StableID.eq_ignore_ascii_case(ip_or_name)
+        {
+            if peer_is_exit_capable(peer) {
+                return Ok(peer.Key.clone());
+            }
+            return Err(TsnetError::NotExitCapable(peer.Name.clone()));
+        }
+    }
+
+    Err(TsnetError::ExitNodeNotFound(ip_or_name.to_string()))
 }
 
 #[cfg(test)]

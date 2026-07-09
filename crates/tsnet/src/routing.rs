@@ -20,10 +20,20 @@ struct RouteEntry {
 }
 
 /// A routing table mapping destination IPs to peers by longest-prefix match.
+///
+/// When an exit node is selected ([`RouteTable::set_exit_node`]), any
+/// destination that does not match a more-specific entry falls through to the
+/// exit node peer — mirroring how the Go client installs `0.0.0.0/0` and
+/// `::/0` from the exit node's `AllowedIPs` regardless of `accept_routes`.
 #[derive(Clone, Default)]
 pub struct RouteTable {
     entries: Vec<RouteEntry>,
     accept_routes: bool,
+    /// The selected exit node peer, if any. Acts as a catch-all fallback for
+    /// destinations not matched by a more-specific entry. Independent of
+    /// `accept_routes`: the exit node's default routes are installed even when
+    /// `accept_routes` is false.
+    exit_node: Option<NodePublic>,
 }
 
 impl RouteTable {
@@ -73,11 +83,17 @@ impl RouteTable {
         Self {
             entries,
             accept_routes,
+            exit_node: None,
         }
     }
 
     /// Look up the peer for a destination IP via longest-prefix match. Returns
     /// `None` if no route matches (the IP is not in any peer's allowed range).
+    ///
+    /// If an exit node is set, it acts as a catch-all: any destination that
+    /// does not match a more-specific entry routes to the exit node. Tailnet
+    /// IPs and accepted subnet routes (more specific than `0.0.0.0/0`) always
+    /// win over the exit fallback.
     pub fn lookup(&self, ip: IpAddr) -> Option<NodePublic> {
         // Entries are sorted by descending prefix, so the first containing
         // entry is the longest-prefix match.
@@ -86,20 +102,26 @@ impl RouteTable {
                 return Some(entry.peer.clone());
             }
         }
-        None
+        // Fall back to the exit node default route.
+        self.exit_node.clone()
     }
 
     /// Rebuild the table from a new peer list (e.g. on a map-stream delta).
-    /// Preserves the `accept_routes` setting of the previous table.
+    /// Preserves the `accept_routes` setting and the selected exit node of the
+    /// previous table.
     pub fn rebuild(&mut self, peers: &[Node]) {
         let accept = self.accept_routes;
+        let exit = self.exit_node.clone();
         *self = Self::from_peers_with_opts(peers, accept);
+        self.exit_node = exit;
     }
 
     /// Rebuild the table from a new peer list with an explicit `accept_routes`
-    /// flag.
+    /// flag. Preserves the selected exit node of the previous table.
     pub fn rebuild_with_opts(&mut self, peers: &[Node], accept_routes: bool) {
+        let exit = self.exit_node.clone();
         *self = Self::from_peers_with_opts(peers, accept_routes);
+        self.exit_node = exit;
     }
 
     /// Number of route entries (for diagnostics/testing).
@@ -107,9 +129,9 @@ impl RouteTable {
         self.entries.len()
     }
 
-    /// Whether the table is empty.
+    /// Whether the table is empty and no exit node is set.
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.entries.is_empty() && self.exit_node.is_none()
     }
 
     /// Iterate over all route entries as `(network_ip, prefix, peer_key)`. Used
@@ -121,6 +143,25 @@ impl RouteTable {
     /// Whether `accept_routes` is enabled for this table.
     pub fn accept_routes(&self) -> bool {
         self.accept_routes
+    }
+
+    /// Select an exit node peer. After this, any destination not matched by a
+    /// more-specific entry routes to `peer`. This is independent of
+    /// `accept_routes`: the exit node's default routes apply even when
+    /// `accept_routes` is false.
+    pub fn set_exit_node(&mut self, peer: NodePublic) {
+        self.exit_node = Some(peer);
+    }
+
+    /// Clear the selected exit node. After this, destinations not matched by
+    /// any entry return `None` from [`lookup`](Self::lookup).
+    pub fn clear_exit_node(&mut self) {
+        self.exit_node = None;
+    }
+
+    /// The currently selected exit node peer, if any.
+    pub fn exit_node(&self) -> Option<&NodePublic> {
+        self.exit_node.as_ref()
     }
 }
 
@@ -167,6 +208,24 @@ fn cidr_match(ip: IpAddr, net: IpAddr, prefix: u8) -> bool {
         }
         _ => false,
     }
+}
+
+/// Whether a peer is exit-node-capable: its `AllowedIPs` (or `Addresses` as a
+/// fallback) contain `0.0.0.0/0`. Mirrors Go's `tsaddr.ContainsExitRoutes`.
+/// A peer advertises exit-node capability by adding `0.0.0.0/0` (and `::/0`)
+/// to its `Hostinfo.RoutableIPs`; once approved by the tailnet admin, control
+/// includes those prefixes in the peer's `AllowedIPs` seen by other nodes.
+pub fn peer_is_exit_capable(peer: &Node) -> bool {
+    let cidrs: &[String] = if peer.AllowedIPs.is_empty() {
+        &peer.Addresses
+    } else {
+        &peer.AllowedIPs
+    };
+    cidrs.iter().any(|c| {
+        parse_cidr(c).is_some_and(
+            |(net, prefix)| matches!(net, IpAddr::V4(v4) if v4.is_unspecified() && prefix == 0),
+        )
+    })
 }
 
 /// Whether a `net`/`prefix` falls within the Tailscale tailnet ranges:
@@ -466,5 +525,178 @@ mod tests {
             IpAddr::V4(Ipv4Addr::new(192, 0, 2, 0)),
             24
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Exit node tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn exit_node_catch_all_routes_non_tailnet() {
+        let exit_key = NodePrivate::generate().public();
+        let host_key = NodePrivate::generate().public();
+        let peers = vec![
+            Node {
+                ID: 1,
+                Name: "exit".into(),
+                Key: exit_key.clone(),
+                Addresses: vec!["100.64.0.1/32".into()],
+                AllowedIPs: vec!["100.64.0.1/32".into(), "0.0.0.0/0".into()],
+                ..Default::default()
+            },
+            Node {
+                ID: 2,
+                Name: "host".into(),
+                Key: host_key.clone(),
+                Addresses: vec!["100.64.0.2/32".into()],
+                AllowedIPs: vec!["100.64.0.2/32".into()],
+                ..Default::default()
+            },
+        ];
+        // accept_routes=false: 0.0.0.0/0 is NOT installed from AllowedIPs.
+        let mut rt = RouteTable::from_peers_with_opts(&peers, false);
+        // Without exit node: 8.8.8.8 has no route.
+        assert!(rt.lookup(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))).is_none());
+
+        // Select the exit node.
+        rt.set_exit_node(exit_key.clone());
+        // Public IP now routes to the exit node.
+        assert_eq!(
+            rt.lookup(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
+            Some(exit_key.clone())
+        );
+        // Tailnet IPs still route to their owning peers (more specific).
+        assert_eq!(
+            rt.lookup(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1))),
+            Some(exit_key.clone())
+        );
+        assert_eq!(
+            rt.lookup(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2))),
+            Some(host_key)
+        );
+    }
+
+    #[test]
+    fn exit_node_clear_restores_no_default() {
+        let exit_key = NodePrivate::generate().public();
+        let peers = vec![Node {
+            ID: 1,
+            Name: "exit".into(),
+            Key: exit_key.clone(),
+            Addresses: vec!["100.64.0.1/32".into()],
+            AllowedIPs: vec!["100.64.0.1/32".into(), "0.0.0.0/0".into()],
+            ..Default::default()
+        }];
+        let mut rt = RouteTable::from_peers_with_opts(&peers, false);
+        rt.set_exit_node(exit_key);
+        assert!(rt.lookup(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))).is_some());
+        rt.clear_exit_node();
+        assert!(rt.lookup(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))).is_none());
+        // Tailnet IP still routes.
+        assert!(rt
+            .lookup(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)))
+            .is_some());
+    }
+
+    #[test]
+    fn exit_node_survives_rebuild() {
+        let exit_key = NodePrivate::generate().public();
+        let peers = vec![Node {
+            ID: 1,
+            Name: "exit".into(),
+            Key: exit_key.clone(),
+            Addresses: vec!["100.64.0.1/32".into()],
+            ..Default::default()
+        }];
+        let mut rt = RouteTable::from_peers_with_opts(&peers, false);
+        rt.set_exit_node(exit_key.clone());
+        // Simulate a map-stream delta: rebuild with a slightly different peer
+        // list. The exit node selection must survive.
+        let new_peers = vec![Node {
+            ID: 1,
+            Name: "exit".into(),
+            Key: exit_key.clone(),
+            Addresses: vec!["100.64.0.1/32".into(), "100.64.0.3/32".into()],
+            ..Default::default()
+        }];
+        rt.rebuild(&new_peers);
+        assert_eq!(rt.exit_node(), Some(&exit_key));
+        assert_eq!(
+            rt.lookup(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
+            Some(exit_key)
+        );
+    }
+
+    #[test]
+    fn exit_node_with_accept_routes_does_not_duplicate() {
+        // When accept_routes=true, the exit-capable peer's 0.0.0.0/0 is
+        // already in entries. Setting the exit node provides a fallback that
+        // is shadowed by the more-specific (well, same-prefix) entry. The
+        // lookup should still return the exit peer either way.
+        let exit_key = NodePrivate::generate().public();
+        let peers = vec![Node {
+            ID: 1,
+            Name: "exit".into(),
+            Key: exit_key.clone(),
+            Addresses: vec!["100.64.0.1/32".into()],
+            AllowedIPs: vec!["100.64.0.1/32".into(), "0.0.0.0/0".into()],
+            ..Default::default()
+        }];
+        let rt = RouteTable::from_peers_with_opts(&peers, true);
+        // 0.0.0.0/0 is already installed → lookup works without set_exit_node.
+        assert_eq!(
+            rt.lookup(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
+            Some(exit_key.clone())
+        );
+    }
+
+    #[test]
+    fn exit_node_v6_fallback() {
+        let exit_key = NodePrivate::generate().public();
+        let peers = vec![Node {
+            ID: 1,
+            Name: "exit".into(),
+            Key: exit_key.clone(),
+            Addresses: vec!["100.64.0.1/32".into()],
+            ..Default::default()
+        }];
+        let mut rt = RouteTable::from_peers_with_opts(&peers, false);
+        rt.set_exit_node(exit_key.clone());
+        let v6: IpAddr = "2001:4860:4860::8888".parse().unwrap();
+        assert_eq!(rt.lookup(v6), Some(exit_key));
+    }
+
+    #[test]
+    fn peer_is_exit_capable_checks_allowed_ips() {
+        let exit_peer = Node {
+            ID: 1,
+            Name: "exit".into(),
+            Key: NodePrivate::generate().public(),
+            Addresses: vec!["100.64.0.1/32".into()],
+            AllowedIPs: vec!["100.64.0.1/32".into(), "0.0.0.0/0".into()],
+            ..Default::default()
+        };
+        assert!(peer_is_exit_capable(&exit_peer));
+
+        let normal_peer = Node {
+            ID: 2,
+            Name: "host".into(),
+            Key: NodePrivate::generate().public(),
+            Addresses: vec!["100.64.0.2/32".into()],
+            AllowedIPs: vec!["100.64.0.2/32".into()],
+            ..Default::default()
+        };
+        assert!(!peer_is_exit_capable(&normal_peer));
+
+        // Subnet router is NOT an exit node.
+        let subnet_peer = Node {
+            ID: 3,
+            Name: "router".into(),
+            Key: NodePrivate::generate().public(),
+            Addresses: vec!["100.64.0.3/32".into()],
+            AllowedIPs: vec!["100.64.0.3/32".into(), "192.0.2.0/24".into()],
+            ..Default::default()
+        };
+        assert!(!peer_is_exit_capable(&subnet_peer));
     }
 }

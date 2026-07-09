@@ -62,6 +62,12 @@
 int ts_accept(int listener);
 
 /**
+ * Clear the selected exit node. Returns 0 on success, a negative errno-style
+ * code on error. Requires the server to be up.
+ */
+int ts_clear_exit_node(int handle);
+
+/**
  * Shut down and destroy a server handle. Returns 0 on success.
  */
 int ts_close(int handle);
@@ -125,6 +131,13 @@ int ts_set_control_url(int handle, const char *url);
  * Set the ephemeral flag (0 = false, non-zero = true).
  */
 int ts_set_ephemeral(int handle, int ephemeral);
+
+/**
+ * Select an exit node by tailnet IP or MagicDNS hostname. The peer must be
+ * exit-node-capable (AllowedIPs containing 0.0.0.0/0). Returns 0 on success,
+ * a negative errno-style code on error. Requires the server to be up.
+ */
+int ts_set_exit_node(int handle, const char *addr);
 
 /**
  * Set the hostname.

@@ -31,6 +31,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut tun_name = "utun".to_string();
     let mut control_url = rustscale_tsnet::DEFAULT_CONTROL_URL.to_string();
     let mut apply_routes = false;
+    let mut exit_node: Option<String> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -68,6 +69,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--apply-routes" => {
                 apply_routes = true;
             }
+            "--exit-node" => {
+                i += 1;
+                if i < args.len() {
+                    exit_node = Some(args[i].clone());
+                }
+            }
             "--help" | "-h" => {
                 eprintln!("rustscale-tun — TUN-mode Tailscale client\n");
                 eprintln!("Usage: sudo rustscale-tun [OPTIONS]\n");
@@ -78,6 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("  --tun-name <name>     TUN device name (default: utun)");
                 eprintln!("  --control-url <url>   Control plane URL");
                 eprintln!("  --apply-routes        Bring up interface + add routes (needs root)");
+                eprintln!("  --exit-node <ip|name> Select a peer as exit node (requires --apply-routes for OS routes)");
                 eprintln!("  --help                Show this help");
                 return Ok(());
             }
@@ -112,9 +120,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             mtu: 1280,
         },
         apply_routes,
+        exit_node,
     };
 
     eprintln!("bringing up TUN mode: device={tun_name}, apply_routes={apply_routes}");
+    if let Some(ref en) = tun_config.exit_node {
+        eprintln!("exit node: {en}");
+    }
     eprintln!("this requires root for utun creation");
 
     server.up_tun(tun_config).await?;

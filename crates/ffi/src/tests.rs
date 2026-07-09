@@ -265,6 +265,28 @@ fn ts_errmsg_captures_error() {
 }
 
 // ---------------------------------------------------------------------------
+// ts_set_exit_node / ts_clear_exit_node error paths
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ts_set_exit_node_bad_handle() {
+    let addr = b"100.64.0.5\0".as_ptr().cast::<c_char>();
+    assert_eq!(ts_set_exit_node(99999, addr), RS_ERR_NOENT);
+}
+
+#[test]
+fn ts_set_exit_node_null_addr() {
+    let h = ts_new();
+    assert_eq!(ts_set_exit_node(h, std::ptr::null()), RS_ERR_INVAL);
+    assert_eq!(ts_close(h), RS_OK);
+}
+
+#[test]
+fn ts_clear_exit_node_bad_handle() {
+    assert_eq!(ts_clear_exit_node(99999), RS_ERR_NOENT);
+}
+
+// ---------------------------------------------------------------------------
 // parse_port unit tests
 // ---------------------------------------------------------------------------
 

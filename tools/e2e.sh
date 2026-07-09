@@ -50,10 +50,16 @@ trap cleanup EXIT
 
 CHILD_TOKEN=$(child_token)
 
+# API-only tailnets require tagged auth keys ("tailnet-owned auth key must have
+# tags set"), and the tag must exist in the policy file first.
+curl -fsS -X POST "$API/api/v2/tailnet/$DNS/acl" \
+  -H "Authorization: Bearer $CHILD_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"tagOwners":{"tag:e2e":[]},"acls":[{"action":"accept","src":["*"],"dst":["*:*"]}]}' >/dev/null
+
 # Reusable ephemeral preauthorized key for nodes under test.
 AUTHKEY=$(curl -fsS -X POST "$API/api/v2/tailnet/$DNS/keys" \
   -H "Authorization: Bearer $CHILD_TOKEN" -H 'Content-Type: application/json' \
-  -d '{"capabilities":{"devices":{"create":{"reusable":true,"ephemeral":true,"preauthorized":true}}},"expirySeconds":3600}' \
+  -d '{"capabilities":{"devices":{"create":{"reusable":true,"ephemeral":true,"preauthorized":true,"tags":["tag:e2e"]}}},"expirySeconds":3600}' \
   | jq -r .key)
 [[ -n "$AUTHKEY" && "$AUTHKEY" != null ]] || { echo "authkey mint failed" >&2; exit 1; }
 

@@ -114,3 +114,56 @@ flow via `/machine/set-dns` can be e2e-tested on an ephemeral tailnet),
 `devicesApprovalOn`, `devicesKeyDurationDays`, `regionalRoutingOn`,
 `networkFlowLoggingOn`. This removes the old "API-only tailnets can't test
 HTTPS" limitation that deferred the ACME order client in port-1.
+
+## Interop e2e (rustscale <-> Go tailscaled)
+
+Cross-client interoperability tests prove rustscale negotiates every path
+type (DERP, direct, path upgrade) and wire protocol (disco, WG handshake,
+MagicDNS) against the real Go `tailscaled` — the strongest wire-compat check.
+All interop tests are `#[ignore]`d and gated on `TS_INTEROP_GO_IP`; they skip
+cleanly when that env var is absent, so `cargo test -- --ignored` under plain
+`tools/e2e.sh` stays green.
+
+### Local
+
+```bash
+source .secrets/tailscale.env && tools/interop.sh
+```
+
+`tools/interop.sh` provisions an ephemeral tailnet (reusing `tools/bench/lib.sh`),
+starts one Go `tailscaled` in userspace-networking mode (hostname
+`go-interop-<pid>`, SOCKS5 on `127.0.0.1:11080`, state in a `mktemp` dir),
+exposes a `tailscale serve --tcp` echo forwarder, advertises + approves a
+subnet route (`10.99.0.0/24`), exports `TS_INTEROP_*` + `TS_E2E_*` env vars,
+then runs `cargo test -p rustscale-tsnet -- --ignored interop_`. Cleanup is
+trapped (INT/TERM/EXIT): kill `tailscaled` by PID, delete the tailnet, remove
+state dirs.
+
+Requires: `tailscaled` + `tailscale` on `$PATH`, `python3`, `curl`, `jq`.
+
+### CI
+
+The `interop` job in `.github/workflows/e2e.yml` installs the Go tailscale
+client via `curl -fsSL https://tailscale.com/install.sh | sh`, mints the WIF
+org token (same as core e2e), and runs `tools/interop.sh`. Guarded by
+`if: github.repository == 'rajsinghtech/rustscale'`.
+
+### Exported env vars
+
+| Var | Description |
+|-----|-------------|
+| `TS_INTEROP_GO_IP` | Go node's tailnet IPv4 |
+| `TS_INTEROP_GO_NAME` | Go node's MagicDNS FQDN (trailing dot) |
+| `TS_INTEROP_GO_ECHO_PORT` | Tailnet port the Go node serves echo on |
+| `TS_INTEROP_SOCKS` | Go node's SOCKS5 proxy (`127.0.0.1:11080`) |
+| `TS_INTEROP_GO_SUBNET` | Subnet the Go node advertises (`10.99.0.0/24`) |
+
+### Test-support flag: `disable_direct_paths`
+
+`ServerBuilder::disable_direct_paths(true)` (backed by
+`MagicsockConfig::disable_direct_paths`) suppresses all direct-path
+establishment and forces every send via DERP. Disco pings are not sent,
+CallMeMaybe-initiated pings are skipped, and inbound disco Pings over UDP are
+not answered — so neither side confirms a direct path. This pins both
+directions to DERP, letting `interop_derp_path` assert relayed connectivity
+in isolation. Production code should leave this false.

@@ -51,3 +51,48 @@ jobs:
         env:
           TS_ORG_TOKEN: ${{ steps.tsauth.outputs.token }}
         run: tools/e2e.sh
+
+  # ---------------------------------------------------------------------------
+  # Cross-client interop: rustscale <-> Go tailscaled.
+  # Separate job so core e2e stays fast. Installs the real Go tailscale client
+  # and runs tools/interop.sh which provisions a tailnet, starts tailscaled in
+  # userspace mode, and runs the `interop_` test suite.
+  # ---------------------------------------------------------------------------
+  interop:
+    name: Cross-client interop (rustscale <-> Go tailscaled)
+    if: github.repository == 'rajsinghtech/rustscale'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Install the Go tailscale client (apt repo). The install script adds
+      # the Tailscale signing key and apt source, then installs tailscale.
+      - name: Install Go tailscale client
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+          tailscale version
+
+      - name: Mint Tailscale org token via GitHub OIDC (WIF)
+        id: tsauth
+        run: |
+          AUD="api.tailscale.com/TbqNGJkY5611CNTRL-kz4CwX2LK721CNTRL"
+          JWT=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$AUD" | jq -r '.value')
+          echo "::add-mask::$JWT"
+          TOKEN=$(curl -sS -X POST https://api.tailscale.com/api/v2/oauth/token-exchange \
+            -H 'Content-Type: application/x-www-form-urlencoded' \
+            -d 'client_id=TbqNGJkY5611CNTRL-kz4CwX2LK721CNTRL' -d "jwt=$JWT" | jq -r '.access_token')
+          if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then echo "OIDC token-exchange failed" >&2; exit 1; fi
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+
+      - name: Run interop tests (rustscale <-> Go tailscaled)
+        env:
+          TS_ORG_TOKEN: ${{ steps.tsauth.outputs.token }}
+        run: tools/interop.sh

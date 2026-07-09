@@ -93,6 +93,14 @@ pub struct MagicsockConfig {
     /// Optional health tracker. When provided, magicsock reports DERP home
     /// region connection state (healthy on connect, unhealthy on failure).
     pub health: Option<rustscale_health::Tracker>,
+    /// Test-support: when true, suppress all direct-path establishment and
+    /// force every send via DERP. Disco pings are not sent in `set_netmap`,
+    /// CallMeMaybe-initiated pings are skipped, and inbound disco Pings over
+    /// UDP are not answered — so neither side confirms a direct path. `send`
+    /// also ignores any Direct/Relay best path and routes via DERP. This
+    /// pins both directions to DERP, letting interop tests assert relayed
+    /// connectivity in isolation. Production code should leave this false.
+    pub disable_direct_paths: bool,
 }
 
 /// A received WG datagram with its sender identified.
@@ -122,6 +130,8 @@ struct Inner {
     wg_send: mpsc::Sender<WgDatagram>,
     /// Optional port-mapping client for NAT-PMP/PCP/UPnP external endpoints.
     portmapper: Option<rustscale_portmapper::Client>,
+    /// Test-support: suppress direct paths and force DERP (see MagicsockConfig).
+    disable_direct_paths: bool,
 }
 
 /// Manages DERP connections across multiple regions.
@@ -407,6 +417,7 @@ impl Magicsock {
             addr_to_peer: RwLock::new(HashMap::new()),
             wg_send,
             portmapper: config.portmapper,
+            disable_direct_paths: config.disable_direct_paths,
         });
 
         // Launch background recv tasks (UDP + DERP demux).
@@ -559,82 +570,86 @@ impl Magicsock {
         };
 
         // Phase 2: send disco pings and CallMeMaybe (async, outside the lock).
+        // When disable_direct_paths is set, skip all direct-path probing —
+        // both sides stay on DERP.
         for (peer_key, peer_disco, candidates, derp_region) in probe_list {
             // Send disco Pings to each candidate over UDP.
-            if let Some(ref udp) = self.inner.udp {
-                for addr in &candidates {
-                    let tx_id = random_tx_id();
-                    {
+            if !self.inner.disable_direct_paths {
+                if let Some(ref udp) = self.inner.udp {
+                    for addr in &candidates {
+                        let tx_id = random_tx_id();
+                        {
+                            let mut endpoints = self
+                                .inner
+                                .endpoints
+                                .write()
+                                .expect("endpoints lock poisoned");
+                            if let Some(ep) = endpoints.get_mut(&peer_key) {
+                                ep.add_pending_ping(tx_id, *addr, std::time::Instant::now());
+                            }
+                        }
+                        let ping = Message::Ping(Ping {
+                            tx_id,
+                            node_key: self.inner.node_public.clone(),
+                            padding: 0,
+                        });
+                        if let Some(packet) = self.inner.disco.seal(&peer_disco, &ping) {
+                            if debug_enabled() {
+                                eprintln!(
+                                    "DBG disco_ping send to {addr} peer={}",
+                                    short_key(&peer_key)
+                                );
+                            }
+                            let _ = udp.send_to(&packet, addr).await;
+                        }
+                    }
+                }
+
+                // Send CallMeMaybe via the peer's home DERP region.
+                if !peer_disco.is_zero() {
+                    let should = {
                         let mut endpoints = self
                             .inner
                             .endpoints
                             .write()
                             .expect("endpoints lock poisoned");
-                        if let Some(ep) = endpoints.get_mut(&peer_key) {
-                            ep.add_pending_ping(tx_id, *addr, std::time::Instant::now());
-                        }
-                    }
-                    let ping = Message::Ping(Ping {
-                        tx_id,
-                        node_key: self.inner.node_public.clone(),
-                        padding: 0,
-                    });
-                    if let Some(packet) = self.inner.disco.seal(&peer_disco, &ping) {
-                        if debug_enabled() {
-                            eprintln!(
-                                "DBG disco_ping send to {addr} peer={}",
-                                short_key(&peer_key)
-                            );
-                        }
-                        let _ = udp.send_to(&packet, addr).await;
-                    }
-                }
-            }
-
-            // Send CallMeMaybe via the peer's home DERP region.
-            if !peer_disco.is_zero() {
-                let should = {
-                    let mut endpoints = self
-                        .inner
-                        .endpoints
-                        .write()
-                        .expect("endpoints lock poisoned");
-                    endpoints
-                        .get_mut(&peer_key)
-                        .is_some_and(endpoint::Endpoint::should_send_call_me_maybe)
-                };
-                if should {
-                    let local_addrs = self.local_udp_addrs();
-                    let cmm = Message::CallMeMaybe(CallMeMaybe {
-                        my_number: local_addrs
-                            .iter()
-                            .filter_map(|s| s.parse::<SocketAddr>().ok())
-                            .map(rustscale_disco::AddrPort::from)
-                            .collect(),
-                    });
-                    if let Some(packet) = self.inner.disco.seal(&peer_disco, &cmm) {
-                        if derp_region > 0 {
-                            self.inner
-                                .derp
-                                .send_packet(derp_region, peer_key.clone(), packet)
-                                .await;
-                        } else {
-                            // Fan out CallMeMaybe to all connected DERP regions
-                            // (peer's home DERP is unknown).
-                            let regions: Vec<i32> = {
-                                let conns = self
-                                    .inner
-                                    .derp
-                                    .connections
-                                    .read()
-                                    .expect("derp connections lock poisoned");
-                                conns.keys().copied().collect()
-                            };
-                            for r in regions {
+                        endpoints
+                            .get_mut(&peer_key)
+                            .is_some_and(endpoint::Endpoint::should_send_call_me_maybe)
+                    };
+                    if should {
+                        let local_addrs = self.local_udp_addrs();
+                        let cmm = Message::CallMeMaybe(CallMeMaybe {
+                            my_number: local_addrs
+                                .iter()
+                                .filter_map(|s| s.parse::<SocketAddr>().ok())
+                                .map(rustscale_disco::AddrPort::from)
+                                .collect(),
+                        });
+                        if let Some(packet) = self.inner.disco.seal(&peer_disco, &cmm) {
+                            if derp_region > 0 {
                                 self.inner
                                     .derp
-                                    .send_packet(r, peer_key.clone(), packet.clone())
+                                    .send_packet(derp_region, peer_key.clone(), packet)
                                     .await;
+                            } else {
+                                // Fan out CallMeMaybe to all connected DERP regions
+                                // (peer's home DERP is unknown).
+                                let regions: Vec<i32> = {
+                                    let conns = self
+                                        .inner
+                                        .derp
+                                        .connections
+                                        .read()
+                                        .expect("derp connections lock poisoned");
+                                    conns.keys().copied().collect()
+                                };
+                                for r in regions {
+                                    self.inner
+                                        .derp
+                                        .send_packet(r, peer_key.clone(), packet.clone())
+                                        .await;
+                                }
                             }
                         }
                     }
@@ -672,6 +687,9 @@ impl Magicsock {
 
         match path {
             endpoint::BestPath::Direct { addr, .. } => {
+                if self.inner.disable_direct_paths {
+                    return self.send_via_derp(peer, derp_region, datagram).await;
+                }
                 if let Some(ref udp) = self.inner.udp {
                     udp.send_to(datagram, addr).await?;
                     return Ok(());
@@ -679,6 +697,9 @@ impl Magicsock {
                 self.send_via_derp(peer, derp_region, datagram).await
             }
             endpoint::BestPath::Relay { addr, vni } => {
+                if self.inner.disable_direct_paths {
+                    return self.send_via_derp(peer, derp_region, datagram).await;
+                }
                 if let Some(ref udp) = self.inner.udp {
                     let framed = relay::encode_geneve(vni, datagram);
                     udp.send_to(&framed, addr).await?;
@@ -963,6 +984,11 @@ impl Inner {
                 if debug_enabled() {
                     eprintln!("DBG disco_ping recv from {src} peer={}", short_key(&peer));
                 }
+                // When direct paths are disabled, don't respond to pings —
+                // this prevents the peer from confirming a direct path to us.
+                if self.disable_direct_paths {
+                    return;
+                }
                 // Respond with a Pong over UDP to the source address.
                 let pong = Message::Pong(Pong {
                     tx_id: ping.tx_id,
@@ -1063,6 +1089,11 @@ impl Inner {
                 // Pong via DERP — no useful address to confirm; just ignore.
             }
             Message::CallMeMaybe(cmm) => {
+                // When direct paths are disabled, don't ping the peer's
+                // advertised addresses — we won't use a direct path anyway.
+                if self.disable_direct_paths {
+                    return;
+                }
                 // The peer is telling us its UDP addresses. Add them as
                 // candidates and start pinging.
                 let peer_disco = sender_disco.clone();

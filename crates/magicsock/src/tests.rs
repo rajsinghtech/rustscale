@@ -204,6 +204,7 @@ async fn derp_data_path_fallback() {
         udp_socket: None,
         portmapper: None,
         health: None,
+        disable_direct_paths: false,
     })
     .await
     .expect("A magicsock");
@@ -219,6 +220,7 @@ async fn derp_data_path_fallback() {
         udp_socket: None,
         portmapper: None,
         health: None,
+        disable_direct_paths: false,
     })
     .await
     .expect("B magicsock");
@@ -283,6 +285,7 @@ async fn direct_path_upgrade_over_udp() {
         udp_socket: None,
         portmapper: None,
         health: None,
+        disable_direct_paths: false,
     })
     .await
     .expect("A magicsock");
@@ -298,6 +301,7 @@ async fn direct_path_upgrade_over_udp() {
         udp_socket: None,
         portmapper: None,
         health: None,
+        disable_direct_paths: false,
     })
     .await
     .expect("B magicsock");
@@ -372,6 +376,7 @@ async fn trust_expiry_downgrades_to_derp() {
         udp_socket: None,
         portmapper: None,
         health: None,
+        disable_direct_paths: false,
     })
     .await
     .expect("A magicsock");
@@ -387,6 +392,7 @@ async fn trust_expiry_downgrades_to_derp() {
         udp_socket: None,
         portmapper: None,
         health: None,
+        disable_direct_paths: false,
     })
     .await
     .expect("B magicsock");
@@ -445,6 +451,7 @@ async fn send_unknown_peer_errors() {
         udp_socket: None,
         portmapper: None,
         health: None,
+        disable_direct_paths: false,
     })
     .await
     .expect("magicsock");
@@ -533,6 +540,7 @@ async fn multi_region_derp_routing() {
         udp_socket: None,
         portmapper: None,
         health: None,
+        disable_direct_paths: false,
     })
     .await
     .expect("A magicsock");
@@ -573,6 +581,7 @@ async fn multi_region_derp_routing() {
         udp_socket: None,
         portmapper: None,
         health: None,
+        disable_direct_paths: false,
     })
     .await
     .expect("B magicsock");

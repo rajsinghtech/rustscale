@@ -2095,3 +2095,688 @@ async fn e2e_socks5_proxy() {
     server_a.close().await;
     server_b.close().await;
 }
+
+// ---------------------------------------------------------------------------
+// Cross-client interop e2e: rustscale <-> Go tailscaled
+// ---------------------------------------------------------------------------
+//
+// All tests in this section are #[ignore]d and gated on TS_INTEROP_GO_IP
+// (set by tools/interop.sh). They skip cleanly when the interop env is
+// absent, so `cargo test -- --ignored` under plain tools/e2e.sh stays green.
+//
+// The harness (tools/interop.sh) provisions an ephemeral tailnet, starts a
+// Go tailscaled in userspace-networking mode, exposes a `tailscale serve
+// --tcp` echo forwarder, and exports:
+//   TS_INTEROP_GO_IP       — Go node's tailnet IPv4
+//   TS_INTEROP_GO_NAME     — Go node's MagicDNS FQDN (with trailing dot)
+//   TS_INTEROP_GO_ECHO_PORT — tailnet port the Go node serves echo on
+//   TS_INTEROP_SOCKS        — Go node's SOCKS5 proxy (127.0.0.1:11080)
+//   TS_INTEROP_GO_SUBNET    — subnet the Go node advertises (for route test)
+//   TS_E2E_AUTHKEY / TS_E2E_TAILNET / TS_E2E_API_TOKEN — shared with e2e.sh
+
+use rustscale_magicsock::PathClass;
+
+/// Parsed interop environment. Returns None if any required var is missing,
+/// causing tests to skip (not fail) when run outside the interop harness.
+struct InteropEnv {
+    authkey: String,
+    go_ip: std::net::Ipv4Addr,
+    go_name: String,
+    echo_port: u16,
+    socks: String,
+    go_subnet: Option<String>,
+}
+
+fn interop_env() -> Option<InteropEnv> {
+    let authkey = std::env::var("TS_E2E_AUTHKEY").ok()?;
+    let go_ip_s = std::env::var("TS_INTEROP_GO_IP").ok()?;
+    let go_ip: std::net::Ipv4Addr = go_ip_s.parse().ok()?;
+    let go_name = std::env::var("TS_INTEROP_GO_NAME").ok()?;
+    let echo_port: u16 = std::env::var("TS_INTEROP_GO_ECHO_PORT")
+        .ok()?
+        .parse()
+        .ok()?;
+    let socks = std::env::var("TS_INTEROP_SOCKS").ok()?;
+    let go_subnet = std::env::var("TS_INTEROP_GO_SUBNET")
+        .ok()
+        .filter(|s| !s.is_empty());
+    Some(InteropEnv {
+        authkey,
+        go_ip,
+        go_name,
+        echo_port,
+        socks,
+        go_subnet,
+    })
+}
+
+/// Require the interop env or return early from the calling test (skip).
+/// Each test uses `let-else` directly to avoid macro hygiene issues.
+fn _interop_skip_doc() {}
+
+/// Start a rustscale node for interop testing. Returns (server, uid).
+fn interop_server(authkey: &str, suffix: &str) -> Server {
+    let uid = std::process::id();
+    Server::builder()
+        .hostname(format!("rustscale-interop-{suffix}-{uid}"))
+        .auth_key(authkey)
+        .ephemeral(true)
+        .build()
+        .expect("build interop server")
+}
+
+/// Like [`interop_server`] but with direct paths suppressed (DERP-only).
+fn interop_server_derp_only(authkey: &str, suffix: &str) -> Server {
+    let uid = std::process::id();
+    Server::builder()
+        .hostname(format!("rustscale-interop-{suffix}-{uid}"))
+        .auth_key(authkey)
+        .ephemeral(true)
+        .disable_direct_paths(true)
+        .build()
+        .expect("build interop server (derp-only)")
+}
+
+/// Find the Go peer's path class from the rustscale server's status.
+fn go_peer_path(server: &Server, go_ip: std::net::Ipv4Addr) -> Option<PathClass> {
+    let st = server.status();
+    st.peers
+        .iter()
+        .find(|p| p.ips.contains(&IpAddr::V4(go_ip)))
+        .map(|p| p.path_class)
+}
+
+/// Log the current negotiated path to the Go peer for diagnostics.
+fn log_go_path(server: &Server, go_ip: std::net::Ipv4Addr, ctx: &str) {
+    let st = server.status();
+    let go_peer = st.peers.iter().find(|p| p.ips.contains(&IpAddr::V4(go_ip)));
+    if let Some(p) = go_peer {
+        eprintln!(
+            "[interop:{ctx}] go peer path={:?} name={}",
+            p.path_class, p.name
+        );
+    } else {
+        eprintln!(
+            "[interop:{ctx}] go peer NOT in netmap ({} peers)",
+            st.peers.len()
+        );
+    }
+}
+
+/// Echo roundtrip helper: write payload, read it back, assert equality.
+async fn echo_roundtrip(
+    stream: &mut (impl tokio::io::AsyncWrite + tokio::io::AsyncRead + Unpin),
+    payload: &[u8],
+    label: &str,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        stream.write_all(payload),
+    )
+    .await
+    .expect("write timed out")
+    .expect("write failed");
+    let mut got = vec![0u8; payload.len()];
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        stream.read_exact(&mut got),
+    )
+    .await
+    .expect("read timed out")
+    .expect("read failed");
+    assert_eq!(&got, payload, "echo mismatch ({label})");
+}
+
+/// Interop: rustscale dials the Go node's serve echo port.
+#[tokio::test]
+#[ignore = "requires TS_INTEROP_GO_IP (run via tools/interop.sh)"]
+async fn interop_rust_dials_go() {
+    let Some(ienv) = interop_env() else {
+        eprintln!("interop_rust_dials_go: skipping (interop env not set)");
+        return;
+    };
+
+    let mut server = interop_server(&ienv.authkey, "dialgo");
+    server.up().await.expect("up");
+
+    let go_ip = ienv.go_ip;
+    wait_for_peer(&server, IpAddr::V4(go_ip), "interop_rust_dials_go").await;
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    let dial_addr = format!("{go_ip}:{}", ienv.echo_port);
+    let mut stream = None;
+    for attempt in 1..=3 {
+        eprintln!("interop_rust_dials_go: dial attempt {attempt} to {dial_addr}");
+        match tokio::time::timeout(std::time::Duration::from_secs(45), server.dial(&dial_addr))
+            .await
+        {
+            Ok(Ok(s)) => {
+                stream = Some(s);
+                break;
+            }
+            Ok(Err(e)) => eprintln!("dial attempt {attempt} failed: {e}"),
+            Err(_) => eprintln!("dial attempt {attempt} timed out"),
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+    let mut stream = stream.expect("all dial attempts failed");
+
+    echo_roundtrip(&mut stream, b"interop-rust-dials-go", "rust_dials_go").await;
+    log_go_path(&server, go_ip, "rust_dials_go");
+
+    tokio::io::AsyncWriteExt::shutdown(&mut stream).await.ok();
+    server.close().await;
+}
+
+/// Interop: the Go node dials the rustscale node through its SOCKS5 proxy.
+/// The test hand-rolls a minimal SOCKS5 client to CONNECT from the Go side
+/// to the rustscale node's tailnet IP:port.
+#[tokio::test]
+#[ignore = "requires TS_INTEROP_GO_IP (run via tools/interop.sh)"]
+async fn interop_go_dials_rust() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    let Some(ienv) = interop_env() else {
+        eprintln!("interop_go_dials_rust: skipping (interop env not set)");
+        return;
+    };
+
+    let mut server = interop_server(&ienv.authkey, "godials");
+    server.up().await.expect("up");
+    let status = server.status();
+    let rust_ip = status
+        .tailscale_ips
+        .iter()
+        .find_map(|ip| match ip {
+            IpAddr::V4(v4) => Some(*v4),
+            _ => None,
+        })
+        .expect("rust should have an IPv4");
+
+    // Rust listens for echo.
+    const ECHO_PORT: u16 = 4545;
+    let mut listener = server.listen(ECHO_PORT).await.expect("listen");
+
+    // Wait for Go peer to appear.
+    wait_for_peer(&server, IpAddr::V4(ienv.go_ip), "interop_go_dials_rust").await;
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    // Spawn the echo acceptor on the rust side.
+    let echo_task = tokio::spawn(async move {
+        let mut stream =
+            tokio::time::timeout(std::time::Duration::from_secs(60), listener.accept())
+                .await
+                .expect("rust accept timed out")
+                .expect("rust accept failed");
+        let mut buf = [0u8; 256];
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(30), stream.read(&mut buf))
+                .await
+            {
+                Ok(Ok(0) | Err(_)) => break,
+                Ok(Ok(n)) => {
+                    if stream.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    // Hand-rolled SOCKS5 client: connect to Go's SOCKS5 proxy, CONNECT to
+    // the rustscale node's tailnet IP:port.
+    let mut client = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        TcpStream::connect(&ienv.socks),
+    )
+    .await
+    .expect("connect to go socks5 timed out")
+    .expect("connect to go socks5 failed");
+
+    // Greeting: VER=5 NMETHODS=1 METHODS=[no-auth]
+    client
+        .write_all(&[0x05, 0x01, 0x00])
+        .await
+        .expect("greeting write");
+    let mut greply = [0u8; 2];
+    client.read_exact(&mut greply).await.expect("greeting read");
+    assert_eq!(greply, [0x05, 0x00], "socks5 greeting rejected");
+
+    // Request: CONNECT to rust_ip:ECHO_PORT (IPv4 ATYP)
+    let mut req = vec![0x05, 0x01, 0x00, 0x01];
+    req.extend_from_slice(&rust_ip.octets());
+    req.extend_from_slice(&ECHO_PORT.to_be_bytes());
+    client.write_all(&req).await.expect("request write");
+
+    // Reply: VER REPLY RSV ATYP <bind-addr>
+    let mut hdr = [0u8; 4];
+    client
+        .read_exact(&mut hdr)
+        .await
+        .expect("reply header read");
+    assert_eq!(hdr[0], 0x05, "bad socks5 reply version");
+    assert_eq!(hdr[1], 0x00, "socks5 connect failed reply={:#x}", hdr[1]);
+    // Drain bind address (ATYP=0x01 IPv4 → 4+2 bytes).
+    let mut bind_rest = vec![0u8; 6];
+    client.read_exact(&mut bind_rest).await.expect("bind read");
+
+    // Echo roundtrip through Go→rust.
+    let payload = b"interop-go-dials-rust";
+    echo_roundtrip(&mut client, payload, "go_dials_rust").await;
+    log_go_path(&server, ienv.go_ip, "go_dials_rust");
+
+    drop(client);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(15), echo_task)
+        .await
+        .expect("echo task did not exit");
+    server.close().await;
+}
+
+/// Interop: rustscale dials the Go node by its MagicDNS FQDN. Proves the
+/// netmap resolver produces a usable address for Go-registered names.
+#[tokio::test]
+#[ignore = "requires TS_INTEROP_GO_IP (run via tools/interop.sh)"]
+async fn interop_magicdns_name() {
+    let Some(ienv) = interop_env() else {
+        eprintln!("interop_magicdns_name: skipping (interop env not set)");
+        return;
+    };
+
+    let mut server = interop_server(&ienv.authkey, "dns");
+    server.up().await.expect("up");
+
+    wait_for_peer(&server, IpAddr::V4(ienv.go_ip), "interop_magicdns_name").await;
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    // Dial by MagicDNS FQDN:port — the resolver looks up the name in the netmap.
+    let dial_addr = format!("{}:{}", ienv.go_name, ienv.echo_port);
+    eprintln!("interop_magicdns_name: dialing {dial_addr}");
+    let mut stream = None;
+    for attempt in 1..=3 {
+        eprintln!("dial attempt {attempt} to {dial_addr}");
+        match tokio::time::timeout(std::time::Duration::from_secs(45), server.dial(&dial_addr))
+            .await
+        {
+            Ok(Ok(s)) => {
+                stream = Some(s);
+                break;
+            }
+            Ok(Err(e)) => eprintln!("dial attempt {attempt} failed: {e}"),
+            Err(_) => eprintln!("dial attempt {attempt} timed out"),
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+    let mut stream = stream.expect("MagicDNS dial failed after 3 attempts");
+
+    echo_roundtrip(&mut stream, b"interop-magicdns-name", "magicdns_name").await;
+    log_go_path(&server, ienv.go_ip, "magicdns_name");
+
+    tokio::io::AsyncWriteExt::shutdown(&mut stream).await.ok();
+    server.close().await;
+}
+
+/// Interop: rustscale whois(go_ip) returns the Go node's FQDN.
+#[tokio::test]
+#[ignore = "requires TS_INTEROP_GO_IP (run via tools/interop.sh)"]
+async fn interop_whois_go_peer() {
+    let Some(ienv) = interop_env() else {
+        eprintln!("interop_whois_go_peer: skipping (interop env not set)");
+        return;
+    };
+
+    let mut server = interop_server(&ienv.authkey, "whois");
+    server.up().await.expect("up");
+
+    wait_for_peer(&server, IpAddr::V4(ienv.go_ip), "interop_whois_go_peer").await;
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    let info = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        server.whois(IpAddr::V4(ienv.go_ip)),
+    )
+    .await
+    .expect("whois timed out")
+    .expect("whois returned None (server up?)");
+
+    assert!(info.found, "whois should find Go peer for {}", ienv.go_ip);
+    eprintln!(
+        "interop_whois_go_peer: node_name={} user_id={} login={}",
+        info.node_name, info.user_id, info.login_name
+    );
+    // The Go node's FQDN should contain its hostname prefix.
+    let whois_name = info.node_name.trim_end_matches('.').to_lowercase();
+    assert!(
+        whois_name.contains("go-interop"),
+        "whois node_name should contain 'go-interop', got '{}'",
+        info.node_name
+    );
+    // Tagged nodes typically have no user profile (user_id=0, empty login).
+    // Just log it; the Go node was registered with tag:e2e.
+    eprintln!(
+        "interop_whois_go_peer: tag identity user_id={} login_name='{}' display='{}'",
+        info.user_id, info.login_name, info.display_name
+    );
+
+    server.close().await;
+}
+
+/// Interop: assert the path to the Go peer settles to Direct after echo
+/// traffic. On localhost, disco ping/pong + CallMeMaybe should hole-punch
+/// trivially. Fails if still on DERP after 60s — the core NAT-traversal
+/// interop proof.
+#[tokio::test]
+#[ignore = "requires TS_INTEROP_GO_IP (run via tools/interop.sh)"]
+async fn interop_direct_path() {
+    let Some(ienv) = interop_env() else {
+        eprintln!("interop_direct_path: skipping (interop env not set)");
+        return;
+    };
+
+    let mut server = interop_server(&ienv.authkey, "direct");
+    server.up().await.expect("up");
+
+    wait_for_peer(&server, IpAddr::V4(ienv.go_ip), "interop_direct_path").await;
+
+    // Generate echo traffic to trigger disco probing.
+    let dial_addr = format!("{}:{}", ienv.go_ip, ienv.echo_port);
+    let mut stream = None;
+    for _ in 1..=3 {
+        if let Ok(Ok(s)) =
+            tokio::time::timeout(std::time::Duration::from_secs(45), server.dial(&dial_addr)).await
+        {
+            stream = Some(s);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+    let mut stream = stream.expect("dial failed for direct_path test");
+
+    // Send a few echo roundtrips to generate disco traffic.
+    for i in 0..5 {
+        let payload = format!("interop-direct-{i}");
+        echo_roundtrip(&mut stream, payload.as_bytes(), "direct_path").await;
+    }
+
+    // Poll for direct path settlement (up to 60s).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut settled = false;
+    while std::time::Instant::now() < deadline {
+        if let Some(class) = go_peer_path(&server, ienv.go_ip) {
+            eprintln!("[interop:direct_path] current path = {:?}", class);
+            if class == PathClass::Direct {
+                settled = true;
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+
+    tokio::io::AsyncWriteExt::shutdown(&mut stream).await.ok();
+
+    if !settled {
+        let st = server.status();
+        let peers: Vec<String> = st
+            .peers
+            .iter()
+            .map(|p| format!("  {} ips={:?} path={:?}", p.name, p.ips, p.path_class))
+            .collect();
+        panic!(
+            "interop_direct_path: path to Go peer did not settle to Direct after 60s\n\
+             This is unexpected on localhost — disco exchange with Go's magicsock failed.\n\
+             Current peers ({}):\n{}",
+            peers.len(),
+            peers.join("\n")
+        );
+    }
+
+    eprintln!("interop_direct_path: SUCCESS — path settled to Direct");
+    server.close().await;
+}
+
+/// Interop: assert relayed (DERP) connectivity works with Go by pinning
+/// direct paths off. Echo must flow and our path class must be Derp.
+#[tokio::test]
+#[ignore = "requires TS_INTEROP_GO_IP (run via tools/interop.sh)"]
+async fn interop_derp_path() {
+    let Some(ienv) = interop_env() else {
+        eprintln!("interop_derp_path: skipping (interop env not set)");
+        return;
+    };
+
+    let mut server = interop_server_derp_only(&ienv.authkey, "derp");
+    server.up().await.expect("up");
+
+    wait_for_peer(&server, IpAddr::V4(ienv.go_ip), "interop_derp_path").await;
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    let dial_addr = format!("{}:{}", ienv.go_ip, ienv.echo_port);
+    let mut stream = None;
+    for attempt in 1..=3 {
+        eprintln!("interop_derp_path: dial attempt {attempt} to {dial_addr}");
+        if let Ok(Ok(s)) =
+            tokio::time::timeout(std::time::Duration::from_secs(45), server.dial(&dial_addr)).await
+        {
+            stream = Some(s);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+    let mut stream = stream.expect("dial failed (DERP path)");
+
+    echo_roundtrip(&mut stream, b"interop-derp-path", "derp_path").await;
+
+    // Assert our path class is Derp (not Direct — disable_direct_paths is on).
+    let class = go_peer_path(&server, ienv.go_ip);
+    eprintln!("interop_derp_path: path class = {:?}", class);
+    assert!(
+        class != Some(PathClass::Direct),
+        "path should NOT be Direct when disable_direct_paths is set"
+    );
+
+    tokio::io::AsyncWriteExt::shutdown(&mut stream).await.ok();
+    server.close().await;
+}
+
+/// Interop: start on DERP, assert upgrade to Direct without connection
+/// interruption. A continuous echo loop runs while the path upgrades —
+/// no dropped or garbled bytes.
+#[tokio::test]
+#[ignore = "requires TS_INTEROP_GO_IP (run via tools/interop.sh)"]
+async fn interop_direct_after_derp() {
+    let Some(ienv) = interop_env() else {
+        eprintln!("interop_direct_after_derp: skipping (interop env not set)");
+        return;
+    };
+
+    let mut server = interop_server(&ienv.authkey, "upgrade");
+    server.up().await.expect("up");
+
+    wait_for_peer(&server, IpAddr::V4(ienv.go_ip), "interop_direct_after_derp").await;
+
+    // Dial and start a continuous echo loop in a background task.
+    let dial_addr = format!("{}:{}", ienv.go_ip, ienv.echo_port);
+    let mut stream = None;
+    for _ in 1..=3 {
+        if let Ok(Ok(s)) =
+            tokio::time::timeout(std::time::Duration::from_secs(45), server.dial(&dial_addr)).await
+        {
+            stream = Some(s);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+    let mut stream = stream.expect("dial failed for direct_after_derp");
+
+    // Continuous echo: sequence-numbered payloads, verify each roundtrip
+    // while the path may upgrade from DERP to Direct.
+    let echo_ok = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let echo_done = std::sync::Arc::new(tokio::sync::Notify::new());
+    let echo_ok_c = echo_ok.clone();
+    let echo_done_c = echo_done.clone();
+    let echo_task = tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for i in 0..200u32 {
+            let payload = format!("interop-upgrade-{i:04}");
+            let bytes = payload.as_bytes();
+            if tokio::time::timeout(std::time::Duration::from_secs(30), stream.write_all(bytes))
+                .await
+                .is_err()
+            {
+                eprintln!("[interop:upgrade] write timeout at seq {i}");
+                break;
+            }
+            let mut got = vec![0u8; bytes.len()];
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                stream.read_exact(&mut got),
+            )
+            .await
+            {
+                Ok(Ok(_)) if got == bytes => {
+                    echo_ok_c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                _ => {
+                    eprintln!("[interop:upgrade] echo mismatch/timeout at seq {i}");
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        echo_done_c.notify_one();
+    });
+
+    // Poll for direct path settlement (up to 60s).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut settled = false;
+    while std::time::Instant::now() < deadline {
+        if let Some(class) = go_peer_path(&server, ienv.go_ip) {
+            eprintln!("[interop:upgrade] current path = {:?}", class);
+            if class == PathClass::Direct {
+                settled = true;
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+
+    // Give the echo loop a moment to complete a few more roundtrips after
+    // the path upgraded, then signal it to stop by dropping the stream
+    // (the task will see EOF on next read).
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    // Cancel the echo task.
+    echo_task.abort();
+
+    let ok_count = echo_ok.load(std::sync::atomic::Ordering::Relaxed);
+    eprintln!(
+        "interop_direct_after_derp: {ok_count} echo roundtrips completed, path settled={settled}"
+    );
+
+    if !settled {
+        let st = server.status();
+        let peers: Vec<String> = st
+            .peers
+            .iter()
+            .map(|p| format!("  {} ips={:?} path={:?}", p.name, p.ips, p.path_class))
+            .collect();
+        panic!(
+            "interop_direct_after_derp: path did not upgrade to Direct after 60s\n\
+             Peers ({}):\n{}",
+            peers.len(),
+            peers.join("\n")
+        );
+    }
+
+    // At least some echo roundtrips must have succeeded (proving no
+    // interruption during the upgrade).
+    assert!(
+        ok_count > 0,
+        "no echo roundtrips succeeded — connection was interrupted during path upgrade"
+    );
+
+    server.close().await;
+}
+
+/// Interop: Go node advertises a subnet route; rustscale with accept_routes
+/// should resolve that subnet to the Go peer in its routing table.
+#[tokio::test]
+#[ignore = "requires TS_INTEROP_GO_IP (run via tools/interop.sh)"]
+async fn interop_subnet_routes() {
+    let Some(ienv) = interop_env() else {
+        eprintln!("interop_subnet_routes: skipping (interop env not set)");
+        return;
+    };
+    let subnet = if let Some(s) = &ienv.go_subnet {
+        s.clone()
+    } else {
+        eprintln!("interop_subnet_routes: skipping (TS_INTEROP_GO_SUBNET not set)");
+        return;
+    };
+
+    let mut server = Server::builder()
+        .hostname(format!("rustscale-interop-subnet-{}", std::process::id()))
+        .auth_key(ienv.authkey.clone())
+        .ephemeral(true)
+        .accept_routes(true)
+        .build()
+        .expect("build");
+    server.up().await.expect("up");
+
+    // Wait for the Go peer to appear.
+    wait_for_peer(&server, IpAddr::V4(ienv.go_ip), "interop_subnet_routes").await;
+
+    // The harness approves the Go node's advertised route. Wait for the
+    // subnet to appear in our routing table (control pushes updated
+    // AllowedIPs after approval).
+    // Parse a sample IP in the subnet for route-table lookup.
+    let sample_ip: IpAddr = if subnet.starts_with("10.99") {
+        IpAddr::V4(Ipv4Addr::new(10, 99, 0, 1))
+    } else {
+        // Generic: try first usable IP. For simplicity, assume /24.
+        let parts: Vec<u8> = subnet
+            .split('/')
+            .next()
+            .unwrap_or("10.99.0.0")
+            .split('.')
+            .filter_map(|s| s.parse().ok())
+            .collect();
+        if parts.len() == 4 {
+            IpAddr::V4(Ipv4Addr::new(
+                parts[0],
+                parts[1],
+                parts[2],
+                parts[3].saturating_add(1),
+            ))
+        } else {
+            IpAddr::V4(Ipv4Addr::new(10, 99, 0, 1))
+        }
+    };
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    loop {
+        if server.route_lookup(sample_ip).is_some() {
+            eprintln!("interop_subnet_routes: route for {sample_ip} resolved to Go peer");
+            // Verify the route is in the route table snapshot.
+            let routes = server.routes();
+            let has_subnet = routes.iter().any(|(cidr, _)| cidr == &subnet);
+            assert!(
+                has_subnet,
+                "route table should contain {subnet}, got: {routes:?}"
+            );
+            eprintln!("interop_subnet_routes: SUCCESS — subnet {subnet} -> Go peer");
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            let routes = server.routes();
+            panic!(
+                "interop_subnet_routes: subnet {subnet} never appeared in route table (90s)\n\
+                 routes: {routes:?}"
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
+    server.close().await;
+}

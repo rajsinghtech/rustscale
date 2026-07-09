@@ -166,6 +166,11 @@ pub struct ServerBuilder {
     /// `localNets` is also extended with the default routes so forwarded
     /// exit traffic is admitted (same mechanism as subnet routes).
     advertise_exit_node: bool,
+    /// Test-support: when true, magicsock suppresses all direct-path
+    /// establishment and forces every send via DERP. See
+    /// [`MagicsockConfig::disable_direct_paths`]. Production code should
+    /// leave this false.
+    disable_direct_paths: bool,
 }
 
 impl ServerBuilder {
@@ -240,6 +245,14 @@ impl ServerBuilder {
     /// enabled (see [`ServerBuilder::advertise_routes`] for the sysctls).
     pub fn advertise_exit_node(mut self, on: bool) -> Self {
         self.advertise_exit_node = on;
+        self
+    }
+
+    /// Test-support: suppress direct-path establishment and force all sends
+    /// via DERP relay. Use only in interop tests that need to assert relayed
+    /// connectivity in isolation. See [`MagicsockConfig::disable_direct_paths`].
+    pub fn disable_direct_paths(mut self, on: bool) -> Self {
+        self.disable_direct_paths = on;
         self
     }
 
@@ -935,6 +948,7 @@ impl Server {
                 udp_socket: Some(udp_socket),
                 portmapper: Some(portmapper),
                 health: Some(health.clone()),
+                disable_direct_paths: self.config.disable_direct_paths,
             })
             .await?,
         );

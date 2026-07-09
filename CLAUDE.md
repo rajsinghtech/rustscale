@@ -90,23 +90,22 @@ way to delete that tailnet.** Always clean up tailnets in test teardown.
 
 ## Roadmap (agreed with user, in order)
 
-1–6. Core stack through TUN mode (phases 1–5 done through tsnet; TUN next).
-7. **Packet filter** — enforce MapResponse filter rules (correctness gate; port wgengine/filter).
-8. **FFI / libtailscale** — C ABI over tsnet + Python/Node/Swift/Kotlin bindings. The strategic
-   differentiator vs Go (no runtime to embed). **Constraint that applies NOW: keep the tsnet
-   public API C-representable** — no generics/lifetimes/async in the public surface that can't
-   map to a C handle model; prefer opaque handles + plain data structs at the boundary.
-9. **Perf data plane + hard benchmarks** (moved before mobile per user) — UDP GSO/GRO,
-   io_uring TUN+socket path, batched magicsock IO; iperf3 benchmark harness with HARD
-   numbers rustscale vs tailscaled. Includes **subnet routing** and **Serve** support
-   first, so the comparison covers forwarding and HTTP-serve scenarios, not just
-   node-to-node.
-10. **Mobile/constrained targets** — iOS NetworkExtension (<50MB), Android, OpenWrt/musl static;
-    size profiling and feature-gated deps.
-11. **Serve/Funnel + certs + MagicDNS** — ListenTLS/ListenFunnel, LE certs via control,
-    in-netstack DNS resolver.
-12. **SSH server, exit node/subnet routes, Taildrop.**
-13. **DERP + peer relay server** in Rust (reuse frame codec).
+1–8 done: core stack, tsnet, TUN, packet filter, FFI, perf (beats tailscaled:
+p50 ~170us vs 257us, throughput 465–838 vs 384 Mbps, localhost direct).
+
+Feature-port order (user-specified 2026-07-09):
+1. **MagicDNS resolver + LE certs via control** — unlocks real listen_tls; required for Funnel/Serve.
+2. **WhoIs (peer identity)** — netmap lookup by IP; critical for auth-aware services.
+3. **Network monitor (netmon)** — re-STUN/endpoint refresh/DERP reconnect on network transitions.
+4. **Port mapping (NAT-PMP/PCP/UPnP)** — direct-connect success behind hard NATs.
+5. **Exit node support** — route all traffic via exit node.
+6. **Funnel + ServeConfig** — public exposure (443/8443/10000).
+7. **Health tracking** — production monitoring UX.
+8. **SOCKS5 proxy** — Docker/k8s sidecar pattern.
+9. **LocalAPI** — CLI tooling integration.
+10. **Tailscale SSH** — large.
+Then: mobile/constrained targets, Linux perf (GSO/GRO, io_uring via CI), Taildrop,
+DERP+peer relay server. Standing constraint: tsnet public API stays C-representable.
 
 ## Reference sources (read-only)
 

@@ -1,0 +1,386 @@
+[
+  {
+    "tool": "rustscale",
+    "mode": "userspace",
+    "topology": "same-zone",
+    "path": "direct",
+    "config": "rs-userspace",
+    "throughput": [
+      {"parallel": 1, "mbps": 820.5, "duration_s": 30},
+      {"parallel": 10, "mbps": 1450.2, "duration_s": 30},
+      {"parallel": 25, "mbps": 1620.8, "duration_s": 30},
+      {"parallel": 50, "mbps": 1680.0, "duration_s": 30},
+      {"parallel": 100, "mbps": 1695.4, "duration_s": 30}
+    ],
+    "latency": {"p50_us": 165, "p95_us": 340, "p99_us": 1820, "count": 200},
+    "footprint": {
+      "binary_size_bytes": 8244000,
+      "rss_peak_kb": 38420,
+      "rss_avg_kb": 35100,
+      "cpu_peak_pct": 88.2,
+      "cpu_avg_pct": 44.5,
+      "samples": 150
+    },
+    "path_class_reported": "direct"
+  },
+  {
+    "tool": "rustscale",
+    "mode": "tun",
+    "topology": "same-zone",
+    "path": "direct",
+    "config": "rs-tun",
+    "throughput": [
+      {"parallel": 1, "mbps": 910.0, "duration_s": 30},
+      {"parallel": 10, "mbps": 2100.5, "duration_s": 30},
+      {"parallel": 25, "mbps": 2480.3, "duration_s": 30},
+      {"parallel": 50, "mbps": 2520.0, "duration_s": 30},
+      {"parallel": 100, "mbps": 2535.6, "duration_s": 30}
+    ],
+    "latency": {"p50_us": 142, "p95_us": 298, "p99_us": 1410, "count": 200},
+    "footprint": {
+      "binary_size_bytes": 9120000,
+      "rss_peak_kb": 42100,
+      "rss_avg_kb": 39800,
+      "cpu_peak_pct": 92.1,
+      "cpu_avg_pct": 51.3,
+      "samples": 150
+    },
+    "path_class_reported": "direct"
+  },
+  {
+    "tool": "tailscaled",
+    "mode": "userspace",
+    "topology": "same-zone",
+    "path": "direct",
+    "config": "ts-userspace",
+    "throughput": [
+      {"parallel": 1, "mbps": 780.1, "duration_s": 30},
+      {"parallel": 10, "mbps": 1320.7, "duration_s": 30},
+      {"parallel": 25, "mbps": 1490.0, "duration_s": 30},
+      {"parallel": 50, "mbps": 1510.2, "duration_s": 30},
+      {"parallel": 100, "mbps": 1505.8, "duration_s": 30}
+    ],
+    "latency": {"p50_us": 210, "p95_us": 410, "p99_us": 2200, "count": 200},
+    "footprint": {
+      "binary_size_bytes": 28400000,
+      "rss_peak_kb": 61200,
+      "rss_avg_kb": 55400,
+      "cpu_peak_pct": 95.4,
+      "cpu_avg_pct": 58.0,
+      "samples": 150
+    },
+    "path_class_reported": "direct"
+  },
+  {
+    "tool": "tailscaled",
+    "mode": "tun",
+    "topology": "same-zone",
+    "path": "direct",
+    "config": "ts-tun",
+    "throughput": [
+      {"parallel": 1, "mbps": 905.3, "duration_s": 30},
+      {"parallel": 10, "mbps": 2050.1, "duration_s": 30},
+      {"parallel": 25, "mbps": 2380.9, "duration_s": 30},
+      {"parallel": 50, "mbps": 2410.4, "duration_s": 30},
+      {"parallel": 100, "mbps": 2402.0, "duration_s": 30}
+    ],
+    "latency": {"p50_us": 155, "p95_us": 320, "p99_us": 1620, "count": 200},
+    "footprint": {
+      "binary_size_bytes": 28400000,
+      "rss_peak_kb": 58900,
+      "rss_avg_kb": 53100,
+      "cpu_peak_pct": 90.7,
+      "cpu_avg_pct": 53.8,
+      "samples": 150
+    },
+    "path_class_reported": "direct"
+  },
+  {
+    "tool": "rustscale",
+    "mode": "userspace",
+    "topology": "same-zone",
+    "path": "derp",
+    "config": "rs-userspace",
+    "throughput": [
+      {"parallel": 1, "mbps": 95.2, "duration_s": 30},
+      {"parallel": 10, "mbps": 180.4, "duration_s": 30},
+      {"parallel": 25, "mbps": 210.0, "duration_s": 30},
+      {"parallel": 50, "mbps": 215.5, "duration_s": 30},
+      {"parallel": 100, "mbps": 218.1, "duration_s": 30}
+    ],
+    "latency": {"p50_us": 24500, "p95_us": 41200, "p99_us": 88000, "count": 200},
+    "footprint": {
+      "binary_size_bytes": 8244000,
+      "rss_peak_kb": 38800,
+      "rss_avg_kb": 35600,
+      "cpu_peak_pct": 60.1,
+      "cpu_avg_pct": 22.0,
+      "samples": 150
+    },
+    "path_class_reported": "derp"
+  },
+  {
+    "tool": "rustscale",
+    "mode": "tun",
+    "topology": "same-zone",
+    "path": "derp",
+    "config": "rs-tun",
+    "throughput": [
+      {"parallel": 1, "mbps": 110.8, "duration_s": 30},
+      {"parallel": 10, "mbps": 220.5, "duration_s": 30},
+      {"parallel": 25, "mbps": 260.0, "duration_s": 30},
+      {"parallel": 50, "mbps": 268.4, "duration_s": 30},
+      {"parallel": 100, "mbps": 270.2, "duration_s": 30}
+    ],
+    "latency": {"p50_us": 22800, "p95_us": 38900, "p99_us": 76000, "count": 200},
+    "footprint": {
+      "binary_size_bytes": 9120000,
+      "rss_peak_kb": 42500,
+      "rss_avg_kb": 40100,
+      "cpu_peak_pct": 65.8,
+      "cpu_avg_pct": 25.4,
+      "samples": 150
+    },
+    "path_class_reported": "derp"
+  },
+  {
+    "tool": "tailscaled",
+    "mode": "userspace",
+    "topology": "same-zone",
+    "path": "derp",
+    "config": "ts-userspace",
+    "throughput": [
+      {"parallel": 1, "mbps": 88.0, "duration_s": 30},
+      {"parallel": 10, "mbps": 165.2, "duration_s": 30},
+      {"parallel": 25, "mbps": 190.0, "duration_s": 30},
+      {"parallel": 50, "mbps": 195.7, "duration_s": 30},
+      {"parallel": 100, "mbps": 198.0, "duration_s": 30}
+    ],
+    "latency": {"p50_us": 26100, "p95_us": 44800, "p99_us": 92000, "count": 200},
+    "footprint": {
+      "binary_size_bytes": 28400000,
+      "rss_peak_kb": 61800,
+      "rss_avg_kb": 55900,
+      "cpu_peak_pct": 68.2,
+      "cpu_avg_pct": 26.5,
+      "samples": 150
+    },
+    "path_class_reported": "derp"
+  },
+  {
+    "tool": "tailscaled",
+    "mode": "tun",
+    "topology": "same-zone",
+    "path": "derp",
+    "config": "ts-tun",
+    "throughput": [
+      {"parallel": 1, "mbps": 105.4, "duration_s": 30},
+      {"parallel": 10, "mbps": 205.1, "duration_s": 30},
+      {"parallel": 25, "mbps": 240.0, "duration_s": 30},
+      {"parallel": 50, "mbps": 248.9, "duration_s": 30},
+      {"parallel": 100, "mbps": 250.3, "duration_s": 30}
+    ],
+    "latency": {"p50_us": 23500, "p95_us": 40100, "p99_us": 81000, "count": 200},
+    "footprint": {
+      "binary_size_bytes": 28400000,
+      "rss_peak_kb": 59200,
+      "rss_avg_kb": 53400,
+      "cpu_peak_pct": 63.0,
+      "cpu_avg_pct": 24.1,
+      "samples": 150
+    },
+    "path_class_reported": "derp"
+  },
+  {
+    "tool": "rustscale",
+    "mode": "userspace",
+    "topology": "cross-region",
+    "path": "direct",
+    "config": "rs-userspace",
+    "throughput": [
+      {"parallel": 1, "mbps": 240.6, "duration_s": 30},
+      {"parallel": 10, "mbps": 740.2, "duration_s": 30},
+      {"parallel": 25, "mbps": 880.5, "duration_s": 30},
+      {"parallel": 50, "mbps": 905.1, "duration_s": 30},
+      {"parallel": 100, "mbps": 910.7, "duration_s": 30}
+    ],
+    "latency": {"p50_us": 34500, "p95_us": 38200, "p99_us": 51200, "count": 200},
+    "footprint": {
+      "binary_size_bytes": 8244000,
+      "rss_peak_kb": 38600,
+      "rss_avg_kb": 35300,
+      "cpu_peak_pct": 70.4,
+      "cpu_avg_pct": 35.1,
+      "samples": 150
+    },
+    "path_class_reported": "direct"
+  },
+  {
+    "tool": "rustscale",
+    "mode": "tun",
+    "topology": "cross-region",
+    "path": "direct",
+    "config": "rs-tun",
+    "throughput": [
+      {"parallel": 1, "mbps": 280.9, "duration_s": 30},
+      {"parallel": 10, "mbps": 980.0, "duration_s": 30},
+      {"parallel": 25, "mbps": 1180.3, "duration_s": 30},
+      {"parallel": 50, "mbps": 1205.8, "duration_s": 30},
+      {"parallel": 100, "mbps": 1210.0, "duration_s": 30}
+    ],
+    "latency": {"p50_us": 33800, "p95_us": 37200, "p99_us": 48900, "count": 200},
+    "footprint": {
+      "binary_size_bytes": 9120000,
+      "rss_peak_kb": 42300,
+      "rss_avg_kb": 39900,
+      "cpu_peak_pct": 75.2,
+      "cpu_avg_pct": 40.6,
+      "samples": 150
+    },
+    "path_class_reported": "direct"
+  },
+  {
+    "tool": "tailscaled",
+    "mode": "userspace",
+    "topology": "cross-region",
+    "path": "direct",
+    "config": "ts-userspace",
+    "throughput": [
+      {"parallel": 1, "mbps": 225.3, "duration_s": 30},
+      {"parallel": 10, "mbps": 680.5, "duration_s": 30},
+      {"parallel": 25, "mbps": 800.0, "duration_s": 30},
+      {"parallel": 50, "mbps": 820.4, "duration_s": 30},
+      {"parallel": 100, "mbps": 815.9, "duration_s": 30}
+    ],
+    "latency": {"p50_us": 35200, "p95_us": 39400, "p99_us": 54800, "count": 200},
+    "footprint": {
+      "binary_size_bytes": 28400000,
+      "rss_peak_kb": 61500,
+      "rss_avg_kb": 55700,
+      "cpu_peak_pct": 78.0,
+      "cpu_avg_pct": 42.3,
+      "samples": 150
+    },
+    "path_class_reported": "direct"
+  },
+  {
+    "tool": "tailscaled",
+    "mode": "tun",
+    "topology": "cross-region",
+    "path": "direct",
+    "config": "ts-tun",
+    "throughput": [
+      {"parallel": 1, "mbps": 275.1, "duration_s": 30},
+      {"parallel": 10, "mbps": 950.8, "duration_s": 30},
+      {"parallel": 25, "mbps": 1120.4, "duration_s": 30},
+      {"parallel": 50, "mbps": 1140.2, "duration_s": 30},
+      {"parallel": 100, "mbps": 1135.6, "duration_s": 30}
+    ],
+    "latency": {"p50_us": 34100, "p95_us": 37600, "p99_us": 50100, "count": 200},
+    "footprint": {
+      "binary_size_bytes": 28400000,
+      "rss_peak_kb": 59000,
+      "rss_avg_kb": 53200,
+      "cpu_peak_pct": 73.5,
+      "cpu_avg_pct": 38.7,
+      "samples": 150
+    },
+    "path_class_reported": "direct"
+  },
+  {
+    "tool": "rustscale",
+    "mode": "userspace",
+    "topology": "cross-region",
+    "path": "derp",
+    "config": "rs-userspace",
+    "throughput": [
+      {"parallel": 1, "mbps": 42.0, "duration_s": 30},
+      {"parallel": 10, "mbps": 95.5, "duration_s": 30},
+      {"parallel": 25, "mbps": 110.2, "duration_s": 30},
+      {"parallel": 50, "mbps": 115.0, "duration_s": 30},
+      {"parallel": 100, "mbps": 116.8, "duration_s": 30}
+    ],
+    "latency": {"p50_us": 88000, "p95_us": 124000, "p99_us": 210000, "count": 200},
+    "footprint": {
+      "binary_size_bytes": 8244000,
+      "rss_peak_kb": 38900,
+      "rss_avg_kb": 35700,
+      "cpu_peak_pct": 40.2,
+      "cpu_avg_pct": 15.1,
+      "samples": 150
+    },
+    "path_class_reported": "derp"
+  },
+  {
+    "tool": "rustscale",
+    "mode": "tun",
+    "topology": "cross-region",
+    "path": "derp",
+    "config": "rs-tun",
+    "throughput": [
+      {"parallel": 1, "mbps": 55.4, "duration_s": 30},
+      {"parallel": 10, "mbps": 120.7, "duration_s": 30},
+      {"parallel": 25, "mbps": 140.0, "duration_s": 30},
+      {"parallel": 50, "mbps": 145.3, "duration_s": 30},
+      {"parallel": 100, "mbps": 147.0, "duration_s": 30}
+    ],
+    "latency": {"p50_us": 85500, "p95_us": 119000, "p99_us": 198000, "count": 200},
+    "footprint": {
+      "binary_size_bytes": 9120000,
+      "rss_peak_kb": 42700,
+      "rss_avg_kb": 40200,
+      "cpu_peak_pct": 45.6,
+      "cpu_avg_pct": 17.8,
+      "samples": 150
+    },
+    "path_class_reported": "derp"
+  },
+  {
+    "tool": "tailscaled",
+    "mode": "userspace",
+    "topology": "cross-region",
+    "path": "derp",
+    "config": "ts-userspace",
+    "throughput": [
+      {"parallel": 1, "mbps": 38.2, "duration_s": 30},
+      {"parallel": 10, "mbps": 88.0, "duration_s": 30},
+      {"parallel": 25, "mbps": 100.5, "duration_s": 30},
+      {"parallel": 50, "mbps": 105.1, "duration_s": 30},
+      {"parallel": 100, "mbps": 106.4, "duration_s": 30}
+    ],
+    "latency": {"p50_us": 92000, "p95_us": 131000, "p99_us": 225000, "count": 200},
+    "footprint": {
+      "binary_size_bytes": 28400000,
+      "rss_peak_kb": 62000,
+      "rss_avg_kb": 56100,
+      "cpu_peak_pct": 48.1,
+      "cpu_avg_pct": 18.9,
+      "samples": 150
+    },
+    "path_class_reported": "derp"
+  },
+  {
+    "tool": "tailscaled",
+    "mode": "tun",
+    "topology": "cross-region",
+    "path": "derp",
+    "config": "ts-tun",
+    "throughput": [
+      {"parallel": 1, "mbps": 52.0, "duration_s": 30},
+      {"parallel": 10, "mbps": 115.6, "duration_s": 30},
+      {"parallel": 25, "mbps": 132.0, "duration_s": 30},
+      {"parallel": 50, "mbps": 138.2, "duration_s": 30},
+      {"parallel": 100, "mbps": 139.5, "duration_s": 30}
+    ],
+    "latency": {"p50_us": 87000, "p95_us": 122000, "p99_us": 205000, "count": 200},
+    "footprint": {
+      "binary_size_bytes": 28400000,
+      "rss_peak_kb": 59400,
+      "rss_avg_kb": 53600,
+      "cpu_peak_pct": 43.7,
+      "cpu_avg_pct": 16.5,
+      "samples": 150
+    },
+    "path_class_reported": "derp"
+  }
+]

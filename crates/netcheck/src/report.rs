@@ -52,6 +52,13 @@ pub struct Report {
     pub global_v4: Option<SocketAddr>,
     /// The best (lowest-latency) reflexive IPv6 endpoint observed.
     pub global_v6: Option<SocketAddr>,
+
+    /// Port-mapping service availability (populated by the caller from a
+    /// separate portmapper probe, not by the STUN prober itself). Mirrors
+    /// Go's `Report.PortMapperProbe*` fields.
+    pub port_mapper_pmp: bool,
+    pub port_mapper_pcp: bool,
+    pub port_mapper_upnp: bool,
 }
 
 impl Report {

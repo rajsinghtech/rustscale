@@ -122,5 +122,18 @@ export TS_E2E_TAILNET="$DNS"
 export TS_E2E_AUTHKEY="$AUTHKEY"
 export TS_E2E_API_TOKEN="$CHILD_TOKEN"
 
+# Enable HTTPS cert provisioning so the ACME e2e can run (best-effort; the
+# test skips itself if CertDomains stays empty). LE staging avoids prod
+# rate limits.
+if curl -sS -o /dev/null -w '%{http_code}' -X PATCH \
+     "$API/api/v2/tailnet/$DNS/settings" \
+     -H "Authorization: Bearer $CHILD_TOKEN" -H 'Content-Type: application/json' \
+     --data '{"httpsEnabled": true}' | grep -q 200; then
+  export TS_E2E_HTTPS=1
+  export RUSTSCALE_ACME_URL="${RUSTSCALE_ACME_URL:-https://acme-staging-v02.api.letsencrypt.org/directory}"
+else
+  echo "WARN: could not enable httpsEnabled; ACME e2e will skip" >&2
+fi
+
 # E2E tests are #[ignore]d unit-style tests gated on TS_E2E_* env vars.
 cargo test --workspace -- --ignored

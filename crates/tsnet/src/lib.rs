@@ -28,6 +28,7 @@
 
 #![forbid(unsafe_code)]
 
+mod acme;
 mod routing;
 mod state;
 mod status;
@@ -227,6 +228,12 @@ struct RunningState {
     user_profiles: Arc<RwLock<BTreeMap<UserID, UserProfile>>>,
     /// Network change monitor handle (None if the monitor couldn't start).
     monitor: Option<rustscale_netmon::MonitorHandle>,
+    /// Machine private key (for control-plane set-dns during cert issuance).
+    machine_key: MachinePrivate,
+    /// Server (control) public key (for control-plane set-dns).
+    server_pub_key: MachinePublic,
+    /// Node private key (for SetDNSRequest.NodeKey during cert issuance).
+    node_key: NodePrivate,
 }
 
 /// Which data plane is wired up: userspace netstack (tsnet listen/dial) or a
@@ -427,6 +434,9 @@ impl Server {
             dns_config: b.dns_config,
             user_profiles: b.user_profiles,
             monitor,
+            machine_key: b.machine_key,
+            server_pub_key: b.server_pub_key,
+            node_key: b.node_key,
         });
         Ok(())
     }
@@ -529,6 +539,9 @@ impl Server {
             dns_config: b.dns_config,
             user_profiles: b.user_profiles,
             monitor,
+            machine_key: b.machine_key,
+            server_pub_key: b.server_pub_key,
+            node_key: b.node_key,
         });
         Ok(())
     }
@@ -611,6 +624,13 @@ impl Server {
         let udp_port = udp_socket.local_addr().map_err(TsnetError::Io)?.port();
         let local_endpoints = rustscale_magicsock::gather_local_endpoints(udp_port);
         eprintln!("tsnet: local UDP endpoints: {local_endpoints:?}");
+
+        // Create a port-mapping client (NAT-PMP/PCP/UPnP) so magicsock can
+        // publish a port-mapped external endpoint alongside local/STUN
+        // endpoints. Best-effort: if the gateway doesn't support any
+        // port-mapping protocol, this silently produces no endpoint.
+        let portmapper = rustscale_portmapper::Client::new();
+        portmapper.set_local_port(udp_port);
 
         // 3c. Send a lightweight non-streaming MapRequest to push our
         // DiscoKey + Endpoints to the control server BEFORE starting the
@@ -746,9 +766,15 @@ impl Server {
                 home_derp_region: home_derp,
                 udp_bind: None,
                 udp_socket: Some(udp_socket),
+                portmapper: Some(portmapper),
             })
             .await?,
         );
+
+        // Start a background port-mapping probe + creation (best-effort, 2s
+        // timeout). The cached mapping will be picked up by subsequent
+        // `all_endpoints()` calls and published to the control plane.
+        magicsock.start_portmap();
 
         // The server may send peers via Peers (full list) or PeersChanged
         // (delta). The first response often uses PeersChanged.
@@ -917,13 +943,14 @@ impl Server {
     /// Build a Let's Encrypt-via-control [`CertProvider`] for this node's
     /// FQDN, fetching/caching the cert material. Returns a typed
     /// [`CertError`] when HTTPS certs are not enabled for the tailnet
-    /// ([`CertError::NotEnabled`]) or the ACME client is not yet
-    /// implemented ([`CertError::AcmeClientUnavailable`]); callers can fall
-    /// back to a self-signed cert in those cases.
+    /// ([`CertError::NotEnabled`]) or the ACME order flow fails
+    /// ([`CertError::Acme`]); callers can fall back to a self-signed cert
+    /// in those cases.
     ///
     /// Requires the server to be up. The cert+key are cached in
     /// `state_dir` (`<fqdn>.crt.pem` / `<fqdn>.key.pem`) and refreshed when
-    /// within 14 days of expiry.
+    /// within 14 days of expiry. The ACME account key is persisted in
+    /// `state_dir/acme-account.key.pem`.
     pub async fn control_cert_provider(&self) -> Result<Arc<dyn CertProvider>, CertError> {
         let inner = self
             .inner
@@ -936,19 +963,28 @@ impl Server {
             .as_ref()
             .map(|c| c.CertDomains.clone())
             .unwrap_or_default();
-        let fetcher = Arc::new(AcmeCertFetcher::new(cert_domains));
         let state_dir = self.config.state_dir.clone().unwrap_or_else(|| {
             let mut p = std::env::temp_dir();
             p.push("rustscale-certs");
             p
         });
         let _ = std::fs::create_dir_all(&state_dir);
+        let fetcher = Arc::new(AcmeCertFetcher::new(
+            cert_domains,
+            state_dir.clone(),
+            self.config.control_url.clone(),
+            inner.machine_key.clone(),
+            inner.server_pub_key.clone(),
+            inner.node_key.clone(),
+            CAPABILITY_VERSION,
+            PROTOCOL_VERSION,
+        ));
         let prov = Arc::new(ControlCertProvider::new(
             state_dir,
             &inner.our_fqdn,
             fetcher,
         ));
-        prov.refresh()?;
+        prov.refresh().await?;
         Ok(prov)
     }
 
@@ -1598,7 +1634,7 @@ fn spawn_link_monitor(
 
             magicsock.link_changed();
 
-            let mut eps = magicsock.local_endpoints();
+            let mut eps = magicsock.all_endpoints();
             if !derp_map.Regions.is_empty() {
                 if let Ok(report) = rustscale_netcheck::Prober
                     .run(&derp_map, &rustscale_netcheck::ProberOpts::default())

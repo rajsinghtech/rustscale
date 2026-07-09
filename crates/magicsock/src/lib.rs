@@ -85,6 +85,11 @@ pub struct MagicsockConfig {
     /// magicsock is fully constructed (magicsock otherwise needs the DERPMap
     /// from the first MapResponse, which is sent after endpoints are set).
     pub udp_socket: Option<Arc<UdpSocket>>,
+    /// Optional port-mapping client (NAT-PMP/PCP/UPnP). When provided,
+    /// magicsock publishes the port-mapped external endpoint alongside its
+    /// local/STUN endpoints. Best-effort: never blocks or fails endpoint
+    /// gathering if no portmapper is present.
+    pub portmapper: Option<rustscale_portmapper::Client>,
 }
 
 /// A received WG datagram with its sender identified.
@@ -112,6 +117,8 @@ struct Inner {
     disco_to_peer: RwLock<HashMap<DiscoPublic, NodePublic>>,
     addr_to_peer: RwLock<HashMap<SocketAddr, NodePublic>>,
     wg_send: mpsc::Sender<WgDatagram>,
+    /// Optional port-mapping client for NAT-PMP/PCP/UPnP external endpoints.
+    portmapper: Option<rustscale_portmapper::Client>,
 }
 
 /// Manages DERP connections across multiple regions.
@@ -375,6 +382,7 @@ impl Magicsock {
             disco_to_peer: RwLock::new(HashMap::new()),
             addr_to_peer: RwLock::new(HashMap::new()),
             wg_send,
+            portmapper: config.portmapper,
         });
 
         // Launch background recv tasks (UDP + DERP demux).
@@ -415,6 +423,53 @@ impl Magicsock {
             .read()
             .expect("local_udp_addrs lock poisoned")
             .clone()
+    }
+
+    /// Best-effort port-mapped external endpoint (from NAT-PMP/PCP/UPnP),
+    /// if a portmapper client was provided and has a cached mapping.
+    /// Non-blocking: returns `None` immediately if no mapping is cached.
+    /// The background creation task (started by
+    /// `get_cached_mapping_or_start_creating_one`) will populate the cache
+    /// asynchronously.
+    pub fn portmap_endpoint(&self) -> Option<String> {
+        let pm = self.inner.portmapper.as_ref()?;
+        let (ext, ok) = pm.get_cached_mapping_or_start_creating_one();
+        if ok {
+            ext.map(|addr| addr.to_string())
+        } else {
+            None
+        }
+    }
+
+    /// All endpoints to advertise: local interface endpoints + port-mapped
+    /// external endpoint (if available). Best-effort: portmap failure never
+    /// blocks or reduces the local endpoint set.
+    pub fn all_endpoints(&self) -> Vec<String> {
+        let mut eps = self.local_endpoints();
+        if let Some(pm_ep) = self.portmap_endpoint() {
+            if !eps.contains(&pm_ep) {
+                eps.push(pm_ep);
+            }
+        }
+        eps
+    }
+
+    /// Start a background port-mapping probe + creation task (best-effort,
+    /// 2 s overall timeout). No-op if no portmapper client was configured.
+    pub fn start_portmap(&self) {
+        if let Some(pm) = &self.inner.portmapper {
+            // Probe in the background; the result populates the cache that
+            // `portmap_endpoint` reads.
+            let pm = pm.clone();
+            tokio::spawn(async move {
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), pm.probe()).await;
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    pm.create_or_get_mapping(),
+                )
+                .await;
+            });
+        }
     }
 
     /// Update the peer set from a netmap. Creates/updates per-peer endpoints,

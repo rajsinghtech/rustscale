@@ -97,7 +97,7 @@ Feature-port order (user-specified 2026-07-09):
 1. **MagicDNS resolver + LE certs via control** — unlocks real listen_tls; required for Funnel/Serve.
 2. **WhoIs (peer identity)** — netmap lookup by IP; critical for auth-aware services.
 3. **Network monitor (netmon)** — re-STUN/endpoint refresh/DERP reconnect on network transitions.
-4. **Port mapping (NAT-PMP/PCP/UPnP)** — direct-connect success behind hard NATs.
+4. **Port mapping (NAT-PMP/PCP/UPnP)** — done: `crates/portmapper` with Client facade (probe, create/renew, cache), PMP/PCP byte-exact packet codec, UPnP SSDP+SOAP, fake IGD tests; magicsock publishes portmap endpoint best-effort alongside local/STUN endpoints.
 5. **Exit node support** — route all traffic via exit node.
 6. **Funnel + ServeConfig** — public exposure (443/8443/10000).
 7. **Health tracking** — production monitoring UX.
@@ -136,6 +136,7 @@ Cargo workspace, crates mirroring the Go layout:
 - `crates/disco` — disco message encode/decode + box crypto
 - `crates/derp` — DERP client protocol over HTTP/TLS (frame codec, derphttp client)
 - `crates/netcheck` — STUN probing, DERP latency, portmap detection
+- `crates/portmapper` — NAT-PMP/PCP/UPnP port mapping client (gateway discovery, probe, create/renew, cache)
 - `crates/controlclient` — ts2021 Noise control channel, map polling, register
 - `crates/magicsock` — UDP socket mgmt, endpoint discovery, path selection (direct/DERP/peer relay)
 - `crates/relayclient` — peer relay (UDP relay) client

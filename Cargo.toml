@@ -31,6 +31,10 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 chacha20poly1305 = "0.10"
 blake2 = "0.10"
 
+# ACME (RFC 8555) account key: ES256 (ECDSA P-256 + SHA-256) JWS signing.
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8", "std"] }
+sha2 = { version = "0.10" }
+
 # WireGuard userspace tunnel engine (noise::Tunn API only — not the device layer).
 boringtun = "0.7"
 

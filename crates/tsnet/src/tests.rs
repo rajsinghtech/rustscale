@@ -1263,9 +1263,10 @@ async fn e2e_whois_and_magicdns_dial() {
 }
 
 /// E2E: control cert provider on an ephemeral API-only tailnet. These
-/// tailnets do not have HTTPS/certs enabled, so the provider must return a
-/// clean typed `CertError::NotEnabled` (or, if HTTPS happens to be enabled,
-/// `AcmeClientUnavailable`). Either is acceptable; anything else fails.
+/// tailnets do not have HTTPS/certs enabled by default, so the provider must
+/// return a clean typed `CertError::NotEnabled`. If HTTPS happens to be
+/// enabled (the e2e harness may flip it), the ACME flow runs and either
+/// succeeds or returns an `Acme` error.
 #[tokio::test]
 #[ignore = "requires TS_E2E_AUTHKEY + TS_E2E_TAILNET env vars (run via tools/e2e.sh)"]
 async fn e2e_control_cert_not_enabled() {
@@ -1273,10 +1274,15 @@ async fn e2e_control_cert_not_enabled() {
     let _tailnet = std::env::var("TS_E2E_TAILNET").expect("TS_E2E_TAILNET not set");
     let uid = std::process::id();
 
+    let state_dir = std::env::temp_dir().join(format!("rustscale-e2e-cert-state-{uid}"));
+    let _ = std::fs::remove_dir_all(&state_dir);
+    std::fs::create_dir_all(&state_dir).unwrap();
+
     let mut server = Server::builder()
         .hostname(format!("rustscale-e2e-cert-{uid}"))
         .auth_key(authkey)
         .ephemeral(true)
+        .state_dir(state_dir.clone())
         .build()
         .expect("build");
     server.up().await.expect("up");
@@ -1292,11 +1298,14 @@ async fn e2e_control_cert_not_enabled() {
         Err(CertError::AcmeClientUnavailable(_)) => {
             eprintln!("control cert: AcmeClientUnavailable (HTTPS enabled, ACME client pending)");
         }
-        Err(e) => panic!("expected NotEnabled or AcmeClientUnavailable, got: {e}"),
+        Err(CertError::Acme(e)) => {
+            eprintln!("control cert: Acme error (HTTPS enabled, ACME flow failed): {e}");
+        }
+        Err(e) => panic!("expected NotEnabled/Acme, got: {e}"),
         Ok(provider) => {
             // If a real cert was provisioned, it must produce a non-empty chain.
             assert!(!provider.cert_chain().is_empty(), "cert chain empty");
-            eprintln!("control cert: real cert provisioned (unexpected for API-only tailnet)");
+            eprintln!("control cert: real cert provisioned");
         }
     }
 
@@ -1308,4 +1317,101 @@ async fn e2e_control_cert_not_enabled() {
     eprintln!("listen_tls fell back to self-signed OK");
     drop(tls_listener);
     server.close().await;
+    std::fs::remove_dir_all(&state_dir).ok();
+}
+
+/// E2E: full ACME cert issuance via LE staging. Requires:
+/// - `TS_E2E_AUTHKEY` + `TS_E2E_TAILNET` (provisioned by tools/e2e.sh)
+/// - `TS_E2E_HTTPS=1` (the harness enables `httpsEnabled` on the tailnet
+///   via the settings API before running this test)
+/// - `RUSTSCALE_ACME_URL` set to LE staging (the harness sets this)
+///
+/// The test checks that `DNSConfig.CertDomains` is non-empty (skips with a
+/// message if not), then requests a cert for the node's FQDN and asserts a
+/// parseable PEM chain.
+#[tokio::test]
+#[ignore = "live ACME: requires TS_E2E_AUTHKEY + TS_E2E_TAILNET + TS_E2E_HTTPS=1 + RUSTSCALE_ACME_URL (LE staging)"]
+async fn e2e_acme_cert_issuance() {
+    let authkey = std::env::var("TS_E2E_AUTHKEY").expect("TS_E2E_AUTHKEY not set");
+    let _tailnet = std::env::var("TS_E2E_TAILNET").expect("TS_E2E_TAILNET not set");
+    let https_enabled = std::env::var("TS_E2E_HTTPS")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    if !https_enabled {
+        eprintln!("e2e_acme_cert_issuance: skipping (TS_E2E_HTTPS != 1)");
+        return;
+    }
+
+    let uid = std::process::id();
+    let state_dir = std::env::temp_dir().join(format!("rustscale-e2e-acme-state-{uid}"));
+    let _ = std::fs::remove_dir_all(&state_dir);
+    std::fs::create_dir_all(&state_dir).unwrap();
+
+    let mut server = Server::builder()
+        .hostname(format!("rustscale-e2e-acme-{uid}"))
+        .auth_key(authkey)
+        .ephemeral(true)
+        .state_dir(state_dir.clone())
+        .build()
+        .expect("build");
+    server.up().await.expect("up");
+
+    // Give control time to deliver DNSConfig with CertDomains.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+    // Check if HTTPS/certs are enabled (CertDomains non-empty).
+    let cert_domains: Vec<String> = {
+        let inner = server.inner.as_ref().expect("server up");
+        inner
+            .dns_config
+            .read()
+            .await
+            .as_ref()
+            .map(|c| c.CertDomains.clone())
+            .unwrap_or_default()
+    };
+    if cert_domains.is_empty() {
+        eprintln!(
+            "e2e_acme_cert_issuance: CertDomains empty (HTTPS not enabled on tailnet); skipping"
+        );
+        server.close().await;
+        return;
+    }
+    eprintln!("e2e_acme_cert_issuance: CertDomains = {cert_domains:?}");
+
+    // Request the cert. This runs the full ACME flow against LE staging.
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        server.control_cert_provider(),
+    )
+    .await;
+
+    server.close().await;
+
+    let provider = match result {
+        Ok(Ok(p)) => p,
+        Ok(Err(CertError::NotEnabled(d))) => {
+            eprintln!("e2e_acme_cert_issuance: NotEnabled({d}) — HTTPS not enabled; skipping");
+            std::fs::remove_dir_all(&state_dir).ok();
+            return;
+        }
+        Ok(Err(e)) => panic!("control_cert_provider failed: {e}"),
+        Err(e) => panic!("control_cert_provider timed out after 120s: {e}"),
+    };
+
+    let chain = provider.cert_chain();
+    assert!(!chain.is_empty(), "cert chain must be non-empty");
+    eprintln!(
+        "e2e_acme_cert_issuance: got cert chain with {} cert(s)",
+        chain.len()
+    );
+
+    // Verify the PEM round-trips (cert_chain already parsed PEM → DER).
+    // Just assert the first cert is non-trivial.
+    assert!(
+        chain[0].as_ref().len() > 100,
+        "leaf cert DER suspiciously small"
+    );
+
+    std::fs::remove_dir_all(&state_dir).ok();
 }

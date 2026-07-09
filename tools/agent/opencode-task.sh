@@ -24,7 +24,7 @@ DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 
 CONTINUE=""
 if [[ "${1:-}" == "--continue" ]]; then
-  CONTINUE="$2"; shift 2
+  CONTINUE="${2:?--continue requires a session ID}"; shift 2
   TITLE="$CONTINUE"
   PROMPT="${1:?prompt text}"
   DEADLINE="${2:-2400}"
@@ -34,11 +34,17 @@ else
   DEADLINE="${3:-2400}"   # 40 min default
 fi
 
-# 0. Ensure server is up.
+# 0. Ensure server is up. (Concurrent harness launches may both attempt to start
+#    `opencode serve`; only one binds the port — the loser exits and the shared
+#    server serves both. We verify health after the wait regardless.)
 if ! curl -sf --max-time 3 "$URL/api/health" >/dev/null 2>&1; then
   echo "[harness] starting opencode server at $URL" >&2
   nohup opencode serve --hostname 127.0.0.1 --port "${URL##*:}" >/tmp/opencode-serve.log 2>&1 &
-  for _ in $(seq 1 20); do sleep 1; curl -sf --max-time 2 "$URL/api/health" >/dev/null 2>&1 && break; done
+  # `|| true` so a loop that exhausts without break (server still down) doesn't
+  # trip `set -e` before the explicit health check below can print a clear error.
+  for _ in $(seq 1 20); do sleep 1; curl -sf --max-time 2 "$URL/api/health" >/dev/null 2>&1 && break; done || true
+  curl -sf --max-time 3 "$URL/api/health" >/dev/null 2>&1 \
+    || { echo "[harness] opencode server did not come up at $URL (see /tmp/opencode-serve.log)" >&2; exit 1; }
 fi
 
 # 1. Create session (allow-all permissions = unattended) or reuse.
@@ -54,18 +60,21 @@ else
 fi
 
 # 2. Async prompt admission — returns 204 immediately.
-curl -sfS -o /dev/null -X POST "$URL/session/$SID/prompt_async?directory=$DIR" \
+curl -sfS --max-time 10 -o /dev/null -X POST "$URL/session/$SID/prompt_async?directory=$DIR" \
   -H 'Content-Type: application/json' \
   -d "$(jq -n --arg pid "$PROVIDER" --arg mid "$MODEL" --arg t "$PROMPT" \
-    '{model:{providerID:$pid,modelID:$mid},parts:[{type:"text",text:$t}]}')"
+    '{model:{providerID:$pid,modelID:$mid},parts:[{type:"text",text:$t}]}')" \
+  || { echo "[harness] prompt admission failed for session $SID" >&2; exit 1; }
 echo "[harness] prompt admitted; watchdog ${DEADLINE}s" >&2
 
 msg_count() {
-  curl -s "$URL/session/$SID/message?directory=$DIR" | jq 'length' 2>/dev/null || echo 0
+  curl -s --max-time 5 "$URL/session/$SID/message?directory=$DIR" | jq 'length' 2>/dev/null || echo 0
 }
 is_busy() {
-  # /session/status returns {sessionID: {...}} only for busy/queued sessions
-  curl -s "$URL/session/status" | jq -e --arg s "$SID" 'has($s)' >/dev/null 2>&1 && echo 1 || echo 0
+  # /session/status returns {sessionID: {...}} only for busy/queued sessions.
+  # --max-time is critical: without it a hung server stalls this poll forever,
+  # which would defeat the watchdog deadline below.
+  curl -s --max-time 5 "$URL/session/status" | jq -e --arg s "$SID" 'has($s)' >/dev/null 2>&1 && echo 1 || echo 0
 }
 
 # 3. Watchdog loop.
@@ -85,7 +94,7 @@ while :; do
   fi
   if (( ELAPSED > DEADLINE )); then
     echo "[harness] DEADLINE ${DEADLINE}s exceeded — aborting session" >&2
-    curl -sS -o /dev/null -X POST "$URL/session/$SID/abort?directory=$DIR" || true
+    curl -sS --max-time 5 -o /dev/null -X POST "$URL/session/$SID/abort?directory=$DIR" || true
     echo "$SID"
     exit 3
   fi
@@ -93,6 +102,7 @@ done
 
 # 4. Harvest final assistant text.
 echo "[harness] done in $(( $(date +%s) - START ))s; session $SID" >&2
-curl -s "$URL/session/$SID/message?directory=$DIR" | jq -r '
-  [.[] | select(.info.role=="assistant")] | last |
-  [.parts[]? | select(.type=="text") | .text] | join("\n")'
+curl -s --max-time 10 "$URL/session/$SID/message?directory=$DIR" | jq -r '
+  [.[] | select(.info.role=="assistant")] | last
+  | if . == null then "(no assistant message produced — session may have aborted)"
+    else [.parts[]? | select(.type=="text") | .text] | join("\n") end'

@@ -22,6 +22,11 @@ cites the session that surfaced it.
   `tools/check.sh rustscale-netcheck` and `tools/check.sh` directly — clean,
   no cargo dumps. Phase-3b also used it for final verification. Keep telling
   agents to use it. *(phase-3a, phase-3b)*
+  **Update (post-phase-10): `tools/check.sh` now mirrors the CI gate exactly —
+  `build --all-targets`, `test`, `clippy -- -D warnings`, and `cargo fmt --all
+  --check` — so a local `ok` means CI-green. It is silent on success and prints
+  only ~50 lines on failure. Agents should use it as their ONLY verify command,
+  not raw `cargo`.**
 - **Hand-rolling Noise IK instead of using the `snow` crate.** The phase-3b
   agent correctly chose to hand-roll the Noise IK handshake with
   curve25519-dalek + chacha20poly1305 + blake2 rather than pulling in the
@@ -137,6 +142,19 @@ cites the session that surfaced it.
   all distilled into `docs/porting-notes.md` § "Control-plane wire protocol
   (ts2021)". Future control-plane agents MUST read that section first.
   *(phase-5)*
+- **Raw `cargo clippy`/`cargo build` instead of `tools/check.sh` (phase-10 a/b/c)**
+  → phase-10a-subnet-serve, phase-10b-bench-harness, and phase-10c-perf-fixes
+  each ran `cargo clippy --workspace --all-targets` raw (1× per session, zero
+  `tools/*.sh` calls), dumping warning output straight into context; only
+  phase-10d-latency used `tools/` (3×, clean). Raw cargo also diverges from CI:
+  the CI gate fails on ANY clippy warning (`-D warnings`) and on `cargo fmt`
+  drift, so an agent that runs plain `cargo clippy` can think it's green when
+  CI will fail. **Fix**: `tools/check.sh` now mirrors CI exactly (build
+  --all-targets + test + clippy `-D warnings` + `cargo fmt --all --check`),
+  silent on success. Tell agents: "Use `tools/check.sh` as your ONLY verify
+  command; never run raw `cargo build`/`cargo test`/`cargo clippy`/`cargo fmt`
+  — it both dumps full output into your context and can hide CI-only
+  failures." *(phase-10a, phase-10b, phase-10c vs phase-10d)*
 
 ## Patterns to fold into future phase prompts
 
@@ -145,9 +163,13 @@ cites the session that surfaced it.
    map, Noise crypto crates, boringtun API, **control-plane wire protocol
    (ts2021)**, TUN platform API, rustls provider, Go source file maps). Only
    read the specific Go line ranges you still need."
-2. Include the line: "Run `tools/check.sh` (or `tools/check.sh <crate>`) to
-   verify. It is silent on success and prints only ~50 lines on failure — do
-   NOT dump full `cargo` output into your context."
+2. Include the line: "Verify with `tools/check.sh` (or `tools/check.sh <crate>`)
+   — it runs the FULL CI gate (`build --all-targets`, `test`, `clippy --
+   -D warnings`, `cargo fmt --all --check`) and is silent on success / ~50
+   lines on failure. Do NOT run raw `cargo build`/`test`/`clippy`/`fmt`
+   yourself: that dumps full output into your context AND can diverge from CI
+   (CI fails on any clippy warning and on unformatted code). A local
+   `tools/check.sh` 'ok' means CI-green."
 3. For any new external crate, state the exact constructor/entry API up front
    (by-value vs by-ref, feature flags). Check porting-notes first — many
    crates are already documented there (crypto_box, curve25519-dalek,

@@ -23,9 +23,13 @@ data-encoding = "2"
 chrono = { version = "0.4", features = ["serde"] }
 tokio = { version = "1", features = ["full"] }
 bytes = "1"
+crc32fast = "1"
 tokio-rustls = "0.26"
 webpki-roots = "0.26"
 rustls = { version = "0.23", features = ["ring"] }
+# Noise IK handshake primitives for controlbase (ts2021 control protocol).
+chacha20poly1305 = "0.10"
+blake2 = "0.10"
 
 # Shared lint policy: pedantic where sane, but allow the noisier style lints so
 # that the default `cargo clippy` run stays clean and readable.

@@ -82,6 +82,14 @@ Outputs it may produce:
 - `.opencode/` config tweaks (custom commands/agents) if they'd cut repeated boilerplate
 Review its diff before committing, like any other agent's work.
 
+## Ephemeral tailnets for e2e tests
+
+See `docs/tailnet-testing.md` (verified live). Local: source `.secrets/tailscale.env`
+(gitignored OAuth creds) + `tools/tailnet/*.sh`. CI: GitHub OIDC/WIF, no secret —
+same WIF client as tailgate. **The org client has only the `tailnets` scope, so you
+must save the child `oauthClient` creds from every create response — they are the only
+way to delete that tailnet.** Always clean up tailnets in test teardown.
+
 ## Reference sources (read-only)
 
 - `/Users/rajsingh/Documents/GitHub/tailscale` — the Go implementation. Key dirs:

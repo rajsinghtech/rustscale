@@ -325,16 +325,11 @@ async fn e2e_two_nodes() {
         server_a.dial(&dial_addr),
     )
     .await;
-    let mut stream_a = dial_result
-        .expect("dial timed out")
-        .expect("dial failed");
+    let mut stream_a = dial_result.expect("dial timed out").expect("dial failed");
 
     // B accepts.
-    let accept_result = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        listener.accept(),
-    )
-    .await;
+    let accept_result =
+        tokio::time::timeout(std::time::Duration::from_secs(30), listener.accept()).await;
     let mut stream_b = accept_result
         .expect("accept timed out")
         .expect("accept failed");
@@ -368,9 +363,7 @@ async fn e2e_two_nodes() {
     );
 
     // Clean up.
-    tokio::io::AsyncWriteExt::shutdown(&mut stream_a)
-        .await
-        .ok();
+    tokio::io::AsyncWriteExt::shutdown(&mut stream_a).await.ok();
     server_a.close().await;
     server_b.close().await;
 }

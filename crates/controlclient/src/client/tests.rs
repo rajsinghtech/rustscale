@@ -148,7 +148,8 @@ async fn real_register_gets_structured_response() {
     let machine_key = MachinePrivate::generate();
 
     // Create the control client.
-    let cc = crate::client::ControlClient::new(host, machine_key.clone(), server_key.clone(), version);
+    let cc =
+        crate::client::ControlClient::new(host, machine_key.clone(), server_key.clone(), version);
 
     // Send a register request with a bogus node key (no auth key).
     // The server should return a structured response, not a parse error.

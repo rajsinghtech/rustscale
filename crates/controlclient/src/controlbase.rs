@@ -41,8 +41,8 @@ use chacha20poly1305::{
 };
 use curve25519_dalek::{constants::X25519_BASEPOINT, montgomery::MontgomeryPoint};
 use rand::RngCore;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use rustscale_key::{MachinePrivate, MachinePublic};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Errors from the Noise handshake and transport.
 #[derive(Debug, thiserror::Error)]

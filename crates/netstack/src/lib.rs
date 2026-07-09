@@ -282,7 +282,9 @@ impl Netstack {
 enum Command {
     Listen {
         port: u16,
-        reply: oneshot::Sender<Result<mpsc::Receiver<Result<NetstackStream, NetstackError>>, NetstackError>>,
+        reply: oneshot::Sender<
+            Result<mpsc::Receiver<Result<NetstackStream, NetstackError>>, NetstackError>,
+        >,
     },
     Dial {
         remote: SocketAddr,
@@ -299,7 +301,10 @@ struct ConnState {
 }
 
 /// A TCP listener's socket handle + accept channel sender.
-type ListenerEntry = (SocketHandle, mpsc::Sender<Result<NetstackStream, NetstackError>>);
+type ListenerEntry = (
+    SocketHandle,
+    mpsc::Sender<Result<NetstackStream, NetstackError>>,
+);
 
 /// A pending dial awaiting connection establishment.
 struct PendingDial {
@@ -328,7 +333,12 @@ fn ephemeral_port() -> u16 {
 
 /// Convert an Ipv4Addr to a smoltcp IpAddress.
 fn to_smoltcp_v4(addr: Ipv4Addr) -> IpAddress {
-    IpAddress::v4(addr.octets()[0], addr.octets()[1], addr.octets()[2], addr.octets()[3])
+    IpAddress::v4(
+        addr.octets()[0],
+        addr.octets()[1],
+        addr.octets()[2],
+        addr.octets()[3],
+    )
 }
 
 /// Create the channel pair + stream for a new connection.
@@ -349,9 +359,7 @@ async fn poll_loop(
     notify: Arc<Notify>,
 ) {
     let start = std::time::Instant::now();
-    let smol_now = || {
-        SmolInstant::from_millis(start.elapsed().as_millis() as i64)
-    };
+    let smol_now = || SmolInstant::from_millis(start.elapsed().as_millis() as i64);
 
     let mut config = smoltcp::iface::Config::new(HardwareAddress::Ip);
     config.random_seed = std::time::SystemTime::now()
@@ -359,9 +367,9 @@ async fn poll_loop(
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0xdead_beef);
     let mut iface = Interface::new(config, &mut device, smol_now());
-        iface.update_ip_addrs(|addrs| {
-            let _ = addrs.push(IpCidr::new(to_smoltcp_v4(addr), 32));
-        });
+    iface.update_ip_addrs(|addrs| {
+        let _ = addrs.push(IpCidr::new(to_smoltcp_v4(addr), 32));
+    });
 
     let mut sockets: SocketSet<'static> = SocketSet::new(vec![]);
     let mut conns: HashMap<SocketHandle, ConnState> = HashMap::new();
@@ -467,7 +475,9 @@ fn do_listen(
     port: u16,
 ) -> Result<mpsc::Receiver<Result<NetstackStream, NetstackError>>, NetstackError> {
     if listeners.contains_key(&port) {
-        return Err(NetstackError::ListenFailed(format!("port {port} already in use")));
+        return Err(NetstackError::ListenFailed(format!(
+            "port {port} already in use"
+        )));
     }
     let mut socket = new_tcp_socket();
     socket

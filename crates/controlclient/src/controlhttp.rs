@@ -397,7 +397,10 @@ mod tests {
     /// Test that `parse_status_code` extracts the code from a full status line.
     #[test]
     fn parse_status_code_from_full_line() {
-        assert_eq!(parse_status_code("HTTP/1.1 101 Switching Protocols").unwrap(), 101);
+        assert_eq!(
+            parse_status_code("HTTP/1.1 101 Switching Protocols").unwrap(),
+            101
+        );
         assert_eq!(parse_status_code("HTTP/1.1 200 OK").unwrap(), 200);
         assert_eq!(parse_status_code("HTTP/1.1 404 Not Found").unwrap(), 404);
         assert!(parse_status_code("garbage").is_err());

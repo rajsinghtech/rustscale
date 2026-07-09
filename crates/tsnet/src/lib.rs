@@ -145,7 +145,10 @@ impl ServerBuilder {
         if self.hostname.is_empty() {
             return Err(TsnetError::Builder("hostname must not be empty".into()));
         }
-        Ok(Server { config: self, inner: None })
+        Ok(Server {
+            config: self,
+            inner: None,
+        })
     }
 }
 
@@ -169,10 +172,13 @@ struct CancelToken {
 
 impl CancelToken {
     fn new() -> Self {
-        Self { cancelled: std::sync::atomic::AtomicBool::new(false) }
+        Self {
+            cancelled: std::sync::atomic::AtomicBool::new(false),
+        }
     }
     fn cancel(&self) {
-        self.cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
     fn is_cancelled(&self) -> bool {
         self.cancelled.load(std::sync::atomic::Ordering::SeqCst)
@@ -225,9 +231,9 @@ impl Server {
         let server_pub_key =
             controlhttp::fetch_server_pub_key(&self.config.control_url, PROTOCOL_VERSION)
                 .await
-                .map_err(|e| TsnetError::Register(rustscale_controlclient::RegisterError::Dial(
-                    e,
-                )))?;
+                .map_err(|e| {
+                    TsnetError::Register(rustscale_controlclient::RegisterError::Dial(e))
+                })?;
 
         // 3. Create the control client with the server's real public key.
         let auth_key = self
@@ -323,7 +329,9 @@ impl Server {
                 Ok(r) if r.preferred_derp > 0 => r.preferred_derp,
                 _ => {
                     // Fall back to the first non-Avoid region.
-                    derp_map.Regions.values()
+                    derp_map
+                        .Regions
+                        .values()
                         .find(|r| !r.Avoid)
                         .or_else(|| derp_map.Regions.values().next())
                         .map(|r| r.RegionID)
@@ -335,7 +343,9 @@ impl Server {
         };
 
         // 6. Connect home DERP.
-        let derp_client = connect_home_derp(&derp_map, home_derp, &state.node_key).await.ok();
+        let derp_client = connect_home_derp(&derp_map, home_derp, &state.node_key)
+            .await
+            .ok();
 
         // 7. Create magicsock.
         let magicsock = Arc::new(
@@ -348,7 +358,12 @@ impl Server {
             .await?,
         );
 
-        let peers = map_resp.Peers.clone();
+        // The server may send peers via Peers (full list) or PeersChanged
+        // (delta). The first response often uses PeersChanged, not Peers.
+        let mut peers = map_resp.Peers.clone();
+        if peers.is_empty() && !map_resp.PeersChanged.is_empty() {
+            peers = map_resp.PeersChanged.clone();
+        }
         magicsock.set_netmap(peers.clone()).await?;
 
         // 8. Create netstack.
@@ -652,7 +667,11 @@ async fn connect_home_derp(
         .find(|n| !n.STUNOnly)
         .or_else(|| nodes.first())
         .ok_or_else(|| rustscale_derp::DerpError::BadFrame("no DERP node".into()))?;
-    let port = if node.DERPPort > 0 { node.DERPPort as u16 } else { 443 };
+    let port = if node.DERPPort > 0 {
+        node.DERPPort as u16
+    } else {
+        443
+    };
 
     // Use the explicit IPv4 for TCP dialing if available, but always use
     // the hostname for TLS SNI (DERP servers reject IP-based SNI).
@@ -701,13 +720,23 @@ fn find_peer_for_ip(peers: &[Node], ip: Ipv4Addr) -> Option<NodePublic> {
 }
 
 fn ip_in_cidr(ip: Ipv4Addr, cidr: &str) -> bool {
-    let Some((net_str, prefix_str)) = cidr.split_once('/') else { return false };
-    let Ok(net) = net_str.parse::<Ipv4Addr>() else { return false };
-    let Ok(prefix) = prefix_str.parse::<u32>() else { return false };
+    let Some((net_str, prefix_str)) = cidr.split_once('/') else {
+        return false;
+    };
+    let Ok(net) = net_str.parse::<Ipv4Addr>() else {
+        return false;
+    };
+    let Ok(prefix) = prefix_str.parse::<u32>() else {
+        return false;
+    };
     if prefix > 32 {
         return false;
     }
-    let mask = if prefix == 0 { 0u32 } else { u32::MAX << (32 - prefix) };
+    let mask = if prefix == 0 {
+        0u32
+    } else {
+        u32::MAX << (32 - prefix)
+    };
     (u32::from(ip) & mask) == (u32::from(net) & mask)
 }
 

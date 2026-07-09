@@ -136,16 +136,11 @@ async fn back_to_back_dial_and_echo() {
         a_net.dial(SocketAddr::new(b_addr.into(), 12345)),
     )
     .await;
-    let mut a_stream = dial_result
-        .expect("dial timed out")
-        .expect("dial failed");
+    let mut a_stream = dial_result.expect("dial timed out").expect("dial failed");
 
     // B accepts.
-    let accept_result = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        listener.accept(),
-    )
-    .await;
+    let accept_result =
+        tokio::time::timeout(std::time::Duration::from_secs(10), listener.accept()).await;
     let mut b_stream = accept_result
         .expect("accept timed out")
         .expect("accept failed");

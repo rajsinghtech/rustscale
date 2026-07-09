@@ -59,10 +59,18 @@ pub struct Node {
     pub Addresses: Vec<String>,
     /// IP ranges to route to this node. Nil is special (means "same as
     /// Addresses"); an empty non-nil vec means "none".
-    #[serde(default, skip_serializing_if = "skip_default", deserialize_with = "deserialize_null_to_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub AllowedIPs: Vec<String>,
     /// Public UDP endpoints (IP:port) discovered via STUN / LANs.
-    #[serde(default, skip_serializing_if = "skip_default", deserialize_with = "deserialize_null_to_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub Endpoints: Vec<String>,
     /// DERP region ID of the node's home DERP; 0 if unknown.
     #[serde(default, skip_serializing_if = "skip_default")]
@@ -77,17 +85,29 @@ pub struct Node {
     #[serde(default, skip_serializing_if = "skip_default")]
     pub Cap: CapabilityVersion,
     /// ACL tags applied to the node (e.g. `tag:prod`).
-    #[serde(default, skip_serializing_if = "skip_default", deserialize_with = "deserialize_null_to_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub Tags: Vec<String>,
     /// Whether the node is currently connected to control; `None` = unknown.
     #[serde(default, skip_serializing_if = "skip_default")]
     pub Online: Option<bool>,
     /// Deprecated free-form capability URLs.
-    #[serde(default, skip_serializing_if = "skip_default", deserialize_with = "deserialize_null_to_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub Capabilities: Vec<NodeCapability>,
     /// Map of capabilities to optional argument/data values. Values may be
     /// `null` on the wire (Go nil slices); we treat null as empty.
-    #[serde(default, skip_serializing_if = "skip_default", deserialize_with = "deserialize_capmap")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_capmap"
+    )]
     pub CapMap: NodeCapMap,
 }
 
@@ -117,7 +137,11 @@ pub struct Hostinfo {
     #[serde(default, skip_serializing_if = "skip_default")]
     pub Hostname: String,
     /// Services advertised by this machine.
-    #[serde(default, skip_serializing_if = "skip_default", deserialize_with = "deserialize_null_to_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub Services: Vec<Service>,
 }
 

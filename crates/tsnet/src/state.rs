@@ -59,9 +59,7 @@ impl PersistedState {
 
     /// Whether all keys are zero (uninitialized).
     pub fn is_zero(&self) -> bool {
-        self.node_key.is_zero()
-            && self.machine_key.is_zero()
-            && self.disco_key.is_zero()
+        self.node_key.is_zero() && self.machine_key.is_zero() && self.disco_key.is_zero()
     }
 
     /// Load state from a JSON file.

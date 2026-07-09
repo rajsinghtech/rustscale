@@ -233,12 +233,8 @@ impl ControlClient {
                 }
             }
 
-            let size = u32::from_le_bytes([
-                read_buf[0],
-                read_buf[1],
-                read_buf[2],
-                read_buf[3],
-            ]) as usize;
+            let size =
+                u32::from_le_bytes([read_buf[0], read_buf[1], read_buf[2], read_buf[3]]) as usize;
             read_buf.drain(..4);
 
             if size > 4 * 1024 * 1024 {
@@ -310,8 +306,7 @@ async fn establish_h2(
         h2::client::Connection<tokio::io::DuplexStream, bytes::Bytes>,
     ),
     H2SetupError,
->
-{
+> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     // Read the first 9 bytes to check for early payload.
@@ -387,7 +382,8 @@ pub fn decode_map_frames(buf: &[u8]) -> Vec<&[u8]> {
     let mut frames = Vec::new();
     let mut pos = 0;
     while pos + 4 <= buf.len() {
-        let size = u32::from_le_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]) as usize;
+        let size =
+            u32::from_le_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]) as usize;
         pos += 4;
         if pos + size > buf.len() {
             break;

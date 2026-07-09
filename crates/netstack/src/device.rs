@@ -36,13 +36,17 @@ impl Device for LoopbackDevice {
         pkt.map(|p| {
             (
                 OwnedRxToken { buf: p },
-                OwnedTxToken { tx: self.tx.clone() },
+                OwnedTxToken {
+                    tx: self.tx.clone(),
+                },
             )
         })
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
-        Some(OwnedTxToken { tx: self.tx.clone() })
+        Some(OwnedTxToken {
+            tx: self.tx.clone(),
+        })
     }
 
     fn capabilities(&self) -> DeviceCapabilities {

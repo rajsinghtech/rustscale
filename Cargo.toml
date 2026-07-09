@@ -22,6 +22,10 @@ base64 = "0.22"
 data-encoding = "2"
 chrono = { version = "0.4", features = ["serde"] }
 tokio = { version = "1", features = ["full"] }
+bytes = "1"
+tokio-rustls = "0.26"
+webpki-roots = "0.26"
+rustls = { version = "0.23", features = ["ring"] }
 
 # Shared lint policy: pedantic where sane, but allow the noisier style lints so
 # that the default `cargo clippy` run stays clean and readable.

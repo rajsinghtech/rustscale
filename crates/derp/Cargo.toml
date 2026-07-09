@@ -1,0 +1,24 @@
+[package]
+name = "rustscale-derp"
+description = "DERP relay client protocol for rustscale"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rustscale-key = { path = "../key", version = "0.1.0" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+webpki-roots.workspace = true
+rustls.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

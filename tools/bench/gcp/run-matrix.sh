@@ -126,15 +126,15 @@ for TOPO in "${TOPOLOGIES[@]}"; do
   # Provision VMs (no-op in dry-run).
   create_vms "$SERVER_VM" "$Z_A" "$CLIENT_VM" "$Z_B"
 
-  # Deliver source + build on both VMs in parallel (saves ~10min).
-  deliver_source "$SERVER_VM" "$Z_A" &
-  deliver_source "$CLIENT_VM" "$Z_B" &
-  wait
+  # Deliver source + build on both VMs. Deliver sequentially (fast: git archive+scp),
+  # then build in parallel (saves ~10min).
+  deliver_source "$SERVER_VM" "$Z_A"
+  deliver_source "$CLIENT_VM" "$Z_B"
   echo "[gcp] building rustscale on both VMs in parallel..." >&2
   ssh_cmd "$SERVER_VM" "$Z_A" \
-    'cd /opt/rustscale && cargo build --release -p rustscale-bench && cargo build --release --example rustscale-tun -p rustscale-tsnet' &
+    'export RUSTUP_HOME=/opt/rust CARGO_HOME=/opt/rust/cargo; cd /opt/rustscale && cargo build --release -p rustscale-bench && cargo build --release --example rustscale-tun -p rustscale-tsnet' &
   ssh_cmd "$CLIENT_VM" "$Z_B" \
-    'cd /opt/rustscale && cargo build --release -p rustscale-bench && cargo build --release --example rustscale-tun -p rustscale-tsnet' &
+    'export RUSTUP_HOME=/opt/rust CARGO_HOME=/opt/rust/cargo; cd /opt/rustscale && cargo build --release -p rustscale-bench && cargo build --release --example rustscale-tun -p rustscale-tsnet' &
   wait
 
   # Path loop.

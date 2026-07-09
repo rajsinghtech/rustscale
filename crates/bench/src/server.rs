@@ -46,7 +46,7 @@ pub async fn run(
     eprintln!("listening on {ip}:{port}");
 
     loop {
-        let accept_result = tokio::time::timeout(Duration::from_secs(600), listener.accept()).await;
+        let accept_result = tokio::time::timeout(Duration::from_secs(1800), listener.accept()).await;
         let stream = match accept_result {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => {
@@ -54,7 +54,7 @@ pub async fn run(
                 continue;
             }
             Err(_) => {
-                eprintln!("accept idle timeout (600s), shutting down");
+                eprintln!("accept idle timeout (1800s), shutting down");
                 break;
             }
         };

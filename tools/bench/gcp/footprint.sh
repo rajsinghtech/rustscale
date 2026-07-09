@@ -46,8 +46,7 @@ start_footprint() {
 # ---------------------------------------------------------------------------
 stop_footprint() {
   local sampler_pid="$1" outfile="$2"
-  kill "$sampler_pid" 2>/dev/null || true
-  wait "$sampler_pid" 2>/dev/null || true
+  [[ -n "$sampler_pid" && "$sampler_pid" != "0" ]] && kill "$sampler_pid" 2>/dev/null || true
   python3 - "$outfile" <<'PYEOF'
 import json, re, sys
 
@@ -132,17 +131,14 @@ remote_start_footprint() {
 remote_stop_footprint() {
   local name="$1" zone="$2" outfile="$3"
   local handle
-  handle=$(ssh_cmd "$name" "$zone" "cat $outfile.handle 2>/dev/null || true")
+  handle=$(ssh_cmd "$name" "$zone" "cat $outfile.handle 2>/dev/null || true" 2>/dev/null)
   if [[ -n "$handle" ]]; then
-    ssh_cmd "$name" "$zone" "kill $handle 2>/dev/null; sleep 1; pkill -f 'pidstat -p' 2>/dev/null" || true
+    ssh_cmd "$name" "$zone" "kill $handle 2>/dev/null" 2>/dev/null || true
   fi
+  # Fetch the pidstat output via ssh (cat) instead of scp.
   local local_copy
   local_copy=$(mktemp /tmp/footprint.XXXXXX)
-  # gcloud scp back.
-  if [[ -z "${GCP_DRY_RUN:-}" ]]; then
-    gcloud compute scp "$name:$outfile" "$local_copy" --zone="$zone" \
-      --ssh-flag='-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null' 2>/dev/null || true
-  fi
+  ssh_cmd "$name" "$zone" "cat $outfile 2>/dev/null" > "$local_copy" 2>/dev/null || true
   stop_footprint 0 "$local_copy"
   rm -f "$local_copy"
 }

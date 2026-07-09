@@ -60,6 +60,9 @@ PATH_TAG="${BENCH_MATRIX##*/}"
 mkdir -p "$RDIR"
 OUT="$RDIR/$CONFIG.json"
 
+# Rust env vars for non-root user.
+export RUSTUP_HOME=/opt/rust CARGO_HOME=/opt/rust/cargo
+
 echo "[gcp] config=$CONFIG topo=$TOPOLOGY path=$PATH_TAG server=$SVM client=$CVM" >&2
 
 # Helper: write a stub JSON (used in dry-run or on failure).

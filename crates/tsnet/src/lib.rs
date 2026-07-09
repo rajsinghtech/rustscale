@@ -36,18 +36,22 @@ pub use routing::RouteTable;
 pub use state::{PersistedState, StateError};
 pub use status::{PeerInfo, ServerStatus};
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 use rustscale_controlclient::client::{ControlClient, RegisterError, StreamMapError};
 use rustscale_controlclient::controlhttp;
 use rustscale_derp::DerpClient;
+use rustscale_filter::Filter;
 use rustscale_key::{NodePrivate, NodePublic};
 use rustscale_magicsock::{Magicsock, MagicsockConfig, MagicsockError};
 use rustscale_netstack::{Netstack, NetstackError, NetstackStream, DEFAULT_MTU};
-use rustscale_tailcfg::{DERPMap, Hostinfo, MapRequest, MapResponse, Node, RegisterRequest};
+use rustscale_tailcfg::{
+    DERPMap, FilterRule, Hostinfo, MapRequest, MapResponse, Node, RegisterRequest,
+};
 use rustscale_tun::Tun;
 use rustscale_wg::{WgError, WgTunn};
 use tokio::sync::{mpsc, Mutex, RwLock};
@@ -171,6 +175,8 @@ struct RunningState {
     home_derp: i32,
     cancel: Arc<CancelToken>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
+    filter: Arc<std::sync::Mutex<Filter>>,
+    packet_drops: Arc<AtomicU64>,
 }
 
 /// Which data plane is wired up: userspace netstack (tsnet listen/dial) or a
@@ -241,6 +247,8 @@ struct Bootstrap {
     map_rx: mpsc::Receiver<Result<MapResponse, StreamMapError>>,
     map_task: JoinHandle<()>,
     node_key: NodePrivate,
+    filter: Arc<std::sync::Mutex<Filter>>,
+    packet_drops: Arc<AtomicU64>,
 }
 
 /// An embedded Tailscale server.
@@ -287,6 +295,8 @@ impl Server {
             netstack.clone(),
             b.wg_tunnels.clone(),
             b.route_table.clone(),
+            b.filter.clone(),
+            b.packet_drops.clone(),
             b.cancel.clone(),
         ));
 
@@ -298,6 +308,8 @@ impl Server {
             b.peers.clone(),
             b.route_table.clone(),
             b.node_key.clone(),
+            b.filter.clone(),
+            b.tailscale_ips.clone(),
             b.cancel.clone(),
         );
 
@@ -312,6 +324,8 @@ impl Server {
             home_derp: b.home_derp,
             cancel: b.cancel,
             tasks: Mutex::new(vec![b.map_task, pump, map_update]),
+            filter: b.filter,
+            packet_drops: b.packet_drops,
         });
         Ok(())
     }
@@ -358,6 +372,8 @@ impl Server {
             tun.clone(),
             b.wg_tunnels.clone(),
             b.route_table.clone(),
+            b.filter.clone(),
+            b.packet_drops.clone(),
             b.cancel.clone(),
         ));
 
@@ -368,6 +384,8 @@ impl Server {
             b.peers.clone(),
             b.route_table.clone(),
             b.node_key.clone(),
+            b.filter.clone(),
+            b.tailscale_ips.clone(),
             b.cancel.clone(),
         );
 
@@ -382,6 +400,8 @@ impl Server {
             home_derp: b.home_derp,
             cancel: b.cancel,
             tasks: Mutex::new(vec![b.map_task, pump, map_update]),
+            filter: b.filter,
+            packet_drops: b.packet_drops,
         });
         Ok(())
     }
@@ -549,6 +569,11 @@ impl Server {
         let derp_arc = Arc::new(RwLock::new(map_resp.DERPMap.clone()));
         let cancel = Arc::new(CancelToken::new());
 
+        // Build the initial packet filter from the first MapResponse.
+        let (filter, _named_filters) = build_filter_from_map_response(&map_resp, &tailscale_ips);
+        let filter = Arc::new(std::sync::Mutex::new(filter));
+        let packet_drops = Arc::new(AtomicU64::new(0));
+
         Ok(Bootstrap {
             tailscale_ips: tailscale_ips.clone(),
             our_v4,
@@ -562,6 +587,8 @@ impl Server {
             map_rx,
             map_task,
             node_key: state.node_key.clone(),
+            filter,
+            packet_drops,
         })
     }
 
@@ -574,6 +601,7 @@ impl Server {
                 peer_count: 0,
                 peers: vec![],
                 hostname: self.config.hostname.clone(),
+                packet_drops: 0,
             };
         };
         let peers: Vec<PeerInfo> = inner
@@ -591,12 +619,16 @@ impl Server {
                     .collect()
             })
             .unwrap_or_default();
+        let packet_drops = inner
+            .packet_drops
+            .load(std::sync::atomic::Ordering::Relaxed);
         ServerStatus {
             up: true,
             tailscale_ips: inner.tailscale_ips.clone(),
             peer_count: peers.len(),
             peers,
             hostname: self.config.hostname.clone(),
+            packet_drops,
         }
     }
 
@@ -670,6 +702,8 @@ async fn run_netstack_pump(
     netstack: Arc<Netstack>,
     wg_tunnels: Arc<RwLock<HashMap<NodePublic, Arc<Mutex<WgTunn>>>>>,
     route_table: Arc<RwLock<RouteTable>>,
+    filter: Arc<std::sync::Mutex<Filter>>,
+    packet_drops: Arc<AtomicU64>,
     cancel: Arc<CancelToken>,
 ) {
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(5));
@@ -684,8 +718,19 @@ async fn run_netstack_pump(
             _ = ticker.tick() => {}
             result = magicsock.poll_recv() => {
                 if let Ok(dgram) = result {
-                    handle_inbound_wg(&magicsock, &wg_tunnels, &dgram, |pt| {
-                        netstack.push_rx(pt);
+                    let f = filter.clone();
+                    let drops = packet_drops.clone();
+                    let ns = netstack.clone();
+                    handle_inbound_wg(&magicsock, &wg_tunnels, &dgram, move |pt| {
+                        let dropped = {
+                            let mut filt = f.lock().unwrap();
+                            filt.check_in(&pt).is_drop()
+                        };
+                        if dropped {
+                            drops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            return;
+                        }
+                        ns.push_rx(pt);
                     }).await;
                 }
             }
@@ -693,6 +738,10 @@ async fn run_netstack_pump(
 
         // Drain outbound IP packets from netstack → route → WG → magicsock.
         while let Some(pkt) = netstack.pop_tx() {
+            {
+                let mut filt = filter.lock().unwrap();
+                filt.update_outbound(&pkt);
+            }
             encapsulate_and_send(&magicsock, &wg_tunnels, &route_table, &pkt).await;
         }
 
@@ -710,6 +759,8 @@ async fn run_tun_pump(
     tun: Arc<dyn Tun>,
     wg_tunnels: Arc<RwLock<HashMap<NodePublic, Arc<Mutex<WgTunn>>>>>,
     route_table: Arc<RwLock<RouteTable>>,
+    filter: Arc<std::sync::Mutex<Filter>>,
+    packet_drops: Arc<AtomicU64>,
     cancel: Arc<CancelToken>,
 ) {
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(250));
@@ -725,6 +776,10 @@ async fn run_tun_pump(
             result = tun.read_packet() => {
                 match result {
                     Ok(pkt) => {
+                        {
+                            let mut filt = filter.lock().unwrap();
+                            filt.update_outbound(&pkt);
+                        }
                         encapsulate_and_send(&magicsock, &wg_tunnels, &route_table, &pkt).await;
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -734,7 +789,7 @@ async fn run_tun_pump(
                     }
                 }
             }
-            // magicsock recv -> WG decapsulate -> TUN write.
+            // magicsock recv -> WG decapsulate -> filter -> TUN write.
             result = magicsock.poll_recv() => {
                 if let Ok(dgram) = result {
                     let tunn = {
@@ -745,7 +800,15 @@ async fn run_tun_pump(
                         if let Ok(mut t) = tunn.try_lock() {
                             if let Ok(decap) = t.decapsulate(&dgram.data) {
                                 if let Some(pt) = decap.plaintext {
-                                    let _ = tun.write_packet(&pt).await;
+                                    let dropped = {
+                                        let mut filt = filter.lock().unwrap();
+                                        filt.check_in(&pt).is_drop()
+                                    };
+                                    if dropped {
+                                        packet_drops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    } else {
+                                        let _ = tun.write_packet(&pt).await;
+                                    }
                                 }
                                 for reply in decap.replies {
                                     let _ = magicsock.send(dgram.peer.clone(), &reply).await;
@@ -843,8 +906,11 @@ fn spawn_map_update_task(
     peers_arc: Arc<RwLock<Vec<Node>>>,
     route_table: Arc<RwLock<RouteTable>>,
     node_key: NodePrivate,
+    filter_arc: Arc<std::sync::Mutex<Filter>>,
+    tailscale_ips: Vec<IpAddr>,
     cancel: Arc<CancelToken>,
 ) -> JoinHandle<()> {
+    let mut named_filters: BTreeMap<String, Vec<FilterRule>> = BTreeMap::new();
     tokio::spawn(async move {
         loop {
             if cancel.is_cancelled() {
@@ -895,11 +961,134 @@ fn spawn_map_update_task(
                             }
                         }
                     }
+                    drop(tunnels);
+
+                    // Process PacketFilter / PacketFilters deltas and rebuild
+                    // the filter if anything changed.
+                    let filter_changed = process_filter_deltas(&resp, &mut named_filters);
+                    if filter_changed {
+                        rebuild_filter(&filter_arc, &named_filters, &tailscale_ips);
+                    }
                 }
                 Some(Err(_)) | None => break,
             }
         }
     })
+}
+
+// ---------------------------------------------------------------------------
+// Packet filter helpers
+// ---------------------------------------------------------------------------
+
+/// Build a [`Filter`] from a [`MapResponse`]'s PacketFilter/PacketFilters
+/// fields. Returns the filter and the initial named-filter map.
+fn build_filter_from_map_response(
+    resp: &MapResponse,
+    local_ips: &[IpAddr],
+) -> (Filter, BTreeMap<String, Vec<FilterRule>>) {
+    let mut named: BTreeMap<String, Vec<FilterRule>> = BTreeMap::new();
+
+    // PacketFilter (singular): sets the "base" key.
+    if let Some(pf) = &resp.PacketFilter {
+        named.insert("base".into(), pf.clone());
+    }
+
+    // PacketFilters (plural): named delta updates.
+    if let Some(pfs) = &resp.PacketFilters {
+        // "*" with None = clear all.
+        if let Some(None) = pfs.get("*") {
+            named.clear();
+        }
+        for (key, val) in pfs {
+            if key == "*" {
+                continue;
+            }
+            match val {
+                None => {
+                    named.remove(key);
+                }
+                Some(rules) if rules.is_empty() => {
+                    named.remove(key);
+                }
+                Some(rules) => {
+                    named.insert(key.clone(), rules.clone());
+                }
+            }
+        }
+    }
+
+    // If no rules at all, default to allow-all (matches Go behavior when
+    // the control server sends no filter).
+    let all_rules: Vec<FilterRule> = if named.is_empty() {
+        rustscale_tailcfg::filter_allow_all()
+    } else {
+        named.values().flatten().cloned().collect()
+    };
+
+    let filter = Filter::new(&all_rules, local_ips).unwrap_or_else(|_| Filter::allow_all());
+    (filter, named)
+}
+
+/// Process PacketFilter/PacketFilters deltas from a MapResponse into the
+/// named-filter map. Returns true if the map changed (and the filter should
+/// be rebuilt).
+fn process_filter_deltas(
+    resp: &MapResponse,
+    named: &mut BTreeMap<String, Vec<FilterRule>>,
+) -> bool {
+    let mut changed = false;
+
+    if let Some(pf) = &resp.PacketFilter {
+        named.insert("base".into(), pf.clone());
+        changed = true;
+    }
+
+    if let Some(pfs) = &resp.PacketFilters {
+        if let Some(None) = pfs.get("*") {
+            named.clear();
+            changed = true;
+        }
+        for (key, val) in pfs {
+            if key == "*" {
+                continue;
+            }
+            match val {
+                None => {
+                    if named.remove(key).is_some() {
+                        changed = true;
+                    }
+                }
+                Some(rules) if rules.is_empty() => {
+                    if named.remove(key).is_some() {
+                        changed = true;
+                    }
+                }
+                Some(rules) => {
+                    named.insert(key.clone(), rules.clone());
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    changed
+}
+
+/// Rebuild the filter from the named-filter map and update the shared
+/// `Arc<Mutex<Filter>>`.
+fn rebuild_filter(
+    filter_arc: &Arc<std::sync::Mutex<Filter>>,
+    named: &BTreeMap<String, Vec<FilterRule>>,
+    local_ips: &[IpAddr],
+) {
+    let all_rules: Vec<FilterRule> = if named.is_empty() {
+        rustscale_tailcfg::filter_allow_all()
+    } else {
+        named.values().flatten().cloned().collect()
+    };
+    if let Ok(new_filter) = Filter::new(&all_rules, local_ips) {
+        *filter_arc.lock().unwrap() = new_filter;
+    }
 }
 
 // ---------------------------------------------------------------------------

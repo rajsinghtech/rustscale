@@ -44,4 +44,6 @@ pub struct ServerStatus {
     pub peers: Vec<PeerInfo>,
     /// Our hostname.
     pub hostname: String,
+    /// Number of packets dropped by the packet filter.
+    pub packet_drops: u64,
 }

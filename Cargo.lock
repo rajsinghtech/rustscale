@@ -868,6 +868,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustscale-filter"
+version = "0.1.0"
+dependencies = [
+ "rustscale-tailcfg",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "rustscale-key"
 version = "0.1.0"
 dependencies = [
@@ -934,6 +942,7 @@ dependencies = [
  "rustls",
  "rustscale-controlclient",
  "rustscale-derp",
+ "rustscale-filter",
  "rustscale-key",
  "rustscale-magicsock",
  "rustscale-netcheck",

@@ -9,11 +9,13 @@
 #![allow(non_snake_case)]
 
 mod derpmap;
+mod filter;
 mod map;
 mod node;
 mod register;
 
 pub use derpmap::{DERPHomeParams, DERPMap, DERPNode, DERPRegion};
+pub use filter::{filter_allow_all, CapGrant, FilterRule, NetPortRange, PeerCapMap, PortRange};
 pub use map::{MapRequest, MapResponse};
 pub use node::{
     Endpoint, EndpointType, Hostinfo, Location, NetInfo, Node, NodeCapMap, Service, ServiceProto,

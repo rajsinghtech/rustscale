@@ -3,10 +3,12 @@
 
 use serde::{Deserialize, Serialize};
 
+use std::collections::BTreeMap;
+
 use rustscale_key::{DiscoPublic, NodePublic};
 
 use crate::deserialize_null_to_default;
-use crate::{skip_default, skip_zero_disco, CapabilityVersion, DERPMap, Node, NodeID};
+use crate::{skip_default, skip_zero_disco, CapabilityVersion, DERPMap, FilterRule, Node, NodeID};
 
 /// Sent by a client to update its state and/or long-poll network-map updates.
 ///
@@ -92,6 +94,15 @@ pub struct MapResponse {
     /// The tailnet domain name; empty means unchanged.
     #[serde(default, skip_serializing_if = "skip_default")]
     pub Domain: String,
+    /// Firewall rules. `None` = unchanged (field absent); `Some([])` = block
+    /// all; `Some([…])` = full replacement of the "base" key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub PacketFilter: Option<Vec<FilterRule>>,
+    /// Incremental named packet-filter updates. `None` = unchanged. Key `"*"`
+    /// with `None` value = clear all named filters. Other key with `None`/
+    /// empty = delete; `Some(vec)` = set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub PacketFilters: Option<BTreeMap<String, Option<Vec<FilterRule>>>>,
 }
 
 #[cfg(test)]

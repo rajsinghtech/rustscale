@@ -510,3 +510,83 @@ ICMP echo-reply/error always accepted, echo-requests match IPs only; `pre()`
 handles multicast/link-local/fragment/unknown-proto before proto-specific logic.
 For the rule/parse types see `crates/tailcfg/src/filter.rs`
 (`FilterRule`, `NetPortRange`, `CapGrant`).
+
+## Subnet routing + Serve (phase 10a)
+
+### Subnet route advertisement
+
+- `Hostinfo.RoutableIPs: Vec<String>` (CIDRs like `"192.0.2.0/24"`) is sent in
+  both the `RegisterRequest` and `MapRequest` Hostinfo. Control must approve
+  the routes (via `POST /api/v2/device/{id}/routes` with `{"routes":[...]}`)
+  before peers see them in this node's `AllowedIPs`.
+- `Node.PrimaryRoutes: Vec<String>` is the approved subset returned by control.
+- Builder: `.advertise_routes(vec!["192.0.2.0/24".into()])` sets
+  `Hostinfo.RoutableIPs`; `.accept_routes(true)` installs peer subnet routes.
+
+### Route table accept_routes filtering
+
+`RouteTable::from_peers_with_opts(peers, accept_routes)`:
+- `accept_routes=false` (default): only prefixes within tailnet ranges
+  (100.64.0.0/10 v4, fd7a:115c:a1e0::/48 v6) are installed.
+- `accept_routes=true`: all `AllowedIPs`/`Addresses` prefixes installed,
+  including peer-advertised subnet CIDRs.
+- The tailnet range check is `is_tailnet_prefix(net, prefix)` in routing.rs.
+- `rebuild_with_opts` / `rebuild` (preserves the previous accept_routes flag).
+
+### Filter + subnet routes
+
+`Filter::add_local_cidrs(&[cidr_strings])` extends the localNets prefilter
+with advertised subnet routes so the filter admits packets destined to those
+subnets (normally the prefilter drops packets whose dst isn't a local tailnet
+IP). Called in `bootstrap()` and `rebuild_filter()` when advertise_routes is
+non-empty. See `crates/filter/src/lib.rs`.
+
+### TLS (listen_tls) — self-signed per node
+
+- `CertProvider` trait (object-safe, `Send + Sync`): `cert_chain()` →
+  `Vec<CertificateDer<'static>>`, `private_key()` → `PrivateKeyDer<'static>`.
+  Future LE-via-control impl drops in behind the same trait.
+- `SelfSignedCertProvider` uses `rcgen` (0.13, ring backend) to generate a
+  self-signed cert in-process. **Self-signed at this stage** — clients must
+  skip verification.
+- `TlsListener` wraps a netstack `Listener` with `tokio_rustls::TlsAcceptor`.
+- `TlsStream` is a concrete newtype over `tokio_rustls::server::TlsStream<NetstackStream>`.
+- **C-representable**: both are concrete structs (no generics), usable behind
+  opaque FFI handles.
+
+### rcgen 0.13 API (ring backend)
+
+```toml
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+```
+```rust
+use rcgen::{generate_simple_self_signed, CertifiedKey};
+let CertifiedKey { cert, key_pair } = generate_simple_self_signed(vec!["localhost".into()])?;
+let cert_chain = vec![cert.der().clone()]; // CertificateDer<'static>
+let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der()));
+```
+`cert.der()` returns `&CertificateDer<'static>` (rustls pki_types).
+`key_pair.serialize_der()` returns `Vec<u8>` (PKCS#8 private key DER).
+
+### Dangerous TLS client verifier (test only)
+
+For tests connecting to a self-signed `listen_tls` server, use
+`rustls::ClientConfig::builder().dangerous().with_custom_certificate_verifier(...)`
+with a `ServerCertVerifier` that returns `Ok(ServerCertVerified::assertion())`
+from `verify_server_cert` and `Ok(HandshakeSignatureValid::assertion())` from
+`verify_tls12/13_signature`. The `verify_server_cert` signature in rustls 0.23
+takes 6 params: `(end_entity, intermediates, server_name, ocsp_response, now)`.
+See `dangerous_client_config()` in `crates/tsnet/src/tests.rs`.
+
+### API route approval (e2e helper)
+
+`POST /api/v2/device/{deviceId}/routes` with `{"routes":["192.0.2.0/24"]}`
+approves advertised routes. The device ID comes from
+`GET /api/v2/tailnet/{tailnet}/devices` (match by hostname). Uses
+`TS_E2E_API_TOKEN` (the child tailnet token from e2e.sh).
+
+### Serve example
+
+`crates/tsnet/examples/rustscale-serve.rs` — serves HTTP (plain + `--tls`)
+with `/bench` endpoint streaming N MB (`--bytes`). Flags: `--authkey`,
+`--hostname`, `--port`, `--bytes`, `--tls`.

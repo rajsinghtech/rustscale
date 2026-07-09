@@ -46,6 +46,10 @@ libc = "0.2"
 # Async trait methods for the TUN device abstraction.
 async-trait = "0.1"
 
+# Self-signed certificate generation for tsnet ListenTLS (self-signed-per-node
+# stage; real LE certs via control come in a later phase).
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+
 # Shared lint policy: pedantic where sane, but allow the noisier style lints so
 # that the default `cargo clippy` run stays clean and readable.
 [workspace.lints.rust]

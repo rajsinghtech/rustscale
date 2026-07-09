@@ -1,2 +1,4 @@
 target/
 .secrets/
+bench-results/
+tools/bench/bin/

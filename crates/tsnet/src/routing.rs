@@ -23,13 +23,26 @@ struct RouteEntry {
 #[derive(Clone, Default)]
 pub struct RouteTable {
     entries: Vec<RouteEntry>,
+    accept_routes: bool,
 }
 
 impl RouteTable {
     /// Build a table from a peer list. Each peer's `AllowedIPs` are used, or
     /// `Addresses` as a fallback when `AllowedIPs` is empty. Peers with a zero
-    /// node key are skipped.
+    /// node key are skipped. All prefixes are installed (equivalent to
+    /// `accept_routes = true`).
     pub fn from_peers(peers: &[Node]) -> Self {
+        Self::from_peers_with_opts(peers, true)
+    }
+
+    /// Build a table from a peer list with an `accept_routes` flag.
+    ///
+    /// When `accept_routes` is true, every `AllowedIPs`/`Addresses` prefix is
+    /// installed (tailnet IPs + peer-advertised subnet routes). When false,
+    /// only prefixes within the tailnet ranges (100.64.0.0/10 for IPv4,
+    /// fd7a:115c:a1e0::/48 for IPv6) are installed — peer subnet routes are
+    /// ignored, matching Go's `--accept-routes=false` behavior.
+    pub fn from_peers_with_opts(peers: &[Node], accept_routes: bool) -> Self {
         let mut entries = Vec::new();
         for peer in peers {
             if peer.Key.is_zero() {
@@ -41,19 +54,26 @@ impl RouteTable {
                 &peer.AllowedIPs
             };
             for cidr in cidrs {
-                if let Some((net, prefix)) = parse_cidr(cidr) {
-                    entries.push(RouteEntry {
-                        net,
-                        prefix,
-                        peer: peer.Key.clone(),
-                    });
+                let Some((net, prefix)) = parse_cidr(cidr) else {
+                    continue;
+                };
+                if !accept_routes && !is_tailnet_prefix(net, prefix) {
+                    continue;
                 }
+                entries.push(RouteEntry {
+                    net,
+                    prefix,
+                    peer: peer.Key.clone(),
+                });
             }
         }
         // Sort by prefix descending so the first match in `lookup` is the
         // longest prefix (avoids a max-scan each call).
         entries.sort_by(|a, b| b.prefix.cmp(&a.prefix));
-        Self { entries }
+        Self {
+            entries,
+            accept_routes,
+        }
     }
 
     /// Look up the peer for a destination IP via longest-prefix match. Returns
@@ -70,8 +90,16 @@ impl RouteTable {
     }
 
     /// Rebuild the table from a new peer list (e.g. on a map-stream delta).
+    /// Preserves the `accept_routes` setting of the previous table.
     pub fn rebuild(&mut self, peers: &[Node]) {
-        *self = Self::from_peers(peers);
+        let accept = self.accept_routes;
+        *self = Self::from_peers_with_opts(peers, accept);
+    }
+
+    /// Rebuild the table from a new peer list with an explicit `accept_routes`
+    /// flag.
+    pub fn rebuild_with_opts(&mut self, peers: &[Node], accept_routes: bool) {
+        *self = Self::from_peers_with_opts(peers, accept_routes);
     }
 
     /// Number of route entries (for diagnostics/testing).
@@ -82,6 +110,17 @@ impl RouteTable {
     /// Whether the table is empty.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Iterate over all route entries as `(network_ip, prefix, peer_key)`. Used
+    /// by TUN mode to install accepted subnet routes as OS routes.
+    pub fn entries(&self) -> impl Iterator<Item = (IpAddr, u8, &NodePublic)> {
+        self.entries.iter().map(|e| (e.net, e.prefix, &e.peer))
+    }
+
+    /// Whether `accept_routes` is enabled for this table.
+    pub fn accept_routes(&self) -> bool {
+        self.accept_routes
     }
 }
 
@@ -127,6 +166,36 @@ fn cidr_match(ip: IpAddr, net: IpAddr, prefix: u8) -> bool {
             (u128::from(ip) & mask) == (u128::from(net) & mask)
         }
         _ => false,
+    }
+}
+
+/// Whether a `net`/`prefix` falls within the Tailscale tailnet ranges:
+/// IPv4 100.64.0.0/10 (CGNAT) or IPv6 fd7a:115c:a1e0::/48 (ULA). These are
+/// the "self" IPs that are always installed regardless of `accept_routes`.
+fn is_tailnet_prefix(net: IpAddr, prefix: u8) -> bool {
+    match net {
+        IpAddr::V4(v4) => {
+            if prefix > 32 {
+                return false;
+            }
+            // 100.64.0.0/10 — the Tailscale CGNAT range.
+            cidr_match(
+                IpAddr::V4(v4),
+                IpAddr::V4(std::net::Ipv4Addr::new(100, 64, 0, 0)),
+                10,
+            )
+        }
+        IpAddr::V6(v6) => {
+            if prefix > 128 {
+                return false;
+            }
+            // fd7a:115c:a1e0::/48 — the Tailscale ULA range.
+            cidr_match(
+                IpAddr::V6(v6),
+                IpAddr::V6("fd7a:115c:a1e0::".parse().unwrap()),
+                48,
+            )
+        }
     }
 }
 
@@ -284,5 +353,118 @@ mod tests {
         let rt = RouteTable::from_peers(&peers);
         // Only the valid /32 survives.
         assert_eq!(rt.len(), 1);
+    }
+
+    #[test]
+    fn accept_routes_false_ignores_subnet_routes() {
+        let key = NodePrivate::generate().public();
+        let node = Node {
+            ID: 1,
+            Name: "router".into(),
+            Key: key.clone(),
+            AllowedIPs: vec![
+                "100.64.0.5/32".into(),
+                "192.0.2.0/24".into(),
+                "fd7a:115c:a1e0::5/128".into(),
+            ],
+            ..Default::default()
+        };
+        // accept_routes=false: only the tailnet /32 and /128 are installed.
+        let rt = RouteTable::from_peers_with_opts(&[node], false);
+        assert_eq!(rt.len(), 2);
+        assert_eq!(
+            rt.lookup(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 5))),
+            Some(key.clone())
+        );
+        assert!(rt.lookup(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))).is_none());
+    }
+
+    #[test]
+    fn accept_routes_true_installs_subnet_routes() {
+        let key = NodePrivate::generate().public();
+        let node = Node {
+            ID: 1,
+            Name: "router".into(),
+            Key: key.clone(),
+            AllowedIPs: vec!["100.64.0.5/32".into(), "192.0.2.0/24".into()],
+            ..Default::default()
+        };
+        let rt = RouteTable::from_peers_with_opts(&[node], true);
+        assert_eq!(rt.len(), 2);
+        // Subnet route is now reachable.
+        assert_eq!(
+            rt.lookup(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 42))),
+            Some(key)
+        );
+    }
+
+    #[test]
+    fn accept_routes_mixed_32_and_cidr_longest_prefix() {
+        let router = NodePrivate::generate().public();
+        let host = NodePrivate::generate().public();
+        let peers = vec![
+            Node {
+                ID: 1,
+                Name: "router".into(),
+                Key: router.clone(),
+                AllowedIPs: vec!["100.64.0.1/32".into(), "192.0.2.0/24".into()],
+                ..Default::default()
+            },
+            Node {
+                ID: 2,
+                Name: "host".into(),
+                Key: host.clone(),
+                AllowedIPs: vec!["192.0.2.9/32".into()],
+                ..Default::default()
+            },
+        ];
+        let rt = RouteTable::from_peers_with_opts(&peers, true);
+        // The host's /32 within the router's /24 should win.
+        assert_eq!(
+            rt.lookup(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 9))),
+            Some(host)
+        );
+        // Other addresses in /24 go to the router.
+        assert_eq!(
+            rt.lookup(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10))),
+            Some(router)
+        );
+    }
+
+    #[test]
+    fn rebuild_preserves_accept_routes() {
+        let key = NodePrivate::generate().public();
+        let node = Node {
+            ID: 1,
+            Name: "r".into(),
+            Key: key,
+            AllowedIPs: vec!["100.64.0.5/32".into(), "192.0.2.0/24".into()],
+            ..Default::default()
+        };
+        let mut rt = RouteTable::from_peers_with_opts(&[node.clone()], false);
+        assert_eq!(rt.len(), 1); // only tailnet /32
+        rt.rebuild(&[node]);
+        assert_eq!(rt.len(), 1); // accept_routes still false
+    }
+
+    #[test]
+    fn tailnet_range_check() {
+        // 100.64.0.0/10 is tailnet; 100.128.0.0 is outside it.
+        assert!(is_tailnet_prefix(
+            IpAddr::V4(Ipv4Addr::new(100, 64, 5, 5)),
+            32
+        ));
+        assert!(!is_tailnet_prefix(
+            IpAddr::V4(Ipv4Addr::new(100, 128, 0, 1)),
+            32
+        ));
+        assert!(is_tailnet_prefix(
+            "fd7a:115c:a1e0:abcd::1".parse().unwrap(),
+            128
+        ));
+        assert!(!is_tailnet_prefix(
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 0)),
+            24
+        ));
     }
 }

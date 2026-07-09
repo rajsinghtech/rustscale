@@ -31,10 +31,12 @@
 mod routing;
 mod state;
 mod status;
+mod tls;
 
 pub use routing::RouteTable;
 pub use state::{PersistedState, StateError};
 pub use status::{PeerInfo, ServerStatus};
+pub use tls::{CertProvider, SelfSignedCertProvider, TlsError, TlsListener, TlsStream};
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -108,6 +110,8 @@ pub enum TsnetError {
     NotAvailableInTunMode,
     #[error("timeout waiting for first map response")]
     MapTimeout,
+    #[error("tls error: {0}")]
+    Tls(#[from] TlsError),
 }
 
 /// A builder for configuring a [`Server`].
@@ -118,6 +122,14 @@ pub struct ServerBuilder {
     control_url: String,
     state_dir: Option<PathBuf>,
     ephemeral: bool,
+    /// Subnet routes to advertise (e.g. `["192.0.2.0/24"]`). Sent in
+    /// `Hostinfo.RoutableIPs`; control must approve them before peers install
+    /// them.
+    advertise_routes: Vec<String>,
+    /// Whether to install peer-advertised subnet routes into the local
+    /// routing table. When false (default), only tailnet-range IPs
+    /// (100.64.0.0/10, fd7a:115c:a1e0::/48) are routed.
+    accept_routes: bool,
 }
 
 impl ServerBuilder {
@@ -148,6 +160,33 @@ impl ServerBuilder {
     /// Set the ephemeral flag.
     pub fn ephemeral(mut self, e: bool) -> Self {
         self.ephemeral = e;
+        self
+    }
+
+    /// Set the subnet routes to advertise (e.g. `["192.0.2.0/24"]`).
+    ///
+    /// These are sent to the control plane in `Hostinfo.RoutableIPs`. The
+    /// tailnet admin must approve them (via the API or admin console) before
+    /// peers see them in this node's `AllowedIPs`.
+    ///
+    /// **TUN mode + subnet routing**: the OS must have IP forwarding enabled
+    /// for the node to actually forward packets between the tailnet and the
+    /// advertised subnet. On Linux: `sysctl net.ipv4.ip_forward=1`. On macOS:
+    /// `sysctl net.inet.ip.forwarding=1`. Without this, packets arriving from
+    /// peers are written to the TUN device but the OS kernel drops them
+    /// instead of forwarding onward.
+    pub fn advertise_routes(mut self, routes: Vec<String>) -> Self {
+        self.advertise_routes = routes;
+        self
+    }
+
+    /// Set whether to accept peer-advertised subnet routes.
+    ///
+    /// When true, peer-advertised subnet CIDRs (non-tailnet ranges in peers'
+    /// `AllowedIPs`) are installed into the local routing table. When false
+    /// (default), only tailnet-range IPs are routed.
+    pub fn accept_routes(mut self, accept: bool) -> Self {
+        self.accept_routes = accept;
         self
     }
 
@@ -310,6 +349,8 @@ impl Server {
             b.node_key.clone(),
             b.filter.clone(),
             b.tailscale_ips.clone(),
+            self.config.accept_routes,
+            self.config.advertise_routes.clone(),
             b.cancel.clone(),
         );
 
@@ -355,6 +396,12 @@ impl Server {
                 let dev = rustscale_tun::create(&config.tun)?;
                 if config.apply_routes {
                     apply_tun_routes(dev.name(), &b.tailscale_ips, config.tun.mtu)?;
+                    // When accept_routes is enabled, install peer-advertised
+                    // subnet routes as OS routes pointing at the TUN device.
+                    if self.config.accept_routes {
+                        let rt = b.route_table.read().await;
+                        apply_accepted_subnet_routes(dev.name(), &rt)?;
+                    }
                 }
                 Arc::new(dev)
             }
@@ -386,6 +433,8 @@ impl Server {
             b.node_key.clone(),
             b.filter.clone(),
             b.tailscale_ips.clone(),
+            self.config.accept_routes,
+            self.config.advertise_routes.clone(),
             b.cancel.clone(),
         );
 
@@ -455,6 +504,7 @@ impl Server {
             Hostinfo: Some(Hostinfo {
                 OS: std::env::consts::OS.to_string(),
                 Hostname: self.config.hostname.clone(),
+                RoutableIPs: self.config.advertise_routes.clone(),
                 ..Default::default()
             }),
             Ephemeral: self.config.ephemeral,
@@ -478,6 +528,7 @@ impl Server {
             Hostinfo: Some(Hostinfo {
                 OS: std::env::consts::OS.to_string(),
                 Hostname: self.config.hostname.clone(),
+                RoutableIPs: self.config.advertise_routes.clone(),
                 ..Default::default()
             }),
             ..Default::default()
@@ -590,12 +641,21 @@ impl Server {
         }
 
         let peers_arc = Arc::new(RwLock::new(peers.clone()));
-        let route_table = Arc::new(RwLock::new(RouteTable::from_peers(&peers)));
+        let route_table = Arc::new(RwLock::new(RouteTable::from_peers_with_opts(
+            &peers,
+            self.config.accept_routes,
+        )));
         let derp_arc = Arc::new(RwLock::new(map_resp.DERPMap.clone()));
         let cancel = Arc::new(CancelToken::new());
 
-        // Build the initial packet filter from the first MapResponse.
-        let (filter, _named_filters) = build_filter_from_map_response(&map_resp, &tailscale_ips);
+        // Build the initial packet filter from the first MapResponse. Add our
+        // advertised subnet routes to the filter's localNets so packets
+        // destined to those subnets are admitted (needed by subnet routers).
+        let (mut filter, _named_filters) =
+            build_filter_from_map_response(&map_resp, &tailscale_ips);
+        if !self.config.advertise_routes.is_empty() {
+            filter.add_local_cidrs(&self.config.advertise_routes);
+        }
         let filter = Arc::new(std::sync::Mutex::new(filter));
         let packet_drops = Arc::new(AtomicU64::new(0));
 
@@ -669,6 +729,43 @@ impl Server {
         }
     }
 
+    /// Listen for incoming TLS connections on `port` (netstack mode only).
+    ///
+    /// Uses a self-signed-per-node certificate (generated in-process) by
+    /// default. Callers can supply a custom [`CertProvider`] via
+    /// [`Server::listen_tls_with_provider`] to use a different certificate
+    /// source. **The certificate is self-signed at this stage** — clients must
+    /// skip verification or pin the node's key. Real Let's Encrypt certs via
+    /// the control plane come in a later phase.
+    ///
+    /// Returns an error in TUN mode.
+    pub async fn listen_tls(&self, port: u16) -> Result<TlsListener, TsnetError> {
+        let inner = self.inner.as_ref().ok_or(TsnetError::NotUp)?;
+        let provider = tls::default_cert_provider(&inner.tailscale_ips);
+        self.listen_tls_with_provider(port, provider).await
+    }
+
+    /// Listen for incoming TLS connections on `port` using a caller-supplied
+    /// [`CertProvider`] (netstack mode only).
+    ///
+    /// This is the lower-level entry point behind [`Server::listen_tls`]; use
+    /// it when you need a custom certificate source (e.g. pre-provisioned
+    /// certs). Returns an error in TUN mode.
+    pub async fn listen_tls_with_provider(
+        &self,
+        port: u16,
+        provider: Arc<dyn CertProvider>,
+    ) -> Result<TlsListener, TsnetError> {
+        let inner = self.inner.as_ref().ok_or(TsnetError::NotUp)?;
+        match &inner.data_plane {
+            DataPlane::Netstack(ns) => {
+                let listener = ns.listen(port).await?;
+                TlsListener::new(listener, provider).map_err(|e| TsnetError::Tls(e))
+            }
+            DataPlane::Tun(_) => Err(TsnetError::NotAvailableInTunMode),
+        }
+    }
+
     /// Dial a remote `ip:port` or `hostname:port` (netstack mode only).
     ///
     /// Returns an error in TUN mode.
@@ -679,6 +776,33 @@ impl Server {
             DataPlane::Netstack(ns) => Ok(ns.dial(socket_addr).await?),
             DataPlane::Tun(_) => Err(TsnetError::NotAvailableInTunMode),
         }
+    }
+
+    /// Look up which peer owns the route for a destination IP (longest-prefix
+    /// match). Returns `None` if no route matches or the server is not up.
+    ///
+    /// This is the in-process routing table's view — it reflects the latest
+    /// netmap peers and the `accept_routes` setting. Useful for testing
+    /// subnet-route installation and for the FFI layer.
+    pub fn route_lookup(&self, ip: IpAddr) -> Option<NodePublic> {
+        let inner = self.inner.as_ref()?;
+        let rt = inner.route_table.try_read().ok()?;
+        rt.lookup(ip)
+    }
+
+    /// Snapshot of the current route table entries as `(cidr_string, peer_key)`
+    /// pairs, sorted by longest prefix first. Useful for diagnostics and
+    /// testing subnet-route installation.
+    pub fn routes(&self) -> Vec<(String, NodePublic)> {
+        let Some(inner) = self.inner.as_ref() else {
+            return vec![];
+        };
+        let Ok(rt) = inner.route_table.try_read() else {
+            return vec![];
+        };
+        rt.entries()
+            .map(|(net, prefix, peer)| (format!("{net}/{prefix}"), peer.clone()))
+            .collect()
     }
 
     /// Shut down the server.
@@ -933,6 +1057,8 @@ fn spawn_map_update_task(
     node_key: NodePrivate,
     filter_arc: Arc<std::sync::Mutex<Filter>>,
     tailscale_ips: Vec<IpAddr>,
+    accept_routes: bool,
+    advertise_routes: Vec<String>,
     cancel: Arc<CancelToken>,
 ) -> JoinHandle<()> {
     let mut named_filters: BTreeMap<String, Vec<FilterRule>> = BTreeMap::new();
@@ -972,7 +1098,10 @@ fn spawn_map_update_task(
                     // Feed the updated peer list to magicsock + rebuild routes.
                     let peers = peers_arc.read().await.clone();
                     let _ = magicsock.set_netmap(peers.clone()).await;
-                    route_table.write().await.rebuild(&peers);
+                    route_table
+                        .write()
+                        .await
+                        .rebuild_with_opts(&peers, accept_routes);
 
                     // Create WG tunnels for new peers.
                     let mut tunnels = wg_tunnels.write().await;
@@ -992,7 +1121,12 @@ fn spawn_map_update_task(
                     // the filter if anything changed.
                     let filter_changed = process_filter_deltas(&resp, &mut named_filters);
                     if filter_changed {
-                        rebuild_filter(&filter_arc, &named_filters, &tailscale_ips);
+                        rebuild_filter(
+                            &filter_arc,
+                            &named_filters,
+                            &tailscale_ips,
+                            &advertise_routes,
+                        );
                     }
                 }
                 Some(Err(_)) | None => break,
@@ -1100,18 +1234,23 @@ fn process_filter_deltas(
 }
 
 /// Rebuild the filter from the named-filter map and update the shared
-/// `Arc<Mutex<Filter>>`.
+/// `Arc<Mutex<Filter>>`. Advertised subnet routes are added to the filter's
+/// localNets so the subnet router admits packets destined to those subnets.
 fn rebuild_filter(
     filter_arc: &Arc<std::sync::Mutex<Filter>>,
     named: &BTreeMap<String, Vec<FilterRule>>,
     local_ips: &[IpAddr],
+    advertise_routes: &[String],
 ) {
     let all_rules: Vec<FilterRule> = if named.is_empty() {
         rustscale_tailcfg::filter_allow_all()
     } else {
         named.values().flatten().cloned().collect()
     };
-    if let Ok(new_filter) = Filter::new(&all_rules, local_ips) {
+    if let Ok(mut new_filter) = Filter::new(&all_rules, local_ips) {
+        if !advertise_routes.is_empty() {
+            new_filter.add_local_cidrs(advertise_routes);
+        }
         *filter_arc.lock().unwrap() = new_filter;
     }
 }
@@ -1226,6 +1365,60 @@ fn apply_tun_routes(ifname: &str, tailscale_ips: &[IpAddr], _mtu: usize) -> Resu
         let _ = (ifname, v4_str);
     }
     Ok(())
+}
+
+/// Install peer-advertised subnet routes (non-tailnet CIDRs from the route
+/// table) as OS routes pointing at the TUN device. Only called in TUN mode
+/// when both `apply_routes` and `accept_routes` are enabled. Requires root.
+///
+/// **Note**: this installs the routes known at `up_tun` time. Dynamically
+/// appearing routes (from later map-stream deltas) are not yet reflected in
+/// the OS table — a future improvement. The in-process `RouteTable` always
+/// has the latest entries.
+fn apply_accepted_subnet_routes(ifname: &str, rt: &RouteTable) -> Result<(), TsnetError> {
+    for (net, prefix, _peer) in rt.entries() {
+        let cidr = format!("{net}/{prefix}");
+        // Skip tailnet-range prefixes — those are handled by apply_tun_routes
+        // (100.64.0.0/10) and don't need per-prefix OS routes.
+        if is_tailnet_cidr(net, prefix) {
+            continue;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // Best-effort: ignore "route already exists" failures.
+            let _ = run_cmd("route", &["-q", "add", "-net", &cidr, "-interface", ifname]);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let _ = run_cmd("ip", &["route", "add", &cidr, "dev", ifname]);
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            let _ = (ifname, &cidr);
+        }
+    }
+    Ok(())
+}
+
+/// Whether a CIDR's network address falls within the tailnet ranges
+/// (100.64.0.0/10 or fd7a:115c:a1e0::/48). Used by `apply_accepted_subnet_routes`
+/// to skip tailnet-range prefixes (handled by the blanket tailnet route).
+fn is_tailnet_cidr(net: IpAddr, _prefix: u8) -> bool {
+    match net {
+        IpAddr::V4(v4) => {
+            // 100.64.0.0/10 — mask the network address and compare.
+            let mask = u32::MAX << (32 - 10);
+            (u32::from(v4) & mask) == (u32::from(std::net::Ipv4Addr::new(100, 64, 0, 0)) & mask)
+        }
+        IpAddr::V6(v6) => {
+            // fd7a:115c:a1e0::/48 — compare the first 6 bytes.
+            let tail: [u8; 16] = "fd7a:115c:a1e0::"
+                .parse::<std::net::Ipv6Addr>()
+                .unwrap()
+                .octets();
+            v6.octets()[..6] == tail[..6]
+        }
+    }
 }
 
 /// Run a command, returning an error if it exits non-zero.

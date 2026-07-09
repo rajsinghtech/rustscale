@@ -120,6 +120,26 @@ impl Filter {
         }
     }
 
+    /// Add extra local CIDR prefixes (e.g. advertised subnet routes) to the
+    /// localNets prefilter. Packets destined to these prefixes are treated as
+    /// "local" and admitted through the normal rule-matching path — needed by
+    /// subnet routers, which receive packets whose dst is not the node's own
+    /// tailnet IP but an advertised subnet address.
+    ///
+    /// Each entry is a `"ip/prefix"` CIDR string; unparseable entries are
+    /// silently skipped (matching Go's tolerant parsing).
+    pub fn add_local_cidrs(&mut self, cidrs: &[String]) {
+        for cidr in cidrs {
+            if let Some(pfx) = parse_cidr_prefix(cidr) {
+                if pfx.is_v4() {
+                    self.local4.push(pfx);
+                } else {
+                    self.local6.push(pfx);
+                }
+            }
+        }
+    }
+
     /// Check an inbound raw IP packet.
     pub fn check_in(&mut self, buf: &[u8]) -> Response {
         let Some(info) = packet::parse_packet(buf) else {
@@ -336,4 +356,19 @@ fn pre(q: &PacketInfo) -> PreResult {
 /// Helper to check an empty buffer (WireGuard keepalive).
 pub fn is_keepalive(buf: &[u8]) -> bool {
     buf.is_empty()
+}
+
+/// Parse a `"ip/prefix"` CIDR string into an [`prefix::IpPrefix`].
+fn parse_cidr_prefix(cidr: &str) -> Option<prefix::IpPrefix> {
+    let (net_str, bits_str) = cidr.split_once('/')?;
+    let addr: IpAddr = net_str.parse().ok()?;
+    let bits: u8 = bits_str.parse().ok()?;
+    let max = match addr {
+        IpAddr::V4(_) => 32,
+        IpAddr::V6(_) => 128,
+    };
+    if bits > max {
+        return None;
+    }
+    Some(prefix::IpPrefix { addr, bits })
 }

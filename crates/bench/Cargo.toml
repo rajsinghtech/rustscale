@@ -1,0 +1,19 @@
+[package]
+name = "rustscale-bench"
+description = "Throughput and latency benchmark harness for rustscale tsnet"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rustscale-tsnet = { path = "../tsnet", version = "0.1.0" }
+rustscale-magicsock = { path = "../magicsock", version = "0.1.0" }
+rustscale-netstack = { path = "../netstack", version = "0.1.0" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+clap = { version = "4", features = ["derive"] }

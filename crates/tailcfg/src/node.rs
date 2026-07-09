@@ -65,6 +65,15 @@ pub struct Node {
         deserialize_with = "deserialize_null_to_default"
     )]
     pub AllowedIPs: Vec<String>,
+    /// Primary subnet routes this node advertises (subset of `AllowedIPs`
+    /// that the node is the primary/sole handler for). Mirrors Go's
+    /// `Node.PrimaryRoutes`.
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
+    pub PrimaryRoutes: Vec<String>,
     /// Public UDP endpoints (IP:port) discovered via STUN / LANs.
     #[serde(
         default,
@@ -143,6 +152,15 @@ pub struct Hostinfo {
         deserialize_with = "deserialize_null_to_default"
     )]
     pub Services: Vec<Service>,
+    /// IP prefixes this node can route (advertised subnet routes), e.g.
+    /// `"192.0.2.0/24"`. Control must approve them before peers see them in
+    /// this node's `AllowedIPs`. Mirrors Go's `Hostinfo.RoutableIPs`.
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
+    pub RoutableIPs: Vec<String>,
 }
 
 /// A service running on a node (matches Go's `tailcfg.Service`).
@@ -304,6 +322,7 @@ mod tests {
             Online: Some(true),
             Capabilities: vec!["https://tailscale.com/cap/file-sharing".into()],
             CapMap: BTreeMap::new(),
+            PrimaryRoutes: vec![],
         }
     }
 

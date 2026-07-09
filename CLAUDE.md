@@ -12,29 +12,27 @@ Edit/Write except for docs, specs, and this file.
 
 ### How to call opencode
 
-The binary is at `~/.opencode/bin/opencode` (on PATH). Model id as opencode knows it:
-`ai/vercel-ent/zai/glm-5.2` (verify with `opencode models | grep vercel`).
-
-One-shot task (preferred, run in background for long builds):
+**Use the server harness — NOT `opencode run`.** `opencode run` is synchronous with no
+timeout; when the model stalls it blocks forever and leaves zombie processes. The harness
+at `tools/agent/opencode-task.sh` drives the persistent server HTTP API instead:
+async prompt admission, allow-all permission ruleset (unattended), hard watchdog
+deadline with abort, result harvesting.
 
 ```bash
-opencode run -m ai/vercel-ent/zai/glm-5.2 \
-  --dir /Users/rajsingh/Documents/GitHub/rustscale \
-  --auto \
-  --title "phase-1-scaffold" \
-  "<detailed task prompt>"
+tools/agent/opencode-task.sh "phase-N-title" "<detailed task prompt>" [deadline_secs=2400]
+tools/agent/opencode-task.sh --continue <sessionID> "fix ..." [deadline_secs]
 ```
 
-Key flags learned:
-- `--auto` — auto-approve tool permissions (required for unattended runs; agents can't be interactive here).
-- `--dir` — working directory for the agent. Always point at this repo.
-- `-c` / `-s <sessionID>` — continue the last / a specific session to iterate with context intact.
-- `--title` — name the session so it's findable later via `opencode session list`.
-- `--format json` — raw event stream if output needs parsing.
-- `--variant high` — bump reasoning effort for hard protocol work.
-- `-f <file>` — attach files (e.g., a spec) to the message.
+- Run it with Bash `run_in_background: true`; the final assistant message lands on stdout.
+- Exit 3 = watchdog aborted at the deadline (prints the sessionID — inspect partial work
+  on disk, then `--continue` that session).
+- The server is auto-started on 127.0.0.1:4096 if not running (`/tmp/opencode-serve.log`).
+- Model default: `ai/vercel-ent/zai/glm-5.2` (override with OPENCODE_PROVIDER/OPENCODE_MODEL).
+- Under the hood: `POST /session?directory=...` (with `permission:[{permission:"*",pattern:"*",action:"allow"}]`),
+  `POST /session/:id/prompt_async` (204, non-blocking), poll `/session/status` +
+  `/session/:id/message`, `POST /session/:id/abort` on deadline.
 
-Session management:
+Session management (inspection/debugging):
 ```bash
 opencode session list            # find previous sessions
 opencode run -s <id> "fix ..."   # continue a session with its context

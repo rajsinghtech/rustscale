@@ -562,6 +562,61 @@ pub extern "C" fn ts_clear_exit_node(handle: c_int) -> c_int {
 }
 
 // ---------------------------------------------------------------------------
+// Serve (TCP forwarding)
+// ---------------------------------------------------------------------------
+
+/// Configure TCP forwarding on `port` to `backend_addr` (e.g. "127.0.0.1:8080").
+/// This sets a minimal serve config with a single TCP-forward handler. Returns
+/// 0 on success, a negative errno-style code on error. Requires the server to
+/// be up in netstack mode.
+#[no_mangle]
+pub extern "C" fn ts_serve_tcp(handle: c_int, port: u16, backend_addr: *const c_char) -> c_int {
+    catch("ts_serve_tcp", || {
+        let Some(backend) = cstr_to_string(backend_addr) else {
+            let mut t = table().lock().expect("table poisoned");
+            set_server_error(&mut t, handle, "null backend_addr");
+            return RS_ERR_INVAL;
+        };
+
+        let server_arc = {
+            let t = table().lock().expect("table poisoned");
+            let Some(e) = t.servers.get(&handle) else {
+                return RS_ERR_NOENT;
+            };
+            let Some(arc) = &e.server else {
+                let mut t = table().lock().expect("table poisoned");
+                set_server_error(&mut t, handle, "server not up");
+                return RS_ERR_BUSY;
+            };
+            arc.clone()
+        };
+
+        let mut cfg = rustscale_tsnet::ServeConfig::default();
+        cfg.TCP.insert(
+            port,
+            rustscale_tsnet::TCPPortHandler {
+                TCPForward: backend,
+                ..Default::default()
+            },
+        );
+
+        let result = {
+            let server = server_arc.lock().expect("server mutex poisoned");
+            runtime().block_on(server.set_serve_config(cfg))
+        };
+
+        match result {
+            Ok(_) => RS_OK,
+            Err(e) => {
+                let mut t = table().lock().expect("table poisoned");
+                set_server_error(&mut t, handle, e.to_string());
+                RS_ERR_UNKNOWN
+            }
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Listen + Accept
 // ---------------------------------------------------------------------------
 

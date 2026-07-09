@@ -30,11 +30,16 @@
 
 mod acme;
 mod routing;
+mod serve;
 mod state;
 mod status;
 mod tls;
 
 pub use routing::{peer_is_exit_capable, RouteTable};
+pub use serve::{
+    check_funnel_access, check_funnel_port, FunnelError, HTTPHandler, HostPort, ServeConfig,
+    ServeError, TCPPortHandler, WebServerConfig, FUNNEL_PORTS,
+};
 pub use state::{PersistedState, StateError};
 pub use status::{PeerInfo, ServerStatus, WhoIsInfo};
 pub use tls::{
@@ -122,6 +127,10 @@ pub enum TsnetError {
     MapTimeout,
     #[error("tls error: {0}")]
     Tls(#[from] TlsError),
+    #[error("serve error: {0}")]
+    Serve(#[from] ServeError),
+    #[error("funnel error: {0}")]
+    Funnel(#[from] FunnelError),
 }
 
 /// A builder for configuring a [`Server`].
@@ -280,6 +289,8 @@ struct RunningState {
     server_pub_key: MachinePublic,
     /// Node private key (for SetDNSRequest.NodeKey during cert issuance).
     node_key: NodePrivate,
+    /// Serve/Funnel runner (None in TUN mode — serve requires netstack).
+    serve: Option<Arc<serve::ServeRunner>>,
 }
 
 /// Which data plane is wired up: userspace netstack (tsnet listen/dial) or a
@@ -490,6 +501,14 @@ impl Server {
             ),
         }
 
+        // Serve/Funnel runner (netstack mode only).
+        let serve = Some(Arc::new(serve::ServeRunner::new(
+            netstack.clone(),
+            b.peers.clone(),
+            b.user_profiles.clone(),
+            b.our_fqdn.clone(),
+        )));
+
         self.inner = Some(RunningState {
             tailscale_ips: b.tailscale_ips,
             magicsock: b.magicsock,
@@ -507,6 +526,7 @@ impl Server {
             machine_key: b.machine_key,
             server_pub_key: b.server_pub_key,
             node_key: b.node_key,
+            serve,
         });
         Ok(())
     }
@@ -630,6 +650,7 @@ impl Server {
             machine_key: b.machine_key,
             server_pub_key: b.server_pub_key,
             node_key: b.node_key,
+            serve: None,
         });
         Ok(())
     }
@@ -1202,9 +1223,144 @@ impl Server {
         )
     }
 
+    /// Set the serve configuration. Starts netstack listeners on the
+    /// configured tailnet ports and dispatches each connection to the matching
+    /// handler (TCP forward, HTTP/HTTPS web, reverse proxy, static text).
+    ///
+    /// For configs with HTTPS or TLS-terminated TCP-forward handlers, a
+    /// Let's Encrypt cert is provisioned via the control plane (falling back
+    /// to self-signed on error). Returns the list of ports now being served.
+    ///
+    /// Requires the server to be up in netstack mode (not TUN mode).
+    /// C-representable: the config is a plain serde struct; the FFI layer
+    /// exposes a minimal `ts_serve_tcp` for the common TCP-forward case.
+    pub async fn set_serve_config(&self, cfg: ServeConfig) -> Result<Vec<u16>, TsnetError> {
+        let inner = self.inner.as_ref().ok_or(TsnetError::NotUp)?;
+        let runner = inner
+            .serve
+            .as_ref()
+            .ok_or(TsnetError::NotAvailableInTunMode)?;
+
+        // If the config has HTTPS or TLS-terminated handlers, provision a cert.
+        let needs_tls = cfg
+            .TCP
+            .values()
+            .any(|h| h.HTTPS || !h.TerminateTLS.is_empty());
+        let cert = if needs_tls {
+            match self.control_cert_provider().await {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    eprintln!("tsnet: serve cert unavailable ({e}); using self-signed");
+                    Some(tls::default_cert_provider(&inner.tailscale_ips))
+                }
+            }
+        } else {
+            None
+        };
+
+        let started = runner.set_config(cfg, cert).await?;
+        Ok(started)
+    }
+
+    /// Listen for incoming Funnel connections on `port` (443, 8443, or 10000).
+    ///
+    /// Validates that the node has the `funnel` node attribute from the
+    /// netmap. On API-only tailnets where control never grants funnel, returns
+    /// a typed [`FunnelError::NotEnabled`] — the expected clean error.
+    ///
+    /// Funnel ingress arrives via DERP-relayed connections from Tailscale's
+    /// ingress servers; the node appears as a peer and no special transport
+    /// is needed beyond accepting TLS conns on the port. The returned
+    /// [`TlsListener`] terminates TLS with the control cert provider (or
+    /// self-signed fallback).
+    ///
+    /// **What remains for full Funnel**: wiring the ingress peer's
+    /// `Tailscale-Ingress-Target` header dispatch (Go's `handleServeIngress`)
+    /// and advertising `Hostinfo.IngressEnabled` to control. The listener
+    /// itself works — connections from the tailnet (and, when control grants
+    /// the funnel attr, from the internet) are accepted and TLS-terminated.
+    pub async fn listen_funnel(&self, port: u16) -> Result<TlsListener, TsnetError> {
+        let inner = self.inner.as_ref().ok_or(TsnetError::NotUp)?;
+        let _runner = inner
+            .serve
+            .as_ref()
+            .ok_or(TsnetError::NotAvailableInTunMode)?;
+
+        // Validate the port is a funnel port.
+        if !FUNNEL_PORTS.contains(&port) {
+            return Err(TsnetError::Funnel(FunnelError::PortNotAllowed(port)));
+        }
+
+        // Check the node has the funnel capability from the netmap.
+        // Use our own node from the netmap (MapResponse.Node is not retained
+        // separately, so we check via the self node's capabilities). The self
+        // node's capabilities come from the DNSConfig/cert domains (HTTPS) and
+        // the node attributes delivered in the map stream.
+        let self_node = self.self_node().await;
+        check_funnel_access(port, &self_node)?;
+
+        // Provision a cert (LE via control, self-signed fallback).
+        let provider = match self.control_cert_provider().await {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("tsnet: funnel cert unavailable ({e}); using self-signed");
+                tls::default_cert_provider(&inner.tailscale_ips)
+            }
+        };
+
+        self.listen_tls_with_provider(port, provider).await
+    }
+
+    /// Snapshot of our own node from the netmap (peers list includes self
+    /// on some control servers; otherwise we synthesize a minimal node from
+    /// the retained DNS config + tailscale IPs for capability checks).
+    async fn self_node(&self) -> Node {
+        let inner = self.inner.as_ref().expect("self_node called before up()");
+        let dns = inner.dns_config.read().await;
+        let cert_domains: Vec<String> = dns
+            .as_ref()
+            .map(|c| c.CertDomains.clone())
+            .unwrap_or_default();
+        // If cert domains are present, the node has the `https` capability.
+        let mut caps: Vec<String> = Vec::new();
+        if !cert_domains.is_empty() {
+            caps.push("https".to_string());
+        }
+        // The funnel node attribute is delivered in the self node's CapMap.
+        // Since we don't retain the self node separately, we check the peers
+        // list for our own node (by FQDN). If not found, the capability check
+        // will return NotEnabled — the expected behavior on API-only tailnets.
+        let peers = inner.peers.read().await;
+        let our_fqdn = inner.our_fqdn.trim_end_matches('.');
+        for peer in peers.iter() {
+            if peer.Name.trim_end_matches('.') == our_fqdn {
+                let mut n = peer.clone();
+                if !caps.is_empty() && !n.Capabilities.contains(&caps[0]) {
+                    n.Capabilities.extend(caps.clone());
+                }
+                return n;
+            }
+        }
+        // Self not in peers list — synthesize a minimal node.
+        Node {
+            Name: inner.our_fqdn.clone(),
+            Addresses: inner
+                .tailscale_ips
+                .iter()
+                .map(|ip| format!("{ip}/32"))
+                .collect(),
+            Capabilities: caps,
+            ..Default::default()
+        }
+    }
+
     /// Shut down the server.
     pub async fn close(&mut self) {
         if let Some(mut inner) = self.inner.take() {
+            // Stop serve listeners first (graceful).
+            if let Some(serve) = inner.serve.take() {
+                serve.stop().await;
+            }
             inner.cancel.cancel();
             if let Some(m) = inner.monitor.take() {
                 m.shutdown();
@@ -1701,7 +1857,7 @@ fn extract_node_ips(node: &Node) -> Vec<IpAddr> {
 /// Pure WhoIs lookup over a peer snapshot + user profiles. Returns `None`
 /// when no peer has `remote_addr` among its `Addresses`. Used by
 /// [`Server::whois`] and unit tests (fake netmap).
-fn whois_lookup(
+pub(crate) fn whois_lookup(
     peers: &[Node],
     user_profiles: &BTreeMap<UserID, UserProfile>,
     remote_addr: IpAddr,

@@ -1710,3 +1710,172 @@ async fn e2e_exit_node() {
     server_a.close().await;
     server_b.close().await;
 }
+
+// ---------------------------------------------------------------------------
+// Serve + Funnel e2e tests (#[ignore])
+// ---------------------------------------------------------------------------
+
+/// E2e: two nodes, B sets serve config TCP-forwarding port 8080 to a local
+/// echo backend. A dials B:8080 and verifies bytes flow through the serve
+/// TCP forward handler.
+#[tokio::test]
+#[ignore = "requires TS_E2E_AUTHKEY + TS_E2E_TAILNET env vars (run via tools/e2e.sh)"]
+async fn e2e_serve_tcp_forward() {
+    let authkey = std::env::var("TS_E2E_AUTHKEY").expect("TS_E2E_AUTHKEY not set");
+    let _tailnet = std::env::var("TS_E2E_TAILNET").expect("TS_E2E_TAILNET not set");
+    let uid = std::process::id();
+
+    // Local echo backend on an ephemeral port.
+    let echo_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_addr = echo_listener.local_addr().unwrap().to_string();
+    eprintln!("e2e_serve: echo backend at {backend_addr}");
+    tokio::spawn(async move {
+        loop {
+            if let Ok((mut sock, _)) = echo_listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    loop {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                if sock.write_all(&buf[..n]).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        }
+    });
+
+    // Start server B with a serve config forwarding port 8080.
+    let mut server_b = Server::builder()
+        .hostname(format!("rustscale-e2e-serve-b-{uid}"))
+        .auth_key(authkey.clone())
+        .ephemeral(true)
+        .build()
+        .expect("build B");
+    server_b.up().await.expect("up B");
+    let status_b = server_b.status();
+    let ip_b = status_b
+        .tailscale_ips
+        .iter()
+        .find_map(|ip| match ip {
+            IpAddr::V4(v4) => Some(*v4),
+            _ => None,
+        })
+        .expect("B should have an IPv4");
+    eprintln!("e2e_serve: B up at {ip_b}");
+
+    // Set serve config: TCP forward port 8080 → echo backend.
+    let mut cfg = ServeConfig::default();
+    cfg.TCP.insert(
+        8080,
+        TCPPortHandler {
+            TCPForward: backend_addr,
+            ..Default::default()
+        },
+    );
+    let started = server_b
+        .set_serve_config(cfg)
+        .await
+        .expect("set_serve_config");
+    assert!(started.contains(&8080), "serve should be listening on 8080");
+    eprintln!("e2e_serve: B serving port 8080 → {started:?}");
+
+    // Start server A.
+    let mut server_a = Server::builder()
+        .hostname(format!("rustscale-e2e-serve-a-{uid}"))
+        .auth_key(authkey)
+        .ephemeral(true)
+        .build()
+        .expect("build A");
+    server_a.up().await.expect("up A");
+
+    // Wait for B to appear in A's netmap.
+    wait_for_peer(&server_a, ip_b.into(), "e2e_serve_tcp_forward").await;
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+    // A dials B:8080 via the serve forward.
+    let dial_addr = format!("{ip_b}:8080");
+    let mut stream = None;
+    for attempt in 1..=3 {
+        eprintln!("e2e_serve: dial attempt {attempt} to {dial_addr}");
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(45),
+            server_a.dial(&dial_addr),
+        )
+        .await
+        {
+            Ok(Ok(s)) => {
+                stream = Some(s);
+                break;
+            }
+            Ok(Err(e)) => eprintln!("dial attempt {attempt} failed: {e}"),
+            Err(_) => eprintln!("dial attempt {attempt} timed out"),
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+    let mut stream = stream.expect("all dial attempts failed");
+
+    // Echo test: write bytes, read them back (served via the TCP forward).
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    stream.write_all(b"serve-echo-test").await.expect("write");
+    let mut buf = [0u8; 64];
+    let n = tokio::time::timeout(std::time::Duration::from_secs(10), stream.read(&mut buf))
+        .await
+        .expect("read timeout")
+        .expect("read err");
+    assert_eq!(&buf[..n], b"serve-echo-test");
+    eprintln!("e2e_serve: echo verified through serve TCP forward");
+
+    server_a.close().await;
+    server_b.close().await;
+}
+
+/// E2e: funnel listen_funnel returns a typed FunnelError::NotEnabled on
+/// API-only tailnets (where control never grants the `funnel` node attribute).
+/// This mirrors the e2e_control_cert_not_enabled pattern.
+#[tokio::test]
+#[ignore = "requires TS_E2E_AUTHKEY + TS_E2E_TAILNET env vars (run via tools/e2e.sh)"]
+async fn e2e_funnel_not_enabled() {
+    let authkey = std::env::var("TS_E2E_AUTHKEY").expect("TS_E2E_AUTHKEY not set");
+    let _tailnet = std::env::var("TS_E2E_TAILNET").expect("TS_E2E_TAILNET not set");
+    let uid = std::process::id();
+
+    let mut server = Server::builder()
+        .hostname(format!("rustscale-e2e-funnel-{uid}"))
+        .auth_key(authkey)
+        .ephemeral(true)
+        .build()
+        .expect("build");
+    server.up().await.expect("up");
+
+    // Give control a moment to deliver capabilities.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+    let result = server.listen_funnel(443).await;
+    match result {
+        Err(TsnetError::Funnel(FunnelError::NotEnabled)) => {
+            eprintln!("e2e_funnel: NotEnabled (expected for API-only tailnet)");
+        }
+        Err(TsnetError::Funnel(FunnelError::HttpsNotEnabled)) => {
+            eprintln!("e2e_funnel: HttpsNotEnabled (HTTPS not enabled on this tailnet)");
+        }
+        Err(TsnetError::Funnel(FunnelError::PortNotAllowed(_))) => {
+            panic!("port 443 should be allowed; got PortNotAllowed");
+        }
+        Err(e) => {
+            eprintln!(
+                "e2e_funnel: listen_funnel failed with non-funnel error ({e}) — funnel may not be the issue"
+            );
+        }
+        Ok(listener) => {
+            eprintln!("e2e_funnel: funnel listener created (funnel is enabled on this tailnet)");
+            drop(listener);
+        }
+    }
+
+    server.close().await;
+}

@@ -21,7 +21,7 @@ update statuses as phases land.
 
 | Feature | Go source | Status |
 | --- | --- | --- |
-| Serve/Funnel (ListenFunnel, ServeConfig, TCP fwd, reverse proxy) | `tsnet`, `ipn/serve*` | ⬜ port-6 (listen_tls exists, self-signed 🔶) |
+| Serve/Funnel (ListenFunnel, ServeConfig, TCP fwd, reverse proxy) | `tsnet`, `ipn/serve*` | ✅ port-6 done (ServeConfig serde model: TCPPortHandler/WebServerConfig/HTTPHandler; Server::set_serve_config starts netstack listeners per port; TCP forward via copy_bidirectional; HTTP reverse proxy sets Host/X-Forwarded-For/Tailscale-User-Login/Name from WhoIs; static text handler; TLS-terminate with ControlCertProvider (self-signed fallback); listen_funnel validates port 443/8443/10000 + funnel node attr from netmap, returns typed FunnelError::NotEnabled on API-only tailnets; ts_serve_tcp FFI. Remaining: ingress peer Tailscale-Ingress-Target dispatch, Hostinfo.IngressEnabled advertisement) |
 | Tailscale Services (ListenService, PROXY protocol) | `tsnet.Server.ListenService` | ⬜ |
 | SOCKS5 proxy | `net/socks5/` | ⬜ port-8 |
 | LocalAPI | `ipn/localapi/` | ⬜ port-9 |

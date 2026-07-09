@@ -118,6 +118,14 @@ int ts_listener_close(int listener);
 int ts_new(void);
 
 /**
+ * Configure TCP forwarding on `port` to `backend_addr` (e.g. "127.0.0.1:8080").
+ * This sets a minimal serve config with a single TCP-forward handler. Returns
+ * 0 on success, a negative errno-style code on error. Requires the server to
+ * be up in netstack mode.
+ */
+int ts_serve_tcp(int handle, uint16_t port, const char *backend_addr);
+
+/**
  * Set the auth key.
  */
 int ts_set_authkey(int handle, const char *authkey);

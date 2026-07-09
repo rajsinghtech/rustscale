@@ -161,6 +161,29 @@ impl DerpClient {
         self.public_key.clone()
     }
 
+    /// Our own private key (for callers that need to decrypt received packets
+    /// after splitting the stream).
+    pub fn private_key(&self) -> NodePrivate {
+        self.private_key.clone()
+    }
+
+    /// Consume the client and split the underlying stream into read and write
+    /// halves, enabling concurrent reads and writes from separate tasks.
+    ///
+    /// Also returns the server's public key, which is needed to decrypt
+    /// `ReceivedPacket` frames read from the split stream.
+    pub fn into_split(
+        self,
+    ) -> (
+        tokio::io::ReadHalf<Box<dyn DerpStream>>,
+        tokio::io::WriteHalf<Box<dyn DerpStream>>,
+        NodePublic,
+    ) {
+        let server_key = self.server_key.clone();
+        let (r, w) = tokio::io::split(self.stream);
+        (r, w, server_key)
+    }
+
     // ---- handshake ----
 
     async fn recv_server_key(&mut self) -> Result<(), DerpError> {

@@ -31,6 +31,9 @@ rustls = { version = "0.23", features = ["ring"] }
 chacha20poly1305 = "0.10"
 blake2 = "0.10"
 
+# WireGuard userspace tunnel engine (noise::Tunn API only — not the device layer).
+boringtun = "0.7"
+
 # Shared lint policy: pedantic where sane, but allow the noisier style lints so
 # that the default `cargo clippy` run stays clean and readable.
 [workspace.lints.rust]

@@ -1,0 +1,24 @@
+[package]
+name = "rustscale-magicsock"
+description = "Path-selection engine for rustscale (direct/DERP/peer-relay)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rustscale-key = { path = "../key", version = "0.1.0" }
+rustscale-tailcfg = { path = "../tailcfg", version = "0.1.0" }
+rustscale-disco = { path = "../disco", version = "0.1.0" }
+rustscale-derp = { path = "../derp", version = "0.1.0" }
+thiserror.workspace = true
+tokio.workspace = true
+bytes.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+rustscale-key = { path = "../key", version = "0.1.0" }

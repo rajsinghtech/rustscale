@@ -95,3 +95,22 @@ Guard the job with `if: github.repository == 'rajsinghtech/rustscale'`.
 2. Persist the child oauthClient creds for the tailnet's whole lifetime.
 3. Name tailnets `rustscale-<purpose>-<unix ts>` so leaks are identifiable.
 4. Never commit `.secrets/`.
+
+## Tailnet settings API (verified live 2026-07-09)
+
+The child oauthClient CAN update its own tailnet's settings via
+`PATCH /api/v2/tailnet/<id>/settings` (200, takes effect immediately):
+
+```bash
+CHILD_TOKEN=$(tools/tailnet/ts-child-token.sh "$CID" "$CSEC")
+curl -X PATCH "$TS_API_BASE_URL/api/v2/tailnet/$TID/settings" \
+  -H "Authorization: Bearer $CHILD_TOKEN" -H 'Content-Type: application/json' \
+  --data '{"httpsEnabled": true}'
+```
+
+Notable settings: `httpsEnabled` (enables HTTPS cert provisioning — after
+this, `MapResponse.DNSConfig.CertDomains` is populated and the ACME DNS-01
+flow via `/machine/set-dns` can be e2e-tested on an ephemeral tailnet),
+`devicesApprovalOn`, `devicesKeyDurationDays`, `regionalRoutingOn`,
+`networkFlowLoggingOn`. This removes the old "API-only tailnets can't test
+HTTPS" limitation that deferred the ACME order client in port-1.

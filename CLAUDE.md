@@ -90,6 +90,23 @@ same WIF client as tailgate. **The org client has only the `tailnets` scope, so 
 must save the child `oauthClient` creds from every create response — they are the only
 way to delete that tailnet.** Always clean up tailnets in test teardown.
 
+## Roadmap (agreed with user, in order)
+
+1–6. Core stack through TUN mode (phases 1–5 done through tsnet; TUN next).
+7. **Packet filter** — enforce MapResponse filter rules (correctness gate; port wgengine/filter).
+8. **FFI / libtailscale** — C ABI over tsnet + Python/Node/Swift/Kotlin bindings. The strategic
+   differentiator vs Go (no runtime to embed). **Constraint that applies NOW: keep the tsnet
+   public API C-representable** — no generics/lifetimes/async in the public surface that can't
+   map to a C handle model; prefer opaque handles + plain data structs at the boundary.
+9. **Mobile/constrained targets** — iOS NetworkExtension (<50MB), Android, OpenWrt/musl static;
+   size profiling and feature-gated deps.
+10. **Perf data plane** — UDP GSO/GRO, io_uring TUN+socket path, batched magicsock IO;
+    iperf3 benchmark harness vs tailscaled in CI.
+11. **Serve/Funnel + certs + MagicDNS** — ListenTLS/ListenFunnel, LE certs via control,
+    in-netstack DNS resolver.
+12. **SSH server, exit node/subnet routes, Taildrop.**
+13. **DERP + peer relay server** in Rust (reuse frame codec).
+
 ## Reference sources (read-only)
 
 - `/Users/rajsingh/Documents/GitHub/tailscale` — the Go implementation. Key dirs:

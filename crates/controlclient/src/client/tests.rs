@@ -119,3 +119,65 @@ fn register_response_auth_url() {
     let back: RegisterResponse = serde_json::from_str(&j).unwrap();
     assert_eq!(back, resp);
 }
+
+/// Real-register probe: dial controlplane.tailscale.com, complete the Noise
+/// handshake, establish HTTP/2, and send a register request with a bogus
+/// auth key. The server should return a structured response (either a
+/// RegisterResponse with an error, or an HTTP error status) — NOT a JSON
+/// parse failure at column 1 (which would indicate we're not speaking HTTP/2
+/// correctly).
+///
+/// #[ignore] because it requires network access.
+#[tokio::test]
+#[ignore = "requires network access to controlplane.tailscale.com"]
+async fn real_register_gets_structured_response() {
+    use crate::controlbase::ProtocolVersion;
+    use crate::controlhttp::fetch_server_pub_key;
+    use rustscale_key::MachinePrivate;
+    use rustscale_tailcfg::{Hostinfo, RegisterRequest};
+
+    let host = "controlplane.tailscale.com";
+    let version: ProtocolVersion = 141;
+
+    // Fetch the server's Noise public key.
+    let server_key = fetch_server_pub_key(host, version)
+        .await
+        .expect("fetch_server_pub_key should succeed");
+
+    // Generate our machine key.
+    let machine_key = MachinePrivate::generate();
+
+    // Create the control client.
+    let cc = crate::client::ControlClient::new(host, machine_key.clone(), server_key.clone(), version);
+
+    // Send a register request with a bogus node key (no auth key).
+    // The server should return a structured response, not a parse error.
+    let req = RegisterRequest {
+        Version: 141,
+        NodeKey: rustscale_key::NodePrivate::generate().public(),
+        Hostinfo: Some(Hostinfo {
+            OS: "linux".to_string(),
+            Hostname: "rustscale-probe".to_string(),
+            ..Default::default()
+        }),
+        Ephemeral: true,
+        ..Default::default()
+    };
+
+    let result = cc.register(&req).await;
+
+    // The key assertion: we should get a structured error (not a JSON parse
+    // failure at column 1). Acceptable outcomes:
+    // - Ok(RegisterResponse) with some error/auth fields
+    // - Err(RegisterError::HttpStatus(..)) — HTTP error status
+    // - Err(RegisterError::Server(..)) — server error in RegisterResponse
+    // NOT acceptable: Err(RegisterError::Json(..)) — means we got non-JSON
+    match &result {
+        Ok(_resp) => {}
+        Err(RegisterError::HttpStatus(_code, _msg)) => {}
+        Err(RegisterError::Json(e)) => {
+            panic!("JSON parse failure (indicates HTTP/2 not working): {e}");
+        }
+        Err(_e) => {}
+    }
+}

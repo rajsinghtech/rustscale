@@ -132,11 +132,44 @@ pub type CapabilityVersion = i32;
 /// `https://tailscale.com/cap/is-admin` (matches Go's `tailcfg.NodeCapability`).
 pub type NodeCapability = String;
 
-/// A raw encoded JSON value, like Go's `json.RawMessage` but string-backed
-/// (matches Go's `tailcfg.RawMessage`). Serializes as `null` when empty.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
+/// A raw encoded JSON value, like Go's `json.RawMessage`.
+///
+/// Captures the raw JSON text of any value (string, number, boolean, object,
+/// array, null) without interpreting it. This is needed because Go's
+/// `json.RawMessage` is `[]byte` that delays deserialization, and the
+/// `NodeCapMap` values can be any JSON type.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct RawMessage(pub String);
+
+impl Serialize for RawMessage {
+    fn serialize<S>(&self, s: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        if self.0.is_empty() {
+            return s.serialize_none();
+        }
+        // The inner string contains valid JSON text; parse and re-serialize
+        // to embed as raw JSON content.
+        let value: serde_json::Value =
+            serde_json::from_str(&self.0).map_err(serde::ser::Error::custom)?;
+        value.serialize(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for RawMessage {
+    fn deserialize<D>(d: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(d)?;
+        if value.is_null() {
+            Ok(Self::default())
+        } else {
+            Ok(Self(value.to_string()))
+        }
+    }
+}
 
 /// Serde helper: skip a field whose value equals its `Default` (mirrors Go's
 /// `omitempty`/`omitzero` for scalars, strings, Vecs, and Options).
@@ -145,6 +178,16 @@ where
     T: Default + PartialEq,
 {
     *v == T::default()
+}
+
+/// Serde helper: deserialize `null` as `Default` (Go nil slices marshal as `null`).
+pub(crate) fn deserialize_null_to_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    let opt: Option<T> = Option::deserialize(deserializer)?;
+    Ok(opt.unwrap_or_default())
 }
 
 /// Serde helper: skip a key field when it is the all-zero key.
@@ -189,6 +232,26 @@ pub mod int_key {
                     .map_err(serde::de::Error::custom)
             })
             .collect()
+    }
+
+    /// Deserialize with null-to-default handling (Go nil maps marshal as null).
+    pub fn deserialize_null<'de, D, V>(d: D) -> Result<BTreeMap<i32, V>, D::Error>
+    where
+        D: Deserializer<'de>,
+        V: Deserialize<'de>,
+    {
+        let opt: Option<BTreeMap<String, V>> = Option::deserialize(d)?;
+        match opt {
+            Some(raw) => raw
+                .into_iter()
+                .map(|(k, v)| {
+                    k.parse::<i32>()
+                        .map(|k| (k, v))
+                        .map_err(serde::de::Error::custom)
+                })
+                .collect(),
+            None => Ok(BTreeMap::new()),
+        }
     }
 }
 

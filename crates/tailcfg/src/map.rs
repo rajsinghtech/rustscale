@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use rustscale_key::{DiscoPublic, NodePublic};
 
 use crate::{skip_default, skip_zero_disco, CapabilityVersion, DERPMap, Node, NodeID};
+use crate::deserialize_null_to_default;
 
 /// Sent by a client to update its state and/or long-poll network-map updates.
 ///
@@ -68,13 +69,13 @@ pub struct MapResponse {
     #[serde(default, skip_serializing_if = "skip_default")]
     pub DERPMap: Option<DERPMap>,
     /// Complete peer list (first response); sorted by `Node.ID`.
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(default, skip_serializing_if = "skip_default", deserialize_with = "deserialize_null_to_default")]
     pub Peers: Vec<Node>,
     /// Changed/added peers since the last update; sorted by `Node.ID`.
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(default, skip_serializing_if = "skip_default", deserialize_with = "deserialize_null_to_default")]
     pub PeersChanged: Vec<Node>,
     /// Node IDs no longer in the peer list.
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(default, skip_serializing_if = "skip_default", deserialize_with = "deserialize_null_to_default")]
     pub PeersRemoved: Vec<NodeID>,
     /// The tailnet domain name; empty means unchanged.
     #[serde(default, skip_serializing_if = "skip_default")]

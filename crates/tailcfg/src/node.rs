@@ -9,9 +9,28 @@ use serde::{Deserialize, Serialize};
 use rustscale_key::{DiscoPublic, MachinePublic, NodePublic};
 
 use crate::{
-    skip_default, skip_zero_disco, skip_zero_machine, CapabilityVersion, NodeCapability, NodeID,
-    OptBool, RawMessage, StableNodeID, UserID,
+    deserialize_null_to_default, skip_default, skip_zero_disco, skip_zero_machine,
+    CapabilityVersion, NodeCapability, NodeID, OptBool, RawMessage, StableNodeID, UserID,
 };
+
+/// Deserialize a `NodeCapMap`, treating `null` values inside the map as empty
+/// vectors (Go's nil slices marshal as `null`).
+fn deserialize_capmap<'de, D>(deserializer: D) -> Result<NodeCapMap, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt: Option<BTreeMap<String, Option<Vec<RawMessage>>>> = Option::deserialize(deserializer)?;
+    match opt {
+        None => Ok(NodeCapMap::new()),
+        Some(raw) => {
+            let mut map = NodeCapMap::new();
+            for (k, v) in raw {
+                map.insert(k, v.unwrap_or_default());
+            }
+            Ok(map)
+        }
+    }
+}
 
 /// A Tailscale device in a tailnet (subset of Go's `tailcfg.Node`).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -36,13 +55,14 @@ pub struct Node {
     #[serde(default, skip_serializing_if = "skip_zero_disco")]
     pub DiscoKey: DiscoPublic,
     /// Tailscale IP prefixes of this node (e.g. `"100.64.0.1/32"`).
+    #[serde(default, deserialize_with = "deserialize_null_to_default")]
     pub Addresses: Vec<String>,
     /// IP ranges to route to this node. Nil is special (means "same as
     /// Addresses"); an empty non-nil vec means "none".
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(default, skip_serializing_if = "skip_default", deserialize_with = "deserialize_null_to_default")]
     pub AllowedIPs: Vec<String>,
     /// Public UDP endpoints (IP:port) discovered via STUN / LANs.
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(default, skip_serializing_if = "skip_default", deserialize_with = "deserialize_null_to_default")]
     pub Endpoints: Vec<String>,
     /// DERP region ID of the node's home DERP; 0 if unknown.
     #[serde(default, skip_serializing_if = "skip_default")]
@@ -57,20 +77,22 @@ pub struct Node {
     #[serde(default, skip_serializing_if = "skip_default")]
     pub Cap: CapabilityVersion,
     /// ACL tags applied to the node (e.g. `tag:prod`).
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(default, skip_serializing_if = "skip_default", deserialize_with = "deserialize_null_to_default")]
     pub Tags: Vec<String>,
     /// Whether the node is currently connected to control; `None` = unknown.
     #[serde(default, skip_serializing_if = "skip_default")]
     pub Online: Option<bool>,
     /// Deprecated free-form capability URLs.
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(default, skip_serializing_if = "skip_default", deserialize_with = "deserialize_null_to_default")]
     pub Capabilities: Vec<NodeCapability>,
-    /// Map of capabilities to optional argument/data values.
-    #[serde(default, skip_serializing_if = "skip_default")]
+    /// Map of capabilities to optional argument/data values. Values may be
+    /// `null` on the wire (Go nil slices); we treat null as empty.
+    #[serde(default, skip_serializing_if = "skip_default", deserialize_with = "deserialize_capmap")]
     pub CapMap: NodeCapMap,
 }
 
 /// `Node.CapMap` — capabilities to optional `RawMessage` argument lists.
+/// Values may be `null` on the wire (Go nil slices); we treat null as empty.
 pub type NodeCapMap = BTreeMap<NodeCapability, Vec<RawMessage>>;
 
 /// Host information advertised by a node (subset of Go's `tailcfg.Hostinfo`).
@@ -95,7 +117,7 @@ pub struct Hostinfo {
     #[serde(default, skip_serializing_if = "skip_default")]
     pub Hostname: String,
     /// Services advertised by this machine.
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(default, skip_serializing_if = "skip_default", deserialize_with = "deserialize_null_to_default")]
     pub Services: Vec<Service>,
 }
 

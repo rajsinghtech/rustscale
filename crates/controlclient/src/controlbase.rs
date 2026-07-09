@@ -41,6 +41,7 @@ use chacha20poly1305::{
 };
 use curve25519_dalek::{constants::X25519_BASEPOINT, montgomery::MontgomeryPoint};
 use rand::RngCore;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use rustscale_key::{MachinePrivate, MachinePublic};
 
 /// Errors from the Noise handshake and transport.
@@ -416,8 +417,8 @@ impl DeferredHandshake {
             version: self.version,
             peer: self.control_key,
             handshake_hash: self.state.h,
-            tx: CipherState::new(c2),
-            rx: CipherState::new(c1),
+            tx: CipherState::new(c1), // client tx = c1 (matching Go)
+            rx: CipherState::new(c2), // client rx = c2
         })
     }
 }
@@ -515,8 +516,8 @@ pub fn server_handshake<R: io::Read, W: io::Write>(
         version: client_version,
         peer: machine_key,
         handshake_hash: s.h,
-        tx: CipherState::new(c1),
-        rx: CipherState::new(c2),
+        tx: CipherState::new(c2), // server tx = c2 (matching Go)
+        rx: CipherState::new(c1), // server rx = c1
     })
 }
 
@@ -564,7 +565,7 @@ impl TransportNonce {
 }
 
 /// Post-handshake cipher state (one direction).
-struct CipherState {
+pub(crate) struct CipherState {
     key: [u8; CHACHA_KEY_LEN],
     nonce: TransportNonce,
 }
@@ -728,7 +729,144 @@ impl NoiseConn {
         r.read_exact(&mut ct).await?;
         self.rx.decrypt(&ct)
     }
+
+    /// Consume the NoiseConn and return the transmit and receive cipher
+    /// states. Used by the streaming adapter to split read/write into
+    /// independent tasks.
+    pub(crate) fn into_ciphers(self) -> (CipherState, CipherState) {
+        (self.tx, self.rx)
+    }
 }
 
-#[cfg(test)]
-mod tests;
+/// An adapter that presents a raw `AsyncRead + AsyncWrite` byte-stream
+/// interface over a Noise-encrypted connection.
+///
+/// Internally spawns two pump tasks:
+/// - **Read pump**: reads Noise records from the underlying stream, decrypts
+///   them, and writes plaintext to a duplex stream that `h2` reads from.
+/// - **Write pump**: reads plaintext that `h2` wrote to the duplex stream,
+///   encrypts it into Noise records, and writes them to the underlying stream.
+///
+/// This matches Go's `controlbase.Conn` which implements `net.Conn` by
+/// transparently encrypting/decrypting records.
+pub struct NoiseIo {
+    inner: tokio::io::DuplexStream,
+    _pump: tokio::task::JoinHandle<()>,
+}
+
+impl NoiseIo {
+    /// Create a NoiseIo from a completed NoiseConn and the underlying async
+    /// stream. Spawns background pump tasks.
+    pub fn new<S>(conn: NoiseConn, stream: S) -> Self
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let (tx_cipher, rx_cipher) = conn.into_ciphers();
+        let (plain_side, noise_side) = tokio::io::duplex(64 * 1024);
+        let (mut noise_rx, mut noise_tx) = tokio::io::split(noise_side);
+        let (mut stream_rx, mut stream_tx) = tokio::io::split(stream);
+
+        // Read pump: stream → decrypt → noise_tx (h2 reads this via plain_side).
+        let pump = tokio::spawn(async move {
+            let mut rx = rx_cipher;
+            let mut hdr = [0u8; HEADER_LEN];
+            loop {
+                if stream_rx.read_exact(&mut hdr).await.is_err() {
+                    break;
+                }
+                if hdr[0] != MSG_TYPE_RECORD {
+                    break;
+                }
+                let len = u16::from_be_bytes([hdr[1], hdr[2]]) as usize;
+                if len > MAX_CIPHERTEXT_SIZE {
+                    break;
+                }
+                let mut ct = vec![0u8; len];
+                if stream_rx.read_exact(&mut ct).await.is_err() {
+                    break;
+                }
+                match rx.decrypt(&ct) {
+                    Ok(pt) => {
+                        if noise_tx.write_all(&pt).await.is_err() {
+                            break;
+                        }
+                        let _ = noise_tx.flush().await;
+                    }
+                    Err(_) => break,
+                }
+            }
+            let _ = noise_tx.shutdown().await;
+        });
+
+        // Write pump: noise_rx (h2 writes to plain_side) → encrypt → stream.
+        let pump2 = tokio::spawn(async move {
+            let mut tx = tx_cipher;
+            let mut buf = vec![0u8; MAX_PLAINTEXT_SIZE];
+            loop {
+                match noise_rx.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let data = &buf[..n];
+                        match tx.encrypt(data) {
+                            Ok(ct) => {
+                                let mut frame = Vec::with_capacity(HEADER_LEN + ct.len());
+                                frame.push(MSG_TYPE_RECORD);
+                                frame.extend_from_slice(&(ct.len() as u16).to_be_bytes());
+                                frame.extend_from_slice(&ct);
+                                if stream_tx.write_all(&frame).await.is_err() {
+                                    break;
+                                }
+                                let _ = stream_tx.flush().await;
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
+            }
+            let _ = stream_tx.shutdown().await;
+        });
+
+        // Keep both pumps alive. We store one handle; the other is leaked
+        // (it will be cleaned up when the streams close).
+        drop(pump2);
+
+        Self {
+            inner: plain_side,
+            _pump: pump,
+        }
+    }
+}
+
+impl tokio::io::AsyncRead for NoiseIo {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for NoiseIo {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}

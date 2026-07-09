@@ -24,15 +24,21 @@ chrono = { version = "0.4", features = ["serde"] }
 tokio = { version = "1", features = ["full"] }
 bytes = "1"
 crc32fast = "1"
-tokio-rustls = "0.26"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 webpki-roots = "0.26"
-rustls = { version = "0.23", features = ["ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 # Noise IK handshake primitives for controlbase (ts2021 control protocol).
 chacha20poly1305 = "0.10"
 blake2 = "0.10"
 
 # WireGuard userspace tunnel engine (noise::Tunn API only — not the device layer).
 boringtun = "0.7"
+
+# Userspace TCP/IP stack for tsnet-style dialing/listening.
+smoltcp = { version = "0.13", default-features = false, features = ["medium-ip", "proto-ipv4", "socket-tcp", "alloc"] }
+
+# HTTP/2 client for the Noise-tunneled control plane (ts2021).
+h2 = "0.4"
 
 # Shared lint policy: pedantic where sane, but allow the noisier style lints so
 # that the default `cargo clippy` run stays clean and readable.

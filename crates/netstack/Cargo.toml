@@ -1,0 +1,22 @@
+[package]
+name = "rustscale-netstack"
+description = "Userspace TCP/IP stack for rustscale (smoltcp over WireGuard)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rustscale-wg = { path = "../wg", version = "0.1.0" }
+rustscale-key = { path = "../key", version = "0.1.0" }
+smoltcp.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+rustscale-wg = { path = "../wg", version = "0.1.0" }
+rustscale-key = { path = "../key", version = "0.1.0" }

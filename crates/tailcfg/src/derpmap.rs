@@ -17,7 +17,11 @@ pub struct DERPMap {
     pub HomeParams: Option<DERPHomeParams>,
 
     /// Geographic regions, keyed by `RegionID`.
-    #[serde(default, with = "int_key")]
+    #[serde(
+        default,
+        serialize_with = "int_key::serialize",
+        deserialize_with = "int_key::deserialize_null"
+    )]
     pub Regions: BTreeMap<i32, DERPRegion>,
 
     /// When true, ignore Tailscale's default DERP servers.

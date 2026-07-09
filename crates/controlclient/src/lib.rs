@@ -15,5 +15,5 @@ pub mod controlbase;
 pub mod controlhttp;
 
 pub use client::{ControlClient, RegisterError, StreamMapError};
-pub use controlbase::{NoiseConn, NoiseError, ProtocolVersion};
-pub use controlhttp::{dial_control, DialError, NoiseStream};
+pub use controlbase::{NoiseConn, NoiseError, NoiseIo, ProtocolVersion};
+pub use controlhttp::{dial_control, fetch_server_pub_key, DialError, NoiseStream};

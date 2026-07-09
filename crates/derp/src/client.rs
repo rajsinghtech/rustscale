@@ -46,8 +46,18 @@ async fn write_frame_async<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
+/// Ensure the rustls ring crypto provider is installed process-wide.
+fn ensure_ring_provider() {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 /// Build a rustls ClientConfig with webpki roots.
 fn tls_config() -> rustls::ClientConfig {
+    ensure_ring_provider();
     let mut roots = rustls::RootCertStore::empty();
     roots
         .roots
@@ -120,14 +130,27 @@ impl DerpClient {
         use_tls: bool,
         private_key: NodePrivate,
     ) -> Result<Self, DerpError> {
-        let addr = format!("{host}:{port}");
+        Self::connect_with_upgrade_dial(host, host, port, use_tls, private_key).await
+    }
+
+    /// Connect with an HTTP upgrade, specifying separate TCP dial address and
+    /// TLS SNI hostname. `dial_addr` is used for the TCP connection; `tls_host`
+    /// is used for TLS SNI and the HTTP Host header.
+    pub async fn connect_with_upgrade_dial(
+        dial_addr: &str,
+        tls_host: &str,
+        port: u16,
+        use_tls: bool,
+        private_key: NodePrivate,
+    ) -> Result<Self, DerpError> {
+        let addr = format!("{dial_addr}:{port}");
         let tcp = TcpStream::connect(&addr).await?;
         tcp.set_nodelay(true).ok();
 
         let mut stream: Box<dyn DerpStream> = if use_tls {
             let config = tls_config();
             let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
-            let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
+            let server_name = rustls::pki_types::ServerName::try_from(tls_host.to_string())
                 .map_err(|e| DerpError::BadFrame(format!("invalid server name: {e}")))?;
             let tls = connector.connect(server_name, tcp).await?;
             Box::new(tls)
@@ -138,7 +161,7 @@ impl DerpClient {
         // Send HTTP upgrade with fast-start.
         let req = format!(
             "GET /derp HTTP/1.1\r\n\
-             Host: {host}\r\n\
+             Host: {tls_host}\r\n\
              Upgrade: DERP\r\n\
              Connection: Upgrade\r\n\
              {}: 1\r\n\

@@ -103,14 +103,22 @@ if [[ -n "${GCP_DRY_RUN:-}" ]]; then
   exit 0
 fi
 
-# Helper: extract iperf3 mbps from a JSON blob on stdin.
+# Helper: extract throughput mbps from a JSON blob on stdin.
+# Handles both rustscale-bench JSON (.total_mbps) and iperf3 JSON (.end.sum_received.bits_per_second).
 iperf3_mbps() {
   python3 -c '
 import json,sys
 d=json.load(sys.stdin)
-end=d.get("end",{})
-s=end.get("sum_received",end.get("sum",{}))
-print(f"{s.get(\"bits_per_second\",0)/1e6:.2f}")
+if "total_mbps" in d:
+    print("%.2f" % d["total_mbps"])
+elif "down_mbps" in d:
+    print("%.2f" % d["down_mbps"])
+elif "up_mbps" in d:
+    print("%.2f" % d["up_mbps"])
+else:
+    end=d.get("end",{})
+    s=end.get("sum_received",end.get("sum",{}))
+    print("%.2f" % (s.get("bits_per_second",0)/1e6))
 '
 }
 

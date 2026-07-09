@@ -40,6 +40,12 @@ smoltcp = { version = "0.13", default-features = false, features = ["medium-ip",
 # HTTP/2 client for the Noise-tunneled control plane (ts2021).
 h2 = "0.4"
 
+# Raw FFI bindings for TUN device syscalls (utun on macOS, /dev/net/tun on Linux).
+libc = "0.2"
+
+# Async trait methods for the TUN device abstraction.
+async-trait = "0.1"
+
 # Shared lint policy: pedantic where sane, but allow the noisier style lints so
 # that the default `cargo clippy` run stays clean and readable.
 [workspace.lints.rust]

@@ -5,7 +5,7 @@
 
 use std::net::Ipv4Addr;
 
-use rustscale_key::{DiscoPrivate, MachinePrivate, NodePrivate};
+use rustscale_key::NodePrivate;
 use rustscale_tailcfg::Node;
 
 use super::*;
@@ -143,16 +143,60 @@ fn resolve_unknown_hostname_returns_none() {
 }
 
 // ---------------------------------------------------------------------------
-// ip_in_cidr helper test
+// RouteTable longest-prefix tests
 // ---------------------------------------------------------------------------
 
 #[test]
-fn ip_in_cidr_works() {
-    assert!(ip_in_cidr(Ipv4Addr::new(100, 64, 0, 1), "100.64.0.1/32"));
-    assert!(ip_in_cidr(Ipv4Addr::new(100, 64, 0, 5), "100.64.0.0/24"));
-    assert!(!ip_in_cidr(Ipv4Addr::new(100, 64, 1, 1), "100.64.0.0/24"));
-    assert!(!ip_in_cidr(Ipv4Addr::new(10, 0, 0, 1), "100.64.0.0/24"));
-    assert!(ip_in_cidr(Ipv4Addr::new(0, 0, 0, 0), "0.0.0.0/0"));
+fn route_table_exact_match() {
+    let key = NodePrivate::generate();
+    let peers = vec![Node {
+        ID: 1,
+        Name: "p".into(),
+        Key: key.public(),
+        Addresses: vec!["100.64.0.5/32".into()],
+        ..Default::default()
+    }];
+    let rt = RouteTable::from_peers(&peers);
+    assert_eq!(
+        rt.lookup(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 5))),
+        Some(key.public())
+    );
+    assert!(rt
+        .lookup(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 6)))
+        .is_none());
+}
+
+#[test]
+fn route_table_longest_prefix() {
+    let broad = NodePrivate::generate();
+    let narrow = NodePrivate::generate();
+    let peers = vec![
+        Node {
+            ID: 1,
+            Name: "broad".into(),
+            Key: broad.public(),
+            Addresses: vec!["100.64.0.0/24".into()],
+            ..Default::default()
+        },
+        Node {
+            ID: 2,
+            Name: "narrow".into(),
+            Key: narrow.public(),
+            Addresses: vec!["100.64.0.9/32".into()],
+            ..Default::default()
+        },
+    ];
+    let rt = RouteTable::from_peers(&peers);
+    // /32 wins for its own address.
+    assert_eq!(
+        rt.lookup(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 9))),
+        Some(narrow.public())
+    );
+    // /24 covers the rest.
+    assert_eq!(
+        rt.lookup(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 10))),
+        Some(broad.public())
+    );
 }
 
 // ---------------------------------------------------------------------------

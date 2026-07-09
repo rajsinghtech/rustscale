@@ -28,9 +28,11 @@
 
 #![forbid(unsafe_code)]
 
+mod routing;
 mod state;
 mod status;
 
+pub use routing::RouteTable;
 pub use state::{PersistedState, StateError};
 pub use status::{PeerInfo, ServerStatus};
 
@@ -42,10 +44,11 @@ use std::sync::Arc;
 use rustscale_controlclient::client::{ControlClient, RegisterError, StreamMapError};
 use rustscale_controlclient::controlhttp;
 use rustscale_derp::DerpClient;
-use rustscale_key::{DiscoPrivate, MachinePrivate, NodePrivate, NodePublic};
-use rustscale_magicsock::{Magicsock, MagicsockConfig, MagicsockError, PathClass};
+use rustscale_key::{NodePrivate, NodePublic};
+use rustscale_magicsock::{Magicsock, MagicsockConfig, MagicsockError};
 use rustscale_netstack::{Netstack, NetstackError, NetstackStream, DEFAULT_MTU};
 use rustscale_tailcfg::{DERPMap, Hostinfo, MapRequest, MapResponse, Node, RegisterRequest};
+use rustscale_tun::Tun;
 use rustscale_wg::{WgError, WgTunn};
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::task::JoinHandle;
@@ -95,6 +98,10 @@ pub enum TsnetError {
     Derp(#[from] rustscale_derp::DerpError),
     #[error("netcheck error: {0}")]
     Netcheck(#[from] rustscale_netcheck::NetcheckError),
+    #[error("tun device error: {0}")]
+    Tun(#[from] rustscale_tun::TunError),
+    #[error("listen/dial not available in TUN mode (no userspace netstack)")]
+    NotAvailableInTunMode,
     #[error("timeout waiting for first map response")]
     MapTimeout,
 }
@@ -156,13 +163,47 @@ impl ServerBuilder {
 struct RunningState {
     tailscale_ips: Vec<IpAddr>,
     magicsock: Arc<Magicsock>,
-    netstack: Arc<Netstack>,
+    data_plane: DataPlane,
     wg_tunnels: Arc<RwLock<HashMap<NodePublic, Arc<Mutex<WgTunn>>>>>,
     peers: Arc<RwLock<Vec<Node>>>,
+    route_table: Arc<RwLock<RouteTable>>,
     derp_map: Arc<RwLock<Option<DERPMap>>>,
     home_derp: i32,
     cancel: Arc<CancelToken>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
+}
+
+/// Which data plane is wired up: userspace netstack (tsnet listen/dial) or a
+/// real TUN device (full-client packet routing).
+enum DataPlane {
+    Netstack(Arc<Netstack>),
+    Tun(Arc<dyn Tun>),
+}
+
+/// Configuration for TUN-mode operation ([`Server::up_tun`]).
+///
+/// In TUN mode the server routes plaintext IP packets between a real OS TUN
+/// device and the WireGuard/magicsock data plane, instead of an in-process
+/// userspace netstack. `listen`/`dial` are unavailable in this mode.
+#[derive(Clone, Debug)]
+pub struct TunModeConfig {
+    /// TUN device parameters (name hint + MTU). On macOS the default name
+    /// `"utun"` auto-selects a unit.
+    pub tun: rustscale_tun::TunConfig,
+    /// If true, bring the interface up and add tailnet routes on macOS via
+    /// `ifconfig`/`route`. **Requires root.** Default `false`, in which case
+    /// you must configure the interface and routes yourself (or rely on the
+    /// data-plane pump alone for in-process traffic).
+    pub apply_routes: bool,
+}
+
+impl Default for TunModeConfig {
+    fn default() -> Self {
+        Self {
+            tun: rustscale_tun::TunConfig::default(),
+            apply_routes: false,
+        }
+    }
 }
 
 /// Simple cancellation token.
@@ -183,6 +224,23 @@ impl CancelToken {
     fn is_cancelled(&self) -> bool {
         self.cancelled.load(std::sync::atomic::Ordering::SeqCst)
     }
+}
+
+/// Result of the shared control-plane bootstrap — everything `up()` and
+/// `up_tun()` need to start their respective data-plane pumps.
+struct Bootstrap {
+    tailscale_ips: Vec<IpAddr>,
+    our_v4: Ipv4Addr,
+    magicsock: Arc<Magicsock>,
+    wg_tunnels: Arc<RwLock<HashMap<NodePublic, Arc<Mutex<WgTunn>>>>>,
+    peers: Arc<RwLock<Vec<Node>>>,
+    route_table: Arc<RwLock<RouteTable>>,
+    derp_map: Arc<RwLock<Option<DERPMap>>>,
+    home_derp: i32,
+    cancel: Arc<CancelToken>,
+    map_rx: mpsc::Receiver<Result<MapResponse, StreamMapError>>,
+    map_task: JoinHandle<()>,
+    node_key: NodePrivate,
 }
 
 /// An embedded Tailscale server.
@@ -206,17 +264,136 @@ impl Server {
         self.inner.is_some()
     }
 
-    /// Bring the server online.
+    /// Bring the server online in userspace netstack mode (tsnet listen/dial).
+    ///
+    /// This is the classic tsnet embedding path: an in-process smoltcp netstack
+    /// backs `listen`/`dial`. For a full-client TUN device instead, use
+    /// [`Server::up_tun`].
     pub async fn up(&mut self) -> Result<(), TsnetError> {
         if self.inner.is_some() {
             return Err(TsnetError::AlreadyUp);
         }
 
-        // Ensure the rustls ring crypto provider is installed before any TLS
-        // operations (control-plane dial, DERP connect). Guarded by Once so
-        // it's a no-op after the first call.
         ensure_ring_provider();
 
+        let b = self.bootstrap().await?;
+
+        // Userspace netstack bound to our tailnet IPv4.
+        let netstack = Arc::new(Netstack::new(b.our_v4, DEFAULT_MTU));
+
+        // Netstack data-plane pump: netstack <-> WG <-> magicsock.
+        let pump = tokio::spawn(run_netstack_pump(
+            b.magicsock.clone(),
+            netstack.clone(),
+            b.wg_tunnels.clone(),
+            b.route_table.clone(),
+            b.cancel.clone(),
+        ));
+
+        // Map-stream update task (peer/route deltas).
+        let map_update = spawn_map_update_task(
+            b.map_rx,
+            b.magicsock.clone(),
+            b.wg_tunnels.clone(),
+            b.peers.clone(),
+            b.route_table.clone(),
+            b.node_key.clone(),
+            b.cancel.clone(),
+        );
+
+        self.inner = Some(RunningState {
+            tailscale_ips: b.tailscale_ips,
+            magicsock: b.magicsock,
+            data_plane: DataPlane::Netstack(netstack),
+            wg_tunnels: b.wg_tunnels,
+            peers: b.peers,
+            route_table: b.route_table,
+            derp_map: b.derp_map,
+            home_derp: b.home_derp,
+            cancel: b.cancel,
+            tasks: Mutex::new(vec![b.map_task, pump, map_update]),
+        });
+        Ok(())
+    }
+
+    /// Bring the server online in **TUN mode**: route plaintext IP packets
+    /// between a real OS TUN device and the WireGuard/magicsock data plane,
+    /// instead of an in-process netstack.
+    ///
+    /// `listen`/`dial` are unavailable in TUN mode. Creating the TUN device
+    /// requires root on both macOS (`utun`) and Linux (`/dev/net/tun`). If
+    /// `config.apply_routes` is true, the interface is brought up and tailnet
+    /// routes are added via `ifconfig`/`route` (macOS) or `ip` (Linux) — also
+    /// requiring root.
+    pub async fn up_tun(&mut self, config: TunModeConfig) -> Result<(), TsnetError> {
+        if self.inner.is_some() {
+            return Err(TsnetError::AlreadyUp);
+        }
+
+        ensure_ring_provider();
+
+        let b = self.bootstrap().await?;
+
+        // Real TUN device.
+        let tun: Arc<dyn Tun> = {
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            {
+                let dev = rustscale_tun::create(&config.tun)?;
+                if config.apply_routes {
+                    apply_tun_routes(dev.name(), &b.tailscale_ips, config.tun.mtu)?;
+                }
+                Arc::new(dev)
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            {
+                return Err(TsnetError::Builder(
+                    "TUN mode not supported on this platform".into(),
+                ));
+            }
+        };
+
+        // TUN data-plane pump: TUN <-> WG <-> magicsock.
+        let pump = tokio::spawn(run_tun_pump(
+            b.magicsock.clone(),
+            tun.clone(),
+            b.wg_tunnels.clone(),
+            b.route_table.clone(),
+            b.cancel.clone(),
+        ));
+
+        let map_update = spawn_map_update_task(
+            b.map_rx,
+            b.magicsock.clone(),
+            b.wg_tunnels.clone(),
+            b.peers.clone(),
+            b.route_table.clone(),
+            b.node_key.clone(),
+            b.cancel.clone(),
+        );
+
+        self.inner = Some(RunningState {
+            tailscale_ips: b.tailscale_ips,
+            magicsock: b.magicsock,
+            data_plane: DataPlane::Tun(tun),
+            wg_tunnels: b.wg_tunnels,
+            peers: b.peers,
+            route_table: b.route_table,
+            derp_map: b.derp_map,
+            home_derp: b.home_derp,
+            cancel: b.cancel,
+            tasks: Mutex::new(vec![b.map_task, pump, map_update]),
+        });
+        Ok(())
+    }
+
+    // --- shared control-plane bootstrap ---
+
+    /// Shared bootstrapping for `up()` and `up_tun()`: load state, register
+    /// with control, start the map long-poll, wait for the first `MapResponse`,
+    /// netcheck for a home DERP, connect it, build magicsock + per-peer WG
+    /// tunnels + the routing table. Returns the shared handles plus the
+    /// still-open map receiver for the update task.
+    async fn bootstrap(&mut self) -> Result<Bootstrap, TsnetError> {
         // 1. Load or generate persistent state.
         let mut state = self.load_or_create_state()?;
         if state.is_zero() {
@@ -227,7 +404,7 @@ impl Server {
         let node_pub = state.node_key.public();
         let disco_pub = state.disco_key.public();
 
-        // 2. Fetch the server's Noise public key (GET /key?v=<version> over HTTPS).
+        // 2. Fetch the server's Noise public key (GET /key?v=<version>).
         let server_pub_key =
             controlhttp::fetch_server_pub_key(&self.config.control_url, PROTOCOL_VERSION)
                 .await
@@ -235,7 +412,7 @@ impl Server {
                     TsnetError::Register(rustscale_controlclient::RegisterError::Dial(e))
                 })?;
 
-        // 3. Create the control client with the server's real public key.
+        // 3. Register with the control plane.
         let auth_key = self
             .config
             .auth_key
@@ -268,11 +445,10 @@ impl Server {
         if !reg_resp.AuthURL.is_empty() {
             return Err(TsnetError::AuthRequired(reg_resp.AuthURL));
         }
-
         state.node_id = reg_resp.User.ID;
         self.save_state(&state)?;
 
-        // 3. Start map long-poll.
+        // 4. Start the map long-poll.
         let map_req = MapRequest {
             Version: CAPABILITY_VERSION,
             KeepAlive: true,
@@ -298,28 +474,20 @@ impl Server {
             let _ = cc2.stream_map(&map_req, map_tx).await;
         });
 
-        // Wait for first MapResponse.
+        // 5. Wait for the first MapResponse.
         let first = tokio::time::timeout(std::time::Duration::from_secs(30), map_rx.recv())
             .await
             .map_err(|_| TsnetError::MapTimeout)?
             .ok_or(TsnetError::MapTimeout)?;
-
         let map_resp: MapResponse = first?;
 
         let tailscale_ips = extract_tailscale_ips(&map_resp);
         if tailscale_ips.is_empty() {
             return Err(TsnetError::Builder("no tailscale IPs assigned".into()));
         }
-        let our_v4 = tailscale_ips
-            .iter()
-            .find_map(|ip| match ip {
-                IpAddr::V4(v4) => Some(*v4),
-                _ => None,
-            })
-            .ok_or_else(|| TsnetError::Builder("no IPv4 tailnet address".into()))?;
+        let our_v4 = first_v4(&tailscale_ips)?;
 
-        // 5. Netcheck to pick home DERP. If netcheck can't probe (no explicit
-        // IPs in the DERP map), fall back to the first region.
+        // 6. Netcheck to pick a home DERP (fall back to the first region).
         let derp_map = map_resp.DERPMap.clone().unwrap_or_default();
         let home_derp = if !derp_map.Regions.is_empty() {
             match rustscale_netcheck::Prober::default()
@@ -327,27 +495,24 @@ impl Server {
                 .await
             {
                 Ok(r) if r.preferred_derp > 0 => r.preferred_derp,
-                _ => {
-                    // Fall back to the first non-Avoid region.
-                    derp_map
-                        .Regions
-                        .values()
-                        .find(|r| !r.Avoid)
-                        .or_else(|| derp_map.Regions.values().next())
-                        .map(|r| r.RegionID)
-                        .unwrap_or(0)
-                }
+                _ => derp_map
+                    .Regions
+                    .values()
+                    .find(|r| !r.Avoid)
+                    .or_else(|| derp_map.Regions.values().next())
+                    .map(|r| r.RegionID)
+                    .unwrap_or(0),
             }
         } else {
             0
         };
 
-        // 6. Connect home DERP.
+        // 7. Connect home DERP.
         let derp_client = connect_home_derp(&derp_map, home_derp, &state.node_key)
             .await
             .ok();
 
-        // 7. Create magicsock.
+        // 8. Create magicsock.
         let magicsock = Arc::new(
             Magicsock::new(MagicsockConfig {
                 private_key: state.node_key.clone(),
@@ -359,17 +524,14 @@ impl Server {
         );
 
         // The server may send peers via Peers (full list) or PeersChanged
-        // (delta). The first response often uses PeersChanged, not Peers.
+        // (delta). The first response often uses PeersChanged.
         let mut peers = map_resp.Peers.clone();
         if peers.is_empty() && !map_resp.PeersChanged.is_empty() {
             peers = map_resp.PeersChanged.clone();
         }
         magicsock.set_netmap(peers.clone()).await?;
 
-        // 8. Create netstack.
-        let netstack = Arc::new(Netstack::new(our_v4, DEFAULT_MTU));
-
-        // 9. Create per-peer WG tunnels.
+        // 9. Per-peer WG tunnels + routing table.
         let wg_tunnels = Arc::new(RwLock::new(HashMap::new()));
         {
             let mut tunnels = wg_tunnels.write().await;
@@ -383,98 +545,24 @@ impl Server {
         }
 
         let peers_arc = Arc::new(RwLock::new(peers.clone()));
+        let route_table = Arc::new(RwLock::new(RouteTable::from_peers(&peers)));
         let derp_arc = Arc::new(RwLock::new(map_resp.DERPMap.clone()));
         let cancel = Arc::new(CancelToken::new());
 
-        let running = RunningState {
+        Ok(Bootstrap {
             tailscale_ips: tailscale_ips.clone(),
-            magicsock: magicsock.clone(),
-            netstack: netstack.clone(),
-            wg_tunnels: wg_tunnels.clone(),
-            peers: peers_arc.clone(),
-            derp_map: derp_arc.clone(),
+            our_v4,
+            magicsock,
+            wg_tunnels,
+            peers: peers_arc,
+            route_table,
+            derp_map: derp_arc,
             home_derp,
-            cancel: cancel.clone(),
-            tasks: Mutex::new(vec![map_task]),
-        };
-
-        // Start the data-plane pump.
-        let pump = tokio::spawn(run_data_pump(
-            magicsock.clone(),
-            netstack.clone(),
-            wg_tunnels.clone(),
-            peers_arc.clone(),
-            cancel.clone(),
-        ));
-        running.tasks.lock().await.push(pump);
-
-        // Start the map update task — processes streaming MapResponse deltas.
-        let ms = magicsock.clone();
-        let wg = wg_tunnels.clone();
-        let nk = state.node_key.clone();
-        let cancel2 = cancel.clone();
-        let map_update = tokio::spawn(async move {
-            loop {
-                if cancel2.is_cancelled() {
-                    break;
-                }
-                match map_rx.recv().await {
-                    Some(Ok(resp)) => {
-                        // Skip keep-alive messages.
-                        if resp.KeepAlive {
-                            continue;
-                        }
-
-                        // Merge peer deltas into the current peer list.
-                        // Peers = full list (first response), PeersChanged = deltas.
-                        {
-                            let mut peers = peers_arc.write().await;
-                            if !resp.Peers.is_empty() {
-                                // Full peer list replaces.
-                                *peers = resp.Peers.clone();
-                            }
-                            if !resp.PeersChanged.is_empty() {
-                                // Merge changed peers by node key.
-                                for changed in &resp.PeersChanged {
-                                    if let Some(existing) =
-                                        peers.iter_mut().find(|p| p.Key == changed.Key)
-                                    {
-                                        *existing = changed.clone();
-                                    } else {
-                                        peers.push(changed.clone());
-                                    }
-                                }
-                            }
-                            if !resp.PeersRemoved.is_empty() {
-                                peers.retain(|p| !resp.PeersRemoved.contains(&p.ID));
-                            }
-                        }
-
-                        // Feed the updated peer list to magicsock.
-                        let peers = peers_arc.read().await.clone();
-                        let _ = ms.set_netmap(peers.clone()).await;
-
-                        // Create WG tunnels for any new peers.
-                        let mut tunnels = wg.write().await;
-                        for peer in &peers {
-                            if peer.Key.is_zero() {
-                                continue;
-                            }
-                            if !tunnels.contains_key(&peer.Key) {
-                                if let Ok(t) = WgTunn::new(&nk, &peer.Key, rand_index()) {
-                                    tunnels.insert(peer.Key.clone(), Arc::new(Mutex::new(t)));
-                                }
-                            }
-                        }
-                    }
-                    Some(Err(_)) | None => break,
-                }
-            }
-        });
-        running.tasks.lock().await.push(map_update);
-
-        self.inner = Some(running);
-        Ok(())
+            cancel,
+            map_rx,
+            map_task,
+            node_key: state.node_key.clone(),
+        })
     }
 
     /// Get the current server status.
@@ -512,17 +600,28 @@ impl Server {
         }
     }
 
-    /// Listen for incoming TCP connections on `port`.
+    /// Listen for incoming TCP connections on `port` (netstack mode only).
+    ///
+    /// Returns an error in TUN mode — there is no in-process netstack to
+    /// accept connections.
     pub async fn listen(&self, port: u16) -> Result<rustscale_netstack::Listener, TsnetError> {
         let inner = self.inner.as_ref().ok_or(TsnetError::NotUp)?;
-        Ok(inner.netstack.listen(port).await?)
+        match &inner.data_plane {
+            DataPlane::Netstack(ns) => Ok(ns.listen(port).await?),
+            DataPlane::Tun(_) => Err(TsnetError::NotAvailableInTunMode),
+        }
     }
 
-    /// Dial a remote `ip:port` or `hostname:port`.
+    /// Dial a remote `ip:port` or `hostname:port` (netstack mode only).
+    ///
+    /// Returns an error in TUN mode.
     pub async fn dial(&self, addr: &str) -> Result<NetstackStream, TsnetError> {
         let inner = self.inner.as_ref().ok_or(TsnetError::NotUp)?;
         let socket_addr = resolve_addr(addr, inner)?;
-        Ok(inner.netstack.dial(socket_addr).await?)
+        match &inner.data_plane {
+            DataPlane::Netstack(ns) => Ok(ns.dial(socket_addr).await?),
+            DataPlane::Tun(_) => Err(TsnetError::NotAvailableInTunMode),
+        }
     }
 
     /// Shut down the server.
@@ -558,14 +657,19 @@ impl Server {
 }
 
 // ---------------------------------------------------------------------------
-// Data pump
+// Data-plane pumps
 // ---------------------------------------------------------------------------
 
-async fn run_data_pump(
+/// Netstack data-plane pump: netstack <-> WG <-> magicsock.
+///
+/// Inbound: magicsock recv → WG decapsulate → netstack.push_rx.
+/// Outbound: netstack.pop_tx → route lookup → WG encapsulate → magicsock send.
+/// Also ticks WG timers every loop iteration.
+async fn run_netstack_pump(
     magicsock: Arc<Magicsock>,
     netstack: Arc<Netstack>,
     wg_tunnels: Arc<RwLock<HashMap<NodePublic, Arc<Mutex<WgTunn>>>>>,
-    peers: Arc<RwLock<Vec<Node>>>,
+    route_table: Arc<RwLock<RouteTable>>,
     cancel: Arc<CancelToken>,
 ) {
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(5));
@@ -580,6 +684,59 @@ async fn run_data_pump(
             _ = ticker.tick() => {}
             result = magicsock.poll_recv() => {
                 if let Ok(dgram) = result {
+                    handle_inbound_wg(&magicsock, &wg_tunnels, &dgram, |pt| {
+                        netstack.push_rx(pt);
+                    }).await;
+                }
+            }
+        }
+
+        // Drain outbound IP packets from netstack → route → WG → magicsock.
+        while let Some(pkt) = netstack.pop_tx() {
+            encapsulate_and_send(&magicsock, &wg_tunnels, &route_table, &pkt).await;
+        }
+
+        tick_wg_timers(&magicsock, &wg_tunnels).await;
+    }
+}
+
+/// TUN data-plane pump: TUN device <-> WG <-> magicsock.
+///
+/// Inbound (from network): magicsock recv -> WG decapsulate -> TUN write.
+/// Outbound (from OS): TUN read -> route lookup -> WG encapsulate -> magicsock send.
+/// WG timer ticks run on a 250ms interval.
+async fn run_tun_pump(
+    magicsock: Arc<Magicsock>,
+    tun: Arc<dyn Tun>,
+    wg_tunnels: Arc<RwLock<HashMap<NodePublic, Arc<Mutex<WgTunn>>>>>,
+    route_table: Arc<RwLock<RouteTable>>,
+    cancel: Arc<CancelToken>,
+) {
+    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(250));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        if cancel.is_cancelled() {
+            break;
+        }
+
+        tokio::select! {
+            // TUN read -> route -> WG encapsulate -> magicsock send.
+            result = tun.read_packet() => {
+                match result {
+                    Ok(pkt) => {
+                        encapsulate_and_send(&magicsock, &wg_tunnels, &route_table, &pkt).await;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(e) => {
+                        eprintln!("tun read error: {e}");
+                        break;
+                    }
+                }
+            }
+            // magicsock recv -> WG decapsulate -> TUN write.
+            result = magicsock.poll_recv() => {
+                if let Ok(dgram) = result {
                     let tunn = {
                         let tunnels = wg_tunnels.read().await;
                         tunnels.get(&dgram.peer).cloned()
@@ -588,7 +745,7 @@ async fn run_data_pump(
                         if let Ok(mut t) = tunn.try_lock() {
                             if let Ok(decap) = t.decapsulate(&dgram.data) {
                                 if let Some(pt) = decap.plaintext {
-                                    netstack.push_rx(pt);
+                                    let _ = tun.write_packet(&pt).await;
                                 }
                                 for reply in decap.replies {
                                     let _ = magicsock.send(dgram.peer.clone(), &reply).await;
@@ -598,40 +755,151 @@ async fn run_data_pump(
                     }
                 }
             }
+            _ = ticker.tick() => {
+                tick_wg_timers(&magicsock, &wg_tunnels).await;
+            }
         }
+    }
+}
 
-        // Drain outbound IP packets from netstack.
-        while let Some(pkt) = netstack.pop_tx() {
-            if let Some(IpAddr::V4(dst_v4)) = WgTunn::dst_address(&pkt) {
-                let peer_key = {
-                    let p = peers.read().await;
-                    find_peer_for_ip(&p, dst_v4)
-                };
-                if let Some(peer_key) = peer_key {
-                    let tunnels = wg_tunnels.read().await;
-                    if let Some(tunn) = tunnels.get(&peer_key) {
-                        if let Ok(mut t) = tunn.try_lock() {
-                            if let Ok(dgrams) = t.encapsulate(&pkt) {
-                                for dg in dgrams {
-                                    let _ = magicsock.send(peer_key.clone(), &dg).await;
-                                }
-                            }
-                        }
-                    }
+/// Handle an inbound WG datagram: decapsulate, deliver plaintext via `deliver`,
+/// and send any WG protocol replies back over magicsock.
+async fn handle_inbound_wg(
+    magicsock: &Magicsock,
+    wg_tunnels: &RwLock<HashMap<NodePublic, Arc<Mutex<WgTunn>>>>,
+    dgram: &rustscale_magicsock::WgDatagram,
+    deliver: impl Fn(Vec<u8>),
+) {
+    let tunn = {
+        let tunnels = wg_tunnels.read().await;
+        tunnels.get(&dgram.peer).cloned()
+    };
+    if let Some(tunn) = tunn {
+        if let Ok(mut t) = tunn.try_lock() {
+            if let Ok(decap) = t.decapsulate(&dgram.data) {
+                if let Some(pt) = decap.plaintext {
+                    deliver(pt);
+                }
+                for reply in decap.replies {
+                    let _ = magicsock.send(dgram.peer.clone(), &reply).await;
                 }
             }
         }
+    }
+}
 
-        // Tick WG timers.
-        let tunnels = wg_tunnels.read().await;
-        for (peer_key, tunn) in tunnels.iter() {
-            if let Ok(mut t) = tunn.try_lock() {
-                for dg in t.tick_timers() {
+/// Route a plaintext IP packet to the right peer, encapsulate it via WG, and
+/// send the resulting datagrams over magicsock.
+async fn encapsulate_and_send(
+    magicsock: &Magicsock,
+    wg_tunnels: &RwLock<HashMap<NodePublic, Arc<Mutex<WgTunn>>>>,
+    route_table: &RwLock<RouteTable>,
+    pkt: &[u8],
+) {
+    let Some(dst) = WgTunn::dst_address(pkt) else {
+        return;
+    };
+    let peer_key = {
+        let rt = route_table.read().await;
+        rt.lookup(dst)
+    };
+    let Some(peer_key) = peer_key else {
+        return;
+    };
+    let tunnels = wg_tunnels.read().await;
+    if let Some(tunn) = tunnels.get(&peer_key) {
+        if let Ok(mut t) = tunn.try_lock() {
+            if let Ok(dgrams) = t.encapsulate(pkt) {
+                for dg in dgrams {
                     let _ = magicsock.send(peer_key.clone(), &dg).await;
                 }
             }
         }
     }
+}
+
+/// Tick WG timers for all peers and send any resulting datagrams.
+async fn tick_wg_timers(
+    magicsock: &Magicsock,
+    wg_tunnels: &RwLock<HashMap<NodePublic, Arc<Mutex<WgTunn>>>>,
+) {
+    let tunnels = wg_tunnels.read().await;
+    for (peer_key, tunn) in tunnels.iter() {
+        if let Ok(mut t) = tunn.try_lock() {
+            for dg in t.tick_timers() {
+                let _ = magicsock.send(peer_key.clone(), &dg).await;
+            }
+        }
+    }
+}
+
+/// Spawn the map-stream delta update task. Shared by `up()` and `up_tun()`:
+/// processes Peers/PeersChanged/PeersRemoved, feeds the new peer list to
+/// magicsock, rebuilds the route table, and creates WG tunnels for new peers.
+fn spawn_map_update_task(
+    mut map_rx: mpsc::Receiver<Result<MapResponse, StreamMapError>>,
+    magicsock: Arc<Magicsock>,
+    wg_tunnels: Arc<RwLock<HashMap<NodePublic, Arc<Mutex<WgTunn>>>>>,
+    peers_arc: Arc<RwLock<Vec<Node>>>,
+    route_table: Arc<RwLock<RouteTable>>,
+    node_key: NodePrivate,
+    cancel: Arc<CancelToken>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            if cancel.is_cancelled() {
+                break;
+            }
+            match map_rx.recv().await {
+                Some(Ok(resp)) => {
+                    if resp.KeepAlive {
+                        continue;
+                    }
+
+                    // Merge peer deltas.
+                    {
+                        let mut peers = peers_arc.write().await;
+                        if !resp.Peers.is_empty() {
+                            *peers = resp.Peers.clone();
+                        }
+                        if !resp.PeersChanged.is_empty() {
+                            for changed in &resp.PeersChanged {
+                                if let Some(existing) =
+                                    peers.iter_mut().find(|p| p.Key == changed.Key)
+                                {
+                                    *existing = changed.clone();
+                                } else {
+                                    peers.push(changed.clone());
+                                }
+                            }
+                        }
+                        if !resp.PeersRemoved.is_empty() {
+                            peers.retain(|p| !resp.PeersRemoved.contains(&p.ID));
+                        }
+                    }
+
+                    // Feed the updated peer list to magicsock + rebuild routes.
+                    let peers = peers_arc.read().await.clone();
+                    let _ = magicsock.set_netmap(peers.clone()).await;
+                    route_table.write().await.rebuild(&peers);
+
+                    // Create WG tunnels for new peers.
+                    let mut tunnels = wg_tunnels.write().await;
+                    for peer in &peers {
+                        if peer.Key.is_zero() {
+                            continue;
+                        }
+                        if !tunnels.contains_key(&peer.Key) {
+                            if let Ok(t) = WgTunn::new(&node_key, &peer.Key, rand_index()) {
+                                tunnels.insert(peer.Key.clone(), Arc::new(Mutex::new(t)));
+                            }
+                        }
+                    }
+                }
+                Some(Err(_)) | None => break,
+            }
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -700,44 +968,67 @@ fn rand_index() -> u32 {
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
-fn find_peer_for_ip(peers: &[Node], ip: Ipv4Addr) -> Option<NodePublic> {
-    for peer in peers {
-        if peer.Key.is_zero() {
-            continue;
-        }
-        let allowed: &[String] = if peer.AllowedIPs.is_empty() {
-            &peer.Addresses
-        } else {
-            &peer.AllowedIPs
-        };
-        for cidr in allowed {
-            if ip_in_cidr(ip, cidr) {
-                return Some(peer.Key.clone());
-            }
-        }
-    }
-    None
+/// Extract the first IPv4 from a list of tailnet IPs.
+fn first_v4(ips: &[IpAddr]) -> Result<Ipv4Addr, TsnetError> {
+    ips.iter()
+        .find_map(|ip| match ip {
+            IpAddr::V4(v4) => Some(*v4),
+            _ => None,
+        })
+        .ok_or_else(|| TsnetError::Builder("no IPv4 tailnet address".into()))
 }
 
-fn ip_in_cidr(ip: Ipv4Addr, cidr: &str) -> bool {
-    let Some((net_str, prefix_str)) = cidr.split_once('/') else {
-        return false;
-    };
-    let Ok(net) = net_str.parse::<Ipv4Addr>() else {
-        return false;
-    };
-    let Ok(prefix) = prefix_str.parse::<u32>() else {
-        return false;
-    };
-    if prefix > 32 {
-        return false;
+/// Bring the TUN interface up and add tailnet routes. Requires root.
+///
+/// On macOS: `ifconfig <name> up <our_v4>/32`, `route add 100.64.0.0/10 -interface <name>`.
+/// On Linux: `ip link set <name> up`, `ip addr add <our_v4>/32 dev <name>`,
+/// `ip route add 100.64.0.0/10 dev <name>`.
+fn apply_tun_routes(ifname: &str, tailscale_ips: &[IpAddr], _mtu: usize) -> Result<(), TsnetError> {
+    let our_v4 = first_v4(tailscale_ips)?;
+    let v4_str = our_v4.to_string();
+
+    #[cfg(target_os = "macos")]
+    {
+        run_cmd(
+            "ifconfig",
+            &["-v", ifname, "inet", &format!("{v4_str}/32"), "up"],
+        )?;
+        run_cmd(
+            "route",
+            &["-q", "add", "-net", "100.64.0.0/10", "-interface", ifname],
+        )?;
     }
-    let mask = if prefix == 0 {
-        0u32
-    } else {
-        u32::MAX << (32 - prefix)
-    };
-    (u32::from(ip) & mask) == (u32::from(net) & mask)
+    #[cfg(target_os = "linux")]
+    {
+        run_cmd("ip", &["link", "set", ifname, "up"])?;
+        run_cmd(
+            "ip",
+            &["addr", "add", &format!("{v4_str}/32"), "dev", ifname],
+        )?;
+        run_cmd("ip", &["route", "add", "100.64.0.0/10", "dev", ifname])?;
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (ifname, v4_str);
+    }
+    Ok(())
+}
+
+/// Run a command, returning an error if it exits non-zero.
+fn run_cmd(prog: &str, args: &[&str]) -> Result<(), TsnetError> {
+    let status = std::process::Command::new(prog)
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .status()
+        .map_err(|e| TsnetError::Builder(format!("spawn {prog}: {e}")))?;
+    if !status.success() {
+        return Err(TsnetError::Builder(format!(
+            "{prog} {:?} exited with {status}",
+            args
+        )));
+    }
+    Ok(())
 }
 
 fn resolve_addr(addr: &str, inner: &RunningState) -> Result<SocketAddr, TsnetError> {

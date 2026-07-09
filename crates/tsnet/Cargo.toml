@@ -18,6 +18,7 @@ rustscale-derp = { path = "../derp", version = "0.1.0" }
 rustscale-netcheck = { path = "../netcheck", version = "0.1.0" }
 rustscale-wg = { path = "../wg", version = "0.1.0" }
 rustscale-netstack = { path = "../netstack", version = "0.1.0" }
+rustscale-tun = { path = "../tun", version = "0.1.0" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

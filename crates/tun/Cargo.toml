@@ -1,0 +1,38 @@
+[package]
+name = "rustscale-tun"
+description = "Platform TUN device abstraction for rustscale (macOS utun / Linux tun)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# NOTE: this crate intentionally does NOT inherit workspace lints
+# (`[lints] workspace = true`). TUN device creation requires raw syscalls
+# (PF_SYSTEM socket + CTLIOCGINFO on macOS, /dev/net/tun + TUNSETIFF on Linux)
+# which are unavoidably `unsafe`. The workspace policy forbids `unsafe_code`
+# for the crypto/protocol crates; this crate must allow it. We re-state the
+# clippy pedantic config locally so clippy stays clean here too.
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+missing_const_for_fn = "allow"
+too_many_lines = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_possible_wrap = "allow"
+needless_pass_by_value = "allow"
+struct_excessive_bools = "allow"
+enum_glob_use = "allow"
+doc_markdown = "allow"
+
+[dependencies]
+tokio.workspace = true
+thiserror.workspace = true
+libc.workspace = true
+async-trait.workspace = true

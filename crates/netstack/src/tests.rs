@@ -185,3 +185,118 @@ async fn listen_rejects_duplicate_port() {
     let result = net.listen(8080).await;
     assert!(result.is_err(), "duplicate port should fail");
 }
+
+/// Push a payload much larger than the TCP send buffer (65 KB) through the
+/// back-to-back rig and verify zero data loss with correct byte ordering.
+/// This exercises the backpressure fix in `pump_connection`: when the
+/// smoltcp send buffer fills, the unwritten remainder is retained and the
+/// app channel is not drained, so `poll_write` returns Pending to the app
+/// until ACKs free up send capacity. Without the fix, the surplus was
+/// silently dropped.
+#[tokio::test]
+async fn backpressure_large_transfer_no_loss() {
+    let a_priv = NodePrivate::generate();
+    let b_priv = NodePrivate::generate();
+    let a_pub = a_priv.public();
+    let b_pub = b_priv.public();
+
+    let a_addr = Ipv4Addr::new(100, 64, 0, 1);
+    let b_addr = Ipv4Addr::new(100, 64, 0, 2);
+
+    let a_net = Arc::new(Netstack::new(a_addr, DEFAULT_MTU));
+    let b_net = Arc::new(Netstack::new(b_addr, DEFAULT_MTU));
+
+    let a_tunn = Arc::new(Mutex::new(
+        WgTunn::new(&a_priv, &b_pub, 1).expect("A tunnel"),
+    ));
+    let b_tunn = Arc::new(Mutex::new(
+        WgTunn::new(&b_priv, &a_pub, 2).expect("B tunnel"),
+    ));
+
+    let a_tunn_p = a_tunn.clone();
+    let b_tunn_p = b_tunn.clone();
+    let a_net_p = a_net.clone();
+    let b_net_p = b_net.clone();
+    let pump = tokio::spawn(async move {
+        loop {
+            let did_work = pump_cycle(&a_tunn_p, &b_tunn_p, &a_net_p, &b_net_p);
+            if !did_work {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        }
+    });
+
+    // B listens.
+    let mut listener = b_net.listen(20000).await.expect("listen");
+
+    // A dials B.
+    let dial_result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        a_net.dial(SocketAddr::new(b_addr.into(), 20000)),
+    )
+    .await;
+    let mut a_stream = dial_result.expect("dial timed out").expect("dial failed");
+
+    let accept_result =
+        tokio::time::timeout(std::time::Duration::from_secs(10), listener.accept()).await;
+    let mut b_stream = accept_result
+        .expect("accept timed out")
+        .expect("accept failed");
+
+    // Build a 1 MB payload with a verifiable byte pattern. 1 MB >> the 65 KB
+    // TCP send buffer, so the send buffer will fill repeatedly and the
+    // backpressure path is exercised on every cycle.
+    const PAYLOAD_SIZE: usize = 1 * 1024 * 1024;
+    let payload: Vec<u8> = (0..PAYLOAD_SIZE)
+        .map(|i| (i % 251) as u8) // prime modulus for a non-trivial pattern
+        .collect();
+
+    // A writes the full payload (write_all loops poll_write until done).
+    let payload_write = payload.clone();
+    let write_task = tokio::spawn(async move {
+        tokio::io::AsyncWriteExt::write_all(&mut a_stream, &payload_write)
+            .await
+            .expect("A write_all");
+        // Half-close so B sees EOF after the last byte.
+        tokio::io::AsyncWriteExt::shutdown(&mut a_stream)
+            .await
+            .expect("A shutdown");
+    });
+
+    // B reads everything until EOF, verifying count + ordering.
+    let mut received = Vec::with_capacity(PAYLOAD_SIZE);
+    let mut buf = vec![0u8; 32_768];
+    loop {
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            tokio::io::AsyncReadExt::read(&mut b_stream, &mut buf),
+        )
+        .await
+        .expect("B read timed out")
+        .expect("B read");
+        if n == 0 {
+            break;
+        }
+        received.extend_from_slice(&buf[..n]);
+    }
+
+    // Wait for the writer to finish.
+    tokio::time::timeout(std::time::Duration::from_secs(10), write_task)
+        .await
+        .expect("write task timed out")
+        .expect("write task panicked");
+
+    pump.abort();
+
+    // Zero loss + correct ordering.
+    assert_eq!(
+        received.len(),
+        PAYLOAD_SIZE,
+        "data loss: expected {PAYLOAD_SIZE} bytes, got {}",
+        received.len()
+    );
+    assert_eq!(
+        received, payload,
+        "byte mismatch: data arrived out of order or corrupted"
+    );
+}

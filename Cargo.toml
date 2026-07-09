@@ -40,6 +40,10 @@ smoltcp = { version = "0.13", default-features = false, features = ["medium-ip",
 # HTTP/2 client for the Noise-tunneled control plane (ts2021).
 h2 = "0.4"
 
+# Local network interface enumeration (getifaddrs) for magicsock endpoint
+# gathering — exposes a safe API over platform-specific unsafe FFI.
+if-addrs = "0.15"
+
 # Raw FFI bindings for TUN device syscalls (utun on macOS, /dev/net/tun on Linux).
 libc = "0.2"
 

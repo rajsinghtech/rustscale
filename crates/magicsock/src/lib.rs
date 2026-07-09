@@ -76,7 +76,15 @@ pub struct MagicsockConfig {
     /// `derp_client`). 0 if unknown.
     pub home_derp_region: i32,
     /// Optional UDP bind address (`None` = no direct UDP; DERP-only mode).
+    /// Ignored when `udp_socket` is provided.
     pub udp_bind: Option<SocketAddr>,
+    /// An already-bound UDP socket to use instead of binding from `udp_bind`.
+    /// When provided, magicsock takes ownership and starts the recv task on
+    /// it. This lets the caller bind early, gather local interface endpoints
+    /// from the bound port, and advertise them in the MapRequest before
+    /// magicsock is fully constructed (magicsock otherwise needs the DERPMap
+    /// from the first MapResponse, which is sent after endpoints are set).
+    pub udp_socket: Option<Arc<UdpSocket>>,
 }
 
 /// A received WG datagram with its sender identified.
@@ -307,11 +315,30 @@ impl Magicsock {
 
         let (wg_send, wg_recv) = mpsc::channel(256);
 
-        // Bind UDP socket if configured.
-        let (udp, local_udp_addrs) = if let Some(bind_addr) = config.udp_bind {
+        // Bind UDP socket if configured. A pre-bound socket (udp_socket)
+        // takes precedence over udp_bind.
+        let (udp, local_udp_addrs) = if let Some(sock) = config.udp_socket {
+            let port = sock.local_addr()?.port();
+            let eps = gather_local_endpoints(port);
+            if debug_enabled() && !eps.is_empty() {
+                eprintln!("DBG magicsock local endpoints: {eps:?}");
+            }
+            (Some(sock), eps)
+        } else if let Some(bind_addr) = config.udp_bind {
             let sock = UdpSocket::bind(bind_addr).await?;
-            let local = sock.local_addr()?.to_string();
-            (Some(Arc::new(sock)), vec![local])
+            let port = sock.local_addr()?.port();
+            // Gather local interface endpoints: the bound UDP port paired
+            // with each up, non-link-local IPv4 address on the host (plus
+            // loopback). This mirrors Go magicsock's determineEndpoints
+            // (local interface enumeration) so peers on the same LAN/host
+            // can disco-ping us directly instead of falling back to DERP.
+            // Without this, two nodes on the same machine never publish
+            // usable candidates and stay on the DERP relay path.
+            let eps = gather_local_endpoints(port);
+            if debug_enabled() && !eps.is_empty() {
+                eprintln!("DBG magicsock local endpoints: {eps:?}");
+            }
+            (Some(Arc::new(sock)), eps)
         } else {
             (None, Vec::new())
         };
@@ -358,6 +385,14 @@ impl Magicsock {
 
     /// Our local UDP addresses (for sharing in CallMeMaybe).
     pub fn local_udp_addrs(&self) -> &[String] {
+        &self.inner.local_udp_addrs
+    }
+
+    /// Local interface endpoints (IP:port) to advertise in the MapRequest
+    /// `Endpoints` field and in CallMeMaybe. Includes the bound UDP port
+    /// paired with each up, non-link-local IPv4 interface address on the
+    /// host (plus loopback for same-machine direct paths).
+    pub fn local_endpoints(&self) -> &[String] {
         &self.inner.local_udp_addrs
     }
 
@@ -412,11 +447,11 @@ impl Magicsock {
                 ));
                 if debug_enabled() {
                     eprintln!(
-                        "DBG set_netmap peer={} HomeDERP={} derp_send_region={} last_recv={}",
+                        "DBG set_netmap peer={} HomeDERP={} candidates={} disco_zero={}",
                         peer.Name,
                         peer.HomeDERP,
-                        ep.derp_send_region(),
-                        ep.last_recv_derp_region_for_debug(),
+                        peer.Endpoints.len(),
+                        peer.DiscoKey.is_zero(),
                     );
                 }
             }
@@ -445,6 +480,12 @@ impl Magicsock {
                         padding: 0,
                     });
                     if let Some(packet) = self.inner.disco.seal(&peer_disco, &ping) {
+                        if debug_enabled() {
+                            eprintln!(
+                                "DBG disco_ping send to {addr} peer={}",
+                                short_key(&peer_key)
+                            );
+                        }
                         let _ = udp.send_to(&packet, addr).await;
                     }
                 }
@@ -670,7 +711,12 @@ impl Magicsock {
 
 /// Launch background UDP recv task + DERP demux task.
 fn spawn_recv_tasks(inner: Arc<Inner>, derp_recv_rx: mpsc::Receiver<(i32, NodePublic, Vec<u8>)>) {
-    // UDP recv task.
+    // UDP recv task. After the first async recv_from wakes us, drain any
+    // additional immediately-available packets with try_recv_from before
+    // awaiting again. This batches a burst of packets per wakeup (e.g. a
+    // train of WG data packets arriving together) into a single scheduler
+    // turn, reducing per-packet wake/context-switch overhead on the hot
+    // path.
     if let Some(ref udp) = inner.udp {
         let udp = udp.clone();
         let inner = inner.clone();
@@ -680,6 +726,11 @@ fn spawn_recv_tasks(inner: Arc<Inner>, derp_recv_rx: mpsc::Receiver<(i32, NodePu
                 match udp.recv_from(&mut buf).await {
                     Ok((len, addr)) => {
                         inner.handle_udp_packet(&buf[..len], addr).await;
+                        // Drain the rest of the currently-ready packet burst
+                        // without another await on the socket.
+                        while let Ok((len2, addr2)) = udp.try_recv_from(&mut buf) {
+                            inner.handle_udp_packet(&buf[..len2], addr2).await;
+                        }
                     }
                     Err(_) => break,
                 }
@@ -783,6 +834,9 @@ impl Inner {
 
         match msg {
             Message::Ping(ping) => {
+                if debug_enabled() {
+                    eprintln!("DBG disco_ping recv from {src} peer={}", short_key(&peer));
+                }
                 // Respond with a Pong over UDP to the source address.
                 let pong = Message::Pong(Pong {
                     tx_id: ping.tx_id,
@@ -790,6 +844,9 @@ impl Inner {
                 });
                 if let Some(reply) = self.disco.seal(&sender_disco, &pong) {
                     if let Some(ref udp) = self.udp {
+                        if debug_enabled() {
+                            eprintln!("DBG disco_pong send to {src} peer={}", short_key(&peer));
+                        }
                         let _ = udp.send_to(&reply, src).await;
                     }
                 }
@@ -805,13 +862,25 @@ impl Inner {
             }
             Message::Pong(pong) => {
                 // Match the pong to a pending ping and confirm the direct path.
+                if debug_enabled() {
+                    eprintln!("DBG disco_pong recv from {src} peer={}", short_key(&peer));
+                }
                 let confirmed_addr = {
                     let mut endpoints = self.endpoints.write().expect("endpoints lock poisoned");
                     if let Some(ep) = endpoints.get_mut(&peer) {
                         if ep.match_pong(&pong.tx_id).is_some() {
                             ep.confirm_direct(src, std::time::Instant::now());
+                            if debug_enabled() {
+                                eprintln!(
+                                    "DBG direct_confirmed peer={} addr={src}",
+                                    short_key(&peer)
+                                );
+                            }
                             Some(src)
                         } else {
+                            if debug_enabled() {
+                                eprintln!("DBG disco_pong nomatch peer={}", short_key(&peer));
+                            }
                             None
                         }
                     } else {
@@ -905,6 +974,59 @@ fn random_tx_id() -> [u8; 12] {
     let mut tx = [0u8; 12];
     rand::rngs::OsRng.fill_bytes(&mut tx);
     tx
+}
+
+/// Gather local interface endpoints for the MapRequest `Endpoints` field
+/// and CallMeMaybe. Pairs `udp_port` with each up, non-link-local IPv4
+/// address on the host (plus loopback) so peers on the same LAN/host can
+/// reach us directly. Mirrors Go magicsock's `determineEndpoints` local
+/// interface enumeration (`netmon.LocalAddresses` + bound port).
+pub fn gather_local_endpoints(udp_port: u16) -> Vec<String> {
+    use std::collections::HashSet;
+    use std::net::IpAddr;
+
+    let ifaces = match if_addrs::get_if_addrs() {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut eps: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut loopback_eps: Vec<String> = Vec::new();
+
+    for iface in &ifaces {
+        if !iface.is_oper_up() {
+            continue;
+        }
+        let v4 = match iface.ip() {
+            IpAddr::V4(v4) => v4,
+            IpAddr::V6(_) => continue, // UDP socket is v4; netstack is v4-only.
+        };
+        // Skip unspecified (0.0.0.0) and link-local (169.254/16).
+        if v4.is_unspecified() || is_link_local_v4(v4) {
+            continue;
+        }
+        let s = format!("{v4}:{udp_port}");
+        if v4.is_loopback() {
+            if seen.insert(s.clone()) {
+                loopback_eps.push(s);
+            }
+        } else if seen.insert(s.clone()) {
+            eps.push(s);
+        }
+    }
+
+    // Non-loopback (LAN/public) first, then loopback as a fallback so
+    // same-machine direct paths work even offline. This matches Go's
+    // intent (loopback only when needed) while keeping it simple.
+    eps.append(&mut loopback_eps);
+    eps
+}
+
+/// Whether an IPv4 address is link-local (169.254.0.0/16).
+fn is_link_local_v4(addr: std::net::Ipv4Addr) -> bool {
+    let o = addr.octets();
+    o[0] == 169 && o[1] == 254
 }
 
 /// Check if debug tracing is enabled (RUSTSCALE_DEBUG=1).

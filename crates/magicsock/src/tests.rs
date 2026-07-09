@@ -206,6 +206,7 @@ async fn derp_data_path_fallback() {
         derp_map: None,
         home_derp_region: 0,
         udp_bind: None,
+        udp_socket: None,
     })
     .await
     .expect("A magicsock");
@@ -218,6 +219,7 @@ async fn derp_data_path_fallback() {
         derp_map: None,
         home_derp_region: 0,
         udp_bind: None,
+        udp_socket: None,
     })
     .await
     .expect("B magicsock");
@@ -282,6 +284,7 @@ async fn direct_path_upgrade_over_udp() {
         derp_map: None,
         home_derp_region: 0,
         udp_bind: Some("127.0.0.1:0".parse().unwrap()),
+        udp_socket: None,
     })
     .await
     .expect("A magicsock");
@@ -294,6 +297,7 @@ async fn direct_path_upgrade_over_udp() {
         derp_map: None,
         home_derp_region: 0,
         udp_bind: Some("127.0.0.1:0".parse().unwrap()),
+        udp_socket: None,
     })
     .await
     .expect("B magicsock");
@@ -365,6 +369,7 @@ async fn trust_expiry_downgrades_to_derp() {
         derp_map: None,
         home_derp_region: 0,
         udp_bind: Some("127.0.0.1:0".parse().unwrap()),
+        udp_socket: None,
     })
     .await
     .expect("A magicsock");
@@ -377,6 +382,7 @@ async fn trust_expiry_downgrades_to_derp() {
         derp_map: None,
         home_derp_region: 0,
         udp_bind: Some("127.0.0.1:0".parse().unwrap()),
+        udp_socket: None,
     })
     .await
     .expect("B magicsock");
@@ -433,6 +439,7 @@ async fn send_unknown_peer_errors() {
         derp_map: None,
         home_derp_region: 0,
         udp_bind: None,
+        udp_socket: None,
     })
     .await
     .expect("magicsock");
@@ -518,6 +525,7 @@ async fn multi_region_derp_routing() {
         derp_map: None,
         home_derp_region: 1,
         udp_bind: None,
+        udp_socket: None,
     })
     .await
     .expect("A magicsock");
@@ -555,6 +563,7 @@ async fn multi_region_derp_routing() {
         derp_map: None,
         home_derp_region: 2,
         udp_bind: None,
+        udp_socket: None,
     })
     .await
     .expect("B magicsock");

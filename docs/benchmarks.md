@@ -127,53 +127,92 @@ target/release/rustscale-bench latency --authkey tskey-... --target 100.64.0.1:5
 | Date        | 2026-07-09                                   |
 | OS          | macOS (darwin/arm64)                         |
 | CPU         | Apple Silicon (M-series)                     |
-| rustscale   | phase-10b bench harness                      |
+| rustscale   | phase-10c (direct path + backpressure fix)   |
 | tailscaled  | 1.98.8-t05a918293                            |
 
 ### Throughput
 
 | Tool         | Direction | Parallel | Path   | Throughput (Mbps) | Duration |
 |--------------|-----------|----------|--------|-------------------|----------|
-| rustscale    | down      | 1        | derp   | 13.14             | 5s       |
-| tailscaled   | down      | 1        | direct | 383.71            | 5s       |
+| rustscale (before 10c) | down | 1 | derp   | 13.14      | 5s       |
+| rustscale (after 10c)  | down | 1 | direct | 781.65     | 10s      |
+| tailscaled             | down | 1 | direct | 383.71     | 5s       |
 
 ### Latency
 
 | Tool         | Path   | p50 (us) | p95 (us) | p99 (us) | Count |
 |--------------|--------|----------|----------|----------|-------|
-| rustscale    | derp   | 69,284   | 74,325   | 79,122   | 200   |
-| tailscaled   | direct | 257      | 422      | 481      | 200   |
+| rustscale (before 10c) | derp   | 69,284   | 74,325   | 79,122   | 200   |
+| rustscale (after 10c)  | direct | 10,140   | 11,048   | 15,082   | 200   |
+| tailscaled             | direct | 257      | 422      | 481      | 200   |
 
 ### Analysis
 
-The large gap is primarily explained by **path class difference**:
+**Phase 10c fixed two bugs that together closed the gap from 13 Mbps (DERP)
+to 782 Mbps (direct) — a 60x improvement, and 2x faster than tailscaled.**
 
-- **tailscaled** established a **direct** UDP path between the two
-  userspace-networking instances on the same machine. Direct localhost UDP
-  has sub-millisecond RTT and full bandwidth.
-- **rustscale** fell back to **DERP relay** — the two nodes connected via a
-  remote DERP server instead of a direct UDP path. DERP adds ~70ms RTT
-  (relay round-trip) and limits throughput to ~13 Mbps.
+#### Bug 1: Direct path not established (endpoint gathering + disco key)
 
-This reveals a **path-selection gap** in rustscale's magicsock: it does not
-establish direct UDP paths as aggressively as Go's magicsock on localhost.
-This is a known area for improvement in the perf data plane phase (roadmap
-item 9: UDP GSO/GRO, batched magicsock IO, direct path discovery).
+Two rustscale nodes on the same machine fell back to DERP because:
 
-A secondary factor is the **netstack write-path data loss**: the current
-smoltcp pump (`pump_connection`) drains the app channel in a single pass
-and drops data that doesn't fit in the TCP send buffer. The bench tool
-mitigates this with MTU-sized (1280-byte) write chunks, but throughput is
-still limited to roughly one send-buffer fill per 10ms poll cycle (~50 Mbps
-ceiling). Fixing the pump to respect `send_slice`'s return value (re-queue
-unwritten data) would recover the remaining bandwidth.
+1. **No local interface endpoints published.** `magicsock` only published
+   the bound socket address (`0.0.0.0:port`), not the host's interface IPs.
+   Go's `determineEndpoints` enumerates local interfaces via `getifaddrs`
+   and pairs each up IPv4 address with the UDP port. Fix: added
+   `gather_local_endpoints()` using the `if-addrs` crate, publishing LAN,
+   tailnet, and loopback IPs + port in the MapRequest `Endpoints` field.
+
+2. **DiscoKey not reaching the control server before the streaming
+   MapResponse.** The control server processes the MapRequest body
+   asynchronously and generates the first streaming MapResponse from
+   registration data (which lacks DiscoKey/Endpoints). Peers therefore
+   see `DiscoKey=zero` and `Endpoints=[]` and can never initiate disco
+   probing. Fix: send a lightweight non-streaming MapRequest
+   (`Stream=false, OmitPeers=true`) to push DiscoKey + Endpoints to the
+   server *before* starting the streaming long-poll. The subsequent
+   streaming MapResponse then includes peers with non-zero DiscoKey and
+   populated Endpoints, enabling disco ping/pong to confirm direct paths.
+
+#### Bug 2: Netstack backpressure data loss
+
+`pump_connection` ignored `send_slice`'s return value, silently dropping
+data when the smoltcp TCP send buffer was full. Fix:
+
+- **Write path:** respect `send_slice`'s return value, store the unwritten
+  remainder in `pending_write`, and stop draining the app channel when the
+  socket is full. This applies backpressure up the mpsc chain — the bounded
+  `app_rx` fills, making `NetstackStream::poll_write` return `Pending` to
+  the application.
+- **Read path:** only consume from the socket when the app channel has
+  capacity, so smoltcp's TCP flow control backs off the sender instead of
+  dropping data.
+- **Unit test:** `backpressure_large_transfer_no_loss` pushes 1 MB through
+  the back-to-back rig (16x the 65 KB TCP buffer) and verifies zero loss
+  with correct byte ordering.
+
+#### Tuning
+
+- TCP socket buffers increased from 65 KB to 256 KB.
+- Poll interval reduced from 10 ms to 2 ms for responsive backpressure retry.
+- Magicsock UDP recv batches a burst of packets per wakeup using
+  `try_recv_from` drain loop after the first `recv_from`.
+
+#### Remaining gap vs tailscaled
+
+rustscale's p50 latency (10.1 ms) is ~40x higher than tailscaled's (257 us).
+This is expected: tailscaled's gVisor netstack processes TCP in-process with
+Go's goroutine scheduler (sub-microsecond wakeups), while rustscale's
+smoltcp runs on a 2 ms poll interval. The throughput is higher because the
+poll interval doesn't limit total bandwidth (the socket buffers absorb
+bursts), but each round-trip incurs the poll-interval latency. Future work:
+event-driven smoltcp polling (wake on packet arrival, not timer-based).
 
 ### Notes
 
 - Both harnesses use ephemeral tailnets that are created and deleted per run.
 - On localhost, the path is typically **direct** (UDP loopback). DERP paths
   require network isolation (separate machines or UDP blocking).
-- The rustscale netstack uses a 1280-byte MTU (Tailscale default) with a 64KB
+- The rustscale netstack uses a 1280-byte MTU (Tailscale default) with a 256KB
   TCP socket buffer. The Go netstack uses similar defaults.
 - Throughput is limited by per-packet userspace processing overhead (WG
   encapsulation/decapsulation, smoltcp/gVisor TCP processing, magicsock IO).

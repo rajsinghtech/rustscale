@@ -44,11 +44,17 @@ use device::LoopbackDevice;
 /// Default MTU (Tailscale tailnet MTU is 1280).
 pub const DEFAULT_MTU: usize = 1280;
 
-/// TCP send/recv buffer size.
-const TCP_BUF: usize = 65_535;
+/// TCP send/recv buffer size. Tuned up from 65 KB to 256 KB so the socket
+/// can absorb more in-flight data per ACK round-trip, raising throughput
+/// before backpressure kicks in. (Go's gVisor netstack uses similar or
+/// larger defaults.)
+const TCP_BUF: usize = 256 * 1024;
 
 /// Poll-loop wake interval (drives timers, retransmissions, channel checks).
-const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+/// Kept short (2 ms) so the backpressure retry path is responsive: when the
+/// send buffer fills, the pending write is retried promptly once ACKs free
+/// capacity, rather than waiting a full 10 ms.
+const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(2);
 
 /// Errors from netstack operations.
 #[derive(Debug, thiserror::Error)]
@@ -298,6 +304,12 @@ struct ConnState {
     app_tx: mpsc::Sender<Vec<u8>>,
     /// Receives data (from the application stream) to write to the socket.
     app_rx: mpsc::Receiver<Vec<u8>>,
+    /// Unwritten tail of an app message that didn't fully fit in the smoltcp
+    /// TCP send buffer. Held until the socket has send capacity again. This
+    /// is the backpressure fix: previously `send_slice`'s return value was
+    /// ignored and the remainder was silently dropped, causing data loss
+    /// whenever the app produced faster than the TCP stack could push out.
+    pending_write: Vec<u8>,
 }
 
 /// A TCP listener's socket handle + accept channel sender.
@@ -347,7 +359,11 @@ fn make_stream_and_conn() -> (NetstackStream, ConnState) {
     let (app_tx, stream_rx) = mpsc::channel(64);
     let (stream_tx, app_rx) = mpsc::channel(64);
     let stream = NetstackStream::new(stream_rx, stream_tx);
-    let conn = ConnState { app_tx, app_rx };
+    let conn = ConnState {
+        app_tx,
+        app_rx,
+        pending_write: Vec::new(),
+    };
     (stream, conn)
 }
 
@@ -530,17 +546,27 @@ fn pump_connection(
     conns: &mut HashMap<SocketHandle, ConnState>,
 ) {
     // --- Read: socket -> app ---
+    // Only consume from the socket when the app channel has capacity, so
+    // smoltcp's TCP flow control applies backpressure to the sender instead
+    // of us dropping data when the app reads slower than the network
+    // delivers. If the channel is full, we leave the data in the socket's
+    // recv buffer; the TCP receive window shrinks and the sender backs off.
     let can_recv = sockets.get::<tcp::Socket>(handle).can_recv();
     if can_recv {
-        let socket = sockets.get_mut::<tcp::Socket>(handle);
-        let mut data = Vec::new();
-        let result = socket.recv(|buf| {
-            data = buf.to_vec();
-            (buf.len(), ())
-        });
-        if result.is_ok() && !data.is_empty() {
-            if let Some(conn) = conns.get(&handle) {
-                let _ = conn.app_tx.try_send(data);
+        let has_room = conns
+            .get(&handle)
+            .is_some_and(|conn| conn.app_tx.capacity() > 0);
+        if has_room {
+            let socket = sockets.get_mut::<tcp::Socket>(handle);
+            let mut data = Vec::new();
+            let result = socket.recv(|buf| {
+                data = buf.to_vec();
+                (buf.len(), ())
+            });
+            if result.is_ok() && !data.is_empty() {
+                if let Some(conn) = conns.get(&handle) {
+                    let _ = conn.app_tx.try_send(data);
+                }
             }
         }
     }
@@ -556,9 +582,30 @@ fn pump_connection(
     }
 
     // --- Write: app -> socket ---
+    // Flush any leftover from a previous cycle first, then drain the app
+    // channel. We respect `send_slice`'s return value: if it writes fewer
+    // bytes than offered (TCP send buffer full), we keep the remainder in
+    // `pending_write` and STOP draining the app channel. This applies
+    // backpressure up the mpsc chain — the bounded app_rx fills, which
+    // makes `NetstackStream::poll_write` return Pending to the app.
     let can_send = sockets.get::<tcp::Socket>(handle).can_send();
     if can_send {
         if let Some(conn) = conns.get_mut(&handle) {
+            // 1. Flush a previously-stored unwritten tail.
+            if !conn.pending_write.is_empty() {
+                let socket = sockets.get_mut::<tcp::Socket>(handle);
+                let written = socket.send_slice(&conn.pending_write).unwrap_or(0);
+                if written > 0 {
+                    conn.pending_write.drain(..written);
+                }
+                // If the tail still isn't fully flushed, wait for the next
+                // poll cycle (when ACKs free up send capacity).
+                if !conn.pending_write.is_empty() {
+                    return;
+                }
+            }
+
+            // 2. Drain newly-arrived app data.
             while let Ok(data) = conn.app_rx.try_recv() {
                 if data.is_empty() {
                     // App signaled close.
@@ -567,7 +614,13 @@ fn pump_connection(
                     break;
                 }
                 let socket = sockets.get_mut::<tcp::Socket>(handle);
-                let _ = socket.send_slice(&data);
+                let written = socket.send_slice(&data).unwrap_or(0);
+                if written < data.len() {
+                    // Socket send buffer filled — keep the remainder and
+                    // stop draining so the app channel applies pressure.
+                    conn.pending_write = data[written..].to_vec();
+                    break;
+                }
             }
         }
     }

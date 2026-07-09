@@ -19,6 +19,7 @@ tokio.workspace = true
 bytes.workspace = true
 rand.workspace = true
 hex.workspace = true
+if-addrs.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true

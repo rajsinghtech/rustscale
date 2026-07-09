@@ -438,6 +438,32 @@ in the initiation, but use current to avoid negotiation surprises.
   (bool/num/null, not just strings) — use `serde_json::Value`, not
   `#[serde(transparent)]` over `String`.
 
+- **DiscoKey + Endpoints must be pushed to the server BEFORE the streaming
+  MapResponse.** The control server processes the MapRequest body
+  asynchronously and generates the first streaming `MapResponse` from
+  registration data (which lacks `DiscoKey` and `Endpoints`). Peers
+  therefore see `DiscoKey=zero` and `Endpoints=[]` and can never initiate
+  disco probing for a direct path. Fix: send a lightweight non-streaming
+  `MapRequest` (`Stream=false, OmitPeers=true`) with `DiscoKey` +
+  `Endpoints` BEFORE starting the streaming long-poll. The server processes
+  this request, stores the DiscoKey/Endpoints, and the subsequent streaming
+  `MapResponse` includes peers with non-zero `DiscoKey` and populated
+  `Endpoints`. Without this, two nodes on the same machine stay on DERP
+  forever (13 Mbps, 69ms p50) instead of going direct (782 Mbps, 10ms p50).
+  Go avoids this because `updateControl` restarts the map poll when
+  endpoints change, effectively re-sending the MapRequest with updated
+  DiscoKey/Endpoints. The `MapRequest.Endpoints` field comment says
+  "Ignored when Stream and Version>=68" — the server still processes
+  DiscoKey from the MapRequest, but only when it's a fresh request, not
+  when it's bundled into the initial streaming response generation.
+
+- **Local interface endpoint gathering.** Go's `determineEndpoints`
+  (`magicsock.go:1285`) enumerates local interfaces via `netmon.LocalAddresses`
+  and pairs each up IPv4 address with the bound UDP port. Rustscale uses
+  the `if-addrs` crate (`get_if_addrs()`) in `gather_local_endpoints()`
+  (`magicsock/src/lib.rs`). Include LAN, tailnet, and loopback IPs —
+  loopback is essential for same-machine direct paths.
+
 ### DERP relay connection
 
 - **TLS SNI must use the DERP node `HostName`, not its IP.** Connecting TCP to

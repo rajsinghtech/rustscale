@@ -518,6 +518,56 @@ impl Server {
         state.node_id = reg_resp.User.ID;
         self.save_state(&state)?;
 
+        // 3b. Bind the UDP socket early so we can gather local interface
+        // endpoints (interface IP + bound port) and advertise them in the
+        // MapRequest. Magicsock takes ownership of this socket later, once
+        // the DERPMap/home-DERP are known from the first MapResponse.
+        // Without advertised endpoints, peers only learn our addresses via
+        // CallMeMaybe (one-shot, racy) and two nodes on the same machine
+        // never establish a direct UDP path — they stay on DERP.
+        let udp_socket = Arc::new(
+            tokio::net::UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], 0u16)))
+                .await
+                .map_err(TsnetError::Io)?,
+        );
+        let udp_port = udp_socket.local_addr().map_err(TsnetError::Io)?.port();
+        let local_endpoints = rustscale_magicsock::gather_local_endpoints(udp_port);
+        eprintln!("tsnet: local UDP endpoints: {local_endpoints:?}");
+
+        // 3c. Send a lightweight non-streaming MapRequest to push our
+        // DiscoKey + Endpoints to the control server BEFORE starting the
+        // streaming long-poll. The control server processes the MapRequest
+        // body asynchronously and the first streaming MapResponse is
+        // generated from registration data (which lacks DiscoKey/Endpoints).
+        // Without this pre-update, peers see DiscoKey=zero and Endpoints=[]
+        // and can never initiate disco probing for a direct path.
+        let endpoint_update_req = MapRequest {
+            Version: CAPABILITY_VERSION,
+            KeepAlive: false,
+            NodeKey: node_pub.clone(),
+            DiscoKey: disco_pub.clone(),
+            Stream: false,
+            OmitPeers: true,
+            Endpoints: local_endpoints.clone(),
+            Hostinfo: Some(Hostinfo {
+                OS: std::env::consts::OS.to_string(),
+                Hostname: self.config.hostname.clone(),
+                RoutableIPs: self.config.advertise_routes.clone(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let cc_ep = ControlClient::new(
+            self.config.control_url.clone(),
+            state.machine_key.clone(),
+            server_pub_key.clone(),
+            PROTOCOL_VERSION,
+        );
+        match cc_ep.fetch_map(&endpoint_update_req).await {
+            Ok(_) => eprintln!("tsnet: endpoint update sent (DiscoKey + {local_endpoints:?})"),
+            Err(e) => eprintln!("tsnet: endpoint update failed (non-fatal): {e}"),
+        }
+
         // 4. Start the map long-poll.
         let map_req = MapRequest {
             Version: CAPABILITY_VERSION,
@@ -525,6 +575,7 @@ impl Server {
             NodeKey: node_pub.clone(),
             DiscoKey: disco_pub.clone(),
             Stream: true,
+            Endpoints: local_endpoints.clone(),
             Hostinfo: Some(Hostinfo {
                 OS: std::env::consts::OS.to_string(),
                 Hostname: self.config.hostname.clone(),
@@ -606,7 +657,9 @@ impl Server {
             }
         };
 
-        // 8. Create magicsock.
+        // 8. Create magicsock, reusing the UDP socket bound in step 3b so
+        // the local endpoints advertised in the MapRequest match the socket
+        // magicsock actually owns and reads from.
         let magicsock = Arc::new(
             Magicsock::new(MagicsockConfig {
                 private_key: state.node_key.clone(),
@@ -614,7 +667,8 @@ impl Server {
                 derp_client,
                 derp_map: Some(derp_map.clone()),
                 home_derp_region: home_derp,
-                udp_bind: Some(SocketAddr::from(([0, 0, 0, 0], 0u16))),
+                udp_bind: None,
+                udp_socket: Some(udp_socket),
             })
             .await?,
         );

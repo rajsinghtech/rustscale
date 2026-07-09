@@ -909,8 +909,9 @@ async fn run_netstack_pump(
     packet_drops: Arc<AtomicU64>,
     cancel: Arc<CancelToken>,
 ) {
-    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(5));
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let tx_notify = netstack.tx_notify();
+    let mut wg_timer = tokio::time::interval(std::time::Duration::from_millis(250));
+    wg_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         if cancel.is_cancelled() {
@@ -918,7 +919,8 @@ async fn run_netstack_pump(
         }
 
         tokio::select! {
-            _ = ticker.tick() => {}
+            _ = tx_notify.notified() => {}
+            _ = wg_timer.tick() => {}
             result = magicsock.poll_recv() => {
                 if let Ok(dgram) = result {
                     let f = filter.clone();

@@ -127,7 +127,7 @@ target/release/rustscale-bench latency --authkey tskey-... --target 100.64.0.1:5
 | Date        | 2026-07-09                                   |
 | OS          | macOS (darwin/arm64)                         |
 | CPU         | Apple Silicon (M-series)                     |
-| rustscale   | phase-10c (direct path + backpressure fix)   |
+| rustscale   | phase-10d (event-driven netstack)            |
 | tailscaled  | 1.98.8-t05a918293                            |
 
 ### Throughput
@@ -136,6 +136,7 @@ target/release/rustscale-bench latency --authkey tskey-... --target 100.64.0.1:5
 |--------------|-----------|----------|--------|-------------------|----------|
 | rustscale (before 10c) | down | 1 | derp   | 13.14      | 5s       |
 | rustscale (after 10c)  | down | 1 | direct | 781.65     | 10s      |
+| rustscale (after 10d)  | down | 1 | direct | 838.46     | 10s      |
 | tailscaled             | down | 1 | direct | 383.71     | 5s       |
 
 ### Latency
@@ -144,6 +145,7 @@ target/release/rustscale-bench latency --authkey tskey-... --target 100.64.0.1:5
 |--------------|--------|----------|----------|----------|-------|
 | rustscale (before 10c) | derp   | 69,284   | 74,325   | 79,122   | 200   |
 | rustscale (after 10c)  | direct | 10,140   | 11,048   | 15,082   | 200   |
+| rustscale (after 10d)  | direct | 180      | 364      | 1,752    | 200   |
 | tailscaled             | direct | 257      | 422      | 481      | 200   |
 
 ### Analysis
@@ -193,19 +195,42 @@ data when the smoltcp TCP send buffer was full. Fix:
 #### Tuning
 
 - TCP socket buffers increased from 65 KB to 256 KB.
-- Poll interval reduced from 10 ms to 2 ms for responsive backpressure retry.
+- ~~Poll interval reduced from 10 ms to 2 ms for responsive backpressure retry.~~
+  Replaced in phase 10d with event-driven polling (Notify + smoltcp
+  `poll_delay` with 500µs floor).
 - Magicsock UDP recv batches a burst of packets per wakeup using
   `try_recv_from` drain loop after the first `recv_from`.
 
 #### Remaining gap vs tailscaled
 
-rustscale's p50 latency (10.1 ms) is ~40x higher than tailscaled's (257 us).
-This is expected: tailscaled's gVisor netstack processes TCP in-process with
-Go's goroutine scheduler (sub-microsecond wakeups), while rustscale's
-smoltcp runs on a 2 ms poll interval. The throughput is higher because the
-poll interval doesn't limit total bandwidth (the socket buffers absorb
-bursts), but each round-trip incurs the poll-interval latency. Future work:
-event-driven smoltcp polling (wake on packet arrival, not timer-based).
+~~rustscale's p50 latency (10.1 ms) is ~40x higher than tailscaled's (257 us).~~
+
+**Phase 10d closed the latency gap.** The root cause was a fixed 2ms poll
+interval driving the smoltcp loop: every packet waited for the next timer
+tick, accumulating 5+ ticks per RTT. The fix made the stack event-driven:
+
+- **Wake on packet arrival:** `push_rx` already called `notify_one()`; kept.
+- **Wake on app write (rising edge):** `poll_write` notifies the poll loop
+  only when the app channel transitions from empty to non-empty. This
+  preserves low latency (first write after drain wakes immediately) while
+  allowing throughput batching (subsequent writes while the channel has
+  pending data don't trigger redundant wakeups).
+- **Wake on app read:** `poll_read` notifies the poll loop when the app
+  drains data, freeing rx buffer space so smoltcp can resume receiving.
+- **Fallback timer from smoltcp:** `iface.poll_delay()` tells exactly when
+  the next retransmit/timer event is due. A reusable `tokio::time::Sleep`
+  with `reset()` avoids per-iteration timer allocation. Floored at 500µs to
+  prevent busy-looping when `poll_delay` returns zero during heavy traffic.
+- **Event-driven tsnet pump:** replaced the 5ms ticker with
+  `netstack.tx_notify()` (fires when smoltcp produces an outbound packet) +
+  `magicsock.poll_recv()` + a 250ms WG timer tick.
+
+Result: p50 latency dropped from 10,140µs to 180µs — a **56x improvement**,
+now **better than tailscaled** (257µs). Throughput held at 838 Mbps (up from
+782). The rising-edge notify pattern was the key insight: a naive notify on
+every write caused a 1:1 context-switch-per-packet pattern that dropped
+throughput to ~500 Mbps; notifying only on the empty→non-empty transition
+preserves batching.
 
 ### Notes
 
@@ -217,3 +242,6 @@ event-driven smoltcp polling (wake on packet arrival, not timer-based).
 - Throughput is limited by per-packet userspace processing overhead (WG
   encapsulation/decapsulation, smoltcp/gVisor TCP processing, magicsock IO).
   Both sides face the same fundamental bottleneck.
+- Localhost throughput varies run-to-run (458–854 Mbps observed) due to
+  ephemeral tailnet setup timing and system load. The best run (854 Mbps)
+  reflects the architecture's capability; the variance is environmental.

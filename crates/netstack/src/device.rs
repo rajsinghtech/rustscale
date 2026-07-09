@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::time::Instant;
+use tokio::sync::Notify;
 
 /// Shared packet queues for the loopback device.
 type Queue = Arc<Mutex<VecDeque<Vec<u8>>>>;
@@ -19,11 +20,17 @@ pub struct LoopbackDevice {
     rx: Queue,
     tx: Queue,
     mtu: usize,
+    tx_notify: Arc<Notify>,
 }
 
 impl LoopbackDevice {
-    pub fn new(rx: Queue, tx: Queue, mtu: usize) -> Self {
-        Self { rx, tx, mtu }
+    pub fn new(rx: Queue, tx: Queue, mtu: usize, tx_notify: Arc<Notify>) -> Self {
+        Self {
+            rx,
+            tx,
+            mtu,
+            tx_notify,
+        }
     }
 }
 
@@ -38,6 +45,7 @@ impl Device for LoopbackDevice {
                 OwnedRxToken { buf: p },
                 OwnedTxToken {
                     tx: self.tx.clone(),
+                    tx_notify: self.tx_notify.clone(),
                 },
             )
         })
@@ -46,6 +54,7 @@ impl Device for LoopbackDevice {
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
         Some(OwnedTxToken {
             tx: self.tx.clone(),
+            tx_notify: self.tx_notify.clone(),
         })
     }
 
@@ -71,6 +80,7 @@ impl RxToken for OwnedRxToken {
 /// A tx token that pushes the transmitted packet into the shared tx queue.
 pub struct OwnedTxToken {
     tx: Queue,
+    tx_notify: Arc<Notify>,
 }
 
 impl TxToken for OwnedTxToken {
@@ -80,6 +90,7 @@ impl TxToken for OwnedTxToken {
         if let Ok(mut q) = self.tx.lock() {
             q.push_back(buf);
         }
+        self.tx_notify.notify_one();
         result
     }
 }

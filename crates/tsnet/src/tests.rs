@@ -477,10 +477,16 @@ fn make_rig() -> (Arc<Netstack>, Arc<Netstack>, tokio::task::JoinHandle<()>) {
     let a_n = a_net.clone();
     let b_n = b_net.clone();
     let pump = tokio::spawn(async move {
+        let a_tx = a_n.tx_notify();
+        let b_tx = b_n.tx_notify();
         loop {
             let did = pump_cycle(&a_t, &b_t, &a_n, &b_n);
             if !did {
-                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                tokio::select! {
+                    _ = a_tx.notified() => {}
+                    _ = b_tx.notified() => {}
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+                }
             }
         }
     });

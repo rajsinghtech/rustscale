@@ -50,12 +50,6 @@ pub const DEFAULT_MTU: usize = 1280;
 /// larger defaults.)
 const TCP_BUF: usize = 256 * 1024;
 
-/// Poll-loop wake interval (drives timers, retransmissions, channel checks).
-/// Kept short (2 ms) so the backpressure retry path is responsive: when the
-/// send buffer fills, the pending write is retried promptly once ACKs free
-/// capacity, rather than waiting a full 10 ms.
-const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(2);
-
 /// Errors from netstack operations.
 #[derive(Debug, thiserror::Error)]
 pub enum NetstackError {
@@ -85,6 +79,7 @@ pub struct Netstack {
     tx_queue: Arc<std::sync::Mutex<VecDeque<Vec<u8>>>>,
     cmd_tx: mpsc::Sender<Command>,
     notify: Arc<Notify>,
+    tx_notify: Arc<Notify>,
 }
 
 /// A TCP listener accepting incoming tailnet connections.
@@ -113,15 +108,22 @@ pub struct NetstackStream {
     read_buf: Vec<u8>,
     /// Whether the remote has half-closed (EOF delivered).
     remote_closed: bool,
+    /// Wakes the poll loop on app read/write so it can process immediately.
+    notify: Arc<Notify>,
 }
 
 impl NetstackStream {
-    fn new(rx: mpsc::Receiver<Vec<u8>>, tx: mpsc::Sender<Vec<u8>>) -> Self {
+    fn new(
+        rx: mpsc::Receiver<Vec<u8>>,
+        tx: mpsc::Sender<Vec<u8>>,
+        notify: Arc<Notify>,
+    ) -> Self {
         Self {
             rx,
             tx,
             read_buf: Vec::new(),
             remote_closed: false,
+            notify,
         }
     }
 }
@@ -153,6 +155,7 @@ impl AsyncRead for NetstackStream {
                 if n < data.len() {
                     self.read_buf = data[n..].to_vec();
                 }
+                self.notify.notify_one();
                 std::task::Poll::Ready(Ok(()))
             }
             std::task::Poll::Ready(None) => {
@@ -174,8 +177,14 @@ impl AsyncWrite for NetstackStream {
             return std::task::Poll::Ready(Ok(0));
         }
         let chunk_len = buf.len().min(TCP_BUF);
+        let was_empty = self.tx.capacity() == self.tx.max_capacity();
         match self.tx.try_send(buf[..chunk_len].to_vec()) {
-            Ok(()) => std::task::Poll::Ready(Ok(chunk_len)),
+            Ok(()) => {
+                if was_empty {
+                    self.notify.notify_one();
+                }
+                std::task::Poll::Ready(Ok(chunk_len))
+            }
             Err(mpsc::error::TrySendError::Full(_)) => {
                 cx.waker().wake_by_ref();
                 std::task::Poll::Pending
@@ -221,9 +230,10 @@ impl Netstack {
         let rx_queue = Arc::new(std::sync::Mutex::new(VecDeque::new()));
         let tx_queue = Arc::new(std::sync::Mutex::new(VecDeque::new()));
         let notify = Arc::new(Notify::new());
+        let tx_notify = Arc::new(Notify::new());
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
 
-        let device = LoopbackDevice::new(rx_queue.clone(), tx_queue.clone(), mtu);
+        let device = LoopbackDevice::new(rx_queue.clone(), tx_queue.clone(), mtu, tx_notify.clone());
         tokio::spawn(poll_loop(addr, device, cmd_rx, notify.clone()));
 
         Self {
@@ -231,6 +241,7 @@ impl Netstack {
             tx_queue,
             cmd_tx,
             notify,
+            tx_notify,
         }
     }
 
@@ -277,6 +288,13 @@ impl Netstack {
     /// Wake the poll loop (e.g. after pushing rx packets from a sync context).
     pub fn wake(&self) {
         self.notify.notify_one();
+    }
+
+    /// Returns the notify handle that fires when smoltcp produces outbound
+    /// packets, so the data-plane pump can wake immediately instead of polling
+    /// on a fixed interval.
+    pub fn tx_notify(&self) -> Arc<Notify> {
+        self.tx_notify.clone()
     }
 }
 
@@ -355,10 +373,10 @@ fn to_smoltcp_v4(addr: Ipv4Addr) -> IpAddress {
 
 /// Create the channel pair + stream for a new connection.
 /// Returns (stream, ConnState).
-fn make_stream_and_conn() -> (NetstackStream, ConnState) {
+fn make_stream_and_conn(notify: Arc<Notify>) -> (NetstackStream, ConnState) {
     let (app_tx, stream_rx) = mpsc::channel(64);
     let (stream_tx, app_rx) = mpsc::channel(64);
-    let stream = NetstackStream::new(stream_rx, stream_tx);
+    let stream = NetstackStream::new(stream_rx, stream_tx, notify);
     let conn = ConnState {
         app_tx,
         app_rx,
@@ -393,12 +411,21 @@ async fn poll_loop(
     // port -> (listener_socket_handle, accept_sender)
     let mut listeners: HashMap<u16, ListenerEntry> = HashMap::new();
 
-    let mut interval = tokio::time::interval(POLL_INTERVAL);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let sleep = tokio::time::sleep(std::time::Duration::from_secs(1));
+    tokio::pin!(sleep);
 
     loop {
+        let fallback = match iface.poll_delay(smol_now(), &sockets) {
+            Some(d) => {
+                let micros = d.total_micros();
+                std::time::Duration::from_micros(micros.max(500))
+            }
+            None => std::time::Duration::from_secs(1),
+        };
+        sleep.as_mut().reset(tokio::time::Instant::now() + fallback);
+
         tokio::select! {
-            _ = interval.tick() => {}
+            _ = &mut sleep => {}
             () = notify.notified() => {}
             cmd = cmd_rx.recv() => {
                 match cmd {
@@ -431,7 +458,7 @@ async fn poll_loop(
                 let accepted = sockets.remove(lh);
                 let conn_handle = sockets.add(accepted);
 
-                let (stream, conn) = make_stream_and_conn();
+                let (stream, conn) = make_stream_and_conn(notify.clone());
                 conns.insert(conn_handle, conn);
 
                 if let Some((_, accept_tx)) = listeners.get(&port) {
@@ -456,7 +483,7 @@ async fn poll_loop(
                 State::Established => {
                     let pd = pending_dials.remove(&handle);
                     if let Some(pd) = pd {
-                        let (stream, conn) = make_stream_and_conn();
+                        let (stream, conn) = make_stream_and_conn(notify.clone());
                         conns.insert(handle, conn);
                         let _ = pd.reply.send(Ok(stream));
                     }

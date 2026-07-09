@@ -119,10 +119,16 @@ async fn back_to_back_dial_and_echo() {
     let a_net_p = a_net.clone();
     let b_net_p = b_net.clone();
     let pump = tokio::spawn(async move {
+        let a_tx = a_net_p.tx_notify();
+        let b_tx = b_net_p.tx_notify();
         loop {
             let did_work = pump_cycle(&a_tunn_p, &b_tunn_p, &a_net_p, &b_net_p);
             if !did_work {
-                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                tokio::select! {
+                    _ = a_tx.notified() => {}
+                    _ = b_tx.notified() => {}
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+                }
             }
         }
     });
@@ -218,10 +224,16 @@ async fn backpressure_large_transfer_no_loss() {
     let a_net_p = a_net.clone();
     let b_net_p = b_net.clone();
     let pump = tokio::spawn(async move {
+        let a_tx = a_net_p.tx_notify();
+        let b_tx = b_net_p.tx_notify();
         loop {
             let did_work = pump_cycle(&a_tunn_p, &b_tunn_p, &a_net_p, &b_net_p);
             if !did_work {
-                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                tokio::select! {
+                    _ = a_tx.notified() => {}
+                    _ = b_tx.notified() => {}
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+                }
             }
         }
     });
@@ -298,5 +310,116 @@ async fn backpressure_large_transfer_no_loss() {
     assert_eq!(
         received, payload,
         "byte mismatch: data arrived out of order or corrupted"
+    );
+}
+
+#[tokio::test]
+async fn latency_small_message_round_trip() {
+    let a_priv = NodePrivate::generate();
+    let b_priv = NodePrivate::generate();
+    let a_pub = a_priv.public();
+    let b_pub = b_priv.public();
+
+    let a_addr = Ipv4Addr::new(100, 64, 0, 1);
+    let b_addr = Ipv4Addr::new(100, 64, 0, 2);
+
+    let a_net = Arc::new(Netstack::new(a_addr, DEFAULT_MTU));
+    let b_net = Arc::new(Netstack::new(b_addr, DEFAULT_MTU));
+
+    let a_tunn = Arc::new(Mutex::new(
+        WgTunn::new(&a_priv, &b_pub, 1).expect("A tunnel"),
+    ));
+    let b_tunn = Arc::new(Mutex::new(
+        WgTunn::new(&b_priv, &a_pub, 2).expect("B tunnel"),
+    ));
+
+    let a_tunn_p = a_tunn.clone();
+    let b_tunn_p = b_tunn.clone();
+    let a_net_p = a_net.clone();
+    let b_net_p = b_net.clone();
+    let pump = tokio::spawn(async move {
+        let a_tx = a_net_p.tx_notify();
+        let b_tx = b_net_p.tx_notify();
+        loop {
+            let did_work = pump_cycle(&a_tunn_p, &b_tunn_p, &a_net_p, &b_net_p);
+            if !did_work {
+                tokio::select! {
+                    _ = a_tx.notified() => {}
+                    _ = b_tx.notified() => {}
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+                }
+            }
+        }
+    });
+
+    let mut listener = b_net.listen(30000).await.expect("listen");
+
+    let dial_result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        a_net.dial(SocketAddr::new(b_addr.into(), 30000)),
+    )
+    .await;
+    let mut a_stream = dial_result.expect("dial timed out").expect("dial failed");
+
+    let accept_result =
+        tokio::time::timeout(std::time::Duration::from_secs(10), listener.accept()).await;
+    let mut b_stream = accept_result
+        .expect("accept timed out")
+        .expect("accept failed");
+
+    let echo_task = tokio::spawn(async move {
+        let mut buf = [0u8; 8];
+        loop {
+            let n = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                tokio::io::AsyncReadExt::read(&mut b_stream, &mut buf),
+            )
+            .await;
+            match n {
+                Ok(Ok(0)) => break,
+                Ok(Ok(n)) => {
+                    tokio::io::AsyncWriteExt::write_all(&mut b_stream, &buf[..n])
+                        .await
+                        .expect("echo write");
+                }
+                _ => break,
+            }
+        }
+    });
+
+    const ROUNDS: usize = 100;
+    let msg = [0x42u8; 8];
+    let mut rtts: Vec<std::time::Duration> = Vec::with_capacity(ROUNDS);
+
+    for _ in 0..ROUNDS {
+        let start = std::time::Instant::now();
+        tokio::io::AsyncWriteExt::write_all(&mut a_stream, &msg)
+            .await
+            .expect("A write");
+        let mut resp = [0u8; 8];
+        tokio::io::AsyncReadExt::read_exact(&mut a_stream, &mut resp)
+            .await
+            .expect("A read");
+        rtts.push(start.elapsed());
+    }
+
+    tokio::io::AsyncWriteExt::shutdown(&mut a_stream).await.ok();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), echo_task).await;
+    pump.abort();
+
+    rtts.sort();
+    let p50 = rtts[ROUNDS / 2];
+    let p95 = rtts[ROUNDS * 95 / 100];
+    let p99 = rtts[ROUNDS * 99 / 100];
+
+    eprintln!(
+        "latency_small_message_round_trip: p50={:?} p95={:?} p99={:?}",
+        p50, p95, p99
+    );
+
+    assert!(
+        p50 < std::time::Duration::from_millis(20),
+        "p50 latency too high: {:?} (expected < 20ms)",
+        p50
     );
 }

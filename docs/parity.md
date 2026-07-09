@@ -10,7 +10,7 @@ update statuses as phases land.
 | Feature | Go source | Status |
 | --- | --- | --- |
 | MagicDNS + split DNS resolver | `net/dns/resolver/tsdns.go` | 🔶 resolver + 100.100.100.100 responder + unified dial done; split DNS via control `Routes` still ⬜ |
-| Let's Encrypt certs via control | `ipn/ipnlocal/cert.go` | 🔶 `ControlCertProvider` (cache/refresh/fallback) + `SetDNS` control call done; ACME order/finalize client deferred (needs HTTPS-enabled tailnet to e2e) |
+| Let's Encrypt certs via control | `ipn/ipnlocal/cert.go` | 🔶 `ControlCertProvider` (cache/refresh/fallback) + `SetDNS` control call done; ACME order client remaining — now e2e-testable (tailnet settings PATCH `httpsEnabled`, see docs/tailnet-testing.md) |
 | WhoIs (peer identity from conn) | `tsnet.Server.WhoIs` | ✅ `Server::whois` + `ts_whois` FFI (UserProfiles from netmap) |
 | Exit node support | LocalBackend/router/magicsock | ⬜ port-5 |
 | Network monitor (netmon) | `net/netmon/` | ⬜ port-3 |

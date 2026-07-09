@@ -52,7 +52,10 @@ impl NodePrivate {
 
     /// Derive the corresponding [`NodePublic`]. Panics if this key is zero.
     pub fn public(&self) -> NodePublic {
-        assert!(!self.is_zero(), "can't take the public key of a zero NodePrivate");
+        assert!(
+            !self.is_zero(),
+            "can't take the public key of a zero NodePrivate"
+        );
         NodePublic {
             k: boxcrypto::derive_public(&self.k),
         }
@@ -64,11 +67,7 @@ impl NodePrivate {
     }
 
     /// Seal `cleartext` to `peer` from this key, returning `nonce(24) || ct`.
-    pub fn seal_to(
-        &self,
-        peer: &NodePublic,
-        cleartext: &[u8],
-    ) -> Result<Vec<u8>, KeyError> {
+    pub fn seal_to(&self, peer: &NodePublic, cleartext: &[u8]) -> Result<Vec<u8>, KeyError> {
         if self.is_zero() || peer.is_zero() {
             return Err(KeyError::ZeroKey);
         }
@@ -76,11 +75,7 @@ impl NodePrivate {
     }
 
     /// Open a box sealed from `peer` to this key. Returns `None` on failure.
-    pub fn open_from(
-        &self,
-        peer: &NodePublic,
-        ciphertext: &[u8],
-    ) -> Option<Vec<u8>> {
+    pub fn open_from(&self, peer: &NodePublic, ciphertext: &[u8]) -> Option<Vec<u8>> {
         if self.is_zero() || peer.is_zero() {
             return None;
         }

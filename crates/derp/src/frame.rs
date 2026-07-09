@@ -134,10 +134,7 @@ mod tests {
         // SendPacket len 1024
         let mut buf = Vec::new();
         write_frame_header(&mut buf, frame_type::SEND_PACKET, 1024).unwrap();
-        assert_eq!(
-            buf,
-            vec![frame_type::SEND_PACKET, 0x00, 0x00, 0x04, 0x00]
-        );
+        assert_eq!(buf, vec![frame_type::SEND_PACKET, 0x00, 0x00, 0x04, 0x00]);
 
         // KeepAlive len 0
         let mut buf = Vec::new();
@@ -147,10 +144,7 @@ mod tests {
         // RecvPacket max len
         let mut buf = Vec::new();
         write_frame_header(&mut buf, frame_type::RECV_PACKET, 0xffff_ffff).unwrap();
-        assert_eq!(
-            buf,
-            vec![frame_type::RECV_PACKET, 0xff, 0xff, 0xff, 0xff]
-        );
+        assert_eq!(buf, vec![frame_type::RECV_PACKET, 0xff, 0xff, 0xff, 0xff]);
     }
 
     #[test]
@@ -197,7 +191,8 @@ mod tests {
 
             let mut cursor = Cursor::new(&out[..]);
             let mut buf = Vec::new();
-            let (got_typ, got_len) = read_frame(&mut cursor, MAX_PACKET_SIZE as u32, &mut buf).unwrap();
+            let (got_typ, got_len) =
+                read_frame(&mut cursor, MAX_PACKET_SIZE as u32, &mut buf).unwrap();
             assert_eq!(got_typ, typ);
             assert_eq!(got_len as usize, body.len());
             assert_eq!(buf, body);

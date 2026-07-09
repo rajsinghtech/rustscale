@@ -30,8 +30,8 @@ pub use message::{
     BIND_UDP_RELAY_ENDPOINT_COMMON_LEN, MESSAGE_HEADER_LEN, PING_LEN, PONG_LEN,
     TYPE_ALLOCATE_UDP_RELAY_ENDPOINT_REQUEST, TYPE_ALLOCATE_UDP_RELAY_ENDPOINT_RESPONSE,
     TYPE_BIND_UDP_RELAY_ENDPOINT, TYPE_BIND_UDP_RELAY_ENDPOINT_ANSWER,
-    TYPE_BIND_UDP_RELAY_ENDPOINT_CHALLENGE, TYPE_CALL_ME_MAYBE, TYPE_CALL_ME_MAYBE_VIA,
-    TYPE_PING, TYPE_PONG, UDP_RELAY_ENDPOINT_LEN_MINUS_ADDRPORTS,
+    TYPE_BIND_UDP_RELAY_ENDPOINT_CHALLENGE, TYPE_CALL_ME_MAYBE, TYPE_CALL_ME_MAYBE_VIA, TYPE_PING,
+    TYPE_PONG, UDP_RELAY_ENDPOINT_LEN_MINUS_ADDRPORTS,
 };
 pub use wire::AddrPort;
 
@@ -342,14 +342,8 @@ mod tests {
 
     #[test]
     fn parse_short_returns_short_error() {
-        assert!(matches!(
-            Message::parse(&[0x01]),
-            Err(DiscoError::Short)
-        ));
-        assert!(matches!(
-            Message::parse(&[]),
-            Err(DiscoError::Short)
-        ));
+        assert!(matches!(Message::parse(&[0x01]), Err(DiscoError::Short)));
+        assert!(matches!(Message::parse(&[]), Err(DiscoError::Short)));
     }
 
     #[test]

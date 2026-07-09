@@ -8,11 +8,11 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    append_hex_key, clamp25519, ct_eq, parse_typed_hex, redacted, KeyError, KEY_LEN,
-    DISCO_PUB_PREFIX, PRIV_PREFIX,
+    append_hex_key, clamp25519, ct_eq, parse_typed_hex, redacted, KeyError, DISCO_PUB_PREFIX,
+    KEY_LEN, PRIV_PREFIX,
 };
 
-use crypto_box::{PublicKey, SecretKey, SalsaBox};
+use crypto_box::{PublicKey, SalsaBox, SecretKey};
 
 /// A disco private key, used for NAT-traversal path discovery.
 ///
@@ -55,7 +55,10 @@ impl DiscoPrivate {
 
     /// Derive the corresponding [`DiscoPublic`]. Panics if this key is zero.
     pub fn public(&self) -> DiscoPublic {
-        assert!(!self.is_zero(), "can't take the public key of a zero DiscoPrivate");
+        assert!(
+            !self.is_zero(),
+            "can't take the public key of a zero DiscoPrivate"
+        );
         DiscoPublic {
             k: crate::boxcrypto::derive_public(&self.k),
         }
@@ -265,9 +268,7 @@ impl DiscoShared {
             return None;
         }
         let nonce = GenericArray::from_slice(&ciphertext[..crate::NONCE_LEN]);
-        salsa
-            .decrypt(nonce, &ciphertext[crate::NONCE_LEN..])
-            .ok()
+        salsa.decrypt(nonce, &ciphertext[crate::NONCE_LEN..]).ok()
     }
 }
 

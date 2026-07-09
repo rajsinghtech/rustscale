@@ -56,7 +56,9 @@ impl<'de> Deserialize<'de> for MeshKey {
     {
         let s: String = Deserialize::deserialize(d)?;
         if s.len() != 64 {
-            return Err(serde::de::Error::custom("invalid mesh key: must be 64 hex chars"));
+            return Err(serde::de::Error::custom(
+                "invalid mesh key: must be 64 hex chars",
+            ));
         }
         let mut bytes = [0u8; 32];
         hex::decode_to_slice(&s, &mut bytes)
@@ -85,9 +87,17 @@ pub struct ClientInfo {
 pub struct ServerInfo {
     #[serde(rename = "version", default, skip_serializing_if = "is_zero_u32")]
     pub version: u32,
-    #[serde(rename = "TokenBucketBytesPerSecond", default, skip_serializing_if = "is_zero_u32")]
+    #[serde(
+        rename = "TokenBucketBytesPerSecond",
+        default,
+        skip_serializing_if = "is_zero_u32"
+    )]
     pub token_bucket_bytes_per_second: u32,
-    #[serde(rename = "TokenBucketBytesBurst", default, skip_serializing_if = "is_zero_u32")]
+    #[serde(
+        rename = "TokenBucketBytesBurst",
+        default,
+        skip_serializing_if = "is_zero_u32"
+    )]
     pub token_bucket_bytes_burst: u32,
 }
 
@@ -174,7 +184,11 @@ pub fn parse_received(
                 0
             };
 
-            Some(Received::PeerPresent { key, ip_port, flags })
+            Some(Received::PeerPresent {
+                key,
+                ip_port,
+                flags,
+            })
         }
         ft::RECV_PACKET => {
             if body.len() < KEY_LEN_BYTES {

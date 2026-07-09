@@ -5,7 +5,7 @@ use crate::{KeyError, NONCE_LEN};
 
 use crypto_box::{
     aead::{generic_array::GenericArray, Aead},
-    PublicKey, SecretKey, SalsaBox,
+    PublicKey, SalsaBox, SecretKey,
 };
 use rand::RngCore;
 
@@ -38,11 +38,7 @@ pub(crate) fn seal(
 /// Open a `nonce(24) || ciphertext` box addressed to `my_sk` from `peer_pk`.
 /// Returns `None` on any authentication or length failure (matching Go's
 /// `(cleartext, ok bool)`).
-pub(crate) fn open(
-    my_sk: &[u8; 32],
-    peer_pk: &[u8; 32],
-    ciphertext: &[u8],
-) -> Option<Vec<u8>> {
+pub(crate) fn open(my_sk: &[u8; 32], peer_pk: &[u8; 32], ciphertext: &[u8]) -> Option<Vec<u8>> {
     if ciphertext.len() < NONCE_LEN {
         return None;
     }

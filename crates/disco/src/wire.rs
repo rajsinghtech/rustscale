@@ -55,7 +55,6 @@ impl AddrPort {
         let port = u16::from_be_bytes([buf[16], buf[17]]);
         Self::from16(ip16, port)
     }
-
 }
 
 fn map_from_16(bytes: [u8; 16]) -> IpAddr {
@@ -121,7 +120,9 @@ mod tests {
     #[test]
     fn v6_encodes_directly() {
         let ap = AddrPort::new(
-            IpAddr::V6(Ipv6Addr::from([0x20, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x34, 0x56, 0, 0])),
+            IpAddr::V6(Ipv6Addr::from([
+                0x20, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x34, 0x56, 0, 0,
+            ])),
             789,
         );
         let buf = encode_buf(&ap);

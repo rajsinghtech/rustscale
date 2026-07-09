@@ -9,11 +9,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::boxcrypto;
 use crate::{
-    append_hex_key, clamp25519, ct_eq, debug32, parse_typed_hex, redacted, KeyError,
-    KEY_LEN, MACHINE_PUB_PREFIX, PRIV_PREFIX,
+    append_hex_key, clamp25519, ct_eq, debug32, parse_typed_hex, redacted, KeyError, KEY_LEN,
+    MACHINE_PUB_PREFIX, PRIV_PREFIX,
 };
 
-use crypto_box::{PublicKey, SecretKey, SalsaBox};
+use crypto_box::{PublicKey, SalsaBox, SecretKey};
 
 /// A machine private key, used for control-plane communication.
 ///
@@ -55,7 +55,10 @@ impl MachinePrivate {
 
     /// Derive the corresponding [`MachinePublic`]. Panics if this key is zero.
     pub fn public(&self) -> MachinePublic {
-        assert!(!self.is_zero(), "can't take the public key of a zero MachinePrivate");
+        assert!(
+            !self.is_zero(),
+            "can't take the public key of a zero MachinePrivate"
+        );
         MachinePublic {
             k: boxcrypto::derive_public(&self.k),
         }
@@ -67,11 +70,7 @@ impl MachinePrivate {
     }
 
     /// Seal `cleartext` to `peer`, returning `nonce(24) || ct`.
-    pub fn seal_to(
-        &self,
-        peer: &MachinePublic,
-        cleartext: &[u8],
-    ) -> Result<Vec<u8>, KeyError> {
+    pub fn seal_to(&self, peer: &MachinePublic, cleartext: &[u8]) -> Result<Vec<u8>, KeyError> {
         if self.is_zero() || peer.is_zero() {
             return Err(KeyError::ZeroKey);
         }
@@ -79,11 +78,7 @@ impl MachinePrivate {
     }
 
     /// Open a box from `peer`. Returns `None` on failure.
-    pub fn open_from(
-        &self,
-        peer: &MachinePublic,
-        ciphertext: &[u8],
-    ) -> Option<Vec<u8>> {
+    pub fn open_from(&self, peer: &MachinePublic, ciphertext: &[u8]) -> Option<Vec<u8>> {
         if self.is_zero() || peer.is_zero() {
             return None;
         }
@@ -268,9 +263,7 @@ impl MachinePrecomputedSharedKey {
             return None;
         }
         let nonce = GenericArray::from_slice(&ciphertext[..crate::NONCE_LEN]);
-        salsa
-            .decrypt(nonce, &ciphertext[crate::NONCE_LEN..])
-            .ok()
+        salsa.decrypt(nonce, &ciphertext[crate::NONCE_LEN..]).ok()
     }
 }
 
@@ -328,7 +321,9 @@ mod tests {
         let shared = a.shared_key(&evil.public());
         assert!(shared.open(&[0u8; 40]).is_none());
         assert!(MachinePrecomputedSharedKey::zero().seal(b"x").is_err());
-        assert!(MachinePrecomputedSharedKey::zero().open(&[0u8; 40]).is_none());
+        assert!(MachinePrecomputedSharedKey::zero()
+            .open(&[0u8; 40])
+            .is_none());
     }
 
     #[test]
@@ -337,7 +332,9 @@ mod tests {
         let json = serde_json::to_string(&privk).unwrap();
         assert!(json.starts_with("\"privkey:"));
         assert_eq!(
-            serde_json::from_str::<MachinePrivate>(&json).unwrap().raw32(),
+            serde_json::from_str::<MachinePrivate>(&json)
+                .unwrap()
+                .raw32(),
             privk.raw32()
         );
         let pubj = serde_json::to_string(&privk.public()).unwrap();

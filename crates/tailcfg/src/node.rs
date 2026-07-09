@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 use rustscale_key::{DiscoPublic, MachinePublic, NodePublic};
 
 use crate::{
-    skip_default, skip_zero_disco, skip_zero_machine, CapabilityVersion, NodeCapability,
-    NodeID, OptBool, RawMessage, StableNodeID, UserID,
+    skip_default, skip_zero_disco, skip_zero_machine, CapabilityVersion, NodeCapability, NodeID,
+    OptBool, RawMessage, StableNodeID, UserID,
 };
 
 /// A Tailscale device in a tailnet (subset of Go's `tailcfg.Node`).
@@ -226,7 +226,11 @@ mod tests {
             Name: "host.tail-scale.ts.net.".into(),
             User: 7,
             Key: np,
-            KeyExpiry: Some(DateTime::parse_from_rfc3339("2025-12-31T23:59:59Z").unwrap().with_timezone(&Utc)),
+            KeyExpiry: Some(
+                DateTime::parse_from_rfc3339("2025-12-31T23:59:59Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
             Machine: mp,
             DiscoKey: dp,
             Addresses: vec!["100.64.0.1/32".into(), "fd7a:115c::1/128".into()],
@@ -244,7 +248,11 @@ mod tests {
                 }],
                 ..Default::default()
             }),
-            Created: Some(DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z").unwrap().with_timezone(&Utc)),
+            Created: Some(
+                DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
             Cap: 999,
             Tags: vec!["tag:prod".into()],
             Online: Some(true),

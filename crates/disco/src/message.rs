@@ -103,7 +103,11 @@ impl Message {
     pub fn summary(&self) -> String {
         match self {
             Message::Ping(m) => {
-                format!("ping tx={} padding={}", hex::encode(&m.tx_id[..6]), m.padding)
+                format!(
+                    "ping tx={} padding={}",
+                    hex::encode(&m.tx_id[..6]),
+                    m.padding
+                )
             }
             Message::Pong(m) => format!("pong tx={}", hex::encode(&m.tx_id[..6])),
             Message::CallMeMaybe(_) => "call-me-maybe".into(),
@@ -306,8 +310,7 @@ macro_rules! bind_relay_msg {
                 let mut out = vec![0u8; MESSAGE_HEADER_LEN + BIND_UDP_RELAY_ENDPOINT_COMMON_LEN];
                 out[0] = $type_byte;
                 out[1] = V0;
-                self.common
-                    .encode_to(&mut out[MESSAGE_HEADER_LEN..]);
+                self.common.encode_to(&mut out[MESSAGE_HEADER_LEN..]);
                 out
             }
         }
@@ -520,10 +523,7 @@ impl AllocateUdpRelayEndpointRequest {
     }
 }
 
-fn parse_allocate_udp_relay_endpoint_request(
-    ver: u8,
-    body: &[u8],
-) -> Result<Message, DiscoError> {
+fn parse_allocate_udp_relay_endpoint_request(ver: u8, body: &[u8]) -> Result<Message, DiscoError> {
     let mut m = AllocateUdpRelayEndpointRequest {
         client_disco: zero_disco_pair(),
         generation: 0,
@@ -568,10 +568,7 @@ impl AllocateUdpRelayEndpointResponse {
     }
 }
 
-fn parse_allocate_udp_relay_endpoint_response(
-    ver: u8,
-    body: &[u8],
-) -> Result<Message, DiscoError> {
+fn parse_allocate_udp_relay_endpoint_response(ver: u8, body: &[u8]) -> Result<Message, DiscoError> {
     let mut m = AllocateUdpRelayEndpointResponse {
         generation: 0,
         endpoint: UdpRelayEndpoint {

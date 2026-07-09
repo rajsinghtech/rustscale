@@ -17,9 +17,7 @@ mod machine;
 mod node;
 
 pub use disco::{DiscoPrivate, DiscoPublic, DiscoShared};
-pub use machine::{
-    MachinePrecomputedSharedKey, MachinePrivate, MachinePublic,
-};
+pub use machine::{MachinePrecomputedSharedKey, MachinePrivate, MachinePublic};
 pub use node::{NodePrivate, NodePublic};
 
 use std::fmt;
@@ -148,7 +146,10 @@ mod tests {
     fn typed_hex_roundtrips() {
         let bytes = [0xab; KEY_LEN];
         let s = append_hex_key(NODE_PUB_PREFIX, &bytes);
-        assert_eq!(s, "nodekey:abababababababababababababababababababababababababababababababab");
+        assert_eq!(
+            s,
+            "nodekey:abababababababababababababababababababababababababababababababab"
+        );
         let mut out = [0u8; KEY_LEN];
         parse_typed_hex(&s, NODE_PUB_PREFIX, &mut out).unwrap();
         assert_eq!(out, bytes);

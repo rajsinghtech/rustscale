@@ -213,11 +213,7 @@ impl DerpClient {
     // ---- send methods ----
 
     /// Send a packet to `dst`.
-    pub async fn send_packet(
-        &mut self,
-        dst: NodePublic,
-        pkt: &[u8],
-    ) -> Result<(), DerpError> {
+    pub async fn send_packet(&mut self, dst: NodePublic, pkt: &[u8]) -> Result<(), DerpError> {
         if pkt.len() > MAX_PACKET_SIZE {
             return Err(DerpError::PacketTooLarge(pkt.len()));
         }
@@ -338,10 +334,7 @@ mod tests {
                 ..Default::default()
             };
             let si_json = serde_json::to_vec(&si).unwrap();
-            let si_box = self
-                .server_priv
-                .seal_to(&client_pub, &si_json)
-                .unwrap();
+            let si_box = self.server_priv.seal_to(&client_pub, &si_json).unwrap();
             write_frame_async(&mut s, frame_type::SERVER_INFO, &si_box)
                 .await
                 .unwrap();
@@ -404,10 +397,7 @@ mod tests {
 
         // Send a packet and expect it echoed back.
         let data = b"hello derp echo";
-        client
-            .send_packet(server_pub, data)
-            .await
-            .unwrap();
+        client.send_packet(server_pub, data).await.unwrap();
 
         let msg = client.recv().await.unwrap();
         match msg {

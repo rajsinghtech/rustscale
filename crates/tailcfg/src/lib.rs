@@ -16,12 +16,9 @@ mod register;
 pub use derpmap::{DERPHomeParams, DERPMap, DERPNode, DERPRegion};
 pub use map::{MapRequest, MapResponse};
 pub use node::{
-    Endpoint, EndpointType, Hostinfo, Location, NetInfo, Node, NodeCapMap, Service,
-    ServiceProto,
+    Endpoint, EndpointType, Hostinfo, Location, NetInfo, Node, NodeCapMap, Service, ServiceProto,
 };
-pub use register::{
-    Login, LoginID, RegisterRequest, RegisterResponse, RegisterResponseAuth, User,
-};
+pub use register::{Login, LoginID, RegisterRequest, RegisterResponse, RegisterResponseAuth, User};
 
 pub use rustscale_key::{
     DiscoPublic as DiscoKey, MachinePublic as MachineKey, NodePublic as NodeKey,
@@ -47,7 +44,11 @@ pub enum OptBool {
 impl OptBool {
     /// Construct from a plain `bool`.
     pub fn new(v: bool) -> Self {
-        if v { Self::True } else { Self::False }
+        if v {
+            Self::True
+        } else {
+            Self::False
+        }
     }
 
     /// The underlying `bool` if set, else `None`.
@@ -226,7 +227,9 @@ mod tests {
             #[serde(default, skip_serializing_if = "OptBool::is_unset")]
             flag: OptBool,
         }
-        let w = Wrap { flag: OptBool::Unset };
+        let w = Wrap {
+            flag: OptBool::Unset,
+        };
         assert_eq!(serde_json::to_string(&w).unwrap(), "{}");
         let back: Wrap = serde_json::from_str("{}").unwrap();
         assert_eq!(back.flag, OptBool::Unset);

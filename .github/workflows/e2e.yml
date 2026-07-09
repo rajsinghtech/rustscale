@@ -1,0 +1,53 @@
+name: E2E
+
+# Ephemeral-tailnet e2e tests. Runs on master pushes only (not every PR) to keep
+# GitHub API and Tailscale API usage low. Manual trigger available.
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  e2e:
+    name: Ephemeral tailnet E2E
+    # WIF subject binding is repo:rajsinghtech* — forks can't mint the token.
+    if: github.repository == 'rajsinghtech/rustscale'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      id-token: write # mint GitHub OIDC JWT for Tailscale WIF token-exchange
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Same WIF client tailgate uses; no long-lived secret in CI.
+      - name: Mint Tailscale org token via GitHub OIDC (WIF)
+        id: tsauth
+        run: |
+          AUD="api.tailscale.com/TbqNGJkY5611CNTRL-kz4CwX2LK721CNTRL"
+          JWT=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$AUD" | jq -r '.value')
+          echo "::add-mask::$JWT"
+          TOKEN=$(curl -sS -X POST https://api.tailscale.com/api/v2/oauth/token-exchange \
+            -H 'Content-Type: application/x-www-form-urlencoded' \
+            -d 'client_id=TbqNGJkY5611CNTRL-kz4CwX2LK721CNTRL' -d "jwt=$JWT" | jq -r '.access_token')
+          if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then echo "OIDC token-exchange failed" >&2; exit 1; fi
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+
+      # Creates an ephemeral tailnet, exports TS_E2E_* env for the tests, and
+      # guarantees deletion via the child oauthClient creds (the org client is
+      # tailnets-scope only — see docs/tailnet-testing.md).
+      - name: Run e2e tests against ephemeral tailnet
+        env:
+          TS_ORG_TOKEN: ${{ steps.tsauth.outputs.token }}
+        run: tools/e2e.sh

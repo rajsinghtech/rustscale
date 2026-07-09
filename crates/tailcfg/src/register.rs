@@ -166,6 +166,8 @@ mod tests {
         let keyed = RegisterResponseAuth {
             AuthKey: "tskey-abc".into(),
         };
-        assert!(serde_json::to_string(&keyed).unwrap().contains("\"AuthKey\":\"tskey-abc\""));
+        assert!(serde_json::to_string(&keyed)
+            .unwrap()
+            .contains("\"AuthKey\":\"tskey-abc\""));
     }
 }

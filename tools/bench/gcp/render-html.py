@@ -92,19 +92,33 @@ def fmt_mbps(n: float) -> str:
 # Bar-chart data preparation.
 # ---------------------------------------------------------------------------
 def throughput_chart_data(runs_idx: dict, topo: str, path: str) -> dict:
-    """Return {parallels: [...], series: {config: [mbps per parallel]}}."""
+    """Return {parallels: [...], series: {config: [mbps per parallel]},
+    failed: {config: bool}, errors: {config: str}}."""
     series = {}
+    failed = {}
+    errors = {}
     for cfg in CONFIGS:
         run = runs_idx.get((topo, path, cfg))
         vals = []
         if run:
+            err = run.get("error", "")
+            if err:
+                failed[cfg] = True
+                errors[cfg] = err
             tp = {t["parallel"]: t.get("mbps", 0) for t in run.get("throughput", [])}
             for p in PARALLELS:
                 vals.append(float(tp.get(p, 0)))
         else:
+            failed[cfg] = True
+            errors[cfg] = "missing (no JSON)"
             vals = [0.0] * len(PARALLELS)
         series[cfg] = vals
-    return {"parallels": PARALLELS, "series": series}
+    return {
+        "parallels": PARALLELS,
+        "series": series,
+        "failed": failed,
+        "errors": errors,
+    }
 
 
 def latency_chart_data(runs_idx: dict) -> dict:
@@ -143,6 +157,7 @@ def footprint_rows(runs_idx: dict) -> list:
                     "topo": topo,
                     "path": path,
                     "config": cfg,
+                    "error": run.get("error", ""),
                     "binary_bytes": int(foot.get("binary_size_bytes", 0)),
                     "rss_peak_kb": int(foot.get("rss_peak_kb", 0)),
                     "rss_avg_kb": int(foot.get("rss_avg_kb", 0)),
@@ -259,6 +274,54 @@ details.detail-card pre {
 }
 .empty { color: var(--fg-dim); padding: 20px; text-align: center; }
 .hidden { display: none !important; }
+/* Failed-run styling. */
+.failed-banner {
+  background: rgba(239,68,68,0.12); border: 1px solid var(--bad);
+  border-radius: 8px; padding: 14px 18px; margin-bottom: 22px;
+}
+.failed-banner h2 { color: var(--bad); border-bottom: none; margin: 0 0 8px; }
+.failed-banner .count { font-size: 13px; color: var(--fg-dim); margin-bottom: 10px; }
+table.failed-runs {
+  width: 100%; border-collapse: collapse; font-size: 13px;
+}
+table.failed-runs th, table.failed-runs td {
+  padding: 7px 10px; text-align: left; border-bottom: 1px solid var(--border);
+}
+table.failed-runs th { color: var(--fg-dim); font-size: 11px; text-transform: uppercase; }
+table.failed-runs td.error { color: var(--bad); font-family: monospace; font-size: 12px; }
+table.failed-runs details { margin-top: 4px; }
+table.failed-runs details summary { cursor: pointer; font-size: 12px; color: var(--fg-dim); }
+table.failed-runds pre, table.failed-runs pre {
+  background: var(--bg); border: 1px solid var(--border); border-radius: 4px;
+  padding: 8px; font-size: 11px; overflow-x: auto; margin-top: 6px;
+  white-space: pre-wrap; word-break: break-all; max-height: 300px; overflow-y: auto;
+}
+.chart-card.has-failures { border-color: var(--bad); }
+.chart-card .fail-badge {
+  display: inline-block; background: var(--bad); color: #fff;
+  font-size: 10px; padding: 2px 7px; border-radius: 3px; margin-left: 8px;
+  font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;
+}
+.detail-card.has-error summary { color: var(--bad); }
+.detail-card .error-box {
+  background: rgba(239,68,68,0.10); border: 1px solid var(--bad);
+  border-radius: 6px; padding: 10px 14px; margin-top: 8px;
+}
+.detail-card .error-box .label { color: var(--bad); font-weight: 600; font-size: 12px; }
+.detail-card .error-box .reason { font-family: monospace; font-size: 13px; }
+.detail-card details.log-tail { margin-top: 8px; }
+.detail-card details.log-tail summary { cursor: pointer; font-size: 12px; color: var(--fg-dim); }
+.detail-card details.log-tail pre {
+  background: var(--bg); border: 1px solid var(--border); border-radius: 4px;
+  padding: 10px; font-size: 11px; overflow-x: auto; margin-top: 6px;
+  white-space: pre-wrap; word-break: break-all; max-height: 300px; overflow-y: auto;
+}
+table.footprint td.status-failed {
+  color: var(--bad); font-weight: 600; font-size: 11px; text-transform: uppercase;
+}
+table.footprint td.status-ok {
+  color: var(--good); font-size: 11px;
+}
 </style>
 </head>
 <body>
@@ -290,8 +353,14 @@ def emit_throughput_charts(runs_idx: dict) -> str:
             cid = f"tp-{topo}-{path}"
             data = throughput_chart_data(runs_idx, topo, path)
             data["title"] = f"{topo} / {path}"
-            parts.append(f"""<div class="chart-card throughput-card" data-topo="{topo}" data-path="{path}">
-  <h3>{html.escape(data["title"])} — throughput (Mbps)</h3>
+            n_failed = len(data["failed"])
+            fail_badge = ""
+            card_class = "chart-card throughput-card"
+            if n_failed:
+                fail_badge = f'<span class="fail-badge">{n_failed} failed</span>'
+                card_class += " has-failures"
+            parts.append(f"""<div class="{card_class}" data-topo="{topo}" data-path="{path}">
+  <h3>{html.escape(data["title"])} — throughput (Mbps){fail_badge}</h3>
   <canvas id="{cid}"></canvas>
 </div>""")
     parts.append("</div>")
@@ -351,7 +420,8 @@ def emit_footprint_table(runs_idx: dict) -> str:
         }
     out = [
         '<table class="footprint" id="footprint-table">',
-        '<thead><tr><th class="label">topology / path</th><th class="label">config</th>',
+        '<thead><tr><th class="label">topology / path</th><th class="label">config</th>'
+        '<th>status</th>',
         '<th>binary size</th><th>RSS peak</th><th>RSS avg</th>',
         '<th>CPU peak %</th><th>CPU avg %</th><th>samples</th></tr></thead>',
         '<tbody>',
@@ -361,11 +431,18 @@ def emit_footprint_table(runs_idx: dict) -> str:
         b = best[key]
         def cls(metric, val):
             return "best" if val == b[metric] and val > 0 else ""
+        if r["error"]:
+            status_cls = "status-failed"
+            status_text = f"FAILED: {html.escape(r['error'])}"
+        else:
+            status_cls = "status-ok"
+            status_text = "OK"
         out.append(
             f'<tr class="footprint-row" data-topo="{r["topo"]}" data-path="{r["path"]}" '
             f'data-config="{r["config"]}" data-mode="{"tun" if r["config"].endswith("tun") else "userspace"}">'
             f'<td class="label">{r["topo"]} / {r["path"]}</td>'
             f'<td class="label" style="color:{CONFIG_COLORS[r["config"]]}">{html.escape(CONFIG_LABELS[r["config"]])}</td>'
+            f'<td class="{status_cls}">{status_text}</td>'
             f'<td class="{cls("binary_bytes", r["binary_bytes"])}">{fmt_bytes(r["binary_bytes"])}</td>'
             f'<td class="{cls("rss_peak_kb", r["rss_peak_kb"])}">{fmt_kb(r["rss_peak_kb"])}</td>'
             f'<td class="{cls("rss_avg_kb", r["rss_avg_kb"])}">{fmt_kb(r["rss_avg_kb"])}</td>'
@@ -387,28 +464,91 @@ def emit_detail_cards(runs: list) -> str:
         topo = r.get("topology", "?")
         path = r.get("path", "?")
         mode = "tun" if cfg.endswith("tun") else "userspace"
+        err = r.get("error", "")
+        card_class = "detail-card detail-row"
+        if err:
+            card_class += " has-error"
         parts.append(
-            f'<details class="detail-card detail-row" data-topo="{topo}" data-path="{path}" '
+            f'<details class="{card_class}" data-topo="{topo}" data-path="{path}" '
             f'data-config="{cfg}" data-mode="{mode}">'
-            f'<summary>{html.escape(key)}</summary>'
-            f'<pre>{html.escape(json.dumps(r, indent=2))}</pre>'
-            f"</details>"
+            f"<summary>{html.escape(key)}</summary>"
         )
+        if err:
+            parts.append(
+                f'<div class="error-box">'
+                f'<div class="label">FAILED</div>'
+                f'<div class="reason">{html.escape(err)}</div>'
+                f"</div>"
+            )
+        parts.append(f"<pre>{html.escape(json.dumps(r, indent=2))}</pre>")
+        log_tail = r.get("log_tail", "")
+        if log_tail:
+            parts.append(
+                '<details class="log-tail"><summary>log tail '
+                f"({log_tail.count(chr(10))+1} lines)</summary>"
+                f"<pre>{html.escape(log_tail)}</pre></details>"
+            )
+        parts.append("</details>")
     parts.append("</div>")
+    return "".join(parts)
+
+
+def emit_failed_runs(runs: list) -> str:
+    """Emit a red banner listing all runs with a non-empty error field."""
+    failed = [r for r in runs if r.get("error")]
+    if not failed:
+        return ""
+    parts = [
+        '<section class="block" id="failed-runs">',
+        '<div class="failed-banner">',
+        f"<h2>⚠ {len(failed)} failed run{'s' if len(failed) != 1 else ''}</h2>",
+        f'<div class="count">{len(failed)} of {len(runs)} cells returned an error — '
+        "zeros below are stubs, not measurements.</div>",
+        '<table class="failed-runs">',
+        "<thead><tr><th>topology / path</th><th>config</th><th>error</th>"
+        "<th>log tail</th></tr></thead><tbody>",
+    ]
+    for r in failed:
+        key = f'{r.get("topology","?")} / {r.get("path","?")}'
+        cfg = r.get("config", "?")
+        err = r.get("error", "?")
+        log_tail = r.get("log_tail", "")
+        if log_tail:
+            log_cell = (
+                f'<details><summary>show last {log_tail.count(chr(10))+1} lines</summary>'
+                f"<pre>{html.escape(log_tail)}</pre></details>"
+            )
+        else:
+            log_cell = '<span class="empty" style="padding:0">(none)</span>'
+        parts.append(
+            f"<tr>"
+            f'<td>{html.escape(key)}</td>'
+            f'<td style="color:{CONFIG_COLORS.get(cfg, "#fff")}">{html.escape(CONFIG_LABELS.get(cfg, cfg))}</td>'
+            f'<td class="error">{html.escape(err)}</td>'
+            f"<td>{log_cell}</td>"
+            f"</tr>"
+        )
+    parts.append("</tbody></table></div></section>")
     return "".join(parts)
 
 
 def emit_header(runs: list) -> str:
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     n = len(runs)
+    n_failed = sum(1 for r in runs if r.get("error"))
+    n_missing = 16 - n  # 2 topos × 2 paths × 4 configs
     tool_versions = {}
     for r in runs:
         tool_versions[r.get("tool", "?")] = r.get("version", "?")
     ver_str = " · ".join(f"{k} {v}" for k, v in sorted(tool_versions.items())) or "no runs"
+    fail_str = ""
+    if n_failed:
+        fail_str = f' · <span style="color:var(--bad)">{n_failed} FAILED</span>'
+    miss_str = f" · {n_missing} missing" if n_missing > 0 else ""
     return (
         f'<header class="app">'
-        f'<h1>rustscale GCP bench dashboard</h1>'
-        f'<div class="meta">{n} runs · generated {stamp} · {html.escape(ver_str)}</div>'
+        f"<h1>rustscale GCP bench dashboard</h1>"
+        f'<div class="meta">{n} runs{fail_str}{miss_str} · generated {stamp} · {html.escape(ver_str)}</div>'
         f"</header>"
     )
 
@@ -475,7 +615,12 @@ function drawGroupedBars(canvas, data, kind) {
   let groups, series, colorFor;
   if (kind === "throughput") {
     groups = data.parallels.map(String);
-    series = CONFIGS.map(c => ({ key: c, vals: data.series[c] || [], color: CONFIG_COLORS[c] }));
+    series = CONFIGS.map(c => ({
+      key: c,
+      vals: data.series[c] || [],
+      color: CONFIG_COLORS[c],
+      failed: (data.failed && data.failed[c]) || false
+    }));
     colorFor = (i) => series[i].color;
   } else {
     groups = data.combos;
@@ -530,6 +675,26 @@ function drawGroupedBars(canvas, data, kind) {
 
   // Bars.
   series.forEach((s, si) => {
+    if (s.failed) {
+      // Draw a red marker at the baseline instead of bars, so failed
+      // configs are visually distinct from real zero-throughput runs.
+      ctx.fillStyle = "rgba(239,68,68,0.20)";
+      s.vals.forEach((v, gi) => {
+        const x = padL + gi * groupW + gap + si * barW;
+        ctx.fillRect(x, padT + plotH - 3, barW * 0.92, 3);
+      });
+      ctx.save();
+      ctx.fillStyle = "rgba(239,68,68,0.8)";
+      ctx.font = "9px sans-serif";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "bottom";
+      s.vals.forEach((v, gi) => {
+        const x = padL + gi * groupW + gap + si * barW + barW * 0.46;
+        ctx.fillText("\u2715", x, padT + plotH - 5);
+      });
+      ctx.restore();
+      return;
+    }
     ctx.fillStyle = s.color;
     s.vals.forEach((v, gi) => {
       const x = padL + gi * groupW + gap + si * barW;
@@ -654,6 +819,9 @@ def main() -> int:
     out.append(emit_header(runs))
     out.append("<main>")
     out.append(emit_filters())
+
+    # Failed-runs banner (only if any runs have errors).
+    out.append(emit_failed_runs(runs))
 
     # Throughput.
     out.append('<section class="block" id="throughput">')

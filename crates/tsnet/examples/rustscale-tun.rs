@@ -131,10 +131,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     server.up_tun(tun_config).await?;
 
-    let status = server.status();
-    eprintln!("online: {}", status.up);
-    eprintln!("tailscale IPs: {:?}", status.tailscale_ips);
-    eprintln!("peers: {}", status.peer_count);
+    // Readiness loop: wait until we have a tailnet IP AND at least one peer.
+    // up_tun() returns as soon as the TUN device is created and the control
+    // channel is established, but the netmap (peers, IPs) may still be
+    // settling. The bench harness greps for "BENCH_READY 1" to know we're
+    // actually ready to carry traffic — printing it prematurely causes the
+    // harness to start iperf3 before the tunnel can route, yielding zeros.
+    {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        let mut ready = false;
+        loop {
+            let st = server.status();
+            let has_ip = st.tailscale_ips.iter().any(std::net::IpAddr::is_ipv4);
+            if st.up && has_ip && st.peer_count > 0 {
+                if let Some(std::net::IpAddr::V4(v4)) = st
+                    .tailscale_ips
+                    .iter()
+                    .copied()
+                    .find(std::net::IpAddr::is_ipv4)
+                {
+                    eprintln!("BENCH_IP {v4}");
+                }
+                eprintln!("BENCH_READY 1");
+                ready = true;
+                break;
+            }
+            eprintln!(
+                "waiting: up={} has_ip={} peers={}",
+                st.up, has_ip, st.peer_count
+            );
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        if !ready {
+            eprintln!("BENCH_READY 0");
+            let st = server.status();
+            eprintln!("online: {}", st.up);
+            eprintln!("tailscale IPs: {:?}", st.tailscale_ips);
+            eprintln!("peers: {}", st.peer_count);
+        }
+    }
 
     // Ctrl-C handler.
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);

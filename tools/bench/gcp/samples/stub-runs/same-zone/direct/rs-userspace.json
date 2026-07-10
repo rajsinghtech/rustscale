@@ -1,0 +1,19 @@
+{
+  "tool": "rustscale",
+  "mode": "userspace",
+  "topology": "same-zone",
+  "path": "direct",
+  "config": "rs-userspace",
+  "error": "",
+  "log_tail": "",
+  "throughput": [
+    {"parallel": 1, "mbps": 820.5, "duration_s": 30},
+    {"parallel": 10, "mbps": 1450.2, "duration_s": 30},
+    {"parallel": 25, "mbps": 1620.8, "duration_s": 30},
+    {"parallel": 50, "mbps": 1680.0, "duration_s": 30},
+    {"parallel": 100, "mbps": 1695.4, "duration_s": 30}
+  ],
+  "latency": {"p50_us": 165, "p95_us": 340, "p99_us": 1820, "count": 200},
+  "footprint": {"binary_size_bytes": 8244000, "rss_peak_kb": 38420, "rss_avg_kb": 35100, "cpu_peak_pct": 88.2, "cpu_avg_pct": 44.5, "samples": 150},
+  "path_class_reported": "direct"
+}

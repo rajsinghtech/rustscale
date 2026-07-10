@@ -1,0 +1,19 @@
+{
+  "tool": "rustscale",
+  "mode": "tun",
+  "topology": "same-zone",
+  "path": "direct",
+  "config": "rs-tun",
+  "error": "tun-not-ready",
+  "log_tail": "bringing up TUN mode: device=utun0, apply_routes=true\nthis requires root for utun creation\nwaiting: up=true has_ip=false peers=0\nwaiting: up=true has_ip=true peers=0\nwaiting: up=true has_ip=true peers=0\nwaiting: up=true has_ip=true peers=0\nwaiting: up=true has_ip=true peers=0\nwaiting: up=true has_ip=true peers=0\nwaiting: up=true has_ip=true peers=0\nwaiting: up=true has_ip=true peers=0\nwaiting: up=true has_ip=true peers=0\nwaiting: up=true has_ip=true peers=0\nwaiting: up=true has_ip=true peers=0\nwaiting: up=true has_ip=true peers=0\nwaiting: up=true has_ip=true peers=0\nwaiting: up=true has_ip=true peers=0\nwaiting: up=true has_ip=true peers=0\nwaiting: up=true has_ip=true peers=0\nwaiting: up=true has_ip=true peers=0\nwaiting: up=true has_ip=true peers=0\nwaiting: up=true has_ip=true peers=0\nwaiting: up=true has_ip=true peers=0\nwaiting: up=true has_ip=true peers=0\nwaiting: up=true has_ip=true peers=0\nwaiting: up=true has_ip=true peers=0\nwaiting: up=true has_ip=true peers=0\nwaiting: up=true has_ip=true peers=0\nwaiting: up=true has_ip=true peers=0\nwaiting: up=true has_ip=true peers=0\nwaiting: up=true has_ip=true peers=0\nwaiting: up=true has_ip=true peers=0\nwaiting: up=true has_ip=true peers=0\nwaiting: up=true has_ip=true peers=0\nwaiting: up=true has_ip=true peers=0\nwaiting: up=true has_ip=true peers=0\nwaiting: up=true has_ip=true peers=0\nwaiting: up=true has_ip=true peers=0\nwaiting: up=true has_ip=true peers=0\nwaiting: up=true has_ip=true peers=0\nwaiting: up=true has_ip=true peers=0\nwaiting: up=true has_ip=true peers=0\nwaiting: up=true has_ip=true peers=0\nBENCH_READY 0\nonline: true\ntailscale IPs: [100.64.0.1]\npeers: 0",
+  "throughput": [
+    {"parallel": 1, "mbps": 0, "duration_s": 30},
+    {"parallel": 10, "mbps": 0, "duration_s": 30},
+    {"parallel": 25, "mbps": 0, "duration_s": 30},
+    {"parallel": 50, "mbps": 0, "duration_s": 30},
+    {"parallel": 100, "mbps": 0, "duration_s": 30}
+  ],
+  "latency": {"p50_us": 0, "p95_us": 0, "p99_us": 0, "count": 200},
+  "footprint": {"binary_size_bytes": 0, "rss_peak_kb": 0, "rss_avg_kb": 0, "cpu_peak_pct": 0, "cpu_avg_pct": 0, "samples": 0},
+  "path_class_reported": "direct"
+}

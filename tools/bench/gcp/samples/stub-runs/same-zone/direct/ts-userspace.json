@@ -1,0 +1,19 @@
+{
+  "tool": "tailscaled",
+  "mode": "userspace",
+  "topology": "same-zone",
+  "path": "direct",
+  "config": "ts-userspace",
+  "error": "",
+  "log_tail": "",
+  "throughput": [
+    {"parallel": 1, "mbps": 780.1, "duration_s": 30},
+    {"parallel": 10, "mbps": 1320.7, "duration_s": 30},
+    {"parallel": 25, "mbps": 1490.0, "duration_s": 30},
+    {"parallel": 50, "mbps": 1510.2, "duration_s": 30},
+    {"parallel": 100, "mbps": 1505.8, "duration_s": 30}
+  ],
+  "latency": {"p50_us": 210, "p95_us": 410, "p99_us": 2200, "count": 200},
+  "footprint": {"binary_size_bytes": 28400000, "rss_peak_kb": 61200, "rss_avg_kb": 55400, "cpu_peak_pct": 95.4, "cpu_avg_pct": 58.0, "samples": 150},
+  "path_class_reported": "direct"
+}

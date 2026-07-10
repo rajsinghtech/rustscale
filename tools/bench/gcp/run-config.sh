@@ -65,9 +65,44 @@ export RUSTUP_HOME=/opt/rust CARGO_HOME=/opt/rust/cargo
 
 echo "[gcp] config=$CONFIG topo=$TOPOLOGY path=$PATH_TAG server=$SVM client=$CVM" >&2
 
-# Helper: write a stub JSON (used in dry-run or on failure).
+# ---------------------------------------------------------------------------
+# Helpers shared across all configs.
+# ---------------------------------------------------------------------------
+
+# Capture the last N lines (default 40) of a remote log file.
+# Args: VM ZONE LOGFILE [LINES]
+capture_log_tail() {
+  local vm="$1" zone="$2" logfile="$3" lines="${4:-40}"
+  ssh_cmd "$vm" "$zone" "tail -n $lines '$logfile' 2>/dev/null" 2>/dev/null \
+    || echo "(log unavailable: $logfile on $vm)"
+}
+
+# Wait for a tailscale peer to appear on a VM.
+# Polls `tailscale status --json` until Peer count > 0.
+# Args: VM ZONE SOCK [TIMEOUT=120]
+wait_ts_peer() {
+  local vm="$1" zone="$2" sock="$3" timeout="${4:-120}"
+  local elapsed=0
+  while (( elapsed < timeout )); do
+    local count
+    count=$(ssh_cmd "$vm" "$zone" \
+      "tailscale --socket=$sock status --json 2>/dev/null \
+       | python3 -c 'import json,sys; print(len(json.load(sys.stdin).get(\"Peer\",{})))' 2>/dev/null" \
+      2>/dev/null || echo "0")
+    if [[ "$count" -gt 0 ]] 2>/dev/null; then
+      return 0
+    fi
+    sleep 5
+    elapsed=$((elapsed + 5))
+  done
+  return 1
+}
+
+# Write a stub JSON (used in dry-run or on failure).
+# Args: ERROR_STRING [LOG_TAIL]
 emit_stub() {
   local err="${1:-dry-run}"
+  local log_tail="${2:-}"
   local tool mode
   case "$CONFIG" in
     rs-*) tool=rustscale; mode=userspace ;;
@@ -75,26 +110,41 @@ emit_stub() {
   esac
   [[ "$CONFIG" == *-tun ]] && mode=tun
   [[ "$CONFIG" == *-userspace ]] && mode=userspace
-  cat >"$OUT" <<EOF
-{
-  "tool": "$tool",
-  "mode": "$mode",
-  "topology": "$TOPOLOGY",
-  "path": "$PATH_TAG",
-  "config": "$CONFIG",
-  "error": "$err",
-  "throughput": [
-    {"parallel": 1, "mbps": 0, "duration_s": $DURATION},
-    {"parallel": 10, "mbps": 0, "duration_s": $DURATION},
-    {"parallel": 25, "mbps": 0, "duration_s": $DURATION},
-    {"parallel": 50, "mbps": 0, "duration_s": $DURATION},
-    {"parallel": 100, "mbps": 0, "duration_s": $DURATION}
-  ],
-  "latency": {"p50_us": 0, "p95_us": 0, "p99_us": 0, "count": $LATENCY_COUNT},
-  "footprint": {"binary_size_bytes": 0, "rss_peak_kb": 0, "rss_avg_kb": 0, "cpu_peak_pct": 0, "cpu_avg_pct": 0, "samples": 0},
-  "path_class_reported": "$PATH_TAG"
+
+  # Use Python so log_tail (which may contain quotes, newlines, etc.) is
+  # properly JSON-escaped. Pass log_tail via a temp file to avoid argv limits.
+  local _lt_tmp
+  _lt_tmp=$(mktemp)
+  printf '%s' "$log_tail" > "$_lt_tmp"
+  python3 - "$CONFIG" "$TOPOLOGY" "$PATH_TAG" "$tool" "$mode" "$err" \
+    "$DURATION" "$LATENCY_COUNT" "$_lt_tmp" >"$OUT" <<'PYEOF'
+import json, sys
+config, topo, path_tag, tool, mode, err, dur, lat_count, lt_path = sys.argv[1:10]
+try:
+    with open(lt_path) as f:
+        log_tail = f.read()
+except OSError:
+    log_tail = ""
+obj = {
+    "tool": tool,
+    "mode": mode,
+    "topology": topo,
+    "path": path_tag,
+    "config": config,
+    "error": err,
+    "log_tail": log_tail,
+    "throughput": [
+        {"parallel": p, "mbps": 0, "duration_s": int(dur)}
+        for p in [1, 10, 25, 50, 100]
+    ],
+    "latency": {"p50_us": 0, "p95_us": 0, "p99_us": 0, "count": int(lat_count)},
+    "footprint": {"binary_size_bytes": 0, "rss_peak_kb": 0, "rss_avg_kb": 0,
+                   "cpu_peak_pct": 0, "cpu_avg_pct": 0, "samples": 0},
+    "path_class_reported": path_tag,
 }
-EOF
+print(json.dumps(obj, indent=2))
+PYEOF
+  rm -f "$_lt_tmp"
 }
 
 if [[ -n "${GCP_DRY_RUN:-}" ]]; then
@@ -170,8 +220,9 @@ run_rs_userspace() {
   done
   if (( elapsed >= 180 )); then
     echo "[gcp] ERROR: rustscale-bench server never became ready" >&2
-    ssh_cmd "$SVM" "$SZONE" 'tail -50 /tmp/rs-srv.log' >&2 || true
-    emit_stub "server-not-ready"
+    local _lt
+    _lt=$(capture_log_tail "$SVM" "$SZONE" /tmp/rs-srv.log)
+    emit_stub "server-not-ready" "$_lt"
     return 1
   fi
 
@@ -235,6 +286,8 @@ obj = {
     "topology": topo,
     "path": path_tag,
     "config": config,
+    "error": "",
+    "log_tail": "",
     "throughput": json.loads(tp),
     "latency": json.loads(lat) if lat and lat != "{}" else {"p50_us":0,"p95_us":0,"p99_us":0,"count":0},
     "footprint": dict(json.loads(foot), binary_size_bytes=int(bin_size)),
@@ -259,36 +312,47 @@ run_rs_tun() {
        --authkey $AUTHKEY --hostname $CHOST --apply-routes --tun-name utun0 \
        --state-dir /tmp/rs-tun-cli > /tmp/rs-tun-cli.log 2>&1 & echo \$! > /tmp/rs-tun-cli.pid"
 
-  # Wait for 'online: true' and 'tailscale IPs' on both.
+  # Wait for BENCH_READY 1 on both VMs. rustscale-tun prints this once it
+  # has a tailnet IP AND at least one peer — NOT merely after up_tun()
+  # returns, which was the old bug (online: true was printed before the
+  # netmap settled, causing false "ready" detection and zeroed iperf3 runs).
   for vm_zone in "$SVM:$SZONE" "$CVM:$CZONE"; do
     local vm="${vm_zone%%:*}" zone="${vm_zone##*:}" logfile
     [[ "$vm" == "$SVM" ]] && logfile=/tmp/rs-tun-srv.log || logfile=/tmp/rs-tun-cli.log
     local elapsed=0
-    while (( elapsed < 180 )); do
-      if ssh_cmd "$vm" "$zone" "grep -q 'online: true' $logfile && grep -q 'tailscale IPs' $logfile" 2>/dev/null; then
+    while (( elapsed < 120 )); do
+      if ssh_cmd "$vm" "$zone" "grep -q 'BENCH_READY 1' $logfile 2>/dev/null" 2>/dev/null; then
         break
       fi
       sleep 5
       elapsed=$((elapsed + 5))
     done
-    if (( elapsed >= 180 )); then
-      echo "[gcp] ERROR: rustscale-tun on $vm never came online" >&2
-      ssh_cmd "$vm" "$zone" "tail -50 $logfile" >&2 || true
-      emit_stub "tun-not-online"
+    if (( elapsed >= 120 )); then
+      echo "[gcp] ERROR: rustscale-tun on $vm never became ready (no BENCH_READY 1 in $logfile)" >&2
+      local _lt
+      _lt=$(capture_log_tail "$vm" "$zone" "$logfile")
+      emit_stub "tun-not-ready" "$_lt"
       ssh_sudo "$SVM" "$SZONE" 'pkill -f rustscale-tun 2>/dev/null' || true
       ssh_sudo "$CVM" "$CZONE" 'pkill -f rustscale-tun 2>/dev/null' || true
       return 1
     fi
   done
 
-  # Get server tailnet IP.
+  # Get server tailnet IP from the BENCH_IP marker (same as rs-userspace).
   local server_ip
-  server_ip=$(ssh_cmd "$SVM" "$SZONE" "grep 'tailscale IPs' /tmp/rs-tun-srv.log | head -1" \
-    | grep -oE '100\.[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+  server_ip=$(ssh_cmd "$SVM" "$SZONE" "grep '^BENCH_IP ' /tmp/rs-tun-srv.log | awk '{print \$2}'" 2>/dev/null)
+  if [[ -z "$server_ip" ]]; then
+    # Fallback: extract from the tailscale IPs line.
+    server_ip=$(ssh_cmd "$SVM" "$SZONE" "grep 'tailscale IPs' /tmp/rs-tun-srv.log | head -1" \
+      | grep -oE '100\.[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+  fi
   echo "[gcp] rs-tun: server tailnet IP=$server_ip" >&2
 
-  # Start iperf3 server on server VM bound to tailnet IP.
-  ssh_cmd "$SVM" "$SZONE" "pkill -x iperf3 2>/dev/null; nohup iperf3 -s -p $PORT -B $server_ip > /tmp/iperf3-srv.log 2>&1 & echo \$! > /tmp/iperf3-srv.pid"
+  # Start iperf3 server on server VM. Bind to 0.0.0.0 (all interfaces) so
+  # the client can reach it via the server's tailnet IP on the utun. Binding
+  # to the tailnet IP specifically can fail if the address isn't fully
+  # configured on the TUN device yet.
+  ssh_cmd "$SVM" "$SZONE" "pkill -x iperf3 2>/dev/null; nohup iperf3 -s -p $PORT > /tmp/iperf3-srv.log 2>&1 & echo \$! > /tmp/iperf3-srv.pid"
   sleep 2
 
   # Footprint sampler for rustscale-tun PID on server VM.
@@ -342,6 +406,8 @@ obj = {
     "topology": topo,
     "path": path_tag,
     "config": config,
+    "error": "",
+    "log_tail": "",
     "throughput": json.loads(tp),
     "latency": json.loads(lat),
     "footprint": dict(json.loads(foot), binary_size_bytes=int(bin_size)),
@@ -363,10 +429,25 @@ run_ts_userspace() {
     "nohup tailscaled --tun=userspace-networking --socket=/tmp/ts-srv.sock \
        --statedir=/tmp/ts-srv --port=41642 > /tmp/ts-srv.log 2>&1 & echo \$! > /tmp/ts-srv.pid"
   sleep 3
-  ssh_cmd "$SVM" "$SZONE" \
-    "tailscale --socket=/tmp/ts-srv.sock up --authkey=$AUTHKEY --hostname=$SHOST --timeout=120s 2>>/tmp/ts-srv.log"
+  if ! ssh_cmd "$SVM" "$SZONE" \
+    "tailscale --socket=/tmp/ts-srv.sock up --authkey=$AUTHKEY --hostname=$SHOST --timeout=120s 2>>/tmp/ts-srv.log"; then
+    echo "[gcp] ERROR: tailscale up failed on server" >&2
+    local _lt
+    _lt=$(capture_log_tail "$SVM" "$SZONE" /tmp/ts-srv.log)
+    emit_stub "ts-up-failed-srv" "$_lt"
+    ssh_cmd "$SVM" "$SZONE" "kill \$(cat /tmp/ts-srv.pid 2>/dev/null) 2>/dev/null; pkill -x tailscaled 2>/dev/null" || true
+    return 1
+  fi
   local server_ip
   server_ip=$(ssh_cmd "$SVM" "$SZONE" "tailscale --socket=/tmp/ts-srv.sock ip -4 2>>/tmp/ts-srv.log")
+  if [[ -z "$server_ip" ]]; then
+    echo "[gcp] ERROR: no tailnet IP on server" >&2
+    local _lt
+    _lt=$(capture_log_tail "$SVM" "$SZONE" /tmp/ts-srv.log)
+    emit_stub "ts-no-ip-srv" "$_lt"
+    ssh_cmd "$SVM" "$SZONE" "kill \$(cat /tmp/ts-srv.pid 2>/dev/null) 2>/dev/null; pkill -x tailscaled 2>/dev/null" || true
+    return 1
+  fi
   echo "[gcp] ts-userspace: server IP=$server_ip" >&2
 
   ssh_cmd "$SVM" "$SZONE" \
@@ -382,10 +463,28 @@ run_ts_userspace() {
        --statedir=/tmp/ts-cli --port=41643 --socks5-server=127.0.0.1:11080 \
        > /tmp/ts-cli.log 2>&1 & echo \$! > /tmp/ts-cli.pid"
   sleep 3
-  ssh_cmd "$CVM" "$CZONE" \
-    "tailscale --socket=/tmp/ts-cli.sock up --authkey=$AUTHKEY --hostname=$CHOST --timeout=120s 2>>/tmp/ts-cli.log"
+  if ! ssh_cmd "$CVM" "$CZONE" \
+    "tailscale --socket=/tmp/ts-cli.sock up --authkey=$AUTHKEY --hostname=$CHOST --timeout=120s 2>>/tmp/ts-cli.log"; then
+    echo "[gcp] ERROR: tailscale up failed on client" >&2
+    local _lt
+    _lt=$(capture_log_tail "$CVM" "$CZONE" /tmp/ts-cli.log)
+    emit_stub "ts-up-failed-cli" "$_lt"
+    ssh_cmd "$SVM" "$SZONE" "kill \$(cat /tmp/ts-srv.pid 2>/dev/null) 2>/dev/null; pkill -x tailscaled 2>/dev/null" || true
+    ssh_cmd "$CVM" "$CZONE" "kill \$(cat /tmp/ts-cli.pid 2>/dev/null) 2>/dev/null; pkill -x tailscaled 2>/dev/null" || true
+    return 1
+  fi
 
-  sleep 5  # peer establishment
+  # Wait for the peer to appear (replaces fixed sleep 5 which was too short
+  # on slower VMs, causing iperf3 to connect before the peer was established).
+  if ! wait_ts_peer "$CVM" "$CZONE" /tmp/ts-cli.sock 120; then
+    echo "[gcp] ERROR: no tailscale peer appeared on client after 120s" >&2
+    local _lt
+    _lt=$(capture_log_tail "$CVM" "$CZONE" /tmp/ts-cli.log)
+    emit_stub "ts-no-peer" "$_lt"
+    ssh_cmd "$SVM" "$SZONE" "kill \$(cat /tmp/ts-srv.pid 2>/dev/null) 2>/dev/null; pkill -x tailscaled 2>/dev/null" || true
+    ssh_cmd "$CVM" "$CZONE" "kill \$(cat /tmp/ts-cli.pid 2>/dev/null) 2>/dev/null; pkill -x tailscaled 2>/dev/null" || true
+    return 1
+  fi
 
   # socat SOCKS5 bridge on client.
   ssh_cmd "$CVM" "$CZONE" \
@@ -505,6 +604,8 @@ obj = {
     "topology": topo,
     "path": path_tag,
     "config": config,
+    "error": "",
+    "log_tail": "",
     "throughput": json.loads(tp),
     "latency": json.loads(lat),
     "footprint": dict(json.loads(foot), binary_size_bytes=int(bin_size)),
@@ -523,19 +624,51 @@ run_ts_tun() {
   ssh_sudo "$SVM" "$SZONE" \
     "nohup tailscaled --socket=/tmp/ts-srv.sock --statedir=/tmp/ts-srv > /tmp/ts-srv.log 2>&1 & echo \$! > /tmp/ts-srv.pid"
   sleep 3
-  ssh_sudo "$SVM" "$SZONE" \
-    "tailscale --socket=/tmp/ts-srv.sock up --authkey=$AUTHKEY --hostname=$SHOST --timeout=120s 2>>/tmp/ts-srv.log"
+  if ! ssh_sudo "$SVM" "$SZONE" \
+    "tailscale --socket=/tmp/ts-srv.sock up --authkey=$AUTHKEY --hostname=$SHOST --timeout=120s 2>>/tmp/ts-srv.log"; then
+    echo "[gcp] ERROR: tailscale up failed on server" >&2
+    local _lt
+    _lt=$(capture_log_tail "$SVM" "$SZONE" /tmp/ts-srv.log)
+    emit_stub "ts-up-failed-srv" "$_lt"
+    ssh_sudo "$SVM" "$SZONE" 'pkill -x tailscaled 2>/dev/null' || true
+    return 1
+  fi
   local server_ip
   server_ip=$(ssh_sudo "$SVM" "$SZONE" "tailscale --socket=/tmp/ts-srv.sock ip -4 2>>/tmp/ts-srv.log")
+  if [[ -z "$server_ip" ]]; then
+    echo "[gcp] ERROR: no tailnet IP on server" >&2
+    local _lt
+    _lt=$(capture_log_tail "$SVM" "$SZONE" /tmp/ts-srv.log)
+    emit_stub "ts-no-ip-srv" "$_lt"
+    ssh_sudo "$SVM" "$SZONE" 'pkill -x tailscaled 2>/dev/null' || true
+    return 1
+  fi
   echo "[gcp] ts-tun: server IP=$server_ip" >&2
 
   ssh_sudo "$CVM" "$CZONE" \
     "nohup tailscaled --socket=/tmp/ts-cli.sock --statedir=/tmp/ts-cli > /tmp/ts-cli.log 2>&1 & echo \$! > /tmp/ts-cli.pid"
   sleep 3
-  ssh_sudo "$CVM" "$CZONE" \
-    "tailscale --socket=/tmp/ts-cli.sock up --authkey=$AUTHKEY --hostname=$CHOST --timeout=120s 2>>/tmp/ts-cli.log"
+  if ! ssh_sudo "$CVM" "$CZONE" \
+    "tailscale --socket=/tmp/ts-cli.sock up --authkey=$AUTHKEY --hostname=$CHOST --timeout=120s 2>>/tmp/ts-cli.log"; then
+    echo "[gcp] ERROR: tailscale up failed on client" >&2
+    local _lt
+    _lt=$(capture_log_tail "$CVM" "$CZONE" /tmp/ts-cli.log)
+    emit_stub "ts-up-failed-cli" "$_lt"
+    ssh_sudo "$SVM" "$SZONE" 'pkill -x tailscaled 2>/dev/null' || true
+    ssh_sudo "$CVM" "$CZONE" 'pkill -x tailscaled 2>/dev/null' || true
+    return 1
+  fi
 
-  sleep 5
+  # Wait for the peer to appear (replaces fixed sleep 5).
+  if ! wait_ts_peer "$CVM" "$CZONE" /tmp/ts-cli.sock 120; then
+    echo "[gcp] ERROR: no tailscale peer appeared on client after 120s" >&2
+    local _lt
+    _lt=$(capture_log_tail "$CVM" "$CZONE" /tmp/ts-cli.log)
+    emit_stub "ts-no-peer" "$_lt"
+    ssh_sudo "$SVM" "$SZONE" 'pkill -x tailscaled 2>/dev/null' || true
+    ssh_sudo "$CVM" "$CZONE" 'pkill -x tailscaled 2>/dev/null' || true
+    return 1
+  fi
 
   # iperf3 server.
   ssh_sudo "$SVM" "$SZONE" \
@@ -592,6 +725,8 @@ obj = {
     "topology": topo,
     "path": path_tag,
     "config": config,
+    "error": "",
+    "log_tail": "",
     "throughput": json.loads(tp),
     "latency": json.loads(lat),
     "footprint": dict(json.loads(foot), binary_size_bytes=int(bin_size)),

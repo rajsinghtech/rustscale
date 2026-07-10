@@ -28,6 +28,7 @@ def main() -> int:
         return 1
 
     runs = []
+    failed = 0
     for cfg_json in sorted(root.glob("*/*/*.json")):
         # Skip a stray summary.json at the root (depth 0).
         try:
@@ -37,7 +38,31 @@ def main() -> int:
             continue
         # Only include objects that look like a bench run.
         if isinstance(obj, dict) and "config" in obj and "throughput" in obj:
+            # Ensure error and log_tail fields exist so downstream
+            # render-html.py can distinguish real zeros from stubs.
+            obj.setdefault("error", "")
+            obj.setdefault("log_tail", "")
+            if obj["error"]:
+                failed += 1
+                print(
+                    f"warn: {obj.get('topology','?')}/{obj.get('path','?')}/"
+                    f"{obj.get('config','?')}: FAILED ({obj['error']})",
+                    file=sys.stderr,
+                )
             runs.append(obj)
+
+    # Check for missing cells: every (topology, path, config) combo should
+    # have a run. Report gaps so they are not silently absent from the
+    # dashboard.
+    seen = {(r.get("topology"), r.get("path"), r.get("config")) for r in runs}
+    for topo in ("same-zone", "cross-region"):
+        for path in ("direct", "derp"):
+            for cfg in ("rs-userspace", "rs-tun", "ts-userspace", "ts-tun"):
+                if (topo, path, cfg) not in seen:
+                    print(
+                        f"warn: MISSING {topo}/{path}/{cfg} — no JSON found",
+                        file=sys.stderr,
+                    )
 
     runs.sort(
         key=lambda r: (

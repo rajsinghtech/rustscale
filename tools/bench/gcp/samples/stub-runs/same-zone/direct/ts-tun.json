@@ -1,0 +1,19 @@
+{
+  "tool": "tailscaled",
+  "mode": "tun",
+  "topology": "same-zone",
+  "path": "direct",
+  "config": "ts-tun",
+  "error": "",
+  "log_tail": "",
+  "throughput": [
+    {"parallel": 1, "mbps": 905.3, "duration_s": 30},
+    {"parallel": 10, "mbps": 2050.1, "duration_s": 30},
+    {"parallel": 25, "mbps": 2380.9, "duration_s": 30},
+    {"parallel": 50, "mbps": 2410.4, "duration_s": 30},
+    {"parallel": 100, "mbps": 2402.0, "duration_s": 30}
+  ],
+  "latency": {"p50_us": 155, "p95_us": 320, "p99_us": 1620, "count": 200},
+  "footprint": {"binary_size_bytes": 28400000, "rss_peak_kb": 58900, "rss_avg_kb": 53100, "cpu_peak_pct": 90.7, "cpu_avg_pct": 53.8, "samples": 150},
+  "path_class_reported": "direct"
+}

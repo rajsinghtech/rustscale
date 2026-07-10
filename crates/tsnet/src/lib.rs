@@ -726,7 +726,7 @@ impl Server {
             "Control connection",
             Severity::High,
             "control connection lost: no map activity for over 3 minutes",
-            std::time::Duration::from_secs(180),
+            std::time::Duration::from_mins(3),
         );
 
         // 1. Load or generate persistent state.

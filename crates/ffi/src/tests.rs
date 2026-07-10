@@ -420,7 +420,7 @@ fn ffi_e2e_two_nodes_echo() {
         let _ = done_tx.send(result);
     });
 
-    match done_rx.recv_timeout(std::time::Duration::from_secs(180)) {
+    match done_rx.recv_timeout(std::time::Duration::from_mins(3)) {
         Ok(Ok(msg)) => eprintln!("{msg}"),
         Ok(Err(e)) => panic!("{e}"),
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(

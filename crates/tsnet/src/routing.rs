@@ -79,7 +79,7 @@ impl RouteTable {
         }
         // Sort by prefix descending so the first match in `lookup` is the
         // longest prefix (avoids a max-scan each call).
-        entries.sort_by(|a, b| b.prefix.cmp(&a.prefix));
+        entries.sort_by_key(|e| std::cmp::Reverse(e.prefix));
         Self {
             entries,
             accept_routes,

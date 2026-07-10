@@ -1591,7 +1591,7 @@ async fn e2e_acme_cert_issuance() {
 
     // Request the cert. This runs the full ACME flow against LE staging.
     let result = tokio::time::timeout(
-        std::time::Duration::from_secs(120),
+        std::time::Duration::from_mins(2),
         server.control_cert_provider(),
     )
     .await;

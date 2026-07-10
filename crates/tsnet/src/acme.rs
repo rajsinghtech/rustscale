@@ -306,10 +306,7 @@ async fn read_chunked(
             loop {
                 line.clear();
                 read_line(stream, &mut line).await?;
-                if std::str::from_utf8(&line)
-                    .map(|s| s.trim().is_empty())
-                    .unwrap_or(true)
-                {
+                if std::str::from_utf8(&line).map_or(true, |s| s.trim().is_empty()) {
                     break;
                 }
             }

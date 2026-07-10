@@ -89,7 +89,7 @@ pub(crate) fn looks_like_igd_response(pkt: &[u8]) -> bool {
 /// responses with the same Location+Server (keeping the first/highest USN).
 pub(crate) fn process_responses(mut responses: Vec<UpnpDiscoResponse>) -> Vec<UpnpDiscoResponse> {
     // Sort by USN in reverse so :2 sorts before :1.
-    responses.sort_by(|a, b| b.usn.cmp(&a.usn));
+    responses.sort_by_key(|r| std::cmp::Reverse(r.usn.clone()));
     // Compact by (location, server).
     responses.dedup_by(|a, b| a.location == b.location && a.server == b.server);
     responses

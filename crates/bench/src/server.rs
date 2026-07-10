@@ -47,7 +47,7 @@ pub async fn run(
 
     loop {
         let accept_result =
-            tokio::time::timeout(Duration::from_secs(30 * 60), listener.accept()).await;
+            tokio::time::timeout(Duration::from_mins(30), listener.accept()).await;
         let stream = match accept_result {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => {

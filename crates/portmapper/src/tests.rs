@@ -145,17 +145,13 @@ impl FakeIgd {
         }
         let op = pkt[1];
         match op {
-            0 => {
-                if self.do_pcp {
-                    let resp = pcp::build_disco_response(op);
-                    let _ = self.pxp_sock.send_to(&resp, src).await;
-                }
+            0 if self.do_pcp => {
+                let resp = pcp::build_disco_response(op);
+                let _ = self.pxp_sock.send_to(&resp, src).await;
             }
-            1 => {
-                if self.do_pcp && pkt.len() >= 60 {
-                    let resp = pcp::build_map_response(pkt);
-                    let _ = self.pxp_sock.send_to(&resp, src).await;
-                }
+            1 if self.do_pcp && pkt.len() >= 60 => {
+                let resp = pcp::build_map_response(pkt);
+                let _ = self.pxp_sock.send_to(&resp, src).await;
             }
             _ => {}
         }

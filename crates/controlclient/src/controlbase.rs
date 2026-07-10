@@ -350,8 +350,8 @@ pub fn client_deferred(
     let mut machine_ephemeral = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut machine_ephemeral);
     // Clamp the ephemeral private (X25519 clamping, like Go's NewMachine).
-    machine_ephemeral[0] &= 248;
-    machine_ephemeral[31] = (machine_ephemeral[31] & 127) | 64;
+    machine_ephemeral[0] &= 0xF8;
+    machine_ephemeral[31] = (machine_ephemeral[31] & 0x7F) | 0x40;
 
     let (init, state) = build_initiation(version, machine_key, control_key, &machine_ephemeral);
 
@@ -492,8 +492,8 @@ pub fn server_handshake<R: io::Read, W: io::Write>(
     // <- e, ee, se (build response)
     let mut control_ephemeral = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut control_ephemeral);
-    control_ephemeral[0] &= 248;
-    control_ephemeral[31] = (control_ephemeral[31] & 127) | 64;
+    control_ephemeral[0] &= 0xF8;
+    control_ephemeral[31] = (control_ephemeral[31] & 0x7F) | 0x40;
     let control_ephemeral_pub = x25519_basepoint(&control_ephemeral);
 
     let mut resp = [0u8; RESPONSE_MSG_LEN];

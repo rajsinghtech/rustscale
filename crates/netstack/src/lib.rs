@@ -395,8 +395,7 @@ async fn poll_loop(
     let mut config = smoltcp::iface::Config::new(HardwareAddress::Ip);
     config.random_seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0xdead_beef);
+        .map_or(0xdead_beef, |d| d.as_nanos() as u64);
     let mut iface = Interface::new(config, &mut device, smol_now());
     iface.update_ip_addrs(|addrs| {
         let _ = addrs.push(IpCidr::new(to_smoltcp_v4(addr), 32));

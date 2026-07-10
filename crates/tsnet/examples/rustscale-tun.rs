@@ -138,7 +138,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // actually ready to carry traffic — printing it prematurely causes the
     // harness to start iperf3 before the tunnel can route, yielding zeros.
     {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        let deadline = tokio::time::Instant::now() + Duration::from_mins(2);
         let mut ready = false;
         loop {
             let st = server.status();

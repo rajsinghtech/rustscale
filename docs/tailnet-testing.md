@@ -167,3 +167,50 @@ CallMeMaybe-initiated pings are skipped, and inbound disco Pings over UDP are
 not answered — so neither side confirms a direct path. This pins both
 directions to DERP, letting `interop_derp_path` assert relayed connectivity
 in isolation. Production code should leave this false.
+
+## TUN-mode interop (rustscale TUN <-> Go tailscaled)
+
+TUN-mode interop tests exercise the real OS TUN device + kernel routing +
+packet filter on raw IP packets — a different data plane from the netstack
+tests. The WG/disco/DERP/MagicDNS wire protocol is shared, so TUN tests
+focus on the TUN-specific surface: TUN read/write, OS route installation,
+filter-on-raw-IP, and subnet-route OS forwarding.
+
+### Three layers
+
+**Layer 1 — TUN pump unit tests** (no root, no Go): MockTun devices wired
+to real WG tunnels via in-memory cross-feeding. Tests the pump logic
+(encapsulate/decapsulate/filter) without any OS dependency. Runs as regular
+`cargo test` (not ignored).
+
+**Layer 2 — TUN interop with Go in userspace mode** (root for TUN, Go stays
+userspace): `tools/interop-tun.sh` provisions a tailnet, starts Go
+tailscaled in userspace mode (same as `tools/interop.sh`), then runs the
+`interop_tun_` test suite under `sudo` so rustscale can create a real TUN
+device and apply OS routes. Tests use OS sockets (`tokio::net::TcpStream`)
+instead of `Server::dial`/`Server::listen` — traffic flows through the
+kernel TCP stack and the TUN device, exercising the full TUN pump.
+
+```bash
+source .secrets/tailscale.env && sudo tools/interop-tun.sh
+```
+
+Tests: `interop_tun_rust_dials_go`, `interop_tun_go_dials_rust`,
+`interop_tun_os_routes`, `interop_tun_subnet_forward`. All skip cleanly
+when `TS_INTEROP_GO_IP` is absent or not running as root.
+
+**Layer 3 — Full TUN both sides** (Linux netns, CI-only):
+`tools/interop-tun-full.sh` runs both rustscale and Go tailscaled in real
+TUN mode inside isolated network namespaces connected via a veth bridge.
+This tests subnet-route forwarding and exit-node data-path where Go also
+needs a kernel interface. Linux-only, requires root + `iproute2`.
+
+```bash
+sudo tools/interop-tun-full.sh
+```
+
+### CI
+
+The `interop-tun` job in `.github/workflows/e2e.yml` runs Layer 2 on Linux
+with `sudo -E tools/interop-tun.sh`. Guarded by
+`if: github.repository == 'rajsinghtech/rustscale'`.

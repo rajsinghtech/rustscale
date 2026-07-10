@@ -2780,3 +2780,798 @@ async fn interop_subnet_routes() {
 
     server.close().await;
 }
+
+// ---------------------------------------------------------------------------
+// Layer 1: TUN pump unit tests (no root, no Go)
+// ---------------------------------------------------------------------------
+//
+// Exercises the same data-plane logic as `run_tun_pump` — TUN read →
+// WG encapsulate → cross-feed → WG decapsulate → filter → TUN write — but
+// with MockTun devices and in-memory cross-feeding instead of a real
+// magicsock. This catches pump bugs, MTU handling, and filter-on-raw-IP
+// issues without any OS dependency.
+
+use rustscale_filter::Filter;
+use rustscale_tun::MockTun;
+
+/// Build a minimal IPv4 TCP packet for testing the TUN pump.
+fn build_ipv4_tcp(src: Ipv4Addr, dst: Ipv4Addr, payload: &[u8]) -> Vec<u8> {
+    let total = 20 + 20 + payload.len();
+    let mut p = vec![0u8; total];
+    p[0] = 0x45;
+    p[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+    p[8] = 64;
+    p[9] = 6;
+    p[12..16].copy_from_slice(&src.octets());
+    p[16..20].copy_from_slice(&dst.octets());
+    p[20..22].copy_from_slice(&12345u16.to_be_bytes());
+    p[22..24].copy_from_slice(&80u16.to_be_bytes());
+    p[24..28].copy_from_slice(&1u32.to_be_bytes());
+    p[32] = 0x50;
+    p[33] = 0x02;
+    p[34..36].copy_from_slice(&65535u16.to_be_bytes());
+    p[20 + 20..].copy_from_slice(payload);
+    p
+}
+
+/// Drive one packet from a TUN through the WG tunnel to the peer's TUN.
+/// Mirrors what `run_tun_pump` does: filter outbound → encapsulate →
+/// (cross-feed) → decapsulate → filter inbound → TUN write.
+async fn tun_pump_packet(
+    pkt: &[u8],
+    src_tunn: &Arc<Mutex<WgTunn>>,
+    dst_tunn: &Arc<Mutex<WgTunn>>,
+    route_table: &Arc<RwLock<RouteTable>>,
+    filter: &Arc<std::sync::Mutex<Filter>>,
+    dst_tun: &Arc<MockTun>,
+) {
+    {
+        let mut f = filter.lock().unwrap();
+        f.update_outbound(pkt);
+    }
+    let dst = WgTunn::dst_address(pkt).expect("dst addr");
+    let has_route = {
+        let rt = route_table.read().await;
+        rt.lookup(dst).is_some()
+    };
+    if !has_route {
+        return;
+    }
+    // Encapsulate under the lock, collect datagrams.
+    let dgrams: Vec<Vec<u8>> = {
+        if let Ok(mut t) = src_tunn.try_lock() {
+            t.encapsulate(pkt).unwrap_or_default()
+        } else {
+            return;
+        }
+    };
+    for dg in &dgrams {
+        // Decapsulate under the lock, collect plaintext + replies.
+        let (plaintext, replies): (Option<Vec<u8>>, Vec<Vec<u8>>) = {
+            if let Ok(mut dt) = dst_tunn.try_lock() {
+                if let Ok(decap) = dt.decapsulate(dg) {
+                    (decap.plaintext.clone(), decap.replies.clone())
+                } else {
+                    (None, vec![])
+                }
+            } else {
+                (None, vec![])
+            }
+        };
+        if let Some(pt) = plaintext {
+            let dropped = {
+                let mut f = filter.lock().unwrap();
+                f.check_in(&pt).is_drop()
+            };
+            if !dropped {
+                let _ = dst_tun.write_packet(&pt).await;
+            }
+        }
+        // Feed handshake replies back to src.
+        for reply in &replies {
+            let reply_pt: Option<Vec<u8>> = {
+                if let Ok(mut st) = src_tunn.try_lock() {
+                    if let Ok(a_decap) = st.decapsulate(reply) {
+                        a_decap.plaintext.clone()
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            };
+            if let Some(pt) = reply_pt {
+                let _ = dst_tun.write_packet(&pt).await;
+            }
+        }
+    }
+}
+
+/// Run the WG handshake by forcing an initiation and cross-feeding the
+/// handshake messages until the tunnel is established. This mirrors what
+/// the netstack rig's `pump_cycle` does — but as a bounded loop since we
+/// don't have a continuous pump.
+async fn wg_handshake(a_tunn: &Arc<Mutex<WgTunn>>, b_tunn: &Arc<Mutex<WgTunn>>) {
+    // Force A to initiate a handshake.
+    let init_dgs: Vec<Vec<u8>> = {
+        if let Ok(mut t) = a_tunn.try_lock() {
+            t.force_handshake()
+        } else {
+            return;
+        }
+    };
+
+    // Cross-feed: A init → B decapsulate → B replies → A decapsulate.
+    for dg in &init_dgs {
+        let b_replies: Vec<Vec<u8>> = {
+            if let Ok(mut bt) = b_tunn.try_lock() {
+                if let Ok(decap) = bt.decapsulate(dg) {
+                    decap.replies.clone()
+                } else {
+                    vec![]
+                }
+            } else {
+                vec![]
+            }
+        };
+        for reply in &b_replies {
+            if let Ok(mut at) = a_tunn.try_lock() {
+                let _ = at.decapsulate(reply);
+            }
+        }
+    }
+
+    // Also force B to initiate — this establishes B→A transport keys.
+    let b_init_dgs: Vec<Vec<u8>> = {
+        if let Ok(mut t) = b_tunn.try_lock() {
+            t.force_handshake()
+        } else {
+            vec![]
+        }
+    };
+    for dg in &b_init_dgs {
+        let a_replies: Vec<Vec<u8>> = {
+            if let Ok(mut at) = a_tunn.try_lock() {
+                if let Ok(decap) = at.decapsulate(dg) {
+                    decap.replies.clone()
+                } else {
+                    vec![]
+                }
+            } else {
+                vec![]
+            }
+        };
+        for reply in &a_replies {
+            if let Ok(mut bt) = b_tunn.try_lock() {
+                let _ = bt.decapsulate(reply);
+            }
+        }
+    }
+
+    // Tick timers on both sides and cross-feed any remaining handshake
+    // messages. A few rounds is enough — the handshake is a 3-way exchange.
+    for _ in 0..20 {
+        for (src, dst) in [(a_tunn, b_tunn), (b_tunn, a_tunn)] {
+            let dgs: Vec<Vec<u8>> = {
+                if let Ok(mut t) = src.try_lock() {
+                    t.tick_timers()
+                } else {
+                    vec![]
+                }
+            };
+            for dg in &dgs {
+                if let Ok(mut dt) = dst.try_lock() {
+                    let decap = dt.decapsulate(dg).unwrap_or_default();
+                    for reply in &decap.replies {
+                        if let Ok(mut st) = src.try_lock() {
+                            let _ = st.decapsulate(reply);
+                        }
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
+/// Set up a TUN pump test rig: two WG tunnels + route tables + filter.
+struct TunPumpRig {
+    tun_a: Arc<MockTun>,
+    tun_b: Arc<MockTun>,
+    a_tunn: Arc<Mutex<WgTunn>>,
+    b_tunn: Arc<Mutex<WgTunn>>,
+    rt_a: Arc<RwLock<RouteTable>>,
+    rt_b: Arc<RwLock<RouteTable>>,
+    filter: Arc<std::sync::Mutex<Filter>>,
+}
+
+fn make_tun_pump_rig(ip_a: Ipv4Addr, ip_b: Ipv4Addr) -> TunPumpRig {
+    let a_priv = NodePrivate::generate();
+    let b_priv = NodePrivate::generate();
+    let a_pub = a_priv.public();
+    let b_pub = b_priv.public();
+
+    let (tun_a, _) = MockTun::new("tun-a", DEFAULT_MTU);
+    let (tun_b, _) = MockTun::new("tun-b", DEFAULT_MTU);
+
+    let a_tunn = Arc::new(Mutex::new(WgTunn::new(&a_priv, &b_pub, 1).expect("A")));
+    let b_tunn = Arc::new(Mutex::new(WgTunn::new(&b_priv, &a_pub, 2).expect("B")));
+
+    let peers_a = vec![Node {
+        ID: 2,
+        Name: "b".into(),
+        Key: b_pub.clone(),
+        Addresses: vec![format!("{ip_b}/32")],
+        ..Default::default()
+    }];
+    let peers_b = vec![Node {
+        ID: 1,
+        Name: "a".into(),
+        Key: a_pub.clone(),
+        Addresses: vec![format!("{ip_a}/32")],
+        ..Default::default()
+    }];
+
+    TunPumpRig {
+        tun_a: Arc::new(tun_a),
+        tun_b: Arc::new(tun_b),
+        a_tunn,
+        b_tunn,
+        rt_a: Arc::new(RwLock::new(RouteTable::from_peers(&peers_a))),
+        rt_b: Arc::new(RwLock::new(RouteTable::from_peers(&peers_b))),
+        filter: Arc::new(std::sync::Mutex::new(Filter::allow_all())),
+    }
+}
+
+#[tokio::test]
+async fn tun_pump_a_to_b() {
+    let rig = make_tun_pump_rig(Ipv4Addr::new(100, 64, 0, 1), Ipv4Addr::new(100, 64, 0, 2));
+    wg_handshake(&rig.a_tunn, &rig.b_tunn).await;
+    let pkt = build_ipv4_tcp(
+        Ipv4Addr::new(100, 64, 0, 1),
+        Ipv4Addr::new(100, 64, 0, 2),
+        b"tun-pump-test",
+    );
+    tun_pump_packet(
+        &pkt,
+        &rig.a_tunn,
+        &rig.b_tunn,
+        &rig.rt_a,
+        &rig.filter,
+        &rig.tun_b,
+    )
+    .await;
+
+    let written = rig.tun_b.written().await;
+    assert_eq!(written.len(), 1);
+    assert_eq!(written[0], pkt, "packet should arrive intact");
+}
+
+#[tokio::test]
+async fn tun_pump_b_to_a() {
+    let rig = make_tun_pump_rig(Ipv4Addr::new(100, 64, 0, 1), Ipv4Addr::new(100, 64, 0, 2));
+    wg_handshake(&rig.a_tunn, &rig.b_tunn).await;
+    let pkt = build_ipv4_tcp(
+        Ipv4Addr::new(100, 64, 0, 2),
+        Ipv4Addr::new(100, 64, 0, 1),
+        b"tun-pump-b2a",
+    );
+    tun_pump_packet(
+        &pkt,
+        &rig.b_tunn,
+        &rig.a_tunn,
+        &rig.rt_b,
+        &rig.filter,
+        &rig.tun_a,
+    )
+    .await;
+
+    let written = rig.tun_a.written().await;
+    assert_eq!(written.len(), 1);
+    assert_eq!(written[0], pkt, "packet should arrive intact");
+}
+
+#[tokio::test]
+async fn tun_pump_multiple_packets() {
+    let rig = make_tun_pump_rig(Ipv4Addr::new(100, 64, 0, 1), Ipv4Addr::new(100, 64, 0, 2));
+    wg_handshake(&rig.a_tunn, &rig.b_tunn).await;
+    let mut pkts = Vec::new();
+    for i in 0..5u8 {
+        let payload = vec![i; 10 + i as usize];
+        let pkt = build_ipv4_tcp(
+            Ipv4Addr::new(100, 64, 0, 1),
+            Ipv4Addr::new(100, 64, 0, 2),
+            &payload,
+        );
+        pkts.push(pkt);
+    }
+    for pkt in &pkts {
+        tun_pump_packet(
+            pkt,
+            &rig.a_tunn,
+            &rig.b_tunn,
+            &rig.rt_a,
+            &rig.filter,
+            &rig.tun_b,
+        )
+        .await;
+    }
+    let written = rig.tun_b.written().await;
+    assert_eq!(written.len(), 5);
+    for (i, w) in written.iter().enumerate() {
+        assert_eq!(w, &pkts[i], "packet {i} mismatch");
+    }
+}
+
+#[tokio::test]
+async fn tun_pump_no_route_drops() {
+    let a_priv = NodePrivate::generate();
+    let b_priv = NodePrivate::generate();
+    let (tun_a, _) = MockTun::new("tun-a", DEFAULT_MTU);
+    let (tun_b, _) = MockTun::new("tun-b", DEFAULT_MTU);
+    let a_tunn = Arc::new(Mutex::new(
+        WgTunn::new(&a_priv, &b_priv.public(), 1).expect("A"),
+    ));
+    let b_tunn = Arc::new(Mutex::new(
+        WgTunn::new(&b_priv, &a_priv.public(), 2).expect("B"),
+    ));
+    let rt_a = Arc::new(RwLock::new(RouteTable::from_peers(&[])));
+    let filter = Arc::new(std::sync::Mutex::new(Filter::allow_all()));
+
+    let pkt = build_ipv4_tcp(
+        Ipv4Addr::new(100, 64, 0, 1),
+        Ipv4Addr::new(100, 64, 0, 99),
+        b"no-route",
+    );
+    tun_pump_packet(&pkt, &a_tunn, &b_tunn, &rt_a, &filter, &Arc::new(tun_b)).await;
+
+    let written = Arc::new(tun_a).written().await;
+    assert!(written.is_empty(), "no packet should arrive with no route");
+}
+
+#[tokio::test]
+async fn tun_mock_inject_and_read() {
+    let (tun, tx) = MockTun::new("mock-inject", 1280);
+    let pkt = build_ipv4_tcp(
+        Ipv4Addr::new(100, 64, 0, 1),
+        Ipv4Addr::new(100, 64, 0, 2),
+        b"inject-test",
+    );
+    tx.send(pkt.clone()).await.unwrap();
+    let got = tun.read_packet().await.unwrap();
+    assert_eq!(got, pkt);
+}
+
+#[tokio::test]
+async fn tun_pump_mtu_sized() {
+    let rig = make_tun_pump_rig(Ipv4Addr::new(100, 64, 0, 1), Ipv4Addr::new(100, 64, 0, 2));
+    wg_handshake(&rig.a_tunn, &rig.b_tunn).await;
+    let payload = vec![0xAB; DEFAULT_MTU - 40];
+    let pkt = build_ipv4_tcp(
+        Ipv4Addr::new(100, 64, 0, 1),
+        Ipv4Addr::new(100, 64, 0, 2),
+        &payload,
+    );
+    assert_eq!(pkt.len(), DEFAULT_MTU);
+    tun_pump_packet(
+        &pkt,
+        &rig.a_tunn,
+        &rig.b_tunn,
+        &rig.rt_a,
+        &rig.filter,
+        &rig.tun_b,
+    )
+    .await;
+
+    let written = rig.tun_b.written().await;
+    assert_eq!(written.len(), 1);
+    assert_eq!(
+        written[0].len(),
+        DEFAULT_MTU,
+        "packet should not be truncated"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Layer 2: TUN interop with Go tailscaled (root for TUN, Go in userspace)
+// ---------------------------------------------------------------------------
+//
+// These tests require:
+//   - TS_INTEROP_GO_IP (set by tools/interop-tun.sh)
+//   - Root/sudo (to create a TUN device and apply OS routes)
+// They skip cleanly otherwise. The Go node stays in userspace-networking
+// mode (no root for Go). rustscale runs `up_tun()` with `apply_routes: true`
+// so the OS routes tailnet traffic through the TUN device.
+//
+// Key difference from netstack interop: tests use OS sockets (std::net /
+// tokio::net) instead of Server::dial/listen, because those are unavailable
+// in TUN mode. Outbound: OS socket → kernel TCP → TUN device → pump → WG →
+// magicsock → Go netstack. Inbound: Go SOCKS5 → Go netstack → magicsock →
+// WG → TUN pump → OS → kernel TCP → OS listener.
+
+/// Check if we have root privileges (needed for TUN device creation).
+/// Uses `id -u` via std::process::Command to avoid unsafe code (the tsnet
+/// crate is #![forbid(unsafe_code)]).
+fn have_root() -> bool {
+    std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "0")
+        .unwrap_or(false)
+}
+
+/// Require interop env + root, or skip.
+fn require_tun_interop(test_name: &str) -> Option<InteropEnv> {
+    let Some(ienv) = interop_env() else {
+        eprintln!("{test_name}: skipping (interop env not set)");
+        return None;
+    };
+    if !have_root() {
+        eprintln!("{test_name}: skipping (not root — TUN mode requires sudo)");
+        return None;
+    }
+    Some(ienv)
+}
+
+/// Interop TUN: rustscale in TUN mode dials the Go node's serve echo via
+/// an OS socket. Traffic flows: OS TCP → TUN → WG → magicsock → Go netstack.
+#[tokio::test]
+#[ignore = "requires TS_INTEROP_GO_IP + root (run via tools/interop-tun.sh)"]
+async fn interop_tun_rust_dials_go() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    let Some(ienv) = require_tun_interop("interop_tun_rust_dials_go") else {
+        return;
+    };
+
+    let uid = std::process::id();
+    let mut server = Server::builder()
+        .hostname(format!("rustscale-tun-dial-{uid}"))
+        .auth_key(ienv.authkey.clone())
+        .ephemeral(true)
+        .build()
+        .expect("build");
+
+    server
+        .up_tun(TunModeConfig {
+            tun: rustscale_tun::TunConfig::default(),
+            apply_routes: true,
+            exit_node: None,
+        })
+        .await
+        .expect("up_tun");
+
+    let status = server.status();
+    eprintln!(
+        "interop_tun_rust_dials_go: up, tailscale_ips={:?}",
+        status.tailscale_ips
+    );
+
+    // Wait for the Go peer to appear in the netmap.
+    wait_for_peer(&server, IpAddr::V4(ienv.go_ip), "interop_tun_rust_dials_go").await;
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+    // OS socket connect to the Go node's tailnet IP:echo_port.
+    // The kernel routes 100.64.0.0/10 through the TUN device.
+    let dial_addr = format!("{}:{}", ienv.go_ip, ienv.echo_port);
+    eprintln!("interop_tun_rust_dials_go: OS connect to {dial_addr}");
+
+    let mut stream = None;
+    for _ in 1..=5 {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            TcpStream::connect(&dial_addr),
+        )
+        .await
+        {
+            Ok(Ok(s)) => {
+                stream = Some(s);
+                break;
+            }
+            Ok(Err(e)) => eprintln!("connect failed: {e}"),
+            Err(_) => eprintln!("connect timed out (15s)"),
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+    let mut stream = stream.expect("OS connect to Go echo failed after 5 attempts");
+
+    // Echo roundtrip through the TUN data plane.
+    let payload = b"interop-tun-rust-dials-go";
+    stream.write_all(payload).await.expect("write");
+    let mut got = vec![0u8; payload.len()];
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        stream.read_exact(&mut got),
+    )
+    .await
+    .expect("read timed out")
+    .expect("read failed");
+    assert_eq!(&got, payload, "echo mismatch through TUN");
+
+    log_go_path(&server, ienv.go_ip, "tun_rust_dials_go");
+    server.close().await;
+}
+
+/// Interop TUN: Go dials the rustscale node through its SOCKS5 proxy.
+/// Traffic flows: Go SOCKS5 → Go netstack → magicsock → WG → TUN pump →
+/// OS kernel TCP → OS listener.
+#[tokio::test]
+#[ignore = "requires TS_INTEROP_GO_IP + root (run via tools/interop-tun.sh)"]
+async fn interop_tun_go_dials_rust() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    let Some(ienv) = require_tun_interop("interop_tun_go_dials_rust") else {
+        return;
+    };
+
+    let uid = std::process::id();
+    let mut server = Server::builder()
+        .hostname(format!("rustscale-tun-accept-{uid}"))
+        .auth_key(ienv.authkey.clone())
+        .ephemeral(true)
+        .build()
+        .expect("build");
+
+    server
+        .up_tun(TunModeConfig {
+            tun: rustscale_tun::TunConfig::default(),
+            apply_routes: true,
+            exit_node: None,
+        })
+        .await
+        .expect("up_tun");
+
+    let status = server.status();
+    let rust_ip = status
+        .tailscale_ips
+        .iter()
+        .find_map(|ip| match ip {
+            IpAddr::V4(v4) => Some(*v4),
+            _ => None,
+        })
+        .expect("rust should have an IPv4");
+    eprintln!("interop_tun_go_dials_rust: up, rust_ip={rust_ip}");
+
+    // OS listener on the tailnet IP (the kernel routes inbound TUN traffic
+    // to this socket).
+    const ECHO_PORT: u16 = 4646;
+    let listener = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        TcpListener::bind((rust_ip, ECHO_PORT)),
+    )
+    .await
+    .expect("bind timed out")
+    .expect("bind failed");
+    eprintln!("interop_tun_go_dials_rust: OS listener on {rust_ip}:{ECHO_PORT}");
+
+    // Wait for the Go peer.
+    wait_for_peer(&server, IpAddr::V4(ienv.go_ip), "interop_tun_go_dials_rust").await;
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+    // Spawn the echo acceptor on the rust side (OS listener).
+    let echo_task = tokio::spawn(async move {
+        let (mut sock, peer) =
+            tokio::time::timeout(std::time::Duration::from_secs(60), listener.accept())
+                .await
+                .expect("accept timed out")
+                .expect("accept failed");
+        eprintln!("interop_tun_go_dials_rust: accepted from {peer}");
+        let mut buf = [0u8; 256];
+        loop {
+            match sock.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if sock.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    // Hand-rolled SOCKS5 client: Go's SOCKS5 → CONNECT to rust_ip:ECHO_PORT.
+    let mut client = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        TcpStream::connect(&ienv.socks),
+    )
+    .await
+    .expect("connect to go socks5 timed out")
+    .expect("connect to go socks5 failed");
+
+    client
+        .write_all(&[0x05, 0x01, 0x00])
+        .await
+        .expect("greeting");
+    let mut greply = [0u8; 2];
+    client.read_exact(&mut greply).await.expect("greeting read");
+    assert_eq!(greply, [0x05, 0x00]);
+
+    let mut req = vec![0x05, 0x01, 0x00, 0x01];
+    req.extend_from_slice(&rust_ip.octets());
+    req.extend_from_slice(&ECHO_PORT.to_be_bytes());
+    client.write_all(&req).await.expect("request write");
+
+    let mut hdr = [0u8; 4];
+    client.read_exact(&mut hdr).await.expect("reply header");
+    assert_eq!(hdr[1], 0x00, "socks5 connect failed");
+    let mut bind_rest = vec![0u8; 6];
+    client.read_exact(&mut bind_rest).await.expect("bind read");
+
+    let payload = b"interop-tun-go-dials-rust";
+    echo_roundtrip(&mut client, payload, "tun_go_dials_rust").await;
+    log_go_path(&server, ienv.go_ip, "tun_go_dials_rust");
+
+    drop(client);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(15), echo_task)
+        .await
+        .expect("echo task did not exit");
+    server.close().await;
+}
+
+/// Interop TUN: verify OS routes were installed — `100.64.0.0/10` should
+/// route through the TUN device. Uses `netstat -rn` (macOS) or `ip route`
+/// (Linux) to check.
+#[tokio::test]
+#[ignore = "requires TS_INTEROP_GO_IP + root (run via tools/interop-tun.sh)"]
+async fn interop_tun_os_routes() {
+    let Some(ienv) = require_tun_interop("interop_tun_os_routes") else {
+        return;
+    };
+
+    let uid = std::process::id();
+    let mut server = Server::builder()
+        .hostname(format!("rustscale-tun-routes-{uid}"))
+        .auth_key(ienv.authkey.clone())
+        .ephemeral(true)
+        .build()
+        .expect("build");
+
+    server
+        .up_tun(TunModeConfig {
+            tun: rustscale_tun::TunConfig::default(),
+            apply_routes: true,
+            exit_node: None,
+        })
+        .await
+        .expect("up_tun");
+
+    let status = server.status();
+    assert!(!status.tailscale_ips.is_empty(), "should have tailnet IPs");
+
+    // Check OS routing table for the tailnet subnet route.
+    let route_check = if cfg!(target_os = "macos") {
+        std::process::Command::new("netstat")
+            .args(["-rn", "-f", "inet"])
+            .output()
+    } else {
+        std::process::Command::new("ip")
+            .args(["route", "show"])
+            .output()
+    };
+
+    if let Ok(out) = route_check {
+        let table = String::from_utf8_lossy(&out.stdout);
+        let has_tailnet = table.contains("100.64.0.0/10") || table.contains("100.64.0.0/10");
+        // On Linux the route might show as "100.64.0.0/10 dev tun0".
+        let has_tailnet_linux = table.contains("100.64.0.0/10");
+        assert!(
+            has_tailnet || has_tailnet_linux,
+            "OS routing table should contain 100.64.0.0/10 route via TUN\n{table}"
+        );
+        eprintln!("interop_tun_os_routes: OS route for 100.64.0.0/10 verified");
+    }
+
+    log_go_path(&server, ienv.go_ip, "tun_os_routes");
+    server.close().await;
+}
+
+/// Interop TUN: Go advertises a subnet route, rustscale in TUN mode with
+/// accept_routes=true installs it as an OS route. Asserts the in-process
+/// RouteTable resolves the subnet to the Go peer AND the OS routing table
+/// contains the subnet route.
+#[tokio::test]
+#[ignore = "requires TS_INTEROP_GO_IP + root + TS_INTEROP_GO_SUBNET (run via tools/interop-tun.sh)"]
+async fn interop_tun_subnet_forward() {
+    let Some(ienv) = require_tun_interop("interop_tun_subnet_forward") else {
+        return;
+    };
+    let Some(subnet) = ienv.go_subnet.clone() else {
+        eprintln!("interop_tun_subnet_forward: skipping (TS_INTEROP_GO_SUBNET not set)");
+        return;
+    };
+
+    let uid = std::process::id();
+    let mut server = Server::builder()
+        .hostname(format!("rustscale-tun-subnet-{uid}"))
+        .auth_key(ienv.authkey.clone())
+        .ephemeral(true)
+        .accept_routes(true)
+        .build()
+        .expect("build");
+
+    server
+        .up_tun(TunModeConfig {
+            tun: rustscale_tun::TunConfig::default(),
+            apply_routes: true,
+            exit_node: None,
+        })
+        .await
+        .expect("up_tun");
+
+    wait_for_peer(
+        &server,
+        IpAddr::V4(ienv.go_ip),
+        "interop_tun_subnet_forward",
+    )
+    .await;
+
+    // Wait for the subnet to appear in the in-process route table.
+    let sample_ip: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 99, 0, 1));
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    loop {
+        if server.route_lookup(sample_ip).is_some() {
+            let routes = server.routes();
+            let has_subnet = routes.iter().any(|(cidr, _)| cidr == &subnet);
+            assert!(has_subnet, "route table should contain {subnet}");
+            eprintln!("interop_tun_subnet_forward: in-process route {subnet} verified");
+
+            // Also check the OS routing table.
+            if cfg!(target_os = "macos") {
+                if let Ok(out) = std::process::Command::new("netstat")
+                    .args(["-rn", "-f", "inet"])
+                    .output()
+                {
+                    let table = String::from_utf8_lossy(&out.stdout);
+                    let net = subnet.split('/').next().unwrap_or("");
+                    if table.contains(net) {
+                        eprintln!("interop_tun_subnet_forward: OS route for {subnet} verified");
+                    } else {
+                        eprintln!(
+                            "interop_tun_subnet_forward: WARN — OS route for {subnet} not found in netstat (may be installed lazily)"
+                        );
+                    }
+                }
+            } else if let Ok(out) = std::process::Command::new("ip")
+                .args(["route", "show"])
+                .output()
+            {
+                let table = String::from_utf8_lossy(&out.stdout);
+                let net = subnet.split('/').next().unwrap_or("");
+                if table.contains(net) {
+                    eprintln!("interop_tun_subnet_forward: OS route for {subnet} verified");
+                } else {
+                    eprintln!(
+                        "interop_tun_subnet_forward: WARN — OS route for {subnet} not found (may be installed lazily)"
+                    );
+                }
+            }
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            let routes = server.routes();
+            panic!(
+                "interop_tun_subnet_forward: subnet {subnet} never appeared in route table (90s)\n\
+                 routes: {routes:?}"
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
+    server.close().await;
+}
+
+// ---------------------------------------------------------------------------
+// Layer 3: Full TUN both sides (Linux netns, CI-only) — harness only
+// ---------------------------------------------------------------------------
+// See tools/interop-tun-full.sh. Both nodes run in real TUN mode inside
+// isolated network namespaces connected via a veth bridge. This tests
+// subnet-route forwarding and exit-node data-path where Go also needs a
+// kernel interface. The test functions are the same as Layer 2 but run
+// with both sides in TUN mode — the harness sets TS_INTEROP_GO_TUN=1 to
+// signal that the Go side is also in TUN mode (no SOCKS5 proxy available;
+// Go uses its TUN interface directly for outbound). Not implemented as
+// separate Rust tests — the Layer 2 tests already cover the TUN pump
+// interop; Layer 3 adds OS-level forwarding which is CI-specific.

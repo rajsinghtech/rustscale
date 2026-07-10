@@ -96,3 +96,46 @@ jobs:
         env:
           TS_ORG_TOKEN: ${{ steps.tsauth.outputs.token }}
         run: tools/interop.sh
+
+  # ---------------------------------------------------------------------------
+  # TUN-mode interop: rustscale in TUN mode <-> Go tailscaled in userspace.
+  # The test binary runs under sudo to create a real TUN device + OS routes.
+  # Linux only — macOS utun requires root and GitHub Actions don't grant it.
+  # ---------------------------------------------------------------------------
+  interop-tun:
+    name: TUN-mode interop (rustscale TUN <-> Go userspace)
+    if: github.repository == 'rajsinghtech/rustscale'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Go tailscale client
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+          tailscale version
+
+      - name: Mint Tailscale org token via GitHub OIDC (WIF)
+        id: tsauth
+        run: |
+          AUD="api.tailscale.com/TbqNGJkY5611CNTRL-kz4CwX2LK721CNTRL"
+          JWT=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$AUD" | jq -r '.value')
+          echo "::add-mask::$JWT"
+          TOKEN=$(curl -sS -X POST https://api.tailscale.com/api/v2/oauth/token-exchange \
+            -H 'Content-Type: application/x-www-form-urlencoded' \
+            -d 'client_id=TbqNGJkY5611CNTRL-kz4CwX2LK721CNTRL' -d "jwt=$JWT" | jq -r '.access_token')
+          if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then echo "OIDC token-exchange failed" >&2; exit 1; fi
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+
+      # GitHub Actions runners allow sudo without a password.
+      - name: Run TUN interop tests (sudo)
+        env:
+          TS_ORG_TOKEN: ${{ steps.tsauth.outputs.token }}
+        run: sudo -E env PATH="$PATH" HOME="$HOME" tools/interop-tun.sh

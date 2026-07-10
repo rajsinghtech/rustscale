@@ -1544,9 +1544,7 @@ async fn e2e_control_cert_not_enabled() {
 async fn e2e_acme_cert_issuance() {
     let authkey = std::env::var("TS_E2E_AUTHKEY").expect("TS_E2E_AUTHKEY not set");
     let _tailnet = std::env::var("TS_E2E_TAILNET").expect("TS_E2E_TAILNET not set");
-    let https_enabled = std::env::var("TS_E2E_HTTPS")
-        .map(|v| v == "1")
-        .unwrap_or(false);
+    let https_enabled = std::env::var("TS_E2E_HTTPS").is_ok_and(|v| v == "1");
     if !https_enabled {
         eprintln!("e2e_acme_cert_issuance: skipping (TS_E2E_HTTPS != 1)");
         return;
@@ -3195,8 +3193,7 @@ fn have_root() -> bool {
     std::process::Command::new("id")
         .arg("-u")
         .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "0")
-        .unwrap_or(false)
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "0")
 }
 
 /// Require interop env + root, or skip.

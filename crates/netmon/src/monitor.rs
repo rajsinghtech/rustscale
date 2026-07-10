@@ -19,7 +19,7 @@ use crate::state::{gather_state, State};
 const WALL_TICK: Duration = Duration::from_secs(15);
 
 /// Minimum wall-clock elapsed time to treat as a time jump (sleep wake).
-const TIME_JUMP_THRESHOLD: Duration = Duration::from_secs(60);
+const TIME_JUMP_THRESHOLD: Duration = Duration::from_mins(1);
 
 /// Debounce coalesce window (matches Go's 1s).
 const DEBOUNCE: Duration = Duration::from_secs(1);

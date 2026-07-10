@@ -45,7 +45,7 @@ pub const RS_ERR_UNKNOWN: c_int = -1;
 /// Default timeout for blocking FFI operations (dial, accept, read).
 /// Prevents unbounded hangs in C callers that can't handle async cancellation.
 /// 60s is generous enough for a WG handshake + DERP relay round trip.
-const FFI_BLOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const FFI_BLOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(1);
 
 // ---------------------------------------------------------------------------
 // Global tokio runtime (lazy)

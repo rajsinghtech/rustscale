@@ -2001,7 +2001,7 @@ async fn e2e_socks5_proxy() {
     let echo_task = tokio::spawn(async move {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let mut stream_b =
-            tokio::time::timeout(std::time::Duration::from_secs(60), listener_b.accept())
+            tokio::time::timeout(std::time::Duration::from_mins(1), listener_b.accept())
                 .await
                 .expect("B accept timed out")
                 .expect("B accept failed");
@@ -2305,11 +2305,10 @@ async fn interop_go_dials_rust() {
 
     // Spawn the echo acceptor on the rust side.
     let echo_task = tokio::spawn(async move {
-        let mut stream =
-            tokio::time::timeout(std::time::Duration::from_secs(60), listener.accept())
-                .await
-                .expect("rust accept timed out")
-                .expect("rust accept failed");
+        let mut stream = tokio::time::timeout(std::time::Duration::from_mins(1), listener.accept())
+            .await
+            .expect("rust accept timed out")
+            .expect("rust accept failed");
         let mut buf = [0u8; 256];
         loop {
             match tokio::time::timeout(std::time::Duration::from_secs(30), stream.read(&mut buf))
@@ -2501,7 +2500,7 @@ async fn interop_direct_path() {
     }
 
     // Poll for direct path settlement (up to 60s).
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
     let mut settled = false;
     while std::time::Instant::now() < deadline {
         if let Some(class) = go_peer_path(&server, ienv.go_ip) {
@@ -2649,7 +2648,7 @@ async fn interop_direct_after_derp() {
     });
 
     // Poll for direct path settlement (up to 60s).
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
     let mut settled = false;
     while std::time::Instant::now() < deadline {
         if let Some(class) = go_peer_path(&server, ienv.go_ip) {
@@ -3353,7 +3352,7 @@ async fn interop_tun_go_dials_rust() {
     // Spawn the echo acceptor on the rust side (OS listener).
     let echo_task = tokio::spawn(async move {
         let (mut sock, peer) =
-            tokio::time::timeout(std::time::Duration::from_secs(60), listener.accept())
+            tokio::time::timeout(std::time::Duration::from_mins(1), listener.accept())
                 .await
                 .expect("accept timed out")
                 .expect("accept failed");

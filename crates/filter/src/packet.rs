@@ -205,21 +205,16 @@ fn fill_transport(info: &mut PacketInfo, proto: u8, transport: &[u8]) {
                 info.dst_port = u16::from_be_bytes([transport[2], transport[3]]);
             }
         }
-        ICMP_V4 => {
-            if !transport.is_empty() {
-                let icmp_type = transport[0];
-                info.is_icmp_echo_reply = icmp_type == 0;
-                info.is_icmp_error = ICMP_ERROR_TYPES.contains(&icmp_type);
-            }
+        ICMP_V4 if !transport.is_empty() => {
+            let icmp_type = transport[0];
+            info.is_icmp_echo_reply = icmp_type == 0;
+            info.is_icmp_error = ICMP_ERROR_TYPES.contains(&icmp_type);
         }
-        ICMP_V6 => {
-            if !transport.is_empty() {
-                let icmp_type = transport[0];
-                // Echo reply = 129 for ICMP_V6.
-                info.is_icmp_echo_reply = icmp_type == 129;
-                info.is_icmp_error =
-                    ICMP_ERROR_TYPES.contains(&icmp_type) || icmp_type == 1 || icmp_type == 2;
-            }
+        ICMP_V6 if !transport.is_empty() => {
+            let icmp_type = transport[0];
+            info.is_icmp_echo_reply = icmp_type == 129;
+            info.is_icmp_error =
+                ICMP_ERROR_TYPES.contains(&icmp_type) || icmp_type == 1 || icmp_type == 2;
         }
         _ => {}
     }

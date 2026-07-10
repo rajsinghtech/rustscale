@@ -295,7 +295,7 @@ mod tests {
             lamport_id: 123,
             vni: 456,
             bind_lifetime: Duration::from_secs(1),
-            steady_state_lifetime: Duration::from_secs(60),
+            steady_state_lifetime: Duration::from_mins(1),
             addr_ports: vec![ap("1.2.3.4", 567), ap("[2001::3456]", 789)],
         }
     }

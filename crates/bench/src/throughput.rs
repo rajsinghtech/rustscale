@@ -231,7 +231,7 @@ async fn run_down(stream: NetstackStream, counter: Arc<AtomicU64>) {
     let mut buf = vec![0u8; READ_BUF_SIZE];
     // Hard timeout: duration + 30s grace period to prevent infinite hang
     // if the server's shutdown signal is lost in the netstack channel.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    let deadline = tokio::time::Instant::now() + Duration::from_mins(2);
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
@@ -275,7 +275,7 @@ async fn run_bidir(
     });
 
     let mut read_buf = vec![0u8; READ_BUF_SIZE];
-    let read_deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    let read_deadline = tokio::time::Instant::now() + Duration::from_mins(2);
     loop {
         let remaining = read_deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {

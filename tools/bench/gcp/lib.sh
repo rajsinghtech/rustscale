@@ -24,6 +24,11 @@
 : "${GCP_IMAGE_PROJECT:=ubuntu-os-cloud}"
 : "${GCP_DRY_RUN:=}"
 
+# SSH connection cache (populated by ssh_cmd on first use per VM).
+declare -A _SSH_IP=()
+declare -A _SSH_USER=()
+_SSH_KEY="$HOME/.ssh/google_compute_engine"
+
 # Auto-detect project if not set.
 if [[ -z "${GCP_PROJECT:-}" ]]; then
   GCP_PROJECT=$(gcloud config get-value core/project 2>/dev/null || true)
@@ -69,11 +74,14 @@ apt-get update -qq
 DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
   iperf3 tcpdump zstd sysstat procps jq curl python3 socat ncat git \
   build-essential pkg-config ca-certificates iptables iproute2 iputils-ping
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
-# Make cargo/rustc accessible to non-root SSH user (gcloud ssh runs as GCP account user).
-ln -sf /root/.cargo/bin/cargo /usr/local/bin/cargo
-ln -sf /root/.cargo/bin/rustc /usr/local/bin/rustc
-ln -sf /root/.cargo/bin/rustup /usr/local/bin/rustup
+# Install rustup to a world-readable location so non-root SSH users can build.
+export RUSTUP_HOME=/opt/rust
+export CARGO_HOME=/opt/rust/cargo
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --no-modify-path
+cp /opt/rust/cargo/bin/cargo /usr/local/bin/cargo
+cp /opt/rust/cargo/bin/rustc /usr/local/bin/rustc
+cp /opt/rust/cargo/bin/rustup /usr/local/bin/rustup
+chmod 755 /usr/local/bin/cargo /usr/local/bin/rustc /usr/local/bin/rustup
 # World-writable build dir for the non-root SSH user (gcloud ssh runs as GCP account user).
 mkdir -p /opt/rustscale && chmod 777 /opt/rustscale
 curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/jammy.noarmor.gpg \
@@ -131,9 +139,30 @@ ssh_cmd() {
     echo "[dry-run] ssh $name ($zone): $cmd" >&2
     return 0
   fi
-  gcloud compute ssh "$name" --zone="$zone" \
-    --ssh-flag='-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=20' \
-    --command="$cmd"
+  # Resolve VM external IP + SSH user once, cache in globals.
+  if [[ -z "${_SSH_IP[$name]:-}" ]]; then
+    _SSH_IP[$name]=$(gcloud compute instances describe "$name" --zone="$zone" \
+      --format='value(networkInterfaces[0].accessConfigs[0].natIP)' 2>/dev/null)
+    # Extract the SSH username from gcloud's dry-run output (the user portion
+    # of the ssh target, which may differ from the gcloud account email).
+    _SSH_USER[$name]=$(gcloud compute ssh "$name" --zone="$zone" --dry-run 2>&1 | grep -oE '[a-zA-Z0-9._-]+@[0-9.]+' | head -1 | cut -d@ -f1)
+    [[ -z "${_SSH_USER[$name]}" ]] && _SSH_USER[$name]=$(gcloud config get-value account 2>/dev/null | cut -d@ -f1)
+    _SSH_KEY="$HOME/.ssh/google_compute_engine"
+  fi
+  local ip="${_SSH_IP[$name]}" user="${_SSH_USER[$name]}"
+  local attempt=0 max=3
+  while (( attempt < max )); do
+    if ssh -i "$_SSH_KEY" \
+      -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes \
+      -o ConnectTimeout=30 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 \
+      "$user@$ip" "$cmd"; then
+      return 0
+    fi
+    attempt=$((attempt + 1))
+    echo "[gcp] ssh retry $attempt/$max for $name" >&2
+    sleep 5
+  done
+  return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -153,9 +182,18 @@ scp_to() {
     echo "[dry-run] scp $local_path -> $name:$remote_path" >&2
     return 0
   fi
-  gcloud compute scp "$local_path" "$name:$remote_path" --zone="$zone" \
-    --scp-flag='-o StrictHostKeyChecking=no' \
-    --scp-flag='-o UserKnownHostsFile=/dev/null'
+  # Resolve VM external IP + SSH user (same cache as ssh_cmd).
+  if [[ -z "${_SSH_IP[$name]:-}" ]]; then
+    _SSH_IP[$name]=$(gcloud compute instances describe "$name" --zone="$zone" \
+      --format='value(networkInterfaces[0].accessConfigs[0].natIP)' 2>/dev/null)
+    _SSH_USER[$name]=$(gcloud compute ssh "$name" --zone="$zone" --dry-run 2>&1 | grep -oE '[a-zA-Z0-9._-]+@[0-9.]+' | head -1 | cut -d@ -f1)
+    [[ -z "${_SSH_USER[$name]}" ]] && _SSH_USER[$name]=$(gcloud config get-value account 2>/dev/null | cut -d@ -f1)
+  fi
+  local ip="${_SSH_IP[$name]}" user="${_SSH_USER[$name]}"
+  scp -i "$_SSH_KEY" \
+    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes \
+    -o ConnectTimeout=30 \
+    "$local_path" "$user@$ip:$remote_path"
 }
 
 # ---------------------------------------------------------------------------
@@ -165,13 +203,14 @@ scp_to() {
 # ---------------------------------------------------------------------------
 deliver_source() {
   local name="$1" zone="$2"
-  local tarball
-  tarball=$(mktemp "/tmp/rustscale-src.$$.XXXXXX.tar.gz")
+  local tmpdir
+  tmpdir=$(mktemp -d /tmp/rustscale-src.XXXXXX)
+  local tarball="$tmpdir/rustscale-src.tar.gz"
   echo "[gcp] archiving source tree -> $tarball" >&2
   git archive --format=tar.gz -o "$tarball" HEAD
   scp_to "$tarball" "$name" "$zone" /tmp/rustscale-src.tar.gz
   ssh_cmd "$name" "$zone" 'mkdir -p /opt/rustscale && tar xzf /tmp/rustscale-src.tar.gz -C /opt/rustscale'
-  rm -f "$tarball"
+  rm -rf "$tmpdir"
 }
 
 # ---------------------------------------------------------------------------

@@ -35,9 +35,9 @@ _bench_cleanup_leftover() {
     leftover=$(cat "$BENCH_LAST_FILE" 2>/dev/null || echo "")
     if [[ -n "$leftover" && "$leftover" != "null" ]]; then
       local l_dns l_cid l_csec
-      l_dns=$(echo "$leftover" | jq -r .dnsName // empty)
-      l_cid=$(echo "$leftover" | jq -r .clientId // empty)
-      l_csec=$(echo "$leftover" | jq -r .clientSecret // empty)
+      l_dns=$(echo "$leftover" | jq -r '.dnsName // empty')
+      l_cid=$(echo "$leftover" | jq -r '.clientId // empty')
+      l_csec=$(echo "$leftover" | jq -r '.clientSecret // empty')
       if [[ -n "$l_dns" && -n "$l_cid" && -n "$l_csec" ]]; then
         echo "[bench] cleaning up leftover tailnet: $l_dns" >&2
         local lt

@@ -45,7 +45,7 @@ interop_tun_cleanup() {
     wait "$ECHO_BACKEND_PID" 2>/dev/null || true
   fi
   if [[ -n "$STATE_DIR" && -d "$STATE_DIR" ]]; then
-    rm -rf "$STATE_DIR"
+    sudo rm -rf "$STATE_DIR"
   fi
   bench_cleanup_tailnet
 }
@@ -60,15 +60,11 @@ for cmd in tailscaled tailscale python3 curl jq; do
   }
 done
 
-# Check sudo availability (TUN device creation requires root).
-if [[ "$(id -u)" -ne 0 ]]; then
-  if ! sudo -n true 2>/dev/null; then
-    echo "[interop-tun] ERROR: TUN mode requires root. Run under sudo or configure passwordless sudo." >&2
-    exit 1
-  fi
-  SUDO="sudo"
-else
-  SUDO=""
+# TUN device creation requires root. We build unprivileged and exec the test
+# binary under sudo (see below). Check that passwordless sudo is available.
+if ! sudo -n true 2>/dev/null; then
+  echo "[interop-tun] ERROR: TUN mode requires root. Configure passwordless sudo." >&2
+  exit 1
 fi
 
 echo "[interop-tun] rustscale TUN <-> Go tailscaled userspace cross-client e2e" >&2
@@ -210,21 +206,38 @@ echo "[interop-tun]   TS_INTEROP_GO_SUBNET=$GO_SUBNET" >&2
 sleep 3
 
 # ---------------------------------------------------------------------------
-# Run the TUN interop test suite under sudo.
+# Build the test binary unprivileged, then exec it under sudo.
+# `sudo cargo test` doesn't work reliably — cargo re-execs and may use root's
+# toolchain. Instead: compile as the current user, find the test binary, and
+# run THAT under sudo with env passed through.
 # ---------------------------------------------------------------------------
-echo "[interop-tun] running cargo test (TUN interop) under $SUDO" >&2
-$SUDO env \
-  TS_E2E_TAILNET="$TS_E2E_TAILNET" \
-  TS_E2E_AUTHKEY="$TS_E2E_AUTHKEY" \
-  TS_E2E_API_TOKEN="$TS_E2E_API_TOKEN" \
-  TS_INTEROP_GO_IP="$TS_INTEROP_GO_IP" \
-  TS_INTEROP_GO_NAME="$TS_INTEROP_GO_NAME" \
-  TS_INTEROP_GO_ECHO_PORT="$TS_INTEROP_GO_ECHO_PORT" \
-  TS_INTEROP_SOCKS="$TS_INTEROP_SOCKS" \
-  TS_INTEROP_GO_SUBNET="$TS_INTEROP_GO_SUBNET" \
-  PATH="$PATH" \
-  HOME="$HOME" \
-  cargo test -p rustscale-tsnet -- --ignored interop_tun_
+echo "[interop-tun] building test binary (unprivileged)..." >&2
+cargo test -p rustscale-tsnet --no-run 2>&1 || {
+  echo "[interop-tun] ERROR: build failed" >&2
+  exit 1
+}
+
+# Find the test binary path.
+TEST_BIN=$(cargo test -p rustscale-tsnet --no-run --message-format=json 2>/dev/null \
+  | python3 -c "
+import json, sys
+for line in sys.stdin:
+    try:
+        d = json.loads(line)
+        if d.get('profile', {}).get('test'):
+            print(d['executable'])
+            break
+    except: pass
+" 2>/dev/null || echo "")
+if [[ -z "$TEST_BIN" || ! -x "$TEST_BIN" ]]; then
+  echo "[interop-tun] ERROR: could not find test binary" >&2
+  exit 1
+fi
+echo "[interop-tun] test binary: $TEST_BIN" >&2
+
+# Run the test binary under sudo with env passed through.
+echo "[interop-tun] running TUN interop tests under sudo..." >&2
+sudo -E "$TEST_BIN" --ignored interop_tun_ --nocapture
 TEST_RC=$?
 
 echo "[interop-tun] test suite exited with code $TEST_RC" >&2

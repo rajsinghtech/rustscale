@@ -134,8 +134,8 @@ jobs:
           echo "::add-mask::$TOKEN"
           echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
 
-      # GitHub Actions runners allow sudo without a password.
-      - name: Run TUN interop tests (sudo)
+      # The script builds unprivileged, then execs the test binary under sudo.
+      - name: Run TUN interop tests
         env:
           TS_ORG_TOKEN: ${{ steps.tsauth.outputs.token }}
-        run: sudo -E env PATH="$PATH" HOME="$HOME" tools/interop-tun.sh
+        run: tools/interop-tun.sh

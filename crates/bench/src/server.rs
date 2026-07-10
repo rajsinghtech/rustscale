@@ -46,7 +46,8 @@ pub async fn run(
     eprintln!("listening on {ip}:{port}");
 
     loop {
-        let accept_result = tokio::time::timeout(Duration::from_secs(1800), listener.accept()).await;
+        let accept_result =
+            tokio::time::timeout(Duration::from_secs(1800), listener.accept()).await;
         let stream = match accept_result {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => {

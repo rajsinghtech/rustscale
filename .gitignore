@@ -2,3 +2,4 @@ target/
 .secrets/
 bench-results/
 tools/bench/bin/
+.DS_Store

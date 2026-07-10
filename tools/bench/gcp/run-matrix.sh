@@ -189,11 +189,15 @@ python3 tools/bench/gcp/aggregate.py "$RESULTS_DIR" > "$RESULTS_DIR/summary.json
 echo "[gcp] rendering dashboard -> $RESULTS_DIR/dashboard.html"
 python3 tools/bench/gcp/render-html.py "$RESULTS_DIR/summary.json" > "$RESULTS_DIR/dashboard.html"
 
+# Refresh the cross-run index so every dashboard is reachable from one page.
+tools/bench/gcp/collect.sh "$(dirname "$RESULTS_DIR")" >/dev/null || true
+
 echo ""
 echo "═══ GCP bench complete ═══"
 echo "  results:  $RESULTS_DIR"
 echo "  summary:  $RESULTS_DIR/summary.json"
 echo "  dashboard: $RESULTS_DIR/dashboard.html"
+echo "  index:    $(dirname "$RESULTS_DIR")/gcp-index.html"
 
 # Clear the trap's VM deletion now that we're done; tailnet cleanup still runs.
 ACTIVE_SRV=""

@@ -47,7 +47,7 @@ pub(crate) const MAP_LIFETIME_SECS: u32 = 7200;
 pub(crate) const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// How long we trust a recently-probed service before re-probing.
-pub(crate) const TRUST_DURATION: std::time::Duration = std::time::Duration::from_secs(600);
+pub(crate) const TRUST_DURATION: std::time::Duration = std::time::Duration::from_mins(10);
 
 /// A port-mapping error that means no NAT mapping is available (gateway not
 /// found, all services disabled, etc.).

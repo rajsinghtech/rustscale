@@ -89,6 +89,11 @@ cp /opt/rust/cargo/bin/rustup /usr/local/bin/rustup
 chmod 755 /usr/local/bin/cargo /usr/local/bin/rustc /usr/local/bin/rustup
 # World-writable build dir for the non-root SSH user (gcloud ssh runs as GCP account user).
 mkdir -p /opt/rustscale && chmod 777 /opt/rustscale
+# The non-root SSH user runs `cargo build`, which writes the registry cache
+# under CARGO_HOME. rustup installed it as root, so make the whole tree
+# group/other-writable or cargo fails with "Permission denied" creating
+# /opt/rust/cargo/registry/cache.
+chmod -R 777 /opt/rust
 curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/jammy.noarmor.gpg \
   | tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
 curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/jammy.tailscale-keyring.list \

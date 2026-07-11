@@ -42,7 +42,8 @@ cleanup_leftover() {
         lt=$(curl -fsS -X POST "$API/api/v2/oauth/token" \
           -d client_id="$l_cid" -d client_secret="$l_csec" 2>/dev/null | jq -r .access_token 2>/dev/null || echo "")
         if [[ -n "$lt" && "$lt" != "null" ]]; then
-          curl -sS -o /dev/null -X DELETE \
+          curl -sS --retry 3 --retry-delay 3 \
+            -o /dev/null -X DELETE \
             "$API/api/v2/tailnet/$l_dns" -H "Authorization: Bearer $lt" >&2 2>/dev/null || true
           echo "leftover cleanup done" >&2
         fi
@@ -58,7 +59,8 @@ cleanup_leftover
 # ---------------------------------------------------------------------------
 NAME="rustscale-e2e-$(date +%s)"
 echo "creating ephemeral tailnet: $NAME" >&2
-CREATED=$(curl -fsS -X POST "$API/api/v2/organizations/-/tailnets" \
+CREATED=$(curl -fsS --retry 5 --retry-delay 5 --retry-all-errors \
+  -X POST "$API/api/v2/organizations/-/tailnets" \
   -H "Authorization: Bearer $TS_ORG_TOKEN" -H 'Content-Type: application/json' \
   -d "{\"displayName\":\"$NAME\"}")
 
@@ -94,7 +96,8 @@ cleanup() {
     -d client_id="$CHILD_CID_VAR" -d client_secret="$CHILD_CSEC_VAR" 2>/dev/null \
     | jq -r .access_token 2>/dev/null || echo "")
   if [[ -n "$T" && "$T" != "null" ]]; then
-    curl -sS -o /dev/null -w 'delete HTTP %{http_code}\n' -X DELETE \
+    curl -sS --retry 3 --retry-delay 3 \
+      -o /dev/null -w 'delete HTTP %{http_code}\n' -X DELETE \
       "$API/api/v2/tailnet/$DNS_VAR" -H "Authorization: Bearer $T" >&2 || true
   else
     echo "WARN: could not mint child token for cleanup" >&2
@@ -107,12 +110,14 @@ CHILD_TOKEN=$(child_token)
 
 # API-only tailnets require tagged auth keys ("tailnet-owned auth key must have
 # tags set"), and the tag must exist in the policy file first.
-curl -fsS -X POST "$API/api/v2/tailnet/$DNS/acl" \
+curl -fsS --retry 3 --retry-delay 3 --retry-all-errors \
+  -X POST "$API/api/v2/tailnet/$DNS/acl" \
   -H "Authorization: Bearer $CHILD_TOKEN" -H 'Content-Type: application/json' \
   -d '{"tagOwners":{"tag:e2e":[]},"acls":[{"action":"accept","src":["*"],"dst":["*:*"]}]}' >/dev/null
 
 # Reusable ephemeral preauthorized key for nodes under test.
-AUTHKEY=$(curl -fsS -X POST "$API/api/v2/tailnet/$DNS/keys" \
+AUTHKEY=$(curl -fsS --retry 3 --retry-delay 3 --retry-all-errors \
+  -X POST "$API/api/v2/tailnet/$DNS/keys" \
   -H "Authorization: Bearer $CHILD_TOKEN" -H 'Content-Type: application/json' \
   -d '{"capabilities":{"devices":{"create":{"reusable":true,"ephemeral":true,"preauthorized":true,"tags":["tag:e2e"]}}},"expirySeconds":3600}' \
   | jq -r .key)

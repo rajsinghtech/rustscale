@@ -45,7 +45,8 @@ _bench_cleanup_leftover() {
           -d client_id="$l_cid" -d client_secret="$l_csec" 2>/dev/null \
           | jq -r .access_token 2>/dev/null || echo "")
         if [[ -n "$lt" && "$lt" != "null" ]]; then
-          curl -sS -o /dev/null -X DELETE \
+          curl -sS --retry 3 --retry-delay 3 \
+            -o /dev/null -X DELETE \
             "$BENCH_API/api/v2/tailnet/$l_dns" -H "Authorization: Bearer $lt" \
             >&2 2>/dev/null || true
         fi
@@ -73,7 +74,8 @@ bench_provision_tailnet() {
   local name="rustscale-bench-$(date +%s)"
   echo "[bench] creating ephemeral tailnet: $name" >&2
   local created
-  created=$(curl -fsS -X POST "$BENCH_API/api/v2/organizations/-/tailnets" \
+  created=$(curl -fsS --retry 5 --retry-delay 5 --retry-all-errors \
+    -X POST "$BENCH_API/api/v2/organizations/-/tailnets" \
     -H "Authorization: Bearer $TS_ORG_TOKEN" -H 'Content-Type: application/json' \
     -d "{\"displayName\":\"$name\"}")
 
@@ -96,7 +98,8 @@ bench_provision_tailnet() {
     | jq -r .access_token)
 
   # Set ACLs (tag:e2e + accept all) and trap cleanup.
-  curl -fsS -X POST "$BENCH_API/api/v2/tailnet/$BENCH_DNS/acl" \
+  curl -fsS --retry 3 --retry-delay 3 --retry-all-errors \
+    -X POST "$BENCH_API/api/v2/tailnet/$BENCH_DNS/acl" \
     -H "Authorization: Bearer $BENCH_CHILD_TOKEN" -H 'Content-Type: application/json' \
     -d '{"tagOwners":{"tag:e2e":[]},"acls":[{"action":"accept","src":["*"],"dst":["*:*"]}]}' >/dev/null
 
@@ -108,7 +111,8 @@ bench_provision_tailnet() {
 # ---------------------------------------------------------------------------
 bench_mint_authkey() {
   local key
-  key=$(curl -fsS -X POST "$BENCH_API/api/v2/tailnet/$BENCH_DNS/keys" \
+  key=$(curl -fsS --retry 3 --retry-delay 3 --retry-all-errors \
+    -X POST "$BENCH_API/api/v2/tailnet/$BENCH_DNS/keys" \
     -H "Authorization: Bearer $BENCH_CHILD_TOKEN" -H 'Content-Type: application/json' \
     -d '{"capabilities":{"devices":{"create":{"reusable":true,"ephemeral":true,"preauthorized":true,"tags":["tag:e2e"]}}},"expirySeconds":900}' \
     | jq -r .key)
@@ -127,7 +131,8 @@ bench_cleanup_tailnet() {
       -d client_id="$BENCH_CHILD_CID" -d client_secret="$BENCH_CHILD_CSEC" 2>/dev/null \
       | jq -r .access_token 2>/dev/null || echo "")
     if [[ -n "$t" && "$t" != "null" ]]; then
-      curl -sS -o /dev/null -X DELETE \
+      curl -sS --retry 3 --retry-delay 3 \
+        -o /dev/null -X DELETE \
         "$BENCH_API/api/v2/tailnet/$BENCH_DNS" -H "Authorization: Bearer $t" >&2 || true
     fi
     rm -f "$BENCH_LAST_FILE"

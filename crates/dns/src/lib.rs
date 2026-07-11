@@ -306,7 +306,7 @@ impl DnsResponder {
                     }
                     break std::sync::Arc::new(s);
                 }
-                Err(e) if bind_idx + 1 < addrs.len() => {
+                Err(_e) if bind_idx + 1 < addrs.len() => {
                     bind_idx += 1;
                     continue;
                 }

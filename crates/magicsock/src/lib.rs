@@ -1134,12 +1134,9 @@ fn random_tx_id() -> [u8; 12] {
 
 /// Gather local interface endpoints for the MapRequest `Endpoints` field
 /// and CallMeMaybe. Pairs `udp_port` with each up, non-link-local IPv4
-/// address on the host. Mirrors Go magicsock's `determineEndpoints` local
+/// address on the host (plus loopback) so peers on the same LAN/host can
+/// reach us directly. Mirrors Go magicsock's `determineEndpoints` local
 /// interface enumeration (`netmon.LocalAddresses` + bound port).
-///
-/// Loopback (127.0.0.1, ::1) and link-local (169.254.x.x) addresses are
-/// filtered out — they are useless for remote peers and waste space in the
-/// endpoint list.
 pub fn gather_local_endpoints(udp_port: u16) -> Vec<String> {
     use std::collections::HashSet;
     use std::net::IpAddr;
@@ -1151,6 +1148,7 @@ pub fn gather_local_endpoints(udp_port: u16) -> Vec<String> {
 
     let mut eps: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
+    let mut loopback_eps: Vec<String> = Vec::new();
 
     for iface in &ifaces {
         if !iface.is_oper_up() {
@@ -1160,16 +1158,24 @@ pub fn gather_local_endpoints(udp_port: u16) -> Vec<String> {
             IpAddr::V4(v4) => v4,
             IpAddr::V6(_) => continue, // UDP socket is v4; netstack is v4-only.
         };
-        // Skip unspecified (0.0.0.0), loopback (127.0.0.1), and link-local (169.254/16).
-        if v4.is_unspecified() || v4.is_loopback() || is_link_local_v4(v4) {
+        // Skip unspecified (0.0.0.0) and link-local (169.254/16).
+        if v4.is_unspecified() || is_link_local_v4(v4) {
             continue;
         }
         let s = format!("{v4}:{udp_port}");
-        if seen.insert(s.clone()) {
+        if v4.is_loopback() {
+            if seen.insert(s.clone()) {
+                loopback_eps.push(s);
+            }
+        } else if seen.insert(s.clone()) {
             eps.push(s);
         }
     }
 
+    // Non-loopback (LAN/public) first, then loopback as a fallback so
+    // same-machine direct paths work even offline. This matches Go's
+    // intent (loopback only when needed) while keeping it simple.
+    eps.append(&mut loopback_eps);
     eps
 }
 

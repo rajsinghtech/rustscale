@@ -949,7 +949,7 @@ async fn e2e_register_only() {
         .build()
         .expect("build");
 
-    server.up().await.expect("up");
+    Box::pin(server.up()).await.expect("up");
 
     let status = server.status();
     assert!(status.up, "server should be up");
@@ -1008,7 +1008,7 @@ async fn e2e_two_nodes() {
         .ephemeral(true)
         .build()
         .expect("build A");
-    server_a.up().await.expect("up A");
+    Box::pin(server_a.up()).await.expect("up A");
     let status_a = server_a.status();
     let ip_a = status_a
         .tailscale_ips
@@ -1026,7 +1026,7 @@ async fn e2e_two_nodes() {
         .ephemeral(true)
         .build()
         .expect("build B");
-    server_b.up().await.expect("up B");
+    Box::pin(server_b.up()).await.expect("up B");
     let status_b = server_b.status();
     let ip_b = status_b
         .tailscale_ips
@@ -1241,7 +1241,7 @@ async fn e2e_subnet_routes() {
         .advertise_routes(vec![subnet.into()])
         .build()
         .expect("build A");
-    server_a.up().await.expect("up A");
+    Box::pin(server_a.up()).await.expect("up A");
     let status_a = server_a.status();
     assert!(!status_a.tailscale_ips.is_empty(), "A should have IPs");
     let ip_a = status_a.tailscale_ips[0];
@@ -1276,7 +1276,7 @@ async fn e2e_subnet_routes() {
         .accept_routes(true)
         .build()
         .expect("build B");
-    server_b.up().await.expect("up B");
+    Box::pin(server_b.up()).await.expect("up B");
 
     // Wait for A to appear in B's netmap, then check B's route table for the
     // subnet route. The route may take a few map updates to propagate after
@@ -1378,7 +1378,7 @@ async fn e2e_whois_and_magicdns_dial() {
         .ephemeral(true)
         .build()
         .expect("build A");
-    server_a.up().await.expect("up A");
+    Box::pin(server_a.up()).await.expect("up A");
 
     let mut server_b = Server::builder()
         .hostname(format!("rustscale-e2e-whois-b-{uid}"))
@@ -1386,7 +1386,7 @@ async fn e2e_whois_and_magicdns_dial() {
         .ephemeral(true)
         .build()
         .expect("build B");
-    server_b.up().await.expect("up B");
+    Box::pin(server_b.up()).await.expect("up B");
     let status_b = server_b.status();
     let ip_b = status_b
         .tailscale_ips
@@ -1495,7 +1495,7 @@ async fn e2e_control_cert_not_enabled() {
         .state_dir(state_dir.clone())
         .build()
         .expect("build");
-    server.up().await.expect("up");
+    Box::pin(server.up()).await.expect("up");
 
     // Give control a moment to deliver DNSConfig.
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -1562,7 +1562,7 @@ async fn e2e_acme_cert_issuance() {
         .state_dir(state_dir.clone())
         .build()
         .expect("build");
-    server.up().await.expect("up");
+    Box::pin(server.up()).await.expect("up");
 
     // Give control time to deliver DNSConfig with CertDomains.
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
@@ -1652,7 +1652,7 @@ async fn e2e_exit_node() {
         .advertise_exit_node(true)
         .build()
         .expect("build B");
-    server_b.up().await.expect("up B");
+    Box::pin(server_b.up()).await.expect("up B");
     let status_b = server_b.status();
     assert!(!status_b.tailscale_ips.is_empty(), "B should have IPs");
     let ip_b = status_b.tailscale_ips[0];
@@ -1685,7 +1685,7 @@ async fn e2e_exit_node() {
         .ephemeral(true)
         .build()
         .expect("build A");
-    server_a.up().await.expect("up A");
+    Box::pin(server_a.up()).await.expect("up A");
 
     // Wait for B to appear in A's netmap AND for B's AllowedIPs to contain
     // 0.0.0.0/0 (after approval, control pushes the updated AllowedIPs).
@@ -1812,7 +1812,7 @@ async fn e2e_serve_tcp_forward() {
         .ephemeral(true)
         .build()
         .expect("build B");
-    server_b.up().await.expect("up B");
+    Box::pin(server_b.up()).await.expect("up B");
     let status_b = server_b.status();
     let ip_b = status_b
         .tailscale_ips
@@ -1847,7 +1847,7 @@ async fn e2e_serve_tcp_forward() {
         .ephemeral(true)
         .build()
         .expect("build A");
-    server_a.up().await.expect("up A");
+    Box::pin(server_a.up()).await.expect("up A");
 
     // Wait for B to appear in A's netmap.
     wait_for_peer(&server_a, ip_b.into(), "e2e_serve_tcp_forward").await;
@@ -1906,7 +1906,7 @@ async fn e2e_funnel_not_enabled() {
         .ephemeral(true)
         .build()
         .expect("build");
-    server.up().await.expect("up");
+    Box::pin(server.up()).await.expect("up");
 
     // Give control a moment to deliver capabilities.
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
@@ -1956,7 +1956,7 @@ async fn e2e_socks5_proxy() {
         .ephemeral(true)
         .build()
         .expect("build A");
-    server_a.up().await.expect("up A");
+    Box::pin(server_a.up()).await.expect("up A");
 
     // Node B — runs the echo backend on its tailnet IP.
     let mut server_b = Server::builder()
@@ -1965,7 +1965,7 @@ async fn e2e_socks5_proxy() {
         .ephemeral(true)
         .build()
         .expect("build B");
-    server_b.up().await.expect("up B");
+    Box::pin(server_b.up()).await.expect("up B");
     let status_b = server_b.status();
     let ip_b = status_b
         .tailscale_ips
@@ -2236,7 +2236,7 @@ async fn interop_rust_dials_go() {
     };
 
     let mut server = interop_server(&ienv.authkey, "dialgo");
-    server.up().await.expect("up");
+    Box::pin(server.up()).await.expect("up");
 
     let go_ip = ienv.go_ip;
     wait_for_peer(&server, IpAddr::V4(go_ip), "interop_rust_dials_go").await;
@@ -2282,7 +2282,7 @@ async fn interop_go_dials_rust() {
     };
 
     let mut server = interop_server(&ienv.authkey, "godials");
-    server.up().await.expect("up");
+    Box::pin(server.up()).await.expect("up");
     let status = server.status();
     let rust_ip = status
         .tailscale_ips
@@ -2417,7 +2417,7 @@ async fn interop_magicdns_name() {
     };
 
     let mut server = interop_server(&ienv.authkey, "dns");
-    server.up().await.expect("up");
+    Box::pin(server.up()).await.expect("up");
 
     wait_for_peer(&server, IpAddr::V4(ienv.go_ip), "interop_magicdns_name").await;
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -2459,7 +2459,7 @@ async fn interop_whois_go_peer() {
     };
 
     let mut server = interop_server(&ienv.authkey, "whois");
-    server.up().await.expect("up");
+    Box::pin(server.up()).await.expect("up");
 
     wait_for_peer(&server, IpAddr::V4(ienv.go_ip), "interop_whois_go_peer").await;
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -2507,7 +2507,7 @@ async fn interop_direct_path() {
     };
 
     let mut server = interop_server(&ienv.authkey, "direct");
-    server.up().await.expect("up");
+    Box::pin(server.up()).await.expect("up");
 
     wait_for_peer(&server, IpAddr::V4(ienv.go_ip), "interop_direct_path").await;
 
@@ -2578,7 +2578,7 @@ async fn interop_derp_path() {
     };
 
     let mut server = interop_server_derp_only(&ienv.authkey, "derp");
-    server.up().await.expect("up");
+    Box::pin(server.up()).await.expect("up");
 
     wait_for_peer(&server, IpAddr::V4(ienv.go_ip), "interop_derp_path").await;
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -2623,7 +2623,7 @@ async fn interop_direct_after_derp() {
     };
 
     let mut server = interop_server(&ienv.authkey, "upgrade");
-    server.up().await.expect("up");
+    Box::pin(server.up()).await.expect("up");
 
     wait_for_peer(&server, IpAddr::V4(ienv.go_ip), "interop_direct_after_derp").await;
 
@@ -2753,7 +2753,7 @@ async fn interop_subnet_routes() {
         .accept_routes(true)
         .build()
         .expect("build");
-    server.up().await.expect("up");
+    Box::pin(server.up()).await.expect("up");
 
     // Wait for the Go peer to appear.
     wait_for_peer(&server, IpAddr::V4(ienv.go_ip), "interop_subnet_routes").await;
@@ -3247,12 +3247,11 @@ fn require_tun_interop(test_name: &str) -> Option<InteropEnv> {
 /// (permission denied, platform not supported, etc.). Returns the server
 /// on success; returns None and logs a skip message on failure.
 async fn up_tun_or_skip(server: &mut Server, test_name: &str) -> Option<()> {
-    match server
-        .up_tun(TunModeConfig {
+    match Box::pin(server.up_tun(TunModeConfig {
             tun: rustscale_tun::TunConfig::default(),
             apply_routes: true,
             exit_node: None,
-        })
+        }))
         .await
     {
         Ok(()) => Some(()),
@@ -3283,7 +3282,7 @@ async fn interop_tun_rust_dials_go() {
         .build()
         .expect("build");
 
-    if up_tun_or_skip(&mut server, "interop_tun_rust_dials_go")
+    if Box::pin(up_tun_or_skip(&mut server, "interop_tun_rust_dials_go"))
         .await
         .is_none()
     {
@@ -3362,7 +3361,7 @@ async fn interop_tun_go_dials_rust() {
         .build()
         .expect("build");
 
-    if up_tun_or_skip(&mut server, "interop_tun_go_dials_rust")
+    if Box::pin(up_tun_or_skip(&mut server, "interop_tun_go_dials_rust"))
         .await
         .is_none()
     {
@@ -3474,7 +3473,7 @@ async fn interop_tun_os_routes() {
         .build()
         .expect("build");
 
-    if up_tun_or_skip(&mut server, "interop_tun_os_routes")
+    if Box::pin(up_tun_or_skip(&mut server, "interop_tun_os_routes"))
         .await
         .is_none()
     {
@@ -3535,7 +3534,7 @@ async fn interop_tun_subnet_forward() {
         .build()
         .expect("build");
 
-    if up_tun_or_skip(&mut server, "interop_tun_subnet_forward")
+    if Box::pin(up_tun_or_skip(&mut server, "interop_tun_subnet_forward"))
         .await
         .is_none()
     {

@@ -129,7 +129,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     eprintln!("this requires root for utun creation");
 
-    server.up_tun(tun_config).await?;
+    Box::pin(server.up_tun(tun_config)).await?;
 
     // Readiness loop: wait until we have a tailnet IP AND at least one peer.
     // up_tun() returns as soon as the TUN device is created and the control

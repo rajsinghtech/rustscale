@@ -111,7 +111,7 @@ async fn main() {
             hostname,
             control_url,
             state_dir,
-        } => server::run(authkey, port, hostname, control_url, state_dir).await,
+        } => Box::pin(server::run(authkey, port, hostname, control_url, state_dir)).await,
         Command::Client {
             authkey,
             target,
@@ -122,7 +122,7 @@ async fn main() {
             control_url,
             state_dir,
         } => {
-            let res = throughput::run(
+            let res = Box::pin(throughput::run(
                 authkey,
                 target,
                 duration,
@@ -131,7 +131,7 @@ async fn main() {
                 hostname,
                 control_url,
                 state_dir,
-            )
+            ))
             .await;
             match res {
                 Ok(r) => {
@@ -153,7 +153,7 @@ async fn main() {
             control_url,
             state_dir,
         } => {
-            let res = latency::run(authkey, target, count, hostname, control_url, state_dir).await;
+            let res = Box::pin(latency::run(authkey, target, count, hostname, control_url, state_dir)).await;
             match res {
                 Ok(r) => {
                     if json {

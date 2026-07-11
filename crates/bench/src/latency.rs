@@ -37,7 +37,7 @@ pub async fn run(
         builder = builder.state_dir(d);
     }
     let mut server = builder.build()?;
-    server.up().await?;
+    Box::pin(server.up()).await?;
 
     let status = server.status();
     let my_ip = status

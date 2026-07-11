@@ -100,7 +100,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     eprintln!("bringing up tsnet server (hostname={hostname})...");
-    server.up().await?;
+    Box::pin(server.up()).await?;
 
     let status = server.status();
     eprintln!("online: {}", status.up);

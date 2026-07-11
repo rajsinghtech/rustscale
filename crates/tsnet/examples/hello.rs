@@ -33,7 +33,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     println!("Bringing up rustscale node '{hostname}'...");
-    server.up().await?;
+    Box::pin(server.up()).await?;
 
     let status = server.status();
     println!("Node is up!");

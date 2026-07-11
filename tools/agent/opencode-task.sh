@@ -118,9 +118,11 @@ is_busy() {
   curl -s --max-time 5 "$URL/session/status?directory=$DIR" | jq -e --arg s "$SID" 'has($s)' >/dev/null 2>&1 && echo 1 || echo 0
 }
 
-# 3. Watchdog loop. glm-5.2 occasionally emits an empty first turn (reasoning
-#    part only, no text/tool calls) and goes idle ~30s in; when that happens we
-#    re-prompt once with a short "proceed" nudge instead of failing the run.
+# 3. Watchdog loop. glm-5.2 frequently outputs tool calls with no visible text
+#    (text goes in the `reasoning` part only). The old heuristic checked only for
+#    text content and falsely re-prompted working agents. We now check whether
+#    the last assistant message has either text content OR completed tool calls.
+#    Only re-prompt when a message has neither — a true stall.
 NUDGED=0
 START=$(date +%s); LAST=0; IDLE=0
 while :; do
@@ -134,12 +136,21 @@ while :; do
   if [[ "$BUSY" == "0" ]]; then
     IDLE=$((IDLE+1))
     if [[ $IDLE -ge 2 ]]; then
-      # Idle: check whether we actually got assistant text before accepting.
-      FINAL=$(curl -s --max-time 10 "$URL/session/$SID/message?directory=$DIR" | jq -r '
+      # Idle: check last assistant message for text or completed tool calls.
+      LAST_MSG=$(curl -s --max-time 10 "$URL/session/$SID/message?directory=$DIR" | jq -r '
         [.[] | select(.info.role=="assistant")] | last
-        | if . == null then "" else [.parts[]? | select(.type=="text") | .text] | join("\n") end')
-      if [[ -z "$FINAL" && $NUDGED -eq 0 ]]; then
-        echo "[harness] empty first turn — re-prompting once" >&2
+        | if . == null then "empty_session"
+          else
+            ([.parts[]? | select(.type=="text") | .text] | join("") | if length > 0 then "has_text" else "" end)
+            +
+            ([.parts[]? | select(.type=="tool" or .type=="tool_use") | select(.state?.status == "completed")] | if length > 0 then "has_tools" else "" end)
+          end')
+      if [[ "$LAST_MSG" == "empty_session" ]]; then
+        break
+      fi
+      # Re-prompt only when last message has NO text AND NO completed tool calls.
+      if [[ "$LAST_MSG" != *"has_tools"* && "$LAST_MSG" != *"has_text"* && $NUDGED -eq 0 ]]; then
+        echo "[harness] last message has no text and no tool calls — re-prompting once" >&2
         NUDGED=1; IDLE=0
         curl -sfS --max-time 10 -o /dev/null -X POST "$URL/session/$SID/prompt_async?directory=$DIR" \
           -H 'Content-Type: application/json' \
@@ -161,12 +172,20 @@ while :; do
   fi
 done
 
-# 4. Harvest final assistant text.
+# 4. Harvest final assistant output: text if present, tool summary otherwise.
 echo "[harness] done in $(( $(date +%s) - START ))s; session $SID" >&2
 curl -s --max-time 10 "$URL/session/$SID/message?directory=$DIR" | jq -r '
   [.[] | select(.info.role=="assistant")] | last
   | if . == null then "(no assistant message produced — session may have aborted)"
-    else [.parts[]? | select(.type=="text") | .text] | join("\n") end'
+    else
+      ([.parts[]? | select(.type=="text") | .text] | join(""))
+      |
+      if length > 0 then .
+      else
+        ([.parts[]? | select(.type=="tool" or .type=="tool_use") | .state?.input?.filePath // .state?.input?.command // (.name // .tool) ] | join("; "))
+        | if length > 0 then "(no text; tool calls: " + . + ")" else "(no output — session may have aborted)" end
+      end
+    end'
 
 # 5. On success with --worktree, print merge instructions.
 if [[ -n "$WORKTREE" ]]; then

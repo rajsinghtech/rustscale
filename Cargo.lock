@@ -1447,6 +1447,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustscale-testcontrol"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "bytes",
+ "chrono",
+ "h2",
+ "http",
+ "rand 0.8.6",
+ "rustscale-controlclient",
+ "rustscale-key",
+ "rustscale-tailcfg",
+ "rustscale-tsnet",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
 name = "rustscale-tsnet"
 version = "0.1.0"
 dependencies = [

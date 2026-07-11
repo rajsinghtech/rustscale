@@ -1284,10 +1284,13 @@ dependencies = [
 name = "rustscale-dns"
 version = "0.1.0"
 dependencies = [
+ "rustls",
  "rustscale-key",
  "rustscale-tailcfg",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-rustls",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]

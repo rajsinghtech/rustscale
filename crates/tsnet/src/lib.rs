@@ -66,7 +66,9 @@ use rustscale_controlclient::controlhttp;
 use rustscale_controlclient::{extract_knobs_from_map_response, C2nRouter};
 use rustscale_controlknobs::ControlKnobs;
 use rustscale_derp::DerpClient;
-use rustscale_dns::{upstream_nameservers, DnsResponder, MagicDnsResolver, MAGICDNS_VIP};
+use rustscale_dns::{
+    config_from_dns, DnsResponder, Forwarder, MagicDnsResolver, MAGICDNS_VIP,
+};
 use rustscale_filter::Filter;
 use rustscale_health::{
     Severity, Tracker, Watchdog, WARN_CERT_FALLBACK, WARN_CONTROL, WARN_DERP_HOME,
@@ -604,13 +606,17 @@ impl Server {
         // MagicDNS responder: best-effort UDP server at 100.100.100.100:53.
         // Binding to :53 typically requires root and the MagicDNS VIP to be
         // assigned to an interface; failure is non-fatal (dial still resolves
-        // via the shared resolver). The responder serves A/AAAA for peer
-        // hostnames and forwards the rest upstream.
+        // via the shared resolver). The responder serves A/AAAA/PTR for peer
+        // hostnames, handles split-DNS routes, ExtraRecords, .onion NXDOMAIN,
+        // 4via6 synthesis, and forwards the rest upstream (with TCP fallback
+        // and DoH support).
         let mut tasks = vec![b.map_task, pump, map_update, periodic_ep];
-        let responder = DnsResponder::new(
+        let dns_cfg_snapshot = b.dns_config.read().await.clone();
+        let forwarder = Arc::new(Forwarder::from_dns_config(dns_cfg_snapshot.as_ref()));
+        let responder = DnsResponder::with_forwarder(
             b.resolver.clone(),
-            upstream_nameservers(b.dns_config.read().await.as_ref()),
             SocketAddr::new(IpAddr::V4(MAGICDNS_VIP), 53),
+            forwarder,
         );
         match responder.spawn().await {
             Ok(handle) => tasks.push(handle),
@@ -2226,13 +2232,14 @@ fn spawn_map_update_task(
                     // Apply DNSConfig delta (None means unchanged).
                     if let Some(cfg) = &resp.DNSConfig {
                         dns_config.write().await.clone_from(&resp.DNSConfig);
-                        // `Proxied` may have changed; rebuild the resolver's
-                        // proxied flag from the latest config.
+                        // Rebuild the resolver config from the new DNSConfig,
+                        // preserving the current peers and domain. This wires
+                        // split-DNS Routes, ExtraRecords hosts, and local
+                        // domains from the control plane.
                         let mut r = resolver.write().await;
-                        // Rebuild from current peers + domain + new config.
                         let domain = r.domain().to_string();
-                        let cur_peers = peers.clone();
-                        *r = MagicDnsResolver::new(cur_peers, &domain, Some(cfg));
+                        let new_config = config_from_dns(cfg, &domain, &peers);
+                        r.set_config(new_config);
                     }
 
                     // Merge UserProfiles delta (add/update; never removed).

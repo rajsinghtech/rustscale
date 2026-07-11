@@ -48,7 +48,7 @@ pub use socks5::{
     spawn_socks5, BoxedStream, CancelToken as Socks5CancelToken, ServerSocksDialer, Socks5Handle,
     Socks5Server, SocksAddr, SocksDialer, SocksStream,
 };
-pub use state::{PersistedState, StateError};
+pub use state::{NetMapCache, PersistedState, StateError};
 pub use status::{PeerInfo, ServerStatus, WhoIsInfo};
 pub use tls::{
     AcmeCertFetcher, CertError, CertFetcher, CertMaterial, CertProvider, ControlCertProvider,
@@ -1021,7 +1021,42 @@ impl Server {
             ..Default::default()
         };
 
-        let reg_resp = cc.register(&reg_req).await?;
+        let reg_resp = cc.register(&reg_req).await.map_err(|e| {
+            // Auth/network failure: the cached netmap may be stale or the
+            // node key may have been revoked. Clear it so a restart doesn't
+            // boot from a stale cache. Mirrors Go's discardDiskCacheLocked
+            // call on register failures (ipn/ipnlocal/local.go:7415).
+            if let Some(ref dir) = self.config.state_dir {
+                PersistedState::clear_netmap(dir);
+                eprintln!("tsnet: cleared netmap cache after register error: {e}");
+            }
+            TsnetError::Register(e)
+        })?;
+
+        // Server-side error string (e.g. "invalid auth key", "node key revoked").
+        if !reg_resp.Error.is_empty() {
+            if let Some(ref dir) = self.config.state_dir {
+                PersistedState::clear_netmap(dir);
+                eprintln!(
+                    "tsnet: cleared netmap cache after register error: {}",
+                    reg_resp.Error
+                );
+            }
+            return Err(TsnetError::Builder(format!(
+                "control register rejected: {}",
+                reg_resp.Error
+            )));
+        }
+
+        // Node key expired — the server says our key is no longer valid.
+        // Clear the cache so we don't reuse a netmap bound to the old key.
+        if reg_resp.NodeKeyExpired {
+            if let Some(ref dir) = self.config.state_dir {
+                PersistedState::clear_netmap(dir);
+                eprintln!("tsnet: cleared netmap cache: node key expired");
+            }
+        }
+
         if !reg_resp.AuthURL.is_empty() {
             return Err(TsnetError::AuthRequired(reg_resp.AuthURL));
         }
@@ -2195,6 +2230,9 @@ fn spawn_map_update_task(
     control_knobs: Arc<ControlKnobs>,
 ) -> JoinHandle<()> {
     let mut named_filters: BTreeMap<String, Vec<FilterRule>> = BTreeMap::new();
+    // Create the netmap cache helper once so that save_if_changed can
+    // dedup identical writes via the in-memory SHA-256 hash.
+    let netmap_cache = state_dir.as_ref().map(|dir| NetMapCache::new(dir));
     tokio::spawn(async move {
         loop {
             if cancel.is_cancelled() {
@@ -2301,9 +2339,11 @@ fn spawn_map_update_task(
                     }
 
                     // Save the updated netmap to disk (best-effort) so a
-                    // restart can skip the blocking first fetch.
-                    if let Some(ref dir) = state_dir {
-                        if let Err(e) = PersistedState::save_netmap(dir, &node_pub, &resp) {
+                    // restart can skip the blocking first fetch. Dedup via
+                    // SHA-256 skips the write if the content is unchanged
+                    // since the last successful save.
+                    if let Some(ref cache) = netmap_cache {
+                        if let Err(e) = cache.save_if_changed(&node_pub, &resp) {
                             eprintln!("tsnet: netmap cache save failed (non-fatal): {e}");
                         }
                     }

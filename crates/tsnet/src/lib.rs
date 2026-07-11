@@ -2297,7 +2297,7 @@ fn spawn_periodic_endpoint_updates(
         let node_pub = node_key.public();
         let disco_pub = disco_key.public();
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+            tokio::time::sleep(std::time::Duration::from_mins(5)).await;
             if cancel.is_cancelled() {
                 break;
             }

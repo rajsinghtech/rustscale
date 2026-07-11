@@ -30,6 +30,7 @@
 
 mod acme;
 mod c2n;
+mod peerapi;
 mod routing;
 mod serve;
 mod socks5;
@@ -327,6 +328,8 @@ struct RunningState {
     c2n_addr: Option<SocketAddr>,
     /// Control-plane feature flags extracted from netmap updates.
     control_knobs: Arc<ControlKnobs>,
+    /// PeerAPI listen port (deterministic, from tailscale IPs).
+    peerapi_port: Option<u16>,
 }
 
 /// Which data plane is wired up: userspace netstack (tsnet listen/dial) or a
@@ -488,6 +491,23 @@ impl Server {
         self.inner.as_ref().and_then(|i| i.c2n_addr)
     }
 
+    /// The PeerAPI listen port, if the server is up. The PeerAPI listens on
+    /// a deterministic port derived from the node's primary Tailscale IP
+    /// (matching Go's `peerapi.go` port selection). The full address is
+    /// `http://<tailscale_ip>:<port>/`.
+    pub fn peerapi_port(&self) -> Option<u16> {
+        self.inner.as_ref().and_then(|i| i.peerapi_port)
+    }
+
+    /// The PeerAPI listen address (first tailscale IP + port), if the server
+    /// is up. Returns `None` if the PeerAPI listener failed to start.
+    pub fn peerapi_addr(&self) -> Option<SocketAddr> {
+        let inner = self.inner.as_ref()?;
+        let port = inner.peerapi_port?;
+        let ip = inner.tailscale_ips.first()?;
+        Some(SocketAddr::new(*ip, port))
+    }
+
     /// The shared control-knobs store, if the server is up. Downstream
     /// consumers can query feature flags pushed by the control plane via
     /// [`ControlKnobs::get_bool`] / [`ControlKnobs::get_float`] /
@@ -612,6 +632,61 @@ impl Server {
                 .await;
         tasks.push(c2n_task);
 
+        // PeerAPI server (netstack mode): listens on a deterministic port on
+        // the node's tailnet IP, serving DoH DNS + debug endpoints to peers.
+        let offering_exit_node = self.config.advertise_exit_node;
+        let (peerapi_task, peerapi_port) = peerapi::spawn_peerapi_netstack(
+            netstack.clone(),
+            b.peers.clone(),
+            b.user_profiles.clone(),
+            b.resolver.clone(),
+            b.dns_config.clone(),
+            b.tailscale_ips.clone(),
+            offering_exit_node,
+        )
+        .await;
+        tasks.push(peerapi_task);
+
+        // Advertise peerapi4/peerapi6 services to the control plane so peers
+        // can discover our PeerAPI port.
+        if let Some(port) = peerapi_port {
+            let has_v6 = b.tailscale_ips.iter().any(|ip| matches!(ip, IpAddr::V6(_)));
+            let services =
+                peerapi::peerapi_services(Some(port), if has_v6 { Some(port) } else { None });
+            if !services.is_empty() {
+                let cc_ep = ControlClient::new(
+                    &b.control_url,
+                    b.machine_key.clone(),
+                    b.server_pub_key.clone(),
+                    PROTOCOL_VERSION,
+                );
+                let node_pub = b.node_key.public();
+                let disco_pub = b.disco_key.public();
+                let svc_req = MapRequest {
+                    Version: CAPABILITY_VERSION,
+                    KeepAlive: false,
+                    NodeKey: node_pub,
+                    DiscoKey: disco_pub,
+                    Stream: false,
+                    OmitPeers: true,
+                    Hostinfo: Some(Hostinfo {
+                        OS: std::env::consts::OS.to_string(),
+                        Hostname: b.hostname.clone(),
+                        RoutableIPs: b.advertise_routes.clone(),
+                        Services: services,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+                match cc_ep.send_map_request(&svc_req).await {
+                    Ok(()) => eprintln!("tsnet: peerapi services advertised (port {port})"),
+                    Err(e) => {
+                        eprintln!("tsnet: peerapi service advertisement failed (non-fatal): {e}");
+                    }
+                }
+            }
+        }
+
         self.inner = Some(RunningState {
             tailscale_ips: b.tailscale_ips,
             magicsock: b.magicsock,
@@ -635,6 +710,7 @@ impl Server {
             c2n_router: b.c2n_router,
             c2n_addr: Some(c2n_addr),
             control_knobs: b.control_knobs,
+            peerapi_port,
         });
         Ok(())
     }
@@ -767,6 +843,58 @@ impl Server {
             c2n::spawn_c2n_server(b.peers.clone(), b.user_profiles.clone(), "rustscale".into())
                 .await;
 
+        // PeerAPI server (TUN mode): binds TCP listeners on the node's
+        // tailnet IPs (v4 + v6) on the deterministic port.
+        let offering_exit_node = self.config.advertise_exit_node;
+        let (peerapi_task, peerapi_port) = peerapi::spawn_peerapi_tun(
+            b.peers.clone(),
+            b.user_profiles.clone(),
+            b.resolver.clone(),
+            b.dns_config.clone(),
+            b.tailscale_ips.clone(),
+            offering_exit_node,
+        )
+        .await;
+
+        // Advertise peerapi4/peerapi6 services to the control plane.
+        if let Some(port) = peerapi_port {
+            let has_v6 = b.tailscale_ips.iter().any(|ip| matches!(ip, IpAddr::V6(_)));
+            let services =
+                peerapi::peerapi_services(Some(port), if has_v6 { Some(port) } else { None });
+            if !services.is_empty() {
+                let cc_ep = ControlClient::new(
+                    &b.control_url,
+                    b.machine_key.clone(),
+                    b.server_pub_key.clone(),
+                    PROTOCOL_VERSION,
+                );
+                let node_pub = b.node_key.public();
+                let disco_pub = b.disco_key.public();
+                let svc_req = MapRequest {
+                    Version: CAPABILITY_VERSION,
+                    KeepAlive: false,
+                    NodeKey: node_pub,
+                    DiscoKey: disco_pub,
+                    Stream: false,
+                    OmitPeers: true,
+                    Hostinfo: Some(Hostinfo {
+                        OS: std::env::consts::OS.to_string(),
+                        Hostname: b.hostname.clone(),
+                        RoutableIPs: b.advertise_routes.clone(),
+                        Services: services,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+                match cc_ep.send_map_request(&svc_req).await {
+                    Ok(()) => eprintln!("tsnet: peerapi services advertised (port {port})"),
+                    Err(e) => {
+                        eprintln!("tsnet: peerapi service advertisement failed (non-fatal): {e}");
+                    }
+                }
+            }
+        }
+
         self.inner = Some(RunningState {
             tailscale_ips: b.tailscale_ips,
             magicsock: b.magicsock,
@@ -774,7 +902,14 @@ impl Server {
             peers: b.peers,
             route_table: b.route_table,
             cancel: b.cancel,
-            tasks: Mutex::new(vec![b.map_task, pump, map_update, periodic_ep, c2n_task]),
+            tasks: Mutex::new(vec![
+                b.map_task,
+                pump,
+                map_update,
+                periodic_ep,
+                c2n_task,
+                peerapi_task,
+            ]),
             packet_drops: b.packet_drops,
             resolver: b.resolver,
             our_fqdn: b.our_fqdn,
@@ -790,6 +925,7 @@ impl Server {
             c2n_router: b.c2n_router,
             c2n_addr: Some(c2n_addr),
             control_knobs: b.control_knobs,
+            peerapi_port,
         });
         Ok(())
     }
@@ -835,9 +971,11 @@ impl Server {
         // with an existing state dir, this lets us skip the blocking first
         // MapResponse fetch (2-5s) and use the cached peers immediately —
         // the streaming long-poll delivers fresh updates in the background.
-        let cached_netmap = self.config.state_dir.as_ref().and_then(|dir| {
-            PersistedState::load_netmap(dir, &node_pub)
-        });
+        let cached_netmap = self
+            .config
+            .state_dir
+            .as_ref()
+            .and_then(|dir| PersistedState::load_netmap(dir, &node_pub));
 
         // 2. Fetch the server's Noise public key (GET /key?v=<version>).
         let server_pub_key =
@@ -2138,7 +2276,6 @@ fn spawn_map_update_task(
                             eprintln!("tsnet: netmap cache save failed (non-fatal): {e}");
                         }
                     }
-
                 }
                 Some(Err(e)) => {
                     health.set_unhealthy(WARN_CONTROL, format!("control connection lost: {e}"));

@@ -1421,6 +1421,7 @@ dependencies = [
  "async-trait",
  "base64",
  "chrono",
+ "crc32fast",
  "p256",
  "rand_core",
  "rcgen",

@@ -313,9 +313,8 @@ async fn dispatch<W: AsyncWrite + Unpin>(
         return Ok(());
     }
 
-    let is_known = KNOWN_PATHS.contains(&path)
-        || path == "/logtail/flush"
-        || path == "/logtail/logs";
+    let is_known =
+        KNOWN_PATHS.contains(&path) || path == "/logtail/flush" || path == "/logtail/logs";
 
     match (method, path) {
         ("GET", "/debug/goroutines") => stub_501(conn, path).await,
@@ -343,10 +342,7 @@ async fn dispatch<W: AsyncWrite + Unpin>(
     }
 }
 
-async fn stub_501<W: AsyncWrite + Unpin>(
-    conn: &mut W,
-    path: &str,
-) -> Result<(), std::io::Error> {
+async fn stub_501<W: AsyncWrite + Unpin>(conn: &mut W, path: &str) -> Result<(), std::io::Error> {
     let body = serde_json::json!({"error": "not implemented", "path": path});
     write_json_response(conn, 501, "Not Implemented", &body).await
 }
@@ -412,8 +408,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_request_with_body() {
-        let raw =
-            b"POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhello";
+        let raw = b"POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhello";
         let mut cursor = std::io::Cursor::new(raw);
         let req = read_request(&mut cursor).await.unwrap();
         assert_eq!(req.method, "POST");
@@ -421,10 +416,7 @@ mod tests {
         assert_eq!(req.body, b"hello");
     }
 
-    async fn send_request(
-        addr: SocketAddr,
-        raw: &[u8],
-    ) -> String {
+    async fn send_request(addr: SocketAddr, raw: &[u8]) -> String {
         let mut stream = TcpStream::connect(addr).await.unwrap();
         stream.write_all(raw).await.unwrap();
         stream.flush().await.unwrap();

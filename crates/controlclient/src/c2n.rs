@@ -65,7 +65,8 @@ impl C2nRouter {
 
     pub fn register(&mut self, pattern: &str, handler: Arc<dyn C2nHandler>) {
         if let Some((method, path)) = pattern.split_once(' ') {
-            self.exact.insert((method.to_string(), path.to_string()), handler);
+            self.exact
+                .insert((method.to_string(), path.to_string()), handler);
         } else {
             self.fallback.insert(pattern.to_string(), handler);
         }

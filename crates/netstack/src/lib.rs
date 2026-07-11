@@ -123,17 +123,32 @@ pub struct NetstackStream {
     remote_closed: bool,
     /// Wakes the poll loop on app read/write so it can process immediately.
     notify: Arc<Notify>,
+    /// Remote peer address (populated on accept/dial; None if unavailable).
+    remote_addr: Option<SocketAddr>,
 }
 
 impl NetstackStream {
-    fn new(rx: mpsc::Receiver<Vec<u8>>, tx: mpsc::Sender<Vec<u8>>, notify: Arc<Notify>) -> Self {
+    fn new(
+        rx: mpsc::Receiver<Vec<u8>>,
+        tx: mpsc::Sender<Vec<u8>>,
+        notify: Arc<Notify>,
+        remote_addr: Option<SocketAddr>,
+    ) -> Self {
         Self {
             rx,
             tx,
             read_buf: Vec::new(),
             remote_closed: false,
             notify,
+            remote_addr,
         }
+    }
+
+    /// The remote peer's socket address, if known. Populated on accept
+    /// (from the smoltcp socket's remote endpoint) and dial (from the
+    /// requested destination). Returns `None` if the address is unavailable.
+    pub fn peer_addr(&self) -> Option<SocketAddr> {
+        self.remote_addr
     }
 }
 
@@ -355,6 +370,7 @@ struct ListenerEntry {
 /// A pending dial awaiting connection establishment.
 struct PendingDial {
     reply: oneshot::Sender<Result<NetstackStream, NetstackError>>,
+    remote: SocketAddr,
 }
 
 /// Create a smoltcp TCP socket with Vec-backed buffers.
@@ -389,10 +405,13 @@ fn to_smoltcp_v4(addr: Ipv4Addr) -> IpAddress {
 
 /// Create the channel pair + stream for a new connection.
 /// Returns (stream, ConnState).
-fn make_stream_and_conn(notify: Arc<Notify>) -> (NetstackStream, ConnState) {
+fn make_stream_and_conn(
+    notify: Arc<Notify>,
+    remote_addr: Option<SocketAddr>,
+) -> (NetstackStream, ConnState) {
     let (app_tx, stream_rx) = mpsc::channel(64);
     let (stream_tx, app_rx) = mpsc::channel(64);
-    let stream = NetstackStream::new(stream_rx, stream_tx, notify);
+    let stream = NetstackStream::new(stream_rx, stream_tx, notify, remote_addr);
     let conn = ConnState {
         app_tx,
         app_rx,
@@ -504,9 +523,20 @@ async fn poll_loop(
                     }
 
                     // Move the accepted socket into the connection map.
+                    let remote_addr =
+                        sockets
+                            .get::<tcp::Socket>(lh)
+                            .remote_endpoint()
+                            .and_then(|ep| match ep.addr {
+                                IpAddress::Ipv4(v4) => {
+                                    Some(SocketAddr::new(IpAddr::V4(v4), ep.port))
+                                }
+                                #[allow(unreachable_patterns)]
+                                _ => None,
+                            });
                     let accepted = sockets.remove(lh);
                     let conn_handle = sockets.add(accepted);
-                    let (stream, conn) = make_stream_and_conn(notify.clone());
+                    let (stream, conn) = make_stream_and_conn(notify.clone(), remote_addr);
                     conns.insert(conn_handle, conn);
 
                     if let Some(entry) = listeners.get(&port) {
@@ -547,7 +577,7 @@ async fn poll_loop(
                 State::Established => {
                     let pd = pending_dials.remove(&handle);
                     if let Some(pd) = pd {
-                        let (stream, conn) = make_stream_and_conn(notify.clone());
+                        let (stream, conn) = make_stream_and_conn(notify.clone(), Some(pd.remote));
                         conns.insert(handle, conn);
                         let _ = pd.reply.send(Ok(stream));
                     }
@@ -635,7 +665,7 @@ fn do_dial(
         return;
     }
     let handle = sockets.add(socket);
-    pending_dials.insert(handle, PendingDial { reply });
+    pending_dials.insert(handle, PendingDial { reply, remote });
 }
 
 /// Pump data between a smoltcp socket and the application stream channels.

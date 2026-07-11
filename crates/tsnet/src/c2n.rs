@@ -3,7 +3,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use rustscale_c2n::{C2nBackend, C2NServer, WhoIsResult};
+use rustscale_c2n::{C2NServer, C2nBackend, WhoIsResult};
 use rustscale_controlclient::c2n::{C2nHandler, C2nRequest, C2nResponse};
 use rustscale_tailcfg::{Node, UserID, UserProfile};
 use tokio::net::TcpListener;

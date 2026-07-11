@@ -50,15 +50,17 @@ portal detection (Report field exists, unwired 🔶) · C2N debug endpoints
 (✅ phase-21: real handlers for prefs/netmap/health/metrics/dns/
 component-logging/goroutines/sockstats; only /debug/pprof/* remains 501 —
 no Rust pprof) ·
-Netmap disk cache (offline startup) (🔶 phase-15 single-blob cache in tsnet
-state.rs; Go columnar store + controlclient wiring pending) · Web client UI ·
+Netmap disk cache (offline startup) (✅ phase-22: versioned envelope,
+SHA-256 write dedup, save per MapResponse, clear on auth failure/key
+expiry; Go columnar store layout not replicated — single-blob by design) · Web client UI ·
 BIRD routing · Linux
 ipset · envknob · version package · Freedesktop/DBus · System tray. All ⬜
 unless noted. Control knobs (`control/controlknobs/`) ✅ phase-17
 (`crates/controlknobs`, CapMap→knobs in controlclient, tsnet accessor).
 PeerAPI (`ipn/ipnlocal/peerapi.go`) ✅ phase-18 (tsnet peerapi.rs: DoH
 /dns-query, /v0/* endpoints, WhoIs auth, CRC32 port, peerapi4/6 Service
-advertisement); Hostinfo 27/36 fields (gaps in validation doc).
+advertisement); Hostinfo ✅ phase-23 (all 36 Go fields, 10min update loop
+with content-hash dedup, runtime setters).
 
 ## Tier 5: Server-side (out of scope for the client)
 

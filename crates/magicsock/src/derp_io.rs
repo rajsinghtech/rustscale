@@ -1,14 +1,18 @@
 //! DERP client actor: splits the `DerpClient` stream into read and write
 //! halves for concurrent I/O from separate tasks.
 
+use rand::RngCore;
 use rustscale_derp::{decode_frame_header, encode_frame_header, frame_type};
 use rustscale_key::NodePublic;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 /// Command sent to the DERP write task.
 enum DerpCmd {
     SendPacket { dst: NodePublic, data: Vec<u8> },
+    Ping { data: [u8; 8] },
+    Pong { data: [u8; 8] },
 }
 
 /// Channel-based wrapper around a DERP connection.
@@ -23,6 +27,7 @@ pub struct DerpIo {
     recv_rx: tokio::sync::Mutex<mpsc::Receiver<(NodePublic, Vec<u8>)>>,
     reader_task: tokio::task::JoinHandle<()>,
     writer_task: tokio::task::JoinHandle<()>,
+    keepalive_task: tokio::task::JoinHandle<()>,
 }
 
 impl DerpIo {
@@ -33,8 +38,9 @@ impl DerpIo {
 
         let (cmd_tx, mut cmd_rx) = mpsc::channel(128);
         let (recv_tx, recv_rx) = mpsc::channel(128);
+        let pong_tx = cmd_tx.clone();
+        let keepalive_tx = cmd_tx.clone();
 
-        // Writer task: processes send commands.
         let writer_task = tokio::spawn(async move {
             let mut writer = write_half;
             while let Some(cmd) = cmd_rx.recv().await {
@@ -55,11 +61,34 @@ impl DerpIo {
                             break;
                         }
                     }
+                    DerpCmd::Ping { data } => {
+                        let header = encode_frame_header(frame_type::PING, 8);
+                        if writer.write_all(&header).await.is_err() {
+                            break;
+                        }
+                        if writer.write_all(&data).await.is_err() {
+                            break;
+                        }
+                        if writer.flush().await.is_err() {
+                            break;
+                        }
+                    }
+                    DerpCmd::Pong { data } => {
+                        let header = encode_frame_header(frame_type::PONG, 8);
+                        if writer.write_all(&header).await.is_err() {
+                            break;
+                        }
+                        if writer.write_all(&data).await.is_err() {
+                            break;
+                        }
+                        if writer.flush().await.is_err() {
+                            break;
+                        }
+                    }
                 }
             }
         });
 
-        // Reader task: reads frames and forwards ReceivedPackets.
         let reader_task = tokio::spawn(async move {
             let mut reader = read_half;
             loop {
@@ -76,7 +105,6 @@ impl DerpIo {
                     break;
                 }
 
-                // Only forward ReceivedPacket frames; ignore everything else.
                 if typ == frame_type::RECV_PACKET && body.len() >= 32 {
                     let mut src = [0u8; 32];
                     src.copy_from_slice(&body[..32]);
@@ -85,12 +113,29 @@ impl DerpIo {
                     if recv_tx.send((source, data)).await.is_err() {
                         break;
                     }
+                } else if typ == frame_type::PING && body.len() >= 8 {
+                    let mut data = [0u8; 8];
+                    data.copy_from_slice(&body[..8]);
+                    if pong_tx.send(DerpCmd::Pong { data }).await.is_err() {
+                        break;
+                    }
                 }
             }
         });
 
-        // Keep private_key alive (it's not used after split, but we don't want
-        // to drop it prematurely if the server sends sealed frames).
+        let keepalive_task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let mut data = [0u8; 8];
+                rand::rngs::OsRng.fill_bytes(&mut data);
+                if keepalive_tx.send(DerpCmd::Ping { data }).await.is_err() {
+                    break;
+                }
+            }
+        });
+
         drop(private_key);
 
         Self {
@@ -98,16 +143,14 @@ impl DerpIo {
             recv_rx: tokio::sync::Mutex::new(recv_rx),
             reader_task,
             writer_task,
+            keepalive_task,
         }
     }
 
-    /// Abort the reader and writer tasks, closing the DERP connection.
-    /// Aborting drops the half-owned TCP read/write halves, which closes
-    /// the underlying connection. The reader task's `recv_tx` is dropped,
-    /// so the consumer task's `try_recv` returns `None` and it exits.
     pub fn close(&self) {
         self.reader_task.abort();
         self.writer_task.abort();
+        self.keepalive_task.abort();
     }
 
     /// Send a data packet to `dst` via DERP.

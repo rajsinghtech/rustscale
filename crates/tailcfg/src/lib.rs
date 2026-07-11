@@ -21,6 +21,7 @@ pub use filter::{filter_allow_all, CapGrant, FilterRule, NetPortRange, PeerCapMa
 pub use map::{MapRequest, MapResponse};
 pub use node::{
     Endpoint, EndpointType, Hostinfo, Location, NetInfo, Node, NodeCapMap, Service, ServiceProto,
+    TPMInfo,
 };
 pub use register::{Login, LoginID, RegisterRequest, RegisterResponse, RegisterResponseAuth, User};
 

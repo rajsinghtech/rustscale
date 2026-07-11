@@ -4,11 +4,15 @@
 //! metadata, and desktop presence so that control-server features for those
 //! environments activate correctly.
 
+#[cfg(target_os = "linux")]
 use std::collections::HashMap;
 use std::fs;
+#[allow(unused_imports)]
 use std::path::Path;
+use std::sync::Arc;
 
-use rustscale_tailcfg::{Hostinfo, OptBool};
+use rustscale_tailcfg::{Hostinfo, OptBool, StableNodeID};
+use tokio::sync::RwLock;
 
 /// Package identifier — tsnet embedding layer.
 const PACKAGE: &str = "tsnet";
@@ -18,10 +22,18 @@ const PACKAGE: &str = "tsnet";
 /// etc. set by the caller — this fills in the remaining platform-detected
 /// fields and returns the updated struct.
 pub fn populate_hostinfo(mut hi: Hostinfo) -> Hostinfo {
-    hi.IPNVersion = env!("CARGO_PKG_VERSION").to_string();
-    hi.Package = PACKAGE.to_string();
-    hi.GoArch = std::env::consts::ARCH.to_string();
-    hi.GoVersion = rustc_version();
+    if hi.IPNVersion.is_empty() {
+        hi.IPNVersion = env!("CARGO_PKG_VERSION").to_string();
+    }
+    if hi.Package.is_empty() {
+        hi.Package = PACKAGE.to_string();
+    }
+    if hi.GoArch.is_empty() {
+        hi.GoArch = std::env::consts::ARCH.to_string();
+    }
+    if hi.GoVersion.is_empty() {
+        hi.GoVersion = rustc_version();
+    }
 
     if hi.OS.is_empty() {
         hi.OS = std::env::consts::OS.to_string();
@@ -67,6 +79,132 @@ pub fn populate_hostinfo(mut hi: Hostinfo) -> Hostinfo {
     }
 
     hi
+}
+
+// ─── Runtime overrides (mirror Go's SetDeviceModel/SetApp/...) ────────
+
+/// Runtime overrides for Hostinfo fields, mirroring Go's
+/// `hostinfo.SetDeviceModel`, `SetApp`, `SetOSVersion`, `SetPackage`.
+///
+/// Values set here take priority over platform-detected values during
+/// `populate_hostinfo`. Held in a shared `Arc<RwLock<>>` so the periodic
+/// Hostinfo update loop picks up changes without restarting the server.
+#[derive(Clone, Debug, Default)]
+pub struct HostinfoOverrides {
+    /// Overrides `Hostinfo.DeviceModel`.
+    pub device_model: Option<String>,
+    /// Overrides `Hostinfo.App`.
+    pub app: Option<String>,
+    /// Overrides `Hostinfo.OSVersion`.
+    pub os_version: Option<String>,
+    /// Overrides `Hostinfo.Package`.
+    pub package: Option<String>,
+}
+
+impl HostinfoOverrides {
+    /// Set the device model override.
+    pub fn set_device_model(&mut self, v: impl Into<String>) {
+        self.device_model = Some(v.into());
+    }
+
+    /// Set the app override.
+    pub fn set_app(&mut self, v: impl Into<String>) {
+        self.app = Some(v.into());
+    }
+
+    /// Set the OS version override.
+    pub fn set_os_version(&mut self, v: impl Into<String>) {
+        self.os_version = Some(v.into());
+    }
+
+    /// Set the package override.
+    pub fn set_package(&mut self, v: impl Into<String>) {
+        self.package = Some(v.into());
+    }
+
+    /// Apply overrides to a `Hostinfo` before platform detection fills in
+    /// the remaining empty fields. `populate_hostinfo` only fills fields
+    /// that are still empty, so setting a field here wins over detection.
+    pub fn apply(&self, hi: &mut Hostinfo) {
+        if let Some(ref v) = self.device_model {
+            hi.DeviceModel.clone_from(v);
+        }
+        if let Some(ref v) = self.app {
+            hi.App.clone_from(v);
+        }
+        if let Some(ref v) = self.os_version {
+            hi.OSVersion.clone_from(v);
+        }
+        if let Some(ref v) = self.package {
+            hi.Package.clone_from(v);
+        }
+    }
+}
+
+/// Shared, thread-safe override store.
+pub type SharedOverrides = Arc<RwLock<HostinfoOverrides>>;
+
+/// Create a fresh shared override store.
+pub fn shared_overrides() -> SharedOverrides {
+    Arc::new(RwLock::new(HostinfoOverrides::default()))
+}
+
+// ─── Runtime field population ─────────────────────────────────────────
+
+/// Apply tsnet-runtime fields to a `Hostinfo` that platform detection
+/// cannot determine on its own:
+///
+/// - `ExitNodeID`: the StableNodeID of the currently selected exit node,
+///   looked up from the peer list by node key. Empty when no exit node is
+///   selected or the peer is not found.
+/// - `IngressEnabled`: `true` when a Funnel listener is active (any
+///   `AllowFunnel` entry in the serve config is `true`).
+///
+/// Device-specific fields (`PushDeviceToken`, `TPM`, `StateEncrypted`) are
+/// left at their defaults — they require platform APIs not available in the
+/// tsnet embedding layer.
+pub fn apply_runtime_fields(
+    hi: &mut Hostinfo,
+    exit_node_id: Option<&StableNodeID>,
+    ingress_enabled: bool,
+) {
+    if let Some(id) = exit_node_id {
+        if !id.is_empty() {
+            hi.ExitNodeID.clone_from(id);
+        }
+    }
+    hi.IngressEnabled = ingress_enabled;
+}
+
+/// Collect a full `Hostinfo`: apply overrides, run platform detection, then
+/// apply runtime fields. This is the single entry point used by both the
+/// initial MapRequest send and the periodic update loop.
+pub fn collect_hostinfo(
+    base: Hostinfo,
+    overrides: &HostinfoOverrides,
+    exit_node_id: Option<&StableNodeID>,
+    ingress_enabled: bool,
+) -> Hostinfo {
+    let mut hi = base;
+    overrides.apply(&mut hi);
+    hi = populate_hostinfo(hi);
+    apply_runtime_fields(&mut hi, exit_node_id, ingress_enabled);
+    hi
+}
+
+// ─── Hostinfo content hash (for update dedup) ─────────────────────────
+
+/// Compute a stable content hash of a `Hostinfo` for dedup. Uses the JSON
+/// serialization (which is deterministic: `BTreeMap` keys are sorted, and
+/// `skip_serializing_if` drops defaults) so two structurally-equal
+/// Hostinfos produce the same hash.
+pub fn hostinfo_hash(hi: &Hostinfo) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let json = serde_json::to_string(hi).unwrap_or_default();
+    let mut hasher = DefaultHasher::new();
+    json.hash(&mut hasher);
+    hasher.finish()
 }
 
 // ─── OS version ───────────────────────────────────────────────────────
@@ -373,6 +511,7 @@ fn device_model() -> String {
 // ─── Cloud detection ──────────────────────────────────────────────────
 
 /// Cloud environment constants matching Go's `cloudenv.Cloud`.
+#[allow(dead_code)]
 pub mod cloud {
     pub const AWS: &str = "aws";
     pub const AZURE: &str = "azure";
@@ -414,6 +553,7 @@ fn cloud_detection() -> &'static str {
     ""
 }
 
+#[allow(dead_code)]
 fn read_trim(path: &str) -> String {
     fs::read_to_string(path)
         .map(|s| s.trim().to_string())
@@ -507,5 +647,184 @@ mod tests {
     fn test_os_version_macos() {
         let v = os_version();
         assert!(!v.is_empty());
+    }
+
+    // ─── Override + runtime field tests ──────────────────────────────
+
+    #[test]
+    fn test_overrides_apply_before_detection() {
+        let mut hi = Hostinfo {
+            OS: "linux".to_string(),
+            Hostname: "h".to_string(),
+            ..Default::default()
+        };
+        let ov = HostinfoOverrides {
+            device_model: Some("Raspberry Pi 4".into()),
+            app: Some("golinks".into()),
+            os_version: Some("20.04".into()),
+            package: Some("snap".into()),
+        };
+        ov.apply(&mut hi);
+        hi = populate_hostinfo(hi);
+        // Overrides win over detection.
+        assert_eq!(hi.DeviceModel, "Raspberry Pi 4");
+        assert_eq!(hi.App, "golinks");
+        assert_eq!(hi.OSVersion, "20.04");
+        assert_eq!(hi.Package, "snap");
+    }
+
+    #[test]
+    fn test_overrides_none_uses_detection() {
+        let hi = Hostinfo {
+            OS: "linux".to_string(),
+            Hostname: "h".to_string(),
+            ..Default::default()
+        };
+        let ov = HostinfoOverrides::default();
+        let hi = collect_hostinfo(hi, &ov, None, false);
+        // No override → detection fills in the field.
+        assert_eq!(hi.Package, "tsnet");
+    }
+
+    #[test]
+    fn test_runtime_fields_exit_node_id() {
+        let mut hi = Hostinfo::default();
+        let exit_id: StableNodeID = "nodeABC".into();
+        apply_runtime_fields(&mut hi, Some(&exit_id), false);
+        assert_eq!(hi.ExitNodeID, "nodeABC");
+        assert!(!hi.IngressEnabled);
+    }
+
+    #[test]
+    fn test_runtime_fields_ingress_enabled() {
+        let mut hi = Hostinfo::default();
+        apply_runtime_fields(&mut hi, None, true);
+        assert!(hi.IngressEnabled);
+        assert!(hi.ExitNodeID.is_empty());
+    }
+
+    #[test]
+    fn test_runtime_fields_empty_exit_id_not_set() {
+        let mut hi = Hostinfo::default();
+        let empty: StableNodeID = String::new();
+        apply_runtime_fields(&mut hi, Some(&empty), false);
+        assert!(hi.ExitNodeID.is_empty(), "empty StableNodeID should not be set");
+    }
+
+    // ─── Content-hash dedup tests ────────────────────────────────────
+
+    #[test]
+    fn test_hostinfo_hash_same_content_same_hash() {
+        let hi1 = Hostinfo {
+            OS: "linux".into(),
+            Hostname: "host".into(),
+            ..Default::default()
+        };
+        let hi2 = Hostinfo {
+            OS: "linux".into(),
+            Hostname: "host".into(),
+            ..Default::default()
+        };
+        assert_eq!(hostinfo_hash(&hi1), hostinfo_hash(&hi2));
+    }
+
+    #[test]
+    fn test_hostinfo_hash_different_content_different_hash() {
+        let hi1 = Hostinfo {
+            OS: "linux".into(),
+            Hostname: "host".into(),
+            ..Default::default()
+        };
+        let hi2 = Hostinfo {
+            OS: "linux".into(),
+            Hostname: "different".into(),
+            ..Default::default()
+        };
+        assert_ne!(hostinfo_hash(&hi1), hostinfo_hash(&hi2));
+    }
+
+    #[test]
+    fn test_hostinfo_hash_dedup_no_send_on_same_content() {
+        // Simulate the update loop's dedup logic: same Hostinfo hash
+        // means no send.
+        let hi = Hostinfo {
+            OS: "linux".into(),
+            Hostname: "host".into(),
+            ..Default::default()
+        };
+        let hash1 = hostinfo_hash(&hi);
+        // Re-collect identical content.
+        let hi2 = Hostinfo {
+            OS: "linux".into(),
+            Hostname: "host".into(),
+            ..Default::default()
+        };
+        let hash2 = hostinfo_hash(&hi2);
+        assert_eq!(hash1, hash2, "same content → same hash → no send");
+    }
+
+    #[test]
+    fn test_hostinfo_hash_changes_with_exit_node() {
+        let base = Hostinfo {
+            OS: "linux".into(),
+            Hostname: "host".into(),
+            ..Default::default()
+        };
+        let h1 = hostinfo_hash(&base);
+        let mut modified = base;
+        modified.ExitNodeID = "nodeExit1".into();
+        let h2 = hostinfo_hash(&modified);
+        assert_ne!(h1, h2, "exit node change should produce different hash");
+    }
+
+    #[test]
+    fn test_hostinfo_hash_changes_with_ingress() {
+        let base = Hostinfo {
+            OS: "linux".into(),
+            Hostname: "host".into(),
+            ..Default::default()
+        };
+        let h1 = hostinfo_hash(&base);
+        let mut modified = base;
+        modified.IngressEnabled = true;
+        let h2 = hostinfo_hash(&modified);
+        assert_ne!(h1, h2, "ingress change should produce different hash");
+    }
+
+    // ─── Override setter tests ───────────────────────────────────────
+
+    #[test]
+    fn test_override_setters() {
+        let mut ov = HostinfoOverrides::default();
+        ov.set_device_model("Pixel 7");
+        ov.set_app("k8s-operator");
+        ov.set_os_version("13.0");
+        ov.set_package("googleplay");
+        assert_eq!(ov.device_model.as_deref(), Some("Pixel 7"));
+        assert_eq!(ov.app.as_deref(), Some("k8s-operator"));
+        assert_eq!(ov.os_version.as_deref(), Some("13.0"));
+        assert_eq!(ov.package.as_deref(), Some("googleplay"));
+    }
+
+    #[test]
+    fn test_collect_hostinfo_with_overrides_and_runtime() {
+        let base = Hostinfo {
+            OS: "linux".into(),
+            Hostname: "host".into(),
+            RoutableIPs: vec!["10.0.0.0/8".into()],
+            ..Default::default()
+        };
+        let ov = HostinfoOverrides {
+            device_model: Some("Synology DS920+".into()),
+            ..Default::default()
+        };
+        let exit_id: StableNodeID = "nodeExit42".into();
+        let hi = collect_hostinfo(base, &ov, Some(&exit_id), true);
+        assert_eq!(hi.DeviceModel, "Synology DS920+");
+        assert_eq!(hi.ExitNodeID, "nodeExit42");
+        assert!(hi.IngressEnabled);
+        assert_eq!(hi.RoutableIPs, vec!["10.0.0.0/8".to_string()]);
+        // Platform detection still runs for non-overridden fields.
+        assert!(!hi.IPNVersion.is_empty());
     }
 }

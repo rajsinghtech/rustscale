@@ -178,13 +178,13 @@ doc exists but no code. Zero lines of peerapi code.
 | `Desktop` | `Desktop` | ✅ | |
 | `Package` | `Package` | ✅ | |
 | `DeviceModel` | `DeviceModel` | ✅ | |
-| `PushDeviceToken` | **MISSING** | ⬜ | macOS/iOS APNs device token for notifications. |
+| `PushDeviceToken` | `PushDeviceToken` | ✅ | macOS/iOS APNs device token for notifications. |
 | `Hostname` | `Hostname` | ✅ | |
 | `ShieldsUp` | `ShieldsUp` | ✅ | |
-| `ShareeNode` | **MISSING** | ⬜ | Indicates this node is a shared-to user's node. |
+| `ShareeNode` | `ShareeNode` | ✅ | Indicates this node is a shared-to user's node. |
 | `NoLogsNoSupport` | `NoLogsNoSupport` | ✅ | |
-| `WireIngress` | **MISSING** | ⬜ | Wants funnel wiring even if not enabled. |
-| `IngressEnabled` | `IngressEnabled` | ✅ | |
+| `WireIngress` | `WireIngress` | ✅ | Wants funnel wiring even if not enabled. |
+| `IngressEnabled` | `IngressEnabled` | ✅ | Populated by `apply_runtime_fields` when funnel is active. |
 | `AllowsUpdate` | `AllowsUpdate` | ✅ | |
 | `Machine` | `Machine` | ✅ | |
 | `GoArch` | `GoArch` | ✅ | |
@@ -192,7 +192,7 @@ doc exists but no code. Zero lines of peerapi code.
 | `GoVersion` | `GoVersion` | ✅ | |
 | `RoutableIPs` | `RoutableIPs` | ✅ | Rust stores as `Vec<String>`, Go uses `[]netip.Prefix` |
 | `RequestTags` | `RequestTags` | ✅ | |
-| `WoLMACs` | **MISSING** | ⬜ | Wake-on-LAN MAC addresses. |
+| `WoLMACs` | `WoLMACs` | ✅ | Wake-on-LAN MAC addresses. |
 | `Services` | `Services` | ✅ | Rust uses `Vec<Service>` |
 | `NetInfo` | `NetInfo` | ✅ | |
 | `SSH_HostKeys` | `SSH_HostKeys` | ✅ | Renamed to `SSH_HostKeys` with `rename = "sshHostKeys"` |
@@ -200,14 +200,14 @@ doc exists but no code. Zero lines of peerapi code.
 | `Userspace` | `Userspace` | ✅ | |
 | `UserspaceRouter` | `UserspaceRouter` | ✅ | |
 | `AppConnector` | `AppConnector` | ✅ | |
-| `ServicesHash` | **MISSING** | ⬜ | Opaque hash of tailnet services list; change signals re-fetch via c2n. |
+| `ServicesHash` | `ServicesHash` | ✅ | Opaque hash of tailnet services list. |
 | `PeerRelay` | `PeerRelay` | ✅ | |
-| `ExitNodeID` | **MISSING** | ⬜ | Client's selected exit node StableNodeID. |
-| `Location` | **MISSING** | ⬜ | `Location` struct exists in `node.rs` but not on `Hostinfo`. |
-| `TPM` | **MISSING** | ⬜ | TPM device metadata. |
-| `StateEncrypted` | **MISSING** | ⬜ | Whether node state is stored encrypted on disk. |
+| `ExitNodeID` | `ExitNodeID` | ✅ | Populated from route table's selected exit node StableNodeID. |
+| `Location` | `Location` | ✅ | Reuses existing `Location` struct; `Option<Location>`. |
+| `TPM` | `TPM` | ✅ | `TPMInfo` struct mirroring Go's `tailcfg.TPMInfo`. |
+| `StateEncrypted` | `StateEncrypted` | ✅ | `OptBool`, defaults to unset. |
 
-Total: **36 Go fields, 27 present in Rust, 9 missing.**
+Total: **36 Go fields, 36 present in Rust, 0 missing.**
 
 ### `collect_hostinfo()` — `tsnet/src/hostinfo.rs` vs `hostinfo/hostinfo.go`
 
@@ -215,7 +215,7 @@ Total: **36 Go fields, 27 present in Rust, 9 missing.**
 | --- | --- | --- | --- |
 | `RegisterHostinfoNewHook` extensibility | `hostinfo.go:39-41` | **missing** | No hook system for plugins to augment Hostinfo. |
 | `SetHostnameFn` custom hostname resolver | `hostinfo.go:517-518` | **missing** | Rust uses `gethostname()` inside `tsnet::Server`, not pluggable. |
-| `SetOSVersion` / `SetDeviceModel` / `SetApp` / `SetPackage` | `hostinfo.go:190-226` | **missing** | No runtime setters for Hostinfo fields. |
+| `SetOSVersion` / `SetDeviceModel` / `SetApp` / `SetPackage` | `hostinfo.go:190-226` | ✅ | `HostinfoOverrides` struct with `set_device_model`/`set_app`/`set_os_version`/`set_package`; builder + Server runtime setters. |
 | `DisabledEtcAptSource()` | `hostinfo.go:442-463` | **missing** | Linux apt-workaround detection. |
 | `IsSELinuxEnforcing()` | `hostinfo.go:483-489` | **missing** | SELinux mode detection. |
 | `IsNATLabGuestVM()` | `hostinfo.go:492-498` | **missing** | NAT lab VM detection. |
@@ -226,9 +226,9 @@ Total: **36 Go fields, 27 present in Rust, 9 missing.**
 
 | item | Go | Rust | status |
 | --- | --- | --- | --- |
-| **Update loop does not exist** | `controlclient/direct.go:HostInfo` | **missing** | Rust has no `start_hostinfo_update_loop`, no periodic refresh, no initial send. |
-| Periodic 10min refresh | `controlclient/direct.go` | **missing** | |
-| Dedup by content hash | `controlclient/direct.go` | **missing** | Rust always-sends without dedup. |
+| **Update loop** | `controlclient/direct.go:HostInfo` | ✅ | `spawn_hostinfo_update_loop` in `tsnet/src/lib.rs`; initial send + 10min periodic refresh. |
+| Periodic 10min refresh | `controlclient/direct.go` | ✅ | `tokio::time::sleep(Duration::from_mins(10))` |
+| Dedup by content hash | `controlclient/direct.go` | ✅ | `hostinfo_hash()` — JSON serialization hash; same content → no send. |
 
 ---
 
@@ -261,7 +261,7 @@ Total: **36 Go fields, 27 present in Rust, 9 missing.**
 | 13 PeerAPI | ~20 handlers/features | 0 | 0 | 20 | 0% |
 | 14 C2N | 17 endpoints | 2 | 12 | 4 | ~12% |
 | 15 Netmap cache | ~10 features | 3 | 0 | ~7 | ~30% |
-| 16 Hostinfo | 36 fields + update loop | 27 | 0 | 9+3 | ~70% |
+| 16 Hostinfo | 36 fields + update loop | 36 | 0 | 0+3 | ~100% |
 
 ---
 

@@ -1352,6 +1352,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustscale-netns"
+version = "0.1.0"
+dependencies = [
+ "if-addrs",
+ "libc",
+ "rustscale-netmon",
+ "socket2",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
 name = "rustscale-netstack"
 version = "0.1.0"
 dependencies = [

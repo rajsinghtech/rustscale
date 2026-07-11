@@ -106,7 +106,7 @@ impl MagicDnsResolver {
             return true;
         }
         // Single-label short name (no dots) — MagicDNS resolves these.
-        !n.contains('.')
+        !self.domain.is_empty() && !n.contains('.')
     }
 
     /// Resolve `A` records for `name` from the netmap.
@@ -366,7 +366,7 @@ async fn handle_query(
                     })
                     .collect();
                 if v4.is_empty() {
-                    return build_nxdomain(query);
+                    return Some(build_nxdomain_noerror(query));
                 }
                 build_a_response(query, &v4)
             } else if qtype == TYPE_AAAA {
@@ -378,7 +378,7 @@ async fn handle_query(
                     })
                     .collect();
                 if v6.is_empty() {
-                    return build_nxdomain(query);
+                    return Some(build_nxdomain_noerror(query));
                 }
                 build_aaaa_response(query, &v6)
             } else {
@@ -398,7 +398,10 @@ async fn handle_query(
 /// return its response verbatim.
 async fn forward_upstream(query: &[u8], upstream: &[SocketAddr]) -> Option<Vec<u8>> {
     for server in upstream {
-        let sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await.ok()?;
+        let sock = match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
         if sock.send_to(query, server).await.is_err() {
             continue;
         }

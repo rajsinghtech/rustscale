@@ -68,13 +68,15 @@ impl PersistedState {
         Ok(serde_json::from_str(&data)?)
     }
 
-    /// Save state to a JSON file.
+    /// Save state to a JSON file (atomic: write to tmp + rename).
     pub fn save(&self, path: &Path) -> Result<(), StateError> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let data = serde_json::to_string_pretty(self)?;
-        std::fs::write(path, data)?;
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, data)?;
+        std::fs::rename(&tmp, path)?;
         Ok(())
     }
 }

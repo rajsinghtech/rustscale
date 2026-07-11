@@ -144,7 +144,7 @@ while :; do
         curl -sfS --max-time 10 -o /dev/null -X POST "$URL/session/$SID/prompt_async?directory=$DIR" \
           -H 'Content-Type: application/json' \
           -d "$(jq -n --arg pid "$PROVIDER" --arg mid "$MODEL" \
-            '{model:{providerID:$pid,modelID:$mid},parts:[{type:"text",text:"Please proceed with the task described above."}]}')" \
+            '{model:{providerID:$pid,modelID:$mid},parts:[{type:"text",text:"Begin now. Re-read the task in my first message, state your plan in one sentence, then start executing it with tool calls immediately."}]}')" \
           || { echo "[harness] re-prompt failed" >&2; break; }
         continue
       fi

@@ -2670,7 +2670,8 @@ fn spawn_link_monitor(
 ) -> Option<rustscale_netmon::MonitorHandle> {
     let monitor = rustscale_netmon::Monitor::new().ok()?;
 
-    let handle = monitor.start(move |delta| {
+    let handle = monitor.start();
+    handle.register_change_callback(move |delta| {
         let magicsock = magicsock.clone();
         let cancel = cancel.clone();
         let control_url = control_url.clone();

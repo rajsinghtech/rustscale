@@ -7,15 +7,17 @@
 //! - [`Monitor`] owns a [`State`] snapshot and a debounce loop.
 //! - On macOS, an AF_ROUTE socket delivers events in real time; on other
 //!   platforms a 10-second polling fallback is used.
-//! - Wall-clock jumps (>60s elapsed between checks) are treated as major
-//!   changes (machine woke from sleep — NAT mappings are stale).
+//! - Wall-clock jumps (monotonic-vs-wall delta > 10 min) are treated as
+//!   major changes (machine woke from sleep — NAT mappings are stale).
 //!
 //! # Unsafe
 //!
-//! This crate uses `unsafe` libc calls for the AF_ROUTE socket on macOS.
-//! The `unsafe_code` lint is allowed via `Cargo.toml` (not inherited from
-//! the workspace `forbid` policy).
+//! This crate uses `unsafe` libc calls for the AF_ROUTE socket on macOS
+//! and `getifaddrs`/`ioctl` for interface metadata. The `unsafe_code` lint
+//! is allowed via `Cargo.toml` (not inherited from the workspace `forbid`
+//! policy).
 
+mod interfaces;
 mod monitor;
 mod os;
 
@@ -30,5 +32,10 @@ mod state;
 #[cfg(test)]
 mod tests;
 
-pub use monitor::{ChangeDelta, Monitor, MonitorHandle, NetmonError, StateProvider};
-pub use state::{default_route_interface, gather_state, InterfaceMeta, IpPrefix, State};
+pub use monitor::{
+    ChangeCallbackHandle, ChangeDelta, Monitor, MonitorHandle, NetmonError, StateProvider,
+};
+pub use state::{
+    default_route, default_route_interface, gather_state, get_interface_list, has_cgnat_interface,
+    InterfaceEntry, InterfaceMeta, IpPrefix, LinkType, Route, State,
+};

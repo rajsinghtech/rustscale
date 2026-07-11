@@ -110,6 +110,15 @@ bench_provision_tailnet() {
 # Mint a reusable ephemeral preauthorized authkey. Prints the key to stdout.
 # ---------------------------------------------------------------------------
 bench_mint_authkey() {
+  # Refresh a child-scoped token from the child OAuth client creds on every
+  # call. The access token minted at provision time expires (~1h), so over a
+  # ~40-min matrix the later per-config mints 401 with a stale token. The
+  # client creds themselves don't expire, so re-derive the token each time.
+  if [[ -n "${BENCH_CHILD_CID:-}" && -n "${BENCH_CHILD_CSEC:-}" ]]; then
+    BENCH_CHILD_TOKEN=$(curl -fsS -X POST "$BENCH_API/api/v2/oauth/token" \
+      -d client_id="$BENCH_CHILD_CID" -d client_secret="$BENCH_CHILD_CSEC" \
+      | jq -r .access_token)
+  fi
   local key
   key=$(curl -fsS --retry 3 --retry-delay 3 --retry-all-errors \
     -X POST "$BENCH_API/api/v2/tailnet/$BENCH_DNS/keys" \

@@ -105,7 +105,7 @@ if [[ $DRY_RUN -eq 1 ]]; then
   AUTHKEY="tskey-dryrun-placeholder"
 else
   bench_provision_tailnet
-  export BENCH_DNS BENCH_CHILD_TOKEN BENCH_API
+  export BENCH_DNS BENCH_CHILD_TOKEN BENCH_CHILD_CID BENCH_CHILD_CSEC BENCH_API
   echo "[gcp] tailnet provisioned; authkeys will be minted per-config" >&2
 fi
 

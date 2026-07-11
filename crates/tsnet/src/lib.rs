@@ -995,6 +995,62 @@ impl Server {
             Err(e) => eprintln!("tsnet: NetInfo update failed (non-fatal): {e}"),
         }
 
+        // 7b. Run a STUN probe now that DERPMap is known, to discover our
+        // external (NAT-mapped) IP:port and include it in the endpoint list.
+        // This is critical for peers on different networks — without STUN
+        // endpoints they can never establish a direct UDP connection.
+        let stun_ep: Option<String> = if derp_map.Regions.is_empty() {
+            None
+        } else {
+            // Run STUN probe to discover external IP:port
+            match rustscale_netcheck::Prober
+                .run(&derp_map, &rustscale_netcheck::ProberOpts::default())
+                .await
+            {
+                Ok(report) => {
+                    if let Some(g) = report.global_v4 {
+                        eprintln!("tsnet: STUN endpoint: {g}");
+                        Some(g.to_string())
+                    } else {
+                        eprintln!("tsnet: STUN probe returned no global_v4");
+                        None
+                    }
+                }
+                Err(e) => {
+                    eprintln!("tsnet: STUN probe failed (non-fatal): {e}");
+                    None
+                }
+            }
+        };
+
+        // Build the enhanced endpoint list: filtered local endpoints + STUN.
+        let mut all_endpoints = local_endpoints.clone();
+        if let Some(ref stun) = stun_ep {
+            all_endpoints.push(stun.clone());
+        }
+        // Re-send endpoint update with STUN results included.
+        let stun_ep_req = MapRequest {
+            Version: CAPABILITY_VERSION,
+            KeepAlive: false,
+            NodeKey: node_pub.clone(),
+            DiscoKey: disco_pub.clone(),
+            Stream: false,
+            OmitPeers: true,
+            Endpoints: all_endpoints,
+            Hostinfo: Some(Hostinfo {
+                OS: std::env::consts::OS.to_string(),
+                Hostname: self.config.hostname.clone(),
+                RoutableIPs: advertise.clone(),
+                NetInfo: Some(netinfo.clone()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        match cc_ep.send_map_request(&stun_ep_req).await {
+            Ok(()) => eprintln!("tsnet: STUN endpoint update sent ({stun_ep:?})"),
+            Err(e) => eprintln!("tsnet: STUN endpoint update failed (non-fatal): {e}"),
+        }
+
         // Start the streaming map long-poll with NetInfo included. This is
         // done after the home DERP is known and connected so the streaming
         // MapRequest carries NetInfo.PreferredDERP from the start.

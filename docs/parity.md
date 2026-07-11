@@ -71,12 +71,26 @@ side). Roadmap tail.
 
 Wire types/keys/disco/DERP client/netcheck (STUN) · ts2021 Noise control
 client (HTTP/2-over-Noise, streaming netmap deltas) · magicsock
-(direct/DERP/peer-relay client, cross-region routing, reply-to-arrival-region)
+(direct/DERP path selection, cross-region routing, reply-to-arrival-region;
+peer-relay client is 🔶 partial — geneve codec + handshake types exist but
+no relayManager loop, see docs/phase-peer-relay.md gap table)
 · WireGuard data plane (boringtun) · userspace netstack (smoltcp,
 event-driven) · packet filter (incl. stateful UDP) · subnet routing
 (advertise/accept/forward) · TUN mode (macOS utun, Linux untested) · tsnet
 embed API · C FFI (librustscale) + Python ctypes · bench harness (beats
 tailscaled userspace: p50 ~170us vs 257us, 465–838 vs 384 Mbps).
+
+## Test infrastructure
+
+`crates/testcontrol` ✅ phase-28: in-process fake control server (Noise
+server handshake, h2c, register, streaming map, Go-testcontrol-style test
+API); tsnet self-test registers → Running → sees injected fake peer with
+no network. `crates/derp` server ✅ phase-29: in-process DERP relay
+(spawn_local + make_derp_map) for integration tests. tailcfg
+null-tolerance ✅ phase-30: every wire field accepts Go nil + property
+test nullifying each field. Full plan: docs/testcontrol-plan.md
+(remaining: Phase B integration scenarios, Phase D UDP impairment shim,
+Go-testcontrol interop harness).
 
 ## Cross-client interop verification
 

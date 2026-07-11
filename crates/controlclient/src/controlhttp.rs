@@ -246,7 +246,9 @@ where
 ///
 /// For `http://` URLs (in-process test fakes) this uses plain TCP; for bare
 /// hostnames or `https://` URLs it uses TLS to port 443 (or the specified
-/// port).
+/// port). For `https://` URLs where the host is an IP literal or `localhost`,
+/// TLS certificate verification is skipped (self-signed cert support for the
+/// Go testcontrol interop harness).
 pub async fn dial_control(
     url: &str,
     machine_key: &MachinePrivate,
@@ -261,7 +263,8 @@ pub async fn dial_control(
         let stream = AnyStream::Plain(tcp);
         upgrade_and_handshake(stream, &parsed.host_port, machine_key, control_key, version).await
     } else {
-        let tls_stream = tls_connect(&parsed.host, parsed.port).await?;
+        let insecure = is_insecure_host(&parsed.host);
+        let tls_stream = tls_connect(&parsed.host, parsed.port, insecure).await?;
         let stream = AnyStream::Tls(Box::new(tls_stream));
         upgrade_and_handshake(stream, &parsed.host, machine_key, control_key, version).await
     }
@@ -276,7 +279,9 @@ pub async fn dial_control(
 ///
 /// For `http://` URLs (in-process test fakes) this uses plain TCP; for bare
 /// hostnames or `https://` URLs it uses TLS to port 443 (or the specified
-/// port).
+/// port). For `https://` URLs where the host is an IP literal or `localhost`,
+/// TLS certificate verification is skipped (self-signed cert support for the
+/// Go testcontrol interop harness).
 pub async fn fetch_server_pub_key(
     url: &str,
     version: ProtocolVersion,
@@ -304,27 +309,8 @@ pub async fn fetch_server_pub_key(
         tcp.read_to_end(&mut buf).await.map_err(DialError::Io)?;
         buf
     } else {
-        ensure_ring_provider();
-
-        let tcp = dns_resolver()
-            .dial_tcp(&parsed.host, parsed.port)
-            .await
-            .map_err(|e| DialError::Io(std::io::Error::other(e.to_string())))?;
-
-        let root_store = rustls::RootCertStore {
-            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-        };
-        let config = rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
-        let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
-
-        let server_name = ServerName::try_from(parsed.host.clone())
-            .map_err(|e| DialError::Tls(format!("invalid server name: {e}")))?;
-        let mut tls = connector
-            .connect(server_name, tcp)
-            .await
-            .map_err(|e| DialError::Tls(e.to_string()))?;
+        let insecure = is_insecure_host(&parsed.host);
+        let mut tls = tls_connect(&parsed.host, parsed.port, insecure).await?;
 
         let request = format!(
             "GET /key?v={version} HTTP/1.1\r\n\
@@ -390,22 +376,42 @@ fn ensure_ring_provider() {
 
 /// Establish a TLS connection to `host:port`.
 ///
-/// Uses the shared DNS cache resolver with DERP fallback so that control-plane
-/// connections survive broken system DNS (matching Go's `dnscache.Dialer`
-/// wrapping the control client's transport).
-async fn tls_connect(host: &str, port: u16) -> Result<tokio_rustls::client::TlsStream<TcpStream>, DialError> {
+/// When `insecure` is true, certificate verification is skipped (for test
+/// control servers with self-signed certs, e.g. the Go testcontrol interop
+/// harness on `https://127.0.0.1:PORT`). Otherwise uses the webpki root CA
+/// store with full verification.
+///
+/// Uses the shared DNS cache resolver with DERP fallback for production
+/// hosts so that control-plane connections survive broken system DNS
+/// (matching Go's `dnscache.Dialer` wrapping the control client's transport).
+async fn tls_connect(
+    host: &str,
+    port: u16,
+    insecure: bool,
+) -> Result<tokio_rustls::client::TlsStream<TcpStream>, DialError> {
     ensure_ring_provider();
-    let tcp = dns_resolver()
-        .dial_tcp(host, port)
-        .await
-        .map_err(|e| DialError::Io(std::io::Error::other(e.to_string())))?;
 
-    let root_store = rustls::RootCertStore {
-        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    let tcp = if port == 443 && !insecure {
+        dns_resolver()
+            .dial_tcp(host, port)
+            .await
+            .map_err(|e| DialError::Io(std::io::Error::other(e.to_string())))?
+    } else {
+        tokio::net::TcpStream::connect((host, port))
+            .await
+            .map_err(DialError::Io)?
     };
-    let config = rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
+
+    let config = if insecure {
+        insecure_tls_config()
+    } else {
+        let root_store = rustls::RootCertStore {
+            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+        };
+        rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth()
+    };
     let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
 
     let server_name = ServerName::try_from(host.to_string())
@@ -415,6 +421,73 @@ async fn tls_connect(host: &str, port: u16) -> Result<tokio_rustls::client::TlsS
         .await
         .map_err(|e| DialError::Tls(e.to_string()))?;
     Ok(tls)
+}
+
+/// Returns true when the host is a literal IP address or `localhost` —
+/// these hosts use self-signed certs in test environments, so TLS
+/// certificate verification must be skipped.
+fn is_insecure_host(host: &str) -> bool {
+    host == "localhost"
+        || host == "127.0.0.1"
+        || host == "::1"
+        || host.parse::<std::net::IpAddr>().is_ok()
+}
+
+/// Build a rustls client config that skips certificate verification entirely.
+/// Used for `https://` control servers with self-signed certificates (the Go
+/// testcontrol interop harness).
+fn insecure_tls_config() -> rustls::ClientConfig {
+    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+
+    #[derive(Debug)]
+    struct NoVerify;
+
+    impl ServerCertVerifier for NoVerify {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &rustls::pki_types::CertificateDer<'_>,
+            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            _server_name: &rustls::pki_types::ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: rustls::pki_types::UnixTime,
+        ) -> Result<ServerCertVerified, rustls::Error> {
+            Ok(ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            vec![
+                rustls::SignatureScheme::RSA_PKCS1_SHA256,
+                rustls::SignatureScheme::RSA_PKCS1_SHA384,
+                rustls::SignatureScheme::RSA_PKCS1_SHA512,
+                rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+                rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+                rustls::SignatureScheme::ED25519,
+            ]
+        }
+    }
+
+    rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(std::sync::Arc::new(NoVerify))
+        .with_no_client_auth()
 }
 
 /// Send the HTTP upgrade request, parse the 101 response, and run the
@@ -585,6 +658,36 @@ mod tests {
     use super::*;
     use rustscale_key::MachinePrivate;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Test that `is_insecure_host` correctly identifies test hosts.
+    #[test]
+    fn is_insecure_host_detects_ip_and_localhost() {
+        assert!(is_insecure_host("127.0.0.1"));
+        assert!(is_insecure_host("localhost"));
+        assert!(is_insecure_host("::1"));
+        assert!(is_insecure_host("10.0.0.1"));
+        assert!(!is_insecure_host("controlplane.tailscale.com"));
+        assert!(!is_insecure_host("example.com"));
+    }
+
+    /// Test that `parse_control_url` handles http://, https://, and bare
+    /// hostnames correctly.
+    #[test]
+    fn parse_control_url_schemes() {
+        let p = parse_control_url("http://127.0.0.1:12345");
+        assert!(p.is_plain);
+        assert_eq!(p.host, "127.0.0.1");
+        assert_eq!(p.port, 12345);
+
+        let p = parse_control_url("https://127.0.0.1:8443");
+        assert!(!p.is_plain);
+        assert_eq!(p.host, "127.0.0.1");
+        assert_eq!(p.port, 8443);
+
+        let p = parse_control_url("controlplane.tailscale.com");
+        assert!(!p.is_plain);
+        assert_eq!(p.port, 443);
+    }
 
     /// Test that `parse_status_code` extracts the code from a full status line.
     #[test]

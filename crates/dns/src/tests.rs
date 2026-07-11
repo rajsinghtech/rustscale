@@ -249,7 +249,10 @@ fn via_domain_resolves_aaaa() {
     };
     // Verify the site ID is embedded in the address.
     let oct = ip6.octets();
-    assert_eq!(&oct[0..8], &[0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0, 0x0b, 0x1a]);
+    assert_eq!(
+        &oct[0..8],
+        &[0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0, 0x0b, 0x1a]
+    );
     assert_eq!(&oct[8..12], &7u32.to_be_bytes());
     assert_eq!(&oct[12..16], &[192, 168, 1, 2]);
 }
@@ -315,7 +318,11 @@ fn all_qtype_returns_first_addr() {
 #[test]
 fn ns_qtype_returns_notimpl() {
     let _r = MagicDnsResolver::from_peers(&[], "tailnet.ts.net");
-    let peers = vec![peer("host.tailnet.ts.net.", "100.64.0.5", "fd7a:115c:a1e0::5")];
+    let peers = vec![peer(
+        "host.tailnet.ts.net.",
+        "100.64.0.5",
+        "fd7a:115c:a1e0::5",
+    )];
     let mut r = MagicDnsResolver::from_peers(&peers, "tailnet.ts.net");
     r.set_peers(peers);
     let (_, code) = r.resolve_local("host.tailnet.ts.net", qtype::NS);
@@ -324,7 +331,11 @@ fn ns_qtype_returns_notimpl() {
 
 #[test]
 fn unknown_qtype_returns_noerror() {
-    let peers = vec![peer("host.tailnet.ts.net.", "100.64.0.5", "fd7a:115c:a1e0::5")];
+    let peers = vec![peer(
+        "host.tailnet.ts.net.",
+        "100.64.0.5",
+        "fd7a:115c:a1e0::5",
+    )];
     let r = MagicDnsResolver::from_peers(&peers, "tailnet.ts.net");
     // Unknown record type → NOERROR with 0 answers (name exists).
     let (_, code) = r.resolve_local("host.tailnet.ts.net", 9999);
@@ -364,9 +375,7 @@ fn set_config_under_concurrent_queries() {
             let mut cfg = Config::default();
             cfg.hosts.insert(
                 format!("host{i}.ts.net"),
-                vec![format!("100.64.0.{i}")
-                    .parse::<IpAddr>()
-                    .unwrap()],
+                vec![format!("100.64.0.{i}").parse::<IpAddr>().unwrap()],
             );
             r2.write().unwrap().set_config(cfg);
         }
@@ -523,7 +532,10 @@ fn map_via_produces_correct_address() {
     let ip4 = Ipv4Addr::new(192, 168, 1, 2);
     let v6 = map_via(7, ip4);
     let oct = v6.octets();
-    assert_eq!(&oct[0..8], &[0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0, 0x0b, 0x1a]);
+    assert_eq!(
+        &oct[0..8],
+        &[0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0, 0x0b, 0x1a]
+    );
     assert_eq!(&oct[8..12], &7u32.to_be_bytes());
     assert_eq!(&oct[12..16], &[192, 168, 1, 2]);
 }

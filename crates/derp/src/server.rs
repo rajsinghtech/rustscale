@@ -108,12 +108,10 @@ impl ServerShared {
         let clients = self.clients.lock().await;
         for (key, entry) in clients.iter() {
             if key != gone_key {
-                let _ = entry
-                    .tx
-                    .try_send(Outbound::PeerGone {
-                        peer: gone_key.clone(),
-                        reason,
-                    });
+                let _ = entry.tx.try_send(Outbound::PeerGone {
+                    peer: gone_key.clone(),
+                    reason,
+                });
             }
         }
     }
@@ -229,9 +227,7 @@ async fn handle_connection(shared: Arc<ServerShared>, stream: TcpStream) {
         .lines()
         .take(1)
         .any(|l| l.contains("GET /derp") && l.contains("HTTP/1.1"))
-        && request
-            .to_ascii_lowercase()
-            .contains("upgrade: derp");
+        && request.to_ascii_lowercase().contains("upgrade: derp");
 
     if !is_derp_upgrade {
         let resp = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
@@ -243,14 +239,13 @@ async fn handle_connection(shared: Arc<ServerShared>, stream: TcpStream) {
 
     // Preserve any bytes read past the HTTP headers as leftover for the
     // DERP frame parser.
-    let header_end = request
-        .find("\r\n\r\n")
-        .map_or(total, |p| p + 4);
+    let header_end = request.find("\r\n\r\n").map_or(total, |p| p + 4);
     let leftover = buf[header_end..total].to_vec();
 
     // If no fast-start, send HTTP 101 response.
     if !has_fast_start {
-        let resp = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: DERP\r\nConnection: Upgrade\r\n\r\n";
+        let resp =
+            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: DERP\r\nConnection: Upgrade\r\n\r\n";
         if write_half.write_all(resp).await.is_err() {
             return;
         }
@@ -600,10 +595,7 @@ async fn handle_ping(
 }
 
 /// The per-client send loop: drains the outbound channel and writes frames.
-async fn send_loop(
-    mut writer: tokio::io::WriteHalf<TcpStream>,
-    rx: &mut mpsc::Receiver<Outbound>,
-) {
+async fn send_loop(mut writer: tokio::io::WriteHalf<TcpStream>, rx: &mut mpsc::Receiver<Outbound>) {
     while let Some(msg) = rx.recv().await {
         let result = match msg {
             Outbound::RecvPacket { src, data } => {
@@ -618,9 +610,7 @@ async fn send_loop(
                 body.push(reason);
                 write_frame_async(&mut writer, frame_type::PEER_GONE, &body).await
             }
-            Outbound::Pong(data) => {
-                write_frame_async(&mut writer, frame_type::PONG, &data).await
-            }
+            Outbound::Pong(data) => write_frame_async(&mut writer, frame_type::PONG, &data).await,
             Outbound::KeepAlive => {
                 write_frame_async(&mut writer, frame_type::KEEP_ALIVE, &[]).await
             }
@@ -676,10 +666,7 @@ mod tests {
     use rustscale_key::NodePrivate;
 
     /// Wait for a client to receive a specific message type, with a timeout.
-    async fn recv_with_timeout(
-        client: &mut DerpClient,
-        timeout: std::time::Duration,
-    ) -> Received {
+    async fn recv_with_timeout(client: &mut DerpClient, timeout: std::time::Duration) -> Received {
         tokio::time::timeout(timeout, client.recv())
             .await
             .expect("recv timeout")
@@ -721,7 +708,10 @@ mod tests {
 
         // A sends to B
         let msg_a_to_b = b"hello from A";
-        client_a.send_packet(pub_b.clone(), msg_a_to_b).await.unwrap();
+        client_a
+            .send_packet(pub_b.clone(), msg_a_to_b)
+            .await
+            .unwrap();
 
         // B receives
         let received = recv_with_timeout(&mut client_b, std::time::Duration::from_secs(5)).await;
@@ -828,8 +818,7 @@ mod tests {
         // A should receive a PeerGone for B.
         // We need to poll with a longer timeout since disconnect detection
         // takes a moment.
-        let received =
-            recv_with_timeout(&mut client_a, std::time::Duration::from_secs(10)).await;
+        let received = recv_with_timeout(&mut client_a, std::time::Duration::from_secs(10)).await;
         match received {
             Received::PeerGone { peer, reason } => {
                 assert_eq!(peer, pub_b);
@@ -903,11 +892,8 @@ mod tests {
 
         // client1 should have been disconnected (its read should fail or
         // return EOF). We verify by attempting a recv with a short timeout.
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            client1.recv(),
-        )
-        .await;
+        let result =
+            tokio::time::timeout(std::time::Duration::from_millis(500), client1.recv()).await;
         assert!(
             result.is_err() || result.unwrap().is_err(),
             "client1 should have been disconnected"
@@ -929,7 +915,8 @@ mod tests {
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
         let (reader, mut writer) = tokio::io::split(tcp);
 
-        let req = "GET /derp HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: DERP\r\nConnection: Upgrade\r\n\r\n";
+        let req =
+            "GET /derp HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: DERP\r\nConnection: Upgrade\r\n\r\n";
         writer.write_all(req.as_bytes()).await.unwrap();
         writer.flush().await.unwrap();
 

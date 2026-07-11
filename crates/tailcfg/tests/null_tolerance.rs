@@ -11,12 +11,12 @@
 //! `null`, then asserts deserialization succeeds. This catches any future
 //! field added without null tolerance.
 
+use rustscale_key::{DiscoPrivate, MachinePrivate, NodePrivate};
 use rustscale_tailcfg::{
-    CapGrant, DNSConfig, DERPMap, DERPNode, DERPRegion, FilterRule, Hostinfo, Location, Login,
+    CapGrant, DERPMap, DERPNode, DERPRegion, DNSConfig, FilterRule, Hostinfo, Location, Login,
     MapResponse, NetInfo, NetPortRange, Node, PortRange, RegisterResponse, Resolver, Service,
     TPMInfo, User, UserProfile,
 };
-use rustscale_key::{DiscoPrivate, MachinePrivate, NodePrivate};
 use serde::de::DeserializeOwned;
 use std::collections::BTreeMap;
 
@@ -387,6 +387,9 @@ fn sample_map_response() -> MapResponse {
             ("base".to_string(), Some(vec![sample_filter_rule()])),
             ("*".to_string(), None),
         ])),
+        NodeKeyExpired: false,
+        ControlTime: None,
+        CollectServices: rustscale_tailcfg::OptBool::Unset,
     }
 }
 
@@ -658,11 +661,11 @@ fn realistic_map_response_fixture_with_nulls() {
         dns.FallbackResolvers.is_empty(),
         "null FallbackResolvers -> empty vec"
     );
-    assert!(dns.ExtraRecords.is_empty(), "null ExtraRecords -> empty vec");
     assert!(
-        dns.Nameservers.is_empty(),
-        "null Nameservers -> empty vec"
+        dns.ExtraRecords.is_empty(),
+        "null ExtraRecords -> empty vec"
     );
+    assert!(dns.Nameservers.is_empty(), "null Nameservers -> empty vec");
 
     let sin = resp.DERPMap.as_ref().unwrap().Regions.get(&9).unwrap();
     assert!(sin.Nodes.is_none(), "null Nodes -> None");

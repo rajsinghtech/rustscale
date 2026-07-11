@@ -300,9 +300,7 @@ fn os_version() -> String {
 
 #[cfg(target_os = "linux")]
 fn uname() -> Result<String, std::io::Error> {
-    let out = std::process::Command::new("uname")
-        .arg("-r")
-        .output()?;
+    let out = std::process::Command::new("uname").arg("-r").output()?;
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
     } else {
@@ -408,10 +406,7 @@ pub fn distro_info_from_map(
     os_release_map: &HashMap<String, String>,
     debian_version_content: Option<&str>,
 ) -> (String, String, String) {
-    let distro = os_release_map
-        .get("ID")
-        .cloned()
-        .unwrap_or_default();
+    let distro = os_release_map.get("ID").cloned().unwrap_or_default();
     let mut version = os_release_map
         .get("VERSION_ID")
         .cloned()
@@ -776,11 +771,7 @@ fn cloud_detection() -> &'static str {
 /// Pure helper: determine the cloud provider from DMI metadata values.
 /// Takes the file contents as params for testability.
 #[allow(dead_code)]
-pub fn cloud_from_dmi(
-    bios_vendor: &str,
-    sys_vendor: &str,
-    product_name: &str,
-) -> &'static str {
+pub fn cloud_from_dmi(bios_vendor: &str, sys_vendor: &str, product_name: &str) -> &'static str {
     if bios_vendor == "Amazon EC2" || bios_vendor.ends_with(".amazon") {
         return cloud::AWS;
     }
@@ -981,9 +972,7 @@ pub fn is_v86_device_model(device_model: &str) -> bool {
 
 /// Returns the Rust compiler version, analogous to Go's `runtime.Version()`.
 fn rustc_version() -> String {
-    option_env!("RUSTC_VERSION")
-        .unwrap_or("rust")
-        .to_string()
+    option_env!("RUSTC_VERSION").unwrap_or("rust").to_string()
 }
 
 #[cfg(test)]
@@ -1005,9 +994,18 @@ VERSION_CODENAME=jammy
 "#;
         let m = parse_os_release_content(content);
         assert_eq!(m.get("ID").map(std::string::String::as_str), Some("ubuntu"));
-        assert_eq!(m.get("VERSION_ID").map(std::string::String::as_str), Some("22.04"));
-        assert_eq!(m.get("VERSION_CODENAME").map(std::string::String::as_str), Some("jammy"));
-        assert_eq!(m.get("NAME").map(std::string::String::as_str), Some("Ubuntu"));
+        assert_eq!(
+            m.get("VERSION_ID").map(std::string::String::as_str),
+            Some("22.04")
+        );
+        assert_eq!(
+            m.get("VERSION_CODENAME").map(std::string::String::as_str),
+            Some("jammy")
+        );
+        assert_eq!(
+            m.get("NAME").map(std::string::String::as_str),
+            Some("Ubuntu")
+        );
     }
 
     #[test]
@@ -1024,7 +1022,10 @@ VERSION_CODENAME=jammy
 VERSION_ID='11'"#;
         let m = parse_os_release_content(content);
         assert_eq!(m.get("ID").map(std::string::String::as_str), Some("debian"));
-        assert_eq!(m.get("VERSION_ID").map(std::string::String::as_str), Some("11"));
+        assert_eq!(
+            m.get("VERSION_ID").map(std::string::String::as_str),
+            Some("11")
+        );
     }
 
     #[test]
@@ -1098,8 +1099,7 @@ VERSION_ID='11'"#;
 
     #[test]
     fn test_container_in_mounts_lxcfs() {
-        let content =
-            "lxcfs /proc/cpuinfo fuse.lxcfs rw,nosuid,nodev,relatime 0 0";
+        let content = "lxcfs /proc/cpuinfo fuse.lxcfs rw,nosuid,nodev,relatime 0 0";
         assert!(container_in_mounts(content));
     }
 
@@ -1242,8 +1242,7 @@ VERSION_ID='11'"#;
 
     #[test]
     fn test_desktop_from_unix_socks_x11() {
-        let content =
-            "000000000000000: 00000003 stream\n  /tmp/.X11-unix/X0";
+        let content = "000000000000000: 00000003 stream\n  /tmp/.X11-unix/X0";
         assert!(desktop_from_unix_socks(content));
     }
 
@@ -1270,7 +1269,10 @@ VERSION_ID='11'"#;
 
     #[test]
     fn test_cloud_from_dmi_azure() {
-        assert_eq!(cloud_from_dmi("Microsoft Corporation", "", ""), cloud::AZURE);
+        assert_eq!(
+            cloud_from_dmi("Microsoft Corporation", "", ""),
+            cloud::AZURE
+        );
     }
 
     #[test]
@@ -1285,7 +1287,10 @@ VERSION_ID='11'"#;
 
     #[test]
     fn test_cloud_from_dmi_unknown() {
-        assert_eq!(cloud_from_dmi("Unknown", "GenericVendor", "GenericProduct"), "");
+        assert_eq!(
+            cloud_from_dmi("Unknown", "GenericVendor", "GenericProduct"),
+            ""
+        );
     }
 
     #[test]
@@ -1305,7 +1310,8 @@ VERSION_ID='11'"#;
 
     #[test]
     fn test_etc_apt_source_disabled_comment_only() {
-        let content = "# disabled on upgrade\n# deb https://pkgs.tailscale.com/stable/ubuntu jammy main\n";
+        let content =
+            "# disabled on upgrade\n# deb https://pkgs.tailscale.com/stable/ubuntu jammy main\n";
         assert!(etc_apt_source_file_is_disabled(content));
     }
 
@@ -1317,7 +1323,8 @@ VERSION_ID='11'"#;
 
     #[test]
     fn test_etc_apt_source_not_disabled_active_content() {
-        let content = "# disabled on upgrade\ndeb https://pkgs.tailscale.com/stable/ubuntu jammy main\n";
+        let content =
+            "# disabled on upgrade\ndeb https://pkgs.tailscale.com/stable/ubuntu jammy main\n";
         assert!(!etc_apt_source_file_is_disabled(content));
     }
 
@@ -1470,8 +1477,7 @@ VERSION_ID='11'"#;
         // Register a hook that adds a unique tag to RequestTags.
         register_hostinfo_hook(|hi| {
             if hi.Hostname == "hook-collect-host" {
-                hi.RequestTags
-                    .push("tag:hook-collect-marker".to_string());
+                hi.RequestTags.push("tag:hook-collect-marker".to_string());
             }
         });
         let base = Hostinfo {
@@ -1482,10 +1488,9 @@ VERSION_ID='11'"#;
         let ov = HostinfoOverrides::default();
         let hi = collect_hostinfo(base, &ov, None, false);
         // Our hook should have added the unique tag.
-        assert!(
-            hi.RequestTags
-                .contains(&"tag:hook-collect-marker".to_string())
-        );
+        assert!(hi
+            .RequestTags
+            .contains(&"tag:hook-collect-marker".to_string()));
     }
 
     #[test]
@@ -1517,10 +1522,7 @@ VERSION_ID='11'"#;
         // If hooks ran in registration order, PushDeviceToken == m1 and
         // DeviceModel == m2. If hook-2 ran before hook-1, DeviceModel
         // would NOT be m2.
-        assert_eq!(
-            hi.DeviceModel, m2,
-            "hooks should run in registration order"
-        );
+        assert_eq!(hi.DeviceModel, m2, "hooks should run in registration order");
     }
 
     // ─── Cache returns same value tests ───────────────────────────────
@@ -1562,7 +1564,11 @@ VERSION_ID='11'"#;
         let v2 = cached_detection(&CELL, detect);
         assert_eq!(v1, 42);
         assert_eq!(v2, 42);
-        assert_eq!(*CALL_COUNT.lock().unwrap(), 1, "detect should run only once");
+        assert_eq!(
+            *CALL_COUNT.lock().unwrap(),
+            1,
+            "detect should run only once"
+        );
     }
 
     // ─── Existing tests (preserved) ───────────────────────────────────
@@ -1698,7 +1704,10 @@ VERSION_ID='11'"#;
         let mut hi = Hostinfo::default();
         let empty: StableNodeID = String::new();
         apply_runtime_fields(&mut hi, Some(&empty), false);
-        assert!(hi.ExitNodeID.is_empty(), "empty StableNodeID should not be set");
+        assert!(
+            hi.ExitNodeID.is_empty(),
+            "empty StableNodeID should not be set"
+        );
     }
 
     // ─── Content-hash dedup tests ─────────────────────────────────────

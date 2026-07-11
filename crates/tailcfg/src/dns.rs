@@ -42,7 +42,11 @@ where
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Resolver {
     /// Resolver address: a plain IP, `IP:port`, or a DoH URL.
-    #[serde(default, skip_serializing_if = "skip_default", deserialize_with = "deserialize_null_to_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub Addr: String,
 }
 
@@ -90,7 +94,11 @@ pub struct DNSConfig {
     )]
     pub Domains: Vec<String>,
     /// Whether MagicDNS (peer-name resolution from the netmap) is on.
-    #[serde(default, skip_serializing_if = "skip_default", deserialize_with = "deserialize_null_to_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub Proxied: bool,
     /// DNS names for which control assists with LE cert provisioning. A
     /// non-empty list signals the tailnet has HTTPS enabled.
@@ -124,7 +132,11 @@ pub struct DNSRecord {
     #[serde(default, deserialize_with = "deserialize_null_to_default")]
     pub Name: String,
     /// DNS record type; empty means A or AAAA depending on `Value`.
-    #[serde(default, skip_serializing_if = "skip_default", deserialize_with = "deserialize_null_to_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     #[allow(non_snake_case)]
     pub Type: String,
     /// IP address in string form.
@@ -176,7 +188,11 @@ pub struct UserProfile {
     #[serde(default, deserialize_with = "deserialize_null_to_default")]
     pub DisplayName: String,
     /// Profile picture URL.
-    #[serde(default, skip_serializing_if = "skip_default", deserialize_with = "deserialize_null_to_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub ProfilePicURL: String,
 }
 

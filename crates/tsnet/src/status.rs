@@ -36,6 +36,9 @@ pub struct ServerStatus {
     pub packet_drops: u64,
     /// Active health warnings (id, severity, text, since).
     pub health: Vec<Warning>,
+    /// Whether the control server has signalled that our node key has
+    /// expired. When true the client is in a "NeedsLogin" state.
+    pub key_expired: bool,
 }
 
 /// Identity of the peer owning a tailnet IP, returned by [`Server::whois`].

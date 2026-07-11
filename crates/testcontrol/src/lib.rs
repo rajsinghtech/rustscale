@@ -29,12 +29,10 @@ use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
 use rustscale_controlclient::controlbase::{server_handshake, NoiseIo};
-use rustscale_key::{
-    DiscoPrivate, MachinePrivate, MachinePublic, NodePrivate, NodePublic,
-};
+use rustscale_key::{DiscoPrivate, MachinePrivate, MachinePublic, NodePrivate, NodePublic};
 use rustscale_tailcfg::{
-    filter_allow_all, DNSConfig, DERPMap, FilterRule, Login, MapRequest, MapResponse,
-    Node, NodeCapMap, NodeID, RegisterRequest, RegisterResponse, User, UserProfile,
+    filter_allow_all, DERPMap, DNSConfig, FilterRule, Login, MapRequest, MapResponse, Node,
+    NodeCapMap, NodeID, RegisterRequest, RegisterResponse, User, UserProfile,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -154,7 +152,7 @@ impl Server {
     /// All nodes, sorted by StableID (matching Go's `AllNodes`).
     pub fn all_nodes(&self) -> Vec<Node> {
         let mut nodes: Vec<Node> = self.inner.lock().unwrap().nodes.values().cloned().collect();
-    nodes.sort_by(|a, b| a.StableID.cmp(&b.StableID));
+        nodes.sort_by(|a, b| a.StableID.cmp(&b.StableID));
         nodes
     }
 
@@ -270,11 +268,9 @@ impl Server {
             if std::time::Instant::now() >= deadline {
                 return Err("timeout waiting for node in map request".into());
             }
-            let _ = tokio::time::timeout(
-                std::time::Duration::from_millis(50),
-                self.notify.notified(),
-            )
-            .await;
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_millis(50), self.notify.notified())
+                    .await;
         }
     }
 
@@ -289,11 +285,7 @@ impl Server {
 // -----------------------------------------------------------------
 
 /// Main accept loop: spawns a task per connection.
-async fn accept_loop(
-    listener: TcpListener,
-    inner: Arc<Mutex<ServerInner>>,
-    notify: Arc<Notify>,
-) {
+async fn accept_loop(listener: TcpListener, inner: Arc<Mutex<ServerInner>>, notify: Arc<Notify>) {
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
@@ -385,7 +377,8 @@ async fn serve_key(
     } else {
         noise_pub.to_string()
     };
-    let resp = format!(
+    let resp =
+        format!(
         "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         if has_v { "application/json" } else { "text/plain" },
         body.len(),
@@ -402,13 +395,17 @@ async fn serve_noise_upgrade(
     notify: Arc<Notify>,
 ) {
     // Extract the base64-encoded Noise initiation from the header.
-    let init_b64 = if let Some(v) = headers.get("x-tailscale-handshake") { v } else {
+    let init_b64 = if let Some(v) = headers.get("x-tailscale-handshake") {
+        v
+    } else {
         let _ = stream
             .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
             .await;
         return;
     };
-    let init_bytes = if let Ok(b) = base64::engine::general_purpose::STANDARD.decode(init_b64) { b } else {
+    let init_bytes = if let Ok(b) = base64::engine::general_purpose::STANDARD.decode(init_b64) {
+        b
+    } else {
         let _ = stream
             .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
             .await;
@@ -423,7 +420,9 @@ async fn serve_noise_upgrade(
     let mut resp_buf: Vec<u8> = Vec::new();
     let conn = {
         let mut empty = std::io::empty();
-        if let Ok(c) = server_handshake(&mut empty, &mut resp_buf, &noise_priv, Some(&init_bytes)) { c } else {
+        if let Ok(c) = server_handshake(&mut empty, &mut resp_buf, &noise_priv, Some(&init_bytes)) {
+            c
+        } else {
             let _ = stream
                 .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
                 .await;
@@ -508,10 +507,7 @@ async fn handle_h2_request(
     notify: &Arc<Notify>,
 ) -> Result<(), ()> {
     if method != "POST" {
-        let resp = http::Response::builder()
-            .status(400)
-            .body(())
-            .unwrap();
+        let resp = http::Response::builder().status(400).body(()).unwrap();
         let _ = respond.send_response(resp, true);
         return Ok(());
     }
@@ -536,17 +532,11 @@ async fn handle_h2_request(
         "/machine/update-health" => {
             // Drain body, respond 204.
             while req_body.data().await.is_some() {}
-            let resp = http::Response::builder()
-                .status(204)
-                .body(())
-                .unwrap();
+            let resp = http::Response::builder().status(204).body(()).unwrap();
             let _ = respond.send_response(resp, true);
         }
         _ => {
-            let resp = http::Response::builder()
-                .status(404)
-                .body(())
-                .unwrap();
+            let resp = http::Response::builder().status(404).body(()).unwrap();
             let _ = respond.send_response(resp, true);
         }
     }
@@ -658,7 +648,9 @@ fn get_or_create_user(inner: &mut ServerInner, nk: &NodePublic) -> (User, Login)
         ProfilePicURL: String::new(),
         Created: None,
     };
-    inner.users.insert(nk.clone(), (user.clone(), login.clone()));
+    inner
+        .users
+        .insert(nk.clone(), (user.clone(), login.clone()));
     (user, login)
 }
 
@@ -675,11 +667,10 @@ async fn serve_map(
     notify: &Arc<Notify>,
     mut respond: h2::server::SendResponse<bytes::Bytes>,
 ) {
-    let req: MapRequest = if let Ok(r) = serde_json::from_slice(body) { r } else {
-        let resp = http::Response::builder()
-            .status(400)
-            .body(())
-            .unwrap();
+    let req: MapRequest = if let Ok(r) = serde_json::from_slice(body) {
+        r
+    } else {
+        let resp = http::Response::builder().status(400).body(()).unwrap();
         let _ = respond.send_response(resp, true);
         return;
     };
@@ -690,19 +681,15 @@ async fn serve_map(
     // Validate the node and update its state.
     {
         let mut inner = inner.lock().unwrap();
-        let node = if let Some(n) = inner.nodes.get(&nk) { n.clone() } else {
-            let resp = http::Response::builder()
-                .status(400)
-                .body(())
-                .unwrap();
+        let node = if let Some(n) = inner.nodes.get(&nk) {
+            n.clone()
+        } else {
+            let resp = http::Response::builder().status(400).body(()).unwrap();
             let _ = respond.send_response(resp, true);
             return;
         };
         if node.Machine != *peer_machine_key {
-            let resp = http::Response::builder()
-                .status(400)
-                .body(())
-                .unwrap();
+            let resp = http::Response::builder().status(400).body(()).unwrap();
             let _ = respond.send_response(resp, true);
             return;
         }
@@ -739,7 +726,9 @@ async fn serve_map(
         .header("content-type", "application/json")
         .body(())
         .unwrap();
-    let mut send_stream = if let Ok(s) = respond.send_response(resp, false) { s } else {
+    let mut send_stream = if let Ok(s) = respond.send_response(resp, false) {
+        s
+    } else {
         if streaming {
             cleanup_map_registration(inner, node_id, notify);
         }
@@ -813,7 +802,11 @@ async fn serve_map(
 }
 
 /// Remove the update channel and decrement in_serve_map.
-fn cleanup_map_registration(inner: &Arc<Mutex<ServerInner>>, node_id: NodeID, notify: &Arc<Notify>) {
+fn cleanup_map_registration(
+    inner: &Arc<Mutex<ServerInner>>,
+    node_id: NodeID,
+    notify: &Arc<Notify>,
+) {
     {
         let mut g = inner.lock().unwrap();
         g.updates.remove(&node_id);
@@ -839,9 +832,7 @@ fn take_injected_message(inner: &Arc<Mutex<ServerInner>>, nk: &NodePublic) -> Op
 /// Whether the node has pending injected messages.
 fn has_pending_injection(inner: &Arc<Mutex<ServerInner>>, nk: &NodePublic) -> bool {
     let g = inner.lock().unwrap();
-    g.msg_to_send
-        .get(nk)
-        .is_some_and(|q| !q.is_empty())
+    g.msg_to_send.get(nk).is_some_and(|q| !q.is_empty())
 }
 
 /// Whether automatic map responses are allowed for this node.
@@ -871,12 +862,7 @@ fn build_map_response(
     }
 
     // Build peers list (all nodes except self).
-    let mut peers: Vec<Node> = g
-        .nodes
-        .values()
-        .filter(|p| p.Key != *nk)
-        .cloned()
-        .collect();
+    let mut peers: Vec<Node> = g.nodes.values().filter(|p| p.Key != *nk).cloned().collect();
     peers.sort_by(|a, b| a.ID.cmp(&b.ID));
 
     // Build user profiles.

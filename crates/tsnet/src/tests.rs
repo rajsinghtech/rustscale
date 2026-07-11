@@ -98,6 +98,7 @@ fn health_warning_appears_in_status() {
         hostname: "test".into(),
         packet_drops: 0,
         health: warnings,
+        key_expired: false,
     };
 
     assert_eq!(status.health.len(), 2);
@@ -3248,11 +3249,11 @@ fn require_tun_interop(test_name: &str) -> Option<InteropEnv> {
 /// on success; returns None and logs a skip message on failure.
 async fn up_tun_or_skip(server: &mut Server, test_name: &str) -> Option<()> {
     match Box::pin(server.up_tun(TunModeConfig {
-            tun: rustscale_tun::TunConfig::default(),
-            apply_routes: true,
-            exit_node: None,
-        }))
-        .await
+        tun: rustscale_tun::TunConfig::default(),
+        apply_routes: true,
+        exit_node: None,
+    }))
+    .await
     {
         Ok(()) => Some(()),
         Err(e) => {

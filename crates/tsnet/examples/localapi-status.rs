@@ -15,16 +15,14 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
 fn main() {
-    let socket_path: PathBuf = env::args()
-        .nth(1)
-        .map_or_else(
-            || {
-                let state_dir = env::var("RUSTSCALE_STATE_DIR")
-                    .unwrap_or_else(|_| "/tmp/rustscale".into());
-                PathBuf::from(state_dir).join("rustscale.sock")
-            },
-            PathBuf::from,
-        );
+    let socket_path: PathBuf = env::args().nth(1).map_or_else(
+        || {
+            let state_dir =
+                env::var("RUSTSCALE_STATE_DIR").unwrap_or_else(|_| "/tmp/rustscale".into());
+            PathBuf::from(state_dir).join("rustscale.sock")
+        },
+        PathBuf::from,
+    );
 
     if !socket_path.exists() {
         eprintln!("error: socket not found at {}", socket_path.display());
@@ -40,7 +38,8 @@ fn main() {
         }
     };
 
-    let request = "GET /localapi/v0/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    let request =
+        "GET /localapi/v0/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
     if let Err(e) = stream.write_all(request.as_bytes()) {
         eprintln!("error: write failed: {e}");
         std::process::exit(1);

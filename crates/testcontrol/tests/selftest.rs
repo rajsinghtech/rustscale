@@ -54,11 +54,18 @@ async fn testcontrol_full_flow() {
     );
 
     // 5. Verify the node registered with testcontrol.
-    assert_eq!(tc.num_nodes(), 1, "testcontrol should have 1 registered node");
+    assert_eq!(
+        tc.num_nodes(),
+        1,
+        "testcontrol should have 1 registered node"
+    );
 
     // 6. Wait for the streaming map poll to be active.
     let node_key = tc.all_nodes()[0].Key.clone();
-    eprintln!("waiting for node {:?} to enter streaming map poll...", node_key);
+    eprintln!(
+        "waiting for node {:?} to enter streaming map poll...",
+        node_key
+    );
     tc.await_node_in_map_request(&node_key, Duration::from_secs(30))
         .await
         .expect("node should enter streaming map poll within 30s");

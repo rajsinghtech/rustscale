@@ -181,9 +181,7 @@ impl C2NServer {
             let backend = self.backend.clone();
             let log_id = self.log_id.clone();
             tokio::spawn(async move {
-                if let Err(e) =
-                    handle_connection(&mut stream, peer_addr, &backend, &log_id).await
-                {
+                if let Err(e) = handle_connection(&mut stream, peer_addr, &backend, &log_id).await {
                     eprintln!("c2n[{log_id}]: connection error: {e}");
                 }
             });
@@ -503,13 +501,7 @@ async fn dispatch<W: AsyncWrite + Unpin>(
 
     // --- POST /sockstats → 200 minimal ---
     if method == "POST" && path == "/sockstats" {
-        write_text_response(
-            conn,
-            200,
-            "OK",
-            "sockstats: no sockstat logger wired up\n",
-        )
-        .await?;
+        write_text_response(conn, 200, "OK", "sockstats: no sockstat logger wired up\n").await?;
         return Ok(());
     }
 
@@ -544,9 +536,7 @@ async fn dispatch<W: AsyncWrite + Unpin>(
             // Negative: already expired (1 ns before now)
             now - std::time::Duration::from_nanos(1)
         };
-        let result = backend
-            .set_component_debug_logging(component, until)
-            .await;
+        let result = backend.set_component_debug_logging(component, until).await;
         let resp = match result {
             Ok(()) => serde_json::json!({}),
             Err(e) => serde_json::json!({"error": e}),
@@ -607,9 +597,7 @@ async fn dispatch<W: AsyncWrite + Unpin>(
     }
 
     // --- GET/POST /debug/netmap (and alias /netmap) ---
-    if (method == "GET" || method == "POST")
-        && (path == "/debug/netmap" || path == "/netmap")
-    {
+    if (method == "GET" || method == "POST") && (path == "/debug/netmap" || path == "/netmap") {
         let omit_fields = if method == "POST" {
             serde_json::from_slice::<NetmapOmitRequest>(&req.body)
                 .map(|r| r.OmitFields)
@@ -771,7 +759,10 @@ mod tests {
 
     #[test]
     fn test_parse_omit_fields() {
-        assert_eq!(parse_omit_fields("omit_fields=Peers,Node"), vec!["Peers", "Node"]);
+        assert_eq!(
+            parse_omit_fields("omit_fields=Peers,Node"),
+            vec!["Peers", "Node"]
+        );
         assert!(parse_omit_fields("").is_empty());
         assert!(parse_omit_fields("other=foo").is_empty());
     }

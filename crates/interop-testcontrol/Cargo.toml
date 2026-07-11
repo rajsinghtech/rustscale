@@ -1,0 +1,22 @@
+[package]
+name = "rustscale-interop-testcontrol"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+rustscale-tsnet = { path = "../tsnet" }
+rustscale-tailcfg = { path = "../tailcfg" }
+rustscale-key = { path = "../key" }
+rustscale-magicsock = { path = "../magicsock" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+webpki-roots = { workspace = true }
+
+[lints]
+workspace = true

@@ -254,11 +254,12 @@ impl DerpManager {
             );
         }
 
-        let client = match DerpClient::connect_with_upgrade_dial(
+        let client = match DerpClient::connect_with_upgrade_dial_insecure(
             &dial_addr,
             &tls_host,
             port,
             true,
+            node.InsecureForTests,
             self.node_private.clone(),
         )
         .await

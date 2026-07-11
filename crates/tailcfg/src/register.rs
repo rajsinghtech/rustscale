@@ -22,10 +22,18 @@ pub struct RegisterRequest {
     #[serde(default, deserialize_with = "deserialize_null_to_default")]
     pub OldNodeKey: NodePublic,
     /// Authentication information returned by a prior registration.
-    #[serde(default, skip_serializing_if = "skip_default", deserialize_with = "deserialize_null_to_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub Auth: Option<RegisterResponseAuth>,
     /// Requested key expiry (server policy may override).
-    #[serde(default, skip_serializing_if = "skip_default", deserialize_with = "deserialize_null_to_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub Expiry: Option<DateTime<Utc>>,
     /// If set, the response waits until the auth URL is visited.
     #[serde(default, deserialize_with = "deserialize_null_to_default")]
@@ -34,10 +42,18 @@ pub struct RegisterRequest {
     #[serde(default)]
     pub Hostinfo: Option<Hostinfo>,
     /// Whether the node is ephemeral (auto-deleted when inactive).
-    #[serde(default, skip_serializing_if = "skip_default", deserialize_with = "deserialize_null_to_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub Ephemeral: bool,
     /// Optional recommended/required tailnet identifier.
-    #[serde(default, skip_serializing_if = "skip_default", deserialize_with = "deserialize_null_to_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub Tailnet: String,
 }
 
@@ -70,7 +86,11 @@ pub struct RegisterResponse {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegisterResponseAuth {
     /// An auth key (the deprecated Android OAuth2 token path is omitted).
-    #[serde(default, skip_serializing_if = "skip_default", deserialize_with = "deserialize_null_to_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub AuthKey: String,
 }
 
@@ -84,10 +104,18 @@ pub struct User {
     #[serde(default, deserialize_with = "deserialize_null_to_default")]
     pub DisplayName: String,
     /// Profile picture URL.
-    #[serde(default, skip_serializing_if = "skip_default", deserialize_with = "deserialize_null_to_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub ProfilePicURL: String,
     /// When the user was created.
-    #[serde(default, skip_serializing_if = "skip_default", deserialize_with = "deserialize_null_to_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub Created: Option<DateTime<Utc>>,
 }
 
@@ -107,7 +135,11 @@ pub struct Login {
     #[serde(default, deserialize_with = "deserialize_null_to_default")]
     pub DisplayName: String,
     /// Profile picture URL from the IdP.
-    #[serde(default, skip_serializing_if = "skip_default", deserialize_with = "deserialize_null_to_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub ProfilePicURL: String,
 }
 

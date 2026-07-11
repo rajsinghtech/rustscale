@@ -4,11 +4,7 @@
 //! `if_addrs` crate. Falls back to defaults (index 0, MTU 0, flags 0, no
 //! MAC) on platforms where the syscalls are unavailable or fail.
 
-#![allow(
-    clippy::cast_ptr_alignment,
-    clippy::borrow_as_ptr,
-    clippy::ptr_as_ptr
-)]
+#![allow(clippy::cast_ptr_alignment, clippy::borrow_as_ptr, clippy::ptr_as_ptr)]
 
 use std::collections::HashMap;
 
@@ -81,11 +77,7 @@ fn gather_interface_details_impl() -> HashMap<String, InterfaceDetails> {
                         if nlen + 6 <= sdl.sdl_data.len() {
                             let mut mac = [0u8; 6];
                             let data_ptr = sdl.sdl_data.as_ptr().cast::<u8>();
-                            std::ptr::copy_nonoverlapping(
-                                data_ptr.add(nlen),
-                                mac.as_mut_ptr(),
-                                6,
-                            );
+                            std::ptr::copy_nonoverlapping(data_ptr.add(nlen), mac.as_mut_ptr(), 6);
                             entry.hw_addr = Some(mac);
                         }
                     }

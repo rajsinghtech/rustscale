@@ -1351,6 +1351,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustscale-interop-testcontrol"
+version = "0.1.0"
+dependencies = [
+ "rustls",
+ "rustscale-key",
+ "rustscale-magicsock",
+ "rustscale-tailcfg",
+ "rustscale-tsnet",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-rustls",
+ "webpki-roots 0.26.11",
+]
+
+[[package]]
 name = "rustscale-key"
 version = "0.1.0"
 dependencies = [
@@ -1455,7 +1471,7 @@ dependencies = [
  "chrono",
  "h2",
  "http",
- "rand 0.8.6",
+ "rand",
  "rustscale-controlclient",
  "rustscale-key",
  "rustscale-tailcfg",

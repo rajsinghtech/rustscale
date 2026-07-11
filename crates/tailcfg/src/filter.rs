@@ -58,7 +58,11 @@ impl PortRange {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct NetPortRange {
     /// IP / CIDR / range / wildcard string.
-    #[serde(default, skip_serializing_if = "String::is_empty", deserialize_with = "deserialize_null_to_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "String::is_empty",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub IP: String,
     /// Deprecated CIDR-bits field. If non-null, the filter rejects it.
     #[serde(default, skip_serializing_if = "Option::is_none")]

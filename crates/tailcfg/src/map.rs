@@ -22,37 +22,73 @@ pub struct MapRequest {
     #[serde(default, deserialize_with = "deserialize_null_to_default")]
     pub Version: CapabilityVersion,
     /// Compression mode: `"zstd"` or `""`.
-    #[serde(default, skip_serializing_if = "skip_default", deserialize_with = "deserialize_null_to_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub Compress: String,
     /// Whether the server should send keep-alives back.
-    #[serde(default, skip_serializing_if = "skip_default", deserialize_with = "deserialize_null_to_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub KeepAlive: bool,
     /// The client's current node public key.
     #[serde(default, deserialize_with = "deserialize_null_to_default")]
     pub NodeKey: NodePublic,
     /// The client's disco public key (zero if unset, then default-filled).
-    #[serde(default, skip_serializing_if = "skip_zero_disco", deserialize_with = "deserialize_null_to_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_zero_disco",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub DiscoKey: DiscoPublic,
     /// magicsock UDP endpoints (IP:port). Ignored when `Stream` and Version>=68.
-    #[serde(default, skip_serializing_if = "skip_default", deserialize_with = "deserialize_null_to_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub Endpoints: Vec<String>,
     /// Types of the corresponding `Endpoints`, in order.
-    #[serde(default, skip_serializing_if = "skip_default", deserialize_with = "deserialize_null_to_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub EndpointTypes: Vec<crate::EndpointType>,
     /// Whether the client wants streamed MapResponses over one connection.
-    #[serde(default, skip_serializing_if = "skip_default", deserialize_with = "deserialize_null_to_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub Stream: bool,
     /// The client's current host info. `None` serializes as `null`.
     #[serde(default)]
     pub Hostinfo: Option<crate::Hostinfo>,
     /// Whether the client is okay with the peers list being omitted.
-    #[serde(default, skip_serializing_if = "skip_default", deserialize_with = "deserialize_null_to_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub OmitPeers: bool,
     /// Deprecated: always false as of Version 68.
-    #[serde(default, skip_serializing_if = "skip_default", deserialize_with = "deserialize_null_to_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub ReadOnly: bool,
     /// Debug/dev feature flags (no compatibility promise).
-    #[serde(default, skip_serializing_if = "skip_default", deserialize_with = "deserialize_null_to_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub DebugFlags: Vec<String>,
 }
 
@@ -61,19 +97,39 @@ pub struct MapRequest {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct MapResponse {
     /// Opaque handle for a stateful map session (first message only).
-    #[serde(default, skip_serializing_if = "skip_default", deserialize_with = "deserialize_null_to_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub MapSessionHandle: String,
     /// Sequence number within a named map session.
-    #[serde(default, skip_serializing_if = "skip_default", deserialize_with = "deserialize_null_to_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub Seq: i64,
     /// Empty keep-alive message; other fields are ignored when true.
-    #[serde(default, skip_serializing_if = "skip_default", deserialize_with = "deserialize_null_to_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub KeepAlive: bool,
     /// The node making the map request; `None` means unchanged.
-    #[serde(default, skip_serializing_if = "skip_default", deserialize_with = "deserialize_null_to_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub Node: Option<Node>,
     /// DERP servers available; `None` means unchanged.
-    #[serde(default, skip_serializing_if = "skip_default", deserialize_with = "deserialize_null_to_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub DERPMap: Option<DERPMap>,
     /// Complete peer list (first response); sorted by `Node.ID`.
     #[serde(
@@ -97,7 +153,11 @@ pub struct MapResponse {
     )]
     pub PeersRemoved: Vec<NodeID>,
     /// The tailnet domain name; empty means unchanged.
-    #[serde(default, skip_serializing_if = "skip_default", deserialize_with = "deserialize_null_to_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub Domain: String,
     /// DNS settings for the client. `None` means unchanged from a prior
     /// non-nil value. Carries MagicDNS config (`Proxied`), search domains,
@@ -121,6 +181,17 @@ pub struct MapResponse {
     /// empty = delete; `Some(vec)` = set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub PacketFilters: Option<BTreeMap<String, Option<Vec<FilterRule>>>>,
+    /// Whether the client's node key has expired. When true, the client
+    /// should transition to a "NeedsLogin" state; when false (un-expire),
+    /// it should recover. Matches Go's `MapResponse.NodeKeyExpired`.
+    #[serde(default, skip_serializing_if = "skip_default")]
+    pub NodeKeyExpired: bool,
+    /// ControlTime from the server (usually only in the first map response).
+    #[serde(default, skip_serializing_if = "skip_default")]
+    pub ControlTime: Option<chrono::DateTime<chrono::Utc>>,
+    /// Whether the server wants the client to collect and report services.
+    #[serde(default, skip_serializing_if = "crate::OptBool::is_unset")]
+    pub CollectServices: crate::OptBool,
 }
 
 #[cfg(test)]

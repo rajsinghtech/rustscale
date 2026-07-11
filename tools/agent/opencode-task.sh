@@ -118,7 +118,10 @@ is_busy() {
   curl -s --max-time 5 "$URL/session/status?directory=$DIR" | jq -e --arg s "$SID" 'has($s)' >/dev/null 2>&1 && echo 1 || echo 0
 }
 
-# 3. Watchdog loop.
+# 3. Watchdog loop. glm-5.2 occasionally emits an empty first turn (reasoning
+#    part only, no text/tool calls) and goes idle ~30s in; when that happens we
+#    re-prompt once with a short "proceed" nudge instead of failing the run.
+NUDGED=0
 START=$(date +%s); LAST=0; IDLE=0
 while :; do
   sleep 15
@@ -129,7 +132,24 @@ while :; do
     LAST="$COUNT"; IDLE=0
   fi
   if [[ "$BUSY" == "0" ]]; then
-    IDLE=$((IDLE+1)); [[ $IDLE -ge 2 ]] && break
+    IDLE=$((IDLE+1))
+    if [[ $IDLE -ge 2 ]]; then
+      # Idle: check whether we actually got assistant text before accepting.
+      FINAL=$(curl -s --max-time 10 "$URL/session/$SID/message?directory=$DIR" | jq -r '
+        [.[] | select(.info.role=="assistant")] | last
+        | if . == null then "" else [.parts[]? | select(.type=="text") | .text] | join("\n") end')
+      if [[ -z "$FINAL" && $NUDGED -eq 0 ]]; then
+        echo "[harness] empty first turn — re-prompting once" >&2
+        NUDGED=1; IDLE=0
+        curl -sfS --max-time 10 -o /dev/null -X POST "$URL/session/$SID/prompt_async?directory=$DIR" \
+          -H 'Content-Type: application/json' \
+          -d "$(jq -n --arg pid "$PROVIDER" --arg mid "$MODEL" \
+            '{model:{providerID:$pid,modelID:$mid},parts:[{type:"text",text:"Please proceed with the task described above."}]}')" \
+          || { echo "[harness] re-prompt failed" >&2; break; }
+        continue
+      fi
+      break
+    fi
   else
     IDLE=0
   fi

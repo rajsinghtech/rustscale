@@ -70,6 +70,11 @@ create_vm() {
     --metadata-from-file startup-script=/dev/stdin <<'STARTUP'
 #!/bin/bash
 set -ex
+# Ensure the hostname resolves before anything else. Debian/Ubuntu GCE images
+# do not add the instance hostname to /etc/hosts by default, so every sudo in
+# later SSH sessions stalls with "unable to resolve host" + DNS timeout.
+HN=$(hostname)
+grep -q "\b$HN\b" /etc/hosts || echo "127.0.1.1 $HN" >> /etc/hosts
 apt-get update -qq
 DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
   iperf3 tcpdump zstd sysstat procps jq curl python3 socat ncat git \

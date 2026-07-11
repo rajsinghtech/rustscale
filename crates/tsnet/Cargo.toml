@@ -13,6 +13,7 @@ workspace = true
 rustscale-key = { path = "../key", version = "0.1.0" }
 rustscale-tailcfg = { path = "../tailcfg", version = "0.1.0" }
 rustscale-controlclient = { path = "../controlclient", version = "0.1.0" }
+rustscale-controlknobs = { path = "../controlknobs", version = "0.1.0" }
 rustscale-magicsock = { path = "../magicsock", version = "0.1.0" }
 rustscale-derp = { path = "../derp", version = "0.1.0" }
 rustscale-netcheck = { path = "../netcheck", version = "0.1.0" }

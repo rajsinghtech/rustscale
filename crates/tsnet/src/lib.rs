@@ -62,7 +62,8 @@ use std::sync::Arc;
 
 use rustscale_controlclient::client::{ControlClient, RegisterError, StreamMapError};
 use rustscale_controlclient::controlhttp;
-use rustscale_controlclient::C2nRouter;
+use rustscale_controlclient::{extract_knobs_from_map_response, C2nRouter};
+use rustscale_controlknobs::ControlKnobs;
 use rustscale_derp::DerpClient;
 use rustscale_dns::{upstream_nameservers, DnsResponder, MagicDnsResolver, MAGICDNS_VIP};
 use rustscale_filter::Filter;
@@ -324,6 +325,8 @@ struct RunningState {
     c2n_router: Arc<C2nRouter>,
     /// C2N HTTP server address (loopback, bound on up()).
     c2n_addr: Option<SocketAddr>,
+    /// Control-plane feature flags extracted from netmap updates.
+    control_knobs: Arc<ControlKnobs>,
 }
 
 /// Which data plane is wired up: userspace netstack (tsnet listen/dial) or a
@@ -441,6 +444,8 @@ struct Bootstrap {
     health_watchdog: Watchdog,
     /// C2N request router (control-to-node handler dispatch).
     c2n_router: Arc<C2nRouter>,
+    /// Control-plane feature flags extracted from netmap updates.
+    control_knobs: Arc<ControlKnobs>,
 }
 
 /// An embedded Tailscale server.
@@ -481,6 +486,15 @@ impl Server {
     /// The C2N HTTP server address (loopback), if the server is up.
     pub fn c2n_addr(&self) -> Option<SocketAddr> {
         self.inner.as_ref().and_then(|i| i.c2n_addr)
+    }
+
+    /// The shared control-knobs store, if the server is up. Downstream
+    /// consumers can query feature flags pushed by the control plane via
+    /// [`ControlKnobs::get_bool`] / [`ControlKnobs::get_float`] /
+    /// [`ControlKnobs::get_string`], and register change callbacks via
+    /// [`ControlKnobs::on_change`].
+    pub fn control_knobs(&self) -> Option<Arc<ControlKnobs>> {
+        self.inner.as_ref().map(|i| i.control_knobs.clone())
     }
 
     /// Bring the server online in userspace netstack mode (tsnet listen/dial).
@@ -564,6 +578,7 @@ impl Server {
             b.health_watchdog.clone(),
             self.config.state_dir.clone(),
             b.node_key.public(),
+            b.control_knobs.clone(),
         );
 
         // MagicDNS responder: best-effort UDP server at 100.100.100.100:53.
@@ -619,6 +634,7 @@ impl Server {
             health_watchdog: b.health_watchdog,
             c2n_router: b.c2n_router,
             c2n_addr: Some(c2n_addr),
+            control_knobs: b.control_knobs,
         });
         Ok(())
     }
@@ -744,6 +760,7 @@ impl Server {
             b.health_watchdog.clone(),
             self.config.state_dir.clone(),
             b.node_key.public(),
+            b.control_knobs.clone(),
         );
 
         let (c2n_task, c2n_addr) =
@@ -772,6 +789,7 @@ impl Server {
             health_watchdog: b.health_watchdog,
             c2n_router: b.c2n_router,
             c2n_addr: Some(c2n_addr),
+            control_knobs: b.control_knobs,
         });
         Ok(())
     }
@@ -1229,6 +1247,13 @@ impl Server {
             Arc::new(r)
         };
 
+        // Control knobs: shared feature-flag store updated from each netmap.
+        let control_knobs = Arc::new(ControlKnobs::new());
+        let initial_knobs = extract_knobs_from_map_response(&map_resp);
+        if !initial_knobs.is_empty() {
+            control_knobs.apply(initial_knobs);
+        }
+
         Ok(Bootstrap {
             tailscale_ips: tailscale_ips.clone(),
             our_v4,
@@ -1258,6 +1283,7 @@ impl Server {
             health,
             health_watchdog,
             c2n_router,
+            control_knobs,
         })
     }
 
@@ -1998,6 +2024,7 @@ fn spawn_map_update_task(
     health_watchdog: Watchdog,
     state_dir: Option<PathBuf>,
     node_pub: NodePublic,
+    control_knobs: Arc<ControlKnobs>,
 ) -> JoinHandle<()> {
     let mut named_filters: BTreeMap<String, Vec<FilterRule>> = BTreeMap::new();
     tokio::spawn(async move {
@@ -2014,6 +2041,15 @@ fn spawn_map_update_task(
 
                     if resp.KeepAlive {
                         continue;
+                    }
+
+                    // Extract control knobs from the self-node's CapMap and
+                    // apply them. Mirrors Go's
+                    // `controlKnobs.UpdateFromNodeAttributes(resp.Node.CapMap)`
+                    // (controlclient/map.go:302).
+                    let knobs = extract_knobs_from_map_response(&resp);
+                    if !knobs.is_empty() {
+                        control_knobs.apply(knobs);
                     }
 
                     // Merge peer deltas.

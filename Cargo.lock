@@ -1236,6 +1236,7 @@ dependencies = [
  "http",
  "rand",
  "rustls",
+ "rustscale-controlknobs",
  "rustscale-key",
  "rustscale-netns",
  "rustscale-tailcfg",
@@ -1246,6 +1247,10 @@ dependencies = [
  "tokio-rustls",
  "webpki-roots 0.26.11",
 ]
+
+[[package]]
+name = "rustscale-controlknobs"
+version = "0.1.0"
 
 [[package]]
 name = "rustscale-derp"
@@ -1422,6 +1427,7 @@ dependencies = [
  "rustls",
  "rustscale-c2n",
  "rustscale-controlclient",
+ "rustscale-controlknobs",
  "rustscale-derp",
  "rustscale-dns",
  "rustscale-filter",

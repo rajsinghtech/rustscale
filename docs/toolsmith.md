@@ -29,6 +29,49 @@ agents cheaper and faster.
   orchestrator to fold into future phase prompts.
 - `.opencode/command/*.md` — custom opencode commands if a workflow repeats verbatim.
 
+## Worktree isolation workflow
+
+Agents build in isolated git worktrees so the orchestrator can review before merging.
+All rustscale work is Go→Rust porting with disjoint crates, so conflicts are rare.
+
+```bash
+# Launch an agent in an isolated worktree:
+tools/agent/opencode-task.sh --worktree "phase-9-magicdns" "<prompt>" 2400
+# On success prints: worktree: .worktrees/phase-9-magicdns  branch: agent/phase-9-magicdns
+
+# Review, run checks, and merge:
+cd .worktrees/phase-9-magicdns && tools/check.sh   # verify
+git diff master                                      # review changes
+
+# When green:
+tools/agent/worktree-merge.sh "phase-9-magicdns"
+# Cleans up worktree and branch.
+```
+
+The companion script `worktree-merge.sh <title>` runs `cargo build/test/clippy`
+(or `tools/check.sh` if present) in the worktree. On green it merges `agent/<title>`
+into master (--no-ff) and removes the worktree + branch. On red it prints the failures
+and leaves the worktree in place for investigation.
+
+## Model tiering
+
+Two tiers to save cost on lightweight tasks:
+
+| Model | Used for | Cost |
+|---|---|---|
+| `ai/deepseek/deepseek-v4-flash` | Research, review, docs, toolsmith passes (cheap) | Low |
+| `ai/vercel-ent/zai/glm-5.2` | Complex coding (default) | Standard |
+
+Set via `OPENCODE_MODEL` env var, or per-invocation with `--model`:
+
+```bash
+# Cheap research pass:
+tools/agent/opencode-task.sh --model ai/deepseek/deepseek-v4-flash "phase-9-research" "<prompt>"
+
+# Complex coding (default, explicit):
+tools/agent/opencode-task.sh "phase-10-whois" "<prompt>"
+```
+
 ## Rules
 
 - Never modify `crates/` product code or anything under the tailscale reference repos.

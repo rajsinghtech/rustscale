@@ -8,23 +8,48 @@
 # abort, and result harvesting.
 #
 # Usage:
-#   tools/agent/opencode-task.sh "<title>" "<prompt text>" [deadline_seconds]
-#   tools/agent/opencode-task.sh --continue <sessionID> "<prompt text>" [deadline_seconds]
+#   tools/agent/opencode-task.sh [--worktree] [--model <id>] "<title>" "<prompt>" [deadline]
+#   tools/agent/opencode-task.sh --continue <sessionID> "<prompt>" [deadline]
+#
+# Flags (must appear before positional args):
+#   --worktree       create an isolated git worktree (.worktrees/<title>) on a
+#                    branch agent/<title> off master; the agent operates in that
+#                    worktree instead of the repo root. On success prints the
+#                    worktree path and branch name for subsequent review/merge.
+#   --model <id>     override OPENCODE_MODEL for this invocation (see model
+#                    tiering policy in docs/toolsmith.md).
+#
+# Model tiering:
+#   ai/deepseek/deepseek-v4-flash     — research, review, docs (cheap/model)
+#   ai/vercel-ent/zai/glm-5.2         — complex coding (default)
+#   Override via OPENCODE_MODEL env var or --model flag.
 #
 # Env: OPENCODE_URL   (default http://127.0.0.1:4096)
-#      OPENCODE_MODEL (default vercel-ent/zai/glm-5.2), OPENCODE_PROVIDER (ai)
+#      OPENCODE_MODEL (default ai/vercel-ent/zai/glm-5.2), OPENCODE_PROVIDER (ai)
 #
 # Exit: 0 completed; 3 watchdog abort (prints sessionID for --continue); 1 error.
 set -euo pipefail
 
 URL="${OPENCODE_URL:-http://127.0.0.1:4096}"
 PROVIDER="${OPENCODE_PROVIDER:-ai}"
-MODEL="${OPENCODE_MODEL:-vercel-ent/zai/glm-5.2}"
+MODEL="${OPENCODE_MODEL:-ai/vercel-ent/zai/glm-5.2}"
 DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 
 CONTINUE=""
-if [[ "${1:-}" == "--continue" ]]; then
-  CONTINUE="${2:?--continue requires a session ID}"; shift 2
+WORKTREE=""
+
+# Parse leading flags before positional args.
+while [[ "${1:-}" == -* ]]; do
+  case "$1" in
+    --continue)  CONTINUE="${2:?--continue requires a session ID}"; shift 2 ;;
+    --worktree)  WORKTREE=1; shift ;;
+    --model)     MODEL="${2:?--model requires a model ID}"; shift 2 ;;
+    --model=*)   MODEL="${1#*=}"; shift ;;
+    *) echo "unknown flag: $1" >&2; exit 2 ;;
+  esac
+done
+
+if [[ -n "$CONTINUE" ]]; then
   TITLE="$CONTINUE"
   PROMPT="${1:?prompt text}"
   DEADLINE="${2:-2400}"
@@ -32,6 +57,19 @@ else
   TITLE="${1:?title}"
   PROMPT="${2:?prompt text}"
   DEADLINE="${3:-2400}"   # 40 min default
+fi
+
+# 0a. Optional worktree setup.
+if [[ -n "$WORKTREE" ]]; then
+  # Ensure .gitignore covers .worktrees/.
+  if ! grep -qxF '.worktrees/' "$DIR/.gitignore" 2>/dev/null; then
+    echo '.worktrees/' >> "$DIR/.gitignore"
+  fi
+  WT_DIR=".worktrees/$TITLE"
+  WT_BRANCH="agent/$TITLE"
+  echo "[harness] creating worktree $WT_DIR on $WT_BRANCH" >&2
+  git worktree add "$WT_DIR" -b "$WT_BRANCH" master
+  DIR="$(cd "$DIR/$WT_DIR" && pwd)"
 fi
 
 # 0. Ensure server is up. (Concurrent harness launches may both attempt to start
@@ -65,7 +103,7 @@ curl -sfS --max-time 10 -o /dev/null -X POST "$URL/session/$SID/prompt_async?dir
   -d "$(jq -n --arg pid "$PROVIDER" --arg mid "$MODEL" --arg t "$PROMPT" \
     '{model:{providerID:$pid,modelID:$mid},parts:[{type:"text",text:$t}]}')" \
   || { echo "[harness] prompt admission failed for session $SID" >&2; exit 1; }
-echo "[harness] prompt admitted; watchdog ${DEADLINE}s" >&2
+echo "[harness] prompt admitted; watchdog ${DEADLINE}s model=$MODEL" >&2
 
 msg_count() {
   curl -s --max-time 5 "$URL/session/$SID/message?directory=$DIR" | jq 'length' 2>/dev/null || echo 0
@@ -106,3 +144,9 @@ curl -s --max-time 10 "$URL/session/$SID/message?directory=$DIR" | jq -r '
   [.[] | select(.info.role=="assistant")] | last
   | if . == null then "(no assistant message produced — session may have aborted)"
     else [.parts[]? | select(.type=="text") | .text] | join("\n") end'
+
+# 5. On success with --worktree, print merge instructions.
+if [[ -n "$WORKTREE" ]]; then
+  echo "[harness] worktree: $WT_DIR  branch: $WT_BRANCH" >&2
+  echo "[harness] run tools/agent/worktree-merge.sh \"$TITLE\" to verify and merge" >&2
+fi

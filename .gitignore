@@ -3,3 +3,4 @@ target/
 bench-results/
 tools/bench/bin/
 .DS_Store
+.worktrees/

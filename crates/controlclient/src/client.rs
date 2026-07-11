@@ -283,6 +283,38 @@ impl ControlClient {
         Ok(())
     }
 
+    /// Stream `MapResponse` updates with automatic reconnection.
+    ///
+    /// Loops forever (until the `updates` channel is closed), calling
+    /// [`stream_map`](Self::stream_map) on each iteration. When the stream
+    /// ends — server closes, network glitch, HTTP/2 GOAWAY — sleeps with
+    /// exponential backoff (2s → 4s → 8s → … → 60s cap) and reconnects.
+    /// Resets the backoff to 2s after a clean stream end (Ok), since a
+    /// clean disconnect typically means responses were received.
+    pub async fn stream_map_loop(
+        &self,
+        req: &MapRequest,
+        updates: mpsc::Sender<Result<MapResponse, StreamMapError>>,
+    ) {
+        let mut backoff = std::time::Duration::from_secs(2);
+        loop {
+            if updates.is_closed() {
+                return;
+            }
+            match self.stream_map(req, updates.clone()).await {
+                Ok(()) => {
+                    backoff = std::time::Duration::from_secs(2);
+                    eprintln!("control: map stream ended; reconnecting in {backoff:?}");
+                }
+                Err(e) => {
+                    eprintln!("control: map stream error: {e}; reconnecting in {backoff:?}");
+                    backoff = (backoff * 2).min(std::time::Duration::from_mins(1));
+                }
+            }
+            tokio::time::sleep(backoff).await;
+        }
+    }
+
     /// Send a fire-and-forget `MapRequest` (no response body expected).
     ///
     /// Opens a Noise + h2 connection, POSTs the request, checks the HTTP

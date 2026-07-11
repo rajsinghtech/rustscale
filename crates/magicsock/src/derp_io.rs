@@ -124,7 +124,7 @@ impl DerpIo {
         });
 
         let keepalive_task = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            let mut interval = tokio::time::interval(Duration::from_mins(1));
             interval.tick().await;
             loop {
                 interval.tick().await;

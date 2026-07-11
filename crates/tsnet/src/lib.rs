@@ -877,13 +877,16 @@ impl Server {
             Err(e) => eprintln!("tsnet: endpoint update failed (non-fatal): {e}"),
         }
 
-        // 4. Start the map long-poll.
-        let map_req = MapRequest {
+        // 4. Fetch the first MapResponse (non-streaming) to learn DERPMap and
+        // tailscale IPs before starting the streaming long-poll. Using
+        // Stream=false ensures the server sends a single complete response and
+        // closes the connection, so fetch_map returns promptly.
+        let fetch_req = MapRequest {
             Version: CAPABILITY_VERSION,
-            KeepAlive: true,
+            KeepAlive: false,
             NodeKey: node_pub.clone(),
             DiscoKey: disco_pub.clone(),
-            Stream: true,
+            Stream: false,
             Endpoints: local_endpoints.clone(),
             Hostinfo: Some(Hostinfo {
                 OS: std::env::consts::OS.to_string(),
@@ -893,24 +896,12 @@ impl Server {
             }),
             ..Default::default()
         };
-
-        let (map_tx, mut map_rx) = mpsc::channel(32);
-        let cc2 = ControlClient::new(
-            self.config.control_url.clone(),
-            state.machine_key.clone(),
-            server_pub_key.clone(),
-            PROTOCOL_VERSION,
-        );
-        let map_task = tokio::spawn(async move {
-            let _ = cc2.stream_map(&map_req, map_tx).await;
-        });
-
-        // 5. Wait for the first MapResponse.
-        let first = tokio::time::timeout(std::time::Duration::from_secs(30), map_rx.recv())
-            .await
-            .map_err(|_| TsnetError::MapTimeout)?
-            .ok_or(TsnetError::MapTimeout)?;
-        let map_resp: MapResponse = first?;
+        let map_resp: MapResponse = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            cc_ep.fetch_map(&fetch_req),
+        )
+        .await
+        .map_err(|_| TsnetError::MapTimeout)??;
 
         let tailscale_ips = extract_tailscale_ips(&map_resp);
         if tailscale_ips.is_empty() {
@@ -1003,6 +994,38 @@ impl Server {
             Ok(()) => eprintln!("tsnet: NetInfo (PreferredDERP={home_derp}) sent to control"),
             Err(e) => eprintln!("tsnet: NetInfo update failed (non-fatal): {e}"),
         }
+
+        // Start the streaming map long-poll with NetInfo included. This is
+        // done after the home DERP is known and connected so the streaming
+        // MapRequest carries NetInfo.PreferredDERP from the start.
+        // stream_map_loop reconnects automatically when the stream ends.
+        let map_req = MapRequest {
+            Version: CAPABILITY_VERSION,
+            KeepAlive: true,
+            NodeKey: node_pub.clone(),
+            DiscoKey: disco_pub.clone(),
+            Stream: true,
+            Endpoints: local_endpoints.clone(),
+            Hostinfo: Some(Hostinfo {
+                OS: std::env::consts::OS.to_string(),
+                Hostname: self.config.hostname.clone(),
+                RoutableIPs: advertise.clone(),
+                NetInfo: Some(netinfo.clone()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let (map_tx, map_rx) = mpsc::channel(32);
+        let cc2 = ControlClient::new(
+            self.config.control_url.clone(),
+            state.machine_key.clone(),
+            server_pub_key.clone(),
+            PROTOCOL_VERSION,
+        );
+        let map_task = tokio::spawn(async move {
+            cc2.stream_map_loop(&map_req, map_tx).await;
+        });
 
         // 8. Create magicsock, reusing the UDP socket bound in step 3b so
         // the local endpoints advertised in the MapRequest match the socket

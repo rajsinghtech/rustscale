@@ -11,8 +11,10 @@
 mod client;
 mod frame;
 mod protocol;
+mod server;
 
 pub use client::DerpClient;
+pub use server::{DerpServer, DerpServerHandle};
 pub use frame::{
     decode_frame_header, encode_frame_header, read_frame, read_frame_header, write_frame,
     write_frame_header, FRAME_HEADER_LEN, KEY_LEN, MAGIC, MAX_INFO_LEN, MAX_PACKET_SIZE, NONCE_LEN,

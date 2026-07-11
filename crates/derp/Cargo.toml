@@ -9,8 +9,12 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+test-utils = ["dep:rustscale-tailcfg"]
+
 [dependencies]
 rustscale-key = { path = "../key", version = "0.1.0" }
+rustscale-tailcfg = { path = "../tailcfg", version = "0.1.0", optional = true }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -23,3 +27,4 @@ rustscale-netns.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
+rustscale-tailcfg = { path = "../tailcfg", version = "0.1.0" }

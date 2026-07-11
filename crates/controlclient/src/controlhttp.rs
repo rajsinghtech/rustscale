@@ -5,8 +5,8 @@
 //! initiation message, saving an RTT. On `101 Switching Protocols` the TLS
 //! stream becomes the Noise transport.
 //!
-//! This implementation is deliberately simple: single `host:443` over TLS,
-//! no port-80 plaintext fallback, no DNS fallback tricks.
+//! DNS resolution uses a `dnscache::Resolver` with `dnsfallback` as the
+//! `LookupIPFallback`, so control-plane connections survive broken system DNS.
 
 use std::sync::Arc;
 
@@ -24,6 +24,22 @@ const UPGRADE_VALUE: &str = "tailscale-control-protocol";
 const HANDSHAKE_HEADER: &str = "X-Tailscale-Handshake";
 /// The URL path for the protocol upgrade.
 const UPGRADE_PATH: &str = "/ts2021";
+
+/// Process-wide DNS cache resolver with DERP bootstrap fallback.
+///
+/// Initialized lazily on first use. Uses `UseLastGood` so a stale cached IP
+/// is served if a refresh fails — matching Go's `controlclient/direct.go`
+/// lines 334-368.
+static DNS_RESOLVER: std::sync::OnceLock<rustscale_dnscache::Resolver> = std::sync::OnceLock::new();
+
+/// Get the shared DNS cache resolver, initializing it on first call.
+fn dns_resolver() -> &'static rustscale_dnscache::Resolver {
+    DNS_RESOLVER.get_or_init(|| {
+        rustscale_dnscache::Resolver::new()
+            .with_use_last_good(true)
+            .with_fallback(rustscale_dnsfallback::make_lookup_fallback())
+    })
+}
 
 /// JSON response from `GET /key?v=<version>` (matching Go's
 /// `OverTLSPublicKeyResponse`).
@@ -122,8 +138,10 @@ pub async fn fetch_server_pub_key(
 ) -> Result<MachinePublic, DialError> {
     ensure_ring_provider();
 
-    let addr = format!("{host}:443");
-    let tcp = TcpStream::connect(&addr).await.map_err(DialError::Io)?;
+    let tcp = dns_resolver()
+        .dial_tcp(host, 443)
+        .await
+        .map_err(|e| DialError::Io(std::io::Error::other(e.to_string())))?;
 
     let root_store = rustls::RootCertStore {
         roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
@@ -203,10 +221,16 @@ fn ensure_ring_provider() {
 }
 
 /// Establish a TLS connection to `host:443`.
+///
+/// Uses the shared DNS cache resolver with DERP fallback so that control-plane
+/// connections survive broken system DNS (matching Go's `dnscache.Dialer`
+/// wrapping the control client's transport).
 async fn tls_connect(host: &str) -> Result<tokio_rustls::client::TlsStream<TcpStream>, DialError> {
     ensure_ring_provider();
-    let addr = format!("{host}:443");
-    let tcp = TcpStream::connect(&addr).await.map_err(DialError::Io)?;
+    let tcp = dns_resolver()
+        .dial_tcp(host, 443)
+        .await
+        .map_err(|e| DialError::Io(std::io::Error::other(e.to_string())))?;
 
     let root_store = rustls::RootCertStore {
         roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),

@@ -1237,6 +1237,8 @@ dependencies = [
  "rand",
  "rustls",
  "rustscale-controlknobs",
+ "rustscale-dnscache",
+ "rustscale-dnsfallback",
  "rustscale-key",
  "rustscale-netns",
  "rustscale-tailcfg",
@@ -1286,6 +1288,32 @@ dependencies = [
  "rustscale-tailcfg",
  "thiserror 1.0.69",
  "tokio",
+]
+
+[[package]]
+name = "rustscale-dnscache"
+version = "0.1.0"
+dependencies = [
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "rustscale-dnsfallback"
+version = "0.1.0"
+dependencies = [
+ "rand",
+ "rustls",
+ "rustscale-dnscache",
+ "rustscale-tailcfg",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]

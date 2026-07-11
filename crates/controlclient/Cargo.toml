@@ -29,6 +29,8 @@ h2.workspace = true
 http = "1"
 bytes.workspace = true
 rustscale-netns.workspace = true
+rustscale-dnscache.workspace = true
+rustscale-dnsfallback.workspace = true
 async-trait.workspace = true
 
 [dev-dependencies]

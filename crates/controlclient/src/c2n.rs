@@ -38,6 +38,30 @@ impl C2nResponse {
             body: msg.into().into_bytes(),
         }
     }
+
+    /// 204 No Content (empty body).
+    pub fn no_content() -> Self {
+        Self {
+            status: 204,
+            body: vec![],
+        }
+    }
+
+    /// Text response with the given status.
+    pub fn text(status: u16, msg: impl Into<String>) -> Self {
+        Self {
+            status,
+            body: msg.into().into_bytes(),
+        }
+    }
+
+    /// JSON response from a `serde_json::Value`.
+    pub fn json(status: u16, value: &serde_json::Value) -> Self {
+        Self {
+            status,
+            body: serde_json::to_vec(value).unwrap_or_default(),
+        }
+    }
 }
 
 /// A C2N handler processes a single request and returns a response.

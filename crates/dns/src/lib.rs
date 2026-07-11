@@ -19,14 +19,14 @@ use std::sync::Arc;
 use rustscale_tailcfg::{DNSConfig, Node};
 use tokio::sync::RwLock;
 
-pub mod wire;
 pub mod forwarder;
+pub mod wire;
 
+pub use forwarder::{Forwarder, UpstreamResolver};
 pub use wire::{
     build_a_response, build_aaaa_response, build_nxdomain, build_ptr_response,
     build_rcode_response, check_response_size_and_set_tc, parse_question, qtype, rcode,
 };
-pub use forwarder::{Forwarder, UpstreamResolver};
 
 /// The MagicDNS VIP that OS resolvers point at (`100.100.100.100`).
 pub const MAGICDNS_VIP: Ipv4Addr = Ipv4Addr::new(100, 100, 100, 100);
@@ -304,9 +304,7 @@ impl MagicDnsResolver {
         if n == DNS_SYMBOLIC_FQDN.trim_end_matches('.') {
             match qt {
                 qtype::A => return (Some(IpAddr::V4(MAGICDNS_VIP)), rcode::SUCCESS),
-                qtype::AAAA => {
-                    return (Some(IpAddr::V6(MAGICDNS_VIP_V6)), rcode::SUCCESS)
-                }
+                qtype::AAAA => return (Some(IpAddr::V6(MAGICDNS_VIP_V6)), rcode::SUCCESS),
                 _ => {}
             }
         }
@@ -554,7 +552,8 @@ fn build_config(dns_config: Option<&DNSConfig>, domain: &str, peers: &[Node]) ->
         if !domain.is_empty() {
             cfg.local_domains.push(domain.to_string());
             // Add reverse DNS zones for tailnet ranges.
-            cfg.local_domains.push("100.64.0.0/10.in-addr.arpa.".to_string());
+            cfg.local_domains
+                .push("100.64.0.0/10.in-addr.arpa.".to_string());
             cfg.local_domains
                 .push("fd7a:115c:a1e0::/48.ip6.arpa.".to_string());
         }
@@ -967,7 +966,11 @@ async fn handle_query(
     }
 
     // .onion rejection (RFC 7686).
-    if name.trim_end_matches('.').to_lowercase().ends_with(".onion") {
+    if name
+        .trim_end_matches('.')
+        .to_lowercase()
+        .ends_with(".onion")
+    {
         return build_rcode_response(query, rcode::NAME_ERROR);
     }
 
@@ -1000,9 +1003,7 @@ async fn handle_query(
             // Name exists but no AAAA record.
             build_rcode_response(query, rcode::SUCCESS)
         }
-        Some(IpAddr::V6(_)) if qtype == qtype::A => {
-            build_rcode_response(query, rcode::SUCCESS)
-        }
+        Some(IpAddr::V6(_)) if qtype == qtype::A => build_rcode_response(query, rcode::SUCCESS),
         _ => {
             // NOERROR with 0 answers (name exists, no records of this type).
             build_rcode_response(query, rcode::SUCCESS)
@@ -1044,11 +1045,7 @@ async fn forward_upstream(query: &[u8], upstream: &[SocketAddr]) -> Option<Vec<u
 }
 
 /// Build a config from a DNSConfig for use with `set_config`.
-pub fn config_from_dns(
-    dns_config: &DNSConfig,
-    domain: &str,
-    peers: &[Node],
-) -> Config {
+pub fn config_from_dns(dns_config: &DNSConfig, domain: &str, peers: &[Node]) -> Config {
     build_config(Some(dns_config), domain, peers)
 }
 

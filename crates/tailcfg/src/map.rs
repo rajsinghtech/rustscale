@@ -119,6 +119,17 @@ pub struct MapResponse {
     /// empty = delete; `Some(vec)` = set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub PacketFilters: Option<BTreeMap<String, Option<Vec<FilterRule>>>>,
+    /// Whether the client's node key has expired. When true, the client
+    /// should transition to a "NeedsLogin" state; when false (un-expire),
+    /// it should recover. Matches Go's `MapResponse.NodeKeyExpired`.
+    #[serde(default, skip_serializing_if = "skip_default")]
+    pub NodeKeyExpired: bool,
+    /// ControlTime from the server (usually only in the first map response).
+    #[serde(default, skip_serializing_if = "skip_default")]
+    pub ControlTime: Option<chrono::DateTime<chrono::Utc>>,
+    /// Whether the server wants the client to collect and report services.
+    #[serde(default, skip_serializing_if = "crate::OptBool::is_unset")]
+    pub CollectServices: crate::OptBool,
 }
 
 #[cfg(test)]

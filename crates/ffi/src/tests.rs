@@ -59,6 +59,7 @@ fn status_to_json_includes_health() {
         hostname: "h".into(),
         packet_drops: 0,
         health: tracker.current_warnings(),
+        key_expired: false,
     };
     let json = status_to_json(&st);
     let health = json.get("health").expect("health array present");

@@ -162,7 +162,10 @@ impl C2nBackend for TsnetC2nBackend {
         );
         let _ = writeln!(out, "# TYPE rustscale_packet_drops_total counter");
         let _ = writeln!(out, "rustscale_packet_drops_total {drops}");
-        let _ = writeln!(out, "# HELP rustscale_peer_count Number of peers in the netmap");
+        let _ = writeln!(
+            out,
+            "# HELP rustscale_peer_count Number of peers in the netmap"
+        );
         let _ = writeln!(out, "# TYPE rustscale_peer_count gauge");
         let _ = writeln!(out, "rustscale_peer_count {peer_count}");
         let _ = writeln!(
@@ -171,7 +174,10 @@ impl C2nBackend for TsnetC2nBackend {
         );
         let _ = writeln!(out, "# TYPE rustscale_health_warnings gauge");
         let _ = writeln!(out, "rustscale_health_warnings{{severity=\"high\"}} {high}");
-        let _ = writeln!(out, "rustscale_health_warnings{{severity=\"medium\"}} {medium}");
+        let _ = writeln!(
+            out,
+            "rustscale_health_warnings{{severity=\"medium\"}} {medium}"
+        );
         let _ = writeln!(out, "rustscale_health_warnings{{severity=\"low\"}} {low}");
         let _ = writeln!(
             out,
@@ -337,10 +343,7 @@ impl C2nHandler for ComponentLoggingHandler {
         let query = req.path.split_once('?').map_or("", |(_, q)| q);
         let params = parse_query_map(query);
         let component = params.get("component").map_or("", String::as_str);
-        let secs: i64 = params
-            .get("secs")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
+        let secs: i64 = params.get("secs").and_then(|s| s.parse().ok()).unwrap_or(0);
         let secs = if secs == 0 { -1 } else { secs };
         let now = SystemTime::now();
         let until = if secs >= 0 {

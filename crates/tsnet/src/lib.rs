@@ -72,9 +72,7 @@ use rustscale_controlclient::controlhttp;
 use rustscale_controlclient::{extract_knobs_from_map_response, C2nRouter};
 use rustscale_controlknobs::ControlKnobs;
 use rustscale_derp::DerpClient;
-use rustscale_dns::{
-    config_from_dns, DnsResponder, Forwarder, MagicDnsResolver, MAGICDNS_VIP,
-};
+use rustscale_dns::{config_from_dns, DnsResponder, Forwarder, MagicDnsResolver, MAGICDNS_VIP};
 use rustscale_filter::Filter;
 use rustscale_health::{
     Severity, Tracker, Watchdog, WARN_CERT_FALLBACK, WARN_CONTROL, WARN_DERP_HOME,
@@ -410,6 +408,10 @@ struct RunningState {
     /// LocalAPI socket path (if the server was spawned). Used for cleanup on
     /// close().
     localapi_socket: Option<PathBuf>,
+    /// Node key expired flag — set when the control server signals
+    /// `NodeKeyExpired` in a MapResponse. The client should transition to
+    /// a "NeedsLogin" state; un-expiring clears it.
+    key_expired: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Which data plane is wired up: userspace netstack (tsnet listen/dial) or a
@@ -533,6 +535,8 @@ struct Bootstrap {
     control_knobs: Arc<ControlKnobs>,
     /// Runtime Hostinfo field overrides (shared with the update loop).
     overrides: SharedOverrides,
+    /// Node key expired flag (shared with the map update task).
+    key_expired: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// An embedded Tailscale server.
@@ -555,6 +559,12 @@ impl Server {
     /// Whether the server is up.
     pub fn is_up(&self) -> bool {
         self.inner.is_some()
+    }
+
+    /// The node's public key, if the server is up. Used by test harnesses
+    /// and diagnostics to identify this node on the control plane.
+    pub fn node_key(&self) -> Option<NodePublic> {
+        self.inner.as_ref().map(|i| i.node_key.public())
     }
 
     /// The shared health tracker, if the server is up. Callers can report
@@ -724,6 +734,7 @@ impl Server {
             self.config.state_dir.clone(),
             b.node_key.public(),
             b.control_knobs.clone(),
+            b.key_expired.clone(),
         );
 
         // MagicDNS responder: best-effort UDP server at 100.100.100.100:53.
@@ -869,7 +880,10 @@ impl Server {
                 eprintln!("tsnet: LocalAPI listening at {}", path.display());
                 Some(h.socket_path)
             } else {
-                eprintln!("tsnet: LocalAPI failed to bind socket at {}", path.display());
+                eprintln!(
+                    "tsnet: LocalAPI failed to bind socket at {}",
+                    path.display()
+                );
                 None
             }
         } else {
@@ -902,6 +916,7 @@ impl Server {
             peerapi_port,
             overrides: b.overrides,
             localapi_socket,
+            key_expired: b.key_expired,
         });
         Ok(())
     }
@@ -1028,6 +1043,7 @@ impl Server {
             self.config.state_dir.clone(),
             b.node_key.public(),
             b.control_knobs.clone(),
+            b.key_expired.clone(),
         );
 
         let (c2n_task, c2n_addr) =
@@ -1149,7 +1165,10 @@ impl Server {
                 eprintln!("tsnet: LocalAPI listening at {}", path.display());
                 Some(h.socket_path)
             } else {
-                eprintln!("tsnet: LocalAPI failed to bind socket at {}", path.display());
+                eprintln!(
+                    "tsnet: LocalAPI failed to bind socket at {}",
+                    path.display()
+                );
                 None
             }
         } else {
@@ -1182,6 +1201,7 @@ impl Server {
             peerapi_port,
             overrides: b.overrides,
             localapi_socket,
+            key_expired: b.key_expired,
         });
         Ok(())
     }
@@ -1738,6 +1758,7 @@ impl Server {
             c2n_backend,
             control_knobs,
             overrides: self.config.overrides.clone(),
+            key_expired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
@@ -1752,6 +1773,7 @@ impl Server {
                 hostname: self.config.hostname.clone(),
                 packet_drops: 0,
                 health: vec![],
+                key_expired: false,
             };
         };
         let peers: Vec<PeerInfo> = inner
@@ -1780,6 +1802,7 @@ impl Server {
             hostname: self.config.hostname.clone(),
             packet_drops,
             health: inner.health.current_warnings(),
+            key_expired: inner.key_expired.load(std::sync::atomic::Ordering::Relaxed),
         }
     }
 
@@ -2483,6 +2506,7 @@ fn spawn_map_update_task(
     state_dir: Option<PathBuf>,
     node_pub: NodePublic,
     control_knobs: Arc<ControlKnobs>,
+    key_expired: Arc<std::sync::atomic::AtomicBool>,
 ) -> JoinHandle<()> {
     let mut named_filters: BTreeMap<String, Vec<FilterRule>> = BTreeMap::new();
     // Create the netmap cache helper once so that save_if_changed can
@@ -2502,6 +2526,25 @@ fn spawn_map_update_task(
 
                     if resp.KeepAlive {
                         continue;
+                    }
+
+                    // Handle key expiry from the control server. The
+                    // testcontrol server signals expiry by setting
+                    // Node.KeyExpiry to a past time in MapResponse. The
+                    // real control server may also set NodeKeyExpired on
+                    // the RegisterResponse. We check both sources.
+                    let expired = resp.NodeKeyExpired
+                        || resp
+                            .Node
+                            .as_ref()
+                            .and_then(|n| n.KeyExpiry)
+                            .is_some_and(|expiry| expiry < chrono::Utc::now());
+                    key_expired.store(expired, std::sync::atomic::Ordering::Relaxed);
+                    if expired {
+                        eprintln!("tsnet: node key expired (signalled by control)");
+                        if let Some(ref dir) = state_dir {
+                            PersistedState::clear_netmap(dir);
+                        }
                     }
 
                     // Extract control knobs from the self-node's CapMap and
@@ -3106,7 +3149,15 @@ async fn connect_home_derp(
         node.HostName.clone()
     };
 
-    DerpClient::connect_with_upgrade_dial(&dial_addr, &tls_host, port, true, node_key.clone()).await
+    DerpClient::connect_with_upgrade_dial_insecure(
+        &dial_addr,
+        &tls_host,
+        port,
+        true,
+        node.InsecureForTests,
+        node_key.clone(),
+    )
+    .await
 }
 
 /// Ensure the rustls ring crypto provider is installed process-wide.

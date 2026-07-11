@@ -66,7 +66,10 @@ pub(crate) struct LocalApiHandle {
 /// Removes any stale socket file at `socket_path`, binds a fresh one, sets
 /// permissions to 0600, and spawns a background task serving HTTP/1.1.
 /// Returns `None` if the socket cannot be bound.
-pub(crate) fn spawn_localapi(state: Arc<LocalApiState>, socket_path: PathBuf) -> Option<LocalApiHandle> {
+pub(crate) fn spawn_localapi(
+    state: Arc<LocalApiState>,
+    socket_path: PathBuf,
+) -> Option<LocalApiHandle> {
     // Remove stale socket from a previous run.
     let _ = std::fs::remove_file(&socket_path);
 
@@ -437,9 +440,10 @@ async fn build_status_json(state: &LocalApiState) -> serde_json::Value {
         };
 
         // Check if this peer is exit-node-capable.
-        let exit_node_option = peer.AllowedIPs.iter().any(|r| {
-            r == "0.0.0.0/0" || r == "::/0"
-        });
+        let exit_node_option = peer
+            .AllowedIPs
+            .iter()
+            .any(|r| r == "0.0.0.0/0" || r == "::/0");
 
         peers_map.insert(
             key_str,
@@ -476,11 +480,7 @@ async fn build_status_json(state: &LocalApiState) -> serde_json::Value {
                 Some((_, d)) => d,
                 None => suffix,
             };
-            (
-                suffix.to_string(),
-                suffix.to_string(),
-                dns.Proxied,
-            )
+            (suffix.to_string(), suffix.to_string(), dns.Proxied)
         } else {
             (String::new(), String::new(), false)
         }
@@ -504,9 +504,7 @@ async fn build_status_json(state: &LocalApiState) -> serde_json::Value {
     })
 }
 
-fn user_profiles_to_json(
-    profiles: &BTreeMap<UserID, UserProfile>,
-) -> serde_json::Value {
+fn user_profiles_to_json(profiles: &BTreeMap<UserID, UserProfile>) -> serde_json::Value {
     let mut map = serde_json::Map::new();
     for (id, profile) in profiles {
         map.insert(
@@ -597,15 +595,14 @@ async fn handle_whois<W: AsyncWrite + Unpin>(
         "Online": peer.Online.unwrap_or(false),
     });
 
-    let profile_json = user_profile
-        .map_or(serde_json::Value::Null, |p| {
-            serde_json::json!({
-                "ID": p.ID,
-                "LoginName": p.LoginName,
-                "DisplayName": p.DisplayName,
-                "ProfilePicURL": p.ProfilePicURL,
-            })
-        });
+    let profile_json = user_profile.map_or(serde_json::Value::Null, |p| {
+        serde_json::json!({
+            "ID": p.ID,
+            "LoginName": p.LoginName,
+            "DisplayName": p.DisplayName,
+            "ProfilePicURL": p.ProfilePicURL,
+        })
+    });
 
     let resp = serde_json::json!({
         "Node": node_json,
@@ -682,7 +679,10 @@ fn build_metrics_text(state: &LocalApiState) -> String {
     );
     let _ = writeln!(out, "# TYPE rustscale_packet_drops_total counter");
     let _ = writeln!(out, "rustscale_packet_drops_total {drops}");
-    let _ = writeln!(out, "# HELP rustscale_peer_count Number of peers in the netmap");
+    let _ = writeln!(
+        out,
+        "# HELP rustscale_peer_count Number of peers in the netmap"
+    );
     let _ = writeln!(out, "# TYPE rustscale_peer_count gauge");
     let _ = writeln!(out, "rustscale_peer_count {peer_count}");
     let _ = writeln!(
@@ -691,7 +691,10 @@ fn build_metrics_text(state: &LocalApiState) -> String {
     );
     let _ = writeln!(out, "# TYPE rustscale_health_warnings gauge");
     let _ = writeln!(out, "rustscale_health_warnings{{severity=\"high\"}} {high}");
-    let _ = writeln!(out, "rustscale_health_warnings{{severity=\"medium\"}} {medium}");
+    let _ = writeln!(
+        out,
+        "rustscale_health_warnings{{severity=\"medium\"}} {medium}"
+    );
     let _ = writeln!(out, "rustscale_health_warnings{{severity=\"low\"}} {low}");
     let _ = writeln!(
         out,
@@ -853,7 +856,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_request_basic() {
-        let raw = b"GET /localapi/v0/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+        let raw =
+            b"GET /localapi/v0/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
         let mut cursor = std::io::Cursor::new(raw);
         let req = read_request(&mut cursor).await.unwrap();
         assert_eq!(req.method, "GET");
@@ -882,10 +886,7 @@ mod tests {
 
     // --- Dispatch tests (using tokio::io::duplex) ---
 
-    async fn send_request_to_state(
-        raw: &[u8],
-        state: &Arc<LocalApiState>,
-    ) -> String {
+    async fn send_request_to_state(raw: &[u8], state: &Arc<LocalApiState>) -> String {
         let (mut client, mut server) = tokio::io::duplex(8192);
         client.write_all(raw).await.unwrap();
         client.flush().await.unwrap();

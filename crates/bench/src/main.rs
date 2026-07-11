@@ -153,7 +153,15 @@ async fn main() {
             control_url,
             state_dir,
         } => {
-            let res = Box::pin(latency::run(authkey, target, count, hostname, control_url, state_dir)).await;
+            let res = Box::pin(latency::run(
+                authkey,
+                target,
+                count,
+                hostname,
+                control_url,
+                state_dir,
+            ))
+            .await;
             match res {
                 Ok(r) => {
                     if json {

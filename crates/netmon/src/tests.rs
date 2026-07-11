@@ -3,7 +3,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use super::monitor::{Monitor, StateProvider};
-use super::state::{has_cgnat_interface, link_type_from_name, InterfaceMeta, IpPrefix, LinkType, Route, State};
+use super::state::{
+    has_cgnat_interface, link_type_from_name, InterfaceMeta, IpPrefix, LinkType, Route, State,
+};
 
 fn ip4(s: &str) -> IpPrefix {
     let (ip, bits) = s.split_once('/').unwrap_or((s, "32"));
@@ -408,10 +410,9 @@ fn test_time_jump_threshold_is_10_minutes() {
 #[test]
 fn test_get_interface_list_returns_entries() {
     let entries = super::state::get_interface_list();
-    let has_loopback = entries.iter().any(|e| {
-        e.meta.is_loopback
-            || e.name.starts_with("lo")
-    });
+    let has_loopback = entries
+        .iter()
+        .any(|e| e.meta.is_loopback || e.name.starts_with("lo"));
     let _ = entries.len();
     let _ = has_loopback;
 }

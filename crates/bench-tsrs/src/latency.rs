@@ -42,16 +42,15 @@ pub async fn run(
 
     tokio::time::sleep(Duration::from_secs(3)).await;
 
-    let target_addr: SocketAddr = target.parse().map_err(|e| {
-        format!("failed to parse target '{target}' as SocketAddr (ip:port): {e}")
-    })?;
+    let target_addr: SocketAddr = target
+        .parse()
+        .map_err(|e| format!("failed to parse target '{target}' as SocketAddr (ip:port): {e}"))?;
 
     let mut stream = {
         let mut connected = None;
         for attempt in 1..=3u32 {
             eprintln!("dial attempt {attempt}");
-            match tokio::time::timeout(Duration::from_secs(45), dev.tcp_connect(target_addr))
-                .await
+            match tokio::time::timeout(Duration::from_secs(45), dev.tcp_connect(target_addr)).await
             {
                 Ok(Ok(s)) => {
                     connected = Some(s);

@@ -67,6 +67,63 @@ fn tls_config() -> rustls::ClientConfig {
         .with_no_client_auth()
 }
 
+/// Build a rustls ClientConfig that skips certificate verification.
+/// Used for DERP servers with `InsecureForTests: true` in the DERPMap.
+fn insecure_tls_config() -> rustls::ClientConfig {
+    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+
+    #[derive(Debug)]
+    struct NoVerify;
+
+    impl ServerCertVerifier for NoVerify {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &rustls::pki_types::CertificateDer<'_>,
+            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            _server_name: &rustls::pki_types::ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: rustls::pki_types::UnixTime,
+        ) -> Result<ServerCertVerified, rustls::Error> {
+            Ok(ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            vec![
+                rustls::SignatureScheme::RSA_PKCS1_SHA256,
+                rustls::SignatureScheme::RSA_PKCS1_SHA384,
+                rustls::SignatureScheme::RSA_PKCS1_SHA512,
+                rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+                rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+                rustls::SignatureScheme::ED25519,
+            ]
+        }
+    }
+
+    ensure_ring_provider();
+    rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoVerify))
+        .with_no_client_auth()
+}
+
 /// An async DERP client connected to a DERP server.
 pub struct DerpClient {
     stream: Box<dyn DerpStream>,
@@ -106,10 +163,25 @@ impl DerpClient {
 
     /// Connect to a DERP server over TCP (optionally TLS) and perform the
     /// DERP handshake directly (no HTTP upgrade).
+    ///
+    /// When `insecure` is true, TLS certificate verification is skipped
+    /// (for test DERP servers with self-signed certs).
     pub async fn connect(
         host: &str,
         port: u16,
         use_tls: bool,
+        private_key: NodePrivate,
+    ) -> Result<Self, DerpError> {
+        Self::connect_insecure(host, port, use_tls, false, private_key).await
+    }
+
+    /// Connect with an explicit insecure flag. Same as [`connect`] but
+    /// allows skipping TLS verification for `InsecureForTests` DERP nodes.
+    pub async fn connect_insecure(
+        host: &str,
+        port: u16,
+        use_tls: bool,
+        insecure: bool,
         private_key: NodePrivate,
     ) -> Result<Self, DerpError> {
         let addr = format!("{host}:{port}");
@@ -117,7 +189,11 @@ impl DerpClient {
         tcp.set_nodelay(true).ok();
 
         if use_tls {
-            let config = tls_config();
+            let config = if insecure {
+                insecure_tls_config()
+            } else {
+                tls_config()
+            };
             let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
             let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
                 .map_err(|e| DerpError::BadFrame(format!("invalid server name: {e}")))?;
@@ -151,12 +227,37 @@ impl DerpClient {
         use_tls: bool,
         private_key: NodePrivate,
     ) -> Result<Self, DerpError> {
+        Self::connect_with_upgrade_dial_insecure(
+            dial_addr,
+            tls_host,
+            port,
+            use_tls,
+            false,
+            private_key,
+        )
+        .await
+    }
+
+    /// Same as [`connect_with_upgrade_dial`] but with an explicit `insecure`
+    /// flag for `InsecureForTests` DERP nodes.
+    pub async fn connect_with_upgrade_dial_insecure(
+        dial_addr: &str,
+        tls_host: &str,
+        port: u16,
+        use_tls: bool,
+        insecure: bool,
+        private_key: NodePrivate,
+    ) -> Result<Self, DerpError> {
         let addr = format!("{dial_addr}:{port}");
         let tcp = TcpStream::connect(&addr).await?;
         tcp.set_nodelay(true).ok();
 
         let mut stream: Box<dyn DerpStream> = if use_tls {
-            let config = tls_config();
+            let config = if insecure {
+                insecure_tls_config()
+            } else {
+                tls_config()
+            };
             let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
             let server_name = rustls::pki_types::ServerName::try_from(tls_host.to_string())
                 .map_err(|e| DerpError::BadFrame(format!("invalid server name: {e}")))?;

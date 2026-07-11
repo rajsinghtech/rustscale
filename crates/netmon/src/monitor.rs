@@ -205,7 +205,10 @@ impl Monitor {
                 };
 
                 let callbacks: Vec<ChangeFunc> = {
-                    let guard = shared_clone.callbacks.read().expect("callback lock poisoned");
+                    let guard = shared_clone
+                        .callbacks
+                        .read()
+                        .expect("callback lock poisoned");
                     guard.values().cloned().collect()
                 };
                 for cb in callbacks {
@@ -283,10 +286,7 @@ impl MonitorHandle {
         F: Fn(ChangeDelta) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = ()> + Send + 'static,
     {
-        let id = self
-            .shared
-            .next_callback_id
-            .fetch_add(1, Ordering::SeqCst);
+        let id = self.shared.next_callback_id.fetch_add(1, Ordering::SeqCst);
         let boxed: ChangeFunc = Arc::new(move |delta| Box::pin(callback(delta)));
         {
             let mut guard = self
@@ -319,7 +319,11 @@ impl MonitorHandle {
             *guard = Some(gw);
         }
         {
-            let mut guard = self.shared.gw_self_ip.write().expect("gw_self lock poisoned");
+            let mut guard = self
+                .shared
+                .gw_self_ip
+                .write()
+                .expect("gw_self lock poisoned");
             *guard = Some(self_ip);
         }
         self.shared.gw_valid.store(true, Ordering::SeqCst);

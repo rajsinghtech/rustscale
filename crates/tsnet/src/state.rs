@@ -392,9 +392,7 @@ mod tests {
 
         // First write creates the file.
         let cache = NetMapCache::new(&dir);
-        cache
-            .save_if_changed(&node_pub, &resp)
-            .expect("first save");
+        cache.save_if_changed(&node_pub, &resp).expect("first save");
         let mtime1 = std::fs::metadata(dir.join("netmap-cache.json"))
             .expect("file exists")
             .modified()
@@ -404,17 +402,12 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(20));
 
         // Second save of identical content should be deduped (no disk I/O).
-        cache
-            .save_if_changed(&node_pub, &resp)
-            .expect("dedup save");
+        cache.save_if_changed(&node_pub, &resp).expect("dedup save");
         let mtime2 = std::fs::metadata(dir.join("netmap-cache.json"))
             .expect("file exists")
             .modified()
             .expect("modified");
-        assert_eq!(
-            mtime1, mtime2,
-            "identical save should not touch the file"
-        );
+        assert_eq!(mtime1, mtime2, "identical save should not touch the file");
 
         // A different MapResponse should produce a real write.
         let resp2 = MapResponse {
@@ -486,9 +479,7 @@ mod tests {
         };
 
         let cache = NetMapCache::new(&dir);
-        cache
-            .save_if_changed(&node_pub, &resp)
-            .expect("save");
+        cache.save_if_changed(&node_pub, &resp).expect("save");
         assert!(dir.join("netmap-cache.json").exists());
 
         // Clear removes the file and resets the hash.
@@ -523,9 +514,7 @@ mod tests {
 
         // Write via one cache instance, then load via another to seed hash.
         let writer = NetMapCache::new(&dir);
-        writer
-            .save_if_changed(&node_pub, &resp)
-            .expect("save");
+        writer.save_if_changed(&node_pub, &resp).expect("save");
         let mtime1 = std::fs::metadata(dir.join("netmap-cache.json"))
             .expect("file exists")
             .modified()

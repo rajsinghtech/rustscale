@@ -41,10 +41,7 @@ pub enum ResolverKind {
     /// Plain IP:port for classic UDP/TCP DNS.
     Udp(SocketAddr),
     /// DNS-over-HTTPS URL (e.g. `https://dns.google/dns-query`).
-    Doh {
-        url: String,
-        host: String,
-    },
+    Doh { url: String, host: String },
 }
 
 impl UpstreamResolver {
@@ -79,10 +76,7 @@ impl UpstreamResolver {
             // Fallback: treat as IP:53 if it looks like an IP.
             Self {
                 addr: addr.to_string(),
-                kind: ResolverKind::Udp(SocketAddr::new(
-                    IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
-                    53,
-                )),
+                kind: ResolverKind::Udp(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53)),
             }
         }
     }
@@ -133,12 +127,7 @@ impl Forwarder {
     /// Forward a DNS query to the appropriate upstream resolver.
     /// `name` is the query name (for route matching), `family` is `"udp"` or
     /// `"tcp"`.
-    pub async fn forward(
-        &self,
-        query: &[u8],
-        _name: &str,
-        family: &str,
-    ) -> Option<Vec<u8>> {
+    pub async fn forward(&self, query: &[u8], _name: &str, family: &str) -> Option<Vec<u8>> {
         // Try default resolvers.
         for resolver in &self.default_resolvers {
             if let Some(resp) = self.send(query, resolver, family).await {
@@ -173,9 +162,7 @@ impl Forwarder {
         family: &str,
     ) -> Option<Vec<u8>> {
         match &resolver.kind {
-            ResolverKind::Doh { url, host } => {
-                self.send_doh(query, url, host).await.ok()
-            }
+            ResolverKind::Doh { url, host } => self.send_doh(query, url, host).await.ok(),
             ResolverKind::Udp(addr) => {
                 // Try UDP first.
                 let udp_resp = self.send_udp(query, addr).await;
@@ -205,11 +192,7 @@ impl Forwarder {
     }
 
     /// Send a DNS query over UDP. Returns `None` on failure.
-    async fn send_udp(
-        &self,
-        query: &[u8],
-        server: &SocketAddr,
-    ) -> Option<Vec<u8>> {
+    async fn send_udp(&self, query: &[u8], server: &SocketAddr) -> Option<Vec<u8>> {
         let sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await.ok()?;
         sock.send_to(query, server).await.ok()?;
 
@@ -223,11 +206,7 @@ impl Forwarder {
 
     /// Send a DNS query over TCP (with 2-byte length prefix).
     /// Ports Go's `sendTCP` (forwarder.go:928).
-    async fn send_tcp(
-        &self,
-        query: &[u8],
-        server: &SocketAddr,
-    ) -> Option<Vec<u8>> {
+    async fn send_tcp(&self, query: &[u8], server: &SocketAddr) -> Option<Vec<u8>> {
         let stream = tokio::time::timeout(TCP_QUERY_TIMEOUT, TcpStream::connect(server))
             .await
             .ok()?

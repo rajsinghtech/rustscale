@@ -2,5 +2,6 @@ target/
 .secrets/
 bench-results/
 tools/bench/bin/
+tools/testcontrol/bin/
 .DS_Store
 .worktrees/

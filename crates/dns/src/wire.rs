@@ -97,11 +97,7 @@ pub fn get_edns_buffer_size(packet: &[u8]) -> Option<u16> {
 /// Check if a response exceeds the maximum allowed UDP size and set the
 /// TC (truncated) flag if needed. Ports Go's `checkResponseSizeAndSetTC`
 /// (forwarder.go:227).
-pub fn check_response_size_and_set_tc(
-    response: &mut [u8],
-    request: &[u8],
-    family: &str,
-) {
+pub fn check_response_size_and_set_tc(response: &mut [u8], request: &[u8], family: &str) {
     const DEFAULT_UDP_SIZE: usize = 512;
 
     if family != "udp" {
@@ -301,7 +297,7 @@ pub fn build_ptr_response(query: &[u8], ptr_name: &str) -> Option<Vec<u8>> {
     resp.extend_from_slice(&qtype::PTR.to_be_bytes()); // TYPE = PTR
     resp.extend_from_slice(&1u16.to_be_bytes()); // CLASS = IN
     resp.extend_from_slice(&300u32.to_be_bytes()); // TTL
-    // RDATA: domain name
+                                                   // RDATA: domain name
     let rdlen_pos = resp.len();
     resp.extend_from_slice(&0u16.to_be_bytes()); // RDLENGTH placeholder
     let rd_start = resp.len();
@@ -437,7 +433,10 @@ mod tests {
         resp.extend(std::iter::repeat_n(0u8, 600));
         assert!(!truncated_flag_set(&resp));
         check_response_size_and_set_tc(&mut resp, &q, "udp");
-        assert!(truncated_flag_set(&resp), "TC should be set for large UDP response");
+        assert!(
+            truncated_flag_set(&resp),
+            "TC should be set for large UDP response"
+        );
     }
 
     #[test]
@@ -462,7 +461,7 @@ mod tests {
         q.push(0); // version
         q.extend_from_slice(&0u16.to_be_bytes()); // flags
         q.extend_from_slice(&0u16.to_be_bytes()); // RDLENGTH = 0
-        // Increment ARCOUNT.
+                                                  // Increment ARCOUNT.
         let ar_count = u16::from_be_bytes([q[10], q[11]]);
         let new_ar = ar_count + 1;
         q[10..12].copy_from_slice(&new_ar.to_be_bytes());

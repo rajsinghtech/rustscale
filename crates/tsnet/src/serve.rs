@@ -29,7 +29,7 @@
 #![allow(non_snake_case)]
 
 use std::collections::BTreeMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -494,17 +494,15 @@ fn build_tls_acceptor(
 // ---------------------------------------------------------------------------
 
 /// Forward a connection to `backend` (an `ip:port` or `host:port` string),
-/// bridging bytes bidirectionally until either side closes.
+/// bridging bytes bidirectionally until either side closes. Hostnames are
+/// resolved via the system resolver (matching Go's `net.Dial`).
 pub(crate) async fn tcp_forward<S>(mut conn: S, backend: &str) -> Result<(), ServeError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let addr: SocketAddr = backend
-        .parse()
-        .map_err(|_| ServeError::BadBackend(backend.to_string()))?;
     let mut back = tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        tokio::net::TcpStream::connect(addr),
+        tokio::net::TcpStream::connect(backend),
     )
     .await
     .map_err(|_| ServeError::BackendConnectTimeout)?

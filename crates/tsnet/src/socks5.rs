@@ -142,8 +142,9 @@ impl ServerSocksDialer {
 #[async_trait]
 impl SocksDialer for ServerSocksDialer {
     async fn dial(&self, addr: &str) -> io::Result<(BoxedStream, SocketAddr)> {
-        let socket_addr =
-            crate::resolve_addr_with(addr, &self.resolver, &self.peers).map_err(tsnet_err_to_io)?;
+        let socket_addr = crate::resolve_addr_with(addr, &self.resolver, &self.peers)
+            .await
+            .map_err(tsnet_err_to_io)?;
         let stream = self
             .netstack
             .dial(socket_addr)
@@ -354,7 +355,8 @@ impl<D: SocksDialer + 'static> Socks5Server<D> {
                 Ok(Ok(s)) => s,
                 Ok(Err(e)) => {
                     eprintln!("socks5: accept failed: {e}");
-                    break;
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
                 }
                 Err(_) => continue, // timeout — re-check cancel
             };

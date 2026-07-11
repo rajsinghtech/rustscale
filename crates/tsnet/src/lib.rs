@@ -1353,10 +1353,13 @@ impl Server {
 
     /// Dial a remote `ip:port` or `hostname:port` (netstack mode only).
     ///
-    /// Returns an error in TUN mode.
+    /// Resolves tailnet hostnames via MagicDNS (short name, FQDN) and
+    /// non-tailnet hostnames via the system resolver (requires an exit
+    /// node for the traffic to reach the internet). Returns an error in
+    /// TUN mode.
     pub async fn dial(&self, addr: &str) -> Result<NetstackStream, TsnetError> {
         let inner = self.inner.as_ref().ok_or(TsnetError::NotUp)?;
-        let socket_addr = resolve_addr(addr, inner)?;
+        let socket_addr = resolve_addr(addr, inner).await?;
         match &inner.data_plane {
             DataPlane::Netstack(ns) => Ok(ns.dial(socket_addr).await?),
             DataPlane::Tun => Err(TsnetError::NotAvailableInTunMode),
@@ -1699,32 +1702,45 @@ async fn run_netstack_pump(
             () = tx_notify.notified() => {}
             _ = wg_timer.tick() => {}
             result = magicsock.poll_recv() => {
-                if let Ok(dgram) = result {
-                    let f = filter.clone();
-                    let drops = packet_drops.clone();
-                    let ns = netstack.clone();
-                    handle_inbound_wg(&magicsock, &wg_tunnels, &dgram, move |pt| {
-                        let dropped = {
-                            let mut filt = f.lock().unwrap();
-                            filt.check_in(&pt).is_drop()
-                        };
-                        if dropped {
-                            drops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            return;
-                        }
-                        ns.push_rx(pt);
-                    }).await;
+                match result {
+                    Ok(dgram) => {
+                        let f = filter.clone();
+                        let drops = packet_drops.clone();
+                        let ns = netstack.clone();
+                        handle_inbound_wg(&magicsock, &wg_tunnels, &dgram, move |pt| {
+                            let dropped = {
+                                let mut filt = f.lock().unwrap();
+                                filt.check_in(&pt).is_drop()
+                            };
+                            if dropped {
+                                drops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                return;
+                            }
+                            ns.push_rx(pt);
+                        }).await;
+                    }
+                    Err(e) => {
+                        eprintln!("tsnet: magicsock recv error: {e}");
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
                 }
             }
         }
 
         // Drain outbound IP packets from netstack → route → WG → magicsock.
-        while let Some(pkt) = netstack.pop_tx() {
+        // Cap the batch size so inbound packets aren't starved under heavy
+        // outbound load (e.g. bulk TCP transfer). A full drain can take long
+        // enough for the magicsock receive buffer to fill and drop inbound.
+        const DRAIN_BATCH: usize = 64;
+        let mut drained = 0;
+        while drained < DRAIN_BATCH {
+            let Some(pkt) = netstack.pop_tx() else { break };
             {
                 let mut filt = filter.lock().unwrap();
                 filt.update_outbound(&pkt);
             }
             encapsulate_and_send(&magicsock, &wg_tunnels, &route_table, &pkt).await;
+            drained += 1;
         }
 
         tick_wg_timers(&magicsock, &wg_tunnels).await;
@@ -1773,30 +1789,36 @@ async fn run_tun_pump(
             }
             // magicsock recv -> WG decapsulate -> filter -> TUN write.
             result = magicsock.poll_recv() => {
-                if let Ok(dgram) = result {
-                    let tunn = {
-                        let tunnels = wg_tunnels.read().await;
-                        tunnels.get(&dgram.peer).cloned()
-                    };
-                    if let Some(tunn) = tunn {
-                        if let Ok(mut t) = tunn.try_lock() {
-                            if let Ok(decap) = t.decapsulate(&dgram.data) {
-                                if let Some(pt) = decap.plaintext {
-                                    let dropped = {
-                                        let mut filt = filter.lock().unwrap();
-                                        filt.check_in(&pt).is_drop()
-                                    };
-                                    if dropped {
-                                        packet_drops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    } else {
-                                        let _ = tun.write_packet(&pt).await;
+                match result {
+                    Ok(dgram) => {
+                        let tunn = {
+                            let tunnels = wg_tunnels.read().await;
+                            tunnels.get(&dgram.peer).cloned()
+                        };
+                        if let Some(tunn) = tunn {
+                            if let Ok(mut t) = tunn.try_lock() {
+                                if let Ok(decap) = t.decapsulate(&dgram.data) {
+                                    if let Some(pt) = decap.plaintext {
+                                        let dropped = {
+                                            let mut filt = filter.lock().unwrap();
+                                            filt.check_in(&pt).is_drop()
+                                        };
+                                        if dropped {
+                                            packet_drops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        } else {
+                                            let _ = tun.write_packet(&pt).await;
+                                        }
                                     }
-                                }
-                                for reply in decap.replies {
-                                    let _ = magicsock.send(dgram.peer.clone(), &reply).await;
+                                    for reply in decap.replies {
+                                        let _ = magicsock.send(dgram.peer.clone(), &reply).await;
+                                    }
                                 }
                             }
                         }
+                    }
+                    Err(e) => {
+                        eprintln!("tsnet: magicsock recv error (tun): {e}");
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     }
                 }
             }
@@ -1851,8 +1873,11 @@ async fn encapsulate_and_send(
     let Some(peer_key) = peer_key else {
         return;
     };
-    let tunnels = wg_tunnels.read().await;
-    if let Some(tunn) = tunnels.get(&peer_key) {
+    let tunn = {
+        let tunnels = wg_tunnels.read().await;
+        tunnels.get(&peer_key).cloned()
+    };
+    if let Some(tunn) = tunn {
         if let Ok(mut t) = tunn.try_lock() {
             if let Ok(dgrams) = t.encapsulate(pkt) {
                 for dg in dgrams {
@@ -1864,17 +1889,29 @@ async fn encapsulate_and_send(
 }
 
 /// Tick WG timers for all peers and send any resulting datagrams.
+///
+/// Collects all timer-generated datagrams while holding the read lock, then
+/// releases the lock before sending. This prevents blocking `spawn_map_update_task`
+/// (which needs a write lock to add new peers) during the potentially many
+/// `magicsock.send().await` calls.
 async fn tick_wg_timers(
     magicsock: &Magicsock,
     wg_tunnels: &RwLock<HashMap<NodePublic, Arc<Mutex<WgTunn>>>>,
 ) {
-    let tunnels = wg_tunnels.read().await;
-    for (peer_key, tunn) in tunnels.iter() {
-        if let Ok(mut t) = tunn.try_lock() {
-            for dg in t.tick_timers() {
-                let _ = magicsock.send(peer_key.clone(), &dg).await;
+    let pending: Vec<(NodePublic, Vec<u8>)> = {
+        let tunnels = wg_tunnels.read().await;
+        let mut out = Vec::new();
+        for (peer_key, tunn) in tunnels.iter() {
+            if let Ok(mut t) = tunn.try_lock() {
+                for dg in t.tick_timers() {
+                    out.push((peer_key.clone(), dg));
+                }
             }
         }
+        out
+    };
+    for (peer_key, dg) in pending {
+        let _ = magicsock.send(peer_key, &dg).await;
     }
 }
 
@@ -2567,17 +2604,18 @@ fn run_cmd(prog: &str, args: &[&str]) -> Result<(), TsnetError> {
     Ok(())
 }
 
-fn resolve_addr(addr: &str, inner: &RunningState) -> Result<SocketAddr, TsnetError> {
-    resolve_addr_with(addr, &inner.resolver, &inner.peers)
+async fn resolve_addr(addr: &str, inner: &RunningState) -> Result<SocketAddr, TsnetError> {
+    resolve_addr_with(addr, &inner.resolver, &inner.peers).await
 }
 
 /// Resolve `addr` (`ip:port`, `hostname:port`, or `host:port`) to a
-/// [`SocketAddr`] using the shared MagicDNS resolver and the peer list.
+/// [`SocketAddr`] using the shared MagicDNS resolver, the peer list, and
+/// finally the system DNS resolver.
 ///
 /// Factored out of [`resolve_addr`] so the SOCKS5 production dialer (which
 /// holds clones of the shared refs, not a `&RunningState`) can reuse the exact
 /// same resolution path as [`Server::dial`].
-fn resolve_addr_with(
+async fn resolve_addr_with(
     addr: &str,
     resolver: &RwLock<MagicDnsResolver>,
     peers: &RwLock<Vec<Node>>,
@@ -2598,31 +2636,42 @@ fn resolve_addr_with(
 
     // Resolve via the shared MagicDNS resolver (unified with the DNS
     // responder at 100.100.100.100:53). Handles FQDNs and short hostnames
-    // from the netmap. Falls back to StableID matching for completeness.
-    if let Ok(r) = resolver.try_read() {
-        if let Some(ip) = r.resolve_first(host) {
-            return Ok(SocketAddr::new(ip, port));
-        }
+    // from the netmap.
+    let r = resolver.read().await;
+    if let Some(ip) = r.resolve_first(host) {
+        return Ok(SocketAddr::new(ip, port));
     }
+    drop(r);
 
-    // Fallback: StableID / suffix match against the peer list (used when
-    // the resolver snapshot is momentarily unavailable).
-    let peers = peers
-        .try_read()
-        .map_err(|_| TsnetError::HostnameNotFound(host.to_string()))?;
+    // Fallback: first-label / suffix / StableID match against the peer
+    // list (used when the resolver snapshot is momentarily unavailable).
+    let peers = peers.read().await;
     let host_lower = host.to_lowercase();
     let host_trimmed = host_lower.trim_end_matches('.');
 
     for peer in peers.iter() {
         let name = peer.Name.to_lowercase();
         let name_trimmed = name.trim_end_matches('.');
+        let first_label = name_trimmed.split('.').next().unwrap_or("");
         if name_trimmed == host_trimmed
+            || first_label == host_trimmed
             || name_trimmed.ends_with(&format!(".{host_trimmed}"))
             || peer.StableID.eq_ignore_ascii_case(host)
         {
             if let Some(ip) = extract_node_ips(peer).first() {
                 return Ok(SocketAddr::new(*ip, port));
             }
+        }
+    }
+    drop(peers);
+
+    // System DNS fallback for non-tailnet hostnames (e.g. when using an
+    // exit node, the SOCKS5 proxy needs to resolve internet names).
+    // Without this, `dial("google.com:443")` or a SOCKS5 CONNECT to a
+    // domain name fails with HostnameNotFound.
+    if let Ok(mut iter) = tokio::net::lookup_host((host, port)).await {
+        if let Some(sa) = iter.next() {
+            return Ok(sa);
         }
     }
 

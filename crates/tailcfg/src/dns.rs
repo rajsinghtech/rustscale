@@ -42,7 +42,7 @@ where
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Resolver {
     /// Resolver address: a plain IP, `IP:port`, or a DoH URL.
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(default, skip_serializing_if = "skip_default", deserialize_with = "deserialize_null_to_default")]
     pub Addr: String,
 }
 
@@ -90,7 +90,7 @@ pub struct DNSConfig {
     )]
     pub Domains: Vec<String>,
     /// Whether MagicDNS (peer-name resolution from the netmap) is on.
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(default, skip_serializing_if = "skip_default", deserialize_with = "deserialize_null_to_default")]
     pub Proxied: bool,
     /// DNS names for which control assists with LE cert provisioning. A
     /// non-empty list signals the tailnet has HTTPS enabled.
@@ -121,12 +121,14 @@ pub struct DNSConfig {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DNSRecord {
     /// FQDN of the record (trailing dot optional).
+    #[serde(default, deserialize_with = "deserialize_null_to_default")]
     pub Name: String,
     /// DNS record type; empty means A or AAAA depending on `Value`.
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(default, skip_serializing_if = "skip_default", deserialize_with = "deserialize_null_to_default")]
     #[allow(non_snake_case)]
     pub Type: String,
     /// IP address in string form.
+    #[serde(default, deserialize_with = "deserialize_null_to_default")]
     pub Value: String,
 }
 
@@ -139,15 +141,20 @@ pub struct DNSRecord {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SetDNSRequest {
     /// Client capability version.
+    #[serde(default, deserialize_with = "deserialize_null_to_default")]
     pub Version: CapabilityVersion,
     /// The client's current node public key.
+    #[serde(default, deserialize_with = "deserialize_null_to_default")]
     pub NodeKey: NodeKey,
     /// Domain name to create a record for.
+    #[serde(default, deserialize_with = "deserialize_null_to_default")]
     pub Name: String,
     /// DNS record type (e.g. `"TXT"`).
+    #[serde(default, deserialize_with = "deserialize_null_to_default")]
     #[allow(non_snake_case)]
     pub Type: String,
     /// Value to add.
+    #[serde(default, deserialize_with = "deserialize_null_to_default")]
     pub Value: String,
 }
 
@@ -160,13 +167,16 @@ pub struct SetDNSResponse {}
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserProfile {
     /// User ID (matches `Node.User`).
+    #[serde(default, deserialize_with = "deserialize_null_to_default")]
     pub ID: UserID,
     /// Login name, e.g. `"alice@example.com"` (provider not listed).
+    #[serde(default, deserialize_with = "deserialize_null_to_default")]
     pub LoginName: String,
     /// Display name, e.g. `"Alice Smith"`.
+    #[serde(default, deserialize_with = "deserialize_null_to_default")]
     pub DisplayName: String,
     /// Profile picture URL.
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(default, skip_serializing_if = "skip_default", deserialize_with = "deserialize_null_to_default")]
     pub ProfilePicURL: String,
 }
 

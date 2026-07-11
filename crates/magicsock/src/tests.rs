@@ -306,8 +306,8 @@ async fn direct_path_upgrade_over_udp() {
     .await
     .expect("B magicsock");
 
-    let a_udp = a.local_udp_addrs()[0].clone();
-    let b_udp = b.local_udp_addrs()[0].clone();
+    let a_udp = a.bound_udp_addr().unwrap().to_string();
+    let b_udp = b.bound_udp_addr().unwrap().to_string();
 
     let b_peer = make_peer(b.node_public(), b.disco_public(), vec![b_udp], 1);
     let a_peer = make_peer(a.node_public(), a.disco_public(), vec![a_udp], 1);
@@ -397,8 +397,8 @@ async fn trust_expiry_downgrades_to_derp() {
     .await
     .expect("B magicsock");
 
-    let a_udp = a.local_udp_addrs()[0].clone();
-    let b_udp = b.local_udp_addrs()[0].clone();
+    let a_udp = a.bound_udp_addr().unwrap().to_string();
+    let b_udp = b.bound_udp_addr().unwrap().to_string();
     let b_peer = make_peer(b.node_public(), b.disco_public(), vec![b_udp], 1);
     let a_peer = make_peer(a.node_public(), a.disco_public(), vec![a_udp], 1);
     a.set_netmap(vec![b_peer]).await.unwrap();

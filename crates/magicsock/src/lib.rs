@@ -531,6 +531,15 @@ impl Magicsock {
             .clone()
     }
 
+    /// The actual address the UDP socket is bound on, if any. This is the
+    /// address peers should use to reach us when the socket is bound to a
+    /// specific interface (e.g. loopback in tests). Distinct from
+    /// `local_udp_addrs`, which enumerates all host interface IPs paired
+    /// with the port for control-plane advertisement.
+    pub fn bound_udp_addr(&self) -> Option<std::net::SocketAddr> {
+        self.inner.udp.as_ref()?.local_addr().ok()
+    }
+
     /// Local interface endpoints (IP:port) to advertise in the MapRequest
     /// `Endpoints` field and in CallMeMaybe. Includes the bound UDP port
     /// paired with each up, non-link-local IPv4 interface address on the

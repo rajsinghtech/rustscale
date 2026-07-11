@@ -1,15 +1,15 @@
-mod socks;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 mod other;
+mod socks;
 
-#[cfg(target_os = "macos")]
-use macos::control_and_connect;
 #[cfg(target_os = "linux")]
 use linux::control_and_connect;
+#[cfg(target_os = "macos")]
+use macos::control_and_connect;
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 use other::control_and_connect;
 

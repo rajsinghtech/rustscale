@@ -42,11 +42,22 @@ Peer MTU discovery (`magicsock/peermtu.go`) · GSO/GRO batching
 (`net/batching/`, Linux CI) · io_uring TUN+socket (Linux) · BPF disco filtering
 (`magicsock_linux.go`) · Flow tracking (`net/flowtrack/`) · sockstats ·
 tcpinfo · ICMP ping (`net/ping/`) · DNS cache + fallback (`net/dnscache/`,
-`net/dnsfallback/`) · CapturePcap · Logtail · Watchdog · Syspolicy · Captive
-portal detection (Report field exists, unwired 🔶) · C2N debug endpoints ·
-Netmap disk cache (offline startup) · Web client UI · BIRD routing · Linux
+`net/dnsfallback/`) ✅ phase-19 (`crates/dnscache` TTL+singleflight+last-good,
+`crates/dnsfallback` bootstrap-dns over embedded DERP IPs + DERP map disk
+cache; wired into controlclient dial) · CapturePcap · Logtail · Watchdog ·
+Syspolicy · Captive
+portal detection (Report field exists, unwired 🔶) · C2N debug endpoints
+(🔶 phase-14 server + auth done, most handlers stub 501 — see
+docs/validation-2026-07-11.md) ·
+Netmap disk cache (offline startup) (🔶 phase-15 single-blob cache in tsnet
+state.rs; Go columnar store + controlclient wiring pending) · Web client UI ·
+BIRD routing · Linux
 ipset · envknob · version package · Freedesktop/DBus · System tray. All ⬜
-unless noted.
+unless noted. Control knobs (`control/controlknobs/`) ✅ phase-17
+(`crates/controlknobs`, CapMap→knobs in controlclient, tsnet accessor).
+PeerAPI (`ipn/ipnlocal/peerapi.go`) ✅ phase-18 (tsnet peerapi.rs: DoH
+/dns-query, /v0/* endpoints, WhoIs auth, CRC32 port, peerapi4/6 Service
+advertisement); Hostinfo 27/36 fields (gaps in validation doc).
 
 ## Tier 5: Server-side (out of scope for the client)
 

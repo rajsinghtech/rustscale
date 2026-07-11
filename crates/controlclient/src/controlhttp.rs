@@ -25,6 +25,133 @@ const HANDSHAKE_HEADER: &str = "X-Tailscale-Handshake";
 /// The URL path for the protocol upgrade.
 const UPGRADE_PATH: &str = "/ts2021";
 
+/// A boxed async read+write stream — either a TLS stream or a plain TCP
+/// stream. Used by [`dial_control`] to return a uniform type regardless of
+/// whether the control URL uses `https://` (TLS) or `http://` (plain TCP,
+/// for in-process test fakes like `rustscale-testcontrol`).
+pub enum AnyStream {
+    /// TLS-encrypted TCP (production control plane).
+    Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
+    /// Plain TCP (for testcontrol and local fakes).
+    Plain(TcpStream),
+}
+
+impl tokio::io::AsyncRead for AnyStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            Self::Tls(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            Self::Plain(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for AnyStream {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match &mut *self {
+            Self::Tls(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            Self::Plain(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            Self::Tls(s) => std::pin::Pin::new(s).poll_flush(cx),
+            Self::Plain(s) => std::pin::Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            Self::Tls(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            Self::Plain(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
+/// Parsed control-plane URL: scheme, host, port, and the `host:port` string
+/// for HTTP `Host` headers.
+struct ParsedUrl {
+    /// `"http"` for plain TCP (test fakes), `"https"` for TLS (production).
+    is_plain: bool,
+    /// Hostname or IP without port.
+    host: String,
+    /// `host:port` — for the HTTP `Host` header and `ServerName`.
+    host_port: String,
+    /// TCP port.
+    port: u16,
+}
+
+/// Parse a control-plane URL string into scheme/host/port.
+///
+/// Accepted forms:
+/// - `"controlplane.tailscale.com"` → TLS to port 443 (bare hostname).
+/// - `"https://control.example.com:8443"` → TLS to 8443.
+/// - `"http://127.0.0.1:12345"` → plain TCP to 12345 (for test fakes).
+fn parse_control_url(url: &str) -> ParsedUrl {
+    if let Some(rest) = url.strip_prefix("http://") {
+        let (host, port) = split_host_port(rest, 80);
+        ParsedUrl {
+            is_plain: true,
+            host_port: format!("{host}:{port}"),
+            host,
+            port,
+        }
+    } else if let Some(rest) = url.strip_prefix("https://") {
+        let (host, port) = split_host_port(rest, 443);
+        ParsedUrl {
+            is_plain: false,
+            host_port: format!("{host}:{port}"),
+            host,
+            port,
+        }
+    } else {
+        ParsedUrl {
+            is_plain: false,
+            host_port: format!("{url}:443"),
+            host: url.to_string(),
+            port: 443,
+        }
+    }
+}
+
+/// Split `host:port` or `[::1]:port` into (host, port), defaulting to
+/// `default_port` if no port is present.
+fn split_host_port(s: &str, default_port: u16) -> (String, u16) {
+    if s.starts_with('[') {
+        if let Some(end) = s.find(']') {
+            let host = &s[1..end];
+            let rest = &s[end + 1..];
+            if let Some(port_str) = rest.strip_prefix(':') {
+                if let Ok(p) = port_str.parse::<u16>() {
+                    return (host.to_string(), p);
+                }
+            }
+            return (host.to_string(), default_port);
+        }
+    }
+    if let Some(colon) = s.rfind(':') {
+        let port_str = &s[colon + 1..];
+        if let Ok(p) = port_str.parse::<u16>() {
+            return (s[..colon].to_string(), p);
+        }
+    }
+    (s.to_string(), default_port)
+}
+
 /// Process-wide DNS cache resolver with DERP bootstrap fallback.
 ///
 /// Initialized lazily on first use. Uses `UseLastGood` so a stale cached IP
@@ -110,80 +237,121 @@ where
     }
 }
 
-/// Dial the control server at `host:443` over TLS, perform the `/ts2021`
-/// upgrade, and complete the Noise handshake.
+/// Dial the control server, perform the `/ts2021` upgrade, and complete the
+/// Noise handshake.
 ///
 /// `control_key` is the server's machine public key (fetched beforehand via
 /// [`fetch_server_pub_key`]). Returns a [`NoiseStream`] ready for encrypted
 /// control-plane messages.
+///
+/// For `http://` URLs (in-process test fakes) this uses plain TCP; for bare
+/// hostnames or `https://` URLs it uses TLS to port 443 (or the specified
+/// port).
 pub async fn dial_control(
-    host: &str,
+    url: &str,
     machine_key: &MachinePrivate,
     control_key: &MachinePublic,
     version: ProtocolVersion,
-) -> Result<NoiseStream<tokio_rustls::client::TlsStream<TcpStream>>, DialError> {
-    let tls_stream = tls_connect(host).await?;
-    upgrade_and_handshake(tls_stream, host, machine_key, control_key, version).await
+) -> Result<NoiseStream<AnyStream>, DialError> {
+    let parsed = parse_control_url(url);
+    if parsed.is_plain {
+        let tcp = tokio::net::TcpStream::connect((parsed.host.as_str(), parsed.port))
+            .await
+            .map_err(DialError::Io)?;
+        let stream = AnyStream::Plain(tcp);
+        upgrade_and_handshake(stream, &parsed.host_port, machine_key, control_key, version).await
+    } else {
+        let tls_stream = tls_connect(&parsed.host, parsed.port).await?;
+        let stream = AnyStream::Tls(Box::new(tls_stream));
+        upgrade_and_handshake(stream, &parsed.host, machine_key, control_key, version).await
+    }
 }
 
-/// Fetch the server's Noise public key via `GET /key?v=<version>` over plain
-/// HTTPS (matching Go's `loadServerPubKeys` in `controlclient/direct.go`).
+/// Fetch the server's Noise public key via `GET /key?v=<version>` (matching
+/// Go's `loadServerPubKeys` in `controlclient/direct.go`).
 ///
-/// This is a regular TLS request — no Noise. The response JSON has
+/// This is a regular HTTP(S) request — no Noise. The response JSON has
 /// `{"publicKey":"mkey:...","legacyPublicKey":"mkey:..."}`. We return the
 /// `publicKey` field (the Noise transport key).
+///
+/// For `http://` URLs (in-process test fakes) this uses plain TCP; for bare
+/// hostnames or `https://` URLs it uses TLS to port 443 (or the specified
+/// port).
 pub async fn fetch_server_pub_key(
-    host: &str,
+    url: &str,
     version: ProtocolVersion,
 ) -> Result<MachinePublic, DialError> {
-    ensure_ring_provider();
+    let parsed = parse_control_url(url);
 
-    let tcp = dns_resolver()
-        .dial_tcp(host, 443)
-        .await
-        .map_err(|e| DialError::Io(std::io::Error::other(e.to_string())))?;
+    let read_buf: Vec<u8> = if parsed.is_plain {
+        // Plain TCP — no TLS (for testcontrol and local fakes).
+        let mut tcp = tokio::net::TcpStream::connect((parsed.host.as_str(), parsed.port))
+            .await
+            .map_err(DialError::Io)?;
 
-    let root_store = rustls::RootCertStore {
-        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+        let request = format!(
+            "GET /key?v={version} HTTP/1.1\r\n\
+             Host: {host_port}\r\n\
+             Connection: close\r\n\
+             \r\n",
+            host_port = parsed.host_port,
+        );
+        tcp.write_all(request.as_bytes())
+            .await
+            .map_err(DialError::Io)?;
+
+        let mut buf = Vec::with_capacity(4096);
+        tcp.read_to_end(&mut buf).await.map_err(DialError::Io)?;
+        buf
+    } else {
+        ensure_ring_provider();
+
+        let tcp = dns_resolver()
+            .dial_tcp(&parsed.host, parsed.port)
+            .await
+            .map_err(|e| DialError::Io(std::io::Error::other(e.to_string())))?;
+
+        let root_store = rustls::RootCertStore {
+            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+        };
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+
+        let server_name = ServerName::try_from(parsed.host.clone())
+            .map_err(|e| DialError::Tls(format!("invalid server name: {e}")))?;
+        let mut tls = connector
+            .connect(server_name, tcp)
+            .await
+            .map_err(|e| DialError::Tls(e.to_string()))?;
+
+        let request = format!(
+            "GET /key?v={version} HTTP/1.1\r\n\
+             Host: {host}\r\n\
+             Connection: close\r\n\
+             \r\n",
+            host = parsed.host,
+        );
+        tls.write_all(request.as_bytes())
+            .await
+            .map_err(DialError::Io)?;
+
+        let mut buf = Vec::with_capacity(4096);
+        tls.read_to_end(&mut buf).await.map_err(DialError::Io)?;
+        buf
     };
-    let config = rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
-
-    let server_name = ServerName::try_from(host.to_string())
-        .map_err(|e| DialError::Tls(format!("invalid server name: {e}")))?;
-    let mut tls = connector
-        .connect(server_name, tcp)
-        .await
-        .map_err(|e| DialError::Tls(e.to_string()))?;
-
-    // Send a simple GET /key?v=<version>
-    let request = format!(
-        "GET /key?v={version} HTTP/1.1\r\n\
-         Host: {host}\r\n\
-         Connection: close\r\n\
-         \r\n"
-    );
-    tls.write_all(request.as_bytes())
-        .await
-        .map_err(DialError::Io)?;
-
-    // Read the full response (headers + body).
-    let mut buf = Vec::with_capacity(4096);
-    tls.read_to_end(&mut buf).await.map_err(DialError::Io)?;
 
     // Find the body (after \r\n\r\n).
-    let body_start = buf
+    let body_start = read_buf
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
         .map(|p| p + 4)
         .ok_or_else(|| DialError::Malformed("no body in /key response".into()))?;
 
-    let body = &buf[body_start..];
+    let body = &read_buf[body_start..];
 
     // Parse JSON: {"publicKey":"mkey:...","legacyPublicKey":"mkey:..."}
-    // Defined at module level to avoid "adding items after statements" warning.
     let resp: Option<KeyResponse> = serde_json::from_slice(body).ok();
 
     if let Some(resp) = resp {
@@ -220,15 +388,15 @@ fn ensure_ring_provider() {
     });
 }
 
-/// Establish a TLS connection to `host:443`.
+/// Establish a TLS connection to `host:port`.
 ///
 /// Uses the shared DNS cache resolver with DERP fallback so that control-plane
 /// connections survive broken system DNS (matching Go's `dnscache.Dialer`
 /// wrapping the control client's transport).
-async fn tls_connect(host: &str) -> Result<tokio_rustls::client::TlsStream<TcpStream>, DialError> {
+async fn tls_connect(host: &str, port: u16) -> Result<tokio_rustls::client::TlsStream<TcpStream>, DialError> {
     ensure_ring_provider();
     let tcp = dns_resolver()
-        .dial_tcp(host, 443)
+        .dial_tcp(host, port)
         .await
         .map_err(|e| DialError::Io(std::io::Error::other(e.to_string())))?;
 

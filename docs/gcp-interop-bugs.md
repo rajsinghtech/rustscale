@@ -1,4 +1,15 @@
-# GCP Interop Bug Report — 2026-07-10
+# GCP Interop Bug Report — 2026-07-11
+
+## Fix status (updated after agents ran)
+
+| Bug | Status | Fix |
+|-----|--------|-----|
+| Bug 2: fetch_map false error | FIXED | Added `send_map_request()` |
+| Bug 3: MagicDNS bind failure | FIXED | Fallback to 127.0.0.1:0 |
+| Bug 4: No periodic endpoint updates | FIXED | `spawn_periodic_endpoint_updates()` every 5 min |
+| Bug 6: DERP keepalive missing | FIXED | PING/PONG handling + 60s keepalive task |
+| Bug 7: NetInfo missing from Hostinfo | FIXED | Added NetInfo field + PreferredDERP in all MapRequests |
+| Bug 1+5: HomeDERP not in netmap | INVESTIGATING | DERP handshake now completes (ServerInfo read), connection stays alive (keepalive), NetInfo sent — but peers still see `Relay: ""` |
 
 ## Environment
 - **GCP VM**: `rs-gcp-interop` (us-east1-b, 34.24.127.181, n1-standard-4, Ubuntu 22.04)

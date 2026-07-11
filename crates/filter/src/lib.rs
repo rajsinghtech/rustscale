@@ -142,6 +142,9 @@ impl Filter {
 
     /// Check an inbound raw IP packet.
     pub fn check_in(&mut self, buf: &[u8]) -> Response {
+        if buf.is_empty() {
+            return Response::Accept;
+        }
         let Some(info) = packet::parse_packet(buf) else {
             return Response::Drop;
         };

@@ -74,7 +74,8 @@ async fn do_request(
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timeout"))??;
     stream.write_all(req.as_bytes()).await?;
     let mut buf = Vec::with_capacity(4096);
-    timeout(deadline, stream.read_to_end(&mut buf))
+    let mut limited = stream.take(MAX_BODY as u64);
+    timeout(deadline, limited.read_to_end(&mut buf))
         .await
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "read timeout"))??;
     if buf.len() > MAX_BODY {

@@ -58,6 +58,10 @@ async-trait = "0.1"
 # stage; real LE certs via control come in a later phase).
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 
+socket2 = { version = "0.10", features = ["all"] }
+rustscale-netns = { path = "crates/netns" }
+rustscale-netmon = { path = "crates/netmon" }
+
 # Shared lint policy: pedantic where sane, but allow the noisier style lints so
 # that the default `cargo clippy` run stays clean and readable.
 [workspace.lints.rust]

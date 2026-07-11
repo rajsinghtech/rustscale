@@ -99,15 +99,12 @@ impl Tun for TunDevice {
     }
 
     async fn write_packet(&self, packet: &[u8]) -> io::Result<()> {
+        let mut buf = packet.to_vec();
         loop {
             let mut guard = self.afd.writable().await?;
-            let packet = packet.to_vec();
             match guard.try_io(|afd| {
                 let fd = afd.get_ref().as_raw_fd();
-                // SAFETY: write the packet buffer through the raw fd.
-                let n = unsafe {
-                    libc::write(fd, packet.as_ptr().cast::<libc::c_void>(), packet.len())
-                };
+                let n = unsafe { libc::write(fd, buf.as_ptr().cast::<libc::c_void>(), buf.len()) };
                 if n < 0 {
                     Err(io::Error::last_os_error())
                 } else {
@@ -115,10 +112,10 @@ impl Tun for TunDevice {
                 }
             }) {
                 Ok(Ok(n)) => {
-                    if n == packet.len() {
+                    if n == buf.len() {
                         return Ok(());
                     }
-                    // Partial write: continue with the remainder on the next ready.
+                    buf.drain(..n);
                 }
                 Ok(Err(e)) => return Err(e),
                 Err(_would_block) => {}

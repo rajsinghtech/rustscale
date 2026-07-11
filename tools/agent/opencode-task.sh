@@ -145,11 +145,12 @@ while :; do
             +
             ([.parts[]? | select(.type=="tool" or .type=="tool_use") | select(.state?.status == "completed")] | if length > 0 then "has_tools" else "" end)
           end')
-      if [[ "$LAST_MSG" == "empty_session" ]]; then
+      if [[ "$LAST_MSG" == "empty_session" && $NUDGED -ge 1 ]]; then
         break
       fi
-      # Re-prompt only when last message has NO text AND NO completed tool calls.
-      if [[ "$LAST_MSG" != *"has_tools"* && "$LAST_MSG" != *"has_text"* && $NUDGED -eq 0 ]]; then
+      # Re-prompt when there is no assistant message at all, or the last one
+      # has NO text AND NO completed tool calls.
+      if [[ "$LAST_MSG" == "empty_session" || ( "$LAST_MSG" != *"has_tools"* && "$LAST_MSG" != *"has_text"* ) ]] && [[ $NUDGED -eq 0 ]]; then
         echo "[harness] last message has no text and no tool calls — re-prompting once" >&2
         NUDGED=1; IDLE=0
         curl -sfS --max-time 10 -o /dev/null -X POST "$URL/session/$SID/prompt_async?directory=$DIR" \

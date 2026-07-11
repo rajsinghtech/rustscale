@@ -34,6 +34,7 @@ pub use relay::{decode_geneve, encode_geneve, RelayHandshake, RelayPhase, GENEVE
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use rustscale_derp::DerpClient;
 use rustscale_disco::{CallMeMaybe, Message, Ping, Pong};
@@ -154,6 +155,11 @@ struct DerpManager {
     /// demux loop. Each lazy connection spawns a recv task that sends to
     /// this channel.
     derp_recv_tx: mpsc::Sender<(i32, NodePublic, Vec<u8>)>,
+    /// Channel for DERP recv consumers to signal that their underlying
+    /// connection has died and needs reconnection. The reconnect supervisor
+    /// task (spawned in [`spawn_recv_tasks`]) listens on this channel and
+    /// calls [`DerpManager::reconnect_region`] with exponential backoff.
+    reconnect_tx: mpsc::UnboundedSender<i32>,
     /// Optional health tracker for reporting DERP home reachability.
     health: Option<rustscale_health::Tracker>,
 }
@@ -165,8 +171,13 @@ impl DerpManager {
         node_private: NodePrivate,
         home_region: i32,
         health: Option<rustscale_health::Tracker>,
-    ) -> (Self, mpsc::Receiver<(i32, NodePublic, Vec<u8>)>) {
+    ) -> (
+        Self,
+        mpsc::Receiver<(i32, NodePublic, Vec<u8>)>,
+        mpsc::UnboundedReceiver<i32>,
+    ) {
         let (derp_recv_tx, derp_recv_rx) = mpsc::channel(256);
+        let (reconnect_tx, reconnect_rx) = mpsc::unbounded_channel();
 
         let mut connections = HashMap::new();
 
@@ -174,7 +185,12 @@ impl DerpManager {
         if let Some(client) = home_client {
             let region = if home_region > 0 { home_region } else { 1 };
             let io = Arc::new(DerpIo::spawn(client));
-            spawn_derp_recv_consumer(region, io.clone(), derp_recv_tx.clone());
+            spawn_derp_recv_consumer(
+                region,
+                io.clone(),
+                derp_recv_tx.clone(),
+                reconnect_tx.clone(),
+            );
             connections.insert(region, io);
         }
 
@@ -184,10 +200,11 @@ impl DerpManager {
             node_private,
             home_region,
             derp_recv_tx,
+            reconnect_tx,
             health,
         };
 
-        (mgr, derp_recv_rx)
+        (mgr, derp_recv_rx, reconnect_rx)
     }
 
     /// Get the DerpIo for a region, lazily connecting if needed.
@@ -290,9 +307,69 @@ impl DerpManager {
             conns.insert(region_id, io.clone());
         }
 
-        spawn_derp_recv_consumer(region_id, io.clone(), self.derp_recv_tx.clone());
+        spawn_derp_recv_consumer(
+            region_id,
+            io.clone(),
+            self.derp_recv_tx.clone(),
+            self.reconnect_tx.clone(),
+        );
 
         Some(io)
+    }
+
+    /// Reconnect to a DERP region after the previous connection died.
+    /// Removes the stale connection from the map, then retries with
+    /// exponential backoff (2 s, 4 s, 8 s, …, 60 s cap) until a new
+    /// connection is established or the region is no longer in the
+    /// DERPMap. [`get_or_connect`] spawns the new recv consumer
+    /// automatically on success.
+    async fn reconnect_region(&self, region_id: i32) {
+        // Remove the dead connection (if still present) and abort its tasks.
+        {
+            let mut conns = self
+                .connections
+                .write()
+                .expect("derp connections lock poisoned");
+            if let Some(old_io) = conns.remove(&region_id) {
+                old_io.close();
+            }
+        }
+
+        // If the region doesn't exist in the DERPMap, there's nothing to
+        // reconnect to — give up.
+        let has_region = {
+            let map = self.derp_map.read().expect("derp_map lock poisoned");
+            map.as_ref()
+                .is_some_and(|m| m.Regions.contains_key(&region_id))
+        };
+        if !has_region {
+            if debug_enabled() {
+                eprintln!("DBG derp_reconnect region={region_id} no DERPMap entry, giving up");
+            }
+            return;
+        }
+
+        let mut delay = Duration::from_secs(2);
+        let max_delay = Duration::from_secs(60);
+
+        loop {
+            if debug_enabled() {
+                eprintln!("DBG derp_reconnect region={region_id} attempt delay={delay:?}");
+            }
+            tokio::time::sleep(delay).await;
+
+            if self.get_or_connect(region_id).await.is_some() {
+                if debug_enabled() {
+                    eprintln!("DBG derp_reconnect region={region_id} OK");
+                }
+                return;
+            }
+
+            if debug_enabled() {
+                eprintln!("DBG derp_reconnect region={region_id} failed, backing off");
+            }
+            delay = (delay * 2).min(max_delay);
+        }
     }
 
     /// Send a packet to `dst` via the DERP server for `region_id`.
@@ -345,11 +422,14 @@ impl DerpManager {
 }
 
 /// Spawn a task that reads from a DerpIo connection and forwards received
-/// packets to the shared derp_recv channel for demux.
+/// packets to the shared derp_recv channel for demux. When the underlying
+/// connection dies (reader task exits, `try_recv` returns `None`), the
+/// region is signaled for automatic reconnection via `reconnect_tx`.
 fn spawn_derp_recv_consumer(
     region_id: i32,
     io: Arc<DerpIo>,
     tx: mpsc::Sender<(i32, NodePublic, Vec<u8>)>,
+    reconnect_tx: mpsc::UnboundedSender<i32>,
 ) {
     tokio::spawn(async move {
         while let Some((source, data)) = io.try_recv().await {
@@ -357,6 +437,9 @@ fn spawn_derp_recv_consumer(
                 break;
             }
         }
+        // Recv loop exited — the underlying DERP connection has died.
+        // Signal for reconnection with exponential backoff.
+        let _ = reconnect_tx.send(region_id);
     });
 }
 
@@ -398,7 +481,7 @@ impl Magicsock {
         };
 
         // Create the DERP manager with the home region connection + DERPMap.
-        let (derp, derp_recv_rx) = DerpManager::new(
+        let (derp, derp_recv_rx, reconnect_rx) = DerpManager::new(
             config.derp_client,
             config.derp_map,
             config.private_key.clone(),
@@ -420,8 +503,8 @@ impl Magicsock {
             disable_direct_paths: config.disable_direct_paths,
         });
 
-        // Launch background recv tasks (UDP + DERP demux).
-        spawn_recv_tasks(inner.clone(), derp_recv_rx);
+        // Launch background recv tasks (UDP + DERP demux + reconnect supervisor).
+        spawn_recv_tasks(inner.clone(), derp_recv_rx, reconnect_rx);
 
         Ok(Self {
             inner,
@@ -853,11 +936,12 @@ impl Magicsock {
     }
 }
 
-/// Spawn a DERP recv task that feeds received packets into the WG/disco demux.
-/// This is called for each connection (home + lazy).
-
 /// Launch background UDP recv task + DERP demux task.
-fn spawn_recv_tasks(inner: Arc<Inner>, derp_recv_rx: mpsc::Receiver<(i32, NodePublic, Vec<u8>)>) {
+fn spawn_recv_tasks(
+    inner: Arc<Inner>,
+    derp_recv_rx: mpsc::Receiver<(i32, NodePublic, Vec<u8>)>,
+    reconnect_rx: mpsc::UnboundedReceiver<i32>,
+) {
     // UDP recv task. After the first async recv_from wakes us, drain any
     // additional immediately-available packets with try_recv_from before
     // awaiting again. This batches a burst of packets per wakeup (e.g. a
@@ -888,11 +972,26 @@ fn spawn_recv_tasks(inner: Arc<Inner>, derp_recv_rx: mpsc::Receiver<(i32, NodePu
     // DERP demux task: consumes from all DERP region recv consumers and
     // dispatches to handle_derp_packet. This single task handles packets
     // from ALL connected regions (home + lazy).
-    let inner2 = inner;
+    let inner2 = inner.clone();
     tokio::spawn(async move {
         let mut derp_recv_rx = derp_recv_rx;
         while let Some((region_id, source, data)) = derp_recv_rx.recv().await {
             inner2.handle_derp_packet(&data, source, region_id).await;
+        }
+    });
+
+    // DERP reconnect supervisor: listens for dead-connection signals from
+    // recv consumers and spawns a per-region reconnect task with
+    // exponential backoff. Each region gets its own task so multiple
+    // regions can reconnect in parallel without blocking each other.
+    let inner3 = inner;
+    tokio::spawn(async move {
+        let mut reconnect_rx = reconnect_rx;
+        while let Some(region_id) = reconnect_rx.recv().await {
+            let inner = inner3.clone();
+            tokio::spawn(async move {
+                inner.derp.reconnect_region(region_id).await;
+            });
         }
     });
 }

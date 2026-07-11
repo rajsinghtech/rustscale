@@ -50,6 +50,19 @@ pub const DEFAULT_MTU: usize = 1280;
 /// larger defaults.)
 const TCP_BUF: usize = 256 * 1024;
 
+/// Number of passive listening sockets maintained per port. Each smoltcp
+/// TCP socket can only handle one connection at a time (Listen →
+/// SynReceived → Established), so a single listening socket drops SYNs that
+/// arrive while a handshake is in progress. Maintaining a pool of N
+/// listening sockets allows N simultaneous handshakes — the same role as
+/// the OS `listen(backlog)` parameter.
+const LISTEN_BACKLOG: usize = 32;
+
+/// Depth of the accept channel between the poll loop and the application's
+/// `Listener::accept()` call. Large enough to buffer a burst of accepted
+/// connections without blocking the poll loop.
+const ACCEPT_CHANNEL_DEPTH: usize = 64;
+
 /// Errors from netstack operations.
 #[derive(Debug, thiserror::Error)]
 pub enum NetstackError {
@@ -327,11 +340,17 @@ struct ConnState {
     pending_write: Vec<u8>,
 }
 
-/// A TCP listener's socket handle + accept channel sender.
-type ListenerEntry = (
-    SocketHandle,
-    mpsc::Sender<Result<NetstackStream, NetstackError>>,
-);
+/// A TCP listener's socket backlog + accept channel sender.
+struct ListenerEntry {
+    /// Pool of passive listening sockets. Each can accept one connection
+    /// (Listen → SynReceived → Established). When one transitions to
+    /// Established it's removed from the pool and re-added as a connection;
+    /// a fresh listening socket takes its place, maintaining the backlog
+    /// depth.
+    handles: Vec<SocketHandle>,
+    /// Delivers accepted connections to the application's `Listener`.
+    accept_tx: mpsc::Sender<Result<NetstackStream, NetstackError>>,
+}
 
 /// A pending dial awaiting connection establishment.
 struct PendingDial {
@@ -441,32 +460,81 @@ async fn poll_loop(
         let now = smol_now();
         let _ = iface.poll(now, &mut device, &mut sockets);
 
-        // Pass 1: process listeners (accept new connections).
-        let listener_ports: Vec<u16> = listeners.keys().copied().collect();
-        for port in listener_ports {
-            let listener_handle = listeners.get(&port).map(|(h, _)| *h);
-            let Some(lh) = listener_handle else { continue };
+        // Pass 1: process listeners (accept new connections + replenish
+        // backlog). Each listening socket can accept exactly one connection
+        // (Listen → SynReceived → Established). We scan all sockets in each
+        // listener's backlog pool, accept any that reached Established, and
+        // replace them with fresh listening sockets so the backlog depth is
+        // maintained. Dead sockets (failed handshakes, timed out) are also
+        // replaced.
+        {
+            let listener_ports: Vec<u16> = listeners.keys().copied().collect();
+            let smol_addr = to_smoltcp_v4(addr);
+            for port in listener_ports {
+                let endpoint = IpListenEndpoint::from((smol_addr, port));
 
-            let state = sockets.get::<tcp::Socket>(lh).state();
-            if state == State::Established {
-                // Accept: remove the listener socket, re-add as a connection,
-                // and create a fresh listening socket.
-                let accepted = sockets.remove(lh);
-                let conn_handle = sockets.add(accepted);
-
-                let (stream, conn) = make_stream_and_conn(notify.clone());
-                conns.insert(conn_handle, conn);
-
-                if let Some((_, accept_tx)) = listeners.get(&port) {
-                    let _ = accept_tx.try_send(Ok(stream));
+                // Collect handles to process (Established or dead).
+                let mut to_accept: Vec<SocketHandle> = Vec::new();
+                let mut to_replace: Vec<SocketHandle> = Vec::new();
+                if let Some(entry) = listeners.get(&port) {
+                    for &h in &entry.handles {
+                        let state = sockets.get::<tcp::Socket>(h).state();
+                        match state {
+                            State::Established => to_accept.push(h),
+                            State::Closed | State::TimeWait => to_replace.push(h),
+                            _ => {}
+                        }
+                    }
                 }
 
-                // Create a fresh listener.
-                let mut fresh = new_tcp_socket();
-                let _ = fresh.listen(IpListenEndpoint::from((to_smoltcp_v4(addr), port)));
-                let fresh_handle = sockets.add(fresh);
-                if let Some(entry) = listeners.get_mut(&port) {
-                    entry.0 = fresh_handle;
+                // Accept established connections. Skip if the accept channel
+                // is full — leave the socket in the pool for the next cycle
+                // so the TCP stack applies flow control to the sender.
+                for lh in to_accept {
+                    let can_accept = listeners
+                        .get(&port)
+                        .is_some_and(|e| e.accept_tx.capacity() > 0);
+                    if !can_accept {
+                        continue;
+                    }
+
+                    // Remove from the backlog pool.
+                    if let Some(entry) = listeners.get_mut(&port) {
+                        entry.handles.retain(|&h| h != lh);
+                    }
+
+                    // Move the accepted socket into the connection map.
+                    let accepted = sockets.remove(lh);
+                    let conn_handle = sockets.add(accepted);
+                    let (stream, conn) = make_stream_and_conn(notify.clone());
+                    conns.insert(conn_handle, conn);
+
+                    if let Some(entry) = listeners.get(&port) {
+                        let _ = entry.accept_tx.try_send(Ok(stream));
+                    }
+
+                    // Replenish the backlog with a fresh listening socket.
+                    let mut fresh = new_tcp_socket();
+                    let _ = fresh.listen(endpoint);
+                    let fresh_handle = sockets.add(fresh);
+                    if let Some(entry) = listeners.get_mut(&port) {
+                        entry.handles.push(fresh_handle);
+                    }
+                }
+
+                // Replace dead listening sockets (failed handshakes, etc.).
+                for lh in to_replace {
+                    if let Some(entry) = listeners.get_mut(&port) {
+                        entry.handles.retain(|&h| h != lh);
+                    }
+                    let _ = sockets.remove(lh);
+
+                    let mut fresh = new_tcp_socket();
+                    let _ = fresh.listen(endpoint);
+                    let fresh_handle = sockets.add(fresh);
+                    if let Some(entry) = listeners.get_mut(&port) {
+                        entry.handles.push(fresh_handle);
+                    }
                 }
             }
         }
@@ -507,6 +575,10 @@ async fn poll_loop(
 }
 
 /// Create a listening socket for `port`.
+///
+/// Creates `LISTEN_BACKLOG` passive listening sockets so multiple SYNs can
+/// be processed concurrently — mirroring the OS `listen(fd, backlog)` API
+/// that smoltcp lacks.
 fn do_listen(
     sockets: &mut SocketSet<'static>,
     listeners: &mut HashMap<u16, ListenerEntry>,
@@ -518,14 +590,18 @@ fn do_listen(
             "port {port} already in use"
         )));
     }
-    let mut socket = new_tcp_socket();
-    socket
-        .listen(IpListenEndpoint::from((to_smoltcp_v4(addr), port)))
-        .map_err(|e| NetstackError::ListenFailed(format!("{e:?}")))?;
-    let handle = sockets.add(socket);
+    let endpoint = IpListenEndpoint::from((to_smoltcp_v4(addr), port));
+    let mut handles = Vec::with_capacity(LISTEN_BACKLOG);
+    for _ in 0..LISTEN_BACKLOG {
+        let mut socket = new_tcp_socket();
+        socket
+            .listen(endpoint)
+            .map_err(|e| NetstackError::ListenFailed(format!("{e:?}")))?;
+        handles.push(sockets.add(socket));
+    }
 
-    let (accept_tx, accept_rx) = mpsc::channel(8);
-    listeners.insert(port, (handle, accept_tx));
+    let (accept_tx, accept_rx) = mpsc::channel(ACCEPT_CHANNEL_DEPTH);
+    listeners.insert(port, ListenerEntry { handles, accept_tx });
     Ok(accept_rx)
 }
 
@@ -672,12 +748,14 @@ fn cleanup_closed(
     // Listeners whose accept channel is closed.
     let stale_ports: Vec<u16> = listeners
         .iter()
-        .filter(|(_, (_, tx))| tx.is_closed())
+        .filter(|(_, entry)| entry.accept_tx.is_closed())
         .map(|(p, _)| *p)
         .collect();
     for port in stale_ports {
-        if let Some((handle, _)) = listeners.remove(&port) {
-            let _ = sockets.remove(handle);
+        if let Some(entry) = listeners.remove(&port) {
+            for handle in entry.handles {
+                let _ = sockets.remove(handle);
+            }
         }
     }
 }

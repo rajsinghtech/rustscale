@@ -419,3 +419,98 @@ async fn latency_small_message_round_trip() {
         "p50 latency too high: {p50:?} (expected < 20ms)"
     );
 }
+
+/// Verify that multiple peers can connect simultaneously. Before the backlog
+/// fix, only one listening socket existed per port — the second peer's SYN
+/// was dropped because the single socket was mid-handshake. With a backlog
+/// pool of 32 listening sockets, all 5 concurrent dials should succeed.
+#[tokio::test]
+async fn concurrent_connections_all_succeed() {
+    let a_priv = NodePrivate::generate();
+    let b_priv = NodePrivate::generate();
+    let a_pub = a_priv.public();
+    let b_pub = b_priv.public();
+
+    let a_addr = Ipv4Addr::new(100, 64, 0, 1);
+    let b_addr = Ipv4Addr::new(100, 64, 0, 2);
+
+    let a_net = Arc::new(Netstack::new(a_addr, DEFAULT_MTU));
+    let b_net = Arc::new(Netstack::new(b_addr, DEFAULT_MTU));
+
+    let a_tunn = Arc::new(Mutex::new(
+        WgTunn::new(&a_priv, &b_pub, 1).expect("A tunnel"),
+    ));
+    let b_tunn = Arc::new(Mutex::new(
+        WgTunn::new(&b_priv, &a_pub, 2).expect("B tunnel"),
+    ));
+
+    let a_tunn_p = a_tunn.clone();
+    let b_tunn_p = b_tunn.clone();
+    let a_net_p = a_net.clone();
+    let b_net_p = b_net.clone();
+    let pump = tokio::spawn(async move {
+        let a_tx = a_net_p.tx_notify();
+        let b_tx = b_net_p.tx_notify();
+        loop {
+            let did_work = pump_cycle(&a_tunn_p, &b_tunn_p, &a_net_p, &b_net_p);
+            if !did_work {
+                tokio::select! {
+                    () = a_tx.notified() => {}
+                    () = b_tx.notified() => {}
+                    () = tokio::time::sleep(std::time::Duration::from_millis(1)) => {}
+                }
+            }
+        }
+    });
+
+    // B listens.
+    let mut listener = b_net.listen(40000).await.expect("listen");
+
+    // A launches 5 concurrent dials to B.
+    const NUM_CONCURRENT: usize = 5;
+    let mut dial_handles = Vec::new();
+    for _ in 0..NUM_CONCURRENT {
+        let net = a_net.clone();
+        dial_handles.push(tokio::spawn(async move {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                net.dial(SocketAddr::new(b_addr.into(), 40000)),
+            )
+            .await
+        }));
+    }
+
+    // B accepts all 5 connections.
+    let mut accepted = 0;
+    for _ in 0..NUM_CONCURRENT {
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(15), listener.accept()).await;
+        match result {
+            Ok(Ok(_stream)) => accepted += 1,
+            Ok(Err(e)) => eprintln!("accept error: {e}"),
+            Err(_) => eprintln!("accept timed out"),
+        }
+    }
+
+    // All dials should have succeeded too.
+    let mut dial_succeeded = 0;
+    for handle in dial_handles {
+        match handle.await {
+            Ok(Ok(Ok(_stream))) => dial_succeeded += 1,
+            Ok(Ok(Err(e))) => eprintln!("dial error: {e}"),
+            Ok(Err(_)) => eprintln!("dial timed out"),
+            Err(e) => eprintln!("dial task panicked: {e}"),
+        }
+    }
+
+    pump.abort();
+
+    assert_eq!(
+        accepted, NUM_CONCURRENT,
+        "only {accepted}/{NUM_CONCURRENT} connections were accepted"
+    );
+    assert_eq!(
+        dial_succeeded, NUM_CONCURRENT,
+        "only {dial_succeeded}/{NUM_CONCURRENT} dials succeeded"
+    );
+}

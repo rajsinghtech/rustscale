@@ -557,8 +557,9 @@ async fn multi_region_derp_routing() {
         // The DerpManager needs to spawn a recv consumer for this connection.
         // We can't do that from here, but the DerpIo's internal reader task
         // feeds a channel. We need to also spawn a consumer.
-        // Actually, let's spawn it here.
+        // Actually, let's spawn it here — including the reconnect signal.
         let tx = a.inner.derp.derp_recv_tx.clone();
+        let reconnect_tx = a.inner.derp.reconnect_tx.clone();
         let io2_clone = io2.clone();
         tokio::spawn(async move {
             while let Some((source, data)) = io2_clone.try_recv().await {
@@ -566,6 +567,7 @@ async fn multi_region_derp_routing() {
                     break;
                 }
             }
+            let _ = reconnect_tx.send(2);
         });
         conns.insert(2, io2);
     }
@@ -595,6 +597,7 @@ async fn multi_region_derp_routing() {
             .expect("derp connections lock poisoned");
         let io1 = Arc::new(DerpIo::spawn(b_derp_r1));
         let tx = b.inner.derp.derp_recv_tx.clone();
+        let reconnect_tx = b.inner.derp.reconnect_tx.clone();
         let io1_clone = io1.clone();
         tokio::spawn(async move {
             while let Some((source, data)) = io1_clone.try_recv().await {
@@ -602,6 +605,7 @@ async fn multi_region_derp_routing() {
                     break;
                 }
             }
+            let _ = reconnect_tx.send(1);
         });
         conns.insert(1, io1);
     }

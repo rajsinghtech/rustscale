@@ -31,7 +31,9 @@ where
 /// A range of TCP/UDP/SCTP ports (inclusive). Matches Go's `tailcfg.PortRange`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PortRange {
+    #[serde(default, deserialize_with = "deserialize_null_to_default")]
     pub First: u16,
+    #[serde(default, deserialize_with = "deserialize_null_to_default")]
     pub Last: u16,
 }
 
@@ -56,11 +58,12 @@ impl PortRange {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct NetPortRange {
     /// IP / CIDR / range / wildcard string.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[serde(default, skip_serializing_if = "String::is_empty", deserialize_with = "deserialize_null_to_default")]
     pub IP: String,
     /// Deprecated CIDR-bits field. If non-null, the filter rejects it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub Bits: Option<i32>,
+    #[serde(default, deserialize_with = "deserialize_null_to_default")]
     pub Ports: PortRange,
 }
 

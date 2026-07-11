@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use rustscale_key::NodePublic;
 
-use crate::{skip_default, CapabilityVersion, Hostinfo, ID};
+use crate::{deserialize_null_to_default, skip_default, CapabilityVersion, Hostinfo, ID};
 
 /// A request to register a node key (subset of Go's `tailcfg.RegisterRequest`).
 ///
@@ -13,28 +13,31 @@ use crate::{skip_default, CapabilityVersion, Hostinfo, ID};
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct RegisterRequest {
     /// Client capability version (must be 1 on the legacy NaCl transport).
+    #[serde(default, deserialize_with = "deserialize_null_to_default")]
     pub Version: CapabilityVersion,
     /// The node public key being registered.
+    #[serde(default, deserialize_with = "deserialize_null_to_default")]
     pub NodeKey: NodePublic,
     /// The previous node key, if rotating.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_to_default")]
     pub OldNodeKey: NodePublic,
     /// Authentication information returned by a prior registration.
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(default, skip_serializing_if = "skip_default", deserialize_with = "deserialize_null_to_default")]
     pub Auth: Option<RegisterResponseAuth>,
     /// Requested key expiry (server policy may override).
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(default, skip_serializing_if = "skip_default", deserialize_with = "deserialize_null_to_default")]
     pub Expiry: Option<DateTime<Utc>>,
     /// If set, the response waits until the auth URL is visited.
+    #[serde(default, deserialize_with = "deserialize_null_to_default")]
     pub Followup: String,
     /// The client's current host info. `None` serializes as `null`.
     #[serde(default)]
     pub Hostinfo: Option<Hostinfo>,
     /// Whether the node is ephemeral (auto-deleted when inactive).
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(default, skip_serializing_if = "skip_default", deserialize_with = "deserialize_null_to_default")]
     pub Ephemeral: bool,
     /// Optional recommended/required tailnet identifier.
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(default, skip_serializing_if = "skip_default", deserialize_with = "deserialize_null_to_default")]
     pub Tailnet: String,
 }
 
@@ -43,16 +46,22 @@ pub struct RegisterRequest {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct RegisterResponse {
     /// The user that owns the node.
+    #[serde(default, deserialize_with = "deserialize_null_to_default")]
     pub User: User,
     /// The login from the identity provider.
+    #[serde(default, deserialize_with = "deserialize_null_to_default")]
     pub Login: Login,
     /// Whether the node key needs to be replaced.
+    #[serde(default, deserialize_with = "deserialize_null_to_default")]
     pub NodeKeyExpired: bool,
     /// Whether the machine is authorized.
+    #[serde(default, deserialize_with = "deserialize_null_to_default")]
     pub MachineAuthorized: bool,
     /// If non-empty, authorization is pending at this URL.
+    #[serde(default, deserialize_with = "deserialize_null_to_default")]
     pub AuthURL: String,
     /// If non-empty, authorization failed and other fields should be ignored.
+    #[serde(default, deserialize_with = "deserialize_null_to_default")]
     pub Error: String,
 }
 
@@ -61,7 +70,7 @@ pub struct RegisterResponse {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegisterResponseAuth {
     /// An auth key (the deprecated Android OAuth2 token path is omitted).
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(default, skip_serializing_if = "skip_default", deserialize_with = "deserialize_null_to_default")]
     pub AuthKey: String,
 }
 
@@ -69,14 +78,16 @@ pub struct RegisterResponseAuth {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct User {
     /// User ID.
+    #[serde(default, deserialize_with = "deserialize_null_to_default")]
     pub ID: UserID,
     /// Display name (overrides the login field if non-empty).
+    #[serde(default, deserialize_with = "deserialize_null_to_default")]
     pub DisplayName: String,
     /// Profile picture URL.
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(default, skip_serializing_if = "skip_default", deserialize_with = "deserialize_null_to_default")]
     pub ProfilePicURL: String,
     /// When the user was created.
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(default, skip_serializing_if = "skip_default", deserialize_with = "deserialize_null_to_default")]
     pub Created: Option<DateTime<Utc>>,
 }
 
@@ -84,15 +95,19 @@ pub struct User {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Login {
     /// Login ID (unused in the Tailscale client).
+    #[serde(default, deserialize_with = "deserialize_null_to_default")]
     pub ID: LoginID,
     /// Provider: `"google"`, `"github"`, `"okta_foo"`, ...
+    #[serde(default, deserialize_with = "deserialize_null_to_default")]
     pub Provider: String,
     /// Email-ish login name.
+    #[serde(default, deserialize_with = "deserialize_null_to_default")]
     pub LoginName: String,
     /// Display name from the IdP.
+    #[serde(default, deserialize_with = "deserialize_null_to_default")]
     pub DisplayName: String,
     /// Profile picture URL from the IdP.
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(default, skip_serializing_if = "skip_default", deserialize_with = "deserialize_null_to_default")]
     pub ProfilePicURL: String,
 }
 

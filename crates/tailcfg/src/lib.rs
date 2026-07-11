@@ -195,6 +195,31 @@ where
     Ok(opt.unwrap_or_default())
 }
 
+/// Serde helper: deserialize a `BTreeMap<String, V>` where the whole map or
+/// individual values may be `null` on the wire (Go nil maps marshal as `null`;
+/// nil pointers in `map[string]*T` values marshal as `null`). Treats null
+/// values as `V::default()`.
+pub(crate) fn deserialize_null_map_values<'de, D, V>(
+    deserializer: D,
+) -> Result<std::collections::BTreeMap<String, V>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    V: Default + Deserialize<'de>,
+{
+    let opt: Option<std::collections::BTreeMap<String, Option<V>>> =
+        Option::deserialize(deserializer)?;
+    match opt {
+        None => Ok(std::collections::BTreeMap::new()),
+        Some(raw) => {
+            let mut map = std::collections::BTreeMap::new();
+            for (k, v) in raw {
+                map.insert(k, v.unwrap_or_default());
+            }
+            Ok(map)
+        }
+    }
+}
+
 /// Serde helper: skip a key field when it is the all-zero key.
 pub(crate) fn skip_zero_machine(v: &rustscale_key::MachinePublic) -> bool {
     v.is_zero()
@@ -256,6 +281,29 @@ pub mod int_key {
                 })
                 .collect(),
             None => Ok(BTreeMap::new()),
+        }
+    }
+
+    /// Deserialize with null-to-default handling for both the whole map and
+    /// individual values (Go nil maps marshal as `null`; nil pointers in
+    /// `map[int]*T` values marshal as `null`). Null values are treated as
+    /// `V::default()`.
+    pub fn deserialize_null_values<'de, D, V>(d: D) -> Result<BTreeMap<i32, V>, D::Error>
+    where
+        D: Deserializer<'de>,
+        V: Default + Deserialize<'de>,
+    {
+        let opt: Option<BTreeMap<String, Option<V>>> = Option::deserialize(d)?;
+        match opt {
+            None => Ok(BTreeMap::new()),
+            Some(raw) => {
+                let mut map = BTreeMap::new();
+                for (k, v) in raw {
+                    let k = k.parse::<i32>().map_err(serde::de::Error::custom)?;
+                    map.insert(k, v.unwrap_or_default());
+                }
+                Ok(map)
+            }
         }
     }
 }

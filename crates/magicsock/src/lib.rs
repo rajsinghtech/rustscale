@@ -1172,10 +1172,9 @@ pub fn gather_local_endpoints(udp_port: u16) -> Vec<String> {
         }
     }
 
-    // Non-loopback (LAN/public) first, then loopback as a fallback so
-    // same-machine direct paths work even offline. This matches Go's
-    // intent (loopback only when needed) while keeping it simple.
-    eps.append(&mut loopback_eps);
+    if eps.is_empty() {
+        eps.append(&mut loopback_eps);
+    }
     eps
 }
 

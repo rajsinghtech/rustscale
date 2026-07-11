@@ -9,7 +9,35 @@
 | Bug 4: No periodic endpoint updates | FIXED | `spawn_periodic_endpoint_updates()` every 5 min |
 | Bug 6: DERP keepalive missing | FIXED | PING/PONG handling + 60s keepalive task |
 | Bug 7: NetInfo missing from Hostinfo | FIXED | Added NetInfo field + PreferredDERP in all MapRequests |
-| Bug 1+5: HomeDERP not in netmap | INVESTIGATING | DERP handshake now completes (ServerInfo read), connection stays alive (keepalive), NetInfo sent — but peers still see `Relay: ""` |
+| Bug 8: Streaming map doesn't reconnect | FIXED | stream_map_loop() with exponential backoff |
+| Bug 9: No STUN endpoints in advertised list | FIXED | Run netcheck after DERPMap known, include global_v4 in endpoints |
+| Bug 10: 127.0.0.1 in advertised endpoints | FIXED | gather_local_endpoints already filters loopback; verified working |
+
+## Current test results (rs-gcp6, after all fixes)
+
+```
+tailscale ping 100.96.238.98:
+  pong from rs-gcp6 (100.96.238.98) via DERP(iad) in 52ms
+curl http://100.96.238.98:8080/:
+  hello from rustscale
+tailscale status:
+  100.96.238.98  rs-gcp6  rajsinghtech@  linux  active; relay "iad", tx 1552 rx 954
+```
+
+Node stays alive after 2+ minutes (keepalive working). DERP relay path stable at ~50ms.
+Two persistent connections: control plane (streaming map) + DERP relay.
+
+## Remaining issues
+
+- Direct UDP path not established (stays on DERP). Likely needs disco protocol
+  (CallMeMaybe) implementation for peers to initiate direct probing.
+- MagicDNS hostname resolution (`rs-gcp6.tailnet.ts.net`) not working from MacBook
+  (may be a client-side config issue — the MagicDNS responder binds to 127.0.0.1:0
+  on the GCP VM which isn't the MagicDNS VIP).
+- No reconnection logic when DERP connection drops (DerpIo::close is called but
+  no automatic reconnect — Go has derphttp.Client.Connect which reconnects).
+- No streaming map NetInfo update on endpoint change (only periodic 5-min updates).
+| Bug 1+5: HomeDERP not in netmap | FIXED | streaming_map_loop() + NetInfo in streaming MapRequest + STUN endpoints. Peers now see `Relay: "iad"` and can ping/curl via DERP at ~50ms |
 
 ## Environment
 - **GCP VM**: `rs-gcp-interop` (us-east1-b, 34.24.127.181, n1-standard-4, Ubuntu 22.04)

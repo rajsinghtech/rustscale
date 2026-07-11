@@ -27,6 +27,7 @@ base64.workspace = true
 h2.workspace = true
 http = "1"
 bytes.workspace = true
+rustscale-netns.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

@@ -44,15 +44,12 @@ pub fn is_localhost(addr: &str) -> bool {
     ) {
         return true;
     }
-
     if let Ok(ip) = addr.parse::<IpAddr>() {
         return ip.is_loopback();
     }
-
     if let Ok(sa) = addr.parse::<std::net::SocketAddr>() {
         return sa.ip().is_loopback();
     }
-
     if let Some(rest) = addr.strip_prefix('[') {
         if let Some(end) = rest.find(']') {
             if let Ok(ip) = rest[..end].parse::<IpAddr>() {
@@ -60,7 +57,6 @@ pub fn is_localhost(addr: &str) -> bool {
             }
         }
     }
-
     if addr.chars().filter(|c| *c == ':').count() == 1 {
         if let Some((h, _)) = addr.rsplit_once(':') {
             let lower = h.to_ascii_lowercase();
@@ -75,7 +71,6 @@ pub fn is_localhost(addr: &str) -> bool {
             }
         }
     }
-
     false
 }
 
@@ -86,11 +81,9 @@ pub async fn dial_tcp(host: &str, port: u16) -> Result<tokio::net::TcpStream, st
         stream.set_nodelay(true).ok();
         return Ok(stream);
     }
-
     if let Some(proxy) = socks::all_proxy() {
         return socks::dial_sock5(&proxy, host, port).await;
     }
-
     let addrs = tokio::net::lookup_host(format!("{host}:{port}")).await?;
     let mut last_err = std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "no addresses");
     for addr in addrs {
@@ -102,9 +95,7 @@ pub async fn dial_tcp(host: &str, port: u16) -> Result<tokio::net::TcpStream, st
     Err(last_err)
 }
 
-pub async fn dial_tcp_addr(
-    addr: SocketAddr,
-) -> Result<tokio::net::TcpStream, std::io::Error> {
+pub async fn dial_tcp_addr(addr: SocketAddr) -> Result<tokio::net::TcpStream, std::io::Error> {
     if !is_enabled() {
         let stream = tokio::net::TcpStream::connect(addr).await?;
         stream.set_nodelay(true).ok();
@@ -120,18 +111,12 @@ fn is_cgnat_v4(ip: Ipv4Addr) -> bool {
 
 fn is_tailscale_ula(ip: Ipv6Addr) -> bool {
     let o = ip.octets();
-    o[0] == 0xfd
-        && o[1] == 0x7a
-        && o[2] == 0x11
-        && o[3] == 0x5c
-        && o[4] == 0xa1
-        && o[5] == 0xe0
+    o[0] == 0xfd && o[1] == 0x7a && o[2] == 0x11 && o[3] == 0x5c && o[4] == 0xa1 && o[5] == 0xe0
 }
 
 #[cfg(test)]
 mod tests {
     use super::is_localhost;
-
     #[test]
     fn test_localhost_str() {
         assert!(is_localhost("localhost"));
@@ -139,14 +124,12 @@ mod tests {
         assert!(is_localhost("ip6-loopback"));
         assert!(is_localhost("ip6-localhost"));
     }
-
     #[test]
     fn test_localhost_ip() {
         assert!(is_localhost("127.0.0.1"));
         assert!(is_localhost("::1"));
         assert!(is_localhost("127.5.5.5"));
     }
-
     #[test]
     fn test_not_localhost() {
         assert!(!is_localhost("example.com"));

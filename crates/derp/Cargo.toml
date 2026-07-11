@@ -19,6 +19,7 @@ tokio-rustls.workspace = true
 webpki-roots.workspace = true
 rustls.workspace = true
 hex.workspace = true
+rustscale-netns.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true

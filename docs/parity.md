@@ -9,7 +9,7 @@ update statuses as phases land.
 
 | Feature | Go source | Status |
 | --- | --- | --- |
-| MagicDNS + split DNS resolver | `net/dns/resolver/tsdns.go` | 🔶 resolver + 100.100.100.100 responder + unified dial done; split DNS via control `Routes` still ⬜ |
+| MagicDNS + split DNS resolver | `net/dns/resolver/tsdns.go` | ✅ phase-20: split DNS via control `Routes` (most-specific suffix wins), Hosts/LocalDomains/SubdomainHosts, atomic SetConfig, PTR reverse (v4/v6), .onion NXDOMAIN, 4via6, TC bit + EDNS size, ANY qtype, TCP fallback + DoH upstream forwarder |
 | Let's Encrypt certs via control | `ipn/ipnlocal/cert.go` | ✅ full ACME client (RFC 8555, ES256 JWS, dns-01 via set-dns, rcgen CSR); live LE-staging e2e green on ephemeral tailnet |
 | WhoIs (peer identity from conn) | `tsnet.Server.WhoIs` | ✅ `Server::whois` + `ts_whois` FFI (UserProfiles from netmap) |
 | Exit node support | LocalBackend/router/magicsock | ✅ port-5 done (advertise_exit_node builder opt adds 0.0.0.0/0+::/0 to RoutableIPs + filter localNets; Server::set_exit_node/clear_exit_node resolve exit-capable peer via IP/hostname + set RouteTable catch-all; TUN mode --exit-node installs /1 split routes on macOS, best-effort default on Linux; ts_set_exit_node/ts_clear_exit_node FFI; bypass routes for DERP/control in TUN+exit mode still ⬜ known limitation) |
@@ -47,8 +47,9 @@ tcpinfo · ICMP ping (`net/ping/`) · DNS cache + fallback (`net/dnscache/`,
 cache; wired into controlclient dial) · CapturePcap · Logtail · Watchdog ·
 Syspolicy · Captive
 portal detection (Report field exists, unwired 🔶) · C2N debug endpoints
-(🔶 phase-14 server + auth done, most handlers stub 501 — see
-docs/validation-2026-07-11.md) ·
+(✅ phase-21: real handlers for prefs/netmap/health/metrics/dns/
+component-logging/goroutines/sockstats; only /debug/pprof/* remains 501 —
+no Rust pprof) ·
 Netmap disk cache (offline startup) (🔶 phase-15 single-blob cache in tsnet
 state.rs; Go columnar store + controlclient wiring pending) · Web client UI ·
 BIRD routing · Linux

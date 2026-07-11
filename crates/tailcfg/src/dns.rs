@@ -6,6 +6,8 @@
 //! (used to publish ACME DNS-01 challenge TXT records; see
 //! `DNSConfig.CertDomains`).
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::{deserialize_null_to_default, skip_default, CapabilityVersion, NodeKey, UserID};
@@ -39,6 +41,25 @@ pub struct DNSConfig {
         deserialize_with = "deserialize_null_to_default"
     )]
     pub Resolvers: Vec<Resolver>,
+    /// Split-DNS routes: maps FQDN suffix → upstream resolvers.
+    /// Keys are fully-qualified DNS name suffixes (may optionally contain
+    /// a trailing dot but no leading dot). An empty resolver slice means
+    /// the suffix is handled by Tailscale's built-in resolver (for
+    /// ExtraRecords support).
+    #[serde(
+        default,
+        skip_serializing_if = "HashMap::is_empty",
+        deserialize_with = "deserialize_null_to_default"
+    )]
+    pub Routes: HashMap<String, Vec<Resolver>>,
+    /// Fallback resolvers (like `Resolvers` but only used when split DNS
+    /// is configured without explicit default resolvers).
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_null_to_default"
+    )]
+    pub FallbackResolvers: Vec<Resolver>,
     /// Search domains (FQDNs without trailing dot).
     #[serde(
         default,
@@ -137,6 +158,13 @@ mod tests {
             Resolvers: vec![Resolver {
                 Addr: "1.1.1.1".into(),
             }],
+            Routes: HashMap::from([(
+                "corp.example.com.".to_string(),
+                vec![Resolver {
+                    Addr: "10.0.0.53".into(),
+                }],
+            )]),
+            FallbackResolvers: vec![],
             Domains: vec!["ts.net".into()],
             Proxied: true,
             CertDomains: vec!["node.ts.net".into()],
@@ -152,6 +180,32 @@ mod tests {
         assert_eq!(back, cfg);
         assert!(j.contains("\"Proxied\":true"));
         assert!(j.contains("\"CertDomains\":[\"node.ts.net\"]"));
+        assert!(j.contains("\"corp.example.com.\""));
+    }
+
+    #[test]
+    fn dns_config_routes_roundtrip() {
+        let cfg = DNSConfig {
+            Routes: HashMap::from([
+                (
+                    "corp.example.com.".to_string(),
+                    vec![Resolver {
+                        Addr: "10.0.0.53".into(),
+                    }],
+                ),
+                (
+                    ".".to_string(),
+                    vec![Resolver {
+                        Addr: "1.1.1.1".into(),
+                    }],
+                ),
+            ]),
+            ..Default::default()
+        };
+        let j = serde_json::to_string(&cfg).unwrap();
+        let back: DNSConfig = serde_json::from_str(&j).unwrap();
+        assert_eq!(back, cfg);
+        assert_eq!(back.Routes.len(), 2);
     }
 
     #[test]

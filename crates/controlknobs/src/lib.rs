@@ -60,10 +60,7 @@ impl ControlKnobs {
         // Collect changes under the write lock, then fire callbacks after
         // releasing it so callbacks can safely read other knobs.
         let changes: Vec<(String, String)> = {
-            let mut knobs = self
-                .knobs
-                .write()
-                .expect("knobs write lock poisoned");
+            let mut knobs = self.knobs.write().expect("knobs write lock poisoned");
             let mut changed = Vec::new();
             for (k, v) in &incoming {
                 let old = knobs.get(k.as_str()).map(String::as_str);
@@ -76,10 +73,7 @@ impl ControlKnobs {
         };
 
         // Fire callbacks outside the knobs lock.
-        let cbs = self
-            .callbacks
-            .lock()
-            .expect("callbacks lock poisoned");
+        let cbs = self.callbacks.lock().expect("callbacks lock poisoned");
         for (key, new_val) in &changes {
             if let Some(handlers) = cbs.get(key.as_str()) {
                 for cb in handlers {
@@ -118,7 +112,10 @@ impl ControlKnobs {
     /// Returns `default` when the knob is absent.
     pub fn get_string(&self, name: &str, default: &str) -> String {
         let knobs = self.knobs.read().expect("knobs read lock poisoned");
-        knobs.get(name).cloned().unwrap_or_else(|| default.to_string())
+        knobs
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| default.to_string())
     }
 
     /// Check if a knob with this name is present.
@@ -133,10 +130,7 @@ impl ControlKnobs {
     /// via [`apply`](Self::apply). Multiple callbacks can be registered for
     /// the same knob; they fire in registration order.
     pub fn on_change(&self, name: &str, callback: Box<dyn Fn(Option<&str>) + Send>) {
-        let mut cbs = self
-            .callbacks
-            .lock()
-            .expect("callbacks lock poisoned");
+        let mut cbs = self.callbacks.lock().expect("callbacks lock poisoned");
         cbs.entry(name.to_string()).or_default().push(callback);
     }
 

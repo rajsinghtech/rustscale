@@ -62,8 +62,8 @@ mod knob_tests {
     use super::*;
     use rustscale_controlknobs::ControlKnobs;
     use rustscale_tailcfg::{MapResponse, Node, RawMessage};
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     #[test]
     fn extract_from_empty_response() {
@@ -94,14 +94,8 @@ mod knob_tests {
     #[test]
     fn extract_with_arg_values() {
         let mut cap_map = rustscale_tailcfg::NodeCapMap::new();
-        cap_map.insert(
-            "custom-knob".into(),
-            vec![RawMessage("\"hello\"".into())],
-        );
-        cap_map.insert(
-            "numeric-knob".into(),
-            vec![RawMessage("42".into())],
-        );
+        cap_map.insert("custom-knob".into(), vec![RawMessage("\"hello\"".into())]);
+        cap_map.insert("numeric-knob".into(), vec![RawMessage("42".into())]);
         let resp = MapResponse {
             Node: Some(Node {
                 CapMap: cap_map,
@@ -137,9 +131,12 @@ mod knob_tests {
         let ck = Arc::new(ControlKnobs::new());
         let count = Arc::new(AtomicUsize::new(0));
         let c = count.clone();
-        ck.on_change("debug-always-stun", Box::new(move |_| {
-            c.fetch_add(1, Ordering::SeqCst);
-        }));
+        ck.on_change(
+            "debug-always-stun",
+            Box::new(move |_| {
+                c.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
 
         let mut cap_map = rustscale_tailcfg::NodeCapMap::new();
         cap_map.insert("debug-always-stun".into(), vec![]);
@@ -154,4 +151,3 @@ mod knob_tests {
         assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 }
-

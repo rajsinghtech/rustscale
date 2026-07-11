@@ -124,7 +124,7 @@ pub struct Node {
 /// Values may be `null` on the wire (Go nil slices); we treat null as empty.
 pub type NodeCapMap = BTreeMap<NodeCapability, Vec<RawMessage>>;
 
-/// Host information advertised by a node (subset of Go's `tailcfg.Hostinfo`).
+/// Host information advertised by a node (mirrors Go's `tailcfg.Hostinfo`).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Hostinfo {
     /// Version of this code (in `version.Long` format).
@@ -139,12 +139,61 @@ pub struct Hostinfo {
     /// Operating system the client runs on.
     #[serde(default, skip_serializing_if = "skip_default")]
     pub OS: String,
-    /// OS version string.
+    /// OS version string (kernel version on Linux, marketing version on
+    /// macOS/iOS, build number on Windows).
     #[serde(default, skip_serializing_if = "skip_default")]
     pub OSVersion: String,
+    /// Best-effort whether the client is running in a container.
+    #[serde(default, skip_serializing_if = "OptBool::is_unset")]
+    pub Container: OptBool,
+    /// A hostinfo `EnvType` in string form (`"kn"`, `"k8s"`, ...).
+    #[serde(default, skip_serializing_if = "skip_default")]
+    pub Env: String,
+    /// Linux distro id (`"debian"`, `"ubuntu"`, `"nixos"`, ...).
+    #[serde(default, skip_serializing_if = "skip_default")]
+    pub Distro: String,
+    /// Linux distro version (`"20.04"`, ...).
+    #[serde(default, skip_serializing_if = "skip_default")]
+    pub DistroVersion: String,
+    /// Linux distro codename (`"jammy"`, `"bullseye"`, ...).
+    #[serde(default, skip_serializing_if = "skip_default")]
+    pub DistroCodeName: String,
+    /// App identifier for tsnet-based clients (`"tsnet"`, `"golinks"`, ...).
+    #[serde(default, skip_serializing_if = "skip_default")]
+    pub App: String,
+    /// Whether a desktop was detected on Linux.
+    #[serde(default, skip_serializing_if = "OptBool::is_unset")]
+    pub Desktop: OptBool,
+    /// Tailscale package type (`"tsnet"`, `"snap"`, ...).
+    #[serde(default, skip_serializing_if = "skip_default")]
+    pub Package: String,
+    /// Device model (mobile phone model, Raspberry Pi, Synology, ...).
+    #[serde(default, skip_serializing_if = "skip_default")]
+    pub DeviceModel: String,
     /// Name of the host the client runs on.
     #[serde(default, skip_serializing_if = "skip_default")]
     pub Hostname: String,
+    /// Whether the host is blocking incoming connections.
+    #[serde(default, skip_serializing_if = "skip_default")]
+    pub ShieldsUp: bool,
+    /// Whether the node opted out of sending logs and support.
+    #[serde(default, skip_serializing_if = "skip_default")]
+    pub NoLogsNoSupport: bool,
+    /// Whether the node has opted-in to admin-console-driven remote updates.
+    #[serde(default, skip_serializing_if = "skip_default")]
+    pub AllowsUpdate: bool,
+    /// The current host's machine type (uname -m).
+    #[serde(default, skip_serializing_if = "skip_default")]
+    pub Machine: String,
+    /// Architecture of the built binary (Go's GOARCH equivalent).
+    #[serde(default, skip_serializing_if = "skip_default")]
+    pub GoArch: String,
+    /// Architecture variant (GOARM, GOAMD64, ...).
+    #[serde(default, skip_serializing_if = "skip_default")]
+    pub GoArchVar: String,
+    /// Go compiler version the binary was built with (or Rust toolchain).
+    #[serde(default, skip_serializing_if = "skip_default")]
+    pub GoVersion: String,
     /// Services advertised by this machine.
     #[serde(
         default,
@@ -161,8 +210,41 @@ pub struct Hostinfo {
         deserialize_with = "deserialize_null_to_default"
     )]
     pub RoutableIPs: Vec<String>,
+    /// ACL tags this node wants to claim.
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
+    pub RequestTags: Vec<String>,
+    /// SSH host keys advertised by this node.
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default",
+        rename = "sshHostKeys"
+    )]
+    pub SSH_HostKeys: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub NetInfo: Option<NetInfo>,
+    /// Cloud environment (`"aws"`, `"gcp"`, `"azure"`, `"digitalocean"`, ...).
+    #[serde(default, skip_serializing_if = "skip_default")]
+    pub Cloud: String,
+    /// Whether the client is running in userspace (netstack) mode.
+    #[serde(default, skip_serializing_if = "OptBool::is_unset")]
+    pub Userspace: OptBool,
+    /// Whether the client's subnet router is running in userspace mode.
+    #[serde(default, skip_serializing_if = "OptBool::is_unset")]
+    pub UserspaceRouter: OptBool,
+    /// Whether the client is running the app-connector service.
+    #[serde(default, skip_serializing_if = "OptBool::is_unset")]
+    pub AppConnector: OptBool,
+    /// Whether the client is willing to relay traffic for other peers.
+    #[serde(default, skip_serializing_if = "skip_default")]
+    pub PeerRelay: bool,
+    /// Whether the node has any funnel endpoint enabled.
+    #[serde(default, skip_serializing_if = "skip_default")]
+    pub IngressEnabled: bool,
 }
 
 /// A service running on a node (matches Go's `tailcfg.Service`).

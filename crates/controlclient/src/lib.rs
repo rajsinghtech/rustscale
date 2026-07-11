@@ -10,10 +10,12 @@
 
 #![forbid(unsafe_code)]
 
+pub mod c2n;
 pub mod client;
 pub mod controlbase;
 pub mod controlhttp;
 
+pub use c2n::{C2nHandler, C2nRequest, C2nResponse, C2nRouter};
 pub use client::{ControlClient, RegisterError, StreamMapError};
 pub use controlbase::{NoiseConn, NoiseError, NoiseIo, ProtocolVersion};
 pub use controlhttp::{dial_control, fetch_server_pub_key, DialError, NoiseStream};

@@ -1212,9 +1212,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustscale-c2n"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
 name = "rustscale-controlclient"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "base64",
  "blake2",
  "bytes",
@@ -1408,6 +1420,7 @@ dependencies = [
  "rand_core",
  "rcgen",
  "rustls",
+ "rustscale-c2n",
  "rustscale-controlclient",
  "rustscale-derp",
  "rustscale-dns",

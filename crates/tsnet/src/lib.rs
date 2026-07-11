@@ -29,6 +29,7 @@
 #![forbid(unsafe_code)]
 
 mod acme;
+mod c2n;
 mod routing;
 mod serve;
 mod socks5;
@@ -61,6 +62,7 @@ use std::sync::Arc;
 
 use rustscale_controlclient::client::{ControlClient, RegisterError, StreamMapError};
 use rustscale_controlclient::controlhttp;
+use rustscale_controlclient::C2nRouter;
 use rustscale_derp::DerpClient;
 use rustscale_dns::{upstream_nameservers, DnsResponder, MagicDnsResolver, MAGICDNS_VIP};
 use rustscale_filter::Filter;
@@ -318,6 +320,10 @@ struct RunningState {
     health: Tracker,
     /// Map-poll staleness watchdog (fires if no MapResponse for >3 min).
     health_watchdog: Watchdog,
+    /// C2N request router (control-to-node handler dispatch).
+    c2n_router: Arc<C2nRouter>,
+    /// C2N HTTP server address (loopback, bound on up()).
+    c2n_addr: Option<SocketAddr>,
 }
 
 /// Which data plane is wired up: userspace netstack (tsnet listen/dial) or a
@@ -433,6 +439,8 @@ struct Bootstrap {
     health: Tracker,
     /// Map-poll staleness watchdog (fires if no MapResponse for >3 min).
     health_watchdog: Watchdog,
+    /// C2N request router (control-to-node handler dispatch).
+    c2n_router: Arc<C2nRouter>,
 }
 
 /// An embedded Tailscale server.
@@ -461,6 +469,18 @@ impl Server {
     /// built-in warnable IDs or their own registered codes.
     pub fn health(&self) -> Option<Tracker> {
         self.inner.as_ref().map(|i| i.health.clone())
+    }
+
+    /// The shared C2N router, if the server is up. Callers can register
+    /// additional control-to-node handlers (e.g. debug endpoints) before or
+    /// after `up()`.
+    pub fn c2n_router(&self) -> Option<Arc<C2nRouter>> {
+        self.inner.as_ref().map(|i| i.c2n_router.clone())
+    }
+
+    /// The C2N HTTP server address (loopback), if the server is up.
+    pub fn c2n_addr(&self) -> Option<SocketAddr> {
+        self.inner.as_ref().and_then(|i| i.c2n_addr)
     }
 
     /// Bring the server online in userspace netstack mode (tsnet listen/dial).
@@ -542,6 +562,8 @@ impl Server {
             b.cancel.clone(),
             b.health.clone(),
             b.health_watchdog.clone(),
+            self.config.state_dir.clone(),
+            b.node_key.public(),
         );
 
         // MagicDNS responder: best-effort UDP server at 100.100.100.100:53.
@@ -570,6 +592,11 @@ impl Server {
             b.our_fqdn.clone(),
         )));
 
+        let (c2n_task, c2n_addr) =
+            c2n::spawn_c2n_server(b.peers.clone(), b.user_profiles.clone(), "rustscale".into())
+                .await;
+        tasks.push(c2n_task);
+
         self.inner = Some(RunningState {
             tailscale_ips: b.tailscale_ips,
             magicsock: b.magicsock,
@@ -590,6 +617,8 @@ impl Server {
             serve,
             health: b.health,
             health_watchdog: b.health_watchdog,
+            c2n_router: b.c2n_router,
+            c2n_addr: Some(c2n_addr),
         });
         Ok(())
     }
@@ -713,7 +742,13 @@ impl Server {
             b.cancel.clone(),
             b.health.clone(),
             b.health_watchdog.clone(),
+            self.config.state_dir.clone(),
+            b.node_key.public(),
         );
+
+        let (c2n_task, c2n_addr) =
+            c2n::spawn_c2n_server(b.peers.clone(), b.user_profiles.clone(), "rustscale".into())
+                .await;
 
         self.inner = Some(RunningState {
             tailscale_ips: b.tailscale_ips,
@@ -722,7 +757,7 @@ impl Server {
             peers: b.peers,
             route_table: b.route_table,
             cancel: b.cancel,
-            tasks: Mutex::new(vec![b.map_task, pump, map_update, periodic_ep]),
+            tasks: Mutex::new(vec![b.map_task, pump, map_update, periodic_ep, c2n_task]),
             packet_drops: b.packet_drops,
             resolver: b.resolver,
             our_fqdn: b.our_fqdn,
@@ -735,6 +770,8 @@ impl Server {
             serve: None,
             health: b.health,
             health_watchdog: b.health_watchdog,
+            c2n_router: b.c2n_router,
+            c2n_addr: Some(c2n_addr),
         });
         Ok(())
     }
@@ -767,13 +804,22 @@ impl Server {
 
         // 1. Load or generate persistent state.
         let mut state = self.load_or_create_state()?;
-        if state.is_zero() {
+        let was_fresh = state.is_zero();
+        if was_fresh {
             state = PersistedState::generate();
             self.save_state(&state)?;
         }
 
         let node_pub = state.node_key.public();
         let disco_pub = state.disco_key.public();
+
+        // Try to load a cached netmap from the state directory. On a restart
+        // with an existing state dir, this lets us skip the blocking first
+        // MapResponse fetch (2-5s) and use the cached peers immediately —
+        // the streaming long-poll delivers fresh updates in the background.
+        let cached_netmap = self.config.state_dir.as_ref().and_then(|dir| {
+            PersistedState::load_netmap(dir, &node_pub)
+        });
 
         // 2. Fetch the server's Noise public key (GET /key?v=<version>).
         let server_pub_key =
@@ -877,31 +923,39 @@ impl Server {
             Err(e) => eprintln!("tsnet: endpoint update failed (non-fatal): {e}"),
         }
 
-        // 4. Fetch the first MapResponse (non-streaming) to learn DERPMap and
-        // tailscale IPs before starting the streaming long-poll. Using
-        // Stream=false ensures the server sends a single complete response and
-        // closes the connection, so fetch_map returns promptly.
-        let fetch_req = MapRequest {
-            Version: CAPABILITY_VERSION,
-            KeepAlive: false,
-            NodeKey: node_pub.clone(),
-            DiscoKey: disco_pub.clone(),
-            Stream: false,
-            Endpoints: local_endpoints.clone(),
-            Hostinfo: Some(Hostinfo {
-                OS: std::env::consts::OS.to_string(),
-                Hostname: self.config.hostname.clone(),
-                RoutableIPs: advertise.clone(),
+        // 4. Fetch the first MapResponse. If we have a cached netmap, skip
+        // the blocking fetch and use the cached data — the streaming
+        // long-poll (started below) will deliver fresh updates in the
+        // background. This eliminates the 2-5s startup delay on restarts.
+        let map_resp: MapResponse = if let Some(ref cached) = cached_netmap {
+            let peer_count = cached.Peers.len();
+            eprintln!(
+                "tsnet: using cached netmap ({peer_count} peers); streaming poll will refresh in background"
+            );
+            cached.clone()
+        } else {
+            let fetch_req = MapRequest {
+                Version: CAPABILITY_VERSION,
+                KeepAlive: false,
+                NodeKey: node_pub.clone(),
+                DiscoKey: disco_pub.clone(),
+                Stream: false,
+                Endpoints: local_endpoints.clone(),
+                Hostinfo: Some(Hostinfo {
+                    OS: std::env::consts::OS.to_string(),
+                    Hostname: self.config.hostname.clone(),
+                    RoutableIPs: advertise.clone(),
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }),
-            ..Default::default()
+            };
+            tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                cc_ep.fetch_map(&fetch_req),
+            )
+            .await
+            .map_err(|_| TsnetError::MapTimeout)??
         };
-        let map_resp: MapResponse = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            cc_ep.fetch_map(&fetch_req),
-        )
-        .await
-        .map_err(|_| TsnetError::MapTimeout)??;
 
         let tailscale_ips = extract_tailscale_ips(&map_resp);
         if tailscale_ips.is_empty() {
@@ -1169,6 +1223,12 @@ impl Server {
             map_resp.DNSConfig.as_ref(),
         )));
 
+        let c2n_router = {
+            let mut r = C2nRouter::new();
+            r.register("/echo", Arc::new(c2n::EchoHandler));
+            Arc::new(r)
+        };
+
         Ok(Bootstrap {
             tailscale_ips: tailscale_ips.clone(),
             our_v4,
@@ -1197,6 +1257,7 @@ impl Server {
             home_derp,
             health,
             health_watchdog,
+            c2n_router,
         })
     }
 
@@ -1935,6 +1996,8 @@ fn spawn_map_update_task(
     cancel: Arc<CancelToken>,
     health: Tracker,
     health_watchdog: Watchdog,
+    state_dir: Option<PathBuf>,
+    node_pub: NodePublic,
 ) -> JoinHandle<()> {
     let mut named_filters: BTreeMap<String, Vec<FilterRule>> = BTreeMap::new();
     tokio::spawn(async move {
@@ -2031,6 +2094,15 @@ fn spawn_map_update_task(
                             &advertise_routes,
                         );
                     }
+
+                    // Save the updated netmap to disk (best-effort) so a
+                    // restart can skip the blocking first fetch.
+                    if let Some(ref dir) = state_dir {
+                        if let Err(e) = PersistedState::save_netmap(dir, &node_pub, &resp) {
+                            eprintln!("tsnet: netmap cache save failed (non-fatal): {e}");
+                        }
+                    }
+
                 }
                 Some(Err(e)) => {
                     health.set_unhealthy(WARN_CONTROL, format!("control connection lost: {e}"));

@@ -1,7 +1,9 @@
 #![forbid(unsafe_code)]
 
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -15,9 +17,107 @@ pub struct WhoIsResult {
     pub login_name: String,
 }
 
+// ---------------------------------------------------------------------------
+// Per-component verbose logging state with expiry
+// ---------------------------------------------------------------------------
+
+/// Shared state for per-component verbose logging.
+///
+/// Maps component names to expiry timestamps. A component is verbose if it
+/// has an entry whose expiry hasn't passed. Expired entries are cleaned up
+/// on access. Mirrors Go's `LocalBackend.SetComponentDebugLogging`.
+#[derive(Clone, Default)]
+pub struct LogLevelState {
+    inner: Arc<Mutex<HashMap<String, SystemTime>>>,
+}
+
+impl LogLevelState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Enable verbose logging for `component` until `until`.
+    pub fn set(&self, component: &str, until: SystemTime) {
+        let mut g = self.inner.lock().expect("LogLevelState mutex poisoned");
+        g.insert(component.to_string(), until);
+    }
+
+    /// Whether `component` currently has verbose logging enabled.
+    pub fn is_verbose(&self, component: &str) -> bool {
+        let mut g = self.inner.lock().expect("LogLevelState mutex poisoned");
+        let now = SystemTime::now();
+        g.retain(|_, until| *until > now);
+        g.contains_key(component)
+    }
+
+    /// Remove expired entries.
+    pub fn cleanup_expired(&self) {
+        let mut g = self.inner.lock().expect("LogLevelState mutex poisoned");
+        let now = SystemTime::now();
+        g.retain(|_, until| *until > now);
+    }
+
+    /// Snapshot of currently-verbose components and their expiry timestamps.
+    pub fn active(&self) -> Vec<(String, SystemTime)> {
+        let mut g = self.inner.lock().expect("LogLevelState mutex poisoned");
+        let now = SystemTime::now();
+        g.retain(|_, until| *until > now);
+        g.iter().map(|(k, v)| (k.clone(), *v)).collect()
+    }
+}
+
+impl std::fmt::Debug for LogLevelState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LogLevelState").finish()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// C2N backend trait
+// ---------------------------------------------------------------------------
+
 #[async_trait]
 pub trait C2nBackend: Send + Sync {
     async fn whois(&self, ip: IpAddr) -> Option<WhoIsResult>;
+
+    /// Current server config/prefs as JSON. None if not available.
+    async fn prefs_json(&self) -> Option<serde_json::Value> {
+        None
+    }
+
+    /// Current netmap as JSON. `omit_fields` names top-level keys to remove.
+    async fn netmap_json(&self, _omit_fields: &[String]) -> Option<serde_json::Value> {
+        None
+    }
+
+    /// Current health state as JSON (array of active warnings).
+    async fn health_json(&self) -> Option<serde_json::Value> {
+        None
+    }
+
+    /// Metrics in Prometheus text exposition format.
+    async fn metrics_text(&self) -> Option<String> {
+        None
+    }
+
+    /// Current DNS config as JSON.
+    async fn dns_config_json(&self) -> Option<serde_json::Value> {
+        None
+    }
+
+    /// Flush logs. Returns `true` if a flush was attempted (even a no-op).
+    async fn try_flush_logs(&self) -> bool {
+        false
+    }
+
+    /// Set per-component debug logging until `until`.
+    async fn set_component_debug_logging(
+        &self,
+        _component: &str,
+        _until: SystemTime,
+    ) -> Result<(), String> {
+        Err("not implemented".into())
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -31,11 +131,35 @@ pub enum C2nError {
 pub struct C2NServer {
     backend: Arc<dyn C2nBackend>,
     log_id: String,
+    log_level_state: LogLevelState,
 }
 
 impl C2NServer {
     pub fn new(backend: Arc<dyn C2nBackend>, log_id: String) -> Self {
-        Self { backend, log_id }
+        Self {
+            backend,
+            log_id,
+            log_level_state: LogLevelState::new(),
+        }
+    }
+
+    /// Like [`new`](Self::new) but with a shared [`LogLevelState`] so callers
+    /// can query per-component verbose flags from outside the server.
+    pub fn new_with_log_level(
+        backend: Arc<dyn C2nBackend>,
+        log_id: String,
+        log_level_state: LogLevelState,
+    ) -> Self {
+        Self {
+            backend,
+            log_id,
+            log_level_state,
+        }
+    }
+
+    /// Shared log-level state (for external query of verbose components).
+    pub fn log_level_state(&self) -> LogLevelState {
+        self.log_level_state.clone()
     }
 
     pub async fn bind() -> Result<(TcpListener, SocketAddr), C2nError> {
@@ -57,7 +181,9 @@ impl C2NServer {
             let backend = self.backend.clone();
             let log_id = self.log_id.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_connection(&mut stream, peer_addr, &backend, &log_id).await {
+                if let Err(e) =
+                    handle_connection(&mut stream, peer_addr, &backend, &log_id).await
+                {
                     eprintln!("c2n[{log_id}]: connection error: {e}");
                 }
             });
@@ -90,7 +216,7 @@ async fn handle_connection(
     }
 
     let _ = log_id;
-    dispatch(stream, &req).await
+    dispatch(stream, &req, backend).await
 }
 
 async fn check_auth(ip: IpAddr, backend: &Arc<dyn C2nBackend>) -> bool {
@@ -126,6 +252,7 @@ fn is_tailnet_ip(ip: IpAddr) -> bool {
 struct HttpRequest {
     method: String,
     path: String,
+    query: String,
     #[allow(dead_code)]
     headers: Vec<(String, String)>,
     body: Vec<u8>,
@@ -164,7 +291,11 @@ fn parse_request_head(head: &[u8], body_preview: Vec<u8>) -> Result<HttpRequest,
     let request_line = lines.next().ok_or("no request line")?;
     let mut parts = request_line.split_whitespace();
     let method = parts.next().ok_or("no method")?.to_string();
-    let path = parts.next().ok_or("no path")?.to_string();
+    let raw_path = parts.next().ok_or("no path")?.to_string();
+    let (path, query) = match raw_path.split_once('?') {
+        Some((p, q)) => (p.to_string(), q.to_string()),
+        None => (raw_path, String::new()),
+    };
     let mut headers = Vec::new();
     for line in lines {
         if line.is_empty() {
@@ -193,10 +324,15 @@ fn parse_request_head(head: &[u8], body_preview: Vec<u8>) -> Result<HttpRequest,
     Ok(HttpRequest {
         method,
         path,
+        query,
         headers,
         body,
     })
 }
+
+// ---------------------------------------------------------------------------
+// Response writers
+// ---------------------------------------------------------------------------
 
 async fn write_json_response<W: AsyncWrite + Unpin>(
     conn: &mut W,
@@ -216,7 +352,6 @@ async fn write_json_response<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-#[allow(dead_code)]
 async fn write_text_response<W: AsyncWrite + Unpin>(
     conn: &mut W,
     status: u16,
@@ -253,6 +388,44 @@ async fn write_raw_response<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
+async fn write_no_content<W: AsyncWrite + Unpin>(conn: &mut W) -> Result<(), std::io::Error> {
+    conn.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        .await?;
+    conn.flush().await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Query string parsing
+// ---------------------------------------------------------------------------
+
+fn parse_query(query: &str) -> HashMap<String, String> {
+    let mut params = HashMap::new();
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        if let Some((k, v)) = pair.split_once('=') {
+            params.insert(k.to_string(), v.to_string());
+        } else {
+            params.insert(pair.to_string(), String::new());
+        }
+    }
+    params
+}
+
+fn parse_omit_fields(query: &str) -> Vec<String> {
+    let params = parse_query(query);
+    params
+        .get("omit_fields")
+        .map(|v| v.split(',').map(|s| s.trim().to_string()).collect())
+        .unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
+// Known paths
+// ---------------------------------------------------------------------------
+
 const KNOWN_PATHS: &[&str] = &[
     "/",
     "/echo",
@@ -260,24 +433,32 @@ const KNOWN_PATHS: &[&str] = &[
     "/debug/pprof/",
     "/debug/pprof/profile",
     "/debug/pprof/heap",
+    "/debug/pprof/allocs",
     "/debug/metrics",
     "/debug/netmap",
     "/debug/prefs",
     "/debug/health",
+    "/debug/component-logging",
+    "/debug/logheap",
     "/netmap",
     "/prefs",
     "/dns",
-    "/logtail/logs",
     "/logtail/flush",
+    "/sockstats",
 ];
 
 fn known_paths() -> serde_json::Value {
     serde_json::json!(KNOWN_PATHS)
 }
 
+// ---------------------------------------------------------------------------
+// Dispatch
+// ---------------------------------------------------------------------------
+
 async fn dispatch<W: AsyncWrite + Unpin>(
     conn: &mut W,
     req: &HttpRequest,
+    backend: &Arc<dyn C2nBackend>,
 ) -> Result<(), std::io::Error> {
     let method = req.method.as_str();
     let path = req.path.as_str();
@@ -313,39 +494,180 @@ async fn dispatch<W: AsyncWrite + Unpin>(
         return Ok(());
     }
 
-    let is_known =
-        KNOWN_PATHS.contains(&path) || path == "/logtail/flush" || path == "/logtail/logs";
+    // --- POST /logtail/flush → 204 ---
+    if method == "POST" && path == "/logtail/flush" {
+        // No logtail wired up yet; return 204 (no content) as a no-op.
+        write_no_content(conn).await?;
+        return Ok(());
+    }
 
-    match (method, path) {
-        ("GET", "/debug/goroutines") => stub_501(conn, path).await,
-        ("GET", "/debug/pprof/") => stub_501(conn, path).await,
-        ("GET", "/debug/pprof/profile") => stub_501(conn, path).await,
-        ("GET", "/debug/pprof/heap") => stub_501(conn, path).await,
-        ("GET", "/debug/metrics") => stub_501(conn, path).await,
-        ("GET", "/debug/netmap") => stub_501(conn, path).await,
-        ("GET", "/debug/prefs") => stub_501(conn, path).await,
-        ("GET", "/debug/health") => stub_501(conn, path).await,
-        ("GET", "/netmap") => stub_501(conn, path).await,
-        ("GET", "/prefs") => stub_501(conn, path).await,
-        ("GET", "/dns") => stub_501(conn, path).await,
-        ("GET", "/logtail/logs") => stub_501(conn, path).await,
-        ("POST", "/logtail/flush") => stub_501(conn, path).await,
-        _ => {
-            if is_known {
-                let body = serde_json::json!({"error": "bad method", "path": path});
-                write_json_response(conn, 405, "Method Not Allowed", &body).await
-            } else {
-                let body = serde_json::json!({"error": "unknown c2n path", "path": path});
-                write_json_response(conn, 400, "Bad Request", &body).await
-            }
+    // --- POST /sockstats → 200 minimal ---
+    if method == "POST" && path == "/sockstats" {
+        write_text_response(
+            conn,
+            200,
+            "OK",
+            "sockstats: no sockstat logger wired up\n",
+        )
+        .await?;
+        return Ok(());
+    }
+
+    // --- GET /debug/goroutines ---
+    if method == "GET" && path == "/debug/goroutines" {
+        let body = "Rust has no goroutine dump. Tokio task introspection is not available.\n";
+        write_text_response(conn, 200, "OK", body).await?;
+        return Ok(());
+    }
+
+    // --- GET /debug/pprof/* → 501 with clear message ---
+    if method == "GET" && path.starts_with("/debug/pprof/") {
+        let body = serde_json::json!({
+            "error": "pprof not available in rustscale (no Rust pprof implementation)",
+            "path": path,
+        });
+        write_json_response(conn, 501, "Not Implemented", &body).await?;
+        return Ok(());
+    }
+
+    // --- GET /debug/component-logging ---
+    if method == "GET" && path == "/debug/component-logging" {
+        let params = parse_query(&req.query);
+        let component = params.get("component").map_or("", String::as_str);
+        let secs: i64 = params.get("secs").and_then(|s| s.parse().ok()).unwrap_or(0);
+        // Go: if secs == 0, secs -= 1 (negative → immediate expiry).
+        let secs = if secs == 0 { -1 } else { secs };
+        let now = SystemTime::now();
+        let until = if secs >= 0 {
+            now + std::time::Duration::from_secs(secs as u64)
+        } else {
+            // Negative: already expired (1 ns before now)
+            now - std::time::Duration::from_nanos(1)
+        };
+        let result = backend
+            .set_component_debug_logging(component, until)
+            .await;
+        let resp = match result {
+            Ok(()) => serde_json::json!({}),
+            Err(e) => serde_json::json!({"error": e}),
+        };
+        write_json_response(conn, 200, "OK", &resp).await?;
+        return Ok(());
+    }
+
+    // --- GET /debug/logheap → 200 with note ---
+    if method == "GET" && path == "/debug/logheap" {
+        write_text_response(
+            conn,
+            200,
+            "OK",
+            "logheap: no heap profiler available in rustscale\n",
+        )
+        .await?;
+        return Ok(());
+    }
+
+    // --- GET /debug/metrics → Prometheus text ---
+    if method == "GET" && path == "/debug/metrics" {
+        let text = backend
+            .metrics_text()
+            .await
+            .unwrap_or_else(|| "# rustscale metrics: no backend metrics available\n".to_string());
+        write_raw_response(
+            conn,
+            200,
+            "OK",
+            "text/plain; version=0.0.4; charset=utf-8",
+            text.as_bytes(),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    // --- GET /debug/prefs (and alias /prefs) ---
+    if method == "GET" && (path == "/debug/prefs" || path == "/prefs") {
+        if let Some(v) = backend.prefs_json().await {
+            write_json_response(conn, 200, "OK", &v).await?;
+        } else {
+            let body = serde_json::json!({"error": "prefs not available"});
+            write_json_response(conn, 501, "Not Implemented", &body).await?;
         }
+        return Ok(());
+    }
+
+    // --- GET /debug/health ---
+    if method == "GET" && path == "/debug/health" {
+        if let Some(v) = backend.health_json().await {
+            write_json_response(conn, 200, "OK", &v).await?;
+        } else {
+            let body = serde_json::json!({"error": "health not available"});
+            write_json_response(conn, 501, "Not Implemented", &body).await?;
+        }
+        return Ok(());
+    }
+
+    // --- GET/POST /debug/netmap (and alias /netmap) ---
+    if (method == "GET" || method == "POST")
+        && (path == "/debug/netmap" || path == "/netmap")
+    {
+        let omit_fields = if method == "POST" {
+            serde_json::from_slice::<NetmapOmitRequest>(&req.body)
+                .map(|r| r.OmitFields)
+                .unwrap_or_default()
+        } else {
+            parse_omit_fields(&req.query)
+        };
+        if let Some(v) = backend.netmap_json(&omit_fields).await {
+            let mut v = v;
+            if let Some(obj) = v.as_object_mut() {
+                for f in &omit_fields {
+                    obj.remove(f);
+                }
+            }
+            write_json_response(conn, 200, "OK", &v).await?;
+        } else {
+            let body = serde_json::json!({"error": "netmap not available"});
+            write_json_response(conn, 501, "Not Implemented", &body).await?;
+        }
+        return Ok(());
+    }
+
+    // --- GET /dns → DNS config JSON ---
+    if method == "GET" && path == "/dns" {
+        if let Some(v) = backend.dns_config_json().await {
+            write_json_response(conn, 200, "OK", &v).await?;
+        } else {
+            let body = serde_json::json!({"error": "dns config not available"});
+            write_json_response(conn, 501, "Not Implemented", &body).await?;
+        }
+        return Ok(());
+    }
+
+    // --- Unknown path ---
+    let is_known = KNOWN_PATHS.contains(&path)
+        || path.starts_with("/debug/pprof/")
+        || path.starts_with("/local/");
+
+    if is_known {
+        let body = serde_json::json!({"error": "bad method", "path": path});
+        write_json_response(conn, 405, "Method Not Allowed", &body).await
+    } else {
+        let body = serde_json::json!({"error": "unknown c2n path", "path": path});
+        write_json_response(conn, 400, "Bad Request", &body).await
     }
 }
 
-async fn stub_501<W: AsyncWrite + Unpin>(conn: &mut W, path: &str) -> Result<(), std::io::Error> {
-    let body = serde_json::json!({"error": "not implemented", "path": path});
-    write_json_response(conn, 501, "Not Implemented", &body).await
+/// POST body for /debug/netmap (matches Go's C2NDebugNetmapRequest).
+#[derive(serde::Deserialize)]
+#[allow(non_snake_case)]
+struct NetmapOmitRequest {
+    #[serde(default)]
+    OmitFields: Vec<String>,
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -363,6 +685,53 @@ mod tests {
                 user_id: 1,
                 login_name: "test@tailnet".into(),
             })
+        }
+    }
+
+    /// Mock backend that returns data for all trait methods.
+    struct MockBackend {
+        log_level: LogLevelState,
+    }
+    #[async_trait]
+    impl C2nBackend for MockBackend {
+        async fn whois(&self, _ip: IpAddr) -> Option<WhoIsResult> {
+            Some(WhoIsResult {
+                found: true,
+                node_name: "mock.".into(),
+                user_id: 1,
+                login_name: "mock@tailnet".into(),
+            })
+        }
+        async fn prefs_json(&self) -> Option<serde_json::Value> {
+            Some(serde_json::json!({"hostname": "mock", "control_url": "https://control"}))
+        }
+        async fn netmap_json(&self, _omit_fields: &[String]) -> Option<serde_json::Value> {
+            Some(serde_json::json!({
+                "SelfNode": {"Name": "mock.tailnet.ts.net."},
+                "Peers": [{"Name": "peer1.tailnet.ts.net."}],
+                "DNSConfig": {"Proxied": true},
+                "Domain": "tailnet.ts.net",
+            }))
+        }
+        async fn health_json(&self) -> Option<serde_json::Value> {
+            Some(serde_json::json!([]))
+        }
+        async fn metrics_text(&self) -> Option<String> {
+            Some("# HELP rustscale_test A test metric\n# TYPE rustscale_test counter\nrustscale_test 1\n".into())
+        }
+        async fn dns_config_json(&self) -> Option<serde_json::Value> {
+            Some(serde_json::json!({"Proxied": true, "Domains": ["tailnet.ts.net"]}))
+        }
+        async fn try_flush_logs(&self) -> bool {
+            true
+        }
+        async fn set_component_debug_logging(
+            &self,
+            component: &str,
+            until: SystemTime,
+        ) -> Result<(), String> {
+            self.log_level.set(component, until);
+            Ok(())
         }
     }
 
@@ -393,6 +762,53 @@ mod tests {
         assert_eq!(find_header_end(b""), None);
     }
 
+    #[test]
+    fn test_parse_query() {
+        let q = parse_query("component=magicsock&secs=30");
+        assert_eq!(q.get("component"), Some(&"magicsock".to_string()));
+        assert_eq!(q.get("secs"), Some(&"30".to_string()));
+    }
+
+    #[test]
+    fn test_parse_omit_fields() {
+        assert_eq!(parse_omit_fields("omit_fields=Peers,Node"), vec!["Peers", "Node"]);
+        assert!(parse_omit_fields("").is_empty());
+        assert!(parse_omit_fields("other=foo").is_empty());
+    }
+
+    #[test]
+    fn test_log_level_state_set_and_check() {
+        let state = LogLevelState::new();
+        assert!(!state.is_verbose("magicsock"));
+        let until = SystemTime::now() + std::time::Duration::from_secs(60);
+        state.set("magicsock", until);
+        assert!(state.is_verbose("magicsock"));
+        assert!(!state.is_verbose("control"));
+    }
+
+    #[test]
+    fn test_log_level_state_expiry() {
+        let state = LogLevelState::new();
+        // Set with already-passed expiry → immediately expired.
+        let past = SystemTime::now() - std::time::Duration::from_secs(10);
+        state.set("expired-component", past);
+        // is_verbose cleans up expired entries.
+        assert!(!state.is_verbose("expired-component"));
+        assert!(state.active().is_empty());
+    }
+
+    #[test]
+    fn test_log_level_state_cleanup() {
+        let state = LogLevelState::new();
+        let future = SystemTime::now() + std::time::Duration::from_secs(60);
+        let past = SystemTime::now() - std::time::Duration::from_secs(10);
+        state.set("active-comp", future);
+        state.set("expired-comp", past);
+        state.cleanup_expired();
+        assert!(state.is_verbose("active-comp"));
+        assert!(!state.is_verbose("expired-comp"));
+    }
+
     #[tokio::test]
     async fn test_parse_request_basic() {
         let raw = b"GET /netmap HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
@@ -400,10 +816,20 @@ mod tests {
         let req = read_request(&mut cursor).await.unwrap();
         assert_eq!(req.method, "GET");
         assert_eq!(req.path, "/netmap");
+        assert_eq!(req.query, "");
         assert_eq!(req.headers.len(), 2);
         assert_eq!(req.headers[0].0, "Host");
         assert_eq!(req.headers[0].1, "localhost");
         assert!(req.body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_parse_request_with_query() {
+        let raw = b"GET /debug/netmap?omit_fields=Peers,Node HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+        let mut cursor = std::io::Cursor::new(raw);
+        let req = read_request(&mut cursor).await.unwrap();
+        assert_eq!(req.path, "/debug/netmap");
+        assert_eq!(req.query, "omit_fields=Peers,Node");
     }
 
     #[tokio::test]
@@ -434,71 +860,244 @@ mod tests {
         addr
     }
 
-    #[tokio::test]
-    async fn handler_returns_501_for_netmap() {
-        let addr = start_server().await;
-        let resp = send_request(
-            addr,
-            b"GET /netmap HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
-        )
-        .await;
-        assert!(resp.contains("501 Not Implemented"));
-        assert!(resp.contains("not implemented"));
+    async fn start_mock_server() -> (SocketAddr, LogLevelState) {
+        let log_level = LogLevelState::new();
+        let backend: Arc<dyn C2nBackend> = Arc::new(MockBackend {
+            log_level: log_level.clone(),
+        });
+        let server = C2NServer::new_with_log_level(backend, "test".into(), log_level.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(server.serve(listener));
+        (addr, log_level)
     }
 
-    #[tokio::test]
-    async fn handler_returns_501_for_prefs() {
-        let addr = start_server().await;
-        let resp = send_request(
-            addr,
-            b"GET /prefs HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
-        )
-        .await;
-        assert!(resp.contains("501 Not Implemented"));
-    }
+    // --- Handler status + content-type tests ---
 
     #[tokio::test]
-    async fn handler_returns_501_for_dns() {
-        let addr = start_server().await;
-        let resp = send_request(
-            addr,
-            b"GET /dns HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
-        )
-        .await;
-        assert!(resp.contains("501 Not Implemented"));
-    }
-
-    #[tokio::test]
-    async fn handler_returns_501_for_debug_netmap() {
-        let addr = start_server().await;
-        let resp = send_request(
-            addr,
-            b"GET /debug/netmap HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
-        )
-        .await;
-        assert!(resp.contains("501 Not Implemented"));
-    }
-
-    #[tokio::test]
-    async fn handler_returns_501_for_debug_health() {
-        let addr = start_server().await;
-        let resp = send_request(
-            addr,
-            b"GET /debug/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
-        )
-        .await;
-        assert!(resp.contains("501 Not Implemented"));
-    }
-
-    #[tokio::test]
-    async fn handler_returns_501_for_logtail_flush() {
+    async fn logtail_flush_returns_204() {
         let addr = start_server().await;
         let resp = send_request(
             addr,
             b"POST /logtail/flush HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
         )
         .await;
+        assert!(resp.contains("204 No Content"));
+        assert!(!resp.contains("Content-Type"));
+    }
+
+    #[tokio::test]
+    async fn debug_prefs_returns_json() {
+        let (addr, _) = start_mock_server().await;
+        let resp = send_request(
+            addr,
+            b"GET /debug/prefs HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(resp.contains("200 OK"));
+        assert!(resp.contains("Content-Type: application/json"));
+        assert!(resp.contains("hostname"));
+    }
+
+    #[tokio::test]
+    async fn prefs_alias_returns_json() {
+        let (addr, _) = start_mock_server().await;
+        let resp = send_request(
+            addr,
+            b"GET /prefs HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(resp.contains("200 OK"));
+        assert!(resp.contains("Content-Type: application/json"));
+    }
+
+    #[tokio::test]
+    async fn debug_metrics_returns_prometheus() {
+        let (addr, _) = start_mock_server().await;
+        let resp = send_request(
+            addr,
+            b"GET /debug/metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(resp.contains("200 OK"));
+        assert!(resp.contains("text/plain"));
+        assert!(resp.contains("rustscale_test"));
+    }
+
+    #[tokio::test]
+    async fn debug_metrics_minimal_without_backend() {
+        let addr = start_server().await;
+        let resp = send_request(
+            addr,
+            b"GET /debug/metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(resp.contains("200 OK"));
+        assert!(resp.contains("text/plain"));
+    }
+
+    #[tokio::test]
+    async fn debug_health_returns_json() {
+        let (addr, _) = start_mock_server().await;
+        let resp = send_request(
+            addr,
+            b"GET /debug/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(resp.contains("200 OK"));
+        assert!(resp.contains("Content-Type: application/json"));
+    }
+
+    #[tokio::test]
+    async fn debug_netmap_returns_json() {
+        let (addr, _) = start_mock_server().await;
+        let resp = send_request(
+            addr,
+            b"GET /debug/netmap HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(resp.contains("200 OK"));
+        assert!(resp.contains("Content-Type: application/json"));
+        assert!(resp.contains("SelfNode"));
+    }
+
+    #[tokio::test]
+    async fn netmap_alias_returns_json() {
+        let (addr, _) = start_mock_server().await;
+        let resp = send_request(
+            addr,
+            b"GET /netmap HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(resp.contains("200 OK"));
+        assert!(resp.contains("Content-Type: application/json"));
+    }
+
+    #[tokio::test]
+    async fn debug_netmap_omit_fields() {
+        let (addr, _) = start_mock_server().await;
+        let resp = send_request(
+            addr,
+            b"GET /debug/netmap?omit_fields=Peers HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(resp.contains("200 OK"));
+        assert!(!resp.contains("peer1"));
+        assert!(resp.contains("SelfNode"));
+    }
+
+    #[tokio::test]
+    async fn debug_netmap_post_omit_fields() {
+        let (addr, _) = start_mock_server().await;
+        let body = r#"{"OmitFields":["DNSConfig"]}"#;
+        let req = format!(
+            "POST /debug/netmap HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let resp = send_request(addr, req.as_bytes()).await;
+        assert!(resp.contains("200 OK"));
+        assert!(!resp.contains("Proxied"));
+        assert!(resp.contains("Peers"));
+    }
+
+    #[tokio::test]
+    async fn debug_goroutines_returns_text() {
+        let addr = start_server().await;
+        let resp = send_request(
+            addr,
+            b"GET /debug/goroutines HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(resp.contains("200 OK"));
+        assert!(resp.contains("text/plain"));
+        assert!(resp.contains("goroutine"));
+    }
+
+    #[tokio::test]
+    async fn debug_pprof_returns_501_with_message() {
+        let addr = start_server().await;
+        let resp = send_request(
+            addr,
+            b"GET /debug/pprof/heap HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
         assert!(resp.contains("501 Not Implemented"));
+        assert!(resp.contains("pprof not available"));
+    }
+
+    #[tokio::test]
+    async fn debug_pprof_allocs_returns_501() {
+        let addr = start_server().await;
+        let resp = send_request(
+            addr,
+            b"GET /debug/pprof/allocs HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(resp.contains("501 Not Implemented"));
+    }
+
+    #[tokio::test]
+    async fn debug_component_logging_sets_state() {
+        let (addr, log_level) = start_mock_server().await;
+        let resp = send_request(
+            addr,
+            b"GET /debug/component-logging?component=magicsock&secs=60 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(resp.contains("200 OK"));
+        assert!(resp.contains("Content-Type: application/json"));
+        assert!(log_level.is_verbose("magicsock"));
+    }
+
+    #[tokio::test]
+    async fn debug_component_logging_secs_zero_immediate_expiry() {
+        let (addr, log_level) = start_mock_server().await;
+        let resp = send_request(
+            addr,
+            b"GET /debug/component-logging?component=foo&secs=0 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(resp.contains("200 OK"));
+        // secs=0 → secs=-1 → already expired → not verbose.
+        assert!(!log_level.is_verbose("foo"));
+    }
+
+    #[tokio::test]
+    async fn debug_logheap_returns_200() {
+        let addr = start_server().await;
+        let resp = send_request(
+            addr,
+            b"GET /debug/logheap HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(resp.contains("200 OK"));
+        assert!(resp.contains("text/plain"));
+    }
+
+    #[tokio::test]
+    async fn sockstats_returns_200() {
+        let addr = start_server().await;
+        let resp = send_request(
+            addr,
+            b"POST /sockstats HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(resp.contains("200 OK"));
+        assert!(resp.contains("text/plain"));
+    }
+
+    #[tokio::test]
+    async fn dns_returns_json() {
+        let (addr, _) = start_mock_server().await;
+        let resp = send_request(
+            addr,
+            b"GET /dns HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(resp.contains("200 OK"));
+        assert!(resp.contains("Content-Type: application/json"));
+        assert!(resp.contains("Proxied"));
     }
 
     #[tokio::test]
@@ -525,6 +1124,9 @@ mod tests {
         assert!(resp.contains("/echo"));
         assert!(resp.contains("/netmap"));
         assert!(resp.contains("/prefs"));
+        assert!(resp.contains("/debug/component-logging"));
+        assert!(resp.contains("/debug/logheap"));
+        assert!(resp.contains("/sockstats"));
     }
 
     #[tokio::test]
@@ -544,7 +1146,7 @@ mod tests {
         let addr = start_server().await;
         let resp = send_request(
             addr,
-            b"POST /netmap HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            b"POST /debug/goroutines HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
         )
         .await;
         assert!(resp.contains("405 Method Not Allowed"));

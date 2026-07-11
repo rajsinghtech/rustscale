@@ -449,6 +449,8 @@ struct Bootstrap {
     health_watchdog: Watchdog,
     /// C2N request router (control-to-node handler dispatch).
     c2n_router: Arc<C2nRouter>,
+    /// C2N backend (shared by HTTP server + Noise-channel router).
+    c2n_backend: Arc<c2n::TsnetC2nBackend>,
     /// Control-plane feature flags extracted from netmap updates.
     control_knobs: Arc<ControlKnobs>,
 }
@@ -634,8 +636,7 @@ impl Server {
         )));
 
         let (c2n_task, c2n_addr) =
-            c2n::spawn_c2n_server(b.peers.clone(), b.user_profiles.clone(), "rustscale".into())
-                .await;
+            c2n::spawn_c2n_server(b.c2n_backend.clone(), "rustscale".into()).await;
         tasks.push(c2n_task);
 
         // PeerAPI server (netstack mode): listens on a deterministic port on
@@ -846,8 +847,7 @@ impl Server {
         );
 
         let (c2n_task, c2n_addr) =
-            c2n::spawn_c2n_server(b.peers.clone(), b.user_profiles.clone(), "rustscale".into())
-                .await;
+            c2n::spawn_c2n_server(b.c2n_backend.clone(), "rustscale".into()).await;
 
         // PeerAPI server (TUN mode): binds TCP listeners on the node's
         // tailnet IPs (v4 + v6) on the deterministic port.
@@ -1385,9 +1385,32 @@ impl Server {
             map_resp.DNSConfig.as_ref(),
         )));
 
+        let c2n_prefs = serde_json::json!({
+            "hostname": self.config.hostname,
+            "control_url": self.config.control_url,
+            "ephemeral": self.config.ephemeral,
+            "advertise_routes": self.config.advertise_routes,
+            "accept_routes": self.config.accept_routes,
+            "advertise_exit_node": self.config.advertise_exit_node,
+        });
+        let c2n_log_level = rustscale_c2n::LogLevelState::new();
+        let c2n_backend = Arc::new(c2n::TsnetC2nBackend::new(
+            c2n::C2nBackendData {
+                peers: peers_arc.clone(),
+                user_profiles: user_profiles.clone(),
+                health: health.clone(),
+                dns_config: dns_config.clone(),
+                packet_drops: packet_drops.clone(),
+                prefs: c2n_prefs,
+                tailscale_ips: tailscale_ips.clone(),
+                our_fqdn: our_fqdn.clone(),
+                magicsock: magicsock.clone(),
+            },
+            c2n_log_level,
+        ));
         let c2n_router = {
             let mut r = C2nRouter::new();
-            r.register("/echo", Arc::new(c2n::EchoHandler));
+            c2n::register_c2n_handlers(&mut r, c2n_backend.clone());
             Arc::new(r)
         };
 
@@ -1427,6 +1450,7 @@ impl Server {
             health,
             health_watchdog,
             c2n_router,
+            c2n_backend,
             control_knobs,
         })
     }

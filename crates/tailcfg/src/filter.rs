@@ -6,7 +6,27 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{NodeCapability, RawMessage};
+use crate::{deserialize_null_to_default, NodeCapability, RawMessage};
+
+/// Deserialize a `PeerCapMap`, treating `null` values inside the map as empty
+/// vectors (Go's nil slices marshal as `null`).
+fn deserialize_peercapmap<'de, D>(deserializer: D) -> Result<PeerCapMap, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt: Option<BTreeMap<NodeCapability, Option<Vec<RawMessage>>>> =
+        Option::deserialize(deserializer)?;
+    match opt {
+        None => Ok(PeerCapMap::new()),
+        Some(raw) => {
+            let mut map = PeerCapMap::new();
+            for (k, v) in raw {
+                map.insert(k, v.unwrap_or_default());
+            }
+            Ok(map)
+        }
+    }
+}
 
 /// A range of TCP/UDP/SCTP ports (inclusive). Matches Go's `tailcfg.PortRange`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -51,11 +71,23 @@ pub struct NetPortRange {
 /// capability→values map.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapGrant {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub Dsts: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub Caps: Vec<NodeCapability>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        deserialize_with = "deserialize_peercapmap"
+    )]
     pub CapMap: PeerCapMap,
 }
 
@@ -69,19 +101,39 @@ pub type PeerCapMap = BTreeMap<NodeCapability, Vec<RawMessage>>;
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FilterRule {
     /// Source IPs/CIDRs/ranges/wildcards.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub SrcIPs: Vec<String>,
     /// Deprecated CIDR bits paired with `SrcIPs`. Rejected by the filter.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub SrcBits: Vec<i32>,
     /// Destination IP+port ranges.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub DstPorts: Vec<NetPortRange>,
     /// IP protocol numbers. Empty → default (TCP, UDP, ICMPv4, ICMPv6).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub IPProto: Vec<i32>,
     /// Capability grants.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub CapGrant: Vec<CapGrant>,
 }
 

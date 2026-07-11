@@ -110,7 +110,7 @@ bench_mint_authkey() {
   local key
   key=$(curl -fsS -X POST "$BENCH_API/api/v2/tailnet/$BENCH_DNS/keys" \
     -H "Authorization: Bearer $BENCH_CHILD_TOKEN" -H 'Content-Type: application/json' \
-    -d '{"capabilities":{"devices":{"create":{"reusable":true,"ephemeral":true,"preauthorized":true,"tags":["tag:e2e"]}}},"expirySeconds":3600}' \
+    -d '{"capabilities":{"devices":{"create":{"reusable":true,"ephemeral":true,"preauthorized":true,"tags":["tag:e2e"]}}},"expirySeconds":900}' \
     | jq -r .key)
   [[ -n "$key" && "$key" != null ]] || { echo "[bench] authkey mint failed" >&2; return 1; }
   echo "$key"

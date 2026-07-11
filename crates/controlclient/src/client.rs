@@ -283,6 +283,58 @@ impl ControlClient {
         Ok(())
     }
 
+    /// Send a fire-and-forget `MapRequest` (no response body expected).
+    ///
+    /// Opens a Noise + h2 connection, POSTs the request, checks the HTTP
+    /// status is 200, then discards the response body. Use for endpoint
+    /// updates where `OmitPeers=true` and `Stream=false` — the control
+    /// server responds with HTTP 200 and an empty body.
+    pub async fn send_map_request(&self, req: &MapRequest) -> Result<(), StreamMapError> {
+        let noise_stream = dial_control(
+            &self.host,
+            &self.machine_key,
+            &self.control_key,
+            self.version,
+        )
+        .await?;
+
+        let (conn, stream) = noise_stream.into_parts();
+        let noise_io = NoiseIo::new(conn, stream);
+
+        let (mut h2_send, h2_conn) = establish_h2(noise_io).await?;
+        tokio::spawn(async move {
+            let _ = h2_conn.await;
+        });
+
+        let body = serde_json::to_vec(req)?;
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("/machine/map")
+            .header("content-type", "application/json")
+            .body(())
+            .unwrap();
+
+        let (resp_future, mut send_stream) = h2_send.send_request(request, false)?;
+        send_stream.send_data(bytes::Bytes::from(body), true)?;
+
+        let resp = resp_future.await?;
+        let status = resp.status().as_u16();
+        let mut body = resp.into_body();
+
+        if status != 200 {
+            let data = read_h2_body(&mut body).await?;
+            return Err(StreamMapError::HttpStatus(
+                status,
+                String::from_utf8_lossy(&data).to_string(),
+            ));
+        }
+
+        // Drain and discard the response body (expected to be empty).
+        while body.data().await.is_some() {}
+
+        Ok(())
+    }
+
     /// Convenience: send a `MapRequest` and read the first `MapResponse`.
     pub async fn fetch_map(&self, req: &MapRequest) -> Result<MapResponse, StreamMapError> {
         let (tx, mut rx) = mpsc::channel(1);

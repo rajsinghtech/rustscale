@@ -493,6 +493,22 @@ impl Server {
         // Userspace netstack bound to our tailnet IPv4.
         let netstack = Arc::new(Netstack::new(b.our_v4, DEFAULT_MTU));
 
+        // Periodic endpoint update (Bug 4): pushes a non-streaming
+        // MapRequest with OmitPeers=true every 5 minutes so the control
+        // server always has fresh endpoint data.
+        let periodic_ep = spawn_periodic_endpoint_updates(
+            b.magicsock.clone(),
+            b.cancel.clone(),
+            b.control_url.clone(),
+            b.machine_key.clone(),
+            b.server_pub_key.clone(),
+            b.node_key.clone(),
+            b.disco_key.clone(),
+            b.hostname.clone(),
+            b.advertise_routes.clone(),
+            b.derp_map.clone(),
+        );
+
         // Netstack data-plane pump: netstack <-> WG <-> magicsock.
         let pump = tokio::spawn(run_netstack_pump(
             b.magicsock.clone(),
@@ -529,7 +545,7 @@ impl Server {
         // assigned to an interface; failure is non-fatal (dial still resolves
         // via the shared resolver). The responder serves A/AAAA for peer
         // hostnames and forwards the rest upstream.
-        let mut tasks = vec![b.map_task, pump, map_update];
+        let mut tasks = vec![b.map_task, pump, map_update, periodic_ep];
         let responder = DnsResponder::new(
             b.resolver.clone(),
             upstream_nameservers(b.dns_config.read().await.as_ref()),
@@ -660,6 +676,20 @@ impl Server {
             b.cancel.clone(),
         ));
 
+        // Periodic endpoint update (Bug 4).
+        let periodic_ep = spawn_periodic_endpoint_updates(
+            b.magicsock.clone(),
+            b.cancel.clone(),
+            b.control_url.clone(),
+            b.machine_key.clone(),
+            b.server_pub_key.clone(),
+            b.node_key.clone(),
+            b.disco_key.clone(),
+            b.hostname.clone(),
+            b.advertise_routes.clone(),
+            b.derp_map.clone(),
+        );
+
         let map_update = spawn_map_update_task(
             b.map_rx,
             b.magicsock.clone(),
@@ -686,7 +716,7 @@ impl Server {
             peers: b.peers,
             route_table: b.route_table,
             cancel: b.cancel,
-            tasks: Mutex::new(vec![b.map_task, pump, map_update]),
+            tasks: Mutex::new(vec![b.map_task, pump, map_update, periodic_ep]),
             packet_drops: b.packet_drops,
             resolver: b.resolver,
             our_fqdn: b.our_fqdn,
@@ -836,8 +866,8 @@ impl Server {
             server_pub_key.clone(),
             PROTOCOL_VERSION,
         );
-        match cc_ep.fetch_map(&endpoint_update_req).await {
-            Ok(_) => eprintln!("tsnet: endpoint update sent (DiscoKey + {local_endpoints:?})"),
+        match cc_ep.send_map_request(&endpoint_update_req).await {
+            Ok(()) => eprintln!("tsnet: endpoint update sent (DiscoKey + {local_endpoints:?})"),
             Err(e) => eprintln!("tsnet: endpoint update failed (non-fatal): {e}"),
         }
 
@@ -919,7 +949,15 @@ impl Server {
         // 7. Connect home DERP.
         eprintln!("tsnet: home DERP region = {home_derp}");
         let derp_client = match connect_home_derp(&derp_map, home_derp, &state.node_key).await {
-            Ok(c) => {
+            Ok(mut c) => {
+                // Tell the DERP server this is our preferred (home) node.
+                // Go's derphttp.Client sets preferred=true after connecting
+                // to the home DERP and calls NotePreferred(true). This lets
+                // the DERP server track home-client metrics and is part of
+                // the expected handshake.
+                if let Err(e) = c.note_preferred(true).await {
+                    eprintln!("tsnet: DERP note_preferred failed (non-fatal): {e}");
+                }
                 eprintln!("tsnet: DERP connected to region {home_derp}");
                 health.set_healthy(WARN_DERP_HOME);
                 Some(c)
@@ -2097,8 +2135,8 @@ fn spawn_link_monitor(
                 ..Default::default()
             };
             let cc = ControlClient::new(&control_url, machine_key, server_pub_key, PROTOCOL_VERSION);
-            match cc.fetch_map(&req).await {
-                Ok(_) => {
+            match cc.send_map_request(&req).await {
+                Ok(()) => {
                     eprintln!("tsnet: link-change endpoint update sent");
                     // Endpoints re-published: clear the transient warning.
                     health.set_healthy(WARN_NETMON_CHANGE);
@@ -2109,6 +2147,81 @@ fn spawn_link_monitor(
     });
 
     Some(handle)
+}
+
+/// Periodic endpoint update task (Bug 4).
+///
+/// Sends a non-streaming MapRequest with `OmitPeers=true` every 5 minutes
+/// so the control server always has fresh endpoint data (local IPs, STUN
+/// results, port-mapped endpoints). Go's controlclient does this via
+/// `setEndpoints` on a timer; rustscale only sent endpoints once at startup
+/// and on link-change (netmon), which could leave the control server with
+/// stale data for the lifetime of a long-lived session.
+///
+/// The task is self-contained: it creates its own `ControlClient` per
+/// update (to avoid sharing the streaming map-poll client) and respects
+/// the shared `CancelToken`.
+fn spawn_periodic_endpoint_updates(
+    magicsock: Arc<Magicsock>,
+    cancel: Arc<CancelToken>,
+    control_url: String,
+    machine_key: MachinePrivate,
+    server_pub_key: MachinePublic,
+    node_key: NodePrivate,
+    disco_key: DiscoPrivate,
+    hostname: String,
+    advertise_routes: Vec<String>,
+    derp_map: DERPMap,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let node_pub = node_key.public();
+        let disco_pub = disco_key.public();
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+            if cancel.is_cancelled() {
+                break;
+            }
+
+            let mut eps = magicsock.all_endpoints();
+            if !derp_map.Regions.is_empty() {
+                if let Ok(report) = rustscale_netcheck::Prober
+                    .run(&derp_map, &rustscale_netcheck::ProberOpts::default())
+                    .await
+                {
+                    if let Some(g) = report.global_v4 {
+                        eps.push(g.to_string());
+                    }
+                }
+            }
+
+            let req = MapRequest {
+                Version: CAPABILITY_VERSION,
+                KeepAlive: false,
+                NodeKey: node_pub.clone(),
+                DiscoKey: disco_pub.clone(),
+                Stream: false,
+                OmitPeers: true,
+                Endpoints: eps,
+                Hostinfo: Some(Hostinfo {
+                    OS: std::env::consts::OS.into(),
+                    Hostname: hostname.clone(),
+                    RoutableIPs: advertise_routes.clone(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let cc = ControlClient::new(
+                &control_url,
+                machine_key.clone(),
+                server_pub_key.clone(),
+                PROTOCOL_VERSION,
+            );
+            match cc.send_map_request(&req).await {
+                Ok(()) => eprintln!("tsnet: periodic endpoint update sent"),
+                Err(e) => eprintln!("tsnet: periodic endpoint update failed (non-fatal): {e}"),
+            }
+        }
+    })
 }
 
 async fn connect_home_derp(

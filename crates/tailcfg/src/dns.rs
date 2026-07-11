@@ -8,7 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{skip_default, CapabilityVersion, NodeKey, UserID};
+use crate::{deserialize_null_to_default, skip_default, CapabilityVersion, NodeKey, UserID};
 
 /// Configuration for one DNS resolver (subset of Go's `dnstype.Resolver`).
 ///
@@ -33,24 +33,44 @@ pub struct Resolver {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct DNSConfig {
     /// Global DNS resolvers to use, in preference order.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub Resolvers: Vec<Resolver>,
     /// Search domains (FQDNs without trailing dot).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub Domains: Vec<String>,
     /// Whether MagicDNS (peer-name resolution from the netmap) is on.
     #[serde(default, skip_serializing_if = "skip_default")]
     pub Proxied: bool,
     /// DNS names for which control assists with LE cert provisioning. A
     /// non-empty list signals the tailnet has HTTPS enabled.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub CertDomains: Vec<String>,
     /// Extra DNS records to add to MagicDNS.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub ExtraRecords: Vec<DNSRecord>,
     /// Deprecated global nameserver IPs (MapRequest.Version <14). Kept for
     /// wire compatibility.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub Nameservers: Vec<String>,
 }
 

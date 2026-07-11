@@ -18,14 +18,14 @@
 
 # ---------------------------------------------------------------------------
 # start_footprint PID OUTFILE
-# Launches `pidstat -p PID -rud 1 > OUTFILE` in the background.
+# Launches `pidstat -p PID -ru 1 > OUTFILE` in the background.
 # Prints the sampler PID (local or remote — caller manages remote via ssh).
 # For VM usage, the caller runs these helpers *inside* an ssh_cmd invocation.
 # ---------------------------------------------------------------------------
 start_footprint() {
   local pid="$1" outfile="$2"
   if command -v pidstat >/dev/null 2>&1; then
-    pidstat -p "$pid" -rud 1 >"$outfile" 2>&1 &
+    pidstat -p "$pid" -ru 1 >"$outfile" 2>&1 &
     echo $!
   else
     # Fallback: ps loop writing "rss pcpu" rows.
@@ -54,15 +54,25 @@ path = sys.argv[1]
 rss_vals = []
 cpu_vals = []
 
+# pidstat -ru interleaves -r (memory) and -u (CPU) rows.  On sysstat >= 12.x
+# each data row is prefixed with a timestamp ("HH:MM:SS" optionally followed
+# by "AM"/"PM"), which shifts every column index by 1-2.  Strip it so the
+# column layout matches the header.
+time_re = re.compile(r'^\d{1,2}:\d{2}:\d{2}')
+
 try:
     with open(path) as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith(("UID", "Linux", "#")):
                 continue
-            # pidstat -r row: UID PID minflt/s majflt/s VSZ RSS %MEM Command
-            # pidstat -u row: UID PID %usr %system %guest %wait %CPU CPU Command
             parts = line.split()
+            # Strip timestamp prefix (sysstat 12.x+).
+            if time_re.match(parts[0]):
+                if len(parts) > 1 and parts[1] in ("AM", "PM"):
+                    parts = parts[2:]
+                else:
+                    parts = parts[1:]
             if len(parts) < 7:
                 # ps fallback: "rss pcpu"
                 if len(parts) == 2:
@@ -72,24 +82,27 @@ try:
                     except ValueError:
                         pass
                 continue
-            # Heuristic: RSS rows have a large integer in column 5 (VSZ in KB)
-            # and column 6 (RSS in KB); CPU rows have a float in column 6 (%CPU).
+            # After timestamp stripping the layout is:
+            #   -r row: UID PID minflt/s majflt/s VSZ RSS %MEM Command
+            #   -u row: UID PID %usr %system %guest %wait %CPU CPU Command
+            # Distinguish: -r rows have an integer in col 4 (VSZ) and col 5
+            # (RSS); -u rows have a float in col 4 (%guest).
             try:
-                vsz = int(parts[4])
+                int(parts[4])  # VSZ (int) → this is a -r row
                 rss = int(parts[5])
                 rss_vals.append(rss)
                 continue
             except ValueError:
                 pass
             try:
-                cpu = float(parts[6])
+                cpu = float(parts[6])  # %CPU
                 cpu_vals.append(cpu)
             except ValueError:
                 pass
 except FileNotFoundError:
     pass
 
-def agg(vals, peak=True, avg=True):
+def agg(vals):
     if not vals:
         return {"peak": 0, "avg": 0}
     return {
@@ -120,7 +133,7 @@ PYEOF
 remote_start_footprint() {
   local name="$1" zone="$2" pid="$3" outfile="$4"
   ssh_cmd "$name" "$zone" \
-    "nohup pidstat -p $pid -rud 1 >$outfile 2>&1 & echo \$! >$outfile.handle; cat $outfile.handle"
+    "nohup pidstat -p $pid -ru 1 >$outfile 2>&1 & echo \$! >$outfile.handle; cat $outfile.handle"
 }
 
 # ---------------------------------------------------------------------------

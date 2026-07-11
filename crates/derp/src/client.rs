@@ -78,8 +78,15 @@ pub struct DerpClient {
 impl DerpClient {
     /// Create a DerpClient from an already-connected stream.
     ///
-    /// Performs the DERP handshake (recvServerKey + sendClientKey) and
-    /// optionally reads the first ServerInfo frame.
+    /// Performs the full DERP handshake:
+    /// 1. Receive the server's public key (`FrameServerKey`).
+    /// 2. Send our client info (`FrameClientInfo`).
+    /// 3. Read the server's `FrameServerInfo` reply.
+    ///
+    /// Reading the ServerInfo confirms the server accepted our connection
+    /// (the server sends it only after `verifyClient` + `registerClient`
+    /// succeed). If the server rejects the client, the connection is closed
+    /// and this returns an IO error rather than a false success.
     pub async fn from_stream(
         stream: Box<dyn DerpStream>,
         private_key: NodePrivate,
@@ -93,6 +100,7 @@ impl DerpClient {
         };
         client.recv_server_key().await?;
         client.send_client_key().await?;
+        client.recv_server_info().await?;
         Ok(client)
     }
 
@@ -229,6 +237,7 @@ impl DerpClient {
     async fn send_client_key(&mut self) -> Result<(), DerpError> {
         let info = ClientInfo {
             version: frame::PROTOCOL_VERSION,
+            can_ack_pings: true,
             ..Default::default()
         };
         let json = serde_json::to_vec(&info)?;
@@ -239,6 +248,30 @@ impl DerpClient {
         body.extend_from_slice(&msgbox);
 
         write_frame_async(&mut self.stream, frame_type::CLIENT_INFO, &body).await?;
+        Ok(())
+    }
+
+    /// Read and consume the `FrameServerInfo` that the server sends after
+    /// verifying and registering the client. If the server rejected the
+    /// client (e.g. admission control denied), it closes the connection
+    /// and this returns an IO error — which is the desired behavior: the
+    /// caller learns immediately that the DERP connection failed.
+    async fn recv_server_info(&mut self) -> Result<(), DerpError> {
+        let (typ, body) = read_frame_async(&mut self.stream, MAX_PACKET_SIZE as u32 * 2).await?;
+        if typ != frame_type::SERVER_INFO {
+            return Err(DerpError::BadFrame(format!(
+                "expected FrameServerInfo (0x{:02x}), got 0x{:02x}",
+                frame_type::SERVER_INFO,
+                typ
+            )));
+        }
+        // Parse to verify the seal opens with the server's key (confirms
+        // server identity). We don't need to return the info.
+        if parse_received(typ, &body, &self.private_key, &self.server_key).is_none() {
+            return Err(DerpError::BadServerInfo(
+                "failed to open ServerInfo box".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -434,14 +467,8 @@ mod tests {
         let client_pub = rx.await.unwrap();
         assert_eq!(client.public_key(), client_pub);
 
-        // Read the ServerInfo.
-        let msg = client.recv().await.unwrap();
-        match msg {
-            Received::ServerInfo(si) => assert_eq!(si.version, frame::PROTOCOL_VERSION),
-            other => panic!("expected ServerInfo, got {other:?}"),
-        }
-
-        // Send a packet and expect it echoed back.
+        // ServerInfo is consumed inside from_stream; send a packet and
+        // expect it echoed back.
         let data = b"hello derp echo";
         client.send_packet(server_pub, data).await.unwrap();
 
@@ -553,10 +580,7 @@ mod tests {
 
         assert_eq!(client.server_public_key(), server_pub_clone);
 
-        // ServerInfo
-        let _ = client.recv().await.unwrap();
-
-        // PeerGone
+        // ServerInfo consumed in from_stream; first recv is PeerGone.
         match client.recv().await.unwrap() {
             Received::PeerGone { peer, reason } => {
                 assert_eq!(peer, client.public_key());

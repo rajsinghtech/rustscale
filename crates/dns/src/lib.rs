@@ -288,7 +288,31 @@ impl DnsResponder {
     /// on success. Binding to `:53` typically requires root; failure is
     /// non-fatal and logged by the caller.
     pub async fn spawn(self) -> std::io::Result<tokio::task::JoinHandle<()>> {
-        let sock = std::sync::Arc::new(tokio::net::UdpSocket::bind(self.bind).await?);
+        let addrs = &[
+            self.bind,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 53),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        ];
+        let mut bind_idx = 0;
+        let sock = loop {
+            if bind_idx >= addrs.len() {
+                return Err(std::io::Error::other("all DNS bind addresses failed"));
+            }
+            let addr = addrs[bind_idx];
+            match tokio::net::UdpSocket::bind(addr).await {
+                Ok(s) => {
+                    if bind_idx > 0 {
+                        eprintln!("DNS responder: bound to {addr} instead of {}", self.bind);
+                    }
+                    break std::sync::Arc::new(s);
+                }
+                Err(e) if bind_idx + 1 < addrs.len() => {
+                    bind_idx += 1;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        };
         let upstream = self.upstream;
         let resolver = self.resolver;
         Ok(tokio::spawn(async move {

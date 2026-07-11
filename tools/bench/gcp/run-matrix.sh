@@ -95,14 +95,18 @@ ACTIVE_CLI_ZONE=""
 
 # ---------------------------------------------------------------------------
 # Provision tailnet (skipped in dry-run to avoid API calls).
+# A FRESH authkey is minted per config invocation inside the main loop to
+# avoid key expiry / invalidation across the ~40-min matrix run.  The
+# org-level child token / DNS / API base are exported so that bench_mint_authkey
+# (defined in tools/bench/lib.sh) works inside run-config.sh if ever needed.
 # ---------------------------------------------------------------------------
 if [[ $DRY_RUN -eq 1 ]]; then
   echo "[dry-run] skipping tailnet provisioning" >&2
   AUTHKEY="tskey-dryrun-placeholder"
 else
   bench_provision_tailnet
-  AUTHKEY=$(bench_mint_authkey)
-  echo "[gcp] authkey minted" >&2
+  export BENCH_DNS BENCH_CHILD_TOKEN BENCH_API
+  echo "[gcp] tailnet provisioned; authkeys will be minted per-config" >&2
 fi
 
 # Register cleanup handler AFTER bench_provision_tailnet so our trap overrides it.
@@ -153,6 +157,17 @@ for TOPO in "${TOPOLOGIES[@]}"; do
       echo ""
       echo "[gcp] >>> config: $CFG (topo=$TOPO path=$PATH_TAG) <<<"
       export BENCH_MATRIX="${TOPO}/${PATH_TAG}"
+
+      # Mint a FRESH authkey per config.  Reusing a single ephemeral key
+      # across all 16 configs causes "invalid key" / "node not found" errors
+      # as the key expires or its ephemeral nodes are reaped mid-run.
+      if [[ $DRY_RUN -eq 1 ]]; then
+        AUTHKEY="tskey-dryrun-placeholder"
+      else
+        AUTHKEY=$(bench_mint_authkey)
+        echo "[gcp] minted fresh authkey for $CFG" >&2
+      fi
+
       if tools/bench/gcp/run-config.sh \
           "$CFG" "$SERVER_VM" "$CLIENT_VM" "$Z_A" "$Z_B" \
           "$AUTHKEY" "$RESULTS_DIR/$TOPO/$PATH_TAG" \

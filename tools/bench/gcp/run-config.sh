@@ -303,6 +303,9 @@ PYEOF
 # ===========================================================================
 run_rs_tun() {
   echo "[gcp] rs-tun: starting tunnels on both VMs" >&2
+  # Remove stale log/pid files from a prior run (may be root-owned).
+  ssh_sudo "$SVM" "$SZONE"  'rm -f /tmp/rs-tun-srv.log /tmp/rs-tun-srv.pid'
+  ssh_sudo "$CVM" "$CZONE"  'rm -f /tmp/rs-tun-cli.log /tmp/rs-tun-cli.pid'
   ssh_sudo "$SVM" "$SZONE" \
     "nohup /opt/rustscale/target/release/examples/rustscale-tun \
        --authkey $AUTHKEY --hostname $SHOST --apply-routes --tun-name utun0 \
@@ -450,9 +453,10 @@ run_ts_userspace() {
   fi
   echo "[gcp] ts-userspace: server IP=$server_ip" >&2
 
+  # Clear any stale serve config from a prior run before setting up ours.
+  ssh_cmd "$SVM" "$SZONE" "tailscale --socket=/tmp/ts-srv.sock serve reset 2>>/tmp/ts-srv.log" || true
   ssh_cmd "$SVM" "$SZONE" \
-    "tailscale --socket=/tmp/ts-srv.sock serve --tcp $PORT --bg localhost:$PORT 2>>/tmp/ts-srv.log || \
-     tailscale --socket=/tmp/ts-srv.sock serve --tcp $PORT --bg $PORT 2>>/tmp/ts-srv.log"
+    "tailscale --socket=/tmp/ts-srv.sock serve --tcp $PORT --bg 127.0.0.1:$PORT 2>>/tmp/ts-srv.log"
   ssh_cmd "$SVM" "$SZONE" \
     "pkill -x iperf3 2>/dev/null; nohup iperf3 -s -p $PORT -B 127.0.0.1 > /tmp/iperf3-srv.log 2>&1 & echo \$! > /tmp/iperf3-srv.pid"
   sleep 2
@@ -521,8 +525,8 @@ print(json.dumps(arr))
      pkill -x ncat 2>/dev/null; \
      nohup ncat -l 5202 --exec '/bin/cat' --keep-open > /tmp/ncat.log 2>&1 & echo \$! > /tmp/ncat.pid; \
      sleep 1; \
-     tailscale --socket=/tmp/ts-srv.sock serve --tcp 5202 --bg localhost:5202 2>>/tmp/ts-srv.log || \
-     tailscale --socket=/tmp/ts-srv.sock serve --tcp 5202 --bg 5202 2>>/tmp/ts-srv.log"
+     tailscale --socket=/tmp/ts-srv.sock serve --tcp 5202 --bg 127.0.0.1:5202 2>>/tmp/ts-srv.log || \
+     tailscale --socket=/tmp/ts-srv.sock serve --tcp 5202 --bg 127.0.0.1:5202 2>>/tmp/ts-srv.log"
   sleep 2
 
   local lat_json
@@ -591,7 +595,7 @@ print('unknown')
 
   # Cleanup.
   ssh_cmd "$CVM" "$CZONE" "kill \$(cat /tmp/socat.pid 2>/dev/null) 2>/dev/null; pkill -x socat 2>/dev/null" || true
-  ssh_cmd "$SVM" "$SZONE" "kill \$(cat /tmp/iperf3-srv.pid 2>/dev/null) \$(cat /tmp/ncat.pid 2>/dev/null) 2>/dev/null; pkill -x iperf3 2>/dev/null; pkill -x ncat 2>/dev/null" || true
+  ssh_cmd "$SVM" "$SZONE" "tailscale --socket=/tmp/ts-srv.sock serve reset 2>/dev/null; kill \$(cat /tmp/iperf3-srv.pid 2>/dev/null) \$(cat /tmp/ncat.pid 2>/dev/null) 2>/dev/null; pkill -x iperf3 2>/dev/null; pkill -x ncat 2>/dev/null" || true
   ssh_cmd "$SVM" "$SZONE" "kill \$(cat /tmp/ts-srv.pid 2>/dev/null) 2>/dev/null; pkill -x tailscaled 2>/dev/null" || true
   ssh_cmd "$CVM" "$CZONE" "kill \$(cat /tmp/ts-cli.pid 2>/dev/null) 2>/dev/null; pkill -x tailscaled 2>/dev/null" || true
 
@@ -621,52 +625,74 @@ PYEOF
 # ===========================================================================
 run_ts_tun() {
   echo "[gcp] ts-tun: starting tailscaled on both VMs (kernel TUN)" >&2
+
+  # Use unique paths so root-owned files from ts-tun don't clash with
+  # ts-userspace's non-root files.  Also remove any stale leftovers from a
+  # prior run (root-owned log/pid/sock that non-root SSH can't truncate).
   ssh_sudo "$SVM" "$SZONE" \
-    "nohup tailscaled --socket=/tmp/ts-srv.sock --statedir=/tmp/ts-srv > /tmp/ts-srv.log 2>&1 & echo \$! > /tmp/ts-srv.pid"
+    "rm -f /tmp/ts-tun-srv.log /tmp/ts-tun-srv.pid /tmp/ts-tun-srv.sock; rm -rf /tmp/ts-tun-srv"
+  ssh_sudo "$CVM" "$CZONE" \
+    "rm -f /tmp/ts-tun-cli.log /tmp/ts-tun-cli.pid /tmp/ts-tun-cli.sock; rm -rf /tmp/ts-tun-cli"
+
+  # Back up /etc/resolv.conf before tailscaled (root) overwrites it for
+  # MagicDNS.  If tailscaled is killed without `tailscale down', resolv.conf
+  # stays pointed at 100.100.100.100 and every subsequent config that relies
+  # on system DNS (rustscale) fails with "Temporary failure in name resolution".
+  ssh_sudo "$SVM" "$SZONE"  'cp /etc/resolv.conf /etc/resolv.conf.bench-bak 2>/dev/null || true'
+  ssh_sudo "$CVM" "$CZONE"  'cp /etc/resolv.conf /etc/resolv.conf.bench-bak 2>/dev/null || true'
+
+  ssh_sudo "$SVM" "$SZONE" \
+    "nohup tailscaled --socket=/tmp/ts-tun-srv.sock --statedir=/tmp/ts-tun-srv > /tmp/ts-tun-srv.log 2>&1 & echo \$! > /tmp/ts-tun-srv.pid"
   sleep 3
   if ! ssh_sudo "$SVM" "$SZONE" \
-    "tailscale --socket=/tmp/ts-srv.sock up --authkey=$AUTHKEY --hostname=$SHOST --timeout=120s 2>>/tmp/ts-srv.log"; then
+    "tailscale --socket=/tmp/ts-tun-srv.sock up --authkey=$AUTHKEY --hostname=$SHOST --timeout=120s 2>>/tmp/ts-tun-srv.log"; then
     echo "[gcp] ERROR: tailscale up failed on server" >&2
     local _lt
-    _lt=$(capture_log_tail "$SVM" "$SZONE" /tmp/ts-srv.log)
+    _lt=$(capture_log_tail "$SVM" "$SZONE" /tmp/ts-tun-srv.log)
     emit_stub "ts-up-failed-srv" "$_lt"
-    ssh_sudo "$SVM" "$SZONE" 'pkill -x tailscaled 2>/dev/null' || true
+    ssh_sudo "$SVM" "$SZONE" \
+      'tailscale --socket=/tmp/ts-tun-srv.sock down 2>/dev/null; pkill -x tailscaled 2>/dev/null; cp /etc/resolv.conf.bench-bak /etc/resolv.conf 2>/dev/null || true' || true
     return 1
   fi
   local server_ip
-  server_ip=$(ssh_sudo "$SVM" "$SZONE" "tailscale --socket=/tmp/ts-srv.sock ip -4 2>>/tmp/ts-srv.log")
+  server_ip=$(ssh_sudo "$SVM" "$SZONE" "tailscale --socket=/tmp/ts-tun-srv.sock ip -4 2>>/tmp/ts-tun-srv.log")
   if [[ -z "$server_ip" ]]; then
     echo "[gcp] ERROR: no tailnet IP on server" >&2
     local _lt
-    _lt=$(capture_log_tail "$SVM" "$SZONE" /tmp/ts-srv.log)
+    _lt=$(capture_log_tail "$SVM" "$SZONE" /tmp/ts-tun-srv.log)
     emit_stub "ts-no-ip-srv" "$_lt"
-    ssh_sudo "$SVM" "$SZONE" 'pkill -x tailscaled 2>/dev/null' || true
+    ssh_sudo "$SVM" "$SZONE" \
+      'tailscale --socket=/tmp/ts-tun-srv.sock down 2>/dev/null; pkill -x tailscaled 2>/dev/null; cp /etc/resolv.conf.bench-bak /etc/resolv.conf 2>/dev/null || true' || true
     return 1
   fi
   echo "[gcp] ts-tun: server IP=$server_ip" >&2
 
   ssh_sudo "$CVM" "$CZONE" \
-    "nohup tailscaled --socket=/tmp/ts-cli.sock --statedir=/tmp/ts-cli > /tmp/ts-cli.log 2>&1 & echo \$! > /tmp/ts-cli.pid"
+    "nohup tailscaled --socket=/tmp/ts-tun-cli.sock --statedir=/tmp/ts-tun-cli > /tmp/ts-tun-cli.log 2>&1 & echo \$! > /tmp/ts-tun-cli.pid"
   sleep 3
   if ! ssh_sudo "$CVM" "$CZONE" \
-    "tailscale --socket=/tmp/ts-cli.sock up --authkey=$AUTHKEY --hostname=$CHOST --timeout=120s 2>>/tmp/ts-cli.log"; then
+    "tailscale --socket=/tmp/ts-tun-cli.sock up --authkey=$AUTHKEY --hostname=$CHOST --timeout=120s 2>>/tmp/ts-tun-cli.log"; then
     echo "[gcp] ERROR: tailscale up failed on client" >&2
     local _lt
-    _lt=$(capture_log_tail "$CVM" "$CZONE" /tmp/ts-cli.log)
+    _lt=$(capture_log_tail "$CVM" "$CZONE" /tmp/ts-tun-cli.log)
     emit_stub "ts-up-failed-cli" "$_lt"
-    ssh_sudo "$SVM" "$SZONE" 'pkill -x tailscaled 2>/dev/null' || true
-    ssh_sudo "$CVM" "$CZONE" 'pkill -x tailscaled 2>/dev/null' || true
+    ssh_sudo "$SVM" "$SZONE" \
+      'tailscale --socket=/tmp/ts-tun-srv.sock down 2>/dev/null; pkill -x tailscaled 2>/dev/null; cp /etc/resolv.conf.bench-bak /etc/resolv.conf 2>/dev/null || true' || true
+    ssh_sudo "$CVM" "$CZONE" \
+      'tailscale --socket=/tmp/ts-tun-cli.sock down 2>/dev/null; pkill -x tailscaled 2>/dev/null; cp /etc/resolv.conf.bench-bak /etc/resolv.conf 2>/dev/null || true' || true
     return 1
   fi
 
   # Wait for the peer to appear (replaces fixed sleep 5).
-  if ! wait_ts_peer "$CVM" "$CZONE" /tmp/ts-cli.sock 120; then
+  if ! wait_ts_peer "$CVM" "$CZONE" /tmp/ts-tun-cli.sock 120; then
     echo "[gcp] ERROR: no tailscale peer appeared on client after 120s" >&2
     local _lt
-    _lt=$(capture_log_tail "$CVM" "$CZONE" /tmp/ts-cli.log)
+    _lt=$(capture_log_tail "$CVM" "$CZONE" /tmp/ts-tun-cli.log)
     emit_stub "ts-no-peer" "$_lt"
-    ssh_sudo "$SVM" "$SZONE" 'pkill -x tailscaled 2>/dev/null' || true
-    ssh_sudo "$CVM" "$CZONE" 'pkill -x tailscaled 2>/dev/null' || true
+    ssh_sudo "$SVM" "$SZONE" \
+      'tailscale --socket=/tmp/ts-tun-srv.sock down 2>/dev/null; pkill -x tailscaled 2>/dev/null; cp /etc/resolv.conf.bench-bak /etc/resolv.conf 2>/dev/null || true' || true
+    ssh_sudo "$CVM" "$CZONE" \
+      'tailscale --socket=/tmp/ts-tun-cli.sock down 2>/dev/null; pkill -x tailscaled 2>/dev/null; cp /etc/resolv.conf.bench-bak /etc/resolv.conf 2>/dev/null || true' || true
     return 1
   fi
 
@@ -677,8 +703,8 @@ run_ts_tun() {
 
   # Footprint for tailscaled PID on server VM.
   local srv_pid
-  srv_pid=$(ssh_sudo "$SVM" "$SZONE" 'cat /tmp/ts-srv.pid')
-  remote_start_footprint "$SVM" "$SZONE" "$srv_pid" /tmp/ts-srv.footprint
+  srv_pid=$(ssh_sudo "$SVM" "$SZONE" 'cat /tmp/ts-tun-srv.pid')
+  remote_start_footprint "$SVM" "$SZONE" "$srv_pid" /tmp/ts-tun-srv.footprint
 
   # Throughput sweep.
   local tp_json="[]"
@@ -706,15 +732,25 @@ print(json.dumps(arr))
 
   # Stop footprint.
   local foot_json
-  foot_json=$(remote_stop_footprint "$SVM" "$SZONE" /tmp/ts-srv.footprint)
+  foot_json=$(remote_stop_footprint "$SVM" "$SZONE" /tmp/ts-tun-srv.footprint)
 
   # Binary size.
   local bin_size
   bin_size=$(ssh_cmd "$SVM" "$SZONE" 'stat -c %s /usr/sbin/tailscaled 2>/dev/null || echo 0')
 
-  # Cleanup.
-  ssh_sudo "$SVM" "$SZONE" "kill \$(cat /tmp/iperf3-srv.pid 2>/dev/null) 2>/dev/null; pkill -x iperf3 2>/dev/null; kill \$(cat /tmp/ts-srv.pid 2>/dev/null) 2>/dev/null; pkill -x tailscaled 2>/dev/null; tailscale --socket=/tmp/ts-srv.sock down 2>/dev/null" || true
-  ssh_sudo "$CVM" "$CZONE" "kill \$(cat /tmp/ts-cli.pid 2>/dev/null) 2>/dev/null; pkill -x tailscaled 2>/dev/null; tailscale --socket=/tmp/ts-cli.sock down 2>/dev/null" || true
+  # Cleanup: `tailscale down' restores /etc/resolv.conf; then kill + restore
+  # resolv.conf backup as a belt-and-suspenders safeguard.
+  ssh_sudo "$SVM" "$SZONE" \
+    "kill \$(cat /tmp/iperf3-srv.pid 2>/dev/null) 2>/dev/null; pkill -x iperf3 2>/dev/null; \
+     tailscale --socket=/tmp/ts-tun-srv.sock down 2>/dev/null; \
+     kill \$(cat /tmp/ts-tun-srv.pid 2>/dev/null) 2>/dev/null; pkill -x tailscaled 2>/dev/null; \
+     cp /etc/resolv.conf.bench-bak /etc/resolv.conf 2>/dev/null || true; \
+     rm -f /etc/resolv.conf.bench-bak" || true
+  ssh_sudo "$CVM" "$CZONE" \
+    "tailscale --socket=/tmp/ts-tun-cli.sock down 2>/dev/null; \
+     kill \$(cat /tmp/ts-tun-cli.pid 2>/dev/null) 2>/dev/null; pkill -x tailscaled 2>/dev/null; \
+     cp /etc/resolv.conf.bench-bak /etc/resolv.conf 2>/dev/null || true; \
+     rm -f /etc/resolv.conf.bench-bak" || true
 
   python3 - "$CONFIG" "$TOPOLOGY" "$PATH_TAG" "$path_class" "$bin_size" "$tp_json" "$lat_json" "$foot_json" >"$OUT" <<'PYEOF'
 import json, sys

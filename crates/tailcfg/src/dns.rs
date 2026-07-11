@@ -12,6 +12,28 @@ use serde::{Deserialize, Serialize};
 
 use crate::{deserialize_null_to_default, skip_default, CapabilityVersion, NodeKey, UserID};
 
+/// Deserialize a `HashMap<String, Vec<Resolver>>` where individual route values
+/// may be `null` on the wire (Go's nil slices marshal as `null`). Treats null
+/// values as empty vectors.
+fn deserialize_null_routes<'de, D>(
+    deserializer: D,
+) -> Result<HashMap<String, Vec<Resolver>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt: Option<HashMap<String, Option<Vec<Resolver>>>> = Option::deserialize(deserializer)?;
+    match opt {
+        None => Ok(HashMap::new()),
+        Some(raw) => {
+            let mut map = HashMap::with_capacity(raw.len());
+            for (k, v) in raw {
+                map.insert(k, v.unwrap_or_default());
+            }
+            Ok(map)
+        }
+    }
+}
+
 /// Configuration for one DNS resolver (subset of Go's `dnstype.Resolver`).
 ///
 /// `Addr` is the workhorse field: a plain IP for classic UDP/TCP DNS, or a
@@ -49,7 +71,7 @@ pub struct DNSConfig {
     #[serde(
         default,
         skip_serializing_if = "HashMap::is_empty",
-        deserialize_with = "deserialize_null_to_default"
+        deserialize_with = "deserialize_null_routes"
     )]
     pub Routes: HashMap<String, Vec<Resolver>>,
     /// Fallback resolvers (like `Resolvers` but only used when split DNS

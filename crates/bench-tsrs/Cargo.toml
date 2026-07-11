@@ -1,0 +1,18 @@
+[package]
+name = "tsrs-bench"
+description = "Throughput and latency benchmark harness for tailscale-rs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+tailscale = { path = "../../../tailscale-rs" }
+url = "2"
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+clap = { version = "4", features = ["derive"] }

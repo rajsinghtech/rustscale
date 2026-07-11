@@ -161,6 +161,8 @@ pub struct Hostinfo {
         deserialize_with = "deserialize_null_to_default"
     )]
     pub RoutableIPs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub NetInfo: Option<NetInfo>,
 }
 
 /// A service running on a node (matches Go's `tailcfg.Service`).

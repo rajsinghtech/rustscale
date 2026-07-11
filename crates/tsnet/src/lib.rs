@@ -72,8 +72,8 @@ use rustscale_key::{DiscoPrivate, MachinePrivate, MachinePublic, NodePrivate, No
 use rustscale_magicsock::{Magicsock, MagicsockConfig, MagicsockError};
 use rustscale_netstack::{Netstack, NetstackError, NetstackStream, DEFAULT_MTU};
 use rustscale_tailcfg::{
-    DERPMap, DNSConfig, FilterRule, Hostinfo, MapRequest, MapResponse, Node, RegisterRequest,
-    UserID, UserProfile,
+    DERPMap, DNSConfig, FilterRule, Hostinfo, MapRequest, MapResponse, NetInfo, Node, OptBool,
+    RegisterRequest, UserID, UserProfile,
 };
 use rustscale_tun::Tun;
 use rustscale_wg::{WgError, WgTunn};
@@ -427,6 +427,8 @@ struct Bootstrap {
     udp_port: u16,
     /// DERP map (for link-change re-STUN).
     derp_map: DERPMap,
+    /// Home DERP region ID (for NetInfo in endpoint updates).
+    home_derp: i32,
     /// Health tracker (shared with all subsystems).
     health: Tracker,
     /// Map-poll staleness watchdog (fires if no MapResponse for >3 min).
@@ -487,6 +489,7 @@ impl Server {
             b.hostname.clone(),
             b.advertise_routes.clone(),
             b.derp_map.clone(),
+            b.home_derp,
             b.health.clone(),
         );
 
@@ -507,6 +510,7 @@ impl Server {
             b.hostname.clone(),
             b.advertise_routes.clone(),
             b.derp_map.clone(),
+            b.home_derp,
         );
 
         // Netstack data-plane pump: netstack <-> WG <-> magicsock.
@@ -631,6 +635,7 @@ impl Server {
             b.hostname.clone(),
             b.advertise_routes.clone(),
             b.derp_map.clone(),
+            b.home_derp,
             b.health.clone(),
         );
 
@@ -688,6 +693,7 @@ impl Server {
             b.hostname.clone(),
             b.advertise_routes.clone(),
             b.derp_map.clone(),
+            b.home_derp,
         );
 
         let map_update = spawn_map_update_task(
@@ -972,6 +978,32 @@ impl Server {
             }
         };
 
+        let netinfo = NetInfo {
+            PreferredDERP: home_derp,
+            WorkingUDP: OptBool::True,
+            ..Default::default()
+        };
+        let netinfo_req = MapRequest {
+            Version: CAPABILITY_VERSION,
+            KeepAlive: false,
+            NodeKey: node_pub.clone(),
+            DiscoKey: disco_pub.clone(),
+            Stream: false,
+            OmitPeers: true,
+            Hostinfo: Some(Hostinfo {
+                OS: std::env::consts::OS.to_string(),
+                Hostname: self.config.hostname.clone(),
+                RoutableIPs: advertise.clone(),
+                NetInfo: Some(netinfo.clone()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        match cc_ep.send_map_request(&netinfo_req).await {
+            Ok(()) => eprintln!("tsnet: NetInfo (PreferredDERP={home_derp}) sent to control"),
+            Err(e) => eprintln!("tsnet: NetInfo update failed (non-fatal): {e}"),
+        }
+
         // 8. Create magicsock, reusing the UDP socket bound in step 3b so
         // the local endpoints advertised in the MapRequest match the socket
         // magicsock actually owns and reads from.
@@ -1083,6 +1115,7 @@ impl Server {
             advertise_routes: advertise,
             udp_port,
             derp_map,
+            home_derp,
             health,
             health_watchdog,
         })
@@ -2072,6 +2105,7 @@ fn spawn_link_monitor(
     hostname: String,
     advertise_routes: Vec<String>,
     derp_map: DERPMap,
+    home_derp: i32,
     health: Tracker,
 ) -> Option<rustscale_netmon::MonitorHandle> {
     let monitor = rustscale_netmon::Monitor::new().ok()?;
@@ -2088,6 +2122,7 @@ fn spawn_link_monitor(
         let advertise_routes = advertise_routes.clone();
         let derp_map = derp_map.clone();
         let health = health.clone();
+        let home_derp = home_derp;
         async move {
             if !delta.major {
                 return;
@@ -2130,6 +2165,11 @@ fn spawn_link_monitor(
                     OS: std::env::consts::OS.into(),
                     Hostname: hostname,
                     RoutableIPs: advertise_routes,
+                    NetInfo: Some(NetInfo {
+                        PreferredDERP: home_derp,
+                        WorkingUDP: OptBool::True,
+                        ..Default::default()
+                    }),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -2172,6 +2212,7 @@ fn spawn_periodic_endpoint_updates(
     hostname: String,
     advertise_routes: Vec<String>,
     derp_map: DERPMap,
+    home_derp: i32,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let node_pub = node_key.public();
@@ -2206,6 +2247,11 @@ fn spawn_periodic_endpoint_updates(
                     OS: std::env::consts::OS.into(),
                     Hostname: hostname.clone(),
                     RoutableIPs: advertise_routes.clone(),
+                    NetInfo: Some(NetInfo {
+                        PreferredDERP: home_derp,
+                        WorkingUDP: OptBool::True,
+                        ..Default::default()
+                    }),
                     ..Default::default()
                 }),
                 ..Default::default()

@@ -112,7 +112,10 @@ is_busy() {
   # /session/status returns {sessionID: {...}} only for busy/queued sessions.
   # --max-time is critical: without it a hung server stalls this poll forever,
   # which would defeat the watchdog deadline below.
-  curl -s --max-time 5 "$URL/session/status" | jq -e --arg s "$SID" 'has($s)' >/dev/null 2>&1 && echo 1 || echo 0
+  # directory param is required: sessions created in a worktree don't appear
+  # in the default-directory status map, which made the watchdog think a busy
+  # worktree session was idle after 30s.
+  curl -s --max-time 5 "$URL/session/status?directory=$DIR" | jq -e --arg s "$SID" 'has($s)' >/dev/null 2>&1 && echo 1 || echo 0
 }
 
 # 3. Watchdog loop.

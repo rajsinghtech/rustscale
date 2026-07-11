@@ -30,6 +30,7 @@
 
 mod acme;
 mod c2n;
+mod hostinfo;
 mod peerapi;
 mod routing;
 mod serve;
@@ -53,6 +54,10 @@ pub use status::{PeerInfo, ServerStatus, WhoIsInfo};
 pub use tls::{
     AcmeCertFetcher, CertError, CertFetcher, CertMaterial, CertProvider, ControlCertProvider,
     SelfSignedCertProvider, TlsError, TlsListener, TlsStream,
+};
+
+pub use hostinfo::{
+    collect_hostinfo, hostinfo_hash, populate_hostinfo, HostinfoOverrides, SharedOverrides,
 };
 
 use std::collections::{BTreeMap, HashMap};
@@ -177,6 +182,11 @@ pub struct ServerBuilder {
     /// [`MagicsockConfig::disable_direct_paths`]. Production code should
     /// leave this false.
     disable_direct_paths: bool,
+    /// Runtime Hostinfo field overrides (mirror Go's
+    /// `hostinfo.SetDeviceModel`/`SetApp`/`SetOSVersion`/`SetPackage`).
+    /// Applied before platform detection so they win over auto-detected
+    /// values. Shared with the periodic Hostinfo update loop.
+    overrides: SharedOverrides,
 }
 
 impl ServerBuilder {
@@ -262,6 +272,45 @@ impl ServerBuilder {
         self
     }
 
+    /// Override the `Hostinfo.DeviceModel` field (mirrors Go's
+    /// `hostinfo.SetDeviceModel`). Takes priority over platform-detected
+    /// values. Can be called before or after `up()`; the periodic Hostinfo
+    /// update loop picks up changes on the next refresh.
+    pub fn set_device_model(self, model: impl Into<String>) -> Self {
+        if let Ok(mut o) = self.overrides.try_write() {
+            o.set_device_model(model);
+        }
+        self
+    }
+
+    /// Override the `Hostinfo.App` field (mirrors Go's `hostinfo.SetApp`).
+    /// Used to disambiguate tsnet-based clients (e.g. `"golinks"`,
+    /// `"k8s-operator"`).
+    pub fn set_app(self, app: impl Into<String>) -> Self {
+        if let Ok(mut o) = self.overrides.try_write() {
+            o.set_app(app);
+        }
+        self
+    }
+
+    /// Override the `Hostinfo.OSVersion` field (mirrors Go's
+    /// `hostinfo.SetOSVersion`).
+    pub fn set_os_version(self, version: impl Into<String>) -> Self {
+        if let Ok(mut o) = self.overrides.try_write() {
+            o.set_os_version(version);
+        }
+        self
+    }
+
+    /// Override the `Hostinfo.Package` field (mirrors Go's
+    /// `hostinfo.SetPackage`).
+    pub fn set_package(self, package: impl Into<String>) -> Self {
+        if let Ok(mut o) = self.overrides.try_write() {
+            o.set_package(package);
+        }
+        self
+    }
+
     /// Compute the effective advertised routes: `advertise_routes` plus the
     /// exit-node default routes (`0.0.0.0/0`, `::/0`) when
     /// `advertise_exit_node` is true. Used everywhere `RoutableIPs` is sent to
@@ -332,6 +381,8 @@ struct RunningState {
     control_knobs: Arc<ControlKnobs>,
     /// PeerAPI listen port (deterministic, from tailscale IPs).
     peerapi_port: Option<u16>,
+    /// Runtime Hostinfo field overrides (shared with the update loop).
+    overrides: SharedOverrides,
 }
 
 /// Which data plane is wired up: userspace netstack (tsnet listen/dial) or a
@@ -453,6 +504,8 @@ struct Bootstrap {
     c2n_backend: Arc<c2n::TsnetC2nBackend>,
     /// Control-plane feature flags extracted from netmap updates.
     control_knobs: Arc<ControlKnobs>,
+    /// Runtime Hostinfo field overrides (shared with the update loop).
+    overrides: SharedOverrides,
 }
 
 /// An embedded Tailscale server.
@@ -467,6 +520,7 @@ impl Server {
         ServerBuilder {
             hostname: "rustscale".into(),
             control_url: DEFAULT_CONTROL_URL.into(),
+            overrides: hostinfo::shared_overrides(),
             ..Default::default()
         }
     }
@@ -519,6 +573,40 @@ impl Server {
     /// [`ControlKnobs::on_change`].
     pub fn control_knobs(&self) -> Option<Arc<ControlKnobs>> {
         self.inner.as_ref().map(|i| i.control_knobs.clone())
+    }
+
+    /// Override `Hostinfo.DeviceModel` at runtime (mirrors Go's
+    /// `hostinfo.SetDeviceModel`). Takes effect on the next periodic
+    /// Hostinfo refresh (within 10 minutes) or the next manual collection.
+    /// Requires the server to be up; use [`ServerBuilder::set_device_model`]
+    /// before `up()` instead for startup-time overrides.
+    pub async fn set_device_model(&self, model: impl Into<String>) {
+        if let Some(ref inner) = self.inner {
+            inner.overrides.write().await.set_device_model(model);
+        }
+    }
+
+    /// Override `Hostinfo.App` at runtime (mirrors Go's `hostinfo.SetApp`).
+    pub async fn set_app(&self, app: impl Into<String>) {
+        if let Some(ref inner) = self.inner {
+            inner.overrides.write().await.set_app(app);
+        }
+    }
+
+    /// Override `Hostinfo.OSVersion` at runtime (mirrors Go's
+    /// `hostinfo.SetOSVersion`).
+    pub async fn set_os_version(&self, version: impl Into<String>) {
+        if let Some(ref inner) = self.inner {
+            inner.overrides.write().await.set_os_version(version);
+        }
+    }
+
+    /// Override `Hostinfo.Package` at runtime (mirrors Go's
+    /// `hostinfo.SetPackage`).
+    pub async fn set_package(&self, package: impl Into<String>) {
+        if let Some(ref inner) = self.inner {
+            inner.overrides.write().await.set_package(package);
+        }
     }
 
     /// Bring the server online in userspace netstack mode (tsnet listen/dial).
@@ -694,6 +782,24 @@ impl Server {
             }
         }
 
+        // Periodic Hostinfo refresh (every 10 min, dedup by content hash).
+        let hostinfo_loop = spawn_hostinfo_update_loop(
+            b.cancel.clone(),
+            b.control_url.clone(),
+            b.machine_key.clone(),
+            b.server_pub_key.clone(),
+            b.node_key.clone(),
+            b.disco_key.clone(),
+            b.hostname.clone(),
+            b.advertise_routes.clone(),
+            b.home_derp,
+            b.peers.clone(),
+            b.route_table.clone(),
+            serve.clone(),
+            b.overrides.clone(),
+        );
+        tasks.push(hostinfo_loop);
+
         self.inner = Some(RunningState {
             tailscale_ips: b.tailscale_ips,
             magicsock: b.magicsock,
@@ -718,6 +824,7 @@ impl Server {
             c2n_addr: Some(c2n_addr),
             control_knobs: b.control_knobs,
             peerapi_port,
+            overrides: b.overrides,
         });
         Ok(())
     }
@@ -901,6 +1008,24 @@ impl Server {
             }
         }
 
+        // Periodic Hostinfo refresh (every 10 min, dedup by content hash).
+        // In TUN mode, serve/funnel is not available so pass None.
+        let hostinfo_loop = spawn_hostinfo_update_loop(
+            b.cancel.clone(),
+            b.control_url.clone(),
+            b.machine_key.clone(),
+            b.server_pub_key.clone(),
+            b.node_key.clone(),
+            b.disco_key.clone(),
+            b.hostname.clone(),
+            b.advertise_routes.clone(),
+            b.home_derp,
+            b.peers.clone(),
+            b.route_table.clone(),
+            None,
+            b.overrides.clone(),
+        );
+
         self.inner = Some(RunningState {
             tailscale_ips: b.tailscale_ips,
             magicsock: b.magicsock,
@@ -915,6 +1040,7 @@ impl Server {
                 periodic_ep,
                 c2n_task,
                 peerapi_task,
+                hostinfo_loop,
             ]),
             packet_drops: b.packet_drops,
             resolver: b.resolver,
@@ -932,6 +1058,7 @@ impl Server {
             c2n_addr: Some(c2n_addr),
             control_knobs: b.control_knobs,
             peerapi_port,
+            overrides: b.overrides,
         });
         Ok(())
     }
@@ -1487,6 +1614,7 @@ impl Server {
             c2n_router,
             c2n_backend,
             control_knobs,
+            overrides: self.config.overrides.clone(),
         })
     }
 
@@ -2698,6 +2826,121 @@ fn spawn_periodic_endpoint_updates(
                 Ok(()) => eprintln!("tsnet: periodic endpoint update sent"),
                 Err(e) => eprintln!("tsnet: periodic endpoint update failed (non-fatal): {e}"),
             }
+        }
+    })
+}
+
+/// Periodic Hostinfo refresh loop (mirrors Go's
+/// `controlclient.Direct.hostinfoUpdateLoop`).
+///
+/// Recollects `Hostinfo` every 10 minutes. If the content hash differs from
+/// the last-sent hash, sends a lightweight non-streaming `MapRequest` with
+/// `OmitPeers=true` carrying the new `Hostinfo`. An initial collection is
+/// performed at startup so the control server has the full platform-detected
+/// Hostinfo (the bootstrap sends a minimal one); the dedup hash prevents a
+/// redundant send if the content matches.
+#[allow(clippy::too_many_arguments)]
+fn spawn_hostinfo_update_loop(
+    cancel: Arc<CancelToken>,
+    control_url: String,
+    machine_key: MachinePrivate,
+    server_pub_key: MachinePublic,
+    node_key: NodePrivate,
+    disco_key: DiscoPrivate,
+    hostname: String,
+    advertise_routes: Vec<String>,
+    home_derp: i32,
+    peers: Arc<RwLock<Vec<Node>>>,
+    route_table: Arc<RwLock<RouteTable>>,
+    serve: Option<Arc<serve::ServeRunner>>,
+    overrides: SharedOverrides,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let node_pub = node_key.public();
+        let disco_pub = disco_key.public();
+
+        // Initial collection: build the full Hostinfo and send it so control
+        // has platform-detected fields. The bootstrap already sent a minimal
+        // Hostinfo; this updates it to the full set. Dedup by content hash
+        // prevents redundant sends on subsequent ticks.
+        let mut last_hash: u64 = 0;
+
+        loop {
+            if cancel.is_cancelled() {
+                break;
+            }
+
+            // Determine the exit node's StableNodeID (if any).
+            let exit_node_id: Option<rustscale_tailcfg::StableNodeID> = {
+                let exit_key = {
+                    let rt = route_table.read().await;
+                    rt.exit_node().cloned()
+                };
+                if let Some(key) = exit_key {
+                    let peers_guard = peers.read().await;
+                    peers_guard
+                        .iter()
+                        .find(|p| p.Key == key)
+                        .map(|p| p.StableID.clone())
+                        .filter(|id| !id.is_empty())
+                } else {
+                    None
+                }
+            };
+
+            // Check whether funnel is active.
+            let ingress_enabled = if let Some(ref runner) = serve {
+                runner.is_funnel_on().await
+            } else {
+                false
+            };
+
+            // Build the base Hostinfo with fields the bootstrap sets.
+            let base = Hostinfo {
+                OS: std::env::consts::OS.to_string(),
+                Hostname: hostname.clone(),
+                RoutableIPs: advertise_routes.clone(),
+                NetInfo: Some(NetInfo {
+                    PreferredDERP: home_derp,
+                    WorkingUDP: OptBool::True,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+
+            // Apply overrides + platform detection + runtime fields.
+            let ov = overrides.read().await.clone();
+            let hi = collect_hostinfo(base, &ov, exit_node_id.as_ref(), ingress_enabled);
+
+            let hash = hostinfo_hash(&hi);
+            if hash != last_hash {
+                let req = MapRequest {
+                    Version: CAPABILITY_VERSION,
+                    KeepAlive: false,
+                    NodeKey: node_pub.clone(),
+                    DiscoKey: disco_pub.clone(),
+                    Stream: false,
+                    OmitPeers: true,
+                    Hostinfo: Some(hi),
+                    ..Default::default()
+                };
+                let cc = ControlClient::new(
+                    &control_url,
+                    machine_key.clone(),
+                    server_pub_key.clone(),
+                    PROTOCOL_VERSION,
+                );
+                match cc.send_map_request(&req).await {
+                    Ok(()) => {
+                        last_hash = hash;
+                    }
+                    Err(e) => {
+                        eprintln!("tsnet: hostinfo update send failed (non-fatal): {e}");
+                    }
+                }
+            }
+
+            tokio::time::sleep(std::time::Duration::from_mins(10)).await;
         }
     })
 }

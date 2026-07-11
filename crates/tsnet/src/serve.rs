@@ -296,6 +296,12 @@ impl ServeRunner {
         }
     }
 
+    /// Whether any funnel (public internet) endpoint is currently active.
+    /// Used by the Hostinfo update loop to set `IngressEnabled`.
+    pub(crate) async fn is_funnel_on(&self) -> bool {
+        self.config.read().await.is_funnel_on()
+    }
+
     /// Replace the serve config, stopping old listeners and starting new ones
     /// for the configured ports. `cert_provider` is installed for TLS handlers
     /// (HTTPS / TLS-terminated TCP forward); pass `None` to clear it. Returns

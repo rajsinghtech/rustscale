@@ -170,15 +170,31 @@ pub struct Hostinfo {
     /// Device model (mobile phone model, Raspberry Pi, Synology, ...).
     #[serde(default, skip_serializing_if = "skip_default")]
     pub DeviceModel: String,
+    /// macOS/iOS APNs device token for notifications (and Android in the
+    /// future). Mirrors Go's `Hostinfo.PushDeviceToken`.
+    #[serde(default, skip_serializing_if = "skip_default")]
+    pub PushDeviceToken: String,
     /// Name of the host the client runs on.
     #[serde(default, skip_serializing_if = "skip_default")]
     pub Hostname: String,
     /// Whether the host is blocking incoming connections.
     #[serde(default, skip_serializing_if = "skip_default")]
     pub ShieldsUp: bool,
+    /// Indicates this node exists in netmap because it's owned by a
+    /// shared-to user. Mirrors Go's `Hostinfo.ShareeNode`.
+    #[serde(default, skip_serializing_if = "skip_default")]
+    pub ShareeNode: bool,
     /// Whether the node opted out of sending logs and support.
     #[serde(default, skip_serializing_if = "skip_default")]
     pub NoLogsNoSupport: bool,
+    /// The node would like to be wired up server-side (DNS, etc) for Funnel,
+    /// even if not currently enabled. Only sent when `IngressEnabled` is
+    /// false. Mirrors Go's `Hostinfo.WireIngress`.
+    #[serde(default, skip_serializing_if = "skip_default")]
+    pub WireIngress: bool,
+    /// Whether the node has any funnel endpoint enabled.
+    #[serde(default, skip_serializing_if = "skip_default")]
+    pub IngressEnabled: bool,
     /// Whether the node has opted-in to admin-console-driven remote updates.
     #[serde(default, skip_serializing_if = "skip_default")]
     pub AllowsUpdate: bool,
@@ -217,6 +233,14 @@ pub struct Hostinfo {
         deserialize_with = "deserialize_null_to_default"
     )]
     pub RequestTags: Vec<String>,
+    /// MAC address(es) to send Wake-on-LAN packets to wake this node
+    /// (lowercase hex with colons). Mirrors Go's `Hostinfo.WoLMACs`.
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
+    pub WoLMACs: Vec<String>,
     /// SSH host keys advertised by this node.
     #[serde(
         default,
@@ -242,9 +266,29 @@ pub struct Hostinfo {
     /// Whether the client is willing to relay traffic for other peers.
     #[serde(default, skip_serializing_if = "skip_default")]
     pub PeerRelay: bool,
-    /// Whether the node has any funnel endpoint enabled.
+    /// Opaque hash of the most recent list of tailnet services. A change in
+    /// hash signals config should be fetched via c2n. Mirrors Go's
+    /// `Hostinfo.ServicesHash`.
     #[serde(default, skip_serializing_if = "skip_default")]
-    pub IngressEnabled: bool,
+    pub ServicesHash: String,
+    /// The client's selected exit node StableNodeID; empty when unselected.
+    /// Mirrors Go's `Hostinfo.ExitNodeID`.
+    #[serde(default, skip_serializing_if = "skip_default")]
+    pub ExitNodeID: StableNodeID,
+    /// Geographical location data about a host. Optional — only set if
+    /// explicitly declared by a node. Mirrors Go's `Hostinfo.Location`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub Location: Option<Location>,
+    /// TPM 2.0 device metadata, if available. Mirrors Go's
+    /// `Hostinfo.TPM`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub TPM: Option<TPMInfo>,
+    /// Whether the node state is stored encrypted on disk. The mechanism is
+    /// platform-specific (Keychain on Apple, TPM on Linux/Windows,
+    /// EncryptedSharedPreferences on Android). Mirrors Go's
+    /// `Hostinfo.StateEncrypted`.
+    #[serde(default, skip_serializing_if = "OptBool::is_unset")]
+    pub StateEncrypted: OptBool,
 }
 
 /// A service running on a node (matches Go's `tailcfg.Service`).
@@ -316,6 +360,42 @@ pub struct Location {
     /// ISO 3166-1 alpha-2 country code, upper case (`"CA"`).
     #[serde(default, skip_serializing_if = "skip_default")]
     pub CountryCode: String,
+}
+
+/// TPM 2.0 device metadata (mirrors Go's `tailcfg.TPMInfo`).
+///
+/// All fields are read from `TPM_CAP_TPM_PROPERTIES`; see Part 2, section 6.13
+/// of the TPM 2.0 library specification.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TPMInfo {
+    /// 4-letter manufacturer code from the TCG vendor-ID registry
+    /// (e.g. `"MSFT"`). Read from `TPM_PT_MANUFACTURER`.
+    #[serde(default, skip_serializing_if = "skip_default")]
+    pub Manufacturer: String,
+    /// Vendor ID string, up to 16 characters. Read from
+    /// `TPM_PT_VENDOR_STRING_*`.
+    #[serde(default, skip_serializing_if = "skip_default")]
+    pub Vendor: String,
+    /// Vendor-defined TPM model. Read from `TPM_PT_VENDOR_TPM_TYPE`.
+    #[serde(default, skip_serializing_if = "skip_default")]
+    pub Model: i32,
+    /// Firmware version number. Read from `TPM_PT_FIRMWARE_VERSION_*`.
+    #[serde(default, skip_serializing_if = "skip_default")]
+    pub FirmwareVersion: u64,
+    /// TPM 2.0 spec revision encoded as a single number. Read from
+    /// `TPM_PT_REVISION`.
+    #[serde(default, skip_serializing_if = "skip_default")]
+    pub SpecRevision: i32,
+    /// TPM spec family, like `"2.0"`. Read from `TPM_PT_FAMILY_INDICATOR`.
+    #[serde(default, skip_serializing_if = "skip_default")]
+    pub FamilyIndicator: String,
+}
+
+impl TPMInfo {
+    /// Whether a TPM device is present (non-default).
+    pub fn is_present(&self) -> bool {
+        *self != Self::default()
+    }
 }
 
 /// Distinguishes sources of endpoint values (matches Go's `tailcfg.EndpointType`).
@@ -487,5 +567,97 @@ mod tests {
         assert!(j.contains("\"OS\":\"darwin\""));
         assert!(!j.contains("\"Hostname\""));
         assert!(!j.contains("\"Services\""));
+    }
+
+    #[test]
+    fn hostinfo_new_fields_roundtrip() {
+        let hi = Hostinfo {
+            PushDeviceToken: "abc123".into(),
+            ShareeNode: true,
+            WireIngress: true,
+            IngressEnabled: true,
+            WoLMACs: vec!["aa:bb:cc:dd:ee:ff".into()],
+            ServicesHash: "deadbeef".into(),
+            ExitNodeID: "nodeXYZ123".into(),
+            Location: Some(Location {
+                Country: "Canada".into(),
+                CountryCode: "CA".into(),
+            }),
+            TPM: Some(TPMInfo {
+                Manufacturer: "MSFT".into(),
+                Vendor: "MSFT".into(),
+                Model: 42,
+                FirmwareVersion: 511,
+                SpecRevision: 127,
+                FamilyIndicator: "2.0".into(),
+            }),
+            StateEncrypted: OptBool::True,
+            ..Default::default()
+        };
+        let j = serde_json::to_string(&hi).unwrap();
+        // Verify exact Go JSON key names.
+        assert!(j.contains("\"PushDeviceToken\":\"abc123\""));
+        assert!(j.contains("\"ShareeNode\":true"));
+        assert!(j.contains("\"WireIngress\":true"));
+        assert!(j.contains("\"IngressEnabled\":true"));
+        assert!(j.contains("\"WoLMACs\":[\"aa:bb:cc:dd:ee:ff\"]"));
+        assert!(j.contains("\"ServicesHash\":\"deadbeef\""));
+        assert!(j.contains("\"ExitNodeID\":\"nodeXYZ123\""));
+        assert!(j.contains("\"Location\":{"));
+        assert!(j.contains("\"Country\":\"Canada\""));
+        assert!(j.contains("\"CountryCode\":\"CA\""));
+        assert!(j.contains("\"TPM\":{"));
+        assert!(j.contains("\"Manufacturer\":\"MSFT\""));
+        assert!(j.contains("\"Vendor\":\"MSFT\""));
+        assert!(j.contains("\"Model\":42"));
+        assert!(j.contains("\"FirmwareVersion\":511"));
+        assert!(j.contains("\"SpecRevision\":127"));
+        assert!(j.contains("\"FamilyIndicator\":\"2.0\""));
+        assert!(j.contains("\"StateEncrypted\":true"));
+        // Round-trip.
+        let back: Hostinfo = serde_json::from_str(&j).unwrap();
+        assert_eq!(back, hi);
+    }
+
+    #[test]
+    fn hostinfo_new_fields_omitted_when_default() {
+        let hi = Hostinfo {
+            OS: "linux".into(),
+            ..Default::default()
+        };
+        let j = serde_json::to_string(&hi).unwrap();
+        assert!(!j.contains("\"PushDeviceToken\""));
+        assert!(!j.contains("\"ShareeNode\""));
+        assert!(!j.contains("\"WireIngress\""));
+        assert!(!j.contains("\"IngressEnabled\""));
+        assert!(!j.contains("\"WoLMACs\""));
+        assert!(!j.contains("\"ServicesHash\""));
+        assert!(!j.contains("\"ExitNodeID\""));
+        assert!(!j.contains("\"Location\""));
+        assert!(!j.contains("\"TPM\""));
+        assert!(!j.contains("\"StateEncrypted\""));
+    }
+
+    #[test]
+    fn tpm_info_present_and_default() {
+        let t = TPMInfo::default();
+        assert!(!t.is_present());
+        let t = TPMInfo {
+            Manufacturer: "INTC".into(),
+            ..Default::default()
+        };
+        assert!(t.is_present());
+    }
+
+    #[test]
+    fn hostinfo_state_encrypted_opt_bool() {
+        let hi = Hostinfo {
+            StateEncrypted: OptBool::False,
+            ..Default::default()
+        };
+        let j = serde_json::to_string(&hi).unwrap();
+        assert!(j.contains("\"StateEncrypted\":false"));
+        let back: Hostinfo = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.StateEncrypted, OptBool::False);
     }
 }

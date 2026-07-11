@@ -9,8 +9,9 @@ use serde::{Deserialize, Serialize};
 use rustscale_key::{DiscoPublic, MachinePublic, NodePublic};
 
 use crate::{
-    deserialize_null_to_default, skip_default, skip_zero_disco, skip_zero_machine,
-    CapabilityVersion, NodeCapability, NodeID, OptBool, RawMessage, StableNodeID, UserID,
+    deserialize_null_map_values, deserialize_null_to_default, skip_default, skip_zero_disco,
+    skip_zero_machine, CapabilityVersion, NodeCapability, NodeID, OptBool, RawMessage,
+    StableNodeID, UserID,
 };
 
 /// Deserialize a `NodeCapMap`, treating `null` values inside the map as empty
@@ -36,23 +37,40 @@ where
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Node {
     /// Numeric node ID (global within a control plane URL).
+    #[serde(default, deserialize_with = "deserialize_null_to_default")]
     pub ID: NodeID,
     /// Stable, string-form node ID.
+    #[serde(default, deserialize_with = "deserialize_null_to_default")]
     pub StableID: StableNodeID,
     /// FQDN of the node, with trailing dot (MagicDNS name).
+    #[serde(default, deserialize_with = "deserialize_null_to_default")]
     pub Name: String,
     /// The user who created the node.
+    #[serde(default, deserialize_with = "deserialize_null_to_default")]
     pub User: UserID,
     /// The node's WireGuard public key.
+    #[serde(default, deserialize_with = "deserialize_null_to_default")]
     pub Key: NodePublic,
     /// When the node key expires; `None` if it does not expire.
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub KeyExpiry: Option<DateTime<Utc>>,
     /// The node's machine key (zero if unset, then omitted).
-    #[serde(default, skip_serializing_if = "skip_zero_machine")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_zero_machine",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub Machine: MachinePublic,
     /// The node's disco public key (zero if unset, then omitted).
-    #[serde(default, skip_serializing_if = "skip_zero_disco")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_zero_disco",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub DiscoKey: DiscoPublic,
     /// Tailscale IP prefixes of this node (e.g. `"100.64.0.1/32"`).
     #[serde(default, deserialize_with = "deserialize_null_to_default")]
@@ -82,16 +100,32 @@ pub struct Node {
     )]
     pub Endpoints: Vec<String>,
     /// DERP region ID of the node's home DERP; 0 if unknown.
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub HomeDERP: i32,
     /// Host information block.
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub Hostinfo: Option<Hostinfo>,
     /// When the node was created.
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub Created: Option<DateTime<Utc>>,
     /// Capability version of the node, if non-zero.
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub Cap: CapabilityVersion,
     /// ACL tags applied to the node (e.g. `tag:prod`).
     #[serde(
@@ -101,7 +135,11 @@ pub struct Node {
     )]
     pub Tags: Vec<String>,
     /// Whether the node is currently connected to control; `None` = unknown.
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub Online: Option<bool>,
     /// Deprecated free-form capability URLs.
     #[serde(
@@ -128,87 +166,183 @@ pub type NodeCapMap = BTreeMap<NodeCapability, Vec<RawMessage>>;
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Hostinfo {
     /// Version of this code (in `version.Long` format).
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub IPNVersion: String,
     /// Logtail ID of the frontend instance.
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub FrontendLogID: String,
     /// Logtail ID of the backend instance.
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub BackendLogID: String,
     /// Operating system the client runs on.
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub OS: String,
     /// OS version string (kernel version on Linux, marketing version on
     /// macOS/iOS, build number on Windows).
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub OSVersion: String,
     /// Best-effort whether the client is running in a container.
     #[serde(default, skip_serializing_if = "OptBool::is_unset")]
     pub Container: OptBool,
     /// A hostinfo `EnvType` in string form (`"kn"`, `"k8s"`, ...).
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub Env: String,
     /// Linux distro id (`"debian"`, `"ubuntu"`, `"nixos"`, ...).
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub Distro: String,
     /// Linux distro version (`"20.04"`, ...).
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub DistroVersion: String,
     /// Linux distro codename (`"jammy"`, `"bullseye"`, ...).
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub DistroCodeName: String,
     /// App identifier for tsnet-based clients (`"tsnet"`, `"golinks"`, ...).
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub App: String,
     /// Whether a desktop was detected on Linux.
     #[serde(default, skip_serializing_if = "OptBool::is_unset")]
     pub Desktop: OptBool,
     /// Tailscale package type (`"tsnet"`, `"snap"`, ...).
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub Package: String,
     /// Device model (mobile phone model, Raspberry Pi, Synology, ...).
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub DeviceModel: String,
     /// macOS/iOS APNs device token for notifications (and Android in the
     /// future). Mirrors Go's `Hostinfo.PushDeviceToken`.
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub PushDeviceToken: String,
     /// Name of the host the client runs on.
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub Hostname: String,
     /// Whether the host is blocking incoming connections.
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub ShieldsUp: bool,
     /// Indicates this node exists in netmap because it's owned by a
     /// shared-to user. Mirrors Go's `Hostinfo.ShareeNode`.
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub ShareeNode: bool,
     /// Whether the node opted out of sending logs and support.
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub NoLogsNoSupport: bool,
     /// The node would like to be wired up server-side (DNS, etc) for Funnel,
     /// even if not currently enabled. Only sent when `IngressEnabled` is
     /// false. Mirrors Go's `Hostinfo.WireIngress`.
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub WireIngress: bool,
     /// Whether the node has any funnel endpoint enabled.
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub IngressEnabled: bool,
     /// Whether the node has opted-in to admin-console-driven remote updates.
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub AllowsUpdate: bool,
     /// The current host's machine type (uname -m).
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub Machine: String,
     /// Architecture of the built binary (Go's GOARCH equivalent).
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub GoArch: String,
     /// Architecture variant (GOARM, GOAMD64, ...).
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub GoArchVar: String,
     /// Go compiler version the binary was built with (or Rust toolchain).
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub GoVersion: String,
     /// Services advertised by this machine.
     #[serde(
@@ -252,7 +386,11 @@ pub struct Hostinfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub NetInfo: Option<NetInfo>,
     /// Cloud environment (`"aws"`, `"gcp"`, `"azure"`, `"digitalocean"`, ...).
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub Cloud: String,
     /// Whether the client is running in userspace (netstack) mode.
     #[serde(default, skip_serializing_if = "OptBool::is_unset")]
@@ -264,16 +402,28 @@ pub struct Hostinfo {
     #[serde(default, skip_serializing_if = "OptBool::is_unset")]
     pub AppConnector: OptBool,
     /// Whether the client is willing to relay traffic for other peers.
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub PeerRelay: bool,
     /// Opaque hash of the most recent list of tailnet services. A change in
     /// hash signals config should be fetched via c2n. Mirrors Go's
     /// `Hostinfo.ServicesHash`.
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub ServicesHash: String,
     /// The client's selected exit node StableNodeID; empty when unselected.
     /// Mirrors Go's `Hostinfo.ExitNodeID`.
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub ExitNodeID: StableNodeID,
     /// Geographical location data about a host. Optional — only set if
     /// explicitly declared by a node. Mirrors Go's `Hostinfo.Location`.
@@ -295,11 +445,17 @@ pub struct Hostinfo {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Service {
     /// Service protocol (`"tcp"`, `"udp"`, or a meta service like `"peerapi4"`).
+    #[serde(default, deserialize_with = "deserialize_null_to_default")]
     pub Proto: ServiceProto,
     /// Port number.
+    #[serde(default, deserialize_with = "deserialize_null_to_default")]
     pub Port: u16,
     /// Textual description, usually the process name.
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub Description: String,
 }
 
@@ -325,7 +481,11 @@ pub struct NetInfo {
     #[serde(default, skip_serializing_if = "OptBool::is_unset")]
     pub WorkingICMPv4: OptBool,
     /// Whether an existing portmap (UPnP/PMP/PCP) is open.
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub HavePortMap: bool,
     /// Whether UPnP appears present on the LAN.
     #[serde(default, skip_serializing_if = "OptBool::is_unset")]
@@ -337,17 +497,33 @@ pub struct NetInfo {
     #[serde(default, skip_serializing_if = "OptBool::is_unset")]
     pub PCP: OptBool,
     /// Preferred (home) DERP region ID; 0 = disconnected/unknown.
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub PreferredDERP: i32,
     /// Current link type: `"wired"`, `"wifi"`, `"mobile"`.
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub LinkType: String,
     /// Fastest recent latencies to DERP STUN servers, in seconds, keyed by
     /// `"regionID-v4"` / `"-v6"`.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        deserialize_with = "deserialize_null_map_values"
+    )]
     pub DERPLatency: BTreeMap<String, f64>,
     /// Linux-specific firewall-mode selector + reason (e.g. `"nft-forced"`).
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub FirewallMode: String,
 }
 
@@ -355,10 +531,18 @@ pub struct NetInfo {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Location {
     /// User-friendly country name (`"Canada"`).
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub Country: String,
     /// ISO 3166-1 alpha-2 country code, upper case (`"CA"`).
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub CountryCode: String,
 }
 
@@ -370,24 +554,48 @@ pub struct Location {
 pub struct TPMInfo {
     /// 4-letter manufacturer code from the TCG vendor-ID registry
     /// (e.g. `"MSFT"`). Read from `TPM_PT_MANUFACTURER`.
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub Manufacturer: String,
     /// Vendor ID string, up to 16 characters. Read from
     /// `TPM_PT_VENDOR_STRING_*`.
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub Vendor: String,
     /// Vendor-defined TPM model. Read from `TPM_PT_VENDOR_TPM_TYPE`.
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub Model: i32,
     /// Firmware version number. Read from `TPM_PT_FIRMWARE_VERSION_*`.
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub FirmwareVersion: u64,
     /// TPM 2.0 spec revision encoded as a single number. Read from
     /// `TPM_PT_REVISION`.
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub SpecRevision: i32,
     /// TPM spec family, like `"2.0"`. Read from `TPM_PT_FAMILY_INDICATOR`.
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub FamilyIndicator: String,
 }
 
@@ -434,8 +642,10 @@ impl fmt::Display for EndpointType {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Endpoint {
     /// IP:port endpoint (a `netip.AddrPort` string).
+    #[serde(default, deserialize_with = "deserialize_null_to_default")]
     pub Addr: String,
     /// How the endpoint was discovered.
+    #[serde(default, deserialize_with = "deserialize_null_to_default")]
     pub Type: EndpointType,
 }
 

@@ -11,6 +11,7 @@
 mod client;
 mod frame;
 mod protocol;
+mod server;
 
 pub use client::DerpClient;
 pub use frame::{
@@ -19,6 +20,7 @@ pub use frame::{
     PROTOCOL_VERSION,
 };
 pub use protocol::{ClientInfo, MeshKey, Received, ServerInfo};
+pub use server::{DerpServer, DerpServerHandle};
 
 /// Errors from the DERP client.
 #[derive(Debug, thiserror::Error)]

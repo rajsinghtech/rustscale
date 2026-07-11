@@ -210,3 +210,57 @@ cites the session that surfaced it.
     crate sets `#![allow(unsafe_code)]` because workspace forbids it."
 12. For long background builds, do NOT background-then-poll with `sleep`.
     Either run foreground with a timeout, or use `tools/wait-build.sh`.
+
+## 2026-07-11: Empty-first-turn investigation (toolsmith-openocode-perms)
+
+**Symptom**: Build agents frequently produce empty assistant turns (reasoning
+only, no text/tool calls) and the harness watchdog re-prompts once with
+"Begin now. Re-read the task...".
+
+**Root cause found**: This is **NOT a permissions issue**. External directory
+reads from `/Users/rajsingh/Documents/GitHub/tailscale/` work correctly — the
+session-create API passes `permission:[{permission:"*",pattern:"*",action:"allow"}]`
+which matches the `external_directory` permission kind (confirmed by reading the
+opencode JSON schema at `opencode.ai/config.json` — `external_directory` is a
+first-class key in `PermissionConfig`).
+
+**Actual cause**: The model (glm-5.2) frequently outputs its reasoning in the
+`reasoning` attribute and then makes tool calls, with **zero-length or
+whitespace-only text** in the `text` part. Our harness only checked `text`
+content to decide "empty turn", so it falsely re-prompted working agents. Of 58
+assistant messages in a healthy phase-28 session, 22 had empty text — but every
+one had completed tool calls. The model was working, just not emitting visible
+text.
+
+**Evidence consulted**:
+- Session exports: `ses_0aca18301ffebzdQ9H5Hr7UVXx` (phase-28, healthy, 58 msgs)
+  and `ses_0aca0af7fffenpxxuJprD8f5Es` (phase-30, re-prompted once)
+- opencode permission docs at `opencode.ai/docs/permissions/` (external_directory
+  default "ask", overridable in `permission` config)
+- opencode JSON schema at `opencode.ai/config.json` (confirms `external_directory`
+  in PermissionConfig)
+- `opencode --help`, `opencode serve --help`
+- Global config at `~/.config/opencode/config.json`
+
+**Config added**:
+- `opencode.json` at project root: explicit `external_directory` permissions for
+  `/Users/rajsingh/Documents/GitHub/tailscale/**` and
+  `/Users/rajsingh/Documents/GitHub/tailscale-client-go-v2/**`. This is a
+  belt-and-suspenders measure — the session-create API already allows these paths
+  — but having it checked in makes the permission policy visible and survives
+  any future changes to session-creation defaults.
+
+**Harness fix** (`tools/agent/opencode-task.sh`):
+- Re-prompt now checks for **completed tool calls** in the last assistant
+  message, not just text content. Only re-prompts when a message has no text AND
+  no completed tool calls.
+- Harvest output now prints a tool call summary instead of "(no output)" when
+  the final message has tool calls but no text.
+
+**If it recurs**:
+1. Export the session: `opencode export <sessionID> > /tmp/ses.json`
+2. Run the analysis script: `python3 -c "import json,sys; d=json.loads(open(sys.argv[1]).read()); ms=d['messages']; [print(f'msg {i:2d} {m[\"info\"][\"role\"]:10s} text={sum(len(p.get(\"text\",\"\")) for p in m[\"parts\"] if p.get(\"type\")==\"text\"):5d} tools={sum(1 for p in m[\"parts\"] if p.get(\"type\") in (\"tool\",\"tool_use\")):2d} res={sum(1 for p in m[\"parts\"] if p.get(\"type\")==\"tool_result\"):2d}') for i,m in enumerate(ms)]" /tmp/ses.json`
+3. Check if the "empty" turns have tool_use parts → model working, watchdog
+   heuristic too aggressive
+4. Check if `/Users/rajsingh/Documents/GitHub/tailscale` reads return permission
+   denials → check `opencode.json` exists and has `external_directory` entries

@@ -3,8 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-use crate::int_key;
-use crate::skip_default;
+use crate::{deserialize_null_to_default, int_key, skip_default};
 
 /// The set of DERP packet relay servers available to clients.
 ///
@@ -13,19 +12,27 @@ use crate::skip_default;
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct DERPMap {
     /// Changes in home- DERP selection parameters; nil means unchanged.
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub HomeParams: Option<DERPHomeParams>,
 
     /// Geographic regions, keyed by `RegionID`.
     #[serde(
         default,
         serialize_with = "int_key::serialize",
-        deserialize_with = "int_key::deserialize_null"
+        deserialize_with = "int_key::deserialize_null_values"
     )]
     pub Regions: BTreeMap<i32, DERPRegion>,
 
     /// When true, ignore Tailscale's default DERP servers.
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub OmitDefaultRegions: bool,
 }
 
@@ -34,7 +41,12 @@ pub struct DERPMap {
 pub struct DERPHomeParams {
     /// Per-region latency scaling factors (1.0 = neutral). A nil map means no
     /// change; an empty map resets all scores to 1.0.
-    #[serde(default, with = "int_key", skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        default,
+        serialize_with = "int_key::serialize",
+        deserialize_with = "int_key::deserialize_null_values",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
     pub RegionScore: BTreeMap<i32, f64>,
 }
 
@@ -42,22 +54,41 @@ pub struct DERPHomeParams {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct DERPRegion {
     /// Unique, non-zero region integer (900-999 reserved for user-run DERP).
+    #[serde(default, deserialize_with = "deserialize_null_to_default")]
     pub RegionID: i32,
     /// Short code, e.g. `"nyc"`, `"sf"`, `"sin"`.
+    #[serde(default, deserialize_with = "deserialize_null_to_default")]
     pub RegionCode: String,
     /// Long English name, e.g. `"New York City"`.
+    #[serde(default, deserialize_with = "deserialize_null_to_default")]
     pub RegionName: String,
     /// Optional geographical latitude in degrees.
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub Latitude: f64,
     /// Optional geographical longitude in degrees.
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub Longitude: f64,
     /// Deprecated: avoid selecting this region as home.
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub Avoid: bool,
     /// Do not measure this region or select it as home; still usable for peers.
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub NoMeasureNoHome: bool,
     /// DERP nodes in this region, in priority order. `None` serializes as
     /// `null` (matching Go's nil `[]*DERPNode`).
@@ -69,37 +100,76 @@ pub struct DERPRegion {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct DERPNode {
     /// Unique node name across all regions (e.g. `"1b"`).
+    #[serde(default, deserialize_with = "deserialize_null_to_default")]
     pub Name: String,
     /// The `RegionID` this node belongs to.
+    #[serde(default, deserialize_with = "deserialize_null_to_default")]
     pub RegionID: i32,
     /// The node's hostname (required; need not be unique).
+    #[serde(default, deserialize_with = "deserialize_null_to_default")]
     pub HostName: String,
     /// Optional expected TLS cert common name; empty means use `HostName`.
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub CertName: String,
     /// Optional forced IPv4 address; `"none"` disables IPv4.
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub IPv4: String,
     /// Optional forced IPv6 address; `"none"` disables IPv6.
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub IPv6: String,
     /// STUN port; 0 means 3478, -1 disables STUN.
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub STUNPort: i32,
     /// Whether this node is STUN-only (not a DERP server).
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub STUNOnly: bool,
     /// Alternate TLS port for the DERP HTTPS server; 0 means 443.
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub DERPPort: i32,
     /// Tests-only: disable TLS verification.
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub InsecureForTests: bool,
     /// Tests-only: override the STUN server IP.
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub STUNTestIP: String,
     /// Whether this node is reachable over HTTP on port 80 (captive-portal checks).
-    #[serde(default, skip_serializing_if = "skip_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
     pub CanPort80: bool,
 }
 

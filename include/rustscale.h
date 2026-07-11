@@ -125,6 +125,13 @@ int ts_listen_socks5(int handle, const char *bind_addr);
 int ts_listener_close(int listener);
 
 /**
+ * Retrieve the LocalAPI Unix socket path into `buf`. Returns bytes written
+ * (excluding NUL), or a negative errno-style code. Returns RS_ERR_NOENT if
+ * the LocalAPI server was not enabled or the server is not up.
+ */
+int ts_localapi_path(int handle, char *buf, int buflen);
+
+/**
  * Create a new tsnet server handle.
  */
 int ts_new(void);
@@ -163,6 +170,14 @@ int ts_set_exit_node(int handle, const char *addr);
  * Set the hostname.
  */
 int ts_set_hostname(int handle, const char *hostname);
+
+/**
+ * Enable the LocalAPI Unix-domain-socket server. When `path` is non-null,
+ * sets an explicit socket path; otherwise the default
+ * (`<state_dir>/rustscale.sock`) is used. Must be called before `ts_up`.
+ * Returns 0 on success, a negative errno-style code on error.
+ */
+int ts_set_localapi(int handle, const char *path);
 
 /**
  * Set the state directory.

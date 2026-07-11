@@ -292,6 +292,29 @@ pub extern "C" fn ts_set_ephemeral(handle: c_int, ephemeral: c_int) -> c_int {
     })
 }
 
+/// Enable the LocalAPI Unix-domain-socket server. When `path` is non-null,
+/// sets an explicit socket path; otherwise the default
+/// (`<state_dir>/rustscale.sock`) is used. Must be called before `ts_up`.
+/// Returns 0 on success, a negative errno-style code on error.
+#[no_mangle]
+pub extern "C" fn ts_set_localapi(handle: c_int, path: *const c_char) -> c_int {
+    catch("ts_set_localapi", || {
+        let mut t = table().lock().expect("table poisoned");
+        let Some(e) = t.servers.get_mut(&handle) else {
+            return RS_ERR_NOENT;
+        };
+        if e.server.is_some() || e.starting {
+            return RS_ERR_BUSY;
+        }
+        if let Some(p) = cstr_to_string(path) {
+            e.builder = e.builder.clone().localapi_path(p);
+        } else {
+            e.builder = e.builder.clone().localapi(true);
+        }
+        RS_OK
+    })
+}
+
 /// Bring the server online (blocking). Returns 0 on success.
 #[no_mangle]
 pub extern "C" fn ts_up(handle: c_int) -> c_int {
@@ -437,6 +460,31 @@ fn status_to_json(st: &rustscale_tsnet::ServerStatus) -> serde_json::Value {
         "peers": peers,
         "packet_drops": st.packet_drops,
         "health": health,
+    })
+}
+
+/// Retrieve the LocalAPI Unix socket path into `buf`. Returns bytes written
+/// (excluding NUL), or a negative errno-style code. Returns RS_ERR_NOENT if
+/// the LocalAPI server was not enabled or the server is not up.
+#[no_mangle]
+pub extern "C" fn ts_localapi_path(handle: c_int, buf: *mut c_char, buflen: c_int) -> c_int {
+    catch("ts_localapi_path", || {
+        let server_arc = {
+            let t = table().lock().expect("table poisoned");
+            let Some(e) = t.servers.get(&handle) else {
+                return RS_ERR_NOENT;
+            };
+            let Some(ref arc) = e.server else {
+                return RS_ERR_BUSY;
+            };
+            arc.clone()
+        };
+
+        let server = server_arc.lock().expect("server mutex poisoned");
+        match server.localapi_path() {
+            Some(path) => write_to_buf(buf, buflen, &path.display().to_string()),
+            None => RS_ERR_NOENT,
+        }
     })
 }
 

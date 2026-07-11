@@ -31,6 +31,7 @@
 mod acme;
 mod c2n;
 mod hostinfo;
+mod localapi;
 mod peerapi;
 mod routing;
 mod serve;
@@ -187,6 +188,11 @@ pub struct ServerBuilder {
     /// Applied before platform detection so they win over auto-detected
     /// values. Shared with the periodic Hostinfo update loop.
     overrides: SharedOverrides,
+    /// Whether to spawn the LocalAPI Unix-domain-socket server. Default OFF.
+    localapi: bool,
+    /// Explicit LocalAPI socket path. If None and localapi is enabled,
+    /// defaults to `<state_dir>/rustscale.sock`.
+    localapi_path: Option<PathBuf>,
 }
 
 impl ServerBuilder {
@@ -311,6 +317,24 @@ impl ServerBuilder {
         self
     }
 
+    /// Enable or disable the LocalAPI Unix-domain-socket server. When enabled,
+    /// the socket is created at the path set by [`localapi_path`](Self::localapi_path),
+    /// or `<state_dir>/rustscale.sock` by default. Default: OFF.
+    pub fn localapi(mut self, on: bool) -> Self {
+        self.localapi = on;
+        self
+    }
+
+    /// Set an explicit path for the LocalAPI Unix socket. Calling this
+    /// implicitly enables the LocalAPI server (equivalent to
+    /// `.localapi(true)`). The parent directory is created if it does not
+    /// exist; any stale socket file at the path is removed before binding.
+    pub fn localapi_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.localapi_path = Some(path.into());
+        self.localapi = true;
+        self
+    }
+
     /// Compute the effective advertised routes: `advertise_routes` plus the
     /// exit-node default routes (`0.0.0.0/0`, `::/0`) when
     /// `advertise_exit_node` is true. Used everywhere `RoutableIPs` is sent to
@@ -383,6 +407,9 @@ struct RunningState {
     peerapi_port: Option<u16>,
     /// Runtime Hostinfo field overrides (shared with the update loop).
     overrides: SharedOverrides,
+    /// LocalAPI socket path (if the server was spawned). Used for cleanup on
+    /// close().
+    localapi_socket: Option<PathBuf>,
 }
 
 /// Which data plane is wired up: userspace netstack (tsnet listen/dial) or a
@@ -573,6 +600,12 @@ impl Server {
     /// [`ControlKnobs::on_change`].
     pub fn control_knobs(&self) -> Option<Arc<ControlKnobs>> {
         self.inner.as_ref().map(|i| i.control_knobs.clone())
+    }
+
+    /// The LocalAPI Unix socket path, if the server was spawned. Returns
+    /// `None` if the LocalAPI was not enabled or the server is not up.
+    pub fn localapi_path(&self) -> Option<&PathBuf> {
+        self.inner.as_ref().and_then(|i| i.localapi_socket.as_ref())
     }
 
     /// Override `Hostinfo.DeviceModel` at runtime (mirrors Go's
@@ -800,6 +833,49 @@ impl Server {
         );
         tasks.push(hostinfo_loop);
 
+        // LocalAPI Unix-domain-socket server (optional, default OFF).
+        let localapi_socket = if self.config.localapi {
+            let path = self.config.localapi_path.clone().unwrap_or_else(|| {
+                let dir = self
+                    .config
+                    .state_dir
+                    .clone()
+                    .unwrap_or_else(|| std::env::temp_dir().join("rustscale"));
+                localapi::default_socket_path(&dir)
+            });
+            let state = localapi::LocalApiState {
+                peers: b.peers.clone(),
+                user_profiles: b.user_profiles.clone(),
+                health: b.health.clone(),
+                dns_config: b.dns_config.clone(),
+                packet_drops: b.packet_drops.clone(),
+                prefs: serde_json::json!({
+                    "hostname": self.config.hostname,
+                    "control_url": self.config.control_url,
+                    "ephemeral": self.config.ephemeral,
+                    "advertise_routes": self.config.advertise_routes,
+                    "accept_routes": self.config.accept_routes,
+                    "advertise_exit_node": self.config.advertise_exit_node,
+                }),
+                tailscale_ips: b.tailscale_ips.clone(),
+                our_fqdn: b.our_fqdn.clone(),
+                hostname: self.config.hostname.clone(),
+                magicsock: b.magicsock.clone(),
+                tun_mode: false,
+                home_derp: b.home_derp,
+            };
+            if let Some(h) = localapi::spawn_localapi(Arc::new(state), path.clone()) {
+                tasks.push(h.task);
+                eprintln!("tsnet: LocalAPI listening at {}", path.display());
+                Some(h.socket_path)
+            } else {
+                eprintln!("tsnet: LocalAPI failed to bind socket at {}", path.display());
+                None
+            }
+        } else {
+            None
+        };
+
         self.inner = Some(RunningState {
             tailscale_ips: b.tailscale_ips,
             magicsock: b.magicsock,
@@ -825,6 +901,7 @@ impl Server {
             control_knobs: b.control_knobs,
             peerapi_port,
             overrides: b.overrides,
+            localapi_socket,
         });
         Ok(())
     }
@@ -1026,6 +1103,59 @@ impl Server {
             b.overrides.clone(),
         );
 
+        let mut tasks = vec![
+            b.map_task,
+            pump,
+            map_update,
+            periodic_ep,
+            c2n_task,
+            peerapi_task,
+            hostinfo_loop,
+        ];
+
+        // LocalAPI Unix-domain-socket server (optional, default OFF).
+        let localapi_socket = if self.config.localapi {
+            let path = self.config.localapi_path.clone().unwrap_or_else(|| {
+                let dir = self
+                    .config
+                    .state_dir
+                    .clone()
+                    .unwrap_or_else(|| std::env::temp_dir().join("rustscale"));
+                localapi::default_socket_path(&dir)
+            });
+            let state = localapi::LocalApiState {
+                peers: b.peers.clone(),
+                user_profiles: b.user_profiles.clone(),
+                health: b.health.clone(),
+                dns_config: b.dns_config.clone(),
+                packet_drops: b.packet_drops.clone(),
+                prefs: serde_json::json!({
+                    "hostname": self.config.hostname,
+                    "control_url": self.config.control_url,
+                    "ephemeral": self.config.ephemeral,
+                    "advertise_routes": self.config.advertise_routes,
+                    "accept_routes": self.config.accept_routes,
+                    "advertise_exit_node": self.config.advertise_exit_node,
+                }),
+                tailscale_ips: b.tailscale_ips.clone(),
+                our_fqdn: b.our_fqdn.clone(),
+                hostname: self.config.hostname.clone(),
+                magicsock: b.magicsock.clone(),
+                tun_mode: true,
+                home_derp: b.home_derp,
+            };
+            if let Some(h) = localapi::spawn_localapi(Arc::new(state), path.clone()) {
+                tasks.push(h.task);
+                eprintln!("tsnet: LocalAPI listening at {}", path.display());
+                Some(h.socket_path)
+            } else {
+                eprintln!("tsnet: LocalAPI failed to bind socket at {}", path.display());
+                None
+            }
+        } else {
+            None
+        };
+
         self.inner = Some(RunningState {
             tailscale_ips: b.tailscale_ips,
             magicsock: b.magicsock,
@@ -1033,15 +1163,7 @@ impl Server {
             peers: b.peers,
             route_table: b.route_table,
             cancel: b.cancel,
-            tasks: Mutex::new(vec![
-                b.map_task,
-                pump,
-                map_update,
-                periodic_ep,
-                c2n_task,
-                peerapi_task,
-                hostinfo_loop,
-            ]),
+            tasks: Mutex::new(tasks),
             packet_drops: b.packet_drops,
             resolver: b.resolver,
             our_fqdn: b.our_fqdn,
@@ -1059,6 +1181,7 @@ impl Server {
             control_knobs: b.control_knobs,
             peerapi_port,
             overrides: b.overrides,
+            localapi_socket,
         });
         Ok(())
     }
@@ -2064,6 +2187,10 @@ impl Server {
             let mut tasks = inner.tasks.lock().await;
             for task in tasks.drain(..) {
                 task.abort();
+            }
+            // Clean up the LocalAPI socket file if it was created.
+            if let Some(ref path) = inner.localapi_socket {
+                let _ = std::fs::remove_file(path);
             }
         }
     }

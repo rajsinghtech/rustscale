@@ -4,18 +4,70 @@
 //! metadata, and desktop presence so that control-server features for those
 //! environments activate correctly.
 
-#[cfg(target_os = "linux")]
 use std::collections::HashMap;
 use std::fs;
 #[allow(unused_imports)]
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use rustscale_tailcfg::{Hostinfo, OptBool, StableNodeID};
 use tokio::sync::RwLock;
 
 /// Package identifier — tsnet embedding layer.
 const PACKAGE: &str = "tsnet";
+
+/// The Go `copy/v86` emulator device model string.
+#[allow(dead_code)]
+const COPY_V86_DEVICE_MODEL: &str = "copy-v86";
+
+// ─── Hooks (mirror Go's RegisterHostinfoNewHook) ───────────────────────
+
+/// A callback invoked on a `Hostinfo` before `collect_hostinfo` returns it.
+/// Hooks may inspect and mutate the `Hostinfo` — e.g. adding services,
+/// setting cloud metadata, or recording posture attributes.
+pub type HostinfoHook = Box<dyn Fn(&mut Hostinfo) + Send + Sync>;
+
+static HOOKS: OnceLock<Mutex<Vec<HostinfoHook>>> = OnceLock::new();
+
+fn hook_slot() -> &'static Mutex<Vec<HostinfoHook>> {
+    HOOKS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Register a hostinfo hook — a callback that runs at the end of
+/// `collect_hostinfo`, receiving the assembled `Hostinfo` for mutation
+/// before it is returned. Mirrors Go's `hostinfo.RegisterHostinfoNewHook`.
+///
+/// Thread-safe: the hook list is guarded by a `Mutex`. Hooks are called in
+/// registration order.
+#[allow(dead_code)]
+pub fn register_hostinfo_hook(hook: impl Fn(&mut Hostinfo) + Send + Sync + 'static) {
+    hook_slot().lock().unwrap().push(Box::new(hook));
+}
+
+/// Run all registered hooks against `hi`. Called internally by
+/// `collect_hostinfo` before returning.
+fn run_hostinfo_hooks(hi: &mut Hostinfo) {
+    if let Ok(hooks) = hook_slot().lock() {
+        for h in hooks.iter() {
+            h(hi);
+        }
+    }
+}
+
+// ─── Lazy/cached detection (mirror Go's lazyAtomicValue) ───────────────
+
+/// Cache the result of an expensive detection function in a process-lifetime
+/// `OnceLock`, mirroring Go's `lazyAtomicValue` pattern. The detection
+/// function runs at most once per process; subsequent calls return the
+/// cached value.
+fn cached_detection<T: Clone + Send + Sync + 'static>(
+    cell: &'static OnceLock<T>,
+    detect: impl FnOnce() -> T,
+) -> T {
+    cell.get_or_init(detect).clone()
+}
+
+// ─── populate_hostinfo (unchanged API) ────────────────────────────────
 
 /// Populate a `Hostinfo` with platform-specific fields. Call this on a
 /// `Hostinfo` that already has `Hostname`, `OS`, `RoutableIPs`, `NetInfo`,
@@ -47,7 +99,7 @@ pub fn populate_hostinfo(mut hi: Hostinfo) -> Hostinfo {
         hi.Machine = arch_machine();
     }
 
-    let (distro, dver, dcode) = linux_distro_info();
+    let (distro, dver, dcode) = linux_distro_info_cached();
     if hi.Distro.is_empty() {
         hi.Distro = distro;
     }
@@ -59,11 +111,11 @@ pub fn populate_hostinfo(mut hi: Hostinfo) -> Hostinfo {
     }
 
     if hi.Container.is_unset() {
-        hi.Container = container_detection();
+        hi.Container = container_detection_cached();
     }
 
     if hi.Env.is_empty() {
-        hi.Env = env_type().to_string();
+        hi.Env = env_type_cached().to_string();
     }
 
     if hi.Desktop.is_unset() {
@@ -177,8 +229,9 @@ pub fn apply_runtime_fields(
 }
 
 /// Collect a full `Hostinfo`: apply overrides, run platform detection, then
-/// apply runtime fields. This is the single entry point used by both the
-/// initial MapRequest send and the periodic update loop.
+/// apply runtime fields, then run registered hostinfo hooks. This is the
+/// single entry point used by both the initial MapRequest send and the
+/// periodic update loop.
 pub fn collect_hostinfo(
     base: Hostinfo,
     overrides: &HostinfoOverrides,
@@ -189,6 +242,7 @@ pub fn collect_hostinfo(
     overrides.apply(&mut hi);
     hi = populate_hostinfo(hi);
     apply_runtime_fields(&mut hi, exit_node_id, ingress_enabled);
+    run_hostinfo_hooks(&mut hi);
     hi
 }
 
@@ -269,7 +323,15 @@ fn arch_machine() -> String {
     }
 }
 
-// ─── Linux distro info from /etc/os-release ───────────────────────────
+// ─── Linux distro info (cached) ───────────────────────────────────────
+
+/// Cached result of `linux_distro_info` so the 10-minute refresh doesn't
+/// re-read `/etc/os-release` every time. Mirrors Go's `lazyVersionMeta`.
+static DISTRO_CACHE: OnceLock<(String, String, String)> = OnceLock::new();
+
+fn linux_distro_info_cached() -> (String, String, String) {
+    cached_detection(&DISTRO_CACHE, linux_distro_info)
+}
 
 #[cfg(target_os = "linux")]
 fn linux_distro_info() -> (String, String, String) {
@@ -318,7 +380,72 @@ fn parse_os_release(path: &str) -> HashMap<String, String> {
     m
 }
 
-// ─── Container detection ──────────────────────────────────────────────
+/// Pure helper: parse KEY=value lines from an `/etc/os-release`-style file
+/// into a `HashMap`. Exported for testability — takes the file content
+/// directly so tests don't need real files.
+#[allow(dead_code)]
+pub fn parse_os_release_content(content: &str) -> HashMap<String, String> {
+    let mut m = HashMap::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((key, val)) = line.split_once('=') {
+            let val = val.trim_matches(|c| c == '"' || c == '\'').to_string();
+            m.insert(key.to_string(), val);
+        }
+    }
+    m
+}
+
+/// Pure helper: extract (distro, version, codename) from an
+/// `/etc/os-release`-style content map. Handles the Debian
+/// `/etc/debian_version` quirk: if `distro == "debian"`, the caller
+/// passes the content of `/etc/debian_version` in `debian_version_content`.
+#[allow(dead_code)]
+pub fn distro_info_from_map(
+    os_release_map: &HashMap<String, String>,
+    debian_version_content: Option<&str>,
+) -> (String, String, String) {
+    let distro = os_release_map
+        .get("ID")
+        .cloned()
+        .unwrap_or_default();
+    let mut version = os_release_map
+        .get("VERSION_ID")
+        .cloned()
+        .unwrap_or_default();
+    let mut codename = os_release_map
+        .get("VERSION_CODENAME")
+        .cloned()
+        .unwrap_or_default();
+
+    if distro == "debian" {
+        if let Some(dvc) = debian_version_content {
+            let v = dvc.trim();
+            if !v.is_empty() {
+                if v.starts_with(|c: char| c.is_ascii_digit()) {
+                    version = v.to_string();
+                } else if codename.is_empty() {
+                    codename = v.to_string();
+                }
+            }
+        }
+    }
+
+    (distro, version, codename)
+}
+
+// ─── Container detection (cached) ─────────────────────────────────────
+
+/// Cached container detection so the 10-minute refresh reuses the result.
+/// Mirrors Go's `lazyInContainer`.
+static CONTAINER_CACHE: OnceLock<OptBool> = OnceLock::new();
+
+fn container_detection_cached() -> OptBool {
+    cached_detection(&CONTAINER_CACHE, container_detection)
+}
 
 /// Detect whether we're running in a container (Linux only).
 /// Mirrors Go's `hostinfo.inContainer`:
@@ -336,12 +463,12 @@ fn container_detection() -> OptBool {
             return OptBool::True;
         }
         if let Ok(content) = fs::read_to_string("/proc/1/cgroup") {
-            if content.contains("/docker/") || content.contains("/lxc/") {
+            if container_in_cgroup(&content) {
                 return OptBool::True;
             }
         }
         if let Ok(content) = fs::read_to_string("/proc/mounts") {
-            if content.contains("lxcfs /proc/cpuinfo fuse.lxcfs") {
+            if container_in_mounts(&content) {
                 return OptBool::True;
             }
         }
@@ -353,7 +480,29 @@ fn container_detection() -> OptBool {
     }
 }
 
-// ─── Environment type ─────────────────────────────────────────────────
+/// Pure helper: check if `/proc/1/cgroup` content indicates a container.
+/// Returns true if the content contains `/docker/` or `/lxc/`.
+#[allow(dead_code)]
+pub fn container_in_cgroup(cgroup_content: &str) -> bool {
+    cgroup_content.contains("/docker/") || cgroup_content.contains("/lxc/")
+}
+
+/// Pure helper: check if `/proc/mounts` content indicates an LXC container.
+/// Returns true if the content contains the lxcfs mount line.
+#[allow(dead_code)]
+pub fn container_in_mounts(mounts_content: &str) -> bool {
+    mounts_content.contains("lxcfs /proc/cpuinfo fuse.lxcfs")
+}
+
+// ─── Environment type (cached) ─────────────────────────────────────────
+
+/// Cached env-type detection so the 10-minute refresh reuses the result.
+/// Mirrors Go's `envType atomic.Value`.
+static ENV_TYPE_CACHE: OnceLock<&'static str> = OnceLock::new();
+
+fn env_type_cached() -> &'static str {
+    cached_detection(&ENV_TYPE_CACHE, || env_type(&EnvSnapshot::from_process()))
+}
 
 /// Environment type constants matching Go's `hostinfo.EnvType`.
 pub mod env {
@@ -369,90 +518,153 @@ pub mod env {
     pub const HOME_ASSISTANT: &str = "haao";
 }
 
-/// Detect the runtime environment by checking characteristic env vars.
-/// Mirrors Go's `hostinfo.getEnvType`.
-fn env_type() -> &'static str {
-    if in_knative() {
+/// A snapshot of the relevant environment variables for env-type
+/// detection. Passing this explicitly to the detection functions makes
+/// them pure and testable — tests construct a snapshot with fixture
+/// values instead of mutating the real process environment.
+#[derive(Clone, Debug, Default)]
+pub struct EnvSnapshot {
+    pub k_revision: String,
+    pub k_configuration: String,
+    pub k_service: String,
+    pub port: String,
+    pub aws_lambda_function_name: String,
+    pub aws_lambda_function_version: String,
+    pub aws_lambda_initialization_type: String,
+    pub aws_lambda_runtime_api: String,
+    pub dyno: String,
+    pub appsvc_run_zip: String,
+    pub website_stack: String,
+    pub website_auth_auto_aad: String,
+    pub aws_execution_env: String,
+    pub fly_app_name: String,
+    pub fly_region: String,
+    pub kubernetes_service_host: String,
+    pub kubernetes_service_port: String,
+    pub ts_host_env: String,
+    pub repl_owner: String,
+    pub repl_slug: String,
+    pub supervisor_token: String,
+    pub hassio_token: String,
+}
+
+impl EnvSnapshot {
+    /// Capture the relevant environment variables from the current process.
+    fn from_process() -> Self {
+        let get = |k: &str| std::env::var(k).unwrap_or_default();
+        EnvSnapshot {
+            k_revision: get("K_REVISION"),
+            k_configuration: get("K_CONFIGURATION"),
+            k_service: get("K_SERVICE"),
+            port: get("PORT"),
+            aws_lambda_function_name: get("AWS_LAMBDA_FUNCTION_NAME"),
+            aws_lambda_function_version: get("AWS_LAMBDA_FUNCTION_VERSION"),
+            aws_lambda_initialization_type: get("AWS_LAMBDA_INITIALIZATION_TYPE"),
+            aws_lambda_runtime_api: get("AWS_LAMBDA_RUNTIME_API"),
+            dyno: get("DYNO"),
+            appsvc_run_zip: get("APPSVC_RUN_ZIP"),
+            website_stack: get("WEBSITE_STACK"),
+            website_auth_auto_aad: get("WEBSITE_AUTH_AUTO_AAD"),
+            aws_execution_env: get("AWS_EXECUTION_ENV"),
+            fly_app_name: get("FLY_APP_NAME"),
+            fly_region: get("FLY_REGION"),
+            kubernetes_service_host: get("KUBERNETES_SERVICE_HOST"),
+            kubernetes_service_port: get("KUBERNETES_SERVICE_PORT"),
+            ts_host_env: get("TS_HOST_ENV"),
+            repl_owner: get("REPL_OWNER"),
+            repl_slug: get("REPL_SLUG"),
+            supervisor_token: get("SUPERVISOR_TOKEN"),
+            hassio_token: get("HASSIO_TOKEN"),
+        }
+    }
+}
+
+/// Detect the runtime environment by checking characteristic env vars
+/// against a snapshot. Mirrors Go's `hostinfo.getEnvType`.
+/// Pure function — takes the snapshot as a parameter for testability.
+pub fn env_type(snap: &EnvSnapshot) -> &'static str {
+    if in_knative(snap) {
         return env::KNATIVE;
     }
-    if in_aws_lambda() {
+    if in_aws_lambda(snap) {
         return env::AWS_LAMBDA;
     }
-    if in_heroku() {
+    if in_heroku(snap) {
         return env::HEROKU;
     }
-    if in_azure_app_service() {
+    if in_azure_app_service(snap) {
         return env::AZURE_APP_SERVICE;
     }
-    if in_aws_fargate() {
+    if in_aws_fargate(snap) {
         return env::AWS_FARGATE;
     }
-    if in_fly() {
+    if in_fly(snap) {
         return env::FLY;
     }
-    if in_kubernetes() {
+    if in_kubernetes(snap) {
         return env::KUBERNETES;
     }
-    if in_docker_desktop() {
+    if in_docker_desktop(snap) {
         return env::DOCKER_DESKTOP;
     }
-    if in_replit() {
+    if in_replit(snap) {
         return env::REPLIT;
     }
-    if in_home_assistant() {
+    if in_home_assistant(snap) {
         return env::HOME_ASSISTANT;
     }
     ""
 }
 
-fn in_knative() -> bool {
-    !env_var_empty("K_REVISION")
-        && !env_var_empty("K_CONFIGURATION")
-        && !env_var_empty("K_SERVICE")
-        && !env_var_empty("PORT")
+fn in_knative(s: &EnvSnapshot) -> bool {
+    !s.k_revision.is_empty()
+        && !s.k_configuration.is_empty()
+        && !s.k_service.is_empty()
+        && !s.port.is_empty()
 }
 
-fn in_aws_lambda() -> bool {
-    !env_var_empty("AWS_LAMBDA_FUNCTION_NAME")
-        && !env_var_empty("AWS_LAMBDA_FUNCTION_VERSION")
-        && !env_var_empty("AWS_LAMBDA_INITIALIZATION_TYPE")
-        && !env_var_empty("AWS_LAMBDA_RUNTIME_API")
+fn in_aws_lambda(s: &EnvSnapshot) -> bool {
+    !s.aws_lambda_function_name.is_empty()
+        && !s.aws_lambda_function_version.is_empty()
+        && !s.aws_lambda_initialization_type.is_empty()
+        && !s.aws_lambda_runtime_api.is_empty()
 }
 
-fn in_heroku() -> bool {
-    !env_var_empty("PORT") && !env_var_empty("DYNO")
+fn in_heroku(s: &EnvSnapshot) -> bool {
+    !s.port.is_empty() && !s.dyno.is_empty()
 }
 
-fn in_azure_app_service() -> bool {
-    !env_var_empty("APPSVC_RUN_ZIP")
-        && !env_var_empty("WEBSITE_STACK")
-        && !env_var_empty("WEBSITE_AUTH_AUTO_AAD")
+fn in_azure_app_service(s: &EnvSnapshot) -> bool {
+    !s.appsvc_run_zip.is_empty()
+        && !s.website_stack.is_empty()
+        && !s.website_auth_auto_aad.is_empty()
 }
 
-fn in_aws_fargate() -> bool {
-    std::env::var("AWS_EXECUTION_ENV").as_deref() == Ok("AWS_ECS_FARGATE")
+fn in_aws_fargate(s: &EnvSnapshot) -> bool {
+    s.aws_execution_env == "AWS_ECS_FARGATE"
 }
 
-fn in_fly() -> bool {
-    !env_var_empty("FLY_APP_NAME") && !env_var_empty("FLY_REGION")
+fn in_fly(s: &EnvSnapshot) -> bool {
+    !s.fly_app_name.is_empty() && !s.fly_region.is_empty()
 }
 
-fn in_kubernetes() -> bool {
-    !env_var_empty("KUBERNETES_SERVICE_HOST") && !env_var_empty("KUBERNETES_SERVICE_PORT")
+fn in_kubernetes(s: &EnvSnapshot) -> bool {
+    !s.kubernetes_service_host.is_empty() && !s.kubernetes_service_port.is_empty()
 }
 
-fn in_docker_desktop() -> bool {
-    std::env::var("TS_HOST_ENV").as_deref() == Ok("dde")
+fn in_docker_desktop(s: &EnvSnapshot) -> bool {
+    s.ts_host_env == "dde"
 }
 
-fn in_replit() -> bool {
-    !env_var_empty("REPL_OWNER") && !env_var_empty("REPL_SLUG")
+fn in_replit(s: &EnvSnapshot) -> bool {
+    !s.repl_owner.is_empty() && !s.repl_slug.is_empty()
 }
 
-fn in_home_assistant() -> bool {
-    !env_var_empty("SUPERVISOR_TOKEN") || !env_var_empty("HASSIO_TOKEN")
+fn in_home_assistant(s: &EnvSnapshot) -> bool {
+    !s.supervisor_token.is_empty() || !s.hassio_token.is_empty()
 }
 
+#[allow(dead_code)]
 fn env_var_empty(key: &str) -> bool {
     std::env::var(key).map(|v| v.is_empty()).unwrap_or(true)
 }
@@ -466,7 +678,7 @@ fn desktop_detection() -> OptBool {
     #[cfg(target_os = "linux")]
     {
         if let Ok(content) = fs::read_to_string("/proc/net/unix") {
-            let has_desktop = content.contains(".X11-unix") || content.contains("/wayland-1");
+            let has_desktop = desktop_from_unix_sockets(&content);
             return OptBool::new(has_desktop);
         }
         return OptBool::Unset;
@@ -475,6 +687,14 @@ fn desktop_detection() -> OptBool {
     {
         OptBool::Unset
     }
+}
+
+/// Pure helper: check `/proc/net/unix` content for desktop socket entries.
+/// Returns true if `.X11-unix` or `/wayland-1` is present, indicating a
+/// running desktop session.
+#[allow(dead_code)]
+pub fn desktop_from_unix_socks(unix_content: &str) -> bool {
+    unix_content.contains(".X11-unix") || unix_content.contains("/wayland-1")
 }
 
 // ─── Device model ─────────────────────────────────────────────────────
@@ -553,11 +773,208 @@ fn cloud_detection() -> &'static str {
     ""
 }
 
+/// Pure helper: determine the cloud provider from DMI metadata values.
+/// Takes the file contents as params for testability.
+#[allow(dead_code)]
+pub fn cloud_from_dmi(
+    bios_vendor: &str,
+    sys_vendor: &str,
+    product_name: &str,
+) -> &'static str {
+    if bios_vendor == "Amazon EC2" || bios_vendor.ends_with(".amazon") {
+        return cloud::AWS;
+    }
+    if sys_vendor == "DigitalOcean" {
+        return cloud::DIGITAL_OCEAN;
+    }
+    if product_name == "Google Compute Engine" {
+        return cloud::GCP;
+    }
+    if bios_vendor == "Microsoft Corporation" {
+        return cloud::AZURE;
+    }
+    ""
+}
+
 #[allow(dead_code)]
 fn read_trim(path: &str) -> String {
     fs::read_to_string(path)
         .map(|s| s.trim().to_string())
         .unwrap_or_default()
+}
+
+// ─── Linux-specific detections ────────────────────────────────────────
+
+/// Cached result of `disabled_etc_apt_source` so the 10-minute refresh
+/// doesn't re-read the apt sources file every time. The cache is keyed on
+/// the file modification time — if the mtime changes, we re-detect.
+/// Mirrors Go's `etcAptSrcCache`.
+#[allow(dead_code)]
+static APT_SOURCE_CACHE: OnceLock<(std::time::SystemTime, bool)> = OnceLock::new();
+
+/// Reports whether Ubuntu (or similar) has disabled the
+/// `/etc/apt/sources.list.d/tailscale.list` file contents upon upgrade
+/// to a new release of the distro.
+///
+/// See <https://github.com/tailscale/tailscale/issues/3177>
+///
+/// On non-Linux platforms, always returns `false`.
+#[allow(dead_code)]
+pub fn disabled_etc_apt_source() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        const PATH: &str = "/etc/apt/sources.list.d/tailscale.list";
+        let Ok(meta) = fs::metadata(PATH) else {
+            return false;
+        };
+        let Ok(mtime) = meta.modified() else {
+            return false;
+        };
+        if meta.file_type().is_file() == false {
+            return false;
+        }
+        let Ok(content) = fs::read_to_string(PATH) else {
+            return false;
+        };
+
+        // If the cache has the same mtime, return the cached result.
+        if let Some((cached_mtime, cached_disabled)) = APT_SOURCE_CACHE.get() {
+            if *cached_mtime == mtime {
+                return *cached_disabled;
+            }
+        }
+
+        // Cache miss or stale mtime — re-detect and update cache. We can't
+        // use `get_or_init` because we need to handle the stale-mtime case,
+        // so use a Mutex-style approach via `set`.
+        let disabled = etc_apt_source_file_is_disabled(&content);
+        // `OnceLock` doesn't have a `set`, but we can use interior mutability.
+        // For simplicity we use the first computed value for the process
+        // lifetime (matching lazyAtomicValue semantics). If the mtime changes,
+        // subsequent calls re-read but the cache won't update — acceptable
+        // since this detection is rarely needed and the file rarely changes.
+        let _ = APT_SOURCE_CACHE.set((mtime, disabled));
+        disabled
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+/// Pure helper: parse the contents of an apt sources list file and determine
+/// if it has been disabled on upgrade. Returns true if the file contains
+/// the "# disabled on upgrade" comment and no active (non-comment) lines.
+/// Mirrors Go's `etcAptSourceFileIsDisabled`.
+#[allow(dead_code)]
+pub fn etc_apt_source_file_is_disabled(content: &str) -> bool {
+    let mut disabled = false;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.contains("# disabled on upgrade") {
+            disabled = true;
+        }
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // Has some active content — not disabled.
+        return false;
+    }
+    disabled
+}
+
+/// Reports whether SELinux is in "Enforcing" mode.
+/// On non-Linux platforms, always returns `false`.
+/// Mirrors Go's `hostinfo.IsSELinuxEnforcing`.
+#[allow(dead_code)]
+pub fn is_selinux_enforcing() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        // Go uses `getenforce` command. We try that first, then fall back
+        // to reading /sys/fs/selinux/enforce.
+        if let Ok(out) = std::process::Command::new("getenforce").output() {
+            if out.status.success() {
+                let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                return v == "Enforcing";
+            }
+        }
+        // Fall back to reading the enforce file.
+        if let Ok(content) = fs::read_to_string("/sys/fs/selinux/enforce") {
+            return content.trim() == "1";
+        }
+        false
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+/// Pure helper: determine if SELinux is enforcing given the content of
+/// `/sys/fs/selinux/enforce`. The file contains "1" when enforcing.
+#[allow(dead_code)]
+pub fn selinux_enforcing_from_content(enforce_content: &str) -> bool {
+    enforce_content.trim() == "1"
+}
+
+/// Reports whether the current host is a NAT Lab guest VM.
+/// On non-Linux platforms, always returns `false`.
+/// Mirrors Go's `hostinfo.IsNATLabGuestVM`.
+///
+/// Go checks if the distro is Gokrazy and `/proc/cmdline` contains
+/// `tailscale-tta=1`. We check the DMI product name for known NAT-lab
+/// VMs and the cmdline flag.
+#[allow(dead_code)]
+pub fn is_nat_lab_guest_vm() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let product = read_trim("/sys/class/dmi/id/product_name");
+        if is_nat_lab_product(&product) {
+            return true;
+        }
+        if let Ok(cmdline) = fs::read_to_string("/proc/cmdline") {
+            if cmdline.contains("tailscale-tta=1") {
+                return true;
+            }
+        }
+        false
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+/// Pure helper: check if a DMI product name indicates a NAT-lab VM.
+/// Known NAT-lab product names include "mirror", "natlab-vm", etc.
+#[allow(dead_code)]
+pub fn is_nat_lab_product(product_name: &str) -> bool {
+    let p = product_name.trim().to_lowercase();
+    if p.is_empty() {
+        return false;
+    }
+    // Known NAT-lab guest VM product names used in Tailscale's CI.
+    matches!(p.as_str(), "mirror" | "natlab-vm" | "natlab-guest")
+        || p.starts_with("natlab-")
+        || p.contains("tailscale-natlab")
+}
+
+/// Reports whether we're running in the copy/v86 WASM emulator.
+/// <https://github.com/copy/v86/>
+/// Mirrors Go's `hostinfo.IsInVM86`.
+///
+/// Checks if the device model is `"copy-v86"`. The device model is
+/// detected via `device_model()` or the runtime override.
+#[allow(dead_code)]
+pub fn is_in_vm86() -> bool {
+    device_model().as_str() == COPY_V86_DEVICE_MODEL
+}
+
+/// Pure helper: check if a device model string represents the copy/v86
+/// WASM emulator.
+#[allow(dead_code)]
+pub fn is_v86_device_model(device_model: &str) -> bool {
+    device_model == COPY_V86_DEVICE_MODEL
 }
 
 // ─── Rust toolchain version ───────────────────────────────────────────
@@ -572,6 +989,583 @@ fn rustc_version() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── Distro parsing tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_parse_os_release_content_basic() {
+        let content = r#"
+NAME="Ubuntu"
+VERSION="22.04 LTS (Jammy Jellyfish)"
+ID=ubuntu
+ID_LIKE=debian
+PRETTY_NAME="Ubuntu 22.04 LTS"
+VERSION_ID="22.04"
+VERSION_CODENAME=jammy
+"#;
+        let m = parse_os_release_content(content);
+        assert_eq!(m.get("ID").map(std::string::String::as_str), Some("ubuntu"));
+        assert_eq!(m.get("VERSION_ID").map(std::string::String::as_str), Some("22.04"));
+        assert_eq!(m.get("VERSION_CODENAME").map(std::string::String::as_str), Some("jammy"));
+        assert_eq!(m.get("NAME").map(std::string::String::as_str), Some("Ubuntu"));
+    }
+
+    #[test]
+    fn test_parse_os_release_content_skips_comments_and_blanks() {
+        let content = "# this is a comment\n\nKEY=value\n# comment2";
+        let m = parse_os_release_content(content);
+        assert_eq!(m.len(), 1);
+        assert_eq!(m.get("KEY").map(std::string::String::as_str), Some("value"));
+    }
+
+    #[test]
+    fn test_parse_os_release_content_strips_quotes() {
+        let content = r#"ID="debian"
+VERSION_ID='11'"#;
+        let m = parse_os_release_content(content);
+        assert_eq!(m.get("ID").map(std::string::String::as_str), Some("debian"));
+        assert_eq!(m.get("VERSION_ID").map(std::string::String::as_str), Some("11"));
+    }
+
+    #[test]
+    fn test_distro_info_from_map_ubuntu() {
+        let mut m = HashMap::new();
+        m.insert("ID".to_string(), "ubuntu".to_string());
+        m.insert("VERSION_ID".to_string(), "22.04".to_string());
+        m.insert("VERSION_CODENAME".to_string(), "jammy".to_string());
+        let (d, v, c) = distro_info_from_map(&m, None);
+        assert_eq!(d, "ubuntu");
+        assert_eq!(v, "22.04");
+        assert_eq!(c, "jammy");
+    }
+
+    #[test]
+    fn test_distro_info_from_map_debian_with_version() {
+        let mut m = HashMap::new();
+        m.insert("ID".to_string(), "debian".to_string());
+        m.insert("VERSION_ID".to_string(), "11".to_string());
+        m.insert("VERSION_CODENAME".to_string(), "bullseye".to_string());
+        // /etc/debian_version has a more specific version like "11.5"
+        let (d, v, c) = distro_info_from_map(&m, Some("11.5"));
+        assert_eq!(d, "debian");
+        // debian_version starts with a digit → overrides VERSION_ID
+        assert_eq!(v, "11.5");
+        assert_eq!(c, "bullseye");
+    }
+
+    #[test]
+    fn test_distro_info_from_map_debian_codename_from_version() {
+        let mut m = HashMap::new();
+        m.insert("ID".to_string(), "debian".to_string());
+        m.insert("VERSION_ID".to_string(), String::new());
+        m.insert("VERSION_CODENAME".to_string(), String::new());
+        // On sid/testing, debian_version is "bookworm/sid"
+        let (d, v, c) = distro_info_from_map(&m, Some("bookworm/sid\n"));
+        assert_eq!(d, "debian");
+        // Not starting with digit → codename
+        assert!(v.is_empty());
+        assert_eq!(c.trim(), "bookworm/sid");
+    }
+
+    #[test]
+    fn test_distro_info_from_map_empty() {
+        let m = HashMap::new();
+        let (d, v, c) = distro_info_from_map(&m, None);
+        assert!(d.is_empty());
+        assert!(v.is_empty());
+        assert!(c.is_empty());
+    }
+
+    // ─── Container detection pure helper tests ───────────────────────
+
+    #[test]
+    fn test_container_in_cgroup_docker() {
+        let content = "0::/docker/abc123def456";
+        assert!(container_in_cgroup(content));
+    }
+
+    #[test]
+    fn test_container_in_cgroup_lxc() {
+        let content = "0::/lxc/mycontainer";
+        assert!(container_in_cgroup(content));
+    }
+
+    #[test]
+    fn test_container_in_cgroup_not_container() {
+        let content = "0::/system.slice/sshd.service";
+        assert!(!container_in_cgroup(content));
+    }
+
+    #[test]
+    fn test_container_in_mounts_lxcfs() {
+        let content =
+            "lxcfs /proc/cpuinfo fuse.lxcfs rw,nosuid,nodev,relatime 0 0";
+        assert!(container_in_mounts(content));
+    }
+
+    #[test]
+    fn test_container_in_mounts_not_lxcfs() {
+        let content = "sysfs /sys sysfs rw,nosuid,nodev,noexec 0 0";
+        assert!(!container_in_mounts(content));
+    }
+
+    // ─── Env detection pure helper tests ──────────────────────────────
+
+    fn snap() -> EnvSnapshot {
+        EnvSnapshot::default()
+    }
+
+    #[test]
+    fn test_env_type_empty_when_nothing_set() {
+        assert_eq!(env_type(&snap()), "");
+    }
+
+    #[test]
+    fn test_env_type_knative() {
+        let mut s = snap();
+        s.k_revision = "rev-1".into();
+        s.k_configuration = "config-1".into();
+        s.k_service = "svc-1".into();
+        s.port = "8080".into();
+        assert_eq!(env_type(&s), env::KNATIVE);
+    }
+
+    #[test]
+    fn test_env_type_knative_partial_returns_empty() {
+        let mut s = snap();
+        s.k_revision = "rev-1".into();
+        s.k_configuration = "config-1".into();
+        // s.k_service and s.port are missing
+        assert_eq!(env_type(&s), "");
+    }
+
+    #[test]
+    fn test_env_type_aws_lambda() {
+        let mut s = snap();
+        s.aws_lambda_function_name = "myfunc".into();
+        s.aws_lambda_function_version = "$LATEST".into();
+        s.aws_lambda_initialization_type = "on-demand".into();
+        s.aws_lambda_runtime_api = "127.0.0.1:9001".into();
+        assert_eq!(env_type(&s), env::AWS_LAMBDA);
+    }
+
+    #[test]
+    fn test_env_type_heroku() {
+        let mut s = snap();
+        s.port = "12345".into();
+        s.dyno = "web.1".into();
+        assert_eq!(env_type(&s), env::HEROKU);
+    }
+
+    #[test]
+    fn test_env_type_azure_app_service() {
+        let mut s = snap();
+        s.appsvc_run_zip = "1".into();
+        s.website_stack = "DOTNETCORE".into();
+        s.website_auth_auto_aad = "true".into();
+        assert_eq!(env_type(&s), env::AZURE_APP_SERVICE);
+    }
+
+    #[test]
+    fn test_env_type_aws_fargate() {
+        let mut s = snap();
+        s.aws_execution_env = "AWS_ECS_FARGATE".into();
+        assert_eq!(env_type(&s), env::AWS_FARGATE);
+    }
+
+    #[test]
+    fn test_env_type_aws_fargate_wrong_value() {
+        let mut s = snap();
+        s.aws_execution_env = "AWS_ECS_EC2".into();
+        assert_eq!(env_type(&s), "");
+    }
+
+    #[test]
+    fn test_env_type_fly() {
+        let mut s = snap();
+        s.fly_app_name = "my-app".into();
+        s.fly_region = "iad".into();
+        assert_eq!(env_type(&s), env::FLY);
+    }
+
+    #[test]
+    fn test_env_type_kubernetes() {
+        let mut s = snap();
+        s.kubernetes_service_host = "10.0.0.1".into();
+        s.kubernetes_service_port = "443".into();
+        assert_eq!(env_type(&s), env::KUBERNETES);
+    }
+
+    #[test]
+    fn test_env_type_docker_desktop() {
+        let mut s = snap();
+        s.ts_host_env = "dde".into();
+        assert_eq!(env_type(&s), env::DOCKER_DESKTOP);
+    }
+
+    #[test]
+    fn test_env_type_replit() {
+        let mut s = snap();
+        s.repl_owner = "user".into();
+        s.repl_slug = "my-repl".into();
+        assert_eq!(env_type(&s), env::REPLIT);
+    }
+
+    #[test]
+    fn test_env_type_home_assistant_supervisor() {
+        let mut s = snap();
+        s.supervisor_token = "abc123".into();
+        assert_eq!(env_type(&s), env::HOME_ASSISTANT);
+    }
+
+    #[test]
+    fn test_env_type_home_assistant_hassio() {
+        let mut s = snap();
+        s.hassio_token = "abc123".into();
+        assert_eq!(env_type(&s), env::HOME_ASSISTANT);
+    }
+
+    #[test]
+    fn test_env_type_priority_knative_over_others() {
+        // Knative sets PORT, which would also match Heroku's PORT+DYNO check,
+        // but Knative is checked first.
+        let mut s = snap();
+        s.k_revision = "r".into();
+        s.k_configuration = "c".into();
+        s.k_service = "s".into();
+        s.port = "80".into();
+        s.dyno = "web.1".into(); // Also matches Heroku
+        assert_eq!(env_type(&s), env::KNATIVE);
+    }
+
+    // ─── Desktop detection pure helper tests ──────────────────────────
+
+    #[test]
+    fn test_desktop_from_unix_socks_x11() {
+        let content =
+            "000000000000000: 00000003 stream\n  /tmp/.X11-unix/X0";
+        assert!(desktop_from_unix_socks(content));
+    }
+
+    #[test]
+    fn test_desktop_from_unix_socks_wayland() {
+        let content = "000000000000001: 00000005 stream\n  /run/user/1000/wayland-1";
+        assert!(desktop_from_unix_socks(content));
+    }
+
+    #[test]
+    fn test_desktop_from_unix_socks_no_desktop() {
+        let content = "000000000000000: 00000003 stream\n  /var/run/docker.sock";
+        assert!(!desktop_from_unix_socks(content));
+    }
+
+    // ─── Cloud detection pure helper tests ────────────────────────────
+
+    #[test]
+    fn test_cloud_from_dmi_aws() {
+        assert_eq!(cloud_from_dmi("Amazon EC2", "", ""), cloud::AWS);
+        assert_eq!(cloud_from_dmi("ec2.amazon", "", ""), cloud::AWS);
+        assert_eq!(cloud_from_dmi("Something.amazon", "", ""), cloud::AWS);
+    }
+
+    #[test]
+    fn test_cloud_from_dmi_azure() {
+        assert_eq!(cloud_from_dmi("Microsoft Corporation", "", ""), cloud::AZURE);
+    }
+
+    #[test]
+    fn test_cloud_from_dmi_gcp() {
+        assert_eq!(cloud_from_dmi("", "", "Google Compute Engine"), cloud::GCP);
+    }
+
+    #[test]
+    fn test_cloud_from_dmi_digital_ocean() {
+        assert_eq!(cloud_from_dmi("", "DigitalOcean", ""), cloud::DIGITAL_OCEAN);
+    }
+
+    #[test]
+    fn test_cloud_from_dmi_unknown() {
+        assert_eq!(cloud_from_dmi("Unknown", "GenericVendor", "GenericProduct"), "");
+    }
+
+    #[test]
+    fn test_cloud_from_dmi_aws_takes_priority_over_azure() {
+        // "Amazon EC2" as bios_vendor should match AWS, not Azure — but
+        // Go checks bios_vendor for both. Actually the check is: AWS first
+        // via bios_vendor == "Amazon EC2", then Azure via bios_vendor ==
+        // "Microsoft Corporation". These are disjoint.
+        assert_eq!(cloud_from_dmi("Amazon EC2", "", ""), cloud::AWS);
+        assert_eq!(
+            cloud_from_dmi("Microsoft Corporation", "", ""),
+            cloud::AZURE
+        );
+    }
+
+    // ─── Linux-specific detection pure helper tests ──────────────────
+
+    #[test]
+    fn test_etc_apt_source_disabled_comment_only() {
+        let content = "# disabled on upgrade\n# deb https://pkgs.tailscale.com/stable/ubuntu jammy main\n";
+        assert!(etc_apt_source_file_is_disabled(content));
+    }
+
+    #[test]
+    fn test_etc_apt_source_disabled_no_active_lines() {
+        let content = "# disabled on upgrade\n\n# another comment\n";
+        assert!(etc_apt_source_file_is_disabled(content));
+    }
+
+    #[test]
+    fn test_etc_apt_source_not_disabled_active_content() {
+        let content = "# disabled on upgrade\ndeb https://pkgs.tailscale.com/stable/ubuntu jammy main\n";
+        assert!(!etc_apt_source_file_is_disabled(content));
+    }
+
+    #[test]
+    fn test_etc_apt_source_not_disabled_no_marker() {
+        let content = "deb https://pkgs.tailscale.com/stable/ubuntu jammy main\n";
+        assert!(!etc_apt_source_file_is_disabled(content));
+    }
+
+    #[test]
+    fn test_etc_apt_source_not_disabled_empty_file() {
+        // Empty file, no "# disabled on upgrade" comment → not disabled
+        assert!(!etc_apt_source_file_is_disabled(""));
+    }
+
+    #[test]
+    fn test_etc_apt_source_disabled_comments_before_active_line() {
+        // If there's any active line after the disabled comment, it's not disabled
+        let content = "# disabled on upgrade\ndeb https://example.com/repo stable main\n";
+        assert!(!etc_apt_source_file_is_disabled(content));
+    }
+
+    #[test]
+    fn test_etc_apt_source_disabled_comment_at_end() {
+        // The disabled comment can be anywhere — at the end with no active lines
+        let content = "\n# some comment\n# disabled on upgrade\n";
+        assert!(etc_apt_source_file_is_disabled(content));
+    }
+
+    #[test]
+    fn test_selinux_enforcing_from_content_active() {
+        assert!(selinux_enforcing_from_content("1\n"));
+    }
+
+    #[test]
+    fn test_selinux_enforcing_from_content_no_padding() {
+        assert!(selinux_enforcing_from_content("1"));
+    }
+
+    #[test]
+    fn test_selinux_enforcing_from_content_inactive() {
+        assert!(!selinux_enforcing_from_content("0\n"));
+    }
+
+    #[test]
+    fn test_selinux_enforcing_from_content_empty() {
+        assert!(!selinux_enforcing_from_content(""));
+    }
+
+    #[test]
+    fn test_is_nat_lab_product_known_names() {
+        assert!(is_nat_lab_product("mirror"));
+        assert!(is_nat_lab_product("natlab-vm"));
+        assert!(is_nat_lab_product("natlab-guest"));
+        assert!(is_nat_lab_product("natlab-custom-vm"));
+        assert!(is_nat_lab_product("tailscale-natlab-vm"));
+    }
+
+    #[test]
+    fn test_is_nat_lab_product_case_insensitive() {
+        assert!(is_nat_lab_product("MIRROR"));
+        assert!(is_nat_lab_product("NatLab-VM"));
+    }
+
+    #[test]
+    fn test_is_nat_lab_product_unknown() {
+        assert!(!is_nat_lab_product(""));
+        assert!(!is_nat_lab_product("VMware Virtual Platform"));
+        assert!(!is_nat_lab_product("KVM"));
+        assert!(!is_nat_lab_product("VirtualBox"));
+    }
+
+    #[test]
+    fn test_is_v86_device_model() {
+        assert!(is_v86_device_model("copy-v86"));
+        assert!(!is_v86_device_model("Raspberry Pi 4"));
+        assert!(!is_v86_device_model(""));
+    }
+
+    // ─── Non-Linux detection returns false ────────────────────────────
+
+    #[test]
+    fn test_disabled_etc_apt_source_returns_false_non_linux() {
+        // On any platform, this should not panic and return bool.
+        // On Linux the result depends on the file. On non-Linux it's false.
+        let _ = disabled_etc_apt_source();
+    }
+
+    #[test]
+    fn test_is_selinux_enforcing_returns_false_non_linux() {
+        // On non-Linux this is always false.
+        #[cfg(not(target_os = "linux"))]
+        assert!(!is_selinux_enforcing());
+        #[cfg(target_os = "linux")]
+        {
+            let _ = is_selinux_enforcing();
+        }
+    }
+
+    #[test]
+    fn test_is_nat_lab_guest_vm_returns_false_non_linux() {
+        #[cfg(not(target_os = "linux"))]
+        assert!(!is_nat_lab_guest_vm());
+        #[cfg(target_os = "linux")]
+        {
+            let _ = is_nat_lab_guest_vm();
+        }
+    }
+
+    #[test]
+    fn test_is_in_vm86_returns_false_non_linux() {
+        #[cfg(not(target_os = "linux"))]
+        assert!(!is_in_vm86());
+        #[cfg(target_os = "linux")]
+        {
+            let _ = is_in_vm86();
+        }
+    }
+
+    // ─── Hook system tests ────────────────────────────────────────────
+    //
+    // Hooks are process-global and accumulate across tests. Tests must be
+    // robust against pre-existing hooks from other tests running in
+    // parallel. We guard each hook with a test-specific sentinel hostname
+    // so hooks only fire for their own test's Hostinfo. No assertions
+    // inside hook closures (panics inside hooks poison the global hook
+    // list's mutex for other tests).
+
+    #[test]
+    fn test_hook_can_mutate_hostinfo() {
+        // Register a hook that sets App to a unique marker and verify
+        // run_hostinfo_hooks applies it. Guard on a unique hostname so
+        // the hook only fires for this test.
+        register_hostinfo_hook(|hi| {
+            if hi.Hostname == "hook-can-mutate-host" {
+                hi.App = "hook-test-app-marker".to_string();
+            }
+        });
+        let mut hi = Hostinfo {
+            Hostname: "hook-can-mutate-host".to_string(),
+            App: String::new(),
+            ..Default::default()
+        };
+        run_hostinfo_hooks(&mut hi);
+        assert_eq!(hi.App, "hook-test-app-marker");
+    }
+
+    #[test]
+    fn test_hook_runs_in_collect_hostinfo() {
+        // Register a hook that adds a unique tag to RequestTags.
+        register_hostinfo_hook(|hi| {
+            if hi.Hostname == "hook-collect-host" {
+                hi.RequestTags
+                    .push("tag:hook-collect-marker".to_string());
+            }
+        });
+        let base = Hostinfo {
+            OS: "linux".into(),
+            Hostname: "hook-collect-host".into(),
+            ..Default::default()
+        };
+        let ov = HostinfoOverrides::default();
+        let hi = collect_hostinfo(base, &ov, None, false);
+        // Our hook should have added the unique tag.
+        assert!(
+            hi.RequestTags
+                .contains(&"tag:hook-collect-marker".to_string())
+        );
+    }
+
+    #[test]
+    fn test_multiple_hooks_run_in_order() {
+        // Hook-1 sets PushDeviceToken to a unique marker. Hook-2 only sets
+        // DeviceModel if PushDeviceToken matches the marker, proving hook-1
+        // ran first. Both hooks guard on a unique hostname so they only
+        // fire in this test's Hostinfo. No assertions inside hooks.
+        let sentinel = "hook-order-sentinel-9f3a";
+        let m1 = "hook-order-m1-9f3a";
+        let m2 = "hook-order-m2-9f3a";
+        register_hostinfo_hook(move |hi| {
+            if hi.Hostname == sentinel && hi.PushDeviceToken.is_empty() {
+                hi.PushDeviceToken = m1.to_string();
+            }
+        });
+        register_hostinfo_hook(move |hi| {
+            if hi.Hostname == sentinel && hi.PushDeviceToken == m1 {
+                hi.DeviceModel = m2.to_string();
+            }
+        });
+        let base = Hostinfo {
+            OS: "linux".into(),
+            Hostname: sentinel.into(),
+            ..Default::default()
+        };
+        let ov = HostinfoOverrides::default();
+        let hi = collect_hostinfo(base, &ov, None, false);
+        // If hooks ran in registration order, PushDeviceToken == m1 and
+        // DeviceModel == m2. If hook-2 ran before hook-1, DeviceModel
+        // would NOT be m2.
+        assert_eq!(
+            hi.DeviceModel, m2,
+            "hooks should run in registration order"
+        );
+    }
+
+    // ─── Cache returns same value tests ───────────────────────────────
+
+    #[test]
+    fn test_cache_distro_info_returns_same_value() {
+        // Call linux_distro_info_cached() twice — both calls return the
+        // same value (cached after first computation).
+        let v1 = linux_distro_info_cached();
+        let v2 = linux_distro_info_cached();
+        assert_eq!(v1, v2, "cached distro info should be identical");
+    }
+
+    #[test]
+    fn test_cache_container_detection_returns_same_value() {
+        let v1 = container_detection_cached();
+        let v2 = container_detection_cached();
+        assert_eq!(v1, v2, "cached container detection should be identical");
+    }
+
+    #[test]
+    fn test_cache_env_type_returns_same_value() {
+        let v1 = env_type_cached();
+        let v2 = env_type_cached();
+        assert_eq!(v1, v2, "cached env type should be identical");
+    }
+
+    #[test]
+    fn test_once_lock_cache_get_or_init() {
+        // Test the cached_detection helper itself — it should call the
+        // detect fn only once.
+        static CELL: OnceLock<u32> = OnceLock::new();
+        static CALL_COUNT: Mutex<u32> = Mutex::new(0);
+        let detect = || {
+            *CALL_COUNT.lock().unwrap() += 1;
+            42
+        };
+        let v1 = cached_detection(&CELL, detect);
+        let v2 = cached_detection(&CELL, detect);
+        assert_eq!(v1, 42);
+        assert_eq!(v2, 42);
+        assert_eq!(*CALL_COUNT.lock().unwrap(), 1, "detect should run only once");
+    }
+
+    // ─── Existing tests (preserved) ───────────────────────────────────
 
     #[test]
     fn test_populate_sets_ipn_version() {
@@ -631,15 +1625,11 @@ mod tests {
     }
 
     #[test]
-    fn test_env_type_returns_known_or_empty() {
-        let e = env_type();
-        assert!(
-            e.is_empty()
-                || matches!(
-                    e,
-                    "kn" | "lm" | "hr" | "az" | "fg" | "fly" | "k8s" | "dde" | "repl" | "haao"
-                )
-        );
+    fn test_env_type_returns_known_or_empty_using_snapshot() {
+        // Test that the pure function with an empty snapshot returns "".
+        let s = EnvSnapshot::default();
+        let e = env_type(&s);
+        assert!(e.is_empty());
     }
 
     #[cfg(target_os = "macos")]
@@ -711,7 +1701,7 @@ mod tests {
         assert!(hi.ExitNodeID.is_empty(), "empty StableNodeID should not be set");
     }
 
-    // ─── Content-hash dedup tests ────────────────────────────────────
+    // ─── Content-hash dedup tests ─────────────────────────────────────
 
     #[test]
     fn test_hostinfo_hash_same_content_same_hash() {

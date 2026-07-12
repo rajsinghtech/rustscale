@@ -13,3 +13,8 @@ workspace = true
 serde.workspace = true
 serde_json.workspace = true
 log = "0.4"
+chrono.workspace = true
+rand.workspace = true
+tokio = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+zstd = "0.13"

@@ -356,3 +356,62 @@ text.
    heuristic too aggressive
 4. Check if `/Users/rajsingh/Documents/GitHub/tailscale` reads return permission
    denials → check `opencode.json` exists and has `external_directory` entries
+
+## 2026-07-12: Toolbench on the Claude ORCHESTRATOR sessions (not build agents)
+
+All prior entries analyze the **opencode build agents**. This pass analyzes the
+**Claude Code orchestrator sessions** themselves — the ~8 JSONL logs in
+`~/.claude/projects/-Users-rajsingh-Documents-GitHub-rustscale/` that drove the
+agents. Analysis script: `/tmp/toolbench2.py` (re-derivable). Findings:
+
+### What the orchestrator actually does (1,258 bash calls, 73% of all tool use)
+- `git` 247 (20%), `inspect` (rg/ls/wc/grep) 228 (18%), `agent-launch`
+  117 (9%), **`agent-poll-api` 107 (8.5%)**, **`agent-poll-log` 103 (8.2%)**,
+  `cargo-test` 83 (6.6%), `check-sh` 53 (4.2%), `gh-ci` 47 (3.7%), raw
+  `cargo-clippy`/`build` 48 (3.8%), `commit-ritual` 19 (1.5%).
+
+### Top 4 token sinks / anti-patterns found
+1. **Log-polling is 17% of all bash (210 calls).** `tail -c 2000 …/agent.log`,
+   `cat /private/tmp/claude-501/…/output`, and `curl -s 127.0.0.1:4096/session/…/message`
+   account for 210 turns, each a full orchestrator turn doing nothing but
+   re-checking a backgrounded agent. CLAUDE.md prescribes "run_in_background +
+   poll the output file," but polling every cycle is wasteful. **Fix**: prefer
+   foreground `opencode-task.sh` with a deadline (the harness already prints the
+   final message to stdout); only background when you genuinely parallelize 2+
+   agents, and then poll with a single `tools/wait-build.sh`-style helper, not
+   bare `tail`/`curl`.
+2. **The orchestrator runs raw `cargo` 131× vs `tools/check.sh` 53×.** Same
+   anti-pattern documented for build agents (§2026-07-11 raw-cargo entry) — the
+   orchestrator isn't eating its own dog food. Raw `cargo test --workspace` etc.
+   dumps full output into context and can diverge from the `-D warnings` + `fmt`
+   CI gate. **Fix**: orchestrator should use `tools/check.sh` for its own
+   verification too, never raw `cargo build`/`test`/`clippy`.
+3. **Commit ritual re-typed 22× (15.8K chars verbatim).**
+   `cargo fmt --all && tools/check.sh && git add -A && git -c user.name=rajsinghtech
+   -c user.email=rajsinghcpre@gmail.com commit -m …` was hand-written 22 times.
+   **Fix**: added `tools/commit.sh "<msg>"` — runs the gate, formats, stages,
+   commits as the local user, prints only `<hash> <subject>`. Orchestrator and
+   any merge-step agent should call this instead of the inline ritual.
+4. **Two sessions re-continued 7× each = stuck fix loops.** `phase-5-netstack-tsnet`
+   and `phase-8-ffi` (the two foundational, highest-complexity phases) each
+   needed 7 `opencode run -s <id>` fix continues. Overall continue/launch ratio
+   is healthy (17 continues / 117 launches = 0.15), but when a phase exceeds
+   ~3 continues it's cheaper to abandon and re-prompt with the compiler errors
+   pasted in than to keep nudging a degraded context.
+
+### What the orchestrator does well (keep)
+- **Bash-first delegation, near-zero code reading.** Read tool is only 4% of
+  tool use; the orchestrator delegates file reading to build agents and mostly
+  drives via bash. Good — keeps orchestrator context lean.
+- **No built-in Task/subagent tool usage** — by design (CLAUDE.md mandates the
+  `opencode-task.sh` harness). Consistently followed.
+- **Worktree isolation + `worktree-merge.sh`** — merges are a tiny fraction
+  (9 calls) and auto-resolve Cargo.lock. Working as designed.
+- **117 distinct fresh agent launches** — one phase per agent, low context
+  bleed. The launch/continue shape is right.
+
+### Codified this pass
+- `tools/commit.sh` — replaces the 22× verbatim commit ritual.
+- This section — folds sink #1–#4 into future orchestrator behavior. The
+  recurring toolsmith pass should now also audit the orchestrator JSONLs
+  (`~/.claude/projects/…/rustscale/*.jsonl`), not only `opencode session list`.

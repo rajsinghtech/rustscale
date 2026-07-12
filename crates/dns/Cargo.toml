@@ -20,3 +20,4 @@ webpki-roots = { workspace = true }
 [dev-dependencies]
 tokio.workspace = true
 rustscale-key = { path = "../key", version = "0.1.0" }
+tempfile = "3"

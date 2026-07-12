@@ -368,7 +368,7 @@ fn ensure_ring_provider() {
 /// Build a `dnscache::LookupFallback` function wrapping `resolve`.
 ///
 /// Usage:
-/// ```ignore
+/// ```text
 /// let resolver = dnscache::Resolver::new()
 ///     .with_fallback(rustscale_dnsfallback::make_lookup_fallback());
 /// ```

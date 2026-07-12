@@ -89,26 +89,59 @@ TUN mode; packets flow between a real OS TUN device and the data plane.
 
 ## Install
 
-### Homebrew
+### macOS / Linux (one-liner)
+
+```sh
+curl -fsSL https://rajsinghtech.github.io/rustscale/install.sh | sh
+```
+
+Detects your OS and architecture, downloads the matching prebuilt archive from
+the latest GitHub Release, and installs `rustscale`, `rustscaled`, and the C
+library (`librustscale` + `rustscale.h`) to `/usr/local`. Override the prefix
+with `PREFIX=...`, pin a version with `--version v0.1.0`, or uninstall with
+`--uninstall`.
+
+### Windows (one-liner)
+
+```powershell
+irm https://rajsinghtech.github.io/rustscale/install.ps1 | iex
+```
+
+Installs `rustscale.exe` and `rustscaled.exe` to `%LOCALAPPDATA%\rustscale`
+(user scope, no admin needed) and adds it to your PATH. Use `-Scope System` for
+a machine-wide install, `-Version v0.1.0` to pin, or `-Uninstall` to remove.
+
+### Homebrew (macOS)
 
 ```sh
 brew install rajsinghtech/tap/rustscale
 ```
 
-Installs the `rustscale` CLI and `rustscaled` daemon. The GitHub release
-archive also includes `librustscale` (static + dynamic) and `rustscale.h`.
+Installs the `rustscale` CLI and `rustscaled` daemon.
 
 ### From source
 
-Build and install the C library and header:
+Build and install the C library and header (requires the Rust toolchain):
 
 ```sh
-sh scripts/install.sh
+sh scripts/install-from-source.sh
 ```
 
 `PREFIX` (default `/usr/local`) selects the install location; `--with-tun`
-also installs the `rustscale-tun` CLI; `--uninstall` removes everything. See
-the `scripts/install.sh` header for the full flag set.
+also installs the `rustscale-tun` CLI; `--uninstall` removes everything.
+
+## Getting started
+
+```sh
+sudo rustscaled run              # start the daemon (root needed for TUN mode)
+rustscale up                     # interactive auth (QR code)
+rustscale up --auth-key tskey-...  # headless auth
+rustscale status                 # daemon state and connections
+rustscale ip                     # show Tailscale IPs
+rustscale whois <ip>             # machine and user for a Tailscale IP
+rustscale down                   # disconnect
+rustscale logout                 # disconnect and log out
+```
 
 ## Build and test
 

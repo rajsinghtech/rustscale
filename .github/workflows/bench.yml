@@ -34,12 +34,20 @@ jobs:
         id: tsauth
         run: |
           AUD="api.tailscale.com/TbqNGJkY5611CNTRL-kz4CwX2LK721CNTRL"
-          JWT=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$AUD" | jq -r '.value')
-          echo "::add-mask::$JWT"
-          TOKEN=$(curl -sS -X POST https://api.tailscale.com/api/v2/oauth/token-exchange \
-            -H 'Content-Type: application/x-www-form-urlencoded' \
-            -d 'client_id=TbqNGJkY5611CNTRL-kz4CwX2LK721CNTRL' -d "jwt=$JWT" | jq -r '.access_token')
+          # The exchange endpoint intermittently 500s, after which the JWT is
+          # rejected with 400s — so re-mint a fresh JWT on every attempt.
+          TOKEN=""
+          for i in 1 2 3 4 5; do
+            JWT=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+              "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$AUD" | jq -r '.value')
+            echo "::add-mask::$JWT"
+            TOKEN=$(curl -sS -X POST https://api.tailscale.com/api/v2/oauth/token-exchange \
+              -H 'Content-Type: application/x-www-form-urlencoded' \
+              -d 'client_id=TbqNGJkY5611CNTRL-kz4CwX2LK721CNTRL' -d "jwt=$JWT" | jq -r '.access_token')
+            if [ -n "$TOKEN" ] && [ "$TOKEN" != "null" ]; then break; fi
+            echo "token-exchange attempt $i failed; retrying" >&2
+            sleep $((i * 5))
+          done
           if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then echo "OIDC token-exchange failed" >&2; exit 1; fi
           echo "::add-mask::$TOKEN"
           echo "token=$TOKEN" >> "$GITHUB_OUTPUT"

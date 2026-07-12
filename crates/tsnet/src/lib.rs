@@ -3865,6 +3865,7 @@ async fn connect_home_derp(
         !node.InsecureForTests,
         node.InsecureForTests,
         node_key.clone(),
+        None,
     )
     .await
 }

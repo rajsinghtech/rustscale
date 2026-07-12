@@ -679,6 +679,7 @@ mod tests {
     async fn two_clients_exchange_packets() {
         let server = DerpServer::with_random_key();
         let (addr, handle) = server.spawn_local().await.unwrap();
+        let server_pub = handle.public_key();
 
         // Client A
         let priv_a = NodePrivate::generate();
@@ -688,6 +689,7 @@ mod tests {
             addr.port(),
             false, // no TLS
             priv_a.clone(),
+            Some(server_pub.clone()),
         )
         .await
         .expect("client A connect");
@@ -701,6 +703,7 @@ mod tests {
             addr.port(),
             false,
             priv_b.clone(),
+            Some(server_pub.clone()),
         )
         .await
         .expect("client B connect");
@@ -744,6 +747,7 @@ mod tests {
     async fn ping_pong_works() {
         let server = DerpServer::with_random_key();
         let (addr, handle) = server.spawn_local().await.unwrap();
+        let server_pub = handle.public_key();
 
         let priv_c = NodePrivate::generate();
         let mut client = DerpClient::connect_with_upgrade_dial(
@@ -752,6 +756,7 @@ mod tests {
             addr.port(),
             false,
             priv_c,
+            Some(server_pub),
         )
         .await
         .expect("client connect");
@@ -773,6 +778,7 @@ mod tests {
     async fn peer_gone_on_disconnect() {
         let server = DerpServer::with_random_key();
         let (addr, handle) = server.spawn_local().await.unwrap();
+        let server_pub = handle.public_key();
 
         // Client A
         let priv_a = NodePrivate::generate();
@@ -782,6 +788,7 @@ mod tests {
             addr.port(),
             false,
             priv_a,
+            Some(server_pub.clone()),
         )
         .await
         .expect("client A connect");
@@ -795,6 +802,7 @@ mod tests {
             addr.port(),
             false,
             priv_b,
+            Some(server_pub.clone()),
         )
         .await
         .expect("client B connect");
@@ -835,6 +843,7 @@ mod tests {
     async fn last_writer_wins() {
         let server = DerpServer::with_random_key();
         let (addr, handle) = server.spawn_local().await.unwrap();
+        let server_pub = handle.public_key();
 
         let priv_k = NodePrivate::generate();
         let pub_k = priv_k.public();
@@ -846,6 +855,7 @@ mod tests {
             addr.port(),
             false,
             priv_k.clone(),
+            Some(server_pub.clone()),
         )
         .await
         .expect("client1 connect");
@@ -858,6 +868,7 @@ mod tests {
             addr.port(),
             false,
             priv_c,
+            Some(server_pub.clone()),
         )
         .await
         .expect("client C connect");
@@ -870,6 +881,7 @@ mod tests {
             addr.port(),
             false,
             priv_k,
+            Some(server_pub.clone()),
         )
         .await
         .expect("client2 connect");

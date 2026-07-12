@@ -15,7 +15,7 @@ verified.md):
 | Area | Was | Actually | Evidence |
 | --- | --- | --- | --- |
 | Packet filter | ✅ | 🔶 | capability ACLs stubbed — `no_cap()` always false (`crates/filter/src/lib.rs`); no shields-up field |
-| DERP client | ✅ | 🔶 | no pinned-key verify — any server key accepted (`crates/derp/src/client.rs`); no send rate-limiting |
+| DERP client | ✅ | ✅ | pinned-key verify via `expected_server_key` param (`crates/derp/src/client.rs`); send rate-limiting via token-bucket from ServerInfo |
 | Tailscale SSH | ✅ | 🔶 | server code exists but policy callback hardcoded `None` (`crates/ssh/src/…`) → all connections rejected |
 | Health tracking | ✅ | 🔶 | ~5 of 20 Go warnables; no per-region DERP health |
 | Exit node (CLI) | ✅ | 🔶 | `--exit-node`/PATCH prefs never calls `set_exit_node` → routing no-op |

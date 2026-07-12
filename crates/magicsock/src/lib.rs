@@ -291,6 +291,7 @@ impl DerpManager {
             !node.InsecureForTests,
             node.InsecureForTests,
             self.node_private.clone(),
+            None,
         )
         .await
         {

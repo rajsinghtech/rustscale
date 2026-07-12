@@ -163,7 +163,7 @@ impl FakeRelay {
 async fn connect_to_relay(relay: &Arc<FakeRelay>, private_key: NodePrivate) -> DerpClient {
     let (client_stream, server_stream) = tokio::io::duplex(64 * 1024);
     relay.accept(server_stream);
-    DerpClient::from_stream(Box::new(client_stream), private_key)
+    DerpClient::from_stream(Box::new(client_stream), private_key, None)
         .await
         .expect("derp handshake")
 }

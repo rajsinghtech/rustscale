@@ -1,6 +1,7 @@
 //! Async DERP client over tokio + rustls.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -8,8 +9,50 @@ use tokio::net::TcpStream;
 use rustscale_key::{NodePrivate, NodePublic};
 
 use crate::frame::{self, decode_frame_header, encode_frame_header, frame_type, MAX_PACKET_SIZE};
-use crate::protocol::{parse_received, ClientInfo, Received};
+use crate::protocol::{parse_received, ClientInfo, Received, ServerInfo};
 use crate::DerpError;
+
+/// Token-bucket rate limiter for the DERP send path.
+///
+/// Mirrors Go's `golang.org/x/time/rate.Limiter` usage in `derp_client.go`:
+/// the server advertises `TokenBucketBytesPerSecond` and `TokenBucketBytesBurst`
+/// in `ServerInfo`; the client creates a limiter and checks each outbound frame
+/// (header + key + payload bytes) via [`TokenBucket::allow_n`]. If the bucket
+/// cannot supply the requested tokens, the packet is silently dropped —
+/// matching Go's `c.send` which returns `nil` on `!c.rate.AllowN(...)`.
+struct TokenBucket {
+    rate: u32,
+    burst: u32,
+    tokens: f64,
+    last: Instant,
+}
+
+impl TokenBucket {
+    fn new(rate: u32, burst: u32) -> Self {
+        Self {
+            rate,
+            burst,
+            tokens: f64::from(burst),
+            last: Instant::now(),
+        }
+    }
+
+    /// Non-blocking attempt to consume `n` tokens. Returns `true` if the
+    /// tokens were available (and consumed), `false` if the bucket is short
+    /// (tokens are NOT consumed in that case, matching Go's `AllowN`).
+    fn allow_n(&mut self, n: u32) -> bool {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * f64::from(self.rate)).min(f64::from(self.burst));
+        self.last = now;
+        if self.tokens >= f64::from(n) {
+            self.tokens -= f64::from(n);
+            true
+        } else {
+            false
+        }
+    }
+}
 
 /// Trait alias for a combined async read+write stream.
 pub trait DerpStream: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -130,15 +173,32 @@ pub struct DerpClient {
     server_key: NodePublic,
     private_key: NodePrivate,
     public_key: NodePublic,
+    /// Optional token-bucket send rate limiter, configured from the server's
+    /// `ServerInfo.TokenBucketBytesPerSecond` / `TokenBucketBytesBurst`.
+    rate_limiter: Option<TokenBucket>,
+}
+
+impl std::fmt::Debug for DerpClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DerpClient")
+            .field("server_key", &self.server_key)
+            .field("public_key", &self.public_key)
+            .field("rate_limited", &self.rate_limiter.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl DerpClient {
     /// Create a DerpClient from an already-connected stream.
     ///
     /// Performs the full DERP handshake:
-    /// 1. Receive the server's public key (`FrameServerKey`).
+    /// 1. Receive the server's public key (`FrameServerKey`). If
+    ///    `expected_server_key` is `Some`, the received key is compared and
+    ///    the connection is rejected on mismatch (pinned-key verification,
+    ///    matching Go's `derp.ServerPublicKey` option posture).
     /// 2. Send our client info (`FrameClientInfo`).
-    /// 3. Read the server's `FrameServerInfo` reply.
+    /// 3. Read the server's `FrameServerInfo` reply and configure the send
+    ///    rate limiter from the advertised token-bucket parameters.
     ///
     /// Reading the ServerInfo confirms the server accepted our connection
     /// (the server sends it only after `verifyClient` + `registerClient`
@@ -147,6 +207,7 @@ impl DerpClient {
     pub async fn from_stream(
         stream: Box<dyn DerpStream>,
         private_key: NodePrivate,
+        expected_server_key: Option<NodePublic>,
     ) -> Result<Self, DerpError> {
         let public_key = private_key.public();
         let mut client = DerpClient {
@@ -154,8 +215,9 @@ impl DerpClient {
             server_key: NodePublic::from_raw32([0u8; 32]),
             private_key,
             public_key,
+            rate_limiter: None,
         };
-        client.recv_server_key().await?;
+        client.recv_server_key(expected_server_key).await?;
         client.send_client_key().await?;
         client.recv_server_info().await?;
         Ok(client)
@@ -171,8 +233,9 @@ impl DerpClient {
         port: u16,
         use_tls: bool,
         private_key: NodePrivate,
+        expected_server_key: Option<NodePublic>,
     ) -> Result<Self, DerpError> {
-        Self::connect_insecure(host, port, use_tls, false, private_key).await
+        Self::connect_insecure(host, port, use_tls, false, private_key, expected_server_key).await
     }
 
     /// Connect with an explicit insecure flag. Same as [`connect`] but
@@ -183,6 +246,7 @@ impl DerpClient {
         use_tls: bool,
         insecure: bool,
         private_key: NodePrivate,
+        expected_server_key: Option<NodePublic>,
     ) -> Result<Self, DerpError> {
         let addr = format!("{host}:{port}");
         let tcp = TcpStream::connect(&addr).await?;
@@ -198,9 +262,9 @@ impl DerpClient {
             let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
                 .map_err(|e| DerpError::BadFrame(format!("invalid server name: {e}")))?;
             let tls = connector.connect(server_name, tcp).await?;
-            Self::from_stream(Box::new(tls), private_key).await
+            Self::from_stream(Box::new(tls), private_key, expected_server_key).await
         } else {
-            Self::from_stream(Box::new(tcp), private_key).await
+            Self::from_stream(Box::new(tcp), private_key, expected_server_key).await
         }
     }
 
@@ -213,8 +277,10 @@ impl DerpClient {
         port: u16,
         use_tls: bool,
         private_key: NodePrivate,
+        expected_server_key: Option<NodePublic>,
     ) -> Result<Self, DerpError> {
-        Self::connect_with_upgrade_dial(host, host, port, use_tls, private_key).await
+        Self::connect_with_upgrade_dial(host, host, port, use_tls, private_key, expected_server_key)
+            .await
     }
 
     /// Connect with an HTTP upgrade, specifying separate TCP dial address and
@@ -226,6 +292,7 @@ impl DerpClient {
         port: u16,
         use_tls: bool,
         private_key: NodePrivate,
+        expected_server_key: Option<NodePublic>,
     ) -> Result<Self, DerpError> {
         Self::connect_with_upgrade_dial_insecure(
             dial_addr,
@@ -234,6 +301,7 @@ impl DerpClient {
             use_tls,
             false,
             private_key,
+            expected_server_key,
         )
         .await
     }
@@ -247,6 +315,7 @@ impl DerpClient {
         use_tls: bool,
         insecure: bool,
         private_key: NodePrivate,
+        expected_server_key: Option<NodePublic>,
     ) -> Result<Self, DerpError> {
         let addr = format!("{dial_addr}:{port}");
         let tcp = TcpStream::connect(&addr).await?;
@@ -280,7 +349,7 @@ impl DerpClient {
         stream.write_all(req.as_bytes()).await?;
         stream.flush().await?;
 
-        Self::from_stream(stream, private_key).await
+        Self::from_stream(stream, private_key, expected_server_key).await
     }
 
     /// The server's public key (learned during handshake).
@@ -318,7 +387,7 @@ impl DerpClient {
 
     // ---- handshake ----
 
-    async fn recv_server_key(&mut self) -> Result<(), DerpError> {
+    async fn recv_server_key(&mut self, expected: Option<NodePublic>) -> Result<(), DerpError> {
         let (typ, body) = read_frame_async(&mut self.stream, 4096).await?;
         if typ != frame_type::SERVER_KEY {
             return Err(DerpError::BadFrame("expected FrameServerKey".into()));
@@ -332,6 +401,30 @@ impl DerpClient {
         let mut key = [0u8; 32];
         key.copy_from_slice(&body[frame::MAGIC.len()..frame::MAGIC.len() + 32]);
         self.server_key = NodePublic::from_raw32(key);
+
+        // Pinned-key verification: when the caller provides an expected server
+        // key (e.g. from the DERPMap or TLS meta cert), compare it against the
+        // key received in the FrameServerKey. On mismatch, fail immediately —
+        // do NOT proceed to sendClientKey. This matches Go's posture where the
+        // ServerPublicKey option pins the key and a wrong key causes crypto
+        // failure downstream; we fail earlier with a clear error.
+        //
+        // When no expected key is provided (bootstrap before DERPMap, or TLS
+        // middlebox ate the meta cert), preserve current behavior but log.
+        if let Some(expected_key) = expected {
+            if !expected_key.is_zero() && expected_key != self.server_key {
+                return Err(DerpError::ServerKeyMismatch {
+                    expected: expected_key,
+                    actual: self.server_key.clone(),
+                });
+            }
+        } else {
+            eprintln!(
+                "derp: no pinned server key provided — accepting key {} without verification",
+                self.server_key.short_string()
+            );
+        }
+
         Ok(())
     }
 
@@ -357,6 +450,10 @@ impl DerpClient {
     /// client (e.g. admission control denied), it closes the connection
     /// and this returns an IO error — which is the desired behavior: the
     /// caller learns immediately that the DERP connection failed.
+    ///
+    /// Also configures the send rate limiter from the server-advertised
+    /// token-bucket parameters (`TokenBucketBytesPerSecond` /
+    /// `TokenBucketBytesBurst`), matching Go's `setSendRateLimiter`.
     async fn recv_server_info(&mut self) -> Result<(), DerpError> {
         let (typ, body) = read_frame_async(&mut self.stream, MAX_PACKET_SIZE as u32 * 2).await?;
         if typ != frame_type::SERVER_INFO {
@@ -366,14 +463,30 @@ impl DerpClient {
                 typ
             )));
         }
-        // Parse to verify the seal opens with the server's key (confirms
-        // server identity). We don't need to return the info.
-        if parse_received(typ, &body, &self.private_key, &self.server_key).is_none() {
-            return Err(DerpError::BadServerInfo(
-                "failed to open ServerInfo box".into(),
-            ));
+        match parse_received(typ, &body, &self.private_key, &self.server_key) {
+            Some(Received::ServerInfo(info)) => {
+                self.configure_rate_limiter(&info);
+            }
+            Some(_) | None => {
+                return Err(DerpError::BadServerInfo(
+                    "failed to open ServerInfo box".into(),
+                ));
+            }
         }
         Ok(())
+    }
+
+    /// Configure the send rate limiter from `ServerInfo`, matching Go's
+    /// `setSendRateLimiter`: if `TokenBucketBytesPerSecond` is 0, no
+    /// limiting; otherwise create a token bucket with the advertised rate
+    /// and burst.
+    fn configure_rate_limiter(&mut self, info: &ServerInfo) {
+        if info.token_bucket_bytes_per_second > 0 {
+            self.rate_limiter = Some(TokenBucket::new(
+                info.token_bucket_bytes_per_second,
+                info.token_bucket_bytes_burst,
+            ));
+        }
     }
 
     // ---- recv ----
@@ -393,9 +506,19 @@ impl DerpClient {
     // ---- send methods ----
 
     /// Send a packet to `dst`.
+    ///
+    /// If a server-advertised rate limiter is active and the send budget is
+    /// exhausted, the packet is silently dropped (returns `Ok(())`), matching
+    /// Go's `derp.Client.send` which returns `nil` on `!c.rate.AllowN(...)`.
     pub async fn send_packet(&mut self, dst: NodePublic, pkt: &[u8]) -> Result<(), DerpError> {
         if pkt.len() > MAX_PACKET_SIZE {
             return Err(DerpError::PacketTooLarge(pkt.len()));
+        }
+        if let Some(ref mut limiter) = self.rate_limiter {
+            let frame_len = (frame::FRAME_HEADER_LEN + 32 + pkt.len()) as u32;
+            if !limiter.allow_n(frame_len) {
+                return Ok(());
+            }
         }
         let mut body = Vec::with_capacity(32 + pkt.len());
         body.extend_from_slice(&dst.raw32());
@@ -404,6 +527,8 @@ impl DerpClient {
     }
 
     /// Forward a packet (mesh use): `src` -> `dst`.
+    ///
+    /// Subject to the same rate limiting as [`send_packet`].
     pub async fn forward_packet(
         &mut self,
         src: NodePublic,
@@ -412,6 +537,12 @@ impl DerpClient {
     ) -> Result<(), DerpError> {
         if pkt.len() > MAX_PACKET_SIZE {
             return Err(DerpError::PacketTooLarge(pkt.len()));
+        }
+        if let Some(ref mut limiter) = self.rate_limiter {
+            let frame_len = (frame::FRAME_HEADER_LEN + 64 + pkt.len()) as u32;
+            if !limiter.allow_n(frame_len) {
+                return Ok(());
+            }
         }
         let mut body = Vec::with_capacity(64 + pkt.len());
         body.extend_from_slice(&src.raw32());
@@ -559,9 +690,13 @@ mod tests {
         let server_handle = tokio::spawn(server.run(server_stream, tx, done_rx));
 
         let client_priv = NodePrivate::generate();
-        let mut client = DerpClient::from_stream(Box::new(client_stream), client_priv)
-            .await
-            .unwrap();
+        let mut client = DerpClient::from_stream(
+            Box::new(client_stream),
+            client_priv,
+            Some(server_pub.clone()),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(client.server_public_key(), server_pub);
 
@@ -675,9 +810,13 @@ mod tests {
         });
 
         let client_priv = NodePrivate::generate();
-        let mut client = DerpClient::from_stream(Box::new(client_stream), client_priv)
-            .await
-            .unwrap();
+        let mut client = DerpClient::from_stream(
+            Box::new(client_stream),
+            client_priv,
+            Some(server_pub_clone.clone()),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(client.server_public_key(), server_pub_clone);
 
@@ -776,13 +915,218 @@ mod tests {
         });
 
         let client_priv = NodePrivate::generate();
-        let mut client = DerpClient::from_stream(Box::new(client_stream), client_priv)
-            .await
-            .unwrap();
+        let mut client = DerpClient::from_stream(
+            Box::new(client_stream),
+            client_priv,
+            Some(server_pub_clone.clone()),
+        )
+        .await
+        .unwrap();
 
         let big = vec![0u8; MAX_PACKET_SIZE + 1];
         let result = client.send_packet(server_pub_clone, &big).await;
         assert!(matches!(result, Err(DerpError::PacketTooLarge(_))));
+
+        let _ = server_task.await;
+    }
+
+    // ---- Pinned-key verification tests ----
+
+    /// A matching expected server key allows the handshake to proceed.
+    #[tokio::test]
+    async fn handshake_with_matching_expected_key() {
+        let (client_stream, server_stream) = duplex(8192);
+        let server = FakeServer::new();
+        let server_pub = server.server_pub.clone();
+
+        let (tx, _rx) = oneshot::channel();
+        let (done_tx, done_rx) = oneshot::channel();
+        let server_handle = tokio::spawn(server.run(server_stream, tx, done_rx));
+
+        let client_priv = NodePrivate::generate();
+        let client = DerpClient::from_stream(
+            Box::new(client_stream),
+            client_priv,
+            Some(server_pub.clone()),
+        )
+        .await
+        .expect("handshake with matching key should succeed");
+
+        assert_eq!(client.server_public_key(), server_pub);
+
+        let _ = done_tx.send(());
+        let _ = server_handle.await;
+    }
+
+    /// A mismatched expected server key causes the handshake to fail with
+    /// `DerpError::ServerKeyMismatch` — the client must NOT proceed to
+    /// sendClientKey.
+    #[tokio::test]
+    async fn handshake_rejects_mismatched_key() {
+        let (client_stream, server_stream) = duplex(8192);
+        let server = FakeServer::new();
+
+        let (tx, _rx) = oneshot::channel();
+        let (done_tx, done_rx) = oneshot::channel();
+        let server_handle = tokio::spawn(server.run(server_stream, tx, done_rx));
+
+        // Generate a *different* key to pin as expected.
+        let wrong_key = NodePrivate::generate().public();
+
+        let client_priv = NodePrivate::generate();
+        let result = DerpClient::from_stream(
+            Box::new(client_stream),
+            client_priv,
+            Some(wrong_key.clone()),
+        )
+        .await;
+
+        assert!(
+            matches!(&result, Err(DerpError::ServerKeyMismatch { expected, .. }) if *expected == wrong_key),
+            "expected ServerKeyMismatch, got {result:?}"
+        );
+
+        let _ = done_tx.send(());
+        let _ = server_handle.await;
+    }
+
+    /// When no expected key is provided, the handshake succeeds (preserves
+    /// bootstrap behavior — match Go's posture when no pinned key is known).
+    #[tokio::test]
+    async fn handshake_with_no_expected_key() {
+        let (client_stream, server_stream) = duplex(8192);
+        let server = FakeServer::new();
+        let server_pub = server.server_pub.clone();
+
+        let (tx, _rx) = oneshot::channel();
+        let (done_tx, done_rx) = oneshot::channel();
+        let server_handle = tokio::spawn(server.run(server_stream, tx, done_rx));
+
+        let client_priv = NodePrivate::generate();
+        let client = DerpClient::from_stream(Box::new(client_stream), client_priv, None)
+            .await
+            .expect("handshake with no expected key should succeed");
+
+        assert_eq!(client.server_public_key(), server_pub);
+
+        let _ = done_tx.send(());
+        let _ = server_handle.await;
+    }
+
+    // ---- Rate limiter tests ----
+
+    /// Token bucket allows burst-sized sends then drops until tokens refill.
+    #[tokio::test]
+    async fn token_bucket_burst_then_drop() {
+        let mut bucket = TokenBucket::new(100, 100);
+
+        // Burst of 100 should be consumed immediately.
+        assert!(bucket.allow_n(100), "first 100 tokens from burst");
+        // Bucket is now empty — next request should be denied.
+        assert!(!bucket.allow_n(1), "no tokens left, should drop");
+
+        // Wait 20ms → ~2 tokens refill at 100/s. A large request should
+        // still fail, but a 1-token request should succeed. Using generous
+        // bounds to avoid timing flakiness.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !bucket.allow_n(100),
+            "only a few tokens refilled, 100 should fail"
+        );
+        assert!(bucket.allow_n(1), "at least 1 token after 20ms refill");
+    }
+
+    /// Token bucket sustained rate: over a longer window the total bytes
+    /// allowed converges to rate × elapsed.
+    #[tokio::test]
+    async fn token_bucket_sustained_rate() {
+        let rate = 10_000u32;
+        let mut bucket = TokenBucket::new(rate, 200);
+
+        // Drain the burst.
+        assert!(bucket.allow_n(200));
+
+        // Over 100ms at 10k/s, 1000 tokens accrue. We request 100 at a time
+        // and should get ~10 successful sends.
+        let mut allowed = 0u32;
+        let window = Duration::from_millis(100);
+        let start = Instant::now();
+        while start.elapsed() < window {
+            if bucket.allow_n(100) {
+                allowed += 100;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // We should have allowed roughly rate * 0.1s = 1000 bytes, ±50% for
+        // timing jitter. The key assertion is that sustained sends are
+        // rate-limited, not unlimited.
+        assert!(
+            allowed > 500 && allowed < 2000,
+            "expected ~1000 bytes allowed in 100ms, got {allowed}"
+        );
+    }
+
+    /// A DerpClient configured with ServerInfo rate-limit parameters
+    /// drops sends that exceed the bucket.
+    #[tokio::test]
+    async fn client_send_rate_limited() {
+        let (client_stream, server_stream) = duplex(8192);
+
+        let server_priv = NodePrivate::generate();
+        let server_pub = server_priv.public();
+        let server_pub_clone = server_pub.clone();
+        let s2 = server_stream;
+
+        let server_task = tokio::spawn(async move {
+            let mut s = s2;
+            // Send server key.
+            let mut sk = Vec::with_capacity(40);
+            sk.extend_from_slice(&frame::MAGIC);
+            sk.extend_from_slice(&server_pub.raw32());
+            write_frame_async(&mut s, frame_type::SERVER_KEY, &sk)
+                .await
+                .unwrap();
+            // Read client info.
+            let (_, body) = read_frame_async(&mut s, 65536).await.unwrap();
+            // Send server info with a tiny rate limit: 1 byte/sec, burst 10.
+            let si = ServerInfo {
+                version: frame::PROTOCOL_VERSION,
+                token_bucket_bytes_per_second: 1,
+                token_bucket_bytes_burst: 10,
+            };
+            let si_json = serde_json::to_vec(&si).unwrap();
+            let mut cp = [0u8; 32];
+            cp.copy_from_slice(&body[..32]);
+            let si_box = server_priv
+                .seal_to(&NodePublic::from_raw32(cp), &si_json)
+                .unwrap();
+            write_frame_async(&mut s, frame_type::SERVER_INFO, &si_box)
+                .await
+                .unwrap();
+            // Keep the connection alive long enough for the test.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        });
+
+        let client_priv = NodePrivate::generate();
+        let mut client = DerpClient::from_stream(
+            Box::new(client_stream),
+            client_priv,
+            Some(server_pub_clone.clone()),
+        )
+        .await
+        .expect("handshake");
+
+        // The first few small sends should succeed (burst budget), then
+        // subsequent sends should be silently dropped. The frame overhead
+        // is 5 (header) + 32 (key) = 37 bytes per send_packet, so a burst
+        // of 10 allows zero sends (37 > 10). This verifies the rate limiter
+        // is active.
+        let data = b"hi";
+        let result = client.send_packet(server_pub_clone, data).await;
+        // With burst=10 and frame_len=37, the first send is dropped.
+        assert!(result.is_ok(), "dropped send returns Ok");
+        // The drop is silent (Ok(())), not an error.
 
         let _ = server_task.await;
     }

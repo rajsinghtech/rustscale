@@ -211,6 +211,9 @@ pub fn shared_overrides() -> SharedOverrides {
 ///   selected or the peer is not found.
 /// - `IngressEnabled`: `true` when a Funnel listener is active (any
 ///   `AllowFunnel` entry in the serve config is `true`).
+/// - `ShieldsUp`: set from `Prefs.ShieldsUp` so the control plane knows
+///   whether to block inbound connections. Mirrors Go's
+///   `ipn/ipnlocal/local.go` hostinfo building path.
 ///
 /// Device-specific fields (`PushDeviceToken`, `TPM`, `StateEncrypted`) are
 /// left at their defaults — they require platform APIs not available in the
@@ -219,6 +222,7 @@ pub fn apply_runtime_fields(
     hi: &mut Hostinfo,
     exit_node_id: Option<&StableNodeID>,
     ingress_enabled: bool,
+    shields_up: bool,
 ) {
     if let Some(id) = exit_node_id {
         if !id.is_empty() {
@@ -226,6 +230,7 @@ pub fn apply_runtime_fields(
         }
     }
     hi.IngressEnabled = ingress_enabled;
+    hi.ShieldsUp = shields_up;
 }
 
 /// Collect a full `Hostinfo`: apply overrides, run platform detection, then
@@ -237,11 +242,12 @@ pub fn collect_hostinfo(
     overrides: &HostinfoOverrides,
     exit_node_id: Option<&StableNodeID>,
     ingress_enabled: bool,
+    shields_up: bool,
 ) -> Hostinfo {
     let mut hi = base;
     overrides.apply(&mut hi);
     hi = populate_hostinfo(hi);
-    apply_runtime_fields(&mut hi, exit_node_id, ingress_enabled);
+    apply_runtime_fields(&mut hi, exit_node_id, ingress_enabled, shields_up);
     run_hostinfo_hooks(&mut hi);
     hi
 }
@@ -1512,7 +1518,7 @@ VERSION_ID='11'"#;
             ..Default::default()
         };
         let ov = HostinfoOverrides::default();
-        let hi = collect_hostinfo(base, &ov, None, false);
+        let hi = collect_hostinfo(base, &ov, None, false, false);
         // Our hook should have added the unique tag.
         assert!(hi
             .RequestTags
@@ -1544,7 +1550,7 @@ VERSION_ID='11'"#;
             ..Default::default()
         };
         let ov = HostinfoOverrides::default();
-        let hi = collect_hostinfo(base, &ov, None, false);
+        let hi = collect_hostinfo(base, &ov, None, false, false);
         // If hooks ran in registration order, PushDeviceToken == m1 and
         // DeviceModel == m2. If hook-2 ran before hook-1, DeviceModel
         // would NOT be m2.
@@ -1730,7 +1736,7 @@ VERSION_ID='11'"#;
             ..Default::default()
         };
         let ov = HostinfoOverrides::default();
-        let hi = collect_hostinfo(hi, &ov, None, false);
+        let hi = collect_hostinfo(hi, &ov, None, false, false);
         // No override → detection fills in the field.
         assert_eq!(hi.Package, "tsnet");
     }
@@ -1739,7 +1745,7 @@ VERSION_ID='11'"#;
     fn test_runtime_fields_exit_node_id() {
         let mut hi = Hostinfo::default();
         let exit_id: StableNodeID = "nodeABC".into();
-        apply_runtime_fields(&mut hi, Some(&exit_id), false);
+        apply_runtime_fields(&mut hi, Some(&exit_id), false, false);
         assert_eq!(hi.ExitNodeID, "nodeABC");
         assert!(!hi.IngressEnabled);
     }
@@ -1747,7 +1753,7 @@ VERSION_ID='11'"#;
     #[test]
     fn test_runtime_fields_ingress_enabled() {
         let mut hi = Hostinfo::default();
-        apply_runtime_fields(&mut hi, None, true);
+        apply_runtime_fields(&mut hi, None, true, false);
         assert!(hi.IngressEnabled);
         assert!(hi.ExitNodeID.is_empty());
     }
@@ -1756,7 +1762,7 @@ VERSION_ID='11'"#;
     fn test_runtime_fields_empty_exit_id_not_set() {
         let mut hi = Hostinfo::default();
         let empty: StableNodeID = String::new();
-        apply_runtime_fields(&mut hi, Some(&empty), false);
+        apply_runtime_fields(&mut hi, Some(&empty), false, false);
         assert!(
             hi.ExitNodeID.is_empty(),
             "empty StableNodeID should not be set"
@@ -1871,12 +1877,37 @@ VERSION_ID='11'"#;
             ..Default::default()
         };
         let exit_id: StableNodeID = "nodeExit42".into();
-        let hi = collect_hostinfo(base, &ov, Some(&exit_id), true);
+        let hi = collect_hostinfo(base, &ov, Some(&exit_id), true, false);
         assert_eq!(hi.DeviceModel, "Synology DS920+");
         assert_eq!(hi.ExitNodeID, "nodeExit42");
         assert!(hi.IngressEnabled);
         assert_eq!(hi.RoutableIPs, vec!["10.0.0.0/8".to_string()]);
         // Platform detection still runs for non-overridden fields.
         assert!(!hi.IPNVersion.is_empty());
+    }
+
+    #[test]
+    fn test_apply_runtime_fields_shields_up() {
+        let mut hi = Hostinfo::default();
+        apply_runtime_fields(&mut hi, None, false, true);
+        assert!(hi.ShieldsUp);
+    }
+
+    #[test]
+    fn test_apply_runtime_fields_shields_down() {
+        let mut hi = Hostinfo::default();
+        apply_runtime_fields(&mut hi, None, false, false);
+        assert!(!hi.ShieldsUp);
+    }
+
+    #[test]
+    fn test_collect_hostinfo_shields_up_populated() {
+        let base = Hostinfo {
+            Hostname: "shields-test".to_string(),
+            ..Default::default()
+        };
+        let ov = HostinfoOverrides::default();
+        let hi = collect_hostinfo(base, &ov, None, false, true);
+        assert!(hi.ShieldsUp);
     }
 }

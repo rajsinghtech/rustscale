@@ -55,7 +55,13 @@ pub(crate) fn spawn_link_monitor(
             let mut eps = magicsock.all_endpoints();
             if !derp_map.Regions.is_empty() {
                 if let Ok(report) = rustscale_netcheck::Prober
-                    .run(&derp_map, &rustscale_netcheck::ProberOpts::default())
+                    .run(
+                        &derp_map,
+                        &rustscale_netcheck::ProberOpts {
+                            health: Some(health.clone()),
+                            ..Default::default()
+                        },
+                    )
                     .await
                 {
                     if let Some(g) = report.global_v4 {
@@ -209,6 +215,7 @@ pub(crate) fn spawn_hostinfo_update_loop(
     route_table: Arc<RwLock<RouteTable>>,
     serve: Option<Arc<serve::ServeRunner>>,
     overrides: SharedOverrides,
+    state_dir: Option<PathBuf>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let node_pub = node_key.public();
@@ -264,8 +271,22 @@ pub(crate) fn spawn_hostinfo_update_loop(
             };
 
             // Apply overrides + platform detection + runtime fields.
+            // Read ShieldsUp from prefs so the control plane knows whether
+            // to block inbound connections. Mirrors Go's hostinfo building
+            // in ipn/ipnlocal/local.go.
+            let shields_up = state_dir
+                .as_ref()
+                .and_then(|d| rustscale_ipn::Prefs::load(d).ok())
+                .map(|p| p.ShieldsUp)
+                .unwrap_or(false);
             let ov = overrides.read().await.clone();
-            let hi = collect_hostinfo(base, &ov, exit_node_id.as_ref(), ingress_enabled);
+            let hi = collect_hostinfo(
+                base,
+                &ov,
+                exit_node_id.as_ref(),
+                ingress_enabled,
+                shields_up,
+            );
 
             let hash = hostinfo_hash(&hi);
             if hash != last_hash {

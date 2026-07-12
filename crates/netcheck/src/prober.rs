@@ -28,6 +28,7 @@ use tokio::time::timeout;
 use crate::captivedetection::Detector;
 use crate::report::{pick_preferred, ProbeProto, Report};
 use crate::stun::{new_tx_id, parse_response, request};
+use rustscale_health::{Tracker, WARN_CAPTIVE_PORTAL};
 
 /// Maximum time a single [`Prober::run`] will spend gathering a report.
 pub const REPORT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -67,6 +68,10 @@ pub struct ProberOpts {
     pub max_retries: usize,
     /// Previous preferred DERP region, for hysteresis. `0` means unknown.
     pub previous_preferred_derp: i32,
+    /// Optional health tracker. When set, captive portal detection results
+    /// are forwarded here: `Some(true)` → `set_unhealthy(WARN_CAPTIVE_PORTAL)`,
+    /// `Some(false)` → `set_healthy(WARN_CAPTIVE_PORTAL)`.
+    pub health: Option<Tracker>,
 }
 
 impl Default for ProberOpts {
@@ -76,6 +81,7 @@ impl Default for ProberOpts {
             probe_timeout: PROBE_TIMEOUT,
             max_retries: MAX_PROBE_RETRIES,
             previous_preferred_derp: 0,
+            health: None,
         }
     }
 }
@@ -163,6 +169,19 @@ impl Prober {
             .ok()
             .flatten();
             report.captive_portal = captive;
+
+            // Forward captive portal result to the health tracker.
+            if let Some(ref health) = opts.health {
+                match report.captive_portal {
+                    Some(true) => {
+                        health.set_unhealthy(WARN_CAPTIVE_PORTAL, "captive portal detected");
+                    }
+                    Some(false) => {
+                        health.set_healthy(WARN_CAPTIVE_PORTAL);
+                    }
+                    None => {}
+                }
+            }
         }
 
         Ok(report)

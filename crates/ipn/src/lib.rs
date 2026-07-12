@@ -26,7 +26,7 @@ mod profiles;
 pub use backend::{BackendInputs, IpnBackend};
 pub use bus::{NotifyBus, NotifyBusReceiver};
 pub use machine::{next_state, StateMachineInputs};
-pub use prefs::{MaskedPrefs, Prefs, StartOptions};
+pub use prefs::{AppConnectorPrefs, MaskedPrefs, Prefs, StartOptions};
 pub use profiles::{LoginProfile, NetworkProfile, ProfileID, StateKey, UserProfile};
 
 use serde::{Deserialize, Serialize};
@@ -284,6 +284,27 @@ pub struct Notify {
         deserialize_with = "deserialize_null_to_default"
     )]
     pub PeerChangedPatch: Option<Vec<serde_json::Value>>,
+
+    /// Current health warnings (text strings). When non-nil, health state
+    /// changed and the consumer should surface it. Mirrors Go's
+    /// `ipn.Notify.Health` (a `*health.State`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub Health: Option<Vec<String>>,
+
+    /// Client version info from control. Mirrors Go's
+    /// `ipn.Notify.ClientVersion` (`*tailcfg.ClientVersion`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ClientVersion: Option<serde_json::Value>,
+
+    /// Suggested exit node ID. Mirrors Go's
+    /// `ipn.Notify.SuggestedExitNode` (`*tailcfg.StableNodeID`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub SuggestedExitNode: Option<String>,
+
+    /// Map of user profiles. Mirrors Go's
+    /// `ipn.Notify.UserProfiles`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub UserProfiles: Option<serde_json::Value>,
 }
 
 /// Serde helper: deserialize `null` as `Default` (Go nil slices marshal as `null`).
@@ -345,6 +366,14 @@ impl Notify {
     pub fn engine(engine: EngineStatus) -> Self {
         Self {
             Engine: Some(engine),
+            ..Default::default()
+        }
+    }
+
+    /// Create a Notify carrying only a health state update.
+    pub fn health(warnings: Vec<String>) -> Self {
+        Self {
+            Health: Some(warnings),
             ..Default::default()
         }
     }

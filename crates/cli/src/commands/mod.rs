@@ -1,3 +1,4 @@
+pub mod cert;
 pub mod down;
 pub mod get;
 pub mod health;

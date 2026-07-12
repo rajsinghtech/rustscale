@@ -23,6 +23,7 @@
 
 mod commands;
 mod flags;
+mod qrcode;
 mod socket;
 mod version;
 
@@ -126,6 +127,7 @@ async fn dispatch(
         "serve" => commands::serve::run(args, &socket_path, json).await,
         "funnel" => commands::serve::run_funnel(args, &socket_path, json).await,
         "switch" => commands::switch::run(args, &socket_path, json).await,
+        "cert" => commands::cert::run(args, &socket_path).await,
         "ping" => commands::ping::run(args, &socket_path).await,
         other => {
             eprintln!("error: unknown subcommand '{other}'");
@@ -164,6 +166,7 @@ fn usage(bin: &str) {
     eprintln!("  netcheck                            print network conditions analysis");
     eprintln!("  metrics                             print Prometheus-format metrics");
     eprintln!("  health                              print active health warnings");
+    eprintln!("  cert [flags] <domain>               get TLS certs for a domain");
     eprintln!("  ping <ip>                           ping a peer (not yet supported)");
 }
 

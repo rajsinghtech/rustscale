@@ -31,6 +31,7 @@ use rustscale_ipn::{
     validate_notify_watch_opt, IpnBackend, LoginProfile, MaskedPrefs, NotifyWatchOpt, Prefs,
     StartOptions, NOTIFY_IN_PROCESS_NO_DISCONNECT,
 };
+use rustscale_key::{MachinePrivate, MachinePublic, NodePrivate};
 use rustscale_magicsock::{Magicsock, PathClass};
 use rustscale_tailcfg::{DERPMap, DNSConfig, Node, UserID, UserProfile};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -39,6 +40,7 @@ use tokio::sync::{mpsc, RwLock};
 use tokio::task::JoinHandle;
 
 use crate::serve::ServeConfig;
+use crate::tls::{AcmeCertFetcher, ControlCertProvider};
 
 const API_PREFIX: &str = "/localapi/v0/";
 
@@ -49,6 +51,21 @@ pub enum DaemonCommand {
     Start { auth_key: Option<String> },
     LoginInteractive,
     Logout,
+}
+
+/// Credentials needed to build an [`AcmeCertFetcher`] on demand for the
+/// `GET /localapi/v0/cert/<domain>` endpoint. The cert domains themselves
+/// are read live from `dns_config` (shared with the map-update task) so the
+/// endpoint always sees the current tailnet HTTPS configuration.
+#[derive(Clone)]
+pub(crate) struct CertParams {
+    pub state_dir: PathBuf,
+    pub control_url: String,
+    pub machine_key: MachinePrivate,
+    pub server_pub_key: MachinePublic,
+    pub node_key: NodePrivate,
+    pub capability_version: i32,
+    pub protocol_version: u16,
 }
 
 /// Shared state for the LocalAPI server — all fields are Arc clones of the
@@ -83,6 +100,9 @@ pub(crate) struct LocalApiState {
     pub profiles: Arc<RwLock<Vec<LoginProfile>>>,
     /// Current profile ID (shared state for the profiles endpoints).
     pub current_profile: Arc<RwLock<Option<String>>>,
+    /// Credentials for the cert endpoint (`GET /cert/<domain>`). `None` when
+    /// the server hasn't joined a tailnet yet (no machine/node keys).
+    pub cert_params: Option<CertParams>,
 }
 
 pub struct LocalApiHandle {
@@ -446,6 +466,7 @@ async fn dispatch<W: AsyncWrite + Unpin>(
                     "/localapi/v0/logout",
                     "/localapi/v0/serve-config",
                     "/localapi/v0/profiles",
+                    "/localapi/v0/cert/<domain>",
                 ]);
                 write_json_response(conn, 200, "OK", &endpoints).await?;
             } else {
@@ -554,6 +575,11 @@ async fn dispatch<W: AsyncWrite + Unpin>(
         }
 
         _ => {
+            // Check for cert/<domain> sub-path.
+            if let Some(suffix) = endpoint.strip_prefix("cert/") {
+                handle_cert(conn, method, suffix, &req.query, state).await?;
+                return Ok(());
+            }
             // Check for profiles/<id> or profiles/current sub-paths.
             if let Some(suffix) = endpoint.strip_prefix("profiles/") {
                 handle_profile_subpath(conn, method, suffix, state).await?;
@@ -589,7 +615,8 @@ async fn dispatch<W: AsyncWrite + Unpin>(
 /// - `ExitNodeStatus`: included when an exit node is selected via the
 ///   route table, but `ID` is derived from the peer's node key (not a
 ///   stable node ID, which rustscale does not track).
-/// - `ClientVersion`, `CertDomains`, `ExtraRecords`, `AuthURL`: omitted.
+/// - `ClientVersion`, `ExtraRecords`, `AuthURL`: omitted.
+/// - `CertDomains`: included (from the live DNSConfig).
 /// - `Peer` is a JSON object keyed by node public key string (same as Go).
 /// - `TUN`: true when the server was started via `up_tun()`.
 async fn build_status_json(state: &LocalApiState) -> serde_json::Value {
@@ -677,6 +704,14 @@ async fn build_status_json(state: &LocalApiState) -> serde_json::Value {
         }
     };
 
+    // Cert domains from the live DNSConfig (mirrors Go's
+    // ipnstate.Status.CertDomains — the domains the tailnet is authorized
+    // to issue LE certs for).
+    let cert_domains: Vec<String> = dns_config
+        .as_ref()
+        .map(|c| c.CertDomains.clone())
+        .unwrap_or_default();
+
     serde_json::json!({
         "Version": "rustscale",
         "TUN": state.tun_mode,
@@ -692,6 +727,7 @@ async fn build_status_json(state: &LocalApiState) -> serde_json::Value {
             "MagicDNSSuffix": magicdns_suffix,
             "MagicDNSEnabled": magicdns_enabled,
         },
+        "CertDomains": cert_domains,
     })
 }
 
@@ -1203,6 +1239,189 @@ async fn handle_post_serve_config<W: AsyncWrite + Unpin>(
 }
 
 // ---------------------------------------------------------------------------
+// Cert handler (GET /localapi/v0/cert/<domain>)
+// ---------------------------------------------------------------------------
+
+/// Handle `GET /localapi/v0/cert/<domain>?type=pair|cert|key&min_validity=<dur>`.
+///
+/// Ports Go's `ipn/localapi/cert.go` → `serveCert` / `serveKeyPair`. The
+/// domain must appear in the tailnet's `DNSConfig.CertDomains` (i.e. HTTPS
+/// certs are enabled); otherwise 404. The cert is provisioned/cached via
+/// the existing ACME path ([`ControlCertProvider`] + [`AcmeCertFetcher`]).
+///
+/// # Query parameters
+///
+/// - `type`: `pair` (default; key PEM then cert PEM concatenated), `cert`
+///   (or `crt`; cert PEM only), `key` (key PEM only).
+/// - `min_validity`: a Go-style duration string (e.g. `"720h"`); the cert
+///   is renewed if its remaining validity is less than this. `0` / empty
+///   means "just don't be expired".
+///
+/// # Response
+///
+/// `Content-Type: text/plain`; the body is PEM text. For `type=pair` the key
+/// PEM block comes first, then the cert PEM blocks (matching Go).
+async fn handle_cert<W: AsyncWrite + Unpin>(
+    conn: &mut W,
+    method: &str,
+    domain_suffix: &str,
+    query: &str,
+    state: &Arc<LocalApiState>,
+) -> Result<(), std::io::Error> {
+    if method != "GET" {
+        let body = serde_json::json!({"error": "use GET"});
+        write_json_response(conn, 405, "Method Not Allowed", &body).await?;
+        return Ok(());
+    }
+
+    let domain = domain_suffix.trim_end_matches('/');
+    if domain.is_empty() {
+        let body = serde_json::json!({"error": "missing domain in path"});
+        write_json_response(conn, 400, "Bad Request", &body).await?;
+        return Ok(());
+    }
+
+    let params = parse_query(query);
+    let typ = params.get("type").map_or("pair", String::as_str);
+
+    // Parse min_validity duration (Go-style: "720h", "30m", "1h30m"; 0/empty = none).
+    let min_validity = match params.get("min_validity") {
+        Some(v) if !v.is_empty() && v != "0" => match parse_go_duration(v) {
+            Ok(d) => d,
+            Err(msg) => {
+                let body = serde_json::json!({"error": format!("invalid min_validity: {msg}")});
+                write_json_response(conn, 400, "Bad Request", &body).await?;
+                return Ok(());
+            }
+        },
+        _ => chrono::Duration::zero(),
+    };
+
+    // Validate the domain against the tailnet's CertDomains (live DNSConfig).
+    let cert_domains: Vec<String> = state
+        .dns_config
+        .read()
+        .await
+        .as_ref()
+        .map(|c| c.CertDomains.clone())
+        .unwrap_or_default();
+    let domain_lc = domain.trim_end_matches('.').to_lowercase();
+    let allowed = cert_domains
+        .iter()
+        .any(|c| c.trim_end_matches('.').eq_ignore_ascii_case(&domain_lc));
+    if !allowed {
+        let body = serde_json::json!({
+            "error": "cert domain not authorized",
+            "domain": domain,
+            "cert_domains": cert_domains,
+        });
+        write_json_response(conn, 404, "Not Found", &body).await?;
+        return Ok(());
+    }
+
+    // Build the cert provider on demand (reuses the ACME fetcher + cache).
+    let Some(ref cp) = state.cert_params else {
+        let body =
+            serde_json::json!({"error": "cert provisioning unavailable (server not fully up)"});
+        write_json_response(conn, 500, "Internal Server Error", &body).await?;
+        return Ok(());
+    };
+
+    let fetcher = Arc::new(AcmeCertFetcher::new(
+        cert_domains,
+        cp.state_dir.clone(),
+        cp.control_url.clone(),
+        cp.machine_key.clone(),
+        cp.server_pub_key.clone(),
+        cp.node_key.clone(),
+        cp.capability_version,
+        cp.protocol_version,
+    ));
+    let provider = ControlCertProvider::new(cp.state_dir.clone(), domain, fetcher);
+    if let Err(e) = provider.refresh_with_min_validity(min_validity).await {
+        let body = serde_json::json!({"error": e.to_string()});
+        write_json_response(conn, 500, "Internal Server Error", &body).await?;
+        return Ok(());
+    }
+
+    let (cert_pem, key_pem) = if let (Some(c), Some(k)) = (provider.cert_pem(), provider.key_pem())
+    {
+        (c, k)
+    } else {
+        let body = serde_json::json!({"error": "cert material unavailable after refresh"});
+        write_json_response(conn, 500, "Internal Server Error", &body).await?;
+        return Ok(());
+    };
+
+    let body: Vec<u8> = match typ {
+        "pair" | "" => {
+            let mut out = Vec::with_capacity(key_pem.len() + cert_pem.len());
+            out.extend_from_slice(&key_pem);
+            out.extend_from_slice(&cert_pem);
+            out
+        }
+        "cert" | "crt" => cert_pem,
+        "key" => key_pem,
+        other => {
+            let body = serde_json::json!({
+                "error": format!("invalid type '{other}'; want \"pair\", \"cert\", or \"key\"")
+            });
+            write_json_response(conn, 400, "Bad Request", &body).await?;
+            return Ok(());
+        }
+    };
+
+    write_raw_response(conn, 200, "OK", "text/plain", &body).await
+}
+
+/// Parse a Go-style duration string (`"720h"`, `"30m"`, `"1h30m"`, `"3600s"`).
+/// Supports `h`, `m`, `s` suffixes (case-insensitive). Returns the parsed
+/// duration or an error message.
+fn parse_go_duration(s: &str) -> Result<chrono::Duration, String> {
+    let s = s.trim();
+    if s.is_empty() || s == "0" {
+        return Ok(chrono::Duration::zero());
+    }
+    let mut total = chrono::Duration::zero();
+    let mut rest = s;
+    while !rest.is_empty() {
+        // Find the end of the numeric part.
+        let num_end = rest
+            .bytes()
+            .position(|b| !b.is_ascii_digit() && b != b'.')
+            .unwrap_or(rest.len());
+        if num_end == 0 {
+            return Err(format!("expected number at start of '{rest}'"));
+        }
+        let n: f64 = rest[..num_end]
+            .parse()
+            .map_err(|e| format!("bad number in '{s}': {e}"))?;
+        rest = &rest[num_end..];
+        // Find the unit.
+        let unit_end = rest
+            .bytes()
+            .position(|b| b.is_ascii_digit() || b == b'.')
+            .unwrap_or(rest.len());
+        if unit_end == 0 {
+            return Err(format!("expected unit after number in '{s}'"));
+        }
+        let unit = rest[..unit_end].to_ascii_lowercase();
+        rest = &rest[unit_end..];
+        let secs = match unit.as_str() {
+            "h" => n * 3600.0,
+            "m" => n * 60.0,
+            "s" => n,
+            "ms" => n / 1000.0,
+            other => return Err(format!("unknown duration unit '{other}'")),
+        };
+        total = total
+            + chrono::Duration::seconds(secs.trunc() as i64)
+            + chrono::Duration::milliseconds(((secs.fract()) * 1000.0).round() as i64);
+    }
+    Ok(total)
+}
+
+// ---------------------------------------------------------------------------
 // Profiles handlers
 // ---------------------------------------------------------------------------
 
@@ -1454,6 +1673,7 @@ mod tests {
             serve_runner: None,
             profiles: Arc::new(RwLock::new(vec![])),
             current_profile: Arc::new(RwLock::new(None)),
+            cert_params: None,
         })
     }
 
@@ -2164,6 +2384,7 @@ mod tests {
             serve_runner: None,
             profiles: Arc::new(RwLock::new(vec![])),
             current_profile: Arc::new(RwLock::new(None)),
+            cert_params: None,
         });
 
         let config = r#"{"TCP":{"8080":{"HTTP":true}}}"#;
@@ -2335,5 +2556,290 @@ mod tests {
             &state,
         ).await;
         assert!(resp.contains("404 Not Found"), "response: {resp}");
+    }
+
+    // --- Cert endpoint tests ---
+
+    /// Build a test state with CertDomains and cert_params wired up so the
+    /// cert endpoint can be exercised. The cert cache is pre-populated so
+    /// refresh loads from cache without hitting a real ACME server.
+    async fn make_cert_test_state(
+        cert_domains: Vec<String>,
+        state_dir: &std::path::Path,
+    ) -> Arc<LocalApiState> {
+        let base = make_test_state().await;
+        let mk = rustscale_key::MachinePrivate::generate();
+        let mk_pub = mk.public();
+        let nk = rustscale_key::NodePrivate::generate();
+        Arc::new(LocalApiState {
+            peers: base.peers.clone(),
+            user_profiles: base.user_profiles.clone(),
+            health: base.health.clone(),
+            dns_config: Arc::new(RwLock::new(Some(rustscale_tailcfg::DNSConfig {
+                CertDomains: cert_domains,
+                ..Default::default()
+            }))),
+            packet_drops: base.packet_drops.clone(),
+            prefs: base.prefs.clone(),
+            tailscale_ips: base.tailscale_ips.clone(),
+            our_fqdn: base.our_fqdn.clone(),
+            hostname: base.hostname.clone(),
+            magicsock: base.magicsock.clone(),
+            tun_mode: base.tun_mode,
+            home_derp: base.home_derp,
+            ipn_backend: base.ipn_backend.clone(),
+            derp_map: base.derp_map.clone(),
+            command_tx: None,
+            state_dir: Some(state_dir.to_path_buf()),
+            auth_url: base.auth_url.clone(),
+            login_trigger: base.login_trigger.clone(),
+            serve_config: base.serve_config.clone(),
+            serve_runner: None,
+            profiles: base.profiles.clone(),
+            current_profile: base.current_profile.clone(),
+            cert_params: Some(CertParams {
+                state_dir: state_dir.to_path_buf(),
+                control_url: "https://control.example.invalid".into(),
+                machine_key: mk,
+                server_pub_key: mk_pub,
+                node_key: nk,
+                capability_version: 141,
+                protocol_version: 141,
+            }),
+        })
+    }
+
+    /// Write a self-signed cert + key into the cert cache so
+    /// ControlCertProvider::refresh loads from cache (no ACME hit).
+    fn write_cert_cache(state_dir: &std::path::Path, domain: &str) {
+        use base64::Engine as _;
+        let ck = rcgen::generate_simple_self_signed(vec![domain.to_string()]).unwrap();
+        let cert = &ck.cert;
+        let key_pair = &ck.key_pair;
+        let der = cert.der();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(der);
+        let mut cert_pem = String::new();
+        cert_pem.push_str("-----BEGIN CERTIFICATE-----\n");
+        for chunk in b64.as_bytes().chunks(64) {
+            cert_pem.push_str(std::str::from_utf8(chunk).unwrap());
+            cert_pem.push('\n');
+        }
+        cert_pem.push_str("-----END CERTIFICATE-----\n");
+        let key_der = key_pair.serialize_der();
+        let kb64 = base64::engine::general_purpose::STANDARD.encode(&key_der);
+        let mut key_pem = String::new();
+        key_pem.push_str("-----BEGIN PRIVATE KEY-----\n");
+        for chunk in kb64.as_bytes().chunks(64) {
+            key_pem.push_str(std::str::from_utf8(chunk).unwrap());
+            key_pem.push('\n');
+        }
+        key_pem.push_str("-----END PRIVATE KEY-----\n");
+        std::fs::write(
+            state_dir.join(format!("{domain}.crt.pem")),
+            cert_pem.as_bytes(),
+        )
+        .unwrap();
+        std::fs::write(
+            state_dir.join(format!("{domain}.key.pem")),
+            key_pem.as_bytes(),
+        )
+        .unwrap();
+        let far_future = chrono::Utc::now() + chrono::Duration::days(90);
+        std::fs::write(
+            state_dir.join(format!("{domain}.expiry")),
+            far_future.to_rfc3339(),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_cert_no_domain_returns_400() {
+        let state = make_test_state().await;
+        let resp = send_request_to_state(
+            b"GET /localapi/v0/cert/ HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            &state,
+        )
+        .await;
+        assert!(resp.contains("400 Bad Request"), "response: {resp}");
+        assert!(resp.contains("missing domain"));
+    }
+
+    #[tokio::test]
+    async fn test_cert_domain_not_in_certdomains_returns_404() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = make_cert_test_state(vec![], tmp.path()).await;
+        let resp = send_request_to_state(
+            b"GET /localapi/v0/cert/unauthorized.ts.net HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            &state,
+        )
+        .await;
+        assert!(resp.contains("404 Not Found"), "response: {resp}");
+        assert!(resp.contains("not authorized"));
+    }
+
+    #[tokio::test]
+    async fn test_cert_no_cert_params_returns_500() {
+        let state = make_test_state().await; // cert_params: None
+                                             // But we need cert_domains to be non-empty to get past the 404 check.
+        *state.dns_config.write().await = Some(rustscale_tailcfg::DNSConfig {
+            CertDomains: vec!["test.ts.net".into()],
+            ..Default::default()
+        });
+        let resp = send_request_to_state(
+            b"GET /localapi/v0/cert/test.ts.net HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            &state,
+        )
+        .await;
+        assert!(resp.contains("500"), "response: {resp}");
+        assert!(resp.contains("cert provisioning unavailable"));
+    }
+
+    #[tokio::test]
+    async fn test_cert_invalid_type_returns_400() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = make_cert_test_state(vec!["test.ts.net".into()], tmp.path()).await;
+        write_cert_cache(tmp.path(), "test.ts.net");
+        let resp = send_request_to_state(
+            b"GET /localapi/v0/cert/test.ts.net?type=bogus HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            &state,
+        )
+        .await;
+        assert!(resp.contains("400 Bad Request"), "response: {resp}");
+        assert!(resp.contains("invalid type"));
+    }
+
+    #[tokio::test]
+    async fn test_cert_invalid_min_validity_returns_400() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = make_cert_test_state(vec!["test.ts.net".into()], tmp.path()).await;
+        write_cert_cache(tmp.path(), "test.ts.net");
+        let resp = send_request_to_state(
+            b"GET /localapi/v0/cert/test.ts.net?min_validity=xyz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            &state,
+        )
+        .await;
+        assert!(resp.contains("400 Bad Request"), "response: {resp}");
+        assert!(resp.contains("invalid min_validity"));
+    }
+
+    #[tokio::test]
+    async fn test_cert_pair_returns_pem_from_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = make_cert_test_state(vec!["test.ts.net".into()], tmp.path()).await;
+        write_cert_cache(tmp.path(), "test.ts.net");
+        let resp = send_request_to_state(
+            b"GET /localapi/v0/cert/test.ts.net?type=pair HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            &state,
+        )
+        .await;
+        assert!(resp.contains("200 OK"), "response: {resp}");
+        assert!(resp.contains("text/plain"));
+        // type=pair: key PEM first, then cert PEM.
+        let body = resp.split("\r\n\r\n").nth(1).unwrap_or("");
+        let key_pos = body.find("BEGIN PRIVATE KEY").unwrap_or(usize::MAX);
+        let cert_pos = body.find("BEGIN CERTIFICATE").unwrap_or(usize::MAX);
+        assert!(key_pos < cert_pos, "pair must have key PEM before cert PEM");
+        assert!(body.contains("END PRIVATE KEY"));
+        assert!(body.contains("END CERTIFICATE"));
+    }
+
+    #[tokio::test]
+    async fn test_cert_cert_only_returns_cert_pem() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = make_cert_test_state(vec!["test.ts.net".into()], tmp.path()).await;
+        write_cert_cache(tmp.path(), "test.ts.net");
+        let resp = send_request_to_state(
+            b"GET /localapi/v0/cert/test.ts.net?type=cert HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            &state,
+        )
+        .await;
+        assert!(resp.contains("200 OK"), "response: {resp}");
+        let body = resp.split("\r\n\r\n").nth(1).unwrap_or("");
+        assert!(body.contains("BEGIN CERTIFICATE"));
+        assert!(
+            !body.contains("BEGIN PRIVATE KEY"),
+            "type=cert must not include key"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cert_key_only_returns_key_pem() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = make_cert_test_state(vec!["test.ts.net".into()], tmp.path()).await;
+        write_cert_cache(tmp.path(), "test.ts.net");
+        let resp = send_request_to_state(
+            b"GET /localapi/v0/cert/test.ts.net?type=key HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            &state,
+        )
+        .await;
+        assert!(resp.contains("200 OK"), "response: {resp}");
+        let body = resp.split("\r\n\r\n").nth(1).unwrap_or("");
+        assert!(body.contains("BEGIN PRIVATE KEY"));
+        assert!(
+            !body.contains("BEGIN CERTIFICATE"),
+            "type=key must not include cert"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cert_default_type_is_pair() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = make_cert_test_state(vec!["test.ts.net".into()], tmp.path()).await;
+        write_cert_cache(tmp.path(), "test.ts.net");
+        let resp = send_request_to_state(
+            b"GET /localapi/v0/cert/test.ts.net HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            &state,
+        )
+        .await;
+        assert!(resp.contains("200 OK"), "response: {resp}");
+        let body = resp.split("\r\n\r\n").nth(1).unwrap_or("");
+        // Default type=pair → both key and cert.
+        assert!(body.contains("BEGIN PRIVATE KEY"));
+        assert!(body.contains("BEGIN CERTIFICATE"));
+    }
+
+    #[tokio::test]
+    async fn test_cert_wrong_method_returns_405() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = make_cert_test_state(vec!["test.ts.net".into()], tmp.path()).await;
+        let resp = send_request_to_state(
+            b"POST /localapi/v0/cert/test.ts.net HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            &state,
+        )
+        .await;
+        assert!(resp.contains("405"), "response: {resp}");
+    }
+
+    #[test]
+    fn test_parse_go_duration() {
+        assert_eq!(parse_go_duration("0"), Ok(chrono::Duration::zero()));
+        assert_eq!(parse_go_duration(""), Ok(chrono::Duration::zero()));
+        assert_eq!(parse_go_duration("720h"), Ok(chrono::Duration::hours(720)));
+        assert_eq!(parse_go_duration("30m"), Ok(chrono::Duration::minutes(30)));
+        assert_eq!(
+            parse_go_duration("1h30m"),
+            Ok(chrono::Duration::seconds(5400))
+        );
+        assert_eq!(
+            parse_go_duration("3600s"),
+            Ok(chrono::Duration::seconds(3600))
+        );
+        assert!(parse_go_duration("xyz").is_err());
+        assert!(
+            parse_go_duration("12").is_err(),
+            "missing unit should error"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_status_includes_cert_domains() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = make_cert_test_state(vec!["node.ts.net".into()], tmp.path()).await;
+        let json = build_status_json(&state).await;
+        let domains = json["CertDomains"]
+            .as_array()
+            .expect("CertDomains is array");
+        assert_eq!(domains.len(), 1);
+        assert_eq!(domains[0], "node.ts.net");
     }
 }

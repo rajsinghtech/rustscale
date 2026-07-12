@@ -572,6 +572,7 @@ fn send_health_notify(health: &Tracker, ipn_backend: &IpnBackend) {
     ipn_backend
         .bus()
         .send(rustscale_ipn::Notify::health(warnings));
+}
 
 /// Apply an incremental [`PeerChange`] patch to an existing [`Node`].
 /// Only fields that are `Some` / non-default are applied; the rest are left

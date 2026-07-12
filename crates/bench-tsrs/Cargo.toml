@@ -1,18 +1,20 @@
 [package]
 name = "tsrs-bench"
 description = "Throughput and latency benchmark harness for tailscale-rs"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-repository.workspace = true
-
-[lints]
-workspace = true
+version = "0.1.0"
+edition = "2021"
+license = "BSD-3-Clause"
+repository = "https://github.com/rajsingh/rustscale"
 
 [dependencies]
-tailscale = { path = "../../../tailscale-rs" }
+tailscale = { git = "https://github.com/tailscale/tailscale-rs.git", tag = "v0.4.0" }
 url = "2"
-serde.workspace = true
-serde_json.workspace = true
-tokio.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
+
+# Standalone crate — not part of the rustscale workspace (tailscale-rs is a
+# separate workspace root). Build with:
+#   cargo build --manifest-path crates/bench-tsrs/Cargo.toml --release
+[workspace]

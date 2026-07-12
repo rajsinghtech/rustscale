@@ -70,6 +70,17 @@ jobs:
           BENCH_DIRECTION: "down"
         run: tools/bench/run-tailscaled.sh
 
+      - name: Build tsrs-bench
+        run: cargo build --manifest-path crates/bench-tsrs/Cargo.toml --release
+
+      - name: Run tailscale-rs benchmark
+        env:
+          TS_ORG_TOKEN: ${{ steps.tsauth.outputs.token }}
+          BENCH_DURATION: "10"
+          BENCH_PARALLEL: "1"
+          BENCH_DIRECTION: "down"
+        run: tools/bench/run-tailscale-rs.sh
+
       - name: Upload bench results
         uses: actions/upload-artifact@v4
         with:

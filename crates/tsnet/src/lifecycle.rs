@@ -7,9 +7,17 @@ impl Server {
     /// This is the classic tsnet embedding path: an in-process smoltcp netstack
     /// backs `listen`/`dial`. For a full-client TUN device instead, use
     /// [`Server::up_tun`].
-    pub async fn up(&mut self) -> Result<(), TsnetError> {
+    ///
+    /// **Idempotent**: calling `up()` on an already-running server returns
+    /// `Ok(ServerStatus)` immediately without re-starting. Mirrors Go's
+    /// `sync.Once`-guarded `Start()`.
+    ///
+    /// Returns the current [`ServerStatus`] after startup (or the existing
+    /// status if already up). Mirrors Go's `Up()` which returns
+    /// `(*ipnstate.Status, error)`.
+    pub async fn up(&mut self) -> Result<ServerStatus, TsnetError> {
         if self.inner.is_some() {
-            return Err(TsnetError::AlreadyUp);
+            return Ok(self.status());
         }
 
         ensure_ring_provider();
@@ -373,7 +381,7 @@ impl Server {
             // os_dns_configurator, so &RunningState can't cross await points.
             let (peers, route_table) = match self.inner.as_ref() {
                 Some(inner) => (inner.peers.clone(), inner.route_table.clone()),
-                None => return Ok(()),
+                None => return Ok(self.status()),
             };
             let ip_or_name = if stored_prefs.ExitNodeIP.is_empty() {
                 &stored_prefs.ExitNodeID
@@ -392,7 +400,7 @@ impl Server {
             }
         }
 
-        Ok(())
+        Ok(self.status())
     }
 
     /// Bring the server online in **TUN mode**: route plaintext IP packets
@@ -404,9 +412,9 @@ impl Server {
     /// `config.apply_routes` is true, the interface is brought up and tailnet
     /// routes are added via `ifconfig`/`route` (macOS) or `ip` (Linux) — also
     /// requiring root.
-    pub async fn up_tun(&mut self, config: TunModeConfig) -> Result<(), TsnetError> {
+    pub async fn up_tun(&mut self, config: TunModeConfig) -> Result<ServerStatus, TsnetError> {
         if self.inner.is_some() {
-            return Err(TsnetError::AlreadyUp);
+            return Ok(self.status());
         }
 
         ensure_ring_provider();
@@ -783,7 +791,7 @@ impl Server {
         if !stored_prefs.ExitNodeIP.is_empty() || !stored_prefs.ExitNodeID.is_empty() {
             let (peers, route_table) = match self.inner.as_ref() {
                 Some(inner) => (inner.peers.clone(), inner.route_table.clone()),
-                None => return Ok(()),
+                None => return Ok(self.status()),
             };
             let ip_or_name = if stored_prefs.ExitNodeIP.is_empty() {
                 &stored_prefs.ExitNodeID
@@ -802,13 +810,24 @@ impl Server {
             }
         }
 
-        Ok(())
+        Ok(self.status())
     }
 
     // --- shared control-plane bootstrap ---
 
+    /// Ensure the server is up, starting it if needed. Called by `listen()`
+    /// and `dial()` for lazy auto-start. Mirrors Go's `Server.Start()` being
+    /// called by `Dial`/`Listen`. If the server is already up, this is a
+    /// no-op (idempotent).
+    pub async fn ensure_up(&mut self) -> Result<ServerStatus, TsnetError> {
+        if self.inner.is_none() {
+            Box::pin(self.up()).await?;
+        }
+        Ok(self.status())
+    }
+
     /// Load prefs from the state directory, or return default if not found.
-    fn load_prefs(&self) -> Result<rustscale_ipn::Prefs, TsnetError> {
+    pub(crate) fn load_prefs(&self) -> Result<rustscale_ipn::Prefs, TsnetError> {
         if let Some(ref dir) = self.config.state_dir {
             rustscale_ipn::Prefs::load(dir).map_err(|e| TsnetError::Builder(e.to_string()))
         } else {
@@ -1055,6 +1074,7 @@ impl Server {
                 OS: std::env::consts::OS.to_string(),
                 Hostname: self.config.hostname.clone(),
                 RoutableIPs: advertise.clone(),
+                RequestTags: self.config.advertise_tags.clone(),
                 PeerRelay: self.config.peer_relay_server,
                 ..Default::default()
             }),
@@ -1133,6 +1153,7 @@ impl Server {
                         OS: std::env::consts::OS.to_string(),
                         Hostname: self.config.hostname.clone(),
                         RoutableIPs: advertise.clone(),
+                        RequestTags: self.config.advertise_tags.clone(),
                         PeerRelay: self.config.peer_relay_server,
                         ..Default::default()
                     }),
@@ -1173,13 +1194,13 @@ impl Server {
         // CallMeMaybe (one-shot, racy) and two nodes on the same machine
         // never establish a direct UDP path — they stay on DERP.
         let udp_socket = Arc::new(
-            tokio::net::UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], 0u16)))
+            tokio::net::UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], self.config.port)))
                 .await
                 .map_err(TsnetError::Io)?,
         );
         let udp_port = udp_socket.local_addr().map_err(TsnetError::Io)?.port();
         let local_endpoints = rustscale_magicsock::gather_local_endpoints(udp_port);
-        eprintln!("tsnet: local UDP endpoints: {local_endpoints:?}");
+        self.log_msg(format!("tsnet: local UDP endpoints: {local_endpoints:?}"));
 
         // Create a port-mapping client (NAT-PMP/PCP/UPnP) so magicsock can
         // publish a port-mapped external endpoint alongside local/STUN

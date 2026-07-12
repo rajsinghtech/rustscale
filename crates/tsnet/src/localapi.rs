@@ -174,17 +174,19 @@ pub(crate) fn spawn_localapi(
 // HTTP request parsing (same pattern as crates/c2n)
 // ---------------------------------------------------------------------------
 
-struct HttpRequest {
-    method: String,
-    path: String,
-    query: String,
+pub(crate) struct HttpRequest {
+    pub(crate) method: String,
+    pub(crate) path: String,
     #[allow(dead_code)]
-    headers: Vec<(String, String)>,
+    pub(crate) query: String,
+    pub(crate) headers: Vec<(String, String)>,
     #[allow(dead_code)]
-    body: Vec<u8>,
+    pub(crate) body: Vec<u8>,
 }
 
-async fn read_request<R: AsyncRead + Unpin>(conn: &mut R) -> Result<HttpRequest, String> {
+pub(crate) async fn read_request<R: AsyncRead + Unpin>(
+    conn: &mut R,
+) -> Result<HttpRequest, String> {
     let mut buf = Vec::with_capacity(4096);
     let mut tmp = [0u8; 4096];
     loop {
@@ -288,7 +290,7 @@ fn parse_request_head(head: &[u8], body_preview: Vec<u8>) -> Result<HttpRequest,
 // Response writers
 // ---------------------------------------------------------------------------
 
-async fn write_json_response<W: AsyncWrite + Unpin>(
+pub(crate) async fn write_json_response<W: AsyncWrite + Unpin>(
     conn: &mut W,
     status: u16,
     reason: &str,
@@ -595,7 +597,7 @@ async fn handle_connection(
 // Dispatch
 // ---------------------------------------------------------------------------
 
-async fn dispatch<W: AsyncWrite + Unpin>(
+pub(crate) async fn dispatch<W: AsyncWrite + Unpin>(
     conn: &mut W,
     req: &HttpRequest,
     state: &Arc<LocalApiState>,

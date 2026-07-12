@@ -28,7 +28,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
 
@@ -42,7 +42,7 @@ use crate::TsnetError;
 // Protocol constants (RFC 1928)
 // ---------------------------------------------------------------------------
 
-const SOCKS5_VERSION: u8 = 5;
+pub(crate) const SOCKS5_VERSION: u8 = 5;
 
 /// Authentication methods (RFC 1928 §3).
 const NO_AUTH_REQUIRED: u8 = 0x00;
@@ -362,7 +362,7 @@ impl<D: SocksDialer + 'static> Socks5Server<D> {
             };
             let d = self.dialer.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_conn(stream, d).await {
+                if let Err(e) = handle_conn_generic(stream, d).await {
                     eprintln!("socks5: connection ended: {e}");
                 }
             });
@@ -401,7 +401,11 @@ impl Default for CancelToken {
 }
 
 /// Handle a single SOCKS5 client connection end-to-end.
-async fn handle_conn<D: SocksDialer>(mut client: TcpStream, dialer: Arc<D>) -> io::Result<()> {
+pub(crate) async fn handle_conn_generic<D, S>(mut client: S, dialer: Arc<D>) -> io::Result<()>
+where
+    D: SocksDialer,
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     // 1. Version/method negotiation (RFC 1928 §3).
     if let Err(e) = negotiate_greeting(&mut client).await {
         // On any greeting failure we still reply 0xFF per the RFC.
@@ -451,7 +455,10 @@ async fn handle_conn<D: SocksDialer>(mut client: TcpStream, dialer: Arc<D>) -> i
 
 /// Parse and validate the client greeting: `VER NMETHODS METHODS...`.
 /// Accepts only SOCKS5 with no-auth offered.
-async fn negotiate_greeting(client: &mut TcpStream) -> io::Result<()> {
+pub(crate) async fn negotiate_greeting<R>(client: &mut R) -> io::Result<()>
+where
+    R: AsyncRead + Unpin,
+{
     let mut hdr = [0u8; 2];
     client
         .read_exact(&mut hdr)
@@ -513,11 +520,15 @@ where
 }
 
 /// Handle the CONNECT command: dial the target, reply, then copy both ways.
-async fn handle_connect<D: SocksDialer>(
-    mut client: TcpStream,
+async fn handle_connect<D, S>(
+    mut client: S,
     dialer: &Arc<D>,
     destination: SocksAddr,
-) -> io::Result<()> {
+) -> io::Result<()>
+where
+    D: SocksDialer,
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let target = destination.host_port();
     let dial = tokio::time::timeout(DIAL_TIMEOUT, dialer.dial(&target)).await;
     let (mut backend, bound) = match dial {

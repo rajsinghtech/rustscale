@@ -82,7 +82,7 @@ async fn setup() -> TestEnv {
     eprintln!("bringing tsnet node up...");
     let up_result = Box::pin(tokio::time::timeout(Duration::from_secs(60), server.up())).await;
     match &up_result {
-        Ok(Ok(())) => eprintln!("tsnet node is up"),
+        Ok(Ok(_)) => eprintln!("tsnet node is up"),
         Ok(Err(e)) => panic!("tsnet up() failed: {e}"),
         Err(elapsed) => panic!("tsnet up() timed out (60s): {elapsed:?}"),
     }

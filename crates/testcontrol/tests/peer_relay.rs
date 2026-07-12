@@ -82,7 +82,7 @@ async fn boot_node(
 
     let timeout = tokio::time::timeout(Duration::from_secs(90), server.up());
     match timeout.await {
-        Ok(Ok(())) => {}
+        Ok(Ok(_)) => {}
         Ok(Err(e)) => panic!("tsnet up() failed for {hostname}: {e}"),
         Err(elapsed) => panic!("tsnet up() timed out for {hostname} after {elapsed:?}"),
     }

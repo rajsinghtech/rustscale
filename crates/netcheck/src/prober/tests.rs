@@ -302,3 +302,25 @@ fn hysteresis_old_region_unreachable_switches() {
     m.insert(2, Duration::from_millis(20));
     assert_eq!(pick_with_hysteresis(&m, 1), 2);
 }
+
+#[test]
+fn prober_opts_health_default_is_none() {
+    let opts = ProberOpts::default();
+    assert!(opts.health.is_none());
+}
+
+#[test]
+fn prober_opts_with_health_tracker() {
+    let tracker = Tracker::new();
+    let opts = ProberOpts {
+        health: Some(tracker.clone()),
+        ..Default::default()
+    };
+    assert!(opts.health.is_some());
+    // Verify the tracker is functional through the opts.
+    opts.health
+        .as_ref()
+        .unwrap()
+        .set_unhealthy(WARN_CAPTIVE_PORTAL, "test");
+    assert!(tracker.is_unhealthy(WARN_CAPTIVE_PORTAL));
+}

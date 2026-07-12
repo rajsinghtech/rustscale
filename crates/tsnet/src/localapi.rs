@@ -924,24 +924,23 @@ mod tests {
         let disco_key = DiscoPrivate::generate();
 
         let derp_map = rustscale_tailcfg::DERPMap::default();
-        let magicsock = Arc::new(
-            Magicsock::new(MagicsockConfig {
-                private_key: node_key.clone(),
-                disco_key: disco_key.clone(),
-                derp_client: None,
-                derp_map: Some(derp_map),
-                home_derp_region: 0,
-                udp_bind: None,
-                udp_socket: None,
-                portmapper: None,
-                health: None,
-                disable_direct_paths: false,
-                peer_relay_server: false,
-                relay_server_config: None,
-            })
-            .await
-            .expect("magicsock"),
-        );
+        let (magicsock_inner, _wg_recv) = Magicsock::new(MagicsockConfig {
+            private_key: node_key.clone(),
+            disco_key: disco_key.clone(),
+            derp_client: None,
+            derp_map: Some(derp_map),
+            home_derp_region: 0,
+            udp_bind: None,
+            udp_socket: None,
+            portmapper: None,
+            health: None,
+            disable_direct_paths: false,
+            peer_relay_server: false,
+            relay_server_config: None,
+        })
+        .await
+        .expect("magicsock");
+        let magicsock = Arc::new(magicsock_inner);
 
         let peer = Node {
             Name: "peer1.tailnet.ts.net.".into(),

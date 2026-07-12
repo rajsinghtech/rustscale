@@ -1,0 +1,24 @@
+[package]
+name = "rustscale-localclient"
+description = "LocalAPI HTTP client for rustscale CLI <-> daemon IPC over safesocket"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rustscale-safesocket = { path = "../safesocket", version = "0.1.0" }
+rustscale-ipn = { path = "../ipn", version = "0.1.0" }
+rustscale-tailcfg = { path = "../tailcfg", version = "0.1.0" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+rustscale-tsnet = { path = "../tsnet", version = "0.1.0" }
+rustscale-testcontrol = { path = "../testcontrol", version = "0.1.0" }

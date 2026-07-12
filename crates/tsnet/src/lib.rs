@@ -986,6 +986,7 @@ impl Server {
                 tun_mode: false,
                 home_derp: b.home_derp,
                 ipn_backend: b.ipn_backend.clone(),
+                derp_map: b.derp_map.clone(),
             };
             if let Some(h) = localapi::spawn_localapi(Arc::new(state), path.clone()) {
                 tasks.push(h.task);
@@ -1277,6 +1278,7 @@ impl Server {
                 tun_mode: true,
                 home_derp: b.home_derp,
                 ipn_backend: b.ipn_backend.clone(),
+                derp_map: b.derp_map.clone(),
             };
             if let Some(h) = localapi::spawn_localapi(Arc::new(state), path.clone()) {
                 tasks.push(h.task);

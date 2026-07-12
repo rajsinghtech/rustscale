@@ -5,6 +5,7 @@ exclude = ["crates/bench-tsrs"]
 
 [workspace.package]
 edition = "2021"
+rust-version = "1.91"
 version = "0.1.0"
 license = "BSD-3-Clause"
 repository = "https://github.com/rajsingh/rustscale"

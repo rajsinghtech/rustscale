@@ -20,7 +20,7 @@ pub(crate) const PMP_LIFETIME_DELETE: u32 = 0;
 
 /// A parsed NAT-PMP response.
 #[derive(Debug, Clone)]
-pub(crate) struct PmpResponse {
+pub struct PmpResponse {
     pub op_code: u8,
     pub result_code: u16,
     #[allow(dead_code)]
@@ -64,7 +64,7 @@ pub(crate) fn build_delete_request(local_port: u16, external_port: u16) -> [u8; 
 ///
 /// Returns `None` if the packet is too short, has the wrong version, or has
 /// an unexpected length for its opcode.
-pub(crate) fn parse_response(pkt: &[u8]) -> Option<PmpResponse> {
+pub fn parse_response(pkt: &[u8]) -> Option<PmpResponse> {
     if pkt.len() < 12 {
         return None;
     }

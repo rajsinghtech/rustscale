@@ -31,7 +31,7 @@ use rustscale_ipn::{
     validate_notify_watch_opt, IpnBackend, NotifyWatchOpt, NOTIFY_IN_PROCESS_NO_DISCONNECT,
 };
 use rustscale_magicsock::{Magicsock, PathClass};
-use rustscale_tailcfg::{DNSConfig, Node, UserID, UserProfile};
+use rustscale_tailcfg::{DERPMap, DNSConfig, Node, UserID, UserProfile};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UnixListener;
 use tokio::sync::RwLock;
@@ -56,6 +56,7 @@ pub(crate) struct LocalApiState {
     pub tun_mode: bool,
     pub home_derp: i32,
     pub ipn_backend: Arc<IpnBackend>,
+    pub derp_map: DERPMap,
 }
 
 /// Result of spawning the LocalAPI server: the background task handle and
@@ -642,6 +643,7 @@ async fn build_netmap_json(state: &LocalApiState) -> serde_json::Value {
         "Peers": peers_json,
         "DNSConfig": dns.as_ref().map(|c| serde_json::to_value(c).unwrap_or(serde_json::Value::Null)),
         "Domain": domain,
+        "DERPMap": serde_json::to_value(&state.derp_map).unwrap_or(serde_json::Value::Null),
     })
 }
 
@@ -989,6 +991,7 @@ mod tests {
             tun_mode: false,
             home_derp: 0,
             ipn_backend,
+            derp_map: rustscale_tailcfg::DERPMap::default(),
         })
     }
 

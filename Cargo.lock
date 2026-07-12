@@ -1234,6 +1234,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustscale-cli"
+version = "0.1.0"
+dependencies = [
+ "rustscale-ipn",
+ "rustscale-localclient",
+ "rustscale-netcheck",
+ "rustscale-safesocket",
+ "rustscale-tailcfg",
+ "rustscale-testcontrol",
+ "rustscale-tsnet",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
 name = "rustscale-controlclient"
 version = "0.1.0"
 dependencies = [
@@ -1398,6 +1416,22 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "rustscale-localclient"
+version = "0.1.0"
+dependencies = [
+ "rustscale-ipn",
+ "rustscale-safesocket",
+ "rustscale-tailcfg",
+ "rustscale-testcontrol",
+ "rustscale-tsnet",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]

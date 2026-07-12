@@ -49,6 +49,15 @@ pub(crate) const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// How long we trust a recently-probed service before re-probing.
 pub(crate) const TRUST_DURATION: std::time::Duration = std::time::Duration::from_mins(10);
 
+/// Internal wire-format parse entrypoints exposed for fuzz targets.
+/// Not part of the stable public API.
+#[doc(hidden)]
+pub mod _fuzz {
+    pub use crate::pcp::parse_common_header as parse_pcp_header;
+    pub use crate::pcp::parse_map_response as parse_pcp_map_response;
+    pub use crate::pmp::parse_response as parse_pmp_response;
+}
+
 /// A port-mapping error that means no NAT mapping is available (gateway not
 /// found, all services disabled, etc.).
 #[derive(Debug, thiserror::Error)]

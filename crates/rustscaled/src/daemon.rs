@@ -216,11 +216,6 @@ async fn wait_for_shutdown() {
     }
 }
 
-#[cfg(not(unix))]
-async fn wait_for_shutdown() {
-    let _ = tokio::signal::ctrl_c().await;
-}
-
 /// Signal-wait future usable in `tokio::select!`.
 #[cfg(unix)]
 async fn wait_for_shutdown_signal() {

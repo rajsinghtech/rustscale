@@ -1463,6 +1463,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustscale-tcpinfo"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "rustscale-testcontrol"
 version = "0.1.0"
 dependencies = [

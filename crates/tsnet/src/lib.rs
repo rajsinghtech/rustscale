@@ -29,6 +29,7 @@
 #![allow(unsafe_code)]
 
 mod acme;
+mod appc;
 mod c2n;
 mod hostinfo;
 mod localapi;
@@ -40,6 +41,10 @@ mod state;
 mod status;
 mod tls;
 
+pub use appc::{
+    extract_appc_config, is_app_connector_node, make_dns_observer, route_info_from_connector,
+    TsnetRouteAdvertiser,
+};
 pub use routing::{peer_is_exit_capable, RouteTable};
 pub use rustscale_health::Warning;
 pub use serve::{

@@ -107,7 +107,13 @@ consume it) · peermtu darwin (no-op in Go too) ⬜ · sockstats ⬜.
 
 Tailscale SSH (`ssh/tailssh/`, port-10) · Taildrop (`ipn/ipnlocal/files.go`) ·
 Taildrive (`drive/`) · Tailnet Lock/TKA (`tka/`) · Device posture (`posture/`) ·
-App connector (`appc/`) · NetNS socket binding (`net/netns/`) · Session
+App connector (`appc/`) ✅ phase-appc (`crates/appc`: AppConnector with
+domain/wildcard matching, DNS response observation with CNAME chain
+resolution, dynamic route advertisement via RouteAdvertiser trait, Conn25
+peer selection + split-DNS resolver map, RouteInfo persistence, rate
+logging; `crates/tailcfg` appctype types; DNS observer callback in
+`crates/dns`; tsnet wiring with TsnetRouteAdvertiser) ·
+NetNS socket binding (`net/netns/`) · Session
 recording (`sessionrecording/`) · Workload identity federation
 (`feature/identityfederation/`). All ⬜.
 

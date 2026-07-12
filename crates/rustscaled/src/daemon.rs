@@ -166,6 +166,10 @@ async fn run_interactive(
             DaemonCommand::Logout => {
                 eprintln!("rustscaled: logout requested (server not up yet)");
             }
+            DaemonCommand::Shutdown => {
+                eprintln!("rustscaled: shutdown requested (server not up yet)");
+                return Ok(());
+            }
         }
     }
 
@@ -173,7 +177,7 @@ async fn run_interactive(
         return Ok(());
     }
 
-    // Phase 2: server is up — wait for shutdown or logout.
+    // Phase 2: server is up — wait for shutdown, logout, or LocalAPI shutdown.
     let logout_trigger = server.logout_trigger();
     tokio::select! {
         () = wait_for_shutdown_signal() => {}
@@ -187,6 +191,11 @@ async fn run_interactive(
             eprintln!("rustscaled: logout requested");
             server.logout().await?;
             eprintln!("rustscaled: logged out, state cleared → NeedsLogin");
+        }
+        Some(cmd) = command_rx.recv() => {
+            if matches!(cmd, DaemonCommand::Shutdown) {
+                eprintln!("rustscaled: shutdown requested via LocalAPI");
+            }
         }
     }
 

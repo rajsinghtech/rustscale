@@ -271,22 +271,32 @@ pub(crate) fn spawn_hostinfo_update_loop(
             };
 
             // Apply overrides + platform detection + runtime fields.
-            // Read ShieldsUp from prefs so the control plane knows whether
-            // to block inbound connections. Mirrors Go's hostinfo building
-            // in ipn/ipnlocal/local.go.
-            let shields_up = state_dir
+            // Read prefs-derived fields so the control plane gets accurate
+            // ShieldsUp, AppConnector, RequestTags, and AllowsUpdate.
+            // Mirrors Go's hostinfo building in ipn/ipnlocal/local.go.
+            let prefs = state_dir
                 .as_ref()
-                .and_then(|d| rustscale_ipn::Prefs::load(d).ok())
-                .map(|p| p.ShieldsUp)
-                .unwrap_or(false);
-            let ov = overrides.read().await.clone();
-            let hi = collect_hostinfo(
-                base,
-                &ov,
-                exit_node_id.as_ref(),
+                .and_then(|d| rustscale_ipn::Prefs::load(d).ok());
+            let shields_up = prefs.as_ref().map(|p| p.ShieldsUp).unwrap_or(false);
+            let rt = crate::hostinfo::HostinfoRuntime {
+                exit_node_id: exit_node_id.clone(),
                 ingress_enabled,
                 shields_up,
-            );
+                allows_update: prefs.as_ref().and_then(|p| p.AutoUpdate).unwrap_or(false),
+                app_connector: prefs
+                    .as_ref()
+                    .map(|p| p.AppConnector.Advertise)
+                    .unwrap_or(false),
+                request_tags: prefs
+                    .as_ref()
+                    .map(|p| p.AdvertiseTags.clone())
+                    .unwrap_or_default(),
+                userspace: true,
+                userspace_router: true,
+                ..Default::default()
+            };
+            let ov = overrides.read().await.clone();
+            let hi = collect_hostinfo(base, &ov, &rt);
 
             let hash = hostinfo_hash(&hi);
             if hash != last_hash {

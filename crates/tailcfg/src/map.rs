@@ -9,8 +9,8 @@ use rustscale_key::{DiscoPublic, NodePublic};
 
 use crate::deserialize_null_to_default;
 use crate::{
-    skip_default, skip_zero_disco, CapabilityVersion, DERPMap, DNSConfig, FilterRule, NetInfo,
-    Node, NodeCapMap, NodeID, StableNodeID, UserProfile,
+    skip_default, CapabilityVersion, DERPMap, DNSConfig, FilterRule, NetInfo, Node, NodeCapMap,
+    NodeID, StableNodeID, UserProfile,
 };
 
 /// Sent by a client to update its state and/or long-poll network-map updates.
@@ -38,12 +38,9 @@ pub struct MapRequest {
     /// The client's current node public key.
     #[serde(default, deserialize_with = "deserialize_null_to_default")]
     pub NodeKey: NodePublic,
-    /// The client's disco public key (zero if unset, then default-filled).
-    #[serde(
-        default,
-        skip_serializing_if = "skip_zero_disco",
-        deserialize_with = "deserialize_null_to_default"
-    )]
+    /// The client's disco public key. Go has no json tag (always present,
+    /// even when zero — emits `discokey:0000...0000`).
+    #[serde(default, deserialize_with = "deserialize_null_to_default")]
     pub DiscoKey: DiscoPublic,
     /// magicsock UDP endpoints (IP:port). Ignored when `Stream` and Version>=68.
     #[serde(
@@ -276,7 +273,12 @@ pub struct PeerChange {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub Key: Option<NodePublic>,
     /// New signature over the WireGuard public key; `None` means unchanged.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Go marshals `[]byte` as base64.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::base64_bytes"
+    )]
     pub KeySignature: Option<Vec<u8>>,
     /// New disco key; `None` means unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -363,14 +365,17 @@ mod tests {
     }
 
     #[test]
-    fn map_request_omits_zero_disco() {
+    fn map_request_emits_zero_disco() {
         let req = MapRequest {
             Version: 1,
             NodeKey: NodePrivate::generate().public(),
             ..Default::default()
         };
         let j = serde_json::to_string(&req).unwrap();
-        assert!(!j.contains("\"DiscoKey\""), "zero disco omitted");
+        assert!(
+            j.contains("\"DiscoKey\":\"discokey:"),
+            "zero DiscoKey is always emitted (matches Go)"
+        );
     }
 
     #[test]

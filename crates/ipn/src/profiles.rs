@@ -362,7 +362,7 @@ impl ProfileManager {
     pub fn set_prefs(&mut self, prefs: Prefs) -> Result<(), std::io::Error> {
         self.prefs = prefs;
         self.prefs.save(&self.state_dir)?;
-        if let Some(ref profile) = self.current_profile() {
+        if let Some(profile) = self.current_profile() {
             if let Some(ref hook) = self.state_change_hook {
                 hook(profile, &self.prefs);
             }
@@ -557,7 +557,7 @@ mod tests {
     #[test]
     fn profile_manager_switch_not_found() {
         let tmp = tempfile::tempdir().unwrap();
-        let pm = ProfileManager::new(tmp.path()).unwrap();
+        let mut pm = ProfileManager::new(tmp.path()).unwrap();
         let err = pm.switch_profile("nonexistent").unwrap_err();
         assert!(matches!(err, ProfileError::NotFound(_)));
     }

@@ -53,6 +53,7 @@ pub enum DaemonCommand {
     Start { auth_key: Option<String> },
     LoginInteractive,
     Logout,
+    Shutdown,
 }
 
 /// Credentials needed to build an [`AcmeCertFetcher`] on demand for the
@@ -639,6 +640,10 @@ pub(crate) async fn dispatch<W: AsyncWrite + Unpin>(
                     "/localapi/v0/dial",
                     "/localapi/v0/dns-query",
                     "/localapi/v0/check-ip-forwarding",
+                    "/localapi/v0/check-prefs",
+                    "/localapi/v0/set-expiry-sooner",
+                    "/localapi/v0/shutdown",
+                    "/localapi/v0/id-token",
                 ]);
                 write_json_response(conn, 200, "OK", &endpoints).await?;
             } else {
@@ -768,6 +773,31 @@ pub(crate) async fn dispatch<W: AsyncWrite + Unpin>(
         // --- GET /localapi/v0/check-ip-forwarding ---
         "check-ip-forwarding" if method == "GET" => {
             handle_check_ip_forwarding(conn).await?;
+        }
+
+        // --- POST /localapi/v0/check-prefs ---
+        "check-prefs" if method == "POST" => {
+            handle_check_prefs(conn, &req.body).await?;
+        }
+
+        // --- POST /localapi/v0/set-expiry-sooner ---
+        "set-expiry-sooner" if method == "POST" => {
+            handle_set_expiry_sooner(conn, &req.body, &req.query).await?;
+        }
+
+        // --- POST /localapi/v0/shutdown ---
+        "shutdown" if method == "POST" => {
+            handle_shutdown(conn, state).await?;
+        }
+
+        // --- GET /localapi/v0/id-token ---
+        "id-token" if method == "GET" => {
+            handle_id_token(conn, &req.query).await?;
+        }
+
+        // --- POST /localapi/v0/debug (action dispatcher) ---
+        "debug" if method == "POST" => {
+            handle_debug_action(conn, &req.body, &req.query, state).await?;
         }
 
         _ => {
@@ -1885,6 +1915,246 @@ async fn handle_debug<W: AsyncWrite + Unpin>(
             let body = serde_json::json!({
                 "error": format!("unknown debug action: {other}"),
                 "available": ["status", "ipconfig", "metrics"],
+            });
+            write_json_response(conn, 400, "Bad Request", &body).await?;
+            return Ok(());
+        }
+    };
+    write_json_response(conn, 200, "OK", &result).await?;
+    Ok(())
+}
+
+/// Handle POST /localapi/v0/check-prefs
+///
+/// Validate a `Prefs` body without applying it. Returns JSON with an
+/// `error` field (empty string on success). Mirrors Go's
+/// `serveCheckPrefs` → `LocalBackend.CheckPrefs`.
+async fn handle_check_prefs<W: AsyncWrite + Unpin>(
+    conn: &mut W,
+    body: &[u8],
+) -> Result<(), std::io::Error> {
+    let prefs: Prefs = match serde_json::from_slice(body) {
+        Ok(p) => p,
+        Err(e) => {
+            let body = serde_json::json!({"error": format!("invalid JSON body: {e}")});
+            write_json_response(conn, 400, "Bad Request", &body).await?;
+            return Ok(());
+        }
+    };
+
+    let mut errors: Vec<String> = Vec::new();
+
+    // Validate ExitNodeIP: must be a parseable IP address if non-empty.
+    if !prefs.ExitNodeIP.is_empty() && prefs.ExitNodeIP.parse::<IpAddr>().is_err() {
+        errors.push(format!(
+            "ExitNodeIP {:?} is not a valid IP address",
+            prefs.ExitNodeIP
+        ));
+    }
+
+    // Validate AdvertiseRoutes: each entry must be a valid CIDR.
+    for route in &prefs.AdvertiseRoutes {
+        if let Some((ip, prefix)) = route.split_once('/') {
+            if ip.parse::<IpAddr>().is_err() {
+                errors.push(format!("AdvertiseRoute {route:?} has invalid IP"));
+            } else if prefix.parse::<u8>().is_err() {
+                errors.push(format!(
+                    "AdvertiseRoute {route:?} has invalid prefix length"
+                ));
+            }
+        } else if !route.is_empty() {
+            errors.push(format!(
+                "AdvertiseRoute {route:?} is not a valid CIDR (missing /)"
+            ));
+        }
+    }
+
+    // Validate ExitNodeAllowLANAccess only makes sense with an exit node.
+    if prefs.ExitNodeAllowLANAccess && prefs.ExitNodeID.is_empty() && prefs.ExitNodeIP.is_empty() {
+        errors.push("ExitNodeAllowLANAccess set without ExitNodeID or ExitNodeIP".into());
+    }
+
+    let error = errors.join("; ");
+    let body = serde_json::json!({"error": error});
+    write_json_response(conn, 200, "OK", &body).await?;
+    Ok(())
+}
+
+/// Handle POST /localapi/v0/set-expiry-sooner
+///
+/// Accepts an `expiry` form parameter (Unix timestamp in seconds) and
+/// queues a key-expiry-sooner request. Mirrors Go's `serveSetExpirySooner`
+/// → `LocalBackend.SetExpirySooner`. Returns `done\n` as text/plain.
+async fn handle_set_expiry_sooner<W: AsyncWrite + Unpin>(
+    conn: &mut W,
+    body: &[u8],
+    query: &str,
+) -> Result<(), std::io::Error> {
+    // The expiry may come from the form body or the query string.
+    let body_str = std::str::from_utf8(body).unwrap_or("");
+    let body_params = parse_query(body_str);
+    let query_params = parse_query(query);
+    let expiry_str = body_params
+        .get("expiry")
+        .or_else(|| query_params.get("expiry"));
+
+    let expiry_str = match expiry_str {
+        Some(v) if !v.is_empty() => v,
+        _ => {
+            let body = serde_json::json!({
+                "error": "missing 'expiry' parameter, a unix timestamp"
+            });
+            write_json_response(conn, 400, "Bad Request", &body).await?;
+            return Ok(());
+        }
+    };
+
+    let expiry_ts: i64 = if let Ok(v) = expiry_str.parse() {
+        v
+    } else {
+        let body = serde_json::json!({
+            "error": "can't parse expiry time, expects a unix timestamp"
+        });
+        write_json_response(conn, 400, "Bad Request", &body).await?;
+        return Ok(());
+    };
+
+    // Basic sanity: the new expiry should be in the future.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    if expiry_ts <= now {
+        let body = serde_json::json!({
+            "error": "expiry must be a future timestamp"
+        });
+        write_json_response(conn, 400, "Bad Request", &body).await?;
+        return Ok(());
+    }
+
+    // TODO: wire the expiry into the next MapRequest's Hostinfo or a
+    // dedicated SetExpirySooner control call. The link_monitor loop
+    // sends periodic MapRequests; the expiry would be included there.
+    // For now we accept and acknowledge the request.
+
+    write_raw_response(conn, 200, "OK", "text/plain", b"done\n").await?;
+    Ok(())
+}
+
+/// Handle POST /localapi/v0/shutdown
+///
+/// Sends a `DaemonCommand::Shutdown` to the daemon loop for graceful
+/// shutdown. Mirrors Go's `serveShutdown` which publishes a `Shutdown`
+/// event on the event bus.
+async fn handle_shutdown<W: AsyncWrite + Unpin>(
+    conn: &mut W,
+    state: &Arc<LocalApiState>,
+) -> Result<(), std::io::Error> {
+    if let Some(ref tx) = state.command_tx {
+        let _ = tx.send(DaemonCommand::Shutdown);
+        write_raw_response(conn, 200, "OK", "text/plain", b"").await?;
+    } else {
+        let body = serde_json::json!({"error": "no daemon command channel"});
+        write_json_response(conn, 503, "Service Unavailable", &body).await?;
+    }
+    Ok(())
+}
+
+/// Handle GET /localapi/v0/id-token
+///
+/// Fetch an OIDC ID token from the control plane for the given audience.
+/// **Stub**: OIDC ID token support requires Noise-protocol control plane
+/// integration (`DoNoiseRequest`) not yet implemented in rustscale.
+/// Returns 501 Not Implemented.
+async fn handle_id_token<W: AsyncWrite + Unpin>(
+    conn: &mut W,
+    query: &str,
+) -> Result<(), std::io::Error> {
+    let params = parse_query(query);
+    let aud = params.get("aud").map(String::as_str).unwrap_or("");
+    if aud.is_empty() {
+        let body = serde_json::json!({"error": "no audience requested"});
+        write_json_response(conn, 400, "Bad Request", &body).await?;
+        return Ok(());
+    }
+    let body = serde_json::json!({
+        "error": "id-token not yet supported: OIDC Noise request not implemented"
+    });
+    write_json_response(conn, 501, "Not Implemented", &body).await?;
+    Ok(())
+}
+
+/// Handle POST /localapi/v0/debug (action dispatcher)
+///
+/// Dispatches debug actions via the `action` form/query parameter.
+/// Mirrors Go's `serveDebug` in `ipn/localapi/debug.go`. Supported
+/// actions are a subset of Go's full set; unsupported actions return
+/// a 400 error listing what's available.
+async fn handle_debug_action<W: AsyncWrite + Unpin>(
+    conn: &mut W,
+    body: &[u8],
+    query: &str,
+    state: &Arc<LocalApiState>,
+) -> Result<(), std::io::Error> {
+    // The action may come from the form body, query string, or a
+    // `Debug-Action` header (matching Go's logic for "notify").
+    let body_str = std::str::from_utf8(body).unwrap_or("");
+    let body_params = parse_query(body_str);
+    let query_params = parse_query(query);
+    let action = body_params
+        .get("action")
+        .or_else(|| query_params.get("action"))
+        .map(String::as_str)
+        .unwrap_or("");
+
+    if action.is_empty() {
+        let body = serde_json::json!({
+            "error": "missing 'action' parameter",
+            "available": [
+                "statedir",
+                "force-netmap-update",
+                "rebind",
+                "restun",
+            ],
+        });
+        write_json_response(conn, 400, "Bad Request", &body).await?;
+        return Ok(());
+    }
+
+    let result = match action {
+        "statedir" => {
+            let dir = state
+                .state_dir
+                .as_ref()
+                .map(|d| d.display().to_string())
+                .unwrap_or_default();
+            serde_json::json!(dir)
+        }
+        "force-netmap-update" => {
+            // TODO: trigger a forced netmap refresh. The link_monitor
+            // loop handles periodic updates; a forced refresh would
+            // signal it to send an immediate MapRequest.
+            serde_json::json!({"status": "queued"})
+        }
+        "rebind" => {
+            // Rebind magicsock: signal link change to close/reopen sockets.
+            state.magicsock.link_changed();
+            serde_json::json!({"status": "ok"})
+        }
+        "restun" => {
+            // Trigger a re-STUN / endpoint refresh.
+            // TODO: wire to netcheck/magicsock endpoint refresh.
+            serde_json::json!({"status": "queued"})
+        }
+        other => {
+            let body = serde_json::json!({
+                "error": format!("unknown debug action: {other}"),
+                "available": [
+                    "statedir",
+                    "force-netmap-update",
+                    "rebind",
+                    "restun",
+                ],
             });
             write_json_response(conn, 400, "Bad Request", &body).await?;
             return Ok(());

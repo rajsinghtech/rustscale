@@ -342,6 +342,7 @@ fn sample_register_response() -> RegisterResponse {
         NodeKeyExpired: false,
         MachineAuthorized: true,
         AuthURL: "https://login.tailscale.com/a/x".into(),
+        NodeKeySignature: None,
         Error: String::new(),
     }
 }

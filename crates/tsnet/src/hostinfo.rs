@@ -80,8 +80,14 @@ pub fn populate_hostinfo(mut hi: Hostinfo) -> Hostinfo {
     if hi.Package.is_empty() {
         hi.Package = PACKAGE.to_string();
     }
+    if hi.App.is_empty() {
+        hi.App = PACKAGE.to_string();
+    }
     if hi.GoArch.is_empty() {
         hi.GoArch = std::env::consts::ARCH.to_string();
+    }
+    if hi.GoArchVar.is_empty() {
+        hi.GoArchVar = go_arch_var();
     }
     if hi.GoVersion.is_empty() {
         hi.GoVersion = rustc_version();
@@ -203,34 +209,110 @@ pub fn shared_overrides() -> SharedOverrides {
 
 // ─── Runtime field population ─────────────────────────────────────────
 
+/// Runtime context for `Hostinfo` fields that platform detection cannot
+/// determine on its own. Built by the caller from `Prefs`, the serve
+/// config, and the netmap. Fields default to "not set" / `false` / empty
+/// so callers only populate what they have.
+///
+/// All fields are applied unconditionally (overwriting any value already
+/// in the `Hostinfo`), except `exit_node_id` and `request_tags` which are
+/// only applied when non-empty.
+#[derive(Clone, Debug, Default)]
+pub struct HostinfoRuntime {
+    /// `StableNodeID` of the currently selected exit node. Empty / `None`
+    /// when no exit node is selected or the peer is not found.
+    pub exit_node_id: Option<StableNodeID>,
+    /// `true` when a Funnel listener is active (any `AllowFunnel` entry
+    /// in the serve config is `true`). Sets `Hostinfo.IngressEnabled`.
+    pub ingress_enabled: bool,
+    /// `true` when the serve config has funnel configured but not active.
+    /// Sets `Hostinfo.WireIngress` (only when `ingress_enabled` is false,
+    /// matching Go's logic).
+    pub wire_ingress: bool,
+    /// From `Prefs.ShieldsUp` — whether the host blocks inbound connections.
+    pub shields_up: bool,
+    /// From `Prefs.AutoUpdate` — whether the node opted into remote updates.
+    pub allows_update: bool,
+    /// From `Prefs.AppConnector.Advertise` — whether the app-connector
+    /// service is active.
+    pub app_connector: bool,
+    /// From `Prefs.AdvertiseTags` — ACL tags this node wants to claim.
+    /// Only applied if `Hostinfo.RequestTags` is still empty (hooks may
+    /// have already set them).
+    pub request_tags: Vec<String>,
+    /// Whether the client runs in userspace (netstack) mode. Always `true`
+    /// for tsnet.
+    pub userspace: bool,
+    /// Whether the client's subnet router runs in userspace mode. Always
+    /// `true` for tsnet.
+    pub userspace_router: bool,
+    /// Whether the client is willing to relay traffic for other peers.
+    pub peer_relay: bool,
+}
+
 /// Apply tsnet-runtime fields to a `Hostinfo` that platform detection
-/// cannot determine on its own:
+/// cannot determine on its own. Mirrors Go's `ipn/ipnlocal/local.go`
+/// hostinfo building path.
 ///
-/// - `ExitNodeID`: the StableNodeID of the currently selected exit node,
-///   looked up from the peer list by node key. Empty when no exit node is
-///   selected or the peer is not found.
-/// - `IngressEnabled`: `true` when a Funnel listener is active (any
-///   `AllowFunnel` entry in the serve config is `true`).
-/// - `ShieldsUp`: set from `Prefs.ShieldsUp` so the control plane knows
-///   whether to block inbound connections. Mirrors Go's
-///   `ipn/ipnlocal/local.go` hostinfo building path.
+/// The following fields are set from [`HostinfoRuntime`]:
 ///
-/// Device-specific fields (`PushDeviceToken`, `TPM`, `StateEncrypted`) are
-/// left at their defaults — they require platform APIs not available in the
-/// tsnet embedding layer.
-pub fn apply_runtime_fields(
-    hi: &mut Hostinfo,
-    exit_node_id: Option<&StableNodeID>,
-    ingress_enabled: bool,
-    shields_up: bool,
-) {
-    if let Some(id) = exit_node_id {
+/// - `ExitNodeID`: from the selected exit node's `StableNodeID`.
+/// - `IngressEnabled`: `true` when a Funnel listener is active.
+/// - `WireIngress`: `true` when funnel is configured but not active.
+/// - `ShieldsUp`: from `Prefs.ShieldsUp`.
+/// - `AllowsUpdate`: from `Prefs.AutoUpdate`.
+/// - `AppConnector`: `OptBool::True` when the app-connector is advertised.
+/// - `RequestTags`: from `Prefs.AdvertiseTags` (only if not already set).
+/// - `Userspace`: `OptBool::True` for tsnet (always userspace mode).
+/// - `UserspaceRouter`: `OptBool::True` for tsnet.
+/// - `PeerRelay`: from the runtime config.
+/// - `ServicesHash`: computed from `Hostinfo.Services` when non-empty.
+///
+/// Fields that require platform APIs not available in the tsnet embedding
+/// layer are left at their defaults — see TODO comments on the struct.
+pub fn apply_runtime_fields(hi: &mut Hostinfo, rt: &HostinfoRuntime) {
+    if let Some(ref id) = rt.exit_node_id {
         if !id.is_empty() {
             hi.ExitNodeID.clone_from(id);
         }
     }
-    hi.IngressEnabled = ingress_enabled;
-    hi.ShieldsUp = shields_up;
+    hi.IngressEnabled = rt.ingress_enabled;
+    // WireIngress is only meaningful when IngressEnabled is false — when
+    // funnel is active, IngressEnabled implies the wiring is done.
+    hi.WireIngress = !rt.ingress_enabled && rt.wire_ingress;
+    hi.ShieldsUp = rt.shields_up;
+    hi.AllowsUpdate = rt.allows_update;
+    if rt.app_connector {
+        hi.AppConnector = OptBool::new(true);
+    }
+    if !rt.request_tags.is_empty() && hi.RequestTags.is_empty() {
+        hi.RequestTags.clone_from(&rt.request_tags);
+    }
+    if rt.userspace {
+        hi.Userspace = OptBool::new(true);
+    }
+    if rt.userspace_router {
+        hi.UserspaceRouter = OptBool::new(true);
+    }
+    hi.PeerRelay = rt.peer_relay;
+
+    // ServicesHash: opaque hash of the Services list so control can tell
+    // the client to re-fetch via c2n when services change.
+    if !hi.Services.is_empty() {
+        hi.ServicesHash = services_hash(&hi.Services);
+    }
+
+    // TODO(tsnet): The following fields require platform APIs or data not
+    // available in the embedding layer:
+    // - FrontendLogID / BackendLogID: need logtail integration
+    // - PushDeviceToken: APNs/FCM platform notification API
+    // - SSH_HostKeys: SSH server not yet implemented in rustscale
+    // - NoLogsNoSupport: not tracked in Prefs yet
+    // - ShareeNode: needs netmap ownership context
+    // - Location: platform-specific GPS/IP geolocation
+    // - TPM: TPM 2.0 platform API
+    // - StateEncrypted: platform-specific encrypted state storage
+    // - WoLMACs: Wake-on-LAN not implemented
 }
 
 /// Collect a full `Hostinfo`: apply overrides, run platform detection, then
@@ -240,16 +322,26 @@ pub fn apply_runtime_fields(
 pub fn collect_hostinfo(
     base: Hostinfo,
     overrides: &HostinfoOverrides,
-    exit_node_id: Option<&StableNodeID>,
-    ingress_enabled: bool,
-    shields_up: bool,
+    rt: &HostinfoRuntime,
 ) -> Hostinfo {
     let mut hi = base;
     overrides.apply(&mut hi);
     hi = populate_hostinfo(hi);
-    apply_runtime_fields(&mut hi, exit_node_id, ingress_enabled, shields_up);
+    apply_runtime_fields(&mut hi, rt);
     run_hostinfo_hooks(&mut hi);
     hi
+}
+
+/// Compute an opaque hash of the `Services` list. A change in hash signals
+/// the control server should tell the client to re-fetch service config via
+/// c2n. Uses the JSON serialization for determinism.
+fn services_hash(services: &[rustscale_tailcfg::Service]) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let json = serde_json::to_string(services).unwrap_or_default();
+    let mut hasher = DefaultHasher::new();
+    json.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 // ─── Hostinfo content hash (for update dedup) ─────────────────────────
@@ -1007,6 +1099,51 @@ fn rustc_version() -> String {
     option_env!("RUSTC_VERSION").unwrap_or("rust").to_string()
 }
 
+// ─── Architecture variant ─────────────────────────────────────────────
+
+/// Returns the architecture variant string, analogous to Go's
+/// `GOARCH`-specific variant (GOARM, GOAMD64, etc.). Detected from
+/// compile-time `target_feature` cfg flags.
+fn go_arch_var() -> String {
+    // x86_64 microarchitecture levels (mirrors Go's GOAMD64=v1–v4).
+    #[cfg(target_arch = "x86_64")]
+    {
+        if cfg!(target_feature = "avx512f") {
+            "v4".to_string()
+        } else if cfg!(target_feature = "avx2") {
+            "v3".to_string()
+        } else if cfg!(target_feature = "sse4.2") {
+            "v2".to_string()
+        } else {
+            "v1".to_string()
+        }
+    }
+    // ARM64: report the FP/SIMD level.
+    #[cfg(target_arch = "aarch64")]
+    {
+        if cfg!(target_feature = "sve") {
+            "sve".to_string()
+        } else {
+            String::new()
+        }
+    }
+    // ARM 32-bit: report the ARM version (GOARM=7, 6, 5).
+    #[cfg(target_arch = "arm")]
+    {
+        if cfg!(target_feature = "v7") {
+            "7".to_string()
+        } else if cfg!(target_feature = "v6") {
+            "6".to_string()
+        } else {
+            "5".to_string()
+        }
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "arm",)))]
+    {
+        String::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1518,7 +1655,7 @@ VERSION_ID='11'"#;
             ..Default::default()
         };
         let ov = HostinfoOverrides::default();
-        let hi = collect_hostinfo(base, &ov, None, false, false);
+        let hi = collect_hostinfo(base, &ov, &HostinfoRuntime::default());
         // Our hook should have added the unique tag.
         assert!(hi
             .RequestTags
@@ -1550,7 +1687,7 @@ VERSION_ID='11'"#;
             ..Default::default()
         };
         let ov = HostinfoOverrides::default();
-        let hi = collect_hostinfo(base, &ov, None, false, false);
+        let hi = collect_hostinfo(base, &ov, &HostinfoRuntime::default());
         // If hooks ran in registration order, PushDeviceToken == m1 and
         // DeviceModel == m2. If hook-2 ran before hook-1, DeviceModel
         // would NOT be m2.
@@ -1736,7 +1873,7 @@ VERSION_ID='11'"#;
             ..Default::default()
         };
         let ov = HostinfoOverrides::default();
-        let hi = collect_hostinfo(hi, &ov, None, false, false);
+        let hi = collect_hostinfo(hi, &ov, &HostinfoRuntime::default());
         // No override → detection fills in the field.
         assert_eq!(hi.Package, "tsnet");
     }
@@ -1745,7 +1882,13 @@ VERSION_ID='11'"#;
     fn test_runtime_fields_exit_node_id() {
         let mut hi = Hostinfo::default();
         let exit_id: StableNodeID = "nodeABC".into();
-        apply_runtime_fields(&mut hi, Some(&exit_id), false, false);
+        apply_runtime_fields(
+            &mut hi,
+            &HostinfoRuntime {
+                exit_node_id: Some(exit_id),
+                ..Default::default()
+            },
+        );
         assert_eq!(hi.ExitNodeID, "nodeABC");
         assert!(!hi.IngressEnabled);
     }
@@ -1753,7 +1896,13 @@ VERSION_ID='11'"#;
     #[test]
     fn test_runtime_fields_ingress_enabled() {
         let mut hi = Hostinfo::default();
-        apply_runtime_fields(&mut hi, None, true, false);
+        apply_runtime_fields(
+            &mut hi,
+            &HostinfoRuntime {
+                ingress_enabled: true,
+                ..Default::default()
+            },
+        );
         assert!(hi.IngressEnabled);
         assert!(hi.ExitNodeID.is_empty());
     }
@@ -1762,7 +1911,13 @@ VERSION_ID='11'"#;
     fn test_runtime_fields_empty_exit_id_not_set() {
         let mut hi = Hostinfo::default();
         let empty: StableNodeID = String::new();
-        apply_runtime_fields(&mut hi, Some(&empty), false, false);
+        apply_runtime_fields(
+            &mut hi,
+            &HostinfoRuntime {
+                exit_node_id: Some(empty),
+                ..Default::default()
+            },
+        );
         assert!(
             hi.ExitNodeID.is_empty(),
             "empty StableNodeID should not be set"
@@ -1877,7 +2032,15 @@ VERSION_ID='11'"#;
             ..Default::default()
         };
         let exit_id: StableNodeID = "nodeExit42".into();
-        let hi = collect_hostinfo(base, &ov, Some(&exit_id), true, false);
+        let hi = collect_hostinfo(
+            base,
+            &ov,
+            &HostinfoRuntime {
+                exit_node_id: Some(exit_id),
+                ingress_enabled: true,
+                ..Default::default()
+            },
+        );
         assert_eq!(hi.DeviceModel, "Synology DS920+");
         assert_eq!(hi.ExitNodeID, "nodeExit42");
         assert!(hi.IngressEnabled);
@@ -1889,14 +2052,20 @@ VERSION_ID='11'"#;
     #[test]
     fn test_apply_runtime_fields_shields_up() {
         let mut hi = Hostinfo::default();
-        apply_runtime_fields(&mut hi, None, false, true);
+        apply_runtime_fields(
+            &mut hi,
+            &HostinfoRuntime {
+                shields_up: true,
+                ..Default::default()
+            },
+        );
         assert!(hi.ShieldsUp);
     }
 
     #[test]
     fn test_apply_runtime_fields_shields_down() {
         let mut hi = Hostinfo::default();
-        apply_runtime_fields(&mut hi, None, false, false);
+        apply_runtime_fields(&mut hi, &HostinfoRuntime::default());
         assert!(!hi.ShieldsUp);
     }
 
@@ -1907,7 +2076,14 @@ VERSION_ID='11'"#;
             ..Default::default()
         };
         let ov = HostinfoOverrides::default();
-        let hi = collect_hostinfo(base, &ov, None, false, true);
+        let hi = collect_hostinfo(
+            base,
+            &ov,
+            &HostinfoRuntime {
+                shields_up: true,
+                ..Default::default()
+            },
+        );
         assert!(hi.ShieldsUp);
     }
 }

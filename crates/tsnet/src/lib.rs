@@ -83,7 +83,8 @@ pub use tls::{
 };
 
 pub use hostinfo::{
-    collect_hostinfo, hostinfo_hash, populate_hostinfo, HostinfoOverrides, SharedOverrides,
+    collect_hostinfo, hostinfo_hash, populate_hostinfo, HostinfoOverrides, HostinfoRuntime,
+    SharedOverrides,
 };
 
 #[cfg(feature = "ssh")]

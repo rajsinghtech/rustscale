@@ -10,65 +10,34 @@
 //! program against the Tailscale Go repo). See `fixtures/README.md` for
 //! regeneration instructions.
 //!
-//! Known wire-compat bugs found during fixture creation (documented here,
-//! not fixed per phase spec — do NOT modify existing crates):
+//! Known wire-compat bugs found during fixture creation — all fixed:
 //!
-//! 1. **RegisterRequest is missing Go fields `NLKey` and `NodeKeySignature`**.
-//!    Go's `NLKey key.NLPublic` has no json tag (always present) and
-//!    `NodeKeySignature tkatype.MarshaledSignature` has no json tag (always
-//!    present as `null` when nil). rustscale's `RegisterRequest` doesn't
-//!    model either field. Tests for these fixtures use subset comparison
-//!    (only checks fields Rust knows about).
+//! 1. **RegisterRequest was missing Go fields `NLKey` and `NodeKeySignature`**.
+//!    Fixed: added `NLKey: NLPublic` (serializes as `nlpub:<hex>`) and
+//!    `NodeKeySignature: Option<Vec<u8>>` (base64, always present).
 //!
-//! 2. **RegisterResponse is missing Go field `NodeKeySignature`**. Same
-//!    issue as above. Test uses subset comparison.
+//! 2. **RegisterResponse was missing Go field `NodeKeySignature`**.
+//!    Fixed: added `NodeKeySignature: Option<Vec<u8>>` (base64, always present).
 //!
-//! 3. **SSH types use PascalCase JSON keys in Rust but camelCase in Go**.
-//!    Go's SSH types have explicit json tags like `json:"rules"`,
-//!    `json:"principals"`, `json:"sshUsers"`, `json:"action"`, etc.
-//!    rustscale's SSH types have NO `#[serde(rename)]` attributes and rely
-//!    on `#![allow(non_snake_case)]`, producing `"Rules"`, `"Principals"`,
-//!    `"SSHUsers"`, `"Action"`, etc. This is a fundamental wire-compat
-//!    break. The `ssh_policy_full.json` fixture is hand-constructed using
-//!    Rust's PascalCase keys (not Go-generated) to verify Rust roundtrips
-//!    its own format. Go interop would fail.
+//! 3. **SSH types used PascalCase JSON keys in Rust but camelCase in Go**.
+//!    Fixed: added `#[serde(rename)]` attributes matching Go's json tags.
 //!
-//! 4. **SSHAction.SessionDuration uses seconds in Rust but nanoseconds in
-//!    Go**. Go's `time.Duration` marshals as raw nanoseconds (int64), but
-//!    rustscale's `duration_secs` module serializes as seconds. The SSH
-//!    fixture leaves SessionDuration at zero (both omit it).
+//! 4. **SSHAction.SessionDuration used seconds in Rust but nanoseconds in Go**.
+//!    Fixed: changed `duration_secs` to `duration_nanos` (i64 nanoseconds).
 //!
-//! 5. **FilterRule.SrcIPs has no json tag in Go (always present) but
-//!    `skip_serializing_if = "Vec::is_empty"` in Rust**. Go always emits
-//!    `"SrcIPs":null` (nil) or `"SrcIPs":[]` (empty) or `"SrcIPs":[...]`,
-//!    but Rust omits when empty. The `filter_full.json` fixture uses
-//!    non-empty SrcIPs to avoid triggering this mismatch.
+//! 5. **FilterRule.SrcIPs had `skip_serializing_if = Vec::is_empty` but Go
+//!    always emits**. Fixed: removed the skip rule.
 //!
-//! 6. **Hostinfo field order differs**. Go's struct has
-//!    `GoVersion → RoutableIPs → RequestTags → WoLMACs → Services → NetInfo
-//!    → SSH_HostKeys`, but Rust's struct has `GoVersion → Services →
-//!    RoutableIPs → RequestTags → WoLMACs → SSH_HostKeys → NetInfo`. The
-//!    `canonical_json` comparison uses `serde_json::Value` (BTreeMap,
-//!    alphabetically sorted keys) which normalizes key order, so this
-//!    field-order bug is NOT caught by these tests. It should be fixed by
-//!    reordering Rust struct fields to match Go.
+//! 6. **Hostinfo field order differed from Go**. Fixed: reordered to match
+//!    Go's struct field order.
 //!
-//! 7. **MapRequest.DiscoKey has no json tag in Go (always present) but
-//!    `skip_serializing_if = "skip_zero_disco"` in Rust**. Go always emits
-//!    DiscoKey (even when zero), but Rust omits the zero key. Fixtures use
-//!    a non-zero DiscoKey to avoid triggering this.
+//! 7. **MapRequest.DiscoKey had `skip_serializing_if = skip_zero_disco` but
+//!    Go always emits**. Fixed: removed the skip rule.
 //!
-//! 8. **Node.KeySignature serializes as base64 in Go but as a JSON array
-//!    in Rust**. Go's `tkatype.MarshaledSignature` (`[]byte`) marshals as
-//!    a base64 string (`"3q2+7w=="`), but Rust's `Option<Vec<u8>>` uses
-//!    serde's default `Vec<u8>` serialization which produces a JSON array
-//!    (`[222,173,190,239]`). Fixtures leave KeySignature nil/None (both
-//!    omit it) to avoid triggering this. Fix: use `serde_bytes` or a
-//!    base64 custom serializer for `KeySignature`.
+//! 8. **Node.KeySignature serialized as JSON array in Rust but base64 in Go**.
+//!    Fixed: added `base64_bytes` serde helper for `Option<Vec<u8>>`.
 
-use rustscale_wire_fixture::{
-    assert_binary_roundtrip, assert_json_roundtrip, assert_json_subset_roundtrip,
-};
+use rustscale_wire_fixture::{assert_binary_roundtrip, assert_json_roundtrip};
 
 // ─── JSON fixture tests (Go-generated, byte-identical comparison) ───
 
@@ -170,32 +139,24 @@ fn null_slice() {
     assert_json_roundtrip::<rustscale_tailcfg::MapResponse>(json);
 }
 
-// ─── JSON fixture tests (subset comparison for types with Go-only fields) ───
-//
-// These types have Go fields without omitempty that rustscale doesn't model.
-// The subset comparison verifies that every field Rust DOES know about
-// matches Go's value, but doesn't fail on extra Go-only fields.
+// ─── JSON fixture tests (previously subset, now full roundtrip) ───
 
 #[test]
 fn register_request_full() {
     let json = include_str!("../fixtures/register_request_full.json");
-    // Go-only fields: NLKey (no tag, always present), NodeKeySignature
-    // (no tag, always present as null). See bug #1 in module docs.
-    assert_json_subset_roundtrip::<rustscale_tailcfg::RegisterRequest>(json);
+    assert_json_roundtrip::<rustscale_tailcfg::RegisterRequest>(json);
 }
 
 #[test]
 fn register_request_minimal() {
     let json = include_str!("../fixtures/register_request_minimal.json");
-    assert_json_subset_roundtrip::<rustscale_tailcfg::RegisterRequest>(json);
+    assert_json_roundtrip::<rustscale_tailcfg::RegisterRequest>(json);
 }
 
 #[test]
 fn register_response_full() {
     let json = include_str!("../fixtures/register_response_full.json");
-    // Go-only field: NodeKeySignature (no tag, always present as null).
-    // See bug #2 in module docs.
-    assert_json_subset_roundtrip::<rustscale_tailcfg::RegisterResponse>(json);
+    assert_json_roundtrip::<rustscale_tailcfg::RegisterResponse>(json);
 }
 
 // ─── JSON fixture tests (hand-constructed) ───

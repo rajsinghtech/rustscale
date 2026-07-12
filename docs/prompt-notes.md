@@ -211,6 +211,18 @@ cites the session that surfaced it.
 12. For long background builds, do NOT background-then-poll with `sleep`.
     Either run foreground with a timeout, or use `tools/wait-build.sh`.
 
+## 2026-07-11: Cargo.lock conflict auto-resolution in worktree-merge.sh
+
+**Symptom**: Parallel worktree agents adding workspace dependency lines
+caused Cargo.toml + Cargo.lock merge conflicts.
+
+**Fix**: `tools/agent/worktree-merge.sh` now auto-resolves Cargo.lock
+conflicts by accepting `--theirs` for Cargo.lock, union-merging Cargo.toml
+(keeping both sides' deps), regenerating with `cargo generate-lockfile`,
+and re-running checks before finalizing the merge. It also runs
+`cargo fmt --all --check` post-merge with a hint if formatting drift is
+found. Orchestrators can merge without manual conflict resolution.
+
 ## 2026-07-11: Empty-first-turn investigation (toolsmith-openocode-perms)
 
 **Symptom**: Build agents frequently produce empty assistant turns (reasoning

@@ -27,7 +27,7 @@ tools/agent/opencode-task.sh --continue <sessionID> "fix ..." [deadline_secs]
 - Exit 3 = watchdog aborted at the deadline (prints the sessionID — inspect partial work
   on disk, then `--continue` that session).
 - The server is auto-started on 127.0.0.1:4096 if not running (`/tmp/opencode-serve.log`).
-- Model default: `ai/vercel-ent/zai/glm-5.2` (override with OPENCODE_PROVIDER/OPENCODE_MODEL).
+- Model default: `vercel-ent/zai/glm-5.2` (override with OPENCODE_PROVIDER/OPENCODE_MODEL).
 - Under the hood: `POST /session?directory=...` (with `permission:[{permission:"*",pattern:"*",action:"allow"}]`),
   `POST /session/:id/prompt_async` (204, non-blocking), poll `/session/status` +
   `/session/:id/message`, `POST /session/:id/abort` on deadline.
@@ -63,7 +63,7 @@ Regularly (after every 1–2 phases) launch a separate opencode agent whose ONLY
 review past session logs and improve tooling to save tokens:
 
 ```bash
-opencode run -m ai/vercel-ent/zai/glm-5.2 --auto \
+opencode run -m vercel-ent/zai/glm-5.2 --auto \
   --dir /Users/rajsingh/Documents/GitHub/rustscale \
   --title "toolsmith-$(date +%Y%m%d)" \
   "Read docs/toolsmith.md and follow it."

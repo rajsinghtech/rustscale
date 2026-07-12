@@ -59,14 +59,14 @@ Two tiers to save cost on lightweight tasks:
 
 | Model | Used for | Cost |
 |---|---|---|
-| `ai/deepseek/deepseek-v4-flash` | Research, review, docs, toolsmith passes (cheap) | Low |
-| `ai/vercel-ent/zai/glm-5.2` | Complex coding (default) | Standard |
+| `deepseek/deepseek-v4-flash` | Research, review, docs, toolsmith passes (cheap) | Low |
+| `vercel-ent/zai/glm-5.2` | Complex coding (default) | Standard |
 
 Set via `OPENCODE_MODEL` env var, or per-invocation with `--model`:
 
 ```bash
 # Cheap research pass:
-tools/agent/opencode-task.sh --model ai/deepseek/deepseek-v4-flash "phase-9-research" "<prompt>"
+tools/agent/opencode-task.sh --model deepseek/deepseek-v4-flash "phase-9-research" "<prompt>"
 
 # Complex coding (default, explicit):
 tools/agent/opencode-task.sh "phase-10-whois" "<prompt>"

@@ -4,6 +4,8 @@
 # Runs cargo build/test/clippy (or tools/check.sh if present) in the worktree.
 # If green, merges agent/<title> into master (--no-ff), removes the worktree
 # and branch. On red, prints failures and leaves the worktree in place.
+# Auto-resolves Cargo.lock conflicts (union-merges Cargo.toml deps) if the
+# merge fails from parallel-dependency additions across worktree agents.
 set -euo pipefail
 
 TITLE="${1:?usage: worktree-merge.sh <title>}"
@@ -35,9 +37,55 @@ CHECK_OUT=$(cd "$REPO_DIR/$WT_DIR" && run_checks 2>&1) || {
 }
 
 echo "[merge] checks green, merging $WT_BRANCH into master"
-(cd "$REPO_DIR" && git checkout master && git merge --no-ff "$WT_BRANCH" -m "Merge $WT_BRANCH")
+cd "$REPO_DIR"
+git checkout master
+MERGE_EXIT=0
+MERGE_OUT=$(git merge --no-ff "$WT_BRANCH" -m "Merge $WT_BRANCH" 2>&1) || MERGE_EXIT=$?
+
+if [ "$MERGE_EXIT" -ne 0 ]; then
+  CONFLICTED=$(git diff --name-only --diff-filter=U 2>/dev/null || true)
+  if echo "$CONFLICTED" | grep -q '^Cargo\.lock$'; then
+    echo "[merge] Cargo.lock conflict detected — auto-resolving"
+    git checkout --theirs Cargo.lock 2>/dev/null || true
+    if echo "$CONFLICTED" | grep -q '^Cargo\.toml$'; then
+      echo "[merge] Cargo.toml conflict — union-merging (deps kept from both sides)"
+      git show :1:Cargo.toml > /tmp/_cargo_base 2>/dev/null || true
+      git show :2:Cargo.toml > /tmp/_cargo_ours 2>/dev/null || true
+      git show :3:Cargo.toml > /tmp/_cargo_theirs 2>/dev/null || true
+      if [ -f /tmp/_cargo_ours ] && [ -f /tmp/_cargo_base ] && [ -f /tmp/_cargo_theirs ]; then
+        cp /tmp/_cargo_ours Cargo.toml
+        git merge-file --union Cargo.toml /tmp/_cargo_base /tmp/_cargo_theirs 2>/dev/null || true
+        git add Cargo.toml
+      fi
+      rm -f /tmp/_cargo_*
+    fi
+    cargo generate-lockfile 2>/dev/null || cargo update --workspace 2>/dev/null || true
+    git add Cargo.lock
+    echo "[merge] re-running checks after conflict resolution ..."
+    CHECK_OUT=$(run_checks 2>&1) || {
+      echo "$CHECK_OUT"
+      echo "[merge] CHECKS FAILED after conflict resolution — manual resolution needed"
+      echo "[merge]   git status"
+      exit 1
+    }
+    GIT_EDITOR=true git merge --continue --no-edit 2>/dev/null \
+      || git commit -m "Merge $WT_BRANCH (with cargo conflict resolution)" --no-edit 2>/dev/null || true
+  else
+    echo "[merge] MERGE FAILED with conflicts outside Cargo.lock — manual resolution needed"
+    echo "[merge]   conflicted files:"
+    echo "$CONFLICTED"
+    exit "$MERGE_EXIT"
+  fi
+fi
+
+echo "[merge] checking formatting across workspace ..."
+(cargo fmt --all --check 2>&1) || {
+  echo "[merge] WARNING: formatting drift detected in workspace crates."
+  echo "[merge]   Run 'cargo fmt --all' to fix, then commit cleanly."
+  echo "[merge]   (This is a hint — the merge itself succeeded.)"
+}
 
 echo "[merge] cleaning up worktree and branch"
-(cd "$REPO_DIR" && git worktree remove "$WT_DIR" && git branch -d "$WT_BRANCH")
+git worktree remove "$WT_DIR" && git branch -d "$WT_BRANCH"
 
 echo "[merge] done — $WT_BRANCH merged to master"

@@ -118,6 +118,15 @@ pub trait C2nBackend: Send + Sync {
     ) -> Result<(), String> {
         Err("not implemented".into())
     }
+
+    /// TLS certificate status for `domain`. Returns a JSON object mirroring
+    /// Go's `tailcfg.C2NTLSCertInfo`:
+    /// `{ "Valid": bool, "Error": str, "Missing": bool, "Expired": bool,
+    ///    "NotBefore": str, "NotAfter": str }`.
+    /// `None` if cert management is not available.
+    async fn tls_cert_status(&self, _domain: &str) -> Option<serde_json::Value> {
+        None
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -443,6 +452,7 @@ const KNOWN_PATHS: &[&str] = &[
     "/dns",
     "/logtail/flush",
     "/sockstats",
+    "/tls-cert-status",
 ];
 
 fn known_paths() -> serde_json::Value {
@@ -631,6 +641,31 @@ async fn dispatch<W: AsyncWrite + Unpin>(
         return Ok(());
     }
 
+    // --- GET /tls-cert-status → TLS certificate info for a domain ---
+    // Mirrors Go's `handleC2NTLSCertStatus` in ipnlocal/cert.go. Returns
+    // a `C2NTLSCertInfo`-shaped JSON object: Valid, Error, Missing, Expired,
+    // NotBefore, NotAfter. The `domain` query parameter is required.
+    if method == "GET" && path == "/tls-cert-status" {
+        let params = parse_query(&req.query);
+        let domain = params.get("domain").map_or("", String::as_str);
+        if domain.is_empty() {
+            let body = serde_json::json!({"error": "no 'domain'"});
+            write_json_response(conn, 400, "Bad Request", &body).await?;
+            return Ok(());
+        }
+        if let Some(v) = backend.tls_cert_status(domain).await {
+            write_json_response(conn, 200, "OK", &v).await?;
+        } else {
+            let body = serde_json::json!({
+                "Valid": false,
+                "Error": "no certificate",
+                "Missing": true,
+            });
+            write_json_response(conn, 200, "OK", &body).await?;
+        }
+        return Ok(());
+    }
+
     // --- Unknown path ---
     let is_known = KNOWN_PATHS.contains(&path)
         || path.starts_with("/debug/pprof/")
@@ -720,6 +755,17 @@ mod tests {
         ) -> Result<(), String> {
             self.log_level.set(component, until);
             Ok(())
+        }
+        async fn tls_cert_status(&self, domain: &str) -> Option<serde_json::Value> {
+            Some(serde_json::json!({
+                "Valid": true,
+                "Error": "",
+                "Missing": false,
+                "Expired": false,
+                "NotBefore": "2026-01-01T00:00:00Z",
+                "NotAfter": "2027-01-01T00:00:00Z",
+                "Domain": domain,
+            }))
         }
     }
 
@@ -1089,6 +1135,47 @@ mod tests {
         assert!(resp.contains("200 OK"));
         assert!(resp.contains("Content-Type: application/json"));
         assert!(resp.contains("Proxied"));
+    }
+
+    #[tokio::test]
+    async fn tls_cert_status_returns_json() {
+        let (addr, _) = start_mock_server().await;
+        let resp = send_request(
+            addr,
+            b"GET /tls-cert-status?domain=example.ts.net HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(resp.contains("200 OK"));
+        assert!(resp.contains("Content-Type: application/json"));
+        assert!(resp.contains("\"Valid\":true"));
+        assert!(resp.contains("NotBefore"));
+        assert!(resp.contains("NotAfter"));
+        assert!(resp.contains("example.ts.net"));
+    }
+
+    #[tokio::test]
+    async fn tls_cert_status_no_domain_returns_400() {
+        let (addr, _) = start_mock_server().await;
+        let resp = send_request(
+            addr,
+            b"GET /tls-cert-status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(resp.contains("400 Bad Request"));
+        assert!(resp.contains("no 'domain'"));
+    }
+
+    #[tokio::test]
+    async fn tls_cert_status_no_backend_returns_missing() {
+        let addr = start_server().await;
+        let resp = send_request(
+            addr,
+            b"GET /tls-cert-status?domain=foo.ts.net HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(resp.contains("200 OK"));
+        assert!(resp.contains("\"Missing\":true"));
+        assert!(resp.contains("\"Valid\":false"));
     }
 
     #[tokio::test]

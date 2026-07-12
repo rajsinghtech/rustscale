@@ -518,6 +518,10 @@ mod tests {
             PeersChanged: None,
             PeersRemoved: None,
             PeerChangedPatch: None,
+            Health: None,
+            ClientVersion: None,
+            SuggestedExitNode: None,
+            UserProfiles: None,
         };
         let j = serde_json::to_string(&n).unwrap();
         assert!(j.contains("\"Version\":\"1.0\""));

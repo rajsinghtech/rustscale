@@ -78,6 +78,7 @@ impl Server {
             disco_key: b.disco_key.clone(),
             capability_version: CAPABILITY_VERSION,
             protocol_version: PROTOCOL_VERSION,
+            shields_up: self.load_prefs().unwrap_or_default().ShieldsUp,
         };
         let map_update = spawn_map_update_task(
             b.map_rx,
@@ -219,6 +220,7 @@ impl Server {
             b.route_table.clone(),
             serve.clone(),
             b.overrides.clone(),
+            self.config.state_dir.clone(),
         );
         tasks.push(hostinfo_loop);
 
@@ -484,6 +486,7 @@ impl Server {
             disco_key: b.disco_key.clone(),
             capability_version: CAPABILITY_VERSION,
             protocol_version: PROTOCOL_VERSION,
+            shields_up: self.load_prefs().unwrap_or_default().ShieldsUp,
         };
         let map_update = spawn_map_update_task(
             b.map_rx,
@@ -591,6 +594,7 @@ impl Server {
             b.route_table.clone(),
             None,
             b.overrides.clone(),
+            self.config.state_dir.clone(),
         );
 
         let mut tasks = vec![

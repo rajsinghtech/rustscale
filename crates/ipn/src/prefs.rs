@@ -18,6 +18,17 @@ fn is_empty_string(v: &str) -> bool {
 fn is_empty_vec(v: &[String]) -> bool {
     v.is_empty()
 }
+fn is_app_connector_default(v: &AppConnectorPrefs) -> bool {
+    !v.Advertise
+}
+
+/// App connector preferences, mirroring Go's `ipn.AppConnectorPrefs`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(non_snake_case)]
+pub struct AppConnectorPrefs {
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub Advertise: bool,
+}
 
 /// User preferences, mirroring Go's `ipn.Prefs`.
 ///
@@ -58,6 +69,18 @@ pub struct Prefs {
     pub AdvertiseExitNode: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub ExitNodeAllowLANAccess: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub AutoUpdate: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub NetfilterMode: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub NoSNAT: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub PostureChecking: bool,
+    #[serde(default, skip_serializing_if = "is_app_connector_default")]
+    pub AppConnector: AppConnectorPrefs,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub RunWebClient: bool,
 }
 
 impl Prefs {
@@ -132,6 +155,18 @@ pub struct MaskedPrefs {
     pub AdvertiseExitNodeSet: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub ExitNodeAllowLANAccessSet: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub AutoUpdateSet: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub NetfilterModeSet: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub NoSNATSet: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub PostureCheckingSet: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub AppConnectorSet: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub RunWebClientSet: bool,
 }
 
 impl MaskedPrefs {
@@ -188,6 +223,24 @@ impl MaskedPrefs {
         if self.ExitNodeAllowLANAccessSet {
             target.ExitNodeAllowLANAccess = self.Prefs.ExitNodeAllowLANAccess;
         }
+        if self.AutoUpdateSet {
+            target.AutoUpdate = self.Prefs.AutoUpdate;
+        }
+        if self.NetfilterModeSet {
+            target.NetfilterMode.clone_from(&self.Prefs.NetfilterMode);
+        }
+        if self.NoSNATSet {
+            target.NoSNAT = self.Prefs.NoSNAT;
+        }
+        if self.PostureCheckingSet {
+            target.PostureChecking = self.Prefs.PostureChecking;
+        }
+        if self.AppConnectorSet {
+            target.AppConnector = self.Prefs.AppConnector.clone();
+        }
+        if self.RunWebClientSet {
+            target.RunWebClient = self.Prefs.RunWebClient;
+        }
     }
 
     /// Returns `true` if no fields are set (no `*Set` bool is `true`).
@@ -207,7 +260,13 @@ impl MaskedPrefs {
             || self.EphemeralSet
             || self.AcceptRoutesSet
             || self.AdvertiseExitNodeSet
-            || self.ExitNodeAllowLANAccessSet)
+            || self.ExitNodeAllowLANAccessSet
+            || self.AutoUpdateSet
+            || self.NetfilterModeSet
+            || self.NoSNATSet
+            || self.PostureCheckingSet
+            || self.AppConnectorSet
+            || self.RunWebClientSet)
     }
 }
 
@@ -349,5 +408,82 @@ mod tests {
         assert!(j.contains("\"AuthKey\":\"tskey-abc\""));
         assert!(!j.contains("UpdUserID"));
         assert!(!j.contains("UpdatePrefs"));
+    }
+
+    #[test]
+    fn prefs_new_fields_round_trip() {
+        let p = Prefs {
+            AutoUpdate: Some(true),
+            NetfilterMode: Some("on".into()),
+            NoSNAT: true,
+            PostureChecking: true,
+            AppConnector: AppConnectorPrefs { Advertise: true },
+            RunWebClient: true,
+            ..Default::default()
+        };
+        let j = serde_json::to_string(&p).unwrap();
+        let p2: Prefs = serde_json::from_str(&j).unwrap();
+        assert_eq!(p, p2);
+        assert_eq!(p2.AutoUpdate, Some(true));
+        assert_eq!(p2.NetfilterMode.as_deref(), Some("on"));
+        assert!(p2.NoSNAT);
+        assert!(p2.PostureChecking);
+        assert!(p2.AppConnector.Advertise);
+        assert!(p2.RunWebClient);
+    }
+
+    #[test]
+    fn prefs_new_fields_omitted_when_default() {
+        let p = Prefs::default();
+        let j = serde_json::to_string(&p).unwrap();
+        assert_eq!(j, "{}");
+        assert!(!j.contains("AutoUpdate"));
+        assert!(!j.contains("NetfilterMode"));
+        assert!(!j.contains("NoSNAT"));
+        assert!(!j.contains("PostureChecking"));
+        assert!(!j.contains("AppConnector"));
+        assert!(!j.contains("RunWebClient"));
+    }
+
+    #[test]
+    fn masked_prefs_new_fields_apply() {
+        let mut target = Prefs::default();
+        let mask = MaskedPrefs {
+            Prefs: Prefs {
+                NoSNAT: true,
+                PostureChecking: true,
+                RunWebClient: true,
+                AppConnector: AppConnectorPrefs { Advertise: true },
+                ..Default::default()
+            },
+            NoSNATSet: true,
+            PostureCheckingSet: true,
+            RunWebClientSet: true,
+            AppConnectorSet: true,
+            ..Default::default()
+        };
+        mask.apply_to(&mut target);
+        assert!(target.NoSNAT);
+        assert!(target.PostureChecking);
+        assert!(target.RunWebClient);
+        assert!(target.AppConnector.Advertise);
+        // Fields not set in mask should remain default.
+        assert_eq!(target.AutoUpdate, None);
+        assert_eq!(target.NetfilterMode, None);
+    }
+
+    #[test]
+    fn masked_prefs_new_fields_is_empty() {
+        let m = MaskedPrefs {
+            AutoUpdateSet: true,
+            ..Default::default()
+        };
+        assert!(!m.is_empty());
+
+        let m = MaskedPrefs {
+            AppConnectorSet: true,
+            ..Default::default()
+        };
+        assert!(!m.is_empty());
     }
 }

@@ -545,4 +545,52 @@ mod tests {
         assert_eq!(n.PeersRemoved, None);
         assert_eq!(n.PeerChangedPatch, None);
     }
+
+    #[tokio::test]
+    async fn notify_health_propagates_via_bus() {
+        let backend = IpnBackend::new("test");
+        let bus = backend.bus();
+        let mut rx = bus.subscribe();
+
+        // Send a health notify with warnings.
+        backend.bus().send(Notify::health(vec![
+            "control connection lost".into(),
+            "captive portal detected".into(),
+        ]));
+
+        let n = rx
+            .recv()
+            .await
+            .expect("should receive notify")
+            .expect("should not lag");
+        assert!(n.Health.is_some());
+        let warnings = n.Health.as_ref().unwrap();
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings[0].contains("control connection"));
+        assert!(warnings[1].contains("captive portal"));
+    }
+
+    #[test]
+    fn notify_new_fields_serialize_omitzero() {
+        let n = Notify::default();
+        let j = serde_json::to_string(&n).unwrap();
+        assert_eq!(j, "{}");
+        assert!(!j.contains("Health"));
+        assert!(!j.contains("ClientVersion"));
+        assert!(!j.contains("SuggestedExitNode"));
+        assert!(!j.contains("UserProfiles"));
+    }
+
+    #[test]
+    fn notify_health_round_trip() {
+        let n = Notify {
+            Health: Some(vec!["warning1".into()]),
+            SuggestedExitNode: Some("nodeABC".into()),
+            ..Default::default()
+        };
+        let j = serde_json::to_string(&n).unwrap();
+        let n2: Notify = serde_json::from_str(&j).unwrap();
+        assert_eq!(n2.Health, n.Health);
+        assert_eq!(n2.SuggestedExitNode, n.SuggestedExitNode);
+    }
 }

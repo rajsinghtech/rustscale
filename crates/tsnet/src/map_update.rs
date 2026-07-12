@@ -16,6 +16,7 @@ pub(crate) struct KeyRotationCtx {
     pub disco_key: DiscoPrivate,
     pub capability_version: i32,
     pub protocol_version: u16,
+    pub shields_up: bool,
 }
 
 /// Spawn the map-stream delta update task. Shared by `up()` and `up_tun()`:
@@ -62,6 +63,7 @@ pub(crate) fn spawn_map_update_task(
                     // healthy. Even keep-alive messages count as activity.
                     health_watchdog.feed();
                     health.set_healthy(WARN_CONTROL);
+                    send_health_notify(&health, &ipn_backend);
 
                     if resp.KeepAlive {
                         continue;
@@ -132,6 +134,7 @@ pub(crate) fn spawn_map_update_task(
                                             Hostname: ctx.hostname.clone(),
                                             RoutableIPs: ctx.advertise_routes.clone(),
                                             PeerRelay: ctx.peer_relay_server,
+                                            ShieldsUp: ctx.shields_up,
                                             ..Default::default()
                                         }),
                                         ..Default::default()
@@ -342,10 +345,12 @@ pub(crate) fn spawn_map_update_task(
                 }
                 Some(Err(e)) => {
                     health.set_unhealthy(WARN_CONTROL, format!("control connection lost: {e}"));
+                    send_health_notify(&health, &ipn_backend);
                     break;
                 }
                 None => {
                     health.set_unhealthy(WARN_CONTROL, "control connection lost: stream closed");
+                    send_health_notify(&health, &ipn_backend);
                     break;
                 }
             }
@@ -398,6 +403,7 @@ async fn perform_key_rotation(
                 Hostname: ctx.hostname.clone(),
                 RoutableIPs: ctx.advertise_routes.clone(),
                 PeerRelay: ctx.peer_relay_server,
+                ShieldsUp: ctx.shields_up,
                 ..Default::default()
             }),
             Ephemeral: ctx.ephemeral,
@@ -448,6 +454,7 @@ async fn perform_key_rotation(
                     Hostname: ctx.hostname.clone(),
                     RoutableIPs: ctx.advertise_routes.clone(),
                     PeerRelay: ctx.peer_relay_server,
+                    ShieldsUp: ctx.shields_up,
                     ..Default::default()
                 }),
                 Ephemeral: ctx.ephemeral,
@@ -507,4 +514,17 @@ async fn perform_key_rotation(
     }
 
     Err("key rotation exhausted retries (max 2)".into())
+}
+
+/// Send a Notify with the current health warnings so frontend consumers
+/// can surface health state changes. Mirrors Go's `LocalBackend.sendHealthNotify`.
+fn send_health_notify(health: &Tracker, ipn_backend: &IpnBackend) {
+    let warnings: Vec<String> = health
+        .current_warnings()
+        .iter()
+        .map(|w| w.text.clone())
+        .collect();
+    ipn_backend
+        .bus()
+        .send(rustscale_ipn::Notify::health(warnings));
 }

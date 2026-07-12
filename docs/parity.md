@@ -107,7 +107,15 @@ consume it) · peermtu darwin (no-op in Go too) ⬜ · sockstats ⬜.
 
 ## Tier 3: Specialized
 
-Tailscale SSH (`ssh/tailssh/`, port-10) · Taildrop (`ipn/ipnlocal/files.go`) ·
+Tailscale SSH (`ssh/tailssh/`, port-10) · Taildrop (`feature/taildrop/`) ✅
+phase-taildrop (`crates/tsnet/src/taildrop.rs`: TaildropManager with file spool,
+conflict modes skip/overwrite/rename, file-targets enumeration from netmap
+peers with file-sharing cap; PeerAPI `PUT /v0/put/<filename>` receive handler
+in `peerapi.rs`; LocalAPI endpoints `files/`, `file-targets`, `file-put/`,
+`await-waiting-files` in `localapi.rs`; localclient file methods; CLI `file cp`
++ `file get` subcommands; `Notify.FilesWaiting` + `WaitingFile` type in
+`crates/ipn`; integration tests for LocalAPI roundtrip, file-targets with cap,
+conflict modes, multi-file get) ·
 Taildrive (`drive/`) · Tailnet Lock/TKA (`tka/`) · Device posture (`posture/`) ·
 App connector (`appc/`) ✅ phase-appc (`crates/appc`: AppConnector with
 domain/wildcard matching, DNS response observation with CNAME chain

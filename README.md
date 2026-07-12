@@ -21,7 +21,43 @@ formats.
 
 ## Usage
 
-Rust embedding API (userspace netstack — `listen`/`dial` in-process):
+### CLI + daemon
+
+Start the daemon (root needed for TUN mode):
+
+```
+sudo rustscaled run
+```
+
+The daemon listens at `/var/run/rustscaled.sock`; override with `--socket
+<path>`. Pass `--json` for structured output on any command that supports it.
+
+Connect to a tailnet:
+
+```
+rustscale up                              # interactive auth (QR code)
+rustscale up --auth-key tskey-...         # headless auth
+```
+
+Common commands:
+
+```
+rustscale status          # daemon state and connections
+rustscale ip              # show Tailscale IPs
+rustscale ip -4 [peer]    # show IPv4 for this node or a peer
+rustscale whois <ip>      # machine and user for a Tailscale IP
+rustscale serve <target>  # expose a local service on the tailnet
+rustscale funnel <target> # expose a local service on the internet
+rustscale cert <domain>   # get TLS certs for a domain
+rustscale switch          # switch between accounts
+rustscale switch --list   # list saved profiles
+rustscale down            # disconnect
+rustscale logout          # disconnect and log out
+```
+
+Run `rustscale help` for the full flag set.
+
+### Rust embedding API (userspace netstack — `listen`/`dial` in-process)
 
 ```rust
 use rustscale_tsnet::Server;
@@ -44,6 +80,8 @@ let stream = server.dial("100.64.0.2:443").await?;
 server.close().await;
 ```
 
+### TUN mode
+
 For a full-client TUN device instead of the in-process netstack, use
 `server.up_tun(config)` with a `TunModeConfig` — see
 `crates/tsnet/examples/rustscale-tun.rs`. `listen`/`dial` are unavailable in
@@ -57,9 +95,12 @@ TUN mode; packets flow between a real OS TUN device and the data plane.
 brew install rajsinghtech/tap/rustscale
 ```
 
+Installs the `rustscale` CLI and `rustscaled` daemon. The GitHub release
+archive also includes `librustscale` (static + dynamic) and `rustscale.h`.
+
 ### From source
 
-Install the C library and header:
+Build and install the C library and header:
 
 ```sh
 sh scripts/install.sh

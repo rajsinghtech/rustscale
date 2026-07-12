@@ -103,6 +103,12 @@ pub(crate) struct LocalApiState {
     /// Credentials for the cert endpoint (`GET /cert/<domain>`). `None` when
     /// the server hasn't joined a tailnet yet (no machine/node keys).
     pub cert_params: Option<CertParams>,
+    /// Taildrop file manager (None if taildrop is disabled or not yet up).
+    pub taildrop: Option<Arc<crate::taildrop::TaildropManager>>,
+    /// Netstack handle for dialing peer PeerAPIs (None in TUN mode or
+    /// before `up()`). Used by the `file-put` endpoint to proxy uploads
+    /// through the tailnet.
+    pub netstack: Option<Arc<rustscale_netstack::Netstack>>,
 }
 
 pub struct LocalApiHandle {
@@ -179,13 +185,41 @@ async fn read_request<R: AsyncRead + Unpin>(conn: &mut R) -> Result<HttpRequest,
         buf.extend_from_slice(&tmp[..n]);
         if let Some(end) = find_header_end(&buf) {
             let head = &buf[..end + 4];
-            let body_preview = buf[end + 4..].to_vec();
-            return parse_request_head(head, body_preview);
+            let mut body = buf[end + 4..].to_vec();
+            // Read the full Content-Length body if the preview is short.
+            let header_text =
+                std::str::from_utf8(head).map_err(|_| "non-utf8 header".to_string())?;
+            let cl = extract_content_length(header_text);
+            while body.len() < cl {
+                let n = conn
+                    .read(&mut tmp)
+                    .await
+                    .map_err(|e| format!("read body: {e}"))?;
+                if n == 0 {
+                    break;
+                }
+                body.extend_from_slice(&tmp[..n]);
+            }
+            body.truncate(cl);
+            return parse_request_head(head, body);
         }
         if buf.len() > 256 * 1024 {
             return Err("header too large".into());
         }
     }
+}
+
+/// Extract the Content-Length value from an HTTP header block. Returns 0
+/// if the header is absent or unparseable.
+fn extract_content_length(header_text: &str) -> usize {
+    for line in header_text.split("\r\n") {
+        if let Some((k, v)) = line.split_once(':') {
+            if k.trim().eq_ignore_ascii_case("content-length") {
+                return v.trim().parse().unwrap_or(0);
+            }
+        }
+    }
+    0
 }
 
 fn find_header_end(buf: &[u8]) -> Option<usize> {
@@ -465,6 +499,9 @@ async fn dispatch<W: AsyncWrite + Unpin>(
                     "/localapi/v0/serve-config",
                     "/localapi/v0/profiles",
                     "/localapi/v0/cert/<domain>",
+                    "/localapi/v0/file-targets",
+                    "/localapi/v0/files/",
+                    "/localapi/v0/file-put/",
                 ]);
                 write_json_response(conn, 200, "OK", &endpoints).await?;
             } else {
@@ -571,6 +608,10 @@ async fn dispatch<W: AsyncWrite + Unpin>(
         "profiles" if method == "PUT" => {
             handle_new_profile(conn, state).await?;
         }
+        // --- GET /localapi/v0/file-targets ---
+        "file-targets" if method == "GET" => {
+            handle_file_targets(conn, state).await?;
+        }
 
         _ => {
             // Check for cert/<domain> sub-path.
@@ -581,6 +622,16 @@ async fn dispatch<W: AsyncWrite + Unpin>(
             // Check for profiles/<id> or profiles/current sub-paths.
             if let Some(suffix) = endpoint.strip_prefix("profiles/") {
                 handle_profile_subpath(conn, method, suffix, state).await?;
+                return Ok(());
+            }
+            // Check for files/<name> or files/ (Taildrop).
+            if endpoint == "files" || endpoint.starts_with("files/") {
+                handle_files(conn, method, endpoint, &req.query, req, state).await?;
+                return Ok(());
+            }
+            // Check for file-put/<stableID>/<filename> (Taildrop upload proxy).
+            if let Some(suffix) = endpoint.strip_prefix("file-put/") {
+                handle_file_put(conn, method, suffix, req, state).await?;
                 return Ok(());
             }
             let body = serde_json::json!({
@@ -1574,6 +1625,299 @@ async fn handle_profile_subpath<W: AsyncWrite + Unpin>(
 }
 
 // ---------------------------------------------------------------------------
+// Taildrop handlers (file-targets, files, file-put)
+// ---------------------------------------------------------------------------
+
+/// Handle GET /localapi/v0/file-targets — list peers that can receive
+/// Taildrop files. Mirrors Go's `serveFileTargets`.
+async fn handle_file_targets<W: AsyncWrite + Unpin>(
+    conn: &mut W,
+    state: &Arc<LocalApiState>,
+) -> Result<(), std::io::Error> {
+    let Some(ref taildrop) = state.taildrop else {
+        let body = serde_json::json!({"error": "taildrop not enabled"});
+        write_json_response(conn, 500, "Internal Server Error", &body).await?;
+        return Ok(());
+    };
+    let peers = state.peers.read().await;
+    let user_profiles = state.user_profiles.read().await;
+    match taildrop.file_targets(&peers, &user_profiles).await {
+        Ok(targets) => {
+            let json = serde_json::to_value(&targets).unwrap_or(serde_json::json!([]));
+            write_json_response(conn, 200, "OK", &json).await?;
+        }
+        Err(e) => {
+            let body = serde_json::json!({"error": e.to_string()});
+            write_json_response(conn, 500, "Internal Server Error", &body).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Handle GET/DELETE /localapi/v0/files/[<name>] — list, download, or
+/// delete waiting files. Mirrors Go's `serveFiles`.
+async fn handle_files<W: AsyncWrite + Unpin>(
+    conn: &mut W,
+    method: &str,
+    endpoint: &str,
+    query: &str,
+    _req: &HttpRequest,
+    state: &Arc<LocalApiState>,
+) -> Result<(), std::io::Error> {
+    let Some(ref taildrop) = state.taildrop else {
+        let body = serde_json::json!({"error": "taildrop not enabled"});
+        write_json_response(conn, 500, "Internal Server Error", &body).await?;
+        return Ok(());
+    };
+
+    // Extract the filename suffix (everything after "files/").
+    let suffix = endpoint.strip_prefix("files").unwrap_or("");
+    let suffix = suffix.strip_prefix('/').unwrap_or(suffix);
+
+    if suffix.is_empty() {
+        // List waiting files (optionally long-poll with ?waitsec=N).
+        if method != "GET" {
+            let body = serde_json::json!({"error": "want GET to list files"});
+            write_json_response(conn, 400, "Bad Request", &body).await?;
+            return Ok(());
+        }
+        let params = parse_query(query);
+        let waitsec: u64 = params
+            .get("waitsec")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let files = if waitsec > 0 {
+            taildrop
+                .await_waiting_files(std::time::Duration::from_secs(waitsec))
+                .await
+        } else {
+            taildrop.waiting_files()
+        };
+        match files {
+            Ok(list) => {
+                let json = serde_json::to_value(&list).unwrap_or(serde_json::json!([]));
+                write_json_response(conn, 200, "OK", &json).await?;
+            }
+            Err(e) => {
+                let body = serde_json::json!({"error": e.to_string()});
+                write_json_response(conn, 500, "Internal Server Error", &body).await?;
+            }
+        }
+        return Ok(());
+    }
+
+    // A specific file: download or delete.
+    let name = percent_decode_path(suffix);
+    match method {
+        "GET" => match taildrop.open_file(&name).await {
+            Ok((bytes, size)) => {
+                write_raw_response(conn, 200, "OK", "application/octet-stream", &bytes).await?;
+                let _ = size; // Content-Length is implicit in the body.
+            }
+            Err(crate::taildrop::TaildropError::FileNotFound(_)) => {
+                let body = serde_json::json!({"error": "file not found"});
+                write_json_response(conn, 404, "Not Found", &body).await?;
+            }
+            Err(e) => {
+                let body = serde_json::json!({"error": e.to_string()});
+                write_json_response(conn, 500, "Internal Server Error", &body).await?;
+            }
+        },
+        "DELETE" => match taildrop.delete_file(&name).await {
+            Ok(()) => {
+                write_no_content_response(conn, 204, "No Content").await?;
+            }
+            Err(crate::taildrop::TaildropError::FileNotFound(_)) => {
+                let body = serde_json::json!({"error": "file not found"});
+                write_json_response(conn, 404, "Not Found", &body).await?;
+            }
+            Err(e) => {
+                let body = serde_json::json!({"error": e.to_string()});
+                write_json_response(conn, 500, "Internal Server Error", &body).await?;
+            }
+        },
+        _ => {
+            let body = serde_json::json!({"error": "want GET or DELETE"});
+            write_json_response(conn, 400, "Bad Request", &body).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Handle PUT /localapi/v0/file-put/<stableID>/<filename> — proxy a file
+/// upload to a peer's PeerAPI. The daemon dials the target's PeerAPI via
+/// the netstack and streams the body. Mirrors Go's `serveFilePut`.
+async fn handle_file_put<W: AsyncWrite + Unpin>(
+    conn: &mut W,
+    method: &str,
+    suffix: &str,
+    req: &HttpRequest,
+    state: &Arc<LocalApiState>,
+) -> Result<(), std::io::Error> {
+    if method != "PUT" {
+        let body = serde_json::json!({"error": "want PUT to put file"});
+        write_json_response(conn, 400, "Bad Request", &body).await?;
+        return Ok(());
+    }
+
+    let Some(ref taildrop) = state.taildrop else {
+        let body = serde_json::json!({"error": "taildrop not enabled"});
+        write_json_response(conn, 500, "Internal Server Error", &body).await?;
+        return Ok(());
+    };
+
+    // Parse <stableID>/<filename> from the suffix.
+    let Some((peer_id_str, filename_escaped)) = suffix.split_once('/') else {
+        let body = serde_json::json!({"error": "bogus URL"});
+        write_json_response(conn, 400, "Bad Request", &body).await?;
+        return Ok(());
+    };
+    let filename = percent_decode_path(filename_escaped);
+
+    // Find the file target matching this stable ID.
+    let peers = state.peers.read().await;
+    let user_profiles = state.user_profiles.read().await;
+    let targets = match taildrop.file_targets(&peers, &user_profiles).await {
+        Ok(t) => t,
+        Err(e) => {
+            let body = serde_json::json!({"error": e.to_string()});
+            write_json_response(conn, 500, "Internal Server Error", &body).await?;
+            return Ok(());
+        }
+    };
+    drop(peers);
+    drop(user_profiles);
+
+    let target = targets.iter().find(|t| t.StableID == peer_id_str);
+    let Some(target) = target else {
+        let body = serde_json::json!({"error": "node not found"});
+        write_json_response(conn, 404, "Not Found", &body).await?;
+        return Ok(());
+    };
+
+    // Dial the peer's PeerAPI via the netstack.
+    let Some(ref netstack) = state.netstack else {
+        let body = serde_json::json!({"error": "netstack not available (TUN mode?)"});
+        write_json_response(conn, 500, "Internal Server Error", &body).await?;
+        return Ok(());
+    };
+
+    // Parse the PeerAPI URL to get the dial address.
+    let peerapi_url = &target.PeerAPIURL;
+    let dial_addr = peerapi_url
+        .strip_prefix("http://")
+        .or_else(|| peerapi_url.strip_prefix("https://"))
+        .unwrap_or(peerapi_url);
+
+    // Parse into a SocketAddr for the netstack dial.
+    let socket_addr: std::net::SocketAddr = match dial_addr.parse() {
+        Ok(sa) => sa,
+        Err(e) => {
+            let body = serde_json::json!({"error": format!("bogus peer URL: {e}")});
+            write_json_response(conn, 500, "Internal Server Error", &body).await?;
+            return Ok(());
+        }
+    };
+
+    // Dial the peer's PeerAPI via the netstack.
+    let mut peer_conn = match netstack.dial(socket_addr).await {
+        Ok(s) => s,
+        Err(e) => {
+            let body = serde_json::json!({"error": format!("failed to dial peer: {e}")});
+            write_json_response(conn, 502, "Bad Gateway", &body).await?;
+            return Ok(());
+        }
+    };
+
+    // Send PUT /v0/put/<filename> to the peer's PeerAPI.
+    let put_path = format!("/v0/put/{}", url_encode_path(&filename));
+    let put_request = format!(
+        "PUT {put_path} HTTP/1.1\r\nHost: peer\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        req.body.len()
+    );
+    use tokio::io::AsyncWriteExt;
+    if peer_conn.write_all(put_request.as_bytes()).await.is_err() {
+        let body = serde_json::json!({"error": "failed to send to peer"});
+        write_json_response(conn, 502, "Bad Gateway", &body).await?;
+        return Ok(());
+    }
+    if !req.body.is_empty() && peer_conn.write_all(&req.body).await.is_err() {
+        let body = serde_json::json!({"error": "failed to send body to peer"});
+        write_json_response(conn, 502, "Bad Gateway", &body).await?;
+        return Ok(());
+    }
+    peer_conn.flush().await.ok();
+
+    // Read the peer's response and forward it to the client.
+    use tokio::io::AsyncReadExt;
+    let mut resp_buf = Vec::with_capacity(4096);
+    let mut tmp = [0u8; 4096];
+    loop {
+        let n = match peer_conn.read(&mut tmp).await {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        resp_buf.extend_from_slice(&tmp[..n]);
+        if resp_buf.len() > 1024 * 1024 {
+            break;
+        }
+    }
+
+    // Forward the raw HTTP response from the peer to the client.
+    conn.write_all(&resp_buf).await?;
+    conn.flush().await?;
+    Ok(())
+}
+
+/// Percent-decode a URL path component (filename). Unlike query param
+/// decoding, this handles %XX sequences and does not convert + to space.
+fn percent_decode_path(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (hex_val_local(bytes[i + 1]), hex_val_local(bytes[i + 2])) {
+                result.push((h * 16 + l) as char);
+                i += 3;
+                continue;
+            }
+        }
+        result.push(bytes[i] as char);
+        i += 1;
+    }
+    result
+}
+
+/// URL-encode a filename for use in a path component. Encodes everything
+/// except unreserved characters and path-safe chars.
+fn url_encode_path(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => {
+                use std::fmt::Write;
+                let _ = write!(out, "%{b:02X}");
+            }
+        }
+    }
+    out
+}
+
+fn hex_val_local(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1672,6 +2016,8 @@ mod tests {
             profiles: Arc::new(RwLock::new(vec![])),
             current_profile: Arc::new(RwLock::new(None)),
             cert_params: None,
+            taildrop: None,
+            netstack: None,
         })
     }
 
@@ -2386,6 +2732,8 @@ mod tests {
             profiles: Arc::new(RwLock::new(vec![])),
             current_profile: Arc::new(RwLock::new(None)),
             cert_params: None,
+            taildrop: None,
+            netstack: None,
         });
 
         let config = r#"{"TCP":{"8080":{"HTTP":true}}}"#;
@@ -2607,6 +2955,8 @@ mod tests {
                 capability_version: 141,
                 protocol_version: 141,
             }),
+            taildrop: None,
+            netstack: None,
         })
     }
 

@@ -273,22 +273,45 @@ fn os_version() -> String {
 
 #[cfg(target_os = "macos")]
 fn os_version() -> String {
-    // Go uses sysctl("kern.osproductversion") on macOS. We shell out to
-    // `sw_vers -productVersion` which returns the same marketing version.
-    if let Ok(out) = std::process::Command::new("sw_vers")
-        .args(["-productVersion"])
-        .output()
-    {
-        if out.status.success() {
-            return String::from_utf8_lossy(&out.stdout).trim().to_string();
-        }
+    sysctl_string(b"kern.osproductversion\0").unwrap_or_default()
+}
+
+/// macOS sysctl string helper via `libc::sysctlbyname`.
+/// The `name` parameter must be a null-terminated C string.
+#[cfg(target_os = "macos")]
+#[allow(clippy::borrow_as_ptr)]
+fn sysctl_string(name: &[u8]) -> Option<String> {
+    let mut len: libc::size_t = 0;
+    let rv = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr().cast::<libc::c_char>(),
+            std::ptr::null_mut(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rv != 0 || len == 0 {
+        return None;
     }
-    if let Ok(out) = std::process::Command::new("uname").arg("-r").output() {
-        if out.status.success() {
-            return String::from_utf8_lossy(&out.stdout).trim().to_string();
-        }
+    let mut buf = vec![0u8; len];
+    let rv = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr().cast::<libc::c_char>(),
+            buf.as_mut_ptr().cast::<libc::c_void>(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rv != 0 {
+        return None;
     }
-    String::new()
+    // sysctl includes a null terminator in len; trim it.
+    if let Some(pos) = buf.iter().position(|&b| b == 0) {
+        buf.truncate(pos);
+    }
+    String::from_utf8(buf).ok()
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -715,6 +738,12 @@ fn device_model() -> String {
                     return s;
                 }
             }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(model) = sysctl_string(b"hw.model\0") {
+            return model;
         }
     }
     #[allow(unreachable_code)]
@@ -1640,9 +1669,36 @@ VERSION_ID='11'"#;
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn test_os_version_macos() {
+    fn test_os_version_macos_format() {
         let v = os_version();
-        assert!(!v.is_empty());
+        assert!(!v.is_empty(), "os_version should not be empty on macOS");
+        // Marketing version: digits.digits or digits.digits.digits (e.g. "15.0.1")
+        let parts: Vec<&str> = v.split('.').collect();
+        assert!(
+            parts.len() >= 2,
+            "os_version should have at least two dot-separated components: {v}"
+        );
+        for p in &parts {
+            assert!(
+                p.chars().all(|c| c.is_ascii_digit()),
+                "each part of os_version should be digits: {v}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_device_model_macos() {
+        let dm = device_model();
+        assert!(
+            !dm.is_empty(),
+            "device_model should not be empty on macOS (e.g. MacBookPro18,3)"
+        );
+        // Should be something like "MacBookProX,Y" or "MacminiX,Y" — at least non-empty
+        assert!(
+            dm.contains(',') || dm.contains("Mac"),
+            "device_model should contain model identifier: {dm}"
+        );
     }
 
     // ─── Override + runtime field tests ──────────────────────────────

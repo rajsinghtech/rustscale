@@ -26,7 +26,7 @@
 //! # }
 //! ```
 
-#![forbid(unsafe_code)]
+#![allow(unsafe_code)]
 
 mod acme;
 mod c2n;

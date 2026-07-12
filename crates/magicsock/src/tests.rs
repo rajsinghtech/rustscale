@@ -578,8 +578,8 @@ async fn multi_region_derp_routing() {
         let reconnect_tx = a.inner.derp.reconnect_tx.clone();
         let io2_clone = io2.clone();
         tokio::spawn(async move {
-            while let Some((source, data)) = io2_clone.try_recv().await {
-                if tx.send((2, source, data)).await.is_err() {
+            while let Some(event) = io2_clone.try_recv().await {
+                if tx.send((2, event)).await.is_err() {
                     break;
                 }
             }
@@ -618,8 +618,8 @@ async fn multi_region_derp_routing() {
         let reconnect_tx = b.inner.derp.reconnect_tx.clone();
         let io1_clone = io1.clone();
         tokio::spawn(async move {
-            while let Some((source, data)) = io1_clone.try_recv().await {
-                if tx.send((1, source, data)).await.is_err() {
+            while let Some(event) = io1_clone.try_recv().await {
+                if tx.send((1, event)).await.is_err() {
                     break;
                 }
             }
@@ -766,4 +766,118 @@ async fn pmtud_flag_multi_size_burst() {
         pending_count >= 6,
         "expected at least 6 pending pings with PMTUD, got {pending_count}"
     );
+}
+
+// ---- Test: PeerGone removes DERP route ----
+
+#[tokio::test]
+async fn peer_gone_removes_derp_route() {
+    let relay = Arc::new(FakeRelay::new());
+
+    let a_priv = NodePrivate::generate();
+    let b_priv = NodePrivate::generate();
+    let b_key = b_priv.public();
+
+    let a_derp = connect_to_relay(&relay, a_priv.clone()).await;
+    let (a, _a_rx) = Magicsock::new(MagicsockConfig {
+        private_key: a_priv,
+        disco_key: DiscoPrivate::generate(),
+        derp_client: Some(a_derp),
+        derp_map: None,
+        home_derp_region: 0,
+        udp_bind: Some("127.0.0.1:0".parse().unwrap()),
+        udp_socket: None,
+        portmapper: None,
+        health: None,
+        disable_direct_paths: false,
+        peer_relay_server: false,
+        relay_server_config: None,
+    })
+    .await
+    .expect("A magicsock");
+
+    // Set up peer B in A's netmap with HomeDERP=1.
+    let b_peer = make_peer(b_key.clone(), DiscoPrivate::generate().public(), vec![], 1);
+    a.set_netmap(vec![b_peer]).await.expect("A set_netmap");
+
+    // Simulate a DERP packet from B arriving on region 3 — this sets
+    // last_recv_derp_region to 3.
+    {
+        let mut endpoints = a.inner.endpoints.write().expect("endpoints lock poisoned");
+        if let Some(ep) = endpoints.get_mut(&b_key) {
+            ep.set_last_recv_derp_region(3);
+            assert_eq!(ep.derp_send_region(), 3);
+        }
+    }
+
+    // Simulate a PeerGone event for B on region 3.
+    a.inner.handle_derp_peer_gone(b_key.clone(), 3, 0);
+
+    // The DERP route should be cleared — derp_send_region falls back to
+    // home_derp (1).
+    {
+        let endpoints = a.inner.endpoints.read().expect("endpoints lock poisoned");
+        if let Some(ep) = endpoints.get(&b_key) {
+            assert_eq!(
+                ep.derp_send_region(),
+                1,
+                "derp_send_region should fall back to home_derp after PeerGone"
+            );
+            assert_eq!(
+                ep.last_recv_derp_region_for_debug(),
+                0,
+                "last_recv_derp_region should be 0 after PeerGone"
+            );
+        }
+    }
+}
+
+// ---- Test: DERP region health tracking ----
+
+#[tokio::test]
+async fn derp_region_health_tracking() {
+    use rustscale_health::Tracker;
+
+    let health = Tracker::new();
+    let relay = Arc::new(FakeRelay::new());
+
+    let a_priv = NodePrivate::generate();
+    let a_derp = connect_to_relay(&relay, a_priv.clone()).await;
+    let (a, _a_rx) = Magicsock::new(MagicsockConfig {
+        private_key: a_priv,
+        disco_key: DiscoPrivate::generate(),
+        derp_client: Some(a_derp),
+        derp_map: None,
+        home_derp_region: 0,
+        udp_bind: Some("127.0.0.1:0".parse().unwrap()),
+        udp_socket: None,
+        portmapper: None,
+        health: Some(health.clone()),
+        disable_direct_paths: false,
+        peer_relay_server: false,
+        relay_server_config: None,
+    })
+    .await
+    .expect("A magicsock");
+
+    // Initially, region 1 has no health record.
+    assert!(!health.is_unhealthy("derp-region-1-unreachable"));
+
+    // Mark region 1 unhealthy via a Health event with a non-empty problem.
+    a.inner
+        .derp
+        .health
+        .as_ref()
+        .unwrap()
+        .set_derp_region_health(1, false);
+    assert!(health.is_unhealthy("derp-region-1-unreachable"));
+
+    // Mark it healthy again.
+    a.inner
+        .derp
+        .health
+        .as_ref()
+        .unwrap()
+        .set_derp_region_health(1, true);
+    assert!(!health.is_unhealthy("derp-region-1-unreachable"));
 }

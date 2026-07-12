@@ -26,4 +26,9 @@ thiserror.workspace = true
 
 [dev-dependencies]
 rustscale-tsnet = { path = "../tsnet", version = "0.1.0" }
+rustscale-derp = { path = "../derp", version = "0.1.0" }
+rustscale-tailcfg = { path = "../tailcfg", version = "0.1.0" }
+rustscale-key = { path = "../key", version = "0.1.0" }
+rustscale-magicsock = { path = "../magicsock", version = "0.1.0" }
+rustscale-udprelay = { path = "../udprelay", version = "0.1.0" }
 tempfile = "3"

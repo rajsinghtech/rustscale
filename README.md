@@ -1,4 +1,15 @@
-# rustscale
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/rustscale-logo.svg">
+    <img src="assets/rustscale-logo.svg" alt="rustscale" height="40">
+  </picture>
+</p>
+
+<p align="center">
+  <strong>A Rust implementation of Tailscale's client stack</strong>
+</p>
+
+---
 
 A from-scratch Rust implementation of Tailscale's client stack — the equivalent
 of Go's [`tsnet`](https://pkg.go.dev/tailscale.com/tsnet) embedding API — plus a

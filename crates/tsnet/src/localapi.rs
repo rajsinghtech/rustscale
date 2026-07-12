@@ -795,6 +795,8 @@ mod tests {
                 portmapper: None,
                 health: None,
                 disable_direct_paths: false,
+                peer_relay_server: false,
+                relay_server_config: None,
             })
             .await
             .expect("magicsock"),

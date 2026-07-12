@@ -28,21 +28,23 @@ update statuses as phases land.
 | Auto-update / ClientVersion | — | ⬜ |
 | Multi-profile/login management | `ipn/ipnlocal/profiles.go` | ⬜ (single profile only) |
 
-## macOS platform parity (phases 32–38, 2026-07-11)
+## macOS platform parity (phases 32–40, 2026-07-11)
 
 | Feature | Go source | Status |
 | --- | --- | --- |
-| macOS DNS OS configurator | `net/dns/manager_darwin.go` | ✅ phase-32: `crates/dns` OsConfigurator trait + DarwinConfigurator (`/etc/resolver/$SUFFIX` split DNS, ownership header marker, search.tailscale file, stale cleanup, foreign files untouched); not yet wired into tsnet TUN mode |
+| macOS DNS OS configurator | `net/dns/manager_darwin.go` | ✅ phase-32: `crates/dns` OsConfigurator trait + DarwinConfigurator (`/etc/resolver/$SUFFIX` split DNS, ownership header marker, search.tailscale file, stale cleanup, foreign files untouched); ✅ phase-39 wired into tsnet TUN mode via opt-in `configure_os_dns(true)` builder flag (build_os_dns_config from netmap DNS config, best-effort on permission errors, cleaned up on close) |
 | Safe socket (CLI↔daemon IPC) | `safesocket/safesocket_darwin.go` | ✅ phase-33: `crates/safesocket` unix listen/connect (stale removal, perms) + darwin sameuserproof (macsys filename variant, macos lsof variant, set_credentials override, token gen) |
 | Route table enumeration | `net/routetable/routetable_bsd.go` | ✅ phase-34: `crates/routetable` NET_RT_DUMP2 sysctl RIB fetch, rt_msghdr2 + 4-byte-aligned sockaddr parse, RTF flag decode, RTF_LOCAL skip, live default-route integration test |
 | tcpinfo (RTT diagnostics) | `net/tcpinfo/tcpinfo_darwin.go` | ✅ phase-35: `crates/tcpinfo` darwin TCP_CONNECTION_INFO (tcpi_rttcur) + linux TCP_INFO (tcpi_rtt) |
-| Break TCP connections | `ipn/ipnlocal/breaktcp_darwin.go` | ✅ phase-35: `break_tcp_conns()` fd 0..1000 scan+close (darwin); not yet called on exit-node switch |
+| Break TCP connections | `ipn/ipnlocal/breaktcp_darwin.go` | ✅ phase-35: `break_tcp_conns()` fd 0..1000 scan+close (darwin); ✅ phase-39 called on set/clear_exit_node in TUN mode only (netstack embedders never affected) |
 | Daemon + launchd install | `cmd/tailscaled/install_darwin.go` | ✅ phase-36: `crates/rustscaled` bin (run/install-system-daemon/uninstall-system-daemon), com.rustscale.rustscaled plist, launchctl lifecycle, safesocket listener stub (LocalAPI TODO) |
 | Default route detection | `net/netmon/defaultroute_darwin.go` | ✅ phase-37: `default_route_interface_index()` RTM_GET sysctl w/ SIOCGIFDELEGATE utun delegation + utun exclusion; state.rs uses sysctl first, `route -n get` fallback |
 | Interface enumeration (darwin) | `net/netmon/interfaces_darwin.go` | ✅ phase-37 (folded into defaultroute work) |
 
-Deferred P3: hostinfo darwin extras 🔶 · quarantine xattr (post-Taildrop) ⬜ ·
-peermtu darwin (no-op in Go too) ⬜ · sockstats ⬜.
+P3 status: hostinfo darwin ✅ phase-40 (OSVersion via kern.osproductversion,
+DeviceModel via hw.model sysctlbyname) · quarantine xattr ✅ phase-40
+(`crates/quarantine`, Go-format com.apple.quarantine value; Taildrop will
+consume it) · peermtu darwin (no-op in Go too) ⬜ · sockstats ⬜.
 
 ## Tier 3: Specialized
 

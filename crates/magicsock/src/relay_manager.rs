@@ -302,6 +302,14 @@ pub fn discover_relay_servers(self_node: &Node, peers: &[Node]) -> Vec<Candidate
         if !has_capability(&node.CapMap, PEER_CAPABILITY_RELAY_TARGET) {
             continue;
         }
+        // Check Hostinfo.PeerRelay (Go: `p.Hostinfo().PeerRelay`).
+        let peer_relay = node
+            .Hostinfo
+            .as_ref()
+            .is_some_and(|hi| hi.PeerRelay);
+        if !peer_relay && node.ID != self_node.ID {
+            continue;
+        }
         if !node.DiscoKey.is_zero() {
             servers.push(CandidatePeerRelay {
                 node_key: node.Key.clone(),
@@ -496,6 +504,38 @@ async fn spawn_alloc_work<RM: RelayManagerContext>(
         client_disco: disco_keys.clone(),
         generation: alloc_gen,
     };
+
+    // In-process shortcut: when the relay server is self, bypass DERP and
+    // call the local extension directly (Go magicsock.go:1946-1963).
+    if ctx.is_self_node(&server.node_key) {
+        if let Some(resp) = ctx.handle_self_alloc_request(disco_keys.clone(), alloc_gen) {
+            if resp.generation == alloc_gen {
+                let sorted = sort_pair(
+                    &resp.endpoint.client_disco[0],
+                    &resp.endpoint.client_disco[1],
+                );
+                if sorted == disco_keys {
+                    let se = ServerEndpoint::from_udp_relay_endpoint(&resp.endpoint);
+                    let _ = event_tx.send(RelayEvent::AllocWorkDone(AllocWorkResult {
+                        peer_key,
+                        peer_disco,
+                        server,
+                        disco_keys,
+                        server_endpoint: Some(se),
+                    }));
+                    return;
+                }
+            }
+        }
+        let _ = event_tx.send(RelayEvent::AllocWorkDone(AllocWorkResult {
+            peer_key,
+            peer_disco,
+            server,
+            disco_keys,
+            server_endpoint: None,
+        }));
+        return;
+    }
 
     let sealed = if let Some(p) = ctx.seal_disco(
         &server.disco_key,
@@ -746,6 +786,9 @@ async fn spawn_handshake_work<RM: RelayManagerContext>(
 
     let mut sent_ping_at: HashMap<[u8; 12], Instant> = HashMap::new();
     let mut handshake_state: u8 = 0; // 0=bind_sent, 1=answer_sent
+    let mut challenge_from: Option<SocketAddr> = None;
+    let ping_retry = tokio::time::sleep(Duration::from_secs(2));
+    tokio::pin!(ping_retry);
     let mut result = HandshakeWorkResult {
         peer_key: peer_key.clone(),
         server_disco: se.server_disco.clone(),
@@ -758,6 +801,26 @@ async fn spawn_handshake_work<RM: RelayManagerContext>(
         tokio::select! {
             _ = &mut cancel_rx => break,
             () = &mut timeout => break,
+            () = &mut ping_retry, if handshake_state >= 1 => {
+                // Periodically resend Pings until we get a Pong or time out.
+                // This handles the case where the first Ping was dropped
+                // because the peer hadn't bound yet.
+                if sent_ping_at.len() < MAX_PINGS {
+                    if let Some(from) = challenge_from {
+                        let tx_id = random_tx_id();
+                        sent_ping_at.insert(tx_id, Instant::now());
+                        let ping = Message::Ping(Ping {
+                            tx_id,
+                            node_key: ctx.our_node_public(),
+                            padding: 0,
+                        });
+                        if let Some(sealed) = ctx.seal_disco(&peer_disco, &ping) {
+                            ctx.send_disco_udp(from, se.vni, false, &sealed);
+                        }
+                    }
+                }
+                ping_retry.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(2));
+            }
             msg_data = disco_msg_rx.recv() => {
                 let (msg, from, vni) = match msg_data {
                     Some(d) => d,
@@ -777,6 +840,7 @@ async fn spawn_handshake_work<RM: RelayManagerContext>(
                             continue;
                         }
                         handshake_state = 1;
+                        challenge_from = Some(from);
 
                         // Step 2: Send Answer + Ping.
                         let answer = Message::BindUdpRelayEndpointAnswer(
@@ -938,10 +1002,15 @@ fn handle_rx_disco_msg<RM: RelayManagerContext>(
             // Route to handshake work if we have one awaiting.
             if let Some(peer_key) = state.handshake_awaiting_pong.get(&apv).cloned() {
                 if let Some(by_sd) = state.handshake_work.get(&peer_key) {
-                    if let Some(work) = by_sd.get(&msg.disco) {
-                        let _ = work
-                            .disco_msg_tx
-                            .try_send((msg.msg.clone(), msg.from, msg.vni));
+                    for work in by_sd.values() {
+                        if work.vni == msg.vni {
+                            let _ = work.disco_msg_tx.try_send((
+                                msg.msg.clone(),
+                                msg.from,
+                                msg.vni,
+                            ));
+                            break;
+                        }
                     }
                 }
             }
@@ -950,10 +1019,19 @@ fn handle_rx_disco_msg<RM: RelayManagerContext>(
         Message::Pong(_) => {
             if let Some(peer_key) = state.handshake_awaiting_pong.get(&apv).cloned() {
                 if let Some(by_sd) = state.handshake_work.get(&peer_key) {
-                    if let Some(work) = by_sd.get(&msg.disco) {
-                        let _ = work
-                            .disco_msg_tx
-                            .try_send((msg.msg.clone(), msg.from, msg.vni));
+                    // Pongs are sent by the peer (not the relay server),
+                    // so msg.disco is the peer's disco key — it won't
+                    // match the server_disco key. Route to the work whose
+                    // VNI matches.
+                    for work in by_sd.values() {
+                        if work.vni == msg.vni {
+                            let _ = work.disco_msg_tx.try_send((
+                                msg.msg.clone(),
+                                msg.from,
+                                msg.vni,
+                            ));
+                            break;
+                        }
                     }
                 }
             }

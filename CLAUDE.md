@@ -1,3 +1,5 @@
+<img src="assets/rustscale-logo.svg" alt="rustscale" height="32">
+
 # rustscale
 
 A Rust implementation of Tailscale's client stack — the equivalent of Go's `tsnet` package —

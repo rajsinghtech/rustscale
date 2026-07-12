@@ -200,6 +200,15 @@ pub struct ServerBuilder {
     /// **Requires root** (writing `/etc/resolver` needs privileged access).
     /// Default `false`. Ignored in netstack mode (`up()`).
     configure_os_dns: bool,
+    /// Whether to run this node as a peer relay server. When true, a
+    /// `udprelay::Server` is started in magicsock and
+    /// `Hostinfo.PeerRelay = true` is advertised to the control plane.
+    /// Default OFF.
+    peer_relay_server: bool,
+    /// Optional relay server config override (lifetimes, port, etc.). When
+    /// `None`, defaults are used. Only effective when `peer_relay_server`
+    /// is true. Used by integration tests to set shortened lifetimes.
+    relay_server_config: Option<rustscale_udprelay::ServerConfig>,
 }
 
 impl ServerBuilder {
@@ -329,6 +338,23 @@ impl ServerBuilder {
     /// or `<state_dir>/rustscale.sock` by default. Default: OFF.
     pub fn localapi(mut self, on: bool) -> Self {
         self.localapi = on;
+        self
+    }
+
+    /// Enable this node as a peer relay server. When true, a `udprelay::Server`
+    /// is started in magicsock, `Hostinfo.PeerRelay = true` is advertised to
+    /// the control plane, and incoming `AllocateUDPRelayEndpointRequest` disco
+    /// messages received via DERP are handled locally. Default OFF.
+    pub fn peer_relay_server(mut self, on: bool) -> Self {
+        self.peer_relay_server = on;
+        self
+    }
+
+    /// Set a custom `ServerConfig` for the relay server (lifetimes, port).
+    /// Only effective when `peer_relay_server(true)` is also set. Used by
+    /// integration tests to set shortened lifetimes for expiry scenarios.
+    pub fn relay_server_config(mut self, config: rustscale_udprelay::ServerConfig) -> Self {
+        self.relay_server_config = Some(config);
         self
     }
 
@@ -646,6 +672,32 @@ impl Server {
         self.inner.as_ref().map(|i| i.control_knobs.clone())
     }
 
+    /// The relay server extension, if this node was started with
+    /// `peer_relay_server(true)`. Returns `None` otherwise.
+    pub fn relay_server(&self) -> Option<Arc<rustscale_magicsock::RelayServerExtension>> {
+        self.inner.as_ref().and_then(|i| i.magicsock.relay_server().cloned())
+    }
+
+    /// The magicsock instance, if the server is up. Exposed for integration
+    /// tests that need to inspect path state or trigger link changes.
+    pub fn magicsock(&self) -> Option<Arc<Magicsock>> {
+        self.inner.as_ref().map(|i| i.magicsock.clone())
+    }
+
+    /// Trigger a link change: re-gather local endpoints, reset direct paths,
+    /// and close DERP connections for reconnection. Delegates to magicsock.
+    pub fn link_changed(&self) {
+        if let Some(ref inner) = self.inner {
+            inner.magicsock.link_changed();
+        }
+    }
+
+    /// The current path class for a peer (for testing). Returns `None` if
+    /// the server is not up or the peer is not in the netmap.
+    pub fn peer_path_class(&self, peer: &NodePublic) -> Option<rustscale_magicsock::PathClass> {
+        self.inner.as_ref().map(|i| i.magicsock.peer_path_class(peer))
+    }
+
     /// The LocalAPI Unix socket path, if the server was spawned. Returns
     /// `None` if the LocalAPI was not enabled or the server is not up.
     pub fn localapi_path(&self) -> Option<&PathBuf> {
@@ -734,6 +786,7 @@ impl Server {
             b.advertise_routes.clone(),
             b.derp_map.clone(),
             b.home_derp,
+            self.config.peer_relay_server,
         );
 
         // Netstack data-plane pump: netstack <-> WG <-> magicsock.
@@ -847,6 +900,7 @@ impl Server {
                         Hostname: b.hostname.clone(),
                         RoutableIPs: b.advertise_routes.clone(),
                         Services: services,
+                        PeerRelay: self.config.peer_relay_server,
                         ..Default::default()
                     }),
                     ..Default::default()
@@ -1056,6 +1110,7 @@ impl Server {
             b.advertise_routes.clone(),
             b.derp_map.clone(),
             b.home_derp,
+            self.config.peer_relay_server,
         );
 
         let map_update = spawn_map_update_task(
@@ -1123,6 +1178,7 @@ impl Server {
                         Hostname: b.hostname.clone(),
                         RoutableIPs: b.advertise_routes.clone(),
                         Services: services,
+                        PeerRelay: self.config.peer_relay_server,
                         ..Default::default()
                     }),
                     ..Default::default()
@@ -1354,6 +1410,7 @@ impl Server {
                 OS: std::env::consts::OS.to_string(),
                 Hostname: self.config.hostname.clone(),
                 RoutableIPs: advertise.clone(),
+                PeerRelay: self.config.peer_relay_server,
                 ..Default::default()
             }),
             Ephemeral: self.config.ephemeral,
@@ -1444,6 +1501,7 @@ impl Server {
                 OS: std::env::consts::OS.to_string(),
                 Hostname: self.config.hostname.clone(),
                 RoutableIPs: advertise.clone(),
+                PeerRelay: self.config.peer_relay_server,
                 ..Default::default()
             }),
             ..Default::default()
@@ -1481,6 +1539,7 @@ impl Server {
                     OS: std::env::consts::OS.to_string(),
                     Hostname: self.config.hostname.clone(),
                     RoutableIPs: advertise.clone(),
+                    PeerRelay: self.config.peer_relay_server,
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -1576,6 +1635,7 @@ impl Server {
                 Hostname: self.config.hostname.clone(),
                 RoutableIPs: advertise.clone(),
                 NetInfo: Some(netinfo.clone()),
+                PeerRelay: self.config.peer_relay_server,
                 ..Default::default()
             }),
             ..Default::default()
@@ -1632,6 +1692,7 @@ impl Server {
                 Hostname: self.config.hostname.clone(),
                 RoutableIPs: advertise.clone(),
                 NetInfo: Some(netinfo.clone()),
+                PeerRelay: self.config.peer_relay_server,
                 ..Default::default()
             }),
             ..Default::default()
@@ -1657,6 +1718,7 @@ impl Server {
                 Hostname: self.config.hostname.clone(),
                 RoutableIPs: advertise.clone(),
                 NetInfo: Some(netinfo.clone()),
+                PeerRelay: self.config.peer_relay_server,
                 ..Default::default()
             }),
             ..Default::default()
@@ -1688,6 +1750,8 @@ impl Server {
                 portmapper: Some(portmapper),
                 health: Some(health.clone()),
                 disable_direct_paths: self.config.disable_direct_paths,
+                peer_relay_server: self.config.peer_relay_server,
+                relay_server_config: self.config.relay_server_config.clone(),
             })
             .await?,
         );
@@ -1702,6 +1766,11 @@ impl Server {
         let mut peers = map_resp.Peers.clone();
         if peers.is_empty() && !map_resp.PeersChanged.is_empty() {
             peers = map_resp.PeersChanged.clone();
+        }
+        // Update the self node's CapMap from the first MapResponse so the
+        // relay server extension can check NODE_ATTR_DISABLE_RELAY_SERVER.
+        if let Some(ref node) = map_resp.Node {
+            magicsock.set_self_cap_map(node.CapMap.clone());
         }
         magicsock.set_netmap(peers.clone()).await?;
 
@@ -2650,6 +2719,12 @@ fn spawn_map_update_task(
                         control_knobs.apply(knobs);
                     }
 
+                    // Update the self node's CapMap in magicsock so the relay
+                    // server extension can check NODE_ATTR_DISABLE_RELAY_SERVER.
+                    if let Some(ref node) = resp.Node {
+                        magicsock.set_self_cap_map(node.CapMap.clone());
+                    }
+
                     // Merge peer deltas.
                     {
                         let mut peers = peers_arc.write().await;
@@ -3038,6 +3113,7 @@ fn spawn_periodic_endpoint_updates(
     advertise_routes: Vec<String>,
     derp_map: DERPMap,
     home_derp: i32,
+    peer_relay_server: bool,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let node_pub = node_key.public();
@@ -3077,6 +3153,7 @@ fn spawn_periodic_endpoint_updates(
                         WorkingUDP: OptBool::True,
                         ..Default::default()
                     }),
+                    PeerRelay: peer_relay_server,
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -3247,7 +3324,7 @@ async fn connect_home_derp(
         &dial_addr,
         &tls_host,
         port,
-        true,
+        !node.InsecureForTests,
         node.InsecureForTests,
         node_key.clone(),
     )

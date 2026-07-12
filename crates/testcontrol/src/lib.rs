@@ -63,6 +63,7 @@ struct ServerInner {
     updates: HashMap<NodeID, mpsc::Sender<UpdateType>>,
     all_expired: bool,
     dns_config: Option<DNSConfig>,
+    derp_map: Option<DERPMap>,
     node_cap_maps: HashMap<NodePublic, NodeCapMap>,
     msg_to_send: HashMap<NodePublic, VecDeque<MapResponse>>,
     suppress_auto: HashSet<NodePublic>,
@@ -104,6 +105,7 @@ impl Server {
                 updates: HashMap::new(),
                 all_expired: false,
                 dns_config: None,
+                derp_map: None,
                 node_cap_maps: HashMap::new(),
                 msg_to_send: HashMap::new(),
                 suppress_auto: HashSet::new(),
@@ -215,6 +217,17 @@ impl Server {
     pub fn set_dns_config(&self, dns: DNSConfig) {
         let mut inner = self.inner.lock().unwrap();
         inner.dns_config = Some(dns);
+        for tx in inner.updates.values() {
+            let _ = tx.try_send(UpdateType::SelfChanged);
+        }
+    }
+
+    /// Set the DERPMap to include in map responses. When set, all map
+    /// responses will include this DERPMap instead of the empty default.
+    /// Used by integration tests to point nodes at a local DERP server.
+    pub fn set_derp_map(&self, derp_map: DERPMap) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.derp_map = Some(derp_map);
         for tx in inner.updates.values() {
             let _ = tx.try_send(UpdateType::SelfChanged);
         }
@@ -861,8 +874,23 @@ fn build_map_response(
         node.KeyExpiry = Some(chrono::Utc::now() - chrono::Duration::minutes(1));
     }
 
-    // Build peers list (all nodes except self).
-    let mut peers: Vec<Node> = g.nodes.values().filter(|p| p.Key != *nk).cloned().collect();
+    // Build peers list (all nodes except self), applying per-node cap maps.
+    let mut peers: Vec<Node> = g
+        .nodes
+        .values()
+        .filter(|p| p.Key != *nk)
+        .cloned()
+        .collect();
+    for p in &mut peers {
+        if let Some(cap_map) = g.node_cap_maps.get(&p.Key) {
+            p.CapMap = cap_map.clone();
+        }
+        // Set HomeDERP to region 1 (the test DERP region) if not already set.
+        // This is needed for DERP-based relay allocation to work in tests.
+        if p.HomeDERP == 0 {
+            p.HomeDERP = 1;
+        }
+    }
     peers.sort_by(|a, b| a.ID.cmp(&b.ID));
 
     // Build user profiles.
@@ -885,9 +913,13 @@ fn build_map_response(
     let v6 = format!("fd7a:115c:a1e0::{id:x}");
     node.Addresses = vec![format!("{v4}/32"), format!("{v6}/128")];
     node.AllowedIPs.clone_from(&node.Addresses);
+    // Set HomeDERP to region 1 (the test DERP region) if not already set.
+    if node.HomeDERP == 0 {
+        node.HomeDERP = 1;
+    }
 
     let derp_map = if include_derp {
-        Some(DERPMap::default())
+        g.derp_map.clone().or_else(|| Some(DERPMap::default()))
     } else {
         None
     };

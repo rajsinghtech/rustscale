@@ -181,6 +181,7 @@ impl SshHandler {
             channel_id,
             data_rx,
             done_tx,
+            recorder: None,
         };
 
         if self.config.session_tx.send(init).await.is_err() {

@@ -1,0 +1,15 @@
+[package]
+name = "rustscale-clientupdate"
+description = "Client update checker for rustscale — port of Go's clientupdate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rustscale-tailcfg = { path = "../tailcfg", version = "0.1.0" }
+thiserror.workspace = true
+log = "0.4"

@@ -7,7 +7,7 @@ impl Server {
     /// This is the classic tsnet embedding path: an in-process smoltcp netstack
     /// backs `listen`/`dial`. For a full-client TUN device instead, use
     /// [`Server::up_tun`].
-#[allow(clippy::large_futures)]
+    #[allow(clippy::large_futures)]
     ///
     /// **Idempotent**: calling `up()` on an already-running server returns
     /// `Ok(ServerStatus)` immediately without re-starting. Mirrors Go's
@@ -250,6 +250,7 @@ impl Server {
                 health: b.health.clone(),
                 dns_config: b.dns_config.clone(),
                 packet_drops: b.packet_drops.clone(),
+                metrics: localapi::default_metric_registry(),
                 prefs: Arc::new(RwLock::new(self.load_prefs().unwrap_or_default())),
                 tailscale_ips: b.tailscale_ips.clone(),
                 our_fqdn: b.our_fqdn.clone(),
@@ -416,7 +417,7 @@ impl Server {
     /// `config.apply_routes` is true, the interface is brought up and tailnet
     /// routes are added via `ifconfig`/`route` (macOS) or `ip` (Linux) — also
     /// requiring root.
-#[allow(clippy::large_futures)]
+    #[allow(clippy::large_futures)]
     pub async fn up_tun(&mut self, config: TunModeConfig) -> Result<ServerStatus, TsnetError> {
         if self.inner.is_some() {
             return Ok(self.status());
@@ -635,6 +636,7 @@ impl Server {
                 health: b.health.clone(),
                 dns_config: b.dns_config.clone(),
                 packet_drops: b.packet_drops.clone(),
+                metrics: localapi::default_metric_registry(),
                 prefs: Arc::new(RwLock::new(self.load_prefs().unwrap_or_default())),
                 tailscale_ips: b.tailscale_ips.clone(),
                 our_fqdn: b.our_fqdn.clone(),
@@ -919,6 +921,7 @@ impl Server {
             health: Tracker::new(),
             dns_config: Arc::new(RwLock::new(None)),
             packet_drops: Arc::new(AtomicU64::new(0)),
+            metrics: localapi::default_metric_registry(),
             prefs: prefs.clone(),
             tailscale_ips: vec![],
             our_fqdn: String::new(),

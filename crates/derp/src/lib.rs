@@ -48,6 +48,8 @@ pub enum DerpError {
         expected: rustscale_key::NodePublic,
         actual: rustscale_key::NodePublic,
     },
+    #[error("proxy: {0}")]
+    Proxy(String),
 }
 
 // Re-export frame type constants for convenience.

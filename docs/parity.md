@@ -63,7 +63,7 @@ P3 status: hostinfo darwin ✅ (OSVersion + DeviceModel via sysctl) · quarantin
 | Outbound dial abstraction | `net/tsdial/` | ⬜ `netns::dial_tcp()` exists but missing PeerAPI/DoH/DNS-map routing |
 | Localhost port proxy map | `net/proxymap/` | ⬜ ephemeral localhost->remote IP port mapping for proxied conns |
 | HTTP CONNECT proxy | `net/connectproxy/` | ✅ `crates/connectproxy`: `ConnectProxyConfig`, `parse_connect_request`, `handle_connect` with bidirectional tunnel |
-| HTTP proxy env detection | `net/tshttpproxy/` | ⬜ `--http-proxy-server` flag exists but "not yet wired" |
+| HTTP proxy env detection | `net/tshttpproxy/` | ✅ `crates/tshttpproxy`: `proxy_from_environment` + `http_connect` (HTTP/1.1 CONNECT tunnel w/ Proxy-Authorization); wired into controlhttp (`dial_control`, `fetch_server_pub_key`, `tls_connect`) and derp (`connect_insecure`, `connect_with_upgrade_dial_insecure` — downgrades upgrade→direct TLS over tunnel when proxied) |
 | Embedded TLS roots fallback | `net/bakedroots/` | ⬜ container/minimal-Linux control-plane cert validation |
 | OS-level route management | `wgengine/router/` | 🔶 `crates/routetable` reads routes via PF_ROUTE sysctl; `tun_pump.rs` installs routes via shell (route/ip); no clean router abstraction |
 | LocalAPI authorization | `ipn/ipnauth/` | ⬜ socket 0600 permission only; no unix_peer_creds middleware |

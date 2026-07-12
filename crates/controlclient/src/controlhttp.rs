@@ -15,6 +15,7 @@ use rustscale_key::{MachinePrivate, MachinePublic};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::rustls::pki_types::ServerName;
+use url::Url;
 
 use crate::controlbase::{client_deferred, NoiseConn, NoiseError, ProtocolVersion};
 
@@ -168,6 +169,18 @@ fn dns_resolver() -> &'static rustscale_dnscache::Resolver {
     })
 }
 
+/// Consult `tshttpproxy::proxy_from_environment` for `scheme://host:port`.
+/// Returns `None` when no proxy is configured or the host is exempt via
+/// `no_proxy` — matching Go's `tshttpproxy.ProxyFromEnvironment` posture
+/// where detection errors are non-fatal (the direct dial surfaces real
+/// connectivity failures).
+fn proxy_url_for(scheme: &str, host: &str, port: u16) -> Option<Url> {
+    let url = Url::parse(&format!("{scheme}://{host}:{port}")).ok()?;
+    rustscale_tshttpproxy::proxy_from_environment(&url)
+        .ok()
+        .flatten()
+}
+
 /// JSON response from `GET /key?v=<version>` (matching Go's
 /// `OverTLSPublicKeyResponse`).
 #[derive(serde::Deserialize)]
@@ -199,6 +212,9 @@ pub enum DialError {
     /// An I/O error.
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    /// An HTTP CONNECT proxy tunnel failed.
+    #[error("proxy: {0}")]
+    Proxy(String),
 }
 
 /// A Noise transport channel owning both the cipher state and the underlying
@@ -257,9 +273,15 @@ pub async fn dial_control(
 ) -> Result<NoiseStream<AnyStream>, DialError> {
     let parsed = parse_control_url(url);
     if parsed.is_plain {
-        let tcp = tokio::net::TcpStream::connect((parsed.host.as_str(), parsed.port))
-            .await
-            .map_err(DialError::Io)?;
+        let tcp = if let Some(proxy) = proxy_url_for("http", &parsed.host, parsed.port) {
+            rustscale_tshttpproxy::http_connect(&proxy, &parsed.host, parsed.port)
+                .await
+                .map_err(|e| DialError::Proxy(e.to_string()))?
+        } else {
+            tokio::net::TcpStream::connect((parsed.host.as_str(), parsed.port))
+                .await
+                .map_err(DialError::Io)?
+        };
         let stream = AnyStream::Plain(tcp);
         upgrade_and_handshake(stream, &parsed.host_port, machine_key, control_key, version).await
     } else {
@@ -290,9 +312,15 @@ pub async fn fetch_server_pub_key(
 
     let read_buf: Vec<u8> = if parsed.is_plain {
         // Plain TCP — no TLS (for testcontrol and local fakes).
-        let mut tcp = tokio::net::TcpStream::connect((parsed.host.as_str(), parsed.port))
-            .await
-            .map_err(DialError::Io)?;
+        let mut tcp = if let Some(proxy) = proxy_url_for("http", &parsed.host, parsed.port) {
+            rustscale_tshttpproxy::http_connect(&proxy, &parsed.host, parsed.port)
+                .await
+                .map_err(|e| DialError::Proxy(e.to_string()))?
+        } else {
+            tokio::net::TcpStream::connect((parsed.host.as_str(), parsed.port))
+                .await
+                .map_err(DialError::Io)?
+        };
 
         let request = format!(
             "GET /key?v={version} HTTP/1.1\r\n\
@@ -391,7 +419,11 @@ async fn tls_connect(
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, DialError> {
     ensure_ring_provider();
 
-    let tcp = if port == 443 && !insecure {
+    let tcp = if let Some(proxy) = proxy_url_for("https", host, port) {
+        rustscale_tshttpproxy::http_connect(&proxy, host, port)
+            .await
+            .map_err(|e| DialError::Proxy(e.to_string()))?
+    } else if port == 443 && !insecure {
         dns_resolver()
             .dial_tcp(host, port)
             .await

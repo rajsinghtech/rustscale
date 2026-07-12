@@ -5,6 +5,7 @@ use std::time::Instant;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
+use url::Url;
 
 use rustscale_key::{NodePrivate, NodePublic};
 
@@ -57,6 +58,17 @@ impl TokenBucket {
 /// Trait alias for a combined async read+write stream.
 pub trait DerpStream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> DerpStream for T {}
+
+/// Consult `tshttpproxy::proxy_from_environment` for `https://host:port`.
+/// Returns `None` when no proxy is configured or the host is exempt via
+/// `no_proxy`. Detection errors are treated as "no proxy" (the direct dial
+/// surfaces real connectivity failures), matching Go's `derphttp.dialNode`.
+fn proxy_url_for(host: &str, port: u16) -> Option<Url> {
+    let url = Url::parse(&format!("https://{host}:{port}")).ok()?;
+    rustscale_tshttpproxy::proxy_from_environment(&url)
+        .ok()
+        .flatten()
+}
 
 /// Read a complete DERP frame from an async reader.
 async fn read_frame_async<R: AsyncRead + Unpin>(
@@ -248,8 +260,14 @@ impl DerpClient {
         private_key: NodePrivate,
         expected_server_key: Option<NodePublic>,
     ) -> Result<Self, DerpError> {
-        let addr = format!("{host}:{port}");
-        let tcp = TcpStream::connect(&addr).await?;
+        let tcp = if let Some(proxy) = proxy_url_for(host, port) {
+            rustscale_tshttpproxy::http_connect(&proxy, host, port)
+                .await
+                .map_err(|e| DerpError::Proxy(e.to_string()))?
+        } else {
+            let addr = format!("{host}:{port}");
+            TcpStream::connect(&addr).await?
+        };
         tcp.set_nodelay(true).ok();
 
         if use_tls {
@@ -317,6 +335,34 @@ impl DerpClient {
         private_key: NodePrivate,
         expected_server_key: Option<NodePublic>,
     ) -> Result<Self, DerpError> {
+        // When an HTTP proxy is configured for this region (checked via the
+        // canonical tls_host, matching Go's `proxyFromEnv` using `n.Addr()`),
+        // tunnel through it with CONNECT and skip the HTTP upgrade — Go's
+        // `dialNodeUsingProxy` does a plain TLS+DERP handshake over the
+        // tunnel.
+        if let Some(proxy) = proxy_url_for(tls_host, port) {
+            let tcp = rustscale_tshttpproxy::http_connect(&proxy, dial_addr, port)
+                .await
+                .map_err(|e| DerpError::Proxy(e.to_string()))?;
+            tcp.set_nodelay(true).ok();
+
+            let stream: Box<dyn DerpStream> = if use_tls {
+                let config = if insecure {
+                    insecure_tls_config()
+                } else {
+                    tls_config()
+                };
+                let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+                let server_name = rustls::pki_types::ServerName::try_from(tls_host.to_string())
+                    .map_err(|e| DerpError::BadFrame(format!("invalid server name: {e}")))?;
+                let tls = connector.connect(server_name, tcp).await?;
+                Box::new(tls)
+            } else {
+                Box::new(tcp)
+            };
+            return Self::from_stream(stream, private_key, expected_server_key).await;
+        }
+
         let addr = format!("{dial_addr}:{port}");
         let tcp = TcpStream::connect(&addr).await?;
         tcp.set_nodelay(true).ok();

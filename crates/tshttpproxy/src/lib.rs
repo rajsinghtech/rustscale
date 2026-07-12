@@ -16,7 +16,16 @@ pub enum TsHttpProxyError {
 
     #[error("platform proxy detection failed: {0}")]
     PlatformDetection(String),
+
+    #[error("proxy IO: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("proxy CONNECT failed: {0}")]
+    ConnectFailed(String),
 }
+
+mod connect;
+pub use connect::http_connect;
 
 static NO_PROXY_UNTIL: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
 static SELF_PROXY_ADDRS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();

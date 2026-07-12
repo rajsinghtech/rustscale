@@ -30,14 +30,7 @@ jobs:
           - os: windows-latest
             name: Check (windows)
             check_only: true
-            # Windows full port is out of scope; crates netmon/netns/portmapper/tun
-            # (and possibly more) do not yet compile on windows-msvc. Tracked in
-            # docs/parity.md "Windows port" section + docs/phase-ci-parity.md.
-            # This leg is best-effort until a dedicated Windows-port phase lands.
-            continue-on-error: true
     runs-on: ${{ matrix.os }}
-    # Only the Windows leg is non-blocking; see the matrix include above.
-    continue-on-error: ${{ matrix.continue-on-error || false }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -57,6 +50,11 @@ jobs:
       - name: Check (windows)
         if: ${{ matrix.check_only }}
         run: cargo check --workspace --locked
+      - name: Test (windows-meaningful crates)
+        if: ${{ matrix.check_only && matrix.os == 'windows-latest' }}
+        run: |
+          cargo test -p rustscale-ipn -p rustscale-localclient -p rustscale-tailcfg \
+            -p rustscale-key -p rustscale-disco -p rustscale-safesocket --locked
       - name: Format check
         if: ${{ matrix.os == 'ubuntu-latest' }}
         run: cargo fmt --all --check
@@ -93,11 +91,7 @@ jobs:
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             packages: ''
-            # Same Windows-port gap as the check job above; non-blocking.
-            continue-on-error: true
     runs-on: ${{ matrix.os }}
-    # Only the windows-msvc leg is non-blocking; see the matrix include above.
-    continue-on-error: ${{ matrix.continue-on-error || false }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2

@@ -3,8 +3,10 @@ use std::path::{Path, PathBuf};
 use rustscale_tsnet::localapi::DaemonCommand;
 use rustscale_tsnet::{Server, TunModeConfig};
 
+#[cfg(unix)]
 const DEFAULT_STATE_DIR: &str = "/var/lib/rustscale";
-const PRIMARY_SOCKET_PATH: &str = "/var/run/rustscaled.sock";
+#[cfg(windows)]
+const DEFAULT_STATE_DIR: &str = "C:\\ProgramData\\Rustscale";
 
 pub async fn run(
     statedir: Option<PathBuf>,
@@ -137,16 +139,28 @@ fn print_status(server: &Server, socket_path: &Path) {
 }
 
 fn determine_socket_path(state_dir: &Path) -> PathBuf {
-    let primary = PathBuf::from(PRIMARY_SOCKET_PATH);
-    let fallback = state_dir.join("rustscaled.sock");
+    let primary = rustscale_safesocket::default_socket_path();
 
-    match rustscale_safesocket::listen(&primary) {
-        Ok(listener) => {
-            drop(listener);
-            let _ = std::fs::remove_file(&primary);
-            primary
+    // On Windows, the named pipe path is always the same — no fallback.
+    #[cfg(windows)]
+    {
+        let _ = state_dir;
+        return primary;
+    }
+
+    // On Unix, try the primary path first, then fall back to the state dir.
+    #[cfg(unix)]
+    {
+        let fallback = state_dir.join("rustscaled.sock");
+
+        match rustscale_safesocket::listen(&primary) {
+            Ok(listener) => {
+                drop(listener);
+                let _ = std::fs::remove_file(&primary);
+                primary
+            }
+            Err(_) => fallback,
         }
-        Err(_) => fallback,
     }
 }
 

@@ -634,6 +634,7 @@ fn likely_home_router_ip_impl() -> Option<(IpAddr, IpAddr)> {
 
 /// Find the first private IPv4 address on `ifname` that is in the same subnet
 /// as `gateway`.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn find_self_ip_on_interface(ifname: &str, gateway: &IpAddr) -> Option<IpAddr> {
     let ifaces = if_addrs::get_if_addrs().ok()?;
     let gw_v4 = match gateway {

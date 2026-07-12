@@ -5,13 +5,13 @@
 //!
 //! No external network access required — everything runs in-process.
 
-use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
 use rustscale_safesocket::connect;
 use rustscale_testcontrol::Server as TestControlServer;
 use rustscale_tsnet::Server;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Build an HTTP/1.1 GET request for the given path.
 fn http_get(path: &str) -> Vec<u8> {
@@ -19,13 +19,16 @@ fn http_get(path: &str) -> Vec<u8> {
 }
 
 /// Send an HTTP request over a Unix socket and read the full response.
-fn unix_http_request(socket_path: &std::path::Path, path: &str) -> String {
+async fn unix_http_request(socket_path: &std::path::Path, path: &str) -> String {
     let mut conn = connect(socket_path).expect("connect to LocalAPI socket");
     let req = http_get(path);
-    conn.write_all(&req).expect("write HTTP request to socket");
-    conn.flush().expect("flush");
+    conn.write_all(&req)
+        .await
+        .expect("write HTTP request to socket");
+    conn.flush().await.expect("flush");
     let mut buf = Vec::with_capacity(8192);
     conn.read_to_end(&mut buf)
+        .await
         .expect("read HTTP response from socket");
     String::from_utf8(buf).unwrap_or_default()
 }
@@ -114,7 +117,7 @@ async fn localapi_status_and_health_over_safesocket() {
     );
 
     // 6. GET /localapi/v0/status — expect 200 + valid JSON with BackendState.
-    let resp = unix_http_request(&socket_path, "/localapi/v0/status");
+    let resp = unix_http_request(&socket_path, "/localapi/v0/status").await;
     eprintln!("status response: {resp}");
     assert_eq!(
         status_code(&resp),
@@ -136,7 +139,7 @@ async fn localapi_status_and_health_over_safesocket() {
     eprintln!("status JSON validated: BackendState=Running, Self.HostName present");
 
     // 7. GET /localapi/v0/health — expect 200 + valid JSON array.
-    let resp = unix_http_request(&socket_path, "/localapi/v0/health");
+    let resp = unix_http_request(&socket_path, "/localapi/v0/health").await;
     eprintln!("health response: {resp}");
     assert_eq!(
         status_code(&resp),

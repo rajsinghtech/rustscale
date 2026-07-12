@@ -101,6 +101,7 @@ fn likely_home_router_ip_impl() -> Option<GatewayInfo> {
 
 /// Find the first non-loopback, non-link-local IPv4 address on the named
 /// interface. Falls back to loopback if nothing else is present.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn ip_for_interface(name: &str) -> Option<Ipv4Addr> {
     let ifaces = if_addrs::get_if_addrs().ok()?;
     let mut loopback_fallback: Option<Ipv4Addr> = None;
@@ -125,6 +126,7 @@ fn ip_for_interface(name: &str) -> Option<Ipv4Addr> {
 }
 
 /// Whether an IPv4 address is link-local (169.254.0.0/16).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn is_link_local(addr: Ipv4Addr) -> bool {
     let o = addr.octets();
     o[0] == 169 && o[1] == 254

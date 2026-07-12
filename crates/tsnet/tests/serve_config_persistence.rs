@@ -1,59 +1,59 @@
 //! Integration test: serve config persistence across daemon restart,
 //! and profile switch via LocalAPI. Uses testcontrol — no external network.
 
-use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
 use rustscale_safesocket::connect;
 use rustscale_testcontrol::Server as TestControlServer;
 use rustscale_tsnet::Server;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-fn http_get(socket_path: &std::path::Path, path: &str) -> String {
+async fn http_get(socket_path: &std::path::Path, path: &str) -> String {
     let mut conn = connect(socket_path).expect("connect");
     let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
-    conn.write_all(req.as_bytes()).expect("write");
-    conn.flush().expect("flush");
+    conn.write_all(req.as_bytes()).await.expect("write");
+    conn.flush().await.expect("flush");
     let mut buf = Vec::with_capacity(8192);
-    conn.read_to_end(&mut buf).expect("read");
+    conn.read_to_end(&mut buf).await.expect("read");
     String::from_utf8(buf).unwrap_or_default()
 }
 
-fn http_post_body(socket_path: &std::path::Path, path: &str, body: &str) -> String {
+async fn http_post_body(socket_path: &std::path::Path, path: &str, body: &str) -> String {
     let mut conn = connect(socket_path).expect("connect");
     let req = format!(
         "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         body.len(),
         body
     );
-    conn.write_all(req.as_bytes()).expect("write");
-    conn.flush().expect("flush");
+    conn.write_all(req.as_bytes()).await.expect("write");
+    conn.flush().await.expect("flush");
     let mut buf = Vec::with_capacity(8192);
-    conn.read_to_end(&mut buf).expect("read");
+    conn.read_to_end(&mut buf).await.expect("read");
     String::from_utf8(buf).unwrap_or_default()
 }
 
-fn http_put(socket_path: &std::path::Path, path: &str) -> String {
+async fn http_put(socket_path: &std::path::Path, path: &str) -> String {
     let mut conn = connect(socket_path).expect("connect");
     let req = format!(
         "PUT {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
     );
-    conn.write_all(req.as_bytes()).expect("write");
-    conn.flush().expect("flush");
+    conn.write_all(req.as_bytes()).await.expect("write");
+    conn.flush().await.expect("flush");
     let mut buf = Vec::with_capacity(8192);
-    conn.read_to_end(&mut buf).expect("read");
+    conn.read_to_end(&mut buf).await.expect("read");
     String::from_utf8(buf).unwrap_or_default()
 }
 
-fn http_delete(socket_path: &std::path::Path, path: &str) -> String {
+async fn http_delete(socket_path: &std::path::Path, path: &str) -> String {
     let mut conn = connect(socket_path).expect("connect");
     let req = format!(
-        "DELETE {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        "DELETE {path} HTTP/1.1\r\nHost: localhost\rContent-Length: 0\r\nConnection: close\r\n\r\n"
     );
-    conn.write_all(req.as_bytes()).expect("write");
-    conn.flush().expect("flush");
+    conn.write_all(req.as_bytes()).await.expect("write");
+    conn.flush().await.expect("flush");
     let mut buf = Vec::with_capacity(8192);
-    conn.read_to_end(&mut buf).expect("read");
+    conn.read_to_end(&mut buf).await.expect("read");
     String::from_utf8(buf).unwrap_or_default()
 }
 
@@ -121,12 +121,12 @@ async fn serve_config_persists_across_restart() {
 
     // POST a serve config.
     let config = r#"{"TCP":{"8080":{"HTTP":true}}}"#;
-    let resp = http_post_body(&socket_path, "/localapi/v0/serve-config", config);
+    let resp = http_post_body(&socket_path, "/localapi/v0/serve-config", config).await;
     eprintln!("POST serve-config response: {resp}");
     assert_eq!(status_code(&resp), 200, "POST should return 200");
 
     // GET to verify it's there.
-    let resp = http_get(&socket_path, "/localapi/v0/serve-config");
+    let resp = http_get(&socket_path, "/localapi/v0/serve-config").await;
     eprintln!("GET serve-config response (before restart): {resp}");
     assert_eq!(status_code(&resp), 200);
     let body = json_body(&resp);
@@ -162,7 +162,7 @@ async fn serve_config_persists_across_restart() {
     wait_for_socket(&socket_path2, Duration::from_secs(10));
 
     // GET the config — it should have been loaded from disk.
-    let resp = http_get(&socket_path2, "/localapi/v0/serve-config");
+    let resp = http_get(&socket_path2, "/localapi/v0/serve-config").await;
     eprintln!("GET serve-config response (after restart): {resp}");
     assert_eq!(
         status_code(&resp),
@@ -211,17 +211,17 @@ async fn profile_switch_integration() {
     wait_for_socket(&socket_path, Duration::from_secs(10));
 
     // Create profile 1.
-    let resp = http_put(&socket_path, "/localapi/v0/profiles");
+    let resp = http_put(&socket_path, "/localapi/v0/profiles").await;
     eprintln!("PUT profiles (1): {resp}");
     assert_eq!(status_code(&resp), 201, "PUT should create profile 1");
 
     // Create profile 2.
-    let resp = http_put(&socket_path, "/localapi/v0/profiles");
+    let resp = http_put(&socket_path, "/localapi/v0/profiles").await;
     eprintln!("PUT profiles (2): {resp}");
     assert_eq!(status_code(&resp), 201, "PUT should create profile 2");
 
     // List profiles — should have 2.
-    let resp = http_get(&socket_path, "/localapi/v0/profiles");
+    let resp = http_get(&socket_path, "/localapi/v0/profiles").await;
     eprintln!("GET profiles: {resp}");
     assert_eq!(status_code(&resp), 200);
     let body = json_body(&resp);
@@ -234,7 +234,7 @@ async fn profile_switch_integration() {
     assert_ne!(id1, id2, "IDs should differ");
 
     // Current should be profile 2 (last created).
-    let resp = http_get(&socket_path, "/localapi/v0/profiles/current");
+    let resp = http_get(&socket_path, "/localapi/v0/profiles/current").await;
     eprintln!("GET current (should be profile 2): {resp}");
     assert_eq!(status_code(&resp), 200);
     let body = json_body(&resp);
@@ -246,12 +246,12 @@ async fn profile_switch_integration() {
     );
 
     // Switch to profile 1.
-    let resp = http_post_body(&socket_path, &format!("/localapi/v0/profiles/{id1}"), "");
+    let resp = http_post_body(&socket_path, &format!("/localapi/v0/profiles/{id1}"), "").await;
     eprintln!("POST switch to profile 1: {resp}");
     assert_eq!(status_code(&resp), 204, "switch should return 204");
 
     // Current should now be profile 1.
-    let resp = http_get(&socket_path, "/localapi/v0/profiles/current");
+    let resp = http_get(&socket_path, "/localapi/v0/profiles/current").await;
     eprintln!("GET current (should be profile 1): {resp}");
     assert_eq!(status_code(&resp), 200);
     let body = json_body(&resp);
@@ -264,12 +264,12 @@ async fn profile_switch_integration() {
     );
 
     // Delete profile 1.
-    let resp = http_delete(&socket_path, &format!("/localapi/v0/profiles/{id2}"));
+    let resp = http_delete(&socket_path, &format!("/localapi/v0/profiles/{id2}")).await;
     eprintln!("DELETE profile 2: {resp}");
     assert_eq!(status_code(&resp), 204, "delete should return 204");
 
     // List should have 1 profile.
-    let resp = http_get(&socket_path, "/localapi/v0/profiles");
+    let resp = http_get(&socket_path, "/localapi/v0/profiles").await;
     let body = json_body(&resp);
     let profiles: serde_json::Value =
         serde_json::from_str(body).expect("parse profiles after delete");

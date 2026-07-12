@@ -34,7 +34,8 @@ use rustscale_ipn::{LoginProfile, MaskedPrefs, NotifyWatchOpt, Prefs, StartOptio
 use rustscale_tailcfg::DERPMap;
 use rustscale_tsnet::{FileTarget, ServeConfig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
+
+use rustscale_safesocket::Connection;
 
 /// The fake Host header value, analogous to Go's `apitype.LocalAPIHost`.
 const LOCAL_API_HOST: &str = "local-rustscaled.sock";
@@ -447,11 +448,8 @@ impl LocalClient {
         body: &[u8],
         extra_headers: &[(String, String)],
     ) -> Result<RawResponseWithHeaders, LocalClientError> {
-        let std_conn = rustscale_safesocket::connect(&self.socket_path)
+        let mut stream = rustscale_safesocket::connect(&self.socket_path)
             .map_err(|e| LocalClientError::Connect(e.to_string()))?;
-        let _ = std_conn.set_nonblocking(true);
-        let mut stream =
-            UnixStream::from_std(std_conn).map_err(|e| LocalClientError::Connect(e.to_string()))?;
 
         let mut request = format!(
             "{method} {path} HTTP/1.1\r\nHost: {LOCAL_API_HOST}\r\n\
@@ -509,12 +507,9 @@ impl LocalClient {
         &self,
         method: &str,
         path: &str,
-    ) -> Result<UnixStream, LocalClientError> {
-        let std_conn = rustscale_safesocket::connect(&self.socket_path)
+    ) -> Result<Connection, LocalClientError> {
+        let mut stream = rustscale_safesocket::connect(&self.socket_path)
             .map_err(|e| LocalClientError::Connect(e.to_string()))?;
-        let _ = std_conn.set_nonblocking(true);
-        let mut stream =
-            UnixStream::from_std(std_conn).map_err(|e| LocalClientError::Connect(e.to_string()))?;
 
         let request = format!(
             "{method} {path} HTTP/1.1\r\nHost: {LOCAL_API_HOST}\r\n\
@@ -539,7 +534,7 @@ struct RawResponseWithHeaders {
 
 /// Read a complete HTTP/1.1 response including the ETag header.
 async fn read_full_response_with_headers(
-    stream: &mut UnixStream,
+    stream: &mut Connection,
 ) -> Result<RawResponseWithHeaders, LocalClientError> {
     let mut buf = Vec::with_capacity(8192);
     let mut tmp = [0u8; 4096];

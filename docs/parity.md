@@ -185,6 +185,28 @@ touching `Cargo.lock` or `deny.toml`. Version stamping via
 `RUSTSCALE_VERSION_LONG`, fallback `CARGO_PKG_VERSION`), exposed through
 `ts_version()` FFI and `tools/version.sh`.
 
+## CI pipeline
+
+`ci.yml` ✅ phase-ci-parity: OS matrix (ubuntu-latest, macos-latest,
+windows-latest). Ubuntu + macOS run full build/test/clippy; Windows is
+`cargo check --workspace` only (check-only, no tests — Windows compilation
+not verified locally; cross-compile from macOS fails due to `ring` C code,
+but Rust code has cfg guards for non-macOS/Linux platforms). Cross-compile
+check matrix: aarch64-unknown-linux-gnu, armv7-unknown-linux-gnueabihf,
+x86_64-unknown-linux-musl (ubuntu), aarch64-apple-darwin (macos),
+x86_64-pc-windows-msvc (windows). `--locked` on every cargo invocation.
+Dirty-tree guard (git diff + untracked-file check) on ubuntu. MSRV job
+(1.91, dictated by smoltcp 0.13) — `rust-version = "1.91"` in workspace
+Cargo.toml. `alls-green` merge-gate job (`re-actors/alls-green`) aggregating
+check + cross + msrv + testcontrol. All actions SHA-pinned across all
+workflows. `testcontrol` job (Go interop) preserved. `merge_group` trigger
+added. `fuzz.yml` ✅ phase-ci-parity: cargo-fuzz targets for disco decode,
+DERP frame codec, STUN parse, portmapper PMP/PCP codecs; 60s per target on
+PRs touching parser crates, daily cron, crash artifacts uploaded.
+`sanitizer.yml` ✅ phase-ci-parity: weekly ThreadSanitizer (nightly, linux)
+over magicsock/derp/tsnet; `continue-on-error` (informational, non-blocking).
+Miri for codec crates deferred. Full spec: `docs/phase-ci-parity.md`.
+
 ## Cross-client interop verification
 
 `tools/interop.sh` runs 8 e2e tests against real Go tailscaled (1.98.8,

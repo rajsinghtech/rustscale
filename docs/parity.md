@@ -71,7 +71,7 @@ P3 status: hostinfo darwin ✅ (OSVersion + DeviceModel via sysctl) · quarantin
 | Service policy | `ipn/policy/` | ⬜ only `SSHPolicy` wire type exists; no policy engine |
 | Config file format | `ipn/conffile/` | ⬜ HUP-reloadable JSON config for daemon |
 | IPN extension system | `ipn/ipnext/` | ⬜ |
-| Cloud log shipping | `logtail/` | 🔶 `crates/logtail` buffers entries with proc_id/proc_seq metadata; HTTP upload is TODO stub |
+| Cloud log shipping | `logtail/` | ✅ `crates/logtail` — async upload loop (background tokio task), HTTP POST to `{base_url}/c/{collection}/{private_id}`, zstd compression (>256B, >64B savings), Retry-After/30–60s backoff, RFC3339Nano `client_time`, buffer cap + drop_count, upload metrics |
 | Port enumeration | `portlist/` | ⬜ |
 | Network flow logging | `wgengine/netlog/` | ⬜ |
 | Network error classification | `net/neterror/` | ✅ `rustscale-neterror` crate with `treat_as_lost_udp`, `packet_was_truncated`, `should_disable_udp_gso`, `is_closed_pipe_error`; wired into magicsock (send/disco paths), portmapper (PMP/PCP mapping sends), dns forwarder (UDP recv) |

@@ -1449,24 +1449,23 @@ impl Server {
         let login_trigger = Arc::new(tokio::sync::Notify::new());
         let auth_url = Arc::new(std::sync::Mutex::new(None));
 
-        let magicsock = Arc::new(
-            Magicsock::new(MagicsockConfig {
-                private_key: state.node_key.clone(),
-                disco_key: state.disco_key.clone(),
-                derp_client: None,
-                derp_map: Some(DERPMap::default()),
-                home_derp_region: 0,
-                udp_bind: None,
-                udp_socket: None,
-                portmapper: None,
-                health: None,
-                disable_direct_paths: false,
-                peer_relay_server: false,
-                relay_server_config: None,
-            })
-            .await
-            .map_err(TsnetError::Magicsock)?,
-        );
+        let (magicsock, _wg_rx) = Magicsock::new(MagicsockConfig {
+            private_key: state.node_key.clone(),
+            disco_key: state.disco_key.clone(),
+            derp_client: None,
+            derp_map: Some(DERPMap::default()),
+            home_derp_region: 0,
+            udp_bind: None,
+            udp_socket: None,
+            portmapper: None,
+            health: None,
+            disable_direct_paths: false,
+            peer_relay_server: false,
+            relay_server_config: None,
+        })
+        .await
+        .map_err(TsnetError::Magicsock)?;
+        let magicsock = Arc::new(magicsock);
 
         let socket_path = if let Some(ref p) = self.config.localapi_path {
             p.clone()

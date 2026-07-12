@@ -24,7 +24,7 @@ update statuses as phases land.
 | Serve/Funnel (ListenFunnel, ServeConfig, TCP fwd, reverse proxy) | `tsnet`, `ipn/serve*` | ✅ port-6 done (ServeConfig serde model: TCPPortHandler/WebServerConfig/HTTPHandler; Server::set_serve_config starts netstack listeners per port; TCP forward via copy_bidirectional; HTTP reverse proxy sets Host/X-Forwarded-For/Tailscale-User-Login/Name from WhoIs; static text handler; TLS-terminate with ControlCertProvider (self-signed fallback); listen_funnel validates port 443/8443/10000 + funnel node attr from netmap, returns typed FunnelError::NotEnabled on API-only tailnets; ts_serve_tcp FFI. Remaining: ingress peer Tailscale-Ingress-Target dispatch, Hostinfo.IngressEnabled advertisement) |
 | Tailscale Services (ListenService, PROXY protocol) | `tsnet.Server.ListenService` | ⬜ |
 | SOCKS5 proxy | `net/socks5/` | ✅ port-8: RFC 1928 CONNECT (v4/domain/v6), dials via shared tsnet resolve path, FFI; e2e green |
-| LocalAPI | `ipn/localapi/` | ⬜ port-9 |
+| LocalAPI | `ipn/localapi/` | ✅ port-9: full LocalAPI HTTP server on safesocket (status, whois, prefs, netmap, metrics, health, ping); daemon wires safesocket::listen → spawn_localapi; integration test proves GET /localapi/v0/status + /health over safesocket::connect returns 200 with valid JSON |
 | Auto-update / ClientVersion | — | ⬜ |
 | Multi-profile/login management | `ipn/ipnlocal/profiles.go` | ⬜ (single profile only) |
 

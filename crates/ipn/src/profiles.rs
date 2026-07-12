@@ -261,10 +261,7 @@ impl ProfileManager {
     pub fn switch_profile(&mut self, id: &str) -> Result<SwitchResult, ProfileError> {
         if let Some(ref cid) = self.current_id {
             if cid == id {
-                let profile = self
-                    .profile_by_id(id)
-                    .cloned()
-                    .unwrap_or_default();
+                let profile = self.profile_by_id(id).cloned().unwrap_or_default();
                 return Ok(SwitchResult {
                     profile,
                     changed: false,

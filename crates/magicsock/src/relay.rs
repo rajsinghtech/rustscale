@@ -20,33 +20,10 @@ use rustscale_disco::{
 };
 use rustscale_key::DiscoPublic;
 
-/// Geneve header length in bytes.
-pub const GENEVE_HEADER_LEN: usize = 8;
-
-/// Encode a Geneve data frame: 8-byte header + payload.
-///
-/// Header layout: version(0) | flags(0) | proto(2, big-endian) | VNI(3) | reserved(1).
-pub fn encode_geneve(vni: u32, payload: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(GENEVE_HEADER_LEN + payload.len());
-    out.push(0x00);
-    out.push(0x00);
-    out.extend_from_slice(&0x0800u16.to_be_bytes());
-    out.push((vni >> 16) as u8);
-    out.push((vni >> 8) as u8);
-    out.push(vni as u8);
-    out.push(0x00);
-    out.extend_from_slice(payload);
-    out
-}
-
-/// Decode a Geneve data frame, returning (VNI, payload slice).
-pub fn decode_geneve(data: &[u8]) -> Option<(u32, &[u8])> {
-    if data.len() < GENEVE_HEADER_LEN {
-        return None;
-    }
-    let vni = (u32::from(data[4]) << 16) | (u32::from(data[5]) << 8) | u32::from(data[6]);
-    Some((vni, &data[GENEVE_HEADER_LEN..]))
-}
+// Geneve codec lives in the udprelay crate; re-export for backward compat.
+pub use rustscale_udprelay::{
+    decode_geneve, encode_geneve, GENEVE_FIXED_HEADER_LENGTH as GENEVE_HEADER_LEN,
+};
 
 /// Read-only view of the relay handshake phase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

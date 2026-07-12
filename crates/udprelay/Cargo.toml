@@ -1,0 +1,21 @@
+[package]
+name = "rustscale-udprelay"
+description = "UDP peer relay server for rustscale"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rustscale-key = { path = "../key", version = "0.1.0" }
+rustscale-disco = { path = "../disco", version = "0.1.0" }
+thiserror.workspace = true
+blake2.workspace = true
+rand.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

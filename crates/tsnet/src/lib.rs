@@ -103,7 +103,7 @@ use rustscale_magicsock::{Magicsock, MagicsockConfig, MagicsockError};
 use rustscale_netstack::{Netstack, NetstackError, NetstackStream, DEFAULT_MTU};
 use rustscale_tailcfg::{
     DERPMap, DNSConfig, FilterRule, Hostinfo, MapRequest, MapResponse, NetInfo, Node, OptBool,
-    RegisterRequest, UserID, UserProfile,
+    RegisterRequest, SSHPolicy, UserID, UserProfile,
 };
 use rustscale_tun::Tun;
 use rustscale_wg::{WgError, WgTunn};
@@ -457,6 +457,12 @@ struct RunningState {
     dns_config: Arc<RwLock<Option<DNSConfig>>>,
     /// User profiles keyed by `UserID` (for WhoIs).
     user_profiles: Arc<RwLock<BTreeMap<UserID, UserProfile>>>,
+    /// Current SSH policy from the netmap (`MapResponse.SSHPolicy`).
+    /// `None` until the control server sends one; the SSH server rejects
+    /// all connections while this is `None`. Updated on each map response
+    /// that carries a new policy.
+    #[cfg_attr(not(feature = "ssh"), allow(dead_code))]
+    ssh_policy: Arc<RwLock<Option<SSHPolicy>>>,
     /// Network change monitor handle (None if the monitor couldn't start).
     monitor: Option<rustscale_netmon::MonitorHandle>,
     /// Machine private key (for control-plane set-dns during cert issuance).
@@ -591,6 +597,8 @@ struct Bootstrap {
     dns_config: Arc<RwLock<Option<DNSConfig>>>,
     /// User profiles keyed by UserID.
     user_profiles: Arc<RwLock<BTreeMap<UserID, UserProfile>>>,
+    /// Current SSH policy from the netmap (fed to the SSH server).
+    ssh_policy: Arc<RwLock<Option<SSHPolicy>>>,
     /// Machine private key (for link-change endpoint updates).
     machine_key: MachinePrivate,
     /// Server (control) public key (for link-change endpoint updates).
@@ -870,6 +878,7 @@ impl Server {
             b.resolver.clone(),
             b.dns_config.clone(),
             b.user_profiles.clone(),
+            b.ssh_policy.clone(),
             b.cancel.clone(),
             b.health.clone(),
             b.health_watchdog.clone(),
@@ -1098,6 +1107,7 @@ impl Server {
             domain: b.domain.clone(),
             dns_config: b.dns_config,
             user_profiles: b.user_profiles,
+            ssh_policy: b.ssh_policy,
             monitor,
             machine_key: b.machine_key,
             server_pub_key: b.server_pub_key,
@@ -1236,6 +1246,7 @@ impl Server {
             b.resolver.clone(),
             b.dns_config.clone(),
             b.user_profiles.clone(),
+            b.ssh_policy.clone(),
             b.cancel.clone(),
             b.health.clone(),
             b.health_watchdog.clone(),
@@ -1472,6 +1483,7 @@ impl Server {
             domain: b.domain.clone(),
             dns_config: b.dns_config,
             user_profiles: b.user_profiles,
+            ssh_policy: b.ssh_policy,
             monitor,
             machine_key: b.machine_key,
             server_pub_key: b.server_pub_key,
@@ -2208,6 +2220,10 @@ impl Server {
                 .map(|p| (p.ID, p.clone()))
                 .collect(),
         ));
+        // SSH policy from the first MapResponse. `None` means the control
+        // server hasn't sent a policy yet (SSH server rejects all connections
+        // until one arrives). Updated on each subsequent map response.
+        let ssh_policy = Arc::new(RwLock::new(map_resp.SSHPolicy.clone()));
         let resolver = Arc::new(RwLock::new(MagicDnsResolver::new(
             peers.clone(),
             &domain,
@@ -2269,6 +2285,7 @@ impl Server {
             domain,
             dns_config,
             user_profiles,
+            ssh_policy,
             machine_key: state.machine_key.clone(),
             server_pub_key,
             disco_key: state.disco_key.clone(),
@@ -3193,6 +3210,7 @@ fn spawn_map_update_task(
     resolver: Arc<RwLock<MagicDnsResolver>>,
     dns_config: Arc<RwLock<Option<DNSConfig>>>,
     user_profiles: Arc<RwLock<BTreeMap<UserID, UserProfile>>>,
+    ssh_policy: Arc<RwLock<Option<SSHPolicy>>>,
     cancel: Arc<CancelToken>,
     health: Tracker,
     health_watchdog: Watchdog,
@@ -3315,6 +3333,14 @@ fn spawn_map_update_task(
                         for up in &resp.UserProfiles {
                             ups.insert(up.ID, up.clone());
                         }
+                    }
+
+                    // Apply SSHPolicy delta (None = unchanged; Some = replace).
+                    // Mirrors Go's `ipn/ipnlocal/local.go` feeding
+                    // `netMap.SSHPolicy` into the SSH server on each netmap
+                    // update.
+                    if resp.SSHPolicy.is_some() {
+                        ssh_policy.write().await.clone_from(&resp.SSHPolicy);
                     }
 
                     // Create WG tunnels for new peers.

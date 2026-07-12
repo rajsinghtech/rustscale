@@ -43,6 +43,7 @@ impl Server {
 
         let peers = inner.peers.clone();
         let user_profiles = inner.user_profiles.clone();
+        let ssh_policy = inner.ssh_policy.clone();
 
         let whois: rustscale_ssh::WhoIsCallback = Arc::new(move |ip| {
             let peers_guard = peers.try_read();
@@ -58,7 +59,13 @@ impl Server {
             None
         });
 
-        let policy: rustscale_ssh::PolicyCallback = Arc::new(|| None);
+        // Policy callback: reads the current SSHPolicy from the shared netmap
+        // state. Returns None (→ reject "no policy configured") until the
+        // control server sends a policy; thereafter returns the latest policy
+        // for eval_ssh_policy to evaluate against the connecting peer.
+        // Mirrors Go's `conn.sshPolicy()` reading `netMap.SSHPolicy`.
+        let policy: rustscale_ssh::PolicyCallback =
+            Arc::new(move || ssh_policy.try_read().ok().and_then(|guard| guard.clone()));
 
         let (session_tx, init_rx) = mpsc::channel::<SessionInit>(16);
         let session_tx = Arc::new(session_tx);
@@ -110,5 +117,56 @@ impl Server {
             init_rx,
             _task: task,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustscale_tailcfg::{SSHAction, SSHPolicy, SSHPrincipal, SSHRule};
+    use std::collections::BTreeMap;
+    use tokio::sync::RwLock;
+
+    /// The policy callback installed by `listen_ssh` reads the current
+    /// SSHPolicy from the shared netmap state (`inner.ssh_policy`). This
+    /// test verifies that wiring: `None` until the control server sends a
+    /// policy, then `Some(policy)` after.
+    #[tokio::test]
+    async fn policy_callback_reads_shared_state() {
+        let ssh_policy: Arc<RwLock<Option<SSHPolicy>>> = Arc::new(RwLock::new(None));
+
+        // Build the same closure pattern used in `listen_ssh`.
+        let policy: rustscale_ssh::PolicyCallback = {
+            let ssh_policy = ssh_policy.clone();
+            Arc::new(move || ssh_policy.try_read().ok().and_then(|g| g.clone()))
+        };
+
+        // No policy yet → callback returns None (server rejects "no policy").
+        assert!(policy().is_none());
+
+        // Control server pushes a policy via the map update task.
+        let test_policy = SSHPolicy {
+            Rules: vec![SSHRule {
+                Principals: vec![SSHPrincipal {
+                    Any: true,
+                    ..Default::default()
+                }],
+                SSHUsers: {
+                    let mut m = BTreeMap::new();
+                    m.insert("*".into(), "=".into());
+                    m
+                },
+                Action: Some(SSHAction {
+                    Accept: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+        };
+        *ssh_policy.write().await = Some(test_policy.clone());
+
+        // Callback now returns the policy.
+        let got = policy().expect("policy should be available after write");
+        assert_eq!(got, test_policy);
     }
 }

@@ -81,7 +81,7 @@ Verdict legend:
 | # | Finding | Report | Verdict | Evidence (rustscale file:line) | Corrected Priority |
 |---|---------|--------|---------|-------------------------------|-------------------|
 | 52 | ListenPacket (UDP) — no UDP listen on netstack | features P0 | **CONFIRMED** | `netstack/lib.rs:35-36` — imports only `smoltcp::socket::tcp`; Command enum (373-395) has only TCP ops. No `listen_packet` in tsnet. | P0 |
-| 53 | SSH policy feed — always returns None, rejecting all connections | features P0 | **CONFIRMED** | `tsnet/ssh.rs:61` — `let policy: PolicyCallback = Arc::new(\|\| None);` hardcoded, no override parameter. `ssh/server.rs:107-114` — returns `Auth::Reject` when policy is None. `ssh/auth.rs:30` — `eval_ssh_policy` works but never reached. Special check 1: crates/ssh EXISTS on master (git log confirms 4 commits). Audit did NOT read worktree by mistake. | P0 |
+| 53 | SSH policy feed — always returns None, rejecting all connections | features P0 | **FIXED** | `tsnet/ssh.rs:61` previously `Arc::new(\|\| None)` — now reads shared `ssh_policy: Arc<RwLock<Option<SSHPolicy>>>` fed by `spawn_map_update_task` from `MapResponse.SSHPolicy`. `ssh/server.rs` honours Reject actions. `ssh/auth.rs:eval_ssh_policy` now reached. Remaining: session recording (#63), incubator (#64), HoldAndDelegate. | ~~P0~~ |
 | 54 | Port builder method missing — can't pin WG UDP port | features P1 | **CONFIRMED** | `tsnet/lib.rs:178-229` — ServerBuilder has no port field/method. | P1 |
 | 55 | AdvertiseTags builder method missing | features P1 | **CONFIRMED** | `tsnet/lib.rs:178-229` — no advertise_tags on builder. Tags settable via prefs/CLI but not builder. | P1 |
 | 56 | UserLogf/Logf — no pluggable logger | features P1 | **CONFIRMED** | `tsnet/lib.rs:178-229` — no logger field. All logging via `eprintln!` or `log::` macros. | P1 |
@@ -149,7 +149,7 @@ Ordered by security/correctness first, then user impact.
 |------|---------|----------|----------|--------|
 | **1** | **DERP pinned-key verify missing** (#8) | P0 | Security | `derp/client.rs:147` accepts any server key — MITM on all relay traffic undetectable. Go verifies against DERPMap public key. |
 | **2** | **Capability ACLs not evaluated** (#28) | P1→P0 | Security | `filter/lib.rs:306` `no_cap()` always returns false. Capability-based ACL rules silently bypassed. Security boundary broken for feature-gated access. |
-| **3** | **SSH policy feed always None** (#53) | P0 | Security/Feature | `ssh.rs:61` hardcodes `Arc::new(\|\| None)` — all SSH connections rejected. Full SSH server (~1200 LOC) is dead code in production. |
+| **3** | ~~**SSH policy feed always None** (#53)~~ **FIXED** | ~~P0~~ | Security/Feature | `ssh.rs:61` previously hardcoded `Arc::new(\|\| None)` — now reads shared netmap `SSHPolicy` state. Reject actions honoured. Remaining gaps: session recording, incubator, HoldAndDelegate. |
 | **4** | **State machine InUseOtherUser unreachable** (#40) | P0 | Correctness | `backend.rs:94-95` hardcodes logged_out/blocked=false; `machine.rs` has no InUseOtherUser branch. Fundamental state correctness broken. |
 | **5** | **No key rotation / re-registration** (#2) | P0 | Correctness | `OldNodeKey` never populated; no expiry re-register loop. Node key expiry = permanent disconnection. |
 | **6** | **No logout from control** (#1) | P0 | Correctness/Security | `daemon.rs:109` prints "logout requested" but does nothing. Orphan node identity on control server. |

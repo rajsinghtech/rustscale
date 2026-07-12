@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 #![allow(non_snake_case)]
 
+mod caps;
 mod derpmap;
 mod dns;
 mod filter;
@@ -15,6 +16,11 @@ mod map;
 mod node;
 mod register;
 
+pub use caps::{
+    cap_ver_is_relay_capable, has_capability, relay_client_disabled, relay_server_disabled,
+    CAP_VERSION_RELAY, NODE_ATTR_DISABLE_RELAY_CLIENT, NODE_ATTR_DISABLE_RELAY_SERVER,
+    PEER_CAPABILITY_RELAY, PEER_CAPABILITY_RELAY_TARGET,
+};
 pub use derpmap::{DERPHomeParams, DERPMap, DERPNode, DERPRegion};
 pub use dns::{DNSConfig, DNSRecord, Resolver, SetDNSRequest, SetDNSResponse, UserProfile};
 pub use filter::{filter_allow_all, CapGrant, FilterRule, NetPortRange, PeerCapMap, PortRange};

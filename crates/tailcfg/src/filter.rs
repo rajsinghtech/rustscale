@@ -107,12 +107,9 @@ pub type PeerCapMap = BTreeMap<NodeCapability, Vec<RawMessage>>;
 /// fields.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FilterRule {
-    /// Source IPs/CIDRs/ranges/wildcards.
-    #[serde(
-        default,
-        skip_serializing_if = "Vec::is_empty",
-        deserialize_with = "deserialize_null_to_default"
-    )]
+    /// Source IPs/CIDRs/ranges/wildcards. Go has no json tag (always
+    /// present; null when nil, `[]` when empty).
+    #[serde(default, deserialize_with = "deserialize_null_to_default")]
     pub SrcIPs: Vec<String>,
     /// Deprecated CIDR bits paired with `SrcIPs`. Rejected by the filter.
     #[serde(
@@ -189,10 +186,10 @@ mod tests {
     }
 
     #[test]
-    fn filter_rule_empty_omits_all() {
+    fn filter_rule_empty_emits_srcips() {
         let rule = FilterRule::default();
         let j = serde_json::to_string(&rule).unwrap();
-        assert_eq!(j, "{}");
+        assert_eq!(j, "{\"SrcIPs\":[]}");
     }
 
     #[test]

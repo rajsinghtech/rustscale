@@ -58,8 +58,13 @@ pub struct Node {
         deserialize_with = "deserialize_null_to_default"
     )]
     pub KeyExpiry: Option<DateTime<Utc>>,
-    /// Ed25519 signature over the node key (TKA / network lock).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Ed25519 signature over the node key (TKA / network lock). Go's
+    /// `tkatype.MarshaledSignature` (`[]byte`) marshals as a base64 string.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::base64_bytes"
+    )]
     pub KeySignature: Option<Vec<u8>>,
     /// The node's machine key (zero if unset, then omitted).
     #[serde(
@@ -367,13 +372,6 @@ pub struct Hostinfo {
         deserialize_with = "deserialize_null_to_default"
     )]
     pub GoVersion: String,
-    /// Services advertised by this machine.
-    #[serde(
-        default,
-        skip_serializing_if = "skip_default",
-        deserialize_with = "deserialize_null_to_default"
-    )]
-    pub Services: Vec<Service>,
     /// IP prefixes this node can route (advertised subnet routes), e.g.
     /// `"192.0.2.0/24"`. Control must approve them before peers see them in
     /// this node's `AllowedIPs`. Mirrors Go's `Hostinfo.RoutableIPs`.
@@ -398,6 +396,15 @@ pub struct Hostinfo {
         deserialize_with = "deserialize_null_to_default"
     )]
     pub WoLMACs: Vec<String>,
+    /// Services advertised by this machine.
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
+    pub Services: Vec<Service>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub NetInfo: Option<NetInfo>,
     /// SSH host keys advertised by this node.
     #[serde(
         default,
@@ -406,8 +413,6 @@ pub struct Hostinfo {
         rename = "sshHostKeys"
     )]
     pub SSH_HostKeys: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub NetInfo: Option<NetInfo>,
     /// Cloud environment (`"aws"`, `"gcp"`, `"azure"`, `"digitalocean"`, ...).
     #[serde(
         default,
@@ -424,13 +429,6 @@ pub struct Hostinfo {
     /// Whether the client is running the app-connector service.
     #[serde(default, skip_serializing_if = "OptBool::is_unset")]
     pub AppConnector: OptBool,
-    /// Whether the client is willing to relay traffic for other peers.
-    #[serde(
-        default,
-        skip_serializing_if = "skip_default",
-        deserialize_with = "deserialize_null_to_default"
-    )]
-    pub PeerRelay: bool,
     /// Opaque hash of the most recent list of tailnet services. A change in
     /// hash signals config should be fetched via c2n. Mirrors Go's
     /// `Hostinfo.ServicesHash`.
@@ -440,6 +438,13 @@ pub struct Hostinfo {
         deserialize_with = "deserialize_null_to_default"
     )]
     pub ServicesHash: String,
+    /// Whether the client is willing to relay traffic for other peers.
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
+    pub PeerRelay: bool,
     /// The client's selected exit node StableNodeID; empty when unselected.
     /// Mirrors Go's `Hostinfo.ExitNodeID`.
     #[serde(
@@ -790,7 +795,7 @@ mod tests {
         n.IsJailed = true;
 
         let j = serde_json::to_string(&n).unwrap();
-        assert!(j.contains("\"KeySignature\":\"3q2-7w\"=") || j.contains("\"KeySignature\""));
+        assert!(j.contains("\"KeySignature\":\"3q2+7w==\""));
         assert!(j.contains("\"LastSeen\":\"2025-07-12T10:00:00Z\""));
         assert!(j.contains("\"UnsignedPeerAPIOnly\":true"));
         assert!(j.contains("\"Expired\":true"));

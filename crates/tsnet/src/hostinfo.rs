@@ -80,8 +80,14 @@ pub fn populate_hostinfo(mut hi: Hostinfo) -> Hostinfo {
     if hi.Package.is_empty() {
         hi.Package = PACKAGE.to_string();
     }
+    if hi.App.is_empty() {
+        hi.App = PACKAGE.to_string();
+    }
     if hi.GoArch.is_empty() {
         hi.GoArch = std::env::consts::ARCH.to_string();
+    }
+    if hi.GoArchVar.is_empty() {
+        hi.GoArchVar = go_arch_var();
     }
     if hi.GoVersion.is_empty() {
         hi.GoVersion = rustc_version();
@@ -222,17 +228,26 @@ pub fn shared_overrides() -> SharedOverrides {
 /// signatures stay manageable as more fields are wired in. Mirrors the
 /// scattered `ipn/ipnlocal/local.go` hostinfo-building path in Go, where
 /// prefs, serve config, and builder config all contribute fields.
+///
+/// Fields default to "not set" / `false` / empty so callers only populate
+/// what they have.
 #[derive(Clone, Debug, Default)]
 pub struct RuntimeHostinfo {
     /// The StableNodeID of the currently selected exit node (empty/None = none).
     pub exit_node_id: Option<StableNodeID>,
     /// `true` when a Funnel listener is active (any `AllowFunnel` in serve config).
     pub ingress_enabled: bool,
+    /// `true` when the serve config has funnel configured but not active.
+    /// Sets `Hostinfo.WireIngress` (only when `ingress_enabled` is false,
+    /// matching Go's logic).
+    pub wire_ingress: bool,
     /// `true` when the host is blocking incoming connections (from `Prefs.ShieldsUp`).
     pub shields_up: bool,
     /// `true` when the app-connector service is advertised (from `Prefs.AppConnector.Advertise`).
     pub app_connector: bool,
     /// ACL tags this node wants to claim (from builder `advertise_tags` / prefs).
+    /// Only applied if `Hostinfo.RequestTags` is still empty (hooks may
+    /// have already set them).
     pub request_tags: Vec<String>,
     /// SSH host keys advertised by this node (if SSH server is enabled).
     pub ssh_host_keys: Vec<String>,
@@ -242,19 +257,25 @@ pub struct RuntimeHostinfo {
     pub allows_update: bool,
     /// `true` when this node exists in netmap because it's owned by a shared-to user.
     pub sharee_node: bool,
+    /// Whether the client runs in userspace (netstack) mode. Always `true`
+    /// for tsnet.
+    pub userspace: bool,
+    /// Whether the client's subnet router runs in userspace mode. Always
+    /// `true` for tsnet.
+    pub userspace_router: bool,
+    /// Whether the client is willing to relay traffic for other peers.
+    pub peer_relay: bool,
 }
 
 /// Apply tsnet-runtime fields to a `Hostinfo` that platform detection
 /// cannot determine on its own. See [`RuntimeHostinfo`] for field
 /// descriptions.
 ///
-/// Device-specific fields (`PushDeviceToken`, `TPM`, `StateEncrypted`) are
-/// left at their defaults — they require platform APIs not available in the
-/// tsnet embedding layer.
-/// TODO: `Userspace` / `UserspaceRouter` should be set from the tsnet
-/// builder config (netstack mode is always userspace in tsnet).
-/// TODO: `WireIngress` should be set when Funnel is configured but not
-/// yet active (see Go's `Hostinfo.WireIngress` logic).
+/// Fields that require platform APIs not available in the tsnet embedding
+/// layer are left at their defaults — see TODO comments on the struct.
+/// TODO: `PushDeviceToken` requires APNs/FCM platform APIs.
+/// TODO: `TPM` / `StateEncrypted` require platform keychain/TPM access.
+/// TODO: `Location` requires explicit node declaration.
 pub fn apply_runtime_fields(hi: &mut Hostinfo, rt: &RuntimeHostinfo) {
     if let Some(ref id) = rt.exit_node_id {
         if !id.is_empty() {
@@ -262,19 +283,44 @@ pub fn apply_runtime_fields(hi: &mut Hostinfo, rt: &RuntimeHostinfo) {
         }
     }
     hi.IngressEnabled = rt.ingress_enabled;
+    // WireIngress is only meaningful when IngressEnabled is false — when
+    // funnel is active, IngressEnabled implies the wiring is done.
+    hi.WireIngress = !rt.ingress_enabled && rt.wire_ingress;
     hi.ShieldsUp = rt.shields_up;
+    hi.AllowsUpdate = rt.allows_update;
     if rt.app_connector {
         hi.AppConnector = OptBool::True;
     }
-    if !rt.request_tags.is_empty() {
+    if !rt.request_tags.is_empty() && hi.RequestTags.is_empty() {
         hi.RequestTags.clone_from(&rt.request_tags);
     }
     if !rt.ssh_host_keys.is_empty() {
         hi.SSH_HostKeys.clone_from(&rt.ssh_host_keys);
     }
     hi.NoLogsNoSupport = rt.no_logs_no_support;
-    hi.AllowsUpdate = rt.allows_update;
     hi.ShareeNode = rt.sharee_node;
+    if rt.userspace {
+        hi.Userspace = OptBool::True;
+    }
+    if rt.userspace_router {
+        hi.UserspaceRouter = OptBool::True;
+    }
+    hi.PeerRelay = rt.peer_relay;
+
+    // ServicesHash: opaque hash of the Services list so control can tell
+    // the client to re-fetch via c2n when services change.
+    if !hi.Services.is_empty() {
+        hi.ServicesHash = services_hash(&hi.Services);
+    }
+
+    // TODO: The following fields require platform APIs or data not
+    // available in the embedding layer:
+    // - FrontendLogID / BackendLogID: need logtail integration
+    // - PushDeviceToken: APNs/FCM platform notification API
+    // - Location: platform-specific GPS/IP geolocation
+    // - TPM: TPM 2.0 platform API
+    // - StateEncrypted: platform-specific encrypted state storage
+    // - WoLMACs: Wake-on-LAN not implemented
 }
 
 /// Collect a full `Hostinfo`: apply overrides, run platform detection, then
@@ -292,6 +338,18 @@ pub fn collect_hostinfo(
     apply_runtime_fields(&mut hi, rt);
     run_hostinfo_hooks(&mut hi);
     hi
+}
+
+/// Compute an opaque hash of the `Services` list. A change in hash signals
+/// the control server should tell the client to re-fetch service config via
+/// c2n. Uses the JSON serialization for determinism.
+fn services_hash(services: &[rustscale_tailcfg::Service]) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let json = serde_json::to_string(services).unwrap_or_default();
+    let mut hasher = DefaultHasher::new();
+    json.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 // ─── Hostinfo content hash (for update dedup) ─────────────────────────
@@ -1095,6 +1153,51 @@ fn rustc_version() -> String {
     option_env!("RUSTC_VERSION").unwrap_or("rust").to_string()
 }
 
+// ─── Architecture variant ─────────────────────────────────────────────
+
+/// Returns the architecture variant string, analogous to Go's
+/// `GOARCH`-specific variant (GOARM, GOAMD64, etc.). Detected from
+/// compile-time `target_feature` cfg flags.
+fn go_arch_var() -> String {
+    // x86_64 microarchitecture levels (mirrors Go's GOAMD64=v1–v4).
+    #[cfg(target_arch = "x86_64")]
+    {
+        if cfg!(target_feature = "avx512f") {
+            "v4".to_string()
+        } else if cfg!(target_feature = "avx2") {
+            "v3".to_string()
+        } else if cfg!(target_feature = "sse4.2") {
+            "v2".to_string()
+        } else {
+            "v1".to_string()
+        }
+    }
+    // ARM64: report the FP/SIMD level.
+    #[cfg(target_arch = "aarch64")]
+    {
+        if cfg!(target_feature = "sve") {
+            "sve".to_string()
+        } else {
+            String::new()
+        }
+    }
+    // ARM 32-bit: report the ARM version (GOARM=7, 6, 5).
+    #[cfg(target_arch = "arm")]
+    {
+        if cfg!(target_feature = "v7") {
+            "7".to_string()
+        } else if cfg!(target_feature = "v6") {
+            "6".to_string()
+        } else {
+            "5".to_string()
+        }
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "arm",)))]
+    {
+        String::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1851,6 +1954,41 @@ VERSION_ID='11'"#;
         apply_runtime_fields(&mut hi, &rt);
         assert!(hi.IngressEnabled);
         assert!(hi.ExitNodeID.is_empty());
+    }
+
+    #[test]
+    fn test_runtime_fields_wire_ingress_configured_not_active() {
+        let mut hi = Hostinfo::default();
+        let rt = RuntimeHostinfo {
+            ingress_enabled: false,
+            wire_ingress: true,
+            ..Default::default()
+        };
+        apply_runtime_fields(&mut hi, &rt);
+        assert!(!hi.IngressEnabled);
+        assert!(hi.WireIngress);
+    }
+
+    #[test]
+    fn test_runtime_fields_wire_ingress_suppressed_when_active() {
+        let mut hi = Hostinfo::default();
+        let rt = RuntimeHostinfo {
+            ingress_enabled: true,
+            wire_ingress: true,
+            ..Default::default()
+        };
+        apply_runtime_fields(&mut hi, &rt);
+        assert!(hi.IngressEnabled);
+        assert!(!hi.WireIngress);
+    }
+
+    #[test]
+    fn test_runtime_fields_wire_ingress_false_when_not_configured() {
+        let mut hi = Hostinfo::default();
+        let rt = RuntimeHostinfo::default();
+        apply_runtime_fields(&mut hi, &rt);
+        assert!(!hi.IngressEnabled);
+        assert!(!hi.WireIngress);
     }
 
     #[test]

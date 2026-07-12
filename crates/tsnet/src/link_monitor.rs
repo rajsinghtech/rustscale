@@ -250,11 +250,15 @@ pub(crate) fn spawn_hostinfo_update_loop(
                 }
             };
 
-            // Check whether funnel is active.
-            let ingress_enabled = if let Some(ref runner) = serve {
-                runner.is_funnel_on().await
+            // Check whether funnel is active and whether it's configured but
+            // inactive. Mirrors Go's hasIngressEnabledLocked / wantIngressLocked /
+            // shouldWireInactiveIngressLocked in ipn/ipnlocal/serve.go.
+            let (ingress_enabled, wire_ingress) = if let Some(ref runner) = serve {
+                let on = runner.is_funnel_on().await;
+                let configured = runner.has_allow_funnel().await;
+                (on, !on && configured)
             } else {
-                false
+                (false, false)
             };
 
             // Build the base Hostinfo with fields the bootstrap sets.
@@ -281,6 +285,7 @@ pub(crate) fn spawn_hostinfo_update_loop(
             let rt = RuntimeHostinfo {
                 exit_node_id: exit_node_id.clone(),
                 ingress_enabled,
+                wire_ingress,
                 shields_up: prefs.ShieldsUp,
                 app_connector: prefs.AppConnector.Advertise,
                 request_tags: prefs.AdvertiseTags.clone(),
@@ -288,6 +293,9 @@ pub(crate) fn spawn_hostinfo_update_loop(
                 allows_update: prefs.AutoUpdate.unwrap_or(false),
                 sharee_node: false,
                 ssh_host_keys: Vec::new(),
+                userspace: true,
+                userspace_router: true,
+                peer_relay: false,
             };
             let ov = overrides.read().await.clone();
             let hi = collect_hostinfo(base, &ov, &rt);

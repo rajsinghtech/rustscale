@@ -170,6 +170,13 @@ impl ServeConfig {
         self.AllowFunnel.values().any(|b| *b)
     }
 
+    /// Whether the serve config has any `AllowFunnel` entries (even if none
+    /// are active). Mirrors Go's `ServeConfig.HasAllowFunnel`. Used to
+    /// compute `Hostinfo.WireIngress` — funnel is configured but not active.
+    pub fn has_allow_funnel(&self) -> bool {
+        !self.AllowFunnel.is_empty()
+    }
+
     /// Whether this config maps the given port to a TCP listener.
     pub fn ports(&self) -> Vec<u16> {
         self.TCP.keys().copied().collect()
@@ -390,6 +397,12 @@ impl ServeRunner {
     /// Used by the Hostinfo update loop to set `IngressEnabled`.
     pub(crate) async fn is_funnel_on(&self) -> bool {
         self.config.read().await.is_funnel_on()
+    }
+
+    /// Whether the serve config has any `AllowFunnel` entries (even if none
+    /// are active). Used by the Hostinfo update loop to set `WireIngress`.
+    pub(crate) async fn has_allow_funnel(&self) -> bool {
+        self.config.read().await.has_allow_funnel()
     }
 
     /// Replace the serve config, stopping old listeners and starting new ones

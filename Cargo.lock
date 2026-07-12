@@ -2556,6 +2556,7 @@ dependencies = [
 name = "rustscale-tailcfg"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "chrono",
  "rustscale-key",
  "serde",

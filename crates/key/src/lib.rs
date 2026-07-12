@@ -14,10 +14,12 @@
 mod boxcrypto;
 mod disco;
 mod machine;
+mod nl;
 mod node;
 
 pub use disco::{DiscoPrivate, DiscoPublic, DiscoShared};
 pub use machine::{MachinePrecomputedSharedKey, MachinePrivate, MachinePublic};
+pub use nl::NLPublic;
 pub use node::{NodePrivate, NodePublic};
 
 use std::fmt;

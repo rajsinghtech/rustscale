@@ -195,6 +195,46 @@ impl<'de> Deserialize<'de> for RawMessage {
     }
 }
 
+/// Serde helpers for `Option<Vec<u8>>` fields that Go marshals as base64
+/// strings (Go's `[]byte` → `json.Marshal` → base64). Without this, serde
+/// serializes `Vec<u8>` as a JSON array of numbers (`[222,173,...]`), which
+/// is wire-incompatible with Go.
+pub mod base64_bytes {
+    use base64::Engine as _;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(opt: &Option<Vec<u8>>, s: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match opt {
+            None => s.serialize_none(),
+            Some(bytes) => {
+                s.serialize_str(&base64::engine::general_purpose::STANDARD.encode(bytes))
+            }
+        }
+    }
+
+    pub fn deserialize<'de, D>(d: D) -> Result<Option<Vec<u8>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let opt: Option<String> = Option::deserialize(d)?;
+        match opt {
+            None => Ok(None),
+            Some(s) => {
+                if s.is_empty() {
+                    return Ok(Some(Vec::new()));
+                }
+                base64::engine::general_purpose::STANDARD
+                    .decode(&s)
+                    .map(Some)
+                    .map_err(serde::de::Error::custom)
+            }
+        }
+    }
+}
+
 /// Serde helper: skip a field whose value equals its `Default` (mirrors Go's
 /// `omitempty`/`omitzero` for scalars, strings, Vecs, and Options).
 pub(crate) fn skip_default<T>(v: &T) -> bool

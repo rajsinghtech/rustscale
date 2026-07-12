@@ -809,6 +809,7 @@ async fn serve_register(
         NodeKeyExpired: node_key_expired,
         MachineAuthorized: true,
         AuthURL: String::new(),
+        NodeKeySignature: None,
         Error: String::new(),
     };
     serde_json::to_vec(&resp).unwrap_or_default()

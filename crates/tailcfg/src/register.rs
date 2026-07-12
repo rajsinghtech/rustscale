@@ -3,7 +3,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use rustscale_key::NodePublic;
+use rustscale_key::{NLPublic, NodePublic};
 
 use crate::{deserialize_null_to_default, skip_default, CapabilityVersion, Hostinfo, ID};
 
@@ -21,6 +21,10 @@ pub struct RegisterRequest {
     /// The previous node key, if rotating.
     #[serde(default, deserialize_with = "deserialize_null_to_default")]
     pub OldNodeKey: NodePublic,
+    /// Network-lock public key (ed25519). Go has no json tag (always
+    /// present, emits `nlpub:<hex>` even when zero).
+    #[serde(default, deserialize_with = "deserialize_null_to_default")]
+    pub NLKey: NLPublic,
     /// Authentication information returned by a prior registration.
     #[serde(
         default,
@@ -48,6 +52,10 @@ pub struct RegisterRequest {
         deserialize_with = "deserialize_null_to_default"
     )]
     pub Ephemeral: bool,
+    /// Node-key signature (TKA / tailnet lock). Go has no json tag (always
+    /// present; `null` when nil, base64 string when set).
+    #[serde(default, with = "crate::base64_bytes")]
+    pub NodeKeySignature: Option<Vec<u8>>,
     /// Optional recommended/required tailnet identifier.
     #[serde(
         default,
@@ -76,6 +84,10 @@ pub struct RegisterResponse {
     /// If non-empty, authorization is pending at this URL.
     #[serde(default, deserialize_with = "deserialize_null_to_default")]
     pub AuthURL: String,
+    /// Node-key signature (TKA / tailnet lock). Go has no json tag (always
+    /// present; `null` when nil, base64 string when set).
+    #[serde(default, with = "crate::base64_bytes")]
+    pub NodeKeySignature: Option<Vec<u8>>,
     /// If non-empty, authorization failed and other fields should be ignored.
     #[serde(default, deserialize_with = "deserialize_null_to_default")]
     pub Error: String,
@@ -164,6 +176,7 @@ mod tests {
                     .with_timezone(&Utc),
             ),
             Ephemeral: true,
+            NodeKeySignature: Some(vec![0xDE, 0xAD, 0xBE, 0xEF]),
             Tailnet: "required:example.com".into(),
             ..Default::default()
         };
@@ -171,10 +184,23 @@ mod tests {
         assert!(j.contains("\"NodeKey\":\"nodekey:"));
         assert!(j.contains("\"Ephemeral\":true"));
         assert!(j.contains("\"Tailnet\":\"required:example.com\""));
-        // OldNodeKey defaults to zero and is emitted (no skip) as nodekey:00...
         assert!(j.contains("\"OldNodeKey\":\"nodekey:"));
-        // Followup is always present (no tag), empty -> "".
+        assert!(j.contains("\"NLKey\":\"nlpub:"));
         assert!(j.contains("\"Followup\":\"\""));
+        assert!(j.contains("\"NodeKeySignature\":\"3q2+7w==\""));
+        let back: RegisterRequest = serde_json::from_str(&j).unwrap();
+        assert_eq!(back, req);
+    }
+
+    #[test]
+    fn register_request_nil_signature() {
+        let req = RegisterRequest {
+            Version: 1,
+            NodeKey: NodePrivate::generate().public(),
+            ..Default::default()
+        };
+        let j = serde_json::to_string(&req).unwrap();
+        assert!(j.contains("\"NodeKeySignature\":null"));
         let back: RegisterRequest = serde_json::from_str(&j).unwrap();
         assert_eq!(back, req);
     }
@@ -196,11 +222,13 @@ mod tests {
             NodeKeyExpired: false,
             MachineAuthorized: true,
             AuthURL: String::new(),
+            NodeKeySignature: None,
             Error: String::new(),
         };
         let j = serde_json::to_string(&resp).unwrap();
         assert!(j.contains("\"MachineAuthorized\":true"));
         assert!(j.contains("\"Provider\":\"google\""));
+        assert!(j.contains("\"NodeKeySignature\":null"));
         let back: RegisterResponse = serde_json::from_str(&j).unwrap();
         assert_eq!(back, resp);
     }

@@ -378,6 +378,8 @@ impl Server {
                 .as_ref()
                 .map(|ps| ps.logout_trigger.clone())
                 .unwrap_or_else(|| Arc::new(tokio::sync::Notify::new())),
+            fallback_tcp_handlers: Arc::new(std::sync::Mutex::new(vec![])),
+            fallback_next_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         });
 
         // Apply stored exit-node pref on start (survives restart).
@@ -799,6 +801,8 @@ impl Server {
                 .as_ref()
                 .map(|ps| ps.logout_trigger.clone())
                 .unwrap_or_else(|| Arc::new(tokio::sync::Notify::new())),
+            fallback_tcp_handlers: Arc::new(std::sync::Mutex::new(vec![])),
+            fallback_next_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         });
 
         // Apply stored exit-node pref on start (survives restart).

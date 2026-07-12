@@ -237,7 +237,7 @@ impl Server {
             DataPlane::Tun => return Err(TsnetError::NotAvailableInTunMode),
         };
         let dialer = ServerSocksDialer::new(netstack, inner.resolver.clone(), inner.peers.clone());
-        let mut handle = socks5::spawn_socks5(bind_addr, dialer)
+        let mut handle = socks5::spawn_socks5(bind_addr, dialer, None)
             .await
             .map_err(TsnetError::Io)?;
         // Register the task in the server's set so close() aborts it.
@@ -470,9 +470,9 @@ impl Server {
     ///
     /// # PROXY protocol v2
     ///
-    /// When [`ServiceMode::proxy_protocol`] is `true`, a PROXY protocol v2
-    /// binary header is prepended to each accepted stream so the backend
-    /// learns the real client address. See
+    /// When [`ServiceMode::with_proxy_protocol`]`(true)` is set, a PROXY
+    /// protocol v2 binary header is prepended to each accepted stream so the
+    /// backend learns the real client address. See
     /// <https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt>.
     ///
     /// # Example
@@ -584,6 +584,70 @@ impl Server {
                 .collect(),
             Capabilities: caps,
             ..Default::default()
+        }
+    }
+
+    /// Capture packets seen by the userspace netstack to a pcap file.
+    ///
+    /// Mirrors Go's `Server.CapturePcap`. The pcap file receives a raw stream
+    /// of WireGuard-encapsulated packets (the same format as
+    /// `tailscale debug capture`). A Lua dissector
+    /// (`wgengine/capture/ts-dissector.lua` in the Go repo) is needed to
+    /// decode the pcap in Wireshark.
+    ///
+    /// **Not yet implemented** in rustscale — returns
+    /// [`TsnetError::NotSupported`]. The API is defined for parity so
+    /// callers can write code that will work once the capture stream is
+    /// wired in.
+    #[allow(clippy::unused_async)] // async for API parity with Go's CapturePcap(ctx, file)
+    pub async fn capture_pcap(&self, _pcap_file: &str) -> Result<(), TsnetError> {
+        Err(TsnetError::NotSupported(
+            "CapturePcap is not yet implemented in rustscale".into(),
+        ))
+    }
+
+    /// Register a fallback TCP handler that is called when an incoming TCP
+    /// flow to this node doesn't match any listener. Mirrors Go's
+    /// `Server.RegisterFallbackTCPHandler`.
+    ///
+    /// If multiple handlers are registered, they are called in registration
+    /// order. The first that returns `intercept=true` with a non-`None`
+    /// handler closure takes over the connection.
+    ///
+    /// The returned [`FallbackTcpGuard`] removes the handler when dropped
+    /// (equivalent to the `func()` deregister return value in Go).
+    pub fn register_fallback_tcp_handler(
+        &self,
+        handler: Box<dyn FallbackTCPHandler + Send + Sync>,
+    ) -> Result<FallbackTcpGuard, TsnetError> {
+        let inner = self.inner.as_ref().ok_or(TsnetError::NotUp)?;
+        let id = inner
+            .fallback_next_id
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        inner
+            .fallback_tcp_handlers
+            .lock()
+            .expect("fallback mutex")
+            .push((id, handler));
+        Ok(FallbackTcpGuard {
+            id,
+            handlers: inner.fallback_tcp_handlers.clone(),
+        })
+    }
+}
+
+/// Guard returned by [`Server::register_fallback_tcp_handler`]. Dropping it
+/// deregisters the handler (equivalent to the `func()` return value in Go's
+/// `RegisterFallbackTCPHandler`).
+pub struct FallbackTcpGuard {
+    id: u64,
+    handlers: Arc<std::sync::Mutex<Vec<(u64, Box<dyn FallbackTCPHandler + Send + Sync>)>>>,
+}
+
+impl Drop for FallbackTcpGuard {
+    fn drop(&mut self) {
+        if let Ok(mut v) = self.handlers.lock() {
+            v.retain(|(id, _)| *id != self.id);
         }
     }
 }

@@ -376,6 +376,150 @@ async fn http_static_text_handler() {
 }
 
 // ---------------------------------------------------------------------------
+// HTTP dispatch: redirect handler
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn http_redirect_handler() {
+    let mut cfg = ServeConfig::default();
+    cfg.TCP.insert(
+        8080,
+        TCPPortHandler {
+            HTTP: true,
+            ..Default::default()
+        },
+    );
+    let hp = "node.ts.net:8080".to_string();
+    let mut web = WebServerConfig::default();
+    web.Handlers.insert(
+        "/".into(),
+        HTTPHandler {
+            Redirect: "https://example.com/".into(),
+            ..Default::default()
+        },
+    );
+    cfg.Web.insert(hp, web);
+
+    let cfg_arc = std::sync::Arc::new(tokio::sync::RwLock::new(cfg));
+    let peers = std::sync::Arc::new(tokio::sync::RwLock::new(vec![]));
+    let ups = std::sync::Arc::new(tokio::sync::RwLock::new(BTreeMap::new()));
+
+    let (mut client, mut server_side) = tokio::io::duplex(4096);
+    client
+        .write_all(b"GET / HTTP/1.1\r\nHost: node.ts.net:8080\r\n\r\n")
+        .await
+        .unwrap();
+
+    let handler_task = tokio::spawn(async move {
+        handle_http(
+            &mut server_side,
+            8080,
+            &cfg_arc,
+            "node.ts.net",
+            None,
+            &peers,
+            &ups,
+        )
+        .await
+    });
+
+    let mut resp = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), client.read(&mut buf)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => resp.extend_from_slice(&buf[..n]),
+            Ok(Err(_)) => break,
+            Err(_) => break,
+        }
+        if resp.contains(&b'\n') {
+            break;
+        }
+    }
+    drop(client);
+    let _ = handler_task.await;
+    let resp_str = String::from_utf8_lossy(&resp);
+    assert!(
+        resp_str.contains("302 Found"),
+        "expected 302, got: {resp_str}"
+    );
+    assert!(
+        resp_str.contains("Location: https://example.com/"),
+        "expected Location header, got: {resp_str}"
+    );
+}
+
+#[tokio::test]
+async fn http_redirect_with_code_prefix() {
+    let mut cfg = ServeConfig::default();
+    cfg.TCP.insert(
+        8080,
+        TCPPortHandler {
+            HTTP: true,
+            ..Default::default()
+        },
+    );
+    let hp = "node.ts.net:8080".to_string();
+    let mut web = WebServerConfig::default();
+    web.Handlers.insert(
+        "/".into(),
+        HTTPHandler {
+            Redirect: "301:https://example.com/new".into(),
+            ..Default::default()
+        },
+    );
+    cfg.Web.insert(hp, web);
+
+    let cfg_arc = std::sync::Arc::new(tokio::sync::RwLock::new(cfg));
+    let peers = std::sync::Arc::new(tokio::sync::RwLock::new(vec![]));
+    let ups = std::sync::Arc::new(tokio::sync::RwLock::new(BTreeMap::new()));
+
+    let (mut client, mut server_side) = tokio::io::duplex(4096);
+    client
+        .write_all(b"GET / HTTP/1.1\r\nHost: node.ts.net:8080\r\n\r\n")
+        .await
+        .unwrap();
+
+    let handler_task = tokio::spawn(async move {
+        handle_http(
+            &mut server_side,
+            8080,
+            &cfg_arc,
+            "node.ts.net",
+            None,
+            &peers,
+            &ups,
+        )
+        .await
+    });
+
+    let mut resp = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), client.read(&mut buf)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => resp.extend_from_slice(&buf[..n]),
+            Ok(Err(_)) => break,
+            Err(_) => break,
+        }
+        if resp.contains(&b'\n') {
+            break;
+        }
+    }
+    drop(client);
+    let _ = handler_task.await;
+    let resp_str = String::from_utf8_lossy(&resp);
+    assert!(
+        resp_str.contains("301 Moved Permanently"),
+        "expected 301, got: {resp_str}"
+    );
+    assert!(
+        resp_str.contains("Location: https://example.com/new"),
+        "expected Location header, got: {resp_str}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // HTTP dispatch: reverse proxy with headers
 // ---------------------------------------------------------------------------
 
@@ -662,4 +806,107 @@ fn serve_config_is_empty_check() {
         },
     );
     assert!(!cfg.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// HTTPHandler.Redirect
+// ---------------------------------------------------------------------------
+
+#[test]
+fn http_handler_redirect_serde() {
+    let h = HTTPHandler {
+        Redirect: "https://example.com/".into(),
+        ..Default::default()
+    };
+    let json = serde_json::to_string(&h).unwrap();
+    let back: HTTPHandler = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.Redirect, "https://example.com/");
+}
+
+#[test]
+fn parse_redirect_default_302() {
+    let (code, url) = parse_redirect_with_code("https://example.com/");
+    assert_eq!(code, 302);
+    assert_eq!(url, "https://example.com/");
+}
+
+#[test]
+fn parse_redirect_with_code_prefix() {
+    let (code, url) = parse_redirect_with_code("301:https://example.com/new");
+    assert_eq!(code, 301);
+    assert_eq!(url, "https://example.com/new");
+}
+
+#[test]
+fn parse_redirect_307() {
+    let (code, url) = parse_redirect_with_code("307:https://example.com/temp");
+    assert_eq!(code, 307);
+    assert_eq!(url, "https://example.com/temp");
+}
+
+#[test]
+fn parse_redirect_invalid_code_defaults_302() {
+    let (code, url) = parse_redirect_with_code("499:https://example.com/");
+    assert_eq!(code, 302);
+    assert_eq!(url, "499:https://example.com/");
+}
+
+// ---------------------------------------------------------------------------
+// ServeConfig Foreground + Services
+// ---------------------------------------------------------------------------
+
+#[test]
+fn serve_config_foreground_serde() {
+    let mut cfg = ServeConfig::default();
+    let mut fg = ServeConfig::default();
+    fg.TCP.insert(
+        8080,
+        TCPPortHandler {
+            HTTP: true,
+            ..Default::default()
+        },
+    );
+    cfg.Foreground.insert("session-1".into(), fg);
+    let json = serde_json::to_string(&cfg).unwrap();
+    let back: ServeConfig = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.Foreground.len(), 1);
+    assert!(back.Foreground["session-1"].TCP[&8080].HTTP);
+    assert!(!back.is_empty());
+}
+
+#[test]
+fn serve_config_services_serde() {
+    let mut cfg = ServeConfig::default();
+    let mut svc = ServiceConfig::default();
+    svc.TCP.insert(
+        443,
+        TCPPortHandler {
+            HTTPS: true,
+            ..Default::default()
+        },
+    );
+    svc.Tun = true;
+    cfg.Services.insert("svc:my-app".into(), svc);
+    let json = serde_json::to_string(&cfg).unwrap();
+    let back: ServeConfig = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.Services.len(), 1);
+    assert!(back.Services["svc:my-app"].TCP[&443].HTTPS);
+    assert!(back.Services["svc:my-app"].Tun);
+}
+
+// ---------------------------------------------------------------------------
+// web_for_host_port (Ingress-Target lookup)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn web_for_host_port_exact_match() {
+    let mut cfg = ServeConfig::default();
+    cfg.Web.insert(
+        "node.ts.net:443".into(),
+        WebServerConfig {
+            Handlers: BTreeMap::new(),
+        },
+    );
+    assert!(cfg.web_for_host_port("node.ts.net:443").is_some());
+    assert!(cfg.web_for_host_port("other.ts.net:443").is_none());
 }

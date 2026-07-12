@@ -75,10 +75,36 @@ pub struct ServeConfig {
     /// Web server configs keyed by `"fqdn:port"`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub Web: BTreeMap<HostPort, WebServerConfig>,
+    /// Per-service configs keyed by service name (`svc:dns-label`).
+    /// Mirrors Go's `ServeConfig.Services`. Not yet fully wired — present
+    /// for config compatibility and future VIP-service serve dispatch.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub Services: BTreeMap<String, ServiceConfig>,
     /// Set of `"fqdn:port"` values for which funnel (public internet) traffic
     /// is allowed from trusted ingress peers.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub AllowFunnel: BTreeMap<HostPort, bool>,
+    /// Foreground serve configs keyed by IPN watch session ID. Mirrors Go's
+    /// `ServeConfig.Foreground`. Each entry is an alternate ephemeral config
+    /// valid for the life of that watch session (CLI `--foreground` mode).
+    /// Not yet fully wired — present for config compatibility.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub Foreground: BTreeMap<String, ServeConfig>,
+}
+
+/// Per-service serve configuration. Mirrors Go's `ipn.ServiceConfig`.
+/// Not yet fully wired — present for config compatibility.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ServiceConfig {
+    /// TCP port handlers for this service.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub TCP: BTreeMap<u16, TCPPortHandler>,
+    /// Web server configs for this service.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub Web: BTreeMap<HostPort, WebServerConfig>,
+    /// Whether the service uses L3 (TUN) forwarding.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub Tun: bool,
 }
 
 /// Describes what to do when handling a TCP connection on a serve port.
@@ -110,8 +136,8 @@ pub struct WebServerConfig {
     pub Handlers: BTreeMap<String, HTTPHandler>,
 }
 
-/// An HTTP handler — exactly one of `Proxy` or `Text` should be set.
-/// Mirrors Go's `ipn.HTTPHandler`.
+/// An HTTP handler — exactly one of `Proxy`, `Text`, `Path`, or `Redirect`
+/// should be set. Mirrors Go's `ipn.HTTPHandler`.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct HTTPHandler {
     /// Reverse-proxy target URL (e.g. `"http://127.0.0.1:3000"`).
@@ -124,6 +150,13 @@ pub struct HTTPHandler {
     /// rustscale; present for config compatibility).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub Path: String,
+    /// Redirect target URL. If non-empty, the handler issues an HTTP redirect
+    /// instead of proxying. May optionally start with `"<3xx>:"` to set the
+    /// status code (default 302 Found). Supports `${HOST}` and
+    /// `${REQUEST_URI}` expansion variables. Mirrors Go's
+    /// `HTTPHandler.Redirect`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub Redirect: String,
 }
 
 impl ServeConfig {
@@ -156,6 +189,12 @@ impl ServeConfig {
             .map(|(_, w)| w)
     }
 
+    /// Find the [`WebServerConfig`] for an exact `"host:port"` key (as used
+    /// by the `Tailscale-Ingress-Target` header in Funnel dispatch).
+    pub fn web_for_host_port(&self, host_port: &str) -> Option<&WebServerConfig> {
+        self.Web.get(host_port)
+    }
+
     /// Compute the ETag for this config — the hex-encoded SHA-256 of the
     /// canonical JSON serialization. Mirrors Go's `generateServeConfigETag`.
     pub fn etag(&self) -> String {
@@ -166,7 +205,11 @@ impl ServeConfig {
 
     /// Whether this config has any handlers configured.
     pub fn is_empty(&self) -> bool {
-        self.TCP.is_empty() && self.Web.is_empty() && self.AllowFunnel.is_empty()
+        self.TCP.is_empty()
+            && self.Web.is_empty()
+            && self.Services.is_empty()
+            && self.AllowFunnel.is_empty()
+            && self.Foreground.is_empty()
     }
 
     /// Load serve config from `<dir>/serve-config.json`. Returns
@@ -495,8 +538,38 @@ async fn dispatch_serve(
             let Some(cert) = cert else {
                 return Err(ServeError::NoCertProvider);
             };
+            // Peek at the first byte to detect plain HTTP vs TLS ClientHello.
+            // A TLS ClientHello starts with 0x16 (Handshake); an HTTP request
+            // starts with an ASCII method letter (GET, POST, etc.).
+            let mut first = [0u8; 1];
+            use tokio::io::AsyncReadExt;
+            let mut rd_stream = stream;
+            let n = rd_stream.read(&mut first).await.unwrap_or(0);
+            if n == 0 {
+                return Ok(());
+            }
+            if first[0] != 0x16 {
+                // Plain HTTP on an HTTPS port — redirect to HTTPS.
+                let cfg_snap = cfg.read().await;
+                let host = cfg_snap
+                    .web_for_port(port, fqdn)
+                    .and_then(|_| {
+                        cfg_snap
+                            .Web
+                            .keys()
+                            .find(|hp| hp.ends_with(&format!(":{port}")))
+                            .cloned()
+                    })
+                    .and_then(|hp| hp.split(':').next().map(std::string::ToString::to_string))
+                    .unwrap_or_else(|| fqdn.to_string());
+                let mut http_stream = PrefixedNetstackStream::new(first[0], rd_stream);
+                let _ = write_https_redirect(&mut http_stream, &host, port).await;
+                return Ok(());
+            }
+            // It's TLS — prepend the consumed byte and accept.
+            let chained = PrefixedNetstackStream::new(first[0], rd_stream);
             let acceptor = build_tls_acceptor(cert)?;
-            let tls = acceptor.accept(stream).await?;
+            let tls = acceptor.accept(chained).await?;
             handle_http(tls, port, cfg, fqdn, src_ip, peers, ups).await?;
         } else {
             handle_http(stream, port, cfg, fqdn, src_ip, peers, ups).await?;
@@ -519,6 +592,92 @@ async fn dispatch_serve(
     }
 
     Err(ServeError::EmptyHandler)
+}
+
+/// A wrapper around [`NetstackStream`] that yields a single prepended byte
+/// before delegating to the inner stream. Used to re-inject a byte consumed
+/// during TLS-vs-HTTP sniffing.
+struct PrefixedNetstackStream {
+    prefix: Option<u8>,
+    inner: NetstackStream,
+}
+
+impl PrefixedNetstackStream {
+    fn new(first_byte: u8, inner: NetstackStream) -> Self {
+        Self {
+            prefix: Some(first_byte),
+            inner,
+        }
+    }
+}
+
+impl AsyncRead for PrefixedNetstackStream {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if let Some(byte) = this.prefix.take() {
+            if buf.remaining() > 0 {
+                buf.put_slice(&[byte]);
+                return std::task::Poll::Ready(Ok(()));
+            }
+        }
+        std::pin::Pin::new(&mut this.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for PrefixedNetstackStream {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+/// Write an HTTP 301 redirect to `https://<host>:<port>/...` for a plain-HTTP
+/// request on an HTTPS serve port. Mirrors Go's implicit HTTP→HTTPS redirect
+/// when a funnel/HTTPS port receives a non-TLS connection.
+async fn write_https_redirect<W: AsyncWrite + Unpin>(
+    conn: &mut W,
+    host: &str,
+    https_port: u16,
+) -> Result<(), ServeError> {
+    let location = if https_port == 443 {
+        format!("https://{host}/")
+    } else {
+        format!("https://{host}:{https_port}/")
+    };
+    let body = format!("Redirecting to <a href=\"{location}\">{location}</a>\n");
+    let resp = format!(
+        "HTTP/1.1 301 Moved Permanently\r\n\
+         Location: {location}\r\n\
+         Content-Type: text/html; charset=utf-8\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    conn.write_all(resp.as_bytes()).await?;
+    conn.flush().await?;
+    Ok(())
 }
 
 /// Extract the remote peer IP from a netstack stream (best-effort; may be
@@ -607,8 +766,59 @@ where
         return Ok(());
     };
 
+    // Funnel Ingress-Target dispatch: when a request carries the
+    // `Tailscale-Ingress-Target` header (set by Tailscale's ingress servers
+    // for Funnel), the target is the `host:port` to route to. If it matches a
+    // web handler in the config, dispatch to that handler instead. Mirrors
+    // Go's `handleServeIngress` → `HandleIngressTCPConn` path.
+    if let Some(target) = req_header(&req.headers, "tailscale-ingress-target") {
+        if let Some(ingress_web) = cfg_snap.web_for_host_port(&target) {
+            if let Some(ingress_handler) = match_mount(&ingress_web.Handlers, &req.path) {
+                return dispatch_handler(
+                    &mut conn,
+                    &req,
+                    ingress_handler,
+                    port,
+                    fqdn,
+                    src_ip,
+                    peers,
+                    ups,
+                )
+                .await;
+            }
+        }
+    }
+
+    dispatch_handler(&mut conn, &req, handler, port, fqdn, src_ip, peers, ups).await
+}
+
+/// Dispatch a matched handler: text, redirect, proxy, or 500.
+async fn dispatch_handler<S>(
+    conn: &mut S,
+    req: &HttpRequest,
+    handler: &HTTPHandler,
+    _port: u16,
+    _fqdn: &str,
+    src_ip: Option<IpAddr>,
+    peers: &Arc<RwLock<Vec<Node>>>,
+    ups: &Arc<RwLock<BTreeMap<UserID, UserProfile>>>,
+) -> Result<(), ServeError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     if !handler.Text.is_empty() {
-        write_simple_response(&mut conn, 200, "OK", &handler.Text).await?;
+        write_simple_response(conn, 200, "OK", &handler.Text).await?;
+        return Ok(());
+    }
+
+    if !handler.Redirect.is_empty() {
+        let (code, url) = parse_redirect_with_code(&handler.Redirect);
+        let host = req_header(&req.headers, "host").unwrap_or_default();
+        let request_uri = &req.path;
+        let expanded = url
+            .replace("${HOST}", &host)
+            .replace("${REQUEST_URI}", request_uri);
+        write_redirect_response(conn, code, &expanded).await?;
         return Ok(());
     }
 
@@ -618,12 +828,63 @@ where
             let u = ups.try_read().ok()?;
             crate::whois_lookup(&p, &u, ip)
         });
-        proxy_request(&mut conn, &req, &handler.Proxy, src_ip, whois.as_ref()).await?;
+        proxy_request(conn, req, &handler.Proxy, src_ip, whois.as_ref()).await?;
         return Ok(());
     }
 
-    write_simple_response(&mut conn, 500, "Internal Server Error", "empty handler").await?;
+    write_simple_response(conn, 500, "Internal Server Error", "empty handler").await?;
     Ok(())
+}
+
+/// Parse a redirect string that may optionally start with a 3xx status code
+/// prefix (`"3xx:url"`). Returns `(status_code, url)`. Defaults to 302 Found.
+/// Mirrors Go's `parseRedirectWithCode`.
+fn parse_redirect_with_code(redirect: &str) -> (u16, String) {
+    if redirect.len() >= 4 && redirect.as_bytes()[3] == b':' {
+        if let Ok(code) = redirect[..3].parse::<u16>() {
+            if (300..=399).contains(&code) {
+                return (code, redirect[4..].to_string());
+            }
+        }
+    }
+    (302, redirect.to_string())
+}
+
+/// Write an HTTP redirect response.
+async fn write_redirect_response<W: AsyncWrite + Unpin>(
+    conn: &mut W,
+    code: u16,
+    location: &str,
+) -> Result<(), ServeError> {
+    let reason = match code {
+        301 => "Moved Permanently",
+        302 => "Found",
+        303 => "See Other",
+        307 => "Temporary Redirect",
+        308 => "Permanent Redirect",
+        _ => "Found",
+    };
+    let body = format!("Redirecting to <a href=\"{location}\">{location}</a>\n");
+    let resp = format!(
+        "HTTP/1.1 {code} {reason}\r\n\
+         Location: {location}\r\n\
+         Content-Type: text/html; charset=utf-8\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    conn.write_all(resp.as_bytes()).await?;
+    conn.flush().await?;
+    Ok(())
+}
+
+/// Case-insensitive header lookup.
+fn req_header(headers: &[(String, String)], name: &str) -> Option<String> {
+    headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.clone())
 }
 
 /// Find the handler for a request path using longest-prefix mount matching.

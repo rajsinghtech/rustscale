@@ -13,6 +13,7 @@ workspace = true
 rustscale-safesocket = { path = "../safesocket", version = "0.1.0" }
 rustscale-ipn = { path = "../ipn", version = "0.1.0" }
 rustscale-tailcfg = { path = "../tailcfg", version = "0.1.0" }
+rustscale-tsnet = { path = "../tsnet", version = "0.1.0" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

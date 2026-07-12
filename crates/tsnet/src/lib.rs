@@ -1015,6 +1015,28 @@ impl Server {
                 state_dir: self.config.state_dir.clone(),
                 auth_url: Arc::new(std::sync::Mutex::new(None)),
                 login_trigger: Arc::new(tokio::sync::Notify::new()),
+                serve_config: Arc::new(RwLock::new(
+                    self.config
+                        .state_dir
+                        .as_ref()
+                        .and_then(|d| serve::ServeConfig::load(d).ok())
+                        .unwrap_or_default(),
+                )),
+                serve_runner: serve.clone(),
+                profiles: Arc::new(RwLock::new(
+                    self.config
+                        .state_dir
+                        .as_ref()
+                        .and_then(|d| rustscale_ipn::LoginProfile::load_all(d).ok())
+                        .unwrap_or_default(),
+                )),
+                current_profile: Arc::new(RwLock::new(
+                    self.config
+                        .state_dir
+                        .as_ref()
+                        .and_then(|d| rustscale_ipn::LoginProfile::load_current_id(d).ok())
+                        .flatten(),
+                )),
             };
             if let Some(h) = localapi::spawn_localapi(Arc::new(state), path.clone()) {
                 tasks.push(h.task);
@@ -1311,6 +1333,28 @@ impl Server {
                 state_dir: self.config.state_dir.clone(),
                 auth_url: Arc::new(std::sync::Mutex::new(None)),
                 login_trigger: Arc::new(tokio::sync::Notify::new()),
+                serve_config: Arc::new(RwLock::new(
+                    self.config
+                        .state_dir
+                        .as_ref()
+                        .and_then(|d| serve::ServeConfig::load(d).ok())
+                        .unwrap_or_default(),
+                )),
+                serve_runner: None, // TUN mode has no serve runner
+                profiles: Arc::new(RwLock::new(
+                    self.config
+                        .state_dir
+                        .as_ref()
+                        .and_then(|d| rustscale_ipn::LoginProfile::load_all(d).ok())
+                        .unwrap_or_default(),
+                )),
+                current_profile: Arc::new(RwLock::new(
+                    self.config
+                        .state_dir
+                        .as_ref()
+                        .and_then(|d| rustscale_ipn::LoginProfile::load_current_id(d).ok())
+                        .flatten(),
+                )),
             };
             if let Some(h) = localapi::spawn_localapi(Arc::new(state), path.clone()) {
                 tasks.push(h.task);
@@ -1494,6 +1538,28 @@ impl Server {
             state_dir: self.config.state_dir.clone(),
             auth_url: auth_url.clone(),
             login_trigger: login_trigger.clone(),
+            serve_config: Arc::new(RwLock::new(
+                self.config
+                    .state_dir
+                    .as_ref()
+                    .and_then(|d| serve::ServeConfig::load(d).ok())
+                    .unwrap_or_default(),
+            )),
+            serve_runner: None,
+            profiles: Arc::new(RwLock::new(
+                self.config
+                    .state_dir
+                    .as_ref()
+                    .and_then(|d| rustscale_ipn::LoginProfile::load_all(d).ok())
+                    .unwrap_or_default(),
+            )),
+            current_profile: Arc::new(RwLock::new(
+                self.config
+                    .state_dir
+                    .as_ref()
+                    .and_then(|d| rustscale_ipn::LoginProfile::load_current_id(d).ok())
+                    .flatten(),
+            )),
         });
 
         let handle = localapi::spawn_localapi(api_state, socket_path.clone());

@@ -30,6 +30,7 @@
 
 use std::collections::BTreeMap;
 use std::net::IpAddr;
+use std::path::Path;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -154,6 +155,52 @@ impl ServeConfig {
             .find(|(hp, _)| hp.ends_with(&suffix))
             .map(|(_, w)| w)
     }
+
+    /// Compute the ETag for this config — the hex-encoded SHA-256 of the
+    /// canonical JSON serialization. Mirrors Go's `generateServeConfigETag`.
+    pub fn etag(&self) -> String {
+        let j = serde_json::to_vec(self).unwrap_or_default();
+        let sum = sha256(&j);
+        hex::encode(sum)
+    }
+
+    /// Whether this config has any handlers configured.
+    pub fn is_empty(&self) -> bool {
+        self.TCP.is_empty() && self.Web.is_empty() && self.AllowFunnel.is_empty()
+    }
+
+    /// Load serve config from `<dir>/serve-config.json`. Returns
+    /// `ServeConfig::default()` if the file does not exist.
+    pub fn load(dir: &Path) -> Result<Self, std::io::Error> {
+        let path = dir.join("serve-config.json");
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let data = std::fs::read_to_string(&path)?;
+        let cfg: Self = serde_json::from_str(&data)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        Ok(cfg)
+    }
+
+    /// Save serve config to `<dir>/serve-config.json` atomically.
+    pub fn save(&self, dir: &Path) -> Result<(), std::io::Error> {
+        std::fs::create_dir_all(dir)?;
+        let path = dir.join("serve-config.json");
+        let tmp = dir.join(format!("serve-config.json.tmp.{}", std::process::id()));
+        let data = serde_json::to_vec_pretty(self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        std::fs::write(&tmp, &data)?;
+        std::fs::rename(&tmp, &path)?;
+        Ok(())
+    }
+}
+
+/// Compute SHA-256 digest of `data`.
+fn sha256(data: &[u8]) -> [u8; 32] {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(data);
+    hasher.finalize().into()
 }
 
 // ---------------------------------------------------------------------------
@@ -311,8 +358,10 @@ impl ServeRunner {
         cfg: ServeConfig,
         cert_provider: Option<Arc<dyn CertProvider>>,
     ) -> Result<Vec<u16>, ServeError> {
-        // Install the cert provider.
-        *self.cert_provider.lock().expect("cert mutex") = cert_provider;
+        // Install the cert provider (if provided; None keeps the existing one).
+        if let Some(cp) = cert_provider {
+            *self.cert_provider.lock().expect("cert mutex") = Some(cp);
+        }
 
         // Cancel the old generation and abort its tasks.
         {

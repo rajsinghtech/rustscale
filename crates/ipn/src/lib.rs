@@ -21,11 +21,13 @@ mod backend;
 mod bus;
 mod machine;
 mod prefs;
+mod profiles;
 
 pub use backend::{BackendInputs, IpnBackend};
 pub use bus::{NotifyBus, NotifyBusReceiver};
 pub use machine::{next_state, StateMachineInputs};
 pub use prefs::{MaskedPrefs, Prefs, StartOptions};
+pub use profiles::{LoginProfile, NetworkProfile, ProfileID, StateKey, UserProfile};
 
 use serde::{Deserialize, Serialize};
 

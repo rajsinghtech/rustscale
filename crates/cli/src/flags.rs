@@ -35,6 +35,11 @@ pub fn parse_str_flag(args: &[String], name: &str) -> Option<String> {
     None
 }
 
+/// A parsed u16 flag that takes a value: `--name value` or `--name=value`.
+pub fn parse_u16_flag(args: &[String], name: &str) -> Option<u16> {
+    parse_str_flag(args, name).and_then(|s| s.parse::<u16>().ok())
+}
+
 /// Return the positional (non-flag) arguments from the given arg list.
 #[allow(dead_code)]
 pub fn positional_args(args: &[String]) -> Vec<String> {

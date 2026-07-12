@@ -123,6 +123,9 @@ async fn dispatch(
         "down" => commands::down::run(args, &socket_path).await,
         "set" => commands::set::run(args, &socket_path).await,
         "get" => commands::get::run(args, &socket_path).await,
+        "serve" => commands::serve::run(args, &socket_path, json).await,
+        "funnel" => commands::serve::run_funnel(args, &socket_path, json).await,
+        "switch" => commands::switch::run(args, &socket_path, json).await,
         "ping" => commands::ping::run(args, &socket_path).await,
         other => {
             eprintln!("error: unknown subcommand '{other}'");
@@ -147,6 +150,13 @@ fn usage(bin: &str) {
     eprintln!("  down                                disconnect from Tailscale");
     eprintln!("  set [flags]                         set preferences");
     eprintln!("  get                                 print preferences");
+    eprintln!("  serve [--bg] [flags] <target>       serve content on the tailnet");
+    eprintln!("  serve status [--json]               show current serve config");
+    eprintln!("  serve reset                         clear serve config");
+    eprintln!("  funnel [--bg] [flags] <target>      serve content on the internet");
+    eprintln!("  funnel status [--json]              show current funnel config");
+    eprintln!("  funnel reset                        clear funnel config");
+    eprintln!("  switch [--list] [<profile>]         switch between accounts");
     eprintln!("  status [--peers=false] [--active]   show state of rustscaled and connections");
     eprintln!("  ip [-4] [-6] [peer]                 show Tailscale IP addresses");
     eprintln!("  version [--daemon]                  print client and daemon version");

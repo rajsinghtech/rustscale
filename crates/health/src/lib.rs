@@ -27,6 +27,9 @@ use chrono::{DateTime, Utc};
 pub const WARN_CONTROL: &str = "control-connection";
 /// Home DERP region unreachable. Medium severity.
 pub const WARN_DERP_HOME: &str = "derp-home-unreachable";
+/// A specific DERP region is unreachable. Medium severity.
+/// The warnable id includes the region id, e.g. "derp-region-3-unreachable".
+pub const WARN_DERP_REGION_PREFIX: &str = "derp-region-";
 /// Serving a self-signed / stale cert fallback. Low severity.
 pub const WARN_CERT_FALLBACK: &str = "cert-fallback";
 /// Network changed, re-probing endpoints. Low severity, transient.
@@ -72,6 +75,15 @@ struct Inner {
     warnables: HashMap<String, Warnable>,
     /// Active warnings: id -> (text, since).
     active: HashMap<String, (String, DateTime<Utc>)>,
+    /// Per-region DERP health: region_id -> (healthy, last_frame_at).
+    derp_regions: HashMap<i32, DerpRegionHealth>,
+}
+
+/// Per-region DERP health state.
+#[derive(Clone, Debug)]
+struct DerpRegionHealth {
+    healthy: bool,
+    last_frame_at: Option<DateTime<Utc>>,
 }
 
 /// The health tracker. Cloneable and cheap — all clones share one inner state.
@@ -93,6 +105,7 @@ impl Tracker {
             inner: Arc::new(Mutex::new(Inner {
                 warnables: HashMap::new(),
                 active: HashMap::new(),
+                derp_regions: HashMap::new(),
             })),
         };
         t.register(Warnable {
@@ -149,6 +162,67 @@ impl Tracker {
     pub fn is_unhealthy(&self, id: &str) -> bool {
         let g = self.inner.lock().expect("health mutex poisoned");
         g.active.contains_key(id)
+    }
+
+    /// Set the health of a DERP region. When `healthy` is false, a warning
+    /// is activated for the region. When true, any existing warning is
+    /// cleared. Mirrors Go's `Tracker.SetDERPRegionHealth`
+    /// (health.go:822-836).
+    pub fn set_derp_region_health(&self, region_id: i32, healthy: bool) {
+        let warnable_id = format!("{WARN_DERP_REGION_PREFIX}{region_id}-unreachable");
+        if healthy {
+            self.set_healthy(&warnable_id);
+        } else {
+            self.set_unhealthy(&warnable_id, format!("DERP region {region_id} unreachable"));
+        }
+        let mut g = self.inner.lock().expect("health mutex poisoned");
+        g.derp_regions
+            .entry(region_id)
+            .and_modify(|h| h.healthy = healthy)
+            .or_insert(DerpRegionHealth {
+                healthy,
+                last_frame_at: None,
+            });
+    }
+
+    /// Note that a frame was received from the given DERP region at the
+    /// current time, resetting the region's health to healthy. Mirrors
+    /// Go's `Tracker.NoteDERPRegionReceivedFrame` (health.go:838-848).
+    pub fn note_derp_region_frame(&self, region_id: i32) {
+        self.set_derp_region_health(region_id, true);
+        let mut g = self.inner.lock().expect("health mutex poisoned");
+        g.derp_regions.entry(region_id).and_modify(|h| {
+            h.last_frame_at = Some(Utc::now());
+        });
+    }
+
+    /// Check whether a DERP region has received a frame within the given
+    /// timeout. If not, mark it unhealthy. Returns true if marked unhealthy.
+    /// Mirrors the recv-loop health check in Go's derp.go.
+    pub fn check_derp_region_staleness(&self, region_id: i32, timeout: Duration) -> bool {
+        let stale = {
+            let g = self.inner.lock().expect("health mutex poisoned");
+            match g.derp_regions.get(&region_id) {
+                Some(h) => match h.last_frame_at {
+                    Some(at) => {
+                        Utc::now().signed_duration_since(at).num_seconds() as u64
+                            >= timeout.as_secs()
+                    }
+                    None => false, // No frame ever received — don't mark stale until we have a baseline.
+                },
+                None => false,
+            }
+        };
+        if stale {
+            self.set_derp_region_health(region_id, false);
+        }
+        stale
+    }
+
+    /// Whether a DERP region is currently marked healthy.
+    pub fn derp_region_healthy(&self, region_id: i32) -> bool {
+        let g = self.inner.lock().expect("health mutex poisoned");
+        g.derp_regions.get(&region_id).is_some_and(|h| h.healthy)
     }
 
     /// Snapshot all active warnings, sorted by severity (High first) then id.
@@ -404,5 +478,59 @@ mod tests {
         // Another 200ms — still under 400ms since feed.
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(!t.is_unhealthy("delayed-wd"));
+    }
+
+    // ---- DERP region health tests ----
+
+    #[test]
+    fn derp_region_set_unhealthy_and_healthy() {
+        let t = Tracker::new();
+        // Initially no record → not unhealthy, not healthy.
+        assert!(!t.is_unhealthy("derp-region-5-unreachable"));
+        assert!(!t.derp_region_healthy(5));
+
+        // Mark unhealthy.
+        t.set_derp_region_health(5, false);
+        assert!(t.is_unhealthy("derp-region-5-unreachable"));
+        assert!(!t.derp_region_healthy(5));
+
+        // Mark healthy.
+        t.set_derp_region_health(5, true);
+        assert!(!t.is_unhealthy("derp-region-5-unreachable"));
+        assert!(t.derp_region_healthy(5));
+    }
+
+    #[test]
+    fn derp_region_note_frame_marks_healthy() {
+        let t = Tracker::new();
+        // Mark unhealthy first.
+        t.set_derp_region_health(3, false);
+        assert!(t.is_unhealthy("derp-region-3-unreachable"));
+
+        // Note a frame — should clear the warning.
+        t.note_derp_region_frame(3);
+        assert!(!t.is_unhealthy("derp-region-3-unreachable"));
+        assert!(t.derp_region_healthy(3));
+    }
+
+    #[test]
+    fn derp_region_staleness_not_triggered_without_baseline() {
+        let t = Tracker::new();
+        // No frame ever received — should not mark stale.
+        assert!(!t.check_derp_region_staleness(7, Duration::from_secs(0)));
+        assert!(!t.is_unhealthy("derp-region-7-unreachable"));
+    }
+
+    #[test]
+    fn derp_region_staleness_triggered_after_timeout() {
+        let t = Tracker::new();
+        // Record a frame to establish a baseline.
+        t.note_derp_region_frame(9);
+        assert!(t.derp_region_healthy(9));
+
+        // With a 0-second timeout, the frame is already stale.
+        assert!(t.check_derp_region_staleness(9, Duration::from_secs(0)));
+        assert!(!t.derp_region_healthy(9));
+        assert!(t.is_unhealthy("derp-region-9-unreachable"));
     }
 }

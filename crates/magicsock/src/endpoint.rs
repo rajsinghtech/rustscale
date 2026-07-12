@@ -13,6 +13,58 @@ use std::time::{Duration, Instant};
 /// Mirrors Go's `trustUDPAddrDuration` (magicsock.go:4036).
 pub const TRUST_BEST_ADDR_DURATION: Duration = Duration::from_millis(6500);
 
+/// How long after the last DERP packet from a peer before we consider the
+/// DERP route stale and clear it. Mirrors Go's derpRoute inactivity
+/// semantics — the route is cleaned up after this timeout.
+pub const DERP_ROUTE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Endpoint type, mirroring Go's `tailcfg.EndpointType` (tailcfg.go:1332).
+/// Used for ranking candidate paths: higher-ranked types are preferred.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub enum EndpointType {
+    /// Unknown / unspecified.
+    #[default]
+    Unknown,
+    /// Explicitly configured by the user.
+    ExplicitConf,
+    /// STUN-resolved public address.
+    Stun,
+    /// Port-mapped (NAT-PMP/PCP/UPnP).
+    Portmapped,
+    /// Hard NAT: STUN'ed IPv4 + local fixed port.
+    Stun4LocalPort,
+    /// Local interface address.
+    Local,
+}
+
+impl EndpointType {
+    /// Ranking priority — higher is better. Mirrors Go's path preference:
+    /// local > portmapped > stun4localport > stun > explicit > unknown.
+    pub fn rank(self) -> u8 {
+        match self {
+            Self::Local => 5,
+            Self::Portmapped => 4,
+            Self::Stun4LocalPort => 3,
+            Self::Stun => 2,
+            Self::ExplicitConf => 1,
+            Self::Unknown => 0,
+        }
+    }
+}
+
+impl From<rustscale_tailcfg::EndpointType> for EndpointType {
+    fn from(t: rustscale_tailcfg::EndpointType) -> Self {
+        match t {
+            rustscale_tailcfg::EndpointType::LOCAL => Self::Local,
+            rustscale_tailcfg::EndpointType::STUN => Self::Stun,
+            rustscale_tailcfg::EndpointType::PORTMAPPED => Self::Portmapped,
+            rustscale_tailcfg::EndpointType::STUN4_LOCAL_PORT => Self::Stun4LocalPort,
+            rustscale_tailcfg::EndpointType::EXPLICIT_CONF => Self::ExplicitConf,
+            _ => Self::Unknown,
+        }
+    }
+}
+
 /// Path class ranking — lower ordinal = better.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum PathClass {
@@ -202,7 +254,7 @@ impl BestPath {
 pub struct Endpoint {
     peer_node_key: rustscale_key::NodePublic,
     peer_disco_key: rustscale_key::DiscoPublic,
-    candidates: Vec<SocketAddr>,
+    candidates: Vec<(SocketAddr, EndpointType)>,
     best_addr: Option<(SocketAddr, Instant)>,
     relay: Option<(SocketAddr, u32)>,
     home_derp: i32,
@@ -210,6 +262,10 @@ pub struct Endpoint {
     /// arrived. Used for reply routing when HomeDERP is 0 or stale.
     /// Mirrors Go's `derpRoute` / `setDerpRoute` caching.
     last_recv_derp_region: i32,
+    /// When `last_recv_derp_region` was last set. Used for timer-based
+    /// expiry — after `DERP_ROUTE_CLEANUP_TIMEOUT` of inactivity, the
+    /// route is considered stale and cleared.
+    last_recv_derp_at: Option<Instant>,
     pending_pings: HashMap<[u8; 12], PendingPing>,
     call_me_maybe_sent: bool,
     /// Last external TX activity (e.g. wireguard send). Drives the heartbeat
@@ -242,6 +298,7 @@ impl Endpoint {
             relay: None,
             home_derp,
             last_recv_derp_region: 0,
+            last_recv_derp_at: None,
             pending_pings: HashMap::new(),
             call_me_maybe_sent: false,
             last_send_ext: None,
@@ -263,12 +320,35 @@ impl Endpoint {
 
     /// Set candidate UDP endpoints (from `tailcfg::Node.Endpoints`).
     pub fn set_candidates(&mut self, addrs: Vec<SocketAddr>) {
+        self.candidates = addrs
+            .into_iter()
+            .map(|a| (a, EndpointType::Unknown))
+            .collect();
+    }
+
+    /// Set candidate UDP endpoints with their endpoint types (from
+    /// `tailcfg::Node.Endpoints` + `EndpointTypes`).
+    pub fn set_candidates_typed(&mut self, addrs: Vec<(SocketAddr, EndpointType)>) {
         self.candidates = addrs;
     }
 
-    /// Candidate UDP endpoints to probe.
-    pub fn candidates(&self) -> &[SocketAddr] {
+    /// Candidate UDP endpoints to probe (address only).
+    pub fn candidates(&self) -> Vec<SocketAddr> {
+        self.candidates.iter().map(|(a, _)| *a).collect()
+    }
+
+    /// Candidate UDP endpoints with their types.
+    pub fn candidates_typed(&self) -> &[(SocketAddr, EndpointType)] {
         &self.candidates
+    }
+
+    /// Candidates sorted by endpoint type rank (highest first), so
+    /// higher-quality paths are probed before lower-quality ones.
+    /// Mirrors Go's endpoint type preference for path ranking.
+    pub fn ranked_candidates(&self) -> Vec<(SocketAddr, EndpointType)> {
+        let mut sorted = self.candidates.clone();
+        sorted.sort_by_key(|b| std::cmp::Reverse(b.1.rank()));
+        sorted
     }
 
     /// The peer's home DERP region.
@@ -282,17 +362,21 @@ impl Endpoint {
     }
 
     /// Record the DERP region from which a packet from this peer arrived.
-    /// Used for reply routing (Go's derpRoute caching).
+    /// Used for reply routing (Go's derpRoute caching). Also records the
+    /// arrival time for timer-based expiry.
     pub fn set_last_recv_derp_region(&mut self, region: i32) {
         self.last_recv_derp_region = region;
+        self.last_recv_derp_at = Some(Instant::now());
     }
 
     /// Pick the DERP region to use for sending to this peer.
-    /// Priority: last-received-region (most reliable) > HomeDERP (netmap) > 0.
+    /// Priority: last-received-region (if still valid) > HomeDERP (netmap) > 0.
     /// This mirrors Go magicsock's derpRoute: the region a packet arrived on
     /// is the one we reply on, since the peer is demonstrably listening there.
+    /// Does not mutate — call `expire_derp_route_if_stale` from housekeeping
+    /// to actually clear stale routes.
     pub fn derp_send_region(&self) -> i32 {
-        if self.last_recv_derp_region > 0 {
+        if self.last_recv_derp_region > 0 && self.derp_route_valid() {
             return self.last_recv_derp_region;
         }
         self.home_derp
@@ -301,6 +385,26 @@ impl Endpoint {
     /// Debug accessor for the last-recv DERP region.
     pub fn last_recv_derp_region_for_debug(&self) -> i32 {
         self.last_recv_derp_region
+    }
+
+    /// Check whether the DERP route has expired and clear it if so.
+    /// Called automatically by `derp_send_region` and usable from
+    /// housekeeping loops.
+    pub fn expire_derp_route_if_stale(&mut self) {
+        if let Some(at) = self.last_recv_derp_at {
+            if Instant::now().duration_since(at) >= DERP_ROUTE_CLEANUP_TIMEOUT {
+                self.last_recv_derp_region = 0;
+                self.last_recv_derp_at = None;
+            }
+        }
+    }
+
+    /// Whether the DERP route is currently valid (not expired).
+    pub fn derp_route_valid(&self) -> bool {
+        match self.last_recv_derp_at {
+            Some(at) => Instant::now().duration_since(at) < DERP_ROUTE_CLEANUP_TIMEOUT,
+            None => false,
+        }
     }
 
     /// Evaluate the best path at time `now`.
@@ -316,9 +420,15 @@ impl Endpoint {
         if let Some((addr, vni)) = self.relay {
             return BestPath::Relay { addr, vni };
         }
-        if self.home_derp > 0 || self.last_recv_derp_region > 0 {
+        // Check derp route validity without mutating (best_path is &self).
+        let derp_region = if self.derp_route_valid() {
+            self.last_recv_derp_region
+        } else {
+            self.home_derp
+        };
+        if derp_region > 0 {
             return BestPath::Derp {
-                region: self.derp_send_region(),
+                region: derp_region,
             };
         }
         BestPath::None
@@ -379,6 +489,11 @@ impl Endpoint {
         self.pending_pings.remove(tx_id)
     }
 
+    /// Check whether a tx_id has a pending ping without consuming it.
+    pub fn has_pending_ping(&self, tx_id: &[u8; 12]) -> bool {
+        self.pending_pings.contains_key(tx_id)
+    }
+
     /// Whether we should send a CallMeMaybe to this peer (once per netmap set).
     pub fn should_send_call_me_maybe(&mut self) -> bool {
         if self.call_me_maybe_sent {
@@ -393,6 +508,26 @@ impl Endpoint {
         self.call_me_maybe_sent = false;
     }
 
+    /// Check whether the best-addr trust has expired and, if so, reset the
+    /// CallMeMaybe flag so it can be retriggered on the next disco ping
+    /// cycle. Mirrors Go's behavior where `trustBestAddrUntil` expiring
+    /// causes `sendDiscoPingsLocked` to re-send CallMeMaybe
+    /// (endpoint.go:1375-1407).
+    ///
+    /// Returns `true` if CallMeMaybe was retriggered (trust expired).
+    pub fn maybe_retrigger_call_me_maybe(&mut self, now: Instant) -> bool {
+        match self.best_addr {
+            Some((_, until)) if now >= until => {
+                if self.call_me_maybe_sent {
+                    self.call_me_maybe_sent = false;
+                    return true;
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
     /// Remove expired pending pings (housekeeping).
     pub fn expire_pending_pings(&mut self, now: Instant, max_age: Duration) {
         self.pending_pings
@@ -405,6 +540,7 @@ impl Endpoint {
         self.best_addr = None;
         self.pending_pings.clear();
         self.last_recv_derp_region = 0;
+        self.last_recv_derp_at = None;
         self.call_me_maybe_sent = false;
         self.last_send_ext = None;
         self.last_recv_udp = None;
@@ -587,6 +723,14 @@ impl Endpoint {
             Some(p) => !self.pending_pings.contains_key(&p.last_tx_id()),
             None => true,
         }
+    }
+
+    /// Clear the DERP route for this peer (e.g. on PeerGone).
+    /// Mirrors Go's `removeDerpPeerRoute`
+    /// (derp.go:52-59).
+    pub fn remove_derp_route(&mut self) {
+        self.last_recv_derp_region = 0;
+        self.last_recv_derp_at = None;
     }
 
     /// Number of pending disco pings (for testing PMTUD burst).
@@ -861,5 +1005,142 @@ mod tests {
         assert!(e
             .maybe_probe_udp_lifetime(now, &lower_disco, Duration::from_secs(2))
             .is_some());
+    }
+
+    // ---- EndpointType ranking tests ----
+
+    #[test]
+    fn endpoint_type_ranking_order() {
+        assert!(EndpointType::Local.rank() > EndpointType::Portmapped.rank());
+        assert!(EndpointType::Portmapped.rank() > EndpointType::Stun4LocalPort.rank());
+        assert!(EndpointType::Stun4LocalPort.rank() > EndpointType::Stun.rank());
+        assert!(EndpointType::Stun.rank() > EndpointType::ExplicitConf.rank());
+        assert!(EndpointType::ExplicitConf.rank() > EndpointType::Unknown.rank());
+    }
+
+    #[test]
+    fn ranked_candidates_sorts_by_type() {
+        let mut e = ep();
+        e.set_candidates_typed(vec![
+            (sa(1000), EndpointType::Stun),
+            (sa(2000), EndpointType::Local),
+            (sa(3000), EndpointType::Portmapped),
+            (sa(4000), EndpointType::Unknown),
+        ]);
+
+        let ranked = e.ranked_candidates();
+        assert_eq!(ranked[0].0, sa(2000)); // Local
+        assert_eq!(ranked[0].1, EndpointType::Local);
+        assert_eq!(ranked[1].0, sa(3000)); // Portmapped
+        assert_eq!(ranked[1].1, EndpointType::Portmapped);
+        assert_eq!(ranked[2].0, sa(1000)); // Stun
+        assert_eq!(ranked[2].1, EndpointType::Stun);
+        assert_eq!(ranked[3].0, sa(4000)); // Unknown
+        assert_eq!(ranked[3].1, EndpointType::Unknown);
+    }
+
+    #[test]
+    fn candidates_typed_preserves_types() {
+        let mut e = ep();
+        e.set_candidates_typed(vec![
+            (sa(1000), EndpointType::Stun),
+            (sa(2000), EndpointType::Local),
+        ]);
+        let typed = e.candidates_typed();
+        assert_eq!(typed.len(), 2);
+        assert_eq!(typed[0].1, EndpointType::Stun);
+        assert_eq!(typed[1].1, EndpointType::Local);
+
+        // candidates() still returns just addresses.
+        let addrs = e.candidates();
+        assert_eq!(addrs, vec![sa(1000), sa(2000)]);
+    }
+
+    // ---- DerpRoute timer expiry tests ----
+
+    #[test]
+    fn derp_route_expires_after_timeout() {
+        let mut e = ep();
+        // Set a DERP route.
+        e.set_last_recv_derp_region(5);
+        assert!(e.derp_route_valid());
+        assert_eq!(e.derp_send_region(), 5);
+
+        // Simulate expiry: manually set the timestamp to the past.
+        let stale = Instant::now()
+            .checked_sub(DERP_ROUTE_CLEANUP_TIMEOUT)
+            .unwrap()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap();
+        e.last_recv_derp_at = Some(stale);
+
+        // Now the route is no longer valid.
+        assert!(!e.derp_route_valid());
+
+        // derp_send_region falls back to home_derp (which is 1).
+        assert_eq!(e.derp_send_region(), 1);
+
+        // expire_derp_route_if_stale clears it.
+        e.expire_derp_route_if_stale();
+        assert_eq!(e.last_recv_derp_region_for_debug(), 0);
+    }
+
+    #[test]
+    fn derp_route_remove_clears_state() {
+        let mut e = ep();
+        e.set_last_recv_derp_region(7);
+        assert!(e.derp_route_valid());
+        assert_eq!(e.derp_send_region(), 7);
+
+        e.remove_derp_route();
+        assert!(!e.derp_route_valid());
+        assert_eq!(e.last_recv_derp_region_for_debug(), 0);
+        // Falls back to home_derp.
+        assert_eq!(e.derp_send_region(), 1);
+    }
+
+    #[test]
+    fn derp_route_reset_on_link_change() {
+        let mut e = ep();
+        e.set_last_recv_derp_region(3);
+        assert!(e.derp_route_valid());
+
+        e.reset_for_link_change();
+        assert!(!e.derp_route_valid());
+        assert_eq!(e.last_recv_derp_region_for_debug(), 0);
+    }
+
+    // ---- CallMeMaybe retriggering tests ----
+
+    #[test]
+    fn call_me_maybe_retriggers_on_trust_expiry() {
+        let mut e = ep();
+        let now = Instant::now();
+
+        // Simulate having sent CallMeMaybe and confirmed a direct path.
+        assert!(e.should_send_call_me_maybe());
+        e.confirm_direct(sa(5000), now);
+
+        // Trust still valid — no retrigger.
+        assert!(!e.maybe_retrigger_call_me_maybe(now));
+
+        // After trust expires — retrigger.
+        let later = now + TRUST_BEST_ADDR_DURATION + Duration::from_millis(1);
+        assert!(e.maybe_retrigger_call_me_maybe(later));
+
+        // Now should_send_call_me_maybe returns true again.
+        assert!(e.should_send_call_me_maybe());
+    }
+
+    #[test]
+    fn call_me_maybe_no_retrigger_when_not_sent() {
+        let mut e = ep();
+        let now = Instant::now();
+        e.confirm_direct(sa(5000), now);
+
+        // CallMeMaybe was never sent, so even after trust expiry
+        // there's nothing to retrigger.
+        let later = now + TRUST_BEST_ADDR_DURATION + Duration::from_millis(1);
+        assert!(!e.maybe_retrigger_call_me_maybe(later));
     }
 }

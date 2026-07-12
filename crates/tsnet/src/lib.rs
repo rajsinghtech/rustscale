@@ -1233,36 +1233,9 @@ impl Server {
             b.health.clone(),
         );
 
-        // Real TUN device.
-        let tun: Arc<dyn Tun> = {
-            #[cfg(any(target_os = "macos", target_os = "linux"))]
-            {
-                let dev = rustscale_tun::create(&config.tun)?;
-                if config.apply_routes {
-                    apply_tun_routes(dev.name(), &b.tailscale_ips, config.tun.mtu)?;
-                    // When accept_routes is enabled, install peer-advertised
-                    // subnet routes as OS routes pointing at the TUN device.
-                    if self.config.accept_routes {
-                        let rt = b.route_table.read().await;
-                        apply_accepted_subnet_routes(dev.name(), &rt)?;
-                    }
-                    // When an exit node is selected, install OS-level
-                    // default-route overrides so all non-tailnet traffic
-                    // enters the TUN. See TunModeConfig::exit_node docs for
-                    // the known loop limitation.
-                    if config.exit_node.is_some() {
-                        apply_exit_node_routes(dev.name())?;
-                    }
-                }
-                Arc::new(dev)
-            }
-            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-            {
-                return Err(TsnetError::Builder(
-                    "TUN mode not supported on this platform".into(),
-                ));
-            }
-        };
+        // Real TUN device (macOS/Linux only; on other platforms
+        // `create_tun_device` returns an error and `?` propagates it).
+        let tun: Arc<dyn Tun> = create_tun_device(&config, &b, self.config.accept_routes).await?;
 
         // TUN data-plane pump: TUN <-> WG <-> magicsock.
         let pump = tokio::spawn(run_tun_pump(
@@ -4215,11 +4188,47 @@ fn first_v4(ips: &[IpAddr]) -> Result<Ipv4Addr, TsnetError> {
         .ok_or_else(|| TsnetError::Builder("no IPv4 tailnet address".into()))
 }
 
+/// Create a TUN device and optionally apply OS routes.
+/// On macOS/Linux this creates the real device and installs routes when
+/// `config.apply_routes` is true. On other platforms it returns an error.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+async fn create_tun_device(
+    config: &TunModeConfig,
+    b: &Bootstrap,
+    accept_routes: bool,
+) -> Result<Arc<dyn Tun>, TsnetError> {
+    let dev = rustscale_tun::create(&config.tun)?;
+    if config.apply_routes {
+        apply_tun_routes(dev.name(), &b.tailscale_ips, config.tun.mtu)?;
+        if accept_routes {
+            let rt = b.route_table.read().await;
+            apply_accepted_subnet_routes(dev.name(), &rt)?;
+        }
+        if config.exit_node.is_some() {
+            apply_exit_node_routes(dev.name())?;
+        }
+    }
+    Ok(Arc::new(dev))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[allow(clippy::unused_async)]
+async fn create_tun_device(
+    _config: &TunModeConfig,
+    _b: &Bootstrap,
+    _accept_routes: bool,
+) -> Result<Arc<dyn Tun>, TsnetError> {
+    Err(TsnetError::Builder(
+        "TUN mode not supported on this platform".into(),
+    ))
+}
+
 /// Bring the TUN interface up and add tailnet routes. Requires root.
 ///
 /// On macOS: `ifconfig <name> up <our_v4>/32`, `route add 100.64.0.0/10 -interface <name>`.
 /// On Linux: `ip link set <name> up`, `ip addr add <our_v4>/32 dev <name>`,
 /// `ip route add 100.64.0.0/10 dev <name>`.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn apply_tun_routes(ifname: &str, tailscale_ips: &[IpAddr], _mtu: usize) -> Result<(), TsnetError> {
     let our_v4 = first_v4(tailscale_ips)?;
     let v4_str = our_v4.to_string();
@@ -4244,10 +4253,6 @@ fn apply_tun_routes(ifname: &str, tailscale_ips: &[IpAddr], _mtu: usize) -> Resu
         )?;
         run_cmd("ip", &["route", "add", "100.64.0.0/10", "dev", ifname])?;
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        let _ = (ifname, v4_str);
-    }
     Ok(())
 }
 
@@ -4259,6 +4264,7 @@ fn apply_tun_routes(ifname: &str, tailscale_ips: &[IpAddr], _mtu: usize) -> Resu
 /// appearing routes (from later map-stream deltas) are not yet reflected in
 /// the OS table — a future improvement. The in-process `RouteTable` always
 /// has the latest entries.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn apply_accepted_subnet_routes(ifname: &str, rt: &RouteTable) -> Result<(), TsnetError> {
     for (net, prefix, _peer) in rt.entries() {
         let cidr = format!("{net}/{prefix}");
@@ -4275,10 +4281,6 @@ fn apply_accepted_subnet_routes(ifname: &str, rt: &RouteTable) -> Result<(), Tsn
         #[cfg(target_os = "linux")]
         {
             let _ = run_cmd("ip", &["route", "add", &cidr, "dev", ifname]);
-        }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        {
-            let _ = (ifname, &cidr);
         }
     }
     Ok(())
@@ -4300,6 +4302,7 @@ fn apply_accepted_subnet_routes(ifname: &str, rt: &RouteTable) -> Result<(), Tsn
 /// **Linux**: best-effort `ip route add 0.0.0.0/0 dev <tun>` and
 /// `::/0 dev <tun>`. This may fail or conflict with an existing default
 /// route; failures are logged but non-fatal.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn apply_exit_node_routes(ifname: &str) -> Result<(), TsnetError> {
     #[cfg(target_os = "macos")]
     {
@@ -4328,16 +4331,13 @@ fn apply_exit_node_routes(ifname: &str) -> Result<(), TsnetError> {
         let _ = run_cmd("ip", &["route", "add", "0.0.0.0/0", "dev", ifname]);
         let _ = run_cmd("ip", &["-6", "route", "add", "::/0", "dev", ifname]);
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        let _ = ifname;
-    }
     Ok(())
 }
 
 /// Whether a CIDR's network address falls within the tailnet ranges
 /// (100.64.0.0/10 or fd7a:115c:a1e0::/48). Used by `apply_accepted_subnet_routes`
 /// to skip tailnet-range prefixes (handled by the blanket tailnet route).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn is_tailnet_cidr(net: IpAddr, _prefix: u8) -> bool {
     match net {
         IpAddr::V4(v4) => {
@@ -4357,6 +4357,7 @@ fn is_tailnet_cidr(net: IpAddr, _prefix: u8) -> bool {
 }
 
 /// Run a command, returning an error if it exits non-zero.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn run_cmd(prog: &str, args: &[&str]) -> Result<(), TsnetError> {
     let status = std::process::Command::new(prog)
         .args(args)

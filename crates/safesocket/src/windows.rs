@@ -111,7 +111,7 @@ fn create_pipe_instance(pipe_name: &str) -> io::Result<NamedPipeServer> {
 fn path_to_pipe_name(path: &Path) -> io::Result<String> {
     path.as_os_str()
         .to_str()
-        .map(|s| s.to_string())
+        .map(str::to_string)
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,

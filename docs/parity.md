@@ -225,10 +225,9 @@ touching `Cargo.lock` or `deny.toml`. Version stamping via
 ## CI pipeline
 
 `ci.yml` ✅ phase-ci-parity: OS matrix (ubuntu-latest, macos-latest,
-windows-latest). Ubuntu + macOS run full build/test/clippy; Windows is
-`cargo check --workspace` only (check-only, no tests — Windows compilation
-not verified locally; cross-compile from macOS fails due to `ring` C code,
-but Rust code has cfg guards for non-macOS/Linux platforms). Cross-compile
+windows-latest). Ubuntu + macOS run full build/test/clippy; Windows runs
+`cargo check`, `cargo clippy -- -D warnings`, and `cargo test` (meaningful
+crates) under `shell: bash` with `RUSTFLAGS="-D warnings"`. Cross-compile
 check matrix: aarch64-unknown-linux-gnu, armv7-unknown-linux-gnueabihf,
 x86_64-unknown-linux-musl (ubuntu), aarch64-apple-darwin (macos),
 x86_64-pc-windows-msvc (windows). `--locked` on every cargo invocation.
@@ -303,11 +302,15 @@ interactive_auth_flow test: testcontrol(require_auth) → start_localapi_only
 
 ## Windows port (x86_64-pc-windows-msvc)
 
-Status: ✅ compile-level portability complete. `cargo check --workspace
---target x86_64-pc-windows-msvc` passes with zero errors. Both Windows CI legs
-(`Check (windows)` and the `x86_64-pc-windows-msvc` cross-check) are now
-blocking (`continue-on-error` removed). The safesocket named-pipe transport is
-implemented and has a `#[cfg(windows)]` loopback unit test.
+Status: ✅ compile-level portability complete and warnings-clean. `cargo check
+--workspace --target x86_64-pc-windows-msvc` and `cargo clippy --workspace
+--all-targets --target x86_64-pc-windows-msvc -- -D warnings` both pass with
+zero errors/warnings. Both Windows CI legs (`Check (windows)` and the
+`x86_64-pc-windows-msvc` cross-check) are blocking (`continue-on-error`
+removed). The Windows test step runs under `shell: bash` with
+`RUSTFLAGS="-D warnings"`, and clippy with `-D warnings` is extended to the
+Windows leg. The safesocket named-pipe transport is implemented and has a
+`#[cfg(windows)]` loopback unit test.
 
 ### What was fixed
 
@@ -324,6 +327,14 @@ implemented and has a `#[cfg(windows)]` loopback unit test.
 | `crates/cli` | hardcoded unix socket paths | Uses `rustscale_safesocket::default_socket_path()`; state-dir fallback gated `#[cfg(unix)]`. |
 | `crates/rustscaled` | hardcoded unix socket paths | Per-OS `DEFAULT_STATE_DIR`; `determine_socket_path` uses `default_socket_path()`; Windows returns pipe path directly. |
 | `.github/workflows/ci.yml` | Windows legs `continue-on-error: true` | Removed; added `cargo test -p` for windows-meaningful crates (ipn, localclient, tailcfg, key, disco, safesocket). |
+| `.github/workflows/ci.yml` | PowerShell-vs-bash line-continuation bug in Windows test step | Added `shell: bash` to the test step; extended clippy with `-D warnings` to the Windows leg; added `RUSTFLAGS="-D warnings"` to the test step. |
+| `crates/tsnet` (up_tun) | 8 unix-only warnings on Windows (unused `monitor`/`tun` vars, unreachable code, 5 never-used route helpers) | Extracted TUN creation into cfg-gated `create_tun_device` (unix creates device + applies routes, non-unix returns error); `?` propagation keeps flow analysis happy without early-return dead code. Gated `apply_tun_routes`, `apply_accepted_subnet_routes`, `apply_exit_node_routes`, `is_tailnet_cidr`, `run_cmd` with `#[cfg(any(target_os = "macos", target_os = "linux"))]`; removed dead `#[cfg(not(...))]` fallback blocks inside them. |
+| `crates/safesocket` (windows.rs) | clippy `redundant_closure_for_method_calls` on `.map(\|s\| s.to_string())` | Changed to `.map(str::to_string)`. |
+| `crates/tun` (tests) | `v6_packet` never used on Windows (only called from `#[cfg(unix)]` tests) | Gated `v6_packet` with `#[cfg(unix)]`. |
+| `crates/rustscaled` (daemon.rs) | clippy `needless_return` on Windows (`return primary;` in `#[cfg(windows)]` block) | Changed to trailing expression `primary` (block evaluates to `PathBuf` on Windows). |
+| `crates/tsnet` (localapi-status example) | Unused imports on Windows (`env`, `Read`/`Write`, `PathBuf` only used in `#[cfg(unix)] main`) | Gated all three imports with `#[cfg(unix)]`. |
+| `crates/cli` (cert.rs) | Unused `mode` parameter on Windows (only used in `#[cfg(unix)]` branch) | Added `let _ = mode;` in the `#[cfg(not(unix))]` branch. |
+| `crates/cli` (ssh.rs) | `gen_known_hosts` never used on Windows (only called from `#[cfg(unix)] write_known_hosts`) | Gated `gen_known_hosts` and its 4 unit tests with `#[cfg(unix)]`. |
 
 ### Remaining Windows gaps (runtime, not compile)
 

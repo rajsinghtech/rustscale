@@ -12,10 +12,15 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::module_name_repetitions)]
 
+mod captivedetection;
 mod prober;
 mod report;
 mod stun;
 
+pub use captivedetection::{
+    available_endpoints, builtin_endpoints, DetectResult, Detector, Endpoint, EndpointProvider,
+    DETECT_TIMEOUT,
+};
 pub use prober::{NetcheckError, Prober, ProberOpts, REPORT_TIMEOUT};
 pub use report::Report;
 pub use stun::{

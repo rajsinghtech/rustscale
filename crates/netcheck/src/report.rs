@@ -59,6 +59,12 @@ pub struct Report {
     pub port_mapper_pmp: bool,
     pub port_mapper_pcp: bool,
     pub port_mapper_upnp: bool,
+
+    /// Whether a captive portal was detected during the netcheck. `None` =
+    /// detection was not run or was inconclusive; `Some(true)` = a captive
+    /// portal is intercepting HTTP traffic; `Some(false)` = no captive portal
+    /// detected. Mirrors Go's `Report.CaptivePortal opt.Bool`.
+    pub captive_portal: Option<bool>,
 }
 
 impl Report {

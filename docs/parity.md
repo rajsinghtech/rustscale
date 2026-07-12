@@ -69,7 +69,7 @@ consume it) · peermtu darwin (no-op in Go too) ⬜ · sockstats ⬜.
 | Network error classification | `net/neterror/` | ⬜ retry-loops benefit from typed error reasons |
 | Network traffic steering | `net/traffic/` | ⬜ hash-based exit-node selection for split-DNS |
 | Subnet route health check | `net/routecheck/` | ⬜ exit-node/subnet-router diagnostics |
-| Captive portal detection | `net/captivedetection/` | 🔶 Report field exists, no detection loop |
+| Captive portal detection | `net/captivedetection/` | ✅ `Detector` with concurrent HTTP GETs, DERPMap endpoint generation, response validation (status + challenge + body), wired into netcheck prober (`Report.captive_portal`) and health Tracker (`WARN_CAPTIVE_PORTAL`); per-interface binding deferred |
 | ICMP ping | `net/ping/` | ⬜ |
 | Socket statistics | `net/sockstats/` | ⬜ |
 | In-memory test net | `net/memnet/` | ⬜ test infrastructure — in-memory net.Conn/Listener |

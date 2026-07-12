@@ -25,6 +25,7 @@ use rustscale_tailcfg::{DERPMap, DERPNode};
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
 
+use crate::captivedetection::Detector;
 use crate::report::{pick_preferred, ProbeProto, Report};
 use crate::stun::{new_tx_id, parse_response, request};
 
@@ -142,6 +143,27 @@ impl Prober {
         apply_outcomes(&mut report, &outcomes);
         report.preferred_derp =
             pick_with_hysteresis(&report.region_latency, opts.previous_preferred_derp);
+
+        // Run captive portal detection when we have no UDP connectivity (the
+        // Go netcheck runs it on every full report via a delayed timer; we
+        // gate it on `!report.udp` since if UDP works, there's no captive
+        // portal intercepting traffic). The detection runs concurrently with
+        // a short delay — matching Go's `captivePortalDelay` of 200ms — so it
+        // doesn't block the report if endpoints are unreachable.
+        if !report.udp {
+            let dm_clone = dm.clone();
+            let preferred = report.preferred_derp;
+            let captive = tokio::spawn(async move {
+                // Small delay so the detection doesn't race ahead of the
+                // just-finished STUN probes' cleanup.
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                Detector.detect_bool(Some(&dm_clone), preferred).await
+            })
+            .await
+            .ok()
+            .flatten();
+            report.captive_portal = captive;
+        }
 
         Ok(report)
     }

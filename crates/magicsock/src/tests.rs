@@ -672,3 +672,98 @@ async fn multi_region_derp_routing() {
     assert_eq!(received.peer, b.node_public());
     assert_eq!(received.data, wg_reply);
 }
+
+// ---- Test: PMTUD disabled by default ----
+
+#[tokio::test]
+async fn pmtud_disabled_by_default() {
+    let relay = Arc::new(FakeRelay::new());
+    let privk = NodePrivate::generate();
+    let derp = connect_to_relay(&relay, privk.clone()).await;
+    let (a, _a_rx) = Magicsock::new(MagicsockConfig {
+        private_key: privk,
+        disco_key: DiscoPrivate::generate(),
+        derp_client: Some(derp),
+        derp_map: None,
+        home_derp_region: 0,
+        udp_bind: Some("127.0.0.1:0".parse().unwrap()),
+        udp_socket: None,
+        portmapper: None,
+        health: None,
+        disable_direct_paths: false,
+        peer_relay_server: false,
+        relay_server_config: None,
+    })
+    .await
+    .expect("magicsock");
+
+    assert!(!a.peer_mtu_enabled(), "PMTUD should be disabled by default");
+
+    a.set_pmtud_enabled(true);
+    assert!(a.peer_mtu_enabled(), "PMTUD should be enabled after set");
+}
+
+// ---- Test: PMTUD flag -> multi-size ping burst ----
+
+#[tokio::test]
+async fn pmtud_flag_multi_size_burst() {
+    let relay = Arc::new(FakeRelay::new());
+
+    let a_priv = NodePrivate::generate();
+    let b_priv = NodePrivate::generate();
+
+    let a_derp = connect_to_relay(&relay, a_priv.clone()).await;
+    let (a, _a_rx) = Magicsock::new(MagicsockConfig {
+        private_key: a_priv,
+        disco_key: DiscoPrivate::generate(),
+        derp_client: Some(a_derp),
+        derp_map: None,
+        home_derp_region: 0,
+        udp_bind: Some("127.0.0.1:0".parse().unwrap()),
+        udp_socket: None,
+        portmapper: None,
+        health: None,
+        disable_direct_paths: false,
+        peer_relay_server: false,
+        relay_server_config: None,
+    })
+    .await
+    .expect("A magicsock");
+
+    a.set_pmtud_enabled(true);
+
+    let b_derp = connect_to_relay(&relay, b_priv.clone()).await;
+    let (b, _b_rx) = Magicsock::new(MagicsockConfig {
+        private_key: b_priv,
+        disco_key: DiscoPrivate::generate(),
+        derp_client: Some(b_derp),
+        derp_map: None,
+        home_derp_region: 0,
+        udp_bind: Some("127.0.0.1:0".parse().unwrap()),
+        udp_socket: None,
+        portmapper: None,
+        health: None,
+        disable_direct_paths: false,
+        peer_relay_server: false,
+        relay_server_config: None,
+    })
+    .await
+    .expect("B magicsock");
+
+    let b_udp = b.bound_udp_addr().unwrap().to_string();
+    let b_peer = make_peer(b.node_public(), b.disco_public(), vec![b_udp], 1);
+
+    a.set_netmap(vec![b_peer]).await.expect("A set_netmap");
+
+    // With PMTUD enabled, each candidate gets 6 pings (WIRE_MTUS_TO_PROBE).
+    let pending_count = {
+        let endpoints = a.inner.endpoints.read().expect("endpoints lock poisoned");
+        endpoints
+            .get(&b.node_public())
+            .map_or(0, super::endpoint::Endpoint::pending_pings_count)
+    };
+    assert!(
+        pending_count >= 6,
+        "expected at least 6 pending pings with PMTUD, got {pending_count}"
+    );
+}

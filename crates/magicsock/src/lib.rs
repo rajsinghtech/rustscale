@@ -29,7 +29,10 @@ mod relay;
 mod relay_manager;
 mod relay_server;
 
-pub use endpoint::{BestPath, Endpoint, PathClass, TRUST_BEST_ADDR_DURATION};
+pub use endpoint::{
+    BestPath, DiscoPingPurpose, Endpoint, PathClass, PendingPing, ProbeUDPLifetime,
+    TRUST_BEST_ADDR_DURATION,
+};
 pub use relay::{
     decode_geneve, decode_geneve_full, encode_geneve, encode_geneve_disco,
     encode_geneve_disco_control, encode_geneve_wireguard, looks_like_geneve_disco,
@@ -44,6 +47,7 @@ pub use relay_server::RelayServerExtension;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -56,6 +60,32 @@ use tokio::sync::mpsc;
 
 use derp_io::DerpIo;
 use disco_io::DiscoIo;
+
+/// Heartbeat interval: how often to ping the best UDP path to keep it alive.
+/// Mirrors Go's `heartbeatInterval` (magicsock.go:4032).
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
+
+/// Session active timeout: how long since last activity before the session is
+/// considered idle and heartbeats stop. Mirrors Go's `sessionActiveTimeout`
+/// (magicsock.go:4016).
+const SESSION_ACTIVE_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// How long to wait for a pong reply before considering a ping timed out.
+/// Mirrors Go's `pingTimeoutDuration` (magicsock.go:4052).
+const PING_TIMEOUT_DURATION: Duration = Duration::from_secs(5);
+
+/// Slack subtracted from a UDP lifetime cliff duration when scheduling a
+/// probe. Mirrors Go's `udpLifetimeProbeCliffSlack` (endpoint.go:164).
+const UDP_LIFETIME_CLIFF_SLACK: Duration = Duration::from_secs(2);
+
+/// MTU sizes to probe when PMTUD is enabled. Mirrors Go's
+/// `tstun.WireMTUsToProbe` (net/tstun/mtu.go:85).
+const WIRE_MTUS_TO_PROBE: &[usize] = &[1280, 1320, 1400, 1500, 8000, 9000];
+
+/// Size of a complete disco ping packet without any padding.
+/// `MAGIC(6) + sender_pub(32) + nonce(24) + tag(16) + header(2) + ping(44)`.
+/// Mirrors Go's `discoPingSize` (endpoint.go:1249-1250).
+const DISCO_PING_SIZE: usize = 124;
 
 /// Errors from magicsock operations.
 #[derive(Debug, thiserror::Error)]
@@ -163,6 +193,12 @@ struct Inner {
     relay_server: Option<Arc<RelayServerExtension>>,
     /// Self node's CapMap — used to check `NODE_ATTR_DISABLE_RELAY_SERVER`.
     self_cap_map: Arc<RwLock<rustscale_tailcfg::NodeCapMap>>,
+    /// Whether peer path MTU discovery is enabled. Disabled by default,
+    /// matching Go's `ShouldPMTUD` returning false (peermtu.go:56).
+    peer_mtu_enabled: Arc<AtomicBool>,
+    /// Per-peer background task handles (heartbeat + UDP lifetime probe).
+    /// At most one task per peer; replaced on new TX activity.
+    background_tasks: RwLock<HashMap<NodePublic, tokio::task::JoinHandle<()>>>,
 }
 
 /// Manages DERP connections across multiple regions.
@@ -555,6 +591,8 @@ impl Magicsock {
             relay_manager: RwLock::new(None),
             relay_server,
             self_cap_map,
+            peer_mtu_enabled: Arc::new(AtomicBool::new(false)),
+            background_tasks: RwLock::new(HashMap::new()),
         });
 
         // Spawn the relay manager event loop. The handle is stored in Inner
@@ -730,35 +768,17 @@ impl Magicsock {
         // both sides stay on DERP.
         for (peer_key, peer_disco, candidates, derp_region) in probe_list {
             // Send disco Pings to each candidate over UDP.
-            if !self.inner.disable_direct_paths {
-                if let Some(ref udp) = self.inner.udp {
-                    for addr in &candidates {
-                        let tx_id = random_tx_id();
-                        {
-                            let mut endpoints = self
-                                .inner
-                                .endpoints
-                                .write()
-                                .expect("endpoints lock poisoned");
-                            if let Some(ep) = endpoints.get_mut(&peer_key) {
-                                ep.add_pending_ping(tx_id, *addr, std::time::Instant::now());
-                            }
-                        }
-                        let ping = Message::Ping(Ping {
-                            tx_id,
-                            node_key: self.inner.node_public.clone(),
-                            padding: 0,
-                        });
-                        if let Some(packet) = self.inner.disco.seal(&peer_disco, &ping) {
-                            if debug_enabled() {
-                                eprintln!(
-                                    "DBG disco_ping send to {addr} peer={}",
-                                    short_key(&peer_key)
-                                );
-                            }
-                            let _ = udp.send_to(&packet, addr).await;
-                        }
-                    }
+            if !self.inner.disable_direct_paths && self.inner.udp.is_some() {
+                for addr in &candidates {
+                    self.inner
+                        .send_disco_ping(
+                            &peer_key,
+                            &peer_disco,
+                            *addr,
+                            DiscoPingPurpose::Discovery,
+                            0,
+                        )
+                        .await;
                 }
 
                 // Send CallMeMaybe via the peer's home DERP region.
@@ -849,6 +869,19 @@ impl Magicsock {
 
     /// Send a WG datagram to `peer` over the best available path.
     pub async fn send(&self, peer: NodePublic, datagram: &[u8]) -> Result<(), MagicsockError> {
+        // Note TX activity and arm heartbeat before path lookup.
+        {
+            let mut endpoints = self
+                .inner
+                .endpoints
+                .write()
+                .expect("endpoints lock poisoned");
+            if let Some(ep) = endpoints.get_mut(&peer) {
+                ep.note_tx_activity(std::time::Instant::now());
+            }
+        }
+        self.arm_heartbeat(&peer);
+
         let (path, derp_region) = {
             let endpoints = self
                 .inner
@@ -917,6 +950,9 @@ impl Magicsock {
                     .expect("local_udp_addrs lock poisoned") = eps;
             }
         }
+        // Abort all heartbeat/UDP-lifetime background tasks — they'll be
+        // re-armed on next TX activity.
+        self.abort_background_tasks();
         {
             let mut endpoints = self
                 .inner
@@ -967,6 +1003,61 @@ impl Magicsock {
     /// server. Returns `None` when `peer_relay_server` was not enabled.
     pub fn relay_server(&self) -> Option<&Arc<RelayServerExtension>> {
         self.inner.relay_server.as_ref()
+    }
+
+    /// Enable or disable peer path MTU discovery. When enabled, discovery
+    /// pings are sent at multiple sizes from `WIRE_MTUs_TO_PROBE` and the
+    /// largest succeeding size is recorded per peer. Disabled by default,
+    /// matching Go's `ShouldPMTUD` (peermtu.go:56).
+    pub fn set_pmtud_enabled(&self, enabled: bool) {
+        self.inner
+            .peer_mtu_enabled
+            .store(enabled, Ordering::Relaxed);
+    }
+
+    /// Whether PMTUD is currently enabled.
+    pub fn peer_mtu_enabled(&self) -> bool {
+        self.inner.peer_mtu_enabled.load(Ordering::Relaxed)
+    }
+
+    /// The largest PMTUD probe size that succeeded for `peer` (0 = not probed).
+    pub fn peer_mtu(&self, peer: &NodePublic) -> usize {
+        let endpoints = self
+            .inner
+            .endpoints
+            .read()
+            .expect("endpoints lock poisoned");
+        endpoints.get(peer).map_or(0, endpoint::Endpoint::peer_mtu)
+    }
+
+    /// Arm (or re-arm) the per-peer background task for heartbeats and UDP
+    /// lifetime probing. Called on TX activity. Aborts any existing task
+    /// for this peer to ensure at most one background task at a time.
+    /// Mirrors Go's `noteTxActivityExtTriggerLocked` arming the heartbeat
+    /// timer (endpoint.go:974-979).
+    fn arm_heartbeat(&self, peer_key: &NodePublic) {
+        let mut tasks = self
+            .inner
+            .background_tasks
+            .write()
+            .expect("background_tasks lock");
+        let handle = tokio::spawn(peer_background_task(self.inner.clone(), peer_key.clone()));
+        if let Some(old) = tasks.insert(peer_key.clone(), handle) {
+            old.abort();
+        }
+    }
+
+    /// Abort all background tasks (heartbeat + UDP lifetime probes).
+    /// Called on link changes.
+    fn abort_background_tasks(&self) {
+        let mut tasks = self
+            .inner
+            .background_tasks
+            .write()
+            .expect("background_tasks lock");
+        for (_, handle) in tasks.drain() {
+            handle.abort();
+        }
     }
 
     /// Send a WG datagram to `peer` via DERP region `region`.
@@ -1117,6 +1208,191 @@ fn spawn_recv_tasks(
     });
 }
 
+/// Per-peer background task: heartbeat pings + UDP lifetime probing.
+///
+/// **Phase 1 — Heartbeat**: every `HEARTBEAT_INTERVAL` (3s), if the session
+/// is active (TX within `SESSION_ACTIVE_TIMEOUT` = 45s), sends a heartbeat
+/// ping to the best direct path. Mirrors Go's `heartbeat()`
+/// (endpoint.go:829-895).
+///
+/// **Phase 2 — UDP lifetime probe**: when the session goes idle, checks
+/// whether UDP lifetime probing is eligible (lower disco key wins) and
+/// cycles through the cliffs [10s, 30s, 60s]. At each cliff, sends a ping
+/// and waits for a pong; on timeout, clears `best_addr` (demotes direct
+/// path). Mirrors Go's `heartbeatForLifetime()` (endpoint.go:778-824) and
+/// `probeUDPLifetimeCliffDoneLocked` (endpoint.go:1166-1194).
+///
+/// The task self-terminates when the peer is removed, the probe cycle
+/// completes, or TX activity resumes (a new task is spawned by
+/// `arm_heartbeat`).
+async fn peer_background_task(inner: Arc<Inner>, peer_key: NodePublic) {
+    use std::time::Instant;
+
+    loop {
+        tokio::time::sleep(HEARTBEAT_INTERVAL).await;
+        let now = Instant::now();
+
+        // Read endpoint state under a short-lived lock.
+        let (idle, best_addr, peer_disco) = {
+            let endpoints = inner.endpoints.read().expect("endpoints lock poisoned");
+            let ep = match endpoints.get(&peer_key) {
+                Some(ep) => ep,
+                None => return, // peer removed from netmap
+            };
+            let idle = !ep.session_active(now, SESSION_ACTIVE_TIMEOUT);
+            (
+                idle,
+                ep.trusted_direct_addr(now),
+                ep.peer_disco_key().clone(),
+            )
+        };
+
+        if idle {
+            // Session idle — stop heartbeating, try UDP lifetime probe.
+            break;
+        }
+
+        // Send heartbeat ping to the best direct path.
+        if let Some(addr) = best_addr {
+            inner
+                .send_disco_ping(&peer_key, &peer_disco, addr, DiscoPingPurpose::Heartbeat, 0)
+                .await;
+        }
+    }
+
+    // Phase 2: UDP lifetime probe (if eligible).
+    udp_lifetime_probe_phase(&inner, &peer_key).await;
+}
+
+/// UDP lifetime probe phase: schedule and execute cliff probes after the
+/// session goes idle.
+async fn udp_lifetime_probe_phase(inner: &Arc<Inner>, peer_key: &NodePublic) {
+    use std::time::Instant;
+
+    let our_disco = inner.disco.public();
+
+    loop {
+        let now = Instant::now();
+
+        // Check eligibility and get the inactivity threshold.
+        let after_inactivity = {
+            let endpoints = inner.endpoints.read().expect("endpoints lock poisoned");
+            let ep = match endpoints.get(peer_key) {
+                Some(ep) => ep,
+                None => return, // peer removed
+            };
+            // If session became active again, exit (send() will spawn a new
+            // heartbeat task via arm_heartbeat).
+            if ep.session_active(now, SESSION_ACTIVE_TIMEOUT) {
+                return;
+            }
+            match ep.maybe_probe_udp_lifetime(now, &our_disco, UDP_LIFETIME_CLIFF_SLACK) {
+                Some(after) => after,
+                None => return, // not eligible (higher disco key, no best_addr, etc.)
+            }
+        };
+
+        // Compute the sleep time: cliff_duration - cliff_slack - inactive_time.
+        let inactive_for = {
+            let endpoints = inner.endpoints.read().expect("endpoints lock poisoned");
+            endpoints
+                .get(peer_key)
+                .map_or(Duration::from_secs(u64::MAX / 2), |ep| {
+                    ep.inactivity_duration(now)
+                })
+        };
+
+        let sleep_time = after_inactivity.saturating_sub(inactive_for);
+        if sleep_time == Duration::ZERO {
+            return;
+        }
+
+        tokio::time::sleep(sleep_time).await;
+
+        // Re-check after sleeping: best_addr must be unchanged and session
+        // must still be idle.
+        let now = Instant::now();
+        let (best_addr_now, peer_disco_now, cycle_active, best_addr_matches) = {
+            let endpoints = inner.endpoints.read().expect("endpoints lock poisoned");
+            let ep = match endpoints.get(peer_key) {
+                Some(ep) => ep,
+                None => return,
+            };
+            if ep.session_active(now, SESSION_ACTIVE_TIMEOUT) {
+                return; // session resumed
+            }
+            (
+                ep.trusted_direct_addr(now),
+                ep.peer_disco_key().clone(),
+                ep.udp_lifetime_cycle_active(),
+                ep.udp_lifetime_best_addr_matches(),
+            )
+        };
+
+        if !best_addr_matches && !cycle_active {
+            // best_addr changed since scheduling — start a fresh cycle.
+            {
+                let mut endpoints = inner.endpoints.write().expect("endpoints lock poisoned");
+                if let Some(ep) = endpoints.get_mut(peer_key) {
+                    ep.start_udp_lifetime_cycle(now);
+                }
+            }
+        } else if !best_addr_matches {
+            // best_addr changed and cycle was already active — abort.
+            return;
+        }
+
+        let addr = match best_addr_now {
+            Some(a) => a,
+            None => return,
+        };
+
+        // Send the probe ping.
+        inner
+            .send_disco_ping(
+                peer_key,
+                &peer_disco_now,
+                addr,
+                DiscoPingPurpose::HeartbeatForUDPLifetime,
+                0,
+            )
+            .await;
+
+        // Wait for pong or timeout.
+        tokio::time::sleep(PING_TIMEOUT_DURATION).await;
+
+        // Check if the probe ping was answered (pong handler removed it
+        // from pending_pings) or timed out.
+        let (pong_received, has_more_cliffs) = {
+            let mut endpoints = inner.endpoints.write().expect("endpoints lock poisoned");
+            let ep = match endpoints.get_mut(peer_key) {
+                Some(ep) => ep,
+                None => return,
+            };
+            let pong_received = ep.is_last_udp_lifetime_ping_answered();
+            let has_more = if pong_received {
+                ep.advance_udp_lifetime_cliff()
+            } else {
+                ep.clear_best_addr();
+                ep.complete_udp_lifetime_cycle();
+                false
+            };
+            (pong_received, has_more)
+        };
+
+        if debug_enabled() {
+            eprintln!(
+                "DBG udp_lifetime_probe peer={} pong={pong_received} more_cliffs={has_more_cliffs}",
+                short_key(peer_key)
+            );
+        }
+
+        if !has_more_cliffs {
+            return;
+        }
+    }
+}
+
 impl relay_manager::RelayManagerContext for Inner {
     fn seal_disco(&self, peer_disco: &DiscoPublic, msg: &Message) -> Option<Vec<u8>> {
         self.disco.seal(peer_disco, msg)
@@ -1223,6 +1499,63 @@ impl relay_manager::RelayManagerContext for Inner {
 }
 
 impl Inner {
+    /// Send a disco ping to `addr` for `peer_key` with the given purpose.
+    /// When PMTUD is enabled and the purpose is `Discovery`, sends multiple
+    /// pings at sizes from `WIRE_MTUs_TOProbe`. Mirrors Go's
+    /// `startDiscoPingLocked` (endpoint.go:1308-1372).
+    async fn send_disco_ping(
+        &self,
+        peer_key: &NodePublic,
+        peer_disco: &DiscoPublic,
+        addr: SocketAddr,
+        purpose: DiscoPingPurpose,
+        size: usize,
+    ) {
+        // Determine ping sizes: PMTUD burst for discovery pings when enabled.
+        let sizes: Vec<usize> = if size > 0 {
+            vec![size]
+        } else if self.peer_mtu_enabled.load(Ordering::Relaxed)
+            && purpose == DiscoPingPurpose::Discovery
+        {
+            WIRE_MTUS_TO_PROBE.to_vec()
+        } else {
+            vec![0]
+        };
+
+        for s in sizes {
+            let tx_id = random_tx_id();
+            let padding = s.saturating_sub(DISCO_PING_SIZE);
+
+            {
+                let mut endpoints = self.endpoints.write().expect("endpoints lock poisoned");
+                if let Some(ep) = endpoints.get_mut(peer_key) {
+                    ep.add_pending_ping(tx_id, addr, std::time::Instant::now(), purpose, s);
+                    if purpose == DiscoPingPurpose::HeartbeatForUDPLifetime {
+                        ep.set_udp_lifetime_tx_id(tx_id);
+                    }
+                }
+            }
+
+            let ping = Message::Ping(Ping {
+                tx_id,
+                node_key: self.node_public.clone(),
+                padding,
+            });
+            if let Some(packet) = self.disco.seal(peer_disco, &ping) {
+                if let Some(ref udp) = self.udp {
+                    if debug_enabled() {
+                        eprintln!(
+                            "DBG disco_ping send to {addr} peer={} purpose={:?} size={s}",
+                            short_key(peer_key),
+                            purpose
+                        );
+                    }
+                    let _ = udp.send_to(&packet, addr).await;
+                }
+            }
+        }
+    }
+
     async fn handle_udp_packet(&self, data: &[u8], src: SocketAddr) {
         // Check for Geneve-encapsulated packets first (relay path).
         if relay::looks_like_geneve_disco(data) {
@@ -1288,6 +1621,13 @@ impl Inner {
             map.get(&src).cloned()
         };
         if let Some(peer) = peer {
+            // Note UDP recv activity for heartbeat / UDP lifetime probe.
+            {
+                let mut endpoints = self.endpoints.write().expect("endpoints lock poisoned");
+                if let Some(ep) = endpoints.get_mut(&peer) {
+                    ep.note_recv_udp(std::time::Instant::now());
+                }
+            }
             let _ = self
                 .wg_send
                 .send(WgDatagram {
@@ -1386,6 +1726,13 @@ impl Inner {
                 if debug_enabled() {
                     eprintln!("DBG disco_ping recv from {src} peer={}", short_key(&peer));
                 }
+                // Note UDP recv activity for heartbeat / UDP lifetime probe.
+                {
+                    let mut endpoints = self.endpoints.write().expect("endpoints lock poisoned");
+                    if let Some(ep) = endpoints.get_mut(&peer) {
+                        ep.note_recv_udp(std::time::Instant::now());
+                    }
+                }
                 // When direct paths are disabled, don't respond to pings —
                 // this prevents the peer from confirming a direct path to us.
                 if self.disable_direct_paths {
@@ -1422,8 +1769,13 @@ impl Inner {
                 let confirmed_addr = {
                     let mut endpoints = self.endpoints.write().expect("endpoints lock poisoned");
                     if let Some(ep) = endpoints.get_mut(&peer) {
-                        if ep.match_pong(&pong.tx_id).is_some() {
+                        if let Some(pp) = ep.match_pong(&pong.tx_id) {
                             ep.confirm_direct(src, std::time::Instant::now());
+                            ep.note_recv_udp(std::time::Instant::now());
+                            // Record PMTUD probe size if this was a sized probe.
+                            if pp.size > 0 {
+                                ep.set_peer_mtu(pp.size);
+                            }
                             if debug_enabled() {
                                 eprintln!(
                                     "DBG direct_confirmed peer={} addr={src}",
@@ -1496,29 +1848,18 @@ impl Inner {
                 if self.disable_direct_paths {
                     return;
                 }
-                // The peer is telling us its UDP addresses. Add them as
-                // candidates and start pinging.
+                // The peer is telling us its UDP addresses. Ping each.
                 let peer_disco = sender_disco.clone();
                 for ep in &cmm.my_number {
                     let addr = SocketAddr::from(*ep);
-                    let tx_id = random_tx_id();
-                    {
-                        let mut endpoints =
-                            self.endpoints.write().expect("endpoints lock poisoned");
-                        if let Some(ep_state) = endpoints.get_mut(&source) {
-                            ep_state.add_pending_ping(tx_id, addr, std::time::Instant::now());
-                        }
-                    }
-                    let ping = Message::Ping(Ping {
-                        tx_id,
-                        node_key: self.node_public.clone(),
-                        padding: 0,
-                    });
-                    if let Some(reply) = self.disco.seal(&peer_disco, &ping) {
-                        if let Some(ref udp) = self.udp {
-                            let _ = udp.send_to(&reply, addr).await;
-                        }
-                    }
+                    self.send_disco_ping(
+                        &source,
+                        &peer_disco,
+                        addr,
+                        DiscoPingPurpose::Discovery,
+                        0,
+                    )
+                    .await;
                 }
             }
             Message::CallMeMaybeVia(cmmv) => {

@@ -16,6 +16,7 @@ mod filter;
 mod map;
 mod node;
 mod register;
+mod service;
 mod ssh;
 
 pub use appctype::{
@@ -37,6 +38,10 @@ pub use node::{
     TPMInfo,
 };
 pub use register::{Login, LoginID, RegisterRequest, RegisterResponse, RegisterResponseAuth, User};
+pub use service::{
+    service_ip_mappings_from_capmap, service_vip_addrs, ServiceIPMappings, ServiceName,
+    ServiceNameError, VIPService, NODE_ATTR_SERVICE_HOST,
+};
 pub use ssh::{SSHAction, SSHPolicy, SSHPrincipal, SSHRecorderFailureAction, SSHRule};
 
 pub use rustscale_key::{

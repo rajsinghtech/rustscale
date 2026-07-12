@@ -34,8 +34,10 @@ mod c2n;
 mod hostinfo;
 mod localapi;
 mod peerapi;
+mod proxyproto;
 mod routing;
 mod serve;
+mod service;
 mod socks5;
 mod state;
 mod status;
@@ -54,6 +56,7 @@ pub use serve::{
     check_funnel_access, check_funnel_port, FunnelError, HTTPHandler, HostPort, ServeConfig,
     ServeError, TCPPortHandler, WebServerConfig, FUNNEL_PORTS,
 };
+pub use service::{ServiceError, ServiceListener, ServiceMode, ServiceStream};
 pub use socks5::{
     spawn_socks5, BoxedStream, CancelToken as Socks5CancelToken, ServerSocksDialer, Socks5Handle,
     Socks5Server, SocksAddr, SocksDialer, SocksStream,
@@ -166,6 +169,8 @@ pub enum TsnetError {
     Serve(#[from] ServeError),
     #[error("funnel error: {0}")]
     Funnel(#[from] FunnelError),
+    #[error("service error: {0}")]
+    Service(#[from] ServiceError),
 }
 
 /// A builder for configuring a [`Server`].
@@ -443,6 +448,8 @@ struct RunningState {
     resolver: Arc<RwLock<MagicDnsResolver>>,
     /// Our node's FQDN (with trailing dot), from the netmap.
     our_fqdn: String,
+    /// Tailnet domain / MagicDNS suffix (e.g. "tailnet.ts.net").
+    domain: String,
     /// DNS config from control (carries `CertDomains` for cert provisioning).
     dns_config: Arc<RwLock<Option<DNSConfig>>>,
     /// User profiles keyed by `UserID` (for WhoIs).
@@ -1022,6 +1029,7 @@ impl Server {
             packet_drops: b.packet_drops,
             resolver: b.resolver,
             our_fqdn: b.our_fqdn,
+            domain: b.domain.clone(),
             dns_config: b.dns_config,
             user_profiles: b.user_profiles,
             monitor,
@@ -1348,6 +1356,7 @@ impl Server {
             packet_drops: b.packet_drops,
             resolver: b.resolver,
             our_fqdn: b.our_fqdn,
+            domain: b.domain.clone(),
             dns_config: b.dns_config,
             user_profiles: b.user_profiles,
             monitor,
@@ -2375,6 +2384,97 @@ impl Server {
         };
 
         self.listen_tls_with_provider(port, provider).await
+    }
+
+    /// Listen for incoming connections addressed to a Tailscale VIP Service
+    /// (netstack mode only).
+    ///
+    /// Resolves the service's VIP v4 addresses from the netmap (self node's
+    /// `CapMap` under the `service-host` key), adds them to the userspace
+    /// netstack interface, and listens on the specified `port` on each VIP.
+    /// Connections addressed to the service's VIP IP on the port are accepted
+    /// and surface as normal tsnet streams via [`ServiceListener::accept`].
+    ///
+    /// The service name must be of the form `svc:dns-label` (e.g.
+    /// `"svc:my-service"`). The node must be tagged and the service must be
+    /// approved by an admin or ACL auto-approval rules; otherwise the netmap
+    /// will not carry VIP addresses for the service and this method returns
+    /// [`ServiceError::NoVipAddrs`].
+    ///
+    /// # PROXY protocol v2
+    ///
+    /// When [`ServiceMode::proxy_protocol`] is `true`, a PROXY protocol v2
+    /// binary header is prepended to each accepted stream so the backend
+    /// learns the real client address. See
+    /// <https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt>.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use rustscale_tsnet::{Server, ServiceMode};
+    /// # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut server = Server::builder()
+    ///     .hostname("my-svc")
+    ///     .auth_key("tskey-...")
+    ///     .build()?;
+    /// server.up().await?;
+    ///
+    /// let mode = ServiceMode::tcp(8080).with_proxy_protocol(true);
+    /// let mut listener = server.listen_service("svc:my-service", mode).await?;
+    /// // loop { let stream = listener.accept().await?; ... }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Returns an error in TUN mode.
+    pub async fn listen_service(
+        &self,
+        svc_name: &str,
+        mode: ServiceMode,
+    ) -> Result<ServiceListener, TsnetError> {
+        let inner = self.inner.as_ref().ok_or(TsnetError::NotUp)?;
+        let netstack = match &inner.data_plane {
+            DataPlane::Netstack(ns) => ns.clone(),
+            DataPlane::Tun => return Err(TsnetError::NotAvailableInTunMode),
+        };
+
+        // Build a self node with the CapMap from magicsock (the authoritative
+        // source for the self node's capabilities, updated from each
+        // MapResponse).
+        let cap_map = inner.magicsock.self_cap_map();
+        let self_node = Node {
+            Name: inner.our_fqdn.clone(),
+            Addresses: inner
+                .tailscale_ips
+                .iter()
+                .map(|ip| format!("{ip}/32"))
+                .collect(),
+            CapMap: cap_map,
+            Tags: self.self_tags().await,
+            ..Default::default()
+        };
+
+        let listener =
+            service::create_service_listener(&netstack, &self_node, &inner.domain, svc_name, mode)
+                .await?;
+
+        Ok(listener)
+    }
+
+    /// Snapshot of this node's ACL tags from the self node in the peers list.
+    /// Returns an empty vec if the self node is not found in the peers list.
+    async fn self_tags(&self) -> Vec<String> {
+        let Some(inner) = self.inner.as_ref() else {
+            return vec![];
+        };
+        let peers = inner.peers.read().await;
+        let our_fqdn = inner.our_fqdn.trim_end_matches('.');
+        for peer in peers.iter() {
+            if peer.Name.trim_end_matches('.') == our_fqdn {
+                return peer.Tags.clone();
+            }
+        }
+        vec![]
     }
 
     /// Snapshot of our own node from the netmap (peers list includes self

@@ -952,6 +952,16 @@ impl Magicsock {
         *guard = cap_map;
     }
 
+    /// Snapshot of the self node's CapMap. Used by service listeners to
+    /// resolve VIP service IP addresses from the `service-host` capability.
+    pub fn self_cap_map(&self) -> rustscale_tailcfg::NodeCapMap {
+        self.inner
+            .self_cap_map
+            .read()
+            .expect("self_cap_map lock poisoned")
+            .clone()
+    }
+
     /// The relay server extension, if this node is configured as a relay
     /// server. Returns `None` when `peer_relay_server` was not enabled.
     pub fn relay_server(&self) -> Option<&Arc<RelayServerExtension>> {

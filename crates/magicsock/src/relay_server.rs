@@ -67,12 +67,16 @@ impl RelayServerExtension {
 
     /// The server's disco public key, if the server is running.
     pub fn disco_public(&self) -> Option<DiscoPublic> {
-        self.server.as_ref().map(rustscale_udprelay::Server::disco_public)
+        self.server
+            .as_ref()
+            .map(rustscale_udprelay::Server::disco_public)
     }
 
     /// The server's local address, if running.
     pub fn local_addr(&self) -> Option<std::net::SocketAddr> {
-        self.server.as_ref().map(rustscale_udprelay::Server::local_addr_v4)
+        self.server
+            .as_ref()
+            .map(rustscale_udprelay::Server::local_addr_v4)
     }
 
     /// A reference to the underlying server (for testing).
@@ -157,9 +161,9 @@ fn endpoint_to_response(se: &UdprelayServerEndpoint) -> AllocateUdpRelayEndpoint
 mod tests {
     use super::*;
     use rustscale_key::DiscoPrivate;
+    use rustscale_tailcfg::{RawMessage, NODE_ATTR_DISABLE_RELAY_SERVER};
     use std::collections::BTreeMap;
     use std::time::Duration;
-    use rustscale_tailcfg::{NODE_ATTR_DISABLE_RELAY_SERVER, RawMessage};
 
     #[tokio::test]
     async fn extension_starts_server_when_enabled() {
@@ -219,7 +223,9 @@ mod tests {
 
         let a = DiscoPrivate::generate().public();
         let b = DiscoPrivate::generate().public();
-        assert!(ext.handle_alloc_request([a.clone(), b.clone()], 1).is_some());
+        assert!(ext
+            .handle_alloc_request([a.clone(), b.clone()], 1)
+            .is_some());
 
         // Now disable via cap map update.
         let mut m = BTreeMap::new();
@@ -259,4 +265,3 @@ mod tests {
 }
 
 // Re-export DiscoPrivate for tests in this module.
-

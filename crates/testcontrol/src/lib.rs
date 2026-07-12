@@ -875,12 +875,7 @@ fn build_map_response(
     }
 
     // Build peers list (all nodes except self), applying per-node cap maps.
-    let mut peers: Vec<Node> = g
-        .nodes
-        .values()
-        .filter(|p| p.Key != *nk)
-        .cloned()
-        .collect();
+    let mut peers: Vec<Node> = g.nodes.values().filter(|p| p.Key != *nk).cloned().collect();
     for p in &mut peers {
         if let Some(cap_map) = g.node_cap_maps.get(&p.Key) {
             p.CapMap = cap_map.clone();

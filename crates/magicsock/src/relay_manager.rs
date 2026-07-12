@@ -303,10 +303,7 @@ pub fn discover_relay_servers(self_node: &Node, peers: &[Node]) -> Vec<Candidate
             continue;
         }
         // Check Hostinfo.PeerRelay (Go: `p.Hostinfo().PeerRelay`).
-        let peer_relay = node
-            .Hostinfo
-            .as_ref()
-            .is_some_and(|hi| hi.PeerRelay);
+        let peer_relay = node.Hostinfo.as_ref().is_some_and(|hi| hi.PeerRelay);
         if !peer_relay && node.ID != self_node.ID {
             continue;
         }
@@ -1004,11 +1001,9 @@ fn handle_rx_disco_msg<RM: RelayManagerContext>(
                 if let Some(by_sd) = state.handshake_work.get(&peer_key) {
                     for work in by_sd.values() {
                         if work.vni == msg.vni {
-                            let _ = work.disco_msg_tx.try_send((
-                                msg.msg.clone(),
-                                msg.from,
-                                msg.vni,
-                            ));
+                            let _ =
+                                work.disco_msg_tx
+                                    .try_send((msg.msg.clone(), msg.from, msg.vni));
                             break;
                         }
                     }
@@ -1025,11 +1020,9 @@ fn handle_rx_disco_msg<RM: RelayManagerContext>(
                     // VNI matches.
                     for work in by_sd.values() {
                         if work.vni == msg.vni {
-                            let _ = work.disco_msg_tx.try_send((
-                                msg.msg.clone(),
-                                msg.from,
-                                msg.vni,
-                            ));
+                            let _ =
+                                work.disco_msg_tx
+                                    .try_send((msg.msg.clone(), msg.from, msg.vni));
                             break;
                         }
                     }

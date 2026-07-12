@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use rustscale_derp::DerpServer;
 use rustscale_tailcfg::{
-    DERPMap, DERPNode, DERPRegion, NodeCapMap, PEER_CAPABILITY_RELAY_TARGET, RawMessage,
+    DERPMap, DERPNode, DERPRegion, NodeCapMap, RawMessage, PEER_CAPABILITY_RELAY_TARGET,
 };
 use rustscale_testcontrol::Server as TestControlServer;
 use rustscale_tsnet::Server as TsnetServer;
@@ -90,23 +90,39 @@ async fn boot_node(
 }
 
 /// Wait for `n` nodes to register with testcontrol, returning their keys.
-async fn wait_for_nodes(tc: &TestControlServer, n: usize, timeout: Duration) -> Vec<rustscale_key::NodePublic> {
+async fn wait_for_nodes(
+    tc: &TestControlServer,
+    n: usize,
+    timeout: Duration,
+) -> Vec<rustscale_key::NodePublic> {
     let deadline = std::time::Instant::now() + timeout;
     loop {
         let nodes = tc.all_nodes();
         if nodes.len() >= n {
             return nodes.into_iter().map(|n| n.Key).collect();
         }
-        assert!(std::time::Instant::now() < deadline, "timeout waiting for {n} nodes (got {})", tc.num_nodes());
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timeout waiting for {n} nodes (got {})",
+            tc.num_nodes()
+        );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
 
 /// Wait for all 3 nodes to be in streaming map poll.
-async fn wait_for_streaming(tc: &TestControlServer, keys: &[rustscale_key::NodePublic], timeout: Duration) {
+async fn wait_for_streaming(
+    tc: &TestControlServer,
+    keys: &[rustscale_key::NodePublic],
+    timeout: Duration,
+) {
     for k in keys {
         let r = tc.await_node_in_map_request(k, timeout).await;
-        assert!(r.is_ok(), "node {:?} not in streaming map poll within {timeout:?}", k);
+        assert!(
+            r.is_ok(),
+            "node {:?} not in streaming map poll within {timeout:?}",
+            k
+        );
     }
 }
 
@@ -138,8 +154,22 @@ async fn peer_relay_e2e() {
         ..Default::default()
     };
 
-    let mut node_a = boot_node("client-a", &control_url, tmp_a.path().to_path_buf(), false, None).await;
-    let mut node_b = boot_node("client-b", &control_url, tmp_b.path().to_path_buf(), false, None).await;
+    let mut node_a = boot_node(
+        "client-a",
+        &control_url,
+        tmp_a.path().to_path_buf(),
+        false,
+        None,
+    )
+    .await;
+    let mut node_b = boot_node(
+        "client-b",
+        &control_url,
+        tmp_b.path().to_path_buf(),
+        false,
+        None,
+    )
+    .await;
     let mut node_r = boot_node(
         "relay-r",
         &control_url,
@@ -170,17 +200,20 @@ async fn peer_relay_e2e() {
     // A discovers R as a relay server, sends an alloc request via DERP,
     // and R allocates an endpoint. Verify R's relay server has endpoints.
     eprintln!("scenario 1: waiting for allocation on R...");
-    let rs = node_r
-        .relay_server()
-        .expect("R has relay server");
+    let rs = node_r.relay_server().expect("R has relay server");
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
-        let count = rs.server().map_or(0, rustscale_udprelay::Server::endpoint_count);
+        let count = rs
+            .server()
+            .map_or(0, rustscale_udprelay::Server::endpoint_count);
         if count > 0 {
             eprintln!("scenario 1: R has {count} endpoint(s) allocated");
             break;
         }
-        assert!(std::time::Instant::now() < deadline, "timeout: R never allocated an endpoint (30s)");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timeout: R never allocated an endpoint (30s)"
+        );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
@@ -197,7 +230,10 @@ async fn peer_relay_e2e() {
             break;
         }
         if std::time::Instant::now() >= deadline {
-            eprintln!("warning: A→B path is {:?} (expected Relay), continuing...", class_a);
+            eprintln!(
+                "warning: A→B path is {:?} (expected Relay), continuing...",
+                class_a
+            );
             break;
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -213,7 +249,10 @@ async fn peer_relay_e2e() {
             break;
         }
         if std::time::Instant::now() >= deadline {
-            eprintln!("warning: B→A path is {:?} (expected Relay), continuing...", class_b);
+            eprintln!(
+                "warning: B→A path is {:?} (expected Relay), continuing...",
+                class_b
+            );
             break;
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -262,10 +301,14 @@ async fn peer_relay_e2e() {
     // re-establish the relay path. The relay server should maintain
     // exactly 1 endpoint for the A-B pair (re-bind, not re-allocate).
     eprintln!("scenario 4: triggering rebind on A...");
-    let count_before = rs.server().map_or(0, rustscale_udprelay::Server::endpoint_count);
+    let count_before = rs
+        .server()
+        .map_or(0, rustscale_udprelay::Server::endpoint_count);
     node_a.link_changed();
     tokio::time::sleep(Duration::from_secs(3)).await;
-    let count_after = rs.server().map_or(0, rustscale_udprelay::Server::endpoint_count);
+    let count_after = rs
+        .server()
+        .map_or(0, rustscale_udprelay::Server::endpoint_count);
     eprintln!("scenario 4: endpoint count before={count_before}, after={count_after}");
     // The endpoint should still exist (may have been re-allocated or maintained).
     assert!(
@@ -277,7 +320,9 @@ async fn peer_relay_e2e() {
     // Stop sending data, wait past steady_state_lifetime (3s), then
     // trigger GC and verify the endpoint is removed.
     eprintln!("scenario 5: waiting for endpoint expiry (3s steady-state)...");
-    let count_before_expiry = rs.server().map_or(0, rustscale_udprelay::Server::endpoint_count);
+    let count_before_expiry = rs
+        .server()
+        .map_or(0, rustscale_udprelay::Server::endpoint_count);
     eprintln!("scenario 5: endpoints before expiry: {count_before_expiry}");
 
     // Wait past steady_state_lifetime (3s) with no data.
@@ -290,7 +335,9 @@ async fn peer_relay_e2e() {
     }
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let count_after_expiry = rs.server().map_or(0, rustscale_udprelay::Server::endpoint_count);
+    let count_after_expiry = rs
+        .server()
+        .map_or(0, rustscale_udprelay::Server::endpoint_count);
     eprintln!("scenario 5: endpoints after expiry: {count_after_expiry}");
     assert!(
         count_after_expiry < count_before_expiry,

@@ -527,12 +527,9 @@ impl Magicsock {
 
         // Start the relay server extension if enabled.
         let relay_server = if config.peer_relay_server {
-            let ext = RelayServerExtension::new(
-                true,
-                config.relay_server_config,
-                self_cap_map.clone(),
-            )
-            .await;
+            let ext =
+                RelayServerExtension::new(true, config.relay_server_config, self_cap_map.clone())
+                    .await;
             Some(Arc::new(ext))
         } else {
             None
@@ -816,7 +813,13 @@ impl Magicsock {
 
         // Discover relay server candidates from the netmap and update the
         // relay manager. Ports Go's `updateRelayServersSet`.
-        if let Some(rm) = self.inner.relay_manager.read().expect("relay_manager lock poisoned").as_ref() {
+        if let Some(rm) = self
+            .inner
+            .relay_manager
+            .read()
+            .expect("relay_manager lock poisoned")
+            .as_ref()
+        {
             let servers = relay_manager::discover_relay_servers(
                 &rustscale_tailcfg::Node {
                     Key: self.inner.node_public.clone(),
@@ -1311,10 +1314,13 @@ impl Inner {
         }
 
         match &msg {
-            Message::BindUdpRelayEndpointChallenge(_)
-            | Message::Ping(_)
-            | Message::Pong(_) => {
-                if let Some(rm) = self.relay_manager.read().expect("relay_manager lock poisoned").as_ref() {
+            Message::BindUdpRelayEndpointChallenge(_) | Message::Ping(_) | Message::Pong(_) => {
+                if let Some(rm) = self
+                    .relay_manager
+                    .read()
+                    .expect("relay_manager lock poisoned")
+                    .as_ref()
+                {
                     rm.handle_rx_disco_msg(relay_manager::RelayDiscoMsg {
                         msg,
                         disco: sender_disco,
@@ -1516,7 +1522,12 @@ impl Inner {
             Message::CallMeMaybeVia(cmmv) => {
                 // The peer is telling us about a relay endpoint it allocated.
                 // Route to the relay manager to start a handshake.
-                if let Some(rm) = self.relay_manager.read().expect("relay_manager lock poisoned").as_ref() {
+                if let Some(rm) = self
+                    .relay_manager
+                    .read()
+                    .expect("relay_manager lock poisoned")
+                    .as_ref()
+                {
                     let peer_disco = {
                         let endpoints = self.endpoints.read().expect("endpoints lock poisoned");
                         endpoints
@@ -1530,7 +1541,12 @@ impl Inner {
             Message::AllocateUdpRelayEndpointResponse(_) => {
                 // Response to our allocation request, arriving via DERP.
                 // Route to the relay manager.
-                if let Some(rm) = self.relay_manager.read().expect("relay_manager lock poisoned").as_ref() {
+                if let Some(rm) = self
+                    .relay_manager
+                    .read()
+                    .expect("relay_manager lock poisoned")
+                    .as_ref()
+                {
                     rm.handle_rx_disco_msg(relay_manager::RelayDiscoMsg {
                         msg,
                         disco: sender_disco,
@@ -1565,13 +1581,11 @@ impl Inner {
                         return;
                     }
 
-                    if let Some(resp) = rs.handle_alloc_request(
-                        alloc_req.client_disco.clone(),
-                        alloc_req.generation,
-                    ) {
+                    if let Some(resp) = rs
+                        .handle_alloc_request(alloc_req.client_disco.clone(), alloc_req.generation)
+                    {
                         // Send the response via DERP back to the requester.
-                        let resp_msg =
-                            Message::AllocateUdpRelayEndpointResponse(resp);
+                        let resp_msg = Message::AllocateUdpRelayEndpointResponse(resp);
                         if let Some(sealed) = self.disco.seal(&sender_disco, &resp_msg) {
                             let region = if derp_region > 0 {
                                 derp_region

@@ -675,7 +675,9 @@ impl Server {
     /// The relay server extension, if this node was started with
     /// `peer_relay_server(true)`. Returns `None` otherwise.
     pub fn relay_server(&self) -> Option<Arc<rustscale_magicsock::RelayServerExtension>> {
-        self.inner.as_ref().and_then(|i| i.magicsock.relay_server().cloned())
+        self.inner
+            .as_ref()
+            .and_then(|i| i.magicsock.relay_server().cloned())
     }
 
     /// The magicsock instance, if the server is up. Exposed for integration
@@ -695,7 +697,9 @@ impl Server {
     /// The current path class for a peer (for testing). Returns `None` if
     /// the server is not up or the peer is not in the netmap.
     pub fn peer_path_class(&self, peer: &NodePublic) -> Option<rustscale_magicsock::PathClass> {
-        self.inner.as_ref().map(|i| i.magicsock.peer_path_class(peer))
+        self.inner
+            .as_ref()
+            .map(|i| i.magicsock.peer_path_class(peer))
     }
 
     /// The LocalAPI Unix socket path, if the server was spawned. Returns

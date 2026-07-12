@@ -14,10 +14,8 @@ use rustscale_key::{DiscoPrivate, DiscoPublic, DiscoShared};
 use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
 
-use crate::endpoint::{ServerEndpoint, SERVER_RETRY_AFTER, UdprelayError};
-use crate::geneve::{
-    encode_geneve_control, GeneveHeader, GENEVE_PROTOCOL_DISCO, MAX_VNI, MIN_VNI,
-};
+use crate::endpoint::{ServerEndpoint, UdprelayError, SERVER_RETRY_AFTER};
+use crate::geneve::{encode_geneve_control, GeneveHeader, GENEVE_PROTOCOL_DISCO, MAX_VNI, MIN_VNI};
 use crate::mac::{compute_mac_from_bind_msg, verify_mac, MAC_SIZE};
 
 /// Default MAC secret rotation interval (~2 minutes, matching Go).
@@ -259,7 +257,9 @@ impl ServerInner {
             &self.disco_private,
         ));
 
-        state.endpoints_by_disco.insert(pair.clone(), endpoint.clone());
+        state
+            .endpoints_by_disco
+            .insert(pair.clone(), endpoint.clone());
         state.endpoints_by_vni.insert(vni, endpoint);
 
         Ok(ServerEndpoint {
@@ -279,11 +279,7 @@ impl ServerInner {
         state.mac_secrets.clone()
     }
 
-    fn maybe_rotate_mac_secret(
-        state: &mut ServerState,
-        now: Instant,
-        interval: Duration,
-    ) {
+    fn maybe_rotate_mac_secret(state: &mut ServerState, now: Instant, interval: Duration) {
         if let Some(last) = state.mac_secret_rotated_at {
             if now.duration_since(last) < interval {
                 return;
@@ -623,11 +619,7 @@ fn sorted_pair(a: DiscoPublic, b: DiscoPublic) -> [DiscoPublic; 2] {
     }
 }
 
-fn get_next_vni(
-    state: &mut ServerState,
-    min_vni: u32,
-    max_vni: u32,
-) -> Result<u32, UdprelayError> {
+fn get_next_vni(state: &mut ServerState, min_vni: u32, max_vni: u32) -> Result<u32, UdprelayError> {
     let total = max_vni - min_vni + 1;
     for _ in 0..total {
         let vni = state.next_vni;
@@ -708,13 +700,7 @@ mod tests {
     /// for further test steps.
     async fn setup_server_and_endpoint(
         config: ServerConfig,
-    ) -> (
-        Server,
-        DiscoPublic,
-        u32,
-        DiscoPrivate,
-        DiscoPrivate,
-    ) {
+    ) -> (Server, DiscoPublic, u32, DiscoPrivate, DiscoPrivate) {
         let server = Server::new(config).await.unwrap();
         let server_disco = server.disco_public();
         let client_a = DiscoPrivate::generate();
@@ -1249,10 +1235,7 @@ mod tests {
         let mut buf = vec![0u8; 65535];
         let result =
             tokio::time::timeout(Duration::from_millis(200), sock.recv_from(&mut buf)).await;
-        assert!(
-            result.is_err(),
-            "generation=0 should be silently dropped"
-        );
+        assert!(result.is_err(), "generation=0 should be silently dropped");
     }
 
     #[tokio::test]

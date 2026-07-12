@@ -206,10 +206,10 @@ impl RelayHandshake {
 
 #[cfg(test)]
 mod tests {
-use super::*;
-use crate::disco_io::DiscoIo;
-use rustscale_key::{DiscoPrivate, NodePublic};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use super::*;
+    use crate::disco_io::DiscoIo;
+    use rustscale_key::{DiscoPrivate, NodePublic};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     #[test]
     fn geneve_roundtrip() {

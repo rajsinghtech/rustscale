@@ -59,7 +59,10 @@ impl GeneveHeader {
     /// Encode the header into the first 8 bytes of `buf`.
     pub fn encode_to(&self, buf: &mut [u8]) -> Result<(), io::Error> {
         if buf.len() < GENEVE_FIXED_HEADER_LENGTH {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "buffer too short"));
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "buffer too short",
+            ));
         }
         if self.vni > MAX_VNI {
             return Err(io::Error::new(
@@ -87,7 +90,10 @@ impl GeneveHeader {
     /// payload slice.
     pub fn decode(buf: &[u8]) -> Result<(GeneveHeader, &[u8]), io::Error> {
         if buf.len() < GENEVE_FIXED_HEADER_LENGTH {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "buffer too short"));
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "buffer too short",
+            ));
         }
         let version = buf[0] >> 6;
         let control = buf[1] & 0x80 != 0;

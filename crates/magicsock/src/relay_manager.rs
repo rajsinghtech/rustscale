@@ -283,7 +283,9 @@ impl RelayManagerHandle {
     }
 
     pub fn handle_derp_home_change(&self, node_key: NodePublic, region: u16) {
-        let _ = self.tx.send(RelayEvent::DerpHomeChange { node_key, region });
+        let _ = self
+            .tx
+            .send(RelayEvent::DerpHomeChange { node_key, region });
     }
 }
 
@@ -337,9 +339,7 @@ pub trait RelayManagerContext: Send + Sync + 'static {
 }
 
 /// Spawn the relay manager event loop.
-pub fn spawn_relay_manager<RM: RelayManagerContext>(
-    ctx: std::sync::Arc<RM>,
-) -> RelayManagerHandle {
+pub fn spawn_relay_manager<RM: RelayManagerContext>(ctx: std::sync::Arc<RM>) -> RelayManagerHandle {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let handle = RelayManagerHandle { tx: tx.clone() };
     tokio::spawn(run_event_loop(rx, tx, ctx));
@@ -356,7 +356,10 @@ async fn run_event_loop<RM: RelayManagerContext>(
 
     while let Some(event) = rx.recv().await {
         match event {
-            RelayEvent::StartDiscovery { peer_key, peer_disco } => {
+            RelayEvent::StartDiscovery {
+                peer_key,
+                peer_disco,
+            } => {
                 if !state.has_active_work_for(&peer_key) {
                     allocate_all_servers(&mut state, &ctx, &event_tx, peer_key, peer_disco);
                 }
@@ -368,7 +371,9 @@ async fn run_event_loop<RM: RelayManagerContext>(
                 handle_servers_update(&mut state, servers);
             }
             RelayEvent::ServerUpsert(server) => {
-                state.servers_by_node_key.insert(server.node_key.clone(), server);
+                state
+                    .servers_by_node_key
+                    .insert(server.node_key.clone(), server);
             }
             RelayEvent::ServerRemove(node_key) => {
                 state.servers_by_node_key.remove(&node_key);
@@ -441,8 +446,7 @@ fn allocate_all_servers<RM: RelayManagerContext>(
     for (_, server) in state.servers_by_node_key.clone() {
         let alloc_gen = state.next_alloc_gen();
         let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
-        let (resp_tx, resp_rx) =
-            tokio::sync::mpsc::channel::<AllocateUdpRelayEndpointResponse>(1);
+        let (resp_tx, resp_rx) = tokio::sync::mpsc::channel::<AllocateUdpRelayEndpointResponse>(1);
 
         let work = AllocWork {
             server: server.clone(),
@@ -634,8 +638,7 @@ fn handle_new_server_endpoint<RM: RelayManagerContext>(
     }
 
     let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
-    let (disco_msg_tx, disco_msg_rx) =
-        tokio::sync::mpsc::channel::<(Message, SocketAddr, u32)>(16);
+    let (disco_msg_tx, disco_msg_rx) = tokio::sync::mpsc::channel::<(Message, SocketAddr, u32)>(16);
 
     let handshake_gen = state.next_handshake_gen();
     let work = HandshakeWork {
@@ -856,9 +859,7 @@ fn handle_handshake_work_done<RM: RelayManagerContext>(
     }
 
     // Also clean up awaiting-pong entries for this work.
-    state
-        .handshake_awaiting_pong
-        .retain(|_, pk| pk != peer_key);
+    state.handshake_awaiting_pong.retain(|_, pk| pk != peer_key);
 
     if let Some(pong_from) = result.pong_from {
         ctx.set_relay(peer_key, pong_from, result.vni);
@@ -921,11 +922,9 @@ fn handle_rx_disco_msg<RM: RelayManagerContext>(
             // Route to the handshake work's disco message channel.
             if let Some(by_sd) = state.handshake_work.get(&peer_key) {
                 if let Some(work) = by_sd.get(&msg.disco) {
-                    let _ = work.disco_msg_tx.try_send((
-                        msg.msg.clone(),
-                        msg.from,
-                        msg.vni,
-                    ));
+                    let _ = work
+                        .disco_msg_tx
+                        .try_send((msg.msg.clone(), msg.from, msg.vni));
                 }
             }
         }
@@ -940,11 +939,9 @@ fn handle_rx_disco_msg<RM: RelayManagerContext>(
             if let Some(peer_key) = state.handshake_awaiting_pong.get(&apv).cloned() {
                 if let Some(by_sd) = state.handshake_work.get(&peer_key) {
                     if let Some(work) = by_sd.get(&msg.disco) {
-                        let _ = work.disco_msg_tx.try_send((
-                            msg.msg.clone(),
-                            msg.from,
-                            msg.vni,
-                        ));
+                        let _ = work
+                            .disco_msg_tx
+                            .try_send((msg.msg.clone(), msg.from, msg.vni));
                     }
                 }
             }
@@ -954,11 +951,9 @@ fn handle_rx_disco_msg<RM: RelayManagerContext>(
             if let Some(peer_key) = state.handshake_awaiting_pong.get(&apv).cloned() {
                 if let Some(by_sd) = state.handshake_work.get(&peer_key) {
                     if let Some(work) = by_sd.get(&msg.disco) {
-                        let _ = work.disco_msg_tx.try_send((
-                            msg.msg.clone(),
-                            msg.from,
-                            msg.vni,
-                        ));
+                        let _ = work
+                            .disco_msg_tx
+                            .try_send((msg.msg.clone(), msg.from, msg.vni));
                     }
                 }
             }
@@ -988,12 +983,14 @@ fn stop_work(state: &mut RelayManagerState, peer_key: &NodePublic) {
             let _ = work.cancel.send(());
         }
     }
-    state
-        .handshake_awaiting_pong
-        .retain(|_, pk| pk != peer_key);
+    state.handshake_awaiting_pong.retain(|_, pk| pk != peer_key);
 }
 
-fn cancel_handshake(state: &mut RelayManagerState, peer_key: &NodePublic, server_disco: &DiscoPublic) {
+fn cancel_handshake(
+    state: &mut RelayManagerState,
+    peer_key: &NodePublic,
+    server_disco: &DiscoPublic,
+) {
     if let Some(by_sd) = state.handshake_work.get_mut(peer_key) {
         if let Some(work) = by_sd.remove(server_disco) {
             let sdv = ServerDiscoVni {
@@ -1083,7 +1080,10 @@ mod tests {
             Cap: 120,
             CapMap: {
                 let mut m = BTreeMap::new();
-                m.insert(PEER_CAPABILITY_RELAY_TARGET.to_string(), vec![RawMessage::default()]);
+                m.insert(
+                    PEER_CAPABILITY_RELAY_TARGET.to_string(),
+                    vec![RawMessage::default()],
+                );
                 m
             },
             ..Default::default()
@@ -1097,7 +1097,10 @@ mod tests {
             Cap: 120,
             CapMap: {
                 let mut m = BTreeMap::new();
-                m.insert(PEER_CAPABILITY_RELAY_TARGET.to_string(), vec![RawMessage::default()]);
+                m.insert(
+                    PEER_CAPABILITY_RELAY_TARGET.to_string(),
+                    vec![RawMessage::default()],
+                );
                 m
             },
             HomeDERP: 5,

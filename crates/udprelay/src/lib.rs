@@ -29,9 +29,9 @@ mod geneve;
 mod mac;
 mod server;
 
-pub use endpoint::{ServerEndpoint, SERVER_RETRY_AFTER, UdprelayError};
+pub use endpoint::{ServerEndpoint, UdprelayError, SERVER_RETRY_AFTER};
 pub use geneve::{
-    decode_geneve, encode_geneve, encode_geneve_control, GeneveHeader,
-    GENEVE_FIXED_HEADER_LENGTH, GENEVE_PROTOCOL_DISCO, GENEVE_PROTOCOL_WIREGUARD,
+    decode_geneve, encode_geneve, encode_geneve_control, GeneveHeader, GENEVE_FIXED_HEADER_LENGTH,
+    GENEVE_PROTOCOL_DISCO, GENEVE_PROTOCOL_WIREGUARD,
 };
 pub use server::{Server, ServerConfig};

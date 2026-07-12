@@ -1097,28 +1097,21 @@ impl relay_manager::RelayManagerContext for Inner {
     }
 
     fn peer_disco_key(&self, peer_key: &NodePublic) -> Option<DiscoPublic> {
-        let endpoints = self
-            .endpoints
-            .read()
-            .expect("endpoints lock poisoned");
-        endpoints.get(peer_key).map(|ep| ep.peer_disco_key().clone())
+        let endpoints = self.endpoints.read().expect("endpoints lock poisoned");
+        endpoints
+            .get(peer_key)
+            .map(|ep| ep.peer_disco_key().clone())
     }
 
     fn peer_derp_region(&self, peer_key: &NodePublic) -> i32 {
-        let endpoints = self
-            .endpoints
-            .read()
-            .expect("endpoints lock poisoned");
+        let endpoints = self.endpoints.read().expect("endpoints lock poisoned");
         endpoints
             .get(peer_key)
             .map_or(0, endpoint::Endpoint::derp_send_region)
     }
 
     fn set_relay(&self, peer_key: &NodePublic, addr: SocketAddr, vni: u32) {
-        let mut endpoints = self
-            .endpoints
-            .write()
-            .expect("endpoints lock poisoned");
+        let mut endpoints = self.endpoints.write().expect("endpoints lock poisoned");
         if let Some(ep) = endpoints.get_mut(peer_key) {
             ep.set_relay(addr, vni);
             if debug_enabled() {
@@ -1253,9 +1246,7 @@ impl Inner {
         }
 
         match &msg {
-            Message::BindUdpRelayEndpointChallenge(_)
-            | Message::Ping(_)
-            | Message::Pong(_) => {
+            Message::BindUdpRelayEndpointChallenge(_) | Message::Ping(_) | Message::Pong(_) => {
                 if let Some(ref rm) = self.relay_manager {
                     rm.handle_rx_disco_msg(relay_manager::RelayDiscoMsg {
                         msg,
@@ -1460,10 +1451,7 @@ impl Inner {
                 // Route to the relay manager to start a handshake.
                 if let Some(ref rm) = self.relay_manager {
                     let peer_disco = {
-                        let endpoints = self
-                            .endpoints
-                            .read()
-                            .expect("endpoints lock poisoned");
+                        let endpoints = self.endpoints.read().expect("endpoints lock poisoned");
                         endpoints
                             .get(&source)
                             .map(|ep| ep.peer_disco_key().clone())

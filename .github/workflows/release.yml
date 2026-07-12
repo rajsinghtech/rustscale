@@ -22,7 +22,7 @@ env:
   CARGO_TERM_COLOR: always
   # Space-separated list of binary crate package names to build + lipo.
   # Add "rustscaled" here when crates/rustscaled lands.
-  BIN_PKGS: ''
+  BIN_PKGS: 'rustscaled'
 
 jobs:
   # -------------------------------------------------------------------------

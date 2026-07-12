@@ -380,7 +380,7 @@ pub extern "C" fn ts_up(handle: c_int) -> c_int {
         };
         e.starting = false;
         match result {
-            Ok(()) => {
+            Ok(_) => {
                 e.server = Some(Arc::new(Mutex::new(server)));
                 e.last_error.clear();
                 RS_OK
@@ -783,7 +783,7 @@ pub extern "C" fn ts_listen(handle: c_int, proto: *const c_char, addr: *const c_
         };
 
         let listener = {
-            let server = server_arc.lock().expect("server mutex poisoned");
+            let mut server = server_arc.lock().expect("server mutex poisoned");
             runtime().block_on(server.listen(port))
         };
 
@@ -908,7 +908,7 @@ pub extern "C" fn ts_dial(handle: c_int, proto: *const c_char, addr: *const c_ch
         };
 
         let stream = {
-            let server = server_arc.lock().expect("server mutex poisoned");
+            let mut server = server_arc.lock().expect("server mutex poisoned");
             runtime().block_on(async {
                 tokio::time::timeout(FFI_BLOCK_TIMEOUT, server.dial(&addr_s)).await
             })

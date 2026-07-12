@@ -48,10 +48,14 @@ impl Server {
 
     /// Listen for incoming TCP connections on `port` (netstack mode only).
     ///
-    /// Returns an error in TUN mode — there is no in-process netstack to
-    /// accept connections.
-    pub async fn listen(&self, port: u16) -> Result<rustscale_netstack::Listener, TsnetError> {
-        let inner = self.inner.as_ref().ok_or(TsnetError::NotUp)?;
+    /// **Auto-starts** the server if it has not been started yet (calling
+    /// [`Server::up`] internally). Returns an error in TUN mode — there is
+    /// no in-process netstack to accept connections.
+    ///
+    /// Mirrors Go's `Server.Listen` which calls `Start()` first.
+    pub async fn listen(&mut self, port: u16) -> Result<rustscale_netstack::Listener, TsnetError> {
+        Box::pin(self.ensure_up()).await?;
+        let inner = self.inner.as_ref().expect("ensure_up guarantees inner");
         match &inner.data_plane {
             DataPlane::Netstack(ns) => Ok(ns.listen(port).await?),
             DataPlane::Tun => Err(TsnetError::NotAvailableInTunMode),
@@ -157,12 +161,16 @@ impl Server {
 
     /// Dial a remote `ip:port` or `hostname:port` (netstack mode only).
     ///
-    /// Resolves tailnet hostnames via MagicDNS (short name, FQDN) and
-    /// non-tailnet hostnames via the system resolver (requires an exit
-    /// node for the traffic to reach the internet). Returns an error in
-    /// TUN mode.
-    pub async fn dial(&self, addr: &str) -> Result<NetstackStream, TsnetError> {
-        let inner = self.inner.as_ref().ok_or(TsnetError::NotUp)?;
+    /// **Auto-starts** the server if it has not been started yet (calling
+    /// [`Server::up`] internally). Resolves tailnet hostnames via MagicDNS
+    /// (short name, FQDN) and non-tailnet hostnames via the system resolver
+    /// (requires an exit node for the traffic to reach the internet). Returns
+    /// an error in TUN mode.
+    ///
+    /// Mirrors Go's `Server.Dial` which calls `Start()` first.
+    pub async fn dial(&mut self, addr: &str) -> Result<NetstackStream, TsnetError> {
+        Box::pin(self.ensure_up()).await?;
+        let inner = self.inner.as_ref().expect("ensure_up guarantees inner");
         let socket_addr = resolve_addr(addr, inner).await?;
         match &inner.data_plane {
             DataPlane::Netstack(ns) => Ok(ns.dial(socket_addr).await?),

@@ -38,6 +38,7 @@ mod hostinfo;
 mod lifecycle;
 mod link_monitor;
 pub mod localapi;
+mod loopback;
 mod map_update;
 mod netstack_pump;
 mod peerapi;
@@ -60,6 +61,7 @@ pub use appc::{
     extract_appc_config, is_app_connector_node, make_dns_observer, route_info_from_connector,
     TsnetRouteAdvertiser,
 };
+pub use loopback::{InMemoryClientError, InMemoryLocalClient, LoopbackHandle};
 pub use routing::{peer_is_exit_capable, RouteTable};
 pub use rustscale_health::Warning;
 pub use serve::{
@@ -215,7 +217,7 @@ pub enum TsnetError {
 }
 
 /// A builder for configuring a [`Server`].
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct ServerBuilder {
     pub(crate) hostname: String,
     pub(crate) auth_key: Option<String>,
@@ -267,6 +269,47 @@ pub struct ServerBuilder {
     /// `None`, defaults are used. Only effective when `peer_relay_server`
     /// is true. Used by integration tests to set shortened lifetimes.
     pub(crate) relay_server_config: Option<rustscale_udprelay::ServerConfig>,
+    /// UDP port for WireGuard / peer-to-peer traffic. If 0 (default), a
+    /// port is automatically selected. Mirrors Go's `Server.Port`.
+    pub(crate) port: u16,
+    /// ACL tags to advertise for this node (e.g. `["tag:prod"]`). Sent in
+    /// `Hostinfo.RequestTags` during registration. The control server must
+    /// permit the node to adopt each tag via `tagOwners` in the policy file.
+    /// Mirrors Go's `Server.AdvertiseTags`.
+    pub(crate) advertise_tags: Vec<String>,
+    /// Pluggable logger callback. When set, diagnostic messages from the
+    /// server are routed through this closure instead of `eprintln!`.
+    /// Mirrors Go's `Server.UserLogf`.
+    pub(crate) logger: Option<Logger>,
+}
+
+/// A pluggable logger callback for diagnostic messages. Implementations
+/// must be `Send + Sync`; the closure receives a pre-formatted message
+/// string. When unset, messages fall through to `eprintln!`.
+pub type Logger = Arc<dyn Fn(&str) + Send + Sync>;
+
+#[allow(clippy::missing_fields_in_debug)]
+impl std::fmt::Debug for ServerBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerBuilder")
+            .field("hostname", &self.hostname)
+            .field("auth_key", &self.auth_key)
+            .field("control_url", &self.control_url)
+            .field("state_dir", &self.state_dir)
+            .field("ephemeral", &self.ephemeral)
+            .field("advertise_routes", &self.advertise_routes)
+            .field("accept_routes", &self.accept_routes)
+            .field("advertise_exit_node", &self.advertise_exit_node)
+            .field("disable_direct_paths", &self.disable_direct_paths)
+            .field("localapi", &self.localapi)
+            .field("localapi_path", &self.localapi_path)
+            .field("configure_os_dns", &self.configure_os_dns)
+            .field("peer_relay_server", &self.peer_relay_server)
+            .field("port", &self.port)
+            .field("advertise_tags", &self.advertise_tags)
+            .field("logger", &self.logger.as_ref().map(|_| "<logger>"))
+            .finish()
+    }
 }
 
 impl ServerBuilder {
@@ -413,6 +456,38 @@ impl ServerBuilder {
     /// integration tests to set shortened lifetimes for expiry scenarios.
     pub fn relay_server_config(mut self, config: rustscale_udprelay::ServerConfig) -> Self {
         self.relay_server_config = Some(config);
+        self
+    }
+
+    /// Set the UDP port for WireGuard and peer-to-peer traffic. If 0
+    /// (default), a port is automatically selected. Leave at zero unless
+    /// you need a fixed port (e.g. firewall rules).
+    ///
+    /// Mirrors Go's `Server.Port`.
+    pub fn port(mut self, port: u16) -> Self {
+        self.port = port;
+        self
+    }
+
+    /// Set the ACL tags to advertise for this node (e.g.
+    /// `["tag:prod", "tag:server"]`). Tags are sent in
+    /// `Hostinfo.RequestTags` during registration. The control server
+    /// must permit the node to adopt each tag via `tagOwners` in the
+    /// tailnet policy file.
+    ///
+    /// Mirrors Go's `Server.AdvertiseTags`.
+    pub fn advertise_tags(mut self, tags: Vec<String>) -> Self {
+        self.advertise_tags = tags;
+        self
+    }
+
+    /// Set a pluggable logger callback. When set, diagnostic messages
+    /// from the server (status updates, auth URLs, non-fatal errors) are
+    /// routed through this closure instead of `eprintln!`.
+    ///
+    /// Mirrors Go's `Server.UserLogf`.
+    pub fn logger(mut self, logger: impl Fn(&str) + Send + Sync + 'static) -> Self {
+        self.logger = Some(Arc::new(logger));
         self
     }
 
@@ -786,6 +861,17 @@ impl Server {
     pub async fn set_package(&self, package: impl Into<String>) {
         if let Some(ref inner) = self.inner {
             inner.overrides.write().await.set_package(package);
+        }
+    }
+
+    /// Route a diagnostic message through the pluggable logger, or
+    /// `eprintln!` if no logger is set. Used internally by lifecycle
+    /// methods instead of bare `eprintln!`.
+    pub(crate) fn log_msg(&self, msg: impl std::fmt::Display) {
+        if let Some(ref logger) = self.config.logger {
+            logger(&msg.to_string());
+        } else {
+            eprintln!("{msg}");
         }
     }
 }

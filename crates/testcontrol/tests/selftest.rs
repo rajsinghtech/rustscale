@@ -34,7 +34,7 @@ async fn testcontrol_full_flow() {
     // 3. Bring it up (60s hard timeout — no external network needed).
     eprintln!("bringing tsnet node up...");
     let up_result = tokio::time::timeout(Duration::from_secs(60), server.up()).await;
-    if let Ok(Ok(())) = &up_result {
+    if let Ok(Ok(_)) = &up_result {
         eprintln!("tsnet node is up");
     } else if let Ok(Err(e)) = &up_result {
         panic!("tsnet up() failed: {e}");

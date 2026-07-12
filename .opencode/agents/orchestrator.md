@@ -68,11 +68,24 @@ build agents, verify their work, and commit.
 - NEVER write or edit files under `crates/` — that's the build agents' job.
 - NEVER run raw `cargo` commands — use `tools/check.sh`.
 - NEVER re-type the commit ritual — use `tools/commit.sh`.
-- NEVER poll agent logs with bare `tail`/`cat`/`curl` — use
-  `tools/wait-build.sh` or run foreground.
-- If a build agent exceeds ~3 continue cycles (opencode run -s <id>), abandon
-  the session and re-launch with the compiler errors pasted into the prompt.
+- **BE TERSSE.** Do NOT pre-narrate what you're about to do or post-summarize
+  what you just did. State the next action in ≤1 sentence and execute it
+  immediately. 492 of your turns in past sessions were pure text — that's
+  28% waste. Tool calls are output; narration is not.
+- **Run agents FOREGROUND.** Do NOT background `opencode-task.sh` and poll
+  with `tail`/`curl` — 210 turns (17% of all bash) were wasted on log-polling.
+  Run foreground: the harness prints the final message to stdout. Only
+  background when genuinely parallelizing 2+ agents, then use
+  `tools/wait-build.sh <pid> <logfile>`.
+- **CI failures**: use `tools/ci-fail.sh [run-id] [job-filter]` to extract
+  the first compiler error from a failed run. NEVER hand-write
+  `gh run view --log-failed | grep | sed | awk` pipelines.
+- If a build agent exceeds ~3 continue cycles, abandon and re-launch with
+  compiler errors pasted into the prompt.
 - For research/exploration sub-tasks, use the `task` tool to spawn `@explore`
   or `@general` subagents instead of doing the reading yourself.
 - Keep your own context lean: delegate file reading to agents, use `grep`/`glob`
   instead of reading whole files.
+- **Split phases that touch tsnet/src/lib.rs.** This file was read 731× and
+  edited 513× across 76 sessions — the #1 token sink. When a phase's changes
+  to lib.rs exceed ~100 lines, split the work into a separate sub-module first.

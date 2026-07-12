@@ -415,3 +415,69 @@ agents. Analysis script: `/tmp/toolbench2.py` (re-derivable). Findings:
 - This section — folds sink #1–#4 into future orchestrator behavior. The
   recurring toolsmith pass should now also audit the orchestrator JSONLs
   (`~/.claude/projects/…/rustscale/*.jsonl`), not only `opencode session list`.
+
+## 2026-07-12: Cross-layer toolbench — opencode build agents (217 sessions)
+
+Analyzed 217 opencode build-agent sessions via the SQLite DB
+(`~/.local/share/opencode/opencode.db`). Combined findings with the orchestrator
+analysis to produce a unified fix set.
+
+### Scale
+- 217 sessions, 25,925 bash calls, 6,100 file reads, 3,688 edits
+- 2.23B tokens consumed (95.5% cache_read = 2.13B, 4.5% fresh input = 101M)
+- Top 5 sessions consumed 20% of all tokens (phase-5 alone: 135M)
+
+### Top cross-layer sinks (ranked by total token waste)
+
+1. **`tsnet/src/lib.rs` god object — 731 reads, 513 edits, 45 sessions.**
+   Read up to 56× in a single session (phase-16-hostinfo). The #1 token sink
+   across the entire project. Every phase touches it because it's the catch-all.
+   **Fix**: split into modules (serve, dial, state, peerapi, listen). **Status:
+   agent launched to refactor.**
+
+2. **Raw cargo 2,584× vs `tools/check.sh` 182× (14:1 ratio in build agents).**
+   `cargo build --workspace` run 257×, `cargo test --workspace` 112×, each
+   dumping 50K+ chars. `tools/check.sh` is silent on success, caps at 50 lines
+   on failure. **Fix**: harness now injects guardrails as a pre-prompt telling
+   agents to use `tools/check.sh` exclusively.
+
+3. **2,470 re-reads of the same file within one session (40% of all reads).**
+   6,100 reads, only 3,630 unique session+file pairs. The model edits a file
+   then re-reads the whole thing to see what it just wrote — working-memory
+   loss. **Fix**: harness guardrails now say "NEVER re-read a file fully after
+   your first read; use grep -n / tools/where.sh / narrow offset windows."
+
+4. **95.5% of build-agent tokens are cache_read.** The context window is
+   bloated with cached content re-sent every turn. Root cause: file re-reads
+   (#3) and raw cargo output (#2) inflate the cache. Fixing #2 and #3 directly
+   reduces this.
+
+5. **Orchestrator: 492 text-only turns (28% of assistant turns).** Pure
+   narration — pre-explaining what it's about to do or post-summarizing. **Fix**:
+   orchestrator.md now says "BE TERSE. Do NOT pre-narrate or post-summarize.
+   State the next action in ≤1 sentence and execute it."
+
+6. **Orchestrator: 210 log-polling turns (17% of bash).** `tail`/`curl` on
+   backgrounded agent output. **Fix**: orchestrator.md now says "Run agents
+   FOREGROUND. Do NOT background and poll."
+
+7. **Orchestrator: 47 CI-debug turns with ad-hoc grep/sed/awk pipelines.**
+   **Fix**: `tools/ci-fail.sh` created — extracts first compiler error from a
+   failed GitHub Actions run, strips ANSI, prints file:line context.
+
+8. **5 foundational phases = 20% of all tokens.** phase-5 (135M), phase-8 (66M),
+   phase-6 (52M), phase-7 (39M), phase-4 (29M). Each needed 7+ continue cycles.
+   **Fix**: for foundational phases, write specs with explicit type signatures
+   and module boundaries upfront. The spec investment pays back 10× in reduced
+   fix cycles.
+
+### Codified this pass (cross-layer)
+- `tools/ci-fail.sh` — replaces 47× ad-hoc CI-log grep pipelines.
+- `tools/agent/opencode-task.sh` — now injects 5 guardrail rules as a
+  pre-prompt before the task text (use check.sh, no re-reads, no docs.rs,
+  use go-find.sh, use clippy-all.sh). Agents see these without the
+  orchestrator repeating them.
+- `.opencode/agents/orchestrator.md` — updated with terse-mode,
+  foreground-only, and CI-helper instructions.
+- **Next**: split `tsnet/src/lib.rs` into modules (agent task). Write a
+  foundational-phase spec template with type signatures.

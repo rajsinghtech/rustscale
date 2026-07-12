@@ -97,10 +97,36 @@ else
   echo "[harness] session $SID ($TITLE)" >&2
 fi
 
+# 1b. Inject guardrails as a pre-prompt so the model sees them before the task.
+#     These are the top token-sink fixes from the toolbench analysis — they
+#     don't need the orchestrator to repeat them every time.
+read -r -d '' GUARDRAILS <<'GUARD' || true
+IMPORTANT TOKEN-SAVING RULES (follow these or you will waste context):
+1. VERIFY: Use tools/check.sh as your ONLY verify command. NEVER run raw
+   `cargo build`, `cargo test`, `cargo clippy`, or `cargo fmt` — they dump
+   full output into your context (50K+ chars) and can hide CI-only failures.
+   tools/check.sh is silent on success, prints ~50 lines on failure, and
+   mirrors CI exactly. Use `tools/check.sh <crate>` during iteration, 
+   `tools/check.sh` (workspace) only at the end.
+2. FILES: After your FIRST read of any file, NEVER re-read it fully. Use
+   `grep -n '^fn\|^pub fn\|^struct\|^enum\|^impl\|^mod' <file>` for a compact
+   index, `tools/where.sh <pattern> <file>` for line numbers, or read a
+   narrow offset/limit window (offset=LINE-5, limit=20). A full re-read of
+   a 500-line file costs ~8K chars; 15 re-reads = 120K chars wasted.
+3. GO SOURCES: Before reading Go files, check docs/porting-notes.md for
+   already-distilled facts. Use tools/go-find.sh to locate definitions
+   without reading full files.
+4. CLIPPY: Run tools/clippy-all.sh <crate> to see ALL warnings in one pass.
+   Fix them all before re-running. Do not fix one warning at a time.
+5. Do NOT explore ~/.cargo/registry/ or fetch docs.rs — crate APIs are in
+   docs/porting-notes.md. If you need a crate not documented there, ask.
+
+GUARD
+
 # 2. Async prompt admission — returns 204 immediately.
 curl -sfS --max-time 10 -o /dev/null -X POST "$URL/session/$SID/prompt_async?directory=$DIR" \
   -H 'Content-Type: application/json' \
-  -d "$(jq -n --arg pid "$PROVIDER" --arg mid "$MODEL" --arg t "$PROMPT" \
+  -d "$(jq -n --arg pid "$PROVIDER" --arg mid "$MODEL" --arg t "$GUARDRAILS\n$PROMPT" \
     '{model:{providerID:$pid,modelID:$mid},parts:[{type:"text",text:$t}]}')" \
   || { echo "[harness] prompt admission failed for session $SID" >&2; exit 1; }
 echo "[harness] prompt admitted; watchdog ${DEADLINE}s model=$MODEL" >&2

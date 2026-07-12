@@ -26,7 +26,9 @@ pub mod osconfig_darwin;
 pub mod wire;
 
 pub use forwarder::{Forwarder, UpstreamResolver};
-pub use osconfig::{new_os_configurator, NoopConfigurator, OsConfig, OsConfigurator};
+pub use osconfig::{
+    build_os_dns_config, new_os_configurator, NoopConfigurator, OsConfig, OsConfigurator,
+};
 #[cfg(target_os = "macos")]
 pub use osconfig_darwin::DarwinConfigurator;
 pub use wire::{

@@ -61,6 +61,99 @@ fn builder_sets_ephemeral_flag() {
     assert!(server.config.ephemeral);
 }
 
+#[test]
+fn builder_configure_os_dns_defaults_off() {
+    let server = Server::builder()
+        .hostname("x")
+        .auth_key("k")
+        .build()
+        .unwrap();
+    assert!(
+        !server.config.configure_os_dns,
+        "configure_os_dns should default to false"
+    );
+}
+
+#[test]
+fn builder_configure_os_dns_opt_in() {
+    let server = Server::builder()
+        .hostname("x")
+        .auth_key("k")
+        .configure_os_dns(true)
+        .build()
+        .unwrap();
+    assert!(server.config.configure_os_dns);
+}
+
+// ---------------------------------------------------------------------------
+// OS DNS config construction tests (pure function, no root needed)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn os_dns_config_from_netmap_proxied() {
+    use rustscale_dns::build_os_dns_config;
+    use rustscale_tailcfg::{DNSConfig, Resolver};
+
+    let dns = DNSConfig {
+        Resolvers: vec![Resolver {
+            Addr: "1.1.1.1".into(),
+        }],
+        Domains: vec!["tailnet.ts.net".into(), "corp.example".into()],
+        Proxied: true,
+        CertDomains: vec!["node.tailnet.ts.net".into()],
+        ..Default::default()
+    };
+    let os = build_os_dns_config(&dns, "tailnet.ts.net");
+
+    assert_eq!(
+        os.nameservers,
+        vec![std::net::IpAddr::V4(Ipv4Addr::new(100, 100, 100, 100))]
+    );
+    assert_eq!(os.search_domains, vec!["tailnet.ts.net", "corp.example"]);
+    assert_eq!(os.match_domains, vec!["tailnet.ts.net"]);
+}
+
+#[test]
+fn os_dns_config_from_netmap_with_split_routes() {
+    use rustscale_dns::build_os_dns_config;
+    use rustscale_tailcfg::{DNSConfig, Resolver};
+    use std::collections::HashMap;
+
+    let mut routes = HashMap::new();
+    routes.insert(
+        "corp.example.com.".to_string(),
+        vec![Resolver {
+            Addr: "10.0.0.53".into(),
+        }],
+    );
+    let dns = DNSConfig {
+        Domains: vec!["tailnet.ts.net".into()],
+        Proxied: true,
+        Routes: routes,
+        ..Default::default()
+    };
+    let os = build_os_dns_config(&dns, "tailnet.ts.net");
+
+    assert_eq!(os.match_domains.len(), 2);
+    assert!(os.match_domains.contains(&"tailnet.ts.net".to_string()));
+    assert!(os.match_domains.contains(&"corp.example.com".to_string()));
+}
+
+#[test]
+fn os_dns_config_not_proxied_no_match_domains() {
+    use rustscale_dns::build_os_dns_config;
+    use rustscale_tailcfg::DNSConfig;
+
+    let dns = DNSConfig {
+        Domains: vec!["tailnet.ts.net".into()],
+        Proxied: false,
+        ..Default::default()
+    };
+    let os = build_os_dns_config(&dns, "tailnet.ts.net");
+    assert!(os.match_domains.is_empty());
+    assert_eq!(os.search_domains, vec!["tailnet.ts.net"]);
+}
+
 // ---------------------------------------------------------------------------
 // Health → ServerStatus integration tests (not ignored)
 // ---------------------------------------------------------------------------

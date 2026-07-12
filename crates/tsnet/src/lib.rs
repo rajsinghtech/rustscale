@@ -72,7 +72,10 @@ use rustscale_controlclient::controlhttp;
 use rustscale_controlclient::{extract_knobs_from_map_response, C2nRouter};
 use rustscale_controlknobs::ControlKnobs;
 use rustscale_derp::DerpClient;
-use rustscale_dns::{config_from_dns, DnsResponder, Forwarder, MagicDnsResolver, MAGICDNS_VIP};
+use rustscale_dns::{
+    build_os_dns_config, config_from_dns, new_os_configurator, DnsResponder, Forwarder,
+    MagicDnsResolver, OsConfig, OsConfigurator, MAGICDNS_VIP,
+};
 use rustscale_filter::Filter;
 use rustscale_health::{
     Severity, Tracker, Watchdog, WARN_CERT_FALLBACK, WARN_CONTROL, WARN_DERP_HOME,
@@ -191,6 +194,12 @@ pub struct ServerBuilder {
     /// Explicit LocalAPI socket path. If None and localapi is enabled,
     /// defaults to `<state_dir>/rustscale.sock`.
     localapi_path: Option<PathBuf>,
+    /// Whether to configure the OS DNS resolver in TUN mode. When true,
+    /// `up_tun` writes `/etc/resolver/` entries (macOS) pointing at
+    /// `100.100.100.100` for the MagicDNS suffix and split-DNS routes.
+    /// **Requires root** (writing `/etc/resolver` needs privileged access).
+    /// Default `false`. Ignored in netstack mode (`up()`).
+    configure_os_dns: bool,
 }
 
 impl ServerBuilder {
@@ -333,6 +342,25 @@ impl ServerBuilder {
         self
     }
 
+    /// Enable OS-level DNS configuration in TUN mode (default: `false`).
+    ///
+    /// When enabled, [`Server::up_tun`] writes `/etc/resolver/` entries on
+    /// macOS (or calls the platform-appropriate configurator) pointing at
+    /// `100.100.100.100` for the MagicDNS suffix and any split-DNS routes
+    /// from the control-plane DNS config. Search domains from the netmap are
+    /// also installed.
+    ///
+    /// **Requires root** — writing `/etc/resolver` needs privileged access.
+    /// Permission failures are logged as warnings and do not prevent `up_tun`
+    /// from completing; the TUN data plane and MagicDNS responder still
+    /// operate.
+    ///
+    /// Ignored in netstack mode ([`Server::up`]).
+    pub fn configure_os_dns(mut self, on: bool) -> Self {
+        self.configure_os_dns = on;
+        self
+    }
+
     /// Compute the effective advertised routes: `advertise_routes` plus the
     /// exit-node default routes (`0.0.0.0/0`, `::/0`) when
     /// `advertise_exit_node` is true. Used everywhere `RoutableIPs` is sent to
@@ -412,6 +440,10 @@ struct RunningState {
     /// `NodeKeyExpired` in a MapResponse. The client should transition to
     /// a "NeedsLogin" state; un-expiring clears it.
     key_expired: Arc<std::sync::atomic::AtomicBool>,
+    /// OS DNS configurator, active only in TUN mode when
+    /// `configure_os_dns` is enabled. `close()` is called on server
+    /// shutdown to remove `/etc/resolver` entries.
+    os_dns_configurator: Option<Box<dyn OsConfigurator + Send>>,
 }
 
 /// Which data plane is wired up: userspace netstack (tsnet listen/dial) or a
@@ -501,6 +533,8 @@ struct Bootstrap {
     resolver: Arc<RwLock<MagicDnsResolver>>,
     /// Our node's FQDN (with trailing dot).
     our_fqdn: String,
+    /// Tailnet domain / MagicDNS suffix (from `MapResponse.Domain`).
+    domain: String,
     /// DNS config (carries CertDomains).
     dns_config: Arc<RwLock<Option<DNSConfig>>>,
     /// User profiles keyed by UserID.
@@ -917,6 +951,7 @@ impl Server {
             overrides: b.overrides,
             localapi_socket,
             key_expired: b.key_expired,
+            os_dns_configurator: None,
         });
         Ok(())
     }
@@ -1175,6 +1210,39 @@ impl Server {
             None
         };
 
+        // OS DNS configuration (macOS: /etc/resolver entries pointing at
+        // 100.100.100.100). Opt-in via `configure_os_dns(true)` — requires
+        // root. Best-effort: permission errors are logged and do not prevent
+        // up_tun from completing.
+        let os_dns_configurator = if self.config.configure_os_dns {
+            let dns_cfg_snapshot = b.dns_config.read().await.clone();
+            let os_cfg = if let Some(ref dc) = dns_cfg_snapshot {
+                build_os_dns_config(dc, &b.domain)
+            } else {
+                OsConfig {
+                    nameservers: vec![IpAddr::V4(MAGICDNS_VIP)],
+                    ..Default::default()
+                }
+            };
+            let mut configurator: Box<dyn OsConfigurator + Send> = Box::new(new_os_configurator());
+            match configurator.set_dns(&os_cfg) {
+                Ok(()) => {
+                    eprintln!(
+                        "tsnet: OS DNS configured ({} match domains, {} search domains)",
+                        os_cfg.match_domains.len(),
+                        os_cfg.search_domains.len()
+                    );
+                    Some(configurator)
+                }
+                Err(e) => {
+                    eprintln!("tsnet: OS DNS configuration failed (non-fatal, needs root?): {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         self.inner = Some(RunningState {
             tailscale_ips: b.tailscale_ips,
             magicsock: b.magicsock,
@@ -1202,6 +1270,7 @@ impl Server {
             overrides: b.overrides,
             localapi_socket,
             key_expired: b.key_expired,
+            os_dns_configurator,
         });
         Ok(())
     }
@@ -1741,6 +1810,7 @@ impl Server {
             packet_drops,
             resolver,
             our_fqdn,
+            domain,
             dns_config,
             user_profiles,
             machine_key: state.machine_key.clone(),
@@ -2002,22 +2072,39 @@ impl Server {
     /// returns [`TsnetError::NotExitCapable`]. Returns
     /// [`TsnetError::ExitNodeNotFound`] if no peer matches.
     ///
+    /// In TUN mode, existing TCP connections are broken best-effort after the
+    /// route change (mirroring Go's `breakTCPConns`), since the old routes no
+    /// longer apply. This is **not** done in netstack mode — it would kill the
+    /// process's own DERP/control TCP connections.
+    ///
     /// C-representable: string in, error code out (see FFI `ts_set_exit_node`).
     pub async fn set_exit_node(&self, ip_or_name: &str) -> Result<(), TsnetError> {
         let inner = self.inner.as_ref().ok_or(TsnetError::NotUp)?;
         let peers = inner.peers.read().await;
         let peer_key = resolve_exit_node(&peers, ip_or_name)?;
+        drop(peers);
         inner.route_table.write().await.set_exit_node(peer_key);
+        if matches!(inner.data_plane, DataPlane::Tun) {
+            break_tcp_conns_best_effort();
+        }
         Ok(())
     }
 
     /// Clear the selected exit node. After this, non-tailnet destinations no
     /// longer route through a peer (unless `accept_routes` installed them).
     ///
+    /// In TUN mode, existing TCP connections are broken best-effort after the
+    /// route change (mirroring Go's `breakTCPConns`), since the old routes no
+    /// longer apply. This is **not** done in netstack mode — it would kill the
+    /// process's own DERP/control TCP connections.
+    ///
     /// C-representable: no args, error code out (see FFI `ts_clear_exit_node`).
     pub async fn clear_exit_node(&self) -> Result<(), TsnetError> {
         let inner = self.inner.as_ref().ok_or(TsnetError::NotUp)?;
         inner.route_table.write().await.clear_exit_node();
+        if matches!(inner.data_plane, DataPlane::Tun) {
+            break_tcp_conns_best_effort();
+        }
         Ok(())
     }
 
@@ -2214,6 +2301,13 @@ impl Server {
             // Clean up the LocalAPI socket file if it was created.
             if let Some(ref path) = inner.localapi_socket {
                 let _ = std::fs::remove_file(path);
+            }
+            // Remove OS DNS configuration (e.g. /etc/resolver entries) if
+            // we installed it. Best-effort: log on error.
+            if let Some(mut cfg) = inner.os_dns_configurator.take() {
+                if let Err(e) = cfg.close() {
+                    eprintln!("tsnet: OS DNS cleanup failed (non-fatal): {e}");
+                }
             }
         }
     }
@@ -3472,6 +3566,23 @@ fn resolve_exit_node(peers: &[Node], ip_or_name: &str) -> Result<NodePublic, Tsn
     }
 
     Err(TsnetError::ExitNodeNotFound(ip_or_name.to_string()))
+}
+
+/// Best-effort: close all TCP connections visible to this process. Called
+/// after exit-node route changes in TUN mode so that existing TCP
+/// connections pick up the new routing. Logs the closed count on success
+/// and the error on failure. Never called in netstack mode or tests —
+/// closing the process's own DERP/control TCP fds there would kill the
+/// data plane.
+fn break_tcp_conns_best_effort() {
+    match rustscale_tcpinfo::break_tcp_conns() {
+        Ok(n) => {
+            eprintln!("tsnet: broke {n} TCP connection(s) on exit-node change");
+        }
+        Err(e) => {
+            eprintln!("tsnet: break_tcp_conns failed (non-fatal): {e}");
+        }
+    }
 }
 
 #[cfg(test)]

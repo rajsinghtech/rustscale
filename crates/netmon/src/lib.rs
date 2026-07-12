@@ -17,6 +17,7 @@
 //! is allowed via `Cargo.toml` (not inherited from the workspace `forbid`
 //! policy).
 
+mod defaultroute;
 mod interfaces;
 mod monitor;
 mod os;
@@ -32,6 +33,7 @@ mod state;
 #[cfg(test)]
 mod tests;
 
+pub use defaultroute::default_route_interface_index;
 pub use monitor::{
     ChangeCallbackHandle, ChangeDelta, Monitor, MonitorHandle, NetmonError, StateProvider,
 };

@@ -1,0 +1,1 @@
+{"Resolvers":[{"Addr":"1.1.1.1"}],"Routes":{"corp.example.com.":[{"Addr":"10.0.0.53"}]},"FallbackResolvers":[{"Addr":"8.8.8.8"}],"Domains":["ts.net"],"Proxied":true,"CertDomains":["node.ts.net"],"ExtraRecords":[{"Name":"app.ts.net","Type":"A","Value":"100.64.0.5"}]}

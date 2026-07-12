@@ -1,0 +1,1 @@
+{"MappingVariesByDestIP":false,"WorkingIPv6":true,"OSHasIPv6":true,"WorkingUDP":true,"WorkingICMPv4":false,"HavePortMap":true,"UPnP":false,"PMP":true,"PCP":false,"PreferredDERP":3,"LinkType":"wifi","DERPLatency":{"1-v4":0.012,"1-v6":0.015,"9-v4":0.18},"FirewallMode":"nft-default"}

@@ -2397,6 +2397,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustscale-wire-fixture"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "rustscale-derp",
+ "rustscale-disco",
+ "rustscale-netcheck",
+ "rustscale-tailcfg",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"

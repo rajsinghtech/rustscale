@@ -30,7 +30,7 @@ pub use stream::WatchIpnBus;
 
 use std::path::PathBuf;
 
-use rustscale_ipn::NotifyWatchOpt;
+use rustscale_ipn::{MaskedPrefs, NotifyWatchOpt, Prefs, StartOptions};
 use rustscale_tailcfg::DERPMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -146,9 +146,90 @@ impl LocalClient {
         Ok(WatchIpnBus::new(stream))
     }
 
+    /// POST /localapi/v0/start — applies prefs and triggers bootstrap.
+    pub async fn start(&self, options: &StartOptions) -> Result<(), LocalClientError> {
+        let body =
+            serde_json::to_vec(options).map_err(|e| LocalClientError::Json(e.to_string()))?;
+        let (_status, _) = self
+            .send_request_with_body("POST", "/localapi/v0/start", &body)
+            .await?;
+        Ok(())
+    }
+
+    /// POST /localapi/v0/login-interactive — triggers interactive login.
+    pub async fn login_interactive(&self) -> Result<(), LocalClientError> {
+        let (_status, _) = self
+            .send_request_with_body("POST", "/localapi/v0/login-interactive", &[])
+            .await?;
+        Ok(())
+    }
+
+    /// POST /localapi/v0/logout — logs out and disconnects.
+    pub async fn logout(&self) -> Result<(), LocalClientError> {
+        let (_status, _) = self
+            .send_request_with_body("POST", "/localapi/v0/logout", &[])
+            .await?;
+        Ok(())
+    }
+
+    /// PATCH /localapi/v0/prefs — applies masked prefs and returns the
+    /// updated prefs JSON.
+    pub async fn edit_prefs(
+        &self,
+        masked: &MaskedPrefs,
+    ) -> Result<serde_json::Value, LocalClientError> {
+        let body = serde_json::to_vec(masked).map_err(|e| LocalClientError::Json(e.to_string()))?;
+        let (_status, resp_body) = self
+            .send_request_with_body("PATCH", "/localapi/v0/prefs", &body)
+            .await?;
+        let json: serde_json::Value = serde_json::from_slice(&resp_body)
+            .map_err(|e| LocalClientError::Json(e.to_string()))?;
+        Ok(json)
+    }
+
+    /// GET /localapi/v0/prefs — returns typed prefs.
+    pub async fn get_prefs(&self) -> Result<Prefs, LocalClientError> {
+        let (_status, body) = self.send_request("GET", "/localapi/v0/prefs", &[]).await?;
+        let prefs: Prefs =
+            serde_json::from_slice(&body).map_err(|e| LocalClientError::Json(e.to_string()))?;
+        Ok(prefs)
+    }
+
     // -----------------------------------------------------------------------
     // Internal HTTP plumbing
     // -----------------------------------------------------------------------
+
+    /// Send an HTTP request with a body, read the full response, check the
+    /// status code, and return (status_code, body_bytes).
+    async fn send_request_with_body(
+        &self,
+        method: &str,
+        path: &str,
+        body: &[u8],
+    ) -> Result<(u16, Vec<u8>), LocalClientError> {
+        let std_conn = rustscale_safesocket::connect(&self.socket_path)
+            .map_err(|e| LocalClientError::Connect(e.to_string()))?;
+        let _ = std_conn.set_nonblocking(true);
+        let mut stream =
+            UnixStream::from_std(std_conn).map_err(|e| LocalClientError::Connect(e.to_string()))?;
+
+        let request = format!(
+            "{method} {path} HTTP/1.1\r\nHost: {LOCAL_API_HOST}\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(request.as_bytes()).await?;
+        if !body.is_empty() {
+            stream.write_all(body).await?;
+        }
+        stream.flush().await?;
+
+        let response = read_full_response(&mut stream).await?;
+        drop(stream);
+
+        check_status(response.status, &response.body)?;
+        Ok((response.status, response.body))
+    }
 
     /// Send a GET request and return the response body as a JSON value.
     /// Maps non-200 status codes to typed errors.

@@ -117,7 +117,12 @@ async fn dispatch(
         "netcheck" => commands::netcheck::run(args, &socket_path).await,
         "metrics" => commands::metrics::run(args, &socket_path).await,
         "health" => commands::health::run(args, &socket_path, json).await,
+        "up" => commands::up::run(args, &socket_path, json).await,
+        "login" => commands::login::run(args, &socket_path, json).await,
+        "logout" => commands::logout::run(args, &socket_path).await,
         "down" => commands::down::run(args, &socket_path).await,
+        "set" => commands::set::run(args, &socket_path).await,
+        "get" => commands::get::run(args, &socket_path).await,
         "ping" => commands::ping::run(args, &socket_path).await,
         other => {
             eprintln!("error: unknown subcommand '{other}'");
@@ -136,6 +141,12 @@ fn usage(bin: &str) {
     eprintln!("  --json             output in JSON format (where applicable)");
     eprintln!();
     eprintln!("subcommands:");
+    eprintln!("  up [flags]                          connect to Tailscale (interactive auth if no auth key)");
+    eprintln!("  login                               log in to Tailscale (interactive)");
+    eprintln!("  logout                              disconnect and log out");
+    eprintln!("  down                                disconnect from Tailscale");
+    eprintln!("  set [flags]                         set preferences");
+    eprintln!("  get                                 print preferences");
     eprintln!("  status [--peers=false] [--active]   show state of rustscaled and connections");
     eprintln!("  ip [-4] [-6] [peer]                 show Tailscale IP addresses");
     eprintln!("  version [--daemon]                  print client and daemon version");
@@ -143,9 +154,6 @@ fn usage(bin: &str) {
     eprintln!("  netcheck                            print network conditions analysis");
     eprintln!("  metrics                             print Prometheus-format metrics");
     eprintln!("  health                              print active health warnings");
-    eprintln!(
-        "  down                                disconnect from Tailscale (not yet supported)"
-    );
     eprintln!("  ping <ip>                           ping a peer (not yet supported)");
 }
 

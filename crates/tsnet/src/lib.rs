@@ -31,7 +31,7 @@
 mod acme;
 mod c2n;
 mod hostinfo;
-mod localapi;
+pub mod localapi;
 mod peerapi;
 mod routing;
 mod serve;
@@ -414,6 +414,7 @@ impl ServerBuilder {
         Ok(Server {
             config: self,
             inner: None,
+            pre_started: None,
         })
     }
 }
@@ -609,6 +610,21 @@ struct Bootstrap {
 pub struct Server {
     config: ServerBuilder,
     inner: Option<RunningState>,
+    pre_started: Option<PreStartedLocalApi>,
+}
+
+/// State from `start_localapi_only()` — used by `up()` to reuse the
+/// pre-started IpnBackend and login trigger, and to clean up the
+/// pre-started LocalAPI server.
+struct PreStartedLocalApi {
+    backend: Arc<IpnBackend>,
+    handle: Option<localapi::LocalApiHandle>,
+    login_trigger: Arc<tokio::sync::Notify>,
+    #[allow(dead_code)]
+    auth_url: Arc<std::sync::Mutex<Option<String>>>,
+    command_rx: Option<mpsc::UnboundedReceiver<localapi::DaemonCommand>>,
+    #[allow(dead_code)]
+    socket_path: PathBuf,
 }
 
 impl Server {
@@ -966,14 +982,7 @@ impl Server {
                 health: b.health.clone(),
                 dns_config: b.dns_config.clone(),
                 packet_drops: b.packet_drops.clone(),
-                prefs: serde_json::json!({
-                    "hostname": self.config.hostname,
-                    "control_url": self.config.control_url,
-                    "ephemeral": self.config.ephemeral,
-                    "advertise_routes": self.config.advertise_routes,
-                    "accept_routes": self.config.accept_routes,
-                    "advertise_exit_node": self.config.advertise_exit_node,
-                }),
+                prefs: Arc::new(RwLock::new(self.load_prefs().unwrap_or_default())),
                 tailscale_ips: b.tailscale_ips.clone(),
                 our_fqdn: b.our_fqdn.clone(),
                 hostname: self.config.hostname.clone(),
@@ -982,9 +991,18 @@ impl Server {
                 home_derp: b.home_derp,
                 ipn_backend: b.ipn_backend.clone(),
                 derp_map: b.derp_map.clone(),
+                command_tx: None,
+                state_dir: self.config.state_dir.clone(),
+                auth_url: Arc::new(std::sync::Mutex::new(None)),
+                login_trigger: Arc::new(tokio::sync::Notify::new()),
             };
             if let Some(h) = localapi::spawn_localapi(Arc::new(state), path.clone()) {
                 tasks.push(h.task);
+                if let Some(ref ps) = self.pre_started {
+                    if let Some(ref handle) = ps.handle {
+                        handle.task.abort();
+                    }
+                }
                 eprintln!("tsnet: LocalAPI listening at {}", path.display());
                 Some(h.socket_path)
             } else {
@@ -1258,14 +1276,7 @@ impl Server {
                 health: b.health.clone(),
                 dns_config: b.dns_config.clone(),
                 packet_drops: b.packet_drops.clone(),
-                prefs: serde_json::json!({
-                    "hostname": self.config.hostname,
-                    "control_url": self.config.control_url,
-                    "ephemeral": self.config.ephemeral,
-                    "advertise_routes": self.config.advertise_routes,
-                    "accept_routes": self.config.accept_routes,
-                    "advertise_exit_node": self.config.advertise_exit_node,
-                }),
+                prefs: Arc::new(RwLock::new(self.load_prefs().unwrap_or_default())),
                 tailscale_ips: b.tailscale_ips.clone(),
                 our_fqdn: b.our_fqdn.clone(),
                 hostname: self.config.hostname.clone(),
@@ -1274,9 +1285,18 @@ impl Server {
                 home_derp: b.home_derp,
                 ipn_backend: b.ipn_backend.clone(),
                 derp_map: b.derp_map.clone(),
+                command_tx: None,
+                state_dir: self.config.state_dir.clone(),
+                auth_url: Arc::new(std::sync::Mutex::new(None)),
+                login_trigger: Arc::new(tokio::sync::Notify::new()),
             };
             if let Some(h) = localapi::spawn_localapi(Arc::new(state), path.clone()) {
                 tasks.push(h.task);
+                if let Some(ref ps) = self.pre_started {
+                    if let Some(ref handle) = ps.handle {
+                        handle.task.abort();
+                    }
+                }
                 eprintln!("tsnet: LocalAPI listening at {}", path.display());
                 Some(h.socket_path)
             } else {
@@ -1358,6 +1378,130 @@ impl Server {
 
     // --- shared control-plane bootstrap ---
 
+    /// Load prefs from the state directory, or return default if not found.
+    fn load_prefs(&self) -> Result<rustscale_ipn::Prefs, TsnetError> {
+        if let Some(ref dir) = self.config.state_dir {
+            rustscale_ipn::Prefs::load(dir).map_err(|e| TsnetError::Builder(e.to_string()))
+        } else {
+            Ok(rustscale_ipn::Prefs::default())
+        }
+    }
+
+    /// Set the auth key after construction (used by the daemon when the CLI
+    /// provides it via `POST /start`).
+    pub fn set_auth_key(&mut self, key: impl Into<String>) {
+        self.config.auth_key = Some(key.into());
+    }
+
+    /// Start only the LocalAPI server without full bootstrap. Used by the
+    /// daemon when no auth key is available — the server enters NeedsLogin
+    /// state and waits for CLI-driven `up()` via `POST /start` or
+    /// `POST /login-interactive`.
+    ///
+    /// Returns a command receiver for the daemon to listen on, and the
+    /// login trigger Notify (used by `/login-interactive` to unblock
+    /// bootstrap's auth wait).
+    pub async fn start_localapi_only(
+        &mut self,
+    ) -> Result<mpsc::UnboundedReceiver<localapi::DaemonCommand>, TsnetError> {
+        let ipn_backend = Arc::new(IpnBackend::new("rustscale"));
+        ipn_backend.set_want_running();
+        ipn_backend.set_auth_cant_continue(true);
+
+        let state = self.load_or_create_state()?;
+        let was_fresh = state.is_zero();
+        let state = if was_fresh {
+            let s = PersistedState::generate();
+            self.save_state(&s)?;
+            s
+        } else {
+            state
+        };
+        ipn_backend.set_has_node_key(!state.is_zero());
+
+        let prefs = self.load_prefs().unwrap_or_default();
+        let prefs = Arc::new(RwLock::new(prefs));
+
+        let (command_tx, command_rx) = mpsc::unbounded_channel();
+        let login_trigger = Arc::new(tokio::sync::Notify::new());
+        let auth_url = Arc::new(std::sync::Mutex::new(None));
+
+        let magicsock = Arc::new(
+            Magicsock::new(MagicsockConfig {
+                private_key: state.node_key.clone(),
+                disco_key: state.disco_key.clone(),
+                derp_client: None,
+                derp_map: Some(DERPMap::default()),
+                home_derp_region: 0,
+                udp_bind: None,
+                udp_socket: None,
+                portmapper: None,
+                health: None,
+                disable_direct_paths: false,
+                peer_relay_server: false,
+                relay_server_config: None,
+            })
+            .await
+            .map_err(TsnetError::Magicsock)?,
+        );
+
+        let socket_path = if let Some(ref p) = self.config.localapi_path {
+            p.clone()
+        } else if let Some(ref dir) = self.config.state_dir {
+            localapi::default_socket_path(dir)
+        } else {
+            localapi::default_socket_path(&std::env::temp_dir().join("rustscale"))
+        };
+
+        let api_state = Arc::new(localapi::LocalApiState {
+            peers: Arc::new(RwLock::new(vec![])),
+            user_profiles: Arc::new(RwLock::new(BTreeMap::new())),
+            health: Tracker::new(),
+            dns_config: Arc::new(RwLock::new(None)),
+            packet_drops: Arc::new(AtomicU64::new(0)),
+            prefs: prefs.clone(),
+            tailscale_ips: vec![],
+            our_fqdn: String::new(),
+            hostname: self.config.hostname.clone(),
+            magicsock: magicsock.clone(),
+            tun_mode: false,
+            home_derp: 0,
+            ipn_backend: ipn_backend.clone(),
+            derp_map: DERPMap::default(),
+            command_tx: Some(command_tx),
+            state_dir: self.config.state_dir.clone(),
+            auth_url: auth_url.clone(),
+            login_trigger: login_trigger.clone(),
+        });
+
+        let handle = localapi::spawn_localapi(api_state, socket_path.clone());
+        if handle.is_some() {
+            eprintln!(
+                "tsnet: LocalAPI (needs-login) listening at {}",
+                socket_path.display()
+            );
+        } else {
+            eprintln!("tsnet: LocalAPI failed to bind {}", socket_path.display());
+        }
+
+        self.pre_started = Some(PreStartedLocalApi {
+            backend: ipn_backend,
+            handle,
+            login_trigger,
+            auth_url,
+            command_rx: Some(command_rx),
+            socket_path,
+        });
+
+        Ok(self
+            .pre_started
+            .as_mut()
+            .unwrap()
+            .command_rx
+            .take()
+            .unwrap())
+    }
+
     /// Shared bootstrapping for `up()` and `up_tun()`: load state, register
     /// with control, start the map long-poll, wait for the first `MapResponse`,
     /// netcheck for a home DERP, connect it, build magicsock + per-peer WG
@@ -1385,7 +1529,11 @@ impl Server {
         // IPN state machine backend. Created early so state transitions
         // are tracked from the start. Want_running is set immediately;
         // other inputs are set as bootstrap progresses.
-        let ipn_backend = Arc::new(IpnBackend::new("rustscale"));
+        let ipn_backend = if let Some(ref ps) = self.pre_started {
+            ps.backend.clone()
+        } else {
+            Arc::new(IpnBackend::new("rustscale"))
+        };
         ipn_backend.set_want_running();
 
         // 1. Load or generate persistent state.
@@ -1421,11 +1569,7 @@ impl Server {
                 })?;
 
         // 3. Register with the control plane.
-        let auth_key = self
-            .config
-            .auth_key
-            .as_ref()
-            .ok_or_else(|| TsnetError::Builder("auth_key is required".into()))?;
+        let auth_key = self.config.auth_key.clone().unwrap_or_default();
 
         let cc = ControlClient::new(
             self.config.control_url.clone(),
@@ -1437,9 +1581,13 @@ impl Server {
         let reg_req = RegisterRequest {
             Version: CAPABILITY_VERSION,
             NodeKey: node_pub.clone(),
-            Auth: Some(rustscale_tailcfg::RegisterResponseAuth {
-                AuthKey: auth_key.clone(),
-            }),
+            Auth: if auth_key.is_empty() {
+                None
+            } else {
+                Some(rustscale_tailcfg::RegisterResponseAuth {
+                    AuthKey: auth_key.clone(),
+                })
+            },
             Hostinfo: Some(Hostinfo {
                 OS: std::env::consts::OS.to_string(),
                 Hostname: self.config.hostname.clone(),
@@ -1490,20 +1638,65 @@ impl Server {
             ipn_backend.set_key_expired(true);
         }
 
-        if !reg_resp.AuthURL.is_empty() {
-            // Auth cannot proceed without human interaction. Emit a
-            // BrowseToURL notify and set auth_cant_continue so the state
-            // machine transitions to NeedsLogin.
+        if reg_resp.AuthURL.is_empty() {
+            ipn_backend.set_machine_authorized(reg_resp.MachineAuthorized);
+            ipn_backend.emit_login_finished();
+            state.node_id = reg_resp.User.ID;
+            self.save_state(&state)?;
+        } else {
             ipn_backend.set_auth_cant_continue(true);
             ipn_backend.emit_browse_to_url(&reg_resp.AuthURL);
-            return Err(TsnetError::AuthRequired(reg_resp.AuthURL));
-        }
 
-        // Register succeeded — machine is authorized, login is finished.
-        ipn_backend.set_machine_authorized(reg_resp.MachineAuthorized);
-        ipn_backend.emit_login_finished();
-        state.node_id = reg_resp.User.ID;
-        self.save_state(&state)?;
+            if let Some(ref ps) = self.pre_started {
+                {
+                    let mut au = ps.auth_url.lock().unwrap();
+                    *au = Some(reg_resp.AuthURL.clone());
+                }
+                ps.login_trigger.notified().await;
+                {
+                    let mut au = ps.auth_url.lock().unwrap();
+                    *au = None;
+                }
+                ipn_backend.set_auth_cant_continue(false);
+
+                let followup_req = RegisterRequest {
+                    Version: CAPABILITY_VERSION,
+                    NodeKey: node_pub.clone(),
+                    Followup: reg_resp.AuthURL.clone(),
+                    Hostinfo: Some(Hostinfo {
+                        OS: std::env::consts::OS.to_string(),
+                        Hostname: self.config.hostname.clone(),
+                        RoutableIPs: advertise.clone(),
+                        PeerRelay: self.config.peer_relay_server,
+                        ..Default::default()
+                    }),
+                    Ephemeral: self.config.ephemeral,
+                    ..Default::default()
+                };
+                let followup_resp = cc.register(&followup_req).await.map_err(|e| {
+                    if let Some(ref dir) = self.config.state_dir {
+                        PersistedState::clear_netmap(dir);
+                    }
+                    ipn_backend.emit_err_message(e.to_string());
+                    TsnetError::Register(e)
+                })?;
+
+                if followup_resp.Error.is_empty() {
+                    ipn_backend.set_machine_authorized(followup_resp.MachineAuthorized);
+                    ipn_backend.emit_login_finished();
+                    state.node_id = followup_resp.User.ID;
+                    self.save_state(&state)?;
+                } else {
+                    ipn_backend.emit_err_message(&followup_resp.Error);
+                    return Err(TsnetError::Builder(format!(
+                        "control register (followup) rejected: {}",
+                        followup_resp.Error
+                    )));
+                }
+            } else {
+                return Err(TsnetError::AuthRequired(reg_resp.AuthURL));
+            }
+        }
 
         // 3b. Bind the UDP socket early so we can gather local interface
         // endpoints (interface IP + bound port) and advertise them in the

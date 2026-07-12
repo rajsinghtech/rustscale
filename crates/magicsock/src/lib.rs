@@ -168,7 +168,7 @@ pub struct Magicsock {
 }
 
 struct Inner {
-    node_public: NodePublic,
+    node_public: RwLock<NodePublic>,
     disco: DiscoIo,
     udp: Option<Arc<UdpSocket>>,
     local_udp_addrs: RwLock<Vec<String>>,
@@ -577,7 +577,7 @@ impl Magicsock {
         };
 
         let inner = Arc::new(Inner {
-            node_public,
+            node_public: RwLock::new(node_public),
             disco,
             udp,
             local_udp_addrs: RwLock::new(local_udp_addrs),
@@ -616,7 +616,25 @@ impl Magicsock {
 
     /// Our node public key.
     pub fn node_public(&self) -> NodePublic {
-        self.inner.node_public.clone()
+        self.inner
+            .node_public
+            .read()
+            .expect("node_public lock poisoned")
+            .clone()
+    }
+
+    /// Update the node private key after a key rotation. Updates the
+    /// stored node public key so subsequent disco messages, relay
+    /// negotiations, and netmap self-checks use the new identity.
+    /// Existing WG tunnels should be cleared and recreated separately
+    /// to pick up the new key.
+    pub fn set_node_key(&self, new_key: &NodePrivate) {
+        let new_pub = new_key.public();
+        *self
+            .inner
+            .node_public
+            .write()
+            .expect("node_public lock poisoned") = new_pub;
     }
 
     /// Our disco public key.
@@ -844,7 +862,12 @@ impl Magicsock {
         {
             let servers = relay_manager::discover_relay_servers(
                 &rustscale_tailcfg::Node {
-                    Key: self.inner.node_public.clone(),
+                    Key: self
+                        .inner
+                        .node_public
+                        .read()
+                        .expect("node_public lock poisoned")
+                        .clone(),
                     DiscoKey: self.inner.disco.public(),
                     Cap: rustscale_tailcfg::CAP_VERSION_RELAY,
                     ..Default::default()
@@ -1434,7 +1457,10 @@ impl relay_manager::RelayManagerContext for Inner {
     }
 
     fn our_node_public(&self) -> NodePublic {
-        self.node_public.clone()
+        self.node_public
+            .read()
+            .expect("node_public lock poisoned")
+            .clone()
     }
 
     fn peer_disco_key(&self, peer_key: &NodePublic) -> Option<DiscoPublic> {
@@ -1481,7 +1507,7 @@ impl relay_manager::RelayManagerContext for Inner {
     }
 
     fn is_self_node(&self, node_key: &NodePublic) -> bool {
-        node_key == &self.node_public
+        *node_key == *self.node_public.read().expect("node_public lock poisoned")
     }
 
     fn handle_self_alloc_request(
@@ -1538,7 +1564,11 @@ impl Inner {
 
             let ping = Message::Ping(Ping {
                 tx_id,
-                node_key: self.node_public.clone(),
+                node_key: self
+                    .node_public
+                    .read()
+                    .expect("node_public lock poisoned")
+                    .clone(),
                 padding,
             });
             if let Some(packet) = self.disco.seal(peer_disco, &ping) {

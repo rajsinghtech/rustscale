@@ -2282,6 +2282,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustscale-neterror"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "rustscale-netmon"
 version = "0.1.0"
 dependencies = [

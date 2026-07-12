@@ -130,6 +130,20 @@ pub fn populate_hostinfo(mut hi: Hostinfo) -> Hostinfo {
         hi.Cloud = cloud_detection().to_string();
     }
 
+    // tsnet always runs in userspace (netstack) mode — there is no kernel
+    // WireGuard path. Mirrors Go's `Hostinfo.Userspace` set in
+    // `ipn/ipnlocal/local.go` when `b.sys.NetMon` is nil and netstack is
+    // used.
+    if hi.Userspace.is_unset() {
+        hi.Userspace = OptBool::True;
+    }
+
+    // GoArchVar: the architecture variant (GOARM, GOAMD64, ...). Rust
+    // doesn't have an exact equivalent; we map the common targets.
+    if hi.GoArchVar.is_empty() {
+        hi.GoArchVar = arch_variant().to_string();
+    }
+
     hi
 }
 
@@ -203,34 +217,64 @@ pub fn shared_overrides() -> SharedOverrides {
 
 // ─── Runtime field population ─────────────────────────────────────────
 
+/// Runtime-derived Hostinfo fields that platform detection cannot determine
+/// on its own. Bundled into a struct so `collect_hostinfo` / `apply_runtime_fields`
+/// signatures stay manageable as more fields are wired in. Mirrors the
+/// scattered `ipn/ipnlocal/local.go` hostinfo-building path in Go, where
+/// prefs, serve config, and builder config all contribute fields.
+#[derive(Clone, Debug, Default)]
+pub struct RuntimeHostinfo {
+    /// The StableNodeID of the currently selected exit node (empty/None = none).
+    pub exit_node_id: Option<StableNodeID>,
+    /// `true` when a Funnel listener is active (any `AllowFunnel` in serve config).
+    pub ingress_enabled: bool,
+    /// `true` when the host is blocking incoming connections (from `Prefs.ShieldsUp`).
+    pub shields_up: bool,
+    /// `true` when the app-connector service is advertised (from `Prefs.AppConnector.Advertise`).
+    pub app_connector: bool,
+    /// ACL tags this node wants to claim (from builder `advertise_tags` / prefs).
+    pub request_tags: Vec<String>,
+    /// SSH host keys advertised by this node (if SSH server is enabled).
+    pub ssh_host_keys: Vec<String>,
+    /// `true` when the node has opted out of logs/support (from `Prefs.NoLogsNoSupport`).
+    pub no_logs_no_support: bool,
+    /// `true` when the node allows admin-console-driven remote updates.
+    pub allows_update: bool,
+    /// `true` when this node exists in netmap because it's owned by a shared-to user.
+    pub sharee_node: bool,
+}
+
 /// Apply tsnet-runtime fields to a `Hostinfo` that platform detection
-/// cannot determine on its own:
-///
-/// - `ExitNodeID`: the StableNodeID of the currently selected exit node,
-///   looked up from the peer list by node key. Empty when no exit node is
-///   selected or the peer is not found.
-/// - `IngressEnabled`: `true` when a Funnel listener is active (any
-///   `AllowFunnel` entry in the serve config is `true`).
-/// - `ShieldsUp`: set from `Prefs.ShieldsUp` so the control plane knows
-///   whether to block inbound connections. Mirrors Go's
-///   `ipn/ipnlocal/local.go` hostinfo building path.
+/// cannot determine on its own. See [`RuntimeHostinfo`] for field
+/// descriptions.
 ///
 /// Device-specific fields (`PushDeviceToken`, `TPM`, `StateEncrypted`) are
 /// left at their defaults — they require platform APIs not available in the
 /// tsnet embedding layer.
-pub fn apply_runtime_fields(
-    hi: &mut Hostinfo,
-    exit_node_id: Option<&StableNodeID>,
-    ingress_enabled: bool,
-    shields_up: bool,
-) {
-    if let Some(id) = exit_node_id {
+/// TODO: `Userspace` / `UserspaceRouter` should be set from the tsnet
+/// builder config (netstack mode is always userspace in tsnet).
+/// TODO: `WireIngress` should be set when Funnel is configured but not
+/// yet active (see Go's `Hostinfo.WireIngress` logic).
+pub fn apply_runtime_fields(hi: &mut Hostinfo, rt: &RuntimeHostinfo) {
+    if let Some(ref id) = rt.exit_node_id {
         if !id.is_empty() {
             hi.ExitNodeID.clone_from(id);
         }
     }
-    hi.IngressEnabled = ingress_enabled;
-    hi.ShieldsUp = shields_up;
+    hi.IngressEnabled = rt.ingress_enabled;
+    hi.ShieldsUp = rt.shields_up;
+    if rt.app_connector {
+        hi.AppConnector = OptBool::True;
+    }
+    if !rt.request_tags.is_empty() {
+        hi.RequestTags.clone_from(&rt.request_tags);
+    }
+    if !rt.ssh_host_keys.is_empty() {
+        hi.SSH_HostKeys.clone_from(&rt.ssh_host_keys);
+    }
+    hi.NoLogsNoSupport = rt.no_logs_no_support;
+    hi.AllowsUpdate = rt.allows_update;
+    hi.ShareeNode = rt.sharee_node;
 }
 
 /// Collect a full `Hostinfo`: apply overrides, run platform detection, then
@@ -240,14 +284,12 @@ pub fn apply_runtime_fields(
 pub fn collect_hostinfo(
     base: Hostinfo,
     overrides: &HostinfoOverrides,
-    exit_node_id: Option<&StableNodeID>,
-    ingress_enabled: bool,
-    shields_up: bool,
+    rt: &RuntimeHostinfo,
 ) -> Hostinfo {
     let mut hi = base;
     overrides.apply(&mut hi);
     hi = populate_hostinfo(hi);
-    apply_runtime_fields(&mut hi, exit_node_id, ingress_enabled, shields_up);
+    apply_runtime_fields(&mut hi, rt);
     run_hostinfo_hooks(&mut hi);
     hi
 }
@@ -344,6 +386,52 @@ fn arch_machine() -> String {
         "aarch64" => "arm64".to_string(),
         "x86_64" => "amd64".to_string(),
         other => other.to_string(),
+    }
+}
+
+/// Detect the architecture variant (analogous to Go's GOARM, GOAMD64, etc.).
+/// Rust doesn't expose this at compile time; we infer from the target triple
+/// via `cfg!` macros. Returns an empty string when no variant applies.
+fn arch_variant() -> &'static str {
+    // GOAMD64 variants (v1–v4). Rust's x86_64 targets don't expose the
+    // microarchitecture level, so we report v1 (baseline).
+    if cfg!(target_arch = "x86_64") {
+        "v1"
+    } else if cfg!(target_arch = "aarch64") {
+        // GOARM equivalent for arm64 — Rust doesn't distinguish ARMv8
+        // versions at the target level.
+        ""
+    } else if cfg!(target_arch = "arm") {
+        // GOARM: 5, 6, or 7. Rust's arm targets default to ARMv6 (GOARM=6).
+        "6"
+    } else {
+        ""
+    }
+}
+
+/// Best-effort container ID extraction. On Linux, reads the hostname from
+/// `/etc/hostname` or the cgroup path — Docker sets the hostname to the
+/// short container ID (12 hex chars). Returns `None` if not in a container
+/// or the ID can't be determined.
+/// TODO: On non-Linux or non-container environments, this always returns
+/// None. Go reads `/proc/self/cgroup` for the full container ID.
+#[allow(dead_code)]
+fn container_id() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        if container_detection_cached() != OptBool::True {
+            return None;
+        }
+        // Docker sets the hostname to the first 12 hex chars of the
+        // container ID. This is a heuristic — not all container runtimes
+        // do this.
+        std::env::var("HOSTNAME")
+            .ok()
+            .filter(|h| h.len() == 12 && h.chars().all(|c| c.is_ascii_hexdigit()))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
     }
 }
 
@@ -1518,7 +1606,7 @@ VERSION_ID='11'"#;
             ..Default::default()
         };
         let ov = HostinfoOverrides::default();
-        let hi = collect_hostinfo(base, &ov, None, false, false);
+        let hi = collect_hostinfo(base, &ov, &RuntimeHostinfo::default());
         // Our hook should have added the unique tag.
         assert!(hi
             .RequestTags
@@ -1550,7 +1638,7 @@ VERSION_ID='11'"#;
             ..Default::default()
         };
         let ov = HostinfoOverrides::default();
-        let hi = collect_hostinfo(base, &ov, None, false, false);
+        let hi = collect_hostinfo(base, &ov, &RuntimeHostinfo::default());
         // If hooks ran in registration order, PushDeviceToken == m1 and
         // DeviceModel == m2. If hook-2 ran before hook-1, DeviceModel
         // would NOT be m2.
@@ -1736,7 +1824,7 @@ VERSION_ID='11'"#;
             ..Default::default()
         };
         let ov = HostinfoOverrides::default();
-        let hi = collect_hostinfo(hi, &ov, None, false, false);
+        let hi = collect_hostinfo(hi, &ov, &RuntimeHostinfo::default());
         // No override → detection fills in the field.
         assert_eq!(hi.Package, "tsnet");
     }
@@ -1876,8 +1964,13 @@ VERSION_ID='11'"#;
             device_model: Some("Synology DS920+".into()),
             ..Default::default()
         };
-        let exit_id: StableNodeID = "nodeExit42".into();
-        let hi = collect_hostinfo(base, &ov, Some(&exit_id), true, false);
+        let rt = RuntimeHostinfo {
+            exit_node_id: Some("nodeExit42".into()),
+            ingress_enabled: true,
+            shields_up: false,
+            ..Default::default()
+        };
+        let hi = collect_hostinfo(base, &ov, &rt);
         assert_eq!(hi.DeviceModel, "Synology DS920+");
         assert_eq!(hi.ExitNodeID, "nodeExit42");
         assert!(hi.IngressEnabled);
@@ -1889,14 +1982,18 @@ VERSION_ID='11'"#;
     #[test]
     fn test_apply_runtime_fields_shields_up() {
         let mut hi = Hostinfo::default();
-        apply_runtime_fields(&mut hi, None, false, true);
+        let rt = RuntimeHostinfo {
+            shields_up: true,
+            ..Default::default()
+        };
+        apply_runtime_fields(&mut hi, &rt);
         assert!(hi.ShieldsUp);
     }
 
     #[test]
     fn test_apply_runtime_fields_shields_down() {
         let mut hi = Hostinfo::default();
-        apply_runtime_fields(&mut hi, None, false, false);
+        apply_runtime_fields(&mut hi, &RuntimeHostinfo::default());
         assert!(!hi.ShieldsUp);
     }
 
@@ -1907,7 +2004,38 @@ VERSION_ID='11'"#;
             ..Default::default()
         };
         let ov = HostinfoOverrides::default();
-        let hi = collect_hostinfo(base, &ov, None, false, true);
+        let rt = RuntimeHostinfo {
+            shields_up: true,
+            ..Default::default()
+        };
+        let hi = collect_hostinfo(base, &ov, &rt);
         assert!(hi.ShieldsUp);
+    }
+
+    #[test]
+    fn test_apply_runtime_fields_app_connector_and_tags() {
+        let mut hi = Hostinfo::default();
+        let rt = RuntimeHostinfo {
+            app_connector: true,
+            request_tags: vec!["tag:web".into(), "tag:server".into()],
+            ssh_host_keys: vec!["ssh-ed25519 AAAA...".into()],
+            no_logs_no_support: true,
+            ..Default::default()
+        };
+        apply_runtime_fields(&mut hi, &rt);
+        assert_eq!(hi.AppConnector, OptBool::True);
+        assert_eq!(hi.RequestTags, vec!["tag:web", "tag:server"]);
+        assert_eq!(hi.SSH_HostKeys, vec!["ssh-ed25519 AAAA..."]);
+        assert!(hi.NoLogsNoSupport);
+    }
+
+    #[test]
+    fn test_populate_hostinfo_userspace_and_goarchvar() {
+        let hi = populate_hostinfo(Hostinfo::default());
+        assert_eq!(hi.Userspace, OptBool::True);
+        // GoArchVar should be set on x86_64/aarch64/arm.
+        if cfg!(target_arch = "x86_64") {
+            assert_eq!(hi.GoArchVar, "v1");
+        }
     }
 }

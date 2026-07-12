@@ -271,22 +271,26 @@ pub(crate) fn spawn_hostinfo_update_loop(
             };
 
             // Apply overrides + platform detection + runtime fields.
-            // Read ShieldsUp from prefs so the control plane knows whether
-            // to block inbound connections. Mirrors Go's hostinfo building
-            // in ipn/ipnlocal/local.go.
-            let shields_up = state_dir
+            // Read prefs so the control plane knows about ShieldsUp,
+            // AppConnector, tags, and other pref-driven hostinfo fields.
+            // Mirrors Go's hostinfo building in ipn/ipnlocal/local.go.
+            let prefs = state_dir
                 .as_ref()
                 .and_then(|d| rustscale_ipn::Prefs::load(d).ok())
-                .map(|p| p.ShieldsUp)
-                .unwrap_or(false);
-            let ov = overrides.read().await.clone();
-            let hi = collect_hostinfo(
-                base,
-                &ov,
-                exit_node_id.as_ref(),
+                .unwrap_or_default();
+            let rt = RuntimeHostinfo {
+                exit_node_id: exit_node_id.clone(),
                 ingress_enabled,
-                shields_up,
-            );
+                shields_up: prefs.ShieldsUp,
+                app_connector: prefs.AppConnector.Advertise,
+                request_tags: prefs.AdvertiseTags.clone(),
+                no_logs_no_support: false,
+                allows_update: prefs.AutoUpdate.unwrap_or(false),
+                sharee_node: false,
+                ssh_host_keys: Vec::new(),
+            };
+            let ov = overrides.read().await.clone();
+            let hi = collect_hostinfo(base, &ov, &rt);
 
             let hash = hostinfo_hash(&hi);
             if hash != last_hash {

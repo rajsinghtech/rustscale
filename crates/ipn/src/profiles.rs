@@ -664,7 +664,7 @@ mod tests {
         pm.new_profile("test").unwrap();
         hook_fired.store(false, std::sync::atomic::Ordering::SeqCst);
 
-        let mut prefs = Prefs {
+        let prefs = Prefs {
             WantRunning: true,
             ..Default::default()
         };

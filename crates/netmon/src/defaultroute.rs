@@ -13,7 +13,9 @@
 #![allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::IpAddr;
+#[cfg(target_os = "macos")]
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 /// `NET_RT_DUMP2` sysctl mib value — not in the `libc` crate.
 /// Defined in macOS `<sys/socket.h>` as 7.
@@ -28,8 +30,8 @@ const NET_RT_DUMP2: libc::c_int = 7;
 const SIOCGIFDELEGATE: libc::c_ulong = 0xc020699d;
 
 /// `RTF_IFSCOPE` — route is scoped to a specific interface. Already in
-/// the `libc` crate on macOS but declared here for documentation and for
-/// non-macOS builds that reference `is_default_gateway` in tests.
+/// the `libc` crate on macOS but declared here for documentation.
+#[cfg(target_os = "macos")]
 const RTF_IFSCOPE: libc::c_int = 0x1000000;
 
 /// Size of `rt_msghdr` / `rt_msghdr2` on darwin (from Go's `route` package:
@@ -38,22 +40,29 @@ const RTF_IFSCOPE: libc::c_int = 0x1000000;
 const RT_MSGHDR_SIZE: usize = 0x5c;
 
 /// `sizeof(struct sockaddr_in)` on darwin.
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 const SOCKADDR_IN_SIZE: u8 = 16;
 
 /// `sizeof(struct sockaddr_in6)` on darwin.
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 const SOCKADDR_IN6_SIZE: u8 = 28;
 
 /// RTAX slot indices in the `rtm_addrs` bitmask.
+#[cfg(target_os = "macos")]
 const RTAX_DST: usize = 0;
+#[cfg(target_os = "macos")]
 const RTAX_GATEWAY: usize = 1;
+#[cfg(target_os = "macos")]
 const RTAX_NETMASK: usize = 2;
+#[cfg(target_os = "macos")]
 const RTAX_MAX: usize = 8;
 
-/// Address families used in sockaddr parsing.
+/// Address families used in sockaddr parsing (darwin routing table).
+#[cfg(target_os = "macos")]
 const AF_INET: u8 = libc::AF_INET as u8;
+#[cfg(target_os = "macos")]
 const AF_INET6: u8 = libc::AF_INET6 as u8;
+#[cfg(target_os = "macos")]
 const AF_LINK: u8 = libc::AF_LINK as u8;
 
 /// Look up the interface index owning the default route.
@@ -112,6 +121,7 @@ struct ParsedRoute {
 
 /// A parsed sockaddr from a route message.
 #[derive(Clone, Copy, Debug)]
+#[cfg(target_os = "macos")]
 enum SockAddr {
     Inet4(Ipv4Addr),
     Inet6(Ipv6Addr),
@@ -248,7 +258,7 @@ fn parse_default_gateway(_buf: &[u8]) -> io::Result<ParsedRoute> {
 }
 
 // ---------------------------------------------------------------------------
-// Sockaddr parsing (shared, platform-independent — used by tests too)
+// Sockaddr parsing (darwin only — used by parse_default_gateway and tests)
 // ---------------------------------------------------------------------------
 
 /// Parse the sockaddr array following the `rtm_addrs` bitmask.
@@ -256,6 +266,7 @@ fn parse_default_gateway(_buf: &[u8]) -> io::Result<ParsedRoute> {
 /// Each bit `i` in `rtm_addrs` indicates whether the address at `RTAX_*`
 /// slot `i` is present. Present addresses are packed sequentially in
 /// `buf`, each aligned to 4 bytes on darwin (`kernelAlign = 4`).
+#[cfg(target_os = "macos")]
 fn parse_sockaddrs(buf: &[u8], rtm_addrs: i32) -> Vec<Option<SockAddr>> {
     let mut result = vec![None; RTAX_MAX];
     let mut offset = 0;
@@ -292,6 +303,7 @@ fn parse_sockaddrs(buf: &[u8], rtm_addrs: i32) -> Vec<Option<SockAddr>> {
 }
 
 /// Parse a single sockaddr from the buffer.
+#[cfg(target_os = "macos")]
 fn parse_sockaddr(
     buf: &[u8],
     sa_len: u8,
@@ -326,6 +338,7 @@ fn parse_sockaddr(
 /// Parse an IPv4 sockaddr. The IP address is at bytes 4-7.
 /// If `sa_len` is 0 or < 5, the IP is all-zeros (kernel filler for
 /// default mask).
+#[cfg(target_os = "macos")]
 fn parse_inet4(buf: &[u8], sa_len: u8) -> Option<SockAddr> {
     if sa_len == 0 {
         return Some(SockAddr::Inet4(Ipv4Addr::UNSPECIFIED));
@@ -340,6 +353,7 @@ fn parse_inet4(buf: &[u8], sa_len: u8) -> Option<SockAddr> {
 
 /// Parse an IPv6 sockaddr. The IP address is at bytes 8-23.
 /// If `sa_len` is 0 or < 9, the IP is all-zeros.
+#[cfg(target_os = "macos")]
 fn parse_inet6(buf: &[u8], sa_len: u8) -> Option<SockAddr> {
     if sa_len == 0 {
         return Some(SockAddr::Inet6(Ipv6Addr::UNSPECIFIED));
@@ -356,6 +370,7 @@ fn parse_inet6(buf: &[u8], sa_len: u8) -> Option<SockAddr> {
 ///
 /// Mirrors Go's `isDefaultGateway`: `RTF_GATEWAY` set, `RTF_IFSCOPE` not
 /// set, destination is `0.0.0.0/0` (v4) or `::/0` (v6).
+#[cfg(target_os = "macos")]
 fn is_default_gateway(flags: i32, addrs: &[Option<SockAddr>]) -> bool {
     if (flags & libc::RTF_GATEWAY) == 0 {
         return false;
@@ -387,6 +402,7 @@ fn is_default_gateway(flags: i32, addrs: &[Option<SockAddr>]) -> bool {
 ///
 /// Matches Go's `strings.HasPrefix(ifName, "utun")` from
 /// `interfaces_darwin.go`.
+#[cfg(target_os = "macos")]
 fn is_utun_name(name: &str) -> bool {
     name.starts_with("utun")
 }
@@ -456,5 +472,5 @@ fn get_delegated_interface(_if_index: u32) -> io::Result<u32> {
 // Tests
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod tests;

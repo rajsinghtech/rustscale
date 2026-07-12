@@ -848,7 +848,7 @@ fn build_metrics_text(state: &LocalApiState) -> String {
     use std::fmt::Write;
 
     let drops = state.packet_drops.load(Ordering::Relaxed);
-    let peer_count = state.peers.try_read().map(|p| p.len()).unwrap_or(0);
+    let peer_count = state.peers.try_read().map_or(0, |p| p.len());
     let warnings = state.health.current_warnings();
     let high = warnings
         .iter()

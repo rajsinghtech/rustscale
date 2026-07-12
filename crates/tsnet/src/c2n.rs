@@ -139,7 +139,7 @@ impl C2nBackend for TsnetC2nBackend {
     async fn metrics_text(&self) -> Option<String> {
         use std::fmt::Write;
         let drops = self.packet_drops.load(Ordering::Relaxed);
-        let peer_count = self.peers.try_read().map(|p| p.len()).unwrap_or(0);
+        let peer_count = self.peers.try_read().map_or(0, |p| p.len());
         let warnings = self.health.current_warnings();
         let high = warnings
             .iter()

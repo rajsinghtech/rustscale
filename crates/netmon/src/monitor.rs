@@ -24,7 +24,7 @@ const WALL_TICK: Duration = Duration::from_secs(15);
 /// Minimum wall-clock elapsed time to treat as a *major* time jump
 /// (sleep wake), requiring socket rebinding. Matches Go's
 /// `majorTimeJumpThreshold = 10 * time.Minute`.
-pub(crate) const MAJOR_TIME_JUMP_THRESHOLD: Duration = Duration::from_secs(10 * 60);
+pub(crate) const MAJOR_TIME_JUMP_THRESHOLD: Duration = Duration::from_mins(10);
 
 /// Tolerance for monotonic-vs-wall-clock scheduling jitter. If the wall
 /// clock advances more than `monotonic_elapsed + TIME_JUMP_TOLERANCE`,

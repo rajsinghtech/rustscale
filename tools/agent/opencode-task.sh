@@ -194,28 +194,37 @@ while :; do
   if (( ELAPSED > DEADLINE )); then
     echo "[harness] DEADLINE ${DEADLINE}s exceeded — aborting session" >&2
     curl -sS --max-time 5 -o /dev/null -X POST "$URL/session/$SID/abort?directory=$DIR" || true
+    echo "##STATUS:ABORTED watchdog=$DEADLINE" >&2
     echo "$SID"
     exit 3
   fi
 done
 
 # 4. Harvest final assistant output: text if present, tool summary otherwise.
-echo "[harness] done in $(( $(date +%s) - START ))s; session $SID" >&2
-curl -s --max-time 10 "$URL/session/$SID/message?directory=$DIR" | jq -r '
+DURATION=$(( $(date +%s) - START ))
+echo "[harness] done in ${DURATION}s; session $SID" >&2
+OUTPUT=$(curl -s --max-time 10 "$URL/session/$SID/message?directory=$DIR" | jq -r '
   [.[] | select(.info.role=="assistant")] | last
-  | if . == null then "(no assistant message produced — session may have aborted)"
+  | if . == null then "STUCK:empty_session"
     else
       ([.parts[]? | select(.type=="text") | .text] | join(""))
       |
       if length > 0 then .
       else
         ([.parts[]? | select(.type=="tool" or .type=="tool_use") | .state?.input?.filePath // .state?.input?.command // (.name // .tool) ] | join("; "))
-        | if length > 0 then "(no text; tool calls: " + . + ")" else "(no output — session may have aborted)" end
+        | if length > 0 then "STUCK:tools_only:" + . else "STUCK:no_output" end
       end
-    end'
+    end')
+if [[ "$OUTPUT" == STUCK:* ]]; then
+  echo "##STATUS:STUCK session=$SID duration=${DURATION}s detail=$OUTPUT" >&2
+else
+  echo "##STATUS:DONE session=$SID duration=${DURATION}s" >&2
+fi
+echo "$OUTPUT"
 
 # 5. On success with --worktree, print merge instructions.
 if [[ -n "$WORKTREE" ]]; then
+  echo "##STATUS:WORKTREE path=$WT_DIR branch=$WT_BRANCH" >&2
   echo "[harness] worktree: $WT_DIR  branch: $WT_BRANCH" >&2
   echo "[harness] run tools/agent/worktree-merge.sh \"$TITLE\" to verify and merge" >&2
 fi

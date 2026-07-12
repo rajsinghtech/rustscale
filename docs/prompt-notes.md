@@ -481,3 +481,102 @@ analysis to produce a unified fix set.
   foreground-only, and CI-helper instructions.
 - **Next**: split `tsnet/src/lib.rs` into modules (agent task). Write a
   foundational-phase spec template with type signatures.
+
+## 2026-07-12: Six unmerged worktrees found — branch/worktree lifecycle gaps
+
+**Symptom**: 6 git worktrees left behind on disk. 5 had already been merged
+into master (HEAD is ancestor of master) but the worktree directories were
+never cleaned up. 1 (fix-wire-compat) had an unmerged commit stuck behind a
+merge conflict (3 tsnet files). Plus 2 orphaned directories (final-p1-batch,
+phase-ipn-bus).
+
+**Root cause**: The orchestrator runs `git merge agent/<branch>` directly
+instead of calling `worktree-merge.sh`, which would clean up the worktree
+after a successful merge. The merge script was designed for this but the
+orchestrator bypassed it. For `fix-wire-compat`, the merge failed on tsnet
+conflicts and the existing script only auto-resolved Cargo.lock.
+
+**Fix**:
+1. `tools/worktree-status.sh` — one-shot overview (human, JSON, porcelain)
+   showing all worktrees, branches, dirty state, ahead/behind master, and
+   whether each branch is merged. Orchestrator runs this before any merge
+   step to decide what needs attention.
+2. `worktree-merge.sh` now auto-resolves .rs file conflicts via union-merge
+   (safe for disjoint-feature agents), not just Cargo.lock. On failure it
+   prints the exact remaining conflict files and resolution commands.
+3. Both scripts emit `##STATUS:` lines for machine parsing.
+
+### 2026-07-12: Duplicate/retry session diagnostic (16 sessions inspected)
+
+**Symptom**: `ipn-store-trait` ran 4 times in 5 minutes (sessions at 4:06,
+4:08, 4:09, 4:13 PM). `cli-wait-lock-drive` ran 3 times (4:23, 4:24, 4:32 PM).
+
+**Root cause**: Export of those sessions shows they are ALMOST EMPTY —
+1-2 messages, only "user" role, 134 chars of text. The prompt was admitted
+to the server (204 response) but the model never produced an assistant
+response. The server's `/session/status` endpoint returned busy→idle without
+the model ever emitting tool calls or text. This is a server-side stall:
+the prompt was accepted into the queue but the model process never started,
+or started and crashed silently.
+
+**Not the same as the empty-first-turn bug** (2026-07-11 entry above): that
+fix was about the harness falsely re-prompting working agents. This is the
+model not starting at all — a complete no-response.
+
+**Fix**: Retries don't help if the server is in a bad state. The orchestrator
+should:
+1. Before retrying a session that produced zero messages, restart the opencode
+   server (`pkill -f "opencode serve"` then let the harness auto-start a new
+   one).
+2. Only retry once; if the second attempt also produces zero messages, report
+   the session ID and stop. Report to orchestrator.
+3. The harness's `##STATUS:STUCK` line makes this detectable — the orchestrator
+   can grep for `STUCK` before deciding to retry.
+
+### 2026-07-12: Model tiering rule — deepseek for research, glm-5.2 for coding
+
+Starting now, all non-implementation passes use `deepseek/deepseek-v4-flash`
+for token efficiency (free, unlimited). glm-5.2 is reserved for implementation
+code only.
+
+GLM-5.2 prompts MUST be self-contained — the agent should not need to
+rediscover tooling conventions, go-find patterns, or porting-notes facts
+mid-session. The deepseek research pass should pre-digest everything the
+glm agent will need into the prompt body.
+
+How deepseek passes feed glm passes:
+1. deepseek reads the Go source, reads porting-notes, reads existing crate
+   code, and writes a distilled "spec prompt" for the glm agent.
+2. The spec prompt includes: exact file paths, type signatures, crate entry
+   APIs, gotchas, and the complete acceptance criteria.
+3. The orchestrator launches the glm agent with this self-contained prompt.
+   The glm agent should not need to re-read Go files or explore the registry.
+
+### 2026-07-12: Always-end-merged-or-report rule
+
+Every agent session that produces code must end with one of:
+- **Merged**: Orchestrator ran `worktree-merge.sh` and it succeeded
+  (`##STATUS:MERGED`).
+- **Reported**: Worktree left behind with a reason (`##STATUS:FAILED`). The
+  orchestrator adds the session ID and failure reason to a tracking issue
+  or report.
+
+The orchestrator MUST NOT start the next phase until the previous phase's
+worktree is either merged or reported. This prevents the accumulation of
+"zombie worktrees" that consume disk space and mental overhead.
+
+The `tools/worktree-status.sh` tool run before any new phase launch reveals
+lingering worktrees. If the count exceeds 1, the orchestrator stops and
+resolves first.
+
+### 2026-07-12: Worktree cleanup after merge
+
+After a successful `git merge` (whether via `worktree-merge.sh` or manual),
+the orchestrator MUST also clean up the worktree directory and branch:
+```bash
+git worktree remove .worktrees/<title>
+git branch -d agent/<title>
+```
+This is built into `worktree-merge.sh` but when merging directly, the
+orchestrator must remember it. The `worktree-status.sh --porcelain` output
+shows which worktrees have `merged:true` — those are candidates for cleanup.

@@ -78,3 +78,23 @@ tools/agent/opencode-task.sh "phase-10-whois" "<prompt>"
 - Keep each helper under ~50 lines; no new dependencies.
 - End your run with a short summary: what you changed, and the top 3 token sinks you
   found with estimated savings.
+
+## Always start with `tools/worktree-status.sh`
+
+Before doing anything else, run `tools/worktree-status.sh` to see the current state
+of worktrees. If there are unmerged worktrees (merged=no), report them before
+proceeding with tooling improvements. Accumulated zombie worktrees are themselves
+a token-waste problem (they confuse future orchestrators).
+
+## Check for harness DONE/STUCK/ABORTED patterns
+
+The opencode-task.sh harness now emits `##STATUS:` lines:
+- `##STATUS:DONE` — session completed normally
+- `##STATUS:ABORTED` — watchdog deadline hit
+- `##STATUS:STUCK` — model produced no output (empty session)
+- `##STATUS:FAILED` — checks or merge failed
+- `##STATUS:MERGED` — worktree was successfully merged and cleaned up
+
+When analyzing session logs, check for sessions that produced `STUCK` or `ABORTED`
+statuses. If a session was `STUCK` with 0-1 messages, the server may have been
+in a bad state — recommend orchestrator to restart the server before retrying.

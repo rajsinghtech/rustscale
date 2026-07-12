@@ -9,8 +9,13 @@ goal of a full TUN-mode client.
 ## Development model: ALL implementation work goes through opencode agents
 
 Claude Code acts as the **orchestrator only**. All code in this repo is written by opencode
-agents running `zai/glm-5.2` via `ai.keiretsu.ts.net`. Do not write implementation code directly with
-Edit/Write except for docs, specs, and this file.
+agents. Model tiering: `deepseek/deepseek-v4-flash` for ALL research/review/docs/toolsmith
+passes (free, unlimited), `zai/glm-5.2` reserved for implementation code only. Do not write
+implementation code directly with Edit/Write except for docs, specs, and this file.
+
+GLM-5.2 prompts MUST be self-contained (pre-researched, pre-distilled). Deepseek research
+passes pre-digest Go sources, porting-notes, and existing crate code into a spec prompt
+that the glm agent can execute without re-reading Go files or exploring crate registries.
 
 ### How to call opencode
 
@@ -48,9 +53,12 @@ opencode export <id>             # dump full session JSON
    sources under `/Users/rajsingh/Documents/GitHub/tailscale` (agent can read them —
    mention exact paths), acceptance criteria (`cargo build`, `cargo test`, `cargo clippy`).
 3. Run long builds with Bash `run_in_background: true` and poll the output file.
-4. After each phase: verify with `cargo build && cargo test && cargo clippy` yourself,
-   review the diff, then either continue the session (`-c`) with fixes or start the next phase.
+4. After each phase: verify with `tools/check.sh` (not raw cargo), review the diff, then
+   run `tools/agent/worktree-merge.sh "<title>"` to merge and clean up. Never leave a
+   worktree unmerged — every session ends merged-or-reported.
 5. Commit as the local user only (no Claude branding — see global CLAUDE.md rules).
+6. Before starting a new phase, run `tools/worktree-status.sh` to verify no lingering
+   worktrees exist. If the unmerged count > 0, resolve first.
 
 ### Prompting lessons for glm-5.2
 
@@ -65,7 +73,7 @@ Regularly (after every 1–2 phases) launch a separate opencode agent whose ONLY
 review past session logs and improve tooling to save tokens:
 
 ```bash
-opencode run -m vercel-ent/zai/glm-5.2 --auto \
+opencode run -m deepseek/deepseek-v4-flash --auto \
   --dir /Users/rajsingh/Documents/GitHub/rustscale \
   --title "toolsmith-$(date +%Y%m%d)" \
   "Read docs/toolsmith.md and follow it."

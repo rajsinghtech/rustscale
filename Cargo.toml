@@ -64,6 +64,7 @@ socket2 = { version = "0.6", features = ["all"] }
 rustscale-netns = { path = "crates/netns" }
 rustscale-dnscache = { path = "crates/dnscache" }
 rustscale-dnsfallback = { path = "crates/dnsfallback" }
+rustscale-safesocket = { path = "crates/safesocket" }
 
 # Shared lint policy: pedantic where sane, but allow the noisier style lints so
 # that the default `cargo clippy` run stays clean and readable.

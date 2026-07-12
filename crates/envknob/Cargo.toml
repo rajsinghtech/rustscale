@@ -1,0 +1,10 @@
+[package]
+name = "rustscale-envknob"
+description = "Typed environment-variable accessor (registered knobs + ad-hoc lookups), port of Go's tailscale.com/envknob"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true

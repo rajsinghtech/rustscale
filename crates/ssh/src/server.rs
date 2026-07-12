@@ -129,6 +129,15 @@ impl SshHandler {
                 if !action.Message.is_empty() {
                     log::info!("SSH auth: {}", action.Message);
                 }
+                // A matched rule may carry a Reject action (Go's
+                // `tailssh.go` checks `action.Reject` after evalSSHPolicy
+                // returns `accepted`). Honour it here.
+                if action.Reject {
+                    log::warn!("SSH: policy rejects connection (reject action)");
+                    return Auth::Reject {
+                        proceed_with_methods: None,
+                    };
+                }
                 self.ssh_user = ssh_user;
                 self.local_user.clone_from(local_user);
                 self.accept_env.clone_from(accept_env);
@@ -350,5 +359,194 @@ impl russh::server::Handler for SshHandler {
     ) -> Result<(), Self::Error> {
         self.channel_data_tx = None;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::host_key_from_node_key;
+    use russh::server::Handler;
+    use rustscale_key::NodePrivate;
+    use rustscale_tailcfg::{SSHAction, SSHPolicy, SSHPrincipal, SSHRule, StableNodeID};
+    use std::collections::BTreeMap;
+    use std::net::{IpAddr, SocketAddr};
+
+    fn peer_ip() -> IpAddr {
+        "100.64.0.2".parse().unwrap()
+    }
+
+    fn test_node() -> Node {
+        Node {
+            ID: 42,
+            StableID: StableNodeID::from("nodePeer"),
+            Key: NodePrivate::generate().public(),
+            ..Default::default()
+        }
+    }
+
+    fn test_profile() -> UserProfile {
+        UserProfile {
+            ID: 42,
+            LoginName: "alice@example.com".into(),
+            DisplayName: "Alice".into(),
+            ProfilePicURL: String::new(),
+        }
+    }
+
+    /// Build an `SshServer` with the given policy + whois callbacks and
+    /// return a fresh `SshHandler` for `peer_ip()`.
+    fn make_handler(policy: PolicyCallback, whois: WhoIsCallback) -> SshHandler {
+        let host_key = host_key_from_node_key(&NodePrivate::generate());
+        let (session_tx, _rx) = mpsc::channel::<SessionInit>(16);
+        let config = SshServerConfig {
+            host_keys: vec![host_key],
+            session_tx,
+            whois,
+            policy,
+        };
+        let mut server = SshServer::new(config);
+        <SshServer as RusshServer>::new_client(&mut server, Some(SocketAddr::new(peer_ip(), 22)))
+    }
+
+    fn whois_finds_peer() -> WhoIsCallback {
+        let node = test_node();
+        let profile = test_profile();
+        Arc::new(move |ip| {
+            if ip == peer_ip() {
+                Some((node.clone(), profile.clone()))
+            } else {
+                None
+            }
+        })
+    }
+
+    fn whois_misses() -> WhoIsCallback {
+        Arc::new(|_| None)
+    }
+
+    fn policy_allow_any() -> PolicyCallback {
+        let policy = SSHPolicy {
+            Rules: vec![SSHRule {
+                Principals: vec![SSHPrincipal {
+                    Any: true,
+                    ..Default::default()
+                }],
+                SSHUsers: {
+                    let mut m = BTreeMap::new();
+                    m.insert("*".into(), "=".into());
+                    m
+                },
+                Action: Some(SSHAction {
+                    Accept: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+        };
+        Arc::new(move || Some(policy.clone()))
+    }
+
+    fn policy_none() -> PolicyCallback {
+        Arc::new(|| None)
+    }
+
+    fn policy_no_match() -> PolicyCallback {
+        let policy = SSHPolicy {
+            Rules: vec![SSHRule {
+                Principals: vec![SSHPrincipal {
+                    UserLogin: "nobody@example.com".into(),
+                    ..Default::default()
+                }],
+                SSHUsers: {
+                    let mut m = BTreeMap::new();
+                    m.insert("*".into(), "=".into());
+                    m
+                },
+                Action: Some(SSHAction {
+                    Accept: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+        };
+        Arc::new(move || Some(policy.clone()))
+    }
+
+    fn policy_reject_action() -> PolicyCallback {
+        let policy = SSHPolicy {
+            Rules: vec![SSHRule {
+                Principals: vec![SSHPrincipal {
+                    Any: true,
+                    ..Default::default()
+                }],
+                SSHUsers: {
+                    let mut m = BTreeMap::new();
+                    m.insert("*".into(), "=".into());
+                    m
+                },
+                Action: Some(SSHAction {
+                    Reject: true,
+                    Message: "banned".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+        };
+        Arc::new(move || Some(policy.clone()))
+    }
+
+    #[tokio::test]
+    async fn auth_accept_allowed_peer() {
+        let mut h = make_handler(policy_allow_any(), whois_finds_peer());
+        let auth = h.auth_none("alice").await.unwrap();
+        assert!(
+            matches!(auth, Auth::Accept),
+            "expected Accept, got {auth:?}"
+        );
+        assert_eq!(h.ssh_user, "alice");
+        assert_eq!(h.local_user, "alice");
+    }
+
+    #[tokio::test]
+    async fn auth_reject_no_policy() {
+        let mut h = make_handler(policy_none(), whois_finds_peer());
+        let auth = h.auth_none("alice").await.unwrap();
+        assert!(
+            matches!(auth, Auth::Reject { .. }),
+            "expected Reject, got {auth:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_reject_unknown_peer() {
+        let mut h = make_handler(policy_allow_any(), whois_misses());
+        let auth = h.auth_none("alice").await.unwrap();
+        assert!(
+            matches!(auth, Auth::Reject { .. }),
+            "expected Reject, got {auth:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_reject_no_match() {
+        let mut h = make_handler(policy_no_match(), whois_finds_peer());
+        let auth = h.auth_none("alice").await.unwrap();
+        assert!(
+            matches!(auth, Auth::Reject { .. }),
+            "expected Reject, got {auth:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_reject_action_is_honoured() {
+        // A matched rule with a Reject action must reject, not accept.
+        // Mirrors Go's `tailssh.go` `case action.Reject:` path.
+        let mut h = make_handler(policy_reject_action(), whois_finds_peer());
+        let auth = h.auth_none("alice").await.unwrap();
+        assert!(
+            matches!(auth, Auth::Reject { .. }),
+            "expected Reject for reject-action, got {auth:?}"
+        );
     }
 }

@@ -16,7 +16,7 @@ verified.md):
 | --- | --- | --- | --- |
 | Packet filter | ✅ | 🔶 | capability ACLs stubbed — `no_cap()` always false (`crates/filter/src/lib.rs`); no shields-up field |
 | DERP client | ✅ | 🔶 | no pinned-key verify — any server key accepted (`crates/derp/src/client.rs`); no send rate-limiting |
-| Tailscale SSH | ✅ | 🔶 | server code exists but policy callback hardcoded `None` (`crates/ssh/src/…`) → all connections rejected |
+| Tailscale SSH | ✅ | 🔶 | policy callback wired to netmap `SSHPolicy` (`tsnet/ssh.rs` reads shared state fed by map-update task); `eval_ssh_policy` matches principals (Node/NodeIP/UserLogin/Any), honours Reject actions; remaining: session recording (#63), incubator subprocess (#64), HoldAndDelegate |
 | Health tracking | ✅ | 🔶 | ~5 of 20 Go warnables; no per-region DERP health |
 | Exit node (CLI) | ✅ | 🔶 | `--exit-node`/PATCH prefs never calls `set_exit_node` → routing no-op |
 | Key lifecycle | — | ⬜ | no key rotation/re-registration; logout is a no-op (`crates/rustscaled/src/daemon.rs`) |

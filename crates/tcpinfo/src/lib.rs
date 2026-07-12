@@ -198,11 +198,10 @@ fn break_tcp_conns_impl() -> io::Result<usize> {
 // Tests
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn test_rtt_localhost() {
         use std::net::{TcpListener, TcpStream};

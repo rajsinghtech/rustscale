@@ -30,6 +30,7 @@ pub fn set_on_file(path: &Path) -> io::Result<()> {
 
 /// Build a v4 UUID from 16 random bytes without external dependencies.
 /// Format: xxxxxxxx-xxxx-4xxx-axxx-xxxxxxxxxxxx (lowercase hex).
+#[cfg(any(target_os = "macos", test))]
 fn uuid_v4() -> String {
     let mut bytes = [0u8; 16];
     use rand::RngCore;
@@ -88,6 +89,7 @@ fn set_on_file_darwin(path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
     use std::io::Write;
 
     #[cfg(target_os = "macos")]

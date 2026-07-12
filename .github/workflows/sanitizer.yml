@@ -1,0 +1,43 @@
+name: Sanitizers
+
+# Nightly ThreadSanitizer run over concurrency-heavy crates.
+# Allowed to fail without blocking merges — informational only.
+
+on:
+  schedule:
+    - cron: '0 5 * * 0' # weekly Sunday 05:00 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  tsan:
+    name: ThreadSanitizer (${{ matrix.crate }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        crate:
+          - rustscale-magicsock
+          - rustscale-derp
+          - rustscale-tsnet
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          key: tsan-${{ matrix.crate }}
+      - name: cargo test with TSan
+        env:
+          RUSTFLAGS: '-Zsanitizer=thread'
+          TSAN_OPTIONS: 'halt_on_error=0'
+        run: cargo +nightly test -p ${{ matrix.crate }} --locked

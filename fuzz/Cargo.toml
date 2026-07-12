@@ -1,0 +1,47 @@
+[package]
+name = "rustscale-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+rustscale-disco = { path = "../crates/disco" }
+rustscale-derp = { path = "../crates/derp" }
+rustscale-netcheck = { path = "../crates/netcheck" }
+rustscale-portmapper = { path = "../crates/portmapper" }
+
+[[bin]]
+name = "disco_decode"
+path = "fuzz_targets/disco_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "derp_frame"
+path = "fuzz_targets/derp_frame.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "stun_parse"
+path = "fuzz_targets/stun_parse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "portmapper_pmp"
+path = "fuzz_targets/portmapper_pmp.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "portmapper_pcp"
+path = "fuzz_targets/portmapper_pcp.rs"
+test = false
+doc = false

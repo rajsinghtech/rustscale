@@ -22,7 +22,7 @@ env:
   CARGO_TERM_COLOR: always
   # Space-separated list of binary crates to build + lipo, as "pkg:bin" pairs
   # (cargo package name : binary artifact name). Add new entries as needed.
-  BIN_PKGS: 'rustscale-rustscaled:rustscaled'
+  BIN_PKGS: 'rustscale-rustscaled:rustscaled rustscale-cli:rustscale'
 
 jobs:
   # -------------------------------------------------------------------------
@@ -33,26 +33,26 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0 # full history for git describe version stamping
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
 
       - name: Build FFI (both architectures)
         run: |
-          cargo build -p rustscale-ffi --release --target aarch64-apple-darwin
-          cargo build -p rustscale-ffi --release --target x86_64-apple-darwin
+          cargo build -p rustscale-ffi --release --locked --target aarch64-apple-darwin
+          cargo build -p rustscale-ffi --release --locked --target x86_64-apple-darwin
 
       - name: Build binary crates (both architectures)
         if: env.BIN_PKGS != ''
         run: |
           for entry in $BIN_PKGS; do
             pkg="${entry%:*}"
-            cargo build -p "$pkg" --release --target aarch64-apple-darwin
-            cargo build -p "$pkg" --release --target x86_64-apple-darwin
+            cargo build -p "$pkg" --release --locked --target aarch64-apple-darwin
+            cargo build -p "$pkg" --release --locked --target x86_64-apple-darwin
           done
 
       - name: Generate C header
@@ -82,7 +82,7 @@ jobs:
           cp include/rustscale.h dist/
           tar czf rustscale-universal-apple-darwin.tar.gz -C dist .
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: rustscale-universal-apple-darwin
           path: rustscale-universal-apple-darwin.tar.gz
@@ -109,13 +109,13 @@ jobs:
             cross: false
             musl: true
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:
           key: ${{ matrix.target }}
 
@@ -137,7 +137,7 @@ jobs:
           CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
           AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
-        run: cargo build -p rustscale-ffi --release --target ${{ matrix.target }}
+        run: cargo build -p rustscale-ffi --release --locked --target ${{ matrix.target }}
 
       - name: Build binary crates
         if: env.BIN_PKGS != ''
@@ -149,7 +149,7 @@ jobs:
         run: |
           for entry in $BIN_PKGS; do
             pkg="${entry%:*}"
-            cargo build -p "$pkg" --release --target ${{ matrix.target }}
+            cargo build -p "$pkg" --release --locked --target ${{ matrix.target }}
           done
 
       - name: Verify C header
@@ -171,7 +171,7 @@ jobs:
           done
           tar czf rustscale-${{ matrix.target }}.tar.gz -C dist .
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: rustscale-${{ matrix.target }}
           path: rustscale-${{ matrix.target }}.tar.gz
@@ -186,8 +186,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: artifacts
 
@@ -200,7 +200,7 @@ jobs:
           cat SHA256SUMS
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: release/*
           generate_release_notes: true

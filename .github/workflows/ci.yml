@@ -4,10 +4,11 @@ on:
   push:
     branches: [master]
   pull_request:
+  merge_group:
     branches: [master]
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.pull_request.number || github.run_id }}
   cancel-in-progress: true
 
 env:
@@ -15,40 +16,133 @@ env:
 
 jobs:
   check:
-    name: Build, test, clippy
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: Build, test, clippy (linux)
+            check_only: false
+          - os: macos-latest
+            name: Build, test, clippy (macos)
+            check_only: false
+          - os: windows-latest
+            name: Check (windows)
+            check_only: true
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+      - name: Build
+        if: ${{ !matrix.check_only }}
+        run: cargo build --workspace --all-targets --locked
+      - name: Test
+        if: ${{ !matrix.check_only }}
+        run: cargo test --workspace --locked
+      - name: Clippy
+        if: ${{ !matrix.check_only }}
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Check (windows)
+        if: ${{ matrix.check_only }}
+        run: cargo check --workspace --locked
+      - name: Format check
+        if: ${{ matrix.os == 'ubuntu-latest' }}
+        run: cargo fmt --all --check
+      - name: Dirty-tree guard (tracked files)
+        if: ${{ matrix.os == 'ubuntu-latest' }}
+        run: git diff --no-ext-diff --name-only --exit-code || (echo "Build/test modified tracked files above."; exit 1)
+      - name: Dirty-tree guard (untracked files)
+        if: ${{ matrix.os == 'ubuntu-latest' }}
+        run: |
+          if git ls-files --others --exclude-standard --directory --no-empty-directory --error-unmatch -- ':/*'
+          then
+            echo "Build/test created untracked files (listed above)."
+            exit 1
+          fi
+
+  cross:
+    name: Cross-check (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            packages: gcc-aarch64-linux-gnu
+          - target: armv7-unknown-linux-gnueabihf
+            os: ubuntu-latest
+            packages: gcc-arm-linux-gnueabihf
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            packages: musl-tools
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            packages: ''
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            packages: ''
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          key: cross-${{ matrix.target }}
+      - name: Install cross-compilers
+        if: ${{ matrix.packages != '' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.packages }}
+      - name: cargo check --target
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
+          CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: arm-linux-gnueabihf-gcc
+          CC_armv7_unknown_linux_gnueabihf: arm-linux-gnueabihf-gcc
+          AR_armv7_unknown_linux_gnueabihf: arm-linux-gnueabihf-ar
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+        run: cargo check --workspace --locked --target ${{ matrix.target }}
+
+  msrv:
+    name: MSRV (1.91)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
-          components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
-      - name: Build
-        run: cargo build --workspace --all-targets
-      - name: Test
-        run: cargo test --workspace
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Format
-        run: cargo fmt --all --check
+          toolchain: '1.91.0'
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          key: msrv-1.91
+      - name: cargo check (MSRV)
+        run: cargo check --workspace --locked
 
   testcontrol:
     name: Go testcontrol interop
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: '1.26'
       - name: Checkout Tailscale Go repo
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           repository: tailscale/tailscale
           path: tailscale-go
@@ -58,4 +152,16 @@ jobs:
           TS_GO_PATH: ${{ github.workspace }}/tailscale-go
         run: bash tools/testcontrol/build.sh
       - name: Run interop tests
-        run: cargo test -p rustscale-interop-testcontrol -- --nocapture --test-threads=1
+        run: cargo test -p rustscale-interop-testcontrol --locked -- --nocapture --test-threads=1
+
+  alls-green:
+    name: All green
+    if: always()
+    needs: [check, cross, msrv, testcontrol]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Decide if change is okay to merge
+        if: ${{ github.event_name != 'push' }}
+        uses: re-actors/alls-green@afee1c1eac2a506084c274e9c02c8e0687b48d9e # v1.2.2
+        with:
+          jobs: ${{ toJSON(needs) }}

@@ -29,7 +29,7 @@ pub(crate) const PCP_CODE_ADDRESS_MISMATCH: u8 = 12;
 
 /// A parsed PCP common-header response (first 24 bytes).
 #[derive(Debug, Clone)]
-pub(crate) struct PcpResponse {
+pub struct PcpResponse {
     pub op_code: u8,
     pub result_code: u8,
     pub lifetime: u32,
@@ -38,7 +38,7 @@ pub(crate) struct PcpResponse {
 
 /// A parsed PCP MAP response (full 60 bytes).
 #[derive(Debug, Clone)]
-pub(crate) struct PcpMapResponse {
+pub struct PcpMapResponse {
     pub result_code: u8,
     pub lifetime: u32,
     #[allow(dead_code)]
@@ -135,7 +135,7 @@ fn ip16_to_socketaddr(bytes: &[u8; 16], port: u16) -> SocketAddr {
 }
 
 /// Parse the PCP common header (first 24 bytes).
-pub(crate) fn parse_common_header(b: &[u8]) -> Option<PcpResponse> {
+pub fn parse_common_header(b: &[u8]) -> Option<PcpResponse> {
     if b.len() < 24 || b[0] != PCP_VERSION {
         return None;
     }
@@ -148,7 +148,7 @@ pub(crate) fn parse_common_header(b: &[u8]) -> Option<PcpResponse> {
 }
 
 /// Parse a full PCP MAP response (60 bytes).
-pub(crate) fn parse_map_response(resp: &[u8]) -> Option<PcpMapResponse> {
+pub fn parse_map_response(resp: &[u8]) -> Option<PcpMapResponse> {
     if resp.len() < 60 {
         return None;
     }

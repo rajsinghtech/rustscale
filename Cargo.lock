@@ -1454,6 +1454,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustscale-routetable"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "rustscale-safesocket"
 version = "0.1.0"
 dependencies = [

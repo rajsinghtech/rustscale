@@ -31,6 +31,8 @@ pub const WARN_DERP_HOME: &str = "derp-home-unreachable";
 pub const WARN_CERT_FALLBACK: &str = "cert-fallback";
 /// Network changed, re-probing endpoints. Low severity, transient.
 pub const WARN_NETMON_CHANGE: &str = "network-changed";
+/// Captive portal detected — traffic is being intercepted. High severity.
+pub const WARN_CAPTIVE_PORTAL: &str = "captive-portal-detected";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -112,6 +114,11 @@ impl Tracker {
             id: WARN_NETMON_CHANGE.into(),
             severity: Severity::Low,
             title: "Network changed".into(),
+        });
+        t.register(Warnable {
+            id: WARN_CAPTIVE_PORTAL.into(),
+            severity: Severity::High,
+            title: "Captive portal detected".into(),
         });
         t
     }

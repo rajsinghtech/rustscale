@@ -139,6 +139,9 @@ async fn dispatch(
         "nc" => commands::nc::run(args, &socket_path, json).await,
         "id-token" => commands::id_token::run(args, &socket_path, json).await,
         "update" => commands::update::run(args, &socket_path, json).await,
+        "wait" => commands::wait::run(args, &socket_path, json).await,
+        "lock" => commands::lock::run(args, &socket_path, json).await,
+        "drive" => commands::drive::run(args, &socket_path, json).await,
         other => {
             eprintln!("error: unknown subcommand '{other}'");
             usage(&std::env::args().next().unwrap_or_default());
@@ -193,6 +196,9 @@ fn usage(bin: &str) {
     eprintln!(
         "  update                               check for client updates (not yet supported)"
     );
+    eprintln!("  wait [--timeout <secs>]              wait for backend to reach Running state");
+    eprintln!("  lock [status|init|add|remove|disable]  manage tailnet lock (not yet supported)");
+    eprintln!("  drive [list|share|unshare]           manage Taildrive shares (not yet supported)");
 }
 
 /// Error type for CLI subcommands.

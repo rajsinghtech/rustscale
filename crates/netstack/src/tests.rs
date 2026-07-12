@@ -630,3 +630,172 @@ async fn listen_and_listen_on_same_port() {
     let result = net.listen(8080).await;
     assert!(result.is_err(), "duplicate (primary_ip, port) should fail");
 }
+
+// ────────────────────────────────────────────────────────────────────
+// UDP tests
+// ────────────────────────────────────────────────────────────────────
+
+/// Two netstacks wired back-to-back: B listens for UDP, A sends a datagram,
+/// B receives it and echoes back. Exercises the full UDP data path through
+/// WireGuard-encapsulated IP packets.
+#[tokio::test]
+async fn udp_recv_and_echo() {
+    use std::net::IpAddr;
+
+    let a_priv = NodePrivate::generate();
+    let b_priv = NodePrivate::generate();
+    let a_pub = a_priv.public();
+    let b_pub = b_priv.public();
+
+    let a_addr = Ipv4Addr::new(100, 64, 0, 1);
+    let b_addr = Ipv4Addr::new(100, 64, 0, 2);
+
+    let a_net = Arc::new(Netstack::new(a_addr, DEFAULT_MTU));
+    let b_net = Arc::new(Netstack::new(b_addr, DEFAULT_MTU));
+
+    let a_tunn = Arc::new(Mutex::new(
+        WgTunn::new(&a_priv, &b_pub, 1).expect("A tunnel"),
+    ));
+    let b_tunn = Arc::new(Mutex::new(
+        WgTunn::new(&b_priv, &a_pub, 2).expect("B tunnel"),
+    ));
+
+    let a_tunn_p = a_tunn.clone();
+    let b_tunn_p = b_tunn.clone();
+    let a_net_p = a_net.clone();
+    let b_net_p = b_net.clone();
+    let pump = tokio::spawn(async move {
+        let a_tx = a_net_p.tx_notify();
+        let b_tx = b_net_p.tx_notify();
+        loop {
+            let did_work = pump_cycle(&a_tunn_p, &b_tunn_p, &a_net_p, &b_net_p);
+            if !did_work {
+                tokio::select! {
+                    () = a_tx.notified() => {}
+                    () = b_tx.notified() => {}
+                    () = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+                }
+            }
+        }
+    });
+
+    // B listens for UDP on its tailnet IP, port 12345.
+    let mut b_udp = b_net
+        .listen_packet(IpAddr::V4(b_addr), 12345)
+        .await
+        .expect("listen_packet");
+    assert_eq!(
+        b_udp.local_addr(),
+        SocketAddr::new(IpAddr::V4(b_addr), 12345)
+    );
+
+    // A listens on an ephemeral port so it can receive the echo reply.
+    let mut a_udp = a_net
+        .listen_packet(IpAddr::V4(a_addr), 0)
+        .await
+        .expect("listen_packet (ephemeral)");
+    let a_local = a_udp.local_addr();
+    assert!(
+        (10002..=19999).contains(&a_local.port()),
+        "ephemeral port {} not in 10002-19999",
+        a_local.port()
+    );
+
+    // A sends a datagram to B.
+    a_udp
+        .send_to(b"hello udp", SocketAddr::new(IpAddr::V4(b_addr), 12345))
+        .await
+        .expect("send_to");
+
+    // B receives it.
+    let (data, src) = tokio::time::timeout(std::time::Duration::from_secs(10), b_udp.recv_from())
+        .await
+        .expect("recv_from timed out")
+        .expect("recv_from failed");
+    assert_eq!(&data[..], b"hello udp");
+    assert_eq!(src, a_local);
+
+    // B echoes back to A.
+    b_udp
+        .send_to(b"echo reply", src)
+        .await
+        .expect("echo send_to");
+
+    // A receives the echo.
+    let (data, _src) = tokio::time::timeout(std::time::Duration::from_secs(10), a_udp.recv_from())
+        .await
+        .expect("echo recv timed out")
+        .expect("echo recv failed");
+    assert_eq!(&data[..], b"echo reply");
+
+    pump.abort();
+}
+
+/// Verify that listening on an already-bound (addr, port) fails.
+#[tokio::test]
+async fn udp_listen_rejects_duplicate_port() {
+    use std::net::IpAddr;
+
+    let addr = Ipv4Addr::new(100, 64, 0, 1);
+    let net = Netstack::new(addr, DEFAULT_MTU);
+
+    let _listener1 = net
+        .listen_packet(IpAddr::V4(addr), 9090)
+        .await
+        .expect("first listen_packet");
+    let result = net.listen_packet(IpAddr::V4(addr), 9090).await;
+    assert!(result.is_err(), "duplicate UDP port should fail");
+}
+
+/// Verify that ephemeral port allocation (port 0) produces distinct ports
+/// across multiple listeners on the same netstack.
+#[tokio::test]
+async fn udp_ephemeral_port_allocation() {
+    use std::net::IpAddr;
+
+    let addr = Ipv4Addr::new(100, 64, 0, 1);
+    let net = Netstack::new(addr, DEFAULT_MTU);
+
+    let mut ports = Vec::new();
+    for _ in 0..3 {
+        let listener = net
+            .listen_packet(IpAddr::V4(addr), 0)
+            .await
+            .expect("ephemeral listen_packet");
+        let p = listener.local_addr().port();
+        assert!(
+            (10002..=19999).contains(&p),
+            "ephemeral port {p} not in range 10002-19999"
+        );
+        assert!(!ports.contains(&p), "duplicate ephemeral port {p}");
+        ports.push(p);
+    }
+}
+
+/// Verify that dropping a UdpListener unregisters the socket so the port
+/// can be reused.
+#[tokio::test]
+async fn udp_drop_releases_port() {
+    use std::net::IpAddr;
+
+    let addr = Ipv4Addr::new(100, 64, 0, 1);
+    let net = Netstack::new(addr, DEFAULT_MTU);
+
+    {
+        let _listener = net
+            .listen_packet(IpAddr::V4(addr), 7070)
+            .await
+            .expect("first listen_packet");
+    }
+    // After drop, the port should be available again — but the poll loop
+    // processes the CloseUdp command asynchronously, so retry briefly.
+    let mut bound = false;
+    for _ in 0..50 {
+        if net.listen_packet(IpAddr::V4(addr), 7070).await.is_ok() {
+            bound = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(bound, "port 7070 was not released after drop");
+}

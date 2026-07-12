@@ -131,7 +131,7 @@ use {
     rustscale_ipn::IpnBackend,
     rustscale_key::{DiscoPrivate, MachinePrivate, MachinePublic, NodePrivate, NodePublic},
     rustscale_magicsock::{Magicsock, MagicsockConfig, MagicsockError},
-    rustscale_netstack::{Netstack, NetstackError, NetstackStream, DEFAULT_MTU},
+    rustscale_netstack::{Netstack, NetstackError, NetstackStream, UdpListener, DEFAULT_MTU},
     rustscale_tailcfg::{
         DERPMap, DNSConfig, FilterRule, Hostinfo, MapRequest, MapResponse, NetInfo, Node, OptBool,
         RegisterRequest, SSHPolicy, UserID, UserProfile,

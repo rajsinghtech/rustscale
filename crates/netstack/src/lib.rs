@@ -28,12 +28,13 @@
 
 mod device;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
 use smoltcp::iface::{Interface, SocketHandle, SocketSet};
 use smoltcp::socket::tcp::{self, State};
+use smoltcp::socket::udp;
 use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -66,6 +67,21 @@ const LISTEN_BACKLOG: usize = 32;
 /// connections without blocking the poll loop.
 const ACCEPT_CHANNEL_DEPTH: usize = 64;
 
+/// Number of packets a UDP socket can buffer (in each direction).
+const UDP_PACKET_COUNT: usize = 64;
+
+/// Total payload bytes a UDP socket can buffer (in each direction).
+const UDP_PAYLOAD_SIZE: usize = 64 * 1024;
+
+/// Depth of the channel between the poll loop and the application's
+/// `UdpListener::recv_from()` / `send_to()` calls.
+const UDP_CHANNEL_DEPTH: usize = 64;
+
+/// Ephemeral port range for UDP listeners requesting port 0, matching
+/// Tailscale's tsnet range (tsnet.go:2013-2014).
+const UDP_EPHEMERAL_MIN: u16 = 10002;
+const UDP_EPHEMERAL_MAX: u16 = 19999;
+
 /// Errors from netstack operations.
 #[derive(Debug, thiserror::Error)]
 pub enum NetstackError {
@@ -81,6 +97,8 @@ pub enum NetstackError {
     ListenFailed(String),
     #[error("dial failed: {0}")]
     DialFailed(String),
+    #[error("udp listen failed: {0}")]
+    UdpListenFailed(String),
     #[error("netstack is shutting down")]
     ShuttingDown,
 }
@@ -117,6 +135,62 @@ impl Listener {
     /// to merge multiple VIP listeners into a single accept stream.
     pub fn into_receiver(self) -> mpsc::Receiver<Result<NetstackStream, NetstackError>> {
         self.accept_rx
+    }
+}
+
+/// A received UDP packet.
+#[derive(Debug)]
+pub struct UdpPacket {
+    /// The packet payload.
+    pub data: Bytes,
+    /// The source address.
+    pub src: SocketAddr,
+}
+
+/// A UDP listener that receives datagrams on the tailnet.
+///
+/// Created by [`Netstack::listen_packet`]. Incoming packets are dequeued via
+/// [`recv_from`](Self::recv_from); outbound packets are sent via
+/// [`send_to`](Self::send_to). Dropping the listener unregisters the
+/// underlying smoltcp socket.
+pub struct UdpListener {
+    recv_rx: mpsc::Receiver<UdpPacket>,
+    send_tx: mpsc::Sender<OutboundUdpPacket>,
+    local_addr: SocketAddr,
+    cmd_tx: mpsc::Sender<Command>,
+    key: (IpAddr, u16),
+}
+
+impl UdpListener {
+    /// Receive the next inbound UDP packet, returning the payload and source.
+    pub async fn recv_from(&mut self) -> Result<(Bytes, SocketAddr), NetstackError> {
+        self.recv_rx
+            .recv()
+            .await
+            .map(|p| (p.data, p.src))
+            .ok_or(NetstackError::ShuttingDown)
+    }
+
+    /// Send a UDP packet to `dst` through the tailnet.
+    pub async fn send_to(&self, data: &[u8], dst: SocketAddr) -> Result<(), NetstackError> {
+        self.send_tx
+            .send(OutboundUdpPacket {
+                data: data.to_vec(),
+                dst,
+            })
+            .await
+            .map_err(|_| NetstackError::ShuttingDown)
+    }
+
+    /// The local address the listener is bound to.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+}
+
+impl Drop for UdpListener {
+    fn drop(&mut self) {
+        let _ = self.cmd_tx.try_send(Command::CloseUdp { key: self.key });
     }
 }
 
@@ -352,6 +426,34 @@ impl Netstack {
         reply_rx.await.map_err(|_| NetstackError::ShuttingDown)?
     }
 
+    /// Start listening for UDP datagrams on `addr:port`.
+    ///
+    /// If `port` is 0, an ephemeral port is allocated from the range
+    /// 10002–19999 (matching Tailscale's tsnet ephemeral range).
+    pub async fn listen_packet(
+        &self,
+        addr: IpAddr,
+        port: u16,
+    ) -> Result<UdpListener, NetstackError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(Command::ListenPacket {
+                addr,
+                port,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| NetstackError::ShuttingDown)?;
+        let parts = reply_rx.await.map_err(|_| NetstackError::ShuttingDown)??;
+        Ok(UdpListener {
+            recv_rx: parts.recv_rx,
+            send_tx: parts.send_tx,
+            local_addr: parts.local_addr,
+            cmd_tx: self.cmd_tx.clone(),
+            key: parts.key,
+        })
+    }
+
     /// Wake the poll loop (e.g. after pushing rx packets from a sync context).
     pub fn wake(&self) {
         self.notify.notify_one();
@@ -392,6 +494,14 @@ enum Command {
         remote: SocketAddr,
         reply: oneshot::Sender<Result<NetstackStream, NetstackError>>,
     },
+    ListenPacket {
+        addr: IpAddr,
+        port: u16,
+        reply: oneshot::Sender<Result<UdpListenerParts, NetstackError>>,
+    },
+    CloseUdp {
+        key: (IpAddr, u16),
+    },
 }
 
 /// State for an established connection, held inside the poll loop.
@@ -419,11 +529,63 @@ struct PendingDial {
     remote: SocketAddr,
 }
 
+/// Outbound UDP packet sent from `UdpListener::send_to` to the poll loop.
+struct OutboundUdpPacket {
+    data: Vec<u8>,
+    dst: SocketAddr,
+}
+
+/// Channels and metadata returned to `Netstack::listen_packet` so it can
+/// assemble a `UdpListener` (which also needs the command sender for Drop).
+struct UdpListenerParts {
+    recv_rx: mpsc::Receiver<UdpPacket>,
+    send_tx: mpsc::Sender<OutboundUdpPacket>,
+    local_addr: SocketAddr,
+    key: (IpAddr, u16),
+}
+
+/// Per-socket state held by the poll loop for a bound UDP listener.
+struct UdpSocketState {
+    handle: SocketHandle,
+    recv_tx: mpsc::Sender<UdpPacket>,
+    send_rx: mpsc::Receiver<OutboundUdpPacket>,
+}
+
 /// Create a smoltcp TCP socket with Vec-backed buffers.
 fn new_tcp_socket() -> tcp::Socket<'static> {
     let rx = tcp::SocketBuffer::new(vec![0u8; TCP_BUF]);
     let tx = tcp::SocketBuffer::new(vec![0u8; TCP_BUF]);
     tcp::Socket::new(rx, tx)
+}
+
+/// Create a smoltcp UDP socket with Vec-backed packet buffers.
+fn new_udp_socket() -> udp::Socket<'static> {
+    let rx_meta: Vec<udp::PacketMetadata> = (0..UDP_PACKET_COUNT)
+        .map(|_| udp::PacketMetadata::EMPTY)
+        .collect();
+    let tx_meta: Vec<udp::PacketMetadata> = (0..UDP_PACKET_COUNT)
+        .map(|_| udp::PacketMetadata::EMPTY)
+        .collect();
+    let rx_buffer = udp::PacketBuffer::new(rx_meta, vec![0u8; UDP_PAYLOAD_SIZE]);
+    let tx_buffer = udp::PacketBuffer::new(tx_meta, vec![0u8; UDP_PAYLOAD_SIZE]);
+    udp::Socket::new(rx_buffer, tx_buffer)
+}
+
+/// Allocate an ephemeral UDP port from the 10002–19999 range, skipping
+/// any already in `allocated`.
+fn allocate_ephemeral_udp_port(allocated: &HashSet<u16>) -> u16 {
+    use std::sync::atomic::{AtomicU16, Ordering};
+    static NEXT: AtomicU16 = AtomicU16::new(UDP_EPHEMERAL_MIN);
+    loop {
+        let p = NEXT.fetch_add(1, Ordering::Relaxed);
+        if !(UDP_EPHEMERAL_MIN..=UDP_EPHEMERAL_MAX).contains(&p) {
+            NEXT.store(UDP_EPHEMERAL_MIN, Ordering::Relaxed);
+            continue;
+        }
+        if !allocated.contains(&p) {
+            return p;
+        }
+    }
 }
 
 /// Simple monotonic ephemeral port allocator.
@@ -491,6 +653,10 @@ async fn poll_loop(
     let mut pending_dials: HashMap<SocketHandle, PendingDial> = HashMap::new();
     // (ip, port) -> (listener_socket_handle, accept_sender)
     let mut listeners: HashMap<(IpAddr, u16), ListenerEntry> = HashMap::new();
+    // UDP listener state: (ip, port) -> UdpSocketState
+    let mut udp_sockets: HashMap<(IpAddr, u16), UdpSocketState> = HashMap::new();
+    // Track allocated ephemeral UDP ports to avoid collisions.
+    let mut udp_allocated_ports: HashSet<u16> = HashSet::new();
 
     let sleep = tokio::time::sleep(std::time::Duration::from_secs(1));
     tokio::pin!(sleep);
@@ -524,6 +690,22 @@ async fn poll_loop(
                     }
                     Some(Command::Dial { remote, reply }) => {
                         do_dial(&mut iface, &mut sockets, &mut pending_dials, addr, remote, reply);
+                    }
+                    Some(Command::ListenPacket { addr: bind_addr, port, reply }) => {
+                        let result = do_listen_packet(
+                            &mut sockets,
+                            &mut udp_sockets,
+                            &mut udp_allocated_ports,
+                            bind_addr,
+                            port,
+                        );
+                        let _ = reply.send(result);
+                    }
+                    Some(Command::CloseUdp { key }) => {
+                        if let Some(state) = udp_sockets.remove(&key) {
+                            let _ = sockets.remove(state.handle);
+                        }
+                        udp_allocated_ports.remove(&key.1);
                     }
                     None => break,
                 }
@@ -667,7 +849,12 @@ async fn poll_loop(
             iface.poll(smol_now(), &mut device, &mut sockets);
         }
 
-        // Pass 4: clean up closed connections.
+        // Pass 4: pump UDP sockets (drain received packets, process outbound).
+        if pump_udp(&mut sockets, &mut udp_sockets, &mut udp_allocated_ports) {
+            iface.poll(smol_now(), &mut device, &mut sockets);
+        }
+
+        // Pass 5: clean up closed connections.
         cleanup_closed(&mut sockets, &mut conns, &mut listeners);
     }
 }
@@ -757,6 +944,144 @@ fn do_dial(
     }
     let handle = sockets.add(socket);
     pending_dials.insert(handle, PendingDial { reply, remote });
+}
+
+/// Create a bound UDP socket for `addr:port` and register it in the poll loop.
+fn do_listen_packet(
+    sockets: &mut SocketSet<'static>,
+    udp_sockets: &mut HashMap<(IpAddr, u16), UdpSocketState>,
+    allocated_ports: &mut HashSet<u16>,
+    addr: IpAddr,
+    mut port: u16,
+) -> Result<UdpListenerParts, NetstackError> {
+    match addr {
+        IpAddr::V4(_) => {}
+        IpAddr::V6(_) => {
+            return Err(NetstackError::UdpListenFailed("IPv6 not supported".into()));
+        }
+    }
+
+    if port == 0 {
+        port = allocate_ephemeral_udp_port(allocated_ports);
+    }
+
+    let key = (addr, port);
+    if udp_sockets.contains_key(&key) {
+        return Err(NetstackError::UdpListenFailed(format!(
+            "port {port} already in use on {addr}"
+        )));
+    }
+
+    let smol_addr = to_smoltcp_v4(match addr {
+        IpAddr::V4(v4) => v4,
+        _ => unreachable!(),
+    });
+    let endpoint = IpListenEndpoint::from((smol_addr, port));
+
+    let mut socket = new_udp_socket();
+    socket
+        .bind(endpoint)
+        .map_err(|e| NetstackError::UdpListenFailed(format!("{e:?}")))?;
+
+    let handle = sockets.add(socket);
+
+    let (recv_tx, recv_rx) = mpsc::channel(UDP_CHANNEL_DEPTH);
+    let (send_tx, send_rx) = mpsc::channel(UDP_CHANNEL_DEPTH);
+
+    udp_sockets.insert(
+        key,
+        UdpSocketState {
+            handle,
+            recv_tx,
+            send_rx,
+        },
+    );
+    allocated_ports.insert(port);
+
+    Ok(UdpListenerParts {
+        recv_rx,
+        send_tx,
+        local_addr: SocketAddr::new(addr, port),
+        key,
+    })
+}
+
+/// Drain received UDP packets from smoltcp to the listener and process
+/// outbound packets from the listener. Also cleans up sockets whose
+/// listener has been dropped.
+fn pump_udp(
+    sockets: &mut SocketSet<'static>,
+    udp_sockets: &mut HashMap<(IpAddr, u16), UdpSocketState>,
+    allocated_ports: &mut HashSet<u16>,
+) -> bool {
+    let mut did_work = false;
+    let keys: Vec<(IpAddr, u16)> = udp_sockets.keys().copied().collect();
+
+    for key in keys {
+        // Clean up if the listener was dropped (recv_tx closed).
+        let listener_gone = udp_sockets.get(&key).is_some_and(|s| s.recv_tx.is_closed());
+        if listener_gone {
+            if let Some(state) = udp_sockets.remove(&key) {
+                let _ = sockets.remove(state.handle);
+            }
+            allocated_ports.remove(&key.1);
+            continue;
+        }
+
+        let Some(handle) = udp_sockets.get(&key).map(|s| s.handle) else {
+            continue;
+        };
+
+        // --- Inbound: drain received packets from smoltcp → listener ---
+        loop {
+            let has_room = udp_sockets
+                .get(&key)
+                .is_some_and(|s| s.recv_tx.capacity() > 0);
+            if !has_room {
+                break;
+            }
+            let socket = sockets.get_mut::<udp::Socket>(handle);
+            if !socket.can_recv() {
+                break;
+            }
+            match socket.recv() {
+                Ok((data, meta)) => {
+                    let src = SocketAddr::new(IpAddr::from(meta.endpoint.addr), meta.endpoint.port);
+                    if let Some(s) = udp_sockets.get(&key) {
+                        let _ = s.recv_tx.try_send(UdpPacket {
+                            data: Bytes::copy_from_slice(data),
+                            src,
+                        });
+                    }
+                    did_work = true;
+                }
+                Err(_) => break,
+            }
+        }
+
+        // --- Outbound: listener → smoltcp ---
+        loop {
+            let outbound = udp_sockets
+                .get_mut(&key)
+                .and_then(|s| s.send_rx.try_recv().ok());
+            let Some(pkt) = outbound else {
+                break;
+            };
+
+            let dst_ip = match pkt.dst.ip() {
+                IpAddr::V4(v4) => to_smoltcp_v4(v4),
+                IpAddr::V6(_) => continue,
+            };
+            let dst_ep = IpEndpoint::new(dst_ip, pkt.dst.port());
+            let socket = sockets.get_mut::<udp::Socket>(handle);
+            match socket.send_slice(&pkt.data, dst_ep) {
+                Ok(()) => did_work = true,
+                Err(_) => break,
+            }
+        }
+    }
+
+    did_work
 }
 
 /// Pump data between a smoltcp socket and the application stream channels.

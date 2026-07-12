@@ -170,6 +170,42 @@ impl Server {
         }
     }
 
+    /// Listen for UDP datagrams on `addr` (netstack mode only).
+    ///
+    /// `addr` is `":port"`, `"ip:port"`, or `"hostname:port"`. An empty host
+    /// binds to the node's primary tailnet IP; a hostname is resolved via
+    /// MagicDNS. If port is 0, an ephemeral port (10002–19999) is allocated.
+    /// Returns an error in TUN mode.
+    pub async fn listen_packet(&self, addr: &str) -> Result<UdpListener, TsnetError> {
+        let inner = self.inner.as_ref().ok_or(TsnetError::NotUp)?;
+        let netstack = match &inner.data_plane {
+            DataPlane::Netstack(ns) => ns.clone(),
+            DataPlane::Tun => return Err(TsnetError::NotAvailableInTunMode),
+        };
+
+        let (host, port_str) = addr
+            .rsplit_once(':')
+            .ok_or_else(|| TsnetError::Builder(format!("invalid address: {addr}")))?;
+        let port: u16 = port_str
+            .parse()
+            .map_err(|_| TsnetError::Builder(format!("invalid port: {addr}")))?;
+
+        let ip = if host.is_empty() {
+            *inner
+                .tailscale_ips
+                .first()
+                .ok_or_else(|| TsnetError::Builder("no tailnet IP assigned".into()))?
+        } else if let Ok(ip) = host.parse::<IpAddr>() {
+            ip
+        } else {
+            let r = inner.resolver.read().await;
+            r.resolve_first(host)
+                .ok_or_else(|| TsnetError::Builder(format!("cannot resolve: {host}")))?
+        };
+
+        Ok(netstack.listen_packet(ip, port).await?)
+    }
+
     /// Start a local SOCKS5 proxy (RFC 1928) bound to `bind_addr` on the **OS**
     /// TCP stack (e.g. `"127.0.0.1:1080"`, `":1080"`, or `"1080"`). Each
     /// CONNECT request is dialed *through the tailnet* via [`Server::dial`]

@@ -1453,6 +1453,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustscale-safesocket"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "libc",
+ "rand",
+ "tempfile",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "rustscale-tailcfg"
 version = "0.1.0"
 dependencies = [

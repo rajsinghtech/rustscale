@@ -118,28 +118,6 @@ cargo test  --workspace
 tools/check.sh   # the CI gate: build + test + clippy -D warnings + fmt --check
 ```
 
-## Workspace layout
-
-```
-crates/
-  key/           curve25519 node/machine/disco keys + NaCl box
-  tailcfg/       control-plane wire types (Node, NetMap, DERPMap, MapRequest/Response)
-  disco/         NAT-traversal discovery message codec + box crypto
-  derp/          DERP relay client protocol (frame codec, derphttp client)
-  netcheck/      STUN-based network probing + per-region DERP latency
-  controlclient/ ts2021 Noise control channel: register + map long-poll
-  magicsock/     path selection — direct UDP, DERP relay, peer relay
-  wg/            WireGuard data plane (boringtun noise::Tunn wrapper)
-  netstack/      userspace TCP/IP stack (smoltcp) for tsnet listen/dial
-  tun/           OS TUN device abstraction (macOS utun, Linux /dev/net/tun)
-  filter/        stateful packet filter (wgengine/filter port)
-  dns/           MagicDNS resolver + in-process UDP DNS responder
-  netmon/        network change monitor (AF_ROUTE on macOS) → re-STUN/DERP
-  tsnet/         public embedding API: Server::builder, up, up_tun, listen, dial
-  ffi/           C ABI (librustscale) — opaque-handle API, libtailscale-equivalent
-  bench/         throughput and latency benchmark harness for tsnet
-```
-
 ## License
 
 BSD-3-Clause, matching the upstream Tailscale license.

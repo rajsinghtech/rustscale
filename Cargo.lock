@@ -2353,6 +2353,8 @@ name = "rustscale-ipnstate"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "rustscale-key",
+ "rustscale-tailcfg",
  "serde",
  "serde_json",
 ]
@@ -2628,6 +2630,7 @@ dependencies = [
  "rustscale-filter",
  "rustscale-health",
  "rustscale-ipn",
+ "rustscale-ipnstate",
  "rustscale-key",
  "rustscale-localclient",
  "rustscale-magicsock",

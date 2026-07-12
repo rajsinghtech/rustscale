@@ -65,6 +65,7 @@ pub use appc::{
 pub use loopback::{InMemoryClientError, InMemoryLocalClient, LoopbackHandle};
 pub use routing::{peer_is_exit_capable, RouteTable};
 pub use rustscale_health::Warning;
+pub use rustscale_ipnstate;
 pub use serve::{
     check_funnel_access, check_funnel_port, FunnelError, HTTPHandler, HostPort, ServeConfig,
     ServeError, ServiceConfig as ServeServiceConfig, TCPPortHandler, WebServerConfig, FUNNEL_PORTS,

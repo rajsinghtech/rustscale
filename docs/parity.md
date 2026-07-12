@@ -74,7 +74,7 @@ P3 status: hostinfo darwin ✅ (OSVersion + DeviceModel via sysctl) · quarantin
 | Cloud log shipping | `logtail/` | 🔶 `crates/logtail` buffers entries with proc_id/proc_seq metadata; HTTP upload is TODO stub |
 | Port enumeration | `portlist/` | ⬜ |
 | Network flow logging | `wgengine/netlog/` | ⬜ |
-| Network error classification | `net/neterror/` | ⬜ uses std::io::ErrorKind only; no custom classification |
+| Network error classification | `net/neterror/` | ✅ `rustscale-neterror` crate with `treat_as_lost_udp`, `packet_was_truncated`, `should_disable_udp_gso`, `is_closed_pipe_error`; wired into magicsock (send/disco paths), portmapper (PMP/PCP mapping sends), dns forwarder (UDP recv) |
 | Network traffic steering | `net/traffic/` | 🔶 split DNS OS config exists (macOS); no general traffic-steering abstraction |
 | Subnet route health check | `net/routecheck/` | ⬜ |
 | Captive portal detection | `net/captivedetection/` | ✅ `Detector` concurrent HTTP GETs, DERPMap endpoints, response validation (status + challenge + body), wired into netcheck prober + health Tracker |

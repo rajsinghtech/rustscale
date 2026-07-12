@@ -13,6 +13,8 @@ use tokio::net::TcpStream;
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::TlsConnector;
 
+use rustscale_neterror::packet_was_truncated;
+
 use crate::wire::{check_response_size_and_set_tc, truncated_flag_set};
 
 /// A DNS query timeout matching Go's `dnsQueryTimeout` (10s).
@@ -144,8 +146,10 @@ impl Forwarder {
                 }
                 let mut buf = vec![0u8; 4096];
                 let fut = tokio::time::timeout(UDP_TIMEOUT, sock.recv(&mut buf));
-                if let Ok(Ok(n)) = fut.await {
-                    return Some(buf[..n].to_vec());
+                match fut.await {
+                    Ok(Ok(n)) => return Some(buf[..n].to_vec()),
+                    Ok(Err(e)) if packet_was_truncated(&e) => continue,
+                    _ => continue,
                 }
             }
         }
@@ -200,6 +204,7 @@ impl Forwarder {
         let fut = tokio::time::timeout(UDP_TIMEOUT, sock.recv(&mut buf));
         match fut.await {
             Ok(Ok(n)) => Some(buf[..n].to_vec()),
+            Ok(Err(e)) if packet_was_truncated(&e) => None,
             _ => None,
         }
     }

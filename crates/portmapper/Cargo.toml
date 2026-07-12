@@ -10,6 +10,7 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+rustscale-neterror = { path = "../neterror", version = "0.1.0" }
 thiserror.workspace = true
 tokio.workspace = true
 rand.workspace = true

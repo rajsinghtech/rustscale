@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 #![allow(non_snake_case)]
 
+mod appctype;
 mod caps;
 mod derpmap;
 mod dns;
@@ -16,6 +17,11 @@ mod map;
 mod node;
 mod register;
 
+pub use appctype::{
+    AppConnectorAttr, AppConnectorConfig, ConfigID, Conn25Attr, Conn25PoolsAttr, DNATConfig,
+    IPRange, ProtoPortRange, RouteInfo, RouteUpdate, SNIProxyConfig,
+    APP_CONNECTORS_EXPERIMENTAL_ATTR_NAME, DNS_ADDR_SCHEME,
+};
 pub use caps::{
     cap_ver_is_relay_capable, has_capability, relay_client_disabled, relay_server_disabled,
     CAP_VERSION_RELAY, NODE_ATTR_DISABLE_RELAY_CLIENT, NODE_ATTR_DISABLE_RELAY_SERVER,

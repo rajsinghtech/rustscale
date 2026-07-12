@@ -1199,6 +1199,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustscale-appc"
+version = "0.1.0"
+dependencies = [
+ "rustscale-key",
+ "rustscale-tailcfg",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "rustscale-bench"
 version = "0.1.0"
 dependencies = [
@@ -1553,6 +1564,7 @@ dependencies = [
  "rand_core",
  "rcgen",
  "rustls",
+ "rustscale-appc",
  "rustscale-c2n",
  "rustscale-controlclient",
  "rustscale-controlknobs",

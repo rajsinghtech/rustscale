@@ -850,6 +850,11 @@ pub fn upstream_nameservers(dns_config: Option<&DNSConfig>) -> Vec<SocketAddr> {
     servers
 }
 
+/// A callback invoked when a DNS response is served. The AppConnector
+/// registers one to observe DNS responses for configured domains and
+/// dynamically advertise routes.
+pub type DnsResponseObserver = Arc<dyn Fn(&[u8]) + Send + Sync>;
+
 /// A minimal UDP DNS responder serving MagicDNS answers and forwarding the
 /// rest upstream.
 pub struct DnsResponder {
@@ -857,6 +862,7 @@ pub struct DnsResponder {
     upstream: Vec<SocketAddr>,
     bind: SocketAddr,
     forwarder: Option<Arc<Forwarder>>,
+    observer: Option<DnsResponseObserver>,
 }
 
 impl DnsResponder {
@@ -871,6 +877,7 @@ impl DnsResponder {
             upstream,
             bind,
             forwarder: None,
+            observer: None,
         }
     }
 
@@ -885,7 +892,17 @@ impl DnsResponder {
             upstream: Vec::new(),
             bind,
             forwarder: Some(forwarder),
+            observer: None,
         }
+    }
+
+    /// Set a DNS response observer callback. The observer is called with
+    /// the raw DNS response bytes whenever the responder serves a response.
+    /// Used by the AppConnector to observe DNS responses for configured
+    /// domains and dynamically advertise routes.
+    pub fn with_observer(mut self, observer: DnsResponseObserver) -> Self {
+        self.observer = Some(observer);
+        self
     }
 
     /// Bind the UDP socket and spawn the query loop.
@@ -918,6 +935,7 @@ impl DnsResponder {
         let upstream = self.upstream;
         let resolver = self.resolver;
         let forwarder = self.forwarder;
+        let observer = self.observer;
         Ok(tokio::spawn(async move {
             let mut buf = vec![0u8; 4096];
             loop {
@@ -929,10 +947,14 @@ impl DnsResponder {
                 let upstream = upstream.clone();
                 let forwarder = forwarder.clone();
                 let sock = sock.clone();
+                let observer = observer.clone();
                 tokio::spawn(async move {
                     if let Some(resp) =
                         handle_query(&query, &resolver, &upstream, forwarder.as_deref()).await
                     {
+                        if let Some(obs) = &observer {
+                            obs(&resp);
+                        }
                         let _ = sock.send_to(&resp, src).await;
                     }
                 });

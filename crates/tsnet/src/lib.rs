@@ -77,7 +77,7 @@ pub use hostinfo::{
 #[cfg(feature = "ssh")]
 pub use ssh::SshListener;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
@@ -1063,7 +1063,11 @@ impl Server {
                     }),
                 taildrop: Some(taildrop.clone()),
                 netstack: Some(netstack.clone()),
+                filter: std::sync::OnceLock::new(),
             };
+            // Publish the live filter so `PATCH /prefs` can toggle
+            // shields-up mode without a full rebuild.
+            let _ = state.filter.set(b.filter.clone());
             if let Some(h) = localapi::spawn_localapi(Arc::new(state), path.clone()) {
                 tasks.push(h.task);
                 if let Some(ref ps) = self.pre_started {
@@ -1404,7 +1408,11 @@ impl Server {
                     }),
                 taildrop: Some(taildrop.clone()),
                 netstack: None, // TUN mode has no netstack
+                filter: std::sync::OnceLock::new(),
             };
+            // Publish the live filter so `PATCH /prefs` can toggle
+            // shields-up mode without a full rebuild.
+            let _ = state.filter.set(b.filter.clone());
             if let Some(h) = localapi::spawn_localapi(Arc::new(state), path.clone()) {
                 tasks.push(h.task);
                 if let Some(ref ps) = self.pre_started {
@@ -1612,9 +1620,10 @@ impl Server {
             cert_params: None,
             taildrop: None,
             netstack: None,
+            filter: std::sync::OnceLock::new(),
         });
 
-        let handle = localapi::spawn_localapi(api_state, socket_path.clone());
+        let handle = localapi::spawn_localapi(api_state.clone(), socket_path.clone());
         if handle.is_some() {
             eprintln!(
                 "tsnet: LocalAPI (needs-login) listening at {}",
@@ -2183,8 +2192,11 @@ impl Server {
         // Build the initial packet filter from the first MapResponse. Add our
         // advertised subnet routes to the filter's localNets so packets
         // destined to those subnets are admitted (needed by subnet routers).
+        // The peer list supplies the capability map for `cap:<name>` source
+        // predicates, and the ShieldsUp pref enables shields-up mode.
+        let shields_up = self.load_prefs().unwrap_or_default().ShieldsUp;
         let (mut filter, _named_filters) =
-            build_filter_from_map_response(&map_resp, &tailscale_ips);
+            build_filter_from_map_response(&map_resp, &tailscale_ips, &peers, shields_up);
         if !advertise.is_empty() {
             filter.add_local_cidrs(&advertise);
         }
@@ -3257,7 +3269,11 @@ fn spawn_map_update_task(
                         magicsock.set_self_cap_map(node.CapMap.clone());
                     }
 
-                    // Merge peer deltas.
+                    // Merge peer deltas. Track whether the peer set changed
+                    // so the filter's capability map can be refreshed.
+                    let peers_changed = !resp.Peers.is_empty()
+                        || !resp.PeersChanged.is_empty()
+                        || !resp.PeersRemoved.is_empty();
                     {
                         let mut peers = peers_arc.write().await;
                         if !resp.Peers.is_empty() {
@@ -3332,14 +3348,23 @@ fn spawn_map_update_task(
                     drop(tunnels);
 
                     // Process PacketFilter / PacketFilters deltas and rebuild
-                    // the filter if anything changed.
+                    // the filter if anything changed. The peer list supplies
+                    // the capability map; the existing shields-up state is
+                    // preserved across the rebuild (mirrors Go passing
+                    // `oldFilter` to `filter.New`). A peer-set change also
+                    // triggers a rebuild so `cap:<name>` source predicates
+                    // see the latest peer `CapMap`s.
                     let filter_changed = process_filter_deltas(&resp, &mut named_filters);
-                    if filter_changed {
+                    if filter_changed || peers_changed {
+                        let shields_up = filter_arc.lock().unwrap().shields_up();
+                        let peers_snapshot = peers_arc.read().await.clone();
                         rebuild_filter(
                             &filter_arc,
                             &named_filters,
                             &tailscale_ips,
                             &advertise_routes,
+                            &peers_snapshot,
+                            shields_up,
                         );
                     }
 
@@ -3372,9 +3397,15 @@ fn spawn_map_update_task(
 
 /// Build a [`Filter`] from a [`MapResponse`]'s PacketFilter/PacketFilters
 /// fields. Returns the filter and the initial named-filter map.
+///
+/// `peers` is used to build the peer IP → capability-set map so the filter
+/// can evaluate `cap:<name>` source predicates. `shields_up` enables
+/// shields-up mode (deny new inbound flows).
 fn build_filter_from_map_response(
     resp: &MapResponse,
     local_ips: &[IpAddr],
+    peers: &[Node],
+    shields_up: bool,
 ) -> (Filter, BTreeMap<String, Vec<FilterRule>>) {
     let mut named: BTreeMap<String, Vec<FilterRule>> = BTreeMap::new();
 
@@ -3415,7 +3446,10 @@ fn build_filter_from_map_response(
         named.values().flatten().cloned().collect()
     };
 
-    let filter = Filter::new(&all_rules, local_ips).unwrap_or_else(|_| Filter::allow_all());
+    let cap_holders = build_cap_holders(peers);
+    let mut filter =
+        Filter::new(&all_rules, local_ips, &cap_holders).unwrap_or_else(|_| Filter::allow_all());
+    filter.set_shields_up(shields_up);
     (filter, named)
 }
 
@@ -3467,21 +3501,27 @@ fn process_filter_deltas(
 /// Rebuild the filter from the named-filter map and update the shared
 /// `Arc<Mutex<Filter>>`. Advertised subnet routes are added to the filter's
 /// localNets so the subnet router admits packets destined to those subnets.
+/// `peers` supplies the peer capability map; `shields_up` enables
+/// shields-up mode.
 fn rebuild_filter(
     filter_arc: &Arc<std::sync::Mutex<Filter>>,
     named: &BTreeMap<String, Vec<FilterRule>>,
     local_ips: &[IpAddr],
     advertise_routes: &[String],
+    peers: &[Node],
+    shields_up: bool,
 ) {
     let all_rules: Vec<FilterRule> = if named.is_empty() {
         rustscale_tailcfg::filter_allow_all()
     } else {
         named.values().flatten().cloned().collect()
     };
-    if let Ok(mut new_filter) = Filter::new(&all_rules, local_ips) {
+    let cap_holders = build_cap_holders(peers);
+    if let Ok(mut new_filter) = Filter::new(&all_rules, local_ips, &cap_holders) {
         if !advertise_routes.is_empty() {
             new_filter.add_local_cidrs(advertise_routes);
         }
+        new_filter.set_shields_up(shields_up);
         *filter_arc.lock().unwrap() = new_filter;
     }
 }
@@ -3499,6 +3539,27 @@ fn extract_node_ips(node: &Node) -> Vec<IpAddr> {
         .iter()
         .filter_map(|s| s.split('/').next().and_then(|ip| ip.parse::<IpAddr>().ok()))
         .collect()
+}
+
+/// Build the peer IP → capability-set map used by the packet filter to
+/// evaluate `cap:<name>` source predicates. Each peer's tailnet IPs are
+/// mapped to the keys of its `Node.CapMap`. Mirrors Go's
+/// `LocalBackend.srcIPHasCapForFilter` (which resolves the peer by address
+/// then checks `Node.HasCap`).
+fn build_cap_holders(peers: &[Node]) -> BTreeMap<IpAddr, BTreeSet<String>> {
+    let mut out: BTreeMap<IpAddr, BTreeSet<String>> = BTreeMap::new();
+    for peer in peers {
+        if peer.CapMap.is_empty() {
+            continue;
+        }
+        let caps: BTreeSet<String> = peer.CapMap.keys().cloned().collect();
+        for ip in extract_node_ips(peer) {
+            // A peer may have multiple addresses; they all share the same
+            // node's CapMap. Merge in case an IP is re-used across nodes.
+            out.entry(ip).or_default().extend(caps.iter().cloned());
+        }
+    }
+    out
 }
 
 /// Pure WhoIs lookup over a peer snapshot + user profiles. Returns `None`

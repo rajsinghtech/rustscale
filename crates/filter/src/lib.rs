@@ -19,10 +19,11 @@ pub use packet::{parse_packet, PacketInfo};
 pub use r#match::{CapMatch, Match, Matches, NetPortRange, PortRange};
 pub use state::{reversed_tuple, FlowState, FlowTuple};
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 
 use r#match::Matches as MatchList;
-use rustscale_tailcfg::FilterRule;
+use rustscale_tailcfg::{FilterRule, PeerCapMap};
 
 /// Filter verdict.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,15 +53,41 @@ pub struct Filter {
     local4: Vec<prefix::IpPrefix>,
     local6: Vec<prefix::IpPrefix>,
     state: FlowState,
+    /// When true, deny all *new* inbound flows. Established traffic
+    /// (non-SYN TCP, cached UDP/SCTP flows, ICMP echo replies/errors,
+    /// TSMP) is still admitted. Mirrors Go's `NewShieldsUpFilter`.
+    shields_up: bool,
+    /// Map from peer tailnet IP → that peer node's capability set
+    /// (the keys of `Node.CapMap`). Used to evaluate `cap:<name>`
+    /// source predicates in filter rules — the Rust equivalent of
+    /// Go's `LocalBackend.srcIPHasCapForFilter` closure passed as
+    /// `capTest` to `filter.New`.
+    cap_holders: BTreeMap<IpAddr, BTreeSet<String>>,
+    /// Capability-grant matches partitioned by source address family,
+    /// for `caps_with_values`. Mirrors Go's `Filter.cap4`/`cap6` built
+    /// by `capMatchesFunc`. Unlike `matches4`/`matches6`, these include
+    /// `CapGrant`-only rules (which have no `DstPorts`).
+    cap4: MatchList,
+    cap6: MatchList,
 }
 
 impl Filter {
-    /// Build a filter from control-plane rules and local IPs.
-    pub fn new(rules: &[FilterRule], local_ips: &[IpAddr]) -> Result<Self, FilterError> {
+    /// Build a filter from control-plane rules, local IPs, and the
+    /// peer capability map.
+    ///
+    /// `cap_holders` maps each peer's tailnet IP to the set of capability
+    /// names that peer holds (the keys of its `Node.CapMap`). It is
+    /// consulted when a rule's `SrcIPs` contains a `cap:<name>` entry.
+    pub fn new(
+        rules: &[FilterRule],
+        local_ips: &[IpAddr],
+        cap_holders: &BTreeMap<IpAddr, BTreeSet<String>>,
+    ) -> Result<Self, FilterError> {
         let all_matches = parse::matches_from_filter_rules(rules)
             .map_err(|e| FilterError::Parse(e.to_string()))?;
         let matches = MatchList(all_matches);
         let (m4, m6) = matches.partition_by_family();
+        let (cap4, cap6) = matches.partition_caps_by_family();
 
         let (local4, local6) = partition_local_ips(local_ips);
 
@@ -70,6 +97,10 @@ impl Filter {
             local4,
             local6,
             state: FlowState::new(),
+            shields_up: false,
+            cap_holders: cap_holders.clone(),
+            cap4,
+            cap6,
         })
     }
 
@@ -82,7 +113,8 @@ impl Filter {
             std::net::Ipv4Addr::UNSPECIFIED.into(),
             std::net::Ipv6Addr::UNSPECIFIED.into(),
         ];
-        let f = Self::new(&rules, &local).unwrap_or_else(|_| Self {
+        let empty_caps = BTreeMap::new();
+        let f = Self::new(&rules, &local, &empty_caps).unwrap_or_else(|_| Self {
             matches4: MatchList::default(),
             matches6: MatchList::default(),
             local4: vec![prefix::IpPrefix {
@@ -94,6 +126,10 @@ impl Filter {
                 bits: 0,
             }],
             state: FlowState::new(),
+            shields_up: false,
+            cap_holders: BTreeMap::new(),
+            cap4: MatchList::default(),
+            cap6: MatchList::default(),
         });
         // Override local4/local6 with wildcard prefixes (host_prefix would
         // give /32 and /128, but we need /0).
@@ -117,7 +153,59 @@ impl Filter {
             local4: vec![],
             local6: vec![],
             state: FlowState::new(),
+            shields_up: false,
+            cap_holders: BTreeMap::new(),
+            cap4: MatchList::default(),
+            cap6: MatchList::default(),
         }
+    }
+
+    /// Enable or disable shields-up mode. When enabled, all *new* inbound
+    /// flows are denied; established flows (non-SYN TCP, cached UDP/SCTP,
+    /// ICMP echo replies/errors, TSMP) continue to be admitted. Outbound
+    /// traffic is unaffected. Mirrors Go's `Filter.shieldsUp`.
+    pub fn set_shields_up(&mut self, on: bool) {
+        self.shields_up = on;
+    }
+
+    /// Whether shields-up mode is currently active.
+    pub fn shields_up(&self) -> bool {
+        self.shields_up
+    }
+
+    /// Look up the capabilities a peer holds when talking to `dst`, per the
+    /// `CapGrant` entries in the compiled filter rules. Mirrors Go's
+    /// `Filter.CapsWithValues`.
+    ///
+    /// Returns a `PeerCapMap` (capability → values) collecting every
+    /// `CapMatch` whose source prefix contains `src` and whose destination
+    /// prefix contains `dst`.
+    pub fn caps_with_values(&self, src: IpAddr, dst: IpAddr) -> PeerCapMap {
+        let fam = if src.is_ipv4() {
+            &self.cap4
+        } else {
+            &self.cap6
+        };
+        let mut out: PeerCapMap = PeerCapMap::new();
+        for m in &fam.0 {
+            if !m.srcs.iter().any(|p| p.contains(src)) {
+                continue;
+            }
+            for cm in &m.caps {
+                if cm.cap.is_empty() {
+                    continue;
+                }
+                if cm.dst.contains(dst) {
+                    match out.get_mut(&cm.cap) {
+                        Some(prev) => prev.extend(cm.values.iter().cloned()),
+                        None => {
+                            out.insert(cm.cap.clone(), cm.values.clone());
+                        }
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// Add extra local CIDR prefixes (e.g. advertised subnet routes) to the
@@ -212,12 +300,18 @@ impl Filter {
         if !local_contains(&self.local4, q.dst) {
             return Verdict::NoVerdict;
         }
+        let caps = &self.cap_holders;
+        let shielded = self.shields_up;
         match q.proto {
             packet::ICMP_V4 => {
                 if q.is_echo_response() || q.is_error() {
                     return Verdict::Accept;
                 }
-                if self.matches4.matches_ips_only(q, no_cap) {
+                if !shielded
+                    && self
+                        .matches4
+                        .matches_ips_only(q, |s, c| has_cap(caps, s, c))
+                {
                     return Verdict::Accept;
                 }
             }
@@ -225,7 +319,7 @@ impl Filter {
                 if !q.is_tcp_syn() {
                     return Verdict::Accept;
                 }
-                if self.matches4.matches(q, no_cap) {
+                if !shielded && self.matches4.matches(q, |s, c| has_cap(caps, s, c)) {
                     return Verdict::Accept;
                 }
             }
@@ -240,13 +334,13 @@ impl Filter {
                 if self.state.get(&t) {
                     return Verdict::Accept;
                 }
-                if self.matches4.matches(q, no_cap) {
+                if !shielded && self.matches4.matches(q, |s, c| has_cap(caps, s, c)) {
                     return Verdict::Accept;
                 }
             }
             packet::TSMP => return Verdict::Accept,
             _ => {
-                if self.matches4.matches_proto_and_ips_only_if_all_ports(q) {
+                if !shielded && self.matches4.matches_proto_and_ips_only_if_all_ports(q) {
                     return Verdict::Accept;
                 }
                 return Verdict::NoVerdict;
@@ -259,12 +353,18 @@ impl Filter {
         if !local_contains(&self.local6, q.dst) {
             return Verdict::NoVerdict;
         }
+        let caps = &self.cap_holders;
+        let shielded = self.shields_up;
         match q.proto {
             packet::ICMP_V6 => {
                 if q.is_echo_response() || q.is_error() {
                     return Verdict::Accept;
                 }
-                if self.matches6.matches_ips_only(q, no_cap) {
+                if !shielded
+                    && self
+                        .matches6
+                        .matches_ips_only(q, |s, c| has_cap(caps, s, c))
+                {
                     return Verdict::Accept;
                 }
             }
@@ -272,7 +372,7 @@ impl Filter {
                 if !q.is_tcp_syn() {
                     return Verdict::Accept;
                 }
-                if self.matches6.matches(q, no_cap) {
+                if !shielded && self.matches6.matches(q, |s, c| has_cap(caps, s, c)) {
                     return Verdict::Accept;
                 }
             }
@@ -287,13 +387,13 @@ impl Filter {
                 if self.state.get(&t) {
                     return Verdict::Accept;
                 }
-                if self.matches6.matches(q, no_cap) {
+                if !shielded && self.matches6.matches(q, |s, c| has_cap(caps, s, c)) {
                     return Verdict::Accept;
                 }
             }
             packet::TSMP => return Verdict::Accept,
             _ => {
-                if self.matches6.matches_proto_and_ips_only_if_all_ports(q) {
+                if !shielded && self.matches6.matches_proto_and_ips_only_if_all_ports(q) {
                     return Verdict::Accept;
                 }
                 return Verdict::NoVerdict;
@@ -303,8 +403,14 @@ impl Filter {
     }
 }
 
-fn no_cap(_: &IpAddr, _: &str) -> bool {
-    false
+/// Look up whether `src` holds capability `cap` in the peer capability map.
+/// Mirrors Go's `LocalBackend.srcIPHasCapForFilter` — resolve the peer node
+/// by address, then check its `NodeCapMap` for the capability key.
+fn has_cap(cap_holders: &BTreeMap<IpAddr, BTreeSet<String>>, src: &IpAddr, cap: &str) -> bool {
+    if cap.is_empty() {
+        return false;
+    }
+    cap_holders.get(src).is_some_and(|caps| caps.contains(cap))
 }
 
 fn local_contains(local: &[prefix::IpPrefix], ip: IpAddr) -> bool {

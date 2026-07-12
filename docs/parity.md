@@ -14,7 +14,7 @@ verified.md):
 
 | Area | Was | Actually | Evidence |
 | --- | --- | --- | --- |
-| Packet filter | ✅ | 🔶 | capability ACLs stubbed — `no_cap()` always false (`crates/filter/src/lib.rs`); no shields-up field |
+| Packet filter | ✅ | ✅ | capability ACLs + shields-up mode wired (phase-fix-filter-caps): `cap:<name>` source predicates evaluated via peer `CapMap` lookup (`build_cap_holders` → `Filter::has_cap`); `CapGrant` dst grants via `caps_with_values`; `Filter::set_shields_up` denies new inbound flows (established TCP non-SYN / cached UDP / ICMP replies / TSMP still admitted); `ShieldsUp` pref wired through `PATCH /prefs` → live `set_shields_up` on the filter |
 | DERP client | ✅ | 🔶 | no pinned-key verify — any server key accepted (`crates/derp/src/client.rs`); no send rate-limiting |
 | Tailscale SSH | ✅ | 🔶 | server code exists but policy callback hardcoded `None` (`crates/ssh/src/…`) → all connections rejected |
 | Health tracking | ✅ | 🔶 | ~5 of 20 Go warnables; no per-region DERP health |

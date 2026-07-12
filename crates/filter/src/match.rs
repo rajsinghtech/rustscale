@@ -124,7 +124,10 @@ impl Matches {
         false
     }
 
-    /// Partition into v4-only and v6-only matches.
+    /// Partition into v4-only and v6-only matches for the packet-admission
+    /// path. A match is kept in a family only if it has at least one source
+    /// (prefix or cap) and at least one destination. Mirrors Go's
+    /// `matchesFamily`.
     pub fn partition_by_family(&self) -> (Matches, Matches) {
         let mut v4 = Vec::new();
         let mut v6 = Vec::new();
@@ -157,6 +160,43 @@ impl Matches {
                 v4.push(m4);
             }
             if (!m6.srcs.is_empty() || !m6.src_caps.is_empty()) && !m6.dsts.is_empty() {
+                v6.push(m6);
+            }
+        }
+        (Matches(v4), Matches(v6))
+    }
+
+    /// Partition the capability-grant matches (`CapGrant` entries) by source
+    /// address family. Unlike [`partition_by_family`], this keeps matches
+    /// that have `caps` and source prefixes regardless of whether they have
+    /// destination port ranges — a `CapGrant`-only rule has no `DstPorts`.
+    /// Mirrors Go's `capMatchesFunc`.
+    pub fn partition_caps_by_family(&self) -> (Matches, Matches) {
+        let mut v4 = Vec::new();
+        let mut v6 = Vec::new();
+        for m in &self.0 {
+            if m.caps.is_empty() {
+                continue;
+            }
+            let mut m4 = Match {
+                caps: m.caps.clone(),
+                ..Default::default()
+            };
+            let mut m6 = Match {
+                caps: m.caps.clone(),
+                ..Default::default()
+            };
+            for s in &m.srcs {
+                if s.is_v4() {
+                    m4.srcs.push(*s);
+                } else {
+                    m6.srcs.push(*s);
+                }
+            }
+            if !m4.srcs.is_empty() {
+                v4.push(m4);
+            }
+            if !m6.srcs.is_empty() {
                 v6.push(m6);
             }
         }

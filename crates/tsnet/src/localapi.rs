@@ -26,6 +26,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use rustscale_filter::Filter;
 use rustscale_health::{Severity, Tracker};
 use rustscale_ipn::{
     validate_notify_watch_opt, IpnBackend, LoginProfile, MaskedPrefs, NotifyWatchOpt, Prefs,
@@ -109,6 +110,11 @@ pub(crate) struct LocalApiState {
     /// before `up()`). Used by the `file-put` endpoint to proxy uploads
     /// through the tailnet.
     pub netstack: Option<Arc<rustscale_netstack::Netstack>>,
+    /// Shared packet filter. Set once after the server joins the tailnet
+    /// (the `Arc<Mutex<Filter>>` is stable across rebuilds — only its inner
+    /// value is swapped — so a `OnceLock` suffices). Used to apply shields-up
+    /// mode changes from `PATCH /prefs` without a full filter rebuild.
+    pub filter: std::sync::OnceLock<Arc<std::sync::Mutex<Filter>>>,
 }
 
 pub struct LocalApiHandle {
@@ -420,6 +426,18 @@ async fn handle_patch_prefs<W: AsyncWrite + Unpin>(
         }
         serde_json::to_value(&*prefs).unwrap_or_default()
     };
+
+    // Apply shields-up changes to the live filter without a full rebuild.
+    // The filter's `set_shields_up` toggles the flag that suppresses new
+    // inbound flow admission; established flows are preserved.
+    if masked.ShieldsUpSet {
+        if let Some(filter) = state.filter.get() {
+            filter
+                .lock()
+                .unwrap()
+                .set_shields_up(masked.Prefs.ShieldsUp);
+        }
+    }
 
     state.ipn_backend.bus().send(rustscale_ipn::Notify {
         Prefs: Some(updated.clone()),
@@ -2018,6 +2036,7 @@ mod tests {
             cert_params: None,
             taildrop: None,
             netstack: None,
+            filter: std::sync::OnceLock::new(),
         })
     }
 
@@ -2734,6 +2753,7 @@ mod tests {
             cert_params: None,
             taildrop: None,
             netstack: None,
+            filter: std::sync::OnceLock::new(),
         });
 
         let config = r#"{"TCP":{"8080":{"HTTP":true}}}"#;
@@ -2957,6 +2977,7 @@ mod tests {
             }),
             taildrop: None,
             netstack: None,
+            filter: std::sync::OnceLock::new(),
         })
     }
 

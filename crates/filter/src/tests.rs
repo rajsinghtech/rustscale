@@ -5,9 +5,12 @@
 
 #![allow(clippy::too_many_lines)]
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr};
 
-use rustscale_tailcfg::{FilterRule, NetPortRange as WireNetPortRange, PortRange as WirePortRange};
+use rustscale_tailcfg::{
+    CapGrant, FilterRule, NetPortRange as WireNetPortRange, PeerCapMap, PortRange, RawMessage,
+};
 
 use crate::packet::PacketInfo;
 use crate::{Filter, Response};
@@ -30,7 +33,7 @@ fn rule(srcs: &[&str], dsts: &[(&str, u16, u16)], protos: &[i32]) -> FilterRule 
             .map(|(ip, first, last)| WireNetPortRange {
                 IP: ip.to_string(),
                 Bits: None,
-                Ports: WirePortRange {
+                Ports: PortRange {
                     First: *first,
                     Last: *last,
                 },
@@ -41,7 +44,8 @@ fn rule(srcs: &[&str], dsts: &[(&str, u16, u16)], protos: &[i32]) -> FilterRule 
     }
 }
 
-/// Build the same filter as Go's `newFilter()` (lines 73-102).
+/// Build the same filter as Go's `newFilter()` (lines 73-102), including the
+/// final capability-gated rule (`cap-hit-1234-ssh`).
 fn new_test_filter() -> Filter {
     let rules = vec![
         rule(
@@ -79,6 +83,20 @@ fn new_test_filter() -> Filter {
             &[("::/0", 0, 65535)],
             &[i32::from(TEST_ALLOWED_PROTO)],
         ),
+        // Capability-gated rule: a peer with the `cap-hit-1234-ssh` node
+        // capability may reach 1.2.3.4:22. Mirrors Go's `newFilter` line 86.
+        FilterRule {
+            SrcIPs: vec!["cap:cap-hit-1234-ssh".into()],
+            DstPorts: vec![WireNetPortRange {
+                IP: "1.2.3.4".into(),
+                Bits: None,
+                Ports: PortRange {
+                    First: 22,
+                    Last: 22,
+                },
+            }],
+            ..Default::default()
+        },
     ];
 
     let _local_ips: Vec<IpAddr> = vec![
@@ -127,7 +145,8 @@ fn new_test_filter() -> Filter {
     // Let me remove 2602::1 from local IPs (it should not be local).
     all_local.retain(|ip| *ip != "2602::1".parse::<IpAddr>().unwrap());
 
-    Filter::new(&rules, &all_local).expect("filter should build")
+    let empty_caps: BTreeMap<IpAddr, BTreeSet<String>> = BTreeMap::new();
+    Filter::new(&rules, &all_local, &empty_caps).expect("filter should build")
 }
 
 /// Create a PacketInfo like Go's `parsed(proto, src, dst, sport, dport)`.
@@ -575,4 +594,297 @@ fn test_lru_max_512() {
         dst_port: 1,
     };
     assert!(s.get(&recent));
+}
+
+// ---------------------------------------------------------------------------
+// Capability ACL evaluation (Gap 1) — mirrors Go's TestFilter cap cases +
+// TestPeerCaps.
+// ---------------------------------------------------------------------------
+
+/// Build a cap_holders map: each `(IpAddr, &[&str])` pair inserts the peer
+/// IP with the given capability names.
+fn cap_holders(pairs: &[(IpAddr, &[&str])]) -> BTreeMap<IpAddr, BTreeSet<String>> {
+    let mut m = BTreeMap::new();
+    for (ip, caps) in pairs {
+        m.insert(
+            *ip,
+            caps.iter().map(std::string::ToString::to_string).collect::<BTreeSet<_>>(),
+        );
+    }
+    m
+}
+
+/// Table-driven capability source-match test, mirroring Go's `TestFilter`
+/// lines 168-171: 10.0.0.1 has `cap-hit-1234-ssh`; 10.0.0.2 does not.
+#[test]
+fn test_filter_src_capability_match() {
+    let mut f = new_test_filter();
+
+    // No cap_holders wired yet → cap-gated rule never matches.
+    assert_eq!(
+        f.check_in_info(&parsed(TCP, "10.0.0.1", "1.2.3.4", 30000, 22)),
+        Response::Drop
+    );
+
+    // Wire the capability: 10.0.0.1 holds cap-hit-1234-ssh.
+    let caps = cap_holders(&[("10.0.0.1".parse().unwrap(), &["cap-hit-1234-ssh"][..])]);
+    f.cap_holders = caps;
+
+    // Peer with the cap → allowed to 1.2.3.4:22.
+    assert_eq!(
+        f.check_in_info(&parsed(TCP, "10.0.0.1", "1.2.3.4", 30000, 22)),
+        Response::Accept
+    );
+    // Peer without the cap → denied.
+    assert_eq!(
+        f.check_in_info(&parsed(TCP, "10.0.0.2", "1.2.3.4", 30000, 22)),
+        Response::Drop
+    );
+    // Wrong cap → denied.
+    let caps2 = cap_holders(&[("10.0.0.3".parse().unwrap(), &["some-other-cap"][..])]);
+    f.cap_holders = caps2;
+    assert_eq!(
+        f.check_in_info(&parsed(TCP, "10.0.0.3", "1.2.3.4", 30000, 22)),
+        Response::Drop
+    );
+}
+
+/// A capability-gated rule also admits ICMP to the dst IP (the
+/// `matches_ips_only` path checks src_caps). Mirrors Go's `matchIPsOnly`
+/// cap branch. Uses a minimal filter (no `0.0.0.0/0` wildcard) so the cap
+/// branch is the only path that can admit the capped peer.
+#[test]
+fn test_filter_src_capability_icmp() {
+    let rules = vec![FilterRule {
+        SrcIPs: vec!["cap:cap-hit-1234-ssh".into()],
+        DstPorts: vec![WireNetPortRange {
+            IP: "1.2.3.4".into(),
+            Bits: None,
+            Ports: PortRange {
+                First: 22,
+                Last: 22,
+            },
+        }],
+        ..Default::default()
+    }];
+    let local: Vec<IpAddr> = vec!["1.2.3.4".parse().unwrap()];
+    let caps = cap_holders(&[("10.0.0.1".parse().unwrap(), &["cap-hit-1234-ssh"][..])]);
+    let mut f = Filter::new(&rules, &local, &caps).expect("filter should build");
+
+    // ICMP from a capped peer to 1.2.3.4 → accepted via matchIPsOnly cap branch.
+    assert_eq!(
+        f.check_in_info(&parsed(ICMP_V4, "10.0.0.1", "1.2.3.4", 0, 0)),
+        Response::Accept
+    );
+    // ICMP from an uncapped peer → dropped (no src-prefix match, no cap).
+    assert_eq!(
+        f.check_in_info(&parsed(ICMP_V4, "10.0.0.2", "1.2.3.4", 0, 0)),
+        Response::Drop
+    );
+}
+
+/// `caps_with_values` — port of Go's `TestPeerCaps`. Verifies that
+/// `CapGrant` entries are evaluated: a (src, dst) pair collects the caps
+/// whose src-prefix contains src and whose dst-prefix contains dst.
+#[test]
+fn test_caps_with_values() {
+    let rules = vec![
+        FilterRule {
+            SrcIPs: vec!["*".into()],
+            CapGrant: vec![CapGrant {
+                Dsts: vec!["0.0.0.0/0".into()],
+                Caps: vec!["is_ipv4".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        FilterRule {
+            SrcIPs: vec!["*".into()],
+            CapGrant: vec![CapGrant {
+                Dsts: vec!["::/0".into()],
+                Caps: vec!["is_ipv6".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        FilterRule {
+            SrcIPs: vec!["100.199.0.0/16".into()],
+            CapGrant: vec![CapGrant {
+                Dsts: vec!["100.200.0.0/16".into()],
+                Caps: vec!["some_super_admin".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+    ];
+    let empty_caps: BTreeMap<IpAddr, BTreeSet<String>> = BTreeMap::new();
+    let local: Vec<IpAddr> = vec![
+        "2.4.5.5".parse().unwrap(),
+        "2::2".parse().unwrap(),
+        "100.200.3.4".parse().unwrap(),
+    ];
+    let f = Filter::new(&rules, &local, &empty_caps).expect("filter should build");
+
+    let cases: &[(&str, &str, &[&str])] = &[
+        ("1.2.3.4", "2.4.5.5", &["is_ipv4"]),
+        ("1::1", "2::2", &["is_ipv6"]),
+        (
+            "100.199.1.2",
+            "100.200.3.4",
+            &["is_ipv4", "some_super_admin"],
+        ),
+        ("100.198.1.2", "100.200.3.4", &["is_ipv4"]), // bad src (198 not 199)
+        ("100.199.1.2", "100.201.3.4", &["is_ipv4"]), // bad dst (201 not 200)
+    ];
+    for (src, dst, want) in cases {
+        let got: Vec<String> = {
+            let map: PeerCapMap = f.caps_with_values(
+                src.parse::<IpAddr>().unwrap(),
+                dst.parse::<IpAddr>().unwrap(),
+            );
+            let mut keys: Vec<String> = map.keys().cloned().collect();
+            keys.sort();
+            keys
+        };
+        let mut want_sorted: Vec<String> = want.iter().map(std::string::ToString::to_string).collect();
+        want_sorted.sort();
+        assert_eq!(got, want_sorted, "src={src} dst={dst}");
+    }
+}
+
+/// `CapMap` (the newer cap→values map) values are carried through
+/// `caps_with_values` and merged across matching grants.
+#[test]
+fn test_caps_with_values_capmap_merge() {
+    let mut cm1 = PeerCapMap::new();
+    cm1.insert(
+        "svc-ports".into(),
+        vec![RawMessage("80".into()), RawMessage("443".into())],
+    );
+    let rules = vec![FilterRule {
+        SrcIPs: vec!["*".into()],
+        CapGrant: vec![CapGrant {
+            Dsts: vec!["0.0.0.0/0".into()],
+            Caps: vec![],
+            CapMap: cm1,
+        }],
+        ..Default::default()
+    }];
+    let empty_caps: BTreeMap<IpAddr, BTreeSet<String>> = BTreeMap::new();
+    let local: Vec<IpAddr> = vec!["5.6.7.8".parse().unwrap()];
+    let f = Filter::new(&rules, &local, &empty_caps).expect("filter should build");
+
+    let map = f.caps_with_values(
+        "1.2.3.4".parse::<IpAddr>().unwrap(),
+        "5.6.7.8".parse::<IpAddr>().unwrap(),
+    );
+    assert!(map.contains_key("svc-ports"));
+    let vals = map.get("svc-ports").unwrap();
+    assert_eq!(vals.len(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// Shields-up mode (Gap 2) — mirrors Go's `NewShieldsUpFilter`.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_shields_up_denies_new_inbound_tcp() {
+    let mut f = new_test_filter();
+    // Sanity: with shields down, 8.1.1.1 => 1.2.3.4:22 is allowed.
+    assert_eq!(
+        f.check_in_info(&parsed(TCP, "8.1.1.1", "1.2.3.4", 999, 22)),
+        Response::Accept
+    );
+
+    // Shields up → new inbound SYN denied even though a rule allows it.
+    f.set_shields_up(true);
+    assert_eq!(
+        f.check_in_info(&parsed(TCP, "8.1.1.1", "1.2.3.4", 999, 22)),
+        Response::Drop
+    );
+
+    // Shields down again → allowed.
+    f.set_shields_up(false);
+    assert_eq!(
+        f.check_in_info(&parsed(TCP, "8.1.1.1", "1.2.3.4", 999, 22)),
+        Response::Accept
+    );
+}
+
+#[test]
+fn test_shields_up_allows_established_tcp() {
+    let mut f = new_test_filter();
+    f.set_shields_up(true);
+
+    // Non-SYN TCP (continuation of an existing session) is still admitted.
+    let mut info = parsed(TCP, "8.1.1.1", "1.2.3.4", 999, 22);
+    info.is_tcp_syn = false;
+    info.tcp_flags = 0x10; // ACK
+    assert_eq!(f.check_in_info(&info), Response::Accept);
+
+    // Even from a src/dst with no matching rule at all.
+    let mut info2 = parsed(TCP, "99.99.99.99", "1.2.3.4", 999, 22);
+    info2.is_tcp_syn = false;
+    info2.tcp_flags = 0x10;
+    assert_eq!(f.check_in_info(&info2), Response::Accept);
+}
+
+#[test]
+fn test_shields_up_allows_cached_udp_drops_new_udp() {
+    let mut f = new_test_filter();
+
+    // Record an outbound UDP flow (we talk to 102.102.102.102:4343).
+    let outbound = parsed(UDP, "102.102.102.102", "119.119.119.119", 4343, 4242);
+    f.update_outbound_info(&outbound);
+
+    // With shields down, the return packet is admitted (cached).
+    let ret = parsed(UDP, "119.119.119.119", "102.102.102.102", 4242, 4343);
+    assert_eq!(f.check_in_info(&ret), Response::Accept);
+
+    // Shields up: the cached return packet is STILL admitted.
+    f.set_shields_up(true);
+    assert_eq!(f.check_in_info(&ret), Response::Accept);
+
+    // But a new unsolicited UDP flow is dropped.
+    let unsolicited = parsed(UDP, "119.119.119.119", "102.102.102.102", 9999, 53);
+    assert_eq!(f.check_in_info(&unsolicited), Response::Drop);
+}
+
+#[test]
+fn test_shields_up_allows_icmp_replies_drops_new_icmp() {
+    let mut f = new_test_filter();
+    f.set_shields_up(true);
+
+    // ICMP echo reply / error is always admitted (established control flow).
+    let mut reply = parsed(ICMP_V4, "8.1.1.1", "1.2.3.4", 0, 0);
+    reply.is_icmp_echo_reply = true;
+    assert_eq!(f.check_in_info(&reply), Response::Accept);
+
+    let mut err = parsed(ICMP_V4, "8.1.1.1", "1.2.3.4", 0, 0);
+    err.is_icmp_error = true;
+    assert_eq!(f.check_in_info(&err), Response::Accept);
+
+    // A fresh ICMP echo request (not a reply, not an error) is dropped
+    // under shields-up (the matchIPsOnly path is suppressed).
+    let echo = parsed(ICMP_V4, "8.1.1.1", "1.2.3.4", 0, 0);
+    assert_eq!(f.check_in_info(&echo), Response::Drop);
+}
+
+#[test]
+fn test_shields_up_allows_tsmp() {
+    let mut f = new_test_filter();
+    f.set_shields_up(true);
+    // TSMP is always admitted (Tailscale Mesh Protocol).
+    let tsmp = parsed(99, "8.1.1.1", "1.2.3.4", 0, 0);
+    assert_eq!(f.check_in_info(&tsmp), Response::Accept);
+}
+
+#[test]
+fn test_shields_up_flag_getter() {
+    let mut f = new_test_filter();
+    assert!(!f.shields_up());
+    f.set_shields_up(true);
+    assert!(f.shields_up());
+    f.set_shields_up(false);
+    assert!(!f.shields_up());
 }

@@ -27,9 +27,19 @@ mod derp_io;
 mod disco_io;
 mod endpoint;
 mod relay;
+mod relay_manager;
 
 pub use endpoint::{BestPath, Endpoint, PathClass, TRUST_BEST_ADDR_DURATION};
-pub use relay::{decode_geneve, encode_geneve, RelayHandshake, RelayPhase, GENEVE_HEADER_LEN};
+pub use relay::{
+    decode_geneve, decode_geneve_full, encode_geneve, encode_geneve_disco,
+    encode_geneve_disco_control, encode_geneve_wireguard, looks_like_geneve_disco,
+    looks_like_geneve_wireguard, RelayHandshake, RelayPhase, GENEVE_HEADER_LEN,
+    GENEVE_PROTOCOL_DISCO, GENEVE_PROTOCOL_WIREGUARD,
+};
+pub use relay_manager::{
+    discover_relay_servers, spawn_relay_manager, CandidatePeerRelay, RelayManagerContext,
+    RelayManagerHandle, ServerEndpoint,
+};
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -133,6 +143,8 @@ struct Inner {
     portmapper: Option<rustscale_portmapper::Client>,
     /// Test-support: suppress direct paths and force DERP (see MagicsockConfig).
     disable_direct_paths: bool,
+    /// Relay manager for peer relay discovery, allocation, and handshake.
+    relay_manager: Option<RelayManagerHandle>,
 }
 
 /// Manages DERP connections across multiple regions.
@@ -490,7 +502,7 @@ impl Magicsock {
             config.health.clone(),
         );
 
-        let inner = Arc::new(Inner {
+        let mut inner = Arc::new(Inner {
             node_public,
             disco,
             udp,
@@ -502,7 +514,17 @@ impl Magicsock {
             wg_send,
             portmapper: config.portmapper,
             disable_direct_paths: config.disable_direct_paths,
+            relay_manager: None,
         });
+
+        // Spawn the relay manager event loop. The handle is stored in Inner
+        // for use by set_netmap and disco receive paths.
+        let rm_handle = relay_manager::spawn_relay_manager(inner.clone());
+        // Safety: inner was just created and no other tasks are running yet,
+        // so get_mut is guaranteed to succeed.
+        if let Some(inner_mut) = Arc::get_mut(&mut inner) {
+            inner_mut.relay_manager = Some(rm_handle);
+        }
 
         // Launch background recv tasks (UDP + DERP demux + reconnect supervisor).
         spawn_recv_tasks(inner.clone(), derp_recv_rx, reconnect_rx);
@@ -747,6 +769,30 @@ impl Magicsock {
                         }
                     }
                 }
+            }
+        }
+
+        // Discover relay server candidates from the netmap and update the
+        // relay manager. Ports Go's `updateRelayServersSet`.
+        if let Some(ref rm) = self.inner.relay_manager {
+            let servers = relay_manager::discover_relay_servers(
+                &rustscale_tailcfg::Node {
+                    Key: self.inner.node_public.clone(),
+                    DiscoKey: self.inner.disco.public(),
+                    Cap: rustscale_tailcfg::CAP_VERSION_RELAY,
+                    ..Default::default()
+                },
+                &peers,
+            );
+            rm.handle_relay_servers_set(servers);
+
+            // Start relay path discovery for peers that don't already have
+            // active relay work.
+            for peer in &peers {
+                if peer.Key.is_zero() || peer.DiscoKey.is_zero() {
+                    continue;
+                }
+                rm.start_discovery(peer.Key.clone(), peer.DiscoKey.clone());
             }
         }
 
@@ -1006,8 +1052,128 @@ fn spawn_recv_tasks(
     });
 }
 
+impl relay_manager::RelayManagerContext for Inner {
+    fn seal_disco(&self, peer_disco: &DiscoPublic, msg: &Message) -> Option<Vec<u8>> {
+        self.disco.seal(peer_disco, msg)
+    }
+
+    fn send_disco_udp(&self, addr: SocketAddr, vni: u32, control: bool, packet: &[u8]) {
+        if let Some(ref udp) = self.udp {
+            let framed = if control {
+                relay::encode_geneve_disco_control(vni, packet)
+            } else {
+                relay::encode_geneve_disco(vni, packet)
+            };
+            let udp = udp.clone();
+            let framed = framed.clone();
+            tokio::spawn(async move {
+                let _ = udp.send_to(&framed, addr).await;
+            });
+        }
+    }
+
+    fn send_disco_derp(&self, region: i32, dst_key: NodePublic, packet: Vec<u8>) {
+        let io = {
+            let conns = self
+                .derp
+                .connections
+                .read()
+                .expect("derp connections lock poisoned");
+            conns.get(&region).cloned()
+        };
+        if let Some(io) = io {
+            tokio::spawn(async move {
+                io.send_packet(dst_key, packet).await;
+            });
+        }
+    }
+
+    fn our_disco_public(&self) -> DiscoPublic {
+        self.disco.public()
+    }
+
+    fn our_node_public(&self) -> NodePublic {
+        self.node_public.clone()
+    }
+
+    fn peer_disco_key(&self, peer_key: &NodePublic) -> Option<DiscoPublic> {
+        let endpoints = self
+            .endpoints
+            .read()
+            .expect("endpoints lock poisoned");
+        endpoints.get(peer_key).map(|ep| ep.peer_disco_key().clone())
+    }
+
+    fn peer_derp_region(&self, peer_key: &NodePublic) -> i32 {
+        let endpoints = self
+            .endpoints
+            .read()
+            .expect("endpoints lock poisoned");
+        endpoints
+            .get(peer_key)
+            .map_or(0, endpoint::Endpoint::derp_send_region)
+    }
+
+    fn set_relay(&self, peer_key: &NodePublic, addr: SocketAddr, vni: u32) {
+        let mut endpoints = self
+            .endpoints
+            .write()
+            .expect("endpoints lock poisoned");
+        if let Some(ep) = endpoints.get_mut(peer_key) {
+            ep.set_relay(addr, vni);
+            if debug_enabled() {
+                eprintln!(
+                    "DBG relay_set peer={} addr={addr} vni={vni}",
+                    short_key(peer_key)
+                );
+            }
+        }
+    }
+
+    fn send_pong_via_relay(
+        &self,
+        addr: SocketAddr,
+        vni: u32,
+        peer_disco: &DiscoPublic,
+        tx_id: [u8; 12],
+    ) {
+        let pong = Message::Pong(Pong {
+            tx_id,
+            src: rustscale_disco::AddrPort::from(addr),
+        });
+        if let Some(sealed) = self.disco.seal(peer_disco, &pong) {
+            self.send_disco_udp(addr, vni, false, &sealed);
+        }
+    }
+
+    fn is_self_node(&self, node_key: &NodePublic) -> bool {
+        node_key == &self.node_public
+    }
+
+    fn handle_self_alloc_request(
+        &self,
+        _client_disco: [DiscoPublic; 2],
+        _generation: u32,
+    ) -> Option<rustscale_disco::AllocateUdpRelayEndpointResponse> {
+        None
+    }
+}
+
 impl Inner {
     async fn handle_udp_packet(&self, data: &[u8], src: SocketAddr) {
+        // Check for Geneve-encapsulated packets first (relay path).
+        if relay::looks_like_geneve_disco(data) {
+            if let Some((_proto, vni, _control, inner)) = relay::decode_geneve_full(data) {
+                self.handle_disco_udp_relay(inner, src, vni);
+                return;
+            }
+        }
+        if relay::looks_like_geneve_wireguard(data) {
+            if let Some((_proto, vni, _control, inner)) = relay::decode_geneve_full(data) {
+                self.handle_wg_udp_relay(inner, src, vni).await;
+                return;
+            }
+        }
         if DiscoIo::looks_like_disco(data) {
             self.handle_disco_udp(data, src).await;
         } else {
@@ -1068,6 +1234,67 @@ impl Inner {
                 .await;
         }
         // Unknown source address — drop the packet.
+    }
+
+    /// Handle a Geneve-encapsulated disco message received via UDP (relay
+    /// path). The Geneve header has already been stripped; `data` is the
+    /// raw disco envelope.
+    fn handle_disco_udp_relay(&self, data: &[u8], src: SocketAddr, vni: u32) {
+        let (sender_disco, msg) = match self.disco.open(data) {
+            Some(v) => v,
+            None => return,
+        };
+
+        if debug_enabled() {
+            eprintln!(
+                "DBG disco_relay recv from {src} vni={vni} type={}",
+                msg.summary()
+            );
+        }
+
+        match &msg {
+            Message::BindUdpRelayEndpointChallenge(_)
+            | Message::Ping(_)
+            | Message::Pong(_) => {
+                if let Some(ref rm) = self.relay_manager {
+                    rm.handle_rx_disco_msg(relay_manager::RelayDiscoMsg {
+                        msg,
+                        disco: sender_disco,
+                        from: src,
+                        vni,
+                        relay_server_node_key: None,
+                        source_node_key: None,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Handle a Geneve-encapsulated WireGuard data packet received via UDP
+    /// (relay path). The Geneve header has already been stripped; `data` is
+    /// the raw WG datagram.
+    async fn handle_wg_udp_relay(&self, data: &[u8], src: SocketAddr, _vni: u32) {
+        // Look up the peer by source address. In the relay path, the source
+        // is the relay server, not the peer — but we record the relay addr
+        // → peer mapping when set_relay is called. For now, use the
+        // addr_to_peer map.
+        let peer = {
+            let map = self
+                .addr_to_peer
+                .read()
+                .expect("addr_to_peer lock poisoned");
+            map.get(&src).cloned()
+        };
+        if let Some(peer) = peer {
+            let _ = self
+                .wg_send
+                .send(WgDatagram {
+                    peer,
+                    data: data.to_vec(),
+                })
+                .await;
+        }
     }
 
     async fn handle_disco_udp(&self, packet: &[u8], src: SocketAddr) {
@@ -1227,6 +1454,45 @@ impl Inner {
                         }
                     }
                 }
+            }
+            Message::CallMeMaybeVia(cmmv) => {
+                // The peer is telling us about a relay endpoint it allocated.
+                // Route to the relay manager to start a handshake.
+                if let Some(ref rm) = self.relay_manager {
+                    let peer_disco = {
+                        let endpoints = self
+                            .endpoints
+                            .read()
+                            .expect("endpoints lock poisoned");
+                        endpoints
+                            .get(&source)
+                            .map(|ep| ep.peer_disco_key().clone())
+                            .unwrap_or(sender_disco.clone())
+                    };
+                    rm.handle_call_me_maybe_via(source.clone(), peer_disco, &cmmv);
+                }
+            }
+            Message::AllocateUdpRelayEndpointResponse(_) => {
+                // Response to our allocation request, arriving via DERP.
+                // Route to the relay manager.
+                if let Some(ref rm) = self.relay_manager {
+                    rm.handle_rx_disco_msg(relay_manager::RelayDiscoMsg {
+                        msg,
+                        disco: sender_disco,
+                        from: SocketAddr::new(
+                            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                            0,
+                        ),
+                        vni: 0,
+                        relay_server_node_key: Some(source.clone()),
+                        source_node_key: Some(source.clone()),
+                    });
+                }
+            }
+            Message::AllocateUdpRelayEndpointRequest(_) => {
+                // A peer is asking us to allocate a relay endpoint. We don't
+                // run a relay server yet — silently drop. Phase 2 will wire
+                // this to the relayserver extension.
             }
             _ => {}
         }

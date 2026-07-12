@@ -1832,8 +1832,11 @@ VERSION_ID='11'"#;
     #[test]
     fn test_runtime_fields_exit_node_id() {
         let mut hi = Hostinfo::default();
-        let exit_id: StableNodeID = "nodeABC".into();
-        apply_runtime_fields(&mut hi, Some(&exit_id), false, false);
+        let rt = RuntimeHostinfo {
+            exit_node_id: Some("nodeABC".into()),
+            ..Default::default()
+        };
+        apply_runtime_fields(&mut hi, &rt);
         assert_eq!(hi.ExitNodeID, "nodeABC");
         assert!(!hi.IngressEnabled);
     }
@@ -1841,7 +1844,11 @@ VERSION_ID='11'"#;
     #[test]
     fn test_runtime_fields_ingress_enabled() {
         let mut hi = Hostinfo::default();
-        apply_runtime_fields(&mut hi, None, true, false);
+        let rt = RuntimeHostinfo {
+            ingress_enabled: true,
+            ..Default::default()
+        };
+        apply_runtime_fields(&mut hi, &rt);
         assert!(hi.IngressEnabled);
         assert!(hi.ExitNodeID.is_empty());
     }
@@ -1849,8 +1856,11 @@ VERSION_ID='11'"#;
     #[test]
     fn test_runtime_fields_empty_exit_id_not_set() {
         let mut hi = Hostinfo::default();
-        let empty: StableNodeID = String::new();
-        apply_runtime_fields(&mut hi, Some(&empty), false, false);
+        let rt = RuntimeHostinfo {
+            exit_node_id: Some(String::new()),
+            ..Default::default()
+        };
+        apply_runtime_fields(&mut hi, &rt);
         assert!(
             hi.ExitNodeID.is_empty(),
             "empty StableNodeID should not be set"

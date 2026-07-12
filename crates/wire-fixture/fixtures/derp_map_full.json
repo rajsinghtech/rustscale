@@ -1,0 +1,1 @@
+{"Regions":{"1":{"RegionID":1,"RegionCode":"nyc","RegionName":"New York City","Latitude":40.71,"Longitude":-74.01,"Nodes":[{"Name":"1a","RegionID":1,"HostName":"derp1.tailscale.com","STUNPort":3478,"DERPPort":443},{"Name":"1b","RegionID":1,"HostName":"derp2.tailscale.com","STUNOnly":true}]},"9":{"RegionID":9,"RegionCode":"sin","RegionName":"Singapore","Nodes":null}}}

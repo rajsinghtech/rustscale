@@ -2,19 +2,19 @@
 
 ## Goal
 
-Add `tailscale-rs` (the official Tailscale Rust implementation at `../tailscale-rs`,
+Add `tailscale-rs` (the official Tailscale Rust implementation,
 v0.4.0) as a third benchmark target alongside `rustscale-bench` and `tailscaled (Go)`.
 Create a new crate `crates/bench-tsrs` that implements the same RSB1 wire protocol and
 CLI as the existing `rustscale-bench`, but uses `tailscale::Device` instead of
 `rustscale_tsnet::Server`. Add a runner script `tools/bench/run-tailscale-rs.sh`.
 
-**Do NOT modify the tailscale-rs repo.** It is a read-only path dependency.
+**Do NOT modify the tailscale-rs repo.** It is a git dependency, not a local path dep.
 
 ## File layout (all in rustscale repo)
 
 ```
 crates/bench-tsrs/
-  Cargo.toml          — depends on tailscale (path = "../../tailscale-rs"), tokio, clap, serde_json
+  Cargo.toml          — depends on tailscale (git, tag v0.4.0), tokio, clap, serde_json
   src/main.rs         — CLI: server / client / latency subcommands, JSON output
   src/protocol.rs     — RSB1 wire protocol (same as rustscale-bench, generic over AsyncRead/AsyncWrite)
   src/server.rs       — server mode: Device::new + tcp_listen + RSB1 handler
@@ -23,9 +23,10 @@ crates/bench-tsrs/
 tools/bench/run-tailscale-rs.sh  — runner script (mirrors run-local.sh pattern)
 ```
 
-Also: add `crates/bench-tsrs` to workspace members in root `Cargo.toml`.
+Also: `crates/bench-tsrs` is excluded from the workspace and built standalone
+(it has an empty `[workspace]` table) because tailscale-rs is a separate workspace root.
 
-## tailscale-rs API reference (v0.4.0, read from ../tailscale-rs/src/lib.rs)
+## tailscale-rs API reference (v0.4.0, from the `tailscale` crate git dep)
 
 ### Device creation
 ```rust
@@ -128,24 +129,25 @@ Mirror `tools/bench/run-local.sh` but use `tsrs-bench` binary. Key changes:
 [package]
 name = "tsrs-bench"
 description = "Throughput and latency benchmark harness for tailscale-rs"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-repository.workspace = true
-
-[lints]
-workspace = true
+version = "0.1.0"
+edition = "2021"
+license = "BSD-3-Clause"
+repository = "https://github.com/rajsingh/rustscale"
 
 [dependencies]
-tailscale = { path = "../../tailscale-rs" }
-serde.workspace = true
-serde_json.workspace = true
-tokio.workspace = true
+tailscale = { git = "https://github.com/tailscale/tailscale-rs.git", tag = "v0.4.0" }
+url = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
+
+# Standalone crate — not part of the rustscale workspace.
+[workspace]
 ```
 
 Note: `tailscale` crate uses edition 2024 internally but that's fine — edition is
-per-crate and cargo handles cross-edition path deps. The `tokio` feature is already
+per-crate and cargo handles cross-edition deps. The `tokio` feature is already
 enabled in tailscale's dependencies (`ts_netstack_smoltcp` with `features = ["tokio"]`).
 
 ## Implementation notes
@@ -177,11 +179,9 @@ enabled in tailscale's dependencies (`ts_netstack_smoltcp` with `features = ["to
 ## Acceptance criteria
 
 ```bash
-cargo build -p tsrs-bench --release
-cargo clippy -p tsrs-bench --all-targets
+cargo build --manifest-path crates/bench-tsrs/Cargo.toml --release
+cargo clippy --manifest-path crates/bench-tsrs/Cargo.toml --all-targets -- -D warnings
 ```
-
-Both must pass with zero warnings (workspace lints are pedantic).
 
 The runner script must work:
 ```bash
@@ -201,8 +201,10 @@ tools/bench/run-tailscale-rs.sh
 
 ## Reference files in tailscale-rs (read-only, do NOT modify)
 
-- `../tailscale-rs/src/lib.rs` — Device API
-- `../tailscale-rs/src/config.rs` — Config type
-- `../tailscale-rs/examples/tcp_echo/main.rs` — TCP listener example
-- `../tailscale-rs/ts_netstack_smoltcp_socket/src/tcp/stream.rs` — TcpStream impl
-- `../tailscale-rs/ts_netstack_smoltcp_socket/src/tcp/listener.rs` — TcpListener impl
+Browse the `tailscale` crate source from the git dep at `v0.4.0`:
+
+- `src/lib.rs` — Device API
+- `src/config.rs` — Config type
+- `examples/tcp_echo/main.rs` — TCP listener example
+- `ts_netstack_smoltcp_socket/src/tcp/stream.rs` — TcpStream impl
+- `ts_netstack_smoltcp_socket/src/tcp/listener.rs` — TcpListener impl

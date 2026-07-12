@@ -33,8 +33,8 @@ echo "[bench] tsrs-bench local harness: $TS"
 
 # Build the bench binary.
 echo "[bench] building tsrs-bench..." >&2
-cargo build -p tsrs-bench --release 2>&1 | tail -1 >&2
-BENCH_BIN="target/release/tsrs-bench"
+cargo build --manifest-path crates/bench-tsrs/Cargo.toml --release 2>&1 | tail -1 >&2
+BENCH_BIN="crates/bench-tsrs/target/release/tsrs-bench"
 
 # Provision ephemeral tailnet.
 bench_provision_tailnet

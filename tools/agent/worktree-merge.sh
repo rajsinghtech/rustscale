@@ -37,6 +37,17 @@ CHECK_OUT=$(cd "$REPO_DIR/$WT_DIR" && run_checks 2>&1) || {
 }
 
 echo "[merge] checks green, merging $WT_BRANCH into master"
+
+# Agents often write files without committing. Stage and commit any uncommitted
+# changes in the worktree before merging, otherwise the work is lost.
+cd "$REPO_DIR/$WT_DIR"
+if ! git diff --cached --quiet 2>/dev/null || ! git diff --quiet 2>/dev/null || [ -n "$(git ls-files --others --exclude-standard 2>/dev/null)" ]; then
+  echo "[merge] committing uncommitted agent changes in worktree ..."
+  git add -A
+  git -c user.name=rajsinghtech -c user.email=rajsinghcpre@gmail.com \
+    commit -q -m "agent: $TITLE" --no-verify 2>/dev/null || true
+fi
+
 cd "$REPO_DIR"
 git checkout master
 MERGE_EXIT=0

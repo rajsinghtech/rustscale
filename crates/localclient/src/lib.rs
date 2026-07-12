@@ -408,6 +408,51 @@ impl LocalClient {
     }
 
     // -----------------------------------------------------------------------
+    // Debug / dial / DNS / IP forwarding API
+    // -----------------------------------------------------------------------
+
+    /// GET /localapi/v0/debug?action=<method> — generic debug endpoint
+    /// caller. Returns the raw JSON response from the debug sub-command.
+    pub async fn debug(&self, method: &str) -> Result<serde_json::Value, LocalClientError> {
+        let path = format!("/localapi/v0/debug?action={}", url_encode(method));
+        self.get_json(&path).await
+    }
+
+    /// POST /localapi/v0/dial?addr=<host:port> — dial a remote address via
+    /// the daemon's netstack. Returns JSON with `ok`, `addr`, and either
+    /// `resolved`+`via` on success or `error` on failure.
+    pub async fn dial(&self, addr: &str) -> Result<serde_json::Value, LocalClientError> {
+        let path = format!("/localapi/v0/dial?addr={}", url_encode(addr));
+        let (_status, body) = self.send_request("POST", &path, &[]).await?;
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|e| LocalClientError::Json(e.to_string()))?;
+        Ok(json)
+    }
+
+    /// GET /localapi/v0/dns-query?name=<name>&type=<type> — query the
+    /// daemon's DNS resolver. Returns JSON with `name`, `type`, `results`,
+    /// and `magicdns_enabled`.
+    pub async fn dns_query(
+        &self,
+        name: &str,
+        qtype: &str,
+    ) -> Result<serde_json::Value, LocalClientError> {
+        let path = format!(
+            "/localapi/v0/dns-query?name={}&type={}",
+            url_encode(name),
+            url_encode(qtype)
+        );
+        self.get_json(&path).await
+    }
+
+    /// GET /localapi/v0/check-ip-forwarding — check if IP forwarding is
+    /// enabled on the daemon's host. Returns JSON with `ipv4_forwarding`,
+    /// `ipv6_forwarding`, and `platform`.
+    pub async fn check_ip_forwarding(&self) -> Result<serde_json::Value, LocalClientError> {
+        self.get_json("/localapi/v0/check-ip-forwarding").await
+    }
+
+    // -----------------------------------------------------------------------
     // Internal HTTP plumbing
     // -----------------------------------------------------------------------
 

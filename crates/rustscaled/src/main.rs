@@ -26,13 +26,17 @@ fn main() {
             let mut hostname = None;
             let mut socket = None;
             let mut tun = false;
+            let mut port: Option<u16> = None;
+            let mut socks5_server: Option<String> = None;
+            let mut http_proxy_server: Option<String> = None;
+            let mut cleanup = false;
             let mut i = 2;
             while i < args.len() {
                 match args[i].as_str() {
-                    "--statedir" => {
+                    "--statedir" | "--state" => {
                         i += 1;
                         if i >= args.len() {
-                            eprintln!("error: --statedir requires a value");
+                            eprintln!("error: {} requires a value", args[i - 1]);
                             std::process::exit(1);
                         }
                         statedir = Some(PathBuf::from(&args[i]));
@@ -53,6 +57,34 @@ fn main() {
                         }
                         hostname = Some(args[i].clone());
                     }
+                    "--port" => {
+                        i += 1;
+                        if i >= args.len() {
+                            eprintln!("error: --port requires a value");
+                            std::process::exit(1);
+                        }
+                        port = Some(args[i].parse().unwrap_or_else(|_| {
+                            eprintln!("error: invalid --port value: {}", args[i]);
+                            std::process::exit(1);
+                        }));
+                    }
+                    "--socks5-server" => {
+                        i += 1;
+                        if i >= args.len() {
+                            eprintln!("error: --socks5-server requires a value");
+                            std::process::exit(1);
+                        }
+                        socks5_server = Some(args[i].clone());
+                    }
+                    "--http-proxy-server" => {
+                        i += 1;
+                        if i >= args.len() {
+                            eprintln!("error: --http-proxy-server requires a value");
+                            std::process::exit(1);
+                        }
+                        http_proxy_server = Some(args[i].clone());
+                    }
+                    "--cleanup" => cleanup = true,
                     "--tun" => tun = true,
                     other => {
                         eprintln!("error: unknown argument '{other}'");
@@ -67,7 +99,18 @@ fn main() {
                 .build()
                 .expect("failed to create tokio runtime");
             rt.block_on(async {
-                if let Err(e) = Box::pin(daemon::run(statedir, hostname, tun, socket)).await {
+                if let Err(e) = Box::pin(daemon::run(
+                    statedir,
+                    hostname,
+                    tun,
+                    socket,
+                    port,
+                    socks5_server,
+                    http_proxy_server,
+                    cleanup,
+                ))
+                .await
+                {
                     eprintln!("rustscaled: {e}");
                     std::process::exit(1);
                 }
@@ -110,7 +153,11 @@ fn main() {
 }
 
 fn usage(bin: &str) {
-    eprintln!("usage: {bin} run [--statedir <dir>] [--socket <path>] [--hostname <name>] [--tun]");
+    eprintln!(
+        "usage: {bin} run [--statedir <dir>] [--state <dir>] [--socket <path>] \
+         [--hostname <name>] [--port <port>] [--tun] \
+         [--socks5-server <addr>] [--http-proxy-server <addr>] [--cleanup]"
+    );
     eprintln!("       {bin} install-system-daemon");
     eprintln!("       {bin} uninstall-system-daemon");
 }

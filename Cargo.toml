@@ -41,7 +41,7 @@ sha2 = { version = "0.10" }
 boringtun = "0.7"
 
 # Userspace TCP/IP stack for tsnet-style dialing/listening.
-smoltcp = { version = "0.13", default-features = false, features = ["medium-ip", "proto-ipv4", "socket-tcp", "alloc"] }
+smoltcp = { version = "0.13", default-features = false, features = ["medium-ip", "proto-ipv4", "socket-tcp", "socket-udp", "alloc"] }
 
 # PollSender for properly waking tasks on full mpsc channels (netstack).
 tokio-util = "0.7"

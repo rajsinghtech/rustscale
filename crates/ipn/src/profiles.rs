@@ -557,7 +557,7 @@ mod tests {
     #[test]
     fn profile_manager_switch_not_found() {
         let tmp = tempfile::tempdir().unwrap();
-        let pm = ProfileManager::new(tmp.path()).unwrap();
+        let mut pm = ProfileManager::new(tmp.path()).unwrap();
         let err = pm.switch_profile("nonexistent").unwrap_err();
         assert!(matches!(err, ProfileError::NotFound(_)));
     }
@@ -652,9 +652,7 @@ mod tests {
     #[test]
     fn profile_manager_set_prefs_fires_hook() {
         let tmp = tempfile::tempdir().unwrap();
-        let pm = ProfileManager::new(tmp.path()).unwrap();
-        // No current profile → set_prefs should not panic.
-        let mut pm = pm;
+        let mut pm = ProfileManager::new(tmp.path()).unwrap();
         let hook_fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let hf = hook_fired.clone();
         pm.set_state_change_hook(Box::new(move |_, _| {

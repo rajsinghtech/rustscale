@@ -5,176 +5,157 @@ Status legend: ✅ done · 🔶 partial · 🚧 in progress · ⬜ not started.
 Active execution order is in CLAUDE.md; this file is the full inventory —
 update statuses as phases land.
 
-## Verified gap audit (2026-07-12)
+## Verified gap audit (2026-07-12, re-verified 2026-07-13)
 
 An independent three-way codebase comparison (`docs/audit/*.md`) plus an
-adversarial verification pass (`docs/audit/verified.md`) found several rows below
-were **overstated**. Corrected status (verdicts backed by file:line evidence in
-verified.md):
-
-| Area | Was | Actually | Evidence |
-| --- | --- | --- | --- |
-| Packet filter | ✅ | ✅ | capability ACLs + shields-up mode wired (phase-fix-filter-caps): `cap:<name>` source predicates evaluated via peer `CapMap` lookup (`build_cap_holders` → `Filter::has_cap`); `CapGrant` dst grants via `caps_with_values`; `Filter::set_shields_up` denies new inbound flows (established TCP non-SYN / cached UDP / ICMP replies / TSMP still admitted); `ShieldsUp` pref wired through `PATCH /prefs` → live `set_shields_up` on the filter |
-| DERP client | ✅ | ✅ | pinned-key verify via `expected_server_key` param (`crates/derp/src/client.rs`); send rate-limiting via token-bucket from ServerInfo |
-| Tailscale SSH | ✅ | 🔶 | policy callback wired to netmap `SSHPolicy` (`tsnet/ssh.rs` reads shared state fed by map-update task); `eval_ssh_policy` matches principals (Node/NodeIP/UserLogin/Any), honours Reject actions; session recording (#63) ✅ `SessionRecorder` writes asciicast v2 format to file; incubator subprocess (#64) ✅ `Incubator` spawns shell with privilege dropping; remaining: HoldAndDelegate, remote recorder upload |
-| Health tracking | ✅ | 🔶 | ~5 of 20 Go warnables; no per-region DERP health |
-| Exit node (CLI) | ✅ | ✅ | PATCH /prefs with ExitNodeID/ExitNodeIP now calls set_exit_node/clear_exit_node via shared route_table; stored exit-node pref applied on daemon start (survives restart); ExitNodeAllowLANAccess pref field added |
-| Key lifecycle | — | ✅ | logout: Server::logout sends control logout (Expiry=far past), clears persisted state + netmap cache, transitions to NeedsLogin; POST /logout wired. **Key rotation**: phase-key-rotation — OldPrivateNodeKey persisted in PersistedState, expiry detection triggers re-registration with RegisterRequest{OldNodeKey, NodeKey}, RegisterResponse.NodeKeyExpired auto-retry (max 2), on success promotes new key + re-keys magicsock (RwLock<NodePublic>) + restarts map poll; LoginFlags bitflags (LoginInteractive/LoginEphemeral); testcontrol per-node expiry + OldNodeKey identity transfer |
-| IPN Notify | ✅ | ✅ | phase-ipn-notify-statemachine: Notify struct has NetMap, PeersChanged, PeersRemoved, PeerChangedPatch (serde_json::Value + null-to-default deser); map-update task forwards peer deltas to notify bus; blocked/logged_out setters wired in IpnBackend (set_blocked on NeedsLogin/auth-wait, clear on auth success; set_logged_out on logout); state machine reads actual values not hardcoded false |
-| magicsock paths | ✅ | ✅ | phase-magicsock-connectivity: 3s disco heartbeat (demand-driven by TX, stops after 45s idle), UDP lifetime probing (cliff intervals 10/30/60s, lexicographic disco-key gating, demote direct path on timeout), PMTUD structure (disabled by default, multi-size ping burst from WireMTUsToProbe); TRUST_BEST_ADDR_DURATION corrected 15s→6.5s |
-| Netstack | ✅ | ✅ | phase-listen-packet: UDP ListenPacket support (smoltcp socket-udp feature enabled, UdpListener with recv_from/send_to/local_addr, ephemeral port allocation 10002-19999, Server::listen_packet resolves addr via MagicDNS); TCP + UDP now both supported |
-
-These are being scheduled as fix phases in priority order (security → correctness
-→ connectivity). Rows below are left as-authored; consult verified.md for the
-authoritative status until each fix lands.
+adversarial verification pass (`docs/audit/verified.md`) found several rows
+were **overstated** or **understated**. A follow-up 12-agent code-source
+verification pass against the live codebase re-checked every item. Statuses
+below reflect actual source code (`crates/*`) as of 2026-07-13.
 
 ## Tier 1: Core compatibility (missing = incomplete client)
 
 | Feature | Go source | Status |
 | --- | --- | --- |
-| MagicDNS + split DNS resolver | `net/dns/resolver/tsdns.go` | ✅ phase-20: split DNS via control `Routes` (most-specific suffix wins), Hosts/LocalDomains/SubdomainHosts, atomic SetConfig, PTR reverse (v4/v6), .onion NXDOMAIN, 4via6, TC bit + EDNS size, ANY qtype, TCP fallback + DoH upstream forwarder |
-| Let's Encrypt certs via control | `ipn/ipnlocal/cert.go` | ✅ full ACME client (RFC 8555, ES256 JWS, dns-01 via set-dns, rcgen CSR); live LE-staging e2e green on ephemeral tailnet; phase-cli-cert-qr: LocalAPI `GET /cert/<domain>?type=pair|cert|key&min_validity=` + `rustscale cert` CLI |
-| WhoIs (peer identity from conn) | `tsnet.Server.WhoIs` | ✅ `Server::whois` + `ts_whois` FFI (UserProfiles from netmap) |
-| Exit node support | LocalBackend/router/magicsock | ✅ port-5 + phase-fix-exitnode-logout (advertise_exit_node builder opt adds 0.0.0.0/0+::/0 to RoutableIPs + filter localNets; Server::set_exit_node/clear_exit_node resolve exit-capable peer via IP/hostname + set RouteTable catch-all; PATCH /prefs with ExitNodeID/ExitNodeIP now applies routing via shared route_table in LocalApiState; stored exit-node pref applied on up()/up_tun() start (survives restart); ExitNodeAllowLANAccess pref field; TUN mode --exit-node installs /1 split routes on macOS, best-effort default on Linux; ts_set_exit_node/ts_clear_exit_node FFI; bypass routes for DERP/control in TUN+exit mode still ⬜ known limitation) |
-| Network monitor (netmon) | `net/netmon/` | ✅ port-3 + phase-netcheck-health: AF_ROUTE on macOS, **NETLINK_ROUTE on Linux** (real-time change detection, RTMGRP_LINK/IPV4/IPV6 addr+route), polling fallback; State, ChangeDelta, major/minor change detection, wall-time jump; wired into magicsock link_changed + tsnet endpoint-update push |
-| Port mapping (NAT-PMP/PCP/UPnP) | `net/portmapper/` | ✅ port-4 done (`crates/portmapper`: Client facade with probe/create/renew/cache lifecycle; PMP/PCP byte-exact packet codec with RFC test vectors; UPnP SSDP M-SEARCH discovery + root-desc XML parse + AddPortMapping/DeletePortMapping/GetExternalIPAddress SOAP; fake IGD tests for all three protocols; magicsock publishes portmap endpoint best-effort alongside local/STUN endpoints; netcheck Report gains portmap capability booleans) |
-| Health tracking | `health/` | ✅ port-7: crates/health Tracker + watchdog, wired control/DERP/certs/netmon, ServerStatus.health + FFI |
-| IPN state machine + notify bus | `ipn/backend.go`, `ipn/ipnlocal/local.go` | ✅ phase-ipn-bus + phase-ipn-notify-statemachine: `crates/ipn` (State enum serde-as-integer matching Go, Notify PascalCase JSON with omitted None, NotifyWatchOpt bitflags with explicit values, EngineStatus); StateMachine ports `nextStateLocked` truth table (table-driven tests); IpnBackend holds state+inputs+bus, emits Notify{State} on transitions, BrowseToURL on auth URL, LoginFinished on register success, ErrMessage on errors; NotifyBus broadcast channel (tokio::sync::broadcast, 128-capacity); `GET /localapi/v0/watch-ipn-bus?mask=` streaming newline-delimited JSON with per-message flush (connection-close delimited); status JSON reports live BackendState string; **Notify has NetMap/PeersChanged/PeersRemoved/PeerChangedPatch fields** (serde_json::Value + null-to-default deser); map-update task forwards peer deltas to notify bus; **blocked/logged_out setters wired** (set_blocked on NeedsLogin enter + interactive auth wait, clear on auth success; set_logged_out on logout in both Server::logout + LocalAPI handler); state machine reads actual values not hardcoded false; tests cover blocked=true+want_running=true→Starting and logged_out=true→NeedsLogin |
-| Interactive auth + prefs persistence | `ipn/prefs.go`, `cmd/tailscale/cli/up.go`, `ipn/localapi/localapi.go` | ✅ phase-interactive-auth + phase-fix-exitnode-logout: `crates/ipn` Prefs (16 fields incl. ExitNodeAllowLANAccess, PascalCase serde, Go wire-compat) + MaskedPrefs (*Set bools, apply_to) + StartOptions (ipn.Options equiv); prefs.json disk persistence (atomic temp+rename); daemon-side login flow: `start_localapi_only()` brings up IpnBackend+LocalAPI in NeedsLogin without full bootstrap; bootstrap() splits into phase 1 (register → AuthURL → block on login_trigger) + phase 2 (UDP/map/DERP/netstack after auth completes); testcontrol RequireAuth/CompleteAuth/AwaitAuthURL flows + saw_logout; LocalAPI endpoints POST /start, POST /login-interactive, POST /logout (fires logout_trigger), PATCH /prefs (applies exit-node routing), GET /prefs (typed); LocalClient start/login_interactive/logout/edit_prefs/get_prefs; CLI up/login/logout/down/set/get commands; daemon no longer requires TS_AUTHKEY; Server::logout sends control logout (Expiry=far past), clears persisted state + netmap cache, transitions to NeedsLogin; daemon selects on logout_trigger + shutdown; integration tests: testcontrol(require_auth) → start → BrowseToURL → complete_auth → Running; testcontrol → up → logout → NeedsLogin + control saw logout; exit-node prefs PATCH + ExitNodeAllowLANAccess roundtrip |
+| MagicDNS + split DNS resolver | `net/dns/resolver/tsdns.go` | ✅ full resolver (A/AAAA/PTR), split-DNS via control `Routes`, DoH upstream forwarder, TCP fallback, TC bit, .onion NXDOMAIN, 4via6, Hosts/LocalDomains, atomic SetConfig, macOS `/etc/resolver` configurator |
+| Let's Encrypt certs via control | `ipn/ipnlocal/cert.go` | ✅ full ACME client (RFC 8555, ES256 JWS, dns-01 via set-dns, rcgen CSR); live LE-staging e2e; LocalAPI `GET /cert/<domain>`; `rustscale cert` CLI |
+| WhoIs (peer identity from conn) | `tsnet.Server.WhoIs` | ✅ `Server::whois` + `ts_whois` FFI (UserProfiles from netmap); e2e + interop tests |
+| Exit node support | LocalBackend/router/magicsock | ✅ set_exit_node/clear_exit_node, RouteTable catch-all, PATCH /prefs wiring, ExitNodeAllowLANAccess, TUN exit-node mode; bypass routes for DERP/control in TUN+exit mode ⬜ |
+| Network monitor (netmon) | `net/netmon/` | ✅ AF_ROUTE (macOS), NETLINK_ROUTE (Linux, real-time), polling fallback; State/ChangeDelta, major/minor change detection, wall-time jump; wired into magicsock link_changed |
+| Port mapping (NAT-PMP/PCP/UPnP) | `net/portmapper/` | ✅ Client facade (probe/create/renew/cache), PMP/PCP byte-exact packet codec with RFC test vectors, UPnP SSDP+SOAP, fake IGD tests, magicsock portmap endpoint publishing |
+| Health tracking | `health/` | 🔶 Tracker+Watchdog complete, 12/20 Go warnables registered (WARN_CONTROL, DERP_HOME, CERT_FALLBACK, NETMON_CHANGE, CAPTIVE_PORTAL, PRODUCTIVITY, UDP, IPV4, IPV6, DERP_NO_REGION, IDLE, LOGIN), per-region DERP health tracking wired; control/DERP/certs/netmon integration, C2N/FFI endpoints; missing ~8 warnables (map-request errors, HTTP flood, DNS fallback, TKA state, etc.) |
+| IPN state machine + notify bus | `ipn/backend.go`, `ipn/ipnlocal/local.go` | ✅ State enum (7 states wire-compatible), Notify with 16 Go fields incl. NetMap/PeersChanged/PeersRemoved/PeerChangedPatch/Health/ClientVersion/SuggestedExitNode/UserProfiles, NotifyBus broadcast channel (128-cap), IpnBackend with blocked/logged_out setters, state machine transition table with tests; LocalAPI GET /watch-ipn-bus |
+| Interactive auth + prefs persistence | `ipn/prefs.go`, `cmd/tailscale/cli/up.go`, `ipn/localapi/localapi.go` | ✅ Prefs (16 fields + MaskedPrefs), prefs.json atomic persistence, start_localapi_only() NeedsLogin mode, bootstrap() full auth flow (register→AuthURL→wait→map), LocalAPI /start/login-interactive/logout/PATCH/GET prefs, CLI up/login/logout/down/set/get, daemon no longer requires TS_AUTHKEY |
 
 ## Tier 2: Production features
 
 | Feature | Go source | Status |
 | --- | --- | --- |
-| Serve/Funnel (ListenFunnel, ServeConfig, TCP fwd, reverse proxy) | `tsnet`, `ipn/serve*` | ✅ port-6 + phase-serve-cli-profiles + phase-serve-misc: ServeConfig serde model (TCPPortHandler/WebServerConfig/HTTPHandler) + ETag + persistence; HTTP reverse proxy with WhoIs headers; TLS-terminate; listen_funnel; CLI serve/funnel; **HTTPHandler.Redirect** with `${HOST}`/`${REQUEST_URI}` expansion; **HTTP-to-HTTPS redirect**; **Ingress-Target header dispatch**; Foreground + ServiceConfig fields added |
-| Tailscale Services (ListenService, PROXY protocol) | `tsnet.Server.ListenService` | ✅ `Server::listen_service(svc_name, ServiceMode)` resolves VIP v4 addrs from self node CapMap `service-host` key (`ServiceIPMappings`), adds them to netstack via `add_addr`, listens on each VIP:port via `listen_on`; merged accept channel from all VIP listeners; `ServiceName` newtype validates `svc:` prefix + DNS label; PROXY protocol v2 binary header encoder (byte-exact IPv4/IPv6/LOCAL); `ServiceStream` wraps `NetstackStream` with PROXY v2 prefix drained before app data; netstack `listen_on`/`add_addr` + `(IpAddr,port)` listener key; IPv6 VIPs skipped (smoltcp proto-ipv4 only). Remaining: TLS termination for service FQDN, serve-config TCP forwarding path, IPv6 VIP support |
-| SOCKS5 proxy | `net/socks5/` | ✅ port-8 + phase-serve-misc: RFC 1928 CONNECT (v4/domain/v6), dials via shared tsnet resolve path, FFI; **RFC 1929 username/password auth** (with_auth() constructor, loopback passes proxy_cred); e2e green |
-| LocalAPI | `ipn/localapi/` | ✅ port-9 + phase-ipn-bus + phase-interactive-auth + phase-serve-cli-profiles + phase-cli-cert-qr: full LocalAPI HTTP server on safesocket (status, whois, prefs GET+PATCH, netmap, metrics, health, ping, watch-ipn-bus, start, login-interactive, logout, serve-config GET+POST with ETag/If-Match/412, profiles GET+PUT/GET+POST+DELETE, cert `<domain>?type=pair|cert|key&min_validity=`); status reports live BackendState + CertDomains; serve-config persists to `<state_dir>/serve-config.json` and reloads on daemon start; profile manager persists to `profiles.json` + `current-profile`; integration tests: LocalAPI over safesocket, serve-config persistence across daemon restart, profile switch with two identities, cert endpoint 400/404 + cache-hit PEM paths |
-| Auto-update / ClientVersion | — | ✅ `crates/clientupdate`: `ClientUpdater` checks `MapResponse.ClientVersion`, `CheckResult`, `auto_apply` stub, `version_to_track` |
-| Multi-profile/login management | `ipn/ipnlocal/profiles.go` | ✅ phase-serve-cli-profiles: `crates/ipn` LoginProfile/NetworkProfile/ProfileID/UserProfile structs (serde PascalCase, Go wire-compat); profile persistence (`profiles.json` + `current-profile` pointer file, atomic saves); LocalAPI endpoints `GET /profiles`, `PUT /profiles` (create+switch), `GET /profiles/current`, `GET/POST/DELETE /profiles/<id>`; LocalClient list/current/new/switch/delete profile methods; CLI `rustscale switch [--list] [--json] [<profile>]` (match by ID or name, poll for Running); integration test: two-profile create/switch/delete against testcontrol. Remaining: backend teardown+restart on switch (currently updates prefs only), Windows LocalUserID |
+| Serve/Funnel (ListenFunnel, ServeConfig, TCP fwd, reverse proxy) | `tsnet`, `ipn/serve*` | ✅ ServeConfig serde + ETag + persistence; TCP/HTTP/HTTPS dispatch; reverse proxy with WhoIs headers (Tailscale-User-Login/Name); TLS-terminate via ControlCertProvider; HTTP-to-HTTPS redirect; HTTPHandler.Redirect with `${HOST}`/`${REQUEST_URI}` expansion; Ingress-Target header dispatch; listen_funnel port validation (443/8443/10000); LocalAPI GET/POST serve-config; CLI serve/funnel with status/reset |
+| Tailscale Services (ListenService, PROXY protocol) | `tsnet.Server.ListenService` | ✅ listen_service(svc_name, ServiceMode) with VIP v4 addrs from CapMap (ServiceIPMappings); PROXY protocol v2 binary header encoder (byte-exact IPv4/IPv6/LOCAL); ServiceStream wrapping; IPv6 VIPs skipped (smoltcp proto-ipv4 only); remaining: TLS termination for service FQDN, serve-config TCP forwarding path |
+| SOCKS5 proxy | `net/socks5/` | ✅ RFC 1928 CONNECT (v4/domain/v6); RFC 1929 username/password auth; pluggable SocksDialer; FFI; e2e tests |
+| LocalAPI | `ipn/localapi/` | ✅ 17+ endpoints (status, whois, prefs GET+PATCH, netmap, metrics, health, ping(stub), watch-ipn-bus, start, login-interactive, logout, serve-config, profiles, cert, file-targets, debug, dial, dns-query, check-ip-forwarding) |
+| Auto-update / ClientVersion | — | 🔶 `crates/clientupdate` API complete (ClientUpdater, CheckResult, version_to_track), MapResponse.ClientVersion field exists, Notify.ClientVersion field exists; auto_apply returns `AutoUpdateNotImplemented`; not wired into map-update loop |
+| Multi-profile/login management | `ipn/ipnlocal/profiles.go` | ✅ ProfileManager with profiles.json + current-profile persistence; LocalAPI CRUD endpoints; CLI switch command; remaining: backend teardown+restart on switch, Windows LocalUserID |
 
 ## macOS platform parity (phases 32–40, 2026-07-11)
 
 | Feature | Go source | Status |
 | --- | --- | --- |
-| macOS DNS OS configurator | `net/dns/manager_darwin.go` | ✅ phase-32: `crates/dns` OsConfigurator trait + DarwinConfigurator (`/etc/resolver/$SUFFIX` split DNS, ownership header marker, search.tailscale file, stale cleanup, foreign files untouched); ✅ phase-39 wired into tsnet TUN mode via opt-in `configure_os_dns(true)` builder flag (build_os_dns_config from netmap DNS config, best-effort on permission errors, cleaned up on close) |
-| Safe socket (CLI↔daemon IPC) | `safesocket/safesocket_darwin.go` | ✅ phase-33: `crates/safesocket` unix listen/connect (stale removal, perms) + darwin sameuserproof (macsys filename variant, macos lsof variant, set_credentials override, token gen) |
-| Route table enumeration | `net/routetable/routetable_bsd.go` | ✅ phase-34: `crates/routetable` NET_RT_DUMP2 sysctl RIB fetch, rt_msghdr2 + 4-byte-aligned sockaddr parse, RTF flag decode, RTF_LOCAL skip, live default-route integration test |
-| tcpinfo (RTT diagnostics) | `net/tcpinfo/tcpinfo_darwin.go` | ✅ phase-35: `crates/tcpinfo` darwin TCP_CONNECTION_INFO (tcpi_rttcur) + linux TCP_INFO (tcpi_rtt) |
-| Break TCP connections | `ipn/ipnlocal/breaktcp_darwin.go` | ✅ phase-35: `break_tcp_conns()` fd 0..1000 scan+close (darwin); ✅ phase-39 called on set/clear_exit_node in TUN mode only (netstack embedders never affected) |
-| Daemon + launchd install | `cmd/tailscaled/install_darwin.go` | ✅ phase-36 + phase-interactive-auth: `crates/rustscaled` bin (run/install-system-daemon/uninstall-system-daemon), com.rustscale.rustscaled plist, launchctl lifecycle, safesocket LocalAPI; daemon no longer requires TS_AUTHKEY — without it starts in NeedsLogin mode (start_localapi_only) and waits for CLI-driven start/login; with TS_AUTHKEY proceeds to full up() directly |
-| Default route detection | `net/netmon/defaultroute_darwin.go` | ✅ phase-37: `default_route_interface_index()` RTM_GET sysctl w/ SIOCGIFDELEGATE utun delegation + utun exclusion; state.rs uses sysctl first, `route -n get` fallback |
-| Interface enumeration (darwin) | `net/netmon/interfaces_darwin.go` | ✅ phase-37 (folded into defaultroute work) |
+| macOS DNS OS configurator | `net/dns/manager_darwin.go` | ✅ DarwinConfigurator (/etc/resolver/$SUFFIX, ownership header, stale cleanup, foreign files untouched); wired into TUN mode |
+| Safe socket (CLI↔daemon IPC) | `safesocket/safesocket_darwin.go` | ✅ unix listen/connect (stale removal, 0o666 perms); darwin sameuserproof (macsys file variant, lsof variant, set_credentials override, token gen) |
+| Route table enumeration | `net/routetable/routetable_bsd.go` | ✅ NET_RT_DUMP2 sysctl RIB fetch, rt_msghdr2 + sockaddr parse, RTF flag decode, RTF_LOCAL skip, live default-route integration test |
+| tcpinfo (RTT diagnostics) | `net/tcpinfo/tcpinfo_darwin.go` | ✅ darwin TCP_CONNECTION_INFO (tcpi_rttcur) + linux TCP_INFO (tcpi_rtt) |
+| Break TCP connections | `ipn/ipnlocal/breaktcp_darwin.go` | ✅ fd 0..1000 scan+close (macOS); called on set/clear_exit_node in TUN mode only |
+| Daemon + launchd install | `cmd/tailscaled/install_darwin.go` | ✅ rustscaled bin (run/install/uninstall), com.rustscale.rustscaled plist, launchctl lifecycle, safesocket LocalAPI; needs-login startup mode when no TS_AUTHKEY |
+| Default route detection | `net/netmon/defaultroute_darwin.go` | ✅ RTM_GET sysctl + SIOCGIFDELEGATE utun delegation; route -n get fallback |
+| Interface enumeration (darwin) | `net/netmon/interfaces_darwin.go` | ✅ getifaddrs + sockaddr_dl for MAC, ifa_data for MTU, IFF flags |
 
-P3 status: hostinfo darwin ✅ phase-40 (OSVersion via kern.osproductversion,
-DeviceModel via hw.model sysctlbyname) · quarantine xattr ✅ phase-40
-(`crates/quarantine`, Go-format com.apple.quarantine value; Taildrop will
-consume it) · peermtu darwin (no-op in Go too) ⬜ · sockstats ⬜.
+P3 status: hostinfo darwin ✅ (OSVersion + DeviceModel via sysctl) · quarantine xattr
+✅ (com.apple.quarantine value) · peermtu darwin (no-op in Go too) ⬜ · sockstats 🔶
+(endpoint wired, stub handler).
 
 ## Tier 2.5: Client infrastructure (Go packages not previously tracked)
 
 | Package | Go source | Rust status |
 | --- | --- | --- |
-| Tailscale IP addr helpers | `net/tsaddr/` | 🔶 partially inlined in `dns` + `tsnet/routing`; no dedicated crate |
-| Outbound dial abstraction | `net/tsdial/` | ⬜ baked ad-hoc into netstack; no standalone module for PeerAPI/DoH/DNS-map routing |
+| Tailscale IP addr helpers | `net/tsaddr/` | 🔶 predicates scattered across c2n, peerapi, netns, netmon, routing, dns; no unified crate |
+| Outbound dial abstraction | `net/tsdial/` | ⬜ `netns::dial_tcp()` exists but missing PeerAPI/DoH/DNS-map routing |
 | Localhost port proxy map | `net/proxymap/` | ⬜ ephemeral localhost->remote IP port mapping for proxied conns |
-| HTTP CONNECT proxy | `net/connectproxy/` | ✅ `crates/connectproxy`: `ConnectProxyConfig`, `parse_connect_request`, `handle_connect` with bidirectional tunnel; stub dial/test wiring |
-| HTTP proxy env detection | `net/tshttpproxy/` | ⬜ cross-platform proxy auto-detection (PAC/WPAD/registry) |
+| HTTP CONNECT proxy | `net/connectproxy/` | ✅ `crates/connectproxy`: `ConnectProxyConfig`, `parse_connect_request`, `handle_connect` with bidirectional tunnel |
+| HTTP proxy env detection | `net/tshttpproxy/` | ⬜ `--http-proxy-server` flag exists but "not yet wired" |
 | Embedded TLS roots fallback | `net/bakedroots/` | ⬜ container/minimal-Linux control-plane cert validation |
-| OS-level route management | `wgengine/router/` | ⬜ TUN mode uses ad-hoc route(8) calls; Go has clean interface + 4 platform impls |
-| LocalAPI authorization | `ipn/ipnauth/` | ⬜ who-can-do-what on LocalAPI (unix peer creds, Windows ACLs) |
-| IPN audit logging | `ipn/auditlog/` | ⬜ JSON audit trail for sensitive operations |
-| Service policy | `ipn/policy/` | ⬜ which services to advertise (Serve/Funnel peer discovery) |
+| OS-level route management | `wgengine/router/` | 🔶 `crates/routetable` reads routes via PF_ROUTE sysctl; `tun_pump.rs` installs routes via shell (route/ip); no clean router abstraction |
+| LocalAPI authorization | `ipn/ipnauth/` | ⬜ socket 0600 permission only; no unix_peer_creds middleware |
+| IPN audit logging | `ipn/auditlog/` | ⬜ |
+| Service policy | `ipn/policy/` | ⬜ only `SSHPolicy` wire type exists; no policy engine |
 | Config file format | `ipn/conffile/` | ⬜ HUP-reloadable JSON config for daemon |
-| IPN extension system | `ipn/ipnext/` | ⬜ LocalBackend plugin architecture |
-| Cloud log shipping | `logtail/` | ✅ `crates/logtail`: `LogTail` buffers entries with proc_id/proc_seq metadata, `send` stub (HTTP upload TODO); `Config` mirrors Go's `logtail.Config` |
-| Port enumeration | `portlist/` | ⬜ firewall diagnostics / listening-port scan |
-| Network flow logging | `wgengine/netlog/` | ⬜ TUN traffic logging → network flow logs |
-| Network error classification | `net/neterror/` | ⬜ retry-loops benefit from typed error reasons |
-| Network traffic steering | `net/traffic/` | ⬜ hash-based exit-node selection for split-DNS |
-| Subnet route health check | `net/routecheck/` | ⬜ exit-node/subnet-router diagnostics |
-| Captive portal detection | `net/captivedetection/` | ✅ `Detector` with concurrent HTTP GETs, DERPMap endpoint generation, response validation (status + challenge + body), wired into netcheck prober (`Report.captive_portal`) and health Tracker (`WARN_CAPTIVE_PORTAL`); per-interface binding deferred |
-| ICMP ping | `net/ping/` | ✅ `crates/netcheck/src/icmp.rs`: best-effort ICMPv4 pinger via socket2 (unprivileged SOCK_DGRAM+IPPROTO_ICMP fallback to SOCK_RAW), integrated as fallback when STUN probes fail |
-| Socket statistics | `net/sockstats/` | ⬜ |
-| In-memory test net | `net/memnet/` | ⬜ test infrastructure — in-memory net.Conn/Listener |
-| Event bus (in progress) | `util/eventbus/` | 🚧 phase-ipn-bus covers this via broadcast channel |
-| Client metrics | `util/clientmetric/` | ✅ `crates/clientmetric`: `Registry` with `Counter`/`Gauge` handles (atomic-backed), `to_prometheus_text()` + `to_json()`; wired into LocalAPI `/metrics` replacing 4 hardcoded metrics; subsystems can register via `state.metrics` |
-| Deep hash / change detection | `util/deephash/` | ⬜ Go uses for netmap change-detect; Rust PartialEq suffices mostly |
-| Singleflight | `util/singleflight/` | ⬜ in-flight request dedup (control client reconnect) |
-| LRU cache | `util/lru/` | ⬜ |
-| Rate limiter | `util/limiter/` | ⬜ |
-| Ring buffer logger | `util/ringlog/` | ⬜ tail-buffered log for diagnostics |
-| QR code rendering | `util/qrcodes/` | ✅ phase-cli-cert-qr: `qrcode` crate + hand-rolled 1-bit PNG encoder (flate2+crc32fast); `up --qr` / `login --qr` terminal half-block QR + `QR` data:image/png;base64 field in `--json` |
-| Dependency injection / tsd | `tsd/` | ⬜ global subsystem registry pattern |
-| Feature gate system | `feature/` | ⬜ Rust `cfg!()` handles compile-time; runtime feature flags ⬜ |
-| Safe atomic file writes | `atomicfile/` | ✅ `crates/atomicfile`: write-temp+rename utility |
-| Metrics registry | `metrics/` | ✅ `crates/clientmetric`: Registry with Counter/Gauge, to_prometheus_text(), wired into LocalAPI /metrics |
-| File path constants | `paths/` | ⬜ central config/log/state dir paths for daemon |
-| Status/PeerStatus model | `ipn/ipnstate/` | ⬜ data model queried by LocalAPI /status (860 lines) |
-| State persistence abstraction | `ipn/store/` | ⬜ MemStore/FileStore for prefs and state (562 lines) |
-| IPN server actor loop | `ipn/ipnserver/` | ⬜ orchestrates LocalBackend lifecycle, reconnect backoff, login flows (7 files) |
-| TSP protocol (alt control) | `control/tsp/` | ⬜ alternative control protocol alongside ts2021 (1.4k lines) |
-| Log policy / logtail setup | `logpolicy/` | ⬜ log dir setup, rotation, logtail stream config (1.1k lines) |
-| Packet parsing (headers) | `net/packet/` | ⬜ IP/TCP/UDP/ICMP/Geneve header parse+marshal (17 files) |
-| DNS name utilities | `util/dnsname/` | ⬜ FQDN formatting, DNS label validation (570 lines) |
-| TLS dial config | `net/tlsdial/` | ⬜ custom tls.Config for control-plane Noise-over-HTTP |
-| Network utility functions | `net/netutil/` | ⬜ interface helpers, multicast check, proxy protocol detection |
-| Socket options | `net/sockopts/` | ⬜ platform-aware socket buffer tuning, SO_MARK, SO_BINDTODEVICE |
-| TCP connection table | `net/netstat/` | ⬜ OS-level TCP connection enumeration |
-| TCP keepalive timeout | `net/ktimeout/` | ⬜ per-platform TCP keepalive configuration |
-| Speedtest protocol | `net/speedtest/` | ⬜ tailscale speedtest client+server |
-| Desktop integration | `ipn/desktop/` | ⬜ Windows session change / macOS extension support |
-| Alternative routing table | `net/art/` | ⬜ Adaptive Radix Tree for IP route lookups (2.6k lines) |
-| BIRD routing client | `chirp/` | ⬜ BIRD Internet Routing Daemon client |
-| Cloud env detection | `util/cloudenv/` | ⬜ AWS/GCP/Azure detection for NAT/connectivity |
+| IPN extension system | `ipn/ipnext/` | ⬜ |
+| Cloud log shipping | `logtail/` | 🔶 `crates/logtail` buffers entries with proc_id/proc_seq metadata; HTTP upload is TODO stub |
+| Port enumeration | `portlist/` | ⬜ |
+| Network flow logging | `wgengine/netlog/` | ⬜ |
+| Network error classification | `net/neterror/` | ⬜ uses std::io::ErrorKind only; no custom classification |
+| Network traffic steering | `net/traffic/` | 🔶 split DNS OS config exists (macOS); no general traffic-steering abstraction |
+| Subnet route health check | `net/routecheck/` | ⬜ |
+| Captive portal detection | `net/captivedetection/` | ✅ `Detector` concurrent HTTP GETs, DERPMap endpoints, response validation (status + challenge + body), wired into netcheck prober + health Tracker |
+| ICMP ping | `net/ping/` | 🔶 `crates/netcheck/src/icmp.rs` — internal pinger for netcheck fallback; CLI `ping` calls daemon but returns 501 |
+| Socket statistics | `net/sockstats/` | 🔶 C2N + PeerAPI endpoints wired (stub handlers); no actual collection |
+| In-memory test net | `net/memnet/` | ⬜ |
+| Event bus | `util/eventbus/` | ✅ `crates/ipn/src/bus.rs`: NotifyBus backed by tokio::sync::broadcast (128-cap), NotifyBusReceiver for async streaming |
+| Client metrics | `util/clientmetric/` | ✅ `crates/clientmetric`: Registry with Counter/Gauge (atomic-backed), to_prometheus_text() + to_json(); wired into LocalAPI /metrics |
+| Deep hash / change detection | `util/deephash/` | ⬜ |
+| Singleflight | `util/singleflight/` | 🔶 inline in `crates/dnscache` (inflight dedup HashMap); no standalone crate |
+| LRU cache | `util/lru/` | 🔶 inline in `crates/filter/src/state.rs` (flow tracking LRU, max 512 entries); no standalone crate |
+| Rate limiter | `util/limiter/` | 🔶 inline in `crates/derp/src/client.rs` (token-bucket for DERP send path); no standalone crate |
+| Ring buffer logger | `util/ringlog/` | ⬜ |
+| QR code rendering | `util/qrcodes/` | ✅ qrcode crate + hand-rolled 1-bit PNG encoder; `up --qr` / `login --qr` terminal half-block QR + data:image/png data URL |
+| Dependency injection / tsd | `tsd/` | ⬜ |
+| Feature gate system | `feature/` | 🔶 `crates/controlknobs` provides runtime feature flags from control plane CapMap; no compile-time gate system |
+| Safe atomic file writes | `atomicfile/` | ✅ `crates/atomicfile`: write-temp+fsync+rename utility with perms 0o600 |
+| Metrics registry | `metrics/` | ✅ via `crates/clientmetric`: Registry with Counter/Gauge, Prometheus text format, wired into LocalAPI /metrics replacing 4 hardcoded metrics |
+| File path constants | `paths/` | ✅ `crates/paths`: default_state_dir/log_dir/config_dir/socket_path per platform (macOS/Linux/Windows) |
+| Status/PeerStatus model | `ipn/ipnstate/` | 🔶 inline in `crates/tsnet/src/status.rs` + localapi build_status_json(); no dedicated crate |
+| State persistence abstraction | `ipn/store/` | ✅ `crates/ipn/src/store.rs`: Store trait + MemStore (HashMap) + FileStore (one file per key) |
+| IPN server actor loop | `ipn/ipnserver/` | ⬜ orchestration embedded in tsnet Server + lifecycle.rs; no dedicated actor loop |
+| TSP protocol (alt control) | `control/tsp/` | ⬜ only ts2021 Noise control protocol implemented |
+| Log policy / logtail setup | `logpolicy/` | ⬜ log dir creation in launchd.rs only; no rotation or policy |
+| Packet parsing (headers) | `net/packet/` | ✅ `crates/packet`: IPv4Header, IPv6Header, ICMPHeader, UDPHeader, TCPFlag, Parsed rich decoded view, parse_packet(); GENEVE in udprelay |
+| DNS name utilities | `util/dnsname/` | 🔶 FQDN handling in dns resolver + tsnet; no standalone crate with ValidLabel/SanitizeLabel |
+| TLS dial config | `net/tlsdial/` | 🔶 tls_config() in DERP client + controlhttp + ACME; no unified tlsdial module |
+| Network utility functions | `net/netutil/` | 🔶 proxy protocol detection in service.rs; interface helpers in netmon/netns; no consolidated crate |
+| Socket options | `net/sockopts/` | ✅ SO_MARK + SO_BINDTODEVICE in `crates/netns/src/linux.rs` |
+| TCP connection table | `net/netstat/` | 🔶 `crates/tcpinfo` iterates FDs 0..1000 on macOS; no full OS TCP connection enumeration |
+| TCP keepalive timeout | `net/ktimeout/` | ⬜ no TCP keepalive setsockopt (keepidle/keepintvl/keepcnt) |
+| Speedtest protocol | `net/speedtest/` | ⬜ |
+| Desktop integration | `ipn/desktop/` | ✅ `crates/tsnet/src/hostinfo.rs`: reads `/proc/net/unix` for .X11-unix / wayland-1 socket detection |
+| Alternative routing table | `net/art/` | ⬜ |
+| BIRD routing client | `chirp/` | ⬜ |
+| Cloud env detection | `util/cloudenv/` | ✅ `crates/tsnet/src/hostinfo.rs`: reads DMI sysfs for AWS/GCP/DigitalOcean; Azure detection constant defined but not wired |
 
 ## Tier 3: Specialized
 
-Tailscale SSH (`ssh/tailssh/`, port-10) · Taildrop (`feature/taildrop/`) ✅
-phase-taildrop (`crates/tsnet/src/taildrop.rs`: TaildropManager with file spool,
-conflict modes skip/overwrite/rename, file-targets enumeration from netmap
-peers with file-sharing cap; PeerAPI `PUT /v0/put/<filename>` receive handler
-in `peerapi.rs`; LocalAPI endpoints `files/`, `file-targets`, `file-put/`,
-`await-waiting-files` in `localapi.rs`; localclient file methods; CLI `file cp`
-+ `file get` subcommands; `Notify.FilesWaiting` + `WaitingFile` type in
-`crates/ipn`; integration tests for LocalAPI roundtrip, file-targets with cap,
-conflict modes, multi-file get) ·
-Taildrive (`drive/`) · Tailnet Lock/TKA (`tka/`) · Device posture (`posture/`) ·
-App connector (`appc/`) ✅ phase-appc (`crates/appc`: AppConnector with
-domain/wildcard matching, DNS response observation with CNAME chain
-resolution, dynamic route advertisement via RouteAdvertiser trait, Conn25
-peer selection + split-DNS resolver map, RouteInfo persistence, rate
-logging; `crates/tailcfg` appctype types; DNS observer callback in
-`crates/dns`; tsnet wiring with TsnetRouteAdvertiser) ·
-NetNS socket binding (`net/netns/`) · Session
-recording (`sessionrecording/`) · Workload identity federation
-(`feature/identityfederation/`). All ⬜.
+| Feature | Status |
+| --- | --- |
+| Tailscale SSH (`ssh/tailssh/`, port-10) | ✅ policy engine (eval_ssh_policy with Any/Node/NodeIP/UserLogin, Reject/Accept), incubator (spawn shell with privilege drop), session recording (asciicast v2 to local .cast file), whois integration; remaining: HoldAndDelegate, remote recorder upload (PeerAPI stream) |
+| Taildrop (`feature/taildrop/`) | ✅ TaildropManager with spool directory, conflict modes (skip/overwrite/rename), file-targets enumeration from netmap, PeerAPI PUT /v0/put/<filename>, LocalAPI files/file-targets/file-put/await-waiting-files, CLI file cp/get |
+| Taildrive (`drive/`) | ⬜ |
+| Tailnet Lock / TKA (`tka/`) | 🔶 wire types only (NodeKeySignature, UnsignedPeer fields on Node); no TKA verification or key management |
+| Device posture (`posture/`) | ⬜ |
+| App connector (`appc/`) | ✅ crates/appc: domain/wildcard matching, DNS response observation with CNAME resolution, dynamic route advertisement (RouteAdvertiser trait), Conn25 peer selection + split-DNS resolver map, RouteInfo persistence; tsnet wiring with TsnetRouteAdvertiser |
+| NetNS socket binding (`net/netns/`) | ✅ `crates/netns`: dial_tcp/dial_tcp_addr with host resolution, SOCKS5 proxy fallback, localhost bypass; macOS IP_BOUND_IF; Linux SO_MARK + SO_BINDTODEVICE |
+| Session recording (`sessionrecording/`) | ✅ asciicast v2 format write to local file (`<state_dir>/ssh-sessions/`); remote upload to recorder nodes ⬜ |
+| Workload identity federation (`feature/identityfederation/`) | ⬜ |
 
 ## Tier 4: Optimization & tools
 
-Peer MTU discovery (`magicsock/peermtu.go`) · GSO/GRO batching
-(`net/batching/`, Linux CI) · io_uring TUN+socket (Linux) · BPF disco filtering
-(`magicsock_linux.go`) · Flow tracking (`net/flowtrack/`) · sockstats ·
-tcpinfo · ICMP ping (`net/ping/`) · DNS cache + fallback (`net/dnscache/`,
-`net/dnsfallback/`) ✅ phase-19 (`crates/dnscache` TTL+singleflight+last-good,
-`crates/dnsfallback` bootstrap-dns over embedded DERP IPs + DERP map disk
-cache; wired into controlclient dial) · CapturePcap · Logtail · Watchdog ·
-Syspolicy · Captive
-portal detection (Report field exists, unwired 🔶) · C2N debug endpoints
-(✅ phase-21: real handlers for prefs/netmap/health/metrics/dns/
-component-logging/goroutines/sockstats; only /debug/pprof/* remains 501 —
-no Rust pprof) ·
-Netmap disk cache (offline startup) (✅ phase-22: versioned envelope,
-SHA-256 write dedup, save per MapResponse, clear on auth failure/key
-expiry; Go columnar store layout not replicated — single-blob by design) · Web client UI (✅ phase-cli-ssh-web: `rustscale web` minimal management UI — embedded single-file HTML with inline JS+fetch, /api/status + /api/up + /api/down + /api/logout handlers, loopback-only binding with --unsafe-any-addr override, --readonly mode; NOT a port of Go's React app) ·
-BIRD routing · Linux
-ipset · envknob · version package · Freedesktop/DBus · System tray. All ⬜
-unless noted. Control knobs (`control/controlknobs/`) ✅ phase-17
-(`crates/controlknobs`, CapMap→knobs in controlclient, tsnet accessor).
-PeerAPI (`ipn/ipnlocal/peerapi.go`) ✅ phase-18 (tsnet peerapi.rs: DoH
-/dns-query, /v0/* endpoints, WhoIs auth, CRC32 port, peerapi4/6 Service
-advertisement); Hostinfo ✅ phase-23 (all 36 Go fields, 10min update loop
-with content-hash dedup, runtime setters).
+| Feature | Status |
+| --- | --- |
+| Peer MTU discovery (`magicsock/peermtu.go`) | ✅ WIRE_MTUS_TO_PROBE defined, set_pmtud_enabled/peer_mtu_enabled, PMTUD burst in send_pings, probe size tracking in endpoint; disabled by default |
+| GSO/GRO batching (`net/batching/`) | ⬜ |
+| io_uring TUN+socket (Linux) | ⬜ |
+| BPF disco filtering (`magicsock_linux.go`) | ⬜ |
+| Flow tracking (`net/flowtrack/`) | 🔶 LRU cache in filter state.rs (512-entry, UDP/SCTP 5-tuple); no time-based expiry, no ConnRecord/packet counters, no TCB tracking |
+| sockstats | 🔶 C2N + PeerAPI endpoints wired (stub handlers); no actual socket statistics collection |
+| tcpinfo | ✅ `crates/tcpinfo`: macOS TCP_CONNECTION_INFO + Linux TCP_INFO; break_tcp_conns() for macOS |
+| ICMP ping (`net/ping/`) | ✅ `crates/netcheck/src/icmp.rs`: unprivileged DGRAM+IPPROTO_ICMP fallback to SOCK_RAW; integrated as fallback when STUN probes fail |
+| DNS cache + fallback (`net/dnscache/`, `net/dnsfallback/`) | ✅ `crates/dnscache` (TTL, singleflight-inline, UseLastGood stale fallback, happy-eyeballs dialer); `crates/dnsfallback` (bootstrap-dns over DERP IPs, static + cached DERP map); wired into controlclient dial |
+| C2N debug endpoints | ✅ 10+ handlers (echo, prefs, netmap, health, metrics, dns, goroutines, component-logging, sockstats, logtail/flush); only /debug/pprof/* remains 501 |
+| Netmap disk cache | ✅ versioned envelope (v1), SHA-256 write dedup, save per MapResponse, clear on auth failure/key expiry; single-blob design |
+| Web client UI | ✅ `rustscale web` with embedded HTML/JS, /api/status/up/down/logout handlers, loopback-only, --readonly, --unsafe-any-addr |
+| Control knobs (`control/controlknobs/`) | ✅ HashMap<String,String> behind RwLock, typed accessors (get_bool/float/string), change-detection merge, on_change callbacks |
+| PeerAPI (`ipn/ipnlocal/peerapi.go`) | ✅ DoH /dns-query (GET + POST), /v0/* endpoints (goroutines, env, metrics, magicsock, dnsfwd, interfaces, sockstats), WhoIs auth, CRC32 port [32768, 65535], Taildrop PUT handler, netstack + TUN spawners |
+| Hostinfo | 🔶 ~22/42 fields populated (IPNVersion, OS, OSVersion, Machine, Hostname, Services, NetInfo, RoutableIPs, etc.); missing ~20 (FrontendLogID, BackendLogID, PushDeviceToken, ShareeNode, NoLogsNoSupport, WireIngress, AllowsUpdate, GoArchVar, RequestTags, WoLMACs, SSH_HostKeys, Userspace, AppConnector, PeerRelay, ServicesHash, Location, TPM, StateEncrypted, ShieldsUp, etc.) |
+| CapturePcap | 🔶 API declared at `Server::capture_pcap()` but returns "not yet implemented" error |
+| Logtail | 🔶 buffers + metadata + write(); HTTP upload is TODO stub (no network upload to log server) |
+| Watchdog | ✅ tokio-based interval task, auto-fires warning if not feed() within interval, Drop-safe |
+| Syspolicy | ⬜ |
+| BIRD routing (`chirp/`) | ⬜ |
+| Linux ipset | ⬜ |
+| envknob | ⬜ |
+| Version package | ✅ build.rs git describe --tags --long --always --dirty → RUSTSCALE_VERSION_LONG; fallback CARGO_PKG_VERSION |
+| Freedesktop/DBus | ⬜ |
+| System tray | ⬜ |
+| Captive portal detection | ✅ full Detector with concurrent HTTP GETs, available_endpoints() from DERPMap, response_looks_like_captive(), wired into netcheck prober + health Tracker WARN_CAPTIVE_PORTAL |
 
 ## Tier 5: Server-side (out of scope for the client)
 
@@ -186,70 +167,56 @@ side). Roadmap tail.
 Wire types/keys/disco/DERP client/netcheck (STUN) · ts2021 Noise control
 client (HTTP/2-over-Noise, streaming netmap deltas) · magicsock
 (direct/DERP path selection, cross-region routing, reply-to-arrival-region;
-peer-relay client ✅ — full relayManager loop (1.5k loc event loop, alloc work,
+peer-relay client ✅ — full relayManager loop: 1.5k loc event loop, alloc work,
 handshake work, disco message routing, call-me-maybe via relay)
 · WireGuard data plane (boringtun) · userspace netstack (smoltcp,
-event-driven) · packet filter (incl. stateful UDP) · subnet routing
-(advertise/accept/forward) · TUN mode (macOS utun, Linux untested) · tsnet
-embed API · C FFI (librustscale) + Python ctypes · bench harness (beats
+event-driven) · packet filter (incl. stateful UDP, capability ACLs, shields-up mode)
+· subnet routing (advertise/accept/forward) · TUN mode (macOS utun, Linux)
+· tsnet embed API · C FFI (librustscale) + Python ctypes · bench harness (beats
 tailscaled userspace: p50 ~170us vs 257us, 465–838 vs 384 Mbps).
 
 ## Test infrastructure
 
-`crates/testcontrol` ✅ phase-28 + phase-interactive-auth: in-process fake control server (Noise server handshake, h2c, register, streaming map, Go-testcontrol-style test API); RequireAuth/CompleteAuth/AwaitAuthURL flows for interactive login testing; tsnet self-test registers → Running → sees injected fake peer with
-no network. `crates/derp` server ✅ phase-29: in-process DERP relay
-(spawn_local + make_derp_map) for integration tests. tailcfg
-null-tolerance ✅ phase-30: every wire field accepts Go nil + property
-test nullifying each field. Full plan: docs/testcontrol-plan.md
+`crates/testcontrol` ✅ in-process fake control server (Noise handshake, h2c,
+register, streaming map, Go-testcontrol-style test API); RequireAuth/CompleteAuth/
+AwaitAuthURL flows for interactive login testing. `crates/derp` server ✅
+in-process DERP relay (spawn_local + make_derp_map) for integration tests.
+tailcfg null-tolerance ✅ every wire field accepts Go nil + property test
+nullifying each field. Full plan: docs/testcontrol-plan.md
 (remaining: Phase B integration scenarios, Phase D UDP impairment shim,
 Go-testcontrol interop harness).
 
 ## Release pipeline
 
-`release.yml` ✅ phase-38: tag-triggered (`v*`) multi-platform build. macOS
-job builds aarch64 + x86_64, lipos universal `librustscale.dylib` + `.a`,
-regenerates `include/rustscale.h` via `tools/gen-header.sh`, and bundles a
-single `rustscale-universal-apple-darwin.tar.gz`. Linux job matrix builds
-x86_64-gnu, aarch64-gnu (cross-compiled via `gcc-aarch64-linux-gnu`), and
-x86_64-musl (static via `musl-gcc`), each producing a per-target tar.gz.
-Checksums job downloads all artifacts, computes `SHA256SUMS`, and creates the
-GitHub Release via `softprops/action-gh-release`. Binary crates (e.g.
-`rustscaled`) are wired via a `BIN_PKGS` env var — add the package name and
-the workflow builds + lipos it automatically. `audit.yml` ✅ phase-38: weekly
-`cargo-audit` (RUSTSEC) + `cargo-deny` (licenses/bans/advisories), also on PRs
-touching `Cargo.lock` or `deny.toml`. Version stamping via
-`crates/ffi/build.rs` (`git describe --tags --long --always --dirty` →
-`RUSTSCALE_VERSION_LONG`, fallback `CARGO_PKG_VERSION`), exposed through
-`ts_version()` FFI and `tools/version.sh`.
+`release.yml` ✅ tag-triggered (v*) multi-platform build. macOS universal
+(aarch64 + x86_64 lipo'd dylib/.a + binaries). Linux matrix (x86_64-gnu,
+aarch64-gnu, x86_64-musl). Windows x86_64-msvc. Docker multi-arch image
+pushed to GHCR. Homebrew formula. SHA256SUMS + GitHub Release.
+`audit.yml` ✅ weekly cargo-audit (RUSTSEC) + cargo-deny (licenses/bans),
+also on PRs touching Cargo.lock or deny.toml. Version stamping ✅ via
+build.rs (`git describe --tags --long --always --dirty` → RUSTSCALE_VERSION_LONG).
 
 ## CI pipeline
 
-`ci.yml` ✅ phase-ci-parity: OS matrix (ubuntu-latest, macos-latest,
-windows-latest). Ubuntu + macOS run full build/test/clippy; Windows runs
-`cargo check`, `cargo clippy -- -D warnings`, and `cargo test` (meaningful
-crates) under `shell: bash` with `RUSTFLAGS="-D warnings"`. Cross-compile
-check matrix: aarch64-unknown-linux-gnu, armv7-unknown-linux-gnueabihf,
-x86_64-unknown-linux-musl (ubuntu), aarch64-apple-darwin (macos),
-x86_64-pc-windows-msvc (windows). `--locked` on every cargo invocation.
-Dirty-tree guard (git diff + untracked-file check) on ubuntu. MSRV job
-(1.91, dictated by smoltcp 0.13) — `rust-version = "1.91"` in workspace
-Cargo.toml. `alls-green` merge-gate job (`re-actors/alls-green`) aggregating
-check + cross + msrv + testcontrol. All actions SHA-pinned across all
-workflows. `testcontrol` job (Go interop) preserved. `merge_group` trigger
-added. `fuzz.yml` ✅ phase-ci-parity: cargo-fuzz targets for disco decode,
-DERP frame codec, STUN parse, portmapper PMP/PCP codecs; 60s per target on
-PRs touching parser crates, daily cron, crash artifacts uploaded.
-`sanitizer.yml` ✅ phase-ci-parity: weekly ThreadSanitizer (nightly, linux)
-over magicsock/derp/tsnet; `continue-on-error` (informational, non-blocking).
-Miri for codec crates deferred. Full spec: `docs/phase-ci-parity.md`.
+`ci.yml` ✅ OS matrix (ubuntu/macos/windows). Full build/test/clippy on
+ubuntu + macOS. Windows: cargo check + select crate tests under bash.
+Cross-compile matrix: aarch64/armv7/x86_64-musl linux, aarch64-darwin,
+x86_64-windows. `--locked` on every cargo invocation. Dirty-tree guard.
+MSRV 1.91. `alls-green` merge gate. All actions SHA-pinned.
+`fuzz.yml` ✅ 5 cargo-fuzz targets (disco_decode, derp_frame, stun_parse,
+portmapper_pmp, portmapper_pcp); 60s per target on PRs, daily cron, crash
+artifacts. `sanitizer.yml` ✅ weekly ThreadSanitizer (nightly, linux) over
+magicsock/derp/tsnet; continue-on-error (informational). Miri for codec
+crates deferred.
 
 ## Cross-client interop verification
 
-`tools/interop.sh` runs 8 e2e tests against real Go tailscaled (1.98.8,
-userspace mode) on an ephemeral tailnet: dial both directions, MagicDNS
-name resolution, WhoIs identity, direct path (disco vs Go magicsock),
-pinned-DERP relay, DERP→direct upgrade without byte loss, subnet route
-accept. All green 2026-07-09. CI: `interop` job in e2e.yml.
+`tools/interop.sh` runs 8 userspace e2e tests + `tools/interop-tun.sh` runs
+4 TUN-mode e2e tests against real Go tailscaled (1.98.8) on ephemeral
+tailnets: dial both directions, MagicDNS name resolution, WhoIs identity,
+direct path (disco vs Go magicsock), pinned-DERP relay, DERP→direct upgrade
+without byte loss, subnet route accept, OS routes, subnet forwarding. All
+green. CI: interop + interop-tun jobs in e2e.yml.
 
 ## CLI (`cmd/tailscale` equivalent)
 
@@ -261,33 +228,33 @@ state-dir fallback probing), `--json`.
 
 | Subcommand | Go source | Status |
 | --- | --- | --- |
-| `status` | `cli/status.go` | ✅ table + `--json` passthrough; `--peers=false`, `--active` flags; peer table (IP, hostname, owner, connection path) |
+| `status` | `cli/status.go` | ✅ table + `--json` passthrough; `--peers=false`, `--active` flags; peer table (IP, hostname, owner, connection path, exit-node flag) |
 | `ip` | `cli/ip.go` | ✅ `-4`/`-6`/`-1` filters; peer lookup by IP or hostname |
 | `version` | `cli/version.go` | ✅ client version (build.rs git stamp) + `--daemon` daemon version from status; `--json` |
 | `whois` | `cli/whois.go` | ✅ machine + user table; `--json` |
-| `netcheck` | `cli/netcheck.go` | ✅ client-side STUN probe via `crates/netcheck`; DERPMap from daemon netmap endpoint; Go-style report (UDP, IPv4/6, MappingVariesByDestIP, DERP latencies sorted) |
+| `netcheck` | `cli/netcheck.go` | ✅ client-side STUN probe via `crates/netcheck`; DERPMap from daemon netmap; Go-style report (UDP, IPv4/6, MappingVariesByDestIP, DERP latencies sorted) |
 | `metrics` | `cli/metrics.go` | ✅ raw Prometheus text passthrough |
 | `health` | — | ✅ health warnings from daemon; `--json` |
-| `down` | `cli/down.go` | ✅ phase-interactive-auth: EditPrefs WantRunning=false via PATCH /prefs |
-| `ping` | `cli/ping.go` | 🔶 surfaces daemon 501 as "not yet supported" (magicsock disco-ping API pending) |
-| `up` | `cli/up.go` | ✅ phase-interactive-auth: full runUp sequence (status → build prefs → watch-ipn-bus → /start → login-interactive if no node key → BrowseToURL loop → success on Running); flags: --auth-key, --hostname, --advertise-routes, --advertise-exit-node, --exit-node, --shields-up, --accept-routes, --accept-dns, --reset, --force-reauth, --timeout, --json, --qr (terminal QR + PNG data URL in --json) |
-| `login` | `cli/login.go` | ✅ phase-interactive-auth: login-interactive + watch-ipn-bus for BrowseToURL/Running; --qr (terminal QR + PNG data URL in --json) |
-| `logout` | `cli/logout.go` | ✅ phase-interactive-auth: POST /logout |
-| `set` | `cli/set.go` | ✅ phase-interactive-auth: EditPrefs via PATCH /prefs from --hostname, --accept-routes, --accept-dns, --shields-up, --advertise-routes, --advertise-exit-node, --exit-node flags |
-| `get` | `cli/prefs.go` | ✅ phase-interactive-auth: GET /prefs, JSON or human-readable |
-| `wait`/`switch` | `cli/wait.go` | 🔶 `switch` ✅ phase-serve-cli-profiles: `rustscale switch [--list] [--json] [<profile>]`; `wait` ⬜ |
-| `serve`/`funnel` | `cli/serve.go` | ✅ port-6 + phase-serve-cli-profiles: `rustscale serve [--bg] [--https|--http|--tcp|--tls-terminated-tcp=<port>] [--set-path <path>] <target>`, `serve status [--json]`, `serve reset`; `rustscale funnel` variants (AllowFunnel + port validation); foreground mode errors "not yet supported" without --bg |
-| `cert` | `cli/cert.go` | ✅ phase-cli-cert-qr: `rustscale cert [--cert-file] [--key-file] [--min-validity] <domain>`; writes files (`-`=stdout); no-domain prints cert domain from status (CertDomains); LocalAPI `GET /cert/<domain>?type=pair|cert|key&min_validity=`; localclient `cert_pair`/`cert`/`cert_key`; reuses existing ACME/ControlCertProvider cache |
-| `file` | `cli/file.go` | ✅ phase-taildrop: `file cp [--name] [--verbose] [--targets] <files...> <target>:`; `file get [--wait] [--conflict=skip|overwrite|rename] [--verbose] <dir>`; LocalAPI file-put/files/file-targets endpoints |
-| `ssh` | `cli/ssh.go` | ✅ phase-cli-ssh-web: `rustscale ssh [user@]host [args...]`; resolves host against status peers (short name/FQDN/IP); execs system ssh with `-o HostName <resolved-ip>` + known_hosts trust options when peer advertises SSH_HostKeys; unix execvp, Windows "not supported"; 29 argv-construction unit tests |
-| `web` | `cli/web.go` | ✅ phase-cli-ssh-web: `rustscale web [--listen <addr>] [--readonly] [--unsafe-any-addr]`; embedded single-file HTML (inline JS+fetch); handlers: GET /api/status, POST /api/up, /api/down, /api/logout; loopback-only by default; LocalApi trait with stub-based handler tests; 23 unit tests |
-| `debug` | `cli/debug.go` | ✅ phase-cli-daemon: `rustscale debug <status|ipconfig|metrics>` calls daemon debug endpoints |
-| `exit-node` | `cli/exitnode.go` | ✅ phase-cli-daemon: lists exit-node-capable peers, `--suggest` for SuggestedExitNode |
-| `dns` | `cli/dns.go` | ✅ phase-cli-daemon: queries daemon DNS resolver or prints status |
-| `bugreport` | `cli/bugreport.go` | ✅ phase-cli-daemon: prints version/state/health summary |
-| `nc` | `cli/nc.go` | 🔶 phase-cli-daemon: stub (not-yet-supported) |
-| `id-token` | `cli/id-token.go` | 🔶 phase-cli-daemon: stub (not-yet-supported) |
-| `update` | `cli/update.go` | 🔶 phase-cli-daemon: stub (not-yet-supported) |
+| `down` | `cli/down.go` | ✅ EditPrefs WantRunning=false via PATCH /prefs |
+| `ping` | `cli/ping.go` | 🔶 CLI calls `client.ping(ip, "disco")` but daemon returns 501 (magicsock disco-ping API pending) |
+| `up` | `cli/up.go` | ✅ full runUp sequence (status → build prefs → watch-ipn-bus → /start → login-interactive → BrowseToURL → Running); flags: --auth-key, --hostname, --advertise-routes, --advertise-exit-node, --exit-node, --shields-up, --accept-routes, --accept-dns, --reset, --force-reauth, --timeout, --json, --qr |
+| `login` | `cli/login.go` | ✅ login-interactive + watch-ipn-bus for BrowseToURL/Running; --qr |
+| `logout` | `cli/logout.go` | ✅ POST /logout |
+| `set` | `cli/set.go` | ✅ EditPrefs via PATCH /prefs; flags: hostname, accept-routes, accept-dns, shields-up, advertise-routes, advertise-exit-node, exit-node, route-all, advertise-tags, reset |
+| `get` | `cli/prefs.go` | ✅ GET /prefs, JSON or human-readable |
+| `switch` | `cli/wait.go` | ✅ `switch [--list] [--json] [<profile>]`; `wait` subcommand ⬜ |
+| `serve`/`funnel` | `cli/serve.go` | ✅ serve/funnel status, reset, set with --bg/--https/--http/--tcp/--tls-terminated-tcp; foreground mode not yet supported |
+| `cert` | `cli/cert.go` | ✅ `cert [--cert-file] [--key-file] [--min-validity] <domain>`; writes files, `-`=stdout; no-domain prints cert domains from status |
+| `file` | `cli/file.go` | ✅ `file cp [--name] [--verbose] [--targets] <files...> <target>:`; `file get [--wait] [--conflict=skip\|overwrite\|rename] [--verbose] <dir>` |
+| `ssh` | `cli/ssh.go` | ✅ `ssh [user@]host [args...]`; resolves peer, writes known_hosts, execs system ssh; 29 unit tests |
+| `web` | `cli/web.go` | ✅ embedded single-file HTML; endpoints: /api/status/up/down/logout; --readonly, --unsafe-any-addr; 23 unit tests |
+| `debug` | `cli/debug.go` | ✅ `debug <status\|metrics\|ipconfig>` |
+| `exit-node` | `cli/exitnode.go` | ✅ lists exit-node-capable peers; `--suggest` for SuggestedExitNode; cannot select exit node via CLI |
+| `dns` | `cli/dns.go` | ✅ queries daemon DNS resolver or prints MagicDNS status; `--type`, `--json` |
+| `bugreport` | `cli/bugreport.go` | ✅ prints version/state/health summary |
+| `nc` | `cli/nc.go` | 🔶 stub (not-yet-supported) |
+| `id-token` | `cli/id-token.go` | 🔶 stub (not-yet-supported) |
+| `update` | `cli/update.go` | 🔶 stub (not-yet-supported) |
 | `drive` | `cli/drive.go` | ⬜ |
 | `lock` | `cli/lock.go` | ⬜ |
 | completion/man | — | ⬜ |
@@ -296,54 +263,27 @@ state-dir fallback probing), `--json`.
 hand-rolled HTTP/1.1 (no hyper), fake Host `local-rustscaled.sock`, typed
 errors (AccessDenied 403, PreconditionsFailed 412, HttpStatus, PeerNotFound),
 `watch_ipn_bus()` streaming method for newline-delimited JSON `Notify`
-messages. ✅ phase-interactive-auth: `start()` (POST /start with StartOptions),
-`login_interactive()`, `logout()`, `edit_prefs()` (PATCH /prefs with
-MaskedPrefs), `get_prefs()` (typed Prefs deserialization),
-`send_request_with_body()` for POST/PATCH with body. ✅ phase-cli-daemon: `debug()`, `dial()`, `dns_query()`, `check_ip_forwarding()` methods. Integration test boots
-testcontrol + daemon with LocalAPI on a temp socket and exercises the
-`status` path both via the library and the binary via `std::process`;
-interactive_auth_flow test: testcontrol(require_auth) → start_localapi_only
-→ /start → BrowseToURL → complete_auth → Running.
+messages. Methods: start(), login_interactive(), logout(), edit_prefs(),
+get_prefs(), status(), whois(), health(), metrics(), ping(), get_serve_config(),
+set_serve_config(), cert_pair(), list_profiles(), current_profile(),
+switch_profile(), delete_profile(), push_file(), waiting_files(),
+get_waiting_file(), delete_waiting_file(), debug(), dial(), dns_query(),
+check_ip_forwarding(). Integration tests: testcontrol + daemon over temp
+socket, interactive auth flow.
 
 ## Windows port (x86_64-pc-windows-msvc)
 
 Status: ✅ compile-level portability complete and warnings-clean. `cargo check
 --workspace --target x86_64-pc-windows-msvc` and `cargo clippy --workspace
 --all-targets --target x86_64-pc-windows-msvc -- -D warnings` both pass with
-zero errors/warnings. Both Windows CI legs (`Check (windows)` and the
-`x86_64-pc-windows-msvc` cross-check) are blocking (`continue-on-error`
-removed). The Windows test step runs under `shell: bash` with
-`RUSTFLAGS="-D warnings"`, and clippy with `-D warnings` is extended to the
-Windows leg. The safesocket named-pipe transport is implemented and has a
-`#[cfg(windows)]` loopback unit test.
-
-### What was fixed
-
-| Crate | Issue | Fix |
-| --- | --- | --- |
-| `crates/tun` | `libc::AF_INET`/`AF_INET6` not available on Windows | `AF_INET`/`AF_INET6` constants and `strip_af_header`/`prepend_af_header` framing functions gated behind `#[cfg(unix)]`; `AF_HEADER_LEN` (plain `usize`) remains cross-platform; framing tests gated `#[cfg(unix)]`. |
-| `crates/tcpinfo` | `std::os::unix::io` import + `as_raw_fd` | `use` and `rtt()` gated `#[cfg(unix)]`; `#[cfg(not(unix))]` `rtt()` stub returns `io::ErrorKind::Unsupported`. |
-| `crates/netmon` | dead-code: `find_self_ip_on_interface` | Gated `#[cfg(any(target_os = "macos", target_os = "linux"))]` (only called from those code paths). |
-| `crates/portmapper` | dead-code: `ip_for_interface`, `is_link_local` | Gated `#[cfg(any(target_os = "macos", target_os = "linux"))]`. |
-| `crates/safesocket` | no Windows transport | Implemented `windows.rs` using `tokio::net::windows::named_pipe` (pipe path `\\.\pipe\ProtectedPrefix\Administrators\Rustscale\rustscaled`, 256 KiB buffers, `reject_remote_clients`). API unified: `Connection`/`ServerStream` type aliases, `Listener` struct with async `accept()`. |
-| `crates/localclient` | `tokio::net::UnixStream` ungated | Replaced with `rustscale_safesocket::Connection` type alias; removed `from_std` conversions. |
-| `crates/tsnet` (localapi) | `tokio::net::UnixListener`/`UnixStream` ungated | Replaced with `rustscale_safesocket::Listener`/`ServerStream`; three ungated tests given `#[cfg(unix)]`. |
-| `crates/tsnet` (example) | `std::os::unix::net::UnixStream` in example | `main` gated `#[cfg(unix)]` with non-unix stub. |
-| `crates/cli` | hardcoded unix socket paths | Uses `rustscale_safesocket::default_socket_path()`; state-dir fallback gated `#[cfg(unix)]`. |
-| `crates/rustscaled` | hardcoded unix socket paths | Per-OS `DEFAULT_STATE_DIR`; `determine_socket_path` uses `default_socket_path()`; Windows returns pipe path directly. |
-| `.github/workflows/ci.yml` | Windows legs `continue-on-error: true` | Removed; added `cargo test -p` for windows-meaningful crates (ipn, localclient, tailcfg, key, disco, safesocket). |
-| `.github/workflows/ci.yml` | PowerShell-vs-bash line-continuation bug in Windows test step | Added `shell: bash` to the test step; extended clippy with `-D warnings` to the Windows leg; added `RUSTFLAGS="-D warnings"` to the test step. |
-| `crates/tsnet` (up_tun) | 8 unix-only warnings on Windows (unused `monitor`/`tun` vars, unreachable code, 5 never-used route helpers) | Extracted TUN creation into cfg-gated `create_tun_device` (unix creates device + applies routes, non-unix returns error); `?` propagation keeps flow analysis happy without early-return dead code. Gated `apply_tun_routes`, `apply_accepted_subnet_routes`, `apply_exit_node_routes`, `is_tailnet_cidr`, `run_cmd` with `#[cfg(any(target_os = "macos", target_os = "linux"))]`; removed dead `#[cfg(not(...))]` fallback blocks inside them. |
-| `crates/safesocket` (windows.rs) | clippy `redundant_closure_for_method_calls` on `.map(\|s\| s.to_string())` | Changed to `.map(str::to_string)`. |
-| `crates/tun` (tests) | `v6_packet` never used on Windows (only called from `#[cfg(unix)]` tests) | Gated `v6_packet` with `#[cfg(unix)]`. |
-| `crates/rustscaled` (daemon.rs) | clippy `needless_return` on Windows (`return primary;` in `#[cfg(windows)]` block) | Changed to trailing expression `primary` (block evaluates to `PathBuf` on Windows). |
-| `crates/tsnet` (localapi-status example) | Unused imports on Windows (`env`, `Read`/`Write`, `PathBuf` only used in `#[cfg(unix)] main`) | Gated all three imports with `#[cfg(unix)]`. |
-| `crates/cli` (cert.rs) | Unused `mode` parameter on Windows (only used in `#[cfg(unix)]` branch) | Added `let _ = mode;` in the `#[cfg(not(unix))]` branch. |
-| `crates/cli` (ssh.rs) | `gen_known_hosts` never used on Windows (only called from `#[cfg(unix)] write_known_hosts`) | Gated `gen_known_hosts` and its 4 unit tests with `#[cfg(unix)]`. |
+zero errors/warnings. Both Windows CI legs are blocking. Windows test step
+runs under `shell: bash` with `RUSTFLAGS="-D warnings"`. Named-pipe transport
+( `\\.\pipe\ProtectedPrefix\Administrators\Rustscale\rustscaled`) implemented
+with `reject_remote_clients`, 256 KiB buffers, loopback test.
 
 ### Remaining Windows gaps (runtime, not compile)
 
 - `crates/tun`: no wintun.dll backend — `create()` returns error on Windows.
-- `crates/dns`: `system_nameservers()` reads `/etc/resolv.conf` (falls through to hardcoded fallback on Windows).
+- `crates/dns`: `system_nameservers()` reads `/etc/resolv.conf` (hardcoded fallback on Windows).
 - `crates/routetable`: macOS-only parser (stub returns `Unsupported` on Windows).
-- Windows service install (SCM registration) is out of scope; `rustscaled run` works in a console with ctrl-c shutdown.
+- Windows service install (SCM registration) out of scope; `rustscaled run` works in console with ctrl-c shutdown.

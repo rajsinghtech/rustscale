@@ -119,6 +119,21 @@ brew install rajsinghtech/tap/rustscale
 
 Installs the `rustscale` CLI and `rustscaled` daemon.
 
+### Docker
+
+```sh
+docker run -d --name rustscale \
+  -e TS_AUTHKEY=tskey-... \
+  -e TS_HOSTNAME=my-container \
+  -v rustscale-state:/var/lib/rustscale \
+  ghcr.io/rajsinghtech/rustscale
+```
+
+Runs in userspace networking mode by default (no `--privileged` needed).
+For TUN mode, add `--privileged --device /dev/net/tun` and set `TS_USERSPACE=0`.
+
+See `container/entrypoint.sh` for the full `TS_*` env var reference.
+
 ### From source
 
 Build and install the C library and header (requires the Rust toolchain):

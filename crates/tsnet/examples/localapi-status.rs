@@ -9,8 +9,11 @@
 //! This demonstrates the LocalAPI client side: a simple Unix-socket HTTP/1.1
 //! client that sends a GET request and prints the JSON response.
 
+#[cfg(unix)]
 use std::env;
+#[cfg(unix)]
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::path::PathBuf;
 
 #[cfg(unix)]

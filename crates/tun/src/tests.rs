@@ -14,6 +14,7 @@ fn v4_packet(dst: [u8; 4], payload: &[u8]) -> Vec<u8> {
     p
 }
 
+#[cfg(unix)]
 fn v6_packet(payload: &[u8]) -> Vec<u8> {
     let total = 40 + payload.len();
     let mut p = vec![0u8; total];

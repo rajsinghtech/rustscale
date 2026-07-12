@@ -219,6 +219,7 @@ fn write_if_changed(path: &str, contents: &[u8], mode: u32) -> Result<(), CliErr
     }
     #[cfg(not(unix))]
     {
+        let _ = mode;
         std::fs::write(path, contents)?;
     }
     Ok(())

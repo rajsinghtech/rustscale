@@ -145,7 +145,7 @@ fn determine_socket_path(state_dir: &Path) -> PathBuf {
     #[cfg(windows)]
     {
         let _ = state_dir;
-        return primary;
+        primary
     }
 
     // On Unix, try the primary path first, then fall back to the state dir.

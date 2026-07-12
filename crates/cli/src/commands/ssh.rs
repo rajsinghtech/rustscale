@@ -231,6 +231,7 @@ fn build_ssh_argv(
 /// Generate the contents of a known_hosts file from the status peers.
 /// Includes entries for DNSName, each Tailscale IP, and optionally the
 /// original host alias the user typed (so short-name lookups succeed).
+#[cfg(unix)]
 fn gen_known_hosts(status: &Value, original_alias: Option<&str>, target_peer: &PeerInfo) -> String {
     let mut buf = String::new();
     if let Some(peers) = status.get("Peer").and_then(|v| v.as_object()) {
@@ -646,6 +647,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn gen_known_hosts_basic() {
         let st = make_status(vec![
@@ -673,6 +675,7 @@ mod tests {
         assert!(content.contains("100.64.0.2 ssh-ed25519 AAAA2"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn gen_known_hosts_no_alias_when_same_as_dnsname() {
         let st = make_status(vec![make_peer(
@@ -692,6 +695,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn gen_known_hosts_no_keys() {
         let st = make_status(vec![make_peer(
@@ -708,6 +712,7 @@ mod tests {
         assert!(content.is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn gen_known_hosts_rejects_newlines_in_keys() {
         let st = make_status(vec![make_peer(

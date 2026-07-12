@@ -1445,11 +1445,13 @@ dependencies = [
 name = "rustscale-netstack"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "rustscale-key",
  "rustscale-wg",
  "smoltcp",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

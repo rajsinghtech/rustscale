@@ -42,6 +42,9 @@ boringtun = "0.7"
 # Userspace TCP/IP stack for tsnet-style dialing/listening.
 smoltcp = { version = "0.13", default-features = false, features = ["medium-ip", "proto-ipv4", "socket-tcp", "alloc"] }
 
+# PollSender for properly waking tasks on full mpsc channels (netstack).
+tokio-util = "0.7"
+
 # HTTP/2 client for the Noise-tunneled control plane (ts2021).
 h2 = "0.4"
 
@@ -105,3 +108,7 @@ cloned_ref_to_slice_refs = "allow"
 uninlined_format_args = "allow"
 empty_line_after_doc_comments = "allow"
 drop_non_drop = "allow"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

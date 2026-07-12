@@ -21,18 +21,18 @@
 #
 # Model tiering (modelID only — provider "ai" is sent separately; do NOT prefix "ai/"):
 #   deepseek/deepseek-v4-flash     — research, review, docs (cheap)
-#   vercel-ent/zai/glm-5.2         — complex coding (default)
+#   zai/glm-5.2                    — complex coding (default, via ai.keiretsu.ts.net)
 #   Override via OPENCODE_MODEL env var or --model flag.
 #
 # Env: OPENCODE_URL   (default http://127.0.0.1:4096)
-#      OPENCODE_MODEL (default vercel-ent/zai/glm-5.2), OPENCODE_PROVIDER (ai)
+#      OPENCODE_MODEL (default zai/glm-5.2), OPENCODE_PROVIDER (ai)
 #
 # Exit: 0 completed; 3 watchdog abort (prints sessionID for --continue); 1 error.
 set -euo pipefail
 
 URL="${OPENCODE_URL:-http://127.0.0.1:4096}"
 PROVIDER="${OPENCODE_PROVIDER:-ai}"
-MODEL="${OPENCODE_MODEL:-vercel-ent/zai/glm-5.2}"
+MODEL="${OPENCODE_MODEL:-zai/glm-5.2}"
 DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 
 CONTINUE=""

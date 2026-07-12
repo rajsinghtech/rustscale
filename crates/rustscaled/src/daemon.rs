@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 use rustscale_tsnet::localapi::DaemonCommand;
 use rustscale_tsnet::{Server, TunModeConfig};
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
+const DEFAULT_STATE_DIR: &str = "/var/db/rustscale";
+#[cfg(all(unix, not(target_os = "macos")))]
 const DEFAULT_STATE_DIR: &str = "/var/lib/rustscale";
 #[cfg(windows)]
 const DEFAULT_STATE_DIR: &str = "C:\\ProgramData\\Rustscale";
@@ -190,18 +192,32 @@ fn determine_socket_path(state_dir: &Path) -> PathBuf {
         primary
     }
 
-    // On Unix, try the primary path first, then fall back to the state dir.
+    // On Unix, probe whether the primary socket's parent directory is
+    // writable by creating a throwaway temp file. We deliberately do NOT
+    // bind the real socket here: the daemon binds it later, and binding as a
+    // probe is racy (another process could grab the path between probe and
+    // real bind) and noisy (a panic during `drop` would leave a stale socket
+    // file on disk). If the parent is missing or not writable, fall back to a
+    // socket inside the state directory.
     #[cfg(unix)]
     {
         let fallback = state_dir.join("rustscaled.sock");
 
-        match rustscale_safesocket::listen(&primary) {
-            Ok(listener) => {
-                drop(listener);
-                let _ = std::fs::remove_file(&primary);
-                primary
-            }
-            Err(_) => fallback,
+        let writable = primary.parent().is_some_and(|dir| {
+            let probe = dir.join(format!(".rustscaled.probe.{}", std::process::id()));
+            let result = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&probe);
+            let _ = std::fs::remove_file(&probe);
+            result.is_ok()
+        });
+
+        if writable {
+            primary
+        } else {
+            fallback
         }
     }
 }

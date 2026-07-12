@@ -9,7 +9,7 @@ goal of a full TUN-mode client.
 ## Development model: ALL implementation work goes through opencode agents
 
 Claude Code acts as the **orchestrator only**. All code in this repo is written by opencode
-agents running `vercel-ent/zai/glm-5.2`. Do not write implementation code directly with
+agents running `zai/glm-5.2` via `ai.keiretsu.ts.net`. Do not write implementation code directly with
 Edit/Write except for docs, specs, and this file.
 
 ### How to call opencode
@@ -29,7 +29,7 @@ tools/agent/opencode-task.sh --continue <sessionID> "fix ..." [deadline_secs]
 - Exit 3 = watchdog aborted at the deadline (prints the sessionID — inspect partial work
   on disk, then `--continue` that session).
 - The server is auto-started on 127.0.0.1:4096 if not running (`/tmp/opencode-serve.log`).
-- Model default: `vercel-ent/zai/glm-5.2` (override with OPENCODE_PROVIDER/OPENCODE_MODEL).
+- Model default: `zai/glm-5.2` via provider `ai` (`http://ai.keiretsu.ts.net/v1`). Override with `OPENCODE_MODEL` or `--model`.
 - Under the hood: `POST /session?directory=...` (with `permission:[{permission:"*",pattern:"*",action:"allow"}]`),
   `POST /session/:id/prompt_async` (204, non-blocking), poll `/session/status` +
   `/session/:id/message`, `POST /session/:id/abort` on deadline.

@@ -15,6 +15,13 @@ const SERVICE_LABEL: &str = "com.rustscale.rustscaled";
 const PLIST_PATH: &str = "/Library/LaunchDaemons/com.rustscale.rustscaled.plist";
 /// Target binary path.
 const TARGET_BIN: &str = "/usr/local/bin/rustscaled";
+/// State directory the daemon uses on macOS — matches the `--statedir`
+/// argument baked into the plist's `ProgramArguments` and the daemon's
+/// `DEFAULT_STATE_DIR` on macOS. Tailscale uses `/var/db/tailscale`.
+const STATE_DIR: &str = "/var/db/rustscale";
+/// Log directory for launchd's `StandardOutPath`/`StandardErrorPath`
+/// redirection.
+const LOG_DIR: &str = "/var/log/rustscale";
 
 /// Errors from launchd install/uninstall operations.
 #[derive(Debug, thiserror::Error)]
@@ -29,7 +36,12 @@ pub enum LaunchdError {
 
 /// Generate the launchd plist XML content.
 ///
-/// Mirrors Go's `darwinLaunchdPlist` constant with rustscale naming.
+/// Mirrors Go's `darwinLaunchdPlist` constant with rustscale naming. The
+/// `ProgramArguments` include the `run` subcommand and `--statedir` so
+/// launchd starts the daemon the same way an interactive `rustscaled run`
+/// would (the binary's `main` requires an explicit subcommand). `KeepAlive`
+/// restarts the daemon after a crash, and the standard out/err paths let
+/// launchd capture logs for debugging.
 pub fn launchd_plist() -> String {
     format!(
         r#"
@@ -44,10 +56,22 @@ pub fn launchd_plist() -> String {
   <key>ProgramArguments</key>
   <array>
     <string>{TARGET_BIN}</string>
+    <string>run</string>
+    <string>--statedir</string>
+    <string>{STATE_DIR}</string>
   </array>
 
   <key>RunAtLoad</key>
   <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardErrorPath</key>
+  <string>{LOG_DIR}/rustscaled.log</string>
+
+  <key>StandardOutPath</key>
+  <string>{LOG_DIR}/rustscaled.log</string>
 
 </dict>
 </plist>
@@ -68,6 +92,32 @@ pub fn check_root(uid: u32) -> Result<(), LaunchdError> {
     }
 }
 
+/// Create the directories the daemon needs at runtime:
+/// - `STATE_DIR` (`/var/db/rustscale`, mode `0o700`) — state files.
+/// - `LOG_DIR` (`/var/log/rustscale`, mode `0o755`) — log files for launchd's
+///   `StandardOutPath`/`StandardErrorPath`.
+///
+/// The state dir is required (its path is baked into the plist's
+/// `ProgramArguments` via `--statedir`). The log dir is created best-effort:
+/// a missing log dir just means launchd has nowhere to redirect the daemon's
+/// stdout/stderr, which is non-fatal. Must run as root.
+fn create_state_and_log_dirs() -> Result<(), LaunchdError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let state_dir = Path::new(STATE_DIR);
+    std::fs::create_dir_all(state_dir)?;
+    std::fs::set_permissions(state_dir, std::fs::Permissions::from_mode(0o700))?;
+
+    let log_dir = Path::new(LOG_DIR);
+    if let Err(e) = std::fs::create_dir_all(log_dir) {
+        eprintln!("create {LOG_DIR}: {e} (non-fatal; launchd logs will go nowhere)");
+    } else {
+        let _ = std::fs::set_permissions(log_dir, std::fs::Permissions::from_mode(0o755));
+    }
+
+    Ok(())
+}
+
 /// Install the rustscaled system daemon.
 ///
 /// Flow (mirrors Go's `installSystemDaemonDarwin`):
@@ -82,6 +132,12 @@ pub fn install_system_daemon() -> Result<(), LaunchdError> {
 
     // Best effort: uninstall any existing version first.
     let _ = uninstall_system_daemon();
+
+    // Create the state and log directories the daemon expects at runtime.
+    // The state dir is required (the plist bakes `--statedir /var/db/rustscale`
+    // into ProgramArguments); the log dir is best-effort but lets launchd
+    // redirect stdout/stderr to the paths declared in the plist.
+    create_state_and_log_dirs()?;
 
     let exe = std::env::current_exe()
         .map_err(|e| LaunchdError::Other(format!("failed to find our own executable path: {e}")))?;
@@ -279,10 +335,22 @@ mod tests {
   <key>ProgramArguments</key>
   <array>
     <string>/usr/local/bin/rustscaled</string>
+    <string>run</string>
+    <string>--statedir</string>
+    <string>/var/db/rustscale</string>
   </array>
 
   <key>RunAtLoad</key>
   <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardErrorPath</key>
+  <string>/var/log/rustscale/rustscaled.log</string>
+
+  <key>StandardOutPath</key>
+  <string>/var/log/rustscale/rustscaled.log</string>
 
 </dict>
 </plist>

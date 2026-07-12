@@ -7,8 +7,12 @@
 
 use std::path::PathBuf;
 
-/// Default state directory for the fallback probe (unix only).
-#[cfg(unix)]
+/// Default state directory for the fallback probe (unix only). On macOS the
+/// daemon lives in `/var/db/rustscale` (matching Tailscale's
+/// `/var/db/tailscale`); on other Unixes `/var/lib/rustscale`.
+#[cfg(target_os = "macos")]
+const DEFAULT_STATE_DIR: &str = "/var/db/rustscale";
+#[cfg(all(unix, not(target_os = "macos")))]
 const DEFAULT_STATE_DIR: &str = "/var/lib/rustscale";
 
 /// Resolve the socket path to connect to. If the caller supplied an explicit

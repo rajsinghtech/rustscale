@@ -41,6 +41,7 @@ mod service;
 mod socks5;
 mod state;
 mod status;
+mod taildrop;
 mod tls;
 
 #[cfg(feature = "ssh")]
@@ -63,6 +64,7 @@ pub use socks5::{
 };
 pub use state::{NetMapCache, PersistedState, StateError};
 pub use status::{PeerInfo, ServerStatus, WhoIsInfo};
+pub use taildrop::{resolve_conflict, ConflictMode, FileTarget, TaildropError, TaildropManager};
 pub use tls::{
     AcmeCertFetcher, CertError, CertFetcher, CertMaterial, CertProvider, ControlCertProvider,
     SelfSignedCertProvider, TlsError, TlsListener, TlsStream,
@@ -912,6 +914,14 @@ impl Server {
             c2n::spawn_c2n_server(b.c2n_backend.clone(), "rustscale".into()).await;
         tasks.push(c2n_task);
 
+        // Taildrop file manager (shared between PeerAPI receive handler
+        // and LocalAPI endpoints). Created from the state directory; if
+        // no state dir, taildrop is disabled.
+        let taildrop = Arc::new(taildrop::TaildropManager::new(
+            self.config.state_dir.as_deref(),
+            Some(b.ipn_backend.clone()),
+        ));
+
         // PeerAPI server (netstack mode): listens on a deterministic port on
         // the node's tailnet IP, serving DoH DNS + debug endpoints to peers.
         let offering_exit_node = self.config.advertise_exit_node;
@@ -923,6 +933,7 @@ impl Server {
             b.dns_config.clone(),
             b.tailscale_ips.clone(),
             offering_exit_node,
+            Some(taildrop.clone()),
         )
         .await;
         tasks.push(peerapi_task);
@@ -1050,6 +1061,8 @@ impl Server {
                         capability_version: CAPABILITY_VERSION,
                         protocol_version: PROTOCOL_VERSION,
                     }),
+                taildrop: Some(taildrop.clone()),
+                netstack: Some(netstack.clone()),
             };
             if let Some(h) = localapi::spawn_localapi(Arc::new(state), path.clone()) {
                 tasks.push(h.task);
@@ -1236,6 +1249,13 @@ impl Server {
         let (c2n_task, c2n_addr) =
             c2n::spawn_c2n_server(b.c2n_backend.clone(), "rustscale".into()).await;
 
+        // Taildrop file manager (shared between PeerAPI receive handler
+        // and LocalAPI endpoints). Created from the state directory.
+        let taildrop = Arc::new(taildrop::TaildropManager::new(
+            self.config.state_dir.as_deref(),
+            Some(b.ipn_backend.clone()),
+        ));
+
         // PeerAPI server (TUN mode): binds TCP listeners on the node's
         // tailnet IPs (v4 + v6) on the deterministic port.
         let offering_exit_node = self.config.advertise_exit_node;
@@ -1246,6 +1266,7 @@ impl Server {
             b.dns_config.clone(),
             b.tailscale_ips.clone(),
             offering_exit_node,
+            Some(taildrop.clone()),
         )
         .await;
 
@@ -1381,6 +1402,8 @@ impl Server {
                         capability_version: CAPABILITY_VERSION,
                         protocol_version: PROTOCOL_VERSION,
                     }),
+                taildrop: Some(taildrop.clone()),
+                netstack: None, // TUN mode has no netstack
             };
             if let Some(h) = localapi::spawn_localapi(Arc::new(state), path.clone()) {
                 tasks.push(h.task);
@@ -1587,6 +1610,8 @@ impl Server {
                     .flatten(),
             )),
             cert_params: None,
+            taildrop: None,
+            netstack: None,
         });
 
         let handle = localapi::spawn_localapi(api_state, socket_path.clone());

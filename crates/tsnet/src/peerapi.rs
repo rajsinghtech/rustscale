@@ -134,6 +134,8 @@ pub(crate) struct PeerApiState {
     tailscale_ips: Vec<IpAddr>,
     /// Whether this node is advertising exit node routes.
     offering_exit_node: bool,
+    /// Taildrop file manager (None if taildrop is disabled).
+    taildrop: Option<Arc<crate::taildrop::TaildropManager>>,
 }
 
 impl PeerApiState {
@@ -261,6 +263,7 @@ pub(crate) async fn spawn_peerapi_netstack(
     dns_config: Arc<RwLock<Option<DNSConfig>>>,
     tailscale_ips: Vec<IpAddr>,
     offering_exit_node: bool,
+    taildrop: Option<Arc<crate::taildrop::TaildropManager>>,
 ) -> (JoinHandle<()>, Option<u16>) {
     // Derive the port from the primary IPv4 address.
     let v4 = tailscale_ips.iter().find_map(|ip| match ip {
@@ -285,6 +288,7 @@ pub(crate) async fn spawn_peerapi_netstack(
                         dns_config: dns_config.clone(),
                         tailscale_ips: tailscale_ips.clone(),
                         offering_exit_node,
+                        taildrop: taildrop.clone(),
                     });
                     let handle = tokio::spawn(serve_netstack_listener(listener, state));
                     // Keep the listener task alive; we return the port.
@@ -310,6 +314,7 @@ pub(crate) async fn spawn_peerapi_netstack(
                         dns_config: dns_config.clone(),
                         tailscale_ips: tailscale_ips.clone(),
                         offering_exit_node,
+                        taildrop: taildrop.clone(),
                     });
                     let handle = tokio::spawn(serve_netstack_listener(listener, state));
                     std::mem::forget(handle);
@@ -342,6 +347,7 @@ pub(crate) async fn spawn_peerapi_tun(
     dns_config: Arc<RwLock<Option<DNSConfig>>>,
     tailscale_ips: Vec<IpAddr>,
     offering_exit_node: bool,
+    taildrop: Option<Arc<crate::taildrop::TaildropManager>>,
 ) -> (JoinHandle<()>, Option<u16>) {
     let state = Arc::new(PeerApiState {
         peers,
@@ -350,6 +356,7 @@ pub(crate) async fn spawn_peerapi_tun(
         dns_config,
         tailscale_ips: tailscale_ips.clone(),
         offering_exit_node,
+        taildrop,
     });
 
     let mut v4_port: Option<u16> = None;
@@ -619,7 +626,8 @@ impl PeerApiResponse {
     }
 }
 
-/// Read and parse an HTTP/1.1 request from a connection.
+/// Read and parse an HTTP/1.1 request from a connection. Reads the full
+/// Content-Length body (not just the preview that arrived with the headers).
 async fn read_request<R: AsyncRead + Unpin>(conn: &mut R) -> Result<PeerApiRequest, String> {
     let mut buf = Vec::with_capacity(4096);
     let mut tmp = [0u8; 4096];
@@ -634,13 +642,41 @@ async fn read_request<R: AsyncRead + Unpin>(conn: &mut R) -> Result<PeerApiReque
         buf.extend_from_slice(&tmp[..n]);
         if let Some(end) = find_header_end(&buf) {
             let head = &buf[..end + 4];
-            let body_preview = buf[end + 4..].to_vec();
-            return parse_request_head(head, body_preview);
+            let mut body = buf[end + 4..].to_vec();
+            // Read the full Content-Length body if the preview is short.
+            let header_text =
+                std::str::from_utf8(head).map_err(|_| "non-utf8 header".to_string())?;
+            let cl = extract_content_length(header_text);
+            while body.len() < cl {
+                let n = conn
+                    .read(&mut tmp)
+                    .await
+                    .map_err(|e| format!("read body: {e}"))?;
+                if n == 0 {
+                    break;
+                }
+                body.extend_from_slice(&tmp[..n]);
+            }
+            body.truncate(cl);
+            return parse_request_head(head, body);
         }
         if buf.len() > 256 * 1024 {
             return Err("header too large".into());
         }
     }
+}
+
+/// Extract the Content-Length value from an HTTP header block. Returns 0
+/// if the header is absent or unparseable.
+fn extract_content_length(header_text: &str) -> usize {
+    for line in header_text.split("\r\n") {
+        if let Some((k, v)) = line.split_once(':') {
+            if k.trim().eq_ignore_ascii_case("content-length") {
+                return v.trim().parse().unwrap_or(0);
+            }
+        }
+    }
+    0
 }
 
 fn find_header_end(buf: &[u8]) -> Option<usize> {
@@ -800,6 +836,12 @@ async fn dispatch(
         return add_security_headers(resp, req);
     }
 
+    // Taildrop receive: /v0/put/<filename>
+    if path.starts_with("/v0/put/") {
+        let resp = handle_peer_put(req, whois, is_self, state).await;
+        return add_security_headers(resp, req);
+    }
+
     // Debug handlers: /v0/*
     if let Some(resp) = handle_debug(req, path, whois, is_self, state) {
         return add_security_headers(resp, req);
@@ -898,6 +940,113 @@ fn parse_doh_query(req: &PeerApiRequest) -> Result<Vec<u8>, String> {
             Ok(req.body.clone())
         }
         _ => Err("bad HTTP method".into()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Taildrop receive: PUT /v0/put/<filename>
+// ---------------------------------------------------------------------------
+
+/// Handle `PUT /v0/put/<filename>` — receive a file from a peer via the
+/// PeerAPI and write it to the Taildrop spool. Mirrors Go's
+/// `feature/taildrop/peerapi.go:handlePeerPut`.
+///
+/// Auth: the peer must be known (WhoIs passed) and either be the same user
+/// or have the `file-send` peer capability. The node must have taildrop
+/// enabled (file-sharing cap + spool directory).
+async fn handle_peer_put(
+    req: &PeerApiRequest,
+    _whois: &WhoIsInfo,
+    is_self: bool,
+    state: &Arc<PeerApiState>,
+) -> PeerApiResponse {
+    // Must have a taildrop manager.
+    let Some(taildrop) = state.taildrop.as_ref() else {
+        return PeerApiResponse::new(
+            403,
+            "Forbidden",
+            "text/plain; charset=utf-8",
+            b"taildrop not enabled".to_vec(),
+        );
+    };
+
+    // Auth: same user (is_self) or file-send cap. We approximate "same
+    // user" with is_self since we don't track our own user_id in
+    // PeerApiState. Tagged peers would need the file-send cap check
+    // against the peer's CapMap; for now we allow same-user sends.
+    if !is_self {
+        return PeerApiResponse::new(
+            403,
+            "Forbidden",
+            "text/plain; charset=utf-8",
+            b"taildrop: peer not authorized".to_vec(),
+        );
+    }
+
+    if req.method != "PUT" {
+        return PeerApiResponse::new(
+            405,
+            "Method Not Allowed",
+            "text/plain; charset=utf-8",
+            b"expected method PUT".to_vec(),
+        );
+    }
+
+    let path = req.path_only();
+    let prefix = match path.strip_prefix("/v0/put/") {
+        Some(p) => p,
+        None => {
+            return PeerApiResponse::new(
+                400,
+                "Bad Request",
+                "text/plain; charset=utf-8",
+                b"misconfigured internals".to_vec(),
+            );
+        }
+    };
+
+    let filename = percent_decode(prefix);
+    if filename.is_empty() {
+        return PeerApiResponse::new(
+            400,
+            "Bad Request",
+            "text/plain; charset=utf-8",
+            b"missing filename".to_vec(),
+        );
+    }
+
+    match taildrop.put_file(&filename, &req.body).await {
+        Ok(_size) => PeerApiResponse::new(200, "OK", "application/json", b"{}\n".to_vec()),
+        Err(crate::taildrop::TaildropError::FileExists(_)) => PeerApiResponse::new(
+            409,
+            "Conflict",
+            "text/plain; charset=utf-8",
+            b"file already exists".to_vec(),
+        ),
+        Err(crate::taildrop::TaildropError::InvalidFileName(msg)) => PeerApiResponse::new(
+            400,
+            "Bad Request",
+            "text/plain; charset=utf-8",
+            format!("invalid file name: {msg}").into_bytes(),
+        ),
+        Err(crate::taildrop::TaildropError::FileTooLarge { .. }) => PeerApiResponse::new(
+            413,
+            "Payload Too Large",
+            "text/plain; charset=utf-8",
+            b"file too large".to_vec(),
+        ),
+        Err(crate::taildrop::TaildropError::NotEnabled) => PeerApiResponse::new(
+            403,
+            "Forbidden",
+            "text/plain; charset=utf-8",
+            b"taildrop not enabled".to_vec(),
+        ),
+        Err(e) => PeerApiResponse::new(
+            500,
+            "Internal Server Error",
+            "text/plain; charset=utf-8",
+            format!("{e}").into_bytes(),
+        ),
     }
 }
 
@@ -1111,6 +1260,7 @@ mod tests {
             dns_config: Arc::new(RwLock::new(None)),
             tailscale_ips: ips,
             offering_exit_node: exit_node,
+            taildrop: None,
         })
     }
 
@@ -1655,6 +1805,7 @@ mod tests {
             dns_config: Arc::new(RwLock::new(None)),
             tailscale_ips: vec!["100.64.0.1".parse().unwrap()],
             offering_exit_node: false,
+            taildrop: None,
         });
         let result = state.whois("100.64.0.2".parse().unwrap());
         assert!(result.is_some());

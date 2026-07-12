@@ -6,9 +6,10 @@ name: Release
 #   - Linux per-target bundles (gnu x86_64/aarch64, musl x86_64)
 #   - SHA256SUMS checksum file
 #   - GitHub Release with all artifacts attached
+#   - Homebrew formula pushed to rajsinghtech/homebrew-tap
 #
-# Binary crates (e.g. rustscaled) are not built yet — add the package name to
-# BIN_PKGS below when they land and the workflow picks them up automatically.
+# Binaries (rustscale CLI + rustscaled daemon) are built for all targets.
+# Add new binary crates to BIN_PKGS below and the workflow picks them up.
 
 on:
   push:
@@ -206,3 +207,108 @@ jobs:
           generate_release_notes: true
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
+
+  # -------------------------------------------------------------------------
+  # Homebrew tap — publish formula to rajsinghtech/homebrew-tap
+  # -------------------------------------------------------------------------
+  homebrew:
+    name: Update Homebrew tap
+    needs: [release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Compute asset URLs and SHA256
+        id: assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          VERSION="${TAG#v}"
+          REPO="${GITHUB_REPOSITORY}"
+          BASE="https://github.com/${REPO}/releases/download/${TAG}"
+
+          # Download each archive and compute SHA256
+          for asset in \
+            "rustscale-universal-apple-darwin.tar.gz" \
+            "rustscale-x86_64-unknown-linux-gnu.tar.gz" \
+            "rustscale-aarch64-unknown-linux-gnu.tar.gz"; do
+            curl -fsSL -o "$asset" "${BASE}/${asset}"
+            sha256sum "$asset" | awk '{print $1}' > "${asset}.sha256"
+          done
+
+          {
+            echo "version=${VERSION}"
+            echo "tag=${TAG}"
+            echo "darwin_url=${BASE}/rustscale-universal-apple-darwin.tar.gz"
+            echo "darwin_sha256=$(cat rustscale-universal-apple-darwin.tar.gz.sha256)"
+            echo "linux_gnu_url=${BASE}/rustscale-x86_64-unknown-linux-gnu.tar.gz"
+            echo "linux_gnu_sha256=$(cat rustscale-x86_64-unknown-linux-gnu.tar.gz.sha256)"
+            echo "linux_arm_url=${BASE}/rustscale-aarch64-unknown-linux-gnu.tar.gz"
+            echo "linux_arm_sha256=$(cat rustscale-aarch64-unknown-linux-gnu.tar.gz.sha256)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Clone homebrew-tap
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: rajsinghtech/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+          path: tap
+          fetch-depth: 1
+
+      - name: Write formula
+        env:
+          VERSION: ${{ steps.assets.outputs.version }}
+          DARWIN_URL: ${{ steps.assets.outputs.darwin_url }}
+          DARWIN_SHA: ${{ steps.assets.outputs.darwin_sha256 }}
+          LINUX_GNU_URL: ${{ steps.assets.outputs.linux_gnu_url }}
+          LINUX_GNU_SHA: ${{ steps.assets.outputs.linux_gnu_sha256 }}
+          LINUX_ARM_URL: ${{ steps.assets.outputs.linux_arm_url }}
+          LINUX_ARM_SHA: ${{ steps.assets.outputs.linux_arm_sha256 }}
+        run: |
+          mkdir -p tap/Formula
+          cat > tap/Formula/rustscale.rb <<EOF
+          class Rustscale < Formula
+            desc "Rust implementation of Tailscale's client stack"
+            homepage "https://github.com/rajsinghtech/rustscale"
+            version "${VERSION}"
+            license "BSD-3-Clause"
+
+            on_macos do
+              url "${DARWIN_URL}"
+              sha256 "${DARWIN_SHA}"
+            end
+
+            on_linux do
+              on_intel do
+                url "${LINUX_GNU_URL}"
+                sha256 "${LINUX_GNU_SHA}"
+              end
+              on_arm do
+                url "${LINUX_ARM_URL}"
+                sha256 "${LINUX_ARM_SHA}"
+              end
+            end
+
+            def install
+              bin.install "rustscale"
+              bin.install "rustscaled"
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/rustscale --version")
+            end
+          end
+          EOF
+
+      - name: Commit and push
+        run: |
+          cd tap
+          git config user.name "Raj Singh"
+          git config user.email "rajsinghcpre@gmail.com"
+          git add Formula/rustscale.rb
+          if git diff --quiet --cached; then
+            echo "No changes to formula — already up to date"
+            exit 0
+          fi
+          git commit -m "rustscale ${{ steps.assets.outputs.version }}"
+          git push

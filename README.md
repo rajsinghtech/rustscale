@@ -49,6 +49,16 @@ For a full-client TUN device instead of the in-process netstack, use
 `crates/tsnet/examples/rustscale-tun.rs`. `listen`/`dial` are unavailable in
 TUN mode; packets flow between a real OS TUN device and the data plane.
 
+## Install
+
+### Homebrew
+
+```sh
+brew install rajsinghtech/tap/rustscale
+```
+
+### From source
+
 Install the C library and header:
 
 ```sh

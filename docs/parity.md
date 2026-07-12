@@ -192,3 +192,42 @@ userspace mode) on an ephemeral tailnet: dial both directions, MagicDNS
 name resolution, WhoIs identity, direct path (disco vs Go magicsock),
 pinned-DERP relay, DERP→direct upgrade without byte loss, subnet route
 accept. All green 2026-07-09. CI: `interop` job in e2e.yml.
+
+## CLI (`cmd/tailscale` equivalent)
+
+`crates/cli` produces the `rustscale` binary; `crates/localclient` is the
+LocalAPI HTTP client (Go `client/local` equivalent) over safesocket. Hand-
+rolled arg parsing (no clap), `#![forbid(unsafe_code)]`, `#[tokio::main]`.
+Global flags: `--socket <path>` (default `/var/run/rustscaled.sock` with
+state-dir fallback probing), `--json`.
+
+| Subcommand | Go source | Status |
+| --- | --- | --- |
+| `status` | `cli/status.go` | ✅ table + `--json` passthrough; `--peers=false`, `--active` flags; peer table (IP, hostname, owner, connection path) |
+| `ip` | `cli/ip.go` | ✅ `-4`/`-6`/`-1` filters; peer lookup by IP or hostname |
+| `version` | `cli/version.go` | ✅ client version (build.rs git stamp) + `--daemon` daemon version from status; `--json` |
+| `whois` | `cli/whois.go` | ✅ machine + user table; `--json` |
+| `netcheck` | `cli/netcheck.go` | ✅ client-side STUN probe via `crates/netcheck`; DERPMap from daemon netmap endpoint; Go-style report (UDP, IPv4/6, MappingVariesByDestIP, DERP latencies sorted) |
+| `metrics` | `cli/metrics.go` | ✅ raw Prometheus text passthrough |
+| `health` | — | ✅ health warnings from daemon; `--json` |
+| `down` | `cli/down.go` | 🔶 prints "not yet supported" (prefs write path pending IPN phase) |
+| `ping` | `cli/ping.go` | 🔶 surfaces daemon 501 as "not yet supported" (magicsock disco-ping API pending) |
+| `up`/`login` | `cli/up.go` | ⬜ next phase (needs IPN bus watch_ipn_bus consumer) |
+| `wait`/`switch` | `cli/wait.go` | ⬜ next phase |
+| `serve`/`funnel` | `cli/serve.go` | ⬜ |
+| `cert` | `cli/cert.go` | ⬜ |
+| `file` | `cli/file.go` | ⬜ |
+| `ssh` | `cli/ssh.go` | ⬜ |
+| `debug` | `cli/debug.go` | ⬜ |
+| `exit-node` | `cli/exitnode.go` | ⬜ |
+| `drive` | `cli/drive.go` | ⬜ |
+| `lock` | `cli/lock.go` | ⬜ |
+| completion/man | — | ⬜ |
+
+`crates/localclient`: async LocalAPI HTTP client over `safesocket::connect`,
+hand-rolled HTTP/1.1 (no hyper), fake Host `local-rustscaled.sock`, typed
+errors (AccessDenied 403, PreconditionsFailed 412, HttpStatus, PeerNotFound),
+`watch_ipn_bus()` streaming method for newline-delimited JSON `Notify`
+messages (ready for the up/login phase). Integration test boots testcontrol +
+daemon with LocalAPI on a temp socket and exercises the `status` path both
+via the library and the binary via `std::process`.

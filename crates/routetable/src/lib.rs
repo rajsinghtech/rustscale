@@ -11,6 +11,7 @@
 //! on macOS. The `unsafe_code` lint is allowed via `Cargo.toml` (not
 //! inherited from the workspace `forbid` policy).
 
+#[cfg(target_os = "macos")]
 mod parser;
 
 #[cfg(target_os = "macos")]
@@ -21,7 +22,36 @@ mod stub;
 
 use std::net::IpAddr;
 
-pub use parser::RouteType;
+/// The type of a route.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RouteType {
+    /// Unspecified.
+    #[default]
+    Unspecified,
+    /// The destination is an address belonging to this system.
+    Local,
+    /// The destination is a "regular" unicast address.
+    Unicast,
+    /// The destination is a broadcast address.
+    Broadcast,
+    /// The destination is a multicast address.
+    Multicast,
+    /// The route is of some other valid type; see `raw_flags` for details.
+    Other,
+}
+
+impl std::fmt::Display for RouteType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unspecified => write!(f, "unspecified"),
+            Self::Local => write!(f, "local"),
+            Self::Unicast => write!(f, "unicast"),
+            Self::Broadcast => write!(f, "broadcast"),
+            Self::Multicast => write!(f, "multicast"),
+            Self::Other => write!(f, "other"),
+        }
+    }
+}
 
 /// The destination of a route — similar to an IP prefix but with an optional
 /// IPv6 zone (interface name or numeric index).

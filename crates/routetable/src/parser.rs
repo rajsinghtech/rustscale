@@ -9,7 +9,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use crate::{RouteDestination, RouteEntry};
+use crate::{RouteDestination, RouteEntry, RouteType};
 
 // ---------------------------------------------------------------------------
 // Constants — BSD/macOS route message constants.
@@ -84,37 +84,6 @@ const RT_MSGHDR2_SIZE: usize = 92;
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
-
-/// The type of a route.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum RouteType {
-    /// Unspecified.
-    #[default]
-    Unspecified,
-    /// The destination is an address belonging to this system.
-    Local,
-    /// The destination is a "regular" unicast address.
-    Unicast,
-    /// The destination is a broadcast address.
-    Broadcast,
-    /// The destination is a multicast address.
-    Multicast,
-    /// The route is of some other valid type; see `raw_flags` for details.
-    Other,
-}
-
-impl std::fmt::Display for RouteType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Unspecified => write!(f, "unspecified"),
-            Self::Local => write!(f, "local"),
-            Self::Unicast => write!(f, "unicast"),
-            Self::Broadcast => write!(f, "broadcast"),
-            Self::Multicast => write!(f, "multicast"),
-            Self::Other => write!(f, "other"),
-        }
-    }
-}
 
 /// A parsed sockaddr from a route message.
 #[derive(Clone, Debug, PartialEq)]

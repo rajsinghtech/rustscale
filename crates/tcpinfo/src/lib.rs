@@ -11,12 +11,27 @@
 
 use std::io;
 use std::net::TcpStream;
-use std::os::unix::io::{AsRawFd, RawFd};
 use std::time::Duration;
 
+#[cfg(unix)]
+use std::os::unix::io::{AsRawFd, RawFd};
+
 /// Returns the round-trip time for the given TCP stream.
+///
+/// On macOS reads `tcpi_rttcur` via `getsockopt(TCP_CONNECTION_INFO)`, on
+/// Linux reads `tcpi_rtt` via `getsockopt(TCP_INFO)`. On other platforms
+/// returns `io::ErrorKind::Unsupported`.
+#[cfg(unix)]
 pub fn rtt(stream: &TcpStream) -> io::Result<Duration> {
     rtt_impl(stream.as_raw_fd())
+}
+
+#[cfg(not(unix))]
+pub fn rtt(_stream: &TcpStream) -> io::Result<Duration> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "tcpinfo: not supported on this platform",
+    ))
 }
 
 /// Closes all TCP connections visible in the current process by iterating
@@ -182,6 +197,7 @@ struct TcpInfo {
 // ---------------------------------------------------------------------------
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(unix)]
 fn rtt_impl(_fd: RawFd) -> io::Result<Duration> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,

@@ -2,13 +2,14 @@
 //! sends newline-delimited JSON [`Notify`](rustscale_ipn::Notify) messages
 //! over a long-lived HTTP/1.1 connection (connection-close delimited, no
 //! Content-Length). This module provides [`WatchIpnBus`] which wraps the
-//! tokio `UnixStream` and yields decoded `Notify` messages one at a time.
+//! safesocket [`Connection`](rustscale_safesocket::Connection) and yields
+//! decoded `Notify` messages one at a time.
 
 use std::collections::VecDeque;
 
 use rustscale_ipn::Notify;
+use rustscale_safesocket::Connection;
 use tokio::io::AsyncReadExt;
-use tokio::net::UnixStream;
 
 use crate::LocalClientError;
 
@@ -23,7 +24,7 @@ use crate::LocalClientError;
 /// (if `NotifyInitialState`/`NotifyInitialPrefs`/`NotifyInitialStatus` bits
 /// are set in the mask). Subsequent lines are state-change notifications.
 pub struct WatchIpnBus {
-    stream: UnixStream,
+    stream: Connection,
     /// Buffered bytes read from the socket that haven't been split into
     /// complete lines yet.
     buf: Vec<u8>,
@@ -36,7 +37,7 @@ pub struct WatchIpnBus {
 }
 
 impl WatchIpnBus {
-    pub(super) fn new(stream: UnixStream) -> Self {
+    pub(super) fn new(stream: Connection) -> Self {
         Self {
             stream,
             buf: Vec::with_capacity(8192),

@@ -33,9 +33,9 @@ use rustscale_ipn::{
 };
 use rustscale_key::{MachinePrivate, MachinePublic, NodePrivate};
 use rustscale_magicsock::{Magicsock, PathClass};
+use rustscale_safesocket::ServerStream;
 use rustscale_tailcfg::{DERPMap, DNSConfig, Node, UserID, UserProfile};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::UnixListener;
 use tokio::sync::{mpsc, RwLock};
 use tokio::task::JoinHandle;
 
@@ -123,15 +123,13 @@ pub(crate) fn spawn_localapi(
     state: Arc<LocalApiState>,
     socket_path: PathBuf,
 ) -> Option<LocalApiHandle> {
-    let std_listener = rustscale_safesocket::listen(&socket_path).ok()?;
-    let _ = std_listener.set_nonblocking(true);
-    let listener = UnixListener::from_std(std_listener).ok()?;
+    let listener = rustscale_safesocket::listen(&socket_path).ok()?;
 
     let path = socket_path.clone();
     let task = tokio::spawn(async move {
         loop {
             match listener.accept().await {
-                Ok((stream, _peer_addr)) => {
+                Ok(stream) => {
                     let state = state.clone();
                     tokio::spawn(async move {
                         if let Err(e) = handle_connection(stream, &state).await {
@@ -421,7 +419,7 @@ fn parse_query(query: &str) -> std::collections::HashMap<String, String> {
 // ---------------------------------------------------------------------------
 
 async fn handle_connection(
-    mut stream: tokio::net::UnixStream,
+    mut stream: ServerStream,
     state: &Arc<LocalApiState>,
 ) -> Result<(), std::io::Error> {
     let req = match read_request(&mut stream).await {
@@ -2046,6 +2044,7 @@ mod tests {
         assert!(resp.contains("NotifyInProcessNoDisconnect"));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_watch_ipn_bus_initial_state_message() {
         // Test over a real Unix socket: connect, send the request, read
@@ -2104,6 +2103,7 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_watch_ipn_bus_transition_notify() {
         // Test that a state transition produces a second JSON line.
@@ -2172,6 +2172,7 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_watch_ipn_bus_no_initial_without_mask() {
         // Without NotifyInitialState, the first message should not have State.

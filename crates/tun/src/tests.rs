@@ -35,6 +35,7 @@ fn v6_packet(payload: &[u8]) -> Vec<u8> {
 
 // --- strip_af_header ---
 
+#[cfg(unix)]
 #[test]
 fn strip_v4_header() {
     let pkt = v4_packet([100, 64, 0, 2], b"hi");
@@ -48,6 +49,7 @@ fn strip_v4_header() {
     assert_eq!(stripped, &pkt[..]);
 }
 
+#[cfg(unix)]
 #[test]
 fn strip_v6_header() {
     let pkt = v6_packet(b"v6hi");
@@ -58,12 +60,14 @@ fn strip_v6_header() {
     assert_eq!(stripped, &pkt[..]);
 }
 
+#[cfg(unix)]
 #[test]
 fn strip_rejects_short_frame() {
     assert!(strip_af_header(&[0, 0, 0]).is_none());
     assert!(strip_af_header(&[]).is_none());
 }
 
+#[cfg(unix)]
 #[test]
 fn strip_rejects_bad_af() {
     // 4 bytes but AF byte is neither AF_INET nor AF_INET6.
@@ -72,12 +76,14 @@ fn strip_rejects_bad_af() {
 
 // --- prepend_af_header ---
 
+#[cfg(unix)]
 #[test]
 fn prepend_rejects_empty() {
     let mut out = Vec::new();
     assert!(prepend_af_header(&[], &mut out).is_err());
 }
 
+#[cfg(unix)]
 #[test]
 fn prepend_rejects_unknown_version() {
     let mut out = Vec::new();
@@ -85,6 +91,7 @@ fn prepend_rejects_unknown_version() {
     assert!(prepend_af_header(&[0x70, 0, 0], &mut out).is_err());
 }
 
+#[cfg(unix)]
 #[test]
 fn prepend_v4_sets_af_inet() {
     let mut out = Vec::new();
@@ -93,6 +100,7 @@ fn prepend_v4_sets_af_inet() {
     assert_eq!(out.len(), 4 + 20 + 1);
 }
 
+#[cfg(unix)]
 #[test]
 fn prepend_v6_sets_af_inet6() {
     let mut out = Vec::new();
@@ -100,6 +108,7 @@ fn prepend_v6_sets_af_inet6() {
     assert_eq!(out[3], AF_INET6);
 }
 
+#[cfg(unix)]
 #[test]
 fn prepend_clears_out_before_writing() {
     let mut out = vec![0xff; 10];

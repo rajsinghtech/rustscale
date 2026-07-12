@@ -120,7 +120,10 @@ pub fn create(config: &TunConfig) -> Result<TunDevice, TunError> {
 // ---------------------------------------------------------------------------
 
 /// macOS address families used in the utun 4-byte packet header.
+#[cfg(unix)]
 pub const AF_INET: u8 = libc::AF_INET as u8;
+/// IPv6 address family for the utun 4-byte packet header.
+#[cfg(unix)]
 pub const AF_INET6: u8 = libc::AF_INET6 as u8;
 
 /// Length of the utun 4-byte address-family header prepended to every packet.
@@ -129,6 +132,7 @@ pub const AF_HEADER_LEN: usize = 4;
 /// Given a raw utun read (4-byte AF header + IP packet), return the plain IP
 /// packet bytes. Returns `None` if the frame is too short or the AF byte is
 /// neither `AF_INET` nor `AF_INET6`.
+#[cfg(unix)]
 pub fn strip_af_header(raw: &[u8]) -> Option<&[u8]> {
     if raw.len() < AF_HEADER_LEN {
         return None;
@@ -143,6 +147,7 @@ pub fn strip_af_header(raw: &[u8]) -> Option<&[u8]> {
 /// Prepend the utun 4-byte AF header to `packet`, writing into `out`. The AF
 /// byte is derived from the IP version nibble of `packet[0]`. Returns an error
 /// if the packet is empty or has an unknown IP version.
+#[cfg(unix)]
 pub fn prepend_af_header(packet: &[u8], out: &mut Vec<u8>) -> io::Result<()> {
     if packet.is_empty() {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty packet"));

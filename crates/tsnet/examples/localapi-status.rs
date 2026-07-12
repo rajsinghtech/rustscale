@@ -11,9 +11,12 @@
 
 use std::env;
 use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
+
+#[cfg(unix)]
 fn main() {
     let socket_path: PathBuf = env::args().nth(1).map_or_else(
         || {
@@ -64,4 +67,9 @@ fn main() {
     } else {
         println!("{body}");
     }
+}
+
+#[cfg(not(unix))]
+fn main() {
+    eprintln!("localapi-status: this example requires a Unix platform");
 }

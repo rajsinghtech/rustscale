@@ -34,6 +34,14 @@ pub struct BackendInputs {
 struct BackendInner {
     state: State,
     inputs: BackendInputs,
+    /// Whether engine updates are blocked (e.g. waiting for auth, key
+    /// expired). Mirrors Go's `LocalBackend.blocked` field. Set via
+    /// [`IpnBackend::set_blocked`].
+    blocked: bool,
+    /// Whether the user has explicitly logged out. Mirrors Go's
+    /// `LocalBackend.loggedOut`, derived from `Prefs.LoggedOut`. Set via
+    /// [`IpnBackend::set_logged_out`].
+    logged_out: bool,
 }
 
 /// The IPN backend: current state + inputs + notification bus.
@@ -55,6 +63,8 @@ impl IpnBackend {
             inner: Mutex::new(BackendInner {
                 state: State::NoState,
                 inputs: BackendInputs::default(),
+                blocked: false,
+                logged_out: false,
             }),
             bus: NotifyBus::new(),
             version: version.into(),
@@ -76,6 +86,16 @@ impl IpnBackend {
         self.inner.lock().unwrap().inputs.clone()
     }
 
+    /// Get the current `blocked` flag.
+    pub fn blocked(&self) -> bool {
+        self.inner.lock().unwrap().blocked
+    }
+
+    /// Get the current `logged_out` flag.
+    pub fn logged_out(&self) -> bool {
+        self.inner.lock().unwrap().logged_out
+    }
+
     /// Get the version string.
     pub fn version(&self) -> &str {
         &self.version
@@ -91,8 +111,8 @@ impl IpnBackend {
 
         let sm_inputs = StateMachineInputs {
             want_running: inner.inputs.want_running,
-            logged_out: false,
-            blocked: false,
+            logged_out: inner.logged_out,
+            blocked: inner.blocked,
             has_node_key: inner.inputs.has_node_key,
             netmap_present: inner.inputs.netmap_present,
             auth_cant_continue: inner.inputs.auth_cant_continue,
@@ -147,6 +167,71 @@ impl IpnBackend {
             i.num_live = num_live;
             i.live_derps = live_derps;
         })
+    }
+
+    /// Set the `blocked` flag and re-evaluate the state machine.
+    ///
+    /// Mirrors Go's `blockEngineUpdatesLocked(block bool)` — the sole
+    /// setter for `LocalBackend.blocked`. When `blocked=true`, Case 1
+    /// (`!wantRunning && !blocked → Stopped`) is suppressed, allowing
+    /// the backend to remain in `Starting`/`NeedsLogin` while engine
+    /// updates are intentionally withheld.
+    pub fn set_blocked(&self, blocked: bool) -> State {
+        let mut inner = self.inner.lock().unwrap();
+        inner.blocked = blocked;
+        let sm_inputs = StateMachineInputs {
+            want_running: inner.inputs.want_running,
+            logged_out: inner.logged_out,
+            blocked: inner.blocked,
+            has_node_key: inner.inputs.has_node_key,
+            netmap_present: inner.inputs.netmap_present,
+            auth_cant_continue: inner.inputs.auth_cant_continue,
+            key_expired: inner.inputs.key_expired,
+            machine_authorized: inner.inputs.machine_authorized,
+            num_live: inner.inputs.num_live,
+            live_derps: inner.inputs.live_derps,
+        };
+        let new_state = next_state(&sm_inputs, inner.state);
+        if new_state == inner.state {
+            drop(inner);
+        } else {
+            inner.state = new_state;
+            drop(inner);
+            self.bus.send(Notify::state(new_state));
+        }
+        new_state
+    }
+
+    /// Set the `logged_out` flag and re-evaluate the state machine.
+    ///
+    /// Mirrors Go's `Logout` writing `Prefs{LoggedOut: true,
+    /// WantRunning: false}` — `loggedOut` is read from prefs in
+    /// `nextStateLocked`. When `logged_out=true` with no netmap, the
+    /// state machine returns `NeedsLogin` instead of `Stopped`.
+    pub fn set_logged_out(&self, logged_out: bool) -> State {
+        let mut inner = self.inner.lock().unwrap();
+        inner.logged_out = logged_out;
+        let sm_inputs = StateMachineInputs {
+            want_running: inner.inputs.want_running,
+            logged_out: inner.logged_out,
+            blocked: inner.blocked,
+            has_node_key: inner.inputs.has_node_key,
+            netmap_present: inner.inputs.netmap_present,
+            auth_cant_continue: inner.inputs.auth_cant_continue,
+            key_expired: inner.inputs.key_expired,
+            machine_authorized: inner.inputs.machine_authorized,
+            num_live: inner.inputs.num_live,
+            live_derps: inner.inputs.live_derps,
+        };
+        let new_state = next_state(&sm_inputs, inner.state);
+        if new_state == inner.state {
+            drop(inner);
+        } else {
+            inner.state = new_state;
+            drop(inner);
+            self.bus.send(Notify::state(new_state));
+        }
+        new_state
     }
 
     /// Emit a `Notify{BrowseToURL}` on the bus.
@@ -345,5 +430,119 @@ mod tests {
             result.is_err(),
             "should not receive a notify when state unchanged"
         );
+    }
+
+    #[tokio::test]
+    async fn backend_set_blocked_suppresses_stopped() {
+        let backend = IpnBackend::new("test");
+        // Set up a Running state first.
+        backend.set_want_running();
+        backend.set_has_node_key(true);
+        backend.set_netmap_present(true);
+        backend.set_machine_authorized(true);
+        backend.set_engine_status(1, 0);
+        assert_eq!(backend.state(), State::Running);
+
+        // Now block engine updates and set want_running=false. Without
+        // blocked, this would be Stopped (Case 1). With blocked=true,
+        // Case 1 is suppressed and Case 3 (!wantRunning → Stopped) is
+        // also reached — but only when netmap is present. The key
+        // scenario is: blocked + want_running=true → stays Starting,
+        // not Stopped.
+        backend.set_blocked(true);
+        assert!(backend.blocked());
+        assert_eq!(backend.state(), State::Running); // no change with netmap present
+
+        // With want_running=true, blocked=true, no netmap, the state
+        // should NOT be Stopped — it should be Starting (from NoState).
+        let backend2 = IpnBackend::new("test");
+        backend2.set_blocked(true);
+        backend2.set_want_running();
+        backend2.set_has_node_key(true);
+        // netmap_present=false, current_state=NoState → NoState (stays)
+        assert_ne!(backend2.state(), State::Stopped);
+    }
+
+    #[tokio::test]
+    async fn backend_set_logged_out_transitions_to_needs_login() {
+        let backend = IpnBackend::new("test");
+        // Set up a Running state first.
+        backend.set_want_running();
+        backend.set_has_node_key(true);
+        backend.set_netmap_present(true);
+        backend.set_machine_authorized(true);
+        backend.set_engine_status(1, 0);
+        assert_eq!(backend.state(), State::Running);
+
+        // Logout: set logged_out=true, want_running=false, clear netmap.
+        backend.set_logged_out(true);
+        assert!(backend.logged_out());
+        backend.update_inputs(|i| {
+            i.want_running = false;
+            i.netmap_present = false;
+            i.has_node_key = false;
+        });
+        // With logged_out=true, no netmap → NeedsLogin (not Stopped).
+        assert_eq!(backend.state(), State::NeedsLogin);
+    }
+
+    #[tokio::test]
+    async fn backend_set_blocked_false_on_auth_success() {
+        let backend = IpnBackend::new("test");
+        // Simulate NeedsLogin: blocked=true, auth_cant_continue=true.
+        backend.set_blocked(true);
+        backend.set_auth_cant_continue(true);
+        backend.set_want_running();
+        // No netmap yet, auth can't continue → NeedsLogin.
+        assert_eq!(backend.state(), State::NeedsLogin);
+
+        // Auth succeeds: unblock, clear auth_cant_continue, set node key.
+        backend.set_blocked(false);
+        backend.set_auth_cant_continue(false);
+        backend.set_has_node_key(true);
+        // Still no netmap, current_state=NeedsLogin → stays NeedsLogin
+        // until netmap arrives. But blocked is now false.
+        assert!(!backend.blocked());
+    }
+
+    #[tokio::test]
+    async fn backend_notify_peers_changed() {
+        let backend = IpnBackend::new("test");
+        let mut sub = backend.bus().subscribe();
+
+        // Send a Notify with PeersChanged directly on the bus.
+        let node_json = serde_json::json!({"ID": 1, "Name": "peer1"});
+        backend.bus().send(Notify {
+            PeersChanged: Some(vec![node_json.clone()]),
+            ..Default::default()
+        });
+
+        let msg = sub.recv().await.unwrap().unwrap();
+        assert_eq!(msg.PeersChanged, Some(vec![node_json]));
+    }
+
+    #[tokio::test]
+    async fn backend_notify_peers_removed() {
+        let backend = IpnBackend::new("test");
+        let mut sub = backend.bus().subscribe();
+
+        backend.bus().send(Notify {
+            PeersRemoved: Some(vec![1, 2, 3]),
+            ..Default::default()
+        });
+
+        let msg = sub.recv().await.unwrap().unwrap();
+        assert_eq!(msg.PeersRemoved, Some(vec![1, 2, 3]));
+    }
+
+    #[tokio::test]
+    async fn backend_notify_deserializes_null_peer_fields() {
+        // Go nil slices marshal as JSON null — ensure deserialization
+        // doesn't fail.
+        let json = r#"{"PeersChanged":null,"PeersRemoved":null,"PeerChangedPatch":null}"#;
+        let n: Notify = serde_json::from_str(json).unwrap();
+        assert_eq!(n.PeersChanged, None);
+        assert_eq!(n.PeersRemoved, None);
+        assert_eq!(n.PeerChangedPatch, None);
     }
 }

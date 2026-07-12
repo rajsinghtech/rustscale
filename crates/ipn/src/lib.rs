@@ -252,6 +252,48 @@ pub struct Notify {
     /// Mirrors Go's `ipn.Notify.FilesWaiting`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub FilesWaiting: Option<Vec<WaitingFile>>,
+
+    /// Full network map (sent on initial request or legacy platforms).
+    /// Mirrors Go's `ipn.Notify.NetMap`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub NetMap: Option<serde_json::Value>,
+
+    /// Peers that were added or changed (full Node JSON objects).
+    /// Mirrors Go's `ipn.Notify.PeersChanged`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_null_to_default"
+    )]
+    pub PeersChanged: Option<Vec<serde_json::Value>>,
+
+    /// Peer IDs that were removed.
+    /// Mirrors Go's `ipn.Notify.PeersRemoved`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_null_to_default"
+    )]
+    pub PeersRemoved: Option<Vec<i64>>,
+
+    /// Partial peer changes (patch format).
+    /// Mirrors Go's `ipn.Notify.PeerChangedPatch`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_null_to_default"
+    )]
+    pub PeerChangedPatch: Option<Vec<serde_json::Value>>,
+}
+
+/// Serde helper: deserialize `null` as `Default` (Go nil slices marshal as `null`).
+fn deserialize_null_to_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    let opt: Option<T> = Option::deserialize(deserializer)?;
+    Ok(opt.unwrap_or_default())
 }
 
 /// A file waiting in the Taildrop inbox, mirroring Go's

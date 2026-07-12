@@ -1615,6 +1615,9 @@ impl Server {
         let ipn_backend = Arc::new(IpnBackend::new("rustscale"));
         ipn_backend.set_want_running();
         ipn_backend.set_auth_cant_continue(true);
+        // Block engine updates while waiting for auth — mirrors Go's
+        // blockEngineUpdatesLocked(true) on NeedsLogin enter.
+        ipn_backend.set_blocked(true);
 
         let state = self.load_or_create_state()?;
         let was_fresh = state.is_zero();
@@ -1879,11 +1882,14 @@ impl Server {
 
         if reg_resp.AuthURL.is_empty() {
             ipn_backend.set_machine_authorized(reg_resp.MachineAuthorized);
+            ipn_backend.set_blocked(false);
             ipn_backend.emit_login_finished();
             state.node_id = reg_resp.User.ID;
             self.save_state(&state)?;
         } else {
             ipn_backend.set_auth_cant_continue(true);
+            // Block engine updates while waiting for interactive auth.
+            ipn_backend.set_blocked(true);
             ipn_backend.emit_browse_to_url(&reg_resp.AuthURL);
 
             if let Some(ref ps) = self.pre_started {
@@ -1922,6 +1928,7 @@ impl Server {
 
                 if followup_resp.Error.is_empty() {
                     ipn_backend.set_machine_authorized(followup_resp.MachineAuthorized);
+                    ipn_backend.set_blocked(false);
                     ipn_backend.emit_login_finished();
                     state.node_id = followup_resp.User.ID;
                     self.save_state(&state)?;
@@ -3045,6 +3052,8 @@ impl Server {
         }
 
         // 4. Transition IPN backend to NeedsLogin.
+        inner.ipn_backend.set_logged_out(true);
+        inner.ipn_backend.set_blocked(true);
         inner.ipn_backend.update_inputs(|i| {
             i.want_running = false;
             i.has_node_key = false;
@@ -3518,6 +3527,61 @@ fn spawn_map_update_task(
                             peers.retain(|p| !resp.PeersRemoved.contains(&p.ID));
                         }
                     }
+
+                    // Forward peer deltas to the IPN notify bus so
+                    // watch-ipn-bus subscribers receive PeersChanged /
+                    // PeersRemoved / NetMap. Mirrors Go's `ipnlocal.send`
+                    // in the full-netmap and delta notify paths.
+                    if !resp.PeersChanged.is_empty() || !resp.Peers.is_empty() {
+                        let changed_nodes: Vec<serde_json::Value> = if resp.Peers.is_empty() {
+                            resp.PeersChanged
+                                .iter()
+                                .filter_map(|p| serde_json::to_value(p).ok())
+                                .collect()
+                        } else {
+                            resp.Peers
+                                .iter()
+                                .filter_map(|p| serde_json::to_value(p).ok())
+                                .collect()
+                        };
+                        if !changed_nodes.is_empty() {
+                            ipn_backend.bus().send(rustscale_ipn::Notify {
+                                PeersChanged: Some(changed_nodes),
+                                ..Default::default()
+                            });
+                        }
+                    }
+                    // On a full peer list (Peers non-empty), also send a
+                    // NetMap notify with a summary JSON. This mirrors Go's
+                    // full-netmap notify path for legacy/initial-netmap
+                    // watchers.
+                    if !resp.Peers.is_empty() {
+                        let peers_json: Vec<serde_json::Value> = resp
+                            .Peers
+                            .iter()
+                            .filter_map(|p| serde_json::to_value(p).ok())
+                            .collect();
+                        let netmap_json = serde_json::json!({
+                            "Peers": peers_json,
+                            "Self": resp.Node.as_ref().and_then(|n| serde_json::to_value(n).ok()),
+                        });
+                        ipn_backend.bus().send(rustscale_ipn::Notify {
+                            NetMap: Some(netmap_json),
+                            ..Default::default()
+                        });
+                    }
+                    if !resp.PeersRemoved.is_empty() {
+                        let removed_ids: Vec<i64> = resp.PeersRemoved.clone();
+                        ipn_backend.bus().send(rustscale_ipn::Notify {
+                            PeersRemoved: Some(removed_ids),
+                            ..Default::default()
+                        });
+                    }
+                    // Note: PeerChangedPatch on Notify is populated from
+                    // NodeMutation delta events (Go's UpdateNetmapDelta),
+                    // not from MapResponse. The MapResponse struct has no
+                    // PeerChangedPatch field. That path will be wired when
+                    // the netmap delta subscription system is ported.
 
                     // Feed the updated peer list to magicsock + rebuild routes.
                     let peers = peers_arc.read().await.clone();

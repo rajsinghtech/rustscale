@@ -334,7 +334,7 @@ async fn wait_for_up(server: &mut Server, label: &str) {
     tokio::pin!(deadline);
     loop {
         let result = tokio::time::timeout(Duration::from_secs(60), server.up()).await;
-        if let Ok(Ok(())) = result {
+        if let Ok(Ok(_)) = result {
             eprintln!("interop-testcontrol: {label} is up");
             return;
         }

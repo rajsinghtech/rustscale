@@ -196,6 +196,15 @@ int ts_status_json(int handle, char *buf, int buflen);
 int ts_up(int handle);
 
 /**
+ * Returns the rustscale build version string (NUL-terminated into `buf`).
+ * Derived from `git describe --tags --long --always --dirty` at build time,
+ * falling back to the crate version when git is unavailable (e.g. crates.io
+ * builds). Returns bytes written (excluding NUL), or a negative errno-style
+ * code on error.
+ */
+int ts_version(char *buf, int buflen);
+
+/**
  * Look up the peer owning a tailnet IP address (WhoIs). `addr` is a string
  * IP (e.g. `"100.64.0.5"`). Writes a JSON object into `buf`:
  * `{"found":bool,"node_name":...,"tailscale_ips":[...],"user_id":...,

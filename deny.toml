@@ -1,0 +1,35 @@
+# cargo-deny configuration
+# Docs: https://embarkstudios.github.io/cargo-deny/
+
+[licenses]
+# Allow common permissive licenses used by workspace dependencies.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+]
+# Confidence threshold for license detection (0-1).
+confidence-threshold = 0.8
+
+[bans]
+# Warn on duplicate versions of the same crate (don't fail the build).
+multiple-versions = "warn"
+# Warn on wildcard dependencies.
+wildcards = "warn"
+
+[advisories]
+# Fail on advisories with no fix available.
+unmaintained = "workspace"
+
+[sources]
+# Allow crates from crates.io and the workspace itself.
+allow-org = { github = [] }
+unknown-registry = "warn"
+unknown-git = "warn"

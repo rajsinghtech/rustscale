@@ -48,6 +48,26 @@ pub const RS_ERR_UNKNOWN: c_int = -1;
 const FFI_BLOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(1);
 
 // ---------------------------------------------------------------------------
+// Version
+// ---------------------------------------------------------------------------
+
+/// Returns the rustscale build version string (NUL-terminated into `buf`).
+/// Derived from `git describe --tags --long --always --dirty` at build time,
+/// falling back to the crate version when git is unavailable (e.g. crates.io
+/// builds). Returns bytes written (excluding NUL), or a negative errno-style
+/// code on error.
+#[no_mangle]
+pub extern "C" fn ts_version(buf: *mut c_char, buflen: c_int) -> c_int {
+    catch("ts_version", || {
+        static VERSION: OnceLock<&'static str> = OnceLock::new();
+        let v = VERSION.get_or_init(|| {
+            option_env!("RUSTSCALE_VERSION_LONG").unwrap_or(env!("CARGO_PKG_VERSION"))
+        });
+        write_to_buf(buf, buflen, v)
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Global tokio runtime (lazy)
 // ---------------------------------------------------------------------------
 

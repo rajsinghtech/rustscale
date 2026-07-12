@@ -375,6 +375,36 @@ fn write_to_buf_null_buf() {
 }
 
 // ---------------------------------------------------------------------------
+// ts_version
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ts_version_returns_nonempty() {
+    let mut buf = [0u8; 128];
+    let n = ts_version(buf.as_mut_ptr().cast::<c_char>(), 128);
+    assert!(n > 0, "ts_version should return a non-empty string");
+    let v = std::str::from_utf8(&buf[..n as usize]).unwrap();
+    assert!(!v.is_empty(), "version string should not be empty");
+    // When built from a git checkout, the version comes from `git describe`
+    // (e.g. "v0.1.0-3-gabc123-dirty"); when built from a crates.io tarball it
+    // falls back to CARGO_PKG_VERSION. Either way it must be non-empty.
+    eprintln!("ts_version: {v}");
+}
+
+#[test]
+fn ts_version_truncates() {
+    let mut buf = [0u8; 4];
+    let n = ts_version(buf.as_mut_ptr().cast::<c_char>(), 4);
+    assert_eq!(n, 3);
+    assert_eq!(buf[3], 0);
+}
+
+#[test]
+fn ts_version_null_buf() {
+    assert_eq!(ts_version(std::ptr::null_mut(), 128), RS_ERR_INVAL);
+}
+
+// ---------------------------------------------------------------------------
 // Use-after-close returns error
 // ---------------------------------------------------------------------------
 

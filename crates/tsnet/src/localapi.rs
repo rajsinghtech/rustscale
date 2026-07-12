@@ -26,8 +26,9 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use rustscale_clientmetric::Registry as MetricRegistry;
 use rustscale_filter::Filter;
-use rustscale_health::{Severity, Tracker};
+use rustscale_health::Tracker;
 use rustscale_ipn::{
     validate_notify_watch_opt, IpnBackend, LoginProfile, MaskedPrefs, NotifyWatchOpt, Prefs,
     StartOptions, NOTIFY_IN_PROCESS_NO_DISCONNECT,
@@ -78,6 +79,10 @@ pub(crate) struct LocalApiState {
     pub health: Tracker,
     pub dns_config: Arc<RwLock<Option<DNSConfig>>>,
     pub packet_drops: Arc<AtomicU64>,
+    /// Client metric registry — supersedes the hardcoded metrics above.
+    /// Subsystems register counters/gauges here; the `/metrics` endpoint
+    /// renders them via `to_prometheus_text()`.
+    pub metrics: MetricRegistry,
     pub prefs: Arc<RwLock<Prefs>>,
     pub tailscale_ips: Vec<IpAddr>,
     pub our_fqdn: String,
@@ -1082,58 +1087,54 @@ async fn build_netmap_json(state: &LocalApiState) -> serde_json::Value {
 // Metrics handler
 // ---------------------------------------------------------------------------
 
-/// Build Prometheus text exposition format. Same metrics as the C2N handler.
+/// Create a default metric registry with the standard rustscale metrics
+/// pre-registered. Subsystems can obtain handles via `reg.get(name)` to
+/// update values. The `/metrics` endpoint calls `build_metrics_text` which
+/// populates dynamic values from `LocalApiState` before rendering.
+pub(crate) fn default_metric_registry() -> MetricRegistry {
+    let reg = MetricRegistry::new();
+    reg.counter_with_help(
+        "rustscale_packet_drops_total",
+        "Packets dropped by the packet filter",
+    );
+    reg.gauge_with_help("rustscale_peer_count", "Number of peers in the netmap");
+    reg.gauge_with_help(
+        "rustscale_health_warnings",
+        "Active health warnings by severity",
+    );
+    reg.gauge_with_help("rustscale_local_endpoints", "Number of local UDP endpoints");
+    reg
+}
+
+/// Build Prometheus text exposition format using the metric registry.
+///
+/// Dynamic values (packet drops, peer count, health, endpoints) are
+/// populated from `LocalApiState` fields before rendering. Additional
+/// metrics registered by subsystems appear alongside the standard ones.
 fn build_metrics_text(state: &LocalApiState) -> String {
-    use std::fmt::Write;
+    // Populate the standard metrics from live state.
+    let drops = state.packet_drops.load(Ordering::Relaxed) as i64;
+    if let Some(m) = state.metrics.get("rustscale_packet_drops_total") {
+        m.set(drops);
+    }
 
-    let drops = state.packet_drops.load(Ordering::Relaxed);
-    let peer_count = state.peers.try_read().map_or(0, |p| p.len());
+    let peer_count = state.peers.try_read().map_or(0, |p| p.len()) as i64;
+    if let Some(m) = state.metrics.get("rustscale_peer_count") {
+        m.set(peer_count);
+    }
+
     let warnings = state.health.current_warnings();
-    let high = warnings
-        .iter()
-        .filter(|w| w.severity == Severity::High)
-        .count();
-    let medium = warnings
-        .iter()
-        .filter(|w| w.severity == Severity::Medium)
-        .count();
-    let low = warnings
-        .iter()
-        .filter(|w| w.severity == Severity::Low)
-        .count();
-    let endpoints = state.magicsock.local_endpoints();
+    if let Some(m) = state.metrics.get("rustscale_health_warnings") {
+        m.set(warnings.len() as i64);
+    }
 
-    let mut out = String::new();
-    let _ = writeln!(
-        out,
-        "# HELP rustscale_packet_drops_total Packets dropped by the packet filter"
-    );
-    let _ = writeln!(out, "# TYPE rustscale_packet_drops_total counter");
-    let _ = writeln!(out, "rustscale_packet_drops_total {drops}");
-    let _ = writeln!(
-        out,
-        "# HELP rustscale_peer_count Number of peers in the netmap"
-    );
-    let _ = writeln!(out, "# TYPE rustscale_peer_count gauge");
-    let _ = writeln!(out, "rustscale_peer_count {peer_count}");
-    let _ = writeln!(
-        out,
-        "# HELP rustscale_health_warnings Active health warnings by severity"
-    );
-    let _ = writeln!(out, "# TYPE rustscale_health_warnings gauge");
-    let _ = writeln!(out, "rustscale_health_warnings{{severity=\"high\"}} {high}");
-    let _ = writeln!(
-        out,
-        "rustscale_health_warnings{{severity=\"medium\"}} {medium}"
-    );
-    let _ = writeln!(out, "rustscale_health_warnings{{severity=\"low\"}} {low}");
-    let _ = writeln!(
-        out,
-        "# HELP rustscale_local_endpoints Number of local UDP endpoints"
-    );
-    let _ = writeln!(out, "# TYPE rustscale_local_endpoints gauge");
-    let _ = writeln!(out, "rustscale_local_endpoints {}", endpoints.len());
-    out
+    let endpoints = state.magicsock.local_endpoints();
+    if let Some(m) = state.metrics.get("rustscale_local_endpoints") {
+        m.set(endpoints.len() as i64);
+    }
+
+    // Render the registry (standard + any subsystem-registered metrics).
+    state.metrics.to_prometheus_text()
 }
 
 // ---------------------------------------------------------------------------
@@ -2412,6 +2413,7 @@ mod tests {
             health: Tracker::new(),
             dns_config: Arc::new(RwLock::new(None)),
             packet_drops: Arc::new(AtomicU64::new(0)),
+            metrics: default_metric_registry(),
             prefs: Arc::new(RwLock::new(Prefs {
                 Hostname: "test".into(),
                 ControlURL: "https://control".into(),
@@ -3137,6 +3139,7 @@ mod tests {
             health: state.health.clone(),
             dns_config: state.dns_config.clone(),
             packet_drops: state.packet_drops.clone(),
+            metrics: default_metric_registry(),
             prefs: state.prefs.clone(),
             tailscale_ips: state.tailscale_ips.clone(),
             our_fqdn: state.our_fqdn.clone(),
@@ -3356,6 +3359,7 @@ mod tests {
                 ..Default::default()
             }))),
             packet_drops: base.packet_drops.clone(),
+            metrics: default_metric_registry(),
             prefs: base.prefs.clone(),
             tailscale_ips: base.tailscale_ips.clone(),
             our_fqdn: base.our_fqdn.clone(),

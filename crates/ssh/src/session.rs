@@ -1,6 +1,7 @@
 //! SSH session type — ports Go's `ssh/tailssh/session.go`.
 #![allow(dead_code)]
 
+use crate::recording::{RecordDir, RecordResult, SessionRecorder};
 use russh::ChannelId;
 use rustscale_tailcfg::{Node, UserProfile};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -36,6 +37,8 @@ pub struct SessionInit {
     pub channel_id: ChannelId,
     pub data_rx: mpsc::Receiver<Vec<u8>>,
     pub done_tx: mpsc::Sender<()>,
+    /// Optional session recorder for capturing PTY output.
+    pub recorder: Option<SessionRecorder>,
 }
 
 pub struct Session {
@@ -50,6 +53,7 @@ pub struct Session {
     read_buf: Vec<u8>,
     done_tx: Option<mpsc::Sender<()>>,
     closed: bool,
+    recorder: Option<SessionRecorder>,
 }
 
 impl Session {
@@ -67,6 +71,7 @@ impl Session {
             read_buf: Vec::new(),
             done_tx: Some(init.done_tx),
             closed: false,
+            recorder: init.recorder,
         }
     }
     pub fn user(&self) -> &str {
@@ -92,6 +97,10 @@ impl Session {
     }
     pub fn pty(&self) -> Option<&Pty> {
         self.pty.as_ref()
+    }
+    /// Returns the session recorder, if recording is enabled.
+    pub fn recorder(&self) -> Option<&SessionRecorder> {
+        self.recorder.as_ref()
     }
 
     pub async fn exit(&mut self, code: u32) {
@@ -161,6 +170,13 @@ impl AsyncWrite for Session {
             )));
         }
         let this = self.get_mut();
+        // Record output to the session recorder before sending to the client.
+        // Mirrors Go's `recording.writer("o", w)` wrapping the PTY output.
+        if let Some(ref rec) = this.recorder {
+            if matches!(rec.write(RecordDir::Output, buf), RecordResult::Failed) {
+                log::warn!("SSH session recording failed; continuing per fail-open policy");
+            }
+        }
         let handle = this.handle.clone();
         let channel_id = this.channel_id;
         let data = buf.to_vec();

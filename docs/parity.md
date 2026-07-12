@@ -16,7 +16,7 @@ verified.md):
 | --- | --- | --- | --- |
 | Packet filter | ✅ | ✅ | capability ACLs + shields-up mode wired (phase-fix-filter-caps): `cap:<name>` source predicates evaluated via peer `CapMap` lookup (`build_cap_holders` → `Filter::has_cap`); `CapGrant` dst grants via `caps_with_values`; `Filter::set_shields_up` denies new inbound flows (established TCP non-SYN / cached UDP / ICMP replies / TSMP still admitted); `ShieldsUp` pref wired through `PATCH /prefs` → live `set_shields_up` on the filter |
 | DERP client | ✅ | ✅ | pinned-key verify via `expected_server_key` param (`crates/derp/src/client.rs`); send rate-limiting via token-bucket from ServerInfo |
-| Tailscale SSH | ✅ | 🔶 | policy callback wired to netmap `SSHPolicy` (`tsnet/ssh.rs` reads shared state fed by map-update task); `eval_ssh_policy` matches principals (Node/NodeIP/UserLogin/Any), honours Reject actions; remaining: session recording (#63), incubator subprocess (#64), HoldAndDelegate |
+| Tailscale SSH | ✅ | 🔶 | policy callback wired to netmap `SSHPolicy` (`tsnet/ssh.rs` reads shared state fed by map-update task); `eval_ssh_policy` matches principals (Node/NodeIP/UserLogin/Any), honours Reject actions; session recording (#63) ✅ `SessionRecorder` writes asciicast v2 format to file; incubator subprocess (#64) ✅ `Incubator` spawns shell with privilege dropping; remaining: HoldAndDelegate, remote recorder upload |
 | Health tracking | ✅ | 🔶 | ~5 of 20 Go warnables; no per-region DERP health |
 | Exit node (CLI) | ✅ | ✅ | PATCH /prefs with ExitNodeID/ExitNodeIP now calls set_exit_node/clear_exit_node via shared route_table; stored exit-node pref applied on daemon start (survives restart); ExitNodeAllowLANAccess pref field added |
 | Key lifecycle | — | ✅ | logout: Server::logout sends control logout (Expiry=far past), clears persisted state + netmap cache, transitions to NeedsLogin; POST /logout wired. **Key rotation**: phase-key-rotation — OldPrivateNodeKey persisted in PersistedState, expiry detection triggers re-registration with RegisterRequest{OldNodeKey, NodeKey}, RegisterResponse.NodeKeyExpired auto-retry (max 2), on success promotes new key + re-keys magicsock (RwLock<NodePublic>) + restarts map poll; LoginFlags bitflags (LoginInteractive/LoginEphemeral); testcontrol per-node expiry + OldNodeKey identity transfer |
@@ -50,7 +50,7 @@ authoritative status until each fix lands.
 | Tailscale Services (ListenService, PROXY protocol) | `tsnet.Server.ListenService` | ✅ `Server::listen_service(svc_name, ServiceMode)` resolves VIP v4 addrs from self node CapMap `service-host` key (`ServiceIPMappings`), adds them to netstack via `add_addr`, listens on each VIP:port via `listen_on`; merged accept channel from all VIP listeners; `ServiceName` newtype validates `svc:` prefix + DNS label; PROXY protocol v2 binary header encoder (byte-exact IPv4/IPv6/LOCAL); `ServiceStream` wraps `NetstackStream` with PROXY v2 prefix drained before app data; netstack `listen_on`/`add_addr` + `(IpAddr,port)` listener key; IPv6 VIPs skipped (smoltcp proto-ipv4 only). Remaining: TLS termination for service FQDN, serve-config TCP forwarding path, IPv6 VIP support |
 | SOCKS5 proxy | `net/socks5/` | ✅ port-8: RFC 1928 CONNECT (v4/domain/v6), dials via shared tsnet resolve path, FFI; e2e green |
 | LocalAPI | `ipn/localapi/` | ✅ port-9 + phase-ipn-bus + phase-interactive-auth + phase-serve-cli-profiles + phase-cli-cert-qr: full LocalAPI HTTP server on safesocket (status, whois, prefs GET+PATCH, netmap, metrics, health, ping, watch-ipn-bus, start, login-interactive, logout, serve-config GET+POST with ETag/If-Match/412, profiles GET+PUT/GET+POST+DELETE, cert `<domain>?type=pair|cert|key&min_validity=`); status reports live BackendState + CertDomains; serve-config persists to `<state_dir>/serve-config.json` and reloads on daemon start; profile manager persists to `profiles.json` + `current-profile`; integration tests: LocalAPI over safesocket, serve-config persistence across daemon restart, profile switch with two identities, cert endpoint 400/404 + cache-hit PEM paths |
-| Auto-update / ClientVersion | — | ⬜ |
+| Auto-update / ClientVersion | — | ✅ `crates/clientupdate`: `ClientUpdater` checks `MapResponse.ClientVersion`, `CheckResult`, `auto_apply` stub, `version_to_track` |
 | Multi-profile/login management | `ipn/ipnlocal/profiles.go` | ✅ phase-serve-cli-profiles: `crates/ipn` LoginProfile/NetworkProfile/ProfileID/UserProfile structs (serde PascalCase, Go wire-compat); profile persistence (`profiles.json` + `current-profile` pointer file, atomic saves); LocalAPI endpoints `GET /profiles`, `PUT /profiles` (create+switch), `GET /profiles/current`, `GET/POST/DELETE /profiles/<id>`; LocalClient list/current/new/switch/delete profile methods; CLI `rustscale switch [--list] [--json] [<profile>]` (match by ID or name, poll for Running); integration test: two-profile create/switch/delete against testcontrol. Remaining: backend teardown+restart on switch (currently updates prefs only), Windows LocalUserID |
 
 ## macOS platform parity (phases 32–40, 2026-07-11)
@@ -78,7 +78,7 @@ consume it) · peermtu darwin (no-op in Go too) ⬜ · sockstats ⬜.
 | Tailscale IP addr helpers | `net/tsaddr/` | 🔶 partially inlined in `dns` + `tsnet/routing`; no dedicated crate |
 | Outbound dial abstraction | `net/tsdial/` | ⬜ baked ad-hoc into netstack; no standalone module for PeerAPI/DoH/DNS-map routing |
 | Localhost port proxy map | `net/proxymap/` | ⬜ ephemeral localhost->remote IP port mapping for proxied conns |
-| HTTP CONNECT proxy | `net/connectproxy/` | ⬜ needed for outbound proxy support |
+| HTTP CONNECT proxy | `net/connectproxy/` | ✅ `crates/connectproxy`: `ConnectProxyConfig`, `parse_connect_request`, `handle_connect` with bidirectional tunnel; stub dial/test wiring |
 | HTTP proxy env detection | `net/tshttpproxy/` | ⬜ cross-platform proxy auto-detection (PAC/WPAD/registry) |
 | Embedded TLS roots fallback | `net/bakedroots/` | ⬜ container/minimal-Linux control-plane cert validation |
 | OS-level route management | `wgengine/router/` | ⬜ TUN mode uses ad-hoc route(8) calls; Go has clean interface + 4 platform impls |
@@ -87,7 +87,7 @@ consume it) · peermtu darwin (no-op in Go too) ⬜ · sockstats ⬜.
 | Service policy | `ipn/policy/` | ⬜ which services to advertise (Serve/Funnel peer discovery) |
 | Config file format | `ipn/conffile/` | ⬜ HUP-reloadable JSON config for daemon |
 | IPN extension system | `ipn/ipnext/` | ⬜ LocalBackend plugin architecture |
-| Cloud log shipping | `logtail/` | ⬜ uploads to log.tailscale.com |
+| Cloud log shipping | `logtail/` | ✅ `crates/logtail`: `LogTail` buffers entries with proc_id/proc_seq metadata, `send` stub (HTTP upload TODO); `Config` mirrors Go's `logtail.Config` |
 | Port enumeration | `portlist/` | ⬜ firewall diagnostics / listening-port scan |
 | Network flow logging | `wgengine/netlog/` | ⬜ TUN traffic logging → network flow logs |
 | Network error classification | `net/neterror/` | ⬜ retry-loops benefit from typed error reasons |
@@ -98,7 +98,7 @@ consume it) · peermtu darwin (no-op in Go too) ⬜ · sockstats ⬜.
 | Socket statistics | `net/sockstats/` | ⬜ |
 | In-memory test net | `net/memnet/` | ⬜ test infrastructure — in-memory net.Conn/Listener |
 | Event bus (in progress) | `util/eventbus/` | 🚧 phase-ipn-bus covers this via broadcast channel |
-| Client metrics | `util/clientmetric/` | ⬜ expvar-style counters; exposed by LocalAPI /metrics |
+| Client metrics | `util/clientmetric/` | ✅ `crates/clientmetric`: `Registry` with `Counter`/`Gauge` handles (atomic-backed), `to_prometheus_text()` + `to_json()`; wired into LocalAPI `/metrics` replacing 4 hardcoded metrics; subsystems can register via `state.metrics` |
 | Deep hash / change detection | `util/deephash/` | ⬜ Go uses for netmap change-detect; Rust PartialEq suffices mostly |
 | Singleflight | `util/singleflight/` | ⬜ in-flight request dedup (control client reconnect) |
 | LRU cache | `util/lru/` | ⬜ |

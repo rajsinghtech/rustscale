@@ -4,6 +4,8 @@ mod auth;
 mod c2n;
 mod env;
 mod hostkeys;
+pub mod incubator;
+pub mod recording;
 mod server;
 pub mod session;
 
@@ -13,6 +15,10 @@ pub use c2n::{
 };
 pub use env::{accept_env_pair, filter_env};
 pub use hostkeys::{host_key_from_node_key, host_key_public_string};
+pub use incubator::{Incubator, IncubatorArgs, IncubatorError, SpawnedProcess};
+pub use recording::{
+    default_recording_path, RecordDir, RecordResult, RecordingConfig, SessionRecorder,
+};
 pub use server::{PolicyCallback, SshHandler, SshServer, SshServerConfig, WhoIsCallback};
 pub use session::{PeerIdentity, Pty, Session, Window};
 

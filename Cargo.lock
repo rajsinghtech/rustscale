@@ -1916,6 +1916,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustscale-clientmetric"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "rustscale-clientupdate"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "rustscale-tailcfg",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "rustscale-connectproxy"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
 name = "rustscale-controlclient"
 version = "0.1.0"
 dependencies = [
@@ -2100,6 +2126,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustscale-logtail"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "rustscale-magicsock"
 version = "0.1.0"
 dependencies = [
@@ -2224,6 +2259,7 @@ dependencies = [
  "base64",
  "chrono",
  "ed25519-dalek",
+ "libc",
  "log",
  "russh",
  "russh-keys",
@@ -2295,6 +2331,7 @@ dependencies = [
  "rustls",
  "rustscale-appc",
  "rustscale-c2n",
+ "rustscale-clientmetric",
  "rustscale-controlclient",
  "rustscale-controlknobs",
  "rustscale-derp",

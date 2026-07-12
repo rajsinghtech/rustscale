@@ -1,0 +1,14 @@
+[package]
+name = "rustscale-clientmetric"
+description = "Client metric registry for rustscale — port of Go's util/clientmetric"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

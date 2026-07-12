@@ -72,6 +72,10 @@ pub struct ProberOpts {
     /// are forwarded here: `Some(true)` → `set_unhealthy(WARN_CAPTIVE_PORTAL)`,
     /// `Some(false)` → `set_healthy(WARN_CAPTIVE_PORTAL)`.
     pub health: Option<Tracker>,
+    /// Skip the ICMP latency fallback (used by tests that point at
+    /// unreachable localhost ports where ICMP would still succeed).
+    /// Default: `false` (ICMP is tried when UDP fails).
+    pub skip_icmp: bool,
 }
 
 impl Default for ProberOpts {
@@ -82,6 +86,7 @@ impl Default for ProberOpts {
             max_retries: MAX_PROBE_RETRIES,
             previous_preferred_derp: 0,
             health: None,
+            skip_icmp: false,
         }
     }
 }
@@ -113,7 +118,7 @@ impl Prober {
     /// matching response within the configured timeouts. Regions that don't
     /// respond are simply absent from the report's latency maps.
     pub async fn run(&self, dm: &DERPMap, opts: &ProberOpts) -> Result<Report, NetcheckError> {
-        let probes = build_probe_plan(dm);
+        let probes = build_probe_plan(dm).await;
         if probes.is_empty() {
             return Err(NetcheckError::NoRegions);
         }
@@ -147,6 +152,19 @@ impl Prober {
         }
 
         apply_outcomes(&mut report, &outcomes);
+
+        // If all STUN probes failed (UDP is blocked), fall back to ICMP
+        // latency probing — mirrors Go's `measureAllICMPLatency`. ICMP is
+        // best-effort: if the socket can't be opened (no root, no
+        // ping_group_range), this is silently skipped.
+        if !report.udp && !opts.skip_icmp {
+            let icmp_results = run_icmp_probes(dm, opts).await;
+            for (region_id, latency) in icmp_results {
+                report.update_latencies(region_id, ProbeProto::V4, latency);
+                report.icmpv4 = true;
+            }
+        }
+
         report.preferred_derp =
             pick_with_hysteresis(&report.region_latency, opts.previous_preferred_derp);
 
@@ -189,8 +207,9 @@ impl Prober {
 }
 
 /// Build the probe plan: for each measurable region, one v4 probe and (if the
-/// node speaks IPv6) one v6 probe, targeting the resolved address.
-fn build_probe_plan(dm: &DERPMap) -> Vec<Probe> {
+/// node speaks IPv6) one v6 probe, targeting the resolved address. DNS
+/// resolution is performed here for nodes that carry only a hostname.
+async fn build_probe_plan(dm: &DERPMap) -> Vec<Probe> {
     let mut probes = Vec::new();
     for region in dm.Regions.values() {
         if region.NoMeasureNoHome {
@@ -208,14 +227,14 @@ fn build_probe_plan(dm: &DERPMap) -> Vec<Probe> {
             .iter()
             .find(|n| !n.STUNOnly)
             .unwrap_or_else(|| &nodes[0]);
-        if let Some(addr) = node_addr_port(node, ProbeProto::V4) {
+        if let Some(addr) = node_addr_port(node, ProbeProto::V4).await {
             probes.push(Probe {
                 region_id: region.RegionID,
                 addr,
                 proto: ProbeProto::V4,
             });
         }
-        if let Some(addr) = node_addr_port(node, ProbeProto::V6) {
+        if let Some(addr) = node_addr_port(node, ProbeProto::V6).await {
             probes.push(Probe {
                 region_id: region.RegionID,
                 addr,
@@ -227,10 +246,12 @@ fn build_probe_plan(dm: &DERPMap) -> Vec<Probe> {
 }
 
 /// Resolve the probe target address for `node` over `proto`, mirroring Go's
-/// `nodeAddrPort` for the explicit-IP cases. DNS resolution is not performed
-/// here (Tailscale-provided DERPs always carry explicit IPs); nodes with only
-/// a hostname and no IP are skipped.
-fn node_addr_port(node: &DERPNode, proto: ProbeProto) -> Option<SocketAddr> {
+/// `nodeAddrPort`. When the node has an explicit IP (`IPv4`/`IPv6` or
+/// `STUNTestIP`), it is parsed directly. When only a `HostName` is available,
+/// it is resolved via DNS (`tokio::net::lookup_host`), and the first address
+/// matching the requested family is used. Returns `None` if the field is
+/// `"none"`, the IP doesn't match the family, or DNS resolution fails.
+async fn node_addr_port(node: &DERPNode, proto: ProbeProto) -> Option<SocketAddr> {
     let port = stun_port(node);
     if port == 0 {
         return None;
@@ -249,10 +270,16 @@ fn node_addr_port(node: &DERPNode, proto: ProbeProto) -> Option<SocketAddr> {
         ProbeProto::V6 => &node.IPv6,
     };
     if field.is_empty() || field == "none" {
-        // No explicit IP; a real client would DNS-resolve HostName. Skip for
-        // now — the prober is tested against explicit-IP DERP maps and fake
-        // servers, and real control-plane integration will add DNS later.
-        return None;
+        // No explicit IP — DNS-resolve the HostName, matching Go's
+        // `nodeAddrPort` fallback to `net.DefaultResolver.LookupIPAddr`.
+        if node.HostName.is_empty() {
+            return None;
+        }
+        let host = node.HostName.as_str();
+        return tokio::net::lookup_host((host, port))
+            .await
+            .ok()?
+            .find(|sa| proto.matches_ip(sa.ip()));
     }
     let ip: IpAddr = field.parse().ok()?;
     if !proto.matches_ip(ip) {
@@ -359,6 +386,57 @@ fn apply_outcomes(report: &mut Report, outcomes: &[ProbeOutcome]) {
             }
         }
     }
+}
+
+/// Run ICMP echo probes against each measurable DERP region's first node,
+/// returning `(region_id, rtt)` pairs for successful probes. Mirrors Go's
+/// `measureAllICMPLatency`. Best-effort: if the ICMP socket can't be opened,
+/// returns an empty vec.
+async fn run_icmp_probes(dm: &DERPMap, opts: &ProberOpts) -> Vec<(i32, Duration)> {
+    // Build the list of (region_id, ipv4) targets, resolving DNS as needed.
+    let mut targets = Vec::new();
+    for region in dm.Regions.values() {
+        if region.NoMeasureNoHome {
+            continue;
+        }
+        let Some(nodes) = region.Nodes.as_ref() else {
+            continue;
+        };
+        if nodes.is_empty() {
+            continue;
+        }
+        let node = &nodes[0];
+        if node.STUNPort < 0 {
+            continue;
+        }
+        if let Some(addr) = node_addr_port(node, ProbeProto::V4).await {
+            targets.push((region.RegionID, addr.ip()));
+        }
+    }
+    if targets.is_empty() {
+        return Vec::new();
+    }
+
+    let deadline = Instant::now() + opts.report_timeout;
+    let mut handles = Vec::with_capacity(targets.len());
+    for (region_id, ip) in targets {
+        handles.push(tokio::spawn(async move {
+            // Each task opens its own ICMP socket — unprivileged datagram
+            // ICMP allows multiple sockets; raw ICMP might fail for the 2nd.
+            let mut pinger = crate::icmp::Pinger::new_v4()?;
+            let rtt = pinger.ping(ip, b"rustscale-netcheck").await?;
+            Some((region_id, rtt))
+        }));
+    }
+
+    let mut results = Vec::new();
+    for h in handles {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if let Ok(Ok(Some((rid, rtt)))) = timeout(remaining, h).await {
+            results.push((rid, rtt));
+        }
+    }
+    results
 }
 
 /// Choose the preferred DERP region with hysteresis: if the previous preferred

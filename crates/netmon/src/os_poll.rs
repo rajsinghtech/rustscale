@@ -1,8 +1,8 @@
-//! Non-macOS OS event source: polling fallback.
+//! Non-macOS/Linux OS event source: polling fallback.
 //!
-//! On platforms without an AF_ROUTE equivalent (Linux, etc.), we poll the
-//! interface state every `poll_interval` (default 10s). This matches Go's
-//! `net/netmon/polling.go` (`pollingMon`).
+//! On platforms without an AF_ROUTE or NETLINK equivalent (Windows, etc.), we
+//! poll the interface state every `poll_interval` (default 10s). This matches
+//! Go's `net/netmon/polling.go` (`pollingMon`).
 
 use std::sync::{atomic::AtomicBool, Arc};
 use std::time::Duration;

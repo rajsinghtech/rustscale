@@ -2126,6 +2126,7 @@ dependencies = [
  "rand",
  "rustscale-health",
  "rustscale-tailcfg",
+ "socket2",
  "thiserror 1.0.69",
  "tokio",
 ]

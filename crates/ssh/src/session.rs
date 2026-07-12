@@ -42,7 +42,7 @@ pub struct Session {
 }
 
 impl Session {
-    pub(crate) fn from_init(init: SessionInit) -> Self {
+    pub fn from_init(init: SessionInit) -> Self {
         let _ = &init.peer;
         Self {
             peer: init.peer, ssh_user: init.ssh_user, command: init.command, env: init.env,

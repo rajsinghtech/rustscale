@@ -6,6 +6,7 @@ use chrono::Utc;
 use rustscale_tailcfg::{Node, SSHAction, SSHPrincipal, SSHRule, SSHPolicy, UserProfile};
 
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum EvalResult {
     Accept { action: SSHAction, local_user: String, accept_env: Vec<String> },
     RejectedUser,
@@ -45,11 +46,11 @@ fn match_rule(rule: &SSHRule, info: &ConnInfo) -> Result<MatchedRule, MatchError
         if expiry < &Utc::now() { return Err(MatchError::RuleExpired); }
     }
     if !any_principal_matches(&rule.Principals, info) { return Err(MatchError::PrincipalMatch); }
-    let local_user = if !action.Reject {
+    let local_user = if action.Reject { String::new() } else {
         let lu = map_local_user(&rule.SSHUsers, &info.ssh_user);
         if lu.is_empty() { return Err(MatchError::UserMatch); }
         lu
-    } else { String::new() };
+    };
     Ok(MatchedRule { action: action.clone(), local_user, accept_env: rule.AcceptEnv.clone() })
 }
 

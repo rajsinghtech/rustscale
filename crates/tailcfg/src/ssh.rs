@@ -80,7 +80,7 @@ pub struct SSHRecorderFailureAction {
 }
 
 mod duration_secs {
-    use super::*;
+    use super::{Deserialize, Duration};
     pub fn serialize<S>(d: &Duration, s: S) -> Result<S::Ok, S::Error>
     where S: serde::Serializer {
         if d.is_zero() { return s.serialize_none(); }

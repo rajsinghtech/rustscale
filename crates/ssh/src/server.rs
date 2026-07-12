@@ -83,14 +83,8 @@ impl SshHandler {
             Some(addr) => addr.ip(),
             None => return Auth::Reject { proceed_with_methods: None },
         };
-        let (node, user_profile) = match (self.config.whois)(peer_ip) {
-            Some(ident) => ident,
-            None => { log::warn!("SSH: unknown identity from {peer_ip}"); return Auth::Reject { proceed_with_methods: None }; }
-        };
-        let policy = match (self.config.policy)() {
-            Some(p) => p,
-            None => { log::warn!("SSH: no policy configured"); return Auth::Reject { proceed_with_methods: None }; }
-        };
+        let (node, user_profile) = if let Some(ident) = (self.config.whois)(peer_ip) { ident } else { log::warn!("SSH: unknown identity from {peer_ip}"); return Auth::Reject { proceed_with_methods: None }; };
+        let policy = if let Some(p) = (self.config.policy)() { p } else { log::warn!("SSH: no policy configured"); return Auth::Reject { proceed_with_methods: None }; };
         let info = ConnInfo {
             ssh_user: ssh_user.clone(), src_ip: peer_ip, dst_ip: peer_ip,
             node: node.clone(), user_profile: user_profile.clone(),
@@ -100,8 +94,8 @@ impl SshHandler {
             EvalResult::Accept { action, local_user, accept_env } => {
                 if !action.Message.is_empty() { log::info!("SSH auth: {}", action.Message); }
                 self.ssh_user = ssh_user;
-                self.local_user = local_user.clone();
-                self.accept_env = accept_env.clone();
+                self.local_user.clone_from(local_user);
+                self.accept_env.clone_from(accept_env);
                 self.peer_identity = Some(PeerIdentity { node, user_profile });
                 Auth::Accept
             }

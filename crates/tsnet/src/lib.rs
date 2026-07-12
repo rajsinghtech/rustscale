@@ -40,6 +40,9 @@ mod state;
 mod status;
 mod tls;
 
+#[cfg(feature = "ssh")]
+mod ssh;
+
 pub use routing::{peer_is_exit_capable, RouteTable};
 pub use rustscale_health::Warning;
 pub use serve::{
@@ -60,6 +63,9 @@ pub use tls::{
 pub use hostinfo::{
     collect_hostinfo, hostinfo_hash, populate_hostinfo, HostinfoOverrides, SharedOverrides,
 };
+
+#[cfg(feature = "ssh")]
+pub use ssh::SshListener;
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};

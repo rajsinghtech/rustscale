@@ -5,7 +5,7 @@ mod c2n;
 mod env;
 mod hostkeys;
 mod server;
-mod session;
+pub mod session;
 
 pub use auth::{eval_ssh_policy, ConnInfo, EvalResult};
 pub use c2n::{get_ssh_usernames, handle_c2n_ssh_usernames, C2nSshUsernamesRequest, C2nSshUsernamesResponse};

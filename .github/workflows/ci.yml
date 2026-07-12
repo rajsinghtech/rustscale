@@ -162,10 +162,19 @@ jobs:
       - name: Run interop tests
         run: cargo test -p rustscale-interop-testcontrol --locked -- --nocapture --test-threads=1
 
+  ignore-guard:
+    name: #[ignore] count guard (L6)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Check #[ignore] count
+        run: IGNORE_GUARD_MODE=check tools/ignore-guard.sh
+
   alls-green:
     name: All green
     if: always()
-    needs: [check, cross, msrv, testcontrol]
+    needs: [check, cross, msrv, testcontrol, ignore-guard]
     runs-on: ubuntu-latest
     steps:
       - name: Decide if change is okay to merge

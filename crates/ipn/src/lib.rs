@@ -27,7 +27,10 @@ pub use backend::{BackendInputs, IpnBackend};
 pub use bus::{NotifyBus, NotifyBusReceiver};
 pub use machine::{next_state, StateMachineInputs};
 pub use prefs::{AppConnectorPrefs, MaskedPrefs, Prefs, StartOptions};
-pub use profiles::{LoginProfile, NetworkProfile, ProfileID, StateKey, UserProfile};
+pub use profiles::{
+    KeyExpiryState, LoginProfile, NetworkProfile, ProfileError, ProfileID, ProfileManager,
+    StateChangeCallback, StateKey, SwitchResult, UserProfile,
+};
 
 use serde::{Deserialize, Serialize};
 

@@ -194,7 +194,7 @@ async fn derp_data_path_fallback() {
     let b_priv = NodePrivate::generate();
 
     let a_derp = connect_to_relay(&relay, a_priv.clone()).await;
-    let a = Magicsock::new(MagicsockConfig {
+    let (a, mut a_rx) = Magicsock::new(MagicsockConfig {
         private_key: a_priv,
         disco_key: DiscoPrivate::generate(),
         derp_client: Some(a_derp),
@@ -212,7 +212,7 @@ async fn derp_data_path_fallback() {
     .expect("A magicsock");
 
     let b_derp = connect_to_relay(&relay, b_priv.clone()).await;
-    let b = Magicsock::new(MagicsockConfig {
+    let (b, mut b_rx) = Magicsock::new(MagicsockConfig {
         private_key: b_priv,
         disco_key: DiscoPrivate::generate(),
         derp_client: Some(b_derp),
@@ -247,7 +247,7 @@ async fn derp_data_path_fallback() {
     let mut got_wg = None;
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
     while std::time::Instant::now() < deadline {
-        if let Ok(Ok(d)) = tokio::time::timeout(Duration::from_millis(500), b.poll_recv()).await {
+        if let Ok(Some(d)) = tokio::time::timeout(Duration::from_millis(500), b_rx.recv()).await {
             if d.data == wg_datagram {
                 got_wg = Some(d);
                 break;
@@ -261,7 +261,7 @@ async fn derp_data_path_fallback() {
     // B sends back to A.
     let wg_reply = b"\x00\x04\x05\x06 fake wg packet from B";
     b.send(a.node_public(), wg_reply).await.expect("B send");
-    let received = tokio::time::timeout(Duration::from_secs(2), a.poll_recv())
+    let received = tokio::time::timeout(Duration::from_secs(2), a_rx.recv())
         .await
         .expect("timed out waiting for A recv")
         .expect("A poll_recv");
@@ -279,7 +279,7 @@ async fn direct_path_upgrade_over_udp() {
     let b_priv = NodePrivate::generate();
 
     let a_derp = connect_to_relay(&relay, a_priv.clone()).await;
-    let a = Magicsock::new(MagicsockConfig {
+    let (a, _a_rx) = Magicsock::new(MagicsockConfig {
         private_key: a_priv,
         disco_key: DiscoPrivate::generate(),
         derp_client: Some(a_derp),
@@ -297,7 +297,7 @@ async fn direct_path_upgrade_over_udp() {
     .expect("A magicsock");
 
     let b_derp = connect_to_relay(&relay, b_priv.clone()).await;
-    let b = Magicsock::new(MagicsockConfig {
+    let (b, mut b_rx) = Magicsock::new(MagicsockConfig {
         private_key: b_priv,
         disco_key: DiscoPrivate::generate(),
         derp_client: Some(b_derp),
@@ -356,7 +356,7 @@ async fn direct_path_upgrade_over_udp() {
     // Send a WG datagram over the direct path.
     let wg_datagram = b"\x08\x07\x06\x05 direct wg packet";
     a.send(b.node_public(), wg_datagram).await.expect("A send");
-    let received = tokio::time::timeout(Duration::from_secs(2), b.poll_recv())
+    let received = tokio::time::timeout(Duration::from_secs(2), b_rx.recv())
         .await
         .expect("timed out waiting for B recv")
         .expect("B poll_recv");
@@ -374,7 +374,7 @@ async fn trust_expiry_downgrades_to_derp() {
     let b_priv = NodePrivate::generate();
 
     let a_derp = connect_to_relay(&relay, a_priv.clone()).await;
-    let a = Magicsock::new(MagicsockConfig {
+    let (a, _a_rx) = Magicsock::new(MagicsockConfig {
         private_key: a_priv,
         disco_key: DiscoPrivate::generate(),
         derp_client: Some(a_derp),
@@ -392,7 +392,7 @@ async fn trust_expiry_downgrades_to_derp() {
     .expect("A magicsock");
 
     let b_derp = connect_to_relay(&relay, b_priv.clone()).await;
-    let b = Magicsock::new(MagicsockConfig {
+    let (b, _b_rx) = Magicsock::new(MagicsockConfig {
         private_key: b_priv,
         disco_key: DiscoPrivate::generate(),
         derp_client: Some(b_derp),
@@ -453,7 +453,7 @@ async fn send_unknown_peer_errors() {
     let relay = Arc::new(FakeRelay::new());
     let privk = NodePrivate::generate();
     let derp = connect_to_relay(&relay, privk.clone()).await;
-    let a = Magicsock::new(MagicsockConfig {
+    let (a, _a_rx) = Magicsock::new(MagicsockConfig {
         private_key: privk,
         disco_key: DiscoPrivate::generate(),
         derp_client: Some(derp),
@@ -544,7 +544,7 @@ async fn multi_region_derp_routing() {
     // Create magicsock A with home region 1. We inject BOTH DERP connections
     // by first creating with the home client, then manually inserting the
     // region 2 connection into the DerpManager.
-    let a = Magicsock::new(MagicsockConfig {
+    let (a, mut a_rx) = Magicsock::new(MagicsockConfig {
         private_key: a_priv,
         disco_key: DiscoPrivate::generate(),
         derp_client: Some(a_derp_home),
@@ -589,7 +589,7 @@ async fn multi_region_derp_routing() {
     }
 
     // Create magicsock B with home region 2. Similarly inject region 1.
-    let b = Magicsock::new(MagicsockConfig {
+    let (b, mut b_rx) = Magicsock::new(MagicsockConfig {
         private_key: b_priv,
         disco_key: DiscoPrivate::generate(),
         derp_client: Some(b_derp_home),
@@ -648,7 +648,7 @@ async fn multi_region_derp_routing() {
     let mut got_wg = None;
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while std::time::Instant::now() < deadline {
-        if let Ok(Ok(d)) = tokio::time::timeout(Duration::from_millis(500), b.poll_recv()).await {
+        if let Ok(Some(d)) = tokio::time::timeout(Duration::from_millis(500), b_rx.recv()).await {
             if d.data == wg_datagram {
                 got_wg = Some(d);
                 break;
@@ -665,7 +665,7 @@ async fn multi_region_derp_routing() {
         .await
         .expect("B send to A via region 1");
 
-    let received = tokio::time::timeout(Duration::from_secs(5), a.poll_recv())
+    let received = tokio::time::timeout(Duration::from_secs(5), a_rx.recv())
         .await
         .expect("timed out waiting for A recv via region 1")
         .expect("A poll_recv");

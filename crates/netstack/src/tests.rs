@@ -514,3 +514,119 @@ async fn concurrent_connections_all_succeed() {
         "only {dial_succeeded}/{NUM_CONCURRENT} dials succeeded"
     );
 }
+
+/// Verify that `add_addr` + `listen_on` allows listening on a VIP address
+/// distinct from the node's primary tailnet IP. This exercises the service
+/// listener path: a netstack with primary IP 100.64.0.2 adds a VIP
+/// 100.64.0.10, listens on it, and a peer dials the VIP.
+#[tokio::test]
+async fn listen_on_vip_addr() {
+    use std::net::IpAddr;
+
+    let a_priv = NodePrivate::generate();
+    let b_priv = NodePrivate::generate();
+    let a_pub = a_priv.public();
+    let b_pub = b_priv.public();
+
+    let a_addr = Ipv4Addr::new(100, 64, 0, 1);
+    let b_addr = Ipv4Addr::new(100, 64, 0, 2);
+    let b_vip = IpAddr::V4(Ipv4Addr::new(100, 64, 0, 10));
+
+    let a_net = Arc::new(Netstack::new(a_addr, DEFAULT_MTU));
+    let b_net = Arc::new(Netstack::new(b_addr, DEFAULT_MTU));
+
+    let a_tunn = Arc::new(Mutex::new(
+        WgTunn::new(&a_priv, &b_pub, 1).expect("A tunnel"),
+    ));
+    let b_tunn = Arc::new(Mutex::new(
+        WgTunn::new(&b_priv, &a_pub, 2).expect("B tunnel"),
+    ));
+
+    // Add the VIP address to B's netstack interface.
+    b_net.add_addr(b_vip).await.expect("add_addr");
+
+    let a_tunn_p = a_tunn.clone();
+    let b_tunn_p = b_tunn.clone();
+    let a_net_p = a_net.clone();
+    let b_net_p = b_net.clone();
+    let pump = tokio::spawn(async move {
+        let a_tx = a_net_p.tx_notify();
+        let b_tx = b_net_p.tx_notify();
+        loop {
+            let did_work = pump_cycle(&a_tunn_p, &b_tunn_p, &a_net_p, &b_net_p);
+            if !did_work {
+                tokio::select! {
+                    () = a_tx.notified() => {}
+                    () = b_tx.notified() => {}
+                    () = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+                }
+            }
+        }
+    });
+
+    // B listens on the VIP address.
+    let mut listener = b_net.listen_on(b_vip, 12345).await.expect("listen_on");
+
+    // A dials B's VIP address.
+    let dial_result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        a_net.dial(SocketAddr::new(b_vip, 12345)),
+    )
+    .await;
+    let mut a_stream = dial_result.expect("dial timed out").expect("dial failed");
+
+    // B accepts.
+    let accept_result =
+        tokio::time::timeout(std::time::Duration::from_secs(10), listener.accept()).await;
+    let mut b_stream = accept_result
+        .expect("accept timed out")
+        .expect("accept failed");
+
+    // Verify bidirectional data exchange.
+    tokio::io::AsyncWriteExt::write_all(&mut a_stream, b"vip-echo")
+        .await
+        .expect("A write");
+
+    let mut buf = [0u8; 32];
+    let n = tokio::io::AsyncReadExt::read(&mut b_stream, &mut buf)
+        .await
+        .expect("B read");
+    assert_eq!(&buf[..n], b"vip-echo");
+
+    tokio::io::AsyncWriteExt::write_all(&mut b_stream, b"vip-reply")
+        .await
+        .expect("B write");
+
+    let n = tokio::io::AsyncReadExt::read(&mut a_stream, &mut buf)
+        .await
+        .expect("A read");
+    assert_eq!(&buf[..n], b"vip-reply");
+
+    tokio::io::AsyncWriteExt::shutdown(&mut a_stream)
+        .await
+        .expect("A shutdown");
+
+    pump.abort();
+}
+
+/// Verify that `listen` (on the primary IP) and `listen_on` (on a VIP) can
+/// coexist on the same port without conflict.
+#[tokio::test]
+async fn listen_and_listen_on_same_port() {
+    use std::net::IpAddr;
+
+    let addr = Ipv4Addr::new(100, 64, 0, 1);
+    let vip = IpAddr::V4(Ipv4Addr::new(100, 64, 0, 50));
+    let net = Netstack::new(addr, DEFAULT_MTU);
+
+    // Listen on the primary IP.
+    let _listener1 = net.listen(8080).await.expect("listen on primary");
+
+    // Add VIP and listen on it — same port, different IP, should succeed.
+    net.add_addr(vip).await.expect("add_addr");
+    let _listener2 = net.listen_on(vip, 8080).await.expect("listen_on VIP");
+
+    // Listening on the same (primary_ip, port) should still fail.
+    let result = net.listen(8080).await;
+    assert!(result.is_err(), "duplicate (primary_ip, port) should fail");
+}

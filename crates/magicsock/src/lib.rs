@@ -18,7 +18,6 @@
 //!
 //! - [`Magicsock::new`] — bind UDP, connect home DERP (if provided), start I/O.
 //! - [`Magicsock::set_netmap`] — create/update peer endpoints, start probing.
-//! - [`Magicsock::poll_recv`] — receive the next WG datagram from any peer.
 //! - [`Magicsock::send`] — send a WG datagram to a peer over the best path.
 
 #![forbid(unsafe_code)]
@@ -136,7 +135,6 @@ pub struct WgDatagram {
 /// The path-selection engine.
 pub struct Magicsock {
     inner: Arc<Inner>,
-    wg_recv: tokio::sync::Mutex<mpsc::Receiver<WgDatagram>>,
 }
 
 struct Inner {
@@ -479,7 +477,13 @@ fn spawn_derp_recv_consumer(
 impl Magicsock {
     /// Create a new Magicsock: bind UDP (if configured), connect DERP, and
     /// launch background I/O tasks.
-    pub async fn new(config: MagicsockConfig) -> Result<Self, MagicsockError> {
+    ///
+    /// Returns the Magicsock and the WG datagram receiver. The caller should
+    /// move the receiver into the pump task that consumes WG packets — it is
+    /// a single-consumer channel, so there is no need for a Mutex.
+    pub async fn new(
+        config: MagicsockConfig,
+    ) -> Result<(Self, mpsc::Receiver<WgDatagram>), MagicsockError> {
         let node_public = config.private_key.public();
         let disco = DiscoIo::new(config.disco_key);
 
@@ -568,10 +572,7 @@ impl Magicsock {
         // Launch background recv tasks (UDP + DERP demux + reconnect supervisor).
         spawn_recv_tasks(inner.clone(), derp_recv_rx, reconnect_rx);
 
-        Ok(Self {
-            inner,
-            wg_recv: tokio::sync::Mutex::new(wg_recv),
-        })
+        Ok((Self { inner }, wg_recv))
     }
 
     /// Our node public key.
@@ -845,16 +846,6 @@ impl Magicsock {
         Ok(())
     }
 
-    /// Receive the next WG datagram from any peer. Blocks until one is ready.
-    pub async fn poll_recv(&self) -> Result<WgDatagram, MagicsockError> {
-        self.wg_recv
-            .lock()
-            .await
-            .recv()
-            .await
-            .ok_or(MagicsockError::NoPath)
-    }
-
     /// Send a WG datagram to `peer` over the best available path.
     pub async fn send(&self, peer: NodePublic, datagram: &[u8]) -> Result<(), MagicsockError> {
         let (path, derp_region) = {
@@ -959,6 +950,16 @@ impl Magicsock {
             .write()
             .expect("self_cap_map lock poisoned");
         *guard = cap_map;
+    }
+
+    /// Snapshot of the self node's CapMap. Used by service listeners to
+    /// resolve VIP service IP addresses from the `service-host` capability.
+    pub fn self_cap_map(&self) -> rustscale_tailcfg::NodeCapMap {
+        self.inner
+            .self_cap_map
+            .read()
+            .expect("self_cap_map lock poisoned")
+            .clone()
     }
 
     /// The relay server extension, if this node is configured as a relay

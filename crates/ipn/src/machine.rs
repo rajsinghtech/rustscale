@@ -388,7 +388,7 @@ mod tests {
             ),
             // --- Edge: blocked with want_running false ---
             (
-                "not stopped when blocked and want_running false",
+                "stopped when blocked and want_running false with netmap",
                 StateMachineInputs {
                     want_running: false,
                     blocked: true,
@@ -398,7 +398,47 @@ mod tests {
                 },
                 State::NoState,
                 State::Stopped,
-            ), // case 3: !wantRunning → Stopped
+            ), // case 3: !wantRunning → Stopped (blocked only suppresses Case 1)
+            // --- blocked=true + want_running=true → NOT Stopped ---
+            (
+                "starting not stopped when blocked and want_running true",
+                StateMachineInputs {
+                    want_running: true,
+                    blocked: true,
+                    has_node_key: true,
+                    netmap_present: true,
+                    machine_authorized: true,
+                    ..inputs()
+                },
+                State::NoState,
+                State::Starting,
+            ),
+            (
+                "needs_machine_auth when blocked and want_running true but unauthorized",
+                StateMachineInputs {
+                    want_running: true,
+                    blocked: true,
+                    has_node_key: true,
+                    netmap_present: true,
+                    machine_authorized: false,
+                    ..inputs()
+                },
+                State::NoState,
+                State::NeedsMachineAuth,
+            ),
+            // --- logged_out=true + want_running=false + no netmap → NeedsLogin ---
+            (
+                "needs_login when logged out and want_running false without netmap",
+                StateMachineInputs {
+                    want_running: false,
+                    logged_out: true,
+                    has_node_key: true,
+                    netmap_present: false,
+                    ..inputs()
+                },
+                State::NoState,
+                State::NeedsLogin,
+            ),
         ];
 
         for (name, inp, current, expected) in cases {
@@ -474,6 +514,10 @@ mod tests {
             BrowseToURL: Some("https://example.com".into()),
             InitialStatus: Some(serde_json::json!({})),
             FilesWaiting: None,
+            NetMap: None,
+            PeersChanged: None,
+            PeersRemoved: None,
+            PeerChangedPatch: None,
         };
         let j = serde_json::to_string(&n).unwrap();
         assert!(j.contains("\"Version\":\"1.0\""));

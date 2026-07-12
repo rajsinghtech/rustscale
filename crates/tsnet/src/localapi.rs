@@ -396,6 +396,8 @@ async fn handle_logout<W: AsyncWrite + Unpin>(
         }
     }
     state.ipn_backend.set_auth_cant_continue(true);
+    state.ipn_backend.set_logged_out(true);
+    state.ipn_backend.set_blocked(true);
     state.ipn_backend.bus().send(rustscale_ipn::Notify {
         Prefs: Some(serde_json::to_value(&*state.prefs.read().await).unwrap_or_default()),
         ..Default::default()

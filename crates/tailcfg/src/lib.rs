@@ -16,6 +16,7 @@ mod filter;
 mod map;
 mod node;
 mod register;
+mod service;
 
 pub use appctype::{
     AppConnectorAttr, AppConnectorConfig, ConfigID, Conn25Attr, Conn25PoolsAttr, DNATConfig,
@@ -36,6 +37,10 @@ pub use node::{
     TPMInfo,
 };
 pub use register::{Login, LoginID, RegisterRequest, RegisterResponse, RegisterResponseAuth, User};
+pub use service::{
+    service_ip_mappings_from_capmap, service_vip_addrs, ServiceIPMappings, ServiceName,
+    ServiceNameError, VIPService, NODE_ATTR_SERVICE_HOST,
+};
 
 pub use rustscale_key::{
     DiscoPublic as DiscoKey, MachinePublic as MachineKey, NodePublic as NodeKey,

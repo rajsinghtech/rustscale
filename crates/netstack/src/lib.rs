@@ -108,6 +108,13 @@ impl Listener {
             .await
             .ok_or(NetstackError::ShuttingDown)?
     }
+
+    /// Consume the listener and return the underlying accept channel
+    /// receiver. Used by [`ServiceListener`](crate::service::ServiceListener)
+    /// to merge multiple VIP listeners into a single accept stream.
+    pub fn into_receiver(self) -> mpsc::Receiver<Result<NetstackStream, NetstackError>> {
+        self.accept_rx
+    }
 }
 
 /// A bidirectional TCP stream over the tailnet, implementing
@@ -283,7 +290,8 @@ impl Netstack {
         self.tx_queue.lock().ok()?.pop_front()
     }
 
-    /// Start listening for incoming TCP connections on `port`.
+    /// Start listening for incoming TCP connections on `port` bound to the
+    /// netstack's primary tailnet IPv4 address.
     pub async fn listen(&self, port: u16) -> Result<Listener, NetstackError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.cmd_tx
@@ -295,6 +303,39 @@ impl Netstack {
             .map_err(|_| NetstackError::ShuttingDown)?;
         let accept_rx = reply_rx.await.map_err(|_| NetstackError::ShuttingDown)??;
         Ok(Listener { accept_rx })
+    }
+
+    /// Start listening for incoming TCP connections on a specific local `addr`
+    /// and `port`. Used by service listeners that bind to a VIP address
+    /// distinct from the node's primary tailnet IP. The address must first be
+    /// added via [`Netstack::add_addr`].
+    pub async fn listen_on(&self, addr: IpAddr, port: u16) -> Result<Listener, NetstackError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(Command::ListenOn {
+                addr,
+                port,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| NetstackError::ShuttingDown)?;
+        let accept_rx = reply_rx.await.map_err(|_| NetstackError::ShuttingDown)??;
+        Ok(Listener { accept_rx })
+    }
+
+    /// Add an additional IP address to the smoltcp interface. Required before
+    /// [`Netstack::listen_on`] can accept connections addressed to this IP.
+    /// Currently only IPv4 is supported; IPv6 returns an error.
+    pub async fn add_addr(&self, addr: IpAddr) -> Result<(), NetstackError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(Command::AddAddr {
+                addr,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| NetstackError::ShuttingDown)?;
+        reply_rx.await.map_err(|_| NetstackError::ShuttingDown)?
     }
 
     /// Dial a remote `ip:port` over the tailnet.
@@ -334,6 +375,17 @@ enum Command {
         reply: oneshot::Sender<
             Result<mpsc::Receiver<Result<NetstackStream, NetstackError>>, NetstackError>,
         >,
+    },
+    ListenOn {
+        addr: IpAddr,
+        port: u16,
+        reply: oneshot::Sender<
+            Result<mpsc::Receiver<Result<NetstackStream, NetstackError>>, NetstackError>,
+        >,
+    },
+    AddAddr {
+        addr: IpAddr,
+        reply: oneshot::Sender<Result<(), NetstackError>>,
     },
     Dial {
         remote: SocketAddr,
@@ -442,8 +494,8 @@ async fn poll_loop(
     let mut sockets: SocketSet<'static> = SocketSet::new(vec![]);
     let mut conns: HashMap<SocketHandle, ConnState> = HashMap::new();
     let mut pending_dials: HashMap<SocketHandle, PendingDial> = HashMap::new();
-    // port -> (listener_socket_handle, accept_sender)
-    let mut listeners: HashMap<u16, ListenerEntry> = HashMap::new();
+    // (ip, port) -> (listener_socket_handle, accept_sender)
+    let mut listeners: HashMap<(IpAddr, u16), ListenerEntry> = HashMap::new();
 
     let sleep = tokio::time::sleep(std::time::Duration::from_secs(1));
     tokio::pin!(sleep);
@@ -464,7 +516,15 @@ async fn poll_loop(
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(Command::Listen { port, reply }) => {
-                        let result = do_listen(&mut sockets, &mut listeners, addr, port);
+                        let result = do_listen(&mut sockets, &mut listeners, IpAddr::V4(addr), port);
+                        let _ = reply.send(result);
+                    }
+                    Some(Command::ListenOn { addr: listen_addr, port, reply }) => {
+                        let result = do_listen(&mut sockets, &mut listeners, listen_addr, port);
+                        let _ = reply.send(result);
+                    }
+                    Some(Command::AddAddr { addr: add_addr, reply }) => {
+                        let result = do_add_addr(&mut iface, add_addr);
                         let _ = reply.send(result);
                     }
                     Some(Command::Dial { remote, reply }) => {
@@ -487,15 +547,19 @@ async fn poll_loop(
         // maintained. Dead sockets (failed handshakes, timed out) are also
         // replaced.
         {
-            let listener_ports: Vec<u16> = listeners.keys().copied().collect();
-            let smol_addr = to_smoltcp_v4(addr);
-            for port in listener_ports {
+            let listener_keys: Vec<(IpAddr, u16)> = listeners.keys().copied().collect();
+            for key in listener_keys {
+                let (listen_ip, port) = key;
+                let smol_addr = match listen_ip {
+                    IpAddr::V4(v4) => to_smoltcp_v4(v4),
+                    IpAddr::V6(_) => continue,
+                };
                 let endpoint = IpListenEndpoint::from((smol_addr, port));
 
                 // Collect handles to process (Established or dead).
                 let mut to_accept: Vec<SocketHandle> = Vec::new();
                 let mut to_replace: Vec<SocketHandle> = Vec::new();
-                if let Some(entry) = listeners.get(&port) {
+                if let Some(entry) = listeners.get(&key) {
                     for &h in &entry.handles {
                         let state = sockets.get::<tcp::Socket>(h).state();
                         match state {
@@ -511,14 +575,14 @@ async fn poll_loop(
                 // so the TCP stack applies flow control to the sender.
                 for lh in to_accept {
                     let can_accept = listeners
-                        .get(&port)
+                        .get(&key)
                         .is_some_and(|e| e.accept_tx.capacity() > 0);
                     if !can_accept {
                         continue;
                     }
 
                     // Remove from the backlog pool.
-                    if let Some(entry) = listeners.get_mut(&port) {
+                    if let Some(entry) = listeners.get_mut(&key) {
                         entry.handles.retain(|&h| h != lh);
                     }
 
@@ -539,7 +603,7 @@ async fn poll_loop(
                     let (stream, conn) = make_stream_and_conn(notify.clone(), remote_addr);
                     conns.insert(conn_handle, conn);
 
-                    if let Some(entry) = listeners.get(&port) {
+                    if let Some(entry) = listeners.get(&key) {
                         let _ = entry.accept_tx.try_send(Ok(stream));
                     }
 
@@ -547,14 +611,14 @@ async fn poll_loop(
                     let mut fresh = new_tcp_socket();
                     let _ = fresh.listen(endpoint);
                     let fresh_handle = sockets.add(fresh);
-                    if let Some(entry) = listeners.get_mut(&port) {
+                    if let Some(entry) = listeners.get_mut(&key) {
                         entry.handles.push(fresh_handle);
                     }
                 }
 
                 // Replace dead listening sockets (failed handshakes, etc.).
                 for lh in to_replace {
-                    if let Some(entry) = listeners.get_mut(&port) {
+                    if let Some(entry) = listeners.get_mut(&key) {
                         entry.handles.retain(|&h| h != lh);
                     }
                     let _ = sockets.remove(lh);
@@ -562,7 +626,7 @@ async fn poll_loop(
                     let mut fresh = new_tcp_socket();
                     let _ = fresh.listen(endpoint);
                     let fresh_handle = sockets.add(fresh);
-                    if let Some(entry) = listeners.get_mut(&port) {
+                    if let Some(entry) = listeners.get_mut(&key) {
                         entry.handles.push(fresh_handle);
                     }
                 }
@@ -604,23 +668,30 @@ async fn poll_loop(
     }
 }
 
-/// Create a listening socket for `port`.
+/// Create a listening socket for `addr:port`.
 ///
 /// Creates `LISTEN_BACKLOG` passive listening sockets so multiple SYNs can
 /// be processed concurrently — mirroring the OS `listen(fd, backlog)` API
 /// that smoltcp lacks.
 fn do_listen(
     sockets: &mut SocketSet<'static>,
-    listeners: &mut HashMap<u16, ListenerEntry>,
-    addr: Ipv4Addr,
+    listeners: &mut HashMap<(IpAddr, u16), ListenerEntry>,
+    addr: IpAddr,
     port: u16,
 ) -> Result<mpsc::Receiver<Result<NetstackStream, NetstackError>>, NetstackError> {
-    if listeners.contains_key(&port) {
+    let key = (addr, port);
+    if listeners.contains_key(&key) {
         return Err(NetstackError::ListenFailed(format!(
-            "port {port} already in use"
+            "port {port} already in use on {addr}"
         )));
     }
-    let endpoint = IpListenEndpoint::from((to_smoltcp_v4(addr), port));
+    let smol_addr = match addr {
+        IpAddr::V4(v4) => to_smoltcp_v4(v4),
+        IpAddr::V6(_) => {
+            return Err(NetstackError::ListenFailed("IPv6 not supported".into()));
+        }
+    };
+    let endpoint = IpListenEndpoint::from((smol_addr, port));
     let mut handles = Vec::with_capacity(LISTEN_BACKLOG);
     for _ in 0..LISTEN_BACKLOG {
         let mut socket = new_tcp_socket();
@@ -631,8 +702,24 @@ fn do_listen(
     }
 
     let (accept_tx, accept_rx) = mpsc::channel(ACCEPT_CHANNEL_DEPTH);
-    listeners.insert(port, ListenerEntry { handles, accept_tx });
+    listeners.insert(key, ListenerEntry { handles, accept_tx });
     Ok(accept_rx)
+}
+
+/// Add an additional IP address to the smoltcp interface.
+fn do_add_addr(iface: &mut Interface, addr: IpAddr) -> Result<(), NetstackError> {
+    match addr {
+        IpAddr::V4(v4) => {
+            iface.update_ip_addrs(|addrs| {
+                let cidr = IpCidr::new(to_smoltcp_v4(v4), 32);
+                if !addrs.contains(&cidr) {
+                    let _ = addrs.push(cidr);
+                }
+            });
+            Ok(())
+        }
+        IpAddr::V6(_) => Err(NetstackError::ListenFailed("IPv6 not supported".into())),
+    }
 }
 
 /// Initiate a dial to `remote`. Stores the reply sender in `pending_dials`;
@@ -759,7 +846,7 @@ fn pump_connection(
 fn cleanup_closed(
     sockets: &mut SocketSet<'static>,
     conns: &mut HashMap<SocketHandle, ConnState>,
-    listeners: &mut HashMap<u16, ListenerEntry>,
+    listeners: &mut HashMap<(IpAddr, u16), ListenerEntry>,
 ) {
     // Connections.
     let dead: Vec<SocketHandle> = conns
@@ -776,13 +863,13 @@ fn cleanup_closed(
     }
 
     // Listeners whose accept channel is closed.
-    let stale_ports: Vec<u16> = listeners
+    let stale_keys: Vec<(IpAddr, u16)> = listeners
         .iter()
         .filter(|(_, entry)| entry.accept_tx.is_closed())
-        .map(|(p, _)| *p)
+        .map(|(k, _)| *k)
         .collect();
-    for port in stale_ports {
-        if let Some(entry) = listeners.remove(&port) {
+    for key in stale_keys {
+        if let Some(entry) = listeners.remove(&key) {
             for handle in entry.handles {
                 let _ = sockets.remove(handle);
             }

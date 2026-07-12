@@ -62,6 +62,7 @@ rustscale-health = { path = "../health", version = "0.1.0" }
 rustscale-udprelay = { path = "../udprelay", version = "0.1.0" }
 rustscale-c2n = { path = "../c2n", version = "0.1.0" }
 rustscale-tcpinfo = { path = "../tcpinfo", version = "0.1.0" }
+rustscale-safesocket = { path = "../safesocket", version = "0.1.0" }
 rustscale-netns.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -84,3 +85,6 @@ libc.workspace = true
 tokio.workspace = true
 rustscale-key = { path = "../key", version = "0.1.0" }
 rustscale-tailcfg = { path = "../tailcfg", version = "0.1.0" }
+rustscale-testcontrol = { path = "../testcontrol", version = "0.1.0" }
+rustscale-safesocket = { path = "../safesocket", version = "0.1.0" }
+tempfile = "3"

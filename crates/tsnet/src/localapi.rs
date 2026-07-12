@@ -63,32 +63,20 @@ pub(crate) struct LocalApiHandle {
 
 /// Spawn the LocalAPI Unix-domain-socket server.
 ///
-/// Removes any stale socket file at `socket_path`, binds a fresh one, sets
-/// permissions to 0600, and spawns a background task serving HTTP/1.1.
+/// Delegates listener creation to [`rustscale_safesocket::listen`], which
+/// removes stale socket files, creates parent directories, and sets
+/// platform-appropriate permissions (0o666 on peer-credential platforms,
+/// 0o600 elsewhere). The listener is converted to non-blocking mode and
+/// a background task serves HTTP/1.1.
+///
 /// Returns `None` if the socket cannot be bound.
 pub(crate) fn spawn_localapi(
     state: Arc<LocalApiState>,
     socket_path: PathBuf,
 ) -> Option<LocalApiHandle> {
-    // Remove stale socket from a previous run.
-    let _ = std::fs::remove_file(&socket_path);
-
-    // Ensure parent directory exists.
-    if let Some(parent) = socket_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-
-    let listener = UnixListener::bind(&socket_path).ok()?;
-
-    // Set socket permissions to 0600 — only the owning user (or root) can
-    // connect. This is the sole auth mechanism, matching tailscaled's
-    // default local root/user model.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        let _ = std::fs::set_permissions(&socket_path, perms);
-    }
+    let std_listener = rustscale_safesocket::listen(&socket_path).ok()?;
+    let _ = std_listener.set_nonblocking(true);
+    let listener = UnixListener::from_std(std_listener).ok()?;
 
     let path = socket_path.clone();
     let task = tokio::spawn(async move {
@@ -1127,7 +1115,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn test_socket_permissions_are_0600() {
+    async fn test_socket_permissions_match_safesocket() {
         use std::os::unix::fs::PermissionsExt;
         let state = make_test_state().await;
         let tmp = std::env::temp_dir().join(format!(
@@ -1142,9 +1130,14 @@ mod tests {
             .expect("socket file exists")
             .permissions();
         let mode = perms.mode() & 0o777;
+        let expected = if rustscale_safesocket::platform_uses_peer_creds() {
+            0o666
+        } else {
+            0o600
+        };
         assert_eq!(
-            mode, 0o600,
-            "socket permissions should be 0600, got {mode:o}"
+            mode, expected,
+            "socket permissions should be {expected:o}, got {mode:o}"
         );
 
         // Clean up: abort the task and remove the socket.

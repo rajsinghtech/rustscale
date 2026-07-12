@@ -27,10 +27,13 @@ pub async fn run(
     let state_dir = statedir.unwrap_or_else(|| PathBuf::from(DEFAULT_STATE_DIR));
     let hostname = hostname.unwrap_or_else(|| "rustscale".to_string());
 
+    let socket_path = determine_socket_path(&state_dir);
+
     let mut server = Server::builder()
         .hostname(&hostname)
         .auth_key(&auth_key)
         .state_dir(&state_dir)
+        .localapi_path(&socket_path)
         .build()?;
 
     if tun {
@@ -53,7 +56,17 @@ pub async fn run(
         .collect();
     eprintln!("rustscaled: tailscale IPs: {}", ips.join(", "));
 
-    let _socket_task = start_safesocket_listener(&state_dir);
+    if server.localapi_path().is_some() {
+        eprintln!(
+            "rustscaled: LocalAPI listening at {}",
+            socket_path.display()
+        );
+    } else {
+        eprintln!(
+            "rustscaled: LocalAPI failed to bind {}",
+            socket_path.display()
+        );
+    }
 
     wait_for_shutdown().await;
 
@@ -63,58 +76,22 @@ pub async fn run(
     Ok(())
 }
 
-/// Bind the safesocket listener for CLI IPC. Tries `/var/run/rustscaled.sock`
-/// first, falling back to `<state_dir>/rustscaled.sock` if the primary path
-/// is not writable.
+/// Determine which socket path to use for the LocalAPI safesocket.
 ///
-/// Connections are accepted and dropped — a TODO placeholder for the
-/// LocalAPI implementation in a later phase.
-#[cfg(unix)]
-fn start_safesocket_listener(state_dir: &Path) -> Option<tokio::task::JoinHandle<()>> {
+/// Tries the primary path (`/var/run/rustscaled.sock`) first; if that is
+/// not writable, falls back to `<state_dir>/rustscaled.sock`.
+fn determine_socket_path(state_dir: &Path) -> PathBuf {
     let primary = PathBuf::from(PRIMARY_SOCKET_PATH);
     let fallback = state_dir.join("rustscaled.sock");
 
-    let (listener, path) = match rustscale_safesocket::listen(&primary) {
-        Ok(l) => (l, primary),
-        Err(e) => {
-            eprintln!(
-                "rustscaled: could not bind {}: {e}; falling back to {}",
-                primary.display(),
-                fallback.display()
-            );
-            match rustscale_safesocket::listen(&fallback) {
-                Ok(l) => (l, fallback),
-                Err(e2) => {
-                    eprintln!("rustscaled: could not bind {}: {e2}", fallback.display());
-                    return None;
-                }
-            }
+    match rustscale_safesocket::listen(&primary) {
+        Ok(listener) => {
+            drop(listener);
+            let _ = std::fs::remove_file(&primary);
+            primary
         }
-    };
-
-    eprintln!("rustscaled: safesocket listening at {}", path.display());
-
-    let _ = listener.set_nonblocking(true);
-    let listener = tokio::net::UnixListener::from_std(listener).ok()?;
-
-    Some(tokio::spawn(async move {
-        loop {
-            match listener.accept().await {
-                Ok((_stream, _addr)) => {
-                    // TODO: LocalAPI (a later phase)
-                }
-                Err(e) => {
-                    eprintln!("rustscaled: safesocket accept error: {e}");
-                    break;
-                }
-            }
-        }
-    }))
-}
-
-#[cfg(not(unix))]
-fn start_safesocket_listener(_state_dir: &Path) -> Option<()> {
-    None
+        Err(_) => fallback,
+    }
 }
 
 /// Wait for SIGINT or SIGTERM.

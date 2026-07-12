@@ -227,8 +227,7 @@ async fn http_get(url: &str, ep: &Endpoint) -> Result<HttpResponse, std::io::Err
 
     let now_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs());
 
     // Build the request.
     let mut req = format!(

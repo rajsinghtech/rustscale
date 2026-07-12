@@ -399,7 +399,7 @@ async fn test_monitor_detects_change_with_fake_provider() {
 fn test_time_jump_threshold_is_10_minutes() {
     assert_eq!(
         super::monitor::MAJOR_TIME_JUMP_THRESHOLD,
-        Duration::from_secs(10 * 60)
+        Duration::from_mins(10)
     );
 }
 

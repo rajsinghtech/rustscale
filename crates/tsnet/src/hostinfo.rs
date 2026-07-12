@@ -684,7 +684,7 @@ fn in_home_assistant(s: &EnvSnapshot) -> bool {
 
 #[allow(dead_code)]
 fn env_var_empty(key: &str) -> bool {
-    std::env::var(key).map(|v| v.is_empty()).unwrap_or(true)
+    std::env::var(key).map_or(true, |v| v.is_empty())
 }
 
 // ─── Desktop detection (Linux) ────────────────────────────────────────

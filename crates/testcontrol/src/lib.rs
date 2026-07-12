@@ -1032,7 +1032,7 @@ fn build_map_response(
             p.HomeDERP = 1;
         }
     }
-    peers.sort_by(|a, b| a.ID.cmp(&b.ID));
+    peers.sort_by_key(|p| p.ID);
 
     // Build user profiles.
     let user_profiles: Vec<UserProfile> = g

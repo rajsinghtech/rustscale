@@ -109,6 +109,10 @@ cloned_ref_to_slice_refs = "allow"
 uninlined_format_args = "allow"
 empty_line_after_doc_comments = "allow"
 drop_non_drop = "allow"
+# duration_suboptimal_units is new in clippy 1.97 and fires across many
+# crates on values like from_secs(60). Allow workspace-wide rather than
+# churning every Duration constructor; netmon's are fixed in-code.
+duration_suboptimal_units = "allow"
 
 [profile.release]
 lto = "thin"

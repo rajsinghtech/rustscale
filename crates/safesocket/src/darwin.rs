@@ -395,13 +395,11 @@ mod tests {
         let count = fs::read_dir(dir.path())
             .unwrap()
             .filter(|e| {
-                e.as_ref()
-                    .map(|e| {
-                        e.file_name()
-                            .to_string_lossy()
-                            .starts_with("sameuserproof-")
-                    })
-                    .unwrap_or(false)
+                e.as_ref().is_ok_and(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .starts_with("sameuserproof-")
+                })
             })
             .count();
         assert_eq!(count, 1, "should have exactly one proof file");
@@ -417,13 +415,11 @@ mod tests {
         let count = fs::read_dir(dir.path())
             .unwrap()
             .filter(|e| {
-                e.as_ref()
-                    .map(|e| {
-                        e.file_name()
-                            .to_string_lossy()
-                            .starts_with("sameuserproof-")
-                    })
-                    .unwrap_or(false)
+                e.as_ref().is_ok_and(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .starts_with("sameuserproof-")
+                })
             })
             .count();
         assert_eq!(count, 1, "old proof files should be removed");

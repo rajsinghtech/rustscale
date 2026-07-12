@@ -118,8 +118,7 @@ pub fn uninstall_system_daemon() -> Result<(), LaunchdError> {
     let running = std::process::Command::new("launchctl")
         .args(["list", SERVICE_LABEL])
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+        .is_ok_and(|o| o.status.success());
 
     if running {
         if let Err(e) = run_launchctl(&["stop", SERVICE_LABEL]) {
@@ -214,9 +213,7 @@ fn copy_binary(src: &Path, dst: &Path) -> io::Result<()> {
 
 /// Check if `path` is a symlink (mirrors Go's `isSymlink`).
 fn is_symlink(path: &Path) -> bool {
-    std::fs::symlink_metadata(path)
-        .map(|m| m.file_type().is_symlink())
-        .unwrap_or(false)
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
 }
 
 /// Check if two paths resolve to the same file (mirrors Go's `sameFile`).

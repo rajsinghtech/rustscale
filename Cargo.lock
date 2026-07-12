@@ -2252,6 +2252,7 @@ version = "0.1.0"
 dependencies = [
  "rustls",
  "rustscale-key",
+ "rustscale-neterror",
  "rustscale-tailcfg",
  "tempfile",
  "thiserror 1.0.69",
@@ -2409,11 +2410,13 @@ dependencies = [
  "bytes",
  "hex",
  "if-addrs",
+ "log",
  "rand 0.8.7",
  "rustscale-derp",
  "rustscale-disco",
  "rustscale-health",
  "rustscale-key",
+ "rustscale-neterror",
  "rustscale-portmapper",
  "rustscale-tailcfg",
  "rustscale-udprelay",
@@ -2491,6 +2494,7 @@ version = "0.1.0"
 dependencies = [
  "if-addrs",
  "rand 0.8.7",
+ "rustscale-neterror",
  "thiserror 1.0.69",
  "tokio",
 ]

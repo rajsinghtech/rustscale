@@ -54,6 +54,7 @@ use std::time::Duration;
 use rustscale_derp::DerpClient;
 use rustscale_disco::{CallMeMaybe, Message, Ping, Pong};
 use rustscale_key::{DiscoPrivate, DiscoPublic, NodePrivate, NodePublic};
+use rustscale_neterror::treat_as_lost_udp;
 use rustscale_tailcfg::{DERPMap, Node};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
@@ -928,7 +929,11 @@ impl Magicsock {
                     return self.send_via_derp(peer, derp_region, datagram).await;
                 }
                 if let Some(ref udp) = self.inner.udp {
-                    udp.send_to(datagram, addr).await?;
+                    if let Err(e) = udp.send_to(datagram, addr).await {
+                        if !treat_as_lost_udp(&e) {
+                            return Err(MagicsockError::Io(e));
+                        }
+                    }
                     return Ok(());
                 }
                 self.send_via_derp(peer, derp_region, datagram).await
@@ -939,7 +944,11 @@ impl Magicsock {
                 // by direct disco pinging.
                 if let Some(ref udp) = self.inner.udp {
                     let framed = relay::encode_geneve(vni, datagram);
-                    udp.send_to(&framed, addr).await?;
+                    if let Err(e) = udp.send_to(&framed, addr).await {
+                        if !treat_as_lost_udp(&e) {
+                            return Err(MagicsockError::Io(e));
+                        }
+                    }
                     return Ok(());
                 }
                 self.send_via_derp(peer, derp_region, datagram).await
@@ -1518,7 +1527,11 @@ impl relay_manager::RelayManagerContext for Inner {
             let udp = udp.clone();
             let framed = framed.clone();
             tokio::spawn(async move {
-                let _ = udp.send_to(&framed, addr).await;
+                if let Err(e) = udp.send_to(&framed, addr).await {
+                    if !treat_as_lost_udp(&e) {
+                        log::debug!("magicsock: disco UDP send failed: {e}");
+                    }
+                }
             });
         }
     }
@@ -1667,7 +1680,11 @@ impl Inner {
                             purpose
                         );
                     }
-                    let _ = udp.send_to(&packet, addr).await;
+                    if let Err(e) = udp.send_to(&packet, addr).await {
+                        if !treat_as_lost_udp(&e) {
+                            log::debug!("magicsock: disco ping send failed: {e}");
+                        }
+                    }
                 }
             }
         }
@@ -1935,7 +1952,11 @@ impl Inner {
                         if debug_enabled() {
                             eprintln!("DBG disco_pong send to {src} peer={}", short_key(&peer));
                         }
-                        let _ = udp.send_to(&reply, src).await;
+                        if let Err(e) = udp.send_to(&reply, src).await {
+                            if !treat_as_lost_udp(&e) {
+                                log::debug!("magicsock: disco pong send failed: {e}");
+                            }
+                        }
                     }
                 }
                 // Also record the addr→peer mapping so future WG packets

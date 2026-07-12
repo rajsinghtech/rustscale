@@ -16,6 +16,8 @@ use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
 
+use rustscale_neterror::treat_as_lost_udp;
+
 use crate::gateway::{likely_home_router_ip, GatewayInfo};
 use crate::pcp;
 use crate::pmp;
@@ -472,7 +474,7 @@ impl Client {
 
         // Try PMP/PCP first (faster, share port 5351).
         if have_recent_pmp || have_recent_pcp || !have_recent_upnp {
-            if let Some(m) = self
+            match self
                 .try_pxp_mapping(
                     &gi,
                     internal_addr,
@@ -484,7 +486,9 @@ impl Client {
                 )
                 .await
             {
-                return Ok(m);
+                Ok(Some(m)) => return Ok(m),
+                Ok(None) => {}
+                Err(e) => return Err(e),
             }
         }
 
@@ -509,8 +513,10 @@ impl Client {
         pxp_port: u16,
         have_recent_pmp: bool,
         have_recent_pcp: bool,
-    ) -> Option<Mapping> {
-        let sock = UdpSocket::bind("0.0.0.0:0").await.ok()?;
+    ) -> Result<Option<Mapping>, crate::PortMapError> {
+        let sock = UdpSocket::bind("0.0.0.0:0")
+            .await
+            .map_err(crate::PortMapError::Io)?;
         let pxp_addr = SocketAddr::V4(SocketAddrV4::new(gi.gateway, pxp_port));
 
         let prefer_pcp = have_recent_pcp && !have_recent_pmp;
@@ -529,15 +535,30 @@ impl Client {
                 crate::MAP_LIFETIME_SECS,
                 Ipv4Addr::UNSPECIFIED,
             );
-            let _ = sock.send_to(&pkt, pxp_addr).await;
+            if let Err(e) = sock.send_to(&pkt, pxp_addr).await {
+                if treat_as_lost_udp(&e) {
+                    return Err(crate::PortMapError::NoServices);
+                }
+                return Err(crate::PortMapError::Io(e));
+            }
         } else {
             // PMP: request external address first if not cached.
             if cached_pub_ip.is_none() {
                 let req = pmp::build_external_addr_request();
-                let _ = sock.send_to(&req, pxp_addr).await;
+                if let Err(e) = sock.send_to(&req, pxp_addr).await {
+                    if treat_as_lost_udp(&e) {
+                        return Err(crate::PortMapError::NoServices);
+                    }
+                    return Err(crate::PortMapError::Io(e));
+                }
             }
             let pkt = pmp::build_map_request(local_port, prev_port, crate::MAP_LIFETIME_SECS);
-            let _ = sock.send_to(&pkt, pxp_addr).await;
+            if let Err(e) = sock.send_to(&pkt, pxp_addr).await {
+                if treat_as_lost_udp(&e) {
+                    return Err(crate::PortMapError::NoServices);
+                }
+                return Err(crate::PortMapError::Io(e));
+            }
         }
 
         let deadline = Instant::now() + crate::PROBE_TIMEOUT * 4;
@@ -568,15 +589,15 @@ impl Client {
                             };
                             let mut state = self.inner.state.lock().expect("state lock");
                             state.mapping = Some(mapping.clone());
-                            return Some(mapping);
+                            return Ok(Some(mapping));
                         }
-                        return None;
+                        return Ok(None);
                     }
 
                     // PMP response.
                     if let Some(pmp_resp) = pmp::parse_response(pkt) {
                         if pmp_resp.result_code != 0 {
-                            return None;
+                            return Ok(None);
                         }
                         if pmp_resp.op_code == pmp::PMP_OP_REPLY | pmp::PMP_OP_MAP_PUBLIC_ADDR {
                             pmp_pub_ip = pmp_resp.public_addr;
@@ -602,13 +623,13 @@ impl Client {
                         state.pmp_pub_ip = Some(pub_ip);
                         state.pmp_pub_ip_time = Some(now);
                         state.mapping = Some(mapping.clone());
-                        return Some(mapping);
+                        return Ok(Some(mapping));
                     }
                 }
                 _ => break,
             }
         }
-        None
+        Ok(None)
     }
 
     /// Try to create a mapping via UPnP.

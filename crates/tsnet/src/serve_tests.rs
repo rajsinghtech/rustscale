@@ -597,3 +597,69 @@ fn clean_path_resolves_dots() {
     assert_eq!(clean_path(""), "/");
     assert_eq!(clean_path("/foo/bar/"), "/foo/bar");
 }
+
+// ---------------------------------------------------------------------------
+// ETag and persistence
+// ---------------------------------------------------------------------------
+
+#[test]
+fn serve_config_etag_is_deterministic() {
+    let cfg = ServeConfig::default();
+    let etag1 = cfg.etag();
+    let etag2 = cfg.etag();
+    assert_eq!(etag1, etag2, "ETag should be deterministic for same config");
+    assert!(!etag1.is_empty(), "ETag should not be empty");
+    assert_eq!(etag1.len(), 64, "ETag should be 32-byte hex (64 chars)");
+}
+
+#[test]
+fn serve_config_etag_differs_for_different_configs() {
+    let cfg1 = ServeConfig::default();
+    let mut cfg2 = ServeConfig::default();
+    cfg2.TCP.insert(
+        443,
+        TCPPortHandler {
+            HTTPS: true,
+            ..Default::default()
+        },
+    );
+    assert_ne!(cfg1.etag(), cfg2.etag());
+}
+
+#[test]
+fn serve_config_persist_and_reload() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = ServeConfig::default();
+    cfg.TCP.insert(
+        8080,
+        TCPPortHandler {
+            TCPForward: "127.0.0.1:3000".into(),
+            ..Default::default()
+        },
+    );
+    cfg.save(tmp.path()).unwrap();
+    let loaded = ServeConfig::load(tmp.path()).unwrap();
+    assert_eq!(loaded.TCP.len(), 1);
+    assert_eq!(loaded.TCP[&8080].TCPForward, "127.0.0.1:3000");
+}
+
+#[test]
+fn serve_config_load_returns_default_when_no_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let loaded = ServeConfig::load(tmp.path()).unwrap();
+    assert!(loaded.is_empty());
+}
+
+#[test]
+fn serve_config_is_empty_check() {
+    assert!(ServeConfig::default().is_empty());
+    let mut cfg = ServeConfig::default();
+    cfg.TCP.insert(
+        80,
+        TCPPortHandler {
+            HTTP: true,
+            ..Default::default()
+        },
+    );
+    assert!(!cfg.is_empty());
+}

@@ -28,8 +28,8 @@ use std::sync::Arc;
 
 use rustscale_health::{Severity, Tracker};
 use rustscale_ipn::{
-    validate_notify_watch_opt, IpnBackend, MaskedPrefs, NotifyWatchOpt, Prefs, StartOptions,
-    NOTIFY_IN_PROCESS_NO_DISCONNECT,
+    validate_notify_watch_opt, IpnBackend, LoginProfile, MaskedPrefs, NotifyWatchOpt, Prefs,
+    StartOptions, NOTIFY_IN_PROCESS_NO_DISCONNECT,
 };
 use rustscale_magicsock::{Magicsock, PathClass};
 use rustscale_tailcfg::{DERPMap, DNSConfig, Node, UserID, UserProfile};
@@ -37,6 +37,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UnixListener;
 use tokio::sync::{mpsc, RwLock};
 use tokio::task::JoinHandle;
+
+use crate::serve::ServeConfig;
 
 const API_PREFIX: &str = "/localapi/v0/";
 
@@ -72,6 +74,15 @@ pub(crate) struct LocalApiState {
     #[allow(dead_code)]
     pub auth_url: Arc<std::sync::Mutex<Option<String>>>,
     pub login_trigger: Arc<tokio::sync::Notify>,
+    /// Serve config (shared with ServeRunner). The LocalAPI serve-config
+    /// endpoint reads/writes this, computing ETags from the canonical JSON.
+    pub serve_config: Arc<RwLock<ServeConfig>>,
+    /// The serve runner (None in TUN mode or before `up()`).
+    pub serve_runner: Option<Arc<crate::serve::ServeRunner>>,
+    /// Login profiles list (shared state for the profiles endpoints).
+    pub profiles: Arc<RwLock<Vec<LoginProfile>>>,
+    /// Current profile ID (shared state for the profiles endpoints).
+    pub current_profile: Arc<RwLock<Option<String>>>,
 }
 
 pub struct LocalApiHandle {
@@ -433,6 +444,8 @@ async fn dispatch<W: AsyncWrite + Unpin>(
                     "/localapi/v0/start",
                     "/localapi/v0/login-interactive",
                     "/localapi/v0/logout",
+                    "/localapi/v0/serve-config",
+                    "/localapi/v0/profiles",
                 ]);
                 write_json_response(conn, 200, "OK", &endpoints).await?;
             } else {
@@ -523,7 +536,29 @@ async fn dispatch<W: AsyncWrite + Unpin>(
             handle_watch_ipn_bus(conn, &req.query, state).await?;
         }
 
+        // --- GET/POST /localapi/v0/serve-config ---
+        "serve-config" if method == "GET" => {
+            handle_get_serve_config(conn, state).await?;
+        }
+        "serve-config" if method == "POST" => {
+            handle_post_serve_config(conn, req, state).await?;
+        }
+
+        // --- GET /localapi/v0/profiles ---
+        "profiles" if method == "GET" => {
+            handle_list_profiles(conn, state).await?;
+        }
+        // --- PUT /localapi/v0/profiles ---
+        "profiles" if method == "PUT" => {
+            handle_new_profile(conn, state).await?;
+        }
+
         _ => {
+            // Check for profiles/<id> or profiles/current sub-paths.
+            if let Some(suffix) = endpoint.strip_prefix("profiles/") {
+                handle_profile_subpath(conn, method, suffix, state).await?;
+                return Ok(());
+            }
             let body = serde_json::json!({
                 "error": "not found",
                 "path": path,
@@ -1065,12 +1100,270 @@ pub(crate) fn default_socket_path(state_dir: &std::path::Path) -> PathBuf {
 }
 
 // ---------------------------------------------------------------------------
+// Serve config handler (GET/POST /localapi/v0/serve-config)
+// ---------------------------------------------------------------------------
+
+/// Write a JSON response with an ETag header.
+async fn write_json_with_etag<W: AsyncWrite + Unpin>(
+    conn: &mut W,
+    status: u16,
+    reason: &str,
+    etag: &str,
+    body: &[u8],
+) -> Result<(), std::io::Error> {
+    let header = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n\
+         ETag: \"{etag}\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    conn.write_all(header.as_bytes()).await?;
+    conn.write_all(body).await?;
+    conn.flush().await?;
+    Ok(())
+}
+
+/// Handle GET /localapi/v0/serve-config — returns the current serve config
+/// with an ETag header (SHA-256 of canonical JSON).
+async fn handle_get_serve_config<W: AsyncWrite + Unpin>(
+    conn: &mut W,
+    state: &Arc<LocalApiState>,
+) -> Result<(), std::io::Error> {
+    let cfg = state.serve_config.read().await.clone();
+    let etag = cfg.etag();
+    let body = serde_json::to_vec(&cfg).unwrap_or_default();
+    write_json_with_etag(conn, 200, "OK", &etag, &body).await
+}
+
+/// Handle POST /localapi/v0/serve-config — requires If-Match header when
+/// a config exists, returns 412 on mismatch. Applies via the serve runner
+/// and persists to `<state_dir>/serve-config.json`.
+async fn handle_post_serve_config<W: AsyncWrite + Unpin>(
+    conn: &mut W,
+    req: &HttpRequest,
+    state: &Arc<LocalApiState>,
+) -> Result<(), std::io::Error> {
+    // Parse the incoming config.
+    let cfg_in: ServeConfig = match serde_json::from_slice(&req.body) {
+        Ok(c) => c,
+        Err(e) => {
+            let err = serde_json::json!({"error": format!("bad serve config: {e}")});
+            write_json_response(conn, 400, "Bad Request", &err).await?;
+            return Ok(());
+        }
+    };
+
+    // Extract If-Match header.
+    let if_match = req
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("if-match"))
+        .map(|(_, v)| v.trim_matches('"').to_string())
+        .unwrap_or_default();
+
+    // Check ETag if If-Match is present.
+    let current_cfg = state.serve_config.read().await.clone();
+    let current_etag = current_cfg.etag();
+    if !if_match.is_empty() && if_match != current_etag {
+        let body = serde_json::json!({"error": "etag mismatch"});
+        let body_bytes = serde_json::to_vec(&body).unwrap_or_default();
+        let header = format!(
+            "HTTP/1.1 412 Precondition Failed\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n",
+            body_bytes.len()
+        );
+        conn.write_all(header.as_bytes()).await?;
+        conn.write_all(&body_bytes).await?;
+        conn.flush().await?;
+        return Ok(());
+    }
+
+    // Apply the config via the serve runner (if available).
+    if let Some(ref runner) = state.serve_runner {
+        if let Err(e) = runner.set_config(cfg_in.clone(), None).await {
+            let err = serde_json::json!({"error": format!("serve apply failed: {e}")});
+            write_json_response(conn, 500, "Internal Server Error", &err).await?;
+            return Ok(());
+        }
+    }
+
+    // Update the shared config state.
+    *state.serve_config.write().await = cfg_in.clone();
+
+    // Persist to disk.
+    if let Some(ref dir) = state.state_dir {
+        if let Err(e) = cfg_in.save(dir) {
+            eprintln!("localapi: serve-config persist failed: {e}");
+        }
+    }
+
+    // Return 200 with the new ETag.
+    let new_etag = cfg_in.etag();
+    let body = serde_json::to_vec(&cfg_in).unwrap_or_default();
+    write_json_with_etag(conn, 200, "OK", &new_etag, &body).await
+}
+
+// ---------------------------------------------------------------------------
+// Profiles handlers
+// ---------------------------------------------------------------------------
+
+/// Handle GET /localapi/v0/profiles — list all profiles.
+async fn handle_list_profiles<W: AsyncWrite + Unpin>(
+    conn: &mut W,
+    state: &Arc<LocalApiState>,
+) -> Result<(), std::io::Error> {
+    let profiles = state.profiles.read().await;
+    let json = serde_json::to_value(&*profiles).unwrap_or(serde_json::json!([]));
+    write_json_response(conn, 200, "OK", &json).await
+}
+
+/// Handle PUT /localapi/v0/profiles — create a new empty profile and
+/// switch to it.
+async fn handle_new_profile<W: AsyncWrite + Unpin>(
+    conn: &mut W,
+    state: &Arc<LocalApiState>,
+) -> Result<(), std::io::Error> {
+    let id = LoginProfile::new_id();
+    let profile = LoginProfile {
+        ID: id.clone(),
+        Key: format!("profile-{id}"),
+        ..Default::default()
+    };
+
+    {
+        let mut profiles = state.profiles.write().await;
+        profiles.push(profile);
+        if let Some(ref dir) = state.state_dir {
+            let _ = LoginProfile::save_all(dir, &profiles);
+        }
+    }
+
+    // Switch to the new profile.
+    {
+        let mut current = state.current_profile.write().await;
+        *current = Some(id.clone());
+        if let Some(ref dir) = state.state_dir {
+            let _ = LoginProfile::save_current_id(dir, &id);
+        }
+    }
+
+    write_no_content_response(conn, 201, "Created").await?;
+    Ok(())
+}
+
+/// Handle profile sub-paths: profiles/current, profiles/<id>.
+async fn handle_profile_subpath<W: AsyncWrite + Unpin>(
+    conn: &mut W,
+    method: &str,
+    suffix: &str,
+    state: &Arc<LocalApiState>,
+) -> Result<(), std::io::Error> {
+    let suffix = suffix.trim_end_matches('/');
+
+    if suffix == "current" {
+        if method != "GET" {
+            let body = serde_json::json!({"error": "use GET"});
+            write_json_response(conn, 405, "Method Not Allowed", &body).await?;
+            return Ok(());
+        }
+        let current_id = state.current_profile.read().await.clone();
+        let profiles = state.profiles.read().await;
+        let current = current_id
+            .and_then(|id| profiles.iter().find(|p| p.ID == id).cloned())
+            .unwrap_or_default();
+        let json = serde_json::to_value(&current).unwrap_or(serde_json::json!({}));
+        write_json_response(conn, 200, "OK", &json).await?;
+        return Ok(());
+    }
+
+    // profiles/<id>
+    let profile_id = suffix.to_string();
+    match method {
+        "GET" => {
+            let profiles = state.profiles.read().await;
+            if let Some(p) = profiles.iter().find(|p| p.ID == profile_id) {
+                let json = serde_json::to_value(p).unwrap_or(serde_json::json!({}));
+                write_json_response(conn, 200, "OK", &json).await?;
+            } else {
+                let body = serde_json::json!({"error": "profile not found"});
+                write_json_response(conn, 404, "Not Found", &body).await?;
+            }
+        }
+        "POST" => {
+            // Switch to the profile.
+            let profiles = state.profiles.read().await;
+            if !profiles.iter().any(|p| p.ID == profile_id) {
+                let body = serde_json::json!({"error": "profile not found"});
+                write_json_response(conn, 404, "Not Found", &body).await?;
+                return Ok(());
+            }
+            drop(profiles);
+
+            {
+                let mut current = state.current_profile.write().await;
+                *current = Some(profile_id.clone());
+                if let Some(ref dir) = state.state_dir {
+                    let _ = LoginProfile::save_current_id(dir, &profile_id);
+                }
+            }
+
+            // Update prefs from the profile's ControlURL if set.
+            let profiles = state.profiles.read().await;
+            if let Some(p) = profiles.iter().find(|p| p.ID == profile_id) {
+                if !p.ControlURL.is_empty() {
+                    let mut prefs = state.prefs.write().await;
+                    p.ControlURL.clone_into(&mut prefs.ControlURL);
+                    if let Some(ref dir) = state.state_dir {
+                        let _ = prefs.save(dir);
+                    }
+                }
+            }
+
+            write_no_content_response(conn, 204, "No Content").await?;
+        }
+        "DELETE" => {
+            let mut profiles = state.profiles.write().await;
+            let len_before = profiles.len();
+            profiles.retain(|p| p.ID != profile_id);
+            if profiles.len() == len_before {
+                let body = serde_json::json!({"error": "profile not found"});
+                write_json_response(conn, 404, "Not Found", &body).await?;
+                return Ok(());
+            }
+            if let Some(ref dir) = state.state_dir {
+                let _ = LoginProfile::save_all(dir, &profiles);
+            }
+
+            // If we deleted the current profile, clear or pick a new one.
+            let mut current = state.current_profile.write().await;
+            if current.as_deref() == Some(profile_id.as_str()) {
+                *current = profiles.first().map(|p| p.ID.clone());
+                if let Some(ref dir) = state.state_dir {
+                    if let Some(ref id) = *current {
+                        let _ = LoginProfile::save_current_id(dir, id);
+                    }
+                }
+            }
+            drop(current);
+            drop(profiles);
+
+            write_no_content_response(conn, 204, "No Content").await?;
+        }
+        _ => {
+            let body = serde_json::json!({"error": "use GET, POST, or DELETE"});
+            write_json_response(conn, 405, "Method Not Allowed", &body).await?;
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TCPPortHandler;
     use rustscale_key::{DiscoPrivate, NodePrivate};
     use rustscale_magicsock::{Magicsock, MagicsockConfig};
     use rustscale_tailcfg::{Node, UserProfile};
@@ -1157,6 +1450,10 @@ mod tests {
             state_dir: None,
             auth_url: Arc::new(std::sync::Mutex::new(None)),
             login_trigger: Arc::new(tokio::sync::Notify::new()),
+            serve_config: Arc::new(RwLock::new(ServeConfig::default())),
+            serve_runner: None,
+            profiles: Arc::new(RwLock::new(vec![])),
+            current_profile: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -1215,6 +1512,25 @@ mod tests {
         // Close the write half so the server sees EOF.
         client.shutdown().await.ok();
 
+        let mut buf = vec![0u8; 8192];
+        let n = tokio::io::AsyncReadExt::read(&mut server, &mut buf)
+            .await
+            .unwrap_or(0);
+        if n > 0 {
+            let req_raw = &buf[..n];
+            // Split header/body at \r\n\r\n for proper body extraction.
+            let body_preview = if let Some(pos) = req_raw.windows(4).position(|w| w == b"\r\n\r\n")
+            {
+                req_raw[pos + 4..].to_vec()
+            } else {
+                Vec::new()
+            };
+            if let Ok(req) = parse_request_head(req_raw, body_preview) {
+                dispatch(&mut server, &req, state).await.ok();
+            }
+        }
+        tokio::io::AsyncWriteExt::shutdown(&mut server).await.ok();
+
         let mut buf = Vec::new();
         // Read the response on the client side.
         let read_task = tokio::spawn(async move {
@@ -1222,21 +1538,6 @@ mod tests {
             client.read_to_end(&mut buf).await.ok();
             String::from_utf8(buf).unwrap_or_default()
         });
-
-        // Handle the request on the server side.
-        // We need to parse the request from the server side of the duplex.
-        let mut server_buf = vec![0u8; 8192];
-        let n = tokio::io::AsyncReadExt::read(&mut server, &mut server_buf)
-            .await
-            .unwrap_or(0);
-        if n > 0 {
-            let req_raw = &server_buf[..n];
-            // Parse and dispatch.
-            if let Ok(req) = parse_request_head(req_raw, Vec::new()) {
-                dispatch(&mut server, &req, state).await.ok();
-            }
-        }
-        tokio::io::AsyncWriteExt::shutdown(&mut server).await.ok();
 
         read_task.await.unwrap_or_default()
     }
@@ -1737,5 +2038,302 @@ mod tests {
 
         let json = build_status_json(&state).await;
         assert_eq!(json["BackendState"], "NeedsLogin");
+    }
+
+    // --- Serve config tests ---
+
+    #[tokio::test]
+    async fn test_get_serve_config_returns_etag() {
+        let state = make_test_state().await;
+        let resp = send_request_to_state(
+            b"GET /localapi/v0/serve-config HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            &state,
+        )
+        .await;
+        assert!(resp.contains("200 OK"), "response: {resp}");
+        assert!(resp.contains("ETag:"), "missing ETag header");
+        // Empty config should serialize as {}.
+        let body = resp.split("\r\n\r\n").nth(1).unwrap_or("");
+        assert!(body.contains("{}"), "body should be empty config: {body}");
+    }
+
+    #[tokio::test]
+    async fn test_post_serve_config_no_if_match_succeeds() {
+        let state = make_test_state().await;
+        let config =
+            r#"{"TCP":{"8080":{"HTTP":true,"HTTPS":false,"TCPForward":"","TerminateTLS":""}}}"#;
+        let req = format!(
+            "POST /localapi/v0/serve-config HTTP/1.1\r\nHost: localhost\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+            config.len(),
+            config
+        );
+        let resp = send_request_to_state(req.as_bytes(), &state).await;
+        assert!(resp.contains("200 OK"), "response: {resp}");
+        // Verify the config was applied to shared state.
+        let cfg = state.serve_config.read().await;
+        assert!(cfg.TCP.contains_key(&8080));
+    }
+
+    #[tokio::test]
+    async fn test_post_serve_config_etag_mismatch_returns_412() {
+        let state = make_test_state().await;
+
+        // Set an initial config.
+        let config = r#"{"TCP":{"8080":{"HTTP":true}}}"#;
+        let req = format!(
+            "POST /localapi/v0/serve-config HTTP/1.1\r\nHost: localhost\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+            config.len(),
+            config
+        );
+        let _ = send_request_to_state(req.as_bytes(), &state).await;
+
+        // Now try to update with a wrong ETag.
+        let config2 = r#"{"TCP":{"9090":{"HTTP":true}}}"#;
+        let req2 = format!(
+            "POST /localapi/v0/serve-config HTTP/1.1\r\nHost: localhost\r\n\
+             If-Match: \"wrong-etag\"\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+            config2.len(),
+            config2
+        );
+        let resp = send_request_to_state(req2.as_bytes(), &state).await;
+        assert!(resp.contains("412 Precondition Failed"), "response: {resp}");
+        assert!(resp.contains("etag mismatch"));
+    }
+
+    #[tokio::test]
+    async fn test_post_serve_config_correct_etag_succeeds() {
+        let state = make_test_state().await;
+
+        // Get the initial config + ETag.
+        let resp = send_request_to_state(
+            b"GET /localapi/v0/serve-config HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            &state,
+        )
+        .await;
+        // Extract the ETag from the response.
+        let etag = resp
+            .split("ETag: \"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .unwrap_or_default();
+
+        // Post with the correct ETag.
+        let config = r#"{"TCP":{"8080":{"HTTP":true}}}"#;
+        let req = format!(
+            "POST /localapi/v0/serve-config HTTP/1.1\r\nHost: localhost\r\n\
+             If-Match: \"{}\"\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+            etag,
+            config.len(),
+            config
+        );
+        let resp = send_request_to_state(req.as_bytes(), &state).await;
+        assert!(resp.contains("200 OK"), "response: {resp}");
+    }
+
+    #[tokio::test]
+    async fn test_post_serve_config_persists_to_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = make_test_state().await;
+        // Set the state_dir so the handler persists.
+        // We need to modify the state — but it's Arc. So instead, create
+        // a state with state_dir set.
+        let state2 = Arc::new(LocalApiState {
+            peers: state.peers.clone(),
+            user_profiles: state.user_profiles.clone(),
+            health: state.health.clone(),
+            dns_config: state.dns_config.clone(),
+            packet_drops: state.packet_drops.clone(),
+            prefs: state.prefs.clone(),
+            tailscale_ips: state.tailscale_ips.clone(),
+            our_fqdn: state.our_fqdn.clone(),
+            hostname: state.hostname.clone(),
+            magicsock: state.magicsock.clone(),
+            tun_mode: state.tun_mode,
+            home_derp: state.home_derp,
+            ipn_backend: state.ipn_backend.clone(),
+            derp_map: state.derp_map.clone(),
+            command_tx: None,
+            state_dir: Some(tmp.path().to_path_buf()),
+            auth_url: state.auth_url.clone(),
+            login_trigger: state.login_trigger.clone(),
+            serve_config: Arc::new(RwLock::new(ServeConfig::default())),
+            serve_runner: None,
+            profiles: Arc::new(RwLock::new(vec![])),
+            current_profile: Arc::new(RwLock::new(None)),
+        });
+
+        let config = r#"{"TCP":{"8080":{"HTTP":true}}}"#;
+        let req = format!(
+            "POST /localapi/v0/serve-config HTTP/1.1\r\nHost: localhost\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+            config.len(),
+            config
+        );
+        let resp = send_request_to_state(req.as_bytes(), &state2).await;
+        assert!(resp.contains("200 OK"), "response: {resp}");
+
+        // Verify the file was written.
+        let serve_config_path = tmp.path().join("serve-config.json");
+        assert!(serve_config_path.exists(), "serve-config.json should exist");
+        let data = std::fs::read_to_string(&serve_config_path).unwrap();
+        assert!(
+            data.contains("8080"),
+            "file should contain port 8080: {data}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_serve_config_loads_from_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = ServeConfig {
+            TCP: {
+                let mut m = BTreeMap::new();
+                m.insert(
+                    443,
+                    TCPPortHandler {
+                        HTTPS: true,
+                        ..Default::default()
+                    },
+                );
+                m
+            },
+            ..Default::default()
+        };
+        cfg.save(tmp.path()).unwrap();
+
+        let loaded = ServeConfig::load(tmp.path()).unwrap();
+        assert!(loaded.TCP.contains_key(&443));
+        assert!(loaded.TCP[&443].HTTPS);
+    }
+
+    #[tokio::test]
+    async fn test_serve_config_etag_changes_on_modification() {
+        let cfg1 = ServeConfig::default();
+        let etag1 = cfg1.etag();
+
+        let mut cfg2 = ServeConfig::default();
+        cfg2.TCP.insert(
+            8080,
+            TCPPortHandler {
+                HTTP: true,
+                ..Default::default()
+            },
+        );
+        let etag2 = cfg2.etag();
+
+        assert_ne!(etag1, etag2, "ETags should differ for different configs");
+    }
+
+    // --- Profile tests ---
+
+    #[tokio::test]
+    async fn test_list_profiles_returns_empty() {
+        let state = make_test_state().await;
+        let resp = send_request_to_state(
+            b"GET /localapi/v0/profiles HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            &state,
+        )
+        .await;
+        assert!(resp.contains("200 OK"), "response: {resp}");
+        let body = resp.split("\r\n\r\n").nth(1).unwrap_or("");
+        assert!(body.trim() == "[]", "expected empty array, got: {body}");
+    }
+
+    #[tokio::test]
+    async fn test_put_profiles_creates_new() {
+        let state = make_test_state().await;
+        let resp = send_request_to_state(
+            b"PUT /localapi/v0/profiles HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            &state,
+        )
+        .await;
+        assert!(resp.contains("201 Created"), "response: {resp}");
+        // Verify the profile was added to state.
+        let profiles = state.profiles.read().await;
+        assert_eq!(profiles.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_profile_switch_and_current() {
+        let state = make_test_state().await;
+
+        // Create two profiles.
+        let _ = send_request_to_state(
+            b"PUT /localapi/v0/profiles HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            &state,
+        ).await;
+        let _ = send_request_to_state(
+            b"PUT /localapi/v0/profiles HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            &state,
+        ).await;
+
+        let profiles = state.profiles.read().await;
+        assert_eq!(profiles.len(), 2);
+        let first_id = profiles[0].ID.clone();
+        let second_id = profiles[1].ID.clone();
+        drop(profiles);
+
+        // Current should be the second (last created).
+        let resp = send_request_to_state(
+            b"GET /localapi/v0/profiles/current HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            &state,
+        ).await;
+        assert!(resp.contains("200 OK"), "response: {resp}");
+        assert!(
+            resp.contains(&second_id),
+            "current should be second profile"
+        );
+
+        // Switch to the first.
+        let switch_path = format!(
+            "POST /localapi/v0/profiles/{} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            first_id
+        );
+        let resp = send_request_to_state(switch_path.as_bytes(), &state).await;
+        assert!(resp.contains("204"), "response: {resp}");
+
+        // Current should now be first.
+        let current = state.current_profile.read().await;
+        assert_eq!(*current, Some(first_id.clone()));
+    }
+
+    #[tokio::test]
+    async fn test_delete_profile() {
+        let state = make_test_state().await;
+
+        // Create a profile.
+        let _ = send_request_to_state(
+            b"PUT /localapi/v0/profiles HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            &state,
+        ).await;
+
+        let profiles = state.profiles.read().await;
+        let id = profiles[0].ID.clone();
+        drop(profiles);
+
+        // Delete it.
+        let delete_path = format!(
+            "DELETE /localapi/v0/profiles/{} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            id
+        );
+        let resp = send_request_to_state(delete_path.as_bytes(), &state).await;
+        assert!(resp.contains("204"), "response: {resp}");
+
+        let profiles = state.profiles.read().await;
+        assert!(profiles.is_empty(), "profile should be deleted");
+    }
+
+    #[tokio::test]
+    async fn test_get_profile_not_found() {
+        let state = make_test_state().await;
+        let resp = send_request_to_state(
+            b"GET /localapi/v0/profiles/nonexistent HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            &state,
+        ).await;
+        assert!(resp.contains("404 Not Found"), "response: {resp}");
     }
 }

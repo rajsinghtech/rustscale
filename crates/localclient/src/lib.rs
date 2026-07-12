@@ -30,8 +30,9 @@ pub use stream::WatchIpnBus;
 
 use std::path::PathBuf;
 
-use rustscale_ipn::{MaskedPrefs, NotifyWatchOpt, Prefs, StartOptions};
+use rustscale_ipn::{LoginProfile, MaskedPrefs, NotifyWatchOpt, Prefs, StartOptions};
 use rustscale_tailcfg::DERPMap;
+use rustscale_tsnet::ServeConfig;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
@@ -89,7 +90,7 @@ impl LocalClient {
 
     /// GET /localapi/v0/metrics — returns raw Prometheus text.
     pub async fn metrics(&self) -> Result<String, LocalClientError> {
-        let body = self.get_raw("/localapi/v0/metrics").await?;
+        let body = self.get_raw_str("/localapi/v0/metrics").await?;
         Ok(body)
     }
 
@@ -196,6 +197,88 @@ impl LocalClient {
     }
 
     // -----------------------------------------------------------------------
+    // Serve config API
+    // -----------------------------------------------------------------------
+
+    /// GET /localapi/v0/serve-config — returns the current serve config
+    /// and its ETag. If no config is set, returns an empty ServeConfig.
+    pub async fn get_serve_config(&self) -> Result<(ServeConfig, String), LocalClientError> {
+        let raw_resp = self
+            .send_request_raw("GET", "/localapi/v0/serve-config", &[], &[])
+            .await?;
+        let cfg: ServeConfig = serde_json::from_slice(&raw_resp.body)
+            .map_err(|e| LocalClientError::Json(e.to_string()))?;
+        Ok((cfg, raw_resp.etag))
+    }
+
+    /// POST /localapi/v0/serve-config — sets the serve config. If `etag`
+    /// is non-empty, sends it as the If-Match header for optimistic
+    /// concurrency control. Returns `PreconditionsFailed` on 412.
+    pub async fn set_serve_config(
+        &self,
+        config: &ServeConfig,
+        etag: &str,
+    ) -> Result<(), LocalClientError> {
+        let body = serde_json::to_vec(config).map_err(|e| LocalClientError::Json(e.to_string()))?;
+        let extra_headers = if etag.is_empty() {
+            vec![]
+        } else {
+            vec![("If-Match".to_string(), format!("\"{etag}\""))]
+        };
+        let (_status, _) = self
+            .send_request_with_headers("POST", "/localapi/v0/serve-config", &body, &extra_headers)
+            .await?;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Profiles API
+    // -----------------------------------------------------------------------
+
+    /// GET /localapi/v0/profiles — returns all login profiles.
+    pub async fn list_profiles(&self) -> Result<Vec<LoginProfile>, LocalClientError> {
+        let (_status, body) = self
+            .send_request("GET", "/localapi/v0/profiles", &[])
+            .await?;
+        let profiles: Vec<LoginProfile> =
+            serde_json::from_slice(&body).map_err(|e| LocalClientError::Json(e.to_string()))?;
+        Ok(profiles)
+    }
+
+    /// GET /localapi/v0/profiles/current — returns the current profile.
+    pub async fn current_profile(&self) -> Result<LoginProfile, LocalClientError> {
+        let (_status, body) = self
+            .send_request("GET", "/localapi/v0/profiles/current", &[])
+            .await?;
+        let profile: LoginProfile =
+            serde_json::from_slice(&body).map_err(|e| LocalClientError::Json(e.to_string()))?;
+        Ok(profile)
+    }
+
+    /// PUT /localapi/v0/profiles — creates a new empty profile and
+    /// switches to it.
+    pub async fn new_profile(&self) -> Result<(), LocalClientError> {
+        let (_status, _) = self
+            .send_request_with_body("PUT", "/localapi/v0/profiles", &[])
+            .await?;
+        Ok(())
+    }
+
+    /// POST /localapi/v0/profiles/<id> — switches to the given profile.
+    pub async fn switch_profile(&self, profile_id: &str) -> Result<(), LocalClientError> {
+        let path = format!("/localapi/v0/profiles/{}", url_encode(profile_id));
+        let (_status, _) = self.send_request_with_body("POST", &path, &[]).await?;
+        Ok(())
+    }
+
+    /// DELETE /localapi/v0/profiles/<id> — deletes the given profile.
+    pub async fn delete_profile(&self, profile_id: &str) -> Result<(), LocalClientError> {
+        let path = format!("/localapi/v0/profiles/{}", url_encode(profile_id));
+        let (_status, _) = self.send_request_with_body("DELETE", &path, &[]).await?;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
     // Internal HTTP plumbing
     // -----------------------------------------------------------------------
 
@@ -207,43 +290,62 @@ impl LocalClient {
         path: &str,
         body: &[u8],
     ) -> Result<(u16, Vec<u8>), LocalClientError> {
+        self.send_request_with_headers(method, path, body, &[])
+            .await
+    }
+
+    /// Send an HTTP request with a body and extra headers, read the full
+    /// response, check the status code, and return (status_code, body_bytes).
+    async fn send_request_with_headers(
+        &self,
+        method: &str,
+        path: &str,
+        body: &[u8],
+        extra_headers: &[(String, String)],
+    ) -> Result<(u16, Vec<u8>), LocalClientError> {
+        let raw = self
+            .send_request_raw(method, path, body, extra_headers)
+            .await?;
+        Ok((raw.status, raw.body))
+    }
+
+    /// Send an HTTP request with a body and extra headers, read the full
+    /// response (including parsed ETag header), without checking the status
+    /// code (the caller handles status checking).
+    async fn send_request_raw(
+        &self,
+        method: &str,
+        path: &str,
+        body: &[u8],
+        extra_headers: &[(String, String)],
+    ) -> Result<RawResponseWithHeaders, LocalClientError> {
         let std_conn = rustscale_safesocket::connect(&self.socket_path)
             .map_err(|e| LocalClientError::Connect(e.to_string()))?;
         let _ = std_conn.set_nonblocking(true);
         let mut stream =
             UnixStream::from_std(std_conn).map_err(|e| LocalClientError::Connect(e.to_string()))?;
 
-        let request = format!(
+        let mut request = format!(
             "{method} {path} HTTP/1.1\r\nHost: {LOCAL_API_HOST}\r\n\
-             Content-Length: {}\r\nConnection: close\r\n\r\n",
+             Content-Length: {}\r\nConnection: close\r\n",
             body.len()
         );
+        for (k, v) in extra_headers {
+            use std::fmt::Write;
+            let _ = write!(request, "{k}: {v}\r\n");
+        }
+        request.push_str("\r\n");
         stream.write_all(request.as_bytes()).await?;
         if !body.is_empty() {
             stream.write_all(body).await?;
         }
         stream.flush().await?;
 
-        let response = read_full_response(&mut stream).await?;
+        let response = read_full_response_with_headers(&mut stream).await?;
         drop(stream);
 
         check_status(response.status, &response.body)?;
-        Ok((response.status, response.body))
-    }
-
-    /// Send a GET request and return the response body as a JSON value.
-    /// Maps non-200 status codes to typed errors.
-    async fn get_json(&self, path: &str) -> Result<serde_json::Value, LocalClientError> {
-        let (_, body) = self.send_request("GET", path, &[]).await?;
-        let json: serde_json::Value =
-            serde_json::from_slice(&body).map_err(|e| LocalClientError::Json(e.to_string()))?;
-        Ok(json)
-    }
-
-    /// Send a GET request and return the response body as a string.
-    async fn get_raw(&self, path: &str) -> Result<String, LocalClientError> {
-        let (_status, body) = self.send_request("GET", path, &[]).await?;
-        Ok(String::from_utf8_lossy(&body).into_owned())
+        Ok(response)
     }
 
     /// Send an HTTP request, read the full response, check the status code,
@@ -254,16 +356,22 @@ impl LocalClient {
         path: &str,
         _body: &[u8],
     ) -> Result<(u16, Vec<u8>), LocalClientError> {
-        let mut stream = self.connect_and_send(method, path).await?;
+        let raw = self.send_request_raw(method, path, &[], &[]).await?;
+        Ok((raw.status, raw.body))
+    }
 
-        // Read the full response (headers + body). The daemon sends
-        // Connection: close + Content-Length, so we read until we have the
-        // full body.
-        let response = read_full_response(&mut stream).await?;
-        drop(stream);
+    /// Send a GET request and return the response body as a JSON value.
+    async fn get_json(&self, path: &str) -> Result<serde_json::Value, LocalClientError> {
+        let (_, body) = self.send_request("GET", path, &[]).await?;
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|e| LocalClientError::Json(e.to_string()))?;
+        Ok(json)
+    }
 
-        check_status(response.status, &response.body)?;
-        Ok((response.status, response.body))
+    /// Send a GET request and return the response body as a string.
+    async fn get_raw_str(&self, path: &str) -> Result<String, LocalClientError> {
+        let (_status, body) = self.send_request("GET", path, &[]).await?;
+        Ok(String::from_utf8_lossy(&body).into_owned())
     }
 
     /// Connect to the socket, send the HTTP request line + headers, and
@@ -294,19 +402,20 @@ impl LocalClient {
 // Response parsing
 // ---------------------------------------------------------------------------
 
-struct RawResponse {
+/// Response with parsed ETag header (used by serve-config endpoint).
+struct RawResponseWithHeaders {
     status: u16,
     body: Vec<u8>,
+    etag: String,
 }
 
-/// Read a complete HTTP/1.1 response from the stream. Parses the status line
-/// and headers, then reads the body based on Content-Length (or until EOF for
-/// streaming responses with Connection: close and no Content-Length).
-async fn read_full_response(stream: &mut UnixStream) -> Result<RawResponse, LocalClientError> {
+/// Read a complete HTTP/1.1 response including the ETag header.
+async fn read_full_response_with_headers(
+    stream: &mut UnixStream,
+) -> Result<RawResponseWithHeaders, LocalClientError> {
     let mut buf = Vec::with_capacity(8192);
     let mut tmp = [0u8; 4096];
 
-    // Read until we find the end of headers.
     let header_end_pos;
     loop {
         let n = stream.read(&mut tmp).await?;
@@ -337,8 +446,8 @@ async fn read_full_response(stream: &mut UnixStream) -> Result<RawResponse, Loca
     let _version = parts.next();
     let status: u16 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
 
-    // Parse headers.
     let mut content_length: Option<usize> = None;
+    let mut etag = String::new();
     for line in lines {
         if line.is_empty() {
             continue;
@@ -346,14 +455,14 @@ async fn read_full_response(stream: &mut UnixStream) -> Result<RawResponse, Loca
         if let Some((k, v)) = line.split_once(':') {
             if k.trim().eq_ignore_ascii_case("content-length") {
                 content_length = v.trim().parse().ok();
+            } else if k.trim().eq_ignore_ascii_case("etag") {
+                etag = v.trim().trim_matches('"').to_string();
             }
         }
     }
 
-    // Read the body.
     let body_start = header_end_pos + 4;
     let body = if let Some(cl) = content_length {
-        // Read exactly cl bytes.
         let mut body = buf[body_start..].to_vec();
         while body.len() < cl {
             let n = stream.read(&mut tmp).await?;
@@ -365,7 +474,6 @@ async fn read_full_response(stream: &mut UnixStream) -> Result<RawResponse, Loca
         body.truncate(cl);
         body
     } else {
-        // No Content-Length: read until EOF (streaming / connection-close).
         let mut body = buf[body_start..].to_vec();
         loop {
             let n = stream.read(&mut tmp).await?;
@@ -377,7 +485,7 @@ async fn read_full_response(stream: &mut UnixStream) -> Result<RawResponse, Loca
         body
     };
 
-    Ok(RawResponse { status, body })
+    Ok(RawResponseWithHeaders { status, body, etag })
 }
 
 fn find_header_end(buf: &[u8]) -> Option<usize> {

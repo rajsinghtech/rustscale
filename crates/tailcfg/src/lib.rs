@@ -16,6 +16,7 @@ mod filter;
 mod map;
 mod node;
 mod register;
+mod ssh;
 
 pub use appctype::{
     AppConnectorAttr, AppConnectorConfig, ConfigID, Conn25Attr, Conn25PoolsAttr, DNATConfig,
@@ -36,6 +37,7 @@ pub use node::{
     TPMInfo,
 };
 pub use register::{Login, LoginID, RegisterRequest, RegisterResponse, RegisterResponseAuth, User};
+pub use ssh::{SSHAction, SSHPrincipal, SSHPolicy, SSHRecorderFailureAction, SSHRule};
 
 pub use rustscale_key::{
     DiscoPublic as DiscoKey, MachinePublic as MachineKey, NodePublic as NodeKey,

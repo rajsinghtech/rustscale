@@ -192,6 +192,9 @@ pub struct MapResponse {
     /// Whether the server wants the client to collect and report services.
     #[serde(default, skip_serializing_if = "crate::OptBool::is_unset")]
     pub CollectServices: crate::OptBool,
+    /// SSH policy for incoming SSH connections. `None` = unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub SSHPolicy: Option<crate::SSHPolicy>,
 }
 
 #[cfg(test)]

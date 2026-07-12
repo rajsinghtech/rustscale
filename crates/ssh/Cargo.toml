@@ -1,0 +1,28 @@
+[package]
+name = "rustscale-ssh"
+description = "Tailscale SSH server for rustscale — port of Go's ssh/tailssh"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rustscale-key = { path = "../key", version = "0.1.0" }
+rustscale-tailcfg = { path = "../tailcfg", version = "0.1.0" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+ed25519-dalek.workspace = true
+sha2.workspace = true
+base64.workspace = true
+chrono.workspace = true
+russh = "0.50"
+russh-keys = "0.50.0-beta.7"
+log = "0.4"
+
+[dev-dependencies]
+tokio.workspace = true

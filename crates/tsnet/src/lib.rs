@@ -41,6 +41,9 @@ mod state;
 mod status;
 mod tls;
 
+#[cfg(feature = "ssh")]
+mod ssh;
+
 pub use appc::{
     extract_appc_config, is_app_connector_node, make_dns_observer, route_info_from_connector,
     TsnetRouteAdvertiser,
@@ -65,6 +68,9 @@ pub use tls::{
 pub use hostinfo::{
     collect_hostinfo, hostinfo_hash, populate_hostinfo, HostinfoOverrides, SharedOverrides,
 };
+
+#[cfg(feature = "ssh")]
+pub use ssh::SshListener;
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};

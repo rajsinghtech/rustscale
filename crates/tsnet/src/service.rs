@@ -46,12 +46,38 @@ use crate::proxyproto;
 
 /// Configuration for a [`ServiceListener`].
 ///
-/// Mirrors the relevant fields of Go's `tsnet.ServiceModeTCP` /
-/// `tsnet.ServiceModeHTTP`. Currently only the TCP mode is implemented.
+/// Mirrors Go's `tsnet.ServiceModeTCP` / `tsnet.ServiceModeHTTP`. In the TCP
+/// mode, the listener accepts raw TCP connections on the VIP. In the HTTP
+/// mode, the listener accepts HTTP connections (plaintext or TLS-terminated)
+/// and dispatches them via the serve web handler machinery.
 #[derive(Clone, Debug)]
-pub struct ServiceMode {
+pub enum ServiceMode {
+    /// Raw TCP forwarding mode (Go's `ServiceModeTCP`).
+    Tcp(TcpServiceMode),
+    /// HTTP mode (Go's `ServiceModeHTTP`). Accepts HTTP (or HTTPS when
+    /// `https` is true) connections on the VIP and dispatches them via
+    /// the serve web handlers.
+    Http(HttpServiceMode),
+}
+
+/// TCP service mode parameters.
+#[derive(Clone, Debug)]
+pub struct TcpServiceMode {
     /// TCP port to listen on for the service VIP.
     pub port: u16,
+    /// If `true`, prepend a PROXY protocol v2 binary header to each accepted
+    /// stream so the backend learns the real client address.
+    pub proxy_protocol: bool,
+}
+
+/// HTTP service mode parameters.
+#[derive(Clone, Debug)]
+pub struct HttpServiceMode {
+    /// TCP port to listen on for the service VIP.
+    pub port: u16,
+    /// If `true`, handle connections as HTTPS (TLS-terminated). The only SNI
+    /// permitted is the service's FQDN.
+    pub https: bool,
     /// If `true`, prepend a PROXY protocol v2 binary header to each accepted
     /// stream so the backend learns the real client address.
     pub proxy_protocol: bool,
@@ -60,16 +86,63 @@ pub struct ServiceMode {
 impl ServiceMode {
     /// Create a TCP service mode on `port` without PROXY protocol.
     pub fn tcp(port: u16) -> Self {
-        Self {
+        Self::Tcp(TcpServiceMode {
             port,
             proxy_protocol: false,
-        }
+        })
+    }
+
+    /// Create an HTTP service mode on `port` (plaintext HTTP, no TLS).
+    pub fn http(port: u16) -> Self {
+        Self::Http(HttpServiceMode {
+            port,
+            https: false,
+            proxy_protocol: false,
+        })
+    }
+
+    /// Create an HTTPS service mode on `port` (TLS-terminated HTTP).
+    pub fn https(port: u16) -> Self {
+        Self::Http(HttpServiceMode {
+            port,
+            https: true,
+            proxy_protocol: false,
+        })
     }
 
     /// Enable PROXY protocol v2 header injection on accepted connections.
     pub fn with_proxy_protocol(mut self, on: bool) -> Self {
-        self.proxy_protocol = on;
+        match &mut self {
+            Self::Tcp(m) => m.proxy_protocol = on,
+            Self::Http(m) => m.proxy_protocol = on,
+        }
         self
+    }
+
+    /// The TCP port this service listens on.
+    pub fn port(&self) -> u16 {
+        match self {
+            Self::Tcp(m) => m.port,
+            Self::Http(m) => m.port,
+        }
+    }
+
+    /// Whether PROXY protocol v2 headers are prepended to accepted streams.
+    pub fn proxy_protocol(&self) -> bool {
+        match self {
+            Self::Tcp(m) => m.proxy_protocol,
+            Self::Http(m) => m.proxy_protocol,
+        }
+    }
+
+    /// Whether this is the HTTP mode (vs raw TCP).
+    pub fn is_http(&self) -> bool {
+        matches!(self, Self::Http(_))
+    }
+
+    /// Whether this is the HTTPS variant of HTTP mode.
+    pub fn is_https(&self) -> bool {
+        matches!(self, Self::Http(m) if m.https)
     }
 }
 
@@ -90,6 +163,10 @@ pub struct ServiceListener {
     pub fqdn: String,
     /// Whether PROXY protocol v2 headers are prepended to accepted streams.
     proxy_protocol: bool,
+    /// Whether this listener is in HTTP mode (vs raw TCP).
+    http_mode: bool,
+    /// Whether this listener is in HTTPS mode (TLS-terminated HTTP).
+    https_mode: bool,
     /// The service name (for diagnostics).
     svc_name: ServiceName,
     /// The port being listened on.
@@ -138,6 +215,16 @@ impl ServiceListener {
     /// The service name.
     pub fn service_name(&self) -> &ServiceName {
         &self.svc_name
+    }
+
+    /// Whether this listener is in HTTP mode (vs raw TCP).
+    pub fn is_http(&self) -> bool {
+        self.http_mode
+    }
+
+    /// Whether this listener is in HTTPS mode (TLS-terminated HTTP).
+    pub fn is_https(&self) -> bool {
+        self.https_mode
     }
 }
 
@@ -284,12 +371,12 @@ pub(crate) async fn create_service_listener(
     let mut listeners: Vec<(IpAddr, Listener)> = Vec::with_capacity(v4_addrs.len());
     for ip in &v4_addrs {
         netstack.add_addr(*ip).await?;
-        match netstack.listen_on(*ip, mode.port).await {
+        match netstack.listen_on(*ip, mode.port()).await {
             Ok(ln) => listeners.push((*ip, ln)),
             Err(NetstackError::ListenFailed(msg)) if msg.contains("already in use") => {
                 eprintln!(
                     "tsnet: service listener on {ip}:{} already exists, reusing",
-                    mode.port
+                    mode.port()
                 );
             }
             Err(e) => return Err(e.into()),
@@ -319,15 +406,18 @@ pub(crate) async fn create_service_listener(
 
     eprintln!(
         "tsnet: service listener for {svc} on v4 VIPs {:?} port {} (FQDN: {fqdn})",
-        v4_addrs, mode.port
+        v4_addrs,
+        mode.port()
     );
 
     Ok(ServiceListener {
         accept_rx: merged_rx,
         fqdn,
-        proxy_protocol: mode.proxy_protocol,
+        proxy_protocol: mode.proxy_protocol(),
+        http_mode: mode.is_http(),
+        https_mode: mode.is_https(),
         svc_name: svc,
-        port: mode.port,
+        port: mode.port(),
     })
 }
 
@@ -338,15 +428,34 @@ mod tests {
     #[test]
     fn service_mode_tcp() {
         let m = ServiceMode::tcp(8080);
-        assert_eq!(m.port, 8080);
-        assert!(!m.proxy_protocol);
+        assert_eq!(m.port(), 8080);
+        assert!(!m.proxy_protocol());
+        assert!(!m.is_http());
     }
 
     #[test]
     fn service_mode_with_proxy() {
         let m = ServiceMode::tcp(443).with_proxy_protocol(true);
-        assert_eq!(m.port, 443);
-        assert!(m.proxy_protocol);
+        assert_eq!(m.port(), 443);
+        assert!(m.proxy_protocol());
+    }
+
+    #[test]
+    fn service_mode_http() {
+        let m = ServiceMode::http(8080);
+        assert_eq!(m.port(), 8080);
+        assert!(m.is_http());
+        assert!(!m.is_https());
+        assert!(!m.proxy_protocol());
+    }
+
+    #[test]
+    fn service_mode_https() {
+        let m = ServiceMode::https(443).with_proxy_protocol(true);
+        assert_eq!(m.port(), 443);
+        assert!(m.is_http());
+        assert!(m.is_https());
+        assert!(m.proxy_protocol());
     }
 
     #[tokio::test]
@@ -358,6 +467,8 @@ mod tests {
             accept_rx: rx,
             fqdn: "test.tailnet.ts.net".into(),
             proxy_protocol: false,
+            http_mode: false,
+            https_mode: false,
             svc_name: ServiceName::new_unchecked("svc:test"),
             port: 8080,
         };

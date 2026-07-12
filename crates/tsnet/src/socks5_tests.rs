@@ -240,7 +240,7 @@ async fn greet_round_trip(client_methods: &[u8], expect_accept: bool) -> Vec<u8>
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
         let (mut s, _) = listener.accept().await.unwrap();
-        let res = negotiate_greeting(&mut s).await;
+        let res = negotiate_greeting(&mut s, false).await;
         if res.is_ok() {
             s.write_all(&[0x05, 0x00]).await.unwrap();
         } else {
@@ -286,7 +286,7 @@ async fn greeting_rejects_bad_version() {
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
         let (mut s, _) = listener.accept().await.unwrap();
-        let _ = negotiate_greeting(&mut s).await;
+        let _ = negotiate_greeting(&mut s, false).await;
         // negotiate_greeting errors before writing; the reply is written by
         // handle_conn. Here we just close.
     });
@@ -392,7 +392,7 @@ async fn socks5_connect_echo_roundtrip() {
     let echo_task = tokio::spawn(echo_server(echo));
 
     // Proxy with a mock dialer that always connects to the echo backend.
-    let handle = spawn_socks5("127.0.0.1:0", MockDialer { backend: echo_addr })
+    let handle = spawn_socks5("127.0.0.1:0", MockDialer { backend: echo_addr }, None)
         .await
         .unwrap();
     let proxy = handle.local_addr();
@@ -434,7 +434,7 @@ async fn socks5_connect_domain_addr_type() {
     let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let echo_addr = echo.local_addr().unwrap();
     let echo_task = tokio::spawn(echo_server(echo));
-    let handle = spawn_socks5("127.0.0.1:0", MockDialer { backend: echo_addr })
+    let handle = spawn_socks5("127.0.0.1:0", MockDialer { backend: echo_addr }, None)
         .await
         .unwrap();
     let proxy = handle.local_addr();
@@ -465,7 +465,7 @@ async fn socks5_connect_ipv6_addr_type() {
     let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let echo_addr = echo.local_addr().unwrap();
     let echo_task = tokio::spawn(echo_server(echo));
-    let handle = spawn_socks5("127.0.0.1:0", MockDialer { backend: echo_addr })
+    let handle = spawn_socks5("127.0.0.1:0", MockDialer { backend: echo_addr }, None)
         .await
         .unwrap();
     let proxy = handle.local_addr();
@@ -529,6 +529,7 @@ async fn socks5_dial_refused_maps_to_05() {
         FailingDialer {
             kind: io::ErrorKind::ConnectionRefused,
         },
+        None,
     )
     .await
     .unwrap();
@@ -552,6 +553,7 @@ async fn socks5_dial_host_unreachable_maps_to_04() {
         FailingDialer {
             kind: io::ErrorKind::HostUnreachable,
         },
+        None,
     )
     .await
     .unwrap();
@@ -575,6 +577,7 @@ async fn socks5_dial_general_failure_maps_to_01() {
         FailingDialer {
             kind: io::ErrorKind::Other,
         },
+        None,
     )
     .await
     .unwrap();
@@ -602,7 +605,7 @@ async fn socks5_bind_command_rejected_07() {
     // No echo task: the command is rejected before any dial, so no backend
     // connection is ever made. Drop the listener to free the port.
     drop(echo);
-    let handle = spawn_socks5("127.0.0.1:0", MockDialer { backend: echo_addr })
+    let handle = spawn_socks5("127.0.0.1:0", MockDialer { backend: echo_addr }, None)
         .await
         .unwrap();
     let proxy = handle.local_addr();
@@ -633,7 +636,7 @@ async fn socks5_udp_associate_rejected_07() {
     let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let echo_addr = echo.local_addr().unwrap();
     drop(echo);
-    let handle = spawn_socks5("127.0.0.1:0", MockDialer { backend: echo_addr })
+    let handle = spawn_socks5("127.0.0.1:0", MockDialer { backend: echo_addr }, None)
         .await
         .unwrap();
     let proxy = handle.local_addr();
@@ -651,6 +654,196 @@ async fn socks5_udp_associate_rejected_07() {
     assert_eq!(hdr[1], 0x07);
 
     drop(s);
+    let mut h = handle;
+    h.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// Username/password authentication (RFC 1929)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn parse_client_auth_round_trip() {
+    // VER=1 ULEN=4 "user" PLEN=4 "pass"
+    let mut bytes = vec![
+        0x01, 0x04, b'u', b's', b'e', b'r', 0x04, b'p', b'a', b's', b's',
+    ];
+    let mut cur = std::io::Cursor::new(&mut bytes[..]);
+    let (user, pass) = parse_client_auth(&mut cur).await.unwrap();
+    assert_eq!(user, "user");
+    assert_eq!(pass, "pass");
+}
+
+#[tokio::test]
+async fn parse_client_auth_bad_version() {
+    let bytes = [0x02, 0x01, b'x', 0x01, b'y'];
+    let mut cur = std::io::Cursor::new(&bytes[..]);
+    let err = parse_client_auth(&mut cur).await.unwrap_err();
+    assert!(err.to_string().contains("bad SOCKS auth version"));
+}
+
+#[tokio::test]
+async fn greeting_rejects_when_password_required_but_not_offered() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut s, _) = listener.accept().await.unwrap();
+        let res = negotiate_greeting(&mut s, true).await;
+        if res.is_err() {
+            s.write_all(&[0x05, 0xFF]).await.unwrap();
+        }
+    });
+    let mut c = TcpStream::connect(addr).await.unwrap();
+    // Offer only no-auth (0x00), not password (0x02)
+    c.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+    let mut resp = [0u8; 2];
+    c.read_exact(&mut resp).await.unwrap();
+    assert_eq!(resp[1], 0xFF); // no acceptable methods
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn greeting_accepts_password_method_when_required() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut s, _) = listener.accept().await.unwrap();
+        let method = negotiate_greeting(&mut s, true).await.unwrap();
+        s.write_all(&[0x05, method]).await.unwrap();
+    });
+    let mut c = TcpStream::connect(addr).await.unwrap();
+    // Offer password (0x02)
+    c.write_all(&[0x05, 0x01, 0x02]).await.unwrap();
+    let mut resp = [0u8; 2];
+    c.read_exact(&mut resp).await.unwrap();
+    assert_eq!(resp[1], 0x02); // password method selected
+    server.await.unwrap();
+}
+
+/// Hand-rolled SOCKS5 client CONNECT with username/password auth.
+async fn socks5_connect_with_auth(
+    proxy: SocketAddr,
+    dest: SocksAddr,
+    username: &str,
+    password: &str,
+) -> io::Result<TcpStream> {
+    let mut s = TcpStream::connect(proxy).await?;
+    // greeting: offer both no-auth and password
+    s.write_all(&[0x05, 0x02, 0x00, 0x02]).await?;
+    let mut greply = [0u8; 2];
+    s.read_exact(&mut greply).await?;
+    if greply[0] != 0x05 {
+        return Err(io::Error::other("bad version"));
+    }
+    if greply[1] == 0x00 {
+        // no-auth selected, proceed to request
+    } else if greply[1] == 0x02 {
+        // password auth sub-negotiation (RFC 1929)
+        let mut auth = vec![0x01, username.len() as u8];
+        auth.extend_from_slice(username.as_bytes());
+        auth.push(password.len() as u8);
+        auth.extend_from_slice(password.as_bytes());
+        s.write_all(&auth).await?;
+        let mut auth_resp = [0u8; 2];
+        s.read_exact(&mut auth_resp).await?;
+        if auth_resp[1] != 0x00 {
+            return Err(io::Error::other("auth failed"));
+        }
+    } else {
+        return Err(io::Error::other(format!("method rejected: {greply:?}")));
+    }
+    // request
+    let mut req = vec![0x05, 0x01, 0x00];
+    req.extend_from_slice(&dest.marshal().unwrap());
+    s.write_all(&req).await?;
+    // reply
+    let mut hdr = [0u8; 4];
+    s.read_exact(&mut hdr).await?;
+    if hdr[1] != 0x00 {
+        return Err(io::Error::other(format!("connect failed: {:#x}", hdr[1])));
+    }
+    let atyp = hdr[3];
+    let addr_len = match atyp {
+        0x01 => 4,
+        0x04 => 16,
+        0x03 => {
+            let mut len = [0u8; 1];
+            s.read_exact(&mut len).await?;
+            len[0] as usize
+        }
+        _ => return Err(io::Error::other("bad atyp")),
+    };
+    let mut rest = vec![0u8; addr_len + 2];
+    s.read_exact(&mut rest).await?;
+    Ok(s)
+}
+
+#[tokio::test]
+async fn socks5_auth_success_roundtrip() {
+    let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_addr = echo.local_addr().unwrap();
+    let echo_task = tokio::spawn(echo_server(echo));
+
+    let handle = spawn_socks5(
+        "127.0.0.1:0",
+        MockDialer { backend: echo_addr },
+        Some(("admin".into(), "secret".into())),
+    )
+    .await
+    .unwrap();
+    let proxy = handle.local_addr();
+
+    let mut s = socks5_connect_with_auth(
+        proxy,
+        SocksAddr::Ipv4 {
+            addr: Ipv4Addr::new(100, 64, 0, 9),
+            port: 4242,
+        },
+        "admin",
+        "secret",
+    )
+    .await
+    .expect("socks5 connect with auth");
+
+    let payload = b"authed-socks5";
+    s.write_all(payload).await.unwrap();
+    let mut got = vec![0u8; payload.len()];
+    s.read_exact(&mut got).await.unwrap();
+    assert_eq!(got, payload);
+
+    drop(s);
+    let mut h = handle;
+    h.stop().await;
+    let _ = echo_task.await;
+}
+
+#[tokio::test]
+async fn socks5_auth_wrong_password_rejected() {
+    let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_addr = echo.local_addr().unwrap();
+    drop(echo);
+
+    let handle = spawn_socks5(
+        "127.0.0.1:0",
+        MockDialer { backend: echo_addr },
+        Some(("admin".into(), "secret".into())),
+    )
+    .await
+    .unwrap();
+    let proxy = handle.local_addr();
+
+    let result = socks5_connect_with_auth(
+        proxy,
+        SocksAddr::Ipv4 {
+            addr: Ipv4Addr::new(1, 2, 3, 4),
+            port: 80,
+        },
+        "admin",
+        "wrong",
+    )
+    .await;
+
+    assert!(result.is_err(), "auth with wrong password should fail");
     let mut h = handle;
     h.stop().await;
 }

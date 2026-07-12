@@ -392,12 +392,14 @@ impl Server {
         let cancel_task = cancel.clone();
 
         let localapi_cred_clone = localapi_cred.clone();
+        let proxy_cred_clone = proxy_cred.clone();
         let task = tokio::spawn(async move {
             serve_loopback(
                 listener,
                 dialer,
                 api_state,
                 localapi_cred_clone,
+                proxy_cred_clone,
                 cancel_task,
             )
             .await;
@@ -501,13 +503,15 @@ impl Server {
 
 /// Serve the combined SOCKS5 + LocalAPI loopback listener. Each accepted
 /// connection is sniffed: if the first byte is `0x05` (SOCKS5), it's handed
-/// to the SOCKS5 handler; otherwise it's treated as HTTP and dispatched to
-/// the LocalAPI handler.
+/// to the SOCKS5 handler (with username `"tsnet"` + `proxy_cred` as password
+/// auth per RFC 1929); otherwise it's treated as HTTP and dispatched to the
+/// LocalAPI handler.
 async fn serve_loopback<D: super::socks5::SocksDialer + 'static>(
     listener: TcpListener,
     dialer: D,
     api_state: Arc<LocalApiState>,
     localapi_cred: String,
+    proxy_cred: String,
     cancel: Arc<socks5::CancelToken>,
 ) {
     let dialer = Arc::new(dialer);
@@ -539,9 +543,11 @@ async fn serve_loopback<D: super::socks5::SocksDialer + 'static>(
 
         if is_socks5 {
             let d = dialer.clone();
+            let cred = proxy_cred.clone();
             tokio::spawn(async move {
                 let prefixed = PrefixedStream::new(peek_buf[0], stream);
-                if let Err(e) = super::socks5::handle_conn_generic(prefixed, d).await {
+                let auth = Some(("tsnet", &cred[..]));
+                if let Err(e) = super::socks5::handle_conn_generic(prefixed, d, auth).await {
                     eprintln!("loopback: socks5 connection ended: {e}");
                 }
             });

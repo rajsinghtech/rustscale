@@ -57,6 +57,7 @@ mod util;
 #[cfg(feature = "ssh")]
 mod ssh;
 
+pub use api::FallbackTcpGuard;
 pub use appc::{
     extract_appc_config, is_app_connector_node, make_dns_observer, route_info_from_connector,
     TsnetRouteAdvertiser,
@@ -66,7 +67,7 @@ pub use routing::{peer_is_exit_capable, RouteTable};
 pub use rustscale_health::Warning;
 pub use serve::{
     check_funnel_access, check_funnel_port, FunnelError, HTTPHandler, HostPort, ServeConfig,
-    ServeError, TCPPortHandler, WebServerConfig, FUNNEL_PORTS,
+    ServeError, ServiceConfig as ServeServiceConfig, TCPPortHandler, WebServerConfig, FUNNEL_PORTS,
 };
 pub use service::{ServiceError, ServiceListener, ServiceMode, ServiceStream};
 pub use socks5::{
@@ -204,6 +205,8 @@ pub enum TsnetError {
     Tun(#[from] rustscale_tun::TunError),
     #[error("listen/dial not available in TUN mode (no userspace netstack)")]
     NotAvailableInTunMode,
+    #[error("feature not supported: {0}")]
+    NotSupported(String),
     #[error("timeout waiting for first map response")]
     MapTimeout,
     #[error("tls error: {0}")]
@@ -619,6 +622,29 @@ pub(crate) struct RunningState {
     /// and transition to NeedsLogin. Stored here so the daemon can select
     /// on it alongside shutdown signals.
     pub(crate) logout_trigger: Arc<tokio::sync::Notify>,
+    /// Registered fallback TCP handlers (called when no listener matches an
+    /// incoming TCP flow). Each entry is a boxed callback keyed by a unique
+    /// ID; `register_fallback_tcp_handler` returns a guard whose `Drop`
+    /// removes the entry.
+    pub(crate) fallback_tcp_handlers:
+        Arc<std::sync::Mutex<Vec<(u64, Box<dyn FallbackTCPHandler + Send + Sync>)>>>,
+    /// Next fallback handler ID (monotonic).
+    pub(crate) fallback_next_id: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// A fallback TCP handler: called when an incoming TCP flow doesn't match any
+/// listener. Mirrors Go's `tsnet.FallbackTCPHandler`.
+///
+/// If `intercept` is `true` and `handler` is `Some`, the handler takes over
+/// the connection. If `intercept` is `false` or `handler` is `None`, the flow
+/// is rejected and the next registered handler is tried.
+pub trait FallbackTCPHandler: Send + Sync {
+    /// Decide whether to handle the TCP flow from `src` to `dst`.
+    fn handle(
+        &self,
+        src: SocketAddr,
+        dst: SocketAddr,
+    ) -> (bool, Option<Box<dyn FnOnce(NetstackStream) + Send>>);
 }
 
 /// Which data plane is wired up: userspace netstack (tsnet listen/dial) or a

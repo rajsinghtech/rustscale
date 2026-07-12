@@ -8,8 +8,9 @@
 //!
 //! # Supported subset (RFC 1928)
 //!
-//! - **Version/method negotiation**: SOCKS5 (`0x05`), no-auth (`0x00`) only.
-//!   Clients not offering no-auth are rejected with `0xFF`.
+//! - **Version/method negotiation**: SOCKS5 (`0x05`). Supports no-auth
+//!   (`0x00`) and username/password auth (`0x02`, RFC 1929). When the server
+//!   is configured with credentials, only the password method is accepted.
 //! - **CONNECT command** (`0x01`) only. BIND (`0x02`) and UDP-ASSOCIATE
 //!   (`0x03`) are rejected with reply `0x07` (command not supported).
 //! - **Address types**: IPv4 (`0x01`), domain name (`0x03`), IPv6 (`0x04`).
@@ -46,7 +47,11 @@ pub(crate) const SOCKS5_VERSION: u8 = 5;
 
 /// Authentication methods (RFC 1928 §3).
 const NO_AUTH_REQUIRED: u8 = 0x00;
+const PASSWORD_AUTH: u8 = 0x02;
 const NO_ACCEPTABLE_AUTH: u8 = 0xFF;
+
+/// Auth sub-negotiation version (RFC 1929).
+const PASSWORD_AUTH_VERSION: u8 = 0x01;
 
 /// Commands (RFC 1928 §3).
 const CMD_CONNECT: u8 = 0x01;
@@ -329,22 +334,46 @@ fn dial_err_to_reply(e: &io::Error) -> u8 {
 /// A SOCKS5 proxy server bound to an OS TCP listener. Construct directly with
 /// a mock [`SocksDialer`] for tests, or via
 /// [`Server::listen_socks5`](crate::Server::listen_socks5) for production.
+///
+/// When `username` and `password` are both non-empty, the server requires
+/// username/password authentication (RFC 1929). Otherwise it uses no-auth.
 pub struct Socks5Server<D: SocksDialer> {
     dialer: Arc<D>,
+    username: String,
+    password: String,
 }
 
 impl<D: SocksDialer + 'static> Socks5Server<D> {
-    /// Wrap a dialer.
+    /// Wrap a dialer (no authentication).
     pub fn new(dialer: D) -> Self {
         Self {
             dialer: Arc::new(dialer),
+            username: String::new(),
+            password: String::new(),
         }
+    }
+
+    /// Require username/password authentication (RFC 1929). When set, the
+    /// server only accepts clients that offer method `0x02` and provide
+    /// matching credentials.
+    pub fn with_auth(mut self, username: impl Into<String>, password: impl Into<String>) -> Self {
+        self.username = username.into();
+        self.password = password.into();
+        self
+    }
+
+    /// Whether this server requires auth.
+    fn needs_auth(&self) -> bool {
+        !self.username.is_empty() || !self.password.is_empty()
     }
 
     /// Accept connections from `listener` until the cancel token fires. Each
     /// connection is handled in its own task. Returns when the listener is
     /// closed or cancelled.
     pub async fn serve(self, listener: TcpListener, cancel: Arc<CancelToken>) {
+        let needs_auth = self.needs_auth();
+        let username = self.username.clone();
+        let password = self.password.clone();
         loop {
             if cancel.is_cancelled() {
                 break;
@@ -361,8 +390,15 @@ impl<D: SocksDialer + 'static> Socks5Server<D> {
                 Err(_) => continue, // timeout — re-check cancel
             };
             let d = self.dialer.clone();
+            let u = username.clone();
+            let p = password.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_conn_generic(stream, d).await {
+                let auth = if needs_auth {
+                    Some((&u[..], &p[..]))
+                } else {
+                    None
+                };
+                if let Err(e) = handle_conn_generic(stream, d, auth).await {
                     eprintln!("socks5: connection ended: {e}");
                 }
             });
@@ -401,24 +437,47 @@ impl Default for CancelToken {
 }
 
 /// Handle a single SOCKS5 client connection end-to-end.
-pub(crate) async fn handle_conn_generic<D, S>(mut client: S, dialer: Arc<D>) -> io::Result<()>
+///
+/// When `auth` is `Some((username, password))`, the server requires
+/// username/password authentication (RFC 1929) before proceeding.
+pub(crate) async fn handle_conn_generic<D, S>(
+    mut client: S,
+    dialer: Arc<D>,
+    auth: Option<(&str, &str)>,
+) -> io::Result<()>
 where
     D: SocksDialer,
     S: AsyncRead + AsyncWrite + Unpin,
 {
     // 1. Version/method negotiation (RFC 1928 §3).
-    if let Err(e) = negotiate_greeting(&mut client).await {
-        // On any greeting failure we still reply 0xFF per the RFC.
-        let _ = client
-            .write_all(&[SOCKS5_VERSION, NO_ACCEPTABLE_AUTH])
-            .await;
-        return Err(e);
-    }
-    client
-        .write_all(&[SOCKS5_VERSION, NO_AUTH_REQUIRED])
-        .await?;
+    let selected_method = match negotiate_greeting(&mut client, auth.is_some()).await {
+        Ok(m) => m,
+        Err(e) => {
+            let _ = client
+                .write_all(&[SOCKS5_VERSION, NO_ACCEPTABLE_AUTH])
+                .await;
+            return Err(e);
+        }
+    };
+    client.write_all(&[SOCKS5_VERSION, selected_method]).await?;
 
-    // 2. Request (RFC 1928 §4/§5).
+    // 2. Auth sub-negotiation (RFC 1929) if required.
+    if let Some((expected_user, expected_pass)) = auth {
+        match parse_client_auth(&mut client).await {
+            Ok((user, pass)) if user == expected_user && pass == expected_pass => {
+                client.write_all(&[PASSWORD_AUTH_VERSION, 0x00]).await?;
+            }
+            _ => {
+                client.write_all(&[PASSWORD_AUTH_VERSION, 0x01]).await?;
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "socks5 auth failed",
+                ));
+            }
+        }
+    }
+
+    // 3. Request (RFC 1928 §4/§5).
     let req = match parse_request(&mut client).await {
         Ok(r) => r,
         Err(e) => {
@@ -429,7 +488,7 @@ where
         }
     };
 
-    // 3. Dispatch by command.
+    // 4. Dispatch by command.
     match req.command {
         CMD_CONNECT => handle_connect(client, &dialer, req.destination).await,
         CMD_BIND | CMD_UDP_ASSOCIATE => {
@@ -454,8 +513,12 @@ where
 }
 
 /// Parse and validate the client greeting: `VER NMETHODS METHODS...`.
-/// Accepts only SOCKS5 with no-auth offered.
-pub(crate) async fn negotiate_greeting<R>(client: &mut R) -> io::Result<()>
+/// Returns the selected method byte (`NO_AUTH_REQUIRED` or `PASSWORD_AUTH`).
+///
+/// When `require_password` is `true`, the server only accepts clients that
+/// offer the username/password method (`0x02`). Otherwise it accepts no-auth
+/// (`0x00`).
+pub(crate) async fn negotiate_greeting<R>(client: &mut R, require_password: bool) -> io::Result<u8>
 where
     R: AsyncRead + Unpin,
 {
@@ -482,13 +545,58 @@ where
         .read_exact(&mut methods)
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::UnexpectedEof, "could not read methods"))?;
+    if require_password {
+        if !methods.contains(&PASSWORD_AUTH) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "no acceptable auth method (username/password not offered)",
+            ));
+        }
+        return Ok(PASSWORD_AUTH);
+    }
     if !methods.contains(&NO_AUTH_REQUIRED) {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "no acceptable auth method (no-auth not offered)",
         ));
     }
-    Ok(())
+    Ok(NO_AUTH_REQUIRED)
+}
+
+/// Parse the RFC 1929 username/password auth sub-negotiation:
+/// `VER(1) ULEN(1) UNAME(ULEN) PLEN(1) PASSWD(PLEN)`.
+/// Returns `(username, password)` as strings.
+pub(crate) async fn parse_client_auth<R>(r: &mut R) -> io::Result<(String, String)>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut hdr = [0u8; 2];
+    r.read_exact(&mut hdr)
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::UnexpectedEof, "could not read auth header"))?;
+    if hdr[0] != PASSWORD_AUTH_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("bad SOCKS auth version {:#x}", hdr[0]),
+        ));
+    }
+    let ulen = hdr[1] as usize;
+    let mut user = vec![0u8; ulen];
+    r.read_exact(&mut user)
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::UnexpectedEof, "could not read username"))?;
+    let mut plen = [0u8; 1];
+    r.read_exact(&mut plen)
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::UnexpectedEof, "could not read password len"))?;
+    let mut pass = vec![0u8; plen[0] as usize];
+    r.read_exact(&mut pass)
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::UnexpectedEof, "could not read password"))?;
+    Ok((
+        String::from_utf8_lossy(&user).into_owned(),
+        String::from_utf8_lossy(&pass).into_owned(),
+    ))
 }
 
 /// A parsed SOCKS5 request: command + destination address.
@@ -626,15 +734,21 @@ impl Drop for Socks5Handle {
 /// using `dialer`. Returns a [`Socks5Handle`] owning the task.
 ///
 /// `bind_addr` accepts `host:port`, `:port`, or a bare port.
+/// When `auth` is `Some((username, password))`, the server requires
+/// username/password authentication (RFC 1929).
 pub async fn spawn_socks5<D: SocksDialer + 'static>(
     bind_addr: &str,
     dialer: D,
+    auth: Option<(String, String)>,
 ) -> io::Result<Socks5Handle> {
     let listener = TcpListener::bind(parse_bind_addr(bind_addr)?).await?;
     let local = listener.local_addr()?;
     let cancel = Arc::new(CancelToken::new());
     let cancel_task = cancel.clone();
-    let server = Socks5Server::new(dialer);
+    let mut server = Socks5Server::new(dialer);
+    if let Some((user, pass)) = auth {
+        server = server.with_auth(user, pass);
+    }
     let task = tokio::spawn(async move {
         server.serve(listener, cancel_task).await;
     });

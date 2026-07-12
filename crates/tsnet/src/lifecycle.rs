@@ -7,7 +7,7 @@ impl Server {
     /// This is the classic tsnet embedding path: an in-process smoltcp netstack
     /// backs `listen`/`dial`. For a full-client TUN device instead, use
     /// [`Server::up_tun`].
-#[allow(clippy::large_futures)]
+    #[allow(clippy::large_futures)]
     ///
     /// **Idempotent**: calling `up()` on an already-running server returns
     /// `Ok(ServerStatus)` immediately without re-starting. Mirrors Go's
@@ -374,6 +374,8 @@ impl Server {
                 .as_ref()
                 .map(|ps| ps.logout_trigger.clone())
                 .unwrap_or_else(|| Arc::new(tokio::sync::Notify::new())),
+            fallback_tcp_handlers: Arc::new(std::sync::Mutex::new(vec![])),
+            fallback_next_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         });
 
         // Apply stored exit-node pref on start (survives restart).
@@ -416,7 +418,7 @@ impl Server {
     /// `config.apply_routes` is true, the interface is brought up and tailnet
     /// routes are added via `ifconfig`/`route` (macOS) or `ip` (Linux) — also
     /// requiring root.
-#[allow(clippy::large_futures)]
+    #[allow(clippy::large_futures)]
     pub async fn up_tun(&mut self, config: TunModeConfig) -> Result<ServerStatus, TsnetError> {
         if self.inner.is_some() {
             return Ok(self.status());
@@ -792,6 +794,8 @@ impl Server {
                 .as_ref()
                 .map(|ps| ps.logout_trigger.clone())
                 .unwrap_or_else(|| Arc::new(tokio::sync::Notify::new())),
+            fallback_tcp_handlers: Arc::new(std::sync::Mutex::new(vec![])),
+            fallback_next_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         });
 
         // Apply stored exit-node pref on start (survives restart).

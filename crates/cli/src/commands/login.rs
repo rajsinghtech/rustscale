@@ -5,6 +5,7 @@ use rustscale_ipn::NOTIFY_INITIAL_STATE;
 use rustscale_localclient::LocalClient;
 
 use crate::flags::{parse_bool_flag, parse_str_flag};
+use crate::qrcode;
 use crate::CliError;
 
 pub async fn run(args: Vec<String>, socket: &Path, json: bool) -> Result<(), CliError> {
@@ -13,6 +14,7 @@ pub async fn run(args: Vec<String>, socket: &Path, json: bool) -> Result<(), Cli
     let timeout = parse_str_flag(&args, "timeout")
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(120);
+    let qr = parse_bool_flag(&args, "qr").unwrap_or(false);
 
     let status = lc.status().await?;
     let backend_state = status
@@ -51,8 +53,24 @@ pub async fn run(args: Vec<String>, socket: &Path, json: bool) -> Result<(), Cli
         };
 
         if let Some(ref url) = msg.BrowseToURL {
-            if !json {
+            if json {
+                let qr_field = qrcode::render_png_data_url(url).ok();
+                let mut out = serde_json::json!({
+                    "AuthURL": url,
+                    "BackendState": "NeedsLogin",
+                });
+                if let Some(qr) = qr_field {
+                    out["QR"] = serde_json::Value::String(qr);
+                }
+                println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+            } else {
                 println!("\nTo authenticate, visit:\n  {url}\n");
+                if qr {
+                    match qrcode::render_terminal(url) {
+                        Ok(rendered) => eprint!("{rendered}"),
+                        Err(e) => eprintln!("QR code error: {e}"),
+                    }
+                }
             }
         }
         if let Some(true) = msg.LoginFinished {

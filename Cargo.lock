@@ -1512,6 +1512,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "qrcode"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "166f136dfdb199f98186f3649cf7a0536534a61417a1a30221b492b4fb60ce3f"
+
+[[package]]
 name = "quote"
 version = "1.0.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1886,6 +1892,10 @@ dependencies = [
 name = "rustscale-cli"
 version = "0.1.0"
 dependencies = [
+ "base64",
+ "crc32fast",
+ "flate2",
+ "qrcode",
  "rustscale-ipn",
  "rustscale-localclient",
  "rustscale-netcheck",

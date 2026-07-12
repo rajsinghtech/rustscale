@@ -455,6 +455,77 @@ impl ControlCertProvider {
         }
     }
 
+    /// Like [`refresh`](Self::refresh) but ensures the cert is valid for at
+    /// least `min_validity` beyond now. If the cached cert is valid but
+    /// expires sooner than `min_validity`, a fresh fetch is forced (bypassing
+    /// the normal [`CERT_REFRESH_THRESHOLD`]). A zero `min_validity` behaves
+    /// exactly like `refresh()` (just ensures not-expired).
+    pub async fn refresh_with_min_validity(&self, min_validity: Duration) -> Result<(), CertError> {
+        if min_validity.is_zero() {
+            return self.refresh().await;
+        }
+
+        let now = Utc::now();
+        if let Some(cached) = self.load_cached()? {
+            if cached.not_after > now + min_validity {
+                *self.material.lock().expect("cert material mutex") = Some(cached);
+                return Ok(());
+            }
+            // Cached but insufficient remaining validity — fall through to fetch.
+        }
+
+        match self.fetcher.fetch(&self.domain).await {
+            Ok(mat) => {
+                self.write_cached(&mat)?;
+                *self.material.lock().expect("cert material mutex") = Some(mat);
+                Ok(())
+            }
+            Err(e) => {
+                // On fetch failure, serve a still-valid cached cert if we have one.
+                if let Some(cached) = self.load_cached()? {
+                    if cached.not_after > now {
+                        if let Some(ref health) = self.health {
+                            health.set_unhealthy(
+                                rustscale_health::WARN_CERT_FALLBACK,
+                                format!("serving stale cached cert: {e}"),
+                            );
+                        }
+                        *self.material.lock().expect("cert material mutex") = Some(cached);
+                        return Ok(());
+                    }
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Return the cached PEM cert chain, or `None` if `refresh` hasn't run.
+    pub fn cert_pem(&self) -> Option<Vec<u8>> {
+        self.material
+            .lock()
+            .expect("cert material mutex")
+            .as_ref()
+            .map(|m| m.cert_pem.clone())
+    }
+
+    /// Return the cached PEM private key, or `None` if `refresh` hasn't run.
+    pub fn key_pem(&self) -> Option<Vec<u8>> {
+        self.material
+            .lock()
+            .expect("cert material mutex")
+            .as_ref()
+            .map(|m| m.key_pem.clone())
+    }
+
+    /// Return the leaf cert's not-after time, or `None` if not loaded.
+    pub fn not_after(&self) -> Option<DateTime<Utc>> {
+        self.material
+            .lock()
+            .expect("cert material mutex")
+            .as_ref()
+            .map(|m| m.not_after)
+    }
+
     fn crt_path(&self) -> PathBuf {
         self.state_dir.join(format!("{}.crt.pem", self.domain))
     }

@@ -1037,6 +1037,19 @@ impl Server {
                         .and_then(|d| rustscale_ipn::LoginProfile::load_current_id(d).ok())
                         .flatten(),
                 )),
+                cert_params: self
+                    .config
+                    .state_dir
+                    .clone()
+                    .map(|dir| localapi::CertParams {
+                        state_dir: dir,
+                        control_url: self.config.control_url.clone(),
+                        machine_key: b.machine_key.clone(),
+                        server_pub_key: b.server_pub_key.clone(),
+                        node_key: b.node_key.clone(),
+                        capability_version: CAPABILITY_VERSION,
+                        protocol_version: PROTOCOL_VERSION,
+                    }),
             };
             if let Some(h) = localapi::spawn_localapi(Arc::new(state), path.clone()) {
                 tasks.push(h.task);
@@ -1355,6 +1368,19 @@ impl Server {
                         .and_then(|d| rustscale_ipn::LoginProfile::load_current_id(d).ok())
                         .flatten(),
                 )),
+                cert_params: self
+                    .config
+                    .state_dir
+                    .clone()
+                    .map(|dir| localapi::CertParams {
+                        state_dir: dir,
+                        control_url: self.config.control_url.clone(),
+                        machine_key: b.machine_key.clone(),
+                        server_pub_key: b.server_pub_key.clone(),
+                        node_key: b.node_key.clone(),
+                        capability_version: CAPABILITY_VERSION,
+                        protocol_version: PROTOCOL_VERSION,
+                    }),
             };
             if let Some(h) = localapi::spawn_localapi(Arc::new(state), path.clone()) {
                 tasks.push(h.task);
@@ -1560,6 +1586,7 @@ impl Server {
                     .and_then(|d| rustscale_ipn::LoginProfile::load_current_id(d).ok())
                     .flatten(),
             )),
+            cert_params: None,
         });
 
         let handle = localapi::spawn_localapi(api_state, socket_path.clone());

@@ -279,6 +279,78 @@ impl LocalClient {
     }
 
     // -----------------------------------------------------------------------
+    // Cert API
+    // -----------------------------------------------------------------------
+
+    /// `GET /localapi/v0/cert/<domain>?type=pair&min_validity=<dur>` — returns
+    /// the raw response body (key PEM then cert PEM, concatenated). This is
+    /// the low-level method behind [`cert_pair`](Self::cert_pair).
+    pub async fn cert_raw(
+        &self,
+        domain: &str,
+        typ: &str,
+        min_validity: &str,
+    ) -> Result<Vec<u8>, LocalClientError> {
+        let path = format!(
+            "/localapi/v0/cert/{}?type={}&min_validity={}",
+            url_encode(domain),
+            url_encode(typ),
+            url_encode(min_validity),
+        );
+        let (_status, body) = self.send_request("GET", &path, &[]).await?;
+        Ok(body)
+    }
+
+    /// Fetch a cert+key pair for `domain`. Returns `(cert_pem, key_pem)` —
+    /// the PEM-encoded cert chain and private key, split from the `type=pair`
+    /// response (key first, then cert, matching Go's wire format).
+    ///
+    /// `min_validity_secs` of 0 means "just don't be expired".
+    pub async fn cert_pair(
+        &self,
+        domain: &str,
+        min_validity_secs: u64,
+    ) -> Result<(Vec<u8>, Vec<u8>), LocalClientError> {
+        let mv = if min_validity_secs == 0 {
+            String::from("0")
+        } else {
+            format!("{}s", min_validity_secs)
+        };
+        let body = self.cert_raw(domain, "pair", &mv).await?;
+        split_pair_pem(&body).ok_or_else(|| {
+            LocalClientError::Io("unexpected cert pair: no key/cert delimiter".into())
+        })
+    }
+
+    /// Fetch the cert PEM only for `domain` (`type=cert`).
+    pub async fn cert(
+        &self,
+        domain: &str,
+        min_validity_secs: u64,
+    ) -> Result<Vec<u8>, LocalClientError> {
+        let mv = if min_validity_secs == 0 {
+            String::from("0")
+        } else {
+            format!("{}s", min_validity_secs)
+        };
+        self.cert_raw(domain, "cert", &mv).await
+    }
+
+    /// Fetch the private key PEM only for `domain` (`type=key`).
+    pub async fn cert_key(
+        &self,
+        domain: &str,
+        min_validity_secs: u64,
+    ) -> Result<Vec<u8>, LocalClientError> {
+        let mv = if min_validity_secs == 0 {
+            String::from("0")
+        } else {
+            format!("{}s", min_validity_secs)
+        };
+        self.cert_raw(domain, "key", &mv).await
+    }
+
+    // -----------------------------------------------------------------------
     // Internal HTTP plumbing
     // -----------------------------------------------------------------------
 
@@ -492,6 +564,30 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
+/// Split a `type=pair` PEM blob into `(cert_pem, key_pem)`. The wire format
+/// (matching Go's `serveKeyPair`) is key PEM first, then cert PEM. We split
+/// at the boundary between the first PEM block end and the second begin.
+fn split_pair_pem(pair: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+    // Find the end of the first PEM block (key).
+    let end_marker = b"-----END PRIVATE KEY-----";
+    let end_pos = pair
+        .windows(end_marker.len())
+        .position(|w| w == end_marker)?;
+    let after_end = end_pos + end_marker.len();
+    // Skip trailing whitespace (newline) after the key block.
+    let rest = &pair[after_end..];
+    let cert_start_offset = rest.iter().position(|b| !b.is_ascii_whitespace())?;
+    let cert_start = after_end + cert_start_offset;
+    let key_pem = pair[..cert_start].to_vec();
+    let cert_pem = pair[cert_start..].to_vec();
+    // Sanity: the second block should be a cert, not another key.
+    let needle = b"PRIVATE KEY-----";
+    if cert_pem.windows(needle.len()).any(|w| w == needle) {
+        return None;
+    }
+    Some((cert_pem, key_pem))
+}
+
 /// Map an HTTP status code to a typed error if it's not 200.
 fn check_status(status: u16, body: &[u8]) -> Result<(), LocalClientError> {
     if status == 200 || (200..300).contains(&status) {
@@ -598,5 +694,32 @@ mod tests {
     fn test_local_client_construction() {
         let lc = LocalClient::new("/tmp/test.sock");
         assert_eq!(lc.socket_path(), std::path::Path::new("/tmp/test.sock"));
+    }
+
+    #[test]
+    fn test_split_pair_pem() {
+        let key = b"-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n";
+        let cert = b"-----BEGIN CERTIFICATE-----\nBBBB\n-----END CERTIFICATE-----\n";
+        let mut pair = Vec::new();
+        pair.extend_from_slice(key);
+        pair.extend_from_slice(cert);
+        let (c, k) = split_pair_pem(&pair).expect("split");
+        assert_eq!(k, key);
+        assert_eq!(c, cert);
+    }
+
+    #[test]
+    fn test_split_pair_pem_rejects_key_in_cert() {
+        let key1 = b"-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n";
+        let key2 = b"-----BEGIN PRIVATE KEY-----\nBBBB\n-----END PRIVATE KEY-----\n";
+        let mut pair = Vec::new();
+        pair.extend_from_slice(key1);
+        pair.extend_from_slice(key2);
+        assert!(split_pair_pem(&pair).is_none());
+    }
+
+    #[test]
+    fn test_split_pair_pem_missing_end_returns_none() {
+        assert!(split_pair_pem(b"not pem at all").is_none());
     }
 }

@@ -28,6 +28,7 @@ mod disco_io;
 mod endpoint;
 mod relay;
 mod relay_manager;
+mod relay_server;
 
 pub use endpoint::{BestPath, Endpoint, PathClass, TRUST_BEST_ADDR_DURATION};
 pub use relay::{
@@ -40,6 +41,7 @@ pub use relay_manager::{
     discover_relay_servers, spawn_relay_manager, CandidatePeerRelay, RelayManagerContext,
     RelayManagerHandle, ServerEndpoint,
 };
+pub use relay_server::RelayServerExtension;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -105,13 +107,22 @@ pub struct MagicsockConfig {
     /// region connection state (healthy on connect, unhealthy on failure).
     pub health: Option<rustscale_health::Tracker>,
     /// Test-support: when true, suppress all direct-path establishment and
-    /// force every send via DERP. Disco pings are not sent in `set_netmap`,
+    /// force direct sends via DERP. Disco pings are not sent in `set_netmap`,
     /// CallMeMaybe-initiated pings are skipped, and inbound disco Pings over
     /// UDP are not answered — so neither side confirms a direct path. `send`
-    /// also ignores any Direct/Relay best path and routes via DERP. This
-    /// pins both directions to DERP, letting interop tests assert relayed
-    /// connectivity in isolation. Production code should leave this false.
+    /// also ignores any Direct best path and routes via DERP. Relay paths
+    /// (established by the relay manager) still work normally — this flag
+    /// only suppresses direct UDP, not relay UDP. Production code should
+    /// leave this false.
     pub disable_direct_paths: bool,
+    /// When true, start a `udprelay::Server` and handle incoming
+    /// `AllocateUDPRelayEndpointRequest` disco messages received via DERP.
+    /// Sets `Hostinfo.PeerRelay = true` at the tsnet layer. Default false.
+    pub peer_relay_server: bool,
+    /// Optional override for the relay server's `ServerConfig`. When `None`,
+    /// defaults are used (30s bind lifetime, 5min steady-state). Tests use
+    /// shortened lifetimes. Only effective when `peer_relay_server` is true.
+    pub relay_server_config: Option<rustscale_udprelay::ServerConfig>,
 }
 
 /// A received WG datagram with its sender identified.
@@ -144,7 +155,16 @@ struct Inner {
     /// Test-support: suppress direct paths and force DERP (see MagicsockConfig).
     disable_direct_paths: bool,
     /// Relay manager for peer relay discovery, allocation, and handshake.
-    relay_manager: Option<RelayManagerHandle>,
+    /// Stored in a RwLock because the relay manager's event loop holds an
+    /// Arc<Inner> (for RelayManagerContext), creating a circular reference
+    /// that prevents Arc::get_mut from working at construction time.
+    relay_manager: RwLock<Option<RelayManagerHandle>>,
+    /// Relay server extension: owns a `udprelay::Server` when this node is
+    /// configured as a relay server. Handles `AllocateUDPRelayEndpointRequest`
+    /// disco messages received via DERP.
+    relay_server: Option<Arc<RelayServerExtension>>,
+    /// Self node's CapMap — used to check `NODE_ATTR_DISABLE_RELAY_SERVER`.
+    self_cap_map: Arc<RwLock<rustscale_tailcfg::NodeCapMap>>,
 }
 
 /// Manages DERP connections across multiple regions.
@@ -270,7 +290,7 @@ impl DerpManager {
             &dial_addr,
             &tls_host,
             port,
-            true,
+            !node.InsecureForTests,
             node.InsecureForTests,
             self.node_private.clone(),
         )
@@ -502,7 +522,23 @@ impl Magicsock {
             config.health.clone(),
         );
 
-        let mut inner = Arc::new(Inner {
+        // Self node's CapMap — shared between Inner and RelayServerExtension.
+        let self_cap_map = Arc::new(RwLock::new(std::collections::BTreeMap::new()));
+
+        // Start the relay server extension if enabled.
+        let relay_server = if config.peer_relay_server {
+            let ext = RelayServerExtension::new(
+                true,
+                config.relay_server_config,
+                self_cap_map.clone(),
+            )
+            .await;
+            Some(Arc::new(ext))
+        } else {
+            None
+        };
+
+        let inner = Arc::new(Inner {
             node_public,
             disco,
             udp,
@@ -514,16 +550,22 @@ impl Magicsock {
             wg_send,
             portmapper: config.portmapper,
             disable_direct_paths: config.disable_direct_paths,
-            relay_manager: None,
+            relay_manager: RwLock::new(None),
+            relay_server,
+            self_cap_map,
         });
 
         // Spawn the relay manager event loop. The handle is stored in Inner
-        // for use by set_netmap and disco receive paths.
+        // for use by set_netmap and disco receive paths. We use RwLock
+        // because spawn_relay_manager takes an Arc<Inner> clone (for the
+        // RelayManagerContext impl), preventing Arc::get_mut.
         let rm_handle = relay_manager::spawn_relay_manager(inner.clone());
-        // Safety: inner was just created and no other tasks are running yet,
-        // so get_mut is guaranteed to succeed.
-        if let Some(inner_mut) = Arc::get_mut(&mut inner) {
-            inner_mut.relay_manager = Some(rm_handle);
+        {
+            let mut guard = inner
+                .relay_manager
+                .write()
+                .expect("relay_manager lock poisoned");
+            *guard = Some(rm_handle);
         }
 
         // Launch background recv tasks (UDP + DERP demux + reconnect supervisor).
@@ -774,7 +816,7 @@ impl Magicsock {
 
         // Discover relay server candidates from the netmap and update the
         // relay manager. Ports Go's `updateRelayServersSet`.
-        if let Some(ref rm) = self.inner.relay_manager {
+        if let Some(rm) = self.inner.relay_manager.read().expect("relay_manager lock poisoned").as_ref() {
             let servers = relay_manager::discover_relay_servers(
                 &rustscale_tailcfg::Node {
                     Key: self.inner.node_public.clone(),
@@ -784,6 +826,7 @@ impl Magicsock {
                 },
                 &peers,
             );
+
             rm.handle_relay_servers_set(servers);
 
             // Start relay path discovery for peers that don't already have
@@ -836,9 +879,9 @@ impl Magicsock {
                 self.send_via_derp(peer, derp_region, datagram).await
             }
             endpoint::BestPath::Relay { addr, vni } => {
-                if self.inner.disable_direct_paths {
-                    return self.send_via_derp(peer, derp_region, datagram).await;
-                }
+                // Relay paths work even when direct paths are disabled —
+                // the relay path is established by the relay manager, not
+                // by direct disco pinging.
                 if let Some(ref udp) = self.inner.udp {
                     let framed = relay::encode_geneve(vni, datagram);
                     udp.send_to(&framed, addr).await?;
@@ -902,6 +945,23 @@ impl Magicsock {
         endpoints
             .get(peer)
             .is_some_and(|ep| ep.trusted_direct_addr(std::time::Instant::now()).is_some())
+    }
+
+    /// Update the self node's CapMap from the latest MapResponse. Used to
+    /// check `NODE_ATTR_DISABLE_RELAY_SERVER` for the relay server extension.
+    pub fn set_self_cap_map(&self, cap_map: rustscale_tailcfg::NodeCapMap) {
+        let mut guard = self
+            .inner
+            .self_cap_map
+            .write()
+            .expect("self_cap_map lock poisoned");
+        *guard = cap_map;
+    }
+
+    /// The relay server extension, if this node is configured as a relay
+    /// server. Returns `None` when `peer_relay_server` was not enabled.
+    pub fn relay_server(&self) -> Option<&Arc<RelayServerExtension>> {
+        self.inner.relay_server.as_ref()
     }
 
     /// Send a WG datagram to `peer` via DERP region `region`.
@@ -1152,9 +1212,14 @@ impl relay_manager::RelayManagerContext for Inner {
 
     fn handle_self_alloc_request(
         &self,
-        _client_disco: [DiscoPublic; 2],
-        _generation: u32,
+        client_disco: [DiscoPublic; 2],
+        generation: u32,
     ) -> Option<rustscale_disco::AllocateUdpRelayEndpointResponse> {
+        // In-process shortcut: when the relay server is self, bypass DERP
+        // and call the local extension directly (Go magicsock.go:1946-1963).
+        if let Some(ref rs) = self.relay_server {
+            return rs.handle_alloc_request(client_disco, generation);
+        }
         None
     }
 }
@@ -1256,7 +1321,7 @@ impl Inner {
             Message::BindUdpRelayEndpointChallenge(_)
             | Message::Ping(_)
             | Message::Pong(_) => {
-                if let Some(ref rm) = self.relay_manager {
+                if let Some(rm) = self.relay_manager.read().expect("relay_manager lock poisoned").as_ref() {
                     rm.handle_rx_disco_msg(relay_manager::RelayDiscoMsg {
                         msg,
                         disco: sender_disco,
@@ -1458,7 +1523,7 @@ impl Inner {
             Message::CallMeMaybeVia(cmmv) => {
                 // The peer is telling us about a relay endpoint it allocated.
                 // Route to the relay manager to start a handshake.
-                if let Some(ref rm) = self.relay_manager {
+                if let Some(rm) = self.relay_manager.read().expect("relay_manager lock poisoned").as_ref() {
                     let peer_disco = {
                         let endpoints = self
                             .endpoints
@@ -1475,7 +1540,7 @@ impl Inner {
             Message::AllocateUdpRelayEndpointResponse(_) => {
                 // Response to our allocation request, arriving via DERP.
                 // Route to the relay manager.
-                if let Some(ref rm) = self.relay_manager {
+                if let Some(rm) = self.relay_manager.read().expect("relay_manager lock poisoned").as_ref() {
                     rm.handle_rx_disco_msg(relay_manager::RelayDiscoMsg {
                         msg,
                         disco: sender_disco,
@@ -1489,10 +1554,44 @@ impl Inner {
                     });
                 }
             }
-            Message::AllocateUdpRelayEndpointRequest(_) => {
-                // A peer is asking us to allocate a relay endpoint. We don't
-                // run a relay server yet — silently drop. Phase 2 will wire
-                // this to the relayserver extension.
+            Message::AllocateUdpRelayEndpointRequest(alloc_req) => {
+                // A peer is asking us to allocate a relay endpoint. If we
+                // have a relay server extension, authenticate the sender
+                // is a known tailnet peer and call allocate_endpoint.
+                if let Some(ref rs) = self.relay_server {
+                    // Authenticate: the sender's disco key must map to a
+                    // known peer in our netmap. Since the message arrived
+                    // via DERP, the `source` NodePublic is the DERP-claimed
+                    // sender, and `sender_disco` is the authenticated disco
+                    // key from the NaCl box. Both must match a known peer.
+                    let peer_known = {
+                        let d2p = self
+                            .disco_to_peer
+                            .read()
+                            .expect("disco_to_peer lock poisoned");
+                        d2p.contains_key(&sender_disco)
+                    };
+                    if !peer_known {
+                        return;
+                    }
+
+                    if let Some(resp) = rs.handle_alloc_request(
+                        alloc_req.client_disco.clone(),
+                        alloc_req.generation,
+                    ) {
+                        // Send the response via DERP back to the requester.
+                        let resp_msg =
+                            Message::AllocateUdpRelayEndpointResponse(resp);
+                        if let Some(sealed) = self.disco.seal(&sender_disco, &resp_msg) {
+                            let region = if derp_region > 0 {
+                                derp_region
+                            } else {
+                                self.derp.home_region()
+                            };
+                            self.derp.send_packet(region, source, sealed).await;
+                        }
+                    }
+                }
             }
             _ => {}
         }

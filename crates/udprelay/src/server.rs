@@ -24,6 +24,7 @@ use crate::mac::{compute_mac_from_bind_msg, verify_mac, MAC_SIZE};
 const DEFAULT_MAC_SECRET_ROTATION_INTERVAL: Duration = Duration::from_secs(120);
 
 /// Configuration for constructing a [`Server`].
+#[derive(Clone, Debug)]
 pub struct ServerConfig {
     /// UDP port to bind (0 = ephemeral).
     pub port: u16,

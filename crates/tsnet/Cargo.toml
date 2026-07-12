@@ -25,6 +25,7 @@ rustscale-dns = { path = "../dns", version = "0.1.0" }
 rustscale-netmon = { path = "../netmon", version = "0.1.0" }
 rustscale-portmapper = { path = "../portmapper", version = "0.1.0" }
 rustscale-health = { path = "../health", version = "0.1.0" }
+rustscale-udprelay = { path = "../udprelay", version = "0.1.0" }
 rustscale-c2n = { path = "../c2n", version = "0.1.0" }
 rustscale-netns.workspace = true
 serde.workspace = true

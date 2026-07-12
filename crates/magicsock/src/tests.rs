@@ -205,6 +205,8 @@ async fn derp_data_path_fallback() {
         portmapper: None,
         health: None,
         disable_direct_paths: false,
+        peer_relay_server: false,
+        relay_server_config: None,
     })
     .await
     .expect("A magicsock");
@@ -221,6 +223,8 @@ async fn derp_data_path_fallback() {
         portmapper: None,
         health: None,
         disable_direct_paths: false,
+        peer_relay_server: false,
+        relay_server_config: None,
     })
     .await
     .expect("B magicsock");
@@ -286,6 +290,8 @@ async fn direct_path_upgrade_over_udp() {
         portmapper: None,
         health: None,
         disable_direct_paths: false,
+        peer_relay_server: false,
+        relay_server_config: None,
     })
     .await
     .expect("A magicsock");
@@ -302,6 +308,8 @@ async fn direct_path_upgrade_over_udp() {
         portmapper: None,
         health: None,
         disable_direct_paths: false,
+        peer_relay_server: false,
+        relay_server_config: None,
     })
     .await
     .expect("B magicsock");
@@ -377,6 +385,8 @@ async fn trust_expiry_downgrades_to_derp() {
         portmapper: None,
         health: None,
         disable_direct_paths: false,
+        peer_relay_server: false,
+        relay_server_config: None,
     })
     .await
     .expect("A magicsock");
@@ -393,6 +403,8 @@ async fn trust_expiry_downgrades_to_derp() {
         portmapper: None,
         health: None,
         disable_direct_paths: false,
+        peer_relay_server: false,
+        relay_server_config: None,
     })
     .await
     .expect("B magicsock");
@@ -452,6 +464,8 @@ async fn send_unknown_peer_errors() {
         portmapper: None,
         health: None,
         disable_direct_paths: false,
+        peer_relay_server: false,
+        relay_server_config: None,
     })
     .await
     .expect("magicsock");
@@ -541,6 +555,8 @@ async fn multi_region_derp_routing() {
         portmapper: None,
         health: None,
         disable_direct_paths: false,
+        peer_relay_server: false,
+        relay_server_config: None,
     })
     .await
     .expect("A magicsock");
@@ -584,6 +600,8 @@ async fn multi_region_derp_routing() {
         portmapper: None,
         health: None,
         disable_direct_paths: false,
+        peer_relay_server: false,
+        relay_server_config: None,
     })
     .await
     .expect("B magicsock");

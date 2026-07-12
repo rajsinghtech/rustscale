@@ -127,6 +127,7 @@ async fn dispatch(
         "funnel" => commands::serve::run_funnel(args, &socket_path, json).await,
         "switch" => commands::switch::run(args, &socket_path, json).await,
         "ping" => commands::ping::run(args, &socket_path).await,
+        "file" => commands::file::run(args, &socket_path, json).await,
         other => {
             eprintln!("error: unknown subcommand '{other}'");
             usage(&std::env::args().next().unwrap_or_default());
@@ -165,6 +166,8 @@ fn usage(bin: &str) {
     eprintln!("  metrics                             print Prometheus-format metrics");
     eprintln!("  health                              print active health warnings");
     eprintln!("  ping <ip>                           ping a peer (not yet supported)");
+    eprintln!("  file cp <files...> <target>:        send file(s) to a host");
+    eprintln!("  file get [--wait] [--conflict=...] <dir>  receive files from the inbox");
 }
 
 /// Error type for CLI subcommands.

@@ -1,4 +1,5 @@
 pub mod down;
+pub mod file;
 pub mod get;
 pub mod health;
 pub mod ip;

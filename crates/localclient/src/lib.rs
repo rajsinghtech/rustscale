@@ -30,9 +30,9 @@ pub use stream::WatchIpnBus;
 
 use std::path::PathBuf;
 
-use rustscale_ipn::{LoginProfile, MaskedPrefs, NotifyWatchOpt, Prefs, StartOptions};
+use rustscale_ipn::{LoginProfile, MaskedPrefs, NotifyWatchOpt, Prefs, StartOptions, WaitingFile};
 use rustscale_tailcfg::DERPMap;
-use rustscale_tsnet::ServeConfig;
+use rustscale_tsnet::{FileTarget, ServeConfig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
@@ -275,6 +275,62 @@ impl LocalClient {
     pub async fn delete_profile(&self, profile_id: &str) -> Result<(), LocalClientError> {
         let path = format!("/localapi/v0/profiles/{}", url_encode(profile_id));
         let (_status, _) = self.send_request_with_body("DELETE", &path, &[]).await?;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Taildrop file API
+    // -----------------------------------------------------------------------
+
+    /// GET /localapi/v0/file-targets — list peers that can receive files.
+    pub async fn file_targets(&self) -> Result<Vec<FileTarget>, LocalClientError> {
+        let (_status, body) = self
+            .send_request("GET", "/localapi/v0/file-targets", &[])
+            .await?;
+        let targets: Vec<FileTarget> =
+            serde_json::from_slice(&body).map_err(|e| LocalClientError::Json(e.to_string()))?;
+        Ok(targets)
+    }
+
+    /// GET /localapi/v0/files/ — list waiting files in the inbox.
+    pub async fn waiting_files(&self) -> Result<Vec<WaitingFile>, LocalClientError> {
+        let (_status, body) = self.send_request("GET", "/localapi/v0/files/", &[]).await?;
+        let files: Vec<WaitingFile> =
+            serde_json::from_slice(&body).map_err(|e| LocalClientError::Json(e.to_string()))?;
+        Ok(files)
+    }
+
+    /// GET /localapi/v0/files/<name> — download a file from the inbox.
+    /// Returns `(bytes, size)`.
+    pub async fn get_waiting_file(&self, name: &str) -> Result<(Vec<u8>, i64), LocalClientError> {
+        let path = format!("/localapi/v0/files/{}", url_encode(name));
+        let (_status, body) = self.send_request("GET", &path, &[]).await?;
+        let size = body.len() as i64;
+        Ok((body, size))
+    }
+
+    /// DELETE /localapi/v0/files/<name> — delete a file from the inbox.
+    pub async fn delete_waiting_file(&self, name: &str) -> Result<(), LocalClientError> {
+        let path = format!("/localapi/v0/files/{}", url_encode(name));
+        let (_status, _) = self.send_request_with_body("DELETE", &path, &[]).await?;
+        Ok(())
+    }
+
+    /// PUT /localapi/v0/file-put/<stableID>/<filename> — upload a file to a
+    /// peer via the daemon (which dials the peer's PeerAPI). The daemon
+    /// proxies the upload through the tailnet.
+    pub async fn push_file(
+        &self,
+        stable_id: &str,
+        filename: &str,
+        body: &[u8],
+    ) -> Result<(), LocalClientError> {
+        let path = format!(
+            "/localapi/v0/file-put/{}/{}",
+            url_encode(stable_id),
+            url_encode(filename)
+        );
+        let (_status, _) = self.send_request_with_body("PUT", &path, body).await?;
         Ok(())
     }
 

@@ -473,6 +473,7 @@ mod tests {
             }),
             BrowseToURL: Some("https://example.com".into()),
             InitialStatus: Some(serde_json::json!({})),
+            FilesWaiting: None,
         };
         let j = serde_json::to_string(&n).unwrap();
         assert!(j.contains("\"Version\":\"1.0\""));

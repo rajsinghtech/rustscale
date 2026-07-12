@@ -247,6 +247,23 @@ pub struct Notify {
     /// Initial status snapshot (set when `NotifyInitialStatus` is requested).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub InitialStatus: Option<serde_json::Value>,
+
+    /// Waiting files in the Taildrop inbox (set when new files arrive).
+    /// Mirrors Go's `ipn.Notify.FilesWaiting`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub FilesWaiting: Option<Vec<WaitingFile>>,
+}
+
+/// A file waiting in the Taildrop inbox, mirroring Go's
+/// `apitype.WaitingFile`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WaitingFile {
+    /// The file name (basename, no path).
+    #[serde(default)]
+    pub Name: String,
+    /// The file size in bytes.
+    #[serde(default)]
+    pub Size: i64,
 }
 
 impl Notify {

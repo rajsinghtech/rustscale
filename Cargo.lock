@@ -2281,6 +2281,7 @@ dependencies = [
  "rustscale-health",
  "rustscale-ipn",
  "rustscale-key",
+ "rustscale-localclient",
  "rustscale-magicsock",
  "rustscale-netcheck",
  "rustscale-netmon",

@@ -15,6 +15,7 @@ mod filter;
 mod map;
 mod node;
 mod register;
+mod ssh;
 
 pub use caps::{
     cap_ver_is_relay_capable, has_capability, relay_client_disabled, relay_server_disabled,
@@ -30,6 +31,7 @@ pub use node::{
     TPMInfo,
 };
 pub use register::{Login, LoginID, RegisterRequest, RegisterResponse, RegisterResponseAuth, User};
+pub use ssh::{SSHAction, SSHPrincipal, SSHPolicy, SSHRecorderFailureAction, SSHRule};
 
 pub use rustscale_key::{
     DiscoPublic as DiscoKey, MachinePublic as MachineKey, NodePublic as NodeKey,

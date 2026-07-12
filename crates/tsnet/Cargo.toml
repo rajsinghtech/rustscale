@@ -89,3 +89,11 @@ rustscale-tailcfg = { path = "../tailcfg", version = "0.1.0" }
 rustscale-testcontrol = { path = "../testcontrol", version = "0.1.0" }
 rustscale-safesocket = { path = "../safesocket", version = "0.1.0" }
 tempfile = "3"
+
+[features]
+ssh = ["dep:rustscale-ssh"]
+
+[dependencies.rustscale-ssh]
+path = "../ssh"
+version = "0.1.0"
+optional = true

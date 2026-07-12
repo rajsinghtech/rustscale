@@ -696,7 +696,7 @@ fn desktop_detection() -> OptBool {
     #[cfg(target_os = "linux")]
     {
         if let Ok(content) = fs::read_to_string("/proc/net/unix") {
-            let has_desktop = desktop_from_unix_sockets(&content);
+            let has_desktop = desktop_from_unix_socks(&content);
             return OptBool::new(has_desktop);
         }
         return OptBool::Unset;

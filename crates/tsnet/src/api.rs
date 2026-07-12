@@ -46,6 +46,141 @@ impl Server {
         }
     }
 
+    /// Get the current server status as an `ipnstate::Status`, the unified
+    /// single source of truth that mirrors Go's `ipnstate.Status`. This is
+    /// the same struct serialized by the LocalAPI `/status` endpoint.
+    ///
+    /// Returns `None` if the server is not up.
+    pub async fn ipn_status(&self) -> Option<rustscale_ipnstate::Status> {
+        let inner = self.inner.as_ref()?;
+        let peers = inner.peers.read().await;
+        let user_profiles = inner.user_profiles.read().await;
+        let dns_config = inner.dns_config.read().await;
+
+        let mut sb = rustscale_ipnstate::StatusBuilder::new();
+
+        sb.mutate_status(|s| {
+            s.Version = "rustscale".into();
+            s.BackendState = inner.ipn_backend.state().as_str().to_string();
+            s.HaveNodeKey = Some(true);
+            s.Health = inner
+                .health
+                .current_warnings()
+                .iter()
+                .map(|w| w.text.clone())
+                .collect();
+            for ip in &inner.tailscale_ips {
+                s.TailscaleIPs.push(*ip);
+            }
+            let (tailnet_name, magicdns_suffix, magicdns_enabled) =
+                if let Some(ref dns) = *dns_config {
+                    let suffix = inner.our_fqdn.trim_end_matches('.');
+                    let suffix = match suffix.split_once('.') {
+                        Some((_, d)) => d,
+                        None => suffix,
+                    };
+                    (suffix.to_string(), suffix.to_string(), dns.Proxied)
+                } else {
+                    (String::new(), String::new(), false)
+                };
+            s.CurrentTailnet = Some(Box::new(rustscale_ipnstate::TailnetStatus {
+                Name: tailnet_name,
+                MagicDNSSuffix: magicdns_suffix,
+                MagicDNSEnabled: magicdns_enabled,
+            }));
+            let cert_domains: Vec<String> = dns_config
+                .as_ref()
+                .map(|c| c.CertDomains.clone())
+                .unwrap_or_default();
+            s.CertDomains = cert_domains;
+        });
+
+        sb.mutate_self_status(|ps| {
+            ps.HostName.clone_from(&self.config.hostname);
+            ps.DNSName.clone_from(&inner.our_fqdn);
+            ps.TailscaleIPs.clone_from(&inner.tailscale_ips);
+            ps.PublicKey = inner.magicsock.node_public().to_string();
+            ps.Online = true;
+            ps.InNetworkMap = true;
+            ps.InMagicSock = true;
+            ps.InEngine = true;
+        });
+
+        for peer in peers.iter() {
+            if peer.Key.is_zero() {
+                continue;
+            }
+            let ips: Vec<IpAddr> = peer
+                .Addresses
+                .iter()
+                .filter_map(|s| s.split('/').next().and_then(|p| p.parse::<IpAddr>().ok()))
+                .collect();
+
+            let path_class = inner.magicsock.peer_path_class(&peer.Key);
+            let relay = match path_class {
+                rustscale_magicsock::PathClass::Derp => {
+                    format!("derp-{}", inner.magicsock.home_derp_region())
+                }
+                _ => String::new(),
+            };
+
+            let exit_node_option = peer
+                .AllowedIPs
+                .iter()
+                .any(|r| r == "0.0.0.0/0" || r == "::/0");
+
+            let ps = rustscale_ipnstate::PeerStatus {
+                HostName: peer.Name.trim_end_matches('.').to_string(),
+                DNSName: peer.Name.clone(),
+                TailscaleIPs: ips,
+                Online: peer.Online.unwrap_or(false),
+                Relay: relay,
+                ExitNodeOption: exit_node_option,
+                InNetworkMap: true,
+                InMagicSock: true,
+                InEngine: true,
+                UserID: peer.User,
+                ..Default::default()
+            };
+            sb.add_peer(&peer.Key, ps);
+        }
+
+        for (id, profile) in user_profiles.iter() {
+            sb.add_user(*id, profile.clone());
+        }
+
+        // Check for exit node.
+        let rt = inner.route_table.read().await;
+        if let Some(exit_key) = rt.exit_node() {
+            let exit_id = exit_key.to_string();
+            let online = peers
+                .iter()
+                .find(|p| &p.Key == exit_key)
+                .and_then(|p| p.Online)
+                .unwrap_or(false);
+            let exit_ips: Vec<String> = peers
+                .iter()
+                .find(|p| &p.Key == exit_key)
+                .map(|p| {
+                    p.Addresses
+                        .iter()
+                        .filter_map(|s| s.split('/').next().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            sb.mutate_status(|s| {
+                s.ExitNodeStatus = Some(Box::new(rustscale_ipnstate::ExitNodeStatus {
+                    ID: exit_id,
+                    Online: online,
+                    TailscaleIPs: exit_ips,
+                }));
+            });
+        }
+        drop(rt);
+
+        Some(sb.status())
+    }
+
     /// Listen for incoming TCP connections on `port` (netstack mode only).
     ///
     /// **Auto-starts** the server if it has not been started yet (calling

@@ -7,6 +7,8 @@ use rustscale_key::NodePublic;
 use rustscale_magicsock::PathClass;
 
 /// Information about a single peer in the netmap.
+///
+/// Deprecated: use `ipnstate::PeerStatus` via `Server::ipn_status()` instead.
 #[derive(Clone, Debug)]
 pub struct PeerInfo {
     /// The peer's WireGuard node public key.
@@ -20,6 +22,8 @@ pub struct PeerInfo {
 }
 
 /// Full server status for diagnostics, returned by `Server::status()`.
+///
+/// Deprecated: use `ipnstate::Status` via `Server::ipn_status()` instead.
 #[derive(Clone, Debug)]
 pub struct ServerStatus {
     /// Whether the server is up.

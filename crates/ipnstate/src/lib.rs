@@ -6,6 +6,9 @@ use std::net::IpAddr;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
 
+use rustscale_key::NodePublic;
+use rustscale_tailcfg::{DNSRecord, UserID, UserProfile};
+
 fn deserialize_null_to_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
     D: Deserializer<'de>,
@@ -20,7 +23,22 @@ fn is_zero_i64(v: &i64) -> bool {
     *v == 0
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_false(v: &bool) -> bool {
+    !*v
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_epoch_time(v: &DateTime<Utc>) -> bool {
+    *v == DateTime::UNIX_EPOCH
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_taildrop_unknown(v: &TaildropTargetStatus) -> bool {
+    *v == TaildropTargetStatus::Unknown
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Status {
     #[serde(default)]
     pub Version: String,
@@ -30,7 +48,7 @@ pub struct Status {
     pub BackendState: String,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub HaveNodeKey: Option<bool>,
-    #[serde(default)]
+    #[serde(skip_serializing_if = "String::is_empty", default)]
     pub AuthURL: String,
     #[serde(default, deserialize_with = "deserialize_null_to_default")]
     pub TailscaleIPs: Vec<IpAddr>,
@@ -40,18 +58,22 @@ pub struct Status {
     pub ExitNodeStatus: Option<Box<ExitNodeStatus>>,
     #[serde(default, deserialize_with = "deserialize_null_to_default")]
     pub Health: Vec<String>,
-    #[serde(default)]
+    #[serde(skip_serializing_if = "String::is_empty", default)]
     pub MagicDNSSuffix: String,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub CurrentTailnet: Option<Box<TailnetStatus>>,
     #[serde(default, deserialize_with = "deserialize_null_to_default")]
     pub CertDomains: Vec<String>,
-    #[serde(default, deserialize_with = "deserialize_null_to_default")]
-    pub ExtraRecords: Vec<serde_json::Value>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_null_to_default",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub ExtraRecords: Vec<DNSRecord>,
     #[serde(default, deserialize_with = "deserialize_null_to_default")]
     pub Peer: BTreeMap<String, PeerStatus>,
     #[serde(default, deserialize_with = "deserialize_null_to_default")]
-    pub User: BTreeMap<i64, serde_json::Value>,
+    pub User: BTreeMap<UserID, UserProfile>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub ClientVersion: Option<serde_json::Value>,
 }
@@ -68,21 +90,21 @@ pub struct PeerStatusLite {
     pub LastHandshake: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct PeerStatus {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub ID: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
     pub NodeID: i64,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub PublicKey: String,
     #[serde(default)]
     pub HostName: String,
     #[serde(default)]
     pub DNSName: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub OS: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
     pub UserID: i64,
     #[serde(default, skip_serializing_if = "is_zero_i64")]
     pub AltSharerUserID: i64,
@@ -94,39 +116,47 @@ pub struct PeerStatus {
     pub Tags: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub PrimaryRoutes: Option<Vec<String>>,
-    #[serde(default, deserialize_with = "deserialize_null_to_default")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_null_to_default",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub Addrs: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub CurAddr: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub Relay: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub PeerRelay: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
     pub RxBytes: i64,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
     pub TxBytes: i64,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_epoch_time")]
     pub Created: DateTime<Utc>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_epoch_time")]
     pub LastWrite: DateTime<Utc>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_epoch_time")]
     pub LastSeen: DateTime<Utc>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_epoch_time")]
     pub LastHandshake: DateTime<Utc>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub Online: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub ExitNode: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub ExitNodeOption: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub Active: bool,
-    #[serde(default, deserialize_with = "deserialize_null_to_default")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_null_to_default",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub PeerAPIURL: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_taildrop_unknown")]
     pub TaildropTarget: TaildropTargetStatus,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub NoFileSharingReason: String,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub Capabilities: Option<Vec<String>>,
@@ -136,11 +166,11 @@ pub struct PeerStatus {
     pub SSH_HostKeys: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub ShareeNode: Option<bool>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub InNetworkMap: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub InMagicSock: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub InEngine: bool,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub Expired: Option<bool>,
@@ -211,6 +241,179 @@ impl<'de> Deserialize<'de> for TaildropTargetStatus {
             ))),
         }
     }
+}
+
+pub struct StatusBuilder {
+    locked: bool,
+    status: Status,
+}
+
+impl Default for StatusBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl StatusBuilder {
+    pub fn new() -> Self {
+        Self {
+            locked: false,
+            status: Status::default(),
+        }
+    }
+
+    pub fn mutate_status(&mut self, f: impl FnOnce(&mut Status)) {
+        assert!(!self.locked, "StatusBuilder already locked");
+        f(&mut self.status);
+    }
+
+    pub fn mutate_self_status(&mut self, f: impl FnOnce(&mut PeerStatus)) {
+        assert!(!self.locked, "StatusBuilder already locked");
+        if self.status.SelfPeer.is_none() {
+            self.status.SelfPeer = Some(Box::new(PeerStatus::default()));
+        }
+        if let Some(ref mut ps) = self.status.SelfPeer {
+            f(ps);
+        }
+    }
+
+    pub fn add_user(&mut self, id: UserID, up: UserProfile) {
+        assert!(!self.locked, "StatusBuilder already locked");
+        self.status.User.insert(id, up);
+    }
+
+    pub fn add_tailscale_ip(&mut self, ip: IpAddr) {
+        assert!(!self.locked, "StatusBuilder already locked");
+        self.status.TailscaleIPs.push(ip);
+    }
+
+    pub fn add_peer(&mut self, peer: &NodePublic, mut st: PeerStatus) {
+        assert!(!self.locked, "StatusBuilder already locked");
+        let key_str = peer.to_string();
+        st.PublicKey.clone_from(&key_str);
+        if let Some(e) = self.status.Peer.get_mut(&key_str) {
+            merge_peer_status(e, &st);
+        } else {
+            self.status.Peer.insert(key_str, st);
+        }
+    }
+
+    pub fn status(&mut self) -> Status {
+        self.locked = true;
+        std::mem::take(&mut self.status)
+    }
+}
+
+fn merge_peer_status(e: &mut PeerStatus, st: &PeerStatus) {
+    if !st.ID.is_empty() {
+        e.ID.clone_from(&st.ID);
+    }
+    if st.NodeID != 0 {
+        e.NodeID = st.NodeID;
+    }
+    if !st.HostName.is_empty() {
+        e.HostName.clone_from(&st.HostName);
+    }
+    if !st.DNSName.is_empty() {
+        e.DNSName.clone_from(&st.DNSName);
+    }
+    if !st.Relay.is_empty() {
+        e.Relay.clone_from(&st.Relay);
+    }
+    if !st.PeerRelay.is_empty() {
+        e.PeerRelay.clone_from(&st.PeerRelay);
+    }
+    if st.UserID != 0 {
+        e.UserID = st.UserID;
+    }
+    if st.AltSharerUserID != 0 {
+        e.AltSharerUserID = st.AltSharerUserID;
+    }
+    if !st.TailscaleIPs.is_empty() {
+        e.TailscaleIPs.clone_from(&st.TailscaleIPs);
+    }
+    if st.PrimaryRoutes.is_some() {
+        e.PrimaryRoutes.clone_from(&st.PrimaryRoutes);
+    }
+    if st.AllowedIPs.is_some() {
+        e.AllowedIPs.clone_from(&st.AllowedIPs);
+    }
+    if st.Tags.is_some() {
+        e.Tags.clone_from(&st.Tags);
+    }
+    if !st.OS.is_empty() {
+        e.OS.clone_from(&st.OS);
+    }
+    if st.SSH_HostKeys.is_some() {
+        e.SSH_HostKeys.clone_from(&st.SSH_HostKeys);
+    }
+    if !st.Addrs.is_empty() {
+        e.Addrs.clone_from(&st.Addrs);
+    }
+    if !st.CurAddr.is_empty() {
+        e.CurAddr.clone_from(&st.CurAddr);
+    }
+    if st.RxBytes != 0 {
+        e.RxBytes = st.RxBytes;
+    }
+    if st.TxBytes != 0 {
+        e.TxBytes = st.TxBytes;
+    }
+    if st.LastHandshake != DateTime::UNIX_EPOCH {
+        e.LastHandshake = st.LastHandshake;
+    }
+    if st.Created != DateTime::UNIX_EPOCH {
+        e.Created = st.Created;
+    }
+    if st.LastSeen != DateTime::UNIX_EPOCH {
+        e.LastSeen = st.LastSeen;
+    }
+    if st.LastWrite != DateTime::UNIX_EPOCH {
+        e.LastWrite = st.LastWrite;
+    }
+    if st.Online {
+        e.Online = true;
+    }
+    if st.InNetworkMap {
+        e.InNetworkMap = true;
+    }
+    if st.InMagicSock {
+        e.InMagicSock = true;
+    }
+    if st.InEngine {
+        e.InEngine = true;
+    }
+    if st.ExitNode {
+        e.ExitNode = true;
+    }
+    if st.ExitNodeOption {
+        e.ExitNodeOption = true;
+    }
+    if st.ShareeNode.is_some() {
+        e.ShareeNode = st.ShareeNode;
+    }
+    if st.Active {
+        e.Active = true;
+    }
+    if !st.PeerAPIURL.is_empty() {
+        e.PeerAPIURL.clone_from(&st.PeerAPIURL);
+    }
+    if st.CapMap.is_some() {
+        e.CapMap.clone_from(&st.CapMap);
+    }
+    if st.Capabilities.is_some() {
+        e.Capabilities.clone_from(&st.Capabilities);
+    }
+    if st.TaildropTarget != TaildropTargetStatus::Unknown {
+        e.TaildropTarget = st.TaildropTarget;
+    }
+    if st.Expired == Some(true) {
+        e.Expired = Some(true);
+    }
+    if st.KeyExpiry.is_some() {
+        e.KeyExpiry = st.KeyExpiry;
+    }
+    e.Location.clone_from(&st.Location);
 }
 
 #[cfg(test)]
@@ -416,5 +619,126 @@ mod tests {
         let peer = &status.Peer["mnode:abc"];
         assert!(peer.TailscaleIPs.is_empty());
         assert!(peer.Addrs.is_empty());
+    }
+
+    #[test]
+    fn status_builder_basic() {
+        let mut sb = StatusBuilder::new();
+        sb.mutate_status(|s| {
+            s.Version = "1.0.0".into();
+            s.BackendState = "Running".into();
+            s.HaveNodeKey = Some(true);
+        });
+        sb.mutate_self_status(|ps| {
+            ps.HostName = "myhost".into();
+            ps.Online = true;
+            ps.InNetworkMap = true;
+            ps.InMagicSock = true;
+            ps.InEngine = true;
+        });
+        sb.add_tailscale_ip("100.64.0.1".parse().unwrap());
+
+        let st = sb.status();
+        assert_eq!(st.Version, "1.0.0");
+        assert_eq!(st.BackendState, "Running");
+        assert_eq!(st.HaveNodeKey, Some(true));
+        assert_eq!(st.TailscaleIPs.len(), 1);
+        assert!(st.SelfPeer.is_some());
+        assert_eq!(st.SelfPeer.as_ref().unwrap().HostName, "myhost");
+        assert!(st.SelfPeer.as_ref().unwrap().Online);
+    }
+
+    #[test]
+    fn status_builder_add_peer_merge() {
+        let key = NodePublic::from_raw32([1u8; 32]);
+        let key_str = key.to_string();
+
+        let mut sb = StatusBuilder::new();
+        let ps1 = PeerStatus {
+            HostName: "node1".into(),
+            Online: true,
+            InNetworkMap: true,
+            ..Default::default()
+        };
+        sb.add_peer(&key, ps1);
+
+        let ps2 = PeerStatus {
+            RxBytes: 1000,
+            TxBytes: 500,
+            InMagicSock: true,
+            ..Default::default()
+        };
+        sb.add_peer(&key, ps2);
+
+        let st = sb.status();
+        assert_eq!(st.Peer.len(), 1);
+        let peer = &st.Peer[&key_str];
+        assert_eq!(peer.HostName, "node1");
+        assert!(peer.Online);
+        assert!(peer.InNetworkMap);
+        assert!(peer.InMagicSock);
+        assert_eq!(peer.RxBytes, 1000);
+        assert_eq!(peer.TxBytes, 500);
+    }
+
+    #[test]
+    fn status_builder_add_user() {
+        let mut sb = StatusBuilder::new();
+        let profile = UserProfile {
+            ID: 1,
+            LoginName: "alice@example.com".into(),
+            DisplayName: "Alice".into(),
+            ProfilePicURL: String::new(),
+        };
+        sb.add_user(1, profile);
+
+        let st = sb.status();
+        assert_eq!(st.User.len(), 1);
+        assert_eq!(st.User[&1].LoginName, "alice@example.com");
+    }
+
+    #[test]
+    fn skip_serializing_default_fields() {
+        let ps = PeerStatus::default();
+        let json = serde_json::to_string(&ps).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = v.as_object().unwrap();
+        assert!(!obj.contains_key("ID"));
+        assert!(!obj.contains_key("NodeID"));
+        assert!(!obj.contains_key("OS"));
+        assert!(!obj.contains_key("Online"));
+        assert!(!obj.contains_key("ExitNode"));
+        assert!(!obj.contains_key("Relay"));
+        assert!(!obj.contains_key("RxBytes"));
+        assert!(!obj.contains_key("TxBytes"));
+        assert!(!obj.contains_key("Addrs"));
+        assert!(!obj.contains_key("PeerAPIURL"));
+        assert!(!obj.contains_key("InNetworkMap"));
+        assert!(!obj.contains_key("InMagicSock"));
+        assert!(!obj.contains_key("InEngine"));
+        assert!(obj.contains_key("HostName"));
+        assert!(obj.contains_key("DNSName"));
+        assert!(obj.contains_key("TailscaleIPs"));
+    }
+
+    #[test]
+    fn serialize_status_omits_empty_collections() {
+        let st = Status::default();
+        let json = serde_json::to_string(&st).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = v.as_object().unwrap();
+        assert!(!obj.contains_key("ExtraRecords"));
+        assert!(!obj.contains_key("HaveNodeKey"));
+        assert!(!obj.contains_key("AuthURL"));
+        assert!(!obj.contains_key("MagicDNSSuffix"));
+        assert!(!obj.contains_key("Self"));
+        assert!(obj.contains_key("Version"));
+        assert!(obj.contains_key("TUN"));
+        assert!(obj.contains_key("BackendState"));
+        assert!(obj.contains_key("TailscaleIPs"));
+        assert!(obj.contains_key("Peer"));
+        assert!(obj.contains_key("Health"));
+        assert!(obj.contains_key("CertDomains"));
+        assert!(obj.contains_key("User"));
     }
 }

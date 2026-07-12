@@ -94,7 +94,7 @@ P3 status: hostinfo darwin ✅ (OSVersion + DeviceModel via sysctl) · quarantin
 | Safe atomic file writes | `atomicfile/` | ✅ `crates/atomicfile`: write-temp+fsync+rename utility with perms 0o600 |
 | Metrics registry | `metrics/` | ✅ via `crates/clientmetric`: Registry with Counter/Gauge, Prometheus text format, wired into LocalAPI /metrics replacing 4 hardcoded metrics |
 | File path constants | `paths/` | ✅ `crates/paths`: default_state_dir/log_dir/config_dir/socket_path per platform (macOS/Linux/Windows) |
-| Status/PeerStatus model | `ipn/ipnstate/` | 🔶 inline in `crates/tsnet/src/status.rs` + localapi build_status_json(); no dedicated crate |
+| Status/PeerStatus model | `ipn/ipnstate/` | ✅ `crates/ipnstate`: Status, PeerStatus, StatusBuilder with Go-compatible merge logic; serde-serialized via StatusBuilder in LocalAPI /status; `Server::ipn_status()` returns `ipnstate::Status`; legacy `ServerStatus`/`PeerInfo` kept for FFI/bench compat |
 | State persistence abstraction | `ipn/store/` | ✅ `crates/ipn/src/store.rs`: Store trait + MemStore (HashMap) + FileStore (one file per key) |
 | IPN server actor loop | `ipn/ipnserver/` | ⬜ orchestration embedded in tsnet Server + lifecycle.rs; no dedicated actor loop |
 | TSP protocol (alt control) | `control/tsp/` | ⬜ only ts2021 Noise control protocol implemented |

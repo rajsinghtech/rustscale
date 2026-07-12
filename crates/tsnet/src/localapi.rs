@@ -33,6 +33,7 @@ use rustscale_ipn::{
     validate_notify_watch_opt, IpnBackend, LoginProfile, MaskedPrefs, NotifyWatchOpt, Prefs,
     StartOptions, NOTIFY_IN_PROCESS_NO_DISCONNECT,
 };
+use rustscale_ipnstate::{PeerStatus, StatusBuilder, TailnetStatus};
 use rustscale_key::{MachinePrivate, MachinePublic, NodePrivate, NodePublic};
 use rustscale_magicsock::{Magicsock, PathClass};
 use rustscale_safesocket::ServerStream;
@@ -129,7 +130,8 @@ pub(crate) struct LocalApiState {
     /// shutdown signals.
     pub logout_trigger: Arc<tokio::sync::Notify>,
     /// Control-suggested exit node (StableNodeID). Set by the map_update
-    /// task from `MapResponse.SuggestedExitNode`. Exposed in /status.
+    /// task from `MapResponse.SuggestedExitNode`.
+    #[allow(dead_code)]
     pub suggested_exit_node: Arc<RwLock<String>>,
 }
 
@@ -837,7 +839,8 @@ pub(crate) async fn dispatch<W: AsyncWrite + Unpin>(
 // Status handler
 // ---------------------------------------------------------------------------
 
-/// Build the status JSON, modeled on Go's `ipnstate.Status`.
+/// Build the status JSON via `ipnstate::StatusBuilder` and serde, producing
+/// byte-identical output to Go's `ipnstate.Status` serialization.
 ///
 /// # Divergences from Go ipnstate.Status
 ///
@@ -855,33 +858,67 @@ pub(crate) async fn dispatch<W: AsyncWrite + Unpin>(
 /// - `CertDomains`: included (from the live DNSConfig).
 /// - `Peer` is a JSON object keyed by node public key string (same as Go).
 /// - `TUN`: true when the server was started via `up_tun()`.
+/// - `SuggestedExitNode`: omitted (Go does not emit it in ipnstate.Status).
 async fn build_status_json(state: &LocalApiState) -> serde_json::Value {
     let peers = state.peers.read().await;
     let user_profiles = state.user_profiles.read().await;
     let dns_config = state.dns_config.read().await;
-    let suggested_exit = state.suggested_exit_node.read().await.clone();
 
-    let node_key = state.magicsock.node_public().to_string();
+    let mut sb = StatusBuilder::new();
 
-    // Build self node.
-    let self_node = serde_json::json!({
-        "HostName": state.hostname,
-        "DNSName": state.our_fqdn,
-        "TailscaleIPs": state.tailscale_ips.iter().map(std::string::ToString::to_string).collect::<Vec<_>>(),
-        "PublicKey": node_key,
-        "Online": true,
-        "InNetworkMap": true,
-        "InMagicSock": true,
-        "InEngine": true,
+    sb.mutate_status(|s| {
+        s.Version = "rustscale".into();
+        s.TUN = state.tun_mode;
+        s.BackendState = state.ipn_backend.state().as_str().to_string();
+        s.HaveNodeKey = Some(true);
+        s.Health = state
+            .health
+            .current_warnings()
+            .iter()
+            .map(|w| w.text.clone())
+            .collect();
+        for ip in &state.tailscale_ips {
+            s.TailscaleIPs.push(*ip);
+        }
+        let (tailnet_name, magicdns_suffix, magicdns_enabled) = if let Some(ref dns) = *dns_config {
+            let suffix = state.our_fqdn.trim_end_matches('.');
+            let suffix = match suffix.split_once('.') {
+                Some((_, d)) => d,
+                None => suffix,
+            };
+            (suffix.to_string(), suffix.to_string(), dns.Proxied)
+        } else {
+            (String::new(), String::new(), false)
+        };
+        s.CurrentTailnet = Some(Box::new(TailnetStatus {
+            Name: tailnet_name,
+            MagicDNSSuffix: magicdns_suffix,
+            MagicDNSEnabled: magicdns_enabled,
+        }));
+        let cert_domains: Vec<String> = dns_config
+            .as_ref()
+            .map(|c| c.CertDomains.clone())
+            .unwrap_or_default();
+        s.CertDomains = cert_domains;
     });
 
-    // Build peers map keyed by node public key.
-    let mut peers_map = serde_json::Map::new();
+    // Self peer.
+    sb.mutate_self_status(|ps| {
+        ps.HostName.clone_from(&state.hostname);
+        ps.DNSName.clone_from(&state.our_fqdn);
+        ps.TailscaleIPs.clone_from(&state.tailscale_ips);
+        ps.PublicKey = state.magicsock.node_public().to_string();
+        ps.Online = true;
+        ps.InNetworkMap = true;
+        ps.InMagicSock = true;
+        ps.InEngine = true;
+    });
+
+    // Peers.
     for peer in peers.iter() {
         if peer.Key.is_zero() {
             continue;
         }
-        let key_str = peer.Key.to_string();
         let ips: Vec<IpAddr> = peer
             .Addresses
             .iter()
@@ -894,95 +931,33 @@ async fn build_status_json(state: &LocalApiState) -> serde_json::Value {
             _ => String::new(),
         };
 
-        // Check if this peer is exit-node-capable.
         let exit_node_option = peer
             .AllowedIPs
             .iter()
             .any(|r| r == "0.0.0.0/0" || r == "::/0");
 
-        peers_map.insert(
-            key_str,
-            serde_json::json!({
-                "HostName": peer.Name.trim_end_matches('.'),
-                "DNSName": peer.Name,
-                "TailscaleIPs": ips.iter().map(std::string::ToString::to_string).collect::<Vec<_>>(),
-                "PublicKey": peer.Key.to_string(),
-                "Online": peer.Online.unwrap_or(false),
-                "Relay": relay,
-                "ExitNode": false,
-                "ExitNodeOption": exit_node_option,
-                "InNetworkMap": true,
-                "InMagicSock": true,
-                "InEngine": true,
-                "UserID": peer.User,
-            }),
-        );
+        let ps = PeerStatus {
+            HostName: peer.Name.trim_end_matches('.').to_string(),
+            DNSName: peer.Name.clone(),
+            TailscaleIPs: ips,
+            Online: peer.Online.unwrap_or(false),
+            Relay: relay,
+            ExitNodeOption: exit_node_option,
+            InNetworkMap: true,
+            InMagicSock: true,
+            InEngine: true,
+            UserID: peer.User,
+            ..Default::default()
+        };
+        sb.add_peer(&peer.Key, ps);
     }
 
-    // Health: list of warning text strings (Go uses []string).
-    let health_warnings: Vec<String> = state
-        .health
-        .current_warnings()
-        .iter()
-        .map(|w| w.text.clone())
-        .collect();
-
-    // Current tailnet info.
-    let (tailnet_name, magicdns_suffix, magicdns_enabled) = {
-        if let Some(ref dns) = *dns_config {
-            let suffix = state.our_fqdn.trim_end_matches('.');
-            let suffix = match suffix.split_once('.') {
-                Some((_, d)) => d,
-                None => suffix,
-            };
-            (suffix.to_string(), suffix.to_string(), dns.Proxied)
-        } else {
-            (String::new(), String::new(), false)
-        }
-    };
-
-    // Cert domains from the live DNSConfig (mirrors Go's
-    // ipnstate.Status.CertDomains — the domains the tailnet is authorized
-    // to issue LE certs for).
-    let cert_domains: Vec<String> = dns_config
-        .as_ref()
-        .map(|c| c.CertDomains.clone())
-        .unwrap_or_default();
-
-    serde_json::json!({
-        "Version": "rustscale",
-        "TUN": state.tun_mode,
-        "BackendState": state.ipn_backend.state().as_str(),
-        "HaveNodeKey": true,
-        "TailscaleIPs": state.tailscale_ips.iter().map(std::string::ToString::to_string).collect::<Vec<_>>(),
-        "Self": self_node,
-        "Peer": peers_map,
-        "User": user_profiles_to_json(&user_profiles),
-        "Health": health_warnings,
-        "CurrentTailnet": {
-            "Name": tailnet_name,
-            "MagicDNSSuffix": magicdns_suffix,
-            "MagicDNSEnabled": magicdns_enabled,
-        },
-        "CertDomains": cert_domains,
-        "SuggestedExitNode": suggested_exit,
-    })
-}
-
-fn user_profiles_to_json(profiles: &BTreeMap<UserID, UserProfile>) -> serde_json::Value {
-    let mut map = serde_json::Map::new();
-    for (id, profile) in profiles {
-        map.insert(
-            id.to_string(),
-            serde_json::json!({
-                "ID": profile.ID,
-                "LoginName": profile.LoginName,
-                "DisplayName": profile.DisplayName,
-                "ProfilePicURL": profile.ProfilePicURL,
-            }),
-        );
+    // Users.
+    for (id, profile) in user_profiles.iter() {
+        sb.add_user(*id, profile.clone());
     }
-    serde_json::Value::Object(map)
+
+    serde_json::to_value(sb.status()).unwrap_or(serde_json::Value::Null)
 }
 
 // ---------------------------------------------------------------------------

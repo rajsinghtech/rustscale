@@ -628,6 +628,11 @@ impl Magicsock {
             .clone()
     }
 
+    /// The home DERP region ID.
+    pub fn home_derp_region(&self) -> i32 {
+        self.inner.derp.home_region()
+    }
+
     /// Update the node private key after a key rotation. Updates the
     /// stored node public key so subsequent disco messages, relay
     /// negotiations, and netmap self-checks use the new identity.

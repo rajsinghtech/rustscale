@@ -4,6 +4,7 @@ name: Release
 # Produces:
 #   - macOS universal bundle (lipo'd librustscale.dylib + .a + rustscale.h)
 #   - Linux per-target bundles (gnu x86_64/aarch64, musl x86_64)
+#   - Windows x86_64 zip (rustscale.exe + rustscaled.exe)
 #   - SHA256SUMS checksum file
 #   - GitHub Release with all artifacts attached
 #   - Homebrew formula pushed to rajsinghtech/homebrew-tap
@@ -179,11 +180,52 @@ jobs:
           retention-days: 14
 
   # -------------------------------------------------------------------------
+  # Windows: x86_64 binaries (MSVC)
+  # -------------------------------------------------------------------------
+  windows:
+    name: Windows x86_64
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          key: x86_64-pc-windows-msvc
+
+      - name: Build binary crates
+        if: env.BIN_PKGS != ''
+        shell: bash
+        run: |
+          for entry in $BIN_PKGS; do
+            pkg="${entry%:*}"
+            cargo build -p "$pkg" --release --locked
+          done
+
+      - name: Bundle
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          foreach ($entry in $env:BIN_PKGS -split ' ') {
+            $bin = ($entry -split ':')[1]
+            Copy-Item "target/release/$bin.exe" "dist/" -ErrorAction Stop
+          }
+          Compress-Archive -Path dist/* -DestinationPath rustscale-x86_64-pc-windows-msvc.zip
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: rustscale-x86_64-pc-windows-msvc
+          path: rustscale-x86_64-pc-windows-msvc.zip
+          retention-days: 14
+
+  # -------------------------------------------------------------------------
   # Checksums + GitHub Release
   # -------------------------------------------------------------------------
   release:
     name: Checksums + GitHub Release
-    needs: [macos, linux]
+    needs: [macos, linux, windows]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -195,16 +237,17 @@ jobs:
       - name: Collect artifacts + compute checksums
         run: |
           mkdir -p release
-          find artifacts -name '*.tar.gz' -exec cp {} release/ \;
+          find artifacts \( -name '*.tar.gz' -o -name '*.zip' \) -exec cp {} release/ \;
           cd release
-          sha256sum *.tar.gz > SHA256SUMS
+          find . -maxdepth 1 \( -name '*.tar.gz' -o -name '*.zip' \) \
+            -exec sha256sum {} + | sed 's| \./| |' > SHA256SUMS
           cat SHA256SUMS
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: release/*
-          generate_release_notes: true
+          body_path: docs/release-notes-0.1.0.md
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
 

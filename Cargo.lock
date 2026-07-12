@@ -1547,6 +1547,7 @@ dependencies = [
  "rustscale-netstack",
  "rustscale-portmapper",
  "rustscale-tailcfg",
+ "rustscale-tcpinfo",
  "rustscale-tun",
  "rustscale-wg",
  "serde",

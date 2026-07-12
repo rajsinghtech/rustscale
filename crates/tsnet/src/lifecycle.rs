@@ -66,6 +66,19 @@ impl Server {
         ));
 
         // Map-stream update task (peer/route deltas).
+        let key_rotation_ctx = KeyRotationCtx {
+            control_url: b.control_url.clone(),
+            machine_key: b.machine_key.clone(),
+            server_pub_key: b.server_pub_key.clone(),
+            hostname: self.config.hostname.clone(),
+            auth_key: self.config.auth_key.clone().unwrap_or_default(),
+            ephemeral: self.config.ephemeral,
+            advertise_routes: b.advertise_routes.clone(),
+            peer_relay_server: self.config.peer_relay_server,
+            disco_key: b.disco_key.clone(),
+            capability_version: CAPABILITY_VERSION,
+            protocol_version: PROTOCOL_VERSION,
+        };
         let map_update = spawn_map_update_task(
             b.map_rx,
             b.magicsock.clone(),
@@ -89,6 +102,7 @@ impl Server {
             b.control_knobs.clone(),
             b.key_expired.clone(),
             b.ipn_backend.clone(),
+            Some(key_rotation_ctx),
         );
 
         // MagicDNS responder: best-effort UDP server at 100.100.100.100:53.
@@ -458,6 +472,19 @@ impl Server {
             self.config.peer_relay_server,
         );
 
+        let key_rotation_ctx = KeyRotationCtx {
+            control_url: b.control_url.clone(),
+            machine_key: b.machine_key.clone(),
+            server_pub_key: b.server_pub_key.clone(),
+            hostname: self.config.hostname.clone(),
+            auth_key: self.config.auth_key.clone().unwrap_or_default(),
+            ephemeral: self.config.ephemeral,
+            advertise_routes: b.advertise_routes.clone(),
+            peer_relay_server: self.config.peer_relay_server,
+            disco_key: b.disco_key.clone(),
+            capability_version: CAPABILITY_VERSION,
+            protocol_version: PROTOCOL_VERSION,
+        };
         let map_update = spawn_map_update_task(
             b.map_rx,
             b.magicsock.clone(),
@@ -481,6 +508,7 @@ impl Server {
             b.control_knobs.clone(),
             b.key_expired.clone(),
             b.ipn_backend.clone(),
+            Some(key_rotation_ctx),
         );
 
         let (c2n_task, c2n_addr) =

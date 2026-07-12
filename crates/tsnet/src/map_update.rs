@@ -1,16 +1,34 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
+/// Context needed to re-register with the control server after a key
+/// expiry. Passed to [`spawn_map_update_task`] so the map update loop
+/// can detect expiry and perform key rotation in-place.
+pub(crate) struct KeyRotationCtx {
+    pub control_url: String,
+    pub machine_key: MachinePrivate,
+    pub server_pub_key: MachinePublic,
+    pub hostname: String,
+    pub auth_key: String,
+    pub ephemeral: bool,
+    pub advertise_routes: Vec<String>,
+    pub peer_relay_server: bool,
+    pub disco_key: DiscoPrivate,
+    pub capability_version: i32,
+    pub protocol_version: u16,
+}
+
 /// Spawn the map-stream delta update task. Shared by `up()` and `up_tun()`:
 /// processes Peers/PeersChanged/PeersRemoved, feeds the new peer list to
 /// magicsock, rebuilds the route table, and creates WG tunnels for new peers.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_map_update_task(
     mut map_rx: mpsc::Receiver<Result<MapResponse, StreamMapError>>,
     magicsock: Arc<Magicsock>,
     wg_tunnels: Arc<RwLock<HashMap<NodePublic, Arc<Mutex<WgTunn>>>>>,
     peers_arc: Arc<RwLock<Vec<Node>>>,
     route_table: Arc<RwLock<RouteTable>>,
-    node_key: NodePrivate,
+    mut node_key: NodePrivate,
     filter_arc: Arc<std::sync::Mutex<Filter>>,
     tailscale_ips: Vec<IpAddr>,
     accept_routes: bool,
@@ -23,10 +41,11 @@ pub(crate) fn spawn_map_update_task(
     health: Tracker,
     health_watchdog: Watchdog,
     state_dir: Option<PathBuf>,
-    node_pub: NodePublic,
+    mut node_pub: NodePublic,
     control_knobs: Arc<ControlKnobs>,
     key_expired: Arc<std::sync::atomic::AtomicBool>,
     ipn_backend: Arc<IpnBackend>,
+    key_rotation_ctx: Option<KeyRotationCtx>,
 ) -> JoinHandle<()> {
     let mut named_filters: BTreeMap<String, Vec<FilterRule>> = BTreeMap::new();
     // Create the netmap cache helper once so that save_if_changed can
@@ -66,19 +85,72 @@ pub(crate) fn spawn_map_update_task(
                         if let Some(ref dir) = state_dir {
                             PersistedState::clear_netmap(dir);
                         }
-                        // TODO(key-rotation): When the node key expires, the
-                        // client should re-register with OldNodeKey set to the
-                        // previous key, generate a fresh node key, and send a
-                        // new RegisterRequest. If interactive auth is required,
-                        // emit BrowseToURL via ipn_backend. After successful
-                        // re-registration, restart the map poll with the new
-                        // key and transition back to Running.
-                        //
-                        // Go ref: control/controlclient/direct.go doLogin with
-                        // OldNodeKey, ipn/ipnlocal/local.go key-expiry handling.
-                        // The RegisterRequest struct already has OldNodeKey;
-                        // the bootstrap() flow would need refactoring to support
-                        // re-registration without tearing down the whole stack.
+
+                        // Attempt key rotation: re-register with
+                        // OldNodeKey + fresh NodeKey. On success, promote
+                        // the new key, restart the map poll, and continue.
+                        if let Some(ctx) = key_rotation_ctx.as_ref() {
+                            match perform_key_rotation(
+                                ctx,
+                                &node_key,
+                                &magicsock,
+                                &wg_tunnels,
+                                state_dir.as_deref(),
+                                &ipn_backend,
+                            )
+                            .await
+                            {
+                                Ok(new_key) => {
+                                    node_key = new_key.clone();
+                                    node_pub = new_key.public();
+                                    key_expired.store(false, std::sync::atomic::Ordering::Relaxed);
+                                    ipn_backend.set_key_expired(false);
+                                    ipn_backend.set_blocked(false);
+                                    ipn_backend.emit_login_finished();
+
+                                    // Restart the map poll with the new
+                                    // key. Dropping the old map_rx closes
+                                    // the channel, which stops the old
+                                    // stream_map_loop. The new map task
+                                    // feeds into the new receiver.
+                                    let (new_tx, new_rx) = mpsc::channel(32);
+                                    let cc_new = ControlClient::new(
+                                        ctx.control_url.clone(),
+                                        ctx.machine_key.clone(),
+                                        ctx.server_pub_key.clone(),
+                                        ctx.protocol_version,
+                                    );
+                                    let new_map_req = MapRequest {
+                                        Version: ctx.capability_version,
+                                        KeepAlive: true,
+                                        NodeKey: node_pub.clone(),
+                                        DiscoKey: ctx.disco_key.public(),
+                                        Stream: true,
+                                        Endpoints: magicsock.local_udp_addrs(),
+                                        Hostinfo: Some(Hostinfo {
+                                            OS: std::env::consts::OS.to_string(),
+                                            Hostname: ctx.hostname.clone(),
+                                            RoutableIPs: ctx.advertise_routes.clone(),
+                                            PeerRelay: ctx.peer_relay_server,
+                                            ..Default::default()
+                                        }),
+                                        ..Default::default()
+                                    };
+                                    tokio::spawn(async move {
+                                        cc_new.stream_map_loop(&new_map_req, new_tx).await;
+                                    });
+                                    map_rx = new_rx;
+                                    eprintln!(
+                                        "tsnet: key rotation complete, map poll restarted with new node key"
+                                    );
+                                }
+                                Err(e) => {
+                                    eprintln!("tsnet: key rotation failed: {e}");
+                                    ipn_backend
+                                        .emit_err_message(format!("key rotation failed: {e}"));
+                                }
+                            }
+                        }
                     }
 
                     // Extract control knobs from the self-node's CapMap and
@@ -279,4 +351,160 @@ pub(crate) fn spawn_map_update_task(
             }
         }
     })
+}
+
+/// Re-register with the control server after a key expiry, using
+/// `OldNodeKey` (public of the old key) and a fresh `NodeKey`.
+///
+/// Mirrors Go's `doLogin` with `regen=true` (`direct.go:739-926`):
+/// 1. Save current key as `OldPrivateNodeKey`.
+/// 2. Generate a fresh node key.
+/// 3. Send `RegisterRequest` with `OldNodeKey` + `NodeKey`.
+/// 4. If `resp.NodeKeyExpired`, retry with another fresh key (max 2).
+/// 5. If `resp.AuthURL` is non-empty, send a followup and block until
+///    interactive auth completes.
+/// 6. On success, persist the new key, re-key magicsock, and clear WG
+///    tunnels so they are recreated with the new key.
+async fn perform_key_rotation(
+    ctx: &KeyRotationCtx,
+    current_key: &NodePrivate,
+    magicsock: &Magicsock,
+    wg_tunnels: &Arc<RwLock<HashMap<NodePublic, Arc<Mutex<WgTunn>>>>>,
+    state_dir: Option<&std::path::Path>,
+    ipn_backend: &Arc<IpnBackend>,
+) -> Result<NodePrivate, String> {
+    let old_key = current_key.clone();
+    let old_pub = old_key.public();
+
+    let mut trying_key = NodePrivate::generate();
+    let mut old_node_key = old_pub.clone();
+
+    for attempt in 0..=2u32 {
+        let new_pub = trying_key.public();
+
+        let reg_req = RegisterRequest {
+            Version: ctx.capability_version,
+            NodeKey: new_pub.clone(),
+            OldNodeKey: old_node_key.clone(),
+            Auth: if ctx.auth_key.is_empty() {
+                None
+            } else {
+                Some(rustscale_tailcfg::RegisterResponseAuth {
+                    AuthKey: ctx.auth_key.clone(),
+                })
+            },
+            Hostinfo: Some(Hostinfo {
+                OS: std::env::consts::OS.to_string(),
+                Hostname: ctx.hostname.clone(),
+                RoutableIPs: ctx.advertise_routes.clone(),
+                PeerRelay: ctx.peer_relay_server,
+                ..Default::default()
+            }),
+            Ephemeral: ctx.ephemeral,
+            ..Default::default()
+        };
+
+        let cc = ControlClient::new(
+            ctx.control_url.clone(),
+            ctx.machine_key.clone(),
+            ctx.server_pub_key.clone(),
+            ctx.protocol_version,
+        );
+
+        let resp = cc
+            .register(&reg_req)
+            .await
+            .map_err(|e| format!("register: {e}"))?;
+
+        if !resp.Error.is_empty() {
+            return Err(format!("control rejected re-registration: {}", resp.Error));
+        }
+
+        if resp.NodeKeyExpired {
+            eprintln!(
+                "tsnet: key rotation attempt {attempt}: server says NodeKeyExpired, regenerating"
+            );
+            old_node_key = new_pub;
+            trying_key = NodePrivate::generate();
+            continue;
+        }
+
+        // If interactive auth is required, emit BrowseToURL and block on
+        // the followup poll until the user completes auth.
+        if !resp.AuthURL.is_empty() {
+            eprintln!(
+                "tsnet: key rotation requires interactive auth: {}",
+                resp.AuthURL
+            );
+            ipn_backend.emit_browse_to_url(&resp.AuthURL);
+
+            let followup_req = RegisterRequest {
+                Version: ctx.capability_version,
+                NodeKey: new_pub.clone(),
+                OldNodeKey: old_node_key.clone(),
+                Followup: resp.AuthURL.clone(),
+                Hostinfo: Some(Hostinfo {
+                    OS: std::env::consts::OS.to_string(),
+                    Hostname: ctx.hostname.clone(),
+                    RoutableIPs: ctx.advertise_routes.clone(),
+                    PeerRelay: ctx.peer_relay_server,
+                    ..Default::default()
+                }),
+                Ephemeral: ctx.ephemeral,
+                ..Default::default()
+            };
+            let cc2 = ControlClient::new(
+                ctx.control_url.clone(),
+                ctx.machine_key.clone(),
+                ctx.server_pub_key.clone(),
+                ctx.protocol_version,
+            );
+            let followup_resp = cc2
+                .register(&followup_req)
+                .await
+                .map_err(|e| format!("followup register: {e}"))?;
+
+            if !followup_resp.Error.is_empty() {
+                return Err(format!(
+                    "control rejected followup: {}",
+                    followup_resp.Error
+                ));
+            }
+            if followup_resp.NodeKeyExpired {
+                eprintln!("tsnet: followup returned NodeKeyExpired, regenerating");
+                old_node_key = new_pub;
+                trying_key = NodePrivate::generate();
+                continue;
+            }
+        }
+
+        // Success — promote the new key.
+        // Persist: save new node_key + old_node_key to disk.
+        if let Some(dir) = state_dir {
+            let path = dir.join("tsnet-state.json");
+            if let Ok(mut state) = PersistedState::load(&path) {
+                state.old_node_key = Some(old_key.clone());
+                state.node_key = trying_key.clone();
+                if let Err(e) = state.save(&path) {
+                    eprintln!("tsnet: failed to save rotated key state: {e}");
+                }
+            }
+        }
+
+        // Re-key magicsock so disco/relay use the new identity.
+        magicsock.set_node_key(&trying_key);
+
+        // Clear all WG tunnels — they were created with the old private
+        // key and must be recreated with the new one.
+        wg_tunnels.write().await.clear();
+
+        eprintln!(
+            "tsnet: key rotation succeeded (old={}, new={})",
+            old_pub,
+            trying_key.public()
+        );
+        return Ok(trying_key);
+    }
+
+    Err("key rotation exhausted retries (max 2)".into())
 }

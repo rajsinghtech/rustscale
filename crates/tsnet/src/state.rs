@@ -39,6 +39,11 @@ pub struct PersistedState {
     /// The stable node ID (string form, empty until registered).
     #[serde(default)]
     pub stable_node_id: String,
+    /// The previous node private key, saved during key rotation so
+    /// `OldNodeKey` can be sent in the next `RegisterRequest`. Matches
+    /// Go's `persist.OldPrivateNodeKey` (`types/persist/persist.go:25`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_node_key: Option<NodePrivate>,
 }
 
 impl Default for PersistedState {
@@ -49,6 +54,7 @@ impl Default for PersistedState {
             disco_key: DiscoPrivate::from_raw32([0u8; 32]),
             node_id: 0,
             stable_node_id: String::new(),
+            old_node_key: None,
         }
     }
 }
@@ -62,6 +68,7 @@ impl PersistedState {
             disco_key: DiscoPrivate::generate(),
             node_id: 0,
             stable_node_id: String::new(),
+            old_node_key: None,
         }
     }
 

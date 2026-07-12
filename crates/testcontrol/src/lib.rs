@@ -77,6 +77,11 @@ struct ServerInner {
     /// Node keys that have been logged out (sent a RegisterRequest with
     /// Expiry in the far past). Tests can check this via `saw_logout`.
     logged_out_nodes: HashSet<NodePublic>,
+    /// Per-node key expiry. When a node key is in this set, its
+    /// MapResponse will carry `Node.KeyExpiry` in the past and
+    /// `RegisterResponse.NodeKeyExpired = true`. Used by key-rotation
+    /// tests to force expiry on a specific node.
+    expired_nodes: HashSet<NodePublic>,
     base_url: String,
 }
 
@@ -126,6 +131,7 @@ impl Server {
                 authed_nodes: HashSet::new(),
                 last_auth_url: None,
                 logged_out_nodes: HashSet::new(),
+                expired_nodes: HashSet::new(),
                 base_url: String::new(),
             })),
             notify: Arc::new(Notify::new()),
@@ -231,6 +237,33 @@ impl Server {
         for tx in inner.updates.values() {
             let _ = tx.try_send(UpdateType::SelfChanged);
         }
+    }
+
+    /// Force key expiry on a specific node. The node's next MapResponse
+    /// will carry `Node.KeyExpiry` in the past, and `RegisterResponse`
+    /// will have `NodeKeyExpired = true`. Use this to test key rotation
+    /// without affecting other nodes.
+    pub fn expire_node_key(&self, node_key: &NodePublic) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.expired_nodes.insert(node_key.clone());
+        // Trigger a map update so the node sees the expiry immediately.
+        if let Some(node) = inner.nodes.get(node_key) {
+            if let Some(tx) = inner.updates.get(&node.ID) {
+                let _ = tx.try_send(UpdateType::SelfChanged);
+            }
+        }
+    }
+
+    /// Clear key expiry on a specific node.
+    pub fn unexpire_node_key(&self, node_key: &NodePublic) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.expired_nodes.remove(node_key);
+    }
+
+    /// Returns true if the given node key has been force-expired via
+    /// [`expire_node_key`].
+    pub fn is_node_expired(&self, node_key: &NodePublic) -> bool {
+        self.inner.lock().unwrap().expired_nodes.contains(node_key)
     }
 
     /// Set the DNS config to include in map responses.
@@ -659,6 +692,31 @@ async fn serve_register(
 
     let nk = req.NodeKey.clone();
 
+    // Key rotation: when OldNodeKey is non-zero and known to the server,
+    // transfer the node's identity from the old key to the new key.
+    // Matches Go testcontrol at testcontrol.go:930-950.
+    if !req.OldNodeKey.is_zero() {
+        let mut g = inner.lock().unwrap();
+        if let Some(old_node) = g.nodes.get(&req.OldNodeKey).cloned() {
+            if !g.nodes.contains_key(&nk) {
+                let mut cloned = old_node.clone();
+                cloned.Key = nk.clone();
+                g.nodes.insert(nk.clone(), cloned);
+            }
+            // Transfer user/login mappings to the new key.
+            if let Some((u, l)) = g.users.get(&req.OldNodeKey).cloned() {
+                g.users.insert(nk.clone(), (u, l));
+            }
+            // On a followup (auth completed), retire the old key.
+            if !req.Followup.is_empty() {
+                g.nodes.remove(&req.OldNodeKey);
+                g.users.remove(&req.OldNodeKey);
+                // Clear per-node expiry on the old key.
+                g.expired_nodes.remove(&req.OldNodeKey);
+            }
+        }
+    }
+
     // Detect logout requests: Expiry set to the far past (before 2000).
     // The control server should expire the node key. We record it for
     // test verification and remove the node from the authed set.
@@ -740,7 +798,10 @@ async fn serve_register(
         return serde_json::to_vec(&resp).unwrap_or_default();
     }
 
-    let node_key_expired = inner.lock().unwrap().all_expired;
+    let node_key_expired = {
+        let g = inner.lock().unwrap();
+        g.all_expired || g.expired_nodes.contains(&nk)
+    };
 
     let resp = RegisterResponse {
         User: user,
@@ -1045,8 +1106,8 @@ fn build_map_response(
         node.CapMap = cap_map.clone();
     }
 
-    // Apply all_expired.
-    if g.all_expired {
+    // Apply all_expired or per-node expiry.
+    if g.all_expired || g.expired_nodes.contains(nk) {
         node.KeyExpiry = Some(chrono::Utc::now() - chrono::Duration::minutes(1));
     }
 
@@ -1173,5 +1234,83 @@ mod tests {
             .expect("fetch key");
         assert!(!key.is_zero(), "fetched key should be non-zero");
         assert_eq!(key, s.noise_public_key());
+    }
+
+    #[test]
+    fn expire_and_unexpire_node_key() {
+        let s = Server::new();
+        let key = NodePublic::from_raw32([0xAB; 32]);
+        assert!(!s.is_node_expired(&key));
+        s.expire_node_key(&key);
+        assert!(s.is_node_expired(&key));
+        s.unexpire_node_key(&key);
+        assert!(!s.is_node_expired(&key));
+    }
+
+    #[tokio::test]
+    async fn old_node_key_transfers_identity() {
+        use rustscale_controlclient::client::ControlClient;
+        use rustscale_key::{MachinePrivate, NodePrivate};
+        use rustscale_tailcfg::{Hostinfo, RegisterRequest};
+
+        let mut s = Server::new();
+        let addr = s.start().await.unwrap();
+        let url = format!("http://{addr}");
+
+        let server_key = s.noise_public_key();
+        let machine_key = MachinePrivate::generate();
+        let node_key = NodePrivate::generate();
+        let node_pub = node_key.public();
+
+        // Register the initial node.
+        let cc = ControlClient::new(&url, machine_key.clone(), server_key.clone(), 141);
+        let req = RegisterRequest {
+            Version: 141,
+            NodeKey: node_pub.clone(),
+            Hostinfo: Some(Hostinfo {
+                Hostname: "rot-test".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let resp = cc.register(&req).await.expect("initial register");
+        assert!(
+            resp.Error.is_empty(),
+            "initial register error: {}",
+            resp.Error
+        );
+        assert_eq!(s.num_nodes(), 1);
+
+        // Now rotate: register with OldNodeKey + new NodeKey.
+        let new_key = NodePrivate::generate();
+        let new_pub = new_key.public();
+        let rot_req = RegisterRequest {
+            Version: 141,
+            NodeKey: new_pub.clone(),
+            OldNodeKey: node_pub.clone(),
+            Hostinfo: Some(Hostinfo {
+                Hostname: "rot-test".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let rot_resp = cc.register(&rot_req).await.expect("rotation register");
+        assert!(
+            rot_resp.Error.is_empty(),
+            "rotation register error: {}",
+            rot_resp.Error
+        );
+
+        // Both nodes should exist (old key is not retired without followup).
+        assert_eq!(s.num_nodes(), 2, "old + new node should both exist");
+
+        // The new node should have the same addresses as the old node.
+        let all = s.all_nodes();
+        let old_node = all.iter().find(|n| n.Key == node_pub).expect("old node");
+        let new_node = all.iter().find(|n| n.Key == new_pub).expect("new node");
+        assert_eq!(
+            new_node.Addresses, old_node.Addresses,
+            "new node should inherit old node's addresses"
+        );
     }
 }

@@ -98,7 +98,7 @@ pub(crate) use link_monitor::{
     connect_home_derp, spawn_hostinfo_update_loop, spawn_link_monitor,
     spawn_periodic_endpoint_updates,
 };
-pub(crate) use map_update::spawn_map_update_task;
+pub(crate) use map_update::{spawn_map_update_task, KeyRotationCtx};
 pub(crate) use netstack_pump::{
     encapsulate_and_send, process_tun_inbound, run_netstack_pump, tick_wg_timers,
 };

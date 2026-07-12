@@ -468,6 +468,43 @@ pub(crate) fn likely_home_router_ip() -> Option<(IpAddr, IpAddr)> {
 
 #[cfg(target_os = "macos")]
 fn default_route_impl() -> Route {
+    // Prefer the sysctl NET_RT_DUMP2 approach (matches Go's
+    // DefaultRouteInterfaceIndex). Falls back to /sbin/route if the
+    // sysctl approach fails or yields no interface name.
+    if let Ok((idx, gw)) = crate::defaultroute::default_route_from_sysctl() {
+        if idx > 0 {
+            if let Some(iface_name) = index_to_name(idx) {
+                return Route {
+                    interface_name: iface_name,
+                    interface_index: idx,
+                    gateway: gw.or_else(gateway_from_route_command),
+                };
+            }
+        }
+    }
+    // Fallback: shell out to /sbin/route.
+    route_from_command()
+}
+
+/// Resolve an interface index to a name via `if_indextoname`.
+#[cfg(target_os = "macos")]
+fn index_to_name(idx: u32) -> Option<String> {
+    let mut buf = [0i8; libc::IF_NAMESIZE];
+    let ptr = unsafe { libc::if_indextoname(idx as libc::c_uint, buf.as_mut_ptr()) };
+    if ptr.is_null() {
+        return None;
+    }
+    Some(
+        unsafe { std::ffi::CStr::from_ptr(ptr) }
+            .to_string_lossy()
+            .to_string(),
+    )
+}
+
+/// Run `/sbin/route -n get default` and parse the interface name, index,
+/// and gateway. Best-effort; returns a default `Route` on any failure.
+#[cfg(target_os = "macos")]
+fn route_from_command() -> Route {
     let output = match std::process::Command::new("/sbin/route")
         .args(["-n", "get", "default"])
         .output()
@@ -513,6 +550,12 @@ fn default_route_impl() -> Route {
         interface_index,
         gateway,
     }
+}
+
+/// Extract just the gateway IP from `/sbin/route -n get default`.
+#[cfg(target_os = "macos")]
+fn gateway_from_route_command() -> Option<IpAddr> {
+    route_from_command().gateway
 }
 
 #[cfg(target_os = "linux")]

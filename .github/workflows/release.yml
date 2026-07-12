@@ -20,9 +20,9 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # Space-separated list of binary crate package names to build + lipo.
-  # Add "rustscaled" here when crates/rustscaled lands.
-  BIN_PKGS: 'rustscaled'
+  # Space-separated list of binary crates to build + lipo, as "pkg:bin" pairs
+  # (cargo package name : binary artifact name). Add new entries as needed.
+  BIN_PKGS: 'rustscale-rustscaled:rustscaled'
 
 jobs:
   # -------------------------------------------------------------------------
@@ -49,7 +49,8 @@ jobs:
       - name: Build binary crates (both architectures)
         if: env.BIN_PKGS != ''
         run: |
-          for pkg in $BIN_PKGS; do
+          for entry in $BIN_PKGS; do
+            pkg="${entry%:*}"
             cargo build -p "$pkg" --release --target aarch64-apple-darwin
             cargo build -p "$pkg" --release --target x86_64-apple-darwin
           done
@@ -68,11 +69,12 @@ jobs:
             target/aarch64-apple-darwin/release/librustscale.a \
             target/x86_64-apple-darwin/release/librustscale.a \
             -output dist/librustscale.a
-          for pkg in $BIN_PKGS; do
+          for entry in $BIN_PKGS; do
+            bin="${entry##*:}"
             lipo -create \
-              "target/aarch64-apple-darwin/release/$pkg" \
-              "target/x86_64-apple-darwin/release/$pkg" \
-              -output "dist/$pkg"
+              "target/aarch64-apple-darwin/release/$bin" \
+              "target/x86_64-apple-darwin/release/$bin" \
+              -output "dist/$bin"
           done
 
       - name: Bundle
@@ -145,7 +147,8 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
           AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
         run: |
-          for pkg in $BIN_PKGS; do
+          for entry in $BIN_PKGS; do
+            pkg="${entry%:*}"
             cargo build -p "$pkg" --release --target ${{ matrix.target }}
           done
 
@@ -162,8 +165,9 @@ jobs:
           cp "$libdir/librustscale.so" dist/ 2>/dev/null || true
           cp "$libdir/librustscale.a" dist/
           cp include/rustscale.h dist/
-          for pkg in $BIN_PKGS; do
-            cp "$libdir/$pkg" dist/ 2>/dev/null || true
+          for entry in $BIN_PKGS; do
+            bin="${entry##*:}"
+            cp "$libdir/$bin" dist/ 2>/dev/null || true
           done
           tar czf rustscale-${{ matrix.target }}.tar.gz -C dist .
 

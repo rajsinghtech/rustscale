@@ -1,0 +1,14 @@
+[package]
+name = "rustscale-neterror"
+description = "Network error classification — a typed enum wrapping io::Error for retry/diagnostics logic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror.workspace = true
+libc.workspace = true

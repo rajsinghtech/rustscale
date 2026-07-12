@@ -130,6 +130,8 @@ async fn dispatch(
         "cert" => commands::cert::run(args, &socket_path).await,
         "ping" => commands::ping::run(args, &socket_path).await,
         "file" => commands::file::run(args, &socket_path, json).await,
+        "ssh" => commands::ssh::run(args, &socket_path).await,
+        "web" => commands::web::run(args, &socket_path).await,
         other => {
             eprintln!("error: unknown subcommand '{other}'");
             usage(&std::env::args().next().unwrap_or_default());
@@ -171,6 +173,10 @@ fn usage(bin: &str) {
     eprintln!("  ping <ip>                           ping a peer (not yet supported)");
     eprintln!("  file cp <files...> <target>:        send file(s) to a host");
     eprintln!("  file get [--wait] [--conflict=...] <dir>  receive files from the inbox");
+    eprintln!(
+        "  ssh [user@]host [args...]            SSH to a Tailscale machine (execs system ssh)"
+    );
+    eprintln!("  web [--listen <addr>] [--readonly]   run a web UI for controlling rustscale");
 }
 
 /// Error type for CLI subcommands.

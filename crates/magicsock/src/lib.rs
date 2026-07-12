@@ -58,7 +58,7 @@ use rustscale_tailcfg::{DERPMap, Node};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
-use derp_io::DerpIo;
+use derp_io::{DerpEvent, DerpIo};
 use disco_io::DiscoIo;
 
 /// Heartbeat interval: how often to ping the best UDP path to keep it alive.
@@ -220,7 +220,7 @@ struct DerpManager {
     /// Channel for DERP recv tasks to forward received packets to the main
     /// demux loop. Each lazy connection spawns a recv task that sends to
     /// this channel.
-    derp_recv_tx: mpsc::Sender<(i32, NodePublic, Vec<u8>)>,
+    derp_recv_tx: mpsc::Sender<(i32, DerpEvent)>,
     /// Channel for DERP recv consumers to signal that their underlying
     /// connection has died and needs reconnection. The reconnect supervisor
     /// task (spawned in [`spawn_recv_tasks`]) listens on this channel and
@@ -239,7 +239,7 @@ impl DerpManager {
         health: Option<rustscale_health::Tracker>,
     ) -> (
         Self,
-        mpsc::Receiver<(i32, NodePublic, Vec<u8>)>,
+        mpsc::Receiver<(i32, DerpEvent)>,
         mpsc::UnboundedReceiver<i32>,
     ) {
         let (derp_recv_tx, derp_recv_rx) = mpsc::channel(256);
@@ -490,18 +490,18 @@ impl DerpManager {
 }
 
 /// Spawn a task that reads from a DerpIo connection and forwards received
-/// packets to the shared derp_recv channel for demux. When the underlying
+/// events to the shared derp_recv channel for demux. When the underlying
 /// connection dies (reader task exits, `try_recv` returns `None`), the
 /// region is signaled for automatic reconnection via `reconnect_tx`.
 fn spawn_derp_recv_consumer(
     region_id: i32,
     io: Arc<DerpIo>,
-    tx: mpsc::Sender<(i32, NodePublic, Vec<u8>)>,
+    tx: mpsc::Sender<(i32, DerpEvent)>,
     reconnect_tx: mpsc::UnboundedSender<i32>,
 ) {
     tokio::spawn(async move {
-        while let Some((source, data)) = io.try_recv().await {
-            if tx.send((region_id, source, data)).await.is_err() {
+        while let Some(event) = io.try_recv().await {
+            if tx.send((region_id, event)).await.is_err() {
                 break;
             }
         }
@@ -1174,7 +1174,7 @@ impl Magicsock {
 /// Launch background UDP recv task + DERP demux task.
 fn spawn_recv_tasks(
     inner: Arc<Inner>,
-    derp_recv_rx: mpsc::Receiver<(i32, NodePublic, Vec<u8>)>,
+    derp_recv_rx: mpsc::Receiver<(i32, DerpEvent)>,
     reconnect_rx: mpsc::UnboundedReceiver<i32>,
 ) {
     // UDP recv task. After the first async recv_from wakes us, drain any
@@ -1205,13 +1205,26 @@ fn spawn_recv_tasks(
     }
 
     // DERP demux task: consumes from all DERP region recv consumers and
-    // dispatches to handle_derp_packet. This single task handles packets
-    // from ALL connected regions (home + lazy).
+    // dispatches to handle_derp_packet / handle_derp_peer_gone. This single
+    // task handles packets from ALL connected regions (home + lazy).
     let inner2 = inner.clone();
     tokio::spawn(async move {
         let mut derp_recv_rx = derp_recv_rx;
-        while let Some((region_id, source, data)) = derp_recv_rx.recv().await {
-            inner2.handle_derp_packet(&data, source, region_id).await;
+        while let Some((region_id, event)) = derp_recv_rx.recv().await {
+            match event {
+                DerpEvent::RecvPacket { source, data } => {
+                    inner2.handle_derp_packet(&data, source, region_id).await;
+                }
+                DerpEvent::PeerGone { peer, reason } => {
+                    inner2.handle_derp_peer_gone(peer, region_id, reason);
+                }
+                DerpEvent::Health { problem } => {
+                    // Update DERP region health. Empty problem = healthy.
+                    if let Some(ref health) = inner2.derp.health {
+                        health.set_derp_region_health(region_id, problem.is_empty());
+                    }
+                }
+            }
         }
     });
 
@@ -1280,6 +1293,49 @@ async fn peer_background_task(inner: Arc<Inner>, peer_key: NodePublic) {
             inner
                 .send_disco_ping(&peer_key, &peer_disco, addr, DiscoPingPurpose::Heartbeat, 0)
                 .await;
+        } else {
+            // Trust expired on best_addr — retrigger CallMeMaybe so the
+            // peer knows to re-establish a direct path. Mirrors Go's
+            // `sendDiscoPingsLocked(now, true)` calling
+            // `enqueueCallMeMaybe` when trust has expired
+            // (endpoint.go:1375-1407).
+            let retriggered = {
+                let mut endpoints = inner.endpoints.write().expect("endpoints lock poisoned");
+                endpoints
+                    .get_mut(&peer_key)
+                    .is_some_and(|ep| ep.maybe_retrigger_call_me_maybe(now))
+            };
+            if retriggered && !peer_disco.is_zero() {
+                let derp_region = {
+                    let endpoints = inner.endpoints.read().expect("endpoints lock poisoned");
+                    endpoints
+                        .get(&peer_key)
+                        .map_or(0, endpoint::Endpoint::derp_send_region)
+                };
+                let region = if derp_region > 0 {
+                    derp_region
+                } else {
+                    inner.derp.home_region()
+                };
+                let local_addrs = inner
+                    .local_udp_addrs
+                    .read()
+                    .expect("local_udp_addrs lock poisoned")
+                    .clone();
+                let cmm = Message::CallMeMaybe(CallMeMaybe {
+                    my_number: local_addrs
+                        .iter()
+                        .filter_map(|s| s.parse::<SocketAddr>().ok())
+                        .map(rustscale_disco::AddrPort::from)
+                        .collect(),
+                });
+                if let Some(reply) = inner.disco.seal(&peer_disco, &cmm) {
+                    inner
+                        .derp
+                        .send_packet(region, peer_key.clone(), reply)
+                        .await;
+                }
+            }
         }
     }
 
@@ -1608,6 +1664,11 @@ impl Inner {
     }
 
     async fn handle_derp_packet(&self, data: &[u8], source: NodePublic, region_id: i32) {
+        // Note DERP region frame for health tracking.
+        if let Some(ref health) = self.derp.health {
+            health.note_derp_region_frame(region_id);
+        }
+
         // Record the arrival DERP region on the peer's endpoint so future
         // replies route to this region (Go's derpRoute caching).
         {
@@ -1639,6 +1700,25 @@ impl Inner {
                     data: data.to_vec(),
                 })
                 .await;
+        }
+    }
+
+    /// Handle a PeerGone frame from a DERP server. Removes the peer's DERP
+    /// route cache entry so future sends fall back to the peer's home DERP.
+    /// Mirrors Go's `removeDerpPeerRoute` (derp.go:52-59) called from the
+    /// DERP recv loop on PeerGoneMessage (derp.go:651-664).
+    fn handle_derp_peer_gone(&self, peer: NodePublic, region_id: i32, reason: u8) {
+        if debug_enabled() {
+            eprintln!(
+                "DBG derp_peer_gone peer={} region={} reason={}",
+                short_key(&peer),
+                region_id,
+                reason
+            );
+        }
+        let mut endpoints = self.endpoints.write().expect("endpoints lock poisoned");
+        if let Some(ep) = endpoints.get_mut(&peer) {
+            ep.remove_derp_route();
         }
     }
 
@@ -1739,6 +1819,7 @@ impl Inner {
             None => return,
         };
 
+        // Try to identify the peer by disco key first.
         let peer = {
             let map = self
                 .disco_to_peer
@@ -1746,9 +1827,54 @@ impl Inner {
                 .expect("disco_to_peer lock poisoned");
             map.get(&sender_disco).cloned()
         };
+
+        // Fallback: if the disco key is not in disco_to_peer, try to
+        // identify the peer by other means. Mirrors Go's
+        // `unambiguousNodeKeyOfPingLocked` for pings (magicsock.go:2511)
+        // and `forEachEndpointWithDiscoKey` for pongs (magicsock.go:2320).
         let peer = match peer {
             Some(p) => p,
-            None => return,
+            None => match &msg {
+                Message::Ping(ping) => {
+                    // Use the ping's node_key to look up the endpoint.
+                    if ping.node_key.is_zero() {
+                        return;
+                    }
+                    let endpoints = self.endpoints.read().expect("endpoints lock poisoned");
+                    if endpoints.contains_key(&ping.node_key) {
+                        // Record the disco→peer mapping for future lookups.
+                        drop(endpoints);
+                        let mut d2p = self
+                            .disco_to_peer
+                            .write()
+                            .expect("disco_to_peer lock poisoned");
+                        d2p.insert(sender_disco.clone(), ping.node_key.clone());
+                        ping.node_key.clone()
+                    } else {
+                        return;
+                    }
+                }
+                Message::Pong(pong) => {
+                    // Search all endpoints for one with a matching pending
+                    // ping tx_id. This mirrors Go's forEachEndpointWithDiscoKey
+                    // which tries each endpoint's handlePongConnLocked
+                    // (magicsock.go:2320-2326).
+                    let mut found_peer: Option<NodePublic> = None;
+                    let endpoints = self.endpoints.read().expect("endpoints lock poisoned");
+                    for (node_key, ep) in endpoints.iter() {
+                        if ep.has_pending_ping(&pong.tx_id) {
+                            found_peer = Some(node_key.clone());
+                            break;
+                        }
+                    }
+                    drop(endpoints);
+                    match found_peer {
+                        Some(p) => p,
+                        None => return,
+                    }
+                }
+                _ => return,
+            },
         };
 
         match msg {

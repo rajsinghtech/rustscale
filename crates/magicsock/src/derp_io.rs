@@ -2,7 +2,7 @@
 //! halves for concurrent I/O from separate tasks.
 
 use rand::RngCore;
-use rustscale_derp::{decode_frame_header, encode_frame_header, frame_type};
+use rustscale_derp::{decode_frame_header, encode_frame_header, frame_type, peer_gone_reason};
 use rustscale_key::NodePublic;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -15,6 +15,21 @@ enum DerpCmd {
     Pong { data: [u8; 8] },
 }
 
+/// Events received from the DERP server, demuxed by the reader task.
+/// Consumers match on this to handle data packets, peer-gone notifications,
+/// and health updates.
+#[derive(Debug, Clone)]
+pub enum DerpEvent {
+    /// A data packet from peer `source`.
+    RecvPacket { source: NodePublic, data: Vec<u8> },
+    /// The server reports that `peer` is no longer present.
+    /// Mirrors Go's `derp.PeerGoneMessage` (derp_client.go:369-381).
+    PeerGone { peer: NodePublic, reason: u8 },
+    /// The server reports a health problem (empty string = healthy).
+    /// Mirrors Go's `derp.HealthMessage` (derp_client.go).
+    Health { problem: String },
+}
+
 /// Channel-based wrapper around a DERP connection.
 ///
 /// Uses `DerpClient::into_split` to separate read and write halves, avoiding
@@ -24,7 +39,7 @@ enum DerpCmd {
 /// the connection).
 pub struct DerpIo {
     cmd_tx: mpsc::Sender<DerpCmd>,
-    recv_rx: tokio::sync::Mutex<mpsc::Receiver<(NodePublic, Vec<u8>)>>,
+    recv_rx: tokio::sync::Mutex<mpsc::Receiver<DerpEvent>>,
     reader_task: tokio::task::JoinHandle<()>,
     writer_task: tokio::task::JoinHandle<()>,
     keepalive_task: tokio::task::JoinHandle<()>,
@@ -110,13 +125,41 @@ impl DerpIo {
                     src.copy_from_slice(&body[..32]);
                     let source = NodePublic::from_raw32(src);
                     let data = body[32..].to_vec();
-                    if recv_tx.send((source, data)).await.is_err() {
+                    if recv_tx
+                        .send(DerpEvent::RecvPacket { source, data })
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 } else if typ == frame_type::PING && body.len() >= 8 {
                     let mut data = [0u8; 8];
                     data.copy_from_slice(&body[..8]);
                     if pong_tx.send(DerpCmd::Pong { data }).await.is_err() {
+                        break;
+                    }
+                } else if typ == frame_type::PEER_GONE && body.len() >= 32 {
+                    let mut peer = [0u8; 32];
+                    peer.copy_from_slice(&body[..32]);
+                    let peer_key = NodePublic::from_raw32(peer);
+                    let reason = if body.len() > 32 {
+                        body[32]
+                    } else {
+                        peer_gone_reason::DISCONNECTED
+                    };
+                    if recv_tx
+                        .send(DerpEvent::PeerGone {
+                            peer: peer_key,
+                            reason,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                } else if typ == frame_type::HEALTH {
+                    let problem = String::from_utf8_lossy(&body).into_owned();
+                    if recv_tx.send(DerpEvent::Health { problem }).await.is_err() {
                         break;
                     }
                 }
@@ -158,8 +201,8 @@ impl DerpIo {
         let _ = self.cmd_tx.send(DerpCmd::SendPacket { dst, data }).await;
     }
 
-    /// Try to receive the next packet from DERP (blocks until one is ready).
-    pub async fn try_recv(&self) -> Option<(NodePublic, Vec<u8>)> {
+    /// Try to receive the next event from DERP (blocks until one is ready).
+    pub async fn try_recv(&self) -> Option<DerpEvent> {
         self.recv_rx.lock().await.recv().await
     }
 }

@@ -7,6 +7,7 @@ impl Server {
     /// This is the classic tsnet embedding path: an in-process smoltcp netstack
     /// backs `listen`/`dial`. For a full-client TUN device instead, use
     /// [`Server::up_tun`].
+    #[allow(clippy::large_futures)]
     pub async fn up(&mut self) -> Result<(), TsnetError> {
         if self.inner.is_some() {
             return Err(TsnetError::AlreadyUp);
@@ -103,6 +104,7 @@ impl Server {
             b.key_expired.clone(),
             b.ipn_backend.clone(),
             Some(key_rotation_ctx),
+            b.map_session.clone(),
         );
 
         // MagicDNS responder: best-effort UDP server at 100.100.100.100:53.
@@ -404,6 +406,7 @@ impl Server {
     /// `config.apply_routes` is true, the interface is brought up and tailnet
     /// routes are added via `ifconfig`/`route` (macOS) or `ip` (Linux) — also
     /// requiring root.
+    #[allow(clippy::large_futures)]
     pub async fn up_tun(&mut self, config: TunModeConfig) -> Result<(), TsnetError> {
         if self.inner.is_some() {
             return Err(TsnetError::AlreadyUp);
@@ -509,6 +512,7 @@ impl Server {
             b.key_expired.clone(),
             b.ipn_backend.clone(),
             Some(key_rotation_ctx),
+            b.map_session.clone(),
         );
 
         let (c2n_task, c2n_addr) =
@@ -1439,14 +1443,18 @@ impl Server {
         };
 
         let (map_tx, map_rx) = mpsc::channel(32);
+        let map_session = Arc::new(MapSessionState::new());
         let cc2 = ControlClient::new(
             self.config.control_url.clone(),
             state.machine_key.clone(),
             server_pub_key.clone(),
             PROTOCOL_VERSION,
         );
-        let map_task = tokio::spawn(async move {
-            cc2.stream_map_loop(&map_req, map_tx).await;
+        let map_task = tokio::spawn({
+            let ss = map_session.clone();
+            async move {
+                cc2.stream_map_loop(&map_req, map_tx, Some(ss)).await;
+            }
         });
 
         // 8. Create magicsock, reusing the UDP socket bound in step 3b so
@@ -1621,6 +1629,7 @@ impl Server {
             overrides: self.config.overrides.clone(),
             key_expired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             ipn_backend,
+            map_session,
         })
     }
 

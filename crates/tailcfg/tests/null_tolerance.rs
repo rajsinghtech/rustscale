@@ -213,6 +213,7 @@ fn sample_node() -> Node {
                 .unwrap()
                 .with_timezone(&chrono::Utc),
         ),
+        KeySignature: None,
         Machine: mp,
         DiscoKey: dp,
         Addresses: vec!["100.64.0.1/32".into(), "fd7a:115c::1/128".into()],
@@ -228,6 +229,7 @@ fn sample_node() -> Node {
         ),
         Cap: 999,
         Tags: vec!["tag:prod".into()],
+        LastSeen: None,
         Online: Some(true),
         Capabilities: vec!["https://tailscale.com/cap/file-sharing".into()],
         CapMap: BTreeMap::from([
@@ -237,6 +239,10 @@ fn sample_node() -> Node {
                 vec![rustscale_tailcfg::RawMessage("42".into())],
             ),
         ]),
+        UnsignedPeerAPIOnly: false,
+        Expired: false,
+        IsWireGuardOnly: false,
+        IsJailed: false,
     }
 }
 
@@ -391,6 +397,9 @@ fn sample_map_response() -> MapResponse {
         ControlTime: None,
         CollectServices: rustscale_tailcfg::OptBool::Unset,
         SSHPolicy: None,
+        PeersChangedPatch: None,
+        NetInfo: None,
+        ClientVersion: None,
     }
 }
 

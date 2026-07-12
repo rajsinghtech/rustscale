@@ -16,7 +16,7 @@ use crate::{
 
 /// Deserialize a `NodeCapMap`, treating `null` values inside the map as empty
 /// vectors (Go's nil slices marshal as `null`).
-fn deserialize_capmap<'de, D>(deserializer: D) -> Result<NodeCapMap, D::Error>
+pub(crate) fn deserialize_capmap<'de, D>(deserializer: D) -> Result<NodeCapMap, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -58,6 +58,9 @@ pub struct Node {
         deserialize_with = "deserialize_null_to_default"
     )]
     pub KeyExpiry: Option<DateTime<Utc>>,
+    /// Ed25519 signature over the node key (TKA / network lock).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub KeySignature: Option<Vec<u8>>,
     /// The node's machine key (zero if unset, then omitted).
     #[serde(
         default,
@@ -134,6 +137,10 @@ pub struct Node {
         deserialize_with = "deserialize_null_to_default"
     )]
     pub Tags: Vec<String>,
+    /// When the node was last online; `None` if unknown or never online.
+    /// Not updated while `Online` is true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub LastSeen: Option<DateTime<Utc>>,
     /// Whether the node is currently connected to control; `None` = unknown.
     #[serde(
         default,
@@ -156,6 +163,22 @@ pub struct Node {
         deserialize_with = "deserialize_capmap"
     )]
     pub CapMap: NodeCapMap,
+    /// Whether the node is not signed nor subject to TKA restrictions;
+    /// such nodes get peerapi access only, not network access.
+    #[serde(default, skip_serializing_if = "skip_default")]
+    pub UnsignedPeerAPIOnly: bool,
+    /// Whether this node's key has expired. Control may send this; clients
+    /// also compute it from `KeyExpiry` to avoid clock skew.
+    #[serde(default, skip_serializing_if = "skip_default")]
+    pub Expired: bool,
+    /// Whether this is a non-Tailscale WireGuard peer (no disco/DERP).
+    /// Must have `Endpoints` to be reachable.
+    #[serde(default, skip_serializing_if = "skip_default")]
+    pub IsWireGuardOnly: bool,
+    /// Whether this node is jailed (cannot initiate connections, but
+    /// outbound connections to it are still allowed).
+    #[serde(default, skip_serializing_if = "skip_default")]
+    pub IsJailed: bool,
 }
 
 /// `Node.CapMap` — capabilities to optional `RawMessage` argument lists.
@@ -669,6 +692,7 @@ mod tests {
                     .unwrap()
                     .with_timezone(&Utc),
             ),
+            KeySignature: Some(vec![0xDE, 0xAD, 0xBE, 0xEF]),
             Machine: mp,
             DiscoKey: dp,
             Addresses: vec!["100.64.0.1/32".into(), "fd7a:115c::1/128".into()],
@@ -693,9 +717,18 @@ mod tests {
             ),
             Cap: 999,
             Tags: vec!["tag:prod".into()],
+            LastSeen: Some(
+                DateTime::parse_from_rfc3339("2025-07-12T10:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
             Online: Some(true),
             Capabilities: vec!["https://tailscale.com/cap/file-sharing".into()],
             CapMap: BTreeMap::new(),
+            UnsignedPeerAPIOnly: false,
+            Expired: false,
+            IsWireGuardOnly: false,
+            IsJailed: false,
             PrimaryRoutes: vec![],
         }
     }
@@ -740,6 +773,76 @@ mod tests {
         n.Online = Some(false);
         let j = serde_json::to_string(&n).unwrap();
         assert!(j.contains("\"Online\":false"));
+    }
+
+    #[test]
+    fn node_new_fields_roundtrip() {
+        let mut n = sample_node();
+        n.KeySignature = Some(vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        n.LastSeen = Some(
+            DateTime::parse_from_rfc3339("2025-07-12T10:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        );
+        n.UnsignedPeerAPIOnly = true;
+        n.Expired = true;
+        n.IsWireGuardOnly = true;
+        n.IsJailed = true;
+
+        let j = serde_json::to_string(&n).unwrap();
+        assert!(j.contains("\"KeySignature\":\"3q2-7w\"=") || j.contains("\"KeySignature\""));
+        assert!(j.contains("\"LastSeen\":\"2025-07-12T10:00:00Z\""));
+        assert!(j.contains("\"UnsignedPeerAPIOnly\":true"));
+        assert!(j.contains("\"Expired\":true"));
+        assert!(j.contains("\"IsWireGuardOnly\":true"));
+        assert!(j.contains("\"IsJailed\":true"));
+
+        let back: Node = serde_json::from_str(&j).unwrap();
+        assert_eq!(back, n);
+    }
+
+    #[test]
+    fn node_new_fields_default_omitted() {
+        let n = Node {
+            ID: 1,
+            Key: NodePrivate::generate().public(),
+            ..Default::default()
+        };
+        let j = serde_json::to_string(&n).unwrap();
+        assert!(!j.contains("\"KeySignature\""), "None KeySignature omitted");
+        assert!(!j.contains("\"LastSeen\""), "None LastSeen omitted");
+        assert!(
+            !j.contains("\"UnsignedPeerAPIOnly\""),
+            "false UnsignedPeerAPIOnly omitted"
+        );
+        assert!(!j.contains("\"Expired\""), "false Expired omitted");
+        assert!(
+            !j.contains("\"IsWireGuardOnly\""),
+            "false IsWireGuardOnly omitted"
+        );
+        assert!(!j.contains("\"IsJailed\""), "false IsJailed omitted");
+    }
+
+    #[test]
+    fn node_new_fields_from_null() {
+        let json = r#"{
+            "ID": 1,
+            "Name": "test",
+            "Key": "nodekey:0000000000000000000000000000000000000000000000000000000000000001",
+            "KeySignature": null,
+            "LastSeen": null,
+            "UnsignedPeerAPIOnly": false,
+            "Expired": false,
+            "IsWireGuardOnly": false,
+            "IsJailed": false
+        }"#;
+        let n: Node = serde_json::from_str(json).unwrap();
+        assert!(n.KeySignature.is_none());
+        assert!(n.LastSeen.is_none());
+        assert!(!n.UnsignedPeerAPIOnly);
+        assert!(!n.Expired);
+        assert!(!n.IsWireGuardOnly);
+        assert!(!n.IsJailed);
     }
 
     #[test]

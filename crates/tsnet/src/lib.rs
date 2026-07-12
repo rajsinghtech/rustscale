@@ -114,7 +114,9 @@ pub(crate) use util::{
 // unused-import lint for the ones only referenced by child modules.
 #[allow(unused_imports)]
 use {
-    rustscale_controlclient::client::{ControlClient, RegisterError, StreamMapError},
+    rustscale_controlclient::client::{
+        ControlClient, MapSessionState, RegisterError, StreamMapError,
+    },
     rustscale_controlclient::controlhttp,
     rustscale_controlclient::{extract_knobs_from_map_response, C2nRouter},
     rustscale_controlknobs::ControlKnobs,
@@ -134,7 +136,7 @@ use {
     rustscale_netstack::{Netstack, NetstackError, NetstackStream, UdpListener, DEFAULT_MTU},
     rustscale_tailcfg::{
         DERPMap, DNSConfig, FilterRule, Hostinfo, MapRequest, MapResponse, NetInfo, Node, OptBool,
-        RegisterRequest, SSHPolicy, UserID, UserProfile,
+        PeerChange, RegisterRequest, SSHPolicy, UserID, UserProfile,
     },
     rustscale_tun::Tun,
     rustscale_wg::{WgError, WgTunn},
@@ -613,6 +615,8 @@ pub(crate) struct Bootstrap {
     pub(crate) key_expired: Arc<std::sync::atomic::AtomicBool>,
     /// IPN state machine backend (shared with LocalApiState).
     pub(crate) ipn_backend: Arc<IpnBackend>,
+    /// Shared map-session state for delta-tracking across reconnections.
+    pub(crate) map_session: Arc<MapSessionState>,
 }
 
 /// An embedded Tailscale server.

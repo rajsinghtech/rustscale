@@ -267,3 +267,52 @@ testcontrol + daemon with LocalAPI on a temp socket and exercises the
 `status` path both via the library and the binary via `std::process`;
 interactive_auth_flow test: testcontrol(require_auth) → start_localapi_only
 → /start → BrowseToURL → complete_auth → Running.
+
+## Windows port (x86_64-pc-windows-msvc)
+
+Status: 🚧 not started — full Windows support is out of scope per
+`docs/phase-ci-parity.md`. The `Check (windows)` matrix leg and the
+`x86_64-pc-windows-msvc` cross-check leg in `.github/workflows/ci.yml` are
+`continue-on-error: true` (best-effort) until a dedicated Windows-port phase
+lands. The failures below are what `cargo check --workspace --target
+x86_64-pc-windows-msvc` reports today (confirmed 2026-07-12).
+
+### Real compile errors (block `cargo check --workspace` on Windows)
+
+| Crate | Location | Error | Cause |
+| --- | --- | --- | --- |
+| `crates/tun` | `src/lib.rs:123-124` | `E0425: cannot find value AF_INET/AF_INET6 in crate libc` | `pub const AF_INET: u8 = libc::AF_INET as u8` is ungated; these POSIX AF constants are not exported by `libc` on Windows. The consts feed the macOS utun 4-byte AF header framing — needs a Windows TUN driver path (`wintun`) or cfg-gating. |
+| `crates/tcpinfo` | `src/lib.rs:14` | `E0433: cannot find unix in os` | `use std::os::unix::io::{AsRawFd, RawFd}` is Unix-only; Windows needs `std::os::windows::io::AsRawSocket` (or a cfg-gated import). |
+| `crates/tcpinfo` | `src/lib.rs:19` | `E0599: no method named as_raw_fd found for &TcpStream` | `as_raw_fd` is Unix-only; on Windows use `as_raw_socket`. The `rtt()` entrypoint calls `rtt_impl(stream.as_raw_fd())` ungated. |
+
+### Dead-code warnings (become errors under `-D warnings`)
+
+These helper functions are only called from `#[cfg(target_os = "macos")]` /
+`#[cfg(target_os = "linux")]` code paths, so on Windows they are unreferenced.
+Under `cargo clippy -- -D warnings` (run by the linux/macOS clippy steps, not
+the Windows check step) they would be errors. Fix by cfg-gating the function
+definitions to `#[cfg(any(target_os = "macos", target_os = "linux"))]` or
+adding `#[allow(dead_code)]` in a future Windows-port phase.
+
+| Crate | Location | Symbol |
+| --- | --- | --- |
+| `crates/netmon` | `src/state.rs:637` | `find_self_ip_on_interface` |
+| `crates/netns` | `src/lib.rs:107` | `is_cgnat_v4` |
+| `crates/netns` | `src/lib.rs:112` | `is_tailscale_ula` |
+| `crates/portmapper` | `src/gateway.rs:104` | `ip_for_interface` |
+| `crates/portmapper` | `src/gateway.rs:128` | `is_link_local` |
+
+### Notes for the future Windows-port phase
+
+- `crates/tun` needs a real Windows TUN backend (wintun.dll) plus cfg-gated AF
+  constants; the current `create()` is already `#[cfg(any(macos, linux))]` but
+  the `AF_INET`/`AF_INET6`/`strip_af_header`/`prepend_af_header` helpers are
+  ungated.
+- `crates/tcpinfo` `rtt()` and `break_tcp_conns()` need Windows stubs
+  (`io::ErrorKind::Unsupported` / no-op `Ok(0)`); the macOS and Linux
+  `rtt_impl`/`break_tcp_conns_impl` are already cfg-gated, only the top-level
+  `use` and `rtt()` wrapper are not.
+- `crates/netns` already has an `other` fallback module; the dead-code warnings
+  are purely from ungated helper predicates.
+- After fixing the above, drop `continue-on-error: true` from the two Windows
+  legs in `ci.yml` and remove this section's "not started" status.

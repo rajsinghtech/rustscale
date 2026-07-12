@@ -43,6 +43,11 @@ pub enum DerpError {
     Key(#[from] rustscale_key::KeyError),
     #[error("packet too large: {0} bytes")]
     PacketTooLarge(usize),
+    #[error("server key mismatch: expected {expected}, got {actual}")]
+    ServerKeyMismatch {
+        expected: rustscale_key::NodePublic,
+        actual: rustscale_key::NodePublic,
+    },
 }
 
 // Re-export frame type constants for convenience.

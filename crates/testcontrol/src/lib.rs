@@ -74,6 +74,9 @@ struct ServerInner {
     auth_path_nodes: HashMap<String, NodePublic>,
     authed_nodes: HashSet<NodePublic>,
     last_auth_url: Option<String>,
+    /// Node keys that have been logged out (sent a RegisterRequest with
+    /// Expiry in the far past). Tests can check this via `saw_logout`.
+    logged_out_nodes: HashSet<NodePublic>,
     base_url: String,
 }
 
@@ -122,6 +125,7 @@ impl Server {
                 auth_path_nodes: HashMap::new(),
                 authed_nodes: HashSet::new(),
                 last_auth_url: None,
+                logged_out_nodes: HashSet::new(),
                 base_url: String::new(),
             })),
             notify: Arc::new(Notify::new()),
@@ -350,6 +354,12 @@ impl Server {
                 tokio::time::timeout(std::time::Duration::from_millis(50), self.notify.notified())
                     .await;
         }
+    }
+
+    /// Returns true if the given node key sent a logout register request
+    /// (RegisterRequest with Expiry in the far past).
+    pub fn saw_logout(&self, nk: &NodePublic) -> bool {
+        self.inner.lock().unwrap().logged_out_nodes.contains(nk)
     }
 }
 
@@ -648,6 +658,26 @@ async fn serve_register(
     }
 
     let nk = req.NodeKey.clone();
+
+    // Detect logout requests: Expiry set to the far past (before 2000).
+    // The control server should expire the node key. We record it for
+    // test verification and remove the node from the authed set.
+    if let Some(ref expiry) = req.Expiry {
+        if *expiry
+            < chrono::DateTime::parse_from_rfc3339("2000-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        {
+            let mut g = inner.lock().unwrap();
+            g.logged_out_nodes.insert(nk.clone());
+            g.authed_nodes.remove(&nk);
+            let resp = RegisterResponse {
+                MachineAuthorized: false,
+                ..Default::default()
+            };
+            return serde_json::to_vec(&resp).unwrap_or_default();
+        }
+    }
 
     // If this is a followup request, block until auth is completed.
     if !req.Followup.is_empty() {

@@ -501,6 +501,10 @@ struct RunningState {
     /// IPN state machine backend — tracks the current IPN state, holds
     /// the notification bus, and drives state transitions.
     ipn_backend: Arc<IpnBackend>,
+    /// Notify fired by POST /logout so the daemon can tear down the server
+    /// and transition to NeedsLogin. Stored here so the daemon can select
+    /// on it alongside shutdown signals.
+    logout_trigger: Arc<tokio::sync::Notify>,
 }
 
 /// Which data plane is wired up: userspace netstack (tsnet listen/dial) or a
@@ -652,6 +656,11 @@ struct PreStartedLocalApi {
     #[allow(dead_code)]
     auth_url: Arc<std::sync::Mutex<Option<String>>>,
     command_rx: Option<mpsc::UnboundedReceiver<localapi::DaemonCommand>>,
+    /// Clone of the command sender stored in LocalApiState, so up() can
+    /// reuse it in the new LocalApiState (keeping the daemon's rx live).
+    command_tx: Option<mpsc::UnboundedSender<localapi::DaemonCommand>>,
+    /// Logout trigger shared with LocalApiState, so up() can reuse it.
+    logout_trigger: Arc<tokio::sync::Notify>,
     #[allow(dead_code)]
     socket_path: PathBuf,
 }
@@ -1031,10 +1040,17 @@ impl Server {
                 home_derp: b.home_derp,
                 ipn_backend: b.ipn_backend.clone(),
                 derp_map: b.derp_map.clone(),
-                command_tx: None,
+                command_tx: self
+                    .pre_started
+                    .as_ref()
+                    .and_then(|ps| ps.command_tx.clone()),
                 state_dir: self.config.state_dir.clone(),
                 auth_url: Arc::new(std::sync::Mutex::new(None)),
-                login_trigger: Arc::new(tokio::sync::Notify::new()),
+                login_trigger: self
+                    .pre_started
+                    .as_ref()
+                    .map(|ps| ps.login_trigger.clone())
+                    .unwrap_or_else(|| Arc::new(tokio::sync::Notify::new())),
                 serve_config: Arc::new(RwLock::new(
                     self.config
                         .state_dir
@@ -1073,6 +1089,12 @@ impl Server {
                 taildrop: Some(taildrop.clone()),
                 netstack: Some(netstack.clone()),
                 filter: std::sync::OnceLock::new(),
+                route_table: Some(b.route_table.clone()),
+                logout_trigger: self
+                    .pre_started
+                    .as_ref()
+                    .map(|ps| ps.logout_trigger.clone())
+                    .unwrap_or_else(|| Arc::new(tokio::sync::Notify::new())),
             };
             // Publish the live filter so `PATCH /prefs` can toggle
             // shields-up mode without a full rebuild.
@@ -1128,7 +1150,41 @@ impl Server {
             key_expired: b.key_expired,
             os_dns_configurator: None,
             ipn_backend: b.ipn_backend,
+            logout_trigger: self
+                .pre_started
+                .as_ref()
+                .map(|ps| ps.logout_trigger.clone())
+                .unwrap_or_else(|| Arc::new(tokio::sync::Notify::new())),
         });
+
+        // Apply stored exit-node pref on start (survives restart).
+        // The peer list is populated from the first MapResponse, so we
+        // can resolve the exit node immediately.
+        let stored_prefs = self.load_prefs().unwrap_or_default();
+        if !stored_prefs.ExitNodeIP.is_empty() || !stored_prefs.ExitNodeID.is_empty() {
+            // Extract Arcs before awaiting — RunningState is !Sync due to
+            // os_dns_configurator, so &RunningState can't cross await points.
+            let (peers, route_table) = match self.inner.as_ref() {
+                Some(inner) => (inner.peers.clone(), inner.route_table.clone()),
+                None => return Ok(()),
+            };
+            let ip_or_name = if stored_prefs.ExitNodeIP.is_empty() {
+                &stored_prefs.ExitNodeID
+            } else {
+                &stored_prefs.ExitNodeIP
+            };
+            let peers_guard = peers.read().await;
+            if let Some(peer_key) = localapi::resolve_exit_node_peer(&peers_guard, ip_or_name) {
+                drop(peers_guard);
+                route_table.write().await.set_exit_node(peer_key);
+                eprintln!("tsnet: applied stored exit-node pref: {ip_or_name}");
+            } else {
+                eprintln!(
+                    "tsnet: stored exit-node pref unresolved (peer not in netmap): {ip_or_name}"
+                );
+            }
+        }
+
         Ok(())
     }
 
@@ -1378,10 +1434,17 @@ impl Server {
                 home_derp: b.home_derp,
                 ipn_backend: b.ipn_backend.clone(),
                 derp_map: b.derp_map.clone(),
-                command_tx: None,
+                command_tx: self
+                    .pre_started
+                    .as_ref()
+                    .and_then(|ps| ps.command_tx.clone()),
                 state_dir: self.config.state_dir.clone(),
                 auth_url: Arc::new(std::sync::Mutex::new(None)),
-                login_trigger: Arc::new(tokio::sync::Notify::new()),
+                login_trigger: self
+                    .pre_started
+                    .as_ref()
+                    .map(|ps| ps.login_trigger.clone())
+                    .unwrap_or_else(|| Arc::new(tokio::sync::Notify::new())),
                 serve_config: Arc::new(RwLock::new(
                     self.config
                         .state_dir
@@ -1420,6 +1483,12 @@ impl Server {
                 taildrop: Some(taildrop.clone()),
                 netstack: None, // TUN mode has no netstack
                 filter: std::sync::OnceLock::new(),
+                route_table: Some(b.route_table.clone()),
+                logout_trigger: self
+                    .pre_started
+                    .as_ref()
+                    .map(|ps| ps.logout_trigger.clone())
+                    .unwrap_or_else(|| Arc::new(tokio::sync::Notify::new())),
             };
             // Publish the live filter so `PATCH /prefs` can toggle
             // shields-up mode without a full rebuild.
@@ -1508,7 +1577,37 @@ impl Server {
             key_expired: b.key_expired,
             os_dns_configurator,
             ipn_backend: b.ipn_backend,
+            logout_trigger: self
+                .pre_started
+                .as_ref()
+                .map(|ps| ps.logout_trigger.clone())
+                .unwrap_or_else(|| Arc::new(tokio::sync::Notify::new())),
         });
+
+        // Apply stored exit-node pref on start (survives restart).
+        let stored_prefs = self.load_prefs().unwrap_or_default();
+        if !stored_prefs.ExitNodeIP.is_empty() || !stored_prefs.ExitNodeID.is_empty() {
+            let (peers, route_table) = match self.inner.as_ref() {
+                Some(inner) => (inner.peers.clone(), inner.route_table.clone()),
+                None => return Ok(()),
+            };
+            let ip_or_name = if stored_prefs.ExitNodeIP.is_empty() {
+                &stored_prefs.ExitNodeID
+            } else {
+                &stored_prefs.ExitNodeIP
+            };
+            let peers_guard = peers.read().await;
+            if let Some(peer_key) = localapi::resolve_exit_node_peer(&peers_guard, ip_or_name) {
+                drop(peers_guard);
+                route_table.write().await.set_exit_node(peer_key);
+                eprintln!("tsnet: applied stored exit-node pref: {ip_or_name}");
+            } else {
+                eprintln!(
+                    "tsnet: stored exit-node pref unresolved (peer not in netmap): {ip_or_name}"
+                );
+            }
+        }
+
         Ok(())
     }
 
@@ -1559,8 +1658,10 @@ impl Server {
         let prefs = Arc::new(RwLock::new(prefs));
 
         let (command_tx, command_rx) = mpsc::unbounded_channel();
+        let command_tx_clone = command_tx.clone();
         let login_trigger = Arc::new(tokio::sync::Notify::new());
         let auth_url = Arc::new(std::sync::Mutex::new(None));
+        let logout_trigger = Arc::new(tokio::sync::Notify::new());
 
         let (magicsock, _wg_rx) = Magicsock::new(MagicsockConfig {
             private_key: state.node_key.clone(),
@@ -1633,6 +1734,8 @@ impl Server {
             taildrop: None,
             netstack: None,
             filter: std::sync::OnceLock::new(),
+            route_table: None,
+            logout_trigger: logout_trigger.clone(),
         });
 
         let handle = localapi::spawn_localapi(api_state.clone(), socket_path.clone());
@@ -1651,6 +1754,8 @@ impl Server {
             login_trigger,
             auth_url,
             command_rx: Some(command_rx),
+            command_tx: Some(command_tx_clone),
+            logout_trigger,
             socket_path,
         });
 
@@ -2889,6 +2994,121 @@ impl Server {
         }
     }
 
+    /// Returns the logout trigger Notify, if the server is running.
+    /// The daemon selects on this alongside shutdown signals to handle
+    /// POST /logout after the server is up.
+    pub fn logout_trigger(&self) -> Option<Arc<tokio::sync::Notify>> {
+        self.inner
+            .as_ref()
+            .map(|inner| inner.logout_trigger.clone())
+            .or_else(|| {
+                self.pre_started
+                    .as_ref()
+                    .map(|ps| ps.logout_trigger.clone())
+            })
+    }
+
+    /// Log out: send a logout register request to the control plane
+    /// (expiring the node key), clear persisted state, transition the IPN
+    /// backend to NeedsLogin, and tear down the running state.
+    ///
+    /// Mirrors Go's `LocalBackend.Logout` → `controlclient.TryLogout`:
+    /// a RegisterRequest with `Expiry` set to the far past (1970-01-01)
+    /// tells the control server to expire the node. After that, persisted
+    /// keys and netmap cache are cleared so a restart starts fresh.
+    ///
+    /// After logout, the server is in a `NeedsLogin` state. The daemon
+    /// should call `start_localapi_only()` again to accept a new login.
+    pub async fn logout(&mut self) -> Result<(), TsnetError> {
+        let mut inner = match self.inner.take() {
+            Some(inner) => inner,
+            None => return Ok(()), // already down
+        };
+
+        // 1. Send a logout register request (Expiry = far past) to expire
+        //    the node key on the control server. Best-effort: network
+        //    errors don't prevent local cleanup.
+        let cc = ControlClient::new(
+            &self.config.control_url,
+            inner.machine_key.clone(),
+            inner.server_pub_key.clone(),
+            PROTOCOL_VERSION,
+        );
+        let node_pub = inner.node_key.public();
+        let logout_req = RegisterRequest {
+            Version: CAPABILITY_VERSION,
+            NodeKey: node_pub,
+            Expiry: Some(
+                chrono::DateTime::parse_from_rfc3339("1970-01-01T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            ),
+            Hostinfo: Some(Hostinfo {
+                OS: std::env::consts::OS.to_string(),
+                Hostname: self.config.hostname.clone(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        if let Err(e) = cc.register(&logout_req).await {
+            eprintln!("tsnet: logout register failed (non-fatal): {e}");
+        }
+
+        // 2. Clear persisted state: regenerate keys, clear netmap cache.
+        if let Some(ref dir) = self.config.state_dir {
+            let fresh = PersistedState::generate();
+            if let Err(e) = self.save_state(&fresh) {
+                eprintln!("tsnet: failed to clear state on logout: {e}");
+            }
+            PersistedState::clear_netmap(dir);
+        }
+
+        // 3. Set prefs LoggedOut=true, WantRunning=false.
+        let mut prefs = self.load_prefs().unwrap_or_default();
+        prefs.LoggedOut = true;
+        prefs.WantRunning = false;
+        if let Some(ref dir) = self.config.state_dir {
+            let _ = prefs.save(dir);
+        }
+
+        // 4. Transition IPN backend to NeedsLogin.
+        inner.ipn_backend.update_inputs(|i| {
+            i.want_running = false;
+            i.has_node_key = false;
+            i.auth_cant_continue = true;
+            i.netmap_present = false;
+        });
+        inner.ipn_backend.bus().send(rustscale_ipn::Notify {
+            State: Some(rustscale_ipn::State::NeedsLogin),
+            Prefs: Some(serde_json::to_value(&prefs).unwrap_or_default()),
+            ..Default::default()
+        });
+
+        // 5. Tear down the running state (stop tasks, cancel, close sockets).
+        if let Some(serve) = inner.serve.take() {
+            serve.stop().await;
+        }
+        inner.cancel.cancel();
+        inner.health_watchdog.stop();
+        if let Some(m) = inner.monitor.take() {
+            m.shutdown();
+        }
+        let mut tasks = inner.tasks.lock().await;
+        for task in tasks.drain(..) {
+            task.abort();
+        }
+        if let Some(ref path) = inner.localapi_socket {
+            let _ = std::fs::remove_file(path);
+        }
+        if let Some(mut cfg) = inner.os_dns_configurator.take() {
+            if let Err(e) = cfg.close() {
+                eprintln!("tsnet: OS DNS cleanup failed (non-fatal): {e}");
+            }
+        }
+
+        Ok(())
+    }
+
     // --- internal helpers ---
 
     fn load_or_create_state(&self) -> Result<PersistedState, TsnetError> {
@@ -3270,6 +3490,19 @@ fn spawn_map_update_task(
                         if let Some(ref dir) = state_dir {
                             PersistedState::clear_netmap(dir);
                         }
+                        // TODO(key-rotation): When the node key expires, the
+                        // client should re-register with OldNodeKey set to the
+                        // previous key, generate a fresh node key, and send a
+                        // new RegisterRequest. If interactive auth is required,
+                        // emit BrowseToURL via ipn_backend. After successful
+                        // re-registration, restart the map poll with the new
+                        // key and transition back to Running.
+                        //
+                        // Go ref: control/controlclient/direct.go doLogin with
+                        // OldNodeKey, ipn/ipnlocal/local.go key-expiry handling.
+                        // The RegisterRequest struct already has OldNodeKey;
+                        // the bootstrap() flow would need refactoring to support
+                        // re-registration without tearing down the whole stack.
                     }
 
                     // Extract control knobs from the self-node's CapMap and

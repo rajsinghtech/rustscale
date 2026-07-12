@@ -32,7 +32,7 @@ use rustscale_ipn::{
     validate_notify_watch_opt, IpnBackend, LoginProfile, MaskedPrefs, NotifyWatchOpt, Prefs,
     StartOptions, NOTIFY_IN_PROCESS_NO_DISCONNECT,
 };
-use rustscale_key::{MachinePrivate, MachinePublic, NodePrivate};
+use rustscale_key::{MachinePrivate, MachinePublic, NodePrivate, NodePublic};
 use rustscale_magicsock::{Magicsock, PathClass};
 use rustscale_safesocket::ServerStream;
 use rustscale_tailcfg::{DERPMap, DNSConfig, Node, UserID, UserProfile};
@@ -115,6 +115,13 @@ pub(crate) struct LocalApiState {
     /// value is swapped — so a `OnceLock` suffices). Used to apply shields-up
     /// mode changes from `PATCH /prefs` without a full filter rebuild.
     pub filter: std::sync::OnceLock<Arc<std::sync::Mutex<Filter>>>,
+    /// Shared route table (for applying exit-node pref changes directly).
+    /// None when the server is not fully up (e.g. start_localapi_only).
+    pub route_table: Option<Arc<RwLock<crate::routing::RouteTable>>>,
+    /// Notify fired by POST /logout so the daemon can tear down the server
+    /// and transition to NeedsLogin. The daemon selects on this alongside
+    /// shutdown signals.
+    pub logout_trigger: Arc<tokio::sync::Notify>,
 }
 
 pub struct LocalApiHandle {
@@ -396,8 +403,94 @@ async fn handle_logout<W: AsyncWrite + Unpin>(
     if let Some(ref tx) = state.command_tx {
         let _ = tx.send(DaemonCommand::Logout);
     }
+    state.logout_trigger.notify_waiters();
     write_no_content_response(conn, 204, "No Content").await?;
     Ok(())
+}
+
+/// Resolve an exit node from the peer list by IP address, MagicDNS name,
+/// or stable node ID. Returns the peer's NodePublic key on success.
+/// Mirrors Go's `resolveExitNodeIPLocked` / `peerWithStableID` lookup.
+pub(crate) fn resolve_exit_node_peer(peers: &[Node], ip_or_name: &str) -> Option<NodePublic> {
+    // Try parsing as an IP address first.
+    if let Ok(ip) = ip_or_name.parse::<IpAddr>() {
+        for peer in peers {
+            for addr in &peer.Addresses {
+                if let Some(peer_ip_str) = addr.split('/').next() {
+                    if let Ok(peer_ip) = peer_ip_str.parse::<IpAddr>() {
+                        if peer_ip == ip {
+                            // Verify the peer is exit-node-capable.
+                            if peer
+                                .AllowedIPs
+                                .iter()
+                                .any(|r| r == "0.0.0.0/0" || r == "::/0")
+                            {
+                                return Some(peer.Key.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return None;
+    }
+
+    // Try matching by hostname (with or without trailing dot, case-insensitive).
+    let name_lc = ip_or_name.trim_end_matches('.').to_lowercase();
+    for peer in peers {
+        let peer_name = peer.Name.trim_end_matches('.').to_lowercase();
+        if peer_name == name_lc
+            && peer
+                .AllowedIPs
+                .iter()
+                .any(|r| r == "0.0.0.0/0" || r == "::/0")
+        {
+            return Some(peer.Key.clone());
+        }
+    }
+
+    // Try matching by StableID.
+    for peer in peers {
+        if peer.StableID == ip_or_name
+            && peer
+                .AllowedIPs
+                .iter()
+                .any(|r| r == "0.0.0.0/0" || r == "::/0")
+        {
+            return Some(peer.Key.clone());
+        }
+    }
+
+    None
+}
+
+/// Apply exit-node prefs to the route table. Called from handle_patch_prefs
+/// when ExitNodeID/ExitNodeIP changes, and from up()/up_tun() on daemon
+/// start to apply persisted prefs. Mirrors Go's applyPrefsToEngine
+/// exit-node handling.
+pub(crate) async fn apply_exit_node_prefs(prefs: &Prefs, state: &Arc<LocalApiState>) {
+    let Some(ref rt) = state.route_table else {
+        return;
+    };
+
+    let ip_or_name = if !prefs.ExitNodeIP.is_empty() {
+        &prefs.ExitNodeIP
+    } else if !prefs.ExitNodeID.is_empty() {
+        &prefs.ExitNodeID
+    } else {
+        // No exit node selected — clear it.
+        rt.write().await.clear_exit_node();
+        return;
+    };
+
+    let peers = state.peers.read().await;
+    if let Some(peer_key) = resolve_exit_node_peer(&peers, ip_or_name) {
+        rt.write().await.set_exit_node(peer_key);
+    } else {
+        // Peer not found (may not be in the netmap yet). Clear for now;
+        // the map update task will re-apply when the peer appears.
+        rt.write().await.clear_exit_node();
+    }
 }
 
 async fn handle_patch_prefs<W: AsyncWrite + Unpin>(
@@ -418,6 +511,8 @@ async fn handle_patch_prefs<W: AsyncWrite + Unpin>(
         }
     };
 
+    let exit_node_changed = masked.ExitNodeIDSet || masked.ExitNodeIPSet;
+
     let updated = {
         let mut prefs = state.prefs.write().await;
         masked.apply_to(&mut prefs);
@@ -437,6 +532,14 @@ async fn handle_patch_prefs<W: AsyncWrite + Unpin>(
                 .unwrap()
                 .set_shields_up(masked.Prefs.ShieldsUp);
         }
+    }
+
+    // Apply exit-node routing changes to the route table (Gap 1).
+    // When ExitNodeIP or ExitNodeID is patched, resolve the peer and
+    // update the route table — mirroring Go's applyPrefsToEngine.
+    if exit_node_changed {
+        let prefs = state.prefs.read().await;
+        apply_exit_node_prefs(&prefs, state).await;
     }
 
     state.ipn_backend.bus().send(rustscale_ipn::Notify {
@@ -2037,6 +2140,8 @@ mod tests {
             taildrop: None,
             netstack: None,
             filter: std::sync::OnceLock::new(),
+            route_table: None,
+            logout_trigger: Arc::new(tokio::sync::Notify::new()),
         })
     }
 
@@ -2754,6 +2859,8 @@ mod tests {
             taildrop: None,
             netstack: None,
             filter: std::sync::OnceLock::new(),
+            route_table: None,
+            logout_trigger: Arc::new(tokio::sync::Notify::new()),
         });
 
         let config = r#"{"TCP":{"8080":{"HTTP":true}}}"#;
@@ -2978,6 +3085,8 @@ mod tests {
             taildrop: None,
             netstack: None,
             filter: std::sync::OnceLock::new(),
+            route_table: None,
+            logout_trigger: Arc::new(tokio::sync::Notify::new()),
         })
     }
 

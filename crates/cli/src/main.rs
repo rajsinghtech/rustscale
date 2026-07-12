@@ -132,6 +132,13 @@ async fn dispatch(
         "file" => commands::file::run(args, &socket_path, json).await,
         "ssh" => commands::ssh::run(args, &socket_path).await,
         "web" => commands::web::run(args, &socket_path).await,
+        "debug" => commands::debug::run(args, &socket_path, json).await,
+        "bugreport" => commands::bugreport::run(args, &socket_path, json).await,
+        "exit-node" => commands::exit_node::run(args, &socket_path, json).await,
+        "dns" => commands::dns::run(args, &socket_path, json).await,
+        "nc" => commands::nc::run(args, &socket_path, json).await,
+        "id-token" => commands::id_token::run(args, &socket_path, json).await,
+        "update" => commands::update::run(args, &socket_path, json).await,
         other => {
             eprintln!("error: unknown subcommand '{other}'");
             usage(&std::env::args().next().unwrap_or_default());
@@ -177,6 +184,15 @@ fn usage(bin: &str) {
         "  ssh [user@]host [args...]            SSH to a Tailscale machine (execs system ssh)"
     );
     eprintln!("  web [--listen <addr>] [--readonly]   run a web UI for controlling rustscale");
+    eprintln!("  debug [status|ipconfig|metrics]      call daemon debug endpoints");
+    eprintln!("  bugreport                            print diagnostic summary for bug reports");
+    eprintln!("  exit-node [--list] [--suggest]       list or select exit nodes");
+    eprintln!("  dns [name] [--type <type>]           query the daemon DNS resolver");
+    eprintln!("  nc <host:port>                       netcat via tailnet (not yet supported)");
+    eprintln!("  id-token <audience>                  fetch OIDC ID token (not yet supported)");
+    eprintln!(
+        "  update                               check for client updates (not yet supported)"
+    );
 }
 
 /// Error type for CLI subcommands.

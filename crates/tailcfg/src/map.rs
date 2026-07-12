@@ -10,7 +10,7 @@ use rustscale_key::{DiscoPublic, NodePublic};
 use crate::deserialize_null_to_default;
 use crate::{
     skip_default, skip_zero_disco, CapabilityVersion, DERPMap, DNSConfig, FilterRule, NetInfo,
-    Node, NodeCapMap, NodeID, UserProfile,
+    Node, NodeCapMap, NodeID, StableNodeID, UserProfile,
 };
 
 /// Sent by a client to update its state and/or long-poll network-map updates.
@@ -226,6 +226,14 @@ pub struct MapResponse {
     /// Latest client version info from control. `None` means no change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ClientVersion: Option<ClientVersion>,
+    /// Control-suggested exit node (`StableNodeID`). Empty means no
+    /// suggestion. Mirrors Go's `MapResponse.SuggestedExitNode`.
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
+    pub SuggestedExitNode: StableNodeID,
 }
 
 /// Incremental update to a single peer (mirrors Go's `tailcfg.PeerChange`).

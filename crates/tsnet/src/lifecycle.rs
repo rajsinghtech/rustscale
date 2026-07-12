@@ -7,7 +7,7 @@ impl Server {
     /// This is the classic tsnet embedding path: an in-process smoltcp netstack
     /// backs `listen`/`dial`. For a full-client TUN device instead, use
     /// [`Server::up_tun`].
-#[allow(clippy::large_futures)]
+    #[allow(clippy::large_futures)]
     ///
     /// **Idempotent**: calling `up()` on an already-running server returns
     /// `Ok(ServerStatus)` immediately without re-starting. Mirrors Go's
@@ -75,6 +75,7 @@ impl Server {
         ));
 
         // Map-stream update task (peer/route deltas).
+        let suggested_exit_node: Arc<RwLock<String>> = Arc::new(RwLock::new(String::new()));
         let key_rotation_ctx = KeyRotationCtx {
             control_url: b.control_url.clone(),
             machine_key: b.machine_key.clone(),
@@ -114,6 +115,7 @@ impl Server {
             b.ipn_backend.clone(),
             Some(key_rotation_ctx),
             b.map_session.clone(),
+            suggested_exit_node.clone(),
         );
 
         // MagicDNS responder: best-effort UDP server at 100.100.100.100:53.
@@ -314,6 +316,7 @@ impl Server {
                     .as_ref()
                     .map(|ps| ps.logout_trigger.clone())
                     .unwrap_or_else(|| Arc::new(tokio::sync::Notify::new())),
+                suggested_exit_node: suggested_exit_node.clone(),
             };
             // Publish the live filter so `PATCH /prefs` can toggle
             // shields-up mode without a full rebuild.
@@ -416,7 +419,7 @@ impl Server {
     /// `config.apply_routes` is true, the interface is brought up and tailnet
     /// routes are added via `ifconfig`/`route` (macOS) or `ip` (Linux) — also
     /// requiring root.
-#[allow(clippy::large_futures)]
+    #[allow(clippy::large_futures)]
     pub async fn up_tun(&mut self, config: TunModeConfig) -> Result<ServerStatus, TsnetError> {
         if self.inner.is_some() {
             return Ok(self.status());
@@ -485,6 +488,7 @@ impl Server {
             self.config.peer_relay_server,
         );
 
+        let suggested_exit_node: Arc<RwLock<String>> = Arc::new(RwLock::new(String::new()));
         let key_rotation_ctx = KeyRotationCtx {
             control_url: b.control_url.clone(),
             machine_key: b.machine_key.clone(),
@@ -524,6 +528,7 @@ impl Server {
             b.ipn_backend.clone(),
             Some(key_rotation_ctx),
             b.map_session.clone(),
+            suggested_exit_node.clone(),
         );
 
         let (c2n_task, c2n_addr) =
@@ -699,6 +704,7 @@ impl Server {
                     .as_ref()
                     .map(|ps| ps.logout_trigger.clone())
                     .unwrap_or_else(|| Arc::new(tokio::sync::Notify::new())),
+                suggested_exit_node: suggested_exit_node.clone(),
             };
             // Publish the live filter so `PATCH /prefs` can toggle
             // shields-up mode without a full rebuild.
@@ -960,6 +966,7 @@ impl Server {
             filter: std::sync::OnceLock::new(),
             route_table: None,
             logout_trigger: logout_trigger.clone(),
+            suggested_exit_node: Arc::new(RwLock::new(String::new())),
         });
 
         let handle = localapi::spawn_localapi(api_state.clone(), socket_path.clone());

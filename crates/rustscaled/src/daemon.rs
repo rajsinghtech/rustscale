@@ -13,16 +13,39 @@ pub async fn run(
     hostname: Option<String>,
     tun: bool,
     socket_override: Option<PathBuf>,
+    port: Option<u16>,
+    socks5_server: Option<String>,
+    http_proxy_server: Option<String>,
+    cleanup: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let auth_key = std::env::var("TS_AUTHKEY").ok();
     let state_dir = statedir.unwrap_or_else(|| PathBuf::from(DEFAULT_STATE_DIR));
     let hostname = hostname.unwrap_or_else(|| "rustscale".to_string());
     let socket_path = socket_override.unwrap_or_else(|| determine_socket_path(&state_dir));
 
+    // --cleanup: remove old state files and exit.
+    if cleanup {
+        eprintln!("rustscaled: cleaning up state in {}", state_dir.display());
+        cleanup_state(&state_dir)?;
+        return Ok(());
+    }
+
+    // --socks5-server: not yet wired into the daemon bootstrap.
+    // TODO: spawn SOCKS5 listener via tsnet::socks5 when the server is up.
+    if let Some(ref addr) = socks5_server {
+        eprintln!("rustscaled: --socks5-server {addr} (TODO: not yet wired)");
+    }
+
+    // --http-proxy-server: set as environment variable for outbound proxies.
+    // TODO: wire into magicsock/controlclient HTTP clients directly.
+    if let Some(ref addr) = http_proxy_server {
+        eprintln!("rustscaled: --http-proxy-server {addr} (TODO: not yet wired)");
+    }
+
     if let Some(key) = auth_key {
-        run_with_auth_key(&key, &state_dir, &hostname, &socket_path, tun).await
+        run_with_auth_key(&key, &state_dir, &hostname, &socket_path, tun, port).await
     } else {
-        run_interactive(&state_dir, &hostname, &socket_path, tun).await
+        run_interactive(&state_dir, &hostname, &socket_path, tun, port).await
     }
 }
 
@@ -32,13 +55,17 @@ async fn run_with_auth_key(
     hostname: &str,
     socket_path: &Path,
     tun: bool,
+    port: Option<u16>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut server = Server::builder()
+    let mut builder = Server::builder()
         .hostname(hostname)
         .auth_key(auth_key)
         .state_dir(state_dir)
-        .localapi_path(socket_path)
-        .build()?;
+        .localapi_path(socket_path);
+    if let Some(p) = port {
+        builder = builder.port(p);
+    }
+    let mut server = builder.build()?;
 
     if tun {
         let config = TunModeConfig {
@@ -81,12 +108,16 @@ async fn run_interactive(
     hostname: &str,
     socket_path: &Path,
     tun: bool,
+    port: Option<u16>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut server = Server::builder()
+    let mut builder = Server::builder()
         .hostname(hostname)
         .state_dir(state_dir)
-        .localapi_path(socket_path)
-        .build()?;
+        .localapi_path(socket_path);
+    if let Some(p) = port {
+        builder = builder.port(p);
+    }
+    let mut server = builder.build()?;
 
     let mut command_rx = server.start_localapi_only().await?;
     eprintln!("rustscaled: waiting for login (no TS_AUTHKEY set; use 'rustscale up' or 'rustscale login')");
@@ -178,6 +209,30 @@ fn print_status(server: &Server, socket_path: &Path) {
             socket_path.display()
         );
     }
+}
+
+/// Remove stale state files (socket, lock files) from the state directory.
+/// Mirrors Go's `cleanupState()` in `cmd/tailscaled/tailscaled.go`.
+fn cleanup_state(state_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    // Remove the LocalAPI socket file if it exists.
+    let socket = state_dir.join("rustscaled.sock");
+    if socket.exists() {
+        std::fs::remove_file(&socket)?;
+        eprintln!("rustscaled: removed {}", socket.display());
+    }
+
+    // Remove the primary socket path if it exists.
+    #[cfg(unix)]
+    {
+        let primary = rustscale_safesocket::default_socket_path();
+        if primary.exists() {
+            let _ = std::fs::remove_file(&primary);
+            eprintln!("rustscaled: removed {}", primary.display());
+        }
+    }
+
+    eprintln!("rustscaled: cleanup complete");
+    Ok(())
 }
 
 fn determine_socket_path(state_dir: &Path) -> PathBuf {

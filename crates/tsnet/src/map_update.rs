@@ -48,6 +48,7 @@ pub(crate) fn spawn_map_update_task(
     ipn_backend: Arc<IpnBackend>,
     key_rotation_ctx: Option<KeyRotationCtx>,
     map_session: Arc<MapSessionState>,
+    suggested_exit_node: Arc<RwLock<String>>,
 ) -> JoinHandle<()> {
     let mut named_filters: BTreeMap<String, Vec<FilterRule>> = BTreeMap::new();
     // Create the netmap cache helper once so that save_if_changed can
@@ -341,6 +342,16 @@ pub(crate) fn spawn_map_update_task(
                     // update.
                     if resp.SSHPolicy.is_some() {
                         ssh_policy.write().await.clone_from(&resp.SSHPolicy);
+                    }
+
+                    // Extract control-suggested exit node (Go's
+                    // MapResponse.SuggestedExitNode). Stored for LocalAPI
+                    // /status to surface to the CLI `exit-node` subcommand.
+                    if !resp.SuggestedExitNode.is_empty() {
+                        suggested_exit_node
+                            .write()
+                            .await
+                            .clone_from(&resp.SuggestedExitNode);
                     }
 
                     // Create WG tunnels for new peers.

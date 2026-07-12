@@ -21,7 +21,7 @@
 //! practical. Divergences are documented in comments on each handler.
 
 use std::collections::BTreeMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -122,6 +122,9 @@ pub(crate) struct LocalApiState {
     /// and transition to NeedsLogin. The daemon selects on this alongside
     /// shutdown signals.
     pub logout_trigger: Arc<tokio::sync::Notify>,
+    /// Control-suggested exit node (StableNodeID). Set by the map_update
+    /// task from `MapResponse.SuggestedExitNode`. Exposed in /status.
+    pub suggested_exit_node: Arc<RwLock<String>>,
 }
 
 pub struct LocalApiHandle {
@@ -627,6 +630,10 @@ pub(crate) async fn dispatch<W: AsyncWrite + Unpin>(
                     "/localapi/v0/file-targets",
                     "/localapi/v0/files/",
                     "/localapi/v0/file-put/",
+                    "/localapi/v0/debug",
+                    "/localapi/v0/dial",
+                    "/localapi/v0/dns-query",
+                    "/localapi/v0/check-ip-forwarding",
                 ]);
                 write_json_response(conn, 200, "OK", &endpoints).await?;
             } else {
@@ -738,6 +745,26 @@ pub(crate) async fn dispatch<W: AsyncWrite + Unpin>(
             handle_file_targets(conn, state).await?;
         }
 
+        // --- GET /localapi/v0/debug?action=<method> ---
+        "debug" if method == "GET" => {
+            handle_debug(conn, &req.query, state).await?;
+        }
+
+        // --- POST /localapi/v0/dial?addr=<host:port> ---
+        "dial" if method == "POST" => {
+            handle_dial(conn, &req.query, state).await?;
+        }
+
+        // --- GET /localapi/v0/dns-query?name=<name>&type=<type> ---
+        "dns-query" if method == "GET" => {
+            handle_dns_query(conn, &req.query, state).await?;
+        }
+
+        // --- GET /localapi/v0/check-ip-forwarding ---
+        "check-ip-forwarding" if method == "GET" => {
+            handle_check_ip_forwarding(conn).await?;
+        }
+
         _ => {
             // Check for cert/<domain> sub-path.
             if let Some(suffix) = endpoint.strip_prefix("cert/") {
@@ -797,6 +824,7 @@ async fn build_status_json(state: &LocalApiState) -> serde_json::Value {
     let peers = state.peers.read().await;
     let user_profiles = state.user_profiles.read().await;
     let dns_config = state.dns_config.read().await;
+    let suggested_exit = state.suggested_exit_node.read().await.clone();
 
     let node_key = state.magicsock.node_public().to_string();
 
@@ -902,6 +930,7 @@ async fn build_status_json(state: &LocalApiState) -> serde_json::Value {
             "MagicDNSEnabled": magicdns_enabled,
         },
         "CertDomains": cert_domains,
+        "SuggestedExitNode": suggested_exit,
     })
 }
 
@@ -1779,6 +1808,271 @@ async fn handle_file_targets<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Debug / dial / DNS query / IP forwarding handlers
+// ---------------------------------------------------------------------------
+
+/// Resolve a `host:port` string to a `SocketAddr`, looking up tailnet
+/// hostnames in the peer list. Returns `None` if the host cannot be
+/// resolved or the port is missing/invalid.
+fn resolve_dial_addr(addr: &str, peers: &[Node]) -> Option<SocketAddr> {
+    let (host, port_str) = addr.rsplit_once(':')?;
+    let port: u16 = port_str.parse().ok()?;
+
+    // Try direct IP parse first.
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Some(SocketAddr::new(ip, port));
+    }
+
+    // Look up hostname in peers (case-insensitive, strip trailing dot).
+    let host_lower = host.trim_end_matches('.').to_lowercase();
+    for peer in peers {
+        let peer_name = peer.Name.trim_end_matches('.').to_lowercase();
+        let first_label = peer_name.split('.').next().unwrap_or("");
+        if peer_name == host_lower || first_label == host_lower {
+            for cidr in &peer.Addresses {
+                if let Some(ip_str) = cidr.split('/').next() {
+                    if let Ok(ip) = ip_str.parse::<IpAddr>() {
+                        return Some(SocketAddr::new(ip, port));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Handle GET /localapi/v0/debug?action=<method>
+///
+/// Generic debug endpoint. The `action` query parameter selects the
+/// sub-command. Mirrors a subset of Go's `LocalBackend.HandleDebugJSON`
+/// actions. Returns JSON with the requested debug info.
+async fn handle_debug<W: AsyncWrite + Unpin>(
+    conn: &mut W,
+    query: &str,
+    state: &Arc<LocalApiState>,
+) -> Result<(), std::io::Error> {
+    let params = parse_query(query);
+    let action = params.get("action").map(String::as_str).unwrap_or("status");
+
+    let result = match action {
+        "status" => {
+            let peers = state.peers.read().await;
+            serde_json::json!({
+                "backend_state": state.ipn_backend.state().as_str(),
+                "peer_count": peers.len(),
+                "hostname": state.hostname,
+                "tun_mode": state.tun_mode,
+                "home_derp": state.home_derp,
+            })
+        }
+        "ipconfig" => {
+            // Return local interface info. On Unix, list interfaces via
+            // std::net or the OS. Minimal stub for now.
+            serde_json::json!({
+                "interfaces": [],
+                "note": "ipconfig detail not yet implemented",
+            })
+        }
+        "metrics" => {
+            let text = build_metrics_text(state);
+            serde_json::json!({
+                "metrics": text,
+            })
+        }
+        other => {
+            let body = serde_json::json!({
+                "error": format!("unknown debug action: {other}"),
+                "available": ["status", "ipconfig", "metrics"],
+            });
+            write_json_response(conn, 400, "Bad Request", &body).await?;
+            return Ok(());
+        }
+    };
+    write_json_response(conn, 200, "OK", &result).await?;
+    Ok(())
+}
+
+/// Handle POST /localapi/v0/dial?addr=<host:port>
+///
+/// Attempts to dial a remote address through the daemon's netstack.
+/// Returns a JSON status indicating success or failure. This is a minimal
+/// implementation that verifies reachability without proxying full data.
+async fn handle_dial<W: AsyncWrite + Unpin>(
+    conn: &mut W,
+    query: &str,
+    state: &Arc<LocalApiState>,
+) -> Result<(), std::io::Error> {
+    let params = parse_query(query);
+    let addr = match params.get("addr") {
+        Some(a) if !a.is_empty() => a.clone(),
+        _ => {
+            let body = serde_json::json!({"error": "missing addr parameter"});
+            write_json_response(conn, 400, "Bad Request", &body).await?;
+            return Ok(());
+        }
+    };
+
+    // If netstack is available, attempt a TCP dial through it.
+    if let Some(ref netstack) = state.netstack {
+        // Parse addr into host:port, resolving hostnames via peers.
+        let dial_addr = resolve_dial_addr(&addr, &state.peers.read().await);
+        if let Some(socket_addr) = dial_addr {
+            match netstack.dial(socket_addr).await {
+                Ok(_stream) => {
+                    let body = serde_json::json!({
+                        "ok": true,
+                        "addr": addr,
+                        "resolved": socket_addr.to_string(),
+                        "via": "netstack",
+                    });
+                    write_json_response(conn, 200, "OK", &body).await?;
+                }
+                Err(e) => {
+                    let body = serde_json::json!({
+                        "ok": false,
+                        "addr": addr,
+                        "resolved": socket_addr.to_string(),
+                        "error": e.to_string(),
+                    });
+                    write_json_response(conn, 200, "OK", &body).await?;
+                }
+            }
+        } else {
+            let body = serde_json::json!({
+                "ok": false,
+                "addr": addr,
+                "error": "could not resolve address",
+            });
+            write_json_response(conn, 200, "OK", &body).await?;
+        }
+    } else {
+        let body = serde_json::json!({
+            "ok": false,
+            "addr": addr,
+            "error": "netstack not available (server not fully up or TUN mode)",
+        });
+        write_json_response(conn, 503, "Service Unavailable", &body).await?;
+    }
+    Ok(())
+}
+
+/// Handle GET /localapi/v0/dns-query?name=<name>&type=<type>
+///
+/// Queries the daemon's DNS resolver for the given name. The `type`
+/// parameter is optional (defaults to "A"). Returns resolved IPs.
+async fn handle_dns_query<W: AsyncWrite + Unpin>(
+    conn: &mut W,
+    query: &str,
+    state: &Arc<LocalApiState>,
+) -> Result<(), std::io::Error> {
+    let params = parse_query(query);
+    let name = match params.get("name") {
+        Some(n) if !n.is_empty() => n.clone(),
+        _ => {
+            let body = serde_json::json!({"error": "missing name parameter"});
+            write_json_response(conn, 400, "Bad Request", &body).await?;
+            return Ok(());
+        }
+    };
+    let qtype = params.get("type").map(String::as_str).unwrap_or("A");
+
+    let peers = state.peers.read().await;
+    let dns_config = state.dns_config.read().await;
+
+    // Resolve by looking up the name in the peer list. This mirrors
+    // MagicDnsResolver's local resolution logic for tailnet names.
+    let name_trimmed = name.trim_end_matches('.').to_lowercase();
+    let mut results: Vec<String> = Vec::new();
+
+    for peer in peers.iter() {
+        let peer_name = peer.Name.trim_end_matches('.').to_lowercase();
+        let first_label = peer_name.split('.').next().unwrap_or("");
+        if peer_name == name_trimmed || first_label == name_trimmed {
+            for addr in &peer.Addresses {
+                if let Some(ip) = addr.split('/').next() {
+                    results.push(ip.to_string());
+                }
+            }
+        }
+    }
+
+    // Check if MagicDNS is enabled and provide context.
+    let magicdns_enabled = dns_config.as_ref().is_some_and(|c| c.Proxied);
+
+    let response = serde_json::json!({
+        "name": name,
+        "type": qtype,
+        "results": results,
+        "magicdns_enabled": magicdns_enabled,
+    });
+    write_json_response(conn, 200, "OK", &response).await?;
+    Ok(())
+}
+
+/// Handle GET /localapi/v0/check-ip-forwarding
+///
+/// Checks whether IP forwarding is enabled on the local system. On Linux,
+/// reads /proc/sys/net/ipv4/ip_forward. On macOS, checks the sysctl value.
+/// Returns JSON with the forwarding status.
+async fn handle_check_ip_forwarding<W: AsyncWrite + Unpin>(
+    conn: &mut W,
+) -> Result<(), std::io::Error> {
+    #[cfg(target_os = "linux")]
+    {
+        let v4 = std::fs::read_to_string("/proc/sys/net/ipv4/ip_forward")
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let v6 = std::fs::read_to_string("/proc/sys/net/ipv6/conf/all/forwarding")
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let body = serde_json::json!({
+            "ipv4_forwarding": v4 == "1",
+            "ipv6_forwarding": v6 == "1",
+            "ipv4_raw": v4,
+            "ipv6_raw": v6,
+            "platform": "linux",
+        });
+        write_json_response(conn, 200, "OK", &body).await?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let v4 = std::process::Command::new("sysctl")
+            .args(["-n", "net.inet.ip.forwarding"])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        let v6 = std::process::Command::new("sysctl")
+            .args(["-n", "net.inet6.ip6.forwarding"])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        let body = serde_json::json!({
+            "ipv4_forwarding": v4 == "1",
+            "ipv6_forwarding": v6 == "1",
+            "ipv4_raw": v4,
+            "ipv6_raw": v6,
+            "platform": "macos",
+        });
+        write_json_response(conn, 200, "OK", &body).await?;
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let body = serde_json::json!({
+            "error": "ip forwarding check not supported on this platform",
+            "platform": std::env::consts::OS,
+        });
+        write_json_response(conn, 501, "Not Implemented", &body).await?;
+    }
+    Ok(())
+}
+
 /// Handle GET/DELETE /localapi/v0/files/[<name>] — list, download, or
 /// delete waiting files. Mirrors Go's `serveFiles`.
 async fn handle_files<W: AsyncWrite + Unpin>(
@@ -2146,6 +2440,7 @@ mod tests {
             filter: std::sync::OnceLock::new(),
             route_table: None,
             logout_trigger: Arc::new(tokio::sync::Notify::new()),
+            suggested_exit_node: Arc::new(RwLock::new(String::new())),
         })
     }
 
@@ -2865,6 +3160,7 @@ mod tests {
             filter: std::sync::OnceLock::new(),
             route_table: None,
             logout_trigger: Arc::new(tokio::sync::Notify::new()),
+            suggested_exit_node: Arc::new(RwLock::new(String::new())),
         });
 
         let config = r#"{"TCP":{"8080":{"HTTP":true}}}"#;
@@ -3091,6 +3387,7 @@ mod tests {
             filter: std::sync::OnceLock::new(),
             route_table: None,
             logout_trigger: Arc::new(tokio::sync::Notify::new()),
+            suggested_exit_node: Arc::new(RwLock::new(String::new())),
         })
     }
 

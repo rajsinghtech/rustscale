@@ -400,6 +400,7 @@ fn sample_map_response() -> MapResponse {
         PeersChangedPatch: None,
         NetInfo: None,
         ClientVersion: None,
+        SuggestedExitNode: String::new(),
     }
 }
 

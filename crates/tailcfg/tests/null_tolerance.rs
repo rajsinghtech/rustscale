@@ -390,6 +390,7 @@ fn sample_map_response() -> MapResponse {
         NodeKeyExpired: false,
         ControlTime: None,
         CollectServices: rustscale_tailcfg::OptBool::Unset,
+        SSHPolicy: None,
     }
 }
 

@@ -14,17 +14,21 @@
 #   tools/check.sh --no-test    # skip tests
 #   tools/check.sh --no-clippy  # skip clippy
 #   tools/check.sh --no-fmt     # skip cargo fmt --check
+#   tools/check.sh --check      # use `cargo check` (type-check only, ~2x faster)
+#                             # instead of `cargo build --all-targets`
 set -euo pipefail
 
 CRATE=""
 RUN_TEST=1
 RUN_CLIPPY=1
 RUN_FMT=1
+RUN_CHECK=0
 for a in "$@"; do
   case "$a" in
     --no-test)   RUN_TEST=0 ;;
     --no-clippy) RUN_CLIPPY=0 ;;
     --no-fmt)    RUN_FMT=0 ;;
+    --check|-c)  RUN_CHECK=1 ;;
     --*) echo "unknown flag: $a" >&2; exit 2 ;;
     *) CRATE="$a" ;;
   esac
@@ -36,9 +40,6 @@ else
   PKG=(); WS=(--workspace)
 fi
 
-# Capture the command's output once, then show filtered errors/warnings (fmt's
-# "Diff in" lines included) or fall back to the raw head — never re-run a slow
-# build twice, and never dump full output into the agent's context.
 fail() {
   local label="$1"; shift
   echo "=== $label FAILED ===" >&2
@@ -54,20 +55,23 @@ fail() {
   exit 1
 }
 
-cargo build "${PKG[@]}" "${WS[@]}" --all-targets >/dev/null 2>&1 \
-  || fail "build" cargo build "${PKG[@]}" "${WS[@]}" --all-targets
+if [ "$RUN_CHECK" = 1 ]; then
+  cargo check "${PKG[@]}" "${WS[@]}" --all-targets >/dev/null 2>&1 \
+    || fail "check" cargo check "${PKG[@]}" "${WS[@]}" --all-targets
+else
+  cargo build "${PKG[@]}" "${WS[@]}" --all-targets >/dev/null 2>&1 \
+    || fail "build" cargo build "${PKG[@]}" "${WS[@]}" --all-targets
+fi
 
 if [ "$RUN_TEST" = 1 ]; then
   cargo test "${PKG[@]}" "${WS[@]}" >/dev/null 2>&1 || fail "test" cargo test "${PKG[@]}" "${WS[@]}"
 fi
 
 if [ "$RUN_CLIPPY" = 1 ]; then
-  # -D warnings matches CI: any clippy warning fails the gate.
   cargo clippy "${PKG[@]}" "${WS[@]}" --all-targets -- -D warnings >/dev/null 2>&1 \
     || fail "clippy" cargo clippy "${PKG[@]}" "${WS[@]}" --all-targets -- -D warnings
 fi
 
-# fmt is workspace-wide (cargo fmt has no -p); always --all --check like CI.
 if [ "$RUN_FMT" = 1 ]; then
   cargo fmt --all --check >/dev/null 2>&1 || fail "fmt" cargo fmt --all --check
 fi

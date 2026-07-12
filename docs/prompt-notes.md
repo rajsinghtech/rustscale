@@ -210,6 +210,86 @@ cites the session that surfaced it.
     crate sets `#![allow(unsafe_code)]` because workspace forbids it."
 12. For long background builds, do NOT background-then-poll with `sleep`.
     Either run foreground with a timeout, or use `tools/wait-build.sh`.
+13. **(New)** To find Go type/function definitions in the reference Go tree:
+    "Use `tools/go-find.sh -t <TypeName>` (structs) or `tools/go-find.sh -f <FuncName> <subdir>`
+    (functions) to locate definitions. This grep the Go tree without reading
+    full files. Once you know the file:line, read a narrow offset/limit window.
+    Do NOT read a full Go file just to find where a struct is defined."
+14. **(New)** During iterative development (editing one crate), use the fast verification
+    path: "Use `tools/check.sh --check <crate>` (type-check only via `cargo check`,
+    ~2x faster than build) during iteration. Only use `tools/check.sh <crate>`
+    (full build) or `tools/check.sh` (workspace build + test + clippy + fmt) at the
+    end. Never run `cargo build --workspace` during iterative editing of a single
+    crate — it wastes time on codegen for all other crates."
+15. **(New)** Never re-read your own large Rust files: "After the initial full read of
+    any own crate file, NEVER re-read it fully. To understand structure, run
+    `grep -n '^fn \|^pub fn\|^struct\|^enum\|^impl\|^mod\|^type\|^trait' <file>`
+    to produce a compact ~20-line index. To find a specific function, use
+    `tools/where.sh <pattern> <file>`. To see context before an edit, read a
+    narrow window (offset=LINE-5, limit=20). Cost: a full re-read of
+    `tsnet/src/lib.rs` is ~8K chars; 15 re-reads = 120K chars wasted."
+
+## 2026-07-11: Excessive cargo build cycles in app-connector (37 cargo cmds/137 msgs)
+
+**Symptom**: The `app-connector` session ran 37 cargo build/test/clippy commands
+in 137 messages (27% of all tool calls), with an estimated 350K+ chars of tool
+output. Each cycle: edit → `cargo build` → wait → parse errors → edit again. Many
+of these were `cargo build --workspace` when only one crate changed.
+
+**Fix**: 
+1. Use `tools/check.sh <crate>` (single crate) instead of workspace-wide builds
+   during development iteration. Only run workspace-wide at the end for merge CI.
+2. Use `tools/check.sh --check <crate>` for pure type-checking (skips codegen,
+   ~2x faster than `cargo build`). Use `--check` during iterative edit-fix cycles.
+3. Use `tools/check.sh` (no args, workspace-wide) only for the final verification
+   before declaring done.
+4. Tell agents: "During iterative development, use `tools/check.sh --check <crate>`
+   for type-check-only verification (fastest). Only run `tools/check.sh` (full gate)
+   at the end. Never run workspace-wide `cargo build` unless you changed cross-crate
+   interfaces."
+
+**Estimated savings**: 37 cargo → ~15 with single-crate + --check would save
+~200K chars and ~15 agent turns (~$0.15-0.30 per session at median rates).
+
+## 2026-07-11: Go type/function location still done by reading full files (ssh-finish, listen-service)
+
+**Symptom**: Despite `tools/where.sh` and `docs/porting-notes.md` having file maps,
+the `ssh-finish` session read `tailssh.go` 7 times (529K chars total) and
+`listen-service` read `tailcfg.go` 3 times (937K chars). The agents still read large
+Go files to find type definitions because `where.sh` requires knowing the file first.
+
+**Fix**: `tools/go-find.sh` now searches the entire Go tree by type/function/pattern,
+printing `file:line:context` without reading the full file. Tell agents:
+"To FIND a Go type or function definition, use `tools/go-find.sh -t <name>` or
+`tools/go-find.sh -f <name> <package-dir>`. This prints `file:line:matched-line`
+so you can then read a narrow window. Do NOT read a full Go file just to locate
+a definition."
+
+**Estimated savings**: 7× tailssh.go reads (~80K chars) per ssh session; 3× tailcfg.go
+reads (~90K chars). With go-find.sh: 1 grep call (~500 chars output) → ~$0.05-0.10
+per session saved.
+
+## 2026-07-11: Own Rust files still re-read despite where.sh (interactive-auth)
+
+**Symptom**: `interactive-auth` read `tsnet/src/lib.rs` 15 times (1.5M chars session),
+`listen-service` 4 times, `app-connector` 4 times. The `where.sh` tool was created
+to fix this but agents still re-read because they need *surrounding context* for
+edits, not just line numbers.
+
+**Observation**: 15 reads of the same file suggests the agent edited the file,
+added a function, then re-read the whole thing to understand what it just wrote
+before adding the next function. This is working memory loss — the model doesn't
+retain the file's structure between turns.
+
+**Mitigation**: Tell agents: "After your FIRST full read of an own file, NEVER
+re-read it fully. To find a line number, use `tools/where.sh`. To see surrounding
+context before editing, read a narrow offset/limit window (e.g. offset=LINE-5, limit=20).
+If you need to understand the file's overall structure a SECOND time, use
+`tools/go-find.sh -f <function-prefix> <file-rel-to-crate>` or `grep -n "^fn\|^pub fn\|^struct\|^enum\|^impl\|^mod "` 
+on the file to produce a ~20-line index without reading 500+ lines."
+
+**Estimated savings**: 15 reads of tsnet/src/lib.rs → ~20K chars × 14 excess reads
+= ~280K chars per session; 4-5 such sessions per phase @ ~$0.15 each.
 
 ## 2026-07-11: Cargo.lock conflict auto-resolution in worktree-merge.sh
 

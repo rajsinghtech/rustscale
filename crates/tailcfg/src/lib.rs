@@ -17,6 +17,7 @@ mod map;
 mod node;
 mod register;
 mod service;
+mod ssh;
 
 pub use appctype::{
     AppConnectorAttr, AppConnectorConfig, ConfigID, Conn25Attr, Conn25PoolsAttr, DNATConfig,
@@ -41,6 +42,7 @@ pub use service::{
     service_ip_mappings_from_capmap, service_vip_addrs, ServiceIPMappings, ServiceName,
     ServiceNameError, VIPService, NODE_ATTR_SERVICE_HOST,
 };
+pub use ssh::{SSHAction, SSHPolicy, SSHPrincipal, SSHRecorderFailureAction, SSHRule};
 
 pub use rustscale_key::{
     DiscoPublic as DiscoKey, MachinePublic as MachineKey, NodePublic as NodeKey,

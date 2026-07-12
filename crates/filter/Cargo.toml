@@ -10,6 +10,7 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+rustscale-packet = { path = "../packet", version = "0.1.0" }
 rustscale-tailcfg = { path = "../tailcfg", version = "0.1.0" }
 thiserror.workspace = true
 

@@ -1,0 +1,10 @@
+[package]
+name = "rustscale-packet"
+description = "IP packet header parsing — port of Tailscale's net/packet"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true

@@ -24,6 +24,8 @@ webpki-roots.workspace = true
 rustls.workspace = true
 hex.workspace = true
 rustscale-netns.workspace = true
+rustscale-tshttpproxy = { path = "../tshttpproxy", version = "0.1.0" }
+url = "2"
 
 [dev-dependencies]
 tokio.workspace = true

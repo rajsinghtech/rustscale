@@ -2207,11 +2207,13 @@ dependencies = [
  "rustscale-key",
  "rustscale-netns",
  "rustscale-tailcfg",
+ "rustscale-tshttpproxy",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
  "tokio-rustls",
+ "url",
  "webpki-roots 0.26.11",
 ]
 
@@ -2228,11 +2230,13 @@ dependencies = [
  "rustscale-key",
  "rustscale-netns",
  "rustscale-tailcfg",
+ "rustscale-tshttpproxy",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
  "tokio-rustls",
+ "url",
  "webpki-roots 0.26.11",
 ]
 
@@ -2599,7 +2603,9 @@ dependencies = [
 name = "rustscale-tshttpproxy"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "thiserror 1.0.69",
+ "tokio",
  "url",
 ]
 

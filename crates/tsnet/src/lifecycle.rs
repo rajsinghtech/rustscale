@@ -7,7 +7,7 @@ impl Server {
     /// This is the classic tsnet embedding path: an in-process smoltcp netstack
     /// backs `listen`/`dial`. For a full-client TUN device instead, use
     /// [`Server::up_tun`].
-#[allow(clippy::large_futures)]
+    #[allow(clippy::large_futures)]
     ///
     /// **Idempotent**: calling `up()` on an already-running server returns
     /// `Ok(ServerStatus)` immediately without re-starting. Mirrors Go's
@@ -416,7 +416,7 @@ impl Server {
     /// `config.apply_routes` is true, the interface is brought up and tailnet
     /// routes are added via `ifconfig`/`route` (macOS) or `ip` (Linux) — also
     /// requiring root.
-#[allow(clippy::large_futures)]
+    #[allow(clippy::large_futures)]
     pub async fn up_tun(&mut self, config: TunModeConfig) -> Result<ServerStatus, TsnetError> {
         if self.inner.is_some() {
             return Ok(self.status());

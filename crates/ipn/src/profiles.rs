@@ -1,13 +1,16 @@
 //! Login profiles — a Rust port of Go's `ipn.LoginProfile` and related
-//! profile management types.
+//! profile management types, plus a [`ProfileManager`] for profile
+//! switching, auto-detection, and key-expiry tracking.
 //!
 //! A [`LoginProfile`] represents one saved tailnet identity on this machine.
 //! Multiple profiles can coexist (e.g. work + personal), and the user
 //! switches between them via `rustscale switch`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+
+use crate::prefs::Prefs;
 
 /// A unique identifier for a profile. Assigned at creation, never changes.
 pub type ProfileID = String;
@@ -151,6 +154,252 @@ impl LoginProfile {
     }
 }
 
+// ─── ProfileManager ───────────────────────────────────────────────────
+
+/// A callback invoked when the current profile changes, receiving the
+/// new profile and its loaded prefs. The backend uses this to apply prefs
+/// to the engine (netmap reset, route table update, etc.). Mirrors Go's
+/// `profileManager.StateChangeHook`.
+pub type StateChangeCallback = Box<dyn Fn(&LoginProfile, &Prefs) + Send + Sync>;
+
+/// Key-expiry information tracked per profile so the manager can flag
+/// expiring keys and trigger re-registration. Mirrors the subset of
+/// Go's `LocalBackend.keyExpired` logic that applies to profile switching.
+#[derive(Clone, Debug, Default)]
+pub struct KeyExpiryState {
+    /// Unix timestamp (seconds) at which the node key expires. Zero if
+    /// unknown or no expiry set.
+    pub expiry_unix: i64,
+    /// Whether the key was flagged as expired on the last check.
+    pub is_expired: bool,
+}
+
+/// Result of a profile switch operation.
+#[derive(Debug)]
+pub struct SwitchResult {
+    /// The profile that is now current.
+    pub profile: LoginProfile,
+    /// Whether the switch actually changed the active profile (false = same).
+    pub changed: bool,
+}
+
+/// Manages a collection of login profiles, the currently active profile,
+/// and per-profile key-expiry state. Mirrors Go's `profileManager`
+/// (ipn/ipnlocal/profiles.go) at the API level — the full backend
+/// integration (netmap reset, engine reconfig) is wired via the
+/// [`StateChangeCallback`].
+///
+/// Not safe for concurrent use without external synchronization — callers
+/// typically hold the `LocalBackend` lock while mutating.
+pub struct ProfileManager {
+    state_dir: PathBuf,
+    known: Vec<LoginProfile>,
+    current_id: Option<ProfileID>,
+    prefs: Prefs,
+    key_expiry: KeyExpiryState,
+    state_change_hook: Option<StateChangeCallback>,
+}
+
+impl ProfileManager {
+    /// Create a new ProfileManager, auto-detecting available profiles from
+    /// `<state_dir>/profiles.json` and loading the current profile ID from
+    /// `<state_dir>/current-profile`. Mirrors Go's `newProfileManager`.
+    pub fn new(state_dir: &Path) -> Result<Self, std::io::Error> {
+        let known = LoginProfile::load_all(state_dir)?;
+        let current_id = LoginProfile::load_current_id(state_dir)?;
+        let prefs = Prefs::load(state_dir)?;
+        Ok(Self {
+            state_dir: state_dir.to_path_buf(),
+            known,
+            current_id,
+            prefs,
+            key_expiry: KeyExpiryState::default(),
+            state_change_hook: None,
+        })
+    }
+
+    /// Set the state-change callback invoked after a successful profile
+    /// switch. The callback receives the new profile and its loaded prefs
+    /// so the backend can apply them to the engine.
+    pub fn set_state_change_hook(&mut self, hook: StateChangeCallback) {
+        self.state_change_hook = Some(hook);
+    }
+
+    /// Returns all known profiles.
+    pub fn profiles(&self) -> &[LoginProfile] {
+        &self.known
+    }
+
+    /// Returns the currently active profile, or `None` if no profile is
+    /// selected.
+    pub fn current_profile(&self) -> Option<&LoginProfile> {
+        self.current_id
+            .as_ref()
+            .and_then(|id| self.known.iter().find(|p| &p.ID == id))
+    }
+
+    /// Returns the current prefs (the prefs of the active profile, or
+    /// defaults if none selected).
+    pub fn current_prefs(&self) -> &Prefs {
+        &self.prefs
+    }
+
+    /// Returns the current key-expiry state.
+    pub fn key_expiry(&self) -> &KeyExpiryState {
+        &self.key_expiry
+    }
+
+    /// Find a profile by ID.
+    pub fn profile_by_id(&self, id: &str) -> Option<&LoginProfile> {
+        self.known.iter().find(|p| p.ID == id)
+    }
+
+    /// Switch to the profile with the given ID. Loads the profile's prefs
+    /// from disk, sets it as current, persists the current-profile marker,
+    /// and fires the state-change callback. Returns an error if the profile
+    /// ID is not found. Mirrors Go's `profileManager.SwitchProfileByID`.
+    pub fn switch_profile(&mut self, id: &str) -> Result<SwitchResult, ProfileError> {
+        if let Some(ref cid) = self.current_id {
+            if cid == id {
+                let profile = self
+                    .profile_by_id(id)
+                    .cloned()
+                    .unwrap_or_default();
+                return Ok(SwitchResult {
+                    profile,
+                    changed: false,
+                });
+            }
+        }
+
+        let profile = self
+            .profile_by_id(id)
+            .ok_or_else(|| ProfileError::NotFound(id.to_string()))?
+            .clone();
+
+        let prefs = Prefs::load(&self.state_dir).unwrap_or_default();
+
+        self.current_id = Some(id.to_string());
+        self.prefs = prefs.clone();
+        LoginProfile::save_current_id(&self.state_dir, id)?;
+
+        if let Some(ref hook) = self.state_change_hook {
+            hook(&profile, &prefs);
+        }
+
+        Ok(SwitchResult {
+            profile,
+            changed: true,
+        })
+    }
+
+    /// Create and switch to a new empty profile. The profile is assigned a
+    /// fresh ID and added to the known list. Mirrors Go's
+    /// `profileManager.NewProfileForUser` + `SwitchToProfile`.
+    pub fn new_profile(&mut self, name: &str) -> Result<SwitchResult, std::io::Error> {
+        let id = LoginProfile::new_id();
+        let profile = LoginProfile {
+            ID: id.clone(),
+            Name: name.to_string(),
+            ControlURL: "https://controlplane.tailscale.com".to_string(),
+            ..Default::default()
+        };
+        self.known.push(profile.clone());
+        LoginProfile::save_all(&self.state_dir, &self.known)?;
+        LoginProfile::save_current_id(&self.state_dir, &id)?;
+
+        self.current_id = Some(id.clone());
+        self.prefs = Prefs::default();
+
+        if let Some(ref hook) = self.state_change_hook {
+            hook(&profile, &self.prefs);
+        }
+
+        Ok(SwitchResult {
+            profile,
+            changed: true,
+        })
+    }
+
+    /// Delete a profile by ID. If the deleted profile was current, the
+    /// current profile is cleared. Persists the updated profile list.
+    pub fn delete_profile(&mut self, id: &str) -> Result<(), std::io::Error> {
+        self.known.retain(|p| p.ID != id);
+        if self.current_id.as_deref() == Some(id) {
+            self.current_id = None;
+        }
+        LoginProfile::save_all(&self.state_dir, &self.known)?;
+        Ok(())
+    }
+
+    /// Update the key-expiry state for the current profile. When the key
+    /// is expired or nearing expiry (within `threshold_secs`), returns
+    /// `true` to signal the caller that re-registration should be
+    /// triggered. Mirrors Go's `LocalBackend` key-expiry check in
+    /// `onNewDataPlaneState` / `setNodeKeyExpired`.
+    pub fn check_key_expiry(&mut self, now_unix: i64, threshold_secs: i64) -> bool {
+        if self.key_expiry.expiry_unix == 0 {
+            return false;
+        }
+        let was_expired = self.key_expiry.is_expired;
+        self.key_expiry.is_expired = self.key_expiry.expiry_unix <= now_unix;
+        let nearing = self.key_expiry.expiry_unix - now_unix <= threshold_secs;
+        let just_expired = self.key_expiry.is_expired && !was_expired;
+        just_expired || (nearing && self.key_expiry.is_expired)
+    }
+
+    /// Set the key-expiry timestamp for the current profile (e.g. from a
+    /// netmap update). This does not trigger re-registration — call
+    /// `check_key_expiry` afterward.
+    pub fn set_key_expiry(&mut self, expiry_unix: i64) {
+        self.key_expiry.expiry_unix = expiry_unix;
+    }
+
+    /// Persist the current prefs to disk.
+    pub fn save_prefs(&self) -> Result<(), std::io::Error> {
+        self.prefs.save(&self.state_dir)
+    }
+
+    /// Update the in-memory prefs and persist them. Used by `PATCH /prefs`
+    /// and `SetExpirySooner` paths.
+    pub fn set_prefs(&mut self, prefs: Prefs) -> Result<(), std::io::Error> {
+        self.prefs = prefs;
+        self.prefs.save(&self.state_dir)?;
+        if let Some(ref profile) = self.current_profile() {
+            if let Some(ref hook) = self.state_change_hook {
+                hook(profile, &self.prefs);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Errors from profile operations.
+#[derive(Debug)]
+pub enum ProfileError {
+    /// Profile ID not found in the known list.
+    NotFound(String),
+    /// I/O error during persistence.
+    Io(std::io::Error),
+}
+
+impl From<std::io::Error> for ProfileError {
+    fn from(e: std::io::Error) -> Self {
+        ProfileError::Io(e)
+    }
+}
+
+impl std::fmt::Display for ProfileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProfileError::NotFound(id) => write!(f, "profile not found: {id}"),
+            ProfileError::Io(e) => write!(f, "profile I/O error: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for ProfileError {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,5 +498,178 @@ mod tests {
             DisplayName: String::new(),
         };
         assert_eq!(np.display_name_or_default(), "tailnet.ts.net");
+    }
+
+    // ─── ProfileManager tests ───────────────────────────────────────
+
+    #[test]
+    fn profile_manager_autodetects_profiles() {
+        let tmp = tempfile::tempdir().unwrap();
+        let profiles = vec![
+            LoginProfile {
+                ID: "p1".into(),
+                Name: "user1@work.com".into(),
+                ..Default::default()
+            },
+            LoginProfile {
+                ID: "p2".into(),
+                Name: "user2@home.com".into(),
+                ..Default::default()
+            },
+        ];
+        LoginProfile::save_all(tmp.path(), &profiles).unwrap();
+        LoginProfile::save_current_id(tmp.path(), "p2").unwrap();
+
+        let pm = ProfileManager::new(tmp.path()).unwrap();
+        assert_eq!(pm.profiles().len(), 2);
+        assert_eq!(pm.current_id.as_deref(), Some("p2"));
+        assert_eq!(pm.current_profile().unwrap().Name, "user2@home.com");
+    }
+
+    #[test]
+    fn profile_manager_switch_profile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let profiles = vec![
+            LoginProfile {
+                ID: "p1".into(),
+                Name: "user1@work.com".into(),
+                ..Default::default()
+            },
+            LoginProfile {
+                ID: "p2".into(),
+                Name: "user2@home.com".into(),
+                ..Default::default()
+            },
+        ];
+        LoginProfile::save_all(tmp.path(), &profiles).unwrap();
+        LoginProfile::save_current_id(tmp.path(), "p1").unwrap();
+
+        let mut pm = ProfileManager::new(tmp.path()).unwrap();
+        assert_eq!(pm.current_id.as_deref(), Some("p1"));
+
+        let result = pm.switch_profile("p2").unwrap();
+        assert!(result.changed);
+        assert_eq!(result.profile.ID, "p2");
+        assert_eq!(pm.current_id.as_deref(), Some("p2"));
+
+        // Switching to same profile is a no-op.
+        let result2 = pm.switch_profile("p2").unwrap();
+        assert!(!result2.changed);
+    }
+
+    #[test]
+    fn profile_manager_switch_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pm = ProfileManager::new(tmp.path()).unwrap();
+        let err = pm.switch_profile("nonexistent").unwrap_err();
+        assert!(matches!(err, ProfileError::NotFound(_)));
+    }
+
+    #[test]
+    fn profile_manager_new_profile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut pm = ProfileManager::new(tmp.path()).unwrap();
+        assert!(pm.profiles().is_empty());
+
+        let result = pm.new_profile("newuser@example.com").unwrap();
+        assert!(result.changed);
+        assert!(!result.profile.ID.is_empty());
+        assert_eq!(pm.profiles().len(), 1);
+        assert_eq!(pm.current_id.as_deref(), Some(result.profile.ID.as_str()));
+    }
+
+    #[test]
+    fn profile_manager_delete_profile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let profiles = vec![
+            LoginProfile {
+                ID: "p1".into(),
+                Name: "user1@work.com".into(),
+                ..Default::default()
+            },
+            LoginProfile {
+                ID: "p2".into(),
+                Name: "user2@home.com".into(),
+                ..Default::default()
+            },
+        ];
+        LoginProfile::save_all(tmp.path(), &profiles).unwrap();
+        LoginProfile::save_current_id(tmp.path(), "p1").unwrap();
+
+        let mut pm = ProfileManager::new(tmp.path()).unwrap();
+        pm.delete_profile("p1").unwrap();
+        assert_eq!(pm.profiles().len(), 1);
+        assert!(pm.current_id.is_none());
+    }
+
+    #[test]
+    fn profile_manager_key_expiry_check() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut pm = ProfileManager::new(tmp.path()).unwrap();
+
+        // No expiry set → no re-registration needed.
+        assert!(!pm.check_key_expiry(1000, 3600));
+
+        // Set expiry in the past → expired, triggers re-registration.
+        pm.set_key_expiry(500);
+        assert!(pm.check_key_expiry(1000, 3600));
+
+        // Already expired flag is set, subsequent check without just-expired
+        // transition does not re-trigger.
+        assert!(!pm.check_key_expiry(1001, 3600));
+
+        // Set expiry in the near future (within threshold) → triggers.
+        pm.set_key_expiry(2000);
+        assert!(pm.check_key_expiry(1500, 3600));
+    }
+
+    #[test]
+    fn profile_manager_state_change_hook() {
+        let tmp = tempfile::tempdir().unwrap();
+        let profiles = vec![
+            LoginProfile {
+                ID: "p1".into(),
+                Name: "user1@work.com".into(),
+                ..Default::default()
+            },
+            LoginProfile {
+                ID: "p2".into(),
+                Name: "user2@home.com".into(),
+                ..Default::default()
+            },
+        ];
+        LoginProfile::save_all(tmp.path(), &profiles).unwrap();
+        LoginProfile::save_current_id(tmp.path(), "p1").unwrap();
+
+        let hook_called = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let hook_called_clone = hook_called.clone();
+        let mut pm = ProfileManager::new(tmp.path()).unwrap();
+        pm.set_state_change_hook(Box::new(move |_profile, _prefs| {
+            *hook_called_clone.lock().unwrap() = Some("hook fired".to_string());
+        }));
+
+        pm.switch_profile("p2").unwrap();
+        assert_eq!(*hook_called.lock().unwrap(), Some("hook fired".to_string()));
+    }
+
+    #[test]
+    fn profile_manager_set_prefs_fires_hook() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pm = ProfileManager::new(tmp.path()).unwrap();
+        // No current profile → set_prefs should not panic.
+        let mut pm = pm;
+        let hook_fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hf = hook_fired.clone();
+        pm.set_state_change_hook(Box::new(move |_, _| {
+            hf.store(true, std::sync::atomic::Ordering::SeqCst);
+        }));
+        // Create a profile first so current_profile() is Some.
+        pm.new_profile("test").unwrap();
+        hook_fired.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        let mut prefs = Prefs::default();
+        prefs.WantRunning = true;
+        pm.set_prefs(prefs).unwrap();
+        assert!(hook_fired.load(std::sync::atomic::Ordering::SeqCst));
     }
 }

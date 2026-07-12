@@ -2218,6 +2218,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustscale-ktimeout"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "rustscale-localclient"
 version = "0.1.0"
 dependencies = [

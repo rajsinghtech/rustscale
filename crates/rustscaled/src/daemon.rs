@@ -52,7 +52,24 @@ async fn run_with_auth_key(
     }
 
     print_status(&server, socket_path);
-    wait_for_shutdown().await;
+
+    // Wait for either shutdown or logout.
+    let logout_trigger = server.logout_trigger();
+    tokio::select! {
+        () = wait_for_shutdown_signal() => {}
+        () = async {
+            if let Some(ref trigger) = logout_trigger {
+                trigger.notified().await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        } => {
+            eprintln!("rustscaled: logout requested");
+            server.logout().await?;
+            eprintln!("rustscaled: logged out, state cleared → NeedsLogin");
+        }
+    }
+
     eprintln!("rustscaled: shutting down...");
     server.close().await;
     Ok(())
@@ -73,6 +90,8 @@ async fn run_interactive(
     let mut command_rx = server.start_localapi_only().await?;
     eprintln!("rustscaled: waiting for login (no TS_AUTHKEY set; use 'rustscale up' or 'rustscale login')");
 
+    // Phase 1: wait for Start/LoginInteractive to bring the server up.
+    let mut is_up = false;
     while let Some(cmd) = command_rx.recv().await {
         match cmd {
             DaemonCommand::Start { auth_key } => {
@@ -91,6 +110,7 @@ async fn run_interactive(
                     eprintln!("rustscaled: up (hostname={hostname})");
                 }
                 print_status(&server, socket_path);
+                is_up = true;
                 break;
             }
             DaemonCommand::LoginInteractive => {
@@ -106,15 +126,36 @@ async fn run_interactive(
                     eprintln!("rustscaled: up (hostname={hostname})");
                 }
                 print_status(&server, socket_path);
+                is_up = true;
                 break;
             }
             DaemonCommand::Logout => {
-                eprintln!("rustscaled: logout requested");
+                eprintln!("rustscaled: logout requested (server not up yet)");
             }
         }
     }
 
-    wait_for_shutdown().await;
+    if !is_up {
+        return Ok(());
+    }
+
+    // Phase 2: server is up — wait for shutdown or logout.
+    let logout_trigger = server.logout_trigger();
+    tokio::select! {
+        () = wait_for_shutdown_signal() => {}
+        () = async {
+            if let Some(ref trigger) = logout_trigger {
+                trigger.notified().await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        } => {
+            eprintln!("rustscaled: logout requested");
+            server.logout().await?;
+            eprintln!("rustscaled: logged out, state cleared → NeedsLogin");
+        }
+    }
+
     eprintln!("rustscaled: shutting down...");
     server.close().await;
     Ok(())
@@ -177,5 +218,16 @@ async fn wait_for_shutdown() {
 
 #[cfg(not(unix))]
 async fn wait_for_shutdown() {
+    let _ = tokio::signal::ctrl_c().await;
+}
+
+/// Signal-wait future usable in `tokio::select!`.
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() {
+    wait_for_shutdown().await;
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }

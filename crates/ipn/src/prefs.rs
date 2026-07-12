@@ -56,6 +56,8 @@ pub struct Prefs {
     pub AcceptRoutes: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub AdvertiseExitNode: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub ExitNodeAllowLANAccess: bool,
 }
 
 impl Prefs {
@@ -128,6 +130,8 @@ pub struct MaskedPrefs {
     pub AcceptRoutesSet: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub AdvertiseExitNodeSet: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub ExitNodeAllowLANAccessSet: bool,
 }
 
 impl MaskedPrefs {
@@ -181,6 +185,9 @@ impl MaskedPrefs {
         if self.AdvertiseExitNodeSet {
             target.AdvertiseExitNode = self.Prefs.AdvertiseExitNode;
         }
+        if self.ExitNodeAllowLANAccessSet {
+            target.ExitNodeAllowLANAccess = self.Prefs.ExitNodeAllowLANAccess;
+        }
     }
 
     /// Returns `true` if no fields are set (no `*Set` bool is `true`).
@@ -199,7 +206,8 @@ impl MaskedPrefs {
             || self.OperatorUserSet
             || self.EphemeralSet
             || self.AcceptRoutesSet
-            || self.AdvertiseExitNodeSet)
+            || self.AdvertiseExitNodeSet
+            || self.ExitNodeAllowLANAccessSet)
     }
 }
 

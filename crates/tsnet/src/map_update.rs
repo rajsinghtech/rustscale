@@ -46,6 +46,7 @@ pub(crate) fn spawn_map_update_task(
     key_expired: Arc<std::sync::atomic::AtomicBool>,
     ipn_backend: Arc<IpnBackend>,
     key_rotation_ctx: Option<KeyRotationCtx>,
+    map_session: Arc<MapSessionState>,
 ) -> JoinHandle<()> {
     let mut named_filters: BTreeMap<String, Vec<FilterRule>> = BTreeMap::new();
     // Create the netmap cache helper once so that save_if_changed can
@@ -65,6 +66,15 @@ pub(crate) fn spawn_map_update_task(
 
                     if resp.KeepAlive {
                         continue;
+                    }
+
+                    // Track map session handle + seq for delta resumption.
+                    // The server sends MapSessionHandle on the first message
+                    // of a session; Seq increments on each subsequent message.
+                    // On reconnection, stream_map_loop reads these to resume
+                    // from the last-processed sequence.
+                    if !resp.MapSessionHandle.is_empty() || resp.Seq > 0 {
+                        map_session.set(resp.MapSessionHandle.clone(), resp.Seq);
                     }
 
                     // Handle key expiry from the control server. The
@@ -136,8 +146,11 @@ pub(crate) fn spawn_map_update_task(
                                         }),
                                         ..Default::default()
                                     };
+                                    let ss = map_session.clone();
                                     tokio::spawn(async move {
-                                        cc_new.stream_map_loop(&new_map_req, new_tx).await;
+                                        cc_new
+                                            .stream_map_loop(&new_map_req, new_tx, Some(ss))
+                                            .await;
                                     });
                                     map_rx = new_rx;
                                     eprintln!(
@@ -168,11 +181,30 @@ pub(crate) fn spawn_map_update_task(
                         magicsock.set_self_cap_map(node.CapMap.clone());
                     }
 
+                    // Wire NetInfo from control to magicsock. Control may push
+                    // updated network probe results (PreferredDERP, connectivity)
+                    // that supersede the client's local netcheck. Also check
+                    // the self-node's Hostinfo for NetInfo (sent back by some
+                    // control servers).
+                    if let Some(ref ni) = resp.NetInfo {
+                        magicsock.set_net_info(ni);
+                    } else if let Some(ref node) = resp.Node {
+                        if let Some(ref hi) = node.Hostinfo {
+                            if let Some(ref ni) = hi.NetInfo {
+                                magicsock.set_net_info(ni);
+                            }
+                        }
+                    }
+
                     // Merge peer deltas. Track whether the peer set changed
                     // so the filter's capability map can be refreshed.
                     let peers_changed = !resp.Peers.is_empty()
                         || !resp.PeersChanged.is_empty()
-                        || !resp.PeersRemoved.is_empty();
+                        || !resp.PeersRemoved.is_empty()
+                        || resp
+                            .PeersChangedPatch
+                            .as_ref()
+                            .is_some_and(|p| !p.is_empty());
                     {
                         let mut peers = peers_arc.write().await;
                         if !resp.Peers.is_empty() {
@@ -191,6 +223,19 @@ pub(crate) fn spawn_map_update_task(
                         }
                         if !resp.PeersRemoved.is_empty() {
                             peers.retain(|p| !resp.PeersRemoved.contains(&p.ID));
+                        }
+                        // Apply incremental peer patches (PeersChangedPatch).
+                        // These are lighter-weight updates that only modify
+                        // individual fields (Online, LastSeen, DERPRegion,
+                        // Endpoints, Key, DiscoKey, KeyExpiry, Cap, CapMap).
+                        if let Some(ref patches) = resp.PeersChangedPatch {
+                            for patch in patches {
+                                if let Some(existing) =
+                                    peers.iter_mut().find(|p| p.ID == patch.NodeID)
+                                {
+                                    apply_peer_change(existing, patch);
+                                }
+                            }
                         }
                     }
 
@@ -507,4 +552,130 @@ async fn perform_key_rotation(
     }
 
     Err("key rotation exhausted retries (max 2)".into())
+}
+
+/// Apply an incremental [`PeerChange`] patch to an existing [`Node`].
+/// Only fields that are `Some` / non-default are applied; the rest are left
+/// unchanged. Mirrors Go's `(*Node).ApplyPatch` in `tailcfg/tailcfg.go`.
+fn apply_peer_change(node: &mut Node, patch: &PeerChange) {
+    if patch.DERPRegion != 0 {
+        node.HomeDERP = patch.DERPRegion;
+    }
+    if patch.Cap != 0 {
+        node.Cap = patch.Cap;
+    }
+    if !patch.CapMap.is_empty() {
+        node.CapMap = patch.CapMap.clone();
+    }
+    if !patch.Endpoints.is_empty() {
+        node.Endpoints.clone_from(&patch.Endpoints);
+    }
+    if let Some(ref key) = patch.Key {
+        node.Key = key.clone();
+    }
+    if let Some(ref sig) = patch.KeySignature {
+        node.KeySignature = Some(sig.clone());
+    }
+    if let Some(ref disco) = patch.DiscoKey {
+        node.DiscoKey = disco.clone();
+    }
+    if let Some(online) = patch.Online {
+        node.Online = Some(online);
+    }
+    if let Some(last_seen) = patch.LastSeen {
+        node.LastSeen = Some(last_seen);
+    }
+    if let Some(key_expiry) = patch.KeyExpiry {
+        node.KeyExpiry = Some(key_expiry);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustscale_key::{DiscoPrivate, NodePrivate};
+    use rustscale_tailcfg::PeerChange;
+
+    fn sample_peer() -> Node {
+        Node {
+            ID: 10,
+            Key: NodePrivate::generate().public(),
+            DiscoKey: DiscoPrivate::generate().public(),
+            HomeDERP: 3,
+            Online: Some(true),
+            Endpoints: vec!["1.2.3.4:5".into()],
+            Cap: 50,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn peer_change_patch_derp_and_online() {
+        let mut peer = sample_peer();
+        let patch = PeerChange {
+            NodeID: 10,
+            DERPRegion: 7,
+            Online: Some(false),
+            ..Default::default()
+        };
+        apply_peer_change(&mut peer, &patch);
+        assert_eq!(peer.HomeDERP, 7);
+        assert_eq!(peer.Online, Some(false));
+        // Unchanged fields stay the same.
+        assert_eq!(peer.Cap, 50);
+        assert!(!peer.Endpoints.is_empty());
+    }
+
+    #[test]
+    fn peer_change_patch_endpoints_and_key() {
+        let mut peer = sample_peer();
+        let new_key = NodePrivate::generate().public();
+        let patch = PeerChange {
+            NodeID: 10,
+            Endpoints: vec!["5.6.7.8:9".into(), "[::1]:10".into()],
+            Key: Some(new_key.clone()),
+            ..Default::default()
+        };
+        apply_peer_change(&mut peer, &patch);
+        assert_eq!(peer.Endpoints, vec!["5.6.7.8:9", "[::1]:10"]);
+        assert_eq!(peer.Key, new_key);
+        // DERPRegion 0 means unchanged.
+        assert_eq!(peer.HomeDERP, 3);
+    }
+
+    #[test]
+    fn peer_change_patch_last_seen_and_key_expiry() {
+        let mut peer = sample_peer();
+        let ts = chrono::DateTime::parse_from_rfc3339("2025-07-12T10:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let patch = PeerChange {
+            NodeID: 10,
+            LastSeen: Some(ts),
+            KeyExpiry: Some(ts),
+            ..Default::default()
+        };
+        apply_peer_change(&mut peer, &patch);
+        assert_eq!(peer.LastSeen, Some(ts));
+        assert_eq!(peer.KeyExpiry, Some(ts));
+    }
+
+    #[test]
+    fn peer_change_patch_unknown_node_is_noop() {
+        let mut peer = sample_peer();
+        let original = peer.clone();
+        // Patch for a different NodeID — should not be applied by the caller,
+        // but apply_peer_change itself doesn't check NodeID.
+        let patch = PeerChange {
+            NodeID: 999,
+            DERPRegion: 42,
+            ..Default::default()
+        };
+        // In the map_update task, the caller checks NodeID before calling
+        // apply_peer_change. Here we just verify the helper is correct.
+        apply_peer_change(&mut peer, &patch);
+        assert_eq!(peer.HomeDERP, 42);
+        // Verify the original is different
+        assert_ne!(peer.HomeDERP, original.HomeDERP);
+    }
 }

@@ -199,6 +199,9 @@ struct Inner {
     /// Per-peer background task handles (heartbeat + UDP lifetime probe).
     /// At most one task per peer; replaced on new TX activity.
     background_tasks: RwLock<HashMap<NodePublic, tokio::task::JoinHandle<()>>>,
+    /// Last NetInfo received from control (or from local probing). Used to
+    /// deduplicate updates and track PreferredDERP / connectivity changes.
+    net_info: RwLock<Option<rustscale_tailcfg::NetInfo>>,
 }
 
 /// Manages DERP connections across multiple regions.
@@ -593,6 +596,7 @@ impl Magicsock {
             self_cap_map,
             peer_mtu_enabled: Arc::new(AtomicBool::new(false)),
             background_tasks: RwLock::new(HashMap::new()),
+            net_info: RwLock::new(None),
         });
 
         // Spawn the relay manager event loop. The handle is stored in Inner
@@ -1036,6 +1040,33 @@ impl Magicsock {
         self.inner
             .peer_mtu_enabled
             .store(enabled, Ordering::Relaxed);
+    }
+
+    /// Apply a NetInfo update received from the control server. Stores the
+    /// NetInfo for endpoint tracking and connectivity diagnostics, deduplicating
+    /// when the new value is basically equal to the last. Mirrors Go's
+    /// `direct.SetNetInfo` dedup path.
+    pub fn set_net_info(&self, ni: &rustscale_tailcfg::NetInfo) {
+        let mut guard = self.inner.net_info.write().expect("net_info lock poisoned");
+        if let Some(ref prev) = *guard {
+            if prev.PreferredDERP == ni.PreferredDERP
+                && prev.WorkingUDP == ni.WorkingUDP
+                && prev.WorkingIPv6 == ni.WorkingIPv6
+                && prev.MappingVariesByDestIP == ni.MappingVariesByDestIP
+            {
+                return;
+            }
+        }
+        *guard = Some(ni.clone());
+    }
+
+    /// Snapshot of the last NetInfo applied via [`set_net_info`].
+    pub fn net_info(&self) -> Option<rustscale_tailcfg::NetInfo> {
+        self.inner
+            .net_info
+            .read()
+            .expect("net_info lock poisoned")
+            .clone()
     }
 
     /// Whether PMTUD is currently enabled.

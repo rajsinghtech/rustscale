@@ -608,7 +608,9 @@ fn cap_holders(pairs: &[(IpAddr, &[&str])]) -> BTreeMap<IpAddr, BTreeSet<String>
     for (ip, caps) in pairs {
         m.insert(
             *ip,
-            caps.iter().map(std::string::ToString::to_string).collect::<BTreeSet<_>>(),
+            caps.iter()
+                .map(std::string::ToString::to_string)
+                .collect::<BTreeSet<_>>(),
         );
     }
     m
@@ -746,7 +748,8 @@ fn test_caps_with_values() {
             keys.sort();
             keys
         };
-        let mut want_sorted: Vec<String> = want.iter().map(std::string::ToString::to_string).collect();
+        let mut want_sorted: Vec<String> =
+            want.iter().map(std::string::ToString::to_string).collect();
         want_sorted.sort();
         assert_eq!(got, want_sorted, "src={src} dst={dst}");
     }

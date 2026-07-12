@@ -5,6 +5,29 @@ Status legend: ✅ done · 🔶 partial · 🚧 in progress · ⬜ not started.
 Active execution order is in CLAUDE.md; this file is the full inventory —
 update statuses as phases land.
 
+## Verified gap audit (2026-07-12)
+
+An independent three-way codebase comparison (`docs/audit/*.md`) plus an
+adversarial verification pass (`docs/audit/verified.md`) found several rows below
+were **overstated**. Corrected status (verdicts backed by file:line evidence in
+verified.md):
+
+| Area | Was | Actually | Evidence |
+| --- | --- | --- | --- |
+| Packet filter | ✅ | 🔶 | capability ACLs stubbed — `no_cap()` always false (`crates/filter/src/lib.rs`); no shields-up field |
+| DERP client | ✅ | 🔶 | no pinned-key verify — any server key accepted (`crates/derp/src/client.rs`); no send rate-limiting |
+| Tailscale SSH | ✅ | 🔶 | server code exists but policy callback hardcoded `None` (`crates/ssh/src/…`) → all connections rejected |
+| Health tracking | ✅ | 🔶 | ~5 of 20 Go warnables; no per-region DERP health |
+| Exit node (CLI) | ✅ | 🔶 | `--exit-node`/PATCH prefs never calls `set_exit_node` → routing no-op |
+| Key lifecycle | — | ⬜ | no key rotation/re-registration; logout is a no-op (`crates/rustscaled/src/daemon.rs`) |
+| IPN Notify | ✅ | 🔶 | missing NetMap + PeersChanged/Removed/ChangedPatch fields |
+| magicsock paths | ✅ | 🔶 | no 3s disco heartbeat, no UDP-lifetime probing, no PMTUD |
+| Netstack | ✅ | 🔶 | TCP-only; no `ListenPacket` (UDP on tailnet) |
+
+These are being scheduled as fix phases in priority order (security → correctness
+→ connectivity). Rows below are left as-authored; consult verified.md for the
+authoritative status until each fix lands.
+
 ## Tier 1: Core compatibility (missing = incomplete client)
 
 | Feature | Go source | Status |

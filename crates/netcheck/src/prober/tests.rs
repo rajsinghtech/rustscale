@@ -239,6 +239,7 @@ async fn prober_handles_unreachable_region() {
         report_timeout: Duration::from_millis(800),
         probe_timeout: Duration::from_millis(100),
         max_retries: 1,
+        skip_icmp: true,
         ..Default::default()
     };
     let report = prober.run(&dm, &opts).await.expect("report");

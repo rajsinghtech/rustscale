@@ -5,8 +5,10 @@
 //! so the data plane can re-gather endpoints, re-STUN, and reconnect DERP.
 //!
 //! - [`Monitor`] owns a [`State`] snapshot and a debounce loop.
-//! - On macOS, an AF_ROUTE socket delivers events in real time; on other
-//!   platforms a 10-second polling fallback is used.
+//! - On macOS, an AF_ROUTE socket delivers events in real time; on Linux, a
+//!   NETLINK_ROUTE socket subscribed to link/address/route multicast groups
+//!   delivers events in real time; on other platforms a 10-second polling
+//!   fallback is used.
 //! - Wall-clock jumps (monotonic-vs-wall delta > 10 min) are treated as
 //!   major changes (machine woke from sleep — NAT mappings are stale).
 //!
@@ -25,7 +27,10 @@ mod os;
 #[cfg(target_os = "macos")]
 mod os_darwin;
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+mod os_linux;
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 mod os_poll;
 
 mod state;

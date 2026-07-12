@@ -37,24 +37,60 @@ pub const WARN_NETMON_CHANGE: &str = "network-changed";
 /// Captive portal detected — traffic is being intercepted. High severity.
 pub const WARN_CAPTIVE_PORTAL: &str = "captive-portal-detected";
 
+/// Network connectivity is down (productivity impacted). High severity.
+/// Mirrors Go's `NetworkStatusWarnable` (`HealthWarnableNetworkStatus`).
+pub const WARN_PRODUCTIVITY: &str = "network-status";
+/// UDP connectivity issues — NAT traversal setup failure. Medium severity.
+/// Mirrors Go's `noUDP4BindWarnable` (`HealthWarnableNoUDP4Bind`).
+pub const WARN_UDP: &str = "no-udp4-bind";
+/// IPv4 connectivity issues. Medium severity.
+pub const WARN_IPV4: &str = "ipv4-connectivity";
+/// IPv6 connectivity issues. Medium severity.
+pub const WARN_IPV6: &str = "ipv6-connectivity";
+/// No DERP region can be reached. Medium severity.
+/// Mirrors Go's `noDERPHomeWarnable` (`HealthWarnableNoDERPHome`).
+pub const WARN_DERP_NO_REGION: &str = "no-derp-home";
+/// Node is idle / Tailscale is stopped. Low severity.
+/// Mirrors Go's `IPNStateWarnable` (`HealthWarnableWantRunningFalse`).
+pub const WARN_IDLE: &str = "ipn-state";
+/// Login interactivity needed. Medium severity.
+/// Mirrors Go's `LoginStateWarnable` (`HealthWarnableLoginState`).
+pub const WARN_LOGIN: &str = "login-state";
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
 /// How serious a warning is. Higher = more urgent.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
 pub enum Severity {
+    #[default]
     Low,
     Medium,
     High,
 }
 
 /// A registered warnable condition: an id, severity, and human title.
-#[derive(Clone, Debug)]
+///
+/// Ports Go's `health.Warnable`. The `depends_on` field lists other warnable
+/// ids that must be *healthy* for this warnable to be relevant — if any
+/// dependency is unhealthy, this warnable is suppressed (the dependency
+/// already explains the symptom). The `time_to_visible` field delays surfacing
+/// a warning to the user, preventing transient blips.
+#[derive(Clone, Debug, Default)]
 pub struct Warnable {
     pub id: String,
     pub severity: Severity,
     pub title: String,
+    /// Warnable ids that this warnable depends on. If any dependency is
+    /// currently unhealthy, this warnable is suppressed in
+    /// [`Tracker::current_warnings`] (the dependency already explains the
+    /// problem). Mirrors Go's `Warnable.DependsOn`.
+    pub depends_on: Vec<String>,
+    /// How long the warnable must be continuously unhealthy before it appears
+    /// in [`Tracker::current_warnings`]. `Duration::ZERO` (the default) means
+    /// immediately visible. Mirrors Go's `Warnable.TimeToVisible`.
+    pub time_to_visible: Duration,
 }
 
 /// A currently-active warning snapshot, returned by [`Tracker::current_warnings`].
@@ -118,26 +154,79 @@ impl Tracker {
             id: WARN_CONTROL.into(),
             severity: Severity::High,
             title: "Control connection".into(),
+            ..Warnable::default()
         });
         t.register(Warnable {
             id: WARN_DERP_HOME.into(),
             severity: Severity::Medium,
             title: "DERP home region".into(),
+            ..Warnable::default()
         });
         t.register(Warnable {
             id: WARN_CERT_FALLBACK.into(),
             severity: Severity::Low,
             title: "Certificate fallback".into(),
+            ..Warnable::default()
         });
         t.register(Warnable {
             id: WARN_NETMON_CHANGE.into(),
             severity: Severity::Low,
             title: "Network changed".into(),
+            ..Warnable::default()
         });
         t.register(Warnable {
             id: WARN_CAPTIVE_PORTAL.into(),
             severity: Severity::High,
             title: "Captive portal detected".into(),
+            ..Warnable::default()
+        });
+        t.register(Warnable {
+            id: WARN_PRODUCTIVITY.into(),
+            severity: Severity::Medium,
+            title: "Network down".into(),
+            time_to_visible: Duration::from_secs(5),
+            ..Warnable::default()
+        });
+        t.register(Warnable {
+            id: WARN_UDP.into(),
+            severity: Severity::Medium,
+            title: "NAT traversal setup failure".into(),
+            depends_on: vec![WARN_PRODUCTIVITY.into(), WARN_IDLE.into()],
+            ..Warnable::default()
+        });
+        t.register(Warnable {
+            id: WARN_IPV4.into(),
+            severity: Severity::Medium,
+            title: "IPv4 connectivity".into(),
+            depends_on: vec![WARN_PRODUCTIVITY.into()],
+            ..Warnable::default()
+        });
+        t.register(Warnable {
+            id: WARN_IPV6.into(),
+            severity: Severity::Medium,
+            title: "IPv6 connectivity".into(),
+            depends_on: vec![WARN_PRODUCTIVITY.into()],
+            ..Warnable::default()
+        });
+        t.register(Warnable {
+            id: WARN_DERP_NO_REGION.into(),
+            severity: Severity::Medium,
+            title: "No home relay server".into(),
+            depends_on: vec![WARN_PRODUCTIVITY.into()],
+            time_to_visible: Duration::from_secs(10),
+        });
+        t.register(Warnable {
+            id: WARN_IDLE.into(),
+            severity: Severity::Low,
+            title: "Tailscale off".into(),
+            ..Warnable::default()
+        });
+        t.register(Warnable {
+            id: WARN_LOGIN.into(),
+            severity: Severity::Medium,
+            title: "Logged out".into(),
+            depends_on: vec![WARN_IDLE.into()],
+            ..Warnable::default()
         });
         t
     }
@@ -232,11 +321,43 @@ impl Tracker {
     }
 
     /// Snapshot all active warnings, sorted by severity (High first) then id.
+    ///
+    /// Applies two visibility filters (mirroring Go's `Warnable.IsVisible`
+    /// and `DependsOn` semantics):
+    ///
+    /// - **TimeToVisible**: a warnable that has been unhealthy for less than
+    ///   its `time_to_visible` duration is suppressed (transient blip guard).
+    /// - **DependsOn**: if any of a warnable's declared dependencies is itself
+    ///   unhealthy, the warnable is suppressed — the dependency already
+    ///   explains the symptom and showing both is noise.
     pub fn current_warnings(&self) -> Vec<Warning> {
         let g = self.inner.lock().expect("health mutex poisoned");
+        let now = Utc::now();
         let mut out: Vec<Warning> = g
             .active
             .iter()
+            .filter(|(id, (_, since))| {
+                let Some(w) = g.warnables.get(*id) else {
+                    return true; // unknown warnable: no metadata, show it
+                };
+                // TimeToVisible: suppress if not yet unhealthy long enough.
+                if w.time_to_visible > Duration::ZERO {
+                    let elapsed = now.signed_duration_since(*since);
+                    if elapsed
+                        < chrono::Duration::from_std(w.time_to_visible)
+                            .unwrap_or(chrono::Duration::zero())
+                    {
+                        return false;
+                    }
+                }
+                // DependsOn: suppress if any dependency is unhealthy.
+                for dep in &w.depends_on {
+                    if g.active.contains_key(dep) {
+                        return false;
+                    }
+                }
+                true
+            })
             .map(|(id, (text, since))| {
                 let severity = g.warnables.get(id).map_or(Severity::Medium, |w| w.severity);
                 Warning {
@@ -249,6 +370,176 @@ impl Tracker {
             .collect();
         out.sort_by(|a, b| b.severity.cmp(&a.severity).then(a.id.cmp(&b.id)));
         out
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ReceiveFuncStats — track stuck receive tasks (#34)
+// ---------------------------------------------------------------------------
+
+/// Stats for a single receive func (e.g. wireguard-go's `ReceiveIPv4`,
+/// `ReceiveIPv6`, `ReceiveDERP`). Mirrors Go's `health.ReceiveFuncStats`,
+/// simplified to track last-received timestamps and in-call state.
+///
+/// A receive func is "stuck" when it has not received a packet in a while and
+/// is not currently inside a call (blocked on nothing — the goroutine/task is
+/// MIA). Call [`ReceiveFuncTracker::check_stuck`] to detect this.
+///
+/// Cloning shares the underlying counters (like a `&` reference in Go).
+#[derive(Clone, Debug)]
+pub struct ReceiveFuncStats {
+    inner: Arc<ReceiveFuncStatsInner>,
+}
+
+#[derive(Debug)]
+struct ReceiveFuncStatsInner {
+    name: String,
+    /// Total number of times the func has been called.
+    num_calls: std::sync::atomic::AtomicU64,
+    /// Whether the func is currently executing (inside `enter`/`exit`).
+    in_call: std::sync::atomic::AtomicBool,
+    /// Last time a packet was received by this func.
+    last_received: Mutex<Option<DateTime<Utc>>>,
+    /// Set by `check_stuck` when the func is detected as missing.
+    missing: Mutex<bool>,
+}
+
+impl ReceiveFuncStats {
+    /// Create a new stats entry with the given name.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            inner: Arc::new(ReceiveFuncStatsInner {
+                name: name.into(),
+                num_calls: std::sync::atomic::AtomicU64::new(0),
+                in_call: std::sync::atomic::AtomicBool::new(false),
+                last_received: Mutex::new(None),
+                missing: Mutex::new(false),
+            }),
+        }
+    }
+
+    /// The name of this receive func.
+    pub fn name(&self) -> &str {
+        &self.inner.name
+    }
+
+    /// Record that the receive func was entered (started executing).
+    pub fn enter(&self) {
+        self.inner
+            .num_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner
+            .in_call
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Record that the receive func exited.
+    pub fn exit(&self) {
+        self.inner
+            .in_call
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Record that a packet was received at the current time.
+    pub fn note_received(&self) {
+        *self.inner.last_received.lock().expect("recv stats mutex") = Some(Utc::now());
+    }
+
+    /// Total number of calls to this func.
+    pub fn num_calls(&self) -> u64 {
+        self.inner
+            .num_calls
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whether the func is currently inside a call.
+    pub fn in_call(&self) -> bool {
+        self.inner
+            .in_call
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Last time a packet was received, if ever.
+    pub fn last_received(&self) -> Option<DateTime<Utc>> {
+        *self.inner.last_received.lock().expect("recv stats mutex")
+    }
+
+    /// Whether this func was flagged as missing by the last `check_stuck`.
+    fn is_missing(&self) -> bool {
+        *self.inner.missing.lock().expect("recv stats mutex")
+    }
+
+    fn set_missing(&self, v: bool) {
+        *self.inner.missing.lock().expect("recv stats mutex") = v;
+    }
+}
+
+/// Tracks [`ReceiveFuncStats`] for a set of named receive funcs and detects
+/// stuck ones (no receive in N seconds and not currently in a call).
+///
+/// Mirrors Go's `Tracker.MagicSockReceiveFuncs` + `checkReceiveFuncsLocked`.
+/// Cloning shares the underlying state.
+#[derive(Clone, Debug, Default)]
+pub struct ReceiveFuncTracker {
+    funcs: Arc<Mutex<Vec<ReceiveFuncStats>>>,
+}
+
+impl ReceiveFuncTracker {
+    /// Create a new empty tracker.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a receive func by name. Returns nothing; use
+    /// [`Self::stats`] to get a handle for `enter`/`exit`/`note_received`.
+    pub fn register(&self, name: impl Into<String>) {
+        let name = name.into();
+        let mut g = self.funcs.lock().expect("recv tracker mutex");
+        if !g.iter().any(|f| f.name() == name) {
+            g.push(ReceiveFuncStats::new(name));
+        }
+    }
+
+    /// Get the stats handle for a named func, if registered.
+    pub fn stats(&self, name: &str) -> Option<ReceiveFuncStats> {
+        let g = self.funcs.lock().expect("recv tracker mutex");
+        g.iter().find(|f| f.name() == name).cloned()
+    }
+
+    /// Check all registered funcs for staleness. A func is "stuck" if:
+    /// - it has not received a packet within `timeout`, AND
+    /// - it is not currently inside a call (not blocked on I/O).
+    ///
+    /// Returns the names of all stuck funcs. Also updates each func's
+    /// `missing` flag. Mirrors Go's `checkReceiveFuncsLocked`.
+    pub fn check_stuck(&self, timeout: Duration) -> Vec<String> {
+        let now = Utc::now();
+        let chrono_timeout =
+            chrono::Duration::from_std(timeout).unwrap_or(chrono::Duration::zero());
+        let g = self.funcs.lock().expect("recv tracker mutex");
+        let mut stuck = Vec::new();
+        for f in g.iter() {
+            let last = f.last_received();
+            let is_stale = match last {
+                Some(t) => now.signed_duration_since(t) >= chrono_timeout,
+                None => false, // no baseline — don't flag as stuck yet
+            };
+            // Only stuck if not currently in a call.
+            let is_stuck = is_stale && !f.in_call();
+            f.set_missing(is_stuck);
+            if is_stuck {
+                stuck.push(f.name().to_string());
+            }
+        }
+        stuck
+    }
+
+    /// Whether a named func is currently flagged as missing/stuck.
+    pub fn is_missing(&self, name: &str) -> bool {
+        let g = self.funcs.lock().expect("recv tracker mutex");
+        g.iter()
+            .find(|f| f.name() == name)
+            .is_some_and(ReceiveFuncStats::is_missing)
     }
 }
 
@@ -300,6 +591,7 @@ impl Watchdog {
             id: id.into(),
             severity,
             title: title.into(),
+            ..Warnable::default()
         });
 
         let last_fed = Arc::new(Mutex::new(Utc::now()));
@@ -538,5 +830,153 @@ mod tests {
         assert!(t.check_derp_region_staleness(9, Duration::from_secs(0)));
         assert!(!t.derp_region_healthy(9));
         assert!(t.is_unhealthy("derp-region-9-unreachable"));
+    }
+
+    // ---- DependsOn / TimeToVisible tests (#33) ----
+
+    #[test]
+    fn depends_on_suppresses_when_dependency_unhealthy() {
+        // WARN_UDP depends on WARN_PRODUCTIVITY and WARN_IDLE.
+        // If WARN_IDLE is unhealthy, WARN_UDP should be suppressed.
+        // (WARN_IDLE has no time_to_visible, so it appears immediately.)
+        let t = Tracker::new();
+        t.set_unhealthy(WARN_UDP, "can't bind udp");
+        assert_eq!(
+            t.current_warnings().len(),
+            1,
+            "WARN_UDP alone should be visible"
+        );
+
+        // Now mark its dependency unhealthy — WARN_UDP should be hidden.
+        t.set_unhealthy(WARN_IDLE, "tailscale off");
+        let ids: Vec<_> = t.current_warnings().iter().map(|w| w.id.clone()).collect();
+        assert!(
+            !ids.contains(&WARN_UDP.to_string()),
+            "WARN_UDP should be suppressed when WARN_IDLE is unhealthy"
+        );
+        assert!(ids.contains(&WARN_IDLE.to_string()));
+
+        // Clear the dependency — WARN_UDP reappears.
+        t.set_healthy(WARN_IDLE);
+        let ids: Vec<_> = t.current_warnings().iter().map(|w| w.id.clone()).collect();
+        assert!(ids.contains(&WARN_UDP.to_string()));
+    }
+
+    #[test]
+    fn time_to_visible_delays_warning() {
+        // Register a warnable with a 200ms time-to-visible.
+        let t = Tracker::new();
+        t.register(Warnable {
+            id: "delayed".into(),
+            severity: Severity::Medium,
+            title: "Delayed".into(),
+            time_to_visible: Duration::from_millis(200),
+            ..Warnable::default()
+        });
+        t.set_unhealthy("delayed", "boom");
+        // Immediately: suppressed.
+        assert!(
+            t.current_warnings().is_empty(),
+            "should not be visible before time_to_visible"
+        );
+        // After the delay: visible.
+        std::thread::sleep(Duration::from_millis(250));
+        assert_eq!(
+            t.current_warnings().len(),
+            1,
+            "should be visible after delay"
+        );
+    }
+
+    #[test]
+    fn new_warnables_registered() {
+        let t = Tracker::new();
+        // All new warnables should be settable.
+        for id in [
+            WARN_PRODUCTIVITY,
+            WARN_UDP,
+            WARN_IPV4,
+            WARN_IPV6,
+            WARN_DERP_NO_REGION,
+            WARN_IDLE,
+            WARN_LOGIN,
+        ] {
+            t.set_unhealthy(id, "test");
+            assert!(t.is_unhealthy(id), "{id} should be unhealthy");
+            t.set_healthy(id);
+            assert!(!t.is_unhealthy(id), "{id} should be healthy");
+        }
+    }
+
+    // ---- ReceiveFuncStats / ReceiveFuncTracker tests (#34) ----
+
+    #[test]
+    fn receive_func_stats_enter_exit() {
+        let s = ReceiveFuncStats::new("ReceiveIPv4");
+        assert_eq!(s.num_calls(), 0);
+        assert!(!s.in_call());
+        s.enter();
+        assert_eq!(s.num_calls(), 1);
+        assert!(s.in_call());
+        s.exit();
+        assert!(!s.in_call());
+    }
+
+    #[test]
+    fn receive_func_tracker_detects_stuck() {
+        let tracker = ReceiveFuncTracker::new();
+        tracker.register("ReceiveIPv4");
+        tracker.register("ReceiveDERP");
+
+        let s = tracker.stats("ReceiveIPv4").unwrap();
+        s.note_received();
+        // Not stuck yet — recent receive.
+        assert!(
+            tracker.check_stuck(Duration::from_secs(60)).is_empty(),
+            "should not be stuck with recent receive"
+        );
+
+        // Simulate staleness by backdating the last_received timestamp.
+        {
+            let s = tracker.stats("ReceiveIPv4").unwrap();
+            *s.inner.last_received.lock().unwrap() =
+                Some(Utc::now() - chrono::Duration::seconds(120));
+        }
+
+        let stuck = tracker.check_stuck(Duration::from_secs(60));
+        assert!(
+            stuck.contains(&"ReceiveIPv4".to_string()),
+            "ReceiveIPv4 should be stuck after 120s without receive"
+        );
+        assert!(tracker.is_missing("ReceiveIPv4"));
+        assert!(!tracker.is_missing("ReceiveDERP"));
+    }
+
+    #[test]
+    fn receive_func_tracker_not_stuck_when_in_call() {
+        let tracker = ReceiveFuncTracker::new();
+        tracker.register("ReceiveIPv6");
+        let s = tracker.stats("ReceiveIPv6").unwrap();
+        s.note_received();
+        // Backdate but mark as in-call (blocked on I/O — not stuck).
+        *s.inner.last_received.lock().unwrap() = Some(Utc::now() - chrono::Duration::seconds(120));
+        s.inner
+            .in_call
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            tracker.check_stuck(Duration::from_secs(60)).is_empty(),
+            "func in a call should not be flagged as stuck"
+        );
+    }
+
+    #[test]
+    fn receive_func_tracker_not_stuck_without_baseline() {
+        let tracker = ReceiveFuncTracker::new();
+        tracker.register("ReceiveDERP");
+        // No note_received ever called — should not be flagged.
+        assert!(
+            tracker.check_stuck(Duration::from_secs(0)).is_empty(),
+            "no baseline receive should not be flagged as stuck"
+        );
     }
 }

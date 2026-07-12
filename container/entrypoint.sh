@@ -36,7 +36,7 @@ err() { echo "[entrypoint] ERROR: $*" >&2; exit 1; }
 maybe_read_file() {
     val="$1"
     case "$val" in
-        file:*) cat "${val#file:}" ;;
+        file:*) cat "${val#file:}" || err "failed to read file: ${val#file:}" ;;
         *)      echo "$val" ;;
     esac
 }
@@ -81,7 +81,7 @@ mkdir -p "$STATE_DIR"
 # Start rustscaled
 # ---------------------------------------------------------------------------
 
-DAEMON_ARGS="run --statedir $STATE_DIR"
+DAEMON_ARGS="run --statedir $STATE_DIR --socket $SOCKET"
 
 # TUN mode unless userspace is explicitly enabled.
 if bool_false "$USERSPACE"; then
@@ -130,7 +130,7 @@ elif [ "$ALREADY_UP" = true ]; then
 fi
 
 if [ "$SHOULD_LOGIN" = true ]; then
-    UP_ARGS="--socket $SOCKET"
+    UP_ARGS=""
 
     if [ -n "$AUTH_KEY" ]; then
         UP_ARGS="$UP_ARGS --auth-key $AUTH_KEY"
@@ -156,7 +156,7 @@ if [ "$SHOULD_LOGIN" = true ]; then
 
     log "running: rustscale up $UP_ARGS"
     # shellcheck disable=SC2086 # intentional word splitting for args
-    if ! rustscale $UP_ARGS up; then
+    if ! rustscale --socket "$SOCKET" up $UP_ARGS; then
         err "rustscale up failed"
     fi
     log "login complete"

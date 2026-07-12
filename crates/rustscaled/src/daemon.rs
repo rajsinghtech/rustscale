@@ -12,11 +12,12 @@ pub async fn run(
     statedir: Option<PathBuf>,
     hostname: Option<String>,
     tun: bool,
+    socket_override: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let auth_key = std::env::var("TS_AUTHKEY").ok();
     let state_dir = statedir.unwrap_or_else(|| PathBuf::from(DEFAULT_STATE_DIR));
     let hostname = hostname.unwrap_or_else(|| "rustscale".to_string());
-    let socket_path = determine_socket_path(&state_dir);
+    let socket_path = socket_override.unwrap_or_else(|| determine_socket_path(&state_dir));
 
     if let Some(key) = auth_key {
         run_with_auth_key(&key, &state_dir, &hostname, &socket_path, tun).await

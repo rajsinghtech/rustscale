@@ -24,6 +24,7 @@ fn main() {
         "run" => {
             let mut statedir = None;
             let mut hostname = None;
+            let mut socket = None;
             let mut tun = false;
             let mut i = 2;
             while i < args.len() {
@@ -35,6 +36,14 @@ fn main() {
                             std::process::exit(1);
                         }
                         statedir = Some(PathBuf::from(&args[i]));
+                    }
+                    "--socket" => {
+                        i += 1;
+                        if i >= args.len() {
+                            eprintln!("error: --socket requires a value");
+                            std::process::exit(1);
+                        }
+                        socket = Some(PathBuf::from(&args[i]));
                     }
                     "--hostname" => {
                         i += 1;
@@ -58,7 +67,7 @@ fn main() {
                 .build()
                 .expect("failed to create tokio runtime");
             rt.block_on(async {
-                if let Err(e) = Box::pin(daemon::run(statedir, hostname, tun)).await {
+                if let Err(e) = Box::pin(daemon::run(statedir, hostname, tun, socket)).await {
                     eprintln!("rustscaled: {e}");
                     std::process::exit(1);
                 }
@@ -101,7 +110,7 @@ fn main() {
 }
 
 fn usage(bin: &str) {
-    eprintln!("usage: {bin} run [--statedir <dir>] [--hostname <name>] [--tun]");
+    eprintln!("usage: {bin} run [--statedir <dir>] [--socket <path>] [--hostname <name>] [--tun]");
     eprintln!("       {bin} install-system-daemon");
     eprintln!("       {bin} uninstall-system-daemon");
 }

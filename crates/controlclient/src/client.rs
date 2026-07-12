@@ -19,10 +19,43 @@ use rustscale_key::{MachinePrivate, MachinePublic};
 use rustscale_tailcfg::{
     MapRequest, MapResponse, RegisterRequest, RegisterResponse, SetDNSRequest, SetDNSResponse,
 };
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 use crate::controlbase::{NoiseIo, ProtocolVersion};
 use crate::controlhttp::dial_control;
+
+/// Shared map-session state for delta-tracking across reconnections.
+///
+/// The map-update task writes `handle` and `seq` as it processes each
+/// `MapResponse`; [`ControlClient::stream_map_loop`] reads them before each
+/// (re)connection to populate `MapRequest.MapSessionHandle` /
+/// `MapRequest.MapSessionSeq` so the server can resume from the last
+/// processed sequence number. Mirrors Go's `Auto.lastSeq` / `mapSessionHandle`
+/// in `controlclient/auto.go`.
+#[derive(Debug, Default)]
+pub struct MapSessionState {
+    inner: Mutex<(String, i64)>,
+}
+
+impl MapSessionState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Update the session handle and sequence number.
+    pub fn set(&self, handle: String, seq: i64) {
+        *self.inner.lock().expect("MapSessionState lock poisoned") = (handle, seq);
+    }
+
+    /// Snapshot the current handle and sequence number.
+    pub fn get(&self) -> (String, i64) {
+        self.inner
+            .lock()
+            .expect("MapSessionState lock poisoned")
+            .clone()
+    }
+}
 
 /// Errors from a register request.
 #[derive(Debug, thiserror::Error)]
@@ -291,17 +324,32 @@ impl ControlClient {
     /// exponential backoff (2s → 4s → 8s → … → 60s cap) and reconnects.
     /// Resets the backoff to 2s after a clean stream end (Ok), since a
     /// clean disconnect typically means responses were received.
+    ///
+    /// When `session` is provided, each (re)connection clones `req` and
+    /// populates `MapSessionHandle` / `MapSessionSeq` from the shared state
+    /// so the server can resume the prior session from the last-processed
+    /// sequence number.
     pub async fn stream_map_loop(
         &self,
         req: &MapRequest,
         updates: mpsc::Sender<Result<MapResponse, StreamMapError>>,
+        session: Option<Arc<MapSessionState>>,
     ) {
         let mut backoff = std::time::Duration::from_secs(2);
         loop {
             if updates.is_closed() {
                 return;
             }
-            match self.stream_map(req, updates.clone()).await {
+            let req_for_iter: MapRequest = if let Some(ref ss) = session {
+                let (handle, seq) = ss.get();
+                let mut r = req.clone();
+                r.MapSessionHandle = handle;
+                r.MapSessionSeq = seq;
+                r
+            } else {
+                req.clone()
+            };
+            match self.stream_map(&req_for_iter, updates.clone()).await {
                 Ok(()) => {
                     backoff = std::time::Duration::from_secs(2);
                     eprintln!("control: map stream ended; reconnecting in {backoff:?}");

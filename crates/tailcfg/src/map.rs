@@ -9,8 +9,8 @@ use rustscale_key::{DiscoPublic, NodePublic};
 
 use crate::deserialize_null_to_default;
 use crate::{
-    skip_default, skip_zero_disco, CapabilityVersion, DERPMap, DNSConfig, FilterRule, Node, NodeID,
-    UserProfile,
+    skip_default, skip_zero_disco, CapabilityVersion, DERPMap, DNSConfig, FilterRule, NetInfo,
+    Node, NodeCapMap, NodeID, UserProfile,
 };
 
 /// Sent by a client to update its state and/or long-poll network-map updates.
@@ -90,6 +90,25 @@ pub struct MapRequest {
         deserialize_with = "deserialize_null_to_default"
     )]
     pub DebugFlags: Vec<String>,
+    /// Opaque handle to reattach to a previous map session after an
+    /// interruption. When set, `MapSessionSeq` must also be set. The server
+    /// may ignore this and start a new session. Only applicable when `Stream`
+    /// is true.
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
+    pub MapSessionHandle: String,
+    /// The last-processed sequence number in the session identified by
+    /// `MapSessionHandle`. Only applicable when `MapSessionHandle` is set;
+    /// the server will return only seq numbers greater than this.
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
+    pub MapSessionSeq: i64,
 }
 
 /// Returned by the control server, either as a single response or as a stream
@@ -195,6 +214,112 @@ pub struct MapResponse {
     /// SSH policy for incoming SSH connections. `None` = unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub SSHPolicy: Option<crate::SSHPolicy>,
+    /// Incremental peer updates (lighter than `PeersChanged`). Applied after
+    /// `Peers`/`PeersChanged`/`PeersRemoved`. In practice the server sends
+    /// these on their own, without the full peer fields also set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub PeersChangedPatch: Option<Vec<PeerChange>>,
+    /// Network probe results pushed from control to the client. `None` means
+    /// unchanged. When present, wired to magicsock for endpoint/DERP tracking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub NetInfo: Option<NetInfo>,
+    /// Latest client version info from control. `None` means no change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ClientVersion: Option<ClientVersion>,
+}
+
+/// Incremental update to a single peer (mirrors Go's `tailcfg.PeerChange`).
+/// Only fields that are `Some` / non-default are applied; the rest are left
+/// unchanged on the existing peer identified by `NodeID`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PeerChange {
+    /// The node ID being mutated.
+    #[serde(default, deserialize_with = "deserialize_null_to_default")]
+    pub NodeID: NodeID,
+    /// New home DERP region ID; 0 means unchanged.
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
+    pub DERPRegion: i32,
+    /// New capability version; 0 means unchanged.
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
+    pub Cap: CapabilityVersion,
+    /// New capability map; empty means unchanged.
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "crate::node::deserialize_capmap"
+    )]
+    pub CapMap: NodeCapMap,
+    /// New UDP endpoints; empty means unchanged.
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
+    pub Endpoints: Vec<String>,
+    /// New WireGuard public key; `None` means unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub Key: Option<NodePublic>,
+    /// New signature over the WireGuard public key; `None` means unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub KeySignature: Option<Vec<u8>>,
+    /// New disco key; `None` means unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub DiscoKey: Option<DiscoPublic>,
+    /// New online status; `None` means unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub Online: Option<bool>,
+    /// New last-seen timestamp; `None` means unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub LastSeen: Option<chrono::DateTime<chrono::Utc>>,
+    /// New key expiry; `None` means unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub KeyExpiry: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Latest client version information from control (mirrors Go's
+/// `tailcfg.ClientVersion`).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ClientVersion {
+    /// Whether the client is running the latest build.
+    #[serde(default, skip_serializing_if = "skip_default")]
+    pub RunningLatest: bool,
+    /// Latest version.Short available for the client's platform. Not
+    /// populated if `RunningLatest` is true.
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
+    pub LatestVersion: String,
+    /// Whether the client is missing an important security update.
+    #[serde(default, skip_serializing_if = "skip_default")]
+    pub UrgentSecurityUpdate: bool,
+    /// Whether the client should OS-notify about a new version. Not populated
+    /// if `RunningLatest` is true.
+    #[serde(default, skip_serializing_if = "skip_default")]
+    pub Notify: bool,
+    /// URL to open when the user clicks the notification.
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
+    pub NotifyURL: String,
+    /// Text to show in the notification.
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
+    pub NotifyText: String,
 }
 
 #[cfg(test)]
@@ -217,6 +342,8 @@ mod tests {
             OmitPeers: false,
             ReadOnly: false,
             DebugFlags: vec![],
+            MapSessionHandle: String::new(),
+            MapSessionSeq: 0,
         };
         let j = serde_json::to_string(&req).unwrap();
         assert!(j.contains("\"NodeKey\":\"nodekey:"));
@@ -260,5 +387,123 @@ mod tests {
         let resp = MapResponse::default();
         let j = serde_json::to_string(&resp).unwrap();
         assert_eq!(j, "{}", "all-default MapResponse is empty JSON object");
+    }
+
+    #[test]
+    fn peer_change_roundtrip() {
+        let pc = PeerChange {
+            NodeID: 42,
+            DERPRegion: 7,
+            Online: Some(false),
+            Endpoints: vec!["1.2.3.4:5".into()],
+            Key: Some(NodePrivate::generate().public()),
+            DiscoKey: Some(DiscoPrivate::generate().public()),
+            LastSeen: Some(
+                chrono::DateTime::parse_from_rfc3339("2025-07-12T10:00:00Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            ),
+            ..Default::default()
+        };
+        let j = serde_json::to_string(&pc).unwrap();
+        assert!(j.contains("\"NodeID\":42"));
+        assert!(j.contains("\"DERPRegion\":7"));
+        assert!(j.contains("\"Online\":false"));
+        assert!(j.contains("\"Endpoints\""));
+        let back: PeerChange = serde_json::from_str(&j).unwrap();
+        assert_eq!(back, pc);
+    }
+
+    #[test]
+    fn peer_change_default_omits_optionals() {
+        let pc = PeerChange {
+            NodeID: 1,
+            ..Default::default()
+        };
+        let j = serde_json::to_string(&pc).unwrap();
+        assert!(j.contains("\"NodeID\":1"));
+        assert!(!j.contains("\"Key\""), "None Key omitted");
+        assert!(!j.contains("\"DiscoKey\""), "None DiscoKey omitted");
+        assert!(!j.contains("\"Online\""), "None Online omitted");
+        assert!(!j.contains("\"LastSeen\""), "None LastSeen omitted");
+        assert!(!j.contains("\"DERPRegion\""), "zero DERPRegion omitted");
+    }
+
+    #[test]
+    fn client_version_roundtrip() {
+        let cv = ClientVersion {
+            RunningLatest: false,
+            LatestVersion: "1.99.0".into(),
+            UrgentSecurityUpdate: true,
+            Notify: true,
+            NotifyURL: "https://tailscale.com/download".into(),
+            NotifyText: "Update available".into(),
+        };
+        let j = serde_json::to_string(&cv).unwrap();
+        assert!(j.contains("\"LatestVersion\":\"1.99.0\""));
+        assert!(j.contains("\"UrgentSecurityUpdate\":true"));
+        assert!(j.contains("\"Notify\":true"));
+        let back: ClientVersion = serde_json::from_str(&j).unwrap();
+        assert_eq!(back, cv);
+    }
+
+    #[test]
+    fn map_response_with_peers_changed_patch() {
+        let resp = MapResponse {
+            PeersChangedPatch: Some(vec![
+                PeerChange {
+                    NodeID: 10,
+                    DERPRegion: 5,
+                    ..Default::default()
+                },
+                PeerChange {
+                    NodeID: 20,
+                    Online: Some(false),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        };
+        let j = serde_json::to_string(&resp).unwrap();
+        assert!(j.contains("\"PeersChangedPatch\""));
+        assert!(j.contains("\"NodeID\":10"));
+        assert!(j.contains("\"DERPRegion\":5"));
+        assert!(j.contains("\"NodeID\":20"));
+        assert!(j.contains("\"Online\":false"));
+        let back: MapResponse = serde_json::from_str(&j).unwrap();
+        assert_eq!(back, resp);
+    }
+
+    #[test]
+    fn map_response_with_client_version() {
+        let resp = MapResponse {
+            ClientVersion: Some(ClientVersion {
+                RunningLatest: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let j = serde_json::to_string(&resp).unwrap();
+        assert!(j.contains("\"ClientVersion\""));
+        assert!(j.contains("\"RunningLatest\":true"));
+        let back: MapResponse = serde_json::from_str(&j).unwrap();
+        assert_eq!(back, resp);
+    }
+
+    #[test]
+    fn map_request_with_session_handle() {
+        let req = MapRequest {
+            Version: 100,
+            NodeKey: NodePrivate::generate().public(),
+            Stream: true,
+            MapSessionHandle: "session-xyz".into(),
+            MapSessionSeq: 42,
+            ..Default::default()
+        };
+        let j = serde_json::to_string(&req).unwrap();
+        assert!(j.contains("\"MapSessionHandle\":\"session-xyz\""));
+        assert!(j.contains("\"MapSessionSeq\":42"));
+        let back: MapRequest = serde_json::from_str(&j).unwrap();
+        assert_eq!(back, req);
     }
 }

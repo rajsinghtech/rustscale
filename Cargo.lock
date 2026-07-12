@@ -1288,6 +1288,7 @@ dependencies = [
  "rustls",
  "rustscale-key",
  "rustscale-tailcfg",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tokio-rustls",

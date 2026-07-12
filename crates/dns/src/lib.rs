@@ -20,9 +20,15 @@ use rustscale_tailcfg::{DNSConfig, Node};
 use tokio::sync::RwLock;
 
 pub mod forwarder;
+pub mod osconfig;
+#[cfg(target_os = "macos")]
+pub mod osconfig_darwin;
 pub mod wire;
 
 pub use forwarder::{Forwarder, UpstreamResolver};
+pub use osconfig::{new_os_configurator, NoopConfigurator, OsConfig, OsConfigurator};
+#[cfg(target_os = "macos")]
+pub use osconfig_darwin::DarwinConfigurator;
 pub use wire::{
     build_a_response, build_aaaa_response, build_nxdomain, build_ptr_response,
     build_rcode_response, check_response_size_and_set_tc, parse_question, qtype, rcode,

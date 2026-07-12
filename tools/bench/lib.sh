@@ -71,13 +71,17 @@ bench_provision_tailnet() {
 
   _bench_cleanup_leftover
 
-  local name="rustscale-bench-$(date +%s)"
-  echo "[bench] creating ephemeral tailnet: $name" >&2
-  local created
-  created=$(curl -fsS --retry 5 --retry-delay 5 --retry-all-errors \
-    -X POST "$BENCH_API/api/v2/organizations/-/tailnets" \
-    -H "Authorization: Bearer $TS_ORG_TOKEN" -H 'Content-Type: application/json' \
-    -d "{\"displayName\":\"$name\"}")
+  local name created=""
+  for attempt in 1 2 3 4 5; do
+    name="rustscale-bench-$(date +%s)-$attempt"
+    echo "[bench] creating ephemeral tailnet: $name (attempt $attempt)" >&2
+    created=$(curl -fsS --retry 3 --retry-delay 3 --retry-all-errors \
+      -X POST "$BENCH_API/api/v2/organizations/-/tailnets" \
+      -H "Authorization: Bearer $TS_ORG_TOKEN" -H 'Content-Type: application/json' \
+      -d "{\"displayName\":\"$name\"}" 2>/dev/null) && break
+    echo "[bench] attempt $attempt failed, retrying..." >&2
+    sleep $((attempt * 3))
+  done
 
   BENCH_DNS=$(echo "$created" | jq -r .dnsName)
   BENCH_CHILD_CID=$(echo "$created" | jq -r .oauthClient.id)

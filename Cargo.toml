@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
-exclude = ["crates/bench-tsrs"]
+exclude = ["crates/bench-tsrs", "crates/ssh"]
 
 [workspace.package]
 edition = "2021"

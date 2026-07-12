@@ -27,6 +27,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use rustscale_health::{Severity, Tracker};
+use rustscale_ipn::{
+    validate_notify_watch_opt, IpnBackend, NotifyWatchOpt, NOTIFY_IN_PROCESS_NO_DISCONNECT,
+};
 use rustscale_magicsock::{Magicsock, PathClass};
 use rustscale_tailcfg::{DNSConfig, Node, UserID, UserProfile};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -52,6 +55,7 @@ pub(crate) struct LocalApiState {
     pub magicsock: Arc<Magicsock>,
     pub tun_mode: bool,
     pub home_derp: i32,
+    pub ipn_backend: Arc<IpnBackend>,
 }
 
 /// Result of spawning the LocalAPI server: the background task handle and
@@ -293,6 +297,7 @@ async fn dispatch<W: AsyncWrite + Unpin>(
                     "/localapi/v0/metrics",
                     "/localapi/v0/health",
                     "/localapi/v0/ping",
+                    "/localapi/v0/watch-ipn-bus",
                 ]);
                 write_json_response(conn, 200, "OK", &endpoints).await?;
             } else {
@@ -355,6 +360,11 @@ async fn dispatch<W: AsyncWrite + Unpin>(
             handle_ping(conn, &req.query).await?;
         }
 
+        // --- GET /localapi/v0/watch-ipn-bus?mask=<u64> ---
+        "watch-ipn-bus" if method == "GET" => {
+            handle_watch_ipn_bus(conn, &req.query, state).await?;
+        }
+
         _ => {
             let body = serde_json::json!({
                 "error": "not found",
@@ -377,8 +387,8 @@ async fn dispatch<W: AsyncWrite + Unpin>(
 /// # Divergences from Go ipnstate.Status
 ///
 /// - `Version`: "rustscale" instead of Go's version.Long().
-/// - `BackendState`: always "Running" when the server is up (rustscale does
-///   not implement the full IPN state machine with NoState/NeedsLogin/etc.).
+/// - `BackendState`: the live IPN state machine string (e.g. "Running",
+///   "Starting", "NeedsLogin"), not a hardcoded value.
 /// - `Self` and `Peer` entries omit fields not tracked by rustscale:
 ///   `RxBytes`, `TxBytes`, `LastHandshake`, `LastSeen`, `LastWrite`,
 ///   `AllowedIPs`, `Tags`, `PrimaryRoutes`, `Capabilities`, `CapMap`,
@@ -477,7 +487,7 @@ async fn build_status_json(state: &LocalApiState) -> serde_json::Value {
     serde_json::json!({
         "Version": "rustscale",
         "TUN": state.tun_mode,
-        "BackendState": "Running",
+        "BackendState": state.ipn_backend.state().as_str(),
         "HaveNodeKey": true,
         "TailscaleIPs": state.tailscale_ips.iter().map(std::string::ToString::to_string).collect::<Vec<_>>(),
         "Self": self_node,
@@ -744,6 +754,148 @@ async fn handle_ping<W: AsyncWrite + Unpin>(
 }
 
 // ---------------------------------------------------------------------------
+// Watch IPN Bus handler (streaming newline-delimited JSON)
+// ---------------------------------------------------------------------------
+
+/// Handle GET /localapi/v0/watch-ipn-bus?mask=<u64>
+///
+/// Streams newline-delimited JSON `Notify` messages. The first message
+/// may contain initial state (depending on the mask bits), then subsequent
+/// messages are delivered as the backend state changes.
+///
+/// The response uses connection-close delimiting (no Content-Length); the
+/// client reads JSON lines until EOF. Each line is flushed immediately.
+///
+/// # Mask validation
+///
+/// - `NotifyInProcessNoDisconnect` is rejected (only valid for in-process
+///   subscribers, not LocalAPI).
+/// - `NotifyRateLimit` combined with incompatible bits is rejected.
+///
+/// # Supported initial bits
+///
+/// - `NotifyInitialState`: includes SessionID + State in the first message.
+/// - `NotifyInitialPrefs`: includes Prefs in the first message.
+/// - `NotifyInitialStatus`: includes InitialStatus (status JSON) in the
+///   first message.
+async fn handle_watch_ipn_bus<W: AsyncWrite + Unpin>(
+    conn: &mut W,
+    query: &str,
+    state: &Arc<LocalApiState>,
+) -> Result<(), std::io::Error> {
+    use rustscale_ipn::{NOTIFY_INITIAL_PREFS, NOTIFY_INITIAL_STATE, NOTIFY_INITIAL_STATUS};
+
+    let params = parse_query(query);
+
+    // Parse and validate the mask.
+    let mask: NotifyWatchOpt = match params.get("mask") {
+        Some(s) if !s.is_empty() => {
+            if let Ok(v) = s.parse::<u64>() {
+                v
+            } else {
+                let body = serde_json::json!({"error": "bad mask"});
+                write_json_response(conn, 400, "Bad Request", &body).await?;
+                return Ok(());
+            }
+        }
+        _ => 0,
+    };
+
+    if mask & NOTIFY_IN_PROCESS_NO_DISCONNECT != 0 {
+        let body = serde_json::json!({
+            "error": "NotifyInProcessNoDisconnect is only valid for in-process IPN bus subscribers"
+        });
+        write_json_response(conn, 400, "Bad Request", &body).await?;
+        return Ok(());
+    }
+
+    if let Err(e) = validate_notify_watch_opt(mask) {
+        let body = serde_json::json!({"error": e});
+        write_json_response(conn, 400, "Bad Request", &body).await?;
+        return Ok(());
+    }
+
+    // Generate a session ID (hex string, like Go's rands.HexString(16)).
+    let session_id = generate_session_id();
+
+    // Build and send the initial Notify message if any initial bits are set.
+    let has_initial =
+        mask & (NOTIFY_INITIAL_STATE | NOTIFY_INITIAL_PREFS | NOTIFY_INITIAL_STATUS) != 0;
+
+    // Write the HTTP response header (streaming, connection-close delimited).
+    let header = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n";
+    conn.write_all(header.as_bytes()).await?;
+    conn.flush().await?;
+
+    if has_initial {
+        // Build initial status if requested.
+        let initial_status = if mask & NOTIFY_INITIAL_STATUS != 0 {
+            Some(build_status_json(state).await)
+        } else {
+            None
+        };
+
+        // Build initial prefs if requested.
+        let initial_prefs = if mask & NOTIFY_INITIAL_PREFS != 0 {
+            Some(state.prefs.clone())
+        } else {
+            None
+        };
+
+        let notify = state.ipn_backend.build_initial_notify(
+            mask,
+            &session_id,
+            initial_status,
+            initial_prefs,
+        );
+
+        let line = serde_json::to_vec(&notify).unwrap_or_default();
+        conn.write_all(&line).await?;
+        conn.write_all(b"\n").await?;
+        conn.flush().await?;
+    }
+
+    // Subscribe to the bus and stream subsequent messages.
+    let mut rx = state.ipn_backend.bus().subscribe();
+
+    loop {
+        match rx.recv().await {
+            Some(Ok(notify)) => {
+                let line = serde_json::to_vec(&notify).unwrap_or_default();
+                conn.write_all(&line).await?;
+                conn.write_all(b"\n").await?;
+                conn.flush().await?;
+            }
+            Some(Err(_)) => {
+                // Subscriber fell behind (Lagged); skip and continue.
+                continue;
+            }
+            None => {
+                // Bus shut down (all senders dropped). End the stream.
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Generate a random hex session ID (16 bytes = 32 hex chars), matching
+/// Go's `rands.HexString(16)`.
+fn generate_session_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    // Simple non-cryptographic session ID: timestamp + counter.
+    // This is sufficient for local IPC session identification.
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let ctr = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{ts:016x}{ctr:016x}")
+}
+
+// ---------------------------------------------------------------------------
 // Default socket path
 // ---------------------------------------------------------------------------
 
@@ -765,7 +917,8 @@ mod tests {
     use rustscale_tailcfg::{Node, UserProfile};
     use tokio::io::AsyncWriteExt;
 
-    /// Build a test LocalApiState with mock data.
+    /// Build a test LocalApiState with mock data. The IPN backend is
+    /// initialized to the Running state to match the pre-IPN behavior.
     async fn make_test_state() -> Arc<LocalApiState> {
         let node_key = NodePrivate::generate();
         let disco_key = DiscoPrivate::generate();
@@ -812,6 +965,16 @@ mod tests {
             },
         );
 
+        // Initialize the IPN backend to Running, matching the pre-IPN
+        // behavior where status always reported "Running".
+        let ipn_backend = Arc::new(rustscale_ipn::IpnBackend::new("rustscale"));
+        ipn_backend.set_want_running();
+        ipn_backend.set_has_node_key(true);
+        ipn_backend.set_machine_authorized(true);
+        ipn_backend.set_netmap_present(true);
+        ipn_backend.set_engine_status(1, 1);
+        assert_eq!(ipn_backend.state(), rustscale_ipn::State::Running);
+
         Arc::new(LocalApiState {
             peers,
             user_profiles: Arc::new(RwLock::new(profiles)),
@@ -825,6 +988,7 @@ mod tests {
             magicsock,
             tun_mode: false,
             home_derp: 0,
+            ipn_backend,
         })
     }
 
@@ -1164,5 +1328,246 @@ mod tests {
         assert!(json["Peer"].is_object());
         assert!(json["Health"].is_array());
         assert!(json["CurrentTailnet"].is_object());
+    }
+
+    // --- watch-ipn-bus tests ---
+
+    #[tokio::test]
+    async fn test_watch_ipn_bus_bad_mask_returns_400() {
+        let state = make_test_state().await;
+        let resp = send_request_to_state(
+            b"GET /localapi/v0/watch-ipn-bus?mask=abc HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            &state,
+        )
+        .await;
+        assert!(resp.contains("400 Bad Request"));
+        assert!(resp.contains("bad mask"));
+    }
+
+    #[tokio::test]
+    async fn test_watch_ipn_bus_rejects_in_process_no_disconnect() {
+        let state = make_test_state().await;
+        // NotifyInProcessNoDisconnect = 1 << 16 = 65536
+        let resp = send_request_to_state(
+            b"GET /localapi/v0/watch-ipn-bus?mask=65536 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            &state,
+        )
+        .await;
+        assert!(resp.contains("400 Bad Request"));
+        assert!(resp.contains("NotifyInProcessNoDisconnect"));
+    }
+
+    #[tokio::test]
+    async fn test_watch_ipn_bus_initial_state_message() {
+        // Test over a real Unix socket: connect, send the request, read
+        // the initial state notify as a JSON line, then close.
+        use tokio::io::AsyncReadExt;
+        use tokio::net::UnixStream;
+
+        let state = make_test_state().await;
+        let tmp = std::env::temp_dir().join(format!(
+            "rustscale-watch-ipn-test-{}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+        let handle = spawn_localapi(state.clone(), tmp.clone());
+        assert!(handle.is_some());
+
+        // Connect and send the request with NotifyInitialState mask (1 << 1 = 2).
+        let mut stream = UnixStream::connect(&tmp).await.expect("connect");
+        let req = b"GET /localapi/v0/watch-ipn-bus?mask=2 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+        stream.write_all(req).await.unwrap();
+        stream.flush().await.unwrap();
+
+        // Read the response. The initial notify should arrive quickly.
+        let mut buf = vec![0u8; 8192];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(2), stream.read(&mut buf))
+            .await
+            .expect("timed out reading initial notify")
+            .expect("read");
+
+        let resp = String::from_utf8_lossy(&buf[..n]);
+
+        // Should be 200 OK with the initial state notify as a JSON line.
+        assert!(resp.contains("200 OK"), "response: {resp}");
+        assert!(resp.contains("Content-Type: application/json"));
+
+        // The body should contain a JSON line with State and SessionID.
+        // Find the body (after \r\n\r\n).
+        let body = resp.split("\r\n\r\n").nth(1).unwrap_or("");
+        let first_line = body.lines().next().unwrap_or("");
+        let notify: serde_json::Value =
+            serde_json::from_str(first_line).expect("parse notify JSON");
+
+        // With NotifyInitialState, the first message should have:
+        // - Version: "rustscale"
+        // - SessionID: non-empty string
+        // - State: 6 (Running, since test state is initialized to Running)
+        assert_eq!(notify["Version"], "rustscale");
+        assert!(notify["SessionID"].is_string());
+        assert!(!notify["SessionID"].as_str().unwrap().is_empty());
+        assert_eq!(notify["State"], 6); // Running
+
+        // Clean up.
+        if let Some(h) = handle {
+            h.task.abort();
+        }
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_watch_ipn_bus_transition_notify() {
+        // Test that a state transition produces a second JSON line.
+        // Connects over a real Unix socket to the LocalAPI server.
+        use tokio::io::AsyncReadExt;
+        use tokio::net::UnixStream;
+
+        let state = make_test_state().await;
+        let tmp = std::env::temp_dir().join(format!(
+            "rustscale-watch-ipn-trans-{}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+        let handle = spawn_localapi(state.clone(), tmp.clone());
+        assert!(handle.is_some());
+
+        // Connect with NotifyInitialState mask (1 << 1 = 2).
+        let mut stream = UnixStream::connect(&tmp).await.expect("connect");
+        let req = b"GET /localapi/v0/watch-ipn-bus?mask=2 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+        stream.write_all(req).await.unwrap();
+        stream.flush().await.unwrap();
+
+        // Read the initial notify.
+        let mut buf = vec![0u8; 8192];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(2), stream.read(&mut buf))
+            .await
+            .expect("timed out reading initial notify")
+            .expect("read");
+
+        let resp = String::from_utf8_lossy(&buf[..n]);
+        assert!(resp.contains("200 OK"));
+
+        // Parse the initial notify from the body.
+        let body = resp.split("\r\n\r\n").nth(1).unwrap_or("");
+        let first_line = body.lines().next().unwrap_or("");
+        let initial: serde_json::Value = serde_json::from_str(first_line).expect("parse initial");
+        assert_eq!(initial["State"], 6); // Running
+
+        // Trigger a state transition: set key_expired=true which
+        // transitions from Running to NeedsLogin (per the truth table).
+        state.ipn_backend.set_key_expired(true);
+        assert_eq!(state.ipn_backend.state(), rustscale_ipn::State::NeedsLogin);
+
+        // Read the transition notify.
+        let mut buf2 = vec![0u8; 8192];
+        let n2 = tokio::time::timeout(std::time::Duration::from_secs(2), stream.read(&mut buf2))
+            .await
+            .expect("timed out reading transition notify")
+            .expect("read");
+
+        let transition = String::from_utf8_lossy(&buf2[..n2]);
+        let transition_line = transition.trim();
+        let transition_notify: serde_json::Value =
+            serde_json::from_str(transition_line).expect("parse transition notify");
+
+        // The transition notify should have State: 2 (NeedsLogin) and no SessionID.
+        assert_eq!(transition_notify["State"], 2); // NeedsLogin
+        assert!(
+            transition_notify.get("SessionID").is_none()
+                || transition_notify["SessionID"].is_null()
+        );
+
+        if let Some(h) = handle {
+            h.task.abort();
+        }
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_watch_ipn_bus_no_initial_without_mask() {
+        // Without NotifyInitialState, the first message should not have State.
+        // With mask=0, the handler sends only the HTTP headers and then
+        // waits for bus messages.
+        use tokio::io::AsyncReadExt;
+        use tokio::net::UnixStream;
+
+        let state = make_test_state().await;
+        let tmp = std::env::temp_dir().join(format!(
+            "rustscale-watch-ipn-noinit-{}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+        let handle = spawn_localapi(state.clone(), tmp.clone());
+        assert!(handle.is_some());
+
+        let mut stream = UnixStream::connect(&tmp).await.expect("connect");
+        let req = b"GET /localapi/v0/watch-ipn-bus?mask=0 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+        stream.write_all(req).await.unwrap();
+        stream.flush().await.unwrap();
+
+        // Give the handler time to write headers and subscribe to the bus.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Emit a notify so the handler sends something.
+        state.ipn_backend.emit_err_message("test error");
+
+        // Read the response — may take multiple reads since the error
+        // notify arrives after the headers.
+        let mut all = Vec::new();
+        let mut buf = vec![0u8; 8192];
+        loop {
+            let n = tokio::time::timeout(std::time::Duration::from_secs(2), stream.read(&mut buf))
+                .await
+                .expect("timed out")
+                .expect("read");
+            if n == 0 {
+                break;
+            }
+            all.extend_from_slice(&buf[..n]);
+            // Check if we have a complete JSON line in the body.
+            let resp = String::from_utf8_lossy(&all);
+            if let Some(body) = resp.split("\r\n\r\n").nth(1) {
+                if !body.lines().next().unwrap_or("").is_empty() {
+                    break;
+                }
+            }
+        }
+
+        let resp = String::from_utf8_lossy(&all);
+        assert!(resp.contains("200 OK"));
+        assert!(resp.contains("Content-Type: application/json"));
+
+        // The body should contain the error notify (no initial state notify).
+        let body = resp.split("\r\n\r\n").nth(1).unwrap_or("");
+        let first_line = body.lines().next().unwrap_or("");
+        assert!(!first_line.is_empty(), "body should have a JSON line");
+        let notify: serde_json::Value = serde_json::from_str(first_line).expect("parse notify");
+        assert_eq!(notify["ErrMessage"], "test error");
+        // No State field (no initial state notify was sent).
+        assert!(notify.get("State").is_none() || notify["State"].is_null());
+
+        if let Some(h) = handle {
+            h.task.abort();
+        }
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_status_reports_live_backend_state() {
+        // Verify that build_status_json reports the live IPN state, not
+        // a hardcoded "Running".
+        let state = make_test_state().await;
+
+        // The test state initializes to Running.
+        let json = build_status_json(&state).await;
+        assert_eq!(json["BackendState"], "Running");
+
+        // Transition to NeedsLogin by setting key_expired=true.
+        // Per the truth table, Running → NeedsLogin when key_expired.
+        state.ipn_backend.set_key_expired(true);
+        assert_eq!(state.ipn_backend.state(), rustscale_ipn::State::NeedsLogin);
+
+        let json = build_status_json(&state).await;
+        assert_eq!(json["BackendState"], "NeedsLogin");
     }
 }

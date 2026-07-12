@@ -16,6 +16,7 @@ update statuses as phases land.
 | Network monitor (netmon) | `net/netmon/` | ✅ port-3 done (AF_ROUTE on macOS, polling fallback; State, ChangeDelta, major/minor change detection, wall-time jump; wired into magicsock link_changed + tsnet endpoint-update push) |
 | Port mapping (NAT-PMP/PCP/UPnP) | `net/portmapper/` | ✅ port-4 done (`crates/portmapper`: Client facade with probe/create/renew/cache lifecycle; PMP/PCP byte-exact packet codec with RFC test vectors; UPnP SSDP M-SEARCH discovery + root-desc XML parse + AddPortMapping/DeletePortMapping/GetExternalIPAddress SOAP; fake IGD tests for all three protocols; magicsock publishes portmap endpoint best-effort alongside local/STUN endpoints; netcheck Report gains portmap capability booleans) |
 | Health tracking | `health/` | ✅ port-7: crates/health Tracker + watchdog, wired control/DERP/certs/netmon, ServerStatus.health + FFI |
+| IPN state machine + notify bus | `ipn/backend.go`, `ipn/ipnlocal/local.go` | ✅ phase-ipn-bus: `crates/ipn` (State enum serde-as-integer matching Go, Notify PascalCase JSON with omitted None, NotifyWatchOpt bitflags with explicit values, EngineStatus); StateMachine ports `nextStateLocked` truth table (table-driven tests); IpnBackend holds state+inputs+bus, emits Notify{State} on transitions, BrowseToURL on auth URL, LoginFinished on register success, ErrMessage on errors; NotifyBus broadcast channel (tokio::sync::broadcast, 128-capacity); `GET /localapi/v0/watch-ipn-bus?mask=` streaming newline-delimited JSON with per-message flush (connection-close delimited); status JSON reports live BackendState string |
 
 ## Tier 2: Production features
 
@@ -24,7 +25,7 @@ update statuses as phases land.
 | Serve/Funnel (ListenFunnel, ServeConfig, TCP fwd, reverse proxy) | `tsnet`, `ipn/serve*` | ✅ port-6 done (ServeConfig serde model: TCPPortHandler/WebServerConfig/HTTPHandler; Server::set_serve_config starts netstack listeners per port; TCP forward via copy_bidirectional; HTTP reverse proxy sets Host/X-Forwarded-For/Tailscale-User-Login/Name from WhoIs; static text handler; TLS-terminate with ControlCertProvider (self-signed fallback); listen_funnel validates port 443/8443/10000 + funnel node attr from netmap, returns typed FunnelError::NotEnabled on API-only tailnets; ts_serve_tcp FFI. Remaining: ingress peer Tailscale-Ingress-Target dispatch, Hostinfo.IngressEnabled advertisement) |
 | Tailscale Services (ListenService, PROXY protocol) | `tsnet.Server.ListenService` | ⬜ |
 | SOCKS5 proxy | `net/socks5/` | ✅ port-8: RFC 1928 CONNECT (v4/domain/v6), dials via shared tsnet resolve path, FFI; e2e green |
-| LocalAPI | `ipn/localapi/` | ✅ port-9: full LocalAPI HTTP server on safesocket (status, whois, prefs, netmap, metrics, health, ping); daemon wires safesocket::listen → spawn_localapi; integration test proves GET /localapi/v0/status + /health over safesocket::connect returns 200 with valid JSON |
+| LocalAPI | `ipn/localapi/` | ✅ port-9 + phase-ipn-bus: full LocalAPI HTTP server on safesocket (status, whois, prefs, netmap, metrics, health, ping, watch-ipn-bus); status reports live BackendState; daemon wires safesocket::listen → spawn_localapi; integration test proves GET /localapi/v0/status + /health over safesocket::connect returns 200 with valid JSON; watch-ipn-bus streams newline-delimited Notify JSON with mask validation + initial-state messages |
 | Auto-update / ClientVersion | — | ⬜ |
 | Multi-profile/login management | `ipn/ipnlocal/profiles.go` | ⬜ (single profile only) |
 
@@ -45,6 +46,62 @@ P3 status: hostinfo darwin ✅ phase-40 (OSVersion via kern.osproductversion,
 DeviceModel via hw.model sysctlbyname) · quarantine xattr ✅ phase-40
 (`crates/quarantine`, Go-format com.apple.quarantine value; Taildrop will
 consume it) · peermtu darwin (no-op in Go too) ⬜ · sockstats ⬜.
+
+## Tier 2.5: Client infrastructure (Go packages not previously tracked)
+
+| Package | Go source | Rust status |
+| --- | --- | --- |
+| Tailscale IP addr helpers | `net/tsaddr/` | 🔶 partially inlined in `dns` + `tsnet/routing`; no dedicated crate |
+| Outbound dial abstraction | `net/tsdial/` | ⬜ baked ad-hoc into netstack; no standalone module for PeerAPI/DoH/DNS-map routing |
+| Localhost port proxy map | `net/proxymap/` | ⬜ ephemeral localhost->remote IP port mapping for proxied conns |
+| HTTP CONNECT proxy | `net/connectproxy/` | ⬜ needed for outbound proxy support |
+| HTTP proxy env detection | `net/tshttpproxy/` | ⬜ cross-platform proxy auto-detection (PAC/WPAD/registry) |
+| Embedded TLS roots fallback | `net/bakedroots/` | ⬜ container/minimal-Linux control-plane cert validation |
+| OS-level route management | `wgengine/router/` | ⬜ TUN mode uses ad-hoc route(8) calls; Go has clean interface + 4 platform impls |
+| LocalAPI authorization | `ipn/ipnauth/` | ⬜ who-can-do-what on LocalAPI (unix peer creds, Windows ACLs) |
+| IPN audit logging | `ipn/auditlog/` | ⬜ JSON audit trail for sensitive operations |
+| Service policy | `ipn/policy/` | ⬜ which services to advertise (Serve/Funnel peer discovery) |
+| Config file format | `ipn/conffile/` | ⬜ HUP-reloadable JSON config for daemon |
+| IPN extension system | `ipn/ipnext/` | ⬜ LocalBackend plugin architecture |
+| Cloud log shipping | `logtail/` | ⬜ uploads to log.tailscale.com |
+| Port enumeration | `portlist/` | ⬜ firewall diagnostics / listening-port scan |
+| Network flow logging | `wgengine/netlog/` | ⬜ TUN traffic logging → network flow logs |
+| Network error classification | `net/neterror/` | ⬜ retry-loops benefit from typed error reasons |
+| Network traffic steering | `net/traffic/` | ⬜ hash-based exit-node selection for split-DNS |
+| Subnet route health check | `net/routecheck/` | ⬜ exit-node/subnet-router diagnostics |
+| Captive portal detection | `net/captivedetection/` | 🔶 Report field exists, no detection loop |
+| ICMP ping | `net/ping/` | ⬜ |
+| Socket statistics | `net/sockstats/` | ⬜ |
+| In-memory test net | `net/memnet/` | ⬜ test infrastructure — in-memory net.Conn/Listener |
+| Event bus (in progress) | `util/eventbus/` | 🚧 phase-ipn-bus covers this via broadcast channel |
+| Client metrics | `util/clientmetric/` | ⬜ expvar-style counters; exposed by LocalAPI /metrics |
+| Deep hash / change detection | `util/deephash/` | ⬜ Go uses for netmap change-detect; Rust PartialEq suffices mostly |
+| Singleflight | `util/singleflight/` | ⬜ in-flight request dedup (control client reconnect) |
+| LRU cache | `util/lru/` | ⬜ |
+| Rate limiter | `util/limiter/` | ⬜ |
+| Ring buffer logger | `util/ringlog/` | ⬜ tail-buffered log for diagnostics |
+| Dependency injection / tsd | `tsd/` | ⬜ global subsystem registry pattern |
+| Feature gate system | `feature/` | ⬜ Rust `cfg!()` handles compile-time; runtime feature flags ⬜ |
+| Safe atomic file writes | `atomicfile/` | ⬜ write-temp+rename, used by EVERY state persistence path |
+| Metrics registry | `metrics/` | ⬜ expvar-style counters/gauges exposed by LocalAPI /metrics |
+| File path constants | `paths/` | ⬜ central config/log/state dir paths for daemon |
+| Status/PeerStatus model | `ipn/ipnstate/` | ⬜ data model queried by LocalAPI /status (860 lines) |
+| State persistence abstraction | `ipn/store/` | ⬜ MemStore/FileStore for prefs and state (562 lines) |
+| IPN server actor loop | `ipn/ipnserver/` | ⬜ orchestrates LocalBackend lifecycle, reconnect backoff, login flows (7 files) |
+| TSP protocol (alt control) | `control/tsp/` | ⬜ alternative control protocol alongside ts2021 (1.4k lines) |
+| Log policy / logtail setup | `logpolicy/` | ⬜ log dir setup, rotation, logtail stream config (1.1k lines) |
+| Packet parsing (headers) | `net/packet/` | ⬜ IP/TCP/UDP/ICMP/Geneve header parse+marshal (17 files) |
+| DNS name utilities | `util/dnsname/` | ⬜ FQDN formatting, DNS label validation (570 lines) |
+| TLS dial config | `net/tlsdial/` | ⬜ custom tls.Config for control-plane Noise-over-HTTP |
+| Network utility functions | `net/netutil/` | ⬜ interface helpers, multicast check, proxy protocol detection |
+| Socket options | `net/sockopts/` | ⬜ platform-aware socket buffer tuning, SO_MARK, SO_BINDTODEVICE |
+| TCP connection table | `net/netstat/` | ⬜ OS-level TCP connection enumeration |
+| TCP keepalive timeout | `net/ktimeout/` | ⬜ per-platform TCP keepalive configuration |
+| Speedtest protocol | `net/speedtest/` | ⬜ tailscale speedtest client+server |
+| Desktop integration | `ipn/desktop/` | ⬜ Windows session change / macOS extension support |
+| Alternative routing table | `net/art/` | ⬜ Adaptive Radix Tree for IP route lookups (2.6k lines) |
+| BIRD routing client | `chirp/` | ⬜ BIRD Internet Routing Daemon client |
+| Cloud env detection | `util/cloudenv/` | ⬜ AWS/GCP/Azure detection for NAT/connectivity |
 
 ## Tier 3: Specialized
 
@@ -90,8 +147,8 @@ side). Roadmap tail.
 Wire types/keys/disco/DERP client/netcheck (STUN) · ts2021 Noise control
 client (HTTP/2-over-Noise, streaming netmap deltas) · magicsock
 (direct/DERP path selection, cross-region routing, reply-to-arrival-region;
-peer-relay client is 🔶 partial — geneve codec + handshake types exist but
-no relayManager loop, see docs/phase-peer-relay.md gap table)
+peer-relay client ✅ — full relayManager loop (1.5k loc event loop, alloc work,
+handshake work, disco message routing, call-me-maybe via relay)
 · WireGuard data plane (boringtun) · userspace netstack (smoltcp,
 event-driven) · packet filter (incl. stateful UDP) · subnet routing
 (advertise/accept/forward) · TUN mode (macOS utun, Linux untested) · tsnet

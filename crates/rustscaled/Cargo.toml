@@ -1,0 +1,20 @@
+[package]
+name = "rustscale-rustscaled"
+description = "rustscale daemon binary with macOS launchd install/uninstall"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "rustscaled"
+path = "src/main.rs"
+
+[dependencies]
+rustscale-tsnet = { path = "../tsnet", version = "0.1.0" }
+rustscale-safesocket = { path = "../safesocket", version = "0.1.0" }
+tokio.workspace = true
+thiserror.workspace = true

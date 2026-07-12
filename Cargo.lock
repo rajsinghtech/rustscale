@@ -1453,6 +1453,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustscale-rustscaled"
+version = "0.1.0"
+dependencies = [
+ "rustscale-safesocket",
+ "rustscale-tsnet",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
 name = "rustscale-safesocket"
 version = "0.1.0"
 dependencies = [

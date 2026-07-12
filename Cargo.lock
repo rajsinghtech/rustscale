@@ -1892,6 +1892,7 @@ dependencies = [
 name = "rustscale-cli"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "base64",
  "crc32fast",
  "flate2",

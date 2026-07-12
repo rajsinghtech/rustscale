@@ -143,7 +143,7 @@ component-logging/goroutines/sockstats; only /debug/pprof/* remains 501 —
 no Rust pprof) ·
 Netmap disk cache (offline startup) (✅ phase-22: versioned envelope,
 SHA-256 write dedup, save per MapResponse, clear on auth failure/key
-expiry; Go columnar store layout not replicated — single-blob by design) · Web client UI ·
+expiry; Go columnar store layout not replicated — single-blob by design) · Web client UI (✅ phase-cli-ssh-web: `rustscale web` minimal management UI — embedded single-file HTML with inline JS+fetch, /api/status + /api/up + /api/down + /api/logout handlers, loopback-only binding with --unsafe-any-addr override, --readonly mode; NOT a port of Go's React app) ·
 BIRD routing · Linux
 ipset · envknob · version package · Freedesktop/DBus · System tray. All ⬜
 unless noted. Control knobs (`control/controlknobs/`) ✅ phase-17
@@ -253,11 +253,12 @@ state-dir fallback probing), `--json`.
 | `logout` | `cli/logout.go` | ✅ phase-interactive-auth: POST /logout |
 | `set` | `cli/set.go` | ✅ phase-interactive-auth: EditPrefs via PATCH /prefs from --hostname, --accept-routes, --accept-dns, --shields-up, --advertise-routes, --advertise-exit-node, --exit-node flags |
 | `get` | `cli/prefs.go` | ✅ phase-interactive-auth: GET /prefs, JSON or human-readable |
-| `wait`/`switch` | `cli/wait.go` | ⬜ next phase |
-| `serve`/`funnel` | `cli/serve.go` | ⬜ |
+| `wait`/`switch` | `cli/wait.go` | 🔶 `switch` ✅ phase-serve-cli-profiles: `rustscale switch [--list] [--json] [<profile>]`; `wait` ⬜ |
+| `serve`/`funnel` | `cli/serve.go` | ✅ port-6 + phase-serve-cli-profiles: `rustscale serve [--bg] [--https|--http|--tcp|--tls-terminated-tcp=<port>] [--set-path <path>] <target>`, `serve status [--json]`, `serve reset`; `rustscale funnel` variants (AllowFunnel + port validation); foreground mode errors "not yet supported" without --bg |
 | `cert` | `cli/cert.go` | ✅ phase-cli-cert-qr: `rustscale cert [--cert-file] [--key-file] [--min-validity] <domain>`; writes files (`-`=stdout); no-domain prints cert domain from status (CertDomains); LocalAPI `GET /cert/<domain>?type=pair|cert|key&min_validity=`; localclient `cert_pair`/`cert`/`cert_key`; reuses existing ACME/ControlCertProvider cache |
-| `file` | `cli/file.go` | ⬜ |
-| `ssh` | `cli/ssh.go` | ⬜ |
+| `file` | `cli/file.go` | ✅ phase-taildrop: `file cp [--name] [--verbose] [--targets] <files...> <target>:`; `file get [--wait] [--conflict=skip|overwrite|rename] [--verbose] <dir>`; LocalAPI file-put/files/file-targets endpoints |
+| `ssh` | `cli/ssh.go` | ✅ phase-cli-ssh-web: `rustscale ssh [user@]host [args...]`; resolves host against status peers (short name/FQDN/IP); execs system ssh with `-o HostName <resolved-ip>` + known_hosts trust options when peer advertises SSH_HostKeys; unix execvp, Windows "not supported"; 29 argv-construction unit tests |
+| `web` | `cli/web.go` | ✅ phase-cli-ssh-web: `rustscale web [--listen <addr>] [--readonly] [--unsafe-any-addr]`; embedded single-file HTML (inline JS+fetch); handlers: GET /api/status, POST /api/up, /api/down, /api/logout; loopback-only by default; LocalApi trait with stub-based handler tests; 23 unit tests |
 | `debug` | `cli/debug.go` | ⬜ |
 | `exit-node` | `cli/exitnode.go` | ⬜ |
 | `drive` | `cli/drive.go` | ⬜ |

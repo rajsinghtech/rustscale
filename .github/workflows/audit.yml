@@ -1,0 +1,42 @@
+name: Audit
+
+# Security advisory + license/ban checks.
+# Runs weekly, on PRs touching Cargo.lock or deny.toml, and on manual trigger.
+
+on:
+  schedule:
+    - cron: '0 0 * * 0' # weekly Sunday 00:00 UTC
+  pull_request:
+    paths:
+      - 'Cargo.lock'
+      - 'deny.toml'
+      - '.github/workflows/audit.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  audit:
+    name: cargo-audit + cargo-deny
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+
+      - name: cargo audit (RUSTSEC advisories)
+        run: cargo audit
+
+      - name: cargo deny check (licenses + bans + advisories)
+        run: cargo deny check

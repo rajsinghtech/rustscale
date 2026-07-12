@@ -1,0 +1,204 @@
+name: Release
+
+# Build and publish release artifacts on tag push (v*).
+# Produces:
+#   - macOS universal bundle (lipo'd librustscale.dylib + .a + rustscale.h)
+#   - Linux per-target bundles (gnu x86_64/aarch64, musl x86_64)
+#   - SHA256SUMS checksum file
+#   - GitHub Release with all artifacts attached
+#
+# Binary crates (e.g. rustscaled) are not built yet — add the package name to
+# BIN_PKGS below when they land and the workflow picks them up automatically.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write # create release + upload assets
+
+env:
+  CARGO_TERM_COLOR: always
+  # Space-separated list of binary crate package names to build + lipo.
+  # Add "rustscaled" here when crates/rustscaled lands.
+  BIN_PKGS: ''
+
+jobs:
+  # -------------------------------------------------------------------------
+  # macOS: universal binary (aarch64 + x86_64 lipo'd)
+  # -------------------------------------------------------------------------
+  macos:
+    name: macOS universal
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0 # full history for git describe version stamping
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build FFI (both architectures)
+        run: |
+          cargo build -p rustscale-ffi --release --target aarch64-apple-darwin
+          cargo build -p rustscale-ffi --release --target x86_64-apple-darwin
+
+      - name: Build binary crates (both architectures)
+        if: env.BIN_PKGS != ''
+        run: |
+          for pkg in $BIN_PKGS; do
+            cargo build -p "$pkg" --release --target aarch64-apple-darwin
+            cargo build -p "$pkg" --release --target x86_64-apple-darwin
+          done
+
+      - name: Generate C header
+        run: bash tools/gen-header.sh
+
+      - name: Lipo universal libraries + binaries
+        run: |
+          mkdir -p dist
+          lipo -create \
+            target/aarch64-apple-darwin/release/librustscale.dylib \
+            target/x86_64-apple-darwin/release/librustscale.dylib \
+            -output dist/librustscale.dylib
+          lipo -create \
+            target/aarch64-apple-darwin/release/librustscale.a \
+            target/x86_64-apple-darwin/release/librustscale.a \
+            -output dist/librustscale.a
+          for pkg in $BIN_PKGS; do
+            lipo -create \
+              "target/aarch64-apple-darwin/release/$pkg" \
+              "target/x86_64-apple-darwin/release/$pkg" \
+              -output "dist/$pkg"
+          done
+
+      - name: Bundle
+        run: |
+          cp include/rustscale.h dist/
+          tar czf rustscale-universal-apple-darwin.tar.gz -C dist .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rustscale-universal-apple-darwin
+          path: rustscale-universal-apple-darwin.tar.gz
+          retention-days: 14
+
+  # -------------------------------------------------------------------------
+  # Linux: per-target bundles (gnu x86_64/aarch64, musl x86_64)
+  # -------------------------------------------------------------------------
+  linux:
+    name: Linux ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            cross: false
+            musl: false
+          - target: aarch64-unknown-linux-gnu
+            cross: true
+            musl: false
+          - target: x86_64-unknown-linux-musl
+            cross: false
+            musl: true
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install aarch64 cross-compiler
+        if: matrix.cross
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Install musl toolchain
+        if: matrix.musl
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Build FFI
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
+        run: cargo build -p rustscale-ffi --release --target ${{ matrix.target }}
+
+      - name: Build binary crates
+        if: env.BIN_PKGS != ''
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
+        run: |
+          for pkg in $BIN_PKGS; do
+            cargo build -p "$pkg" --release --target ${{ matrix.target }}
+          done
+
+      - name: Verify C header
+        run: |
+          test -f include/rustscale.h || { echo "header not generated"; exit 1; }
+
+      - name: Bundle
+        run: |
+          set -e
+          mkdir -p dist
+          libdir="target/${{ matrix.target }}/release"
+          # cdylib: .so on Linux (gnu + musl)
+          cp "$libdir/librustscale.so" dist/ 2>/dev/null || true
+          cp "$libdir/librustscale.a" dist/
+          cp include/rustscale.h dist/
+          for pkg in $BIN_PKGS; do
+            cp "$libdir/$pkg" dist/ 2>/dev/null || true
+          done
+          tar czf rustscale-${{ matrix.target }}.tar.gz -C dist .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rustscale-${{ matrix.target }}
+          path: rustscale-${{ matrix.target }}.tar.gz
+          retention-days: 14
+
+  # -------------------------------------------------------------------------
+  # Checksums + GitHub Release
+  # -------------------------------------------------------------------------
+  release:
+    name: Checksums + GitHub Release
+    needs: [macos, linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect artifacts + compute checksums
+        run: |
+          mkdir -p release
+          find artifacts -name '*.tar.gz' -exec cp {} release/ \;
+          cd release
+          sha256sum *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}

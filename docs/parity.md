@@ -92,6 +92,24 @@ test nullifying each field. Full plan: docs/testcontrol-plan.md
 (remaining: Phase B integration scenarios, Phase D UDP impairment shim,
 Go-testcontrol interop harness).
 
+## Release pipeline
+
+`release.yml` ✅ phase-38: tag-triggered (`v*`) multi-platform build. macOS
+job builds aarch64 + x86_64, lipos universal `librustscale.dylib` + `.a`,
+regenerates `include/rustscale.h` via `tools/gen-header.sh`, and bundles a
+single `rustscale-universal-apple-darwin.tar.gz`. Linux job matrix builds
+x86_64-gnu, aarch64-gnu (cross-compiled via `gcc-aarch64-linux-gnu`), and
+x86_64-musl (static via `musl-gcc`), each producing a per-target tar.gz.
+Checksums job downloads all artifacts, computes `SHA256SUMS`, and creates the
+GitHub Release via `softprops/action-gh-release`. Binary crates (e.g.
+`rustscaled`) are wired via a `BIN_PKGS` env var — add the package name and
+the workflow builds + lipos it automatically. `audit.yml` ✅ phase-38: weekly
+`cargo-audit` (RUSTSEC) + `cargo-deny` (licenses/bans/advisories), also on PRs
+touching `Cargo.lock` or `deny.toml`. Version stamping via
+`crates/ffi/build.rs` (`git describe --tags --long --always --dirty` →
+`RUSTSCALE_VERSION_LONG`, fallback `CARGO_PKG_VERSION`), exposed through
+`ts_version()` FFI and `tools/version.sh`.
+
 ## Cross-client interop verification
 
 `tools/interop.sh` runs 8 e2e tests against real Go tailscaled (1.98.8,

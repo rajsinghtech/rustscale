@@ -327,10 +327,7 @@ fn uname() -> Result<String, std::io::Error> {
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
     } else {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "uname failed",
-        ))
+        Err(std::io::Error::other("uname failed"))
     }
 }
 
@@ -490,7 +487,7 @@ fn container_detection() -> OptBool {
                 return OptBool::True;
             }
         }
-        return OptBool::False;
+        OptBool::False
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -699,7 +696,7 @@ fn desktop_detection() -> OptBool {
             let has_desktop = desktop_from_unix_socks(&content);
             return OptBool::new(has_desktop);
         }
-        return OptBool::Unset;
+        OptBool::Unset
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -850,7 +847,7 @@ pub fn disabled_etc_apt_source() -> bool {
         let Ok(mtime) = meta.modified() else {
             return false;
         };
-        if meta.file_type().is_file() == false {
+        if !meta.file_type().is_file() {
             return false;
         }
         let Ok(content) = fs::read_to_string(PATH) else {

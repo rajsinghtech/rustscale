@@ -100,8 +100,16 @@ enum Command {
     },
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .event_interval(1)
+        .build()
+        .unwrap();
+    runtime.block_on(async_main());
+}
+
+async fn async_main() {
     let cli = Cli::parse();
     let json = cli.json;
     let result = match cli.command {

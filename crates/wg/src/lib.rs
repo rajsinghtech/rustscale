@@ -20,9 +20,6 @@ use rustscale_key::{NodePrivate, NodePublic};
 /// Maximum WireGuard message size (header + payload).
 const MAX_WG_MSG: usize = 65_536;
 
-/// Minimum dst buffer per boringtun's contract: `src.len() + 32`, at least 148.
-const MIN_DST: usize = 148;
-
 /// Errors from the WireGuard tunnel wrapper.
 #[derive(Debug, thiserror::Error)]
 pub enum WgError {
@@ -47,6 +44,8 @@ pub struct DecapResult {
 /// A per-peer WireGuard tunnel wrapping `boringtun::noise::Tunn`.
 pub struct WgTunn {
     tunn: Tunn,
+    decap_buf: Box<[u8]>,
+    encap_buf: Box<[u8]>,
 }
 
 impl WgTunn {
@@ -70,7 +69,11 @@ impl WgTunn {
 
         let tunn = Tunn::new(static_private, peer_static_public, None, None, index, None);
 
-        Ok(Self { tunn })
+        Ok(Self {
+            tunn,
+            decap_buf: vec![0u8; MAX_WG_MSG].into_boxed_slice(),
+            encap_buf: vec![0u8; MAX_WG_MSG].into_boxed_slice(),
+        })
     }
 
     /// Encapsulate a plaintext IP packet into WireGuard ciphertext datagrams.
@@ -79,15 +82,8 @@ impl WgTunn {
     /// call after `new` typically triggers a handshake initiation, producing a
     /// handshake datagram instead of (or in addition to) the data datagram.
     pub fn encapsulate(&mut self, plaintext: &[u8]) -> Result<Vec<Vec<u8>>, WgError> {
-        let dst_len = plaintext.len() + 32;
-        let mut dst = vec![0u8; dst_len.max(MIN_DST)];
-
-        match self.tunn.encapsulate(plaintext, &mut dst) {
-            TunnResult::WriteToNetwork(buf) => {
-                let len = buf.len();
-                dst.truncate(len);
-                Ok(vec![dst])
-            }
+        match self.tunn.encapsulate(plaintext, &mut self.encap_buf[..]) {
+            TunnResult::WriteToNetwork(buf) => Ok(vec![buf.to_vec()]),
             TunnResult::Err(e) => Err(WgError::Tunnel(format!("{e:?}"))),
             TunnResult::Done
             | TunnResult::WriteToTunnelV4(_, _)
@@ -106,27 +102,20 @@ impl WgTunn {
     /// that loop internally and collects all replies.
     pub fn decapsulate(&mut self, datagram: &[u8]) -> Result<DecapResult, WgError> {
         let mut result = DecapResult::default();
-        let mut dst = vec![0u8; MAX_WG_MSG];
 
-        // First call with the actual datagram.
         let mut to_process = Some(datagram);
         loop {
             let src = to_process.take().unwrap_or(&[]);
-            match self.tunn.decapsulate(None, src, &mut dst) {
+            match self.tunn.decapsulate(None, src, &mut self.decap_buf[..]) {
                 TunnResult::WriteToNetwork(buf) => {
-                    let len = buf.len();
-                    result.replies.push(dst[..len].to_vec());
-                    // Must re-call with empty datagram until Done.
+                    result.replies.push(buf.to_vec());
                     to_process = Some(&[]);
                 }
                 TunnResult::WriteToTunnelV4(buf, _) | TunnResult::WriteToTunnelV6(buf, _) => {
-                    let len = buf.len();
-                    result.plaintext = Some(dst[..len].to_vec());
+                    result.plaintext = Some(buf.to_vec());
                 }
                 TunnResult::Done => break,
                 TunnResult::Err(e) => {
-                    // Non-fatal: dropped packet or unexpected message type.
-                    // Don't propagate; just stop processing this datagram.
                     let _ = e;
                     break;
                 }
@@ -141,10 +130,9 @@ impl WgTunn {
     /// ~250ms per boringtun's convention).
     pub fn tick_timers(&mut self) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
-        let mut dst = vec![0u8; MAX_WG_MSG];
-        while let TunnResult::WriteToNetwork(buf) = self.tunn.update_timers(&mut dst) {
-            let len = buf.len();
-            out.push(dst[..len].to_vec());
+        while let TunnResult::WriteToNetwork(buf) = self.tunn.update_timers(&mut self.encap_buf[..])
+        {
+            out.push(buf.to_vec());
         }
         out
     }
@@ -152,12 +140,11 @@ impl WgTunn {
     /// Force a new handshake initiation. Returns the initiation datagram if a
     /// handshake was produced.
     pub fn force_handshake(&mut self) -> Vec<Vec<u8>> {
-        let mut dst = vec![0u8; MAX_WG_MSG];
-        match self.tunn.format_handshake_initiation(&mut dst, false) {
-            TunnResult::WriteToNetwork(buf) => {
-                let len = buf.len();
-                vec![dst[..len].to_vec()]
-            }
+        match self
+            .tunn
+            .format_handshake_initiation(&mut self.encap_buf[..], false)
+        {
+            TunnResult::WriteToNetwork(buf) => vec![buf.to_vec()],
             _ => vec![],
         }
     }

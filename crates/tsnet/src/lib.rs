@@ -561,6 +561,7 @@ struct Bootstrap {
     tailscale_ips: Vec<IpAddr>,
     our_v4: Ipv4Addr,
     magicsock: Arc<Magicsock>,
+    wg_recv: mpsc::Receiver<rustscale_magicsock::WgDatagram>,
     wg_tunnels: Arc<RwLock<HashMap<NodePublic, Arc<Mutex<WgTunn>>>>>,
     peers: Arc<RwLock<Vec<Node>>>,
     route_table: Arc<RwLock<RouteTable>>,
@@ -820,6 +821,7 @@ impl Server {
         // Netstack data-plane pump: netstack <-> WG <-> magicsock.
         let pump = tokio::spawn(run_netstack_pump(
             b.magicsock.clone(),
+            b.wg_recv,
             netstack.clone(),
             b.wg_tunnels.clone(),
             b.route_table.clone(),
@@ -1121,6 +1123,7 @@ impl Server {
         // TUN data-plane pump: TUN <-> WG <-> magicsock.
         let pump = tokio::spawn(run_tun_pump(
             b.magicsock.clone(),
+            b.wg_recv,
             tun.clone(),
             b.wg_tunnels.clone(),
             b.route_table.clone(),
@@ -1803,23 +1806,22 @@ impl Server {
         // 8. Create magicsock, reusing the UDP socket bound in step 3b so
         // the local endpoints advertised in the MapRequest match the socket
         // magicsock actually owns and reads from.
-        let magicsock = Arc::new(
-            Magicsock::new(MagicsockConfig {
-                private_key: state.node_key.clone(),
-                disco_key: state.disco_key.clone(),
-                derp_client,
-                derp_map: Some(derp_map.clone()),
-                home_derp_region: home_derp,
-                udp_bind: None,
-                udp_socket: Some(udp_socket),
-                portmapper: Some(portmapper),
-                health: Some(health.clone()),
-                disable_direct_paths: self.config.disable_direct_paths,
-                peer_relay_server: self.config.peer_relay_server,
-                relay_server_config: self.config.relay_server_config.clone(),
-            })
-            .await?,
-        );
+        let (magicsock_inner, wg_recv) = Magicsock::new(MagicsockConfig {
+            private_key: state.node_key.clone(),
+            disco_key: state.disco_key.clone(),
+            derp_client,
+            derp_map: Some(derp_map.clone()),
+            home_derp_region: home_derp,
+            udp_bind: None,
+            udp_socket: Some(udp_socket),
+            portmapper: Some(portmapper),
+            health: Some(health.clone()),
+            disable_direct_paths: self.config.disable_direct_paths,
+            peer_relay_server: self.config.peer_relay_server,
+            relay_server_config: self.config.relay_server_config.clone(),
+        })
+        .await?;
+        let magicsock = Arc::new(magicsock_inner);
 
         // Start a background port-mapping probe + creation (best-effort, 2s
         // timeout). The cached mapping will be picked up by subsequent
@@ -1933,6 +1935,7 @@ impl Server {
             tailscale_ips: tailscale_ips.clone(),
             our_v4,
             magicsock,
+            wg_recv,
             wg_tunnels,
             peers: peers_arc,
             route_table,
@@ -2479,6 +2482,7 @@ impl Server {
 /// Also ticks WG timers every loop iteration.
 async fn run_netstack_pump(
     magicsock: Arc<Magicsock>,
+    mut wg_recv: mpsc::Receiver<rustscale_magicsock::WgDatagram>,
     netstack: Arc<Netstack>,
     wg_tunnels: Arc<RwLock<HashMap<NodePublic, Arc<Mutex<WgTunn>>>>>,
     route_table: Arc<RwLock<RouteTable>>,
@@ -2498,13 +2502,31 @@ async fn run_netstack_pump(
         tokio::select! {
             () = tx_notify.notified() => {}
             _ = wg_timer.tick() => {}
-            result = magicsock.poll_recv() => {
-                match result {
-                    Ok(dgram) => {
+            result = wg_recv.recv() => {
+                if let Some(dgram) = result {
+                    let f = filter.clone();
+                    let drops = packet_drops.clone();
+                    let ns = netstack.clone();
+                    handle_inbound_wg(&magicsock, &wg_tunnels, &dgram, move |pt| {
+                        let dropped = {
+                            let mut filt = f.lock().unwrap();
+                            filt.check_in(&pt).is_drop()
+                        };
+                        if dropped {
+                            drops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            return;
+                        }
+                        ns.push_rx(pt);
+                    }).await;
+
+                    // Drain any additional immediately-available datagrams
+                    // to batch a burst of packets (e.g. TCP handshake +
+                    // data) into a single scheduler turn.
+                    while let Ok(more) = wg_recv.try_recv() {
                         let f = filter.clone();
                         let drops = packet_drops.clone();
                         let ns = netstack.clone();
-                        handle_inbound_wg(&magicsock, &wg_tunnels, &dgram, move |pt| {
+                        handle_inbound_wg(&magicsock, &wg_tunnels, &more, move |pt| {
                             let dropped = {
                                 let mut filt = f.lock().unwrap();
                                 filt.check_in(&pt).is_drop()
@@ -2516,10 +2538,9 @@ async fn run_netstack_pump(
                             ns.push_rx(pt);
                         }).await;
                     }
-                    Err(e) => {
-                        eprintln!("tsnet: magicsock recv error: {e}");
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    }
+                } else {
+                    eprintln!("tsnet: magicsock wg channel closed");
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
             }
         }
@@ -2551,6 +2572,7 @@ async fn run_netstack_pump(
 /// WG timer ticks run on a 250ms interval.
 async fn run_tun_pump(
     magicsock: Arc<Magicsock>,
+    mut wg_recv: mpsc::Receiver<rustscale_magicsock::WgDatagram>,
     tun: Arc<dyn Tun>,
     wg_tunnels: Arc<RwLock<HashMap<NodePublic, Arc<Mutex<WgTunn>>>>>,
     route_table: Arc<RwLock<RouteTable>>,
@@ -2585,38 +2607,22 @@ async fn run_tun_pump(
                 }
             }
             // magicsock recv -> WG decapsulate -> filter -> TUN write.
-            result = magicsock.poll_recv() => {
-                match result {
-                    Ok(dgram) => {
-                        let tunn = {
-                            let tunnels = wg_tunnels.read().await;
-                            tunnels.get(&dgram.peer).cloned()
-                        };
-                        if let Some(tunn) = tunn {
-                            if let Ok(mut t) = tunn.try_lock() {
-                                if let Ok(decap) = t.decapsulate(&dgram.data) {
-                                    if let Some(pt) = decap.plaintext {
-                                        let dropped = {
-                                            let mut filt = filter.lock().unwrap();
-                                            filt.check_in(&pt).is_drop()
-                                        };
-                                        if dropped {
-                                            packet_drops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                        } else {
-                                            let _ = tun.write_packet(&pt).await;
-                                        }
-                                    }
-                                    for reply in decap.replies {
-                                        let _ = magicsock.send(dgram.peer.clone(), &reply).await;
-                                    }
-                                }
-                            }
-                        }
+            result = wg_recv.recv() => {
+                if let Some(dgram) = result {
+                    process_tun_inbound(
+                        &magicsock, &wg_tunnels, &filter, &packet_drops, &tun, &dgram,
+                    ).await;
+
+                    // Drain any additional immediately-available datagrams
+                    // to batch a burst of packets into a single scheduler turn.
+                    while let Ok(more) = wg_recv.try_recv() {
+                        process_tun_inbound(
+                            &magicsock, &wg_tunnels, &filter, &packet_drops, &tun, &more,
+                        ).await;
                     }
-                    Err(e) => {
-                        eprintln!("tsnet: magicsock recv error (tun): {e}");
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    }
+                } else {
+                    eprintln!("tsnet: magicsock wg channel closed (tun)");
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
             }
             _ = ticker.tick() => {
@@ -2639,14 +2645,59 @@ async fn handle_inbound_wg(
         tunnels.get(&dgram.peer).cloned()
     };
     if let Some(tunn) = tunn {
-        if let Ok(mut t) = tunn.try_lock() {
-            if let Ok(decap) = t.decapsulate(&dgram.data) {
-                if let Some(pt) = decap.plaintext {
-                    deliver(pt);
+        // Lock the tunnel, decapsulate (synchronous), then drop the lock
+        // before any async I/O (magicsock.send). This prevents packet drops
+        // from try_lock failures and avoids holding the lock across .await.
+        let decap_result = {
+            let mut t = tunn.lock().await;
+            t.decapsulate(&dgram.data)
+        };
+        if let Ok(decap) = decap_result {
+            if let Some(pt) = decap.plaintext {
+                deliver(pt);
+            }
+            for reply in decap.replies {
+                let _ = magicsock.send(dgram.peer.clone(), &reply).await;
+            }
+        }
+    }
+}
+
+/// Process a single inbound WG datagram for the TUN pump: look up the peer
+/// tunnel, decapsulate, filter, write plaintext to TUN, and send any WG
+/// protocol replies over magicsock. The tunnel lock is dropped before any
+/// async I/O to avoid holding it across .await points.
+async fn process_tun_inbound(
+    magicsock: &Magicsock,
+    wg_tunnels: &RwLock<HashMap<NodePublic, Arc<Mutex<WgTunn>>>>,
+    filter: &Arc<std::sync::Mutex<Filter>>,
+    packet_drops: &Arc<AtomicU64>,
+    tun: &Arc<dyn Tun>,
+    dgram: &rustscale_magicsock::WgDatagram,
+) {
+    let tunn = {
+        let tunnels = wg_tunnels.read().await;
+        tunnels.get(&dgram.peer).cloned()
+    };
+    if let Some(tunn) = tunn {
+        let decap_result = {
+            let mut t = tunn.lock().await;
+            t.decapsulate(&dgram.data)
+        };
+        if let Ok(decap) = decap_result {
+            if let Some(pt) = decap.plaintext {
+                let dropped = {
+                    let mut filt = filter.lock().unwrap();
+                    filt.check_in(&pt).is_drop()
+                };
+                if dropped {
+                    packet_drops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    let _ = tun.write_packet(&pt).await;
                 }
-                for reply in decap.replies {
-                    let _ = magicsock.send(dgram.peer.clone(), &reply).await;
-                }
+            }
+            for reply in decap.replies {
+                let _ = magicsock.send(dgram.peer.clone(), &reply).await;
             }
         }
     }
@@ -2675,11 +2726,15 @@ async fn encapsulate_and_send(
         tunnels.get(&peer_key).cloned()
     };
     if let Some(tunn) = tunn {
-        if let Ok(mut t) = tunn.try_lock() {
-            if let Ok(dgrams) = t.encapsulate(pkt) {
-                for dg in dgrams {
-                    let _ = magicsock.send(peer_key.clone(), &dg).await;
-                }
+        // Lock the tunnel, encapsulate (synchronous), then drop the lock
+        // before async magicsock.send to avoid holding it across .await.
+        let dgrams = {
+            let mut t = tunn.lock().await;
+            t.encapsulate(pkt)
+        };
+        if let Ok(dgrams) = dgrams {
+            for dg in dgrams {
+                let _ = magicsock.send(peer_key.clone(), &dg).await;
             }
         }
     }
@@ -2699,10 +2754,9 @@ async fn tick_wg_timers(
         let tunnels = wg_tunnels.read().await;
         let mut out = Vec::new();
         for (peer_key, tunn) in tunnels.iter() {
-            if let Ok(mut t) = tunn.try_lock() {
-                for dg in t.tick_timers() {
-                    out.push((peer_key.clone(), dg));
-                }
+            let mut t = tunn.lock().await;
+            for dg in t.tick_timers() {
+                out.push((peer_key.clone(), dg));
             }
         }
         out

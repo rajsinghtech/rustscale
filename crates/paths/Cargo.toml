@@ -1,0 +1,10 @@
+[package]
+name = "rustscale-paths"
+description = "Platform-specific default paths for rustscale state, logs, and config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true

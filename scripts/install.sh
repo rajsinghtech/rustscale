@@ -1,67 +1,66 @@
 #!/bin/sh
-# rustscale installer - builds from source and installs the C library + header.
+# rustscale binary installer — downloads prebuilt binaries from GitHub Releases
+# and installs them. One-liner on macOS and Linux:
 #
-# Modeled on Tailscale's scripts/installer.sh: POSIX sh, set -eu, all logic
-# wrapped in main() invoked at the bottom so a truncated download never
-# executes half a script.
+#   curl -fsSL https://rajsinghtech.github.io/rustscale/install.sh | sh
+#
+# Detects OS (macOS/Linux) and architecture (x86_64/aarch64), downloads the
+# matching release archive, and installs:
+#   rustscale        CLI          -> $PREFIX/bin
+#   rustscaled       daemon       -> $PREFIX/bin
+#   librustscale.*   shared lib   -> $PREFIX/lib   (when present in archive)
+#   librustscale.a   static lib   -> $PREFIX/lib   (when present in archive)
+#   rustscale.h      C header     -> $PREFIX/include (when present in archive)
 #
 # Environment variables:
-#   PREFIX         Install prefix (default: /usr/local).
-#                  Libs -> $PREFIX/lib, header -> $PREFIX/include,
-#                  optional CLI -> $PREFIX/bin.
-#   RUSTSCALE_REPO Git URL to clone from when not run inside the repo
-#                  (default: https://github.com/rajsinghtech/rustscale).
-#   RUSTSCALE_REF  Git ref (branch/tag/commit) to pin after clone
-#                  (default: unset -> repository default branch).
+#   PREFIX    Install prefix (default: /usr/local).
+#   VERSION   Pin to a specific release tag (e.g. "v0.1.0").
+#             Default: latest release.
 #
 # Flags:
-#   --with-tun     Also build and install the rustscale-tun CLI example.
-#   --uninstall    Remove the files this script installs.
-#   --help, -h     Show this help.
+#   --uninstall       Remove installed files.
+#   --version <tag>   Pin to a specific release tag.
+#   --help, -h        Show this help.
 #
 # Examples:
-#   sh scripts/install.sh
-#   PREFIX=$HOME/.local sh scripts/install.sh --with-tun
-#   curl -fsSL https://rustscale.dev/install.sh | PREFIX=/opt/rustscale sh
+#   curl -fsSL https://rajsinghtech.github.io/rustscale/install.sh | sh
+#   curl -fsSL https://rajsinghtech.github.io/rustscale/install.sh | PREFIX=$HOME/.local sh
+#   sh scripts/install.sh --version v0.1.0
+#
+# POSIX sh, set -eu, all logic wrapped in main() at the bottom so a truncated
+# download never executes half a script.
 
 set -eu
 
 PREFIX="${PREFIX:-/usr/local}"
-RUSTSCALE_REPO="${RUSTSCALE_REPO:-https://github.com/rajsinghtech/rustscale}"
-RUSTSCALE_REF="${RUSTSCALE_REF:-}"
+VERSION="${VERSION:-}"
+REPO="rajsinghtech/rustscale"
 
-# Working directory of a source clone, emptied when building in place. The trap
-# guard keeps set -u happy when WORKDIR is never assigned.
+# Kept empty until assigned; the trap guard keeps set -u happy.
 WORKDIR=
 trap '[ -n "$WORKDIR" ] && rm -rf "$WORKDIR"' EXIT
 
 usage() {
     cat <<'EOF'
-rustscale installer - builds from source and installs the C library + header.
+rustscale binary installer — downloads prebuilt binaries from GitHub Releases.
 
 Environment variables:
-  PREFIX         Install prefix (default: /usr/local).
-                 Libs -> $PREFIX/lib, header -> $PREFIX/include,
-                 optional CLI -> $PREFIX/bin.
-  RUSTSCALE_REPO Git URL to clone when not run inside the repo
-                 (default: https://github.com/rajsinghtech/rustscale).
-  RUSTSCALE_REF  Git ref (branch/tag/commit) to pin after clone
-                 (default: unset -> default branch).
+  PREFIX    Install prefix (default: /usr/local).
+  VERSION   Pin to a specific release tag (e.g. "v0.1.0").
 
 Flags:
-  --with-tun     Also build and install the rustscale-tun CLI example.
-  --uninstall    Remove the files this script installs.
-  --help, -h     Show this help.
+  --uninstall       Remove installed files.
+  --version <tag>   Pin to a specific release tag.
+  --help, -h        Show this help.
 
 Examples:
-  sh scripts/install.sh
-  PREFIX=$HOME/.local sh scripts/install.sh --with-tun
-  curl -fsSL https://rustscale.dev/install.sh | PREFIX=/opt/rustscale sh
+  curl -fsSL https://rajsinghtech.github.io/rustscale/install.sh | sh
+  curl -fsSL https://rajsinghtech.github.io/rustscale/install.sh | PREFIX=$HOME/.local sh
+  sh scripts/install.sh --version v0.1.0
 EOF
 }
 
 # Run a command, escalating through sudo/doas only when INSTALL_SUDO is set.
-# shellcheck disable=SC2086
 run_as_root() {
     if [ -n "$INSTALL_SUDO" ]; then
         $INSTALL_SUDO "$@"
@@ -71,117 +70,78 @@ run_as_root() {
 }
 
 main() {
-    WITH_TUN=0
     UNINSTALL=0
-    for arg in "$@"; do
-        case "$arg" in
-            --with-tun) WITH_TUN=1 ;;
+    while [ $# -gt 0 ]; do
+        case "$1" in
             --uninstall) UNINSTALL=1 ;;
+            --version)
+                shift
+                if [ $# -eq 0 ]; then
+                    echo "rustscale: --version requires a value" >&2
+                    exit 1
+                fi
+                VERSION="$1"
+                ;;
             --help|-h) usage; exit 0 ;;
             *)
-                echo "rustscale: unknown option '$arg' (try --help)" >&2
+                echo "rustscale: unknown option '$1' (try --help)" >&2
                 exit 1
                 ;;
         esac
+        shift
     done
 
-    detect_os
+    detect_platform
+    choose_sudo
 
     if [ "$UNINSTALL" = 1 ]; then
         do_uninstall
         return
     fi
 
-    preflight
-    acquire_source
-    build
-    choose_sudo
-    do_install
-    post_install
+    download_and_install
 }
 
-# Step 1: detect OS via uname and pick the shared-library extension.
-detect_os() {
+# Detect OS, architecture, and pick the archive name + shared-lib extension.
+detect_platform() {
+    OS=
+    ARCH=
+    ARCHIVE=
+    DYEXT=
+
     case "$(uname -s)" in
         Darwin) OS=darwin; DYEXT=dylib ;;
         Linux)  OS=linux;  DYEXT=so ;;
         *)
-            echo "rustscale: unsupported OS '$(uname -s)' (only darwin/linux are supported)" >&2
+            echo "rustscale: unsupported OS '$(uname -s)' (only darwin/linux)" >&2
+            exit 1
+            ;;
+    esac
+
+    case "$(uname -m)" in
+        x86_64|amd64)   ARCH=x86_64 ;;
+        aarch64|arm64)  ARCH=aarch64 ;;
+        *)
+            echo "rustscale: unsupported architecture '$(uname -m)'" >&2
+            exit 1
+            ;;
+    esac
+
+    # Map to the release archive naming convention from .github/workflows/release.yml.
+    case "$OS-$ARCH" in
+        darwin-x86_64)  ARCHIVE="rustscale-universal-apple-darwin.tar.gz" ;;
+        darwin-aarch64) ARCHIVE="rustscale-universal-apple-darwin.tar.gz" ;;
+        linux-x86_64)   ARCHIVE="rustscale-x86_64-unknown-linux-gnu.tar.gz" ;;
+        linux-aarch64)  ARCHIVE="rustscale-aarch64-unknown-linux-gnu.tar.gz" ;;
+        *)
+            echo "rustscale: no release archive for $OS-$ARCH" >&2
             exit 1
             ;;
     esac
 }
 
-# Step 2: preflight - cargo is mandatory; git is checked at clone time.
-preflight() {
-    if ! command -v cargo >/dev/null 2>&1; then
-        echo "rustscale: 'cargo' was not found on PATH." >&2
-        echo "Install the Rust toolchain with rustup:" >&2
-        echo "  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh" >&2
-        exit 1
-    fi
-}
-
-# Step 3: acquire source. Build in place when run from inside the repo
-# (script sits next to Cargo.toml and include/rustscale.h), otherwise clone.
-acquire_source() {
-    script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
-    if [ -f "$script_dir/../Cargo.toml" ] && [ -f "$script_dir/../include/rustscale.h" ]; then
-        SRCDIR=$(CDPATH='' cd -- "$script_dir/.." && pwd)
-        return
-    fi
-
-    if ! command -v git >/dev/null 2>&1; then
-        echo "rustscale: 'git' was not found (needed to clone the source tree)." >&2
-        exit 1
-    fi
-
-    WORKDIR=$(mktemp -d -t rustscale-install)
-    SRCDIR="$WORKDIR/rustscale"
-    echo "rustscale: cloning $RUSTSCALE_REPO"
-    if [ -n "$RUSTSCALE_REF" ]; then
-        git clone "$RUSTSCALE_REPO" "$SRCDIR"
-        git -C "$SRCDIR" checkout "$RUSTSCALE_REF"
-    else
-        git clone --depth 1 "$RUSTSCALE_REPO" "$SRCDIR"
-    fi
-}
-
-# Step 4: build release artifacts. --quiet suppresses progress noise while
-# rustc diagnostics still surface on failure.
-build() {
-    manifest="$SRCDIR/Cargo.toml"
-    echo "rustscale: building release artifacts (this can take a while)"
-    if ! cargo build --manifest-path "$manifest" -p rustscale-ffi --release --quiet; then
-        echo "rustscale: cargo build of rustscale-ffi failed" >&2
-        exit 1
-    fi
-    if [ "$WITH_TUN" = 1 ]; then
-        if ! cargo build --manifest-path "$manifest" -p rustscale-tsnet --release --example rustscale-tun --quiet; then
-            echo "rustscale: cargo build of the rustscale-tun example failed" >&2
-            exit 1
-        fi
-    fi
-
-    SHARED_LIB="$SRCDIR/target/release/librustscale.$DYEXT"
-    STATIC_LIB="$SRCDIR/target/release/librustscale.a"
-    HEADER="$SRCDIR/include/rustscale.h"
-    TUN_BIN="$SRCDIR/target/release/examples/rustscale-tun"
-
-    for f in "$SHARED_LIB" "$STATIC_LIB" "$HEADER"; do
-        if [ ! -f "$f" ]; then
-            echo "rustscale: expected build output not found: $f" >&2
-            exit 1
-        fi
-    done
-    if [ "$WITH_TUN" = 1 ] && [ ! -f "$TUN_BIN" ]; then
-        echo "rustscale: expected build output not found: $TUN_BIN" >&2
-        exit 1
-    fi
-}
-
-# Step 5: decide how to escalate for the install copy. The build itself never
-# runs as root, mirroring Tailscale's installer keeping privileged work narrow.
+# Decide how to escalate for the install copy. The download itself never
+# runs as root.
 choose_sudo() {
     INSTALL_SUDO=
     if [ -w "$PREFIX" ] 2>/dev/null; then
@@ -201,57 +161,117 @@ choose_sudo() {
     fi
 }
 
-# Step 6: install. 755 for the shared lib and binary, 644 for the static lib
-# and header.
-do_install() {
-    echo "rustscale: installing to $PREFIX"
-    run_as_root install -d -m 755 "$PREFIX/lib" "$PREFIX/include"
-    run_as_root install -m 755 "$SHARED_LIB" "$PREFIX/lib/"
-    run_as_root install -m 644 "$STATIC_LIB" "$PREFIX/lib/"
-    run_as_root install -m 644 "$HEADER" "$PREFIX/include/"
-    if [ "$WITH_TUN" = 1 ]; then
-        run_as_root install -d -m 755 "$PREFIX/bin"
-        run_as_root install -m 755 "$TUN_BIN" "$PREFIX/bin/"
+# Resolve the download URL. If VERSION is set, use the direct asset URL.
+# Otherwise query the GitHub API for the latest release tag.
+resolve_url() {
+    if [ -n "$VERSION" ]; then
+        DOWNLOAD_URL="https://github.com/$REPO/releases/download/$VERSION/$ARCHIVE"
+    else
+        # Query the latest release API, extract the tag_name, then build the
+        # direct asset URL. jq is not assumed — use sed/grep.
+        API_URL="https://api.github.com/repos/$REPO/releases/latest"
+        TAG=$($CURL "$API_URL" | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')
+        if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
+            echo "rustscale: could not determine latest release tag from GitHub API" >&2
+            exit 1
+        fi
+        VERSION="$TAG"
+        DOWNLOAD_URL="https://github.com/$REPO/releases/download/$TAG/$ARCHIVE"
     fi
+}
+
+# Pick a HTTP client.
+pick_curl() {
+    CURL=
+    if command -v curl >/dev/null 2>&1; then
+        CURL="curl -fsSL"
+    elif command -v wget >/dev/null 2>&1; then
+        CURL="wget -q -O-"
+    else
+        echo "rustscale: needs either curl or wget to download." >&2
+        exit 1
+    fi
+}
+
+download_and_install() {
+    pick_curl
+    resolve_url
+
+    echo "rustscale: downloading $ARCHIVE from release $VERSION"
+    WORKDIR=$(mktemp -d -t rustscale-install)
+    if ! $CURL -o "$WORKDIR/$ARCHIVE" "$DOWNLOAD_URL"; then
+        echo "rustscale: download failed: $DOWNLOAD_URL" >&2
+        exit 1
+    fi
+
+    echo "rustscale: extracting"
+    tar xzf "$WORKDIR/$ARCHIVE" -C "$WORKDIR"
+
+    # The archive contains rustscale, rustscaled, and optionally libs + header
+    # at the root level (see the Bundle step in release.yml).
+    install_files
+    post_install
+}
+
+# Install the extracted files to $PREFIX.
+install_files() {
+    echo "rustscale: installing to $PREFIX"
+    run_as_root install -d -m 755 "$PREFIX/bin"
+
+    for bin in rustscale rustscaled; do
+        if [ -f "$WORKDIR/$bin" ]; then
+            run_as_root install -m 755 "$WORKDIR/$bin" "$PREFIX/bin/"
+        fi
+    done
+
+    # Libraries and header are optional — present in macOS/Linux archives,
+    # absent in Windows (Windows uses a separate .ps1 installer).
+    if [ -f "$WORKDIR/librustscale.$DYEXT" ]; then
+        run_as_root install -d -m 755 "$PREFIX/lib"
+        run_as_root install -m 755 "$WORKDIR/librustscale.$DYEXT" "$PREFIX/lib/"
+    fi
+    if [ -f "$WORKDIR/librustscale.a" ]; then
+        run_as_root install -d -m 755 "$PREFIX/lib"
+        run_as_root install -m 644 "$WORKDIR/librustscale.a" "$PREFIX/lib/"
+    fi
+    if [ -f "$WORKDIR/rustscale.h" ]; then
+        run_as_root install -d -m 755 "$PREFIX/include"
+        run_as_root install -m 644 "$WORKDIR/rustscale.h" "$PREFIX/include/"
+    fi
+
     if [ "$OS" = linux ]; then
-        # Refresh the dynamic linker cache; best-effort, ignore failure.
         run_as_root ldconfig 2>/dev/null || true
     fi
 }
 
-# Step 7: report what landed where and how to compile against it.
 post_install() {
     echo
     echo "rustscale: installed:"
-    echo "  $PREFIX/lib/librustscale.$DYEXT"
-    echo "  $PREFIX/lib/librustscale.a"
-    echo "  $PREFIX/include/rustscale.h"
-    [ "$WITH_TUN" = 1 ] && echo "  $PREFIX/bin/rustscale-tun"
+    [ -f "$WORKDIR/rustscale" ]  && echo "  $PREFIX/bin/rustscale"
+    [ -f "$WORKDIR/rustscaled" ] && echo "  $PREFIX/bin/rustscaled"
+    [ -f "$WORKDIR/librustscale.$DYEXT" ] && echo "  $PREFIX/lib/librustscale.$DYEXT"
+    [ -f "$WORKDIR/librustscale.a" ]      && echo "  $PREFIX/lib/librustscale.a"
+    [ -f "$WORKDIR/rustscale.h" ]         && echo "  $PREFIX/include/rustscale.h"
     echo
-    echo "Compile against rustscale with:"
-    echo "  cc app.c -I$PREFIX/include -L$PREFIX/lib -lrustscale"
-    echo "See $PREFIX/include/rustscale.h for the C API."
+    echo "Get started:"
+    echo "  sudo rustscaled run          # start the daemon"
+    echo "  rustscale up                 # connect to a tailnet"
+    echo "  rustscale status             # check state"
     if [ "$OS" = darwin ]; then
         case "$PREFIX" in
             /usr/local|/usr) ;;
-            *) echo "At runtime export DYLD_LIBRARY_PATH=$PREFIX/lib so the dylib is found." ;;
-        esac
-    elif [ "$OS" = linux ]; then
-        case "$PREFIX" in
-            /usr/local|/usr|/usr/lib) ;;
-            *) echo "At runtime add $PREFIX/lib to the linker cache, e.g." \
-                  "echo '$PREFIX/lib' | sudo tee /etc/ld.so.conf.d/rustscale.conf && sudo ldconfig" ;;
+            *) echo; echo "If $PREFIX/bin is not on your PATH, add it:" \
+                  "export PATH=$PREFIX/bin:\$PATH" ;;
         esac
     fi
 }
 
-# --uninstall: remove exactly the files do_install would have placed.
 do_uninstall() {
-    choose_sudo
     echo "rustscale: uninstalling from $PREFIX"
     any=0
-    for f in "$PREFIX/lib/librustscale.$DYEXT" "$PREFIX/lib/librustscale.a" \
-             "$PREFIX/include/rustscale.h" "$PREFIX/bin/rustscale-tun"; do
+    for f in "$PREFIX/bin/rustscale" "$PREFIX/bin/rustscaled" \
+             "$PREFIX/lib/librustscale.$DYEXT" "$PREFIX/lib/librustscale.a" \
+             "$PREFIX/include/rustscale.h"; do
         if [ -e "$f" ] || [ -L "$f" ]; then
             run_as_root rm -f "$f" && echo "  removed $f"
             any=1

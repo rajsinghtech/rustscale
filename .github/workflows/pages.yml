@@ -1,0 +1,81 @@
+name: Pages
+
+# Publishes the install scripts to GitHub Pages so they're reachable at:
+#   https://rajsinghtech.github.io/rustscale/install.sh
+#   https://rajsinghtech.github.io/rustscale/install.ps1
+#
+# The scripts themselves download prebuilt binaries from GitHub Releases —
+# Pages only hosts the scripts (no package server needed).
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'scripts/install.sh'
+      - 'scripts/install.ps1'
+      - '.github/workflows/pages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    name: Deploy install scripts to Pages
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Assemble Pages site
+        run: |
+          mkdir -p _site
+          cp scripts/install.sh   _site/install.sh
+          cp scripts/install.ps1  _site/install.ps1
+          cat > _site/index.html <<'HTML'
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <title>rustscale</title>
+          <style>
+          body { font-family: -apple-system, system-ui, sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; color: #333; }
+          code { background: #f4f4f4; padding: 0.15em 0.3em; border-radius: 3px; font-size: 0.9em; }
+          pre { background: #f4f4f4; padding: 1rem; border-radius: 6px; overflow-x: auto; }
+          pre code { background: none; padding: 0; }
+          a { color: #0366d6; }
+          </style>
+          </head>
+          <body>
+          <h1>rustscale</h1>
+          <p>A Rust implementation of <a href="https://github.com/rajsinghtech/rustscale">Tailscale's client stack</a>.</p>
+          <h2>Install</h2>
+          <p>macOS / Linux:</p>
+          <pre><code>curl -fsSL https://rajsinghtech.github.io/rustscale/install.sh | sh</code></pre>
+          <p>Windows (PowerShell):</p>
+          <pre><code>irm https://rajsinghtech.github.io/rustscale/install.ps1 | iex</code></pre>
+          <h2>Get started</h2>
+          <pre><code>sudo rustscaled run       # start the daemon
+          rustscale up              # connect to a tailnet
+          rustscale status          # check state</code></pre>
+          </body>
+          </html>
+          HTML
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

@@ -82,12 +82,18 @@ pub struct SSHRecorderFailureAction {
 mod duration_secs {
     use super::{Deserialize, Duration};
     pub fn serialize<S>(d: &Duration, s: S) -> Result<S::Ok, S::Error>
-    where S: serde::Serializer {
-        if d.is_zero() { return s.serialize_none(); }
+    where
+        S: serde::Serializer,
+    {
+        if d.is_zero() {
+            return s.serialize_none();
+        }
         s.serialize_u64(d.as_secs())
     }
     pub fn deserialize<'de, D>(d: D) -> Result<Duration, D::Error>
-    where D: serde::Deserializer<'de> {
+    where
+        D: serde::Deserializer<'de>,
+    {
         let opt: Option<u64> = Option::deserialize(d)?;
         Ok(opt.map(Duration::from_secs).unwrap_or_default())
     }
@@ -100,9 +106,20 @@ mod tests {
     fn ssh_policy_roundtrip() {
         let policy = SSHPolicy {
             Rules: vec![SSHRule {
-                Principals: vec![SSHPrincipal { Any: true, ..Default::default() }],
-                SSHUsers: { let mut m = BTreeMap::new(); m.insert("*".into(), "=".into()); m },
-                Action: Some(SSHAction { Accept: true, Message: "Welcome".into(), ..Default::default() }),
+                Principals: vec![SSHPrincipal {
+                    Any: true,
+                    ..Default::default()
+                }],
+                SSHUsers: {
+                    let mut m = BTreeMap::new();
+                    m.insert("*".into(), "=".into());
+                    m
+                },
+                Action: Some(SSHAction {
+                    Accept: true,
+                    Message: "Welcome".into(),
+                    ..Default::default()
+                }),
                 AcceptEnv: vec!["TERM".into(), "LANG".into()],
                 ..Default::default()
             }],
@@ -113,7 +130,11 @@ mod tests {
     }
     #[test]
     fn ssh_action_reject_roundtrip() {
-        let action = SSHAction { Reject: true, Message: "Access denied".into(), ..Default::default() };
+        let action = SSHAction {
+            Reject: true,
+            Message: "Access denied".into(),
+            ..Default::default()
+        };
         let j = serde_json::to_string(&action).unwrap();
         assert!(j.contains("\"Reject\":true"));
         let back: SSHAction = serde_json::from_str(&j).unwrap();

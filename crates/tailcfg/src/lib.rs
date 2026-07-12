@@ -37,7 +37,7 @@ pub use node::{
     TPMInfo,
 };
 pub use register::{Login, LoginID, RegisterRequest, RegisterResponse, RegisterResponseAuth, User};
-pub use ssh::{SSHAction, SSHPrincipal, SSHPolicy, SSHRecorderFailureAction, SSHRule};
+pub use ssh::{SSHAction, SSHPolicy, SSHPrincipal, SSHRecorderFailureAction, SSHRule};
 
 pub use rustscale_key::{
     DiscoPublic as DiscoKey, MachinePublic as MachineKey, NodePublic as NodeKey,

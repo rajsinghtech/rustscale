@@ -2,18 +2,29 @@
 #![allow(dead_code)]
 
 use russh::ChannelId;
+use rustscale_tailcfg::{Node, UserProfile};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
-use rustscale_tailcfg::{Node, UserProfile};
 
 #[derive(Clone, Debug, Default)]
-pub struct Window { pub width: u32, pub height: u32, pub width_pixels: u32, pub height_pixels: u32 }
+pub struct Window {
+    pub width: u32,
+    pub height: u32,
+    pub width_pixels: u32,
+    pub height_pixels: u32,
+}
 
 #[derive(Clone, Debug, Default)]
-pub struct Pty { pub term: String, pub window: Window }
+pub struct Pty {
+    pub term: String,
+    pub window: Window,
+}
 
 #[derive(Clone, Debug, Default)]
-pub struct PeerIdentity { pub node: Node, pub user_profile: UserProfile }
+pub struct PeerIdentity {
+    pub node: Node,
+    pub user_profile: UserProfile,
+}
 
 pub struct SessionInit {
     pub peer: PeerIdentity,
@@ -45,35 +56,71 @@ impl Session {
     pub fn from_init(init: SessionInit) -> Self {
         let _ = &init.peer;
         Self {
-            peer: init.peer, ssh_user: init.ssh_user, command: init.command, env: init.env,
-            pty: init.pty, handle: init.handle, channel_id: init.channel_id,
-            data_rx: init.data_rx, read_buf: Vec::new(), done_tx: Some(init.done_tx), closed: false,
+            peer: init.peer,
+            ssh_user: init.ssh_user,
+            command: init.command,
+            env: init.env,
+            pty: init.pty,
+            handle: init.handle,
+            channel_id: init.channel_id,
+            data_rx: init.data_rx,
+            read_buf: Vec::new(),
+            done_tx: Some(init.done_tx),
+            closed: false,
         }
     }
-    pub fn user(&self) -> &str { &self.ssh_user }
-    pub fn peer(&self) -> &PeerIdentity { &self.peer }
-    pub fn peer_node(&self) -> &Node { &self.peer.node }
-    pub fn peer_user_profile(&self) -> &UserProfile { &self.peer.user_profile }
-    pub fn raw_command(&self) -> &str { &self.command }
-    pub fn is_shell(&self) -> bool { self.command.is_empty() }
-    pub fn environ(&self) -> &[(String, String)] { &self.env }
-    pub fn pty(&self) -> Option<&Pty> { self.pty.as_ref() }
+    pub fn user(&self) -> &str {
+        &self.ssh_user
+    }
+    pub fn peer(&self) -> &PeerIdentity {
+        &self.peer
+    }
+    pub fn peer_node(&self) -> &Node {
+        &self.peer.node
+    }
+    pub fn peer_user_profile(&self) -> &UserProfile {
+        &self.peer.user_profile
+    }
+    pub fn raw_command(&self) -> &str {
+        &self.command
+    }
+    pub fn is_shell(&self) -> bool {
+        self.command.is_empty()
+    }
+    pub fn environ(&self) -> &[(String, String)] {
+        &self.env
+    }
+    pub fn pty(&self) -> Option<&Pty> {
+        self.pty.as_ref()
+    }
 
     pub async fn exit(&mut self, code: u32) {
-        if self.closed { return; }
+        if self.closed {
+            return;
+        }
         self.closed = true;
         let _ = self.handle.exit_status_request(self.channel_id, code).await;
         let _ = self.handle.eof(self.channel_id).await;
         let _ = self.handle.close(self.channel_id).await;
-        if let Some(tx) = self.done_tx.take() { let _ = tx.send(()).await; }
+        if let Some(tx) = self.done_tx.take() {
+            let _ = tx.send(()).await;
+        }
     }
-    pub async fn close(&mut self) { self.exit(0).await; }
+    pub async fn close(&mut self) {
+        self.exit(0).await;
+    }
 }
 
 impl AsyncRead for Session {
-    fn poll_read(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &mut ReadBuf<'_>) -> std::task::Poll<std::io::Result<()>> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
         let this = self.get_mut();
-        if this.closed { return std::task::Poll::Ready(Ok(())); }
+        if this.closed {
+            return std::task::Poll::Ready(Ok(()));
+        }
         if !this.read_buf.is_empty() {
             let n = std::cmp::min(this.read_buf.len(), buf.remaining());
             buf.put_slice(&this.read_buf[..n]);
@@ -82,21 +129,37 @@ impl AsyncRead for Session {
         }
         match this.data_rx.poll_recv(cx) {
             std::task::Poll::Ready(Some(data)) => {
-                if data.is_empty() { return std::task::Poll::Ready(Ok(())); }
+                if data.is_empty() {
+                    return std::task::Poll::Ready(Ok(()));
+                }
                 let n = std::cmp::min(data.len(), buf.remaining());
                 buf.put_slice(&data[..n]);
-                if n < data.len() { this.read_buf.extend_from_slice(&data[n..]); }
+                if n < data.len() {
+                    this.read_buf.extend_from_slice(&data[n..]);
+                }
                 std::task::Poll::Ready(Ok(()))
             }
-            std::task::Poll::Ready(None) => { this.closed = true; std::task::Poll::Ready(Ok(())) }
+            std::task::Poll::Ready(None) => {
+                this.closed = true;
+                std::task::Poll::Ready(Ok(()))
+            }
             std::task::Poll::Pending => std::task::Poll::Pending,
         }
     }
 }
 
 impl AsyncWrite for Session {
-    fn poll_write(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &[u8]) -> std::task::Poll<std::io::Result<usize>> {
-        if self.closed { return std::task::Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "session closed"))); }
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        if self.closed {
+            return std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "session closed",
+            )));
+        }
         let this = self.get_mut();
         let handle = this.handle.clone();
         let channel_id = this.channel_id;
@@ -108,14 +171,25 @@ impl AsyncWrite for Session {
         });
         std::task::Poll::Pending
     }
-    fn poll_flush(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> { std::task::Poll::Ready(Ok(())) }
-    fn poll_shutdown(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
         let this = self.get_mut();
         if !this.closed {
             this.closed = true;
             let handle = this.handle.clone();
             let channel_id = this.channel_id;
-            tokio::spawn(async move { let _ = handle.eof(channel_id).await; let _ = handle.close(channel_id).await; });
+            tokio::spawn(async move {
+                let _ = handle.eof(channel_id).await;
+                let _ = handle.close(channel_id).await;
+            });
         }
         std::task::Poll::Ready(Ok(()))
     }
@@ -123,6 +197,8 @@ impl AsyncWrite for Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        if let Some(tx) = self.done_tx.take() { let _ = tx.try_send(()); }
+        if let Some(tx) = self.done_tx.take() {
+            let _ = tx.try_send(());
+        }
     }
 }

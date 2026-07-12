@@ -1,8 +1,8 @@
 //! SSH host key generation — deterministic from the node private key.
 
 use russh::keys::ssh_key::PrivateKey;
-use sha2::{Digest, Sha512};
 use rustscale_key::NodePrivate;
+use sha2::{Digest, Sha512};
 
 pub fn host_key_from_node_key(node_key: &NodePrivate) -> PrivateKey {
     let seed = derive_ed25519_seed(node_key);
@@ -11,7 +11,11 @@ pub fn host_key_from_node_key(node_key: &NodePrivate) -> PrivateKey {
 }
 
 pub fn host_key_public_string(key: &PrivateKey) -> String {
-    key.public_key().to_openssh().unwrap_or_default().trim().to_string()
+    key.public_key()
+        .to_openssh()
+        .unwrap_or_default()
+        .trim()
+        .to_string()
 }
 
 fn derive_ed25519_seed(node_key: &NodePrivate) -> [u8; 32] {
@@ -30,11 +34,17 @@ mod tests {
     #[test]
     fn host_key_is_deterministic() {
         let nk = NodePrivate::generate();
-        assert_eq!(host_key_from_node_key(&nk).public_key(), host_key_from_node_key(&nk).public_key());
+        assert_eq!(
+            host_key_from_node_key(&nk).public_key(),
+            host_key_from_node_key(&nk).public_key()
+        );
     }
     #[test]
     fn different_node_keys_produce_different_host_keys() {
-        assert_ne!(host_key_from_node_key(&NodePrivate::generate()).public_key(), host_key_from_node_key(&NodePrivate::generate()).public_key());
+        assert_ne!(
+            host_key_from_node_key(&NodePrivate::generate()).public_key(),
+            host_key_from_node_key(&NodePrivate::generate()).public_key()
+        );
     }
     #[test]
     fn host_key_is_ed25519() {

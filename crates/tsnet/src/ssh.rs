@@ -7,10 +7,8 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use rustscale_ssh::{
-    handle_ssh_conn, host_key_from_node_key, Session, SshServer, SshServerConfig,
-};
 use rustscale_ssh::session::SessionInit;
+use rustscale_ssh::{handle_ssh_conn, host_key_from_node_key, Session, SshServer, SshServerConfig};
 
 use crate::Server;
 

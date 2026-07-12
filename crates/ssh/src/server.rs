@@ -1,15 +1,15 @@
 //! SSH server — ports Go's `ssh/tailssh/tailssh.go` and `listen.go`.
 
-use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
-use russh::server::{Auth, Msg, Session, Server as RusshServer};
-use russh::{Channel, ChannelId, MethodSet};
-use russh::keys::PrivateKey;
-use tokio::sync::mpsc;
-use rustscale_tailcfg::{Node, SSHPolicy, UserProfile};
 use crate::auth::{eval_ssh_policy, ConnInfo, EvalResult};
 use crate::env::accept_env_pair;
 use crate::session::{PeerIdentity, Pty, SessionInit, Window};
+use russh::keys::PrivateKey;
+use russh::server::{Auth, Msg, Server as RusshServer, Session};
+use russh::{Channel, ChannelId, MethodSet};
+use rustscale_tailcfg::{Node, SSHPolicy, UserProfile};
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
+use tokio::sync::mpsc;
 
 pub type WhoIsCallback = Arc<dyn Fn(IpAddr) -> Option<(Node, UserProfile)> + Send + Sync>;
 pub type PolicyCallback = Arc<dyn Fn() -> Option<SSHPolicy> + Send + Sync>;
@@ -27,7 +27,9 @@ pub struct SshServer {
 
 impl SshServer {
     pub fn new(config: SshServerConfig) -> Self {
-        Self { config: Arc::new(config) }
+        Self {
+            config: Arc::new(config),
+        }
     }
     pub fn russh_config(&self) -> Arc<russh::server::Config> {
         Arc::new(russh::server::Config {
@@ -47,10 +49,15 @@ impl RusshServer for SshServer {
     type Handler = SshHandler;
     fn new_client(&mut self, peer_addr: Option<SocketAddr>) -> Self::Handler {
         SshHandler {
-            config: self.config.clone(), peer_addr,
-            ssh_user: String::new(), local_user: String::new(),
-            accept_env: Vec::new(), peer_identity: None,
-            channel_data_tx: None, env_vars: Vec::new(), pty: None,
+            config: self.config.clone(),
+            peer_addr,
+            ssh_user: String::new(),
+            local_user: String::new(),
+            accept_env: Vec::new(),
+            peer_identity: None,
+            channel_data_tx: None,
+            env_vars: Vec::new(),
+            pty: None,
             command: String::new(),
         }
     }
@@ -77,34 +84,77 @@ impl SshHandler {
         let ssh_user = user.trim_end_matches("+password").to_string();
         if !ssh_user.is_empty() && ssh_user.chars().all(|c| c.is_ascii_digit()) {
             log::warn!("rejecting numeric username {ssh_user:?}");
-            return Auth::Reject { proceed_with_methods: None };
+            return Auth::Reject {
+                proceed_with_methods: None,
+            };
         }
         let peer_ip = match self.peer_addr {
             Some(addr) => addr.ip(),
-            None => return Auth::Reject { proceed_with_methods: None },
+            None => {
+                return Auth::Reject {
+                    proceed_with_methods: None,
+                }
+            }
         };
-        let (node, user_profile) = if let Some(ident) = (self.config.whois)(peer_ip) { ident } else { log::warn!("SSH: unknown identity from {peer_ip}"); return Auth::Reject { proceed_with_methods: None }; };
-        let policy = if let Some(p) = (self.config.policy)() { p } else { log::warn!("SSH: no policy configured"); return Auth::Reject { proceed_with_methods: None }; };
+        let (node, user_profile) = if let Some(ident) = (self.config.whois)(peer_ip) {
+            ident
+        } else {
+            log::warn!("SSH: unknown identity from {peer_ip}");
+            return Auth::Reject {
+                proceed_with_methods: None,
+            };
+        };
+        let policy = if let Some(p) = (self.config.policy)() {
+            p
+        } else {
+            log::warn!("SSH: no policy configured");
+            return Auth::Reject {
+                proceed_with_methods: None,
+            };
+        };
         let info = ConnInfo {
-            ssh_user: ssh_user.clone(), src_ip: peer_ip, dst_ip: peer_ip,
-            node: node.clone(), user_profile: user_profile.clone(),
+            ssh_user: ssh_user.clone(),
+            src_ip: peer_ip,
+            dst_ip: peer_ip,
+            node: node.clone(),
+            user_profile: user_profile.clone(),
         };
         let result = eval_ssh_policy(&policy, &info);
         match &result {
-            EvalResult::Accept { action, local_user, accept_env } => {
-                if !action.Message.is_empty() { log::info!("SSH auth: {}", action.Message); }
+            EvalResult::Accept {
+                action,
+                local_user,
+                accept_env,
+            } => {
+                if !action.Message.is_empty() {
+                    log::info!("SSH auth: {}", action.Message);
+                }
                 self.ssh_user = ssh_user;
                 self.local_user.clone_from(local_user);
                 self.accept_env.clone_from(accept_env);
                 self.peer_identity = Some(PeerIdentity { node, user_profile });
                 Auth::Accept
             }
-            EvalResult::RejectedUser => { log::warn!("SSH: policy rejects user {ssh_user:?}"); Auth::Reject { proceed_with_methods: None } }
-            EvalResult::Rejected | EvalResult::NoPolicy => { log::warn!("SSH: policy rejects connection"); Auth::Reject { proceed_with_methods: None } }
+            EvalResult::RejectedUser => {
+                log::warn!("SSH: policy rejects user {ssh_user:?}");
+                Auth::Reject {
+                    proceed_with_methods: None,
+                }
+            }
+            EvalResult::Rejected | EvalResult::NoPolicy => {
+                log::warn!("SSH: policy rejects connection");
+                Auth::Reject {
+                    proceed_with_methods: None,
+                }
+            }
         }
     }
 
-    async fn send_session(&mut self, channel_id: ChannelId, session: &mut Session) -> Result<(), russh::Error> {
+    async fn send_session(
+        &mut self,
+        channel_id: ChannelId,
+        session: &mut Session,
+    ) -> Result<(), russh::Error> {
         let (data_tx, data_rx) = mpsc::channel::<Vec<u8>>(64);
         let (done_tx, mut done_rx) = mpsc::channel::<()>(1);
         self.channel_data_tx = Some(data_tx);
@@ -113,9 +163,15 @@ impl SshHandler {
         let peer = self.peer_identity.clone().unwrap_or_default();
 
         let init = SessionInit {
-            peer, ssh_user: self.ssh_user.clone(), command: self.command.clone(),
-            env: self.env_vars.clone(), pty: self.pty.clone(),
-            handle, channel_id, data_rx, done_tx,
+            peer,
+            ssh_user: self.ssh_user.clone(),
+            command: self.command.clone(),
+            env: self.env_vars.clone(),
+            pty: self.pty.clone(),
+            handle,
+            channel_id,
+            data_rx,
+            done_tx,
         };
 
         if self.config.session_tx.send(init).await.is_err() {
@@ -129,18 +185,44 @@ impl SshHandler {
 impl russh::server::Handler for SshHandler {
     type Error = russh::Error;
 
-    async fn auth_none(&mut self, user: &str) -> Result<Auth, Self::Error> { Ok(self.tailscale_auth(user)) }
-    async fn auth_password(&mut self, user: &str, _password: &str) -> Result<Auth, Self::Error> { Ok(self.tailscale_auth(user)) }
-    async fn auth_publickey(&mut self, user: &str, _key: &russh::keys::ssh_key::PublicKey) -> Result<Auth, Self::Error> { Ok(self.tailscale_auth(user)) }
+    async fn auth_none(&mut self, user: &str) -> Result<Auth, Self::Error> {
+        Ok(self.tailscale_auth(user))
+    }
+    async fn auth_password(&mut self, user: &str, _password: &str) -> Result<Auth, Self::Error> {
+        Ok(self.tailscale_auth(user))
+    }
+    async fn auth_publickey(
+        &mut self,
+        user: &str,
+        _key: &russh::keys::ssh_key::PublicKey,
+    ) -> Result<Auth, Self::Error> {
+        Ok(self.tailscale_auth(user))
+    }
 
     async fn auth_succeeded(&mut self, _session: &mut Session) -> Result<(), Self::Error> {
-        log::info!("SSH auth succeeded: {} -> {}", self.ssh_user, self.local_user);
+        log::info!(
+            "SSH auth succeeded: {} -> {}",
+            self.ssh_user,
+            self.local_user
+        );
         Ok(())
     }
 
-    async fn channel_open_session(&mut self, _channel: Channel<Msg>, _session: &mut Session) -> Result<bool, Self::Error> { Ok(true) }
+    async fn channel_open_session(
+        &mut self,
+        _channel: Channel<Msg>,
+        _session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        Ok(true)
+    }
 
-    async fn env_request(&mut self, _channel: ChannelId, name: &str, value: &str, _session: &mut Session) -> Result<(), Self::Error> {
+    async fn env_request(
+        &mut self,
+        _channel: ChannelId,
+        name: &str,
+        value: &str,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
         let kv = format!("{name}={value}");
         if accept_env_pair(&kv) || self.accept_env.iter().any(|p| p == name) {
             self.env_vars.push((name.to_string(), value.to_string()));
@@ -148,26 +230,58 @@ impl russh::server::Handler for SshHandler {
         Ok(())
     }
 
-    async fn pty_request(&mut self, _channel: ChannelId, term: &str, col_width: u32, row_height: u32, pix_width: u32, pix_height: u32, _modes: &[(russh::Pty, u32)], _session: &mut Session) -> Result<(), Self::Error> {
-        self.pty = Some(Pty { term: term.to_string(), window: Window { width: col_width, height: row_height, width_pixels: pix_width, height_pixels: pix_height } });
+    async fn pty_request(
+        &mut self,
+        _channel: ChannelId,
+        term: &str,
+        col_width: u32,
+        row_height: u32,
+        pix_width: u32,
+        pix_height: u32,
+        _modes: &[(russh::Pty, u32)],
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        self.pty = Some(Pty {
+            term: term.to_string(),
+            window: Window {
+                width: col_width,
+                height: row_height,
+                width_pixels: pix_width,
+                height_pixels: pix_height,
+            },
+        });
         Ok(())
     }
 
-    async fn shell_request(&mut self, channel: ChannelId, session: &mut Session) -> Result<(), Self::Error> {
+    async fn shell_request(
+        &mut self,
+        channel: ChannelId,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
         self.command.clear();
         let _ = session.channel_success(channel);
         self.send_session(channel, session).await?;
         Ok(())
     }
 
-    async fn exec_request(&mut self, channel: ChannelId, data: &[u8], session: &mut Session) -> Result<(), Self::Error> {
+    async fn exec_request(
+        &mut self,
+        channel: ChannelId,
+        data: &[u8],
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
         self.command = String::from_utf8_lossy(data).to_string();
         let _ = session.channel_success(channel);
         self.send_session(channel, session).await?;
         Ok(())
     }
 
-    async fn subsystem_request(&mut self, channel: ChannelId, name: &str, session: &mut Session) -> Result<(), Self::Error> {
+    async fn subsystem_request(
+        &mut self,
+        channel: ChannelId,
+        name: &str,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
         if name == "sftp" {
             self.command.clear();
             let _ = session.channel_success(channel);
@@ -178,29 +292,62 @@ impl russh::server::Handler for SshHandler {
         Ok(())
     }
 
-    async fn data(&mut self, _channel: ChannelId, data: &[u8], _session: &mut Session) -> Result<(), Self::Error> {
-        if let Some(tx) = &self.channel_data_tx { let _ = tx.send(data.to_vec()).await; }
-        Ok(())
-    }
-
-    async fn window_change_request(&mut self, _channel: ChannelId, col_width: u32, row_height: u32, pix_width: u32, pix_height: u32, _session: &mut Session) -> Result<(), Self::Error> {
-        if let Some(ref mut pty) = self.pty {
-            pty.window = Window { width: col_width, height: row_height, width_pixels: pix_width, height_pixels: pix_height };
+    async fn data(
+        &mut self,
+        _channel: ChannelId,
+        data: &[u8],
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        if let Some(tx) = &self.channel_data_tx {
+            let _ = tx.send(data.to_vec()).await;
         }
         Ok(())
     }
 
-    async fn signal(&mut self, _channel: ChannelId, signal: russh::Sig, _session: &mut Session) -> Result<(), Self::Error> {
+    async fn window_change_request(
+        &mut self,
+        _channel: ChannelId,
+        col_width: u32,
+        row_height: u32,
+        pix_width: u32,
+        pix_height: u32,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        if let Some(ref mut pty) = self.pty {
+            pty.window = Window {
+                width: col_width,
+                height: row_height,
+                width_pixels: pix_width,
+                height_pixels: pix_height,
+            };
+        }
+        Ok(())
+    }
+
+    async fn signal(
+        &mut self,
+        _channel: ChannelId,
+        signal: russh::Sig,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
         log::debug!("SSH signal: {signal:?}");
         Ok(())
     }
 
-    async fn channel_eof(&mut self, _channel: ChannelId, _session: &mut Session) -> Result<(), Self::Error> {
+    async fn channel_eof(
+        &mut self,
+        _channel: ChannelId,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
         self.channel_data_tx = None;
         Ok(())
     }
 
-    async fn channel_close(&mut self, _channel: ChannelId, _session: &mut Session) -> Result<(), Self::Error> {
+    async fn channel_close(
+        &mut self,
+        _channel: ChannelId,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
         self.channel_data_tx = None;
         Ok(())
     }

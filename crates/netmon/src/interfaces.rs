@@ -175,7 +175,12 @@ fn gather_interface_details_impl() -> HashMap<String, InterfaceDetails> {
                 for (i, &b) in name_bytes[..copy_len].iter().enumerate() {
                     ifr.ifr_name[i] = b as libc::c_char;
                 }
-                if libc::ioctl(fd, libc::SIOCGIFMTU as _, &mut ifr as *mut libc::ifreq) == 0 {
+                if libc::ioctl(
+                    fd,
+                    libc::SIOCGIFMTU as _,
+                    std::ptr::from_mut::<libc::ifreq>(&mut ifr),
+                ) == 0
+                {
                     entry.mtu = ifr.ifr_ifru.ifru_mtu as u32;
                 }
             }

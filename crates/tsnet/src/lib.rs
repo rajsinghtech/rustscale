@@ -81,6 +81,7 @@ use rustscale_health::{
     Severity, Tracker, Watchdog, WARN_CERT_FALLBACK, WARN_CONTROL, WARN_DERP_HOME,
     WARN_NETMON_CHANGE,
 };
+use rustscale_ipn::IpnBackend;
 use rustscale_key::{DiscoPrivate, MachinePrivate, MachinePublic, NodePrivate, NodePublic};
 use rustscale_magicsock::{Magicsock, MagicsockConfig, MagicsockError};
 use rustscale_netstack::{Netstack, NetstackError, NetstackStream, DEFAULT_MTU};
@@ -470,6 +471,9 @@ struct RunningState {
     /// `configure_os_dns` is enabled. `close()` is called on server
     /// shutdown to remove `/etc/resolver` entries.
     os_dns_configurator: Option<Box<dyn OsConfigurator + Send>>,
+    /// IPN state machine backend — tracks the current IPN state, holds
+    /// the notification bus, and drives state transitions.
+    ipn_backend: Arc<IpnBackend>,
 }
 
 /// Which data plane is wired up: userspace netstack (tsnet listen/dial) or a
@@ -597,6 +601,8 @@ struct Bootstrap {
     overrides: SharedOverrides,
     /// Node key expired flag (shared with the map update task).
     key_expired: Arc<std::sync::atomic::AtomicBool>,
+    /// IPN state machine backend (shared with LocalApiState).
+    ipn_backend: Arc<IpnBackend>,
 }
 
 /// An embedded Tailscale server.
@@ -706,6 +712,13 @@ impl Server {
     /// `None` if the LocalAPI was not enabled or the server is not up.
     pub fn localapi_path(&self) -> Option<&PathBuf> {
         self.inner.as_ref().and_then(|i| i.localapi_socket.as_ref())
+    }
+
+    /// The IPN state machine backend, if the server is up. Exposed for
+    /// integration tests and external consumers that need to query the
+    /// current IPN state or subscribe to the notification bus.
+    pub fn ipn_backend(&self) -> Option<&Arc<IpnBackend>> {
+        self.inner.as_ref().map(|i| &i.ipn_backend)
     }
 
     /// Override `Hostinfo.DeviceModel` at runtime (mirrors Go's
@@ -826,6 +839,7 @@ impl Server {
             b.node_key.public(),
             b.control_knobs.clone(),
             b.key_expired.clone(),
+            b.ipn_backend.clone(),
         );
 
         // MagicDNS responder: best-effort UDP server at 100.100.100.100:53.
@@ -966,6 +980,7 @@ impl Server {
                 magicsock: b.magicsock.clone(),
                 tun_mode: false,
                 home_derp: b.home_derp,
+                ipn_backend: b.ipn_backend.clone(),
             };
             if let Some(h) = localapi::spawn_localapi(Arc::new(state), path.clone()) {
                 tasks.push(h.task);
@@ -1010,6 +1025,7 @@ impl Server {
             localapi_socket,
             key_expired: b.key_expired,
             os_dns_configurator: None,
+            ipn_backend: b.ipn_backend,
         });
         Ok(())
     }
@@ -1138,6 +1154,7 @@ impl Server {
             b.node_key.public(),
             b.control_knobs.clone(),
             b.key_expired.clone(),
+            b.ipn_backend.clone(),
         );
 
         let (c2n_task, c2n_addr) =
@@ -1254,6 +1271,7 @@ impl Server {
                 magicsock: b.magicsock.clone(),
                 tun_mode: true,
                 home_derp: b.home_derp,
+                ipn_backend: b.ipn_backend.clone(),
             };
             if let Some(h) = localapi::spawn_localapi(Arc::new(state), path.clone()) {
                 tasks.push(h.task);
@@ -1331,6 +1349,7 @@ impl Server {
             localapi_socket,
             key_expired: b.key_expired,
             os_dns_configurator,
+            ipn_backend: b.ipn_backend,
         });
         Ok(())
     }
@@ -1361,6 +1380,12 @@ impl Server {
             std::time::Duration::from_mins(3),
         );
 
+        // IPN state machine backend. Created early so state transitions
+        // are tracked from the start. Want_running is set immediately;
+        // other inputs are set as bootstrap progresses.
+        let ipn_backend = Arc::new(IpnBackend::new("rustscale"));
+        ipn_backend.set_want_running();
+
         // 1. Load or generate persistent state.
         let mut state = self.load_or_create_state()?;
         let was_fresh = state.is_zero();
@@ -1371,6 +1396,9 @@ impl Server {
 
         let node_pub = state.node_key.public();
         let disco_pub = state.disco_key.public();
+
+        // We have a node key (generated or loaded from state).
+        ipn_backend.set_has_node_key(!state.is_zero());
 
         // Try to load a cached netmap from the state directory. On a restart
         // with an existing state dir, this lets us skip the blocking first
@@ -1430,6 +1458,7 @@ impl Server {
                 PersistedState::clear_netmap(dir);
                 eprintln!("tsnet: cleared netmap cache after register error: {e}");
             }
+            ipn_backend.emit_err_message(e.to_string());
             TsnetError::Register(e)
         })?;
 
@@ -1442,6 +1471,7 @@ impl Server {
                     reg_resp.Error
                 );
             }
+            ipn_backend.emit_err_message(&reg_resp.Error);
             return Err(TsnetError::Builder(format!(
                 "control register rejected: {}",
                 reg_resp.Error
@@ -1455,11 +1485,21 @@ impl Server {
                 PersistedState::clear_netmap(dir);
                 eprintln!("tsnet: cleared netmap cache: node key expired");
             }
+            ipn_backend.set_key_expired(true);
         }
 
         if !reg_resp.AuthURL.is_empty() {
+            // Auth cannot proceed without human interaction. Emit a
+            // BrowseToURL notify and set auth_cant_continue so the state
+            // machine transitions to NeedsLogin.
+            ipn_backend.set_auth_cant_continue(true);
+            ipn_backend.emit_browse_to_url(&reg_resp.AuthURL);
             return Err(TsnetError::AuthRequired(reg_resp.AuthURL));
         }
+
+        // Register succeeded — machine is authorized, login is finished.
+        ipn_backend.set_machine_authorized(reg_resp.MachineAuthorized);
+        ipn_backend.emit_login_finished();
         state.node_id = reg_resp.User.ID;
         self.save_state(&state)?;
 
@@ -1561,6 +1601,14 @@ impl Server {
             return Err(TsnetError::Builder("no tailscale IPs assigned".into()));
         }
         let our_v4 = first_v4(&tailscale_ips)?;
+
+        // We have a netmap — update the IPN state machine. Set netmap_present
+        // and engine status (peer count + DERP home as a proxy for live
+        // connections). This may transition the state from Starting to Running.
+        let peer_count = map_resp.Peers.iter().filter(|p| !p.Key.is_zero()).count() as i32;
+        let has_derp_home = map_resp.Node.as_ref().is_some_and(|n| n.HomeDERP > 0);
+        ipn_backend.set_netmap_present(true);
+        ipn_backend.set_engine_status(peer_count, i32::from(has_derp_home));
 
         // 6. Pick home DERP. Prefer the control-assigned HomeDERP from our
         // own node in the MapResponse — this ensures both nodes in the same
@@ -1902,6 +1950,7 @@ impl Server {
             control_knobs,
             overrides: self.config.overrides.clone(),
             key_expired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ipn_backend,
         })
     }
 
@@ -2674,6 +2723,7 @@ fn spawn_map_update_task(
     node_pub: NodePublic,
     control_knobs: Arc<ControlKnobs>,
     key_expired: Arc<std::sync::atomic::AtomicBool>,
+    ipn_backend: Arc<IpnBackend>,
 ) -> JoinHandle<()> {
     let mut named_filters: BTreeMap<String, Vec<FilterRule>> = BTreeMap::new();
     // Create the netmap cache helper once so that save_if_changed can
@@ -2707,6 +2757,7 @@ fn spawn_map_update_task(
                             .and_then(|n| n.KeyExpiry)
                             .is_some_and(|expiry| expiry < chrono::Utc::now());
                     key_expired.store(expired, std::sync::atomic::Ordering::Relaxed);
+                    ipn_backend.set_key_expired(expired);
                     if expired {
                         eprintln!("tsnet: node key expired (signalled by control)");
                         if let Some(ref dir) = state_dir {
@@ -2758,6 +2809,12 @@ fn spawn_map_update_task(
                         .write()
                         .await
                         .rebuild_with_opts(&peers, accept_routes);
+
+                    // Update IPN engine status: peer count as NumLive, DERP
+                    // home connection as LiveDERPs. This may transition the
+                    // state machine from Starting to Running.
+                    let live_count = peers.iter().filter(|p| !p.Key.is_zero()).count() as i32;
+                    ipn_backend.set_engine_status(live_count, 1);
 
                     // Refresh the shared MagicDNS resolver with the new peers.
                     resolver.write().await.set_peers(peers.clone());

@@ -9,9 +9,9 @@
 //! 3. If WantRunning is false, the state must not be Running or Starting.
 //! 4. The state machine must never panic on any input combination.
 //!
-//! Invariants 1-3 are currently violated by `next_state` for some input
-//! combinations. See the `#[ignore = "BUG: ..."]` regression tests below
-//! for the specific cases. Invariant 4 holds for all inputs.
+//! Invariants 1-3 are enforced by `next_state` for all input combinations.
+//! The regression tests below pin the specific cases that previously violated
+//! them. Invariant 4 holds for all inputs.
 
 #![allow(non_snake_case)]
 
@@ -101,10 +101,8 @@ proptest! {
 proptest! {
     /// Invariants 1-3: the state machine contract.
     ///
-    /// Currently fails for some input combinations — see the regression
-    /// tests below for the specific cases.
+    /// All three invariants hold for every (state, input) combination.
     #[test]
-    #[ignore = "BUG: invariants 1-3 violated by next_state for some (state, input) combinations — see regression tests below. See docs/regression-strategy.md G6."]
     fn state_machine_contract_invariants(
         state in state_strategy(),
         inputs in inputs_strategy(),
@@ -146,18 +144,14 @@ proptest! {
 }
 
 // ---------------------------------------------------------------------------
-// Regression tests: specific (state, input) combinations that violate
-// invariants 1-3. These are #[ignore]d because they assert the invariant
-// (the contract), not the current (buggy) behavior. When the state machine
-// is fixed to enforce the invariant, these tests will pass and the
-// #[ignore] can be removed.
+// Regression tests: specific (state, input) combinations that previously
+// violated invariants 1-3. They assert the invariant (the contract), not the
+// old buggy behavior, and now pass after the state machine was fixed.
 // ---------------------------------------------------------------------------
 
-/// Invariant 1 violation: `next_state` returns Running (Case 8) when
-/// `blocked=true` and `current_state=Running`. The state machine does not
-/// enforce that a Running state implies `blocked=false`.
+/// Invariant 1: `next_state` must not return Running when `blocked=true`.
+/// Previously Case 8 returned Running unconditionally for state==Running.
 #[test]
-#[ignore = "BUG: invariant 1 — next_state returns Running when blocked=true (Case 8: state==Running → Running unconditionally). See docs/regression-strategy.md G6."]
 fn invariant_1_running_with_blocked_true() {
     let inputs = StateMachineInputs {
         want_running: true,
@@ -179,11 +173,9 @@ fn invariant_1_running_with_blocked_true() {
     );
 }
 
-/// Invariant 2 violation: `next_state` returns Stopped (Case 3) when
-/// `logged_out=true`, `want_running=false`, and `netmap_present=true`.
-/// The state machine should return NeedsLogin when logged_out, not Stopped.
+/// Invariant 2: `next_state` must return NeedsLogin when `logged_out=true`.
+/// Previously Case 3 returned Stopped for !want_running, ignoring logged_out.
 #[test]
-#[ignore = "BUG: invariant 2 — next_state returns Stopped when logged_out=true and want_running=false (Case 3: !wantRunning → Stopped, ignoring logged_out). See docs/regression-strategy.md G6."]
 fn invariant_2_logged_out_returns_stopped_not_needs_login() {
     let inputs = StateMachineInputs {
         want_running: false,
@@ -205,12 +197,10 @@ fn invariant_2_logged_out_returns_stopped_not_needs_login() {
     );
 }
 
-/// Invariant 3 violation: `next_state` returns Running (Case 2, no netmap)
-/// when `want_running=false`, `blocked=true`, `netmap_present=false`, and
-/// `current_state=Running`. Case 2 keeps the current state when netmap is
-/// absent, even if want_running is false.
+/// Invariant 3: `next_state` must not return Running or Starting when
+/// `want_running=false`. Previously Case 2 (no netmap) kept the current state
+/// even when want_running was false.
 #[test]
-#[ignore = "BUG: invariant 3 — next_state returns Running when !want_running and no netmap (Case 2: no netmap → keep current state, ignoring want_running). See docs/regression-strategy.md G6."]
 fn invariant_3_not_want_running_but_running() {
     let inputs = StateMachineInputs {
         want_running: false,

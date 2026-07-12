@@ -443,15 +443,12 @@ mod tests {
         backend.set_engine_status(1, 0);
         assert_eq!(backend.state(), State::Running);
 
-        // Now block engine updates and set want_running=false. Without
-        // blocked, this would be Stopped (Case 1). With blocked=true,
-        // Case 1 is suppressed and Case 3 (!wantRunning → Stopped) is
-        // also reached — but only when netmap is present. The key
-        // scenario is: blocked + want_running=true → stays Starting,
-        // not Stopped.
+        // Now block engine updates while Running. Per invariant 1, a blocked
+        // node must not remain in Running — it drops to NeedsLogin (waiting
+        // for auth/unblock).
         backend.set_blocked(true);
         assert!(backend.blocked());
-        assert_eq!(backend.state(), State::Running); // no change with netmap present
+        assert_eq!(backend.state(), State::NeedsLogin);
 
         // With want_running=true, blocked=true, no netmap, the state
         // should NOT be Stopped — it should be Starting (from NoState).

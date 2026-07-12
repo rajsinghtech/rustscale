@@ -339,10 +339,12 @@ impl ProfileManager {
             return false;
         }
         let was_expired = self.key_expiry.is_expired;
-        self.key_expiry.is_expired = self.key_expiry.expiry_unix <= now_unix;
-        let nearing = self.key_expiry.expiry_unix - now_unix <= threshold_secs;
+        let remaining = self.key_expiry.expiry_unix - now_unix;
+        self.key_expiry.is_expired = remaining <= 0;
         let just_expired = self.key_expiry.is_expired && !was_expired;
-        just_expired || (nearing && self.key_expiry.is_expired)
+        // Trigger re-registration only on the expired transition, or when
+        // nearing expiry within the threshold (but not yet expired).
+        just_expired || (remaining > 0 && remaining <= threshold_secs)
     }
 
     /// Set the key-expiry timestamp for the current profile (e.g. from a
@@ -362,7 +364,7 @@ impl ProfileManager {
     pub fn set_prefs(&mut self, prefs: Prefs) -> Result<(), std::io::Error> {
         self.prefs = prefs;
         self.prefs.save(&self.state_dir)?;
-        if let Some(ref profile) = self.current_profile() {
+        if let Some(profile) = self.current_profile() {
             if let Some(ref hook) = self.state_change_hook {
                 hook(profile, &self.prefs);
             }
@@ -662,8 +664,10 @@ mod tests {
         pm.new_profile("test").unwrap();
         hook_fired.store(false, std::sync::atomic::Ordering::SeqCst);
 
-        let mut prefs = Prefs::default();
-        prefs.WantRunning = true;
+        let mut prefs = Prefs {
+            WantRunning: true,
+            ..Default::default()
+        };
         pm.set_prefs(prefs).unwrap();
         assert!(hook_fired.load(std::sync::atomic::Ordering::SeqCst));
     }

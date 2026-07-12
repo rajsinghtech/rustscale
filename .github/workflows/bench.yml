@@ -20,15 +20,15 @@ jobs:
       id-token: write
       contents: read
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
 
       - name: Install system tools
         run: |
           sudo apt-get update
           sudo apt-get install -y iperf3 socat ncat jq
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
 
       - name: Mint Tailscale org token via GitHub OIDC (WIF)
         id: tsauth
@@ -45,7 +45,7 @@ jobs:
           echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
 
       - name: Build rustscale-bench
-        run: cargo build -p rustscale-bench --release
+        run: cargo build -p rustscale-bench --release --locked
 
       - name: Run rustscale benchmark
         env:
@@ -71,7 +71,7 @@ jobs:
         run: tools/bench/run-tailscaled.sh
 
       - name: Upload bench results
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: bench-results
           path: bench-results/

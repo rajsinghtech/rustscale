@@ -32,6 +32,9 @@ param(
 $ErrorActionPreference = 'Stop'
 $Repo = 'rajsinghtech/rustscale'
 $Archive = 'rustscale-x86_64-pc-windows-msvc.zip'
+# Fallback version when the GitHub API is unreachable (private repos, rate
+# limits, offline). Bump with each release.
+$DefaultVersion = 'v0.1.0'
 
 function Get-InstallDir {
     if ($Scope -eq 'System') {
@@ -44,9 +47,36 @@ function Get-DownloadUrl {
     if ($Version) {
         return "https://github.com/$Repo/releases/download/$Version/$Archive"
     }
-    $apiUrl = "https://api.github.com/repos/$Repo/releases/latest"
-    $release = Invoke-RestMethod -Uri $apiUrl -UseBasicParsing
-    $Version = $release.tag_name
+
+    # Try the releases/latest redirect first (works for public repos without API).
+    try {
+        $resp = Invoke-WebRequest -Uri "https://github.com/$Repo/releases/latest" `
+            -Method Head -MaximumRedirection 0 -ErrorAction Stop -UseBasicParsing
+    } catch [System.Net.Http.HttpRequestException] {
+        $resp = $_.Exception.Response
+    }
+    if ($resp -and $resp.Headers.Location) {
+        $tag = ($resp.Headers.Location -split '/')[-1]
+        if ($tag -match '^v') {
+            $Version = $tag
+            return "https://github.com/$Repo/releases/download/$Version/$Archive"
+        }
+    }
+
+    # Try the GitHub API.
+    try {
+        $apiUrl = "https://api.github.com/repos/$Repo/releases/latest"
+        $release = Invoke-RestMethod -Uri $apiUrl -UseBasicParsing
+        if ($release.tag_name) {
+            $Version = $release.tag_name
+            return "https://github.com/$Repo/releases/download/$Version/$Archive"
+        }
+    } catch {
+        # Fall through to default.
+    }
+
+    # Fallback to hardcoded default.
+    $Version = $DefaultVersion
     return "https://github.com/$Repo/releases/download/$Version/$Archive"
 }
 
@@ -122,7 +152,7 @@ function Do-Install {
     $tempExtract = Join-Path $env:TEMP "rustscale-install-$([guid]::NewGuid())"
 
     try {
-        Invoke-WebRequest -Uri $url -OutFile $tempZip -UseBasicParsing
+        Invoke-WebRequest -Uri $url -OutFile $tempZip -UseBasicParsing -ErrorAction Stop
         Expand-Archive -Path $tempZip -DestinationPath $tempExtract -Force
 
         if (-not (Test-Path $installDir)) {
@@ -147,6 +177,19 @@ function Do-Install {
         Write-Host "  rustscaled run          # start the daemon"
         Write-Host "  rustscale up            # connect to a tailnet"
         Write-Host "  rustscale status        # check state"
+    } catch {
+        Write-Host "rustscale: download failed: $url" -ForegroundColor Red
+        Write-Host ""
+        Write-Host "This can happen if:" -ForegroundColor Yellow
+        Write-Host "  - the repository is private (release assets require auth)"
+        Write-Host "  - the version '$Version' doesn't have an asset named '$Archive'"
+        Write-Host "  - there's a network issue"
+        Write-Host ""
+        Write-Host "If the repo is private, download the archive from:"
+        Write-Host "  https://github.com/$Repo/releases"
+        Write-Host "and install manually, or build from source:"
+        Write-Host "  git clone https://github.com/$Repo && sh rustscale/scripts/install-from-source.sh"
+        exit 1
     } finally {
         Remove-Item $tempZip -ErrorAction SilentlyContinue
         Remove-Item $tempExtract -Recurse -ErrorAction SilentlyContinue

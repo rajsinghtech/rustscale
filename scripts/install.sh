@@ -35,6 +35,9 @@ set -eu
 PREFIX="${PREFIX:-/usr/local}"
 VERSION="${VERSION:-}"
 REPO="rajsinghtech/rustscale"
+# Fallback version when the GitHub API is unreachable (e.g. private repos,
+# rate limits, offline). Bump this with each release.
+DEFAULT_VERSION="v0.1.0"
 
 # Kept empty until assigned; the trap guard keeps set -u happy.
 WORKDIR=
@@ -161,23 +164,41 @@ choose_sudo() {
     fi
 }
 
-# Resolve the download URL. If VERSION is set, use the direct asset URL.
-# Otherwise query the GitHub API for the latest release tag.
+# Resolve the download URL. Tries, in order:
+#   1. Explicit --version / VERSION env var
+#   2. GitHub releases/latest redirect (works for public repos, no API needed)
+#   3. GitHub API (works for public repos, returns JSON)
+#   4. DEFAULT_VERSION fallback (works when offline or repo is private)
 resolve_url() {
     if [ -n "$VERSION" ]; then
         DOWNLOAD_URL="https://github.com/$REPO/releases/download/$VERSION/$ARCHIVE"
-    else
-        # Query the latest release API, extract the tag_name, then build the
-        # direct asset URL. jq is not assumed — use sed/grep.
-        API_URL="https://api.github.com/repos/$REPO/releases/latest"
-        TAG=$($CURL "$API_URL" | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')
-        if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
-            echo "rustscale: could not determine latest release tag from GitHub API" >&2
-            exit 1
-        fi
+        return
+    fi
+
+    # Approach 2: follow the releases/latest redirect and extract the tag
+    # from the final URL (302 → /releases/tag/v0.1.0).
+    TAG=$(curl -fsSI -o /dev/null -w '%{url_effective}' \
+        "https://github.com/$REPO/releases/latest" 2>/dev/null \
+        | grep -oE 'tag/[^"]+' | head -1 | sed 's|tag/||')
+    if [ -n "$TAG" ]; then
         VERSION="$TAG"
         DOWNLOAD_URL="https://github.com/$REPO/releases/download/$TAG/$ARCHIVE"
+        return
     fi
+
+    # Approach 3: GitHub API.
+    API_URL="https://api.github.com/repos/$REPO/releases/latest"
+    TAG=$($CURL "$API_URL" 2>/dev/null | grep -m1 '"tag_name"' \
+        | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')
+    if [ -n "$TAG" ] && [ "$TAG" != "null" ]; then
+        VERSION="$TAG"
+        DOWNLOAD_URL="https://github.com/$REPO/releases/download/$TAG/$ARCHIVE"
+        return
+    fi
+
+    # Approach 4: fallback to the hardcoded default.
+    VERSION="$DEFAULT_VERSION"
+    DOWNLOAD_URL="https://github.com/$REPO/releases/download/$VERSION/$ARCHIVE"
 }
 
 # Pick a HTTP client.
@@ -199,8 +220,18 @@ download_and_install() {
 
     echo "rustscale: downloading $ARCHIVE from release $VERSION"
     WORKDIR=$(mktemp -d -t rustscale-install)
-    if ! $CURL -o "$WORKDIR/$ARCHIVE" "$DOWNLOAD_URL"; then
+    if ! $CURL -o "$WORKDIR/$ARCHIVE" "$DOWNLOAD_URL" 2>/dev/null; then
         echo "rustscale: download failed: $DOWNLOAD_URL" >&2
+        echo >&2
+        echo "rustscale: this can happen if:" >&2
+        echo "  - the repository is private (release assets require auth)" >&2
+        echo "  - the version '$VERSION' doesn't have an asset named '$ARCHIVE'" >&2
+        echo "  - there's a network issue" >&2
+        echo >&2
+        echo "If the repo is private, download the archive from:" >&2
+        echo "  https://github.com/$REPO/releases" >&2
+        echo "and install manually, or build from source:" >&2
+        echo "  git clone https://github.com/$REPO && sh rustscale/scripts/install-from-source.sh" >&2
         exit 1
     fi
 

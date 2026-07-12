@@ -50,6 +50,19 @@ pub fn next_state(inputs: &StateMachineInputs, current_state: State) -> State {
         if inputs.auth_cant_continue || inputs.logged_out {
             return State::NeedsLogin;
         }
+        // Invariant 3: !want_running must not yield Running or Starting. Case 1
+        // only catches !want_running when !blocked && has_node_key; the remaining
+        // !want_running paths (blocked or no node key) must still drop to Stopped
+        // rather than falling into the state switch below (which can return
+        // Running/Starting).
+        if !inputs.want_running {
+            return State::Stopped;
+        }
+        // Invariant 1: blocked prevents remaining in Running even before the
+        // netmap arrives.
+        if inputs.blocked && current_state == State::Running {
+            return State::NeedsLogin;
+        }
         return match current_state {
             // If we were already Stopped, auth is in good shape — transition
             // to Starting right away.
@@ -64,6 +77,13 @@ pub fn next_state(inputs: &StateMachineInputs, current_state: State) -> State {
     }
 
     // Past here, netmap is present.
+
+    // Invariant 2: logged_out forces NeedsLogin regardless of want_running or
+    // any other input. Go only checks logged_out inside the no-netmap branch,
+    // but the contract requires NeedsLogin whenever the user has logged out.
+    if inputs.logged_out {
+        return State::NeedsLogin;
+    }
 
     // Case 3: !wantRunning → Stopped
     if !inputs.want_running {
@@ -88,13 +108,21 @@ pub fn next_state(inputs: &StateMachineInputs, current_state: State) -> State {
     // Case 7: state == Starting → Running if engine has live peers/DERPs
     if current_state == State::Starting {
         if inputs.num_live > 0 || inputs.live_derps > 0 {
+            // Invariant 1: blocked prevents transition to Running.
+            if inputs.blocked {
+                return State::Starting;
+            }
             return State::Running;
         }
         return State::Starting;
     }
 
-    // Case 8: state == Running → Running
+    // Case 8: state == Running → Running (unless blocked)
     if current_state == State::Running {
+        // Invariant 1: blocked prevents remaining in Running.
+        if inputs.blocked {
+            return State::NeedsLogin;
+        }
         return State::Running;
     }
 
@@ -373,9 +401,9 @@ mod tests {
                 State::NoState,
                 State::Starting,
             ),
-            // --- Edge: logged_out with want_running false ---
+            // --- Edge: logged_out forces NeedsLogin even when want_running false ---
             (
-                "stopped when logged out but want_running false and has key",
+                "needs_login when logged out and want_running false with netmap",
                 StateMachineInputs {
                     want_running: false,
                     logged_out: true,
@@ -384,7 +412,7 @@ mod tests {
                     ..inputs()
                 },
                 State::NoState,
-                State::Stopped,
+                State::NeedsLogin,
             ),
             // --- Edge: blocked with want_running false ---
             (

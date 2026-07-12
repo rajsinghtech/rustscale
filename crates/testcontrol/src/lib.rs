@@ -69,6 +69,12 @@ struct ServerInner {
     suppress_auto: HashSet<NodePublic>,
     in_serve_map: i32,
     next_node_id: i64,
+    require_auth: bool,
+    auth_paths: HashMap<String, Arc<Notify>>,
+    auth_path_nodes: HashMap<String, NodePublic>,
+    authed_nodes: HashSet<NodePublic>,
+    last_auth_url: Option<String>,
+    base_url: String,
 }
 
 /// An in-process fake Tailscale control server.
@@ -111,6 +117,12 @@ impl Server {
                 suppress_auto: HashSet::new(),
                 in_serve_map: 0,
                 next_node_id: 1,
+                require_auth: false,
+                auth_paths: HashMap::new(),
+                auth_path_nodes: HashMap::new(),
+                authed_nodes: HashSet::new(),
+                last_auth_url: None,
+                base_url: String::new(),
             })),
             notify: Arc::new(Notify::new()),
             addr: None,
@@ -124,6 +136,10 @@ impl Server {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
         self.addr = Some(addr);
+        {
+            let mut inner = self.inner.lock().unwrap();
+            inner.base_url = format!("http://{addr}");
+        }
 
         let inner = self.inner.clone();
         let notify = self.notify.clone();
@@ -290,6 +306,50 @@ impl Server {
     /// Number of clients currently in a streaming map poll.
     pub fn in_serve_map(&self) -> i32 {
         self.inner.lock().unwrap().in_serve_map
+    }
+
+    /// Enable or disable interactive auth requirement. When enabled, new
+    /// register requests receive an AuthURL and must be completed via
+    /// [`complete_auth`](Self::complete_auth) before proceeding.
+    pub fn set_require_auth(&self, v: bool) {
+        self.inner.lock().unwrap().require_auth = v;
+    }
+
+    /// Complete the auth flow for the given auth URL or path. Finds the
+    /// matching entry in `auth_paths`, marks the node as authed, and
+    /// notifies the blocked register request. Returns `true` if the auth
+    /// path was found and completed.
+    pub fn complete_auth(&self, auth_url_or_path: &str) -> bool {
+        let path = extract_auth_path(auth_url_or_path);
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(notify) = inner.auth_paths.remove(&path) {
+            if let Some(nk) = inner.auth_path_nodes.remove(&path) {
+                inner.authed_nodes.insert(nk);
+            }
+            notify.notify_waiters();
+            return true;
+        }
+        false
+    }
+
+    /// Wait until a register produces an AuthURL and return it. Times out
+    /// after `timeout`.
+    pub async fn await_auth_url(&self, timeout: std::time::Duration) -> Result<String, String> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            {
+                let inner = self.inner.lock().unwrap();
+                if let Some(ref url) = inner.last_auth_url {
+                    return Ok(url.clone());
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err("timeout waiting for auth URL".into());
+            }
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_millis(50), self.notify.notified())
+                    .await;
+        }
     }
 }
 
@@ -528,7 +588,7 @@ async fn handle_h2_request(
     match path {
         "/machine/register" => {
             let body = read_h2_body(&mut req_body).await.map_err(|_| ())?;
-            let resp_body = serve_register(&body, peer_machine_key, inner);
+            let resp_body = serve_register(&body, peer_machine_key, inner, notify).await;
             let resp = http::Response::builder()
                 .status(200)
                 .header("content-type", "application/json")
@@ -561,10 +621,13 @@ async fn handle_h2_request(
 // -----------------------------------------------------------------
 
 /// Handle a register request: create/update the node, return a RegisterResponse.
-fn serve_register(
+/// When `require_auth` is enabled and the node hasn't been authed, returns an
+/// AuthURL. When `Followup` is set, blocks until `complete_auth` is called.
+async fn serve_register(
     body: &[u8],
     peer_machine_key: &MachinePublic,
     inner: &Arc<Mutex<ServerInner>>,
+    notify: &Arc<Notify>,
 ) -> Vec<u8> {
     let req: RegisterRequest = match serde_json::from_slice(body) {
         Ok(r) => r,
@@ -586,48 +649,68 @@ fn serve_register(
 
     let nk = req.NodeKey.clone();
 
+    // If this is a followup request, block until auth is completed.
+    if !req.Followup.is_empty() {
+        let path = extract_auth_path(&req.Followup);
+        let auth_notify = {
+            let g = inner.lock().unwrap();
+            g.auth_paths.get(&path).cloned()
+        };
+        if let Some(an) = auth_notify {
+            an.notified().await;
+        }
+        let mut g = inner.lock().unwrap();
+        let (user, login) = get_or_create_user(&mut g, &nk);
+        ensure_node_exists(&mut g, &nk, peer_machine_key, &req);
+        let resp = RegisterResponse {
+            User: user,
+            Login: login,
+            MachineAuthorized: true,
+            ..Default::default()
+        };
+        return serde_json::to_vec(&resp).unwrap_or_default();
+    }
+
     let (user, login) = {
-        let mut inner = inner.lock().unwrap();
-        get_or_create_user(&mut inner, &nk)
+        let mut g = inner.lock().unwrap();
+        get_or_create_user(&mut g, &nk)
     };
 
-    let mut inner = inner.lock().unwrap();
-    let _node_id = if let Some(existing) = inner.nodes.get(&nk) {
-        existing.ID
-    } else {
-        let id = inner.next_node_id;
-        inner.next_node_id += 1;
-        let ip4 = format!("100.64.{}.{}", (id >> 8) as u8, id as u8);
-        let v4_prefix = format!("{ip4}/32");
-        let v6_prefix = format!("fd7a:115c:a1e0::{id:x}/128");
-        let allowed_ips = vec![v4_prefix, v6_prefix];
+    // Always create the node on first register, even if auth is required.
+    // The node needs to exist before map requests can succeed.
+    {
+        let mut g = inner.lock().unwrap();
+        ensure_node_exists(&mut g, &nk, peer_machine_key, &req);
+    }
 
-        let hostname = req
-            .Hostinfo
-            .as_ref()
-            .map(|h| h.Hostname.clone())
-            .unwrap_or_default();
-
-        inner.nodes.insert(
-            nk.clone(),
-            Node {
-                ID: id,
-                StableID: format!("TESTCTRL{id:08x}"),
-                User: user.ID,
-                Machine: peer_machine_key.clone(),
-                Key: nk.clone(),
-                Addresses: allowed_ips.clone(),
-                AllowedIPs: allowed_ips,
-                Name: hostname,
-                Cap: req.Version,
-                Hostinfo: req.Hostinfo.clone(),
-                ..Default::default()
-            },
-        );
-        id
+    // Check if auth is required and the node hasn't been authed yet.
+    let needs_auth = {
+        let g = inner.lock().unwrap();
+        g.require_auth && !g.authed_nodes.contains(&nk)
     };
 
-    let node_key_expired = inner.all_expired;
+    if needs_auth {
+        let auth_path = format!("/auth/{}", random_hex(16));
+        let auth_notify = Arc::new(Notify::new());
+        let auth_url = {
+            let mut g = inner.lock().unwrap();
+            let url = format!("{}{}", g.base_url, auth_path);
+            g.auth_paths.insert(auth_path.clone(), auth_notify.clone());
+            g.auth_path_nodes.insert(auth_path, nk.clone());
+            g.last_auth_url = Some(url.clone());
+            url
+        };
+        notify.notify_waiters();
+        let resp = RegisterResponse {
+            User: user,
+            Login: login,
+            AuthURL: auth_url,
+            ..Default::default()
+        };
+        return serde_json::to_vec(&resp).unwrap_or_default();
+    }
+
+    let node_key_expired = inner.lock().unwrap().all_expired;
 
     let resp = RegisterResponse {
         User: user,
@@ -638,6 +721,69 @@ fn serve_register(
         Error: String::new(),
     };
     serde_json::to_vec(&resp).unwrap_or_default()
+}
+
+/// Ensure a node exists in the server's node map. Creates it if not present.
+fn ensure_node_exists(
+    inner: &mut ServerInner,
+    nk: &NodePublic,
+    peer_machine_key: &MachinePublic,
+    req: &RegisterRequest,
+) {
+    if inner.nodes.contains_key(nk) {
+        return;
+    }
+    let id = inner.next_node_id;
+    inner.next_node_id += 1;
+    let ip4 = format!("100.64.{}.{}", (id >> 8) as u8, id as u8);
+    let v4_prefix = format!("{ip4}/32");
+    let v6_prefix = format!("fd7a:115c:a1e0::{id:x}/128");
+    let allowed_ips = vec![v4_prefix, v6_prefix];
+
+    let hostname = req
+        .Hostinfo
+        .as_ref()
+        .map(|h| h.Hostname.clone())
+        .unwrap_or_default();
+
+    let (user, _) = get_or_create_user(inner, nk);
+
+    inner.nodes.insert(
+        nk.clone(),
+        Node {
+            ID: id,
+            StableID: format!("TESTCTRL{id:08x}"),
+            User: user.ID,
+            Machine: peer_machine_key.clone(),
+            Key: nk.clone(),
+            Addresses: allowed_ips.clone(),
+            AllowedIPs: allowed_ips,
+            Name: hostname,
+            Cap: req.Version,
+            Hostinfo: req.Hostinfo.clone(),
+            ..Default::default()
+        },
+    );
+}
+
+/// Extract the `/auth/...` path from a full URL or a bare path.
+fn extract_auth_path(s: &str) -> String {
+    if let Some(idx) = s.find("/auth/") {
+        s[idx..].to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+/// Generate a random hex string of the given byte length.
+fn random_hex(bytes: usize) -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let pid = std::process::id();
+    format!("{ts:024x}{pid:08x}")[..bytes * 2].to_string()
 }
 
 /// Get or create a User + Login for a node key (matching Go's `getUser`).

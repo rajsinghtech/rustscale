@@ -1,12 +1,14 @@
-//! Subcommand implementations. Each module mirrors the corresponding Go
-//! `cmd/tailscale/cli/*.go` source in output format and flag semantics.
-
 pub mod down;
+pub mod get;
 pub mod health;
 pub mod ip;
+pub mod login;
+pub mod logout;
 pub mod metrics;
 pub mod netcheck;
 pub mod ping;
+pub mod set;
 pub mod status;
+pub mod up;
 pub mod version;
 pub mod whois;

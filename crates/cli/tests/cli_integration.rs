@@ -296,3 +296,203 @@ async fn cli_netmap_includes_derp_map() {
 
     env.server.close().await;
 }
+
+// ---------------------------------------------------------------------------
+// Interactive auth integration test
+// ---------------------------------------------------------------------------
+
+/// Interactive auth flow: daemon starts with no auth key in NeedsLogin →
+/// CLI up → testcontrol issues AuthURL → testcontrol completes auth →
+/// CLI sees Running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn interactive_auth_flow() {
+    use rustscale_ipn::NOTIFY_INITIAL_STATE;
+    use rustscale_localclient::LocalClient;
+
+    // 1. Start testcontrol with require_auth.
+    let mut tc = TestControlServer::new();
+    let _addr = tc.start().await.expect("testcontrol start");
+    tc.set_require_auth(true);
+    let control_url = tc.base_url();
+    eprintln!("testcontrol (require_auth) listening at {control_url}");
+
+    // 2. Prepare temp dirs.
+    let state_tmp = tempfile::tempdir().expect("state tempdir");
+    let sock_tmp = tempfile::tempdir().expect("socket tempdir");
+    let socket_path: PathBuf = sock_tmp.path().join("rustscale-auth-test.sock");
+    let _ = std::fs::remove_file(&socket_path);
+
+    // 3. Build tsnet Server WITHOUT auth_key — start_localapi_only().
+    let mut server = Server::builder()
+        .hostname("auth-test")
+        .control_url(&control_url)
+        .ephemeral(true)
+        .state_dir(state_tmp.path().to_path_buf())
+        .localapi_path(&socket_path)
+        .build()
+        .expect("tsnet build");
+
+    let mut command_rx = server
+        .start_localapi_only()
+        .await
+        .expect("start_localapi_only");
+
+    // 4. Wait for LocalAPI socket.
+    wait_for_socket(&socket_path, Duration::from_secs(10));
+    eprintln!("LocalAPI socket ready at {}", socket_path.display());
+
+    // 5. Verify the daemon is in NeedsLogin state.
+    let lc = LocalClient::new(&socket_path);
+    let status = lc.status().await.expect("status");
+    let backend_state = status
+        .get("BackendState")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Unknown");
+    eprintln!("Initial backend state: {backend_state}");
+    assert!(
+        backend_state == "NeedsLogin" || backend_state == "NoState",
+        "expected NeedsLogin or NoState, got {backend_state}"
+    );
+
+    // 6. Start a watch-ipn-bus stream to observe BrowseToURL + state changes.
+    let mut watch = lc
+        .watch_ipn_bus(NOTIFY_INITIAL_STATE)
+        .await
+        .expect("watch_ipn_bus");
+
+    // 7. Send /start (no auth_key) to trigger bootstrap.
+    let start_opts = rustscale_ipn::StartOptions {
+        UpdatePrefs: Some(rustscale_ipn::MaskedPrefs {
+            Prefs: rustscale_ipn::Prefs {
+                WantRunning: true,
+                ..Default::default()
+            },
+            WantRunningSet: true,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    lc.start(&start_opts).await.expect("start");
+
+    // 8. Receive the Start command and call up() in a background task.
+    //    up() will block on login_trigger during the auth flow.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let up_task = {
+        tokio::spawn(async move {
+            if let Some(cmd) = command_rx.recv().await {
+                match cmd {
+                    rustscale_tsnet::localapi::DaemonCommand::Start { auth_key: _ } => {
+                        eprintln!("received Start command, calling up()...");
+                        let result = Box::pin(server.up()).await;
+                        if let Err(e) = &result {
+                            eprintln!("up() failed: {e}");
+                        }
+                        eprintln!("up() completed");
+                        let _ = shutdown_rx.await;
+                        eprintln!("shutting down server...");
+                        server.close().await;
+                        eprintln!("server closed");
+                    }
+                    _ => {
+                        eprintln!("unexpected command: {cmd:?}");
+                    }
+                }
+            }
+        })
+    };
+
+    // 9. Wait for BrowseToURL from the watch-ipn-bus stream.
+    let mut auth_url: Option<String> = None;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while auth_url.is_none() {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let msg = tokio::time::timeout(remaining, watch.next())
+            .await
+            .expect("timeout waiting for BrowseToURL")
+            .expect("connection error")
+            .expect("stream closed");
+        if let Some(ref url) = msg.BrowseToURL {
+            auth_url = Some(url.clone());
+            eprintln!("Got BrowseToURL: {url}");
+        }
+        if let Some(state) = msg.State {
+            eprintln!("State: {state}");
+        }
+    }
+
+    let auth_url = auth_url.expect("should have received BrowseToURL");
+
+    // 10. Trigger login (unblocks bootstrap's login_trigger wait).
+    eprintln!("Triggering login-interactive...");
+    lc.login_interactive().await.expect("login_interactive");
+
+    // 11. Complete auth on the testcontrol server.
+    eprintln!("Completing auth for {auth_url}...");
+    assert!(
+        tc.complete_auth(&auth_url),
+        "complete_auth should succeed for the auth URL"
+    );
+    eprintln!("Auth completed on testcontrol");
+
+    // 11. Wait for state to reach Running.
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        assert!(!remaining.is_zero(), "timeout waiting for Running state");
+        let msg = match tokio::time::timeout(remaining, watch.next()).await {
+            Ok(Ok(Some(n))) => n,
+            Ok(Ok(None)) => {
+                eprintln!("watch-ipn-bus stream closed; reconnecting...");
+                // The pre-started LocalAPI may have been replaced by the full one.
+                // Reconnect to the new LocalAPI.
+                watch = lc
+                    .watch_ipn_bus(NOTIFY_INITIAL_STATE)
+                    .await
+                    .expect("watch_ipn_bus reconnect");
+                continue;
+            }
+            Ok(Err(e)) => {
+                eprintln!("watch-ipn-bus error: {e}; reconnecting...");
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                watch = lc
+                    .watch_ipn_bus(NOTIFY_INITIAL_STATE)
+                    .await
+                    .expect("watch_ipn_bus reconnect");
+                continue;
+            }
+            Err(elapsed) => panic!("timeout waiting for Running state: {elapsed:?}"),
+        };
+
+        if let Some(state) = msg.State {
+            eprintln!("State: {state}");
+            if state == rustscale_ipn::State::Running {
+                eprintln!("Interactive auth flow complete: Running!");
+                break;
+            }
+        }
+        if let Some(ref err) = msg.ErrMessage {
+            eprintln!("Error from daemon: {err}");
+        }
+    }
+
+    // 12. Verify status via localclient.
+    let status = lc.status().await.expect("status after up");
+    let backend_state = status
+        .get("BackendState")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Unknown");
+    assert_eq!(
+        backend_state, "Running",
+        "expected Running after interactive auth, got {backend_state}"
+    );
+
+    // 13. Verify prefs are accessible.
+    let prefs = lc.get_prefs().await.expect("get_prefs");
+    assert!(prefs.WantRunning, "WantRunning should be true after up");
+
+    eprintln!("Interactive auth integration test passed!");
+
+    // Clean up.
+    let _ = shutdown_tx.send(());
+    let _ = up_task.await;
+}

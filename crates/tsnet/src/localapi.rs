@@ -28,16 +28,26 @@ use std::sync::Arc;
 
 use rustscale_health::{Severity, Tracker};
 use rustscale_ipn::{
-    validate_notify_watch_opt, IpnBackend, NotifyWatchOpt, NOTIFY_IN_PROCESS_NO_DISCONNECT,
+    validate_notify_watch_opt, IpnBackend, MaskedPrefs, NotifyWatchOpt, Prefs, StartOptions,
+    NOTIFY_IN_PROCESS_NO_DISCONNECT,
 };
 use rustscale_magicsock::{Magicsock, PathClass};
 use rustscale_tailcfg::{DERPMap, DNSConfig, Node, UserID, UserProfile};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UnixListener;
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 use tokio::task::JoinHandle;
 
 const API_PREFIX: &str = "/localapi/v0/";
+
+/// Commands sent from LocalAPI handlers to the daemon for actions that
+/// require server-level operations (start, login, logout).
+#[derive(Clone, Debug)]
+pub enum DaemonCommand {
+    Start { auth_key: Option<String> },
+    LoginInteractive,
+    Logout,
+}
 
 /// Shared state for the LocalAPI server — all fields are Arc clones of the
 /// same state held by [`crate::RunningState`], so the API always sees live
@@ -48,7 +58,7 @@ pub(crate) struct LocalApiState {
     pub health: Tracker,
     pub dns_config: Arc<RwLock<Option<DNSConfig>>>,
     pub packet_drops: Arc<AtomicU64>,
-    pub prefs: serde_json::Value,
+    pub prefs: Arc<RwLock<Prefs>>,
     pub tailscale_ips: Vec<IpAddr>,
     pub our_fqdn: String,
     pub hostname: String,
@@ -57,11 +67,14 @@ pub(crate) struct LocalApiState {
     pub home_derp: i32,
     pub ipn_backend: Arc<IpnBackend>,
     pub derp_map: DERPMap,
+    pub command_tx: Option<mpsc::UnboundedSender<DaemonCommand>>,
+    pub state_dir: Option<PathBuf>,
+    #[allow(dead_code)]
+    pub auth_url: Arc<std::sync::Mutex<Option<String>>>,
+    pub login_trigger: Arc<tokio::sync::Notify>,
 }
 
-/// Result of spawning the LocalAPI server: the background task handle and
-/// the resolved socket path.
-pub(crate) struct LocalApiHandle {
+pub struct LocalApiHandle {
     pub task: JoinHandle<()>,
     pub socket_path: PathBuf,
 }
@@ -235,6 +248,124 @@ async fn write_raw_response<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
+async fn write_no_content_response<W: AsyncWrite + Unpin>(
+    conn: &mut W,
+    status: u16,
+    reason: &str,
+) -> Result<(), std::io::Error> {
+    let header =
+        format!("HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    conn.write_all(header.as_bytes()).await?;
+    conn.flush().await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Start / login-interactive / logout / prefs handlers
+// ---------------------------------------------------------------------------
+
+async fn handle_start<W: AsyncWrite + Unpin>(
+    conn: &mut W,
+    body: &[u8],
+    state: &Arc<LocalApiState>,
+) -> Result<(), std::io::Error> {
+    let opts: StartOptions = if body.is_empty() {
+        StartOptions::default()
+    } else {
+        match serde_json::from_slice(body) {
+            Ok(o) => o,
+            Err(e) => {
+                let err = serde_json::json!({"error": format!("bad StartOptions: {e}")});
+                write_json_response(conn, 400, "Bad Request", &err).await?;
+                return Ok(());
+            }
+        }
+    };
+
+    if let Some(ref mask) = opts.UpdatePrefs {
+        let mut prefs = state.prefs.write().await;
+        mask.apply_to(&mut prefs);
+        if let Some(ref dir) = state.state_dir {
+            let _ = prefs.save(dir);
+        }
+        state.ipn_backend.bus().send(rustscale_ipn::Notify {
+            Prefs: Some(serde_json::to_value(&*prefs).unwrap_or_default()),
+            ..Default::default()
+        });
+    }
+
+    if let Some(ref tx) = state.command_tx {
+        let _ = tx.send(DaemonCommand::Start {
+            auth_key: if opts.AuthKey.is_empty() {
+                None
+            } else {
+                Some(opts.AuthKey.clone())
+            },
+        });
+    }
+    write_no_content_response(conn, 204, "No Content").await?;
+    Ok(())
+}
+
+async fn handle_logout<W: AsyncWrite + Unpin>(
+    conn: &mut W,
+    state: &Arc<LocalApiState>,
+) -> Result<(), std::io::Error> {
+    {
+        let mut prefs = state.prefs.write().await;
+        prefs.LoggedOut = true;
+        prefs.WantRunning = false;
+        if let Some(ref dir) = state.state_dir {
+            let _ = prefs.save(dir);
+        }
+    }
+    state.ipn_backend.set_auth_cant_continue(true);
+    state.ipn_backend.bus().send(rustscale_ipn::Notify {
+        Prefs: Some(serde_json::to_value(&*state.prefs.read().await).unwrap_or_default()),
+        ..Default::default()
+    });
+    if let Some(ref tx) = state.command_tx {
+        let _ = tx.send(DaemonCommand::Logout);
+    }
+    write_no_content_response(conn, 204, "No Content").await?;
+    Ok(())
+}
+
+async fn handle_patch_prefs<W: AsyncWrite + Unpin>(
+    conn: &mut W,
+    body: &[u8],
+    state: &Arc<LocalApiState>,
+) -> Result<(), std::io::Error> {
+    let masked: MaskedPrefs = if body.is_empty() {
+        MaskedPrefs::default()
+    } else {
+        match serde_json::from_slice(body) {
+            Ok(m) => m,
+            Err(e) => {
+                let err = serde_json::json!({"error": format!("bad MaskedPrefs: {e}")});
+                write_json_response(conn, 400, "Bad Request", &err).await?;
+                return Ok(());
+            }
+        }
+    };
+
+    let updated = {
+        let mut prefs = state.prefs.write().await;
+        masked.apply_to(&mut prefs);
+        if let Some(ref dir) = state.state_dir {
+            let _ = prefs.save(dir);
+        }
+        serde_json::to_value(&*prefs).unwrap_or_default()
+    };
+
+    state.ipn_backend.bus().send(rustscale_ipn::Notify {
+        Prefs: Some(updated.clone()),
+        ..Default::default()
+    });
+    write_json_response(conn, 200, "OK", &updated).await?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Query string parsing
 // ---------------------------------------------------------------------------
@@ -299,6 +430,9 @@ async fn dispatch<W: AsyncWrite + Unpin>(
                     "/localapi/v0/health",
                     "/localapi/v0/ping",
                     "/localapi/v0/watch-ipn-bus",
+                    "/localapi/v0/start",
+                    "/localapi/v0/login-interactive",
+                    "/localapi/v0/logout",
                 ]);
                 write_json_response(conn, 200, "OK", &endpoints).await?;
             } else {
@@ -328,7 +462,30 @@ async fn dispatch<W: AsyncWrite + Unpin>(
 
         // --- GET /localapi/v0/prefs ---
         "prefs" if method == "GET" => {
-            write_json_response(conn, 200, "OK", &state.prefs).await?;
+            let prefs = state.prefs.read().await.clone();
+            let json = serde_json::to_value(&prefs).unwrap_or(serde_json::json!({}));
+            write_json_response(conn, 200, "OK", &json).await?;
+        }
+
+        // --- PATCH /localapi/v0/prefs ---
+        "prefs" if method == "PATCH" => {
+            handle_patch_prefs(conn, &req.body, state).await?;
+        }
+
+        // --- POST /localapi/v0/start ---
+        "start" if method == "POST" => {
+            handle_start(conn, &req.body, state).await?;
+        }
+
+        // --- POST /localapi/v0/login-interactive ---
+        "login-interactive" if method == "POST" => {
+            state.login_trigger.notify_waiters();
+            write_no_content_response(conn, 204, "No Content").await?;
+        }
+
+        // --- POST /localapi/v0/logout ---
+        "logout" if method == "POST" => {
+            handle_logout(conn, state).await?;
         }
 
         // --- GET /localapi/v0/netmap ---
@@ -839,7 +996,7 @@ async fn handle_watch_ipn_bus<W: AsyncWrite + Unpin>(
 
         // Build initial prefs if requested.
         let initial_prefs = if mask & NOTIFY_INITIAL_PREFS != 0 {
-            Some(state.prefs.clone())
+            Some(serde_json::to_value(&*state.prefs.read().await).unwrap_or_default())
         } else {
             None
         };
@@ -982,7 +1139,12 @@ mod tests {
             health: Tracker::new(),
             dns_config: Arc::new(RwLock::new(None)),
             packet_drops: Arc::new(AtomicU64::new(0)),
-            prefs: serde_json::json!({"hostname": "test", "control_url": "https://control"}),
+            prefs: Arc::new(RwLock::new(Prefs {
+                Hostname: "test".into(),
+                ControlURL: "https://control".into(),
+                WantRunning: true,
+                ..Default::default()
+            })),
             tailscale_ips: vec!["100.64.0.1".parse().unwrap()],
             our_fqdn: "test.tailnet.ts.net.".into(),
             hostname: "test".into(),
@@ -991,6 +1153,10 @@ mod tests {
             home_derp: 0,
             ipn_backend,
             derp_map: rustscale_tailcfg::DERPMap::default(),
+            command_tx: None,
+            state_dir: None,
+            auth_url: Arc::new(std::sync::Mutex::new(None)),
+            login_trigger: Arc::new(tokio::sync::Notify::new()),
         })
     }
 
@@ -1163,8 +1329,8 @@ mod tests {
         )
         .await;
         assert!(resp.contains("200 OK"));
-        assert!(resp.contains("hostname"));
-        assert!(resp.contains("control_url"));
+        assert!(resp.contains("Hostname"));
+        assert!(resp.contains("ControlURL"));
     }
 
     #[tokio::test]

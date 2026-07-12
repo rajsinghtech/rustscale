@@ -17,6 +17,7 @@ update statuses as phases land.
 | Port mapping (NAT-PMP/PCP/UPnP) | `net/portmapper/` | ✅ port-4 done (`crates/portmapper`: Client facade with probe/create/renew/cache lifecycle; PMP/PCP byte-exact packet codec with RFC test vectors; UPnP SSDP M-SEARCH discovery + root-desc XML parse + AddPortMapping/DeletePortMapping/GetExternalIPAddress SOAP; fake IGD tests for all three protocols; magicsock publishes portmap endpoint best-effort alongside local/STUN endpoints; netcheck Report gains portmap capability booleans) |
 | Health tracking | `health/` | ✅ port-7: crates/health Tracker + watchdog, wired control/DERP/certs/netmon, ServerStatus.health + FFI |
 | IPN state machine + notify bus | `ipn/backend.go`, `ipn/ipnlocal/local.go` | ✅ phase-ipn-bus: `crates/ipn` (State enum serde-as-integer matching Go, Notify PascalCase JSON with omitted None, NotifyWatchOpt bitflags with explicit values, EngineStatus); StateMachine ports `nextStateLocked` truth table (table-driven tests); IpnBackend holds state+inputs+bus, emits Notify{State} on transitions, BrowseToURL on auth URL, LoginFinished on register success, ErrMessage on errors; NotifyBus broadcast channel (tokio::sync::broadcast, 128-capacity); `GET /localapi/v0/watch-ipn-bus?mask=` streaming newline-delimited JSON with per-message flush (connection-close delimited); status JSON reports live BackendState string |
+| Interactive auth + prefs persistence | `ipn/prefs.go`, `cmd/tailscale/cli/up.go`, `ipn/localapi/localapi.go` | ✅ phase-interactive-auth: `crates/ipn` Prefs (15 fields, PascalCase serde, Go wire-compat) + MaskedPrefs (*Set bools, apply_to) + StartOptions (ipn.Options equiv); prefs.json disk persistence (atomic temp+rename); daemon-side login flow: `start_localapi_only()` brings up IpnBackend+LocalAPI in NeedsLogin without full bootstrap; bootstrap() splits into phase 1 (register → AuthURL → block on login_trigger) + phase 2 (UDP/map/DERP/netstack after auth completes); testcontrol RequireAuth/CompleteAuth/AwaitAuthURL flows; LocalAPI endpoints POST /start, POST /login-interactive, POST /logout, PATCH /prefs, GET /prefs (typed); LocalClient start/login_interactive/logout/edit_prefs/get_prefs; CLI up/login/logout/down/set/get commands; daemon no longer requires TS_AUTHKEY; integration test: testcontrol(require_auth) → start → BrowseToURL → complete_auth → Running |
 
 ## Tier 2: Production features
 
@@ -25,7 +26,7 @@ update statuses as phases land.
 | Serve/Funnel (ListenFunnel, ServeConfig, TCP fwd, reverse proxy) | `tsnet`, `ipn/serve*` | ✅ port-6 done (ServeConfig serde model: TCPPortHandler/WebServerConfig/HTTPHandler; Server::set_serve_config starts netstack listeners per port; TCP forward via copy_bidirectional; HTTP reverse proxy sets Host/X-Forwarded-For/Tailscale-User-Login/Name from WhoIs; static text handler; TLS-terminate with ControlCertProvider (self-signed fallback); listen_funnel validates port 443/8443/10000 + funnel node attr from netmap, returns typed FunnelError::NotEnabled on API-only tailnets; ts_serve_tcp FFI. Remaining: ingress peer Tailscale-Ingress-Target dispatch, Hostinfo.IngressEnabled advertisement) |
 | Tailscale Services (ListenService, PROXY protocol) | `tsnet.Server.ListenService` | ✅ `Server::listen_service(svc_name, ServiceMode)` resolves VIP v4 addrs from self node CapMap `service-host` key (`ServiceIPMappings`), adds them to netstack via `add_addr`, listens on each VIP:port via `listen_on`; merged accept channel from all VIP listeners; `ServiceName` newtype validates `svc:` prefix + DNS label; PROXY protocol v2 binary header encoder (byte-exact IPv4/IPv6/LOCAL); `ServiceStream` wraps `NetstackStream` with PROXY v2 prefix drained before app data; netstack `listen_on`/`add_addr` + `(IpAddr,port)` listener key; IPv6 VIPs skipped (smoltcp proto-ipv4 only). Remaining: TLS termination for service FQDN, serve-config TCP forwarding path, IPv6 VIP support |
 | SOCKS5 proxy | `net/socks5/` | ✅ port-8: RFC 1928 CONNECT (v4/domain/v6), dials via shared tsnet resolve path, FFI; e2e green |
-| LocalAPI | `ipn/localapi/` | ✅ port-9 + phase-ipn-bus: full LocalAPI HTTP server on safesocket (status, whois, prefs, netmap, metrics, health, ping, watch-ipn-bus); status reports live BackendState; daemon wires safesocket::listen → spawn_localapi; integration test proves GET /localapi/v0/status + /health over safesocket::connect returns 200 with valid JSON; watch-ipn-bus streams newline-delimited Notify JSON with mask validation + initial-state messages |
+| LocalAPI | `ipn/localapi/` | ✅ port-9 + phase-ipn-bus + phase-interactive-auth: full LocalAPI HTTP server on safesocket (status, whois, prefs GET+PATCH, netmap, metrics, health, ping, watch-ipn-bus, start, login-interactive, logout); status reports live BackendState; daemon wires safesocket::listen → spawn_localapi; integration test proves GET /localapi/v0/status + /health over safesocket::connect returns 200 with valid JSON; watch-ipn-bus streams newline-delimited Notify JSON with mask validation + initial-state messages; PATCH /prefs applies MaskedPrefs, persists to prefs.json, emits Notify{Prefs}; POST /start applies UpdatePrefs + triggers bootstrap; POST /login-interactive unblocks auth flow; POST /logout sets LoggedOut + persists |
 | Auto-update / ClientVersion | — | ⬜ |
 | Multi-profile/login management | `ipn/ipnlocal/profiles.go` | ⬜ (single profile only) |
 
@@ -38,7 +39,7 @@ update statuses as phases land.
 | Route table enumeration | `net/routetable/routetable_bsd.go` | ✅ phase-34: `crates/routetable` NET_RT_DUMP2 sysctl RIB fetch, rt_msghdr2 + 4-byte-aligned sockaddr parse, RTF flag decode, RTF_LOCAL skip, live default-route integration test |
 | tcpinfo (RTT diagnostics) | `net/tcpinfo/tcpinfo_darwin.go` | ✅ phase-35: `crates/tcpinfo` darwin TCP_CONNECTION_INFO (tcpi_rttcur) + linux TCP_INFO (tcpi_rtt) |
 | Break TCP connections | `ipn/ipnlocal/breaktcp_darwin.go` | ✅ phase-35: `break_tcp_conns()` fd 0..1000 scan+close (darwin); ✅ phase-39 called on set/clear_exit_node in TUN mode only (netstack embedders never affected) |
-| Daemon + launchd install | `cmd/tailscaled/install_darwin.go` | ✅ phase-36: `crates/rustscaled` bin (run/install-system-daemon/uninstall-system-daemon), com.rustscale.rustscaled plist, launchctl lifecycle, safesocket listener stub (LocalAPI TODO) |
+| Daemon + launchd install | `cmd/tailscaled/install_darwin.go` | ✅ phase-36 + phase-interactive-auth: `crates/rustscaled` bin (run/install-system-daemon/uninstall-system-daemon), com.rustscale.rustscaled plist, launchctl lifecycle, safesocket LocalAPI; daemon no longer requires TS_AUTHKEY — without it starts in NeedsLogin mode (start_localapi_only) and waits for CLI-driven start/login; with TS_AUTHKEY proceeds to full up() directly |
 | Default route detection | `net/netmon/defaultroute_darwin.go` | ✅ phase-37: `default_route_interface_index()` RTM_GET sysctl w/ SIOCGIFDELEGATE utun delegation + utun exclusion; state.rs uses sysctl first, `route -n get` fallback |
 | Interface enumeration (darwin) | `net/netmon/interfaces_darwin.go` | ✅ phase-37 (folded into defaultroute work) |
 
@@ -163,9 +164,7 @@ tailscaled userspace: p50 ~170us vs 257us, 465–838 vs 384 Mbps).
 
 ## Test infrastructure
 
-`crates/testcontrol` ✅ phase-28: in-process fake control server (Noise
-server handshake, h2c, register, streaming map, Go-testcontrol-style test
-API); tsnet self-test registers → Running → sees injected fake peer with
+`crates/testcontrol` ✅ phase-28 + phase-interactive-auth: in-process fake control server (Noise server handshake, h2c, register, streaming map, Go-testcontrol-style test API); RequireAuth/CompleteAuth/AwaitAuthURL flows for interactive login testing; tsnet self-test registers → Running → sees injected fake peer with
 no network. `crates/derp` server ✅ phase-29: in-process DERP relay
 (spawn_local + make_derp_map) for integration tests. tailcfg
 null-tolerance ✅ phase-30: every wire field accepts Go nil + property
@@ -238,9 +237,13 @@ state-dir fallback probing), `--json`.
 | `netcheck` | `cli/netcheck.go` | ✅ client-side STUN probe via `crates/netcheck`; DERPMap from daemon netmap endpoint; Go-style report (UDP, IPv4/6, MappingVariesByDestIP, DERP latencies sorted) |
 | `metrics` | `cli/metrics.go` | ✅ raw Prometheus text passthrough |
 | `health` | — | ✅ health warnings from daemon; `--json` |
-| `down` | `cli/down.go` | 🔶 prints "not yet supported" (prefs write path pending IPN phase) |
+| `down` | `cli/down.go` | ✅ phase-interactive-auth: EditPrefs WantRunning=false via PATCH /prefs |
 | `ping` | `cli/ping.go` | 🔶 surfaces daemon 501 as "not yet supported" (magicsock disco-ping API pending) |
-| `up`/`login` | `cli/up.go` | ⬜ next phase (needs IPN bus watch_ipn_bus consumer) |
+| `up` | `cli/up.go` | ✅ phase-interactive-auth: full runUp sequence (status → build prefs → watch-ipn-bus → /start → login-interactive if no node key → BrowseToURL loop → success on Running); flags: --auth-key, --hostname, --advertise-routes, --advertise-exit-node, --exit-node, --shields-up, --accept-routes, --accept-dns, --reset, --force-reauth, --timeout, --json |
+| `login` | `cli/login.go` | ✅ phase-interactive-auth: login-interactive + watch-ipn-bus for BrowseToURL/Running |
+| `logout` | `cli/logout.go` | ✅ phase-interactive-auth: POST /logout |
+| `set` | `cli/set.go` | ✅ phase-interactive-auth: EditPrefs via PATCH /prefs from --hostname, --accept-routes, --accept-dns, --shields-up, --advertise-routes, --advertise-exit-node, --exit-node flags |
+| `get` | `cli/prefs.go` | ✅ phase-interactive-auth: GET /prefs, JSON or human-readable |
 | `wait`/`switch` | `cli/wait.go` | ⬜ next phase |
 | `serve`/`funnel` | `cli/serve.go` | ⬜ |
 | `cert` | `cli/cert.go` | ⬜ |
@@ -256,6 +259,11 @@ state-dir fallback probing), `--json`.
 hand-rolled HTTP/1.1 (no hyper), fake Host `local-rustscaled.sock`, typed
 errors (AccessDenied 403, PreconditionsFailed 412, HttpStatus, PeerNotFound),
 `watch_ipn_bus()` streaming method for newline-delimited JSON `Notify`
-messages (ready for the up/login phase). Integration test boots testcontrol +
-daemon with LocalAPI on a temp socket and exercises the `status` path both
-via the library and the binary via `std::process`.
+messages. ✅ phase-interactive-auth: `start()` (POST /start with StartOptions),
+`login_interactive()`, `logout()`, `edit_prefs()` (PATCH /prefs with
+MaskedPrefs), `get_prefs()` (typed Prefs deserialization),
+`send_request_with_body()` for POST/PATCH with body. Integration test boots
+testcontrol + daemon with LocalAPI on a temp socket and exercises the
+`status` path both via the library and the binary via `std::process`;
+interactive_auth_flow test: testcontrol(require_auth) → start_localapi_only
+→ /start → BrowseToURL → complete_auth → Running.

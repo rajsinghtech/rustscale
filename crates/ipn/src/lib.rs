@@ -20,10 +20,12 @@
 mod backend;
 mod bus;
 mod machine;
+mod prefs;
 
 pub use backend::{BackendInputs, IpnBackend};
 pub use bus::{NotifyBus, NotifyBusReceiver};
 pub use machine::{next_state, StateMachineInputs};
+pub use prefs::{MaskedPrefs, Prefs, StartOptions};
 
 use serde::{Deserialize, Serialize};
 

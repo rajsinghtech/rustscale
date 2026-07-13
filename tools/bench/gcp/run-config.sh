@@ -34,22 +34,43 @@ EOF
   exit 2
 }
 
-[[ $# -ge 9 ]] || usage
+SELF_TEST=0
+if [[ "${1:-}" == "--self-test" ]]; then
+  SELF_TEST=1
+  shift
+fi
 
-CONFIG="$1"
-SVM="$2"
-CVM="$3"
-SZONE="$4"
-CZONE="$5"
-AUTHKEY="$6"
-RDIR="$7"
-SHOST="$8"
-CHOST="$9"
+if (( SELF_TEST )); then
+  CONFIG=rs-tun
+  SVM=self-test-server
+  CVM=self-test-client
+  SZONE=self-test-zone
+  CZONE=self-test-zone
+  AUTHKEY=self-test-authkey
+  RDIR=$(mktemp -d)
+  SHOST=self-test-server
+  CHOST=self-test-client
+else
+  [[ $# -ge 9 ]] || usage
+  CONFIG="$1"
+  SVM="$2"
+  CVM="$3"
+  SZONE="$4"
+  CZONE="$5"
+  AUTHKEY="$6"
+  RDIR="$7"
+  SHOST="$8"
+  CHOST="$9"
+fi
 
-PARALLELS=(1 10 25 50 100)
-DURATION=30
-LATENCY_COUNT=200
+PARALLELS=(1 10 100)
+DURATION=10
+LATENCY_COUNT=50
+LATENCY_INTERVAL=0.1
 PORT=5201
+# Reserved for an unsafe rs-tun → tailscaled handoff.  Keep this distinct from
+# ordinary benchmark failures so run-matrix can destroy the affected VMs.
+FATAL_HANDOFF_STATUS=86
 
 # BENCH_MATRIX is "<topo>/<path>" — set by run-matrix.sh.
 BENCH_MATRIX="${BENCH_MATRIX:-}"
@@ -194,13 +215,68 @@ tun_path_gate() {
 }
 
 cleanup_rs_tun() {
-  ssh_cmd "$SVM" "$SZONE" "kill \$(cat /tmp/iperf3-srv.pid 2>/dev/null) 2>/dev/null; pkill -x iperf3 2>/dev/null" || true
-  # A following tailscaled TUN must not race rustscaled's interface teardown.
-  # Always exit zero after this bounded best-effort wait: a missing process or
-  # interface is successful cleanup, not a reason for ssh retry machinery.
-  local wait_rs_tun='kill $(cat /tmp/rs-tun-%s.pid 2>/dev/null) 2>/dev/null || true; pkill -x rustscaled 2>/dev/null || true; for _ in $(seq 1 20); do if ! pgrep -x rustscaled >/dev/null 2>&1 && ! ip link show tailscale0 >/dev/null 2>&1; then exit 0; fi; sleep 1; done; exit 0'
-  ssh_sudo "$SVM" "$SZONE" "$(printf "$wait_rs_tun" srv)" || true
-  ssh_sudo "$CVM" "$CZONE" "$(printf "$wait_rs_tun" cli)" || true
+  local status=0
+  if ! ssh_cmd "$SVM" "$SZONE" "kill \$(cat /tmp/iperf3-srv.pid 2>/dev/null) 2>/dev/null; pkill -x iperf3 2>/dev/null"; then
+    echo "[gcp] WARNING: could not stop rs-tun iperf3 server on $SVM" >&2
+  fi
+
+  # Run both endpoints even if one remains dirty.  ssh_cmd retries a nonzero
+  # remote result, so the remote action is deliberately idempotent.
+  if ! ssh_sudo "$SVM" "$SZONE" "$(rs_tun_cleanup_command srv)"; then
+    echo "[gcp] ERROR: rs-tun cleanup failed on server $SVM" >&2
+    status=1
+  fi
+  if ! ssh_sudo "$CVM" "$CZONE" "$(rs_tun_cleanup_command cli)"; then
+    echo "[gcp] ERROR: rs-tun cleanup failed on client $CVM" >&2
+    status=1
+  fi
+  return "$status"
+}
+
+# Print the root-side cleanup program for one rs-tun endpoint.  It intentionally
+# contains no single quotes because ssh_sudo wraps the command in `bash -c '…'`.
+rs_tun_cleanup_command() {
+  local role="$1"
+  printf '%s\n' "pidfile=/tmp/rs-tun-${role}.pid" \
+'is_clear() {' \
+'  ! pgrep -x rustscaled >/dev/null 2>&1 && ! ip link show dev tailscale0 >/dev/null 2>&1' \
+'}' \
+'wait_for_clear() {' \
+'  local elapsed=0 timeout=10' \
+'  while (( elapsed < timeout )); do' \
+'    is_clear && return 0' \
+'    sleep 1' \
+'    elapsed=$((elapsed + 1))' \
+'  done' \
+'  is_clear' \
+'}' \
+'diagnose() {' \
+'  echo "[gcp] rs-tun cleanup diagnostics: rustscaled processes and tailscale0 ownership" >&2' \
+'  pgrep -a -x rustscaled >&2 || true' \
+'  ps -eo pid,ppid,user,stat,comm,args | grep "[r]ustscaled" >&2 || true' \
+'  ip -d link show dev tailscale0 >&2 || true' \
+'  ls -l /sys/class/net/tailscale0 >&2 || true' \
+'  fuser -v /dev/net/tun >&2 || true' \
+'}' \
+'signal_daemons() {' \
+'  local signal="$1" pid=""' \
+'  if [[ -r "$pidfile" ]]; then' \
+'    pid=$(cat "$pidfile" 2>/dev/null || true)' \
+'    case "$pid" in' \
+'      ""|*[!0-9]*) ;;' \
+'      *) kill "-$signal" "$pid" 2>/dev/null || true ;;' \
+'    esac' \
+'  fi' \
+'  pkill "-$signal" -x rustscaled 2>/dev/null || true' \
+'}' \
+'signal_daemons TERM' \
+'if wait_for_clear; then exit 0; fi' \
+'diagnose' \
+'signal_daemons KILL' \
+'if wait_for_clear; then exit 0; fi' \
+'diagnose' \
+'echo "[gcp] ERROR: rs-tun cleanup left rustscaled or tailscale0 behind" >&2' \
+'exit 1'
 }
 
 cleanup_ts_tun() {
@@ -234,9 +310,10 @@ emit_stub() {
   _lt_tmp=$(mktemp)
   printf '%s' "$log_tail" > "$_lt_tmp"
   python3 - "$CONFIG" "$TOPOLOGY" "$PATH_TAG" "$tool" "$mode" "$err" \
-    "$DURATION" "$LATENCY_COUNT" "$_lt_tmp" >"$OUT" <<'PYEOF'
+    "$DURATION" "$LATENCY_COUNT" "${PARALLELS[@]}" "$_lt_tmp" >"$OUT" <<'PYEOF'
 import json, sys
-config, topo, path_tag, tool, mode, err, dur, lat_count, lt_path = sys.argv[1:10]
+config, topo, path_tag, tool, mode, err, dur, lat_count, *rest = sys.argv[1:]
+*parallel_values, lt_path = rest
 try:
     with open(lt_path) as f:
         log_tail = f.read()
@@ -252,7 +329,7 @@ obj = {
     "log_tail": log_tail,
     "throughput": [
         {"parallel": p, "mbps": 0, "duration_s": int(dur)}
-        for p in [1, 10, 25, 50, 100]
+        for p in map(int, parallel_values)
     ],
     "latency": {"p50_us": 0, "p95_us": 0, "p99_us": 0, "count": int(lat_count)},
     "footprint": {"binary_size_bytes": 0, "rss_peak_kb": 0, "rss_avg_kb": 0,
@@ -264,8 +341,106 @@ PYEOF
   rm -f "$_lt_tmp"
 }
 
+cleanup_self_test() {
+  local state result events command
+  local -a cases=(absent graceful forced failure)
+
+  # These mocks exercise the remote cleanup program's transitions without a
+  # TUN device or GCP: TERM clears one state, KILL clears another, and the
+  # final state must return failure.  `sleep` is a no-op to keep it fast.
+  pgrep() {
+    [[ "$CLEANUP_TEST_PRESENT" == 1 ]]
+  }
+  ip() {
+    [[ "$CLEANUP_TEST_PRESENT" == 1 ]]
+  }
+  pkill() {
+    CLEANUP_TEST_EVENTS+=" pkill:$1"
+    case "$CLEANUP_TEST_STATE:$1" in
+      graceful:-TERM|forced:-KILL) CLEANUP_TEST_PRESENT=0 ;;
+    esac
+    return 0
+  }
+  sleep() { :; }
+  ps() { :; }
+  fuser() { :; }
+  test_remote_cleanup() { eval "$1"; }
+
+  for state in "${cases[@]}"; do
+    CLEANUP_TEST_STATE="$state"
+    CLEANUP_TEST_PRESENT=1
+    CLEANUP_TEST_EVENTS=""
+    [[ "$state" == absent ]] && CLEANUP_TEST_PRESENT=0
+    command=$(rs_tun_cleanup_command self-test)
+    command=${command//$'exit 0'/$'return 0'}
+    command=${command//$'exit 1'/$'return 1'}
+    if test_remote_cleanup "$command" 2>/dev/null; then
+      result=0
+    else
+      result=1
+    fi
+    events="$CLEANUP_TEST_EVENTS"
+    case "$state" in
+      absent|graceful)
+        [[ "$result" == 0 && "$events" != *"pkill:-KILL"* ]] || return 1
+        ;;
+      forced)
+        [[ "$result" == 0 && "$events" == *"pkill:-KILL"* ]] || return 1
+        ;;
+      failure)
+        [[ "$result" == 1 && "$events" == *"pkill:-KILL"* ]] || return 1
+        ;;
+    esac
+  done
+  unset -f pgrep ip pkill sleep ps fuser test_remote_cleanup
+}
+
+result_shape_self_test() {
+  emit_stub self-test
+  python3 - "$OUT" "$DURATION" "$LATENCY_COUNT" "${PARALLELS[@]}" <<'PYEOF'
+import json, sys
+path, duration, latency_count, *parallels = sys.argv[1:]
+with open(path) as f:
+    result = json.load(f)
+assert [row["parallel"] for row in result["throughput"]] == [int(p) for p in parallels]
+assert all(row["duration_s"] == int(duration) for row in result["throughput"])
+assert result["latency"]["count"] == int(latency_count)
+PYEOF
+
+  # render-html consumes an aggregate JSON list, not one per-config object.
+  # Verify its chart registry is driven solely by the configured result shape.
+  local summary="$RDIR/summary.json" dashboard="$RDIR/dashboard.html"
+  python3 - "$OUT" "$summary" <<'PYEOF'
+import json, sys
+with open(sys.argv[1]) as f:
+    result = json.load(f)
+with open(sys.argv[2], "w") as f:
+    json.dump([result], f)
+PYEOF
+  python3 "$(cd "$(dirname "$0")/../../.." && pwd)/tools/bench/gcp/render-html.py" "$summary" >"$dashboard"
+  python3 - "$dashboard" "${PARALLELS[@]}" <<'PYEOF'
+import json, re, sys
+with open(sys.argv[1]) as f:
+    html = f.read()
+match = re.search(r"window\.__chartData = (.*?);</script>", html, re.DOTALL)
+assert match, "chart registry missing"
+registry = json.loads(match.group(1))
+expected = [int(p) for p in sys.argv[2:]]
+assert all(data["parallels"] == expected
+           for chart, data in registry.items() if chart.startswith("tp-"))
+PYEOF
+}
+
 classifier_self_test
 command_shape_self_test
+
+if (( SELF_TEST )); then
+  cleanup_self_test
+  result_shape_self_test
+  rm -rf "$RDIR"
+  echo "run-config self-tests: OK" >&2
+  exit 0
+fi
 
 if [[ -n "${GCP_DRY_RUN:-}" ]]; then
   echo "[dry-run] would run $CONFIG on $SVM/$CVM ($TOPOLOGY/$PATH_TAG)" >&2
@@ -439,14 +614,23 @@ run_rs_tun() {
 
   local server_ip
   server_ip=$(wait_tun_ip 1 "$SVM" "$SZONE" /opt/rustscale/target/release/rustscale /tmp/rs-tun-srv.sock /tmp/rs-tun-srv.log) || {
-    emit_stub "rs-no-ip-srv" "$(capture_log_tail "$SVM" "$SZONE" /tmp/rs-tun-srv.log)"; cleanup_rs_tun; return 1; }
+    emit_stub "rs-no-ip-srv" "$(capture_log_tail "$SVM" "$SZONE" /tmp/rs-tun-srv.log)"
+    if ! cleanup_rs_tun; then return "$FATAL_HANDOFF_STATUS"; fi
+    return 1
+  }
   wait_tun_ip 1 "$CVM" "$CZONE" /opt/rustscale/target/release/rustscale /tmp/rs-tun-cli.sock /tmp/rs-tun-cli.log >/dev/null || {
-    emit_stub "rs-no-ip-cli" "$(capture_log_tail "$CVM" "$CZONE" /tmp/rs-tun-cli.log)"; cleanup_rs_tun; return 1; }
+    emit_stub "rs-no-ip-cli" "$(capture_log_tail "$CVM" "$CZONE" /tmp/rs-tun-cli.log)"
+    if ! cleanup_rs_tun; then return "$FATAL_HANDOFF_STATUS"; fi
+    return 1
+  }
   echo "[gcp] rs-tun: server tailnet IP=$server_ip" >&2
 
   local path_class
   path_class=$(tun_path_gate 1 "$CVM" "$CZONE" /opt/rustscale/target/release/rustscale /tmp/rs-tun-cli.sock "$server_ip" "$PATH_TAG" /tmp/rs-tun-cli.path.log) || {
-    emit_stub "rs-cli-path-gate-failed" "$(capture_log_tail "$CVM" "$CZONE" /tmp/rs-tun-cli.path.log)"; cleanup_rs_tun; return 1; }
+    emit_stub "rs-cli-path-gate-failed" "$(capture_log_tail "$CVM" "$CZONE" /tmp/rs-tun-cli.path.log)"
+    if ! cleanup_rs_tun; then return "$FATAL_HANDOFF_STATUS"; fi
+    return 1
+  }
 
   # Start iperf3 server on server VM. Bind to 0.0.0.0 (all interfaces) so
   # the client can reach it via the server's tailnet IP on the utun. Binding
@@ -480,7 +664,7 @@ print(json.dumps(arr))
   # Latency via ping.
   echo "[gcp] rs-tun: latency" >&2
   local lat_json
-  lat_json=$(ssh_cmd "$CVM" "$CZONE" "ping -c $LATENCY_COUNT $server_ip 2>/dev/null" | ping_latency)
+  lat_json=$(ssh_cmd "$CVM" "$CZONE" "ping -i $LATENCY_INTERVAL -c $LATENCY_COUNT $server_ip 2>/dev/null" | ping_latency)
 
   # Stop footprint.
   local foot_json
@@ -491,7 +675,10 @@ print(json.dumps(arr))
   bin_size=$(ssh_cmd "$SVM" "$SZONE" 'stat -c %s /opt/rustscale/target/release/rustscaled 2>/dev/null || echo 0')
 
   # Cleanup.
-  cleanup_rs_tun
+  if ! cleanup_rs_tun; then
+    emit_stub "rs-tun-cleanup-failed" "$(capture_log_tail "$SVM" "$SZONE" /tmp/rs-tun-srv.log)"
+    return "$FATAL_HANDOFF_STATUS"
+  fi
 
   python3 - "$CONFIG" "$TOPOLOGY" "$PATH_TAG" "$path_class" "$bin_size" "$tp_json" "$lat_json" "$foot_json" >"$OUT" <<'PYEOF'
 import json, sys
@@ -650,6 +837,7 @@ try:
             if not chunk: break
             data += chunk
         rtts.append((time.perf_counter_ns() - start) // 1000)
+        time.sleep(0.1)
     s.close()
     rtts.sort()
     n = len(rtts)
@@ -813,7 +1001,7 @@ print(json.dumps(arr))
   # Latency via ping.
   echo "[gcp] ts-tun: latency" >&2
   local lat_json
-  lat_json=$(ssh_sudo "$CVM" "$CZONE" "ping -c $LATENCY_COUNT $server_ip 2>/dev/null" | ping_latency)
+  lat_json=$(ssh_sudo "$CVM" "$CZONE" "ping -i $LATENCY_INTERVAL -c $LATENCY_COUNT $server_ip 2>/dev/null" | ping_latency)
 
   # Stop footprint.
   local foot_json

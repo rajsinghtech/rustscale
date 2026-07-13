@@ -39,9 +39,6 @@ CONFIG_LABELS = {
 }
 TOPOLOGIES = ["same-zone", "cross-region"]
 PATHS = ["direct", "derp"]
-PARALLELS = [1, 10, 25, 50, 100]
-
-
 def load_summary() -> list:
     if len(sys.argv) > 1 and sys.argv[1] not in ("-", ""):
         with open(sys.argv[1], "r", encoding="utf-8") as f:
@@ -56,6 +53,16 @@ def index_runs(runs: list) -> dict:
         key = (r.get("topology", "?"), r.get("path", "?"), r.get("config", "?"))
         idx[key] = r
     return idx
+
+
+def configured_parallels(runs: list) -> list:
+    """Return the throughput shape declared by the result data."""
+    return sorted({
+        int(row["parallel"])
+        for run in runs
+        for row in run.get("throughput", [])
+        if "parallel" in row
+    })
 
 
 def fmt_bytes(n: float) -> str:
@@ -91,7 +98,7 @@ def fmt_mbps(n: float) -> str:
 # ---------------------------------------------------------------------------
 # Bar-chart data preparation.
 # ---------------------------------------------------------------------------
-def throughput_chart_data(runs_idx: dict, topo: str, path: str) -> dict:
+def throughput_chart_data(runs_idx: dict, parallels: list[int], topo: str, path: str) -> dict:
     """Return {parallels: [...], series: {config: [mbps per parallel]},
     failed: {config: bool}, errors: {config: str}}."""
     series = {}
@@ -106,15 +113,15 @@ def throughput_chart_data(runs_idx: dict, topo: str, path: str) -> dict:
                 failed[cfg] = True
                 errors[cfg] = err
             tp = {t["parallel"]: t.get("mbps", 0) for t in run.get("throughput", [])}
-            for p in PARALLELS:
+            for p in parallels:
                 vals.append(float(tp.get(p, 0)))
         else:
             failed[cfg] = True
             errors[cfg] = "missing (no JSON)"
-            vals = [0.0] * len(PARALLELS)
+            vals = [0.0] * len(parallels)
         series[cfg] = vals
     return {
-        "parallels": PARALLELS,
+        "parallels": parallels,
         "series": series,
         "failed": failed,
         "errors": errors,
@@ -346,12 +353,12 @@ def render_chart_js_block(canvas_id: str, data: dict, kind: str) -> str:
 </script>"""
 
 
-def emit_throughput_charts(runs_idx: dict) -> str:
+def emit_throughput_charts(runs_idx: dict, parallels: list[int]) -> str:
     parts = ['<div class="chart-grid" id="throughput-grid">']
     for topo in TOPOLOGIES:
         for path in PATHS:
             cid = f"tp-{topo}-{path}"
-            data = throughput_chart_data(runs_idx, topo, path)
+            data = throughput_chart_data(runs_idx, parallels, topo, path)
             data["title"] = f"{topo} / {path}"
             n_failed = len(data["failed"])
             fail_badge = ""
@@ -378,7 +385,7 @@ def emit_throughput_charts(runs_idx: dict) -> str:
     for topo in TOPOLOGIES:
         for path in PATHS:
             cid = f"tp-{topo}-{path}"
-            data = throughput_chart_data(runs_idx, topo, path)
+            data = throughput_chart_data(runs_idx, parallels, topo, path)
             scripts.append(render_chart_js_block(cid, data, "throughput"))
     return "".join(parts) + "".join(scripts)
 
@@ -797,13 +804,13 @@ document.addEventListener("DOMContentLoaded", () => { initFilters(); applyFilter
 """
 
 
-def emit_chart_data_registry(runs_idx: dict) -> str:
+def emit_chart_data_registry(runs_idx: dict, parallels: list[int]) -> str:
     """Emit a <script> registering chart data on window.__chartData for redraw."""
     entries = {}
     for topo in TOPOLOGIES:
         for path in PATHS:
             cid = f"tp-{topo}-{path}"
-            entries[cid] = throughput_chart_data(runs_idx, topo, path)
+            entries[cid] = throughput_chart_data(runs_idx, parallels, topo, path)
     entries["latency-chart"] = latency_chart_data(runs_idx)
     return f'<script>window.__chartData = {json.dumps(entries)};</script>'
 
@@ -813,6 +820,7 @@ def main() -> int:
     if not isinstance(runs, list):
         runs = []
     runs_idx = index_runs(runs)
+    parallels = configured_parallels(runs)
 
     out = []
     out.append(HTML_HEAD)
@@ -825,8 +833,8 @@ def main() -> int:
 
     # Throughput.
     out.append('<section class="block" id="throughput">')
-    out.append("<h2>Throughput — iperf3 TCP sweep (30s, download)</h2>")
-    out.append(emit_throughput_charts(runs_idx))
+    out.append("<h2>Throughput — iperf3 TCP sweep (download)</h2>")
+    out.append(emit_throughput_charts(runs_idx, parallels))
     out.append("</section>")
 
     # Latency.
@@ -849,7 +857,7 @@ def main() -> int:
 
     out.append("</main>")
     # Chart data registry must come before CHART_JS so redraw can find it.
-    out.append(emit_chart_data_registry(runs_idx))
+    out.append(emit_chart_data_registry(runs_idx, parallels))
     out.append(CHART_JS)
     out.append(HTML_FOOT)
 

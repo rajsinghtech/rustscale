@@ -31,6 +31,16 @@ source tools/bench/gcp/lib.sh
 # shellcheck source=./footprint.sh
 source tools/bench/gcp/footprint.sh
 
+MATRIX_SELF_TEST=0
+if [[ "${1:-}" == "--self-test" ]]; then
+  MATRIX_SELF_TEST=1
+  shift
+fi
+
+# Must match the distinct status returned by run-config.sh when rustscaled or
+# tailscale0 remains after its forced cleanup.  This is unsafe to hand off.
+FATAL_HANDOFF_STATUS=86
+
 rust_build_command() {
   printf '%s' 'export RUSTUP_HOME=/opt/rust CARGO_HOME=/opt/rust/cargo; cd /opt/rustscale && cargo build --release -p rustscale-bench -p rustscale-cli -p rustscale-rustscaled'
 }
@@ -68,8 +78,59 @@ matrix_remote_build_aggregation_self_test() {
   fi
 }
 
+matrix_run_config_with_policy() {
+  local config="$1" success_suffix="$2" status
+  shift 2
+
+  if "$@"; then
+    echo "[gcp] $config: OK$success_suffix"
+  else
+    status=$?
+    if (( status == FATAL_HANDOFF_STATUS )); then
+      echo "[gcp] FATAL: $config left an unsafe TUN handoff; aborting matrix" >&2
+      exit "$FATAL_HANDOFF_STATUS"
+    fi
+    echo "[gcp] $config: FAILED (continuing)" >&2
+  fi
+}
+
+matrix_config_failure_policy_self_test() {
+  local output status
+
+  matrix_test_success() { return 0; }
+  matrix_test_ordinary_failure() { return 1; }
+  matrix_test_fatal_handoff() { return "$FATAL_HANDOFF_STATUS"; }
+  matrix_test_config_flow() {
+    local config="$1"
+    matrix_run_config_with_policy "$config" "" "${@:2}"
+    echo "sentinel: $config"
+  }
+
+  output=$(matrix_test_config_flow success matrix_test_success 2>&1) || return 1
+  [[ "$output" == $'[gcp] success: OK\nsentinel: success' ]] || return 1
+
+  output=$(matrix_test_config_flow ordinary matrix_test_ordinary_failure 2>&1) || return 1
+  [[ "$output" == $'[gcp] ordinary: FAILED (continuing)\nsentinel: ordinary' ]] || return 1
+
+  if output=$(matrix_test_config_flow fatal matrix_test_fatal_handoff 2>&1); then
+    return 1
+  else
+    status=$?
+  fi
+  (( status == FATAL_HANDOFF_STATUS )) || return 1
+  [[ "$output" == '[gcp] FATAL: fatal left an unsafe TUN handoff; aborting matrix' ]] || return 1
+  unset -f matrix_test_success matrix_test_ordinary_failure \
+    matrix_test_fatal_handoff matrix_test_config_flow
+}
+
 matrix_command_shape_self_test
 matrix_remote_build_aggregation_self_test
+matrix_config_failure_policy_self_test
+
+if (( MATRIX_SELF_TEST )); then
+  echo "run-matrix self-tests: OK" >&2
+  exit 0
+fi
 
 # ---------------------------------------------------------------------------
 # Arg parsing.
@@ -260,14 +321,12 @@ for TOPO in "${TOPOLOGIES[@]}"; do
         echo "[gcp] minted fresh authkey for $CFG" >&2
       fi
 
-      if tools/bench/gcp/run-config.sh \
-          "$CFG" "$SERVER_VM" "$CLIENT_VM" "$Z_A" "$Z_B" \
-          "$AUTHKEY" "$RESULTS_DIR/$TOPO/$PATH_TAG" \
-          "rs-srv-$TOPO" "rs-cli-$TOPO"; then
-        echo "[gcp] $CFG: OK -> $RESULTS_DIR/$TOPO/$PATH_TAG/$CFG.json"
-      else
-        echo "[gcp] $CFG: FAILED (continuing)" >&2
-      fi
+      matrix_run_config_with_policy "$CFG" \
+        " -> $RESULTS_DIR/$TOPO/$PATH_TAG/$CFG.json" \
+        tools/bench/gcp/run-config.sh \
+        "$CFG" "$SERVER_VM" "$CLIENT_VM" "$Z_A" "$Z_B" \
+        "$AUTHKEY" "$RESULTS_DIR/$TOPO/$PATH_TAG" \
+        "rs-srv-$TOPO" "rs-cli-$TOPO"
     done
 
     if [[ "$PATH_TAG" == "derp" ]]; then

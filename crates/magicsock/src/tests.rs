@@ -611,6 +611,76 @@ async fn cli_ping_fans_out_udp_and_derp() {
 }
 
 #[tokio::test]
+async fn cli_ping_with_unknown_derp_region_uses_fanout() {
+    let relay = Arc::new(FakeRelay::new());
+    let a_priv = NodePrivate::generate();
+    let b_priv = NodePrivate::generate();
+    let a_derp = connect_to_relay(&relay, a_priv.clone()).await;
+    let (a, _a_rx) = Magicsock::new(MagicsockConfig {
+        private_key: a_priv,
+        disco_key: DiscoPrivate::generate(),
+        derp_client: Some(a_derp),
+        derp_map: None,
+        home_derp_region: 0,
+        udp_bind: None,
+        udp_socket: None,
+        portmapper: None,
+        health: None,
+        disable_direct_paths: false,
+        peer_relay_server: false,
+        relay_server_config: None,
+        sockstats: None,
+        control_knobs: None,
+    })
+    .await
+    .unwrap();
+    let b_derp = connect_to_relay(&relay, b_priv.clone()).await;
+    let (b, _b_rx) = Magicsock::new(MagicsockConfig {
+        private_key: b_priv,
+        disco_key: DiscoPrivate::generate(),
+        derp_client: Some(b_derp),
+        derp_map: None,
+        home_derp_region: 0,
+        udp_bind: None,
+        udp_socket: None,
+        portmapper: None,
+        health: None,
+        disable_direct_paths: false,
+        peer_relay_server: false,
+        relay_server_config: None,
+        sockstats: None,
+        control_knobs: None,
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // No UDP candidates or known DERP route leaves fanout as the only path.
+    a.set_netmap(vec![make_peer(
+        b.node_public(),
+        b.disco_public(),
+        vec![],
+        0,
+    )])
+    .await
+    .unwrap();
+    b.set_netmap(vec![make_peer(
+        a.node_public(),
+        a.disco_public(),
+        vec![],
+        1,
+    )])
+    .await
+    .unwrap();
+
+    let result = a
+        .cli_ping(&b.node_public(), "b", "100.64.0.2".parse().unwrap(), 0)
+        .await
+        .expect("DERP CLI pong");
+    assert_eq!(result.DERPRegionID, 1);
+}
+
+#[tokio::test]
 async fn derp_or_none_send_starts_rate_limited_direct_discovery() {
     // No UDP socket and no DERP client keeps this deterministic in the test
     // sandbox: send() has no usable data path, but it must still start direct

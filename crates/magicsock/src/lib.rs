@@ -1434,43 +1434,44 @@ impl Magicsock {
                     )
                     .await;
             }
-            if derp_region > 0 {
-                let tx_id = random_tx_id();
-                let ping = Message::Ping(Ping {
-                    tx_id,
-                    node_key: self
+            let tx_id = random_tx_id();
+            let ping = Message::Ping(Ping {
+                tx_id,
+                node_key: self
+                    .inner
+                    .node_public
+                    .read()
+                    .expect("node_public lock poisoned")
+                    .clone(),
+                padding: 0,
+            });
+            if let Some(packet) = self.inner.disco.seal(&peer_disco, &ping) {
+                // Register the pending ping on the endpoint so match_pong
+                // can find it.
+                {
+                    let mut endpoints = self
                         .inner
-                        .node_public
-                        .read()
-                        .expect("node_public lock poisoned")
-                        .clone(),
-                    padding: 0,
-                });
-                if let Some(packet) = self.inner.disco.seal(&peer_disco, &ping) {
-                    // Register the pending ping on the endpoint so match_pong
-                    // can find it.
-                    {
-                        let mut endpoints = self
-                            .inner
-                            .endpoints
-                            .write()
-                            .expect("endpoints lock poisoned");
-                        if let Some(ep) = endpoints.get_mut(peer_key) {
-                            ep.add_pending_ping(
-                                tx_id,
-                                SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0),
-                                std::time::Instant::now(),
-                                DiscoPingPurpose::CLI,
-                                0,
-                                Some(request_id),
-                            );
-                        }
+                        .endpoints
+                        .write()
+                        .expect("endpoints lock poisoned");
+                    if let Some(ep) = endpoints.get_mut(peer_key) {
+                        ep.add_pending_ping(
+                            tx_id,
+                            SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0),
+                            std::time::Instant::now(),
+                            DiscoPingPurpose::CLI,
+                            0,
+                            Some(request_id),
+                        );
                     }
-                    self.inner
-                        .derp
-                        .send_packet(derp_region, peer_key.clone(), packet)
-                        .await;
                 }
+                // Use the regular DERP sender so an unknown region takes
+                // its bootstrap fanout path, just like a normal datagram.
+                // A send failure remains observable through the existing
+                // CLI timeout/error contract.
+                let _ = self
+                    .send_via_derp(peer_key.clone(), derp_region, &packet)
+                    .await;
             }
         }
 
@@ -1570,7 +1571,7 @@ impl Magicsock {
         }
     }
 
-    /// Send a WG datagram to `peer` via DERP region `region`.
+    /// Send a packet to `peer` via DERP region `region`.
     /// If `region` is 0 (unknown), fans out to ALL connected DERP regions
     /// so the peer receives the packet on whichever region it's on.
     /// Once a reply arrives, `last_recv_derp_region` is set and future
@@ -1591,7 +1592,7 @@ impl Magicsock {
             {
                 if debug_enabled() {
                     eprintln!(
-                        "DBG derp_send peer={} region={} wg_len={}",
+                        "DBG derp_send peer={} region={} packet_len={}",
                         short_key(&peer),
                         region,
                         datagram.len()
@@ -1637,7 +1638,7 @@ impl Magicsock {
 
         if debug_enabled() {
             eprintln!(
-                "DBG derp_fanout peer={} regions={:?} wg_len={}",
+                "DBG derp_fanout peer={} regions={:?} packet_len={}",
                 short_key(&peer),
                 all_regions,
                 datagram.len()

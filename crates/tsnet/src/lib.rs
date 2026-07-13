@@ -645,6 +645,9 @@ pub(crate) struct RunningState {
         Arc<std::sync::Mutex<Vec<(u64, Box<dyn FallbackTCPHandler + Send + Sync>)>>>,
     /// Next fallback handler ID (monotonic).
     pub(crate) fallback_next_id: Arc<std::sync::atomic::AtomicU64>,
+    /// Client update checker — fed by the map-update loop, read by
+    /// `ipn_status()` and the LocalAPI `/status` endpoint.
+    pub(crate) client_updater: Arc<std::sync::Mutex<rustscale_clientupdate::ClientUpdater>>,
 }
 
 /// A fallback TCP handler: called when an incoming TCP flow doesn't match any

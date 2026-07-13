@@ -138,6 +138,10 @@ pub(crate) struct LocalApiState {
     /// task from `MapResponse.SuggestedExitNode`.
     #[allow(dead_code)]
     pub suggested_exit_node: Arc<RwLock<String>>,
+    /// Client update checker — fed by the map-update loop from
+    /// `MapResponse.ClientVersion`; read by `build_status_json` to populate
+    /// `Status.ClientVersion`.
+    pub client_updater: Arc<std::sync::Mutex<rustscale_clientupdate::ClientUpdater>>,
 }
 
 pub struct LocalApiHandle {
@@ -991,6 +995,17 @@ async fn build_status_json(state: &LocalApiState) -> serde_json::Value {
             .map(|c| c.CertDomains.clone())
             .unwrap_or_default();
         s.CertDomains = cert_domains;
+        if let Ok(u) = state.client_updater.lock() {
+            let cr = u.check();
+            s.ClientVersion = Some(Box::new(rustscale_ipnstate::ClientVersionStatus {
+                RunningLatest: cr.running_latest,
+                LatestVersion: cr.latest_version.clone(),
+                UrgentSecurityUpdate: cr.urgent_security_update,
+                Notify: cr.notify,
+                NotifyURL: cr.notify_url.clone(),
+                NotifyText: cr.notify_text.clone(),
+            }));
+        }
     });
 
     // Self peer.
@@ -2780,6 +2795,9 @@ mod tests {
             route_table: None,
             logout_trigger: Arc::new(tokio::sync::Notify::new()),
             suggested_exit_node: Arc::new(RwLock::new(String::new())),
+            client_updater: Arc::new(std::sync::Mutex::new(
+                rustscale_clientupdate::ClientUpdater::new("0.1.0"),
+            )),
         })
     }
 
@@ -3531,6 +3549,9 @@ mod tests {
             route_table: None,
             logout_trigger: Arc::new(tokio::sync::Notify::new()),
             suggested_exit_node: Arc::new(RwLock::new(String::new())),
+            client_updater: Arc::new(std::sync::Mutex::new(
+                rustscale_clientupdate::ClientUpdater::new("0.1.0"),
+            )),
         });
 
         let config = r#"{"TCP":{"8080":{"HTTP":true}}}"#;
@@ -3759,6 +3780,9 @@ mod tests {
             route_table: None,
             logout_trigger: Arc::new(tokio::sync::Notify::new()),
             suggested_exit_node: Arc::new(RwLock::new(String::new())),
+            client_updater: Arc::new(std::sync::Mutex::new(
+                rustscale_clientupdate::ClientUpdater::new("0.1.0"),
+            )),
         })
     }
 

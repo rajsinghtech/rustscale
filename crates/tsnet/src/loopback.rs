@@ -500,6 +500,7 @@ impl Server {
             route_table: Some(inner.route_table.clone()),
             logout_trigger: inner.logout_trigger.clone(),
             suggested_exit_node: Arc::new(RwLock::new(String::new())),
+            client_updater: inner.client_updater.clone(),
         })
     }
 }

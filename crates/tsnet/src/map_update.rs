@@ -49,6 +49,7 @@ pub(crate) fn spawn_map_update_task(
     key_rotation_ctx: Option<KeyRotationCtx>,
     map_session: Arc<MapSessionState>,
     suggested_exit_node: Arc<RwLock<String>>,
+    client_updater: Arc<std::sync::Mutex<rustscale_clientupdate::ClientUpdater>>,
 ) -> JoinHandle<()> {
     let mut named_filters: BTreeMap<String, Vec<FilterRule>> = BTreeMap::new();
     // Create the netmap cache helper once so that save_if_changed can
@@ -364,6 +365,20 @@ pub(crate) fn spawn_map_update_task(
                             .write()
                             .await
                             .clone_from(&resp.SuggestedExitNode);
+                    }
+
+                    // Process ClientVersion from the control server (Go's
+                    // `LocalBackend.onClientVersion`). Feed it to the
+                    // ClientUpdater and fire a Notify so CLI status can show
+                    // update availability.
+                    if let Some(ref cv) = resp.ClientVersion {
+                        if let Ok(mut u) = client_updater.lock() {
+                            u.set_client_version(cv.clone());
+                        }
+                        ipn_backend.bus().send(rustscale_ipn::Notify {
+                            ClientVersion: serde_json::to_value(cv).ok(),
+                            ..Default::default()
+                        });
                     }
 
                     // Create WG tunnels for new peers.

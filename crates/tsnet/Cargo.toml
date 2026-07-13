@@ -72,6 +72,7 @@ rustscale-appc = { path = "../appc", version = "0.1.0" }
 rustscale-bakedroots = { path = "../bakedroots", version = "0.1.0" }
 rustscale-tsaddr = { path = "../tsaddr", version = "0.1.0" }
 rustscale-sockstats = { path = "../sockstats", version = "0.1.0" }
+rustscale-clientupdate = { path = "../clientupdate", version = "0.1.0" }
 rustscale-netns.workspace = true
 serde.workspace = true
 serde_json.workspace = true

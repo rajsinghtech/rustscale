@@ -109,6 +109,29 @@ pub async fn run(args: Vec<String>, socket: &Path, json: bool) -> Result<(), Cli
         }
     }
 
+    if let Some(cv) = status.get("ClientVersion") {
+        let running_latest = cv
+            .get("RunningLatest")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let latest_version = cv
+            .get("LatestVersion")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let urgent = cv
+            .get("UrgentSecurityUpdate")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        if !running_latest && !latest_version.is_empty() {
+            println!();
+            if urgent {
+                println!("** URGENT update available: {latest_version} **");
+            } else {
+                println!("Update available: {latest_version}");
+            }
+        }
+    }
+
     Ok(())
 }
 

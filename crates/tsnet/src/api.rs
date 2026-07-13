@@ -94,6 +94,19 @@ impl Server {
                 .unwrap_or_default();
             s.CertDomains = cert_domains;
         });
+        if let Ok(u) = inner.client_updater.lock() {
+            let cr = u.check();
+            sb.mutate_status(|s| {
+                s.ClientVersion = Some(Box::new(rustscale_ipnstate::ClientVersionStatus {
+                    RunningLatest: cr.running_latest,
+                    LatestVersion: cr.latest_version.clone(),
+                    UrgentSecurityUpdate: cr.urgent_security_update,
+                    Notify: cr.notify,
+                    NotifyURL: cr.notify_url.clone(),
+                    NotifyText: cr.notify_text.clone(),
+                }));
+            });
+        }
 
         sb.mutate_self_status(|ps| {
             ps.HostName.clone_from(&self.config.hostname);

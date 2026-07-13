@@ -75,7 +75,37 @@ pub struct Status {
     #[serde(default, deserialize_with = "deserialize_null_to_default")]
     pub User: BTreeMap<UserID, UserProfile>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub ClientVersion: Option<serde_json::Value>,
+    pub ClientVersion: Option<Box<ClientVersionStatus>>,
+}
+
+/// Client version status — mirrors Go's `tailcfg.ClientVersion` as emitted
+/// in `ipnstate.Status.ClientVersion`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ClientVersionStatus {
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub RunningLatest: bool,
+    #[serde(
+        default,
+        skip_serializing_if = "String::is_empty",
+        deserialize_with = "deserialize_null_to_default"
+    )]
+    pub LatestVersion: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub UrgentSecurityUpdate: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub Notify: bool,
+    #[serde(
+        default,
+        skip_serializing_if = "String::is_empty",
+        deserialize_with = "deserialize_null_to_default"
+    )]
+    pub NotifyURL: String,
+    #[serde(
+        default,
+        skip_serializing_if = "String::is_empty",
+        deserialize_with = "deserialize_null_to_default"
+    )]
+    pub NotifyText: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

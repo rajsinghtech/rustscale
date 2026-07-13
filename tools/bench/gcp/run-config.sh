@@ -195,8 +195,12 @@ tun_path_gate() {
 
 cleanup_rs_tun() {
   ssh_cmd "$SVM" "$SZONE" "kill \$(cat /tmp/iperf3-srv.pid 2>/dev/null) 2>/dev/null; pkill -x iperf3 2>/dev/null" || true
-  ssh_sudo "$SVM" "$SZONE" 'kill $(cat /tmp/rs-tun-srv.pid 2>/dev/null) 2>/dev/null; pkill -x rustscaled 2>/dev/null' || true
-  ssh_sudo "$CVM" "$CZONE" 'kill $(cat /tmp/rs-tun-cli.pid 2>/dev/null) 2>/dev/null; pkill -x rustscaled 2>/dev/null' || true
+  # A following tailscaled TUN must not race rustscaled's interface teardown.
+  # Always exit zero after this bounded best-effort wait: a missing process or
+  # interface is successful cleanup, not a reason for ssh retry machinery.
+  local wait_rs_tun='kill $(cat /tmp/rs-tun-%s.pid 2>/dev/null) 2>/dev/null || true; pkill -x rustscaled 2>/dev/null || true; for _ in $(seq 1 20); do if ! pgrep -x rustscaled >/dev/null 2>&1 && ! ip link show tailscale0 >/dev/null 2>&1; then exit 0; fi; sleep 1; done; exit 0'
+  ssh_sudo "$SVM" "$SZONE" "$(printf "$wait_rs_tun" srv)" || true
+  ssh_sudo "$CVM" "$CZONE" "$(printf "$wait_rs_tun" cli)" || true
 }
 
 cleanup_ts_tun() {

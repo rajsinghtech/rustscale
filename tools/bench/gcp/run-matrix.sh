@@ -40,7 +40,36 @@ matrix_command_shape_self_test() {
   [[ "$(rust_build_command)" != *'-p rustscaled'* ]] || return 1
 }
 
+wait_for_remote_builds() {
+  local server_pid="$1" client_pid="$2" status=0
+
+  if ! wait "$server_pid"; then
+    echo "[gcp] server remote build failed" >&2
+    status=1
+  fi
+  if ! wait "$client_pid"; then
+    echo "[gcp] client remote build failed" >&2
+    status=1
+  fi
+  return "$status"
+}
+
+matrix_remote_build_aggregation_self_test() {
+  local first_pid second_pid
+
+  (exit 0) & first_pid=$!
+  (exit 0) & second_pid=$!
+  wait_for_remote_builds "$first_pid" "$second_pid" || return 1
+
+  (exit 0) & first_pid=$!
+  (exit 1) & second_pid=$!
+  if wait_for_remote_builds "$first_pid" "$second_pid" 2>/dev/null; then
+    return 1
+  fi
+}
+
 matrix_command_shape_self_test
+matrix_remote_build_aggregation_self_test
 
 # ---------------------------------------------------------------------------
 # Arg parsing.
@@ -125,12 +154,15 @@ ACTIVE_SRV=""
 ACTIVE_SRV_ZONE=""
 ACTIVE_CLI=""
 ACTIVE_CLI_ZONE=""
+CLEANUP_RAN=0
 
  # ---------------------------------------------------------------------------
  # Cleanup trap. Deletes VMs + tailnet. Always best-effort.
  # Set AFTER bench_provision_tailnet calls its own trap, so this overrides it.
  # ---------------------------------------------------------------------------
  gcp_bench_cleanup() {
+   [[ $CLEANUP_RAN -eq 0 ]] || return
+   CLEANUP_RAN=1
    set +e
    echo "[gcp] cleanup: deleting VMs + tailnet" >&2
    if [[ -n "$ACTIVE_SRV" ]]; then
@@ -141,6 +173,12 @@ ACTIVE_CLI_ZONE=""
    fi
    bench_cleanup_tailnet
  }
+
+gcp_bench_on_signal() {
+  local signal="$1"
+  echo "[gcp] received $signal; exiting" >&2
+  exit 1
+}
 
 # ---------------------------------------------------------------------------
 # Provision tailnet (skipped in dry-run to avoid API calls).
@@ -159,7 +197,10 @@ else
 fi
 
 # Register cleanup handler AFTER bench_provision_tailnet so our trap overrides it.
-trap gcp_bench_cleanup INT TERM EXIT
+# Signal handlers exit nonzero; the EXIT trap performs the cleanup exactly once.
+trap 'gcp_bench_on_signal INT' INT
+trap 'gcp_bench_on_signal TERM' TERM
+trap gcp_bench_cleanup EXIT
 
 # ---------------------------------------------------------------------------
 # Main matrix loop.
@@ -186,9 +227,11 @@ for TOPO in "${TOPOLOGIES[@]}"; do
   echo "[gcp] building rustscale on both VMs in parallel..." >&2
   ssh_cmd "$SERVER_VM" "$Z_A" \
     "$(rust_build_command)" &
+  SERVER_BUILD_PID=$!
   ssh_cmd "$CLIENT_VM" "$Z_B" \
     "$(rust_build_command)" &
-  wait
+  CLIENT_BUILD_PID=$!
+  wait_for_remote_builds "$SERVER_BUILD_PID" "$CLIENT_BUILD_PID"
 
   # Path loop.
   for PATH_TAG in "${PATHS[@]}"; do

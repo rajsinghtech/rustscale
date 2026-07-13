@@ -94,7 +94,7 @@ fn parse_hex6_addr(s: &str) -> Option<(IpAddr, u16)> {
         ipv6[base + 3] = bytes[base];
     }
     let port = u16::from_str_radix(port, 16).ok()?;
-    Some((IpAddr::V6(Ipv6Addr::from(ipv6))), port)
+    Some((IpAddr::V6(Ipv6Addr::from(ipv6)), port))
 }
 
 fn is_localhost(ip: IpAddr) -> bool {
@@ -258,6 +258,16 @@ mod tests {
         let (ip, port) = parse_hex6_addr("00000000000000000000000001000000:0035").unwrap();
         assert_eq!(ip, IpAddr::V6(Ipv6Addr::LOCALHOST));
         assert_eq!(port, 53);
+    }
+
+    #[test]
+    fn test_parse_proc6_line_listen() {
+        let line = "   0: 00000000000000000000000001000000:1F90 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 12345 1 0000000000000000 100 0 0 10 0";
+        let (ip, port, state, inode) = parse_proc6_line(line).unwrap();
+        assert_eq!(ip, IpAddr::V6(Ipv6Addr::LOCALHOST));
+        assert_eq!(port, 8080);
+        assert_eq!(state, TCP_LISTEN);
+        assert_eq!(inode, 12345);
     }
 
     #[test]

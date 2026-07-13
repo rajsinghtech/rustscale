@@ -3002,6 +3002,7 @@ dependencies = [
  "rustscale-bakedroots",
  "rustscale-c2n",
  "rustscale-clientmetric",
+ "rustscale-clientupdate",
  "rustscale-conffile",
  "rustscale-controlclient",
  "rustscale-controlknobs",

@@ -569,7 +569,29 @@ The `tools/worktree-status.sh` tool run before any new phase launch reveals
 lingering worktrees. If the count exceeds 1, the orchestrator stops and
 resolves first.
 
-### 2026-07-12: Worktree cleanup after merge
+### 2026-07-12: Shared CARGO_TARGET_DIR rejected — sccache is the right fix
+
+**Research**: Adding `export CARGO_TARGET_DIR=$REPO_ROOT/.cache/wt-target-shared` in
+`opencode-task.sh` was considered to share compiled artifacts across worktree agents
+and avoid redundant recompilation.
+
+**Rejected because**: Cargo file-locks `target/` via `.cargo-lock`. Parallel cargo
+processes with a shared target dir **serialize** — one holds the lock, the other
+waits. Under high concurrency (the common case), this is **worse than separate target
+dirs**: agents can't build in parallel and total wall-clock time increases.
+
+**Better approach**: `sccache` (now auto-detected in `tools/check.sh`). It caches
+compilation results at the object-file level in a daemon-managed store. Parallel
+worktree agents that compile the same crate (e.g., both building `rustscale-key`)
+will hit sccache's shared object cache without contending on cargo's file lock.
+Separate `target/` directories + sccache = parallel builds + shared cache.
+
+**What was done**:
+- `tools/check.sh` now does `command -v sccache && export RUSTC_WRAPPER=sccache`
+  at startup, making all agents use sccache automatically.
+- `CARGO_TARGET_DIR` is NOT added — documented here why.
+
+## 2026-07-12: Worktree cleanup after merge
 
 After a successful `git merge` (whether via `worktree-merge.sh` or manual),
 the orchestrator MUST also clean up the worktree directory and branch:

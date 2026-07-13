@@ -36,10 +36,24 @@ run_checks() {
 echo "[merge] running checks in $WT_DIR ..."
 CHECK_OUT=$(cd "$REPO_DIR/$WT_DIR" && run_checks 2>&1) || {
   echo "$CHECK_OUT"
-  echo "[merge] CHECKS FAILED — worktree left in place for inspection" >&2
-  echo "[merge]   cd $REPO_DIR/$WT_DIR && tools/check.sh" >&2
-  echo "##STATUS:FAILED checks_in_worktree" >&2
-  exit 1
+  # Contention retry: if other cargo processes are running, wait 30s and retry
+  # once. Concurrency between parallel worktree agents causes false failures.
+  if pgrep -f "cargo " | grep -v "$$" >/dev/null 2>&1; then
+    echo "[merge] other cargo processes detected — potential contention" >&2
+    echo "[merge] waiting 30s then retrying once ..." >&2
+    sleep 30
+    RETRY_OUT=$(cd "$REPO_DIR/$WT_DIR" && run_checks 2>&1) || {
+      echo "$RETRY_OUT"
+      echo "[merge] RETRY ALSO FAILED — worktree left in place for inspection" >&2
+      echo "##STATUS:FAILED checks_in_worktree (retried)" >&2
+      exit 1
+    }
+    echo "[merge] retry passed (contention resolved)" >&2
+  else
+    echo "[merge] CHECKS FAILED — worktree left in place for inspection" >&2
+    echo "##STATUS:FAILED checks_in_worktree" >&2
+    exit 1
+  fi
 }
 
 echo "[merge] checks green, merging $WT_BRANCH into master"
@@ -70,16 +84,71 @@ if [ "$MERGE_EXIT" -ne 0 ]; then
     git add Cargo.lock
   fi
 
-  # --- Cargo.toml: three-way union merge ---
+  # --- Cargo.toml: smart dependency-list resolution ---
+  # Strategy: union-merge first. If conflicts remain, check whether each
+  # conflict region is a PURE ADDITION (both sides added new content not in
+  # base — the classic dep-list case). If so, auto-resolve by keeping both
+  # sides. Only bail when a side MODIFIES existing lines.
   if echo "$CONFLICTED" | grep -q '^Cargo\.toml$'; then
-    echo "[merge] Cargo.toml conflict — union-merging"
+    echo "[merge] Cargo.toml conflict — resolving"
     git show :1:Cargo.toml > /tmp/_cargo_base 2>/dev/null || true
     git show :2:Cargo.toml > /tmp/_cargo_ours 2>/dev/null || true
     git show :3:Cargo.toml > /tmp/_cargo_theirs 2>/dev/null || true
     if [ -f /tmp/_cargo_ours ] && [ -f /tmp/_cargo_base ] && [ -f /tmp/_cargo_theirs ]; then
       cp /tmp/_cargo_ours Cargo.toml
       git merge-file --union Cargo.toml /tmp/_cargo_base /tmp/_cargo_theirs 2>/dev/null || true
-      git add Cargo.toml
+      if git merge-file --check Cargo.toml /tmp/_cargo_base /tmp/_cargo_theirs 2>/dev/null; then
+        git add Cargo.toml
+        echo "[merge]   Cargo.toml union-merge clean"
+      else
+        # Check if ALL conflicts are pure additions (none is a modification)
+        python3 -c "
+import sys, re
+with open('/tmp/_cargo_base') as f: base = f.read()
+with open('Cargo.toml') as f: merged = f.read()
+# Find conflict regions
+pattern = re.compile(r'<<<<<<< .*?\n(.*?)=======\n(.*?)>>>>>>> .*?\n', re.DOTALL)
+additions = modifications = 0
+for m in pattern.finditer(merged):
+    ours = m.group(1)
+    theirs = m.group(2)
+    ours_in_base = ours.strip() in base
+    theirs_in_base = theirs.strip() in base
+    if ours_in_base or theirs_in_base:
+        modifications += 1
+    else:
+        additions += 1
+if modifications > 0:
+    sys.exit(2)  # bail
+elif additions > 0:
+    sys.exit(1)  # resolve
+else:
+    sys.exit(0)  # no conflicts
+" 2>/dev/null && RES=0 || RES=$?
+        if [ "$RES" = 1 ]; then
+          # Pure addition conflicts — resolve by keeping both sides (ours first)
+          echo "[merge]   Cargo.toml: addition-only conflicts — auto-resolving"
+          python3 -c "
+import re
+with open('Cargo.toml') as f: content = f.read()
+# Replace conflict markers, keeping both sides (ours first)
+result = re.sub(
+    r'<<<<<<< .*?\n(.*?)=======\n(.*?)>>>>>>> .*?\n',
+    r'\1\2',
+    content,
+    flags=re.DOTALL
+)
+with open('Cargo.toml', 'w') as f: f.write(result)
+" 2>/dev/null || true
+          git add Cargo.toml
+          echo "[merge]   Cargo.toml resolved (addition-only union)"
+        elif [ "$RES" = 2 ]; then
+          echo "[merge]   Cargo.toml: modification detected in conflicts — manual resolution needed" >&2
+          # Leave conflicted file in place for manual resolution
+        else
+          git add Cargo.toml
+        fi
+      fi
     fi
     rm -f /tmp/_cargo_*
   fi

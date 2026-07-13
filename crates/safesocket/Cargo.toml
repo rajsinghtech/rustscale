@@ -49,7 +49,7 @@ rand.workspace = true
 hex.workspace = true
 tokio = { workspace = true }
 
-[target.'cfg(target_os = "macos")'.dependencies]
+[target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
 [dev-dependencies]

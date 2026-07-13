@@ -1,0 +1,287 @@
+//! Unix peer credential extraction — ports the credential-checking half of
+//! Go's `ipn/ipnauth` package (`ConnIdentity`, `SO_PEERCRED`/`LOCAL_PEERCRED`).
+//!
+//! On Linux/macOS/FreeBSD the kernel stamps each accepted Unix-domain-socket
+//! connection with the peer's real UID and PID. [`ConnIdentity`] wraps those
+//! credentials and provides [`ConnIdentity::is_readwrite`] mirroring Go's
+//! `ConnIdentity.IsReadonlyConn` (inverted).
+//!
+//! # Auth model
+//!
+//! Read-write access is granted when the peer's uid is 0 (root), matches the
+//! daemon's uid (same user), or matches an optional operator uid. When no
+//! credentials are available the connection defaults to read-only.
+
+/// Peer credentials (uid + pid) extracted from a connected Unix socket.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PeerCreds {
+    pub uid: u32,
+    pub pid: u32,
+}
+
+/// Identity of a connecting peer. Ports Go's `ipn/ipnauth.ConnIdentity`.
+#[derive(Clone, Debug, Default)]
+pub struct ConnIdentity {
+    pub uid: Option<u32>,
+    pub pid: Option<u32>,
+    pub is_unix_sock: bool,
+}
+
+impl ConnIdentity {
+    /// Returns an identity that is always granted read-write access (uid 0).
+    /// Used on transports where peer credentials are not available but the
+    /// connection is already authenticated by other means (named-pipe ACL,
+    /// in-process loopback, HTTP basic-auth).
+    pub fn readwrite() -> Self {
+        Self {
+            uid: Some(0),
+            pid: None,
+            is_unix_sock: false,
+        }
+    }
+
+    /// Whether this connection should be granted full read-write access.
+    /// Mirrors Go's `ConnIdentity.IsReadonlyConn` (inverted).
+    ///
+    /// Read-write if the peer's uid is 0 (root), matches `daemon_uid` (same
+    /// user), or matches `operator_uid` (if set). Returns `false` when no uid
+    /// is available (credentials not extractable -> default read-only).
+    pub fn is_readwrite(&self, daemon_uid: u32, operator_uid: Option<u32>) -> bool {
+        let Some(uid) = self.uid else {
+            return false;
+        };
+        uid == 0 || uid == daemon_uid || operator_uid.is_some_and(|op| uid == op)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Platform-specific peer-credential extraction (unix only)
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+impl ConnIdentity {
+    /// Extract peer credentials from a connected Unix stream.
+    pub fn from_stream(stream: &tokio::net::UnixStream) -> Self {
+        let creds = get_peer_creds(stream);
+        Self {
+            uid: creds.as_ref().map(|c| c.uid),
+            pid: creds.as_ref().map(|c| c.pid),
+            is_unix_sock: true,
+        }
+    }
+}
+
+/// Get peer credentials from a connected Unix socket.
+///
+/// - **Linux**: `SO_PEERCRED` -> `struct ucred` (pid, uid, gid)
+/// - **macOS**: `getpeereid()` for uid + `LOCAL_PEERPID` for pid
+/// - **FreeBSD**: `LOCAL_PEERCRED` -> `struct xucred`
+///
+/// Returns `None` when credentials are not available or the platform is
+/// unsupported (e.g. Solaris/Illumos — future work).
+#[cfg(target_os = "linux")]
+pub fn get_peer_creds(stream: &tokio::net::UnixStream) -> Option<PeerCreds> {
+    use std::os::unix::io::AsRawFd;
+
+    let fd = stream.as_raw_fd();
+    let mut ucred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let ret = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&raw mut ucred).cast::<libc::c_void>(),
+            &raw mut len,
+        )
+    };
+    if ret == 0 {
+        Some(PeerCreds {
+            uid: ucred.uid,
+            pid: ucred.pid as u32,
+        })
+    } else {
+        None
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub fn get_peer_creds(stream: &tokio::net::UnixStream) -> Option<PeerCreds> {
+    use std::os::unix::io::AsRawFd;
+
+    let fd = stream.as_raw_fd();
+    let mut uid: libc::uid_t = 0;
+    let mut gid: libc::gid_t = 0;
+    if unsafe { libc::getpeereid(fd, &raw mut uid, &raw mut gid) } != 0 {
+        return None;
+    }
+    // LOCAL_PEERPID is not in the libc crate; defined in <sys/un.h> as 0x004.
+    const LOCAL_PEERPID: libc::c_int = 0x004;
+    let mut pid: libc::pid_t = 0;
+    let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+    let pid_ok = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            LOCAL_PEERPID,
+            (&raw mut pid).cast::<libc::c_void>(),
+            &raw mut len,
+        )
+    } == 0;
+    Some(PeerCreds {
+        uid,
+        pid: if pid_ok && pid > 0 { pid as u32 } else { 0 },
+    })
+}
+
+#[cfg(target_os = "freebsd")]
+pub fn get_peer_creds(stream: &tokio::net::UnixStream) -> Option<PeerCreds> {
+    use std::os::unix::io::AsRawFd;
+
+    let fd = stream.as_raw_fd();
+    let mut xucred: libc::xucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::xucred>() as libc::socklen_t;
+    let ret = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::LOCAL_PEERCRED,
+            (&raw mut xucred).cast::<libc::c_void>(),
+            &raw mut len,
+        )
+    };
+    if ret == 0 && xucred.cr_version != 0 {
+        Some(PeerCreds {
+            uid: xucred.cr_uid,
+            pid: 0,
+        })
+    } else {
+        None
+    }
+}
+
+/// Fallback for unix platforms without a dedicated implementation
+/// (solaris/illumos — future work).
+#[cfg(all(
+    unix,
+    not(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))
+))]
+pub fn get_peer_creds(_stream: &tokio::net::UnixStream) -> Option<PeerCreds> {
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_readwrite_identity_alows_all() {
+        let id = ConnIdentity::readwrite();
+        assert!(id.is_readwrite(0, None));
+        assert!(id.is_readwrite(1000, None));
+        assert!(id.is_readwrite(501, Some(42)));
+    }
+
+    #[test]
+    fn test_is_readwrite_root() {
+        let id = ConnIdentity {
+            uid: Some(0),
+            pid: Some(123),
+            is_unix_sock: true,
+        };
+        assert!(id.is_readwrite(501, None));
+        assert!(id.is_readwrite(1000, None));
+    }
+
+    #[test]
+    fn test_is_readwrite_same_uid() {
+        let id = ConnIdentity {
+            uid: Some(501),
+            pid: Some(123),
+            is_unix_sock: true,
+        };
+        assert!(id.is_readwrite(501, None));
+        assert!(!id.is_readwrite(502, None));
+    }
+
+    #[test]
+    fn test_is_readwrite_operator_uid() {
+        let id = ConnIdentity {
+            uid: Some(42),
+            pid: None,
+            is_unix_sock: true,
+        };
+        assert!(id.is_readwrite(501, Some(42)));
+        assert!(!id.is_readwrite(501, None));
+    }
+
+    #[test]
+    fn test_is_readwrite_no_creds_is_readonly() {
+        let id = ConnIdentity::default();
+        assert!(!id.is_readwrite(0, None));
+        assert!(!id.is_readwrite(501, None));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
+    #[tokio::test]
+    async fn test_get_peer_creds_same_process() {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("peercred-test.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let creds = get_peer_creds(&stream);
+            // Drop the stream so the client sees EOF.
+            drop(stream);
+            creds
+        });
+
+        let mut client = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        // Keep the client open until the server has read creds.
+        let mut buf = [0u8; 1];
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_secs(2), client.read(&mut buf)).await;
+        drop(client);
+
+        let creds = server.await.unwrap();
+        assert!(creds.is_some(), "peer creds should be available");
+        let creds = creds.unwrap();
+        let self_uid = unsafe { libc::getuid() };
+        assert_eq!(creds.uid, self_uid);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
+    #[tokio::test]
+    async fn test_conn_identity_from_stream() {
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("identity-test.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let identity = ConnIdentity::from_stream(&stream);
+            drop(stream);
+            identity
+        });
+
+        let _client = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        let identity = server.await.unwrap();
+
+        assert!(identity.is_unix_sock);
+        assert!(identity.uid.is_some());
+        let self_uid = unsafe { libc::getuid() };
+        assert_eq!(identity.uid, Some(self_uid));
+        // Same-uid peer should be read-write.
+        assert!(identity.is_readwrite(self_uid, None));
+    }
+}

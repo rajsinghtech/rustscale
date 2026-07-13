@@ -15,6 +15,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use rustscale_ipn::{LoginProfile, Prefs, StartOptions, WaitingFile};
+use rustscale_safesocket::peercred::ConnIdentity;
 use rustscale_tailcfg::DERPMap;
 
 use super::localapi::{self, LocalApiState};
@@ -155,7 +156,7 @@ impl InMemoryLocalClient {
                 Ok(r) => r,
                 Err(_) => return,
             };
-            let _ = localapi::dispatch(&mut server, &req, &state).await;
+            let _ = localapi::dispatch(&mut server, &req, &state, &ConnIdentity::readwrite()).await;
         });
 
         // Write the request to the client end of the pipe.
@@ -616,7 +617,7 @@ async fn handle_localapi_http(
         return Ok(());
     }
 
-    localapi::dispatch(&mut stream, &req, &state)
+    localapi::dispatch(&mut stream, &req, &state, &ConnIdentity::readwrite())
         .await
         .map_err(std::io::Error::other)
 }

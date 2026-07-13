@@ -11,9 +11,13 @@
 //!
 //! # Auth model
 //!
-//! Socket filesystem permissions (0600) — matching tailscaled's default
-//! local root/user model. No password or token. Only the same UID that
-//! created the socket (or root) can connect.
+//! Unix peer credentials (SO_PEERCRED/LOCAL_PEERCRED) — the kernel stamps
+//! each accepted connection with the peer's real UID. Connections from root
+//! (uid 0) or the daemon's own UID are granted read-write access; all others
+//! are read-only (mutating endpoints return 403). On platforms without peer
+//! credentials (Windows named pipes), the pipe ACL handles access control
+//! and all connections are read-write. See
+//! [`rustscale_safesocket::peercred::ConnIdentity`].
 //!
 //! # Wire shapes
 //!
@@ -36,6 +40,7 @@ use rustscale_ipn::{
 use rustscale_ipnstate::{PeerStatus, StatusBuilder, TailnetStatus};
 use rustscale_key::{MachinePrivate, MachinePublic, NodePrivate, NodePublic};
 use rustscale_magicsock::{Magicsock, PathClass};
+use rustscale_safesocket::peercred::ConnIdentity;
 use rustscale_safesocket::ServerStream;
 use rustscale_tailcfg::{DERPMap, DNSConfig, Node, UserID, UserProfile};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -160,9 +165,10 @@ pub(crate) fn spawn_localapi(
         loop {
             match listener.accept().await {
                 Ok(stream) => {
+                    let peer_identity = peer_identity_from_stream(&stream);
                     let state = state.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = handle_connection(stream, &state).await {
+                        if let Err(e) = handle_connection(stream, &state, peer_identity).await {
                             eprintln!("localapi: connection error: {e}");
                         }
                     });
@@ -179,6 +185,19 @@ pub(crate) fn spawn_localapi(
         task,
         socket_path: path,
     })
+}
+
+/// Extract a [`ConnIdentity`] from a server-side stream. On Unix this reads
+/// peer credentials (SO_PEERCRED/LOCAL_PEERCRED); on other platforms all
+/// connections are treated as read-write (pipe ACL handles access control).
+#[cfg(unix)]
+fn peer_identity_from_stream(stream: &ServerStream) -> ConnIdentity {
+    ConnIdentity::from_stream(stream)
+}
+
+#[cfg(not(unix))]
+fn peer_identity_from_stream(_stream: &ServerStream) -> ConnIdentity {
+    ConnIdentity::readwrite()
 }
 
 // ---------------------------------------------------------------------------
@@ -591,6 +610,7 @@ fn parse_query(query: &str) -> std::collections::HashMap<String, String> {
 async fn handle_connection(
     mut stream: ServerStream,
     state: &Arc<LocalApiState>,
+    peer_identity: ConnIdentity,
 ) -> Result<(), std::io::Error> {
     let req = match read_request(&mut stream).await {
         Ok(r) => r,
@@ -601,17 +621,40 @@ async fn handle_connection(
         }
     };
 
-    dispatch(&mut stream, &req, state).await
+    dispatch(&mut stream, &req, state, &peer_identity).await
 }
 
 // ---------------------------------------------------------------------------
 // Dispatch
 // ---------------------------------------------------------------------------
 
+/// Check whether the peer has read-write access. On Unix, compares the peer's
+/// uid against the daemon's uid (and root). On non-Unix platforms, always
+/// returns true (named-pipe ACL handles access control).
+fn require_readwrite(identity: &ConnIdentity) -> bool {
+    #[cfg(unix)]
+    {
+        let daemon_uid = unsafe { libc::getuid() };
+        identity.is_readwrite(daemon_uid, None)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = identity;
+        true
+    }
+}
+
+/// Write a 403 Forbidden response for read-only peers attempting mutations.
+async fn write_access_denied<W: AsyncWrite + Unpin>(conn: &mut W) -> Result<(), std::io::Error> {
+    let body = serde_json::json!({"error": "access denied"});
+    write_json_response(conn, 403, "Forbidden", &body).await
+}
+
 pub(crate) async fn dispatch<W: AsyncWrite + Unpin>(
     conn: &mut W,
     req: &HttpRequest,
     state: &Arc<LocalApiState>,
+    peer_identity: &ConnIdentity,
 ) -> Result<(), std::io::Error> {
     let method = req.method.as_str();
     let path = req.path.as_str();
@@ -682,22 +725,38 @@ pub(crate) async fn dispatch<W: AsyncWrite + Unpin>(
 
         // --- PATCH /localapi/v0/prefs ---
         "prefs" if method == "PATCH" => {
+            if !require_readwrite(peer_identity) {
+                write_access_denied(conn).await?;
+                return Ok(());
+            }
             handle_patch_prefs(conn, &req.body, state).await?;
         }
 
         // --- POST /localapi/v0/start ---
         "start" if method == "POST" => {
+            if !require_readwrite(peer_identity) {
+                write_access_denied(conn).await?;
+                return Ok(());
+            }
             handle_start(conn, &req.body, state).await?;
         }
 
         // --- POST /localapi/v0/login-interactive ---
         "login-interactive" if method == "POST" => {
+            if !require_readwrite(peer_identity) {
+                write_access_denied(conn).await?;
+                return Ok(());
+            }
             state.login_trigger.notify_waiters();
             write_no_content_response(conn, 204, "No Content").await?;
         }
 
         // --- POST /localapi/v0/logout ---
         "logout" if method == "POST" => {
+            if !require_readwrite(peer_identity) {
+                write_access_denied(conn).await?;
+                return Ok(());
+            }
             handle_logout(conn, state).await?;
         }
 
@@ -741,6 +800,10 @@ pub(crate) async fn dispatch<W: AsyncWrite + Unpin>(
             handle_get_serve_config(conn, state).await?;
         }
         "serve-config" if method == "POST" => {
+            if !require_readwrite(peer_identity) {
+                write_access_denied(conn).await?;
+                return Ok(());
+            }
             handle_post_serve_config(conn, req, state).await?;
         }
 
@@ -750,6 +813,10 @@ pub(crate) async fn dispatch<W: AsyncWrite + Unpin>(
         }
         // --- PUT /localapi/v0/profiles ---
         "profiles" if method == "PUT" => {
+            if !require_readwrite(peer_identity) {
+                write_access_denied(conn).await?;
+                return Ok(());
+            }
             handle_new_profile(conn, state).await?;
         }
         // --- GET /localapi/v0/file-targets ---
@@ -784,11 +851,19 @@ pub(crate) async fn dispatch<W: AsyncWrite + Unpin>(
 
         // --- POST /localapi/v0/set-expiry-sooner ---
         "set-expiry-sooner" if method == "POST" => {
+            if !require_readwrite(peer_identity) {
+                write_access_denied(conn).await?;
+                return Ok(());
+            }
             handle_set_expiry_sooner(conn, &req.body, &req.query).await?;
         }
 
         // --- POST /localapi/v0/shutdown ---
         "shutdown" if method == "POST" => {
+            if !require_readwrite(peer_identity) {
+                write_access_denied(conn).await?;
+                return Ok(());
+            }
             handle_shutdown(conn, state).await?;
         }
 
@@ -799,6 +874,10 @@ pub(crate) async fn dispatch<W: AsyncWrite + Unpin>(
 
         // --- POST /localapi/v0/debug (action dispatcher) ---
         "debug" if method == "POST" => {
+            if !require_readwrite(peer_identity) {
+                write_access_denied(conn).await?;
+                return Ok(());
+            }
             handle_debug_action(conn, &req.body, &req.query, state).await?;
         }
 
@@ -810,16 +889,28 @@ pub(crate) async fn dispatch<W: AsyncWrite + Unpin>(
             }
             // Check for profiles/<id> or profiles/current sub-paths.
             if let Some(suffix) = endpoint.strip_prefix("profiles/") {
+                if (method == "POST" || method == "DELETE") && !require_readwrite(peer_identity) {
+                    write_access_denied(conn).await?;
+                    return Ok(());
+                }
                 handle_profile_subpath(conn, method, suffix, state).await?;
                 return Ok(());
             }
             // Check for files/<name> or files/ (Taildrop).
             if endpoint == "files" || endpoint.starts_with("files/") {
+                if method == "DELETE" && !require_readwrite(peer_identity) {
+                    write_access_denied(conn).await?;
+                    return Ok(());
+                }
                 handle_files(conn, method, endpoint, &req.query, req, state).await?;
                 return Ok(());
             }
             // Check for file-put/<stableID>/<filename> (Taildrop upload proxy).
             if let Some(suffix) = endpoint.strip_prefix("file-put/") {
+                if !require_readwrite(peer_identity) {
+                    write_access_denied(conn).await?;
+                    return Ok(());
+                }
                 handle_file_put(conn, method, suffix, req, state).await?;
                 return Ok(());
             }
@@ -2760,7 +2851,9 @@ mod tests {
                 Vec::new()
             };
             if let Ok(req) = parse_request_head(req_raw, body_preview) {
-                dispatch(&mut server, &req, state).await.ok();
+                // Tests run as the same user as the daemon → read-write.
+                let identity = test_rw_identity();
+                dispatch(&mut server, &req, state, &identity).await.ok();
             }
         }
         tokio::io::AsyncWriteExt::shutdown(&mut server).await.ok();
@@ -2774,6 +2867,34 @@ mod tests {
         });
 
         read_task.await.unwrap_or_default()
+    }
+
+    /// Build a read-write ConnIdentity for tests (same-uid as the daemon).
+    #[cfg(unix)]
+    fn test_rw_identity() -> ConnIdentity {
+        ConnIdentity {
+            uid: Some(unsafe { libc::getuid() }),
+            pid: Some(std::process::id()),
+            is_unix_sock: true,
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn test_rw_identity() -> ConnIdentity {
+        ConnIdentity::readwrite()
+    }
+
+    /// Build a read-only ConnIdentity for tests (different uid).
+    fn test_ro_identity() -> ConnIdentity {
+        // Use a uid that is guaranteed to differ from the daemon's.
+        // uid 65534 is "nobody" on most systems; daemon is typically root or
+        // a regular user. Even if it matches, the test still validates the
+        // read-only path when the identity has no creds.
+        ConnIdentity {
+            uid: Some(65534),
+            pid: Some(99999),
+            is_unix_sock: true,
+        }
     }
 
     #[tokio::test]
@@ -3872,5 +3993,176 @@ mod tests {
             .expect("CertDomains is array");
         assert_eq!(domains.len(), 1);
         assert_eq!(domains[0], "node.ts.net");
+    }
+
+    // --- IPNAUTH: peer-credential enforcement tests ---
+
+    async fn send_request_with_identity(
+        raw: &[u8],
+        state: &Arc<LocalApiState>,
+        identity: ConnIdentity,
+    ) -> String {
+        let (mut client, mut server) = tokio::io::duplex(8192);
+        client.write_all(raw).await.unwrap();
+        client.flush().await.unwrap();
+        client.shutdown().await.ok();
+
+        let mut buf = vec![0u8; 8192];
+        let n = tokio::io::AsyncReadExt::read(&mut server, &mut buf)
+            .await
+            .unwrap_or(0);
+        if n > 0 {
+            let req_raw = &buf[..n];
+            let body_preview = if let Some(pos) = req_raw.windows(4).position(|w| w == b"\r\n\r\n")
+            {
+                req_raw[pos + 4..].to_vec()
+            } else {
+                Vec::new()
+            };
+            if let Ok(req) = parse_request_head(req_raw, body_preview) {
+                dispatch(&mut server, &req, state, &identity).await.ok();
+            }
+        }
+        tokio::io::AsyncWriteExt::shutdown(&mut server).await.ok();
+
+        let mut buf = Vec::new();
+        let read_task = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            client.read_to_end(&mut buf).await.ok();
+            String::from_utf8(buf).unwrap_or_default()
+        });
+        read_task.await.unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn test_readonly_identity_can_read_status() {
+        let state = make_test_state().await;
+        let resp = send_request_with_identity(
+            b"GET /localapi/v0/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            &state,
+            test_ro_identity(),
+        )
+        .await;
+        assert!(
+            resp.contains("200 OK"),
+            "read-only peer should read status: {resp}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_readonly_identity_can_read_health() {
+        let state = make_test_state().await;
+        let resp = send_request_with_identity(
+            b"GET /localapi/v0/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            &state,
+            test_ro_identity(),
+        )
+        .await;
+        assert!(resp.contains("200 OK"));
+    }
+
+    #[tokio::test]
+    async fn test_readonly_identity_can_read_metrics() {
+        let state = make_test_state().await;
+        let resp = send_request_with_identity(
+            b"GET /localapi/v0/metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            &state,
+            test_ro_identity(),
+        )
+        .await;
+        assert!(resp.contains("200 OK"));
+    }
+
+    #[tokio::test]
+    async fn test_readonly_identity_can_read_whois() {
+        let state = make_test_state().await;
+        let resp = send_request_with_identity(
+            b"GET /localapi/v0/whois?addr=100.64.0.2 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            &state,
+            test_ro_identity(),
+        )
+        .await;
+        assert!(resp.contains("200 OK"));
+    }
+
+    #[tokio::test]
+    async fn test_readonly_identity_blocked_from_patch_prefs() {
+        let state = make_test_state().await;
+        let resp = send_request_with_identity(
+            b"PATCH /localapi/v0/prefs HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            &state,
+            test_ro_identity(),
+        )
+        .await;
+        assert!(
+            resp.contains("403 Forbidden"),
+            "read-only peer should get 403: {resp}"
+        );
+        assert!(resp.contains("access denied"));
+    }
+
+    #[tokio::test]
+    async fn test_readonly_identity_blocked_from_shutdown() {
+        let state = make_test_state().await;
+        let resp = send_request_with_identity(
+            b"POST /localapi/v0/shutdown HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            &state,
+            test_ro_identity(),
+        )
+        .await;
+        assert!(resp.contains("403 Forbidden"));
+    }
+
+    #[tokio::test]
+    async fn test_readonly_identity_blocked_from_logout() {
+        let state = make_test_state().await;
+        let resp = send_request_with_identity(
+            b"POST /localapi/v0/logout HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            &state,
+            test_ro_identity(),
+        )
+        .await;
+        assert!(resp.contains("403 Forbidden"));
+    }
+
+    #[tokio::test]
+    async fn test_readonly_identity_blocked_from_login_interactive() {
+        let state = make_test_state().await;
+        let resp = send_request_with_identity(
+            b"POST /localapi/v0/login-interactive HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            &state,
+            test_ro_identity(),
+        )
+        .await;
+        assert!(resp.contains("403 Forbidden"));
+    }
+
+    #[tokio::test]
+    async fn test_readwrite_identity_can_patch_prefs() {
+        let state = make_test_state().await;
+        let body = r#"{"Hostname":"renamed"}"#;
+        let req = format!(
+            "PATCH /localapi/v0/prefs HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let resp = send_request_with_identity(req.as_bytes(), &state, test_rw_identity()).await;
+        assert!(
+            resp.contains("200 OK") || resp.contains("204"),
+            "read-write peer should patch prefs: {resp}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_no_creds_identity_is_readonly() {
+        let state = make_test_state().await;
+        let no_creds = ConnIdentity::default();
+        let resp = send_request_with_identity(
+            b"POST /localapi/v0/shutdown HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            &state,
+            no_creds,
+        )
+        .await;
+        assert!(resp.contains("403 Forbidden"));
     }
 }

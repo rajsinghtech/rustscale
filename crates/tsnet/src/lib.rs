@@ -290,6 +290,10 @@ pub struct ServerBuilder {
     /// baked ISRG roots for control-plane and DERP TLS connections. Mirrors
     /// Go's `tsnet.Server.ExtraRootCAs`.
     pub(crate) extra_root_certs: Option<Vec<Vec<u8>>>,
+    /// Path to the declarative config file (`--config` flag), if set.
+    /// Threaded through to `LocalApiState` so `POST /reload-config` can
+    /// re-read the file. Mirrors Go's `tsd.System.InitialConfig`.
+    pub(crate) config_path: Option<PathBuf>,
 }
 
 /// A pluggable logger callback for diagnostic messages. Implementations
@@ -519,6 +523,14 @@ impl ServerBuilder {
         self
     }
 
+    /// Set the declarative config file path (`--config` flag). When set,
+    /// the config file is loaded at startup and its prefs are applied.
+    /// `POST /localapi/v0/reload-config` re-reads this file.
+    pub fn config_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.config_path = Some(path.into());
+        self
+    }
+
     /// Enable OS-level DNS configuration in TUN mode (default: `false`).
     ///
     /// When enabled, [`Server::up_tun`] writes `/etc/resolver/` entries on
@@ -645,6 +657,10 @@ pub(crate) struct RunningState {
         Arc<std::sync::Mutex<Vec<(u64, Box<dyn FallbackTCPHandler + Send + Sync>)>>>,
     /// Next fallback handler ID (monotonic).
     pub(crate) fallback_next_id: Arc<std::sync::atomic::AtomicU64>,
+    /// Shared prefs — same Arc as `LocalApiState.prefs`, giving the daemon
+    /// direct access for SIGHUP-driven config reload without going through
+    /// the LocalAPI endpoint.
+    pub(crate) prefs: Arc<RwLock<rustscale_ipn::Prefs>>,
 }
 
 /// A fallback TCP handler: called when an incoming TCP flow doesn't match any
@@ -906,6 +922,39 @@ impl Server {
         if let Some(ref inner) = self.inner {
             inner.overrides.write().await.set_package(package);
         }
+    }
+
+    /// Re-read the config file at `path` and apply the resulting `MaskedPrefs`
+    /// to the live prefs. Used by the daemon's SIGHUP handler. The server
+    /// must be up (i.e. `up()` or `up_tun()` has been called).
+    ///
+    /// Mirrors Go's `LocalBackend.ReloadConfig()` → `setConfigLocked()` →
+    /// `ToPrefs()` → `ApplyEdits()` → `setPrefsLocked()`.
+    pub async fn reload_config(&self, path: &str) -> Result<(), String> {
+        let inner = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| "server not up".to_string())?;
+
+        let config =
+            rustscale_conffile::Config::load(path).map_err(|e| format!("config load: {e}"))?;
+
+        let masked = config.parsed.to_prefs();
+        let updated = {
+            let mut prefs = inner.prefs.write().await;
+            masked.apply_to(&mut prefs);
+            if let Some(ref dir) = self.config.state_dir {
+                let _ = prefs.save(dir);
+            }
+            serde_json::to_value(&*prefs).unwrap_or_default()
+        };
+
+        inner.ipn_backend.bus().send(rustscale_ipn::Notify {
+            Prefs: Some(updated),
+            ..Default::default()
+        });
+
+        Ok(())
     }
 
     /// Route a diagnostic message through the pluggable logger, or

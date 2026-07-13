@@ -239,6 +239,7 @@ impl Server {
         tasks.push(hostinfo_loop);
 
         // LocalAPI Unix-domain-socket server (optional, default OFF).
+        let prefs = Arc::new(RwLock::new(self.load_prefs().unwrap_or_default()));
         let localapi_socket = if self.config.localapi {
             let path = self.config.localapi_path.clone().unwrap_or_else(|| {
                 let dir = self
@@ -255,7 +256,7 @@ impl Server {
                 dns_config: b.dns_config.clone(),
                 packet_drops: b.packet_drops.clone(),
                 metrics: localapi::default_metric_registry(),
-                prefs: Arc::new(RwLock::new(self.load_prefs().unwrap_or_default())),
+                prefs: prefs.clone(),
                 tailscale_ips: b.tailscale_ips.clone(),
                 our_fqdn: b.our_fqdn.clone(),
                 hostname: self.config.hostname.clone(),
@@ -320,6 +321,7 @@ impl Server {
                     .map(|ps| ps.logout_trigger.clone())
                     .unwrap_or_else(|| Arc::new(tokio::sync::Notify::new())),
                 suggested_exit_node: suggested_exit_node.clone(),
+                config_path: self.config.config_path.clone(),
             };
             // Publish the live filter so `PATCH /prefs` can toggle
             // shields-up mode without a full rebuild.
@@ -382,6 +384,7 @@ impl Server {
                 .unwrap_or_else(|| Arc::new(tokio::sync::Notify::new())),
             fallback_tcp_handlers: Arc::new(std::sync::Mutex::new(vec![])),
             fallback_next_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            prefs,
         });
 
         // Apply stored exit-node pref on start (survives restart).
@@ -631,6 +634,7 @@ impl Server {
         ];
 
         // LocalAPI Unix-domain-socket server (optional, default OFF).
+        let prefs = Arc::new(RwLock::new(self.load_prefs().unwrap_or_default()));
         let localapi_socket = if self.config.localapi {
             let path = self.config.localapi_path.clone().unwrap_or_else(|| {
                 let dir = self
@@ -647,7 +651,7 @@ impl Server {
                 dns_config: b.dns_config.clone(),
                 packet_drops: b.packet_drops.clone(),
                 metrics: localapi::default_metric_registry(),
-                prefs: Arc::new(RwLock::new(self.load_prefs().unwrap_or_default())),
+                prefs: prefs.clone(),
                 tailscale_ips: b.tailscale_ips.clone(),
                 our_fqdn: b.our_fqdn.clone(),
                 hostname: self.config.hostname.clone(),
@@ -712,6 +716,7 @@ impl Server {
                     .map(|ps| ps.logout_trigger.clone())
                     .unwrap_or_else(|| Arc::new(tokio::sync::Notify::new())),
                 suggested_exit_node: suggested_exit_node.clone(),
+                config_path: self.config.config_path.clone(),
             };
             // Publish the live filter so `PATCH /prefs` can toggle
             // shields-up mode without a full rebuild.
@@ -807,6 +812,7 @@ impl Server {
                 .unwrap_or_else(|| Arc::new(tokio::sync::Notify::new())),
             fallback_tcp_handlers: Arc::new(std::sync::Mutex::new(vec![])),
             fallback_next_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            prefs,
         });
 
         // Apply stored exit-node pref on start (survives restart).
@@ -978,6 +984,7 @@ impl Server {
             route_table: None,
             logout_trigger: logout_trigger.clone(),
             suggested_exit_node: Arc::new(RwLock::new(String::new())),
+            config_path: self.config.config_path.clone(),
         });
 
         let handle = localapi::spawn_localapi(api_state.clone(), socket_path.clone());

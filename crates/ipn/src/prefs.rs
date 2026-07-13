@@ -81,6 +81,10 @@ pub struct Prefs {
     pub AppConnector: AppConnectorPrefs,
     #[serde(default, skip_serializing_if = "is_false")]
     pub RunWebClient: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub RunSSH: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub NoStatefulFiltering: bool,
 }
 
 impl Prefs {
@@ -167,6 +171,10 @@ pub struct MaskedPrefs {
     pub AppConnectorSet: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub RunWebClientSet: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub RunSSHSet: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub NoStatefulFilteringSet: bool,
 }
 
 impl MaskedPrefs {
@@ -241,6 +249,12 @@ impl MaskedPrefs {
         if self.RunWebClientSet {
             target.RunWebClient = self.Prefs.RunWebClient;
         }
+        if self.RunSSHSet {
+            target.RunSSH = self.Prefs.RunSSH;
+        }
+        if self.NoStatefulFilteringSet {
+            target.NoStatefulFiltering = self.Prefs.NoStatefulFiltering;
+        }
     }
 
     /// Returns `true` if no fields are set (no `*Set` bool is `true`).
@@ -266,7 +280,9 @@ impl MaskedPrefs {
             || self.NoSNATSet
             || self.PostureCheckingSet
             || self.AppConnectorSet
-            || self.RunWebClientSet)
+            || self.RunWebClientSet
+            || self.RunSSHSet
+            || self.NoStatefulFilteringSet)
     }
 }
 

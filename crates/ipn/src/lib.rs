@@ -20,7 +20,7 @@
 mod backend;
 mod bus;
 mod machine;
-mod prefs;
+pub mod prefs;
 mod profiles;
 pub mod store;
 

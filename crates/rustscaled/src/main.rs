@@ -29,6 +29,7 @@ fn main() {
             let mut port: Option<u16> = None;
             let mut socks5_server: Option<String> = None;
             let mut http_proxy_server: Option<String> = None;
+            let mut config: Option<PathBuf> = None;
             let mut cleanup = false;
             let mut i = 2;
             while i < args.len() {
@@ -84,6 +85,14 @@ fn main() {
                         }
                         http_proxy_server = Some(args[i].clone());
                     }
+                    "--config" => {
+                        i += 1;
+                        if i >= args.len() {
+                            eprintln!("error: --config requires a value");
+                            std::process::exit(1);
+                        }
+                        config = Some(PathBuf::from(&args[i]));
+                    }
                     "--cleanup" => cleanup = true,
                     "--tun" => tun = true,
                     other => {
@@ -107,6 +116,7 @@ fn main() {
                     port,
                     socks5_server,
                     http_proxy_server,
+                    config,
                     cleanup,
                 ))
                 .await
@@ -156,7 +166,8 @@ fn usage(bin: &str) {
     eprintln!(
         "usage: {bin} run [--statedir <dir>] [--state <dir>] [--socket <path>] \
          [--hostname <name>] [--port <port>] [--tun] \
-         [--socks5-server <addr>] [--http-proxy-server <addr>] [--cleanup]"
+         [--socks5-server <addr>] [--http-proxy-server <addr>] \
+         [--config <path>] [--cleanup]"
     );
     eprintln!("       {bin} install-system-daemon");
     eprintln!("       {bin} uninstall-system-daemon");

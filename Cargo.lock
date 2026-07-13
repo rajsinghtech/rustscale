@@ -2457,6 +2457,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustscale-conffile"
+version = "0.1.0"
+dependencies = [
+ "rustscale-ipn",
+ "rustscale-tailcfg",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "rustscale-connectproxy"
 version = "0.1.0"
 dependencies = [
@@ -2814,6 +2826,8 @@ dependencies = [
 name = "rustscale-rustscaled"
 version = "0.1.0"
 dependencies = [
+ "rustscale-conffile",
+ "rustscale-ipn",
  "rustscale-safesocket",
  "rustscale-tsnet",
  "thiserror 1.0.69",
@@ -2943,6 +2957,7 @@ dependencies = [
  "rustscale-bakedroots",
  "rustscale-c2n",
  "rustscale-clientmetric",
+ "rustscale-conffile",
  "rustscale-controlclient",
  "rustscale-controlknobs",
  "rustscale-derp",

@@ -385,7 +385,7 @@ cleanup_self_test() {
   sleep() { :; }
   ps() { :; }
   fuser() { :; }
-  test_remote_cleanup() { eval "$1"; }
+  test_remote_cleanup() { source /dev/stdin <<< "$1"; }
 
   for state in "${cases[@]}"; do
     CLEANUP_TEST_STATE="$state"
@@ -423,7 +423,7 @@ cleanup_self_test() {
     kill() { CLEANUP_TEST_EVENTS+=" kill"; return 1; }
     pkill() { CLEANUP_TEST_EVENTS+=" pkill"; return 1; }
     rm() { CLEANUP_TEST_EVENTS+=" rm:$*"; return 0; }
-    eval "$(rs_tun_iperf_cleanup_command)"
+    source /dev/stdin <<< "$(rs_tun_iperf_cleanup_command)"
     printf '%s\n' "$CLEANUP_TEST_EVENTS"
   ); then
     return 1
@@ -530,6 +530,70 @@ print(json.dumps({
     "count": n,
 }))
 '
+}
+
+# Measure a production kernel-TUN path after its product CLI path gate.
+# Args: LABEL AS_ROOT SERVER_IP DAEMON_PID_FILE FOOTPRINT_FILE BINARY_PATH
+# Results are returned in TUN_MEASURE_{THROUGHPUT,LATENCY,FOOTPRINT,BIN_SIZE}.
+tun_measure() {
+  local label="$1" as_root="$2" server_ip="$3" daemon_pid_file="$4"
+  local footprint_file="$5" binary_path="$6" srv_pid mbps
+  local tp_json="[]"
+
+  run_tun_command "$as_root" "$SVM" "$SZONE" \
+    "pkill -x iperf3 2>/dev/null; nohup iperf3 -s -p $PORT > /tmp/iperf3-srv.log 2>&1 & echo \$! > /tmp/iperf3-srv.pid"
+  sleep 2
+
+  srv_pid=$(run_tun_command "$as_root" "$SVM" "$SZONE" "cat $daemon_pid_file")
+  remote_start_footprint "$SVM" "$SZONE" "$srv_pid" "$footprint_file"
+
+  for N in "${PARALLELS[@]}"; do
+    echo "[gcp] $label: iperf3 N=$N" >&2
+    mbps=$(run_tun_command "$as_root" "$CVM" "$CZONE" \
+      "iperf3 -c $server_ip -p $PORT -t $DURATION -P $N -R -J 2>/dev/null" \
+      | iperf3_mbps 2>/dev/null || echo "0")
+    tp_json=$(printf '%s' "$tp_json" | python3 -c "
+import json,sys
+arr=json.load(sys.stdin)
+arr.append({'parallel': $N, 'mbps': float('$mbps'), 'duration_s': $DURATION})
+print(json.dumps(arr))
+")
+    sleep 3
+  done
+
+  echo "[gcp] $label: latency" >&2
+  TUN_MEASURE_LATENCY=$(run_tun_command "$as_root" "$CVM" "$CZONE" \
+    "ping -i $LATENCY_INTERVAL -c $LATENCY_COUNT $server_ip 2>/dev/null" | ping_latency)
+  TUN_MEASURE_FOOTPRINT=$(remote_stop_footprint "$SVM" "$SZONE" "$footprint_file")
+  TUN_MEASURE_BIN_SIZE=$(ssh_cmd "$SVM" "$SZONE" \
+    "stat -c %s $binary_path 2>/dev/null || echo 0")
+  TUN_MEASURE_THROUGHPUT="$tp_json"
+}
+
+# Emit a production kernel-TUN result. Args: TOOL LABEL PATH_CLASS
+tun_emit_result() {
+  local tool="$1" label="$2" path_class="$3"
+  python3 - "$CONFIG" "$TOPOLOGY" "$PATH_TAG" "$path_class" \
+    "$TUN_MEASURE_BIN_SIZE" "$TUN_MEASURE_THROUGHPUT" "$TUN_MEASURE_LATENCY" \
+    "$TUN_MEASURE_FOOTPRINT" "$tool" >"$OUT" <<'PYEOF'
+import json, sys
+config, topo, path_tag, path_class, bin_size, tp, lat, foot, tool = sys.argv[1:10]
+obj = {
+    "tool": tool,
+    "mode": "tun",
+    "topology": topo,
+    "path": path_tag,
+    "config": config,
+    "error": "",
+    "log_tail": "",
+    "throughput": json.loads(tp),
+    "latency": json.loads(lat),
+    "footprint": dict(json.loads(foot), binary_size_bytes=int(bin_size)),
+    "path_class_reported": path_class,
+}
+print(json.dumps(obj, indent=2))
+PYEOF
+  echo "[gcp] $label: wrote $OUT" >&2
 }
 
 # ===========================================================================
@@ -670,47 +734,8 @@ run_rs_tun() {
     return 1
   }
 
-  # Start iperf3 server on server VM. Bind to 0.0.0.0 (all interfaces) so
-  # the client can reach it via the server's tailnet IP on the utun. Binding
-  # to the tailnet IP specifically can fail if the address isn't fully
-  # configured on the TUN device yet.
-  ssh_cmd "$SVM" "$SZONE" "pkill -x iperf3 2>/dev/null; nohup iperf3 -s -p $PORT > /tmp/iperf3-srv.log 2>&1 & echo \$! > /tmp/iperf3-srv.pid"
-  sleep 2
-
-  # Footprint sampler for the production daemon PID on server VM.
-  local srv_pid
-  srv_pid=$(ssh_cmd "$SVM" "$SZONE" 'cat /tmp/rs-tun-srv.pid')
-  remote_start_footprint "$SVM" "$SZONE" "$srv_pid" /tmp/rs-tun-srv.footprint
-
-  # Throughput sweep (download, -R).
-  local tp_json="[]"
-  for N in "${PARALLELS[@]}"; do
-    echo "[gcp] rs-tun: iperf3 N=$N" >&2
-    local mbps
-    mbps=$(ssh_cmd "$CVM" "$CZONE" \
-      "iperf3 -c $server_ip -p $PORT -t $DURATION -P $N -R -J 2>/dev/null" \
-      | iperf3_mbps 2>/dev/null || echo "0")
-    tp_json=$(echo "$tp_json" | python3 -c "
-import json,sys
-arr=json.load(sys.stdin)
-arr.append({'parallel': $N, 'mbps': float('$mbps'), 'duration_s': $DURATION})
-print(json.dumps(arr))
-")
-    sleep 3
-  done
-
-  # Latency via ping.
-  echo "[gcp] rs-tun: latency" >&2
-  local lat_json
-  lat_json=$(ssh_cmd "$CVM" "$CZONE" "ping -i $LATENCY_INTERVAL -c $LATENCY_COUNT $server_ip 2>/dev/null" | ping_latency)
-
-  # Stop footprint.
-  local foot_json
-  foot_json=$(remote_stop_footprint "$SVM" "$SZONE" /tmp/rs-tun-srv.footprint)
-
-  # Binary size of the production daemon.
-  local bin_size
-  bin_size=$(ssh_cmd "$SVM" "$SZONE" 'stat -c %s /opt/rustscale/target/release/rustscaled 2>/dev/null || echo 0')
+  tun_measure rs-tun 0 "$server_ip" /tmp/rs-tun-srv.pid \
+    /tmp/rs-tun-srv.footprint /opt/rustscale/target/release/rustscaled
 
   # Cleanup.
   if ! cleanup_rs_tun; then
@@ -718,25 +743,7 @@ print(json.dumps(arr))
     return "$FATAL_HANDOFF_STATUS"
   fi
 
-  python3 - "$CONFIG" "$TOPOLOGY" "$PATH_TAG" "$path_class" "$bin_size" "$tp_json" "$lat_json" "$foot_json" >"$OUT" <<'PYEOF'
-import json, sys
-config, topo, path_tag, path_class, bin_size, tp, lat, foot = sys.argv[1:9]
-obj = {
-    "tool": "rustscale",
-    "mode": "tun",
-    "topology": topo,
-    "path": path_tag,
-    "config": config,
-    "error": "",
-    "log_tail": "",
-    "throughput": json.loads(tp),
-    "latency": json.loads(lat),
-    "footprint": dict(json.loads(foot), binary_size_bytes=int(bin_size)),
-    "path_class_reported": path_class,
-}
-print(json.dumps(obj, indent=2))
-PYEOF
-  echo "[gcp] rs-tun: wrote $OUT" >&2
+  tun_emit_result rustscale rs-tun "$path_class"
 }
 
 # ===========================================================================
@@ -1009,67 +1016,12 @@ run_ts_tun() {
   path_class=$(tun_path_gate 1 "$CVM" "$CZONE" tailscale /tmp/ts-tun-cli.sock "$server_ip" "$PATH_TAG" /tmp/ts-tun-cli.path.log) || {
     emit_stub "ts-cli-path-gate-failed" "$(capture_log_tail "$CVM" "$CZONE" /tmp/ts-tun-cli.path.log)"; cleanup_ts_tun; return 1; }
 
-  # iperf3 server.
-  ssh_sudo "$SVM" "$SZONE" \
-    "pkill -x iperf3 2>/dev/null; nohup iperf3 -s -p $PORT > /tmp/iperf3-srv.log 2>&1 & echo \$! > /tmp/iperf3-srv.pid"
-  sleep 2
-
-  # Footprint for tailscaled PID on server VM.
-  local srv_pid
-  srv_pid=$(ssh_sudo "$SVM" "$SZONE" 'cat /tmp/ts-tun-srv.pid')
-  remote_start_footprint "$SVM" "$SZONE" "$srv_pid" /tmp/ts-tun-srv.footprint
-
-  # Throughput sweep.
-  local tp_json="[]"
-  for N in "${PARALLELS[@]}"; do
-    echo "[gcp] ts-tun: iperf3 N=$N" >&2
-    local mbps
-    mbps=$(ssh_sudo "$CVM" "$CZONE" \
-      "iperf3 -c $server_ip -p $PORT -t $DURATION -P $N -R -J 2>/dev/null" \
-      | iperf3_mbps 2>/dev/null || echo "0")
-    tp_json=$(echo "$tp_json" | python3 -c "
-import json,sys
-arr=json.load(sys.stdin)
-arr.append({'parallel': $N, 'mbps': float('$mbps'), 'duration_s': $DURATION})
-print(json.dumps(arr))
-")
-    sleep 3
-  done
-
-  # Latency via ping.
-  echo "[gcp] ts-tun: latency" >&2
-  local lat_json
-  lat_json=$(ssh_sudo "$CVM" "$CZONE" "ping -i $LATENCY_INTERVAL -c $LATENCY_COUNT $server_ip 2>/dev/null" | ping_latency)
-
-  # Stop footprint.
-  local foot_json
-  foot_json=$(remote_stop_footprint "$SVM" "$SZONE" /tmp/ts-tun-srv.footprint)
-
-  # Binary size.
-  local bin_size
-  bin_size=$(ssh_cmd "$SVM" "$SZONE" 'stat -c %s /usr/sbin/tailscaled 2>/dev/null || echo 0')
+  tun_measure ts-tun 1 "$server_ip" /tmp/ts-tun-srv.pid \
+    /tmp/ts-tun-srv.footprint /usr/sbin/tailscaled
 
   cleanup_ts_tun
 
-  python3 - "$CONFIG" "$TOPOLOGY" "$PATH_TAG" "$path_class" "$bin_size" "$tp_json" "$lat_json" "$foot_json" >"$OUT" <<'PYEOF'
-import json, sys
-config, topo, path_tag, path_class, bin_size, tp, lat, foot = sys.argv[1:9]
-obj = {
-    "tool": "tailscaled",
-    "mode": "tun",
-    "topology": topo,
-    "path": path_tag,
-    "config": config,
-    "error": "",
-    "log_tail": "",
-    "throughput": json.loads(tp),
-    "latency": json.loads(lat),
-    "footprint": dict(json.loads(foot), binary_size_bytes=int(bin_size)),
-    "path_class_reported": path_class,
-}
-print(json.dumps(obj, indent=2))
-PYEOF
-  echo "[gcp] ts-tun: wrote $OUT" >&2
+  tun_emit_result tailscaled ts-tun "$path_class"
 }
 
 # ---------------------------------------------------------------------------

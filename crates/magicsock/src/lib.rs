@@ -1447,6 +1447,28 @@ impl Magicsock {
         // Send direct and DERP CLI pings independently. A relay pong is a
         // useful result even if direct candidates were advertised.
         if !peer_disco.is_zero() {
+            // A CLI ping is an explicit request to establish a direct path.
+            // Advertise our current UDP addresses without inheriting the
+            // background discovery rate limit; repeated CLI attempts provide
+            // their own retry cadence.
+            if !self.inner.disable_direct_paths {
+                let cmm = Message::CallMeMaybe(CallMeMaybe {
+                    my_number: self
+                        .local_udp_addrs()
+                        .iter()
+                        .filter_map(|addr| addr.parse::<SocketAddr>().ok())
+                        .map(rustscale_disco::AddrPort::from)
+                        .collect(),
+                });
+                if let Some(packet) = self.inner.disco.seal(&peer_disco, &cmm) {
+                    // Use the regular DERP sender so an unknown region takes
+                    // its bootstrap fanout path.
+                    let _ = self
+                        .send_via_derp(peer_key.clone(), derp_region, &packet)
+                        .await;
+                }
+            }
+
             for addr in &candidates {
                 self.inner
                     .send_disco_ping(
@@ -2724,15 +2746,34 @@ impl Inner {
                 }
             }
             Message::CallMeMaybe(cmm) => {
+                // The peer is telling us its UDP addresses. Retain every
+                // authenticated address before probing so later discovery and
+                // CLI rounds can reuse them. Drop the endpoint lock before
+                // awaiting any network IO.
+                let addrs: Vec<SocketAddr> = cmm
+                    .my_number
+                    .iter()
+                    .copied()
+                    .map(SocketAddr::from)
+                    .collect();
+                {
+                    let mut endpoints = self.endpoints.write().expect("endpoints lock poisoned");
+                    if let Some(endpoint) = endpoints.get_mut(&source) {
+                        for &addr in &addrs {
+                            endpoint.learn_candidate(addr);
+                        }
+                    }
+                }
+
                 // When direct paths are disabled, don't ping the peer's
                 // advertised addresses — we won't use a direct path anyway.
                 if self.disable_direct_paths {
                     return;
                 }
-                // The peer is telling us its UDP addresses. Ping each.
+
+                // Ping each advertised address.
                 let peer_disco = sender_disco.clone();
-                for ep in &cmm.my_number {
-                    let addr = SocketAddr::from(*ep);
+                for addr in addrs {
                     self.send_disco_ping(
                         &source,
                         &peer_disco,

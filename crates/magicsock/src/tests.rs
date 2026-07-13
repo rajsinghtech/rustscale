@@ -13,12 +13,38 @@ use rustscale_derp::{
 };
 use rustscale_key::{DiscoPrivate, NodePrivate, NodePublic};
 use rustscale_tailcfg::{DERPMap, DERPNode, DERPRegion};
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, Mutex, Notify};
+
+#[test]
+fn post_selection_configures_some_socket_from_udp_socket_and_udp_bind() {
+    // `Magicsock::new` resolves both constructor alternatives before this
+    // hook, so each selected `Some` must receive the same configuration.
+    for constructor in ["udp_socket", "udp_bind"] {
+        let calls = Cell::new(0);
+
+        configure_selected_udp_socket(Some(constructor), |configured| {
+            assert_eq!(configured, constructor);
+            calls.set(calls.get() + 1);
+        });
+
+        assert_eq!(calls.get(), 1, "{constructor} selected socket");
+    }
+}
+
+#[test]
+fn post_selection_skips_configuration_without_a_selected_socket() {
+    let calls = Cell::new(0);
+
+    configure_selected_udp_socket(None::<()>, |()| calls.set(calls.get() + 1));
+
+    assert_eq!(calls.get(), 0);
+}
 
 /// Minimal ServerInfo JSON for the handshake (just the version field).
 async fn write_frame<W: AsyncWrite + Unpin>(

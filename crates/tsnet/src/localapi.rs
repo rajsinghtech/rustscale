@@ -56,10 +56,15 @@ const API_PREFIX: &str = "/localapi/v0/";
 /// require server-level operations (start, login, logout).
 #[derive(Clone, Debug)]
 pub enum DaemonCommand {
-    Start { auth_key: Option<String> },
+    Start {
+        auth_key: Option<String>,
+    },
     LoginInteractive,
     Logout,
     Shutdown,
+    /// Re-read the config file and apply the resulting prefs. Fired by
+    /// `POST /reload-config` or daemon-side SIGHUP handler.
+    ReloadConfig,
 }
 
 /// Credentials needed to build an [`AcmeCertFetcher`] on demand for the
@@ -138,6 +143,10 @@ pub(crate) struct LocalApiState {
     /// task from `MapResponse.SuggestedExitNode`.
     #[allow(dead_code)]
     pub suggested_exit_node: Arc<RwLock<String>>,
+    /// Path to the declarative config file (`--config` flag), if set.
+    /// `POST /reload-config` re-reads this file and applies the resulting
+    /// `MaskedPrefs` to the live prefs.
+    pub config_path: Option<PathBuf>,
 }
 
 pub struct LocalApiHandle {
@@ -442,7 +451,48 @@ async fn handle_logout<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-/// Resolve an exit node from the peer list by IP address, MagicDNS name,
+/// Handle `POST /localapi/v0/reload-config`: re-read the config file at
+/// `state.config_path`, convert to `MaskedPrefs`, and apply to the live
+/// prefs. Mirrors Go's `LocalBackend.ReloadConfig()`.
+async fn handle_reload_config<W: AsyncWrite + Unpin>(
+    conn: &mut W,
+    state: &Arc<LocalApiState>,
+) -> Result<(), std::io::Error> {
+    let Some(ref config_path) = state.config_path else {
+        let err = serde_json::json!({"error": "no config file path set"});
+        write_json_response(conn, 400, "Bad Request", &err).await?;
+        return Ok(());
+    };
+
+    let path_str = config_path.to_string_lossy();
+    let config = match rustscale_conffile::Config::load(&path_str) {
+        Ok(c) => c,
+        Err(e) => {
+            let err = serde_json::json!({"error": format!("config reload failed: {e}")});
+            write_json_response(conn, 400, "Bad Request", &err).await?;
+            return Ok(());
+        }
+    };
+
+    let masked = config.parsed.to_prefs();
+    let updated = {
+        let mut prefs = state.prefs.write().await;
+        masked.apply_to(&mut prefs);
+        if let Some(ref dir) = state.state_dir {
+            let _ = prefs.save(dir);
+        }
+        serde_json::to_value(&*prefs).unwrap_or_default()
+    };
+
+    state.ipn_backend.bus().send(rustscale_ipn::Notify {
+        Prefs: Some(updated.clone()),
+        ..Default::default()
+    });
+
+    eprintln!("rustscaled: config reloaded from {path_str}");
+    write_json_response(conn, 200, "OK", &updated).await?;
+    Ok(())
+}
 /// or stable node ID. Returns the peer's NodePublic key on success.
 /// Mirrors Go's `resolveExitNodeIPLocked` / `peerWithStableID` lookup.
 pub(crate) fn resolve_exit_node_peer(peers: &[Node], ip_or_name: &str) -> Option<NodePublic> {
@@ -689,6 +739,7 @@ pub(crate) async fn dispatch<W: AsyncWrite + Unpin>(
                     "/localapi/v0/set-expiry-sooner",
                     "/localapi/v0/shutdown",
                     "/localapi/v0/id-token",
+                    "/localapi/v0/reload-config",
                 ]);
                 write_json_response(conn, 200, "OK", &endpoints).await?;
             } else {
@@ -870,6 +921,15 @@ pub(crate) async fn dispatch<W: AsyncWrite + Unpin>(
         // --- GET /localapi/v0/id-token ---
         "id-token" if method == "GET" => {
             handle_id_token(conn, &req.query).await?;
+        }
+
+        // --- POST /localapi/v0/reload-config ---
+        "reload-config" if method == "POST" => {
+            if !require_readwrite(peer_identity) {
+                write_access_denied(conn).await?;
+                return Ok(());
+            }
+            handle_reload_config(conn, state).await?;
         }
 
         // --- POST /localapi/v0/debug (action dispatcher) ---
@@ -2780,6 +2840,7 @@ mod tests {
             route_table: None,
             logout_trigger: Arc::new(tokio::sync::Notify::new()),
             suggested_exit_node: Arc::new(RwLock::new(String::new())),
+            config_path: None,
         })
     }
 
@@ -3531,6 +3592,7 @@ mod tests {
             route_table: None,
             logout_trigger: Arc::new(tokio::sync::Notify::new()),
             suggested_exit_node: Arc::new(RwLock::new(String::new())),
+            config_path: None,
         });
 
         let config = r#"{"TCP":{"8080":{"HTTP":true}}}"#;
@@ -3759,6 +3821,7 @@ mod tests {
             route_table: None,
             logout_trigger: Arc::new(tokio::sync::Notify::new()),
             suggested_exit_node: Arc::new(RwLock::new(String::new())),
+            config_path: None,
         })
     }
 

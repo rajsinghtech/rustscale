@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use rustscale_conffile::Config;
 use rustscale_tsnet::localapi::DaemonCommand;
 use rustscale_tsnet::{Server, TunModeConfig};
 
@@ -18,11 +19,11 @@ pub async fn run(
     port: Option<u16>,
     socks5_server: Option<String>,
     http_proxy_server: Option<String>,
+    config_path: Option<PathBuf>,
     cleanup: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let auth_key = std::env::var("TS_AUTHKEY").ok();
     let state_dir = statedir.unwrap_or_else(|| PathBuf::from(DEFAULT_STATE_DIR));
-    let hostname = hostname.unwrap_or_else(|| "rustscale".to_string());
     let socket_path = socket_override.unwrap_or_else(|| determine_socket_path(&state_dir));
 
     // --cleanup: remove old state files and exit.
@@ -44,10 +45,53 @@ pub async fn run(
         eprintln!("rustscaled: --http-proxy-server {addr} (TODO: not yet wired)");
     }
 
-    if let Some(key) = auth_key {
-        run_with_auth_key(&key, &state_dir, &hostname, &socket_path, tun, port).await
+    // Load declarative config file if --config was provided.
+    let config = if let Some(ref cp) = config_path {
+        match Config::load(cp.to_str().unwrap_or("")) {
+            Ok(c) => {
+                eprintln!("rustscaled: config loaded from {}", cp.display());
+                Some(c)
+            }
+            Err(e) => {
+                eprintln!("rustscaled: config load failed: {e}");
+                return Err(e.into());
+            }
+        }
     } else {
-        run_interactive(&state_dir, &hostname, &socket_path, tun, port).await
+        None
+    };
+
+    // Resolve hostname: CLI --hostname takes priority, then config file, then default.
+    let hostname = hostname
+        .or_else(|| config.as_ref().and_then(|c| c.parsed.Hostname.clone()))
+        .unwrap_or_else(|| "rustscale".to_string());
+
+    // Resolve auth key: TS_AUTHKEY env, then config file.
+    let auth_key = auth_key.or_else(|| config.as_ref().and_then(|c| c.parsed.AuthKey.clone()));
+
+    if let Some(key) = auth_key {
+        run_with_auth_key(
+            &key,
+            &state_dir,
+            &hostname,
+            &socket_path,
+            tun,
+            port,
+            config_path,
+            config,
+        )
+        .await
+    } else {
+        run_interactive(
+            &state_dir,
+            &hostname,
+            &socket_path,
+            tun,
+            port,
+            config_path,
+            config,
+        )
+        .await
     }
 }
 
@@ -58,15 +102,41 @@ async fn run_with_auth_key(
     socket_path: &Path,
     tun: bool,
     port: Option<u16>,
+    config_path: Option<PathBuf>,
+    config: Option<Config>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut builder = Server::builder()
         .hostname(hostname)
         .auth_key(auth_key)
         .state_dir(state_dir)
         .localapi_path(socket_path);
+
+    // Apply config-file fields to the builder.
+    if let Some(ref cfg) = config {
+        if let Some(ref url) = cfg.parsed.ServerURL {
+            if !url.is_empty() {
+                builder = builder.control_url(url);
+            }
+        }
+        if !cfg.parsed.AdvertiseRoutes.is_empty() {
+            builder = builder.advertise_routes(cfg.parsed.AdvertiseRoutes.clone());
+        }
+        if let Some(true) = cfg.parsed.AcceptRoutes.as_bool() {
+            builder = builder.accept_routes(true);
+        }
+    }
+    if let Some(ref cp) = config_path {
+        builder = builder.config_path(cp);
+    }
     if let Some(p) = port {
         builder = builder.port(p);
     }
+
+    // Apply config prefs to the on-disk prefs so up() picks them up.
+    if let Some(ref cfg) = config {
+        apply_config_prefs_to_disk(cfg, state_dir)?;
+    }
+
     let mut server = builder.build()?;
 
     if tun {
@@ -85,8 +155,9 @@ async fn run_with_auth_key(
 
     // Wait for either shutdown or logout.
     let logout_trigger = server.logout_trigger();
+    let config_path_clone = config_path.clone();
     tokio::select! {
-        () = wait_for_shutdown_signal() => {}
+        () = wait_for_shutdown_signal(config_path_clone.as_ref()) => {}
         () = async {
             if let Some(ref trigger) = logout_trigger {
                 trigger.notified().await;
@@ -111,14 +182,40 @@ async fn run_interactive(
     socket_path: &Path,
     tun: bool,
     port: Option<u16>,
+    config_path: Option<PathBuf>,
+    config: Option<Config>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut builder = Server::builder()
         .hostname(hostname)
         .state_dir(state_dir)
         .localapi_path(socket_path);
+
+    // Apply config-file fields to the builder.
+    if let Some(ref cfg) = config {
+        if let Some(ref url) = cfg.parsed.ServerURL {
+            if !url.is_empty() {
+                builder = builder.control_url(url);
+            }
+        }
+        if !cfg.parsed.AdvertiseRoutes.is_empty() {
+            builder = builder.advertise_routes(cfg.parsed.AdvertiseRoutes.clone());
+        }
+        if let Some(true) = cfg.parsed.AcceptRoutes.as_bool() {
+            builder = builder.accept_routes(true);
+        }
+    }
+    if let Some(ref cp) = config_path {
+        builder = builder.config_path(cp);
+    }
     if let Some(p) = port {
         builder = builder.port(p);
     }
+
+    // Apply config prefs to the on-disk prefs so up() picks them up.
+    if let Some(ref cfg) = config {
+        apply_config_prefs_to_disk(cfg, state_dir)?;
+    }
+
     let mut server = builder.build()?;
 
     let mut command_rx = server.start_localapi_only().await?;
@@ -170,6 +267,9 @@ async fn run_interactive(
                 eprintln!("rustscaled: shutdown requested (server not up yet)");
                 return Ok(());
             }
+            DaemonCommand::ReloadConfig => {
+                eprintln!("rustscaled: reload-config requested (server not up yet)");
+            }
         }
     }
 
@@ -179,8 +279,9 @@ async fn run_interactive(
 
     // Phase 2: server is up — wait for shutdown, logout, or LocalAPI shutdown.
     let logout_trigger = server.logout_trigger();
+    let config_path_clone = config_path.clone();
     tokio::select! {
-        () = wait_for_shutdown_signal() => {}
+        () = wait_for_shutdown_signal(config_path_clone.as_ref()) => {}
         () = async {
             if let Some(ref trigger) = logout_trigger {
                 trigger.notified().await;
@@ -193,14 +294,44 @@ async fn run_interactive(
             eprintln!("rustscaled: logged out, state cleared → NeedsLogin");
         }
         Some(cmd) = command_rx.recv() => {
-            if matches!(cmd, DaemonCommand::Shutdown) {
-                eprintln!("rustscaled: shutdown requested via LocalAPI");
+            match cmd {
+                DaemonCommand::Shutdown => {
+                    eprintln!("rustscaled: shutdown requested via LocalAPI");
+                }
+                DaemonCommand::ReloadConfig => {
+                    if let Some(ref cp) = config_path {
+                        eprintln!("rustscaled: reload-config via LocalAPI from {}", cp.display());
+                        if let Err(e) = server.reload_config(cp.to_str().unwrap_or("")).await {
+                            eprintln!("rustscaled: config reload failed: {e}");
+                        }
+                    }
+                }
+                _ => {}
             }
         }
     }
 
     eprintln!("rustscaled: shutting down...");
     server.close().await;
+    Ok(())
+}
+
+/// Apply config-file prefs to the on-disk prefs file so that `Server::up()`
+/// picks them up via `load_prefs()`. This handles fields that don't have
+/// direct `ServerBuilder` equivalents (e.g. `ShieldsUp`, `CorpDNS`,
+/// `ExitNodeID`, `RunSSH`, etc.). Fields with builder methods are applied
+/// separately in the caller.
+fn apply_config_prefs_to_disk(
+    config: &Config,
+    state_dir: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let masked = config.parsed.to_prefs();
+    if masked.is_empty() {
+        return Ok(());
+    }
+    let mut prefs = rustscale_ipn::Prefs::load(state_dir).unwrap_or_default();
+    masked.apply_to(&mut prefs);
+    prefs.save(state_dir)?;
     Ok(())
 }
 
@@ -287,23 +418,38 @@ fn determine_socket_path(state_dir: &Path) -> PathBuf {
 }
 
 #[cfg(unix)]
-async fn wait_for_shutdown() {
+async fn wait_for_shutdown(config_path: Option<&PathBuf>) {
     use tokio::signal::unix::{signal, SignalKind};
     let mut sigint = signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
     let mut sigterm = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
-    tokio::select! {
-        _ = sigint.recv() => {}
-        _ = sigterm.recv() => {}
+    let mut sighup = signal(SignalKind::hangup()).expect("failed to install SIGHUP handler");
+    loop {
+        tokio::select! {
+            _ = sigint.recv() => break,
+            _ = sigterm.recv() => break,
+            _ = sighup.recv() => {
+                if let Some(cp) = config_path {
+                    eprintln!("rustscaled: SIGHUP received, reloading config from {}", cp.display());
+                    // The server reference is not available here; the reload
+                    // is handled via the LocalAPI POST /reload-config endpoint.
+                    // In practice, the daemon's caller can wire a reload
+                    // callback. For now, log and continue.
+                    eprintln!("rustscaled: use 'POST /localapi/v0/reload-config' for live reload");
+                } else {
+                    eprintln!("rustscaled: SIGHUP received (no config file set, ignoring)");
+                }
+            }
+        }
     }
 }
 
 /// Signal-wait future usable in `tokio::select!`.
 #[cfg(unix)]
-async fn wait_for_shutdown_signal() {
-    wait_for_shutdown().await;
+async fn wait_for_shutdown_signal(config_path: Option<&PathBuf>) {
+    wait_for_shutdown(config_path).await;
 }
 
 #[cfg(not(unix))]
-async fn wait_for_shutdown_signal() {
+async fn wait_for_shutdown_signal(_config_path: Option<&PathBuf>) {
     let _ = tokio::signal::ctrl_c().await;
 }

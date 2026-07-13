@@ -38,6 +38,8 @@ fn full_prefs() -> Prefs {
         PostureChecking: true,
         AppConnector: AppConnectorPrefs { Advertise: true },
         RunWebClient: true,
+        RunSSH: true,
+        NoStatefulFiltering: false,
     }
 }
 

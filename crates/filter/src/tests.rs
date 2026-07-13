@@ -891,3 +891,100 @@ fn test_shields_up_flag_getter() {
     f.set_shields_up(false);
     assert!(!f.shields_up());
 }
+
+/// Build a minimal raw IPv4+TCP packet (20-byte IP header + 20-byte TCP
+/// header + optional payload).
+fn build_ipv4_tcp(src: Ipv4Addr, dst: Ipv4Addr, sport: u16, dport: u16, payload: &[u8]) -> Vec<u8> {
+    let total = 20 + 20 + payload.len();
+    let mut p = vec![0u8; total];
+    p[0] = 0x45; // IPv4, IHL=5
+    p[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+    p[8] = 64; // TTL
+    p[9] = 6; // proto = TCP
+    p[12..16].copy_from_slice(&src.octets());
+    p[16..20].copy_from_slice(&dst.octets());
+    p[20..22].copy_from_slice(&sport.to_be_bytes());
+    p[22..24].copy_from_slice(&dport.to_be_bytes());
+    p[32] = 0x50; // data offset = 5
+    p[33] = 0x02; // SYN
+    p[34..36].copy_from_slice(&65535u16.to_be_bytes());
+    p[40..].copy_from_slice(payload);
+    p
+}
+
+#[test]
+fn test_connection_counter_fires_on_outbound() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    let mut f = new_test_filter();
+
+    // Track calls with an atomic counter.
+    let call_count = Arc::new(AtomicU64::new(0));
+    let last_bytes = Arc::new(AtomicU64::new(0));
+    let cc = call_count.clone();
+    let lb = last_bytes.clone();
+    f.set_connection_counter(Some(Arc::new(
+        move |_proto, _src, _dst, _pkts, bytes, _recv| {
+            cc.fetch_add(1, Ordering::Relaxed);
+            lb.store(bytes, Ordering::Relaxed);
+        },
+    )));
+
+    // Build a raw IPv4+TCP packet.
+    let pkt = build_ipv4_tcp(
+        "8.1.1.1".parse().unwrap(),
+        "1.2.3.4".parse().unwrap(),
+        12345,
+        80,
+        &[],
+    );
+    f.update_outbound(&pkt);
+
+    assert_eq!(call_count.load(Ordering::Relaxed), 1);
+    assert_eq!(last_bytes.load(Ordering::Relaxed), pkt.len() as u64);
+}
+
+#[test]
+fn test_connection_counter_none_is_noop() {
+    let mut f = new_test_filter();
+    // No counter installed — update_outbound should not panic.
+    let pkt = build_ipv4_tcp(
+        "8.1.1.1".parse().unwrap(),
+        "1.2.3.4".parse().unwrap(),
+        12345,
+        80,
+        &[],
+    );
+    f.update_outbound(&pkt);
+}
+
+#[test]
+fn test_set_connection_counter_clears() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    let mut f = new_test_filter();
+    let call_count = Arc::new(AtomicU64::new(0));
+    let cc = call_count.clone();
+    f.set_connection_counter(Some(Arc::new(
+        move |_proto, _src, _dst, _pkts, _bytes, _recv| {
+            cc.fetch_add(1, Ordering::Relaxed);
+        },
+    )));
+
+    let pkt = build_ipv4_tcp(
+        "8.1.1.1".parse().unwrap(),
+        "1.2.3.4".parse().unwrap(),
+        12345,
+        80,
+        &[],
+    );
+    f.update_outbound(&pkt);
+    assert_eq!(call_count.load(Ordering::Relaxed), 1);
+
+    // Clear the counter — subsequent calls should not fire.
+    f.set_connection_counter(None);
+    f.update_outbound(&pkt);
+    assert_eq!(call_count.load(Ordering::Relaxed), 1);
+}

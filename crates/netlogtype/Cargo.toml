@@ -1,0 +1,18 @@
+[package]
+name = "rustscale-netlogtype"
+description = "Network logging wire types — port of Go's types/netlogtype"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rustscale-tailcfg = { path = "../tailcfg", version = "0.1.0" }
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

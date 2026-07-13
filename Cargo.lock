@@ -2764,6 +2764,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustscale-netlog"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "log",
+ "rustscale-logtail",
+ "rustscale-netlogtype",
+ "rustscale-tailcfg",
+ "rustscale-tsaddr",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
+name = "rustscale-netlogtype"
+version = "0.1.0"
+dependencies = [
+ "rustscale-tailcfg",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "rustscale-netmon"
 version = "0.1.0"
 dependencies = [

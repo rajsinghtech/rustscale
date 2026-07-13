@@ -637,65 +637,237 @@ PYEOF
   echo "[gcp] $label: wrote $OUT" >&2
 }
 
-# Profile only the production rs-tun server after normal measurements. The
-# authkey is deliberately absent from commands, metadata, and artifacts.
-profile_prepare() {
-  ssh_sudo "$SVM" "$SZONE" "if command -v perf >/dev/null; then exit 0; fi; apt-get update -qq; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq linux-perf || DEBIAN_FRONTEND=noninteractive apt-get install -y -qq linux-tools-common linux-tools-\$(uname -r) || DEBIAN_FRONTEND=noninteractive apt-get install -y -qq linux-tools-common || true; command -v perf >/dev/null"
+# Profile both halves of the production rs-tun data path after normal
+# measurements.  The authkey is deliberately absent from commands, metadata,
+# and artifacts.
+profile_perf_install_command() {
+  printf '%s' 'if command -v perf >/dev/null; then exit 0; fi; apt-get update -qq; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq linux-perf || DEBIAN_FRONTEND=noninteractive apt-get install -y -qq linux-tools-common linux-tools-$(uname -r) || DEBIAN_FRONTEND=noninteractive apt-get install -y -qq linux-tools-common || true; command -v perf >/dev/null'
 }
 
+profile_prepare() {
+  local status=0 command
+  command=$(profile_perf_install_command)
+  if ! ssh_sudo "$SVM" "$SZONE" "$command"; then
+    status=1
+  fi
+  if ! ssh_sudo "$CVM" "$CZONE" "$command"; then
+    status=1
+  fi
+  return "$status"
+}
+
+profile_endpoint_prefix() {
+  local endpoint="$1"
+  printf '/tmp/rs-tun-perf-%s' "$endpoint"
+}
+
+# Remove exactly one endpoint's profiler files.  The wrapper PID is validated
+# before it is signalled, so malformed stale files cannot cause arbitrary kill.
+profile_remote_cleanup_endpoint() {
+  local endpoint="$1" vm="$2" zone="$3" prefix command
+  prefix=$(profile_endpoint_prefix "$endpoint")
+  command="pid=\$(cat ${prefix}.pid 2>/dev/null || true); case \$pid in \"\"|0|0[0-9]*|*[!0-9]*) ;; *) kill \"\$pid\" 2>/dev/null || true ;; esac; rm -f ${prefix}.pid ${prefix}.status ${prefix}.data ${prefix}-children.txt ${prefix}-self.txt ${prefix}.log"
+  [[ "$endpoint" == client ]] && command+=" /tmp/rs-tun-profile-iperf.json"
+  ssh_sudo "$vm" "$zone" "$command"
+}
+
+# Always attempt both cleanup actions, including after setup or workload
+# failures.  This deliberately does not use a broad process-name kill.
 profile_remote_cleanup() {
-  ssh_sudo "$SVM" "$SZONE" "pid=\$(cat /tmp/rs-tun-perf.pid 2>/dev/null || true); case \$pid in *[!0-9]*|\"\") ;; *) kill \$pid 2>/dev/null || true ;; esac; rm -f /tmp/rs-tun-perf.pid /tmp/rs-tun-perf.data /tmp/rs-tun-perf-children.txt /tmp/rs-tun-perf-self.txt /tmp/rs-tun-perf.log /tmp/rs-tun-profile-iperf.json" || true
+  local status=0
+  if ! profile_remote_cleanup_endpoint server "$SVM" "$SZONE"; then
+    status=1
+  fi
+  if ! profile_remote_cleanup_endpoint client "$CVM" "$CZONE"; then
+    status=1
+  fi
+  return "$status"
+}
+
+profile_start_command() {
+  local endpoint="$1" daemon_pid="$2" prefix duration
+  prefix=$(profile_endpoint_prefix "$endpoint")
+  duration=$((DURATION + 3))
+  # No single quotes: ssh_sudo wraps this program in a single-quoted bash -c.
+  printf 'rm -f %s.pid %s.status %s.data %s-children.txt %s-self.txt %s.log; nohup bash -c "perf record -F 199 -g -p %s -o %s.data -- sleep %s; status=\$?; printf \\"%%s\\n\\" \\"\$status\\" > %s.status; exit \\"\$status\\"" >%s.log 2>&1 & echo $! >%s.pid' \
+    "$prefix" "$prefix" "$prefix" "$prefix" "$prefix" "$prefix" "$daemon_pid" "$prefix" "$duration" "$prefix" "$prefix" "$prefix"
+}
+
+profile_wait_command() {
+  local endpoint="$1" prefix timeout
+  prefix=$(profile_endpoint_prefix "$endpoint")
+  timeout=$((DURATION + 30))
+  printf 'pid=$(cat %s.pid 2>/dev/null || true); case $pid in ""|0|0[0-9]*|*[!0-9]*) exit 1 ;; esac; elapsed=0; while kill -0 "$pid" 2>/dev/null; do (( elapsed < %s )) || exit 1; sleep 1; elapsed=$((elapsed + 1)); done; status=$(cat %s.status 2>/dev/null || true); [[ "$status" == 0 ]]' \
+    "$prefix" "$timeout" "$prefix"
+}
+
+profile_report_command() {
+  local endpoint="$1" prefix
+  prefix=$(profile_endpoint_prefix "$endpoint")
+  printf 'test -s %s.data && perf report --stdio --children -i %s.data > %s-children.txt && perf report --stdio --no-children -i %s.data > %s-self.txt && test -s %s-children.txt && test -s %s-self.txt && chmod 0644 %s.data %s-children.txt %s-self.txt' \
+    "$prefix" "$prefix" "$prefix" "$prefix" "$prefix" "$prefix" "$prefix" "$prefix" "$prefix" "$prefix"
 }
 
 profile_rs_tun() {
-  local profile_dir="$RDIR/profile" srv_pid remote_data=/tmp/rs-tun-perf.data commit
-  mkdir -p "$profile_dir"
-  if ! srv_pid=$(ssh_sudo "$SVM" "$SZONE" "cat /tmp/rs-tun-srv.pid"); then
-    profile_remote_cleanup; return 1
-  fi
-  case "$srv_pid" in *[!0-9]*|"") profile_remote_cleanup; return 1 ;; esac
-  if ! ssh_sudo "$SVM" "$SZONE" "rm -f $remote_data /tmp/rs-tun-perf-children.txt /tmp/rs-tun-perf-self.txt; nohup perf record -F 199 -g -p $srv_pid -o $remote_data -- sleep $((DURATION + 3)) >/tmp/rs-tun-perf.log 2>&1 & echo \$! >/tmp/rs-tun-perf.pid"; then
-    profile_remote_cleanup; return 1
-  fi
+  local profile_dir="$RDIR/profile" server_dir="$RDIR/profile/server" client_dir="$RDIR/profile/client"
+  local srv_pid cli_pid commit status=0 server_wait_status=0 client_wait_status=0
+  mkdir -p "$server_dir" "$client_dir"
+
+  if ! srv_pid=$(ssh_sudo "$SVM" "$SZONE" 'cat /tmp/rs-tun-srv.pid'); then
+    status=1
+  elif ! cli_pid=$(ssh_sudo "$CVM" "$CZONE" 'cat /tmp/rs-tun-cli.pid'); then
+    status=1
+  elif [[ ! "$srv_pid" =~ ^[1-9][0-9]*$ || ! "$cli_pid" =~ ^[1-9][0-9]*$ ]]; then
+    status=1
+  elif ! ssh_sudo "$SVM" "$SZONE" "$(profile_start_command server "$srv_pid")"; then
+    status=1
+  elif ! ssh_sudo "$CVM" "$CZONE" "$(profile_start_command client "$cli_pid")"; then
+    status=1
   # This extra P10 is intentionally outside tun_measure and result JSON.
-  if ! run_tun_command 0 "$CVM" "$CZONE" "iperf3 -c $server_ip -p $PORT -t $DURATION -P 10 -R -J >/tmp/rs-tun-profile-iperf.json"; then
-    profile_remote_cleanup; return 1
-  fi
-  if ! ssh_sudo "$SVM" "$SZONE" "elapsed=0; while kill -0 \$(cat /tmp/rs-tun-perf.pid) 2>/dev/null; do (( elapsed < $((DURATION + 30)) )) || exit 1; sleep 1; elapsed=\$((elapsed + 1)); done; test -s $remote_data && perf report --stdio --children -i $remote_data > /tmp/rs-tun-perf-children.txt && perf report --stdio --no-children -i $remote_data > /tmp/rs-tun-perf-self.txt && chmod 0644 $remote_data /tmp/rs-tun-perf-children.txt /tmp/rs-tun-perf-self.txt"; then
-    profile_remote_cleanup; return 1
-  fi
-  if ! scp_from "$SVM" "$SZONE" "$remote_data" "$profile_dir/perf.data" ||
-     ! scp_from "$SVM" "$SZONE" /tmp/rs-tun-perf-children.txt "$profile_dir/perf-children.txt" ||
-     ! scp_from "$SVM" "$SZONE" /tmp/rs-tun-perf-self.txt "$profile_dir/perf-self.txt" ||
-     [[ ! -s "$profile_dir/perf.data" || ! -s "$profile_dir/perf-children.txt" || ! -s "$profile_dir/perf-self.txt" ]]; then
-    profile_remote_cleanup; return 1
-  fi
-  if ! commit=$(git -C "$(cd "$(dirname "$0")/../../.." && pwd)" rev-parse HEAD); then
-    profile_remote_cleanup; return 1
-  fi
-  if ! python3 - "$profile_dir/metadata.json" "$commit" "$TOPOLOGY" "$PATH_TAG" "$CONFIG" "$DURATION" "$srv_pid" "$OUT" <<'PYEOF'
+  elif ! run_tun_command 0 "$CVM" "$CZONE" "iperf3 -c $server_ip -p $PORT -t $DURATION -P 10 -R -J >/tmp/rs-tun-profile-iperf.json"; then
+    status=1
+  else
+    # Do not combine waits: each endpoint's profiler status is independently
+    # bounded and retained so a failure cannot be hidden by the other side.
+    if ssh_sudo "$SVM" "$SZONE" "$(profile_wait_command server)"; then
+      server_wait_status=0
+    else
+      server_wait_status=$?
+    fi
+    if ssh_sudo "$CVM" "$CZONE" "$(profile_wait_command client)"; then
+      client_wait_status=0
+    else
+      client_wait_status=$?
+    fi
+    if (( server_wait_status != 0 || client_wait_status != 0 )); then
+      status=1
+    elif ! ssh_sudo "$SVM" "$SZONE" "$(profile_report_command server)"; then
+      status=1
+    elif ! ssh_sudo "$CVM" "$CZONE" "$(profile_report_command client)"; then
+      status=1
+    elif ! scp_from "$SVM" "$SZONE" /tmp/rs-tun-perf-server.data "$server_dir/perf.data" ||
+         ! scp_from "$SVM" "$SZONE" /tmp/rs-tun-perf-server-children.txt "$server_dir/perf-children.txt" ||
+         ! scp_from "$SVM" "$SZONE" /tmp/rs-tun-perf-server-self.txt "$server_dir/perf-self.txt" ||
+         ! scp_from "$CVM" "$CZONE" /tmp/rs-tun-perf-client.data "$client_dir/perf.data" ||
+         ! scp_from "$CVM" "$CZONE" /tmp/rs-tun-perf-client-children.txt "$client_dir/perf-children.txt" ||
+         ! scp_from "$CVM" "$CZONE" /tmp/rs-tun-perf-client-self.txt "$client_dir/perf-self.txt" ||
+         [[ ! -s "$server_dir/perf.data" || ! -s "$server_dir/perf-children.txt" || ! -s "$server_dir/perf-self.txt" || ! -s "$client_dir/perf.data" || ! -s "$client_dir/perf-children.txt" || ! -s "$client_dir/perf-self.txt" ]]; then
+      status=1
+    elif ! commit=$(git -C "$(cd "$(dirname "$0")/../../.." && pwd)" rev-parse HEAD); then
+      status=1
+    elif ! python3 - "$profile_dir/metadata.json" "$commit" "$TOPOLOGY" "$PATH_TAG" "$CONFIG" "$DURATION" "$srv_pid" "$cli_pid" "$OUT" <<'PYEOF'
 import json, sys
-out, commit, topo, path, config, duration, pid, result = sys.argv[1:]
+out, commit, topo, path, config, duration, srv_pid, cli_pid, result = sys.argv[1:]
 json.dump({"commit":commit,"topology":topo,"path":path,"config":config,
            "parallel":10,"duration_s":int(duration),"frequency_hz":199,
-           "pid":int(pid),"command":"rustscaled","result_json":result}, open(out,"w"), indent=2)
+           "result_json":result,"workload_direction":"server_to_client",
+           "reverse":True,"endpoints":{
+             "server":{"pid":int(srv_pid),"command":"rustscaled","role":"sender"},
+             "client":{"pid":int(cli_pid),"command":"rustscaled","role":"receiver"}}},
+          open(out,"w"), indent=2)
 PYEOF
-  then
-    profile_remote_cleanup; return 1
+    then
+      status=1
+    fi
   fi
-  profile_remote_cleanup
+
+  if ! profile_remote_cleanup; then
+    status=1
+  fi
+  return "$status"
 }
 
 profile_command_self_test() {
-  local log=""
-  ssh_sudo() { log+=" sudo:$3"; [[ "$3" == *'perf report'* ]] && return 1; [[ "$3" == *'cat /tmp/rs-tun-srv.pid'* ]] && { printf '42\n'; return 0; }; return 0; }
-  run_tun_command() { log+=" iperf:$4"; return 0; }
-  scp_from() { log+=" copy:$3"; : >"$4"; }
-  server_ip=100.64.0.1
+  local log="" log_file server_ip=100.64.0.1 result
+  local -a copied=(server/perf.data server/perf-children.txt server/perf-self.txt client/perf.data client/perf-children.txt client/perf-self.txt)
+  mkdir -p "$RDIR"
+  log_file=$(mktemp "$RDIR/profile-test.XXXXXX")
+
+  ssh_sudo() { printf ' sudo:%s:%s' "$1" "$3" >>"$log_file"; }
+  profile_prepare || return 1
+  log=$(<"$log_file")
+  [[ "$log" == *"sudo:$SVM:"*'command -v perf'* && "$log" == *"sudo:$CVM:"*'command -v perf'* ]] || return 1
+
+  # The happy path proves two recordings start before reverse P10, endpoint
+  # waits/reports are independent, all artifacts are copied, and both remote
+  # filename sets are cleaned up.
+  ssh_sudo() {
+    printf ' sudo:%s:%s' "$1" "$3" >>"$log_file"
+    case "$3" in
+      'cat /tmp/rs-tun-srv.pid') printf '42\n' ;;
+      'cat /tmp/rs-tun-cli.pid') printf '84\n' ;;
+    esac
+    return 0
+  }
+  run_tun_command() { printf ' iperf:%s:%s' "$2" "$4" >>"$log_file"; }
+  scp_from() { printf ' copy:%s:%s:%s' "$1" "$3" "$4" >>"$log_file"; printf x >"$4"; }
+  profile_rs_tun || return 1
+  log=$(<"$log_file")
+  [[ "$log" == *"perf record -F 199 -g -p 42"* && "$log" == *"perf record -F 199 -g -p 84"* ]] || return 1
+  [[ "${log%% iperf:*}" == *"perf record -F 199 -g -p 42"* && "${log%% iperf:*}" == *"perf record -F 199 -g -p 84"* ]] || return 1
+  [[ "$log" == *"sudo:$SVM:"*"rs-tun-perf-server.status"* && "$log" == *"sudo:$CVM:"*"rs-tun-perf-client.status"* && "$log" == *"perf report --stdio --children -i /tmp/rs-tun-perf-server.data"* && "$log" == *"perf report --stdio --children -i /tmp/rs-tun-perf-client.data"* ]] || return 1
+  for artifact in "${copied[@]}"; do [[ "$log" == *"$RDIR/profile/$artifact"* ]] || return 1; done
+  [[ "$log" == *"rm -f /tmp/rs-tun-perf-server.pid"* && "$log" == *"rm -f /tmp/rs-tun-perf-client.pid"* && "$log" == *"/tmp/rs-tun-profile-iperf.json"* ]] || return 1
+  python3 - "$RDIR/profile/metadata.json" <<'PYEOF'
+import json, sys
+with open(sys.argv[1]) as f:
+    metadata = json.load(f)
+assert metadata["workload_direction"] == "server_to_client"
+assert metadata["reverse"] is True
+assert metadata["endpoints"]["server"] == {"pid": 42, "command": "rustscaled", "role": "sender"}
+assert metadata["endpoints"]["client"] == {"pid": 84, "command": "rustscaled", "role": "receiver"}
+PYEOF
+
+  # A malformed PID is rejected before either profile start or workload.
+  : >"$log_file"
+  ssh_sudo() { printf ' sudo:%s:%s' "$1" "$3" >>"$log_file"; [[ "$3" == 'cat /tmp/rs-tun-srv.pid' ]] && printf 'not-a-pid\n'; return 0; }
   if profile_rs_tun; then return 1; fi
-  [[ "$log" == *'perf record -F 199 -g -p'* && "$log" == *'iperf3 -c 100.64.0.1 -p 5201 -t 10 -P 10 -R'* ]] || return 1
-  [[ "${log#*perf record}" == *'iperf:'* ]] || return 1
-  [[ "$log" == *'rm -f /tmp/rs-tun-perf.pid'* ]] || return 1
+  log=$(<"$log_file")
+  [[ "$log" == *'cat /tmp/rs-tun-srv.pid'* && "$log" == *'cat /tmp/rs-tun-cli.pid'* && "$log" != *'perf record'* && "$log" != *'iperf3 -c'* ]] || return 1
+
+  # A failure starting either endpoint profiler skips the workload but still
+  # cleans both endpoint filename sets.
+  : >"$log_file"
+  ssh_sudo() {
+    printf ' sudo:%s:%s' "$1" "$3" >>"$log_file"
+    case "$3" in
+      'cat /tmp/rs-tun-srv.pid') printf '42\n' ;;
+      'cat /tmp/rs-tun-cli.pid') printf '84\n' ;;
+    esac
+    [[ "$1" == "$CVM" && "$3" == *'perf record'* ]] && return 1
+    return 0
+  }
+  if profile_rs_tun; then return 1; fi
+  log=$(<"$log_file")
+  [[ "$log" == *"perf record -F 199 -g -p 42"* && "$log" == *"perf record -F 199 -g -p 84"* && "$log" != *'iperf3 -c'* && "$log" == *"rm -f /tmp/rs-tun-perf-server.pid"* && "$log" == *"rm -f /tmp/rs-tun-perf-client.pid"* ]] || return 1
+
+  # Empty or missing endpoint artifacts fail the profile instead of producing
+  # partial evidence; cleanup still reaches both endpoint VMs.
+  local empty_endpoint
+  for empty_endpoint in server client; do
+    : >"$log_file"
+    ssh_sudo() {
+      printf ' sudo:%s:%s' "$1" "$3" >>"$log_file"
+      case "$3" in
+        'cat /tmp/rs-tun-srv.pid') printf '42\n' ;;
+        'cat /tmp/rs-tun-cli.pid') printf '84\n' ;;
+      esac
+      return 0
+    }
+    scp_from() { printf ' copy:%s:%s:%s' "$1" "$3" "$4" >>"$log_file"; [[ "$3" == *"$empty_endpoint-self.txt" ]] && : >"$4" || printf x >"$4"; }
+    if profile_rs_tun; then return 1; fi
+    log=$(<"$log_file")
+    [[ "$log" == *"copy:"*"/tmp/rs-tun-perf-$empty_endpoint-self.txt"* && "$log" == *"rm -f /tmp/rs-tun-perf-server.pid"* && "$log" == *"rm -f /tmp/rs-tun-perf-client.pid"* ]] || return 1
+  done
+
+  # A workload failure also cleans both endpoints.
+  : >"$log_file"
+  run_tun_command() { printf ' iperf:%s:%s' "$2" "$4" >>"$log_file"; return 1; }
+  scp_from() { return 1; }
+  if profile_rs_tun; then return 1; fi
+  log=$(<"$log_file")
+  [[ "$log" == *'iperf3 -c 100.64.0.1 -p 5201 -t 10 -P 10 -R'* && "$log" == *"rm -f /tmp/rs-tun-perf-server.pid"* && "$log" == *"rm -f /tmp/rs-tun-perf-client.pid"* ]] || return 1
+  rm -f "$log_file"
   unset -f ssh_sudo run_tun_command scp_from
 }
 
@@ -808,6 +980,7 @@ run_rs_tun() {
   echo "[gcp] rs-tun: starting production rustscaled daemons" >&2
   if (( PROFILE )) && ! profile_prepare; then
     emit_stub "rs-tun-perf-prepare-failed"
+    profile_remote_cleanup || true
     cleanup_rs_tun || return "$FATAL_HANDOFF_STATUS"
     return 1
   fi
@@ -853,7 +1026,7 @@ run_rs_tun() {
     /tmp/rs-tun-srv.footprint /opt/rustscale/target/release/rustscaled
 
   if (( PROFILE )) && ! profile_rs_tun; then
-    emit_stub "rs-tun-profile-failed" "$(capture_log_tail "$SVM" "$SZONE" /tmp/rs-tun-perf.log)"
+    emit_stub "rs-tun-profile-failed" "$(capture_log_tail "$SVM" "$SZONE" /tmp/rs-tun-perf-server.log)"
     cleanup_rs_tun || return "$FATAL_HANDOFF_STATUS"
     return 1
   fi
@@ -1150,6 +1323,7 @@ run_ts_tun() {
 # ---------------------------------------------------------------------------
 if (( SELF_TEST )); then
   profile_command_self_test
+  rm -rf "$RDIR"
   echo "run-config self-tests: OK" >&2
   exit 0
 fi

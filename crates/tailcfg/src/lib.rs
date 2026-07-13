@@ -9,6 +9,7 @@
 #![allow(non_snake_case)]
 
 mod appctype;
+mod auditlog;
 mod caps;
 mod derpmap;
 mod dns;
@@ -23,6 +24,9 @@ pub use appctype::{
     AppConnectorAttr, AppConnectorConfig, ConfigID, Conn25Attr, Conn25PoolsAttr, DNATConfig,
     IPRange, ProtoPortRange, RouteInfo, RouteUpdate, SNIProxyConfig,
     APP_CONNECTORS_EXPERIMENTAL_ATTR_NAME, DNS_ADDR_SCHEME,
+};
+pub use auditlog::{
+    AuditLogRequest, AuditNodeDisconnect, ClientAuditAction, AUDIT_NODE_DISCONNECT,
 };
 pub use caps::{
     cap_ver_is_relay_capable, has_capability, relay_client_disabled, relay_server_disabled,

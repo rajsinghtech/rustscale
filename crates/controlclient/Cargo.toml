@@ -30,6 +30,7 @@ http = "1"
 bytes.workspace = true
 rustscale-netns.workspace = true
 rustscale-dnscache.workspace = true
+rustscale-auditlog = { path = "../auditlog", version = "0.1.0" }
 rustscale-dnsfallback.workspace = true
 rustscale-tshttpproxy = { path = "../tshttpproxy", version = "0.1.0" }
 rustscale-bakedroots = { path = "../bakedroots", version = "0.1.0" }

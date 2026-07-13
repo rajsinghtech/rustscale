@@ -69,7 +69,7 @@ real JSON).
 | Embedded TLS roots fallback | `net/bakedroots/` | ✅ `crates/bakedroots`: ISRG Root X1+X2 PEMs, `get()` lazy `RootCertStore`, `combined_root_store()` 3-tier (webpki+extra+baked); integrated into derp, controlhttp, acme, dns forwarder; `ServerBuilder::extra_root_certs` plumbing through `ControlClient` |
 | OS-level route management | `wgengine/router/` | 🔶 `crates/routetable` reads routes via PF_ROUTE sysctl; `tun_pump.rs` installs routes via shell (route/ip); no clean router abstraction |
 | LocalAPI authorization | `ipn/ipnauth/` | ✅ `safesocket::peercred::ConnIdentity` (SO_PEERCRED/LOCAL_PEERCRED/getpeereid), `is_readwrite()` uid check, enforced at all mutating LocalAPI endpoints (403 on mismatch) |
-| IPN audit logging | `ipn/auditlog/` | ⬜ |
+| IPN audit logging | `ipn/auditlog/` | ✅ `crates/auditlog`: profile-scoped persistent queue, EventID deduplication, retry/backoff and final flush; Noise `/machine/audit-log` transport plus LocalAPI disconnect/logout wiring |
 | Service policy | `ipn/policy/` | ⬜ only `SSHPolicy` wire type exists; no policy engine |
 | Config file format | `ipn/conffile/` | ✅ `crates/conffile` — `ConfigVAlpha` schema with `Load`/`ToPrefs`/`WantRunning`, `deny_unknown_fields`, version `"alpha0"` validation; `--config <path>` flag on rustscaled, `POST /localapi/v0/reload-config` endpoint, SIGHUP reload handler |
 | IPN extension system | `ipn/ipnext/` | ⬜ |

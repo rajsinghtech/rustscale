@@ -158,6 +158,8 @@ pub(crate) struct LocalApiState {
     /// `MapResponse.ClientVersion`; read by `build_status_json` to populate
     /// `Status.ClientVersion`.
     pub client_updater: Arc<std::sync::Mutex<rustscale_clientupdate::ClientUpdater>>,
+    /// Persistent audit logger for intentional disconnect events.
+    pub audit_logger: Option<Arc<rustscale_auditlog::Logger>>,
 }
 
 pub struct LocalApiHandle {
@@ -607,6 +609,7 @@ async fn handle_patch_prefs<W: AsyncWrite + Unpin>(
     };
 
     let exit_node_changed = masked.ExitNodeIDSet || masked.ExitNodeIPSet;
+    let disconnect_requested = masked.WantRunningSet && !masked.Prefs.WantRunning;
 
     let updated = {
         let mut prefs = state.prefs.write().await;
@@ -635,6 +638,17 @@ async fn handle_patch_prefs<W: AsyncWrite + Unpin>(
     if exit_node_changed {
         let prefs = state.prefs.read().await;
         apply_exit_node_prefs(&prefs, state).await;
+    }
+
+    if disconnect_requested {
+        if let Some(logger) = &state.audit_logger {
+            if let Err(error) = logger.enqueue(
+                rustscale_tailcfg::AuditNodeDisconnect,
+                "disconnect requested via LocalAPI",
+            ) {
+                eprintln!("tsnet: failed to persist audit log (non-fatal): {error}");
+            }
+        }
     }
 
     state.ipn_backend.bus().send(rustscale_ipn::Notify {
@@ -3057,6 +3071,7 @@ mod tests {
             client_updater: Arc::new(std::sync::Mutex::new(
                 rustscale_clientupdate::ClientUpdater::new("0.1.0"),
             )),
+            audit_logger: None,
         })
     }
 
@@ -3817,6 +3832,7 @@ mod tests {
             client_updater: Arc::new(std::sync::Mutex::new(
                 rustscale_clientupdate::ClientUpdater::new("0.1.0"),
             )),
+            audit_logger: None,
         });
 
         let config = r#"{"TCP":{"8080":{"HTTP":true}}}"#;
@@ -4050,6 +4066,7 @@ mod tests {
             client_updater: Arc::new(std::sync::Mutex::new(
                 rustscale_clientupdate::ClientUpdater::new("0.1.0"),
             )),
+            audit_logger: None,
         })
     }
 

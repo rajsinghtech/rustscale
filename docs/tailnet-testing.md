@@ -32,11 +32,11 @@ CHILD_TOKEN=$(curl -fsS -X POST "$TS_API_BASE_URL/api/v2/oauth/token" \
   -d client_id="$CHILD_CID" -d client_secret="$CHILD_CSEC" | jq -r .access_token)
 
 # e.g. mint a device auth key for the rust client under test.
-# API-only tailnets have no human owner, so keys MUST be tagged and the tag
-# must exist in the ACL first ('tailnet-owned auth key must have tags set'):
+# API-only tailnets have no human owner, so keys MUST be tagged; make
+# autogroup:admin own tag:e2e and allow all-to-all grants:
 curl -fsS -X POST "$TS_API_BASE_URL/api/v2/tailnet/$DNS/acl" \
   -H "Authorization: Bearer $CHILD_TOKEN" -H 'Content-Type: application/json' \
-  -d '{"tagOwners":{"tag:e2e":[]},"acls":[{"action":"accept","src":["*"],"dst":["*:*"]}]}'
+  -d '{"tagOwners":{"tag:e2e":["autogroup:admin"]},"grants":[{"src":["*"],"dst":["*"],"ip":["*"]}]}'
 AUTHKEY=$(curl -fsS -X POST "$TS_API_BASE_URL/api/v2/tailnet/$DNS/keys" \
   -H "Authorization: Bearer $CHILD_TOKEN" -H 'Content-Type: application/json' \
   -d '{"capabilities":{"devices":{"create":{"reusable":true,"ephemeral":true,"preauthorized":true,"tags":["tag:e2e"]}}},"expirySeconds":3600}' \

@@ -227,7 +227,8 @@ cleanup_rs_tun() {
   # It is deliberately idempotent: an already-absent optional iperf3 server
   # must not make ssh_sudo retry before the next non-root config starts.
   if ! ssh_sudo "$SVM" "$SZONE" "$(rs_tun_iperf_cleanup_command)"; then
-    echo "[gcp] WARNING: could not stop rs-tun iperf3 server on $SVM" >&2
+    echo "[gcp] ERROR: rs-tun iperf3 cleanup failed on server $SVM" >&2
+    status=1
   fi
 
   # Run both endpoints even if one remains dirty.  ssh_cmd retries a nonzero
@@ -252,6 +253,11 @@ rs_tun_iperf_cleanup_command() {
 'kill "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null || true' \
 'pkill -x iperf3 2>/dev/null || true' \
 'rm -f "$pidfile" /tmp/iperf3-srv.log'
+}
+
+# Clear root-owned iperf3 leftovers before rs-tun measures as the SSH user.
+rs_tun_measurement_preflight() {
+  ssh_sudo "$SVM" "$SZONE" "$(rs_tun_iperf_cleanup_command)"
 }
 
 # Print the root-side cleanup program for one rs-tun endpoint.  It intentionally
@@ -363,7 +369,7 @@ PYEOF
 }
 
 cleanup_self_test() {
-  local state result events command iperf_events
+  local state result events command iperf_events preflight_call cleanup_failure
   local -a cases=(absent graceful forced failure)
 
   # These mocks exercise the remote cleanup program's transitions without a
@@ -429,6 +435,32 @@ cleanup_self_test() {
     return 1
   fi
   [[ "$iperf_events" == ' kill pkill rm:-f /tmp/iperf3-srv.pid /tmp/iperf3-srv.log' ]] || return 1
+
+  # The measurement preflight must use the server and root execution path,
+  # while reusing the exact narrowly scoped iperf3 cleanup program.
+  preflight_call=$(
+    ssh_sudo() { printf '%s|%s|%s\n' "$1" "$2" "$3"; }
+    rs_tun_measurement_preflight
+  ) || return 1
+  [[ "$preflight_call" == "$SVM|$SZONE|$(rs_tun_iperf_cleanup_command)" ]] || return 1
+
+  # An iperf3 cleanup failure makes the handoff unsafe, but must not skip
+  # either daemon endpoint cleanup.
+  cleanup_failure=$(
+    CLEANUP_TEST_SSH_CALLS=""
+    ssh_sudo() {
+      CLEANUP_TEST_SSH_CALLS+=" $1:$2"
+      [[ "$3" == "$(rs_tun_iperf_cleanup_command)" ]] && return 1
+      return 0
+    }
+    if cleanup_rs_tun; then
+      result=0
+    else
+      result=$?
+    fi
+    printf '%s|%s\n' "$result" "$CLEANUP_TEST_SSH_CALLS"
+  ) || return 1
+  [[ "$cleanup_failure" == "1| $SVM:$SZONE $SVM:$SZONE $CVM:$CZONE" ]] || return 1
 
   unset -f pgrep ip pkill sleep ps fuser test_remote_cleanup
 }
@@ -733,6 +765,13 @@ run_rs_tun() {
     if ! cleanup_rs_tun; then return "$FATAL_HANDOFF_STATUS"; fi
     return 1
   }
+
+  if ! rs_tun_measurement_preflight; then
+    echo "[gcp] ERROR: could not clear rs-tun iperf3 leftovers on $SVM" >&2
+    emit_stub "rs-tun-iperf-preflight-failed" "$(capture_log_tail "$SVM" "$SZONE" /tmp/iperf3-srv.log)"
+    if ! cleanup_rs_tun; then return "$FATAL_HANDOFF_STATUS"; fi
+    return 1
+  fi
 
   tun_measure rs-tun 0 "$server_ip" /tmp/rs-tun-srv.pid \
     /tmp/rs-tun-srv.footprint /opt/rustscale/target/release/rustscaled

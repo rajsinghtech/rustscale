@@ -141,12 +141,12 @@ fn prepend_clears_out_before_writing() {
 async fn mock_round_trip_framing() {
     let (tun, tx) = MockTun::new("mock0", 1280);
 
-    // Inject a plain IP packet; read_packet should return it verbatim.
+    // Inject a plain IP packet; read_batch should return it verbatim.
     let pkt = v4_packet([100, 64, 0, 5], b"hello");
     tx.send(pkt.clone()).await.unwrap();
-    let mut got = Vec::new();
-    tun.read_packet(&mut got).await.unwrap();
-    assert_eq!(got, pkt);
+    let mut got = TunPacketBatch::new();
+    tun.read_batch(&mut got).await.unwrap();
+    assert_eq!(got.packets(), std::slice::from_ref(&pkt));
 
     // Write a packet out; it should be captured verbatim (no AF header on the
     // public API surface).
@@ -166,11 +166,11 @@ async fn mock_name_and_mtu() {
 async fn mock_read_after_close_returns_eof() {
     let (tun, tx) = MockTun::new("mock0", 1280);
     drop(tx);
-    let mut packet = vec![1, 2, 3];
-    let res = tun.read_packet(&mut packet).await;
+    let mut packet = TunPacketBatch::new();
+    let res = tun.read_batch(&mut packet).await;
     assert!(res.is_err());
     assert_eq!(res.unwrap_err().kind(), std::io::ErrorKind::UnexpectedEof);
-    assert!(packet.is_empty());
+    assert!(packet.packets().is_empty());
 }
 
 #[tokio::test]
@@ -181,14 +181,13 @@ async fn mock_successive_reads_reuse_caller_capacity() {
     tx.send(first.clone()).await.unwrap();
     tx.send(second.clone()).await.unwrap();
 
-    let mut packet = Vec::with_capacity(1280);
-    let capacity = packet.capacity();
-    tun.read_packet(&mut packet).await.unwrap();
-    assert_eq!(packet, first);
-    assert_eq!(packet.capacity(), capacity);
-    tun.read_packet(&mut packet).await.unwrap();
-    assert_eq!(packet, second);
-    assert_eq!(packet.capacity(), capacity);
+    let mut packet = TunPacketBatch::new();
+    tun.read_batch(&mut packet).await.unwrap();
+    assert_eq!(packet.packets(), &[first]);
+    let capacity = packet.packets()[0].capacity();
+    tun.read_batch(&mut packet).await.unwrap();
+    assert_eq!(packet.packets(), &[second]);
+    assert_eq!(packet.packets()[0].capacity(), capacity);
 }
 
 // --- real utun creation (needs root) ---

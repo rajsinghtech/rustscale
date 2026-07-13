@@ -5,7 +5,8 @@
 //! - **macOS**: `utun` via `socket(PF_SYSTEM, SOCK_DGRAM, SYSPROTO_CONTROL)` +
 //!   `CTLIOCGINFO` for `com.apple.net.utun_control`, with the 4-byte address-family
 //!   header stripped/prepended on read/write (matching Go's `wireguard-go/tun`).
-//! - **Linux**: `/dev/net/tun` with `TUNSETIFF` (`IFF_TUN | IFF_NO_PI`).
+//! - **Linux**: `/dev/net/tun` with `TUNSETIFF` (`IFF_TUN | IFF_NO_PI`), using
+//!   VNET headers and receive-side GSO splitting when supported by the kernel.
 //!
 //! The public API deals in **plain IP packets** — the macOS AF header and the
 //! Linux packet-info byte are never exposed to callers. See [`strip_af_header`]
@@ -34,12 +35,77 @@ mod darwin;
 #[path = "linux.rs"]
 mod linux;
 mod mock;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod offload;
 
 #[cfg(target_os = "macos")]
 pub use darwin::TunDevice;
 #[cfg(target_os = "linux")]
 pub use linux::TunDevice;
 pub use mock::MockTun;
+
+/// Reusable storage for packets returned by [`Tun::read_batch`].
+///
+/// A successful read may contain up to [`Self::MAX_PACKETS`] packets. Calling
+/// [`Self::clear`] drops the logical packet count while retaining all backing
+/// allocations for the next read.
+pub struct TunPacketBatch {
+    packets: Vec<Vec<u8>>,
+    len: usize,
+}
+
+impl TunPacketBatch {
+    /// Maximum number of packets one TUN read may return.
+    pub const MAX_PACKETS: usize = 128;
+
+    /// Construct an empty batch with no packet allocations.
+    pub fn new() -> Self {
+        Self {
+            packets: Vec::new(),
+            len: 0,
+        }
+    }
+    /// Remove all logically present packets while retaining their allocations.
+    pub fn clear(&mut self) {
+        self.len = 0;
+    }
+    /// Packets produced by the most recent successful read, in read order.
+    pub fn packets(&self) -> &[Vec<u8>] {
+        &self.packets[..self.len]
+    }
+    /// Append one packet, primarily for in-memory [`Tun`] implementations.
+    ///
+    /// Returns `InvalidData` when the batch has reached [`Self::MAX_PACKETS`].
+    pub fn push_packet(&mut self, packet: &[u8]) -> io::Result<()> {
+        let index = self.len;
+        let out = self.packet_mut(index)?;
+        out.clear();
+        out.extend_from_slice(packet);
+        self.len += 1;
+        Ok(())
+    }
+    pub(crate) fn packet_mut(&mut self, index: usize) -> io::Result<&mut Vec<u8>> {
+        if index >= Self::MAX_PACKETS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "too many TUN packets",
+            ));
+        }
+        while self.packets.len() <= index {
+            self.packets.push(Vec::new());
+        }
+        Ok(&mut self.packets[index])
+    }
+    pub(crate) fn set_len(&mut self, len: usize) {
+        self.len = len;
+    }
+}
+
+impl Default for TunPacketBatch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Errors from TUN device operations.
 #[derive(Debug, thiserror::Error)]
@@ -48,6 +114,12 @@ pub enum TunError {
     Io(#[from] io::Error),
     #[error("invalid tun name: {0}")]
     InvalidName(String),
+    #[error("tun device creation failed during {operation}: {source}")]
+    CreateIo {
+        operation: &'static str,
+        #[source]
+        source: io::Error,
+    },
     #[error("tun device creation failed: {0}")]
     Create(String),
 }
@@ -59,12 +131,12 @@ pub enum TunError {
 /// implementation; [`MockTun`] is an in-memory implementation for tests.
 #[async_trait]
 pub trait Tun: Send + Sync {
-    /// Read one raw IP packet into `packet`, replacing its previous contents.
+    /// Read one or more raw IP packets into reusable batch storage.
     ///
     /// Implementations retain the allocation where possible. On success,
-    /// `packet` contains exactly one IPv4 or IPv6 packet; platform framing is
-    /// never exposed.
-    async fn read_packet(&self, packet: &mut Vec<u8>) -> io::Result<()>;
+    /// [`TunPacketBatch::packets`] contains one or more IPv4 or IPv6 packets;
+    /// platform framing is never exposed.
+    async fn read_batch(&self, batch: &mut TunPacketBatch) -> io::Result<()>;
 
     /// Write one IP packet to the device.
     async fn write_packet(&self, packet: &[u8]) -> io::Result<()>;

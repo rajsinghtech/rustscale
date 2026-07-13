@@ -13,11 +13,17 @@ use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use async_trait::async_trait;
 use tokio::io::unix::AsyncFd;
+use tokio::sync::Mutex;
 
-use crate::{prepare_read_buffer, Tun, TunConfig, TunError};
+use crate::{offload, prepare_read_buffer, Tun, TunConfig, TunError, TunPacketBatch};
 
 /// Linux interface-name field size (`IFNAMSIZ`).
 const IFNAMSIZ: usize = 16;
+const IFF_VNET_HDR: libc::c_short = 0x4000;
+const TUN_F_CSUM: libc::c_int = 0x01;
+const TUN_F_TSO4: libc::c_int = 0x02;
+const TUN_F_TSO6: libc::c_int = 0x04;
+const VNET_READ_LEN: usize = offload::VIRTIO_NET_HDR_LEN + 65_535;
 
 /// The `ifreq` union. `ifmap` is the largest Linux member on 64-bit targets;
 /// three `c_ulong`s provide its size and alignment without relying on a
@@ -45,6 +51,8 @@ pub struct TunDevice {
     afd: AsyncFd<OwnedFd>,
     name: String,
     mtu: usize,
+    vnet_hdr: bool,
+    raw_frame: Mutex<Vec<u8>>,
 }
 
 impl TunDevice {
@@ -54,19 +62,14 @@ impl TunDevice {
         let mtu = read_buffer_len(config.mtu)
             .map_err(|e| TunError::Create(format!("invalid MTU {}: {e}", config.mtu)))?;
 
-        let path = std::ffi::CString::new("/dev/net/tun").expect("static path");
-        // SAFETY: opening a well-known device path; no memory-safety preconditions.
-        let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
-        if fd < 0 {
-            return Err(TunError::Create(format!(
-                "open /dev/net/tun: {}",
-                io::Error::last_os_error()
-            )));
-        }
-
-        // SAFETY: `fd` is a freshly opened, owned descriptor.
-        let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-        let name = set_tun_iff(owned.as_raw_fd(), &config.name)?;
+        let (owned, name, vnet_hdr) = match open_configured_tun(&config.name, true) {
+            Ok((fd, name)) => (fd, name, true),
+            Err(e) if is_unsupported(&e) => {
+                let (fd, name) = open_configured_tun(&config.name, false)?;
+                (fd, name, false)
+            }
+            Err(e) => return Err(e),
+        };
         // A TUN device defaults to MTU 1500. Set the kernel interface MTU before
         // using `config.mtu` as the read buffer bound, so reads cannot truncate
         // packets admitted by the interface.
@@ -75,14 +78,42 @@ impl TunDevice {
         let afd = AsyncFd::new(owned)
             .map_err(|e| TunError::Create(format!("AsyncFd registration: {e}")))?;
 
-        Ok(Self { afd, name, mtu })
+        Ok(Self {
+            afd,
+            name,
+            mtu,
+            vnet_hdr,
+            raw_frame: Mutex::new(Vec::new()),
+        })
     }
+}
+
+fn open_configured_tun(requested: &str, vnet_hdr: bool) -> Result<(OwnedFd, String), TunError> {
+    let path = std::ffi::CString::new("/dev/net/tun").expect("static path");
+    // SAFETY: opening a well-known device path; no memory-safety preconditions.
+    let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(create_io("open /dev/net/tun", io::Error::last_os_error()));
+    }
+
+    // SAFETY: `fd` is a freshly opened, owned descriptor.
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    let name = set_tun_iff(owned.as_raw_fd(), requested, vnet_hdr)?;
+    if vnet_hdr {
+        set_tun_offload(owned.as_raw_fd())?;
+    }
+    Ok((owned, name))
 }
 
 #[async_trait]
 impl Tun for TunDevice {
-    async fn read_packet(&self, packet: &mut Vec<u8>) -> io::Result<()> {
+    async fn read_batch(&self, batch: &mut TunPacketBatch) -> io::Result<()> {
+        if self.vnet_hdr {
+            return self.read_vnet_batch(batch).await;
+        }
+        batch.clear();
         let read_len = read_buffer_len(self.mtu)?;
+        let packet = batch.packet_mut(0)?;
         // Keep the vector valid if this future is cancelled while waiting, or
         // if readiness proves stale and we retry below.
         prepare_read_buffer(packet, read_len);
@@ -114,6 +145,7 @@ impl Tun for TunDevice {
                     // SAFETY: the successful read above initialized exactly
                     // `n` bytes in `packet`'s spare capacity.
                     unsafe { packet.set_len(n) };
+                    batch.set_len(1);
                     return Ok(());
                 }
                 Ok(Err(e)) => return Err(e),
@@ -149,6 +181,46 @@ impl Tun for TunDevice {
 
     fn mtu(&self) -> usize {
         self.mtu
+    }
+}
+
+impl TunDevice {
+    async fn read_vnet_batch(&self, batch: &mut TunPacketBatch) -> io::Result<()> {
+        batch.clear();
+        let mut raw = self.raw_frame.lock().await;
+        prepare_read_buffer(&mut raw, VNET_READ_LEN);
+        loop {
+            let mut guard = self.afd.readable().await?;
+            match guard.try_io(|afd| {
+                let spare = &mut raw.spare_capacity_mut()[..VNET_READ_LEN];
+                // SAFETY: the spare capacity is the exact destination of this read.
+                let n = unsafe {
+                    libc::read(
+                        afd.get_ref().as_raw_fd(),
+                        spare.as_mut_ptr().cast(),
+                        spare.len(),
+                    )
+                };
+                if n < 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(n as usize)
+                }
+            }) {
+                Ok(Ok(0)) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "tun device closed",
+                    ))
+                }
+                Ok(Ok(n)) => {
+                    unsafe { raw.set_len(n) };
+                    return offload::split_virtio(&raw, batch);
+                }
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {}
+            }
+        }
     }
 }
 
@@ -230,16 +302,13 @@ fn validate_packet_write(result: io::Result<usize>, packet_len: usize) -> io::Re
 
 /// Issue `TUNSETIFF` on `fd` with `IFF_TUN | IFF_NO_PI` and return the
 /// kernel-assigned interface name.
-fn set_tun_iff(fd: RawFd, requested: &str) -> Result<String, TunError> {
-    let mut ifr = tun_iff_request(requested)?;
+fn set_tun_iff(fd: RawFd, requested: &str, vnet_hdr: bool) -> Result<String, TunError> {
+    let mut ifr = tun_iff_request(requested, vnet_hdr)?;
 
     // SAFETY: TUNSETIFF on an ifreq pointer is the documented use.
     let rc = unsafe { libc::ioctl(fd, libc::TUNSETIFF, std::ptr::addr_of_mut!(ifr)) };
     if rc < 0 {
-        return Err(TunError::Create(format!(
-            "TUNSETIFF: {}",
-            io::Error::last_os_error()
-        )));
+        return Err(create_io("TUNSETIFF", io::Error::last_os_error()));
     }
 
     // Read back the (possibly kernel-assigned) name.
@@ -257,27 +326,51 @@ fn set_tun_iff(fd: RawFd, requested: &str) -> Result<String, TunError> {
     // SAFETY: fcntl on a valid fd.
     unsafe {
         if libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) < 0 {
-            return Err(TunError::Create(format!(
-                "fcntl O_NONBLOCK: {}",
-                io::Error::last_os_error()
-            )));
+            return Err(create_io("fcntl O_NONBLOCK", io::Error::last_os_error()));
         }
     }
 
     Ok(name)
 }
 
-fn tun_iff_request(requested: &str) -> Result<Ifreq, TunError> {
+fn tun_iff_request(requested: &str, vnet_hdr: bool) -> Result<Ifreq, TunError> {
     let mut ifr = Ifreq {
         name: [0; IFNAMSIZ],
         data: IfreqData {
-            flags: (libc::IFF_TUN | libc::IFF_NO_PI) as libc::c_short,
+            flags: ((libc::IFF_TUN | libc::IFF_NO_PI) as libc::c_short)
+                | if vnet_hdr { IFF_VNET_HDR } else { 0 },
         },
     };
     if copy_ifname(&mut ifr.name, requested).is_err() {
         return Err(TunError::InvalidName(requested.into()));
     }
     Ok(ifr)
+}
+
+fn set_tun_offload(fd: RawFd) -> Result<(), TunError> {
+    let flags = TUN_F_CSUM | TUN_F_TSO4 | TUN_F_TSO6;
+    // SAFETY: TUNSETOFFLOAD expects an integer flag value, not a pointer.
+    if unsafe { libc::ioctl(fd, libc::TUNSETOFFLOAD, flags) } < 0 {
+        return Err(create_io("TUNSETOFFLOAD", io::Error::last_os_error()));
+    }
+    Ok(())
+}
+fn create_io(operation: &'static str, source: io::Error) -> TunError {
+    TunError::CreateIo { operation, source }
+}
+
+/// Only capability negotiation ioctls may trigger a clean-descriptor fallback.
+fn is_unsupported(error: &TunError) -> bool {
+    let TunError::CreateIo { operation, source } = error else {
+        return false;
+    };
+    if !matches!(*operation, "TUNSETIFF" | "TUNSETOFFLOAD") {
+        return false;
+    }
+    matches!(
+        source.raw_os_error(),
+        Some(libc::EINVAL | libc::EOPNOTSUPP | libc::ENOTTY)
+    )
 }
 
 #[cfg(test)]
@@ -339,7 +432,7 @@ mod tests {
 
     #[test]
     fn tun_iff_request_encodes_name_and_flags() {
-        let request = tun_iff_request("tun0").unwrap();
+        let request = tun_iff_request("tun0", false).unwrap();
         assert_eq!(
             &request.name[..5],
             &[
@@ -355,6 +448,49 @@ mod tests {
             unsafe { request.data.flags },
             (libc::IFF_TUN | libc::IFF_NO_PI) as libc::c_short
         );
+    }
+
+    #[test]
+    fn vnet_request_and_offload_constants_match_linux_uapi() {
+        let request = tun_iff_request("tun0", true).unwrap();
+        // SAFETY: this request initialized the flags union member.
+        assert_eq!(
+            unsafe { request.data.flags },
+            (libc::IFF_TUN | libc::IFF_NO_PI) as libc::c_short | 0x4000
+        );
+        assert_eq!(TUN_F_CSUM | TUN_F_TSO4 | TUN_F_TSO6, 0x07);
+        assert_eq!(libc::TUNSETOFFLOAD as u64, 0x4004_54d0);
+        assert_eq!(VNET_READ_LEN, offload::VIRTIO_NET_HDR_LEN + 65_535);
+    }
+
+    #[test]
+    fn fallback_is_limited_to_vnet_ioctl_capability_errnos() {
+        for errno in [libc::EINVAL, libc::EOPNOTSUPP, libc::ENOTTY] {
+            assert!(is_unsupported(&create_io(
+                "TUNSETIFF",
+                io::Error::from_raw_os_error(errno)
+            )));
+            assert!(is_unsupported(&create_io(
+                "TUNSETOFFLOAD",
+                io::Error::from_raw_os_error(errno)
+            )));
+        }
+        for operation in ["open /dev/net/tun", "fcntl O_NONBLOCK", "set MTU"] {
+            assert!(!is_unsupported(&create_io(
+                operation,
+                io::Error::from_raw_os_error(libc::EINVAL)
+            )));
+        }
+        for errno in [libc::EPERM, libc::ENOENT, libc::EIO] {
+            assert!(!is_unsupported(&create_io(
+                "TUNSETIFF",
+                io::Error::from_raw_os_error(errno)
+            )));
+        }
+        assert!(!is_unsupported(&TunError::InvalidName("bad".into())));
+        assert!(!is_unsupported(&TunError::Create(
+            "arbitrary EINVAL text".into()
+        )));
     }
 
     #[test]

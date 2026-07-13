@@ -15,7 +15,7 @@ first pass should reduce per-packet work before adding concurrency.
 
 ## Problem
 
-On Linux, `TunDevice::read_packet` allocates and zeroes 65,535 bytes for every
+On Linux, the former `TunDevice::read_packet` allocated and zeroed 65,535 bytes for every
 packet even though the configured TUN MTU is 1,280 bytes. `write_packet` also
 copies every packet into a new `Vec` solely to support a partial-write loop.
 Linux TUN packet writes are datagram-like; a short positive write must be treated

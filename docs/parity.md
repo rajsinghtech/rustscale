@@ -75,7 +75,7 @@ real JSON).
 | IPN extension system | `ipn/ipnext/` | ⬜ |
 | Cloud log shipping | `logtail/` | ✅ `crates/logtail` — async upload loop (background tokio task), HTTP POST to `{base_url}/c/{collection}/{private_id}`, zstd compression (>256B, >64B savings), Retry-After/30–60s backoff, RFC3339Nano `client_time`, buffer cap + drop_count, upload metrics |
 | Port enumeration | `portlist/` | ✅ `crates/portlist`: `Poller` (same-count shortcut, 1s Linux / 5s macOS), Linux `/proc/net/{tcp,tcp6,udp,udp6}` hex parser + `/proc/*/fd` PID resolution, macOS `netstat -na` + `lsof -F` parser with sandbox-failure cache, `to_services()` with is_interesting_service policy; wired into tsnet via HostinfoHook + background poller task |
-| Network flow logging | `wgengine/netlog/` | ⬜ |
+| Network flow logging | `wgengine/netlog/` | 🔶 `crates/netlogtype` (wire types: Message, Node, Connection, Counts, ConnectionCounts with Go-compatible AddrPort JSON), `crates/netlog` (Logger with 5s aggregation + logtail upload, Record aggregation, traffic classification Virtual/Subnet/Exit/Unknown, exit anonymization, ReconfigRoutes); filter `ConnectionCounter` on outbound; Phase 1 virtual traffic only — physical traffic from magicsock deferred |
 | Network error classification | `net/neterror/` | ✅ `rustscale-neterror` crate with `treat_as_lost_udp`, `packet_was_truncated`, `should_disable_udp_gso`, `is_closed_pipe_error`; wired into magicsock (send/disco paths), portmapper (PMP/PCP mapping sends), dns forwarder (UDP recv) |
 | Network traffic steering | `net/traffic/` | 🔶 split DNS OS config exists (macOS); no general traffic-steering abstraction |
 | Subnet route health check | `net/routecheck/` | ⬜ |

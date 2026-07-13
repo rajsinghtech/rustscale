@@ -21,9 +21,21 @@ pub use state::{reversed_tuple, FlowState, FlowTuple};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
+use std::sync::Arc;
 
 use r#match::Matches as MatchList;
 use rustscale_tailcfg::{FilterRule, PeerCapMap};
+
+/// Callback for counting packets on a connection.
+///
+/// Signature: `fn(proto, src, dst, packets, bytes, recv)`.
+/// `recv=true` = received (Rx), `false` = transmitted (Tx).
+///
+/// This is structurally identical to `rustscale_netlog::ConnectionCounter`
+/// — the same `Arc<dyn Fn(...)>` type — so a counter created by the
+/// netlog logger can be installed directly without conversion.
+pub type ConnectionCounter =
+    Arc<dyn Fn(u8, (IpAddr, u16), (IpAddr, u16), u64, u64, bool) + Send + Sync>;
 
 /// Filter verdict.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,6 +81,12 @@ pub struct Filter {
     /// `CapGrant`-only rules (which have no `DstPorts`).
     cap4: MatchList,
     cap6: MatchList,
+    /// Optional connection counter for network flow logging. When set,
+    /// the filter calls it for each outbound packet that is parsed,
+    /// providing the 5-tuple, packet count (1), and byte count (packet
+    /// length). Mirrors Go's `netlogfunc.ConnectionCounter` registration
+    /// in the tun device.
+    connection_counter: Option<ConnectionCounter>,
 }
 
 impl Filter {
@@ -101,6 +119,7 @@ impl Filter {
             cap_holders: cap_holders.clone(),
             cap4,
             cap6,
+            connection_counter: None,
         })
     }
 
@@ -130,6 +149,7 @@ impl Filter {
             cap_holders: BTreeMap::new(),
             cap4: MatchList::default(),
             cap6: MatchList::default(),
+            connection_counter: None,
         });
         // Override local4/local6 with wildcard prefixes (host_prefix would
         // give /32 and /128, but we need /0).
@@ -157,6 +177,7 @@ impl Filter {
             cap_holders: BTreeMap::new(),
             cap4: MatchList::default(),
             cap6: MatchList::default(),
+            connection_counter: None,
         }
     }
 
@@ -260,10 +281,22 @@ impl Filter {
     }
 
     /// Record outbound flow state from a raw IP packet (for UDP/SCTP return
-    /// traffic).
+    /// traffic). Also invokes the connection counter (if installed) with
+    /// the parsed 5-tuple and packet size — this is the netlog integration
+    /// point for virtual (tun) traffic.
     pub fn update_outbound(&mut self, buf: &[u8]) {
         if let Some(info) = packet::parse_packet(buf) {
             self.update_outbound_info(&info);
+            if let Some(ref counter) = self.connection_counter {
+                counter(
+                    info.proto,
+                    (info.src, info.src_port),
+                    (info.dst, info.dst_port),
+                    1,
+                    buf.len() as u64,
+                    false, // outbound = transmitted (Tx)
+                );
+            }
         }
     }
 
@@ -276,6 +309,16 @@ impl Filter {
             }
             _ => {}
         }
+    }
+
+    /// Install or remove a connection counter for network flow logging.
+    ///
+    /// When set, the counter is called from [`Filter::update_outbound`]
+    /// for each parsed outbound packet. Pass `None` to disable counting.
+    /// The counter type is structurally identical to
+    /// `rustscale_netlog::ConnectionCounter`.
+    pub fn set_connection_counter(&mut self, counter: Option<ConnectionCounter>) {
+        self.connection_counter = counter;
     }
 
     /// Low-level check: is traffic from `src` to `dst`:`dst_port` using

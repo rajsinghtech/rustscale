@@ -287,6 +287,9 @@ pub struct ServerBuilder {
     /// server are routed through this closure instead of `eprintln!`.
     /// Mirrors Go's `Server.UserLogf`.
     pub(crate) logger: Option<Logger>,
+    /// Optional daemon logtail client. Embeddings leave this unset by default;
+    /// rustscaled supplies it so C2N can request an immediate upload.
+    pub(crate) logtail: Option<rustscale_logtail::LogTail>,
     /// Additional DER-encoded root CAs to trust alongside the webpki and
     /// baked ISRG roots for control-plane and DERP TLS connections. Mirrors
     /// Go's `tsnet.Server.ExtraRootCAs`.
@@ -322,6 +325,7 @@ impl std::fmt::Debug for ServerBuilder {
             .field("port", &self.port)
             .field("advertise_tags", &self.advertise_tags)
             .field("logger", &self.logger.as_ref().map(|_| "<logger>"))
+            .field("logtail", &self.logtail.as_ref().map(|_| "<logtail>"))
             .finish()
     }
 }
@@ -510,6 +514,15 @@ impl ServerBuilder {
     /// Mirrors Go's `Server.UserLogf`.
     pub fn logger(mut self, logger: impl Fn(&str) + Send + Sync + 'static) -> Self {
         self.logger = Some(Arc::new(logger));
+        self
+    }
+
+    /// Attach a logtail client to this server.
+    ///
+    /// This is opt-in so tsnet embeddings do not upload logs unless their
+    /// host application explicitly configures a client.
+    pub fn logtail(mut self, logtail: rustscale_logtail::LogTail) -> Self {
+        self.logtail = Some(logtail);
         self
     }
 
@@ -790,6 +803,10 @@ pub(crate) struct Bootstrap {
     pub(crate) sockstats: Arc<rustscale_sockstats::SockStats>,
     /// Public backend log ID, derived from the state-directory-private ID.
     pub(crate) backend_log_id: String,
+    /// Private half of `backend_log_id`, retained so daemon logtail uses the
+    /// exact persisted identity that hostinfo advertises publicly.
+    #[allow(dead_code)]
+    pub(crate) private_log_id: rustscale_logid::PrivateID,
 }
 
 /// An embedded Tailscale server.
@@ -1009,7 +1026,7 @@ impl Server {
         if let Some(ref logger) = self.config.logger {
             logger(&msg.to_string());
         } else {
-            eprintln!("{msg}");
+            log::debug!("{msg}");
         }
     }
 }

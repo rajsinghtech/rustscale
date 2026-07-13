@@ -100,7 +100,7 @@ real JSON).
 | State persistence abstraction | `ipn/store/` | ✅ `crates/ipn/src/store.rs`: Store trait + MemStore (HashMap) + FileStore (one file per key) |
 | IPN server actor loop | `ipn/ipnserver/` | ⬜ orchestration embedded in tsnet Server + lifecycle.rs; no dedicated actor loop |
 | TSP protocol (alt control) | `control/tsp/` | ⬜ only ts2021 Noise control protocol implemented |
-| Log policy / logtail setup | `logpolicy/` | ⬜ log dir creation in launchd.rs only; no rotation or policy |
+| Log policy / logtail setup | `logpolicy/` | ✅ `crates/logpolicy`: Go-compatible persisted `rustscaled.log.conf`, state-dir `logid-private` reuse, `TS_LOGS_DIR`/`TS_LOG_TARGET`, and daemon startup/shutdown wiring |
 | Packet parsing (headers) | `net/packet/` | ✅ `crates/packet`: IPv4Header, IPv6Header, ICMPHeader, UDPHeader, TCPFlag, Parsed rich decoded view, parse_packet(); GENEVE in udprelay |
 | DNS name utilities | `util/dnsname/` | 🔶 FQDN handling in dns resolver + tsnet; no standalone crate with ValidLabel/SanitizeLabel |
 | TLS dial config | `net/tlsdial/` | 🔶 tls_config() in DERP client + controlhttp + ACME; no unified tlsdial module |
@@ -146,9 +146,9 @@ real JSON).
 | Web client UI | ✅ `rustscale web` with embedded HTML/JS, /api/status/up/down/logout handlers, loopback-only, --readonly, --unsafe-any-addr |
 | Control knobs (`control/controlknobs/`) | ✅ HashMap<String,String> behind RwLock, typed accessors (get_bool/float/string), change-detection merge, on_change callbacks |
 | PeerAPI (`ipn/ipnlocal/peerapi.go`) | ✅ DoH /dns-query (GET + POST), /v0/* endpoints (goroutines, env, metrics, magicsock, dnsfwd, interfaces, sockstats), WhoIs auth, CRC32 port [32768, 65535], Taildrop PUT handler, netstack + TUN spawners |
-| Hostinfo | ✅ ~41 fields populated: platform/runtime fields plus persisted `BackendLogID`, override-supplied `FrontendLogID`, `WoLMACs`, `StateEncrypted`, and SSH host keys when the SSH listener is enabled. Intentional skips: PushDeviceToken, TPM, Location, ShareeNode, PeerRelay |
+| Hostinfo | ✅ ~41 fields populated: platform/runtime fields plus persisted `BackendLogID` (derived from the same `logid-private` used for logtail auth), override-supplied `FrontendLogID`, `WoLMACs`, `StateEncrypted`, and SSH host keys when the SSH listener is enabled. Intentional skips: PushDeviceToken, TPM, Location, ShareeNode, PeerRelay |
 | CapturePcap | ✅ `crates/tsnet/src/capture.rs`: byte-exact LINKTYPE_USER0 pcap sink (Go `feature/capture` format), fanout with slow-client drop, hooks in TUN pump (FromLocal/FromPeer) + netstack pump (SynthesizedToPeer/ToLocal); `Server::capture_pcap(file)`, LocalAPI POST /debug-capture stream, CLI `rustscale debug capture -o` |
-| Logtail | ✅ `crates/logtail` upload loop (HTTP POST, zstd, backoff) — see Tier 2.5 row |
+| Logtail | ✅ `crates/logtail` upload loop (HTTP POST, zstd, backoff), `log` facade adapter with stderr mirroring/level gating, per-client disable switch, and live C2N flush; uploads are opt-in for tsnet and enabled by rustscaled — see Tier 2.5 row |
 | Watchdog | ✅ tokio-based interval task, auto-fires warning if not feed() within interval, Drop-safe |
 | Syspolicy | ⬜ |
 | BIRD routing (`chirp/`) | ⬜ |

@@ -193,12 +193,12 @@ pub(crate) fn spawn_localapi(
                     let state = state.clone();
                     tokio::spawn(async move {
                         if let Err(e) = handle_connection(stream, &state, peer_identity).await {
-                            eprintln!("localapi: connection error: {e}");
+                            log::warn!("localapi: connection error: {e}");
                         }
                     });
                 }
                 Err(e) => {
-                    eprintln!("localapi: accept error: {e}");
+                    log::warn!("localapi: accept error: {e}");
                     continue;
                 }
             }
@@ -504,7 +504,7 @@ async fn handle_reload_config<W: AsyncWrite + Unpin>(
         ..Default::default()
     });
 
-    eprintln!("rustscaled: config reloaded from {path_str}");
+    log::info!("rustscaled: config reloaded from {path_str}");
     write_json_response(conn, 200, "OK", &updated).await?;
     Ok(())
 }
@@ -660,7 +660,7 @@ async fn handle_patch_prefs<W: AsyncWrite + Unpin>(
                 rustscale_tailcfg::AuditNodeDisconnect,
                 "disconnect requested via LocalAPI",
             ) {
-                eprintln!("tsnet: failed to persist audit log (non-fatal): {error}");
+                log::warn!("tsnet: failed to persist audit log (non-fatal): {error}");
             }
         }
     }
@@ -1826,7 +1826,7 @@ async fn handle_post_serve_config<W: AsyncWrite + Unpin>(
     // Persist to disk.
     if let Some(ref dir) = state.state_dir {
         if let Err(e) = cfg_in.save(dir) {
-            eprintln!("localapi: serve-config persist failed: {e}");
+            log::warn!("localapi: serve-config persist failed: {e}");
         }
     }
 

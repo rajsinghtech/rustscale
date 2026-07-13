@@ -383,7 +383,7 @@ impl<D: SocksDialer + 'static> Socks5Server<D> {
             let (stream, _peer) = match accept {
                 Ok(Ok(s)) => s,
                 Ok(Err(e)) => {
-                    eprintln!("socks5: accept failed: {e}");
+                    log::warn!("socks5: accept failed: {e}");
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     continue;
                 }
@@ -399,7 +399,7 @@ impl<D: SocksDialer + 'static> Socks5Server<D> {
                     None
                 };
                 if let Err(e) = handle_conn_generic(stream, d, auth).await {
-                    eprintln!("socks5: connection ended: {e}");
+                    log::debug!("socks5: connection ended: {e}");
                 }
             });
         }

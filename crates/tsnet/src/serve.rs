@@ -449,7 +449,7 @@ impl ServeRunner {
             let listener = match self.netstack.listen(port).await {
                 Ok(l) => l,
                 Err(e) => {
-                    eprintln!("tsnet: serve listener on port {port} failed: {e}");
+                    log::warn!("tsnet: serve listener on port {port} failed: {e}");
                     continue;
                 }
             };
@@ -489,7 +489,7 @@ impl ServeRunner {
                     let v4_vips: Vec<IpAddr> =
                         vips.iter().filter(|ip| ip.is_ipv4()).copied().collect();
                     if v4_vips.is_empty() {
-                        eprintln!("tsnet: serve service {svc_name} on port {port} has no v4 VIPs");
+                        log::warn!("tsnet: serve service {svc_name} on port {port} has no v4 VIPs");
                         continue;
                     }
                     for vip in &v4_vips {
@@ -515,7 +515,7 @@ impl ServeRunner {
                                 )));
                             }
                             Err(e) => {
-                                eprintln!(
+                                log::warn!(
                                     "tsnet: serve service {svc_name} listener on {vip}:{port} failed: {e}"
                                 );
                             }
@@ -567,7 +567,7 @@ async fn serve_listener_loop(
         let stream = match accept {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => {
-                eprintln!("tsnet: serve accept on port {port} failed: {e}");
+                log::warn!("tsnet: serve accept on port {port} failed: {e}");
                 continue;
             }
             Err(_) => continue, // periodic cancel check
@@ -582,7 +582,7 @@ async fn serve_listener_loop(
             if let Err(e) =
                 dispatch_serve(stream, port, &handler, &cfg, cert, &peers, &ups, &fqdn).await
             {
-                eprintln!("tsnet: serve dispatch on port {port} failed: {e}");
+                log::warn!("tsnet: serve dispatch on port {port} failed: {e}");
             }
         });
     }

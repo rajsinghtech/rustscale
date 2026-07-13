@@ -94,10 +94,10 @@ pub(crate) fn first_v4(ips: &[IpAddr]) -> Result<Ipv4Addr, TsnetError> {
 pub(crate) fn break_tcp_conns_best_effort() {
     match rustscale_tcpinfo::break_tcp_conns() {
         Ok(n) => {
-            eprintln!("tsnet: broke {n} TCP connection(s) on exit-node change");
+            log::debug!("tsnet: broke {n} TCP connection(s) on exit-node change");
         }
         Err(e) => {
-            eprintln!("tsnet: break_tcp_conns failed (non-fatal): {e}");
+            log::warn!("tsnet: break_tcp_conns failed (non-fatal): {e}");
         }
     }
 }

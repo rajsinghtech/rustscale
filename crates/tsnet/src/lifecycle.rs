@@ -152,7 +152,7 @@ impl Server {
         );
         match responder.spawn().await {
             Ok(handle) => tasks.push(handle),
-            Err(e) => eprintln!(
+            Err(e) => log::warn!(
                 "tsnet: MagicDNS responder not started ({e}); dial still resolves via netmap"
             ),
         }
@@ -228,9 +228,9 @@ impl Server {
                     ..Default::default()
                 };
                 match cc_ep.send_map_request(&svc_req).await {
-                    Ok(()) => eprintln!("tsnet: peerapi services advertised (port {port})"),
+                    Ok(()) => log::info!("tsnet: peerapi services advertised (port {port})"),
                     Err(e) => {
-                        eprintln!("tsnet: peerapi service advertisement failed (non-fatal): {e}");
+                        log::warn!("tsnet: peerapi service advertisement failed (non-fatal): {e}");
                     }
                 }
             }
@@ -416,10 +416,10 @@ impl Server {
                         handle.task.abort();
                     }
                 }
-                eprintln!("tsnet: LocalAPI listening at {}", path.display());
+                log::info!("tsnet: LocalAPI listening at {}", path.display());
                 Some(h.socket_path)
             } else {
-                eprintln!(
+                log::warn!(
                     "tsnet: LocalAPI failed to bind socket at {}",
                     path.display()
                 );
@@ -498,9 +498,9 @@ impl Server {
             if let Some(peer_key) = localapi::resolve_exit_node_peer(&peers_guard, ip_or_name) {
                 drop(peers_guard);
                 route_table.write().await.set_exit_node(peer_key);
-                eprintln!("tsnet: applied stored exit-node pref: {ip_or_name}");
+                log::info!("tsnet: applied stored exit-node pref: {ip_or_name}");
             } else {
-                eprintln!(
+                log::debug!(
                     "tsnet: stored exit-node pref unresolved (peer not in netmap): {ip_or_name}"
                 );
             }
@@ -703,9 +703,9 @@ impl Server {
                     ..Default::default()
                 };
                 match cc_ep.send_map_request(&svc_req).await {
-                    Ok(()) => eprintln!("tsnet: peerapi services advertised (port {port})"),
+                    Ok(()) => log::info!("tsnet: peerapi services advertised (port {port})"),
                     Err(e) => {
-                        eprintln!("tsnet: peerapi service advertisement failed (non-fatal): {e}");
+                        log::warn!("tsnet: peerapi service advertisement failed (non-fatal): {e}");
                     }
                 }
             }
@@ -896,10 +896,10 @@ impl Server {
                         handle.task.abort();
                     }
                 }
-                eprintln!("tsnet: LocalAPI listening at {}", path.display());
+                log::info!("tsnet: LocalAPI listening at {}", path.display());
                 Some(h.socket_path)
             } else {
-                eprintln!(
+                log::warn!(
                     "tsnet: LocalAPI failed to bind socket at {}",
                     path.display()
                 );
@@ -926,7 +926,7 @@ impl Server {
             let mut configurator: Box<dyn OsConfigurator + Send> = Box::new(new_os_configurator());
             match configurator.set_dns(&os_cfg) {
                 Ok(()) => {
-                    eprintln!(
+                    log::info!(
                         "tsnet: OS DNS configured ({} match domains, {} search domains)",
                         os_cfg.match_domains.len(),
                         os_cfg.search_domains.len()
@@ -934,7 +934,7 @@ impl Server {
                     Some(configurator)
                 }
                 Err(e) => {
-                    eprintln!("tsnet: OS DNS configuration failed (non-fatal, needs root?): {e}");
+                    log::warn!("tsnet: OS DNS configuration failed (non-fatal, needs root?): {e}");
                     None
                 }
             }
@@ -1016,9 +1016,9 @@ impl Server {
                 if let Some(router) = router.as_ref() {
                     sync_router(router, &tailscale_ips, &routes)?;
                 }
-                eprintln!("tsnet: applied stored exit-node pref: {ip_or_name}");
+                log::info!("tsnet: applied stored exit-node pref: {ip_or_name}");
             } else {
-                eprintln!(
+                log::debug!(
                     "tsnet: stored exit-node pref unresolved (peer not in netmap): {ip_or_name}"
                 );
             }
@@ -1181,12 +1181,12 @@ impl Server {
 
         let handle = localapi::spawn_localapi(api_state.clone(), socket_path.clone());
         if handle.is_some() {
-            eprintln!(
+            log::info!(
                 "tsnet: LocalAPI (needs-login) listening at {}",
                 socket_path.display()
             );
         } else {
-            eprintln!("tsnet: LocalAPI failed to bind {}", socket_path.display());
+            log::warn!("tsnet: LocalAPI failed to bind {}", socket_path.display());
         }
 
         self.pre_started = Some(PreStartedLocalApi {
@@ -1257,13 +1257,12 @@ impl Server {
             self.save_state(&state)?;
         }
 
-        let backend_log_id = if let Some(dir) = self.config.state_dir.as_ref() {
+        let private_log_id = if let Some(dir) = self.config.state_dir.as_ref() {
             rustscale_logid::PrivateID::load_or_create(&dir.join("logid-private"))?
         } else {
             rustscale_logid::PrivateID::new()
-        }
-        .public()
-        .to_string();
+        };
+        let backend_log_id = private_log_id.public().to_string();
 
         let node_pub = state.node_key.public();
         let disco_pub = state.disco_key.public();
@@ -1332,7 +1331,7 @@ impl Server {
             // call on register failures (ipn/ipnlocal/local.go:7415).
             if let Some(ref dir) = self.config.state_dir {
                 PersistedState::clear_netmap(dir);
-                eprintln!("tsnet: cleared netmap cache after register error: {e}");
+                log::warn!("tsnet: cleared netmap cache after register error: {e}");
             }
             ipn_backend.emit_err_message(e.to_string());
             TsnetError::Register(e)
@@ -1342,7 +1341,7 @@ impl Server {
         if !reg_resp.Error.is_empty() {
             if let Some(ref dir) = self.config.state_dir {
                 PersistedState::clear_netmap(dir);
-                eprintln!(
+                log::warn!(
                     "tsnet: cleared netmap cache after register error: {}",
                     reg_resp.Error
                 );
@@ -1359,7 +1358,7 @@ impl Server {
         if reg_resp.NodeKeyExpired {
             if let Some(ref dir) = self.config.state_dir {
                 PersistedState::clear_netmap(dir);
-                eprintln!("tsnet: cleared netmap cache: node key expired");
+                log::info!("tsnet: cleared netmap cache: node key expired");
             }
             ipn_backend.set_key_expired(true);
         }
@@ -1483,8 +1482,8 @@ impl Server {
             PROTOCOL_VERSION,
         );
         match cc_ep.send_map_request(&endpoint_update_req).await {
-            Ok(()) => eprintln!("tsnet: endpoint update sent (DiscoKey + {local_endpoints:?})"),
-            Err(e) => eprintln!("tsnet: endpoint update failed (non-fatal): {e}"),
+            Ok(()) => log::debug!("tsnet: endpoint update sent (DiscoKey + {local_endpoints:?})"),
+            Err(e) => log::warn!("tsnet: endpoint update failed (non-fatal): {e}"),
         }
 
         // 4. Fetch the first MapResponse. If we have a cached netmap, skip
@@ -1493,7 +1492,7 @@ impl Server {
         // background. This eliminates the 2-5s startup delay on restarts.
         let map_resp: MapResponse = if let Some(ref cached) = cached_netmap {
             let peer_count = cached.Peers.len();
-            eprintln!(
+            log::debug!(
                 "tsnet: using cached netmap ({peer_count} peers); streaming poll will refresh in background"
             );
             cached.clone()
@@ -1551,7 +1550,7 @@ impl Server {
                 .map(|n| n.HomeDERP)
                 .filter(|&d| d > 0);
             if let Some(d) = assigned {
-                eprintln!("tsnet: using control-assigned home DERP region {d}");
+                log::info!("tsnet: using control-assigned home DERP region {d}");
                 d
             } else {
                 // Fall back to netcheck.
@@ -1571,7 +1570,7 @@ impl Server {
         };
 
         // 7. Connect home DERP.
-        eprintln!("tsnet: home DERP region = {home_derp}");
+        log::info!("tsnet: home DERP region = {home_derp}");
         let derp_client = match connect_home_derp(&derp_map, home_derp, &state.node_key).await {
             Ok(mut c) => {
                 // Tell the DERP server this is our preferred (home) node.
@@ -1580,14 +1579,14 @@ impl Server {
                 // the DERP server track home-client metrics and is part of
                 // the expected handshake.
                 if let Err(e) = c.note_preferred(true).await {
-                    eprintln!("tsnet: DERP note_preferred failed (non-fatal): {e}");
+                    log::warn!("tsnet: DERP note_preferred failed (non-fatal): {e}");
                 }
-                eprintln!("tsnet: DERP connected to region {home_derp}");
+                log::info!("tsnet: DERP connected to region {home_derp}");
                 health.set_healthy(WARN_DERP_HOME);
                 Some(c)
             }
             Err(e) => {
-                eprintln!("tsnet: DERP connection to region {home_derp} failed: {e}");
+                log::warn!("tsnet: DERP connection to region {home_derp} failed: {e}");
                 health.set_unhealthy(
                     WARN_DERP_HOME,
                     format!("derp home region {home_derp} unreachable: {e}"),
@@ -1619,8 +1618,8 @@ impl Server {
             ..Default::default()
         };
         match cc_ep.send_map_request(&netinfo_req).await {
-            Ok(()) => eprintln!("tsnet: NetInfo (PreferredDERP={home_derp}) sent to control"),
-            Err(e) => eprintln!("tsnet: NetInfo update failed (non-fatal): {e}"),
+            Ok(()) => log::debug!("tsnet: NetInfo (PreferredDERP={home_derp}) sent to control"),
+            Err(e) => log::warn!("tsnet: NetInfo update failed (non-fatal): {e}"),
         }
 
         // 7b. Run a STUN probe now that DERPMap is known, to discover our
@@ -1637,15 +1636,15 @@ impl Server {
             {
                 Ok(report) => {
                     if let Some(g) = report.global_v4 {
-                        eprintln!("tsnet: STUN endpoint: {g}");
+                        log::debug!("tsnet: STUN endpoint: {g}");
                         Some(g.to_string())
                     } else {
-                        eprintln!("tsnet: STUN probe returned no global_v4");
+                        log::warn!("tsnet: STUN probe returned no global_v4");
                         None
                     }
                 }
                 Err(e) => {
-                    eprintln!("tsnet: STUN probe failed (non-fatal): {e}");
+                    log::warn!("tsnet: STUN probe failed (non-fatal): {e}");
                     None
                 }
             }
@@ -1676,8 +1675,8 @@ impl Server {
             ..Default::default()
         };
         match cc_ep.send_map_request(&stun_ep_req).await {
-            Ok(()) => eprintln!("tsnet: STUN endpoint update sent ({stun_ep:?})"),
-            Err(e) => eprintln!("tsnet: STUN endpoint update failed (non-fatal): {e}"),
+            Ok(()) => log::debug!("tsnet: STUN endpoint update sent ({stun_ep:?})"),
+            Err(e) => log::warn!("tsnet: STUN endpoint update failed (non-fatal): {e}"),
         }
 
         // Start the streaming map long-poll with NetInfo included. This is
@@ -1849,6 +1848,7 @@ impl Server {
                 our_fqdn: our_fqdn.clone(),
                 magicsock: magicsock.clone(),
                 sockstats: sockstats.clone(),
+                logtail: self.config.logtail.clone(),
             },
             c2n_log_level,
         ));
@@ -1901,6 +1901,7 @@ impl Server {
             map_session,
             sockstats,
             backend_log_id,
+            private_log_id,
         })
     }
 
@@ -1948,7 +1949,7 @@ impl Server {
             // we installed it. Best-effort: log on error.
             if let Some(mut cfg) = inner.os_dns_configurator.take() {
                 if let Err(e) = cfg.close() {
-                    eprintln!("tsnet: OS DNS cleanup failed (non-fatal): {e}");
+                    log::warn!("tsnet: OS DNS cleanup failed (non-fatal): {e}");
                 }
             }
         }
@@ -2000,7 +2001,7 @@ impl Server {
             .audit_logger
             .enqueue(rustscale_tailcfg::AuditNodeDisconnect, "logout")
         {
-            eprintln!("tsnet: failed to persist audit log (non-fatal): {error}");
+            log::warn!("tsnet: failed to persist audit log (non-fatal): {error}");
         }
         inner
             .audit_logger
@@ -2033,14 +2034,14 @@ impl Server {
             ..Default::default()
         };
         if let Err(e) = cc.register(&logout_req).await {
-            eprintln!("tsnet: logout register failed (non-fatal): {e}");
+            log::warn!("tsnet: logout register failed (non-fatal): {e}");
         }
 
         // 2. Clear persisted state: regenerate keys, clear netmap cache.
         if let Some(ref dir) = self.config.state_dir {
             let fresh = PersistedState::generate();
             if let Err(e) = self.save_state(&fresh) {
-                eprintln!("tsnet: failed to clear state on logout: {e}");
+                log::warn!("tsnet: failed to clear state on logout: {e}");
             }
             PersistedState::clear_netmap(dir);
         }
@@ -2086,7 +2087,7 @@ impl Server {
         }
         if let Some(mut cfg) = inner.os_dns_configurator.take() {
             if let Err(e) = cfg.close() {
-                eprintln!("tsnet: OS DNS cleanup failed (non-fatal): {e}");
+                log::warn!("tsnet: OS DNS cleanup failed (non-fatal): {e}");
             }
         }
 
@@ -2128,7 +2129,7 @@ impl Server {
             }
             // Save prefs to disk so bootstrap picks them up.
             if let Err(e) = new_prefs.save(dir) {
-                eprintln!("tsnet: failed to save prefs on profile switch: {e}");
+                log::warn!("tsnet: failed to save prefs on profile switch: {e}");
             }
         }
 
@@ -2173,14 +2174,14 @@ impl Server {
             })
             .unwrap_or_else(|| "default".to_string());
         if let Err(error) = logger.set_profile_id(profile_id) {
-            eprintln!("tsnet: failed to configure audit log profile (non-fatal): {error}");
+            log::warn!("tsnet: failed to configure audit log profile (non-fatal): {error}");
         }
 
         let mut control_client =
             ControlClient::new(control_url, machine_key, server_pub_key, PROTOCOL_VERSION);
         control_client.set_audit_node_key(node_key.public());
         if let Err(error) = logger.start(Arc::new(control_client)).await {
-            eprintln!("tsnet: failed to start audit logger (non-fatal): {error}");
+            log::warn!("tsnet: failed to start audit logger (non-fatal): {error}");
         }
         logger
     }

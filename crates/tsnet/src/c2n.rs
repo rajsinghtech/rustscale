@@ -38,6 +38,7 @@ pub(crate) struct C2nBackendData {
     pub our_fqdn: String,
     pub magicsock: Arc<Magicsock>,
     pub sockstats: Arc<rustscale_sockstats::SockStats>,
+    pub logtail: Option<rustscale_logtail::LogTail>,
 }
 
 pub struct TsnetC2nBackend {
@@ -51,6 +52,7 @@ pub struct TsnetC2nBackend {
     our_fqdn: String,
     magicsock: Arc<Magicsock>,
     sockstats: Arc<rustscale_sockstats::SockStats>,
+    logtail: Option<rustscale_logtail::LogTail>,
     log_level: LogLevelState,
 }
 
@@ -67,6 +69,7 @@ impl TsnetC2nBackend {
             our_fqdn: data.our_fqdn,
             magicsock: data.magicsock,
             sockstats: data.sockstats,
+            logtail: data.logtail,
             log_level,
         }
     }
@@ -198,7 +201,12 @@ impl C2nBackend for TsnetC2nBackend {
     }
 
     async fn try_flush_logs(&self) -> bool {
-        true
+        if let Some(logtail) = &self.logtail {
+            logtail.flush();
+            true
+        } else {
+            false
+        }
     }
 
     async fn set_component_debug_logging(
@@ -298,11 +306,17 @@ impl C2nHandler for BackendDnsHandler {
     }
 }
 
-struct LogtailFlushHandler;
+struct LogtailFlushHandler {
+    backend: Arc<TsnetC2nBackend>,
+}
 #[async_trait]
 impl C2nHandler for LogtailFlushHandler {
     async fn handle(&self, _req: C2nRequest) -> C2nResponse {
-        C2nResponse::no_content()
+        if self.backend.try_flush_logs().await {
+            C2nResponse::no_content()
+        } else {
+            C2nResponse::error(500, "no log flusher wired up")
+        }
     }
 }
 
@@ -410,7 +424,12 @@ fn parse_query_map(query: &str) -> std::collections::HashMap<String, String> {
 /// Mirrors Go's `init()` registration in `c2n.go`.
 pub(crate) fn register_c2n_handlers(router: &mut C2nRouter, backend: Arc<TsnetC2nBackend>) {
     router.register("/echo", Arc::new(EchoHandler));
-    router.register("POST /logtail/flush", Arc::new(LogtailFlushHandler));
+    router.register(
+        "POST /logtail/flush",
+        Arc::new(LogtailFlushHandler {
+            backend: backend.clone(),
+        }),
+    );
     router.register("/debug/goroutines", Arc::new(GoroutinesHandler));
     router.register("/debug/pprof/heap", Arc::new(PprofHandler));
     router.register("/debug/pprof/allocs", Arc::new(PprofHandler));
@@ -482,7 +501,7 @@ pub(crate) async fn spawn_c2n_server(
 
     let handle = tokio::spawn(async move {
         if let Err(e) = server.serve(listener).await {
-            eprintln!("c2n server error: {e}");
+            log::warn!("c2n server error: {e}");
         }
     });
 

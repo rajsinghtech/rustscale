@@ -2748,6 +2748,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustscale-logpolicy"
+version = "0.1.0"
+dependencies = [
+ "rustscale-envknob",
+ "rustscale-logid",
+ "rustscale-logtail",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "rustscale-logtail"
 version = "0.1.0"
 dependencies = [
@@ -2755,6 +2768,7 @@ dependencies = [
  "log",
  "rand 0.8.7",
  "reqwest",
+ "rustscale-envknob",
  "serde",
  "serde_json",
  "tokio",
@@ -2931,8 +2945,11 @@ dependencies = [
 name = "rustscale-rustscaled"
 version = "0.1.0"
 dependencies = [
+ "log",
  "rustscale-conffile",
  "rustscale-ipn",
+ "rustscale-logpolicy",
+ "rustscale-logtail",
  "rustscale-safesocket",
  "rustscale-tsnet",
  "thiserror 1.0.69",
@@ -3072,6 +3089,7 @@ dependencies = [
  "crc32fast",
  "hex",
  "libc",
+ "log",
  "p256",
  "rand_core 0.6.4",
  "rcgen",
@@ -3096,6 +3114,7 @@ dependencies = [
  "rustscale-key",
  "rustscale-localclient",
  "rustscale-logid",
+ "rustscale-logtail",
  "rustscale-magicsock",
  "rustscale-netcheck",
  "rustscale-netmon",

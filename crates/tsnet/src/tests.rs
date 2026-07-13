@@ -1363,7 +1363,7 @@ async fn e2e_two_nodes() {
     let dial_addr = format!("{ip_b}:4242");
     let mut stream_a = None;
     for attempt in 1..=3 {
-        eprintln!("dial attempt {attempt} to {dial_addr}");
+        log::debug!("dial attempt {attempt} to {dial_addr}");
         let dial_result = tokio::time::timeout(
             std::time::Duration::from_secs(45),
             server_a.dial(&dial_addr),
@@ -1375,7 +1375,7 @@ async fn e2e_two_nodes() {
                 break;
             }
             Ok(Err(e)) => {
-                eprintln!("dial attempt {attempt} failed: {e}");
+                log::warn!("dial attempt {attempt} failed: {e}");
             }
             Err(_) => {
                 let st = server_a.status();
@@ -1384,7 +1384,7 @@ async fn e2e_two_nodes() {
                     .iter()
                     .map(|p| format!("  {} ips={:?} path={:?}", p.name, p.ips, p.path_class))
                     .collect();
-                eprintln!(
+                log::debug!(
                     "dial attempt {attempt} timed out (45s)\nA peers ({}):\n{}",
                     peers.len(),
                     peers.join("\n")
@@ -1556,7 +1556,7 @@ async fn e2e_subnet_routes() {
     let status_a = server_a.status();
     assert!(!status_a.tailscale_ips.is_empty(), "A should have IPs");
     let ip_a = status_a.tailscale_ips[0];
-    eprintln!("A up: ip={ip_a}, advertising {subnet}");
+    log::debug!("A up: ip={ip_a}, advertising {subnet}");
 
     // Wait for A to appear in the device list, then approve its routes.
     // The device may take a few seconds to show up in the API after up().
@@ -1575,9 +1575,9 @@ async fn e2e_subnet_routes() {
         }
         found.expect("A never appeared in device list (30s)")
     };
-    eprintln!("A device_id={device_id}, approving routes...");
+    log::debug!("A device_id={device_id}, approving routes...");
     api_approve_routes(&device_id, &[subnet]).expect("approve routes");
-    eprintln!("routes approved");
+    log::debug!("routes approved");
 
     // Start node B — accepts routes.
     let mut server_b = Server::builder()
@@ -1599,14 +1599,14 @@ async fn e2e_subnet_routes() {
             // Peer is visible — check the route table.
             if let Some(peer_key) = server_b.route_lookup(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 42)))
             {
-                eprintln!("B route for 192.0.2.42 -> {peer_key:?}");
+                log::debug!("B route for 192.0.2.42 -> {peer_key:?}");
                 let routes = server_b.routes();
                 let has_subnet = routes.iter().any(|(cidr, _)| cidr == subnet);
                 assert!(
                     has_subnet,
                     "B's route table should contain {subnet}, got: {routes:?}"
                 );
-                eprintln!("SUCCESS: B has route {subnet} -> peer");
+                log::debug!("SUCCESS: B has route {subnet} -> peer");
                 break;
             }
         }
@@ -1724,7 +1724,7 @@ async fn e2e_whois_and_magicdns_dial() {
     .expect("whois timed out")
     .expect("whois returned None (server up?)");
     assert!(info.found, "whois should find peer for {ip_b}");
-    eprintln!("whois({ip_b}) -> node_name={}", info.node_name);
+    log::debug!("whois({ip_b}) -> node_name={}", info.node_name);
     assert!(
         info.node_name
             .to_lowercase()
@@ -1740,7 +1740,7 @@ async fn e2e_whois_and_magicdns_dial() {
     let dial_addr = format!("{short_name}:4343");
     let mut stream_a = None;
     for attempt in 1..=3 {
-        eprintln!("MagicDNS dial attempt {attempt} to {dial_addr}");
+        log::debug!("MagicDNS dial attempt {attempt} to {dial_addr}");
         let r = tokio::time::timeout(
             std::time::Duration::from_secs(45),
             server_a.dial(&dial_addr),
@@ -1751,8 +1751,8 @@ async fn e2e_whois_and_magicdns_dial() {
                 stream_a = Some(s);
                 break;
             }
-            Ok(Err(e)) => eprintln!("dial attempt {attempt} failed: {e}"),
-            Err(_) => eprintln!("dial attempt {attempt} timed out"),
+            Ok(Err(e)) => log::warn!("dial attempt {attempt} failed: {e}"),
+            Err(_) => log::debug!("dial attempt {attempt} timed out"),
         }
         if attempt < 3 {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -1814,19 +1814,19 @@ async fn e2e_control_cert_not_enabled() {
     let result = server.control_cert_provider().await;
     match result {
         Err(CertError::NotEnabled(_)) => {
-            eprintln!("control cert: NotEnabled (expected for API-only tailnet)");
+            log::debug!("control cert: NotEnabled (expected for API-only tailnet)");
         }
         Err(CertError::AcmeClientUnavailable(_)) => {
-            eprintln!("control cert: AcmeClientUnavailable (HTTPS enabled, ACME client pending)");
+            log::debug!("control cert: AcmeClientUnavailable (HTTPS enabled, ACME client pending)");
         }
         Err(CertError::Acme(e)) => {
-            eprintln!("control cert: Acme error (HTTPS enabled, ACME flow failed): {e}");
+            log::warn!("control cert: Acme error (HTTPS enabled, ACME flow failed): {e}");
         }
         Err(e) => panic!("expected NotEnabled/Acme, got: {e}"),
         Ok(provider) => {
             // If a real cert was provisioned, it must produce a non-empty chain.
             assert!(!provider.cert_chain().is_empty(), "cert chain empty");
-            eprintln!("control cert: real cert provisioned");
+            log::debug!("control cert: real cert provisioned");
         }
     }
 
@@ -1835,7 +1835,7 @@ async fn e2e_control_cert_not_enabled() {
         .listen_tls(9443)
         .await
         .expect("listen_tls should fall back");
-    eprintln!("listen_tls fell back to self-signed OK");
+    log::debug!("listen_tls fell back to self-signed OK");
     drop(tls_listener);
     server.close().await;
     std::fs::remove_dir_all(&state_dir).ok();
@@ -1857,7 +1857,7 @@ async fn e2e_acme_cert_issuance() {
     let _tailnet = std::env::var("TS_E2E_TAILNET").expect("TS_E2E_TAILNET not set");
     let https_enabled = std::env::var("TS_E2E_HTTPS").is_ok_and(|v| v == "1");
     if !https_enabled {
-        eprintln!("e2e_acme_cert_issuance: skipping (TS_E2E_HTTPS != 1)");
+        log::debug!("e2e_acme_cert_issuance: skipping (TS_E2E_HTTPS != 1)");
         return;
     }
 
@@ -1890,13 +1890,13 @@ async fn e2e_acme_cert_issuance() {
             .unwrap_or_default()
     };
     if cert_domains.is_empty() {
-        eprintln!(
+        log::debug!(
             "e2e_acme_cert_issuance: CertDomains empty (HTTPS not enabled on tailnet); skipping"
         );
         server.close().await;
         return;
     }
-    eprintln!("e2e_acme_cert_issuance: CertDomains = {cert_domains:?}");
+    log::debug!("e2e_acme_cert_issuance: CertDomains = {cert_domains:?}");
 
     // Request the cert. This runs the full ACME flow against LE staging.
     let result = tokio::time::timeout(
@@ -1910,7 +1910,7 @@ async fn e2e_acme_cert_issuance() {
     let provider = match result {
         Ok(Ok(p)) => p,
         Ok(Err(CertError::NotEnabled(d))) => {
-            eprintln!("e2e_acme_cert_issuance: NotEnabled({d}) — HTTPS not enabled; skipping");
+            log::debug!("e2e_acme_cert_issuance: NotEnabled({d}) — HTTPS not enabled; skipping");
             std::fs::remove_dir_all(&state_dir).ok();
             return;
         }
@@ -1920,7 +1920,7 @@ async fn e2e_acme_cert_issuance() {
 
     let chain = provider.cert_chain();
     assert!(!chain.is_empty(), "cert chain must be non-empty");
-    eprintln!(
+    log::debug!(
         "e2e_acme_cert_issuance: got cert chain with {} cert(s)",
         chain.len()
     );
@@ -1967,7 +1967,7 @@ async fn e2e_exit_node() {
     let status_b = server_b.status();
     assert!(!status_b.tailscale_ips.is_empty(), "B should have IPs");
     let ip_b = status_b.tailscale_ips[0];
-    eprintln!("B up: ip={ip_b}, advertising exit node");
+    log::debug!("B up: ip={ip_b}, advertising exit node");
 
     // Approve B's exit routes (0.0.0.0/0 + ::/0) via the API.
     let device_id = {
@@ -1985,9 +1985,9 @@ async fn e2e_exit_node() {
         }
         found.expect("B never appeared in device list (30s)")
     };
-    eprintln!("B device_id={device_id}, approving exit routes...");
+    log::debug!("B device_id={device_id}, approving exit routes...");
     api_approve_routes(&device_id, &["0.0.0.0/0", "::/0"]).expect("approve exit routes");
-    eprintln!("exit routes approved");
+    log::debug!("exit routes approved");
 
     // --- Node A: selects B as exit node ---
     let mut server_a = Server::builder()
@@ -2009,7 +2009,7 @@ async fn e2e_exit_node() {
             // NotExitCapable and we wait for the next map update.
             match server_a.set_exit_node(&ip_b.to_string()).await {
                 Ok(()) => {
-                    eprintln!("A selected B as exit node");
+                    log::debug!("A selected B as exit node");
                     break;
                 }
                 Err(TsnetError::NotExitCapable(_)) => {
@@ -2040,7 +2040,7 @@ async fn e2e_exit_node() {
         route.is_some(),
         "public IP 8.8.8.8 should route to exit node after set_exit_node"
     );
-    eprintln!("A route for 8.8.8.8 -> {route:?}");
+    log::debug!("A route for 8.8.8.8 -> {route:?}");
 
     // Tailnet IPs still route to their owning peers (more specific than the
     // exit default route).
@@ -2066,7 +2066,7 @@ async fn e2e_exit_node() {
             .is_none(),
         "public IP should NOT route after clear_exit_node"
     );
-    eprintln!("A cleared exit node — public IPs no longer route");
+    log::debug!("A cleared exit node — public IPs no longer route");
 
     // Verify exit_node() accessor.
     assert!(
@@ -2095,7 +2095,7 @@ async fn e2e_serve_tcp_forward() {
     // Local echo backend on an ephemeral port.
     let echo_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let backend_addr = echo_listener.local_addr().unwrap().to_string();
-    eprintln!("e2e_serve: echo backend at {backend_addr}");
+    log::debug!("e2e_serve: echo backend at {backend_addr}");
     tokio::spawn(async move {
         loop {
             if let Ok((mut sock, _)) = echo_listener.accept().await {
@@ -2133,7 +2133,7 @@ async fn e2e_serve_tcp_forward() {
             _ => None,
         })
         .expect("B should have an IPv4");
-    eprintln!("e2e_serve: B up at {ip_b}");
+    log::debug!("e2e_serve: B up at {ip_b}");
 
     // Set serve config: TCP forward port 8080 → echo backend.
     let mut cfg = ServeConfig::default();
@@ -2149,7 +2149,7 @@ async fn e2e_serve_tcp_forward() {
         .await
         .expect("set_serve_config");
     assert!(started.contains(&8080), "serve should be listening on 8080");
-    eprintln!("e2e_serve: B serving port 8080 → {started:?}");
+    log::debug!("e2e_serve: B serving port 8080 → {started:?}");
 
     // Start server A.
     let mut server_a = Server::builder()
@@ -2168,7 +2168,7 @@ async fn e2e_serve_tcp_forward() {
     let dial_addr = format!("{ip_b}:8080");
     let mut stream = None;
     for attempt in 1..=3 {
-        eprintln!("e2e_serve: dial attempt {attempt} to {dial_addr}");
+        log::debug!("e2e_serve: dial attempt {attempt} to {dial_addr}");
         match tokio::time::timeout(
             std::time::Duration::from_secs(45),
             server_a.dial(&dial_addr),
@@ -2179,8 +2179,8 @@ async fn e2e_serve_tcp_forward() {
                 stream = Some(s);
                 break;
             }
-            Ok(Err(e)) => eprintln!("dial attempt {attempt} failed: {e}"),
-            Err(_) => eprintln!("dial attempt {attempt} timed out"),
+            Ok(Err(e)) => log::warn!("dial attempt {attempt} failed: {e}"),
+            Err(_) => log::debug!("dial attempt {attempt} timed out"),
         }
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
@@ -2195,7 +2195,7 @@ async fn e2e_serve_tcp_forward() {
         .expect("read timeout")
         .expect("read err");
     assert_eq!(&buf[..n], b"serve-echo-test");
-    eprintln!("e2e_serve: echo verified through serve TCP forward");
+    log::debug!("e2e_serve: echo verified through serve TCP forward");
 
     server_a.close().await;
     server_b.close().await;
@@ -2225,21 +2225,21 @@ async fn e2e_funnel_not_enabled() {
     let result = server.listen_funnel(443).await;
     match result {
         Err(TsnetError::Funnel(FunnelError::NotEnabled)) => {
-            eprintln!("e2e_funnel: NotEnabled (expected for API-only tailnet)");
+            log::debug!("e2e_funnel: NotEnabled (expected for API-only tailnet)");
         }
         Err(TsnetError::Funnel(FunnelError::HttpsNotEnabled)) => {
-            eprintln!("e2e_funnel: HttpsNotEnabled (HTTPS not enabled on this tailnet)");
+            log::debug!("e2e_funnel: HttpsNotEnabled (HTTPS not enabled on this tailnet)");
         }
         Err(TsnetError::Funnel(FunnelError::PortNotAllowed(_))) => {
             panic!("port 443 should be allowed; got PortNotAllowed");
         }
         Err(e) => {
-            eprintln!(
+            log::warn!(
                 "e2e_funnel: listen_funnel failed with non-funnel error ({e}) — funnel may not be the issue"
             );
         }
         Ok(listener) => {
-            eprintln!("e2e_funnel: funnel listener created (funnel is enabled on this tailnet)");
+            log::debug!("e2e_funnel: funnel listener created (funnel is enabled on this tailnet)");
             drop(listener);
         }
     }
@@ -2304,7 +2304,7 @@ async fn e2e_socks5_proxy() {
     .expect("listen_socks5 timed out")
     .expect("listen_socks5 failed");
     let proxy_addr = proxy.local_addr();
-    eprintln!("e2e_socks5: proxy listening on {proxy_addr}");
+    log::debug!("e2e_socks5: proxy listening on {proxy_addr}");
 
     // Accept B's side and run a simple echo loop in a spawned task.
     let echo_task = tokio::spawn(async move {
@@ -2500,12 +2500,13 @@ fn log_go_path(server: &Server, go_ip: std::net::Ipv4Addr, ctx: &str) {
     let st = server.status();
     let go_peer = st.peers.iter().find(|p| p.ips.contains(&IpAddr::V4(go_ip)));
     if let Some(p) = go_peer {
-        eprintln!(
+        log::debug!(
             "[interop:{ctx}] go peer path={:?} name={}",
-            p.path_class, p.name
+            p.path_class,
+            p.name
         );
     } else {
-        eprintln!(
+        log::debug!(
             "[interop:{ctx}] go peer NOT in netmap ({} peers)",
             st.peers.len()
         );
@@ -2542,7 +2543,7 @@ async fn echo_roundtrip(
 #[ignore = "requires TS_INTEROP_GO_IP (run via tools/interop.sh)"]
 async fn interop_rust_dials_go() {
     let Some(ienv) = interop_env() else {
-        eprintln!("interop_rust_dials_go: skipping (interop env not set)");
+        log::debug!("interop_rust_dials_go: skipping (interop env not set)");
         return;
     };
 
@@ -2556,7 +2557,7 @@ async fn interop_rust_dials_go() {
     let dial_addr = format!("{go_ip}:{}", ienv.echo_port);
     let mut stream = None;
     for attempt in 1..=3 {
-        eprintln!("interop_rust_dials_go: dial attempt {attempt} to {dial_addr}");
+        log::debug!("interop_rust_dials_go: dial attempt {attempt} to {dial_addr}");
         match tokio::time::timeout(std::time::Duration::from_secs(45), server.dial(&dial_addr))
             .await
         {
@@ -2564,8 +2565,8 @@ async fn interop_rust_dials_go() {
                 stream = Some(s);
                 break;
             }
-            Ok(Err(e)) => eprintln!("dial attempt {attempt} failed: {e}"),
-            Err(_) => eprintln!("dial attempt {attempt} timed out"),
+            Ok(Err(e)) => log::warn!("dial attempt {attempt} failed: {e}"),
+            Err(_) => log::debug!("dial attempt {attempt} timed out"),
         }
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
@@ -2588,7 +2589,7 @@ async fn interop_go_dials_rust() {
     use tokio::net::TcpStream;
 
     let Some(ienv) = interop_env() else {
-        eprintln!("interop_go_dials_rust: skipping (interop env not set)");
+        log::debug!("interop_go_dials_rust: skipping (interop env not set)");
         return;
     };
 
@@ -2642,7 +2643,7 @@ async fn interop_go_dials_rust() {
     // side may not have the rustscale peer in its netmap yet.
     let mut client = None;
     for attempt in 1..=5 {
-        eprintln!("interop_go_dials_rust: SOCKS5 connect attempt {attempt}");
+        log::debug!("interop_go_dials_rust: SOCKS5 connect attempt {attempt}");
         let conn = tokio::time::timeout(
             std::time::Duration::from_secs(10),
             TcpStream::connect(&ienv.socks),
@@ -2651,18 +2652,18 @@ async fn interop_go_dials_rust() {
         if let Ok(Ok(mut c)) = conn {
             // SOCKS5 greeting.
             if c.write_all(&[0x05, 0x01, 0x00]).await.is_err() {
-                eprintln!("interop_go_dials_rust: greeting write failed on attempt {attempt}");
+                log::warn!("interop_go_dials_rust: greeting write failed on attempt {attempt}");
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                 continue;
             }
             let mut greply = [0u8; 2];
             if c.read_exact(&mut greply).await.is_err() {
-                eprintln!("interop_go_dials_rust: greeting read failed on attempt {attempt}");
+                log::warn!("interop_go_dials_rust: greeting read failed on attempt {attempt}");
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                 continue;
             }
             if greply != [0x05, 0x00] {
-                eprintln!("interop_go_dials_rust: greeting rejected on attempt {attempt}");
+                log::debug!("interop_go_dials_rust: greeting rejected on attempt {attempt}");
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                 continue;
             }
@@ -2672,18 +2673,18 @@ async fn interop_go_dials_rust() {
             req.extend_from_slice(&ECHO_PORT.to_be_bytes());
             let mut c = c;
             if c.write_all(&req).await.is_err() {
-                eprintln!("interop_go_dials_rust: request write failed on attempt {attempt}");
+                log::warn!("interop_go_dials_rust: request write failed on attempt {attempt}");
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                 continue;
             }
             let mut hdr = [0u8; 4];
             if c.read_exact(&mut hdr).await.is_err() {
-                eprintln!("interop_go_dials_rust: reply read failed on attempt {attempt}");
+                log::warn!("interop_go_dials_rust: reply read failed on attempt {attempt}");
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                 continue;
             }
             if hdr[1] != 0x00 {
-                eprintln!(
+                log::warn!(
                     "interop_go_dials_rust: SOCKS5 connect failed reply={:#x} on attempt {attempt}",
                     hdr[1]
                 );
@@ -2693,14 +2694,14 @@ async fn interop_go_dials_rust() {
             // Drain bind address.
             let mut bind_rest = vec![0u8; 6];
             if c.read_exact(&mut bind_rest).await.is_err() {
-                eprintln!("interop_go_dials_rust: bind read failed on attempt {attempt}");
+                log::warn!("interop_go_dials_rust: bind read failed on attempt {attempt}");
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                 continue;
             }
             client = Some(c);
             break;
         }
-        eprintln!("interop_go_dials_rust: connect to SOCKS5 failed on attempt {attempt}");
+        log::warn!("interop_go_dials_rust: connect to SOCKS5 failed on attempt {attempt}");
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
     }
     let mut client = client.expect("all SOCKS5 connect attempts failed");
@@ -2723,7 +2724,7 @@ async fn interop_go_dials_rust() {
 #[ignore = "requires TS_INTEROP_GO_IP (run via tools/interop.sh)"]
 async fn interop_magicdns_name() {
     let Some(ienv) = interop_env() else {
-        eprintln!("interop_magicdns_name: skipping (interop env not set)");
+        log::debug!("interop_magicdns_name: skipping (interop env not set)");
         return;
     };
 
@@ -2735,10 +2736,10 @@ async fn interop_magicdns_name() {
 
     // Dial by MagicDNS FQDN:port — the resolver looks up the name in the netmap.
     let dial_addr = format!("{}:{}", ienv.go_name, ienv.echo_port);
-    eprintln!("interop_magicdns_name: dialing {dial_addr}");
+    log::debug!("interop_magicdns_name: dialing {dial_addr}");
     let mut stream = None;
     for attempt in 1..=3 {
-        eprintln!("dial attempt {attempt} to {dial_addr}");
+        log::debug!("dial attempt {attempt} to {dial_addr}");
         match tokio::time::timeout(std::time::Duration::from_secs(45), server.dial(&dial_addr))
             .await
         {
@@ -2746,8 +2747,8 @@ async fn interop_magicdns_name() {
                 stream = Some(s);
                 break;
             }
-            Ok(Err(e)) => eprintln!("dial attempt {attempt} failed: {e}"),
-            Err(_) => eprintln!("dial attempt {attempt} timed out"),
+            Ok(Err(e)) => log::warn!("dial attempt {attempt} failed: {e}"),
+            Err(_) => log::debug!("dial attempt {attempt} timed out"),
         }
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
@@ -2765,7 +2766,7 @@ async fn interop_magicdns_name() {
 #[ignore = "requires TS_INTEROP_GO_IP (run via tools/interop.sh)"]
 async fn interop_whois_go_peer() {
     let Some(ienv) = interop_env() else {
-        eprintln!("interop_whois_go_peer: skipping (interop env not set)");
+        log::debug!("interop_whois_go_peer: skipping (interop env not set)");
         return;
     };
 
@@ -2784,9 +2785,11 @@ async fn interop_whois_go_peer() {
     .expect("whois returned None (server up?)");
 
     assert!(info.found, "whois should find Go peer for {}", ienv.go_ip);
-    eprintln!(
+    log::debug!(
         "interop_whois_go_peer: node_name={} user_id={} login={}",
-        info.node_name, info.user_id, info.login_name
+        info.node_name,
+        info.user_id,
+        info.login_name
     );
     // The Go node's FQDN should contain its hostname prefix.
     let whois_name = info.node_name.trim_end_matches('.').to_lowercase();
@@ -2797,9 +2800,11 @@ async fn interop_whois_go_peer() {
     );
     // Tagged nodes typically have no user profile (user_id=0, empty login).
     // Just log it; the Go node was registered with tag:e2e.
-    eprintln!(
+    log::debug!(
         "interop_whois_go_peer: tag identity user_id={} login_name='{}' display='{}'",
-        info.user_id, info.login_name, info.display_name
+        info.user_id,
+        info.login_name,
+        info.display_name
     );
 
     server.close().await;
@@ -2813,7 +2818,7 @@ async fn interop_whois_go_peer() {
 #[ignore = "requires TS_INTEROP_GO_IP (run via tools/interop.sh)"]
 async fn interop_direct_path() {
     let Some(ienv) = interop_env() else {
-        eprintln!("interop_direct_path: skipping (interop env not set)");
+        log::debug!("interop_direct_path: skipping (interop env not set)");
         return;
     };
 
@@ -2847,7 +2852,7 @@ async fn interop_direct_path() {
     let mut settled = false;
     while std::time::Instant::now() < deadline {
         if let Some(class) = go_peer_path(&server, ienv.go_ip) {
-            eprintln!("[interop:direct_path] current path = {:?}", class);
+            log::debug!("[interop:direct_path] current path = {:?}", class);
             if class == PathClass::Direct {
                 settled = true;
                 break;
@@ -2874,7 +2879,7 @@ async fn interop_direct_path() {
         );
     }
 
-    eprintln!("interop_direct_path: SUCCESS — path settled to Direct");
+    log::debug!("interop_direct_path: SUCCESS — path settled to Direct");
     server.close().await;
 }
 
@@ -2884,7 +2889,7 @@ async fn interop_direct_path() {
 #[ignore = "requires TS_INTEROP_GO_IP (run via tools/interop.sh)"]
 async fn interop_derp_path() {
     let Some(ienv) = interop_env() else {
-        eprintln!("interop_derp_path: skipping (interop env not set)");
+        log::debug!("interop_derp_path: skipping (interop env not set)");
         return;
     };
 
@@ -2897,7 +2902,7 @@ async fn interop_derp_path() {
     let dial_addr = format!("{}:{}", ienv.go_ip, ienv.echo_port);
     let mut stream = None;
     for attempt in 1..=3 {
-        eprintln!("interop_derp_path: dial attempt {attempt} to {dial_addr}");
+        log::debug!("interop_derp_path: dial attempt {attempt} to {dial_addr}");
         if let Ok(Ok(s)) =
             tokio::time::timeout(std::time::Duration::from_secs(45), server.dial(&dial_addr)).await
         {
@@ -2912,7 +2917,7 @@ async fn interop_derp_path() {
 
     // Assert our path class is Derp (not Direct — disable_direct_paths is on).
     let class = go_peer_path(&server, ienv.go_ip);
-    eprintln!("interop_derp_path: path class = {:?}", class);
+    log::debug!("interop_derp_path: path class = {:?}", class);
     assert!(
         class != Some(PathClass::Direct),
         "path should NOT be Direct when disable_direct_paths is set"
@@ -2929,7 +2934,7 @@ async fn interop_derp_path() {
 #[ignore = "requires TS_INTEROP_GO_IP (run via tools/interop.sh)"]
 async fn interop_direct_after_derp() {
     let Some(ienv) = interop_env() else {
-        eprintln!("interop_direct_after_derp: skipping (interop env not set)");
+        log::debug!("interop_direct_after_derp: skipping (interop env not set)");
         return;
     };
 
@@ -2967,7 +2972,7 @@ async fn interop_direct_after_derp() {
                 .await
                 .is_err()
             {
-                eprintln!("[interop:upgrade] write timeout at seq {i}");
+                log::debug!("[interop:upgrade] write timeout at seq {i}");
                 break;
             }
             let mut got = vec![0u8; bytes.len()];
@@ -2981,7 +2986,7 @@ async fn interop_direct_after_derp() {
                     echo_ok_c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 _ => {
-                    eprintln!("[interop:upgrade] echo mismatch/timeout at seq {i}");
+                    log::debug!("[interop:upgrade] echo mismatch/timeout at seq {i}");
                     break;
                 }
             }
@@ -2995,7 +3000,7 @@ async fn interop_direct_after_derp() {
     let mut settled = false;
     while std::time::Instant::now() < deadline {
         if let Some(class) = go_peer_path(&server, ienv.go_ip) {
-            eprintln!("[interop:upgrade] current path = {:?}", class);
+            log::debug!("[interop:upgrade] current path = {:?}", class);
             if class == PathClass::Direct {
                 settled = true;
                 break;
@@ -3012,7 +3017,7 @@ async fn interop_direct_after_derp() {
     echo_task.abort();
 
     let ok_count = echo_ok.load(std::sync::atomic::Ordering::Relaxed);
-    eprintln!(
+    log::debug!(
         "interop_direct_after_derp: {ok_count} echo roundtrips completed, path settled={settled}"
     );
 
@@ -3047,13 +3052,13 @@ async fn interop_direct_after_derp() {
 #[ignore = "requires TS_INTEROP_GO_IP (run via tools/interop.sh)"]
 async fn interop_subnet_routes() {
     let Some(ienv) = interop_env() else {
-        eprintln!("interop_subnet_routes: skipping (interop env not set)");
+        log::debug!("interop_subnet_routes: skipping (interop env not set)");
         return;
     };
     let subnet = if let Some(s) = &ienv.go_subnet {
         s.clone()
     } else {
-        eprintln!("interop_subnet_routes: skipping (TS_INTEROP_GO_SUBNET not set)");
+        log::debug!("interop_subnet_routes: skipping (TS_INTEROP_GO_SUBNET not set)");
         return;
     };
 
@@ -3099,7 +3104,7 @@ async fn interop_subnet_routes() {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
     loop {
         if server.route_lookup(sample_ip).is_some() {
-            eprintln!("interop_subnet_routes: route for {sample_ip} resolved to Go peer");
+            log::debug!("interop_subnet_routes: route for {sample_ip} resolved to Go peer");
             // Verify the route is in the route table snapshot.
             let routes = server.routes();
             let has_subnet = routes.iter().any(|(cidr, _)| cidr == &subnet);
@@ -3107,7 +3112,7 @@ async fn interop_subnet_routes() {
                 has_subnet,
                 "route table should contain {subnet}, got: {routes:?}"
             );
-            eprintln!("interop_subnet_routes: SUCCESS — subnet {subnet} -> Go peer");
+            log::debug!("interop_subnet_routes: SUCCESS — subnet {subnet} -> Go peer");
             break;
         }
         if std::time::Instant::now() >= deadline {
@@ -3617,11 +3622,11 @@ fn have_root() -> bool {
 /// Require interop env + root, or skip.
 fn require_tun_interop(test_name: &str) -> Option<InteropEnv> {
     let Some(ienv) = interop_env() else {
-        eprintln!("{test_name}: skipping (interop env not set)");
+        log::debug!("{test_name}: skipping (interop env not set)");
         return None;
     };
     if !have_root() {
-        eprintln!("{test_name}: skipping (not root — TUN mode requires sudo)");
+        log::debug!("{test_name}: skipping (not root — TUN mode requires sudo)");
         return None;
     }
     Some(ienv)
@@ -3640,7 +3645,7 @@ async fn up_tun_or_skip(server: &mut Server, test_name: &str) -> Option<()> {
     {
         Ok(_) => Some(()),
         Err(e) => {
-            eprintln!("{test_name}: skipping — up_tun failed: {e}");
+            log::warn!("{test_name}: skipping — up_tun failed: {e}");
             None
         }
     }
@@ -3674,7 +3679,7 @@ async fn interop_tun_rust_dials_go() {
     }
 
     let status = server.status();
-    eprintln!(
+    log::debug!(
         "interop_tun_rust_dials_go: up, tailscale_ips={:?}",
         status.tailscale_ips
     );
@@ -3686,7 +3691,7 @@ async fn interop_tun_rust_dials_go() {
     // OS socket connect to the Go node's tailnet IP:echo_port.
     // The kernel routes 100.64.0.0/10 through the TUN device.
     let dial_addr = format!("{}:{}", ienv.go_ip, ienv.echo_port);
-    eprintln!("interop_tun_rust_dials_go: OS connect to {dial_addr}");
+    log::debug!("interop_tun_rust_dials_go: OS connect to {dial_addr}");
 
     let mut stream = None;
     for _ in 1..=5 {
@@ -3700,8 +3705,8 @@ async fn interop_tun_rust_dials_go() {
                 stream = Some(s);
                 break;
             }
-            Ok(Err(e)) => eprintln!("connect failed: {e}"),
-            Err(_) => eprintln!("connect timed out (15s)"),
+            Ok(Err(e)) => log::warn!("connect failed: {e}"),
+            Err(_) => log::debug!("connect timed out (15s)"),
         }
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
@@ -3761,7 +3766,7 @@ async fn interop_tun_go_dials_rust() {
             _ => None,
         })
         .expect("rust should have an IPv4");
-    eprintln!("interop_tun_go_dials_rust: up, rust_ip={rust_ip}");
+    log::debug!("interop_tun_go_dials_rust: up, rust_ip={rust_ip}");
 
     // OS listener on the tailnet IP (the kernel routes inbound TUN traffic
     // to this socket).
@@ -3773,7 +3778,7 @@ async fn interop_tun_go_dials_rust() {
     .await
     .expect("bind timed out")
     .expect("bind failed");
-    eprintln!("interop_tun_go_dials_rust: OS listener on {rust_ip}:{ECHO_PORT}");
+    log::debug!("interop_tun_go_dials_rust: OS listener on {rust_ip}:{ECHO_PORT}");
 
     // Wait for the Go peer.
     wait_for_peer(&server, IpAddr::V4(ienv.go_ip), "interop_tun_go_dials_rust").await;
@@ -3786,7 +3791,7 @@ async fn interop_tun_go_dials_rust() {
                 .await
                 .expect("accept timed out")
                 .expect("accept failed");
-        eprintln!("interop_tun_go_dials_rust: accepted from {peer}");
+        log::debug!("interop_tun_go_dials_rust: accepted from {peer}");
         let mut buf = [0u8; 256];
         loop {
             match sock.read(&mut buf).await {
@@ -3887,7 +3892,7 @@ async fn interop_tun_os_routes() {
             has_tailnet || has_tailnet_linux,
             "OS routing table should contain 100.64.0.0/10 route via TUN\n{table}"
         );
-        eprintln!("interop_tun_os_routes: OS route for 100.64.0.0/10 verified");
+        log::debug!("interop_tun_os_routes: OS route for 100.64.0.0/10 verified");
     }
 
     log_go_path(&server, ienv.go_ip, "tun_os_routes");
@@ -3905,7 +3910,7 @@ async fn interop_tun_subnet_forward() {
         return;
     };
     let Some(subnet) = ienv.go_subnet.clone() else {
-        eprintln!("interop_tun_subnet_forward: skipping (TS_INTEROP_GO_SUBNET not set)");
+        log::debug!("interop_tun_subnet_forward: skipping (TS_INTEROP_GO_SUBNET not set)");
         return;
     };
 
@@ -3941,7 +3946,7 @@ async fn interop_tun_subnet_forward() {
             let routes = server.routes();
             let has_subnet = routes.iter().any(|(cidr, _)| cidr == &subnet);
             assert!(has_subnet, "route table should contain {subnet}");
-            eprintln!("interop_tun_subnet_forward: in-process route {subnet} verified");
+            log::debug!("interop_tun_subnet_forward: in-process route {subnet} verified");
 
             // Also check the OS routing table.
             if cfg!(target_os = "macos") {
@@ -3952,9 +3957,9 @@ async fn interop_tun_subnet_forward() {
                     let table = String::from_utf8_lossy(&out.stdout);
                     let net = subnet.split('/').next().unwrap_or("");
                     if table.contains(net) {
-                        eprintln!("interop_tun_subnet_forward: OS route for {subnet} verified");
+                        log::debug!("interop_tun_subnet_forward: OS route for {subnet} verified");
                     } else {
-                        eprintln!(
+                        log::warn!(
                             "interop_tun_subnet_forward: WARN — OS route for {subnet} not found in netstat (may be installed lazily)"
                         );
                     }
@@ -3966,9 +3971,9 @@ async fn interop_tun_subnet_forward() {
                 let table = String::from_utf8_lossy(&out.stdout);
                 let net = subnet.split('/').next().unwrap_or("");
                 if table.contains(net) {
-                    eprintln!("interop_tun_subnet_forward: OS route for {subnet} verified");
+                    log::debug!("interop_tun_subnet_forward: OS route for {subnet} verified");
                 } else {
-                    eprintln!(
+                    log::warn!(
                         "interop_tun_subnet_forward: WARN — OS route for {subnet} not found (may be installed lazily)"
                     );
                 }

@@ -85,6 +85,9 @@ pub struct Prefs {
     pub RunSSH: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub NoStatefulFiltering: bool,
+    /// Opt out of cloud log upload and remote support diagnostics.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub NoLogsNoSupport: bool,
 }
 
 impl Prefs {
@@ -175,6 +178,8 @@ pub struct MaskedPrefs {
     pub RunSSHSet: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub NoStatefulFilteringSet: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub NoLogsNoSupportSet: bool,
 }
 
 impl MaskedPrefs {
@@ -255,6 +260,9 @@ impl MaskedPrefs {
         if self.NoStatefulFilteringSet {
             target.NoStatefulFiltering = self.Prefs.NoStatefulFiltering;
         }
+        if self.NoLogsNoSupportSet {
+            target.NoLogsNoSupport = self.Prefs.NoLogsNoSupport;
+        }
     }
 
     /// Returns `true` if no fields are set (no `*Set` bool is `true`).
@@ -282,7 +290,8 @@ impl MaskedPrefs {
             || self.AppConnectorSet
             || self.RunWebClientSet
             || self.RunSSHSet
-            || self.NoStatefulFilteringSet)
+            || self.NoStatefulFilteringSet
+            || self.NoLogsNoSupportSet)
     }
 }
 

@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use rustscale_conffile::Config;
+use rustscale_logpolicy::{Policy, DEFAULT_COLLECTION};
+use rustscale_logtail::{LogTail, LogtailLogger};
 use rustscale_tsnet::localapi::DaemonCommand;
 use rustscale_tsnet::{Server, TunModeConfig};
 
@@ -21,6 +23,7 @@ pub async fn run(
     http_proxy_server: Option<String>,
     config_path: Option<PathBuf>,
     cleanup: bool,
+    no_logs_no_support: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let auth_key = std::env::var("TS_AUTHKEY").ok();
     let state_dir = statedir.unwrap_or_else(|| PathBuf::from(DEFAULT_STATE_DIR));
@@ -28,7 +31,7 @@ pub async fn run(
 
     // --cleanup: remove old state files and exit.
     if cleanup {
-        eprintln!("rustscaled: cleaning up state in {}", state_dir.display());
+        log::info!("rustscaled: cleaning up state in {}", state_dir.display());
         cleanup_state(&state_dir)?;
         return Ok(());
     }
@@ -36,24 +39,24 @@ pub async fn run(
     // --socks5-server: not yet wired into the daemon bootstrap.
     // TODO: spawn SOCKS5 listener via tsnet::socks5 when the server is up.
     if let Some(ref addr) = socks5_server {
-        eprintln!("rustscaled: --socks5-server {addr} (TODO: not yet wired)");
+        log::debug!("rustscaled: --socks5-server {addr} (TODO: not yet wired)");
     }
 
     // --http-proxy-server: set as environment variable for outbound proxies.
     // TODO: wire into magicsock/controlclient HTTP clients directly.
     if let Some(ref addr) = http_proxy_server {
-        eprintln!("rustscaled: --http-proxy-server {addr} (TODO: not yet wired)");
+        log::debug!("rustscaled: --http-proxy-server {addr} (TODO: not yet wired)");
     }
 
     // Load declarative config file if --config was provided.
     let config = if let Some(ref cp) = config_path {
         match Config::load(cp.to_str().unwrap_or("")) {
             Ok(c) => {
-                eprintln!("rustscaled: config loaded from {}", cp.display());
+                log::info!("rustscaled: config loaded from {}", cp.display());
                 Some(c)
             }
             Err(e) => {
-                eprintln!("rustscaled: config load failed: {e}");
+                log::warn!("rustscaled: config load failed: {e}");
                 return Err(e.into());
             }
         }
@@ -69,7 +72,30 @@ pub async fn run(
     // Resolve auth key: TS_AUTHKEY env, then config file.
     let auth_key = auth_key.or_else(|| config.as_ref().and_then(|c| c.parsed.AuthKey.clone()));
 
-    if let Some(key) = auth_key {
+    // Apply config preferences before constructing log policy so a persisted
+    // NoLogsNoSupport preference takes effect from the first upload task.
+    if let Some(ref cfg) = config {
+        apply_config_prefs_to_disk(cfg, &state_dir)?;
+    }
+
+    // Go creates logpolicy before its local backend. Keep that order here so
+    // the private ID used by upload is the same persisted ID tsnet exposes as
+    // Hostinfo.BackendLogID.
+    let policy = Policy::new(DEFAULT_COLLECTION, &state_dir)?;
+    let prefs = rustscale_ipn::Prefs::load(&state_dir).unwrap_or_default();
+    policy.set_enabled(!no_logs_no_support && !prefs.NoLogsNoSupport);
+    let logtail = policy.logtail().clone();
+    if log::set_boxed_logger(Box::new(LogtailLogger::new(
+        logtail.clone(),
+        log::LevelFilter::Info,
+    )))
+    .is_ok()
+    {
+        log::set_max_level(log::LevelFilter::Info);
+    }
+    let upload = policy.start_upload();
+
+    let result = if let Some(key) = auth_key {
         run_with_auth_key(
             &key,
             &state_dir,
@@ -79,6 +105,7 @@ pub async fn run(
             port,
             config_path,
             config,
+            logtail,
         )
         .await
     } else {
@@ -90,9 +117,16 @@ pub async fn run(
             port,
             config_path,
             config,
+            logtail,
         )
         .await
-    }
+    };
+
+    // Logtail is deliberately shut down after the server so final daemon
+    // shutdown messages can still be flushed.
+    policy.logtail().flush();
+    upload.shutdown().await;
+    result
 }
 
 async fn run_with_auth_key(
@@ -104,12 +138,14 @@ async fn run_with_auth_key(
     port: Option<u16>,
     config_path: Option<PathBuf>,
     config: Option<Config>,
+    logtail: LogTail,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut builder = Server::builder()
         .hostname(hostname)
         .auth_key(auth_key)
         .state_dir(state_dir)
-        .localapi_path(socket_path);
+        .localapi_path(socket_path)
+        .logtail(logtail);
 
     // Apply config-file fields to the builder.
     if let Some(ref cfg) = config {
@@ -132,11 +168,6 @@ async fn run_with_auth_key(
         builder = builder.port(p);
     }
 
-    // Apply config prefs to the on-disk prefs so up() picks them up.
-    if let Some(ref cfg) = config {
-        apply_config_prefs_to_disk(cfg, state_dir)?;
-    }
-
     let mut server = builder.build()?;
 
     if tun {
@@ -145,10 +176,10 @@ async fn run_with_auth_key(
             ..Default::default()
         };
         Box::pin(server.up_tun(config)).await?;
-        eprintln!("rustscaled: TUN mode up (hostname={hostname})");
+        log::info!("rustscaled: TUN mode up (hostname={hostname})");
     } else {
         Box::pin(server.up()).await?;
-        eprintln!("rustscaled: up (hostname={hostname})");
+        log::info!("rustscaled: up (hostname={hostname})");
     }
 
     print_status(&server, socket_path);
@@ -165,13 +196,13 @@ async fn run_with_auth_key(
                 std::future::pending::<()>().await;
             }
         } => {
-            eprintln!("rustscaled: logout requested");
+            log::info!("rustscaled: logout requested");
             server.logout().await?;
-            eprintln!("rustscaled: logged out, state cleared → NeedsLogin");
+            log::info!("rustscaled: logged out, state cleared → NeedsLogin");
         }
     }
 
-    eprintln!("rustscaled: shutting down...");
+    log::info!("rustscaled: shutting down...");
     server.close().await;
     Ok(())
 }
@@ -184,11 +215,13 @@ async fn run_interactive(
     port: Option<u16>,
     config_path: Option<PathBuf>,
     config: Option<Config>,
+    logtail: LogTail,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut builder = Server::builder()
         .hostname(hostname)
         .state_dir(state_dir)
-        .localapi_path(socket_path);
+        .localapi_path(socket_path)
+        .logtail(logtail);
 
     // Apply config-file fields to the builder.
     if let Some(ref cfg) = config {
@@ -211,15 +244,10 @@ async fn run_interactive(
         builder = builder.port(p);
     }
 
-    // Apply config prefs to the on-disk prefs so up() picks them up.
-    if let Some(ref cfg) = config {
-        apply_config_prefs_to_disk(cfg, state_dir)?;
-    }
-
     let mut server = builder.build()?;
 
     let mut command_rx = server.start_localapi_only().await?;
-    eprintln!("rustscaled: waiting for login (no TS_AUTHKEY set; use 'rustscale up' or 'rustscale login')");
+    log::info!("rustscaled: waiting for login (no TS_AUTHKEY set; use 'rustscale up' or 'rustscale login')");
 
     // Phase 1: wait for Start/LoginInteractive to bring the server up.
     let mut is_up = false;
@@ -235,10 +263,10 @@ async fn run_interactive(
                         ..Default::default()
                     };
                     Box::pin(server.up_tun(config)).await?;
-                    eprintln!("rustscaled: TUN mode up (hostname={hostname})");
+                    log::info!("rustscaled: TUN mode up (hostname={hostname})");
                 } else {
                     Box::pin(server.up()).await?;
-                    eprintln!("rustscaled: up (hostname={hostname})");
+                    log::info!("rustscaled: up (hostname={hostname})");
                 }
                 print_status(&server, socket_path);
                 is_up = true;
@@ -251,31 +279,31 @@ async fn run_interactive(
                         ..Default::default()
                     };
                     Box::pin(server.up_tun(config)).await?;
-                    eprintln!("rustscaled: TUN mode up (hostname={hostname})");
+                    log::info!("rustscaled: TUN mode up (hostname={hostname})");
                 } else {
                     Box::pin(server.up()).await?;
-                    eprintln!("rustscaled: up (hostname={hostname})");
+                    log::info!("rustscaled: up (hostname={hostname})");
                 }
                 print_status(&server, socket_path);
                 is_up = true;
                 break;
             }
             DaemonCommand::Logout => {
-                eprintln!("rustscaled: logout requested (server not up yet)");
+                log::info!("rustscaled: logout requested (server not up yet)");
             }
             DaemonCommand::Shutdown => {
-                eprintln!("rustscaled: shutdown requested (server not up yet)");
+                log::debug!("rustscaled: shutdown requested (server not up yet)");
                 return Ok(());
             }
             DaemonCommand::ReloadConfig => {
-                eprintln!("rustscaled: reload-config requested (server not up yet)");
+                log::debug!("rustscaled: reload-config requested (server not up yet)");
             }
             DaemonCommand::SwitchProfile(id) => {
-                eprintln!("rustscaled: switching to profile {id}");
+                log::info!("rustscaled: switching to profile {id}");
                 if let Err(e) = server.switch_profile(&id).await {
-                    eprintln!("rustscaled: profile switch failed: {e}");
+                    log::warn!("rustscaled: profile switch failed: {e}");
                 } else {
-                    eprintln!("rustscaled: up (hostname={hostname})");
+                    log::info!("rustscaled: up (hostname={hostname})");
                     print_status(&server, socket_path);
                     is_up = true;
                     break;
@@ -304,29 +332,29 @@ async fn run_interactive(
                     std::future::pending::<()>().await;
                 }
             } => {
-                eprintln!("rustscaled: logout requested");
+                log::info!("rustscaled: logout requested");
                 server.logout().await?;
-                eprintln!("rustscaled: logged out, state cleared → NeedsLogin");
+                log::info!("rustscaled: logged out, state cleared → NeedsLogin");
                 break;
             }
             Some(cmd) = command_rx.recv() => {
                 match cmd {
                     DaemonCommand::Shutdown => {
-                        eprintln!("rustscaled: shutdown requested via LocalAPI");
+                        log::debug!("rustscaled: shutdown requested via LocalAPI");
                         break;
                     }
                     DaemonCommand::ReloadConfig => {
                         if let Some(ref cp) = config_path {
-                            eprintln!("rustscaled: reload-config via LocalAPI from {}", cp.display());
+                            log::debug!("rustscaled: reload-config via LocalAPI from {}", cp.display());
                             if let Err(e) = server.reload_config(cp.to_str().unwrap_or("")).await {
-                                eprintln!("rustscaled: config reload failed: {e}");
+                                log::warn!("rustscaled: config reload failed: {e}");
                             }
                         }
                     }
                     DaemonCommand::SwitchProfile(id) => {
-                        eprintln!("rustscaled: switching to profile {id}");
+                        log::info!("rustscaled: switching to profile {id}");
                         if let Err(e) = server.switch_profile(&id).await {
-                            eprintln!("rustscaled: profile switch failed: {e}");
+                            log::warn!("rustscaled: profile switch failed: {e}");
                         }
                     }
                     _ => {}
@@ -335,7 +363,7 @@ async fn run_interactive(
         }
     }
 
-    eprintln!("rustscaled: shutting down...");
+    log::info!("rustscaled: shutting down...");
     server.close().await;
     Ok(())
 }
@@ -367,10 +395,10 @@ fn print_status(server: &Server, socket_path: &Path) {
         .map(std::string::ToString::to_string)
         .collect();
     if !ips.is_empty() {
-        eprintln!("rustscaled: tailscale IPs: {}", ips.join(", "));
+        log::debug!("rustscaled: tailscale IPs: {}", ips.join(", "));
     }
     if server.localapi_path().is_some() {
-        eprintln!(
+        log::info!(
             "rustscaled: LocalAPI listening at {}",
             socket_path.display()
         );
@@ -384,7 +412,7 @@ fn cleanup_state(state_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let socket = state_dir.join("rustscaled.sock");
     if socket.exists() {
         std::fs::remove_file(&socket)?;
-        eprintln!("rustscaled: removed {}", socket.display());
+        log::debug!("rustscaled: removed {}", socket.display());
     }
 
     // Remove the primary socket path if it exists.
@@ -393,11 +421,11 @@ fn cleanup_state(state_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
         let primary = rustscale_safesocket::default_socket_path();
         if primary.exists() {
             let _ = std::fs::remove_file(&primary);
-            eprintln!("rustscaled: removed {}", primary.display());
+            log::debug!("rustscaled: removed {}", primary.display());
         }
     }
 
-    eprintln!("rustscaled: cleanup complete");
+    log::info!("rustscaled: cleanup complete");
     Ok(())
 }
 
@@ -453,14 +481,14 @@ async fn wait_for_shutdown(config_path: Option<&PathBuf>) {
             _ = sigterm.recv() => break,
             _ = sighup.recv() => {
                 if let Some(cp) = config_path {
-                    eprintln!("rustscaled: SIGHUP received, reloading config from {}", cp.display());
+                    log::info!("rustscaled: SIGHUP received, reloading config from {}", cp.display());
                     // The server reference is not available here; the reload
                     // is handled via the LocalAPI POST /reload-config endpoint.
                     // In practice, the daemon's caller can wire a reload
                     // callback. For now, log and continue.
-                    eprintln!("rustscaled: use 'POST /localapi/v0/reload-config' for live reload");
+                    log::debug!("rustscaled: use 'POST /localapi/v0/reload-config' for live reload");
                 } else {
-                    eprintln!("rustscaled: SIGHUP received (no config file set, ignoring)");
+                    log::info!("rustscaled: SIGHUP received (no config file set, ignoring)");
                 }
             }
         }

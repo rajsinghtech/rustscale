@@ -12,9 +12,10 @@ workspace = true
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
-log = "0.4"
+log.workspace = true
 chrono.workspace = true
 rand.workspace = true
 tokio = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 zstd = "0.13"
+rustscale-envknob = { path = "../envknob", version = "0.1.0" }

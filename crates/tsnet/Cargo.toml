@@ -80,6 +80,7 @@ rustscale-portlist = { path = "../portlist", version = "0.1.0" }
 rustscale-clientupdate = { path = "../clientupdate", version = "0.1.0" }
 rustscale-envknob = { path = "../envknob", version = "0.1.0" }
 rustscale-logid = { path = "../logid", version = "0.1.0" }
+rustscale-logtail = { path = "../logtail", version = "0.1.0" }
 rustscale-netns.workspace = true
 rustscale-tsdial = { path = "../tsdial" }
 serde.workspace = true
@@ -100,6 +101,7 @@ webpki-roots.workspace = true
 async-trait.workspace = true
 rand_core.workspace = true
 libc.workspace = true
+log.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true

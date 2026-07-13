@@ -18,5 +18,8 @@ rustscale-tsnet = { path = "../tsnet", version = "0.1.0" }
 rustscale-safesocket = { path = "../safesocket", version = "0.1.0" }
 rustscale-conffile = { path = "../conffile", version = "0.1.0" }
 rustscale-ipn = { path = "../ipn", version = "0.1.0" }
+rustscale-logpolicy = { path = "../logpolicy", version = "0.1.0" }
+rustscale-logtail = { path = "../logtail", version = "0.1.0" }
 tokio.workspace = true
 thiserror.workspace = true
+log.workspace = true

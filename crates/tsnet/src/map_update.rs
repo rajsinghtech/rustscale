@@ -108,7 +108,7 @@ pub(crate) fn spawn_map_update_task(
                     key_expired.store(expired, std::sync::atomic::Ordering::Relaxed);
                     ipn_backend.set_key_expired(expired);
                     if expired {
-                        eprintln!("tsnet: node key expired (signalled by control)");
+                        log::info!("tsnet: node key expired (signalled by control)");
                         if let Some(ref dir) = state_dir {
                             PersistedState::clear_netmap(dir);
                         }
@@ -171,12 +171,12 @@ pub(crate) fn spawn_map_update_task(
                                             .await;
                                     });
                                     map_rx = new_rx;
-                                    eprintln!(
+                                    log::info!(
                                         "tsnet: key rotation complete, map poll restarted with new node key"
                                     );
                                 }
                                 Err(e) => {
-                                    eprintln!("tsnet: key rotation failed: {e}");
+                                    log::warn!("tsnet: key rotation failed: {e}");
                                     ipn_backend
                                         .emit_err_message(format!("key rotation failed: {e}"));
                                 }
@@ -427,7 +427,7 @@ pub(crate) fn spawn_map_update_task(
                     // since the last successful save.
                     if let Some(ref cache) = netmap_cache {
                         if let Err(e) = cache.save_if_changed(&node_pub, &resp) {
-                            eprintln!("tsnet: netmap cache save failed (non-fatal): {e}");
+                            log::warn!("tsnet: netmap cache save failed (non-fatal): {e}");
                         }
                     }
                 }
@@ -523,7 +523,7 @@ async fn perform_key_rotation(
         }
 
         if resp.NodeKeyExpired {
-            eprintln!(
+            log::info!(
                 "tsnet: key rotation attempt {attempt}: server says NodeKeyExpired, regenerating"
             );
             old_node_key = new_pub;
@@ -534,7 +534,7 @@ async fn perform_key_rotation(
         // If interactive auth is required, emit BrowseToURL and block on
         // the followup poll until the user completes auth.
         if !resp.AuthURL.is_empty() {
-            eprintln!(
+            log::info!(
                 "tsnet: key rotation requires interactive auth: {}",
                 resp.AuthURL
             );
@@ -574,7 +574,7 @@ async fn perform_key_rotation(
                 ));
             }
             if followup_resp.NodeKeyExpired {
-                eprintln!("tsnet: followup returned NodeKeyExpired, regenerating");
+                log::info!("tsnet: followup returned NodeKeyExpired, regenerating");
                 old_node_key = new_pub;
                 trying_key = NodePrivate::generate();
                 continue;
@@ -589,7 +589,7 @@ async fn perform_key_rotation(
                 state.old_node_key = Some(old_key.clone());
                 state.node_key = trying_key.clone();
                 if let Err(e) = state.save(&path) {
-                    eprintln!("tsnet: failed to save rotated key state: {e}");
+                    log::warn!("tsnet: failed to save rotated key state: {e}");
                 }
             }
         }
@@ -601,7 +601,7 @@ async fn perform_key_rotation(
         // key and must be recreated with the new one.
         wg_tunnels.write().await.clear();
 
-        eprintln!(
+        log::info!(
             "tsnet: key rotation succeeded (old={}, new={})",
             old_pub,
             trying_key.public()

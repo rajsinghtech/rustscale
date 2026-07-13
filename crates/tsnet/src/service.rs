@@ -31,18 +31,21 @@
 //!
 //! - Only IPv4 VIPs are supported (smoltcp is configured for `proto-ipv4`
 //!   only). IPv6 VIPs are skipped with a warning.
-//! - TLS termination is not implemented for service listeners.
 
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use rustscale_netstack::{Listener, NetstackError, NetstackStream};
 use rustscale_tailcfg::{service_vip_addrs, ServiceName};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
+use tokio_rustls::server::TlsStream as RustlsTlsStream;
+use tokio_rustls::TlsAcceptor;
 
 use crate::proxyproto;
+use crate::tls::CertProvider;
 
 /// Configuration for a [`ServiceListener`].
 ///
@@ -167,6 +170,8 @@ pub struct ServiceListener {
     http_mode: bool,
     /// Whether this listener is in HTTPS mode (TLS-terminated HTTP).
     https_mode: bool,
+    /// TLS acceptor used when `https_mode` is true.
+    tls_acceptor: Option<Arc<TlsAcceptor>>,
     /// The service name (for diagnostics).
     svc_name: ServiceName,
     /// The port being listened on.
@@ -185,6 +190,15 @@ impl ServiceListener {
             .recv()
             .await
             .ok_or(NetstackError::ShuttingDown)??;
+
+        if let Some(ref acceptor) = self.tls_acceptor {
+            let tls = acceptor
+                .accept(stream)
+                .await
+                .map_err(|e| NetstackError::Tls(e.to_string()))?;
+            return Ok(self.wrap_tls_stream(tls, vip_addr));
+        }
+
         Ok(self.wrap_stream(stream, vip_addr))
     }
 
@@ -204,6 +218,25 @@ impl ServiceListener {
             prefix: header,
             prefix_pos: 0,
             inner: stream,
+        }
+    }
+
+    /// Wrap a TLS-decrypted stream with a PROXY protocol v2 header if enabled.
+    fn wrap_tls_stream(
+        &self,
+        tls: RustlsTlsStream<NetstackStream>,
+        _vip_addr: IpAddr,
+    ) -> ServiceStream {
+        if !self.proxy_protocol {
+            return ServiceStream::Tls(tls);
+        }
+
+        let header = proxyproto::proxy_v2_local_header();
+
+        ServiceStream::TlsWithProxy {
+            prefix: header,
+            prefix_pos: 0,
+            inner: tls,
         }
     }
 
@@ -242,6 +275,17 @@ pub enum ServiceStream {
         /// The underlying netstack stream.
         inner: NetstackStream,
     },
+    /// TLS-terminated stream (no PROXY protocol).
+    Tls(RustlsTlsStream<NetstackStream>),
+    /// TLS-terminated stream with a PROXY protocol v2 header prepended.
+    TlsWithProxy {
+        /// The PROXY v2 header bytes, drained before the inner stream.
+        prefix: Vec<u8>,
+        /// Current read position in `prefix`.
+        prefix_pos: usize,
+        /// The underlying TLS stream.
+        inner: RustlsTlsStream<NetstackStream>,
+    },
 }
 
 impl ServiceStream {
@@ -250,6 +294,7 @@ impl ServiceStream {
         match self {
             Self::Plain(s) => s.peer_addr(),
             Self::WithProxy { inner, .. } => inner.peer_addr(),
+            Self::Tls(_) | Self::TlsWithProxy { .. } => None,
         }
     }
 }
@@ -267,7 +312,6 @@ impl AsyncRead for ServiceStream {
                 prefix_pos,
                 inner,
             } => {
-                // Drain the PROXY header first.
                 if *prefix_pos < prefix.len() {
                     let remaining = &prefix[*prefix_pos..];
                     let n = remaining.len().min(buf.remaining());
@@ -275,7 +319,21 @@ impl AsyncRead for ServiceStream {
                     *prefix_pos += n;
                     return Poll::Ready(Ok(()));
                 }
-                // Header fully drained — delegate to the inner stream.
+                Pin::new(inner).poll_read(cx, buf)
+            }
+            Self::Tls(s) => Pin::new(s).poll_read(cx, buf),
+            Self::TlsWithProxy {
+                prefix,
+                prefix_pos,
+                inner,
+            } => {
+                if *prefix_pos < prefix.len() {
+                    let remaining = &prefix[*prefix_pos..];
+                    let n = remaining.len().min(buf.remaining());
+                    buf.put_slice(&remaining[..n]);
+                    *prefix_pos += n;
+                    return Poll::Ready(Ok(()));
+                }
                 Pin::new(inner).poll_read(cx, buf)
             }
         }
@@ -291,6 +349,8 @@ impl AsyncWrite for ServiceStream {
         match &mut *self {
             Self::Plain(s) => Pin::new(s).poll_write(cx, buf),
             Self::WithProxy { inner, .. } => Pin::new(inner).poll_write(cx, buf),
+            Self::Tls(s) => Pin::new(s).poll_write(cx, buf),
+            Self::TlsWithProxy { inner, .. } => Pin::new(inner).poll_write(cx, buf),
         }
     }
 
@@ -298,6 +358,8 @@ impl AsyncWrite for ServiceStream {
         match &mut *self {
             Self::Plain(s) => Pin::new(s).poll_flush(cx),
             Self::WithProxy { inner, .. } => Pin::new(inner).poll_flush(cx),
+            Self::Tls(s) => Pin::new(s).poll_flush(cx),
+            Self::TlsWithProxy { inner, .. } => Pin::new(inner).poll_flush(cx),
         }
     }
 
@@ -305,6 +367,8 @@ impl AsyncWrite for ServiceStream {
         match &mut *self {
             Self::Plain(s) => Pin::new(s).poll_shutdown(cx),
             Self::WithProxy { inner, .. } => Pin::new(inner).poll_shutdown(cx),
+            Self::Tls(s) => Pin::new(s).poll_shutdown(cx),
+            Self::TlsWithProxy { inner, .. } => Pin::new(inner).poll_shutdown(cx),
         }
     }
 }
@@ -320,6 +384,8 @@ pub enum ServiceError {
     NoV4VipAddrs(String),
     #[error("netstack error: {0}")]
     Netstack(#[from] NetstackError),
+    #[error("service error: {0}")]
+    Other(String),
 }
 
 /// Resolve the VIP addresses for a service from the current netmap and create
@@ -338,6 +404,7 @@ pub(crate) async fn create_service_listener(
     magicdns_suffix: &str,
     svc_name: &str,
     mode: ServiceMode,
+    cert_provider: Option<Arc<dyn CertProvider>>,
 ) -> Result<ServiceListener, ServiceError> {
     // 1. Validate the service name.
     let svc =
@@ -404,6 +471,21 @@ pub(crate) async fn create_service_listener(
     // 6. Compute the FQDN.
     let fqdn = format!("{}.{}", svc.without_prefix(), magicdns_suffix);
 
+    // 7. Build the TLS acceptor when HTTPS mode is requested.
+    let tls_acceptor = if mode.is_https() {
+        let provider = cert_provider
+            .ok_or_else(|| ServiceError::Other("HTTPS mode requires a cert provider".into()))?;
+        let cert_chain = provider.cert_chain();
+        let key = provider.private_key();
+        let server_config = rustls::server::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(cert_chain, key)
+            .map_err(|e| ServiceError::Other(format!("TLS config: {e}")))?;
+        Some(Arc::new(TlsAcceptor::from(Arc::new(server_config))))
+    } else {
+        None
+    };
+
     eprintln!(
         "tsnet: service listener for {svc} on v4 VIPs {:?} port {} (FQDN: {fqdn})",
         v4_addrs,
@@ -416,6 +498,7 @@ pub(crate) async fn create_service_listener(
         proxy_protocol: mode.proxy_protocol(),
         http_mode: mode.is_http(),
         https_mode: mode.is_https(),
+        tls_acceptor,
         svc_name: svc,
         port: mode.port(),
     })
@@ -469,6 +552,7 @@ mod tests {
             proxy_protocol: false,
             http_mode: false,
             https_mode: false,
+            tls_acceptor: None,
             svc_name: ServiceName::new_unchecked("svc:test"),
             port: 8080,
         };
@@ -486,5 +570,8 @@ mod tests {
 
         let e = ServiceError::NoV4VipAddrs("svc:web".into());
         assert!(e.to_string().contains("IPv4"));
+
+        let e = ServiceError::Other("bad config".into());
+        assert!(e.to_string().contains("bad config"));
     }
 }

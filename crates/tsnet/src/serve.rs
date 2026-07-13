@@ -76,8 +76,8 @@ pub struct ServeConfig {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub Web: BTreeMap<HostPort, WebServerConfig>,
     /// Per-service configs keyed by service name (`svc:dns-label`).
-    /// Mirrors Go's `ServeConfig.Services`. Not yet fully wired — present
-    /// for config compatibility and future VIP-service serve dispatch.
+    /// Mirrors Go's `ServeConfig.Services`. Wired for TCP forwarding
+    /// (TCPForward/TerminateTLS) via the service VIP listener path.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub Services: BTreeMap<String, ServiceConfig>,
     /// Set of `"fqdn:port"` values for which funnel (public internet) traffic
@@ -93,7 +93,6 @@ pub struct ServeConfig {
 }
 
 /// Per-service serve configuration. Mirrors Go's `ipn.ServiceConfig`.
-/// Not yet fully wired — present for config compatibility.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ServiceConfig {
     /// TCP port handlers for this service.
@@ -346,6 +345,7 @@ pub(crate) struct ServeRunner {
     user_profiles: Arc<RwLock<BTreeMap<UserID, UserProfile>>>,
     our_fqdn: String,
     netstack: Arc<Netstack>,
+    self_cap_map: std::sync::Arc<std::sync::RwLock<NodeCapMap>>,
     /// The active generation's cancel token. Replaced on each `set_config`.
     cancel: std::sync::Mutex<Arc<CancelToken>>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
@@ -380,6 +380,7 @@ impl ServeRunner {
         peers: Arc<RwLock<Vec<Node>>>,
         user_profiles: Arc<RwLock<BTreeMap<UserID, UserProfile>>>,
         our_fqdn: String,
+        self_cap_map: std::sync::Arc<std::sync::RwLock<NodeCapMap>>,
     ) -> Self {
         Self {
             config: Arc::new(RwLock::new(ServeConfig::default())),
@@ -388,6 +389,7 @@ impl ServeRunner {
             user_profiles,
             our_fqdn,
             netstack,
+            self_cap_map,
             cancel: std::sync::Mutex::new(Arc::new(CancelToken::new())),
             tasks: Mutex::new(vec![]),
         }
@@ -469,6 +471,60 @@ impl ServeRunner {
                 new_cancel.clone(),
             )));
         }
+
+        // Start per-service TCP listeners from ServeConfig.Services.
+        if !cfg.Services.is_empty() {
+            let cap_map = self
+                .self_cap_map
+                .read()
+                .expect("self_cap_map lock poisoned")
+                .clone();
+            let cert = self.cert_provider.lock().expect("cert mutex").clone();
+            for (svc_name, svc_cfg) in &cfg.Services {
+                for (port, handler) in &svc_cfg.TCP {
+                    let vips = rustscale_tailcfg::service_vip_addrs(
+                        &cap_map,
+                        &rustscale_tailcfg::ServiceName::new_unchecked(svc_name),
+                    );
+                    let v4_vips: Vec<IpAddr> =
+                        vips.iter().filter(|ip| ip.is_ipv4()).copied().collect();
+                    if v4_vips.is_empty() {
+                        eprintln!("tsnet: serve service {svc_name} on port {port} has no v4 VIPs");
+                        continue;
+                    }
+                    for vip in &v4_vips {
+                        match self.netstack.listen_on(*vip, *port).await {
+                            Ok(ln) => {
+                                started.push(*port);
+                                let cfg_arc = self.config.clone();
+                                let cert = cert.clone();
+                                let peers = self.peers.clone();
+                                let ups = self.user_profiles.clone();
+                                let fqdn = self.our_fqdn.clone();
+                                let handler = handler.clone();
+                                new_tasks.push(tokio::spawn(serve_listener_loop(
+                                    ln,
+                                    *port,
+                                    handler,
+                                    cfg_arc,
+                                    cert,
+                                    peers,
+                                    ups,
+                                    fqdn,
+                                    new_cancel.clone(),
+                                )));
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "tsnet: serve service {svc_name} listener on {vip}:{port} failed: {e}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         {
             let mut tasks = self.tasks.lock().await;
             *tasks = new_tasks;

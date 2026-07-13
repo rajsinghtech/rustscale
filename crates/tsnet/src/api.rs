@@ -695,9 +695,27 @@ impl Server {
             ..Default::default()
         };
 
-        let listener =
-            service::create_service_listener(&netstack, &self_node, &inner.domain, svc_name, mode)
-                .await?;
+        let cert_provider = if mode.is_https() {
+            match self.control_cert_provider().await {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    eprintln!("tsnet: service cert unavailable ({e}); using self-signed");
+                    Some(tls::default_cert_provider(&inner.tailscale_ips))
+                }
+            }
+        } else {
+            None
+        };
+
+        let listener = service::create_service_listener(
+            &netstack,
+            &self_node,
+            &inner.domain,
+            svc_name,
+            mode,
+            cert_provider,
+        )
+        .await?;
 
         Ok(listener)
     }

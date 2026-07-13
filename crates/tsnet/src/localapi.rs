@@ -142,6 +142,8 @@ pub(crate) struct LocalApiState {
     /// Shared route table (for applying exit-node pref changes directly).
     /// None when the server is not fully up (e.g. start_localapi_only).
     pub route_table: Option<Arc<RwLock<crate::routing::RouteTable>>>,
+    /// OS router when TUN mode owns system routes.
+    pub router: Option<crate::SharedRouter>,
     /// Notify fired by POST /logout so the daemon can tear down the server
     /// and transition to NeedsLogin. The daemon selects on this alongside
     /// shutdown signals.
@@ -576,17 +578,29 @@ pub(crate) async fn apply_exit_node_prefs(prefs: &Prefs, state: &Arc<LocalApiSta
         &prefs.ExitNodeID
     } else {
         // No exit node selected — clear it.
-        rt.write().await.clear_exit_node();
+        let mut routes = rt.write().await;
+        routes.clear_exit_node();
+        if let Some(router) = state.router.as_ref() {
+            if let Err(error) = crate::sync_router(router, &state.tailscale_ips, &routes) {
+                eprintln!("tsnet: route update failed (non-fatal): {error}");
+            }
+        }
         return;
     };
 
     let peers = state.peers.read().await;
+    let mut routes = rt.write().await;
     if let Some(peer_key) = resolve_exit_node_peer(&peers, ip_or_name) {
-        rt.write().await.set_exit_node(peer_key);
+        routes.set_exit_node(peer_key);
     } else {
         // Peer not found (may not be in the netmap yet). Clear for now;
         // the map update task will re-apply when the peer appears.
-        rt.write().await.clear_exit_node();
+        routes.clear_exit_node();
+    }
+    if let Some(router) = state.router.as_ref() {
+        if let Err(error) = crate::sync_router(router, &state.tailscale_ips, &routes) {
+            eprintln!("tsnet: route update failed (non-fatal): {error}");
+        }
     }
 }
 
@@ -3065,6 +3079,7 @@ mod tests {
             netstack: None,
             filter: std::sync::OnceLock::new(),
             route_table: None,
+            router: None,
             logout_trigger: Arc::new(tokio::sync::Notify::new()),
             suggested_exit_node: Arc::new(RwLock::new(String::new())),
             config_path: None,
@@ -3826,6 +3841,7 @@ mod tests {
             netstack: None,
             filter: std::sync::OnceLock::new(),
             route_table: None,
+            router: None,
             logout_trigger: Arc::new(tokio::sync::Notify::new()),
             suggested_exit_node: Arc::new(RwLock::new(String::new())),
             config_path: None,
@@ -4060,6 +4076,7 @@ mod tests {
             netstack: None,
             filter: std::sync::OnceLock::new(),
             route_table: None,
+            router: None,
             logout_trigger: Arc::new(tokio::sync::Notify::new()),
             suggested_exit_node: Arc::new(RwLock::new(String::new())),
             config_path: None,

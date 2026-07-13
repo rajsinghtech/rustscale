@@ -77,6 +77,9 @@ impl Server {
 
         // Map-stream update task (peer/route deltas).
         let suggested_exit_node: Arc<RwLock<String>> = Arc::new(RwLock::new(String::new()));
+        let client_updater = Arc::new(std::sync::Mutex::new(
+            rustscale_clientupdate::ClientUpdater::new(env!("CARGO_PKG_VERSION")),
+        ));
         let key_rotation_ctx = KeyRotationCtx {
             control_url: b.control_url.clone(),
             machine_key: b.machine_key.clone(),
@@ -117,6 +120,7 @@ impl Server {
             Some(key_rotation_ctx),
             b.map_session.clone(),
             suggested_exit_node.clone(),
+            client_updater.clone(),
         );
 
         // MagicDNS responder: best-effort UDP server at 100.100.100.100:53.
@@ -383,6 +387,7 @@ impl Server {
                     .unwrap_or_else(|| Arc::new(tokio::sync::Notify::new())),
                 suggested_exit_node: suggested_exit_node.clone(),
                 config_path: self.config.config_path.clone(),
+                client_updater: client_updater.clone(),
             };
             // Publish the live filter so `PATCH /prefs` can toggle
             // shields-up mode without a full rebuild.
@@ -448,6 +453,7 @@ impl Server {
             prefs,
             proxy_mapper,
             portlist_ports,
+            client_updater: client_updater.clone(),
         });
 
         // Apply stored exit-node pref on start (survives restart).
@@ -560,6 +566,9 @@ impl Server {
         );
 
         let suggested_exit_node: Arc<RwLock<String>> = Arc::new(RwLock::new(String::new()));
+        let client_updater = Arc::new(std::sync::Mutex::new(
+            rustscale_clientupdate::ClientUpdater::new(env!("CARGO_PKG_VERSION")),
+        ));
         let key_rotation_ctx = KeyRotationCtx {
             control_url: b.control_url.clone(),
             machine_key: b.machine_key.clone(),
@@ -600,6 +609,7 @@ impl Server {
             Some(key_rotation_ctx),
             b.map_session.clone(),
             suggested_exit_node.clone(),
+            client_updater.clone(),
         );
 
         let (c2n_task, c2n_addr) =
@@ -835,6 +845,7 @@ impl Server {
                     .unwrap_or_else(|| Arc::new(tokio::sync::Notify::new())),
                 suggested_exit_node: suggested_exit_node.clone(),
                 config_path: self.config.config_path.clone(),
+                client_updater: client_updater.clone(),
             };
             // Publish the live filter so `PATCH /prefs` can toggle
             // shields-up mode without a full rebuild.
@@ -933,6 +944,7 @@ impl Server {
             prefs,
             proxy_mapper,
             portlist_ports,
+            client_updater: client_updater.clone(),
         });
 
         // Apply stored exit-node pref on start (survives restart).
@@ -1105,6 +1117,9 @@ impl Server {
             logout_trigger: logout_trigger.clone(),
             suggested_exit_node: Arc::new(RwLock::new(String::new())),
             config_path: self.config.config_path.clone(),
+            client_updater: Arc::new(std::sync::Mutex::new(
+                rustscale_clientupdate::ClientUpdater::new(env!("CARGO_PKG_VERSION")),
+            )),
         });
 
         let handle = localapi::spawn_localapi(api_state.clone(), socket_path.clone());

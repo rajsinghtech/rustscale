@@ -671,6 +671,9 @@ pub(crate) struct RunningState {
     /// server's lifetime; the background task and hook operate on clones.
     #[allow(dead_code)]
     pub(crate) portlist_ports: Arc<std::sync::Mutex<Vec<rustscale_portlist::Port>>>,
+    /// Client update checker — fed by the map-update loop, read by
+    /// `ipn_status()` and the LocalAPI `/status` endpoint.
+    pub(crate) client_updater: Arc<std::sync::Mutex<rustscale_clientupdate::ClientUpdater>>,
 }
 
 /// A fallback TCP handler: called when an incoming TCP flow doesn't match any

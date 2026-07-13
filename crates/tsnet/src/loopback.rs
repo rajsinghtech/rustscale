@@ -501,6 +501,7 @@ impl Server {
             logout_trigger: inner.logout_trigger.clone(),
             suggested_exit_node: Arc::new(RwLock::new(String::new())),
             config_path: None,
+            client_updater: inner.client_updater.clone(),
         })
     }
 }

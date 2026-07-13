@@ -31,8 +31,50 @@ AUTHKEY RESULTS_DIR SERVER_HOSTNAME CLIENT_HOSTNAME
 
 CONFIG: rs-userspace | rs-tun | ts-userspace | ts-tun
 --profile: rs-tun only; collect a Linux perf profile after normal metrics
+--repeat N: production TUN samples per parallelism (1..=9; default 3)
 EOF
   exit 2
+}
+
+# Parse trailing options independently of their order.  It intentionally has
+# no GCP dependencies so the CLI contract can be tested locally.
+parse_run_config_options() {
+  PROFILE=0
+  REPEAT=3
+  local seen_profile=0 seen_repeat=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --profile)
+        (( seen_profile == 0 )) || { echo "duplicate option: --profile" >&2; return 2; }
+        PROFILE=1; seen_profile=1; shift ;;
+      --repeat)
+        (( seen_repeat == 0 )) || { echo "duplicate option: --repeat" >&2; return 2; }
+        [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || { echo "--repeat requires a value" >&2; return 2; }
+        [[ "$2" =~ ^[1-9]$ ]] || { echo "--repeat must be an integer in 1..=9" >&2; return 2; }
+        REPEAT="$2"; seen_repeat=1; shift 2 ;;
+      *) echo "unknown option: $1" >&2; return 2 ;;
+    esac
+  done
+}
+
+run_config_option_parsing_self_test() {
+  local actual status
+  actual=$(parse_run_config_options --profile --repeat 1; printf '%s/%s\n' "$PROFILE" "$REPEAT") || return 1
+  [[ "$actual" == '1/1' ]] || return 1
+  actual=$(parse_run_config_options --repeat 9 --profile; printf '%s/%s\n' "$PROFILE" "$REPEAT") || return 1
+  [[ "$actual" == '1/9' ]] || return 1
+  actual=$(parse_run_config_options; printf '%s/%s\n' "$PROFILE" "$REPEAT") || return 1
+  [[ "$actual" == '0/3' ]] || return 1
+  local -a case_args=()
+  for args in '--repeat' '--repeat 0' '--repeat 10' '--repeat 1.5' '--repeat 1 --repeat 2' '--profile --profile' '--unknown'; do
+    read -r -a case_args <<< "$args"
+    if ( parse_run_config_options "${case_args[@]}" ) >/dev/null 2>&1; then
+      return 1
+    else
+      status=$?
+      (( status == 2 )) || return 1
+    fi
+  done
 }
 
 SELF_TEST=0
@@ -52,6 +94,7 @@ if (( SELF_TEST )); then
   SHOST=self-test-server
   CHOST=self-test-client
   PROFILE=1
+  REPEAT=3
 else
   [[ $# -ge 9 ]] || usage
   CONFIG="$1"
@@ -64,9 +107,7 @@ else
   SHOST="$8"
   CHOST="$9"
   shift 9
-  PROFILE=0
-  if [[ "${1:-}" == --profile ]]; then PROFILE=1; shift; fi
-  [[ $# -eq 0 ]] || usage
+  parse_run_config_options "$@" || exit $?
 fi
 if (( PROFILE )) && [[ "$CONFIG" != rs-tun ]]; then
   echo "--profile is only valid for rs-tun" >&2
@@ -236,8 +277,12 @@ cleanup_rs_tun() {
   # This runs as root because rs-tun may have left root-owned benchmark files.
   # It is deliberately idempotent: an already-absent optional iperf3 server
   # must not make ssh_sudo retry before the next non-root config starts.
-  if ! ssh_sudo "$SVM" "$SZONE" "$(rs_tun_iperf_cleanup_command)"; then
+  if ! ssh_sudo "$SVM" "$SZONE" "$(rs_tun_iperf_cleanup_command server)"; then
     echo "[gcp] ERROR: rs-tun iperf3 cleanup failed on server $SVM" >&2
+    status=1
+  fi
+  if ! ssh_sudo "$CVM" "$CZONE" "$(rs_tun_iperf_cleanup_command client)"; then
+    echo "[gcp] ERROR: rs-tun iperf3 cleanup failed on client $CVM" >&2
     status=1
   fi
 
@@ -254,20 +299,34 @@ cleanup_rs_tun() {
   return "$status"
 }
 
+# Label-specific iperf3 artifacts keep the non-root rs-tun client separate
+# from root-owned ts-tun artifacts when a matrix reuses the same VMs.
+tun_iperf_server_pid_path() { printf '/tmp/%s-iperf3-srv.pid' "$1"; }
+tun_iperf_server_log_path() { printf '/tmp/%s-iperf3-srv.log' "$1"; }
+tun_iperf_warmup_path() { printf '/tmp/%s-iperf3-warmup.json' "$1"; }
+tun_iperf_sample_path() { printf '/tmp/%s-iperf3-current.json' "$1"; }
+
 # Print the root-side iperf3 cleanup program used before rs-tun hands a VM to
-# the next configuration.  Remove both files even when the optional process
-# is already absent so a non-root benchmark can create them.
+# the next configuration.  Remove its label-specific files even when the
+# optional process is already absent so a non-root benchmark can create them.
+# Args: server | client
 rs_tun_iperf_cleanup_command() {
+  local role="${1:-server}"
+  if [[ "$role" == client ]]; then
+    printf 'rm -f %s %s\n' "$(tun_iperf_warmup_path rs-tun)" "$(tun_iperf_sample_path rs-tun)"
+    return 0
+  fi
   printf '%s\n' \
-'pidfile=/tmp/iperf3-srv.pid' \
+"pidfile=$(tun_iperf_server_pid_path rs-tun)" \
 'kill "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null || true' \
 'pkill -x iperf3 2>/dev/null || true' \
-'rm -f "$pidfile" /tmp/iperf3-srv.log'
+"rm -f \"\$pidfile\" $(tun_iperf_server_log_path rs-tun)"
 }
 
-# Clear root-owned iperf3 leftovers before rs-tun measures as the SSH user.
+# Clear root-owned rs-tun artifacts before its non-root measurement.
 rs_tun_measurement_preflight() {
-  ssh_sudo "$SVM" "$SZONE" "$(rs_tun_iperf_cleanup_command)"
+  ssh_sudo "$SVM" "$SZONE" "$(rs_tun_iperf_cleanup_command server)" \
+    && ssh_sudo "$CVM" "$CZONE" "$(rs_tun_iperf_cleanup_command client)"
 }
 
 # Print the root-side cleanup program for one rs-tun endpoint.  It intentionally
@@ -318,14 +377,23 @@ rs_tun_cleanup_command() {
 
 cleanup_ts_tun() {
   ssh_sudo "$SVM" "$SZONE" \
-    "kill \$(cat /tmp/iperf3-srv.pid 2>/dev/null) 2>/dev/null; pkill -x iperf3 2>/dev/null; \
+    "kill \$(cat $(tun_iperf_server_pid_path ts-tun) 2>/dev/null) 2>/dev/null; pkill -x iperf3 2>/dev/null; \
      tailscale --socket=/tmp/ts-tun-srv.sock down 2>/dev/null; \
      kill \$(cat /tmp/ts-tun-srv.pid 2>/dev/null) 2>/dev/null; pkill -x tailscaled 2>/dev/null; \
-     cp /etc/resolv.conf.bench-bak /etc/resolv.conf 2>/dev/null || true; rm -f /etc/resolv.conf.bench-bak" || true
+     cp /etc/resolv.conf.bench-bak /etc/resolv.conf 2>/dev/null || true; rm -f /etc/resolv.conf.bench-bak $(tun_iperf_server_pid_path ts-tun) $(tun_iperf_server_log_path ts-tun)" || true
   ssh_sudo "$CVM" "$CZONE" \
     "tailscale --socket=/tmp/ts-tun-cli.sock down 2>/dev/null; \
      kill \$(cat /tmp/ts-tun-cli.pid 2>/dev/null) 2>/dev/null; pkill -x tailscaled 2>/dev/null; \
-     cp /etc/resolv.conf.bench-bak /etc/resolv.conf 2>/dev/null || true; rm -f /etc/resolv.conf.bench-bak" || true
+     cp /etc/resolv.conf.bench-bak /etc/resolv.conf 2>/dev/null || true; rm -f /etc/resolv.conf.bench-bak $(tun_iperf_warmup_path ts-tun) $(tun_iperf_sample_path ts-tun)" || true
+}
+
+# ts-tun also removes its own root-owned artifacts before each measurement so
+# direct/DERP reruns cannot reuse a prior sample diagnostic.
+ts_tun_measurement_preflight() {
+  ssh_sudo "$SVM" "$SZONE" \
+    "kill \$(cat $(tun_iperf_server_pid_path ts-tun) 2>/dev/null) 2>/dev/null || true; pkill -x iperf3 2>/dev/null || true; rm -f $(tun_iperf_server_pid_path ts-tun) $(tun_iperf_server_log_path ts-tun)" \
+    && ssh_sudo "$CVM" "$CZONE" \
+      "rm -f $(tun_iperf_warmup_path ts-tun) $(tun_iperf_sample_path ts-tun)"
 }
 
 # Write a stub JSON (used in dry-run or on failure).
@@ -347,9 +415,9 @@ emit_stub() {
   _lt_tmp=$(mktemp)
   printf '%s' "$log_tail" > "$_lt_tmp"
   python3 - "$CONFIG" "$TOPOLOGY" "$PATH_TAG" "$tool" "$mode" "$err" \
-    "$DURATION" "$LATENCY_COUNT" "${PARALLELS[@]}" "$_lt_tmp" >"$OUT" <<'PYEOF'
+    "$DURATION" "$LATENCY_COUNT" "$REPEAT" "${PARALLELS[@]}" "$_lt_tmp" >"$OUT" <<'PYEOF'
 import json, sys
-config, topo, path_tag, tool, mode, err, dur, lat_count, *rest = sys.argv[1:]
+config, topo, path_tag, tool, mode, err, dur, lat_count, repeat, *rest = sys.argv[1:]
 *parallel_values, lt_path = rest
 try:
     with open(lt_path) as f:
@@ -362,10 +430,13 @@ obj = {
     "topology": topo,
     "path": path_tag,
     "config": config,
+    "repeat": int(repeat),
     "error": err,
     "log_tail": log_tail,
     "throughput": [
-        {"parallel": p, "mbps": 0, "duration_s": int(dur)}
+        {"parallel": p,
+         "mbps": 0, "duration_s": int(dur),
+         "samples_mbps": [0] * int(repeat), "statistic": "median"}
         for p in map(int, parallel_values)
     ],
     "latency": {"p50_us": 0, "p95_us": 0, "p99_us": 0, "count": int(lat_count)},
@@ -379,7 +450,7 @@ PYEOF
 }
 
 cleanup_self_test() {
-  local state result events command iperf_events preflight_call cleanup_failure
+  local state result events command iperf_events preflight_call preflight_expected ts_preflight cleanup_failure
   local -a cases=(absent graceful forced failure)
 
   # These mocks exercise the remote cleanup program's transitions without a
@@ -439,20 +510,32 @@ cleanup_self_test() {
     kill() { CLEANUP_TEST_EVENTS+=" kill"; return 1; }
     pkill() { CLEANUP_TEST_EVENTS+=" pkill"; return 1; }
     rm() { CLEANUP_TEST_EVENTS+=" rm:$*"; return 0; }
-    source /dev/stdin <<< "$(rs_tun_iperf_cleanup_command)"
+    source /dev/stdin <<< "$(rs_tun_iperf_cleanup_command server)"
     printf '%s\n' "$CLEANUP_TEST_EVENTS"
   ); then
     return 1
   fi
-  [[ "$iperf_events" == ' kill pkill rm:-f /tmp/iperf3-srv.pid /tmp/iperf3-srv.log' ]] || return 1
+  [[ "$iperf_events" == ' kill pkill rm:-f /tmp/rs-tun-iperf3-srv.pid /tmp/rs-tun-iperf3-srv.log' ]] || return 1
 
-  # The measurement preflight must use the server and root execution path,
-  # while reusing the exact narrowly scoped iperf3 cleanup program.
+  local client_cleanup
+  client_cleanup=$(rs_tun_iperf_cleanup_command client)
+  [[ "$client_cleanup" == 'rm -f /tmp/rs-tun-iperf3-warmup.json /tmp/rs-tun-iperf3-current.json' ]] || return 1
+
+  # The measurement preflight must use root on both endpoints, clearing the
+  # server and client artifacts before a non-root rs-tun client creates them.
   preflight_call=$(
     ssh_sudo() { printf '%s|%s|%s\n' "$1" "$2" "$3"; }
     rs_tun_measurement_preflight
   ) || return 1
-  [[ "$preflight_call" == "$SVM|$SZONE|$(rs_tun_iperf_cleanup_command)" ]] || return 1
+  preflight_expected="$SVM|$SZONE|$(rs_tun_iperf_cleanup_command server)"$'\n'"$CVM|$CZONE|$(rs_tun_iperf_cleanup_command client)"
+  [[ "$preflight_call" == "$preflight_expected" ]] || return 1
+
+  ts_preflight=$(
+    ssh_sudo() { printf '%s|%s|%s\n' "$1" "$2" "$3"; }
+    ts_tun_measurement_preflight
+  ) || return 1
+  [[ "$ts_preflight" == *"$SVM|$SZONE|"*"/tmp/ts-tun-iperf3-srv.pid"* ]] || return 1
+  [[ "$ts_preflight" == *"$CVM|$CZONE|rm -f /tmp/ts-tun-iperf3-warmup.json /tmp/ts-tun-iperf3-current.json"* ]] || return 1
 
   # An iperf3 cleanup failure makes the handoff unsafe, but must not skip
   # either daemon endpoint cleanup.
@@ -460,7 +543,7 @@ cleanup_self_test() {
     CLEANUP_TEST_SSH_CALLS=""
     ssh_sudo() {
       CLEANUP_TEST_SSH_CALLS+=" $1:$2"
-      [[ "$3" == "$(rs_tun_iperf_cleanup_command)" ]] && return 1
+      [[ "$3" == "$(rs_tun_iperf_cleanup_command server)" ]] && return 1
       return 0
     }
     if cleanup_rs_tun; then
@@ -470,7 +553,7 @@ cleanup_self_test() {
     fi
     printf '%s|%s\n' "$result" "$CLEANUP_TEST_SSH_CALLS"
   ) || return 1
-  [[ "$cleanup_failure" == "1| $SVM:$SZONE $SVM:$SZONE $CVM:$CZONE" ]] || return 1
+  [[ "$cleanup_failure" == "1| $SVM:$SZONE $CVM:$CZONE $SVM:$SZONE $CVM:$CZONE" ]] || return 1
 
   unset -f pgrep ip pkill sleep ps fuser test_remote_cleanup
 }
@@ -484,6 +567,11 @@ with open(path) as f:
     result = json.load(f)
 assert [row["parallel"] for row in result["throughput"]] == [int(p) for p in parallels]
 assert all(row["duration_s"] == int(duration) for row in result["throughput"])
+assert result["repeat"] == 3
+assert all(row["statistic"] == "median" and len(row["samples_mbps"]) == 3
+           for row in result["throughput"])
+assert all(row["samples_mbps"] == [0, 0, 0] and row["mbps"] == 0
+           for row in result["throughput"])
 assert result["latency"]["count"] == int(latency_count)
 PYEOF
 
@@ -513,6 +601,7 @@ PYEOF
 
 classifier_self_test
 command_shape_self_test
+run_config_option_parsing_self_test
 
 if (( SELF_TEST )); then
   cleanup_self_test
@@ -573,42 +662,151 @@ print(json.dumps({
 '
 }
 
+# Extract one positive, finite iperf3 throughput sample.  This is deliberately
+# separate from iperf3_mbps so userspace measurement behavior remains intact.
+tun_iperf3_mbps() {
+  python3 -c '
+import json, math, sys
+d = json.load(sys.stdin)
+if "total_mbps" in d:
+    value = d["total_mbps"]
+elif "down_mbps" in d:
+    value = d["down_mbps"]
+elif "up_mbps" in d:
+    value = d["up_mbps"]
+else:
+    end = d.get("end", {})
+    value = end.get("sum_received", end.get("sum", {})).get("bits_per_second", 0) / 1e6
+try:
+    value = float(value)
+except (TypeError, ValueError):
+    raise SystemExit("invalid iperf3 throughput sample")
+if not math.isfinite(value) or value <= 0:
+    raise SystemExit("invalid iperf3 throughput sample")
+print(repr(value))
+'
+}
+
+# Add one TUN throughput row, preserving execution order while calculating the
+# mathematically exact median (including an arithmetic mean for even repeats).
+# Args: CURRENT_JSON PARALLEL DURATION SAMPLE...
+append_tun_throughput_row() {
+  local current="$1" parallel="$2" duration="$3"
+  shift 3
+  python3 - "$current" "$parallel" "$duration" "$@" <<'PYEOF'
+import json, math, sys
+rows = json.loads(sys.argv[1])
+parallel, duration = int(sys.argv[2]), int(sys.argv[3])
+samples = [float(value) for value in sys.argv[4:]]
+if not samples or any(not math.isfinite(value) or value <= 0 for value in samples):
+    raise SystemExit("invalid TUN throughput samples")
+ordered = sorted(samples)
+middle = len(ordered) // 2
+median = ordered[middle] if len(ordered) % 2 else (ordered[middle - 1] + ordered[middle]) / 2
+rows.append({"parallel": parallel, "mbps": median, "duration_s": duration,
+             "samples_mbps": samples, "statistic": "median"})
+print(json.dumps(rows))
+PYEOF
+}
+
 # Measure a production kernel-TUN path after its product CLI path gate.
 # Args: LABEL AS_ROOT SERVER_IP DAEMON_PID_FILE FOOTPRINT_FILE BINARY_PATH
 # Results are returned in TUN_MEASURE_{THROUGHPUT,LATENCY,FOOTPRINT,BIN_SIZE}.
 tun_measure() {
   local label="$1" as_root="$2" server_ip="$3" daemon_pid_file="$4"
-  local footprint_file="$5" binary_path="$6" srv_pid mbps
-  local tp_json="[]"
+  local footprint_file="$5" binary_path="$6" srv_pid mbps sample_json N repeat_index
+  local server_pid_path server_log_path warmup_path sample_path
+  local tp_json="[]" footprint_started=0 sample_number=0 total_samples
+  local -a samples=()
+  total_samples=$((${#PARALLELS[@]} * REPEAT))
+  server_pid_path=$(tun_iperf_server_pid_path "$label")
+  server_log_path=$(tun_iperf_server_log_path "$label")
+  warmup_path=$(tun_iperf_warmup_path "$label")
+  sample_path=$(tun_iperf_sample_path "$label")
+  TUN_MEASURE_FAILURE_STAGE=""
 
+  TUN_MEASURE_FAILURE_STAGE=server-start
   run_tun_command "$as_root" "$SVM" "$SZONE" \
-    "pkill -x iperf3 2>/dev/null; nohup iperf3 -s -p $PORT > /tmp/iperf3-srv.log 2>&1 & echo \$! > /tmp/iperf3-srv.pid"
+    "pkill -x iperf3 2>/dev/null; nohup iperf3 -s -p $PORT > $server_log_path 2>&1 & echo \$! > $server_pid_path" || return 1
   sleep 2
 
-  srv_pid=$(run_tun_command "$as_root" "$SVM" "$SZONE" "cat $daemon_pid_file")
-  remote_start_footprint "$SVM" "$SZONE" "$srv_pid" "$footprint_file"
+  # This reverse P1 primes the established TUN/TCP path, but is intentionally
+  # before footprint sampling and never added to normal result data.
+  echo "[gcp] $label: warmup reverse P1 (3s)" >&2
+  TUN_MEASURE_FAILURE_STAGE=warmup
+  run_tun_command "$as_root" "$CVM" "$CZONE" \
+    "iperf3 -c $server_ip -p $PORT -t 3 -P 1 -R -J >$warmup_path 2>&1" || return 1
+
+  TUN_MEASURE_FAILURE_STAGE=daemon-pid
+  srv_pid=$(run_tun_command "$as_root" "$SVM" "$SZONE" "cat $daemon_pid_file") || return 1
+  TUN_MEASURE_FAILURE_STAGE=footprint-start
+  footprint_started=1
+  remote_start_footprint "$SVM" "$SZONE" "$srv_pid" "$footprint_file" || {
+    remote_stop_footprint "$SVM" "$SZONE" "$footprint_file" >/dev/null || true
+    footprint_started=0
+    return 1
+  }
 
   for N in "${PARALLELS[@]}"; do
-    echo "[gcp] $label: iperf3 N=$N" >&2
-    mbps=$(run_tun_command "$as_root" "$CVM" "$CZONE" \
-      "iperf3 -c $server_ip -p $PORT -t $DURATION -P $N -R -J 2>/dev/null" \
-      | iperf3_mbps 2>/dev/null || echo "0")
-    tp_json=$(printf '%s' "$tp_json" | python3 -c "
-import json,sys
-arr=json.load(sys.stdin)
-arr.append({'parallel': $N, 'mbps': float('$mbps'), 'duration_s': $DURATION})
-print(json.dumps(arr))
-")
-    sleep 3
+    samples=()
+    for ((repeat_index = 1; repeat_index <= REPEAT; repeat_index++)); do
+      echo "[gcp] $label: iperf3 N=$N sample=$repeat_index/$REPEAT" >&2
+      TUN_MEASURE_FAILURE_STAGE=measured-sample
+      sample_json=$(run_tun_command "$as_root" "$CVM" "$CZONE" \
+        "iperf3 -c $server_ip -p $PORT -t $DURATION -P $N -R -J >$sample_path 2>&1; status=\$?; cat $sample_path; exit \$status") || {
+          (( footprint_started )) && remote_stop_footprint "$SVM" "$SZONE" "$footprint_file" >/dev/null || true
+          return 1
+        }
+      mbps=$(printf '%s' "$sample_json" | tun_iperf3_mbps) || {
+        (( footprint_started )) && remote_stop_footprint "$SVM" "$SZONE" "$footprint_file" >/dev/null || true
+        return 1
+      }
+      samples+=("$mbps")
+      sample_number=$((sample_number + 1))
+      if (( sample_number < total_samples )); then
+        sleep 3
+      fi
+    done
+    tp_json=$(append_tun_throughput_row "$tp_json" "$N" "$DURATION" "${samples[@]}") || {
+      (( footprint_started )) && remote_stop_footprint "$SVM" "$SZONE" "$footprint_file" >/dev/null || true
+      return 1
+    }
   done
 
   echo "[gcp] $label: latency" >&2
+  TUN_MEASURE_FAILURE_STAGE=latency
   TUN_MEASURE_LATENCY=$(run_tun_command "$as_root" "$CVM" "$CZONE" \
-    "ping -i $LATENCY_INTERVAL -c $LATENCY_COUNT $server_ip 2>/dev/null" | ping_latency)
-  TUN_MEASURE_FOOTPRINT=$(remote_stop_footprint "$SVM" "$SZONE" "$footprint_file")
+    "ping -i $LATENCY_INTERVAL -c $LATENCY_COUNT $server_ip 2>/dev/null" | ping_latency) || {
+      remote_stop_footprint "$SVM" "$SZONE" "$footprint_file" >/dev/null || true
+      return 1
+    }
+  TUN_MEASURE_FAILURE_STAGE=footprint-stop
+  TUN_MEASURE_FOOTPRINT=$(remote_stop_footprint "$SVM" "$SZONE" "$footprint_file") || return 1
+  TUN_MEASURE_FAILURE_STAGE=binary-stat
   TUN_MEASURE_BIN_SIZE=$(ssh_cmd "$SVM" "$SZONE" \
-    "stat -c %s $binary_path 2>/dev/null || echo 0")
+    "stat -c %s $binary_path 2>/dev/null || echo 0") || return 1
   TUN_MEASURE_THROUGHPUT="$tp_json"
+  TUN_MEASURE_FAILURE_STAGE=""
+}
+
+# Select a diagnostic that corresponds to the actual failed TUN stage.  A
+# successful earlier iperf artifact is never presented as evidence for a
+# later latency, footprint, or binary-stat failure.
+# Args: LABEL FAILURE_STAGE
+tun_measure_failure_tail() {
+  local label="$1" stage="${2:-unknown}"
+  case "$stage" in
+    server-start|daemon-pid)
+      capture_log_tail "$SVM" "$SZONE" "$(tun_iperf_server_log_path "$label")" ;;
+    warmup)
+      capture_log_tail "$CVM" "$CZONE" "$(tun_iperf_warmup_path "$label")" ;;
+    measured-sample)
+      capture_log_tail "$CVM" "$CZONE" "$(tun_iperf_sample_path "$label")" ;;
+    footprint-start|latency|footprint-stop|binary-stat)
+      printf '[gcp] %s: tun_measure failed during %s; no iperf diagnostic applies\n' "$label" "$stage" ;;
+    *)
+      printf '[gcp] %s: tun_measure failed at unknown stage; no diagnostic file selected\n' "$label" ;;
+  esac
 }
 
 # Emit a production kernel-TUN result. Args: TOOL LABEL PATH_CLASS
@@ -616,15 +814,16 @@ tun_emit_result() {
   local tool="$1" label="$2" path_class="$3"
   python3 - "$CONFIG" "$TOPOLOGY" "$PATH_TAG" "$path_class" \
     "$TUN_MEASURE_BIN_SIZE" "$TUN_MEASURE_THROUGHPUT" "$TUN_MEASURE_LATENCY" \
-    "$TUN_MEASURE_FOOTPRINT" "$tool" >"$OUT" <<'PYEOF'
+    "$TUN_MEASURE_FOOTPRINT" "$tool" "$REPEAT" >"$OUT" <<'PYEOF'
 import json, sys
-config, topo, path_tag, path_class, bin_size, tp, lat, foot, tool = sys.argv[1:10]
+config, topo, path_tag, path_class, bin_size, tp, lat, foot, tool, repeat = sys.argv[1:11]
 obj = {
     "tool": tool,
     "mode": "tun",
     "topology": topo,
     "path": path_tag,
     "config": config,
+    "repeat": int(repeat),
     "error": "",
     "log_tail": "",
     "throughput": json.loads(tp),
@@ -632,9 +831,162 @@ obj = {
     "footprint": dict(json.loads(foot), binary_size_bytes=int(bin_size)),
     "path_class_reported": path_class,
 }
+
 print(json.dumps(obj, indent=2))
 PYEOF
   echo "[gcp] $label: wrote $OUT" >&2
+}
+
+tun_measure_self_test() {
+  local log_file count_file sleep_file rows odd even
+  local saved_repeat="$REPEAT"
+  local -a saved_parallels=("${PARALLELS[@]}")
+  log_file=$(mktemp "$RDIR/tun-measure-test.XXXXXX")
+  count_file=$(mktemp "$RDIR/tun-measure-count.XXXXXX")
+  sleep_file=$(mktemp "$RDIR/tun-measure-sleeps.XXXXXX")
+  printf '0' >"$count_file"
+
+  run_tun_command() {
+    printf '%s\n' "$4" >>"$log_file"
+    case "$4" in
+      'cat /tmp/test-daemon.pid') printf '42\n' ;;
+      *'iperf3 -c'*'-t 10'*)
+        [[ "${TUN_TEST_FAIL_AFTER_START:-0}" != 1 ]] || return 1
+        [[ "${TUN_TEST_ZERO_SAMPLE:-0}" != 1 ]] || { printf '%s' '{"total_mbps": 0}'; return 0; }
+        TUN_TEST_SAMPLE=$(<"$count_file")
+        TUN_TEST_SAMPLE=$((TUN_TEST_SAMPLE + 1))
+        printf '%s' "$TUN_TEST_SAMPLE" >"$count_file"
+        case "$TUN_TEST_SAMPLE" in
+          1) printf '%s' '{"total_mbps": 100}' ;;
+          2) printf '%s' '{"total_mbps": 200}' ;;
+          3) printf '%s' '{"total_mbps": 300}' ;;
+          4) printf '%s' '{"total_mbps": 400}' ;;
+        esac ;;
+      *'ping '*) printf '%s\n' '64 bytes from test: time=1 ms' ;;
+    esac
+  }
+  remote_start_footprint() { printf '%s\n' 'footprint-start' >>"$log_file"; }
+  remote_stop_footprint() { printf '%s\n' 'footprint-stop' >>"$log_file"; printf '%s' '{"rss_peak_kb":1,"rss_avg_kb":1,"cpu_peak_pct":1,"cpu_avg_pct":1,"samples":1}'; }
+  ssh_cmd() { printf '%s' '123'; }
+  sleep() { printf '%s\n' "$1" >>"$sleep_file"; }
+
+  REPEAT=2
+  PARALLELS=(1 10)
+  tun_measure self-test 0 100.64.0.1 /tmp/test-daemon.pid /tmp/test.footprint /bin/test || return 1
+  rows="$TUN_MEASURE_THROUGHPUT"
+  python3 - "$rows" "$log_file" "$sleep_file" <<'PYEOF'
+import json, sys
+rows = json.loads(sys.argv[1])
+assert [row["samples_mbps"] for row in rows] == [[100.0, 200.0], [300.0, 400.0]]
+assert [row["mbps"] for row in rows] == [150.0, 350.0]
+assert all(row["statistic"] == "median" for row in rows)
+lines = open(sys.argv[2]).read().splitlines()
+warmup = next(i for i, line in enumerate(lines) if "-t 3 -P 1 -R" in line)
+footprint = lines.index("footprint-start")
+samples = [line for line in lines if "iperf3 -c" in line and "-t 10" in line]
+assert warmup < footprint and len(samples) == 4
+assert lines.count("footprint-stop") == 1
+assert "/tmp/self-test-iperf3-warmup.json" in lines[warmup]
+assert all("/tmp/self-test-iperf3-current.json" in line and "2>&1; status=$?; cat" in line
+           for line in samples)
+assert not any("/tmp/iperf3-warmup.json" in line or " /tmp/iperf3-srv" in line for line in lines)
+sleeps = open(sys.argv[3]).read().splitlines()
+assert sleeps == ["2", "3", "3", "3"]
+assert sleeps.count("2") == 1
+assert sleeps.count("3") == len(samples) - 1
+PYEOF
+
+  tun_emit_result rustscale self-test direct
+  python3 - "$OUT" <<'PYEOF'
+import json, sys
+with open(sys.argv[1]) as f:
+    result = json.load(f)
+assert result["repeat"] == 2
+PYEOF
+
+  # A zero-valued JSON sample is a measurement failure, not a transport
+  # failure: stop the sampler once, make no later measured sample, and leave
+  # the previously successful state and result file intact.
+  : >"$log_file"
+  printf '0' >"$count_file"
+  printf 'previous-result\n' >"$OUT"
+  TUN_MEASURE_THROUGHPUT='["previous-success"]'
+  TUN_TEST_ZERO_SAMPLE=1
+  if tun_measure self-test 0 100.64.0.1 /tmp/test-daemon.pid /tmp/test.footprint /bin/test; then
+    return 1
+  fi
+  unset TUN_TEST_ZERO_SAMPLE
+  [[ "$TUN_MEASURE_FAILURE_STAGE" == measured-sample ]] || return 1
+  [[ "$TUN_MEASURE_THROUGHPUT" == '["previous-success"]' ]] || return 1
+  [[ "$(<"$OUT")" == previous-result ]] || return 1
+  python3 - "$log_file" <<'PYEOF'
+import sys
+lines = open(sys.argv[1]).read().splitlines()
+samples = [line for line in lines if "iperf3 -c" in line and "-t 10" in line]
+assert len(samples) == 1
+assert "-P 1" in samples[0]
+assert lines.count("footprint-start") == 1
+assert lines.count("footprint-stop") == 1
+PYEOF
+
+  # Once sampling has been requested, every measurement failure makes one
+  # best-effort stop attempt. Cover both a rejected start and a later sample
+  # failure; the remaining return sites follow the same stop-before-return
+  # pattern in tun_measure.
+  : >"$log_file"
+  TUN_TEST_FAIL_AFTER_START=1
+  if tun_measure self-test 0 100.64.0.1 /tmp/test-daemon.pid /tmp/test.footprint /bin/test; then
+    return 1
+  fi
+  unset TUN_TEST_FAIL_AFTER_START
+  python3 - "$log_file" <<'PYEOF'
+import sys
+lines = open(sys.argv[1]).read().splitlines()
+assert lines.count("footprint-start") == 1
+assert lines.count("footprint-stop") == 1
+PYEOF
+
+  remote_start_footprint() { printf '%s\n' 'footprint-start' >>"$log_file"; return 1; }
+  : >"$log_file"
+  if tun_measure self-test 0 100.64.0.1 /tmp/test-daemon.pid /tmp/test.footprint /bin/test; then
+    return 1
+  fi
+  [[ "$TUN_MEASURE_FAILURE_STAGE" == footprint-start ]] || return 1
+  python3 - "$log_file" <<'PYEOF'
+import sys
+lines = open(sys.argv[1]).read().splitlines()
+assert lines.count("footprint-start") == 1
+assert lines.count("footprint-stop") == 1
+PYEOF
+
+  odd=$(append_tun_throughput_row '[]' 1 10 10 30 20) || return 1
+  even=$(append_tun_throughput_row '[]' 1 10 10 30) || return 1
+  python3 - "$odd" "$even" <<'PYEOF'
+import json, sys
+assert json.loads(sys.argv[1])[0]["mbps"] == 20.0
+assert json.loads(sys.argv[2])[0]["mbps"] == 20.0
+PYEOF
+  if printf '%s' '{"total_mbps": 0}' | tun_iperf3_mbps >/dev/null 2>&1; then
+    return 1
+  fi
+
+  # Failure stubs select diagnostics by stage: a pre-sample warmup failure,
+  # a measured sample failure, and a post-sample latency failure must not be
+  # conflated with one another or with a successful earlier sample.
+  local failure_tail
+  failure_tail=$(capture_log_tail() { printf '%s|%s|%s\n' "$1" "$2" "$3"; }; tun_measure_failure_tail rs-tun warmup)
+  [[ "$failure_tail" == "$CVM|$CZONE|/tmp/rs-tun-iperf3-warmup.json" ]] || return 1
+  failure_tail=$(capture_log_tail() { printf '%s|%s|%s\n' "$1" "$2" "$3"; }; tun_measure_failure_tail rs-tun server-start)
+  [[ "$failure_tail" == "$SVM|$SZONE|/tmp/rs-tun-iperf3-srv.log" ]] || return 1
+  failure_tail=$(capture_log_tail() { printf '%s|%s|%s\n' "$1" "$2" "$3"; }; tun_measure_failure_tail ts-tun measured-sample)
+  [[ "$failure_tail" == "$CVM|$CZONE|/tmp/ts-tun-iperf3-current.json" ]] || return 1
+  failure_tail=$(capture_log_tail() { printf 'stale-file:%s\n' "$3"; }; tun_measure_failure_tail ts-tun latency)
+  [[ "$failure_tail" == '[gcp] ts-tun: tun_measure failed during latency; no iperf diagnostic applies' ]] || return 1
+
+  REPEAT="$saved_repeat"
+  PARALLELS=("${saved_parallels[@]}")
+  rm -f "$log_file" "$count_file" "$sleep_file"
+  unset -f run_tun_command remote_start_footprint remote_stop_footprint ssh_cmd sleep
 }
 
 # Profile both halves of the production rs-tun data path after normal
@@ -755,11 +1107,11 @@ profile_rs_tun() {
       status=1
     elif ! commit=$(git -C "$(cd "$(dirname "$0")/../../.." && pwd)" rev-parse HEAD); then
       status=1
-    elif ! python3 - "$profile_dir/metadata.json" "$commit" "$TOPOLOGY" "$PATH_TAG" "$CONFIG" "$DURATION" "$srv_pid" "$cli_pid" "$OUT" <<'PYEOF'
+    elif ! python3 - "$profile_dir/metadata.json" "$commit" "$TOPOLOGY" "$PATH_TAG" "$CONFIG" "$DURATION" "$REPEAT" "$srv_pid" "$cli_pid" "$OUT" <<'PYEOF'
 import json, sys
-out, commit, topo, path, config, duration, srv_pid, cli_pid, result = sys.argv[1:]
+out, commit, topo, path, config, duration, repeat, srv_pid, cli_pid, result = sys.argv[1:]
 json.dump({"commit":commit,"topology":topo,"path":path,"config":config,
-           "parallel":10,"duration_s":int(duration),"frequency_hz":199,
+           "parallel":10,"duration_s":int(duration),"repeat":int(repeat),"frequency_hz":199,
            "result_json":result,"workload_direction":"server_to_client",
            "reverse":True,"endpoints":{
              "server":{"pid":int(srv_pid),"command":"rustscaled","role":"sender"},
@@ -814,6 +1166,7 @@ with open(sys.argv[1]) as f:
     metadata = json.load(f)
 assert metadata["workload_direction"] == "server_to_client"
 assert metadata["reverse"] is True
+assert metadata["repeat"] == 3
 assert metadata["endpoints"]["server"] == {"pid": 42, "command": "rustscaled", "role": "sender"}
 assert metadata["endpoints"]["client"] == {"pid": 84, "command": "rustscaled", "role": "receiver"}
 PYEOF
@@ -1017,13 +1370,17 @@ run_rs_tun() {
 
   if ! rs_tun_measurement_preflight; then
     echo "[gcp] ERROR: could not clear rs-tun iperf3 leftovers on $SVM" >&2
-    emit_stub "rs-tun-iperf-preflight-failed" "$(capture_log_tail "$SVM" "$SZONE" /tmp/iperf3-srv.log)"
+    emit_stub "rs-tun-iperf-preflight-failed" "$(capture_log_tail "$SVM" "$SZONE" "$(tun_iperf_server_log_path rs-tun)")"
     if ! cleanup_rs_tun; then return "$FATAL_HANDOFF_STATUS"; fi
     return 1
   fi
 
-  tun_measure rs-tun 0 "$server_ip" /tmp/rs-tun-srv.pid \
-    /tmp/rs-tun-srv.footprint /opt/rustscale/target/release/rustscaled
+  if ! tun_measure rs-tun 0 "$server_ip" /tmp/rs-tun-srv.pid \
+    /tmp/rs-tun-srv.footprint /opt/rustscale/target/release/rustscaled; then
+    emit_stub "rs-tun-measure-failed" "$(tun_measure_failure_tail rs-tun "$TUN_MEASURE_FAILURE_STAGE")"
+    if ! cleanup_rs_tun; then return "$FATAL_HANDOFF_STATUS"; fi
+    return 1
+  fi
 
   if (( PROFILE )) && ! profile_rs_tun; then
     emit_stub "rs-tun-profile-failed" "$(capture_log_tail "$SVM" "$SZONE" /tmp/rs-tun-perf-server.log)"
@@ -1310,8 +1667,18 @@ run_ts_tun() {
   path_class=$(tun_path_gate 1 "$CVM" "$CZONE" tailscale /tmp/ts-tun-cli.sock "$server_ip" "$PATH_TAG" /tmp/ts-tun-cli.path.log) || {
     emit_stub "ts-cli-path-gate-failed" "$(capture_log_tail "$CVM" "$CZONE" /tmp/ts-tun-cli.path.log)"; cleanup_ts_tun; return 1; }
 
-  tun_measure ts-tun 1 "$server_ip" /tmp/ts-tun-srv.pid \
-    /tmp/ts-tun-srv.footprint /usr/sbin/tailscaled
+  if ! ts_tun_measurement_preflight; then
+    emit_stub "ts-tun-iperf-preflight-failed" "$(capture_log_tail "$SVM" "$SZONE" "$(tun_iperf_server_log_path ts-tun)")"
+    cleanup_ts_tun
+    return 1
+  fi
+
+  if ! tun_measure ts-tun 1 "$server_ip" /tmp/ts-tun-srv.pid \
+    /tmp/ts-tun-srv.footprint /usr/sbin/tailscaled; then
+    emit_stub "ts-tun-measure-failed" "$(tun_measure_failure_tail ts-tun "$TUN_MEASURE_FAILURE_STAGE")"
+    cleanup_ts_tun
+    return 1
+  fi
 
   cleanup_ts_tun
 
@@ -1323,6 +1690,7 @@ run_ts_tun() {
 # ---------------------------------------------------------------------------
 if (( SELF_TEST )); then
   profile_command_self_test
+  tun_measure_self_test
   rm -rf "$RDIR"
   echo "run-config self-tests: OK" >&2
   exit 0

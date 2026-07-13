@@ -1843,6 +1843,59 @@ impl Server {
         Ok(())
     }
 
+    /// Switch to profile `profile_id`, tearing down the running backend and
+    /// restarting with the new profile's prefs. Mirrors Go's
+    /// `resetForProfileChangeLocked`.
+    ///
+    /// Sequence:
+    /// 1. `close()` — stop serve listeners, cancel tasks, drop magicsock
+    ///    and the control client (like Go's `currentNode` shutdown).
+    /// 2. Reload the `ProfileManager` from disk, switch to the target
+    ///    profile, and apply its prefs (`ControlURL`, `Hostname`) to
+    ///    `self.config` so `up()` bootstraps against the right control
+    ///    plane.
+    /// 3. If ephemeral, regenerate persisted state so bootstrap creates
+    ///    fresh node keys.
+    /// 4. `up()` — re-bootstrap the engine, control client, and netstack.
+    pub async fn switch_profile(&mut self, profile_id: &str) -> Result<(), TsnetError> {
+        // 1. Stop the running engine (like close() but keep the config).
+        self.close().await;
+
+        // 2. Update current profile + prefs from the ProfileManager.
+        //    (ProfileManager lives in state_dir on disk; reload it.)
+        if let Some(ref dir) = self.config.state_dir {
+            let mut pm = rustscale_ipn::ProfileManager::new(dir)
+                .map_err(|e| TsnetError::Builder(e.to_string()))?;
+            pm.switch_profile(profile_id)
+                .map_err(|e| TsnetError::Builder(e.to_string()))?;
+            // Apply the profile's prefs to self.config.
+            let new_prefs = pm.current_prefs().clone();
+            if !new_prefs.ControlURL.is_empty() {
+                self.config.control_url.clone_from(&new_prefs.ControlURL);
+            }
+            if !new_prefs.Hostname.is_empty() {
+                self.config.hostname.clone_from(&new_prefs.Hostname);
+            }
+            // Save prefs to disk so bootstrap picks them up.
+            if let Err(e) = new_prefs.save(dir) {
+                eprintln!("tsnet: failed to save prefs on profile switch: {e}");
+            }
+        }
+
+        // 3. Restart the engine. Ephemeral nodes regenerate keys on
+        //    restart — clear persisted state so bootstrap generates fresh
+        //    keys. (Mirrors Go clearing the node key on profile switch for
+        //    ephemeral nodes.)
+        if self.config.ephemeral {
+            if let Some(ref _dir) = self.config.state_dir {
+                let fresh = PersistedState::generate();
+                let _ = self.save_state(&fresh);
+            }
+        }
+        Box::pin(self.up()).await?;
+        Ok(())
+    }
+
     // --- internal helpers ---
 
     pub(crate) fn load_or_create_state(&self) -> Result<PersistedState, TsnetError> {

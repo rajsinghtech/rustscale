@@ -36,7 +36,7 @@ below reflect actual source code (`crates/*`) as of 2026-07-13.
 | SOCKS5 proxy | `net/socks5/` | ✅ RFC 1928 CONNECT (v4/domain/v6); RFC 1929 username/password auth; pluggable SocksDialer; FFI; e2e tests |
 | LocalAPI | `ipn/localapi/` | ✅ 17+ endpoints (status, whois, prefs GET+PATCH, netmap, metrics, health, ping(stub), watch-ipn-bus, start, login-interactive, logout, serve-config, profiles, cert, file-targets, debug, dial, dns-query, check-ip-forwarding) |
 | Auto-update / ClientVersion | — | 🔶 `crates/clientupdate` API complete (ClientUpdater, CheckResult, version_to_track), MapResponse.ClientVersion field exists, Notify.ClientVersion field exists; auto_apply returns `AutoUpdateNotImplemented`; not wired into map-update loop |
-| Multi-profile/login management | `ipn/ipnlocal/profiles.go` | ✅ ProfileManager with profiles.json + current-profile persistence; LocalAPI CRUD endpoints; CLI switch command; remaining: backend teardown+restart on switch, Windows LocalUserID |
+| Multi-profile/login management | `ipn/ipnlocal/profiles.go` | ✅ ProfileManager with profiles.json + current-profile persistence; LocalAPI CRUD endpoints; CLI switch command; backend teardown+restart on switch (`Server::switch_profile` → close + reload prefs + `up()`, `DaemonCommand::SwitchProfile` wired through daemon loop); remaining: Windows LocalUserID |
 
 ## macOS platform parity (phases 32–40, 2026-07-11)
 

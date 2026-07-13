@@ -270,6 +270,17 @@ async fn run_interactive(
             DaemonCommand::ReloadConfig => {
                 eprintln!("rustscaled: reload-config requested (server not up yet)");
             }
+            DaemonCommand::SwitchProfile(id) => {
+                eprintln!("rustscaled: switching to profile {id}");
+                if let Err(e) = server.switch_profile(&id).await {
+                    eprintln!("rustscaled: profile switch failed: {e}");
+                } else {
+                    eprintln!("rustscaled: up (hostname={hostname})");
+                    print_status(&server, socket_path);
+                    is_up = true;
+                    break;
+                }
+            }
         }
     }
 
@@ -277,36 +288,49 @@ async fn run_interactive(
         return Ok(());
     }
 
-    // Phase 2: server is up — wait for shutdown, logout, or LocalAPI shutdown.
+    // Phase 2: server is up — wait for shutdown, logout, or LocalAPI
+    // commands. This is a loop so that `SwitchProfile` and `ReloadConfig`
+    // can be handled without exiting: after the teardown+restart the
+    // daemon continues to wait for the next event.
     let logout_trigger = server.logout_trigger();
     let config_path_clone = config_path.clone();
-    tokio::select! {
-        () = wait_for_shutdown_signal(config_path_clone.as_ref()) => {}
-        () = async {
-            if let Some(ref trigger) = logout_trigger {
-                trigger.notified().await;
-            } else {
-                std::future::pending::<()>().await;
-            }
-        } => {
-            eprintln!("rustscaled: logout requested");
-            server.logout().await?;
-            eprintln!("rustscaled: logged out, state cleared → NeedsLogin");
-        }
-        Some(cmd) = command_rx.recv() => {
-            match cmd {
-                DaemonCommand::Shutdown => {
-                    eprintln!("rustscaled: shutdown requested via LocalAPI");
+    loop {
+        tokio::select! {
+            () = wait_for_shutdown_signal(config_path_clone.as_ref()) => break,
+            () = async {
+                if let Some(ref trigger) = logout_trigger {
+                    trigger.notified().await;
+                } else {
+                    std::future::pending::<()>().await;
                 }
-                DaemonCommand::ReloadConfig => {
-                    if let Some(ref cp) = config_path {
-                        eprintln!("rustscaled: reload-config via LocalAPI from {}", cp.display());
-                        if let Err(e) = server.reload_config(cp.to_str().unwrap_or("")).await {
-                            eprintln!("rustscaled: config reload failed: {e}");
+            } => {
+                eprintln!("rustscaled: logout requested");
+                server.logout().await?;
+                eprintln!("rustscaled: logged out, state cleared → NeedsLogin");
+                break;
+            }
+            Some(cmd) = command_rx.recv() => {
+                match cmd {
+                    DaemonCommand::Shutdown => {
+                        eprintln!("rustscaled: shutdown requested via LocalAPI");
+                        break;
+                    }
+                    DaemonCommand::ReloadConfig => {
+                        if let Some(ref cp) = config_path {
+                            eprintln!("rustscaled: reload-config via LocalAPI from {}", cp.display());
+                            if let Err(e) = server.reload_config(cp.to_str().unwrap_or("")).await {
+                                eprintln!("rustscaled: config reload failed: {e}");
+                            }
                         }
                     }
+                    DaemonCommand::SwitchProfile(id) => {
+                        eprintln!("rustscaled: switching to profile {id}");
+                        if let Err(e) = server.switch_profile(&id).await {
+                            eprintln!("rustscaled: profile switch failed: {e}");
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
         }
     }

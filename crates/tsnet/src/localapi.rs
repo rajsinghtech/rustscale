@@ -65,6 +65,11 @@ pub enum DaemonCommand {
     /// Re-read the config file and apply the resulting prefs. Fired by
     /// `POST /reload-config` or daemon-side SIGHUP handler.
     ReloadConfig,
+    /// Switch to a different profile by ID, tearing down the running
+    /// backend and re-bootstrapping with the new profile's prefs+keys.
+    /// Fired by `POST /localapi/v0/profiles/<id>`. Mirrors Go's
+    /// `LocalBackend.SwitchProfile` → `resetForProfileChangeLocked`.
+    SwitchProfile(String),
 }
 
 /// Credentials needed to build an [`AcmeCertFetcher`] on demand for the
@@ -1868,7 +1873,13 @@ async fn handle_profile_subpath<W: AsyncWrite + Unpin>(
             }
         }
         "POST" => {
-            // Switch to the profile.
+            // Switch to the profile. Validate the ID, then delegate the
+            // full teardown+restart to the daemon loop via
+            // `DaemonCommand::SwitchProfile`. The daemon calls
+            // `Server::switch_profile`, which closes the running engine,
+            // reloads the ProfileManager from disk, applies the new
+            // profile's prefs, and re-bootstraps with `up()`. Mirrors
+            // Go's `LocalBackend.SwitchProfile` → `resetForProfileChangeLocked`.
             let profiles = state.profiles.read().await;
             if !profiles.iter().any(|p| p.ID == profile_id) {
                 let body = serde_json::json!({"error": "profile not found"});
@@ -1877,24 +1888,19 @@ async fn handle_profile_subpath<W: AsyncWrite + Unpin>(
             }
             drop(profiles);
 
+            if let Some(ref tx) = state.command_tx {
+                let _ = tx.send(DaemonCommand::SwitchProfile(profile_id.clone()));
+            }
+            // Save the current-profile ID immediately so a crash during
+            // teardown doesn't lose the switch intent.
+            if let Some(ref dir) = state.state_dir {
+                let _ = LoginProfile::save_current_id(dir, &profile_id);
+            }
+            // Update the in-memory current-profile pointer so concurrent
+            // `GET /profiles/current` requests see the switch right away.
             {
                 let mut current = state.current_profile.write().await;
                 *current = Some(profile_id.clone());
-                if let Some(ref dir) = state.state_dir {
-                    let _ = LoginProfile::save_current_id(dir, &profile_id);
-                }
-            }
-
-            // Update prefs from the profile's ControlURL if set.
-            let profiles = state.profiles.read().await;
-            if let Some(p) = profiles.iter().find(|p| p.ID == profile_id) {
-                if !p.ControlURL.is_empty() {
-                    let mut prefs = state.prefs.write().await;
-                    p.ControlURL.clone_into(&mut prefs.ControlURL);
-                    if let Some(ref dir) = state.state_dir {
-                        let _ = prefs.save(dir);
-                    }
-                }
             }
 
             write_no_content_response(conn, 204, "No Content").await?;

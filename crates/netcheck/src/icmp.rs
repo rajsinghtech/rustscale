@@ -29,7 +29,7 @@ const ICMP_RECV_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// A best-effort ICMPv4 pinger. Created once per netcheck run and reused
 /// across multiple targets (matching Go's `ping.Pinger`).
-pub(crate) struct Pinger {
+pub struct Pinger {
     sock: UdpSocket,
     id: u16,
     seq: u16,
@@ -39,7 +39,7 @@ impl Pinger {
     /// Create a new ICMPv4 pinger. Tries unprivileged datagram ICMP first,
     /// then raw ICMP. Returns `None` if neither can be opened (e.g. no
     /// permissions).
-    pub(crate) fn new_v4() -> Option<Self> {
+    pub fn new_v4() -> Option<Self> {
         let sock = Self::open_icmp_socket()?;
         let id = rand::random::<u16>();
         Some(Self { sock, id, seq: 0 })
@@ -63,7 +63,7 @@ impl Pinger {
 
     /// Send an ICMP echo request to `dest` and wait for the reply. Returns
     /// the RTT on success, or `None` on timeout/error.
-    pub(crate) async fn ping(&mut self, dest: IpAddr, data: &[u8]) -> Option<Duration> {
+    pub async fn ping(&mut self, dest: IpAddr, data: &[u8]) -> Option<Duration> {
         let addr = SocketAddr::new(dest, 0);
         self.seq = self.seq.wrapping_add(1);
         let packet = build_echo_request(self.id, self.seq, data);

@@ -787,7 +787,7 @@ pub(crate) async fn dispatch<W: AsyncWrite + Unpin>(
 
         // --- POST /localapi/v0/ping?ip=<ip>&type=disco ---
         "ping" if method == "POST" => {
-            handle_ping(conn, &req.query).await?;
+            handle_ping(conn, &req.query, state).await?;
         }
 
         // --- GET /localapi/v0/watch-ipn-bus?mask=<u64> ---
@@ -1247,40 +1247,180 @@ fn build_health_json(state: &LocalApiState) -> serde_json::Value {
 // Ping handler
 // ---------------------------------------------------------------------------
 
-/// Handle POST /localapi/v0/ping?ip=<ip>&type=disco
+/// Handle POST /localapi/v0/ping?ip=<ip>&type=<disco|tsmp|icmp|peerapi>&size=<n>
 ///
-/// Returns 501 because magicsock does not expose a standalone disco-ping
-/// API that returns latency. The disco ping/pong mechanism is internal to
-/// path establishment and not callable as a one-shot latency probe from
-/// outside the crate. This is a known gap to be addressed in a future phase.
+/// Dispatches to the appropriate ping sub-handler based on `type`. For
+/// `disco` (the default), sends a CLI-initiated disco ping via magicsock
+/// and returns a `PingResult` with latency + endpoint info. For `icmp`,
+/// uses the netcheck ICMP pinger. `tsmp` and `peerapi` are stubbed.
 async fn handle_ping<W: AsyncWrite + Unpin>(
     conn: &mut W,
     query: &str,
+    state: &Arc<LocalApiState>,
 ) -> Result<(), std::io::Error> {
     let params = parse_query(query);
     let ip_str = params.get("ip").map_or("", String::as_str);
-    let ping_type = params.get("type").map_or("", String::as_str);
+    let ping_type = params.get("type").map_or("disco", String::as_str);
+    let size_str = params.get("size").map_or("0", String::as_str);
+    let size: usize = size_str.parse().unwrap_or(0);
 
     if ip_str.is_empty() {
         let body = serde_json::json!({"error": "missing 'ip' parameter"});
         write_json_response(conn, 400, "Bad Request", &body).await?;
         return Ok(());
     }
-    if ping_type.is_empty() {
-        let body = serde_json::json!({"error": "missing 'type' parameter"});
-        write_json_response(conn, 400, "Bad Request", &body).await?;
-        return Ok(());
-    }
 
-    let body = serde_json::json!({
-        "error": "ping not implemented",
-        "reason": "magicsock does not expose a standalone disco-ping API; \
-                   the ping/pong mechanism is internal to path establishment",
-        "ip": ip_str,
-        "type": ping_type,
-    });
-    write_json_response(conn, 501, "Not Implemented", &body).await?;
-    Ok(())
+    let ip: IpAddr = if let Ok(ip) = ip_str.parse() {
+        ip
+    } else {
+        let body = serde_json::json!({"error": "invalid IP address"});
+        return write_json_response(conn, 400, "Bad Request", &body).await;
+    };
+
+    match ping_type {
+        "disco" | "" => handle_disco_ping(conn, ip, size, state).await,
+        "tsmp" => handle_tsmp_ping(conn, ip, state).await,
+        "icmp" => handle_icmp_ping(conn, ip, state).await,
+        "peerapi" => handle_peerapi_ping(conn, ip, state).await,
+        other => {
+            let body = serde_json::json!({
+                "error": format!("unknown ping type '{other}'; try disco, tsmp, icmp, or peerapi")
+            });
+            write_json_response(conn, 400, "Bad Request", &body).await
+        }
+    }
+}
+
+/// Find a peer in the netmap by its Tailscale IP address.
+fn peer_by_ip(peers: &[Node], ip: IpAddr) -> Option<&Node> {
+    peers.iter().find(|p| {
+        p.Addresses.iter().any(|cidr| {
+            cidr.split('/')
+                .next()
+                .and_then(|s| s.parse::<IpAddr>().ok())
+                == Some(ip)
+        })
+    })
+}
+
+/// Handle disco ping: sends a CLI-initiated disco ping via magicsock.
+async fn handle_disco_ping<W: AsyncWrite + Unpin>(
+    conn: &mut W,
+    ip: IpAddr,
+    size: usize,
+    state: &Arc<LocalApiState>,
+) -> Result<(), std::io::Error> {
+    // Look up the peer by Tailscale IP in the netmap.
+    let (peer_key, peer_name) = {
+        let peers = state.peers.read().await;
+        let Some(peer) = peer_by_ip(&peers, ip) else {
+            let body = serde_json::json!({
+                "error": format!("no peer found for {ip}"),
+                "ip": ip.to_string(),
+            });
+            return write_json_response(conn, 404, "Not Found", &body).await;
+        };
+        (peer.Key.clone(), peer.Name.clone())
+    };
+
+    // Check if the IP is one of our own (self-ping).
+    let is_local_ip = state.tailscale_ips.contains(&ip);
+
+    match state
+        .magicsock
+        .cli_ping(&peer_key, &peer_name, ip, size)
+        .await
+    {
+        Ok(mut pr) => {
+            pr.NodeIP = ip.to_string();
+            pr.IsLocalIP = is_local_ip;
+            if pr.Err.is_empty() && is_local_ip {
+                pr.Err = "local IP".into();
+            }
+            let json = serde_json::to_value(&pr).unwrap_or_default();
+            write_json_response(conn, 200, "OK", &json).await
+        }
+        Err(e) => {
+            let pr = rustscale_ipnstate::PingResult {
+                IP: ip.to_string(),
+                NodeIP: ip.to_string(),
+                NodeName: peer_name,
+                Err: e.to_string(),
+                ..Default::default()
+            };
+            let json = serde_json::to_value(&pr).unwrap_or_default();
+            // Return 200 with the error in the result (Go does the same —
+            // the ping "succeeded" as an operation, it just got an error).
+            write_json_response(conn, 200, "OK", &json).await
+        }
+    }
+}
+
+/// Handle ICMP ping: uses the netcheck ICMP pinger (unprivileged DGRAM+ICMP).
+async fn handle_icmp_ping<W: AsyncWrite + Unpin>(
+    conn: &mut W,
+    ip: IpAddr,
+    state: &Arc<LocalApiState>,
+) -> Result<(), std::io::Error> {
+    let _ = state;
+    let Some(mut pinger) = rustscale_netcheck::icmp::Pinger::new_v4() else {
+        let body = serde_json::json!({
+            "error": "ICMP not available (need root or ping_group_range)"
+        });
+        return write_json_response(conn, 501, "Not Implemented", &body).await;
+    };
+    if let Some(rtt) = pinger.ping(ip, b"rustscale-ping").await {
+        let pr = rustscale_ipnstate::PingResult {
+            IP: ip.to_string(),
+            NodeIP: ip.to_string(),
+            LatencySeconds: rtt.as_secs_f64(),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&pr).unwrap_or_default();
+        write_json_response(conn, 200, "OK", &json).await
+    } else {
+        let pr = rustscale_ipnstate::PingResult {
+            IP: ip.to_string(),
+            NodeIP: ip.to_string(),
+            Err: "ICMP ping timed out or failed".into(),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&pr).unwrap_or_default();
+        write_json_response(conn, 200, "OK", &json).await
+    }
+}
+
+/// Handle TSMP ping: Tailscale's own protocol over WireGuard. Currently
+/// stubbed — requires a TSMP implementation in the WireGuard data plane.
+async fn handle_tsmp_ping<W: AsyncWrite + Unpin>(
+    conn: &mut W,
+    ip: IpAddr,
+    _state: &Arc<LocalApiState>,
+) -> Result<(), std::io::Error> {
+    let pr = rustscale_ipnstate::PingResult {
+        IP: ip.to_string(),
+        NodeIP: ip.to_string(),
+        Err: "TSMP ping not yet implemented".into(),
+        ..Default::default()
+    };
+    let json = serde_json::to_value(&pr).unwrap_or_default();
+    write_json_response(conn, 200, "OK", &json).await
+}
+
+/// Handle peerapi ping: sends a HEAD to the peer's PeerAPI via netstack.
+async fn handle_peerapi_ping<W: AsyncWrite + Unpin>(
+    conn: &mut W,
+    ip: IpAddr,
+    _state: &Arc<LocalApiState>,
+) -> Result<(), std::io::Error> {
+    let pr = rustscale_ipnstate::PingResult {
+        IP: ip.to_string(),
+        NodeIP: ip.to_string(),
+        Err: "peerapi ping not yet implemented".into(),
+        ..Default::default()
+    };
+    let json = serde_json::to_value(&pr).unwrap_or_default();
+    write_json_response(conn, 200, "OK", &json).await
 }
 
 // ---------------------------------------------------------------------------
@@ -3030,15 +3170,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_ping_returns_501() {
+    async fn test_ping_disco_returns_result() {
         let state = make_test_state().await;
         let resp = send_request_to_state(
             b"POST /localapi/v0/ping?ip=100.64.0.2&type=disco HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
             &state,
         )
         .await;
-        assert!(resp.contains("501 Not Implemented"));
-        assert!(resp.contains("ping not implemented"));
+        // Disco ping to a known peer should return 200 (with PingResult JSON,
+        // possibly containing an error since no real path exists in the test).
+        assert!(
+            resp.contains("200 OK") || resp.contains("404 Not Found"),
+            "expected 200 or 404, got: {resp}"
+        );
     }
 
     #[tokio::test]

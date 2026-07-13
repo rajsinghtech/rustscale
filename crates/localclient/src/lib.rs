@@ -31,6 +31,7 @@ pub use stream::WatchIpnBus;
 use std::path::PathBuf;
 
 use rustscale_ipn::{LoginProfile, MaskedPrefs, NotifyWatchOpt, Prefs, StartOptions, WaitingFile};
+use rustscale_ipnstate::PingResult;
 use rustscale_tailcfg::DERPMap;
 use rustscale_tsnet::{FileTarget, ServeConfig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -100,25 +101,24 @@ impl LocalClient {
         self.get_json("/localapi/v0/health").await
     }
 
-    /// POST /localapi/v0/ping?ip=<ip>&type=<ping_type> — returns the ping
-    /// result JSON. The daemon currently returns 501; this surfaces the error.
+    /// POST /localapi/v0/ping?ip=<ip>&type=<ping_type>&size=<size> — returns
+    /// a typed [`PingResult`] with latency, endpoint, and path info.
     pub async fn ping(
         &self,
         ip: &str,
         ping_type: &str,
-    ) -> Result<serde_json::Value, LocalClientError> {
+        size: usize,
+    ) -> Result<PingResult, LocalClientError> {
         let path = format!(
-            "/localapi/v0/ping?ip={}&type={}",
+            "/localapi/v0/ping?ip={}&type={}&size={}",
             url_encode(ip),
-            url_encode(ping_type)
+            url_encode(ping_type),
+            size,
         );
-        // The ping endpoint uses POST.
         let (_status, body) = self.send_request("POST", &path, &[]).await?;
-        // ping returns 501 which maps to HttpStatus error; but if it succeeds,
-        // parse the JSON.
-        let json: serde_json::Value =
+        let result: PingResult =
             serde_json::from_slice(&body).map_err(|e| LocalClientError::Json(e.to_string()))?;
-        Ok(json)
+        Ok(result)
     }
 
     /// GET /localapi/v0/netmap, extracting just the DERPMap. Convenience

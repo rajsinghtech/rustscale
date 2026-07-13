@@ -46,7 +46,7 @@ pub use relay_manager::{
 pub use relay_server::RelayServerExtension;
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -99,6 +99,8 @@ pub enum MagicsockError {
     NoPath,
     #[error("peer not found in netmap")]
     PeerNotFound,
+    #[error("ping timed out")]
+    Timeout,
 }
 
 /// Configuration for constructing a [`Magicsock`].
@@ -212,6 +214,12 @@ struct Inner {
     /// is a relaxed atomic increment and never affects send/recv error paths.
     sockstats_udp4: Option<rustscale_sockstats::LabelHandle>,
     sockstats_udp6: Option<rustscale_sockstats::LabelHandle>,
+    /// Pending CLI-initiated pings, keyed by peer node key. When a pong
+    /// arrives with `DiscoPingPurpose::CLI`, the matching sender is fired
+    /// with the latency and endpoint info. Mirrors Go's callback-based
+    /// `Conn.Ping` (magicsock.go:1181-1206).
+    cli_ping_callbacks:
+        RwLock<HashMap<NodePublic, tokio::sync::oneshot::Sender<rustscale_ipnstate::PingResult>>>,
 }
 
 /// Manages DERP connections across multiple regions.
@@ -636,6 +644,7 @@ impl Magicsock {
             net_info: RwLock::new(None),
             sockstats_udp4,
             sockstats_udp6,
+            cli_ping_callbacks: RwLock::new(HashMap::new()),
         });
 
         // Spawn the relay manager event loop. The handle is stored in Inner
@@ -1138,6 +1147,120 @@ impl Magicsock {
             .read()
             .expect("endpoints lock poisoned");
         endpoints.get(peer).map_or(0, endpoint::Endpoint::peer_mtu)
+    }
+
+    /// Send a CLI-initiated disco ping to `peer_key`. Returns a
+    /// [`rustscale_ipnstate::PingResult`] with latency, endpoint, and path
+    /// info. Mirrors Go's `Conn.Ping` (magicsock.go:1181-1206).
+    ///
+    /// Sends disco pings with [`DiscoPingPurpose::CLI`] to all candidate
+    /// endpoints. The first pong to arrive fires the callback and completes
+    /// the future. If no pong arrives within 5 seconds, returns
+    /// [`MagicsockError::Timeout`].
+    pub async fn cli_ping(
+        &self,
+        peer_key: &NodePublic,
+        peer_name: &str,
+        peer_ip: IpAddr,
+        size: usize,
+    ) -> Result<rustscale_ipnstate::PingResult, MagicsockError> {
+        use std::time::Duration;
+
+        // Look up the endpoint to get disco key, candidates, and home DERP.
+        let (peer_disco, candidates, home_derp) = {
+            let endpoints = self
+                .inner
+                .endpoints
+                .read()
+                .expect("endpoints lock poisoned");
+            let ep = endpoints.get(peer_key).ok_or(MagicsockError::NoPath)?;
+            (ep.peer_disco_key().clone(), ep.candidates(), ep.home_derp())
+        };
+
+        // Register the callback BEFORE sending pings so we don't miss the pong.
+        let (tx, rx) = tokio::sync::oneshot::channel::<rustscale_ipnstate::PingResult>();
+        {
+            let mut callbacks = self
+                .inner
+                .cli_ping_callbacks
+                .write()
+                .expect("cli_ping_callbacks lock poisoned");
+            callbacks.insert(peer_key.clone(), tx);
+        }
+
+        // Send disco pings to all candidate endpoints.
+        if candidates.is_empty() || peer_disco.is_zero() {
+            // No direct candidates — try via DERP as a fallback.
+            if home_derp > 0 && !peer_disco.is_zero() {
+                let tx_id = random_tx_id();
+                let ping = Message::Ping(Ping {
+                    tx_id,
+                    node_key: self
+                        .inner
+                        .node_public
+                        .read()
+                        .expect("node_public lock poisoned")
+                        .clone(),
+                    padding: 0,
+                });
+                if let Some(packet) = self.inner.disco.seal(&peer_disco, &ping) {
+                    // Register the pending ping on the endpoint so match_pong
+                    // can find it.
+                    {
+                        let mut endpoints = self
+                            .inner
+                            .endpoints
+                            .write()
+                            .expect("endpoints lock poisoned");
+                        if let Some(ep) = endpoints.get_mut(peer_key) {
+                            ep.add_pending_ping(
+                                tx_id,
+                                SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0),
+                                std::time::Instant::now(),
+                                DiscoPingPurpose::CLI,
+                                0,
+                            );
+                        }
+                    }
+                    self.inner
+                        .derp
+                        .send_packet(home_derp, peer_key.clone(), packet)
+                        .await;
+                }
+            }
+        } else {
+            for addr in &candidates {
+                self.inner
+                    .send_disco_ping(peer_key, &peer_disco, *addr, DiscoPingPurpose::CLI, size)
+                    .await;
+            }
+        }
+
+        // Wait for the pong callback or timeout.
+        let result = tokio::time::timeout(Duration::from_secs(5), rx).await;
+        let result = match result {
+            Ok(Ok(mut pr)) => {
+                pr.IP = peer_ip.to_string();
+                pr.NodeName = peer_name.to_string();
+                Ok(pr)
+            }
+            Ok(Err(_)) => {
+                // Callback was dropped (replaced by another ping). Return a
+                // timeout-style error.
+                Err(MagicsockError::NoPath)
+            }
+            Err(_) => {
+                // Timeout — remove the callback so a stale pong doesn't fire later.
+                let mut callbacks = self
+                    .inner
+                    .cli_ping_callbacks
+                    .write()
+                    .expect("cli_ping_callbacks lock poisoned");
+                callbacks.remove(peer_key);
+                Err(MagicsockError::Timeout)
+            }
+        };
+        result
     }
 
     /// Arm (or re-arm) the per-peer background task for heartbeats and UDP
@@ -2088,7 +2211,7 @@ impl Inner {
                 if debug_enabled() {
                     eprintln!("DBG disco_pong recv from {src} peer={}", short_key(&peer));
                 }
-                let confirmed_addr = {
+                let matched = {
                     let mut endpoints = self.endpoints.write().expect("endpoints lock poisoned");
                     if let Some(ep) = endpoints.get_mut(&peer) {
                         if let Some(pp) = ep.match_pong(&pong.tx_id) {
@@ -2104,7 +2227,7 @@ impl Inner {
                                     short_key(&peer)
                                 );
                             }
-                            Some(src)
+                            Some((src, pp))
                         } else {
                             if debug_enabled() {
                                 eprintln!("DBG disco_pong nomatch peer={}", short_key(&peer));
@@ -2115,12 +2238,32 @@ impl Inner {
                         None
                     }
                 };
-                if let Some(addr) = confirmed_addr {
-                    let mut map = self
-                        .addr_to_peer
-                        .write()
-                        .expect("addr_to_peer lock poisoned");
-                    map.insert(addr, peer);
+                if let Some((addr, pp)) = matched {
+                    {
+                        let mut map = self
+                            .addr_to_peer
+                            .write()
+                            .expect("addr_to_peer lock poisoned");
+                        map.insert(addr, peer.clone());
+                    }
+                    // Fire CLI ping callback if this was a CLI-purpose ping.
+                    if pp.purpose == DiscoPingPurpose::CLI {
+                        let latency = std::time::Instant::now()
+                            .duration_since(pp.sent_at)
+                            .as_secs_f64();
+                        let pr = rustscale_ipnstate::PingResult {
+                            LatencySeconds: latency,
+                            Endpoint: addr.to_string(),
+                            ..Default::default()
+                        };
+                        let mut callbacks = self
+                            .cli_ping_callbacks
+                            .write()
+                            .expect("cli_ping_callbacks lock poisoned");
+                        if let Some(tx) = callbacks.remove(&peer) {
+                            let _ = tx.send(pr);
+                        }
+                    }
                 }
             }
             _ => {}
@@ -2161,8 +2304,42 @@ impl Inner {
                     self.derp.send_packet(region, source, reply).await;
                 }
             }
-            Message::Pong(_) => {
-                // Pong via DERP — no useful address to confirm; just ignore.
+            Message::Pong(pong) => {
+                // Pong via DERP — match pending CLI pings so they complete
+                // with DERP path info (mirrors Go's handlePongConnLocked
+                // being called for DERP pongs too).
+                let matched = {
+                    let mut endpoints = self.endpoints.write().expect("endpoints lock poisoned");
+                    if let Some(ep) = endpoints.get_mut(&source) {
+                        ep.match_pong(&pong.tx_id)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(pp) = matched {
+                    if pp.purpose == DiscoPingPurpose::CLI {
+                        let latency = std::time::Instant::now()
+                            .duration_since(pp.sent_at)
+                            .as_secs_f64();
+                        let derp_id = if derp_region > 0 {
+                            derp_region
+                        } else {
+                            self.derp.home_region()
+                        };
+                        let pr = rustscale_ipnstate::PingResult {
+                            LatencySeconds: latency,
+                            DERPRegionID: derp_id,
+                            ..Default::default()
+                        };
+                        let mut callbacks = self
+                            .cli_ping_callbacks
+                            .write()
+                            .expect("cli_ping_callbacks lock poisoned");
+                        if let Some(tx) = callbacks.remove(&source) {
+                            let _ = tx.send(pr);
+                        }
+                    }
+                }
             }
             Message::CallMeMaybe(cmm) => {
                 // When direct paths are disabled, don't ping the peer's

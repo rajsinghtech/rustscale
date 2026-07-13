@@ -77,18 +77,81 @@ fn be32(data: &[u8], offset: usize) -> io::Result<u32> {
 
 /// Return a non-complemented Internet checksum sum.
 fn checksum(data: &[u8], initial: u16) -> u16 {
-    let mut sum = u32::from(initial);
-    for word in data.chunks(2) {
-        sum += if let [a, b] = word {
-            u32::from(u16::from_be_bytes([*a, *b]))
-        } else {
-            u32::from(word[0]) << 8
+    // Accumulate native-endian words, as wireguard-go does. Converting the
+    // accumulator at each boundary retains Internet checksum byte order on
+    // both little- and big-endian targets.
+    let mut sum = u64::from_be_bytes(u64::from(initial).to_ne_bytes());
+    let mut data = data;
+
+    macro_rules! add_words {
+        ($sum:expr, $carry:expr; $($offset:literal),+ $(,)?) => {
+            $(add_with_carry($sum, native_u64(&data[$offset..$offset + 8]), $carry);)+
         };
     }
+
+    while data.len() >= 128 {
+        let mut carry = 0;
+        add_words!(&mut sum, &mut carry; 0, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120);
+        sum = sum.wrapping_add(carry);
+        data = &data[128..];
+    }
+    if data.len() >= 64 {
+        let mut carry = 0;
+        add_words!(&mut sum, &mut carry; 0, 8, 16, 24, 32, 40, 48, 56);
+        sum = sum.wrapping_add(carry);
+        data = &data[64..];
+    }
+    if data.len() >= 32 {
+        let mut carry = 0;
+        add_words!(&mut sum, &mut carry; 0, 8, 16, 24);
+        sum = sum.wrapping_add(carry);
+        data = &data[32..];
+    }
+    if data.len() >= 16 {
+        let mut carry = 0;
+        add_words!(&mut sum, &mut carry; 0, 8);
+        sum = sum.wrapping_add(carry);
+        data = &data[16..];
+    }
+    if data.len() >= 8 {
+        let (next, carry) = sum.overflowing_add(native_u64(&data[..8]));
+        sum = next.wrapping_add(u64::from(carry));
+        data = &data[8..];
+    }
+    if data.len() >= 4 {
+        let word = u32::from_ne_bytes(data[..4].try_into().expect("four-byte tail"));
+        let (next, carry) = sum.overflowing_add(u64::from(word));
+        sum = next.wrapping_add(u64::from(carry));
+        data = &data[4..];
+    }
+    if data.len() >= 2 {
+        let word = u16::from_ne_bytes(data[..2].try_into().expect("two-byte tail"));
+        let (next, carry) = sum.overflowing_add(u64::from(word));
+        sum = next.wrapping_add(u64::from(carry));
+        data = &data[2..];
+    }
+    if let [byte] = data {
+        let word = u16::from_ne_bytes([*byte, 0]);
+        let (next, carry) = sum.overflowing_add(u64::from(word));
+        sum = next.wrapping_add(u64::from(carry));
+    }
+
+    let mut sum = u64::from_ne_bytes(sum.to_be_bytes());
     while sum >> 16 != 0 {
         sum = (sum & 0xffff) + (sum >> 16);
     }
     sum as u16
+}
+
+fn native_u64(data: &[u8]) -> u64 {
+    u64::from_ne_bytes(data[..8].try_into().expect("eight-byte word"))
+}
+
+fn add_with_carry(sum: &mut u64, word: u64, carry: &mut u64) {
+    let (next, first_carry) = sum.overflowing_add(word);
+    let (next, second_carry) = next.overflowing_add(*carry);
+    *sum = next;
+    *carry = u64::from(first_carry || second_carry);
 }
 fn pseudo(protocol: u8, src: &[u8], dst: &[u8], len: u16) -> u16 {
     let sum = checksum(src, 0);
@@ -333,6 +396,63 @@ fn split_gso(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The pre-fast-path two-byte implementation. Keep this independent from
+    // the native-word path so differential tests protect byte order and carry
+    // handling.
+    fn scalar_checksum(data: &[u8], initial: u16) -> u16 {
+        let mut sum = u32::from(initial);
+        for word in data.chunks(2) {
+            sum += if let [a, b] = word {
+                u32::from(u16::from_be_bytes([*a, *b]))
+            } else {
+                u32::from(word[0]) << 8
+            };
+        }
+        while sum >> 16 != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        sum as u16
+    }
+
+    #[test]
+    fn checksum_matches_scalar_for_lengths_initials_and_alignments() {
+        const INITIALS: &[u16] = &[0, 1, 0x1234, 0x7fff, 0xffff];
+        const BOUNDARIES: &[usize] = &[
+            1, 2, 3, 4, 7, 8, 15, 16, 31, 32, 63, 64, 127, 128, 129, 255, 256, 511,
+        ];
+
+        let mut bytes = vec![0; 520];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = match index % 11 {
+                0 | 1 => 0xff,
+                _ => (index as u8).wrapping_mul(73).wrapping_add(29),
+            };
+        }
+
+        for offset in 0..8 {
+            let aligned = &bytes[offset..];
+            for len in 0..=512 {
+                let data = &aligned[..len];
+                for &initial in INITIALS {
+                    assert_eq!(
+                        checksum(data, initial),
+                        scalar_checksum(data, initial),
+                        "offset={offset}, len={len}, initial={initial:#06x}",
+                    );
+                }
+            }
+            for &len in BOUNDARIES {
+                for &initial in INITIALS {
+                    assert_eq!(
+                        checksum(&aligned[..len], initial),
+                        scalar_checksum(&aligned[..len], initial),
+                        "boundary offset={offset}, len={len}, initial={initial:#06x}",
+                    );
+                }
+            }
+        }
+    }
 
     fn virtio(
         gso: u8,

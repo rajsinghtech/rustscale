@@ -97,6 +97,72 @@ const UDP_LIFETIME_CLIFF_SLACK: Duration = Duration::from_secs(2);
 /// `tstun.WireMTUsToProbe` (net/tstun/mtu.go:85).
 const WIRE_MTUS_TO_PROBE: &[usize] = &[1280, 1320, 1400, 1500, 8000, 9000];
 
+/// Whether a kernel-received UDP packet must use the established scalar
+/// handler. The fast handoff only applies to ordinary direct WireGuard UDP.
+#[cfg(target_os = "linux")]
+fn udp_batch_needs_scalar_handler(data: &[u8]) -> bool {
+    DiscoIo::looks_like_disco(data)
+        || relay::looks_like_geneve_disco(data)
+        || relay::looks_like_geneve_wireguard(data)
+}
+
+/// Publish an all-ordinary-WireGuard batch without changing the channel's
+/// packet-count capacity. A failed immediate full-batch reservation must not
+/// wait for an atomic reservation: packet-at-a-time `send` preserves the old
+/// streaming backpressure and lets other senders (notably DERP) make progress.
+#[cfg(target_os = "linux")]
+async fn publish_linux_wg_batch(sender: &mpsc::Sender<WgDatagram>, pending: &mut Vec<WgDatagram>) {
+    use tokio::sync::mpsc::error::TrySendError;
+
+    if pending.is_empty() {
+        return;
+    }
+    match sender.try_reserve_many(pending.len()) {
+        Ok(permits) => {
+            for (permit, datagram) in permits.zip(pending.drain(..)) {
+                permit.send(datagram);
+            }
+        }
+        Err(TrySendError::Full(_)) => {
+            for datagram in pending.drain(..) {
+                if sender.send(datagram).await.is_err() {
+                    break;
+                }
+            }
+        }
+        Err(TrySendError::Closed(_)) => {
+            // Draining drops all ciphertext immediately and releases no
+            // partially-held permits because reservation never succeeded.
+            pending.clear();
+        }
+    }
+}
+
+/// Identify and copy ordinary direct WireGuard packets in receive order while
+/// the caller holds its one address-map and endpoints-map snapshots.
+#[cfg(target_os = "linux")]
+fn stage_linux_wg_datagrams<'a>(
+    packets: impl IntoIterator<Item = (&'a [u8], SocketAddr)>,
+    peers: &HashMap<SocketAddr, NodePublic>,
+    endpoints: &mut HashMap<NodePublic, Endpoint>,
+    pending: &mut Vec<WgDatagram>,
+    mut record_rx: impl FnMut(SocketAddr, usize),
+) {
+    for (data, addr) in packets {
+        record_rx(addr, data.len());
+        let Some(peer) = peers.get(&addr).cloned() else {
+            continue;
+        };
+        if let Some(endpoint) = endpoints.get_mut(&peer) {
+            endpoint.note_recv_udp(std::time::Instant::now());
+        }
+        pending.push(WgDatagram {
+            peer,
+            data: data.to_vec(),
+        });
+    }
+}
+
 /// Size of a complete disco ping packet without any padding.
 /// `MAGIC(6) + sender_pub(32) + nonce(24) + tag(16) + header(2) + ping(44)`.
 /// Mirrors Go's `discoPingSize` (endpoint.go:1249-1250).
@@ -1724,17 +1790,24 @@ fn spawn_recv_tasks(
             // active for diagnostics and old-kernel fallback behavior.
             let disable_udp_gro = std::env::var_os("RUSTSCALE_DISABLE_UDP_GRO").is_some();
             let mut batch = udp_batch::ReceiveBatch::new(&udp, disable_udp_gro);
+            // This is deliberately only an outer staging allocation. Every
+            // ciphertext Vec moves into the channel (or is dropped) before
+            // the next kernel receive, so an idle receive task does not pin
+            // a previous GRO-sized batch of buffers.
+            let mut pending = Vec::with_capacity(udp_batch::MAX_BATCH);
             loop {
                 match udp.async_io(Interest::READABLE, || batch.recv(&udp)).await {
                     Ok(count) => {
-                        for index in 0..count {
-                            let Some((data, addr)) = batch.datagram(index) else {
-                                // A successful receive batch must always have
-                                // a source and a logical packet for each slot.
-                                return;
-                            };
-                            inner.record_udp_rx(addr, data.len());
-                            inner.handle_udp_packet(data, addr).await;
+                        if inner.prepare_linux_udp_batch(&batch, count, &mut pending) {
+                            for index in 0..count {
+                                let Some((data, addr)) = batch.datagram(index) else {
+                                    return;
+                                };
+                                inner.record_udp_rx(addr, data.len());
+                                inner.handle_udp_packet(data, addr).await;
+                            }
+                        } else {
+                            publish_linux_wg_batch(&inner.wg_send, &mut pending).await;
                         }
                     }
                     Err(error) if udp_batch::recvmmsg_is_unsupported(&error) => {
@@ -2386,6 +2459,65 @@ impl Inner {
         }
     }
 
+    /// Returns true when the caller must run the established sequential
+    /// handler. Control traffic deliberately takes the scalar path for the
+    /// *whole* batch: disco and Geneve handling can update routing state and
+    /// has historically been interleaved with direct WireGuard delivery in
+    /// packet order. The normal path completes all ReceiveBatch borrowing
+    /// before the caller awaits channel capacity, keeping ReceiveBatch
+    /// confined to its one non-Sync receive task.
+    #[cfg(target_os = "linux")]
+    fn prepare_linux_udp_batch(
+        &self,
+        batch: &udp_batch::ReceiveBatch,
+        count: usize,
+        pending: &mut Vec<WgDatagram>,
+    ) -> bool {
+        let mut has_control = false;
+        for index in 0..count {
+            let Some((data, _)) = batch.datagram(index) else {
+                // A successful receive batch must always have a source and a
+                // logical packet for each slot.
+                // No staged data may survive a scalar fallback, even though
+                // normal publication always drains it before the next batch.
+                pending.clear();
+                return true;
+            };
+            if udp_batch_needs_scalar_handler(data) {
+                has_control = true;
+                break;
+            }
+        }
+
+        if has_control {
+            return true;
+        }
+
+        pending.clear();
+        // The all-ordinary-WireGuard path performs both peer identification
+        // and activity accounting under one snapshot. Do not hold either
+        // lock while waiting for channel capacity.
+        {
+            let peers = self
+                .addr_to_peer
+                .read()
+                .expect("addr_to_peer lock poisoned");
+            let mut endpoints = self.endpoints.write().expect("endpoints lock poisoned");
+            stage_linux_wg_datagrams(
+                (0..count).map(|index| {
+                    batch
+                        .datagram(index)
+                        .expect("published receive batch has every logical datagram")
+                }),
+                &peers,
+                &mut endpoints,
+                pending,
+                |addr, len| self.record_udp_rx(addr, len),
+            );
+        }
+        false
+    }
+
     async fn handle_derp_packet(&self, data: &[u8], source: NodePublic, region_id: i32) {
         // Note DERP region frame for health tracking.
         if let Some(ref health) = self.derp.health {
@@ -2996,6 +3128,16 @@ fn short_key(k: &NodePublic) -> String {
 mod linux_batch_tests {
     use super::*;
 
+    fn pending(count: usize) -> Vec<WgDatagram> {
+        let peer = NodePrivate::generate().public();
+        (0..count)
+            .map(|index| WgDatagram {
+                peer: peer.clone(),
+                data: vec![index as u8],
+            })
+            .collect()
+    }
+
     fn advance_sequence(
         lengths: &[usize],
         results: impl IntoIterator<Item = io::Result<usize>>,
@@ -3062,6 +3204,135 @@ mod linux_batch_tests {
             error.and_then(|error| error.raw_os_error()),
             Some(libc::EINVAL)
         );
+    }
+
+    #[test]
+    fn control_batch_selection_covers_disco_and_geneve() {
+        let mut disco = vec![
+            0;
+            rustscale_disco::MAGIC.len()
+                + rustscale_disco::KEY_LEN
+                + rustscale_disco::NONCE_LEN
+        ];
+        disco[..rustscale_disco::MAGIC.len()].copy_from_slice(&rustscale_disco::MAGIC);
+        assert!(DiscoIo::looks_like_disco(&disco));
+        assert!(udp_batch_needs_scalar_handler(&disco));
+        assert!(udp_batch_needs_scalar_handler(
+            &relay::encode_geneve_wireguard(7, b"wg")
+        ));
+        assert!(!udp_batch_needs_scalar_handler(b"ordinary-wireguard"));
+    }
+
+    #[test]
+    fn direct_batch_keeps_known_sources_ordered_and_drops_unknown() {
+        let a = NodePrivate::generate().public();
+        let b = NodePrivate::generate().public();
+        let a_addr: SocketAddr = "127.0.0.1:10001".parse().unwrap();
+        let b_addr: SocketAddr = "127.0.0.1:10002".parse().unwrap();
+        let unknown_addr: SocketAddr = "127.0.0.1:10003".parse().unwrap();
+        let peers = HashMap::from([(a_addr, a.clone()), (b_addr, b.clone())]);
+        let packets = vec![
+            (b"a-first".to_vec(), a_addr),
+            (b"unknown".to_vec(), unknown_addr),
+            (b"b-only".to_vec(), b_addr),
+            (b"a-last".to_vec(), a_addr),
+        ];
+        let mut endpoints = HashMap::new();
+        let mut pending = Vec::new();
+        let mut accounted = Vec::new();
+        stage_linux_wg_datagrams(
+            packets.iter().map(|(data, addr)| (data.as_slice(), *addr)),
+            &peers,
+            &mut endpoints,
+            &mut pending,
+            |addr, len| accounted.push((addr, len)),
+        );
+        assert_eq!(
+            accounted.len(),
+            packets.len(),
+            "sockstats sees every packet"
+        );
+        assert_eq!(
+            pending
+                .iter()
+                .map(|datagram| (datagram.peer.clone(), datagram.data.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (a.clone(), b"a-first".to_vec()),
+                (b, b"b-only".to_vec()),
+                (a, b"a-last".to_vec()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn full_immediate_reservation_publishes_once_in_order() {
+        let (sender, mut receiver) = mpsc::channel(256);
+        let mut staged = pending(256);
+        publish_linux_wg_batch(&sender, &mut staged).await;
+        assert!(staged.is_empty());
+        for index in 0..256 {
+            assert_eq!(receiver.recv().await.unwrap().data, vec![index as u8]);
+        }
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn full_reservation_falls_back_to_ordered_sends_and_drains() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+        use tokio::sync::mpsc::error::TrySendError;
+
+        let (sender, mut receiver) = mpsc::channel(256);
+        for index in 0..256 {
+            sender
+                .try_send(WgDatagram {
+                    peer: NodePrivate::generate().public(),
+                    data: vec![0x80, index as u8],
+                })
+                .unwrap();
+        }
+        assert!(matches!(
+            sender.try_reserve_many(2),
+            Err(TrySendError::Full(_))
+        ));
+        let mut staged = pending(2);
+        {
+            let mut publish = std::pin::pin!(publish_linux_wg_batch(&sender, &mut staged));
+            let mut context = Context::from_waker(Waker::noop());
+
+            // The channel is completely full, so `try_reserve_many(2)` must
+            // return Full and the first ordered send must wait for a drain.
+            assert!(matches!(publish.as_mut().poll(&mut context), Poll::Pending));
+            assert_eq!(receiver.try_recv().unwrap().data, vec![0x80, 0]);
+
+            // One drain admits only the first staged packet. The second remains
+            // blocked until a second receiver drain; no executor scheduling is
+            // involved in either observation.
+            assert!(matches!(publish.as_mut().poll(&mut context), Poll::Pending));
+            assert_eq!(receiver.try_recv().unwrap().data, vec![0x80, 1]);
+            assert!(matches!(
+                publish.as_mut().poll(&mut context),
+                Poll::Ready(())
+            ));
+        }
+        assert!(staged.is_empty());
+
+        let mut tail = Vec::new();
+        while let Ok(datagram) = receiver.try_recv() {
+            tail.push(datagram.data);
+        }
+        assert_eq!(tail.len(), 256);
+        assert_eq!(tail[tail.len() - 2..], [vec![0], vec![1]]);
+    }
+
+    #[tokio::test]
+    async fn closed_receiver_drops_staged_packets_without_permits() {
+        let (sender, receiver) = mpsc::channel(256);
+        drop(receiver);
+        let mut staged = pending(3);
+        publish_linux_wg_batch(&sender, &mut staged).await;
+        assert!(staged.is_empty());
     }
 }
 

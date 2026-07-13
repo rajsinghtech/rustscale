@@ -823,6 +823,20 @@ impl Magicsock {
                     Endpoint::new(peer.Key.clone(), peer.DiscoKey.clone(), peer.HomeDERP)
                 });
 
+                // An existing endpoint must follow netmap disco-key updates:
+                // CLI pings and discovery read the key from the endpoint.
+                // Only remove the old reverse mapping if it still belongs to
+                // this peer; another peer may have claimed it in the meantime.
+                if let Some(previous_disco) = ep.update_peer_disco_key(peer.DiscoKey.clone()) {
+                    if !previous_disco.is_zero()
+                        && d2p
+                            .get(&previous_disco)
+                            .is_some_and(|mapped_peer| mapped_peer == &peer.Key)
+                    {
+                        d2p.remove(&previous_disco);
+                    }
+                }
+
                 // Update HomeDERP if it changed.
                 if peer.HomeDERP != ep.home_derp() {
                     ep.set_home_derp(peer.HomeDERP);

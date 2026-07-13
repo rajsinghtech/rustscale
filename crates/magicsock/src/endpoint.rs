@@ -324,6 +324,20 @@ impl Endpoint {
         &self.peer_disco_key
     }
 
+    /// Refresh the peer's disco public key.
+    ///
+    /// Returns the previous key when it changed, or `None` when it was
+    /// already current. This deliberately preserves all other endpoint state.
+    pub fn update_peer_disco_key(
+        &mut self,
+        peer_disco_key: rustscale_key::DiscoPublic,
+    ) -> Option<rustscale_key::DiscoPublic> {
+        if self.peer_disco_key == peer_disco_key {
+            return None;
+        }
+        Some(std::mem::replace(&mut self.peer_disco_key, peer_disco_key))
+    }
+
     /// Set candidate UDP endpoints (from `tailcfg::Node.Endpoints`).
     pub fn set_candidates(&mut self, addrs: Vec<SocketAddr>) {
         self.candidates = addrs
@@ -803,6 +817,34 @@ mod tests {
         let e = ep();
         let now = Instant::now();
         assert_eq!(e.best_path(now).class(), PathClass::Derp);
+    }
+
+    #[test]
+    fn peer_disco_key_update_reports_only_changes() {
+        let mut e = ep();
+        let original = e.peer_disco_key().clone();
+        let now = Instant::now();
+        let candidate = sa(1234);
+        e.set_candidates(vec![candidate]);
+        e.confirm_direct(sa(5678), now);
+        e.add_pending_ping(
+            [0xaa; 12],
+            candidate,
+            now,
+            DiscoPingPurpose::Discovery,
+            0,
+            None,
+        );
+
+        assert_eq!(e.update_peer_disco_key(original.clone()), None);
+        assert_eq!(e.peer_disco_key(), &original);
+
+        let replacement = DiscoPrivate::generate().public();
+        assert_eq!(e.update_peer_disco_key(replacement.clone()), Some(original));
+        assert_eq!(e.peer_disco_key(), &replacement);
+        assert_eq!(e.candidates(), vec![candidate]);
+        assert_eq!(e.best_path(now).class(), PathClass::Direct);
+        assert_eq!(e.pending_pings_count(), 1);
     }
 
     #[test]

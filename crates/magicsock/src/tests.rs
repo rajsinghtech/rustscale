@@ -184,6 +184,113 @@ fn make_peer(
     }
 }
 
+#[tokio::test]
+async fn netmap_refreshes_peer_disco_key_and_reverse_map() {
+    let private_key = NodePrivate::generate();
+    let peer_key = NodePrivate::generate().public();
+    let other_peer = NodePrivate::generate().public();
+    let zero_disco = rustscale_key::DiscoPublic::from_raw32([0; 32]);
+    let first_disco = DiscoPrivate::generate().public();
+    let rotated_disco = DiscoPrivate::generate().public();
+    let (magicsock, _rx) = Magicsock::new(MagicsockConfig {
+        private_key,
+        disco_key: DiscoPrivate::generate(),
+        derp_client: None,
+        derp_map: None,
+        home_derp_region: 0,
+        udp_bind: None,
+        udp_socket: None,
+        portmapper: None,
+        health: None,
+        disable_direct_paths: false,
+        peer_relay_server: false,
+        relay_server_config: None,
+        sockstats: None,
+        control_knobs: None,
+    })
+    .await
+    .expect("magicsock");
+
+    magicsock
+        .set_netmap(vec![make_peer(
+            peer_key.clone(),
+            zero_disco.clone(),
+            vec![],
+            0,
+        )])
+        .await
+        .unwrap();
+    assert_eq!(magicsock.inner.peer_disco_key(&peer_key), Some(zero_disco));
+
+    magicsock
+        .set_netmap(vec![make_peer(
+            peer_key.clone(),
+            first_disco.clone(),
+            vec![],
+            0,
+        )])
+        .await
+        .unwrap();
+    assert_eq!(
+        magicsock.inner.peer_disco_key(&peer_key),
+        Some(first_disco.clone())
+    );
+    assert_eq!(
+        magicsock
+            .inner
+            .disco_to_peer
+            .read()
+            .unwrap()
+            .get(&first_disco),
+        Some(&peer_key)
+    );
+
+    magicsock
+        .set_netmap(vec![make_peer(
+            peer_key.clone(),
+            rotated_disco.clone(),
+            vec![],
+            0,
+        )])
+        .await
+        .unwrap();
+    {
+        let d2p = magicsock.inner.disco_to_peer.read().unwrap();
+        assert!(!d2p.contains_key(&first_disco));
+        assert_eq!(d2p.get(&rotated_disco), Some(&peer_key));
+    }
+
+    // A stale mapping must not be removed if another peer now owns the key.
+    magicsock
+        .inner
+        .disco_to_peer
+        .write()
+        .unwrap()
+        .insert(rotated_disco.clone(), other_peer.clone());
+    magicsock
+        .set_netmap(vec![make_peer(
+            peer_key.clone(),
+            rustscale_key::DiscoPublic::from_raw32([0; 32]),
+            vec![],
+            0,
+        )])
+        .await
+        .unwrap();
+    assert_eq!(
+        magicsock.inner.peer_disco_key(&peer_key),
+        Some(rustscale_key::DiscoPublic::from_raw32([0; 32]))
+    );
+    assert_eq!(
+        magicsock
+            .inner
+            .disco_to_peer
+            .read()
+            .unwrap()
+            .get(&rotated_disco),
+        Some(&other_peer)
+    );
+}
+
 // ---- Test (a): DERP data path fallback ----
 
 #[tokio::test]

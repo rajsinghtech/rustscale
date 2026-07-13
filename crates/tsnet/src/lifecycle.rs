@@ -63,6 +63,8 @@ impl Server {
             self.config.peer_relay_server,
         );
 
+        let capture = crate::capture::new_slot();
+
         // Netstack data-plane pump: netstack <-> WG <-> magicsock.
         let pump = tokio::spawn(run_netstack_pump(
             b.magicsock.clone(),
@@ -73,6 +75,7 @@ impl Server {
             b.filter.clone(),
             b.packet_drops.clone(),
             b.cancel.clone(),
+            capture.clone(),
         ));
 
         // Map-stream update task (peer/route deltas).
@@ -320,6 +323,7 @@ impl Server {
                 health: b.health.clone(),
                 dns_config: b.dns_config.clone(),
                 packet_drops: b.packet_drops.clone(),
+                capture: capture.clone(),
                 metrics: localapi::default_metric_registry(),
                 prefs: prefs.clone(),
                 tailscale_ips: b.tailscale_ips.clone(),
@@ -421,6 +425,8 @@ impl Server {
             cancel: b.cancel,
             tasks: Mutex::new(tasks),
             packet_drops: b.packet_drops,
+            capture,
+            capture_handles: std::sync::Mutex::new(vec![]),
             resolver: b.resolver,
             our_fqdn: b.our_fqdn,
             domain: b.domain.clone(),
@@ -537,6 +543,8 @@ impl Server {
         // `create_tun_device` returns an error and `?` propagates it).
         let tun: Arc<dyn Tun> = create_tun_device(&config, &b, self.config.accept_routes).await?;
 
+        let capture = crate::capture::new_slot();
+
         // TUN data-plane pump: TUN <-> WG <-> magicsock.
         let pump = tokio::spawn(run_tun_pump(
             b.magicsock.clone(),
@@ -547,6 +555,7 @@ impl Server {
             b.filter.clone(),
             b.packet_drops.clone(),
             b.cancel.clone(),
+            capture.clone(),
         ));
 
         // Periodic endpoint update (Bug 4).
@@ -778,6 +787,7 @@ impl Server {
                 health: b.health.clone(),
                 dns_config: b.dns_config.clone(),
                 packet_drops: b.packet_drops.clone(),
+                capture: capture.clone(),
                 metrics: localapi::default_metric_registry(),
                 prefs: prefs.clone(),
                 tailscale_ips: b.tailscale_ips.clone(),
@@ -912,6 +922,8 @@ impl Server {
             cancel: b.cancel,
             tasks: Mutex::new(tasks),
             packet_drops: b.packet_drops,
+            capture,
+            capture_handles: std::sync::Mutex::new(vec![]),
             resolver: b.resolver,
             our_fqdn: b.our_fqdn,
             domain: b.domain.clone(),
@@ -1074,6 +1086,7 @@ impl Server {
             health: Tracker::new(),
             dns_config: Arc::new(RwLock::new(None)),
             packet_drops: Arc::new(AtomicU64::new(0)),
+            capture: crate::capture::new_slot(),
             metrics: localapi::default_metric_registry(),
             prefs: prefs.clone(),
             tailscale_ips: vec![],
@@ -1840,6 +1853,12 @@ impl Server {
     /// Shut down the server.
     pub async fn close(&mut self) {
         if let Some(mut inner) = self.inner.take() {
+            crate::capture::clear(&inner.capture);
+            inner
+                .capture_handles
+                .lock()
+                .expect("capture handles lock poisoned")
+                .clear();
             // Stop serve listeners first (graceful).
             if let Some(serve) = inner.serve.take() {
                 serve.stop().await;

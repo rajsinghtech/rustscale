@@ -13,6 +13,77 @@ use tokio::io::AsyncReadExt;
 
 use crate::LocalClientError;
 
+/// Raw pcap byte stream returned by `POST /localapi/v0/debug-capture`.
+pub struct DebugCapture {
+    stream: Connection,
+    buffered: Vec<u8>,
+    header_consumed: bool,
+}
+
+impl DebugCapture {
+    pub(super) fn new(stream: Connection) -> Self {
+        Self {
+            stream,
+            buffered: Vec::with_capacity(8192),
+            header_consumed: false,
+        }
+    }
+
+    /// Read raw pcap bytes, returning zero at EOF.
+    pub async fn read(&mut self, out: &mut [u8]) -> Result<usize, LocalClientError> {
+        self.consume_header().await?;
+        if !self.buffered.is_empty() {
+            let len = out.len().min(self.buffered.len());
+            out[..len].copy_from_slice(&self.buffered[..len]);
+            self.buffered.drain(..len);
+            return Ok(len);
+        }
+        self.stream
+            .read(out)
+            .await
+            .map_err(|e| LocalClientError::Io(e.to_string()))
+    }
+
+    /// Close the capture connection and ask the LocalAPI handler to clean up.
+    pub async fn close(&mut self) -> Result<(), LocalClientError> {
+        use tokio::io::AsyncWriteExt;
+        self.stream
+            .shutdown()
+            .await
+            .map_err(|e| LocalClientError::Io(e.to_string()))
+    }
+
+    async fn consume_header(&mut self) -> Result<(), LocalClientError> {
+        while !self.header_consumed {
+            if let Some(pos) = self.buffered.windows(4).position(|w| w == b"\r\n\r\n") {
+                let header = &self.buffered[..pos];
+                if !header.starts_with(b"HTTP/1.1 200 ") {
+                    return Err(LocalClientError::HttpStatus {
+                        status: 0,
+                        message: String::from_utf8_lossy(header).into_owned(),
+                    });
+                }
+                self.buffered.drain(..pos + 4);
+                self.header_consumed = true;
+                break;
+            }
+            let mut tmp = [0u8; 4096];
+            let count = self
+                .stream
+                .read(&mut tmp)
+                .await
+                .map_err(|e| LocalClientError::Io(e.to_string()))?;
+            if count == 0 {
+                return Err(LocalClientError::Io(
+                    "capture closed before HTTP response".into(),
+                ));
+            }
+            self.buffered.extend_from_slice(&tmp[..count]);
+        }
+        Ok(())
+    }
+}
+
 /// A streaming reader for `GET /localapi/v0/watch-ipn-bus`.
 ///
 /// Created by

@@ -96,6 +96,8 @@ pub(crate) struct LocalApiState {
     pub health: Tracker,
     pub dns_config: Arc<RwLock<Option<DNSConfig>>>,
     pub packet_drops: Arc<AtomicU64>,
+    /// Shared optional packet-capture sink, also used by data-plane pumps.
+    pub capture: crate::capture::CaptureSlot,
     /// Client metric registry — supersedes the hardcoded metrics above.
     /// Subsystems register counters/gauges here; the `/metrics` endpoint
     /// renders them via `to_prometheus_text()`.
@@ -850,6 +852,15 @@ pub(crate) async fn dispatch<W: AsyncWrite + Unpin>(
             handle_ping(conn, &req.query, state).await?;
         }
 
+        // --- POST /localapi/v0/debug-capture ---
+        "debug-capture" if method == "POST" => {
+            if !require_readwrite(peer_identity) {
+                write_access_denied(conn).await?;
+                return Ok(());
+            }
+            handle_debug_capture(conn, state).await?;
+        }
+
         // --- GET /localapi/v0/watch-ipn-bus?mask=<u64> ---
         "watch-ipn-bus" if method == "GET" => {
             handle_watch_ipn_bus(conn, &req.query, state).await?;
@@ -992,6 +1003,45 @@ pub(crate) async fn dispatch<W: AsyncWrite + Unpin>(
         }
     }
 
+    Ok(())
+}
+
+/// Handle POST /localapi/v0/debug-capture.
+///
+/// The response is a connection-close-delimited pcap byte stream. The sink's
+/// bounded channel output means a stalled LocalAPI client cannot block packet
+/// processing. Like Go's handler, leaving this endpoint clears the sink.
+async fn handle_debug_capture<W: AsyncWrite + Unpin>(
+    conn: &mut W,
+    state: &Arc<LocalApiState>,
+) -> Result<(), std::io::Error> {
+    conn.write_all(
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/vnd.tcpdump.pcap\r\n\
+          Connection: close\r\n\r\n",
+    )
+    .await?;
+    conn.flush().await?;
+
+    let sink = crate::capture::get_or_set(&state.capture);
+    let (tx, mut rx) = mpsc::channel(64);
+    let handle = sink.register_output(crate::capture::ChannelOutput::new(tx))?;
+
+    loop {
+        tokio::select! {
+            packet = rx.recv() => match packet {
+                Some(packet) => {
+                    if conn.write_all(&packet).await.is_err() || conn.flush().await.is_err() {
+                        break;
+                    }
+                }
+                None => break,
+            },
+            () = sink.wait() => break,
+        }
+    }
+
+    handle.unregister();
+    crate::capture::clear(&state.capture);
     Ok(())
 }
 
@@ -2972,6 +3022,7 @@ mod tests {
             health: Tracker::new(),
             dns_config: Arc::new(RwLock::new(None)),
             packet_drops: Arc::new(AtomicU64::new(0)),
+            capture: crate::capture::new_slot(),
             metrics: default_metric_registry(),
             prefs: Arc::new(RwLock::new(Prefs {
                 Hostname: "test".into(),
@@ -3736,6 +3787,7 @@ mod tests {
             health: state.health.clone(),
             dns_config: state.dns_config.clone(),
             packet_drops: state.packet_drops.clone(),
+            capture: state.capture.clone(),
             metrics: default_metric_registry(),
             prefs: state.prefs.clone(),
             tailscale_ips: state.tailscale_ips.clone(),
@@ -3960,6 +4012,7 @@ mod tests {
                 ..Default::default()
             }))),
             packet_drops: base.packet_drops.clone(),
+            capture: base.capture.clone(),
             metrics: default_metric_registry(),
             prefs: base.prefs.clone(),
             tailscale_ips: base.tailscale_ips.clone(),

@@ -26,7 +26,7 @@ mod error;
 mod stream;
 
 pub use error::LocalClientError;
-pub use stream::WatchIpnBus;
+pub use stream::{DebugCapture, WatchIpnBus};
 
 use std::path::PathBuf;
 
@@ -146,6 +146,14 @@ impl LocalClient {
         let path = format!("/localapi/v0/watch-ipn-bus?mask={mask}");
         let stream = self.connect_and_send("GET", &path).await?;
         Ok(WatchIpnBus::new(stream))
+    }
+
+    /// POST /localapi/v0/debug-capture — returns a long-lived raw pcap stream.
+    pub async fn debug_capture(&self) -> Result<DebugCapture, LocalClientError> {
+        let stream = self
+            .connect_and_send("POST", "/localapi/v0/debug-capture")
+            .await?;
+        Ok(DebugCapture::new(stream))
     }
 
     /// POST /localapi/v0/start — applies prefs and triggers bootstrap.

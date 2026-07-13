@@ -19,6 +19,7 @@ pub(crate) async fn run_netstack_pump(
     filter: Arc<std::sync::Mutex<Filter>>,
     packet_drops: Arc<AtomicU64>,
     cancel: Arc<CancelToken>,
+    capture: crate::capture::CaptureSlot,
 ) {
     let tx_notify = netstack.tx_notify();
     let mut wg_timer = tokio::time::interval(std::time::Duration::from_millis(250));
@@ -37,6 +38,7 @@ pub(crate) async fn run_netstack_pump(
                     let f = filter.clone();
                     let drops = packet_drops.clone();
                     let ns = netstack.clone();
+                    let inbound_capture = capture.clone();
                     handle_inbound_wg(&magicsock, &wg_tunnels, &dgram, move |pt| {
                         let dropped = {
                             let mut filt = f.lock().unwrap();
@@ -46,6 +48,11 @@ pub(crate) async fn run_netstack_pump(
                             drops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             return;
                         }
+                        crate::capture::log_packet(
+                            &inbound_capture,
+                            crate::capture::CapturePath::SynthesizedToLocal,
+                            &pt,
+                        );
                         ns.push_rx(pt);
                     }).await;
 
@@ -56,6 +63,7 @@ pub(crate) async fn run_netstack_pump(
                         let f = filter.clone();
                         let drops = packet_drops.clone();
                         let ns = netstack.clone();
+                        let capture = capture.clone();
                         handle_inbound_wg(&magicsock, &wg_tunnels, &more, move |pt| {
                             let dropped = {
                                 let mut filt = f.lock().unwrap();
@@ -65,6 +73,11 @@ pub(crate) async fn run_netstack_pump(
                                 drops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 return;
                             }
+                            crate::capture::log_packet(
+                                &capture,
+                                crate::capture::CapturePath::SynthesizedToLocal,
+                                &pt,
+                            );
                             ns.push_rx(pt);
                         }).await;
                     }
@@ -87,6 +100,11 @@ pub(crate) async fn run_netstack_pump(
                 let mut filt = filter.lock().unwrap();
                 filt.update_outbound(&pkt);
             }
+            crate::capture::log_packet(
+                &capture,
+                crate::capture::CapturePath::SynthesizedToPeer,
+                &pkt,
+            );
             encapsulate_and_send(&magicsock, &wg_tunnels, &route_table, &pkt).await;
             drained += 1;
         }
@@ -136,6 +154,7 @@ pub(crate) async fn process_tun_inbound(
     packet_drops: &Arc<AtomicU64>,
     tun: &Arc<dyn Tun>,
     dgram: &rustscale_magicsock::WgDatagram,
+    capture: &crate::capture::CaptureSlot,
 ) {
     let tunn = {
         let tunnels = wg_tunnels.read().await;
@@ -155,6 +174,7 @@ pub(crate) async fn process_tun_inbound(
                 if dropped {
                     packet_drops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 } else {
+                    crate::capture::log_packet(capture, crate::capture::CapturePath::FromPeer, &pt);
                     let _ = tun.write_packet(&pt).await;
                 }
             }

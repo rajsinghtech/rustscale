@@ -442,6 +442,7 @@ impl Server {
             health: inner.health.clone(),
             dns_config: inner.dns_config.clone(),
             packet_drops: inner.packet_drops.clone(),
+            capture: inner.capture.clone(),
             metrics: crate::localapi::default_metric_registry(),
             prefs: Arc::new(RwLock::new(self.load_prefs().unwrap_or_default())),
             tailscale_ips: inner.tailscale_ips.clone(),

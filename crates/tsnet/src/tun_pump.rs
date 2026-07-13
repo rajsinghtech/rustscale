@@ -15,6 +15,7 @@ pub(crate) async fn run_tun_pump(
     filter: Arc<std::sync::Mutex<Filter>>,
     packet_drops: Arc<AtomicU64>,
     cancel: Arc<CancelToken>,
+    capture: crate::capture::CaptureSlot,
 ) {
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(250));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -33,7 +34,7 @@ pub(crate) async fn run_tun_pump(
                     Ok(()) => {
                         send_tun_batch(
                             &magicsock, &wg_tunnels, &route_table, &filter,
-                            batch.packets(), &mut outbound,
+                            batch.packets(), &mut outbound, &capture,
                         ).await;
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -47,14 +48,14 @@ pub(crate) async fn run_tun_pump(
             result = wg_recv.recv() => {
                 if let Some(dgram) = result {
                     process_tun_inbound(
-                        &magicsock, &wg_tunnels, &filter, &packet_drops, &tun, &dgram,
+                        &magicsock, &wg_tunnels, &filter, &packet_drops, &tun, &dgram, &capture,
                     ).await;
 
                     // Drain any additional immediately-available datagrams
                     // to batch a burst of packets into a single scheduler turn.
                     while let Ok(more) = wg_recv.try_recv() {
                         process_tun_inbound(
-                            &magicsock, &wg_tunnels, &filter, &packet_drops, &tun, &more,
+                            &magicsock, &wg_tunnels, &filter, &packet_drops, &tun, &more, &capture,
                         ).await;
                     }
                 } else {
@@ -124,6 +125,7 @@ async fn send_tun_batch(
     filter: &std::sync::Mutex<Filter>,
     packets: &[Vec<u8>],
     scratch: &mut OutboundBatchScratch,
+    capture: &crate::capture::CaptureSlot,
 ) {
     scratch.routes.clear();
     scratch.runs.clear();
@@ -136,6 +138,7 @@ async fn send_tun_batch(
         let mut filt = filter.lock().unwrap();
         for packet in packets {
             filt.update_outbound(packet);
+            crate::capture::log_packet(capture, crate::capture::CapturePath::FromLocal, packet);
             scratch
                 .routes
                 .push(WgTunn::dst_address(packet).and_then(|dst| routes.lookup(dst)));

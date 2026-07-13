@@ -2697,6 +2697,7 @@ dependencies = [
  "rustscale-key",
  "rustscale-neterror",
  "rustscale-portmapper",
+ "rustscale-sockstats",
  "rustscale-tailcfg",
  "rustscale-udprelay",
  "thiserror 1.0.69",
@@ -2816,6 +2817,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustscale-sockstats"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "rustscale-ssh"
 version = "0.1.0"
 dependencies = [
@@ -2923,6 +2933,7 @@ dependencies = [
  "rustscale-netstack",
  "rustscale-portmapper",
  "rustscale-safesocket",
+ "rustscale-sockstats",
  "rustscale-ssh",
  "rustscale-tailcfg",
  "rustscale-tcpinfo",

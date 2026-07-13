@@ -207,6 +207,7 @@ async fn derp_data_path_fallback() {
         disable_direct_paths: false,
         peer_relay_server: false,
         relay_server_config: None,
+        sockstats: None,
     })
     .await
     .expect("A magicsock");
@@ -225,6 +226,7 @@ async fn derp_data_path_fallback() {
         disable_direct_paths: false,
         peer_relay_server: false,
         relay_server_config: None,
+        sockstats: None,
     })
     .await
     .expect("B magicsock");
@@ -292,6 +294,7 @@ async fn direct_path_upgrade_over_udp() {
         disable_direct_paths: false,
         peer_relay_server: false,
         relay_server_config: None,
+        sockstats: None,
     })
     .await
     .expect("A magicsock");
@@ -310,6 +313,7 @@ async fn direct_path_upgrade_over_udp() {
         disable_direct_paths: false,
         peer_relay_server: false,
         relay_server_config: None,
+        sockstats: None,
     })
     .await
     .expect("B magicsock");
@@ -387,6 +391,7 @@ async fn trust_expiry_downgrades_to_derp() {
         disable_direct_paths: false,
         peer_relay_server: false,
         relay_server_config: None,
+        sockstats: None,
     })
     .await
     .expect("A magicsock");
@@ -405,6 +410,7 @@ async fn trust_expiry_downgrades_to_derp() {
         disable_direct_paths: false,
         peer_relay_server: false,
         relay_server_config: None,
+        sockstats: None,
     })
     .await
     .expect("B magicsock");
@@ -466,6 +472,7 @@ async fn send_unknown_peer_errors() {
         disable_direct_paths: false,
         peer_relay_server: false,
         relay_server_config: None,
+        sockstats: None,
     })
     .await
     .expect("magicsock");
@@ -557,6 +564,7 @@ async fn multi_region_derp_routing() {
         disable_direct_paths: false,
         peer_relay_server: false,
         relay_server_config: None,
+        sockstats: None,
     })
     .await
     .expect("A magicsock");
@@ -602,6 +610,7 @@ async fn multi_region_derp_routing() {
         disable_direct_paths: false,
         peer_relay_server: false,
         relay_server_config: None,
+        sockstats: None,
     })
     .await
     .expect("B magicsock");
@@ -693,6 +702,7 @@ async fn pmtud_disabled_by_default() {
         disable_direct_paths: false,
         peer_relay_server: false,
         relay_server_config: None,
+        sockstats: None,
     })
     .await
     .expect("magicsock");
@@ -726,6 +736,7 @@ async fn pmtud_flag_multi_size_burst() {
         disable_direct_paths: false,
         peer_relay_server: false,
         relay_server_config: None,
+        sockstats: None,
     })
     .await
     .expect("A magicsock");
@@ -746,6 +757,7 @@ async fn pmtud_flag_multi_size_burst() {
         disable_direct_paths: false,
         peer_relay_server: false,
         relay_server_config: None,
+        sockstats: None,
     })
     .await
     .expect("B magicsock");
@@ -792,6 +804,7 @@ async fn peer_gone_removes_derp_route() {
         disable_direct_paths: false,
         peer_relay_server: false,
         relay_server_config: None,
+        sockstats: None,
     })
     .await
     .expect("A magicsock");
@@ -856,6 +869,7 @@ async fn derp_region_health_tracking() {
         disable_direct_paths: false,
         peer_relay_server: false,
         relay_server_config: None,
+        sockstats: None,
     })
     .await
     .expect("A magicsock");

@@ -136,6 +136,9 @@ pub(crate) struct PeerApiState {
     offering_exit_node: bool,
     /// Taildrop file manager (None if taildrop is disabled).
     taildrop: Option<Arc<crate::taildrop::TaildropManager>>,
+    /// Per-label socket TX/RX counter registry (for the `/v0/sockstats`
+    /// debug endpoint). `None` when no registry was injected.
+    sockstats: Option<Arc<rustscale_sockstats::SockStats>>,
 }
 
 impl PeerApiState {
@@ -264,6 +267,7 @@ pub(crate) async fn spawn_peerapi_netstack(
     tailscale_ips: Vec<IpAddr>,
     offering_exit_node: bool,
     taildrop: Option<Arc<crate::taildrop::TaildropManager>>,
+    sockstats: Option<Arc<rustscale_sockstats::SockStats>>,
 ) -> (JoinHandle<()>, Option<u16>) {
     // Derive the port from the primary IPv4 address.
     let v4 = tailscale_ips.iter().find_map(|ip| match ip {
@@ -289,6 +293,7 @@ pub(crate) async fn spawn_peerapi_netstack(
                         tailscale_ips: tailscale_ips.clone(),
                         offering_exit_node,
                         taildrop: taildrop.clone(),
+                        sockstats: sockstats.clone(),
                     });
                     let handle = tokio::spawn(serve_netstack_listener(listener, state));
                     // Keep the listener task alive; we return the port.
@@ -315,6 +320,7 @@ pub(crate) async fn spawn_peerapi_netstack(
                         tailscale_ips: tailscale_ips.clone(),
                         offering_exit_node,
                         taildrop: taildrop.clone(),
+                        sockstats: sockstats.clone(),
                     });
                     let handle = tokio::spawn(serve_netstack_listener(listener, state));
                     std::mem::forget(handle);
@@ -348,6 +354,7 @@ pub(crate) async fn spawn_peerapi_tun(
     tailscale_ips: Vec<IpAddr>,
     offering_exit_node: bool,
     taildrop: Option<Arc<crate::taildrop::TaildropManager>>,
+    sockstats: Option<Arc<rustscale_sockstats::SockStats>>,
 ) -> (JoinHandle<()>, Option<u16>) {
     let state = Arc::new(PeerApiState {
         peers,
@@ -357,6 +364,7 @@ pub(crate) async fn spawn_peerapi_tun(
         tailscale_ips: tailscale_ips.clone(),
         offering_exit_node,
         taildrop,
+        sockstats,
     });
 
     let mut v4_port: Option<u16> = None;
@@ -1057,7 +1065,7 @@ fn handle_debug(
     path: &str,
     whois: &WhoIsInfo,
     is_self: bool,
-    _state: &Arc<PeerApiState>,
+    state: &Arc<PeerApiState>,
 ) -> Option<PeerApiResponse> {
     let can_debug = is_self; // Simplified: only same-user can debug.
 
@@ -1188,13 +1196,18 @@ fn handle_debug(
                     b"denied; no debug access".to_vec(),
                 ));
             }
-            let body = "Socket stats not available for this client\n";
-            Some(PeerApiResponse::new(
-                200,
-                "OK",
-                "text/plain; charset=utf-8",
-                body.as_bytes().to_vec(),
-            ))
+            if let Some(stats) = state.sockstats.as_ref() {
+                let body = serde_json::to_vec(&stats.to_json()).unwrap_or_default();
+                Some(PeerApiResponse::new(200, "OK", "application/json", body))
+            } else {
+                let body = "sockstats: no sockstat logger wired up\n";
+                Some(PeerApiResponse::new(
+                    200,
+                    "OK",
+                    "text/plain; charset=utf-8",
+                    body.as_bytes().to_vec(),
+                ))
+            }
         }
         _ => None,
     }
@@ -1261,6 +1274,7 @@ mod tests {
             tailscale_ips: ips,
             offering_exit_node: exit_node,
             taildrop: None,
+            sockstats: None,
         })
     }
 
@@ -1723,6 +1737,49 @@ mod tests {
         };
         let resp = dispatch(&req, &whois, true, &state).await;
         assert_eq!(resp.status, 200);
+        // No sockstats wired → text/plain fallback.
+        assert!(resp.content_type.contains("text/plain"));
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_v0_sockstats_json_when_wired() {
+        let stats = Arc::new(rustscale_sockstats::SockStats::new());
+        let h = stats.label_handle(rustscale_sockstats::Label::MagicsockConnUDP4);
+        h.record_tx(1234);
+        h.record_rx(5678);
+
+        let state = Arc::new(PeerApiState {
+            peers: Arc::new(RwLock::new(vec![])),
+            user_profiles: Arc::new(RwLock::new(BTreeMap::new())),
+            resolver: Arc::new(RwLock::new(MagicDnsResolver::default())),
+            dns_config: Arc::new(RwLock::new(None)),
+            tailscale_ips: vec![],
+            offering_exit_node: false,
+            taildrop: None,
+            sockstats: Some(stats),
+        });
+        let whois = WhoIsInfo {
+            found: true,
+            node_name: "test.".into(),
+            tailscale_ips: vec![],
+            user_id: 1,
+            login_name: String::new(),
+            display_name: String::new(),
+        };
+        let req = PeerApiRequest {
+            method: "GET".into(),
+            path: "/v0/sockstats".into(),
+            headers: vec![],
+            body: vec![],
+        };
+        let resp = dispatch(&req, &whois, true, &state).await;
+        assert_eq!(resp.status, 200);
+        assert!(resp.content_type.contains("application/json"));
+        let body = String::from_utf8(resp.body).expect("valid utf8");
+        assert!(body.contains("\"stats\""));
+        assert!(body.contains("MagicsockConnUDP4"));
+        assert!(body.contains("1234"));
+        assert!(body.contains("5678"));
     }
 
     #[tokio::test]
@@ -1806,6 +1863,7 @@ mod tests {
             tailscale_ips: vec!["100.64.0.1".parse().unwrap()],
             offering_exit_node: false,
             taildrop: None,
+            sockstats: None,
         });
         let result = state.whois("100.64.0.2".parse().unwrap());
         assert!(result.is_some());

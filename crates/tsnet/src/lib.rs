@@ -720,6 +720,9 @@ pub(crate) struct Bootstrap {
     pub(crate) ipn_backend: Arc<IpnBackend>,
     /// Shared map-session state for delta-tracking across reconnections.
     pub(crate) map_session: Arc<MapSessionState>,
+    /// Per-label socket TX/RX counter registry (shared with magicsock,
+    /// DERP, DNS, and the C2N/PeerAPI debug endpoints).
+    pub(crate) sockstats: Arc<rustscale_sockstats::SockStats>,
 }
 
 /// An embedded Tailscale server.

@@ -31,6 +31,7 @@ mod relay_manager;
 mod relay_server;
 #[cfg(target_os = "linux")]
 mod udp_batch;
+mod udp_socket_buffers;
 
 pub use endpoint::{
     BestPath, DiscoPingPurpose, Endpoint, PathClass, PendingPing, ProbeUDPLifetime,
@@ -715,6 +716,10 @@ impl Magicsock {
         } else {
             (None, Vec::new())
         };
+
+        // Configure the socket selected above, whether it came from
+        // `udp_socket` or `udp_bind`, before probing/spawning UDP I/O.
+        configure_selected_udp_socket(udp.as_deref(), udp_socket_buffers::configure);
 
         #[cfg(target_os = "linux")]
         let udp_tx_gso = udp
@@ -3106,6 +3111,15 @@ pub fn gather_local_endpoints(udp_port: u16) -> Vec<String> {
         eps.append(&mut loopback_eps);
     }
     eps
+}
+
+/// Configure the optional direct-UDP socket after `udp_socket`/`udp_bind`
+/// precedence has selected it. Keeping this shared post-selection hook small
+/// makes both constructor alternatives exercise the same buffer policy.
+fn configure_selected_udp_socket<T>(socket: Option<T>, configure: impl FnOnce(T)) {
+    if let Some(socket) = socket {
+        configure(socket);
+    }
 }
 
 /// Whether an IPv4 address is link-local (169.254.0.0/16).

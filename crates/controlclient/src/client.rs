@@ -131,6 +131,7 @@ pub struct ControlClient {
     machine_key: MachinePrivate,
     control_key: MachinePublic,
     version: ProtocolVersion,
+    extra_root_certs: Option<Vec<Vec<u8>>>,
 }
 
 impl ControlClient {
@@ -145,7 +146,14 @@ impl ControlClient {
             machine_key,
             control_key,
             version,
+            extra_root_certs: None,
         }
+    }
+
+    /// Set additional root CAs (DER-encoded) to trust alongside the webpki and
+    /// baked ISRG roots. Mirrors Go's `tsnet.Server.ExtraRootCAs` plumbing.
+    pub fn set_extra_root_certs(&mut self, certs: Vec<Vec<u8>>) {
+        self.extra_root_certs = Some(certs);
     }
 
     /// Send a `RegisterRequest` to `/machine/register` and return the response.
@@ -155,6 +163,7 @@ impl ControlClient {
             &self.machine_key,
             &self.control_key,
             self.version,
+            self.extra_root_certs.as_deref(),
         )
         .await?;
 
@@ -207,6 +216,7 @@ impl ControlClient {
             &self.machine_key,
             &self.control_key,
             self.version,
+            self.extra_root_certs.as_deref(),
         )
         .await?;
 
@@ -375,6 +385,7 @@ impl ControlClient {
             &self.machine_key,
             &self.control_key,
             self.version,
+            self.extra_root_certs.as_deref(),
         )
         .await?;
 
@@ -437,6 +448,7 @@ impl ControlClient {
             &self.machine_key,
             &self.control_key,
             self.version,
+            self.extra_root_certs.as_deref(),
         )
         .await?;
 

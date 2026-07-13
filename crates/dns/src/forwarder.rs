@@ -273,9 +273,7 @@ impl Forwarder {
 
         // Establish TLS.
         ensure_ring_provider();
-        let root_store = rustls::RootCertStore {
-            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-        };
+        let root_store = rustscale_bakedroots::combined_root_store(None);
         let config = rustls::ClientConfig::builder()
             .with_root_certificates(root_store)
             .with_no_client_auth();

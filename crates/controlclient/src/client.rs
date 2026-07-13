@@ -141,8 +141,14 @@ impl ControlClient {
         control_key: MachinePublic,
         version: ProtocolVersion,
     ) -> Self {
+        let host = host.into();
+        if host == "https://controlplane.tailscale.com"
+            && rustscale_envknob::bool("TS_PANIC_IF_HIT_MAIN_CONTROL").unwrap_or(false)
+        {
+            panic!("TS_PANIC_IF_HIT_MAIN_CONTROL: connecting to main control");
+        }
         Self {
-            host: host.into(),
+            host,
             machine_key,
             control_key,
             version,

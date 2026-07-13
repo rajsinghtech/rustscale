@@ -300,6 +300,8 @@ impl Server {
             serve.clone(),
             b.overrides.clone(),
             self.config.state_dir.clone(),
+            b.backend_log_id.clone(),
+            b.ssh_host_keys.clone(),
         );
         tasks.push(hostinfo_loop);
 
@@ -427,6 +429,7 @@ impl Server {
             dns_config: b.dns_config,
             user_profiles: b.user_profiles,
             ssh_policy: b.ssh_policy,
+            ssh_host_keys: b.ssh_host_keys,
             monitor,
             machine_key: b.machine_key,
             server_pub_key: b.server_pub_key,
@@ -748,6 +751,8 @@ impl Server {
             None,
             b.overrides.clone(),
             self.config.state_dir.clone(),
+            b.backend_log_id.clone(),
+            b.ssh_host_keys.clone(),
         );
 
         let mut tasks = vec![
@@ -918,6 +923,7 @@ impl Server {
             dns_config: b.dns_config,
             user_profiles: b.user_profiles,
             ssh_policy: b.ssh_policy,
+            ssh_host_keys: b.ssh_host_keys,
             monitor,
             machine_key: b.machine_key,
             server_pub_key: b.server_pub_key,
@@ -1200,6 +1206,14 @@ impl Server {
             state = PersistedState::generate();
             self.save_state(&state)?;
         }
+
+        let backend_log_id = if let Some(dir) = self.config.state_dir.as_ref() {
+            rustscale_logid::PrivateID::load_or_create(&dir.join("logid-private"))?
+        } else {
+            rustscale_logid::PrivateID::new()
+        }
+        .public()
+        .to_string();
 
         let node_pub = state.node_key.public();
         let disco_pub = state.disco_key.public();
@@ -1757,6 +1771,7 @@ impl Server {
         // server hasn't sent a policy yet (SSH server rejects all connections
         // until one arrives). Updated on each subsequent map response.
         let ssh_policy = Arc::new(RwLock::new(map_resp.SSHPolicy.clone()));
+        let ssh_host_keys = Arc::new(RwLock::new(Vec::new()));
         let resolver = Arc::new(RwLock::new(MagicDnsResolver::new(
             peers.clone(),
             &domain,
@@ -1815,6 +1830,7 @@ impl Server {
             dns_config,
             user_profiles,
             ssh_policy,
+            ssh_host_keys,
             machine_key: state.machine_key.clone(),
             server_pub_key,
             disco_key: state.disco_key.clone(),
@@ -1834,6 +1850,7 @@ impl Server {
             ipn_backend,
             map_session,
             sockstats,
+            backend_log_id,
         })
     }
 

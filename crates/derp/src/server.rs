@@ -13,6 +13,8 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+#[cfg(target_os = "linux")]
+use std::{os::fd::AsRawFd, time::Duration};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -179,6 +181,13 @@ impl DerpServer {
             loop {
                 match listener.accept().await {
                     Ok((stream, _peer)) => {
+                        #[cfg(target_os = "linux")]
+                        if let Err(error) = rustscale_ktimeout::set_user_timeout(
+                            stream.as_raw_fd(),
+                            Duration::from_secs(15),
+                        ) {
+                            eprintln!("derp: unable to set TCP_USER_TIMEOUT: {error}");
+                        }
                         let s = shared_clone.clone();
                         tokio::spawn(handle_connection(s, stream));
                     }

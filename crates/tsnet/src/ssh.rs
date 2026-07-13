@@ -8,7 +8,10 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use rustscale_ssh::session::SessionInit;
-use rustscale_ssh::{handle_ssh_conn, host_key_from_node_key, Session, SshServer, SshServerConfig};
+use rustscale_ssh::{
+    handle_ssh_conn, host_key_from_node_key, host_key_public_string, Session, SshServer,
+    SshServerConfig,
+};
 
 use crate::Server;
 
@@ -55,6 +58,7 @@ impl Server {
 
         let host_key = host_key_from_node_key(&inner.node_key);
         let host_keys = vec![host_key];
+        *inner.ssh_host_keys.write().await = host_keys.iter().map(host_key_public_string).collect();
 
         let peers = inner.peers.clone();
         let user_profiles = inner.user_profiles.clone();

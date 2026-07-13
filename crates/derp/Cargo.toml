@@ -27,6 +27,8 @@ rustscale-netns.workspace = true
 rustscale-tshttpproxy = { path = "../tshttpproxy", version = "0.1.0" }
 rustscale-bakedroots = { path = "../bakedroots", version = "0.1.0" }
 rustscale-tsdial = { path = "../tsdial" }
+rustscale-envknob = { path = "../envknob", version = "0.1.0" }
+rustscale-ktimeout = { path = "../ktimeout", version = "0.1.0" }
 url = "2"
 
 [dev-dependencies]

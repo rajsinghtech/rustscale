@@ -2497,6 +2497,7 @@ dependencies = [
  "rustscale-controlknobs",
  "rustscale-dnscache",
  "rustscale-dnsfallback",
+ "rustscale-envknob",
  "rustscale-key",
  "rustscale-netns",
  "rustscale-tailcfg",
@@ -2522,7 +2523,9 @@ dependencies = [
  "hex",
  "rustls",
  "rustscale-bakedroots",
+ "rustscale-envknob",
  "rustscale-key",
+ "rustscale-ktimeout",
  "rustscale-netns",
  "rustscale-tailcfg",
  "rustscale-tsdial",
@@ -2552,6 +2555,7 @@ version = "0.1.0"
 dependencies = [
  "rustls",
  "rustscale-bakedroots",
+ "rustscale-envknob",
  "rustscale-key",
  "rustscale-neterror",
  "rustscale-tailcfg",
@@ -2700,6 +2704,20 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+]
+
+[[package]]
+name = "rustscale-logid"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "rand 0.8.7",
+ "rustscale-atomicfile",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -3035,12 +3053,14 @@ dependencies = [
  "rustscale-controlknobs",
  "rustscale-derp",
  "rustscale-dns",
+ "rustscale-envknob",
  "rustscale-filter",
  "rustscale-health",
  "rustscale-ipn",
  "rustscale-ipnstate",
  "rustscale-key",
  "rustscale-localclient",
+ "rustscale-logid",
  "rustscale-magicsock",
  "rustscale-netcheck",
  "rustscale-netmon",

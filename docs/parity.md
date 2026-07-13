@@ -107,7 +107,7 @@ real JSON).
 | Network utility functions | `net/netutil/` | 🔶 proxy protocol detection in service.rs; interface helpers in netmon/netns; no consolidated crate |
 | Socket options | `net/sockopts/` | ✅ SO_MARK + SO_BINDTODEVICE in `crates/netns/src/linux.rs` |
 | TCP connection table | `net/netstat/` | 🔶 `crates/tcpinfo` iterates FDs 0..1000 on macOS; no full OS TCP connection enumeration |
-| TCP keepalive timeout | `net/ktimeout/` | 🔶 `crates/ktimeout` exists (93 loc) but has no consumers — not wired into listener/socket creation |
+| TCP keepalive timeout | `net/ktimeout/` | ✅ `crates/ktimeout` applies Linux `TCP_USER_TIMEOUT=15s` to each accepted in-process DERP server connection (no-op on other platforms) |
 | Speedtest protocol | `net/speedtest/` | ⬜ |
 | Desktop integration | `ipn/desktop/` | ✅ `crates/tsnet/src/hostinfo.rs`: reads `/proc/net/unix` for .X11-unix / wayland-1 socket detection |
 | Alternative routing table | `net/art/` | ⬜ |
@@ -146,14 +146,14 @@ real JSON).
 | Web client UI | ✅ `rustscale web` with embedded HTML/JS, /api/status/up/down/logout handlers, loopback-only, --readonly, --unsafe-any-addr |
 | Control knobs (`control/controlknobs/`) | ✅ HashMap<String,String> behind RwLock, typed accessors (get_bool/float/string), change-detection merge, on_change callbacks |
 | PeerAPI (`ipn/ipnlocal/peerapi.go`) | ✅ DoH /dns-query (GET + POST), /v0/* endpoints (goroutines, env, metrics, magicsock, dnsfwd, interfaces, sockstats), WhoIs auth, CRC32 port [32768, 65535], Taildrop PUT handler, netstack + TUN spawners |
-| Hostinfo | 🔶 ~22/42 fields populated (IPNVersion, OS, OSVersion, Machine, Hostname, Services, NetInfo, RoutableIPs, etc.); missing ~20 (FrontendLogID, BackendLogID, PushDeviceToken, ShareeNode, NoLogsNoSupport, WireIngress, AllowsUpdate, GoArchVar, RequestTags, WoLMACs, SSH_HostKeys, Userspace, AppConnector, PeerRelay, ServicesHash, Location, TPM, StateEncrypted, ShieldsUp, etc.) |
+| Hostinfo | ✅ ~41 fields populated: platform/runtime fields plus persisted `BackendLogID`, override-supplied `FrontendLogID`, `WoLMACs`, `StateEncrypted`, and SSH host keys when the SSH listener is enabled. Intentional skips: PushDeviceToken, TPM, Location, ShareeNode, PeerRelay |
 | CapturePcap | 🔶 API declared at `Server::capture_pcap()` but returns "not yet implemented" error |
 | Logtail | ✅ `crates/logtail` upload loop (HTTP POST, zstd, backoff) — see Tier 2.5 row |
 | Watchdog | ✅ tokio-based interval task, auto-fires warning if not feed() within interval, Drop-safe |
 | Syspolicy | ⬜ |
 | BIRD routing (`chirp/`) | ⬜ |
 | Linux ipset | ⬜ |
-| envknob | 🔶 `crates/envknob` exists (453 loc) but has no consumers — not wired into any call sites |
+| envknob | ✅ wired: `TS_NO_LOGS_NO_SUPPORT`, `TS_ALLOW_ADMIN_CONSOLE_REMOTE_UPDATE`, `TS_WAKE_MAC`, `TS_DEBUG_USE_DERP_HTTP`, `TS_DNS_FORWARD_SKIP_TCP_RETRY`, `TS_PANIC_IF_HIT_MAIN_CONTROL`; `TSNET_FORCE_LOGIN` is intentionally skipped because tsnet has no cached-Running-state auth bypass |
 | Version package | ✅ build.rs git describe --tags --long --always --dirty → RUSTSCALE_VERSION_LONG; fallback CARGO_PKG_VERSION |
 | Freedesktop/DBus | ⬜ |
 | System tray | ⬜ |

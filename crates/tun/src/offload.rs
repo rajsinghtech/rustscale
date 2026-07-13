@@ -80,62 +80,58 @@ fn checksum(data: &[u8], initial: u16) -> u16 {
     // Accumulate native-endian words, as wireguard-go does. Converting the
     // accumulator at each boundary retains Internet checksum byte order on
     // both little- and big-endian targets.
-    let mut sum = u64::from_be_bytes(u64::from(initial).to_ne_bytes());
-    let mut data = data;
+    let sum = checksum_accumulate(data, checksum_initial(initial));
+    checksum_fold(sum)
+}
 
-    macro_rules! add_words {
-        ($sum:expr, $carry:expr; $($offset:literal),+ $(,)?) => {
-            $(add_with_carry($sum, native_u64(&data[$offset..$offset + 8]), $carry);)+
-        };
-    }
-
-    while data.len() >= 128 {
-        let mut carry = 0;
-        add_words!(&mut sum, &mut carry; 0, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120);
-        sum = sum.wrapping_add(carry);
-        data = &data[128..];
-    }
-    if data.len() >= 64 {
-        let mut carry = 0;
-        add_words!(&mut sum, &mut carry; 0, 8, 16, 24, 32, 40, 48, 56);
-        sum = sum.wrapping_add(carry);
-        data = &data[64..];
-    }
-    if data.len() >= 32 {
-        let mut carry = 0;
-        add_words!(&mut sum, &mut carry; 0, 8, 16, 24);
-        sum = sum.wrapping_add(carry);
+/// Add data to an unfurled native-word checksum accumulator.
+///
+/// Callers may compose even-length pieces without folding between them. The
+/// pseudo-header is deliberately built this way: each of its components is
+/// even length, so no byte can cross a component boundary.
+fn checksum_accumulate(mut data: &[u8], mut sum: u64) -> u64 {
+    // Four independent carry chains over a 32-byte stripe expose ILP on every
+    // target without relying on SIMD or runtime feature detection. Each lane
+    // is reduced modulo 2^64 - 1 before the lanes are composed below, which is
+    // the same one's-complement addition used by the scalar path.
+    let mut lanes = [0_u64; 4];
+    while data.len() >= 32 {
+        add_word(&mut lanes[0], native_u64(&data[0..8]));
+        add_word(&mut lanes[1], native_u64(&data[8..16]));
+        add_word(&mut lanes[2], native_u64(&data[16..24]));
+        add_word(&mut lanes[3], native_u64(&data[24..32]));
         data = &data[32..];
     }
-    if data.len() >= 16 {
-        let mut carry = 0;
-        add_words!(&mut sum, &mut carry; 0, 8);
-        sum = sum.wrapping_add(carry);
-        data = &data[16..];
+    for lane in lanes {
+        add_word(&mut sum, lane);
     }
-    if data.len() >= 8 {
-        let (next, carry) = sum.overflowing_add(native_u64(&data[..8]));
-        sum = next.wrapping_add(u64::from(carry));
+
+    while data.len() >= 8 {
+        add_word(&mut sum, native_u64(&data[..8]));
         data = &data[8..];
     }
     if data.len() >= 4 {
         let word = u32::from_ne_bytes(data[..4].try_into().expect("four-byte tail"));
-        let (next, carry) = sum.overflowing_add(u64::from(word));
-        sum = next.wrapping_add(u64::from(carry));
+        add_word(&mut sum, u64::from(word));
         data = &data[4..];
     }
     if data.len() >= 2 {
         let word = u16::from_ne_bytes(data[..2].try_into().expect("two-byte tail"));
-        let (next, carry) = sum.overflowing_add(u64::from(word));
-        sum = next.wrapping_add(u64::from(carry));
+        add_word(&mut sum, u64::from(word));
         data = &data[2..];
     }
     if let [byte] = data {
         let word = u16::from_ne_bytes([*byte, 0]);
-        let (next, carry) = sum.overflowing_add(u64::from(word));
-        sum = next.wrapping_add(u64::from(carry));
+        add_word(&mut sum, u64::from(word));
     }
+    sum
+}
 
+fn checksum_initial(initial: u16) -> u64 {
+    u64::from_be_bytes(u64::from(initial).to_ne_bytes())
+}
+
+fn checksum_fold(sum: u64) -> u16 {
     let mut sum = u64::from_ne_bytes(sum.to_be_bytes());
     while sum >> 16 != 0 {
         sum = (sum & 0xffff) + (sum >> 16);
@@ -147,17 +143,15 @@ fn native_u64(data: &[u8]) -> u64 {
     u64::from_ne_bytes(data[..8].try_into().expect("eight-byte word"))
 }
 
-fn add_with_carry(sum: &mut u64, word: u64, carry: &mut u64) {
+fn add_word(sum: &mut u64, word: u64) {
     let (next, first_carry) = sum.overflowing_add(word);
-    let (next, second_carry) = next.overflowing_add(*carry);
-    *sum = next;
-    *carry = u64::from(first_carry || second_carry);
+    *sum = next.wrapping_add(u64::from(first_carry));
 }
 fn pseudo(protocol: u8, src: &[u8], dst: &[u8], len: u16) -> u16 {
-    let sum = checksum(src, 0);
-    let sum = checksum(dst, sum);
-    let sum = checksum(&[0, protocol], sum);
-    checksum(&len.to_be_bytes(), sum)
+    let sum = checksum_accumulate(src, checksum_initial(0));
+    let sum = checksum_accumulate(dst, sum);
+    let sum = checksum_accumulate(&[0, protocol], sum);
+    checksum_fold(checksum_accumulate(&len.to_be_bytes(), sum))
 }
 
 // ---------------------------------------------------------------------------
@@ -819,14 +813,35 @@ mod tests {
         sum as u16
     }
 
+    fn measure_checksum(
+        data: &[u8],
+        iterations: usize,
+        checksum: fn(&[u8], u16) -> u16,
+    ) -> (std::time::Duration, f64) {
+        use std::{hint::black_box, time::Instant};
+
+        const MIN_ELAPSED: std::time::Duration = std::time::Duration::from_millis(100);
+
+        let started = Instant::now();
+        let mut result = 0_u16;
+        let batch_bytes = f64::from(
+            u32::try_from(iterations * data.len()).expect("benchmark batch byte count fits in u32"),
+        );
+        let mut bytes = 0_f64;
+        while started.elapsed() < MIN_ELAPSED {
+            for _ in 0..iterations {
+                result ^= checksum(black_box(data), black_box(0x1234));
+            }
+            bytes += batch_bytes;
+        }
+        black_box(result);
+        (started.elapsed(), bytes)
+    }
+
     #[test]
     fn checksum_matches_scalar_for_lengths_initials_and_alignments() {
-        const INITIALS: &[u16] = &[0, 1, 0x1234, 0x7fff, 0xffff];
-        const BOUNDARIES: &[usize] = &[
-            1, 2, 3, 4, 7, 8, 15, 16, 31, 32, 63, 64, 127, 128, 129, 255, 256, 511,
-        ];
-
-        let mut bytes = vec![0; 520];
+        const INITIALS: &[u16] = &[0, 1, 0x1234, 0xffff];
+        let mut bytes = vec![0; 4096 + 31];
         for (index, byte) in bytes.iter_mut().enumerate() {
             *byte = match index % 11 {
                 0 | 1 => 0xff,
@@ -834,10 +849,9 @@ mod tests {
             };
         }
 
-        for offset in 0..8 {
-            let aligned = &bytes[offset..];
-            for len in 0..=512 {
-                let data = &aligned[..len];
+        for offset in 0..=31 {
+            for len in 0..=4096 {
+                let data = &bytes[offset..offset + len];
                 for &initial in INITIALS {
                     assert_eq!(
                         checksum(data, initial),
@@ -846,15 +860,82 @@ mod tests {
                     );
                 }
             }
-            for &len in BOUNDARIES {
-                for &initial in INITIALS {
-                    assert_eq!(
-                        checksum(&aligned[..len], initial),
-                        scalar_checksum(&aligned[..len], initial),
-                        "boundary offset={offset}, len={len}, initial={initial:#06x}",
-                    );
+        }
+    }
+
+    #[test]
+    fn checksum_adversarial_carries_and_stripe_boundaries() {
+        const INITIALS: &[u16] = &[0, 1, 0x1234, 0xffff];
+        const LENGTHS: &[usize] = &[
+            0, 1, 2, 3, 30, 31, 32, 33, 34, 126, 127, 128, 129, 130, 254, 255, 256, 257, 258,
+        ];
+
+        for (name, byte) in [("zero", 0), ("ff", 0xff)] {
+            let bytes = vec![byte; LENGTHS.iter().copied().max().unwrap() + 32];
+            for offset in [0, 1, 3, 31] {
+                for &len in LENGTHS {
+                    let data = &bytes[offset..offset + len];
+                    for &initial in INITIALS {
+                        assert_eq!(
+                            checksum(data, initial),
+                            scalar_checksum(data, initial),
+                            "pattern={name}, offset={offset}, len={len}, initial={initial:#06x}",
+                        );
+                    }
                 }
             }
+        }
+    }
+
+    #[test]
+    #[ignore = "microbenchmark; run with --release -- --ignored --nocapture"]
+    fn checksum_microbenchmark_release() {
+        const BATCH_BYTES: usize = 64 * 1024 * 1024;
+        const ROUNDS: usize = 4;
+
+        for (length_index, len) in [64, 512, 1440, 65_535].into_iter().enumerate() {
+            let mut data = vec![0; len];
+            let mut state = 0x9e37_79b9_u32;
+            for byte in &mut data {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                *byte = state as u8;
+            }
+            let expected = scalar_checksum(&data, 0x1234);
+            assert_eq!(checksum(&data, 0x1234), expected, "len={len}");
+            let iterations = BATCH_BYTES.div_ceil(len);
+            let mut optimized_elapsed = std::time::Duration::ZERO;
+            let mut optimized_bytes = 0_f64;
+            let mut scalar_elapsed = std::time::Duration::ZERO;
+            let mut scalar_bytes = 0_f64;
+
+            // Each leg runs long enough to smooth timer granularity and
+            // short-lived CPU-frequency effects. Alternate the first leg on
+            // every round and length so neither implementation always gets
+            // the warmer cache or earlier boost state.
+            for round in 0..ROUNDS {
+                let optimized_first = (length_index + round).is_multiple_of(2);
+                for optimized_run in [optimized_first, !optimized_first] {
+                    let (elapsed, bytes) = if optimized_run {
+                        measure_checksum(&data, iterations, checksum)
+                    } else {
+                        measure_checksum(&data, iterations, scalar_checksum)
+                    };
+                    if optimized_run {
+                        optimized_elapsed += elapsed;
+                        optimized_bytes += bytes;
+                    } else {
+                        scalar_elapsed += elapsed;
+                        scalar_bytes += bytes;
+                    }
+                }
+            }
+
+            let mib = 1024_f64 * 1024_f64;
+            eprintln!(
+                "checksum len={len:5}: optimized={:.1} MiB/s scalar={:.1} MiB/s",
+                optimized_bytes / optimized_elapsed.as_secs_f64() / mib,
+                scalar_bytes / scalar_elapsed.as_secs_f64() / mib,
+            );
         }
     }
 
@@ -1326,6 +1407,27 @@ mod tests {
         ];
         bad[1][36] ^= 1;
         assert_eq!(gro_output_count(&mut bad), 2);
+    }
+
+    #[test]
+    fn tcp_gro_rejects_corrupt_prepend_head_and_candidate() {
+        // These packets take the prepend path: the first packet is the old
+        // head, while the second is the candidate new head. Keep both checks
+        // explicit so a checksum optimization cannot accidentally admit an
+        // invalid packet in either GRO role.
+        let mut bad_head = vec![
+            tcp_packet(false, 104, 7, b"tail", TCP_ACK),
+            tcp_packet(false, 100, 7, b"head", TCP_ACK),
+        ];
+        bad_head[0][36] ^= 1;
+        assert_eq!(gro_output_count(&mut bad_head), 2);
+
+        let mut bad_candidate = vec![
+            tcp_packet(false, 104, 7, b"tail", TCP_ACK),
+            tcp_packet(false, 100, 7, b"head", TCP_ACK),
+        ];
+        bad_candidate[1][36] ^= 1;
+        assert_eq!(gro_output_count(&mut bad_candidate), 2);
     }
 
     #[test]

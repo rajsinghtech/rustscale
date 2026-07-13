@@ -50,17 +50,14 @@ pub(crate) async fn run_tun_pump(
                 if let Some(dgram) = result {
                     inbound.clear();
                     take_immediate_burst(dgram, &mut wg_recv, &mut inbound.datagrams);
-                    let (datagrams, plaintext, replies) = (
-                        &inbound.datagrams,
-                        &mut inbound.plaintext,
-                        &mut inbound.replies,
-                    );
-                    for dgram in datagrams {
-                        collect_tun_inbound(
-                            &wg_tunnels, &filter, &packet_drops, dgram, &capture,
-                            plaintext, replies,
-                        ).await;
-                    }
+                    collect_tun_inbound_batch(
+                        &wg_tunnels,
+                        &filter,
+                        &packet_drops,
+                        &capture,
+                        &mut inbound,
+                    )
+                    .await;
                     // Datagrams are ciphertext ownership; release their
                     // nested buffers before reply I/O or a blocked TUN write.
                     inbound.datagrams.clear();
@@ -122,6 +119,8 @@ async fn flush_inbound_burst<F, Fut>(
 #[derive(Default)]
 struct InboundBatchScratch {
     datagrams: Vec<rustscale_magicsock::WgDatagram>,
+    runs: Vec<InboundBatchRun>,
+    decaps: Vec<rustscale_wg::DecapResult>,
     plaintext: Vec<Vec<u8>>,
     replies: Vec<(NodePublic, Vec<u8>)>,
 }
@@ -129,9 +128,124 @@ struct InboundBatchScratch {
 impl InboundBatchScratch {
     fn clear(&mut self) {
         self.datagrams.clear();
+        self.runs.clear();
+        self.decaps.clear();
         self.plaintext.clear();
         self.replies.clear();
     }
+}
+
+struct InboundRun {
+    peer: NodePublic,
+    tunnel: Arc<Mutex<WgTunn>>,
+    start: usize,
+    end: usize,
+}
+
+enum InboundBatchRun {
+    Drop { start: usize, end: usize },
+    Routed(InboundRun),
+}
+
+/// Build maximal contiguous same-peer receive runs using a single tunnel-map
+/// snapshot. A missing map entry remains an explicit drop boundary, so later
+/// packets for the same peer are never merged across it.
+fn build_inbound_runs(
+    datagrams: &[rustscale_magicsock::WgDatagram],
+    tunnels: &HashMap<NodePublic, Arc<Mutex<WgTunn>>>,
+    runs: &mut Vec<InboundBatchRun>,
+) {
+    runs.clear();
+    let mut start = 0;
+    while start < datagrams.len() {
+        let peer = datagrams[start].peer.clone();
+        let mut end = start + 1;
+        while end < datagrams.len() && datagrams[end].peer == peer {
+            end += 1;
+        }
+        if let Some(tunnel) = tunnels.get(&peer).cloned() {
+            runs.push(InboundBatchRun::Routed(InboundRun {
+                peer,
+                tunnel,
+                start,
+                end,
+            }));
+        } else {
+            runs.push(InboundBatchRun::Drop { start, end });
+        }
+        start = end;
+    }
+}
+
+/// Decapsulate a capped immediate receive burst in peer runs. Map and tunnel
+/// locks are released before the filter, capture, reply transport, or TUN I/O
+/// stages; only synchronous boringtun work occurs while a tunnel is locked.
+async fn collect_tun_inbound_batch(
+    wg_tunnels: &RwLock<HashMap<NodePublic, Arc<Mutex<WgTunn>>>>,
+    filter: &Arc<std::sync::Mutex<Filter>>,
+    packet_drops: &Arc<AtomicU64>,
+    capture: &crate::capture::CaptureSlot,
+    inbound: &mut InboundBatchScratch,
+) {
+    let tunnels = wg_tunnels.read().await;
+    build_inbound_runs(&inbound.datagrams, &tunnels, &mut inbound.runs);
+    drop(tunnels);
+
+    for run in inbound.runs.drain(..) {
+        let run = match run {
+            InboundBatchRun::Drop { start, end } => {
+                debug_assert!(start < end && end <= inbound.datagrams.len());
+                continue;
+            }
+            InboundBatchRun::Routed(run) => run,
+        };
+        inbound.decaps.clear();
+        {
+            let mut tunnel = run.tunnel.lock().await;
+            for datagram in &inbound.datagrams[run.start..run.end] {
+                if let Ok(decap) = tunnel.decapsulate(&datagram.data) {
+                    inbound.decaps.push(decap);
+                }
+            }
+        }
+        for decap in inbound.decaps.drain(..) {
+            enqueue_tun_inbound_result(
+                filter,
+                packet_drops,
+                &run.peer,
+                decap,
+                capture,
+                &mut inbound.plaintext,
+                &mut inbound.replies,
+            );
+        }
+    }
+}
+
+fn enqueue_tun_inbound_result(
+    filter: &Arc<std::sync::Mutex<Filter>>,
+    packet_drops: &Arc<AtomicU64>,
+    peer: &NodePublic,
+    decap: rustscale_wg::DecapResult,
+    capture: &crate::capture::CaptureSlot,
+    plaintext: &mut Vec<Vec<u8>>,
+    replies: &mut Vec<(NodePublic, Vec<u8>)>,
+) {
+    if let Some(pt) = decap.plaintext {
+        let dropped = {
+            let mut filt = filter.lock().unwrap();
+            filt.check_in(&pt).is_drop()
+        };
+        if dropped {
+            packet_drops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            // Capture before Linux write-side GRO is allowed to rewrite the
+            // packet's offload and transport headers.
+            crate::capture::log_packet(capture, crate::capture::CapturePath::FromPeer, &pt);
+            plaintext.push(pt);
+        }
+    }
+    replies.extend(decap.replies.into_iter().map(|reply| (peer.clone(), reply)));
 }
 
 /// Reused state for one outbound kernel-TUN read.
@@ -412,6 +526,50 @@ mod tests {
             .collect()
     }
 
+    fn inbound_shapes(runs: &[InboundBatchRun]) -> Vec<(Option<NodePublic>, usize, usize)> {
+        runs.iter()
+            .map(|run| match run {
+                InboundBatchRun::Drop { start, end } => (None, *start, *end),
+                InboundBatchRun::Routed(run) => (Some(run.peer.clone()), run.start, run.end),
+            })
+            .collect()
+    }
+
+    async fn establish_tunnels(a: &Arc<Mutex<WgTunn>>, b: &Arc<Mutex<WgTunn>>) {
+        let a_init = { a.lock().await.force_handshake() };
+        for packet in &a_init {
+            let replies = { b.lock().await.decapsulate(packet).unwrap().replies };
+            for reply in &replies {
+                let _ = a.lock().await.decapsulate(reply);
+            }
+        }
+        let b_init = { b.lock().await.force_handshake() };
+        for packet in &b_init {
+            let replies = { a.lock().await.decapsulate(packet).unwrap().replies };
+            for reply in &replies {
+                let _ = b.lock().await.decapsulate(reply);
+            }
+        }
+        for _ in 0..4 {
+            for (source, destination) in [(a, b), (b, a)] {
+                let pending = { source.lock().await.tick_timers() };
+                for packet in pending {
+                    let replies = {
+                        destination
+                            .lock()
+                            .await
+                            .decapsulate(&packet)
+                            .unwrap()
+                            .replies
+                    };
+                    for reply in replies {
+                        let _ = source.lock().await.decapsulate(&reply);
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn build_batch_runs_preserves_contiguous_route_boundaries() {
         let a = NodePrivate::generate().public();
@@ -482,6 +640,146 @@ mod tests {
     }
 
     #[test]
+    fn build_inbound_runs_keeps_peer_and_missing_boundaries() {
+        let a = NodePrivate::generate().public();
+        let b = NodePrivate::generate().public();
+        let missing = NodePrivate::generate().public();
+        let mut tunnels = HashMap::new();
+        tunnels.insert(a.clone(), tunnel_for(&a));
+        tunnels.insert(b.clone(), tunnel_for(&b));
+        let datagrams = [
+            a.clone(),
+            a.clone(),
+            b.clone(),
+            a.clone(),
+            missing,
+            a.clone(),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, peer)| rustscale_magicsock::WgDatagram {
+            peer,
+            data: vec![index as u8],
+        })
+        .collect::<Vec<_>>();
+        let mut runs = Vec::new();
+        build_inbound_runs(&datagrams, &tunnels, &mut runs);
+        assert_eq!(
+            inbound_shapes(&runs),
+            vec![
+                (Some(a.clone()), 0, 2),
+                (Some(b), 2, 3),
+                (Some(a.clone()), 3, 4),
+                (None, 4, 5),
+                (Some(a), 5, 6),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn inbound_batch_matches_scalar_plaintext_order_then_releases_lock() {
+        let a_private = NodePrivate::generate();
+        let b_private = NodePrivate::generate();
+        let a_public = a_private.public();
+        let b_public = b_private.public();
+        let sender = Arc::new(Mutex::new(
+            WgTunn::new(&a_private, &b_public, 1).expect("source tunnel"),
+        ));
+        let receiver = Arc::new(Mutex::new(
+            WgTunn::new(&b_private, &a_public, 2).expect("receiver tunnel"),
+        ));
+        establish_tunnels(&sender, &receiver).await;
+
+        let packets = vec![
+            vec![
+                0x45, 0, 0, 20, 0, 1, 0, 0, 64, 17, 0, 0, 100, 64, 0, 1, 100, 64, 0, 2,
+            ],
+            vec![
+                0x45, 0, 0, 20, 0, 2, 0, 0, 64, 17, 0, 0, 100, 64, 0, 1, 100, 64, 0, 2,
+            ],
+        ];
+        let mut inbound = InboundBatchScratch::default();
+        for packet in &packets {
+            let ciphertext = sender
+                .lock()
+                .await
+                .encapsulate(packet)
+                .expect("encrypt packet")
+                .into_iter()
+                .next()
+                .expect("one wireguard data packet");
+            inbound.datagrams.push(rustscale_magicsock::WgDatagram {
+                peer: a_public.clone(),
+                data: ciphertext,
+            });
+        }
+        let tunnels = RwLock::new(HashMap::from([(a_public, receiver.clone())]));
+        let filter = Arc::new(std::sync::Mutex::new(Filter::allow_all()));
+        let packet_drops = Arc::new(AtomicU64::new(0));
+        let capture = crate::capture::new_slot();
+
+        collect_tun_inbound_batch(&tunnels, &filter, &packet_drops, &capture, &mut inbound).await;
+
+        assert_eq!(inbound.plaintext, packets);
+        assert!(inbound.replies.is_empty());
+        assert_eq!(packet_drops.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert!(
+            receiver.try_lock().is_ok(),
+            "filtering and flush are lock-free"
+        );
+    }
+
+    #[tokio::test]
+    async fn inbound_batch_filter_drops_are_counted() {
+        let a_private = NodePrivate::generate();
+        let b_private = NodePrivate::generate();
+        let a_public = a_private.public();
+        let b_public = b_private.public();
+        let sender = Arc::new(Mutex::new(
+            WgTunn::new(&a_private, &b_public, 1).expect("source tunnel"),
+        ));
+        let receiver = Arc::new(Mutex::new(
+            WgTunn::new(&b_private, &a_public, 2).expect("receiver tunnel"),
+        ));
+        establish_tunnels(&sender, &receiver).await;
+
+        let packets = [
+            vec![
+                0x45, 0, 0, 20, 0, 1, 0, 0, 64, 17, 0, 0, 100, 64, 0, 1, 100, 64, 0, 2,
+            ],
+            vec![
+                0x45, 0, 0, 20, 0, 2, 0, 0, 64, 17, 0, 0, 100, 64, 0, 1, 100, 64, 0, 2,
+            ],
+        ];
+        let mut inbound = InboundBatchScratch::default();
+        for packet in packets {
+            inbound.datagrams.push(rustscale_magicsock::WgDatagram {
+                peer: a_public.clone(),
+                data: sender
+                    .lock()
+                    .await
+                    .encapsulate(&packet)
+                    .expect("encrypt packet")
+                    .into_iter()
+                    .next()
+                    .expect("one wireguard data packet"),
+            });
+        }
+
+        let tunnels = RwLock::new(HashMap::from([(a_public, receiver)]));
+        let filter = Arc::new(std::sync::Mutex::new(Filter::allow_none()));
+        let packet_drops = Arc::new(AtomicU64::new(0));
+        let capture = crate::capture::new_slot();
+        collect_tun_inbound_batch(&tunnels, &filter, &packet_drops, &capture, &mut inbound).await;
+
+        assert!(
+            inbound.plaintext.is_empty(),
+            "dropped packets are not queued"
+        );
+        assert_eq!(packet_drops.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
+
+    #[test]
     fn immediate_burst_is_capped_at_tun_batch_capacity() {
         let (tx, mut rx) = mpsc::channel(256);
         for value in 1_u16..=130 {
@@ -506,6 +804,7 @@ mod tests {
             datagrams: Vec::new(),
             plaintext: vec![vec![1], vec![2]],
             replies: vec![(peer.clone(), vec![3]), (peer, vec![4])],
+            ..Default::default()
         };
         let reply_events = events.clone();
         flush_inbound_burst(&tun, &mut inbound, move |_peer, _reply| {
@@ -531,6 +830,7 @@ mod tests {
             datagrams: Vec::new(),
             plaintext: vec![vec![1]],
             replies: vec![(peer.clone(), vec![2]), (peer, vec![3])],
+            ..Default::default()
         };
         let task = tokio::spawn(async move {
             flush_inbound_burst(&tun, &mut inbound, move |_peer, _reply| {

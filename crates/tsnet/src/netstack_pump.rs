@@ -147,6 +147,7 @@ async fn handle_inbound_wg(
 /// protocol replies for the caller's batch boundary. No async device or
 /// magicsock I/O occurs here, so tunnel and filter guards are always dropped
 /// before those operations.
+#[cfg(test)]
 pub(crate) async fn collect_tun_inbound(
     wg_tunnels: &RwLock<HashMap<NodePublic, Arc<Mutex<WgTunn>>>>,
     filter: &Arc<std::sync::Mutex<Filter>>,

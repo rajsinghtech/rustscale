@@ -119,6 +119,9 @@ DURATION=10
 LATENCY_COUNT=50
 LATENCY_INTERVAL=0.1
 PORT=5201
+RUNTIME_STATS_MAX_LINES=80
+RUNTIME_STATS_MAX_COLUMNS=512
+RUNTIME_STATS_MAX_BYTES=16384
 # Reserved for an unsafe rs-tun → tailscaled handoff.  Keep this distinct from
 # ordinary benchmark failures so run-matrix can destroy the affected VMs.
 FATAL_HANDOFF_STATUS=86
@@ -148,6 +151,41 @@ capture_log_tail() {
   local vm="$1" zone="$2" logfile="$3" lines="${4:-40}"
   ssh_cmd "$vm" "$zone" "tail -n $lines '$logfile' 2>/dev/null" 2>/dev/null \
     || echo "(log unavailable: $logfile on $vm)"
+}
+
+# Apply the result bounds locally as well as remotely. This keeps a mocked or
+# unexpectedly chatty SSH transport from widening the captured JSON field.
+bound_rs_tun_runtime_stats() {
+  sed -n "1,${RUNTIME_STATS_MAX_LINES}p" \
+    | cut -c1-"$RUNTIME_STATS_MAX_COLUMNS" \
+    | head -c "$RUNTIME_STATS_MAX_BYTES"
+}
+
+# Capture only bounded, transport-relevant daemon diagnostics. This intentionally
+# does not copy a log tail: daemon logs can contain control-plane output and
+# credentials. Args: VM ZONE LOGFILE.
+capture_rs_tun_runtime_stats() {
+  local vm="$1" zone="$2" logfile="$3" quoted_log
+  printf -v quoted_log '%q' "$logfile"
+  ssh_cmd "$vm" "$zone" \
+    "grep -E 'rustscale: (Linux UDP GRO receive (enabled|unavailable|disabled|permanently disabled)|udp_gro_stats|.*RXQ overflow|SO_RXQ_OVFL|.*wg_handoff_stats)' $quoted_log 2>/dev/null | tail -n $RUNTIME_STATS_MAX_LINES | cut -c1-$RUNTIME_STATS_MAX_COLUMNS | head -c $RUNTIME_STATS_MAX_BYTES" \
+    2>/dev/null | bound_rs_tun_runtime_stats || true
+}
+
+# Final rs-tun result lifecycle. Capture while the daemons are alive, then
+# clean them up, and only then write the result. Keeping this as one callable
+# unit makes the ordering executable and locally testable.
+finalize_rs_tun_measurement() {
+  local path_class="$1" runtime_server runtime_client
+  runtime_server=$(capture_rs_tun_runtime_stats "$SVM" "$SZONE" /tmp/rs-tun-srv.log)
+  runtime_client=$(capture_rs_tun_runtime_stats "$CVM" "$CZONE" /tmp/rs-tun-cli.log)
+
+  if ! cleanup_rs_tun; then
+    emit_stub "rs-tun-cleanup-failed" "$(capture_log_tail "$SVM" "$SZONE" /tmp/rs-tun-srv.log)"
+    return "$FATAL_HANDOFF_STATUS"
+  fi
+
+  tun_emit_result rustscale rs-tun "$path_class" "$runtime_server" "$runtime_client"
 }
 
 # Wait for a tailscale peer to appear on a VM.
@@ -599,6 +637,54 @@ assert all(data["parallels"] == expected
 PYEOF
 }
 
+runtime_stats_self_test() {
+  local log_file stats command line bytes
+  log_file=$(mktemp "$RDIR/runtime-stats-test.XXXXXX")
+  ssh_cmd() {
+    printf '%s\n' "$3" >"$log_file"
+    for ((line = 0; line <= RUNTIME_STATS_MAX_LINES; line++)); do
+      printf 'rustscale: udp_gro_stats %*s\n' "$((RUNTIME_STATS_MAX_COLUMNS + 100))" '' \
+        | tr ' ' x
+    done
+  }
+  stats=$(capture_rs_tun_runtime_stats "$SVM" "$SZONE" '/tmp/rs tun.log')
+  [[ "$stats" == *'udp_gro_stats'* ]] || return 1
+  bytes=$(LC_ALL=C printf '%s' "$stats" | wc -c)
+  (( bytes <= RUNTIME_STATS_MAX_BYTES )) || return 1
+  (( $(printf '%s\n' "$stats" | wc -l) <= RUNTIME_STATS_MAX_LINES )) || return 1
+  while IFS= read -r line; do
+    (( ${#line} <= RUNTIME_STATS_MAX_COLUMNS )) || return 1
+  done <<<"$stats"
+  command=$(<"$log_file")
+  [[ "$command" == *"grep -E"* && "$command" == *"tail -n $RUNTIME_STATS_MAX_LINES"* \
+    && "$command" == *"cut -c1-$RUNTIME_STATS_MAX_COLUMNS"* \
+    && "$command" == *"head -c $RUNTIME_STATS_MAX_BYTES"* \
+    && "$command" == *'/tmp/rs\'*' tun.log'* ]] || return 1
+
+  ssh_cmd() { :; }
+  [[ -z "$(capture_rs_tun_runtime_stats "$SVM" "$SZONE" /tmp/rs-tun-empty.log)" ]] || return 1
+  rm -f "$log_file"
+  unset -f ssh_cmd
+}
+
+rs_tun_lifecycle_self_test() {
+  local events
+  events=$(mktemp "$RDIR/rs-tun-lifecycle-test.XXXXXX")
+  capture_rs_tun_runtime_stats() {
+    printf 'capture:%s\n' "$1" >>"$events"
+    printf 'stats-%s' "$1"
+  }
+  cleanup_rs_tun() { printf '%s\n' cleanup >>"$events"; }
+  tun_emit_result() {
+    printf 'emit:%s:%s:%s:%s:%s\n' "$1" "$2" "$3" "$4" "$5" >>"$events"
+  }
+
+  finalize_rs_tun_measurement direct
+  [[ "$(<"$events")" == $'capture:self-test-server\ncapture:self-test-client\ncleanup\nemit:rustscale:rs-tun:direct:stats-self-test-server:stats-self-test-client' ]] || return 1
+  rm -f "$events"
+  unset -f capture_rs_tun_runtime_stats cleanup_rs_tun tun_emit_result
+}
+
 classifier_self_test
 command_shape_self_test
 run_config_option_parsing_self_test
@@ -606,6 +692,8 @@ run_config_option_parsing_self_test
 if (( SELF_TEST )); then
   cleanup_self_test
   result_shape_self_test
+  runtime_stats_self_test
+  rs_tun_lifecycle_self_test
   rm -rf "$RDIR"
 fi
 
@@ -811,12 +899,12 @@ tun_measure_failure_tail() {
 
 # Emit a production kernel-TUN result. Args: TOOL LABEL PATH_CLASS
 tun_emit_result() {
-  local tool="$1" label="$2" path_class="$3"
+  local tool="$1" label="$2" path_class="$3" runtime_server="${4:-}" runtime_client="${5:-}"
   python3 - "$CONFIG" "$TOPOLOGY" "$PATH_TAG" "$path_class" \
     "$TUN_MEASURE_BIN_SIZE" "$TUN_MEASURE_THROUGHPUT" "$TUN_MEASURE_LATENCY" \
-    "$TUN_MEASURE_FOOTPRINT" "$tool" "$REPEAT" >"$OUT" <<'PYEOF'
+    "$TUN_MEASURE_FOOTPRINT" "$tool" "$REPEAT" "$runtime_server" "$runtime_client" >"$OUT" <<'PYEOF'
 import json, sys
-config, topo, path_tag, path_class, bin_size, tp, lat, foot, tool, repeat = sys.argv[1:11]
+config, topo, path_tag, path_class, bin_size, tp, lat, foot, tool, repeat, runtime_server, runtime_client = sys.argv[1:13]
 obj = {
     "tool": tool,
     "mode": "tun",
@@ -831,6 +919,8 @@ obj = {
     "footprint": dict(json.loads(foot), binary_size_bytes=int(bin_size)),
     "path_class_reported": path_class,
 }
+if config == "rs-tun":
+    obj["runtime_stats"] = {"server": runtime_server, "client": runtime_client}
 
 print(json.dumps(obj, indent=2))
 PYEOF
@@ -902,6 +992,7 @@ import json, sys
 with open(sys.argv[1]) as f:
     result = json.load(f)
 assert result["repeat"] == 2
+assert result["runtime_stats"] == {"server": "", "client": ""}
 PYEOF
 
   # A zero-valued JSON sample is a measurement failure, not a transport
@@ -1388,13 +1479,7 @@ run_rs_tun() {
     return 1
   fi
 
-  # Cleanup.
-  if ! cleanup_rs_tun; then
-    emit_stub "rs-tun-cleanup-failed" "$(capture_log_tail "$SVM" "$SZONE" /tmp/rs-tun-srv.log)"
-    return "$FATAL_HANDOFF_STATUS"
-  fi
-
-  tun_emit_result rustscale rs-tun "$path_class"
+  finalize_rs_tun_measurement "$path_class"
 }
 
 # ===========================================================================

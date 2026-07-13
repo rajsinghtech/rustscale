@@ -20,11 +20,12 @@
 //! - [`Magicsock::set_netmap`] — create/update peer endpoints, start probing.
 //! - [`Magicsock::send`] — send a WG datagram to a peer over the best path.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 mod derp_io;
 mod disco_io;
 mod endpoint;
+mod pmtud;
 mod relay;
 mod relay_manager;
 mod relay_server;
@@ -159,6 +160,9 @@ pub struct MagicsockConfig {
     /// UDP TX/RX bytes per label (`MagicsockConnUDP4` / `MagicsockConnUDP6`).
     /// Best-effort: instrumentation never affects send/recv error paths.
     pub sockstats: Option<Arc<rustscale_sockstats::SockStats>>,
+    /// Optional control knobs for PMTUD and other feature toggles.
+    /// When provided, `update_pmtud` reads `PeerMTUEnable` from the knobs.
+    pub control_knobs: Option<Arc<rustscale_controlknobs::ControlKnobs>>,
 }
 
 /// A received WG datagram with its sender identified.
@@ -203,6 +207,8 @@ struct Inner {
     /// Whether peer path MTU discovery is enabled. Disabled by default,
     /// matching Go's `ShouldPMTUD` returning false (peermtu.go:56).
     peer_mtu_enabled: Arc<AtomicBool>,
+    /// Optional control knobs for PMTUD and other feature toggles.
+    control_knobs: Option<Arc<rustscale_controlknobs::ControlKnobs>>,
     /// Per-peer background task handles (heartbeat + UDP lifetime probe).
     /// At most one task per peer; replaced on new TX activity.
     background_tasks: RwLock<HashMap<NodePublic, tokio::task::JoinHandle<()>>>,
@@ -640,6 +646,7 @@ impl Magicsock {
             relay_server,
             self_cap_map,
             peer_mtu_enabled: Arc::new(AtomicBool::new(false)),
+            control_knobs: config.control_knobs,
             background_tasks: RwLock::new(HashMap::new()),
             net_info: RwLock::new(None),
             sockstats_udp4,
@@ -1056,6 +1063,7 @@ impl Magicsock {
             }
         }
         self.inner.derp.close_all();
+        self.update_pmtud();
     }
 
     /// Whether a peer's direct path is still trusted (for testing).
@@ -1107,10 +1115,63 @@ impl Magicsock {
     /// pings are sent at multiple sizes from `WIRE_MTUs_TO_PROBE` and the
     /// largest succeeding size is recorded per peer. Disabled by default,
     /// matching Go's `ShouldPMTUD` (peermtu.go:56).
+    ///
+    /// This is a manual override. The internal `update_pmtud` manages the
+    /// socket option side (DF bit) and the decision logic (envknob +
+    /// control knobs); `set_pmtud_enabled` manages the probe side.
+    /// They should be kept consistent: `update_pmtud` probes the socket
+    /// capability and updates the `peer_mtu_enabled` atomic, which
+    /// `send_pings` reads.
     pub fn set_pmtud_enabled(&self, enabled: bool) {
         self.inner
             .peer_mtu_enabled
             .store(enabled, Ordering::Relaxed);
+    }
+
+    /// Re-evaluate PMTUD configuration from control knobs / env and apply
+    /// the DF socket option accordingly. Mirrors Go's `Conn.UpdatePMTUD()`.
+    ///
+    /// If the effective PMTUD status changed, resets all endpoint PMTU
+    /// state so discovery re-probes path MTUs.
+    pub fn update_pmtud(&self) {
+        let current = self.inner.peer_mtu_enabled.load(Ordering::Relaxed);
+        let (new_enabled, changed) = pmtud::update_pmtud(
+            self.inner.udp.as_deref(),
+            self.inner.control_knobs.as_deref(),
+            current,
+        );
+        self.inner
+            .peer_mtu_enabled
+            .store(new_enabled, Ordering::Relaxed);
+        if changed {
+            self.reset_endpoint_states();
+        }
+    }
+
+    /// Whether PMTUD should be enabled based on control knobs and env.
+    /// Mirrors Go's `Conn.ShouldPMTUD()`.
+    pub fn should_pmtud(&self) -> bool {
+        pmtud::should_pmtud(self.inner.control_knobs.as_deref())
+    }
+
+    /// Query the DF bit state on the UDP socket.
+    /// Mirrors Go's `Conn.DontFragSetting()`.
+    pub fn dont_frag_setting(&self) -> Result<bool, pmtud::SetDfError> {
+        pmtud::dont_frag_setting(self.inner.udp.as_deref())
+    }
+
+    /// Reset per-peer PMTU values and endpoint state so discovery re-probes.
+    /// Mirrors Go's `Conn.resetEndpointStates()`.
+    fn reset_endpoint_states(&self) {
+        let mut endpoints = self
+            .inner
+            .endpoints
+            .write()
+            .expect("endpoints lock poisoned");
+        for ep in endpoints.values_mut() {
+            ep.reset_for_link_change();
+            ep.reset_peer_mtu();
+        }
     }
 
     /// Apply a NetInfo update received from the control server. Stores the
@@ -1920,7 +1981,7 @@ impl Inner {
                         );
                     }
                     if let Err(e) = udp.send_to(&packet, addr).await {
-                        if !treat_as_lost_udp(&e) {
+                        if !treat_as_lost_udp(&e) && pmtud::should_log_disco_tx_err(&ping, &e) {
                             log::debug!("magicsock: disco ping send failed: {e}");
                         }
                     } else {

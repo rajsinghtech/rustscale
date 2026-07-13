@@ -2928,6 +2928,7 @@ mod tests {
             peer_relay_server: false,
             relay_server_config: None,
             sockstats: None,
+            control_knobs: None,
         })
         .await
         .expect("magicsock");

@@ -230,7 +230,7 @@ async fn check_auth(ip: IpAddr, backend: &Arc<dyn C2nBackend>) -> bool {
     if is_loopback(ip) {
         return true;
     }
-    if is_tailnet_ip(ip) {
+    if rustscale_tsaddr::is_tailscale_ip(ip) {
         return backend.whois(ip).await.is_some();
     }
     false
@@ -240,19 +240,6 @@ fn is_loopback(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => v4.is_loopback(),
         IpAddr::V6(v6) => v6.is_loopback(),
-    }
-}
-
-fn is_tailnet_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            let octets = v4.octets();
-            octets[0] == 100 && (octets[1] >= 64 && octets[1] <= 127)
-        }
-        IpAddr::V6(v6) => {
-            let segs = v6.segments();
-            segs[0] == 0xfd7a && segs[1] == 0x115c && segs[2] == 0xa1e0
-        }
     }
 }
 
@@ -779,14 +766,30 @@ mod tests {
 
     #[test]
     fn test_is_tailnet_ip() {
-        assert!(is_tailnet_ip("100.64.0.1".parse().unwrap()));
-        assert!(is_tailnet_ip("100.127.255.255".parse().unwrap()));
-        assert!(is_tailnet_ip("fd7a:115c:a1e0::1".parse().unwrap()));
-        assert!(!is_tailnet_ip("8.8.8.8".parse().unwrap()));
-        assert!(!is_tailnet_ip("127.0.0.1".parse().unwrap()));
-        assert!(!is_tailnet_ip("99.64.0.1".parse().unwrap()));
-        assert!(!is_tailnet_ip("100.63.0.1".parse().unwrap()));
-        assert!(!is_tailnet_ip("100.128.0.1".parse().unwrap()));
+        assert!(rustscale_tsaddr::is_tailscale_ip(
+            "100.64.0.1".parse().unwrap()
+        ));
+        assert!(rustscale_tsaddr::is_tailscale_ip(
+            "100.127.255.255".parse().unwrap()
+        ));
+        assert!(rustscale_tsaddr::is_tailscale_ip(
+            "fd7a:115c:a1e0::1".parse().unwrap()
+        ));
+        assert!(!rustscale_tsaddr::is_tailscale_ip(
+            "8.8.8.8".parse().unwrap()
+        ));
+        assert!(!rustscale_tsaddr::is_tailscale_ip(
+            "127.0.0.1".parse().unwrap()
+        ));
+        assert!(!rustscale_tsaddr::is_tailscale_ip(
+            "99.64.0.1".parse().unwrap()
+        ));
+        assert!(!rustscale_tsaddr::is_tailscale_ip(
+            "100.63.0.1".parse().unwrap()
+        ));
+        assert!(!rustscale_tsaddr::is_tailscale_ip(
+            "100.128.0.1".parse().unwrap()
+        ));
     }
 
     #[test]

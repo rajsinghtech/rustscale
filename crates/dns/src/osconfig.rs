@@ -72,7 +72,7 @@ impl OsConfigurator for NoopConfigurator {
 ///
 /// Pure function — does not touch the filesystem. Safe to call in tests.
 pub fn build_os_dns_config(dns_config: &DNSConfig, magic_dns_suffix: &str) -> OsConfig {
-    let nameservers = vec![IpAddr::V4(crate::MAGICDNS_VIP)];
+    let nameservers = vec![rustscale_tsaddr::tailscale_service_ip()];
 
     let search_domains = dns_config
         .Domains
@@ -119,7 +119,6 @@ pub fn new_os_configurator() -> NoopConfigurator {
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use std::net::Ipv4Addr;
 
     fn resolver(addr: &str) -> rustscale_tailcfg::Resolver {
         rustscale_tailcfg::Resolver { Addr: addr.into() }
@@ -135,7 +134,7 @@ mod tests {
         let os = build_os_dns_config(&cfg, "tailnet.ts.net");
         assert_eq!(
             os.nameservers,
-            vec![IpAddr::V4(Ipv4Addr::new(100, 100, 100, 100))]
+            vec![rustscale_tsaddr::tailscale_service_ip()]
         );
         assert_eq!(os.search_domains, vec!["tailnet.ts.net", "corp.example"]);
         assert_eq!(os.match_domains, vec!["tailnet.ts.net"]);
@@ -207,7 +206,7 @@ mod tests {
         let os = build_os_dns_config(&cfg, "");
         assert_eq!(
             os.nameservers,
-            vec![IpAddr::V4(Ipv4Addr::new(100, 100, 100, 100))]
+            vec![rustscale_tsaddr::tailscale_service_ip()]
         );
         assert!(os.search_domains.is_empty());
         assert!(os.match_domains.is_empty());

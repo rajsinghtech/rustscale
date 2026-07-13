@@ -433,7 +433,7 @@ async fn handle_connection_netstack(
 ) {
     let remote_ip = remote_addr.map(|a| a.ip());
     if let Some(ip) = remote_ip {
-        if !is_tailnet_ip(ip) {
+        if !rustscale_tsaddr::is_tailscale_ip(ip) {
             return;
         }
     }
@@ -447,26 +447,11 @@ async fn handle_connection_tcp(
     remote_addr: SocketAddr,
     state: Arc<PeerApiState>,
 ) {
-    if !is_tailnet_ip(remote_addr.ip()) {
+    if !rustscale_tsaddr::is_tailscale_ip(remote_addr.ip()) {
         return;
     }
     let conn = PeerApiConn::new(stream, Some(remote_addr), state);
     conn.serve().await;
-}
-
-/// Check whether an IP is in the tailnet range (100.64.0.0/10 or
-/// fd7a:115c:a1e0::/48).
-fn is_tailnet_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            let o = v4.octets();
-            o[0] == 100 && (o[1] >= 64 && o[1] <= 127)
-        }
-        IpAddr::V6(v6) => {
-            let s = v6.segments();
-            s[0] == 0xfd7a && s[1] == 0x115c && s[2] == 0xa1e0
-        }
-    }
 }
 
 /// A connection wrapper that abstracts netstack vs TCP streams.
@@ -1336,13 +1321,27 @@ mod tests {
 
     #[test]
     fn test_is_tailnet_ip() {
-        assert!(is_tailnet_ip("100.64.0.1".parse().unwrap()));
-        assert!(is_tailnet_ip("100.127.255.255".parse().unwrap()));
-        assert!(is_tailnet_ip("fd7a:115c:a1e0::1".parse().unwrap()));
-        assert!(!is_tailnet_ip("8.8.8.8".parse().unwrap()));
-        assert!(!is_tailnet_ip("127.0.0.1".parse().unwrap()));
-        assert!(!is_tailnet_ip("100.63.0.1".parse().unwrap()));
-        assert!(!is_tailnet_ip("100.128.0.1".parse().unwrap()));
+        assert!(rustscale_tsaddr::is_tailscale_ip(
+            "100.64.0.1".parse().unwrap()
+        ));
+        assert!(rustscale_tsaddr::is_tailscale_ip(
+            "100.127.255.255".parse().unwrap()
+        ));
+        assert!(rustscale_tsaddr::is_tailscale_ip(
+            "fd7a:115c:a1e0::1".parse().unwrap()
+        ));
+        assert!(!rustscale_tsaddr::is_tailscale_ip(
+            "8.8.8.8".parse().unwrap()
+        ));
+        assert!(!rustscale_tsaddr::is_tailscale_ip(
+            "127.0.0.1".parse().unwrap()
+        ));
+        assert!(!rustscale_tsaddr::is_tailscale_ip(
+            "100.63.0.1".parse().unwrap()
+        ));
+        assert!(!rustscale_tsaddr::is_tailscale_ip(
+            "100.128.0.1".parse().unwrap()
+        ));
     }
 
     #[test]

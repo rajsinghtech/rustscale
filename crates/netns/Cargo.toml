@@ -50,3 +50,4 @@ tokio.workspace = true
 thiserror.workspace = true
 if-addrs.workspace = true
 rustscale-netmon.workspace = true
+rustscale-tsaddr.workspace = true

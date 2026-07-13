@@ -163,7 +163,7 @@ mod tests {
     #[test]
     fn filter_rule_roundtrip() {
         let rule = FilterRule {
-            SrcIPs: vec!["100.64.0.0/10".into(), "*".into()],
+            SrcIPs: vec![rustscale_tsaddr::cgnat_range().to_string(), "*".into()],
             DstPorts: vec![NetPortRange {
                 IP: "1.2.3.4".into(),
                 Bits: None,

@@ -59,7 +59,7 @@ P3 status: hostinfo darwin ✅ (OSVersion + DeviceModel via sysctl) · quarantin
 
 | Package | Go source | Rust status |
 | --- | --- | --- |
-| Tailscale IP addr helpers | `net/tsaddr/` | 🔶 predicates scattered across c2n, peerapi, netns, netmon, routing, dns; no unified crate |
+| Tailscale IP addr helpers | `net/tsaddr/` | ✅ `crates/tsaddr`: CGNAT/ULA/4via6/4to6/ephemeral ranges, service VIPs, `is_tailscale_ip`, `map_via`/`unmap_via`, exit-route helpers; all call sites migrated |
 | Outbound dial abstraction | `net/tsdial/` | ⬜ `netns::dial_tcp()` exists but missing PeerAPI/DoH/DNS-map routing |
 | Localhost port proxy map | `net/proxymap/` | ⬜ ephemeral localhost->remote IP port mapping for proxied conns |
 | HTTP CONNECT proxy | `net/connectproxy/` | ✅ `crates/connectproxy`: `ConnectProxyConfig`, `parse_connect_request`, `handle_connect` with bidirectional tunnel |

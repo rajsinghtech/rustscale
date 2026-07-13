@@ -349,7 +349,7 @@ fn sample_register_response() -> RegisterResponse {
 
 fn sample_filter_rule() -> FilterRule {
     FilterRule {
-        SrcIPs: vec!["100.64.0.0/10".into(), "*".into()],
+        SrcIPs: vec![rustscale_tsaddr::cgnat_range().to_string(), "*".into()],
         SrcBits: vec![32, 0],
         DstPorts: vec![NetPortRange {
             IP: "1.2.3.4".into(),

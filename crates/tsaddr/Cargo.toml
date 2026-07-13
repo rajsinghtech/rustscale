@@ -1,6 +1,6 @@
 [package]
-name = "rustscale-c2n"
-description = "Control-to-Node (C2N) HTTP API for rustscale"
+name = "rustscale-tsaddr"
+description = "Tailscale IP address predicates and ranges — port of Go net/tsaddr"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,7 +12,4 @@ workspace = true
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
-tokio.workspace = true
-async-trait.workspace = true
 thiserror.workspace = true
-rustscale-tsaddr = { path = "../tsaddr", version = "0.1.0" }

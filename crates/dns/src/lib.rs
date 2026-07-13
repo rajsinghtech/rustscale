@@ -37,10 +37,10 @@ pub use wire::{
 };
 
 /// The MagicDNS VIP that OS resolvers point at (`100.100.100.100`).
-pub const MAGICDNS_VIP: Ipv4Addr = Ipv4Addr::new(100, 100, 100, 100);
+pub const MAGICDNS_VIP: Ipv4Addr = rustscale_tsaddr::tailscale_service_ipv4();
 
 /// The MagicDNS IPv6 service VIP (`fd7a:115c:a1e0::53`).
-pub const MAGICDNS_VIP_V6: Ipv6Addr = Ipv6Addr::new(0xfd7a, 0x115c, 0xa1e0, 0, 0, 0, 0, 0x53);
+pub const MAGICDNS_VIP_V6: Ipv6Addr = rustscale_tsaddr::tailscale_service_ipv6_addr();
 
 /// The symbolic FQDN that resolves to the MagicDNS VIP.
 const DNS_SYMBOLIC_FQDN: &str = "magicdns.localhost-tailscale-daemon.";
@@ -55,14 +55,6 @@ const RDNS_V4_SUFFIX: &str = ".in-addr.arpa.";
 
 /// The IPv6 suffix for reverse DNS lookups.
 const RDNS_V6_SUFFIX: &str = ".ip6.arpa.";
-
-/// The Tailscale 4to6 range prefix (fd7a:115c:a1e0:ab12:4843:cd96:6200::/104).
-const TS_4TO6_PREFIX: [u8; 13] = [
-    0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0, 0xab, 0x12, 0x48, 0x43, 0xcd, 0x96, 0x62,
-];
-
-/// The Tailscale Via range first 8 bytes (fd7a:115c:a1e0:b1a::).
-const TS_VIA_PREFIX: [u8; 8] = [0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0, 0x0b, 0x1a];
 
 /// Outcome of resolving a name against the netmap.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -561,9 +553,11 @@ fn build_config(dns_config: Option<&DNSConfig>, domain: &str, peers: &[Node]) ->
             cfg.local_domains.push(domain.to_string());
             // Add reverse DNS zones for tailnet ranges.
             cfg.local_domains
-                .push("100.64.0.0/10.in-addr.arpa.".to_string());
-            cfg.local_domains
-                .push("fd7a:115c:a1e0::/48.ip6.arpa.".to_string());
+                .push(format!("{}.in-addr.arpa.", rustscale_tsaddr::cgnat_range()));
+            cfg.local_domains.push(format!(
+                "{}.ip6.arpa.",
+                rustscale_tsaddr::tailscale_ula_range()
+            ));
         }
         for d in &dc.Domains {
             cfg.local_domains.push(d.clone());
@@ -768,25 +762,26 @@ fn hex_val(b: u8) -> Option<u8> {
 }
 
 /// Map an IPv4 address + siteID into the Tailscale 4via6 range.
-/// Ports Go's `tsaddr.MapVia` (tsaddr.go:308-318).
+/// Delegates to `rustscale_tsaddr::map_via`.
 fn map_via(site_id: u32, ip4: Ipv4Addr) -> Ipv6Addr {
-    let mut a = [0u8; 16];
-    a[..8].copy_from_slice(&TS_VIA_PREFIX);
-    a[8..12].copy_from_slice(&site_id.to_be_bytes());
-    let oct = ip4.octets();
-    a[12..16].copy_from_slice(&oct);
-    Ipv6Addr::from(a)
+    let p = rustscale_tsaddr::map_via(
+        site_id,
+        rustscale_tsaddr::IpPrefix {
+            ip: IpAddr::V4(ip4),
+            bits: 32,
+        },
+    )
+    .expect("map_via: must be IPv4");
+    match p.ip {
+        IpAddr::V6(v6) => v6,
+        _ => unreachable!(),
+    }
 }
 
 /// Convert a Tailscale 4to6 IPv6 address back to IPv4.
-/// Ports Go's `tsaddr.Tailscale6to4` (tsaddr.go:148-154).
+/// Delegates to `rustscale_tsaddr::tailscale_6to4`.
 fn tailscale_6to4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
-    let b = v6.octets();
-    // Check the first 13 bytes match the 4to6 prefix.
-    if b[..13] != TS_4TO6_PREFIX {
-        return None;
-    }
-    Some(Ipv4Addr::new(100, b[13], b[14], b[15]))
+    rustscale_tsaddr::tailscale_6to4(v6)
 }
 
 /// Check if a name has a Bonjour mDNS service prefix.

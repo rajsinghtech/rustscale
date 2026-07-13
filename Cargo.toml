@@ -63,6 +63,7 @@ async-trait = "0.1"
 # stage; real LE certs via control come in a later phase).
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 
+rustscale-tsaddr = { path = "crates/tsaddr" }
 rustscale-packet = { path = "crates/packet" }
 rustscale-netmon = { path = "crates/netmon" }
 socket2 = { version = "0.6", features = ["all"] }

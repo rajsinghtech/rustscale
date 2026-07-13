@@ -1,5 +1,5 @@
 use std::ffi::CString;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::os::fd::AsRawFd;
 use tokio::net::{TcpSocket, TcpStream};
 
@@ -62,8 +62,12 @@ fn default_interface_index() -> Option<u32> {
                     continue;
                 }
                 let is_ts = match iface.addr {
-                    if_addrs::IfAddr::V4(ref a) => super::is_cgnat_v4(a.ip),
-                    if_addrs::IfAddr::V6(ref a) => super::is_tailscale_ula(a.ip),
+                    if_addrs::IfAddr::V4(ref a) => {
+                        rustscale_tsaddr::cgnat_range().contains(IpAddr::V4(a.ip))
+                    }
+                    if_addrs::IfAddr::V6(ref a) => {
+                        rustscale_tsaddr::tailscale_ula_range().contains(IpAddr::V6(a.ip))
+                    }
                 };
                 if is_ts {
                     return None;
@@ -239,13 +243,4 @@ fn parse_route_response(buf: &[u8]) -> Option<u32> {
         offset += aligned;
     }
     None
-}
-
-#[allow(dead_code)]
-fn _is_cgnat_v4(ip: Ipv4Addr) -> bool {
-    super::is_cgnat_v4(ip)
-}
-#[allow(dead_code)]
-fn _is_tailscale_ula(ip: Ipv6Addr) -> bool {
-    super::is_tailscale_ula(ip)
 }

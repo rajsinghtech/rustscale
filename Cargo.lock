@@ -2400,6 +2400,7 @@ name = "rustscale-c2n"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "rustscale-tsaddr",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -2526,6 +2527,7 @@ dependencies = [
  "rustscale-key",
  "rustscale-neterror",
  "rustscale-tailcfg",
+ "rustscale-tsaddr",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -2730,6 +2732,7 @@ version = "0.1.0"
 dependencies = [
  "if-addrs",
  "libc",
+ "rustscale-tsaddr",
  "thiserror 1.0.69",
  "tokio",
 ]
@@ -2741,6 +2744,7 @@ dependencies = [
  "if-addrs",
  "libc",
  "rustscale-netmon",
+ "rustscale-tsaddr",
  "socket2",
  "thiserror 1.0.69",
  "tokio",
@@ -2842,6 +2846,7 @@ dependencies = [
  "base64",
  "chrono",
  "rustscale-key",
+ "rustscale-tsaddr",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -2876,6 +2881,15 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+]
+
+[[package]]
+name = "rustscale-tsaddr"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -2927,6 +2941,7 @@ dependencies = [
  "rustscale-tailcfg",
  "rustscale-tcpinfo",
  "rustscale-testcontrol",
+ "rustscale-tsaddr",
  "rustscale-tun",
  "rustscale-udprelay",
  "rustscale-wg",

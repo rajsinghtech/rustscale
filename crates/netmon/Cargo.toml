@@ -54,6 +54,7 @@ if-addrs.workspace = true
 libc.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
+rustscale-tsaddr.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true

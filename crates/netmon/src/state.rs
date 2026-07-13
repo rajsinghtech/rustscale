@@ -249,7 +249,7 @@ pub fn has_cgnat_interface(state: &State) -> bool {
         }
         for pfx in prefixes {
             if let IpAddr::V4(v4) = pfx.ip {
-                if is_cgnat_v4(v4) {
+                if rustscale_tsaddr::cgnat_range().contains(IpAddr::V4(v4)) {
                     return true;
                 }
             }
@@ -364,7 +364,7 @@ fn is_usable_v6(ip: IpAddr) -> bool {
     if (octets[0] & 0xE0) == 0x20 {
         return true;
     }
-    if (octets[0] & 0xFE) == 0xFC && !is_tailscale_ula(&octets) {
+    if (octets[0] & 0xFE) == 0xFC && !rustscale_tsaddr::is_tailscale_ip(ip) {
         return true;
     }
     false
@@ -374,22 +374,6 @@ fn is_usable_v6(ip: IpAddr) -> bool {
 fn is_link_local_v4(addr: Ipv4Addr) -> bool {
     let o = addr.octets();
     o[0] == 169 && o[1] == 254
-}
-
-/// Whether an IPv6 address is in Tailscale's ULA range (fd7a:115c:a1e0::/48).
-fn is_tailscale_ula(octets: &[u8; 16]) -> bool {
-    octets[0] == 0xfd
-        && octets[1] == 0x7a
-        && octets[2] == 0x11
-        && octets[3] == 0x5c
-        && octets[4] == 0xa1
-        && octets[5] == 0xe0
-}
-
-/// Whether an IPv4 address is in the Tailscale CGNAT range (100.64.0.0/10).
-fn is_cgnat_v4(addr: Ipv4Addr) -> bool {
-    let o = addr.octets();
-    o[0] == 100 && (o[1] & 0xC0) == 0x40
 }
 
 /// Filter out non-routable IPs: loopback, link-local, multicast, Tailscale
@@ -403,14 +387,14 @@ pub(crate) fn filter_routable_ips(ips: &[IpPrefix]) -> Vec<IpPrefix> {
             }
             match ip {
                 IpAddr::V4(v4) => {
-                    if is_link_local_v4(v4) || is_cgnat_v4(v4) {
+                    if is_link_local_v4(v4) || rustscale_tsaddr::is_tailscale_ip(ip) {
                         return false;
                     }
                     true
                 }
                 IpAddr::V6(v6) => {
                     let octets = v6.octets();
-                    if is_link_local_v6(&octets) || is_tailscale_ula(&octets) {
+                    if is_link_local_v6(&octets) || rustscale_tsaddr::is_tailscale_ip(ip) {
                         return false;
                     }
                     true

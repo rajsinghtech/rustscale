@@ -107,7 +107,7 @@ real JSON).
 | Network utility functions | `net/netutil/` | 🔶 proxy protocol detection in service.rs; interface helpers in netmon/netns; no consolidated crate |
 | Socket options | `net/sockopts/` | ✅ SO_MARK + SO_BINDTODEVICE in `crates/netns/src/linux.rs` |
 | TCP connection table | `net/netstat/` | 🔶 `crates/tcpinfo` iterates FDs 0..1000 on macOS; no full OS TCP connection enumeration |
-| TCP keepalive timeout | `net/ktimeout/` | ⬜ no TCP keepalive setsockopt (keepidle/keepintvl/keepcnt) |
+| TCP keepalive timeout | `net/ktimeout/` | 🔶 `crates/ktimeout` exists (93 loc) but has no consumers — not wired into listener/socket creation |
 | Speedtest protocol | `net/speedtest/` | ⬜ |
 | Desktop integration | `ipn/desktop/` | ✅ `crates/tsnet/src/hostinfo.rs`: reads `/proc/net/unix` for .X11-unix / wayland-1 socket detection |
 | Alternative routing table | `net/art/` | ⬜ |
@@ -148,12 +148,12 @@ real JSON).
 | PeerAPI (`ipn/ipnlocal/peerapi.go`) | ✅ DoH /dns-query (GET + POST), /v0/* endpoints (goroutines, env, metrics, magicsock, dnsfwd, interfaces, sockstats), WhoIs auth, CRC32 port [32768, 65535], Taildrop PUT handler, netstack + TUN spawners |
 | Hostinfo | 🔶 ~22/42 fields populated (IPNVersion, OS, OSVersion, Machine, Hostname, Services, NetInfo, RoutableIPs, etc.); missing ~20 (FrontendLogID, BackendLogID, PushDeviceToken, ShareeNode, NoLogsNoSupport, WireIngress, AllowsUpdate, GoArchVar, RequestTags, WoLMACs, SSH_HostKeys, Userspace, AppConnector, PeerRelay, ServicesHash, Location, TPM, StateEncrypted, ShieldsUp, etc.) |
 | CapturePcap | 🔶 API declared at `Server::capture_pcap()` but returns "not yet implemented" error |
-| Logtail | 🔶 buffers + metadata + write(); HTTP upload is TODO stub (no network upload to log server) |
+| Logtail | ✅ `crates/logtail` upload loop (HTTP POST, zstd, backoff) — see Tier 2.5 row |
 | Watchdog | ✅ tokio-based interval task, auto-fires warning if not feed() within interval, Drop-safe |
 | Syspolicy | ⬜ |
 | BIRD routing (`chirp/`) | ⬜ |
 | Linux ipset | ⬜ |
-| envknob | ⬜ |
+| envknob | 🔶 `crates/envknob` exists (453 loc) but has no consumers — not wired into any call sites |
 | Version package | ✅ build.rs git describe --tags --long --always --dirty → RUSTSCALE_VERSION_LONG; fallback CARGO_PKG_VERSION |
 | Freedesktop/DBus | ⬜ |
 | System tray | ⬜ |
@@ -238,7 +238,7 @@ state-dir fallback probing), `--json`.
 | `metrics` | `cli/metrics.go` | ✅ raw Prometheus text passthrough |
 | `health` | — | ✅ health warnings from daemon; `--json` |
 | `down` | `cli/down.go` | ✅ EditPrefs WantRunning=false via PATCH /prefs |
-| `ping` | `cli/ping.go` | 🔶 CLI calls `client.ping(ip, "disco")` but daemon returns 501 (magicsock disco-ping API pending) |
+| `ping` | `cli/ping.go` | ✅ disco/icmp/tsmp/peerapi via LocalAPI /ping; DERP bootstrap + forced direct discovery (2026-07-13) |
 | `up` | `cli/up.go` | ✅ full runUp sequence (status → build prefs → watch-ipn-bus → /start → login-interactive → BrowseToURL → Running); flags: --auth-key, --hostname, --advertise-routes, --advertise-exit-node, --exit-node, --shields-up, --accept-routes, --accept-dns, --reset, --force-reauth, --timeout, --json, --qr |
 | `login` | `cli/login.go` | ✅ login-interactive + watch-ipn-bus for BrowseToURL/Running; --qr |
 | `logout` | `cli/logout.go` | ✅ POST /logout |

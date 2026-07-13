@@ -219,6 +219,66 @@ impl Server {
             }
         }
 
+        // Portlist: shared state for the background port-scanning task and
+        // the hostinfo hook. The hook adds portlist services to
+        // Hostinfo.Services; the background task polls every N seconds and
+        // updates the shared list. Mirrors Go's portlist EventBus extension.
+        let portlist_ports: Arc<std::sync::Mutex<Vec<rustscale_portlist::Port>>> =
+            Arc::new(std::sync::Mutex::new(vec![]));
+        let proxy_mapper = Arc::new(rustscale_proxymap::Mapper::new());
+
+        // Register a hostinfo hook that adds portlist + peerapi services to
+        // Hostinfo.Services before it is sent to control.
+        let pl_ports_hook = portlist_ports.clone();
+        let hp_port = peerapi_port;
+        let has_v6_hook = b.tailscale_ips.iter().any(|ip| matches!(ip, IpAddr::V6(_)));
+        hostinfo::register_hostinfo_hook(move |hi| {
+            let mut services = Vec::new();
+            if let Some(port) = hp_port {
+                if port > 0 {
+                    services.push(rustscale_tailcfg::Service {
+                        Proto: "peerapi4".into(),
+                        Port: port,
+                        Description: String::new(),
+                    });
+                    if has_v6_hook {
+                        services.push(rustscale_tailcfg::Service {
+                            Proto: "peerapi6".into(),
+                            Port: port,
+                            Description: String::new(),
+                        });
+                    }
+                }
+            }
+            if let Ok(ports) = pl_ports_hook.lock() {
+                services.extend(rustscale_portlist::to_services(&ports));
+            }
+            if !services.is_empty() {
+                hi.Services = services;
+            }
+        });
+
+        // Spawn the portlist poller background task.
+        let pl_ports_task = portlist_ports.clone();
+        let pl_cancel = b.cancel.clone();
+        let pl_interval = rustscale_portlist::Poller::new(false).interval();
+        let portlist_task = tokio::spawn(async move {
+            let mut poller = rustscale_portlist::Poller::new(false);
+            loop {
+                if pl_cancel.is_cancelled() {
+                    break;
+                }
+                let (ports, changed) = poller.poll().await;
+                if changed {
+                    if let Ok(mut guard) = pl_ports_task.lock() {
+                        *guard = ports;
+                    }
+                }
+                tokio::time::sleep(pl_interval).await;
+            }
+        });
+        tasks.push(portlist_task);
+
         // Periodic Hostinfo refresh (every 10 min, dedup by content hash).
         let hostinfo_loop = spawn_hostinfo_update_loop(
             b.cancel.clone(),
@@ -385,6 +445,8 @@ impl Server {
             fallback_tcp_handlers: Arc::new(std::sync::Mutex::new(vec![])),
             fallback_next_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             prefs,
+            proxy_mapper,
+            portlist_ports,
         });
 
         // Apply stored exit-node pref on start (survives restart).
@@ -604,6 +666,60 @@ impl Server {
             }
         }
 
+        // Portlist: shared state for the background port-scanning task and
+        // the hostinfo hook (TUN mode).
+        let portlist_ports: Arc<std::sync::Mutex<Vec<rustscale_portlist::Port>>> =
+            Arc::new(std::sync::Mutex::new(vec![]));
+        let proxy_mapper = Arc::new(rustscale_proxymap::Mapper::new());
+
+        let pl_ports_hook = portlist_ports.clone();
+        let hp_port = peerapi_port;
+        let has_v6_hook = b.tailscale_ips.iter().any(|ip| matches!(ip, IpAddr::V6(_)));
+        hostinfo::register_hostinfo_hook(move |hi| {
+            let mut services = Vec::new();
+            if let Some(port) = hp_port {
+                if port > 0 {
+                    services.push(rustscale_tailcfg::Service {
+                        Proto: "peerapi4".into(),
+                        Port: port,
+                        Description: String::new(),
+                    });
+                    if has_v6_hook {
+                        services.push(rustscale_tailcfg::Service {
+                            Proto: "peerapi6".into(),
+                            Port: port,
+                            Description: String::new(),
+                        });
+                    }
+                }
+            }
+            if let Ok(ports) = pl_ports_hook.lock() {
+                services.extend(rustscale_portlist::to_services(&ports));
+            }
+            if !services.is_empty() {
+                hi.Services = services;
+            }
+        });
+
+        let pl_ports_task = portlist_ports.clone();
+        let pl_cancel = b.cancel.clone();
+        let pl_interval = rustscale_portlist::Poller::new(false).interval();
+        let portlist_task = tokio::spawn(async move {
+            let mut poller = rustscale_portlist::Poller::new(false);
+            loop {
+                if pl_cancel.is_cancelled() {
+                    break;
+                }
+                let (ports, changed) = poller.poll().await;
+                if changed {
+                    if let Ok(mut guard) = pl_ports_task.lock() {
+                        *guard = ports;
+                    }
+                }
+                tokio::time::sleep(pl_interval).await;
+            }
+        });
+
         // Periodic Hostinfo refresh (every 10 min, dedup by content hash).
         // In TUN mode, serve/funnel is not available so pass None.
         let hostinfo_loop = spawn_hostinfo_update_loop(
@@ -631,6 +747,7 @@ impl Server {
             c2n_task,
             peerapi_task,
             hostinfo_loop,
+            portlist_task,
         ];
 
         // LocalAPI Unix-domain-socket server (optional, default OFF).
@@ -813,6 +930,8 @@ impl Server {
             fallback_tcp_handlers: Arc::new(std::sync::Mutex::new(vec![])),
             fallback_next_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             prefs,
+            proxy_mapper,
+            portlist_ports,
         });
 
         // Apply stored exit-node pref on start (survives restart).

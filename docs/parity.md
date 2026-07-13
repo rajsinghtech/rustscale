@@ -63,7 +63,7 @@ real JSON).
 | --- | --- | --- |
 | Tailscale IP addr helpers | `net/tsaddr/` | ✅ `crates/tsaddr`: CGNAT/ULA/4via6/4to6/ephemeral ranges, service VIPs, `is_tailscale_ip`, `map_via`/`unmap_via`, exit-route helpers; all call sites migrated |
 | Outbound dial abstraction | `net/tsdial/` | ✅ `crates/tsdial`: `Dialer` with SystemDial/UserDial/PeerDial paths, `DnsMap` MagicDNS resolution, `UserDialPlan`, netmon link-change callback stub, `ActiveConns` tracking; all 10 `TcpStream::connect` call sites migrated |
-| Localhost port proxy map | `net/proxymap/` | ⬜ ephemeral localhost->remote IP port mapping for proxied conns |
+| Localhost port proxy map | `net/proxymap/` | ✅ `crates/proxymap`: `Mapper` (register/unregister/whois_ipport with 0/10/20/50/100ms retry, reverse whois_by_ip); wired into `tsnet::Server` (RunningState.proxy_mapper, WhoIs fallback, register_proxy_identity/unregister_proxy_identity) |
 | HTTP CONNECT proxy | `net/connectproxy/` | ✅ `crates/connectproxy`: `ConnectProxyConfig`, `parse_connect_request`, `handle_connect` with bidirectional tunnel |
 | HTTP proxy env detection | `net/tshttpproxy/` | ✅ `crates/tshttpproxy`: `proxy_from_environment` + `http_connect` (HTTP/1.1 CONNECT tunnel w/ Proxy-Authorization); wired into controlhttp (`dial_control`, `fetch_server_pub_key`, `tls_connect`) and derp (`connect_insecure`, `connect_with_upgrade_dial_insecure` — downgrades upgrade→direct TLS over tunnel when proxied) |
 | Embedded TLS roots fallback | `net/bakedroots/` | ✅ `crates/bakedroots`: ISRG Root X1+X2 PEMs, `get()` lazy `RootCertStore`, `combined_root_store()` 3-tier (webpki+extra+baked); integrated into derp, controlhttp, acme, dns forwarder; `ServerBuilder::extra_root_certs` plumbing through `ControlClient` |
@@ -74,7 +74,7 @@ real JSON).
 | Config file format | `ipn/conffile/` | ✅ `crates/conffile` — `ConfigVAlpha` schema with `Load`/`ToPrefs`/`WantRunning`, `deny_unknown_fields`, version `"alpha0"` validation; `--config <path>` flag on rustscaled, `POST /localapi/v0/reload-config` endpoint, SIGHUP reload handler |
 | IPN extension system | `ipn/ipnext/` | ⬜ |
 | Cloud log shipping | `logtail/` | ✅ `crates/logtail` — async upload loop (background tokio task), HTTP POST to `{base_url}/c/{collection}/{private_id}`, zstd compression (>256B, >64B savings), Retry-After/30–60s backoff, RFC3339Nano `client_time`, buffer cap + drop_count, upload metrics |
-| Port enumeration | `portlist/` | ⬜ |
+| Port enumeration | `portlist/` | ✅ `crates/portlist`: `Poller` (same-count shortcut, 1s Linux / 5s macOS), Linux `/proc/net/{tcp,tcp6,udp,udp6}` hex parser + `/proc/*/fd` PID resolution, macOS `netstat -na` + `lsof -F` parser with sandbox-failure cache, `to_services()` with is_interesting_service policy; wired into tsnet via HostinfoHook + background poller task |
 | Network flow logging | `wgengine/netlog/` | ⬜ |
 | Network error classification | `net/neterror/` | ✅ `rustscale-neterror` crate with `treat_as_lost_udp`, `packet_was_truncated`, `should_disable_udp_gso`, `is_closed_pipe_error`; wired into magicsock (send/disco paths), portmapper (PMP/PCP mapping sends), dns forwarder (UDP recv) |
 | Network traffic steering | `net/traffic/` | 🔶 split DNS OS config exists (macOS); no general traffic-steering abstraction |

@@ -661,6 +661,16 @@ pub(crate) struct RunningState {
     /// direct access for SIGHUP-driven config reload without going through
     /// the LocalAPI endpoint.
     pub(crate) prefs: Arc<RwLock<rustscale_ipn::Prefs>>,
+    /// Ephemeral `(proto, localhost ip:port) -> Tailscale IP` mapping for
+    /// proxied connections. Used by WhoIs to attribute netstack-proxied
+    /// connections to their originating peer. Mirrors Go's `proxymap.Mapper`.
+    pub(crate) proxy_mapper: Arc<rustscale_proxymap::Mapper>,
+    /// Shared portlist state — the background portlist task writes here and
+    /// the hostinfo hook reads here. Mirrors Go's `portlist.Poller` EventBus
+    /// integration. Held in `RunningState` to keep the Arc alive for the
+    /// server's lifetime; the background task and hook operate on clones.
+    #[allow(dead_code)]
+    pub(crate) portlist_ports: Arc<std::sync::Mutex<Vec<rustscale_portlist::Port>>>,
 }
 
 /// A fallback TCP handler: called when an incoming TCP flow doesn't match any

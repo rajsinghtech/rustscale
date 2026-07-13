@@ -307,11 +307,8 @@ pub fn apply_runtime_fields(hi: &mut Hostinfo, rt: &RuntimeHostinfo) {
     }
     hi.PeerRelay = rt.peer_relay;
 
-    // ServicesHash: opaque hash of the Services list so control can tell
-    // the client to re-fetch via c2n when services change.
-    if !hi.Services.is_empty() {
-        hi.ServicesHash = services_hash(&hi.Services);
-    }
+    // ServicesHash is computed after hooks run (see collect_hostinfo) so
+    // that hostinfo hooks adding Services entries are reflected in the hash.
 
     // TODO: The following fields require platform APIs or data not
     // available in the embedding layer:
@@ -337,6 +334,10 @@ pub fn collect_hostinfo(
     hi = populate_hostinfo(hi);
     apply_runtime_fields(&mut hi, rt);
     run_hostinfo_hooks(&mut hi);
+    // Compute ServicesHash after hooks so hook-added services are reflected.
+    if !hi.Services.is_empty() {
+        hi.ServicesHash = services_hash(&hi.Services);
+    }
     hi
 }
 

@@ -73,6 +73,8 @@ rustscale-bakedroots = { path = "../bakedroots", version = "0.1.0" }
 rustscale-tsaddr = { path = "../tsaddr", version = "0.1.0" }
 rustscale-sockstats = { path = "../sockstats", version = "0.1.0" }
 rustscale-conffile = { path = "../conffile", version = "0.1.0" }
+rustscale-proxymap = { path = "../proxymap", version = "0.1.0" }
+rustscale-portlist = { path = "../portlist", version = "0.1.0" }
 rustscale-netns.workspace = true
 rustscale-tsdial = { path = "../tsdial" }
 serde.workspace = true

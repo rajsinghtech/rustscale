@@ -140,7 +140,7 @@ async fn real_register_gets_structured_response() {
     let version: ProtocolVersion = 141;
 
     // Fetch the server's Noise public key.
-    let server_key = fetch_server_pub_key(host, version)
+    let server_key = fetch_server_pub_key(host, version, None)
         .await
         .expect("fetch_server_pub_key should succeed");
 

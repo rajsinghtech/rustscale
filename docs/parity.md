@@ -66,7 +66,7 @@ real JSON).
 | Localhost port proxy map | `net/proxymap/` | ⬜ ephemeral localhost->remote IP port mapping for proxied conns |
 | HTTP CONNECT proxy | `net/connectproxy/` | ✅ `crates/connectproxy`: `ConnectProxyConfig`, `parse_connect_request`, `handle_connect` with bidirectional tunnel |
 | HTTP proxy env detection | `net/tshttpproxy/` | ✅ `crates/tshttpproxy`: `proxy_from_environment` + `http_connect` (HTTP/1.1 CONNECT tunnel w/ Proxy-Authorization); wired into controlhttp (`dial_control`, `fetch_server_pub_key`, `tls_connect`) and derp (`connect_insecure`, `connect_with_upgrade_dial_insecure` — downgrades upgrade→direct TLS over tunnel when proxied) |
-| Embedded TLS roots fallback | `net/bakedroots/` | ⬜ container/minimal-Linux control-plane cert validation |
+| Embedded TLS roots fallback | `net/bakedroots/` | ✅ `crates/bakedroots`: ISRG Root X1+X2 PEMs, `get()` lazy `RootCertStore`, `combined_root_store()` 3-tier (webpki+extra+baked); integrated into derp, controlhttp, acme, dns forwarder; `ServerBuilder::extra_root_certs` plumbing through `ControlClient` |
 | OS-level route management | `wgengine/router/` | 🔶 `crates/routetable` reads routes via PF_ROUTE sysctl; `tun_pump.rs` installs routes via shell (route/ip); no clean router abstraction |
 | LocalAPI authorization | `ipn/ipnauth/` | ✅ `safesocket::peercred::ConnIdentity` (SO_PEERCRED/LOCAL_PEERCRED/getpeereid), `is_readwrite()` uid check, enforced at all mutating LocalAPI endpoints (403 on mismatch) |
 | IPN audit logging | `ipn/auditlog/` | ⬜ |

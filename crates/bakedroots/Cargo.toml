@@ -1,0 +1,18 @@
+[package]
+name = "rustscale-bakedroots"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["bakedroots"]
+bakedroots = []
+
+[dependencies]
+rustls = { workspace = true }
+webpki-roots = { workspace = true }
+base64 = { workspace = true }
+
+[lints]
+workspace = true

@@ -270,6 +270,7 @@ pub async fn dial_control(
     machine_key: &MachinePrivate,
     control_key: &MachinePublic,
     version: ProtocolVersion,
+    extra_roots: Option<&[Vec<u8>]>,
 ) -> Result<NoiseStream<AnyStream>, DialError> {
     let parsed = parse_control_url(url);
     if parsed.is_plain {
@@ -286,7 +287,7 @@ pub async fn dial_control(
         upgrade_and_handshake(stream, &parsed.host_port, machine_key, control_key, version).await
     } else {
         let insecure = is_insecure_host(&parsed.host);
-        let tls_stream = tls_connect(&parsed.host, parsed.port, insecure).await?;
+        let tls_stream = tls_connect(&parsed.host, parsed.port, insecure, extra_roots).await?;
         let stream = AnyStream::Tls(Box::new(tls_stream));
         upgrade_and_handshake(stream, &parsed.host, machine_key, control_key, version).await
     }
@@ -307,6 +308,7 @@ pub async fn dial_control(
 pub async fn fetch_server_pub_key(
     url: &str,
     version: ProtocolVersion,
+    extra_roots: Option<&[Vec<u8>]>,
 ) -> Result<MachinePublic, DialError> {
     let parsed = parse_control_url(url);
 
@@ -338,7 +340,7 @@ pub async fn fetch_server_pub_key(
         buf
     } else {
         let insecure = is_insecure_host(&parsed.host);
-        let mut tls = tls_connect(&parsed.host, parsed.port, insecure).await?;
+        let mut tls = tls_connect(&parsed.host, parsed.port, insecure, extra_roots).await?;
 
         let request = format!(
             "GET /key?v={version} HTTP/1.1\r\n\
@@ -416,6 +418,7 @@ async fn tls_connect(
     host: &str,
     port: u16,
     insecure: bool,
+    extra_roots: Option<&[Vec<u8>]>,
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, DialError> {
     ensure_ring_provider();
 
@@ -437,9 +440,7 @@ async fn tls_connect(
     let config = if insecure {
         insecure_tls_config()
     } else {
-        let root_store = rustls::RootCertStore {
-            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-        };
+        let root_store = rustscale_bakedroots::combined_root_store(extra_roots);
         rustls::ClientConfig::builder()
             .with_root_certificates(root_store)
             .with_no_client_auth()
@@ -917,7 +918,7 @@ mod tests {
         let version: ProtocolVersion = 141;
 
         // 1. Fetch the server's Noise public key.
-        let server_key = fetch_server_pub_key(host, version)
+        let server_key = fetch_server_pub_key(host, version, None)
             .await
             .expect("fetch_server_pub_key should succeed");
         assert!(!server_key.is_zero(), "server key should be non-zero");
@@ -926,7 +927,7 @@ mod tests {
         let machine_key = MachinePrivate::generate();
 
         // 3. Dial and complete the Noise handshake.
-        let mut stream = dial_control(host, &machine_key, &server_key, version)
+        let mut stream = dial_control(host, &machine_key, &server_key, version, None)
             .await
             .expect("dial_control should succeed");
 

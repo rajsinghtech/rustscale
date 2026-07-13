@@ -1230,7 +1230,7 @@ mod tests {
         let url = format!("http://{addr}");
 
         // Fetch the server's key.
-        let key = rustscale_controlclient::controlhttp::fetch_server_pub_key(&url, 141)
+        let key = rustscale_controlclient::controlhttp::fetch_server_pub_key(&url, 141, None)
             .await
             .expect("fetch key");
         assert!(!key.is_zero(), "fetched key should be non-zero");

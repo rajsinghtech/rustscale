@@ -169,17 +169,14 @@ impl HttpResponse {
     }
 }
 
-/// Build a rustls `ClientConfig` with webpki roots (matches the derp client).
+/// Build a rustls `ClientConfig` with webpki + baked ISRG roots.
 fn tls_config() -> rustls::ClientConfig {
     use std::sync::Once;
     static INIT: Once = Once::new();
     INIT.call_once(|| {
         let _ = rustls::crypto::ring::default_provider().install_default();
     });
-    let mut roots = rustls::RootCertStore::empty();
-    roots
-        .roots
-        .extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let roots = rustscale_bakedroots::combined_root_store(None);
     rustls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth()

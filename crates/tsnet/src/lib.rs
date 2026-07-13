@@ -286,6 +286,10 @@ pub struct ServerBuilder {
     /// server are routed through this closure instead of `eprintln!`.
     /// Mirrors Go's `Server.UserLogf`.
     pub(crate) logger: Option<Logger>,
+    /// Additional DER-encoded root CAs to trust alongside the webpki and
+    /// baked ISRG roots for control-plane and DERP TLS connections. Mirrors
+    /// Go's `tsnet.Server.ExtraRootCAs`.
+    pub(crate) extra_root_certs: Option<Vec<Vec<u8>>>,
 }
 
 /// A pluggable logger callback for diagnostic messages. Implementations
@@ -493,6 +497,15 @@ impl ServerBuilder {
     /// Mirrors Go's `Server.UserLogf`.
     pub fn logger(mut self, logger: impl Fn(&str) + Send + Sync + 'static) -> Self {
         self.logger = Some(Arc::new(logger));
+        self
+    }
+
+    /// Set additional DER-encoded root CAs to trust for control-plane and
+    /// DERP TLS connections. These are concatenated with the webpki roots
+    /// and baked ISRG roots (see `rustscale_bakedroots::combined_root_store`).
+    /// Mirrors Go's `tsnet.Server.ExtraRootCAs`.
+    pub fn extra_root_certs(mut self, certs: Vec<Vec<u8>>) -> Self {
+        self.extra_root_certs = Some(certs);
         self
     }
 

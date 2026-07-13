@@ -1075,22 +1075,26 @@ impl Server {
             .and_then(|dir| PersistedState::load_netmap(dir, &node_pub));
 
         // 2. Fetch the server's Noise public key (GET /key?v=<version>).
-        let server_pub_key =
-            controlhttp::fetch_server_pub_key(&self.config.control_url, PROTOCOL_VERSION)
-                .await
-                .map_err(|e| {
-                    TsnetError::Register(rustscale_controlclient::RegisterError::Dial(e))
-                })?;
+        let server_pub_key = controlhttp::fetch_server_pub_key(
+            &self.config.control_url,
+            PROTOCOL_VERSION,
+            self.config.extra_root_certs.as_deref(),
+        )
+        .await
+        .map_err(|e| TsnetError::Register(rustscale_controlclient::RegisterError::Dial(e)))?;
 
         // 3. Register with the control plane.
         let auth_key = self.config.auth_key.clone().unwrap_or_default();
 
-        let cc = ControlClient::new(
+        let mut cc = ControlClient::new(
             self.config.control_url.clone(),
             state.machine_key.clone(),
             server_pub_key.clone(),
             PROTOCOL_VERSION,
         );
+        if let Some(certs) = self.config.extra_root_certs.clone() {
+            cc.set_extra_root_certs(certs);
+        }
 
         let reg_req = RegisterRequest {
             Version: CAPABILITY_VERSION,

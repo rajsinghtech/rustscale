@@ -40,16 +40,19 @@ approximately 0.05 Mbps and is not part of this phase.
 ## TUN batch API
 
 1. Add an object-safe async `Tun::write_batch` accepting a mutable slice of
-   owned packet buffers. The mutable contract must document that an OS-backed
-   implementation may rewrite transport/offload headers while the call is in
-   progress. An empty batch is a successful no-op.
+   owned packet buffers. This is consume-on-write storage: once the future is
+   polled, an OS-backed implementation may permanently rewrite selected head
+   packet headers. Those mutations may remain after success, I/O failure, or
+   cancellation, and callers must not inspect or reuse packet contents without
+   replacing them. An empty batch is a successful no-op.
 2. Provide a default scalar implementation that calls `write_packet` in
    order. Preserve the existing single-packet API without allocating or
    copying its packet merely to reach the batch API.
-3. The default implementation should attempt the complete batch and return
-   the first I/O error after later packets have also been attempted, matching
-   wireguard-go's best-effort vector behavior as closely as `io::Result`
-   permits.
+3. The default implementation should attempt the complete batch and retain
+   the first I/O error after later packets have also been attempted. This is a
+   deliberate observability difference from wireguard-go's `errors.Join`: the
+   batch remains best effort, but the `io::Result` surface retains only the
+   first error identity.
 4. Mock TUN observation, Darwin framing, and all existing `Tun`
    implementations must retain their current externally visible packet order
    and bytes.
@@ -69,10 +72,12 @@ approximately 0.05 Mbps and is not part of this phase.
 3. Drop every tunnel/filter guard before async TUN or magicsock I/O. Call
    `tun.write_batch` once for the accepted plaintext burst. An empty plaintext
    burst performs no TUN write.
-4. Retain and send all decapsulation replies with their peer identities after
-   the batch write, in input and reply order. A TUN write error must not
-   suppress required WireGuard protocol replies, and one reply send error
-   must not suppress later replies.
+4. Retain all decapsulation replies with their peer identities and send them,
+   in input and reply order, before awaiting the potentially backpressured TUN
+   batch write. One reply send error must not suppress later replies. This
+   deliberately prevents required WireGuard protocol progress from being held
+   indefinitely behind repeated TUN `EAGAIN`; document the resulting ordering
+   difference from the old per-datagram plaintext-write-then-reply loop.
 5. Reuse vector capacity between loop iterations. Do not add a steady-state
    clone of plaintext or ciphertext buffers.
 
@@ -147,13 +152,20 @@ For an output with more than one TCP segment:
 1. Add one write-operation mutex/scratch owner to `TunDevice`, equivalent to
    wireguard-go's `writeOpMu`, because flow tables, headers, output plans, and
    packet mutation cannot be shared by overlapping `&self` calls. Reset all
-   logical state after success or error while retaining allocations.
+   logical state after success or error while retaining allocations. Future
+   cancellation while waiting for writability must also leave the mutex and
+   scratch reusable: use RAII cleanup where practical and unconditionally
+   reset/zero all logical tables, output plans, fragment indexes, and reusable
+   virtio headers before every new plan so stale cancelled state is never
+   observed.
 2. When VNET is unavailable, use the scalar batch fallback. When VNET is
    active, build the TCP-only plan and issue one `writev` per planned output,
    in plan order. UDP and every other noncandidate remain individual outputs.
 3. Retry `EINTR` immediately. Route `EAGAIN`/`WouldBlock` back through
    `AsyncFd` readiness and retry without rebuilding or losing the plan.
-   Convert `EBADF` consistently with the existing device behavior.
+   Treat Linux `EBADFD` (the explicit wireguard-go case), `EBADF`, and an
+   `AsyncFd` readiness/poller closure error as terminal descriptor failures;
+   never readiness-loop on them.
 4. Treat a short frame write as an error; never retry a suffix as a new TUN
    frame. Attempt later planned outputs and return the first error after the
    batch, unless the async descriptor itself is closed and cannot continue.
@@ -181,14 +193,23 @@ tests. Cover at least:
   scatter-gather boundary behavior;
 - exact TCP4/TCP6 virtio header bytes, IP lengths/checksums, pseudo-header
   checksum seed, fragment ranges, output count, and reset/reuse behavior;
+- materialized TCP4/TCP6 append, prepend, PSH, and sequence-wraparound VNET
+  frames passed through the existing `split_virtio`, proving the reconstructed
+  packets, checksums, sequence numbers, flags, and payloads match the original
+  logical segments;
 - mixed TCP and UDP input proving TCP coalesces while UDP remains scalar and
   byte-identical;
+- deterministic arbitrary malformed packets and batches proving no panic,
+  output count no greater than input, all planned packet indexes/ranges valid,
+  and byte preservation for scalar no-op packets (a fuzz target is also
+  acceptable if the repository's normal checks execute an equivalent corpus);
 - default `Tun::write_batch` ordering, best-effort errors, and empty input;
 - TUN pump burst acceptance/filter/drop/capture behavior, 128-datagram cap,
-  one batch call, retained reply ordering, and replies surviving a TUN write
-  failure;
+  one batch call, retained reply ordering, and replies completing before a
+  failed or indefinitely pending TUN write;
 - Linux syscall helpers for full/short writes, `EINTR`, `EAGAIN`, invalid
-  iovec limits, and scalar VNET framing without requiring privileged TUN.
+  iovec limits, terminal descriptor errors, cancellation followed by scratch
+  reuse, and scalar VNET framing without requiring privileged TUN.
 
 Existing single-packet, read-batch, VNET split, mock TUN, pump, direct, DERP,
 relay, filter, and capture tests must remain green.

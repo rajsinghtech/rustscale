@@ -53,6 +53,10 @@ pub struct IncubatorArgs {
     pub is_shell: bool,
     /// Environment variables as KEY=VALUE strings.
     pub env: Vec<OsString>,
+    /// PTY slave fd — when set, the child's stdin/stdout/stderr are dup2'd
+    /// onto this fd in pre_exec instead of using pipes.
+    #[cfg(unix)]
+    pub pty_slave_fd: Option<std::os::fd::RawFd>,
 }
 
 /// Error from the incubator.
@@ -213,30 +217,66 @@ impl Incubator {
         };
         cmd.current_dir(&dir);
 
-        // Use pipes by default. When a PTY is allocated, the caller should
-        // dup the PTY slave fd onto stdin/stdout/stderr before spawn.
-        cmd.stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        // PTY mode: dup2 slave fd onto stdin/stdout/stderr in pre_exec.
+        // Pipe mode: use Stdio::piped() for I/O pumping.
+        #[cfg(unix)]
+        if self.args.pty_slave_fd.is_some() {
+            cmd.stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+        } else {
+            cmd.stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+        }
+        #[cfg(not(unix))]
+        {
+            cmd.stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+        }
 
-        // On Unix, set uid/gid before exec.
+        // On Unix, set uid/gid before exec, and dup2 PTY slave if present.
         #[cfg(unix)]
         {
             let gids = self.args.gids.clone();
             let uid = self.args.uid;
             let gid = self.args.gid;
-            // Only drop privileges if we're not already the target user.
-            if uid != 0 || gid != 0 {
-                let gids_clone = gids.clone();
+            let pty_slave = self.args.pty_slave_fd;
+            // Only set pre_exec if we need to drop privileges or dup2 a PTY.
+            // Skip if we're already the target user (avoids EPERM and lets
+            // std use posix_spawn instead of fork+exec).
+            let current_uid = unsafe { libc::getuid() };
+            let current_gid = unsafe { libc::getgid() };
+            let need_priv_drop =
+                (uid != 0 && uid != current_uid) || (gid != 0 && gid != current_gid);
+            if need_priv_drop || pty_slave.is_some() {
                 // SAFETY: pre_exec closures run after fork before exec.
-                // The setgroups/setgid/setuid calls are safe with valid ids.
+                // The dup2/setgroups/setgid/setuid calls are safe with
+                // valid fds and ids.
                 unsafe {
                     cmd.pre_exec(move || {
+                        // If a PTY slave fd is set, dup2 it onto
+                        // stdin/stdout/stderr.
+                        if let Some(sfd) = pty_slave {
+                            if libc::dup2(sfd, 0) < 0 {
+                                return Err(io::Error::last_os_error());
+                            }
+                            if libc::dup2(sfd, 1) < 0 {
+                                return Err(io::Error::last_os_error());
+                            }
+                            if libc::dup2(sfd, 2) < 0 {
+                                return Err(io::Error::last_os_error());
+                            }
+                            if sfd > 2 {
+                                libc::close(sfd);
+                            }
+                        }
                         // Set supplementary groups first.
-                        if !gids_clone.is_empty() {
-                            let gids: Vec<libc::gid_t> =
-                                gids_clone.iter().map(|&g| g as libc::gid_t).collect();
-                            let ret = libc::setgroups(gids.len() as libc::c_int, gids.as_ptr());
+                        if !gids.is_empty() {
+                            let gids_v: Vec<libc::gid_t> =
+                                gids.iter().map(|&g| g as libc::gid_t).collect();
+                            let ret = libc::setgroups(gids_v.len() as libc::c_int, gids_v.as_ptr());
                             if ret != 0 {
                                 return Err(io::Error::last_os_error());
                             }

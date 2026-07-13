@@ -8,6 +8,9 @@ pub mod incubator;
 pub mod recording;
 mod server;
 pub mod session;
+pub mod session_handler;
+#[cfg(test)]
+mod tests;
 
 pub use auth::{eval_ssh_policy, ConnInfo, EvalResult};
 pub use c2n::{
@@ -21,6 +24,7 @@ pub use recording::{
 };
 pub use server::{PolicyCallback, SshHandler, SshServer, SshServerConfig, WhoIsCallback};
 pub use session::{PeerIdentity, Pty, Session, Window};
+pub use session_handler::{run_session, SessionHandlerError};
 
 use russh::server::{run_stream, Server as RusshServer};
 use std::sync::Arc;

@@ -2,8 +2,9 @@
 #![allow(dead_code)]
 
 use crate::recording::{RecordDir, RecordResult, SessionRecorder};
-use russh::ChannelId;
+use russh::{ChannelId, Sig};
 use rustscale_tailcfg::{Node, UserProfile};
+use std::net::SocketAddr;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
 
@@ -39,6 +40,14 @@ pub struct SessionInit {
     pub done_tx: mpsc::Sender<()>,
     /// Optional session recorder for capturing PTY output.
     pub recorder: Option<SessionRecorder>,
+    /// Receiver for SSH signals (SIGINT, SIGTERM, etc.) forwarded by
+    /// SshHandler::signal. Mirrors Go's signal handling in handleSession.
+    pub signal_rx: mpsc::Receiver<Sig>,
+    /// Receiver for PTY window-size changes forwarded by
+    /// SshHandler::window_change_request.
+    pub window_change_rx: mpsc::Receiver<Window>,
+    /// TCP peer address of the SSH client (used for SSH_CLIENT/SSH_CONNECTION).
+    pub peer_addr: Option<SocketAddr>,
 }
 
 pub struct Session {
@@ -54,11 +63,13 @@ pub struct Session {
     done_tx: Option<mpsc::Sender<()>>,
     closed: bool,
     recorder: Option<SessionRecorder>,
+    signal_rx: mpsc::Receiver<Sig>,
+    window_change_rx: mpsc::Receiver<Window>,
+    peer_addr: Option<SocketAddr>,
 }
 
 impl Session {
     pub fn from_init(init: SessionInit) -> Self {
-        let _ = &init.peer;
         Self {
             peer: init.peer,
             ssh_user: init.ssh_user,
@@ -72,6 +83,9 @@ impl Session {
             done_tx: Some(init.done_tx),
             closed: false,
             recorder: init.recorder,
+            signal_rx: init.signal_rx,
+            window_change_rx: init.window_change_rx,
+            peer_addr: init.peer_addr,
         }
     }
     pub fn user(&self) -> &str {
@@ -101,6 +115,30 @@ impl Session {
     /// Returns the session recorder, if recording is enabled.
     pub fn recorder(&self) -> Option<&SessionRecorder> {
         self.recorder.as_ref()
+    }
+    /// Take the session recorder out of the Session, leaving None in its place.
+    pub fn take_recorder(&mut self) -> Option<SessionRecorder> {
+        self.recorder.take()
+    }
+    /// Returns the russh server handle (for sending data/extended_data/exit).
+    pub fn handle(&self) -> &russh::server::Handle {
+        &self.handle
+    }
+    /// Returns the SSH channel ID.
+    pub fn channel_id(&self) -> ChannelId {
+        self.channel_id
+    }
+    /// Returns the TCP peer address of the SSH client.
+    pub fn peer_addr(&self) -> Option<SocketAddr> {
+        self.peer_addr
+    }
+    /// Takes the signal receiver out of the Session.
+    pub fn take_signal_rx(&mut self) -> mpsc::Receiver<Sig> {
+        std::mem::replace(&mut self.signal_rx, mpsc::channel(1).1)
+    }
+    /// Takes the window-change receiver out of the Session.
+    pub fn take_window_change_rx(&mut self) -> mpsc::Receiver<Window> {
+        std::mem::replace(&mut self.window_change_rx, mpsc::channel(1).1)
     }
 
     pub async fn exit(&mut self, code: u32) {

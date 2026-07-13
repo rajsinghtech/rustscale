@@ -14,10 +14,11 @@ use rustscale_derp::{
 use rustscale_key::{DiscoPrivate, NodePrivate, NodePublic};
 use rustscale_tailcfg::{DERPMap, DERPNode, DERPRegion};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, Notify};
 
 /// Minimal ServerInfo JSON for the handshake (just the version field).
 async fn write_frame<W: AsyncWrite + Unpin>(
@@ -64,6 +65,11 @@ struct FakeRelay {
     server_priv: NodePrivate,
     server_pub: NodePublic,
     senders: Arc<Mutex<HashMap<NodePublic, mpsc::UnboundedSender<(NodePublic, Vec<u8>)>>>>,
+    clients_registered: Arc<Notify>,
+    drop_next_packets: Arc<Mutex<usize>>,
+    dropped_packets: Arc<AtomicUsize>,
+    forwarded_packets: Arc<AtomicUsize>,
+    packet_event: Arc<Notify>,
 }
 
 impl FakeRelay {
@@ -73,6 +79,53 @@ impl FakeRelay {
             server_pub: privk.public(),
             server_priv: privk,
             senders: Arc::new(Mutex::new(HashMap::new())),
+            clients_registered: Arc::new(Notify::new()),
+            drop_next_packets: Arc::new(Mutex::new(0)),
+            dropped_packets: Arc::new(AtomicUsize::new(0)),
+            forwarded_packets: Arc::new(AtomicUsize::new(0)),
+            packet_event: Arc::new(Notify::new()),
+        }
+    }
+
+    async fn wait_for_clients(&self, count: usize) {
+        loop {
+            let notified = self.clients_registered.notified();
+            if self.senders.lock().await.len() >= count {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    async fn drop_next_packets(&self, count: usize) {
+        *self.drop_next_packets.lock().await = count;
+    }
+
+    async fn wait_for_dropped_packets(&self, count: usize) {
+        loop {
+            let notified = self.packet_event.notified();
+            if self.dropped_packets.load(Ordering::SeqCst) >= count {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    fn dropped_packets(&self) -> usize {
+        self.dropped_packets.load(Ordering::SeqCst)
+    }
+
+    fn forwarded_packets(&self) -> usize {
+        self.forwarded_packets.load(Ordering::SeqCst)
+    }
+
+    async fn wait_for_forwarded_packets(&self, count: usize) {
+        loop {
+            let notified = self.packet_event.notified();
+            if self.forwarded_packets() >= count {
+                return;
+            }
+            notified.await;
         }
     }
 
@@ -81,6 +134,11 @@ impl FakeRelay {
         let server_priv = self.server_priv.clone();
         let server_pub = self.server_pub.clone();
         let senders = self.senders.clone();
+        let clients_registered = self.clients_registered.clone();
+        let drop_next_packets = self.drop_next_packets.clone();
+        let dropped_packets = self.dropped_packets.clone();
+        let forwarded_packets = self.forwarded_packets.clone();
+        let packet_event = self.packet_event.clone();
 
         tokio::spawn(async move {
             let mut s = stream;
@@ -109,6 +167,7 @@ impl FakeRelay {
             // 4. Register this client BEFORE splitting (so it's reachable immediately).
             let (relay_tx, mut relay_rx) = mpsc::unbounded_channel::<(NodePublic, Vec<u8>)>();
             senders.lock().await.insert(client_pub.clone(), relay_tx);
+            clients_registered.notify_waiters();
 
             // 5. Split the stream for concurrent read + write.
             let (read_half, mut write_half) = tokio::io::split(s);
@@ -116,6 +175,10 @@ impl FakeRelay {
             // Reader task: reads SEND_PACKET frames and relays to other clients.
             let senders_r = senders.clone();
             let client_pub_r = client_pub.clone();
+            let drop_next_packets_r = drop_next_packets.clone();
+            let dropped_packets_r = dropped_packets.clone();
+            let forwarded_packets_r = forwarded_packets.clone();
+            let packet_event_r = packet_event.clone();
             tokio::spawn(async move {
                 let mut reader = read_half;
                 loop {
@@ -126,9 +189,25 @@ impl FakeRelay {
                                 dst.copy_from_slice(&body[..32]);
                                 let dst_pub = NodePublic::from_raw32(dst);
                                 let data = body[32..].to_vec();
+                                let drop_packet = {
+                                    let mut remaining = drop_next_packets_r.lock().await;
+                                    if *remaining == 0 {
+                                        false
+                                    } else {
+                                        *remaining -= 1;
+                                        true
+                                    }
+                                };
+                                if drop_packet {
+                                    dropped_packets_r.fetch_add(1, Ordering::SeqCst);
+                                    packet_event_r.notify_waiters();
+                                    continue;
+                                }
                                 let senders = senders_r.lock().await;
                                 if let Some(tx) = senders.get(&dst_pub) {
                                     let _ = tx.send((client_pub_r.clone(), data));
+                                    forwarded_packets_r.fetch_add(1, Ordering::SeqCst);
+                                    packet_event_r.notify_waiters();
                                 }
                             }
                         }
@@ -495,7 +574,7 @@ async fn derp_data_path_fallback() {
     let a_peer = make_peer(a.node_public(), a.disco_public(), vec![], 1);
 
     // Give relay time to fully register both clients.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    relay.wait_for_clients(2).await;
 
     a.set_netmap(vec![b_peer]).await.expect("A set_netmap");
     b.set_netmap(vec![a_peer]).await.expect("B set_netmap");
@@ -528,6 +607,156 @@ async fn derp_data_path_fallback() {
         .expect("A poll_recv");
     assert_eq!(received.peer, b.node_public());
     assert_eq!(received.data, wg_reply);
+}
+
+#[tokio::test]
+async fn cli_ping_cmm_recovers_direct_path_after_initial_netmap_drop() {
+    let relay = Arc::new(FakeRelay::new());
+    let a_priv = NodePrivate::generate();
+    let b_priv = NodePrivate::generate();
+    let a_derp = connect_to_relay(&relay, a_priv.clone()).await;
+    let (a, _a_rx) = Magicsock::new(MagicsockConfig {
+        private_key: a_priv,
+        disco_key: DiscoPrivate::generate(),
+        derp_client: Some(a_derp),
+        derp_map: None,
+        home_derp_region: 0,
+        udp_bind: Some("127.0.0.1:0".parse().unwrap()),
+        udp_socket: None,
+        portmapper: None,
+        health: None,
+        disable_direct_paths: false,
+        peer_relay_server: false,
+        relay_server_config: None,
+        sockstats: None,
+        control_knobs: None,
+    })
+    .await
+    .unwrap();
+    let b_derp = connect_to_relay(&relay, b_priv.clone()).await;
+    let (b, _b_rx) = Magicsock::new(MagicsockConfig {
+        private_key: b_priv,
+        disco_key: DiscoPrivate::generate(),
+        derp_client: Some(b_derp),
+        derp_map: None,
+        home_derp_region: 0,
+        udp_bind: Some("127.0.0.1:0".parse().unwrap()),
+        udp_socket: None,
+        portmapper: None,
+        health: None,
+        disable_direct_paths: false,
+        peer_relay_server: false,
+        relay_server_config: None,
+        sockstats: None,
+        control_knobs: None,
+    })
+    .await
+    .unwrap();
+
+    // This test binds loopback sockets, while interface discovery may prefer
+    // a non-loopback host address. Advertise the actual bound sockets so the
+    // CMM-triggered probes are reachable in this in-process scenario.
+    *a.inner.local_udp_addrs.write().unwrap() = vec![a.bound_udp_addr().unwrap().to_string()];
+    *b.inner.local_udp_addrs.write().unwrap() = vec![b.bound_udp_addr().unwrap().to_string()];
+    relay.wait_for_clients(2).await;
+
+    // Model the startup race: both one-shot netmap CMM packets disappear,
+    // leaving neither endpoint with a usable UDP candidate.
+    relay.drop_next_packets(2).await;
+    a.set_netmap(vec![make_peer(
+        b.node_public(),
+        b.disco_public(),
+        vec![],
+        0,
+    )])
+    .await
+    .unwrap();
+    b.set_netmap(vec![make_peer(
+        a.node_public(),
+        a.disco_public(),
+        vec![],
+        0,
+    )])
+    .await
+    .unwrap();
+    relay.wait_for_dropped_packets(2).await;
+    assert!(a
+        .inner
+        .endpoints
+        .read()
+        .unwrap()
+        .get(&b.node_public())
+        .unwrap()
+        .candidates()
+        .is_empty());
+    assert!(b
+        .inner
+        .endpoints
+        .read()
+        .unwrap()
+        .get(&a.node_public())
+        .unwrap()
+        .candidates()
+        .is_empty());
+
+    // This attempt's CMM makes B probe A over UDP. Its existing first-pong
+    // contract permits either a DERP or direct result.
+    let _first = tokio::time::timeout(
+        Duration::from_secs(2),
+        a.cli_ping(&b.node_public(), "b", "100.64.0.2".parse().unwrap(), 0),
+    )
+    .await
+    .expect("first CLI ping should not time out")
+    .expect("first CLI ping should complete");
+
+    let learned_candidate = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if !a
+                .inner
+                .endpoints
+                .read()
+                .unwrap()
+                .get(&b.node_public())
+                .unwrap()
+                .candidates()
+                .is_empty()
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .is_ok();
+    assert!(
+        learned_candidate,
+        "B's CMM-triggered UDP probe should teach A B's source address"
+    );
+
+    // For one attempt, remove the CMM and DERP ping from the fake relay.
+    // The learned UDP candidate ping is then the only callback-completing
+    // path, proving the CLI path can return Direct without changing its
+    // production first-pong behavior.
+    let drops_before = relay.dropped_packets();
+    relay.drop_next_packets(2).await;
+    let direct = tokio::time::timeout(
+        Duration::from_secs(2),
+        a.cli_ping(&b.node_public(), "b", "100.64.0.2".parse().unwrap(), 0),
+    )
+    .await
+    .expect("CLI ping should return through the learned direct candidate")
+    .expect("CLI ping should complete");
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        relay.wait_for_dropped_packets(drops_before + 2),
+    )
+    .await
+    .expect("the attempt's CMM and DERP ping should be dropped");
+    assert!(
+        !direct.Endpoint.is_empty(),
+        "CLI ping should return its direct endpoint when DERP is unavailable"
+    );
+    assert_eq!(a.peer_path_class(&b.node_public()), PathClass::Direct);
 }
 
 #[tokio::test]
@@ -573,7 +802,7 @@ async fn cli_ping_fans_out_udp_and_derp() {
     })
     .await
     .unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    relay.wait_for_clients(2).await;
 
     // Port 9 has no peer listener, so only the independently sent DERP ping
     // can answer. Its pending UDP ping proves both paths were started.
@@ -653,7 +882,7 @@ async fn cli_ping_with_unknown_derp_region_uses_fanout() {
     })
     .await
     .unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    relay.wait_for_clients(2).await;
 
     // No UDP candidates or known DERP route leaves fanout as the only path.
     a.set_netmap(vec![make_peer(
@@ -673,11 +902,23 @@ async fn cli_ping_with_unknown_derp_region_uses_fanout() {
     .await
     .unwrap();
 
+    let packets_before = relay.forwarded_packets();
     let result = a
         .cli_ping(&b.node_public(), "b", "100.64.0.2".parse().unwrap(), 0)
         .await
         .expect("DERP CLI pong");
     assert_eq!(result.DERPRegionID, 1);
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        relay.wait_for_forwarded_packets(packets_before + 3),
+    )
+    .await
+    .expect("unknown-region CMM, CLI ping, and pong should all reach the relay");
+    assert_eq!(
+        relay.forwarded_packets() - packets_before,
+        3,
+        "unknown-region CLI ping must fan out both CallMeMaybe and its DERP ping"
+    );
 }
 
 #[tokio::test]

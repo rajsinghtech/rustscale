@@ -245,6 +245,7 @@ impl Control {
         self.0.as_mut_ptr().cast()
     }
 
+    #[cfg(test)]
     fn as_ptr(&self) -> *const libc::cmsghdr {
         self.0.as_ptr().cast()
     }

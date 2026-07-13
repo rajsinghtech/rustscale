@@ -58,6 +58,12 @@ this phase.
 4. Plain mode reads at most the configured MTU. VNET mode reads into one
    retained `10 + 65_535` byte raw-frame buffer because a coalesced GSO frame
    is larger than the interface MTU.
+5. `IFF_VNET_HDR` also changes the kernel's write contract. In VNET mode,
+   write each inbound plain IP packet as one `writev` operation containing a
+   zeroed 10-byte `virtio_net_hdr` (`GSO_NONE`, no checksum work) followed by
+   the packet. Do not allocate or copy the packet to add this framing. Require
+   the syscall to consume the complete header and packet; plain fallback mode
+   keeps its existing exact single-buffer write behavior.
 
 ## Virtio header
 
@@ -112,8 +118,9 @@ Port wireguard-go `GSOSplit` behavior into safe Rust:
   data offset, invalid checksum offsets, IP/GSO mismatch, overflow/bounds, and
   more than 128 segments.
 - Linux-specific tests verify exact `ifreq` flags, offload constants, VNET read
-  bound, and fallback classification. Existing Darwin framing, mock TUN, pump,
-  and reusable-buffer tests must continue to pass.
+  bound, VNET write framing/exact-write validation, and fallback
+  classification. Existing Darwin framing, mock TUN, pump, and reusable-buffer
+  tests must continue to pass.
 - Add a pump test proving all packets in one injected batch traverse in order
   without an intervening TUN read.
 

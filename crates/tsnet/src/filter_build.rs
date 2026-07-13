@@ -132,7 +132,9 @@ pub(crate) fn rebuild_filter(
             new_filter.add_local_cidrs(advertise_routes);
         }
         new_filter.set_shields_up(shields_up);
-        *filter_arc.lock().unwrap() = new_filter;
+        let mut old_filter = filter_arc.lock().unwrap();
+        new_filter.share_state_with(&mut old_filter);
+        *old_filter = new_filter;
     }
 }
 

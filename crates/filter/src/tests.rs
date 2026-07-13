@@ -854,6 +854,22 @@ fn test_shields_up_allows_cached_udp_drops_new_udp() {
 }
 
 #[test]
+fn test_share_state_with_preserves_cached_udp_flow() {
+    let mut old = new_test_filter();
+    let outbound = parsed(UDP, "102.102.102.102", "119.119.119.119", 4343, 4242);
+    let reply = parsed(UDP, "119.119.119.119", "102.102.102.102", 4242, 4343);
+    old.update_outbound_info(&outbound);
+
+    // This reply has no matching filter rule; it is admitted only because
+    // the outbound packet installed the reversed flow tuple.
+    let mut new = new_test_filter();
+    assert_eq!(new.check_in_info(&reply), Response::Drop);
+
+    new.share_state_with(&mut old);
+    assert_eq!(new.check_in_info(&reply), Response::Accept);
+}
+
+#[test]
 fn test_shields_up_allows_icmp_replies_drops_new_icmp() {
     let mut f = new_test_filter();
     f.set_shields_up(true);

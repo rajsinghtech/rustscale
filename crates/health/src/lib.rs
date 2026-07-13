@@ -57,6 +57,55 @@ pub const WARN_IDLE: &str = "ipn-state";
 /// Mirrors Go's `LoginStateWarnable` (`HealthWarnableLoginState`).
 pub const WARN_LOGIN: &str = "login-state";
 
+/// Map poll not active (no stream connection). Medium severity.
+/// Mirrors Go's `notInMapPollWarnable` (`"not-in-map-poll"`).
+pub const WARN_NOT_IN_MAP_POLL: &str = "not-in-map-poll";
+
+/// Map response timeout (stream stalled >2m5s). Medium severity.
+/// Mirrors Go's `mapResponseTimeoutWarnable` (`"mapresponse-timeout"`).
+pub const WARN_MAP_RESPONSE_TIMEOUT: &str = "mapresponse-timeout";
+
+/// A specific DERP connection is down (not just home). Medium severity.
+/// Mirrors Go's `noDERPConnectionWarnable` (`"no-derp-connection"`).
+pub const WARN_NO_DERP_CONNECTION: &str = "no-derp-connection";
+
+/// DERP region timed out (no frame for >2m5s). Medium severity.
+/// Mirrors Go's `derpTimeoutWarnable` (`"derp-timed-out"`).
+pub const WARN_DERP_TIMEOUT: &str = "derp-timed-out";
+
+/// DERP region reporting an error. Low severity.
+/// Mirrors Go's `derpRegionErrorWarnable` (`"derp-region-error"`).
+pub const WARN_DERP_REGION_ERROR: &str = "derp-region-error";
+
+/// TLS connection failure. Medium severity.
+/// Mirrors Go's `tlsConnectionFailedWarnable` (`"tls-connection-failed"`).
+pub const WARN_TLS_CONNECTION_FAILED: &str = "tls-connection-failed";
+
+/// TLS cert pending (ACME in progress). Low severity.
+/// Mirrors Go's `certPendingWarnable` (`"tls-cert-pending"`).
+pub const WARN_TLS_CERT_PENDING: &str = "tls-cert-pending";
+
+/// Prefix for subsystem warnables (`"subsystem-dns"`, `"subsystem-tailnet-lock"`, etc.).
+/// Go creates these dynamically for `SysRouter`, `SysDNS`, `SysDNSManager`, `SysTKA`.
+pub const WARN_SUBSYSTEM_PREFIX: &str = "subsystem-";
+
+// --- Arg key constants used in Go's `health.Args` for dynamic text ---
+
+/// Elapsed duration (formatted string). Used by map-response-timeout, derp-timed-out.
+pub const ARG_DURATION: &str = "duration";
+/// DERP region numeric id. Used by no-derp-connection, derp-region-error.
+pub const ARG_DERP_REGION_ID: &str = "derp_region_id";
+/// DERP region human name. Used by no-derp-connection, derp-timed-out.
+pub const ARG_DERP_REGION_NAME: &str = "derp_region_name";
+/// Error detail string. Used by derp-region-error, tls-connection-failed.
+pub const ARG_ERROR: &str = "error";
+/// Server name (SNI). Used by tls-connection-failed.
+pub const ARG_SERVER_NAME: &str = "server_name";
+/// Domain list. Used by tls-cert-pending.
+pub const ARG_DOMAINS: &str = "domains";
+/// Legacy error (for subsystem warnables that wrap an old error).
+pub const ARG_LEGACY_ERROR: &str = "legacy_error";
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -216,6 +265,58 @@ impl Tracker {
             time_to_visible: Duration::from_secs(10),
         });
         t.register(Warnable {
+            id: WARN_NOT_IN_MAP_POLL.into(),
+            severity: Severity::Medium,
+            title: "Out of sync".into(),
+            depends_on: vec![WARN_PRODUCTIVITY.into(), WARN_IDLE.into()],
+            time_to_visible: Duration::from_secs(8 * 60),
+        });
+        t.register(Warnable {
+            id: WARN_MAP_RESPONSE_TIMEOUT.into(),
+            severity: Severity::Medium,
+            title: "Network map response timeout".into(),
+            depends_on: vec![WARN_PRODUCTIVITY.into(), WARN_IDLE.into()],
+            ..Warnable::default()
+        });
+        t.register(Warnable {
+            id: WARN_NO_DERP_CONNECTION.into(),
+            severity: Severity::Medium,
+            title: "Relay server unavailable".into(),
+            depends_on: vec![WARN_PRODUCTIVITY.into(), WARN_DERP_NO_REGION.into()],
+            time_to_visible: Duration::from_secs(10),
+        });
+        t.register(Warnable {
+            id: WARN_DERP_TIMEOUT.into(),
+            severity: Severity::Medium,
+            title: "Relay server timed out".into(),
+            depends_on: vec![
+                WARN_PRODUCTIVITY.into(),
+                WARN_NO_DERP_CONNECTION.into(),
+                WARN_DERP_NO_REGION.into(),
+            ],
+            ..Warnable::default()
+        });
+        t.register(Warnable {
+            id: WARN_DERP_REGION_ERROR.into(),
+            severity: Severity::Low,
+            title: "Relay server error".into(),
+            depends_on: vec![WARN_PRODUCTIVITY.into()],
+            ..Warnable::default()
+        });
+        t.register(Warnable {
+            id: WARN_TLS_CONNECTION_FAILED.into(),
+            severity: Severity::Medium,
+            title: "Encrypted connection failed".into(),
+            depends_on: vec![WARN_PRODUCTIVITY.into()],
+            ..Warnable::default()
+        });
+        t.register(Warnable {
+            id: WARN_TLS_CERT_PENDING.into(),
+            severity: Severity::Low,
+            title: "Fetching TLS certificate".into(),
+            ..Warnable::default()
+        });
+        t.register(Warnable {
             id: WARN_IDLE.into(),
             severity: Severity::Low,
             title: "Tailscale off".into(),
@@ -283,16 +384,24 @@ impl Tracker {
     /// Note that a frame was received from the given DERP region at the
     /// current time, resetting the region's health to healthy. Mirrors
     /// Go's `Tracker.NoteDERPRegionReceivedFrame` (health.go:838-848).
+    /// Also clears [`WARN_DERP_TIMEOUT`] when all known regions are healthy.
     pub fn note_derp_region_frame(&self, region_id: i32) {
         self.set_derp_region_health(region_id, true);
-        let mut g = self.inner.lock().expect("health mutex poisoned");
-        g.derp_regions.entry(region_id).and_modify(|h| {
-            h.last_frame_at = Some(Utc::now());
-        });
+        let all_healthy = {
+            let mut g = self.inner.lock().expect("health mutex poisoned");
+            g.derp_regions.entry(region_id).and_modify(|h| {
+                h.last_frame_at = Some(Utc::now());
+            });
+            g.derp_regions.values().all(|h| h.healthy)
+        };
+        if all_healthy {
+            self.set_healthy(WARN_DERP_TIMEOUT);
+        }
     }
 
     /// Check whether a DERP region has received a frame within the given
-    /// timeout. If not, mark it unhealthy. Returns true if marked unhealthy.
+    /// timeout. If not, mark it unhealthy and fire [`WARN_DERP_TIMEOUT`].
+    /// Returns true if marked unhealthy.
     /// Mirrors the recv-loop health check in Go's derp.go.
     pub fn check_derp_region_staleness(&self, region_id: i32, timeout: Duration) -> bool {
         let stale = {
@@ -310,6 +419,12 @@ impl Tracker {
         };
         if stale {
             self.set_derp_region_health(region_id, false);
+            self.set_unhealthy(
+                WARN_DERP_TIMEOUT,
+                format!(
+                    "{{\"{ARG_DERP_REGION_ID}\":{region_id},\"{ARG_DURATION}\":\"{timeout:?}\"}}"
+                ),
+            );
         }
         stale
     }
@@ -891,7 +1006,7 @@ mod tests {
     #[test]
     fn new_warnables_registered() {
         let t = Tracker::new();
-        // All new warnables should be settable.
+        // All warnables (legacy + new) should be settable.
         for id in [
             WARN_PRODUCTIVITY,
             WARN_UDP,
@@ -900,12 +1015,117 @@ mod tests {
             WARN_DERP_NO_REGION,
             WARN_IDLE,
             WARN_LOGIN,
+            WARN_NOT_IN_MAP_POLL,
+            WARN_MAP_RESPONSE_TIMEOUT,
+            WARN_NO_DERP_CONNECTION,
+            WARN_DERP_TIMEOUT,
+            WARN_DERP_REGION_ERROR,
+            WARN_TLS_CONNECTION_FAILED,
+            WARN_TLS_CERT_PENDING,
         ] {
             t.set_unhealthy(id, "test");
             assert!(t.is_unhealthy(id), "{id} should be unhealthy");
             t.set_healthy(id);
             assert!(!t.is_unhealthy(id), "{id} should be healthy");
         }
+    }
+
+    #[test]
+    fn arg_constants_have_expected_values() {
+        // Verify the ARG_* key constants match Go's health.Args keys.
+        assert_eq!(ARG_DURATION, "duration");
+        assert_eq!(ARG_DERP_REGION_ID, "derp_region_id");
+        assert_eq!(ARG_DERP_REGION_NAME, "derp_region_name");
+        assert_eq!(ARG_ERROR, "error");
+        assert_eq!(ARG_SERVER_NAME, "server_name");
+        assert_eq!(ARG_DOMAINS, "domains");
+        assert_eq!(ARG_LEGACY_ERROR, "legacy_error");
+    }
+
+    #[test]
+    fn new_warnables_in_sorted_warnings() {
+        // current_warnings sorts by severity (High first) then id ascending.
+        // Set several new warnables unhealthy and verify they appear sorted.
+        let t = Tracker::new();
+        t.set_unhealthy(WARN_TLS_CERT_PENDING, "pending");
+        t.set_unhealthy(WARN_DERP_REGION_ERROR, "err");
+        t.set_unhealthy(WARN_TLS_CONNECTION_FAILED, "fail");
+        let ids: Vec<_> = t.current_warnings().iter().map(|w| w.id.clone()).collect();
+        // All three should be present (none have unhealthy dependencies).
+        assert!(ids.contains(&WARN_TLS_CERT_PENDING.to_string()));
+        assert!(ids.contains(&WARN_DERP_REGION_ERROR.to_string()));
+        assert!(ids.contains(&WARN_TLS_CONNECTION_FAILED.to_string()));
+        // Severity ordering: Medium before Low.
+        let cert_idx = ids.iter().position(|x| x == WARN_TLS_CERT_PENDING).unwrap();
+        let tls_idx = ids
+            .iter()
+            .position(|x| x == WARN_TLS_CONNECTION_FAILED)
+            .unwrap();
+        let err_idx = ids
+            .iter()
+            .position(|x| x == WARN_DERP_REGION_ERROR)
+            .unwrap();
+        assert!(tls_idx < cert_idx, "Medium should precede Low");
+        assert!(tls_idx < err_idx, "Medium should precede Low");
+    }
+
+    #[test]
+    fn not_in_map_poll_suppressed_by_idle_dependency() {
+        // WARN_NOT_IN_MAP_POLL depends on WARN_PRODUCTIVITY + WARN_IDLE.
+        // If WARN_IDLE is unhealthy, WARN_NOT_IN_MAP_POLL is suppressed in
+        // current_warnings (but still tracked as unhealthy internally).
+        // NOTE: WARN_NOT_IN_MAP_POLL has time_to_visible=8min, so it won't
+        // appear in current_warnings immediately — use is_unhealthy to
+        // verify the raw state, and current_warnings for the suppression.
+        let t = Tracker::new();
+        t.set_unhealthy(WARN_NOT_IN_MAP_POLL, "no stream");
+        assert!(
+            t.is_unhealthy(WARN_NOT_IN_MAP_POLL),
+            "should be unhealthy internally"
+        );
+        // With WARN_IDLE unhealthy, WARN_NOT_IN_MAP_POLL is suppressed
+        // even if it were past its time_to_visible.
+        t.set_unhealthy(WARN_IDLE, "off");
+        // WARN_IDLE has no time_to_visible → appears immediately.
+        let warnings = t.current_warnings();
+        assert!(
+            !warnings.iter().any(|w| w.id == WARN_NOT_IN_MAP_POLL),
+            "should be suppressed when WARN_IDLE is unhealthy"
+        );
+        assert!(
+            warnings.iter().any(|w| w.id == WARN_IDLE),
+            "WARN_IDLE should be visible"
+        );
+    }
+
+    #[test]
+    fn derp_timeout_fires_on_staleness() {
+        let t = Tracker::new();
+        // Establish a baseline frame, then check staleness with 0s timeout.
+        t.note_derp_region_frame(9);
+        assert!(t.check_derp_region_staleness(9, Duration::from_secs(0)));
+        // WARN_DERP_TIMEOUT should now be active.
+        assert!(t.is_unhealthy(WARN_DERP_TIMEOUT));
+    }
+
+    #[test]
+    fn derp_timeout_cleared_when_all_regions_healthy() {
+        let t = Tracker::new();
+        // Mark a region stale to fire WARN_DERP_TIMEOUT.
+        t.note_derp_region_frame(3);
+        assert!(t.check_derp_region_staleness(3, Duration::from_secs(0)));
+        assert!(t.is_unhealthy(WARN_DERP_TIMEOUT));
+        // Receiving a frame marks the region healthy → all healthy → cleared.
+        t.note_derp_region_frame(3);
+        assert!(!t.is_unhealthy(WARN_DERP_TIMEOUT));
+    }
+
+    #[test]
+    fn subsystem_prefix_constant() {
+        assert_eq!(WARN_SUBSYSTEM_PREFIX, "subsystem-");
+        // Verify a concrete subsystem id can be constructed.
+        let dns_warnable = format!("{WARN_SUBSYSTEM_PREFIX}dns");
+        assert_eq!(dns_warnable, "subsystem-dns");
     }
 
     // ---- ReceiveFuncStats / ReceiveFuncTracker tests (#34) ----

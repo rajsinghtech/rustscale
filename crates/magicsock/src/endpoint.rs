@@ -599,11 +599,23 @@ impl Endpoint {
         }
     }
 
-    /// Note external TX activity (e.g. a WG send). Arms the heartbeat timer
-    /// on first activity. Mirrors Go's `noteTxActivityExtTriggerLocked`
-    /// (endpoint.go:974-979).
+    /// Note external TX activity (e.g. a WG send). Mirrors Go's
+    /// `noteTxActivityExtTriggerLocked` (endpoint.go:974-979).
     pub fn note_tx_activity(&mut self, now: Instant) {
         self.last_send_ext = Some(now);
+    }
+
+    /// Note external TX activity and report an inactive-to-active session
+    /// transition. Kept crate-private so the public TX accounting API remains
+    /// stable.
+    pub(crate) fn note_tx_activity_transition(
+        &mut self,
+        now: Instant,
+        session_active_timeout: Duration,
+    ) -> bool {
+        let was_inactive = !self.session_active(now, session_active_timeout);
+        self.note_tx_activity(now);
+        was_inactive
     }
 
     /// Last external TX activity time.
@@ -958,18 +970,30 @@ mod tests {
     // ---- Heartbeat tests ----
 
     #[test]
-    fn heartbeat_arms_on_tx_activity() {
+    fn tx_activity_reports_inactive_to_active_transition_and_refreshes_timestamp() {
         let mut e = ep();
         let now = Instant::now();
-        // Before TX activity, session is not active.
-        assert!(!e.session_active(now, Duration::from_secs(45)));
-        // Note TX activity.
-        e.note_tx_activity(now);
-        // Session should be active immediately after.
-        assert!(e.session_active(now, Duration::from_secs(45)));
-        // And still active just under the timeout.
-        let almost_idle = now + Duration::from_secs(44);
-        assert!(e.session_active(almost_idle, Duration::from_secs(45)));
+        let timeout = Duration::from_secs(45);
+
+        // No prior TX is inactive and starts a session.
+        assert!(e.note_tx_activity_transition(now, timeout));
+        assert_eq!(e.last_send_ext(), Some(now));
+
+        // Recent TX remains active, but every send refreshes the timestamp.
+        let recent = now + Duration::from_secs(1);
+        assert!(!e.note_tx_activity_transition(recent, timeout));
+        assert_eq!(e.last_send_ext(), Some(recent));
+
+        // The timeout boundary is inactive because activity is strictly less
+        // than the timeout, and therefore starts a new session.
+        let boundary = recent + timeout;
+        assert!(e.note_tx_activity_transition(boundary, timeout));
+        assert_eq!(e.last_send_ext(), Some(boundary));
+
+        // A stale timestamp likewise starts a new session and is refreshed.
+        let stale = boundary + timeout + Duration::from_nanos(1);
+        assert!(e.note_tx_activity_transition(stale, timeout));
+        assert_eq!(e.last_send_ext(), Some(stale));
     }
 
     #[test]
@@ -984,6 +1008,18 @@ mod tests {
         // Inactivity duration should be ~46s.
         let inact = e.inactivity_duration(idle);
         assert!(inact >= Duration::from_secs(46));
+    }
+
+    #[test]
+    fn link_reset_makes_next_tx_inactive_to_active() {
+        let mut e = ep();
+        let now = Instant::now();
+        let timeout = Duration::from_secs(45);
+
+        assert!(e.note_tx_activity_transition(now, timeout));
+        e.reset_for_link_change();
+        assert_eq!(e.last_send_ext(), None);
+        assert!(e.note_tx_activity_transition(now + Duration::from_secs(1), timeout));
     }
 
     // ---- UDP lifetime probe tests ----

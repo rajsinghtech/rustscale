@@ -2473,6 +2473,7 @@ name = "rustscale-connectproxy"
 version = "0.1.0"
 dependencies = [
  "log",
+ "rustscale-tsdial",
  "thiserror 1.0.69",
  "tokio",
 ]
@@ -2498,6 +2499,7 @@ dependencies = [
  "rustscale-key",
  "rustscale-netns",
  "rustscale-tailcfg",
+ "rustscale-tsdial",
  "rustscale-tshttpproxy",
  "serde",
  "serde_json",
@@ -2522,6 +2524,7 @@ dependencies = [
  "rustscale-key",
  "rustscale-netns",
  "rustscale-tailcfg",
+ "rustscale-tsdial",
  "rustscale-tshttpproxy",
  "serde",
  "serde_json",
@@ -2552,6 +2555,7 @@ dependencies = [
  "rustscale-neterror",
  "rustscale-tailcfg",
  "rustscale-tsaddr",
+ "rustscale-tsdial",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -2563,6 +2567,7 @@ dependencies = [
 name = "rustscale-dnscache"
 version = "0.1.0"
 dependencies = [
+ "rustscale-netns",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
@@ -2576,6 +2581,7 @@ dependencies = [
  "rustls",
  "rustscale-dnscache",
  "rustscale-tailcfg",
+ "rustscale-tsdial",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -2738,6 +2744,7 @@ dependencies = [
  "rand 0.8.7",
  "rustscale-health",
  "rustscale-tailcfg",
+ "rustscale-tsdial",
  "socket2",
  "thiserror 1.0.69",
  "tokio",
@@ -2803,6 +2810,7 @@ dependencies = [
  "if-addrs",
  "rand 0.8.7",
  "rustscale-neterror",
+ "rustscale-tsdial",
  "thiserror 1.0.69",
  "tokio",
 ]
@@ -2929,10 +2937,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustscale-tsdial"
+version = "0.1.0"
+dependencies = [
+ "rustls",
+ "rustscale-dnscache",
+ "rustscale-netmon",
+ "rustscale-netns",
+ "rustscale-tailcfg",
+ "rustscale-tshttpproxy",
+ "serde",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "webpki-roots 0.26.11",
+]
+
+[[package]]
 name = "rustscale-tshttpproxy"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "rustscale-netns",
  "thiserror 1.0.69",
  "tokio",
  "url",
@@ -2981,6 +3008,7 @@ dependencies = [
  "rustscale-tcpinfo",
  "rustscale-testcontrol",
  "rustscale-tsaddr",
+ "rustscale-tsdial",
  "rustscale-tun",
  "rustscale-udprelay",
  "rustscale-wg",

@@ -9,7 +9,6 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::TlsConnector;
 
@@ -212,10 +211,13 @@ impl Forwarder {
     /// Send a DNS query over TCP (with 2-byte length prefix).
     /// Ports Go's `sendTCP` (forwarder.go:928).
     async fn send_tcp(&self, query: &[u8], server: &SocketAddr) -> Option<Vec<u8>> {
-        let stream = tokio::time::timeout(TCP_QUERY_TIMEOUT, TcpStream::connect(server))
-            .await
-            .ok()?
-            .ok()?;
+        let stream = tokio::time::timeout(
+            TCP_QUERY_TIMEOUT,
+            rustscale_tsdial::system_dial("tcp", &server.to_string()),
+        )
+        .await
+        .ok()?
+        .ok()?;
         let _ = stream.set_nodelay(true);
         let (mut read_half, mut write_half) = stream.into_split();
 
@@ -268,7 +270,7 @@ impl Forwarder {
             std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "no DoH addr")
         })?;
 
-        let tcp = TcpStream::connect(addr).await?;
+        let tcp = rustscale_tsdial::system_dial("tcp", &addr.to_string()).await?;
         let _ = tcp.set_nodelay(true);
 
         // Establish TLS.

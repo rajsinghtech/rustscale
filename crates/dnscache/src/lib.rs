@@ -10,7 +10,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -399,7 +399,7 @@ async fn system_lookup(host: &str) -> Result<Vec<IpAddr>, std::io::Error> {
 
 /// Dial a single IP on the given port.
 async fn dial_one(ip: IpAddr, port: u16) -> Result<TcpStream, DnsError> {
-    let stream = TcpStream::connect(SocketAddr::new(ip, port)).await?;
+    let stream = rustscale_netns::dial_tcp(&ip.to_string(), port).await?;
     let _ = stream.set_nodelay(true);
     Ok(stream)
 }

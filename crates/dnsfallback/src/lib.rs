@@ -18,7 +18,6 @@ use rand::seq::SliceRandom;
 use rand::thread_rng;
 use rustscale_tailcfg::DERPMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::TlsConnector;
 
@@ -294,7 +293,7 @@ async fn bootstrap_dns_map(
 ) -> Result<std::collections::HashMap<String, Vec<IpAddr>>, FallbackError> {
     // Connect TCP to the DERP server's IP on port 443.
     let addr = std::net::SocketAddr::new(*server_ip, 443);
-    let tcp = TcpStream::connect(addr).await?;
+    let tcp = rustscale_tsdial::system_dial("tcp", &addr.to_string()).await?;
     let _ = tcp.set_nodelay(true);
 
     // Establish TLS with SNI = server_name (e.g. "derp1.tailscale.com").

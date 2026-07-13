@@ -167,7 +167,11 @@ async fn dial_target(
         return Ok(result);
     }
 
-    let timeout = tokio::time::timeout(config.dial_timeout, TcpStream::connect(&addr)).await;
+    let timeout = tokio::time::timeout(
+        config.dial_timeout,
+        rustscale_tsdial::system_dial("tcp", &addr),
+    )
+    .await;
 
     match timeout {
         Ok(result) => Ok(result),

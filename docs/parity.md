@@ -62,7 +62,7 @@ real JSON).
 | Package | Go source | Rust status |
 | --- | --- | --- |
 | Tailscale IP addr helpers | `net/tsaddr/` | ✅ `crates/tsaddr`: CGNAT/ULA/4via6/4to6/ephemeral ranges, service VIPs, `is_tailscale_ip`, `map_via`/`unmap_via`, exit-route helpers; all call sites migrated |
-| Outbound dial abstraction | `net/tsdial/` | ⬜ `netns::dial_tcp()` exists but missing PeerAPI/DoH/DNS-map routing |
+| Outbound dial abstraction | `net/tsdial/` | ✅ `crates/tsdial`: `Dialer` with SystemDial/UserDial/PeerDial paths, `DnsMap` MagicDNS resolution, `UserDialPlan`, netmon link-change callback stub, `ActiveConns` tracking; all 10 `TcpStream::connect` call sites migrated |
 | Localhost port proxy map | `net/proxymap/` | ⬜ ephemeral localhost->remote IP port mapping for proxied conns |
 | HTTP CONNECT proxy | `net/connectproxy/` | ✅ `crates/connectproxy`: `ConnectProxyConfig`, `parse_connect_request`, `handle_connect` with bidirectional tunnel |
 | HTTP proxy env detection | `net/tshttpproxy/` | ✅ `crates/tshttpproxy`: `proxy_from_environment` + `http_connect` (HTTP/1.1 CONNECT tunnel w/ Proxy-Authorization); wired into controlhttp (`dial_control`, `fetch_server_pub_key`, `tls_connect`) and derp (`connect_insecure`, `connect_with_upgrade_dial_insecure` — downgrades upgrade→direct TLS over tunnel when proxied) |

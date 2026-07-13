@@ -41,7 +41,7 @@ pub async fn http_connect(
 
     let tcp = tokio::time::timeout(
         CONNECT_TIMEOUT,
-        TcpStream::connect((proxy_host, proxy_port)),
+        rustscale_netns::dial_tcp(proxy_host, proxy_port),
     )
     .await
     .map_err(|_| {

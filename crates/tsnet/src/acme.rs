@@ -187,7 +187,7 @@ async fn tls_connect(
     host: &str,
     port: u16,
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, AcmeError> {
-    let tcp = TcpStream::connect((host, port)).await?;
+    let tcp = rustscale_tsdial::system_dial("tcp", &format!("{host}:{port}")).await?;
     tcp.set_nodelay(true).ok();
     let config = tls_config();
     let connector = tokio_rustls::TlsConnector::from(Arc::new(config));

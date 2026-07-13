@@ -279,7 +279,7 @@ pub async fn dial_control(
                 .await
                 .map_err(|e| DialError::Proxy(e.to_string()))?
         } else {
-            tokio::net::TcpStream::connect((parsed.host.as_str(), parsed.port))
+            rustscale_tsdial::system_dial("tcp", &format!("{}:{}", parsed.host, parsed.port))
                 .await
                 .map_err(DialError::Io)?
         };
@@ -319,7 +319,7 @@ pub async fn fetch_server_pub_key(
                 .await
                 .map_err(|e| DialError::Proxy(e.to_string()))?
         } else {
-            tokio::net::TcpStream::connect((parsed.host.as_str(), parsed.port))
+            rustscale_tsdial::system_dial("tcp", &format!("{}:{}", parsed.host, parsed.port))
                 .await
                 .map_err(DialError::Io)?
         };
@@ -432,7 +432,7 @@ async fn tls_connect(
             .await
             .map_err(|e| DialError::Io(std::io::Error::other(e.to_string())))?
     } else {
-        tokio::net::TcpStream::connect((host, port))
+        rustscale_tsdial::system_dial("tcp", &format!("{host}:{port}"))
             .await
             .map_err(DialError::Io)?
     };

@@ -48,6 +48,8 @@ pub use relay_server::RelayServerExtension;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -213,8 +215,11 @@ struct Inner {
     /// Optional control knobs for PMTUD and other feature toggles.
     control_knobs: Option<Arc<rustscale_controlknobs::ControlKnobs>>,
     /// Per-peer background task handles (heartbeat + UDP lifetime probe).
-    /// At most one task per peer; replaced on new TX activity.
+    /// At most one task per peer; replaced when TX resumes an idle session.
     background_tasks: RwLock<HashMap<NodePublic, tokio::task::JoinHandle<()>>>,
+    /// Number of heartbeat tasks armed, used to verify TX coalescing.
+    #[cfg(test)]
+    heartbeat_task_generations: AtomicUsize,
     /// Last NetInfo received from control (or from local probing). Used to
     /// deduplicate updates and track PreferredDERP / connectivity changes.
     net_info: RwLock<Option<rustscale_tailcfg::NetInfo>>,
@@ -656,6 +661,8 @@ impl Magicsock {
             peer_mtu_enabled: Arc::new(AtomicBool::new(false)),
             control_knobs: config.control_knobs,
             background_tasks: RwLock::new(HashMap::new()),
+            #[cfg(test)]
+            heartbeat_task_generations: AtomicUsize::new(0),
             net_info: RwLock::new(None),
             sockstats_udp4,
             sockstats_udp6,
@@ -980,18 +987,21 @@ impl Magicsock {
 
     /// Send a WG datagram to `peer` over the best available path.
     pub async fn send(&self, peer: NodePublic, datagram: &[u8]) -> Result<(), MagicsockError> {
-        // Note TX activity and arm heartbeat before path lookup.
-        {
+        // Note TX activity before path lookup. Only an inactive-to-active
+        // transition arms the independent heartbeat cadence.
+        let arm_heartbeat = {
             let mut endpoints = self
                 .inner
                 .endpoints
                 .write()
                 .expect("endpoints lock poisoned");
-            if let Some(ep) = endpoints.get_mut(&peer) {
-                ep.note_tx_activity(std::time::Instant::now());
-            }
+            endpoints.get_mut(&peer).is_some_and(|ep| {
+                ep.note_tx_activity_transition(std::time::Instant::now(), SESSION_ACTIVE_TIMEOUT)
+            })
+        };
+        if arm_heartbeat {
+            self.arm_heartbeat(&peer);
         }
-        self.arm_heartbeat(&peer);
 
         let (path, derp_region) = {
             let endpoints = self
@@ -1391,8 +1401,8 @@ impl Magicsock {
     }
 
     /// Arm (or re-arm) the per-peer background task for heartbeats and UDP
-    /// lifetime probing. Called on TX activity. Aborts any existing task
-    /// for this peer to ensure at most one background task at a time.
+    /// lifetime probing when TX transitions from inactive to active. Aborts
+    /// any existing task for this peer to ensure at most one task at a time.
     /// Mirrors Go's `noteTxActivityExtTriggerLocked` arming the heartbeat
     /// timer (endpoint.go:974-979).
     fn arm_heartbeat(&self, peer_key: &NodePublic) {
@@ -1401,6 +1411,10 @@ impl Magicsock {
             .background_tasks
             .write()
             .expect("background_tasks lock");
+        #[cfg(test)]
+        self.inner
+            .heartbeat_task_generations
+            .fetch_add(1, Ordering::Relaxed);
         let handle = tokio::spawn(peer_background_task(self.inner.clone(), peer_key.clone()));
         if let Some(old) = tasks.insert(peer_key.clone(), handle) {
             old.abort();
@@ -1642,8 +1656,8 @@ fn spawn_recv_tasks(
 /// `probeUDPLifetimeCliffDoneLocked` (endpoint.go:1166-1194).
 ///
 /// The task self-terminates when the peer is removed, the probe cycle
-/// completes, or TX activity resumes (a new task is spawned by
-/// `arm_heartbeat`).
+/// completes, or TX resumes after becoming idle (which replaces it with a
+/// heartbeat task).
 async fn peer_background_task(inner: Arc<Inner>, peer_key: NodePublic) {
     use std::time::Instant;
 

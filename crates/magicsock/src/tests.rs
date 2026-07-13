@@ -184,6 +184,146 @@ fn make_peer(
     }
 }
 
+async fn magicsock_with_idle_peer() -> (Magicsock, NodePublic) {
+    let private_key = NodePrivate::generate();
+    let peer_key = NodePrivate::generate().public();
+    let (magicsock, _rx) = Magicsock::new(MagicsockConfig {
+        private_key,
+        disco_key: DiscoPrivate::generate(),
+        derp_client: None,
+        derp_map: None,
+        home_derp_region: 0,
+        udp_bind: None,
+        udp_socket: None,
+        portmapper: None,
+        health: None,
+        disable_direct_paths: false,
+        peer_relay_server: false,
+        relay_server_config: None,
+        sockstats: None,
+        control_knobs: None,
+    })
+    .await
+    .expect("magicsock");
+    magicsock
+        .set_netmap(vec![make_peer(
+            peer_key.clone(),
+            DiscoPrivate::generate().public(),
+            vec![],
+            0,
+        )])
+        .await
+        .expect("netmap");
+    (magicsock, peer_key)
+}
+
+#[tokio::test]
+async fn active_tx_keeps_one_heartbeat_task_and_idle_tx_rearms_it() {
+    let (magicsock, peer_key) = magicsock_with_idle_peer().await;
+
+    assert!(magicsock.send(peer_key.clone(), b"first").await.is_err());
+    assert_eq!(
+        magicsock
+            .inner
+            .heartbeat_task_generations
+            .load(Ordering::Relaxed),
+        1
+    );
+
+    for _ in 0..4 {
+        assert!(magicsock.send(peer_key.clone(), b"active").await.is_err());
+    }
+    assert_eq!(
+        magicsock
+            .inner
+            .heartbeat_task_generations
+            .load(Ordering::Relaxed),
+        1,
+        "active sends must not replace the heartbeat task"
+    );
+    assert_eq!(magicsock.inner.background_tasks.read().unwrap().len(), 1);
+
+    // Make the session stale as if the task had entered its UDP-lifetime
+    // phase. The next TX must replace that task with a heartbeat task.
+    let now = std::time::Instant::now();
+    magicsock
+        .inner
+        .endpoints
+        .write()
+        .unwrap()
+        .get_mut(&peer_key)
+        .unwrap()
+        .note_tx_activity(
+            now.checked_sub(SESSION_ACTIVE_TIMEOUT)
+                .expect("monotonic clock predates timeout"),
+        );
+    assert!(magicsock
+        .send(peer_key.clone(), b"after idle")
+        .await
+        .is_err());
+    assert_eq!(
+        magicsock
+            .inner
+            .heartbeat_task_generations
+            .load(Ordering::Relaxed),
+        2,
+        "TX after idle must replace the lifetime-phase task"
+    );
+    assert_eq!(magicsock.inner.background_tasks.read().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn link_change_makes_next_tx_rearm_heartbeat() {
+    let (magicsock, peer_key) = magicsock_with_idle_peer().await;
+
+    assert!(magicsock
+        .send(peer_key.clone(), b"before link change")
+        .await
+        .is_err());
+    magicsock.link_changed();
+    assert!(magicsock
+        .send(peer_key, b"after link change")
+        .await
+        .is_err());
+    assert_eq!(
+        magicsock
+            .inner
+            .heartbeat_task_generations
+            .load(Ordering::Relaxed),
+        2
+    );
+}
+
+#[tokio::test]
+async fn abort_background_tasks_drains_all_peer_records() {
+    let (magicsock, first_peer) = magicsock_with_idle_peer().await;
+    let second_peer = NodePrivate::generate().public();
+    magicsock
+        .set_netmap(vec![
+            make_peer(
+                first_peer.clone(),
+                DiscoPrivate::generate().public(),
+                vec![],
+                0,
+            ),
+            make_peer(
+                second_peer.clone(),
+                DiscoPrivate::generate().public(),
+                vec![],
+                0,
+            ),
+        ])
+        .await
+        .expect("netmap");
+
+    assert!(magicsock.send(first_peer, b"first").await.is_err());
+    assert!(magicsock.send(second_peer, b"second").await.is_err());
+    assert_eq!(magicsock.inner.background_tasks.read().unwrap().len(), 2);
+
+    magicsock.abort_background_tasks();
+    assert!(magicsock.inner.background_tasks.read().unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn netmap_refreshes_peer_disco_key_and_reverse_map() {
     let private_key = NodePrivate::generate();

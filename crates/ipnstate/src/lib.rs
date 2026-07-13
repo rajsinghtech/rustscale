@@ -273,6 +273,32 @@ impl<'de> Deserialize<'de> for TaildropTargetStatus {
     }
 }
 
+/// Result of a CLI-initiated ping. Mirrors Go's `ipnstate.PingResult`
+/// (`ipn/ipnstate/ipnstate.go`).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct PingResult {
+    #[serde(default)]
+    pub IP: String,
+    #[serde(default)]
+    pub NodeIP: String,
+    #[serde(default)]
+    pub NodeName: String,
+    #[serde(default)]
+    pub LatencySeconds: f64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub Endpoint: String,
+    #[serde(default)]
+    pub DERPRegionID: i32,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub DERPRegionCode: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub PeerRelay: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub Err: String,
+    #[serde(default)]
+    pub IsLocalIP: bool,
+}
+
 pub struct StatusBuilder {
     locked: bool,
     status: Status,

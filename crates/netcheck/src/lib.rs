@@ -13,7 +13,7 @@
 #![allow(clippy::module_name_repetitions)]
 
 mod captivedetection;
-mod icmp;
+pub mod icmp;
 mod prober;
 mod report;
 mod stun;

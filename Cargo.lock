@@ -2426,6 +2426,7 @@ dependencies = [
  "flate2",
  "qrcode",
  "rustscale-ipn",
+ "rustscale-ipnstate",
  "rustscale-localclient",
  "rustscale-netcheck",
  "rustscale-safesocket",
@@ -2689,6 +2690,7 @@ name = "rustscale-localclient"
 version = "0.1.0"
 dependencies = [
  "rustscale-ipn",
+ "rustscale-ipnstate",
  "rustscale-safesocket",
  "rustscale-tailcfg",
  "rustscale-testcontrol",
@@ -2726,6 +2728,7 @@ dependencies = [
  "rustscale-derp",
  "rustscale-disco",
  "rustscale-health",
+ "rustscale-ipnstate",
  "rustscale-key",
  "rustscale-neterror",
  "rustscale-portmapper",

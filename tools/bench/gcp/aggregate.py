@@ -16,6 +16,32 @@ from pathlib import Path
 CONFIG_ORDER = {"rs-userspace": 0, "rs-tun": 1, "ts-userspace": 2, "ts-tun": 3}
 PATH_ORDER = {"direct": 0, "derp": 1}
 TOPO_ORDER = {"same-zone": 0, "cross-region": 1}
+DEFAULT_MATRIX = {
+    "topologies": ["same-zone", "cross-region"],
+    "paths": ["direct", "derp"],
+    "configs": ["rs-userspace", "rs-tun", "ts-userspace", "ts-tun"],
+}
+
+
+def selected_matrix(root: Path) -> dict:
+    """Read schema-v1 run selection, retaining the historical default."""
+    manifest = root / "matrix.json"
+    if not manifest.exists():
+        return DEFAULT_MATRIX
+    try:
+        data = json.loads(manifest.read_text())
+        if data.get("schema_version") != 1:
+            raise ValueError("unsupported schema_version")
+        matrix = {key: data[key] for key in DEFAULT_MATRIX}
+        for key, values in matrix.items():
+            if (not isinstance(values, list) or not values or
+                    len(values) != len(set(values)) or
+                    any(value not in DEFAULT_MATRIX[key] for value in values)):
+                raise ValueError(f"invalid {key}")
+        return matrix
+    except (OSError, ValueError, KeyError, json.JSONDecodeError) as e:
+        print(f"warn: invalid {manifest}: {e}; using historical full matrix", file=sys.stderr)
+        return DEFAULT_MATRIX
 
 
 def main() -> int:
@@ -55,9 +81,10 @@ def main() -> int:
     # have a run. Report gaps so they are not silently absent from the
     # dashboard.
     seen = {(r.get("topology"), r.get("path"), r.get("config")) for r in runs}
-    for topo in ("same-zone", "cross-region"):
-        for path in ("direct", "derp"):
-            for cfg in ("rs-userspace", "rs-tun", "ts-userspace", "ts-tun"):
+    matrix = selected_matrix(root)
+    for topo in matrix["topologies"]:
+        for path in matrix["paths"]:
+            for cfg in matrix["configs"]:
                 if (topo, path, cfg) not in seen:
                     print(
                         f"warn: MISSING {topo}/{path}/{cfg} — no JSON found",

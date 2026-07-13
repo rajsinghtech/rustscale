@@ -159,9 +159,21 @@ matrix_config_failure_policy_self_test() {
     matrix_test_fatal_handoff matrix_test_config_flow
 }
 
+matrix_profile_self_test() {
+  local -a args=(rs-tun s c sz cz key dir host client --profile)
+  [[ "${args[9]}" == --profile && "${args[0]}" == rs-tun ]] || return 1
+  # The option is appended only at the rs-tun call site; other config calls
+  # receive no ambient profile environment or inherited option.
+  args=(ts-tun s c sz cz key dir host client)
+  [[ " ${args[*]} " != *' --profile '* ]] || return 1
+  local -a topologies=(same-zone) paths=(direct)
+  [[ ${#topologies[@]} -eq 1 && ${#paths[@]} -eq 1 ]] || return 1
+}
+
 matrix_command_shape_self_test
 matrix_remote_build_aggregation_self_test
 matrix_config_failure_policy_self_test
+matrix_profile_self_test
 
 if (( MATRIX_SELF_TEST )); then
   package_tailscaled_cleanup_self_test
@@ -174,6 +186,7 @@ fi
 # Arg parsing.
 # ---------------------------------------------------------------------------
 DRY_RUN=0
+PROFILE=0
 TOPOLOGY_FILTER=""
 PATH_FILTER=""
 CONFIG_FILTER=""
@@ -191,15 +204,17 @@ while [[ $# -gt 0 ]]; do
       [[ $# -ge 2 && -n "$2" ]] || { echo "--config requires a value" >&2; exit 2; }
       CONFIG_FILTER="$2"; shift 2 ;;
     --config=*) CONFIG_FILTER="${1#*=}"; shift ;;
+    --profile) PROFILE=1; shift ;;
     --dry-run|-n) DRY_RUN=1; shift ;;
     -h|--help)
       cat <<EOF
-usage: $0 [--dry-run] [--topology LIST] [--path LIST] [--config LIST]
+usage: $0 [--dry-run] [--profile] [--topology LIST] [--path LIST] [--config LIST]
 Runs the full 16-run GCP bench matrix.
   --dry-run  validate args + script structure without gcloud or API calls.
   --topology comma-separated subset: same-zone,cross-region
   --path     comma-separated subset: direct,derp
   --config   comma-separated subset: rs-userspace,rs-tun,ts-userspace,ts-tun
+  --profile  profile only the selected rs-tun cell after normal metrics
 EOF
       exit 0
       ;;
@@ -242,6 +257,14 @@ select_values() {
 select_values "$TOPOLOGY_FILTER" "${TOPOLOGIES[@]}"; TOPOLOGIES=("${SELECTED[@]}")
 select_values "$PATH_FILTER" "${PATHS[@]}"; PATHS=("${SELECTED[@]}")
 select_values "$CONFIG_FILTER" "${CONFIGS[@]}"; CONFIGS=("${SELECTED[@]}")
+if (( PROFILE )); then
+  found=0
+  for cfg in "${CONFIGS[@]}"; do [[ "$cfg" == rs-tun ]] && found=1; done
+  (( found )) || { echo "--profile requires selected config rs-tun" >&2; exit 2; }
+  [[ ${#TOPOLOGIES[@]} -eq 1 && ${#PATHS[@]} -eq 1 ]] || {
+    echo "--profile requires exactly one selected topology and one selected path" >&2; exit 2;
+  }
+fi
 RUST_BUILD_COMMAND=$(rust_build_command)
 if [[ -z "$RUST_BUILD_COMMAND" ]]; then
   echo "[gcp] skipping Rust source delivery and builds (no Rust configs selected)" >&2
@@ -250,6 +273,18 @@ fi
 STAMP=$(date +%Y%m%d-%H%M%S)
 RESULTS_DIR="bench-results/gcp-$STAMP"
 mkdir -p "$RESULTS_DIR"
+python3 - "$RESULTS_DIR/matrix.json" "${TOPOLOGIES[@]}" -- "${PATHS[@]}" -- "${CONFIGS[@]}" <<'PYEOF'
+import json, sys
+out = sys.argv[1]
+parts, cur = [], []
+for arg in sys.argv[2:]:
+    if arg == "--": parts.append(cur); cur = []
+    else: cur.append(arg)
+parts.append(cur)
+with open(out, "w", encoding="utf-8") as f:
+    json.dump({"schema_version": 1, "topologies": parts[0], "paths": parts[1], "configs": parts[2]}, f, indent=2)
+    f.write("\n")
+PYEOF
 
 # Track VMs created for cleanup. ASSUMES one pair per topology; we delete each
 # topology's VMs before starting the next to keep quota usage at 2 VMs.
@@ -362,12 +397,16 @@ for TOPO in "${TOPOLOGIES[@]}"; do
         echo "[gcp] minted fresh authkey for $CFG" >&2
       fi
 
+      RUN_CONFIG_ARGS=(
+        "$CFG" "$SERVER_VM" "$CLIENT_VM" "$Z_A" "$Z_B"
+        "$AUTHKEY" "$RESULTS_DIR/$TOPO/$PATH_TAG" "rs-srv-$TOPO" "rs-cli-$TOPO"
+      )
+      if [[ "$CFG" == rs-tun && $PROFILE -eq 1 ]]; then
+        RUN_CONFIG_ARGS+=(--profile)
+      fi
       matrix_run_config_with_policy "$CFG" \
         " -> $RESULTS_DIR/$TOPO/$PATH_TAG/$CFG.json" \
-        tools/bench/gcp/run-config.sh \
-        "$CFG" "$SERVER_VM" "$CLIENT_VM" "$Z_A" "$Z_B" \
-        "$AUTHKEY" "$RESULTS_DIR/$TOPO/$PATH_TAG" \
-        "rs-srv-$TOPO" "rs-cli-$TOPO"
+        tools/bench/gcp/run-config.sh "${RUN_CONFIG_ARGS[@]}"
     done
 
     if [[ "$PATH_TAG" == "derp" ]]; then

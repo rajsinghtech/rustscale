@@ -29,6 +29,8 @@ mod pmtud;
 mod relay;
 mod relay_manager;
 mod relay_server;
+#[cfg(target_os = "linux")]
+mod udp_batch;
 
 pub use endpoint::{
     BestPath, DiscoPingPurpose, Endpoint, PathClass, PendingPing, ProbeUDPLifetime,
@@ -47,6 +49,8 @@ pub use relay_manager::{
 pub use relay_server::RelayServerExtension;
 
 use std::collections::HashMap;
+#[cfg(target_os = "linux")]
+use std::io;
 use std::net::{IpAddr, SocketAddr};
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
@@ -59,6 +63,8 @@ use rustscale_disco::{CallMeMaybe, Message, Ping, Pong};
 use rustscale_key::{DiscoPrivate, DiscoPublic, NodePrivate, NodePublic};
 use rustscale_neterror::treat_as_lost_udp;
 use rustscale_tailcfg::{DERPMap, Node};
+#[cfg(target_os = "linux")]
+use tokio::io::Interest;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
@@ -93,6 +99,32 @@ const WIRE_MTUS_TO_PROBE: &[usize] = &[1280, 1320, 1400, 1500, 8000, 9000];
 /// `MAGIC(6) + sender_pub(32) + nonce(24) + tag(16) + header(2) + ping(44)`.
 /// Mirrors Go's `discoPingSize` (endpoint.go:1249-1250).
 const DISCO_PING_SIZE: usize = 124;
+
+/// Advance one Linux direct-batch attempt. This deliberately small seam keeps
+/// partial-send/error policy deterministic without abstracting the UDP socket.
+#[cfg(target_os = "linux")]
+fn advance_direct_batch(
+    head: &mut usize,
+    len: usize,
+    first_error: &mut Option<io::Error>,
+    result: io::Result<usize>,
+) -> usize {
+    match result {
+        Ok(sent) => {
+            debug_assert!(sent > 0 && sent <= len - *head);
+            *head += sent;
+            sent
+        }
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => 0,
+        Err(error) => {
+            if !treat_as_lost_udp(&error) {
+                first_error.get_or_insert(error);
+            }
+            *head += 1;
+            0
+        }
+    }
+}
 
 /// Errors from magicsock operations.
 #[derive(Debug, thiserror::Error)]
@@ -1048,17 +1080,24 @@ impl Magicsock {
                     return first_error.map_or(Ok(()), Err);
                 }
                 if let Some(ref udp) = self.inner.udp {
-                    for datagram in datagrams {
-                        let datagram = datagram.as_ref();
-                        if let Err(e) = udp.send_to(datagram, addr).await {
-                            if !treat_as_lost_udp(&e) {
-                                first_error.get_or_insert(MagicsockError::Io(e));
-                            }
-                        } else {
-                            self.inner.record_udp_tx(addr, datagram.len());
-                        }
+                    #[cfg(target_os = "linux")]
+                    {
+                        return self.send_direct_batch_linux(udp, addr, datagrams).await;
                     }
-                    return first_error.map_or(Ok(()), Err);
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        for datagram in datagrams {
+                            let datagram = datagram.as_ref();
+                            if let Err(e) = udp.send_to(datagram, addr).await {
+                                if !treat_as_lost_udp(&e) {
+                                    first_error.get_or_insert(MagicsockError::Io(e));
+                                }
+                            } else {
+                                self.inner.record_udp_tx(addr, datagram.len());
+                            }
+                        }
+                        return first_error.map_or(Ok(()), Err);
+                    }
                 }
                 for datagram in datagrams {
                     if let Err(e) = self
@@ -1107,6 +1146,32 @@ impl Magicsock {
             }
         }
         first_error.map_or(Ok(()), Err)
+    }
+
+    /// Linux direct-path sender. `async_io` owns readiness registration for
+    /// this Tokio socket; the raw helper only performs the one nonblocking IO.
+    #[cfg(target_os = "linux")]
+    async fn send_direct_batch_linux<T: AsRef<[u8]>>(
+        &self,
+        udp: &Arc<UdpSocket>,
+        addr: SocketAddr,
+        datagrams: &[T],
+    ) -> Result<(), MagicsockError> {
+        let mut head = 0;
+        let mut first_error = None;
+        while head < datagrams.len() {
+            let end = (head + udp_batch::MAX_BATCH).min(datagrams.len());
+            let result = udp
+                .async_io(Interest::WRITABLE, || {
+                    udp_batch::send(udp, addr, &datagrams[head..end])
+                })
+                .await;
+            let sent = advance_direct_batch(&mut head, datagrams.len(), &mut first_error, result);
+            for datagram in &datagrams[head - sent..head] {
+                self.inner.record_udp_tx(addr, datagram.as_ref().len());
+            }
+        }
+        first_error.map_or(Ok(()), |error| Err(MagicsockError::Io(error)))
     }
 
     /// Inspect the current best path class for a peer (for testing).
@@ -2804,6 +2869,79 @@ fn debug_enabled() -> bool {
 /// Short 4-byte hex prefix of a node key for log lines.
 fn short_key(k: &NodePublic) -> String {
     hex::encode(&k.raw32()[..4])
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_batch_tests {
+    use super::*;
+
+    fn advance_sequence(
+        lengths: &[usize],
+        results: impl IntoIterator<Item = io::Result<usize>>,
+    ) -> (usize, Vec<usize>, Option<io::Error>) {
+        let mut head = 0;
+        let mut first_error = None;
+        let mut accounted = Vec::new();
+        for result in results {
+            let before = head;
+            let sent = advance_direct_batch(&mut head, lengths.len(), &mut first_error, result);
+            accounted.extend_from_slice(&lengths[before..before + sent]);
+        }
+        (head, accounted, first_error)
+    }
+
+    #[test]
+    fn direct_batch_advancement_accounts_successful_prefixes() {
+        let (head, accounted, error) = advance_sequence(&[3, 5, 7, 11], [Ok(4)]);
+        assert_eq!(head, 4);
+        assert_eq!(accounted, [3, 5, 7, 11]);
+        assert!(error.is_none());
+
+        let (head, accounted, error) = advance_sequence(&[3, 5, 7, 11], [Ok(1), Ok(2), Ok(1)]);
+        assert_eq!(head, 4);
+        assert_eq!(accounted, [3, 5, 7, 11]);
+        assert!(error.is_none());
+    }
+
+    #[test]
+    fn would_block_retains_the_same_suffix() {
+        let (head, accounted, error) = advance_sequence(
+            &[3, 5],
+            [Err(io::Error::from(io::ErrorKind::WouldBlock)), Ok(2)],
+        );
+        assert_eq!(head, 2);
+        assert_eq!(accounted, [3, 5]);
+        assert!(error.is_none());
+    }
+
+    #[test]
+    fn lost_error_skips_only_its_head() {
+        let (head, accounted, error) = advance_sequence(
+            &[3, 5, 7],
+            [Err(io::Error::from_raw_os_error(libc::EPERM)), Ok(2)],
+        );
+        assert_eq!(head, 3);
+        assert_eq!(accounted, [5, 7]);
+        assert!(error.is_none());
+    }
+
+    #[test]
+    fn retained_error_is_first_and_later_suffix_still_sends() {
+        let (head, accounted, error) = advance_sequence(
+            &[3, 5, 7],
+            [
+                Err(io::Error::from_raw_os_error(libc::EINVAL)),
+                Err(io::Error::from_raw_os_error(libc::EIO)),
+                Ok(1),
+            ],
+        );
+        assert_eq!(head, 3);
+        assert_eq!(accounted, [7]);
+        assert_eq!(
+            error.and_then(|error| error.raw_os_error()),
+            Some(libc::EINVAL)
+        );
+    }
 }
 
 #[cfg(test)]

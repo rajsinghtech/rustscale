@@ -160,20 +160,138 @@ matrix_config_failure_policy_self_test() {
 }
 
 matrix_profile_self_test() {
-  local -a args=(rs-tun s c sz cz key dir host client --profile)
-  [[ "${args[9]}" == --profile && "${args[0]}" == rs-tun ]] || return 1
-  # The option is appended only at the rs-tun call site; other config calls
-  # receive no ambient profile environment or inherited option.
-  args=(ts-tun s c sz cz key dir host client)
-  [[ " ${args[*]} " != *' --profile '* ]] || return 1
-  local -a topologies=(same-zone) paths=(direct)
-  [[ ${#topologies[@]} -eq 1 && ${#paths[@]} -eq 1 ]] || return 1
+  local config
+  local -a calls=()
+  REPEAT=4
+  PROFILE=1
+  matrix_test_record_run_config() { calls+=("$1|${*:4}"); }
+
+  # Exercise the same selected-cell loop used by the matrix, with its
+  # run-config policy call mocked locally. Both cells must receive the same
+  # repeat, while only rustscale receives the rs-tun-only profiling flag.
+  for config in rs-tun ts-tun; do
+    matrix_run_config_cell "$config" s c sz cz key dir host client matrix_test_record_run_config
+  done
+  unset -f matrix_test_record_run_config
+
+  [[ ${#calls[@]} -eq 2 ]] || return 1
+  [[ "${calls[0]}" == 'rs-tun|rs-tun s c sz cz key dir host client --repeat 4 --profile' ]] || return 1
+  [[ "${calls[1]}" == 'ts-tun|ts-tun s c sz cz key dir host client --repeat 4' ]] || return 1
+}
+
+# Build the directly invocable run-config command shape used by each cell.
+# Args: CONFIG SERVER_VM CLIENT_VM SERVER_ZONE CLIENT_ZONE AUTHKEY RESULTS_DIR
+#       SERVER_HOSTNAME CLIENT_HOSTNAME
+matrix_build_run_config_args() {
+  local config="$1"
+  RUN_CONFIG_ARGS=(
+    "$config" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" --repeat "$REPEAT"
+  )
+  if [[ "$config" == rs-tun && $PROFILE -eq 1 ]]; then
+    RUN_CONFIG_ARGS+=(--profile)
+  fi
+}
+
+# Run one already-selected matrix cell. Keeping this invocation shape in a
+# helper lets the local self-test exercise the same loop without GCP access.
+matrix_run_config_cell() {
+  local config="$1" server_vm="$2" client_vm="$3" server_zone="$4" client_zone="$5"
+  local authkey="$6" results_dir="$7" server_hostname="$8" client_hostname="$9"
+  local policy_fn="${10:-matrix_run_config_with_policy}"
+
+  matrix_build_run_config_args "$config" "$server_vm" "$client_vm" "$server_zone" "$client_zone" \
+    "$authkey" "$results_dir" "$server_hostname" "$client_hostname"
+  "$policy_fn" "$config" " -> $results_dir/$config.json" \
+    tools/bench/gcp/run-config.sh "${RUN_CONFIG_ARGS[@]}"
+}
+
+# Parse command-line options without contacting GCP.  Keeping this separate
+# makes the strict option contract directly self-testable.
+matrix_parse_args() {
+  DRY_RUN=0
+  PROFILE=0
+  REPEAT=3
+  SHOW_HELP=0
+  TOPOLOGY_FILTER=""
+  PATH_FILTER=""
+  CONFIG_FILTER=""
+  local seen_dry_run=0 seen_profile=0 seen_repeat=0
+  local seen_topology=0 seen_path=0 seen_config=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --topology)
+        (( seen_topology == 0 )) || { echo "duplicate option: --topology" >&2; return 2; }
+        [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || { echo "--topology requires a value" >&2; return 2; }
+        TOPOLOGY_FILTER="$2"; seen_topology=1; shift 2 ;;
+      --topology=*)
+        (( seen_topology == 0 )) || { echo "duplicate option: --topology" >&2; return 2; }
+        TOPOLOGY_FILTER="${1#*=}"
+        [[ -n "$TOPOLOGY_FILTER" ]] || { echo "--topology requires a value" >&2; return 2; }
+        seen_topology=1; shift ;;
+      --path)
+        (( seen_path == 0 )) || { echo "duplicate option: --path" >&2; return 2; }
+        [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || { echo "--path requires a value" >&2; return 2; }
+        PATH_FILTER="$2"; seen_path=1; shift 2 ;;
+      --path=*)
+        (( seen_path == 0 )) || { echo "duplicate option: --path" >&2; return 2; }
+        PATH_FILTER="${1#*=}"
+        [[ -n "$PATH_FILTER" ]] || { echo "--path requires a value" >&2; return 2; }
+        seen_path=1; shift ;;
+      --config)
+        (( seen_config == 0 )) || { echo "duplicate option: --config" >&2; return 2; }
+        [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || { echo "--config requires a value" >&2; return 2; }
+        CONFIG_FILTER="$2"; seen_config=1; shift 2 ;;
+      --config=*)
+        (( seen_config == 0 )) || { echo "duplicate option: --config" >&2; return 2; }
+        CONFIG_FILTER="${1#*=}"
+        [[ -n "$CONFIG_FILTER" ]] || { echo "--config requires a value" >&2; return 2; }
+        seen_config=1; shift ;;
+      --repeat)
+        (( seen_repeat == 0 )) || { echo "duplicate option: --repeat" >&2; return 2; }
+        [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || { echo "--repeat requires a value" >&2; return 2; }
+        [[ "$2" =~ ^[1-9]$ ]] || { echo "--repeat must be an integer in 1..=9" >&2; return 2; }
+        REPEAT="$2"; seen_repeat=1; shift 2 ;;
+      --profile)
+        (( seen_profile == 0 )) || { echo "duplicate option: --profile" >&2; return 2; }
+        PROFILE=1; seen_profile=1; shift ;;
+      --dry-run|-n)
+        (( seen_dry_run == 0 )) || { echo "duplicate option: $1" >&2; return 2; }
+        DRY_RUN=1; seen_dry_run=1; shift ;;
+      -h|--help)
+        # Preserve the long-standing behavior: help wins wherever it occurs
+        # and never reaches the GCP setup path.
+        SHOW_HELP=1; return 0 ;;
+      *) echo "unknown arg: $1" >&2; return 2 ;;
+    esac
+  done
+}
+
+matrix_option_parsing_self_test() {
+  local actual status
+  actual=$(matrix_parse_args; printf '%s/%s/%s/%s/%s/%s\n' "$REPEAT" "$PROFILE" "$DRY_RUN" "$TOPOLOGY_FILTER" "$PATH_FILTER" "$CONFIG_FILTER") || return 1
+  [[ "$actual" == '3/0/0///' ]] || return 1
+  actual=$(matrix_parse_args --repeat 1 --profile --topology same-zone --path direct --config rs-tun,ts-tun; printf '%s/%s/%s/%s/%s/%s\n' "$REPEAT" "$PROFILE" "$DRY_RUN" "$TOPOLOGY_FILTER" "$PATH_FILTER" "$CONFIG_FILTER") || return 1
+  [[ "$actual" == '1/1/0/same-zone/direct/rs-tun,ts-tun' ]] || return 1
+  actual=$(matrix_parse_args --dry-run --help --not-an-error; printf '%s/%s/%s\n' "$DRY_RUN" "$SHOW_HELP" "$REPEAT") || return 1
+  [[ "$actual" == '1/1/3' ]] || return 1
+  local -a case_args=()
+  for args in '--repeat' '--repeat 0' '--repeat 10' '--repeat 1.5' '--repeat 1 --repeat 2' '--profile --profile'; do
+    read -r -a case_args <<< "$args"
+    if ( matrix_parse_args "${case_args[@]}" ) >/dev/null 2>&1; then
+      return 1
+    else
+      status=$?
+      (( status == 2 )) || return 1
+    fi
+  done
 }
 
 matrix_command_shape_self_test
 matrix_remote_build_aggregation_self_test
 matrix_config_failure_policy_self_test
 matrix_profile_self_test
+matrix_option_parsing_self_test
 
 if (( MATRIX_SELF_TEST )); then
   package_tailscaled_cleanup_self_test
@@ -185,42 +303,23 @@ fi
 # ---------------------------------------------------------------------------
 # Arg parsing.
 # ---------------------------------------------------------------------------
-DRY_RUN=0
-PROFILE=0
-TOPOLOGY_FILTER=""
-PATH_FILTER=""
-CONFIG_FILTER=""
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --topology)
-      [[ $# -ge 2 && -n "$2" ]] || { echo "--topology requires a value" >&2; exit 2; }
-      TOPOLOGY_FILTER="$2"; shift 2 ;;
-    --topology=*) TOPOLOGY_FILTER="${1#*=}"; shift ;;
-    --path)
-      [[ $# -ge 2 && -n "$2" ]] || { echo "--path requires a value" >&2; exit 2; }
-      PATH_FILTER="$2"; shift 2 ;;
-    --path=*) PATH_FILTER="${1#*=}"; shift ;;
-    --config)
-      [[ $# -ge 2 && -n "$2" ]] || { echo "--config requires a value" >&2; exit 2; }
-      CONFIG_FILTER="$2"; shift 2 ;;
-    --config=*) CONFIG_FILTER="${1#*=}"; shift ;;
-    --profile) PROFILE=1; shift ;;
-    --dry-run|-n) DRY_RUN=1; shift ;;
-    -h|--help)
-      cat <<EOF
-usage: $0 [--dry-run] [--profile] [--topology LIST] [--path LIST] [--config LIST]
+matrix_usage() {
+  cat <<EOF
+usage: $0 [--dry-run] [--profile] [--repeat N] [--topology LIST] [--path LIST] [--config LIST]
 Runs the full 16-run GCP bench matrix.
   --dry-run  validate args + script structure without gcloud or API calls.
   --topology comma-separated subset: same-zone,cross-region
   --path     comma-separated subset: direct,derp
   --config   comma-separated subset: rs-userspace,rs-tun,ts-userspace,ts-tun
+  --repeat N run each production TUN throughput parallelism N times (1..=9; default 3)
   --profile  profile only the selected rs-tun cell after normal metrics
 EOF
-      exit 0
-      ;;
-    *) echo "unknown arg: $1" >&2; exit 2 ;;
-  esac
-done
+}
+matrix_parse_args "$@" || exit $?
+if (( SHOW_HELP )); then
+  matrix_usage
+  exit 0
+fi
 
 if [[ $DRY_RUN -eq 1 ]]; then
   export GCP_DRY_RUN=1
@@ -273,16 +372,19 @@ fi
 STAMP=$(date +%Y%m%d-%H%M%S)
 RESULTS_DIR="bench-results/gcp-$STAMP"
 mkdir -p "$RESULTS_DIR"
-python3 - "$RESULTS_DIR/matrix.json" "${TOPOLOGIES[@]}" -- "${PATHS[@]}" -- "${CONFIGS[@]}" <<'PYEOF'
+python3 - "$RESULTS_DIR/matrix.json" "$REPEAT" "${TOPOLOGIES[@]}" -- "${PATHS[@]}" -- "${CONFIGS[@]}" <<'PYEOF'
 import json, sys
 out = sys.argv[1]
+repeat = int(sys.argv[2])
 parts, cur = [], []
-for arg in sys.argv[2:]:
+for arg in sys.argv[3:]:
     if arg == "--": parts.append(cur); cur = []
     else: cur.append(arg)
 parts.append(cur)
 with open(out, "w", encoding="utf-8") as f:
-    json.dump({"schema_version": 1, "topologies": parts[0], "paths": parts[1], "configs": parts[2]}, f, indent=2)
+    json.dump({"schema_version": 1, "topologies": parts[0], "paths": parts[1], "configs": parts[2],
+               "repeat": repeat,
+               "warmup": {"parallel": 1, "duration_s": 3, "reverse": True}}, f, indent=2)
     f.write("\n")
 PYEOF
 
@@ -397,16 +499,8 @@ for TOPO in "${TOPOLOGIES[@]}"; do
         echo "[gcp] minted fresh authkey for $CFG" >&2
       fi
 
-      RUN_CONFIG_ARGS=(
-        "$CFG" "$SERVER_VM" "$CLIENT_VM" "$Z_A" "$Z_B"
+      matrix_run_config_cell "$CFG" "$SERVER_VM" "$CLIENT_VM" "$Z_A" "$Z_B" \
         "$AUTHKEY" "$RESULTS_DIR/$TOPO/$PATH_TAG" "rs-srv-$TOPO" "rs-cli-$TOPO"
-      )
-      if [[ "$CFG" == rs-tun && $PROFILE -eq 1 ]]; then
-        RUN_CONFIG_ARGS+=(--profile)
-      fi
-      matrix_run_config_with_policy "$CFG" \
-        " -> $RESULTS_DIR/$TOPO/$PATH_TAG/$CFG.json" \
-        tools/bench/gcp/run-config.sh "${RUN_CONFIG_ARGS[@]}"
     done
 
     if [[ "$PATH_TAG" == "derp" ]]; then

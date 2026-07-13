@@ -21,13 +21,24 @@ with tempfile.TemporaryDirectory() as tmp:
     dest.mkdir(parents=True)
     for cfg in ("rs-tun", "ts-tun"):
         shutil.copy(source / f"{cfg}.json", dest / f"{cfg}.json")
+    # Keep rs-tun in the historical row shape while enriching ts-tun.  The
+    # aggregate/dashboard path must accept both during the additive rollout.
+    ts_tun = dest / "ts-tun.json"
+    enriched = json.loads(ts_tun.read_text())
+    for row in enriched["throughput"]:
+        value = row["mbps"]
+        row.update({"samples_mbps": [value - 1, value, value + 1],
+                    "statistic": "median"})
+    ts_tun.write_text(json.dumps(enriched))
     (root / "matrix.json").write_text(json.dumps({"schema_version": 1,
         "topologies": ["same-zone"], "paths": ["direct"],
-        "configs": ["rs-tun", "ts-tun"]}))
+        "configs": ["rs-tun", "ts-tun"], "repeat": 3,
+        "warmup": {"parallel": 1, "duration_s": 3, "reverse": True}}))
     aggregate = run("python3", GCP / "aggregate.py", root)
     assert "MISSING" not in aggregate.stderr
     results = json.loads(aggregate.stdout)
     assert len(results) == 2 and [r["config"] for r in results] == ["rs-tun", "ts-tun"]
+    assert results[1]["throughput"][0]["statistic"] == "median"
     summary = root / "summary.json"; summary.write_text(aggregate.stdout)
     html = run("python3", GCP / "render-html.py", summary).stdout
     assert "2 runs" in html and "0 missing" in html

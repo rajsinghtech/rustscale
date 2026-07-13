@@ -69,6 +69,7 @@ rustscale-clientmetric = { path = "../clientmetric", version = "0.1.0" }
 rustscale-ipn = { path = "../ipn", version = "0.1.0" }
 rustscale-ipnstate = { path = "../ipnstate", version = "0.1.0" }
 rustscale-appc = { path = "../appc", version = "0.1.0" }
+rustscale-tsaddr = { path = "../tsaddr", version = "0.1.0" }
 rustscale-netns.workspace = true
 serde.workspace = true
 serde_json.workspace = true

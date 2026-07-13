@@ -67,7 +67,7 @@ impl RouteTable {
                 let Some((net, prefix)) = parse_cidr(cidr) else {
                     continue;
                 };
-                if !accept_routes && !is_tailnet_prefix(net, prefix) {
+                if !accept_routes && !rustscale_tsaddr::is_tailscale_ip(net) {
                     continue;
                 }
                 entries.push(RouteEntry {
@@ -226,36 +226,6 @@ pub fn peer_is_exit_capable(peer: &Node) -> bool {
             |(net, prefix)| matches!(net, IpAddr::V4(v4) if v4.is_unspecified() && prefix == 0),
         )
     })
-}
-
-/// Whether a `net`/`prefix` falls within the Tailscale tailnet ranges:
-/// IPv4 100.64.0.0/10 (CGNAT) or IPv6 fd7a:115c:a1e0::/48 (ULA). These are
-/// the "self" IPs that are always installed regardless of `accept_routes`.
-fn is_tailnet_prefix(net: IpAddr, prefix: u8) -> bool {
-    match net {
-        IpAddr::V4(v4) => {
-            if prefix > 32 {
-                return false;
-            }
-            // 100.64.0.0/10 — the Tailscale CGNAT range.
-            cidr_match(
-                IpAddr::V4(v4),
-                IpAddr::V4(std::net::Ipv4Addr::new(100, 64, 0, 0)),
-                10,
-            )
-        }
-        IpAddr::V6(v6) => {
-            if prefix > 128 {
-                return false;
-            }
-            // fd7a:115c:a1e0::/48 — the Tailscale ULA range.
-            cidr_match(
-                IpAddr::V6(v6),
-                IpAddr::V6("fd7a:115c:a1e0::".parse().unwrap()),
-                48,
-            )
-        }
-    }
 }
 
 #[cfg(test)]
@@ -509,22 +479,18 @@ mod tests {
     #[test]
     fn tailnet_range_check() {
         // 100.64.0.0/10 is tailnet; 100.128.0.0 is outside it.
-        assert!(is_tailnet_prefix(
-            IpAddr::V4(Ipv4Addr::new(100, 64, 5, 5)),
-            32
+        assert!(rustscale_tsaddr::is_tailscale_ip(IpAddr::V4(
+            Ipv4Addr::new(100, 64, 5, 5)
+        )));
+        assert!(!rustscale_tsaddr::is_tailscale_ip(IpAddr::V4(
+            Ipv4Addr::new(100, 128, 0, 1)
+        )));
+        assert!(rustscale_tsaddr::is_tailscale_ip(
+            "fd7a:115c:a1e0:abcd::1".parse().unwrap()
         ));
-        assert!(!is_tailnet_prefix(
-            IpAddr::V4(Ipv4Addr::new(100, 128, 0, 1)),
-            32
-        ));
-        assert!(is_tailnet_prefix(
-            "fd7a:115c:a1e0:abcd::1".parse().unwrap(),
-            128
-        ));
-        assert!(!is_tailnet_prefix(
-            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 0)),
-            24
-        ));
+        assert!(!rustscale_tsaddr::is_tailscale_ip(IpAddr::V4(
+            Ipv4Addr::new(192, 0, 2, 0)
+        )));
     }
 
     // -----------------------------------------------------------------------

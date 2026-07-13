@@ -165,12 +165,9 @@ mod tests {
     use std::net::IpAddr;
     use tempfile::TempDir;
 
-    fn cfg(nameservers: &[&str], search: &[&str], match_domains: &[&str]) -> OsConfig {
+    fn cfg(nameservers: &[IpAddr], search: &[&str], match_domains: &[&str]) -> OsConfig {
         OsConfig {
-            nameservers: nameservers
-                .iter()
-                .map(|s| s.parse::<IpAddr>().unwrap())
-                .collect(),
+            nameservers: nameservers.to_vec(),
             search_domains: search.iter().copied().map(String::from).collect(),
             match_domains: match_domains.iter().copied().map(String::from).collect(),
         }
@@ -188,10 +185,17 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut c = DarwinConfigurator::new(dir.path().to_str().unwrap(), "/dev/null");
 
-        c.set_dns(&cfg(&["100.100.100.100"], &[], &["example.com", "ts.net"]))
-            .unwrap();
+        c.set_dns(&cfg(
+            &[rustscale_tsaddr::tailscale_service_ip()],
+            &[],
+            &["example.com", "ts.net"],
+        ))
+        .unwrap();
 
-        let expected = "# Added by tailscaled\nnameserver 100.100.100.100\n";
+        let expected = format!(
+            "# Added by tailscaled\nnameserver {}\n",
+            rustscale_tsaddr::tailscale_service_ip()
+        );
         let content1 = fs::read_to_string(dir.path().join("example.com")).unwrap();
         assert_eq!(content1, expected);
         let content2 = fs::read_to_string(dir.path().join("ts.net")).unwrap();
@@ -204,7 +208,7 @@ mod tests {
         let mut c = DarwinConfigurator::new(dir.path().to_str().unwrap(), "/dev/null");
 
         c.set_dns(&cfg(
-            &["100.100.100.100"],
+            &[rustscale_tsaddr::tailscale_service_ip()],
             &["tailnet.ts.net", "corp.example"],
             &["example.com"],
         ))
@@ -222,13 +226,21 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut c = DarwinConfigurator::new(dir.path().to_str().unwrap(), "/dev/null");
 
-        c.set_dns(&cfg(&["100.100.100.100"], &[], &["a.example", "b.example"]))
-            .unwrap();
+        c.set_dns(&cfg(
+            &[rustscale_tsaddr::tailscale_service_ip()],
+            &[],
+            &["a.example", "b.example"],
+        ))
+        .unwrap();
         assert!(dir.path().join("a.example").exists());
         assert!(dir.path().join("b.example").exists());
 
-        c.set_dns(&cfg(&["100.100.100.100"], &[], &["a.example"]))
-            .unwrap();
+        c.set_dns(&cfg(
+            &[rustscale_tsaddr::tailscale_service_ip()],
+            &[],
+            &["a.example"],
+        ))
+        .unwrap();
         assert!(dir.path().join("a.example").exists());
         assert!(!dir.path().join("b.example").exists());
     }
@@ -241,8 +253,12 @@ mod tests {
         fs::write(dir.path().join("foreign"), "nameserver 8.8.8.8\n").unwrap();
 
         let mut c = DarwinConfigurator::new(dir.path().to_str().unwrap(), "/dev/null");
-        c.set_dns(&cfg(&["100.100.100.100"], &[], &["a.example", "b.example"]))
-            .unwrap();
+        c.set_dns(&cfg(
+            &[rustscale_tsaddr::tailscale_service_ip()],
+            &[],
+            &["a.example", "b.example"],
+        ))
+        .unwrap();
         assert!(dir.path().join("a.example").exists());
         assert!(dir.path().join("b.example").exists());
 
@@ -268,8 +284,12 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut c = DarwinConfigurator::new(dir.path().to_str().unwrap(), "/dev/null");
 
-        c.set_dns(&cfg(&["100.100.100.100"], &[], &["a.example"]))
-            .unwrap();
+        c.set_dns(&cfg(
+            &[rustscale_tsaddr::tailscale_service_ip()],
+            &[],
+            &["a.example"],
+        ))
+        .unwrap();
         assert!(dir.path().join("a.example").exists());
 
         // Zero config should remove all our files.
@@ -283,7 +303,11 @@ mod tests {
         let mut c = DarwinConfigurator::new(dir.path().to_str().unwrap(), "/dev/null");
 
         let err = c
-            .set_dns(&cfg(&["100.100.100.100"], &[], &["ev/il.com"]))
+            .set_dns(&cfg(
+                &[rustscale_tsaddr::tailscale_service_ip()],
+                &[],
+                &["ev/il.com"],
+            ))
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }

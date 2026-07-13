@@ -111,6 +111,7 @@ pub(crate) async fn create_tun_device(
 fn apply_tun_routes(ifname: &str, tailscale_ips: &[IpAddr], _mtu: usize) -> Result<(), TsnetError> {
     let our_v4 = first_v4(tailscale_ips)?;
     let v4_str = our_v4.to_string();
+    let cgnat = rustscale_tsaddr::cgnat_range().to_string();
 
     #[cfg(target_os = "macos")]
     {
@@ -120,7 +121,7 @@ fn apply_tun_routes(ifname: &str, tailscale_ips: &[IpAddr], _mtu: usize) -> Resu
         )?;
         run_cmd(
             "route",
-            &["-q", "add", "-net", "100.64.0.0/10", "-interface", ifname],
+            &["-q", "add", "-net", &cgnat, "-interface", ifname],
         )?;
     }
     #[cfg(target_os = "linux")]
@@ -130,7 +131,7 @@ fn apply_tun_routes(ifname: &str, tailscale_ips: &[IpAddr], _mtu: usize) -> Resu
             "ip",
             &["addr", "add", &format!("{v4_str}/32"), "dev", ifname],
         )?;
-        run_cmd("ip", &["route", "add", "100.64.0.0/10", "dev", ifname])?;
+        run_cmd("ip", &["route", "add", &cgnat, "dev", ifname])?;
     }
     Ok(())
 }
@@ -149,7 +150,7 @@ fn apply_accepted_subnet_routes(ifname: &str, rt: &RouteTable) -> Result<(), Tsn
         let cidr = format!("{net}/{prefix}");
         // Skip tailnet-range prefixes — those are handled by apply_tun_routes
         // (100.64.0.0/10) and don't need per-prefix OS routes.
-        if is_tailnet_cidr(net, prefix) {
+        if rustscale_tsaddr::is_tailscale_ip(net) {
             continue;
         }
         #[cfg(target_os = "macos")]
@@ -211,28 +212,6 @@ fn apply_exit_node_routes(ifname: &str) -> Result<(), TsnetError> {
         let _ = run_cmd("ip", &["-6", "route", "add", "::/0", "dev", ifname]);
     }
     Ok(())
-}
-
-/// Whether a CIDR's network address falls within the tailnet ranges
-/// (100.64.0.0/10 or fd7a:115c:a1e0::/48). Used by `apply_accepted_subnet_routes`
-/// to skip tailnet-range prefixes (handled by the blanket tailnet route).
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn is_tailnet_cidr(net: IpAddr, _prefix: u8) -> bool {
-    match net {
-        IpAddr::V4(v4) => {
-            // 100.64.0.0/10 — mask the network address and compare.
-            let mask = u32::MAX << (32 - 10);
-            (u32::from(v4) & mask) == (u32::from(std::net::Ipv4Addr::new(100, 64, 0, 0)) & mask)
-        }
-        IpAddr::V6(v6) => {
-            // fd7a:115c:a1e0::/48 — compare the first 6 bytes.
-            let tail: [u8; 16] = "fd7a:115c:a1e0::"
-                .parse::<std::net::Ipv6Addr>()
-                .unwrap()
-                .octets();
-            v6.octets()[..6] == tail[..6]
-        }
-    }
 }
 
 /// Run a command, returning an error if it exits non-zero.

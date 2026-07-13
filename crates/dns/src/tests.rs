@@ -544,12 +544,7 @@ fn map_via_produces_correct_address() {
 fn tailscale_6to4_roundtrip() {
     // 100.64.0.5 → 4to6 → fd7a:115c:a1e0:ab12:4843:cd96:6264:0005
     let v4 = Ipv4Addr::new(100, 64, 0, 5);
-    let mut a = [0u8; 16];
-    a[..13].copy_from_slice(&TS_4TO6_PREFIX);
-    a[13] = 64;
-    a[14] = 0;
-    a[15] = 5;
-    let v6 = Ipv6Addr::from(a);
+    let v6 = rustscale_tsaddr::tailscale_4to6(v4);
 
     let back = tailscale_6to4(v6);
     assert_eq!(back, Some(v4));

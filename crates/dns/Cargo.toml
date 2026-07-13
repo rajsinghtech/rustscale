@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 rustscale-tailcfg = { path = "../tailcfg", version = "0.1.0" }
 rustscale-neterror = { path = "../neterror", version = "0.1.0" }
+rustscale-tsaddr = { path = "../tsaddr", version = "0.1.0" }
 thiserror.workspace = true
 tokio.workspace = true
 tokio-rustls = { workspace = true }

@@ -14,8 +14,6 @@ use macos::control_and_connect;
 use other::control_and_connect;
 
 use std::net::{IpAddr, SocketAddr};
-#[cfg(target_os = "macos")]
-use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 static ENABLED: AtomicBool = AtomicBool::new(true);
@@ -104,18 +102,6 @@ pub async fn dial_tcp_addr(addr: SocketAddr) -> Result<tokio::net::TcpStream, st
         return Ok(stream);
     }
     control_and_connect(addr).await
-}
-
-#[cfg(target_os = "macos")]
-fn is_cgnat_v4(ip: Ipv4Addr) -> bool {
-    let o = ip.octets();
-    o[0] == 100 && (o[1] & 0xC0) == 0x40
-}
-
-#[cfg(target_os = "macos")]
-fn is_tailscale_ula(ip: Ipv6Addr) -> bool {
-    let o = ip.octets();
-    o[0] == 0xfd && o[1] == 0x7a && o[2] == 0x11 && o[3] == 0x5c && o[4] == 0xa1 && o[5] == 0xe0
 }
 
 #[cfg(test)]

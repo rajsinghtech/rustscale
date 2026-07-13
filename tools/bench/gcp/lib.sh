@@ -77,7 +77,7 @@ HN=$(hostname)
 grep -q "\b$HN\b" /etc/hosts || echo "127.0.1.1 $HN" >> /etc/hosts
 apt-get update -qq
 DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-  iperf3 tcpdump zstd sysstat procps jq curl python3 socat ncat git \
+  iperf3 tcpdump zstd sysstat procps psmisc jq curl python3 socat ncat git \
   build-essential pkg-config ca-certificates iptables iproute2 iputils-ping
 # Install rustup to a world-readable location so non-root SSH users can build.
 export RUSTUP_HOME=/opt/rust

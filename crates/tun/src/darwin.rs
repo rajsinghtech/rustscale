@@ -15,10 +15,15 @@ use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use async_trait::async_trait;
 use tokio::io::unix::AsyncFd;
 
-use crate::{Tun, TunConfig, TunError, AF_HEADER_LEN};
+use crate::{prepare_read_buffer, Tun, TunConfig, TunError, AF_HEADER_LEN};
 
-/// Maximum IP packet size we read from the kernel (header + payload).
-const MAX_READ: usize = 65_535;
+/// Largest IP packet accepted by the utun framing API.
+const MAX_IP_PACKET_LEN: usize = 65_535;
+/// Maximum utun frame: a maximum IP packet plus its 4-byte AF header.
+///
+/// Unlike Linux, this implementation does not apply `TunConfig::mtu` to the
+/// kernel interface, so that configuration is not a safe syscall read bound.
+const MAX_READ: usize = MAX_IP_PACKET_LEN + AF_HEADER_LEN;
 
 /// The kernel-control name for utun devices.
 const UTUN_CONTROL_NAME: &[u8] = b"com.apple.net.utun_control\0";
@@ -66,23 +71,43 @@ impl TunDevice {
 
 #[async_trait]
 impl Tun for TunDevice {
-    async fn read_packet(&self) -> io::Result<Vec<u8>> {
-        let mut buf = vec![0u8; MAX_READ];
+    async fn read_packet(&self, packet: &mut Vec<u8>) -> io::Result<()> {
+        // utun does not receive a configured MTU here; retain one maximum-size
+        // frame allocation rather than risking truncation based on `self.mtu`.
+        let read_len = MAX_READ;
+        // The vector remains valid and empty on cancellation, a stale
+        // readiness retry, EOF, or syscall error.
+        prepare_read_buffer(packet, read_len);
         loop {
             let mut guard = self.afd.readable().await?;
             match guard.try_io(|afd| {
                 let fd = afd.get_ref().as_raw_fd();
-                // SAFETY: reading into our own initialized-length buffer via the
-                // raw fd; `read` writes at most `buf.len()` bytes.
-                let n =
-                    unsafe { libc::read(fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
+                let spare = &mut packet.spare_capacity_mut()[..read_len];
+                // SAFETY: `spare` is precisely the vector's uninitialized
+                // capacity used for this read. A successful read initializes
+                // exactly the result count, which is the only count later
+                // passed to set_len.
+                let n = unsafe {
+                    libc::read(fd, spare.as_mut_ptr().cast::<libc::c_void>(), spare.len())
+                };
                 if n < 0 {
                     Err(io::Error::last_os_error())
                 } else {
                     Ok(n as usize)
                 }
             }) {
-                Ok(Ok(n)) => return strip_packet(&buf[..n]),
+                Ok(Ok(n)) => {
+                    if n == 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "utun device closed",
+                        ));
+                    }
+                    // SAFETY: the successful read above initialized exactly
+                    // `n` bytes in `packet`'s spare capacity.
+                    unsafe { packet.set_len(n) };
+                    return strip_packet_in_place(packet);
+                }
                 Ok(Err(e)) => return Err(e),
                 Err(_would_block) => {}
             }
@@ -230,20 +255,59 @@ fn set_nonblock_cloexec(fd: RawFd) -> io::Result<()> {
     Ok(())
 }
 
-/// Validate and strip the 4-byte AF header from a raw utun read.
-fn strip_packet(raw: &[u8]) -> io::Result<Vec<u8>> {
-    if raw.len() < AF_HEADER_LEN {
+/// Validate a utun frame and remove its 4-byte AF header in place.
+fn strip_packet_in_place(packet: &mut Vec<u8>) -> io::Result<()> {
+    if packet.len() < AF_HEADER_LEN {
+        packet.clear();
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
             "short utun read (no AF header)",
         ));
     }
-    let af = raw[3];
+    let af = packet[3];
     if af != crate::AF_INET && af != crate::AF_INET6 {
+        packet.clear();
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unknown address family {af:#x}"),
         ));
     }
-    Ok(raw[AF_HEADER_LEN..].to_vec())
+    packet.copy_within(AF_HEADER_LEN.., 0);
+    packet.truncate(packet.len() - AF_HEADER_LEN);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_packet_compacts_a_valid_frame_in_place() {
+        let mut packet = Vec::with_capacity(1284);
+        packet.extend_from_slice(&[0, 0, 0, crate::AF_INET, 0x45, 1, 2]);
+        let capacity = packet.capacity();
+
+        strip_packet_in_place(&mut packet).unwrap();
+
+        assert_eq!(packet, [0x45, 1, 2]);
+        assert_eq!(packet.capacity(), capacity);
+    }
+
+    #[test]
+    fn strip_packet_rejects_short_and_unknown_frames() {
+        let mut short = vec![0, 0, 0];
+        let error = strip_packet_in_place(&mut short).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(short.is_empty());
+
+        let mut unknown = vec![0, 0, 0, 99, 0x45];
+        let error = strip_packet_in_place(&mut unknown).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(unknown.is_empty());
+    }
+
+    #[test]
+    fn read_buffer_includes_maximum_ip_packet_and_utun_header() {
+        assert_eq!(MAX_READ, MAX_IP_PACKET_LEN + AF_HEADER_LEN);
+    }
 }

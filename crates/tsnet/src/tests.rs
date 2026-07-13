@@ -3421,7 +3421,8 @@ async fn tun_mock_inject_and_read() {
         b"inject-test",
     );
     tx.send(pkt.clone()).await.unwrap();
-    let got = tun.read_packet().await.unwrap();
+    let mut got = Vec::new();
+    tun.read_packet(&mut got).await.unwrap();
     assert_eq!(got, pkt);
 }
 

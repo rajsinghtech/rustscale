@@ -14,7 +14,7 @@ use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use async_trait::async_trait;
 use tokio::io::unix::AsyncFd;
 
-use crate::{Tun, TunConfig, TunError};
+use crate::{prepare_read_buffer, Tun, TunConfig, TunError};
 
 /// Linux interface-name field size (`IFNAMSIZ`).
 const IFNAMSIZ: usize = 16;
@@ -81,15 +81,23 @@ impl TunDevice {
 
 #[async_trait]
 impl Tun for TunDevice {
-    async fn read_packet(&self) -> io::Result<Vec<u8>> {
-        let mut buf = vec![0u8; read_buffer_len(self.mtu)?];
+    async fn read_packet(&self, packet: &mut Vec<u8>) -> io::Result<()> {
+        let read_len = read_buffer_len(self.mtu)?;
+        // Keep the vector valid if this future is cancelled while waiting, or
+        // if readiness proves stale and we retry below.
+        prepare_read_buffer(packet, read_len);
         loop {
             let mut guard = self.afd.readable().await?;
             match guard.try_io(|afd| {
                 let fd = afd.get_ref().as_raw_fd();
-                // SAFETY: read into our buffer via the raw fd.
-                let n =
-                    unsafe { libc::read(fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
+                let spare = &mut packet.spare_capacity_mut()[..read_len];
+                // SAFETY: `spare` names exactly the vector's uninitialized
+                // capacity used for this read. `read` initializes at most
+                // `read_len` bytes; only the successful nonzero result is
+                // exposed with set_len.
+                let n = unsafe {
+                    libc::read(fd, spare.as_mut_ptr().cast::<libc::c_void>(), spare.len())
+                };
                 if n < 0 {
                     Err(io::Error::last_os_error())
                 } else {
@@ -103,8 +111,10 @@ impl Tun for TunDevice {
                             "tun device closed",
                         ));
                     }
-                    buf.truncate(n);
-                    return Ok(buf);
+                    // SAFETY: the successful read above initialized exactly
+                    // `n` bytes in `packet`'s spare capacity.
+                    unsafe { packet.set_len(n) };
+                    return Ok(());
                 }
                 Ok(Err(e)) => return Err(e),
                 Err(_would_block) => {}

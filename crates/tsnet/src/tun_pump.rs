@@ -18,6 +18,7 @@ pub(crate) async fn run_tun_pump(
 ) {
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(250));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut packet = Vec::with_capacity(tun.mtu());
 
     loop {
         if cancel.is_cancelled() {
@@ -26,14 +27,14 @@ pub(crate) async fn run_tun_pump(
 
         tokio::select! {
             // TUN read -> route -> WG encapsulate -> magicsock send.
-            result = tun.read_packet() => {
+            result = tun.read_packet(&mut packet) => {
                 match result {
-                    Ok(pkt) => {
+                    Ok(()) => {
                         {
                             let mut filt = filter.lock().unwrap();
-                            filt.update_outbound(&pkt);
+                            filt.update_outbound(&packet);
                         }
-                        encapsulate_and_send(&magicsock, &wg_tunnels, &route_table, &pkt).await;
+                        encapsulate_and_send(&magicsock, &wg_tunnels, &route_table, &packet).await;
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                     Err(e) => {

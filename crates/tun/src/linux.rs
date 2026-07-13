@@ -155,6 +155,10 @@ impl Tun for TunDevice {
     }
 
     async fn write_packet(&self, packet: &[u8]) -> io::Result<()> {
+        if self.vnet_hdr {
+            return self.write_vnet_packet(packet).await;
+        }
+
         loop {
             let mut guard = self.afd.writable().await?;
             match guard.try_io(|afd| {
@@ -185,6 +189,39 @@ impl Tun for TunDevice {
 }
 
 impl TunDevice {
+    /// Write one plain IP packet using the Linux VNET framing contract.
+    ///
+    /// The virtio header is deliberately stack allocated: every inbound packet
+    /// is non-GSO and needs neither checksum work nor any other metadata.
+    async fn write_vnet_packet(&self, packet: &[u8]) -> io::Result<()> {
+        let header = [0_u8; offload::VIRTIO_NET_HDR_LEN];
+        let expected = vnet_write_len(packet.len())?;
+
+        loop {
+            let mut guard = self.afd.writable().await?;
+            match guard.try_io(|afd| {
+                let iovecs = vnet_write_iovecs(&header, packet);
+                // SAFETY: both iovecs reference live immutable buffers for
+                // this call, and their count matches the array length.
+                let n = unsafe {
+                    libc::writev(
+                        afd.get_ref().as_raw_fd(),
+                        iovecs.as_ptr(),
+                        iovecs.len() as libc::c_int,
+                    )
+                };
+                if n < 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(n as usize)
+                }
+            }) {
+                Ok(result) => return validate_vnet_write(result, expected),
+                Err(_would_block) => {}
+            }
+        }
+    }
+
     async fn read_vnet_batch(&self, batch: &mut TunPacketBatch) -> io::Result<()> {
         batch.clear();
         let mut raw = self.raw_frame.lock().await;
@@ -297,6 +334,51 @@ fn validate_packet_write(result: io::Result<usize>, packet_len: usize) -> io::Re
     Err(io::Error::new(
         io::ErrorKind::WriteZero,
         format!("short TUN packet write: wrote {written} of {packet_len} bytes"),
+    ))
+}
+
+/// Return the total VNET frame length, rejecting values that `writev` cannot
+/// report as a positive `ssize_t` result.
+fn vnet_write_len(packet_len: usize) -> io::Result<usize> {
+    let total = offload::VIRTIO_NET_HDR_LEN
+        .checked_add(packet_len)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "VNET frame length overflow"))?;
+    if total > libc::ssize_t::MAX as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "VNET frame length exceeds ssize_t",
+        ));
+    }
+    Ok(total)
+}
+
+/// Build the exact two-vector Linux VNET frame without copying `packet`.
+fn vnet_write_iovecs(
+    header: &[u8; offload::VIRTIO_NET_HDR_LEN],
+    packet: &[u8],
+) -> [libc::iovec; 2] {
+    [
+        libc::iovec {
+            iov_base: header.as_ptr().cast_mut().cast::<libc::c_void>(),
+            iov_len: header.len(),
+        },
+        libc::iovec {
+            iov_base: packet.as_ptr().cast_mut().cast::<libc::c_void>(),
+            iov_len: packet.len(),
+        },
+    ]
+}
+
+/// Validate that a VNET write consumed both its header and its packet.
+fn validate_vnet_write(result: io::Result<usize>, expected: usize) -> io::Result<()> {
+    let written = result?;
+    if written == expected {
+        return Ok(());
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::WriteZero,
+        format!("short VNET TUN write: wrote {written} of {expected} bytes"),
     ))
 }
 
@@ -510,5 +592,54 @@ mod tests {
             validate_packet_write(Err(io::Error::other("TUN write failed")), 1280).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Other);
         assert_eq!(error.to_string(), "TUN write failed");
+    }
+
+    #[test]
+    fn vnet_write_uses_a_zeroed_ten_byte_header_and_two_iovecs() {
+        let header = [0_u8; offload::VIRTIO_NET_HDR_LEN];
+        let packet = [0x45, 0, 0, 20];
+        let iovecs = vnet_write_iovecs(&header, &packet);
+
+        assert_eq!(header, [0; 10]);
+        assert_eq!(iovecs.len(), 2);
+        assert_eq!(iovecs[0].iov_base, header.as_ptr().cast_mut().cast());
+        assert_eq!(iovecs[0].iov_len, offload::VIRTIO_NET_HDR_LEN);
+        assert_eq!(iovecs[1].iov_base, packet.as_ptr().cast_mut().cast());
+        assert_eq!(iovecs[1].iov_len, packet.len());
+    }
+
+    #[test]
+    fn full_vnet_write_requires_header_and_packet() {
+        let expected = vnet_write_len(1280).unwrap();
+        assert_eq!(expected, 1290);
+        validate_vnet_write(Ok(expected), expected).unwrap();
+    }
+
+    #[test]
+    fn short_vnet_write_is_an_error() {
+        let expected = vnet_write_len(1280).unwrap();
+        let error = validate_vnet_write(Ok(expected - 1), expected).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WriteZero);
+    }
+
+    #[test]
+    fn vnet_syscall_error_is_preserved() {
+        let error = validate_vnet_write(Err(io::Error::other("writev failed")), 1290).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(error.to_string(), "writev failed");
+    }
+
+    #[test]
+    fn vnet_write_rejects_overflow_and_unreportable_lengths() {
+        assert_eq!(
+            vnet_write_len(usize::MAX).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            vnet_write_len(libc::ssize_t::MAX as usize)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
     }
 }

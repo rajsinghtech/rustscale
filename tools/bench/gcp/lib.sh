@@ -2,7 +2,7 @@
 # tools/bench/gcp/lib.sh — GCP VM helpers for the bench harness.
 #
 # Sourced by run-matrix.sh and run-config.sh. NOT meant to be run directly.
-# Provides: create_vms, delete_vms, ssh_cmd, scp_to, deliver_source,
+# Provides: create_vms, delete_vms, ssh_cmd, scp_to, scp_from, deliver_source,
 #           apply_derp_block, remove_derp_block, vm_exec.
 #
 # Requires: gcloud (authenticated), GCP_PROJECT set (auto-detected from gcloud
@@ -316,6 +316,19 @@ scp_to() {
     -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes \
     -o ConnectTimeout=30 \
     "$local_path" "$user@$ip:$remote_path"
+}
+
+# Copy a VM file to local storage. Args: NAME ZONE REMOTE_PATH LOCAL_PATH.
+scp_from() {
+  local name="$1" zone="$2" remote_path="$3" local_path="$4"
+  if [[ -n "$GCP_DRY_RUN" ]]; then
+    echo "[dry-run] scp $name:$remote_path -> $local_path" >&2
+    : >"$local_path"
+    return 0
+  fi
+  ssh_cmd "$name" "$zone" ':' >/dev/null
+  scp -i "$_SSH_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes \
+    -o ConnectTimeout=30 "${_SSH_USER[$name]}@${_SSH_IP[$name]}:$remote_path" "$local_path"
 }
 
 # ---------------------------------------------------------------------------

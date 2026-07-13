@@ -3,7 +3,7 @@
 #
 # Usage:
 #   run-config.sh CONFIG SERVER_VM CLIENT_VM SERVER_ZONE CLIENT_ZONE \
-#                 AUTHKEY RESULTS_DIR SERVER_HOSTNAME CLIENT_HOSTNAME
+#                 AUTHKEY RESULTS_DIR SERVER_HOSTNAME CLIENT_HOSTNAME [--profile]
 #
 # CONFIG ∈ {rs-userspace, rs-tun, ts-userspace, ts-tun}
 # Emits <RESULTS_DIR>/<CONFIG>.json with the schema from docs/phase-gcp-bench.md.
@@ -30,6 +30,7 @@ usage: $0 CONFIG SERVER_VM CLIENT_VM SERVER_ZONE CLIENT_ZONE \
 AUTHKEY RESULTS_DIR SERVER_HOSTNAME CLIENT_HOSTNAME
 
 CONFIG: rs-userspace | rs-tun | ts-userspace | ts-tun
+--profile: rs-tun only; collect a Linux perf profile after normal metrics
 EOF
   exit 2
 }
@@ -50,6 +51,7 @@ if (( SELF_TEST )); then
   RDIR=$(mktemp -d)
   SHOST=self-test-server
   CHOST=self-test-client
+  PROFILE=1
 else
   [[ $# -ge 9 ]] || usage
   CONFIG="$1"
@@ -61,6 +63,14 @@ else
   RDIR="$7"
   SHOST="$8"
   CHOST="$9"
+  shift 9
+  PROFILE=0
+  if [[ "${1:-}" == --profile ]]; then PROFILE=1; shift; fi
+  [[ $# -eq 0 ]] || usage
+fi
+if (( PROFILE )) && [[ "$CONFIG" != rs-tun ]]; then
+  echo "--profile is only valid for rs-tun" >&2
+  exit 2
 fi
 
 PARALLELS=(1 10 100)
@@ -508,12 +518,11 @@ if (( SELF_TEST )); then
   cleanup_self_test
   result_shape_self_test
   rm -rf "$RDIR"
-  echo "run-config self-tests: OK" >&2
-  exit 0
 fi
 
 if [[ -n "${GCP_DRY_RUN:-}" ]]; then
   echo "[dry-run] would run $CONFIG on $SVM/$CVM ($TOPOLOGY/$PATH_TAG)" >&2
+  (( PROFILE )) && echo "[dry-run] would profile rs-tun after normal metrics" >&2
   emit_stub "dry-run"
   exit 0
 fi
@@ -628,6 +637,68 @@ PYEOF
   echo "[gcp] $label: wrote $OUT" >&2
 }
 
+# Profile only the production rs-tun server after normal measurements. The
+# authkey is deliberately absent from commands, metadata, and artifacts.
+profile_prepare() {
+  ssh_sudo "$SVM" "$SZONE" "if command -v perf >/dev/null; then exit 0; fi; apt-get update -qq; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq linux-perf || DEBIAN_FRONTEND=noninteractive apt-get install -y -qq linux-tools-common linux-tools-\$(uname -r) || DEBIAN_FRONTEND=noninteractive apt-get install -y -qq linux-tools-common || true; command -v perf >/dev/null"
+}
+
+profile_remote_cleanup() {
+  ssh_sudo "$SVM" "$SZONE" "pid=\$(cat /tmp/rs-tun-perf.pid 2>/dev/null || true); case \$pid in *[!0-9]*|\"\") ;; *) kill \$pid 2>/dev/null || true ;; esac; rm -f /tmp/rs-tun-perf.pid /tmp/rs-tun-perf.data /tmp/rs-tun-perf-children.txt /tmp/rs-tun-perf-self.txt /tmp/rs-tun-perf.log /tmp/rs-tun-profile-iperf.json" || true
+}
+
+profile_rs_tun() {
+  local profile_dir="$RDIR/profile" srv_pid remote_data=/tmp/rs-tun-perf.data commit
+  mkdir -p "$profile_dir"
+  if ! srv_pid=$(ssh_sudo "$SVM" "$SZONE" "cat /tmp/rs-tun-srv.pid"); then
+    profile_remote_cleanup; return 1
+  fi
+  case "$srv_pid" in *[!0-9]*|"") profile_remote_cleanup; return 1 ;; esac
+  if ! ssh_sudo "$SVM" "$SZONE" "rm -f $remote_data /tmp/rs-tun-perf-children.txt /tmp/rs-tun-perf-self.txt; nohup perf record -F 199 -g -p $srv_pid -o $remote_data -- sleep $((DURATION + 3)) >/tmp/rs-tun-perf.log 2>&1 & echo \$! >/tmp/rs-tun-perf.pid"; then
+    profile_remote_cleanup; return 1
+  fi
+  # This extra P10 is intentionally outside tun_measure and result JSON.
+  if ! run_tun_command 0 "$CVM" "$CZONE" "iperf3 -c $server_ip -p $PORT -t $DURATION -P 10 -R -J >/tmp/rs-tun-profile-iperf.json"; then
+    profile_remote_cleanup; return 1
+  fi
+  if ! ssh_sudo "$SVM" "$SZONE" "elapsed=0; while kill -0 \$(cat /tmp/rs-tun-perf.pid) 2>/dev/null; do (( elapsed < $((DURATION + 30)) )) || exit 1; sleep 1; elapsed=\$((elapsed + 1)); done; test -s $remote_data && perf report --stdio --children -i $remote_data > /tmp/rs-tun-perf-children.txt && perf report --stdio --no-children -i $remote_data > /tmp/rs-tun-perf-self.txt && chmod 0644 $remote_data /tmp/rs-tun-perf-children.txt /tmp/rs-tun-perf-self.txt"; then
+    profile_remote_cleanup; return 1
+  fi
+  if ! scp_from "$SVM" "$SZONE" "$remote_data" "$profile_dir/perf.data" ||
+     ! scp_from "$SVM" "$SZONE" /tmp/rs-tun-perf-children.txt "$profile_dir/perf-children.txt" ||
+     ! scp_from "$SVM" "$SZONE" /tmp/rs-tun-perf-self.txt "$profile_dir/perf-self.txt" ||
+     [[ ! -s "$profile_dir/perf.data" || ! -s "$profile_dir/perf-children.txt" || ! -s "$profile_dir/perf-self.txt" ]]; then
+    profile_remote_cleanup; return 1
+  fi
+  if ! commit=$(git -C "$(cd "$(dirname "$0")/../../.." && pwd)" rev-parse HEAD); then
+    profile_remote_cleanup; return 1
+  fi
+  if ! python3 - "$profile_dir/metadata.json" "$commit" "$TOPOLOGY" "$PATH_TAG" "$CONFIG" "$DURATION" "$srv_pid" "$OUT" <<'PYEOF'
+import json, sys
+out, commit, topo, path, config, duration, pid, result = sys.argv[1:]
+json.dump({"commit":commit,"topology":topo,"path":path,"config":config,
+           "parallel":10,"duration_s":int(duration),"frequency_hz":199,
+           "pid":int(pid),"command":"rustscaled","result_json":result}, open(out,"w"), indent=2)
+PYEOF
+  then
+    profile_remote_cleanup; return 1
+  fi
+  profile_remote_cleanup
+}
+
+profile_command_self_test() {
+  local log=""
+  ssh_sudo() { log+=" sudo:$3"; [[ "$3" == *'perf report'* ]] && return 1; [[ "$3" == *'cat /tmp/rs-tun-srv.pid'* ]] && { printf '42\n'; return 0; }; return 0; }
+  run_tun_command() { log+=" iperf:$4"; return 0; }
+  scp_from() { log+=" copy:$3"; : >"$4"; }
+  server_ip=100.64.0.1
+  if profile_rs_tun; then return 1; fi
+  [[ "$log" == *'perf record -F 199 -g -p'* && "$log" == *'iperf3 -c 100.64.0.1 -p 5201 -t 10 -P 10 -R'* ]] || return 1
+  [[ "${log#*perf record}" == *'iperf:'* ]] || return 1
+  [[ "$log" == *'rm -f /tmp/rs-tun-perf.pid'* ]] || return 1
+  unset -f ssh_sudo run_tun_command scp_from
+}
+
 # ===========================================================================
 # Config: rs-userspace — rustscale-bench server + client
 # ===========================================================================
@@ -735,6 +806,11 @@ PYEOF
 # ===========================================================================
 run_rs_tun() {
   echo "[gcp] rs-tun: starting production rustscaled daemons" >&2
+  if (( PROFILE )) && ! profile_prepare; then
+    emit_stub "rs-tun-perf-prepare-failed"
+    cleanup_rs_tun || return "$FATAL_HANDOFF_STATUS"
+    return 1
+  fi
   ssh_sudo "$SVM" "$SZONE"  'rm -rf /tmp/rs-tun-srv; rm -f /tmp/rs-tun-srv.log /tmp/rs-tun-srv.pid /tmp/rs-tun-srv.sock'
   ssh_sudo "$CVM" "$CZONE"  'rm -rf /tmp/rs-tun-cli; rm -f /tmp/rs-tun-cli.log /tmp/rs-tun-cli.pid /tmp/rs-tun-cli.sock'
   ssh_sudo "$SVM" "$SZONE" \
@@ -775,6 +851,12 @@ run_rs_tun() {
 
   tun_measure rs-tun 0 "$server_ip" /tmp/rs-tun-srv.pid \
     /tmp/rs-tun-srv.footprint /opt/rustscale/target/release/rustscaled
+
+  if (( PROFILE )) && ! profile_rs_tun; then
+    emit_stub "rs-tun-profile-failed" "$(capture_log_tail "$SVM" "$SZONE" /tmp/rs-tun-perf.log)"
+    cleanup_rs_tun || return "$FATAL_HANDOFF_STATUS"
+    return 1
+  fi
 
   # Cleanup.
   if ! cleanup_rs_tun; then
@@ -1066,6 +1148,11 @@ run_ts_tun() {
 # ---------------------------------------------------------------------------
 # Dispatch.
 # ---------------------------------------------------------------------------
+if (( SELF_TEST )); then
+  profile_command_self_test
+  echo "run-config self-tests: OK" >&2
+  exit 0
+fi
 case "$CONFIG" in
   rs-userspace)  run_rs_userspace ;;
   rs-tun)        run_rs_tun ;;

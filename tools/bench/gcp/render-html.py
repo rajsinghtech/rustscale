@@ -39,11 +39,40 @@ CONFIG_LABELS = {
 }
 TOPOLOGIES = ["same-zone", "cross-region"]
 PATHS = ["direct", "derp"]
-def load_summary() -> list:
+DEFAULT_MATRIX = {"topologies": TOPOLOGIES, "paths": PATHS, "configs": CONFIGS}
+
+
+def valid_matrix(data: dict) -> dict | None:
+    try:
+        if data.get("schema_version") != 1:
+            return None
+        matrix = {key: data[key] for key in DEFAULT_MATRIX}
+        for key, values in matrix.items():
+            if (not isinstance(values, list) or not values or
+                    len(values) != len(set(values)) or
+                    any(value not in DEFAULT_MATRIX[key] for value in values)):
+                return None
+        return matrix
+    except (AttributeError, KeyError, TypeError):
+        return None
+
+
+def load_summary() -> tuple[list, dict]:
     if len(sys.argv) > 1 and sys.argv[1] not in ("-", ""):
-        with open(sys.argv[1], "r", encoding="utf-8") as f:
-            return json.load(f)
-    return json.load(sys.stdin)
+        summary = os.path.abspath(sys.argv[1])
+        with open(summary, "r", encoding="utf-8") as f:
+            runs = json.load(f)
+        manifest = os.path.join(os.path.dirname(summary), "matrix.json")
+        try:
+            with open(manifest, encoding="utf-8") as f:
+                data = json.load(f)
+            matrix = valid_matrix(data)
+            if matrix is not None:
+                return runs, matrix
+        except (OSError, json.JSONDecodeError):
+            pass
+        return runs, DEFAULT_MATRIX
+    return json.load(sys.stdin), DEFAULT_MATRIX
 
 
 def index_runs(runs: list) -> dict:
@@ -98,13 +127,13 @@ def fmt_mbps(n: float) -> str:
 # ---------------------------------------------------------------------------
 # Bar-chart data preparation.
 # ---------------------------------------------------------------------------
-def throughput_chart_data(runs_idx: dict, parallels: list[int], topo: str, path: str) -> dict:
+def throughput_chart_data(runs_idx: dict, parallels: list[int], topo: str, path: str, configs: list[str]) -> dict:
     """Return {parallels: [...], series: {config: [mbps per parallel]},
     failed: {config: bool}, errors: {config: str}}."""
     series = {}
     failed = {}
     errors = {}
-    for cfg in CONFIGS:
+    for cfg in configs:
         run = runs_idx.get((topo, path, cfg))
         vals = []
         if run:
@@ -122,23 +151,24 @@ def throughput_chart_data(runs_idx: dict, parallels: list[int], topo: str, path:
         series[cfg] = vals
     return {
         "parallels": parallels,
+        "configs": configs,
         "series": series,
         "failed": failed,
         "errors": errors,
     }
 
 
-def latency_chart_data(runs_idx: dict) -> dict:
+def latency_chart_data(runs_idx: dict, matrix: dict) -> dict:
     """Return {topos_paths: [...], series: {config: {p50,p95,p99 per combo}}}."""
     combos = []
-    for topo in TOPOLOGIES:
-        for path in PATHS:
+    for topo in matrix["topologies"]:
+        for path in matrix["paths"]:
             combos.append(f"{topo} / {path}")
     series = {}
-    for cfg in CONFIGS:
+    for cfg in matrix["configs"]:
         rows = []
-        for topo in TOPOLOGIES:
-            for path in PATHS:
+        for topo in matrix["topologies"]:
+            for path in matrix["paths"]:
                 run = runs_idx.get((topo, path, cfg))
                 lat = run.get("latency", {}) if run else {}
                 rows.append({
@@ -147,15 +177,15 @@ def latency_chart_data(runs_idx: dict) -> dict:
                     "p99": float(lat.get("p99_us", 0)),
                 })
         series[cfg] = rows
-    return {"combos": combos, "series": series}
+    return {"combos": combos, "configs": matrix["configs"], "series": series}
 
 
-def footprint_rows(runs_idx: dict) -> list:
+def footprint_rows(runs_idx: dict, matrix: dict) -> list:
     """Return one row per (topo, path, config) with footprint metrics."""
     rows = []
-    for topo in TOPOLOGIES:
-        for path in PATHS:
-            for cfg in CONFIGS:
+    for topo in matrix["topologies"]:
+        for path in matrix["paths"]:
+            for cfg in matrix["configs"]:
                 run = runs_idx.get((topo, path, cfg))
                 if not run:
                     continue
@@ -353,12 +383,12 @@ def render_chart_js_block(canvas_id: str, data: dict, kind: str) -> str:
 </script>"""
 
 
-def emit_throughput_charts(runs_idx: dict, parallels: list[int]) -> str:
+def emit_throughput_charts(runs_idx: dict, parallels: list[int], matrix: dict) -> str:
     parts = ['<div class="chart-grid" id="throughput-grid">']
-    for topo in TOPOLOGIES:
-        for path in PATHS:
+    for topo in matrix["topologies"]:
+        for path in matrix["paths"]:
             cid = f"tp-{topo}-{path}"
-            data = throughput_chart_data(runs_idx, parallels, topo, path)
+            data = throughput_chart_data(runs_idx, parallels, topo, path, matrix["configs"])
             data["title"] = f"{topo} / {path}"
             n_failed = len(data["failed"])
             fail_badge = ""
@@ -373,7 +403,7 @@ def emit_throughput_charts(runs_idx: dict, parallels: list[int]) -> str:
     parts.append("</div>")
     # Legend.
     parts.append('<div class="legend">')
-    for cfg in CONFIGS:
+    for cfg in matrix["configs"]:
         parts.append(
             f'<div class="item"><span class="swatch" style="background:{CONFIG_COLORS[cfg]}"></span>'
             f'{html.escape(CONFIG_LABELS[cfg])}</div>'
@@ -382,16 +412,16 @@ def emit_throughput_charts(runs_idx: dict, parallels: list[int]) -> str:
     # Scripts (after DOM — but we emit them inline; the draw fn is defined
     # later in the global script).
     scripts = []
-    for topo in TOPOLOGIES:
-        for path in PATHS:
+    for topo in matrix["topologies"]:
+        for path in matrix["paths"]:
             cid = f"tp-{topo}-{path}"
-            data = throughput_chart_data(runs_idx, parallels, topo, path)
+            data = throughput_chart_data(runs_idx, parallels, topo, path, matrix["configs"])
             scripts.append(render_chart_js_block(cid, data, "throughput"))
     return "".join(parts) + "".join(scripts)
 
 
-def emit_latency_chart(runs_idx: dict) -> str:
-    data = latency_chart_data(runs_idx)
+def emit_latency_chart(runs_idx: dict, matrix: dict) -> str:
+    data = latency_chart_data(runs_idx, matrix)
     parts = [
         '<div class="chart-card">',
         '  <h3>Latency p50 / p95 / p99 (µs) — grouped by topology / path</h3>',
@@ -408,8 +438,8 @@ def emit_latency_chart(runs_idx: dict) -> str:
     return "".join(parts)
 
 
-def emit_footprint_table(runs_idx: dict) -> str:
-    rows = footprint_rows(runs_idx)
+def emit_footprint_table(runs_idx: dict, matrix: dict) -> str:
+    rows = footprint_rows(runs_idx, matrix)
     if not rows:
         return '<div class="empty">No footprint data.</div>'
     # Compute best (min) per metric within each (topo, path) group.
@@ -539,11 +569,12 @@ def emit_failed_runs(runs: list) -> str:
     return "".join(parts)
 
 
-def emit_header(runs: list) -> str:
+def emit_header(runs: list, matrix: dict) -> str:
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     n = len(runs)
     n_failed = sum(1 for r in runs if r.get("error"))
-    n_missing = 16 - n  # 2 topos × 2 paths × 4 configs
+    expected = len(matrix["topologies"]) * len(matrix["paths"]) * len(matrix["configs"])
+    n_missing = max(0, expected - n)
     tool_versions = {}
     for r in runs:
         tool_versions[r.get("tool", "?")] = r.get("version", "?")
@@ -551,7 +582,7 @@ def emit_header(runs: list) -> str:
     fail_str = ""
     if n_failed:
         fail_str = f' · <span style="color:var(--bad)">{n_failed} FAILED</span>'
-    miss_str = f" · {n_missing} missing" if n_missing > 0 else ""
+    miss_str = f" · {n_missing} missing"
     return (
         f'<header class="app">'
         f"<h1>rustscale GCP bench dashboard</h1>"
@@ -560,19 +591,19 @@ def emit_header(runs: list) -> str:
     )
 
 
-def emit_filters() -> str:
-    return """<div class="filters" id="filters">
+def emit_filters(matrix: dict) -> str:
+    buttons = lambda field, values: ''.join(
+        f'<button data-filter="{field}" data-value="{v}">{html.escape(v)}</button>' for v in values)
+    return f'''<div class="filters" id="filters">
   <div class="group">
     <label>topology</label>
     <button data-filter="topo" data-value="all" class="active">all</button>
-    <button data-filter="topo" data-value="same-zone">same-zone</button>
-    <button data-filter="topo" data-value="cross-region">cross-region</button>
+    {buttons("topo", matrix["topologies"])}
   </div>
   <div class="group">
     <label>path</label>
     <button data-filter="path" data-value="all" class="active">all</button>
-    <button data-filter="path" data-value="direct">direct</button>
-    <button data-filter="path" data-value="derp">derp</button>
+    {buttons("path", matrix["paths"])}
   </div>
   <div class="group">
     <label>mode</label>
@@ -583,7 +614,7 @@ def emit_filters() -> str:
   <div class="group theme-toggle">
     <button id="theme-toggle">☾ dark</button>
   </div>
-</div>"""
+</div>'''
 
 
 # Hand-rolled canvas grouped bar chart renderer.
@@ -622,7 +653,7 @@ function drawGroupedBars(canvas, data, kind) {
   let groups, series, colorFor;
   if (kind === "throughput") {
     groups = data.parallels.map(String);
-    series = CONFIGS.map(c => ({
+    series = (data.configs || CONFIGS).map(c => ({
       key: c,
       vals: data.series[c] || [],
       color: CONFIG_COLORS[c],
@@ -645,7 +676,7 @@ function drawGroupedBars(canvas, data, kind) {
     // configs of each percentile.
     series = series.map(s => {
       s.vals = groups.map((_, gi) => {
-        const vals = CONFIGS.map(c => {
+        const vals = (data.configs || CONFIGS).map(c => {
           const arr = (data.series[c] || []);
           const row = arr[gi] || {};
           return row[s.field] || 0;
@@ -804,19 +835,19 @@ document.addEventListener("DOMContentLoaded", () => { initFilters(); applyFilter
 """
 
 
-def emit_chart_data_registry(runs_idx: dict, parallels: list[int]) -> str:
+def emit_chart_data_registry(runs_idx: dict, parallels: list[int], matrix: dict) -> str:
     """Emit a <script> registering chart data on window.__chartData for redraw."""
     entries = {}
-    for topo in TOPOLOGIES:
-        for path in PATHS:
+    for topo in matrix["topologies"]:
+        for path in matrix["paths"]:
             cid = f"tp-{topo}-{path}"
-            entries[cid] = throughput_chart_data(runs_idx, parallels, topo, path)
-    entries["latency-chart"] = latency_chart_data(runs_idx)
+            entries[cid] = throughput_chart_data(runs_idx, parallels, topo, path, matrix["configs"])
+    entries["latency-chart"] = latency_chart_data(runs_idx, matrix)
     return f'<script>window.__chartData = {json.dumps(entries)};</script>'
 
 
 def main() -> int:
-    runs = load_summary()
+    runs, matrix = load_summary()
     if not isinstance(runs, list):
         runs = []
     runs_idx = index_runs(runs)
@@ -824,9 +855,9 @@ def main() -> int:
 
     out = []
     out.append(HTML_HEAD)
-    out.append(emit_header(runs))
+    out.append(emit_header(runs, matrix))
     out.append("<main>")
-    out.append(emit_filters())
+    out.append(emit_filters(matrix))
 
     # Failed-runs banner (only if any runs have errors).
     out.append(emit_failed_runs(runs))
@@ -834,19 +865,19 @@ def main() -> int:
     # Throughput.
     out.append('<section class="block" id="throughput">')
     out.append("<h2>Throughput — iperf3 TCP sweep (download)</h2>")
-    out.append(emit_throughput_charts(runs_idx, parallels))
+    out.append(emit_throughput_charts(runs_idx, parallels, matrix))
     out.append("</section>")
 
     # Latency.
     out.append('<section class="block" id="latency">')
     out.append("<h2>Latency — ping-pong p50 / p95 / p99</h2>")
-    out.append(emit_latency_chart(runs_idx))
+    out.append(emit_latency_chart(runs_idx, matrix))
     out.append("</section>")
 
     # Footprint.
     out.append('<section class="block" id="footprint">')
     out.append("<h2>Footprint — binary size, RSS, CPU (green = best in group)</h2>")
-    out.append(emit_footprint_table(runs_idx))
+    out.append(emit_footprint_table(runs_idx, matrix))
     out.append("</section>")
 
     # Detail cards.
@@ -857,7 +888,7 @@ def main() -> int:
 
     out.append("</main>")
     # Chart data registry must come before CHART_JS so redraw can find it.
-    out.append(emit_chart_data_registry(runs_idx, parallels))
+    out.append(emit_chart_data_registry(runs_idx, parallels, matrix))
     out.append(CHART_JS)
     out.append(HTML_FOOT)
 

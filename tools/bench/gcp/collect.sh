@@ -52,7 +52,13 @@ total_runs=0 total_failed=0 total_missing=0
 for dir in "${runs[@]}"; do
   dir="${dir%/}"
   stamp="$(basename "$dir")"
-  json_count=$(find "$dir" -name '*.json' ! -name 'summary.json' 2>/dev/null | wc -l | tr -d ' ')
+  # matrix.json is run metadata, not a result. Zero-result aborted dirs do not
+  # belong in the cross-run index.
+  json_count=$(find "$dir" -path '*/profile' -prune -o -name '*.json' ! -name 'summary.json' ! -name 'matrix.json' -print 2>/dev/null | wc -l | tr -d ' ')
+  if [[ "$json_count" -eq 0 ]]; then
+    echo "[collect] $stamp: omitted (no run JSON)" >&2
+    continue
+  fi
 
   # (Re)build summary + dashboard. aggregate warns to stderr about FAILED and
   # MISSING cells; capture that to count them for the index.

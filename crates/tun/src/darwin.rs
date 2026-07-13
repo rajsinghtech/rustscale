@@ -15,7 +15,7 @@ use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use async_trait::async_trait;
 use tokio::io::unix::AsyncFd;
 
-use crate::{prepare_read_buffer, Tun, TunConfig, TunError, AF_HEADER_LEN};
+use crate::{prepare_read_buffer, Tun, TunConfig, TunError, TunPacketBatch, AF_HEADER_LEN};
 
 /// Largest IP packet accepted by the utun framing API.
 const MAX_IP_PACKET_LEN: usize = 65_535;
@@ -71,7 +71,9 @@ impl TunDevice {
 
 #[async_trait]
 impl Tun for TunDevice {
-    async fn read_packet(&self, packet: &mut Vec<u8>) -> io::Result<()> {
+    async fn read_batch(&self, batch: &mut TunPacketBatch) -> io::Result<()> {
+        batch.clear();
+        let packet = batch.packet_mut(0)?;
         // utun does not receive a configured MTU here; retain one maximum-size
         // frame allocation rather than risking truncation based on `self.mtu`.
         let read_len = MAX_READ;
@@ -106,7 +108,9 @@ impl Tun for TunDevice {
                     // SAFETY: the successful read above initialized exactly
                     // `n` bytes in `packet`'s spare capacity.
                     unsafe { packet.set_len(n) };
-                    return strip_packet_in_place(packet);
+                    strip_packet_in_place(packet)?;
+                    batch.set_len(1);
+                    return Ok(());
                 }
                 Ok(Err(e)) => return Err(e),
                 Err(_would_block) => {}

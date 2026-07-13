@@ -3075,7 +3075,49 @@ async fn interop_subnet_routes() {
 // issues without any OS dependency.
 
 use rustscale_filter::Filter;
-use rustscale_tun::MockTun;
+use rustscale_tun::{MockTun, Tun, TunPacketBatch};
+
+/// Delivers two packets from exactly one read, then ends. The counter lets the
+/// pump test distinguish processing a batch from issuing a read per packet.
+struct TwoPacketTun {
+    reads: std::sync::atomic::AtomicUsize,
+    dispatched: std::sync::Mutex<Vec<Vec<u8>>>,
+    name: String,
+    first: Vec<u8>,
+    second: Vec<u8>,
+}
+
+#[async_trait::async_trait]
+impl Tun for TwoPacketTun {
+    async fn read_batch(&self, batch: &mut TunPacketBatch) -> std::io::Result<()> {
+        let read = self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        batch.clear();
+        if read == 0 {
+            batch.push_packet(&self.first)?;
+            batch.push_packet(&self.second)?;
+            Ok(())
+        } else {
+            assert_eq!(
+                *self.dispatched.lock().unwrap(),
+                vec![self.first.clone(), self.second.clone()],
+                "the whole first read batch must be dispatched in order before another TUN read"
+            );
+            Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "done",
+            ))
+        }
+    }
+    async fn write_packet(&self, _packet: &[u8]) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn mtu(&self) -> usize {
+        DEFAULT_MTU
+    }
+}
 
 /// Build a minimal IPv4 TCP packet for testing the TUN pump.
 fn build_ipv4_tcp(src: Ipv4Addr, dst: Ipv4Addr, payload: &[u8]) -> Vec<u8> {
@@ -3421,9 +3463,39 @@ async fn tun_mock_inject_and_read() {
         b"inject-test",
     );
     tx.send(pkt.clone()).await.unwrap();
-    let mut got = Vec::new();
-    tun.read_packet(&mut got).await.unwrap();
-    assert_eq!(got, pkt);
+    let mut got = rustscale_tun::TunPacketBatch::new();
+    tun.read_batch(&mut got).await.unwrap();
+    assert_eq!(got.packets(), &[pkt]);
+}
+
+#[tokio::test]
+async fn tun_pump_processes_one_read_batch_before_reading_again() {
+    let first = build_ipv4_tcp(
+        Ipv4Addr::new(100, 64, 0, 1),
+        Ipv4Addr::new(100, 64, 0, 2),
+        b"first",
+    );
+    let second = build_ipv4_tcp(
+        Ipv4Addr::new(100, 64, 0, 1),
+        Ipv4Addr::new(100, 64, 0, 3),
+        b"second",
+    );
+    let tun = Arc::new(TwoPacketTun {
+        reads: std::sync::atomic::AtomicUsize::new(0),
+        dispatched: std::sync::Mutex::new(Vec::new()),
+        name: "two-packet-test".into(),
+        first,
+        second,
+    });
+    let filter = std::sync::Mutex::new(Filter::allow_all());
+    let mut batch = TunPacketBatch::new();
+    tun.read_batch(&mut batch).await.unwrap();
+    for packet in crate::tun_pump::filtered_outbound_packets(batch.packets(), &filter) {
+        tun.dispatched.lock().unwrap().push(packet.to_vec());
+    }
+    // The second read verifies the dispatch log before returning EOF.
+    assert!(tun.read_batch(&mut batch).await.is_err());
+    assert_eq!(tun.reads.load(std::sync::atomic::Ordering::SeqCst), 2);
 }
 
 #[tokio::test]

@@ -1,7 +1,7 @@
 //! An in-memory [`Tun`] implementation for unit tests.
 //!
 //! `MockTun::new` returns a device plus a sender to inject packets that
-//! `read_packet` will surface. Anything written via `write_packet` is captured
+//! `read_batch` will surface. Anything written via `write_packet` is captured
 //! and retrievable through `written()`.
 
 use std::io;
@@ -9,7 +9,7 @@ use std::io;
 use async_trait::async_trait;
 use tokio::sync::{mpsc, Mutex};
 
-use crate::Tun;
+use crate::{Tun, TunPacketBatch};
 
 /// A mock TUN device for tests.
 pub struct MockTun {
@@ -42,11 +42,15 @@ impl MockTun {
 
 #[async_trait]
 impl Tun for MockTun {
-    async fn read_packet(&self, packet: &mut Vec<u8>) -> io::Result<()> {
-        packet.clear();
+    async fn read_batch(&self, batch: &mut TunPacketBatch) -> io::Result<()> {
+        batch.clear();
         match self.read_rx.lock().await.recv().await {
             Some(pkt) => {
-                packet.extend_from_slice(&pkt);
+                let out = batch.packet_mut(0)?;
+                out.clear();
+                out.reserve(self.mtu);
+                out.extend_from_slice(&pkt);
+                batch.set_len(1);
                 Ok(())
             }
             None => Err(io::Error::new(io::ErrorKind::UnexpectedEof, "mock closed")),

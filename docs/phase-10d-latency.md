@@ -54,7 +54,7 @@ timer (it knows exactly when retransmits/timers are due).
   - `netstack.tx_notify().notified()` — wake when netstack has outbound packets
   - 250ms ticker for WG timer ticks only (was implicitly every 5ms before)
 - The `run_tun_pump` already uses a 250ms ticker for WG timers and is
-  event-driven via `tun.read_packet()` and `magicsock.poll_recv()` — no change.
+  event-driven via `tun.read_batch()` and `magicsock.poll_recv()` — no change.
 
 #### 4. Test rig updates — `crates/netstack/src/tests.rs` + `crates/tsnet/src/tests.rs`
 

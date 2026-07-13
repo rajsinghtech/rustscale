@@ -5,7 +5,8 @@
 Remove the per-packet heap allocation from the TUN outbound hot path without
 changing packet framing, scheduling, or batching behavior.
 
-The current `Tun::read_packet` returns a fresh `Vec<u8>`. Linux allocates and
+The former `Tun::read_packet` returned a fresh `Vec<u8>`. The current
+`Tun::read_batch` reuses packet storage. Linux previously allocated and
 initializes an MTU-sized vector for every packet, while macOS allocates a maximum
 packet buffer and then allocates again when stripping the utun address-family
 header. The production TUN pump consumes each packet before beginning the next
@@ -13,12 +14,12 @@ read, so it can retain one vector for its lifetime.
 
 ## Required changes
 
-1. Replace the allocating trait method with a caller-owned reusable buffer
-   contract. The method must clear/replace the previous packet and return one raw
-   IPv4 or IPv6 packet in that buffer. Keep the trait object-safe under
+1. Replace the allocating trait method with a caller-owned reusable batch
+   contract. The method must clear/replace the previous contents and return raw
+   IPv4 or IPv6 packets in read order. Keep the trait object-safe under
    `async_trait`.
-2. Allocate the production pump buffer once, outside its select loop, and reuse
-   it for every TUN read. Do not hold a packet slice across the next read.
+2. Allocate the production pump batch once, outside its select loop, and reuse
+   it for every TUN read. Do not hold packet slices across the next read.
 3. On Linux, reserve at least the configured MTU and read directly into retained
    vector capacity. Only expose the bytes initialized by a successful syscall.
    A cancelled read, readiness retry, EOF, or syscall error must leave a valid

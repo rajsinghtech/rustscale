@@ -519,7 +519,7 @@ untestable there. Use `tokio::io::AsyncFd` for async IO.
 ### Routing into TUN mode
 
 `Server::up_tun(TunModeConfig)` shares a `bootstrap()` with `up()`, then runs a
-pump racing `tun.read_packet()` (→ longest-prefix route lookup over peer
+pump racing `tun.read_batch()` (→ longest-prefix route lookup over peer
 `AllowedIPs`/`Addresses` via `RouteTable` → WG encapsulate → magicsock send)
 against `magicsock.poll_recv()` (→ WG decapsulate → TUN write) and a 250ms WG
 timer tick. `RouteTable` is longest-prefix-match; when `AllowedIPs` is empty

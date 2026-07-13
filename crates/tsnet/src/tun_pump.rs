@@ -18,7 +18,7 @@ pub(crate) async fn run_tun_pump(
 ) {
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(250));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut packet = Vec::with_capacity(tun.mtu());
+    let mut batch = rustscale_tun::TunPacketBatch::new();
 
     loop {
         if cancel.is_cancelled() {
@@ -27,14 +27,13 @@ pub(crate) async fn run_tun_pump(
 
         tokio::select! {
             // TUN read -> route -> WG encapsulate -> magicsock send.
-            result = tun.read_packet(&mut packet) => {
+            result = tun.read_batch(&mut batch) => {
                 match result {
                     Ok(()) => {
-                        {
-                            let mut filt = filter.lock().unwrap();
-                            filt.update_outbound(&packet);
+                        for packet in filtered_outbound_packets(batch.packets(), &filter) {
+                            encapsulate_and_send(&magicsock, &wg_tunnels, &route_table, packet)
+                                .await;
                         }
-                        encapsulate_and_send(&magicsock, &wg_tunnels, &route_table, &packet).await;
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                     Err(e) => {
@@ -67,6 +66,19 @@ pub(crate) async fn run_tun_pump(
             }
         }
     }
+}
+
+/// Lazily filter the packets from one TUN read in read order.
+///
+/// The filter is applied once, immediately before each packet is dispatched.
+pub(crate) fn filtered_outbound_packets<'a>(
+    packets: &'a [Vec<u8>],
+    filter: &'a std::sync::Mutex<Filter>,
+) -> impl Iterator<Item = &'a [u8]> + 'a {
+    packets.iter().map(Vec::as_slice).inspect(move |packet| {
+        let mut filt = filter.lock().unwrap();
+        filt.update_outbound(packet);
+    })
 }
 /// Create a TUN device and optionally apply OS routes.
 /// On macOS/Linux this creates the real device and installs routes when

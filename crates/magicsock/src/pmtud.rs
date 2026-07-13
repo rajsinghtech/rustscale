@@ -157,15 +157,24 @@ pub fn should_log_disco_tx_err(msg: &DiscoMessage, err: &std::io::Error) -> bool
 mod tests {
     use super::*;
     use std::net::UdpSocket as StdUdpSocket;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_should_pmtud_default_false() {
+        let _env_lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::env::remove_var("TS_DEBUG_ENABLE_PMTUD");
         assert!(!should_pmtud(None));
     }
 
     #[test]
     fn test_should_pmtud_env_override() {
+        let _env_lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::env::set_var("TS_DEBUG_ENABLE_PMTUD", "1");
         assert!(should_pmtud(None));
         std::env::set_var("TS_DEBUG_ENABLE_PMTUD", "0");
@@ -239,7 +248,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_update_pmtud_toggle() {
+        let _env_lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tokio_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
         // With no control knobs and no env, should_pmtud returns false.

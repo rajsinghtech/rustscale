@@ -147,7 +147,7 @@ real JSON).
 | Control knobs (`control/controlknobs/`) | ✅ HashMap<String,String> behind RwLock, typed accessors (get_bool/float/string), change-detection merge, on_change callbacks |
 | PeerAPI (`ipn/ipnlocal/peerapi.go`) | ✅ DoH /dns-query (GET + POST), /v0/* endpoints (goroutines, env, metrics, magicsock, dnsfwd, interfaces, sockstats), WhoIs auth, CRC32 port [32768, 65535], Taildrop PUT handler, netstack + TUN spawners |
 | Hostinfo | ✅ ~41 fields populated: platform/runtime fields plus persisted `BackendLogID`, override-supplied `FrontendLogID`, `WoLMACs`, `StateEncrypted`, and SSH host keys when the SSH listener is enabled. Intentional skips: PushDeviceToken, TPM, Location, ShareeNode, PeerRelay |
-| CapturePcap | 🔶 API declared at `Server::capture_pcap()` but returns "not yet implemented" error |
+| CapturePcap | ✅ `crates/tsnet/src/capture.rs`: byte-exact LINKTYPE_USER0 pcap sink (Go `feature/capture` format), fanout with slow-client drop, hooks in TUN pump (FromLocal/FromPeer) + netstack pump (SynthesizedToPeer/ToLocal); `Server::capture_pcap(file)`, LocalAPI POST /debug-capture stream, CLI `rustscale debug capture -o` |
 | Logtail | ✅ `crates/logtail` upload loop (HTTP POST, zstd, backoff) — see Tier 2.5 row |
 | Watchdog | ✅ tokio-based interval task, auto-fires warning if not feed() within interval, Drop-safe |
 | Syspolicy | ⬜ |

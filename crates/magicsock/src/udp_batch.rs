@@ -14,6 +14,12 @@ use tokio::net::UdpSocket;
 /// header allocation for each WireGuard microburst.
 pub(crate) const MAX_BATCH: usize = 128;
 
+#[cfg(target_env = "gnu")]
+const SENDMMSG_FLAGS: libc::c_int = libc::MSG_DONTWAIT as libc::c_int;
+
+#[cfg(target_env = "musl")]
+const SENDMMSG_FLAGS: libc::c_uint = libc::MSG_DONTWAIT as libc::c_uint;
+
 enum SockAddr {
     V4(libc::sockaddr_in),
     V6(libc::sockaddr_in6),
@@ -119,7 +125,7 @@ pub(crate) fn send<T: AsRef<[u8]>>(
             socket.as_raw_fd(),
             headers.as_mut_ptr(),
             datagrams.len() as libc::c_uint,
-            libc::MSG_DONTWAIT as libc::c_uint,
+            SENDMMSG_FLAGS,
         )
     };
     match sent.cmp(&0) {

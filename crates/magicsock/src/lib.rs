@@ -1719,25 +1719,8 @@ fn spawn_recv_tasks(
         let udp = udp.clone();
         let inner = inner.clone();
         tokio::spawn(async move {
-            let mut batch = udp_batch::ReceiveBatch::new(&udp);
-            let mut scalar_fallback = false;
-            let mut scalar_buf = vec![0u8; 65_536];
+            let mut batch = udp_batch::ReceiveBatch::new();
             loop {
-                if scalar_fallback {
-                    match udp.recv_from(&mut scalar_buf).await {
-                        Ok((len, addr)) => {
-                            inner.record_udp_rx(addr, len);
-                            inner.handle_udp_packet(&scalar_buf[..len], addr).await;
-                            while let Ok((len2, addr2)) = udp.try_recv_from(&mut scalar_buf) {
-                                inner.record_udp_rx(addr2, len2);
-                                inner.handle_udp_packet(&scalar_buf[..len2], addr2).await;
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                    continue;
-                }
-
                 match udp.async_io(Interest::READABLE, || batch.recv(&udp)).await {
                     Ok(count) => {
                         for index in 0..count {
@@ -1751,10 +1734,7 @@ fn spawn_recv_tasks(
                         }
                     }
                     Err(error) if udp_batch::recvmmsg_is_unsupported(&error) => {
-                        // A scalar recv cannot interpret a coalesced GRO
-                        // payload, so turn GRO off before changing paths.
-                        udp_batch::disable_udp_gro(&udp);
-                        scalar_fallback = true;
+                        break;
                     }
                     Err(error) if error.kind() == io::ErrorKind::InvalidData => {
                         // `recvmmsg` already consumed this entire kernel batch.
@@ -1762,14 +1742,31 @@ fn spawn_recv_tasks(
                         // source, truncation, or size failures, so drop all of
                         // it atomically and keep the direct UDP task alive.
                     }
-                    Err(_) => break,
+                    Err(_) => return,
+                }
+            }
+
+            // Allocate the scalar buffer only after an old kernel has proved
+            // that it does not implement recvmmsg.
+            let mut scalar_buf = vec![0u8; 65_536];
+            loop {
+                match udp.recv_from(&mut scalar_buf).await {
+                    Ok((len, addr)) => {
+                        inner.record_udp_rx(addr, len);
+                        inner.handle_udp_packet(&scalar_buf[..len], addr).await;
+                        while let Ok((len2, addr2)) = udp.try_recv_from(&mut scalar_buf) {
+                            inner.record_udp_rx(addr2, len2);
+                            inner.handle_udp_packet(&scalar_buf[..len2], addr2).await;
+                        }
+                    }
+                    Err(_) => return,
                 }
             }
         });
     }
 
     // Keep the established awaited receive plus immediate drain path exactly
-    // as-is on platforms without Linux recvmmsg/UDP GRO support.
+    // as-is on platforms without Linux recvmmsg support.
     #[cfg(not(target_os = "linux"))]
     if let Some(ref udp) = inner.udp {
         let udp = udp.clone();

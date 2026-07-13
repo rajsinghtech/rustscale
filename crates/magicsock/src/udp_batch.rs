@@ -20,12 +20,8 @@ const MAX_IPV6_PAYLOAD: usize = 65_527;
 /// this buffer. Larger ordinary UDP packets are deliberately rejected rather
 /// than silently truncated before they reach the protocol parsers.
 const LOGICAL_PACKET_CAPACITY: usize = 2_048;
-const GRO_PACKET_CAPACITY: usize = 65_536;
-const GRO_TAIL_SLOTS: usize = 2;
 // libc does not expose this on every supported Linux libc target.
 const UDP_SEGMENT: libc::c_int = 103;
-// libc does not expose this on every supported Linux libc target.
-const UDP_GRO: libc::c_int = 104;
 
 #[cfg(target_env = "gnu")]
 const SENDMMSG_FLAGS: libc::c_int = libc::MSG_DONTWAIT as libc::c_int;
@@ -193,39 +189,6 @@ fn probe_gso(socket: &UdpSocket) -> io::Result<()> {
     }
 }
 
-/// Best-effort enablement of UDP GRO for this socket. This is deliberately
-/// independent from the UDP GSO capability probe: kernels and drivers can
-/// support either direction without supporting the other.
-pub(crate) fn try_enable_udp_gro(socket: &UdpSocket) -> bool {
-    set_udp_gro(socket, true).is_ok()
-}
-
-/// Disable UDP GRO before changing to a receive implementation that cannot
-/// interpret UDP_GRO control messages.
-pub(crate) fn disable_udp_gro(socket: &UdpSocket) {
-    let _ = set_udp_gro(socket, false);
-}
-
-fn set_udp_gro(socket: &UdpSocket, enabled: bool) -> io::Result<()> {
-    let value = libc::c_int::from(enabled);
-    // SAFETY: `value` is valid storage for the integer UDP_GRO option and the
-    // socket fd remains valid for the duration of this synchronous syscall.
-    let result = unsafe {
-        libc::setsockopt(
-            socket.as_raw_fd(),
-            libc::SOL_UDP,
-            UDP_GRO,
-            ptr::from_ref(&value).cast(),
-            mem::size_of_val(&value) as libc::socklen_t,
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
 /// True when this process is running against a kernel too old to provide the
 /// `recvmmsg` syscall. It is intentionally narrow: ordinary socket failures
 /// still follow the receive task's existing error handling.
@@ -324,17 +287,12 @@ fn set_segment_control(control: &mut Control, segment_size: u16) {
 
 /// Reusable `recvmmsg` scratch owned by one UDP receive task.
 ///
-/// The storage is allocated once when the task starts. In GRO mode only the
-/// final two slots are submitted to the kernel, then split into the logical
-/// packet buffers at the head; this preserves the bounded layout used by
-/// Tailscale's Linux implementation.
+/// The storage is allocated once when the task starts and all 128 ordinary
+/// datagram slots are submitted to the kernel on each receive.
 pub(crate) struct ReceiveBatch {
-    gro_enabled: bool,
     packets: Vec<Packet>,
-    gro_packets: Vec<Vec<u8>>,
     iovecs: Vec<libc::iovec>,
     names: Vec<libc::sockaddr_storage>,
-    controls: Vec<Control>,
     headers: Vec<libc::mmsghdr>,
     lengths: Vec<usize>,
     sources: Vec<Option<SocketAddr>>,
@@ -349,17 +307,11 @@ pub(crate) struct ReceiveBatch {
 unsafe impl Send for ReceiveBatch {}
 
 impl ReceiveBatch {
-    pub(crate) fn new(socket: &UdpSocket) -> Self {
-        Self::with_gro(try_enable_udp_gro(socket))
-    }
-
-    fn with_gro(gro_enabled: bool) -> Self {
+    pub(crate) fn new() -> Self {
         // These vectors never change length, so all pointer targets remain
         // stable for every recvmmsg call made by this batch.
         Self {
-            gro_enabled,
             packets: vec![[0; LOGICAL_PACKET_CAPACITY]; MAX_BATCH],
-            gro_packets: vec![vec![0; GRO_PACKET_CAPACITY]; GRO_TAIL_SLOTS],
             iovecs: vec![
                 libc::iovec {
                     iov_base: ptr::null_mut(),
@@ -370,7 +322,6 @@ impl ReceiveBatch {
             // SAFETY: sockaddr_storage is a plain C storage struct; an all
             // zero value is valid prior to the kernel filling it.
             names: (0..MAX_BATCH).map(|_| unsafe { mem::zeroed() }).collect(),
-            controls: vec![Control::ZERO; MAX_BATCH],
             // SAFETY: all fields are pointers or integer lengths/flags. Each
             // submitted entry is completely initialized by `prepare_slot`.
             headers: (0..MAX_BATCH).map(|_| unsafe { mem::zeroed() }).collect(),
@@ -403,44 +354,23 @@ impl ReceiveBatch {
         self.sources.fill(None);
         self.count = 0;
 
-        let first = if self.gro_enabled {
-            MAX_BATCH - GRO_TAIL_SLOTS
-        } else {
-            0
-        };
-        let slots = if self.gro_enabled {
-            GRO_TAIL_SLOTS
-        } else {
-            MAX_BATCH
-        };
-        for index in first..first + slots {
+        for index in 0..MAX_BATCH {
             self.prepare_slot(index);
         }
 
-        let received = raw_recvmmsg(socket.as_raw_fd(), &mut self.headers[first..first + slots])?;
+        let received = raw_recvmmsg(socket.as_raw_fd(), &mut self.headers)?;
         if received == 0 {
             return Ok(0);
         }
-        if self.gro_enabled {
-            self.split_gro_tail(first, received)?;
-        } else {
-            self.finish_plain(received)?;
-        }
+        self.finish_plain(received)?;
         Ok(self.len())
     }
 
     fn prepare_slot(&mut self, index: usize) {
         self.names[index] = unsafe { mem::zeroed() };
-        self.controls[index] = Control::ZERO;
-        let (data, len) = if self.gro_enabled {
-            let tail = index - (MAX_BATCH - GRO_TAIL_SLOTS);
-            (&mut self.gro_packets[tail][..], GRO_PACKET_CAPACITY)
-        } else {
-            (&mut self.packets[index][..], LOGICAL_PACKET_CAPACITY)
-        };
         self.iovecs[index] = libc::iovec {
-            iov_base: data.as_mut_ptr().cast(),
-            iov_len: len,
+            iov_base: self.packets[index].as_mut_ptr().cast(),
+            iov_len: LOGICAL_PACKET_CAPACITY,
         };
         // SAFETY: a zeroed msghdr is valid before its pointer and length fields
         // below are initialized. Resetting it also resets kernel-written flags,
@@ -450,8 +380,6 @@ impl ReceiveBatch {
         hdr.msg_namelen = mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
         hdr.msg_iov = ptr::addr_of_mut!(self.iovecs[index]);
         hdr.msg_iovlen = 1;
-        hdr.msg_control = self.controls[index].as_mut_ptr();
-        hdr.msg_controllen = UDP_SEGMENT_CONTROL_SPACE as _;
         self.headers[index] = libc::mmsghdr {
             msg_hdr: hdr,
             msg_len: 0,
@@ -472,42 +400,6 @@ impl ReceiveBatch {
         Ok(())
     }
 
-    fn split_gro_tail(&mut self, first: usize, received: usize) -> io::Result<()> {
-        self.count = 0;
-        let mut output = 0;
-        for index in first..first + received {
-            self.validate_message(index, GRO_PACKET_CAPACITY)?;
-            let length = self.headers[index].msg_len as usize;
-            let source = socket_addr(&self.names[index], self.headers[index].msg_hdr.msg_namelen)?;
-            let control_len = self.headers[index].msg_hdr.msg_controllen as usize;
-            if control_len > UDP_SEGMENT_CONTROL_SPACE {
-                return invalid_data("kernel returned oversized ancillary data");
-            }
-            let segment_size = gro_size(&self.controls[index].as_bytes()[..control_len])?;
-            let segments = segment_size.map_or(1, |size| length.div_ceil(usize::from(size)).max(1));
-            if output + segments > MAX_BATCH {
-                return invalid_data("splitting UDP GRO packet would overflow batch");
-            }
-            let mut start = 0;
-            for _ in 0..segments {
-                let end =
-                    segment_size.map_or(length, |size| (start + usize::from(size)).min(length));
-                let logical_len = end - start;
-                if logical_len > LOGICAL_PACKET_CAPACITY {
-                    return invalid_data("logical UDP packet exceeds receive buffer");
-                }
-                self.packets[output][..logical_len]
-                    .copy_from_slice(&self.gro_packets[index - first][start..end]);
-                self.lengths[output] = logical_len;
-                self.sources[output] = Some(source);
-                output += 1;
-                start = end;
-            }
-        }
-        self.count = output;
-        Ok(())
-    }
-
     fn validate_message(&self, index: usize, capacity: usize) -> io::Result<()> {
         let header = &self.headers[index];
         if header.msg_len as usize > capacity {
@@ -520,17 +412,9 @@ impl ReceiveBatch {
     }
 }
 
-impl Control {
-    fn as_bytes(&self) -> &[u8] {
-        // SAFETY: `Control` is contiguous initialized storage. The kernel may
-        // initialize only the reported prefix, which callers slice before use.
-        unsafe { std::slice::from_raw_parts(self.0.as_ptr().cast(), mem::size_of::<Self>()) }
-    }
-}
-
 fn raw_recvmmsg(fd: libc::c_int, headers: &mut [libc::mmsghdr]) -> io::Result<usize> {
-    // SAFETY: `headers` points at initialized mmsghdr/iovec/name/control
-    // storage that lives until this syscall returns. The socket is nonblocking
+    // SAFETY: `headers` points at initialized mmsghdr/iovec/name storage that
+    // lives until this syscall returns. The socket is nonblocking
     // because it is owned by Tokio, and the null timeout requests no timeout.
     #[cfg(target_env = "gnu")]
     let result = unsafe {
@@ -587,56 +471,6 @@ fn socket_addr(
         }
         _ => invalid_data("invalid UDP source address"),
     }
-}
-
-fn gro_size(control: &[u8]) -> io::Result<Option<u16>> {
-    let header_len = unsafe { libc::CMSG_LEN(0) } as usize;
-    let alignment = mem::size_of::<libc::c_long>();
-    let mut offset = 0;
-    let mut segment_size = None;
-    while offset < control.len() {
-        if control.len() - offset < header_len {
-            return invalid_data("truncated socket control header");
-        }
-        // SAFETY: the length check above covers a complete cmsghdr. Use an
-        // unaligned read so this parser remains correct even for malformed
-        // caller-provided byte slices in tests.
-        let header =
-            unsafe { ptr::read_unaligned(control[offset..].as_ptr().cast::<libc::cmsghdr>()) };
-        let cmsg_len = header.cmsg_len as usize;
-        if cmsg_len < header_len || cmsg_len > control.len() - offset {
-            return invalid_data("malformed socket control length");
-        }
-        let data = &control[offset + header_len..offset + cmsg_len];
-        if header.cmsg_level == libc::SOL_UDP && header.cmsg_type == UDP_GRO {
-            if data.len() != UDP_SEGMENT_DATA_LEN {
-                return invalid_data("UDP_GRO control payload is not a u16");
-            }
-            let size = u16::from_ne_bytes([data[0], data[1]]);
-            if size == 0 {
-                return invalid_data("UDP_GRO control has a zero segment size");
-            }
-            if segment_size.replace(size).is_some() {
-                return invalid_data("duplicate UDP_GRO control message");
-            }
-        }
-        let aligned = cmsg_len
-            .checked_add(alignment - 1)
-            .map(|n| n / alignment * alignment);
-        let Some(next) = aligned else {
-            return invalid_data("overflowing socket control length");
-        };
-        if next > control.len() {
-            // cmsg_len itself can consume the last unpadded message. Any
-            // leftover bytes smaller than a header are ABI padding, not data.
-            if cmsg_len == control.len() - offset {
-                break;
-            }
-            return invalid_data("malformed socket control padding");
-        }
-        offset += next;
-    }
-    Ok(segment_size)
 }
 
 fn invalid_data<T>(message: &'static str) -> io::Result<T> {
@@ -720,48 +554,9 @@ mod tests {
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
 
-    fn set_gro_control(control: &mut Control, segment_size: u16) {
-        let header_len = unsafe { libc::CMSG_LEN(UDP_SEGMENT_DATA_LEN as _) } as usize;
-        // SAFETY: `Control` is cmsghdr-aligned and has CMSG_SPACE(2) bytes.
-        unsafe {
-            let header = control.as_mut_ptr().cast::<libc::cmsghdr>();
-            (*header).cmsg_level = libc::SOL_UDP;
-            (*header).cmsg_type = UDP_GRO;
-            (*header).cmsg_len = header_len as _;
-            ptr::copy_nonoverlapping(
-                segment_size.to_ne_bytes().as_ptr(),
-                libc::CMSG_DATA(header),
-                UDP_SEGMENT_DATA_LEN,
-            );
-        }
-    }
-
-    fn gro_control_with_payload(payload: &[u8]) -> (Control, usize) {
-        assert!(payload.len() <= 3);
-        let mut control = Control::ZERO;
-        let control_len = unsafe { libc::CMSG_SPACE(payload.len() as _) } as usize;
-        let header_len = unsafe { libc::CMSG_LEN(payload.len() as _) } as usize;
-        // SAFETY: `Control` is cmsghdr-aligned and the test payload fits in its
-        // CMSG_SPACE(2) allocation on every supported Linux ABI.
-        unsafe {
-            let header = control.as_mut_ptr().cast::<libc::cmsghdr>();
-            (*header).cmsg_level = libc::SOL_UDP;
-            (*header).cmsg_type = UDP_GRO;
-            (*header).cmsg_len = header_len as _;
-            ptr::copy_nonoverlapping(payload.as_ptr(), libc::CMSG_DATA(header), payload.len());
-        }
-        (control, control_len)
-    }
-
-    fn set_tail_message(
-        batch: &mut ReceiveBatch,
-        tail: usize,
-        packet: &[u8],
-        segment_size: Option<u16>,
-    ) {
-        let index = MAX_BATCH - GRO_TAIL_SLOTS + tail;
-        batch.gro_packets[tail][..packet.len()].copy_from_slice(packet);
-        let address = sockaddr_in(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1234 + tail as u16));
+    fn set_plain_message(batch: &mut ReceiveBatch, index: usize, packet: &[u8], port: u16) {
+        batch.packets[index][..packet.len()].copy_from_slice(packet);
+        let address = sockaddr_in(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
         // SAFETY: sockaddr_storage is large and aligned enough for sockaddr_in.
         unsafe {
             ptr::write(
@@ -772,11 +567,6 @@ mod tests {
         batch.headers[index].msg_len = packet.len() as _;
         batch.headers[index].msg_hdr.msg_namelen = mem::size_of::<libc::sockaddr_in>() as _;
         batch.headers[index].msg_hdr.msg_flags = 0;
-        batch.headers[index].msg_hdr.msg_controllen = 0;
-        if let Some(segment_size) = segment_size {
-            set_gro_control(&mut batch.controls[index], segment_size);
-            batch.headers[index].msg_hdr.msg_controllen = UDP_SEGMENT_CONTROL_SPACE as _;
-        }
     }
 
     fn packets(lengths: &[usize]) -> Vec<Vec<u8>> {
@@ -827,98 +617,37 @@ mod tests {
 
     #[tokio::test]
     async fn recvmmsg_loopback_preserves_order_sources_and_zero_length_packets() {
-        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sender_one = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sender_two = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let packets = [b"one".as_slice(), b"", b"three"];
-        assert_eq!(
-            send(&sender, receiver.local_addr().unwrap(), &packets).unwrap(),
-            3
-        );
+        let receiver_addr = receiver.local_addr().unwrap();
+        sender_one.send_to(b"one", receiver_addr).await.unwrap();
+        sender_two.send_to(b"", receiver_addr).await.unwrap();
+        sender_one.send_to(b"three", receiver_addr).await.unwrap();
 
-        let mut batch = ReceiveBatch::with_gro(false);
-        assert_eq!(batch.recv(&receiver).unwrap(), packets.len());
-        for (index, expected) in packets.into_iter().enumerate() {
+        let expected = [
+            (b"one".as_slice(), sender_one.local_addr().unwrap()),
+            (b"", sender_two.local_addr().unwrap()),
+            (b"three", sender_one.local_addr().unwrap()),
+        ];
+        let mut batch = ReceiveBatch::new();
+        assert_eq!(batch.recv(&receiver).unwrap(), expected.len());
+        for (index, (expected_packet, expected_source)) in expected.into_iter().enumerate() {
             let (packet, source) = batch.datagram(index).unwrap();
-            assert_eq!(packet, expected);
-            assert_eq!(source, sender.local_addr().unwrap());
+            assert_eq!(packet, expected_packet);
+            assert_eq!(source, expected_source);
         }
     }
 
     #[test]
-    fn udp_gro_enablement_is_best_effort_and_independent_from_gso() {
-        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        socket.set_nonblocking(true).unwrap();
-        let socket = UdpSocket::from_std(socket).unwrap();
-        // This intentionally does not inspect UDP_SEGMENT. A kernel may expose
-        // GRO and GSO independently, and either outcome is valid here.
-        let _ = try_enable_udp_gro(&socket);
-        disable_udp_gro(&socket);
-    }
-
-    #[test]
-    fn split_two_gro_tail_messages_preserves_order_and_smaller_tail() {
-        let mut batch = ReceiveBatch::with_gro(true);
-        set_tail_message(&mut batch, 0, b"aaabbbcc", Some(3));
-        set_tail_message(&mut batch, 1, b"ddddx", Some(4));
-        batch.split_gro_tail(MAX_BATCH - GRO_TAIL_SLOTS, 2).unwrap();
-        let got: Vec<_> = (0..batch.len())
-            .map(|index| batch.datagram(index).unwrap().0.to_vec())
-            .collect();
-        assert_eq!(
-            got,
-            vec![
-                b"aaa".to_vec(),
-                b"bbb".to_vec(),
-                b"cc".to_vec(),
-                b"dddd".to_vec(),
-                b"x".to_vec()
-            ]
-        );
-        assert_eq!(batch.datagram(0).unwrap().1.port(), 1234);
-        assert_eq!(batch.datagram(3).unwrap().1.port(), 1235);
-    }
-
-    #[test]
-    fn missing_gro_control_is_one_logical_datagram() {
-        let mut batch = ReceiveBatch::with_gro(true);
-        set_tail_message(&mut batch, 0, b"not-split", None);
-        batch.split_gro_tail(MAX_BATCH - GRO_TAIL_SLOTS, 1).unwrap();
-        assert_eq!(batch.len(), 1);
-        assert_eq!(batch.datagram(0).unwrap().0, b"not-split");
-    }
-
-    #[test]
-    fn gro_control_requires_exactly_one_nonzero_native_endian_u16() {
-        for payload in [&[][..], &[7][..], &[7, 0, 0][..], &[0, 0][..]] {
-            let (control, control_len) = gro_control_with_payload(payload);
-            assert_eq!(
-                gro_size(&control.as_bytes()[..control_len])
-                    .unwrap_err()
-                    .kind(),
-                io::ErrorKind::InvalidData
-            );
-        }
-
-        let expected = 0x1234u16;
-        let (control, control_len) = gro_control_with_payload(&expected.to_ne_bytes());
-        assert_eq!(
-            gro_size(&control.as_bytes()[..control_len]).unwrap(),
-            Some(expected)
-        );
-    }
-
-    #[test]
-    fn failed_later_gro_message_keeps_the_entire_batch_undispatchable() {
-        let mut batch = ReceiveBatch::with_gro(true);
-        set_tail_message(&mut batch, 0, b"first", None);
-        set_tail_message(&mut batch, 1, b"second", None);
-        batch.names[MAX_BATCH - 1] = unsafe { mem::zeroed() };
+    fn plain_recvmmsg_truncation_is_rejected_atomically() {
+        let mut batch = ReceiveBatch::new();
+        set_plain_message(&mut batch, 0, b"first", 1234);
+        set_plain_message(&mut batch, 1, b"second", 1235);
+        batch.headers[1].msg_hdr.msg_flags = libc::MSG_TRUNC;
 
         assert_eq!(
-            batch
-                .split_gro_tail(MAX_BATCH - GRO_TAIL_SLOTS, GRO_TAIL_SLOTS)
-                .unwrap_err()
-                .kind(),
+            batch.finish_plain(2).unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
         assert_eq!(batch.len(), 0);
@@ -926,74 +655,11 @@ mod tests {
         assert!(batch.datagram(1).is_none());
     }
 
-    #[test]
-    fn malformed_control_truncation_invalid_source_oversize_and_overflow_are_rejected() {
-        assert_eq!(
-            gro_size(&[0]).unwrap_err().kind(),
-            io::ErrorKind::InvalidData
-        );
-        let mut malformed = Control::ZERO;
-        // SAFETY: `malformed` is cmsghdr-aligned storage. Its deliberately
-        // impossible cmsg_len must be rejected before any payload is read.
-        let malformed_len = mem::size_of::<Control>() + 1;
-        unsafe {
-            (*malformed.as_mut_ptr().cast::<libc::cmsghdr>()).cmsg_len = malformed_len as _;
-        }
-        assert_eq!(
-            gro_size(malformed.as_bytes()).unwrap_err().kind(),
-            io::ErrorKind::InvalidData
-        );
-
-        let mut batch = ReceiveBatch::with_gro(true);
-        set_tail_message(&mut batch, 0, b"abc", None);
-        batch.headers[MAX_BATCH - GRO_TAIL_SLOTS].msg_hdr.msg_flags = libc::MSG_CTRUNC;
-        assert_eq!(
-            batch
-                .split_gro_tail(MAX_BATCH - GRO_TAIL_SLOTS, 1)
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidData
-        );
-
-        let mut batch = ReceiveBatch::with_gro(true);
-        set_tail_message(&mut batch, 0, b"abc", None);
-        batch.names[MAX_BATCH - GRO_TAIL_SLOTS] = unsafe { mem::zeroed() };
-        assert_eq!(
-            batch
-                .split_gro_tail(MAX_BATCH - GRO_TAIL_SLOTS, 1)
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidData
-        );
-
-        let mut batch = ReceiveBatch::with_gro(true);
-        let oversized = vec![0; LOGICAL_PACKET_CAPACITY + 1];
-        set_tail_message(&mut batch, 0, &oversized, None);
-        assert_eq!(
-            batch
-                .split_gro_tail(MAX_BATCH - GRO_TAIL_SLOTS, 1)
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidData
-        );
-
-        let mut batch = ReceiveBatch::with_gro(true);
-        let too_many_segments = vec![0; MAX_BATCH + 1];
-        set_tail_message(&mut batch, 0, &too_many_segments, Some(1));
-        assert_eq!(
-            batch
-                .split_gro_tail(MAX_BATCH - GRO_TAIL_SLOTS, 1)
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidData
-        );
-    }
-
     #[tokio::test]
     async fn receive_batch_reuse_clears_old_lengths_sources_and_packet_bytes() {
         let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let mut batch = ReceiveBatch::with_gro(false);
+        let mut batch = ReceiveBatch::new();
         assert_eq!(
             send(
                 &sender,
@@ -1195,38 +861,6 @@ mod tests {
         for expected in packets {
             let (n, _) = receiver.recv_from(&mut buf).await.unwrap();
             assert_eq!(&buf[..n], expected);
-        }
-    }
-
-    #[tokio::test]
-    async fn gso_loopback_gro_receive_splits_equal_segments_and_smaller_tail() {
-        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let mut batch = ReceiveBatch::new(&receiver);
-        if !batch.gro_enabled {
-            // UDP_GRO is not available on this kernel/socket. The send-side
-            // test above separately covers the case where UDP_SEGMENT exists.
-            return;
-        }
-        if let Err(error) = probe_gso(&sender) {
-            match error.raw_os_error() {
-                Some(libc::ENOPROTOOPT | libc::EOPNOTSUPP) => return,
-                _ => panic!("UDP_SEGMENT capability probe failed: {error}"),
-            }
-        }
-        let packets = [
-            vec![1; 1_200],
-            vec![2; 1_200],
-            vec![3; 1_200],
-            vec![4; 1_000],
-        ];
-        assert_eq!(
-            send_gso(&sender, receiver.local_addr().unwrap(), &packets).unwrap(),
-            packets.len()
-        );
-        assert_eq!(batch.recv(&receiver).unwrap(), packets.len());
-        for (index, expected) in packets.iter().enumerate() {
-            assert_eq!(batch.datagram(index).unwrap().0, expected);
         }
     }
 }

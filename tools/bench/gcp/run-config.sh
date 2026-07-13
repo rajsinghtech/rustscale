@@ -194,7 +194,7 @@ tun_ping_invocation() {
   local cli="$1" socket="$2" path_tag="$3" server_ip="$4"
   local ping_args
   if [[ "$path_tag" == direct ]]; then
-    ping_args="--until-direct --c=120"
+    ping_args="--until-direct --c=30"
   else
     ping_args="--until-direct=false --c=1"
   fi
@@ -207,8 +207,8 @@ command_shape_self_test() {
   rs_direct=$(tun_ping_invocation /opt/rustscale/target/release/rustscale /tmp/rs.sock direct 100.64.0.1)
   ts_derp=$(tun_ping_invocation tailscale /tmp/ts.sock derp 100.64.0.1)
   rs_derp=$(tun_ping_invocation /opt/rustscale/target/release/rustscale /tmp/rs.sock derp 100.64.0.1)
-  [[ "$ts_direct" == 'tailscale --socket=/tmp/ts.sock ping --until-direct --c=120 100.64.0.1' ]] || return 1
-  [[ "$rs_direct" == '/opt/rustscale/target/release/rustscale --socket=/tmp/rs.sock ping --until-direct --c=120 100.64.0.1' ]] || return 1
+  [[ "$ts_direct" == 'tailscale --socket=/tmp/ts.sock ping --until-direct --c=30 100.64.0.1' ]] || return 1
+  [[ "$rs_direct" == '/opt/rustscale/target/release/rustscale --socket=/tmp/rs.sock ping --until-direct --c=30 100.64.0.1' ]] || return 1
   [[ "${ts_direct#* ping }" == "${rs_direct#* ping }" ]] || return 1
   [[ "$ts_derp" == 'tailscale --socket=/tmp/ts.sock ping --until-direct=false --c=1 100.64.0.1' ]] || return 1
   [[ "$rs_derp" == '/opt/rustscale/target/release/rustscale --socket=/tmp/rs.sock ping --until-direct=false --c=1 100.64.0.1' ]] || return 1

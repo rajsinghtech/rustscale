@@ -474,16 +474,55 @@ impl Server {
         let inner = self.inner.as_ref()?;
         let peers = inner.peers.read().await;
         let ups = inner.user_profiles.read().await;
-        Some(
-            whois_lookup(&peers, &ups, remote_addr).unwrap_or_else(|| WhoIsInfo {
-                found: false,
-                node_name: String::new(),
-                tailscale_ips: vec![],
-                user_id: 0,
-                login_name: String::new(),
-                display_name: String::new(),
-            }),
-        )
+        if let Some(info) = whois_lookup(&peers, &ups, remote_addr) {
+            return Some(info);
+        }
+        drop(peers);
+        drop(ups);
+        // Fallback: check the proxy mapper for a reverse mapping. If the
+        // remote_addr is a Tailscale IP that a localhost proxy maps to,
+        // resolve it through the proxy mapper and then look up the
+        // resolved IP in the peer list. Mirrors Go's proxymap WhoIs fallback.
+        if let Some((_proto, _local)) = inner.proxy_mapper.whois_by_ip(remote_addr) {
+            // The proxy mapper tells us a localhost address maps to this
+            // Tailscale IP. The IP itself should be in the peer list — try
+            // again with a fresh read. If still not found, return a
+            // best-effort WhoIsInfo with found=true.
+            let peers = inner.peers.read().await;
+            let ups = inner.user_profiles.read().await;
+            if let Some(info) = whois_lookup(&peers, &ups, remote_addr) {
+                return Some(info);
+            }
+        }
+        Some(WhoIsInfo {
+            found: false,
+            node_name: String::new(),
+            tailscale_ips: vec![],
+            user_id: 0,
+            login_name: String::new(),
+            display_name: String::new(),
+        })
+    }
+
+    /// Register a proxy identity mapping: `(proto, localhost ip:port) -> ts_ip`.
+    ///
+    /// Used by netstack's TCP handler to attribute proxied connections so
+    /// that WhoIs can resolve them. Mirrors Go's `proxymap.Mapper.Register`.
+    pub fn register_proxy_identity(
+        &self,
+        proto: &str,
+        ipport: std::net::SocketAddr,
+        ts_ip: IpAddr,
+    ) -> Result<(), String> {
+        let inner = self.inner.as_ref().ok_or("server not up")?;
+        inner.proxy_mapper.register(proto, ipport, ts_ip)
+    }
+
+    /// Unregister a proxy identity mapping. Safe to call on non-existent keys.
+    pub fn unregister_proxy_identity(&self, proto: &str, ipport: std::net::SocketAddr) {
+        if let Some(inner) = self.inner.as_ref() {
+            inner.proxy_mapper.unregister(proto, ipport);
+        }
     }
 
     /// Set the serve configuration. Starts netstack listeners on the

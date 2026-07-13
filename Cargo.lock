@@ -2773,6 +2773,14 @@ name = "rustscale-paths"
 version = "0.1.0"
 
 [[package]]
+name = "rustscale-portlist"
+version = "0.1.0"
+dependencies = [
+ "rustscale-tailcfg",
+ "tokio",
+]
+
+[[package]]
 name = "rustscale-portmapper"
 version = "0.1.0"
 dependencies = [
@@ -2780,6 +2788,13 @@ dependencies = [
  "rand 0.8.7",
  "rustscale-neterror",
  "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
+name = "rustscale-proxymap"
+version = "0.1.0"
+dependencies = [
  "tokio",
 ]
 
@@ -2945,7 +2960,9 @@ dependencies = [
  "rustscale-netmon",
  "rustscale-netns",
  "rustscale-netstack",
+ "rustscale-portlist",
  "rustscale-portmapper",
+ "rustscale-proxymap",
  "rustscale-safesocket",
  "rustscale-sockstats",
  "rustscale-ssh",

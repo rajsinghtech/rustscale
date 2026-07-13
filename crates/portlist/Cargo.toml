@@ -1,0 +1,15 @@
+[package]
+name = "rustscale-portlist"
+description = "Periodic enumeration of listening TCP/UDP ports for Hostinfo.Services"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rustscale-tailcfg = { path = "../tailcfg", version = "0.1.0" }
+tokio = { workspace = true, features = ["process", "io-util", "time", "sync"] }
+

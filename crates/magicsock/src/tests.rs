@@ -221,7 +221,17 @@ async fn magicsock_with_idle_peer() -> (Magicsock, NodePublic) {
 async fn active_tx_keeps_one_heartbeat_task_and_idle_tx_rearms_it() {
     let (magicsock, peer_key) = magicsock_with_idle_peer().await;
 
-    assert!(magicsock.send(peer_key.clone(), b"first").await.is_err());
+    assert!(magicsock
+        .send_batch(
+            peer_key.clone(),
+            &[
+                b"first".as_slice(),
+                b"second".as_slice(),
+                b"third".as_slice()
+            ],
+        )
+        .await
+        .is_err());
     assert_eq!(
         magicsock
             .inner
@@ -832,15 +842,23 @@ async fn direct_path_upgrade_over_udp() {
         "B's path to A should be Direct"
     );
 
-    // Send a WG datagram over the direct path.
-    let wg_datagram = b"\x08\x07\x06\x05 direct wg packet";
-    a.send(b.node_public(), wg_datagram).await.expect("A send");
-    let received = tokio::time::timeout(Duration::from_secs(2), b_rx.recv())
+    // A direct batch remains ordered and is delivered as one datagram per UDP
+    // send, using the already-established direct path snapshot.
+    let datagrams = [
+        b"\x08\x07\x06\x05 direct wg packet one".as_slice(),
+        b"\x08\x07\x06\x05 direct wg packet two".as_slice(),
+    ];
+    a.send_batch(b.node_public(), &datagrams)
         .await
-        .expect("timed out waiting for B recv")
-        .expect("B poll_recv");
-    assert_eq!(received.peer, a.node_public());
-    assert_eq!(received.data, wg_datagram);
+        .expect("A batch send");
+    for datagram in datagrams {
+        let received = tokio::time::timeout(Duration::from_secs(2), b_rx.recv())
+            .await
+            .expect("timed out waiting for B recv")
+            .expect("B poll_recv");
+        assert_eq!(received.peer, a.node_public());
+        assert_eq!(received.data, datagram);
+    }
 }
 
 // ---- Test: trust expiry downgrades to DERP ----
@@ -956,6 +974,10 @@ async fn send_unknown_peer_errors() {
     .expect("magicsock");
 
     let unknown = NodePrivate::generate().public();
+    assert!(a
+        .send_batch(unknown.clone(), &[] as &[Vec<u8>])
+        .await
+        .is_ok());
     assert!(a.send(unknown, b"hello").await.is_err());
 }
 

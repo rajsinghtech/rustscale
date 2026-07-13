@@ -19,6 +19,7 @@ pub(crate) async fn run_tun_pump(
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(250));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut batch = rustscale_tun::TunPacketBatch::new();
+    let mut outbound = OutboundBatchScratch::default();
 
     loop {
         if cancel.is_cancelled() {
@@ -30,10 +31,10 @@ pub(crate) async fn run_tun_pump(
             result = tun.read_batch(&mut batch) => {
                 match result {
                     Ok(()) => {
-                        for packet in filtered_outbound_packets(batch.packets(), &filter) {
-                            encapsulate_and_send(&magicsock, &wg_tunnels, &route_table, packet)
-                                .await;
-                        }
+                        send_tun_batch(
+                            &magicsock, &wg_tunnels, &route_table, &filter,
+                            batch.packets(), &mut outbound,
+                        ).await;
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                     Err(e) => {
@@ -68,9 +69,110 @@ pub(crate) async fn run_tun_pump(
     }
 }
 
+/// Reused state for one outbound kernel-TUN read.
+#[derive(Default)]
+struct OutboundBatchScratch {
+    routes: Vec<Option<NodePublic>>,
+    runs: Vec<BatchRun>,
+    datagrams: rustscale_wg::WgDatagramBatch,
+}
+
+struct OutboundRun {
+    peer: NodePublic,
+    tunnel: Arc<Mutex<WgTunn>>,
+    start: usize,
+    end: usize,
+}
+
+enum BatchRun {
+    Skip { start: usize, end: usize },
+    Routed(OutboundRun),
+}
+
+/// Build maximal contiguous route runs from one tunnels-map snapshot.
+fn build_batch_runs(
+    routes: &[Option<NodePublic>],
+    tunnels: &HashMap<NodePublic, Arc<Mutex<WgTunn>>>,
+    runs: &mut Vec<BatchRun>,
+) {
+    runs.clear();
+    let mut start = 0;
+    while start < routes.len() {
+        let route = routes[start].clone();
+        let mut end = start + 1;
+        while end < routes.len() && routes[end] == route {
+            end += 1;
+        }
+        match route.and_then(|peer| tunnels.get(&peer).cloned().map(|tunnel| (peer, tunnel))) {
+            Some((peer, tunnel)) => runs.push(BatchRun::Routed(OutboundRun {
+                peer,
+                tunnel,
+                start,
+                end,
+            })),
+            None => runs.push(BatchRun::Skip { start, end }),
+        }
+        start = end;
+    }
+}
+
+/// Filter, route, and send one ordered TUN read as contiguous peer runs.
+async fn send_tun_batch(
+    magicsock: &Magicsock,
+    wg_tunnels: &RwLock<HashMap<NodePublic, Arc<Mutex<WgTunn>>>>,
+    route_table: &RwLock<RouteTable>,
+    filter: &std::sync::Mutex<Filter>,
+    packets: &[Vec<u8>],
+    scratch: &mut OutboundBatchScratch,
+) {
+    scratch.routes.clear();
+    scratch.runs.clear();
+    scratch.datagrams.clear();
+
+    // Keep filtering and route lookup in input order under one acquisition of
+    // each guard. Invalid packets deliberately get filtered before routing.
+    {
+        let routes = route_table.read().await;
+        let mut filt = filter.lock().unwrap();
+        for packet in packets {
+            filt.update_outbound(packet);
+            scratch
+                .routes
+                .push(WgTunn::dst_address(packet).and_then(|dst| routes.lookup(dst)));
+        }
+    }
+
+    // Form maximal equal-route runs using a single map snapshot. `None` and a
+    // missing tunnel are boundaries, so they cannot merge routed runs.
+    let tunnels = wg_tunnels.read().await;
+    build_batch_runs(&scratch.routes, &tunnels, &mut scratch.runs);
+    drop(tunnels);
+
+    for run in scratch.runs.drain(..) {
+        let run = match run {
+            BatchRun::Skip { start, end } => {
+                debug_assert!(start <= end && end <= packets.len());
+                continue;
+            }
+            BatchRun::Routed(run) => run,
+        };
+        scratch.datagrams.clear();
+        {
+            let mut tunnel = run.tunnel.lock().await;
+            for packet in &packets[run.start..run.end] {
+                let _ = tunnel.encapsulate_into(packet, &mut scratch.datagrams);
+            }
+        }
+        let _ = magicsock
+            .send_batch(run.peer.clone(), scratch.datagrams.packets())
+            .await;
+    }
+}
+
 /// Lazily filter the packets from one TUN read in read order.
 ///
 /// The filter is applied once, immediately before each packet is dispatched.
+#[cfg(test)]
 pub(crate) fn filtered_outbound_packets<'a>(
     packets: &'a [Vec<u8>],
     filter: &'a std::sync::Mutex<Filter>,
@@ -80,6 +182,7 @@ pub(crate) fn filtered_outbound_packets<'a>(
         filt.update_outbound(packet);
     })
 }
+
 /// Create a TUN device and optionally apply OS routes.
 /// On macOS/Linux this creates the real device and installs routes when
 /// `config.apply_routes` is true. On other platforms it returns an error.
@@ -242,4 +345,94 @@ fn run_cmd(prog: &str, args: &[&str]) -> Result<(), TsnetError> {
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustscale_key::NodePrivate;
+
+    fn tunnel_for(peer: &NodePublic) -> Arc<Mutex<WgTunn>> {
+        Arc::new(Mutex::new(
+            WgTunn::new(&NodePrivate::generate(), peer, 1).expect("tunnel"),
+        ))
+    }
+
+    fn shapes(runs: &[BatchRun]) -> Vec<(Option<NodePublic>, usize, usize)> {
+        runs.iter()
+            .map(|run| match run {
+                BatchRun::Skip { start, end } => (None, *start, *end),
+                BatchRun::Routed(run) => (Some(run.peer.clone()), run.start, run.end),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn build_batch_runs_preserves_contiguous_route_boundaries() {
+        let a = NodePrivate::generate().public();
+        let b = NodePrivate::generate().public();
+        let mut tunnels = HashMap::new();
+        tunnels.insert(a.clone(), tunnel_for(&a));
+        tunnels.insert(b.clone(), tunnel_for(&b));
+        let mut runs = Vec::new();
+
+        build_batch_runs(&[], &tunnels, &mut runs);
+        assert!(runs.is_empty());
+
+        build_batch_runs(&[Some(a.clone())], &tunnels, &mut runs);
+        assert_eq!(shapes(&runs), vec![(Some(a.clone()), 0, 1)]);
+
+        build_batch_runs(
+            &[Some(a.clone()), Some(a.clone()), Some(a.clone())],
+            &tunnels,
+            &mut runs,
+        );
+        assert_eq!(shapes(&runs), vec![(Some(a.clone()), 0, 3)]);
+
+        build_batch_runs(
+            &[Some(a.clone()), Some(b.clone()), Some(a.clone())],
+            &tunnels,
+            &mut runs,
+        );
+        assert_eq!(
+            shapes(&runs),
+            vec![
+                (Some(a.clone()), 0, 1),
+                (Some(b.clone()), 1, 2),
+                (Some(a.clone()), 2, 3)
+            ]
+        );
+
+        build_batch_runs(
+            &[Some(a.clone()), None, Some(a.clone())],
+            &tunnels,
+            &mut runs,
+        );
+        assert_eq!(
+            shapes(&runs),
+            vec![
+                (Some(a.clone()), 0, 1),
+                (None, 1, 2),
+                (Some(a.clone()), 2, 3)
+            ]
+        );
+    }
+
+    #[test]
+    fn build_batch_runs_keeps_missing_tunnel_as_a_boundary() {
+        let a = NodePrivate::generate().public();
+        let missing = NodePrivate::generate().public();
+        let mut tunnels = HashMap::new();
+        tunnels.insert(a.clone(), tunnel_for(&a));
+        let mut runs = Vec::new();
+        build_batch_runs(
+            &[Some(a.clone()), Some(missing.clone()), Some(a.clone())],
+            &tunnels,
+            &mut runs,
+        );
+        assert_eq!(
+            shapes(&runs),
+            vec![(Some(a.clone()), 0, 1), (None, 1, 2), (Some(a), 2, 3)]
+        );
+    }
 }

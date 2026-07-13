@@ -61,6 +61,8 @@ use std::time::Duration;
 use rustscale_derp::DerpClient;
 use rustscale_disco::{CallMeMaybe, Message, Ping, Pong};
 use rustscale_key::{DiscoPrivate, DiscoPublic, NodePrivate, NodePublic};
+#[cfg(target_os = "linux")]
+use rustscale_neterror::should_disable_udp_gso;
 use rustscale_neterror::treat_as_lost_udp;
 use rustscale_tailcfg::{DERPMap, Node};
 #[cfg(target_os = "linux")]
@@ -219,6 +221,10 @@ struct Inner {
     node_public: RwLock<NodePublic>,
     disco: DiscoIo,
     udp: Option<Arc<UdpSocket>>,
+    /// TX UDP GSO availability, probed once per direct UDP socket and disabled
+    /// permanently if Linux reports EIO for a GSO send.
+    #[cfg(target_os = "linux")]
+    udp_tx_gso: AtomicBool,
     local_udp_addrs: RwLock<Vec<String>>,
     /// Multi-region DERP connection manager.
     derp: DerpManager,
@@ -644,6 +650,11 @@ impl Magicsock {
             (None, Vec::new())
         };
 
+        #[cfg(target_os = "linux")]
+        let udp_tx_gso = udp
+            .as_ref()
+            .is_some_and(|socket| udp_batch::supports_gso(socket));
+
         // Create the DERP manager with the home region connection + DERPMap.
         let (derp, derp_recv_rx, reconnect_rx) = DerpManager::new(
             config.derp_client,
@@ -679,6 +690,8 @@ impl Magicsock {
             node_public: RwLock::new(node_public),
             disco,
             udp,
+            #[cfg(target_os = "linux")]
+            udp_tx_gso: AtomicBool::new(udp_tx_gso),
             local_udp_addrs: RwLock::new(local_udp_addrs),
             derp,
             endpoints: RwLock::new(HashMap::new()),
@@ -1161,11 +1174,23 @@ impl Magicsock {
         let mut first_error = None;
         while head < datagrams.len() {
             let end = (head + udp_batch::MAX_BATCH).min(datagrams.len());
+            let use_gso = self.inner.udp_tx_gso.load(Ordering::Relaxed);
             let result = udp
                 .async_io(Interest::WRITABLE, || {
-                    udp_batch::send(udp, addr, &datagrams[head..end])
+                    if use_gso {
+                        udp_batch::send_gso(udp, addr, &datagrams[head..end])
+                    } else {
+                        udp_batch::send(udp, addr, &datagrams[head..end])
+                    }
                 })
                 .await;
+            if use_gso && result.as_ref().is_err_and(should_disable_udp_gso) {
+                self.inner.udp_tx_gso.store(false, Ordering::Relaxed);
+                // `sendmmsg` reports no progress with an error, so retry this
+                // exact unsent suffix through the independently exercised
+                // plain path while retaining AsyncFd readiness ownership.
+                continue;
+            }
             let sent = advance_direct_batch(&mut head, datagrams.len(), &mut first_error, result);
             for datagram in &datagrams[head - sent..head] {
                 self.inner.record_udp_tx(addr, datagram.as_ref().len());

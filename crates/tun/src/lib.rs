@@ -79,7 +79,8 @@ pub struct TunConfig {
     /// `"utunN"` (e.g. `"utun9"`) for a specific unit. On Linux any interface
     /// name ≤ 15 bytes.
     pub name: String,
-    /// Desired MTU. Tailscale's tailnet MTU is 1280.
+    /// Desired MTU. Linux applies this to the created interface; Tailscale's
+    /// tailnet MTU is 1280.
     pub mtu: usize,
 }
 

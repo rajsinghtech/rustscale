@@ -26,9 +26,11 @@ batching. An ordinary Linux `readv` does not batch independent TUN packets.
 
 ## Required changes
 
-1. Size the Linux read allocation from the configured MTU instead of the maximum
-   IPv4 packet size. Reject an unusable zero MTU or otherwise make the allocation
-   safe without restoring the 65,535-byte hot-path zeroing cost.
+1. Apply the configured MTU to the Linux interface during TUN creation, then size
+   the Linux read allocation from that MTU instead of the maximum IPv4 packet
+   size. Reject an unusable MTU or propagate the interface-configuration error;
+   a newly created Linux TUN otherwise commonly retains its 1,500-byte default
+   and could truncate packets in a 1,280-byte read buffer.
 2. Remove the unconditional `packet.to_vec()` in the Linux write path. Preserve
    Tokio `AsyncFd` readiness handling and return a clear error for a short write.
 3. Add focused unit-testable helpers for buffer sizing and write-result handling,

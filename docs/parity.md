@@ -118,7 +118,7 @@ real JSON).
 
 | Feature | Status |
 | --- | --- |
-| Tailscale SSH (`ssh/tailssh/`, port-10) | ✅ policy engine (eval_ssh_policy with Any/Node/NodeIP/UserLogin, Reject/Accept), incubator (spawn shell with privilege drop), session recording (asciicast v2 to local .cast file), whois integration; remaining: HoldAndDelegate, remote recorder upload (PeerAPI stream) |
+| Tailscale SSH (`ssh/tailssh/`, port-10) | ✅ policy engine (eval_ssh_policy with Any/Node/NodeIP/UserLogin, Reject/Accept), incubator (spawn shell with privilege drop + PTY slave fd dup2), session recording (asciicast v2 to local .cast file), whois integration, session orchestrator (run_session: user resolution via getpwnam_r, SSH env vars, PTY allocation via openpty, bidirectional I/O pumps, signal/window-change forwarding, exit status reporting), SshListener::accept_and_run; remaining: HoldAndDelegate, remote recorder upload (PeerAPI stream), SFTP |
 | Taildrop (`feature/taildrop/`) | ✅ TaildropManager with spool directory, conflict modes (skip/overwrite/rename), file-targets enumeration from netmap, PeerAPI PUT /v0/put/<filename>, LocalAPI files/file-targets/file-put/await-waiting-files, CLI file cp/get |
 | Taildrive (`drive/`) | ⬜ |
 | Tailnet Lock / TKA (`tka/`) | 🔶 wire types only (NodeKeySignature, UnsignedPeer fields on Node); no TKA verification or key management |

@@ -59,6 +59,8 @@ impl RusshServer for SshServer {
             env_vars: Vec::new(),
             pty: None,
             command: String::new(),
+            signal_tx: None,
+            window_change_tx: None,
         }
     }
     fn handle_session_error(&mut self, error: <Self::Handler as russh::server::Handler>::Error) {
@@ -77,6 +79,8 @@ pub struct SshHandler {
     env_vars: Vec<(String, String)>,
     pty: Option<Pty>,
     command: String,
+    signal_tx: Option<mpsc::Sender<russh::Sig>>,
+    window_change_tx: Option<mpsc::Sender<Window>>,
 }
 
 impl SshHandler {
@@ -166,10 +170,15 @@ impl SshHandler {
     ) -> Result<(), russh::Error> {
         let (data_tx, data_rx) = mpsc::channel::<Vec<u8>>(64);
         let (done_tx, mut done_rx) = mpsc::channel::<()>(1);
+        let (signal_tx, signal_rx) = mpsc::channel::<russh::Sig>(16);
+        let (window_change_tx, window_change_rx) = mpsc::channel::<Window>(16);
         self.channel_data_tx = Some(data_tx);
+        self.signal_tx = Some(signal_tx);
+        self.window_change_tx = Some(window_change_tx);
 
         let handle = session.handle();
         let peer = self.peer_identity.clone().unwrap_or_default();
+        let peer_addr = self.peer_addr;
 
         let init = SessionInit {
             peer,
@@ -182,6 +191,9 @@ impl SshHandler {
             data_rx,
             done_tx,
             recorder: None,
+            signal_rx,
+            window_change_rx,
+            peer_addr,
         };
 
         if self.config.session_tx.send(init).await.is_err() {
@@ -323,13 +335,17 @@ impl russh::server::Handler for SshHandler {
         pix_height: u32,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
+        let win = Window {
+            width: col_width,
+            height: row_height,
+            width_pixels: pix_width,
+            height_pixels: pix_height,
+        };
         if let Some(ref mut pty) = self.pty {
-            pty.window = Window {
-                width: col_width,
-                height: row_height,
-                width_pixels: pix_width,
-                height_pixels: pix_height,
-            };
+            pty.window = win.clone();
+        }
+        if let Some(tx) = &self.window_change_tx {
+            let _ = tx.try_send(win);
         }
         Ok(())
     }
@@ -341,6 +357,9 @@ impl russh::server::Handler for SshHandler {
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         log::debug!("SSH signal: {signal:?}");
+        if let Some(tx) = &self.signal_tx {
+            let _ = tx.try_send(signal);
+        }
         Ok(())
     }
 
@@ -350,6 +369,8 @@ impl russh::server::Handler for SshHandler {
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         self.channel_data_tx = None;
+        self.signal_tx = None;
+        self.window_change_tx = None;
         Ok(())
     }
 
@@ -359,6 +380,8 @@ impl russh::server::Handler for SshHandler {
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         self.channel_data_tx = None;
+        self.signal_tx = None;
+        self.window_change_tx = None;
         Ok(())
     }
 }

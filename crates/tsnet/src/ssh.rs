@@ -25,6 +25,21 @@ impl SshListener {
         }
         None
     }
+
+    /// Accept the next SSH session and spawn an async task that runs it to
+    /// completion (resolves local user, spawns shell, pumps I/O).
+    ///
+    /// The returned `JoinHandle` resolves to the shell exit code. Callers
+    /// that want custom processing should use `accept()` and `run_session()`
+    /// directly instead.
+    pub async fn accept_and_run(
+        &mut self,
+    ) -> Option<JoinHandle<Result<i32, rustscale_ssh::SessionHandlerError>>> {
+        let session = self.accept().await?;
+        Some(tokio::spawn(async move {
+            rustscale_ssh::run_session(session, None).await
+        }))
+    }
 }
 
 impl Server {

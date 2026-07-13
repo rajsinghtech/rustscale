@@ -1719,7 +1719,11 @@ fn spawn_recv_tasks(
         let udp = udp.clone();
         let inner = inner.clone();
         tokio::spawn(async move {
-            let mut batch = udp_batch::ReceiveBatch::new();
+            // This process knob is intentionally sampled once for the task.
+            // It disables only receive GRO; the 128-slot recvmmsg path stays
+            // active for diagnostics and old-kernel fallback behavior.
+            let disable_udp_gro = std::env::var_os("RUSTSCALE_DISABLE_UDP_GRO").is_some();
+            let mut batch = udp_batch::ReceiveBatch::new(&udp, disable_udp_gro);
             loop {
                 match udp.async_io(Interest::READABLE, || batch.recv(&udp)).await {
                     Ok(count) => {

@@ -189,6 +189,15 @@ impl Filter {
         self.shields_up = on;
     }
 
+    /// Take over UDP/SCTP flow-tracking state from a filter being replaced.
+    ///
+    /// Filter reloads replace the compiled rules but must not interrupt
+    /// established UDP or SCTP flows. The old filter is discarded after this
+    /// call, so moving its state is equivalent to Go sharing its filter state.
+    pub fn share_state_with(&mut self, old: &mut Self) {
+        self.state = std::mem::take(&mut old.state);
+    }
+
     /// Whether shields-up mode is currently active.
     pub fn shields_up(&self) -> bool {
         self.shields_up

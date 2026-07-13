@@ -75,7 +75,7 @@ real JSON).
 | IPN extension system | `ipn/ipnext/` | ⬜ |
 | Cloud log shipping | `logtail/` | ✅ `crates/logtail` — async upload loop (background tokio task), HTTP POST to `{base_url}/c/{collection}/{private_id}`, zstd compression (>256B, >64B savings), Retry-After/30–60s backoff, RFC3339Nano `client_time`, buffer cap + drop_count, upload metrics |
 | Port enumeration | `portlist/` | ✅ `crates/portlist`: `Poller` (same-count shortcut, 1s Linux / 5s macOS), Linux `/proc/net/{tcp,tcp6,udp,udp6}` hex parser + `/proc/*/fd` PID resolution, macOS `netstat -na` + `lsof -F` parser with sandbox-failure cache, `to_services()` with is_interesting_service policy; wired into tsnet via HostinfoHook + background poller task |
-| Network flow logging | `wgengine/netlog/` | 🔶 `crates/netlogtype` (wire types: Message, Node, Connection, Counts, ConnectionCounts with Go-compatible AddrPort JSON), `crates/netlog` (Logger with 5s aggregation + logtail upload, Record aggregation, traffic classification Virtual/Subnet/Exit/Unknown, exit anonymization, ReconfigRoutes); filter `ConnectionCounter` on outbound; Phase 1 virtual traffic only — physical traffic from magicsock deferred |
+| Network flow logging | `wgengine/netlog/` | 🔶 `crates/netlogtype` (wire types: Message, Node, Connection, Counts, ConnectionCounts with Go-compatible AddrPort JSON), `crates/netlog` (Logger with 5s aggregation + logtail upload, Record aggregation, traffic classification Virtual/Subnet/Exit/Unknown, exit anonymization, ReconfigRoutes); filter `ConnectionCounter` on outbound; Phase 1 virtual traffic only — physical traffic from magicsock deferred; flowtrack Tuple adoption intentionally deferred |
 | Network error classification | `net/neterror/` | ✅ `rustscale-neterror` crate with `treat_as_lost_udp`, `packet_was_truncated`, `should_disable_udp_gso`, `is_closed_pipe_error`; wired into magicsock (send/disco paths), portmapper (PMP/PCP mapping sends), dns forwarder (UDP recv) |
 | Network traffic steering | `net/traffic/` | 🔶 split DNS OS config exists (macOS); no general traffic-steering abstraction |
 | Subnet route health check | `net/routecheck/` | ⬜ |
@@ -87,7 +87,7 @@ real JSON).
 | Client metrics | `util/clientmetric/` | ✅ `crates/clientmetric`: Registry with Counter/Gauge (atomic-backed), to_prometheus_text() + to_json(); wired into LocalAPI /metrics |
 | Deep hash / change detection | `util/deephash/` | ⬜ |
 | Singleflight | `util/singleflight/` | 🔶 inline in `crates/dnscache` (inflight dedup HashMap); no standalone crate |
-| LRU cache | `util/lru/` | 🔶 inline in `crates/filter/src/state.rs` (flow tracking LRU, max 512 entries); no standalone crate |
+| LRU cache | `util/lru/` | ✅ standalone O(1) HashMap + index-linked-list implementation in `crates/flowtrack` (used by filter flow tracking) |
 | Rate limiter | `util/limiter/` | 🔶 inline in `crates/derp/src/client.rs` (token-bucket for DERP send path); no standalone crate |
 | Ring buffer logger | `util/ringlog/` | ⬜ |
 | QR code rendering | `util/qrcodes/` | ✅ qrcode crate + hand-rolled 1-bit PNG encoder; `up --qr` / `login --qr` terminal half-block QR + data:image/png data URL |
@@ -136,7 +136,7 @@ real JSON).
 | GSO/GRO batching (`net/batching/`) | ⬜ |
 | io_uring TUN+socket (Linux) | ⬜ |
 | BPF disco filtering (`magicsock_linux.go`) | ⬜ |
-| Flow tracking (`net/flowtrack/`) | 🔶 LRU cache in filter state.rs (512-entry, UDP/SCTP 5-tuple); no time-based expiry, no ConnRecord/packet counters, no TCB tracking |
+| Flow tracking (`net/flowtrack/`) | ✅ `crates/flowtrack`: packed v4-mapped 5-tuples, Go-compatible legacy JSON adapter, and O(1) generic LRU; filter uses its 512-entry UDP/SCTP cache and preserves active state across filter reloads |
 | sockstats | ✅ `crates/sockstats`: Label taxonomy (13 labels), SockStats registry (Arc<Mutex> + AtomicU64), LabelHandle (cheap clone, record_tx/rx), CountedStream wrapper; magicsock UDP4/UDP6 tx/rx instrumented at send/recv; C2N /sockstats + PeerAPI /v0/sockstats emit JSON `{stats, current_interface_cellular}`; manual instrumentation (no Go runtime socktrace) |
 | tcpinfo | ✅ `crates/tcpinfo`: macOS TCP_CONNECTION_INFO + Linux TCP_INFO; break_tcp_conns() for macOS |
 | ICMP ping (`net/ping/`) | ✅ `crates/netcheck/src/icmp.rs`: public `Pinger` (unprivileged DGRAM+IPPROTO_ICMP → SOCK_RAW fallback); integrated as netcheck fallback when STUN probes fail; CLI `ping --icmp` dispatches via LocalAPI to the same pinger |

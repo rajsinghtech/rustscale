@@ -2635,9 +2635,18 @@ dependencies = [
 name = "rustscale-filter"
 version = "0.1.0"
 dependencies = [
+ "rustscale-flowtrack",
  "rustscale-packet",
  "rustscale-tailcfg",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "rustscale-flowtrack"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

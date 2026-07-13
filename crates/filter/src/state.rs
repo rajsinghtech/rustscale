@@ -3,8 +3,9 @@
 //! Mirrors Go's `filterState` + `flowtrack.Cache` (size-based eviction,
 //! no time-based timeout). Max 512 entries.
 
-use std::collections::{HashMap, VecDeque};
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
+
+use rustscale_flowtrack::{Cache, Tuple};
 
 /// A 5-tuple identifying a UDP/SCTP flow.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -35,55 +36,45 @@ pub fn reversed_tuple(
 
 /// Size-based LRU cache for flow state. Max 512 entries.
 pub struct FlowState {
-    entries: HashMap<FlowTuple, ()>,
-    order: VecDeque<FlowTuple>,
-    max: usize,
+    cache: Cache<()>,
 }
 
 impl FlowState {
     pub fn new() -> Self {
-        Self {
-            entries: HashMap::new(),
-            order: VecDeque::new(),
-            max: 512,
-        }
+        let mut cache = Cache::default();
+        // Go's wgengine/filter uses `lruMax = 512`.
+        cache.max_entries = 512;
+        Self { cache }
     }
 
-    /// Look up `tuple`; if found, move it to the back (most recently used).
+    /// Look up `tuple`; if found, make it most recently used.
     pub fn get(&mut self, tuple: &FlowTuple) -> bool {
-        if self.entries.contains_key(tuple) {
-            self.order.retain(|t| t != tuple);
-            self.order.push_back(tuple.clone());
-            true
-        } else {
-            false
-        }
+        self.cache.get(&tuple.as_tuple()).is_some()
     }
 
     /// Insert `tuple`; evict the least recently used entry if over capacity.
     pub fn add(&mut self, tuple: FlowTuple) {
-        if self.entries.contains_key(&tuple) {
-            self.order.retain(|t| t != &tuple);
-            self.order.push_back(tuple);
-            return;
-        }
-        self.entries.insert(tuple.clone(), ());
-        self.order.push_back(tuple);
-        if self.entries.len() > self.max {
-            if let Some(old) = self.order.pop_front() {
-                self.entries.remove(&old);
-            }
-        }
+        self.cache.add(tuple.as_tuple(), ());
     }
 
     /// Current number of cached flows.
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.cache.len()
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.cache.len() == 0
+    }
+}
+
+impl FlowTuple {
+    fn as_tuple(&self) -> Tuple {
+        Tuple::new(
+            self.proto,
+            SocketAddr::new(self.src, self.src_port),
+            SocketAddr::new(self.dst, self.dst_port),
+        )
     }
 }
 

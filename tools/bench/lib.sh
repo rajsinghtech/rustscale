@@ -101,11 +101,11 @@ bench_provision_tailnet() {
     -d client_id="$BENCH_CHILD_CID" -d client_secret="$BENCH_CHILD_CSEC" \
     | jq -r .access_token)
 
-  # Set ACLs (tag:e2e + accept all) and trap cleanup.
+  # Set all-to-all grants; API-owned tailnets use autogroup:admin to own tag:e2e.
   curl -fsS --retry 3 --retry-delay 3 --retry-all-errors \
     -X POST "$BENCH_API/api/v2/tailnet/$BENCH_DNS/acl" \
     -H "Authorization: Bearer $BENCH_CHILD_TOKEN" -H 'Content-Type: application/json' \
-    -d '{"tagOwners":{"tag:e2e":[]},"acls":[{"action":"accept","src":["*"],"dst":["*:*"]}]}' >/dev/null
+    -d '{"tagOwners":{"tag:e2e":["autogroup:admin"]},"grants":[{"src":["*"],"dst":["*"],"ip":["*"]}]}' >/dev/null
 
   trap bench_cleanup_tailnet INT TERM EXIT
 }

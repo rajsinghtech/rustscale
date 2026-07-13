@@ -99,6 +99,8 @@ pub enum NetstackError {
     DialFailed(String),
     #[error("udp listen failed: {0}")]
     UdpListenFailed(String),
+    #[error("tls error: {0}")]
+    Tls(String),
     #[error("netstack is shutting down")]
     ShuttingDown,
 }

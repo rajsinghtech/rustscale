@@ -147,6 +147,7 @@ impl Server {
             b.peers.clone(),
             b.user_profiles.clone(),
             b.our_fqdn.clone(),
+            b.magicsock.self_cap_map_arc(),
         )));
 
         let (c2n_task, c2n_addr) =

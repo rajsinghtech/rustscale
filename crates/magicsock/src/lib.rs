@@ -1082,6 +1082,12 @@ impl Magicsock {
             .clone()
     }
 
+    /// Arc handle to the self node's CapMap. Used by the serve runner to
+    /// resolve VIP service IP addresses for serve-config TCP forwarding.
+    pub fn self_cap_map_arc(&self) -> Arc<RwLock<rustscale_tailcfg::NodeCapMap>> {
+        self.inner.self_cap_map.clone()
+    }
+
     /// The relay server extension, if this node is configured as a relay
     /// server. Returns `None` when `peer_relay_server` was not enabled.
     pub fn relay_server(&self) -> Option<&Arc<RelayServerExtension>> {

@@ -249,7 +249,7 @@ apply_derp_block() {
   local name="$1" zone="$2"
   echo "[gcp] applying DERP-forcing iptables block on $name" >&2
   ssh_sudo "$name" "$zone" \
-    'iptables -A OUTPUT -p udp --dport 53 -j ACCEPT; iptables -A OUTPUT -p udp -j DROP; iptables -L OUTPUT -n -v'
+    'iptables -A OUTPUT -p tcp --dport 53 -j ACCEPT; iptables -A OUTPUT -p udp --dport 53 -j ACCEPT; iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT; iptables -A OUTPUT -p udp -j DROP; iptables -L OUTPUT -n -v'
 }
 
 # ---------------------------------------------------------------------------
@@ -259,7 +259,7 @@ remove_derp_block() {
   local name="$1" zone="$2"
   echo "[gcp] removing DERP-forcing iptables block on $name" >&2
   ssh_sudo "$name" "$zone" \
-    'iptables -D OUTPUT -p udp --dport 53 -j ACCEPT 2>/dev/null; iptables -D OUTPUT -p udp -j DROP 2>/dev/null; iptables -L OUTPUT -n -v'
+    'iptables -D OUTPUT -p tcp --dport 53 -j ACCEPT 2>/dev/null; iptables -D OUTPUT -p udp --dport 53 -j ACCEPT 2>/dev/null; iptables -D OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null; iptables -D OUTPUT -p udp -j DROP 2>/dev/null; iptables -L OUTPUT -n -v'
 }
 
 # ---------------------------------------------------------------------------

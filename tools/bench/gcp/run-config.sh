@@ -209,9 +209,12 @@ run_rs_userspace() {
        --authkey $AUTHKEY --port $PORT --hostname $SHOST --state-dir /tmp/rs-srv \
        > /tmp/rs-srv.log 2>&1 & echo \$! > /tmp/rs-srv.pid"
 
-  # Wait for BENCH_READY 1.
+  # Wait for BENCH_READY 1. DERP path (UDP blocked) can take significantly longer
+  # than direct for the control plane handshake and IP assignment.
+  local timeout=180
+  [[ "$PATH_TAG" == "derp" ]] && timeout=300
   local elapsed=0
-  while (( elapsed < 180 )); do
+  while (( elapsed < timeout )); do
     if ssh_cmd "$SVM" "$SZONE" 'grep -q "BENCH_READY 1" /tmp/rs-srv.log 2>/dev/null' 2>/dev/null; then
       break
     fi
@@ -323,7 +326,9 @@ run_rs_tun() {
     local vm="${vm_zone%%:*}" zone="${vm_zone##*:}" logfile
     [[ "$vm" == "$SVM" ]] && logfile=/tmp/rs-tun-srv.log || logfile=/tmp/rs-tun-cli.log
     local elapsed=0
-    while (( elapsed < 120 )); do
+    local timeout=120
+    [[ "$PATH_TAG" == "derp" ]] && timeout=300
+    while (( elapsed < timeout )); do
       if ssh_cmd "$vm" "$zone" "grep -q 'BENCH_READY 1' $logfile 2>/dev/null" 2>/dev/null; then
         break
       fi

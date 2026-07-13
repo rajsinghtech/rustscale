@@ -1,6 +1,6 @@
 //! Safe, platform-neutral virtio-net GSO receive splitting.
 
-use std::io;
+use std::{collections::HashMap, io};
 
 use crate::TunPacketBatch;
 
@@ -158,6 +158,410 @@ fn pseudo(protocol: u8, src: &[u8], dst: &[u8], len: u16) -> u16 {
     let sum = checksum(dst, sum);
     let sum = checksum(&[0, protocol], sum);
     checksum(&len.to_be_bytes(), sum)
+}
+
+// ---------------------------------------------------------------------------
+// Linux write-side TCP GRO
+//
+// This section intentionally has no Linux types or syscalls.  It is the
+// write-side counterpart of the splitter above: it plans scatter/gather
+// frames by packet index, then Linux materializes iovecs while holding its
+// write-operation lock.  Keeping references out of the plan makes the logic
+// testable on every host and avoids self-referential packet storage.
+
+pub(crate) const MAX_GRO_IOVECS: usize = 1024;
+const TCP: u8 = 6;
+const TCP_ACK: u8 = 0x10;
+const TCP_PSH: u8 = 0x08;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PayloadFragment {
+    pub packet: usize,
+    pub start: usize,
+    pub end: usize,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct GroOutput {
+    pub header: [u8; VIRTIO_NET_HDR_LEN],
+    pub head: usize,
+    pub fragments: Vec<PayloadFragment>,
+}
+
+impl GroOutput {
+    pub(crate) fn iovec_count(&self) -> usize {
+        2 + self.fragments.len()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct TcpFlowKey {
+    src: [u8; 16],
+    dst: [u8; 16],
+    src_port: u16,
+    dst_port: u16,
+    ack: u32,
+    v6: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TcpMeta {
+    key: TcpFlowKey,
+    ip_len: usize,
+    tcp_len: usize,
+    payload: usize,
+    seq: u32,
+    psh: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TcpItem {
+    key: TcpFlowKey,
+    output: usize,
+    sent_seq: u32,
+    payload_len: u16,
+    gso_size: u16,
+    ip_len: u8,
+    tcp_len: u8,
+    psh: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Coalesce {
+    Prepend,
+    No,
+    Append,
+}
+
+/// Reusable TCP-only GRO planning state. `reset` retains all allocations.
+#[derive(Default)]
+pub(crate) struct TcpGroState {
+    flows: HashMap<TcpFlowKey, Vec<TcpItem>>,
+    item_pool: Vec<Vec<TcpItem>>,
+    outputs: Vec<GroOutput>,
+    output_pool: Vec<GroOutput>,
+}
+
+impl TcpGroState {
+    pub(crate) fn outputs(&self) -> &[GroOutput] {
+        &self.outputs
+    }
+
+    pub(crate) fn reset(&mut self) {
+        for (_, mut items) in self.flows.drain() {
+            items.clear();
+            self.item_pool.push(items);
+        }
+        for mut output in self.outputs.drain(..) {
+            output.fragments.clear();
+            self.output_pool.push(output);
+        }
+    }
+
+    /// Build an ordered TCP4/TCP6 GRO plan and apply VNET accounting to the
+    /// selected head packets. Malformed and non-TCP packets are scalar output.
+    pub(crate) fn plan(&mut self, packets: &mut [Vec<u8>]) {
+        self.reset();
+        for index in 0..packets.len() {
+            let Some(meta) = tcp_meta(&packets[index]) else {
+                self.push_scalar(index);
+                continue;
+            };
+            self.tcp_gro(index, meta, packets);
+        }
+        self.apply_accounting(packets);
+    }
+
+    fn push_scalar(&mut self, packet: usize) {
+        let mut output = self.output_pool.pop().unwrap_or(GroOutput {
+            header: [0; VIRTIO_NET_HDR_LEN],
+            head: packet,
+            fragments: Vec::new(),
+        });
+        output.header = [0; VIRTIO_NET_HDR_LEN];
+        output.head = packet;
+        output.fragments.clear();
+        self.outputs.push(output);
+    }
+
+    fn insert(&mut self, packet: usize, meta: TcpMeta) {
+        let output = self.outputs.len();
+        self.push_scalar(packet);
+        let items = self.flows.entry(meta.key).or_insert_with(|| {
+            let mut items = self.item_pool.pop().unwrap_or_default();
+            items.clear();
+            items
+        });
+        items.push(TcpItem {
+            key: meta.key,
+            output,
+            sent_seq: meta.seq,
+            payload_len: meta.payload as u16,
+            gso_size: meta.payload as u16,
+            ip_len: meta.ip_len as u8,
+            tcp_len: meta.tcp_len as u8,
+            psh: meta.psh,
+        });
+    }
+
+    fn tcp_gro(&mut self, packet: usize, meta: TcpMeta, packets: &mut [Vec<u8>]) {
+        let Some(item_len) = self.flows.get(&meta.key).map(Vec::len) else {
+            self.insert(packet, meta);
+            return;
+        };
+
+        for item_index in (0..item_len).rev() {
+            // Copy one candidate out of the table, rather than cloning the
+            // entire per-flow Vec on every packet.
+            let item = self.flows.get(&meta.key).expect("flow exists")[item_index];
+            let mode = self.can_coalesce(&packets[packet], meta, item, packets);
+            if mode == Coalesce::No {
+                continue;
+            }
+            if self.output_is_single(item.output)
+                && !tcp_checksum_valid(
+                    &packets[self.outputs[item.output].head],
+                    item.ip_len as usize,
+                    item.key.v6,
+                )
+            {
+                self.flows
+                    .get_mut(&meta.key)
+                    .expect("flow exists")
+                    .remove(item_index);
+                continue;
+            }
+            if !tcp_checksum_valid(&packets[packet], meta.ip_len, meta.key.v6) {
+                self.push_scalar(packet);
+                return;
+            }
+
+            let item = self.merge(packet, meta, item, mode, packets);
+            self.flows.get_mut(&meta.key).expect("flow exists")[item_index] = item;
+            return;
+        }
+        self.insert(packet, meta);
+    }
+
+    fn output_is_single(&self, output: usize) -> bool {
+        self.outputs[output].fragments.is_empty()
+    }
+
+    fn can_coalesce(
+        &self,
+        packet: &[u8],
+        meta: TcpMeta,
+        item: TcpItem,
+        packets: &[Vec<u8>],
+    ) -> Coalesce {
+        let output = &self.outputs[item.output];
+        if output.iovec_count() >= MAX_GRO_IOVECS {
+            return Coalesce::No;
+        }
+        let head = &packets[output.head];
+        if meta.tcp_len != item.tcp_len as usize
+            || !ip_headers_match(packet, head, meta.key.v6)
+            || meta.ip_len + meta.tcp_len + usize::from(item.payload_len) + meta.payload
+                > u16::MAX as usize
+        {
+            return Coalesce::No;
+        }
+        if meta.tcp_len > 20
+            && packet[meta.ip_len + 20..meta.ip_len + meta.tcp_len]
+                != head[item.ip_len as usize + 20..item.ip_len as usize + item.tcp_len as usize]
+        {
+            return Coalesce::No;
+        }
+        if meta.seq == item.sent_seq.wrapping_add(u32::from(item.payload_len)) {
+            if item.psh
+                || !item.payload_len.is_multiple_of(item.gso_size)
+                || meta.payload > usize::from(item.gso_size)
+            {
+                Coalesce::No
+            } else {
+                Coalesce::Append
+            }
+        } else if meta.seq.wrapping_add(meta.payload as u32) == item.sent_seq {
+            if meta.psh
+                || meta.payload < usize::from(item.gso_size)
+                || (meta.payload > usize::from(item.gso_size) && output.iovec_count() > 2)
+            {
+                Coalesce::No
+            } else {
+                Coalesce::Prepend
+            }
+        } else {
+            Coalesce::No
+        }
+    }
+
+    fn merge(
+        &mut self,
+        packet: usize,
+        meta: TcpMeta,
+        mut item: TcpItem,
+        mode: Coalesce,
+        packets: &[Vec<u8>],
+    ) -> TcpItem {
+        let output = &mut self.outputs[item.output];
+        if mode == Coalesce::Prepend {
+            let old_head = output.head;
+            output.head = packet;
+            output.fragments.insert(
+                0,
+                PayloadFragment {
+                    packet: old_head,
+                    start: usize::from(item.ip_len) + usize::from(item.tcp_len),
+                    // `payload_len` is aggregate after prior appends. The
+                    // old head itself owns only its original full packet
+                    // payload; earlier appended segments are already present
+                    // as their own fragments and stay after this insertion.
+                    end: packets[old_head].len(),
+                },
+            );
+            item.sent_seq = meta.seq;
+        } else {
+            output.fragments.push(PayloadFragment {
+                packet,
+                start: meta.ip_len + meta.tcp_len,
+                end: meta.ip_len + meta.tcp_len + meta.payload,
+            });
+            if meta.psh {
+                item.psh = true;
+            }
+        }
+        item.payload_len += meta.payload as u16;
+        item.gso_size = item.gso_size.max(meta.payload as u16);
+        item
+    }
+
+    fn apply_accounting(&mut self, packets: &mut [Vec<u8>]) {
+        for items in self.flows.values() {
+            for item in items {
+                let output = &mut self.outputs[item.output];
+                if output.fragments.is_empty() {
+                    continue;
+                }
+                let total = u16::from(item.ip_len) + u16::from(item.tcp_len) + item.payload_len;
+                let packet = &mut packets[output.head];
+                if item.psh {
+                    packet[usize::from(item.ip_len) + 13] |= TCP_PSH;
+                }
+                output.header = vnet_tcp_header(item);
+                if item.key.v6 {
+                    packet[4..6].copy_from_slice(&(total - u16::from(item.ip_len)).to_be_bytes());
+                } else {
+                    packet[2..4].copy_from_slice(&total.to_be_bytes());
+                    packet[10..12].fill(0);
+                    let sum = !checksum(&packet[..usize::from(item.ip_len)], 0);
+                    packet[10..12].copy_from_slice(&sum.to_be_bytes());
+                }
+                let (address, size) = if item.key.v6 { (8, 16) } else { (12, 4) };
+                let seed = checksum(
+                    &[],
+                    pseudo(
+                        TCP,
+                        &packet[address..address + size],
+                        &packet[address + size..address + 2 * size],
+                        total - u16::from(item.ip_len),
+                    ),
+                );
+                let checksum_at = usize::from(item.ip_len) + 16;
+                packet[checksum_at..checksum_at + 2].copy_from_slice(&seed.to_be_bytes());
+            }
+        }
+    }
+}
+
+fn vnet_tcp_header(item: &TcpItem) -> [u8; VIRTIO_NET_HDR_LEN] {
+    let mut header = [0; VIRTIO_NET_HDR_LEN];
+    header[0] = VIRTIO_NET_HDR_F_NEEDS_CSUM;
+    header[1] = if item.key.v6 { GSO_TCPV6 } else { GSO_TCPV4 };
+    header[2..4].copy_from_slice(&(u16::from(item.ip_len) + u16::from(item.tcp_len)).to_ne_bytes());
+    header[4..6].copy_from_slice(&item.gso_size.to_ne_bytes());
+    header[6..8].copy_from_slice(&u16::from(item.ip_len).to_ne_bytes());
+    header[8..10].copy_from_slice(&16_u16.to_ne_bytes());
+    header
+}
+
+fn tcp_meta(packet: &[u8]) -> Option<TcpMeta> {
+    if packet.len() > u16::MAX as usize || packet.len() < 40 {
+        return None;
+    }
+    let v6 = match packet[0] >> 4 {
+        4 if packet[0] & 0x0f == 5 && packet[9] == TCP => {
+            if u16::from_be_bytes(packet[2..4].try_into().ok()?) as usize != packet.len()
+                || packet[6] & 0x20 != 0
+                || packet[6] << 3 != 0
+                || packet[7] != 0
+            {
+                return None;
+            }
+            false
+        }
+        6 if packet.len() >= 60 && packet[6] == TCP => {
+            if u16::from_be_bytes(packet[4..6].try_into().ok()?) as usize != packet.len() - 40 {
+                return None;
+            }
+            true
+        }
+        _ => return None,
+    };
+    let ip_len = if v6 { 40 } else { 20 };
+    let tcp_len = usize::from(packet.get(ip_len + 12)? >> 4) * 4;
+    if !(20..=60).contains(&tcp_len) || packet.len() < ip_len + tcp_len {
+        return None;
+    }
+    let flags = *packet.get(ip_len + 13)?;
+    if flags != TCP_ACK && flags != TCP_ACK | TCP_PSH {
+        return None;
+    }
+    let payload = packet.len() - ip_len - tcp_len;
+    if payload == 0 {
+        return None;
+    }
+    let (address, size) = if v6 { (8, 16) } else { (12, 4) };
+    let mut src = [0; 16];
+    let mut dst = [0; 16];
+    src[..size].copy_from_slice(&packet[address..address + size]);
+    dst[..size].copy_from_slice(&packet[address + size..address + 2 * size]);
+    Some(TcpMeta {
+        key: TcpFlowKey {
+            src,
+            dst,
+            src_port: u16::from_be_bytes(packet[ip_len..ip_len + 2].try_into().ok()?),
+            dst_port: u16::from_be_bytes(packet[ip_len + 2..ip_len + 4].try_into().ok()?),
+            ack: u32::from_be_bytes(packet[ip_len + 8..ip_len + 12].try_into().ok()?),
+            v6,
+        },
+        ip_len,
+        tcp_len,
+        payload,
+        seq: u32::from_be_bytes(packet[ip_len + 4..ip_len + 8].try_into().ok()?),
+        psh: flags & TCP_PSH != 0,
+    })
+}
+
+fn ip_headers_match(packet: &[u8], head: &[u8], v6: bool) -> bool {
+    if v6 {
+        packet[0] == head[0] && packet[1] >> 4 == head[1] >> 4 && packet[7] == head[7]
+    } else {
+        packet[1] == head[1] && packet[6] >> 5 == head[6] >> 5 && packet[8] == head[8]
+    }
+}
+
+fn tcp_checksum_valid(packet: &[u8], ip_len: usize, v6: bool) -> bool {
+    let (address, size) = if v6 { (8, 16) } else { (12, 4) };
+    let Ok(length) = u16::try_from(packet.len().saturating_sub(ip_len)) else {
+        return false;
+    };
+    let initial = pseudo(
+        TCP,
+        &packet[address..address + size],
+        &packet[address + size..address + 2 * size],
+        length,
+    );
+    !checksum(&packet[ip_len..], initial) == 0
 }
 
 /// Split one virtio-net frame. On every error `batch` is empty and may be
@@ -752,5 +1156,412 @@ mod tests {
             &mut batch
         )
         .is_err());
+    }
+
+    fn tcp_packet(v6: bool, seq: u32, ack: u32, payload: &[u8], flags: u8) -> Vec<u8> {
+        let ip = if v6 { 40 } else { 20 };
+        let mut packet = vec![0; ip + 20 + payload.len()];
+        if v6 {
+            packet[0] = 0x60;
+            packet[4..6].copy_from_slice(&((20 + payload.len()) as u16).to_be_bytes());
+            packet[6] = TCP;
+            packet[7] = 64;
+            packet[8..24].copy_from_slice(&[1; 16]);
+            packet[24..40].copy_from_slice(&[2; 16]);
+        } else {
+            packet[0] = 0x45;
+            let total = packet.len() as u16;
+            packet[2..4].copy_from_slice(&total.to_be_bytes());
+            packet[8] = 64;
+            packet[9] = TCP;
+            packet[12..16].copy_from_slice(&[10, 0, 0, 1]);
+            packet[16..20].copy_from_slice(&[10, 0, 0, 2]);
+        }
+        packet[ip..ip + 2].copy_from_slice(&1000_u16.to_be_bytes());
+        packet[ip + 2..ip + 4].copy_from_slice(&2000_u16.to_be_bytes());
+        packet[ip + 4..ip + 8].copy_from_slice(&seq.to_be_bytes());
+        packet[ip + 8..ip + 12].copy_from_slice(&ack.to_be_bytes());
+        packet[ip + 12] = 0x50;
+        packet[ip + 13] = flags;
+        packet[ip + 20..].copy_from_slice(payload);
+        if !v6 {
+            let sum = !checksum(&packet[..ip], 0);
+            packet[10..12].copy_from_slice(&sum.to_be_bytes());
+        }
+        let (address, size) = if v6 { (8, 16) } else { (12, 4) };
+        let sum = !checksum(
+            &packet[ip..],
+            pseudo(
+                TCP,
+                &packet[address..address + size],
+                &packet[address + size..address + 2 * size],
+                (packet.len() - ip) as u16,
+            ),
+        );
+        packet[ip + 16..ip + 18].copy_from_slice(&sum.to_be_bytes());
+        packet
+    }
+
+    fn refresh_tcp_packet(packet: &mut [u8]) {
+        let v6 = packet[0] >> 4 == 6;
+        let ip = if v6 { 40 } else { 20 };
+        let packet_len = packet.len();
+        if v6 {
+            packet[4..6].copy_from_slice(&((packet_len - ip) as u16).to_be_bytes());
+        } else {
+            packet[2..4].copy_from_slice(&(packet_len as u16).to_be_bytes());
+            packet[10..12].fill(0);
+            let sum = !checksum(&packet[..ip], 0);
+            packet[10..12].copy_from_slice(&sum.to_be_bytes());
+        }
+        let (address, size) = if v6 { (8, 16) } else { (12, 4) };
+        packet[ip + 16..ip + 18].fill(0);
+        let sum = !checksum(
+            &packet[ip..],
+            pseudo(
+                TCP,
+                &packet[address..address + size],
+                &packet[address + size..address + 2 * size],
+                (packet_len - ip) as u16,
+            ),
+        );
+        packet[ip + 16..ip + 18].copy_from_slice(&sum.to_be_bytes());
+    }
+
+    fn tcp_packet_with_options(
+        v6: bool,
+        seq: u32,
+        ack: u32,
+        payload: &[u8],
+        options: &[u8],
+    ) -> Vec<u8> {
+        assert!(options.len().is_multiple_of(4));
+        let ip = if v6 { 40 } else { 20 };
+        let mut packet = tcp_packet(v6, seq, ack, payload, TCP_ACK);
+        packet.splice(ip + 20..ip + 20, options.iter().copied());
+        packet[ip + 12] = ((20 + options.len()) as u8 / 4) << 4;
+        refresh_tcp_packet(&mut packet);
+        packet
+    }
+
+    fn gro_output_count(packets: &mut [Vec<u8>]) -> usize {
+        let mut state = TcpGroState::default();
+        state.plan(packets);
+        state.outputs().len()
+    }
+
+    #[test]
+    fn tcp_gro_interleaves_flows_and_keeps_udp_scalar() {
+        let mut packets = vec![
+            tcp_packet(false, 10, 1, b"aaaa", TCP_ACK),
+            tcp_packet(true, 20, 1, b"bbbb", TCP_ACK),
+            vec![
+                0x45, 0, 0, 20, 0, 0, 0, 0, 64, 17, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2,
+            ],
+            tcp_packet(false, 14, 1, b"cccc", TCP_ACK | TCP_PSH),
+            tcp_packet(true, 24, 1, b"dddd", TCP_ACK),
+        ];
+        let udp = packets[2].clone();
+        let mut state = TcpGroState::default();
+        state.plan(&mut packets);
+        assert_eq!(state.outputs().len(), 3);
+        assert_eq!(state.outputs()[0].fragments.len(), 1);
+        assert_eq!(state.outputs()[1].fragments.len(), 1);
+        assert_eq!(state.outputs()[2].head, 2);
+        assert_eq!(packets[2], udp);
+        assert_eq!(state.outputs()[0].header[1], GSO_TCPV4);
+        assert_eq!(state.outputs()[1].header[1], GSO_TCPV6);
+        assert_eq!(packets[0][33] & TCP_PSH, TCP_PSH);
+    }
+
+    #[test]
+    fn tcp_gro_ack_prepend_and_checksum_rules() {
+        let original = vec![
+            tcp_packet(false, 104, 7, b"tail", TCP_ACK),
+            tcp_packet(false, 100, 7, b"head", TCP_ACK),
+            tcp_packet(false, 108, 7, b"more", TCP_ACK),
+            tcp_packet(false, 112, 8, b"ack!", TCP_ACK),
+        ];
+        let mut packets = original.clone();
+        let mut state = TcpGroState::default();
+        state.plan(&mut packets);
+        assert_eq!(state.outputs().len(), 2);
+        let output = &state.outputs()[0];
+        assert_eq!(output.head, 1);
+        assert_eq!(output.fragments.len(), 2);
+        assert_eq!(output.fragments[0].packet, 0);
+        assert_eq!(output.fragments[1].packet, 2);
+        assert_eq!(output.fragments[0].end, packets[0].len());
+        assert_eq!(u16::from_be_bytes(packets[1][2..4].try_into().unwrap()), 52);
+        let mut raw = output.header.to_vec();
+        raw.extend_from_slice(&packets[output.head]);
+        for fragment in &output.fragments {
+            raw.extend_from_slice(&packets[fragment.packet][fragment.start..fragment.end]);
+        }
+        let mut split = TunPacketBatch::new();
+        split_virtio(&raw, &mut split).unwrap();
+        let mut expected = vec![
+            original[1].clone(),
+            original[0].clone(),
+            original[2].clone(),
+        ];
+        for (index, packet) in expected.iter_mut().enumerate() {
+            packet[4..6].copy_from_slice(&(index as u16).to_be_bytes());
+            packet[10..12].fill(0);
+            let sum = !checksum(&packet[..20], 0);
+            packet[10..12].copy_from_slice(&sum.to_be_bytes());
+        }
+        assert_eq!(split.packets(), expected.as_slice());
+
+        // Both a corrupt head and a corrupt incoming packet remain scalar.
+        let mut bad = vec![
+            tcp_packet(false, 1, 1, b"good", TCP_ACK),
+            tcp_packet(false, 5, 1, b"next", TCP_ACK),
+        ];
+        bad[0][36] ^= 1;
+        assert_eq!(gro_output_count(&mut bad), 2);
+        let mut bad = vec![
+            tcp_packet(false, 1, 1, b"good", TCP_ACK),
+            tcp_packet(false, 5, 1, b"next", TCP_ACK),
+        ];
+        bad[1][36] ^= 1;
+        assert_eq!(gro_output_count(&mut bad), 2);
+    }
+
+    #[test]
+    fn tcp_gro_requires_matching_ip_headers_and_tcp_options() {
+        #[derive(Clone, Copy, Debug)]
+        enum Change {
+            V4Tos,
+            V4Ttl,
+            V4Df,
+            V4Reserved,
+            V6TrafficClassHigh,
+            V6TrafficClassLow,
+            V6HopLimit,
+        }
+        for change in [
+            Change::V4Tos,
+            Change::V4Ttl,
+            Change::V4Df,
+            Change::V4Reserved,
+            Change::V6TrafficClassHigh,
+            Change::V6TrafficClassLow,
+            Change::V6HopLimit,
+        ] {
+            let v6 = matches!(
+                change,
+                Change::V6TrafficClassHigh | Change::V6TrafficClassLow | Change::V6HopLimit
+            );
+            let mut packets = vec![
+                tcp_packet(v6, 1, 1, b"same", TCP_ACK),
+                tcp_packet(v6, 5, 1, b"next", TCP_ACK),
+            ];
+            match change {
+                Change::V4Tos => packets[1][1] = 1,
+                Change::V4Ttl => packets[1][8] = 63,
+                Change::V4Df => packets[1][6] = 0x40,
+                Change::V4Reserved => packets[1][6] = 0x80,
+                Change::V6TrafficClassHigh => packets[1][0] |= 1,
+                Change::V6TrafficClassLow => packets[1][1] |= 0x10,
+                Change::V6HopLimit => packets[1][7] = 63,
+            }
+            refresh_tcp_packet(&mut packets[1]);
+            assert_eq!(gro_output_count(&mut packets), 2, "{change:?}");
+        }
+
+        let mut matching = vec![
+            tcp_packet_with_options(false, 1, 1, b"same", &[1, 1, 1, 1]),
+            tcp_packet_with_options(false, 5, 1, b"next", &[1, 1, 1, 1]),
+        ];
+        assert_eq!(gro_output_count(&mut matching), 1);
+        let mut different = vec![
+            tcp_packet_with_options(false, 1, 1, b"same", &[1, 1, 1, 1]),
+            tcp_packet_with_options(false, 5, 1, b"next", &[1, 1, 1, 2]),
+        ];
+        assert_eq!(gro_output_count(&mut different), 2);
+    }
+
+    #[test]
+    fn tcp_gro_segment_size_and_aggregate_limits_match_wireguard_go() {
+        for (name, first_seq, first_len, second_seq, second_len, outputs) in [
+            ("append permits a shorter tail", 1, 4, 5, 3, 1),
+            ("append rejects a larger segment", 1, 4, 5, 5, 2),
+            ("prepend rejects a shorter segment", 5, 4, 2, 3, 2),
+            ("prepend permits a larger first segment", 5, 4, 0, 5, 1),
+        ] {
+            let first_payload = vec![b'a'; first_len];
+            let second_payload = vec![b'b'; second_len];
+            let mut packets = vec![
+                tcp_packet(false, first_seq, 1, &first_payload, TCP_ACK),
+                tcp_packet(false, second_seq, 1, &second_payload, TCP_ACK),
+            ];
+            assert_eq!(gro_output_count(&mut packets), outputs, "{name}");
+        }
+
+        let first_payload = vec![b'a'; 32_748];
+        let second_payload = vec![b'b'; 32_748];
+        let mut overflow = vec![
+            tcp_packet(false, 1, 1, &first_payload, TCP_ACK),
+            tcp_packet(false, 32_749, 1, &second_payload, TCP_ACK),
+        ];
+        assert_eq!(gro_output_count(&mut overflow), 2);
+    }
+
+    #[test]
+    fn tcp_gro_vnet_accounting_and_reset_reuse() {
+        let mut packets = vec![
+            tcp_packet(false, 1, 1, b"abcd", TCP_ACK),
+            tcp_packet(false, 5, 1, b"efgh", TCP_ACK),
+        ];
+        let mut state = TcpGroState::default();
+        state.plan(&mut packets);
+        let output = &state.outputs()[0];
+        assert_eq!(output.header[0], VIRTIO_NET_HDR_F_NEEDS_CSUM);
+        assert_eq!(output.header[1], GSO_TCPV4);
+        assert_eq!(&output.header[2..4], &40_u16.to_ne_bytes());
+        assert_eq!(&output.header[4..6], &4_u16.to_ne_bytes());
+        assert_eq!(&output.header[6..8], &20_u16.to_ne_bytes());
+        assert_eq!(&output.header[8..10], &16_u16.to_ne_bytes());
+        assert_eq!(u16::from_be_bytes(packets[0][2..4].try_into().unwrap()), 48);
+        assert!(!tcp_checksum_valid(&packets[0], 20, false));
+        state.reset();
+        assert!(state.outputs().is_empty());
+    }
+
+    #[test]
+    fn tcp_gro_append_then_prepend_keeps_old_head_bounds() {
+        let original = vec![
+            tcp_packet(false, 100, 7, b"aaaa", TCP_ACK),
+            tcp_packet(false, 104, 7, b"bbbb", TCP_ACK),
+            tcp_packet(false, 96, 7, b"cccc", TCP_ACK),
+        ];
+        let mut packets = original.clone();
+        let mut state = TcpGroState::default();
+        state.plan(&mut packets);
+        assert_eq!(state.outputs().len(), 1);
+        let output = &state.outputs()[0];
+        assert_eq!(output.head, 2);
+        assert_eq!(output.fragments.len(), 2);
+        assert_eq!(output.fragments[0].packet, 0);
+        assert_eq!(output.fragments[0].end, packets[0].len());
+        assert_eq!(output.fragments[1].packet, 1);
+        let mut raw = output.header.to_vec();
+        raw.extend_from_slice(&packets[output.head]);
+        for fragment in &output.fragments {
+            raw.extend_from_slice(&packets[fragment.packet][fragment.start..fragment.end]);
+        }
+        let mut split = TunPacketBatch::new();
+        split_virtio(&raw, &mut split).unwrap();
+        let mut expected = vec![
+            original[2].clone(),
+            original[0].clone(),
+            original[1].clone(),
+        ];
+        for (index, packet) in expected.iter_mut().enumerate() {
+            packet[4..6].copy_from_slice(&(index as u16).to_be_bytes());
+            packet[10..12].fill(0);
+            let sum = !checksum(&packet[..20], 0);
+            packet[10..12].copy_from_slice(&sum.to_be_bytes());
+        }
+        assert_eq!(split.packets(), expected.as_slice());
+    }
+
+    #[test]
+    fn tcp_gro_materialized_frames_round_trip_through_splitter() {
+        for v6 in [false, true] {
+            let original = vec![
+                tcp_packet(v6, u32::MAX - 2, 9, b"abcd", TCP_ACK),
+                tcp_packet(v6, 1, 9, b"efgh", TCP_ACK | TCP_PSH),
+            ];
+            let mut packets = original.clone();
+            let mut state = TcpGroState::default();
+            state.plan(&mut packets);
+            let output = &state.outputs()[0];
+            let mut raw = output.header.to_vec();
+            raw.extend_from_slice(&packets[output.head]);
+            for fragment in &output.fragments {
+                raw.extend_from_slice(&packets[fragment.packet][fragment.start..fragment.end]);
+            }
+            let mut split = TunPacketBatch::new();
+            split_virtio(&raw, &mut split).unwrap();
+            let mut expected = original;
+            if !v6 {
+                // The receive-side splitter follows wireguard-go and assigns
+                // a distinct IPv4 ID to later reconstructed segments.
+                expected[1][4..6].copy_from_slice(&1_u16.to_be_bytes());
+                expected[1][10..12].fill(0);
+                let sum = !checksum(&expected[1][..20], 0);
+                expected[1][10..12].copy_from_slice(&sum.to_be_bytes());
+            }
+            assert_eq!(split.packets(), expected.as_slice());
+        }
+    }
+
+    #[test]
+    fn tcp_gro_malformed_and_incompatible_packets_stay_scalar() {
+        let base = tcp_packet(false, 1, 1, b"data", TCP_ACK);
+        let mut cases = Vec::new();
+        let mut options = base.clone();
+        options[0] = 0x46;
+        cases.push(options);
+        let mut fragment = base.clone();
+        fragment[6] = 0x20;
+        cases.push(fragment);
+        let mut no_payload = base.clone();
+        no_payload.truncate(40);
+        no_payload[2..4].copy_from_slice(&40_u16.to_be_bytes());
+        cases.push(no_payload);
+        let mut syn = base.clone();
+        syn[33] = 0x12;
+        cases.push(syn);
+        let mut bad_length = base.clone();
+        bad_length[2..4].copy_from_slice(&99_u16.to_be_bytes());
+        cases.push(bad_length);
+        let mut extension = tcp_packet(true, 1, 1, b"data", TCP_ACK);
+        extension[6] = 0;
+        cases.push(extension);
+        for packet in cases {
+            let before = packet.clone();
+            let mut packets = vec![packet];
+            let mut state = TcpGroState::default();
+            state.plan(&mut packets);
+            assert_eq!(state.outputs().len(), 1);
+            assert!(state.outputs()[0].fragments.is_empty());
+            assert_eq!(packets[0], before);
+        }
+    }
+
+    #[test]
+    fn tcp_gro_arbitrary_inputs_never_escape_packet_ranges() {
+        let mut seed = 0x1234_5678_u32;
+        for batch_len in 0..=16 {
+            let mut packets = Vec::new();
+            for _ in 0..batch_len {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let len = (seed as usize) % 96;
+                let mut packet = vec![0; len];
+                for byte in &mut packet {
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    *byte = seed as u8;
+                }
+                packets.push(packet);
+            }
+            let before = packets.clone();
+            let mut state = TcpGroState::default();
+            state.plan(&mut packets);
+            assert!(state.outputs().len() <= before.len());
+            for output in state.outputs() {
+                assert!(output.head < packets.len());
+                for fragment in &output.fragments {
+                    assert!(fragment.packet < packets.len());
+                    assert!(fragment.start <= fragment.end);
+                    assert!(fragment.end <= packets[fragment.packet].len());
+                }
+                if output.fragments.is_empty() {
+                    assert_eq!(packets[output.head], before[output.head]);
+                }
+            }
+        }
     }
 }

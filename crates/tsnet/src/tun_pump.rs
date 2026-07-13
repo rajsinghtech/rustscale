@@ -21,6 +21,7 @@ pub(crate) async fn run_tun_pump(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut batch = rustscale_tun::TunPacketBatch::new();
     let mut outbound = OutboundBatchScratch::default();
+    let mut inbound = InboundBatchScratch::default();
 
     loop {
         if cancel.is_cancelled() {
@@ -47,17 +48,30 @@ pub(crate) async fn run_tun_pump(
             // magicsock recv -> WG decapsulate -> filter -> TUN write.
             result = wg_recv.recv() => {
                 if let Some(dgram) = result {
-                    process_tun_inbound(
-                        &magicsock, &wg_tunnels, &filter, &packet_drops, &tun, &dgram, &capture,
-                    ).await;
-
-                    // Drain any additional immediately-available datagrams
-                    // to batch a burst of packets into a single scheduler turn.
-                    while let Ok(more) = wg_recv.try_recv() {
-                        process_tun_inbound(
-                            &magicsock, &wg_tunnels, &filter, &packet_drops, &tun, &more, &capture,
+                    inbound.clear();
+                    take_immediate_burst(dgram, &mut wg_recv, &mut inbound.datagrams);
+                    let (datagrams, plaintext, replies) = (
+                        &inbound.datagrams,
+                        &mut inbound.plaintext,
+                        &mut inbound.replies,
+                    );
+                    for dgram in datagrams {
+                        collect_tun_inbound(
+                            &wg_tunnels, &filter, &packet_drops, dgram, &capture,
+                            plaintext, replies,
                         ).await;
                     }
+                    // Datagrams are ciphertext ownership; release their
+                    // nested buffers before reply I/O or a blocked TUN write.
+                    inbound.datagrams.clear();
+                    let reply_socket = magicsock.clone();
+                    flush_inbound_burst(tun.as_ref(), &mut inbound, move |peer, reply| {
+                        let magicsock = reply_socket.clone();
+                        async move {
+                            let _ = magicsock.send(peer, &reply).await;
+                        }
+                    })
+                    .await;
                 } else {
                     log::warn!("tsnet: magicsock wg channel closed (tun)");
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -67,6 +81,56 @@ pub(crate) async fn run_tun_pump(
                 tick_wg_timers(&magicsock, &wg_tunnels).await;
             }
         }
+    }
+}
+
+/// Take the triggering datagram plus at most 127 immediately-ready entries.
+fn take_immediate_burst<T>(first: T, receiver: &mut mpsc::Receiver<T>, output: &mut Vec<T>) {
+    output.push(first);
+    while output.len() < rustscale_tun::TunPacketBatch::MAX_PACKETS {
+        let Ok(next) = receiver.try_recv() else { break };
+        output.push(next);
+    }
+}
+
+/// Send replies before the one batch write. Draining drops completed reply
+/// buffers; `Vec::clear` only retains the outer allocation and must not be
+/// mistaken for retaining boringtun plaintext allocations.
+async fn flush_inbound_burst<F, Fut>(
+    tun: &dyn Tun,
+    inbound: &mut InboundBatchScratch,
+    mut send_reply: F,
+) where
+    F: FnMut(NodePublic, Vec<u8>) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    for (peer, reply) in inbound.replies.drain(..) {
+        send_reply(peer, reply).await;
+    }
+    if !inbound.plaintext.is_empty() {
+        if let Err(error) = tun.write_batch(&mut inbound.plaintext).await {
+            log::warn!("tun batch write error: {error}");
+        }
+        // Retain only the outer Vec allocation while idle; plaintext buffers
+        // are consume-on-write and must not remain resident after return.
+        inbound.plaintext.clear();
+    }
+}
+
+/// Reused outer storage for one bounded inbound WireGuard burst. Clearing it
+/// does not retain the individual decrypted plaintext buffers.
+#[derive(Default)]
+struct InboundBatchScratch {
+    datagrams: Vec<rustscale_magicsock::WgDatagram>,
+    plaintext: Vec<Vec<u8>>,
+    replies: Vec<(NodePublic, Vec<u8>)>,
+}
+
+impl InboundBatchScratch {
+    fn clear(&mut self) {
+        self.datagrams.clear();
+        self.plaintext.clear();
+        self.replies.clear();
     }
 }
 
@@ -271,6 +335,68 @@ mod tests {
     use super::*;
     use rustscale_key::NodePrivate;
 
+    struct BatchProbe {
+        events: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+
+    struct PendingProbe {
+        replies_seen: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        polled: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<usize>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tun for PendingProbe {
+        async fn read_batch(
+            &self,
+            _batch: &mut rustscale_tun::TunPacketBatch,
+        ) -> std::io::Result<()> {
+            unreachable!("write-only TUN probe")
+        }
+        async fn write_packet(&self, _packet: &[u8]) -> std::io::Result<()> {
+            unreachable!("write_batch must be used")
+        }
+        async fn write_batch(&self, _packets: &mut [Vec<u8>]) -> std::io::Result<()> {
+            if let Some(polled) = self.polled.lock().unwrap().take() {
+                let _ = polled.send(self.replies_seen.load(std::sync::atomic::Ordering::SeqCst));
+            }
+            std::future::pending().await
+        }
+        fn name(&self) -> &'static str {
+            "pending-probe"
+        }
+        fn mtu(&self) -> usize {
+            1280
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Tun for BatchProbe {
+        async fn read_batch(
+            &self,
+            _batch: &mut rustscale_tun::TunPacketBatch,
+        ) -> std::io::Result<()> {
+            unreachable!("write-only TUN probe")
+        }
+
+        async fn write_packet(&self, _packet: &[u8]) -> std::io::Result<()> {
+            unreachable!("write_batch must be used")
+        }
+
+        async fn write_batch(&self, packets: &mut [Vec<u8>]) -> std::io::Result<()> {
+            assert_eq!(packets.len(), 2);
+            self.events.lock().unwrap().push("write");
+            Err(std::io::Error::other("intentional write failure"))
+        }
+
+        fn name(&self) -> &'static str {
+            "batch-probe"
+        }
+
+        fn mtu(&self) -> usize {
+            1280
+        }
+    }
+
     fn tunnel_for(peer: &NodePublic) -> Arc<Mutex<WgTunn>> {
         Arc::new(Mutex::new(
             WgTunn::new(&NodePrivate::generate(), peer, 1).expect("tunnel"),
@@ -353,5 +479,74 @@ mod tests {
             shapes(&runs),
             vec![(Some(a.clone()), 0, 1), (None, 1, 2), (Some(a), 2, 3)]
         );
+    }
+
+    #[test]
+    fn immediate_burst_is_capped_at_tun_batch_capacity() {
+        let (tx, mut rx) = mpsc::channel(256);
+        for value in 1_u16..=130 {
+            tx.try_send(value).unwrap();
+        }
+        let mut burst = Vec::new();
+        take_immediate_burst(0, &mut rx, &mut burst);
+        assert_eq!(burst.len(), rustscale_tun::TunPacketBatch::MAX_PACKETS);
+        assert_eq!(burst[0], 0);
+        assert_eq!(burst.last(), Some(&127));
+        assert_eq!(rx.try_recv().unwrap(), 128);
+    }
+
+    #[tokio::test]
+    async fn replies_complete_before_one_failed_batch_write() {
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let tun = BatchProbe {
+            events: events.clone(),
+        };
+        let peer = NodePrivate::generate().public();
+        let mut inbound = InboundBatchScratch {
+            datagrams: Vec::new(),
+            plaintext: vec![vec![1], vec![2]],
+            replies: vec![(peer.clone(), vec![3]), (peer, vec![4])],
+        };
+        let reply_events = events.clone();
+        flush_inbound_burst(&tun, &mut inbound, move |_peer, _reply| {
+            let events = reply_events.clone();
+            async move { events.lock().unwrap().push("reply") }
+        })
+        .await;
+        assert_eq!(*events.lock().unwrap(), vec!["reply", "reply", "write"]);
+        assert!(inbound.replies.is_empty());
+        assert!(inbound.plaintext.is_empty());
+    }
+
+    #[tokio::test]
+    async fn replies_finish_before_a_pending_batch_write_is_polled() {
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (polled_tx, polled_rx) = tokio::sync::oneshot::channel();
+        let tun = PendingProbe {
+            replies_seen: seen.clone(),
+            polled: std::sync::Mutex::new(Some(polled_tx)),
+        };
+        let peer = NodePrivate::generate().public();
+        let mut inbound = InboundBatchScratch {
+            datagrams: Vec::new(),
+            plaintext: vec![vec![1]],
+            replies: vec![(peer.clone(), vec![2]), (peer, vec![3])],
+        };
+        let task = tokio::spawn(async move {
+            flush_inbound_burst(&tun, &mut inbound, move |_peer, _reply| {
+                let seen = seen.clone();
+                async move {
+                    seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            })
+            .await;
+        });
+        let replies_at_write =
+            tokio::time::timeout(std::time::Duration::from_millis(100), polled_rx)
+                .await
+                .expect("write_batch was polled")
+                .unwrap();
+        assert_eq!(replies_at_write, 2);
+        task.abort();
     }
 }

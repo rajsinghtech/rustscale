@@ -141,6 +141,31 @@ pub trait Tun: Send + Sync {
     /// Write one IP packet to the device.
     async fn write_packet(&self, packet: &[u8]) -> io::Result<()>;
 
+    /// Write an ordered batch of owned IP packets to the device.
+    ///
+    /// This is consume-on-write storage: once this future is polled, an
+    /// OS-backed implementation may permanently rewrite selected packet
+    /// headers. Those mutations can remain after success, I/O error, or
+    /// cancellation; callers must replace or clear packet contents before
+    /// reusing them. Callers that need original bytes (for example capture)
+    /// must observe them before this boundary. An empty batch is a successful
+    /// no-op.
+    ///
+    /// The default deliberately retains the scalar contract: it attempts every
+    /// packet in order and returns the first error only after attempting the
+    /// remainder of the batch.
+    async fn write_batch(&self, packets: &mut [Vec<u8>]) -> io::Result<()> {
+        let mut first_error = None;
+        for packet in packets {
+            if let Err(error) = self.write_packet(packet).await {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
     /// The OS-assigned interface name (e.g. `utun4`).
     fn name(&self) -> &str;
 

@@ -105,7 +105,7 @@ pub(crate) use link_monitor::{
     spawn_periodic_endpoint_updates,
 };
 pub(crate) use map_update::{spawn_map_update_task, KeyRotationCtx};
-pub(crate) use netstack_pump::{process_tun_inbound, run_netstack_pump, tick_wg_timers};
+pub(crate) use netstack_pump::{collect_tun_inbound, run_netstack_pump, tick_wg_timers};
 pub(crate) use tun_pump::{create_tun_device, run_tun_pump, sync_router, SharedRouter};
 pub use util::TunModeConfig;
 pub(crate) use util::{

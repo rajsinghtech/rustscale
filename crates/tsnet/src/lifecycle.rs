@@ -173,6 +173,7 @@ impl Server {
             b.tailscale_ips.clone(),
             offering_exit_node,
             Some(taildrop.clone()),
+            Some(b.sockstats.clone()),
         )
         .await;
         tasks.push(peerapi_task);
@@ -556,6 +557,7 @@ impl Server {
             b.tailscale_ips.clone(),
             offering_exit_node,
             Some(taildrop.clone()),
+            Some(b.sockstats.clone()),
         )
         .await;
 
@@ -913,6 +915,7 @@ impl Server {
             disable_direct_paths: false,
             peer_relay_server: false,
             relay_server_config: None,
+            sockstats: None,
         })
         .await
         .map_err(TsnetError::Magicsock)?;
@@ -1030,6 +1033,12 @@ impl Server {
             "control connection lost: no map activity for over 3 minutes",
             std::time::Duration::from_mins(3),
         );
+
+        // Socket-statistics registry (per-label TX/RX byte counters).
+        // Shared across magicsock, DERP, DNS, and the C2N/PeerAPI debug
+        // endpoints. Best-effort: instrumentation is fire-and-forget atomic
+        // increments with no error paths.
+        let sockstats = Arc::new(rustscale_sockstats::SockStats::new());
 
         // IPN state machine backend. Created early so state transitions
         // are tracked from the start. Want_running is set immediately;
@@ -1513,6 +1522,7 @@ impl Server {
             disable_direct_paths: self.config.disable_direct_paths,
             peer_relay_server: self.config.peer_relay_server,
             relay_server_config: self.config.relay_server_config.clone(),
+            sockstats: Some(sockstats.clone()),
         })
         .await?;
         let magicsock = Arc::new(magicsock_inner);
@@ -1616,6 +1626,7 @@ impl Server {
                 tailscale_ips: tailscale_ips.clone(),
                 our_fqdn: our_fqdn.clone(),
                 magicsock: magicsock.clone(),
+                sockstats: sockstats.clone(),
             },
             c2n_log_level,
         ));
@@ -1670,6 +1681,7 @@ impl Server {
             key_expired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             ipn_backend,
             map_session,
+            sockstats,
         })
     }
 

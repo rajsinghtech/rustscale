@@ -153,6 +153,10 @@ pub struct MagicsockConfig {
     /// defaults are used (30s bind lifetime, 5min steady-state). Tests use
     /// shortened lifetimes. Only effective when `peer_relay_server` is true.
     pub relay_server_config: Option<rustscale_udprelay::ServerConfig>,
+    /// Optional socket-statistics registry. When provided, magicsock records
+    /// UDP TX/RX bytes per label (`MagicsockConnUDP4` / `MagicsockConnUDP6`).
+    /// Best-effort: instrumentation never affects send/recv error paths.
+    pub sockstats: Option<Arc<rustscale_sockstats::SockStats>>,
 }
 
 /// A received WG datagram with its sender identified.
@@ -203,6 +207,11 @@ struct Inner {
     /// Last NetInfo received from control (or from local probing). Used to
     /// deduplicate updates and track PreferredDERP / connectivity changes.
     net_info: RwLock<Option<rustscale_tailcfg::NetInfo>>,
+    /// Per-label socket TX/RX counters for magicsock's UDP socket.
+    /// `None` when no sockstats registry was injected. Best-effort: recording
+    /// is a relaxed atomic increment and never affects send/recv error paths.
+    sockstats_udp4: Option<rustscale_sockstats::LabelHandle>,
+    sockstats_udp6: Option<rustscale_sockstats::LabelHandle>,
 }
 
 /// Manages DERP connections across multiple regions.
@@ -588,6 +597,15 @@ impl Magicsock {
         // Self node's CapMap — shared between Inner and RelayServerExtension.
         let self_cap_map = Arc::new(RwLock::new(std::collections::BTreeMap::new()));
 
+        // Per-label UDP sockstat handles (best-effort, fire-and-forget).
+        let (sockstats_udp4, sockstats_udp6) = match &config.sockstats {
+            Some(stats) => (
+                Some(stats.label_handle(rustscale_sockstats::Label::MagicsockConnUDP4)),
+                Some(stats.label_handle(rustscale_sockstats::Label::MagicsockConnUDP6)),
+            ),
+            None => (None, None),
+        };
+
         // Start the relay server extension if enabled.
         let relay_server = if config.peer_relay_server {
             let ext =
@@ -616,6 +634,8 @@ impl Magicsock {
             peer_mtu_enabled: Arc::new(AtomicBool::new(false)),
             background_tasks: RwLock::new(HashMap::new()),
             net_info: RwLock::new(None),
+            sockstats_udp4,
+            sockstats_udp6,
         });
 
         // Spawn the relay manager event loop. The handle is stored in Inner
@@ -956,6 +976,8 @@ impl Magicsock {
                         if !treat_as_lost_udp(&e) {
                             return Err(MagicsockError::Io(e));
                         }
+                    } else {
+                        self.inner.record_udp_tx(addr, datagram.len());
                     }
                     return Ok(());
                 }
@@ -971,6 +993,8 @@ impl Magicsock {
                         if !treat_as_lost_udp(&e) {
                             return Err(MagicsockError::Io(e));
                         }
+                    } else {
+                        self.inner.record_udp_tx(addr, framed.len());
                     }
                     return Ok(());
                 }
@@ -1254,10 +1278,12 @@ fn spawn_recv_tasks(
             loop {
                 match udp.recv_from(&mut buf).await {
                     Ok((len, addr)) => {
+                        inner.record_udp_rx(addr, len);
                         inner.handle_udp_packet(&buf[..len], addr).await;
                         // Drain the rest of the currently-ready packet burst
                         // without another await on the socket.
                         while let Ok((len2, addr2)) = udp.try_recv_from(&mut buf) {
+                            inner.record_udp_rx(addr2, len2);
                             inner.handle_udp_packet(&buf[..len2], addr2).await;
                         }
                     }
@@ -1563,11 +1589,17 @@ impl relay_manager::RelayManagerContext for Inner {
             };
             let udp = udp.clone();
             let framed = framed.clone();
+            let handle = match addr {
+                SocketAddr::V4(_) => self.sockstats_udp4.clone(),
+                SocketAddr::V6(_) => self.sockstats_udp6.clone(),
+            };
             tokio::spawn(async move {
                 if let Err(e) = udp.send_to(&framed, addr).await {
                     if !treat_as_lost_udp(&e) {
                         log::debug!("magicsock: disco UDP send failed: {e}");
                     }
+                } else if let Some(ref h) = handle {
+                    h.record_tx(framed.len());
                 }
             });
         }
@@ -1662,6 +1694,47 @@ impl relay_manager::RelayManagerContext for Inner {
 }
 
 impl Inner {
+    /// Record `n` bytes sent over the UDP socket to `addr` on the matching
+    /// v4/v6 sockstats label. Best-effort: no-op when no registry is wired.
+    fn record_udp_tx(&self, addr: SocketAddr, n: usize) {
+        if n == 0 {
+            return;
+        }
+        match addr {
+            SocketAddr::V4(_) => {
+                if let Some(ref h) = self.sockstats_udp4 {
+                    h.record_tx(n);
+                }
+            }
+            SocketAddr::V6(_) => {
+                if let Some(ref h) = self.sockstats_udp6 {
+                    h.record_tx(n);
+                }
+            }
+        }
+    }
+
+    /// Record `n` bytes received over the UDP socket from `addr` on the
+    /// matching v4/v6 sockstats label. Best-effort: no-op when no registry is
+    /// wired.
+    fn record_udp_rx(&self, addr: SocketAddr, n: usize) {
+        if n == 0 {
+            return;
+        }
+        match addr {
+            SocketAddr::V4(_) => {
+                if let Some(ref h) = self.sockstats_udp4 {
+                    h.record_rx(n);
+                }
+            }
+            SocketAddr::V6(_) => {
+                if let Some(ref h) = self.sockstats_udp6 {
+                    h.record_rx(n);
+                }
+            }
+        }
+    }
+
     /// Send a disco ping to `addr` for `peer_key` with the given purpose.
     /// When PMTUD is enabled and the purpose is `Discovery`, sends multiple
     /// pings at sizes from `WIRE_MTUs_TOProbe`. Mirrors Go's
@@ -1721,6 +1794,8 @@ impl Inner {
                         if !treat_as_lost_udp(&e) {
                             log::debug!("magicsock: disco ping send failed: {e}");
                         }
+                    } else {
+                        self.record_udp_tx(addr, packet.len());
                     }
                 }
             }
@@ -1993,6 +2068,8 @@ impl Inner {
                             if !treat_as_lost_udp(&e) {
                                 log::debug!("magicsock: disco pong send failed: {e}");
                             }
+                        } else {
+                            self.record_udp_tx(src, reply.len());
                         }
                     }
                 }

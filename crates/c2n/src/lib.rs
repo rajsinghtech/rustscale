@@ -127,6 +127,12 @@ pub trait C2nBackend: Send + Sync {
     async fn tls_cert_status(&self, _domain: &str) -> Option<serde_json::Value> {
         None
     }
+
+    /// Per-label socket TX/RX byte counters as JSON (the body for
+    /// `POST /sockstats`). `None` if no sockstats registry is wired up.
+    async fn sockstats_json(&self) -> Option<serde_json::Value> {
+        None
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -496,9 +502,15 @@ async fn dispatch<W: AsyncWrite + Unpin>(
         return Ok(());
     }
 
-    // --- POST /sockstats → 200 minimal ---
+    // --- POST /sockstats → 200 with per-label TX/RX JSON ---
     if method == "POST" && path == "/sockstats" {
-        write_text_response(conn, 200, "OK", "sockstats: no sockstat logger wired up\n").await?;
+        match backend.sockstats_json().await {
+            Some(v) => write_json_response(conn, 200, "OK", &v).await?,
+            None => {
+                write_text_response(conn, 200, "OK", "sockstats: no sockstat logger wired up\n")
+                    .await?;
+            }
+        }
         return Ok(());
     }
 
@@ -752,6 +764,14 @@ mod tests {
                 "NotBefore": "2026-01-01T00:00:00Z",
                 "NotAfter": "2027-01-01T00:00:00Z",
                 "Domain": domain,
+            }))
+        }
+        async fn sockstats_json(&self) -> Option<serde_json::Value> {
+            Some(serde_json::json!({
+                "stats": {
+                    "MagicsockConnUDP4": { "tx_bytes": 100, "rx_bytes": 200 }
+                },
+                "current_interface_cellular": false
             }))
         }
     }
@@ -1125,6 +1145,22 @@ mod tests {
         .await;
         assert!(resp.contains("200 OK"));
         assert!(resp.contains("text/plain"));
+    }
+
+    #[tokio::test]
+    async fn sockstats_returns_json_when_wired() {
+        let (addr, _log_level) = start_mock_server().await;
+        let resp = send_request(
+            addr,
+            b"POST /sockstats HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(resp.contains("200 OK"));
+        assert!(resp.contains("application/json"));
+        assert!(resp.contains("\"stats\""));
+        assert!(resp.contains("MagicsockConnUDP4"));
+        assert!(resp.contains("\"tx_bytes\""));
+        assert!(resp.contains("current_interface_cellular"));
     }
 
     #[tokio::test]

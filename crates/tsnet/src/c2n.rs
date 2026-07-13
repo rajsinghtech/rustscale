@@ -37,6 +37,7 @@ pub(crate) struct C2nBackendData {
     pub tailscale_ips: Vec<IpAddr>,
     pub our_fqdn: String,
     pub magicsock: Arc<Magicsock>,
+    pub sockstats: Arc<rustscale_sockstats::SockStats>,
 }
 
 pub struct TsnetC2nBackend {
@@ -49,6 +50,7 @@ pub struct TsnetC2nBackend {
     tailscale_ips: Vec<IpAddr>,
     our_fqdn: String,
     magicsock: Arc<Magicsock>,
+    sockstats: Arc<rustscale_sockstats::SockStats>,
     log_level: LogLevelState,
 }
 
@@ -64,6 +66,7 @@ impl TsnetC2nBackend {
             tailscale_ips: data.tailscale_ips,
             our_fqdn: data.our_fqdn,
             magicsock: data.magicsock,
+            sockstats: data.sockstats,
             log_level,
         }
     }
@@ -209,6 +212,10 @@ impl C2nBackend for TsnetC2nBackend {
         self.log_level.set(component, until);
         Ok(())
     }
+
+    async fn sockstats_json(&self) -> Option<serde_json::Value> {
+        Some(self.sockstats.to_json())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -326,11 +333,16 @@ impl C2nHandler for LogheapHandler {
     }
 }
 
-struct SockStatsHandler;
+struct SockStatsHandler {
+    backend: Arc<TsnetC2nBackend>,
+}
 #[async_trait]
 impl C2nHandler for SockStatsHandler {
     async fn handle(&self, _req: C2nRequest) -> C2nResponse {
-        C2nResponse::text(200, "sockstats: no sockstat logger wired up\n")
+        match self.backend.sockstats_json().await {
+            Some(v) => C2nResponse::json(200, &v),
+            None => C2nResponse::text(200, "sockstats: no sockstat logger wired up\n"),
+        }
     }
 }
 
@@ -409,7 +421,12 @@ pub(crate) fn register_c2n_handlers(router: &mut C2nRouter, backend: Arc<TsnetC2
         }),
     );
     router.register("/debug/logheap", Arc::new(LogheapHandler));
-    router.register("POST /sockstats", Arc::new(SockStatsHandler));
+    router.register(
+        "POST /sockstats",
+        Arc::new(SockStatsHandler {
+            backend: backend.clone(),
+        }),
+    );
     // Handlers that need the backend:
     router.register(
         "/debug/netmap",

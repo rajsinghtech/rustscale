@@ -52,8 +52,10 @@ below reflect actual source code (`crates/*`) as of 2026-07-13.
 | Interface enumeration (darwin) | `net/netmon/interfaces_darwin.go` | ✅ getifaddrs + sockaddr_dl for MAC, ifa_data for MTU, IFF flags |
 
 P3 status: hostinfo darwin ✅ (OSVersion + DeviceModel via sysctl) · quarantine xattr
-✅ (com.apple.quarantine value) · peermtu darwin (no-op in Go too) ⬜ · sockstats 🔶
-(endpoint wired, stub handler).
+✅ (com.apple.quarantine value) · peermtu darwin (no-op in Go too) ⬜ · sockstats ✅
+(`crates/sockstats`: Label taxonomy, SockStats/LabelHandle atomics, CountedStream;
+magicsock UDP4/UDP6 tx/rx instrumented; C2N /sockstats + PeerAPI /v0/sockstats emit
+real JSON).
 
 ## Tier 2.5: Client infrastructure (Go packages not previously tracked)
 
@@ -79,7 +81,7 @@ P3 status: hostinfo darwin ✅ (OSVersion + DeviceModel via sysctl) · quarantin
 | Subnet route health check | `net/routecheck/` | ⬜ |
 | Captive portal detection | `net/captivedetection/` | ✅ `Detector` concurrent HTTP GETs, DERPMap endpoints, response validation (status + challenge + body), wired into netcheck prober + health Tracker |
 | ICMP ping | `net/ping/` | 🔶 `crates/netcheck/src/icmp.rs` — internal pinger for netcheck fallback; CLI `ping` calls daemon but returns 501 |
-| Socket statistics | `net/sockstats/` | 🔶 C2N + PeerAPI endpoints wired (stub handlers); no actual collection |
+| Socket statistics | `net/sockstats/` | ✅ `crates/sockstats`: per-label TX/RX byte counters (Label enum, SockStats registry, LabelHandle atomics, CountedStream); magicsock UDP4/UDP6 instrumented; C2N /sockstats + PeerAPI /v0/sockstats emit real JSON |
 | In-memory test net | `net/memnet/` | ⬜ |
 | Event bus | `util/eventbus/` | ✅ `crates/ipn/src/bus.rs`: NotifyBus backed by tokio::sync::broadcast (128-cap), NotifyBusReceiver for async streaming |
 | Client metrics | `util/clientmetric/` | ✅ `crates/clientmetric`: Registry with Counter/Gauge (atomic-backed), to_prometheus_text() + to_json(); wired into LocalAPI /metrics |
@@ -135,7 +137,7 @@ P3 status: hostinfo darwin ✅ (OSVersion + DeviceModel via sysctl) · quarantin
 | io_uring TUN+socket (Linux) | ⬜ |
 | BPF disco filtering (`magicsock_linux.go`) | ⬜ |
 | Flow tracking (`net/flowtrack/`) | 🔶 LRU cache in filter state.rs (512-entry, UDP/SCTP 5-tuple); no time-based expiry, no ConnRecord/packet counters, no TCB tracking |
-| sockstats | 🔶 C2N + PeerAPI endpoints wired (stub handlers); no actual socket statistics collection |
+| sockstats | ✅ `crates/sockstats`: Label taxonomy (13 labels), SockStats registry (Arc<Mutex> + AtomicU64), LabelHandle (cheap clone, record_tx/rx), CountedStream wrapper; magicsock UDP4/UDP6 tx/rx instrumented at send/recv; C2N /sockstats + PeerAPI /v0/sockstats emit JSON `{stats, current_interface_cellular}`; manual instrumentation (no Go runtime socktrace) |
 | tcpinfo | ✅ `crates/tcpinfo`: macOS TCP_CONNECTION_INFO + Linux TCP_INFO; break_tcp_conns() for macOS |
 | ICMP ping (`net/ping/`) | ✅ `crates/netcheck/src/icmp.rs`: unprivileged DGRAM+IPPROTO_ICMP fallback to SOCK_RAW; integrated as fallback when STUN probes fail |
 | DNS cache + fallback (`net/dnscache/`, `net/dnsfallback/`) | ✅ `crates/dnscache` (TTL, singleflight-inline, UseLastGood stale fallback, happy-eyeballs dialer); `crates/dnsfallback` (bootstrap-dns over DERP IPs, static + cached DERP map); wired into controlclient dial |

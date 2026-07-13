@@ -18,6 +18,7 @@ rustscale-portmapper = { path = "../portmapper", version = "0.1.0" }
 rustscale-health = { path = "../health", version = "0.1.0" }
 rustscale-udprelay = { path = "../udprelay", version = "0.1.0" }
 rustscale-neterror = { path = "../neterror", version = "0.1.0" }
+rustscale-sockstats = { path = "../sockstats", version = "0.1.0" }
 thiserror.workspace = true
 log = "0.4"
 tokio.workspace = true

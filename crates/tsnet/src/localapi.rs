@@ -2706,6 +2706,7 @@ mod tests {
             disable_direct_paths: false,
             peer_relay_server: false,
             relay_server_config: None,
+            sockstats: None,
         })
         .await
         .expect("magicsock");

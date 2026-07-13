@@ -59,8 +59,12 @@ pub enum TunError {
 /// implementation; [`MockTun`] is an in-memory implementation for tests.
 #[async_trait]
 pub trait Tun: Send + Sync {
-    /// Read one IP packet from the device into a fresh `Vec`.
-    async fn read_packet(&self) -> io::Result<Vec<u8>>;
+    /// Read one raw IP packet into `packet`, replacing its previous contents.
+    ///
+    /// Implementations retain the allocation where possible. On success,
+    /// `packet` contains exactly one IPv4 or IPv6 packet; platform framing is
+    /// never exposed.
+    async fn read_packet(&self, packet: &mut Vec<u8>) -> io::Result<()>;
 
     /// Write one IP packet to the device.
     async fn write_packet(&self, packet: &[u8]) -> io::Result<()>;
@@ -114,6 +118,16 @@ impl TunConfig {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub fn create(config: &TunConfig) -> Result<TunDevice, TunError> {
     TunDevice::create(config)
+}
+
+/// Clear `packet` and retain enough capacity for a read of `read_len` bytes.
+///
+/// Clearing first is important: [`Vec::reserve`] guarantees capacity relative
+/// to the current length, so after this call `packet.capacity() >= read_len`
+/// regardless of its previous length and capacity.
+pub(crate) fn prepare_read_buffer(packet: &mut Vec<u8>, read_len: usize) {
+    packet.clear();
+    packet.reserve(read_len);
 }
 
 // ---------------------------------------------------------------------------

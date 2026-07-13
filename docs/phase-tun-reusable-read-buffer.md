@@ -23,9 +23,11 @@ read, so it can retain one vector for its lifetime.
    vector capacity. Only expose the bytes initialized by a successful syscall.
    A cancelled read, readiness retry, EOF, or syscall error must leave a valid
    vector and must never expose uninitialized memory.
-4. On macOS, reuse retained storage for the utun frame, validate the four-byte
-   address-family header, and remove it in place. Preserve the public raw-IP
-   packet contract without a second packet allocation.
+4. On macOS, reuse retained storage for a maximum-size utun frame, validate the
+   four-byte address-family header, and remove it in place. The current macOS
+   implementation does not apply the configured MTU to the kernel interface,
+   so the MTU is not a safe read bound. Preserve the public raw-IP packet
+   contract without a second packet allocation.
 5. Update `MockTun`, crate tests, and all `Tun` call sites. Preserve mock channel
    ownership and EOF behavior.
 6. Add focused tests proving capacity is reused across successive reads and that
@@ -48,4 +50,3 @@ read, so it can retain one vector for its lifetime.
 - `cargo clippy -p rustscale-tun --tests --target x86_64-unknown-linux-musl -- -D warnings`
 - `RUST_TEST_THREADS=1 tools/check.sh`
 - A clean same-zone, direct-only `rs-tun,ts-tun` GCP matrix after merge.
-

@@ -42,9 +42,13 @@ impl MockTun {
 
 #[async_trait]
 impl Tun for MockTun {
-    async fn read_packet(&self) -> io::Result<Vec<u8>> {
+    async fn read_packet(&self, packet: &mut Vec<u8>) -> io::Result<()> {
+        packet.clear();
         match self.read_rx.lock().await.recv().await {
-            Some(pkt) => Ok(pkt),
+            Some(pkt) => {
+                packet.extend_from_slice(&pkt);
+                Ok(())
+            }
             None => Err(io::Error::new(io::ErrorKind::UnexpectedEof, "mock closed")),
         }
     }

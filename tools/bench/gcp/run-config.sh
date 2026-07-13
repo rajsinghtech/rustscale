@@ -52,6 +52,7 @@ LATENCY_COUNT=200
 PORT=5201
 
 # BENCH_MATRIX is "<topo>/<path>" — set by run-matrix.sh.
+BENCH_MATRIX="${BENCH_MATRIX:-}"
 TOPOLOGY="${BENCH_MATRIX%%/*}"
 PATH_TAG="${BENCH_MATRIX##*/}"
 [[ -z "${TOPOLOGY:-}" ]] && TOPOLOGY="unknown"
@@ -98,6 +99,118 @@ wait_ts_peer() {
   return 1
 }
 
+# Run a product CLI command, optionally as root for kernel-TUN configurations.
+# Args: AS_ROOT VM ZONE COMMAND
+run_tun_command() {
+  local as_root="$1" vm="$2" zone="$3" command="$4"
+  if [[ "$as_root" == 1 ]]; then
+    ssh_sudo "$vm" "$zone" "$command"
+  else
+    ssh_cmd "$vm" "$zone" "$command"
+  fi
+}
+
+# Wait until the product CLI can report an IPv4 tailnet address.
+# Args: AS_ROOT VM ZONE CLI SOCKET LOGFILE
+wait_tun_ip() {
+  local as_root="$1" vm="$2" zone="$3" cli="$4" socket="$5" logfile="$6"
+  local elapsed=0 ip
+  while (( elapsed < 120 )); do
+    ip=$(run_tun_command "$as_root" "$vm" "$zone" "$cli --socket=$socket ip -4 2>>$logfile" 2>/dev/null || true)
+    if [[ -n "$ip" ]]; then
+      printf '%s\n' "$ip"
+      return 0
+    fi
+    sleep 5
+    elapsed=$((elapsed + 5))
+  done
+  return 1
+}
+
+# Classify a product CLI ping transcript. Requested paths are not evidence.
+classify_cli_path() {
+  awk '
+    /^pong .* via peer-relay\(/ { peer_relay = 1; next }
+    /^pong .* via DERP\(/ { derp = 1; next }
+    /^pong .* via / { direct = 1 }
+    END {
+      if (direct) print "direct"
+      else if (peer_relay) print "peer-relay"
+      else if (derp) print "derp"
+      else print "unknown"
+    }'
+}
+
+classifier_self_test() {
+  local input expected actual
+  while IFS='|' read -r input expected; do
+    actual=$(printf '%s\n' "$input" | classify_cli_path)
+    [[ "$actual" == "$expected" ]] || {
+      echo "classifier self-test failed: expected $expected, got $actual" >&2
+      return 1
+    }
+  done <<'EOF'
+pong from node (100.64.0.1) via 192.0.2.1:41641 in 1ms|direct
+pong from node (100.64.0.1) via DERP(ord) in 1ms|derp
+pong from node (100.64.0.1) via peer-relay(node) in 1ms|peer-relay
+ping error: unavailable|unknown
+EOF
+}
+
+# Build a standard CLI ping invocation, with flags preceding the target.
+# Args: CLI SOCKET PATH_TAG SERVER_IP
+tun_ping_invocation() {
+  local cli="$1" socket="$2" path_tag="$3" server_ip="$4"
+  local ping_args
+  if [[ "$path_tag" == direct ]]; then
+    ping_args="--until-direct --count=120"
+  else
+    ping_args="--until-direct=false --count=1"
+  fi
+  printf '%s --socket=%s ping %s %s' "$cli" "$socket" "$ping_args" "$server_ip"
+}
+
+command_shape_self_test() {
+  [[ "$(tun_ping_invocation tailscale /tmp/ts.sock direct 100.64.0.1)" == \
+    'tailscale --socket=/tmp/ts.sock ping --until-direct --count=120 100.64.0.1' ]] || return 1
+  [[ "$(tun_ping_invocation /opt/rustscale/target/release/rustscale /tmp/rs.sock derp 100.64.0.1)" == \
+    '/opt/rustscale/target/release/rustscale --socket=/tmp/rs.sock ping --until-direct=false --count=1 100.64.0.1' ]] || return 1
+}
+
+# Gate kernel benchmarks on a product CLI ping and return its observed class.
+# Args: AS_ROOT VM ZONE CLI SOCKET SERVER_IP PATH_TAG PATH_LOG
+tun_path_gate() {
+  local as_root="$1" vm="$2" zone="$3" cli="$4" socket="$5" server_ip="$6" path_tag="$7" path_log="$8"
+  local ping_command
+  ping_command=$(tun_ping_invocation "$cli" "$socket" "$path_tag" "$server_ip")
+  run_tun_command "$as_root" "$vm" "$zone" \
+    "$ping_command >$path_log 2>&1" || return 1
+  local transcript observed
+  transcript=$(run_tun_command "$as_root" "$vm" "$zone" "cat $path_log" 2>/dev/null || true)
+  observed=$(printf '%s\n' "$transcript" | classify_cli_path)
+  [[ "$path_tag" != direct || "$observed" == direct ]] || return 1
+  [[ "$path_tag" != derp || "$observed" == derp ]] || return 1
+  printf '%s\n' "$observed"
+}
+
+cleanup_rs_tun() {
+  ssh_cmd "$SVM" "$SZONE" "kill \$(cat /tmp/iperf3-srv.pid 2>/dev/null) 2>/dev/null; pkill -x iperf3 2>/dev/null" || true
+  ssh_sudo "$SVM" "$SZONE" 'kill $(cat /tmp/rs-tun-srv.pid 2>/dev/null) 2>/dev/null; pkill -x rustscaled 2>/dev/null' || true
+  ssh_sudo "$CVM" "$CZONE" 'kill $(cat /tmp/rs-tun-cli.pid 2>/dev/null) 2>/dev/null; pkill -x rustscaled 2>/dev/null' || true
+}
+
+cleanup_ts_tun() {
+  ssh_sudo "$SVM" "$SZONE" \
+    "kill \$(cat /tmp/iperf3-srv.pid 2>/dev/null) 2>/dev/null; pkill -x iperf3 2>/dev/null; \
+     tailscale --socket=/tmp/ts-tun-srv.sock down 2>/dev/null; \
+     kill \$(cat /tmp/ts-tun-srv.pid 2>/dev/null) 2>/dev/null; pkill -x tailscaled 2>/dev/null; \
+     cp /etc/resolv.conf.bench-bak /etc/resolv.conf 2>/dev/null || true; rm -f /etc/resolv.conf.bench-bak" || true
+  ssh_sudo "$CVM" "$CZONE" \
+    "tailscale --socket=/tmp/ts-tun-cli.sock down 2>/dev/null; \
+     kill \$(cat /tmp/ts-tun-cli.pid 2>/dev/null) 2>/dev/null; pkill -x tailscaled 2>/dev/null; \
+     cp /etc/resolv.conf.bench-bak /etc/resolv.conf 2>/dev/null || true; rm -f /etc/resolv.conf.bench-bak" || true
+}
+
 # Write a stub JSON (used in dry-run or on failure).
 # Args: ERROR_STRING [LOG_TAIL]
 emit_stub() {
@@ -140,12 +253,15 @@ obj = {
     "latency": {"p50_us": 0, "p95_us": 0, "p99_us": 0, "count": int(lat_count)},
     "footprint": {"binary_size_bytes": 0, "rss_peak_kb": 0, "rss_avg_kb": 0,
                    "cpu_peak_pct": 0, "cpu_avg_pct": 0, "samples": 0},
-    "path_class_reported": path_tag,
+    "path_class_reported": "unknown",
 }
 print(json.dumps(obj, indent=2))
 PYEOF
   rm -f "$_lt_tmp"
 }
+
+classifier_self_test
+command_shape_self_test
 
 if [[ -n "${GCP_DRY_RUN:-}" ]]; then
   echo "[dry-run] would run $CONFIG on $SVM/$CVM ($TOPOLOGY/$PATH_TAG)" >&2
@@ -302,59 +418,31 @@ PYEOF
 }
 
 # ===========================================================================
-# Config: rs-tun — rustscale-tun on both VMs + kernel iperf3
+# Config: rs-tun — production rustscaled + rustscale CLIs + kernel iperf3
 # ===========================================================================
 run_rs_tun() {
-  echo "[gcp] rs-tun: starting tunnels on both VMs" >&2
-  # Remove stale log/pid files from a prior run (may be root-owned).
-  ssh_sudo "$SVM" "$SZONE"  'rm -f /tmp/rs-tun-srv.log /tmp/rs-tun-srv.pid'
-  ssh_sudo "$CVM" "$CZONE"  'rm -f /tmp/rs-tun-cli.log /tmp/rs-tun-cli.pid'
+  echo "[gcp] rs-tun: starting production rustscaled daemons" >&2
+  ssh_sudo "$SVM" "$SZONE"  'rm -rf /tmp/rs-tun-srv; rm -f /tmp/rs-tun-srv.log /tmp/rs-tun-srv.pid /tmp/rs-tun-srv.sock'
+  ssh_sudo "$CVM" "$CZONE"  'rm -rf /tmp/rs-tun-cli; rm -f /tmp/rs-tun-cli.log /tmp/rs-tun-cli.pid /tmp/rs-tun-cli.sock'
   ssh_sudo "$SVM" "$SZONE" \
-    "nohup /opt/rustscale/target/release/examples/rustscale-tun \
-       --authkey $AUTHKEY --hostname $SHOST --apply-routes --tun-name utun0 \
-       --state-dir /tmp/rs-tun-srv > /tmp/rs-tun-srv.log 2>&1 & echo \$! > /tmp/rs-tun-srv.pid"
+    "TS_AUTHKEY=$AUTHKEY nohup /opt/rustscale/target/release/rustscaled run --tun \
+       --statedir /tmp/rs-tun-srv --socket /tmp/rs-tun-srv.sock --hostname $SHOST \
+       > /tmp/rs-tun-srv.log 2>&1 & echo \$! > /tmp/rs-tun-srv.pid"
   ssh_sudo "$CVM" "$CZONE" \
-    "nohup /opt/rustscale/target/release/examples/rustscale-tun \
-       --authkey $AUTHKEY --hostname $CHOST --apply-routes --tun-name utun0 \
-       --state-dir /tmp/rs-tun-cli > /tmp/rs-tun-cli.log 2>&1 & echo \$! > /tmp/rs-tun-cli.pid"
+    "TS_AUTHKEY=$AUTHKEY nohup /opt/rustscale/target/release/rustscaled run --tun \
+       --statedir /tmp/rs-tun-cli --socket /tmp/rs-tun-cli.sock --hostname $CHOST \
+       > /tmp/rs-tun-cli.log 2>&1 & echo \$! > /tmp/rs-tun-cli.pid"
 
-  # Wait for BENCH_READY 1 on both VMs. rustscale-tun prints this once it
-  # has a tailnet IP AND at least one peer — NOT merely after up_tun()
-  # returns, which was the old bug (online: true was printed before the
-  # netmap settled, causing false "ready" detection and zeroed iperf3 runs).
-  for vm_zone in "$SVM:$SZONE" "$CVM:$CZONE"; do
-    local vm="${vm_zone%%:*}" zone="${vm_zone##*:}" logfile
-    [[ "$vm" == "$SVM" ]] && logfile=/tmp/rs-tun-srv.log || logfile=/tmp/rs-tun-cli.log
-    local elapsed=0
-    local timeout=120
-    [[ "$PATH_TAG" == "derp" ]] && timeout=300
-    while (( elapsed < timeout )); do
-      if ssh_cmd "$vm" "$zone" "grep -q 'BENCH_READY 1' $logfile 2>/dev/null" 2>/dev/null; then
-        break
-      fi
-      sleep 5
-      elapsed=$((elapsed + 5))
-    done
-    if (( elapsed >= 120 )); then
-      echo "[gcp] ERROR: rustscale-tun on $vm never became ready (no BENCH_READY 1 in $logfile)" >&2
-      local _lt
-      _lt=$(capture_log_tail "$vm" "$zone" "$logfile")
-      emit_stub "tun-not-ready" "$_lt"
-      ssh_sudo "$SVM" "$SZONE" 'pkill -f rustscale-tun 2>/dev/null' || true
-      ssh_sudo "$CVM" "$CZONE" 'pkill -f rustscale-tun 2>/dev/null' || true
-      return 1
-    fi
-  done
-
-  # Get server tailnet IP from the BENCH_IP marker (same as rs-userspace).
   local server_ip
-  server_ip=$(ssh_cmd "$SVM" "$SZONE" "grep '^BENCH_IP ' /tmp/rs-tun-srv.log | awk '{print \$2}'" 2>/dev/null)
-  if [[ -z "$server_ip" ]]; then
-    # Fallback: extract from the tailscale IPs line.
-    server_ip=$(ssh_cmd "$SVM" "$SZONE" "grep 'tailscale IPs' /tmp/rs-tun-srv.log | head -1" \
-      | grep -oE '100\.[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-  fi
+  server_ip=$(wait_tun_ip 1 "$SVM" "$SZONE" /opt/rustscale/target/release/rustscale /tmp/rs-tun-srv.sock /tmp/rs-tun-srv.log) || {
+    emit_stub "rs-no-ip-srv" "$(capture_log_tail "$SVM" "$SZONE" /tmp/rs-tun-srv.log)"; cleanup_rs_tun; return 1; }
+  wait_tun_ip 1 "$CVM" "$CZONE" /opt/rustscale/target/release/rustscale /tmp/rs-tun-cli.sock /tmp/rs-tun-cli.log >/dev/null || {
+    emit_stub "rs-no-ip-cli" "$(capture_log_tail "$CVM" "$CZONE" /tmp/rs-tun-cli.log)"; cleanup_rs_tun; return 1; }
   echo "[gcp] rs-tun: server tailnet IP=$server_ip" >&2
+
+  local path_class
+  path_class=$(tun_path_gate 1 "$CVM" "$CZONE" /opt/rustscale/target/release/rustscale /tmp/rs-tun-cli.sock "$server_ip" "$PATH_TAG" /tmp/rs-tun-cli.path.log) || {
+    emit_stub "rs-cli-path-gate-failed" "$(capture_log_tail "$CVM" "$CZONE" /tmp/rs-tun-cli.path.log)"; cleanup_rs_tun; return 1; }
 
   # Start iperf3 server on server VM. Bind to 0.0.0.0 (all interfaces) so
   # the client can reach it via the server's tailnet IP on the utun. Binding
@@ -363,7 +451,7 @@ run_rs_tun() {
   ssh_cmd "$SVM" "$SZONE" "pkill -x iperf3 2>/dev/null; nohup iperf3 -s -p $PORT > /tmp/iperf3-srv.log 2>&1 & echo \$! > /tmp/iperf3-srv.pid"
   sleep 2
 
-  # Footprint sampler for rustscale-tun PID on server VM.
+  # Footprint sampler for the production daemon PID on server VM.
   local srv_pid
   srv_pid=$(ssh_cmd "$SVM" "$SZONE" 'cat /tmp/rs-tun-srv.pid')
   remote_start_footprint "$SVM" "$SZONE" "$srv_pid" /tmp/rs-tun-srv.footprint
@@ -390,20 +478,16 @@ print(json.dumps(arr))
   local lat_json
   lat_json=$(ssh_cmd "$CVM" "$CZONE" "ping -c $LATENCY_COUNT $server_ip 2>/dev/null" | ping_latency)
 
-  local path_class="$PATH_TAG"
-
   # Stop footprint.
   local foot_json
   foot_json=$(remote_stop_footprint "$SVM" "$SZONE" /tmp/rs-tun-srv.footprint)
 
-  # Binary size of rustscale-tun example.
+  # Binary size of the production daemon.
   local bin_size
-  bin_size=$(ssh_cmd "$SVM" "$SZONE" 'stat -c %s /opt/rustscale/target/release/examples/rustscale-tun 2>/dev/null || echo 0')
+  bin_size=$(ssh_cmd "$SVM" "$SZONE" 'stat -c %s /opt/rustscale/target/release/rustscaled 2>/dev/null || echo 0')
 
   # Cleanup.
-  ssh_cmd "$SVM" "$SZONE" "kill \$(cat /tmp/iperf3-srv.pid 2>/dev/null) 2>/dev/null; pkill -x iperf3 2>/dev/null" || true
-  ssh_sudo "$SVM" "$SZONE" 'pkill -f rustscale-tun 2>/dev/null' || true
-  ssh_sudo "$CVM" "$CZONE" 'pkill -f rustscale-tun 2>/dev/null' || true
+  cleanup_rs_tun
 
   python3 - "$CONFIG" "$TOPOLOGY" "$PATH_TAG" "$path_class" "$bin_size" "$tp_json" "$lat_json" "$foot_json" >"$OUT" <<'PYEOF'
 import json, sys
@@ -655,19 +739,16 @@ run_ts_tun() {
     local _lt
     _lt=$(capture_log_tail "$SVM" "$SZONE" /tmp/ts-tun-srv.log)
     emit_stub "ts-up-failed-srv" "$_lt"
-    ssh_sudo "$SVM" "$SZONE" \
-      'tailscale --socket=/tmp/ts-tun-srv.sock down 2>/dev/null; pkill -x tailscaled 2>/dev/null; cp /etc/resolv.conf.bench-bak /etc/resolv.conf 2>/dev/null || true' || true
+    cleanup_ts_tun
     return 1
   fi
   local server_ip
-  server_ip=$(ssh_sudo "$SVM" "$SZONE" "tailscale --socket=/tmp/ts-tun-srv.sock ip -4 2>>/tmp/ts-tun-srv.log")
-  if [[ -z "$server_ip" ]]; then
+  if ! server_ip=$(wait_tun_ip 1 "$SVM" "$SZONE" tailscale /tmp/ts-tun-srv.sock /tmp/ts-tun-srv.log); then
     echo "[gcp] ERROR: no tailnet IP on server" >&2
     local _lt
     _lt=$(capture_log_tail "$SVM" "$SZONE" /tmp/ts-tun-srv.log)
     emit_stub "ts-no-ip-srv" "$_lt"
-    ssh_sudo "$SVM" "$SZONE" \
-      'tailscale --socket=/tmp/ts-tun-srv.sock down 2>/dev/null; pkill -x tailscaled 2>/dev/null; cp /etc/resolv.conf.bench-bak /etc/resolv.conf 2>/dev/null || true' || true
+    cleanup_ts_tun
     return 1
   fi
   echo "[gcp] ts-tun: server IP=$server_ip" >&2
@@ -681,25 +762,22 @@ run_ts_tun() {
     local _lt
     _lt=$(capture_log_tail "$CVM" "$CZONE" /tmp/ts-tun-cli.log)
     emit_stub "ts-up-failed-cli" "$_lt"
-    ssh_sudo "$SVM" "$SZONE" \
-      'tailscale --socket=/tmp/ts-tun-srv.sock down 2>/dev/null; pkill -x tailscaled 2>/dev/null; cp /etc/resolv.conf.bench-bak /etc/resolv.conf 2>/dev/null || true' || true
-    ssh_sudo "$CVM" "$CZONE" \
-      'tailscale --socket=/tmp/ts-tun-cli.sock down 2>/dev/null; pkill -x tailscaled 2>/dev/null; cp /etc/resolv.conf.bench-bak /etc/resolv.conf 2>/dev/null || true' || true
+    cleanup_ts_tun
     return 1
   fi
 
-  # Wait for the peer to appear (replaces fixed sleep 5).
-  if ! wait_ts_peer "$CVM" "$CZONE" /tmp/ts-tun-cli.sock 120; then
-    echo "[gcp] ERROR: no tailscale peer appeared on client after 120s" >&2
+  if ! wait_tun_ip 1 "$CVM" "$CZONE" tailscale /tmp/ts-tun-cli.sock /tmp/ts-tun-cli.log >/dev/null; then
+    echo "[gcp] ERROR: tailscale CLI did not report a client IP" >&2
     local _lt
     _lt=$(capture_log_tail "$CVM" "$CZONE" /tmp/ts-tun-cli.log)
-    emit_stub "ts-no-peer" "$_lt"
-    ssh_sudo "$SVM" "$SZONE" \
-      'tailscale --socket=/tmp/ts-tun-srv.sock down 2>/dev/null; pkill -x tailscaled 2>/dev/null; cp /etc/resolv.conf.bench-bak /etc/resolv.conf 2>/dev/null || true' || true
-    ssh_sudo "$CVM" "$CZONE" \
-      'tailscale --socket=/tmp/ts-tun-cli.sock down 2>/dev/null; pkill -x tailscaled 2>/dev/null; cp /etc/resolv.conf.bench-bak /etc/resolv.conf 2>/dev/null || true' || true
+    emit_stub "ts-no-ip-cli" "$_lt"
+    cleanup_ts_tun
     return 1
   fi
+
+  local path_class
+  path_class=$(tun_path_gate 1 "$CVM" "$CZONE" tailscale /tmp/ts-tun-cli.sock "$server_ip" "$PATH_TAG" /tmp/ts-tun-cli.path.log) || {
+    emit_stub "ts-cli-path-gate-failed" "$(capture_log_tail "$CVM" "$CZONE" /tmp/ts-tun-cli.path.log)"; cleanup_ts_tun; return 1; }
 
   # iperf3 server.
   ssh_sudo "$SVM" "$SZONE" \
@@ -733,8 +811,6 @@ print(json.dumps(arr))
   local lat_json
   lat_json=$(ssh_sudo "$CVM" "$CZONE" "ping -c $LATENCY_COUNT $server_ip 2>/dev/null" | ping_latency)
 
-  local path_class="$PATH_TAG"
-
   # Stop footprint.
   local foot_json
   foot_json=$(remote_stop_footprint "$SVM" "$SZONE" /tmp/ts-tun-srv.footprint)
@@ -743,19 +819,7 @@ print(json.dumps(arr))
   local bin_size
   bin_size=$(ssh_cmd "$SVM" "$SZONE" 'stat -c %s /usr/sbin/tailscaled 2>/dev/null || echo 0')
 
-  # Cleanup: `tailscale down' restores /etc/resolv.conf; then kill + restore
-  # resolv.conf backup as a belt-and-suspenders safeguard.
-  ssh_sudo "$SVM" "$SZONE" \
-    "kill \$(cat /tmp/iperf3-srv.pid 2>/dev/null) 2>/dev/null; pkill -x iperf3 2>/dev/null; \
-     tailscale --socket=/tmp/ts-tun-srv.sock down 2>/dev/null; \
-     kill \$(cat /tmp/ts-tun-srv.pid 2>/dev/null) 2>/dev/null; pkill -x tailscaled 2>/dev/null; \
-     cp /etc/resolv.conf.bench-bak /etc/resolv.conf 2>/dev/null || true; \
-     rm -f /etc/resolv.conf.bench-bak" || true
-  ssh_sudo "$CVM" "$CZONE" \
-    "tailscale --socket=/tmp/ts-tun-cli.sock down 2>/dev/null; \
-     kill \$(cat /tmp/ts-tun-cli.pid 2>/dev/null) 2>/dev/null; pkill -x tailscaled 2>/dev/null; \
-     cp /etc/resolv.conf.bench-bak /etc/resolv.conf 2>/dev/null || true; \
-     rm -f /etc/resolv.conf.bench-bak" || true
+  cleanup_ts_tun
 
   python3 - "$CONFIG" "$TOPOLOGY" "$PATH_TAG" "$path_class" "$bin_size" "$tp_json" "$lat_json" "$foot_json" >"$OUT" <<'PYEOF'
 import json, sys

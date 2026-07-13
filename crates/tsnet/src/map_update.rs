@@ -54,6 +54,16 @@ pub(crate) fn spawn_map_update_task(
     // Create the netmap cache helper once so that save_if_changed can
     // dedup identical writes via the in-memory SHA-256 hash.
     let netmap_cache = state_dir.as_ref().map(|dir| NetMapCache::new(dir));
+    // Watchdog for map-response timeout: fires if no MapResponse for >2m5s
+    // (matching Go's MapResponseTimeout duration). Fed on each response.
+    let map_timeout_watchdog = Watchdog::new(
+        health.clone(),
+        WARN_MAP_RESPONSE_TIMEOUT,
+        "Network map response timeout",
+        Severity::Medium,
+        "no map response for over 2 minutes",
+        std::time::Duration::from_secs(125),
+    );
     tokio::spawn(async move {
         loop {
             if cancel.is_cancelled() {
@@ -61,10 +71,12 @@ pub(crate) fn spawn_map_update_task(
             }
             match map_rx.recv().await {
                 Some(Ok(resp)) => {
-                    // Map activity: feed the staleness watchdog + mark control
-                    // healthy. Even keep-alive messages count as activity.
+                    // Map activity: feed the staleness watchdogs + mark
+                    // control healthy. Even keep-alive messages count.
                     health_watchdog.feed();
+                    map_timeout_watchdog.feed();
                     health.set_healthy(WARN_CONTROL);
+                    health.set_healthy(WARN_NOT_IN_MAP_POLL);
                     send_health_notify(&health, &ipn_backend);
 
                     if resp.KeepAlive {
@@ -401,11 +413,19 @@ pub(crate) fn spawn_map_update_task(
                 }
                 Some(Err(e)) => {
                     health.set_unhealthy(WARN_CONTROL, format!("control connection lost: {e}"));
+                    health.set_unhealthy(
+                        WARN_NOT_IN_MAP_POLL,
+                        "map poll stream error: not receiving updates",
+                    );
                     send_health_notify(&health, &ipn_backend);
                     break;
                 }
                 None => {
                     health.set_unhealthy(WARN_CONTROL, "control connection lost: stream closed");
+                    health.set_unhealthy(
+                        WARN_NOT_IN_MAP_POLL,
+                        "map poll stream closed: not receiving updates",
+                    );
                     send_health_notify(&health, &ipn_backend);
                     break;
                 }

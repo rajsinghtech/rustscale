@@ -133,7 +133,7 @@ use {
     rustscale_filter::Filter,
     rustscale_health::{
         Severity, Tracker, Watchdog, WARN_CERT_FALLBACK, WARN_CONTROL, WARN_DERP_HOME,
-        WARN_NETMON_CHANGE,
+        WARN_MAP_RESPONSE_TIMEOUT, WARN_NETMON_CHANGE, WARN_NOT_IN_MAP_POLL,
     },
     rustscale_ipn::IpnBackend,
     rustscale_key::{DiscoPrivate, MachinePrivate, MachinePublic, NodePrivate, NodePublic},

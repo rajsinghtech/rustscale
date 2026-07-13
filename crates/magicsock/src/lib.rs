@@ -349,6 +349,20 @@ impl DerpManager {
                         );
                     }
                 }
+                // Report the per-region connection-down warnable.
+                if let Some(ref health) = self.health {
+                    health.set_unhealthy(
+                        rustscale_health::WARN_NO_DERP_CONNECTION,
+                        format!(
+                            "{{\"{}\":{},\"{}\":\"\",\"{}\":\"{}\"}}",
+                            rustscale_health::ARG_DERP_REGION_ID,
+                            region_id,
+                            rustscale_health::ARG_DERP_REGION_NAME,
+                            rustscale_health::ARG_ERROR,
+                            e,
+                        ),
+                    );
+                }
                 return None;
             }
         };
@@ -362,6 +376,10 @@ impl DerpManager {
             if let Some(ref health) = self.health {
                 health.set_healthy(rustscale_health::WARN_DERP_HOME);
             }
+        }
+        // Clear the per-region connection-down warnable on success.
+        if let Some(ref health) = self.health {
+            health.set_healthy(rustscale_health::WARN_NO_DERP_CONNECTION);
         }
 
         let io = Arc::new(DerpIo::spawn(client));
@@ -1267,6 +1285,20 @@ fn spawn_recv_tasks(
                     // Update DERP region health. Empty problem = healthy.
                     if let Some(ref health) = inner2.derp.health {
                         health.set_derp_region_health(region_id, problem.is_empty());
+                        if problem.is_empty() {
+                            health.set_healthy(rustscale_health::WARN_DERP_REGION_ERROR);
+                        } else {
+                            health.set_unhealthy(
+                                rustscale_health::WARN_DERP_REGION_ERROR,
+                                format!(
+                                    "{{\"{}\":{},\"{}\":\"{}\"}}",
+                                    rustscale_health::ARG_DERP_REGION_ID,
+                                    region_id,
+                                    rustscale_health::ARG_ERROR,
+                                    problem,
+                                ),
+                            );
+                        }
                     }
                 }
             }

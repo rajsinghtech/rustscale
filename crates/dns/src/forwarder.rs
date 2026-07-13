@@ -185,6 +185,9 @@ impl Forwarder {
                     if family == "udp" {
                         return Some(resp.clone());
                     }
+                    if rustscale_envknob::bool("TS_DNS_FORWARD_SKIP_TCP_RETRY").unwrap_or(false) {
+                        return Some(resp.clone());
+                    }
                     // - If the original query was TCP, fall back to TCP.
                 }
 

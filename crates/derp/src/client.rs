@@ -256,6 +256,8 @@ impl DerpClient {
         private_key: NodePrivate,
         expected_server_key: Option<NodePublic>,
     ) -> Result<Self, DerpError> {
+        let use_tls =
+            use_tls && !rustscale_envknob::bool("TS_DEBUG_USE_DERP_HTTP").unwrap_or(false);
         let tcp = if let Some(proxy) = proxy_url_for(host, port) {
             rustscale_tshttpproxy::http_connect(&proxy, host, port)
                 .await
@@ -331,6 +333,8 @@ impl DerpClient {
         private_key: NodePrivate,
         expected_server_key: Option<NodePublic>,
     ) -> Result<Self, DerpError> {
+        let use_tls =
+            use_tls && !rustscale_envknob::bool("TS_DEBUG_USE_DERP_HTTP").unwrap_or(false);
         // When an HTTP proxy is configured for this region (checked via the
         // canonical tls_host, matching Go's `proxyFromEnv` using `n.Addr()`),
         // tunnel through it with CONNECT and skip the HTTP upgrade — Go's

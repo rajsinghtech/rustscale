@@ -175,6 +175,8 @@ pub enum TsnetError {
     Builder(String),
     #[error("state file error: {0}")]
     State(#[from] StateError),
+    #[error("log ID error: {0}")]
+    LogId(#[from] rustscale_logid::LogIdError),
     #[error("control register error: {0}")]
     Register(#[from] RegisterError),
     #[error("map stream error: {0}")]
@@ -445,6 +447,14 @@ impl ServerBuilder {
         self
     }
 
+    /// Set the frontend log ID supplied by the embedding application.
+    pub fn set_frontend_log_id(self, id: impl Into<String>) -> Self {
+        if let Ok(mut o) = self.overrides.try_write() {
+            o.set_frontend_log_id(id);
+        }
+        self
+    }
+
     /// Enable or disable the LocalAPI Unix-domain-socket server. When enabled,
     /// the socket is created at the path set by [`localapi_path`](Self::localapi_path),
     /// or `<state_dir>/rustscale.sock` by default. Default: OFF.
@@ -605,6 +615,9 @@ pub(crate) struct RunningState {
     /// that carries a new policy.
     #[cfg_attr(not(feature = "ssh"), allow(dead_code))]
     pub(crate) ssh_policy: Arc<RwLock<Option<SSHPolicy>>>,
+    /// SSH host keys currently advertised through Hostinfo.
+    #[cfg_attr(not(feature = "ssh"), allow(dead_code))]
+    pub(crate) ssh_host_keys: Arc<RwLock<Vec<String>>>,
     /// Network change monitor handle (None if the monitor couldn't start).
     pub(crate) monitor: Option<rustscale_netmon::MonitorHandle>,
     /// Machine private key (for control-plane set-dns during cert issuance).
@@ -724,6 +737,8 @@ pub(crate) struct Bootstrap {
     pub(crate) user_profiles: Arc<RwLock<BTreeMap<UserID, UserProfile>>>,
     /// Current SSH policy from the netmap (fed to the SSH server).
     pub(crate) ssh_policy: Arc<RwLock<Option<SSHPolicy>>>,
+    /// SSH host keys currently advertised through Hostinfo.
+    pub(crate) ssh_host_keys: Arc<RwLock<Vec<String>>>,
     /// Machine private key (for link-change endpoint updates).
     pub(crate) machine_key: MachinePrivate,
     /// Server (control) public key (for link-change endpoint updates).
@@ -763,6 +778,8 @@ pub(crate) struct Bootstrap {
     /// Per-label socket TX/RX counter registry (shared with magicsock,
     /// DERP, DNS, and the C2N/PeerAPI debug endpoints).
     pub(crate) sockstats: Arc<rustscale_sockstats::SockStats>,
+    /// Public backend log ID, derived from the state-directory-private ID.
+    pub(crate) backend_log_id: String,
 }
 
 /// An embedded Tailscale server.
@@ -932,6 +949,13 @@ impl Server {
     pub async fn set_package(&self, package: impl Into<String>) {
         if let Some(ref inner) = self.inner {
             inner.overrides.write().await.set_package(package);
+        }
+    }
+
+    /// Set the frontend log ID supplied by the embedding application.
+    pub async fn set_frontend_log_id(&self, id: impl Into<String>) {
+        if let Some(ref inner) = self.inner {
+            inner.overrides.write().await.set_frontend_log_id(id);
         }
     }
 

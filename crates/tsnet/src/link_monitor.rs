@@ -216,6 +216,8 @@ pub(crate) fn spawn_hostinfo_update_loop(
     serve: Option<Arc<serve::ServeRunner>>,
     overrides: SharedOverrides,
     state_dir: Option<PathBuf>,
+    backend_log_id: String,
+    ssh_host_keys: Arc<RwLock<Vec<String>>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let node_pub = node_key.public();
@@ -283,6 +285,7 @@ pub(crate) fn spawn_hostinfo_update_loop(
                 .and_then(|d| rustscale_ipn::Prefs::load(d).ok())
                 .unwrap_or_default();
             let rt = RuntimeHostinfo {
+                backend_log_id: backend_log_id.clone(),
                 exit_node_id: exit_node_id.clone(),
                 ingress_enabled,
                 wire_ingress,
@@ -292,7 +295,9 @@ pub(crate) fn spawn_hostinfo_update_loop(
                 no_logs_no_support: false,
                 allows_update: prefs.AutoUpdate.unwrap_or(false),
                 sharee_node: false,
-                ssh_host_keys: Vec::new(),
+                ssh_host_keys: ssh_host_keys.read().await.clone(),
+                wol_macs: hostinfo::wol_macs(),
+                state_encrypted: OptBool::False,
                 userspace: true,
                 userspace_router: true,
                 peer_relay: false,

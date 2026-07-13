@@ -4,6 +4,8 @@
 //! - **macOS**: "sameuserproof" localhost-TCP fallback for sandboxed daemon
 //!   scenarios where a Unix socket is not available (see [`darwin`] module).
 //! - **Windows**: Named pipe listen/connect (see `windows` module).
+//! - **Peer credentials**: [`peercred`] module extracts Unix peer credentials
+//!   (uid/pid via SO_PEERCRED/LOCAL_PEERCRED) for connection-level auth.
 //!
 //! # Core API
 //!
@@ -12,6 +14,7 @@
 //! - [`connect_with_retries`] — dial with retry loop (mirrors Go's
 //!   `ConnectContext` for when the daemon is still starting).
 //! - [`Listener::accept`] — accept an incoming connection (async).
+//! - [`peercred::ConnIdentity`] — peer identity + read-write access check.
 //!
 //! All connection types implement `tokio::io::AsyncRead + AsyncWrite + Unpin`.
 
@@ -25,6 +28,8 @@ mod windows;
 
 #[cfg(target_os = "macos")]
 pub mod darwin;
+
+pub mod peercred;
 
 // ---------------------------------------------------------------------------
 // Platform-agnostic type aliases

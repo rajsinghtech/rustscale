@@ -101,6 +101,9 @@ pub struct PendingPing {
     pub purpose: DiscoPingPurpose,
     /// Probe size for PMTUD (0 for non-PMTUD pings).
     pub size: usize,
+    /// The CLI request that owns this ping, when it was user initiated.
+    /// This prevents an older ping's pong from completing a newer request.
+    pub cli_request_id: Option<u64>,
 }
 
 /// UDP path lifetime probing state. Mirrors Go's `probeUDPLifetime`
@@ -281,6 +284,8 @@ pub struct Endpoint {
     probe_udp_lifetime: Option<ProbeUDPLifetime>,
     /// Largest PMTUD probe size that received a pong (0 = not probed).
     peer_mtu: usize,
+    /// Last time a full candidate discovery round was started.
+    last_full_ping: Option<Instant>,
 }
 
 impl Endpoint {
@@ -305,6 +310,7 @@ impl Endpoint {
             last_recv_udp: None,
             probe_udp_lifetime: Some(ProbeUDPLifetime::default_config()),
             peer_mtu: 0,
+            last_full_ping: None,
         }
     }
 
@@ -324,6 +330,34 @@ impl Endpoint {
             .into_iter()
             .map(|a| (a, EndpointType::Unknown))
             .collect();
+    }
+
+    /// Learn an authenticated source address from an incoming disco Ping.
+    /// Keep the candidate set bounded, as Go does for discovered endpoints.
+    pub fn learn_candidate(&mut self, addr: SocketAddr) -> bool {
+        const MAX_CANDIDATES: usize = 100;
+        if self
+            .candidates
+            .iter()
+            .any(|(candidate, _)| *candidate == addr)
+            || self.candidates.len() >= MAX_CANDIDATES
+        {
+            return false;
+        }
+        self.candidates.push((addr, EndpointType::Unknown));
+        true
+    }
+
+    /// Rate-limit full direct discovery rounds started by WireGuard sends.
+    pub fn should_start_discovery(&mut self, now: Instant, interval: Duration) -> bool {
+        if self
+            .last_full_ping
+            .is_some_and(|last| now.duration_since(last) < interval)
+        {
+            return false;
+        }
+        self.last_full_ping = Some(now);
+        true
     }
 
     /// Set candidate UDP endpoints with their endpoint types (from
@@ -472,6 +506,7 @@ impl Endpoint {
         now: Instant,
         purpose: DiscoPingPurpose,
         size: usize,
+        cli_request_id: Option<u64>,
     ) {
         self.pending_pings.insert(
             tx_id,
@@ -480,6 +515,7 @@ impl Endpoint {
                 addr,
                 purpose,
                 size,
+                cli_request_id,
             },
         );
     }
@@ -811,12 +847,28 @@ mod tests {
         let now = Instant::now();
         let tx = [0xaa; 12];
         let addr = sa(1234);
-        e.add_pending_ping(tx, addr, now, DiscoPingPurpose::Discovery, 0);
+        e.add_pending_ping(tx, addr, now, DiscoPingPurpose::Discovery, 0, None);
         let pp = e.match_pong(&tx).expect("should match");
         assert_eq!(pp.addr, addr);
         assert_eq!(pp.purpose, DiscoPingPurpose::Discovery);
         // Second match returns None.
         assert_eq!(e.match_pong(&tx), None);
+    }
+
+    #[test]
+    fn recording_new_pings_can_expire_stale_transactions() {
+        let mut e = ep();
+        let now = Instant::now();
+        e.add_pending_ping(
+            [0xaa; 12],
+            sa(1234),
+            now,
+            DiscoPingPurpose::Discovery,
+            0,
+            None,
+        );
+        e.expire_pending_pings(now + Duration::from_secs(5), Duration::from_secs(5));
+        assert_eq!(e.pending_pings_count(), 0);
     }
 
     #[test]
@@ -826,6 +878,31 @@ mod tests {
         assert!(!e.should_send_call_me_maybe());
         e.reset_call_me_maybe();
         assert!(e.should_send_call_me_maybe());
+    }
+
+    #[test]
+    fn learned_candidate_is_deduplicated_and_bounded() {
+        let mut e = ep();
+        let learned = sa(4242);
+        assert!(e.learn_candidate(learned));
+        assert!(!e.learn_candidate(learned));
+        assert_eq!(e.candidates(), vec![learned]);
+
+        for port in 10_000..10_099 {
+            assert!(e.learn_candidate(sa(port)));
+        }
+        assert_eq!(e.candidates().len(), 100);
+        assert!(!e.learn_candidate(sa(20_000)));
+    }
+
+    #[test]
+    fn full_discovery_is_rate_limited() {
+        let mut e = ep();
+        let now = Instant::now();
+        let interval = Duration::from_secs(5);
+        assert!(e.should_start_discovery(now, interval));
+        assert!(!e.should_start_discovery(now + Duration::from_secs(1), interval));
+        assert!(e.should_start_discovery(now + interval, interval));
     }
 
     #[test]
@@ -918,6 +995,7 @@ mod tests {
             now,
             DiscoPingPurpose::HeartbeatForUDPLifetime,
             0,
+            None,
         );
         // The ping is still pending → not answered.
         assert!(!e.is_last_udp_lifetime_ping_answered());
@@ -946,6 +1024,7 @@ mod tests {
             now,
             DiscoPingPurpose::HeartbeatForUDPLifetime,
             0,
+            None,
         );
         // Pong received → match_pong removes it.
         e.match_pong(&tx_id);

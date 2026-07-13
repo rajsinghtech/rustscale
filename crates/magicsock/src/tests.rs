@@ -273,6 +273,230 @@ async fn derp_data_path_fallback() {
     assert_eq!(received.data, wg_reply);
 }
 
+#[tokio::test]
+async fn cli_ping_fans_out_udp_and_derp() {
+    let relay = Arc::new(FakeRelay::new());
+    let a_priv = NodePrivate::generate();
+    let b_priv = NodePrivate::generate();
+    let a_derp = connect_to_relay(&relay, a_priv.clone()).await;
+    let (a, _a_rx) = Magicsock::new(MagicsockConfig {
+        private_key: a_priv,
+        disco_key: DiscoPrivate::generate(),
+        derp_client: Some(a_derp),
+        derp_map: None,
+        home_derp_region: 0,
+        udp_bind: Some("127.0.0.1:0".parse().unwrap()),
+        udp_socket: None,
+        portmapper: None,
+        health: None,
+        disable_direct_paths: false,
+        peer_relay_server: false,
+        relay_server_config: None,
+        sockstats: None,
+        control_knobs: None,
+    })
+    .await
+    .unwrap();
+    let b_derp = connect_to_relay(&relay, b_priv.clone()).await;
+    let (b, _b_rx) = Magicsock::new(MagicsockConfig {
+        private_key: b_priv,
+        disco_key: DiscoPrivate::generate(),
+        derp_client: Some(b_derp),
+        derp_map: None,
+        home_derp_region: 0,
+        udp_bind: None,
+        udp_socket: None,
+        portmapper: None,
+        health: None,
+        disable_direct_paths: false,
+        peer_relay_server: false,
+        relay_server_config: None,
+        sockstats: None,
+        control_knobs: None,
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Port 9 has no peer listener, so only the independently sent DERP ping
+    // can answer. Its pending UDP ping proves both paths were started.
+    a.set_netmap(vec![make_peer(
+        b.node_public(),
+        b.disco_public(),
+        vec!["127.0.0.1:9".to_owned()],
+        1,
+    )])
+    .await
+    .unwrap();
+    b.set_netmap(vec![make_peer(
+        a.node_public(),
+        a.disco_public(),
+        vec![],
+        1,
+    )])
+    .await
+    .unwrap();
+
+    let result = a
+        .cli_ping(&b.node_public(), "b", "100.64.0.2".parse().unwrap(), 0)
+        .await
+        .expect("DERP CLI pong");
+    assert_eq!(result.DERPRegionID, 1);
+    let pending_udp = a
+        .inner
+        .endpoints
+        .read()
+        .unwrap()
+        .get(&b.node_public())
+        .unwrap()
+        .pending_pings_count();
+    assert!(pending_udp > 0, "UDP candidate ping should also be pending");
+}
+
+#[tokio::test]
+async fn derp_or_none_send_starts_rate_limited_direct_discovery() {
+    // No UDP socket and no DERP client keeps this deterministic in the test
+    // sandbox: send() has no usable data path, but it must still start direct
+    // discovery for the advertised candidate exactly once per interval.
+    let private_key = NodePrivate::generate();
+    let peer_key = NodePrivate::generate().public();
+    let peer_disco = DiscoPrivate::generate().public();
+    let (magicsock, _rx) = Magicsock::new(MagicsockConfig {
+        private_key,
+        disco_key: DiscoPrivate::generate(),
+        derp_client: None,
+        derp_map: None,
+        home_derp_region: 0,
+        udp_bind: None,
+        udp_socket: None,
+        portmapper: None,
+        health: None,
+        disable_direct_paths: false,
+        peer_relay_server: false,
+        relay_server_config: None,
+        sockstats: None,
+        control_knobs: None,
+    })
+    .await
+    .unwrap();
+    magicsock
+        .set_netmap(vec![make_peer(
+            peer_key.clone(),
+            peer_disco,
+            vec!["127.0.0.1:4242".to_owned(), "127.0.0.1:4243".to_owned()],
+            0,
+        )])
+        .await
+        .unwrap();
+
+    assert_eq!(magicsock.peer_path_class(&peer_key), PathClass::None);
+    assert_eq!(
+        magicsock
+            .inner
+            .endpoints
+            .read()
+            .unwrap()
+            .get(&peer_key)
+            .unwrap()
+            .pending_pings_count(),
+        0
+    );
+
+    assert!(magicsock.send(peer_key.clone(), b"first").await.is_err());
+    tokio::task::yield_now().await;
+    let pending_after_first_send = magicsock
+        .inner
+        .endpoints
+        .read()
+        .unwrap()
+        .get(&peer_key)
+        .unwrap()
+        .pending_pings_count();
+    assert_eq!(pending_after_first_send, 2, "send should fan out discovery");
+
+    assert!(magicsock.send(peer_key.clone(), b"second").await.is_err());
+    tokio::task::yield_now().await;
+    let pending_after_second_send = magicsock
+        .inner
+        .endpoints
+        .read()
+        .unwrap()
+        .get(&peer_key)
+        .unwrap()
+        .pending_pings_count();
+    assert_eq!(
+        pending_after_second_send, pending_after_first_send,
+        "a second immediate send must not start another discovery round"
+    );
+}
+
+#[tokio::test]
+async fn derp_send_starts_rate_limited_direct_discovery() {
+    let relay = Arc::new(FakeRelay::new());
+    let private_key = NodePrivate::generate();
+    let peer_key = NodePrivate::generate().public();
+    let peer_disco = DiscoPrivate::generate().public();
+    let derp_client = connect_to_relay(&relay, private_key.clone()).await;
+    let (magicsock, _rx) = Magicsock::new(MagicsockConfig {
+        private_key,
+        disco_key: DiscoPrivate::generate(),
+        derp_client: Some(derp_client),
+        derp_map: None,
+        home_derp_region: 1,
+        udp_bind: None,
+        udp_socket: None,
+        portmapper: None,
+        health: None,
+        disable_direct_paths: false,
+        peer_relay_server: false,
+        relay_server_config: None,
+        sockstats: None,
+        control_knobs: None,
+    })
+    .await
+    .unwrap();
+    magicsock
+        .set_netmap(vec![make_peer(
+            peer_key.clone(),
+            peer_disco,
+            vec!["127.0.0.1:4343".to_owned(), "127.0.0.1:4344".to_owned()],
+            1,
+        )])
+        .await
+        .unwrap();
+
+    assert_eq!(magicsock.peer_path_class(&peer_key), PathClass::Derp);
+    magicsock.send(peer_key.clone(), b"first").await.unwrap();
+    tokio::task::yield_now().await;
+    let pending_after_first_send = magicsock
+        .inner
+        .endpoints
+        .read()
+        .unwrap()
+        .get(&peer_key)
+        .unwrap()
+        .pending_pings_count();
+    assert_eq!(
+        pending_after_first_send, 2,
+        "DERP send should fan out discovery"
+    );
+
+    magicsock.send(peer_key.clone(), b"second").await.unwrap();
+    tokio::task::yield_now().await;
+    assert_eq!(
+        magicsock
+            .inner
+            .endpoints
+            .read()
+            .unwrap()
+            .get(&peer_key)
+            .unwrap()
+            .pending_pings_count(),
+        pending_after_first_send,
+        "a second immediate DERP send must not start another discovery round"
+    );
+}
+
 // ---- Test (b): Direct path upgrade over loopback UDP ----
 
 #[tokio::test]

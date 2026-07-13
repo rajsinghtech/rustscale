@@ -31,22 +31,51 @@ source tools/bench/gcp/lib.sh
 # shellcheck source=./footprint.sh
 source tools/bench/gcp/footprint.sh
 
+rust_build_command() {
+  printf '%s' 'export RUSTUP_HOME=/opt/rust CARGO_HOME=/opt/rust/cargo; cd /opt/rustscale && cargo build --release -p rustscale-bench -p rustscale-cli -p rustscale-rustscaled'
+}
+
+matrix_command_shape_self_test() {
+  [[ "$(rust_build_command)" == *'-p rustscale-rustscaled'* ]] || return 1
+  [[ "$(rust_build_command)" != *'-p rustscaled'* ]] || return 1
+}
+
+matrix_command_shape_self_test
+
 # ---------------------------------------------------------------------------
 # Arg parsing.
 # ---------------------------------------------------------------------------
 DRY_RUN=0
-for arg in "$@"; do
-  case "$arg" in
-    --dry-run|-n) DRY_RUN=1 ;;
+TOPOLOGY_FILTER=""
+PATH_FILTER=""
+CONFIG_FILTER=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --topology)
+      [[ $# -ge 2 && -n "$2" ]] || { echo "--topology requires a value" >&2; exit 2; }
+      TOPOLOGY_FILTER="$2"; shift 2 ;;
+    --topology=*) TOPOLOGY_FILTER="${1#*=}"; shift ;;
+    --path)
+      [[ $# -ge 2 && -n "$2" ]] || { echo "--path requires a value" >&2; exit 2; }
+      PATH_FILTER="$2"; shift 2 ;;
+    --path=*) PATH_FILTER="${1#*=}"; shift ;;
+    --config)
+      [[ $# -ge 2 && -n "$2" ]] || { echo "--config requires a value" >&2; exit 2; }
+      CONFIG_FILTER="$2"; shift 2 ;;
+    --config=*) CONFIG_FILTER="${1#*=}"; shift ;;
+    --dry-run|-n) DRY_RUN=1; shift ;;
     -h|--help)
       cat <<EOF
-usage: $0 [--dry-run]
+usage: $0 [--dry-run] [--topology LIST] [--path LIST] [--config LIST]
 Runs the full 16-run GCP bench matrix.
   --dry-run  validate args + script structure without gcloud or API calls.
+  --topology comma-separated subset: same-zone,cross-region
+  --path     comma-separated subset: direct,derp
+  --config   comma-separated subset: rs-userspace,rs-tun,ts-userspace,ts-tun
 EOF
       exit 0
       ;;
-    *) echo "unknown arg: $arg" >&2; exit 2 ;;
+    *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
 
@@ -65,6 +94,26 @@ declare -A ZONES=(
 TOPOLOGIES=(same-zone cross-region)
 PATHS=(direct derp)
 CONFIGS=(rs-userspace rs-tun ts-userspace ts-tun)
+select_values() {
+  local filter="$1"; shift
+  local -a available=("$@") selected=()
+  [[ -z "$filter" ]] && { SELECTED=("${available[@]}"); return; }
+  local item candidate found
+  IFS=, read -r -a selected <<< "$filter"
+  for item in "${selected[@]}"; do
+    found=0
+    for candidate in "${available[@]}"; do
+      if [[ "$item" == "$candidate" ]]; then
+        found=1
+      fi
+    done
+    (( found )) || { echo "invalid selection: $item" >&2; exit 2; }
+  done
+  SELECTED=("${selected[@]}")
+}
+select_values "$TOPOLOGY_FILTER" "${TOPOLOGIES[@]}"; TOPOLOGIES=("${SELECTED[@]}")
+select_values "$PATH_FILTER" "${PATHS[@]}"; PATHS=("${SELECTED[@]}")
+select_values "$CONFIG_FILTER" "${CONFIGS[@]}"; CONFIGS=("${SELECTED[@]}")
 
 STAMP=$(date +%Y%m%d-%H%M%S)
 RESULTS_DIR="bench-results/gcp-$STAMP"
@@ -136,9 +185,9 @@ for TOPO in "${TOPOLOGIES[@]}"; do
   deliver_source "$CLIENT_VM" "$Z_B"
   echo "[gcp] building rustscale on both VMs in parallel..." >&2
   ssh_cmd "$SERVER_VM" "$Z_A" \
-    'export RUSTUP_HOME=/opt/rust CARGO_HOME=/opt/rust/cargo; cd /opt/rustscale && cargo build --release -p rustscale-bench && cargo build --release --example rustscale-tun -p rustscale-tsnet' &
+    "$(rust_build_command)" &
   ssh_cmd "$CLIENT_VM" "$Z_B" \
-    'export RUSTUP_HOME=/opt/rust CARGO_HOME=/opt/rust/cargo; cd /opt/rustscale && cargo build --release -p rustscale-bench && cargo build --release --example rustscale-tun -p rustscale-tsnet' &
+    "$(rust_build_command)" &
   wait
 
   # Path loop.

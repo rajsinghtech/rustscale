@@ -48,6 +48,44 @@ pub struct WgTunn {
     encap_buf: Box<[u8]>,
 }
 
+/// Reusable storage for WireGuard datagrams produced by [`WgTunn`].
+///
+/// `clear` only resets the logical length, retaining packet allocations for
+/// the next batch.
+#[derive(Default)]
+pub struct WgDatagramBatch {
+    packets: Vec<Vec<u8>>,
+    len: usize,
+}
+
+impl WgDatagramBatch {
+    /// Create an empty reusable batch.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Forget the initialized packet prefix without releasing its storage.
+    pub fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    /// Copy one datagram into the next reusable packet slot.
+    pub fn push_copy(&mut self, packet: &[u8]) {
+        if self.len == self.packets.len() {
+            self.packets.push(Vec::new());
+        }
+        let slot = &mut self.packets[self.len];
+        slot.clear();
+        slot.extend_from_slice(packet);
+        self.len += 1;
+    }
+
+    /// The initialized packet prefix.
+    pub fn packets(&self) -> &[Vec<u8>] {
+        &self.packets[..self.len]
+    }
+}
+
 impl WgTunn {
     /// Create a new tunnel from our node private key and the peer's node public
     /// key. Both are X25519; the 32 raw bytes are converted to boringtun's key
@@ -88,6 +126,24 @@ impl WgTunn {
             TunnResult::Done
             | TunnResult::WriteToTunnelV4(_, _)
             | TunnResult::WriteToTunnelV6(_, _) => Ok(vec![]),
+        }
+    }
+
+    /// Encapsulate `plaintext`, appending any resulting datagram to `batch`.
+    pub fn encapsulate_into(
+        &mut self,
+        plaintext: &[u8],
+        batch: &mut WgDatagramBatch,
+    ) -> Result<(), WgError> {
+        match self.tunn.encapsulate(plaintext, &mut self.encap_buf[..]) {
+            TunnResult::WriteToNetwork(buf) => {
+                batch.push_copy(buf);
+                Ok(())
+            }
+            TunnResult::Err(e) => Err(WgError::Tunnel(format!("{e:?}"))),
+            TunnResult::Done
+            | TunnResult::WriteToTunnelV4(_, _)
+            | TunnResult::WriteToTunnelV6(_, _) => Ok(()),
         }
     }
 
@@ -330,5 +386,55 @@ mod tests {
         let pkt = make_ipv4_packet(b"x");
         let dst = WgTunn::dst_address(&pkt);
         assert_eq!(dst, Some(IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 2))));
+    }
+
+    #[test]
+    fn datagram_batch_clear_reuses_slots_and_hides_stale_packets() {
+        let mut batch = WgDatagramBatch::new();
+        batch.push_copy(b"first");
+        let capacity = batch.packets()[0].capacity();
+        batch.clear();
+        assert!(batch.packets().is_empty());
+        batch.push_copy(b"second");
+        assert_eq!(batch.packets(), &[b"second".to_vec()]);
+        assert_eq!(batch.packets()[0].capacity(), capacity);
+    }
+
+    #[test]
+    fn encapsulate_into_retains_ordered_ciphertexts_after_scratch_reuse() {
+        let a_priv = NodePrivate::generate();
+        let b_priv = NodePrivate::generate();
+        let mut a = WgTunn::new(&a_priv, &b_priv.public(), 40).expect("A tunnel");
+        let mut b = WgTunn::new(&b_priv, &a_priv.public(), 41).expect("B tunnel");
+        handshake(&mut a, &mut b);
+
+        let first = make_ipv4_packet(b"first batch packet");
+        let second = make_ipv4_packet(b"second batch packet");
+        let mut batch = WgDatagramBatch::new();
+        a.encapsulate_into(&first, &mut batch)
+            .expect("first encapsulate");
+        a.encapsulate_into(&second, &mut batch)
+            .expect("second encapsulate");
+        assert_eq!(batch.packets().len(), 2);
+
+        // A subsequent scalar call overwrites WgTunn's internal scratch. The
+        // batch copies must nevertheless remain valid and ordered.
+        let scalar = make_ipv4_packet(b"scalar comparison packet");
+        let scalar_out = a.encapsulate(&scalar).expect("scalar encapsulate");
+        assert_eq!(scalar_out.len(), 1);
+
+        let plaintexts: Vec<Vec<u8>> = batch
+            .packets()
+            .iter()
+            .filter_map(|packet| b.decapsulate(packet).expect("batch decrypt").plaintext)
+            .collect();
+        assert_eq!(plaintexts, vec![first, second]);
+        assert_eq!(
+            b.decapsulate(&scalar_out[0])
+                .expect("scalar decrypt")
+                .plaintext,
+            Some(scalar),
+            "encapsulate_into follows the existing encapsulate behavior"
+        );
     }
 }

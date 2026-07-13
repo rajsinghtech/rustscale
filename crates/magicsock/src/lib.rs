@@ -987,34 +987,39 @@ impl Magicsock {
 
     /// Send a WG datagram to `peer` over the best available path.
     pub async fn send(&self, peer: NodePublic, datagram: &[u8]) -> Result<(), MagicsockError> {
+        self.send_batch(peer, std::slice::from_ref(&datagram)).await
+    }
+
+    /// Send ordered WireGuard datagrams over one snapshot of the peer's path.
+    pub async fn send_batch<T: AsRef<[u8]>>(
+        &self,
+        peer: NodePublic,
+        datagrams: &[T],
+    ) -> Result<(), MagicsockError> {
+        if datagrams.is_empty() {
+            return Ok(());
+        }
         // Note TX activity before path lookup. Only an inactive-to-active
         // transition arms the independent heartbeat cadence.
-        let arm_heartbeat = {
+        let (arm_heartbeat, path, derp_region) = {
             let mut endpoints = self
                 .inner
                 .endpoints
                 .write()
                 .expect("endpoints lock poisoned");
-            endpoints.get_mut(&peer).is_some_and(|ep| {
-                ep.note_tx_activity_transition(std::time::Instant::now(), SESSION_ACTIVE_TIMEOUT)
-            })
+            let now = std::time::Instant::now();
+            let ep = endpoints
+                .get_mut(&peer)
+                .ok_or(MagicsockError::PeerNotFound)?;
+            (
+                ep.note_tx_activity_transition(now, SESSION_ACTIVE_TIMEOUT),
+                ep.best_path(now),
+                ep.derp_send_region(),
+            )
         };
         if arm_heartbeat {
             self.arm_heartbeat(&peer);
         }
-
-        let (path, derp_region) = {
-            let endpoints = self
-                .inner
-                .endpoints
-                .read()
-                .expect("endpoints lock poisoned");
-            let ep = endpoints.get(&peer).ok_or(MagicsockError::PeerNotFound)?;
-            (
-                ep.best_path(std::time::Instant::now()),
-                ep.derp_send_region(),
-            )
-        };
 
         // DERP is a fallback, not the end of discovery. Start a bounded,
         // rate-limited candidate round in the background so packet delivery
@@ -1028,44 +1033,80 @@ impl Magicsock {
             self.start_discovery(peer.clone());
         }
 
+        let mut first_error = None;
         match path {
             endpoint::BestPath::Direct { addr, .. } => {
                 if self.inner.disable_direct_paths {
-                    return self.send_via_derp(peer, derp_region, datagram).await;
+                    for datagram in datagrams {
+                        if let Err(e) = self
+                            .send_via_derp(peer.clone(), derp_region, datagram.as_ref())
+                            .await
+                        {
+                            first_error.get_or_insert(e);
+                        }
+                    }
+                    return first_error.map_or(Ok(()), Err);
                 }
                 if let Some(ref udp) = self.inner.udp {
-                    if let Err(e) = udp.send_to(datagram, addr).await {
-                        if !treat_as_lost_udp(&e) {
-                            return Err(MagicsockError::Io(e));
+                    for datagram in datagrams {
+                        let datagram = datagram.as_ref();
+                        if let Err(e) = udp.send_to(datagram, addr).await {
+                            if !treat_as_lost_udp(&e) {
+                                first_error.get_or_insert(MagicsockError::Io(e));
+                            }
+                        } else {
+                            self.inner.record_udp_tx(addr, datagram.len());
                         }
-                    } else {
-                        self.inner.record_udp_tx(addr, datagram.len());
                     }
-                    return Ok(());
+                    return first_error.map_or(Ok(()), Err);
                 }
-                self.send_via_derp(peer, derp_region, datagram).await
+                for datagram in datagrams {
+                    if let Err(e) = self
+                        .send_via_derp(peer.clone(), derp_region, datagram.as_ref())
+                        .await
+                    {
+                        first_error.get_or_insert(e);
+                    }
+                }
             }
             endpoint::BestPath::Relay { addr, vni } => {
                 // Relay paths work even when direct paths are disabled —
                 // the relay path is established by the relay manager, not
                 // by direct disco pinging.
                 if let Some(ref udp) = self.inner.udp {
-                    let framed = relay::encode_geneve(vni, datagram);
-                    if let Err(e) = udp.send_to(&framed, addr).await {
-                        if !treat_as_lost_udp(&e) {
-                            return Err(MagicsockError::Io(e));
+                    for datagram in datagrams {
+                        let framed = relay::encode_geneve(vni, datagram.as_ref());
+                        if let Err(e) = udp.send_to(&framed, addr).await {
+                            if !treat_as_lost_udp(&e) {
+                                first_error.get_or_insert(MagicsockError::Io(e));
+                            }
+                        } else {
+                            self.inner.record_udp_tx(addr, framed.len());
                         }
-                    } else {
-                        self.inner.record_udp_tx(addr, framed.len());
                     }
-                    return Ok(());
+                    return first_error.map_or(Ok(()), Err);
                 }
-                self.send_via_derp(peer, derp_region, datagram).await
+                for datagram in datagrams {
+                    if let Err(e) = self
+                        .send_via_derp(peer.clone(), derp_region, datagram.as_ref())
+                        .await
+                    {
+                        first_error.get_or_insert(e);
+                    }
+                }
             }
             endpoint::BestPath::Derp { .. } | endpoint::BestPath::None => {
-                self.send_via_derp(peer, derp_region, datagram).await
+                for datagram in datagrams {
+                    if let Err(e) = self
+                        .send_via_derp(peer.clone(), derp_region, datagram.as_ref())
+                        .await
+                    {
+                        first_error.get_or_insert(e);
+                    }
+                }
             }
         }
+        first_error.map_or(Ok(()), Err)
     }
 
     /// Inspect the current best path class for a peer (for testing).

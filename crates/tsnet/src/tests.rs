@@ -881,10 +881,18 @@ fn pump_cycle(
     b_tunn: &Mutex<WgTunn>,
     a_net: &Netstack,
     b_net: &Netstack,
+    capture: Option<&crate::capture::CaptureSlot>,
 ) -> bool {
     let mut did_work = false;
     while let Some(pkt) = a_net.pop_tx() {
         did_work = true;
+        if let Some(capture) = capture {
+            crate::capture::log_packet(
+                capture,
+                crate::capture::CapturePath::SynthesizedToPeer,
+                &pkt,
+            );
+        }
         let dgs = a_tunn
             .lock()
             .expect("a")
@@ -896,6 +904,13 @@ fn pump_cycle(
     }
     while let Some(pkt) = b_net.pop_tx() {
         did_work = true;
+        if let Some(capture) = capture {
+            crate::capture::log_packet(
+                capture,
+                crate::capture::CapturePath::SynthesizedToPeer,
+                &pkt,
+            );
+        }
         let dgs = b_tunn
             .lock()
             .expect("b")
@@ -919,6 +934,12 @@ fn pump_cycle(
 /// Set up a back-to-back rig: two netstacks + WG tunnels + a pump task.
 /// Returns (a_net, b_net, pump_handle).
 fn make_rig() -> (Arc<Netstack>, Arc<Netstack>, tokio::task::JoinHandle<()>) {
+    make_rig_with_capture(None)
+}
+
+fn make_rig_with_capture(
+    capture: Option<crate::capture::CaptureSlot>,
+) -> (Arc<Netstack>, Arc<Netstack>, tokio::task::JoinHandle<()>) {
     let a_priv = NodePrivate::generate();
     let b_priv = NodePrivate::generate();
     let a_pub = a_priv.public();
@@ -942,7 +963,7 @@ fn make_rig() -> (Arc<Netstack>, Arc<Netstack>, tokio::task::JoinHandle<()>) {
         let a_tx = a_n.tx_notify();
         let b_tx = b_n.tx_notify();
         loop {
-            let did = pump_cycle(&a_t, &b_t, &a_n, &b_n);
+            let did = pump_cycle(&a_t, &b_t, &a_n, &b_n, capture.as_ref());
             if !did {
                 tokio::select! {
                     () = a_tx.notified() => {}
@@ -953,6 +974,44 @@ fn make_rig() -> (Arc<Netstack>, Arc<Netstack>, tokio::task::JoinHandle<()>) {
         }
     });
     (a_net, b_net, pump)
+}
+
+#[tokio::test]
+async fn netstack_mode_capture_emits_parseable_pcap() {
+    let capture = crate::capture::new_slot();
+    let sink = crate::capture::get_or_set(&capture);
+    let temp = tempfile::NamedTempFile::new().expect("capture file");
+    let handle = sink
+        .register_output(std::fs::File::create(temp.path()).expect("open capture file"))
+        .expect("register capture file");
+    let (a_net, b_net, pump) = make_rig_with_capture(Some(capture));
+    let mut listener = b_net.listen(8081).await.expect("listen");
+    let accept = tokio::spawn(async move { listener.accept().await.expect("accept") });
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2)), 8081);
+    let client = tokio::time::timeout(std::time::Duration::from_secs(5), a_net.dial(addr))
+        .await
+        .expect("dial timeout")
+        .expect("dial");
+    drop(client);
+    let accepted = tokio::time::timeout(std::time::Duration::from_secs(5), accept)
+        .await
+        .expect("accept timeout")
+        .expect("accept task");
+    drop(accepted);
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let bytes = std::fs::read(temp.path()).expect("read capture file");
+    assert!(
+        bytes.len() >= 44,
+        "pcap must contain a record: {} bytes",
+        bytes.len()
+    );
+    assert_eq!(&bytes[..4], &[0xd4, 0xc3, 0xb2, 0xa1]);
+    let caplen = u32::from_le_bytes(bytes[32..36].try_into().unwrap()) as usize;
+    assert!(caplen >= 4);
+    assert!(bytes.len() >= 24 + 16 + caplen);
+    assert_eq!(&bytes[40..42], &[3, 0]);
+    drop(handle);
+    pump.abort();
 }
 
 /// Minimal HTTP/1.1 server: read request line, respond with a fixed body.

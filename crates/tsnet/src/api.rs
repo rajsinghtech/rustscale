@@ -792,23 +792,28 @@ impl Server {
         }
     }
 
-    /// Capture packets seen by the userspace netstack to a pcap file.
+    /// Capture plaintext packets crossing the data plane to a pcap file.
     ///
     /// Mirrors Go's `Server.CapturePcap`. The pcap file receives a raw stream
-    /// of WireGuard-encapsulated packets (the same format as
+    /// in Tailscale's LINKTYPE_USER0 capture format (the same format as
     /// `tailscale debug capture`). A Lua dissector
     /// (`wgengine/capture/ts-dissector.lua` in the Go repo) is needed to
     /// decode the pcap in Wireshark.
     ///
-    /// **Not yet implemented** in rustscale — returns
-    /// [`TsnetError::NotSupported`]. The API is defined for parity so
-    /// callers can write code that will work once the capture stream is
-    /// wired in.
+    /// Capture remains active until [`Server::close`] is called. Repeated
+    /// calls add independent file outputs to the same sink.
     #[allow(clippy::unused_async)] // async for API parity with Go's CapturePcap(ctx, file)
-    pub async fn capture_pcap(&self, _pcap_file: &str) -> Result<(), TsnetError> {
-        Err(TsnetError::NotSupported(
-            "CapturePcap is not yet implemented in rustscale".into(),
-        ))
+    pub async fn capture_pcap(&self, pcap_file: &str) -> Result<(), TsnetError> {
+        let inner = self.inner.as_ref().ok_or(TsnetError::NotUp)?;
+        let file = std::fs::File::create(pcap_file)?;
+        let sink = crate::capture::get_or_set(&inner.capture);
+        let handle = sink.register_output(file)?;
+        inner
+            .capture_handles
+            .lock()
+            .expect("capture handles lock poisoned")
+            .push(handle);
+        Ok(())
     }
 
     /// Register a fallback TCP handler that is called when an incoming TCP

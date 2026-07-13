@@ -32,6 +32,7 @@ mod acme;
 mod api;
 mod appc;
 mod c2n;
+mod capture;
 mod dns_resolve;
 mod filter_build;
 mod hostinfo;
@@ -599,6 +600,11 @@ pub(crate) struct RunningState {
     pub(crate) cancel: Arc<CancelToken>,
     pub(crate) tasks: Mutex<Vec<JoinHandle<()>>>,
     pub(crate) packet_drops: Arc<AtomicU64>,
+    /// Optional packet-capture sink. Disabled capture costs pumps one cheap
+    /// read-lock/Option check per observed packet.
+    pub(crate) capture: capture::CaptureSlot,
+    /// File capture registrations retained until server shutdown.
+    pub(crate) capture_handles: std::sync::Mutex<Vec<capture::CaptureHandle>>,
     /// Shared MagicDNS resolver (dial path + DNS responder).
     pub(crate) resolver: Arc<RwLock<MagicDnsResolver>>,
     /// Our node's FQDN (with trailing dot), from the netmap.

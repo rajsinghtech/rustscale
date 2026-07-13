@@ -80,7 +80,7 @@ fn parse_ping_args(args: &[String]) -> Result<PingArgs, CliError> {
                     .parse()
                     .map_err(|_| CliError(format!("invalid {arg} value: {raw}")))?;
             }
-            "--count" | "-c" => {
+            "--count" | "--c" | "-c" => {
                 let raw = value(arg, &mut i)?;
                 count = raw
                     .parse()
@@ -97,6 +97,7 @@ fn parse_ping_args(args: &[String]) -> Result<PingArgs, CliError> {
             value
                 if let Some(raw) = value
                     .strip_prefix("--count=")
+                    .or_else(|| value.strip_prefix("--c="))
                     .or_else(|| value.strip_prefix("-c=")) =>
             {
                 count = raw
@@ -143,7 +144,7 @@ fn print_help() {
     println!("  --icmp                     Send ICMP pings");
     println!("  --peerapi                  Send PeerAPI pings");
     println!("  --size, -s <bytes>         Ping payload size (default 0)");
-    println!("  --count, -c <count>        Maximum pings; 0 retries indefinitely (default 10)");
+    println!("  --c, --count, -c <count>   Number of pings; 0 retries indefinitely (default 10)");
     println!("  --timeout <duration>       Per-ping timeout (default 5s)");
     println!("  --until-direct[=true|false]  Stop after a direct path (default true)");
 }
@@ -249,12 +250,24 @@ mod tests {
                 .count,
             2
         );
+        for input in [
+            args(&["--c", "3", "100.64.0.1"]),
+            args(&["--c=4", "100.64.0.1"]),
+            args(&["--count", "5", "100.64.0.1"]),
+            args(&["--count=6", "100.64.0.1"]),
+            args(&["-c", "7", "100.64.0.1"]),
+        ] {
+            assert!(parse_ping_args(&input).is_ok(), "{input:?}");
+        }
     }
 
     #[test]
     fn rejects_malformed_and_unknown_flags() {
         for input in [
             args(&["100.64.0.1", "--count=wat"]),
+            args(&["100.64.0.1", "--c=wat"]),
+            args(&["100.64.0.1", "--c"]),
+            args(&["100.64.0.1", "--c", "-1"]),
             args(&["100.64.0.1", "--timeout=5"]),
             args(&["100.64.0.1", "--until-direct=maybe"]),
             args(&["100.64.0.1", "--bogus"]),

@@ -184,18 +184,25 @@ tun_ping_invocation() {
   local cli="$1" socket="$2" path_tag="$3" server_ip="$4"
   local ping_args
   if [[ "$path_tag" == direct ]]; then
-    ping_args="--until-direct --count=120"
+    ping_args="--until-direct --c=120"
   else
-    ping_args="--until-direct=false --count=1"
+    ping_args="--until-direct=false --c=1"
   fi
   printf '%s --socket=%s ping %s %s' "$cli" "$socket" "$ping_args" "$server_ip"
 }
 
 command_shape_self_test() {
-  [[ "$(tun_ping_invocation tailscale /tmp/ts.sock direct 100.64.0.1)" == \
-    'tailscale --socket=/tmp/ts.sock ping --until-direct --count=120 100.64.0.1' ]] || return 1
-  [[ "$(tun_ping_invocation /opt/rustscale/target/release/rustscale /tmp/rs.sock derp 100.64.0.1)" == \
-    '/opt/rustscale/target/release/rustscale --socket=/tmp/rs.sock ping --until-direct=false --count=1 100.64.0.1' ]] || return 1
+  local ts_direct rs_direct ts_derp rs_derp
+  ts_direct=$(tun_ping_invocation tailscale /tmp/ts.sock direct 100.64.0.1)
+  rs_direct=$(tun_ping_invocation /opt/rustscale/target/release/rustscale /tmp/rs.sock direct 100.64.0.1)
+  ts_derp=$(tun_ping_invocation tailscale /tmp/ts.sock derp 100.64.0.1)
+  rs_derp=$(tun_ping_invocation /opt/rustscale/target/release/rustscale /tmp/rs.sock derp 100.64.0.1)
+  [[ "$ts_direct" == 'tailscale --socket=/tmp/ts.sock ping --until-direct --c=120 100.64.0.1' ]] || return 1
+  [[ "$rs_direct" == '/opt/rustscale/target/release/rustscale --socket=/tmp/rs.sock ping --until-direct --c=120 100.64.0.1' ]] || return 1
+  [[ "${ts_direct#* ping }" == "${rs_direct#* ping }" ]] || return 1
+  [[ "$ts_derp" == 'tailscale --socket=/tmp/ts.sock ping --until-direct=false --c=1 100.64.0.1' ]] || return 1
+  [[ "$rs_derp" == '/opt/rustscale/target/release/rustscale --socket=/tmp/rs.sock ping --until-direct=false --c=1 100.64.0.1' ]] || return 1
+  [[ "${ts_derp#* ping }" == "${rs_derp#* ping }" ]] || return 1
 }
 
 # Gate kernel benchmarks on a product CLI ping and return its observed class.
@@ -216,7 +223,7 @@ tun_path_gate() {
 
 cleanup_rs_tun() {
   local status=0
-  if ! ssh_cmd "$SVM" "$SZONE" "kill \$(cat /tmp/iperf3-srv.pid 2>/dev/null) 2>/dev/null; pkill -x iperf3 2>/dev/null"; then
+  if ! ssh_cmd "$SVM" "$SZONE" "kill \$(cat /tmp/iperf3-srv.pid 2>/dev/null) 2>/dev/null || true; pkill -x iperf3 2>/dev/null || true"; then
     echo "[gcp] WARNING: could not stop rs-tun iperf3 server on $SVM" >&2
   fi
 

@@ -6,18 +6,33 @@ A Rust implementation of Tailscale's client stack — the equivalent of Go's `ts
 supporting direct (UDP hole-punched) connections, DERP relay, and peer relay, with the long-term
 goal of a full TUN-mode client.
 
-## Development model: ALL implementation work goes through opencode agents
+## Development model: ALL implementation work goes through coding agents
 
-Claude Code acts as the **orchestrator only**. All code in this repo is written by opencode
-agents. Model tiering: `deepseek/deepseek-v4-flash` for ALL research/review/docs/toolsmith
-passes (free, unlimited), `zai/glm-5.2` reserved for implementation code only. Do not write
-implementation code directly with Edit/Write except for docs, specs, and this file.
+The primary assistant acts as the **orchestrator only**. All implementation code in this
+repo is written by Codex agents using `gpt-5.6-terra`. OpenCode agents using
+`deepseek/deepseek-v4-flash` are reserved for research, review, docs, and toolsmith passes.
+Do not use GLM for implementation. Do not write implementation code directly except for
+docs, specs, and this file.
 
-GLM-5.2 prompts MUST be self-contained (pre-researched, pre-distilled). Deepseek research
-passes pre-digest Go sources, porting-notes, and existing crate code into a spec prompt
-that the glm agent can execute without re-reading Go files or exploring crate registries.
+Coding-agent prompts MUST be self-contained (pre-researched, pre-distilled). DeepSeek
+research passes pre-digest Go sources, porting-notes, and existing crate code into a spec
+prompt that the Codex agent can execute without repeating broad source exploration.
 
-### How to call opencode
+### How to call Codex for implementation
+
+Create an isolated worktree, then run Codex non-interactively with the model selected
+explicitly:
+
+```bash
+git worktree add .worktrees/<title> -b agent/<title> master
+codex -a never exec -m gpt-5.6-terra -s workspace-write \
+  -C "$PWD/.worktrees/<title>" "<detailed implementation prompt>"
+```
+
+Tell the agent not to commit and not to spawn other agents. After review and validation,
+merge with `tools/agent/worktree-merge.sh "<title>"`.
+
+### How to call OpenCode for research
 
 **Use the server harness — NOT `opencode run`.** `opencode run` is synchronous with no
 timeout; when the model stalls it blocks forever and leaves zombie processes. The harness
@@ -34,7 +49,8 @@ tools/agent/opencode-task.sh --continue <sessionID> "fix ..." [deadline_secs]
 - Exit 3 = watchdog aborted at the deadline (prints the sessionID — inspect partial work
   on disk, then `--continue` that session).
 - The server is auto-started on 127.0.0.1:4096 if not running (`/tmp/opencode-serve.log`).
-- Model default: `zai/glm-5.2` via provider `ai` (`http://ai.keiretsu.ts.net/v1`). Override with `OPENCODE_MODEL` or `--model`.
+- Always select `deepseek/deepseek-v4-flash` for these research-only runs via
+  `OPENCODE_MODEL` or `--model`.
 - Under the hood: `POST /session?directory=...` (with `permission:[{permission:"*",pattern:"*",action:"allow"}]`),
   `POST /session/:id/prompt_async` (204, non-blocking), poll `/session/status` +
   `/session/:id/message`, `POST /session/:id/abort` on deadline.
@@ -49,7 +65,8 @@ opencode export <id>             # dump full session JSON
 ### Orchestration workflow
 
 1. Write/refine the phase spec in `docs/` (Claude does this).
-2. Launch opencode with a **self-contained prompt**: goal, file layout, references to the Go
+2. Use OpenCode/DeepSeek to research and distill the phase when needed, then launch a
+   Codex `gpt-5.6-terra` agent with a **self-contained prompt**: goal, file layout, references to the Go
    sources under `/Users/rajsingh/Documents/GitHub/tailscale` (agent can read them —
    mention exact paths), acceptance criteria (`cargo build`, `cargo test`, `cargo clippy`).
 3. Run long builds with Bash `run_in_background: true` and poll the output file.
@@ -60,7 +77,7 @@ opencode export <id>             # dump full session JSON
 6. Before starting a new phase, run `tools/worktree-status.sh` to verify no lingering
    worktrees exist. If the unmerged count > 0, resolve first.
 
-### Prompting lessons for glm-5.2
+### Prompting lessons for coding agents
 
 - Give exact file paths in the Go repo to port from; it will read them.
 - One phase per run; keep phases to a few thousand lines of output max.

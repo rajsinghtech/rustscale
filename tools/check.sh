@@ -60,12 +60,13 @@ fail() {
   local out hits
   out="$("$@" 2>&1 || true)"
   if [[ "$label" == "test" ]]; then
-    hits="$(printf '%s\n' "$out" | grep -E '(FAILED|panicked|failures:)' | head -20 || true)"
-    if [ -n "$hits" ]; then
-      # Show the test-failure context (test name + 15 lines around each failure)
-      printf '%s\n' "$out" | grep -B2 -A15 -E '^(test |error:|panicked)' | head -50 >&2
+    if printf '%s\n' "$out" | grep -q -E '(FAILED|panicked|failures:)'; then
+      # Test failures — show the structured failures block from "failures:" to end.
+      # This captures actual test failure messages instead of preceding "test ... ok" lines.
+      printf '%s\n' "$out" | sed -n '/^failures:/,$ p' | head -120 >&2
     else
-      printf '%s\n' "$out" | head -50 >&2
+      # Compilation error (no test runner output) — show the start where errors live.
+      printf '%s\n' "$out" | head -60 >&2
     fi
   else
     hits="$(printf '%s\n' "$out" | grep -E '^(error|warning|Diff in )' | head -50 || true)"

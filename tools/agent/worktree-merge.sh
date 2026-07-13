@@ -33,6 +33,32 @@ run_checks() {
   fi
 }
 
+# --- Update worktree branch with latest master before checks ---
+# This prevents stale-branch failures where master has moved forward.
+echo "[merge] updating worktree branch with latest master ..."
+cd "$REPO_DIR"
+git fetch origin master:master 2>/dev/null || git fetch 2>/dev/null || true
+cd "$REPO_DIR/$WT_DIR"
+if ! GIT_EDITOR=true git merge master --no-edit 2>/dev/null; then
+  CONFLICTED=$(git diff --name-only --diff-filter=U 2>/dev/null || true)
+  echo "[merge] master merge conflict in: $CONFLICTED" >&2
+  # Cargo.lock: accept theirs (safest default for disjoint crate worktrees)
+  if echo "$CONFLICTED" | grep -q '^Cargo\.lock$'; then
+    git checkout --theirs Cargo.lock 2>/dev/null || true
+    git add Cargo.lock
+  fi
+  REMAINING=$(git diff --name-only --diff-filter=U 2>/dev/null || true)
+  if [ -z "$REMAINING" ]; then
+    GIT_EDITOR=true git commit --no-edit 2>/dev/null || true
+    echo "[merge] Cargo.lock conflict auto-resolved"
+  else
+    echo "[merge] UNRESOLVED CONFLICTS — aborting merge; manual resolution needed" >&2
+    git merge --abort 2>/dev/null || true
+    echo "##STATUS:FAILED master_merge_conflicts" >&2
+    exit 1
+  fi
+fi
+
 echo "[merge] running checks in $WT_DIR ..."
 CHECK_OUT=$(cd "$REPO_DIR/$WT_DIR" && run_checks 2>&1) || {
   echo "$CHECK_OUT"

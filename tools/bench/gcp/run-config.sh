@@ -223,7 +223,10 @@ tun_path_gate() {
 
 cleanup_rs_tun() {
   local status=0
-  if ! ssh_cmd "$SVM" "$SZONE" "kill \$(cat /tmp/iperf3-srv.pid 2>/dev/null) 2>/dev/null || true; pkill -x iperf3 2>/dev/null || true"; then
+  # This runs as root because rs-tun may have left root-owned benchmark files.
+  # It is deliberately idempotent: an already-absent optional iperf3 server
+  # must not make ssh_sudo retry before the next non-root config starts.
+  if ! ssh_sudo "$SVM" "$SZONE" "$(rs_tun_iperf_cleanup_command)"; then
     echo "[gcp] WARNING: could not stop rs-tun iperf3 server on $SVM" >&2
   fi
 
@@ -238,6 +241,17 @@ cleanup_rs_tun() {
     status=1
   fi
   return "$status"
+}
+
+# Print the root-side iperf3 cleanup program used before rs-tun hands a VM to
+# the next configuration.  Remove both files even when the optional process
+# is already absent so a non-root benchmark can create them.
+rs_tun_iperf_cleanup_command() {
+  printf '%s\n' \
+'pidfile=/tmp/iperf3-srv.pid' \
+'kill "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null || true' \
+'pkill -x iperf3 2>/dev/null || true' \
+'rm -f "$pidfile" /tmp/iperf3-srv.log'
 }
 
 # Print the root-side cleanup program for one rs-tun endpoint.  It intentionally
@@ -349,7 +363,7 @@ PYEOF
 }
 
 cleanup_self_test() {
-  local state result events command
+  local state result events command iperf_events
   local -a cases=(absent graceful forced failure)
 
   # These mocks exercise the remote cleanup program's transitions without a
@@ -399,6 +413,23 @@ cleanup_self_test() {
         ;;
     esac
   done
+
+  # The optional iperf3 process can already be absent.  Its cleanup must still
+  # succeed and remove files that were created by the root-run rs-tun benchmark
+  # before a later non-root configuration attempts to create them.
+  if ! iperf_events=$(
+    CLEANUP_TEST_EVENTS=""
+    cat() { CLEANUP_TEST_EVENTS+=" cat"; return 1; }
+    kill() { CLEANUP_TEST_EVENTS+=" kill"; return 1; }
+    pkill() { CLEANUP_TEST_EVENTS+=" pkill"; return 1; }
+    rm() { CLEANUP_TEST_EVENTS+=" rm:$*"; return 0; }
+    eval "$(rs_tun_iperf_cleanup_command)"
+    printf '%s\n' "$CLEANUP_TEST_EVENTS"
+  ); then
+    return 1
+  fi
+  [[ "$iperf_events" == ' kill pkill rm:-f /tmp/iperf3-srv.pid /tmp/iperf3-srv.log' ]] || return 1
+
   unset -f pgrep ip pkill sleep ps fuser test_remote_cleanup
 }
 

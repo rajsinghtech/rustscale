@@ -22,7 +22,9 @@ and CLI parity failures:
    `ping --until-direct --c=120 <ip>` for direct and
    `ping --until-direct=false --c=1 <ip>` for DERP.
 4. Avoid SSH retries when the optional benchmark `iperf3` process is already
-   absent during cleanup.
+   absent during cleanup. Remove benchmark-owned root `iperf3` PID/log files
+   before handing the VM to a non-root configuration so sequential products
+   cannot collide on file ownership.
 
 ## Acceptance
 

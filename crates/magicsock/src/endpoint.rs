@@ -701,6 +701,13 @@ impl Endpoint {
         self.peer_mtu
     }
 
+    /// Reset the PMTUD state to 0 so the next discovery ping burst re-probes
+    /// all sizes. Mirrors Go's `resetEndpointStates` clearing per-endpoint
+    /// PMTU values.
+    pub fn reset_peer_mtu(&mut self) {
+        self.peer_mtu = 0;
+    }
+
     /// Enable or disable UDP lifetime probing on this endpoint.
     pub fn set_probe_udp_lifetime(&mut self, enabled: bool) {
         if enabled {

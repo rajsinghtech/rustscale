@@ -1054,6 +1054,7 @@ impl Server {
             peer_relay_server: false,
             relay_server_config: None,
             sockstats: None,
+            control_knobs: Some(Arc::new(ControlKnobs::new())),
         })
         .await
         .map_err(TsnetError::Magicsock)?;
@@ -1652,6 +1653,15 @@ impl Server {
             }
         });
 
+        // Control knobs: shared feature-flag store updated from each netmap.
+        // Created here (before magicsock) so PMTUD can read PeerMTUEnable at
+        // construction time.
+        let control_knobs = Arc::new(ControlKnobs::new());
+        let initial_knobs = extract_knobs_from_map_response(&map_resp);
+        if !initial_knobs.is_empty() {
+            control_knobs.apply(initial_knobs);
+        }
+
         // 8. Create magicsock, reusing the UDP socket bound in step 3b so
         // the local endpoints advertised in the MapRequest match the socket
         // magicsock actually owns and reads from.
@@ -1669,6 +1679,7 @@ impl Server {
             peer_relay_server: self.config.peer_relay_server,
             relay_server_config: self.config.relay_server_config.clone(),
             sockstats: Some(sockstats.clone()),
+            control_knobs: Some(control_knobs.clone()),
         })
         .await?;
         let magicsock = Arc::new(magicsock_inner);
@@ -1782,12 +1793,7 @@ impl Server {
             Arc::new(r)
         };
 
-        // Control knobs: shared feature-flag store updated from each netmap.
-        let control_knobs = Arc::new(ControlKnobs::new());
-        let initial_knobs = extract_knobs_from_map_response(&map_resp);
-        if !initial_knobs.is_empty() {
-            control_knobs.apply(initial_knobs);
-        }
+        // Control knobs created earlier (before magicsock construction).
 
         Ok(Bootstrap {
             tailscale_ips: tailscale_ips.clone(),

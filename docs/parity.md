@@ -132,7 +132,7 @@ real JSON).
 
 | Feature | Status |
 | --- | --- |
-| Peer MTU discovery (`magicsock/peermtu.go`) | ✅ WIRE_MTUS_TO_PROBE defined, set_pmtud_enabled/peer_mtu_enabled, PMTUD burst in send_pings, probe size tracking in endpoint; disabled by default |
+| Peer MTU discovery (`magicsock/peermtu.go`) | ✅ Full PMTUD: `crates/magicsock/src/pmtud/` platform modules (Linux `IP_MTU_DISCOVER`/`IP_PMTUDISC_DO`, Darwin `IP_DONTFRAG`/`IPV6_DONTFRAG`, stubs for unsupported); `update_pmtud` orchestration (env override → control knob `peer-mtu-enable` → default false), DF socket option set/clear via `setsockopt`, `should_log_disco_tx_err` EMSGSIZE suppression for padded disco pings, `reset_endpoint_states` on PMTUD toggle; `WIRE_MTUS_TO_PROBE` burst in `send_disco_ping`, per-endpoint `peer_mtu` tracking, `reset_peer_mtu` on state reset; wired via `Magicsock::update_pmtud()` on `link_changed` and control-knob re-evaluation |
 | GSO/GRO batching (`net/batching/`) | ⬜ |
 | io_uring TUN+socket (Linux) | ⬜ |
 | BPF disco filtering (`magicsock_linux.go`) | ⬜ |

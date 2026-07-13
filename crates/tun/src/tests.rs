@@ -155,6 +155,49 @@ async fn mock_round_trip_framing() {
     assert_eq!(written, vec![pkt.clone()]);
 }
 
+struct BatchProbe {
+    writes: std::sync::Mutex<Vec<Vec<u8>>>,
+}
+
+#[async_trait::async_trait]
+impl Tun for BatchProbe {
+    async fn read_batch(&self, _batch: &mut TunPacketBatch) -> std::io::Result<()> {
+        unreachable!("write-only test TUN")
+    }
+
+    async fn write_packet(&self, packet: &[u8]) -> std::io::Result<()> {
+        self.writes.lock().unwrap().push(packet.to_vec());
+        if packet == b"bad" {
+            Err(std::io::Error::other("expected failure"))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "batch-probe"
+    }
+
+    fn mtu(&self) -> usize {
+        1280
+    }
+}
+
+#[tokio::test]
+async fn default_write_batch_is_ordered_best_effort_and_empty_is_noop() {
+    let tun = BatchProbe {
+        writes: std::sync::Mutex::new(Vec::new()),
+    };
+    let mut packets = vec![b"first".to_vec(), b"bad".to_vec(), b"last".to_vec()];
+    let error = tun.write_batch(&mut packets).await.unwrap_err();
+    assert_eq!(error.to_string(), "expected failure");
+    assert_eq!(
+        *tun.writes.lock().unwrap(),
+        vec![b"first".to_vec(), b"bad".to_vec(), b"last".to_vec()]
+    );
+    tun.write_batch(&mut []).await.unwrap();
+}
+
 #[tokio::test]
 async fn mock_name_and_mtu() {
     let (tun, _tx) = MockTun::new("mock9", 1400);

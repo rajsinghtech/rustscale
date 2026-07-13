@@ -9,6 +9,7 @@
 //! not exercised on the macOS dev machine but is kept CI-friendly.
 
 use std::io;
+use std::mem::MaybeUninit;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use async_trait::async_trait;
@@ -53,6 +54,88 @@ pub struct TunDevice {
     mtu: usize,
     vnet_hdr: bool,
     raw_frame: Mutex<Vec<u8>>,
+    write_op: Mutex<WriteScratch>,
+}
+
+/// State that must remain exclusively owned while a VNET batch is planned,
+/// header-accounted, and written. The raw iovecs only borrow packets for the
+/// duration of one syscall and are rebuilt immediately before that syscall.
+#[derive(Default)]
+struct WriteScratch {
+    gro: offload::TcpGroState,
+}
+
+/// Guarantees logical GRO state is released even when an async write is
+/// cancelled while waiting for descriptor readiness.
+struct ActiveWritePlan<'a> {
+    scratch: &'a mut WriteScratch,
+}
+
+impl ActiveWritePlan<'_> {
+    fn gro(&mut self) -> &mut offload::TcpGroState {
+        &mut self.scratch.gro
+    }
+}
+
+impl Drop for ActiveWritePlan<'_> {
+    fn drop(&mut self) {
+        self.scratch.gro.reset();
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WriteRetry {
+    Immediate,
+    WaitWritable,
+    Terminal,
+}
+
+enum OutputWriteError {
+    Readiness(io::Error),
+    Frame(io::Error),
+}
+
+#[derive(Default)]
+struct WritePlanErrors {
+    first: Option<io::Error>,
+}
+
+enum WritePlanStep {
+    Continue,
+    Stop(io::Error),
+}
+
+impl WritePlanErrors {
+    fn record(&mut self, error: OutputWriteError) -> WritePlanStep {
+        match error {
+            OutputWriteError::Readiness(error) => WritePlanStep::Stop(error),
+            OutputWriteError::Frame(error) => {
+                let terminal = terminal_write_error(&error);
+                if self.first.is_none() {
+                    self.first = Some(error);
+                }
+                if terminal {
+                    WritePlanStep::Stop(self.first.take().expect("first frame error"))
+                } else {
+                    WritePlanStep::Continue
+                }
+            }
+        }
+    }
+
+    fn finish(self) -> io::Result<()> {
+        self.first.map_or(Ok(()), Err)
+    }
+}
+
+fn classify_write_error(error: &io::Error) -> WriteRetry {
+    if error.raw_os_error() == Some(libc::EINTR) {
+        WriteRetry::Immediate
+    } else if error.kind() == io::ErrorKind::WouldBlock {
+        WriteRetry::WaitWritable
+    } else {
+        WriteRetry::Terminal
+    }
 }
 
 impl TunDevice {
@@ -84,6 +167,7 @@ impl TunDevice {
             mtu,
             vnet_hdr,
             raw_frame: Mutex::new(Vec::new()),
+            write_op: Mutex::new(WriteScratch::default()),
         })
     }
 }
@@ -179,6 +263,30 @@ impl Tun for TunDevice {
         }
     }
 
+    async fn write_batch(&self, packets: &mut [Vec<u8>]) -> io::Result<()> {
+        if packets.is_empty() {
+            return Ok(());
+        }
+        if !self.vnet_hdr {
+            let mut first_error = None;
+            for packet in packets {
+                if let Err(error) = self.write_packet(packet).await {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
+            return first_error.map_or(Ok(()), Err);
+        }
+
+        let mut scratch = self.write_op.lock().await;
+        let mut plan = ActiveWritePlan {
+            scratch: &mut scratch,
+        };
+        plan.gro().plan(packets);
+        self.write_vnet_plan(packets, plan.gro()).await
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
@@ -222,6 +330,68 @@ impl TunDevice {
         }
     }
 
+    async fn write_vnet_plan(
+        &self,
+        packets: &[Vec<u8>],
+        gro: &offload::TcpGroState,
+    ) -> io::Result<()> {
+        let mut errors = WritePlanErrors::default();
+        for output in gro.outputs() {
+            if let Err(error) = self.write_gro_output(output, packets).await {
+                if let WritePlanStep::Stop(error) = errors.record(error) {
+                    return Err(error);
+                }
+            }
+        }
+        errors.finish()
+    }
+
+    async fn write_gro_output(
+        &self,
+        output: &offload::GroOutput,
+        packets: &[Vec<u8>],
+    ) -> Result<(), OutputWriteError> {
+        loop {
+            let mut guard = self
+                .afd
+                .writable()
+                .await
+                .map_err(OutputWriteError::Readiness)?;
+            match guard.try_io(|afd| loop {
+                // The iovecs are created inside the readiness closure and
+                // never survive an await or cancellation point.
+                let mut iovecs: [MaybeUninit<libc::iovec>; offload::MAX_GRO_IOVECS] =
+                    std::array::from_fn(|_| MaybeUninit::uninit());
+                let (iovecs, expected) = gro_write_iovecs(&mut iovecs, output, packets)?;
+                // SAFETY: `iovecs` was just built from live packet and header
+                // storage held by the caller's write-operation mutex. The
+                // kernel reads it only for this syscall.
+                let n = unsafe {
+                    libc::writev(
+                        afd.get_ref().as_raw_fd(),
+                        iovecs.as_ptr(),
+                        iovecs.len() as libc::c_int,
+                    )
+                };
+                if n >= 0 {
+                    return Ok((n as usize, expected));
+                }
+                let error = io::Error::last_os_error();
+                match classify_write_error(&error) {
+                    WriteRetry::Immediate => continue,
+                    WriteRetry::WaitWritable | WriteRetry::Terminal => return Err(error),
+                }
+            }) {
+                Ok(Ok((written, expected))) => {
+                    return validate_vnet_write(Ok(written), expected)
+                        .map_err(OutputWriteError::Frame)
+                }
+                Ok(Err(error)) => return Err(OutputWriteError::Frame(error)),
+                Err(_would_block) => {}
+            }
+        }
+    }
+
     async fn read_vnet_batch(&self, batch: &mut TunPacketBatch) -> io::Result<()> {
         batch.clear();
         let mut raw = self.raw_frame.lock().await;
@@ -259,6 +429,11 @@ impl TunDevice {
             }
         }
     }
+}
+
+/// Descriptor failures cannot make progress by polling a later frame.
+fn terminal_write_error(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(libc::EBADF) | Some(libc::EBADFD))
 }
 
 /// Return the allocation size for one TUN packet read.
@@ -367,6 +542,79 @@ fn vnet_write_iovecs(
             iov_len: packet.len(),
         },
     ]
+}
+
+/// Materialize one platform-neutral GRO output as Linux iovecs. The plan
+/// contains indexes and ranges rather than borrows, so all pointer work stays
+/// at this syscall boundary. Only the returned initialized prefix is exposed.
+fn gro_write_iovecs<'a>(
+    iovecs: &'a mut [MaybeUninit<libc::iovec>],
+    output: &offload::GroOutput,
+    packets: &[Vec<u8>],
+) -> io::Result<(&'a [libc::iovec], usize)> {
+    let count = output.iovec_count();
+    if count > offload::MAX_GRO_IOVECS || count > iovecs.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "too many VNET iovecs",
+        ));
+    }
+    if count > libc::c_int::MAX as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "iov count exceeds C int",
+        ));
+    }
+    let head = packets.get(output.head).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "GRO head packet index out of bounds",
+        )
+    })?;
+    let mut total = vnet_write_len(head.len())?;
+    // Validate every fragment and total before initializing any caller slot.
+    for fragment in &output.fragments {
+        let packet = packets.get(fragment.packet).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "GRO fragment packet index out of bounds",
+            )
+        })?;
+        let bytes = packet.get(fragment.start..fragment.end).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "GRO fragment range out of bounds",
+            )
+        })?;
+        total = total.checked_add(bytes.len()).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "VNET frame length overflow")
+        })?;
+        if total > libc::ssize_t::MAX as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "VNET frame length exceeds ssize_t",
+            ));
+        }
+    }
+    iovecs[0].write(libc::iovec {
+        iov_base: output.header.as_ptr().cast_mut().cast(),
+        iov_len: output.header.len(),
+    });
+    iovecs[1].write(libc::iovec {
+        iov_base: head.as_ptr().cast_mut().cast(),
+        iov_len: head.len(),
+    });
+    for (index, fragment) in output.fragments.iter().enumerate() {
+        let bytes = &packets[fragment.packet][fragment.start..fragment.end];
+        iovecs[index + 2].write(libc::iovec {
+            iov_base: bytes.as_ptr().cast_mut().cast(),
+            iov_len: bytes.len(),
+        });
+    }
+    // SAFETY: the count and every index written above are bounded by
+    // `iovecs.len()`, and all slots in this prefix were initialized.
+    let iovecs = unsafe { std::slice::from_raw_parts(iovecs.as_ptr().cast(), count) };
+    Ok((iovecs, total))
 }
 
 /// Validate that a VNET write consumed both its header and its packet.
@@ -641,5 +889,140 @@ mod tests {
                 .kind(),
             io::ErrorKind::InvalidInput
         );
+    }
+
+    #[test]
+    fn gro_iovec_materialization_checks_ranges_and_limits() {
+        let packets = vec![vec![0x45, 0, 0, 20], vec![1, 2, 3, 4]];
+        let output = offload::GroOutput {
+            header: [0; offload::VIRTIO_NET_HDR_LEN],
+            head: 0,
+            fragments: vec![offload::PayloadFragment {
+                packet: 1,
+                start: 1,
+                end: 3,
+            }],
+        };
+        let mut iovecs: [MaybeUninit<libc::iovec>; offload::MAX_GRO_IOVECS] =
+            std::array::from_fn(|_| MaybeUninit::uninit());
+        {
+            let (prefix, total) = gro_write_iovecs(&mut iovecs, &output, &packets).unwrap();
+            assert_eq!(prefix.len(), 3);
+            assert_eq!(total, offload::VIRTIO_NET_HDR_LEN + 4 + 2);
+            assert_eq!(prefix[0].iov_len, offload::VIRTIO_NET_HDR_LEN);
+        }
+
+        let bad_range = offload::GroOutput {
+            fragments: vec![offload::PayloadFragment {
+                packet: 1,
+                start: 3,
+                end: 5,
+            }],
+            ..output.clone()
+        };
+        assert!(gro_write_iovecs(&mut iovecs, &bad_range, &packets).is_err());
+
+        let exactly_max = offload::GroOutput {
+            fragments: vec![
+                offload::PayloadFragment {
+                    packet: 1,
+                    start: 0,
+                    end: 1,
+                };
+                offload::MAX_GRO_IOVECS - 2
+            ],
+            ..output.clone()
+        };
+        {
+            let (prefix, _) = gro_write_iovecs(&mut iovecs, &exactly_max, &packets).unwrap();
+            assert_eq!(prefix.len(), offload::MAX_GRO_IOVECS);
+        }
+
+        let too_many = offload::GroOutput {
+            fragments: vec![
+                offload::PayloadFragment {
+                    packet: 1,
+                    start: 0,
+                    end: 1,
+                };
+                offload::MAX_GRO_IOVECS - 1
+            ],
+            ..output
+        };
+        assert!(gro_write_iovecs(&mut iovecs, &too_many, &packets).is_err());
+    }
+
+    #[test]
+    fn bad_descriptor_errors_are_terminal() {
+        for errno in [libc::EBADF, libc::EBADFD] {
+            assert!(terminal_write_error(&io::Error::from_raw_os_error(errno)));
+        }
+        assert!(!terminal_write_error(&io::Error::from_raw_os_error(
+            libc::EAGAIN
+        )));
+    }
+
+    #[test]
+    fn syscall_retry_classification_handles_eintr_and_eagain() {
+        assert_eq!(
+            classify_write_error(&io::Error::from_raw_os_error(libc::EINTR)),
+            WriteRetry::Immediate
+        );
+        assert_eq!(
+            classify_write_error(&io::Error::from_raw_os_error(libc::EAGAIN)),
+            WriteRetry::WaitWritable
+        );
+        assert_eq!(
+            classify_write_error(&io::Error::from_raw_os_error(libc::EBADF)),
+            WriteRetry::Terminal
+        );
+    }
+
+    #[test]
+    fn active_plan_drop_resets_state_for_reuse() {
+        let mut packets = vec![vec![0x45, 0, 0, 20]];
+        let mut scratch = WriteScratch::default();
+        {
+            let mut plan = ActiveWritePlan {
+                scratch: &mut scratch,
+            };
+            plan.gro().plan(&mut packets);
+            assert_eq!(plan.gro().outputs().len(), 1);
+        }
+        assert!(scratch.gro.outputs().is_empty());
+        scratch.gro.plan(&mut packets);
+        assert_eq!(scratch.gro.outputs().len(), 1);
+    }
+
+    #[test]
+    fn write_plan_error_policy_is_terminal_only_when_required() {
+        let mut errors = WritePlanErrors::default();
+        assert!(matches!(
+            errors.record(OutputWriteError::Frame(io::Error::other("first"))),
+            WritePlanStep::Continue
+        ));
+        assert!(matches!(
+            errors.record(OutputWriteError::Frame(io::Error::other("later"))),
+            WritePlanStep::Continue
+        ));
+        assert_eq!(errors.finish().unwrap_err().to_string(), "first");
+
+        let mut errors = WritePlanErrors::default();
+        match errors.record(OutputWriteError::Readiness(io::Error::other("poller"))) {
+            WritePlanStep::Stop(error) => assert_eq!(error.to_string(), "poller"),
+            WritePlanStep::Continue => panic!("readiness failure must stop"),
+        }
+
+        for errno in [libc::EBADF, libc::EBADFD] {
+            let mut errors = WritePlanErrors::default();
+            assert!(matches!(
+                errors.record(OutputWriteError::Frame(io::Error::other("first"))),
+                WritePlanStep::Continue
+            ));
+            match errors.record(OutputWriteError::Frame(io::Error::from_raw_os_error(errno))) {
+                WritePlanStep::Stop(error) => assert_eq!(error.to_string(), "first"),
+                WritePlanStep::Continue => panic!("bad descriptor must stop"),
+            }
+        }
     }
 }

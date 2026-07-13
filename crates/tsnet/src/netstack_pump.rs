@@ -143,18 +143,18 @@ async fn handle_inbound_wg(
     }
 }
 
-/// Process a single inbound WG datagram for the TUN pump: look up the peer
-/// tunnel, decapsulate, filter, write plaintext to TUN, and send any WG
-/// protocol replies over magicsock. The tunnel lock is dropped before any
-/// async I/O to avoid holding it across .await points.
-pub(crate) async fn process_tun_inbound(
-    magicsock: &Magicsock,
+/// Decapsulate one TUN-bound datagram and retain accepted plaintext and
+/// protocol replies for the caller's batch boundary. No async device or
+/// magicsock I/O occurs here, so tunnel and filter guards are always dropped
+/// before those operations.
+pub(crate) async fn collect_tun_inbound(
     wg_tunnels: &RwLock<HashMap<NodePublic, Arc<Mutex<WgTunn>>>>,
     filter: &Arc<std::sync::Mutex<Filter>>,
     packet_drops: &Arc<AtomicU64>,
-    tun: &Arc<dyn Tun>,
     dgram: &rustscale_magicsock::WgDatagram,
     capture: &crate::capture::CaptureSlot,
+    plaintext: &mut Vec<Vec<u8>>,
+    replies: &mut Vec<(NodePublic, Vec<u8>)>,
 ) {
     let tunn = {
         let tunnels = wg_tunnels.read().await;
@@ -174,12 +174,14 @@ pub(crate) async fn process_tun_inbound(
                 if dropped {
                     packet_drops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 } else {
+                    // Capture before Linux write-side GRO is allowed to
+                    // rewrite the packet's offload and transport headers.
                     crate::capture::log_packet(capture, crate::capture::CapturePath::FromPeer, &pt);
-                    let _ = tun.write_packet(&pt).await;
+                    plaintext.push(pt);
                 }
             }
             for reply in decap.replies {
-                let _ = magicsock.send(dgram.peer.clone(), &reply).await;
+                replies.push((dgram.peer.clone(), reply));
             }
         }
     }

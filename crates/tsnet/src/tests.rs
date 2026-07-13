@@ -3,7 +3,9 @@
 //! E2e tests are `#[ignore]`d — they require `TS_E2E_AUTHKEY` and
 //! `TS_E2E_TAILNET` env vars (provisioned by `tools/e2e.sh`).
 
+use std::collections::HashMap;
 use std::net::Ipv4Addr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -3367,6 +3369,7 @@ async fn wg_handshake(a_tunn: &Arc<Mutex<WgTunn>>, b_tunn: &Arc<Mutex<WgTunn>>) 
 struct TunPumpRig {
     tun_a: Arc<MockTun>,
     tun_b: Arc<MockTun>,
+    a_pub: NodePublic,
     a_tunn: Arc<Mutex<WgTunn>>,
     b_tunn: Arc<Mutex<WgTunn>>,
     rt_a: Arc<RwLock<RouteTable>>,
@@ -3404,12 +3407,133 @@ fn make_tun_pump_rig(ip_a: Ipv4Addr, ip_b: Ipv4Addr) -> TunPumpRig {
     TunPumpRig {
         tun_a: Arc::new(tun_a),
         tun_b: Arc::new(tun_b),
+        a_pub,
         a_tunn,
         b_tunn,
         rt_a: Arc::new(RwLock::new(RouteTable::from_peers(&peers_a))),
         rt_b: Arc::new(RwLock::new(RouteTable::from_peers(&peers_b))),
         filter: Arc::new(std::sync::Mutex::new(Filter::allow_all())),
     }
+}
+
+#[tokio::test]
+async fn collect_tun_inbound_queues_accepts_drops_and_captures_before_batch_mutation() {
+    let rig = make_tun_pump_rig(Ipv4Addr::new(100, 64, 0, 1), Ipv4Addr::new(100, 64, 0, 2));
+    wg_handshake(&rig.a_tunn, &rig.b_tunn).await;
+    let TunPumpRig {
+        a_pub,
+        a_tunn,
+        b_tunn,
+        filter,
+        ..
+    } = rig;
+    let b_tunn = Arc::try_unwrap(b_tunn)
+        .unwrap_or_else(|_| panic!("test rig receiver tunnel must not have other owners"));
+    let b_tunn = Arc::new(tokio::sync::Mutex::new(
+        b_tunn.into_inner().expect("test rig receiver tunnel lock"),
+    ));
+
+    let tunnels = RwLock::new(HashMap::from([(a_pub.clone(), b_tunn)]));
+    let packet_drops = Arc::new(AtomicU64::new(0));
+    let capture = crate::capture::new_slot();
+    let sink = crate::capture::get_or_set(&capture);
+    let (capture_tx, mut capture_rx) = tokio::sync::mpsc::channel(2);
+    let _capture_handle = sink
+        .register_output(crate::capture::ChannelOutput::new(capture_tx))
+        .expect("register capture output");
+    assert_eq!(
+        capture_rx.recv().await.expect("pcap global header"),
+        vec![
+            0xd4, 0xc3, 0xb2, 0xa1, 0x02, 0x00, 0x04, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0,
+            0, 0x93, 0, 0, 0,
+        ]
+    );
+
+    let accepted = build_ipv4_tcp(
+        Ipv4Addr::new(100, 64, 0, 1),
+        Ipv4Addr::new(100, 64, 0, 2),
+        b"collect-tun-inbound-accepted",
+    );
+    let accepted_datagram = rustscale_magicsock::WgDatagram {
+        peer: a_pub.clone(),
+        data: a_tunn
+            .lock()
+            .expect("source tunnel lock")
+            .encapsulate(&accepted)
+            .expect("encrypt accepted packet")
+            .into_iter()
+            .next()
+            .expect("encrypted WireGuard data datagram"),
+    };
+    let mut plaintext = Vec::new();
+    let mut replies = Vec::new();
+    collect_tun_inbound(
+        &tunnels,
+        &filter,
+        &packet_drops,
+        &accepted_datagram,
+        &capture,
+        &mut plaintext,
+        &mut replies,
+    )
+    .await;
+
+    assert_eq!(
+        plaintext,
+        vec![accepted.clone()],
+        "accepted plaintext is queued"
+    );
+    assert!(replies.is_empty(), "data datagram needs no protocol reply");
+    assert_eq!(packet_drops.load(Ordering::Relaxed), 0);
+
+    // `write_batch` may rewrite this owned buffer for GRO. Capture must have
+    // retained the original plaintext before that later mutation occurs.
+    plaintext[0].fill(0xa5);
+    let captured = capture_rx.recv().await.expect("captured plaintext record");
+    assert_eq!(
+        &captured[16..18],
+        &(crate::capture::CapturePath::FromPeer as u16).to_le_bytes()
+    );
+    assert_eq!(&captured[20..], accepted.as_slice());
+
+    plaintext.clear();
+    *filter.lock().unwrap() = Filter::allow_none();
+    let dropped = build_ipv4_tcp(
+        Ipv4Addr::new(100, 64, 0, 1),
+        Ipv4Addr::new(100, 64, 0, 2),
+        b"collect-tun-inbound-dropped",
+    );
+    let dropped_datagram = rustscale_magicsock::WgDatagram {
+        peer: a_pub.clone(),
+        data: a_tunn
+            .lock()
+            .expect("source tunnel lock")
+            .encapsulate(&dropped)
+            .expect("encrypt dropped packet")
+            .into_iter()
+            .next()
+            .expect("encrypted WireGuard data datagram"),
+    };
+    collect_tun_inbound(
+        &tunnels,
+        &filter,
+        &packet_drops,
+        &dropped_datagram,
+        &capture,
+        &mut plaintext,
+        &mut replies,
+    )
+    .await;
+
+    assert!(
+        plaintext.is_empty(),
+        "filter-dropped plaintext is not queued"
+    );
+    assert_eq!(packet_drops.load(Ordering::Relaxed), 1);
+    assert!(matches!(
+        capture_rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
 }
 
 #[tokio::test]

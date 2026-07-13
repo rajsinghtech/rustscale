@@ -184,6 +184,10 @@ mod tests {
 
     #[test]
     fn test_should_pmtud_control_knob() {
+        let _env_lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::remove_var("TS_DEBUG_ENABLE_PMTUD");
         let knobs = ControlKnobs::new();
         // Default: false
         assert!(!should_pmtud(Some(&knobs)));
@@ -253,11 +257,11 @@ mod tests {
         let _env_lock = ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::remove_var("TS_DEBUG_ENABLE_PMTUD");
         let tokio_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
         // With no control knobs and no env, should_pmtud returns false.
         // If current is true, update should toggle to false.
-        std::env::remove_var("TS_DEBUG_ENABLE_PMTUD");
         let (new_enabled, changed) = update_pmtud(Some(&tokio_sock), None, true);
         assert!(!new_enabled);
         assert!(changed);

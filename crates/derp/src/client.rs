@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpStream;
 use url::Url;
 
 use rustscale_key::{NodePrivate, NodePublic};
@@ -266,7 +265,7 @@ impl DerpClient {
                 .map_err(|e| DerpError::Proxy(e.to_string()))?
         } else {
             let addr = format!("{host}:{port}");
-            TcpStream::connect(&addr).await?
+            rustscale_tsdial::system_dial("tcp", &addr).await?
         };
         tcp.set_nodelay(true).ok();
 
@@ -364,7 +363,7 @@ impl DerpClient {
         }
 
         let addr = format!("{dial_addr}:{port}");
-        let tcp = TcpStream::connect(&addr).await?;
+        let tcp = rustscale_tsdial::system_dial("tcp", &addr).await?;
         tcp.set_nodelay(true).ok();
 
         let mut stream: Box<dyn DerpStream> = if use_tls {

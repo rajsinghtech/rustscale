@@ -1,0 +1,24 @@
+[package]
+name = "rustscale-tsdial"
+description = "Outbound dial abstraction — system, user, and peer dial paths"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rustscale-netns = { workspace = true }
+rustscale-netmon = { workspace = true }
+rustscale-dnscache = { workspace = true }
+rustscale-tailcfg = { path = "../tailcfg" }
+rustscale-tshttpproxy = { path = "../tshttpproxy" }
+tokio = { workspace = true, features = ["net", "sync", "time"] }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+webpki-roots = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+thiserror = { workspace = true }
+tracing = "0.1"

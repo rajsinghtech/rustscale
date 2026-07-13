@@ -16,7 +16,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rustscale_tailcfg::DERPMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::time::timeout;
 
 /// Per-request and overall detection timeout. Captive portals are usually
@@ -243,7 +242,7 @@ async fn http_get(url: &str, ep: &Endpoint) -> Result<HttpResponse, std::io::Err
     }
     req.push_str("\r\n");
 
-    let stream = TcpStream::connect(&host_port).await?;
+    let stream = rustscale_tsdial::system_dial("tcp", &host_port).await?;
     // Set a read/write timeout via tokio's timeout wrapper instead.
     let mut stream = stream;
 

@@ -7,7 +7,6 @@
 
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::time::timeout;
 
 /// Maximum response body size we'll accept (root-desc XML + SOAP responses
@@ -69,9 +68,12 @@ async fn do_request(
     req: &str,
     deadline: Duration,
 ) -> Result<Vec<u8>, std::io::Error> {
-    let mut stream = timeout(deadline, TcpStream::connect((host, port)))
-        .await
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timeout"))??;
+    let mut stream = timeout(
+        deadline,
+        rustscale_tsdial::system_dial("tcp", &format!("{host}:{port}")),
+    )
+    .await
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timeout"))??;
     stream.write_all(req.as_bytes()).await?;
     let mut buf = Vec::with_capacity(4096);
     let mut limited = stream.take(MAX_BODY as u64);

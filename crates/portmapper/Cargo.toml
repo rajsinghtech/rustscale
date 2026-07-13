@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 rustscale-neterror = { path = "../neterror", version = "0.1.0" }
+rustscale-tsdial = { path = "../tsdial" }
 thiserror.workspace = true
 tokio.workspace = true
 rand.workspace = true

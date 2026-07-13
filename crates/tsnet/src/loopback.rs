@@ -556,7 +556,7 @@ async fn serve_loopback<D: super::socks5::SocksDialer + 'static>(
                 let prefixed = PrefixedStream::new(peek_buf[0], stream);
                 let auth = Some(("tsnet", &cred[..]));
                 if let Err(e) = super::socks5::handle_conn_generic(prefixed, d, auth).await {
-                    eprintln!("loopback: socks5 connection ended: {e}");
+                    log::debug!("loopback: socks5 connection ended: {e}");
                 }
             });
         } else {
@@ -565,7 +565,7 @@ async fn serve_loopback<D: super::socks5::SocksDialer + 'static>(
             tokio::spawn(async move {
                 let prefixed = PrefixedStream::new(peek_buf[0], stream);
                 if let Err(e) = handle_localapi_http(prefixed, state, &cred).await {
-                    eprintln!("loopback: localapi connection ended: {e}");
+                    log::debug!("loopback: localapi connection ended: {e}");
                 }
             });
         }

@@ -43,7 +43,7 @@ pub(crate) fn spawn_link_monitor(
             if cancel.is_cancelled() {
                 return;
             }
-            eprintln!(
+            log::debug!(
                 "tsnet: major link change detected; re-gathering endpoints + re-STUN (udp_port={udp_port})"
             );
 
@@ -96,11 +96,11 @@ pub(crate) fn spawn_link_monitor(
             let cc = ControlClient::new(&control_url, machine_key, server_pub_key, PROTOCOL_VERSION);
             match cc.send_map_request(&req).await {
                 Ok(()) => {
-                    eprintln!("tsnet: link-change endpoint update sent");
+                    log::debug!("tsnet: link-change endpoint update sent");
                     // Endpoints re-published: clear the transient warning.
                     health.set_healthy(WARN_NETMON_CHANGE);
                 }
-                Err(e) => eprintln!("tsnet: link-change endpoint update failed (non-fatal): {e}"),
+                Err(e) => log::warn!("tsnet: link-change endpoint update failed (non-fatal): {e}"),
             }
         }
     });
@@ -184,8 +184,8 @@ pub(crate) fn spawn_periodic_endpoint_updates(
                 PROTOCOL_VERSION,
             );
             match cc.send_map_request(&req).await {
-                Ok(()) => eprintln!("tsnet: periodic endpoint update sent"),
-                Err(e) => eprintln!("tsnet: periodic endpoint update failed (non-fatal): {e}"),
+                Ok(()) => log::debug!("tsnet: periodic endpoint update sent"),
+                Err(e) => log::warn!("tsnet: periodic endpoint update failed (non-fatal): {e}"),
             }
         }
     })
@@ -292,7 +292,7 @@ pub(crate) fn spawn_hostinfo_update_loop(
                 shields_up: prefs.ShieldsUp,
                 app_connector: prefs.AppConnector.Advertise,
                 request_tags: prefs.AdvertiseTags.clone(),
-                no_logs_no_support: false,
+                no_logs_no_support: prefs.NoLogsNoSupport,
                 allows_update: prefs.AutoUpdate.unwrap_or(false),
                 sharee_node: false,
                 ssh_host_keys: ssh_host_keys.read().await.clone(),
@@ -328,7 +328,7 @@ pub(crate) fn spawn_hostinfo_update_loop(
                         last_hash = hash;
                     }
                     Err(e) => {
-                        eprintln!("tsnet: hostinfo update send failed (non-fatal): {e}");
+                        log::warn!("tsnet: hostinfo update send failed (non-fatal): {e}");
                     }
                 }
             }

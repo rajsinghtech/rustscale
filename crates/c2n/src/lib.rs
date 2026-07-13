@@ -495,10 +495,14 @@ async fn dispatch<W: AsyncWrite + Unpin>(
         return Ok(());
     }
 
-    // --- POST /logtail/flush → 204 ---
+    // --- POST /logtail/flush → 204 when a flusher is wired ---
     if method == "POST" && path == "/logtail/flush" {
-        // No logtail wired up yet; return 204 (no content) as a no-op.
-        write_no_content(conn).await?;
+        if backend.try_flush_logs().await {
+            write_no_content(conn).await?;
+        } else {
+            let body = serde_json::json!({"error": "no log flusher wired up"});
+            write_json_response(conn, 500, "Internal Server Error", &body).await?;
+        }
         return Ok(());
     }
 
@@ -707,6 +711,10 @@ mod tests {
                 user_id: 1,
                 login_name: "test@tailnet".into(),
             })
+        }
+
+        async fn try_flush_logs(&self) -> bool {
+            true
         }
     }
 

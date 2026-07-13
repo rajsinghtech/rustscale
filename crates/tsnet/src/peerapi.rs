@@ -326,7 +326,7 @@ pub(crate) async fn spawn_peerapi_netstack(
                     std::mem::forget(handle);
                 }
                 Err(e) => {
-                    eprintln!("peerapi: failed to listen on netstack (non-fatal): {e}");
+                    log::warn!("peerapi: failed to listen on netstack (non-fatal): {e}");
                 }
             }
         }
@@ -374,7 +374,7 @@ pub(crate) async fn spawn_peerapi_tun(
     for ip in &tailscale_ips {
         match bind_peerapi_tcp(*ip).await {
             Ok((listener, port)) => {
-                eprintln!("peerapi: listening on {ip}:{port}");
+                log::info!("peerapi: listening on {ip}:{port}");
                 match ip {
                     IpAddr::V4(_) => v4_port = Some(port),
                     IpAddr::V6(_) => v6_port = Some(port),
@@ -383,7 +383,7 @@ pub(crate) async fn spawn_peerapi_tun(
                 handles.push(tokio::spawn(serve_tcp_listener(listener, state)));
             }
             Err(e) => {
-                eprintln!("peerapi: failed to bind on {ip}: {e} (non-fatal)");
+                log::warn!("peerapi: failed to bind on {ip}: {e} (non-fatal)");
             }
         }
     }
@@ -410,7 +410,7 @@ async fn serve_netstack_listener(
                 tokio::spawn(handle_connection_netstack(stream, remote_addr, state));
             }
             Err(e) => {
-                eprintln!("peerapi: netstack accept error: {e}");
+                log::warn!("peerapi: netstack accept error: {e}");
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
         }
@@ -426,7 +426,7 @@ async fn serve_tcp_listener(listener: TcpListener, state: Arc<PeerApiState>) {
                 tokio::spawn(handle_connection_tcp(stream, addr, state));
             }
             Err(e) => {
-                eprintln!("peerapi: tcp accept error: {e}");
+                log::warn!("peerapi: tcp accept error: {e}");
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
         }
@@ -497,7 +497,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerApiConn<S> {
             _ => {
                 // Unknown peer — reject.
                 if let Some(ip) = remote_ip {
-                    eprintln!("peerapi: unknown peer {ip}");
+                    log::warn!("peerapi: unknown peer {ip}");
                 }
                 let _ = write_error_response(
                     &mut self.stream,

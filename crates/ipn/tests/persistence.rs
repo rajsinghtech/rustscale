@@ -40,6 +40,7 @@ fn full_prefs() -> Prefs {
         RunWebClient: true,
         RunSSH: true,
         NoStatefulFiltering: false,
+        NoLogsNoSupport: true,
     }
 }
 

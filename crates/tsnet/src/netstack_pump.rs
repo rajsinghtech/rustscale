@@ -82,7 +82,7 @@ pub(crate) async fn run_netstack_pump(
                         }).await;
                     }
                 } else {
-                    eprintln!("tsnet: magicsock wg channel closed");
+                    log::warn!("tsnet: magicsock wg channel closed");
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
             }

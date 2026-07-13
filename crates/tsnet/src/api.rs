@@ -228,7 +228,7 @@ impl Server {
                 p
             }
             Err(e) => {
-                eprintln!("tsnet: control cert unavailable ({e}); using self-signed");
+                log::warn!("tsnet: control cert unavailable ({e}); using self-signed");
                 inner.health.set_unhealthy(
                     WARN_CERT_FALLBACK,
                     format!("serving self-signed fallback: {e}"),
@@ -576,7 +576,7 @@ impl Server {
                     Some(p)
                 }
                 Err(e) => {
-                    eprintln!("tsnet: serve cert unavailable ({e}); using self-signed");
+                    log::warn!("tsnet: serve cert unavailable ({e}); using self-signed");
                     inner.health.set_unhealthy(
                         WARN_CERT_FALLBACK,
                         format!("serving self-signed fallback: {e}"),
@@ -636,7 +636,7 @@ impl Server {
                 p
             }
             Err(e) => {
-                eprintln!("tsnet: funnel cert unavailable ({e}); using self-signed");
+                log::warn!("tsnet: funnel cert unavailable ({e}); using self-signed");
                 inner.health.set_unhealthy(
                     WARN_CERT_FALLBACK,
                     format!("serving self-signed fallback: {e}"),
@@ -720,7 +720,7 @@ impl Server {
             match self.control_cert_provider().await {
                 Ok(p) => Some(p),
                 Err(e) => {
-                    eprintln!("tsnet: service cert unavailable ({e}); using self-signed");
+                    log::warn!("tsnet: service cert unavailable ({e}); using self-signed");
                     Some(tls::default_cert_provider(&inner.tailscale_ips))
                 }
             }

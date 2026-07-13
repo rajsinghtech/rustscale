@@ -165,7 +165,7 @@ pub(crate) fn default_cert_provider(tailscale_ips: &[std::net::IpAddr]) -> Arc<d
     match SelfSignedCertProvider::new(sans) {
         Ok(p) => Arc::new(p),
         Err(e) => {
-            eprintln!("tsnet: self-signed cert generation failed ({e}); using fallback");
+            log::warn!("tsnet: self-signed cert generation failed ({e}); using fallback");
             // Fallback: localhost-only cert. If this also fails we panic —
             // TLS is unavailable, which is a hard error for listen_tls.
             Arc::new(
@@ -436,7 +436,7 @@ impl ControlCertProvider {
                 // have one (stale-but-usable); otherwise propagate the error.
                 if let Some(cached) = self.load_cached()? {
                     if cached.not_after > Utc::now() {
-                        eprintln!(
+                        log::warn!(
                             "tsnet: cert fetch failed ({e}); serving stale cache for {}",
                             self.domain
                         );

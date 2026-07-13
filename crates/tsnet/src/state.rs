@@ -104,15 +104,16 @@ impl PersistedState {
     pub fn load_netmap(dir: &Path, expected_node_key: &NodePublic) -> Option<MapResponse> {
         let cache = NetMapCache::new(dir).load()?;
         if cache.version != NETMAP_CACHE_VERSION {
-            eprintln!(
+            log::debug!(
                 "tsnet: netmap cache version mismatch ({} != {}); discarding",
-                cache.version, NETMAP_CACHE_VERSION
+                cache.version,
+                NETMAP_CACHE_VERSION
             );
             NetMapCache::new(dir).clear();
             return None;
         }
         if &cache.node_key != expected_node_key {
-            eprintln!("tsnet: netmap cache stale (node key mismatch); discarding");
+            log::warn!("tsnet: netmap cache stale (node key mismatch); discarding");
             return None;
         }
         Some(cache.map_response)
@@ -183,7 +184,7 @@ impl NetMapCache {
                 Some(c)
             }
             Err(e) => {
-                eprintln!("tsnet: netmap cache corrupt ({e}); discarding");
+                log::warn!("tsnet: netmap cache corrupt ({e}); discarding");
                 let _ = std::fs::remove_file(&self.path);
                 None
             }

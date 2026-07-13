@@ -110,7 +110,7 @@ fn create_state_and_log_dirs() -> Result<(), LaunchdError> {
 
     let log_dir = Path::new(LOG_DIR);
     if let Err(e) = std::fs::create_dir_all(log_dir) {
-        eprintln!("create {LOG_DIR}: {e} (non-fatal; launchd logs will go nowhere)");
+        log::warn!("create {LOG_DIR}: {e} (non-fatal; launchd logs will go nowhere)");
     } else {
         let _ = std::fs::set_permissions(log_dir, std::fs::Permissions::from_mode(0o755));
     }
@@ -178,13 +178,13 @@ pub fn uninstall_system_daemon() -> Result<(), LaunchdError> {
 
     if running {
         if let Err(e) = run_launchctl(&["stop", SERVICE_LABEL]) {
-            eprintln!("{e}");
+            log::error!("{e}");
             if ret.is_ok() {
                 ret = Err(e);
             }
         }
         if let Err(e) = run_launchctl(&["unload", PLIST_PATH]) {
-            eprintln!("{e}");
+            log::error!("{e}");
             if ret.is_ok() {
                 ret = Err(e);
             }
@@ -194,7 +194,7 @@ pub fn uninstall_system_daemon() -> Result<(), LaunchdError> {
     // Remove plist (tolerate not-exist).
     if let Err(e) = std::fs::remove_file(PLIST_PATH) {
         if !is_not_found(&e) {
-            eprintln!("remove {PLIST_PATH}: {e}");
+            log::error!("remove {PLIST_PATH}: {e}");
             if ret.is_ok() {
                 ret = Err(LaunchdError::Io(e));
             }
@@ -209,7 +209,7 @@ pub fn uninstall_system_daemon() -> Result<(), LaunchdError> {
     // Remove binary (tolerate not-exist).
     if let Err(e) = std::fs::remove_file(TARGET_BIN) {
         if !is_not_found(&e) {
-            eprintln!("remove {TARGET_BIN}: {e}");
+            log::error!("remove {TARGET_BIN}: {e}");
             if ret.is_ok() {
                 ret = Err(LaunchdError::Io(e));
             }

@@ -423,14 +423,14 @@ pub(crate) async fn create_service_listener(
         .copied()
         .collect();
     if v4_addrs.is_empty() {
-        eprintln!("tsnet: service {svc} has only IPv6 VIPs (not yet supported)");
+        log::warn!("tsnet: service {svc} has only IPv6 VIPs (not yet supported)");
         return Err(ServiceError::NoV4VipAddrs(svc.to_string()));
     }
 
     // Log any v6 addresses we're skipping.
     for ip in &vip_addrs {
         if ip.is_ipv6() {
-            eprintln!("tsnet: skipping IPv6 VIP {ip} for service {svc} (not yet supported)");
+            log::warn!("tsnet: skipping IPv6 VIP {ip} for service {svc} (not yet supported)");
         }
     }
 
@@ -441,7 +441,7 @@ pub(crate) async fn create_service_listener(
         match netstack.listen_on(*ip, mode.port()).await {
             Ok(ln) => listeners.push((*ip, ln)),
             Err(NetstackError::ListenFailed(msg)) if msg.contains("already in use") => {
-                eprintln!(
+                log::debug!(
                     "tsnet: service listener on {ip}:{} already exists, reusing",
                     mode.port()
                 );
@@ -486,7 +486,7 @@ pub(crate) async fn create_service_listener(
         None
     };
 
-    eprintln!(
+    log::info!(
         "tsnet: service listener for {svc} on v4 VIPs {:?} port {} (FQDN: {fqdn})",
         v4_addrs,
         mode.port()

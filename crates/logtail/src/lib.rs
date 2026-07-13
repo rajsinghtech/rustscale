@@ -11,11 +11,15 @@
 //! `logtail/config.go` — `type Config`.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{oneshot, Notify};
+
+pub mod log;
+
+pub use log::LogtailLogger;
 
 pub const DEFAULT_HOST: &str = "log.tailscale.com";
 
@@ -35,6 +39,9 @@ pub struct Config {
     pub compress_logs: bool,
     pub max_upload_size: usize,
     pub skip_client_time: bool,
+    /// Whether this client accepts log entries. Environment opt-out still
+    /// takes precedence over this setting.
+    pub enabled: bool,
 }
 
 impl Default for Config {
@@ -47,6 +54,7 @@ impl Default for Config {
             compress_logs: false,
             max_upload_size: 0,
             skip_client_time: false,
+            enabled: true,
         }
     }
 }
@@ -88,6 +96,8 @@ struct LogTailInner {
     proc_id: u32,
     proc_seq: Mutex<u64>,
     flush_notify: Notify,
+    enabled: AtomicBool,
+    environment_disabled: bool,
     drop_count: AtomicU64,
     metrics: Metrics,
     shutdown_tx: Mutex<Option<oneshot::Sender<()>>>,
@@ -103,14 +113,19 @@ struct LogTailInner {
 /// lt.write("hello world");
 /// assert_eq!(lt.buffered_count(), 1);
 /// ```
+#[derive(Clone)]
 pub struct LogTail {
     inner: Arc<LogTailInner>,
 }
 
 impl LogTail {
     pub fn new(config: Config) -> Self {
+        let environment_disabled =
+            rustscale_envknob::bool("TS_NO_LOGS_NO_SUPPORT").unwrap_or(false);
         Self {
             inner: Arc::new(LogTailInner {
+                enabled: AtomicBool::new(config.enabled),
+                environment_disabled,
                 config,
                 buffer: Mutex::new(VecDeque::new()),
                 proc_id: proc_id(),
@@ -153,6 +168,9 @@ impl LogTail {
     }
 
     fn write_entry(&self, entry: LogEntry) {
+        if self.disabled() {
+            return;
+        }
         let mut buf = self.inner.buffer.lock().unwrap();
         if buf.len() >= MAX_BUFFER_ENTRIES {
             buf.pop_front();
@@ -195,6 +213,20 @@ impl LogTail {
         self.inner.flush_notify.notify_waiters();
     }
 
+    /// Enable or disable accepting log entries for this client. The
+    /// `TS_NO_LOGS_NO_SUPPORT` environment opt-out always remains effective.
+    pub fn set_enabled(&self, enabled: bool) {
+        self.inner.enabled.store(enabled, Ordering::Relaxed);
+        if enabled {
+            self.flush();
+        }
+    }
+
+    /// Whether this client is disabled, either explicitly or by environment.
+    pub fn disabled(&self) -> bool {
+        self.inner.environment_disabled || !self.inner.enabled.load(Ordering::Relaxed)
+    }
+
     pub async fn shutdown(&self) {
         let tx_opt = self.inner.shutdown_tx.lock().unwrap().take();
         if let Some(tx) = tx_opt {
@@ -228,6 +260,18 @@ impl LogTail {
 
     pub fn uploaded_bytes(&self) -> u64 {
         self.inner.metrics.uploaded_bytes.load(Ordering::Relaxed)
+    }
+}
+
+impl std::io::Write for LogTail {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        LogTail::write(self, &String::from_utf8_lossy(buf));
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        LogTail::flush(self);
+        Ok(())
     }
 }
 
@@ -325,7 +369,7 @@ async fn upload_loop(
                     inner.metrics.uploaded_bytes.fetch_add(n, Ordering::Relaxed);
                     if failures > 0 {
                         let elapsed = first_failure.map(|t| t.elapsed()).unwrap_or_default();
-                        log::info!(
+                        ::log::info!(
                             "logtail: upload succeeded after {failures} failures, {elapsed:?}"
                         );
                     }
@@ -337,7 +381,7 @@ async fn upload_loop(
                     inner.metrics.upload_errors.fetch_add(1, Ordering::Relaxed);
 
                     if last_error != err_str {
-                        log::warn!("logtail: upload: {err_str}");
+                        ::log::warn!("logtail: upload: {err_str}");
                         last_error = err_str;
                     }
 
@@ -447,6 +491,15 @@ mod tests {
         lt.write("hello");
         lt.write("world");
         assert_eq!(lt.buffered_count(), 2);
+    }
+
+    #[test]
+    fn disabled_client_drops_entries() {
+        let lt = LogTail::new(Config::default());
+        lt.set_enabled(false);
+        lt.write("not buffered");
+        assert!(lt.disabled());
+        assert_eq!(lt.buffered_count(), 0);
     }
 
     #[test]

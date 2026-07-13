@@ -39,7 +39,7 @@ pub(crate) async fn run_tun_pump(
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                     Err(e) => {
-                        eprintln!("tun read error: {e}");
+                        log::warn!("tun read error: {e}");
                         break;
                     }
                 }
@@ -59,7 +59,7 @@ pub(crate) async fn run_tun_pump(
                         ).await;
                     }
                 } else {
-                    eprintln!("tsnet: magicsock wg channel closed (tun)");
+                    log::warn!("tsnet: magicsock wg channel closed (tun)");
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
             }

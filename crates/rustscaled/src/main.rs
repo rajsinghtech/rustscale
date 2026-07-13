@@ -31,13 +31,14 @@ fn main() {
             let mut http_proxy_server: Option<String> = None;
             let mut config: Option<PathBuf> = None;
             let mut cleanup = false;
+            let mut no_logs_no_support = false;
             let mut i = 2;
             while i < args.len() {
                 match args[i].as_str() {
                     "--statedir" | "--state" => {
                         i += 1;
                         if i >= args.len() {
-                            eprintln!("error: {} requires a value", args[i - 1]);
+                            log::error!("error: {} requires a value", args[i - 1]);
                             std::process::exit(1);
                         }
                         statedir = Some(PathBuf::from(&args[i]));
@@ -45,7 +46,7 @@ fn main() {
                     "--socket" => {
                         i += 1;
                         if i >= args.len() {
-                            eprintln!("error: --socket requires a value");
+                            log::error!("error: --socket requires a value");
                             std::process::exit(1);
                         }
                         socket = Some(PathBuf::from(&args[i]));
@@ -53,7 +54,7 @@ fn main() {
                     "--hostname" => {
                         i += 1;
                         if i >= args.len() {
-                            eprintln!("error: --hostname requires a value");
+                            log::error!("error: --hostname requires a value");
                             std::process::exit(1);
                         }
                         hostname = Some(args[i].clone());
@@ -61,18 +62,18 @@ fn main() {
                     "--port" => {
                         i += 1;
                         if i >= args.len() {
-                            eprintln!("error: --port requires a value");
+                            log::error!("error: --port requires a value");
                             std::process::exit(1);
                         }
                         port = Some(args[i].parse().unwrap_or_else(|_| {
-                            eprintln!("error: invalid --port value: {}", args[i]);
+                            log::error!("error: invalid --port value: {}", args[i]);
                             std::process::exit(1);
                         }));
                     }
                     "--socks5-server" => {
                         i += 1;
                         if i >= args.len() {
-                            eprintln!("error: --socks5-server requires a value");
+                            log::error!("error: --socks5-server requires a value");
                             std::process::exit(1);
                         }
                         socks5_server = Some(args[i].clone());
@@ -80,7 +81,7 @@ fn main() {
                     "--http-proxy-server" => {
                         i += 1;
                         if i >= args.len() {
-                            eprintln!("error: --http-proxy-server requires a value");
+                            log::error!("error: --http-proxy-server requires a value");
                             std::process::exit(1);
                         }
                         http_proxy_server = Some(args[i].clone());
@@ -88,15 +89,16 @@ fn main() {
                     "--config" => {
                         i += 1;
                         if i >= args.len() {
-                            eprintln!("error: --config requires a value");
+                            log::error!("error: --config requires a value");
                             std::process::exit(1);
                         }
                         config = Some(PathBuf::from(&args[i]));
                     }
                     "--cleanup" => cleanup = true,
+                    "--no-logs-no-support" => no_logs_no_support = true,
                     "--tun" => tun = true,
                     other => {
-                        eprintln!("error: unknown argument '{other}'");
+                        log::error!("error: unknown argument '{other}'");
                         std::process::exit(1);
                     }
                 }
@@ -118,10 +120,11 @@ fn main() {
                     http_proxy_server,
                     config,
                     cleanup,
+                    no_logs_no_support,
                 ))
                 .await
                 {
-                    eprintln!("rustscaled: {e}");
+                    log::error!("rustscaled: {e}");
                     std::process::exit(1);
                 }
             });
@@ -130,13 +133,13 @@ fn main() {
             #[cfg(target_os = "macos")]
             {
                 if let Err(e) = launchd::install_system_daemon() {
-                    eprintln!("install-system-daemon: {e}");
+                    log::error!("install-system-daemon: {e}");
                     std::process::exit(1);
                 }
             }
             #[cfg(not(target_os = "macos"))]
             {
-                eprintln!("install-system-daemon: not supported on this platform");
+                log::error!("install-system-daemon: not supported on this platform");
                 std::process::exit(1);
             }
         }
@@ -144,18 +147,18 @@ fn main() {
             #[cfg(target_os = "macos")]
             {
                 if let Err(e) = launchd::uninstall_system_daemon() {
-                    eprintln!("uninstall-system-daemon: {e}");
+                    log::error!("uninstall-system-daemon: {e}");
                     std::process::exit(1);
                 }
             }
             #[cfg(not(target_os = "macos"))]
             {
-                eprintln!("uninstall-system-daemon: not supported on this platform");
+                log::error!("uninstall-system-daemon: not supported on this platform");
                 std::process::exit(1);
             }
         }
         other => {
-            eprintln!("error: unknown subcommand '{other}'");
+            log::error!("error: unknown subcommand '{other}'");
             usage(&args[0]);
             std::process::exit(1);
         }
@@ -163,12 +166,12 @@ fn main() {
 }
 
 fn usage(bin: &str) {
-    eprintln!(
+    log::info!(
         "usage: {bin} run [--statedir <dir>] [--state <dir>] [--socket <path>] \
          [--hostname <name>] [--port <port>] [--tun] \
          [--socks5-server <addr>] [--http-proxy-server <addr>] \
-         [--config <path>] [--cleanup]"
+         [--config <path>] [--cleanup] [--no-logs-no-support]"
     );
-    eprintln!("       {bin} install-system-daemon");
-    eprintln!("       {bin} uninstall-system-daemon");
+    log::info!("       {bin} install-system-daemon");
+    log::info!("       {bin} uninstall-system-daemon");
 }

@@ -1154,42 +1154,43 @@ mod tests {
 
         // Register account.
         client.register_account().await.expect("register");
-        eprintln!("repro: account registered, kid={:?}", client.kid);
+        log::debug!("repro: account registered, kid={:?}", client.kid);
 
         // Create order for a random domain (we won't complete it).
         let (order_url, order) = client
             .new_order("rustscale-acme-repro-1234567.xyz")
             .await
             .expect("new_order");
-        eprintln!("repro: order created, url={order_url}");
-        eprintln!(
+        log::debug!("repro: order created, url={order_url}");
+        log::debug!(
             "repro: order status={}, authzs={:?}",
-            order.status, order.authorizations
+            order.status,
+            order.authorizations
         );
 
         // Fetch the first authorization and print the RAW body.
         if let Some(authz_url) = order.authorizations.first() {
             let resp = client.post_as_get(authz_url).await.expect("get_authz");
-            eprintln!("repro: authz status={}", resp.status);
-            eprintln!("repro: authz headers={:?}", resp.headers);
+            log::debug!("repro: authz status={}", resp.status);
+            log::debug!("repro: authz headers={:?}", resp.headers);
             let body_str = String::from_utf8_lossy(&resp.body);
-            eprintln!(
+            log::debug!(
                 "repro: authz raw body (len={}):\n{body_str}",
                 resp.body.len()
             );
 
             // Try parsing — this is where it fails.
             match serde_json::from_slice::<Authorization>(&resp.body) {
-                Ok(az) => eprintln!(
+                Ok(az) => log::debug!(
                     "repro: parsed OK, status={}, {} challenges",
                     az.status,
                     az.challenges.len()
                 ),
                 Err(e) => {
-                    eprintln!("repro: PARSE FAILED: {e}");
+                    log::debug!("repro: PARSE FAILED: {e}");
                     // Try parsing as raw Value to see the structure.
                     if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&resp.body) {
-                        eprintln!(
+                        log::debug!(
                             "repro: raw JSON value:\n{}",
                             serde_json::to_string_pretty(&v).unwrap()
                         );

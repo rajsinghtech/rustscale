@@ -46,28 +46,96 @@ _gc() {
 }
 
 # ---------------------------------------------------------------------------
-# Create a single VM. Args: NAME ZONE
-# Idempotent: if the VM already exists, returns 0.
+# Print the root-side program that removes the package-managed tailscaled
+# before benchmark daemons are allowed to own the kernel TUN.  The benchmark
+# always starts its own tailscaled instances with /tmp state directories.
 # ---------------------------------------------------------------------------
-create_vm() {
-  local name="$1" zone="$2"
-  echo "[gcp] creating VM $name in $zone" >&2
-  # Check existence first.
-  if _gc gcloud compute instances describe "$name" --zone="$zone" >/dev/null 2>&1; then
-    echo "[gcp] VM $name already exists, reusing" >&2
+package_tailscaled_cleanup_command() {
+  printf '%s\n' \
+'systemctl stop tailscaled.service 2>/dev/null || true' \
+'systemctl disable tailscaled.service 2>/dev/null || true' \
+'systemctl mask tailscaled.service 2>/dev/null || true' \
+'is_clear() {' \
+'  ! pgrep -x tailscaled >/dev/null 2>&1 && ! ip link show dev tailscale0 >/dev/null 2>&1' \
+'}' \
+'wait_for_clear() {' \
+'  local elapsed=0 timeout=15' \
+'  while (( elapsed < timeout )); do' \
+'    is_clear && return 0' \
+'    sleep 1' \
+'    elapsed=$((elapsed + 1))' \
+'  done' \
+'  is_clear' \
+'}' \
+'diagnose() {' \
+'  echo "[gcp] package tailscaled cleanup diagnostics" >&2' \
+'  systemctl status tailscaled.service --no-pager >&2 || true' \
+'  pgrep -a -x tailscaled >&2 || true' \
+'  ps -eo pid,ppid,user,stat,comm,args | grep "[t]ailscaled" >&2 || true' \
+'  ip -d link show dev tailscale0 >&2 || true' \
+'  fuser -v /dev/net/tun >&2 || true' \
+'}' \
+'pkill -TERM -x tailscaled 2>/dev/null || true' \
+'if ! wait_for_clear; then' \
+'  diagnose' \
+'  pkill -KILL -x tailscaled 2>/dev/null || true' \
+'  if ! wait_for_clear; then' \
+'    diagnose' \
+'    echo "[gcp] ERROR: package tailscaled or tailscale0 remains after cleanup" >&2' \
+'    exit 1' \
+'  fi' \
+'fi' \
+'rm -f /var/lib/tailscale/tailscaled.state /run/tailscale/tailscaled.sock /var/run/tailscale/tailscaled.sock'
+}
+
+# Exercise the generated startup program without systemd, a TUN device, or
+# GCP.  It verifies service isolation, graceful/forced termination, failure
+# diagnostics, and that package state is removed only once the host is clean.
+package_tailscaled_cleanup_self_test() {
+  local state result events command
+  local -a cases=(graceful forced failure)
+
+  systemctl() { PACKAGE_TEST_EVENTS+=" systemctl:$*"; return 0; }
+  pgrep() { [[ "$PACKAGE_TEST_PRESENT" == 1 ]]; }
+  ip() { [[ "$PACKAGE_TEST_PRESENT" == 1 ]]; }
+  pkill() {
+    PACKAGE_TEST_EVENTS+=" pkill:$1"
+    case "$PACKAGE_TEST_STATE:$1" in
+      graceful:-TERM|forced:-KILL) PACKAGE_TEST_PRESENT=0 ;;
+    esac
     return 0
-  fi
-  _gc gcloud compute instances create "$name" \
-    --zone="$zone" \
-    --machine-type="$GCP_MACHINE" \
-    --image-family="$GCP_IMAGE" \
-    --image-project="$GCP_IMAGE_PROJECT" \
-    --boot-disk-size="${GCP_DISK_GB}GB" \
-    --boot-disk-type=pd-standard \
-    --network="$GCP_NETWORK" \
-    --subnet=default \
-    --no-boot-disk-auto-delete \
-    --metadata-from-file startup-script=/dev/stdin <<'STARTUP'
+  }
+  rm() { PACKAGE_TEST_EVENTS+=" rm:$*"; }
+  sleep() { :; }
+  ps() { :; }
+  fuser() { :; }
+  test_package_cleanup() { eval "$1"; }
+
+  for state in "${cases[@]}"; do
+    PACKAGE_TEST_STATE="$state"
+    PACKAGE_TEST_PRESENT=1
+    PACKAGE_TEST_EVENTS=""
+    command=$(package_tailscaled_cleanup_command)
+    command=${command//$'exit 1'/$'return 1'}
+    if test_package_cleanup "$command" 2>/dev/null; then result=0; else result=1; fi
+    events="$PACKAGE_TEST_EVENTS"
+    [[ "$events" == *"systemctl:stop tailscaled.service"* ]] || return 1
+    [[ "$events" == *"systemctl:disable tailscaled.service"* ]] || return 1
+    [[ "$events" == *"systemctl:mask tailscaled.service"* ]] || return 1
+    case "$state" in
+      graceful) [[ "$result" == 0 && "$events" != *"pkill:-KILL"* && "$events" == *"rm:-f /var/lib/tailscale/tailscaled.state"* ]] || return 1 ;;
+      forced) [[ "$result" == 0 && "$events" == *"pkill:-KILL"* && "$events" == *"rm:-f /var/lib/tailscale/tailscaled.state"* ]] || return 1 ;;
+      failure) [[ "$result" == 1 && "$events" == *"pkill:-KILL"* && "$events" != *" rm:"* ]] || return 1 ;;
+    esac
+  done
+  unset -f systemctl pgrep ip pkill rm sleep ps fuser test_package_cleanup
+}
+
+# Render the VM startup program.  Keep the static portions in quoted heredocs
+# so this host never expands remote variables, command substitutions, or
+# comments containing backticks.
+render_startup_script() {
+  cat <<'STARTUP_HEAD'
 #!/bin/bash
 set -ex
 # Ensure the hostname resolves before anything else. Debian/Ubuntu GCE images
@@ -99,8 +167,52 @@ curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/jammy.noarmor.gpg \
 curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/jammy.tailscale-keyring.list \
   | tee /etc/apt/sources.list.d/tailscale.list
 apt-get update -qq && apt-get install -y -qq tailscale
+STARTUP_HEAD
+  package_tailscaled_cleanup_command
+  cat <<'STARTUP_TAIL'
 echo "DONE" > /tmp/startup-done
-STARTUP
+STARTUP_TAIL
+}
+
+startup_script_self_test() {
+  local script cleanup_marker='rm -f /var/lib/tailscale/tailscaled.state /run/tailscale/tailscaled.sock /var/run/tailscale/tailscaled.sock'
+
+  script=$(render_startup_script)
+  bash -n <<<"$script" || return 1
+  [[ "$script" == *'HN=$(hostname)'* ]] || return 1
+  [[ "$script" == *'`cargo build`'* ]] || return 1
+  [[ "$script" == *'systemctl stop tailscaled.service 2>/dev/null || true'* ]] || return 1
+  [[ "$script" == *'systemctl disable tailscaled.service 2>/dev/null || true'* ]] || return 1
+  [[ "$script" == *'systemctl mask tailscaled.service 2>/dev/null || true'* ]] || return 1
+  [[ "$script" != *'package_tailscaled_cleanup_command'* ]] || return 1
+  [[ "$script" != *'$(package_tailscaled_cleanup_command)'* ]] || return 1
+  [[ "${script#*"$cleanup_marker"}" == *'echo "DONE" > /tmp/startup-done'* ]] || return 1
+  [[ "$script" != *'exit 0'* ]] || return 1
+}
+
+# ---------------------------------------------------------------------------
+# Create a single VM. Args: NAME ZONE
+# Idempotent: if the VM already exists, returns 0.
+# ---------------------------------------------------------------------------
+create_vm() {
+  local name="$1" zone="$2"
+  echo "[gcp] creating VM $name in $zone" >&2
+  # Check existence first.
+  if _gc gcloud compute instances describe "$name" --zone="$zone" >/dev/null 2>&1; then
+    echo "[gcp] VM $name already exists, reusing" >&2
+    return 0
+  fi
+  render_startup_script | _gc gcloud compute instances create "$name" \
+    --zone="$zone" \
+    --machine-type="$GCP_MACHINE" \
+    --image-family="$GCP_IMAGE" \
+    --image-project="$GCP_IMAGE_PROJECT" \
+    --boot-disk-size="${GCP_DISK_GB}GB" \
+    --boot-disk-type=pd-standard \
+    --network="$GCP_NETWORK" \
+    --subnet=default \
+    --no-boot-disk-auto-delete \
+    --metadata-from-file startup-script=/dev/stdin
 }
 
 # ---------------------------------------------------------------------------

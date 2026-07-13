@@ -128,6 +128,8 @@ matrix_remote_build_aggregation_self_test
 matrix_config_failure_policy_self_test
 
 if (( MATRIX_SELF_TEST )); then
+  package_tailscaled_cleanup_self_test
+  startup_script_self_test
   echo "run-matrix self-tests: OK" >&2
   exit 0
 fi

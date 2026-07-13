@@ -25,6 +25,14 @@ impl Server {
         ensure_ring_provider();
 
         let b = self.bootstrap().await?;
+        let audit_logger = Self::start_audit_logger(
+            self.config.state_dir.clone(),
+            self.config.control_url.clone(),
+            b.machine_key.clone(),
+            b.server_pub_key.clone(),
+            b.node_key.clone(),
+        )
+        .await;
 
         let monitor = spawn_link_monitor(
             b.magicsock.clone(),
@@ -388,6 +396,7 @@ impl Server {
                 suggested_exit_node: suggested_exit_node.clone(),
                 config_path: self.config.config_path.clone(),
                 client_updater: client_updater.clone(),
+                audit_logger: Some(audit_logger.clone()),
             };
             // Publish the live filter so `PATCH /prefs` can toggle
             // shields-up mode without a full rebuild.
@@ -454,6 +463,7 @@ impl Server {
             proxy_mapper,
             portlist_ports,
             client_updater: client_updater.clone(),
+            audit_logger,
         });
 
         // Apply stored exit-node pref on start (survives restart).
@@ -505,6 +515,14 @@ impl Server {
         ensure_ring_provider();
 
         let b = self.bootstrap().await?;
+        let audit_logger = Self::start_audit_logger(
+            self.config.state_dir.clone(),
+            self.config.control_url.clone(),
+            b.machine_key.clone(),
+            b.server_pub_key.clone(),
+            b.node_key.clone(),
+        )
+        .await;
 
         // Resolve and apply the exit node selection from TunModeConfig, if
         // set. This sets the in-process RouteTable's exit node so the data
@@ -846,6 +864,7 @@ impl Server {
                 suggested_exit_node: suggested_exit_node.clone(),
                 config_path: self.config.config_path.clone(),
                 client_updater: client_updater.clone(),
+                audit_logger: Some(audit_logger.clone()),
             };
             // Publish the live filter so `PATCH /prefs` can toggle
             // shields-up mode without a full rebuild.
@@ -945,6 +964,7 @@ impl Server {
             proxy_mapper,
             portlist_ports,
             client_updater: client_updater.clone(),
+            audit_logger,
         });
 
         // Apply stored exit-node pref on start (survives restart).
@@ -1121,6 +1141,7 @@ impl Server {
             client_updater: Arc::new(std::sync::Mutex::new(
                 rustscale_clientupdate::ClientUpdater::new(env!("CARGO_PKG_VERSION")),
             )),
+            audit_logger: None,
         });
 
         let handle = localapi::spawn_localapi(api_state.clone(), socket_path.clone());
@@ -1840,6 +1861,10 @@ impl Server {
     /// Shut down the server.
     pub async fn close(&mut self) {
         if let Some(mut inner) = self.inner.take() {
+            inner
+                .audit_logger
+                .flush_and_stop(std::time::Duration::from_secs(5))
+                .await;
             // Stop serve listeners first (graceful).
             if let Some(serve) = inner.serve.take() {
                 serve.stop().await;
@@ -1897,6 +1922,17 @@ impl Server {
             Some(inner) => inner,
             None => return Ok(()), // already down
         };
+
+        if let Err(error) = inner
+            .audit_logger
+            .enqueue(rustscale_tailcfg::AuditNodeDisconnect, "logout")
+        {
+            eprintln!("tsnet: failed to persist audit log (non-fatal): {error}");
+        }
+        inner
+            .audit_logger
+            .flush_and_stop(std::time::Duration::from_secs(5))
+            .await;
 
         // 1. Send a logout register request (Expiry = far past) to expire
         //    the node key on the control server. Best-effort: network
@@ -2038,6 +2074,43 @@ impl Server {
     }
 
     // --- internal helpers ---
+
+    async fn start_audit_logger(
+        state_dir: Option<PathBuf>,
+        control_url: String,
+        machine_key: MachinePrivate,
+        server_pub_key: MachinePublic,
+        node_key: NodePrivate,
+    ) -> Arc<rustscale_auditlog::Logger> {
+        let store: Arc<dyn rustscale_ipn::store::Store> = match &state_dir {
+            Some(dir) => Arc::new(rustscale_ipn::store::FileStore::new(dir)),
+            None => Arc::new(rustscale_ipn::store::MemStore::new()),
+        };
+        let log_store = Arc::new(rustscale_auditlog::LogStore::new(store));
+        let logger = rustscale_auditlog::Logger::new(rustscale_auditlog::LoggerOptions {
+            retry_limit: 10,
+            store: log_store,
+        });
+        let profile_id = state_dir
+            .as_ref()
+            .and_then(|dir| {
+                rustscale_ipn::LoginProfile::load_current_id(dir)
+                    .ok()
+                    .flatten()
+            })
+            .unwrap_or_else(|| "default".to_string());
+        if let Err(error) = logger.set_profile_id(profile_id) {
+            eprintln!("tsnet: failed to configure audit log profile (non-fatal): {error}");
+        }
+
+        let mut control_client =
+            ControlClient::new(control_url, machine_key, server_pub_key, PROTOCOL_VERSION);
+        control_client.set_audit_node_key(node_key.public());
+        if let Err(error) = logger.start(Arc::new(control_client)).await {
+            eprintln!("tsnet: failed to start audit logger (non-fatal): {error}");
+        }
+        logger
+    }
 
     pub(crate) fn load_or_create_state(&self) -> Result<PersistedState, TsnetError> {
         if let Some(ref dir) = self.config.state_dir {

@@ -15,9 +15,11 @@
 //!   then the response body is a stream of 4-byte LE size-prefixed JSON
 //!   `MapResponse` messages (application-level framing within the HTTP body).
 
-use rustscale_key::{MachinePrivate, MachinePublic};
+use rustscale_auditlog::{Transport, TransportError};
+use rustscale_key::{MachinePrivate, MachinePublic, NodePublic};
 use rustscale_tailcfg::{
-    MapRequest, MapResponse, RegisterRequest, RegisterResponse, SetDNSRequest, SetDNSResponse,
+    AuditLogRequest, MapRequest, MapResponse, RegisterRequest, RegisterResponse, SetDNSRequest,
+    SetDNSResponse,
 };
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
@@ -132,6 +134,7 @@ pub struct ControlClient {
     control_key: MachinePublic,
     version: ProtocolVersion,
     extra_root_certs: Option<Vec<Vec<u8>>>,
+    audit_node_key: Option<NodePublic>,
 }
 
 impl ControlClient {
@@ -147,6 +150,7 @@ impl ControlClient {
             control_key,
             version,
             extra_root_certs: None,
+            audit_node_key: None,
         }
     }
 
@@ -154,6 +158,11 @@ impl ControlClient {
     /// baked ISRG roots. Mirrors Go's `tsnet.Server.ExtraRootCAs` plumbing.
     pub fn set_extra_root_certs(&mut self, certs: Vec<Vec<u8>>) {
         self.extra_root_certs = Some(certs);
+    }
+
+    /// Set the persisted node key used when delivering audit events.
+    pub fn set_audit_node_key(&mut self, node_key: NodePublic) {
+        self.audit_node_key = Some(node_key);
     }
 
     /// Send a `RegisterRequest` to `/machine/register` and return the response.
@@ -489,6 +498,90 @@ impl ControlClient {
         } else {
             Ok(serde_json::from_slice(&data)?)
         }
+    }
+
+    /// Post an audit event to `/machine/audit-log` over a Noise connection.
+    /// The control client supplies the capability version and persisted node
+    /// key; callers only supply the event fields.
+    pub async fn send_audit_log(&self, req: &AuditLogRequest) -> Result<(), TransportError> {
+        let node_key = self.audit_node_key.clone().ok_or_else(|| {
+            TransportError::new("audit log transport has no persisted node key", false)
+        })?;
+        let request = AuditLogRequest {
+            Version: i32::from(self.version),
+            NodeKey: node_key,
+            Action: req.Action.clone(),
+            Details: req.Details.clone(),
+            Timestamp: req.Timestamp,
+        };
+
+        let noise_stream = dial_control(
+            &self.host,
+            &self.machine_key,
+            &self.control_key,
+            self.version,
+            self.extra_root_certs.as_deref(),
+        )
+        .await
+        .map_err(|error| audit_transport_error(RegisterError::Dial(error)))?;
+
+        let (conn, stream) = noise_stream.into_parts();
+        let noise_io = NoiseIo::new(conn, stream);
+        let (mut h2_send, h2_conn) = establish_h2(noise_io)
+            .await
+            .map_err(|error| audit_transport_error(error.into()))?;
+        tokio::spawn(async move {
+            let _ = h2_conn.await;
+        });
+
+        let body = serde_json::to_vec(&request)
+            .map_err(|error| audit_transport_error(RegisterError::Json(error)))?;
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("/machine/audit-log")
+            .header("content-type", "application/json")
+            .body(())
+            .unwrap();
+        let (resp_future, mut send_stream) = h2_send
+            .send_request(request, false)
+            .map_err(|error| audit_transport_error(RegisterError::H2(error)))?;
+        send_stream
+            .send_data(bytes::Bytes::from(body), true)
+            .map_err(|error| audit_transport_error(RegisterError::H2(error)))?;
+
+        let response = resp_future
+            .await
+            .map_err(|error| audit_transport_error(RegisterError::H2(error)))?;
+        let status = response.status().as_u16();
+        let mut body = response.into_body();
+        let data = read_h2_body(&mut body)
+            .await
+            .map_err(|error| audit_transport_error(RegisterError::H2(error)))?;
+        if status != 200 {
+            return Err(TransportError::new(
+                format!("http status {status}: {}", String::from_utf8_lossy(&data)),
+                status == 429 || status >= 500,
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn audit_transport_error(error: RegisterError) -> TransportError {
+    let retryable = matches!(
+        error,
+        RegisterError::Dial(_)
+            | RegisterError::Noise(_)
+            | RegisterError::H2(_)
+            | RegisterError::Io(_)
+    );
+    TransportError::new(error.to_string(), retryable)
+}
+
+#[async_trait::async_trait]
+impl Transport for ControlClient {
+    async fn send_audit_log(&self, req: &AuditLogRequest) -> Result<(), TransportError> {
+        ControlClient::send_audit_log(self, req).await
     }
 }
 

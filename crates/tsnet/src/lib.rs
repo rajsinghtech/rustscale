@@ -106,7 +106,7 @@ pub(crate) use link_monitor::{
 };
 pub(crate) use map_update::{spawn_map_update_task, KeyRotationCtx};
 pub(crate) use netstack_pump::{process_tun_inbound, run_netstack_pump, tick_wg_timers};
-pub(crate) use tun_pump::{create_tun_device, run_tun_pump};
+pub(crate) use tun_pump::{create_tun_device, run_tun_pump, sync_router, SharedRouter};
 pub use util::TunModeConfig;
 pub(crate) use util::{
     break_tcp_conns_best_effort, ensure_ring_provider, first_v4, rand_index, CancelToken,
@@ -597,6 +597,8 @@ pub(crate) struct RunningState {
     pub(crate) data_plane: DataPlane,
     pub(crate) peers: Arc<RwLock<Vec<Node>>>,
     pub(crate) route_table: Arc<RwLock<RouteTable>>,
+    /// OS-route manager in TUN mode when `TunModeConfig::apply_routes` is set.
+    pub(crate) router: Option<SharedRouter>,
     pub(crate) cancel: Arc<CancelToken>,
     pub(crate) tasks: Mutex<Vec<JoinHandle<()>>>,
     pub(crate) packet_drops: Arc<AtomicU64>,

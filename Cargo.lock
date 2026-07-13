@@ -2914,6 +2914,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustscale-router"
+version = "0.1.0"
+dependencies = [
+ "rustscale-tsaddr",
+]
+
+[[package]]
 name = "rustscale-routetable"
 version = "0.1.0"
 dependencies = [
@@ -3097,6 +3104,7 @@ dependencies = [
  "rustscale-portlist",
  "rustscale-portmapper",
  "rustscale-proxymap",
+ "rustscale-router",
  "rustscale-safesocket",
  "rustscale-sockstats",
  "rustscale-ssh",

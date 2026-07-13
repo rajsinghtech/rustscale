@@ -445,7 +445,11 @@ impl Server {
         let peers = inner.peers.read().await;
         let peer_key = resolve_exit_node(&peers, ip_or_name)?;
         drop(peers);
-        inner.route_table.write().await.set_exit_node(peer_key);
+        let mut routes = inner.route_table.write().await;
+        routes.set_exit_node(peer_key);
+        if let Some(router) = inner.router.as_ref() {
+            sync_router(router, &inner.tailscale_ips, &routes)?;
+        }
         if matches!(inner.data_plane, DataPlane::Tun) {
             break_tcp_conns_best_effort();
         }
@@ -463,7 +467,11 @@ impl Server {
     /// C-representable: no args, error code out (see FFI `ts_clear_exit_node`).
     pub async fn clear_exit_node(&self) -> Result<(), TsnetError> {
         let inner = self.inner.as_ref().ok_or(TsnetError::NotUp)?;
-        inner.route_table.write().await.clear_exit_node();
+        let mut routes = inner.route_table.write().await;
+        routes.clear_exit_node();
+        if let Some(router) = inner.router.as_ref() {
+            sync_router(router, &inner.tailscale_ips, &routes)?;
+        }
         if matches!(inner.data_plane, DataPlane::Tun) {
             break_tcp_conns_best_effort();
         }

@@ -72,6 +72,7 @@ rustscale-ipnstate = { path = "../ipnstate", version = "0.1.0" }
 rustscale-appc = { path = "../appc", version = "0.1.0" }
 rustscale-bakedroots = { path = "../bakedroots", version = "0.1.0" }
 rustscale-tsaddr = { path = "../tsaddr", version = "0.1.0" }
+rustscale-router = { path = "../router", version = "0.1.0" }
 rustscale-sockstats = { path = "../sockstats", version = "0.1.0" }
 rustscale-conffile = { path = "../conffile", version = "0.1.0" }
 rustscale-proxymap = { path = "../proxymap", version = "0.1.0" }

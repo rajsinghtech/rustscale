@@ -499,6 +499,7 @@ impl Server {
             },
             filter: std::sync::OnceLock::new(),
             route_table: Some(inner.route_table.clone()),
+            router: inner.router.clone(),
             logout_trigger: inner.logout_trigger.clone(),
             suggested_exit_node: Arc::new(RwLock::new(String::new())),
             config_path: None,

@@ -29,6 +29,7 @@ pub(crate) fn spawn_map_update_task(
     wg_tunnels: Arc<RwLock<HashMap<NodePublic, Arc<Mutex<WgTunn>>>>>,
     peers_arc: Arc<RwLock<Vec<Node>>>,
     route_table: Arc<RwLock<RouteTable>>,
+    router: Option<SharedRouter>,
     mut node_key: NodePrivate,
     filter_arc: Arc<std::sync::Mutex<Filter>>,
     tailscale_ips: Vec<IpAddr>,
@@ -314,10 +315,14 @@ pub(crate) fn spawn_map_update_task(
                     // Feed the updated peer list to magicsock + rebuild routes.
                     let peers = peers_arc.read().await.clone();
                     let _ = magicsock.set_netmap(peers.clone()).await;
-                    route_table
-                        .write()
-                        .await
-                        .rebuild_with_opts(&peers, accept_routes);
+                    let mut routes = route_table.write().await;
+                    routes.rebuild_with_opts(&peers, accept_routes);
+                    if let Some(router) = router.as_ref() {
+                        if let Err(error) = sync_router(router, &tailscale_ips, &routes) {
+                            eprintln!("tsnet: route update failed (non-fatal): {error}");
+                        }
+                    }
+                    drop(routes);
 
                     // Update IPN engine status: peer count as NumLive, DERP
                     // home connection as LiveDERPs. This may transition the

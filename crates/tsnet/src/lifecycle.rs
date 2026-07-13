@@ -111,6 +111,7 @@ impl Server {
             b.wg_tunnels.clone(),
             b.peers.clone(),
             b.route_table.clone(),
+            None,
             b.node_key.clone(),
             b.filter.clone(),
             b.tailscale_ips.clone(),
@@ -394,6 +395,7 @@ impl Server {
                 netstack: Some(netstack.clone()),
                 filter: std::sync::OnceLock::new(),
                 route_table: Some(b.route_table.clone()),
+                router: None,
                 logout_trigger: self
                     .pre_started
                     .as_ref()
@@ -433,6 +435,7 @@ impl Server {
             data_plane: DataPlane::Netstack(netstack),
             peers: b.peers,
             route_table: b.route_table,
+            router: None,
             cancel: b.cancel,
             tasks: Mutex::new(tasks),
             packet_drops: b.packet_drops,
@@ -562,7 +565,7 @@ impl Server {
 
         // Real TUN device (macOS/Linux only; on other platforms
         // `create_tun_device` returns an error and `?` propagates it).
-        let tun: Arc<dyn Tun> = create_tun_device(&config, &b, self.config.accept_routes).await?;
+        let (tun, router) = create_tun_device(&config, &b, self.config.accept_routes).await?;
 
         let capture = crate::capture::new_slot();
 
@@ -619,6 +622,7 @@ impl Server {
             b.wg_tunnels.clone(),
             b.peers.clone(),
             b.route_table.clone(),
+            router.clone(),
             b.node_key.clone(),
             b.filter.clone(),
             b.tailscale_ips.clone(),
@@ -871,6 +875,7 @@ impl Server {
                 netstack: None, // TUN mode has no netstack
                 filter: std::sync::OnceLock::new(),
                 route_table: Some(b.route_table.clone()),
+                router: router.clone(),
                 logout_trigger: self
                     .pre_started
                     .as_ref()
@@ -943,6 +948,7 @@ impl Server {
             data_plane: DataPlane::Tun,
             peers: b.peers,
             route_table: b.route_table,
+            router,
             cancel: b.cancel,
             tasks: Mutex::new(tasks),
             packet_drops: b.packet_drops,
@@ -988,8 +994,13 @@ impl Server {
         // Apply stored exit-node pref on start (survives restart).
         let stored_prefs = self.load_prefs().unwrap_or_default();
         if !stored_prefs.ExitNodeIP.is_empty() || !stored_prefs.ExitNodeID.is_empty() {
-            let (peers, route_table) = match self.inner.as_ref() {
-                Some(inner) => (inner.peers.clone(), inner.route_table.clone()),
+            let (peers, route_table, router, tailscale_ips) = match self.inner.as_ref() {
+                Some(inner) => (
+                    inner.peers.clone(),
+                    inner.route_table.clone(),
+                    inner.router.clone(),
+                    inner.tailscale_ips.clone(),
+                ),
                 None => return Ok(self.status()),
             };
             let ip_or_name = if stored_prefs.ExitNodeIP.is_empty() {
@@ -1000,7 +1011,11 @@ impl Server {
             let peers_guard = peers.read().await;
             if let Some(peer_key) = localapi::resolve_exit_node_peer(&peers_guard, ip_or_name) {
                 drop(peers_guard);
-                route_table.write().await.set_exit_node(peer_key);
+                let mut routes = route_table.write().await;
+                routes.set_exit_node(peer_key);
+                if let Some(router) = router.as_ref() {
+                    sync_router(router, &tailscale_ips, &routes)?;
+                }
                 eprintln!("tsnet: applied stored exit-node pref: {ip_or_name}");
             } else {
                 eprintln!(
@@ -1154,6 +1169,7 @@ impl Server {
             netstack: None,
             filter: std::sync::OnceLock::new(),
             route_table: None,
+            router: None,
             logout_trigger: logout_trigger.clone(),
             suggested_exit_node: Arc::new(RwLock::new(String::new())),
             config_path: self.config.config_path.clone(),
@@ -1891,6 +1907,16 @@ impl Server {
     /// Shut down the server.
     pub async fn close(&mut self) {
         if let Some(mut inner) = self.inner.take() {
+            if let Some(router) = inner.router.take() {
+                match router.lock() {
+                    Ok(mut router) => {
+                        if let Err(error) = router.close() {
+                            eprintln!("tsnet: route cleanup failed (non-fatal): {error}");
+                        }
+                    }
+                    Err(_) => eprintln!("tsnet: route cleanup skipped (router lock poisoned)"),
+                }
+            }
             crate::capture::clear(&inner.capture);
             inner
                 .capture_handles
@@ -1958,6 +1984,17 @@ impl Server {
             Some(inner) => inner,
             None => return Ok(()), // already down
         };
+
+        if let Some(router) = inner.router.take() {
+            match router.lock() {
+                Ok(mut router) => {
+                    if let Err(error) = router.close() {
+                        eprintln!("tsnet: route cleanup failed (non-fatal): {error}");
+                    }
+                }
+                Err(_) => eprintln!("tsnet: route cleanup skipped (router lock poisoned)"),
+            }
+        }
 
         if let Err(error) = inner
             .audit_logger

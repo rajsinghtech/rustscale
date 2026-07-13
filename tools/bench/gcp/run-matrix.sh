@@ -42,12 +42,48 @@ fi
 FATAL_HANDOFF_STATUS=86
 
 rust_build_command() {
-  printf '%s' 'export RUSTUP_HOME=/opt/rust CARGO_HOME=/opt/rust/cargo; cd /opt/rustscale && cargo build --release -p rustscale-bench -p rustscale-cli -p rustscale-rustscaled'
+  local config candidate existing seen
+  local -a requested=() packages=()
+
+  for config in "${CONFIGS[@]}"; do
+    case "$config" in
+      rs-userspace) requested=(rustscale-bench) ;;
+      rs-tun) requested=(rustscale-cli rustscale-rustscaled) ;;
+      *) continue ;;
+    esac
+    for candidate in "${requested[@]}"; do
+      seen=0
+      for existing in "${packages[@]}"; do
+        [[ "$candidate" == "$existing" ]] && seen=1
+      done
+      (( seen )) || packages+=("$candidate")
+    done
+  done
+
+  (( ${#packages[@]} )) || return 0
+  printf '%s' 'export RUSTUP_HOME=/opt/rust CARGO_HOME=/opt/rust/cargo; cd /opt/rustscale && cargo build --release'
+  for package in "${packages[@]}"; do
+    printf ' -p %s' "$package"
+  done
 }
 
 matrix_command_shape_self_test() {
-  [[ "$(rust_build_command)" == *'-p rustscale-rustscaled'* ]] || return 1
-  [[ "$(rust_build_command)" != *'-p rustscaled'* ]] || return 1
+  local actual
+  CONFIGS=(rs-userspace)
+  actual=$(rust_build_command)
+  [[ "$actual" == 'export RUSTUP_HOME=/opt/rust CARGO_HOME=/opt/rust/cargo; cd /opt/rustscale && cargo build --release -p rustscale-bench' ]] || return 1
+  CONFIGS=(rs-tun)
+  actual=$(rust_build_command)
+  [[ "$actual" == 'export RUSTUP_HOME=/opt/rust CARGO_HOME=/opt/rust/cargo; cd /opt/rustscale && cargo build --release -p rustscale-cli -p rustscale-rustscaled' ]] || return 1
+  CONFIGS=(rs-userspace rs-tun)
+  actual=$(rust_build_command)
+  [[ "$actual" == 'export RUSTUP_HOME=/opt/rust CARGO_HOME=/opt/rust/cargo; cd /opt/rustscale && cargo build --release -p rustscale-bench -p rustscale-cli -p rustscale-rustscaled' ]] || return 1
+  CONFIGS=(ts-userspace ts-tun)
+  [[ -z "$(rust_build_command)" ]] || return 1
+  CONFIGS=(rs-userspace rs-tun ts-userspace ts-tun)
+  actual=$(rust_build_command)
+  [[ "$actual" == 'export RUSTUP_HOME=/opt/rust CARGO_HOME=/opt/rust/cargo; cd /opt/rustscale && cargo build --release -p rustscale-bench -p rustscale-cli -p rustscale-rustscaled' ]] || return 1
+  [[ "$actual" != *'-p rustscaled'* ]] || return 1
 }
 
 wait_for_remote_builds() {
@@ -206,6 +242,10 @@ select_values() {
 select_values "$TOPOLOGY_FILTER" "${TOPOLOGIES[@]}"; TOPOLOGIES=("${SELECTED[@]}")
 select_values "$PATH_FILTER" "${PATHS[@]}"; PATHS=("${SELECTED[@]}")
 select_values "$CONFIG_FILTER" "${CONFIGS[@]}"; CONFIGS=("${SELECTED[@]}")
+RUST_BUILD_COMMAND=$(rust_build_command)
+if [[ -z "$RUST_BUILD_COMMAND" ]]; then
+  echo "[gcp] skipping Rust source delivery and builds (no Rust configs selected)" >&2
+fi
 
 STAMP=$(date +%Y%m%d-%H%M%S)
 RESULTS_DIR="bench-results/gcp-$STAMP"
@@ -283,18 +323,17 @@ for TOPO in "${TOPOLOGIES[@]}"; do
   # Provision VMs (no-op in dry-run).
   create_vms "$SERVER_VM" "$Z_A" "$CLIENT_VM" "$Z_B"
 
-  # Deliver source + build on both VMs. Deliver sequentially (fast: git archive+scp),
-  # then build in parallel (saves ~10min).
-  deliver_source "$SERVER_VM" "$Z_A"
-  deliver_source "$CLIENT_VM" "$Z_B"
-  echo "[gcp] building rustscale on both VMs in parallel..." >&2
-  ssh_cmd "$SERVER_VM" "$Z_A" \
-    "$(rust_build_command)" &
-  SERVER_BUILD_PID=$!
-  ssh_cmd "$CLIENT_VM" "$Z_B" \
-    "$(rust_build_command)" &
-  CLIENT_BUILD_PID=$!
-  wait_for_remote_builds "$SERVER_BUILD_PID" "$CLIENT_BUILD_PID"
+  if [[ -n "$RUST_BUILD_COMMAND" ]]; then
+    # Deliver source sequentially, then build on both VMs in parallel.
+    deliver_source "$SERVER_VM" "$Z_A"
+    deliver_source "$CLIENT_VM" "$Z_B"
+    echo "[gcp] building rustscale on both VMs in parallel..." >&2
+    ssh_cmd "$SERVER_VM" "$Z_A" "$RUST_BUILD_COMMAND" &
+    SERVER_BUILD_PID=$!
+    ssh_cmd "$CLIENT_VM" "$Z_B" "$RUST_BUILD_COMMAND" &
+    CLIENT_BUILD_PID=$!
+    wait_for_remote_builds "$SERVER_BUILD_PID" "$CLIENT_BUILD_PID"
+  fi
 
   # Path loop.
   for PATH_TAG in "${PATHS[@]}"; do

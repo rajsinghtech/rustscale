@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
 
+use rustscale_deephash::{update as deephash_update, Sum};
 use rustscale_neterror::treat_as_lost_udp;
 
 use crate::gateway::{likely_home_router_ip, GatewayInfo};
@@ -129,8 +130,8 @@ struct ClientState {
     upnp_saw_time: Option<Instant>,
     /// UPnP: cached discovery responses (Location -> UpnpService).
     upnp_services: HashMap<String, upnp::UpnpService>,
-    /// The last gateway/self_ip we saw (to detect changes).
-    last_gw: Option<GatewayInfo>,
+    /// Hash of the last gateway/self-IP we saw (to detect changes).
+    gw_hash: Sum,
 }
 
 impl Client {
@@ -207,11 +208,7 @@ impl Client {
         let gi = (self.inner.gateway_lookup.read().expect("gw lock"))()?;
         let changed = {
             let mut state = self.inner.state.lock().expect("state lock");
-            let changed = state.last_gw != Some(gi);
-            if changed {
-                state.last_gw = Some(gi);
-            }
-            changed
+            deephash_update(&mut state.gw_hash, &gi)
         };
         if changed {
             self.invalidate_mappings(true);
@@ -700,3 +697,36 @@ impl Default for Client {
 }
 // ClientInner contains a Box<dyn Fn()> which doesn't implement Default, so
 // a manual impl is required even though clippy thinks it can be derived.
+
+#[cfg(test)]
+mod tests {
+    use std::net::Ipv4Addr;
+
+    use super::{Client, ClientConfig, GatewayInfo};
+
+    #[test]
+    fn gateway_deephash_detects_changes() {
+        let first_gateway = GatewayInfo {
+            gateway: Ipv4Addr::new(192, 168, 1, 1),
+            self_ip: Ipv4Addr::new(192, 168, 1, 2),
+        };
+        let client = Client::with_config(ClientConfig {
+            gateway_lookup: Some(Box::new(move || Some(first_gateway))),
+        });
+
+        client.gateway_and_self_ip();
+        let first_hash = client.inner.state.lock().unwrap().gw_hash;
+
+        client.gateway_and_self_ip();
+        assert_eq!(client.inner.state.lock().unwrap().gw_hash, first_hash);
+
+        client.set_gateway_lookup(Box::new(|| {
+            Some(GatewayInfo {
+                gateway: Ipv4Addr::new(10, 0, 0, 1),
+                self_ip: Ipv4Addr::new(10, 0, 0, 2),
+            })
+        }));
+        client.gateway_and_self_ip();
+        assert_ne!(client.inner.state.lock().unwrap().gw_hash, first_hash);
+    }
+}

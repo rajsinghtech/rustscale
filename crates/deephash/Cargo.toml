@@ -17,5 +17,4 @@ serde.workspace = true
 serde_json.workspace = true
 rustscale-ipn = { path = "../ipn", version = "0.1.1" }
 rustscale-key = { path = "../key", version = "0.1.1" }
-rustscale-portmapper = { path = "../portmapper", version = "0.1.1" }
 rustscale-tailcfg = { path = "../tailcfg", version = "0.1.1" }

@@ -10,6 +10,7 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+rustscale-deephash = { path = "../deephash", version = "0.1.1" }
 rustscale-tailcfg = { path = "../tailcfg", version = "0.1.1" }
 serde.workspace = true
 serde_json.workspace = true

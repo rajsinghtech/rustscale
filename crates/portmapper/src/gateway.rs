@@ -10,6 +10,8 @@
 
 use std::net::Ipv4Addr;
 
+use rustscale_deephash::{DeepHash, Hasher};
+
 /// The gateway IP and our local IP toward it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GatewayInfo {
@@ -17,6 +19,13 @@ pub struct GatewayInfo {
     pub gateway: Ipv4Addr,
     /// Our local IPv4 address on the interface facing the gateway.
     pub self_ip: Ipv4Addr,
+}
+
+impl DeepHash for GatewayInfo {
+    fn deep_hash(&self, hasher: &mut Hasher) {
+        self.gateway.deep_hash(hasher);
+        self.self_ip.deep_hash(hasher);
+    }
 }
 
 impl GatewayInfo {

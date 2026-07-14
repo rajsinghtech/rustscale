@@ -2413,6 +2413,7 @@ dependencies = [
 name = "rustscale-appc"
 version = "0.1.1"
 dependencies = [
+ "rustscale-deephash",
  "rustscale-key",
  "rustscale-tailcfg",
  "serde",
@@ -2586,7 +2587,6 @@ dependencies = [
  "rand 0.8.7",
  "rustscale-ipn",
  "rustscale-key",
- "rustscale-portmapper",
  "rustscale-tailcfg",
  "serde",
  "serde_json",
@@ -2702,6 +2702,7 @@ dependencies = [
 name = "rustscale-filter"
 version = "0.1.1"
 dependencies = [
+ "rustscale-deephash",
  "rustscale-flowtrack",
  "rustscale-packet",
  "rustscale-tailcfg",
@@ -2975,6 +2976,7 @@ version = "0.1.1"
 dependencies = [
  "if-addrs",
  "rand 0.8.7",
+ "rustscale-deephash",
  "rustscale-neterror",
  "rustscale-tsdial",
  "thiserror 1.0.69",

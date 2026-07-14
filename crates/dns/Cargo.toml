@@ -16,6 +16,7 @@ rustscale-tsaddr = { path = "../tsaddr", version = "0.1.0" }
 rustscale-bakedroots = { path = "../bakedroots", version = "0.1.0" }
 rustscale-tsdial = { path = "../tsdial" }
 rustscale-envknob = { path = "../envknob", version = "0.1.0" }
+rustscale-dnsname = { path = "../dnsname", version = "0.1.0" }
 thiserror.workspace = true
 tokio.workspace = true
 tokio-rustls = { workspace = true }

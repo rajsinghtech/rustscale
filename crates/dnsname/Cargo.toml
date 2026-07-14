@@ -1,0 +1,13 @@
+[package]
+name = "rustscale-dnsname"
+description = "DNS name string utilities — port of Go's tailscale.com/util/dnsname"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror.workspace = true

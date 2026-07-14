@@ -2573,6 +2573,7 @@ version = "0.1.0"
 dependencies = [
  "rustls",
  "rustscale-bakedroots",
+ "rustscale-dnsname",
  "rustscale-envknob",
  "rustscale-key",
  "rustscale-neterror",
@@ -2612,6 +2613,13 @@ dependencies = [
  "tokio-rustls",
  "tracing",
  "webpki-roots 0.26.11",
+]
+
+[[package]]
+name = "rustscale-dnsname"
+version = "0.1.0"
+dependencies = [
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -2929,6 +2937,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustscale-ringlog"
+version = "0.1.0"
+
+[[package]]
 name = "rustscale-router"
 version = "0.1.0"
 dependencies = [
@@ -3004,6 +3016,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "chrono",
+ "rustscale-dnsname",
  "rustscale-key",
  "rustscale-tsaddr",
  "serde",
@@ -3107,6 +3120,7 @@ dependencies = [
  "rustscale-controlknobs",
  "rustscale-derp",
  "rustscale-dns",
+ "rustscale-dnsname",
  "rustscale-envknob",
  "rustscale-filter",
  "rustscale-health",

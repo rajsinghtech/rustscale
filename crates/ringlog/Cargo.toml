@@ -1,0 +1,12 @@
+[package]
+name = "rustscale-ringlog"
+description = "Fixed-capacity concurrency-safe ring buffer — port of Go's tailscale.com/util/ringlog"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]

@@ -640,12 +640,8 @@ fn peer_matches(peer: &Node, name: &str, domain: &str) -> bool {
     }
     // Short-name match: the first label of the peer's FQDN equals `name`
     // (only meaningful for single-label `name`).
-    if !name.contains('.') {
-        if let Some(first_label) = peer_name.split('.').next() {
-            if first_label == name {
-                return true;
-            }
-        }
+    if !name.contains('.') && rustscale_dnsname::first_label(peer_name) == name {
+        return true;
     }
     // Suffix match: `name` is `host` and peer is `host.<domain>` handled
     // above by short-name; also allow `name` without the domain suffix to

@@ -1,7 +1,7 @@
 use std::ffi::CString;
 use std::net::{IpAddr, SocketAddr};
 use std::os::fd::AsRawFd;
-use tokio::net::{TcpSocket, TcpStream};
+use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 
 const IP_BOUND_IF: u32 = 25;
 const IPV6_BOUND_IF: u32 = 125;
@@ -38,6 +38,37 @@ pub async fn control_and_connect(addr: SocketAddr) -> Result<TcpStream, std::io:
     let stream = socket.connect(addr).await?;
     stream.set_nodelay(true).ok();
     Ok(stream)
+}
+
+/// Configure a magicsock UDP socket to use the default physical interface.
+pub fn configure_udp_socket(socket: &UdpSocket) -> Result<(), std::io::Error> {
+    if super::DISABLE_BIND_CONN_TO_INTERFACE.load(std::sync::atomic::Ordering::Relaxed) {
+        return Ok(());
+    }
+    let Some(idx) = default_interface_index() else {
+        return Ok(());
+    };
+    let fd = socket.as_raw_fd();
+    let idx_val: libc::c_uint = idx;
+    let (level, opt) = if socket.local_addr()?.is_ipv4() {
+        (libc::IPPROTO_IP, IP_BOUND_IF)
+    } else {
+        (libc::IPPROTO_IPV6, IPV6_BOUND_IF)
+    };
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            level,
+            opt as libc::c_int,
+            (&raw const idx_val).cast::<libc::c_void>(),
+            std::mem::size_of_val(&idx_val) as libc::socklen_t,
+        )
+    };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    Ok(())
 }
 
 fn get_interface_index(addr: SocketAddr) -> Option<u32> {

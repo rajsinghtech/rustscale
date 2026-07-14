@@ -2859,6 +2859,7 @@ dependencies = [
  "rustscale-ipnstate",
  "rustscale-key",
  "rustscale-neterror",
+ "rustscale-netns",
  "rustscale-portmapper",
  "rustscale-sockstats",
  "rustscale-tailcfg",
@@ -3132,6 +3133,7 @@ dependencies = [
 name = "rustscale-tsaddr"
 version = "0.1.1"
 dependencies = [
+ "if-addrs",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

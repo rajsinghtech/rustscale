@@ -2,7 +2,7 @@ use std::ffi::CString;
 use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
 use std::sync::OnceLock;
-use tokio::net::{TcpSocket, TcpStream};
+use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 
 const LINUX_BYPASS_MARK: u32 = 0x80000;
 
@@ -13,6 +13,18 @@ pub async fn control_and_connect(addr: SocketAddr) -> Result<TcpStream, std::io:
         TcpSocket::new_v6()?
     };
     let fd = socket.as_raw_fd();
+    configure_socket(fd)?;
+    let stream = socket.connect(addr).await?;
+    stream.set_nodelay(true).ok();
+    Ok(stream)
+}
+
+/// Configure a magicsock UDP socket with the same bypass policy as TCP.
+pub fn configure_udp_socket(socket: &UdpSocket) -> Result<(), std::io::Error> {
+    configure_socket(socket.as_raw_fd())
+}
+
+fn configure_socket(fd: std::os::fd::RawFd) -> Result<(), std::io::Error> {
     if use_socket_mark() {
         let mark: libc::c_int = LINUX_BYPASS_MARK as libc::c_int;
         let ret = unsafe {
@@ -49,9 +61,7 @@ pub async fn control_and_connect(addr: SocketAddr) -> Result<TcpStream, std::io:
             return Err(std::io::Error::last_os_error());
         }
     }
-    let stream = socket.connect(addr).await?;
-    stream.set_nodelay(true).ok();
-    Ok(stream)
+    Ok(())
 }
 
 fn use_socket_mark() -> bool {

@@ -7,11 +7,11 @@ mod other;
 mod socks;
 
 #[cfg(target_os = "linux")]
-use linux::control_and_connect;
+use linux::{configure_udp_socket as configure_platform_udp_socket, control_and_connect};
 #[cfg(target_os = "macos")]
-use macos::control_and_connect;
+use macos::{configure_udp_socket as configure_platform_udp_socket, control_and_connect};
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-use other::control_and_connect;
+use other::{configure_udp_socket as configure_platform_udp_socket, control_and_connect};
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -102,6 +102,19 @@ pub async fn dial_tcp_addr(addr: SocketAddr) -> Result<tokio::net::TcpStream, st
         return Ok(stream);
     }
     control_and_connect(addr).await
+}
+
+/// Apply this process's route-loop bypass policy to a UDP socket.
+///
+/// On Linux this uses the Tailscale bypass mark (or the default physical
+/// device on kernels that do not permit socket marks); on macOS it binds the
+/// socket to the default physical interface. This is used by magicsock before
+/// its UDP socket starts sending traffic.
+pub fn configure_udp_socket(socket: &tokio::net::UdpSocket) -> Result<(), std::io::Error> {
+    if !is_enabled() {
+        return Ok(());
+    }
+    configure_platform_udp_socket(socket)
 }
 
 #[cfg(test)]

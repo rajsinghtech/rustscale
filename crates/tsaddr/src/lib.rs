@@ -140,6 +140,50 @@ pub fn exit_routes() -> Vec<IpPrefix> {
     vec![all_ipv4(), all_ipv6()]
 }
 
+/// Return prefixes assigned to local, non-Tailscale interfaces.
+///
+/// Host routes are omitted because they do not protect a local LAN from an
+/// exit-node default route. Tailscale addresses are omitted so the TUN device
+/// cannot add routes that bypass itself.
+pub fn local_interface_prefixes() -> Vec<IpPrefix> {
+    let Ok(interfaces) = if_addrs::get_if_addrs() else {
+        return Vec::new();
+    };
+
+    let mut prefixes = Vec::new();
+    for interface in interfaces {
+        if !interface.is_oper_up() || is_tailscale_ip(interface.ip()) {
+            continue;
+        }
+        match interface.addr {
+            if_addrs::IfAddr::V4(addr) if addr.prefixlen > 0 && addr.prefixlen < 32 => {
+                prefixes.push(IpPrefix {
+                    ip: IpAddr::V4(mask_v4(addr.ip, addr.prefixlen)),
+                    bits: addr.prefixlen,
+                });
+            }
+            if_addrs::IfAddr::V6(addr) if addr.prefixlen > 0 && addr.prefixlen < 128 => {
+                prefixes.push(IpPrefix {
+                    ip: IpAddr::V6(mask_v6(addr.ip, addr.prefixlen)),
+                    bits: addr.prefixlen,
+                });
+            }
+            _ => {}
+        }
+    }
+    prefixes
+}
+
+fn mask_v4(ip: Ipv4Addr, bits: u8) -> Ipv4Addr {
+    let mask = u32::MAX.checked_shl(u32::from(32 - bits)).unwrap_or(0);
+    Ipv4Addr::from(u32::from(ip) & mask)
+}
+
+fn mask_v6(ip: Ipv6Addr, bits: u8) -> Ipv6Addr {
+    let mask = u128::MAX.checked_shl(u32::from(128 - bits)).unwrap_or(0);
+    Ipv6Addr::from(u128::from(ip) & mask)
+}
+
 // ---------------------------------------------------------------------------
 // IP predicates
 // ---------------------------------------------------------------------------

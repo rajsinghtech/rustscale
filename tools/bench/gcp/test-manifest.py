@@ -26,7 +26,8 @@ def run_identity():
             "cloud": {"provider": "gcp", "project": "fixture-project", "requested_image_project": "ubuntu-os-cloud",
                       "requested_image_family": "ubuntu-2204-lts", "requested_machine_type": "n1-standard-4",
                       "network": "default", "disk_type": "pd-standard", "disk_gb": 200},
-            "build": {"command": "cargo build --release", "rustflags": "", "cargo_profile_release_lto": "", "cargo_profile_release_codegen_units": ""}}
+            "build": {"command": "cargo build --release", "rustflags": "", "cargo_profile_release_lto": "", "cargo_profile_release_codegen_units": ""},
+            "runtime": {"rs_tun_inbound_pipeline": False}}
 
 
 def observed():
@@ -42,16 +43,16 @@ def observed():
             "product": {"server": products, "client": products}}
 
 
-def matrix(root, *, repeat=2, parallelism=PARALLELS, include_parallelism=True, dry_run=False, configs=None):
+def matrix(root, *, repeat=2, parallelism=PARALLELS, include_parallelism=True, dry_run=False, configs=None, identity=None):
     data = {"schema_version": 2, "topologies": ["same-zone"], "paths": ["direct"],
             "configs": configs or ["rs-tun"], "repeat": repeat, "dry_run": dry_run,
-            "warmup": {"parallel": 1, "duration_s": 3, "reverse": True}, "run": run_identity()}
+            "warmup": {"parallel": 1, "duration_s": 3, "reverse": True}, "run": identity or run_identity()}
     if include_parallelism:
         data["parallelism"] = parallelism
     (root / "matrix.json").write_text(json.dumps(data))
 
 
-def valid(*, repeat=2, config="rs-tun", path="direct", parallels=PARALLELS):
+def valid(*, repeat=2, config="rs-tun", path="direct", parallels=PARALLELS, identity=None):
     rows = []
     for parallel in parallels:
         rows.append({"parallel": parallel, "mbps": 100.0 + parallel,
@@ -64,7 +65,7 @@ def valid(*, repeat=2, config="rs-tun", path="direct", parallels=PARALLELS):
                                                 "loss": 0, "p50_us": 10, "p95_us": 20, "p99_us": 30, "count": 50},
             "footprint": {"binary_size_bytes": 1, "rss_peak_kb": 2, "rss_avg_kb": 1,
                           "cpu_peak_pct": 0, "cpu_avg_pct": 0, "samples": 1},
-            "path_class_reported": path, "run": run_identity(), "observed": observed()}
+            "path_class_reported": path, "run": identity or run_identity(), "observed": observed()}
 
 
 def valid_ts_tun():
@@ -110,6 +111,18 @@ with tempfile.TemporaryDirectory() as tmp:
     assert manifest["parallelism"] == [1, 10, 100]
     assert all(type(value) is int for value in manifest["parallelism"])
     assert len(json.loads(result.stdout)) == 1
+
+    # Current schema-v2 manifests predate runtime metadata. They remain
+    # readable and aggregate as the historical/default pipeline-off state,
+    # but cannot be used to launch a new paid cell.
+    historical = Path(tmp) / "historical" / run_identity()["id"]; historical.mkdir(parents=True)
+    historical_identity = run_identity(); historical_identity.pop("runtime")
+    matrix(historical, identity=historical_identity)
+    historical_cell = write_cell(historical, valid(identity=historical_identity))
+    run("python3", GCP / "provenance.py", "validate", "--manifest", historical / "matrix.json")
+    run("python3", GCP / "provenance.py", "validate", "--manifest", historical / "matrix.json", "--result", historical_cell)
+    historical_summary = run("python3", GCP / "aggregate.py", historical)
+    assert len(json.loads(historical_summary.stdout)) == 1
 
     # Semantic current-manifest validation rejects impossible timestamps,
     # duplicate sweeps, and any warmup contract drift.
@@ -170,10 +183,19 @@ with tempfile.TemporaryDirectory() as tmp:
     # Preflight is a paid-work gate, so all three selected-cell dimensions are
     # checked before run-config can start a daemon or profile a VM.
     run("python3", GCP / "provenance.py", "preflight", "--manifest", root / "matrix.json", "--observed", selected,
-        "--config", "rs-tun", "--topology", "same-zone", "--path", "direct", "--server-zone", "us-central1-a", "--client-zone", "us-central1-b")
+        "--config", "rs-tun", "--topology", "same-zone", "--path", "direct", "--server-zone", "us-central1-a", "--client-zone", "us-central1-b", "--rs-tun-inbound-pipeline", "0")
+    unbound = run("python3", GCP / "provenance.py", "preflight", "--manifest", root / "matrix.json", "--observed", selected,
+                  "--config", "rs-tun", "--topology", "same-zone", "--path", "direct", "--server-zone", "us-central1-a", "--client-zone", "us-central1-b", ok=False)
+    assert unbound.returncode == 2 and "--rs-tun-inbound-pipeline" in unbound.stderr
+    missing_runtime = run("python3", GCP / "provenance.py", "preflight", "--manifest", historical / "matrix.json", "--observed", selected,
+                          "--config", "rs-tun", "--topology", "same-zone", "--path", "direct", "--server-zone", "us-central1-a", "--client-zone", "us-central1-b", "--rs-tun-inbound-pipeline", "0", ok=False)
+    assert "missing from immutable run metadata" in missing_runtime.stderr
     excluded = run("python3", GCP / "provenance.py", "preflight", "--manifest", root / "matrix.json", "--observed", selected,
-                   "--config", "rs-tun", "--topology", "same-zone", "--path", "derp", "--server-zone", "us-central1-a", "--client-zone", "us-central1-b", ok=False)
+                   "--config", "rs-tun", "--topology", "same-zone", "--path", "derp", "--server-zone", "us-central1-a", "--client-zone", "us-central1-b", "--rs-tun-inbound-pipeline", "0", ok=False)
     assert "not selected" in excluded.stderr
+    mismatch = run("python3", GCP / "provenance.py", "preflight", "--manifest", root / "matrix.json", "--observed", selected,
+                   "--config", "rs-tun", "--topology", "same-zone", "--path", "direct", "--server-zone", "us-central1-a", "--client-zone", "us-central1-b", "--rs-tun-inbound-pipeline", "1", ok=False)
+    assert "inbound pipeline" in mismatch.stderr
 
     # Two current cells share endpoint environment/toolchain identity but have
     # config-specific product lists. Valid-but-different provenance must be
@@ -211,6 +233,7 @@ with tempfile.TemporaryDirectory() as tmp:
         ("run.id", lambda o: o["run"].__setitem__("id", "gcp-20260714-010204-fixture")),
         ("run.started_at_utc", lambda o: o["run"].__setitem__("started_at_utc", "2026-07-14T01:02:04Z")),
         ("cloud.machine", lambda o: o["run"]["cloud"].__setitem__("requested_machine_type", "n2-standard-4")),
+        ("runtime.pipeline", lambda o: o["run"]["runtime"].__setitem__("rs_tun_inbound_pipeline", True)),
         ("endpoint zone", lambda o: o["observed"]["client"].__setitem__("zone", "us-central1-a")),
         ("endpoint machine", lambda o: o["observed"]["server"].__setitem__("machine_type", "n2-standard-4")),
         ("environment", lambda o: o["observed"]["server"].__setitem__("kernel_release", "")),

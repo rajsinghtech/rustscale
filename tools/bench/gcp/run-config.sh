@@ -11,6 +11,7 @@
 # Environment:
 #   BENCH_MATRIX  — optional, set by run-matrix.sh; "topo/path" for tagging.
 #   GCP_DRY_RUN   — when set, commands are echoed not executed (still emits a stub JSON).
+#   RS_TUN_INBOUND_PIPELINE — rs-tun inbound pipeline toggle: 0 (default) or 1.
 #
 # Returns 0 on success.
 
@@ -96,6 +97,58 @@ run_config_option_parsing_self_test() {
   done
 }
 
+rs_tun_inbound_pipeline_self_test() {
+  local actual status
+  actual=$(export RS_TUN_INBOUND_PIPELINE=1; configure_rs_tun_inbound_pipeline; printf '%s' "$RS_TUN_INBOUND_PIPELINE") || return 1
+  [[ "$actual" == 1 ]] || return 1
+  actual=$(unset RS_TUN_INBOUND_PIPELINE; configure_rs_tun_inbound_pipeline; printf '%s' "$RS_TUN_INBOUND_PIPELINE") || return 1
+  [[ "$actual" == 0 ]] || return 1
+  if ( export RS_TUN_INBOUND_PIPELINE=enabled; configure_rs_tun_inbound_pipeline ) >/dev/null 2>&1; then
+    return 1
+  else
+    status=$?
+  fi
+  (( status == 2 )) || return 1
+  if ( export RS_TUN_INBOUND_PIPELINE=; configure_rs_tun_inbound_pipeline ) >/dev/null 2>&1; then
+    return 1
+  else
+    status=$?
+  fi
+  (( status == 2 ))
+}
+
+validate_rs_tun_daemon_input() {
+  local authkey="$1" hostname="$2"
+  [[ "$authkey" =~ ^tskey-[A-Za-z0-9_-]+$ ]] || { echo "invalid rs-tun auth key" >&2; return 2; }
+  [[ "$hostname" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]] || { echo "invalid rs-tun hostname" >&2; return 2; }
+}
+
+validate_rs_tun_daemon_inputs() {
+  validate_rs_tun_daemon_input "$AUTHKEY" "$SHOST" || return $?
+  validate_rs_tun_daemon_input "$AUTHKEY" "$CHOST"
+}
+
+rs_tun_daemon_input_self_test() {
+  local value status
+  validate_rs_tun_daemon_input tskey-auth-selftest rs-srv-same-zone || return 1
+  for value in '' 'tskey-auth bad' "tskey-auth-'bad" 'tskey-auth-bad;id' 'tskey-auth-$(id)' 'not-a-tskey'; do
+    if ( validate_rs_tun_daemon_input "$value" rs-srv-same-zone ) >/dev/null 2>&1; then
+      return 1
+    else
+      status=$?
+    fi
+    (( status == 2 )) || return 1
+  done
+  for value in '' 'bad host' "bad'host" 'bad;id' 'bad$(id)' '-bad' 'bad-'; do
+    if ( validate_rs_tun_daemon_input tskey-auth-selftest "$value" ) >/dev/null 2>&1; then
+      return 1
+    else
+      status=$?
+    fi
+    (( status == 2 )) || return 1
+  done
+}
+
 SELF_TEST=0
 if [[ "${1:-}" == "--self-test" ]]; then
   SELF_TEST=1
@@ -108,7 +161,7 @@ if (( SELF_TEST )); then
   CVM=self-test-client
   SZONE=self-test-zone
   CZONE=self-test-zone
-  AUTHKEY=self-test-authkey
+  AUTHKEY=tskey-auth-selftest
   RDIR=$(mktemp -d)
   SHOST=self-test-server
   CHOST=self-test-client
@@ -129,9 +182,13 @@ else
   shift 9
   parse_run_config_options "$@" || exit $?
 fi
+configure_rs_tun_inbound_pipeline || exit $?
 if (( PROFILE || PROFILE_ONLY )) && [[ "$CONFIG" != rs-tun ]]; then
   echo "--profile and --profile-only are only valid for rs-tun" >&2
   exit 2
+fi
+if [[ "$CONFIG" == rs-tun ]]; then
+  validate_rs_tun_daemon_inputs || exit $?
 fi
 
 PARALLELS=(1 10 100)
@@ -168,7 +225,7 @@ if (( SELF_TEST )); then
   python3 "$PROVENANCE_HELPER" manifest "$RESULT_MANIFEST" --run-id gcp-20260714-000000-selftest \
     --started-at-utc 2026-07-14T00:00:00Z --commit "$self_commit" --dirty 0 --project dry-run \
     --image-project ubuntu-os-cloud --image-family ubuntu-2204-lts --machine n1-standard-4 --network default \
-    --disk-type pd-standard --disk-gb 200 --dry-run --topologies same-zone --paths direct --configs rs-tun --parallelism 1 10 100 --repeat 3
+    --disk-type pd-standard --disk-gb 200 --rs-tun-inbound-pipeline "$RS_TUN_INBOUND_PIPELINE" --dry-run --topologies same-zone --paths direct --configs rs-tun --parallelism 1 10 100 --repeat 3
   # The self-test config intentionally uses a non-production topology; the
   # provenance helper only validates endpoint identity when it is non-dry.
   python3 "$PROVENANCE_HELPER" dry-observed "$OBSERVED_METADATA"
@@ -177,7 +234,8 @@ fi
 preflight_current_metadata() {
   [[ -n "$RESULT_MANIFEST" && -n "$OBSERVED_METADATA" ]] || return 1
   python3 "$PROVENANCE_HELPER" preflight --manifest "$RESULT_MANIFEST" --observed "$OBSERVED_METADATA" \
-    --config "$CONFIG" --topology "$TOPOLOGY" --path "$PATH_TAG" --server-zone "$SZONE" --client-zone "$CZONE"
+    --config "$CONFIG" --topology "$TOPOLOGY" --path "$PATH_TAG" --server-zone "$SZONE" --client-zone "$CZONE" \
+    --rs-tun-inbound-pipeline "$RS_TUN_INBOUND_PIPELINE"
 }
 
 if ! preflight_current_metadata; then
@@ -363,8 +421,26 @@ tun_path_gate_command() {
   fi
 }
 
+nohup_background_command() {
+  local environment="$1" program="$2" logfile="$3" pidfile="$4"
+  # The literal $! reaches the root-side bash -c through ssh_sudo's enclosing
+  # single quotes, where it expands to the nohup process PID.
+  printf '%snohup %s > %s 2>&1 & echo $! > %s' "$environment" "$program" "$logfile" "$pidfile"
+}
+
+rs_tun_daemon_start_command() {
+  local pipeline="$1" authkey="$2" statedir="$3" socket="$4" hostname="$5" logfile="$6" pidfile="$7" environment
+  [[ "$pipeline" == 0 || "$pipeline" == 1 ]] || return 2
+  validate_rs_tun_daemon_input "$authkey" "$hostname" || return $?
+  environment="TS_AUTHKEY=$authkey "
+  [[ "$pipeline" == 1 ]] && environment="RUSTSCALE_TUN_INBOUND_PIPELINE=1 $environment"
+  nohup_background_command "$environment" \
+    "/opt/rustscale/target/release/rustscaled run --tun --statedir $statedir --socket $socket --hostname $hostname" \
+    "$logfile" "$pidfile"
+}
+
 command_shape_self_test() {
-  local ts_direct rs_direct ts_derp rs_derp
+  local ts_direct rs_direct ts_derp rs_derp rs_server_off rs_client_off rs_server_on rs_client_on
   ts_direct=$(tun_ping_invocation tailscale /tmp/ts.sock direct 100.64.0.1)
   rs_direct=$(tun_ping_invocation /opt/rustscale/target/release/rustscale /tmp/rs.sock direct 100.64.0.1)
   ts_derp=$(tun_ping_invocation tailscale /tmp/ts.sock derp 100.64.0.1)
@@ -377,6 +453,39 @@ command_shape_self_test() {
   [[ "${ts_derp#* ping }" == "${rs_derp#* ping }" ]] || return 1
   [[ "$(tun_path_gate_command "$ts_direct" direct)" == "timeout --kill-after=5s 180s $ts_direct" ]] || return 1
   [[ "$(tun_path_gate_command "$rs_direct" direct)" == "timeout --kill-after=5s 180s $rs_direct" ]] || return 1
+  rs_server_off=$(rs_tun_daemon_start_command 0 tskey-auth-selftest /tmp/srv /tmp/srv.sock srv /tmp/srv.log /tmp/srv.pid)
+  rs_client_off=$(rs_tun_daemon_start_command 0 tskey-auth-selftest /tmp/cli /tmp/cli.sock cli /tmp/cli.log /tmp/cli.pid)
+  [[ "$rs_server_off" != *RUSTSCALE_TUN_INBOUND_PIPELINE* && "$rs_client_off" != *RUSTSCALE_TUN_INBOUND_PIPELINE* ]] || return 1
+  [[ "$rs_server_off" == 'TS_AUTHKEY=tskey-auth-selftest nohup /opt/rustscale/target/release/rustscaled run --tun --statedir /tmp/srv --socket /tmp/srv.sock --hostname srv > /tmp/srv.log 2>&1 & echo $! > /tmp/srv.pid' ]] || return 1
+  [[ "$rs_client_off" == 'TS_AUTHKEY=tskey-auth-selftest nohup /opt/rustscale/target/release/rustscaled run --tun --statedir /tmp/cli --socket /tmp/cli.sock --hostname cli > /tmp/cli.log 2>&1 & echo $! > /tmp/cli.pid' ]] || return 1
+  rs_server_on=$(rs_tun_daemon_start_command 1 tskey-auth-selftest /tmp/srv /tmp/srv.sock srv /tmp/srv.log /tmp/srv.pid)
+  rs_client_on=$(rs_tun_daemon_start_command 1 tskey-auth-selftest /tmp/cli /tmp/cli.sock cli /tmp/cli.log /tmp/cli.pid)
+  [[ "$rs_server_on" == 'RUSTSCALE_TUN_INBOUND_PIPELINE=1 TS_AUTHKEY=tskey-auth-selftest nohup /opt/rustscale/target/release/rustscaled run --tun --statedir /tmp/srv --socket /tmp/srv.sock --hostname srv > /tmp/srv.log 2>&1 & echo $! > /tmp/srv.pid' ]] || return 1
+  [[ "$rs_client_on" == 'RUSTSCALE_TUN_INBOUND_PIPELINE=1 TS_AUTHKEY=tskey-auth-selftest nohup /opt/rustscale/target/release/rustscaled run --tun --statedir /tmp/cli --socket /tmp/cli.sock --hostname cli > /tmp/cli.log 2>&1 & echo $! > /tmp/cli.pid' ]] || return 1
+  [[ "${rs_server_on#RUSTSCALE_TUN_INBOUND_PIPELINE=1 }" != *RUSTSCALE_TUN_INBOUND_PIPELINE* && "${rs_client_on#RUSTSCALE_TUN_INBOUND_PIPELINE=1 }" != *RUSTSCALE_TUN_INBOUND_PIPELINE* ]] || return 1
+}
+
+pid_capture_semantics_self_test() {
+  local directory pipeline environment command remote_command pidfile pid attempt
+  directory=$(mktemp -d "$RDIR/pid-capture-test.XXXXXX") || return 1
+  for pipeline in 0 1; do
+    pidfile="$directory/$pipeline.pid"
+    environment='TS_AUTHKEY=authkey '
+    [[ "$pipeline" == 1 ]] && environment="RUSTSCALE_TUN_INBOUND_PIPELINE=1 $environment"
+    command=$(nohup_background_command "$environment" 'sleep 30' "$directory/$pipeline.log" "$pidfile") || { rm -rf "$directory"; return 1; }
+    remote_command=$(ssh_sudo_remote_command "$command") || { rm -rf "$directory"; return 1; }
+    # This is the remote login shell followed by ssh_sudo's root-side bash -c.
+    bash -c "${remote_command#sudo }" || { rm -rf "$directory"; return 1; }
+    pid=$(<"$pidfile")
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] && kill -0 "$pid" 2>/dev/null || { rm -rf "$directory"; return 1; }
+    kill "$pid" 2>/dev/null || { rm -rf "$directory"; return 1; }
+    for attempt in {1..20}; do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.05
+    done
+    ! kill -0 "$pid" 2>/dev/null || { kill -KILL "$pid" 2>/dev/null || true; rm -rf "$directory"; return 1; }
+  done
+  rm -rf "$directory"
 }
 
 # Gate kernel benchmarks on a product CLI ping and return its observed class.
@@ -773,13 +882,14 @@ cleanup_self_test() {
 
 result_shape_self_test() {
   emit_stub self-test
-  python3 - "$OUT" "$DURATION" "$LATENCY_COUNT" "${PARALLELS[@]}" <<'PYEOF'
+  python3 - "$OUT" "$DURATION" "$LATENCY_COUNT" "$RS_TUN_INBOUND_PIPELINE" "${PARALLELS[@]}" <<'PYEOF'
 import json, sys
-path, duration, latency_count, *parallels = sys.argv[1:]
+path, duration, latency_count, inbound_pipeline, *parallels = sys.argv[1:]
 with open(path) as f:
     result = json.load(f)
 assert result["schema_version"] == 3 and result["status"] == "failed"
 assert result["run"]["source"]["includes_uncommitted_changes"] is False
+assert result["run"]["runtime"]["rs_tun_inbound_pipeline"] is (inbound_pipeline == "1")
 assert result["observed"]["resolved_image"] == "dry-run"
 assert result["parallelism_requested"] == [int(p) for p in parallels]
 assert result["throughput"] is None and result["latency"] is None and result["footprint"] is None
@@ -869,8 +979,11 @@ rs_tun_lifecycle_self_test() {
 
 classifier_self_test
 command_shape_self_test
+pid_capture_semantics_self_test
 path_gate_self_test
 run_config_option_parsing_self_test
+rs_tun_inbound_pipeline_self_test
+rs_tun_daemon_input_self_test
 
 if (( SELF_TEST )); then
   metadata_preflight_self_test
@@ -1674,14 +1787,8 @@ run_rs_tun() {
   fi
   ssh_sudo "$SVM" "$SZONE"  'rm -rf /tmp/rs-tun-srv; rm -f /tmp/rs-tun-srv.log /tmp/rs-tun-srv.pid /tmp/rs-tun-srv.sock'
   ssh_sudo "$CVM" "$CZONE"  'rm -rf /tmp/rs-tun-cli; rm -f /tmp/rs-tun-cli.log /tmp/rs-tun-cli.pid /tmp/rs-tun-cli.sock'
-  ssh_sudo "$SVM" "$SZONE" \
-    "TS_AUTHKEY=$AUTHKEY nohup /opt/rustscale/target/release/rustscaled run --tun \
-       --statedir /tmp/rs-tun-srv --socket /tmp/rs-tun-srv.sock --hostname $SHOST \
-       > /tmp/rs-tun-srv.log 2>&1 & echo \$! > /tmp/rs-tun-srv.pid"
-  ssh_sudo "$CVM" "$CZONE" \
-    "TS_AUTHKEY=$AUTHKEY nohup /opt/rustscale/target/release/rustscaled run --tun \
-       --statedir /tmp/rs-tun-cli --socket /tmp/rs-tun-cli.sock --hostname $CHOST \
-       > /tmp/rs-tun-cli.log 2>&1 & echo \$! > /tmp/rs-tun-cli.pid"
+  ssh_sudo "$SVM" "$SZONE" "$(rs_tun_daemon_start_command "$RS_TUN_INBOUND_PIPELINE" "$AUTHKEY" /tmp/rs-tun-srv /tmp/rs-tun-srv.sock "$SHOST" /tmp/rs-tun-srv.log /tmp/rs-tun-srv.pid)"
+  ssh_sudo "$CVM" "$CZONE" "$(rs_tun_daemon_start_command "$RS_TUN_INBOUND_PIPELINE" "$AUTHKEY" /tmp/rs-tun-cli /tmp/rs-tun-cli.sock "$CHOST" /tmp/rs-tun-cli.log /tmp/rs-tun-cli.pid)"
 
   local server_ip
   server_ip=$(wait_tun_ip 1 "$SVM" "$SZONE" /opt/rustscale/target/release/rustscale /tmp/rs-tun-srv.sock /tmp/rs-tun-srv.log) || {

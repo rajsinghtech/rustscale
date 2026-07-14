@@ -24,6 +24,14 @@
 : "${GCP_IMAGE_PROJECT:=ubuntu-os-cloud}"
 : "${GCP_DRY_RUN:=}"
 
+configure_rs_tun_inbound_pipeline() {
+  [[ -n "${RS_TUN_INBOUND_PIPELINE+x}" ]] || RS_TUN_INBOUND_PIPELINE=0
+  case "$RS_TUN_INBOUND_PIPELINE" in
+    0|1) export RS_TUN_INBOUND_PIPELINE ;;
+    *) echo "RS_TUN_INBOUND_PIPELINE must be 0 or 1" >&2; return 2 ;;
+  esac
+}
+
 # SSH connection cache (populated by ssh_cmd on first use per VM).
 declare -A _SSH_IP=()
 declare -A _SSH_USER=()
@@ -360,9 +368,15 @@ gcloud_project_self_test() {
 # ---------------------------------------------------------------------------
 # Run a sudo command on a VM. Args: NAME ZONE COMMAND
 # ---------------------------------------------------------------------------
+ssh_sudo_remote_command() {
+  # Callers must not include single quotes: this is intentionally one remote
+  # shell word whose contents are evaluated only by the root-side bash -c.
+  printf "sudo bash -c '%s'" "$1"
+}
+
 ssh_sudo() {
   local name="$1" zone="$2" cmd="$3"
-  ssh_cmd "$name" "$zone" "sudo bash -c '$cmd'"
+  ssh_cmd "$name" "$zone" "$(ssh_sudo_remote_command "$cmd")"
 }
 
 # ---------------------------------------------------------------------------

@@ -42,10 +42,23 @@ assert (m["topologies"], m["paths"], m["configs"]) == (
     ["same-zone"], ["direct"], ["rs-tun", "ts-tun"])
 assert len(m["topologies"]) * len(m["paths"]) * len(m["configs"]) == 2
 assert m["schema_version"] == 2 and root.name == m["run"]["id"]
+assert m["run"]["runtime"]["rs_tun_inbound_pipeline"] is False
 for cell in (root / "same-zone" / "direct").glob("*.json"):
     r = json.load(open(cell))
     assert r["schema_version"] == 3 and r["run"] == m["run"] and r["observed"]["resolved_image"] == "dry-run"
 PYEOF
+run env RS_TUN_INBOUND_PIPELINE=1 MATRIX_SKIP_COLLECT=1 MATRIX_RESULTS_DIR="$tmp/pipeline-on" tools/bench/gcp/run-matrix.sh --dry-run --config rs-tun
+run python3 - "$tmp/pipeline-on" <<'PYEOF'
+import json, pathlib, sys
+root = next(pathlib.Path(sys.argv[1]).glob("gcp-*/matrix.json")).parent
+m = json.load(open(root / "matrix.json"))
+r = json.load(open(root / "same-zone/direct/rs-tun.json"))
+assert m["run"]["runtime"]["rs_tun_inbound_pipeline"] is True
+assert r["run"] == m["run"]
+PYEOF
+expect_status 2 env RS_TUN_INBOUND_PIPELINE=invalid tools/bench/gcp/run-matrix.sh --dry-run
+expect_status 2 env RS_TUN_INBOUND_PIPELINE=invalid tools/bench/gcp/run-config.sh --self-test
+expect_status 2 env RS_TUN_INBOUND_PIPELINE= tools/bench/gcp/run-matrix.sh --dry-run
 run env MATRIX_SKIP_COLLECT=1 MATRIX_RESULTS_DIR="$tmp/full" tools/bench/gcp/run-matrix.sh --full --dry-run
 run python3 - "$tmp/full" <<'PYEOF'
 import json, pathlib, sys

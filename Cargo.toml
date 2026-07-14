@@ -75,6 +75,7 @@ rustscale-dnscache = { path = "crates/dnscache", version = "0.1.1" }
 rustscale-dnsfallback = { path = "crates/dnsfallback", version = "0.1.1" }
 rustscale-safesocket = { path = "crates/safesocket", version = "0.1.1" }
 rustscale-routetable = { path = "crates/routetable", version = "0.1.1" }
+rustscale-routecheck = { path = "crates/routecheck", version = "0.1.1" }
 rustscale-dnsname = { path = "crates/dnsname", version = "0.1.1" }
 rustscale-ringlog = { path = "crates/ringlog", version = "0.1.1" }
 rustscale-speedtest = { path = "crates/speedtest", version = "0.1.1" }

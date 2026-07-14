@@ -3003,6 +3003,16 @@ name = "rustscale-ringlog"
 version = "0.1.1"
 
 [[package]]
+name = "rustscale-routecheck"
+version = "0.1.1"
+dependencies = [
+ "log",
+ "rustscale-netmon",
+ "rustscale-routetable",
+ "rustscale-tsaddr",
+]
+
+[[package]]
 name = "rustscale-router"
 version = "0.1.1"
 dependencies = [

@@ -11,14 +11,20 @@
 #![forbid(unsafe_code)]
 
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use boringtun::noise::{Tunn, TunnResult};
+use boringtun::noise::{OpenedData, PreparedData, Tunn, TunnResult};
 use boringtun::x25519::{PublicKey, StaticSecret};
 use rustscale_key::{NodePrivate, NodePublic};
 
 /// Maximum WireGuard message size (header + payload).
 const MAX_WG_MSG: usize = 65_536;
+/// The speculative path is deliberately MTU-sized. Jumbo valid WireGuard
+/// data remains on the allocation-neutral scalar path.
+pub const MAX_PIPELINED_ENCRYPTED_BODY: usize = 2048;
+static NEXT_PLAINTEXT_BATCH_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_WG_TUNNEL_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Errors from the WireGuard tunnel wrapper.
 #[derive(Debug, thiserror::Error)]
@@ -52,6 +58,7 @@ pub struct WgTunn {
     tunn: Tunn,
     decap_buf: Box<[u8]>,
     encap_buf: Box<[u8]>,
+    pipeline_instance_id: u64,
 }
 
 /// Reusable storage for WireGuard datagrams produced by [`WgTunn`].
@@ -70,10 +77,45 @@ pub struct WgDatagramBatch {
 /// [`Self::retain_mut`] retain the backing packet allocations, so callers can
 /// reuse the same slots across bounded receive bursts without accidentally
 /// treating stale slots as packets.
-#[derive(Default)]
 pub struct WgPlaintextBatch {
     packets: Vec<Vec<u8>>,
     len: usize,
+    reserved: usize,
+    id: u64,
+    epoch: u64,
+}
+
+impl Default for WgPlaintextBatch {
+    fn default() -> Self {
+        Self {
+            packets: Vec::new(),
+            len: 0,
+            reserved: 0,
+            id: NEXT_PLAINTEXT_BATCH_ID.fetch_add(1, Ordering::Relaxed),
+            epoch: 0,
+        }
+    }
+}
+
+/// An opaque successful open. It transitively owns its plaintext slot; neither
+/// a key nor a borrow crosses the receive-worker channel.
+pub struct WgOpenedPacket {
+    opened: Option<OpenedData>,
+    slot: usize,
+    batch_id: u64,
+    batch_epoch: u64,
+    tunnel_instance_id: u64,
+}
+
+/// Opaque mutation-free data preflight result.
+#[derive(Debug)]
+pub struct WgPreparedPacket(PreparedData);
+
+/// Ordered speculative commit result.
+pub enum WgCommitResult {
+    Accepted,
+    Dropped,
+    Stale,
 }
 
 impl WgPlaintextBatch {
@@ -95,9 +137,29 @@ impl WgPlaintextBatch {
         self.len == 0
     }
 
+    /// Number of slots currently loaned to opaque speculative-open tokens.
+    /// This is normally zero at pipeline ownership boundaries.
+    pub fn reserved_len(&self) -> usize {
+        self.reserved
+    }
+
     /// Forget the initialized packet prefix without releasing slot storage.
     pub fn clear(&mut self) {
         self.len = 0;
+        self.reserved = 0;
+        self.epoch = self.epoch.wrapping_add(1);
+    }
+
+    /// Release oversized scalar-fallback slot allocations once no TUN write
+    /// can still observe them. Normal MTU-sized slots remain reusable.
+    pub fn release_oversized_slots(&mut self) {
+        debug_assert_eq!(self.len, 0);
+        debug_assert_eq!(self.reserved, 0);
+        for packet in &mut self.packets {
+            if packet.capacity() > MAX_PIPELINED_ENCRYPTED_BODY {
+                *packet = Vec::new();
+            }
+        }
     }
 
     /// The initialized plaintext packet prefix.
@@ -149,6 +211,51 @@ impl WgPlaintextBatch {
         slot.extend_from_slice(packet);
         self.len += 1;
         Ok(())
+    }
+
+    fn take_open_slot(&mut self, encrypted_len: usize) -> Result<(usize, Vec<u8>), WgError> {
+        if encrypted_len > MAX_PIPELINED_ENCRYPTED_BODY {
+            return Err(WgError::PlaintextTooLarge);
+        }
+        if self.reserved == Self::MAX_PACKETS {
+            return Err(WgError::PlaintextBatchFull);
+        }
+        if self.reserved == self.packets.len() {
+            self.packets.push(Vec::new());
+        }
+        let slot = self.reserved;
+        self.reserved += 1;
+        let packet = &mut self.packets[slot];
+        // `ring::open_in_place` needs exactly the encrypted body.  Reserving
+        // a 64 KiB maximum for every speculative packet would retain 16 MiB
+        // across two 128-packet scratches and needlessly zero-fill it.
+        packet.resize(encrypted_len, 0);
+        Ok((slot, std::mem::take(packet)))
+    }
+
+    fn return_open_slot(&mut self, slot: usize, mut packet: Vec<u8>, len: Option<usize>) -> bool {
+        if slot < self.len || slot >= self.reserved || slot >= self.packets.len() {
+            return false;
+        }
+        if let Some(len) = len {
+            packet.truncate(len);
+            self.packets[slot] = packet;
+            if slot != self.len {
+                self.packets.swap(slot, self.len);
+            }
+            self.len += 1;
+        } else {
+            self.packets[slot] = packet;
+            // A returned speculative slot is represented by a non-empty
+            // allocation, while a loaned slot was replaced by `Vec::new()`.
+            // Collapse a returned suffix so an AEAD-open failure restores the
+            // reservation immediately; earlier still-loaned slots keep their
+            // exact indices until their token is committed or aborted.
+            while self.reserved > self.len && self.packets[self.reserved - 1].capacity() != 0 {
+                self.reserved -= 1;
+            }
+        }
+        true
     }
 }
 
@@ -205,6 +312,7 @@ impl WgTunn {
             tunn,
             decap_buf: vec![0u8; MAX_WG_MSG].into_boxed_slice(),
             encap_buf: vec![0u8; MAX_WG_MSG].into_boxed_slice(),
+            pipeline_instance_id: NEXT_WG_TUNNEL_ID.fetch_add(1, Ordering::Relaxed),
         })
     }
 
@@ -310,6 +418,126 @@ impl WgTunn {
         Ok(replies)
     }
 
+    /// Mutation-free data preflight for the worker's complete-burst check.
+    pub fn preflight_data(&self, datagram: &[u8]) -> Result<WgPreparedPacket, WgError> {
+        if datagram.len().saturating_sub(16) > MAX_PIPELINED_ENCRYPTED_BODY {
+            return Err(WgError::PlaintextTooLarge);
+        }
+        self.tunn
+            .preflight_data(datagram)
+            .map(WgPreparedPacket)
+            .map_err(|error| WgError::Tunnel(format!("{error:?}")))
+    }
+
+    /// Synchronously copy and open into a retained scratch slot.
+    pub fn open_prepared_into(
+        &self,
+        datagram: &[u8],
+        prepared: &WgPreparedPacket,
+        plaintext: &mut WgPlaintextBatch,
+    ) -> Result<WgOpenedPacket, WgError> {
+        let (slot, packet) = plaintext.take_open_slot(datagram.len().saturating_sub(16))?;
+        let opened = match self.tunn.open_prepared_data(datagram, &prepared.0, packet) {
+            Ok(opened) => opened,
+            Err(error) => {
+                // An AEAD or immutable-token failure must not turn this
+                // bounded scratch into a fresh allocation on the next burst.
+                let restored = plaintext.return_open_slot(slot, error.plaintext, None);
+                debug_assert!(restored);
+                return Err(WgError::Tunnel(format!("{:?}", error.error)));
+            }
+        };
+        Ok(WgOpenedPacket {
+            opened: Some(opened),
+            slot,
+            batch_id: plaintext.id,
+            batch_epoch: plaintext.epoch,
+            tunnel_instance_id: self.pipeline_instance_id,
+        })
+    }
+
+    /// Return the owned plaintext slot from an uncommitted capability to its
+    /// originating batch. This is used when a complete speculative burst is
+    /// abandoned before its first replay mutation.
+    pub fn abort_opened(opened: &mut WgOpenedPacket, plaintext: &mut WgPlaintextBatch) {
+        let Some(vendor_opened) = opened.opened.take() else {
+            return;
+        };
+        if opened.batch_id == plaintext.id
+            && opened.batch_epoch == plaintext.epoch
+            && opened.slot < plaintext.packets.len()
+            && opened.slot < plaintext.reserved
+        {
+            let restored =
+                plaintext.return_open_slot(opened.slot, vendor_opened.into_plaintext(), None);
+            debug_assert!(restored);
+        }
+        // A malformed public capability should never panic. Its exceptional
+        // owned slot is dropped rather than being installed in another batch.
+    }
+
+    /// Commit after whole-burst revalidation. `Stale` never mutates state.
+    pub fn commit_opened(
+        &mut self,
+        opened: &mut WgOpenedPacket,
+        plaintext: &mut WgPlaintextBatch,
+    ) -> Result<WgCommitResult, WgError> {
+        // Taking the vendor token makes this capability single-use, including
+        // when a caller tries a substituted input or destination.
+        let Some(vendor_opened) = opened.opened.take() else {
+            return Ok(WgCommitResult::Stale);
+        };
+        if opened.tunnel_instance_id != self.pipeline_instance_id
+            || opened.batch_id != plaintext.id
+            || opened.batch_epoch != plaintext.epoch
+            || opened.slot >= plaintext.packets.len()
+            || opened.slot >= plaintext.reserved
+        {
+            if opened.batch_id == plaintext.id
+                && opened.batch_epoch == plaintext.epoch
+                && opened.slot < plaintext.packets.len()
+                && opened.slot < plaintext.reserved
+            {
+                let restored =
+                    plaintext.return_open_slot(opened.slot, vendor_opened.into_plaintext(), None);
+                debug_assert!(restored);
+            }
+            return Ok(WgCommitResult::Stale);
+        }
+        match self.tunn.commit_opened_data(vendor_opened) {
+            Ok((packet, Some(len))) => Ok(
+                if plaintext.return_open_slot(opened.slot, packet, Some(len)) {
+                    WgCommitResult::Accepted
+                } else {
+                    WgCommitResult::Dropped
+                },
+            ),
+            Ok((packet, None)) => {
+                let _ = plaintext.return_open_slot(opened.slot, packet, None);
+                Ok(WgCommitResult::Dropped)
+            }
+            Err(error) => {
+                let restored =
+                    plaintext.return_open_slot(opened.slot, error.into_plaintext(), None);
+                debug_assert!(restored);
+                Ok(WgCommitResult::Stale)
+            }
+        }
+    }
+
+    /// Mutation-free revalidation used before the first commit in a burst.
+    pub fn preflight_opened(&self, opened: &WgOpenedPacket, plaintext: &WgPlaintextBatch) -> bool {
+        let Some(vendor_opened) = opened.opened.as_ref() else {
+            return false;
+        };
+        opened.tunnel_instance_id == self.pipeline_instance_id
+            && opened.batch_id == plaintext.id
+            && opened.batch_epoch == plaintext.epoch
+            && opened.slot < plaintext.packets.len()
+            && opened.slot < plaintext.reserved
+            && self.tunn.validate_opened_data(vendor_opened)
+    }
+
     /// Drive the tunnel's timer state. Returns any datagrams that need to be
     /// sent (handshake retransmissions, keepalives). Call periodically (every
     /// ~250ms per boringtun's convention).
@@ -318,6 +546,11 @@ impl WgTunn {
         while let TunnResult::WriteToNetwork(buf) = self.tunn.update_timers(&mut self.encap_buf[..])
         {
             out.push(buf.to_vec());
+        }
+        // Timer ticks themselves do not change established-data eligibility;
+        // emitted handshake/keepalive output can, so invalidate precisely then.
+        if !out.is_empty() {
+            self.tunn.invalidate_pipeline_generation();
         }
         out
     }
@@ -724,5 +957,388 @@ mod tests {
             Some(scalar),
             "encapsulate_into follows the existing encapsulate behavior"
         );
+    }
+
+    #[test]
+    fn speculative_slots_retain_normal_packet_capacity_not_64k_each() {
+        let mut plaintext = WgPlaintextBatch::new();
+        for _ in 0..WgPlaintextBatch::MAX_PACKETS {
+            let (index, slot) = plaintext.take_open_slot(1500).expect("slot");
+            assert_eq!(slot.len(), 1500);
+            assert!(plaintext.return_open_slot(index, slot, None));
+        }
+        let retained: usize = plaintext.packets.iter().map(Vec::capacity).sum();
+        assert!(
+            retained <= WgPlaintextBatch::MAX_PACKETS * 2048,
+            "normal speculative burst retained {retained} bytes"
+        );
+    }
+
+    #[test]
+    fn corrupt_tag_open_restores_the_warmed_plaintext_slot() {
+        let sender_private = NodePrivate::generate();
+        let receiver_private = NodePrivate::generate();
+        let mut sender =
+            WgTunn::new(&sender_private, &receiver_private.public(), 63).expect("sender tunnel");
+        let mut receiver =
+            WgTunn::new(&receiver_private, &sender_private.public(), 64).expect("receiver tunnel");
+        handshake(&mut sender, &mut receiver);
+
+        let packet = make_ipv4_packet(b"warm and corrupt");
+        let ciphertext = sender
+            .encapsulate(&packet)
+            .expect("encrypt")
+            .pop()
+            .expect("data packet");
+        let mut plaintext = WgPlaintextBatch::new();
+
+        let mut warmed = receiver
+            .open_prepared_into(
+                &ciphertext,
+                &receiver.preflight_data(&ciphertext).expect("preflight"),
+                &mut plaintext,
+            )
+            .expect("warm open");
+        WgTunn::abort_opened(&mut warmed, &mut plaintext);
+        let pointer = plaintext.packets[0].as_ptr();
+        let capacity = plaintext.packets[0].capacity();
+        assert_eq!(plaintext.reserved, 0);
+
+        let mut corrupt = ciphertext.clone();
+        *corrupt.last_mut().expect("tag") ^= 1;
+        let prepared = receiver.preflight_data(&corrupt).expect("header preflight");
+        assert!(receiver
+            .open_prepared_into(&corrupt, &prepared, &mut plaintext)
+            .is_err());
+        assert_eq!(plaintext.reserved, 0);
+        assert_eq!(plaintext.len(), 0);
+        assert_eq!(plaintext.packets[0].as_ptr(), pointer);
+        assert_eq!(plaintext.packets[0].capacity(), capacity);
+        assert!(receiver.preflight_data(&ciphertext).is_ok());
+    }
+
+    #[test]
+    fn speculative_preflight_rejects_jumbo_burst_without_retaining_jumbo_slots() {
+        let private = NodePrivate::generate();
+        let tunnel = WgTunn::new(&private, &NodePrivate::generate().public(), 60).expect("tunnel");
+        let jumbo = vec![0_u8; MAX_WG_MSG];
+        let mut plaintext = WgPlaintextBatch::new();
+        for _ in 0..WgPlaintextBatch::MAX_PACKETS {
+            assert!(matches!(
+                tunnel.preflight_data(&jumbo),
+                Err(WgError::PlaintextTooLarge)
+            ));
+        }
+        assert!(plaintext.packets.is_empty());
+        assert_eq!(plaintext.reserved, 0);
+        // Keep the compiler from considering this test's empty batch unused:
+        // the invariant is that the preflight path never touches its slots.
+        plaintext.clear();
+    }
+
+    #[test]
+    fn speculative_commit_matches_scalar_replay_drops() {
+        let a_private = NodePrivate::generate();
+        let b_private = NodePrivate::generate();
+        let mut sender = WgTunn::new(&a_private, &b_private.public(), 61).expect("sender");
+        let mut receiver = WgTunn::new(&b_private, &a_private.public(), 62).expect("receiver");
+        handshake(&mut sender, &mut receiver);
+
+        let first = sender
+            .encapsulate(&make_ipv4_packet(b"first"))
+            .unwrap()
+            .pop()
+            .unwrap();
+        let second = sender
+            .encapsulate(&make_ipv4_packet(b"second"))
+            .unwrap()
+            .pop()
+            .unwrap();
+        let mut plaintext = WgPlaintextBatch::new();
+        let mut second_opened = receiver
+            .open_prepared_into(
+                &second,
+                &receiver.preflight_data(&second).unwrap(),
+                &mut plaintext,
+            )
+            .unwrap();
+        let mut first_opened = receiver
+            .open_prepared_into(
+                &first,
+                &receiver.preflight_data(&first).unwrap(),
+                &mut plaintext,
+            )
+            .unwrap();
+        assert!(matches!(
+            receiver
+                .commit_opened(&mut second_opened, &mut plaintext)
+                .unwrap(),
+            WgCommitResult::Accepted
+        ));
+        assert!(matches!(
+            receiver
+                .commit_opened(&mut first_opened, &mut plaintext)
+                .unwrap(),
+            WgCommitResult::Accepted
+        ));
+
+        let duplicate = sender
+            .encapsulate(&make_ipv4_packet(b"duplicate"))
+            .unwrap()
+            .pop()
+            .unwrap();
+        let duplicate_prepared = receiver.preflight_data(&duplicate).unwrap();
+        let mut duplicate_opened = receiver
+            .open_prepared_into(&duplicate, &duplicate_prepared, &mut plaintext)
+            .unwrap();
+        let mut replay_opened = receiver
+            .open_prepared_into(&duplicate, &duplicate_prepared, &mut plaintext)
+            .unwrap();
+        assert!(matches!(
+            receiver
+                .commit_opened(&mut duplicate_opened, &mut plaintext)
+                .unwrap(),
+            WgCommitResult::Accepted
+        ));
+        assert!(matches!(
+            receiver
+                .commit_opened(&mut replay_opened, &mut plaintext)
+                .unwrap(),
+            WgCommitResult::Dropped
+        ));
+
+        let old = sender
+            .encapsulate(&make_ipv4_packet(b"old"))
+            .unwrap()
+            .pop()
+            .unwrap();
+        let mut high = old.clone();
+        for _ in 0..1025 {
+            high = sender
+                .encapsulate(&make_ipv4_packet(b"gap"))
+                .unwrap()
+                .pop()
+                .unwrap();
+        }
+        let mut high_opened = receiver
+            .open_prepared_into(
+                &high,
+                &receiver.preflight_data(&high).unwrap(),
+                &mut plaintext,
+            )
+            .unwrap();
+        let mut old_opened = receiver
+            .open_prepared_into(
+                &old,
+                &receiver.preflight_data(&old).unwrap(),
+                &mut plaintext,
+            )
+            .unwrap();
+        assert!(matches!(
+            receiver
+                .commit_opened(&mut high_opened, &mut plaintext)
+                .unwrap(),
+            WgCommitResult::Accepted
+        ));
+        assert!(matches!(
+            receiver
+                .commit_opened(&mut old_opened, &mut plaintext)
+                .unwrap(),
+            WgCommitResult::Dropped
+        ));
+    }
+
+    #[test]
+    fn opened_capability_rejects_substitution_batch_and_reuse() {
+        let sender_private = NodePrivate::generate();
+        let receiver_private = NodePrivate::generate();
+        let mut sender =
+            WgTunn::new(&sender_private, &receiver_private.public(), 71).expect("sender");
+        let mut receiver =
+            WgTunn::new(&receiver_private, &sender_private.public(), 72).expect("receiver");
+        handshake(&mut sender, &mut receiver);
+
+        let first = sender
+            .encapsulate(&make_ipv4_packet(b"capability first"))
+            .expect("encrypt first")
+            .pop()
+            .expect("data first");
+        let mut first_batch = WgPlaintextBatch::new();
+        let mut other_batch = WgPlaintextBatch::new();
+
+        let mut substituted = receiver
+            .open_prepared_into(
+                &first,
+                &receiver.preflight_data(&first).expect("preflight first"),
+                &mut first_batch,
+            )
+            .expect("open first");
+        assert!(matches!(
+            receiver
+                .commit_opened(&mut substituted, &mut other_batch)
+                .expect("substitution result"),
+            WgCommitResult::Stale
+        ));
+        assert!(
+            receiver.preflight_data(&first).is_ok(),
+            "substitution mutated state"
+        );
+
+        let mut wrong_batch = receiver
+            .open_prepared_into(
+                &first,
+                &receiver
+                    .preflight_data(&first)
+                    .expect("preflight first again"),
+                &mut first_batch,
+            )
+            .expect("open first again");
+        assert!(matches!(
+            receiver
+                .commit_opened(&mut wrong_batch, &mut other_batch)
+                .expect("wrong-batch result"),
+            WgCommitResult::Stale
+        ));
+        assert!(
+            receiver.preflight_data(&first).is_ok(),
+            "wrong batch mutated state"
+        );
+
+        let mut reusable = receiver
+            .open_prepared_into(
+                &first,
+                &receiver
+                    .preflight_data(&first)
+                    .expect("preflight valid commit"),
+                &mut first_batch,
+            )
+            .expect("open valid commit");
+        assert!(matches!(
+            receiver
+                .commit_opened(&mut reusable, &mut first_batch)
+                .expect("valid commit"),
+            WgCommitResult::Accepted
+        ));
+        assert!(matches!(
+            receiver
+                .commit_opened(&mut reusable, &mut first_batch)
+                .expect("reuse result"),
+            WgCommitResult::Stale
+        ));
+    }
+
+    #[test]
+    fn opened_capability_rejects_modified_body_reopened_slot_and_other_tunnel() {
+        let sender_private = NodePrivate::generate();
+        let receiver_private = NodePrivate::generate();
+        let mut sender = WgTunn::new(&sender_private, &receiver_private.public(), 73).unwrap();
+        let mut receiver = WgTunn::new(&receiver_private, &sender_private.public(), 74).unwrap();
+        let mut other_receiver =
+            WgTunn::new(&receiver_private, &sender_private.public(), 75).unwrap();
+        handshake(&mut sender, &mut receiver);
+        let datagram = sender
+            .encapsulate(&make_ipv4_packet(b"opaque input binding"))
+            .unwrap()
+            .pop()
+            .unwrap();
+        let mut batch = WgPlaintextBatch::new();
+        let mut other_batch = WgPlaintextBatch::new();
+        let mut modified_body = receiver
+            .open_prepared_into(
+                &datagram,
+                &receiver.preflight_data(&datagram).unwrap(),
+                &mut batch,
+            )
+            .unwrap();
+        // The commit API deliberately accepts no replacement ciphertext or
+        // destination. A separate caller copy cannot affect this authenticated
+        // capability; wrong-batch use is stale without mutating the tunnel.
+        assert!(matches!(
+            receiver
+                .commit_opened(&mut modified_body, &mut other_batch)
+                .unwrap(),
+            WgCommitResult::Stale
+        ));
+        assert!(
+            receiver.preflight_data(&datagram).is_ok(),
+            "wrong batch mutated state"
+        );
+
+        let mut old_slot = receiver
+            .open_prepared_into(
+                &datagram,
+                &receiver.preflight_data(&datagram).unwrap(),
+                &mut batch,
+            )
+            .unwrap();
+        batch.clear();
+        let _new_slot = receiver
+            .open_prepared_into(
+                &datagram,
+                &receiver.preflight_data(&datagram).unwrap(),
+                &mut batch,
+            )
+            .unwrap();
+        assert!(matches!(
+            receiver.commit_opened(&mut old_slot, &mut batch).unwrap(),
+            WgCommitResult::Stale
+        ));
+        assert!(
+            receiver.preflight_data(&datagram).is_ok(),
+            "old slot token mutated state"
+        );
+
+        let mut other_tunnel = receiver
+            .open_prepared_into(
+                &datagram,
+                &receiver.preflight_data(&datagram).unwrap(),
+                &mut batch,
+            )
+            .unwrap();
+        assert!(matches!(
+            other_receiver
+                .commit_opened(&mut other_tunnel, &mut batch)
+                .unwrap(),
+            WgCommitResult::Stale
+        ));
+        assert!(
+            receiver.preflight_data(&datagram).is_ok(),
+            "other tunnel mutated state"
+        );
+    }
+
+    #[test]
+    fn scalar_jumbo_fallback_releases_oversize_capacity_from_both_scratch_batches() {
+        let sender_private = NodePrivate::generate();
+        let receiver_private = NodePrivate::generate();
+        let mut sender =
+            WgTunn::new(&sender_private, &receiver_private.public(), 76).expect("sender");
+        let mut receiver =
+            WgTunn::new(&receiver_private, &sender_private.public(), 77).expect("receiver");
+        handshake(&mut sender, &mut receiver);
+        let jumbo = make_ipv4_packet(&vec![0x5a; MAX_PIPELINED_ENCRYPTED_BODY + 512]);
+        let normal = make_ipv4_packet(&vec![0x5a; 1400]);
+        let mut first = WgPlaintextBatch::new();
+        let mut second = WgPlaintextBatch::new();
+        for _ in 0..2 {
+            for batch in [&mut first, &mut second] {
+                let jumbo_datagram = sender.encapsulate(&jumbo).unwrap().pop().unwrap();
+                receiver.decapsulate_into(&jumbo_datagram, batch).unwrap();
+                batch.clear();
+                batch.release_oversized_slots();
+                let normal_datagram = sender.encapsulate(&normal).unwrap().pop().unwrap();
+                receiver.decapsulate_into(&normal_datagram, batch).unwrap();
+                batch.clear();
+            }
+        }
+        let retained: usize = first
+            .packets
+            .iter()
+            .chain(&second.packets)
+            .map(Vec::capacity)
+            .sum();
+        assert!(retained <= 2 * MAX_PIPELINED_ENCRYPTED_BODY);
+        assert!(first.packets[0].capacity() >= normal.len());
+        assert!(second.packets[0].capacity() >= normal.len());
     }
 }

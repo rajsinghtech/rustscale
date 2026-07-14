@@ -233,8 +233,6 @@ dependencies = [
 [[package]]
 name = "boringtun"
 version = "0.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "15dd6a8a89cbe8997f37ca0cf035e6ea4d64cd2ecea4aed83ffb9f99f7126939"
 dependencies = [
  "aead",
  "base64",
@@ -3137,6 +3135,17 @@ dependencies = [
  "sha2",
  "thiserror 1.0.69",
  "tokio",
+]
+
+[[package]]
+name = "rustscale-syspolicy"
+version = "0.1.1"
+dependencies = [
+ "log",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
 ]
 
 [[package]]

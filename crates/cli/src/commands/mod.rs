@@ -19,6 +19,7 @@ pub mod netcheck;
 pub mod ping;
 pub mod serve;
 pub mod set;
+pub mod speedtest;
 pub mod ssh;
 pub mod status;
 pub mod switch;

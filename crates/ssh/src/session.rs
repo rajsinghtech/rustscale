@@ -1,7 +1,7 @@
 //! SSH session type — ports Go's `ssh/tailssh/session.go`.
 #![allow(dead_code)]
 
-use crate::recording::{RecordDir, RecordResult, SessionRecorder};
+use crate::recording::{RecordDir, RecordResult, RecordingConfig, SessionRecorder};
 use russh::{ChannelId, Sig};
 use rustscale_tailcfg::{Node, UserProfile};
 use std::net::SocketAddr;
@@ -40,6 +40,7 @@ pub struct SessionInit {
     pub done_tx: mpsc::Sender<()>,
     /// Optional session recorder for capturing PTY output.
     pub recorder: Option<SessionRecorder>,
+    pub recording_config: Option<RecordingConfig>,
     /// Receiver for SSH signals (SIGINT, SIGTERM, etc.) forwarded by
     /// SshHandler::signal. Mirrors Go's signal handling in handleSession.
     pub signal_rx: mpsc::Receiver<Sig>,
@@ -63,6 +64,7 @@ pub struct Session {
     done_tx: Option<mpsc::Sender<()>>,
     closed: bool,
     recorder: Option<SessionRecorder>,
+    recording_config: Option<RecordingConfig>,
     signal_rx: mpsc::Receiver<Sig>,
     window_change_rx: mpsc::Receiver<Window>,
     peer_addr: Option<SocketAddr>,
@@ -83,6 +85,7 @@ impl Session {
             done_tx: Some(init.done_tx),
             closed: false,
             recorder: init.recorder,
+            recording_config: init.recording_config,
             signal_rx: init.signal_rx,
             window_change_rx: init.window_change_rx,
             peer_addr: init.peer_addr,
@@ -119,6 +122,9 @@ impl Session {
     /// Take the session recorder out of the Session, leaving None in its place.
     pub fn take_recorder(&mut self) -> Option<SessionRecorder> {
         self.recorder.take()
+    }
+    pub fn take_recording_config(&mut self) -> Option<RecordingConfig> {
+        self.recording_config.take()
     }
     /// Returns the russh server handle (for sending data/extended_data/exit).
     pub fn handle(&self) -> &russh::server::Handle {

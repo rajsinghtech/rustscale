@@ -10,6 +10,9 @@ use std::net::IpAddr;
 pub enum EvalResult {
     Accept {
         action: SSHAction,
+        /// First matching action, used as recorder fallback when the final
+        /// action doesn't name recorder nodes.
+        action0: Option<SSHAction>,
         local_user: String,
         accept_env: Vec<String>,
     },
@@ -29,6 +32,7 @@ pub struct ConnInfo {
 
 pub fn eval_ssh_policy(policy: &SSHPolicy, info: &ConnInfo) -> EvalResult {
     let mut failed_on_user = false;
+    let mut action0 = None;
     for rule in &policy.Rules {
         match match_rule(rule, info) {
             Ok(MatchedRule {
@@ -36,8 +40,12 @@ pub fn eval_ssh_policy(policy: &SSHPolicy, info: &ConnInfo) -> EvalResult {
                 local_user,
                 accept_env,
             }) => {
+                if action0.is_none() {
+                    action0 = Some(action.clone());
+                }
                 return EvalResult::Accept {
                     action,
+                    action0,
                     local_user,
                     accept_env,
                 };

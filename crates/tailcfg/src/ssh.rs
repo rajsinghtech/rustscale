@@ -6,7 +6,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{deserialize_null_to_default, skip_default, StableNodeID};
+use crate::{deserialize_null_to_default, skip_default, NodeID, StableNodeID};
 
 /// The policy for how to handle incoming SSH connections over Tailscale.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -121,6 +121,55 @@ pub struct SSHRecorderFailureAction {
     pub TerminateSessionWithMessage: String,
     #[serde(default, skip_serializing_if = "skip_default")]
     pub NotifyURL: String,
+}
+
+/// A single attempt to start recording at a recorder node.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SSHRecordingAttempt {
+    #[serde(rename = "recorder")]
+    pub Recorder: String,
+    #[serde(
+        rename = "failureMessage",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub FailureMessage: String,
+}
+
+/// The type of SSH recording event reported to control.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum SSHEventType {
+    #[default]
+    #[serde(rename = "0")]
+    Unspecified = 0,
+    #[serde(rename = "1")]
+    SessionRecordingRejected = 1,
+    #[serde(rename = "2")]
+    SessionRecordingTerminated = 2,
+    #[serde(rename = "3")]
+    SessionRecordingFailed = 3,
+}
+
+/// SSH recording event payload for the control-plane Noise transport.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SSHEventNotifyRequest {
+    #[serde(rename = "eventType")]
+    pub EventType: SSHEventType,
+    #[serde(rename = "connectionID")]
+    pub ConnectionID: String,
+    #[serde(rename = "capVersion")]
+    pub CapVersion: i32,
+    #[serde(rename = "nodeKey")]
+    pub NodeKey: String,
+    #[serde(rename = "srcNode")]
+    pub SrcNode: NodeID,
+    #[serde(rename = "sshUser")]
+    pub SSHUser: String,
+    #[serde(rename = "localUser")]
+    pub LocalUser: String,
+    #[serde(rename = "recordingAttempts")]
+    pub RecordingAttempts: Vec<SSHRecordingAttempt>,
 }
 
 /// Serde helper for Go's `time.Duration` which marshals as int64 nanoseconds.

@@ -3103,8 +3103,11 @@ name = "rustscale-ssh"
 version = "0.1.1"
 dependencies = [
  "base64",
+ "bytes",
  "chrono",
  "ed25519-dalek",
+ "h2",
+ "http",
  "libc",
  "log",
  "russh",

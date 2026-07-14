@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
-exclude = ["crates/bench-tsrs"]
+exclude = ["crates/bench-tsrs", "vendor/boringtun"]
 
 [workspace.package]
 edition = "2021"
@@ -125,3 +125,8 @@ duration_suboptimal_units = "allow"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+[patch.crates-io]
+# The inbound TUN pipeline needs BoringTun's receive-data prepare/open/commit
+# split. Keep this pinned copy at the version recorded in Cargo.lock.
+boringtun = { path = "vendor/boringtun" }

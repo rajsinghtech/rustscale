@@ -45,20 +45,41 @@ pub struct TunModeConfig {
 /// Simple cancellation token.
 pub(crate) struct CancelToken {
     cancelled: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
 }
 
 impl CancelToken {
     pub(crate) fn new() -> Self {
         Self {
             cancelled: std::sync::atomic::AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
         }
     }
     pub(crate) fn cancel(&self) {
         self.cancelled
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.notify.notify_waiters();
     }
     pub(crate) fn is_cancelled(&self) -> bool {
         self.cancelled.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Wait for cancellation without a lost-notification race.
+    pub(crate) async fn cancelled(&self) {
+        loop {
+            if self.is_cancelled() {
+                return;
+            }
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            // Register before the second load: `notify_waiters` does not
+            // retain a permit for a future waiter.
+            notified.as_mut().enable();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+        }
     }
 }
 /// Ensure the rustls ring crypto provider is installed process-wide.
@@ -99,5 +120,29 @@ pub(crate) fn break_tcp_conns_best_effort() {
         Err(e) => {
             log::warn!("tsnet: break_tcp_conns failed (non-fatal): {e}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CancelToken;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn cancel_token_registered_waiter_wakes_after_cancel_race_window() {
+        let cancel = Arc::new(CancelToken::new());
+        let waiter = tokio::spawn({
+            let cancel = cancel.clone();
+            async move { cancel.cancelled().await }
+        });
+        // Yield after construction so the waiter has registered its Notify
+        // future. `cancelled` performs a second atomic load after enabling
+        // that waiter, which is the notify_waiters race this protects.
+        tokio::task::yield_now().await;
+        cancel.cancel();
+        tokio::time::timeout(std::time::Duration::from_millis(250), waiter)
+            .await
+            .expect("cancelled waiter lost its wake")
+            .expect("cancelled waiter panicked");
     }
 }

@@ -82,6 +82,7 @@ rustscale-speedtest = { path = "crates/speedtest", version = "0.1.1" }
 rustscale-singleflight = { path = "crates/singleflight", version = "0.1.1" }
 rustscale-limiter = { path = "crates/limiter", version = "0.1.1" }
 rustscale-memnet = { path = "crates/memnet", version = "0.1.1" }
+rustscale-art = { path = "crates/art", version = "0.1.1" }
 
 # Shared lint policy: pedantic where sane, but allow the noisier style lints so
 # that the default `cargo clippy` run stays clean and readable.

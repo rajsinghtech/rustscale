@@ -276,7 +276,7 @@ impl Incubator {
                         if !gids.is_empty() {
                             let gids_v: Vec<libc::gid_t> =
                                 gids.iter().map(|&g| g as libc::gid_t).collect();
-                            let ret = libc::setgroups(gids_v.len() as libc::c_int, gids_v.as_ptr());
+                            let ret = libc::setgroups(gids_v.len(), gids_v.as_ptr());
                             if ret != 0 {
                                 return Err(io::Error::last_os_error());
                             }

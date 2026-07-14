@@ -2,7 +2,7 @@ module rustscale-testcontrol
 
 go 1.26.4
 
-require tailscale.com v0.0.0-00010101000000-000000000000
+require tailscale.com v1.100.0
 
 require (
 	filippo.io/edwards25519 v1.2.0 // indirect
@@ -34,5 +34,3 @@ require (
 	golang.org/x/time v0.15.0 // indirect
 	golang.zx2c4.com/wireguard/windows v0.5.3 // indirect
 )
-
-replace tailscale.com => /Users/rajsingh/Documents/GitHub/tailscale

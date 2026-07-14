@@ -19,6 +19,9 @@ peer-relay paths. This is an independent reimplementation; the Tailscale Go
 source is used only as a read-only reference for protocol semantics and wire
 formats.
 
+RustScale is an independent project and is not affiliated with, sponsored by,
+or endorsed by Tailscale Inc.
+
 ## Usage
 
 ### CLI + daemon
@@ -101,10 +104,6 @@ library (`librustscale` + `rustscale.h`) to `/usr/local`. Override the prefix
 with `PREFIX=...`, pin a version with `--version v0.1.1`, skip system service
 setup with `--no-service`, or uninstall with `--uninstall`. Downloads are
 verified against the release's `SHA256SUMS` before extraction.
-
-While the GitHub repository is private, set `GH_TOKEN` to a fine-grained token
-with Contents read access before running either installer. Public one-line and
-Homebrew installation require public release assets.
 
 For scripts that invoke the upstream command names, pass
 `--tailscale-compatible` to install `tailscale` and `tailscaled` aliases. This

@@ -1,7 +1,6 @@
 //! Packet capture sink and pcap encoder.
 //!
-//! The custom payload metadata uses Tailscale's LINKTYPE_USER0 format. See
-//! `docs/phase-capture-pcap.md` for the byte-level layout.
+//! The custom payload metadata uses Tailscale's LINKTYPE_USER0 format.
 
 use std::collections::HashMap;
 use std::io::{self, Write};

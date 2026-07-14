@@ -17,7 +17,7 @@ env:
 jobs:
   e2e:
     name: Ephemeral tailnet E2E
-    # WIF subject binding is repo:rajsinghtech* — forks can't mint the token.
+    # Restrict token minting to the trusted upstream repository.
     if: github.repository == 'rajsinghtech/rustscale'
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -29,7 +29,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
 
-      # Same WIF client tailgate uses; no long-lived secret in CI.
+      # Exchange GitHub's short-lived OIDC identity; no long-lived secret in CI.
       - name: Mint Tailscale org token via GitHub OIDC (WIF)
         id: tsauth
         run: |
@@ -53,8 +53,7 @@ jobs:
           echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
 
       # Creates an ephemeral tailnet, exports TS_E2E_* env for the tests, and
-      # guarantees deletion via the child oauthClient creds (the org client is
-      # tailnets-scope only — see docs/tailnet-testing.md).
+      # guarantees deletion via the child OAuth client credentials.
       - name: Run e2e tests against ephemeral tailnet
         env:
           TS_ORG_TOKEN: ${{ steps.tsauth.outputs.token }}

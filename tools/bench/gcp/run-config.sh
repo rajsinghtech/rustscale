@@ -6,7 +6,7 @@
 #                 AUTHKEY RESULTS_DIR SERVER_HOSTNAME CLIENT_HOSTNAME [--profile]
 #
 # CONFIG ∈ {rs-userspace, rs-tun, ts-userspace, ts-tun}
-# Emits <RESULTS_DIR>/<CONFIG>.json with the schema from docs/phase-gcp-bench.md.
+# Emits <RESULTS_DIR>/<CONFIG>.json with benchmark results and provenance.
 #
 # Environment:
 #   BENCH_MATRIX  — optional, set by run-matrix.sh; "topo/path" for tagging.

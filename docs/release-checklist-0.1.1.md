@@ -1,14 +1,12 @@
 # v0.1.1 release checklist
 
-The repository is prepared for a public-package release contract. Do not push
-the `v0.1.1` tag until the GitHub Actions account-level billing/spending-limit
-block is cleared; currently GitHub rejects jobs before their first step.
+Use this checklist only after the release pull request has passed every
+required GitHub Actions workflow.
 
 ## Before tagging
 
-- Confirm the repository and release assets are public if anonymous one-line,
-  Homebrew, and GHCR installation should work immediately. The installers also
-  accept `GH_TOKEN`/`GITHUB_TOKEN` while the repository remains private.
+- Confirm the repository and release assets are public so anonymous one-line,
+  Homebrew, and GHCR installation work immediately.
 - Confirm Pages is enabled with GitHub Actions as its source.
 - Confirm `HOMEBREW_TAP_GITHUB_TOKEN` can write to
   `rajsinghtech/homebrew-tap`.

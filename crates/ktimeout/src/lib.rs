@@ -1,6 +1,14 @@
 use std::io;
+#[cfg(unix)]
 use std::os::unix::io::{AsRawFd, RawFd};
+#[cfg(windows)]
+use std::os::windows::io::{AsRawSocket, RawSocket};
 use std::time::Duration;
+
+#[cfg(unix)]
+pub type RawSocketHandle = RawFd;
+#[cfg(windows)]
+pub type RawSocketHandle = RawSocket;
 
 /// Sets the TCP user timeout (`TCP_USER_TIMEOUT` on Linux) on the given file
 /// descriptor. The user timeout specifies the maximum age of unacknowledged
@@ -13,7 +21,7 @@ use std::time::Duration;
 /// # Errors
 ///
 /// Returns `io::Error` if the underlying `setsockopt` call fails (Linux only).
-pub fn set_user_timeout(fd: RawFd, timeout: Duration) -> io::Result<()> {
+pub fn set_user_timeout(fd: RawSocketHandle, timeout: Duration) -> io::Result<()> {
     set_user_timeout_impl(fd, timeout)
 }
 
@@ -26,7 +34,13 @@ pub fn set_user_timeout(fd: RawFd, timeout: Duration) -> io::Result<()> {
 ///
 /// Returns `io::Error` if the underlying `setsockopt` call fails (Linux only).
 pub fn user_timeout_control(timeout: Duration) -> impl Fn(&std::net::TcpStream) -> io::Result<()> {
-    move |stream: &std::net::TcpStream| set_user_timeout(stream.as_raw_fd(), timeout)
+    move |stream: &std::net::TcpStream| {
+        #[cfg(unix)]
+        let fd = stream.as_raw_fd();
+        #[cfg(windows)]
+        let fd = stream.as_raw_socket();
+        set_user_timeout(fd, timeout)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -34,7 +48,7 @@ pub fn user_timeout_control(timeout: Duration) -> impl Fn(&std::net::TcpStream) 
 // ---------------------------------------------------------------------------
 
 #[cfg(target_os = "linux")]
-fn set_user_timeout_impl(fd: RawFd, timeout: Duration) -> io::Result<()> {
+fn set_user_timeout_impl(fd: RawSocketHandle, timeout: Duration) -> io::Result<()> {
     let timeout_ms: libc::c_int = timeout.as_millis().try_into().unwrap_or(libc::c_int::MAX);
     let ret = unsafe {
         libc::setsockopt(
@@ -56,7 +70,7 @@ fn set_user_timeout_impl(fd: RawFd, timeout: Duration) -> io::Result<()> {
 // ---------------------------------------------------------------------------
 
 #[cfg(not(target_os = "linux"))]
-fn set_user_timeout_impl(_fd: RawFd, _timeout: Duration) -> io::Result<()> {
+fn set_user_timeout_impl(_fd: RawSocketHandle, _timeout: Duration) -> io::Result<()> {
     Ok(())
 }
 
@@ -76,8 +90,12 @@ mod tests {
         let stream = TcpStream::connect(addr).unwrap();
         let _accepted = listener.accept().unwrap();
 
-        set_user_timeout(stream.as_raw_fd(), Duration::from_secs(30)).unwrap();
-        set_user_timeout(stream.as_raw_fd(), Duration::ZERO).unwrap();
+        #[cfg(unix)]
+        let fd = stream.as_raw_fd();
+        #[cfg(windows)]
+        let fd = stream.as_raw_socket();
+        set_user_timeout(fd, Duration::from_secs(30)).unwrap();
+        set_user_timeout(fd, Duration::ZERO).unwrap();
     }
 
     #[test]

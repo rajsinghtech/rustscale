@@ -1,13 +1,9 @@
 #!/usr/bin/env bash
 # tools/ignore-guard.sh — L6: prevent #[ignore] count from drifting upward.
 #
-# On master (IGNORE_GUARD_MODE=baseline): writes the current #[ignore] count
-# to .github/ignore-baseline.txt.
-#
-# On PRs (IGNORE_GUARD_MODE=check): compares the current count against the
-# baseline. If the count increased, prints the diff and exits 1.
-#
-# See docs/regression-strategy.md L6.
+# In check mode, compares the current count against the tracked baseline. In
+# baseline mode, explicitly refreshes that file after maintainers review newly
+# ignored tests.
 set -euo pipefail
 
 cd "$(git rev-parse --show-toplevel 2>/dev/null || echo .)"
@@ -17,7 +13,13 @@ BASELINE_FILE=".github/ignore-baseline.txt"
 # Count #[ignore] attributes in crates/ (lines starting with #[ignore,
 # not comments that mention #[ignore]).
 count_ignores() {
-  rg '^\s*#\[(ignore|ignore\s*=)' crates/ -c 2>/dev/null | awk -F: '{s+=$2} END{print s+0}'
+  if command -v rg >/dev/null 2>&1; then
+    rg '^\s*#\[(ignore|ignore\s*=)' crates/ -c 2>/dev/null \
+      | awk -F: '{s+=$2} END{print s+0}'
+  else
+    grep -R -h -E '^[[:space:]]*#\[(ignore|ignore[[:space:]]*=)' \
+      --include='*.rs' crates/ 2>/dev/null | awk 'END{print NR+0}'
+  fi
 }
 
 MODE="${IGNORE_GUARD_MODE:-auto}"
@@ -49,7 +51,7 @@ fi
 BASELINE=$(cat "$BASELINE_FILE" | tr -d '[:space:]')
 
 if [ "$CURRENT" -gt "$BASELINE" ]; then
-  echo "#[ignore] count increased ($BASELINE -> $CURRENT). Add a Regression-Exception: trailer to the commit or fix the test. See docs/regression-strategy.md L6."
+  echo "#[ignore] count increased ($BASELINE -> $CURRENT). Re-enable the test or update the reviewed baseline."
   exit 1
 fi
 

@@ -12,16 +12,15 @@ output.
 tools/gen-wire-fixtures.sh
 ```
 
-This writes a temporary Go program to `/tmp/gen_wire_fixtures.go`, runs it
-inside the Tailscale Go module (`/Users/rajsingh/Documents/GitHub/tailscale`),
-and writes fixtures to this directory. Requirements:
+This writes a temporary Go module, downloads the pinned `tailscale.com` module
+published from `github.com/tailscale/tailscale`, and writes fixtures to this
+directory. Requirements:
 
-- Go 1.26+ (`/opt/homebrew/bin/go`)
-- The Tailscale Go repo at `/Users/rajsingh/Documents/GitHub/tailscale`
+- Go 1.26+
 
 Override paths via environment:
 ```bash
-TAILSCALE_GO_REPO=/path/to/tailscale GO_BIN=/path/to/go tools/gen-wire-fixtures.sh
+TAILSCALE_GO_VERSION=v1.100.0 GO_BIN=/path/to/go tools/gen-wire-fixtures.sh
 ```
 
 ## Fixture inventory

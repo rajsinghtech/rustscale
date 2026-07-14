@@ -50,7 +50,7 @@ pub use relay_manager::{
 pub use relay_server::RelayServerExtension;
 
 use std::collections::HashMap;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 #[cfg(test)]
@@ -100,7 +100,7 @@ const WIRE_MTUS_TO_PROBE: &[usize] = &[1280, 1320, 1400, 1500, 8000, 9000];
 
 /// Whether a kernel-received UDP packet must use the established scalar
 /// handler. The fast handoff only applies to ordinary direct WireGuard UDP.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 fn udp_batch_needs_scalar_handler(data: &[u8]) -> bool {
     DiscoIo::looks_like_disco(data)
         || relay::looks_like_geneve_disco(data)
@@ -110,7 +110,7 @@ fn udp_batch_needs_scalar_handler(data: &[u8]) -> bool {
 /// Whether a Linux kernel receive batch must stay on the established scalar
 /// path. One control or malformed entry keeps the *entire* burst scalar so
 /// routing updates and ordinary WireGuard packets retain receive order.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 fn linux_batch_requires_scalar_handler<'a>(
     packets: impl IntoIterator<Item = Option<&'a [u8]>>,
 ) -> bool {
@@ -159,7 +159,7 @@ async fn publish_wg_batch(
 /// Publish a Linux direct receive burst after all borrowed socket storage has
 /// been copied into owned datagrams. Moving the staging Vec into the channel
 /// item ensures no `ReceiveBatch` borrow crosses the capacity await.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 async fn publish_linux_wg_batch(
     sender: &mpsc::Sender<WgReceiveBatch>,
     credits: &Arc<Semaphore>,
@@ -170,28 +170,55 @@ async fn publish_linux_wg_batch(
 }
 
 /// Identify and copy ordinary direct WireGuard packets in receive order while
-/// the caller holds its one address-map and endpoints-map snapshots.
-#[cfg(target_os = "linux")]
+/// the caller holds its one address-map and endpoints-map snapshots. Adjacent
+/// packets from one source share one peer and endpoint lookup; a source seen
+/// again after another source begins a new run.
+#[cfg(any(target_os = "linux", test))]
 fn stage_linux_wg_datagrams<'a>(
     packets: impl IntoIterator<Item = (&'a [u8], SocketAddr)>,
     peers: &HashMap<SocketAddr, NodePublic>,
     endpoints: &mut HashMap<NodePublic, Endpoint>,
     pending: &mut Vec<WgDatagram>,
-    mut record_rx: impl FnMut(SocketAddr, usize),
+    mut note_recv_udp: impl FnMut(&NodePublic, &mut Endpoint, std::time::Instant),
+    mut record_rx: impl FnMut(usize, usize),
 ) {
-    for (data, addr) in packets {
-        record_rx(addr, data.len());
-        let Some(peer) = peers.get(&addr).cloned() else {
-            continue;
-        };
-        if let Some(endpoint) = endpoints.get_mut(&peer) {
-            endpoint.note_recv_udp(std::time::Instant::now());
+    let mut packets = packets.into_iter().peekable();
+    let now = std::time::Instant::now();
+    let (mut udp4_rx_bytes, mut udp6_rx_bytes) = (0, 0);
+
+    while let Some((mut data, addr)) = packets.next() {
+        let peer = peers.get(&addr);
+        if let Some(peer) = peer {
+            if let Some(endpoint) = endpoints.get_mut(peer) {
+                note_recv_udp(peer, endpoint, now);
+            }
         }
-        pending.push(WgDatagram {
-            peer,
-            data: data.to_vec(),
-        });
+
+        let mut run_bytes = 0;
+        loop {
+            run_bytes += data.len();
+            if let Some(peer) = peer {
+                pending.push(WgDatagram {
+                    peer: peer.clone(),
+                    data: data.to_vec(),
+                });
+            }
+
+            let Some((next_data, _next_addr)) =
+                packets.next_if(|(_, next_addr)| *next_addr == addr)
+            else {
+                break;
+            };
+            data = next_data;
+        }
+
+        match addr {
+            SocketAddr::V4(_) => udp4_rx_bytes += run_bytes,
+            SocketAddr::V6(_) => udp6_rx_bytes += run_bytes,
+        }
     }
+
+    record_rx(udp4_rx_bytes, udp6_rx_bytes);
 }
 
 /// Size of a complete disco ping packet without any padding.
@@ -201,7 +228,7 @@ const DISCO_PING_SIZE: usize = 124;
 
 /// Advance one Linux direct-batch attempt. This deliberately small seam keeps
 /// partial-send/error policy deterministic without abstracting the UDP socket.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 fn advance_direct_batch(
     head: &mut usize,
     len: usize,
@@ -2462,6 +2489,22 @@ impl Inner {
         }
     }
 
+    /// Record the aggregate direct-receive bytes from one Linux kernel batch.
+    /// Each populated address family performs one relaxed counter update.
+    #[cfg(target_os = "linux")]
+    fn record_linux_udp_batch_rx(&self, udp4_rx_bytes: usize, udp6_rx_bytes: usize) {
+        if udp4_rx_bytes != 0 {
+            if let Some(ref h) = self.sockstats_udp4 {
+                h.record_rx(udp4_rx_bytes);
+            }
+        }
+        if udp6_rx_bytes != 0 {
+            if let Some(ref h) = self.sockstats_udp6 {
+                h.record_rx(udp6_rx_bytes);
+            }
+        }
+    }
+
     /// Send a disco ping to `addr` for `peer_key` with the given purpose.
     /// When PMTUD is enabled and the purpose is `Discovery`, sends multiple
     /// pings at sizes from `WIRE_MTUs_TOProbe`. Mirrors Go's
@@ -2597,7 +2640,10 @@ impl Inner {
                 &peers,
                 &mut endpoints,
                 pending,
-                |addr, len| self.record_udp_rx(addr, len),
+                |_, endpoint, now| endpoint.note_recv_udp(now),
+                |udp4_rx_bytes, udp6_rx_bytes| {
+                    self.record_linux_udp_batch_rx(udp4_rx_bytes, udp6_rx_bytes);
+                },
             );
         }
         false
@@ -3224,9 +3270,13 @@ fn short_key(k: &NodePublic) -> String {
     hex::encode(&k.raw32()[..4])
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 mod linux_batch_tests {
     use super::*;
+
+    fn endpoint(peer: NodePublic) -> Endpoint {
+        Endpoint::new(peer, DiscoPrivate::generate().public(), 0)
+    }
 
     fn pending(count: usize) -> Vec<WgDatagram> {
         let peer = NodePrivate::generate().public();
@@ -3277,6 +3327,7 @@ mod linux_batch_tests {
         assert!(error.is_none());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn lost_error_skips_only_its_head() {
         let (head, accounted, error) = advance_sequence(
@@ -3344,7 +3395,7 @@ mod linux_batch_tests {
         let b_addr: SocketAddr = "127.0.0.1:10002".parse().unwrap();
         let unknown_addr: SocketAddr = "127.0.0.1:10003".parse().unwrap();
         let peers = HashMap::from([(a_addr, a.clone()), (b_addr, b.clone())]);
-        let packets = vec![
+        let packets = [
             (b"a-first".to_vec(), a_addr),
             (b"unknown".to_vec(), unknown_addr),
             (b"b-only".to_vec(), b_addr),
@@ -3353,18 +3404,20 @@ mod linux_batch_tests {
         let mut endpoints = HashMap::new();
         let mut pending = Vec::new();
         let mut accounted = Vec::new();
+        let mut noted = Vec::new();
         stage_linux_wg_datagrams(
             packets.iter().map(|(data, addr)| (data.as_slice(), *addr)),
             &peers,
             &mut endpoints,
             &mut pending,
-            |addr, len| accounted.push((addr, len)),
+            |peer, endpoint, now| {
+                noted.push((peer.clone(), now));
+                endpoint.note_recv_udp(now);
+            },
+            |udp4_bytes, udp6_bytes| accounted.push((udp4_bytes, udp6_bytes)),
         );
-        assert_eq!(
-            accounted.len(),
-            packets.len(),
-            "sockstats sees every packet"
-        );
+        assert_eq!(accounted, [(26, 0)], "sockstats sees every packet");
+        assert_eq!(noted, [], "no endpoint means no activity callback");
         assert_eq!(
             pending
                 .iter()
@@ -3376,6 +3429,162 @@ mod linux_batch_tests {
                 (a, b"a-last".to_vec()),
             ]
         );
+    }
+
+    #[test]
+    fn direct_128_same_source_stages_in_exact_order_with_one_endpoint_note() {
+        let peer = NodePrivate::generate().public();
+        let addr: SocketAddr = "127.0.0.1:10001".parse().unwrap();
+        let peers = HashMap::from([(addr, peer.clone())]);
+        let packets = (0..WG_RECEIVE_BATCH_MAX_PACKETS)
+            .map(|index| (vec![index as u8], addr))
+            .collect::<Vec<_>>();
+        let mut endpoints = HashMap::from([(peer.clone(), endpoint(peer.clone()))]);
+        let mut pending = Vec::new();
+        let mut noted = Vec::new();
+        let mut accounted = Vec::new();
+
+        stage_linux_wg_datagrams(
+            packets.iter().map(|(data, addr)| (data.as_slice(), *addr)),
+            &peers,
+            &mut endpoints,
+            &mut pending,
+            |peer, endpoint, now| {
+                noted.push((peer.clone(), now));
+                endpoint.note_recv_udp(now);
+            },
+            |udp4_bytes, udp6_bytes| accounted.push((udp4_bytes, udp6_bytes)),
+        );
+
+        assert_eq!(noted.len(), 1);
+        assert_eq!(noted[0].0, peer);
+        assert_eq!(accounted, [(WG_RECEIVE_BATCH_MAX_PACKETS, 0)]);
+        assert_eq!(
+            pending
+                .into_iter()
+                .map(|datagram| datagram.data)
+                .collect::<Vec<_>>(),
+            (0..WG_RECEIVE_BATCH_MAX_PACKETS)
+                .map(|index| vec![index as u8])
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn direct_source_runs_do_not_merge_across_an_intervening_address() {
+        let a = NodePrivate::generate().public();
+        let b = NodePrivate::generate().public();
+        let a_addr: SocketAddr = "127.0.0.1:10001".parse().unwrap();
+        let b_addr: SocketAddr = "127.0.0.1:10002".parse().unwrap();
+        let peers = HashMap::from([(a_addr, a.clone()), (b_addr, b.clone())]);
+        let packets = [
+            (b"a-1".to_vec(), a_addr),
+            (b"a-2".to_vec(), a_addr),
+            (b"b-1".to_vec(), b_addr),
+            (b"a-3".to_vec(), a_addr),
+        ];
+        let mut endpoints = HashMap::from([
+            (a.clone(), endpoint(a.clone())),
+            (b.clone(), endpoint(b.clone())),
+        ]);
+        let mut pending = Vec::new();
+        let mut noted = Vec::new();
+
+        stage_linux_wg_datagrams(
+            packets.iter().map(|(data, addr)| (data.as_slice(), *addr)),
+            &peers,
+            &mut endpoints,
+            &mut pending,
+            |peer, endpoint, now| {
+                noted.push((peer.clone(), now));
+                endpoint.note_recv_udp(now);
+            },
+            |_, _| {},
+        );
+
+        assert_eq!(
+            noted.iter().map(|(peer, _)| peer).collect::<Vec<_>>(),
+            [&a, &b, &a],
+        );
+        assert!(
+            noted.windows(2).all(|notes| notes[0].1 == notes[1].1),
+            "all run activity uses one batch timestamp"
+        );
+        assert_eq!(
+            pending
+                .into_iter()
+                .map(|datagram| datagram.data)
+                .collect::<Vec<_>>(),
+            vec![
+                b"a-1".to_vec(),
+                b"a-2".to_vec(),
+                b"b-1".to_vec(),
+                b"a-3".to_vec(),
+            ],
+        );
+    }
+
+    #[test]
+    fn direct_unknown_sources_are_dropped_but_bytes_are_counted() {
+        let unknown4: SocketAddr = "127.0.0.1:10003".parse().unwrap();
+        let unknown6: SocketAddr = "[::1]:10003".parse().unwrap();
+        let packets = [(b"four".to_vec(), unknown4), (b"sixsix".to_vec(), unknown6)];
+        let mut pending = Vec::new();
+        let mut accounted = Vec::new();
+
+        stage_linux_wg_datagrams(
+            packets.iter().map(|(data, addr)| (data.as_slice(), *addr)),
+            &HashMap::new(),
+            &mut HashMap::new(),
+            &mut pending,
+            |_, _, _| panic!("unknown sources do not note endpoints"),
+            |udp4_bytes, udp6_bytes| accounted.push((udp4_bytes, udp6_bytes)),
+        );
+
+        assert!(pending.is_empty());
+        assert_eq!(accounted, [(4, 6)]);
+    }
+
+    #[test]
+    fn direct_batch_aggregates_ipv4_and_ipv6_rx_bytes() {
+        let v4: SocketAddr = "127.0.0.1:10004".parse().unwrap();
+        let v6: SocketAddr = "[::1]:10004".parse().unwrap();
+        let packets = [
+            (b"one".to_vec(), v4),
+            (b"twotwo".to_vec(), v6),
+            (b"tri".to_vec(), v4),
+        ];
+        let mut totals = Vec::new();
+
+        stage_linux_wg_datagrams(
+            packets.iter().map(|(data, addr)| (data.as_slice(), *addr)),
+            &HashMap::new(),
+            &mut HashMap::new(),
+            &mut Vec::new(),
+            |_, _, _| unreachable!(),
+            |udp4_bytes, udp6_bytes| totals.push((udp4_bytes, udp6_bytes)),
+        );
+
+        assert_eq!(totals, [(6, 6)]);
+    }
+
+    #[test]
+    fn direct_empty_batch_has_no_endpoint_activity_or_bytes() {
+        let mut noted = false;
+        let mut totals = Vec::new();
+        let mut pending = Vec::new();
+        stage_linux_wg_datagrams(
+            std::iter::empty(),
+            &HashMap::new(),
+            &mut HashMap::new(),
+            &mut pending,
+            |_, _, _| noted = true,
+            |udp4_bytes, udp6_bytes| totals.push((udp4_bytes, udp6_bytes)),
+        );
+
+        assert!(!noted);
+        assert!(pending.is_empty());
+        assert_eq!(totals, [(0, 0)]);
     }
 
     #[tokio::test]

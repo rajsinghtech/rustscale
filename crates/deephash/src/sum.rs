@@ -1,7 +1,7 @@
 use std::fmt;
 
 /// A SHA-256 structural checksum.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct Sum(pub(crate) [u8; 32]);
 
 impl Sum {

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{BuildHasher, Hash};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
@@ -6,7 +6,6 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use rustscale_ipn::{AppConnectorPrefs, MaskedPrefs, Prefs, State};
 use rustscale_key::{DiscoPublic, MachinePublic, NodePublic};
-use rustscale_portmapper::GatewayInfo;
 use rustscale_tailcfg::{
     CapGrant, ClientVersion, DNSConfig, DNSRecord, EndpointType, FilterRule, Hostinfo, Location,
     MapResponse, NetInfo, NetPortRange, OptBool, PeerChange, PortRange, RawMessage, Resolver,
@@ -129,6 +128,14 @@ impl<K: DeepHash + Ord, V: DeepHash> DeepHash for BTreeMap<K, V> {
         hasher.hash_uint64(self.len() as u64);
         for (key, value) in self {
             key.deep_hash(hasher);
+            value.deep_hash(hasher);
+        }
+    }
+}
+impl<T: DeepHash + Ord> DeepHash for BTreeSet<T> {
+    fn deep_hash(&self, hasher: &mut Hasher) {
+        hasher.hash_uint64(self.len() as u64);
+        for value in self {
             value.deep_hash(hasher);
         }
     }
@@ -436,12 +443,6 @@ impl DeepHash for MaskedPrefs {
 impl DeepHash for State {
     fn deep_hash(&self, h: &mut Hasher) {
         h.hash_uint8(*self as u8);
-    }
-}
-impl DeepHash for GatewayInfo {
-    fn deep_hash(&self, h: &mut Hasher) {
-        self.gateway.deep_hash(h);
-        self.self_ip.deep_hash(h);
     }
 }
 impl DeepHash for ClientVersion {

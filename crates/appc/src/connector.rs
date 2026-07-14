@@ -29,6 +29,7 @@ use std::net::IpAddr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use rustscale_deephash::{update as deephash_update, Sum};
 use rustscale_tailcfg::RouteInfo;
 
 use crate::ratelog::RateLogger;
@@ -86,6 +87,8 @@ pub(crate) struct AppConnectorState {
     domains: BTreeMap<String, Vec<IpAddr>>,
     /// Routes last supplied by control.
     control_routes: Vec<Prefix>,
+    /// Hash of the routes last supplied by control.
+    control_routes_hash: Sum,
     /// Wildcard domain suffixes (e.g. `example.com` for `*.example.com`).
     wildcards: Vec<String>,
 }
@@ -156,6 +159,7 @@ impl AppConnector {
             state: Mutex::new(AppConnectorState {
                 domains,
                 control_routes,
+                control_routes_hash: Sum::default(),
                 wildcards,
             }),
             write_rate_minute,
@@ -174,6 +178,7 @@ impl AppConnector {
         {
             let mut state = self.state.lock().unwrap();
             state.control_routes.clear();
+            state.control_routes_hash = Sum::default();
             state.domains.clear();
             state.wildcards.clear();
         }
@@ -264,7 +269,7 @@ impl AppConnector {
         let (to_advertise, to_remove) = {
             let mut state = self.state.lock().unwrap();
 
-            if state.control_routes.as_slice() == routes {
+            if !deephash_update(&mut state.control_routes_hash, routes) {
                 return;
             }
 
@@ -839,6 +844,25 @@ mod tests {
         a.update_routes(&routes);
         a.wait();
         assert_eq!(rc.routes().len(), 1);
+    }
+
+    #[test]
+    fn update_routes_deephash_detects_changes() {
+        let (a, rc) = make_connector_with_ra(false);
+        let routes = prefixes(&["10.0.0.0/8"]);
+
+        a.update_routes(&routes);
+        let first_hash = a.state.lock().unwrap().control_routes_hash;
+        assert_ne!(first_hash, Sum::default());
+
+        a.update_routes(&routes);
+        assert_eq!(a.state.lock().unwrap().control_routes_hash, first_hash);
+        assert_eq!(rc.routes().len(), 1, "unchanged routes are not advertised");
+
+        a.update_routes(&prefixes(&["10.0.0.0/16"]));
+        let changed_hash = a.state.lock().unwrap().control_routes_hash;
+        assert_ne!(changed_hash, first_hash);
+        assert_eq!(rc.routes().len(), 2, "changed routes are advertised");
     }
 
     fn prefixes(ss: &[&str]) -> Vec<Prefix> {

@@ -23,6 +23,7 @@ import json
 import os
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 
 CONFIGS = ["rs-userspace", "rs-tun", "ts-userspace", "ts-tun"]
 CONFIG_COLORS = {
@@ -44,7 +45,7 @@ DEFAULT_MATRIX = {"topologies": TOPOLOGIES, "paths": PATHS, "configs": CONFIGS}
 
 def valid_matrix(data: dict) -> dict | None:
     try:
-        if data.get("schema_version") != 1:
+        if data.get("schema_version") not in (1, 2):
             return None
         matrix = {key: data[key] for key in DEFAULT_MATRIX}
         for key, values in matrix.items():
@@ -55,6 +56,8 @@ def valid_matrix(data: dict) -> dict | None:
         if not isinstance(data.get("dry_run", False), bool):
             return None
         matrix["dry_run"] = data.get("dry_run", False)
+        if data.get("schema_version") == 2 and isinstance(data.get("run"), dict):
+            matrix["run"] = data["run"]
         return matrix
     except (AttributeError, KeyError, TypeError):
         return None
@@ -593,6 +596,34 @@ def emit_dry_run_notice(matrix: dict) -> str:
     )
 
 
+def observed_product_versions(runs: list) -> list[tuple[str, str, str]]:
+    """Return every current-run product identity in deterministic order.
+
+    Observed product lists are config-scoped, so a dashboard must inspect all
+    cells rather than borrowing the first cell's filtered list. Keep path and
+    version in the key: conflicting executable identities remain visible.
+    """
+    products = set()
+    for run in runs:
+        observed = run.get("observed")
+        if not isinstance(observed, dict):
+            continue
+        product = observed.get("product")
+        if not isinstance(product, dict):
+            continue
+        for endpoint in ("server", "client"):
+            entries = product.get(endpoint)
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                path, version = entry.get("path"), entry.get("version")
+                if isinstance(path, str) and isinstance(version, str):
+                    products.add((Path(path).name, path, version))
+    return sorted(products)
+
+
 def emit_header(runs: list, matrix: dict) -> str:
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     n = len(runs)
@@ -617,10 +648,25 @@ def emit_header(runs: list, matrix: dict) -> str:
         partial = ' · <span style="color:var(--warn);font-weight:600">PARTIAL — NOT COMPLETE</span>'
     else:
         partial = ''
+    provenance = ""
+    run = matrix.get("run")
+    if isinstance(run, dict):
+        source = run.get("source", {})
+        cloud = run.get("cloud", {})
+        observed = next((r.get("observed") for r in runs if isinstance(r.get("observed"), dict)), {})
+        versions = [f"{name} [{path}] {version}" for name, path, version in observed_product_versions(runs)]
+        resolved = observed.get("resolved_image", "pending") if isinstance(observed, dict) else "pending"
+        dirty = "dirty launch" if source.get("launch_worktree_dirty") else "clean launch"
+        provenance = (f'<div class="meta">run {html.escape(str(run.get("id", "?")))} · '
+                      f'{html.escape(str(run.get("started_at_utc", "?")))} · '
+                      f'commit {html.escape(str(source.get("commit", ""))[:12])} ({dirty}) · '
+                      f'image requested {html.escape(str(cloud.get("requested_image_family", "?")))} / resolved {html.escape(str(resolved))} · '
+                      f'machine {html.escape(str(cloud.get("requested_machine_type", "?")))} · '
+                      f'{html.escape(" | ".join(dict.fromkeys(versions)) or "tool versions pending")}</div>')
     return (
         f'<header class="app">'
         f"<h1>rustscale GCP bench dashboard</h1>"
-        f'<div class="meta">{n} runs{fail_str}{miss_str}{legacy_str}{dry_run_str}{partial} · generated {stamp} · {html.escape(ver_str)}</div>'
+        f'<div class="meta">{n} runs{fail_str}{miss_str}{legacy_str}{dry_run_str}{partial} · generated {stamp} · {html.escape(ver_str)}</div>{provenance}'
         f"</header>"
     )
 

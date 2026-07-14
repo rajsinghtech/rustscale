@@ -17,7 +17,7 @@
 #   GCP_PROJECT                              — auto-detected from gcloud config
 #   GCP_DRY_RUN                              — set by --dry-run; propagated to lib.sh
 #   SKIP_VM_DELETE=1                         — keep VMs at the end (debugging)
-#   MATRIX_RESULTS_DIR                        — local validation output override
+#   MATRIX_RESULTS_DIR                        — parent/root for the run-ID directory override
 
 set -euo pipefail
 
@@ -32,6 +32,16 @@ source tools/bench/lib.sh
 source tools/bench/gcp/lib.sh
 # shellcheck source=./footprint.sh
 source tools/bench/gcp/footprint.sh
+
+# Defaults make pure local self-tests deterministic. The real invocation
+# replaces these immediately before publishing matrix.json.
+MATRIX_RUN_ID="gcp-20260714-000000-selftest"
+MATRIX_STARTED_AT_UTC="2026-07-14T00:00:00Z"
+MATRIX_SOURCE_COMMIT="$(git rev-parse HEAD)"
+MATRIX_WORKTREE_DIRTY=0
+MATRIX_PROJECT="dry-run"
+MATRIX_MANIFEST_PATH="/dev/null"
+MATRIX_OBSERVED_PATH="/dev/null"
 
 MATRIX_SELF_TEST=0
 if [[ "${1:-}" == "--self-test" ]]; then
@@ -63,7 +73,11 @@ rust_build_command() {
   done
 
   (( ${#packages[@]} )) || return 0
-  printf '%s' 'export RUSTUP_HOME=/opt/rust CARGO_HOME=/opt/rust/cargo; cd /opt/rustscale && cargo build --release'
+  printf '%s' 'export RUSTUP_HOME=/opt/rust CARGO_HOME=/opt/rust/cargo'
+  [[ -z "${RUSTFLAGS:-}" ]] || { printf ' RUSTFLAGS='; printf '%q' "$RUSTFLAGS"; }
+  [[ -z "${CARGO_PROFILE_RELEASE_LTO:-}" ]] || { printf ' CARGO_PROFILE_RELEASE_LTO='; printf '%q' "$CARGO_PROFILE_RELEASE_LTO"; }
+  [[ -z "${CARGO_PROFILE_RELEASE_CODEGEN_UNITS:-}" ]] || { printf ' CARGO_PROFILE_RELEASE_CODEGEN_UNITS='; printf '%q' "$CARGO_PROFILE_RELEASE_CODEGEN_UNITS"; }
+  printf '%s' '; cd /opt/rustscale && cargo build --release'
   for package in "${packages[@]}"; do
     printf ' -p %s' "$package"
   done
@@ -86,6 +100,10 @@ matrix_command_shape_self_test() {
   actual=$(rust_build_command)
   [[ "$actual" == 'export RUSTUP_HOME=/opt/rust CARGO_HOME=/opt/rust/cargo; cd /opt/rustscale && cargo build --release -p rustscale-bench -p rustscale-cli -p rustscale-rustscaled' ]] || return 1
   [[ "$actual" != *'-p rustscaled'* ]] || return 1
+  RUSTFLAGS='-C target-cpu=native'; CARGO_PROFILE_RELEASE_LTO=thin; CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
+  CONFIGS=(rs-tun); actual=$(rust_build_command)
+  [[ "$actual" == *'RUSTFLAGS=-C\ target-cpu=native'* && "$actual" == *'CARGO_PROFILE_RELEASE_LTO=thin'* && "$actual" == *'CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1'* ]] || return 1
+  unset RUSTFLAGS CARGO_PROFILE_RELEASE_LTO CARGO_PROFILE_RELEASE_CODEGEN_UNITS
 }
 
 wait_for_remote_builds() {
@@ -178,9 +196,9 @@ matrix_profile_self_test() {
   unset -f matrix_test_record_run_config matrix_test_record_profile
 
   [[ ${#calls[@]} -eq 3 ]] || return 1
-  [[ "${calls[0]}" == 'rs-tun|rs-tun s c sz cz key dir host client --repeat 4' ]] || return 1
-  [[ "${calls[1]}" == 'ts-tun|ts-tun s c sz cz key dir host client --repeat 4' ]] || return 1
-  [[ "${calls[2]}" == 'profile|rs-tun s c sz cz profile-key dir host client --repeat 4 --profile-only' ]] || return 1
+  [[ "${calls[0]}" == 'rs-tun|rs-tun s c sz cz key dir host client --repeat 4 --manifest /dev/null --observed /dev/null' ]] || return 1
+  [[ "${calls[1]}" == 'ts-tun|ts-tun s c sz cz key dir host client --repeat 4 --manifest /dev/null --observed /dev/null' ]] || return 1
+  [[ "${calls[2]}" == 'profile|rs-tun s c sz cz profile-key dir host client --repeat 4 --profile-only --manifest /dev/null --observed /dev/null' ]] || return 1
 }
 
 # Build the directly invocable run-config command shape used by each cell.
@@ -189,7 +207,8 @@ matrix_profile_self_test() {
 matrix_build_run_config_args() {
   local config="$1"
   RUN_CONFIG_ARGS=(
-    "$config" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" --repeat "$REPEAT"
+    "$config" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" --repeat "$REPEAT" \
+    --manifest "$MATRIX_MANIFEST_PATH" --observed "$MATRIX_OBSERVED_PATH"
   )
 }
 
@@ -215,7 +234,7 @@ matrix_run_profile_diagnostic() {
   local runner="${9:-tools/bench/gcp/run-config.sh}"
   "$runner" rs-tun "$server_vm" "$client_vm" "$server_zone" "$client_zone" \
     "$authkey" "$results_dir" "$server_hostname" "$client_hostname" \
-    --repeat "$REPEAT" --profile-only
+    --repeat "$REPEAT" --profile-only --manifest "$MATRIX_MANIFEST_PATH" --observed "$MATRIX_OBSERVED_PATH"
 }
 
 # Parse command-line options without contacting GCP.  Keeping this separate
@@ -304,47 +323,184 @@ matrix_option_parsing_self_test() {
   done
 }
 
+matrix_launch_worktree_dirty() {
+  [[ -n "$(git status --porcelain=v1 --untracked-files=all)" ]]
+}
+
+matrix_dirty_detection_self_test() {
+  local kind
+  for kind in tracked staged untracked; do
+    if ! (
+      git() { printf '%s\n' "$kind-change"; }
+      matrix_launch_worktree_dirty
+    ); then return 1; fi
+  done
+  if (
+    git() { :; }
+    matrix_launch_worktree_dirty
+  ); then return 1; fi
+  # The immutable source assertion is enforced by the structured validator,
+  # independent of which category made the launch worktree dirty.
+  python3 - <<'PYEOF'
+import sys
+sys.path.insert(0, "tools/bench/gcp")
+import provenance
+run = {"id":"gcp-20260714-000000-dirtytest", "started_at_utc":"2026-07-14T00:00:00Z",
+       "source":{"commit":"a"*40,"delivery":"git-archive-head","includes_uncommitted_changes":False,"launch_worktree_dirty":True},
+       "cloud":{"provider":"gcp","project":"dry-run","requested_image_project":"ubuntu-os-cloud","requested_image_family":"ubuntu-2204-lts","requested_machine_type":"n1-standard-4","network":"default","disk_type":"pd-standard","disk_gb":200},
+       "build":{"command":"","rustflags":"","cargo_profile_release_lto":"","cargo_profile_release_codegen_units":""}}
+provenance.validate_run(run)
+PYEOF
+}
+
+# GCE names must be unique for each immutable run, even when two runs begin in
+# the same second.  Keep the run suffix at the end if a future run-id format
+# grows, because it contains the uniqueness component.
+matrix_vm_name() {
+  local run_id="$1" topology="$2" role="$3" run_component prefix max
+  case "$topology/$role" in
+    same-zone/srv|same-zone/cli|cross-region/srv|cross-region/cli) ;;
+    *) return 1 ;;
+  esac
+  run_component="${run_id#gcp-}"
+  [[ "$run_component" != "$run_id" && "$run_component" =~ ^[a-z0-9_-]+$ ]] || return 1
+  run_component="${run_component//_/-}"
+  prefix="rs-bench-${topology}-${role}-"
+  max=$((63 - ${#prefix}))
+  (( max > 0 )) || return 1
+  if (( ${#run_component} > max )); then
+    run_component="${run_component: -max}"
+  fi
+  printf '%s%s\n' "$prefix" "$run_component"
+}
+
+matrix_vm_name_self_test() {
+  local one two long
+  one=$(matrix_vm_name gcp-20260714-010203-aaaaaaaaaa same-zone srv) || return 1
+  two=$(matrix_vm_name gcp-20260714-010203-bbbbbbbbbb same-zone srv) || return 1
+  [[ "$one" != "$two" && ${#one} -le 63 && ${#two} -le 63 ]] || return 1
+  [[ "$one" =~ ^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || return 1
+  [[ "$two" =~ ^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || return 1
+  long=$(matrix_vm_name "gcp-$(printf 'a%.0s' {1..80})" cross-region cli) || return 1
+  [[ ${#long} -le 63 && "$long" =~ ^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || return 1
+}
+
+# Every product identity is interrogated through the exact binary that the
+# harness invokes. Native --version probes avoid package-metadata aliases.
+matrix_remote_observation_program() {
+  cat <<'PYEOF'
+python3 - <<'PY'
+import hashlib, json, os, platform, subprocess
+def output(argv):
+    return subprocess.check_output(argv, text=True, stderr=subprocess.STDOUT, timeout=15).strip()
+products=[]
+for name, explicit in (
+    ("rustscale-bench", "/opt/rustscale/target/release/rustscale-bench"),
+    ("rustscale", "/opt/rustscale/target/release/rustscale"),
+    ("rustscaled", "/opt/rustscale/target/release/rustscaled"),
+):
+    if os.path.isfile(explicit):
+        products.append({"path": explicit, "version": output(["timeout", "15", explicit, "--version"]), "version_source": "executable --version", "sha256": hashlib.sha256(open(explicit,"rb").read()).hexdigest()})
+for name, explicit in (("tailscaled","/usr/sbin/tailscaled"),("tailscale","/usr/bin/tailscale")):
+    if os.path.isfile(explicit):
+        products.append({"path": explicit, "version": output(["timeout", "15", explicit, "--version"]), "version_source": "executable --version", "sha256": hashlib.sha256(open(explicit,"rb").read()).hexdigest()})
+os_name=""
+for line in open("/etc/os-release", encoding="utf-8"):
+    if line.startswith("PRETTY_NAME="): os_name=line.split("=",1)[1].strip().strip('"'); break
+cpu=output(["lscpu", "-J"])
+try: cpu_model=next(x["data"] for x in json.loads(cpu)["lscpu"] if x["field"].strip()=="Model name:")
+except Exception: raise SystemExit("unable to determine CPU model")
+print(json.dumps({"cpu_model":cpu_model,"logical_cpus":os.cpu_count(),"kernel_release":platform.release(),"os_pretty_name":os_name,"cargo":output(["cargo","--version"]),"rustc_verbose":output(["rustc","-Vv"]),"product":products}))
+PY
+PYEOF
+}
+
+matrix_product_observation_self_test() {
+  local program
+  program=$(matrix_remote_observation_program) || return 1
+  [[ "$program" == *'("rustscale-bench", "/opt/rustscale/target/release/rustscale-bench")'* ]] || return 1
+  [[ "$program" == *'("rustscale", "/opt/rustscale/target/release/rustscale")'* ]] || return 1
+  [[ "$program" == *'("rustscaled", "/opt/rustscale/target/release/rustscaled")'* ]] || return 1
+  [[ "$program" == *'output(["timeout", "15", explicit, "--version"])'* ]] || return 1
+  [[ "$program" != *cargo*metadata* && "$program" != *'--help'* && "$program" != *'exit 1'* ]] || return 1
+  # The fast shell suite does not compile benchmarks, but it requires the
+  # explicit Clap version contract. When a local binary already exists (as in
+  # the package acceptance check), exercise both aliases as well.
+  sed -n '/#\[command(/,/)]/p' crates/bench/src/main.rs | grep -Fxq '    version' || return 1
+  grep -Fq 'fn clap_metadata_exposes_package_version()' crates/bench/src/main.rs || return 1
+  if [[ -x target/debug/rustscale-bench ]]; then
+    local bench_version bench_short_version
+    bench_version=$(target/debug/rustscale-bench --version) || return 1
+    bench_short_version=$(target/debug/rustscale-bench -V) || return 1
+    [[ "$bench_version" == rustscale-bench\ * && "$bench_version" == "$bench_short_version" ]] || return 1
+  fi
+  grep -Fq 'matches!(args[1].as_str(), "--version" | "-V")' crates/cli/src/main.rs || return 1
+  grep -Fq 'matches!(arg.as_str(), "--version" | "-V")' crates/rustscaled/src/main.rs || return 1
+}
+
+# Atomically publish command stdout in the result directory. The command is
+# invoked as argv so callers can safely pass shell functions (such as ssh_cmd)
+# without eval. A subshell confines its signal cleanup trap to this capture.
+matrix_atomic_capture() (
+  local destination="$1" directory base temporary command_status
+  shift
+  directory=$(dirname "$destination")
+  base=$(basename "$destination")
+  mkdir -p "$directory" || exit $?
+  temporary=$(mktemp "$directory/.${base}.XXXXXX") || exit $?
+  trap 'rm -f "$temporary"; exit 128' HUP INT TERM
+  trap 'rm -f "$temporary"' EXIT
+  "$@" >"$temporary"
+  command_status=$?
+  if (( command_status != 0 )); then
+    exit "$command_status"
+  fi
+  mv -f "$temporary" "$destination" || exit $?
+  trap - EXIT
+)
+
+matrix_atomic_capture_self_test() {
+  local temp_dir destination command_status
+  temp_dir=$(mktemp -d) || return 1
+  destination="$temp_dir/sidecar.json"
+  printf '%s\n' old >"$destination"
+  matrix_atomic_capture "$destination" printf '%s\n' new || { rm -rf "$temp_dir"; return 1; }
+  [[ "$(<"$destination")" == new ]] || { rm -rf "$temp_dir"; return 1; }
+  printf '%s\n' preserved >"$destination"
+  if matrix_atomic_capture "$destination" bash -c 'printf "%s\\n" partial; exit 37'; then
+    rm -rf "$temp_dir"; return 1
+  else
+    command_status=$?
+  fi
+  (( command_status == 37 )) || { rm -rf "$temp_dir"; return 1; }
+  [[ "$(<"$destination")" == preserved ]] || { rm -rf "$temp_dir"; return 1; }
+  ! compgen -G "$temp_dir/.sidecar.json.*" >/dev/null || { rm -rf "$temp_dir"; return 1; }
+  rm -rf "$temp_dir"
+}
+
 matrix_write_manifest() {
   local output="$1" repeat="$2" dry_run="${MATRIX_MANIFEST_DRY_RUN:-0}"
   shift 2
-
-  python3 - "$output" "$repeat" "$dry_run" "$@" <<'PYEOF'
-import json
-import re
-import sys
-
-out, repeat_value, dry_run_value, *args = sys.argv[1:]
-if not re.fullmatch(r"[1-9][0-9]*", repeat_value):
-    raise ValueError("repeat must be a positive integer")
-if dry_run_value not in ("0", "1"):
-    raise ValueError("dry-run marker must be 0 or 1")
-
-parts, current = [], []
-for arg in args:
-    if arg == "--":
-        parts.append(current)
-        current = []
-    else:
-        current.append(arg)
-parts.append(current)
-if len(parts) != 4:
-    raise ValueError("manifest requires topology, path, config, and parallelism groups")
-
-parallelism = []
-for value in parts[3]:
-    if not re.fullmatch(r"[1-9][0-9]*", value):
-        raise ValueError(f"parallelism must be a positive integer: {value!r}")
-    parallelism.append(int(value))
-if not parallelism:
-    raise ValueError("parallelism must not be empty")
-
-with open(out, "w", encoding="utf-8") as f:
-    json.dump({"schema_version": 1, "topologies": parts[0], "paths": parts[1],
-               "configs": parts[2], "parallelism": parallelism, "repeat": int(repeat_value),
-               "dry_run": dry_run_value == "1",
-               "warmup": {"parallel": 1, "duration_s": 3, "reverse": True}}, f, indent=2)
-    f.write("\n")
-PYEOF
+  local -a groups=() current=() topologies paths configs parallelism dry_flag=()
+  local value
+  for value in "$@"; do
+    if [[ "$value" == -- ]]; then groups+=("${current[*]}"); current=(); else current+=("$value"); fi
+  done
+  groups+=("${current[*]}")
+  [[ ${#groups[@]} -eq 4 ]] || return 1
+  read -r -a topologies <<<"${groups[0]}"; read -r -a paths <<<"${groups[1]}"
+  read -r -a configs <<<"${groups[2]}"; read -r -a parallelism <<<"${groups[3]}"
+  [[ "$repeat" =~ ^[1-9][0-9]*$ ]] || return 1
+  for value in "${parallelism[@]}"; do [[ "$value" =~ ^[1-9][0-9]*$ ]] || return 1; done
+  [[ "$dry_run" == 1 ]] && dry_flag=(--dry-run)
+  python3 tools/bench/gcp/provenance.py manifest "$output" \
+    --run-id "$MATRIX_RUN_ID" --started-at-utc "$MATRIX_STARTED_AT_UTC" --commit "$MATRIX_SOURCE_COMMIT" \
+    --dirty "$MATRIX_WORKTREE_DIRTY" --project "$MATRIX_PROJECT" --image-project "$GCP_IMAGE_PROJECT" \
+    --image-family "$GCP_IMAGE" --machine "$GCP_MACHINE" --network "$GCP_NETWORK" --disk-type pd-standard \
+    --disk-gb "$GCP_DISK_GB" --build-command "${RUST_BUILD_COMMAND:-}" --rustflags "${RUSTFLAGS:-}" \
+    --lto "${CARGO_PROFILE_RELEASE_LTO:-}" --codegen-units "${CARGO_PROFILE_RELEASE_CODEGEN_UNITS:-}" \
+    "${dry_flag[@]}" --topologies "${topologies[@]}" --paths "${paths[@]}" \
+    --configs "${configs[@]}" --parallelism "${parallelism[@]}" --repeat "$repeat"
 }
 
 # Render into a sibling temporary file and publish only a complete document.
@@ -417,11 +573,14 @@ matrix_finalize_results() {
 }
 
 matrix_finalization_self_test() {
-  local temp_dir dry_dir prod_dir output status
+  local temp_dir dry_dir prod_dir output status saved_project="$MATRIX_PROJECT"
   temp_dir=$(mktemp -d)
-  dry_dir="$temp_dir/dry"; prod_dir="$temp_dir/prod"
+  dry_dir="$temp_dir/gcp-20260714-000000-dry"; prod_dir="$temp_dir/gcp-20260714-000000-prod"
   mkdir -p "$dry_dir/same-zone/direct" "$prod_dir/same-zone/direct"
+  MATRIX_RUN_ID=$(basename "$dry_dir")
   MATRIX_MANIFEST_DRY_RUN=1 matrix_write_manifest "$dry_dir/matrix.json" 1 same-zone -- direct -- rs-tun -- 1
+  MATRIX_RUN_ID=$(basename "$prod_dir")
+  MATRIX_PROJECT=fixture-project
   MATRIX_MANIFEST_DRY_RUN=0 matrix_write_manifest "$prod_dir/matrix.json" 1 same-zone -- direct -- rs-tun -- 1
   if ! python3 - "$dry_dir" "$prod_dir" <<'PYEOF'
 import json
@@ -429,22 +588,27 @@ import sys
 from pathlib import Path
 
 dry, prod = map(Path, sys.argv[1:])
-failed = {"schema_version": 2, "status": "failed", "tool": "rustscale", "mode": "tun",
+def endpoint(zone): return {"zone":zone,"machine_type":"n1-standard-4","cpu_platform":"fixture","cpu_model":"fixture","logical_cpus":4,"kernel_release":"fixture","os_pretty_name":"fixture"}
+def observed(dry_run):
+    if dry_run: return {"resolved_image":"dry-run","server":"dry-run","client":"dry-run","toolchain":"dry-run","product":"dry-run"}
+    products=[{"path":"/opt/rustscale/target/release/rustscale","version":"rustscale 1.0","version_source":"executable --version","sha256":"a"*64},{"path":"/opt/rustscale/target/release/rustscaled","version":"rustscaled 1.0","version_source":"executable --version","sha256":"b"*64}]
+    return {"resolved_image":"fixture-image","server":endpoint("us-central1-a"),"client":endpoint("us-central1-b"),"toolchain":{"server_cargo":"cargo fixture","server_rustc_verbose":"rustc fixture","client_cargo":"cargo fixture","client_rustc_verbose":"rustc fixture"},"product":{"server":products,"client":products}}
+def result(root, status):
+    run=json.loads((root/"matrix.json").read_text())["run"]
+    common={"schema_version":3,"run":run,"observed":observed(status=="failed"),"status":status,"tool":"rustscale","mode":"tun",
           "topology": "same-zone", "path": "direct", "config": "rs-tun", "repeat": 1,
           "parallelism_requested": [1], "error": "dry-run", "log_tail": "",
           "throughput": None, "latency": None, "footprint": None, "path_class_reported": "unknown"}
-(dry / "same-zone/direct/rs-tun.json").write_text(json.dumps(failed))
-ok = {"schema_version": 2, "status": "ok", "tool": "rustscale", "mode": "tun",
-      "topology": "same-zone", "path": "direct", "config": "rs-tun", "repeat": 1,
-      "parallelism_requested": [1], "error": "", "log_tail": "",
-      "throughput": [{"parallel": 1, "mbps": 1.0, "duration_s": 1.0,
+    if status=="ok": common.update({"error":"","throughput":[{"parallel": 1, "mbps": 1.0, "duration_s": 1.0,
                       "samples_mbps": [1.0], "statistic": "median"}],
       "latency": {"requested": 50, "transmitted": 50, "received": 50, "loss": 0,
                   "p50_us": 1, "p95_us": 2, "p99_us": 3, "count": 50},
       "footprint": {"binary_size_bytes": 1, "rss_peak_kb": 1, "rss_avg_kb": 1,
-                    "cpu_peak_pct": 0, "cpu_avg_pct": 0, "samples": 1},
-      "path_class_reported": "direct"}
-(prod / "same-zone/direct/rs-tun.json").write_text(json.dumps(ok))
+                  "cpu_peak_pct": 0, "cpu_avg_pct": 0, "samples": 1},
+      "path_class_reported": "direct"})
+    return common
+(dry / "same-zone/direct/rs-tun.json").write_text(json.dumps(result(dry,"failed")))
+(prod / "same-zone/direct/rs-tun.json").write_text(json.dumps(result(prod,"ok")))
 PYEOF
   then rm -rf "$temp_dir"; return 1; fi
 
@@ -468,63 +632,25 @@ PYEOF
   [[ "$(<"$prod_dir/dashboard.html")" == 'prior dashboard' ]] || { rm -rf "$temp_dir"; return 1; }
   ! compgen -G "$prod_dir/.dashboard.html.*" >/dev/null || { rm -rf "$temp_dir"; return 1; }
   ! compgen -G "$prod_dir/.summary.json.*" >/dev/null || { rm -rf "$temp_dir"; return 1; }
-  rm -rf "$temp_dir"
+  rm -rf "$temp_dir"; MATRIX_PROJECT="$saved_project"
 }
 
 matrix_manifest_self_test() {
-  local temp_dir manifest invalid_manifest
+  local temp_dir manifest invalid_manifest saved_project="$MATRIX_PROJECT"
+  MATRIX_PROJECT=fixture-project
   temp_dir=$(mktemp -d)
   manifest="$temp_dir/matrix.json"
   invalid_manifest="$temp_dir/invalid.json"
-
-  if ! matrix_write_manifest "$manifest" 3 same-zone -- direct -- rs-tun -- 1 10 100; then
-    rm -rf "$temp_dir"
-    return 1
-  fi
-  if ! python3 - "$manifest" "$temp_dir" <<'PYEOF'
-import json
-import sys
-from pathlib import Path
-
-manifest = json.loads(Path(sys.argv[1]).read_text())
-assert manifest["parallelism"] == [1, 10, 100]
-assert all(type(value) is int for value in manifest["parallelism"])
-
-root = Path(sys.argv[2])
-cell = root / "same-zone/direct/rs-tun.json"
-cell.parent.mkdir(parents=True)
-parallelism = manifest["parallelism"]
-cell.write_text(json.dumps({
-    "schema_version": 2, "status": "ok", "tool": "rustscale", "mode": "tun",
-    "topology": "same-zone", "path": "direct", "config": "rs-tun", "repeat": 3,
-    "parallelism_requested": parallelism, "error": "", "log_tail": "",
-    "throughput": [{"parallel": value, "mbps": float(value), "duration_s": 1,
-                    "samples_mbps": [float(value)] * 3, "statistic": "median"}
-                   for value in parallelism],
-    "latency": {"requested": 50, "transmitted": 50, "received": 50, "loss": 0,
-                "p50_us": 1, "p95_us": 2, "p99_us": 3, "count": 50},
-    "footprint": {"binary_size_bytes": 1, "rss_peak_kb": 1, "rss_avg_kb": 1,
-                  "cpu_peak_pct": 0, "cpu_avg_pct": 0, "samples": 1},
-    "path_class_reported": "direct",
-}))
+  matrix_write_manifest "$manifest" 3 same-zone -- direct -- rs-tun -- 1 10 100 || { rm -rf "$temp_dir"; return 1; }
+  python3 tools/bench/gcp/provenance.py validate --manifest "$manifest" || { rm -rf "$temp_dir"; return 1; }
+  python3 - "$manifest" <<'PYEOF' || { rm -rf "$temp_dir"; return 1; }
+import json, sys
+data=json.load(open(sys.argv[1])); assert data["schema_version"] == 2 and data["parallelism"] == [1,10,100] and data["run"]["cloud"]["disk_gb"] == 200
 PYEOF
-  then
-    rm -rf "$temp_dir"
-    return 1
+  if matrix_write_manifest "$invalid_manifest" 3 same-zone -- direct -- rs-tun -- 0 >/dev/null 2>&1 || [[ -e "$invalid_manifest" ]]; then
+    rm -rf "$temp_dir"; return 1
   fi
-  if ! python3 tools/bench/gcp/aggregate.py "$temp_dir" >/dev/null; then
-    rm -rf "$temp_dir"
-    return 1
-  fi
-  local malformed
-  for malformed in 0 -1 1.0 +1 ' 1' abc; do
-    if matrix_write_manifest "$invalid_manifest" 3 same-zone -- direct -- rs-tun -- "$malformed" >/dev/null 2>&1; then
-      rm -rf "$temp_dir"
-      return 1
-    fi
-    [[ ! -e "$invalid_manifest" ]] || { rm -rf "$temp_dir"; return 1; }
-  done
-  rm -rf "$temp_dir"
+  rm -rf "$temp_dir"; MATRIX_PROJECT="$saved_project"
 }
 
 matrix_command_shape_self_test
@@ -532,11 +658,16 @@ matrix_remote_build_aggregation_self_test
 matrix_config_failure_policy_self_test
 matrix_profile_self_test
 matrix_option_parsing_self_test
+matrix_dirty_detection_self_test
+matrix_vm_name_self_test
+matrix_product_observation_self_test
+matrix_atomic_capture_self_test
 matrix_manifest_self_test
 matrix_finalization_self_test
 
 if (( MATRIX_SELF_TEST )); then
   ssh_cmd_self_test
+  gcloud_project_self_test
   package_tailscaled_cleanup_self_test
   startup_script_self_test
   echo "run-matrix self-tests: OK" >&2
@@ -630,11 +761,73 @@ if [[ -z "$RUST_BUILD_COMMAND" ]]; then
   echo "[gcp] skipping Rust source delivery and builds (no Rust configs selected)" >&2
 fi
 
-STAMP=$(date +%Y%m%d-%H%M%S)
-RESULTS_DIR="${MATRIX_RESULTS_DIR:-bench-results/gcp-$STAMP}"
+MATRIX_STARTED_AT_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+STAMP="${MATRIX_STARTED_AT_UTC:0:4}${MATRIX_STARTED_AT_UTC:5:2}${MATRIX_STARTED_AT_UTC:8:2}-${MATRIX_STARTED_AT_UTC:11:2}${MATRIX_STARTED_AT_UTC:14:2}${MATRIX_STARTED_AT_UTC:17:2}"
+MATRIX_SOURCE_COMMIT="$(git rev-parse HEAD)"
+if matrix_launch_worktree_dirty; then
+  MATRIX_WORKTREE_DIRTY=1
+  echo "[gcp] WARNING: launch worktree is dirty; git archive HEAD (not uncommitted files) will be benchmarked" >&2
+else
+  MATRIX_WORKTREE_DIRTY=0
+fi
+MATRIX_PROJECT="${GCP_PROJECT:-}"
+(( DRY_RUN )) && MATRIX_PROJECT="dry-run"
+[[ -n "$MATRIX_PROJECT" ]] || { echo "GCP_PROJECT is required for a real benchmark" >&2; exit 2; }
+MATRIX_RUN_ID="gcp-${STAMP}-$(printf '%s' "${MATRIX_SOURCE_COMMIT}${$}${RANDOM}" | shasum -a 256 | cut -c1-10)"
+RESULTS_DIR="${MATRIX_RESULTS_DIR:+$MATRIX_RESULTS_DIR/}$MATRIX_RUN_ID"
+[[ -n "${MATRIX_RESULTS_DIR:-}" ]] || RESULTS_DIR="bench-results/$MATRIX_RUN_ID"
 mkdir -p "$RESULTS_DIR"
 MATRIX_MANIFEST_DRY_RUN="$DRY_RUN" matrix_write_manifest "$RESULTS_DIR/matrix.json" "$REPEAT" \
   "${TOPOLOGIES[@]}" -- "${PATHS[@]}" -- "${CONFIGS[@]}" -- "${PARALLELS[@]}"
+MATRIX_MANIFEST_PATH="$RESULTS_DIR/matrix.json"
+
+matrix_collect_observed() {
+  local topology="$1" server="$2" server_zone="$3" client="$4" client_zone="$5"
+  local metadata_dir server_instance client_instance server_endpoint client_endpoint server_disk client_disk
+  metadata_dir="$RESULTS_DIR/metadata/$topology"
+  server_instance="$metadata_dir/server-instance.json"; client_instance="$metadata_dir/client-instance.json"
+  server_endpoint="$metadata_dir/server-endpoint.json"; client_endpoint="$metadata_dir/client-endpoint.json"
+  server_disk="$metadata_dir/server-boot-disk.json"; client_disk="$metadata_dir/client-boot-disk.json"
+  mkdir -p "$metadata_dir"
+  if (( DRY_RUN )); then
+    python3 tools/bench/gcp/provenance.py dry-observed "$metadata_dir/base-observed.json"
+    return
+  fi
+  # Persist only the identity fields needed below, never arbitrary instance
+  # metadata or service-account configuration.
+  matrix_atomic_capture "$server_instance" gcloud compute instances describe "$server" --project="$GCP_PROJECT" --zone="$server_zone" --format='json(machineType,cpuPlatform,zone,disks.source)'
+  matrix_atomic_capture "$client_instance" gcloud compute instances describe "$client" --project="$GCP_PROJECT" --zone="$client_zone" --format='json(machineType,cpuPlatform,zone,disks.source)'
+  # Resolve the image through the boot disk created for this instance.  Do not
+  # query an image family here: family resolution is intentionally racy.
+  local server_disk_name client_disk_name
+  server_disk_name=$(python3 - "$server_instance" <<'PYEOF'
+import json, sys
+d=json.load(open(sys.argv[1])); print(d["disks"][0]["source"].rsplit("/", 1)[-1])
+PYEOF
+)
+  client_disk_name=$(python3 - "$client_instance" <<'PYEOF'
+import json, sys
+d=json.load(open(sys.argv[1])); print(d["disks"][0]["source"].rsplit("/", 1)[-1])
+PYEOF
+)
+  matrix_atomic_capture "$server_disk" gcloud compute disks describe "$server_disk_name" --project="$GCP_PROJECT" --zone="$server_zone" --format='json(sourceImage)'
+  matrix_atomic_capture "$client_disk" gcloud compute disks describe "$client_disk_name" --project="$GCP_PROJECT" --zone="$client_zone" --format='json(sourceImage)'
+  local remote_program
+  remote_program=$(matrix_remote_observation_program)
+  matrix_atomic_capture "$server_endpoint" ssh_cmd "$server" "$server_zone" "$remote_program"
+  matrix_atomic_capture "$client_endpoint" ssh_cmd "$client" "$client_zone" "$remote_program"
+  python3 tools/bench/gcp/provenance.py observed-real "$metadata_dir/base-observed.json" --server-instance "$server_instance" --client-instance "$client_instance" --server-boot-disk "$server_disk" --client-boot-disk "$client_disk" --server-endpoint "$server_endpoint" --client-endpoint "$client_endpoint"
+}
+
+matrix_select_cell_observed() {
+  local topology="$1" config="$2" server_zone="$3" client_zone="$4"
+  local base="$RESULTS_DIR/metadata/$topology/base-observed.json"
+  MATRIX_OBSERVED_PATH="$RESULTS_DIR/metadata/$topology/$config-observed.json"
+  local -a dry_flag=()
+  (( DRY_RUN )) && dry_flag=(--dry-run)
+  python3 tools/bench/gcp/provenance.py select-observed "$MATRIX_OBSERVED_PATH" --input "$base" --config "$config" \
+    --topology "$topology" --server-zone "$server_zone" --client-zone "$client_zone" --machine "$GCP_MACHINE" "${dry_flag[@]}"
+}
 
 # Track VMs created for cleanup. ASSUMES one pair per topology; we delete each
 # topology's VMs before starting the next to keep quota usage at 2 VMs.
@@ -695,8 +888,8 @@ trap gcp_bench_cleanup EXIT
 # ---------------------------------------------------------------------------
 for TOPO in "${TOPOLOGIES[@]}"; do
   IFS=: read -r Z_A Z_B <<< "${ZONES[$TOPO]}"
-  SERVER_VM="rs-bench-${STAMP}-${TOPO}-srv"
-  CLIENT_VM="rs-bench-${STAMP}-${TOPO}-cli"
+  SERVER_VM=$(matrix_vm_name "$MATRIX_RUN_ID" "$TOPO" srv)
+  CLIENT_VM=$(matrix_vm_name "$MATRIX_RUN_ID" "$TOPO" cli)
   ACTIVE_SRV="$SERVER_VM"
   ACTIVE_SRV_ZONE="$Z_A"
   ACTIVE_CLI="$CLIENT_VM"
@@ -720,6 +913,10 @@ for TOPO in "${TOPOLOGIES[@]}"; do
     wait_for_remote_builds "$SERVER_BUILD_PID" "$CLIENT_BUILD_PID"
   fi
 
+  # Capture immutable environment/toolchain/product identity after startup and
+  # any Rust build, before the topology's first measured cell.
+  matrix_collect_observed "$TOPO" "$SERVER_VM" "$Z_A" "$CLIENT_VM" "$Z_B"
+
   # Path loop.
   for PATH_TAG in "${PATHS[@]}"; do
     echo ""
@@ -736,6 +933,7 @@ for TOPO in "${TOPOLOGIES[@]}"; do
       echo ""
       echo "[gcp] >>> config: $CFG (topo=$TOPO path=$PATH_TAG) <<<"
       export BENCH_MATRIX="${TOPO}/${PATH_TAG}"
+      matrix_select_cell_observed "$TOPO" "$CFG" "$Z_A" "$Z_B"
 
       # Mint a FRESH authkey per config.  Reusing a single ephemeral key
       # across all 16 configs causes "invalid key" / "node not found" errors
@@ -760,6 +958,7 @@ for TOPO in "${TOPOLOGIES[@]}"; do
         AUTHKEY=$(bench_mint_authkey)
         echo "[gcp] minted fresh authkey for rs-tun profile diagnostic" >&2
       fi
+      matrix_select_cell_observed "$TOPO" rs-tun "$Z_A" "$Z_B"
       echo "[gcp] >>> profile: rs-tun (topo=$TOPO path=$PATH_TAG) <<<"
       if matrix_run_profile_diagnostic "$SERVER_VM" "$CLIENT_VM" "$Z_A" "$Z_B" \
         "$AUTHKEY" "$RESULTS_DIR/$TOPO/$PATH_TAG" "rs-srv-$TOPO" "rs-cli-$TOPO"; then

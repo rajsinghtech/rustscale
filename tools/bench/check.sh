@@ -34,25 +34,31 @@ run tools/bench/gcp/run-config.sh --self-test
 run tools/bench/gcp/run-matrix.sh --self-test
 run python3 tools/bench/gcp/test-manifest.py
 run env MATRIX_SKIP_COLLECT=1 MATRIX_RESULTS_DIR="$tmp/focused" tools/bench/gcp/run-matrix.sh --dry-run
-run python3 - "$tmp/focused/matrix.json" <<'PYEOF'
-import json, sys
-m = json.load(open(sys.argv[1]))
+run python3 - "$tmp/focused" <<'PYEOF'
+import json, pathlib, sys
+root = next(pathlib.Path(sys.argv[1]).glob("gcp-*/matrix.json")).parent
+m = json.load(open(root / "matrix.json"))
 assert (m["topologies"], m["paths"], m["configs"]) == (
     ["same-zone"], ["direct"], ["rs-tun", "ts-tun"])
 assert len(m["topologies"]) * len(m["paths"]) * len(m["configs"]) == 2
+assert m["schema_version"] == 2 and root.name == m["run"]["id"]
+for cell in (root / "same-zone" / "direct").glob("*.json"):
+    r = json.load(open(cell))
+    assert r["schema_version"] == 3 and r["run"] == m["run"] and r["observed"]["resolved_image"] == "dry-run"
 PYEOF
 run env MATRIX_SKIP_COLLECT=1 MATRIX_RESULTS_DIR="$tmp/full" tools/bench/gcp/run-matrix.sh --full --dry-run
-run python3 - "$tmp/full/matrix.json" <<'PYEOF'
-import json, sys
-m = json.load(open(sys.argv[1]))
+run python3 - "$tmp/full" <<'PYEOF'
+import json, pathlib, sys
+m = json.load(open(next(pathlib.Path(sys.argv[1]).glob("gcp-*/matrix.json"))))
 assert len(m["topologies"]) * len(m["paths"]) * len(m["configs"]) == 16
+assert m["schema_version"] == 2
 PYEOF
 run env MATRIX_SKIP_COLLECT=1 MATRIX_RESULTS_DIR="$tmp/focused-filter" tools/bench/gcp/run-matrix.sh --dry-run --topology cross-region --path derp --config rs-userspace
 run env MATRIX_SKIP_COLLECT=1 MATRIX_RESULTS_DIR="$tmp/full-filter" tools/bench/gcp/run-matrix.sh --full --dry-run --topology same-zone --path direct --config ts-tun
 expect_status 2 tools/bench/gcp/run-matrix.sh --dry-run --config rs-tun,rs-tun
-run python3 - "$tmp/focused-filter/matrix.json" "$tmp/full-filter/matrix.json" <<'PYEOF'
-import json, sys
-focused, full = (json.load(open(path)) for path in sys.argv[1:])
+run python3 - "$tmp/focused-filter" "$tmp/full-filter" <<'PYEOF'
+import json, pathlib, sys
+focused, full = (json.load(open(next(pathlib.Path(path).glob("gcp-*/matrix.json")))) for path in sys.argv[1:])
 assert (focused["topologies"], focused["paths"], focused["configs"]) == (
     ["cross-region"], ["derp"], ["rs-userspace"])
 assert (full["topologies"], full["paths"], full["configs"]) == (

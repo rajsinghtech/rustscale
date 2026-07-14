@@ -198,11 +198,12 @@ create_vm() {
   local name="$1" zone="$2"
   echo "[gcp] creating VM $name in $zone" >&2
   # Check existence first.
-  if _gc gcloud compute instances describe "$name" --zone="$zone" >/dev/null 2>&1; then
+  if _gc gcloud compute instances describe "$name" --project="$GCP_PROJECT" --zone="$zone" >/dev/null 2>&1; then
     echo "[gcp] VM $name already exists, reusing" >&2
     return 0
   fi
   render_startup_script | _gc gcloud compute instances create "$name" \
+    --project="$GCP_PROJECT" \
     --zone="$zone" \
     --machine-type="$GCP_MACHINE" \
     --image-family="$GCP_IMAGE" \
@@ -238,7 +239,7 @@ wait_for_startup() {
   echo "[gcp] waiting for startup-done on $name ($zone), timeout=${timeout}s" >&2
   local elapsed=0
   while (( elapsed < timeout )); do
-    if gcloud compute ssh "$name" --zone="$zone" \
+    if gcloud compute ssh "$name" --project="$GCP_PROJECT" --zone="$zone" \
         --command='test -f /tmp/startup-done && echo OK' 2>/dev/null | grep -q OK; then
       echo "[gcp] $name startup complete (${elapsed}s)" >&2
       return 0
@@ -265,11 +266,11 @@ ssh_cmd() {
   fi
   # Resolve VM external IP + SSH user once, cache in globals.
   if [[ -z "${_SSH_IP[$name]:-}" ]]; then
-    _SSH_IP[$name]=$(gcloud compute instances describe "$name" --zone="$zone" \
+    _SSH_IP[$name]=$(gcloud compute instances describe "$name" --project="$GCP_PROJECT" --zone="$zone" \
       --format='value(networkInterfaces[0].accessConfigs[0].natIP)' 2>/dev/null)
     # Extract the SSH username from gcloud's dry-run output (the user portion
     # of the ssh target, which may differ from the gcloud account email).
-    _SSH_USER[$name]=$(gcloud compute ssh "$name" --zone="$zone" --dry-run 2>&1 | grep -oE '[a-zA-Z0-9._-]+@[0-9.]+' | head -1 | cut -d@ -f1)
+    _SSH_USER[$name]=$(gcloud compute ssh "$name" --project="$GCP_PROJECT" --zone="$zone" --dry-run 2>&1 | grep -oE '[a-zA-Z0-9._-]+@[0-9.]+' | head -1 | cut -d@ -f1)
     [[ -z "${_SSH_USER[$name]}" ]] && _SSH_USER[$name]=$(gcloud config get-value account 2>/dev/null | cut -d@ -f1)
     _SSH_KEY="$HOME/.ssh/google_compute_engine"
   fi
@@ -326,6 +327,36 @@ ssh_cmd_self_test() {
   unset SSH_TEST_STATUSES SSH_TEST_ATTEMPTS SSH_TEST_SLEPT
 }
 
+# Verify every compute lifecycle/identity command explicitly carries the
+# configured project, without invoking gcloud or a network transport.
+gcloud_project_self_test() {
+  local log old_project original_render
+  log=$(mktemp); old_project="$GCP_PROJECT"; GCP_PROJECT=fixture-project
+  original_render=$(declare -f render_startup_script)
+  _gc() { printf '%s\n' "$*" >>"$log"; [[ "$*" == *'instances describe'* ]] && return 1; return 0; }
+  render_startup_script() { printf '#!/bin/bash\n'; }
+  create_vm project-test us-central1-a
+  delete_vm project-test us-central1-a
+  gcloud() {
+    printf '%s\n' "$*" >>"$log"
+    [[ "$*" == *'instances describe'* ]] && { printf '192.0.2.1\n'; return 0; }
+    [[ "$*" == *'compute ssh'* ]] && { printf 'tester@192.0.2.1\n'; return 0; }
+    return 0
+  }
+  ssh() { :; }
+  unset '_SSH_IP[project-test]' '_SSH_USER[project-test]'
+  ssh_cmd project-test us-central1-a true
+  gcloud compute disks describe disk --project="$GCP_PROJECT" --zone=us-central1-a >>"$log"
+  grep -q -- 'instances create project-test --project=fixture-project' "$log" || return 1
+  grep -q -- 'instances describe project-test --project=fixture-project' "$log" || return 1
+  grep -q -- 'instances delete project-test --project=fixture-project' "$log" || return 1
+  grep -q -- 'compute ssh project-test --project=fixture-project --zone=us-central1-a --dry-run' "$log" || return 1
+  grep -q -- 'compute disks describe disk --project=fixture-project' "$log" || return 1
+  rm -f "$log"; GCP_PROJECT="$old_project"
+  unset -f _gc gcloud ssh
+  eval "$original_render"
+}
+
 # ---------------------------------------------------------------------------
 # Run a sudo command on a VM. Args: NAME ZONE COMMAND
 # ---------------------------------------------------------------------------
@@ -345,9 +376,9 @@ scp_to() {
   fi
   # Resolve VM external IP + SSH user (same cache as ssh_cmd).
   if [[ -z "${_SSH_IP[$name]:-}" ]]; then
-    _SSH_IP[$name]=$(gcloud compute instances describe "$name" --zone="$zone" \
+    _SSH_IP[$name]=$(gcloud compute instances describe "$name" --project="$GCP_PROJECT" --zone="$zone" \
       --format='value(networkInterfaces[0].accessConfigs[0].natIP)' 2>/dev/null)
-    _SSH_USER[$name]=$(gcloud compute ssh "$name" --zone="$zone" --dry-run 2>&1 | grep -oE '[a-zA-Z0-9._-]+@[0-9.]+' | head -1 | cut -d@ -f1)
+    _SSH_USER[$name]=$(gcloud compute ssh "$name" --project="$GCP_PROJECT" --zone="$zone" --dry-run 2>&1 | grep -oE '[a-zA-Z0-9._-]+@[0-9.]+' | head -1 | cut -d@ -f1)
     [[ -z "${_SSH_USER[$name]}" ]] && _SSH_USER[$name]=$(gcloud config get-value account 2>/dev/null | cut -d@ -f1)
   fi
   local ip="${_SSH_IP[$name]}" user="${_SSH_USER[$name]}"
@@ -393,7 +424,7 @@ deliver_source() {
 delete_vm() {
   local name="$1" zone="$2"
   echo "[gcp] deleting VM $name ($zone)" >&2
-  _gc gcloud compute instances delete "$name" --zone="$zone" --delete-disks=all -q
+  _gc gcloud compute instances delete "$name" --project="$GCP_PROJECT" --zone="$zone" --delete-disks=all -q
 }
 
 # ---------------------------------------------------------------------------

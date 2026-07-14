@@ -11,6 +11,7 @@ import json
 import math
 import sys
 from pathlib import Path
+import provenance
 
 CONFIG_ORDER = {"rs-userspace": 0, "rs-tun": 1, "ts-userspace": 2, "ts-tun": 3}
 PATH_ORDER = {"direct": 0, "derp": 1}
@@ -18,7 +19,7 @@ TOPO_ORDER = {"same-zone": 0, "cross-region": 1}
 DEFAULT_PARALLELISM = [1, 10, 100]
 DEFAULT_MATRIX = {"topologies": list(TOPO_ORDER), "paths": list(PATH_ORDER), "configs": list(CONFIG_ORDER),
                   "parallelism": DEFAULT_PARALLELISM}
-RESULT_SCHEMA_VERSION = 2
+RESULT_SCHEMA_VERSION = 3
 CONFIG_MODE = {"rs-userspace": "userspace", "rs-tun": "tun",
                "ts-userspace": "userspace", "ts-tun": "tun"}
 # Results are written by Python JSON and retain full binary64 precision.  This
@@ -38,8 +39,13 @@ def selected_matrix(root: Path, allow_partial: bool) -> dict:
             raise ValueError("matrix.json is required for strict aggregation")
         return {**DEFAULT_MATRIX, "repeat": None, "legacy_manifest": True}
     data = json.loads(manifest.read_text())
-    if data.get("schema_version") != 1:
-        raise ValueError("unsupported matrix schema_version")
+    if data.get("schema_version") == 2:
+        provenance.validate_manifest(data)
+        if root.name != data["run"]["id"]:
+            raise ValueError("current run directory basename must equal matrix run.id")
+        return {key: data[key] for key in ("topologies", "paths", "configs", "parallelism", "repeat", "dry_run", "run")}
+    if data.get("schema_version") != 1 or not allow_partial:
+        raise ValueError("matrix schema_version must be 2 for strict aggregation")
     matrix = {key: data[key] for key in ("topologies", "paths", "configs")}
     for key, values in matrix.items():
         if (not isinstance(values, list) or not values or len(values) != len(set(values))
@@ -82,6 +88,14 @@ def validate_ok(obj: dict, key: tuple[str, str, str], matrix: dict) -> list[str]
     errors = []
     if obj.get("schema_version") != RESULT_SCHEMA_VERSION:
         errors.append(f"schema_version must be {RESULT_SCHEMA_VERSION}")
+    if "run" in matrix:
+        if obj.get("run") != matrix["run"]:
+            errors.append("result run must exactly equal matrix run")
+        try:
+            zones = provenance.TOPOLOGY_ZONES[topo]
+            provenance.validate_observed(obj.get("observed"), config, matrix["dry_run"], topo, *zones, matrix["run"]["cloud"]["requested_machine_type"])
+        except (ValueError, TypeError) as exc:
+            errors.append(str(exc))
     if obj.get("status") != "ok":
         errors.append("status must be ok")
     if obj.get("error") != "":
@@ -166,6 +180,14 @@ def validate_failed(obj: dict, key: tuple[str, str, str], matrix: dict) -> list[
     errors = []
     if obj.get("schema_version") != RESULT_SCHEMA_VERSION:
         errors.append(f"schema_version must be {RESULT_SCHEMA_VERSION}")
+    if "run" in matrix:
+        if obj.get("run") != matrix["run"]:
+            errors.append("result run must exactly equal matrix run")
+        try:
+            zones = provenance.TOPOLOGY_ZONES[key[0]]
+            provenance.validate_observed(obj.get("observed"), key[2], matrix["dry_run"], key[0], *zones, matrix["run"]["cloud"]["requested_machine_type"])
+        except (ValueError, TypeError) as exc:
+            errors.append(str(exc))
     for field, expected in zip(("topology", "path", "config"), key):
         if obj.get(field) != expected:
             errors.append(f"{field}={obj.get(field)!r}, expected {expected!r}")
@@ -184,7 +206,7 @@ def failed_cell(obj: dict, key: tuple[str, str, str], reason: str) -> dict:
     """Make malformed historical input safe for the partial-only renderer."""
     topo, path, config = key
     return {
-        "schema_version": RESULT_SCHEMA_VERSION, "status": "failed",
+        "schema_version": RESULT_SCHEMA_VERSION, "status": "failed", "legacy": True,
         "topology": topo, "path": path, "config": config,
         "error": reason, "log_tail": obj.get("log_tail", "") if isinstance(obj, dict) else "",
         "throughput": None, "latency": None, "footprint": None,
@@ -252,6 +274,11 @@ def main() -> int:
     found: dict[tuple[str, str, str], list[tuple[Path, object]]] = {key: [] for key in selected}
     problems = []
     for filename in root.glob("*/*/*.json"):
+        # Provenance sidecars are intentionally not result cells. They remain
+        # under the run directory for auditability and are attached into each
+        # result before aggregation.
+        if filename.relative_to(root).parts[0] == "metadata":
+            continue
         try:
             obj = json.loads(filename.read_text())
         except (OSError, json.JSONDecodeError) as exc:
@@ -267,6 +294,25 @@ def main() -> int:
             # one-field mismatch and must never be silently ignored.
             problems.append((None, f"IDENTITY {filename}: does not match a selected cell ({key})"))
     output = []
+    topology_provenance = {}; config_products = {}; run_image = None
+    def check_topology_provenance(key, obj):
+        if "run" not in matrix or not isinstance(obj.get("observed"), dict):
+            return
+        # Per-config product lists intentionally differ. Endpoint image,
+        # runtime environment, and toolchain must remain topology-consistent.
+        nonlocal run_image
+        observed = obj["observed"]
+        if run_image is None: run_image = observed.get("resolved_image")
+        elif run_image != observed.get("resolved_image"):
+            problems.append((key, f"PROVENANCE {'/'.join(key)}: mixed resolved image within run"))
+        fingerprint = json.dumps({field: observed.get(field) for field in ("resolved_image", "server", "client", "toolchain")}, sort_keys=True, separators=(",", ":"))
+        prior = topology_provenance.setdefault(key[0], fingerprint)
+        if prior != fingerprint:
+            problems.append((key, f"PROVENANCE {'/'.join(key)}: mixed observed identity within topology"))
+        product = json.dumps(observed.get("product"), sort_keys=True, separators=(",", ":"))
+        prior_product = config_products.setdefault(key[2], product)
+        if prior_product != product:
+            problems.append((key, f"PROVENANCE {'/'.join(key)}: mixed executable identity for {key[2]}"))
     for key in selected:
         entries = found[key]
         expected = root / key[0] / key[1] / f"{key[2]}.json"
@@ -287,7 +333,12 @@ def main() -> int:
                 problems.append((key, f"MALFORMED {'/'.join(key)}: {reason}"))
             else:
                 problems.append((key, f"FAILED {'/'.join(key)}: {reason}"))
-            output.append(failed_cell(obj, key, reason)); continue
+                check_topology_provenance(key, obj)
+            if allow_partial and not failed_errors and "run" in matrix:
+                output.append(obj)
+            else:
+                output.append(failed_cell(obj, key, reason))
+            continue
         if obj.get("schema_version") != RESULT_SCHEMA_VERSION and allow_partial:
             normalized, legacy_error = normalize_legacy_success(obj, key, matrix)
             if normalized is not None:
@@ -303,6 +354,7 @@ def main() -> int:
             reason = "; ".join(errors)
             problems.append((key, f"MALFORMED {'/'.join(key)}: {reason}"))
             output.append(failed_cell(obj, key, reason)); continue
+        check_topology_provenance(key, obj)
         output.append(obj)
     for _, problem in problems:
         print(f"error: {problem}", file=sys.stderr)

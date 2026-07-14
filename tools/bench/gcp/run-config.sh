@@ -33,6 +33,7 @@ CONFIG: rs-userspace | rs-tun | ts-userspace | ts-tun
 --profile: rs-tun only; collect a Linux perf profile after normal metrics
 --profile-only: rs-tun only; collect a Linux perf diagnostic without writing metrics
 --repeat N: production TUN samples per parallelism (1..=9; default 3)
+--manifest FILE and --observed FILE: current-run immutable provenance inputs
 EOF
   exit 2
 }
@@ -43,7 +44,9 @@ parse_run_config_options() {
   PROFILE=0
   PROFILE_ONLY=0
   REPEAT=3
-  local seen_profile=0 seen_profile_only=0 seen_repeat=0
+  RESULT_MANIFEST=""
+  OBSERVED_METADATA=""
+  local seen_profile=0 seen_profile_only=0 seen_repeat=0 seen_manifest=0 seen_observed=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --profile)
@@ -57,6 +60,14 @@ parse_run_config_options() {
         [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || { echo "--repeat requires a value" >&2; return 2; }
         [[ "$2" =~ ^[1-9]$ ]] || { echo "--repeat must be an integer in 1..=9" >&2; return 2; }
         REPEAT="$2"; seen_repeat=1; shift 2 ;;
+      --manifest)
+        (( seen_manifest == 0 )) || { echo "duplicate option: --manifest" >&2; return 2; }
+        [[ $# -ge 2 && -n "$2" ]] || { echo "--manifest requires a file" >&2; return 2; }
+        RESULT_MANIFEST="$2"; seen_manifest=1; shift 2 ;;
+      --observed)
+        (( seen_observed == 0 )) || { echo "duplicate option: --observed" >&2; return 2; }
+        [[ $# -ge 2 && -n "$2" ]] || { echo "--observed requires a file" >&2; return 2; }
+        OBSERVED_METADATA="$2"; seen_observed=1; shift 2 ;;
       *) echo "unknown option: $1" >&2; return 2 ;;
     esac
   done
@@ -141,9 +152,61 @@ TOPOLOGY="${BENCH_MATRIX%%/*}"
 PATH_TAG="${BENCH_MATRIX##*/}"
 [[ -z "${TOPOLOGY:-}" ]] && TOPOLOGY="unknown"
 [[ -z "${PATH_TAG:-}" ]] && PATH_TAG="unknown"
+if (( SELF_TEST )); then
+  TOPOLOGY=same-zone
+  PATH_TAG=direct
+fi
 
 mkdir -p "$RDIR"
 OUT="$RDIR/$CONFIG.json"
+PROVENANCE_HELPER="$(dirname "$0")/provenance.py"
+
+if (( SELF_TEST )); then
+  RESULT_MANIFEST="$RDIR/matrix.json"
+  OBSERVED_METADATA="$RDIR/observed.json"
+  self_commit=$(git -C "$(cd "$(dirname "$0")/../../.." && pwd)" rev-parse HEAD)
+  python3 "$PROVENANCE_HELPER" manifest "$RESULT_MANIFEST" --run-id gcp-20260714-000000-selftest \
+    --started-at-utc 2026-07-14T00:00:00Z --commit "$self_commit" --dirty 0 --project dry-run \
+    --image-project ubuntu-os-cloud --image-family ubuntu-2204-lts --machine n1-standard-4 --network default \
+    --disk-type pd-standard --disk-gb 200 --dry-run --topologies same-zone --paths direct --configs rs-tun --parallelism 1 10 100 --repeat 3
+  # The self-test config intentionally uses a non-production topology; the
+  # provenance helper only validates endpoint identity when it is non-dry.
+  python3 "$PROVENANCE_HELPER" dry-observed "$OBSERVED_METADATA"
+fi
+
+preflight_current_metadata() {
+  [[ -n "$RESULT_MANIFEST" && -n "$OBSERVED_METADATA" ]] || return 1
+  python3 "$PROVENANCE_HELPER" preflight --manifest "$RESULT_MANIFEST" --observed "$OBSERVED_METADATA" \
+    --config "$CONFIG" --topology "$TOPOLOGY" --path "$PATH_TAG" --server-zone "$SZONE" --client-zone "$CZONE"
+}
+
+if ! preflight_current_metadata; then
+  echo "current-run provenance is missing, malformed, or mismatched" >&2
+  exit 2
+fi
+
+finalize_result_metadata() {
+  (( PROFILE_ONLY )) && return 0
+  python3 "$PROVENANCE_HELPER" attach --manifest "$RESULT_MANIFEST" --observed "$OBSERVED_METADATA" "$OUT"
+}
+
+metadata_preflight_self_test() {
+  local saved="$OBSERVED_METADATA" saved_path="$PATH_TAG" broken="$RDIR/broken-observed.json"
+  printf '%s\n' '{}' >"$broken"
+  OBSERVED_METADATA="$broken"
+  if preflight_current_metadata >/dev/null 2>&1; then
+    return 1
+  fi
+  OBSERVED_METADATA="$saved"
+  # This is deliberately only a preflight call: an excluded path must fail
+  # before daemon startup, profiling, or any measurement command can run.
+  PATH_TAG=derp
+  if preflight_current_metadata >/dev/null 2>&1; then
+    return 1
+  fi
+  PATH_TAG="$saved_path"
+  preflight_current_metadata >/dev/null
+}
 
 # Rust env vars for non-root user.
 export RUSTUP_HOME=/opt/rust CARGO_HOME=/opt/rust/cargo
@@ -509,7 +572,7 @@ cleanup_ts_userspace() {
 # explicit and testable.
 fail_userspace_config() {
   local cleanup_fn="$1" err="$2" log_tail="${3:-}"
-  emit_stub "$err" "$log_tail"
+  emit_stub "$err" "$log_tail" || true
   "$cleanup_fn" || true
   return 1
 }
@@ -575,6 +638,11 @@ obj = {
 }
 print(json.dumps(obj, indent=2))
 PYEOF
+  # A failed-cell attachment error must not short-circuit caller cleanup. The
+  # un-attached result remains fail-closed at strict aggregation.
+  if ! finalize_result_metadata; then
+    echo "[gcp] failed to attach provenance to failed cell" >&2
+  fi
   rm -f "$_lt_tmp"
 }
 
@@ -710,7 +778,9 @@ import json, sys
 path, duration, latency_count, *parallels = sys.argv[1:]
 with open(path) as f:
     result = json.load(f)
-assert result["schema_version"] == 2 and result["status"] == "failed"
+assert result["schema_version"] == 3 and result["status"] == "failed"
+assert result["run"]["source"]["includes_uncommitted_changes"] is False
+assert result["observed"]["resolved_image"] == "dry-run"
 assert result["parallelism_requested"] == [int(p) for p in parallels]
 assert result["throughput"] is None and result["latency"] is None and result["footprint"] is None
 PYEOF
@@ -803,11 +873,11 @@ path_gate_self_test
 run_config_option_parsing_self_test
 
 if (( SELF_TEST )); then
+  metadata_preflight_self_test
   cleanup_self_test
   result_shape_self_test
   runtime_stats_self_test
   rs_tun_lifecycle_self_test
-  rm -rf "$RDIR"
 fi
 
 if [[ -n "${GCP_DRY_RUN:-}" ]]; then
@@ -1073,6 +1143,7 @@ if config == "rs-tun":
 
 print(json.dumps(obj, indent=2))
 PYEOF
+  finalize_result_metadata
   echo "[gcp] $label: wrote $OUT" >&2
 }
 
@@ -1320,7 +1391,7 @@ profile_report_command() {
 
 profile_rs_tun() {
   local profile_dir="$RDIR/profile" server_dir="$RDIR/profile/server" client_dir="$RDIR/profile/client"
-  local srv_pid cli_pid commit status=0 server_wait_status=0 client_wait_status=0
+  local srv_pid cli_pid status=0 server_wait_status=0 client_wait_status=0
   mkdir -p "$server_dir" "$client_dir"
 
   if ! srv_pid=$(ssh_sudo "$SVM" "$SZONE" 'cat /tmp/rs-tun-srv.pid'); then
@@ -1363,12 +1434,10 @@ profile_rs_tun() {
          ! scp_from "$CVM" "$CZONE" /tmp/rs-tun-perf-client-self.txt "$client_dir/perf-self.txt" ||
          [[ ! -s "$server_dir/perf.data" || ! -s "$server_dir/perf-children.txt" || ! -s "$server_dir/perf-self.txt" || ! -s "$client_dir/perf.data" || ! -s "$client_dir/perf-children.txt" || ! -s "$client_dir/perf-self.txt" ]]; then
       status=1
-    elif ! commit=$(git -C "$(cd "$(dirname "$0")/../../.." && pwd)" rev-parse HEAD); then
-      status=1
-    elif ! python3 - "$profile_dir/metadata.json" "$commit" "$TOPOLOGY" "$PATH_TAG" "$CONFIG" "$DURATION" "$REPEAT" "$srv_pid" "$cli_pid" "$OUT" <<'PYEOF'
+    elif ! python3 - "$profile_dir/metadata.json" "$TOPOLOGY" "$PATH_TAG" "$CONFIG" "$DURATION" "$REPEAT" "$srv_pid" "$cli_pid" "$OUT" <<'PYEOF'
 import json, sys
-out, commit, topo, path, config, duration, repeat, srv_pid, cli_pid, result = sys.argv[1:]
-json.dump({"commit":commit,"topology":topo,"path":path,"config":config,
+out, topo, path, config, duration, repeat, srv_pid, cli_pid, result = sys.argv[1:]
+json.dump({"topology":topo,"path":path,"config":config,
            "parallel":10,"duration_s":int(duration),"repeat":int(repeat),"frequency_hz":199,
            "result_json":result,"workload_direction":"server_to_client",
            "reverse":True,"endpoints":{
@@ -1377,6 +1446,8 @@ json.dump({"commit":commit,"topology":topo,"path":path,"config":config,
           open(out,"w"), indent=2)
 PYEOF
     then
+      status=1
+    elif ! python3 "$PROVENANCE_HELPER" profile --manifest "$RESULT_MANIFEST" --observed "$OBSERVED_METADATA" --config "$CONFIG" "$profile_dir/metadata.json"; then
       status=1
     fi
   fi
@@ -1425,6 +1496,9 @@ with open(sys.argv[1]) as f:
 assert metadata["workload_direction"] == "server_to_client"
 assert metadata["reverse"] is True
 assert metadata["repeat"] == 3
+assert metadata["run"]["id"] == "gcp-20260714-000000-selftest"
+assert metadata["source_commit"] == metadata["run"]["source"]["commit"]
+assert metadata["observed"]["resolved_image"] == "dry-run"
 assert metadata["endpoints"]["server"] == {"pid": 42, "command": "rustscaled", "role": "sender"}
 assert metadata["endpoints"]["client"] == {"pid": 84, "command": "rustscaled", "role": "receiver"}
 PYEOF
@@ -1583,6 +1657,7 @@ obj = {
 }
 print(json.dumps(obj, indent=2))
 PYEOF
+  finalize_result_metadata
   echo "[gcp] rs-userspace: wrote $OUT" >&2
 }
 
@@ -1858,6 +1933,7 @@ obj = {
 }
 print(json.dumps(obj, indent=2))
 PYEOF
+  finalize_result_metadata
   echo "[gcp] ts-userspace: wrote $OUT" >&2
 }
 

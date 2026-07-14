@@ -156,3 +156,30 @@ capture-before-GRO, reply order, cancellation, TUN write error handling, and
 pool recycling.  It must then pass the exact focused same-zone/direct
 `rs-tun --profile --repeat 3` comparison without P100, latency, RSS, cleanup,
 or correctness regressions.
+
+## Result
+
+Rejected on the host gate. The isolated vendored BoringTun 0.7.1 spike was
+removed; no production crate, wrapper, transport, or ownership code was
+changed.
+
+Command:
+
+```bash
+cargo test --manifest-path vendor/boringtun-0.7.1/Cargo.toml --release --lib two_chunk_borrowed_decrypt_microbenchmark -- --ignored --nocapture
+```
+
+Host: MacBook Pro (Mac16,7), Apple M4 Pro (14 cores), macOS 26.5.2 / Darwin
+25.5.0 arm64. The 31-round medians for 128 established IPv4 packets with
+1,400-byte plaintexts were:
+
+| Mode | Median | Packets/s | Bytes/s | Ratio |
+| --- | ---: | ---: | ---: | ---: |
+| Stock scalar copy-then-open | 163.459 µs | 783,070.98 | 1,096,299,377.83 | 1.000x |
+| One borrowed in-place chunk | 146.708 µs | 872,481.39 | 1,221,473,948.25 | 1.114x |
+| Two borrowed in-place chunks | 171.458 µs | 746,538.51 | 1,045,153,915.24 | 0.953x stock / 0.856x one |
+
+The two-chunk result missed both required host thresholds: 1.30x versus stock
+scalar and 1.20x versus one borrowed chunk. The dedicated-pool dispatch cost
+was not recovered at this batch size on this host, so the spike is rejected
+and no Linux N2 or production TUN measurement was started.

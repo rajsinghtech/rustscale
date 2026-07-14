@@ -605,7 +605,7 @@ mod tests {
     fn control_server_resolution_returns_host_prefixes() {
         assert_eq!(
             resolve_control_server_ips("https://127.0.0.1:8443"),
-            vec!["127.0.0.1".parse().unwrap()]
+            vec!["127.0.0.1".parse::<IpAddr>().unwrap()]
         );
     }
 

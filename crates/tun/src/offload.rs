@@ -1,6 +1,10 @@
 //! Safe, platform-neutral virtio-net GSO receive splitting.
 
-use std::{collections::HashMap, io};
+use std::{
+    collections::{hash_map::Entry, HashMap},
+    hash::BuildHasher,
+    io,
+};
 
 use crate::TunPacketBatch;
 
@@ -228,15 +232,37 @@ enum Coalesce {
 }
 
 /// Reusable TCP-only GRO planning state. `reset` retains all allocations.
-#[derive(Default)]
-pub(crate) struct TcpGroState {
-    flows: HashMap<TcpFlowKey, Vec<TcpItem>>,
+pub(crate) struct TcpGroState<S = std::hash::RandomState> {
+    flows: HashMap<TcpFlowKey, Vec<TcpItem>, S>,
     item_pool: Vec<Vec<TcpItem>>,
     outputs: Vec<GroOutput>,
     output_pool: Vec<GroOutput>,
 }
 
-impl TcpGroState {
+impl Default for TcpGroState {
+    fn default() -> Self {
+        Self {
+            flows: HashMap::new(),
+            item_pool: Vec::new(),
+            outputs: Vec::new(),
+            output_pool: Vec::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl<S: BuildHasher> TcpGroState<S> {
+    fn with_hasher(hasher: S) -> Self {
+        Self {
+            flows: HashMap::with_hasher(hasher),
+            item_pool: Vec::new(),
+            outputs: Vec::new(),
+            output_pool: Vec::new(),
+        }
+    }
+}
+
+impl<S: BuildHasher> TcpGroState<S> {
     pub(crate) fn outputs(&self) -> &[GroOutput] {
         &self.outputs
     }
@@ -258,7 +284,7 @@ impl TcpGroState {
         self.reset();
         for index in 0..packets.len() {
             let Some(meta) = tcp_meta(&packets[index]) else {
-                self.push_scalar(index);
+                Self::push_scalar(&mut self.outputs, &mut self.output_pool, index);
                 continue;
             };
             self.tcp_gro(index, meta, packets);
@@ -266,8 +292,8 @@ impl TcpGroState {
         self.apply_accounting(packets);
     }
 
-    fn push_scalar(&mut self, packet: usize) {
-        let mut output = self.output_pool.pop().unwrap_or(GroOutput {
+    fn push_scalar(outputs: &mut Vec<GroOutput>, output_pool: &mut Vec<GroOutput>, packet: usize) {
+        let mut output = output_pool.pop().unwrap_or(GroOutput {
             header: [0; VIRTIO_NET_HDR_LEN],
             head: packet,
             fragments: Vec::new(),
@@ -275,18 +301,11 @@ impl TcpGroState {
         output.header = [0; VIRTIO_NET_HDR_LEN];
         output.head = packet;
         output.fragments.clear();
-        self.outputs.push(output);
+        outputs.push(output);
     }
 
-    fn insert(&mut self, packet: usize, meta: TcpMeta) {
-        let output = self.outputs.len();
-        self.push_scalar(packet);
-        let items = self.flows.entry(meta.key).or_insert_with(|| {
-            let mut items = self.item_pool.pop().unwrap_or_default();
-            items.clear();
-            items
-        });
-        items.push(TcpItem {
+    fn item(meta: TcpMeta, output: usize) -> TcpItem {
+        TcpItem {
             key: meta.key,
             output,
             sent_seq: meta.seq,
@@ -295,60 +314,72 @@ impl TcpGroState {
             ip_len: meta.ip_len as u8,
             tcp_len: meta.tcp_len as u8,
             psh: meta.psh,
-        });
+        }
     }
 
     fn tcp_gro(&mut self, packet: usize, meta: TcpMeta, packets: &mut [Vec<u8>]) {
-        let Some(item_len) = self.flows.get(&meta.key).map(Vec::len) else {
-            self.insert(packet, meta);
-            return;
+        let Self {
+            flows,
+            item_pool,
+            outputs,
+            output_pool,
+        } = self;
+        let items = match flows.entry(meta.key) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                let output = outputs.len();
+                Self::push_scalar(outputs, output_pool, packet);
+                let mut items = item_pool.pop().unwrap_or_default();
+                items.clear();
+                entry.insert(items).push(Self::item(meta, output));
+                return;
+            }
         };
 
-        for item_index in (0..item_len).rev() {
+        for item_index in (0..items.len()).rev() {
             // Copy one candidate out of the table, rather than cloning the
             // entire per-flow Vec on every packet.
-            let item = self.flows.get(&meta.key).expect("flow exists")[item_index];
-            let mode = self.can_coalesce(&packets[packet], meta, item, packets);
+            let item = items[item_index];
+            let mode = Self::can_coalesce(outputs, &packets[packet], meta, item, packets);
             if mode == Coalesce::No {
                 continue;
             }
-            if self.output_is_single(item.output)
+            if Self::output_is_single(outputs, item.output)
                 && !tcp_checksum_valid(
-                    &packets[self.outputs[item.output].head],
+                    &packets[outputs[item.output].head],
                     item.ip_len as usize,
                     item.key.v6,
                 )
             {
-                self.flows
-                    .get_mut(&meta.key)
-                    .expect("flow exists")
-                    .remove(item_index);
+                items.remove(item_index);
                 continue;
             }
             if !tcp_checksum_valid(&packets[packet], meta.ip_len, meta.key.v6) {
-                self.push_scalar(packet);
+                Self::push_scalar(outputs, output_pool, packet);
                 return;
             }
 
-            let item = self.merge(packet, meta, item, mode, packets);
-            self.flows.get_mut(&meta.key).expect("flow exists")[item_index] = item;
+            let item = Self::merge(outputs, packet, meta, item, mode, packets);
+            items[item_index] = item;
             return;
         }
-        self.insert(packet, meta);
+        let output = outputs.len();
+        Self::push_scalar(outputs, output_pool, packet);
+        items.push(Self::item(meta, output));
     }
 
-    fn output_is_single(&self, output: usize) -> bool {
-        self.outputs[output].fragments.is_empty()
+    fn output_is_single(outputs: &[GroOutput], output: usize) -> bool {
+        outputs[output].fragments.is_empty()
     }
 
     fn can_coalesce(
-        &self,
+        outputs: &[GroOutput],
         packet: &[u8],
         meta: TcpMeta,
         item: TcpItem,
         packets: &[Vec<u8>],
     ) -> Coalesce {
-        let output = &self.outputs[item.output];
+        let output = &outputs[item.output];
         if output.iovec_count() >= MAX_GRO_IOVECS {
             return Coalesce::No;
         }
@@ -390,14 +421,14 @@ impl TcpGroState {
     }
 
     fn merge(
-        &mut self,
+        outputs: &mut [GroOutput],
         packet: usize,
         meta: TcpMeta,
         mut item: TcpItem,
         mode: Coalesce,
         packets: &[Vec<u8>],
     ) -> TcpItem {
-        let output = &mut self.outputs[item.output];
+        let output = &mut outputs[item.output];
         if mode == Coalesce::Prepend {
             let old_head = output.head;
             output.head = packet;
@@ -1329,6 +1360,76 @@ mod tests {
         let mut state = TcpGroState::default();
         state.plan(packets);
         state.outputs().len()
+    }
+
+    #[test]
+    fn tcp_gro_prefers_newest_compatible_candidate_then_keeps_older_one() {
+        let mut packets = vec![
+            tcp_packet(false, 100, 7, b"aaaa", TCP_ACK),
+            tcp_packet(false, 200, 7, b"bbbb", TCP_ACK),
+            tcp_packet(false, 204, 7, b"cccc", TCP_ACK),
+            tcp_packet(false, 104, 7, b"dddd", TCP_ACK),
+        ];
+        let mut state = TcpGroState::default();
+        state.plan(&mut packets);
+
+        assert_eq!(state.outputs().len(), 2);
+        assert_eq!(state.outputs()[0].fragments[0].packet, 3);
+        assert_eq!(state.outputs()[1].fragments[0].packet, 2);
+        let items = state.flows.values().next().expect("one TCP flow");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].output, 0);
+        assert_eq!(items[1].output, 1);
+    }
+
+    #[test]
+    fn tcp_gro_evicts_invalid_newest_head_and_uses_older_candidate() {
+        let mut packets = vec![
+            tcp_packet(false, 100, 7, b"good", TCP_ACK),
+            tcp_packet(false, 100, 7, b"bad!", TCP_ACK),
+            tcp_packet(false, 104, 7, b"next", TCP_ACK),
+        ];
+        packets[1][36] ^= 1;
+        let mut state = TcpGroState::default();
+        state.plan(&mut packets);
+
+        assert_eq!(state.outputs().len(), 2);
+        assert_eq!(state.outputs()[0].fragments[0].packet, 2);
+        let items = state.flows.values().next().expect("one TCP flow");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].output, 0);
+    }
+
+    #[derive(Clone)]
+    struct CountingBuildHasher(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl std::hash::BuildHasher for CountingBuildHasher {
+        type Hasher = std::collections::hash_map::DefaultHasher;
+
+        fn build_hasher(&self) -> Self::Hasher {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Self::Hasher::new()
+        }
+    }
+
+    #[test]
+    fn tcp_gro_established_append_hashes_flow_table_once() {
+        let hashes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut state = TcpGroState::with_hasher(CountingBuildHasher(hashes.clone()));
+        let mut packets = vec![
+            tcp_packet(false, 100, 7, b"head", TCP_ACK),
+            tcp_packet(false, 104, 7, b"tail", TCP_ACK),
+        ];
+
+        let first = tcp_meta(&packets[0]).expect("valid TCP packet");
+        state.tcp_gro(0, first, &mut packets);
+        hashes.store(0, std::sync::atomic::Ordering::Relaxed);
+
+        let second = tcp_meta(&packets[1]).expect("valid TCP packet");
+        state.tcp_gro(1, second, &mut packets);
+
+        assert_eq!(hashes.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(state.outputs()[0].fragments[0].packet, 1);
     }
 
     #[test]

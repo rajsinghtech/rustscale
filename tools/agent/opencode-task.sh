@@ -88,6 +88,12 @@ status_busy() {
 }
 
 START="$(date +%s)"
+SEEN_BUSY=0
+# Cold-start grace: right after prompt_async the session may not yet be in the
+# busy set, and its assistant row can exist with empty parts. Do not accept an
+# empty/stuck result as final until we have observed the session busy at least
+# once, or this many seconds have elapsed.
+WARMUP="${OPENCODE_WARMUP:-45}"
 while :; do
   now="$(date +%s)"
   elapsed=$((now - START))
@@ -102,20 +108,28 @@ while :; do
   if ! busy="$(status_busy)"; then
     fail "session status is unknown (server error or timeout)"
   fi
-  if [[ "$busy" == 0 ]]; then
+  if [[ "$busy" == 1 ]]; then
+    SEEN_BUSY=1
+  else
     if ! output="$(messages | jq -r '
       [.[] | select(.info.role == "assistant")] | last |
       if . == null then "STUCK:empty_session"
       else ([.parts[]? | select(.type == "text") | .text] | join("")) end')"; then
       fail "message retrieval is unknown (server error or timeout)"
     fi
-    if [[ "$output" == STUCK:* ]]; then
-      echo "##STATUS:STUCK session=$SID duration=${elapsed}s detail=$output" >&2
+    if [[ -z "$output" || "$output" == STUCK:* ]]; then
+      # Empty result. If we have not warmed up yet, this is the cold-start
+      # race, not a real finish — keep polling.
+      if [[ "$SEEN_BUSY" == 1 || "$elapsed" -ge "$WARMUP" ]]; then
+        echo "##STATUS:STUCK session=$SID duration=${elapsed}s detail=${output:-STUCK:empty_output}" >&2
+        echo "${output:-STUCK:empty_output}"
+        exit 0
+      fi
     else
       echo "##STATUS:DONE session=$SID duration=${elapsed}s" >&2
+      echo "$output"
+      exit 0
     fi
-    echo "$output"
-    exit 0
   fi
   sleep 5
 done

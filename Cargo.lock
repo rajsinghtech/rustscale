@@ -2413,7 +2413,7 @@ dependencies = [
 
 [[package]]
 name = "rustscale-appc"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rustscale-key",
  "rustscale-tailcfg",
@@ -2424,11 +2424,11 @@ dependencies = [
 
 [[package]]
 name = "rustscale-atomicfile"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "rustscale-auditlog"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2445,7 +2445,7 @@ dependencies = [
 
 [[package]]
 name = "rustscale-bakedroots"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64",
  "rustls",
@@ -2454,7 +2454,7 @@ dependencies = [
 
 [[package]]
 name = "rustscale-bench"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap",
  "rustscale-magicsock",
@@ -2467,7 +2467,7 @@ dependencies = [
 
 [[package]]
 name = "rustscale-c2n"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "rustscale-tsaddr",
@@ -2479,7 +2479,7 @@ dependencies = [
 
 [[package]]
 name = "rustscale-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "base64",
@@ -2503,7 +2503,7 @@ dependencies = [
 
 [[package]]
 name = "rustscale-clientmetric"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -2511,7 +2511,7 @@ dependencies = [
 
 [[package]]
 name = "rustscale-clientupdate"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "log",
  "rustscale-tailcfg",
@@ -2520,7 +2520,7 @@ dependencies = [
 
 [[package]]
 name = "rustscale-conffile"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rustscale-ipn",
  "rustscale-tailcfg",
@@ -2532,7 +2532,7 @@ dependencies = [
 
 [[package]]
 name = "rustscale-connectproxy"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "log",
  "rustscale-tsdial",
@@ -2542,7 +2542,7 @@ dependencies = [
 
 [[package]]
 name = "rustscale-controlclient"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "base64",
@@ -2576,11 +2576,11 @@ dependencies = [
 
 [[package]]
 name = "rustscale-controlknobs"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "rustscale-derp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "hex",
  "rustls",
@@ -2603,7 +2603,7 @@ dependencies = [
 
 [[package]]
 name = "rustscale-disco"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "hex",
  "rustscale-key",
@@ -2613,7 +2613,7 @@ dependencies = [
 
 [[package]]
 name = "rustscale-dns"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rustls",
  "rustscale-bakedroots",
@@ -2633,7 +2633,7 @@ dependencies = [
 
 [[package]]
 name = "rustscale-dnscache"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rustscale-netns",
  "thiserror 1.0.69",
@@ -2643,7 +2643,7 @@ dependencies = [
 
 [[package]]
 name = "rustscale-dnsfallback"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rand 0.8.7",
  "rustls",
@@ -2661,18 +2661,18 @@ dependencies = [
 
 [[package]]
 name = "rustscale-dnsname"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "thiserror 1.0.69",
 ]
 
 [[package]]
 name = "rustscale-envknob"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "rustscale-ffi"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cbindgen",
  "rustscale-health",
@@ -2685,7 +2685,7 @@ dependencies = [
 
 [[package]]
 name = "rustscale-filter"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rustscale-flowtrack",
  "rustscale-packet",
@@ -2695,7 +2695,7 @@ dependencies = [
 
 [[package]]
 name = "rustscale-flowtrack"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -2703,7 +2703,7 @@ dependencies = [
 
 [[package]]
 name = "rustscale-health"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "serde",
@@ -2712,7 +2712,7 @@ dependencies = [
 
 [[package]]
 name = "rustscale-interop-testcontrol"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rustls",
  "rustscale-key",
@@ -2728,7 +2728,7 @@ dependencies = [
 
 [[package]]
 name = "rustscale-ipn"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "proptest",
  "serde",
@@ -2739,7 +2739,7 @@ dependencies = [
 
 [[package]]
 name = "rustscale-ipnstate"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "rustscale-key",
@@ -2750,7 +2750,7 @@ dependencies = [
 
 [[package]]
 name = "rustscale-key"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64",
  "crypto_box",
@@ -2763,14 +2763,14 @@ dependencies = [
 
 [[package]]
 name = "rustscale-ktimeout"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "rustscale-localclient"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rustscale-ipn",
  "rustscale-ipnstate",
@@ -2787,7 +2787,7 @@ dependencies = [
 
 [[package]]
 name = "rustscale-logid"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "hex",
  "rand 0.8.7",
@@ -2801,7 +2801,7 @@ dependencies = [
 
 [[package]]
 name = "rustscale-logpolicy"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rustscale-envknob",
  "rustscale-logid",
@@ -2814,7 +2814,7 @@ dependencies = [
 
 [[package]]
 name = "rustscale-logtail"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "log",
@@ -2829,7 +2829,7 @@ dependencies = [
 
 [[package]]
 name = "rustscale-magicsock"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "hex",
@@ -2855,7 +2855,7 @@ dependencies = [
 
 [[package]]
 name = "rustscale-netcheck"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "crc32fast",
  "rand 0.8.7",
@@ -2869,7 +2869,7 @@ dependencies = [
 
 [[package]]
 name = "rustscale-neterror"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libc",
  "thiserror 1.0.69",
@@ -2877,7 +2877,7 @@ dependencies = [
 
 [[package]]
 name = "rustscale-netlog"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "log",
@@ -2893,7 +2893,7 @@ dependencies = [
 
 [[package]]
 name = "rustscale-netlogtype"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rustscale-tailcfg",
  "serde",
@@ -2902,7 +2902,7 @@ dependencies = [
 
 [[package]]
 name = "rustscale-netmon"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "if-addrs",
  "libc",
@@ -2913,7 +2913,7 @@ dependencies = [
 
 [[package]]
 name = "rustscale-netns"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "if-addrs",
  "libc",
@@ -2926,7 +2926,7 @@ dependencies = [
 
 [[package]]
 name = "rustscale-netstack"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "rustscale-key",
@@ -2939,15 +2939,15 @@ dependencies = [
 
 [[package]]
 name = "rustscale-packet"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "rustscale-paths"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "rustscale-portlist"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rustscale-tailcfg",
  "tokio",
@@ -2955,7 +2955,7 @@ dependencies = [
 
 [[package]]
 name = "rustscale-portmapper"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "if-addrs",
  "rand 0.8.7",
@@ -2967,14 +2967,14 @@ dependencies = [
 
 [[package]]
 name = "rustscale-proxymap"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "tokio",
 ]
 
 [[package]]
 name = "rustscale-quarantine"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libc",
  "rand 0.8.7",
@@ -2982,25 +2982,25 @@ dependencies = [
 
 [[package]]
 name = "rustscale-ringlog"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "rustscale-router"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rustscale-tsaddr",
 ]
 
 [[package]]
 name = "rustscale-routetable"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "rustscale-rustscaled"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "log",
  "rustscale-conffile",
@@ -3015,7 +3015,7 @@ dependencies = [
 
 [[package]]
 name = "rustscale-safesocket"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "hex",
  "libc",
@@ -3027,7 +3027,7 @@ dependencies = [
 
 [[package]]
 name = "rustscale-sockstats"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -3036,7 +3036,7 @@ dependencies = [
 
 [[package]]
 name = "rustscale-ssh"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64",
  "chrono",
@@ -3056,7 +3056,7 @@ dependencies = [
 
 [[package]]
 name = "rustscale-tailcfg"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64",
  "chrono",
@@ -3070,14 +3070,14 @@ dependencies = [
 
 [[package]]
 name = "rustscale-tcpinfo"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "rustscale-testcontrol"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64",
  "bytes",
@@ -3101,7 +3101,7 @@ dependencies = [
 
 [[package]]
 name = "rustscale-tka"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "argon2",
  "blake2",
@@ -3115,7 +3115,7 @@ dependencies = [
 
 [[package]]
 name = "rustscale-tsaddr"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -3124,7 +3124,7 @@ dependencies = [
 
 [[package]]
 name = "rustscale-tsdial"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rustls",
  "rustscale-dnscache",
@@ -3142,7 +3142,7 @@ dependencies = [
 
 [[package]]
 name = "rustscale-tshttpproxy"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64",
  "rustscale-netns",
@@ -3153,7 +3153,7 @@ dependencies = [
 
 [[package]]
 name = "rustscale-tsnet"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "base64",
@@ -3221,7 +3221,7 @@ dependencies = [
 
 [[package]]
 name = "rustscale-tun"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "libc",
@@ -3231,7 +3231,7 @@ dependencies = [
 
 [[package]]
 name = "rustscale-udprelay"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "blake2",
  "rand 0.8.7",
@@ -3243,7 +3243,7 @@ dependencies = [
 
 [[package]]
 name = "rustscale-wg"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "boringtun",
  "rustscale-key",
@@ -3252,7 +3252,7 @@ dependencies = [
 
 [[package]]
 name = "rustscale-wire-fixture"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "hex",
  "rustscale-derp",

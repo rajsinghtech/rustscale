@@ -10,4 +10,4 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-rustscale-tsaddr = { path = "../tsaddr", version = "0.1.0" }
+rustscale-tsaddr = { path = "../tsaddr", version = "0.1.1" }

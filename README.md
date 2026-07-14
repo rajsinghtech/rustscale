@@ -98,8 +98,18 @@ curl -fsSL https://rajsinghtech.github.io/rustscale/install.sh | sh
 Detects your OS and architecture, downloads the matching prebuilt archive from
 the latest GitHub Release, and installs `rustscale`, `rustscaled`, and the C
 library (`librustscale` + `rustscale.h`) to `/usr/local`. Override the prefix
-with `PREFIX=...`, pin a version with `--version v0.1.0`, or uninstall with
-`--uninstall`.
+with `PREFIX=...`, pin a version with `--version v0.1.1`, skip system service
+setup with `--no-service`, or uninstall with `--uninstall`. Downloads are
+verified against the release's `SHA256SUMS` before extraction.
+
+While the GitHub repository is private, set `GH_TOKEN` to a fine-grained token
+with Contents read access before running either installer. Public one-line and
+Homebrew installation require public release assets.
+
+For scripts that invoke the upstream command names, pass
+`--tailscale-compatible` to install `tailscale` and `tailscaled` aliases. This
+mode conflicts with an existing official Tailscale installation and is never
+enabled implicitly on a host.
 
 ### Windows (one-liner)
 
@@ -109,7 +119,9 @@ irm https://rajsinghtech.github.io/rustscale/install.ps1 | iex
 
 Installs `rustscale.exe` and `rustscaled.exe` to `%LOCALAPPDATA%\rustscale`
 (user scope, no admin needed) and adds it to your PATH. Use `-Scope System` for
-a machine-wide install, `-Version v0.1.0` to pin, or `-Uninstall` to remove.
+a machine-wide install, `-Version v0.1.1` to pin, or `-Uninstall` to remove.
+The Windows installer also verifies `SHA256SUMS`; `-TailscaleCompatible` adds
+command aliases for replacement deployments.
 
 ### Homebrew (macOS)
 
@@ -126,11 +138,12 @@ docker run -d --name rustscale \
   -e TS_AUTHKEY=tskey-... \
   -e TS_HOSTNAME=my-container \
   -v rustscale-state:/var/lib/rustscale \
-  ghcr.io/rajsinghtech/rustscale
+  ghcr.io/rajsinghtech/rustscale:v0.1.1
 ```
 
 Runs in userspace networking mode by default (no `--privileged` needed).
 For TUN mode, add `--privileged --device /dev/net/tun` and set `TS_USERSPACE=0`.
+The image supports both the rustscale and upstream Tailscale command names.
 
 See `container/entrypoint.sh` for the full `TS_*` env var reference.
 

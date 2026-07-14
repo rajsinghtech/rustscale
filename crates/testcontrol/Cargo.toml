@@ -10,9 +10,9 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-rustscale-key = { path = "../key", version = "0.1.0" }
-rustscale-tailcfg = { path = "../tailcfg", version = "0.1.0" }
-rustscale-controlclient = { path = "../controlclient", version = "0.1.0" }
+rustscale-key = { path = "../key", version = "0.1.1" }
+rustscale-tailcfg = { path = "../tailcfg", version = "0.1.1" }
+rustscale-controlclient = { path = "../controlclient", version = "0.1.1" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
@@ -25,10 +25,12 @@ chrono.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-rustscale-tsnet = { path = "../tsnet", version = "0.1.0" }
-rustscale-derp = { path = "../derp", version = "0.1.0" }
-rustscale-tailcfg = { path = "../tailcfg", version = "0.1.0" }
-rustscale-key = { path = "../key", version = "0.1.0" }
-rustscale-magicsock = { path = "../magicsock", version = "0.1.0" }
-rustscale-udprelay = { path = "../udprelay", version = "0.1.0" }
+# Intentionally path-only: keeping this dev-only back-edge out of the published
+# manifest breaks the testcontrol <-> tsnet package cycle.
+rustscale-tsnet = { path = "../tsnet" }
+rustscale-derp = { path = "../derp", version = "0.1.1" }
+rustscale-tailcfg = { path = "../tailcfg", version = "0.1.1" }
+rustscale-key = { path = "../key", version = "0.1.1" }
+rustscale-magicsock = { path = "../magicsock", version = "0.1.1" }
+rustscale-udprelay = { path = "../udprelay", version = "0.1.1" }
 tempfile = "3"

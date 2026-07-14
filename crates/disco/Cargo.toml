@@ -10,7 +10,7 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-rustscale-key = { path = "../key", version = "0.1.0" }
+rustscale-key = { path = "../key", version = "0.1.1" }
 thiserror.workspace = true
 hex.workspace = true
 

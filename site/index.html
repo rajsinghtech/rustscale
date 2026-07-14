@@ -1,28 +1,79 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>rustscale</title>
-<style>
-body { font-family: -apple-system, system-ui, sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; color: #333; }
-code { background: #f4f4f4; padding: 0.15em 0.3em; border-radius: 3px; font-size: 0.9em; }
-pre { background: #f4f4f4; padding: 1rem; border-radius: 6px; overflow-x: auto; }
-pre code { background: none; padding: 0; }
-a { color: #0366d6; }
-</style>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Install rustscale, a Rust implementation of Tailscale's client stack.">
+  <title>Install rustscale</title>
+  <style>
+    :root { color-scheme: light dark; --accent: #ce422b; --muted: #777; --card: color-mix(in srgb, Canvas 94%, CanvasText 6%); --border: color-mix(in srgb, CanvasText 18%, transparent); }
+    * { box-sizing: border-box; }
+    body { margin: 0; color: CanvasText; background: Canvas; font: 16px/1.55 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    main { width: min(760px, calc(100% - 2rem)); margin: 0 auto; padding: 4rem 0 3rem; }
+    header { text-align: center; margin-bottom: 3rem; }
+    header img { width: min(300px, 80%); height: auto; }
+    h1 { margin: 1.25rem 0 .5rem; font-size: clamp(2.2rem, 8vw, 3.4rem); letter-spacing: -.04em; }
+    h2 { margin: 0 0 .35rem; font-size: 1.05rem; }
+    p { margin: .35rem 0; }
+    .lede { max-width: 620px; margin: .5rem auto; color: var(--muted); font-size: 1.1rem; }
+    .badge { display: inline-block; padding: .2rem .65rem; border: 1px solid color-mix(in srgb, var(--accent) 55%, transparent); border-radius: 999px; color: var(--accent); font-size: .78rem; font-weight: 700; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 1rem; }
+    .card { padding: 1.15rem; border: 1px solid var(--border); border-radius: 12px; background: var(--card); }
+    .card p { color: var(--muted); font-size: .9rem; }
+    .command { display: flex; align-items: center; gap: .7rem; margin-top: .8rem; padding: .75rem; border: 1px solid var(--border); border-radius: 8px; background: Canvas; }
+    code { min-width: 0; overflow-x: auto; white-space: nowrap; font: .82rem/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    button { margin-left: auto; padding: .35rem .55rem; color: CanvasText; background: var(--card); border: 1px solid var(--border); border-radius: 6px; cursor: pointer; }
+    button:hover { border-color: var(--accent); }
+    .note { margin-top: 1.25rem; padding: 1rem 1.15rem; border-left: 3px solid var(--accent); background: var(--card); color: var(--muted); }
+    footer { margin-top: 2.5rem; text-align: center; color: var(--muted); font-size: .9rem; }
+    a { color: var(--accent); }
+  </style>
 </head>
 <body>
-<h1>rustscale</h1>
-<p>A Rust implementation of <a href="https://github.com/rajsinghtech/rustscale">Tailscale's client stack</a>.</p>
-<h2>Install</h2>
-<p>macOS / Linux:</p>
-<pre><code>curl -fsSL https://rajsinghtech.github.io/rustscale/install.sh | sh</code></pre>
-<p>Windows (PowerShell):</p>
-<pre><code>irm https://rajsinghtech.github.io/rustscale/install.ps1 | iex</code></pre>
-<h2>Get started</h2>
-<pre><code>sudo rustscaled run       # start the daemon
-rustscale up              # connect to a tailnet
-rustscale status          # check state</code></pre>
+  <main>
+    <header>
+      <img src="assets/rustscale-logo.svg" alt="rustscale">
+      <h1>Install rustscale</h1>
+      <span class="badge">v0.1.1</span>
+      <p class="lede">A Rust implementation of Tailscale's client stack, with familiar CLI and container workflows for drop-in deployments.</p>
+    </header>
+
+    <section class="grid" aria-label="Installation methods">
+      <article class="card">
+        <h2>macOS and Linux</h2>
+        <p>Installs verified release binaries and the C library. System service setup is automatic where supported.</p>
+        <div class="command"><code>curl -fsSL https://rajsinghtech.github.io/rustscale/install.sh | sh</code><button type="button">Copy</button></div>
+      </article>
+      <article class="card">
+        <h2>Windows PowerShell</h2>
+        <p>User-scoped by default, with checksum verification and no administrator requirement.</p>
+        <div class="command"><code>irm https://rajsinghtech.github.io/rustscale/install.ps1 | iex</code><button type="button">Copy</button></div>
+      </article>
+      <article class="card">
+        <h2>Homebrew</h2>
+        <p>Installs the rustscale CLI and rustscaled daemon on macOS or Linux.</p>
+        <div class="command"><code>brew install rajsinghtech/tap/rustscale</code><button type="button">Copy</button></div>
+      </article>
+      <article class="card">
+        <h2>Container</h2>
+        <p>Multi-architecture image with Tailscale-compatible environment variables and command aliases.</p>
+        <div class="command"><code>docker pull ghcr.io/rajsinghtech/rustscale:v0.1.1</code><button type="button">Copy</button></div>
+      </article>
+    </section>
+
+    <aside class="note">Replacing an upstream installation? Download the Unix installer and run it with <code>--tailscale-compatible</code>. The aliases are explicit so rustscale never silently overwrites an installed official client.</aside>
+
+    <footer><a href="https://github.com/rajsinghtech/rustscale">Source</a> · <a href="https://github.com/rajsinghtech/rustscale/releases">Releases</a> · BSD-3-Clause</footer>
+  </main>
+  <script>
+    document.querySelectorAll('button').forEach(function (button) {
+      button.addEventListener('click', function () {
+        navigator.clipboard.writeText(button.previousElementSibling.textContent).then(function () {
+          button.textContent = 'Copied';
+          setTimeout(function () { button.textContent = 'Copy'; }, 1200);
+        });
+      });
+    });
+  </script>
 </body>
 </html>

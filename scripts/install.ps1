@@ -11,13 +11,15 @@
 #
 # Parameters:
 #   -Scope <User|System>   Install location (default: User)
-#   -Version <tag>         Pin to a specific release tag (e.g. "v0.1.0")
+#   -Version <tag>         Pin to a specific release tag (e.g. "v0.1.1")
+#   -TailscaleCompatible   Also install tailscale.exe and tailscaled.exe aliases
+#   -NoPath                Do not change the persistent PATH (portable installs)
 #   -Uninstall             Remove installed files
 #
 # Examples:
 #   irm https://rajsinghtech.github.io/rustscale/install.ps1 | iex
-#   irm https://rajsinghtech.github.io/rustscale/install.ps1 | iex -Scope System
-#   & .\install.ps1 -Version v0.1.0
+#   & ([scriptblock]::Create((irm https://rajsinghtech.github.io/rustscale/install.ps1))) -Scope System
+#   & .\install.ps1 -Version v0.1.1
 
 [CmdletBinding()]
 param(
@@ -26,15 +28,21 @@ param(
 
     [string]$Version = '',
 
+    [switch]$TailscaleCompatible,
+
+    [switch]$NoPath,
+
     [switch]$Uninstall
 )
 
 $ErrorActionPreference = 'Stop'
 $Repo = 'rajsinghtech/rustscale'
 $Archive = 'rustscale-x86_64-pc-windows-msvc.zip'
-# Fallback version when the GitHub API is unreachable (private repos, rate
-# limits, offline). Bump with each release.
-$DefaultVersion = 'v0.1.0'
+$ReleaseBase = if ($env:RUSTSCALE_RELEASE_BASE) {
+    $env:RUSTSCALE_RELEASE_BASE.TrimEnd('/')
+} else {
+    "https://github.com/$Repo/releases"
+}
 
 function Get-InstallDir {
     if ($Scope -eq 'System') {
@@ -43,41 +51,55 @@ function Get-InstallDir {
     return Join-Path $env:LOCALAPPDATA 'rustscale'
 }
 
-function Get-DownloadUrl {
+function Get-ReleaseRoot {
     if ($Version) {
-        return "https://github.com/$Repo/releases/download/$Version/$Archive"
-    }
-
-    # Try the releases/latest redirect first (works for public repos without API).
-    try {
-        $resp = Invoke-WebRequest -Uri "https://github.com/$Repo/releases/latest" `
-            -Method Head -MaximumRedirection 0 -ErrorAction Stop -UseBasicParsing
-    } catch [System.Net.Http.HttpRequestException] {
-        $resp = $_.Exception.Response
-    }
-    if ($resp -and $resp.Headers.Location) {
-        $tag = ($resp.Headers.Location -split '/')[-1]
-        if ($tag -match '^v') {
-            $Version = $tag
-            return "https://github.com/$Repo/releases/download/$Version/$Archive"
+        if (-not $Version.StartsWith('v')) {
+            $script:Version = "v$Version"
         }
+        return "$ReleaseBase/download/$Version"
     }
+    $script:Version = 'latest'
+    return "$ReleaseBase/latest/download"
+}
 
-    # Try the GitHub API.
-    try {
-        $apiUrl = "https://api.github.com/repos/$Repo/releases/latest"
-        $release = Invoke-RestMethod -Uri $apiUrl -UseBasicParsing
-        if ($release.tag_name) {
-            $Version = $release.tag_name
-            return "https://github.com/$Repo/releases/download/$Version/$Archive"
+function Get-AssetUrl {
+    param([string]$ReleaseRoot, [string]$Name)
+
+    $token = if ($env:GH_TOKEN) { $env:GH_TOKEN } else { $env:GITHUB_TOKEN }
+    if (-not $token) { return "$ReleaseRoot/$Name" }
+
+    if (-not $script:PrivateRelease) {
+        $releaseApi = if ($Version -eq 'latest') {
+            "https://api.github.com/repos/$Repo/releases/latest"
+        } else {
+            "https://api.github.com/repos/$Repo/releases/tags/$Version"
         }
-    } catch {
-        # Fall through to default.
+        $headers = @{
+            Authorization = "Bearer $token"
+            Accept = 'application/vnd.github+json'
+            'X-GitHub-Api-Version' = '2022-11-28'
+        }
+        $script:PrivateRelease = Invoke-RestMethod -Uri $releaseApi -Headers $headers
     }
+    $asset = $script:PrivateRelease.assets | Where-Object { $_.name -eq $Name } |
+        Select-Object -First 1
+    if (-not $asset) { throw "release API response is missing $Name" }
+    return $asset.url
+}
 
-    # Fallback to hardcoded default.
-    $Version = $DefaultVersion
-    return "https://github.com/$Repo/releases/download/$Version/$Archive"
+function Save-ReleaseFile {
+    param([string]$Uri, [string]$OutFile)
+
+    if ($Uri.StartsWith('file:')) {
+        Copy-Item ([Uri]$Uri).LocalPath $OutFile -Force
+        return
+    }
+    $token = if ($env:GH_TOKEN) { $env:GH_TOKEN } else { $env:GITHUB_TOKEN }
+    $headers = if ($token) {
+        @{ Authorization = "Bearer $token"; Accept = 'application/octet-stream' }
+    } else { @{} }
+    Invoke-WebRequest -Uri $Uri -OutFile $OutFile -Headers $headers `
+        -UseBasicParsing -ErrorAction Stop
 }
 
 function Add-ToPath {
@@ -89,12 +111,15 @@ function Add-ToPath {
         $pathKey = 'HKCU:\Environment'
     }
 
-    $currentPath = (Get-ItemProperty -Path $pathKey -Name PATH).PATH
+    $currentPath = (Get-ItemProperty -Path $pathKey -Name PATH -ErrorAction SilentlyContinue).PATH
+    if (-not $currentPath) { $currentPath = '' }
     if ($currentPath -split ';' -contains $PathToAdd) {
         return
     }
 
-    $newPath = if ($currentPath.EndsWith(';')) {
+    $newPath = if (-not $currentPath) {
+        "$PathToAdd;"
+    } elseif ($currentPath.EndsWith(';')) {
         "$currentPath$PathToAdd;"
     } else {
         "$currentPath;$PathToAdd;"
@@ -128,7 +153,8 @@ function Remove-FromPath {
         $pathKey = 'HKCU:\Environment'
     }
 
-    $currentPath = (Get-ItemProperty -Path $pathKey -Name PATH).PATH
+    $currentPath = (Get-ItemProperty -Path $pathKey -Name PATH -ErrorAction SilentlyContinue).PATH
+    if (-not $currentPath) { return }
     $entries = $currentPath -split ';' | Where-Object { $_ -and $_ -ne $PathToRemove }
     $newPath = ($entries -join ';') + ';'
     Set-ItemProperty -Path $pathKey -Name PATH -Value $newPath
@@ -145,15 +171,51 @@ function Do-Install {
         }
     }
 
-    $url = Get-DownloadUrl
+    $releaseRoot = Get-ReleaseRoot
+    $url = Get-AssetUrl -ReleaseRoot $releaseRoot -Name $Archive
+    $checksumUrl = Get-AssetUrl -ReleaseRoot $releaseRoot -Name 'SHA256SUMS'
     Write-Host "rustscale: downloading $Archive from release $Version"
 
     $tempZip = Join-Path $env:TEMP "rustscale-install-$([guid]::NewGuid()).zip"
     $tempExtract = Join-Path $env:TEMP "rustscale-install-$([guid]::NewGuid())"
+    $tempChecksums = Join-Path $env:TEMP "rustscale-install-$([guid]::NewGuid()).sha256"
 
     try {
-        Invoke-WebRequest -Uri $url -OutFile $tempZip -UseBasicParsing -ErrorAction Stop
+        Save-ReleaseFile -Uri $url -OutFile $tempZip
+        Save-ReleaseFile -Uri $checksumUrl -OutFile $tempChecksums
+
+        $checksumLine = Get-Content $tempChecksums | Where-Object {
+            $_ -match "^[0-9a-fA-F]{64}\s+\*?$([regex]::Escape($Archive))$"
+        } | Select-Object -First 1
+        if (-not $checksumLine) {
+            throw "SHA256SUMS has no entry for $Archive"
+        }
+        $expected = ($checksumLine -split '\s+')[0].ToLowerInvariant()
+        $actual = (Get-FileHash -Path $tempZip -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($actual -ne $expected) {
+            throw "checksum mismatch for $Archive (expected $expected, got $actual)"
+        }
+        Write-Host "rustscale: checksum verified"
+
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $zip = [System.IO.Compression.ZipFile]::OpenRead($tempZip)
+        try {
+            foreach ($entry in $zip.Entries) {
+                if ([IO.Path]::IsPathRooted($entry.FullName) -or
+                    ($entry.FullName -split '[/\\]' -contains '..')) {
+                    throw "unsafe path in release archive: $($entry.FullName)"
+                }
+            }
+        } finally {
+            $zip.Dispose()
+        }
         Expand-Archive -Path $tempZip -DestinationPath $tempExtract -Force
+
+        foreach ($bin in @('rustscale.exe', 'rustscaled.exe')) {
+            if (-not (Test-Path (Join-Path $tempExtract $bin))) {
+                throw "release archive is missing required file '$bin'"
+            }
+        }
 
         if (-not (Test-Path $installDir)) {
             New-Item -ItemType Directory -Path $installDir -Force | Out-Null
@@ -161,37 +223,46 @@ function Do-Install {
 
         foreach ($bin in @('rustscale.exe', 'rustscaled.exe')) {
             $src = Join-Path $tempExtract $bin
-            if (Test-Path $src) {
-                Copy-Item $src (Join-Path $installDir $bin) -Force
-            }
+            Copy-Item $src (Join-Path $installDir $bin) -Force
+        }
+        if ($TailscaleCompatible) {
+            Copy-Item (Join-Path $tempExtract 'rustscale.exe') `
+                (Join-Path $installDir 'tailscale.exe') -Force
+            Copy-Item (Join-Path $tempExtract 'rustscaled.exe') `
+                (Join-Path $installDir 'tailscaled.exe') -Force
         }
 
-        Add-ToPath $installDir
+        if (-not $NoPath) { Add-ToPath $installDir }
 
         Write-Host ""
         Write-Host "rustscale: installed to $installDir"
         if (Test-Path (Join-Path $installDir 'rustscale.exe'))  { Write-Host "  $installDir\rustscale.exe" }
         if (Test-Path (Join-Path $installDir 'rustscaled.exe')) { Write-Host "  $installDir\rustscaled.exe" }
+        if ($TailscaleCompatible) {
+            Write-Host "  $installDir\tailscale.exe (compatibility alias)"
+            Write-Host "  $installDir\tailscaled.exe (compatibility alias)"
+        }
         Write-Host ""
         Write-Host "Open a new terminal, then get started:"
         Write-Host "  rustscaled run          # start the daemon"
         Write-Host "  rustscale up            # connect to a tailnet"
         Write-Host "  rustscale status        # check state"
     } catch {
-        Write-Host "rustscale: download failed: $url" -ForegroundColor Red
+        Write-Host "rustscale: installation failed: $($_.Exception.Message)" -ForegroundColor Red
         Write-Host ""
         Write-Host "This can happen if:" -ForegroundColor Yellow
-        Write-Host "  - the repository is private (release assets require auth)"
         Write-Host "  - the version '$Version' doesn't have an asset named '$Archive'"
         Write-Host "  - there's a network issue"
+        Write-Host "  - the repository is private and GH_TOKEN was not set"
         Write-Host ""
-        Write-Host "If the repo is private, download the archive from:"
+        Write-Host "Download the archive manually from:"
         Write-Host "  https://github.com/$Repo/releases"
         Write-Host "and install manually, or build from source:"
         Write-Host "  git clone https://github.com/$Repo && sh rustscale/scripts/install-from-source.sh"
         exit 1
     } finally {
         Remove-Item $tempZip -ErrorAction SilentlyContinue
+        Remove-Item $tempChecksums -ErrorAction SilentlyContinue
         Remove-Item $tempExtract -Recurse -ErrorAction SilentlyContinue
     }
 }
@@ -205,7 +276,7 @@ function Do-Uninstall {
 
     Write-Host "rustscale: removing $installDir"
     Remove-Item $installDir -Recurse -Force
-    Remove-FromPath $installDir
+    if (-not $NoPath) { Remove-FromPath $installDir }
     Write-Host "rustscale: uninstalled"
 }
 

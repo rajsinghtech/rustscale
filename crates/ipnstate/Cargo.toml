@@ -13,5 +13,5 @@ workspace = true
 serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
-rustscale-tailcfg = { path = "../tailcfg", version = "0.1.0" }
-rustscale-key = { path = "../key", version = "0.1.0" }
+rustscale-tailcfg = { path = "../tailcfg", version = "0.1.1" }
+rustscale-key = { path = "../key", version = "0.1.1" }

@@ -8,7 +8,7 @@ on:
     branches: [master]
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.pull_request.number || github.run_id }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: true
 
 env:
@@ -61,6 +61,18 @@ jobs:
       - name: Format check
         if: ${{ matrix.os == 'ubuntu-latest' }}
         run: cargo fmt --all --check
+      - name: Release and installer contract
+        if: ${{ matrix.os == 'ubuntu-latest' }}
+        run: |
+          go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+          shellcheck scripts/*.sh container/*.sh tools/packaging/*.sh
+          tools/packaging/check-release.sh
+          tools/packaging/test-install.sh
+          tools/packaging/test-container.sh
+      - name: Windows installer contract
+        if: ${{ matrix.os == 'windows-latest' }}
+        shell: pwsh
+        run: tools/packaging/test-install.ps1
       - name: Dirty-tree guard (tracked files)
         if: ${{ matrix.os == 'ubuntu-latest' }}
         run: git diff --no-ext-diff --name-only --exit-code || (echo "Build/test modified tracked files above."; exit 1)

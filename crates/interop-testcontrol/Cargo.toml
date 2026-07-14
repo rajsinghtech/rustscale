@@ -1,5 +1,6 @@
 [package]
 name = "rustscale-interop-testcontrol"
+description = "Cross-client testcontrol interoperability harness for rustscale"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
@@ -7,10 +8,10 @@ repository.workspace = true
 publish = false
 
 [dependencies]
-rustscale-tsnet = { path = "../tsnet" }
-rustscale-tailcfg = { path = "../tailcfg" }
-rustscale-key = { path = "../key" }
-rustscale-magicsock = { path = "../magicsock" }
+rustscale-tsnet = { path = "../tsnet", version = "0.1.1" }
+rustscale-tailcfg = { path = "../tailcfg", version = "0.1.1" }
+rustscale-key = { path = "../key", version = "0.1.1" }
+rustscale-magicsock = { path = "../magicsock", version = "0.1.1" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

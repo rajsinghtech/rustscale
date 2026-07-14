@@ -10,10 +10,10 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-rustscale-flowtrack = { path = "../flowtrack", version = "0.1.0" }
-rustscale-packet = { path = "../packet", version = "0.1.0" }
-rustscale-tailcfg = { path = "../tailcfg", version = "0.1.0" }
+rustscale-flowtrack = { path = "../flowtrack", version = "0.1.1" }
+rustscale-packet = { path = "../packet", version = "0.1.1" }
+rustscale-tailcfg = { path = "../tailcfg", version = "0.1.1" }
 thiserror.workspace = true
 
 [dev-dependencies]
-rustscale-tailcfg = { path = "../tailcfg", version = "0.1.0" }
+rustscale-tailcfg = { path = "../tailcfg", version = "0.1.1" }

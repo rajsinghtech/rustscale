@@ -1,0 +1,21 @@
+[Unit]
+Description=rustscale node agent
+Documentation=https://github.com/rajsinghtech/rustscale
+Wants=network-pre.target
+After=network-pre.target NetworkManager.service systemd-resolved.service
+
+[Service]
+EnvironmentFile=-/etc/default/rustscaled
+ExecStart=/usr/bin/env rustscaled run --state /var/lib/rustscale --socket /var/run/rustscaled.sock --tun $FLAGS
+ExecStopPost=/usr/bin/env rustscaled run --state /var/lib/rustscale --cleanup
+Restart=on-failure
+RuntimeDirectory=rustscale
+RuntimeDirectoryMode=0755
+StateDirectory=rustscale
+StateDirectoryMode=0700
+CacheDirectory=rustscale
+CacheDirectoryMode=0750
+Type=simple
+
+[Install]
+WantedBy=multi-user.target

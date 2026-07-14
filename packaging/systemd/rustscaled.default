@@ -1,0 +1,3 @@
+# Extra arguments appended to rustscaled by rustscaled.service.
+# The packaged service starts in kernel TUN mode to match tailscaled's host-network UX.
+FLAGS=

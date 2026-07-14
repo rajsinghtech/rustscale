@@ -10,8 +10,8 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-rustscale-ipn = { path = "../ipn" }
-rustscale-tailcfg = { path = "../tailcfg" }
+rustscale-ipn = { path = "../ipn", version = "0.1.1" }
+rustscale-tailcfg = { path = "../tailcfg", version = "0.1.1" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

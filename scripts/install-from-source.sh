@@ -57,9 +57,8 @@ Flags:
   --help, -h     Show this help.
 
 Examples:
-  sh scripts/install.sh
-  PREFIX=$HOME/.local sh scripts/install.sh --with-tun
-  curl -fsSL https://rustscale.dev/install.sh | PREFIX=/opt/rustscale sh
+  sh scripts/install-from-source.sh
+  PREFIX=$HOME/.local sh scripts/install-from-source.sh --with-tun
 EOF
 }
 
@@ -155,12 +154,12 @@ acquire_source() {
 build() {
     manifest="$SRCDIR/Cargo.toml"
     echo "rustscale: building release artifacts (this can take a while)"
-    if ! cargo build --manifest-path "$manifest" -p rustscale-ffi --release --quiet; then
+    if ! cargo build --manifest-path "$manifest" -p rustscale-ffi --release --locked --quiet; then
         echo "rustscale: cargo build of rustscale-ffi failed" >&2
         exit 1
     fi
     if [ "$WITH_TUN" = 1 ]; then
-        if ! cargo build --manifest-path "$manifest" -p rustscale-tsnet --release --example rustscale-tun --quiet; then
+        if ! cargo build --manifest-path "$manifest" -p rustscale-tsnet --release --locked --example rustscale-tun --quiet; then
             echo "rustscale: cargo build of the rustscale-tun example failed" >&2
             exit 1
         fi

@@ -73,6 +73,10 @@ pub async fn run(args: Vec<String>, socket: &Path, json: bool) -> Result<(), Cli
         update.Prefs.CorpDNS = true;
         update.CorpDNSSet = true;
     }
+    if let Some(tags) = parse_str_flag(&args, "advertise-tags") {
+        update.Prefs.AdvertiseTags = tags.split(',').map(|s| s.trim().to_string()).collect();
+        update.AdvertiseTagsSet = true;
+    }
     if parse_bool_flag(&args, "reset").unwrap_or(false) {
         update.Prefs = rustscale_ipn::Prefs::default();
         update.Prefs.WantRunning = true;

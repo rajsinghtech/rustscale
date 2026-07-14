@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.1.1
+
+Large compatibility, performance, and production-readiness update following
+the first tagged release.
+
+### Compatibility and client surface
+
+- Expanded the workspace from 36 to 66 crates, including TKA, audit logging,
+  baked roots, config files, flow tracking, network logging, proxy discovery,
+  socket statistics, route management, and additional upstream utility ports.
+- Filled out the CLI and LocalAPI surface with ping, wait, lock, drive, web,
+  debug capture, update status, profile switching, and additional daemon flags.
+- Added declarative configuration with SIGHUP reload, multi-profile backend
+  restart, client-version notifications, hostinfo completion, and key rotation.
+- Improved wire compatibility through Go-generated fixtures and stricter state
+  machine invariants.
+
+### Networking and performance
+
+- Added Linux TUN VNET/GSO/GRO batching, reusable packet buffers, faster
+  checksums, batched WireGuard handoff, direct UDP send/receive batching, and
+  guarded UDP GRO.
+- Improved direct-path convergence, disco-key refresh, PMTUD behavior, socket
+  buffer sizing, heartbeat scheduling, and relay-to-direct migration.
+- Added Linux netlink monitoring, router abstraction, packet capture, network
+  flow logs, and expanded health reporting.
+
+### Installation and release engineering
+
+- Added checksum-verifying macOS/Linux and Windows one-line installers, an
+  optional Tailscale-compatible command-alias mode, and Linux systemd assets.
+- Added a multi-architecture GHCR image with Tailscale-compatible command names
+  and containerboot-compatible environment variables.
+- Added release-contract and installer tests covering every shipped archive
+  mapping, checksum failure, required contents, aliases, uninstall, Pages
+  assembly, and container entrypoint behavior.
+- Hardened the release workflow with tag/version/release-note validation,
+  deterministic checksums, OCI metadata, and commit-pinned Actions.
+
 ## 0.1.0
 
 First tagged release. Rust reimplementation of Tailscale's client stack —

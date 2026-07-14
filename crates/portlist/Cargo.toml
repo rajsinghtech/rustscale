@@ -10,6 +10,6 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-rustscale-tailcfg = { path = "../tailcfg", version = "0.1.0" }
+rustscale-tailcfg = { path = "../tailcfg", version = "0.1.1" }
 tokio = { workspace = true, features = ["process", "io-util", "time", "sync"] }
 

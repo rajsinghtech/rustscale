@@ -10,8 +10,8 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-rustscale-neterror = { path = "../neterror", version = "0.1.0" }
-rustscale-tsdial = { path = "../tsdial" }
+rustscale-neterror = { path = "../neterror", version = "0.1.1" }
+rustscale-tsdial = { path = "../tsdial", version = "0.1.1" }
 thiserror.workspace = true
 tokio.workspace = true
 rand.workspace = true

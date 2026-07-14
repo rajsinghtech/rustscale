@@ -10,10 +10,10 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-rustscale-tailcfg = { path = "../tailcfg", version = "0.1.0" }
-rustscale-disco = { path = "../disco", version = "0.1.0" }
-rustscale-derp = { path = "../derp", version = "0.1.0" }
-rustscale-netcheck = { path = "../netcheck", version = "0.1.0" }
+rustscale-tailcfg = { path = "../tailcfg", version = "0.1.1" }
+rustscale-disco = { path = "../disco", version = "0.1.1" }
+rustscale-derp = { path = "../derp", version = "0.1.1" }
+rustscale-netcheck = { path = "../netcheck", version = "0.1.1" }
 serde.workspace = true
 serde_json.workspace = true
 hex.workspace = true

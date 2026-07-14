@@ -10,9 +10,9 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-rustscale-tailcfg = { path = "../tailcfg", version = "0.1.0" }
-rustscale-dnscache = { path = "../dnscache", version = "0.1.0" }
-rustscale-tsdial = { path = "../tsdial" }
+rustscale-tailcfg = { path = "../tailcfg", version = "0.1.1" }
+rustscale-dnscache = { path = "../dnscache", version = "0.1.1" }
+rustscale-tsdial = { path = "../tsdial", version = "0.1.1" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

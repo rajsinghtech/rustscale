@@ -89,36 +89,30 @@ fn parse_ping_args(args: &[String]) -> Result<PingArgs, CliError> {
             "--timeout" => timeout = parse_duration(&value(arg, &mut i)?)?,
             "--until-direct" | "-d" => until_direct = true,
             "--help" | "-h" => return Err(CliError("usage: rustscale ping <ip> [flags]".into())),
-            value if let Some(raw) = value.strip_prefix("--size=") => {
-                size = raw
-                    .parse()
-                    .map_err(|_| CliError(format!("invalid --size value: {raw}")))?;
-            }
-            value
-                if let Some(raw) = value
+            value => {
+                if let Some(raw) = value.strip_prefix("--size=") {
+                    size = raw
+                        .parse()
+                        .map_err(|_| CliError(format!("invalid --size value: {raw}")))?;
+                } else if let Some(raw) = value
                     .strip_prefix("--count=")
                     .or_else(|| value.strip_prefix("--c="))
-                    .or_else(|| value.strip_prefix("-c=")) =>
-            {
-                count = raw
-                    .parse()
-                    .map_err(|_| CliError(format!("invalid --count value: {raw}")))?;
-            }
-            value if let Some(raw) = value.strip_prefix("--timeout=") => {
-                timeout = parse_duration(raw)?;
-            }
-            value if let Some(raw) = value.strip_prefix("--until-direct=") => {
-                until_direct = match raw {
-                    "true" => true,
-                    "false" => false,
-                    _ => return Err(CliError(format!("invalid --until-direct value: {raw}"))),
-                };
-            }
-            value if value.starts_with('-') => {
-                return Err(CliError(format!("unknown flag: {value}")))
-            }
-            value => {
-                if ip.replace(value.to_string()).is_some() {
+                    .or_else(|| value.strip_prefix("-c="))
+                {
+                    count = raw
+                        .parse()
+                        .map_err(|_| CliError(format!("invalid --count value: {raw}")))?;
+                } else if let Some(raw) = value.strip_prefix("--timeout=") {
+                    timeout = parse_duration(raw)?;
+                } else if let Some(raw) = value.strip_prefix("--until-direct=") {
+                    until_direct = match raw {
+                        "true" => true,
+                        "false" => false,
+                        _ => return Err(CliError(format!("invalid --until-direct value: {raw}"))),
+                    };
+                } else if value.starts_with('-') {
+                    return Err(CliError(format!("unknown flag: {value}")));
+                } else if ip.replace(value.to_string()).is_some() {
                     return Err(CliError("usage: rustscale ping <ip> [flags]".into()));
                 }
             }

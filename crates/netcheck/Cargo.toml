@@ -10,9 +10,9 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-rustscale-tailcfg = { path = "../tailcfg", version = "0.1.0" }
-rustscale-health = { path = "../health", version = "0.1.0" }
-rustscale-tsdial = { path = "../tsdial" }
+rustscale-tailcfg = { path = "../tailcfg", version = "0.1.1" }
+rustscale-health = { path = "../health", version = "0.1.1" }
+rustscale-tsdial = { path = "../tsdial", version = "0.1.1" }
 thiserror.workspace = true
 tokio.workspace = true
 rand.workspace = true

@@ -1,8 +1,10 @@
 [package]
 name = "rustscale-bakedroots"
+description = "Embedded trust roots used by rustscale control and DERP clients"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 rust-version.workspace = true
 
 [features]

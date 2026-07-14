@@ -13,8 +13,8 @@ workspace = true
 rustscale-netns = { workspace = true }
 rustscale-netmon = { workspace = true }
 rustscale-dnscache = { workspace = true }
-rustscale-tailcfg = { path = "../tailcfg" }
-rustscale-tshttpproxy = { path = "../tshttpproxy" }
+rustscale-tailcfg = { path = "../tailcfg", version = "0.1.1" }
+rustscale-tshttpproxy = { path = "../tshttpproxy", version = "0.1.1" }
 tokio = { workspace = true, features = ["net", "sync", "time"] }
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }

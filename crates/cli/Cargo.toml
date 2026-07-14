@@ -14,13 +14,13 @@ name = "rustscale"
 path = "src/main.rs"
 
 [dependencies]
-rustscale-localclient = { path = "../localclient", version = "0.1.0" }
-rustscale-safesocket = { path = "../safesocket", version = "0.1.0" }
-rustscale-ipn = { path = "../ipn", version = "0.1.0" }
-rustscale-netcheck = { path = "../netcheck", version = "0.1.0" }
-rustscale-tailcfg = { path = "../tailcfg", version = "0.1.0" }
-rustscale-tsnet = { path = "../tsnet", version = "0.1.0" }
-rustscale-ipnstate = { path = "../ipnstate", version = "0.1.0" }
+rustscale-localclient = { path = "../localclient", version = "0.1.1" }
+rustscale-safesocket = { path = "../safesocket", version = "0.1.1" }
+rustscale-ipn = { path = "../ipn", version = "0.1.1" }
+rustscale-netcheck = { path = "../netcheck", version = "0.1.1" }
+rustscale-tailcfg = { path = "../tailcfg", version = "0.1.1" }
+rustscale-tsnet = { path = "../tsnet", version = "0.1.1" }
+rustscale-ipnstate = { path = "../ipnstate", version = "0.1.1" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
@@ -33,8 +33,8 @@ async-trait.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
-rustscale-tsnet = { path = "../tsnet", version = "0.1.0" }
-rustscale-testcontrol = { path = "../testcontrol", version = "0.1.0" }
+rustscale-tsnet = { path = "../tsnet", version = "0.1.1" }
+rustscale-testcontrol = { path = "../testcontrol", version = "0.1.1" }
 
 [build-dependencies]
 # build.rs stamps git version — no external deps needed.

@@ -17,9 +17,12 @@
 #   TS_ACCEPT_ROUTES    Set to 1 to accept advertised routes from peers.
 #   TS_EXIT_NODE        IP of the exit node to route all traffic through.
 #   TS_SOCKS5_SERVER    Address for SOCKS5 proxy into the tailnet.
+#   TS_OUTBOUND_HTTP_PROXY_LISTEN
+#                       Address for an outbound HTTP proxy into the tailnet.
 #   TS_EXTRA_ARGS       Extra arguments to pass to `rustscale up`.
 #   TS_TAILSCALED_EXTRA_ARGS  Extra arguments to pass to `rustscaled run`.
-#   TS_AUTH_ONCE        If 1, only login if not already logged in (default: 1).
+#   TS_AUTH_ONCE        If 1, only login if not already logged in (default: 0,
+#                       matching Tailscale containerboot).
 #                       Set to 0 to force re-auth on every start.
 
 set -eu
@@ -65,7 +68,7 @@ wait_for_socket() {
 STATE_DIR="${TS_STATE_DIR:-/var/lib/rustscale}"
 SOCKET="${TS_SOCKET:-/var/run/rustscaled.sock}"
 USERSPACE="${TS_USERSPACE:-1}"
-AUTH_ONCE="${TS_AUTH_ONCE:-1}"
+AUTH_ONCE="${TS_AUTH_ONCE:-0}"
 
 # Resolve auth key from TS_AUTHKEY or TS_AUTH_KEY (file: prefix supported).
 AUTH_KEY=""
@@ -92,13 +95,19 @@ fi
 if [ -n "${TS_HOSTNAME:-}" ]; then
     DAEMON_ARGS="$DAEMON_ARGS --hostname $TS_HOSTNAME"
 fi
+if [ -n "${TS_SOCKS5_SERVER:-}" ]; then
+    DAEMON_ARGS="$DAEMON_ARGS --socks5-server $TS_SOCKS5_SERVER"
+fi
+if [ -n "${TS_OUTBOUND_HTTP_PROXY_LISTEN:-}" ]; then
+    DAEMON_ARGS="$DAEMON_ARGS --http-proxy-server $TS_OUTBOUND_HTTP_PROXY_LISTEN"
+fi
 
 # Extra daemon args.
 if [ -n "${TS_TAILSCALED_EXTRA_ARGS:-}" ]; then
     DAEMON_ARGS="$DAEMON_ARGS $TS_TAILSCALED_EXTRA_ARGS"
 fi
 
-log "starting rustscaled: $DAEMON_ARGS"
+log "starting rustscaled"
 # shellcheck disable=SC2086 # intentional word splitting for args
 rustscaled $DAEMON_ARGS &
 DAEMON_PID=$!
@@ -154,20 +163,12 @@ if [ "$SHOULD_LOGIN" = true ]; then
         UP_ARGS="$UP_ARGS $TS_EXTRA_ARGS"
     fi
 
-    log "running: rustscale up $UP_ARGS"
+    log "running rustscale up"
     # shellcheck disable=SC2086 # intentional word splitting for args
     if ! rustscale --socket "$SOCKET" up $UP_ARGS; then
         err "rustscale up failed"
     fi
     log "login complete"
-fi
-
-# ---------------------------------------------------------------------------
-# SOCKS5 proxy (optional)
-# ---------------------------------------------------------------------------
-
-if [ -n "${TS_SOCKS5_SERVER:-}" ]; then
-    log "SOCKS5 proxy at $TS_SOCKS5_SERVER (not yet implemented in rustscale)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -177,7 +178,9 @@ fi
 log "rustscale is up; container ready"
 
 # Wait for the daemon to exit. If it dies, the container should exit too.
+set +e
 wait $DAEMON_PID
 EXIT_CODE=$?
+set -e
 log "rustscaled exited with code $EXIT_CODE"
 exit $EXIT_CODE

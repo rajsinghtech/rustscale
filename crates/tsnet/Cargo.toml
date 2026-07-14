@@ -46,44 +46,44 @@ duration_suboptimal_units = "allow"
 map_unwrap_or = "allow"
 
 [dependencies]
-rustscale-key = { path = "../key", version = "0.1.0" }
-rustscale-tailcfg = { path = "../tailcfg", version = "0.1.0" }
-rustscale-controlclient = { path = "../controlclient", version = "0.1.0" }
-rustscale-controlknobs = { path = "../controlknobs", version = "0.1.0" }
-rustscale-magicsock = { path = "../magicsock", version = "0.1.0" }
-rustscale-derp = { path = "../derp", version = "0.1.0" }
-rustscale-netcheck = { path = "../netcheck", version = "0.1.0" }
-rustscale-wg = { path = "../wg", version = "0.1.0" }
-rustscale-netstack = { path = "../netstack", version = "0.1.0" }
-rustscale-tun = { path = "../tun", version = "0.1.0" }
-rustscale-filter = { path = "../filter", version = "0.1.0" }
-rustscale-dns = { path = "../dns", version = "0.1.0" }
-rustscale-netmon = { path = "../netmon", version = "0.1.0" }
-rustscale-portmapper = { path = "../portmapper", version = "0.1.0" }
-rustscale-health = { path = "../health", version = "0.1.0" }
-rustscale-udprelay = { path = "../udprelay", version = "0.1.0" }
-rustscale-c2n = { path = "../c2n", version = "0.1.0" }
-rustscale-tcpinfo = { path = "../tcpinfo", version = "0.1.0" }
-rustscale-safesocket = { path = "../safesocket", version = "0.1.0" }
-rustscale-clientmetric = { path = "../clientmetric", version = "0.1.0" }
-rustscale-ipn = { path = "../ipn", version = "0.1.0" }
-rustscale-auditlog = { path = "../auditlog", version = "0.1.0" }
-rustscale-ipnstate = { path = "../ipnstate", version = "0.1.0" }
-rustscale-appc = { path = "../appc", version = "0.1.0" }
-rustscale-bakedroots = { path = "../bakedroots", version = "0.1.0" }
-rustscale-tsaddr = { path = "../tsaddr", version = "0.1.0" }
-rustscale-router = { path = "../router", version = "0.1.0" }
-rustscale-sockstats = { path = "../sockstats", version = "0.1.0" }
-rustscale-conffile = { path = "../conffile", version = "0.1.0" }
-rustscale-proxymap = { path = "../proxymap", version = "0.1.0" }
-rustscale-portlist = { path = "../portlist", version = "0.1.0" }
-rustscale-clientupdate = { path = "../clientupdate", version = "0.1.0" }
-rustscale-envknob = { path = "../envknob", version = "0.1.0" }
-rustscale-logid = { path = "../logid", version = "0.1.0" }
-rustscale-logtail = { path = "../logtail", version = "0.1.0" }
+rustscale-key = { path = "../key", version = "0.1.1" }
+rustscale-tailcfg = { path = "../tailcfg", version = "0.1.1" }
+rustscale-controlclient = { path = "../controlclient", version = "0.1.1" }
+rustscale-controlknobs = { path = "../controlknobs", version = "0.1.1" }
+rustscale-magicsock = { path = "../magicsock", version = "0.1.1" }
+rustscale-derp = { path = "../derp", version = "0.1.1" }
+rustscale-netcheck = { path = "../netcheck", version = "0.1.1" }
+rustscale-wg = { path = "../wg", version = "0.1.1" }
+rustscale-netstack = { path = "../netstack", version = "0.1.1" }
+rustscale-tun = { path = "../tun", version = "0.1.1" }
+rustscale-filter = { path = "../filter", version = "0.1.1" }
+rustscale-dns = { path = "../dns", version = "0.1.1" }
+rustscale-netmon = { path = "../netmon", version = "0.1.1" }
+rustscale-portmapper = { path = "../portmapper", version = "0.1.1" }
+rustscale-health = { path = "../health", version = "0.1.1" }
+rustscale-udprelay = { path = "../udprelay", version = "0.1.1" }
+rustscale-c2n = { path = "../c2n", version = "0.1.1" }
+rustscale-tcpinfo = { path = "../tcpinfo", version = "0.1.1" }
+rustscale-safesocket = { path = "../safesocket", version = "0.1.1" }
+rustscale-clientmetric = { path = "../clientmetric", version = "0.1.1" }
+rustscale-ipn = { path = "../ipn", version = "0.1.1" }
+rustscale-auditlog = { path = "../auditlog", version = "0.1.1" }
+rustscale-ipnstate = { path = "../ipnstate", version = "0.1.1" }
+rustscale-appc = { path = "../appc", version = "0.1.1" }
+rustscale-bakedroots = { path = "../bakedroots", version = "0.1.1" }
+rustscale-tsaddr = { path = "../tsaddr", version = "0.1.1" }
+rustscale-router = { path = "../router", version = "0.1.1" }
+rustscale-sockstats = { path = "../sockstats", version = "0.1.1" }
+rustscale-conffile = { path = "../conffile", version = "0.1.1" }
+rustscale-proxymap = { path = "../proxymap", version = "0.1.1" }
+rustscale-portlist = { path = "../portlist", version = "0.1.1" }
+rustscale-clientupdate = { path = "../clientupdate", version = "0.1.1" }
+rustscale-envknob = { path = "../envknob", version = "0.1.1" }
+rustscale-logid = { path = "../logid", version = "0.1.1" }
+rustscale-logtail = { path = "../logtail", version = "0.1.1" }
 rustscale-netns.workspace = true
-rustscale-tsdial = { path = "../tsdial" }
-rustscale-dnsname = { path = "../dnsname" }
+rustscale-tsdial = { path = "../tsdial", version = "0.1.1" }
+rustscale-dnsname = { path = "../dnsname", version = "0.1.1" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -106,12 +106,14 @@ log.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
-rustscale-key = { path = "../key", version = "0.1.0" }
-rustscale-tailcfg = { path = "../tailcfg", version = "0.1.0" }
-rustscale-testcontrol = { path = "../testcontrol", version = "0.1.0" }
-rustscale-safesocket = { path = "../safesocket", version = "0.1.0" }
-rustscale-localclient = { path = "../localclient", version = "0.1.0" }
-rustscale-ipn = { path = "../ipn", version = "0.1.0" }
+rustscale-key = { path = "../key", version = "0.1.1" }
+rustscale-tailcfg = { path = "../tailcfg", version = "0.1.1" }
+rustscale-testcontrol = { path = "../testcontrol", version = "0.1.1" }
+rustscale-safesocket = { path = "../safesocket", version = "0.1.1" }
+# Intentionally path-only: localclient depends on tsnet at runtime, so this
+# test-only back-edge must not enter the published dependency graph.
+rustscale-localclient = { path = "../localclient" }
+rustscale-ipn = { path = "../ipn", version = "0.1.1" }
 tempfile = "3"
 
 [features]
@@ -119,7 +121,7 @@ ssh = ["dep:rustscale-ssh", "dep:russh"]
 
 [dependencies.rustscale-ssh]
 path = "../ssh"
-version = "0.1.0"
+version = "0.1.1"
 optional = true
 
 [dependencies.russh]

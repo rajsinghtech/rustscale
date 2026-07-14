@@ -27,11 +27,62 @@ env:
   BIN_PKGS: 'rustscale-rustscaled:rustscaled rustscale-cli:rustscale'
 
 jobs:
+  metadata:
+    name: Validate release metadata
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      series: ${{ steps.release.outputs.series }}
+      notes: ${{ steps.release.outputs.notes }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Match tag, workspace version, and release notes
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]] || {
+            echo "invalid release tag: $tag" >&2
+            exit 1
+          }
+          version="${tag#v}"
+          manifest_version=$(awk '
+            /^\[workspace.package\]/ { workspace = 1; next }
+            workspace && /^version = / { gsub(/[\" ]/, "", $3); print $3; exit }
+          ' Cargo.toml)
+          test "$version" = "$manifest_version" || {
+            echo "tag $tag does not match workspace version $manifest_version" >&2
+            exit 1
+          }
+          notes="docs/release-notes-${version}.md"
+          test -s "$notes" || { echo "missing release notes: $notes" >&2; exit 1; }
+          {
+            echo "version=$version"
+            echo "series=${version%.*}"
+            echo "notes=$notes"
+          } >> "$GITHUB_OUTPUT"
+
+  crate-packages:
+    name: Assemble Cargo packages
+    needs: [metadata]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          key: cargo-package
+      - name: Package every workspace crate
+        run: cargo package --workspace --no-verify --locked
+
   # -------------------------------------------------------------------------
   # macOS: universal binary (aarch64 + x86_64 lipo'd)
   # -------------------------------------------------------------------------
   macos:
     name: macOS universal
+    needs: [metadata]
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
@@ -81,7 +132,7 @@ jobs:
 
       - name: Bundle
         run: |
-          cp include/rustscale.h dist/
+          cp include/rustscale.h LICENSE dist/
           tar czf rustscale-universal-apple-darwin.tar.gz -C dist .
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -95,6 +146,7 @@ jobs:
   # -------------------------------------------------------------------------
   linux:
     name: Linux ${{ matrix.target }}
+    needs: [metadata]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -166,7 +218,9 @@ jobs:
           # cdylib: .so on Linux (gnu + musl)
           cp "$libdir/librustscale.so" dist/ 2>/dev/null || true
           cp "$libdir/librustscale.a" dist/
-          cp include/rustscale.h dist/
+          cp include/rustscale.h LICENSE dist/
+          cp packaging/systemd/rustscaled.service dist/
+          cp packaging/systemd/rustscaled.default dist/
           for entry in $BIN_PKGS; do
             bin="${entry##*:}"
             cp "$libdir/$bin" dist/ 2>/dev/null || true
@@ -184,6 +238,7 @@ jobs:
   # -------------------------------------------------------------------------
   windows:
     name: Windows x86_64
+    needs: [metadata]
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
@@ -212,6 +267,7 @@ jobs:
             $bin = ($entry -split ':')[1]
             Copy-Item "target/release/$bin.exe" "dist/" -ErrorAction Stop
           }
+          Copy-Item LICENSE "dist/" -ErrorAction Stop
           Compress-Archive -Path dist/* -DestinationPath rustscale-x86_64-pc-windows-msvc.zip
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -225,6 +281,7 @@ jobs:
   # -------------------------------------------------------------------------
   docker:
     name: Docker image
+    needs: [metadata]
     runs-on: ubuntu-latest
     timeout-minutes: 40
     permissions:
@@ -236,13 +293,13 @@ jobs:
           fetch-depth: 0
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -261,14 +318,19 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Build and push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           file: ./Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
+          build-args: |
+            RUSTSCALE_VERSION=${{ needs.metadata.outputs.version }}
+            RUSTSCALE_REVISION=${{ github.sha }}
           tags: |
             ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}
+            ${{ steps.meta.outputs.image }}:${{ needs.metadata.outputs.series }}
             ${{ steps.meta.outputs.image }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -278,7 +340,7 @@ jobs:
   # -------------------------------------------------------------------------
   release:
     name: Checksums + GitHub Release
-    needs: [macos, linux, windows, docker]
+    needs: [metadata, crate-packages, macos, linux, windows, docker]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -292,15 +354,16 @@ jobs:
           mkdir -p release
           find artifacts \( -name '*.tar.gz' -o -name '*.zip' \) -exec cp {} release/ \;
           cd release
+          test "$(find . -maxdepth 1 \( -name '*.tar.gz' -o -name '*.zip' \) | wc -l)" -eq 5
           find . -maxdepth 1 \( -name '*.tar.gz' -o -name '*.zip' \) \
-            -exec sha256sum {} + | sed 's| \./| |' > SHA256SUMS
+            -exec sha256sum {} + | LC_ALL=C sort -k2 | sed 's| \./| |' > SHA256SUMS
           cat SHA256SUMS
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: release/*
-          body_path: docs/release-notes-0.1.0.md
+          body_path: ${{ needs.metadata.outputs.notes }}
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
 

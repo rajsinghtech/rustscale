@@ -10,8 +10,8 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-rustscale-key = { path = "../key", version = "0.1.0" }
-rustscale-disco = { path = "../disco", version = "0.1.0" }
+rustscale-key = { path = "../key", version = "0.1.1" }
+rustscale-disco = { path = "../disco", version = "0.1.1" }
 thiserror.workspace = true
 blake2.workspace = true
 rand.workspace = true

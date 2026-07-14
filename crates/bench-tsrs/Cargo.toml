@@ -1,7 +1,7 @@
 [package]
 name = "tsrs-bench"
 description = "Throughput and latency benchmark harness for tailscale-rs"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "BSD-3-Clause"
 repository = "https://github.com/rajsingh/rustscale"

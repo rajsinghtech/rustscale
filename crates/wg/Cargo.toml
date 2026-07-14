@@ -10,6 +10,6 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-rustscale-key = { path = "../key", version = "0.1.0" }
+rustscale-key = { path = "../key", version = "0.1.1" }
 boringtun.workspace = true
 thiserror.workspace = true

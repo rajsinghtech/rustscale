@@ -21,7 +21,10 @@
 # ---------------------------------------------------------------------------
 # Build stage
 # ---------------------------------------------------------------------------
-FROM rust:1.91-alpine AS builder
+FROM rust:1.91-alpine@sha256:45c1c35cd364b8055e9e86f8ecd3e8c874b2dcb658d8a4f94b5d111aa0d651a2 AS builder
+
+# Beta images can disable LTO to keep cross-platform build times practical.
+ARG RUSTSCALE_LTO=true
 
 RUN apk add --no-cache musl-dev
 
@@ -33,12 +36,21 @@ COPY crates/ ./crates/
 COPY include/ ./include/
 
 # Build release binaries. --locked ensures reproducible builds.
-RUN cargo build --release --locked -p rustscale-cli -p rustscale-rustscaled
+RUN CARGO_PROFILE_RELEASE_LTO=$RUSTSCALE_LTO cargo build --release --locked -p rustscale-cli -p rustscale-rustscaled
 
 # ---------------------------------------------------------------------------
 # Runtime stage
 # ---------------------------------------------------------------------------
-FROM alpine:3.22
+FROM alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce
+
+ARG RUSTSCALE_VERSION=dev
+ARG RUSTSCALE_REVISION=unknown
+LABEL org.opencontainers.image.title="rustscale" \
+      org.opencontainers.image.description="Rust implementation of Tailscale's client stack" \
+      org.opencontainers.image.source="https://github.com/rajsinghtech/rustscale" \
+      org.opencontainers.image.licenses="BSD-3-Clause" \
+      org.opencontainers.image.version="$RUSTSCALE_VERSION" \
+      org.opencontainers.image.revision="$RUSTSCALE_REVISION"
 
 RUN apk add --no-cache ca-certificates iptables iptables-legacy iproute2 ip6tables iputils
 
@@ -50,7 +62,10 @@ RUN rm /usr/sbin/ip6tables && ln -s /usr/sbin/ip6tables-legacy /usr/sbin/ip6tabl
 COPY --from=builder /build/target/release/rustscale  /usr/local/bin/rustscale
 COPY --from=builder /build/target/release/rustscaled /usr/local/bin/rustscaled
 COPY container/entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod +x /usr/local/bin/entrypoint.sh
+COPY LICENSE /usr/share/licenses/rustscale/LICENSE
+RUN chmod +x /usr/local/bin/entrypoint.sh \
+    && ln -s rustscale /usr/local/bin/tailscale \
+    && ln -s rustscaled /usr/local/bin/tailscaled
 
 # State directory (mount a volume here for persistence).
 RUN mkdir -p /var/lib/rustscale

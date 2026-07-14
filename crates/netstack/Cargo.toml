@@ -10,8 +10,8 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-rustscale-wg = { path = "../wg", version = "0.1.0" }
-rustscale-key = { path = "../key", version = "0.1.0" }
+rustscale-wg = { path = "../wg", version = "0.1.1" }
+rustscale-key = { path = "../key", version = "0.1.1" }
 smoltcp.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
@@ -20,5 +20,5 @@ tokio-util.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
-rustscale-wg = { path = "../wg", version = "0.1.0" }
-rustscale-key = { path = "../key", version = "0.1.0" }
+rustscale-wg = { path = "../wg", version = "0.1.1" }
+rustscale-key = { path = "../key", version = "0.1.1" }

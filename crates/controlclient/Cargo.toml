@@ -10,9 +10,9 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-rustscale-key = { path = "../key", version = "0.1.0" }
-rustscale-tailcfg = { path = "../tailcfg", version = "0.1.0" }
-rustscale-controlknobs = { path = "../controlknobs", version = "0.1.0" }
+rustscale-key = { path = "../key", version = "0.1.1" }
+rustscale-tailcfg = { path = "../tailcfg", version = "0.1.1" }
+rustscale-controlknobs = { path = "../controlknobs", version = "0.1.1" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -30,12 +30,12 @@ http = "1"
 bytes.workspace = true
 rustscale-netns.workspace = true
 rustscale-dnscache.workspace = true
-rustscale-auditlog = { path = "../auditlog", version = "0.1.0" }
+rustscale-auditlog = { path = "../auditlog", version = "0.1.1" }
 rustscale-dnsfallback.workspace = true
-rustscale-tshttpproxy = { path = "../tshttpproxy", version = "0.1.0" }
-rustscale-bakedroots = { path = "../bakedroots", version = "0.1.0" }
-rustscale-tsdial = { path = "../tsdial" }
-rustscale-envknob = { path = "../envknob", version = "0.1.0" }
+rustscale-tshttpproxy = { path = "../tshttpproxy", version = "0.1.1" }
+rustscale-bakedroots = { path = "../bakedroots", version = "0.1.1" }
+rustscale-tsdial = { path = "../tsdial", version = "0.1.1" }
+rustscale-envknob = { path = "../envknob", version = "0.1.1" }
 url = "2"
 async-trait.workspace = true
 

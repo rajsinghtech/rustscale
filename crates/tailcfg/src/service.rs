@@ -22,9 +22,6 @@ use crate::NodeCapMap;
 /// Matches Go's `tailcfg.NodeAttrServiceHost = "service-host"`.
 pub const NODE_ATTR_SERVICE_HOST: &str = "service-host";
 
-/// Maximum DNS label length (RFC 1035).
-const MAX_LABEL_LENGTH: usize = 63;
-
 /// The name of a Tailscale Service, of the form `svc:dns-label`.
 ///
 /// Matches Go's `tailcfg.ServiceName` (a `string` newtype). The `svc:` prefix
@@ -127,51 +124,13 @@ pub enum ServiceNameError {
 }
 
 /// Validate a single DNS label per RFC 1035 (matches Go's
-/// `dnsname.ValidLabel`).
+/// `dnsname.ValidLabel`). Delegates to `rustscale_dnsname::valid_label` and
+/// maps the error into [`ServiceNameError`].
 fn validate_dns_label(label: &str) -> Result<(), ServiceNameError> {
-    if label.is_empty() {
-        return Err(ServiceNameError::InvalidLabel(
-            label.to_string(),
-            "empty DNS label".into(),
-        ));
-    }
-    if label.len() > MAX_LABEL_LENGTH {
-        return Err(ServiceNameError::InvalidLabel(
-            label.to_string(),
-            format!("too long, max length is {MAX_LABEL_LENGTH} bytes"),
-        ));
-    }
-    if !is_alphanum(label.as_bytes()[0]) {
-        return Err(ServiceNameError::InvalidLabel(
-            label.to_string(),
-            "must start with a letter or number".into(),
-        ));
-    }
-    if !is_alphanum(label.as_bytes()[label.len() - 1]) {
-        return Err(ServiceNameError::InvalidLabel(
-            label.to_string(),
-            "must end with a letter or number".into(),
-        ));
-    }
-    if label.len() >= 2 {
-        for &c in &label.as_bytes()[1..label.len() - 1] {
-            if !is_dns_char(c) {
-                return Err(ServiceNameError::InvalidLabel(
-                    label.to_string(),
-                    format!("contains invalid character '{}'", c as char),
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn is_alphanum(c: u8) -> bool {
-    c.is_ascii_alphanumeric()
-}
-
-fn is_dns_char(c: u8) -> bool {
-    is_alphanum(c) || c == b'-'
+    rustscale_dnsname::valid_label(label).map_err(|e| {
+        let msg = e.to_string();
+        ServiceNameError::InvalidLabel(label.to_string(), msg)
+    })
 }
 
 /// A VIP Service from the perspective of a node providing that service.

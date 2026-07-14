@@ -83,6 +83,7 @@ rustscale-logid = { path = "../logid", version = "0.1.0" }
 rustscale-logtail = { path = "../logtail", version = "0.1.0" }
 rustscale-netns.workspace = true
 rustscale-tsdial = { path = "../tsdial" }
+rustscale-dnsname = { path = "../dnsname" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

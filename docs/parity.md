@@ -89,7 +89,7 @@ real JSON).
 | Singleflight | `util/singleflight/` | 🔶 inline in `crates/dnscache` (inflight dedup HashMap); no standalone crate |
 | LRU cache | `util/lru/` | ✅ standalone O(1) HashMap + index-linked-list implementation in `crates/flowtrack` (used by filter flow tracking) |
 | Rate limiter | `util/limiter/` | 🔶 inline in `crates/derp/src/client.rs` (token-bucket for DERP send path); no standalone crate |
-| Ring buffer logger | `util/ringlog/` | ⬜ |
+| Ring buffer logger | `util/ringlog/` | ✅ `crates/ringlog`: `RingLog<T>` generic fixed-capacity ring buffer (Mutex<VecDeque<T>>), `add`/`get_all`/`len`/`clear`, nil-safe via `Option`; full Go test suite ported |
 | QR code rendering | `util/qrcodes/` | ✅ qrcode crate + hand-rolled 1-bit PNG encoder; `up --qr` / `login --qr` terminal half-block QR + data:image/png data URL |
 | Dependency injection / tsd | `tsd/` | ⬜ |
 | Feature gate system | `feature/` | 🔶 `crates/controlknobs` provides runtime feature flags from control plane CapMap; no compile-time gate system |
@@ -102,7 +102,7 @@ real JSON).
 | TSP protocol (alt control) | `control/tsp/` | ⬜ only ts2021 Noise control protocol implemented |
 | Log policy / logtail setup | `logpolicy/` | ✅ `crates/logpolicy`: Go-compatible persisted `rustscaled.log.conf`, state-dir `logid-private` reuse, `TS_LOGS_DIR`/`TS_LOG_TARGET`, and daemon startup/shutdown wiring |
 | Packet parsing (headers) | `net/packet/` | ✅ `crates/packet`: IPv4Header, IPv6Header, ICMPHeader, UDPHeader, TCPFlag, Parsed rich decoded view, parse_packet(); GENEVE in udprelay |
-| DNS name utilities | `util/dnsname/` | 🔶 FQDN handling in dns resolver + tsnet; no standalone crate with ValidLabel/SanitizeLabel |
+| DNS name utilities | `util/dnsname/` | ✅ `crates/dnsname`: `Fqdn` type (always-dot-terminated), `to_fqdn`/`valid_label`/`valid_hostname`/`sanitize_label`/`sanitize_hostname`/`has_suffix`/`trim_suffix`/`trim_common_suffixes`/`first_label`/`num_labels`/`contains`/`parent`; full Go table tests ported; adopted by `tailcfg::service::validate_dns_label`, `dns::peer_matches`, and `tsnet` first-label call sites |
 | TLS dial config | `net/tlsdial/` | 🔶 tls_config() in DERP client + controlhttp + ACME; no unified tlsdial module |
 | Network utility functions | `net/netutil/` | 🔶 proxy protocol detection in service.rs; interface helpers in netmon/netns; no consolidated crate |
 | Socket options | `net/sockopts/` | ✅ SO_MARK + SO_BINDTODEVICE in `crates/netns/src/linux.rs` |

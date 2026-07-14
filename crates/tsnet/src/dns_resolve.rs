@@ -51,7 +51,7 @@ pub(crate) async fn resolve_addr_with(
     for peer in peers.iter() {
         let name = peer.Name.to_lowercase();
         let name_trimmed = name.trim_end_matches('.');
-        let first_label = name_trimmed.split('.').next().unwrap_or("");
+        let first_label = rustscale_dnsname::first_label(name_trimmed);
         if name_trimmed == host_trimmed
             || first_label == host_trimmed
             || name_trimmed.ends_with(&format!(".{host_trimmed}"))
@@ -122,7 +122,7 @@ pub(crate) fn resolve_exit_node(
         let name = peer.Name.to_lowercase();
         let name_trimmed = name.trim_end_matches('.');
         // First label of the FQDN (MagicDNS short name).
-        let first_label = name_trimmed.split('.').next().unwrap_or("");
+        let first_label = rustscale_dnsname::first_label(name_trimmed);
         if name_trimmed == host_trimmed
             || first_label == host_trimmed
             || name_trimmed.ends_with(&format!(".{host_trimmed}"))

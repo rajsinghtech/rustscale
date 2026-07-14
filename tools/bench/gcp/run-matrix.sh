@@ -475,6 +475,30 @@ matrix_atomic_capture_self_test() {
   rm -rf "$temp_dir"
 }
 
+# Capture the exact instance identity needed to resolve its immutable boot
+# image. `disks` is repeated, so this must project `disks[].source`.
+matrix_capture_instance_metadata() {
+  local destination="$1" instance="$2" zone="$3"
+  matrix_atomic_capture "$destination" gcloud compute instances describe "$instance" \
+    --project="$GCP_PROJECT" --zone="$zone" \
+    --format='json(machineType,cpuPlatform,zone,disks[].source)'
+}
+
+matrix_instance_metadata_capture_self_test() (
+  local temp_dir
+  local -a calls=()
+  temp_dir=$(mktemp -d) || return 1
+  matrix_atomic_capture() { calls+=("$*"); }
+  matrix_capture_instance_metadata "$temp_dir/server.json" server us-central1-a
+  matrix_capture_instance_metadata "$temp_dir/client.json" client us-central1-b
+  [[ ${#calls[@]} -eq 2 ]] || { rm -rf "$temp_dir"; return 1; }
+  [[ "${calls[0]}" == *'instances describe server'* && "${calls[1]}" == *'instances describe client'* ]] || { rm -rf "$temp_dir"; return 1; }
+  for call in "${calls[@]}"; do
+    [[ "$call" == *'--format=json(machineType,cpuPlatform,zone,disks[].source)'* && "$call" != *'disks.source'* ]] || { rm -rf "$temp_dir"; return 1; }
+  done
+  rm -rf "$temp_dir"
+)
+
 matrix_write_manifest() {
   local output="$1" repeat="$2" dry_run="${MATRIX_MANIFEST_DRY_RUN:-0}"
   shift 2
@@ -682,6 +706,7 @@ matrix_dirty_detection_self_test
 matrix_vm_name_self_test
 matrix_product_observation_self_test
 matrix_atomic_capture_self_test
+matrix_instance_metadata_capture_self_test
 matrix_manifest_self_test
 matrix_inbound_pipeline_self_test
 matrix_finalization_self_test
@@ -815,8 +840,8 @@ matrix_collect_observed() {
   fi
   # Persist only the identity fields needed below, never arbitrary instance
   # metadata or service-account configuration.
-  matrix_atomic_capture "$server_instance" gcloud compute instances describe "$server" --project="$GCP_PROJECT" --zone="$server_zone" --format='json(machineType,cpuPlatform,zone,disks.source)'
-  matrix_atomic_capture "$client_instance" gcloud compute instances describe "$client" --project="$GCP_PROJECT" --zone="$client_zone" --format='json(machineType,cpuPlatform,zone,disks.source)'
+  matrix_capture_instance_metadata "$server_instance" "$server" "$server_zone"
+  matrix_capture_instance_metadata "$client_instance" "$client" "$client_zone"
   # Resolve the image through the boot disk created for this instance.  Do not
   # query an image family here: family resolution is intentionally racy.
   local server_disk_name client_disk_name

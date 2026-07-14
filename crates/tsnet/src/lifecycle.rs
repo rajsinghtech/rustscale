@@ -1581,6 +1581,21 @@ impl Server {
             }
         };
 
+        // The IPN backend normally owns only state-machine data. At this
+        // point bootstrap has the shared health tracker and current DERP
+        // selection, so install its captive-portal watcher with the real
+        // runtime dependencies.
+        let (_captive_derp_map_tx, captive_derp_map_rx) =
+            tokio::sync::watch::channel(Some(derp_map.clone()));
+        let (_captive_preferred_derp_tx, captive_preferred_derp_rx) =
+            tokio::sync::watch::channel(home_derp);
+        ipn_backend.start_captive_portal_watcher(
+            health.clone(),
+            rustscale_netcheck::Detector::default(),
+            captive_derp_map_rx,
+            captive_preferred_derp_rx,
+        );
+
         // 7. Connect home DERP.
         log::info!("tsnet: home DERP region = {home_derp}");
         let derp_client = match connect_home_derp(&derp_map, home_derp, &state.node_key).await {

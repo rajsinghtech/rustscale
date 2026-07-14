@@ -5,6 +5,12 @@
 
 use std::sync::Mutex;
 
+use rustscale_health::Tracker;
+use rustscale_netcheck::Detector;
+use rustscale_tailcfg::DERPMap;
+use tokio::sync::watch;
+
+use crate::captiveportal::CaptivePortalWatcher;
 use crate::machine::StateMachineInputs;
 use crate::{next_state, Notify, NotifyBus, State};
 
@@ -54,6 +60,9 @@ pub struct IpnBackend {
     bus: NotifyBus,
     /// Version string included in the initial Notify message.
     version: String,
+    /// Retains the background captive-portal watcher when this backend was
+    /// initialized with health and DERP state.
+    captive_portal_watcher: Mutex<Option<CaptivePortalWatcher>>,
 }
 
 impl IpnBackend {
@@ -68,7 +77,40 @@ impl IpnBackend {
             }),
             bus: NotifyBus::new(),
             version: version.into(),
+            captive_portal_watcher: Mutex::new(None),
         }
+    }
+
+    /// Create a backend and start captive-portal monitoring with the supplied
+    /// runtime health and DERP state.
+    ///
+    /// The plain [`IpnBackend::new`] constructor remains for state-machine
+    /// users that do not own these runtime dependencies.
+    pub fn new_with_captive_portal_watcher(
+        version: impl Into<String>,
+        health: Tracker,
+        detector: Detector,
+        derp_map: watch::Receiver<Option<DERPMap>>,
+        preferred_derp: watch::Receiver<i32>,
+    ) -> Self {
+        let backend = Self::new(version);
+        backend.start_captive_portal_watcher(health, detector, derp_map, preferred_derp);
+        backend
+    }
+
+    /// Start (or replace) the backend's captive-portal watcher.
+    pub fn start_captive_portal_watcher(
+        &self,
+        health: Tracker,
+        detector: Detector,
+        derp_map: watch::Receiver<Option<DERPMap>>,
+        preferred_derp: watch::Receiver<i32>,
+    ) {
+        let watcher = CaptivePortalWatcher::spawn(health, detector, derp_map, preferred_derp);
+        *self
+            .captive_portal_watcher
+            .lock()
+            .expect("captive portal watcher mutex poisoned") = Some(watcher);
     }
 
     /// Get a clone of the notification bus for subscribing.

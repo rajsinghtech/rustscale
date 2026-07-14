@@ -29,6 +29,12 @@ pub enum WgError {
     /// A key was zero / unusable.
     #[error("invalid key")]
     InvalidKey,
+    /// A caller supplied a full reusable plaintext batch.
+    #[error("wireguard plaintext batch is full")]
+    PlaintextBatchFull,
+    /// A caller supplied plaintext larger than a WireGuard message can carry.
+    #[error("wireguard plaintext packet is too large")]
+    PlaintextTooLarge,
 }
 
 /// Result of decapsulating an incoming WireGuard datagram.
@@ -56,6 +62,94 @@ pub struct WgTunn {
 pub struct WgDatagramBatch {
     packets: Vec<Vec<u8>>,
     len: usize,
+}
+
+/// Reusable owned plaintext storage produced by [`WgTunn::decapsulate_into`].
+///
+/// The batch exposes only its initialized packet prefix. [`Self::clear`] and
+/// [`Self::retain_mut`] retain the backing packet allocations, so callers can
+/// reuse the same slots across bounded receive bursts without accidentally
+/// treating stale slots as packets.
+#[derive(Default)]
+pub struct WgPlaintextBatch {
+    packets: Vec<Vec<u8>>,
+    len: usize,
+}
+
+impl WgPlaintextBatch {
+    /// Maximum number of packets in one kernel-TUN receive burst.
+    pub const MAX_PACKETS: usize = 128;
+
+    /// Create an empty reusable plaintext batch.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Number of initialized plaintext packets.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether there are no initialized plaintext packets.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Forget the initialized packet prefix without releasing slot storage.
+    pub fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    /// The initialized plaintext packet prefix.
+    pub fn packets(&self) -> &[Vec<u8>] {
+        &self.packets[..self.len]
+    }
+
+    /// Mutably access only the initialized plaintext packet prefix.
+    pub fn packets_mut(&mut self) -> &mut [Vec<u8>] {
+        &mut self.packets[..self.len]
+    }
+
+    /// Stably retain initialized packets selected by `keep` without freeing
+    /// any retained slot allocations.
+    pub fn retain_mut<F>(&mut self, mut keep: F)
+    where
+        F: FnMut(&mut Vec<u8>) -> bool,
+    {
+        let mut retained = 0;
+        for current in 0..self.len {
+            if keep(&mut self.packets[current]) {
+                if retained != current {
+                    self.packets.swap(retained, current);
+                }
+                retained += 1;
+            }
+        }
+        self.len = retained;
+    }
+
+    /// Copy one packet into the next retained plaintext slot.
+    ///
+    /// This is primarily useful for callers that need to stage owned packets
+    /// alongside `decapsulate_into` output.
+    pub fn push_copy(&mut self, packet: &[u8]) -> Result<(), WgError> {
+        if packet.len() > MAX_WG_MSG {
+            return Err(WgError::PlaintextTooLarge);
+        }
+        if self.len == Self::MAX_PACKETS {
+            return Err(WgError::PlaintextBatchFull);
+        }
+        if self.len == self.packets.len() {
+            self.packets.push(Vec::new());
+        }
+        // A Linux write-side GRO call can change both contents and length.
+        // Clear first so the following copy makes the slot wholly valid again.
+        let slot = &mut self.packets[self.len];
+        slot.clear();
+        slot.extend_from_slice(packet);
+        self.len += 1;
+        Ok(())
+    }
 }
 
 impl WgDatagramBatch {
@@ -181,6 +275,41 @@ impl WgTunn {
         Ok(result)
     }
 
+    /// Decapsulate an incoming datagram into reusable caller-owned plaintext
+    /// slots, returning only immediate WireGuard network replies.
+    ///
+    /// BoringTun's plaintext slice aliases this tunnel's scratch buffer, so it
+    /// is copied into `plaintext` before another decapsulation can occur.
+    /// The protocol loop intentionally matches [`Self::decapsulate`].
+    pub fn decapsulate_into(
+        &mut self,
+        datagram: &[u8],
+        plaintext: &mut WgPlaintextBatch,
+    ) -> Result<Vec<Vec<u8>>, WgError> {
+        let mut replies = Vec::new();
+
+        let mut to_process = Some(datagram);
+        loop {
+            let src = to_process.take().unwrap_or(&[]);
+            match self.tunn.decapsulate(None, src, &mut self.decap_buf[..]) {
+                TunnResult::WriteToNetwork(buf) => {
+                    replies.push(buf.to_vec());
+                    to_process = Some(&[]);
+                }
+                TunnResult::WriteToTunnelV4(buf, _) | TunnResult::WriteToTunnelV6(buf, _) => {
+                    plaintext.push_copy(buf)?;
+                }
+                TunnResult::Done => break,
+                TunnResult::Err(e) => {
+                    let _ = e;
+                    break;
+                }
+            }
+        }
+
+        Ok(replies)
+    }
+
     /// Drive the tunnel's timer state. Returns any datagrams that need to be
     /// sent (handshake retransmissions, keepalives). Call periodically (every
     /// ~250ms per boringtun's convention).
@@ -238,6 +367,18 @@ mod tests {
         pkt[12..16].copy_from_slice(&[10, 0, 0, 1]); // src
         pkt[16..20].copy_from_slice(&[10, 0, 0, 2]); // dst
         pkt[20..].copy_from_slice(payload);
+        pkt
+    }
+
+    fn make_ipv6_packet(payload: &[u8]) -> Vec<u8> {
+        let mut pkt = vec![0u8; 40 + payload.len()];
+        pkt[0] = 0x60; // version 6
+        pkt[4..6].copy_from_slice(&(payload.len() as u16).to_be_bytes());
+        pkt[6] = 17; // next header: UDP
+        pkt[7] = 64; // hop limit
+        pkt[8..24].copy_from_slice(&[0x20, 1, 0xdb, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        pkt[24..40].copy_from_slice(&[0x20, 1, 0xdb, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+        pkt[40..].copy_from_slice(payload);
         pkt
     }
 
@@ -398,6 +539,153 @@ mod tests {
         batch.push_copy(b"second");
         assert_eq!(batch.packets(), &[b"second".to_vec()]);
         assert_eq!(batch.packets()[0].capacity(), capacity);
+    }
+
+    #[test]
+    fn plaintext_batch_compacts_stably_and_hides_stale_slots() {
+        let mut batch = WgPlaintextBatch::new();
+        for packet in [b"first".as_slice(), b"drop".as_slice(), b"third".as_slice()] {
+            batch.push_copy(packet).unwrap();
+        }
+        let first_slot = batch.packets()[0].as_ptr();
+        batch.retain_mut(|packet| packet.as_slice() != b"drop");
+        assert_eq!(batch.packets(), &[b"first".to_vec(), b"third".to_vec()]);
+        assert_eq!(batch.packets()[0].as_ptr(), first_slot);
+        batch.clear();
+        assert!(batch.packets().is_empty());
+    }
+
+    #[test]
+    fn plaintext_batch_has_wireguard_sized_packet_and_burst_bounds() {
+        let mut batch = WgPlaintextBatch::new();
+        for _ in 0..WgPlaintextBatch::MAX_PACKETS {
+            batch.push_copy(b"packet").unwrap();
+        }
+        assert_eq!(batch.len(), WgPlaintextBatch::MAX_PACKETS);
+        assert!(matches!(
+            batch.push_copy(b"one too many"),
+            Err(WgError::PlaintextBatchFull)
+        ));
+        batch.clear();
+        assert!(matches!(
+            batch.push_copy(&vec![0; MAX_WG_MSG + 1]),
+            Err(WgError::PlaintextTooLarge)
+        ));
+    }
+
+    #[test]
+    fn decapsulate_into_matches_scalar_for_handshake_data_keepalive_and_garbage() {
+        let scalar_a_private = NodePrivate::generate();
+        let scalar_b_private = NodePrivate::generate();
+        let mut scalar_a = WgTunn::new(&scalar_a_private, &scalar_b_private.public(), 50)
+            .expect("scalar source tunnel");
+        let mut scalar_b = WgTunn::new(&scalar_b_private, &scalar_a_private.public(), 51)
+            .expect("scalar receiver tunnel");
+
+        let batch_a_private = NodePrivate::generate();
+        let batch_b_private = NodePrivate::generate();
+        let mut batch_a = WgTunn::new(&batch_a_private, &batch_b_private.public(), 52)
+            .expect("batch source tunnel");
+        let mut batch_b = WgTunn::new(&batch_b_private, &batch_a_private.public(), 53)
+            .expect("batch receiver tunnel");
+
+        // The same handshake transition produces immediate replies through
+        // both APIs; the batch API does not expose boringtun's borrowed slice.
+        let scalar_init = scalar_a.force_handshake();
+        let batch_init = batch_a.force_handshake();
+        let scalar_handshake = scalar_b
+            .decapsulate(&scalar_init[0])
+            .expect("scalar handshake decapsulation");
+        let mut plaintext = WgPlaintextBatch::new();
+        let batch_handshake = batch_b
+            .decapsulate_into(&batch_init[0], &mut plaintext)
+            .expect("batched handshake decapsulation");
+        assert_eq!(batch_handshake.len(), scalar_handshake.replies.len());
+        assert!(plaintext.is_empty());
+
+        // Processing a handshake response deterministically produces an
+        // encrypted empty-payload keepalive. This exercises the no-payload
+        // protocol path without relying on timer expiry or on a later empty
+        // encapsulation being scheduled.
+        let scalar_response = scalar_a
+            .decapsulate(&scalar_handshake.replies[0])
+            .expect("scalar handshake response");
+        assert!(scalar_response.plaintext.is_none());
+        assert_eq!(scalar_response.replies.len(), 1);
+        let scalar_keepalive = scalar_b
+            .decapsulate(&scalar_response.replies[0])
+            .expect("scalar keepalive decapsulation");
+        assert!(scalar_keepalive.plaintext.is_none());
+        assert!(scalar_keepalive.replies.is_empty());
+
+        let batch_response = batch_a
+            .decapsulate_into(&batch_handshake[0], &mut plaintext)
+            .expect("batched handshake response");
+        assert!(plaintext.is_empty());
+        assert_eq!(batch_response.len(), scalar_response.replies.len());
+        let batch_keepalive = batch_b
+            .decapsulate_into(&batch_response[0], &mut plaintext)
+            .expect("batched keepalive decapsulation");
+        assert_eq!(batch_keepalive, scalar_keepalive.replies);
+        assert!(plaintext.is_empty());
+
+        // Compare IPv4/IPv6 data and packet ordering from independent
+        // sessions. This avoids comparing random WireGuard ciphertext.
+        plaintext.clear();
+        let packets = [
+            make_ipv4_packet(b"batched ipv4"),
+            make_ipv6_packet(b"batched ipv6"),
+            make_ipv4_packet(b"batched order"),
+        ];
+        for packet in &packets {
+            let scalar_datagram = scalar_a.encapsulate(packet).expect("scalar encrypt");
+            let batch_datagram = batch_a.encapsulate(packet).expect("batch encrypt");
+            let scalar = scalar_b
+                .decapsulate(&scalar_datagram[0])
+                .expect("scalar data decapsulation");
+            let replies = batch_b
+                .decapsulate_into(&batch_datagram[0], &mut plaintext)
+                .expect("batched data decapsulation");
+            assert_eq!(replies.len(), scalar.replies.len());
+            assert_eq!(scalar.plaintext.as_deref(), Some(packet.as_slice()));
+        }
+        assert_eq!(plaintext.packets(), packets.as_slice());
+
+        plaintext.clear();
+        let scalar_garbage = scalar_b.decapsulate(&[0xff; 100]).expect("scalar garbage");
+        let batch_garbage = batch_b
+            .decapsulate_into(&[0xff; 100], &mut plaintext)
+            .expect("batched garbage");
+        assert!(scalar_garbage.plaintext.is_none());
+        assert_eq!(batch_garbage, scalar_garbage.replies);
+        assert!(plaintext.is_empty());
+    }
+
+    #[test]
+    fn decapsulate_into_reuses_a_slot_after_write_side_mutation() {
+        let a_private = NodePrivate::generate();
+        let b_private = NodePrivate::generate();
+        let mut a = WgTunn::new(&a_private, &b_private.public(), 54).expect("source tunnel");
+        let mut b = WgTunn::new(&b_private, &a_private.public(), 55).expect("receiver tunnel");
+        handshake(&mut a, &mut b);
+
+        let first = make_ipv4_packet(b"same length one");
+        let first_datagram = a.encapsulate(&first).expect("first encrypt");
+        let mut plaintext = WgPlaintextBatch::new();
+        b.decapsulate_into(&first_datagram[0], &mut plaintext)
+            .expect("first decapsulation");
+        let ptr = plaintext.packets()[0].as_ptr();
+        let capacity = plaintext.packets()[0].capacity();
+        plaintext.packets_mut()[0].fill(0xa5);
+        plaintext.clear();
+
+        let second = make_ipv4_packet(b"same length two");
+        let second_datagram = a.encapsulate(&second).expect("second encrypt");
+        b.decapsulate_into(&second_datagram[0], &mut plaintext)
+            .expect("second decapsulation");
+        assert_eq!(plaintext.packets(), &[second]);
+        assert_eq!(plaintext.packets()[0].as_ptr(), ptr);
+        assert_eq!(plaintext.packets()[0].capacity(), capacity);
     }
 
     #[test]

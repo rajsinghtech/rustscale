@@ -50,14 +50,13 @@ pub(crate) async fn run_tun_pump(
                 if let Some(dgram) = result {
                     inbound.clear();
                     take_immediate_burst(dgram, &mut wg_recv, &mut inbound.datagrams);
-                    collect_tun_inbound_batch(
-                        &wg_tunnels,
+                    collect_tun_inbound_batch(&wg_tunnels, &mut inbound).await;
+                    filter_tun_inbound_batch(
                         &filter,
                         &packet_drops,
                         &capture,
                         &mut inbound,
-                    )
-                    .await;
+                    );
                     // Datagrams are ciphertext ownership; release their
                     // nested buffers before reply I/O or a blocked TUN write.
                     inbound.datagrams.clear();
@@ -90,9 +89,8 @@ fn take_immediate_burst<T>(first: T, receiver: &mut mpsc::Receiver<T>, output: &
     }
 }
 
-/// Send replies before the one batch write. Draining drops completed reply
-/// buffers; `Vec::clear` only retains the outer allocation and must not be
-/// mistaken for retaining boringtun plaintext allocations.
+/// Send replies before the one batch write, then reset the logical plaintext
+/// length. The owned plaintext slots remain available for the next burst.
 async fn flush_inbound_burst<F, Fut>(
     tun: &dyn Tun,
     inbound: &mut InboundBatchScratch,
@@ -105,23 +103,25 @@ async fn flush_inbound_burst<F, Fut>(
         send_reply(peer, reply).await;
     }
     if !inbound.plaintext.is_empty() {
-        if let Err(error) = tun.write_batch(&mut inbound.plaintext).await {
+        if let Err(error) = tun.write_batch(inbound.plaintext.packets_mut()).await {
             log::warn!("tun batch write error: {error}");
         }
-        // Retain only the outer Vec allocation while idle; plaintext buffers
-        // are consume-on-write and must not remain resident after return.
+        // TUN write-side GRO may have rewritten these buffers even on error.
+        // `decapsulate_into` clears and fully overwrites each slot before it is
+        // initialized by a later burst.
         inbound.plaintext.clear();
+        inbound.plaintext_peers.clear();
     }
 }
 
-/// Reused outer storage for one bounded inbound WireGuard burst. Clearing it
-/// does not retain the individual decrypted plaintext buffers.
+/// Reused state for one bounded inbound WireGuard burst.
 #[derive(Default)]
 struct InboundBatchScratch {
     datagrams: Vec<rustscale_magicsock::WgDatagram>,
     runs: Vec<InboundBatchRun>,
-    decaps: Vec<rustscale_wg::DecapResult>,
-    plaintext: Vec<Vec<u8>>,
+    plaintext: rustscale_wg::WgPlaintextBatch,
+    /// Identity aligned with each initialized `plaintext` slot.
+    plaintext_peers: Vec<NodePublic>,
     replies: Vec<(NodePublic, Vec<u8>)>,
 }
 
@@ -129,8 +129,8 @@ impl InboundBatchScratch {
     fn clear(&mut self) {
         self.datagrams.clear();
         self.runs.clear();
-        self.decaps.clear();
         self.plaintext.clear();
+        self.plaintext_peers.clear();
         self.replies.clear();
     }
 }
@@ -177,14 +177,10 @@ fn build_inbound_runs(
     }
 }
 
-/// Decapsulate a capped immediate receive burst in peer runs. Map and tunnel
-/// locks are released before the filter, capture, reply transport, or TUN I/O
-/// stages; only synchronous boringtun work occurs while a tunnel is locked.
+/// Decapsulate a capped immediate receive burst in peer runs. Only synchronous
+/// boringtun work and owned-result collection occur while a tunnel is locked.
 async fn collect_tun_inbound_batch(
     wg_tunnels: &RwLock<HashMap<NodePublic, Arc<Mutex<WgTunn>>>>,
-    filter: &Arc<std::sync::Mutex<Filter>>,
-    packet_drops: &Arc<AtomicU64>,
-    capture: &crate::capture::CaptureSlot,
     inbound: &mut InboundBatchScratch,
 ) {
     let tunnels = wg_tunnels.read().await;
@@ -199,53 +195,55 @@ async fn collect_tun_inbound_batch(
             }
             InboundBatchRun::Routed(run) => run,
         };
-        inbound.decaps.clear();
         {
             let mut tunnel = run.tunnel.lock().await;
             for datagram in &inbound.datagrams[run.start..run.end] {
-                if let Ok(decap) = tunnel.decapsulate(&datagram.data) {
-                    inbound.decaps.push(decap);
+                let plaintext_start = inbound.plaintext.len();
+                if let Ok(replies) = tunnel.decapsulate_into(&datagram.data, &mut inbound.plaintext)
+                {
+                    for _ in plaintext_start..inbound.plaintext.len() {
+                        inbound.plaintext_peers.push(run.peer.clone());
+                    }
+                    inbound
+                        .replies
+                        .extend(replies.into_iter().map(|reply| (run.peer.clone(), reply)));
                 }
             }
-        }
-        for decap in inbound.decaps.drain(..) {
-            enqueue_tun_inbound_result(
-                filter,
-                packet_drops,
-                &run.peer,
-                decap,
-                capture,
-                &mut inbound.plaintext,
-                &mut inbound.replies,
-            );
         }
     }
 }
 
-fn enqueue_tun_inbound_result(
+/// Filter and stably compact plaintext after every tunnel lock has been
+/// released. Capture sees each accepted packet before a Linux GRO write can
+/// mutate it; the parallel peer vector is compacted in the same stable order.
+fn filter_tun_inbound_batch(
     filter: &Arc<std::sync::Mutex<Filter>>,
     packet_drops: &Arc<AtomicU64>,
-    peer: &NodePublic,
-    decap: rustscale_wg::DecapResult,
     capture: &crate::capture::CaptureSlot,
-    plaintext: &mut Vec<Vec<u8>>,
-    replies: &mut Vec<(NodePublic, Vec<u8>)>,
+    inbound: &mut InboundBatchScratch,
 ) {
-    if let Some(pt) = decap.plaintext {
-        let dropped = {
-            let mut filt = filter.lock().unwrap();
-            filt.check_in(&pt).is_drop()
-        };
-        if dropped {
-            packet_drops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        } else {
+    debug_assert_eq!(inbound.plaintext.len(), inbound.plaintext_peers.len());
+    let mut source = 0;
+    let mut retained = 0;
+    let mut filt = filter.lock().unwrap();
+    inbound.plaintext.retain_mut(|packet| {
+        let keep = !filt.check_in(packet).is_drop();
+        if keep {
             // Capture before Linux write-side GRO is allowed to rewrite the
             // packet's offload and transport headers.
-            crate::capture::log_packet(capture, crate::capture::CapturePath::FromPeer, &pt);
-            plaintext.push(pt);
+            crate::capture::log_packet(capture, crate::capture::CapturePath::FromPeer, packet);
+            if retained != source {
+                inbound.plaintext_peers[retained] = inbound.plaintext_peers[source].clone();
+            }
+            retained += 1;
+        } else {
+            packet_drops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-    }
-    replies.extend(decap.replies.into_iter().map(|reply| (peer.clone(), reply)));
+        source += 1;
+        keep
+    });
+    drop(filt);
+    inbound.plaintext_peers.truncate(retained);
 }
 
 /// Reused state for one outbound kernel-TUN read.
@@ -498,6 +496,9 @@ mod tests {
 
         async fn write_batch(&self, packets: &mut [Vec<u8>]) -> std::io::Result<()> {
             assert_eq!(packets.len(), 2);
+            for packet in packets {
+                packet.fill(0xa5);
+            }
             self.events.lock().unwrap().push("write");
             Err(std::io::Error::other("intentional write failure"))
         }
@@ -713,20 +714,100 @@ mod tests {
                 data: ciphertext,
             });
         }
-        let tunnels = RwLock::new(HashMap::from([(a_public, receiver.clone())]));
+        let tunnels = RwLock::new(HashMap::from([(a_public.clone(), receiver.clone())]));
         let filter = Arc::new(std::sync::Mutex::new(Filter::allow_all()));
         let packet_drops = Arc::new(AtomicU64::new(0));
         let capture = crate::capture::new_slot();
 
-        collect_tun_inbound_batch(&tunnels, &filter, &packet_drops, &capture, &mut inbound).await;
+        collect_tun_inbound_batch(&tunnels, &mut inbound).await;
+        filter_tun_inbound_batch(&filter, &packet_drops, &capture, &mut inbound);
 
-        assert_eq!(inbound.plaintext, packets);
+        assert_eq!(inbound.plaintext.packets(), packets.as_slice());
+        assert_eq!(inbound.plaintext_peers, vec![a_public.clone(), a_public]);
         assert!(inbound.replies.is_empty());
         assert_eq!(packet_drops.load(std::sync::atomic::Ordering::Relaxed), 0);
         assert!(
             receiver.try_lock().is_ok(),
             "filtering and flush are lock-free"
         );
+    }
+
+    #[tokio::test]
+    async fn inbound_batch_collects_all_128_plaintext_slots_in_order() {
+        let first_source_private = NodePrivate::generate();
+        let first_target_private = NodePrivate::generate();
+        let first_source_public = first_source_private.public();
+        let first_target_public = first_target_private.public();
+        let first_sender = Arc::new(Mutex::new(
+            WgTunn::new(&first_source_private, &first_target_public, 1).expect("first sender"),
+        ));
+        let first_receiver = Arc::new(Mutex::new(
+            WgTunn::new(&first_target_private, &first_source_public, 2).expect("first receiver"),
+        ));
+        let second_source_private = NodePrivate::generate();
+        let second_target_private = NodePrivate::generate();
+        let second_source_public = second_source_private.public();
+        let second_target_public = second_target_private.public();
+        let second_sender = Arc::new(Mutex::new(
+            WgTunn::new(&second_source_private, &second_target_public, 3).expect("second sender"),
+        ));
+        let second_receiver = Arc::new(Mutex::new(
+            WgTunn::new(&second_target_private, &second_source_public, 4).expect("second receiver"),
+        ));
+        establish_tunnels(&first_sender, &first_receiver).await;
+        establish_tunnels(&second_sender, &second_receiver).await;
+
+        let packets = (0..rustscale_wg::WgPlaintextBatch::MAX_PACKETS)
+            .map(|sequence| {
+                let mut packet = vec![0x45, 0, 0, 20, 0, 0, 0, 0, 64, 17, 0, 0];
+                packet.extend_from_slice(&[100, 64, 0, 1, 100, 64, 0, 2]);
+                packet[4..6].copy_from_slice(&(sequence as u16).to_be_bytes());
+                packet
+            })
+            .collect::<Vec<_>>();
+        let mut inbound = InboundBatchScratch::default();
+        let mut expected_peers = Vec::with_capacity(packets.len());
+        for (sequence, packet) in packets.iter().enumerate() {
+            let (sender, peer) = if sequence % 2 == 0 {
+                (&first_sender, &first_source_public)
+            } else {
+                (&second_sender, &second_source_public)
+            };
+            let ciphertext = sender
+                .lock()
+                .await
+                .encapsulate(packet)
+                .expect("encrypt packet")
+                .into_iter()
+                .next()
+                .expect("one wireguard data packet");
+            inbound.datagrams.push(rustscale_magicsock::WgDatagram {
+                peer: peer.clone(),
+                data: ciphertext,
+            });
+            expected_peers.push(peer.clone());
+        }
+        assert_eq!(
+            inbound.datagrams.len(),
+            rustscale_wg::WgPlaintextBatch::MAX_PACKETS
+        );
+
+        let tunnels = RwLock::new(HashMap::from([
+            (first_source_public, first_receiver),
+            (second_source_public, second_receiver),
+        ]));
+        collect_tun_inbound_batch(&tunnels, &mut inbound).await;
+
+        // Reaching the exact batch capacity proves collection did not fail
+        // with PlaintextBatchFull; each sequence number makes reordering
+        // observable, and every plaintext slot keeps its sender identity.
+        assert_eq!(
+            inbound.plaintext.len(),
+            rustscale_wg::WgPlaintextBatch::MAX_PACKETS
+        );
+        assert_eq!(inbound.plaintext.packets(), packets.as_slice());
+        assert_eq!(inbound.plaintext_peers, expected_peers);
+        assert!(inbound.replies.is_empty());
     }
 
     #[tokio::test]
@@ -770,7 +851,8 @@ mod tests {
         let filter = Arc::new(std::sync::Mutex::new(Filter::allow_none()));
         let packet_drops = Arc::new(AtomicU64::new(0));
         let capture = crate::capture::new_slot();
-        collect_tun_inbound_batch(&tunnels, &filter, &packet_drops, &capture, &mut inbound).await;
+        collect_tun_inbound_batch(&tunnels, &mut inbound).await;
+        filter_tun_inbound_batch(&filter, &packet_drops, &capture, &mut inbound);
 
         assert!(
             inbound.plaintext.is_empty(),
@@ -780,7 +862,41 @@ mod tests {
     }
 
     #[test]
+    fn inbound_filter_compacts_mixed_packets_and_aligned_peers_stably() {
+        let first_peer = NodePrivate::generate().public();
+        let dropped_peer = NodePrivate::generate().public();
+        let last_peer = NodePrivate::generate().public();
+        let first = vec![
+            0x45, 0, 0, 20, 0, 1, 0, 0, 64, 17, 0, 0, 100, 64, 0, 1, 100, 64, 0, 2,
+        ];
+        let last = vec![
+            0x45, 0, 0, 20, 0, 3, 0, 0, 64, 17, 0, 0, 100, 64, 0, 1, 100, 64, 0, 2,
+        ];
+        let mut inbound = InboundBatchScratch::default();
+        for packet in [&first[..], &[0x10][..], &last[..]] {
+            inbound.plaintext.push_copy(packet).unwrap();
+        }
+        inbound.plaintext_peers = vec![first_peer.clone(), dropped_peer, last_peer.clone()];
+        let filter = Arc::new(std::sync::Mutex::new(Filter::allow_all()));
+        let packet_drops = Arc::new(AtomicU64::new(0));
+        filter_tun_inbound_batch(
+            &filter,
+            &packet_drops,
+            &crate::capture::new_slot(),
+            &mut inbound,
+        );
+
+        assert_eq!(inbound.plaintext.packets(), &[first, last]);
+        assert_eq!(inbound.plaintext_peers, vec![first_peer, last_peer]);
+        assert_eq!(packet_drops.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[test]
     fn immediate_burst_is_capped_at_tun_batch_capacity() {
+        assert_eq!(
+            rustscale_wg::WgPlaintextBatch::MAX_PACKETS,
+            rustscale_tun::TunPacketBatch::MAX_PACKETS
+        );
         let (tx, mut rx) = mpsc::channel(256);
         for value in 1_u16..=130 {
             tx.try_send(value).unwrap();
@@ -800,12 +916,10 @@ mod tests {
             events: events.clone(),
         };
         let peer = NodePrivate::generate().public();
-        let mut inbound = InboundBatchScratch {
-            datagrams: Vec::new(),
-            plaintext: vec![vec![1], vec![2]],
-            replies: vec![(peer.clone(), vec![3]), (peer, vec![4])],
-            ..Default::default()
-        };
+        let mut inbound = InboundBatchScratch::default();
+        inbound.plaintext.push_copy(&[1]).unwrap();
+        inbound.plaintext.push_copy(&[2]).unwrap();
+        inbound.replies = vec![(peer.clone(), vec![3]), (peer, vec![4])];
         let reply_events = events.clone();
         flush_inbound_burst(&tun, &mut inbound, move |_peer, _reply| {
             let events = reply_events.clone();
@@ -818,6 +932,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inbound_capture_precedes_mutating_write_and_reuses_slots_after_error() {
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let tun = BatchProbe {
+            events: events.clone(),
+        };
+        let first = vec![
+            0x45, 0, 0, 20, 0, 1, 0, 0, 64, 17, 0, 0, 100, 64, 0, 1, 100, 64, 0, 2,
+        ];
+        let second = vec![
+            0x45, 0, 0, 20, 0, 2, 0, 0, 64, 17, 0, 0, 100, 64, 0, 1, 100, 64, 0, 2,
+        ];
+        let mut inbound = InboundBatchScratch::default();
+        inbound.plaintext.push_copy(&first).unwrap();
+        inbound.plaintext.push_copy(&second).unwrap();
+        let first_slot = inbound.plaintext.packets()[0].as_ptr();
+        let first_capacity = inbound.plaintext.packets()[0].capacity();
+        let filter = Arc::new(std::sync::Mutex::new(Filter::allow_all()));
+        let packet_drops = Arc::new(AtomicU64::new(0));
+        let capture = crate::capture::new_slot();
+        let sink = crate::capture::get_or_set(&capture);
+        let (capture_tx, mut capture_rx) = mpsc::channel(4);
+        let _handle = sink
+            .register_output(crate::capture::ChannelOutput::new(capture_tx))
+            .expect("register capture output");
+        let _header = capture_rx.recv().await.expect("pcap header");
+        inbound.plaintext_peers = vec![
+            NodePrivate::generate().public(),
+            NodePrivate::generate().public(),
+        ];
+        filter_tun_inbound_batch(&filter, &packet_drops, &capture, &mut inbound);
+        flush_inbound_burst(&tun, &mut inbound, |_peer, _reply| async {}).await;
+
+        let captured = capture_rx.recv().await.expect("first captured packet");
+        assert_eq!(&captured[20..], first.as_slice());
+        assert!(inbound.plaintext.is_empty());
+        inbound.plaintext.push_copy(&first).unwrap();
+        assert_eq!(inbound.plaintext.packets()[0], first);
+        assert_eq!(inbound.plaintext.packets()[0].as_ptr(), first_slot);
+        assert_eq!(inbound.plaintext.packets()[0].capacity(), first_capacity);
+    }
+
+    #[tokio::test]
     async fn replies_finish_before_a_pending_batch_write_is_polled() {
         let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (polled_tx, polled_rx) = tokio::sync::oneshot::channel();
@@ -826,12 +982,9 @@ mod tests {
             polled: std::sync::Mutex::new(Some(polled_tx)),
         };
         let peer = NodePrivate::generate().public();
-        let mut inbound = InboundBatchScratch {
-            datagrams: Vec::new(),
-            plaintext: vec![vec![1]],
-            replies: vec![(peer.clone(), vec![2]), (peer, vec![3])],
-            ..Default::default()
-        };
+        let mut inbound = InboundBatchScratch::default();
+        inbound.plaintext.push_copy(&[1]).unwrap();
+        inbound.replies = vec![(peer.clone(), vec![2]), (peer, vec![3])];
         let task = tokio::spawn(async move {
             flush_inbound_burst(&tun, &mut inbound, move |_peer, _reply| {
                 let seen = seen.clone();

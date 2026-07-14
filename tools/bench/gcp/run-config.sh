@@ -312,6 +312,7 @@ tun_path_gate() {
 
 cleanup_rs_tun() {
   local status=0
+  remote_stop_footprint "$SVM" "$SZONE" /tmp/rs-tun-srv.footprint >/dev/null || true
   # This runs as root because rs-tun may have left root-owned benchmark files.
   # It is deliberately idempotent: an already-absent optional iperf3 server
   # must not make ssh_sudo retry before the next non-root config starts.
@@ -334,6 +335,11 @@ cleanup_rs_tun() {
     echo "[gcp] ERROR: rs-tun cleanup failed on client $CVM" >&2
     status=1
   fi
+  # Erase helpers left by a previously interrupted userspace cell as well.
+  # This is intentionally best effort; rs-tun's safety status is determined
+  # by its daemon/TUN cleanup above.
+  ssh_sudo "$SVM" "$SZONE" "pkill -f rustscale-bench 2>/dev/null || true; pkill -x tailscaled 2>/dev/null || true; pkill -x socat 2>/dev/null || true; pkill -x iperf3 2>/dev/null || true; rm -rf /tmp/rs-srv /tmp/rs-cli-* /tmp/ts-srv /tmp/ts-cli" || true
+  ssh_sudo "$CVM" "$CZONE" "pkill -f rustscale-bench 2>/dev/null || true; pkill -x tailscaled 2>/dev/null || true; pkill -x socat 2>/dev/null || true; pkill -x iperf3 2>/dev/null || true; rm -rf /tmp/rs-srv /tmp/rs-cli-* /tmp/ts-srv /tmp/ts-cli" || true
   return "$status"
 }
 
@@ -414,15 +420,47 @@ rs_tun_cleanup_command() {
 }
 
 cleanup_ts_tun() {
+  # Samplers are independent background processes; stopping an already-stopped
+  # sampler is harmless and keeps every post-start exit quiescent.
+  remote_stop_footprint "$SVM" "$SZONE" /tmp/ts-tun-srv.footprint >/dev/null || true
   ssh_sudo "$SVM" "$SZONE" \
-    "kill \$(cat $(tun_iperf_server_pid_path ts-tun) 2>/dev/null) 2>/dev/null; pkill -x iperf3 2>/dev/null; \
+    "kill \$(cat $(tun_iperf_server_pid_path ts-tun) 2>/dev/null) 2>/dev/null; pkill -x iperf3 2>/dev/null; pkill -x socat 2>/dev/null; pkill -f rustscale-bench 2>/dev/null; \
      tailscale --socket=/tmp/ts-tun-srv.sock down 2>/dev/null; \
      kill \$(cat /tmp/ts-tun-srv.pid 2>/dev/null) 2>/dev/null; pkill -x tailscaled 2>/dev/null; \
-     cp /etc/resolv.conf.bench-bak /etc/resolv.conf 2>/dev/null || true; rm -f /etc/resolv.conf.bench-bak $(tun_iperf_server_pid_path ts-tun) $(tun_iperf_server_log_path ts-tun)" || true
+     cp /etc/resolv.conf.bench-bak /etc/resolv.conf 2>/dev/null || true; rm -rf /tmp/ts-tun-srv; rm -f /etc/resolv.conf.bench-bak /tmp/ts-tun-srv.{log,pid,sock} $(tun_iperf_server_pid_path ts-tun) $(tun_iperf_server_log_path ts-tun)" || true
   ssh_sudo "$CVM" "$CZONE" \
-    "tailscale --socket=/tmp/ts-tun-cli.sock down 2>/dev/null; \
+    "pkill -x iperf3 2>/dev/null; pkill -x socat 2>/dev/null; pkill -f rustscale-bench 2>/dev/null; tailscale --socket=/tmp/ts-tun-cli.sock down 2>/dev/null; \
      kill \$(cat /tmp/ts-tun-cli.pid 2>/dev/null) 2>/dev/null; pkill -x tailscaled 2>/dev/null; \
-     cp /etc/resolv.conf.bench-bak /etc/resolv.conf 2>/dev/null || true; rm -f /etc/resolv.conf.bench-bak $(tun_iperf_warmup_path ts-tun) $(tun_iperf_sample_path ts-tun)" || true
+     cp /etc/resolv.conf.bench-bak /etc/resolv.conf 2>/dev/null || true; rm -rf /tmp/ts-tun-cli; rm -f /etc/resolv.conf.bench-bak /tmp/ts-tun-cli.{log,pid,sock} $(tun_iperf_warmup_path ts-tun) $(tun_iperf_sample_path ts-tun)" || true
+}
+
+# Userspace cells share VMs with later matrix cells.  Their cleanup is
+# deliberately broad and idempotent: it stops the sampler first, then removes
+# every benchmark/tunnel helper and temporary state on both endpoints.
+cleanup_rs_userspace() {
+  remote_stop_footprint "$SVM" "$SZONE" /tmp/rs-srv.footprint >/dev/null || true
+  ssh_cmd "$SVM" "$SZONE" \
+    "kill \$(cat /tmp/rs-srv.pid 2>/dev/null) 2>/dev/null || true; pkill -f rustscale-bench 2>/dev/null || true; pkill -x tailscaled 2>/dev/null || true; pkill -x socat 2>/dev/null || true; pkill -x iperf3 2>/dev/null || true; rm -rf /tmp/rs-srv /tmp/rs-cli-* /tmp/ts-srv /tmp/ts-cli; rm -f /tmp/rs-srv.{pid,log,footprint} /tmp/ts-{srv,cli}.{pid,log,sock} /tmp/{socat,iperf3-srv,ncat}.{pid,log}" || true
+  ssh_cmd "$CVM" "$CZONE" \
+    "pkill -f rustscale-bench 2>/dev/null || true; pkill -x tailscaled 2>/dev/null || true; pkill -x socat 2>/dev/null || true; pkill -x iperf3 2>/dev/null || true; rm -rf /tmp/rs-cli-* /tmp/rs-srv /tmp/ts-srv /tmp/ts-cli; rm -f /tmp/rs-cli-*.{log,pid} /tmp/ts-{srv,cli}.{pid,log,sock} /tmp/{socat,iperf3-cli}.{pid,log}" || true
+}
+
+cleanup_ts_userspace() {
+  remote_stop_footprint "$SVM" "$SZONE" /tmp/ts-srv.footprint >/dev/null || true
+  ssh_cmd "$SVM" "$SZONE" \
+    "tailscale --socket=/tmp/ts-srv.sock serve reset 2>/dev/null || true; kill \$(cat /tmp/ts-srv.pid 2>/dev/null) \$(cat /tmp/iperf3-srv.pid 2>/dev/null) \$(cat /tmp/ncat.pid 2>/dev/null) 2>/dev/null || true; pkill -f rustscale-bench 2>/dev/null || true; pkill -x tailscaled 2>/dev/null || true; pkill -x socat 2>/dev/null || true; pkill -x iperf3 2>/dev/null || true; pkill -x ncat 2>/dev/null || true; rm -rf /tmp/ts-srv /tmp/ts-cli /tmp/rs-srv /tmp/rs-cli-*; rm -f /tmp/ts-{srv,cli}.{pid,log,sock,footprint} /tmp/{iperf3-srv,ncat,socat}.{pid,log}" || true
+  ssh_cmd "$CVM" "$CZONE" \
+    "kill \$(cat /tmp/ts-cli.pid 2>/dev/null) \$(cat /tmp/socat.pid 2>/dev/null) 2>/dev/null || true; pkill -f rustscale-bench 2>/dev/null || true; pkill -x tailscaled 2>/dev/null || true; pkill -x socat 2>/dev/null || true; pkill -x iperf3 2>/dev/null || true; rm -rf /tmp/ts-cli /tmp/ts-srv /tmp/rs-srv /tmp/rs-cli-*; rm -f /tmp/ts-{srv,cli}.{pid,log,sock} /tmp/{socat,iperf3-cli}.{pid,log}" || true
+}
+
+# Args: CLEANUP_FUNCTION ERROR_STRING [LOG_TAIL].  This is the sole failure
+# exit used after a userspace daemon has been started, making cleanup ordering
+# explicit and testable.
+fail_userspace_config() {
+  local cleanup_fn="$1" err="$2" log_tail="${3:-}"
+  emit_stub "$err" "$log_tail"
+  "$cleanup_fn" || true
+  return 1
 }
 
 # ts-tun also removes its own root-owned artifacts before each measurement so
@@ -434,7 +472,8 @@ ts_tun_measurement_preflight() {
       "rm -f $(tun_iperf_warmup_path ts-tun) $(tun_iperf_sample_path ts-tun)"
 }
 
-# Write a stub JSON (used in dry-run or on failure).
+# Write an explicit failed-cell JSON (used in dry-run or on failure).  A
+# failure is not a zero-valued benchmark: consumers must never chart it as one.
 # Args: ERROR_STRING [LOG_TAIL]
 emit_stub() {
   local err="${1:-dry-run}"
@@ -463,6 +502,8 @@ try:
 except OSError:
     log_tail = ""
 obj = {
+    "schema_version": 2,
+    "status": "failed",
     "tool": tool,
     "mode": mode,
     "topology": topo,
@@ -471,15 +512,10 @@ obj = {
     "repeat": int(repeat),
     "error": err,
     "log_tail": log_tail,
-    "throughput": [
-        {"parallel": p,
-         "mbps": 0, "duration_s": int(dur),
-         "samples_mbps": [0] * int(repeat), "statistic": "median"}
-        for p in map(int, parallel_values)
-    ],
-    "latency": {"p50_us": 0, "p95_us": 0, "p99_us": 0, "count": int(lat_count)},
-    "footprint": {"binary_size_bytes": 0, "rss_peak_kb": 0, "rss_avg_kb": 0,
-                   "cpu_peak_pct": 0, "cpu_avg_pct": 0, "samples": 0},
+    "parallelism_requested": [int(p) for p in parallel_values],
+    "throughput": None,
+    "latency": None,
+    "footprint": None,
     "path_class_reported": "unknown",
 }
 print(json.dumps(obj, indent=2))
@@ -579,6 +615,7 @@ cleanup_self_test() {
   # either daemon endpoint cleanup.
   cleanup_failure=$(
     CLEANUP_TEST_SSH_CALLS=""
+    remote_stop_footprint() { :; }
     ssh_sudo() {
       CLEANUP_TEST_SSH_CALLS+=" $1:$2"
       [[ "$3" == "$(rs_tun_iperf_cleanup_command server)" ]] && return 1
@@ -591,7 +628,22 @@ cleanup_self_test() {
     fi
     printf '%s|%s\n' "$result" "$CLEANUP_TEST_SSH_CALLS"
   ) || return 1
-  [[ "$cleanup_failure" == "1| $SVM:$SZONE $CVM:$CZONE $SVM:$SZONE $CVM:$CZONE" ]] || return 1
+  [[ "$cleanup_failure" == "1| $SVM:$SZONE $CVM:$CZONE $SVM:$SZONE $CVM:$CZONE $SVM:$SZONE $CVM:$CZONE" ]] || return 1
+
+  # Failure injection uses the same helper as the post-start userspace
+  # throughput exits.  Cleanup must finish before a later matrix cell starts.
+  local injection_events injection_result
+  injection_events=$(mktemp "$RDIR/userspace-failure-test.XXXXXX")
+  injection_result=$(
+    emit_stub() { printf 'stub:%s\n' "$1" >>"$injection_events"; }
+    cleanup_rs_userspace() { printf 'cleanup:rs-userspace\n' >>"$injection_events"; }
+    if fail_userspace_config cleanup_rs_userspace injected-throughput-failure; then
+      exit 1
+    fi
+    printf 'next-cell\n' >>"$injection_events"
+  ) || return 1
+  [[ "$(<"$injection_events")" == $'stub:injected-throughput-failure\ncleanup:rs-userspace\nnext-cell' ]] || return 1
+  rm -f "$injection_events"
 
   unset -f pgrep ip pkill sleep ps fuser test_remote_cleanup
 }
@@ -603,14 +655,9 @@ import json, sys
 path, duration, latency_count, *parallels = sys.argv[1:]
 with open(path) as f:
     result = json.load(f)
-assert [row["parallel"] for row in result["throughput"]] == [int(p) for p in parallels]
-assert all(row["duration_s"] == int(duration) for row in result["throughput"])
-assert result["repeat"] == 3
-assert all(row["statistic"] == "median" and len(row["samples_mbps"]) == 3
-           for row in result["throughput"])
-assert all(row["samples_mbps"] == [0, 0, 0] and row["mbps"] == 0
-           for row in result["throughput"])
-assert result["latency"]["count"] == int(latency_count)
+assert result["schema_version"] == 2 and result["status"] == "failed"
+assert result["parallelism_requested"] == [int(p) for p in parallels]
+assert result["throughput"] is None and result["latency"] is None and result["footprint"] is None
 PYEOF
 
   # render-html consumes an aggregate JSON list, not one per-config object.
@@ -631,7 +678,7 @@ with open(sys.argv[1]) as f:
 match = re.search(r"window\.__chartData = (.*?);</script>", html, re.DOTALL)
 assert match, "chart registry missing"
 registry = json.loads(match.group(1))
-expected = [int(p) for p in sys.argv[2:]]
+expected = []  # failed cells deliberately expose no numeric measurements
 assert all(data["parallels"] == expected
            for chart, data in registry.items() if chart.startswith("tp-"))
 PYEOF
@@ -912,16 +959,19 @@ tun_emit_result() {
   local tool="$1" label="$2" path_class="$3" runtime_server="${4:-}" runtime_client="${5:-}"
   python3 - "$CONFIG" "$TOPOLOGY" "$PATH_TAG" "$path_class" \
     "$TUN_MEASURE_BIN_SIZE" "$TUN_MEASURE_THROUGHPUT" "$TUN_MEASURE_LATENCY" \
-    "$TUN_MEASURE_FOOTPRINT" "$tool" "$REPEAT" "$runtime_server" "$runtime_client" >"$OUT" <<'PYEOF'
+    "$TUN_MEASURE_FOOTPRINT" "$tool" "$REPEAT" "$runtime_server" "$runtime_client" "${PARALLELS[@]}" >"$OUT" <<'PYEOF'
 import json, sys
-config, topo, path_tag, path_class, bin_size, tp, lat, foot, tool, repeat, runtime_server, runtime_client = sys.argv[1:13]
+config, topo, path_tag, path_class, bin_size, tp, lat, foot, tool, repeat, runtime_server, runtime_client, *parallel_values = sys.argv[1:]
 obj = {
+    "schema_version": 2,
+    "status": "ok",
     "tool": tool,
     "mode": "tun",
     "topology": topo,
     "path": path_tag,
     "config": config,
     "repeat": int(repeat),
+    "parallelism_requested": [int(value) for value in parallel_values],
     "error": "",
     "log_tail": "",
     "throughput": json.loads(tp),
@@ -1002,6 +1052,7 @@ import json, sys
 with open(sys.argv[1]) as f:
     result = json.load(f)
 assert result["repeat"] == 2
+assert result["parallelism_requested"] == [1, 10]
 assert result["runtime_stats"] == {"server": "", "client": ""}
 PYEOF
 
@@ -1351,7 +1402,7 @@ run_rs_userspace() {
     echo "[gcp] ERROR: rustscale-bench server never became ready" >&2
     local _lt
     _lt=$(capture_log_tail "$SVM" "$SZONE" /tmp/rs-srv.log)
-    emit_stub "server-not-ready" "$_lt"
+    fail_userspace_config cleanup_rs_userspace "server-not-ready" "$_lt"
     return 1
   fi
 
@@ -1367,19 +1418,18 @@ run_rs_userspace() {
   # Throughput sweep on client.
   local tp_json="[]"
   for N in "${PARALLELS[@]}"; do
-    echo "[gcp] rs-userspace: throughput N=$N" >&2
-    local mbps
-    mbps=$(ssh_cmd "$CVM" "$CZONE" \
-      "/opt/rustscale/target/release/rustscale-bench client \
-         --authkey $AUTHKEY --target $server_ip:$PORT --duration $DURATION \
-         --parallel $N --hostname $CHOST-$N --state-dir /tmp/rs-cli-$N --json 2>/tmp/rs-cli-$N.log" \
-      | iperf3_mbps 2>/dev/null || echo "0")
-    tp_json=$(echo "$tp_json" | python3 -c "
-import json,sys
-arr=json.load(sys.stdin)
-arr.append({'parallel': $N, 'mbps': float('$mbps'), 'duration_s': $DURATION})
-print(json.dumps(arr))
-")
+    local -a samples=()
+    for ((sample_index = 1; sample_index <= REPEAT; sample_index++)); do
+      echo "[gcp] rs-userspace: throughput N=$N sample=$sample_index/$REPEAT" >&2
+      local mbps
+      mbps=$(ssh_cmd "$CVM" "$CZONE" \
+        "/opt/rustscale/target/release/rustscale-bench client \
+           --authkey $AUTHKEY --target $server_ip:$PORT --duration $DURATION \
+           --parallel $N --hostname $CHOST-$N-$sample_index --state-dir /tmp/rs-cli-$N-$sample_index --json 2>/tmp/rs-cli-$N-$sample_index.log" \
+        | tun_iperf3_mbps 2>/dev/null) || { fail_userspace_config cleanup_rs_userspace "rs-userspace-throughput-failed" "$(capture_log_tail "$CVM" "$CZONE" /tmp/rs-cli-$N-$sample_index.log)"; return 1; }
+      samples+=("$mbps")
+    done
+    tp_json=$(append_tun_throughput_row "$tp_json" "$N" "$DURATION" "${samples[@]}") || { fail_userspace_config cleanup_rs_userspace "rs-userspace-throughput-invalid"; return 1; }
     sleep 3
   done
 
@@ -1402,19 +1452,22 @@ print(json.dumps(arr))
   local bin_size
   bin_size=$(ssh_cmd "$SVM" "$SZONE" 'stat -c %s /opt/rustscale/target/release/rustscale-bench 2>/dev/null || echo 0')
 
-  # Kill server.
-  ssh_cmd "$SVM" "$SZONE" "kill \$(cat /tmp/rs-srv.pid 2>/dev/null) 2>/dev/null; pkill -f rustscale-bench 2>/dev/null" || true
+  cleanup_rs_userspace
 
   # Emit result JSON.
-  python3 - "$CONFIG" "$TOPOLOGY" "$PATH_TAG" "$path_class" "$bin_size" "$tp_json" "$lat_json" "$foot_json" >"$OUT" <<'PYEOF'
+  python3 - "$CONFIG" "$TOPOLOGY" "$PATH_TAG" "$path_class" "$bin_size" "$tp_json" "$lat_json" "$foot_json" "$REPEAT" "${PARALLELS[@]}" >"$OUT" <<'PYEOF'
 import json, sys
-config, topo, path_tag, path_class, bin_size, tp, lat, foot = sys.argv[1:9]
+config, topo, path_tag, path_class, bin_size, tp, lat, foot, repeat, *parallel_values = sys.argv[1:]
 obj = {
+    "schema_version": 2,
+    "status": "ok",
     "tool": "rustscale",
     "mode": "userspace",
     "topology": topo,
     "path": path_tag,
     "config": config,
+    "repeat": int(repeat),
+    "parallelism_requested": [int(value) for value in parallel_values],
     "error": "",
     "log_tail": "",
     "throughput": json.loads(tp),
@@ -1508,8 +1561,7 @@ run_ts_userspace() {
     echo "[gcp] ERROR: tailscale up failed on server" >&2
     local _lt
     _lt=$(capture_log_tail "$SVM" "$SZONE" /tmp/ts-srv.log)
-    emit_stub "ts-up-failed-srv" "$_lt"
-    ssh_cmd "$SVM" "$SZONE" "kill \$(cat /tmp/ts-srv.pid 2>/dev/null) 2>/dev/null; pkill -x tailscaled 2>/dev/null" || true
+    fail_userspace_config cleanup_ts_userspace "ts-up-failed-srv" "$_lt"
     return 1
   fi
   local server_ip
@@ -1518,8 +1570,7 @@ run_ts_userspace() {
     echo "[gcp] ERROR: no tailnet IP on server" >&2
     local _lt
     _lt=$(capture_log_tail "$SVM" "$SZONE" /tmp/ts-srv.log)
-    emit_stub "ts-no-ip-srv" "$_lt"
-    ssh_cmd "$SVM" "$SZONE" "kill \$(cat /tmp/ts-srv.pid 2>/dev/null) 2>/dev/null; pkill -x tailscaled 2>/dev/null" || true
+    fail_userspace_config cleanup_ts_userspace "ts-no-ip-srv" "$_lt"
     return 1
   fi
   echo "[gcp] ts-userspace: server IP=$server_ip" >&2
@@ -1543,9 +1594,7 @@ run_ts_userspace() {
     echo "[gcp] ERROR: tailscale up failed on client" >&2
     local _lt
     _lt=$(capture_log_tail "$CVM" "$CZONE" /tmp/ts-cli.log)
-    emit_stub "ts-up-failed-cli" "$_lt"
-    ssh_cmd "$SVM" "$SZONE" "kill \$(cat /tmp/ts-srv.pid 2>/dev/null) 2>/dev/null; pkill -x tailscaled 2>/dev/null" || true
-    ssh_cmd "$CVM" "$CZONE" "kill \$(cat /tmp/ts-cli.pid 2>/dev/null) 2>/dev/null; pkill -x tailscaled 2>/dev/null" || true
+    fail_userspace_config cleanup_ts_userspace "ts-up-failed-cli" "$_lt"
     return 1
   fi
 
@@ -1555,9 +1604,7 @@ run_ts_userspace() {
     echo "[gcp] ERROR: no tailscale peer appeared on client after 120s" >&2
     local _lt
     _lt=$(capture_log_tail "$CVM" "$CZONE" /tmp/ts-cli.log)
-    emit_stub "ts-no-peer" "$_lt"
-    ssh_cmd "$SVM" "$SZONE" "kill \$(cat /tmp/ts-srv.pid 2>/dev/null) 2>/dev/null; pkill -x tailscaled 2>/dev/null" || true
-    ssh_cmd "$CVM" "$CZONE" "kill \$(cat /tmp/ts-cli.pid 2>/dev/null) 2>/dev/null; pkill -x tailscaled 2>/dev/null" || true
+    fail_userspace_config cleanup_ts_userspace "ts-no-peer" "$_lt"
     return 1
   fi
 
@@ -1575,17 +1622,16 @@ run_ts_userspace() {
   # Throughput sweep via socat bridge.
   local tp_json="[]"
   for N in "${PARALLELS[@]}"; do
-    echo "[gcp] ts-userspace: iperf3 N=$N via socat" >&2
-    local mbps
-    mbps=$(ssh_cmd "$CVM" "$CZONE" \
-      "iperf3 -c 127.0.0.1 -p 5300 -t $DURATION -P $N -R -J --connect-timeout 5000 2>/tmp/iperf3-cli-$N.log" \
-      | iperf3_mbps 2>/dev/null || echo "0")
-    tp_json=$(echo "$tp_json" | python3 -c "
-import json,sys
-arr=json.load(sys.stdin)
-arr.append({'parallel': $N, 'mbps': float('$mbps'), 'duration_s': $DURATION})
-print(json.dumps(arr))
-")
+    local -a samples=()
+    for ((sample_index = 1; sample_index <= REPEAT; sample_index++)); do
+      echo "[gcp] ts-userspace: iperf3 N=$N sample=$sample_index/$REPEAT via socat" >&2
+      local mbps
+      mbps=$(ssh_cmd "$CVM" "$CZONE" \
+        "iperf3 -c 127.0.0.1 -p 5300 -t $DURATION -P $N -R -J --connect-timeout 5000 2>/tmp/iperf3-cli-$N-$sample_index.log" \
+        | tun_iperf3_mbps 2>/dev/null) || { fail_userspace_config cleanup_ts_userspace "ts-userspace-throughput-failed" "$(capture_log_tail "$CVM" "$CZONE" /tmp/iperf3-cli-$N-$sample_index.log)"; return 1; }
+      samples+=("$mbps")
+    done
+    tp_json=$(append_tun_throughput_row "$tp_json" "$N" "$DURATION" "${samples[@]}") || { fail_userspace_config cleanup_ts_userspace "ts-userspace-throughput-invalid"; return 1; }
     sleep 3
   done
 
@@ -1665,21 +1711,21 @@ print('unknown')
   local bin_size
   bin_size=$(ssh_cmd "$SVM" "$SZONE" 'stat -c %s /usr/sbin/tailscaled 2>/dev/null || echo 0')
 
-  # Cleanup.
-  ssh_cmd "$CVM" "$CZONE" "kill \$(cat /tmp/socat.pid 2>/dev/null) 2>/dev/null; pkill -x socat 2>/dev/null" || true
-  ssh_cmd "$SVM" "$SZONE" "tailscale --socket=/tmp/ts-srv.sock serve reset 2>/dev/null; kill \$(cat /tmp/iperf3-srv.pid 2>/dev/null) \$(cat /tmp/ncat.pid 2>/dev/null) 2>/dev/null; pkill -x iperf3 2>/dev/null; pkill -x ncat 2>/dev/null" || true
-  ssh_cmd "$SVM" "$SZONE" "kill \$(cat /tmp/ts-srv.pid 2>/dev/null) 2>/dev/null; pkill -x tailscaled 2>/dev/null" || true
-  ssh_cmd "$CVM" "$CZONE" "kill \$(cat /tmp/ts-cli.pid 2>/dev/null) 2>/dev/null; pkill -x tailscaled 2>/dev/null" || true
+  cleanup_ts_userspace
 
-  python3 - "$CONFIG" "$TOPOLOGY" "$PATH_TAG" "$path_class" "$bin_size" "$tp_json" "$lat_json" "$foot_json" >"$OUT" <<'PYEOF'
+  python3 - "$CONFIG" "$TOPOLOGY" "$PATH_TAG" "$path_class" "$bin_size" "$tp_json" "$lat_json" "$foot_json" "$REPEAT" "${PARALLELS[@]}" >"$OUT" <<'PYEOF'
 import json, sys
-config, topo, path_tag, path_class, bin_size, tp, lat, foot = sys.argv[1:9]
+config, topo, path_tag, path_class, bin_size, tp, lat, foot, repeat, *parallel_values = sys.argv[1:]
 obj = {
+    "schema_version": 2,
+    "status": "ok",
     "tool": "tailscaled",
     "mode": "userspace",
     "topology": topo,
     "path": path_tag,
     "config": config,
+    "repeat": int(repeat),
+    "parallelism_requested": [int(value) for value in parallel_values],
     "error": "",
     "log_tail": "",
     "throughput": json.loads(tp),

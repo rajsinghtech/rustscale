@@ -15,6 +15,15 @@ use std::path::PathBuf;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    // Keep this ahead of all subcommand/log/runtime setup: version queries are
+    // a side-effect-free identity probe for packaged and benchmarked daemons.
+    if args
+        .get(1)
+        .is_some_and(|arg| matches!(arg.as_str(), "--version" | "-V"))
+    {
+        println!("{}", version_string());
+        return;
+    }
     if args.len() < 2 {
         usage(&args[0]);
         std::process::exit(1);
@@ -165,6 +174,10 @@ fn main() {
     }
 }
 
+fn version_string() -> &'static str {
+    concat!("rustscaled ", env!("CARGO_PKG_VERSION"))
+}
+
 fn usage(bin: &str) {
     log::info!(
         "usage: {bin} run [--statedir <dir>] [--state <dir>] [--socket <path>] \
@@ -174,4 +187,18 @@ fn usage(bin: &str) {
     );
     log::info!("       {bin} install-system-daemon");
     log::info!("       {bin} uninstall-system-daemon");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::version_string;
+
+    #[test]
+    fn version_is_a_stable_daemon_identity() {
+        assert_eq!(
+            version_string(),
+            concat!("rustscaled ", env!("CARGO_PKG_VERSION"))
+        );
+        assert!(!version_string().trim().is_empty());
+    }
 }

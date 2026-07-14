@@ -19,7 +19,8 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(
     name = "rustscale-bench",
-    about = "Throughput and latency benchmark for rustscale tsnet"
+    about = "Throughput and latency benchmark for rustscale tsnet",
+    version
 )]
 struct Cli {
     #[command(subcommand)]
@@ -101,16 +102,18 @@ enum Command {
 }
 
 fn main() {
+    // Clap handles --version/-V before the benchmark runtime or any workload
+    // state is started.
+    let cli = Cli::parse();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .event_interval(1)
         .build()
         .unwrap();
-    runtime.block_on(async_main());
+    runtime.block_on(async_main(cli));
 }
 
-async fn async_main() {
-    let cli = Cli::parse();
+async fn async_main(cli: Cli) {
     let json = cli.json;
     let result = match cli.command {
         Command::Server {
@@ -305,5 +308,18 @@ fn format_bytes(bytes: u64) -> String {
         format!("{:.2} KiB", bytes as f64 / 1024.0)
     } else {
         format!("{bytes} B")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Cli;
+    use clap::CommandFactory;
+
+    #[test]
+    fn clap_metadata_exposes_package_version() {
+        let command = Cli::command();
+        assert_eq!(command.get_name(), "rustscale-bench");
+        assert_eq!(command.get_version(), Some(env!("CARGO_PKG_VERSION")));
     }
 }

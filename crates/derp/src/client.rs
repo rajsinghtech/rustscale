@@ -1,58 +1,16 @@
 //! Async DERP client over tokio + rustls.
 
 use std::sync::Arc;
-use std::time::Instant;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use url::Url;
 
 use rustscale_key::{NodePrivate, NodePublic};
+use rustscale_limiter::Bucket;
 
 use crate::frame::{self, decode_frame_header, encode_frame_header, frame_type, MAX_PACKET_SIZE};
 use crate::protocol::{parse_received, ClientInfo, Received, ServerInfo};
 use crate::DerpError;
-
-/// Token-bucket rate limiter for the DERP send path.
-///
-/// Mirrors Go's `golang.org/x/time/rate.Limiter` usage in `derp_client.go`:
-/// the server advertises `TokenBucketBytesPerSecond` and `TokenBucketBytesBurst`
-/// in `ServerInfo`; the client creates a limiter and checks each outbound frame
-/// (header + key + payload bytes) via [`TokenBucket::allow_n`]. If the bucket
-/// cannot supply the requested tokens, the packet is silently dropped —
-/// matching Go's `c.send` which returns `nil` on `!c.rate.AllowN(...)`.
-struct TokenBucket {
-    rate: u32,
-    burst: u32,
-    tokens: f64,
-    last: Instant,
-}
-
-impl TokenBucket {
-    fn new(rate: u32, burst: u32) -> Self {
-        Self {
-            rate,
-            burst,
-            tokens: f64::from(burst),
-            last: Instant::now(),
-        }
-    }
-
-    /// Non-blocking attempt to consume `n` tokens. Returns `true` if the
-    /// tokens were available (and consumed), `false` if the bucket is short
-    /// (tokens are NOT consumed in that case, matching Go's `AllowN`).
-    fn allow_n(&mut self, n: u32) -> bool {
-        let now = Instant::now();
-        let elapsed = now.duration_since(self.last).as_secs_f64();
-        self.tokens = (self.tokens + elapsed * f64::from(self.rate)).min(f64::from(self.burst));
-        self.last = now;
-        if self.tokens >= f64::from(n) {
-            self.tokens -= f64::from(n);
-            true
-        } else {
-            false
-        }
-    }
-}
 
 /// Trait alias for a combined async read+write stream.
 pub trait DerpStream: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -183,7 +141,7 @@ pub struct DerpClient {
     public_key: NodePublic,
     /// Optional token-bucket send rate limiter, configured from the server's
     /// `ServerInfo.TokenBucketBytesPerSecond` / `TokenBucketBytesBurst`.
-    rate_limiter: Option<TokenBucket>,
+    rate_limiter: Option<Bucket>,
 }
 
 impl std::fmt::Debug for DerpClient {
@@ -528,7 +486,7 @@ impl DerpClient {
     /// and burst.
     fn configure_rate_limiter(&mut self, info: &ServerInfo) {
         if info.token_bucket_bytes_per_second > 0 {
-            self.rate_limiter = Some(TokenBucket::new(
+            self.rate_limiter = Some(Bucket::new(
                 info.token_bucket_bytes_per_second,
                 info.token_bucket_bytes_burst,
             ));
@@ -629,7 +587,7 @@ mod tests {
     use super::*;
     use crate::protocol::ServerInfo;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use rustscale_key::NodePrivate;
     use tokio::io::duplex;
@@ -1064,7 +1022,7 @@ mod tests {
     /// Token bucket allows burst-sized sends then drops until tokens refill.
     #[tokio::test]
     async fn token_bucket_burst_then_drop() {
-        let mut bucket = TokenBucket::new(100, 100);
+        let mut bucket = Bucket::new(100, 100);
 
         // Burst of 100 should be consumed immediately.
         assert!(bucket.allow_n(100), "first 100 tokens from burst");
@@ -1087,7 +1045,7 @@ mod tests {
     #[tokio::test]
     async fn token_bucket_sustained_rate() {
         let rate = 10_000u32;
-        let mut bucket = TokenBucket::new(rate, 200);
+        let mut bucket = Bucket::new(rate, 200);
 
         // Drain the burst.
         assert!(bucket.allow_n(200));

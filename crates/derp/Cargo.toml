@@ -29,6 +29,7 @@ rustscale-bakedroots = { path = "../bakedroots", version = "0.1.1" }
 rustscale-tsdial = { path = "../tsdial", version = "0.1.1" }
 rustscale-envknob = { path = "../envknob", version = "0.1.1" }
 rustscale-ktimeout = { path = "../ktimeout", version = "0.1.1" }
+rustscale-limiter.workspace = true
 url = "2"
 
 [dev-dependencies]

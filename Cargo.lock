@@ -2605,6 +2605,7 @@ dependencies = [
  "rustscale-envknob",
  "rustscale-key",
  "rustscale-ktimeout",
+ "rustscale-limiter",
  "rustscale-netns",
  "rustscale-tailcfg",
  "rustscale-tsdial",
@@ -2653,6 +2654,7 @@ name = "rustscale-dnscache"
 version = "0.1.1"
 dependencies = [
  "rustscale-netns",
+ "rustscale-singleflight",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
@@ -2784,6 +2786,10 @@ version = "0.1.1"
 dependencies = [
  "libc",
 ]
+
+[[package]]
+name = "rustscale-limiter"
+version = "0.1.1"
 
 [[package]]
 name = "rustscale-localclient"
@@ -3040,6 +3046,14 @@ dependencies = [
  "rand 0.8.7",
  "tempfile",
  "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
+name = "rustscale-singleflight"
+version = "0.1.1"
+dependencies = [
+ "futures-util",
  "tokio",
 ]
 

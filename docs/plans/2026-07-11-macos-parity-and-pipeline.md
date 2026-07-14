@@ -1,15 +1,15 @@
 # macOS Parity + Build Pipeline Implementation Plan
 
 > **For agentic workers:** Execution model is repo-specific: Claude Code orchestrates; every
-> task is executed by an opencode agent via `tools/agent/opencode-task.sh --worktree` (see
-> CLAUDE.md). Model tiering: `vercel-ent/zai/glm-5.2` for complex phases, `deepseek/deepseek-v4-flash`
-> for small/mechanical phases. Steps use checkbox (`- [ ]`) syntax for tracking.
+> task is executed by a Codex agent via `tools/agent/codex-task.sh` (see CLAUDE.md).
+> OpenCode is reserved for DeepSeek research, review, docs, and toolsmith passes. Steps use
+> checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Close the macOS-specific parity gaps (P1/P2 from the 2026-07-11 gap inventory) and add
 a Tailscale-style release/build pipeline.
 
-**Architecture:** Each phase is one opencode agent run in an isolated worktree
-(`tools/agent/opencode-task.sh --worktree "phase-NN-title" "<prompt>"`), verified with
+**Architecture:** Each phase is one Codex agent run in an isolated worktree
+(`tools/agent/codex-task.sh "phase-NN-title" "<prompt>"`), verified with
 `cargo build && cargo test && cargo clippy` + diff review, then merged via
 `tools/agent/worktree-merge.sh`. Go sources under `/Users/rajsingh/Documents/GitHub/tailscale`
 are the porting references.
@@ -18,7 +18,7 @@ are the porting references.
 
 ## Global Constraints
 
-- All implementation code written by opencode agents, never directly by the orchestrator.
+- All implementation code written by Codex agents, never directly by the orchestrator.
 - tsnet/ffi public API stays C-representable.
 - Acceptance per phase: `cargo build --workspace`, `cargo test --workspace`,
   `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all --check`.

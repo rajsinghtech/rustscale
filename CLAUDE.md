@@ -20,17 +20,15 @@ prompt that the Codex agent can execute without repeating broad source explorati
 
 ### How to call Codex for implementation
 
-Create an isolated worktree, then run Codex non-interactively with the model selected
-explicitly:
+Use the fail-closed wrapper from a clean `master` checkout:
 
 ```bash
-git worktree add .worktrees/<title> -b agent/<title> master
-codex -a never exec -m gpt-5.6-terra -s workspace-write \
-  -C "$PWD/.worktrees/<title>" "<detailed implementation prompt>"
+tools/agent/codex-task.sh "<title>" "<detailed implementation prompt>" [deadline_secs=2400]
 ```
 
-Tell the agent not to commit and not to spawn other agents. After review and validation,
-merge with `tools/agent/worktree-merge.sh "<title>"`.
+It creates `agent/<title>` under `.worktrees/`, selects `gpt-5.6-terra`, and injects
+the no-commit/no-subagent guardrail. On failure it preserves the worktree for review.
+After review and validation, merge with `tools/agent/worktree-merge.sh "<title>"`.
 
 ### How to call OpenCode for research
 
@@ -53,12 +51,13 @@ tools/agent/opencode-task.sh --continue <sessionID> "fix ..." [deadline_secs]
   `OPENCODE_MODEL` or `--model`.
 - Under the hood: `POST /session?directory=...` (with `permission:[{permission:"*",pattern:"*",action:"allow"}]`),
   `POST /session/:id/prompt_async` (204, non-blocking), poll `/session/status` +
-  `/session/:id/message`, `POST /session/:id/abort` on deadline.
+  `/session/:id/message`, `POST /session/:id/abort` on deadline. The wrapper is research-only:
+  it never creates worktrees and rejects every model except `deepseek/deepseek-v4-flash` by default.
 
 Session management (inspection/debugging):
 ```bash
 opencode session list            # find previous sessions
-opencode run -s <id> "fix ..."   # continue a session with its context
+tools/agent/opencode-task.sh --continue <id> "follow-up research ..."
 opencode export <id>             # dump full session JSON
 ```
 
@@ -86,13 +85,11 @@ opencode export <id>             # dump full session JSON
 
 ### Recurring toolsmith pass (token efficiency)
 
-Regularly (after every 1–2 phases) launch a separate opencode agent whose ONLY job is to
-review past session logs and improve tooling to save tokens:
+Regularly (after every 1–2 phases) launch a separate OpenCode research agent whose ONLY job is
+to review past session logs and improve tooling to save tokens:
 
 ```bash
-opencode run -m deepseek/deepseek-v4-flash --auto \
-  --dir /Users/rajsingh/Documents/GitHub/rustscale \
-  --title "toolsmith-$(date +%Y%m%d)" \
+tools/agent/opencode-task.sh "toolsmith-$(date +%Y%m%d)" \
   "Read docs/toolsmith.md and follow it."
 ```
 

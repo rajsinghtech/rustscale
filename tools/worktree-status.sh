@@ -1,92 +1,116 @@
 #!/usr/bin/env bash
-# tools/worktree-status.sh — one-shot overview of ALL git worktrees.
-# Shows branch, dirty status, ahead/behind master, and whether each
-# branch is already merged into master.
-#
-# Also checks the main repo for an in-progress merge (conflicts).
-#
-# Usage:
-#   tools/worktree-status.sh              # human-readable table
-#   tools/worktree-status.sh --json       # machine-readable JSON
-#   tools/worktree-status.sh --porcelain  # tab-separated, one per line
+# tools/worktree-status.sh — fail-closed overview of registered worktrees.
+# Usage: tools/worktree-status.sh [--json|--porcelain]
 set -euo pipefail
 
-REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
+START_DIR="$(git -C "$SCRIPT_DIR/.." rev-parse --show-toplevel)"
 MODE="${1:-table}"
 
-main_tree_status() {
-  local mstate="" conflicts=""
-  if [ -f "$REPO_DIR/.git/MERGE_MSG" ]; then
-    mstate="MERGE_IN_PROGRESS"
-    local branch
-    branch="$(git -C "$REPO_DIR" branch --show-current 2>/dev/null || echo "detached")"
-    conflicts="$(git -C "$REPO_DIR" diff --name-only --diff-filter=U 2>/dev/null | tr '\n' ' ')"
-    mstate="MERGE_INTO_${branch}_CONFLICTS:${conflicts}"
+case "$MODE" in table|--json|--porcelain) ;; *) echo "usage: worktree-status.sh [--json|--porcelain]" >&2; exit 2 ;; esac
+
+die() { echo "[worktree-status] $*" >&2; exit 1; }
+json_escape() { sed 's/\\/\\\\/g; s/"/\\"/g; s/	/\\t/g'; }
+
+MAIN_DIR="$(git -C "$START_DIR" worktree list --porcelain | sed -n 's/^worktree //p' | sed -n '1p')"
+[[ -n "$MAIN_DIR" ]] || die "could not determine main worktree"
+MAIN_DIR="$(cd "$MAIN_DIR" && pwd -P)"
+git -C "$MAIN_DIR" rev-parse --verify --quiet master >/dev/null || die "master does not exist"
+
+TMP="$(mktemp "${TMPDIR:-/tmp}/worktree-status.XXXXXX")"
+trap 'rm -f "$TMP"' EXIT
+REGISTERED=()
+while IFS= read -r path; do
+  [[ -n "$path" ]] || continue
+  path="$(cd "$path" && pwd -P)"
+  REGISTERED+=("$path")
+done < <(git -C "$MAIN_DIR" worktree list --porcelain | sed -n 's/^worktree //p')
+
+write_registered() {
+  local path="$1" branch dirty ahead behind class last
+  branch="$(git -C "$path" branch --show-current)"
+  dirty="$(git -C "$path" status --porcelain | wc -l | tr -d ' ')"
+  ahead="$(git -C "$path" rev-list --count master..HEAD)"
+  behind="$(git -C "$path" rev-list --count HEAD..master)"
+  last="$(git -C "$path" log -1 --oneline HEAD)"
+
+  if [[ "$path" == "$MAIN_DIR" ]]; then
+    class="MAIN"
+  elif [[ "$dirty" != 0 ]]; then
+    class="DIRTY_UNCOMMITTED"
+  elif [[ "$(git -C "$path" rev-parse HEAD)" == "$(git -C "$MAIN_DIR" rev-parse master)" ]]; then
+    class="EMPTY_STALE"
+  elif git -C "$path" merge-base --is-ancestor HEAD master; then
+    class="MERGED_CLEAN"
+  elif [[ "$ahead" != 0 ]]; then
+    class="AHEAD_UNMERGED"
+  else
+    class="EMPTY_STALE"
   fi
-  echo "$mstate"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$class" "$path" "$branch" "$dirty" "$ahead" "$behind" "$last" >>"$TMP"
 }
 
-worktree_info() {
-  local wt_dir="$1"
-  local branch dirty ahead_behind merged
+for path in "${REGISTERED[@]}"; do
+  write_registered "$path"
+done
 
-  branch="$(git -C "$wt_dir" branch --show-current 2>/dev/null || echo "(detached)")"
-  dirty="$(git -C "$wt_dir" status --short 2>/dev/null | wc -l | tr -d ' ')"
-
-  # ahead/behind master
-  local ahead=0 behind=0
-  ahead="$(git -C "$wt_dir" rev-list --count master..HEAD 2>/dev/null || echo 0)"
-  behind="$(git -C "$wt_dir" rev-list --count HEAD..master 2>/dev/null || echo 0)"
-  ahead_behind="${ahead}|${behind}"
-
-  # merged if HEAD is an ancestor of master
-  local merged="no"
-  if git -C "$wt_dir" merge-base --is-ancestor HEAD master 2>/dev/null; then
-    merged="yes"
-  fi
-
-  # last commit
-  local last_commit last_subject
-  last_commit="$(git -C "$wt_dir" log --oneline -1 HEAD 2>/dev/null || echo "?")"
-
-  printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$(basename "$wt_dir")" "$branch" "$dirty" "$ahead_behind" "$merged" "$last_commit"
+is_registered() {
+  local candidate="$1" path
+  for path in "${REGISTERED[@]}"; do
+    [[ "$path" == "$candidate" ]] && return 0
+  done
+  return 1
 }
+
+if [[ -d "$MAIN_DIR/.worktrees" ]]; then
+  for path in "$MAIN_DIR/.worktrees"/*; do
+    [[ -d "$path" ]] || continue
+    path="$(cd "$path" && pwd -P)"
+    if ! is_registered "$path"; then
+      printf 'ORPHAN\t%s\t-\t-\t-\t-\tunregistered directory\n' "$path" >>"$TMP"
+    fi
+  done
+fi
+
+attention=0
+while IFS=$'\t' read -r class path _; do
+  case "$class" in
+    MAIN|MERGED_CLEAN) ;;
+    DIRTY_UNCOMMITTED|AHEAD_UNMERGED|EMPTY_STALE|ORPHAN) attention=1 ;;
+    *) die "unknown worktree status: $class" ;;
+  esac
+done <"$TMP"
 
 case "$MODE" in
-  --json)
-    merge_state="$(main_tree_status)"
-    printf '{"main_tree":"%s","worktrees":[' "$merge_state"
-    first=1
-    while IFS=$'\t' read -r name branch dirty ahead_behind merged last; do
-      [ "$first" = 0 ] && echo ","
-      first=0
-      ahead="${ahead_behind%%|*}"
-      behind="${ahead_behind##*|}"
-      m=$([ "$merged" = "yes" ] && echo true || echo false)
-      printf '{"name":"%s","branch":"%s","dirty":%s,"ahead":%s,"behind":%s,"merged":%s,"last":"%s"}' \
-        "$name" "$branch" "$dirty" "$ahead" "$behind" "$m" "$(printf '%s' "$last" | sed 's/"/\\"/g')"
-    done < <(worktree_info "$REPO_DIR"; git -C "$REPO_DIR" worktree list --porcelain 2>/dev/null | grep '^worktree ' | while read -r _ w; do [ "$w" != "$REPO_DIR" ] && worktree_info "$w"; done)
-    echo "]}" ;;
   --porcelain)
-    worktree_info "$REPO_DIR"
-    git -C "$REPO_DIR" worktree list --porcelain 2>/dev/null | grep '^worktree ' | while read -r _ w; do
-      [ "$w" != "$REPO_DIR" ] && worktree_info "$w"
-    done
+    cat "$TMP"
     ;;
-  *)
-    merge_state="$(main_tree_status)"
-    echo "Main tree: $([ -z "$merge_state" ] && echo 'clean' || echo "$merge_state")"
-    printf '%-24s %-28s %s %-8s %-4s %s\n' "WORKTREE" "BRANCH" "DIRTY" "A/B" "MERGED" "LAST COMMIT"
-    printf '%-24s %-28s %s %-8s %-4s %s\n' "-------" "------" "----" "---" "------" "-----------"
-    worktree_info "$REPO_DIR"
-    git -C "$REPO_DIR" worktree list --porcelain 2>/dev/null | grep '^worktree ' | while read -r _ w; do
-      [ "$w" != "$REPO_DIR" ] && worktree_info "$w"
-    done | while IFS=$'\t' read -r name branch dirty ahead_behind merged last; do
-      ahead="${ahead_behind%%|*}"
-      behind="${ahead_behind##*|}"
-      printf '%-24s %-28s %-4s %2s/%-3s %-6s %s\n' \
-        "$name" "$branch" "$dirty" "$ahead" "$behind" "$merged" "$last"
-    done
+  --json)
+    printf '{"worktrees":['
+    first=1
+    while IFS=$'\t' read -r class path branch dirty ahead behind last; do
+      [[ "$first" == 1 ]] || printf ','
+      first=0
+      if [[ "$class" == ORPHAN ]]; then
+        printf '{"status":"%s","path":"%s","branch":null,"dirty":null,"ahead":null,"behind":null,"last":"%s"}' \
+          "$(printf '%s' "$class" | json_escape)" "$(printf '%s' "$path" | json_escape)" \
+          "$(printf '%s' "$last" | json_escape)"
+      else
+        printf '{"status":"%s","path":"%s","branch":"%s","dirty":%s,"ahead":%s,"behind":%s,"last":"%s"}' \
+          "$(printf '%s' "$class" | json_escape)" "$(printf '%s' "$path" | json_escape)" \
+          "$(printf '%s' "$branch" | json_escape)" "$dirty" "$ahead" "$behind" \
+          "$(printf '%s' "$last" | json_escape)"
+      fi
+    done <"$TMP"
+    echo ']}'
+    ;;
+  table)
+    printf '%-20s %-38s %-24s %5s %5s %5s %s\n' STATUS WORKTREE BRANCH DIRTY AHEAD BEHIND 'LAST COMMIT'
+    printf '%-20s %-38s %-24s %5s %5s %5s %s\n' ------ -------- ------ ----- ----- ------ -------------
+    while IFS=$'\t' read -r class path branch dirty ahead behind last; do
+      printf '%-20s %-38s %-24s %5s %5s %5s %s\n' "$class" "$(basename "$path")" "$branch" "$dirty" "$ahead" "$behind" "$last"
+    done <"$TMP"
     ;;
 esac
+
+exit "$attention"

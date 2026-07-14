@@ -29,48 +29,22 @@ agents cheaper and faster.
   orchestrator to fold into future phase prompts.
 - `.opencode/command/*.md` — custom opencode commands if a workflow repeats verbatim.
 
-## Worktree isolation workflow
+## Agent boundaries
 
-Agents build in isolated git worktrees so the orchestrator can review before merging.
-All rustscale work is Go→Rust porting with disjoint crates, so conflicts are rare.
+OpenCode is research-only. Use `tools/agent/opencode-task.sh` for research, review,
+documentation, and toolsmith passes; it does not create worktrees and permits only the
+DeepSeek research model. Product implementation belongs in the Codex wrapper:
 
 ```bash
-# Launch an agent in an isolated worktree:
-tools/agent/opencode-task.sh --worktree "phase-9-magicdns" "<prompt>" 2400
-# On success prints: worktree: .worktrees/phase-9-magicdns  branch: agent/phase-9-magicdns
-
-# Review, run checks, and merge:
-cd .worktrees/phase-9-magicdns && tools/check.sh   # verify
-git diff master                                      # review changes
-
-# When green:
+tools/agent/codex-task.sh "phase-9-magicdns" "<implementation prompt>" 2400
 tools/agent/worktree-merge.sh "phase-9-magicdns"
-# Cleans up worktree and branch.
 ```
 
-The companion script `worktree-merge.sh <title>` runs `cargo build/test/clippy`
-(or `tools/check.sh` if present) in the worktree. On green it merges `agent/<title>`
-into master (--no-ff) and removes the worktree + branch. On red it prints the failures
-and leaves the worktree in place for investigation.
+## Model routing
 
-## Model tiering
-
-Two tiers to save cost on lightweight tasks:
-
-| Model | Used for | Cost |
-|---|---|---|
-| `deepseek/deepseek-v4-flash` | Research, review, docs, toolsmith passes (cheap) | Low |
-| `vercel-ent/zai/glm-5.2` | Complex coding (default) | Standard |
-
-Set via `OPENCODE_MODEL` env var, or per-invocation with `--model`:
-
-```bash
-# Cheap research pass:
-tools/agent/opencode-task.sh --model deepseek/deepseek-v4-flash "phase-9-research" "<prompt>"
-
-# Complex coding (default, explicit):
-tools/agent/opencode-task.sh "phase-10-whois" "<prompt>"
-```
+OpenCode always uses `deepseek/deepseek-v4-flash` for research, review, docs, and
+toolsmith work. Codex implementation runs always use `gpt-5.6-terra` through
+`tools/agent/codex-task.sh`.
 
 ## Rules
 
@@ -82,7 +56,7 @@ tools/agent/opencode-task.sh "phase-10-whois" "<prompt>"
 ## Always start with `tools/worktree-status.sh`
 
 Before doing anything else, run `tools/worktree-status.sh` to see the current state
-of worktrees. If there are unmerged worktrees (merged=no), report them before
+of worktrees. If it reports any non-`MAIN` status, report it before
 proceeding with tooling improvements. Accumulated zombie worktrees are themselves
 a token-waste problem (they confuse future orchestrators).
 

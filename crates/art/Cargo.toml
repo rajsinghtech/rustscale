@@ -1,0 +1,14 @@
+[package]
+name = "rustscale-art"
+description = "Allotment Routing Table for fast IPv4 and IPv6 longest-prefix matching"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+rand.workspace = true

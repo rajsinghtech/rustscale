@@ -299,9 +299,9 @@ caused Cargo.toml + Cargo.lock merge conflicts.
 **Fix**: `tools/agent/worktree-merge.sh` now auto-resolves Cargo.lock
 conflicts by accepting `--theirs` for Cargo.lock, union-merging Cargo.toml
 (keeping both sides' deps), regenerating with `cargo generate-lockfile`,
-and re-running checks before finalizing the merge. It also runs
-`cargo fmt --all --check` post-merge with a hint if formatting drift is
-found. Orchestrators can merge without manual conflict resolution.
+and re-running checks before finalizing the merge. This historical behavior is
+superseded: `worktree-merge.sh` now aborts every conflict and requires explicit
+resolution in the preserved agent worktree.
 
 ## 2026-07-11: Empty-first-turn investigation (toolsmith-openocode-perms)
 
@@ -316,7 +316,7 @@ which matches the `external_directory` permission kind (confirmed by reading the
 opencode JSON schema at `opencode.ai/config.json` — `external_directory` is a
 first-class key in `PermissionConfig`).
 
-**Actual cause**: The model (glm-5.2) frequently outputs its reasoning in the
+**Actual cause**: The then-configured model frequently output its reasoning in the
 `reasoning` attribute and then makes tool calls, with **zero-length or
 whitespace-only text** in the `text` part. Our harness only checked `text`
 content to decide "empty turn", so it falsely re-prompted working agents. Of 58
@@ -473,10 +473,8 @@ analysis to produce a unified fix set.
 
 ### Codified this pass (cross-layer)
 - `tools/ci-fail.sh` — replaces 47× ad-hoc CI-log grep pipelines.
-- `tools/agent/opencode-task.sh` — now injects 5 guardrail rules as a
-  pre-prompt before the task text (use check.sh, no re-reads, no docs.rs,
-  use go-find.sh, use clippy-all.sh). Agents see these without the
-  orchestrator repeating them.
+- `tools/agent/opencode-task.sh` — now has a research-only pre-prompt. Product
+  implementation guardrails belong in `tools/agent/codex-task.sh`.
 - `.opencode/agents/orchestrator.md` — updated with terse-mode,
   foreground-only, and CI-helper instructions.
 - **Next**: split `tsnet/src/lib.rs` into modules (agent task). Write a
@@ -533,24 +531,23 @@ should:
 3. The harness's `##STATUS:STUCK` line makes this detectable — the orchestrator
    can grep for `STUCK` before deciding to retry.
 
-### 2026-07-12: Model tiering rule — deepseek for research, glm-5.2 for coding
+### 2026-07-12: Model routing rule — DeepSeek for research, Codex for coding
 
-Starting now, all non-implementation passes use `deepseek/deepseek-v4-flash`
-for token efficiency (free, unlimited). glm-5.2 is reserved for implementation
-code only.
+All non-implementation passes use `deepseek/deepseek-v4-flash`. Implementation
+uses Codex with `gpt-5.6-terra` through `tools/agent/codex-task.sh`.
 
-GLM-5.2 prompts MUST be self-contained — the agent should not need to
+Codex prompts MUST be self-contained — the agent should not need to
 rediscover tooling conventions, go-find patterns, or porting-notes facts
 mid-session. The deepseek research pass should pre-digest everything the
-glm agent will need into the prompt body.
+Codex agent will need into the prompt body.
 
-How deepseek passes feed glm passes:
-1. deepseek reads the Go source, reads porting-notes, reads existing crate
-   code, and writes a distilled "spec prompt" for the glm agent.
+How DeepSeek passes feed Codex passes:
+1. DeepSeek reads the Go source, reads porting-notes, reads existing crate
+   code, and writes a distilled "spec prompt" for the Codex agent.
 2. The spec prompt includes: exact file paths, type signatures, crate entry
    APIs, gotchas, and the complete acceptance criteria.
-3. The orchestrator launches the glm agent with this self-contained prompt.
-   The glm agent should not need to re-read Go files or explore the registry.
+3. The orchestrator launches the Codex agent with this self-contained prompt.
+   The Codex agent should not need to re-read Go files or explore the registry.
 
 ### 2026-07-12: Always-end-merged-or-report rule
 
@@ -572,7 +569,7 @@ resolves first.
 ### 2026-07-12: Shared CARGO_TARGET_DIR rejected — sccache is the right fix
 
 **Research**: Adding `export CARGO_TARGET_DIR=$REPO_ROOT/.cache/wt-target-shared` in
-`opencode-task.sh` was considered to share compiled artifacts across worktree agents
+`codex-task.sh` was considered to share compiled artifacts across worktree agents
 and avoid redundant recompilation.
 
 **Rejected because**: Cargo file-locks `target/` via `.cargo-lock`. Parallel cargo
@@ -601,4 +598,4 @@ git branch -d agent/<title>
 ```
 This is built into `worktree-merge.sh` but when merging directly, the
 orchestrator must remember it. The `worktree-status.sh --porcelain` output
-shows which worktrees have `merged:true` — those are candidates for cleanup.
+labels clean integrated branches as `MERGED_CLEAN` — those are candidates for cleanup.

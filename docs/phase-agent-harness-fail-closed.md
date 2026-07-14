@@ -38,7 +38,9 @@ reported rather than guessed or auto-resolved.
   `DIRTY_UNCOMMITTED`, never merged.
 - Report unregistered directories immediately under `.worktrees/` as orphans.
 - Keep human-readable, JSON, and porcelain output useful to callers. Return
-  nonzero when any non-main worktree needs attention.
+  zero when every non-main registered worktree is `MERGED_CLEAN`; return
+  nonzero for `DIRTY_UNCOMMITTED`, `AHEAD_UNMERGED`, `EMPTY_STALE`, or
+  `ORPHAN`.
 
 ### Merge helper
 
@@ -57,8 +59,9 @@ reported rather than guessed or auto-resolved.
   stubbed `codex`/`opencode` where external execution would otherwise occur.
 - Cover model rejection, exact Codex arguments, dirty-main refusal, dirty
   ancestor classification, ahead-unmerged classification, empty-stale
-  classification, orphan detection, uncommitted-work refusal, conflict
-  refusal, and preservation after a failed final gate.
+  classification, orphan detection, a genuinely merged clean worktree with a
+  zero status exit, uncommitted-work refusal, conflict refusal, and
+  preservation after a failed final gate.
 - Existing supported happy paths must remain usable.
 - `tools/check.sh` and the new focused harness tests must pass.
 

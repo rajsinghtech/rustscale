@@ -50,54 +50,65 @@ else
   PKG=(); WS=(--workspace)
 fi
 
+# Keep each command's complete output only for the lifetime of this gate. This
+# lets us show diagnostics from its one execution instead of rerunning cargo.
+TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/rustscale-check.XXXXXX")"
+trap 'rm -rf "$TMP_DIR"' EXIT
+
 # --- Failure excerpt helper ---
 # For clippy/build steps: grep for error/warning lines.
 # For the test step: grep for FAILED/panicked/failures: context (shows the
 # actual failing test name and assertion) before falling back to head -50.
 fail() {
-  local label="$1"; shift
+  local label="$1" out="$2"; shift 2
   echo "=== $label FAILED ===" >&2
-  local out hits
-  out="$("$@" 2>&1 || true)"
+  local hits
   if [[ "$label" == "test" ]]; then
-    if printf '%s\n' "$out" | grep -q -E '(FAILED|panicked|failures:)'; then
+    if grep -q -E '(FAILED|panicked|failures:)' "$out"; then
       # Test failures — show the structured failures block from "failures:" to end.
       # This captures actual test failure messages instead of preceding "test ... ok" lines.
-      printf '%s\n' "$out" | sed -n '/^failures:/,$ p' | head -120 >&2
+      sed -n '/^failures:/,$ p' "$out" | head -120 >&2
     else
       # Compilation error (no test runner output) — show the start where errors live.
-      printf '%s\n' "$out" | head -60 >&2
+      head -60 "$out" >&2
     fi
   else
-    hits="$(printf '%s\n' "$out" | grep -E '^(error|warning|Diff in )' | head -50 || true)"
+    hits="$(grep -E '^(error|warning|Diff in )' "$out" | head -50 || true)"
     if [ -n "$hits" ]; then
       printf '%s\n' "$hits" >&2
     else
-      printf '%s\n' "$out" | head -50 >&2
+      head -50 "$out" >&2
     fi
   fi
   echo "(run '$*' to see full output)" >&2
   exit 1
 }
 
+run() {
+  local label="$1"; shift
+  local out="$TMP_DIR/$label.log"
+  if "$@" >"$out" 2>&1; then
+    return 0
+  fi
+  fail "$label" "$out" "$@"
+}
+
 # --- Step 1: clippy (type-checks AND lints — no separate build step) ---
 # If --check is used, run `cargo check` instead (type-check only, faster).
 if [ "$RUN_CLIPPY" = 1 ] && [ "$RUN_CHECK" = 0 ]; then
-  cargo clippy "${PKG[@]}" "${WS[@]}" --all-targets -- -D warnings >/dev/null 2>&1 \
-    || fail "clippy" cargo clippy "${PKG[@]}" "${WS[@]}" --all-targets -- -D warnings
+  run "clippy" cargo clippy "${PKG[@]}" "${WS[@]}" --all-targets -- -D warnings
 elif [ "$RUN_CHECK" = 1 ]; then
-  cargo check "${PKG[@]}" "${WS[@]}" --all-targets >/dev/null 2>&1 \
-    || fail "check" cargo check "${PKG[@]}" "${WS[@]}" --all-targets
+  run "check" cargo check "${PKG[@]}" "${WS[@]}" --all-targets
 fi
 
 # --- Step 2: tests (builds test binaries) ---
 if [ "$RUN_TEST" = 1 ]; then
-  cargo test "${PKG[@]}" "${WS[@]}" >/dev/null 2>&1 || fail "test" cargo test "${PKG[@]}" "${WS[@]}"
+  run "test" cargo test "${PKG[@]}" "${WS[@]}"
 fi
 
 # --- Step 3: formatting ---
 if [ "$RUN_FMT" = 1 ]; then
-  cargo fmt --all --check >/dev/null 2>&1 || fail "fmt" cargo fmt --all --check
+  run "fmt" cargo fmt --all --check
 fi
 
 echo "ok"

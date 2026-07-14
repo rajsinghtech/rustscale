@@ -6,9 +6,9 @@ A Rust implementation of Tailscale's client stack — the equivalent of Go's `ts
 supporting direct (UDP hole-punched) connections, DERP relay, and peer relay, with the long-term
 goal of a full TUN-mode client.
 
-## Development model: ALL implementation work goes through coding agents
+## Development model: orchestrated implementation work
 
-The primary assistant acts as the **orchestrator only**. All implementation code in this
+The primary role is the **orchestrator**. All implementation code in this
 repo is written by Codex agents using `gpt-5.6-terra`. OpenCode agents using
 `deepseek/deepseek-v4-flash` are reserved for research, review, docs, and toolsmith passes.
 Do not use GLM for implementation. Do not write implementation code directly except for
@@ -24,32 +24,35 @@ Use the fail-closed wrapper from a clean `master` checkout:
 
 ```bash
 tools/agent/codex-task.sh "<title>" "<detailed implementation prompt>" [deadline_secs=2400]
+tools/agent/codex-task.sh --continue "<title>" "<follow-up prompt>" [deadline_secs=2400]
 ```
 
-It creates `agent/<title>` under `.worktrees/`, selects `gpt-5.6-terra`, and injects
-the no-commit/no-subagent guardrail. On failure it preserves the worktree for review.
-After review and validation, merge with `tools/agent/worktree-merge.sh "<title>"`.
+It creates `agent/<title>` under `.worktrees/`, selects `gpt-5.6-terra`, injects the
+no-commit/no-subagent guardrail, and stores session metadata/logs under `.agent-runs/`.
+`--continue` resumes that exact saved session and worktree. On failure it preserves the
+worktree for `tools/agent/agent-review.sh "<title>"`. Coding agents never commit; only
+the local user may explicitly decide to commit or merge after review.
 
 ### How to call OpenCode for research
 
 **Use the server harness — NOT `opencode run`.** `opencode run` is synchronous with no
 timeout; when the model stalls it blocks forever and leaves zombie processes. The harness
 at `tools/agent/opencode-task.sh` drives the persistent server HTTP API instead:
-async prompt admission, allow-all permission ruleset (unattended), hard watchdog
-deadline with abort, result harvesting.
+async prompt admission, bash/write/edit/patch-denying permission rules where supported, hard
+watchdog deadline with abort, result harvesting, and a fail-closed dirty-tree check.
 
 ```bash
 tools/agent/opencode-task.sh "phase-N-title" "<detailed task prompt>" [deadline_secs=2400]
-tools/agent/opencode-task.sh --continue <sessionID> "fix ..." [deadline_secs]
 ```
 
 - Run it with Bash `run_in_background: true`; the final assistant message lands on stdout.
-- Exit 3 = watchdog aborted at the deadline (prints the sessionID — inspect partial work
-  on disk, then `--continue` that session).
+- Exit 3 = watchdog aborted at the deadline after the session is confirmed idle. Inspect
+  the partial result, then start a new read-only research session with a distilled prompt.
+- Exit 4 = STUCK (no usable assistant result after warmup).
 - The server is auto-started on 127.0.0.1:4096 if not running (`/tmp/opencode-serve.log`).
 - Always select `deepseek/deepseek-v4-flash` for these research-only runs via
   `OPENCODE_MODEL` or `--model`.
-- Under the hood: `POST /session?directory=...` (with `permission:[{permission:"*",pattern:"*",action:"allow"}]`),
+- Under the hood: `POST /session?directory=...` (with explicit bash/write/edit/patch deny rules),
   `POST /session/:id/prompt_async` (204, non-blocking), poll `/session/status` +
   `/session/:id/message`, `POST /session/:id/abort` on deadline. The wrapper is research-only:
   it never creates worktrees and rejects every model except `deepseek/deepseek-v4-flash` by default.
@@ -57,7 +60,6 @@ tools/agent/opencode-task.sh --continue <sessionID> "fix ..." [deadline_secs]
 Session management (inspection/debugging):
 ```bash
 opencode session list            # find previous sessions
-tools/agent/opencode-task.sh --continue <id> "follow-up research ..."
 opencode export <id>             # dump full session JSON
 ```
 
@@ -67,12 +69,13 @@ opencode export <id>             # dump full session JSON
 2. Use OpenCode/DeepSeek to research and distill the phase when needed, then launch a
    Codex `gpt-5.6-terra` agent with a **self-contained prompt**: goal, file layout, references to the Go
    sources under `/Users/rajsingh/Documents/GitHub/tailscale` (agent can read them —
-   mention exact paths), acceptance criteria (`cargo build`, `cargo test`, `cargo clippy`).
+   mention exact paths), and the task-specific quiet acceptance gate.
 3. Run long builds with Bash `run_in_background: true` and poll the output file.
-4. After each phase: verify with `tools/check.sh` (not raw cargo), review the diff, then
+4. After each phase: verify with `tools/check.sh` (or `tools/bench/check.sh` for benchmark-only
+   changes), review the diff, then
    run `tools/agent/worktree-merge.sh "<title>"` to merge and clean up. Never leave a
    worktree unmerged — every session ends merged-or-reported.
-5. Commit as the local user only (no Claude branding — see global CLAUDE.md rules).
+5. Coding agents do not commit. The local user decides whether to commit reviewed work.
 6. Before starting a new phase, run `tools/worktree-status.sh` to verify no lingering
    worktrees exist. If the unmerged count > 0, resolve first.
 
@@ -80,7 +83,7 @@ opencode export <id>             # dump full session JSON
 
 - Give exact file paths in the Go repo to port from; it will read them.
 - One phase per run; keep phases to a few thousand lines of output max.
-- Always state acceptance criteria explicitly and tell it to run `cargo build`/`cargo test` itself.
+- Always state the task-specific quiet acceptance gate explicitly.
 - If a run stalls or produces broken code, continue the session with the compiler errors pasted in.
 
 ### Recurring toolsmith pass (token efficiency)
@@ -172,7 +175,7 @@ Cargo workspace, crates mirroring the Go layout:
 ## Build/verify
 
 ```bash
-cargo build --workspace
-cargo test --workspace
-cargo clippy --workspace --all-targets
+tools/check.sh
+# benchmark-harness-only changes:
+tools/bench/check.sh
 ```

@@ -5,3 +5,5 @@ tools/bench/bin/
 tools/testcontrol/bin/
 .DS_Store
 .worktrees/
+.agent-runs/
+__pycache__/

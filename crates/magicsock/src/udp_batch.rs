@@ -8,8 +8,11 @@ use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::fd::AsRawFd;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
+use std::sync::Arc;
 
 use tokio::net::UdpSocket;
+use tokio::sync::Semaphore;
 
 /// Matches the TUN batch cap. Keeping these arrays on the stack avoids a
 /// header allocation for each WireGuard microburst.
@@ -35,7 +38,150 @@ const SENDMMSG_FLAGS: libc::c_int = libc::MSG_DONTWAIT as libc::c_int;
 const SENDMMSG_FLAGS: libc::c_uint = libc::MSG_DONTWAIT as libc::c_uint;
 
 type Packet = [u8; LOGICAL_PACKET_CAPACITY];
+/// Total fixed receive storage. 128 boxes are always installed in recvmmsg
+/// scratch, leaving exactly 384 independently reserved detachable buffers.
+/// This is exactly 1 MiB of payload storage.
+pub(crate) const RECEIVE_BUFFER_POOL_CAPACITY: usize = 512;
+const RECEIVE_BUFFER_POOL_FREE_CAPACITY: usize = RECEIVE_BUFFER_POOL_CAPACITY;
+const RECEIVE_BUFFER_POOL_DETACHABLE_CAPACITY: usize = RECEIVE_BUFFER_POOL_CAPACITY - MAX_BATCH;
 const GRO_SNAPSHOT_INTERVAL: u64 = 256;
+
+/// A fixed receive buffer detached from a `ReceiveBatch`.
+///
+/// The synchronous recycler is deliberately bounded and `try_send` is used
+/// from Drop: returning a ciphertext never waits for the receive task or a
+/// mutex. A full recycler is an invariant violation, never a recoverable
+/// packet/buffer loss path.
+pub(crate) struct PooledPacket {
+    packet: Option<Box<Packet>>,
+    len: usize,
+    recycler: Arc<RecyclerState>,
+}
+
+impl PooledPacket {
+    fn new(packet: Box<Packet>, len: usize, recycler: Arc<RecyclerState>) -> Self {
+        Self {
+            packet: Some(packet),
+            len,
+            recycler,
+        }
+    }
+
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        &self.packet.as_ref().expect("pooled packet exists")[..self.len]
+    }
+}
+
+impl Drop for PooledPacket {
+    fn drop(&mut self) {
+        let Some(packet) = self.packet.take() else {
+            return;
+        };
+        match self.recycler.sender.try_send(packet) {
+            Ok(()) => {
+                self.recycler.recycled.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                // The receive task has shut down; releasing this box is the
+                // correct lifecycle outcome.
+            }
+            Err(TrySendError::Full(_)) => {
+                self.recycler
+                    .recycle_overflow
+                    .fetch_add(1, Ordering::Relaxed);
+                panic!("bounded receive recycler overflowed");
+            }
+        }
+    }
+}
+
+/// Shared drop-side state for every detached packet. A pooled ciphertext
+/// clones this one Arc, rather than a sender plus several counter Arcs.
+struct RecyclerState {
+    sender: SyncSender<Box<Packet>>,
+    recycled: AtomicU64,
+    recycle_overflow: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(test)]
+pub(crate) struct ReceiveBufferPoolSnapshot {
+    pub(crate) capacity: usize,
+    pub(crate) free: usize,
+    pub(crate) inventory: usize,
+    pub(crate) detached: u64,
+    pub(crate) recycled: u64,
+    pub(crate) unavailable: u64,
+    pub(crate) recycle_overflow: u64,
+}
+
+struct ReceiveBufferPool {
+    recycler: Arc<RecyclerState>,
+    available: Receiver<Box<Packet>>,
+    /// Counts only buffers that may be detached. The 128 scratch boxes are
+    /// permanently installed in `ReceiveBatch` and are not inventory permits.
+    inventory: Arc<Semaphore>,
+    detached: AtomicU64,
+    unavailable: AtomicU64,
+}
+
+impl ReceiveBufferPool {
+    fn new() -> Self {
+        let (sender, available) = mpsc::sync_channel(RECEIVE_BUFFER_POOL_FREE_CAPACITY);
+        for _ in 0..RECEIVE_BUFFER_POOL_CAPACITY {
+            sender
+                .send(Box::new([0; LOGICAL_PACKET_CAPACITY]))
+                .expect("new receive recycler is connected and has capacity");
+        }
+        Self {
+            recycler: Arc::new(RecyclerState {
+                sender,
+                recycled: AtomicU64::new(0),
+                recycle_overflow: AtomicU64::new(0),
+            }),
+            available,
+            inventory: Arc::new(Semaphore::new(RECEIVE_BUFFER_POOL_DETACHABLE_CAPACITY)),
+            detached: AtomicU64::new(0),
+            unavailable: AtomicU64::new(0),
+        }
+    }
+
+    fn take_scratch(&self) -> Box<Packet> {
+        self.available
+            .recv()
+            .expect("new receive pool contains its 128 scratch buffers")
+    }
+
+    fn replace_and_detach(&self, slot: &mut Box<Packet>, len: usize) -> PooledPacket {
+        let replacement = match self.available.try_recv() {
+            Ok(packet) => packet,
+            Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => {
+                self.unavailable.fetch_add(1, Ordering::Relaxed);
+                panic!("receive buffer pool exhausted despite inventory reservation");
+            }
+        };
+        let packet = std::mem::replace(slot, replacement);
+        self.detached.fetch_add(1, Ordering::Relaxed);
+        PooledPacket::new(packet, len, self.recycler.clone())
+    }
+
+    fn inventory(&self) -> Arc<Semaphore> {
+        self.inventory.clone()
+    }
+
+    #[cfg(test)]
+    fn snapshot(&self) -> ReceiveBufferPoolSnapshot {
+        ReceiveBufferPoolSnapshot {
+            capacity: RECEIVE_BUFFER_POOL_CAPACITY,
+            free: self.available.len(),
+            inventory: self.inventory.available_permits(),
+            detached: self.detached.load(Ordering::Relaxed),
+            recycled: self.recycler.recycled.load(Ordering::Relaxed),
+            unavailable: self.unavailable.load(Ordering::Relaxed),
+            recycle_overflow: self.recycler.recycle_overflow.load(Ordering::Relaxed),
+        }
+    }
+}
 
 /// Receive-side GRO diagnostics. These are deliberately process-local and
 /// relaxed: they are canary evidence, not a public metrics surface.
@@ -530,7 +676,11 @@ fn set_segment_control(control: &mut Control, segment_size: u16) {
 /// into the same logical head buffers.
 pub(crate) struct ReceiveBatch {
     gro_enabled: bool,
-    packets: Vec<Packet>,
+    /// Boxed fixed slots keep the kernel target stable even while an ordinary
+    /// direct packet is detached for the consumer. `detach_datagram` replaces
+    /// a slot before the next syscall and refreshes its iovec.
+    packets: Vec<Box<Packet>>,
+    pool: ReceiveBufferPool,
     /// Present only while GRO is active. Dropping this after a permanent
     /// fallback immediately releases the two 64 KiB tail buffers; no syscall
     /// retains their pointers after it returns.
@@ -568,11 +718,13 @@ impl ReceiveBatch {
     }
 
     fn with_gro(gro_enabled: bool) -> Self {
+        let pool = ReceiveBufferPool::new();
         // These vectors never change length, so all pointer targets remain
         // stable for every recvmmsg call made by this batch.
         Self {
             gro_enabled,
-            packets: vec![[0; LOGICAL_PACKET_CAPACITY]; MAX_BATCH],
+            packets: (0..MAX_BATCH).map(|_| pool.take_scratch()).collect(),
+            pool,
             gro_packets: gro_enabled.then(|| vec![vec![0; GRO_PACKET_CAPACITY]; GRO_TAIL_SLOTS]),
             iovecs: vec![
                 libc::iovec {
@@ -610,6 +762,59 @@ impl ReceiveBatch {
         let len = *self.lengths.get(index)?;
         let source = self.sources.get(index).copied().flatten()?;
         Some((&self.packets[index][..len], source))
+    }
+
+    /// Metadata for a published logical datagram without borrowing packet
+    /// storage. This is used to identify source runs before awaiting receive
+    /// credits and before detaching any scratch slot.
+    pub(crate) fn datagram_meta(&self, index: usize) -> Option<(usize, SocketAddr)> {
+        if index >= self.count {
+            return None;
+        }
+        Some((
+            *self.lengths.get(index)?,
+            self.sources.get(index).copied().flatten()?,
+        ))
+    }
+
+    /// Detach one published logical datagram into stable owned storage.
+    ///
+    /// Credits are acquired by the caller before this operation, so a pool
+    /// miss is an invariant failure rather than an allocation fallback. GRO
+    /// logical segments were copied into these fixed slots during splitting;
+    /// plain recvmmsg packets are transferred without copying.
+    pub(crate) fn detach_datagram(&mut self, index: usize) -> Option<(PooledPacket, SocketAddr)> {
+        if index >= self.count {
+            return None;
+        }
+        let len = *self.lengths.get(index)?;
+        let source = self.sources.get(index).copied().flatten()?;
+        let packet = self.pool.replace_and_detach(&mut self.packets[index], len);
+        self.refresh_iovec(index);
+        Some((packet, source))
+    }
+
+    /// Clone the detached-buffer inventory semaphore before awaiting its
+    /// permits. This avoids borrowing `ReceiveBatch` across backpressure.
+    pub(crate) fn pool_inventory(&self) -> Arc<Semaphore> {
+        self.pool.inventory()
+    }
+
+    fn refresh_iovec(&mut self, index: usize) {
+        self.iovecs[index] = libc::iovec {
+            iov_base: self.packets[index].as_mut_ptr().cast(),
+            iov_len: LOGICAL_PACKET_CAPACITY,
+        };
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pool_snapshot(&self) -> ReceiveBufferPoolSnapshot {
+        self.pool.snapshot()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn iovec_base(&self, index: usize) -> *mut libc::c_void {
+        self.iovecs[index].iov_base
     }
 
     /// Receive one nonblocking kernel batch. `WouldBlock` is returned without
@@ -1085,7 +1290,13 @@ pub(crate) fn send_gso<T: AsRef<[u8]>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        PoolInventoryReservation, WgCiphertext, WgDatagram, WgReceiveBatch,
+        WG_RECEIVE_PACKET_CAPACITY,
+    };
+    use rustscale_key::NodePrivate;
     use std::net::{Ipv4Addr, Ipv6Addr};
+    use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
     fn append_control(
         control: &mut Control,
@@ -1152,6 +1363,50 @@ mod tests {
         batch.headers[index].msg_len = packet.len() as _;
         batch.headers[index].msg_hdr.msg_namelen = mem::size_of::<libc::sockaddr_in>() as _;
         batch.headers[index].msg_hdr.msg_flags = 0;
+    }
+
+    fn pooled_publication_parts(
+        batch: &mut ReceiveBatch,
+        credits: &Arc<Semaphore>,
+        peer: &rustscale_key::NodePublic,
+        count: usize,
+    ) -> (
+        Vec<WgDatagram>,
+        OwnedSemaphorePermit,
+        Arc<PoolInventoryReservation>,
+    ) {
+        let channel_permit = credits
+            .clone()
+            .try_acquire_many_owned(count.try_into().unwrap())
+            .expect("test channel has credits");
+        let pool_permit = batch
+            .pool_inventory()
+            .try_acquire_many_owned(count.try_into().unwrap())
+            .expect("test pool inventory has detached buffers");
+        let pool_reservation = Arc::new(PoolInventoryReservation {
+            _permit: pool_permit,
+        });
+        let datagrams = (0..count)
+            .map(|index| {
+                let (packet, _) = batch.detach_datagram(index).unwrap();
+                WgDatagram {
+                    peer: peer.clone(),
+                    data: WgCiphertext::from_pooled(packet, pool_reservation.clone()),
+                }
+            })
+            .collect();
+        (datagrams, channel_permit, pool_reservation)
+    }
+
+    fn pooled_receive_batch(
+        batch: &mut ReceiveBatch,
+        credits: &Arc<Semaphore>,
+        peer: &rustscale_key::NodePublic,
+        count: usize,
+    ) -> WgReceiveBatch {
+        let (datagrams, channel_permit, pool_reservation) =
+            pooled_publication_parts(batch, credits, peer, count);
+        WgReceiveBatch::new_pooled(datagrams, channel_permit, pool_reservation)
     }
 
     #[test]
@@ -1273,6 +1528,223 @@ mod tests {
         assert_eq!(batch.len(), 0);
         assert!(batch.datagram(0).is_none());
         assert!(batch.datagram(1).is_none());
+    }
+
+    #[test]
+    fn detach_replaces_iovec_and_returns_fixed_storage() {
+        let mut batch = ReceiveBatch::with_gro(false);
+        assert_eq!(
+            batch.pool_snapshot(),
+            ReceiveBufferPoolSnapshot {
+                capacity: RECEIVE_BUFFER_POOL_CAPACITY,
+                free: RECEIVE_BUFFER_POOL_CAPACITY - MAX_BATCH,
+                inventory: RECEIVE_BUFFER_POOL_DETACHABLE_CAPACITY,
+                detached: 0,
+                recycled: 0,
+                unavailable: 0,
+                recycle_overflow: 0,
+            }
+        );
+        batch.prepare_slot(0);
+        set_plain_message(&mut batch, 0, b"detached", 1234);
+        batch.finish_plain(1).unwrap();
+        let old_iovec = batch.iovec_base(0);
+        let (packet, source) = batch.detach_datagram(0).expect("published packet detaches");
+        assert_eq!(packet.as_slice(), b"detached");
+        assert_eq!(source, "127.0.0.1:1234".parse().unwrap());
+        assert_ne!(batch.iovec_base(0), old_iovec);
+        assert_eq!(
+            batch.iovec_base(0),
+            batch.packets[0].as_mut_ptr().cast::<libc::c_void>()
+        );
+        assert_eq!(
+            batch.pool_snapshot().free,
+            RECEIVE_BUFFER_POOL_CAPACITY - MAX_BATCH - 1
+        );
+        drop(packet);
+        let snapshot = batch.pool_snapshot();
+        assert_eq!(snapshot.free, RECEIVE_BUFFER_POOL_CAPACITY - MAX_BATCH);
+        assert_eq!(snapshot.inventory, RECEIVE_BUFFER_POOL_DETACHABLE_CAPACITY);
+        assert_eq!(snapshot.detached, 1);
+        assert_eq!(snapshot.recycled, 1);
+        assert_eq!(snapshot.unavailable, 0);
+        assert_eq!(snapshot.recycle_overflow, 0);
+    }
+
+    #[test]
+    fn repeated_plain_detaches_reuse_the_bounded_pool() {
+        let mut batch = ReceiveBatch::with_gro(false);
+        for burst in 0..4 {
+            for index in 0..MAX_BATCH {
+                set_plain_message(
+                    &mut batch,
+                    index,
+                    &[burst as u8, index as u8],
+                    2000 + index as u16,
+                );
+            }
+            batch.finish_plain(MAX_BATCH).unwrap();
+            let packets = (0..MAX_BATCH)
+                .map(|index| batch.detach_datagram(index).expect("bounded replacement"))
+                .collect::<Vec<_>>();
+            for (index, (packet, _)) in packets.iter().enumerate() {
+                assert_eq!(packet.as_slice(), &[burst as u8, index as u8]);
+            }
+            drop(packets);
+            let snapshot = batch.pool_snapshot();
+            assert_eq!(snapshot.free, RECEIVE_BUFFER_POOL_CAPACITY - MAX_BATCH);
+            assert_eq!(snapshot.detached, ((burst + 1) * MAX_BATCH) as u64);
+            assert_eq!(snapshot.recycled, ((burst + 1) * MAX_BATCH) as u64);
+            assert_eq!(
+                snapshot.unavailable, 0,
+                "ordinary direct bursts never allocate/fallback"
+            );
+            assert_eq!(snapshot.recycle_overflow, 0);
+        }
+    }
+
+    #[test]
+    fn consumed_pooled_batch_releases_channel_credits_but_not_pool_inventory() {
+        let mut batch = ReceiveBatch::with_gro(false);
+        let peer = NodePrivate::generate().public();
+        for index in 0..3 {
+            set_plain_message(&mut batch, index, &[index as u8], 3000 + index as u16);
+        }
+        batch.finish_plain(3).unwrap();
+
+        let credits = Arc::new(Semaphore::new(WG_RECEIVE_PACKET_CAPACITY));
+        let receive = pooled_receive_batch(&mut batch, &credits, &peer, 3);
+        let mut extracted = receive.into_datagrams();
+        let last = extracted.pop().unwrap();
+        assert_eq!(credits.available_permits(), WG_RECEIVE_PACKET_CAPACITY);
+        assert_eq!(batch.pool_inventory().available_permits(), 381);
+        drop(extracted);
+        assert_eq!(batch.pool_inventory().available_permits(), 381);
+        drop(last);
+        assert_eq!(batch.pool_inventory().available_permits(), 384);
+
+        let snapshot = batch.pool_snapshot();
+        assert_eq!(snapshot.free, RECEIVE_BUFFER_POOL_CAPACITY - MAX_BATCH);
+        assert_eq!(snapshot.detached, 3);
+        assert_eq!(snapshot.recycled, 3);
+        assert_eq!(snapshot.unavailable, 0);
+        assert_eq!(snapshot.recycle_overflow, 0);
+    }
+
+    #[test]
+    fn dropped_queued_pooled_batch_returns_channel_and_pool_reservations() {
+        let mut batch = ReceiveBatch::with_gro(false);
+        set_plain_message(&mut batch, 0, b"queued", 3000);
+        batch.finish_plain(1).unwrap();
+        let credits = Arc::new(Semaphore::new(WG_RECEIVE_PACKET_CAPACITY));
+        let peer = NodePrivate::generate().public();
+        let queued = pooled_receive_batch(&mut batch, &credits, &peer, 1);
+        assert_eq!(credits.available_permits(), WG_RECEIVE_PACKET_CAPACITY - 1);
+        assert_eq!(batch.pool_inventory().available_permits(), 383);
+        drop(queued);
+        assert_eq!(credits.available_permits(), WG_RECEIVE_PACKET_CAPACITY);
+        assert_eq!(batch.pool_inventory().available_permits(), 384);
+        let snapshot = batch.pool_snapshot();
+        assert_eq!(snapshot.free, RECEIVE_BUFFER_POOL_CAPACITY - MAX_BATCH);
+        assert_eq!(snapshot.unavailable, 0);
+        assert_eq!(snapshot.recycle_overflow, 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_and_closed_pooled_publication_return_both_reservations() {
+        let mut batch = ReceiveBatch::with_gro(false);
+        let peer = NodePrivate::generate().public();
+        let credits = Arc::new(Semaphore::new(WG_RECEIVE_PACKET_CAPACITY));
+        set_plain_message(&mut batch, 0, b"cancelled", 3000);
+        batch.finish_plain(1).unwrap();
+
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        sender
+            .send(WgReceiveBatch::from_datagrams_for_test(Vec::new()))
+            .await
+            .unwrap();
+        let (datagrams, channel_permit, pool_reservation) =
+            pooled_publication_parts(&mut batch, &credits, &peer, 1);
+        let cancelled_sender = sender.clone();
+        let cancelled = tokio::spawn(async move {
+            crate::publish_reserved_wg_batch(
+                &cancelled_sender,
+                datagrams,
+                channel_permit,
+                pool_reservation,
+            )
+            .await;
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(credits.available_permits(), WG_RECEIVE_PACKET_CAPACITY - 1);
+        assert_eq!(batch.pool_inventory().available_permits(), 383);
+        cancelled.abort();
+        let _ = cancelled.await;
+        assert_eq!(credits.available_permits(), WG_RECEIVE_PACKET_CAPACITY);
+        assert_eq!(batch.pool_inventory().available_permits(), 384);
+        drop(receiver.recv().await);
+
+        set_plain_message(&mut batch, 0, b"closed", 3001);
+        batch.finish_plain(1).unwrap();
+        let (closed_sender, closed_receiver) = tokio::sync::mpsc::channel(1);
+        drop(closed_receiver);
+        let (datagrams, channel_permit, pool_reservation) =
+            pooled_publication_parts(&mut batch, &credits, &peer, 1);
+        crate::publish_reserved_wg_batch(
+            &closed_sender,
+            datagrams,
+            channel_permit,
+            pool_reservation,
+        )
+        .await;
+        assert_eq!(credits.available_permits(), WG_RECEIVE_PACKET_CAPACITY);
+        assert_eq!(batch.pool_inventory().available_permits(), 384);
+        assert_eq!(batch.pool_snapshot().unavailable, 0);
+    }
+
+    #[tokio::test]
+    async fn retained_pooled_packets_fill_384_inventory_then_wait_without_pool_miss() {
+        let mut batch = ReceiveBatch::with_gro(false);
+        let peer = NodePrivate::generate().public();
+        let credits = Arc::new(Semaphore::new(WG_RECEIVE_PACKET_CAPACITY));
+        let mut retained = Vec::new();
+        for burst in 0..3 {
+            for index in 0..MAX_BATCH {
+                set_plain_message(
+                    &mut batch,
+                    index,
+                    &[burst as u8, index as u8],
+                    4000 + index as u16,
+                );
+            }
+            batch.finish_plain(MAX_BATCH).unwrap();
+            retained.push(
+                pooled_receive_batch(&mut batch, &credits, &peer, MAX_BATCH).into_datagrams(),
+            );
+        }
+        assert_eq!(credits.available_permits(), WG_RECEIVE_PACKET_CAPACITY);
+        assert_eq!(batch.pool_inventory().available_permits(), 0);
+        assert_eq!(batch.pool_snapshot().unavailable, 0);
+
+        let inventory = batch.pool_inventory();
+        let waiting =
+            tokio::spawn(async move { PoolInventoryReservation::acquire(inventory, 1).await });
+        tokio::task::yield_now().await;
+        assert!(
+            !waiting.is_finished(),
+            "inventory waits before detachment can panic"
+        );
+
+        drop(retained.remove(0));
+        let reservation = tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
+            .await
+            .expect("returned pooled buffers wake inventory waiter")
+            .expect("waiter task completes")
+            .expect("inventory remains open");
+        assert_eq!(batch.pool_snapshot().unavailable, 0);
+        drop(reservation);
+        drop(retained);
+        assert_eq!(batch.pool_inventory().available_permits(), 384);
     }
 
     #[tokio::test]

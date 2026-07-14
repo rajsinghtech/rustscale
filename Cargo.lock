@@ -2879,6 +2879,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustscale-memnet"
+version = "0.1.1"
+dependencies = [
+ "bytes",
+ "tokio",
+]
+
+[[package]]
 name = "rustscale-netcheck"
 version = "0.1.1"
 dependencies = [

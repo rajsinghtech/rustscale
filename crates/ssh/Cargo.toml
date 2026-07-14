@@ -59,6 +59,9 @@ russh = "0.50"
 russh-keys = "0.50.0-beta.7"
 log = "0.4"
 libc.workspace = true
+h2.workspace = true
+bytes.workspace = true
+http = "1"
 
 [dev-dependencies]
 tokio.workspace = true

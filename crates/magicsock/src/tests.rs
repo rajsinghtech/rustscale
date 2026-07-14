@@ -613,8 +613,13 @@ async fn derp_data_path_fallback() {
     let mut got_wg = None;
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
     while std::time::Instant::now() < deadline {
-        if let Ok(Some(d)) = tokio::time::timeout(Duration::from_millis(500), b_rx.recv()).await {
-            if d.data == wg_datagram {
+        if let Ok(Some(batch)) = tokio::time::timeout(Duration::from_millis(500), b_rx.recv()).await
+        {
+            if let Some(d) = batch
+                .into_datagrams()
+                .into_iter()
+                .find(|d| d.data == wg_datagram)
+            {
                 got_wg = Some(d);
                 break;
             }
@@ -630,7 +635,11 @@ async fn derp_data_path_fallback() {
     let received = tokio::time::timeout(Duration::from_secs(2), a_rx.recv())
         .await
         .expect("timed out waiting for A recv")
-        .expect("A poll_recv");
+        .expect("A poll_recv")
+        .into_datagrams()
+        .into_iter()
+        .next()
+        .expect("one DERP datagram");
     assert_eq!(received.peer, b.node_public());
     assert_eq!(received.data, wg_reply);
 }
@@ -1179,8 +1188,8 @@ async fn direct_path_upgrade_over_udp() {
         "B's path to A should be Direct"
     );
 
-    // A direct batch remains ordered and is delivered as one datagram per UDP
-    // send, using the already-established direct path snapshot.
+    // A direct UDP burst remains ordered in one receive-batch item, using the
+    // already-established direct path snapshot.
     let datagrams = [
         b"\x08\x07\x06\x05 direct wg packet one".as_slice(),
         b"\x08\x07\x06\x05 direct wg packet two".as_slice(),
@@ -1188,11 +1197,18 @@ async fn direct_path_upgrade_over_udp() {
     a.send_batch(b.node_public(), &datagrams)
         .await
         .expect("A batch send");
-    for datagram in datagrams {
-        let received = tokio::time::timeout(Duration::from_secs(2), b_rx.recv())
-            .await
-            .expect("timed out waiting for B recv")
-            .expect("B poll_recv");
+    let mut received = Vec::new();
+    while received.len() < datagrams.len() {
+        received.extend(
+            tokio::time::timeout(Duration::from_secs(2), b_rx.recv())
+                .await
+                .expect("timed out waiting for B recv")
+                .expect("B poll_recv")
+                .into_datagrams(),
+        );
+    }
+    assert_eq!(received.len(), datagrams.len());
+    for (received, datagram) in received.into_iter().zip(datagrams) {
         assert_eq!(received.peer, a.node_public());
         assert_eq!(received.data, datagram);
     }
@@ -1496,8 +1512,13 @@ async fn multi_region_derp_routing() {
     let mut got_wg = None;
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while std::time::Instant::now() < deadline {
-        if let Ok(Some(d)) = tokio::time::timeout(Duration::from_millis(500), b_rx.recv()).await {
-            if d.data == wg_datagram {
+        if let Ok(Some(batch)) = tokio::time::timeout(Duration::from_millis(500), b_rx.recv()).await
+        {
+            if let Some(d) = batch
+                .into_datagrams()
+                .into_iter()
+                .find(|d| d.data == wg_datagram)
+            {
                 got_wg = Some(d);
                 break;
             }
@@ -1516,7 +1537,11 @@ async fn multi_region_derp_routing() {
     let received = tokio::time::timeout(Duration::from_secs(5), a_rx.recv())
         .await
         .expect("timed out waiting for A recv via region 1")
-        .expect("A poll_recv");
+        .expect("A poll_recv")
+        .into_datagrams()
+        .into_iter()
+        .next()
+        .expect("one DERP datagram");
     assert_eq!(received.peer, b.node_public());
     assert_eq!(received.data, wg_reply);
 }

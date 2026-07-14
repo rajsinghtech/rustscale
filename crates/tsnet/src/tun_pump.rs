@@ -8,7 +8,7 @@ use super::*;
 /// WG timer ticks run on a 250ms interval.
 pub(crate) async fn run_tun_pump(
     magicsock: Arc<Magicsock>,
-    mut wg_recv: mpsc::Receiver<rustscale_magicsock::WgDatagram>,
+    mut wg_recv: mpsc::Receiver<rustscale_magicsock::WgReceiveBatch>,
     tun: Arc<dyn Tun>,
     wg_tunnels: Arc<RwLock<HashMap<NodePublic, Arc<Mutex<WgTunn>>>>>,
     route_table: Arc<RwLock<RouteTable>>,
@@ -22,10 +22,34 @@ pub(crate) async fn run_tun_pump(
     let mut batch = rustscale_tun::TunPacketBatch::new();
     let mut outbound = OutboundBatchScratch::default();
     let mut inbound = InboundBatchScratch::default();
+    // A whole receive item that did not fit after a smaller item. Keeping it
+    // here instead of splitting it preserves both batch ordering and the
+    // packet-credit permit until its next turn.
+    let mut deferred_wg_batch = None;
 
     loop {
         if cancel.is_cancelled() {
             break;
+        }
+
+        // Process a whole batch deferred by the previous opportunistic drain
+        // before accepting later channel items. This is the only way a batch
+        // can be kept out of the current TUN write, so it cannot be overtaken.
+        if let Some(first) = deferred_wg_batch.take() {
+            inbound.clear();
+            deferred_wg_batch =
+                take_immediate_receive_batches(first, &mut wg_recv, &mut inbound.datagrams);
+            process_tun_inbound_batch(
+                &magicsock,
+                tun.as_ref(),
+                &wg_tunnels,
+                &filter,
+                &packet_drops,
+                &capture,
+                &mut inbound,
+            )
+            .await;
+            continue;
         }
 
         tokio::select! {
@@ -47,26 +71,22 @@ pub(crate) async fn run_tun_pump(
             }
             // magicsock recv -> WG decapsulate -> filter -> TUN write.
             result = wg_recv.recv() => {
-                if let Some(dgram) = result {
+                if let Some(first) = result {
                     inbound.clear();
-                    take_immediate_burst(dgram, &mut wg_recv, &mut inbound.datagrams);
-                    collect_tun_inbound_batch(&wg_tunnels, &mut inbound).await;
-                    filter_tun_inbound_batch(
+                    deferred_wg_batch = take_immediate_receive_batches(
+                        first,
+                        &mut wg_recv,
+                        &mut inbound.datagrams,
+                    );
+                    process_tun_inbound_batch(
+                        &magicsock,
+                        tun.as_ref(),
+                        &wg_tunnels,
                         &filter,
                         &packet_drops,
                         &capture,
                         &mut inbound,
-                    );
-                    // Datagrams are ciphertext ownership; release their
-                    // nested buffers before reply I/O or a blocked TUN write.
-                    inbound.datagrams.clear();
-                    let reply_socket = magicsock.clone();
-                    flush_inbound_burst(tun.as_ref(), &mut inbound, move |peer, reply| {
-                        let magicsock = reply_socket.clone();
-                        async move {
-                            let _ = magicsock.send(peer, &reply).await;
-                        }
-                    })
+                    )
                     .await;
                 } else {
                     log::warn!("tsnet: magicsock wg channel closed (tun)");
@@ -80,13 +100,48 @@ pub(crate) async fn run_tun_pump(
     }
 }
 
-/// Take the triggering datagram plus at most 127 immediately-ready entries.
-fn take_immediate_burst<T>(first: T, receiver: &mut mpsc::Receiver<T>, output: &mut Vec<T>) {
-    output.push(first);
+/// Move one received item and every immediately-ready whole item that fits
+/// into the TUN's 128-packet write. A too-large next item is returned without
+/// consuming it, so no batch is split or reordered.
+fn take_immediate_receive_batches(
+    first: rustscale_magicsock::WgReceiveBatch,
+    receiver: &mut mpsc::Receiver<rustscale_magicsock::WgReceiveBatch>,
+    output: &mut Vec<rustscale_magicsock::WgDatagram>,
+) -> Option<rustscale_magicsock::WgReceiveBatch> {
+    debug_assert!(output.is_empty());
+    *output = first.into_datagrams();
     while output.len() < rustscale_tun::TunPacketBatch::MAX_PACKETS {
         let Ok(next) = receiver.try_recv() else { break };
-        output.push(next);
+        if next.len() > rustscale_tun::TunPacketBatch::MAX_PACKETS - output.len() {
+            return Some(next);
+        }
+        output.append(&mut next.into_datagrams());
     }
+    None
+}
+
+async fn process_tun_inbound_batch(
+    magicsock: &Arc<Magicsock>,
+    tun: &dyn Tun,
+    wg_tunnels: &RwLock<HashMap<NodePublic, Arc<Mutex<WgTunn>>>>,
+    filter: &Arc<std::sync::Mutex<Filter>>,
+    packet_drops: &Arc<AtomicU64>,
+    capture: &crate::capture::CaptureSlot,
+    inbound: &mut InboundBatchScratch,
+) {
+    collect_tun_inbound_batch(wg_tunnels, inbound).await;
+    filter_tun_inbound_batch(filter, packet_drops, capture, inbound);
+    // Datagrams are ciphertext ownership; release their nested buffers before
+    // reply I/O or a blocked TUN write.
+    inbound.datagrams.clear();
+    let reply_socket = magicsock.clone();
+    flush_inbound_burst(tun, inbound, move |peer, reply| {
+        let magicsock = reply_socket.clone();
+        async move {
+            let _ = magicsock.send(peer, &reply).await;
+        }
+    })
+    .await;
 }
 
 /// Send replies before the one batch write, then reset the logical plaintext
@@ -733,6 +788,137 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tun_wg_receive_batch_consumer_matches_scalar_delivery_order() {
+        let batch_source_private = NodePrivate::generate();
+        let batch_target_private = NodePrivate::generate();
+        let batch_source_public = batch_source_private.public();
+        let batch_target_public = batch_target_private.public();
+        let batch_sender = Arc::new(Mutex::new(
+            WgTunn::new(&batch_source_private, &batch_target_public, 11).expect("batch sender"),
+        ));
+        let batch_receiver = Arc::new(Mutex::new(
+            WgTunn::new(&batch_target_private, &batch_source_public, 12).expect("batch receiver"),
+        ));
+        establish_tunnels(&batch_sender, &batch_receiver).await;
+
+        let scalar_source_private = NodePrivate::generate();
+        let scalar_target_private = NodePrivate::generate();
+        let scalar_source_public = scalar_source_private.public();
+        let scalar_target_public = scalar_target_private.public();
+        let scalar_sender = Arc::new(Mutex::new(
+            WgTunn::new(&scalar_source_private, &scalar_target_public, 13).expect("scalar sender"),
+        ));
+        let scalar_receiver = Arc::new(Mutex::new(
+            WgTunn::new(&scalar_target_private, &scalar_source_public, 14)
+                .expect("scalar receiver"),
+        ));
+        establish_tunnels(&scalar_sender, &scalar_receiver).await;
+
+        let plaintext = vec![
+            vec![
+                0x45, 0, 0, 20, 0, 1, 0, 0, 64, 17, 0, 0, 100, 64, 0, 1, 100, 64, 0, 2,
+            ],
+            vec![
+                0x45, 0, 0, 20, 0, 2, 0, 0, 64, 17, 0, 0, 100, 64, 0, 1, 100, 64, 0, 2,
+            ],
+            vec![
+                0x45, 0, 0, 20, 0, 3, 0, 0, 64, 17, 0, 0, 100, 64, 0, 1, 100, 64, 0, 2,
+            ],
+        ];
+        let mut batch_datagrams = Vec::new();
+        for packet in &plaintext {
+            batch_datagrams.push(rustscale_magicsock::WgDatagram {
+                peer: batch_source_public.clone(),
+                data: batch_sender
+                    .lock()
+                    .await
+                    .encapsulate(packet)
+                    .expect("batch encrypt")
+                    .into_iter()
+                    .next()
+                    .expect("one batch data datagram"),
+            });
+        }
+        let second = batch_datagrams.split_off(1);
+        let (send, mut recv) = mpsc::channel(2);
+        send.try_send(
+            rustscale_magicsock::WgReceiveBatch::from_datagrams_for_test(batch_datagrams),
+        )
+        .unwrap();
+        send.try_send(rustscale_magicsock::WgReceiveBatch::from_datagrams_for_test(second))
+            .unwrap();
+        let first = recv.recv().await.expect("first receive batch");
+        let mut batch_inbound = InboundBatchScratch::default();
+        assert!(
+            take_immediate_receive_batches(first, &mut recv, &mut batch_inbound.datagrams)
+                .is_none()
+        );
+        assert_eq!(batch_inbound.datagrams.len(), plaintext.len());
+
+        let batch_tunnels = RwLock::new(HashMap::from([(batch_source_public, batch_receiver)]));
+        collect_tun_inbound_batch(&batch_tunnels, &mut batch_inbound).await;
+
+        let scalar_tunnels = RwLock::new(HashMap::from([(
+            scalar_source_public.clone(),
+            scalar_receiver,
+        )]));
+        let mut scalar_inbound = InboundBatchScratch::default();
+        for packet in &plaintext {
+            scalar_inbound.datagrams = vec![rustscale_magicsock::WgDatagram {
+                peer: scalar_source_public.clone(),
+                data: scalar_sender
+                    .lock()
+                    .await
+                    .encapsulate(packet)
+                    .expect("scalar encrypt")
+                    .into_iter()
+                    .next()
+                    .expect("one scalar data datagram"),
+            }];
+            collect_tun_inbound_batch(&scalar_tunnels, &mut scalar_inbound).await;
+        }
+
+        assert_eq!(batch_inbound.plaintext.packets(), plaintext.as_slice());
+        assert_eq!(scalar_inbound.plaintext.packets(), plaintext.as_slice());
+    }
+
+    #[test]
+    fn tun_receive_coalescing_defers_a_whole_nonfitting_batch() {
+        let peer = NodePrivate::generate().public();
+        let datagrams = |start, count| {
+            (start..start + count)
+                .map(|byte| rustscale_magicsock::WgDatagram {
+                    peer: peer.clone(),
+                    data: vec![byte as u8],
+                })
+                .collect::<Vec<_>>()
+        };
+        let (send, mut recv) = mpsc::channel(2);
+        send.try_send(
+            rustscale_magicsock::WgReceiveBatch::from_datagrams_for_test(datagrams(0, 3)),
+        )
+        .unwrap();
+        send.try_send(
+            rustscale_magicsock::WgReceiveBatch::from_datagrams_for_test(datagrams(3, 126)),
+        )
+        .unwrap();
+        let mut output = Vec::new();
+        let deferred = take_immediate_receive_batches(
+            recv.try_recv().expect("first batch"),
+            &mut recv,
+            &mut output,
+        )
+        .expect("126-packet batch must not be split");
+
+        assert_eq!(
+            output.iter().map(|d| d.data[0]).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(deferred.len(), 126);
+        assert_eq!(deferred.into_datagrams()[0].data, vec![3]);
+    }
+
+    #[tokio::test]
     async fn inbound_batch_collects_all_128_plaintext_slots_in_order() {
         let first_source_private = NodePrivate::generate();
         let first_target_private = NodePrivate::generate();
@@ -892,21 +1078,15 @@ mod tests {
     }
 
     #[test]
-    fn immediate_burst_is_capped_at_tun_batch_capacity() {
+    fn receive_batch_is_capped_at_tun_batch_capacity() {
         assert_eq!(
             rustscale_wg::WgPlaintextBatch::MAX_PACKETS,
             rustscale_tun::TunPacketBatch::MAX_PACKETS
         );
-        let (tx, mut rx) = mpsc::channel(256);
-        for value in 1_u16..=130 {
-            tx.try_send(value).unwrap();
-        }
-        let mut burst = Vec::new();
-        take_immediate_burst(0, &mut rx, &mut burst);
-        assert_eq!(burst.len(), rustscale_tun::TunPacketBatch::MAX_PACKETS);
-        assert_eq!(burst[0], 0);
-        assert_eq!(burst.last(), Some(&127));
-        assert_eq!(rx.try_recv().unwrap(), 128);
+        assert_eq!(
+            rustscale_magicsock::WG_RECEIVE_BATCH_MAX_PACKETS,
+            rustscale_tun::TunPacketBatch::MAX_PACKETS
+        );
     }
 
     #[tokio::test]

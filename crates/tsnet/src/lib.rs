@@ -740,7 +740,7 @@ pub(crate) struct Bootstrap {
     pub(crate) tailscale_ips: Vec<IpAddr>,
     pub(crate) our_v4: Ipv4Addr,
     pub(crate) magicsock: Arc<Magicsock>,
-    pub(crate) wg_recv: mpsc::Receiver<rustscale_magicsock::WgDatagram>,
+    pub(crate) wg_recv: mpsc::Receiver<rustscale_magicsock::WgReceiveBatch>,
     pub(crate) wg_tunnels: Arc<RwLock<HashMap<NodePublic, Arc<Mutex<WgTunn>>>>>,
     pub(crate) peers: Arc<RwLock<Vec<Node>>>,
     pub(crate) route_table: Arc<RwLock<RouteTable>>,

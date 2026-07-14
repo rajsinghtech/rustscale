@@ -70,7 +70,7 @@ real JSON).
 | OS-level route management | `wgengine/router/` | 🔶 `crates/router` provides incremental, teardown-safe shell-backed `Router` implementations for macOS/Linux (including TUN route updates and exit-node toggles); `FakeRouter` unit-tests pure diffing. Phase 2: native PF_ROUTE/netlink plus Linux table-52 policy routing. |
 | LocalAPI authorization | `ipn/ipnauth/` | ✅ `safesocket::peercred::ConnIdentity` (SO_PEERCRED/LOCAL_PEERCRED/getpeereid), `is_readwrite()` uid check, enforced at all mutating LocalAPI endpoints (403 on mismatch) |
 | IPN audit logging | `ipn/auditlog/` | ✅ `crates/auditlog`: profile-scoped persistent queue, EventID deduplication, retry/backoff and final flush; Noise `/machine/audit-log` transport plus LocalAPI disconnect/logout wiring |
-| Service policy | `ipn/policy/` | ⬜ only `SSHPolicy` wire type exists; no policy engine |
+| Service policy | `ipn/policy/` | ✅ Go's package is a single `IsInterestingService` function — ported as `crates/portlist/src/policy.rs::is_interesting_service` (wired into portlist `to_services()`) |
 | Config file format | `ipn/conffile/` | ✅ `crates/conffile` — `ConfigVAlpha` schema with `Load`/`ToPrefs`/`WantRunning`, `deny_unknown_fields`, version `"alpha0"` validation; `--config <path>` flag on rustscaled, `POST /localapi/v0/reload-config` endpoint, SIGHUP reload handler |
 | IPN extension system | `ipn/ipnext/` | ⬜ |
 | Cloud log shipping | `logtail/` | ✅ `crates/logtail` — async upload loop (background tokio task), HTTP POST to `{base_url}/c/{collection}/{private_id}`, zstd compression (>256B, >64B savings), Retry-After/30–60s backoff, RFC3339Nano `client_time`, buffer cap + drop_count, upload metrics |

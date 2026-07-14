@@ -18,6 +18,8 @@ use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
+use rustscale_singleflight::Group;
+
 /// Default TTL for cache entries (10 minutes, matching Go's default).
 const DEFAULT_TTL: Duration = Duration::from_secs(600);
 
@@ -101,7 +103,7 @@ pub struct Resolver {
     /// IP cache keyed by hostname.
     cache: Mutex<HashMap<String, CacheEntry>>,
     /// Singleflight dedup: in-flight lookups keyed by hostname.
-    inflight: Mutex<HashMap<String, Arc<Mutex<Option<Result<LookupResult, String>>>>>>,
+    inflight: Group<String, LookupResult, String>,
 }
 
 impl Default for Resolver {
@@ -119,7 +121,7 @@ impl Resolver {
             ttl: DEFAULT_TTL,
             use_last_good: false,
             cache: Mutex::new(HashMap::new()),
-            inflight: Mutex::new(HashMap::new()),
+            inflight: Group::new(),
         }
     }
 
@@ -169,31 +171,27 @@ impl Resolver {
             return Ok(entry);
         }
 
-        // Single-flight: get or create the shared lookup slot.
-        let slot = self.get_or_create_inflight(host).await;
-
-        // Acquire the inner mutex (blocks if another caller is doing the lookup).
-        let mut guard = slot.lock().await;
-
-        if let Some(ref result) = *guard {
-            // Another caller already completed the lookup.
-            return result.clone().map_err(DnsError::Resolve);
-        }
-
-        // We're the first caller. Do the actual lookup.
-        let timeout = self.lookup_timeout_for_host(host).await;
-        let result = tokio::time::timeout(timeout, self.do_lookup(host))
-            .await
-            .map_err(|_| DnsError::Resolve(format!("lookup timeout for {host}")))
-            .and_then(|r| r);
-
-        // Store the result so concurrent waiters can read it.
-        *guard = Some(result.as_ref().map_err(ToString::to_string).cloned());
-
-        // On success, cache the result.
-        if let Ok(ref res) = result {
-            self.cache_add(host, res.clone()).await;
-        }
+        let shared = self
+            .inflight
+            .do_(host.to_owned(), || async {
+                let timeout = self.lookup_timeout_for_host(host).await;
+                let result = tokio::time::timeout(timeout, self.do_lookup(host))
+                    .await
+                    .map_err(|_| format!("lookup timeout for {host}"))
+                    .and_then(|result| result.map_err(|err| err.to_string()));
+                if let Ok(ref resolved) = result {
+                    self.cache_add(host, resolved.clone()).await;
+                }
+                result
+            })
+            .await;
+        let result = match (shared.val, shared.err) {
+            (Some(value), None) => Ok(value),
+            (_, Some(error)) => Err(DnsError::Resolve(error)),
+            (None, None) => Err(DnsError::Resolve(
+                "singleflight returned no result".to_owned(),
+            )),
+        };
 
         // On error with UseLastGood, try stale cache.
         if let Err(ref err) = result {
@@ -298,18 +296,6 @@ impl Resolver {
             }
         }
         SLOW_LOOKUP_TIMEOUT
-    }
-
-    /// Get or create the singleflight slot for `host`.
-    async fn get_or_create_inflight(
-        &self,
-        host: &str,
-    ) -> Arc<Mutex<Option<Result<LookupResult, String>>>> {
-        let mut inflight = self.inflight.lock().await;
-        inflight
-            .entry(host.to_string())
-            .or_insert_with(|| Arc::new(Mutex::new(None)))
-            .clone()
     }
 
     /// Perform the actual DNS lookup: forward (system or custom) first, then fallback.

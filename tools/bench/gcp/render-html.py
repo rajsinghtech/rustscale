@@ -52,6 +52,9 @@ def valid_matrix(data: dict) -> dict | None:
                     len(values) != len(set(values)) or
                     any(value not in DEFAULT_MATRIX[key] for value in values)):
                 return None
+        if not isinstance(data.get("dry_run", False), bool):
+            return None
+        matrix["dry_run"] = data.get("dry_run", False)
         return matrix
     except (AttributeError, KeyError, TypeError):
         return None
@@ -89,7 +92,7 @@ def configured_parallels(runs: list) -> list:
     return sorted({
         int(row["parallel"])
         for run in runs
-        for row in run.get("throughput", [])
+        for row in (run.get("throughput") or [])
         if "parallel" in row
     })
 
@@ -138,10 +141,10 @@ def throughput_chart_data(runs_idx: dict, parallels: list[int], topo: str, path:
         vals = []
         if run:
             err = run.get("error", "")
-            if err:
+            if run.get("status") == "failed" or err:
                 failed[cfg] = True
                 errors[cfg] = err
-            tp = {t["parallel"]: t.get("mbps", 0) for t in run.get("throughput", [])}
+            tp = {t["parallel"]: t.get("mbps", 0) for t in (run.get("throughput") or [])}
             for p in parallels:
                 vals.append(float(tp.get(p, 0)))
         else:
@@ -170,7 +173,7 @@ def latency_chart_data(runs_idx: dict, matrix: dict) -> dict:
         for topo in matrix["topologies"]:
             for path in matrix["paths"]:
                 run = runs_idx.get((topo, path, cfg))
-                lat = run.get("latency", {}) if run else {}
+                lat = (run.get("latency") or {}) if run else {}
                 rows.append({
                     "p50": float(lat.get("p50_us", 0)),
                     "p95": float(lat.get("p95_us", 0)),
@@ -189,12 +192,12 @@ def footprint_rows(runs_idx: dict, matrix: dict) -> list:
                 run = runs_idx.get((topo, path, cfg))
                 if not run:
                     continue
-                foot = run.get("footprint", {})
+                foot = run.get("footprint") or {}
                 rows.append({
                     "topo": topo,
                     "path": path,
                     "config": cfg,
-                    "error": run.get("error", ""),
+                    "error": run.get("error", "") or ("failed" if run.get("status") == "failed" else ""),
                     "binary_bytes": int(foot.get("binary_size_bytes", 0)),
                     "rss_peak_kb": int(foot.get("rss_peak_kb", 0)),
                     "rss_avg_kb": int(foot.get("rss_avg_kb", 0)),
@@ -517,6 +520,13 @@ def emit_detail_cards(runs: list) -> str:
                 f'<div class="reason">{html.escape(err)}</div>'
                 f"</div>"
             )
+        if r.get("legacy"):
+            parts.append(
+                '<div class="error-box" style="border-color:var(--warn)">'
+                '<div class="label" style="color:var(--warn)">LEGACY NORMALIZED</div>'
+                f'<div class="reason">{html.escape(r.get("legacy_note", "historical partial data"))}</div>'
+                '</div>'
+            )
         parts.append(f"<pre>{html.escape(json.dumps(r, indent=2))}</pre>")
         log_tail = r.get("log_tail", "")
         if log_tail:
@@ -532,7 +542,7 @@ def emit_detail_cards(runs: list) -> str:
 
 def emit_failed_runs(runs: list) -> str:
     """Emit a red banner listing all runs with a non-empty error field."""
-    failed = [r for r in runs if r.get("error")]
+    failed = [r for r in runs if r.get("status") == "failed" or r.get("error")]
     if not failed:
         return ""
     parts = [
@@ -540,7 +550,7 @@ def emit_failed_runs(runs: list) -> str:
         '<div class="failed-banner">',
         f"<h2>⚠ {len(failed)} failed run{'s' if len(failed) != 1 else ''}</h2>",
         f'<div class="count">{len(failed)} of {len(runs)} cells returned an error — '
-        "zeros below are stubs, not measurements.</div>",
+        "failed cells have no numeric measurements.</div>",
         '<table class="failed-runs">',
         "<thead><tr><th>topology / path</th><th>config</th><th>error</th>"
         "<th>log tail</th></tr></thead><tbody>",
@@ -569,10 +579,25 @@ def emit_failed_runs(runs: list) -> str:
     return "".join(parts)
 
 
+def emit_dry_run_notice(matrix: dict) -> str:
+    """Make intentionally failed dry-run stubs unmistakable in the dashboard."""
+    if not matrix.get("dry_run"):
+        return ""
+    return (
+        '<section class="block"><div class="failed-banner" '
+        'style="border-color:var(--warn)">'
+        '<h2 style="color:var(--warn)">DRY-RUN — PARTIAL</h2>'
+        '<div class="count">No benchmark measurements were taken. Failed/null '
+        'cells are intentional dry-run stubs and must not be interpreted as results.</div>'
+        '</div></section>'
+    )
+
+
 def emit_header(runs: list, matrix: dict) -> str:
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     n = len(runs)
-    n_failed = sum(1 for r in runs if r.get("error"))
+    n_failed = sum(1 for r in runs if r.get("status") == "failed" or r.get("error"))
+    n_legacy = sum(1 for r in runs if r.get("legacy"))
     expected = len(matrix["topologies"]) * len(matrix["paths"]) * len(matrix["configs"])
     n_missing = max(0, expected - n)
     tool_versions = {}
@@ -583,10 +608,19 @@ def emit_header(runs: list, matrix: dict) -> str:
     if n_failed:
         fail_str = f' · <span style="color:var(--bad)">{n_failed} FAILED</span>'
     miss_str = f" · {n_missing} missing"
+    legacy_str = f' · <span style="color:var(--warn)">{n_legacy} LEGACY NORMALIZED</span>' if n_legacy else ''
+    dry_run = matrix.get("dry_run", False)
+    dry_run_str = ' · <span style="color:var(--warn);font-weight:600">DRY-RUN</span>' if dry_run else ''
+    if dry_run:
+        partial = ' · <span style="color:var(--warn);font-weight:600">PARTIAL</span>'
+    elif n_failed or n_missing or n_legacy:
+        partial = ' · <span style="color:var(--warn);font-weight:600">PARTIAL — NOT COMPLETE</span>'
+    else:
+        partial = ''
     return (
         f'<header class="app">'
         f"<h1>rustscale GCP bench dashboard</h1>"
-        f'<div class="meta">{n} runs{fail_str}{miss_str} · generated {stamp} · {html.escape(ver_str)}</div>'
+        f'<div class="meta">{n} runs{fail_str}{miss_str}{legacy_str}{dry_run_str}{partial} · generated {stamp} · {html.escape(ver_str)}</div>'
         f"</header>"
     )
 
@@ -858,6 +892,8 @@ def main() -> int:
     out.append(emit_header(runs, matrix))
     out.append("<main>")
     out.append(emit_filters(matrix))
+
+    out.append(emit_dry_run_notice(matrix))
 
     # Failed-runs banner (only if any runs have errors).
     out.append(emit_failed_runs(runs))

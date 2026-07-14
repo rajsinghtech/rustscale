@@ -24,8 +24,8 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 cd "$REPO_ROOT"
 
 ROOT="${1:-bench-results}"
-AGG="tools/bench/gcp/aggregate.py"
-RENDER="tools/bench/gcp/render-html.py"
+AGG="${AGG:-tools/bench/gcp/aggregate.py}"
+RENDER="${RENDER:-tools/bench/gcp/render-html.py}"
 INDEX="$ROOT/gcp-index.html"
 
 if [[ ! -d "$ROOT" ]]; then
@@ -46,9 +46,10 @@ mapfile -t runs < <(printf '%s\n' "${runs[@]}" | sort -r)
 
 # Index rows accumulate here (a temp file avoids subshell scoping issues).
 rows="$(mktemp)"
-trap 'rm -f "$rows"' EXIT
+index_tmp=""
+trap 'rm -f "$rows" "$index_tmp"' EXIT
 
-total_runs=0 total_failed=0 total_missing=0
+total_runs=0 total_failed=0 total_missing=0 total_legacy=0 total_partial=0
 for dir in "${runs[@]}"; do
   dir="${dir%/}"
   stamp="$(basename "$dir")"
@@ -63,37 +64,67 @@ for dir in "${runs[@]}"; do
   # (Re)build summary + dashboard. aggregate warns to stderr about FAILED and
   # MISSING cells; capture that to count them for the index.
   agg_err="$(mktemp)"
-  if python3 "$AGG" "$dir" > "$dir/summary.json" 2>"$agg_err"; then
-    python3 "$RENDER" "$dir/summary.json" > "$dir/dashboard.html"
-    ok=1
+  summary_tmp="$(mktemp "$dir/.summary.json.XXXXXX")"
+  dashboard_tmp="$(mktemp "$dir/.dashboard.html.XXXXXX")"
+  render_failed=0
+  if python3 "$AGG" --allow-partial "$dir" > "$summary_tmp" 2>"$agg_err"; then
+    # Do not let set -e discard a previous usable dashboard.  Both artifacts
+    # become visible together only after render succeeds.
+    if python3 "$RENDER" "$summary_tmp" > "$dashboard_tmp"; then
+      mv "$summary_tmp" "$dir/summary.json"
+      mv "$dashboard_tmp" "$dir/dashboard.html"
+      ok=1
+    else
+      ok=0
+      render_failed=1
+      rm -f "$summary_tmp" "$dashboard_tmp"
+    fi
   else
     ok=0
+    rm -f "$summary_tmp" "$dashboard_tmp"
   fi
-  failed=$(grep -c 'FAILED' "$agg_err" 2>/dev/null || true)
+  failed=$(grep -Ec 'FAILED|MALFORMED|IDENTITY|DUPLICATE' "$agg_err" 2>/dev/null || true)
   missing=$(grep -c 'MISSING' "$agg_err" 2>/dev/null || true)
-  failed=${failed:-0}; missing=${missing:-0}
+  legacy=$(grep -c 'LEGACY ' "$agg_err" 2>/dev/null || true)
+  failed=${failed:-0}; missing=${missing:-0}; legacy=${legacy:-0}
   rm -f "$agg_err"
 
   total_runs=$((total_runs + 1))
   total_failed=$((total_failed + failed))
   total_missing=$((total_missing + missing))
+  total_legacy=$((total_legacy + legacy))
 
   if [[ "$ok" = 1 ]]; then
-    status="<span class=\"ok\">rendered</span>"
+    if [[ "$failed" -gt 0 || "$missing" -gt 0 || "$legacy" -gt 0 ]]; then
+      status="<span class=\"warn\">PARTIAL</span>"
+      total_partial=$((total_partial + 1))
+    else
+      status="<span class=\"ok\">rendered</span>"
+    fi
     [[ "$failed" -gt 0 ]] && status="$status · <span class=\"bad\">$failed failed</span>"
     [[ "$missing" -gt 0 ]] && status="$status · <span class=\"warn\">$missing missing</span>"
+    [[ "$legacy" -gt 0 ]] && status="$status · <span class=\"warn\">$legacy LEGACY NORMALIZED</span>"
     link="<a href=\"$stamp/dashboard.html\">dashboard</a>"
   else
-    status="<span class=\"bad\">render failed</span>"
+    if [[ "$render_failed" = 1 ]]; then
+      status="<span class=\"bad\">render-failed</span>"
+    else
+      status="<span class=\"bad\">aggregate-failed</span>"
+    fi
     link="—"
   fi
 
   printf '<tr><td>%s</td><td>%s JSON</td><td>%s</td><td>%s</td></tr>\n' \
     "$stamp" "$json_count" "$status" "$link" >> "$rows"
-  echo "[collect] $stamp: $json_count JSON, failed=$failed missing=$missing" >&2
+  if [[ "$render_failed" = 1 ]]; then
+    echo "[collect] $stamp: $json_count JSON, failed=$failed missing=$missing legacy=$legacy render-failed" >&2
+  else
+    echo "[collect] $stamp: $json_count JSON, failed=$failed missing=$missing legacy=$legacy" >&2
+  fi
 done
 
 # Emit the index.
+index_tmp=$(mktemp "$ROOT/.gcp-index.html.XXXXXX")
 {
   cat <<'HTML'
 <!DOCTYPE html>
@@ -137,12 +168,14 @@ HTML
 </main>
 <script>
 document.getElementById('meta').textContent =
-  '$total_runs run(s) collected — $total_failed failed cell(s), $total_missing missing cell(s) across all runs.';
+  '$total_runs run(s) collected — $total_partial partial run(s), $total_failed failed cell(s), $total_missing missing cell(s), $total_legacy legacy-normalized cell(s) across all runs.';
 </script>
 </body>
 </html>
 HTML
-} > "$INDEX"
+} > "$index_tmp"
+mv "$index_tmp" "$INDEX"
+index_tmp=""
 
 echo "[collect] wrote $INDEX ($total_runs runs)" >&2
 echo "$INDEX"

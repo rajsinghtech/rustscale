@@ -287,11 +287,234 @@ matrix_option_parsing_self_test() {
   done
 }
 
+matrix_write_manifest() {
+  local output="$1" repeat="$2" dry_run="${MATRIX_MANIFEST_DRY_RUN:-0}"
+  shift 2
+
+  python3 - "$output" "$repeat" "$dry_run" "$@" <<'PYEOF'
+import json
+import re
+import sys
+
+out, repeat_value, dry_run_value, *args = sys.argv[1:]
+if not re.fullmatch(r"[1-9][0-9]*", repeat_value):
+    raise ValueError("repeat must be a positive integer")
+if dry_run_value not in ("0", "1"):
+    raise ValueError("dry-run marker must be 0 or 1")
+
+parts, current = [], []
+for arg in args:
+    if arg == "--":
+        parts.append(current)
+        current = []
+    else:
+        current.append(arg)
+parts.append(current)
+if len(parts) != 4:
+    raise ValueError("manifest requires topology, path, config, and parallelism groups")
+
+parallelism = []
+for value in parts[3]:
+    if not re.fullmatch(r"[1-9][0-9]*", value):
+        raise ValueError(f"parallelism must be a positive integer: {value!r}")
+    parallelism.append(int(value))
+if not parallelism:
+    raise ValueError("parallelism must not be empty")
+
+with open(out, "w", encoding="utf-8") as f:
+    json.dump({"schema_version": 1, "topologies": parts[0], "paths": parts[1],
+               "configs": parts[2], "parallelism": parallelism, "repeat": int(repeat_value),
+               "dry_run": dry_run_value == "1",
+               "warmup": {"parallel": 1, "duration_s": 3, "reverse": True}}, f, indent=2)
+    f.write("\n")
+PYEOF
+}
+
+# Render into a sibling temporary file and publish only a complete document.
+# This preserves a prior dashboard if the renderer itself fails or is killed.
+matrix_render_dashboard() {
+  local summary="$1" dashboard="$2" renderer="${3:-tools/bench/gcp/render-html.py}"
+  local dashboard_tmp
+  dashboard_tmp=$(mktemp "$(dirname "$dashboard")/.dashboard.html.XXXXXX") || return 1
+  if python3 "$renderer" "$summary" >"$dashboard_tmp"; then
+    mv "$dashboard_tmp" "$dashboard"
+  else
+    rm -f "$dashboard_tmp"
+    return 1
+  fi
+}
+
+# Finalization has two deliberately distinct contracts. Production is strict:
+# any failed/null cell fails before a dashboard is published. Dry-run cells are
+# intentionally failed/null stubs, so they are aggregated with --allow-partial,
+# rendered as DRY-RUN/PARTIAL, and return success with ##STATUS:DRY_RUN.
+matrix_finalize_results() {
+  local results_dir="$1" dry_run="$2" renderer="${3:-tools/bench/gcp/render-html.py}"
+  local summary="$results_dir/summary.json" dashboard="$results_dir/dashboard.html"
+  local summary_tmp aggregate_status
+  local -a aggregate_args=()
+  (( dry_run )) && aggregate_args+=(--allow-partial)
+
+  echo "[gcp] aggregating results -> $summary"
+  summary_tmp=$(mktemp "$results_dir/.summary.json.XXXXXX") || {
+    echo "##STATUS:FAILED"
+    return 1
+  }
+  if python3 tools/bench/gcp/aggregate.py "${aggregate_args[@]}" "$results_dir" >"$summary_tmp"; then
+    :
+  else
+    aggregate_status=$?
+    rm -f "$summary_tmp"
+    echo "##STATUS:FAILED"
+    echo "[gcp] result validation failed; dashboard is intentionally not marked complete" >&2
+    return "$aggregate_status"
+  fi
+
+  echo "[gcp] rendering dashboard -> $dashboard"
+  if ! matrix_render_dashboard "$summary_tmp" "$dashboard" "$renderer"; then
+    rm -f "$summary_tmp"
+    echo "##STATUS:FAILED"
+    echo "[gcp] dashboard rendering failed; preserved any prior dashboard" >&2
+    return 1
+  fi
+  mv "$summary_tmp" "$summary"
+
+  # A collection failure must not change the completed run's contract; it only
+  # affects the convenience cross-run index.
+  if [[ "${MATRIX_SKIP_COLLECT:-0}" != 1 ]]; then
+    tools/bench/gcp/collect.sh "$(dirname "$results_dir")" >/dev/null || true
+  fi
+
+  echo ""
+  if (( dry_run )); then
+    echo "═══ GCP bench dry-run finalized — PARTIAL ═══"
+    echo "##STATUS:DRY_RUN"
+  else
+    echo "═══ GCP bench complete ═══"
+    echo "##STATUS:OK"
+  fi
+  echo "  results:  $results_dir"
+  echo "  summary:  $summary"
+  echo "  dashboard: $dashboard"
+  echo "  index:    $(dirname "$results_dir")/gcp-index.html"
+}
+
+matrix_finalization_self_test() {
+  local temp_dir dry_dir prod_dir output status
+  temp_dir=$(mktemp -d)
+  dry_dir="$temp_dir/dry"; prod_dir="$temp_dir/prod"
+  mkdir -p "$dry_dir/same-zone/direct" "$prod_dir/same-zone/direct"
+  MATRIX_MANIFEST_DRY_RUN=1 matrix_write_manifest "$dry_dir/matrix.json" 1 same-zone -- direct -- rs-tun -- 1
+  MATRIX_MANIFEST_DRY_RUN=0 matrix_write_manifest "$prod_dir/matrix.json" 1 same-zone -- direct -- rs-tun -- 1
+  if ! python3 - "$dry_dir" "$prod_dir" <<'PYEOF'
+import json
+import sys
+from pathlib import Path
+
+dry, prod = map(Path, sys.argv[1:])
+failed = {"schema_version": 2, "status": "failed", "tool": "rustscale", "mode": "tun",
+          "topology": "same-zone", "path": "direct", "config": "rs-tun", "repeat": 1,
+          "parallelism_requested": [1], "error": "dry-run", "log_tail": "",
+          "throughput": None, "latency": None, "footprint": None, "path_class_reported": "unknown"}
+(dry / "same-zone/direct/rs-tun.json").write_text(json.dumps(failed))
+ok = {"schema_version": 2, "status": "ok", "tool": "rustscale", "mode": "tun",
+      "topology": "same-zone", "path": "direct", "config": "rs-tun", "repeat": 1,
+      "parallelism_requested": [1], "error": "", "log_tail": "",
+      "throughput": [{"parallel": 1, "mbps": 1.0, "duration_s": 1.0,
+                      "samples_mbps": [1.0], "statistic": "median"}],
+      "latency": {"p50_us": 1, "p95_us": 2, "p99_us": 3, "count": 1},
+      "footprint": {"binary_size_bytes": 1, "rss_peak_kb": 1, "rss_avg_kb": 1,
+                    "cpu_peak_pct": 0, "cpu_avg_pct": 0, "samples": 1},
+      "path_class_reported": "direct"}
+(prod / "same-zone/direct/rs-tun.json").write_text(json.dumps(ok))
+PYEOF
+  then rm -rf "$temp_dir"; return 1; fi
+
+  MATRIX_SKIP_COLLECT=1 output=$(matrix_finalize_results "$dry_dir" 1 2>&1) || { rm -rf "$temp_dir"; return 1; }
+  [[ "$output" == *'##STATUS:DRY_RUN'* && "$output" != *'##STATUS:OK'* && "$output" != *'complete'* ]] || { rm -rf "$temp_dir"; return 1; }
+  grep -q 'DRY-RUN — PARTIAL' "$dry_dir/dashboard.html" || { rm -rf "$temp_dir"; return 1; }
+  grep -q 'DRY-RUN' "$dry_dir/dashboard.html" || { rm -rf "$temp_dir"; return 1; }
+
+  # Production success has its own explicit status, unlike dry-run success.
+  MATRIX_SKIP_COLLECT=1 output=$(matrix_finalize_results "$prod_dir" 0 2>&1) || { rm -rf "$temp_dir"; return 1; }
+  [[ "$output" == *'##STATUS:OK'* && "$output" != *'##STATUS:DRY_RUN'* ]] || { rm -rf "$temp_dir"; return 1; }
+
+  printf '%s\n' 'import sys; sys.exit(7)' >"$temp_dir/bad-renderer.py"
+  printf '%s' 'prior dashboard' >"$prod_dir/dashboard.html"
+  if MATRIX_SKIP_COLLECT=1 output=$(matrix_finalize_results "$prod_dir" 0 "$temp_dir/bad-renderer.py" 2>&1); then
+    rm -rf "$temp_dir"; return 1
+  else
+    status=$?
+  fi
+  (( status != 0 )) && [[ "$output" == *'##STATUS:FAILED'* ]] || { rm -rf "$temp_dir"; return 1; }
+  [[ "$(<"$prod_dir/dashboard.html")" == 'prior dashboard' ]] || { rm -rf "$temp_dir"; return 1; }
+  ! compgen -G "$prod_dir/.dashboard.html.*" >/dev/null || { rm -rf "$temp_dir"; return 1; }
+  ! compgen -G "$prod_dir/.summary.json.*" >/dev/null || { rm -rf "$temp_dir"; return 1; }
+  rm -rf "$temp_dir"
+}
+
+matrix_manifest_self_test() {
+  local temp_dir manifest invalid_manifest
+  temp_dir=$(mktemp -d)
+  manifest="$temp_dir/matrix.json"
+  invalid_manifest="$temp_dir/invalid.json"
+
+  if ! matrix_write_manifest "$manifest" 3 same-zone -- direct -- rs-tun -- 1 10 100; then
+    rm -rf "$temp_dir"
+    return 1
+  fi
+  if ! python3 - "$manifest" "$temp_dir" <<'PYEOF'
+import json
+import sys
+from pathlib import Path
+
+manifest = json.loads(Path(sys.argv[1]).read_text())
+assert manifest["parallelism"] == [1, 10, 100]
+assert all(type(value) is int for value in manifest["parallelism"])
+
+root = Path(sys.argv[2])
+cell = root / "same-zone/direct/rs-tun.json"
+cell.parent.mkdir(parents=True)
+parallelism = manifest["parallelism"]
+cell.write_text(json.dumps({
+    "schema_version": 2, "status": "ok", "tool": "rustscale", "mode": "tun",
+    "topology": "same-zone", "path": "direct", "config": "rs-tun", "repeat": 3,
+    "parallelism_requested": parallelism, "error": "", "log_tail": "",
+    "throughput": [{"parallel": value, "mbps": float(value), "duration_s": 1,
+                    "samples_mbps": [float(value)] * 3, "statistic": "median"}
+                   for value in parallelism],
+    "latency": {"p50_us": 1, "p95_us": 2, "p99_us": 3, "count": 1},
+    "footprint": {"binary_size_bytes": 1, "rss_peak_kb": 1, "rss_avg_kb": 1,
+                  "cpu_peak_pct": 0, "cpu_avg_pct": 0, "samples": 1},
+    "path_class_reported": "direct",
+}))
+PYEOF
+  then
+    rm -rf "$temp_dir"
+    return 1
+  fi
+  if ! python3 tools/bench/gcp/aggregate.py "$temp_dir" >/dev/null; then
+    rm -rf "$temp_dir"
+    return 1
+  fi
+  local malformed
+  for malformed in 0 -1 1.0 +1 ' 1' abc; do
+    if matrix_write_manifest "$invalid_manifest" 3 same-zone -- direct -- rs-tun -- "$malformed" >/dev/null 2>&1; then
+      rm -rf "$temp_dir"
+      return 1
+    fi
+    [[ ! -e "$invalid_manifest" ]] || { rm -rf "$temp_dir"; return 1; }
+  done
+  rm -rf "$temp_dir"
+}
+
 matrix_command_shape_self_test
 matrix_remote_build_aggregation_self_test
 matrix_config_failure_policy_self_test
 matrix_profile_self_test
 matrix_option_parsing_self_test
+matrix_manifest_self_test
+matrix_finalization_self_test
 
 if (( MATRIX_SELF_TEST )); then
   package_tailscaled_cleanup_self_test
@@ -336,6 +559,9 @@ declare -A ZONES=(
 TOPOLOGIES=(same-zone cross-region)
 PATHS=(direct derp)
 CONFIGS=(rs-userspace rs-tun ts-userspace ts-tun)
+# This is serialized into matrix.json and must exactly match every result's
+# parallelism_requested list; changing the sweep is therefore self-describing.
+PARALLELS=(1 10 100)
 select_values() {
   local filter="$1"; shift
   local -a available=("$@") selected=()
@@ -372,21 +598,8 @@ fi
 STAMP=$(date +%Y%m%d-%H%M%S)
 RESULTS_DIR="bench-results/gcp-$STAMP"
 mkdir -p "$RESULTS_DIR"
-python3 - "$RESULTS_DIR/matrix.json" "$REPEAT" "${TOPOLOGIES[@]}" -- "${PATHS[@]}" -- "${CONFIGS[@]}" <<'PYEOF'
-import json, sys
-out = sys.argv[1]
-repeat = int(sys.argv[2])
-parts, cur = [], []
-for arg in sys.argv[3:]:
-    if arg == "--": parts.append(cur); cur = []
-    else: cur.append(arg)
-parts.append(cur)
-with open(out, "w", encoding="utf-8") as f:
-    json.dump({"schema_version": 1, "topologies": parts[0], "paths": parts[1], "configs": parts[2],
-               "repeat": repeat,
-               "warmup": {"parallel": 1, "duration_s": 3, "reverse": True}}, f, indent=2)
-    f.write("\n")
-PYEOF
+MATRIX_MANIFEST_DRY_RUN="$DRY_RUN" matrix_write_manifest "$RESULTS_DIR/matrix.json" "$REPEAT" \
+  "${TOPOLOGIES[@]}" -- "${PATHS[@]}" -- "${CONFIGS[@]}" -- "${PARALLELS[@]}"
 
 # Track VMs created for cleanup. ASSUMES one pair per topology; we delete each
 # topology's VMs before starting the next to keep quota usage at 2 VMs.
@@ -518,26 +731,10 @@ for TOPO in "${TOPOLOGIES[@]}"; do
 done
 
 # ---------------------------------------------------------------------------
-# Aggregate + render.
+# Aggregate + render. Any finalization return exits through gcp_bench_cleanup,
+# including the successful DRY_RUN contract and renderer failures.
 # ---------------------------------------------------------------------------
-echo ""
-echo "[gcp] aggregating results -> $RESULTS_DIR/summary.json"
-# aggregate.py is pure python (no gcloud/API) so it runs in dry-run too,
-# exercising the glob+sort path against the stub JSONs run-config.sh wrote.
-python3 tools/bench/gcp/aggregate.py "$RESULTS_DIR" > "$RESULTS_DIR/summary.json"
-
-echo "[gcp] rendering dashboard -> $RESULTS_DIR/dashboard.html"
-python3 tools/bench/gcp/render-html.py "$RESULTS_DIR/summary.json" > "$RESULTS_DIR/dashboard.html"
-
-# Refresh the cross-run index so every dashboard is reachable from one page.
-tools/bench/gcp/collect.sh "$(dirname "$RESULTS_DIR")" >/dev/null || true
-
-echo ""
-echo "═══ GCP bench complete ═══"
-echo "  results:  $RESULTS_DIR"
-echo "  summary:  $RESULTS_DIR/summary.json"
-echo "  dashboard: $RESULTS_DIR/dashboard.html"
-echo "  index:    $(dirname "$RESULTS_DIR")/gcp-index.html"
+matrix_finalize_results "$RESULTS_DIR" "$DRY_RUN" || exit $?
 
 # Clear the trap's VM deletion now that we're done; tailnet cleanup still runs.
 ACTIVE_SRV=""

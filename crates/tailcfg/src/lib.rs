@@ -10,6 +10,7 @@
 
 mod appctype;
 mod auditlog;
+mod c2n;
 mod caps;
 mod derpmap;
 mod dns;
@@ -28,6 +29,7 @@ pub use appctype::{
 pub use auditlog::{
     AuditLogRequest, AuditNodeDisconnect, ClientAuditAction, AUDIT_NODE_DISCONNECT,
 };
+pub use c2n::C2NPostureIdentityResponse;
 pub use caps::{
     cap_ver_is_relay_capable, has_capability, relay_client_disabled, relay_server_disabled,
     CAP_VERSION_RELAY, NODE_ATTR_DISABLE_RELAY_CLIENT, NODE_ATTR_DISABLE_RELAY_SERVER,

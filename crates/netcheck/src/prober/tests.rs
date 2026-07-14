@@ -6,7 +6,8 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use rustscale_tailcfg::{DERPMap, DERPNode, DERPRegion};
-use tokio::net::UdpSocket;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
 use super::*;
 use crate::stun::{parse_binding_request, response};
@@ -79,6 +80,110 @@ fn map_from_servers(servers: &[(i32, FakeStunServer)]) -> DERPMap {
         Regions: regions,
         ..Default::default()
     }
+}
+
+async fn fake_captive_http_server(captive: bool) -> std::io::Result<SocketAddr> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut request = [0; 4096];
+                let n = stream.read(&mut request).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&request[..n]);
+                let challenge = request.lines().find_map(|line| {
+                    line.strip_prefix("X-Tailscale-Challenge: ")
+                        .map(str::to_owned)
+                });
+                let response = if captive {
+                    "HTTP/1.1 302 Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_owned()
+                } else if let Some(challenge) = challenge {
+                    format!("HTTP/1.1 204 No Content\r\nX-Tailscale-Response: response {challenge}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                } else {
+                    "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_owned()
+                };
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    Ok(addr)
+}
+
+fn add_captive_endpoint(dm: &mut DERPMap) {
+    let node = &mut dm.Regions.get_mut(&1).unwrap().Nodes.as_mut().unwrap()[0];
+    node.IPv4 = "127.0.0.1".into();
+    node.CanPort80 = true;
+}
+
+#[tokio::test]
+async fn prober_runs_captive_portal_on_full_probe() {
+    let stun = FakeStunServer::start(None, Duration::ZERO).await.unwrap();
+    let mut dm = map_from_servers(&[(1, stun)]);
+    add_captive_endpoint(&mut dm);
+    let http = fake_captive_http_server(false).await.unwrap();
+    let detector = crate::captivedetection::Detector::with_dialer(move |_, _| {
+        Box::pin(TcpStream::connect(http))
+    });
+    let health = Tracker::new();
+
+    let report = Prober
+        .run(
+            &dm,
+            &ProberOpts {
+                captive_detector: detector,
+                health: Some(health.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("report");
+
+    assert!(report.udp, "the STUN probe should have worked");
+    assert_eq!(report.captive_portal, Some(false));
+    assert!(!health.is_unhealthy(WARN_CAPTIVE_PORTAL));
+}
+
+#[tokio::test]
+async fn prober_runs_captive_portal_on_udp_fail() {
+    let mut dm = map_from_servers(&[(
+        1,
+        FakeStunServer {
+            addr: "127.0.0.1:1".parse().unwrap(),
+            fixed_reflexive: None,
+            delay: Duration::ZERO,
+        },
+    )]);
+    add_captive_endpoint(&mut dm);
+    let http = fake_captive_http_server(true).await.unwrap();
+    let detector = crate::captivedetection::Detector::with_dialer(move |_, _| {
+        Box::pin(TcpStream::connect(http))
+    });
+    let health = Tracker::new();
+
+    let report = Prober
+        .run(
+            &dm,
+            &ProberOpts {
+                report_timeout: Duration::from_secs(1),
+                probe_timeout: Duration::from_millis(50),
+                max_retries: 1,
+                skip_icmp: true,
+                captive_detector: detector,
+                health: Some(health.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("report");
+
+    assert!(!report.udp, "the STUN probe should fail");
+    assert_eq!(report.captive_portal, Some(true));
+    assert!(health.is_unhealthy(WARN_CAPTIVE_PORTAL));
 }
 
 #[tokio::test]

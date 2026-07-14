@@ -72,6 +72,9 @@ pub struct ProberOpts {
     /// are forwarded here: `Some(true)` → `set_unhealthy(WARN_CAPTIVE_PORTAL)`,
     /// `Some(false)` → `set_healthy(WARN_CAPTIVE_PORTAL)`.
     pub health: Option<Tracker>,
+    /// Detector used for captive-portal probing. The default uses the system
+    /// dialer; callers can replace it to bind probes to a particular network.
+    pub captive_detector: Detector,
     /// Skip the ICMP latency fallback (used by tests that point at
     /// unreachable localhost ports where ICMP would still succeed).
     /// Default: `false` (ICMP is tried when UDP fails).
@@ -86,6 +89,7 @@ impl Default for ProberOpts {
             max_retries: MAX_PROBE_RETRIES,
             previous_preferred_derp: 0,
             health: None,
+            captive_detector: Detector::default(),
             skip_icmp: false,
         }
     }
@@ -168,37 +172,31 @@ impl Prober {
         report.preferred_derp =
             pick_with_hysteresis(&report.region_latency, opts.previous_preferred_derp);
 
-        // Run captive portal detection when we have no UDP connectivity (the
-        // Go netcheck runs it on every full report via a delayed timer; we
-        // gate it on `!report.udp` since if UDP works, there's no captive
-        // portal intercepting traffic). The detection runs concurrently with
-        // a short delay — matching Go's `captivePortalDelay` of 200ms — so it
-        // doesn't block the report if endpoints are unreachable.
-        if !report.udp {
-            let dm_clone = dm.clone();
-            let preferred = report.preferred_derp;
-            let captive = tokio::spawn(async move {
-                // Small delay so the detection doesn't race ahead of the
-                // just-finished STUN probes' cleanup.
-                tokio::time::sleep(Duration::from_millis(200)).await;
-                Detector.detect_bool(Some(&dm_clone), preferred).await
-            })
-            .await
-            .ok()
-            .flatten();
-            report.captive_portal = captive;
+        // Run captive portal detection on every full netcheck. The delay
+        // mirrors Go's `captivePortalDelay` and lets STUN socket cleanup win
+        // before opening HTTP connections.
+        let dm_clone = dm.clone();
+        let detector = opts.captive_detector.clone();
+        let preferred = report.preferred_derp;
+        let captive = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            detector.detect_bool(Some(&dm_clone), preferred).await
+        })
+        .await
+        .ok()
+        .flatten();
+        report.captive_portal = captive;
 
-            // Forward captive portal result to the health tracker.
-            if let Some(ref health) = opts.health {
-                match report.captive_portal {
-                    Some(true) => {
-                        health.set_unhealthy(WARN_CAPTIVE_PORTAL, "captive portal detected");
-                    }
-                    Some(false) => {
-                        health.set_healthy(WARN_CAPTIVE_PORTAL);
-                    }
-                    None => {}
+        // Forward captive portal result to the health tracker.
+        if let Some(ref health) = opts.health {
+            match report.captive_portal {
+                Some(true) => {
+                    health.set_unhealthy(WARN_CAPTIVE_PORTAL, "captive portal detected");
                 }
+                Some(false) => {
+                    health.set_healthy(WARN_CAPTIVE_PORTAL);
+                }
+                None => {}
             }
         }
 

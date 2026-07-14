@@ -2758,6 +2758,9 @@ name = "rustscale-ipn"
 version = "0.1.1"
 dependencies = [
  "proptest",
+ "rustscale-health",
+ "rustscale-netcheck",
+ "rustscale-tailcfg",
  "serde",
  "serde_json",
  "tempfile",

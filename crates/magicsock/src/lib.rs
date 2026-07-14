@@ -69,7 +69,7 @@ use rustscale_tailcfg::{DERPMap, Node};
 #[cfg(target_os = "linux")]
 use tokio::io::Interest;
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 
 use derp_io::{DerpEvent, DerpIo};
 use disco_io::DiscoIo;
@@ -107,36 +107,66 @@ fn udp_batch_needs_scalar_handler(data: &[u8]) -> bool {
         || relay::looks_like_geneve_wireguard(data)
 }
 
-/// Publish an all-ordinary-WireGuard batch without changing the channel's
-/// packet-count capacity. A failed immediate full-batch reservation must not
-/// wait for an atomic reservation: packet-at-a-time `send` preserves the old
-/// streaming backpressure and lets other senders (notably DERP) make progress.
+/// Whether a Linux kernel receive batch must stay on the established scalar
+/// path. One control or malformed entry keeps the *entire* burst scalar so
+/// routing updates and ordinary WireGuard packets retain receive order.
 #[cfg(target_os = "linux")]
-async fn publish_linux_wg_batch(sender: &mpsc::Sender<WgDatagram>, pending: &mut Vec<WgDatagram>) {
-    use tokio::sync::mpsc::error::TrySendError;
+fn linux_batch_requires_scalar_handler<'a>(
+    packets: impl IntoIterator<Item = Option<&'a [u8]>>,
+) -> bool {
+    packets.into_iter().any(|packet| match packet {
+        Some(data) => udp_batch_needs_scalar_handler(data),
+        None => true,
+    })
+}
 
-    if pending.is_empty() {
+/// Maximum number of ordered WireGuard packets carried by one receive item.
+pub const WG_RECEIVE_BATCH_MAX_PACKETS: usize = 128;
+
+/// Total number of WireGuard packets that may wait between magicsock and its
+/// consumer. This is deliberately packet-counted, even though the channel
+/// transports batches.
+const WG_RECEIVE_PACKET_CAPACITY: usize = 256;
+
+/// Publish an owned receive batch. The permit is stored in the item until the
+/// consumer takes or drops it, so cancellation and closed-channel paths return
+/// packet credits without bespoke cleanup.
+async fn publish_wg_batch(
+    sender: &mpsc::Sender<WgReceiveBatch>,
+    credits: &Arc<Semaphore>,
+    datagrams: Vec<WgDatagram>,
+) {
+    if datagrams.is_empty() {
         return;
     }
-    match sender.try_reserve_many(pending.len()) {
-        Ok(permits) => {
-            for (permit, datagram) in permits.zip(pending.drain(..)) {
-                permit.send(datagram);
-            }
-        }
-        Err(TrySendError::Full(_)) => {
-            for datagram in pending.drain(..) {
-                if sender.send(datagram).await.is_err() {
-                    break;
-                }
-            }
-        }
-        Err(TrySendError::Closed(_)) => {
-            // Draining drops all ciphertext immediately and releases no
-            // partially-held permits because reservation never succeeded.
-            pending.clear();
-        }
-    }
+    assert!(
+        datagrams.len() <= WG_RECEIVE_BATCH_MAX_PACKETS,
+        "receive batch exceeds its 128-packet maximum"
+    );
+    let count = u32::try_from(datagrams.len()).expect("receive batch count fits u32");
+    let Ok(permit) = credits.clone().acquire_many_owned(count).await else {
+        return;
+    };
+    // If this await is cancelled or the receiver is closed, `batch` is
+    // dropped and its owned permit returns all packet credits.
+    let batch = WgReceiveBatch {
+        datagrams,
+        _permit: permit,
+    };
+    let _ = sender.send(batch).await;
+}
+
+/// Publish a Linux direct receive burst after all borrowed socket storage has
+/// been copied into owned datagrams. Moving the staging Vec into the channel
+/// item ensures no `ReceiveBatch` borrow crosses the capacity await.
+#[cfg(target_os = "linux")]
+async fn publish_linux_wg_batch(
+    sender: &mpsc::Sender<WgReceiveBatch>,
+    credits: &Arc<Semaphore>,
+    pending: &mut Vec<WgDatagram>,
+) {
+    let datagrams = std::mem::take(pending);
+    publish_wg_batch(sender, credits, datagrams).await;
 }
 
 /// Identify and copy ordinary direct WireGuard packets in receive order while
@@ -279,6 +309,54 @@ pub struct WgDatagram {
     pub data: Vec<u8>,
 }
 
+/// Ordered WireGuard receive burst handed to one tsnet consumer.
+///
+/// The private owned semaphore permit accounts for every contained packet.
+/// It is released only when the batch is consumed through
+/// [`WgReceiveBatch::into_datagrams`] or dropped.
+pub struct WgReceiveBatch {
+    datagrams: Vec<WgDatagram>,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl WgReceiveBatch {
+    /// Number of ordered ciphertext datagrams in this batch.
+    pub fn len(&self) -> usize {
+        self.datagrams.len()
+    }
+
+    /// Whether this batch contains no datagrams.
+    pub fn is_empty(&self) -> bool {
+        self.datagrams.is_empty()
+    }
+
+    /// Consume this handoff item and return its datagrams in receive order.
+    pub fn into_datagrams(self) -> Vec<WgDatagram> {
+        self.datagrams
+    }
+
+    /// Constructs an unqueued batch for consumer tests.
+    ///
+    /// This does not reserve receive credits and must not be used to publish
+    /// into Magicsock's receive channel; production publication is private to
+    /// [`publish_wg_batch`]. Keeping the test constructor here lets downstream
+    /// consumer tests exercise the real owned handoff type.
+    #[doc(hidden)]
+    pub fn from_datagrams_for_test(datagrams: Vec<WgDatagram>) -> Self {
+        assert!(
+            datagrams.len() <= WG_RECEIVE_BATCH_MAX_PACKETS,
+            "receive batch exceeds its 128-packet maximum"
+        );
+        let permit = Arc::new(Semaphore::new(0))
+            .try_acquire_many_owned(0)
+            .expect("zero-credit test permit is always available");
+        Self {
+            datagrams,
+            _permit: permit,
+        }
+    }
+}
+
 /// The path-selection engine.
 pub struct Magicsock {
     inner: Arc<Inner>,
@@ -298,7 +376,11 @@ struct Inner {
     endpoints: RwLock<HashMap<NodePublic, Endpoint>>,
     disco_to_peer: RwLock<HashMap<DiscoPublic, NodePublic>>,
     addr_to_peer: RwLock<HashMap<SocketAddr, NodePublic>>,
-    wg_send: mpsc::Sender<WgDatagram>,
+    wg_send: mpsc::Sender<WgReceiveBatch>,
+    /// The actual receive queue bound. The mpsc channel has enough item slots
+    /// for the worst case of 256 one-packet batches; permits make its effective
+    /// capacity packet-counted rather than batch-counted.
+    wg_receive_credits: Arc<Semaphore>,
     /// Optional port-mapping client for NAT-PMP/PCP/UPnP external endpoints.
     portmapper: Option<rustscale_portmapper::Client>,
     /// Test-support: suppress direct paths and force DERP (see MagicsockConfig).
@@ -683,11 +765,12 @@ impl Magicsock {
     /// a single-consumer channel, so there is no need for a Mutex.
     pub async fn new(
         config: MagicsockConfig,
-    ) -> Result<(Self, mpsc::Receiver<WgDatagram>), MagicsockError> {
+    ) -> Result<(Self, mpsc::Receiver<WgReceiveBatch>), MagicsockError> {
         let node_public = config.private_key.public();
         let disco = DiscoIo::new(config.disco_key);
 
-        let (wg_send, wg_recv) = mpsc::channel(256);
+        let (wg_send, wg_recv) = mpsc::channel(WG_RECEIVE_PACKET_CAPACITY);
+        let wg_receive_credits = Arc::new(Semaphore::new(WG_RECEIVE_PACKET_CAPACITY));
 
         // Bind UDP socket if configured. A pre-bound socket (udp_socket)
         // takes precedence over udp_bind.
@@ -769,6 +852,7 @@ impl Magicsock {
             disco_to_peer: RwLock::new(HashMap::new()),
             addr_to_peer: RwLock::new(HashMap::new()),
             wg_send,
+            wg_receive_credits,
             portmapper: config.portmapper,
             disable_direct_paths: config.disable_direct_paths,
             relay_manager: RwLock::new(None),
@@ -1812,7 +1896,12 @@ fn spawn_recv_tasks(
                                 inner.handle_udp_packet(data, addr).await;
                             }
                         } else {
-                            publish_linux_wg_batch(&inner.wg_send, &mut pending).await;
+                            publish_linux_wg_batch(
+                                &inner.wg_send,
+                                &inner.wg_receive_credits,
+                                &mut pending,
+                            )
+                            .await;
                         }
                     }
                     Err(error) if udp_batch::recvmmsg_is_unsupported(&error) => {
@@ -2478,23 +2567,14 @@ impl Inner {
         count: usize,
         pending: &mut Vec<WgDatagram>,
     ) -> bool {
-        let mut has_control = false;
-        for index in 0..count {
-            let Some((data, _)) = batch.datagram(index) else {
-                // A successful receive batch must always have a source and a
-                // logical packet for each slot.
-                // No staged data may survive a scalar fallback, even though
-                // normal publication always drains it before the next batch.
-                pending.clear();
-                return true;
-            };
-            if udp_batch_needs_scalar_handler(data) {
-                has_control = true;
-                break;
-            }
-        }
-
-        if has_control {
+        if linux_batch_requires_scalar_handler(
+            (0..count).map(|index| batch.datagram(index).map(|(data, _)| data)),
+        ) {
+            // A successful receive batch must always have a source and a
+            // logical packet for each slot. No staged data may survive a
+            // scalar fallback, even though normal publication drains it
+            // before the next batch.
+            pending.clear();
             return true;
         }
 
@@ -2553,13 +2633,15 @@ impl Inner {
             self.handle_disco_derp(data, source).await;
         } else {
             // WG datagram via DERP — deliver to caller.
-            let _ = self
-                .wg_send
-                .send(WgDatagram {
+            publish_wg_batch(
+                &self.wg_send,
+                &self.wg_receive_credits,
+                vec![WgDatagram {
                     peer: source,
                     data: data.to_vec(),
-                })
-                .await;
+                }],
+            )
+            .await;
         }
     }
 
@@ -2598,13 +2680,15 @@ impl Inner {
                     ep.note_recv_udp(std::time::Instant::now());
                 }
             }
-            let _ = self
-                .wg_send
-                .send(WgDatagram {
+            publish_wg_batch(
+                &self.wg_send,
+                &self.wg_receive_credits,
+                vec![WgDatagram {
                     peer,
                     data: data.to_vec(),
-                })
-                .await;
+                }],
+            )
+            .await;
         }
         // Unknown source address — drop the packet.
     }
@@ -2663,13 +2747,15 @@ impl Inner {
             map.get(&src).cloned()
         };
         if let Some(peer) = peer {
-            let _ = self
-                .wg_send
-                .send(WgDatagram {
+            publish_wg_batch(
+                &self.wg_send,
+                &self.wg_receive_credits,
+                vec![WgDatagram {
                     peer,
                     data: data.to_vec(),
-                })
-                .await;
+                }],
+            )
+            .await;
         }
     }
 
@@ -3221,7 +3307,7 @@ mod linux_batch_tests {
     }
 
     #[test]
-    fn control_batch_selection_covers_disco_and_geneve() {
+    fn mixed_control_disco_batch_falls_back_without_reordering_ordinary_wg() {
         let mut disco = vec![
             0;
             rustscale_disco::MAGIC.len()
@@ -3229,12 +3315,25 @@ mod linux_batch_tests {
                 + rustscale_disco::NONCE_LEN
         ];
         disco[..rustscale_disco::MAGIC.len()].copy_from_slice(&rustscale_disco::MAGIC);
+        let geneve_wg = relay::encode_geneve_wireguard(7, b"wg");
         assert!(DiscoIo::looks_like_disco(&disco));
         assert!(udp_batch_needs_scalar_handler(&disco));
-        assert!(udp_batch_needs_scalar_handler(
-            &relay::encode_geneve_wireguard(7, b"wg")
-        ));
+        assert!(udp_batch_needs_scalar_handler(&geneve_wg));
         assert!(!udp_batch_needs_scalar_handler(b"ordinary-wireguard"));
+        assert!(linux_batch_requires_scalar_handler([
+            Some(b"ordinary-wireguard-before".as_slice()),
+            Some(disco.as_slice()),
+            Some(b"ordinary-wireguard-after".as_slice()),
+            Some(geneve_wg.as_slice()),
+        ]));
+        assert!(!linux_batch_requires_scalar_handler([
+            Some(b"ordinary-wireguard-before".as_slice()),
+            Some(b"ordinary-wireguard-after".as_slice()),
+        ]));
+        assert!(linux_batch_requires_scalar_handler([None]));
+        // `spawn_recv_tasks` handles the true branch by iterating the same
+        // receive indexes in ascending order through `handle_udp_packet`;
+        // ordinary packets therefore cannot leap over disco/Geneve control.
     }
 
     #[test]
@@ -3280,73 +3379,162 @@ mod linux_batch_tests {
     }
 
     #[tokio::test]
-    async fn full_immediate_reservation_publishes_once_in_order() {
-        let (sender, mut receiver) = mpsc::channel(256);
-        let mut staged = pending(256);
-        publish_linux_wg_batch(&sender, &mut staged).await;
+    async fn direct_128_packet_burst_is_one_ordered_receive_item() {
+        let (sender, mut receiver) = mpsc::channel(WG_RECEIVE_PACKET_CAPACITY);
+        let credits = Arc::new(Semaphore::new(WG_RECEIVE_PACKET_CAPACITY));
+        let mut staged = pending(WG_RECEIVE_BATCH_MAX_PACKETS);
+        publish_linux_wg_batch(&sender, &credits, &mut staged).await;
+
         assert!(staged.is_empty());
-        for index in 0..256 {
-            assert_eq!(receiver.recv().await.unwrap().data, vec![index as u8]);
-        }
-        assert!(receiver.try_recv().is_err());
-    }
-
-    #[test]
-    fn full_reservation_falls_back_to_ordered_sends_and_drains() {
-        use std::future::Future;
-        use std::task::{Context, Poll, Waker};
-        use tokio::sync::mpsc::error::TrySendError;
-
-        let (sender, mut receiver) = mpsc::channel(256);
-        for index in 0..256 {
-            sender
-                .try_send(WgDatagram {
-                    peer: NodePrivate::generate().public(),
-                    data: vec![0x80, index as u8],
-                })
-                .unwrap();
-        }
-        assert!(matches!(
-            sender.try_reserve_many(2),
-            Err(TrySendError::Full(_))
-        ));
-        let mut staged = pending(2);
-        {
-            let mut publish = std::pin::pin!(publish_linux_wg_batch(&sender, &mut staged));
-            let mut context = Context::from_waker(Waker::noop());
-
-            // The channel is completely full, so `try_reserve_many(2)` must
-            // return Full and the first ordered send must wait for a drain.
-            assert!(matches!(publish.as_mut().poll(&mut context), Poll::Pending));
-            assert_eq!(receiver.try_recv().unwrap().data, vec![0x80, 0]);
-
-            // One drain admits only the first staged packet. The second remains
-            // blocked until a second receiver drain; no executor scheduling is
-            // involved in either observation.
-            assert!(matches!(publish.as_mut().poll(&mut context), Poll::Pending));
-            assert_eq!(receiver.try_recv().unwrap().data, vec![0x80, 1]);
-            assert!(matches!(
-                publish.as_mut().poll(&mut context),
-                Poll::Ready(())
-            ));
-        }
-        assert!(staged.is_empty());
-
-        let mut tail = Vec::new();
-        while let Ok(datagram) = receiver.try_recv() {
-            tail.push(datagram.data);
-        }
-        assert_eq!(tail.len(), 256);
-        assert_eq!(tail[tail.len() - 2..], [vec![0], vec![1]]);
+        assert_eq!(receiver.len(), 1, "burst occupies one channel item");
+        assert_eq!(credits.available_permits(), 128);
+        let batch = receiver.recv().await.expect("receive burst");
+        assert_eq!(batch.len(), WG_RECEIVE_BATCH_MAX_PACKETS);
+        assert_eq!(
+            batch
+                .into_datagrams()
+                .into_iter()
+                .map(|datagram| datagram.data)
+                .collect::<Vec<_>>(),
+            (0..WG_RECEIVE_BATCH_MAX_PACKETS)
+                .map(|index| vec![index as u8])
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(credits.available_permits(), WG_RECEIVE_PACKET_CAPACITY);
     }
 
     #[tokio::test]
-    async fn closed_receiver_drops_staged_packets_without_permits() {
-        let (sender, receiver) = mpsc::channel(256);
-        drop(receiver);
+    async fn queued_direct_burst_bounds_derp_progress_under_sustained_direct_work() {
+        let (sender, mut receiver) = mpsc::channel(WG_RECEIVE_PACKET_CAPACITY);
+        let credits = Arc::new(Semaphore::new(WG_RECEIVE_PACKET_CAPACITY));
+        let mut first = pending(WG_RECEIVE_BATCH_MAX_PACKETS);
+        let mut second = pending(WG_RECEIVE_BATCH_MAX_PACKETS);
+        publish_linux_wg_batch(&sender, &credits, &mut first).await;
+        publish_linux_wg_batch(&sender, &credits, &mut second).await;
+        assert_eq!(receiver.len(), 2, "256 packets are two, not 256, batches");
+        assert_eq!(credits.available_permits(), 0);
+
+        // A third direct burst is already waiting for its atomic 128 credits
+        // when DERP arrives. This is the adverse case: the scalar cannot
+        // overtake established receive order, but it must not be overtaken by
+        // direct work that arrives after it.
+        let queued_direct_sender = sender.clone();
+        let queued_direct_credits = credits.clone();
+        let queued_direct = tokio::spawn(async move {
+            publish_wg_batch(
+                &queued_direct_sender,
+                &queued_direct_credits,
+                pending(WG_RECEIVE_BATCH_MAX_PACKETS),
+            )
+            .await;
+        });
+        tokio::task::yield_now().await;
+
+        let derp_sender = sender.clone();
+        let derp_credits = credits.clone();
+        let derp_peer = NodePrivate::generate().public();
+        let derp = tokio::spawn(async move {
+            publish_wg_batch(
+                &derp_sender,
+                &derp_credits,
+                vec![WgDatagram {
+                    peer: derp_peer,
+                    data: b"derp".to_vec(),
+                }],
+            )
+            .await;
+        });
+        tokio::task::yield_now().await;
+
+        // This fourth burst models the sustained direct source. Tokio's fair
+        // semaphore queues it after DERP, so it cannot extend DERP's wait.
+        let sustained_direct_sender = sender.clone();
+        let sustained_direct_credits = credits.clone();
+        let sustained_direct = tokio::spawn(async move {
+            publish_wg_batch(
+                &sustained_direct_sender,
+                &sustained_direct_credits,
+                pending(WG_RECEIVE_BATCH_MAX_PACKETS),
+            )
+            .await;
+        });
+        tokio::task::yield_now().await;
+
+        // Releasing the first queued batch admits the older direct waiter.
+        // Releasing the second then admits DERP before the later direct work;
+        // its progress is therefore bounded by the two batches that preceded
+        // it at the packet-credit semaphore.
+        drop(receiver.recv().await.expect("first direct batch"));
+        tokio::time::timeout(std::time::Duration::from_secs(1), queued_direct)
+            .await
+            .expect("queued direct burst receives its preceding credits")
+            .expect("queued direct publisher task");
+        assert_eq!(credits.available_permits(), 0);
+
+        drop(receiver.recv().await.expect("second direct batch"));
+        tokio::time::timeout(std::time::Duration::from_secs(1), derp)
+            .await
+            .expect("DERP packet progresses behind only the queued direct burst")
+            .expect("DERP publisher task");
+
+        let third = receiver.recv().await.expect("queued direct batch");
+        assert_eq!(third.len(), WG_RECEIVE_BATCH_MAX_PACKETS);
+        drop(third);
+        let derp = receiver.recv().await.expect("DERP receive item");
+        assert_eq!(derp.len(), 1);
+        assert_eq!(derp.into_datagrams()[0].data, b"derp");
+
+        // The post-DERP direct burst may now acquire and publish, but it
+        // cannot have delayed the scalar publication above.
+        tokio::time::timeout(std::time::Duration::from_secs(1), sustained_direct)
+            .await
+            .expect("sustained direct publisher resumes after DERP")
+            .expect("sustained direct publisher task");
+        drop(receiver.recv().await.expect("post-DERP direct batch"));
+        assert_eq!(credits.available_permits(), WG_RECEIVE_PACKET_CAPACITY);
+    }
+
+    #[tokio::test]
+    async fn receive_batch_permits_return_after_consume_drop_cancel_and_close() {
+        let (sender, mut receiver) = mpsc::channel(WG_RECEIVE_PACKET_CAPACITY);
+        let credits = Arc::new(Semaphore::new(WG_RECEIVE_PACKET_CAPACITY));
         let mut staged = pending(3);
-        publish_linux_wg_batch(&sender, &mut staged).await;
-        assert!(staged.is_empty());
+        publish_linux_wg_batch(&sender, &credits, &mut staged).await;
+        assert_eq!(credits.available_permits(), 253);
+        let consumed = receiver.recv().await.expect("batch");
+        let _datagrams = consumed.into_datagrams();
+        assert_eq!(credits.available_permits(), WG_RECEIVE_PACKET_CAPACITY);
+
+        let mut staged = pending(4);
+        publish_linux_wg_batch(&sender, &credits, &mut staged).await;
+        assert_eq!(credits.available_permits(), 252);
+        drop(receiver.recv().await.expect("batch to drop"));
+        assert_eq!(credits.available_permits(), WG_RECEIVE_PACKET_CAPACITY);
+
+        let mut full = pending(WG_RECEIVE_BATCH_MAX_PACKETS);
+        publish_linux_wg_batch(&sender, &credits, &mut full).await;
+        let mut full = pending(WG_RECEIVE_BATCH_MAX_PACKETS);
+        publish_linux_wg_batch(&sender, &credits, &mut full).await;
+        let cancelled_sender = sender.clone();
+        let cancelled_credits = credits.clone();
+        let cancelled = tokio::spawn(async move {
+            publish_wg_batch(&cancelled_sender, &cancelled_credits, pending(1)).await;
+        });
+        tokio::task::yield_now().await;
+        cancelled.abort();
+        let _ = cancelled.await;
+        assert_eq!(
+            credits.available_permits(),
+            0,
+            "cancelled waiter owns no credit"
+        );
+        drop(receiver);
+        assert_eq!(credits.available_permits(), WG_RECEIVE_PACKET_CAPACITY);
+
+        let (closed_sender, closed_receiver) = mpsc::channel(WG_RECEIVE_PACKET_CAPACITY);
+        drop(closed_receiver);
+        publish_wg_batch(&closed_sender, &credits, pending(1)).await;
+        assert_eq!(credits.available_permits(), WG_RECEIVE_PACKET_CAPACITY);
     }
 }
 

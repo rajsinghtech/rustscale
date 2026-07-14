@@ -9,7 +9,8 @@
 //! HoldAndDelegate, check/verification URLs, SFTP.
 
 use crate::incubator::{Incubator, IncubatorArgs, IncubatorError};
-use crate::recording::{RecordDir, RecordResult, RecordingConfig};
+use crate::recording::{CastHeader, RecordDir, RecordResult, RecordingConfig, SessionRecorder};
+use crate::recording_upload::DialFn;
 use crate::session::{Session, Window};
 
 use russh::{CryptoVec, Sig};
@@ -18,6 +19,69 @@ use std::io;
 use std::net::IpAddr;
 use std::os::fd::{FromRawFd, RawFd};
 use tokio::io::AsyncReadExt;
+
+/// Initialize the recording backend before the shell is started.
+///
+/// Remote recorder failures reject only when the policy supplies a rejection
+/// message; otherwise they deliberately fail open. NotifyURL requires the
+/// control-plane Noise client and is deferred for now.
+pub async fn init_recording(
+    config: &RecordingConfig,
+    cast_header: CastHeader,
+    dial: Option<DialFn>,
+) -> Result<Option<SessionRecorder>, String> {
+    if config.recorders.is_empty() {
+        return match &config.local_path {
+            Some(path) => SessionRecorder::new(
+                path,
+                (cast_header.width, cast_header.height),
+                &cast_header.command,
+                &cast_header
+                    .env
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+                config.fail_open,
+            )
+            .map(Some)
+            .map_err(|error| error.to_string()),
+            None => Ok(None),
+        };
+    }
+    let Some(dial) = dial else {
+        return recording_connect_failed(config, "no recorder dialer configured");
+    };
+    match crate::recording_upload::connect_to_recorder(&config.recorders, dial).await {
+        Ok(connection) => SessionRecorder::with_upload(
+            connection.writer,
+            connection.result_rx,
+            cast_header,
+            config.fail_open,
+        )
+        .map(Some)
+        .map_err(|error| error.to_string()),
+        Err((attempts, error)) => {
+            log::warn!("SSH recording could not start ({error}); attempts: {attempts:?}");
+            recording_connect_failed(config, &error.to_string())
+        }
+    }
+}
+
+fn recording_connect_failed(
+    config: &RecordingConfig,
+    error: &str,
+) -> Result<Option<SessionRecorder>, String> {
+    if let Some(action) = &config.on_failure {
+        if !action.NotifyURL.is_empty() {
+            log::warn!("SSH recording NotifyURL is not implemented yet");
+        }
+        if !action.RejectSessionWithMessage.is_empty() {
+            return Err(action.RejectSessionWithMessage.clone());
+        }
+    }
+    log::warn!("SSH recording disabled: {error}");
+    Ok(None)
+}
 
 /// Extended data type code for stderr (RFC 4254 section 5.2).
 const EXTENDED_DATA_STDERR: u32 = 1;
@@ -308,7 +372,7 @@ fn set_winsize(fd: RawFd, win: &Window) -> Result<(), SessionHandlerError> {
 /// * `rec_config` — optional recording configuration (None = no recording)
 pub async fn run_session(
     mut session: Session,
-    _rec_config: Option<RecordingConfig>,
+    rec_config: Option<RecordingConfig>,
 ) -> Result<i32, SessionHandlerError> {
     // 1. Resolve local user.
     let local_user = get_local_user(session.user())?;
@@ -377,11 +441,44 @@ pub async fn run_session(
 
     // 6. Take the recorder out of the session for the stdout pump.
     let recorder = session.take_recorder();
+    let session_rec_config = session.take_recording_config();
 
     // 7. Spawn shell.
     let incubator = Incubator::new(args);
     let mut spawned = incubator.spawn()?;
     let pid = spawned.pid();
+
+    // Upload completion is watched independently from output writes. A V2
+    // recorder can report an error while the shell is still running.
+    let terminate_message = rec_config
+        .or(session_rec_config)
+        .and_then(|config| config.on_failure)
+        .map(|action| action.TerminateSessionWithMessage)
+        .filter(|message| !message.is_empty());
+    let mut upload_result_rx = None;
+    if let Some(recorder) = recorder.as_ref() {
+        if let Some(result_rx) = recorder.take_result_rx() {
+            if let Some(message) = terminate_message {
+                let handle = session.handle().clone();
+                let channel_id = session.channel_id();
+                tokio::spawn(async move {
+                    if !matches!(result_rx.await, Ok(Ok(()))) {
+                        log::warn!("SSH recorder upload failed; terminating session");
+                        if let Some(pid) = pid {
+                            #[cfg(unix)]
+                            unsafe {
+                                let _ = libc::kill(-(pid as libc::pid_t), libc::SIGTERM);
+                                let _ = libc::kill(pid as libc::pid_t, libc::SIGTERM);
+                            }
+                        }
+                        let _ = handle.data(channel_id, CryptoVec::from(message)).await;
+                    }
+                });
+            } else {
+                upload_result_rx = Some(result_rx);
+            }
+        }
+    }
 
     // 8. Take I/O handles (None in PTY mode since Stdio::null was used).
     let mut child_stdin = spawned.take_stdin();
@@ -600,6 +697,14 @@ pub async fn run_session(
     // 15. Report exit status to the SSH client.
     session.exit(exit_code as u32).await;
 
+    if let Some(recorder) = recorder {
+        let _ = recorder.close();
+    }
+    if let Some(result_rx) = upload_result_rx {
+        if !matches!(result_rx.await, Ok(Ok(()))) {
+            log::warn!("SSH recorder upload failed; continuing per recording policy");
+        }
+    }
     Ok(exit_code)
 }
 

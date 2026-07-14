@@ -538,7 +538,7 @@ async fn detect_clean_204_no_captive() {
         provider: EndpointProvider::DerpMapPreferred,
     };
 
-    let detector = Detector;
+    let detector = Detector::default();
     let result = detector.detect_with_endpoints(&[ep]).await;
     assert_eq!(
         result,
@@ -569,7 +569,7 @@ async fn detect_captive_redirect() {
         provider: EndpointProvider::DerpMapPreferred,
     };
 
-    let detector = Detector;
+    let detector = Detector::default();
     let result = detector.detect_with_endpoints(&[ep]).await;
     assert_eq!(
         result,
@@ -598,7 +598,7 @@ async fn detect_captive_body_mismatch() {
         provider: EndpointProvider::Tailscale,
     };
 
-    let detector = Detector;
+    let detector = Detector::default();
     let result = detector.detect_with_endpoints(&[ep]).await;
     assert_eq!(
         result,
@@ -621,7 +621,7 @@ async fn detect_captive_missing_challenge_header() {
         provider: EndpointProvider::DerpMapPreferred,
     };
 
-    let detector = Detector;
+    let detector = Detector::default();
     let result = detector.detect_with_endpoints(&[ep]).await;
     assert_eq!(
         result,
@@ -645,7 +645,7 @@ async fn detect_body_match_not_captive() {
         provider: EndpointProvider::Tailscale,
     };
 
-    let detector = Detector;
+    let detector = Detector::default();
     let result = detector.detect_with_endpoints(&[ep]).await;
     assert_eq!(
         result,
@@ -666,7 +666,7 @@ async fn detect_inconclusive_on_connection_failure() {
         provider: EndpointProvider::DerpMapPreferred,
     };
 
-    let detector = Detector;
+    let detector = Detector::default();
     let result = detector.detect_with_endpoints(&[ep]).await;
     assert_eq!(
         result,
@@ -677,7 +677,7 @@ async fn detect_inconclusive_on_connection_failure() {
 
 #[tokio::test]
 async fn detect_empty_endpoints_inconclusive() {
-    let detector = Detector;
+    let detector = Detector::default();
     let result = detector.detect_with_endpoints(&[]).await;
     assert_eq!(result, DetectResult::Inconclusive);
 }
@@ -703,7 +703,7 @@ async fn detect_any_clean_overrides_failures() {
         provider: EndpointProvider::Tailscale,
     };
 
-    let detector = Detector;
+    let detector = Detector::default();
     let result = detector.detect_with_endpoints(&[dead_ep, clean_ep]).await;
     assert_eq!(
         result,
@@ -737,7 +737,7 @@ async fn detect_captive_wins_over_clean() {
         provider: EndpointProvider::Tailscale,
     };
 
-    let detector = Detector;
+    let detector = Detector::default();
     let result = detector
         .detect_with_endpoints(&[clean_ep, captive_ep])
         .await;
@@ -769,7 +769,7 @@ async fn detect_with_timeout() {
         provider: EndpointProvider::Tailscale,
     };
 
-    let detector = Detector;
+    let detector = Detector::default();
     let start = std::time::Instant::now();
     let result = detector.detect_with_endpoints(&[ep]).await;
     let elapsed = start.elapsed();

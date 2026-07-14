@@ -2413,11 +2413,19 @@ dependencies = [
 name = "rustscale-appc"
 version = "0.1.1"
 dependencies = [
+ "rustscale-deephash",
  "rustscale-key",
  "rustscale-tailcfg",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "rustscale-art"
+version = "0.1.1"
+dependencies = [
+ "rand 0.8.7",
 ]
 
 [[package]]
@@ -2468,6 +2476,7 @@ name = "rustscale-c2n"
 version = "0.1.1"
 dependencies = [
  "async-trait",
+ "rustscale-tailcfg",
  "rustscale-tsaddr",
  "serde",
  "serde_json",
@@ -2586,7 +2595,6 @@ dependencies = [
  "rand 0.8.7",
  "rustscale-ipn",
  "rustscale-key",
- "rustscale-portmapper",
  "rustscale-tailcfg",
  "serde",
  "serde_json",
@@ -2603,6 +2611,7 @@ dependencies = [
  "rustscale-envknob",
  "rustscale-key",
  "rustscale-ktimeout",
+ "rustscale-limiter",
  "rustscale-netns",
  "rustscale-tailcfg",
  "rustscale-tsdial",
@@ -2651,6 +2660,7 @@ name = "rustscale-dnscache"
 version = "0.1.1"
 dependencies = [
  "rustscale-netns",
+ "rustscale-singleflight",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
@@ -2702,6 +2712,7 @@ dependencies = [
 name = "rustscale-filter"
 version = "0.1.1"
 dependencies = [
+ "rustscale-deephash",
  "rustscale-flowtrack",
  "rustscale-packet",
  "rustscale-tailcfg",
@@ -2746,6 +2757,9 @@ name = "rustscale-ipn"
 version = "0.1.1"
 dependencies = [
  "proptest",
+ "rustscale-health",
+ "rustscale-netcheck",
+ "rustscale-tailcfg",
  "serde",
  "serde_json",
  "tempfile",
@@ -2782,6 +2796,10 @@ version = "0.1.1"
 dependencies = [
  "libc",
 ]
+
+[[package]]
+name = "rustscale-limiter"
+version = "0.1.1"
 
 [[package]]
 name = "rustscale-localclient"
@@ -2866,6 +2884,14 @@ dependencies = [
  "rustscale-udprelay",
  "socket2",
  "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
+name = "rustscale-memnet"
+version = "0.1.1"
+dependencies = [
+ "bytes",
  "tokio",
 ]
 
@@ -2975,10 +3001,21 @@ version = "0.1.1"
 dependencies = [
  "if-addrs",
  "rand 0.8.7",
+ "rustscale-deephash",
  "rustscale-neterror",
  "rustscale-tsdial",
  "thiserror 1.0.69",
  "tokio",
+]
+
+[[package]]
+name = "rustscale-posture"
+version = "0.1.1"
+dependencies = [
+ "libc",
+ "log",
+ "rustscale-netmon",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -2999,6 +3036,16 @@ dependencies = [
 [[package]]
 name = "rustscale-ringlog"
 version = "0.1.1"
+
+[[package]]
+name = "rustscale-routecheck"
+version = "0.1.1"
+dependencies = [
+ "log",
+ "rustscale-netmon",
+ "rustscale-routetable",
+ "rustscale-tsaddr",
+]
 
 [[package]]
 name = "rustscale-router"
@@ -3042,6 +3089,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustscale-singleflight"
+version = "0.1.1"
+dependencies = [
+ "futures-util",
+ "tokio",
+]
+
+[[package]]
 name = "rustscale-sockstats"
 version = "0.1.1"
 dependencies = [
@@ -3066,8 +3121,11 @@ name = "rustscale-ssh"
 version = "0.1.1"
 dependencies = [
  "base64",
+ "bytes",
  "chrono",
  "ed25519-dalek",
+ "h2",
+ "http",
  "libc",
  "log",
  "russh",
@@ -3079,6 +3137,17 @@ dependencies = [
  "sha2",
  "thiserror 1.0.69",
  "tokio",
+]
+
+[[package]]
+name = "rustscale-syspolicy"
+version = "0.1.1"
+dependencies = [
+ "log",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -3223,6 +3292,7 @@ dependencies = [
  "rustscale-netstack",
  "rustscale-portlist",
  "rustscale-portmapper",
+ "rustscale-posture",
  "rustscale-proxymap",
  "rustscale-router",
  "rustscale-safesocket",

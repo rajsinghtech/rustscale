@@ -12,6 +12,10 @@
 //! configuration without pulling in a heavy HTTP dependency.
 
 use std::fmt;
+use std::future::Future;
+use std::io;
+use std::pin::Pin;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rustscale_tailcfg::DERPMap;
@@ -220,7 +224,7 @@ fn memcontains(haystack: &[u8], needle: &[u8]) -> bool {
 /// No redirects are followed. Fails on connection errors or response parse
 /// errors. The `?t=<timestamp>` query parameter is appended to bust caches,
 /// matching Go's behavior.
-async fn http_get(url: &str, ep: &Endpoint) -> Result<HttpResponse, std::io::Error> {
+async fn http_get(url: &str, ep: &Endpoint, dial: &DialFn) -> Result<HttpResponse, io::Error> {
     // Parse the URL manually (it's always http://host[:port]/path?query).
     let (host_port, path) = parse_http_url(url)?;
 
@@ -242,7 +246,7 @@ async fn http_get(url: &str, ep: &Endpoint) -> Result<HttpResponse, std::io::Err
     }
     req.push_str("\r\n");
 
-    let stream = rustscale_tsdial::system_dial("tcp", &host_port).await?;
+    let stream = dial("tcp".to_owned(), host_port.clone()).await?;
     // Set a read/write timeout via tokio's timeout wrapper instead.
     let mut stream = stream;
 
@@ -338,8 +342,33 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// in this first pass — requests go out via the default route, which is
 /// sufficient for most cases (the Go code's per-interface logic is mainly
 /// needed for macOS before the user accepts the portal alert).
-#[derive(Debug, Clone)]
-pub struct Detector;
+pub type DialFuture = Pin<Box<dyn Future<Output = io::Result<tokio::net::TcpStream>> + Send>>;
+
+/// Function used by [`Detector`] to open an HTTP connection.
+///
+/// The default is [`rustscale_tsdial::system_dial`]. Supplying a dialer lets
+/// callers bind captive-portal probes to a particular interface in the future.
+pub type DialFn = Arc<dyn Fn(String, String) -> DialFuture + Send + Sync>;
+
+/// Detects whether the system is behind a captive portal.
+#[derive(Clone)]
+pub struct Detector {
+    dial: DialFn,
+}
+
+impl fmt::Debug for Detector {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Detector").finish_non_exhaustive()
+    }
+}
+
+impl Default for Detector {
+    fn default() -> Self {
+        Self::with_dialer(|network, addr| {
+            Box::pin(async move { rustscale_tsdial::system_dial(&network, &addr).await })
+        })
+    }
+}
 
 /// The outcome of a detection run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -353,6 +382,16 @@ pub enum DetectResult {
 }
 
 impl Detector {
+    /// Construct a detector using a custom TCP dialer.
+    pub fn with_dialer<F>(dial: F) -> Self
+    where
+        F: Fn(String, String) -> DialFuture + Send + Sync + 'static,
+    {
+        Self {
+            dial: Arc::new(dial),
+        }
+    }
+
     /// Run captive portal detection. Probes up to [`MAX_ENDPOINTS`] endpoints
     /// concurrently; if any returns a response that looks like a captive
     /// portal, returns `CaptivePortal`. If any returns a clean response and
@@ -383,8 +422,9 @@ impl Detector {
         let mut tasks = Vec::with_capacity(endpoints.len());
         for ep in endpoints {
             let ep = ep.clone();
+            let dial = self.dial.clone();
             tasks.push(tokio::spawn(async move {
-                match timeout(DETECT_TIMEOUT, http_get(&ep.url, &ep)).await {
+                match timeout(DETECT_TIMEOUT, http_get(&ep.url, &ep, &dial)).await {
                     Ok(Ok(resp)) => {
                         let captive = response_looks_like_captive(&resp, &ep);
                         Some(captive)

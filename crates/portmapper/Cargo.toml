@@ -10,6 +10,7 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+rustscale-deephash = { path = "../deephash", version = "0.1.1" }
 rustscale-neterror = { path = "../neterror", version = "0.1.1" }
 rustscale-tsdial = { path = "../tsdial", version = "0.1.1" }
 thiserror.workspace = true

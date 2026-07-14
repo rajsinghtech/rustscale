@@ -61,6 +61,13 @@ impl Server {
         *inner.ssh_host_keys.write().await = host_keys.iter().map(host_key_public_string).collect();
 
         let peers = inner.peers.clone();
+        let recorder_peers = inner.peers.clone();
+        let recorder_netstack = match &inner.data_plane {
+            crate::DataPlane::Netstack(netstack) => netstack.clone(),
+            crate::DataPlane::Tun => return Err(crate::TsnetError::NotAvailableInTunMode),
+        };
+        let state_dir = self.config.state_dir.clone();
+        let source_node = inner.our_fqdn.clone();
         let user_profiles = inner.user_profiles.clone();
         let ssh_policy = inner.ssh_policy.clone();
 
@@ -86,6 +93,47 @@ impl Server {
         let policy: rustscale_ssh::PolicyCallback =
             Arc::new(move || ssh_policy.try_read().ok().and_then(|guard| guard.clone()));
 
+        // Recorder addresses normally contain a tailnet IP. Resolve a
+        // MagicDNS name from the current peer map as well, then dial directly
+        // through the netstack so recorder traffic stays on the tailnet.
+        let dial_fn: rustscale_ssh::DialFn = Arc::new(move |host, port| {
+            let netstack = recorder_netstack.clone();
+            let peers = recorder_peers.clone();
+            let host = host.to_string();
+            Box::pin(async move {
+                let ip = host.parse().or_else(|_| {
+                    peers
+                        .try_read()
+                        .ok()
+                        .and_then(|peers| {
+                            peers.iter().find_map(|node| {
+                                let name = node.Name.trim_end_matches('.');
+                                let short_name = name.split('.').next().unwrap_or(name);
+                                if host == name || host == short_name {
+                                    node.Addresses
+                                        .first()
+                                        .and_then(|address| address.split('/').next())
+                                        .and_then(|address| address.parse().ok())
+                                } else {
+                                    None
+                                }
+                            })
+                        })
+                        .ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::NotFound,
+                                "recorder hostname not in peer map",
+                            )
+                        })
+                })?;
+                let stream = netstack
+                    .dial(std::net::SocketAddr::new(ip, port))
+                    .await
+                    .map_err(std::io::Error::other)?;
+                Ok(Box::new(stream) as rustscale_ssh::BoxedIo)
+            })
+        });
+
         let (session_tx, init_rx) = mpsc::channel::<SessionInit>(16);
         let session_tx = Arc::new(session_tx);
 
@@ -103,6 +151,9 @@ impl Server {
         let whois_clone = whois.clone();
         let policy_clone = policy.clone();
         let host_keys_clone = host_keys.clone();
+        let dial_fn_clone = dial_fn.clone();
+        let state_dir_clone = state_dir.clone();
+        let source_node_clone = source_node.clone();
 
         let task = tokio::spawn(async move {
             let mut tcp_listener = tcp_listener;
@@ -115,6 +166,9 @@ impl Server {
                         let whois = whois_clone.clone();
                         let policy = policy_clone.clone();
                         let hk = host_keys_clone.clone();
+                        let dial_fn = dial_fn_clone.clone();
+                        let state_dir = state_dir_clone.clone();
+                        let source_node = source_node_clone.clone();
 
                         tokio::spawn(async move {
                             let ssh_config = SshServerConfig {
@@ -122,6 +176,9 @@ impl Server {
                                 session_tx: tx,
                                 whois,
                                 policy,
+                                state_dir,
+                                dial_fn: Some(dial_fn),
+                                source_node,
                             };
                             let mut server = SshServer::new(ssh_config);
                             let _ = handle_ssh_conn(config, &mut server, stream, peer_addr).await;

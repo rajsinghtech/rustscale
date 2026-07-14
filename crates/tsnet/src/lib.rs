@@ -302,6 +302,9 @@ pub struct ServerBuilder {
     /// Threaded through to `LocalApiState` so `POST /reload-config` can
     /// re-read the file. Mirrors Go's `tsd.System.InitialConfig`.
     pub(crate) config_path: Option<PathBuf>,
+    /// Enable collection of device posture serial numbers and hardware
+    /// addresses through the C2N posture identity endpoint. Default: false.
+    pub(crate) posture_checking: bool,
 }
 
 /// A pluggable logger callback for diagnostic messages. Implementations
@@ -328,6 +331,7 @@ impl std::fmt::Debug for ServerBuilder {
             .field("peer_relay_server", &self.peer_relay_server)
             .field("port", &self.port)
             .field("advertise_tags", &self.advertise_tags)
+            .field("posture_checking", &self.posture_checking)
             .field("logger", &self.logger.as_ref().map(|_| "<logger>"))
             .field("logtail", &self.logtail.as_ref().map(|_| "<logtail>"))
             .finish()
@@ -554,6 +558,14 @@ impl ServerBuilder {
     /// `POST /localapi/v0/reload-config` re-reads this file.
     pub fn config_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.config_path = Some(path.into());
+        self
+    }
+
+    /// Enable device posture data collection. When enabled, serial numbers
+    /// and non-loopback MAC addresses are exposed on demand through
+    /// `GET /posture/identity`. Default: `false`.
+    pub fn posture_checking(mut self, on: bool) -> Self {
+        self.posture_checking = on;
         self
     }
 

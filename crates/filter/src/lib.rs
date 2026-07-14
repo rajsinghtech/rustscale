@@ -24,6 +24,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 
 use r#match::Matches as MatchList;
+use rustscale_deephash::{update as deephash_update, DeepHash, Hasher, Sum};
 use rustscale_tailcfg::{FilterRule, PeerCapMap};
 
 /// Callback for counting packets on a connection.
@@ -87,6 +88,38 @@ pub struct Filter {
     /// length). Mirrors Go's `netlogfunc.ConnectionCounter` registration
     /// in the tun device.
     connection_counter: Option<ConnectionCounter>,
+    /// Hash of the inputs used to build this filter. A zero value means the
+    /// filter was built by a convenience constructor rather than these inputs.
+    input_hash: Sum,
+}
+
+struct FilterInputs {
+    rules: Vec<FilterRule>,
+    local_ips: Vec<IpAddr>,
+    cap_holders: BTreeMap<IpAddr, BTreeSet<String>>,
+}
+
+impl DeepHash for FilterInputs {
+    fn deep_hash(&self, hasher: &mut Hasher) {
+        self.rules.deep_hash(hasher);
+        self.local_ips.deep_hash(hasher);
+        self.cap_holders.deep_hash(hasher);
+    }
+}
+
+fn filter_inputs_hash(
+    rules: &[FilterRule],
+    local_ips: &[IpAddr],
+    cap_holders: &BTreeMap<IpAddr, BTreeSet<String>>,
+) -> Sum {
+    let inputs = FilterInputs {
+        rules: rules.to_vec(),
+        local_ips: local_ips.to_vec(),
+        cap_holders: cap_holders.clone(),
+    };
+    let mut input_hash = Sum::default();
+    deephash_update(&mut input_hash, &inputs);
+    input_hash
 }
 
 impl Filter {
@@ -108,6 +141,7 @@ impl Filter {
         let (cap4, cap6) = matches.partition_caps_by_family();
 
         let (local4, local6) = partition_local_ips(local_ips);
+        let input_hash = filter_inputs_hash(rules, local_ips, cap_holders);
 
         Ok(Self {
             matches4: m4,
@@ -120,6 +154,7 @@ impl Filter {
             cap4,
             cap6,
             connection_counter: None,
+            input_hash,
         })
     }
 
@@ -150,6 +185,7 @@ impl Filter {
             cap4: MatchList::default(),
             cap6: MatchList::default(),
             connection_counter: None,
+            input_hash: Sum::default(),
         });
         // Override local4/local6 with wildcard prefixes (host_prefix would
         // give /32 and /128, but we need /0).
@@ -162,6 +198,7 @@ impl Filter {
             addr: IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
             bits: 0,
         }];
+        f.input_hash = Sum::default();
         f
     }
 
@@ -178,7 +215,40 @@ impl Filter {
             cap4: MatchList::default(),
             cap6: MatchList::default(),
             connection_counter: None,
+            input_hash: Sum::default(),
         }
+    }
+
+    /// Whether this filter was built from exactly these inputs. Filters built
+    /// by [`Self::allow_all`] or [`Self::allow_none`] always report changed.
+    pub fn is_inputs_unchanged(
+        &self,
+        rules: &[FilterRule],
+        local_ips: &[IpAddr],
+        cap_holders: &BTreeMap<IpAddr, BTreeSet<String>>,
+    ) -> bool {
+        self.input_hash != Sum::default()
+            && self.input_hash == filter_inputs_hash(rules, local_ips, cap_holders)
+    }
+
+    /// Rebuild this filter when its inputs have changed, preserving flow state,
+    /// shields-up mode, and the installed connection counter.
+    pub fn rebuild_if_changed(
+        &mut self,
+        rules: &[FilterRule],
+        local_ips: &[IpAddr],
+        cap_holders: &BTreeMap<IpAddr, BTreeSet<String>>,
+    ) -> Result<bool, FilterError> {
+        if self.is_inputs_unchanged(rules, local_ips, cap_holders) {
+            return Ok(false);
+        }
+
+        let mut new_filter = Self::new(rules, local_ips, cap_holders)?;
+        new_filter.share_state_with(self);
+        new_filter.shields_up = self.shields_up;
+        new_filter.connection_counter = self.connection_counter.take();
+        *self = new_filter;
+        Ok(true)
     }
 
     /// Enable or disable shields-up mode. When enabled, all *new* inbound

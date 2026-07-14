@@ -6,6 +6,8 @@
 
 use std::net::IpAddr;
 
+use rustscale_deephash::{DeepHash, Hasher};
+
 /// An IP prefix (CIDR), matching Go's `netip.Prefix`.
 ///
 /// Stores the network address and prefix length. Used for route
@@ -16,6 +18,13 @@ pub struct Prefix {
     pub addr: IpAddr,
     /// Prefix length in bits (0–32 for IPv4, 0–128 for IPv6).
     pub bits: u8,
+}
+
+impl DeepHash for Prefix {
+    fn deep_hash(&self, hasher: &mut Hasher) {
+        self.addr.deep_hash(hasher);
+        self.bits.deep_hash(hasher);
+    }
 }
 
 impl Default for Prefix {

@@ -1004,3 +1004,33 @@ fn test_set_connection_counter_clears() {
     f.update_outbound(&pkt);
     assert_eq!(call_count.load(Ordering::Relaxed), 1);
 }
+
+#[test]
+fn test_filter_input_hash_change_detection() {
+    let rules = vec![];
+    let local_ips = vec!["100.64.0.1".parse::<IpAddr>().unwrap()];
+    let caps = BTreeMap::new();
+    let mut filter = Filter::new(&rules, &local_ips, &caps).unwrap();
+
+    assert!(filter.is_inputs_unchanged(&rules, &local_ips, &caps));
+    assert!(!filter
+        .rebuild_if_changed(&rules, &local_ips, &caps)
+        .unwrap());
+
+    let changed_local_ips = vec!["100.64.0.2".parse::<IpAddr>().unwrap()];
+    assert!(!filter.is_inputs_unchanged(&rules, &changed_local_ips, &caps));
+    assert!(filter
+        .rebuild_if_changed(&rules, &changed_local_ips, &caps)
+        .unwrap());
+    assert!(filter.is_inputs_unchanged(&rules, &changed_local_ips, &caps));
+
+    let mut changed_caps = BTreeMap::new();
+    changed_caps.insert(
+        "100.64.0.3".parse().unwrap(),
+        BTreeSet::from(["example-cap".to_string()]),
+    );
+    assert!(!filter.is_inputs_unchanged(&rules, &changed_local_ips, &changed_caps));
+
+    let allow_all = Filter::allow_all();
+    assert!(!allow_all.is_inputs_unchanged(&rules, &local_ips, &caps));
+}

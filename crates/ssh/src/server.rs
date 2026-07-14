@@ -2,12 +2,17 @@
 
 use crate::auth::{eval_ssh_policy, ConnInfo, EvalResult};
 use crate::env::accept_env_pair;
+use crate::recording::{default_recording_path, CastHeader, RecordingConfig};
+use crate::recording_upload::DialFn;
 use crate::session::{PeerIdentity, Pty, SessionInit, Window};
+use crate::session_handler::init_recording;
 use russh::keys::PrivateKey;
 use russh::server::{Auth, Msg, Server as RusshServer, Session};
 use russh::{Channel, ChannelId, MethodSet};
 use rustscale_tailcfg::{Node, SSHPolicy, UserProfile};
 use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -19,6 +24,12 @@ pub struct SshServerConfig {
     pub session_tx: mpsc::Sender<SessionInit>,
     pub whois: WhoIsCallback,
     pub policy: PolicyCallback,
+    /// State directory used for the local recording fallback.
+    pub state_dir: Option<PathBuf>,
+    /// Tailnet TCP dialer for recorder nodes.
+    pub dial_fn: Option<DialFn>,
+    /// MagicDNS name of this SSH server, included in recording headers.
+    pub source_node: String,
 }
 
 pub struct SshServer {
@@ -61,11 +72,32 @@ impl RusshServer for SshServer {
             command: String::new(),
             signal_tx: None,
             window_change_tx: None,
+            recording_config: None,
+            connection_id: next_connection_id(),
         }
     }
     fn handle_session_error(&mut self, error: <Self::Handler as russh::server::Handler>::Error) {
         log::error!("SSH session error: {error:?}");
     }
+}
+
+fn next_connection_id() -> String {
+    static NEXT_CONNECTION: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    let sequence = u128::from(NEXT_CONNECTION.fetch_add(1, Ordering::Relaxed));
+    let value = (nanos << 16) ^ sequence;
+    // UUID-shaped, unique per process; its version and variant bits retain the
+    // established v4 representation without requiring another dependency.
+    format!(
+        "{:08x}-{:04x}-4{:03x}-8{:03x}-{:012x}",
+        value >> 96,
+        (value >> 80) & 0xffff,
+        (value >> 68) & 0x0fff,
+        (value >> 52) & 0x0fff,
+        value & 0x000f_ffff_ffff_ffff_ffff
+    )
 }
 
 pub struct SshHandler {
@@ -81,6 +113,8 @@ pub struct SshHandler {
     command: String,
     signal_tx: Option<mpsc::Sender<russh::Sig>>,
     window_change_tx: Option<mpsc::Sender<Window>>,
+    recording_config: Option<RecordingConfig>,
+    connection_id: String,
 }
 
 impl SshHandler {
@@ -127,6 +161,7 @@ impl SshHandler {
         match &result {
             EvalResult::Accept {
                 action,
+                action0,
                 local_user,
                 accept_env,
             } => {
@@ -146,6 +181,44 @@ impl SshHandler {
                 self.local_user.clone_from(local_user);
                 self.accept_env.clone_from(accept_env);
                 self.peer_identity = Some(PeerIdentity { node, user_profile });
+                let recorders = if action.Recorders.is_empty() {
+                    action0
+                        .as_ref()
+                        .map_or_else(Vec::new, |initial| initial.Recorders.clone())
+                } else {
+                    action.Recorders.clone()
+                };
+                let on_failure = action.OnRecordingFailure.clone().or_else(|| {
+                    action0
+                        .as_ref()
+                        .and_then(|initial| initial.OnRecordingFailure.clone())
+                });
+                if on_failure
+                    .as_ref()
+                    .is_some_and(|failure| !failure.NotifyURL.is_empty())
+                {
+                    log::warn!("SSH recording NotifyURL is not implemented yet");
+                }
+                let local_path = if recorders.is_empty() {
+                    self.config
+                        .state_dir
+                        .as_deref()
+                        .and_then(|state_dir| default_recording_path(state_dir).ok())
+                } else {
+                    None
+                };
+                self.recording_config = if recorders.is_empty() && local_path.is_none() {
+                    None
+                } else {
+                    Some(RecordingConfig {
+                        recorders,
+                        fail_open: on_failure
+                            .as_ref()
+                            .is_none_or(|failure| failure.RejectSessionWithMessage.is_empty()),
+                        on_failure,
+                        local_path,
+                    })
+                };
                 Auth::Accept
             }
             EvalResult::RejectedUser => {
@@ -180,6 +253,31 @@ impl SshHandler {
         let peer = self.peer_identity.clone().unwrap_or_default();
         let peer_addr = self.peer_addr;
 
+        let recording_config = self.recording_config.clone();
+        let mut cast_header = CastHeader::new(
+            self.pty
+                .as_ref()
+                .map_or((0, 0), |pty| (pty.window.width, pty.window.height)),
+            self.command.clone(),
+            self.env_vars.iter().cloned().collect(),
+            self.ssh_user.clone(),
+            self.local_user.clone(),
+            self.connection_id.clone(),
+        );
+        cast_header.src_node.clone_from(&self.config.source_node);
+        let recorder = match &recording_config {
+            Some(config) => {
+                match init_recording(config, cast_header, self.config.dial_fn.clone()).await {
+                    Ok(recorder) => recorder,
+                    Err(message) => {
+                        let _ = session.data(channel_id, russh::CryptoVec::from(message));
+                        let _ = session.channel_failure(channel_id);
+                        return Ok(());
+                    }
+                }
+            }
+            None => None,
+        };
         let init = SessionInit {
             peer,
             ssh_user: self.ssh_user.clone(),
@@ -190,7 +288,8 @@ impl SshHandler {
             channel_id,
             data_rx,
             done_tx,
-            recorder: None,
+            recorder,
+            recording_config,
             signal_rx,
             window_change_rx,
             peer_addr,
@@ -428,6 +527,9 @@ mod tests {
             session_tx,
             whois,
             policy,
+            state_dir: None,
+            dial_fn: None,
+            source_node: String::new(),
         };
         let mut server = SshServer::new(config);
         <SshServer as RusshServer>::new_client(&mut server, Some(SocketAddr::new(peer_ip(), 22)))

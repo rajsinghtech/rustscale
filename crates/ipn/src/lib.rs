@@ -19,6 +19,7 @@
 
 mod backend;
 mod bus;
+mod captiveportal;
 mod machine;
 pub mod prefs;
 mod profiles;
@@ -26,6 +27,7 @@ pub mod store;
 
 pub use backend::{BackendInputs, IpnBackend};
 pub use bus::{NotifyBus, NotifyBusReceiver};
+pub use captiveportal::CaptivePortalWatcher;
 pub use machine::{next_state, StateMachineInputs};
 pub use prefs::{AppConnectorPrefs, MaskedPrefs, Prefs, StartOptions};
 pub use profiles::{

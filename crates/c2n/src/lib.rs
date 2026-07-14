@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use async_trait::async_trait;
+use rustscale_tailcfg::C2NPostureIdentityResponse;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -131,6 +132,13 @@ pub trait C2nBackend: Send + Sync {
     /// Per-label socket TX/RX byte counters as JSON (the body for
     /// `POST /sockstats`). `None` if no sockstats registry is wired up.
     async fn sockstats_json(&self) -> Option<serde_json::Value> {
+        None
+    }
+
+    /// Serial numbers and hardware addresses for device posture.
+    ///
+    /// A `None` response means the backend does not support posture identity.
+    async fn posture_identity(&self) -> Option<C2NPostureIdentityResponse> {
         None
     }
 }
@@ -446,6 +454,7 @@ const KNOWN_PATHS: &[&str] = &[
     "/logtail/flush",
     "/sockstats",
     "/tls-cert-status",
+    "/posture/identity",
 ];
 
 fn known_paths() -> serde_json::Value {
@@ -514,6 +523,18 @@ async fn dispatch<W: AsyncWrite + Unpin>(
                 write_text_response(conn, 200, "OK", "sockstats: no sockstat logger wired up\n")
                     .await?;
             }
+        }
+        return Ok(());
+    }
+
+    // --- GET /posture/identity → device posture identity JSON ---
+    if method == "GET" && path == "/posture/identity" {
+        if let Some(response) = backend.posture_identity().await {
+            let body = serde_json::to_value(response).unwrap_or(serde_json::Value::Null);
+            write_json_response(conn, 200, "OK", &body).await?;
+        } else {
+            let body = serde_json::json!({"error": "posture identity not available"});
+            write_json_response(conn, 501, "Not Implemented", &body).await?;
         }
         return Ok(());
     }
@@ -940,6 +961,39 @@ mod tests {
         (addr, log_level)
     }
 
+    struct PostureBackend {
+        posture_disabled: bool,
+    }
+
+    #[async_trait]
+    impl C2nBackend for PostureBackend {
+        async fn whois(&self, _ip: IpAddr) -> Option<WhoIsResult> {
+            Some(WhoIsResult {
+                found: true,
+                node_name: "posture.".into(),
+                user_id: 1,
+                login_name: "posture@tailnet".into(),
+            })
+        }
+
+        async fn posture_identity(&self) -> Option<C2NPostureIdentityResponse> {
+            Some(C2NPostureIdentityResponse {
+                serial_numbers: vec!["serial-1".into()],
+                iface_hardware_addrs: vec!["00:11:22:33:44:55".into()],
+                posture_disabled: self.posture_disabled,
+            })
+        }
+    }
+
+    async fn start_posture_server(posture_disabled: bool) -> SocketAddr {
+        let backend: Arc<dyn C2nBackend> = Arc::new(PostureBackend { posture_disabled });
+        let server = C2NServer::new(backend, "test".into());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(server.serve(listener));
+        addr
+    }
+
     // --- Handler status + content-type tests ---
 
     #[tokio::test]
@@ -1287,6 +1341,31 @@ mod tests {
         )
         .await;
         assert!(resp.contains("501 Not Implemented"));
+    }
+
+    #[tokio::test]
+    async fn c2n_posture_identity_dispatch() {
+        let addr = start_posture_server(false).await;
+        let resp = send_request(
+            addr,
+            b"GET /posture/identity HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(resp.contains("200 OK"));
+        assert!(resp.contains("\"serialNumbers\":[\"serial-1\"]"));
+        assert!(resp.contains("\"ifaceHardwareAddrs\":[\"00:11:22:33:44:55\"]"));
+    }
+
+    #[tokio::test]
+    async fn c2n_posture_disabled() {
+        let addr = start_posture_server(true).await;
+        let resp = send_request(
+            addr,
+            b"GET /posture/identity HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(resp.contains("200 OK"));
+        assert!(resp.contains("\"postureDisabled\":true"));
     }
 
     #[tokio::test]

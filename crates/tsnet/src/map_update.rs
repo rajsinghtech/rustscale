@@ -33,6 +33,7 @@ pub(crate) fn spawn_map_update_task(
     mut node_key: NodePrivate,
     filter_arc: Arc<std::sync::Mutex<Filter>>,
     tailscale_ips: Vec<IpAddr>,
+    control_url: String,
     accept_routes: bool,
     advertise_routes: Vec<String>,
     resolver: Arc<RwLock<MagicDnsResolver>>,
@@ -81,7 +82,28 @@ pub(crate) fn spawn_map_update_task(
                     health.set_healthy(WARN_NOT_IN_MAP_POLL);
                     send_health_notify(&health, &ipn_backend);
 
+                    if let Some(derp_map) = resp.DERPMap.as_ref() {
+                        magicsock.set_derp_map(derp_map);
+                    }
+
                     if resp.KeepAlive {
+                        if let Some(router) = router.as_ref() {
+                            let routes = route_table.read().await;
+                            if routes.exit_node().is_some() {
+                                let derp_map = magicsock.get_derp_map();
+                                if let Err(error) = sync_router(
+                                    router,
+                                    &tailscale_ips,
+                                    &routes,
+                                    derp_map.as_ref(),
+                                    &control_url,
+                                ) {
+                                    eprintln!(
+                                        "tsnet: bypass-route update failed (non-fatal): {error}"
+                                    );
+                                }
+                            }
+                        }
                         continue;
                     }
 
@@ -318,7 +340,14 @@ pub(crate) fn spawn_map_update_task(
                     let mut routes = route_table.write().await;
                     routes.rebuild_with_opts(&peers, accept_routes);
                     if let Some(router) = router.as_ref() {
-                        if let Err(error) = sync_router(router, &tailscale_ips, &routes) {
+                        let derp_map = magicsock.get_derp_map();
+                        if let Err(error) = sync_router(
+                            router,
+                            &tailscale_ips,
+                            &routes,
+                            derp_map.as_ref(),
+                            &control_url,
+                        ) {
                             eprintln!("tsnet: route update failed (non-fatal): {error}");
                         }
                     }

@@ -498,6 +498,8 @@ impl Platform for LinuxPlatform {
                     "add".into(),
                     "throw".into(),
                     prefix.to_string(),
+                    "table".into(),
+                    "52".into(),
                 ]);
                 args
             })],
@@ -511,6 +513,8 @@ impl Platform for LinuxPlatform {
                     "del".into(),
                     "throw".into(),
                     prefix.to_string(),
+                    "table".into(),
+                    "52".into(),
                 ]);
                 args
             })],
@@ -692,6 +696,43 @@ mod tests {
                 RouterOperation::AddRoute(prefix("10.0.0.0/8")),
                 RouterOperation::AddLocalRoute(prefix("192.168.0.0/16")),
             ]
+        );
+    }
+
+    #[test]
+    fn local_route_diff_removes_before_adding_replacements() {
+        let mut previous = config();
+        previous.local_routes = vec![prefix("192.168.0.0/16")];
+        let mut next = config();
+        next.local_routes = vec![prefix("10.0.0.0/8")];
+
+        assert_eq!(
+            diff(Some(&previous), &next).operations(),
+            [
+                RouterOperation::RemoveLocalRoute(prefix("192.168.0.0/16")),
+                RouterOperation::AddLocalRoute(prefix("10.0.0.0/8")),
+            ]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_local_routes_use_tailscale_table_52() {
+        let platform = LinuxPlatform::new("tailscale0");
+        let commands = platform.commands(&RouterOperation::AddLocalRoute(prefix("192.0.2.0/24")));
+        assert_eq!(
+            commands,
+            vec![(
+                ("ip").into(),
+                vec![
+                    "route".into(),
+                    "add".into(),
+                    "throw".into(),
+                    "192.0.2.0/24".into(),
+                    "table".into(),
+                    "52".into(),
+                ]
+            )]
         );
     }
 

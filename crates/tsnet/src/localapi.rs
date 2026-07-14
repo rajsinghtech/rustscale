@@ -581,7 +581,20 @@ pub(crate) async fn apply_exit_node_prefs(prefs: &Prefs, state: &Arc<LocalApiSta
         let mut routes = rt.write().await;
         routes.clear_exit_node();
         if let Some(router) = state.router.as_ref() {
-            if let Err(error) = crate::sync_router(router, &state.tailscale_ips, &routes) {
+            let derp_map = state.magicsock.get_derp_map();
+            let control_url = state.prefs.read().await.ControlURL.clone();
+            let control_url = if control_url.is_empty() {
+                crate::DEFAULT_CONTROL_URL
+            } else {
+                &control_url
+            };
+            if let Err(error) = crate::sync_router(
+                router,
+                &state.tailscale_ips,
+                &routes,
+                derp_map.as_ref(),
+                control_url,
+            ) {
                 eprintln!("tsnet: route update failed (non-fatal): {error}");
             }
         }
@@ -598,7 +611,20 @@ pub(crate) async fn apply_exit_node_prefs(prefs: &Prefs, state: &Arc<LocalApiSta
         routes.clear_exit_node();
     }
     if let Some(router) = state.router.as_ref() {
-        if let Err(error) = crate::sync_router(router, &state.tailscale_ips, &routes) {
+        let derp_map = state.magicsock.get_derp_map();
+        let control_url = state.prefs.read().await.ControlURL.clone();
+        let control_url = if control_url.is_empty() {
+            crate::DEFAULT_CONTROL_URL
+        } else {
+            &control_url
+        };
+        if let Err(error) = crate::sync_router(
+            router,
+            &state.tailscale_ips,
+            &routes,
+            derp_map.as_ref(),
+            control_url,
+        ) {
             eprintln!("tsnet: route update failed (non-fatal): {error}");
         }
     }

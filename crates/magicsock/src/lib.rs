@@ -1120,6 +1120,9 @@ impl Magicsock {
 
         // Configure the socket selected above, whether it came from
         // `udp_socket` or `udp_bind`, before probing/spawning UDP I/O.
+        if let Some(socket) = udp.as_deref() {
+            rustscale_netns::configure_udp_socket(socket)?;
+        }
         configure_selected_udp_socket(udp.as_deref(), udp_socket_buffers::configure);
 
         #[cfg(target_os = "linux")]
@@ -1219,6 +1222,26 @@ impl Magicsock {
     /// The home DERP region ID.
     pub fn home_derp_region(&self) -> i32 {
         self.inner.derp.home_region()
+    }
+
+    /// Replace the DERP map used for lazy DERP connections.
+    pub fn set_derp_map(&self, map: &DERPMap) {
+        *self
+            .inner
+            .derp
+            .derp_map
+            .write()
+            .expect("derp_map lock poisoned") = Some(map.clone());
+    }
+
+    /// Return a snapshot of the latest DERP map, if one has been supplied.
+    pub fn get_derp_map(&self) -> Option<DERPMap> {
+        self.inner
+            .derp
+            .derp_map
+            .read()
+            .expect("derp_map lock poisoned")
+            .clone()
     }
 
     /// Update the node private key after a key rotation. Updates the

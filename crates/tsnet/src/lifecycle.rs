@@ -115,6 +115,7 @@ impl Server {
             b.node_key.clone(),
             b.filter.clone(),
             b.tailscale_ips.clone(),
+            b.control_url.clone(),
             self.config.accept_routes,
             b.advertise_routes.clone(),
             b.resolver.clone(),
@@ -626,6 +627,7 @@ impl Server {
             b.node_key.clone(),
             b.filter.clone(),
             b.tailscale_ips.clone(),
+            b.control_url.clone(),
             self.config.accept_routes,
             b.advertise_routes.clone(),
             b.resolver.clone(),
@@ -994,12 +996,13 @@ impl Server {
         // Apply stored exit-node pref on start (survives restart).
         let stored_prefs = self.load_prefs().unwrap_or_default();
         if !stored_prefs.ExitNodeIP.is_empty() || !stored_prefs.ExitNodeID.is_empty() {
-            let (peers, route_table, router, tailscale_ips) = match self.inner.as_ref() {
+            let (peers, route_table, router, tailscale_ips, magicsock) = match self.inner.as_ref() {
                 Some(inner) => (
                     inner.peers.clone(),
                     inner.route_table.clone(),
                     inner.router.clone(),
                     inner.tailscale_ips.clone(),
+                    inner.magicsock.clone(),
                 ),
                 None => return Ok(self.status()),
             };
@@ -1014,7 +1017,14 @@ impl Server {
                 let mut routes = route_table.write().await;
                 routes.set_exit_node(peer_key);
                 if let Some(router) = router.as_ref() {
-                    sync_router(router, &tailscale_ips, &routes)?;
+                    let derp_map = magicsock.get_derp_map();
+                    sync_router(
+                        router,
+                        &tailscale_ips,
+                        &routes,
+                        derp_map.as_ref(),
+                        &self.config.control_url,
+                    )?;
                 }
                 log::info!("tsnet: applied stored exit-node pref: {ip_or_name}");
             } else {

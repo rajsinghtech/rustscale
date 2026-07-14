@@ -1,5 +1,6 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
+use crate::routing::resolve_control_server_ips;
 
 /// TUN data-plane pump: TUN device <-> WG <-> magicsock.
 ///
@@ -424,7 +425,53 @@ pub(crate) type SharedRouter = Arc<std::sync::Mutex<Box<dyn rustscale_router::Ro
 pub(crate) fn build_router_config(
     local_addrs: &[IpAddr],
     route_table: &RouteTable,
+    derp_map: Option<&DERPMap>,
+    control_url: &str,
 ) -> rustscale_router::RouterConfig {
+    let mut local_routes = Vec::new();
+    if route_table.exit_node().is_some() {
+        if let Some(derp_map) = derp_map {
+            for region in derp_map.Regions.values() {
+                for node in region.Nodes.iter().flatten() {
+                    if node.STUNOnly {
+                        continue;
+                    }
+                    for address in [&node.IPv4, &node.IPv6] {
+                        if let Ok(ip) = address.parse::<IpAddr>() {
+                            if !ip.is_unspecified() {
+                                local_routes.push(rustscale_tsaddr::IpPrefix {
+                                    ip,
+                                    bits: if ip.is_ipv4() { 32 } else { 128 },
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        local_routes.extend(
+            resolve_control_server_ips(control_url)
+                .into_iter()
+                .map(|ip| rustscale_tsaddr::IpPrefix {
+                    ip,
+                    bits: if ip.is_ipv4() { 32 } else { 128 },
+                }),
+        );
+        local_routes.extend(rustscale_tsaddr::local_interface_prefixes());
+        local_routes.extend([
+            rustscale_tsaddr::IpPrefix {
+                ip: "127.0.0.0".parse().expect("valid IPv4 loopback prefix"),
+                bits: 8,
+            },
+            rustscale_tsaddr::IpPrefix {
+                ip: "::1".parse().expect("valid IPv6 loopback address"),
+                bits: 128,
+            },
+        ]);
+        local_routes.sort_by_key(|prefix| (prefix.ip, prefix.bits));
+        local_routes.dedup();
+    }
+
     let mut routes = vec![rustscale_tsaddr::cgnat_range()];
     for (net, bits, _) in route_table.entries() {
         // Exit-node defaults are controlled solely by `exit_node`; accepting
@@ -436,7 +483,7 @@ pub(crate) fn build_router_config(
     rustscale_router::RouterConfig {
         local_addrs: local_addrs.to_vec(),
         routes,
-        local_routes: vec![],
+        local_routes,
         exit_node: route_table.exit_node().is_some(),
     }
 }
@@ -446,8 +493,10 @@ pub(crate) fn sync_router(
     router: &SharedRouter,
     local_addrs: &[IpAddr],
     route_table: &RouteTable,
+    derp_map: Option<&DERPMap>,
+    control_url: &str,
 ) -> Result<(), TsnetError> {
-    let config = build_router_config(local_addrs, route_table);
+    let config = build_router_config(local_addrs, route_table, derp_map, control_url);
     router
         .lock()
         .map_err(|_| TsnetError::Builder("router lock poisoned".into()))?
@@ -472,7 +521,12 @@ pub(crate) async fn create_tun_device(
             .map_err(|error| TsnetError::Builder(format!("bring TUN interface up: {error}")))?;
         let route_config = {
             let route_table = b.route_table.read().await;
-            build_router_config(&b.tailscale_ips, &route_table)
+            build_router_config(
+                &b.tailscale_ips,
+                &route_table,
+                b.magicsock.get_derp_map().as_ref(),
+                &b.control_url,
+            )
         };
         if let Err(error) = router.set(&route_config) {
             let _ = router.close();
@@ -501,6 +555,7 @@ pub(crate) async fn create_tun_device(
 mod tests {
     use super::*;
     use rustscale_key::NodePrivate;
+    use rustscale_tailcfg::{DERPNode, DERPRegion};
 
     struct BatchProbe {
         events: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
@@ -509,6 +564,49 @@ mod tests {
     struct PendingProbe {
         replies_seen: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         polled: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<usize>>>,
+    }
+
+    #[test]
+    fn exit_node_router_config_includes_derp_control_and_loopback_bypasses() {
+        let exit_key = NodePrivate::generate().public();
+        let mut routes = RouteTable::default();
+        routes.set_exit_node(exit_key);
+        let mut derp_map = DERPMap::default();
+        derp_map.Regions.insert(
+            1,
+            DERPRegion {
+                Nodes: Some(vec![DERPNode {
+                    IPv4: "192.0.2.10".into(),
+                    IPv6: "2001:db8::10".into(),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            },
+        );
+
+        let config = build_router_config(&[], &routes, Some(&derp_map), "https://127.0.0.1");
+        for prefix in [
+            "192.0.2.10/32",
+            "2001:db8::10/128",
+            "127.0.0.1/32",
+            "127.0.0.0/8",
+            "::1/128",
+        ] {
+            assert!(
+                config
+                    .local_routes
+                    .contains(&rustscale_tsaddr::IpPrefix::parse(prefix).unwrap()),
+                "missing bypass route {prefix}",
+            );
+        }
+    }
+
+    #[test]
+    fn control_server_resolution_returns_host_prefixes() {
+        assert_eq!(
+            resolve_control_server_ips("https://127.0.0.1:8443"),
+            vec!["127.0.0.1".parse().unwrap()]
+        );
     }
 
     #[async_trait::async_trait]

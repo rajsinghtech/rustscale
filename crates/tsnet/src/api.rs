@@ -448,7 +448,14 @@ impl Server {
         let mut routes = inner.route_table.write().await;
         routes.set_exit_node(peer_key);
         if let Some(router) = inner.router.as_ref() {
-            sync_router(router, &inner.tailscale_ips, &routes)?;
+            let derp_map = inner.magicsock.get_derp_map();
+            sync_router(
+                router,
+                &inner.tailscale_ips,
+                &routes,
+                derp_map.as_ref(),
+                &self.config.control_url,
+            )?;
         }
         if matches!(inner.data_plane, DataPlane::Tun) {
             break_tcp_conns_best_effort();
@@ -470,7 +477,14 @@ impl Server {
         let mut routes = inner.route_table.write().await;
         routes.clear_exit_node();
         if let Some(router) = inner.router.as_ref() {
-            sync_router(router, &inner.tailscale_ips, &routes)?;
+            let derp_map = inner.magicsock.get_derp_map();
+            sync_router(
+                router,
+                &inner.tailscale_ips,
+                &routes,
+                derp_map.as_ref(),
+                &self.config.control_url,
+            )?;
         }
         if matches!(inner.data_plane, DataPlane::Tun) {
             break_tcp_conns_best_effort();

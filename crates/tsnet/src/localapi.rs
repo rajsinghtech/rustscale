@@ -2224,7 +2224,7 @@ fn resolve_dial_addr(addr: &str, peers: &[Node]) -> Option<SocketAddr> {
     let host_lower = host.trim_end_matches('.').to_lowercase();
     for peer in peers {
         let peer_name = peer.Name.trim_end_matches('.').to_lowercase();
-        let first_label = peer_name.split('.').next().unwrap_or("");
+        let first_label = rustscale_dnsname::first_label(&peer_name);
         if peer_name == host_lower || first_label == host_lower {
             for cidr in &peer.Addresses {
                 if let Some(ip_str) = cidr.split('/').next() {
@@ -2623,7 +2623,7 @@ async fn handle_dns_query<W: AsyncWrite + Unpin>(
 
     for peer in peers.iter() {
         let peer_name = peer.Name.trim_end_matches('.').to_lowercase();
-        let first_label = peer_name.split('.').next().unwrap_or("");
+        let first_label = rustscale_dnsname::first_label(&peer_name);
         if peer_name == name_trimmed || first_label == name_trimmed {
             for addr in &peer.Addresses {
                 if let Some(ip) = addr.split('/').next() {

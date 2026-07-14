@@ -99,7 +99,8 @@ once when the TUN pump starts; do not read the environment in the packet path.
    publishing `OPENED`. No tunnel guard or borrow may cross a channel or await.
    The pump reacquires the guard for ordered commit. Do not hold the
    tunnels-map read lock during cryptography or I/O.
-10. An opened item owns an opaque session-generation token, receiver/session
+10. An opened item owns an opaque scalar-eligibility token covering session
+    generation plus queued-packet/handshake-output generation, receiver/session
     identity, counter, authenticated-open outcome metadata, and its plaintext
     destination range, but no exported key or borrowed input. Quick replay
     validation happens before open. Replay marking, current-session selection,
@@ -108,12 +109,14 @@ once when the TUN pump starts; do not read the environment in the packet path.
 11. Preflight the complete burst without mutation before the first AEAD open.
     Handshake, cookie, malformed, empty, queued-output, wrong-index,
     no-session, key-rotation-boundary, and mixed-protocol bursts wait for the
-    prior burst to reach `EMPTY` and use the scalar path. If any session token
-    becomes stale before commit, discard every speculative plaintext result
-    and run the complete original ciphertext burst through the scalar path.
-    The original ciphertext remains unchanged and owned until that decision.
-    One-packet data bursts may use the pipeline but must not create a thread or
-    allocation per packet.
+    prior burst to reach `EMPTY` and use the scalar path. After any arbitration
+    opportunity and before the first commit, rerun the complete mutation-free
+    eligibility preflight. If any session or queued-output state changed,
+    discard every speculative plaintext result and run the complete original
+    ciphertext burst, including its required empty-datagram output loop,
+    through the scalar path. The original ciphertext remains unchanged and
+    owned until that decision. One-packet data bursts may use the pipeline but
+    must not create a thread or allocation per packet.
 12. Bound changed arbitration. At most one inbound burst may be prefetched.
     After N reaches `EMPTY`, give the outer pump loop one opportunity to
     service an already-ready outbound TUN read or timer before committing or
@@ -141,21 +144,24 @@ the crate's conventions, but the semantic split is mandatory:
 1. **Preflight/prepare:** prove every item in the complete burst is eligible
    established transport data and that queued scalar output is absent. Parse
    and rate-check each datagram, resolve its session slot and receiver index,
-   extract its counter, capture an opaque generation token, and run the
+   extract its counter, capture an opaque scalar-eligibility token covering the
+   receive session and queued-packet/handshake-output state, and run the
    existing quick replay-window check. Do not mark replay state, tick timers,
    select a current session, or update accounting.
 2. **Open:** in one synchronous non-awaiting scope, use the resolved session's
    existing `ring::aead::LessSafeKey` to copy-then-open into caller-owned
    destination storage. Consume every borrowed session and encrypted-input
    value before returning an owned authenticated outcome containing the
-   generation token, session identity, counter, and plaintext length/range.
-   Do not expose or clone the key and do not commit protocol state. A prepared
-   borrowed value must never be stored self-referentially in the owning burst
-   or sent through a channel.
-3. **Commit:** validate every opaque generation token after the pump reacquires
-   the tunnel. If any token is stale, return a stale-burst outcome without
-   mutation so the caller can discard speculative plaintext and use scalar
-   decapsulation on the retained ciphertext. Otherwise mark replay counters,
+   scalar-eligibility token, session identity, counter, and plaintext
+   length/range. Do not expose or clone the key and do not commit protocol
+   state. A prepared borrowed value must never be stored self-referentially in
+   the owning burst or sent through a channel.
+3. **Commit:** rerun complete mutation-free eligibility and validate every
+   opaque token after the pump reacquires the tunnel. If the receive session,
+   queued packets, or handshake-output state changed, return a stale-burst
+   outcome without mutation so the caller can discard speculative plaintext
+   and use scalar decapsulation plus its empty-datagram output loop on the
+   retained ciphertext. Otherwise mark replay counters,
    update `current`, tick `TimeLastPacketReceived`, validate/truncate IPv4 or
    IPv6 plaintext, tick `TimeLastDataPacketReceived`, and update `rx_bytes` in
    the same per-packet order as the scalar path. Keepalive and every error must
@@ -223,8 +229,9 @@ and record the measured scalar/pipeline results here.
   replies, keepalives, malformed packets, and decrypt failures match scalar
   results and reply order.
 - Whole-burst preflight proves that a scalar-only item at the tail prevents
-  every earlier data item from opening; a session becoming stale after open
-  discards all speculative results and produces byte-identical scalar output.
+  every earlier data item from opening; a session or queued-output generation
+  becoming stale after open discards all speculative results and produces
+  byte-identical scalar output and replies.
 - Duplicate counters in one burst and across the slot boundary, reverse-order
   counters within the replay window, too-old and large-gap counters, a corrupt
   tag followed by valid same-counter data, and session/key rotation boundaries

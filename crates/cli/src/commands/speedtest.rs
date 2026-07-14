@@ -83,11 +83,50 @@ fn parse_speedtest_args(args: &[String]) -> Result<SpeedtestArgs, CliError> {
     }
 
     Ok(SpeedtestArgs {
-        host,
+        host: normalize_host(&host)?,
         duration,
         server,
         reverse,
     })
+}
+
+/// Add speedtest's default port when `host` has none, following Go's
+/// `SplitHostPort`/`JoinHostPort` behavior. Explicit service-name ports are
+/// preserved for Tokio's downstream address resolution.
+fn normalize_host(host: &str) -> Result<String, CliError> {
+    if host.is_empty() || host.chars().any(char::is_whitespace) {
+        return Err(CliError(format!("invalid --host value: {host}")));
+    }
+    if let Some(bracketed) = host.strip_prefix('[') {
+        let Some((ip, port)) = bracketed.split_once("]:") else {
+            return Err(CliError(format!("invalid --host value: {host}")));
+        };
+        if ip.parse::<std::net::Ipv6Addr>().is_err() || port.is_empty() || port.contains(']') {
+            return Err(CliError(format!("invalid --host value: {host}")));
+        }
+        return Ok(host.into());
+    }
+
+    let colon_count = host.bytes().filter(|byte| *byte == b':').count();
+    match colon_count {
+        0 => {
+            if host.contains(['[', ']']) {
+                return Err(CliError(format!("invalid --host value: {host}")));
+            }
+            Ok(format!("{host}:{}", speedtest::DEFAULT_PORT))
+        }
+        1 => {
+            let (name, port) = host.split_once(':').expect("one colon");
+            if port.is_empty() || name.contains(['[', ']']) {
+                return Err(CliError(format!("invalid --host value: {host}")));
+            }
+            Ok(host.into())
+        }
+        _ => match host.parse::<std::net::Ipv6Addr>() {
+            Ok(ip) => Ok(format!("[{ip}]:{}", speedtest::DEFAULT_PORT)),
+            Err(_) => Err(CliError(format!("invalid --host value: {host}"))),
+        },
+    }
 }
 
 fn print_help() {
@@ -190,5 +229,33 @@ mod tests {
         assert_eq!(parsed.duration, Duration::from_secs(10));
         assert!(parsed.server);
         assert!(parsed.reverse);
+    }
+
+    #[test]
+    fn normalizes_speedtest_hosts() {
+        let default_host = format!(":{}", speedtest::DEFAULT_PORT);
+        for (input, want) in [
+            (
+                "example.test",
+                format!("example.test:{}", speedtest::DEFAULT_PORT),
+            ),
+            (
+                "192.0.2.1",
+                format!("192.0.2.1:{}", speedtest::DEFAULT_PORT),
+            ),
+            ("[2001:db8::1]:4444", "[2001:db8::1]:4444".into()),
+            (
+                "2001:db8::1",
+                format!("[2001:db8::1]:{}", speedtest::DEFAULT_PORT),
+            ),
+            ("example.test:4444", "example.test:4444".into()),
+            ("example.test:http", "example.test:http".into()),
+            (&default_host, default_host.clone()),
+        ] {
+            assert_eq!(normalize_host(input).unwrap(), want);
+        }
+        for malformed in ["", "[2001:db8::1]", "example.test:", "bad host"] {
+            assert!(normalize_host(malformed).is_err(), "{malformed}");
+        }
     }
 }

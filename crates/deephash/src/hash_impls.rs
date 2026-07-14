@@ -406,6 +406,31 @@ impl DeepHash for Prefs {
 impl DeepHash for MaskedPrefs {
     fn deep_hash(&self, h: &mut Hasher) {
         self.Prefs.deep_hash(h);
+        self.ControlURLSet.deep_hash(h);
+        self.WantRunningSet.deep_hash(h);
+        self.LoggedOutSet.deep_hash(h);
+        self.RouteAllSet.deep_hash(h);
+        self.ExitNodeIDSet.deep_hash(h);
+        self.ExitNodeIPSet.deep_hash(h);
+        self.CorpDNSSet.deep_hash(h);
+        self.ShieldsUpSet.deep_hash(h);
+        self.HostnameSet.deep_hash(h);
+        self.AdvertiseRoutesSet.deep_hash(h);
+        self.AdvertiseTagsSet.deep_hash(h);
+        self.OperatorUserSet.deep_hash(h);
+        self.EphemeralSet.deep_hash(h);
+        self.AcceptRoutesSet.deep_hash(h);
+        self.AdvertiseExitNodeSet.deep_hash(h);
+        self.ExitNodeAllowLANAccessSet.deep_hash(h);
+        self.AutoUpdateSet.deep_hash(h);
+        self.NetfilterModeSet.deep_hash(h);
+        self.NoSNATSet.deep_hash(h);
+        self.PostureCheckingSet.deep_hash(h);
+        self.AppConnectorSet.deep_hash(h);
+        self.RunWebClientSet.deep_hash(h);
+        self.RunSSHSet.deep_hash(h);
+        self.NoStatefulFilteringSet.deep_hash(h);
+        self.NoLogsNoSupportSet.deep_hash(h);
     }
 }
 impl DeepHash for State {

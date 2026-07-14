@@ -28,29 +28,9 @@ pub async fn run(args: Vec<String>, socket: &Path, json: bool) -> Result<(), Cli
 
     // Check backend state — print a human-readable description for
     // non-running states, mirroring Go's isRunningOrStarting.
-    let backend_state = status
-        .get("BackendState")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("NoState");
-
-    match backend_state {
-        "Running" | "Starting" => {}
-        "Stopped" => {
-            println!("rustscale is stopped.");
-            return Ok(());
-        }
-        "NeedsLogin" => {
-            println!("Logged out.");
-            return Ok(());
-        }
-        "NeedsMachineAuth" => {
-            println!("Machine is not yet approved by tailnet admin.");
-            return Ok(());
-        }
-        other => {
-            println!("unexpected state: {other}");
-            return Ok(());
-        }
+    if let Some(description) = backend_state_description(&status) {
+        println!("{description}");
+        return Ok(());
     }
 
     // Print health warnings if present (Go prints these before the table
@@ -133,6 +113,32 @@ pub async fn run(args: Vec<String>, socket: &Path, json: bool) -> Result<(), Cli
     }
 
     Ok(())
+}
+
+/// Return the standard user-facing description for a state that cannot yet
+/// service tailnet operations. `Running` and `Starting` are usable.
+pub(crate) fn backend_state_description(status: &Value) -> Option<String> {
+    match status
+        .get("BackendState")
+        .and_then(Value::as_str)
+        .unwrap_or("NoState")
+    {
+        "Running" | "Starting" => None,
+        "Stopped" => Some("Tailscale is stopped.".into()),
+        "NeedsLogin" => {
+            let auth_url = status
+                .get("AuthURL")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if auth_url.is_empty() {
+                Some("Logged out.".into())
+            } else {
+                Some(format!("Logged out.\nLog in at: {auth_url}"))
+            }
+        }
+        "NeedsMachineAuth" => Some("Machine is not yet approved by tailnet admin.".into()),
+        other => Some(format!("unexpected state: {other}")),
+    }
 }
 
 struct PeerEntry {

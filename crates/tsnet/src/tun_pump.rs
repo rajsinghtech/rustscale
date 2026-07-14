@@ -427,6 +427,25 @@ pub(crate) fn build_router_config(
     route_table: &RouteTable,
     derp_map: Option<&DERPMap>,
     control_url: &str,
+    exit_node_allow_lan_access: bool,
+) -> rustscale_router::RouterConfig {
+    build_router_config_with_local_routes(
+        local_addrs,
+        route_table,
+        derp_map,
+        control_url,
+        exit_node_allow_lan_access,
+        rustscale_tsaddr::local_interface_prefixes(),
+    )
+}
+
+fn build_router_config_with_local_routes(
+    local_addrs: &[IpAddr],
+    route_table: &RouteTable,
+    derp_map: Option<&DERPMap>,
+    control_url: &str,
+    exit_node_allow_lan_access: bool,
+    local_interface_prefixes: Vec<rustscale_tsaddr::IpPrefix>,
 ) -> rustscale_router::RouterConfig {
     let mut local_routes = Vec::new();
     if route_table.exit_node().is_some() {
@@ -457,7 +476,9 @@ pub(crate) fn build_router_config(
                     bits: if ip.is_ipv4() { 32 } else { 128 },
                 }),
         );
-        local_routes.extend(rustscale_tsaddr::local_interface_prefixes());
+        if exit_node_allow_lan_access {
+            local_routes.extend(local_interface_prefixes);
+        }
         local_routes.extend([
             rustscale_tsaddr::IpPrefix {
                 ip: "127.0.0.0".parse().expect("valid IPv4 loopback prefix"),
@@ -495,8 +516,15 @@ pub(crate) fn sync_router(
     route_table: &RouteTable,
     derp_map: Option<&DERPMap>,
     control_url: &str,
+    exit_node_allow_lan_access: bool,
 ) -> Result<(), TsnetError> {
-    let config = build_router_config(local_addrs, route_table, derp_map, control_url);
+    let config = build_router_config(
+        local_addrs,
+        route_table,
+        derp_map,
+        control_url,
+        exit_node_allow_lan_access,
+    );
     router
         .lock()
         .map_err(|_| TsnetError::Builder("router lock poisoned".into()))?
@@ -512,6 +540,7 @@ pub(crate) async fn create_tun_device(
     config: &TunModeConfig,
     b: &Bootstrap,
     _accept_routes: bool,
+    exit_node_allow_lan_access: bool,
 ) -> Result<(Arc<dyn Tun>, Option<SharedRouter>), TsnetError> {
     let dev = rustscale_tun::create(&config.tun)?;
     let router = if config.apply_routes {
@@ -526,6 +555,7 @@ pub(crate) async fn create_tun_device(
                 &route_table,
                 b.magicsock.get_derp_map().as_ref(),
                 &b.control_url,
+                exit_node_allow_lan_access,
             )
         };
         if let Err(error) = router.set(&route_config) {
@@ -545,6 +575,7 @@ pub(crate) async fn create_tun_device(
     _config: &TunModeConfig,
     _b: &Bootstrap,
     _accept_routes: bool,
+    _exit_node_allow_lan_access: bool,
 ) -> Result<(Arc<dyn Tun>, Option<SharedRouter>), TsnetError> {
     Err(TsnetError::Builder(
         "TUN mode not supported on this platform".into(),
@@ -567,7 +598,7 @@ mod tests {
     }
 
     #[test]
-    fn exit_node_router_config_includes_derp_control_and_loopback_bypasses() {
+    fn exit_node_router_config_respects_lan_access_preference() {
         let exit_key = NodePrivate::generate().public();
         let mut routes = RouteTable::default();
         routes.set_exit_node(exit_key);
@@ -584,7 +615,43 @@ mod tests {
             },
         );
 
-        let config = build_router_config(&[], &routes, Some(&derp_map), "https://127.0.0.1");
+        let lan_prefix = rustscale_tsaddr::IpPrefix::parse("192.168.0.0/16").unwrap();
+        let config = build_router_config_with_local_routes(
+            &[],
+            &routes,
+            Some(&derp_map),
+            "https://127.0.0.1",
+            false,
+            vec![lan_prefix],
+        );
+        for prefix in [
+            "192.0.2.10/32",
+            "2001:db8::10/128",
+            "127.0.0.1/32",
+            "127.0.0.0/8",
+            "::1/128",
+        ] {
+            assert!(
+                config
+                    .local_routes
+                    .contains(&rustscale_tsaddr::IpPrefix::parse(prefix).unwrap()),
+                "missing bypass route {prefix}",
+            );
+        }
+        assert!(
+            !config.local_routes.contains(&lan_prefix),
+            "LAN route {lan_prefix} must not bypass the exit node by default"
+        );
+
+        let config = build_router_config_with_local_routes(
+            &[],
+            &routes,
+            Some(&derp_map),
+            "https://127.0.0.1",
+            true,
+            vec![lan_prefix],
+        );
+        assert!(config.local_routes.contains(&lan_prefix));
         for prefix in [
             "192.0.2.10/32",
             "2001:db8::10/128",

@@ -25,6 +25,10 @@ impl Server {
         ensure_ring_provider();
 
         let b = self.bootstrap().await?;
+        let prefs = Arc::new(RwLock::new(self.load_prefs().unwrap_or_default()));
+        let exit_node_selection = Arc::new(RwLock::new(ExitNodeSelection::from_prefs(
+            &*prefs.read().await,
+        )));
         let audit_logger = Self::start_audit_logger(
             self.config.state_dir.clone(),
             self.config.control_url.clone(),
@@ -103,7 +107,7 @@ impl Server {
             disco_key: b.disco_key.clone(),
             capability_version: CAPABILITY_VERSION,
             protocol_version: PROTOCOL_VERSION,
-            shields_up: self.load_prefs().unwrap_or_default().ShieldsUp,
+            shields_up: prefs.read().await.ShieldsUp,
         };
         let map_update = spawn_map_update_task(
             b.map_rx,
@@ -112,6 +116,8 @@ impl Server {
             b.peers.clone(),
             b.route_table.clone(),
             None,
+            prefs.clone(),
+            exit_node_selection.clone(),
             b.node_key.clone(),
             b.filter.clone(),
             b.tailscale_ips.clone(),
@@ -319,7 +325,6 @@ impl Server {
         tasks.push(hostinfo_loop);
 
         // LocalAPI Unix-domain-socket server (optional, default OFF).
-        let prefs = Arc::new(RwLock::new(self.load_prefs().unwrap_or_default()));
         let localapi_socket = if self.config.localapi {
             let path = self.config.localapi_path.clone().unwrap_or_else(|| {
                 let dir = self
@@ -338,6 +343,7 @@ impl Server {
                 capture: capture.clone(),
                 metrics: localapi::default_metric_registry(),
                 prefs: prefs.clone(),
+                exit_node_selection: exit_node_selection.clone(),
                 tailscale_ips: b.tailscale_ips.clone(),
                 our_fqdn: b.our_fqdn.clone(),
                 hostname: self.config.hostname.clone(),
@@ -472,40 +478,23 @@ impl Server {
                 .unwrap_or_else(|| Arc::new(tokio::sync::Notify::new())),
             fallback_tcp_handlers: Arc::new(std::sync::Mutex::new(vec![])),
             fallback_next_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            prefs,
+            prefs: prefs.clone(),
+            exit_node_selection: exit_node_selection.clone(),
             proxy_mapper,
             portlist_ports,
             client_updater: client_updater.clone(),
             audit_logger,
         });
 
-        // Apply stored exit-node pref on start (survives restart).
-        // The peer list is populated from the first MapResponse, so we
-        // can resolve the exit node immediately.
-        let stored_prefs = self.load_prefs().unwrap_or_default();
-        if !stored_prefs.ExitNodeIP.is_empty() || !stored_prefs.ExitNodeID.is_empty() {
-            // Extract Arcs before awaiting — RunningState is !Sync due to
-            // os_dns_configurator, so &RunningState can't cross await points.
-            let (peers, route_table) = match self.inner.as_ref() {
-                Some(inner) => (inner.peers.clone(), inner.route_table.clone()),
-                None => return Ok(self.status()),
-            };
-            let ip_or_name = if stored_prefs.ExitNodeIP.is_empty() {
-                &stored_prefs.ExitNodeID
-            } else {
-                &stored_prefs.ExitNodeIP
-            };
-            let peers_guard = peers.read().await;
-            if let Some(peer_key) = localapi::resolve_exit_node_peer(&peers_guard, ip_or_name) {
-                drop(peers_guard);
-                route_table.write().await.set_exit_node(peer_key);
-                log::info!("tsnet: applied stored exit-node pref: {ip_or_name}");
-            } else {
-                log::debug!(
-                    "tsnet: stored exit-node pref unresolved (peer not in netmap): {ip_or_name}"
-                );
-            }
-        }
+        // A persisted selection retries only while it is unresolved. Once it
+        // resolves, later map rebuilds retain the route-table owner.
+        let (peers, route_table) = match self.inner.as_ref() {
+            Some(inner) => (inner.peers.clone(), inner.route_table.clone()),
+            None => return Ok(self.status()),
+        };
+        let peers = peers.read().await;
+        let mut routes = route_table.write().await;
+        exit_node_selection.write().await.retry(&peers, &mut routes);
 
         Ok(self.status())
     }
@@ -528,6 +517,10 @@ impl Server {
         ensure_ring_provider();
 
         let b = self.bootstrap().await?;
+        let prefs = Arc::new(RwLock::new(self.load_prefs().unwrap_or_default()));
+        let exit_node_selection = Arc::new(RwLock::new(ExitNodeSelection::from_prefs(
+            &*prefs.read().await,
+        )));
         let audit_logger = Self::start_audit_logger(
             self.config.state_dir.clone(),
             self.config.control_url.clone(),
@@ -546,6 +539,12 @@ impl Server {
             let peer_key = resolve_exit_node(&peers, exit)?;
             drop(peers);
             b.route_table.write().await.set_exit_node(peer_key);
+            exit_node_selection.write().await.clear_pending();
+            let mut live_prefs = prefs.write().await;
+            set_exit_node_pref(&mut live_prefs, exit);
+            if let Some(ref dir) = self.config.state_dir {
+                let _ = live_prefs.save(dir);
+            }
         }
 
         let monitor = spawn_link_monitor(
@@ -566,7 +565,14 @@ impl Server {
 
         // Real TUN device (macOS/Linux only; on other platforms
         // `create_tun_device` returns an error and `?` propagates it).
-        let (tun, router) = create_tun_device(&config, &b, self.config.accept_routes).await?;
+        let exit_node_allow_lan_access = prefs.read().await.ExitNodeAllowLANAccess;
+        let (tun, router) = create_tun_device(
+            &config,
+            &b,
+            self.config.accept_routes,
+            exit_node_allow_lan_access,
+        )
+        .await?;
 
         let capture = crate::capture::new_slot();
 
@@ -615,7 +621,7 @@ impl Server {
             disco_key: b.disco_key.clone(),
             capability_version: CAPABILITY_VERSION,
             protocol_version: PROTOCOL_VERSION,
-            shields_up: self.load_prefs().unwrap_or_default().ShieldsUp,
+            shields_up: prefs.read().await.ShieldsUp,
         };
         let map_update = spawn_map_update_task(
             b.map_rx,
@@ -624,6 +630,8 @@ impl Server {
             b.peers.clone(),
             b.route_table.clone(),
             router.clone(),
+            prefs.clone(),
+            exit_node_selection.clone(),
             b.node_key.clone(),
             b.filter.clone(),
             b.tailscale_ips.clone(),
@@ -800,7 +808,6 @@ impl Server {
         ];
 
         // LocalAPI Unix-domain-socket server (optional, default OFF).
-        let prefs = Arc::new(RwLock::new(self.load_prefs().unwrap_or_default()));
         let localapi_socket = if self.config.localapi {
             let path = self.config.localapi_path.clone().unwrap_or_else(|| {
                 let dir = self
@@ -819,6 +826,7 @@ impl Server {
                 capture: capture.clone(),
                 metrics: localapi::default_metric_registry(),
                 prefs: prefs.clone(),
+                exit_node_selection: exit_node_selection.clone(),
                 tailscale_ips: b.tailscale_ips.clone(),
                 our_fqdn: b.our_fqdn.clone(),
                 hostname: self.config.hostname.clone(),
@@ -986,51 +994,42 @@ impl Server {
                 .unwrap_or_else(|| Arc::new(tokio::sync::Notify::new())),
             fallback_tcp_handlers: Arc::new(std::sync::Mutex::new(vec![])),
             fallback_next_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            prefs,
+            prefs: prefs.clone(),
+            exit_node_selection: exit_node_selection.clone(),
             proxy_mapper,
             portlist_ports,
             client_updater: client_updater.clone(),
             audit_logger,
         });
 
-        // Apply stored exit-node pref on start (survives restart).
-        let stored_prefs = self.load_prefs().unwrap_or_default();
-        if !stored_prefs.ExitNodeIP.is_empty() || !stored_prefs.ExitNodeID.is_empty() {
-            let (peers, route_table, router, tailscale_ips, magicsock) = match self.inner.as_ref() {
+        // TUN config owns a selection made above; otherwise retry only an
+        // unresolved persisted selection.
+        let (peers, route_table, router, tailscale_ips, magicsock, live_prefs) =
+            match self.inner.as_ref() {
                 Some(inner) => (
                     inner.peers.clone(),
                     inner.route_table.clone(),
                     inner.router.clone(),
                     inner.tailscale_ips.clone(),
                     inner.magicsock.clone(),
+                    inner.prefs.clone(),
                 ),
                 None => return Ok(self.status()),
             };
-            let ip_or_name = if stored_prefs.ExitNodeIP.is_empty() {
-                &stored_prefs.ExitNodeID
-            } else {
-                &stored_prefs.ExitNodeIP
-            };
-            let peers_guard = peers.read().await;
-            if let Some(peer_key) = localapi::resolve_exit_node_peer(&peers_guard, ip_or_name) {
-                drop(peers_guard);
-                let mut routes = route_table.write().await;
-                routes.set_exit_node(peer_key);
-                if let Some(router) = router.as_ref() {
-                    let derp_map = magicsock.get_derp_map();
-                    sync_router(
-                        router,
-                        &tailscale_ips,
-                        &routes,
-                        derp_map.as_ref(),
-                        &self.config.control_url,
-                    )?;
-                }
-                log::info!("tsnet: applied stored exit-node pref: {ip_or_name}");
-            } else {
-                log::debug!(
-                    "tsnet: stored exit-node pref unresolved (peer not in netmap): {ip_or_name}"
-                );
+        let peers = peers.read().await;
+        let mut routes = route_table.write().await;
+        if exit_node_selection.write().await.retry(&peers, &mut routes) {
+            if let Some(router) = router.as_ref() {
+                let derp_map = magicsock.get_derp_map();
+                let exit_node_allow_lan_access = live_prefs.read().await.ExitNodeAllowLANAccess;
+                sync_router(
+                    router,
+                    &tailscale_ips,
+                    &routes,
+                    derp_map.as_ref(),
+                    &self.config.control_url,
+                    exit_node_allow_lan_access,
+                )?;
             }
         }
 
@@ -1140,6 +1139,9 @@ impl Server {
             capture: crate::capture::new_slot(),
             metrics: localapi::default_metric_registry(),
             prefs: prefs.clone(),
+            exit_node_selection: Arc::new(RwLock::new(ExitNodeSelection::from_prefs(
+                &*prefs.read().await,
+            ))),
             tailscale_ips: vec![],
             our_fqdn: String::new(),
             hostname: self.config.hostname.clone(),

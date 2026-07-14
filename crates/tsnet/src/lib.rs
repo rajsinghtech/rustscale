@@ -104,7 +104,9 @@ pub(crate) use link_monitor::{
     connect_home_derp, spawn_hostinfo_update_loop, spawn_link_monitor,
     spawn_periodic_endpoint_updates,
 };
-pub(crate) use map_update::{spawn_map_update_task, KeyRotationCtx};
+pub(crate) use map_update::{
+    exit_node_pref, set_exit_node_pref, spawn_map_update_task, ExitNodeSelection, KeyRotationCtx,
+};
 #[cfg(test)]
 pub(crate) use netstack_pump::collect_tun_inbound;
 pub(crate) use netstack_pump::{run_netstack_pump, tick_wg_timers};
@@ -695,6 +697,9 @@ pub(crate) struct RunningState {
     /// direct access for SIGHUP-driven config reload without going through
     /// the LocalAPI endpoint.
     pub(crate) prefs: Arc<RwLock<rustscale_ipn::Prefs>>,
+    /// Tracks the one persisted exit-node selection that may be retried after
+    /// a map update. Explicit API/config choices clear this pending state.
+    pub(crate) exit_node_selection: Arc<RwLock<ExitNodeSelection>>,
     /// Ephemeral `(proto, localhost ip:port) -> Tailscale IP` mapping for
     /// proxied connections. Used by WhoIs to attribute netstack-proxied
     /// connections to their originating peer. Mirrors Go's `proxymap.Mapper`.
@@ -1012,6 +1017,53 @@ impl Server {
             }
             serde_json::to_value(&*prefs).unwrap_or_default()
         };
+
+        if masked.ExitNodeAllowLANAccessSet || masked.ExitNodeIDSet || masked.ExitNodeIPSet {
+            let prefs = inner.prefs.read().await.clone();
+            let exit_node_changed = masked.ExitNodeIDSet || masked.ExitNodeIPSet;
+            let selected_exit_node = if exit_node_changed {
+                if let Some(ip_or_name) = exit_node_pref(&prefs) {
+                    let peers = inner.peers.read().await;
+                    Some(localapi::resolve_exit_node_peer(&peers, &ip_or_name))
+                } else {
+                    Some(None)
+                }
+            } else {
+                None
+            };
+            let mut routes = inner.route_table.write().await;
+            if let Some(selected_exit_node) = selected_exit_node {
+                if let Some(peer) = selected_exit_node {
+                    routes.set_exit_node(peer);
+                    inner.exit_node_selection.write().await.clear_pending();
+                } else {
+                    routes.clear_exit_node();
+                    let mut selection = inner.exit_node_selection.write().await;
+                    if exit_node_pref(&prefs).is_some() {
+                        selection.replace_from_prefs(&prefs);
+                    } else {
+                        selection.clear_pending();
+                    }
+                }
+            }
+            if let Some(router) = inner.router.as_ref() {
+                let derp_map = inner.magicsock.get_derp_map();
+                let control_url = if prefs.ControlURL.is_empty() {
+                    DEFAULT_CONTROL_URL
+                } else {
+                    &prefs.ControlURL
+                };
+                sync_router(
+                    router,
+                    &inner.tailscale_ips,
+                    &routes,
+                    derp_map.as_ref(),
+                    control_url,
+                    prefs.ExitNodeAllowLANAccess,
+                )
+                .map_err(|error| error.to_string())?;
+            }
+        }
 
         inner.ipn_backend.bus().send(rustscale_ipn::Notify {
             Prefs: Some(updated),

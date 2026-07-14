@@ -198,7 +198,7 @@ fn usage(bin: &str) {
     eprintln!(
         "  update                               check for client updates (not yet supported)"
     );
-    eprintln!("  wait [--timeout <secs>]              wait for backend to reach Running state");
+    eprintln!("  wait [--timeout <duration>]          wait for backend to reach Running state");
     eprintln!("  lock [status|init|add|remove|disable]  manage tailnet lock (not yet supported)");
     eprintln!("  drive [list|share|unshare]           manage Taildrive shares (not yet supported)");
 }

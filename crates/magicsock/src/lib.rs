@@ -164,10 +164,9 @@ async fn publish_reserved_wg_batch(
     sender: &mpsc::Sender<WgReceiveBatch>,
     datagrams: Vec<WgDatagram>,
     channel_permit: OwnedSemaphorePermit,
-    pool_reservation: Arc<PoolInventoryReservation>,
 ) {
     debug_assert!(!datagrams.is_empty());
-    let batch = WgReceiveBatch::new_pooled(datagrams, channel_permit, pool_reservation);
+    let batch = WgReceiveBatch::new(datagrams, channel_permit);
     let _ = sender.send(batch).await;
 }
 
@@ -216,15 +215,15 @@ fn identify_linux_wg_peers(
 
 /// Detach identified ordinary direct WireGuard packets in receive order.
 /// `ReceiveBatch` fixed boxes are replaced before the next recvmmsg; no plain
-/// packet payload is copied. UDP GRO already copied its coalesced logical
-/// tails into those fixed boxes during split, which remains necessary so each
-/// published segment has independent stable storage.
+/// packet payload is copied unless retained ciphertexts have exhausted the
+/// replacement boxes. UDP GRO already copied its coalesced logical tails into
+/// those fixed boxes during split, which remains necessary so each published
+/// segment has independent stable storage.
 #[cfg(target_os = "linux")]
 fn detach_linux_wg_datagrams(
     batch: &mut udp_batch::ReceiveBatch,
     count: usize,
     identified: &IdentifiedLinuxWg,
-    pool_reservation: &Arc<PoolInventoryReservation>,
     endpoints: &mut HashMap<NodePublic, Endpoint>,
     pending: &mut Vec<WgDatagram>,
     mut note_recv_udp: impl FnMut(&NodePublic, &mut Endpoint, std::time::Instant),
@@ -253,11 +252,14 @@ fn detach_linux_wg_datagrams(
         if let Some(peer) = peer {
             let (packet, detached_source) = batch
                 .detach_datagram(index)
-                .expect("reserved receive credit always has fixed pooled replacement");
+                .expect("published receive batch has every logical datagram");
             debug_assert_eq!(addr, detached_source);
             pending.push(WgDatagram {
                 peer: peer.clone(),
-                data: WgCiphertext::from_pooled(packet, pool_reservation.clone()),
+                data: match packet {
+                    udp_batch::DetachedPacket::Pooled(packet) => WgCiphertext::from_pooled(packet),
+                    udp_batch::DetachedPacket::Copied(bytes) => bytes.into(),
+                },
             });
         }
     }
@@ -457,30 +459,7 @@ enum WgCiphertextStorage {
     #[cfg(target_os = "linux")]
     Pooled {
         packet: udp_batch::PooledPacket,
-        // Keep this after `packet`: Rust drops fields in declaration order,
-        // so the fixed buffer returns to the recycler before the last shared
-        // inventory permit can wake a receiver that needs a replacement.
-        _pool_reservation: Arc<PoolInventoryReservation>,
     },
-}
-
-/// Reservation of detached fixed-buffer inventory for one Linux receive
-/// batch. This is independent from channel backpressure credits: pooled
-/// ciphertexts retain it until every detached buffer from the batch returns.
-#[cfg(any(target_os = "linux", test))]
-struct PoolInventoryReservation {
-    _permit: OwnedSemaphorePermit,
-}
-
-#[cfg(any(target_os = "linux", test))]
-impl PoolInventoryReservation {
-    async fn acquire(inventory: Arc<Semaphore>, count: usize) -> Option<Arc<Self>> {
-        let permit = inventory
-            .acquire_many_owned(u32::try_from(count).expect("pool reservation count fits u32"))
-            .await
-            .ok()?;
-        Some(Arc::new(Self { _permit: permit }))
-    }
 }
 
 impl WgCiphertext {
@@ -496,15 +475,9 @@ impl WgCiphertext {
     }
 
     #[cfg(target_os = "linux")]
-    fn from_pooled(
-        packet: udp_batch::PooledPacket,
-        pool_reservation: Arc<PoolInventoryReservation>,
-    ) -> Self {
+    fn from_pooled(packet: udp_batch::PooledPacket) -> Self {
         Self {
-            storage: WgCiphertextStorage::Pooled {
-                packet,
-                _pool_reservation: pool_reservation,
-            },
+            storage: WgCiphertextStorage::Pooled { packet },
         }
     }
 
@@ -597,18 +570,10 @@ pub struct WgDatagram {
 ///
 /// Its owned channel permit accounts for every contained packet while queued.
 /// Consuming it through [`WgReceiveBatch::into_datagrams`] releases that
-/// backpressure permit immediately. Linux pooled ciphertexts separately keep
-/// their fixed-buffer inventory reservation until their buffers are dropped.
+/// backpressure permit immediately.
 pub struct WgReceiveBatch {
     datagrams: Vec<WgDatagram>,
-    // Kept separately from `_pool_reservation` so channel backpressure has
-    // the same lifetime as the pre-pool implementation.
     _channel_permit: OwnedSemaphorePermit,
-    // Pooled ciphertexts also own this Arc. Keeping one in the queued batch
-    // makes cancellation and closed-channel cleanup explicit and ensures a
-    // malformed empty pooled publication cannot leak its reservation.
-    #[cfg(target_os = "linux")]
-    _pool_reservation: Option<Arc<PoolInventoryReservation>>,
 }
 
 impl WgReceiveBatch {
@@ -625,7 +590,6 @@ impl WgReceiveBatch {
     /// Consume this handoff item and return its datagrams in receive order.
     ///
     /// This releases the batch's channel backpressure permit immediately.
-    /// Pooled ciphertexts retain only their separate buffer reservation.
     pub fn into_datagrams(self) -> Vec<WgDatagram> {
         self.datagrams
     }
@@ -652,21 +616,6 @@ impl WgReceiveBatch {
         Self {
             datagrams,
             _channel_permit: permit,
-            #[cfg(target_os = "linux")]
-            _pool_reservation: None,
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    fn new_pooled(
-        datagrams: Vec<WgDatagram>,
-        channel_permit: OwnedSemaphorePermit,
-        pool_reservation: Arc<PoolInventoryReservation>,
-    ) -> Self {
-        Self {
-            datagrams,
-            _channel_permit: channel_permit,
-            _pool_reservation: Some(pool_reservation),
         }
     }
 }
@@ -2951,9 +2900,8 @@ impl Inner {
             self.record_linux_udp_batch_rx(udp4_rx_bytes, udp6_rx_bytes);
             return false;
         }
-        // No ReceiveBatch slice borrow or endpoint/address lock survives
-        // either await. Channel backpressure keeps its established queued
-        // lifetime; fixed-buffer inventory is a separate 384-slot limit.
+        // No ReceiveBatch slice borrow or endpoint/address lock survives the
+        // channel-capacity await.
         let Ok(channel_permit) = self
             .wg_receive_credits
             .clone()
@@ -2962,12 +2910,6 @@ impl Inner {
         else {
             return false;
         };
-        let pool_inventory = batch.pool_inventory();
-        let Some(pool_reservation) = PoolInventoryReservation::acquire(pool_inventory, known).await
-        else {
-            return false;
-        };
-
         pending.clear();
         {
             let mut endpoints = self.endpoints.write().expect("endpoints lock poisoned");
@@ -2975,7 +2917,6 @@ impl Inner {
                 batch,
                 count,
                 &identified,
-                &pool_reservation,
                 &mut endpoints,
                 pending,
                 |_, endpoint, now| endpoint.note_recv_udp(now),
@@ -2986,7 +2927,7 @@ impl Inner {
         }
         debug_assert_eq!(pending.len(), known);
         let datagrams = std::mem::take(pending);
-        publish_reserved_wg_batch(&self.wg_send, datagrams, channel_permit, pool_reservation).await;
+        publish_reserved_wg_batch(&self.wg_send, datagrams, channel_permit).await;
         false
     }
 
@@ -3659,26 +3600,15 @@ mod linux_batch_tests {
         };
     }
 
-    // This seam is intentionally platform-neutral: macOS test builds do not
-    // compile Linux recvmmsg storage, but they still verify the two permit
-    // lifetimes that the Linux pooled path combines below.
     #[tokio::test]
-    async fn consumed_batch_releases_channel_credit_before_pool_inventory() {
+    async fn consumed_batch_releases_channel_credit_immediately() {
         let channel_credits = Arc::new(Semaphore::new(1));
-        let pool_inventory = Arc::new(Semaphore::new(1));
         let channel_permit = channel_credits.clone().try_acquire_owned().unwrap();
-        let pool_reservation = PoolInventoryReservation::acquire(pool_inventory.clone(), 1)
-            .await
-            .expect("open pool inventory reserves one buffer");
         let batch = WgReceiveBatch::new(pending(1), channel_permit);
 
         let datagrams = batch.into_datagrams();
         assert_eq!(channel_credits.available_permits(), 1);
-        assert_eq!(pool_inventory.available_permits(), 0);
         drop(datagrams);
-        assert_eq!(pool_inventory.available_permits(), 0);
-        drop(pool_reservation);
-        assert_eq!(pool_inventory.available_permits(), 1);
     }
 
     #[test]

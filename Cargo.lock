@@ -2470,6 +2470,7 @@ name = "rustscale-c2n"
 version = "0.1.1"
 dependencies = [
  "async-trait",
+ "rustscale-tailcfg",
  "rustscale-tsaddr",
  "serde",
  "serde_json",
@@ -2990,6 +2991,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustscale-posture"
+version = "0.1.1"
+dependencies = [
+ "libc",
+ "log",
+ "rustscale-netmon",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "rustscale-proxymap"
 version = "0.1.1"
 dependencies = [
@@ -3249,6 +3260,7 @@ dependencies = [
  "rustscale-netstack",
  "rustscale-portlist",
  "rustscale-portmapper",
+ "rustscale-posture",
  "rustscale-proxymap",
  "rustscale-router",
  "rustscale-safesocket",

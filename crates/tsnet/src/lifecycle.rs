@@ -321,6 +321,7 @@ impl Server {
             self.config.state_dir.clone(),
             b.backend_log_id.clone(),
             b.ssh_host_keys.clone(),
+            self.config.posture_checking,
         );
         tasks.push(hostinfo_loop);
 
@@ -794,6 +795,7 @@ impl Server {
             self.config.state_dir.clone(),
             b.backend_log_id.clone(),
             b.ssh_host_keys.clone(),
+            self.config.posture_checking,
         );
 
         let mut tasks = vec![
@@ -1861,6 +1863,7 @@ impl Server {
                 magicsock: magicsock.clone(),
                 sockstats: sockstats.clone(),
                 logtail: self.config.logtail.clone(),
+                posture_checking: self.config.posture_checking,
             },
             c2n_log_level,
         ));

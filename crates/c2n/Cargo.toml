@@ -16,3 +16,4 @@ tokio.workspace = true
 async-trait.workspace = true
 thiserror.workspace = true
 rustscale-tsaddr = { path = "../tsaddr", version = "0.1.1" }
+rustscale-tailcfg = { path = "../tailcfg", version = "0.1.1" }

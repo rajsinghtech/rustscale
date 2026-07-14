@@ -9,7 +9,7 @@ use rustscale_c2n::{C2NServer, C2nBackend, LogLevelState, WhoIsResult};
 use rustscale_controlclient::c2n::{C2nHandler, C2nRequest, C2nResponse, C2nRouter};
 use rustscale_health::{Severity, Tracker};
 use rustscale_magicsock::Magicsock;
-use rustscale_tailcfg::{DNSConfig, Node, UserID, UserProfile};
+use rustscale_tailcfg::{C2NPostureIdentityResponse, DNSConfig, Node, UserID, UserProfile};
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
@@ -39,6 +39,7 @@ pub(crate) struct C2nBackendData {
     pub magicsock: Arc<Magicsock>,
     pub sockstats: Arc<rustscale_sockstats::SockStats>,
     pub logtail: Option<rustscale_logtail::LogTail>,
+    pub posture_checking: bool,
 }
 
 pub struct TsnetC2nBackend {
@@ -53,6 +54,7 @@ pub struct TsnetC2nBackend {
     magicsock: Arc<Magicsock>,
     sockstats: Arc<rustscale_sockstats::SockStats>,
     logtail: Option<rustscale_logtail::LogTail>,
+    posture_checking: bool,
     log_level: LogLevelState,
 }
 
@@ -70,6 +72,7 @@ impl TsnetC2nBackend {
             magicsock: data.magicsock,
             sockstats: data.sockstats,
             logtail: data.logtail,
+            posture_checking: data.posture_checking,
             log_level,
         }
     }
@@ -224,6 +227,28 @@ impl C2nBackend for TsnetC2nBackend {
     async fn sockstats_json(&self) -> Option<serde_json::Value> {
         Some(self.sockstats.to_json())
     }
+
+    async fn posture_identity(&self) -> Option<C2NPostureIdentityResponse> {
+        if !self.posture_checking {
+            return Some(C2NPostureIdentityResponse {
+                posture_disabled: true,
+                ..Default::default()
+            });
+        }
+
+        let serial_numbers = match rustscale_posture::get_serial_numbers() {
+            Ok(serial_numbers) => serial_numbers,
+            Err(error) => {
+                log::warn!("posture: serial collection failed: {error}");
+                Vec::new()
+            }
+        };
+        Some(C2NPostureIdentityResponse {
+            serial_numbers,
+            iface_hardware_addrs: rustscale_posture::get_hardware_addrs(),
+            posture_disabled: false,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -350,6 +375,23 @@ impl C2nHandler for LogheapHandler {
 struct SockStatsHandler {
     backend: Arc<TsnetC2nBackend>,
 }
+
+struct PostureIdentityHandler {
+    backend: Arc<TsnetC2nBackend>,
+}
+
+#[async_trait]
+impl C2nHandler for PostureIdentityHandler {
+    async fn handle(&self, _req: C2nRequest) -> C2nResponse {
+        match self.backend.posture_identity().await {
+            Some(response) => {
+                let body = serde_json::to_value(response).unwrap_or(serde_json::Value::Null);
+                C2nResponse::json(200, &body)
+            }
+            None => C2nResponse::error(501, "posture identity not available"),
+        }
+    }
+}
 #[async_trait]
 impl C2nHandler for SockStatsHandler {
     async fn handle(&self, _req: C2nRequest) -> C2nResponse {
@@ -443,6 +485,12 @@ pub(crate) fn register_c2n_handlers(router: &mut C2nRouter, backend: Arc<TsnetC2
     router.register(
         "POST /sockstats",
         Arc::new(SockStatsHandler {
+            backend: backend.clone(),
+        }),
+    );
+    router.register(
+        "GET /posture/identity",
+        Arc::new(PostureIdentityHandler {
             backend: backend.clone(),
         }),
     );

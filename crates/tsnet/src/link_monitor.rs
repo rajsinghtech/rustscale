@@ -218,6 +218,7 @@ pub(crate) fn spawn_hostinfo_update_loop(
     state_dir: Option<PathBuf>,
     backend_log_id: String,
     ssh_host_keys: Arc<RwLock<Vec<String>>>,
+    posture_checking: bool,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let node_pub = node_key.public();
@@ -285,6 +286,7 @@ pub(crate) fn spawn_hostinfo_update_loop(
                 .and_then(|d| rustscale_ipn::Prefs::load(d).ok())
                 .unwrap_or_default();
             let rt = RuntimeHostinfo {
+                posture_checking,
                 backend_log_id: backend_log_id.clone(),
                 exit_node_id: exit_node_id.clone(),
                 ingress_enabled,

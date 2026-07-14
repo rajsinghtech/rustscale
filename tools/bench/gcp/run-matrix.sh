@@ -425,17 +425,12 @@ matrix_product_observation_self_test() {
   [[ "$program" == *'("rustscaled", "/opt/rustscale/target/release/rustscaled")'* ]] || return 1
   [[ "$program" == *'output(["timeout", "15", explicit, "--version"])'* ]] || return 1
   [[ "$program" != *cargo*metadata* && "$program" != *'--help'* && "$program" != *'exit 1'* ]] || return 1
-  # The fast shell suite does not compile benchmarks, but it requires the
-  # explicit Clap version contract. When a local binary already exists (as in
-  # the package acceptance check), exercise both aliases as well.
+  # The fast shell suite does not compile or execute benchmarks. Shared target
+  # directories can hold another worktree's stale binary, so only the source
+  # contract is checked here; remote production still probes delivered release
+  # binaries with --version above.
   sed -n '/#\[command(/,/)]/p' crates/bench/src/main.rs | grep -Fxq '    version' || return 1
   grep -Fq 'fn clap_metadata_exposes_package_version()' crates/bench/src/main.rs || return 1
-  if [[ -x target/debug/rustscale-bench ]]; then
-    local bench_version bench_short_version
-    bench_version=$(target/debug/rustscale-bench --version) || return 1
-    bench_short_version=$(target/debug/rustscale-bench -V) || return 1
-    [[ "$bench_version" == rustscale-bench\ * && "$bench_version" == "$bench_short_version" ]] || return 1
-  fi
   grep -Fq 'matches!(args[1].as_str(), "--version" | "-V")' crates/cli/src/main.rs || return 1
   grep -Fq 'matches!(arg.as_str(), "--version" | "-V")' crates/rustscaled/src/main.rs || return 1
 }

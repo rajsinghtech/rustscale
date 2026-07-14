@@ -2491,6 +2491,7 @@ dependencies = [
  "rustscale-localclient",
  "rustscale-netcheck",
  "rustscale-safesocket",
+ "rustscale-speedtest",
  "rustscale-tailcfg",
  "rustscale-testcontrol",
  "rustscale-tsnet",
@@ -3031,6 +3032,17 @@ version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "rustscale-speedtest"
+version = "0.1.1"
+dependencies = [
+ "rand 0.8.7",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
  "tokio",
 ]
 

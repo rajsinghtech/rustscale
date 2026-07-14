@@ -129,6 +129,7 @@ async fn dispatch(
         "switch" => commands::switch::run(args, &socket_path, json).await,
         "cert" => commands::cert::run(args, &socket_path).await,
         "ping" => commands::ping::run(args, &socket_path).await,
+        "speedtest" => commands::speedtest::run(args, &socket_path).await,
         "file" => commands::file::run(args, &socket_path, json).await,
         "ssh" => commands::ssh::run(args, &socket_path).await,
         "web" => commands::web::run(args, &socket_path).await,
@@ -181,6 +182,7 @@ fn usage(bin: &str) {
     eprintln!("  health                              print active health warnings");
     eprintln!("  cert [flags] <domain>               get TLS certs for a domain");
     eprintln!("  ping <ip>                           ping a peer (not yet supported)");
+    eprintln!("  speedtest [-host ...] [-s] [-r] [-t <duration>]");
     eprintln!("  file cp <files...> <target>:        send file(s) to a host");
     eprintln!("  file get [--wait] [--conflict=...] <dir>  receive files from the inbox");
     eprintln!(

@@ -36,12 +36,12 @@ ordering, path/control handling, DERP progress, or UDP parsing behavior.
   before publication and owns that permit while queued; consuming
   `WgReceiveBatch` releases it immediately, while dropping a queued batch also
   releases it.
-- Linux direct receive owns 512 fixed buffers: 128 remain installed as
-  `recvmmsg` scratch and 384 are available as zero-copy replacements. After a
-  known direct batch acquires its channel credits, each available replacement
-  is swapped into the scratch slot and the old fixed buffer is detached. If
-  retained ciphertexts exhaust the replacements, only that logical datagram
-  falls back to an owned copy; the scratch slot and its `iovec` stay installed.
+- Linux direct receive uses a separate fixed-buffer inventory semaphore. Of
+  512 fixed buffers, 128 remain permanently installed as `recvmmsg` scratch
+  and exactly 384 may be detached. A known direct batch reserves both channel
+  credits and its detached-buffer inventory before detaching slots. Pooled
+  ciphertexts retain only the shared inventory reservation until every buffer
+  in the detached batch has returned to the recycler.
 - DERP/scalar packets must use the same credit accounting and remain able to
   make progress under sustained direct UDP traffic.
 - The TUN path must move a received batch directly into its inbound scratch
@@ -59,13 +59,11 @@ ordering, path/control handling, DERP progress, or UDP parsing behavior.
 - Exact 128-packet burst ordering.
 - Mixed DERP/direct traffic under the 256-packet credit limit.
 - Channel credits return when a batch is consumed, dropped, publication is
-  cancelled, or the channel is closed. Detached fixed buffers return to the
-  recycler when their individual ciphertexts drop.
-- Retaining consumed direct ciphertexts can exhaust all 384 replacements;
-  subsequent datagrams use bounded per-packet copy fallback without blocking,
-  panicking, losing buffers, or changing installed scratch `iovec` pointers.
-- The 512-buffer total, recycled-buffer reuse, and refreshed `iovec`
-  replacement invariants hold.
+  cancelled, or the channel is closed; independent pool inventory returns only
+  after all pooled ciphertexts from its detached batch drop.
+- Retaining consumed direct ciphertexts can reach the 384-buffer pool limit;
+  the receive task waits for inventory rather than exhausting the recycler.
+- The 512-buffer total and refreshed `iovec` replacement invariants hold.
 - A full batch cannot turn the queue into 256 batches/32K packets.
 - Scalar control/disco fallback and missing-peer behavior remain unchanged.
 - Focused magicsock/tsnet tests, clippy, and `tools/check.sh` pass.

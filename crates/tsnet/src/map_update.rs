@@ -19,6 +19,67 @@ pub(crate) struct KeyRotationCtx {
     pub shields_up: bool,
 }
 
+/// The only exit-node preference that a map update may apply. Once it
+/// resolves, or an explicit API/config selection supersedes it, route-table
+/// rebuilds preserve their existing selection without consulting prefs again.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ExitNodeSelection {
+    pending_persisted: Option<String>,
+}
+
+impl ExitNodeSelection {
+    pub(crate) fn from_prefs(prefs: &rustscale_ipn::Prefs) -> Self {
+        let mut selection = Self::default();
+        selection.replace_from_prefs(prefs);
+        selection
+    }
+
+    pub(crate) fn replace_from_prefs(&mut self, prefs: &rustscale_ipn::Prefs) {
+        self.pending_persisted = exit_node_pref(prefs);
+    }
+
+    pub(crate) fn clear_pending(&mut self) {
+        self.pending_persisted = None;
+    }
+
+    /// Retry an unresolved persisted selection. This deliberately does not
+    /// clear the route table when the peer is absent: an explicit selection
+    /// owns the table once it has superseded the persisted preference.
+    pub(crate) fn retry(&mut self, peers: &[Node], routes: &mut RouteTable) -> bool {
+        let Some(selector) = self.pending_persisted.as_deref() else {
+            return false;
+        };
+        if let Some(peer) = crate::localapi::resolve_exit_node_peer(peers, selector) {
+            routes.set_exit_node(peer);
+            self.pending_persisted = None;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+pub(crate) fn exit_node_pref(prefs: &rustscale_ipn::Prefs) -> Option<String> {
+    if !prefs.ExitNodeIP.is_empty() {
+        Some(prefs.ExitNodeIP.clone())
+    } else if !prefs.ExitNodeID.is_empty() {
+        Some(prefs.ExitNodeID.clone())
+    } else {
+        None
+    }
+}
+
+pub(crate) fn set_exit_node_pref(prefs: &mut rustscale_ipn::Prefs, selector: &str) {
+    if selector.parse::<std::net::IpAddr>().is_ok() {
+        prefs.ExitNodeIP = selector.into();
+        prefs.ExitNodeID.clear();
+    } else {
+        // ExitNodeID is also the prefs field LocalAPI uses for a hostname.
+        prefs.ExitNodeID = selector.into();
+        prefs.ExitNodeIP.clear();
+    }
+}
+
 /// Spawn the map-stream delta update task. Shared by `up()` and `up_tun()`:
 /// processes Peers/PeersChanged/PeersRemoved, feeds the new peer list to
 /// magicsock, rebuilds the route table, and creates WG tunnels for new peers.
@@ -30,6 +91,8 @@ pub(crate) fn spawn_map_update_task(
     peers_arc: Arc<RwLock<Vec<Node>>>,
     route_table: Arc<RwLock<RouteTable>>,
     router: Option<SharedRouter>,
+    prefs: Arc<RwLock<rustscale_ipn::Prefs>>,
+    exit_node_selection: Arc<RwLock<ExitNodeSelection>>,
     mut node_key: NodePrivate,
     filter_arc: Arc<std::sync::Mutex<Filter>>,
     tailscale_ips: Vec<IpAddr>,
@@ -91,12 +154,15 @@ pub(crate) fn spawn_map_update_task(
                             let routes = route_table.read().await;
                             if routes.exit_node().is_some() {
                                 let derp_map = magicsock.get_derp_map();
+                                let exit_node_allow_lan_access =
+                                    prefs.read().await.ExitNodeAllowLANAccess;
                                 if let Err(error) = sync_router(
                                     router,
                                     &tailscale_ips,
                                     &routes,
                                     derp_map.as_ref(),
                                     &control_url,
+                                    exit_node_allow_lan_access,
                                 ) {
                                     eprintln!(
                                         "tsnet: bypass-route update failed (non-fatal): {error}"
@@ -337,8 +403,10 @@ pub(crate) fn spawn_map_update_task(
                     // Feed the updated peer list to magicsock + rebuild routes.
                     let peers = peers_arc.read().await.clone();
                     let _ = magicsock.set_netmap(peers.clone()).await;
+                    let live_prefs = prefs.read().await.clone();
                     let mut routes = route_table.write().await;
                     routes.rebuild_with_opts(&peers, accept_routes);
+                    exit_node_selection.write().await.retry(&peers, &mut routes);
                     if let Some(router) = router.as_ref() {
                         let derp_map = magicsock.get_derp_map();
                         if let Err(error) = sync_router(
@@ -347,6 +415,7 @@ pub(crate) fn spawn_map_update_task(
                             &routes,
                             derp_map.as_ref(),
                             &control_url,
+                            live_prefs.ExitNodeAllowLANAccess,
                         ) {
                             eprintln!("tsnet: route update failed (non-fatal): {error}");
                         }
@@ -693,6 +762,7 @@ fn send_health_notify(health: &Tracker, ipn_backend: &IpnBackend) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustscale_ipn::Prefs;
     use rustscale_key::{DiscoPrivate, NodePrivate};
     use rustscale_tailcfg::PeerChange;
 
@@ -707,6 +777,85 @@ mod tests {
             Cap: 50,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn unresolved_persisted_exit_node_is_retried_when_peer_arrives() {
+        let exit_key = NodePrivate::generate().public();
+        let prefs = Prefs {
+            ExitNodeIP: "100.64.0.9".into(),
+            ..Default::default()
+        };
+        let mut routes = RouteTable::default();
+        let mut selection = ExitNodeSelection::from_prefs(&prefs);
+        selection.retry(&[], &mut routes);
+        assert!(routes.exit_node().is_none());
+
+        let peer = Node {
+            Key: exit_key.clone(),
+            Addresses: vec!["100.64.0.9/32".into()],
+            AllowedIPs: vec!["0.0.0.0/0".into()],
+            ..Default::default()
+        };
+        selection.retry(&[peer], &mut routes);
+        assert_eq!(routes.exit_node(), Some(&exit_key));
+    }
+
+    #[test]
+    fn persisted_exit_node_does_not_overwrite_explicit_set() {
+        let persisted = NodePrivate::generate().public();
+        let explicit = NodePrivate::generate().public();
+        let prefs = Prefs {
+            ExitNodeIP: "100.64.0.9".into(),
+            ..Default::default()
+        };
+        let peer = Node {
+            Key: persisted,
+            Addresses: vec!["100.64.0.9/32".into()],
+            AllowedIPs: vec!["0.0.0.0/0".into()],
+            ..Default::default()
+        };
+        let mut selection = ExitNodeSelection::from_prefs(&prefs);
+        let mut routes = RouteTable::default();
+        selection.retry(&[peer], &mut routes);
+
+        routes.set_exit_node(explicit.clone());
+        routes.rebuild_with_opts(&[], false);
+        selection.retry(&[], &mut routes);
+        assert_eq!(routes.exit_node(), Some(&explicit));
+    }
+
+    #[test]
+    fn persisted_exit_node_does_not_overwrite_explicit_clear() {
+        let persisted = NodePrivate::generate().public();
+        let prefs = Prefs {
+            ExitNodeIP: "100.64.0.9".into(),
+            ..Default::default()
+        };
+        let peer = Node {
+            Key: persisted,
+            Addresses: vec!["100.64.0.9/32".into()],
+            AllowedIPs: vec!["0.0.0.0/0".into()],
+            ..Default::default()
+        };
+        let mut selection = ExitNodeSelection::from_prefs(&prefs);
+        let mut routes = RouteTable::default();
+        selection.retry(&[peer], &mut routes);
+        routes.clear_exit_node();
+        routes.rebuild_with_opts(&[], false);
+        selection.retry(&[], &mut routes);
+        assert!(routes.exit_node().is_none());
+    }
+
+    #[test]
+    fn config_exit_node_survives_map_rebuild() {
+        let config_exit = NodePrivate::generate().public();
+        let mut routes = RouteTable::default();
+        routes.set_exit_node(config_exit.clone());
+        routes.rebuild_with_opts(&[], false);
+        let mut selection = ExitNodeSelection::default();
+        selection.retry(&[], &mut routes);
+        assert_eq!(routes.exit_node(), Some(&config_exit));
     }
 
     #[test]

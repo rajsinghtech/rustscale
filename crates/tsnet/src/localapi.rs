@@ -103,6 +103,8 @@ pub(crate) struct LocalApiState {
     /// renders them via `to_prometheus_text()`.
     pub metrics: MetricRegistry,
     pub prefs: Arc<RwLock<Prefs>>,
+    /// Pending persisted exit-node selection, retried only until it resolves.
+    pub exit_node_selection: Arc<RwLock<crate::ExitNodeSelection>>,
     pub tailscale_ips: Vec<IpAddr>,
     pub our_fqdn: String,
     pub hostname: String,
@@ -499,6 +501,10 @@ async fn handle_reload_config<W: AsyncWrite + Unpin>(
         serde_json::to_value(&*prefs).unwrap_or_default()
     };
 
+    if masked.ExitNodeAllowLANAccessSet || masked.ExitNodeIDSet || masked.ExitNodeIPSet {
+        apply_exit_node_prefs(state).await;
+    }
+
     state.ipn_backend.bus().send(rustscale_ipn::Notify {
         Prefs: Some(updated.clone()),
         ..Default::default()
@@ -563,11 +569,11 @@ pub(crate) fn resolve_exit_node_peer(peers: &[Node], ip_or_name: &str) -> Option
     None
 }
 
-/// Apply exit-node prefs to the route table. Called from handle_patch_prefs
-/// when ExitNodeID/ExitNodeIP changes, and from up()/up_tun() on daemon
-/// start to apply persisted prefs. Mirrors Go's applyPrefsToEngine
-/// exit-node handling.
-pub(crate) async fn apply_exit_node_prefs(prefs: &Prefs, state: &Arc<LocalApiState>) {
+/// Apply an explicit LocalAPI/config preference to the route table. An
+/// unresolved value becomes the sole pending persisted selection for map
+/// updates to retry; a resolved or cleared value has no later prefs reapply.
+pub(crate) async fn apply_exit_node_prefs(state: &Arc<LocalApiState>) {
+    let prefs = state.prefs.read().await.clone();
     let Some(ref rt) = state.route_table else {
         return;
     };
@@ -580,6 +586,7 @@ pub(crate) async fn apply_exit_node_prefs(prefs: &Prefs, state: &Arc<LocalApiSta
         // No exit node selected — clear it.
         let mut routes = rt.write().await;
         routes.clear_exit_node();
+        state.exit_node_selection.write().await.clear_pending();
         if let Some(router) = state.router.as_ref() {
             let derp_map = state.magicsock.get_derp_map();
             let control_url = state.prefs.read().await.ControlURL.clone();
@@ -594,6 +601,7 @@ pub(crate) async fn apply_exit_node_prefs(prefs: &Prefs, state: &Arc<LocalApiSta
                 &routes,
                 derp_map.as_ref(),
                 control_url,
+                prefs.ExitNodeAllowLANAccess,
             ) {
                 eprintln!("tsnet: route update failed (non-fatal): {error}");
             }
@@ -605,10 +613,16 @@ pub(crate) async fn apply_exit_node_prefs(prefs: &Prefs, state: &Arc<LocalApiSta
     let mut routes = rt.write().await;
     if let Some(peer_key) = resolve_exit_node_peer(&peers, ip_or_name) {
         routes.set_exit_node(peer_key);
+        state.exit_node_selection.write().await.clear_pending();
     } else {
-        // Peer not found (may not be in the netmap yet). Clear for now;
-        // the map update task will re-apply when the peer appears.
+        // Peer not found (may not be in the netmap yet). Clear for now and
+        // retain only this unresolved explicit preference for a future map.
         routes.clear_exit_node();
+        state
+            .exit_node_selection
+            .write()
+            .await
+            .replace_from_prefs(&prefs);
     }
     if let Some(router) = state.router.as_ref() {
         let derp_map = state.magicsock.get_derp_map();
@@ -624,6 +638,7 @@ pub(crate) async fn apply_exit_node_prefs(prefs: &Prefs, state: &Arc<LocalApiSta
             &routes,
             derp_map.as_ref(),
             control_url,
+            prefs.ExitNodeAllowLANAccess,
         ) {
             eprintln!("tsnet: route update failed (non-fatal): {error}");
         }
@@ -648,7 +663,8 @@ async fn handle_patch_prefs<W: AsyncWrite + Unpin>(
         }
     };
 
-    let exit_node_changed = masked.ExitNodeIDSet || masked.ExitNodeIPSet;
+    let exit_node_changed =
+        masked.ExitNodeIDSet || masked.ExitNodeIPSet || masked.ExitNodeAllowLANAccessSet;
     let disconnect_requested = masked.WantRunningSet && !masked.Prefs.WantRunning;
 
     let updated = {
@@ -676,8 +692,7 @@ async fn handle_patch_prefs<W: AsyncWrite + Unpin>(
     // When ExitNodeIP or ExitNodeID is patched, resolve the peer and
     // update the route table — mirroring Go's applyPrefsToEngine.
     if exit_node_changed {
-        let prefs = state.prefs.read().await;
-        apply_exit_node_prefs(&prefs, state).await;
+        apply_exit_node_prefs(state).await;
     }
 
     if disconnect_requested {
@@ -3152,6 +3167,7 @@ mod tests {
                 WantRunning: true,
                 ..Default::default()
             })),
+            exit_node_selection: Arc::new(RwLock::new(crate::ExitNodeSelection::default())),
             tailscale_ips: vec!["100.64.0.1".parse().unwrap()],
             our_fqdn: "test.tailnet.ts.net.".into(),
             hostname: "test".into(),
@@ -3914,6 +3930,7 @@ mod tests {
             capture: state.capture.clone(),
             metrics: default_metric_registry(),
             prefs: state.prefs.clone(),
+            exit_node_selection: state.exit_node_selection.clone(),
             tailscale_ips: state.tailscale_ips.clone(),
             our_fqdn: state.our_fqdn.clone(),
             hostname: state.hostname.clone(),
@@ -4141,6 +4158,7 @@ mod tests {
             capture: base.capture.clone(),
             metrics: default_metric_registry(),
             prefs: base.prefs.clone(),
+            exit_node_selection: base.exit_node_selection.clone(),
             tailscale_ips: base.tailscale_ips.clone(),
             our_fqdn: base.our_fqdn.clone(),
             hostname: base.hostname.clone(),

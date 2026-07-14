@@ -445,16 +445,26 @@ impl Server {
         let peers = inner.peers.read().await;
         let peer_key = resolve_exit_node(&peers, ip_or_name)?;
         drop(peers);
+        {
+            let mut prefs = inner.prefs.write().await;
+            crate::set_exit_node_pref(&mut prefs, ip_or_name);
+            if let Some(ref dir) = self.config.state_dir {
+                let _ = prefs.save(dir);
+            }
+        }
+        inner.exit_node_selection.write().await.clear_pending();
         let mut routes = inner.route_table.write().await;
         routes.set_exit_node(peer_key);
         if let Some(router) = inner.router.as_ref() {
             let derp_map = inner.magicsock.get_derp_map();
+            let exit_node_allow_lan_access = inner.prefs.read().await.ExitNodeAllowLANAccess;
             sync_router(
                 router,
                 &inner.tailscale_ips,
                 &routes,
                 derp_map.as_ref(),
                 &self.config.control_url,
+                exit_node_allow_lan_access,
             )?;
         }
         if matches!(inner.data_plane, DataPlane::Tun) {
@@ -474,16 +484,27 @@ impl Server {
     /// C-representable: no args, error code out (see FFI `ts_clear_exit_node`).
     pub async fn clear_exit_node(&self) -> Result<(), TsnetError> {
         let inner = self.inner.as_ref().ok_or(TsnetError::NotUp)?;
+        {
+            let mut prefs = inner.prefs.write().await;
+            prefs.ExitNodeID.clear();
+            prefs.ExitNodeIP.clear();
+            if let Some(ref dir) = self.config.state_dir {
+                let _ = prefs.save(dir);
+            }
+        }
+        inner.exit_node_selection.write().await.clear_pending();
         let mut routes = inner.route_table.write().await;
         routes.clear_exit_node();
         if let Some(router) = inner.router.as_ref() {
             let derp_map = inner.magicsock.get_derp_map();
+            let exit_node_allow_lan_access = inner.prefs.read().await.ExitNodeAllowLANAccess;
             sync_router(
                 router,
                 &inner.tailscale_ips,
                 &routes,
                 derp_map.as_ref(),
                 &self.config.control_url,
+                exit_node_allow_lan_access,
             )?;
         }
         if matches!(inner.data_plane, DataPlane::Tun) {

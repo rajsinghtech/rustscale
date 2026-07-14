@@ -8,6 +8,12 @@ use tokio::io::AsyncWriteExt;
 use crate::CliError;
 
 pub async fn run(args: Vec<String>, socket: &Path, _json: bool) -> Result<(), CliError> {
+    let client = LocalClient::new(socket);
+    let status = client.status().await?;
+    if let Some(description) = crate::commands::status::backend_state_description(&status) {
+        return Err(CliError(description));
+    }
+
     if args.len() != 2 || args.iter().any(|arg| arg.starts_with('-')) {
         return Err(CliError(
             "usage: rustscale nc <hostname-or-IP> <port>".into(),
@@ -18,7 +24,6 @@ pub async fn run(args: Vec<String>, socket: &Path, _json: bool) -> Result<(), Cl
         .parse()
         .map_err(|_| CliError(format!("invalid port: {}", args[1])))?;
 
-    let client = LocalClient::new(socket);
     let stream = client.dial_tcp_stream(host, port).await?;
     let (mut read_half, mut write_half) = tokio::io::split(stream);
 
@@ -50,4 +55,40 @@ pub async fn run(args: Vec<String>, socket: &Path, _json: bool) -> Result<(), Cl
         .map_err(|error| CliError(error.to_string()))?
         .map_err(|error| CliError(error.to_string()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use crate::commands::status::backend_state_description;
+
+    #[test]
+    fn nc_allows_only_running_or_starting_backend_states() {
+        for state in ["Running", "Starting"] {
+            assert!(backend_state_description(&json!({"BackendState": state})).is_none());
+        }
+        for (state, description) in [
+            ("Stopped", "Tailscale is stopped."),
+            ("NeedsLogin", "Logged out."),
+            (
+                "NeedsMachineAuth",
+                "Machine is not yet approved by tailnet admin.",
+            ),
+            ("NoState", "unexpected state: NoState"),
+        ] {
+            assert_eq!(
+                backend_state_description(&json!({"BackendState": state})).as_deref(),
+                Some(description)
+            );
+        }
+        assert_eq!(
+            backend_state_description(&json!({
+                "BackendState": "NeedsLogin",
+                "AuthURL": "https://login.example.test/"
+            }))
+            .as_deref(),
+            Some("Logged out.\nLog in at: https://login.example.test/")
+        );
+    }
 }

@@ -2485,6 +2485,7 @@ dependencies = [
  "base64",
  "crc32fast",
  "flate2",
+ "if-addrs",
  "qrcode",
  "rustscale-ipn",
  "rustscale-ipnstate",

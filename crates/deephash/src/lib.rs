@@ -63,7 +63,7 @@ fn type_hash<T: ?Sized + 'static>() -> u64 {
 mod tests {
     use std::collections::HashMap;
 
-    use rustscale_ipn::Prefs;
+    use rustscale_ipn::{MaskedPrefs, Prefs};
     use rustscale_tailcfg::{FilterRule, Node};
 
     use super::{hash, update, Sum};
@@ -106,6 +106,48 @@ mod tests {
         assert_ne!(original, hash(&prefs));
         prefs.AdvertiseRoutes.push("192.0.2.0/24".into());
         assert_ne!(original, hash(&prefs));
+    }
+
+    #[test]
+    fn masked_prefs_mask_bits_affect_hash() {
+        let cases: [(&str, fn(&mut MaskedPrefs)); 25] = [
+            ("ControlURLSet", |p| p.ControlURLSet = true),
+            ("WantRunningSet", |p| p.WantRunningSet = true),
+            ("LoggedOutSet", |p| p.LoggedOutSet = true),
+            ("RouteAllSet", |p| p.RouteAllSet = true),
+            ("ExitNodeIDSet", |p| p.ExitNodeIDSet = true),
+            ("ExitNodeIPSet", |p| p.ExitNodeIPSet = true),
+            ("CorpDNSSet", |p| p.CorpDNSSet = true),
+            ("ShieldsUpSet", |p| p.ShieldsUpSet = true),
+            ("HostnameSet", |p| p.HostnameSet = true),
+            ("AdvertiseRoutesSet", |p| p.AdvertiseRoutesSet = true),
+            ("AdvertiseTagsSet", |p| p.AdvertiseTagsSet = true),
+            ("OperatorUserSet", |p| p.OperatorUserSet = true),
+            ("EphemeralSet", |p| p.EphemeralSet = true),
+            ("AcceptRoutesSet", |p| p.AcceptRoutesSet = true),
+            ("AdvertiseExitNodeSet", |p| p.AdvertiseExitNodeSet = true),
+            ("ExitNodeAllowLANAccessSet", |p| {
+                p.ExitNodeAllowLANAccessSet = true;
+            }),
+            ("AutoUpdateSet", |p| p.AutoUpdateSet = true),
+            ("NetfilterModeSet", |p| p.NetfilterModeSet = true),
+            ("NoSNATSet", |p| p.NoSNATSet = true),
+            ("PostureCheckingSet", |p| p.PostureCheckingSet = true),
+            ("AppConnectorSet", |p| p.AppConnectorSet = true),
+            ("RunWebClientSet", |p| p.RunWebClientSet = true),
+            ("RunSSHSet", |p| p.RunSSHSet = true),
+            ("NoStatefulFilteringSet", |p| {
+                p.NoStatefulFilteringSet = true;
+            }),
+            ("NoLogsNoSupportSet", |p| p.NoLogsNoSupportSet = true),
+        ];
+        let baseline = MaskedPrefs::default();
+        for (name, toggle) in cases {
+            let mut changed = MaskedPrefs::default();
+            toggle(&mut changed);
+            assert_ne!(hash(&baseline), hash(&changed), "mask bit {name}");
+            assert_eq!(hash(&changed), hash(&changed), "mask bit {name}");
+        }
     }
 
     #[test]

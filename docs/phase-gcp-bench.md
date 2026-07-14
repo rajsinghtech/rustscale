@@ -186,14 +186,20 @@ Each run produces a JSON file under `bench-results/gcp-<stamp>/<topology>/<path>
 
 ```json
 {
+  "schema_version": 2,
+  "status": "ok",
   "tool": "rustscale" | "tailscaled",
   "mode": "userspace" | "tun",
   "topology": "same-zone" | "cross-region",
   "path": "direct" | "derp",
   "config": "rs-userspace" | "rs-tun" | "ts-userspace" | "ts-tun",
+  "repeat": 3,
+  "parallelism_requested": [1, 10, 100],
   "throughput": [
-    {"parallel": 1, "mbps": 781.65, "duration_s": 30},
-    {"parallel": 10, "mbps": 1200.0, "duration_s": 30}
+    {"parallel": 1, "mbps": 781.65, "duration_s": 30,
+     "samples_mbps": [780.1, 781.65, 782.0], "statistic": "median"},
+    {"parallel": 10, "mbps": 1200.0, "duration_s": 30,
+     "samples_mbps": [1198.0, 1200.0, 1201.0], "statistic": "median"}
   ],
   "latency": {
     "p50_us": 180, "p95_us": 364, "p99_us": 1752, "count": 200
@@ -209,6 +215,26 @@ Each run produces a JSON file under `bench-results/gcp-<stamp>/<topology>/<path>
   "path_class_reported": "direct"
 }
 ```
+
+`matrix.json` records the selected topology/path/config lists, positive
+`repeat`, and the exact ordered `parallelism` list. Schema-v2 aggregation is
+fail-closed: every matrix-selected cell must appear exactly once with
+`status: "ok"`, an empty error, matching identity/path/repeat/parallelism, and
+finite positive measurements. Each throughput row must declare
+`statistic: "median"`; `mbps` must match the mathematical median of
+`samples_mbps` within only binary64/JSON round-off (`rel_tol=1e-12`,
+`abs_tol=1e-9`). Failed cells use `status: "failed"`, a nonempty actionable
+`error`/`log_tail`, and `null` measurements; they are never represented as zero
+throughput or latency. `aggregate.py --allow-partial` is reserved for
+historical dashboard collection: it may normalize positive pre-v2
+single-sample successes as visibly legacy data and turns old error/zero stubs
+into failed/null cells. Its output is visibly partial and is not a completed
+benchmark result.
+
+`run-matrix.sh --dry-run` has a separate finalization contract: it deliberately
+emits failed/null stub cells, aggregates them with `--allow-partial`, and
+renders a `DRY-RUN`/`PARTIAL` dashboard. It exits 0 with `##STATUS:DRY_RUN`,
+never reports production success, and still runs the normal exit cleanup.
 
 Final outputs:
 

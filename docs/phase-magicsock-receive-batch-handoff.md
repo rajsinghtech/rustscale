@@ -20,6 +20,31 @@ Tokio channel entries and then immediately drains those entries back into a
 TUN batch. Relevant paths are `crates/magicsock/src/udp_batch.rs`,
 `crates/magicsock/src/lib.rs`, and `crates/tsnet/src/tun_pump.rs`.
 
+## Final Linux validation
+
+The accepted bounded-pool candidate is commit `33b6b4a`, measured by the exact
+same-zone/direct `rs-tun --profile --repeat 3` workflow at
+`bench-results/gcp-20260713-235632`. Relative to the `737d73b` baseline at
+`gcp-20260713-213538`:
+
+- P1: 1898.846 to 1968.383 Mbps (+3.66%).
+- P10: 1896.366 to 2009.813 Mbps (+5.98%).
+- P100: 1638.981 to 1637.574 Mbps (-0.09%).
+- Latency p50/p95/p99: 990/2550/9470 to 931/1160/1230 microseconds
+  (-5.96%/-54.51%/-87.01%).
+- Client `malloc` sampled self CPU: 3.13% to 0.14% (-95.5%).
+- RX queue overflow delta: 2153 to 605.
+- Average CPU: 74.42% to 76.87% (+3.29%).
+- Peak/average RSS: 15232/15068.55 to 16384/16349.27 KiB
+  (+1152/+1280.72 KiB).
+- Binary size: 15431616 to 15490280 bytes (+58664 bytes).
+
+The RSS increase is the deliberate resident cost of the fixed replacement
+inventory, not benchmark noise. It is accepted here because it removes the
+per-packet allocation hot spot, materially improves P1/P10 and latency, and
+preserves P100. The unbounded-copy alternative was rejected after
+`gcp-20260713-233612` regressed P100 by 10.38% and p50 latency by 43.43%.
+
 ## Goal
 
 Preserve receive bursts as one channel item from magicsock to tsnet while

@@ -18,7 +18,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 static ENABLED: AtomicBool = AtomicBool::new(true);
 static BIND_TO_INTERFACE_BY_ROUTE: AtomicBool = AtomicBool::new(false);
-static DISABLE_BIND_CONN_TO_INTERFACE: AtomicBool = AtomicBool::new(false);
+// Binding magicsock's own UDP sockets to the default physical interface is a
+// route-loop bypass that is only needed when the OS route table sends the
+// node's traffic back through our tunnel (TUN full-tunnel / exit-node mode).
+// In userspace tsnet mode it is actively harmful: pinning to the physical
+// interface breaks loopback and same-machine direct UDP (rustscale's
+// localhost-direct path). Default to disabled; TUN/exit-node mode opts in via
+// `set_disable_bind_conn_to_interface(false)`.
+static DISABLE_BIND_CONN_TO_INTERFACE: AtomicBool = AtomicBool::new(true);
 
 pub fn set_enabled(on: bool) {
     ENABLED.store(on, Ordering::Relaxed);

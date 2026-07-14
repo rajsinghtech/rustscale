@@ -34,7 +34,7 @@ use rustscale_ipn::{LoginProfile, MaskedPrefs, NotifyWatchOpt, Prefs, StartOptio
 use rustscale_ipnstate::PingResult;
 use rustscale_tailcfg::DERPMap;
 use rustscale_tsnet::{FileTarget, ServeConfig};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 use rustscale_safesocket::Connection;
 
@@ -437,6 +437,55 @@ impl LocalClient {
         Ok(json)
     }
 
+    /// POST /localapi/v0/dial with `Upgrade: ts-dial`, returning the raw
+    /// LocalAPI connection after the daemon has connected it to `host:port`
+    /// through the tailnet.
+    pub async fn dial_tcp_stream(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> Result<Connection, LocalClientError> {
+        if host.is_empty() || host.contains(['\r', '\n']) {
+            return Err(LocalClientError::Io("invalid dial host".into()));
+        }
+
+        let mut stream = rustscale_safesocket::connect(&self.socket_path)
+            .map_err(|e| LocalClientError::Connect(e.to_string()))?;
+        let request = format!(
+            "POST /localapi/v0/dial HTTP/1.1\r\nHost: {LOCAL_API_HOST}\r\n\
+             Upgrade: ts-dial\r\nConnection: upgrade\r\nDial-Host: {host}\r\n\
+             Dial-Port: {port}\r\nDial-Network: tcp\r\nContent-Length: 0\r\n\r\n"
+        );
+        stream.write_all(request.as_bytes()).await?;
+        stream.flush().await?;
+
+        let header = read_upgrade_response_header(&mut stream).await?;
+        let header_text = std::str::from_utf8(&header)
+            .map_err(|_| LocalClientError::Io("non-utf8 response header".into()))?;
+        let mut lines = header_text.split("\r\n");
+        let status_line = lines
+            .next()
+            .ok_or_else(|| LocalClientError::Io("missing response status".into()))?;
+        let status = status_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|value| value.parse::<u16>().ok())
+            .unwrap_or(0);
+        let upgraded = lines
+            .filter_map(|line| line.split_once(':'))
+            .any(|(name, value)| {
+                name.trim().eq_ignore_ascii_case("upgrade")
+                    && value.trim().eq_ignore_ascii_case("ts-dial")
+            });
+        if status != 101 || !upgraded {
+            return Err(LocalClientError::HttpStatus {
+                status,
+                message: format!("unexpected dial upgrade response: {status_line}"),
+            });
+        }
+        Ok(stream)
+    }
+
     /// GET /localapi/v0/dns-query?name=<name>&type=<type> — query the
     /// daemon's DNS resolver. Returns JSON with `name`, `type`, `results`,
     /// and `magicdns_enabled`.
@@ -668,6 +717,24 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
+/// Read an upgrade response one byte at a time so no raw proxied bytes are
+/// consumed along with the HTTP headers. After this returns, `stream` starts
+/// exactly at the dialed TCP stream.
+async fn read_upgrade_response_header(
+    stream: &mut (impl AsyncRead + Unpin),
+) -> Result<Vec<u8>, LocalClientError> {
+    let mut header = Vec::with_capacity(256);
+    let mut byte = [0u8; 1];
+    while !header.ends_with(b"\r\n\r\n") {
+        stream.read_exact(&mut byte).await?;
+        header.push(byte[0]);
+        if header.len() > 256 * 1024 {
+            return Err(LocalClientError::Io("header too large".into()));
+        }
+    }
+    Ok(header)
+}
+
 /// Split a `type=pair` PEM blob into `(cert_pem, key_pem)`. The wire format
 /// (matching Go's `serveKeyPair`) is key PEM first, then cert PEM. We split
 /// at the boundary between the first PEM block end and the second begin.
@@ -798,6 +865,27 @@ mod tests {
     fn test_local_client_construction() {
         let lc = LocalClient::new("/tmp/test.sock");
         assert_eq!(lc.socket_path(), std::path::Path::new("/tmp/test.sock"));
+    }
+
+    #[tokio::test]
+    async fn upgrade_header_reader_does_not_consume_proxied_bytes() {
+        let (mut reader, mut writer) = tokio::io::duplex(1024);
+        let server = tokio::spawn(async move {
+            writer
+                .write_all(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: ts-dial\r\n\r\nhello")
+                .await
+                .unwrap();
+        });
+
+        let header = read_upgrade_response_header(&mut reader).await.unwrap();
+        assert_eq!(
+            header,
+            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: ts-dial\r\n\r\n"
+        );
+        let mut proxied = [0u8; 5];
+        reader.read_exact(&mut proxied).await.unwrap();
+        assert_eq!(&proxied, b"hello");
+        server.await.unwrap();
     }
 
     #[test]

@@ -739,7 +739,7 @@ async fn write_access_denied<W: AsyncWrite + Unpin>(conn: &mut W) -> Result<(), 
     write_json_response(conn, 403, "Forbidden", &body).await
 }
 
-pub(crate) async fn dispatch<W: AsyncWrite + Unpin>(
+pub(crate) async fn dispatch<W: AsyncRead + AsyncWrite + Unpin>(
     conn: &mut W,
     req: &HttpRequest,
     state: &Arc<LocalApiState>,
@@ -928,9 +928,15 @@ pub(crate) async fn dispatch<W: AsyncWrite + Unpin>(
             handle_debug(conn, &req.query, state).await?;
         }
 
-        // --- POST /localapi/v0/dial?addr=<host:port> ---
+        // --- POST /localapi/v0/dial (ts-dial upgrade or legacy JSON) ---
         "dial" if method == "POST" => {
-            handle_dial(conn, &req.query, state).await?;
+            if request_header(req, "upgrade")
+                .is_some_and(|value| value.eq_ignore_ascii_case("ts-dial"))
+            {
+                handle_tcp_dial(conn, req, state).await?;
+            } else {
+                handle_dial(conn, &req.query, state).await?;
+            }
         }
 
         // --- GET /localapi/v0/dns-query?name=<name>&type=<type> ---
@@ -2238,6 +2244,14 @@ fn resolve_dial_addr(addr: &str, peers: &[Node]) -> Option<SocketAddr> {
     None
 }
 
+fn request_header<'a>(request: &'a HttpRequest, name: &str) -> Option<&'a str> {
+    request
+        .headers
+        .iter()
+        .find(|(header, _)| header.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
+
 /// Handle GET /localapi/v0/debug?action=<method>
 ///
 /// Generic debug endpoint. The `action` query parameter selects the
@@ -2590,6 +2604,60 @@ async fn handle_dial<W: AsyncWrite + Unpin>(
         });
         write_json_response(conn, 503, "Service Unavailable", &body).await?;
     }
+    Ok(())
+}
+
+/// Handle an HTTP `Upgrade: ts-dial` request by connecting the LocalAPI
+/// socket to the requested tailnet TCP stream.
+async fn handle_tcp_dial<W: AsyncRead + AsyncWrite + Unpin>(
+    conn: &mut W,
+    request: &HttpRequest,
+    state: &Arc<LocalApiState>,
+) -> Result<(), std::io::Error> {
+    let Some(host) = request_header(request, "dial-host").filter(|host| !host.is_empty()) else {
+        let body = serde_json::json!({"error": "missing Dial-Host header"});
+        write_json_response(conn, 400, "Bad Request", &body).await?;
+        return Ok(());
+    };
+    let Some(port) = request_header(request, "dial-port").and_then(|port| port.parse::<u16>().ok())
+    else {
+        let body = serde_json::json!({"error": "invalid Dial-Port header"});
+        write_json_response(conn, 400, "Bad Request", &body).await?;
+        return Ok(());
+    };
+    if request_header(request, "dial-network") != Some("tcp") {
+        let body = serde_json::json!({"error": "only Dial-Network: tcp is supported"});
+        write_json_response(conn, 400, "Bad Request", &body).await?;
+        return Ok(());
+    }
+    let Some(netstack) = &state.netstack else {
+        let body = serde_json::json!({"error": "netstack not available"});
+        write_json_response(conn, 503, "Service Unavailable", &body).await?;
+        return Ok(());
+    };
+
+    let addr = format!("{host}:{port}");
+    let Some(socket_addr) = resolve_dial_addr(&addr, &state.peers.read().await) else {
+        let body = serde_json::json!({"error": "could not resolve address"});
+        write_json_response(conn, 404, "Not Found", &body).await?;
+        return Ok(());
+    };
+    let mut tailnet_stream = match netstack.dial(socket_addr).await {
+        Ok(stream) => stream,
+        Err(error) => {
+            let body =
+                serde_json::json!({"error": format!("failed to dial {socket_addr}: {error}")});
+            write_json_response(conn, 502, "Bad Gateway", &body).await?;
+            return Ok(());
+        }
+    };
+
+    conn.write_all(
+        b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: ts-dial\r\nConnection: upgrade\r\n\r\n",
+    )
+    .await?;
+    conn.flush().await?;
+    tokio::io::copy_bidirectional(conn, &mut tailnet_stream).await?;
     Ok(())
 }
 

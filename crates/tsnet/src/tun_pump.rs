@@ -715,7 +715,7 @@ mod tests {
         .enumerate()
         .map(|(index, peer)| rustscale_magicsock::WgDatagram {
             peer,
-            data: vec![index as u8],
+            data: vec![index as u8].into(),
         })
         .collect::<Vec<_>>();
         let mut runs = Vec::new();
@@ -766,7 +766,7 @@ mod tests {
                 .expect("one wireguard data packet");
             inbound.datagrams.push(rustscale_magicsock::WgDatagram {
                 peer: a_public.clone(),
-                data: ciphertext,
+                data: ciphertext.into(),
             });
         }
         let tunnels = RwLock::new(HashMap::from([(a_public.clone(), receiver.clone())]));
@@ -836,7 +836,8 @@ mod tests {
                     .expect("batch encrypt")
                     .into_iter()
                     .next()
-                    .expect("one batch data datagram"),
+                    .expect("one batch data datagram")
+                    .into(),
             });
         }
         let second = batch_datagrams.split_off(1);
@@ -873,7 +874,8 @@ mod tests {
                     .expect("scalar encrypt")
                     .into_iter()
                     .next()
-                    .expect("one scalar data datagram"),
+                    .expect("one scalar data datagram")
+                    .into(),
             }];
             collect_tun_inbound_batch(&scalar_tunnels, &mut scalar_inbound).await;
         }
@@ -889,7 +891,7 @@ mod tests {
             (start..start + count)
                 .map(|byte| rustscale_magicsock::WgDatagram {
                     peer: peer.clone(),
-                    data: vec![byte as u8],
+                    data: vec![byte as u8].into(),
                 })
                 .collect::<Vec<_>>()
         };
@@ -915,7 +917,8 @@ mod tests {
             vec![0, 1, 2]
         );
         assert_eq!(deferred.len(), 126);
-        assert_eq!(deferred.into_datagrams()[0].data, vec![3]);
+        let deferred = deferred.into_datagrams();
+        assert_eq!(deferred[0].data, vec![3]);
     }
 
     #[tokio::test]
@@ -969,7 +972,7 @@ mod tests {
                 .expect("one wireguard data packet");
             inbound.datagrams.push(rustscale_magicsock::WgDatagram {
                 peer: peer.clone(),
-                data: ciphertext,
+                data: ciphertext.into(),
             });
             expected_peers.push(peer.clone());
         }
@@ -1029,7 +1032,8 @@ mod tests {
                     .expect("encrypt packet")
                     .into_iter()
                     .next()
-                    .expect("one wireguard data packet"),
+                    .expect("one wireguard data packet")
+                    .into(),
             });
         }
 

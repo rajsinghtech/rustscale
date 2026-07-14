@@ -50,9 +50,12 @@ pub use relay_manager::{
 pub use relay_server::RelayServerExtension;
 
 use std::collections::HashMap;
+use std::fmt;
 #[cfg(any(target_os = "linux", test))]
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::ops::Deref;
+use std::ops::Range;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -149,17 +152,29 @@ async fn publish_wg_batch(
     };
     // If this await is cancelled or the receiver is closed, `batch` is
     // dropped and its owned permit returns all packet credits.
+    let batch = WgReceiveBatch::new(datagrams, permit);
+    let _ = sender.send(batch).await;
+}
+
+/// Publish ciphertexts after a Linux direct receive has reserved their packet
+/// credits before detaching scratch storage. No borrow or map lock crosses the
+/// await in this helper.
+#[cfg(target_os = "linux")]
+async fn publish_reserved_wg_batch(
+    sender: &mpsc::Sender<WgReceiveBatch>,
+    datagrams: Vec<WgDatagram>,
+    credits: Arc<WgBatchCredits>,
+) {
+    debug_assert!(!datagrams.is_empty());
     let batch = WgReceiveBatch {
         datagrams,
-        _permit: permit,
+        _credits: credits,
     };
     let _ = sender.send(batch).await;
 }
 
-/// Publish a Linux direct receive burst after all borrowed socket storage has
-/// been copied into owned datagrams. Moving the staging Vec into the channel
-/// item ensures no `ReceiveBatch` borrow crosses the capacity await.
-#[cfg(any(target_os = "linux", test))]
+/// Test-only publication helper for pre-owned staged datagrams.
+#[cfg(test)]
 async fn publish_linux_wg_batch(
     sender: &mpsc::Sender<WgReceiveBatch>,
     credits: &Arc<Semaphore>,
@@ -169,23 +184,125 @@ async fn publish_linux_wg_batch(
     publish_wg_batch(sender, credits, datagrams).await;
 }
 
-/// Identify and copy ordinary direct WireGuard packets in receive order while
-/// the caller holds its one address-map and endpoints-map snapshots. Adjacent
-/// packets from one source share one peer and endpoint lookup; a source seen
-/// again after another source begins a new run.
+/// Identify ordinary direct WireGuard source runs before awaiting capacity.
+/// The source map is consulted once for every contiguous run; the resulting
+/// per-packet peer identities let detachment happen later without any lock.
+#[derive(Debug)]
 #[cfg(any(target_os = "linux", test))]
-fn stage_linux_wg_datagrams<'a>(
-    packets: impl IntoIterator<Item = (&'a [u8], SocketAddr)>,
+struct IdentifiedLinuxWg {
+    peers: Vec<Option<NodePublic>>,
+    received_at: std::time::Instant,
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn identify_linux_wg_peers(
+    sources: impl IntoIterator<Item = SocketAddr>,
     peers: &HashMap<SocketAddr, NodePublic>,
+    received_at: std::time::Instant,
+) -> IdentifiedLinuxWg {
+    let mut identified = Vec::with_capacity(WG_RECEIVE_BATCH_MAX_PACKETS);
+    let mut previous = None;
+    let mut peer = None;
+    for source in sources {
+        if previous != Some(source) {
+            peer = peers.get(&source).cloned();
+            previous = Some(source);
+        }
+        identified.push(peer.clone());
+    }
+    IdentifiedLinuxWg {
+        peers: identified,
+        received_at,
+    }
+}
+
+/// Detach identified ordinary direct WireGuard packets in receive order.
+/// `ReceiveBatch` fixed boxes are replaced before the next recvmmsg; no plain
+/// packet payload is copied. UDP GRO already copied its coalesced logical
+/// tails into those fixed boxes during split, which remains necessary so each
+/// published segment has independent stable storage.
+#[cfg(target_os = "linux")]
+fn detach_linux_wg_datagrams(
+    batch: &mut udp_batch::ReceiveBatch,
+    count: usize,
+    identified: &IdentifiedLinuxWg,
+    credits: &Arc<WgBatchCredits>,
     endpoints: &mut HashMap<NodePublic, Endpoint>,
     pending: &mut Vec<WgDatagram>,
     mut note_recv_udp: impl FnMut(&NodePublic, &mut Endpoint, std::time::Instant),
     mut record_rx: impl FnMut(usize, usize),
 ) {
-    let mut packets = packets.into_iter().peekable();
-    let now = std::time::Instant::now();
+    debug_assert_eq!(identified.peers.len(), count);
     let (mut udp4_rx_bytes, mut udp6_rx_bytes) = (0, 0);
+    let mut previous = None;
 
+    for (index, peer) in identified.peers.iter().enumerate() {
+        let (len, addr) = batch
+            .datagram_meta(index)
+            .expect("published receive batch has metadata for every logical datagram");
+        if previous != Some(addr) {
+            previous = Some(addr);
+            if let Some(peer) = peer {
+                if let Some(endpoint) = endpoints.get_mut(peer) {
+                    note_recv_udp(peer, endpoint, identified.received_at);
+                }
+            }
+        }
+        match addr {
+            SocketAddr::V4(_) => udp4_rx_bytes += len,
+            SocketAddr::V6(_) => udp6_rx_bytes += len,
+        }
+        if let Some(peer) = peer {
+            let (packet, detached_source) = batch
+                .detach_datagram(index)
+                .expect("reserved receive credit always has fixed pooled replacement");
+            debug_assert_eq!(addr, detached_source);
+            pending.push(WgDatagram {
+                peer: peer.clone(),
+                data: WgCiphertext::from_pooled(packet, credits.clone()),
+            });
+        }
+    }
+
+    record_rx(udp4_rx_bytes, udp6_rx_bytes);
+}
+
+// Keep the source-run accounting seam executable independently of recvmmsg.
+// Linux production uses the detach variant above; this test version models
+// only ordering/accounting with ordinary owned vectors.
+#[cfg(test)]
+fn stage_linux_wg_datagrams<'a>(
+    packets: impl IntoIterator<Item = (&'a [u8], SocketAddr)>,
+    peers: &HashMap<SocketAddr, NodePublic>,
+    endpoints: &mut HashMap<NodePublic, Endpoint>,
+    pending: &mut Vec<WgDatagram>,
+    note_recv_udp: impl FnMut(&NodePublic, &mut Endpoint, std::time::Instant),
+    record_rx: impl FnMut(usize, usize),
+) {
+    stage_linux_wg_datagrams_at(
+        packets,
+        peers,
+        endpoints,
+        pending,
+        std::time::Instant::now(),
+        note_recv_udp,
+        record_rx,
+    );
+}
+
+#[cfg(test)]
+fn stage_linux_wg_datagrams_at<'a>(
+    packets: impl IntoIterator<Item = (&'a [u8], SocketAddr)>,
+    peers: &HashMap<SocketAddr, NodePublic>,
+    endpoints: &mut HashMap<NodePublic, Endpoint>,
+    pending: &mut Vec<WgDatagram>,
+    received_at: std::time::Instant,
+    mut note_recv_udp: impl FnMut(&NodePublic, &mut Endpoint, std::time::Instant),
+    mut record_rx: impl FnMut(usize, usize),
+) {
+    let mut packets = packets.into_iter().peekable();
+    let now = received_at;
+    let (mut udp4_rx_bytes, mut udp6_rx_bytes) = (0, 0);
     while let Some((mut data, addr)) = packets.next() {
         let peer = peers.get(&addr);
         if let Some(peer) = peer {
@@ -193,31 +310,25 @@ fn stage_linux_wg_datagrams<'a>(
                 note_recv_udp(peer, endpoint, now);
             }
         }
-
         let mut run_bytes = 0;
         loop {
             run_bytes += data.len();
             if let Some(peer) = peer {
                 pending.push(WgDatagram {
                     peer: peer.clone(),
-                    data: data.to_vec(),
+                    data: data.to_vec().into(),
                 });
             }
-
-            let Some((next_data, _next_addr)) =
-                packets.next_if(|(_, next_addr)| *next_addr == addr)
-            else {
+            let Some((next_data, _)) = packets.next_if(|(_, next)| *next == addr) else {
                 break;
             };
             data = next_data;
         }
-
         match addr {
             SocketAddr::V4(_) => udp4_rx_bytes += run_bytes,
             SocketAddr::V6(_) => udp6_rx_bytes += run_bytes,
         }
     }
-
     record_rx(udp4_rx_bytes, udp6_rx_bytes);
 }
 
@@ -328,22 +439,154 @@ pub struct MagicsockConfig {
     pub control_knobs: Option<Arc<rustscale_controlknobs::ControlKnobs>>,
 }
 
+/// Owned WireGuard ciphertext.
+///
+/// This is a deliberate v0.1 migration from `WgDatagram { data: Vec<u8> }`:
+/// a direct Linux packet can borrow a fixed receive buffer without copying, so
+/// it cannot be represented by a public `Vec` field. Use `vec.into()` when
+/// constructing a datagram, and use `AsRef<[u8]>`/slice indexing when reading
+/// one. `WgCiphertext` intentionally is not `Clone`: cloning pooled storage
+/// would either copy a packet or make its lifetime surprising.
+pub struct WgCiphertext {
+    storage: WgCiphertextStorage,
+}
+
+enum WgCiphertextStorage {
+    Vec {
+        bytes: Vec<u8>,
+        range: Range<usize>,
+    },
+    #[cfg(target_os = "linux")]
+    Pooled {
+        packet: udp_batch::PooledPacket,
+        // This is deliberately stored with each packet rather than with its
+        // containing Vec. Moving a packet out of a batch therefore cannot
+        // return a receive credit while fixed storage remains retained.
+        _credits: Arc<WgBatchCredits>,
+    },
+}
+
+/// The packet-credit reservation for one published receive batch. Every
+/// Linux pooled ciphertext from the batch owns an Arc to this guard.
+struct WgBatchCredits {
+    _permit: OwnedSemaphorePermit,
+}
+
+impl WgCiphertext {
+    /// Keep an existing owned frame and expose only its selected range.
+    pub fn from_vec_range(bytes: Vec<u8>, range: Range<usize>) -> Self {
+        assert!(
+            range.start <= range.end && range.end <= bytes.len(),
+            "ciphertext range must be within its owned frame"
+        );
+        Self {
+            storage: WgCiphertextStorage::Vec { bytes, range },
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn from_pooled(packet: udp_batch::PooledPacket, credits: Arc<WgBatchCredits>) -> Self {
+        Self {
+            storage: WgCiphertextStorage::Pooled {
+                packet,
+                _credits: credits,
+            },
+        }
+    }
+
+    /// Clone only ordinary owned-vector storage without copying a pooled
+    /// receive buffer. `None` means this ciphertext is pooled and must remain
+    /// uniquely owned until processing completes.
+    pub fn try_clone(&self) -> Option<Self> {
+        match &self.storage {
+            WgCiphertextStorage::Vec { bytes, range } => {
+                Some(Self::from_vec_range(bytes.clone(), range.clone()))
+            }
+            #[cfg(target_os = "linux")]
+            WgCiphertextStorage::Pooled { .. } => None,
+        }
+    }
+}
+
+impl From<Vec<u8>> for WgCiphertext {
+    fn from(bytes: Vec<u8>) -> Self {
+        let len = bytes.len();
+        Self::from_vec_range(bytes, 0..len)
+    }
+}
+
+impl AsRef<[u8]> for WgCiphertext {
+    fn as_ref(&self) -> &[u8] {
+        match &self.storage {
+            WgCiphertextStorage::Vec { bytes, range } => &bytes[range.clone()],
+            #[cfg(target_os = "linux")]
+            WgCiphertextStorage::Pooled { packet, .. } => packet.as_slice(),
+        }
+    }
+}
+
+impl Deref for WgCiphertext {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_ref()
+    }
+}
+
+impl fmt::Debug for WgCiphertext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("WgCiphertext").field(&self.as_ref()).finish()
+    }
+}
+
+impl PartialEq for WgCiphertext {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_ref() == other.as_ref()
+    }
+}
+
+impl Eq for WgCiphertext {}
+
+impl PartialEq<Vec<u8>> for WgCiphertext {
+    fn eq(&self, other: &Vec<u8>) -> bool {
+        self.as_ref() == other.as_slice()
+    }
+}
+
+impl PartialEq<WgCiphertext> for Vec<u8> {
+    fn eq(&self, other: &WgCiphertext) -> bool {
+        self.as_slice() == other.as_ref()
+    }
+}
+
+impl PartialEq<&[u8]> for WgCiphertext {
+    fn eq(&self, other: &&[u8]) -> bool {
+        self.as_ref() == *other
+    }
+}
+
+impl<const N: usize> PartialEq<&[u8; N]> for WgCiphertext {
+    fn eq(&self, other: &&[u8; N]) -> bool {
+        self.as_ref() == other.as_slice()
+    }
+}
+
 /// A received WG datagram with its sender identified.
 pub struct WgDatagram {
     /// The peer's WireGuard public key.
     pub peer: NodePublic,
     /// The raw WG ciphertext datagram.
-    pub data: Vec<u8>,
+    pub data: WgCiphertext,
 }
 
 /// Ordered WireGuard receive burst handed to one tsnet consumer.
 ///
-/// The private owned semaphore permit accounts for every contained packet.
-/// It is released only when the batch is consumed through
-/// [`WgReceiveBatch::into_datagrams`] or dropped.
+/// Its private credit guard accounts for every contained packet. A Linux
+/// pooled ciphertext retains an Arc to that guard if it is moved out through
+/// [`WgReceiveBatch::into_datagrams`].
 pub struct WgReceiveBatch {
     datagrams: Vec<WgDatagram>,
-    _permit: OwnedSemaphorePermit,
+    _credits: Arc<WgBatchCredits>,
 }
 
 impl WgReceiveBatch {
@@ -358,6 +601,9 @@ impl WgReceiveBatch {
     }
 
     /// Consume this handoff item and return its datagrams in receive order.
+    ///
+    /// Pooled ciphertexts carry the batch credit guard themselves, so this
+    /// ordinary ownership operation cannot release credits early.
     pub fn into_datagrams(self) -> Vec<WgDatagram> {
         self.datagrams
     }
@@ -377,9 +623,13 @@ impl WgReceiveBatch {
         let permit = Arc::new(Semaphore::new(0))
             .try_acquire_many_owned(0)
             .expect("zero-credit test permit is always available");
+        Self::new(datagrams, permit)
+    }
+
+    fn new(datagrams: Vec<WgDatagram>, permit: OwnedSemaphorePermit) -> Self {
         Self {
             datagrams,
-            _permit: permit,
+            _credits: Arc::new(WgBatchCredits { _permit: permit }),
         }
     }
 }
@@ -1906,15 +2156,21 @@ fn spawn_recv_tasks(
             // active for diagnostics and old-kernel fallback behavior.
             let disable_udp_gro = std::env::var_os("RUSTSCALE_DISABLE_UDP_GRO").is_some();
             let mut batch = udp_batch::ReceiveBatch::new(&udp, disable_udp_gro);
-            // This is deliberately only an outer staging allocation. Every
-            // ciphertext Vec moves into the channel (or is dropped) before
-            // the next kernel receive, so an idle receive task does not pin
-            // a previous GRO-sized batch of buffers.
+            // `pending` is a reusable outer `Vec<WgDatagram>` staging buffer;
+            // pooled ciphertext ownership moves into the channel (or is dropped)
+            // before the next receive.
             let mut pending = Vec::with_capacity(udp_batch::MAX_BATCH);
             loop {
                 match udp.async_io(Interest::READABLE, || batch.recv(&udp)).await {
                     Ok(count) => {
-                        if inner.prepare_linux_udp_batch(&batch, count, &mut pending) {
+                        // This must precede every classification, lock, and
+                        // semaphore await: endpoint activity records packet
+                        // arrival rather than consumer backpressure delay.
+                        let received_at = std::time::Instant::now();
+                        if inner
+                            .prepare_linux_udp_batch(&mut batch, count, &mut pending, received_at)
+                            .await
+                        {
                             for index in 0..count {
                                 let Some((data, addr)) = batch.datagram(index) else {
                                     return;
@@ -1922,13 +2178,6 @@ fn spawn_recv_tasks(
                                 inner.record_udp_rx(addr, data.len());
                                 inner.handle_udp_packet(data, addr).await;
                             }
-                        } else {
-                            publish_linux_wg_batch(
-                                &inner.wg_send,
-                                &inner.wg_receive_credits,
-                                &mut pending,
-                            )
-                            .await;
                         }
                     }
                     Err(error) if udp_batch::recvmmsg_is_unsupported(&error) => {
@@ -1997,8 +2246,14 @@ fn spawn_recv_tasks(
         let mut derp_recv_rx = derp_recv_rx;
         while let Some((region_id, event)) = derp_recv_rx.recv().await {
             match event {
-                DerpEvent::RecvPacket { source, data } => {
-                    inner2.handle_derp_packet(&data, source, region_id).await;
+                DerpEvent::RecvPacket {
+                    source,
+                    frame,
+                    payload,
+                } => {
+                    inner2
+                        .handle_derp_packet(frame, payload, source, region_id)
+                        .await;
                 }
                 DerpEvent::PeerGone { peer, reason } => {
                     inner2.handle_derp_peer_gone(peer, region_id, reason);
@@ -2600,15 +2855,15 @@ impl Inner {
     /// handler. Control traffic deliberately takes the scalar path for the
     /// *whole* batch: disco and Geneve handling can update routing state and
     /// has historically been interleaved with direct WireGuard delivery in
-    /// packet order. The normal path completes all ReceiveBatch borrowing
-    /// before the caller awaits channel capacity, keeping ReceiveBatch
-    /// confined to its one non-Sync receive task.
+    /// packet order. The normal path identifies source runs, then awaits
+    /// credits with no batch borrow or map lock before detaching fixed slots.
     #[cfg(target_os = "linux")]
-    fn prepare_linux_udp_batch(
+    async fn prepare_linux_udp_batch(
         &self,
-        batch: &udp_batch::ReceiveBatch,
+        batch: &mut udp_batch::ReceiveBatch,
         count: usize,
         pending: &mut Vec<WgDatagram>,
+        received_at: std::time::Instant,
     ) -> bool {
         if linux_batch_requires_scalar_handler(
             (0..count).map(|index| batch.datagram(index).map(|(data, _)| data)),
@@ -2621,23 +2876,66 @@ impl Inner {
             return true;
         }
 
-        pending.clear();
-        // The all-ordinary-WireGuard path performs both peer identification
-        // and activity accounting under one snapshot. Do not hold either
-        // lock while waiting for channel capacity.
-        {
+        let identified = {
             let peers = self
                 .addr_to_peer
                 .read()
                 .expect("addr_to_peer lock poisoned");
-            let mut endpoints = self.endpoints.write().expect("endpoints lock poisoned");
-            stage_linux_wg_datagrams(
+            identify_linux_wg_peers(
                 (0..count).map(|index| {
                     batch
-                        .datagram(index)
+                        .datagram_meta(index)
                         .expect("published receive batch has every logical datagram")
+                        .1
                 }),
                 &peers,
+                received_at,
+            )
+        };
+        let known = identified
+            .peers
+            .iter()
+            .filter(|peer| peer.is_some())
+            .count();
+        if known == 0 {
+            pending.clear();
+            // Unknown ordinary direct packets are still accounted below, but
+            // need neither a credit nor a pooled detach.
+            let mut udp4_rx_bytes = 0;
+            let mut udp6_rx_bytes = 0;
+            for index in 0..count {
+                let (len, source) = batch
+                    .datagram_meta(index)
+                    .expect("published receive batch has every logical datagram");
+                match source {
+                    SocketAddr::V4(_) => udp4_rx_bytes += len,
+                    SocketAddr::V6(_) => udp6_rx_bytes += len,
+                }
+            }
+            self.record_linux_udp_batch_rx(udp4_rx_bytes, udp6_rx_bytes);
+            return false;
+        }
+        // No ReceiveBatch slice borrow or endpoint/address lock survives this
+        // await. Each pooled ciphertext subsequently holds an Arc to this
+        // credit guard until that ciphertext is dropped.
+        let Ok(permit) = self
+            .wg_receive_credits
+            .clone()
+            .acquire_many_owned(u32::try_from(known).expect("known batch count fits u32"))
+            .await
+        else {
+            return false;
+        };
+        let credits = Arc::new(WgBatchCredits { _permit: permit });
+
+        pending.clear();
+        {
+            let mut endpoints = self.endpoints.write().expect("endpoints lock poisoned");
+            detach_linux_wg_datagrams(
+                batch,
+                count,
+                &identified,
+                &credits,
                 &mut endpoints,
                 pending,
                 |_, endpoint, now| endpoint.note_recv_udp(now),
@@ -2646,10 +2944,19 @@ impl Inner {
                 },
             );
         }
+        debug_assert_eq!(pending.len(), known);
+        let datagrams = std::mem::take(pending);
+        publish_reserved_wg_batch(&self.wg_send, datagrams, credits).await;
         false
     }
 
-    async fn handle_derp_packet(&self, data: &[u8], source: NodePublic, region_id: i32) {
+    async fn handle_derp_packet(
+        &self,
+        frame: Vec<u8>,
+        payload: Range<usize>,
+        source: NodePublic,
+        region_id: i32,
+    ) {
         // Note DERP region frame for health tracking.
         if let Some(ref health) = self.derp.health {
             health.note_derp_region_frame(region_id);
@@ -2664,6 +2971,7 @@ impl Inner {
             }
         }
 
+        let data = &frame[payload.clone()];
         let is_disco = DiscoIo::looks_like_disco(data);
         if debug_enabled() {
             eprintln!(
@@ -2684,7 +2992,7 @@ impl Inner {
                 &self.wg_receive_credits,
                 vec![WgDatagram {
                     peer: source,
-                    data: data.to_vec(),
+                    data: WgCiphertext::from_vec_range(frame, payload),
                 }],
             )
             .await;
@@ -2731,7 +3039,7 @@ impl Inner {
                 &self.wg_receive_credits,
                 vec![WgDatagram {
                     peer,
-                    data: data.to_vec(),
+                    data: data.to_vec().into(),
                 }],
             )
             .await;
@@ -2798,7 +3106,7 @@ impl Inner {
                 &self.wg_receive_credits,
                 vec![WgDatagram {
                     peer,
-                    data: data.to_vec(),
+                    data: data.to_vec().into(),
                 }],
             )
             .await;
@@ -3283,9 +3591,65 @@ mod linux_batch_tests {
         (0..count)
             .map(|index| WgDatagram {
                 peer: peer.clone(),
-                data: vec![index as u8],
+                data: vec![index as u8].into(),
             })
             .collect()
+    }
+
+    #[test]
+    fn owned_ciphertext_range_exposes_exact_derp_payload() {
+        let frame = b"prefix-derp-ciphertext-suffix".to_vec();
+        let ciphertext = WgCiphertext::from_vec_range(frame, 7..22);
+        assert_eq!(ciphertext.as_ref(), b"derp-ciphertext");
+        assert_eq!(&*ciphertext, b"derp-ciphertext");
+    }
+
+    #[test]
+    fn ciphertext_v01_migration_api_is_ergonomic_for_owned_vectors() {
+        let ciphertext: WgCiphertext = vec![1, 2, 3].into();
+        assert_eq!(ciphertext.as_ref(), [1, 2, 3]);
+        assert_eq!(&*ciphertext, [1, 2, 3]);
+        assert_eq!(ciphertext, vec![1, 2, 3]);
+        assert_eq!(vec![1, 2, 3], ciphertext);
+        assert_eq!(ciphertext.try_clone().unwrap().as_ref(), [1, 2, 3]);
+        assert_eq!(format!("{ciphertext:?}"), "WgCiphertext([1, 2, 3])");
+        let _datagram = WgDatagram {
+            peer: NodePrivate::generate().public(),
+            data: vec![4, 5].into(),
+        };
+    }
+
+    #[test]
+    fn direct_identification_keeps_pre_backpressure_arrival_timestamp() {
+        let address: SocketAddr = "127.0.0.1:10001".parse().unwrap();
+        let peer = NodePrivate::generate().public();
+        let arrival = std::time::Instant::now();
+        let identified =
+            identify_linux_wg_peers([address], &HashMap::from([(address, peer)]), arrival);
+        std::thread::sleep(Duration::from_millis(10));
+
+        assert_eq!(identified.peers.len(), 1);
+        assert_eq!(identified.received_at, arrival);
+        assert!(identified.received_at.elapsed() >= Duration::from_millis(10));
+    }
+
+    #[test]
+    fn delayed_capacity_still_notes_direct_endpoint_at_arrival() {
+        let peer = NodePrivate::generate().public();
+        let address: SocketAddr = "127.0.0.1:10001".parse().unwrap();
+        let arrival = std::time::Instant::now();
+        std::thread::sleep(Duration::from_millis(10));
+        let mut noted = Vec::new();
+        stage_linux_wg_datagrams_at(
+            [(b"packet".as_slice(), address)],
+            &HashMap::from([(address, peer.clone())]),
+            &mut HashMap::from([(peer.clone(), endpoint(peer.clone()))]),
+            &mut Vec::new(),
+            arrival,
+            |_, _, timestamp| noted.push(timestamp),
+            |_, _| {},
+        );
+        assert_eq!(noted, vec![arrival]);
     }
 
     fn advance_sequence(
@@ -3421,7 +3785,7 @@ mod linux_batch_tests {
         assert_eq!(
             pending
                 .iter()
-                .map(|datagram| (datagram.peer.clone(), datagram.data.clone()))
+                .map(|datagram| (datagram.peer.clone(), datagram.data.as_ref().to_vec()))
                 .collect::<Vec<_>>(),
             vec![
                 (a.clone(), b"a-first".to_vec()),
@@ -3599,16 +3963,22 @@ mod linux_batch_tests {
         assert_eq!(credits.available_permits(), 128);
         let batch = receiver.recv().await.expect("receive burst");
         assert_eq!(batch.len(), WG_RECEIVE_BATCH_MAX_PACKETS);
+        let datagrams = batch.into_datagrams();
         assert_eq!(
-            batch
-                .into_datagrams()
-                .into_iter()
-                .map(|datagram| datagram.data)
+            datagrams
+                .iter()
+                .map(|datagram| datagram.data.as_ref().to_vec())
                 .collect::<Vec<_>>(),
             (0..WG_RECEIVE_BATCH_MAX_PACKETS)
                 .map(|index| vec![index as u8])
                 .collect::<Vec<_>>()
         );
+        assert_eq!(
+            credits.available_permits(),
+            WG_RECEIVE_PACKET_CAPACITY,
+            "test vectors are ordinary owned ciphertexts"
+        );
+        drop(datagrams);
         assert_eq!(credits.available_permits(), WG_RECEIVE_PACKET_CAPACITY);
     }
 
@@ -3648,7 +4018,7 @@ mod linux_batch_tests {
                 &derp_credits,
                 vec![WgDatagram {
                     peer: derp_peer,
-                    data: b"derp".to_vec(),
+                    data: b"derp".to_vec().into(),
                 }],
             )
             .await;
@@ -3691,7 +4061,9 @@ mod linux_batch_tests {
         drop(third);
         let derp = receiver.recv().await.expect("DERP receive item");
         assert_eq!(derp.len(), 1);
-        assert_eq!(derp.into_datagrams()[0].data, b"derp");
+        let derp = derp.into_datagrams();
+        assert_eq!(derp[0].data, b"derp");
+        drop(derp);
 
         // The post-DERP direct burst may now acquire and publish, but it
         // cannot have delayed the scalar publication above.
@@ -3711,7 +4083,13 @@ mod linux_batch_tests {
         publish_linux_wg_batch(&sender, &credits, &mut staged).await;
         assert_eq!(credits.available_permits(), 253);
         let consumed = receiver.recv().await.expect("batch");
-        let _datagrams = consumed.into_datagrams();
+        let datagrams = consumed.into_datagrams();
+        assert_eq!(
+            credits.available_permits(),
+            WG_RECEIVE_PACKET_CAPACITY,
+            "ordinary Vec ciphertexts do not need a retained pool credit"
+        );
+        drop(datagrams);
         assert_eq!(credits.available_permits(), WG_RECEIVE_PACKET_CAPACITY);
 
         let mut staged = pending(4);

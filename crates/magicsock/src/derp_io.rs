@@ -4,6 +4,7 @@
 use rand::RngCore;
 use rustscale_derp::{decode_frame_header, encode_frame_header, frame_type, peer_gone_reason};
 use rustscale_key::NodePublic;
+use std::ops::Range;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -21,13 +22,29 @@ enum DerpCmd {
 #[derive(Debug, Clone)]
 pub enum DerpEvent {
     /// A data packet from peer `source`.
-    RecvPacket { source: NodePublic, data: Vec<u8> },
+    /// `frame` is the complete DERP frame body; `payload` selects the
+    /// WireGuard/disco bytes after the 32-byte source key. Keeping the frame
+    /// owned avoids a second `body[32..].to_vec()` copy on the hot path.
+    RecvPacket {
+        source: NodePublic,
+        frame: Vec<u8>,
+        payload: Range<usize>,
+    },
     /// The server reports that `peer` is no longer present.
     /// Mirrors Go's `derp.PeerGoneMessage` (derp_client.go:369-381).
     PeerGone { peer: NodePublic, reason: u8 },
     /// The server reports a health problem (empty string = healthy).
     /// Mirrors Go's `derp.HealthMessage` (derp_client.go).
     Health { problem: String },
+}
+
+fn recv_packet_event(frame: Vec<u8>) -> Option<DerpEvent> {
+    let source_bytes: [u8; 32] = frame.get(..32)?.try_into().ok()?;
+    Some(DerpEvent::RecvPacket {
+        source: NodePublic::from_raw32(source_bytes),
+        payload: 32..frame.len(),
+        frame,
+    })
 }
 
 /// Channel-based wrapper around a DERP connection.
@@ -120,16 +137,11 @@ impl DerpIo {
                     break;
                 }
 
-                if typ == frame_type::RECV_PACKET && body.len() >= 32 {
-                    let mut src = [0u8; 32];
-                    src.copy_from_slice(&body[..32]);
-                    let source = NodePublic::from_raw32(src);
-                    let data = body[32..].to_vec();
-                    if recv_tx
-                        .send(DerpEvent::RecvPacket { source, data })
-                        .await
-                        .is_err()
-                    {
+                if typ == frame_type::RECV_PACKET {
+                    let Some(event) = recv_packet_event(body) else {
+                        continue;
+                    };
+                    if recv_tx.send(event).await.is_err() {
                         break;
                     }
                 } else if typ == frame_type::PING && body.len() >= 8 {
@@ -204,5 +216,35 @@ impl DerpIo {
     /// Try to receive the next event from DERP (blocks until one is ready).
     pub async fn try_recv(&self) -> Option<DerpEvent> {
         self.recv_rx.lock().await.recv().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recv_packet_event_keeps_owned_frame_and_payload_range() {
+        let source = NodePublic::from_raw32([7; 32]);
+        let payload = b"exact DERP payload";
+        let mut frame = source.raw32().to_vec();
+        frame.extend_from_slice(payload);
+        let frame_ptr = frame.as_ptr();
+
+        let DerpEvent::RecvPacket {
+            source: actual_source,
+            frame,
+            payload: range,
+        } = recv_packet_event(frame).unwrap()
+        else {
+            unreachable!();
+        };
+        assert_eq!(actual_source, source);
+        assert_eq!(
+            frame.as_ptr(),
+            frame_ptr,
+            "frame ownership moved without copying"
+        );
+        assert_eq!(&frame[range], payload);
     }
 }

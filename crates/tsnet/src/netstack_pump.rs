@@ -92,7 +92,8 @@ async fn handle_inbound_wg_batch(
     packet_drops: &AtomicU64,
     capture: &crate::capture::CaptureSlot,
 ) {
-    handle_inbound_wg_datagrams(magicsock, wg_tunnels, batch.into_datagrams(), |pt| {
+    let datagrams = batch.into_datagrams();
+    handle_inbound_wg_datagrams(magicsock, wg_tunnels, &datagrams, |pt| {
         let dropped = {
             let mut filt = filter.lock().unwrap();
             filt.check_in(&pt).is_drop()
@@ -117,11 +118,11 @@ async fn handle_inbound_wg_batch(
 async fn handle_inbound_wg_datagrams(
     magicsock: &Magicsock,
     wg_tunnels: &RwLock<HashMap<NodePublic, Arc<Mutex<WgTunn>>>>,
-    datagrams: Vec<rustscale_magicsock::WgDatagram>,
+    datagrams: &[rustscale_magicsock::WgDatagram],
     deliver: impl Fn(Vec<u8>),
 ) {
     for dgram in datagrams {
-        handle_inbound_wg(magicsock, wg_tunnels, &dgram, |pt| {
+        handle_inbound_wg(magicsock, wg_tunnels, dgram, |pt| {
             deliver(pt);
         })
         .await;
@@ -326,13 +327,13 @@ mod tests {
         for packet in &plaintext {
             batch.push(rustscale_magicsock::WgDatagram {
                 peer: source_public.clone(),
-                data: encrypt(&sender, packet).await,
+                data: encrypt(&sender, packet).await.into(),
             });
         }
         for packet in &plaintext {
             scalar.push(rustscale_magicsock::WgDatagram {
                 peer: source_public.clone(),
-                data: encrypt(&sender, packet).await,
+                data: encrypt(&sender, packet).await.into(),
             });
         }
 
@@ -357,7 +358,7 @@ mod tests {
         let tunnels = RwLock::new(HashMap::from([(source_public, receiver)]));
         let batched_plaintext = Arc::new(std::sync::Mutex::new(Vec::new()));
         let batched_delivery = batched_plaintext.clone();
-        handle_inbound_wg_datagrams(&magicsock, &tunnels, batch, move |packet| {
+        handle_inbound_wg_datagrams(&magicsock, &tunnels, &batch, move |packet| {
             batched_delivery.lock().unwrap().push(packet);
         })
         .await;
@@ -365,7 +366,7 @@ mod tests {
         let scalar_plaintext = Arc::new(std::sync::Mutex::new(Vec::new()));
         for datagram in scalar {
             let scalar_delivery = scalar_plaintext.clone();
-            handle_inbound_wg_datagrams(&magicsock, &tunnels, vec![datagram], move |packet| {
+            handle_inbound_wg_datagrams(&magicsock, &tunnels, &[datagram], move |packet| {
                 scalar_delivery.lock().unwrap().push(packet);
             })
             .await;

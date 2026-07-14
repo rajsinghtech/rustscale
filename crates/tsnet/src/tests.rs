@@ -3463,7 +3463,8 @@ async fn collect_tun_inbound_queues_accepts_drops_and_captures_before_batch_muta
             .expect("encrypt accepted packet")
             .into_iter()
             .next()
-            .expect("encrypted WireGuard data datagram"),
+            .expect("encrypted WireGuard data datagram")
+            .into(),
     };
     let mut plaintext = Vec::new();
     let mut replies = Vec::new();
@@ -3512,7 +3513,8 @@ async fn collect_tun_inbound_queues_accepts_drops_and_captures_before_batch_muta
             .expect("encrypt dropped packet")
             .into_iter()
             .next()
-            .expect("encrypted WireGuard data datagram"),
+            .expect("encrypted WireGuard data datagram")
+            .into(),
     };
     collect_tun_inbound(
         &tunnels,

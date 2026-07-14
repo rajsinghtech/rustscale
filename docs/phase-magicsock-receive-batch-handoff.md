@@ -32,9 +32,16 @@ ordering, path/control handling, DERP progress, or UDP parsing behavior.
   a logical maximum of 128 packets.
 - Publish one channel item per receive burst rather than one per datagram.
 - Bound queued work with a packet-credit semaphore sized to the current total
-  packet allowance (256). A batch must acquire credits equal to its packet
-  count before publication and retain the permit until the batch is consumed
-  or dropped.
+  packet allowance (256). A batch acquires credits equal to its packet count
+  before publication and owns that permit while queued; consuming
+  `WgReceiveBatch` releases it immediately, while dropping a queued batch also
+  releases it.
+- Linux direct receive uses a separate fixed-buffer inventory semaphore. Of
+  512 fixed buffers, 128 remain permanently installed as `recvmmsg` scratch
+  and exactly 384 may be detached. A known direct batch reserves both channel
+  credits and its detached-buffer inventory before detaching slots. Pooled
+  ciphertexts retain only the shared inventory reservation until every buffer
+  in the detached batch has returned to the recycler.
 - DERP/scalar packets must use the same credit accounting and remain able to
   make progress under sustained direct UDP traffic.
 - The TUN path must move a received batch directly into its inbound scratch
@@ -43,17 +50,20 @@ ordering, path/control handling, DERP progress, or UDP parsing behavior.
 - Preserve direct/DERP ordering as observed at the existing publication point,
   missing-peer behavior, control/disco fallback, filtering, capture timing,
   reply ordering, and cancellation/closed-channel cleanup.
-- The first implementation may retain each `WgDatagram`'s owned `Vec<u8>`.
-  Pooling or moving UDP receive slots across an await boundary is explicitly a
-  later profile-gated phase.
+- Vector-backed scalar and DERP frames retain their existing owned storage and
+  range semantics. Only Linux direct WireGuard ciphertexts use the fixed pool.
 
 ## Verification
 
 - Differential scalar-versus-batch ordering for TUN and netstack consumers.
 - Exact 128-packet burst ordering.
 - Mixed DERP/direct traffic under the 256-packet credit limit.
-- Credits return when a batch is consumed, dropped, publication is cancelled,
-  or the channel is closed.
+- Channel credits return when a batch is consumed, dropped, publication is
+  cancelled, or the channel is closed; independent pool inventory returns only
+  after all pooled ciphertexts from its detached batch drop.
+- Retaining consumed direct ciphertexts can reach the 384-buffer pool limit;
+  the receive task waits for inventory rather than exhausting the recycler.
+- The 512-buffer total and refreshed `iovec` replacement invariants hold.
 - A full batch cannot turn the queue into 256 batches/32K packets.
 - Scalar control/disco fallback and missing-peer behavior remain unchanged.
 - Focused magicsock/tsnet tests, clippy, and `tools/check.sh` pass.

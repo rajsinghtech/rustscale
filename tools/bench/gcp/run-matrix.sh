@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # tools/bench/gcp/run-matrix.sh — main orchestrator for the GCP bench matrix.
 #
-# Runs the full 2x2x4 = 16-run matrix (topology × path × config) on dedicated
+# Defaults to the focused same-zone/direct rs-tun,ts-tun matrix. --full
+# restores the historical 2x2x4 = 16-cell matrix on dedicated
 # GCP VMs, writing per-run JSON + a combined summary.json + a standalone HTML
 # dashboard into bench-results/gcp-<stamp>/.
 #
 # Reuses tools/bench/lib.sh for ephemeral tailnet provisioning.
 #
 # Usage:
-#   tools/bench/gcp/run-matrix.sh            # full run
+#   tools/bench/gcp/run-matrix.sh            # focused run
 #   tools/bench/gcp/run-matrix.sh --dry-run  # validate args, no gcloud/API
 #
 # Environment:
@@ -16,6 +17,7 @@
 #   GCP_PROJECT                              — auto-detected from gcloud config
 #   GCP_DRY_RUN                              — set by --dry-run; propagated to lib.sh
 #   SKIP_VM_DELETE=1                         — keep VMs at the end (debugging)
+#   MATRIX_RESULTS_DIR                        — local validation output override
 
 set -euo pipefail
 
@@ -165,18 +167,20 @@ matrix_profile_self_test() {
   REPEAT=4
   PROFILE=1
   matrix_test_record_run_config() { calls+=("$1|${*:4}"); }
+  matrix_test_record_profile() { calls+=("profile|$*"); }
 
-  # Exercise the same selected-cell loop used by the matrix, with its
-  # run-config policy call mocked locally. Both cells must receive the same
-  # repeat, while only rustscale receives the rs-tun-only profiling flag.
+  # The profile diagnostic must be distinct from, and follow, all normal
+  # selected cells. Its profile-only option preserves the accepted rs-tun JSON.
   for config in rs-tun ts-tun; do
     matrix_run_config_cell "$config" s c sz cz key dir host client matrix_test_record_run_config
   done
-  unset -f matrix_test_record_run_config
+  matrix_run_profile_diagnostic s c sz cz profile-key dir host client matrix_test_record_profile
+  unset -f matrix_test_record_run_config matrix_test_record_profile
 
-  [[ ${#calls[@]} -eq 2 ]] || return 1
-  [[ "${calls[0]}" == 'rs-tun|rs-tun s c sz cz key dir host client --repeat 4 --profile' ]] || return 1
+  [[ ${#calls[@]} -eq 3 ]] || return 1
+  [[ "${calls[0]}" == 'rs-tun|rs-tun s c sz cz key dir host client --repeat 4' ]] || return 1
   [[ "${calls[1]}" == 'ts-tun|ts-tun s c sz cz key dir host client --repeat 4' ]] || return 1
+  [[ "${calls[2]}" == 'profile|rs-tun s c sz cz profile-key dir host client --repeat 4 --profile-only' ]] || return 1
 }
 
 # Build the directly invocable run-config command shape used by each cell.
@@ -187,9 +191,6 @@ matrix_build_run_config_args() {
   RUN_CONFIG_ARGS=(
     "$config" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" --repeat "$REPEAT"
   )
-  if [[ "$config" == rs-tun && $PROFILE -eq 1 ]]; then
-    RUN_CONFIG_ARGS+=(--profile)
-  fi
 }
 
 # Run one already-selected matrix cell. Keeping this invocation shape in a
@@ -205,6 +206,18 @@ matrix_run_config_cell() {
     tools/bench/gcp/run-config.sh "${RUN_CONFIG_ARGS[@]}"
 }
 
+# Run the one post-measurement rs-tun profile diagnostic. Unlike ordinary
+# cells, a failure here returns to the caller so a requested profile is never
+# silently treated as a successful matrix run.
+matrix_run_profile_diagnostic() {
+  local server_vm="$1" client_vm="$2" server_zone="$3" client_zone="$4"
+  local authkey="$5" results_dir="$6" server_hostname="$7" client_hostname="$8"
+  local runner="${9:-tools/bench/gcp/run-config.sh}"
+  "$runner" rs-tun "$server_vm" "$client_vm" "$server_zone" "$client_zone" \
+    "$authkey" "$results_dir" "$server_hostname" "$client_hostname" \
+    --repeat "$REPEAT" --profile-only
+}
+
 # Parse command-line options without contacting GCP.  Keeping this separate
 # makes the strict option contract directly self-testable.
 matrix_parse_args() {
@@ -215,11 +228,15 @@ matrix_parse_args() {
   TOPOLOGY_FILTER=""
   PATH_FILTER=""
   CONFIG_FILTER=""
-  local seen_dry_run=0 seen_profile=0 seen_repeat=0
+  FULL=0
+  local seen_dry_run=0 seen_profile=0 seen_repeat=0 seen_full=0
   local seen_topology=0 seen_path=0 seen_config=0
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
+      --full)
+        (( seen_full == 0 )) || { echo "duplicate option: --full" >&2; return 2; }
+        FULL=1; seen_full=1; shift ;;
       --topology)
         (( seen_topology == 0 )) || { echo "duplicate option: --topology" >&2; return 2; }
         [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || { echo "--topology requires a value" >&2; return 2; }
@@ -269,14 +286,14 @@ matrix_parse_args() {
 
 matrix_option_parsing_self_test() {
   local actual status
-  actual=$(matrix_parse_args; printf '%s/%s/%s/%s/%s/%s\n' "$REPEAT" "$PROFILE" "$DRY_RUN" "$TOPOLOGY_FILTER" "$PATH_FILTER" "$CONFIG_FILTER") || return 1
-  [[ "$actual" == '3/0/0///' ]] || return 1
-  actual=$(matrix_parse_args --repeat 1 --profile --topology same-zone --path direct --config rs-tun,ts-tun; printf '%s/%s/%s/%s/%s/%s\n' "$REPEAT" "$PROFILE" "$DRY_RUN" "$TOPOLOGY_FILTER" "$PATH_FILTER" "$CONFIG_FILTER") || return 1
-  [[ "$actual" == '1/1/0/same-zone/direct/rs-tun,ts-tun' ]] || return 1
+  actual=$(matrix_parse_args; printf '%s/%s/%s/%s/%s/%s/%s\n' "$REPEAT" "$PROFILE" "$DRY_RUN" "$FULL" "$TOPOLOGY_FILTER" "$PATH_FILTER" "$CONFIG_FILTER") || return 1
+  [[ "$actual" == '3/0/0/0///' ]] || return 1
+  actual=$(matrix_parse_args --full --repeat 1 --profile --topology same-zone --path direct --config rs-tun,ts-tun; printf '%s/%s/%s/%s/%s/%s/%s\n' "$REPEAT" "$PROFILE" "$DRY_RUN" "$FULL" "$TOPOLOGY_FILTER" "$PATH_FILTER" "$CONFIG_FILTER") || return 1
+  [[ "$actual" == '1/1/0/1/same-zone/direct/rs-tun,ts-tun' ]] || return 1
   actual=$(matrix_parse_args --dry-run --help --not-an-error; printf '%s/%s/%s\n' "$DRY_RUN" "$SHOW_HELP" "$REPEAT") || return 1
   [[ "$actual" == '1/1/3' ]] || return 1
   local -a case_args=()
-  for args in '--repeat' '--repeat 0' '--repeat 10' '--repeat 1.5' '--repeat 1 --repeat 2' '--profile --profile'; do
+  for args in '--repeat' '--repeat 0' '--repeat 10' '--repeat 1.5' '--repeat 1 --repeat 2' '--profile --profile' '--full --full'; do
     read -r -a case_args <<< "$args"
     if ( matrix_parse_args "${case_args[@]}" ) >/dev/null 2>&1; then
       return 1
@@ -422,7 +439,8 @@ ok = {"schema_version": 2, "status": "ok", "tool": "rustscale", "mode": "tun",
       "parallelism_requested": [1], "error": "", "log_tail": "",
       "throughput": [{"parallel": 1, "mbps": 1.0, "duration_s": 1.0,
                       "samples_mbps": [1.0], "statistic": "median"}],
-      "latency": {"p50_us": 1, "p95_us": 2, "p99_us": 3, "count": 1},
+      "latency": {"requested": 50, "transmitted": 50, "received": 50, "loss": 0,
+                  "p50_us": 1, "p95_us": 2, "p99_us": 3, "count": 50},
       "footprint": {"binary_size_bytes": 1, "rss_peak_kb": 1, "rss_avg_kb": 1,
                     "cpu_peak_pct": 0, "cpu_avg_pct": 0, "samples": 1},
       "path_class_reported": "direct"}
@@ -483,7 +501,8 @@ cell.write_text(json.dumps({
     "throughput": [{"parallel": value, "mbps": float(value), "duration_s": 1,
                     "samples_mbps": [float(value)] * 3, "statistic": "median"}
                    for value in parallelism],
-    "latency": {"p50_us": 1, "p95_us": 2, "p99_us": 3, "count": 1},
+    "latency": {"requested": 50, "transmitted": 50, "received": 50, "loss": 0,
+                "p50_us": 1, "p95_us": 2, "p99_us": 3, "count": 50},
     "footprint": {"binary_size_bytes": 1, "rss_peak_kb": 1, "rss_avg_kb": 1,
                   "cpu_peak_pct": 0, "cpu_avg_pct": 0, "samples": 1},
     "path_class_reported": "direct",
@@ -517,6 +536,7 @@ matrix_manifest_self_test
 matrix_finalization_self_test
 
 if (( MATRIX_SELF_TEST )); then
+  ssh_cmd_self_test
   package_tailscaled_cleanup_self_test
   startup_script_self_test
   echo "run-matrix self-tests: OK" >&2
@@ -528,9 +548,10 @@ fi
 # ---------------------------------------------------------------------------
 matrix_usage() {
   cat <<EOF
-usage: $0 [--dry-run] [--profile] [--repeat N] [--topology LIST] [--path LIST] [--config LIST]
-Runs the full 16-run GCP bench matrix.
+usage: $0 [--dry-run] [--full] [--profile] [--repeat N] [--topology LIST] [--path LIST] [--config LIST]
+Runs the focused same-zone/direct rs-tun,ts-tun GCP bench matrix.
   --dry-run  validate args + script structure without gcloud or API calls.
+  --full     restore the historical two-topology, two-path, four-config matrix.
   --topology comma-separated subset: same-zone,cross-region
   --path     comma-separated subset: direct,derp
   --config   comma-separated subset: rs-userspace,rs-tun,ts-userspace,ts-tun
@@ -556,19 +577,32 @@ declare -A ZONES=(
   [same-zone]="us-central1-a:us-central1-b"
   [cross-region]="us-central1-a:us-west1-a"
 )
-TOPOLOGIES=(same-zone cross-region)
-PATHS=(direct derp)
-CONFIGS=(rs-userspace rs-tun ts-userspace ts-tun)
+ALL_TOPOLOGIES=(same-zone cross-region)
+ALL_PATHS=(direct derp)
+ALL_CONFIGS=(rs-userspace rs-tun ts-userspace ts-tun)
+if (( FULL )); then
+  TOPOLOGIES=("${ALL_TOPOLOGIES[@]}")
+  PATHS=("${ALL_PATHS[@]}")
+  CONFIGS=("${ALL_CONFIGS[@]}")
+else
+  TOPOLOGIES=(same-zone)
+  PATHS=(direct)
+  CONFIGS=(rs-tun ts-tun)
+fi
 # This is serialized into matrix.json and must exactly match every result's
 # parallelism_requested list; changing the sweep is therefore self-describing.
 PARALLELS=(1 10 100)
 select_values() {
   local filter="$1"; shift
-  local -a available=("$@") selected=()
+  local -a available=("$@") selected=() seen_items=()
   [[ -z "$filter" ]] && { SELECTED=("${available[@]}"); return; }
-  local item candidate found
+  local item candidate found already_selected
   IFS=, read -r -a selected <<< "$filter"
   for item in "${selected[@]}"; do
+    [[ -n "$item" ]] || { echo "invalid selection: empty value" >&2; exit 2; }
+    already_selected=0
+    for candidate in "${seen_items[@]}"; do [[ "$item" == "$candidate" ]] && already_selected=1; done
+    (( already_selected == 0 )) || { echo "duplicate selection: $item" >&2; exit 2; }
     found=0
     for candidate in "${available[@]}"; do
       if [[ "$item" == "$candidate" ]]; then
@@ -576,12 +610,13 @@ select_values() {
       fi
     done
     (( found )) || { echo "invalid selection: $item" >&2; exit 2; }
+    seen_items+=("$item")
   done
   SELECTED=("${selected[@]}")
 }
-select_values "$TOPOLOGY_FILTER" "${TOPOLOGIES[@]}"; TOPOLOGIES=("${SELECTED[@]}")
-select_values "$PATH_FILTER" "${PATHS[@]}"; PATHS=("${SELECTED[@]}")
-select_values "$CONFIG_FILTER" "${CONFIGS[@]}"; CONFIGS=("${SELECTED[@]}")
+select_values "$TOPOLOGY_FILTER" "${ALL_TOPOLOGIES[@]}"; [[ -n "$TOPOLOGY_FILTER" ]] && TOPOLOGIES=("${SELECTED[@]}")
+select_values "$PATH_FILTER" "${ALL_PATHS[@]}"; [[ -n "$PATH_FILTER" ]] && PATHS=("${SELECTED[@]}")
+select_values "$CONFIG_FILTER" "${ALL_CONFIGS[@]}"; [[ -n "$CONFIG_FILTER" ]] && CONFIGS=("${SELECTED[@]}")
 if (( PROFILE )); then
   found=0
   for cfg in "${CONFIGS[@]}"; do [[ "$cfg" == rs-tun ]] && found=1; done
@@ -596,7 +631,7 @@ if [[ -z "$RUST_BUILD_COMMAND" ]]; then
 fi
 
 STAMP=$(date +%Y%m%d-%H%M%S)
-RESULTS_DIR="bench-results/gcp-$STAMP"
+RESULTS_DIR="${MATRIX_RESULTS_DIR:-bench-results/gcp-$STAMP}"
 mkdir -p "$RESULTS_DIR"
 MATRIX_MANIFEST_DRY_RUN="$DRY_RUN" matrix_write_manifest "$RESULTS_DIR/matrix.json" "$REPEAT" \
   "${TOPOLOGIES[@]}" -- "${PATHS[@]}" -- "${CONFIGS[@]}" -- "${PARALLELS[@]}"
@@ -715,6 +750,26 @@ for TOPO in "${TOPOLOGIES[@]}"; do
       matrix_run_config_cell "$CFG" "$SERVER_VM" "$CLIENT_VM" "$Z_A" "$Z_B" \
         "$AUTHKEY" "$RESULTS_DIR/$TOPO/$PATH_TAG" "rs-srv-$TOPO" "rs-cli-$TOPO"
     done
+
+    if (( PROFILE )); then
+      # Keep the profile diagnostic outside the normal selected-cell loop: it
+      # gets a fresh key and cannot repeat or overwrite rs-tun measurements.
+      if [[ $DRY_RUN -eq 1 ]]; then
+        AUTHKEY="tskey-dryrun-placeholder"
+      else
+        AUTHKEY=$(bench_mint_authkey)
+        echo "[gcp] minted fresh authkey for rs-tun profile diagnostic" >&2
+      fi
+      echo "[gcp] >>> profile: rs-tun (topo=$TOPO path=$PATH_TAG) <<<"
+      if matrix_run_profile_diagnostic "$SERVER_VM" "$CLIENT_VM" "$Z_A" "$Z_B" \
+        "$AUTHKEY" "$RESULTS_DIR/$TOPO/$PATH_TAG" "rs-srv-$TOPO" "rs-cli-$TOPO"; then
+        echo "[gcp] rs-tun profile: OK"
+      else
+        profile_status=$?
+        echo "[gcp] rs-tun profile: FAILED" >&2
+        exit "$profile_status"
+      fi
+    fi
 
     if [[ "$PATH_TAG" == "derp" ]]; then
       remove_derp_block "$SERVER_VM" "$Z_A"

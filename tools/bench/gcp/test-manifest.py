@@ -36,7 +36,8 @@ def valid(*, repeat=2, config="rs-tun", path="direct", parallels=PARALLELS):
     return {"schema_version": 2, "status": "ok", "tool": "rustscale", "mode": "tun",
             "topology": "same-zone", "path": path, "config": config, "repeat": repeat,
             "parallelism_requested": list(parallels), "error": "", "log_tail": "",
-            "throughput": rows, "latency": {"p50_us": 10, "p95_us": 20, "p99_us": 30, "count": 50},
+            "throughput": rows, "latency": {"requested": 50, "transmitted": 50, "received": 50,
+                                                "loss": 0, "p50_us": 10, "p95_us": 20, "p99_us": 30, "count": 50},
             "footprint": {"binary_size_bytes": 1, "rss_peak_kb": 2, "rss_avg_kb": 1,
                           "cpu_peak_pct": 0, "cpu_avg_pct": 0, "samples": 1},
             "path_class_reported": path}
@@ -95,6 +96,13 @@ with tempfile.TemporaryDirectory() as tmp:
     assert "finite positive" in run("python3", GCP / "aggregate.py", root, ok=False).stderr
     bool_count = valid(); bool_count["latency"]["count"] = True; write_cell(root, bool_count)
     assert "latency count" in run("python3", GCP / "aggregate.py", root, ok=False).stderr
+    wrong_mode = valid(); wrong_mode["mode"] = "userspace"; write_cell(root, wrong_mode)
+    assert "expected 'tun' for rs-tun" in run("python3", GCP / "aggregate.py", root, ok=False).stderr
+    partial_latency = valid()
+    for field in ("requested", "transmitted", "received", "count"):
+        partial_latency["latency"][field] = 1
+    write_cell(root, partial_latency)
+    assert "all 50 requested replies" in run("python3", GCP / "aggregate.py", root, ok=False).stderr
 
     write_cell(root, valid()); write_cell(root, valid(), "duplicate.json")
     assert "DUPLICATE" in run("python3", GCP / "aggregate.py", root, ok=False).stderr

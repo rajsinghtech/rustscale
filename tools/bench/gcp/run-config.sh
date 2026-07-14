@@ -31,6 +31,7 @@ AUTHKEY RESULTS_DIR SERVER_HOSTNAME CLIENT_HOSTNAME
 
 CONFIG: rs-userspace | rs-tun | ts-userspace | ts-tun
 --profile: rs-tun only; collect a Linux perf profile after normal metrics
+--profile-only: rs-tun only; collect a Linux perf diagnostic without writing metrics
 --repeat N: production TUN samples per parallelism (1..=9; default 3)
 EOF
   exit 2
@@ -40,13 +41,17 @@ EOF
 # no GCP dependencies so the CLI contract can be tested locally.
 parse_run_config_options() {
   PROFILE=0
+  PROFILE_ONLY=0
   REPEAT=3
-  local seen_profile=0 seen_repeat=0
+  local seen_profile=0 seen_profile_only=0 seen_repeat=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --profile)
         (( seen_profile == 0 )) || { echo "duplicate option: --profile" >&2; return 2; }
         PROFILE=1; seen_profile=1; shift ;;
+      --profile-only)
+        (( seen_profile_only == 0 )) || { echo "duplicate option: --profile-only" >&2; return 2; }
+        PROFILE_ONLY=1; seen_profile_only=1; shift ;;
       --repeat)
         (( seen_repeat == 0 )) || { echo "duplicate option: --repeat" >&2; return 2; }
         [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || { echo "--repeat requires a value" >&2; return 2; }
@@ -55,18 +60,21 @@ parse_run_config_options() {
       *) echo "unknown option: $1" >&2; return 2 ;;
     esac
   done
+  (( !(PROFILE && PROFILE_ONLY) )) || { echo "--profile and --profile-only are mutually exclusive" >&2; return 2; }
 }
 
 run_config_option_parsing_self_test() {
   local actual status
-  actual=$(parse_run_config_options --profile --repeat 1; printf '%s/%s\n' "$PROFILE" "$REPEAT") || return 1
-  [[ "$actual" == '1/1' ]] || return 1
-  actual=$(parse_run_config_options --repeat 9 --profile; printf '%s/%s\n' "$PROFILE" "$REPEAT") || return 1
-  [[ "$actual" == '1/9' ]] || return 1
-  actual=$(parse_run_config_options; printf '%s/%s\n' "$PROFILE" "$REPEAT") || return 1
-  [[ "$actual" == '0/3' ]] || return 1
+  actual=$(parse_run_config_options --profile --repeat 1; printf '%s/%s/%s\n' "$PROFILE" "$PROFILE_ONLY" "$REPEAT") || return 1
+  [[ "$actual" == '1/0/1' ]] || return 1
+  actual=$(parse_run_config_options --profile-only --repeat 1; printf '%s/%s/%s\n' "$PROFILE" "$PROFILE_ONLY" "$REPEAT") || return 1
+  [[ "$actual" == '0/1/1' ]] || return 1
+  actual=$(parse_run_config_options --repeat 9 --profile; printf '%s/%s/%s\n' "$PROFILE" "$PROFILE_ONLY" "$REPEAT") || return 1
+  [[ "$actual" == '1/0/9' ]] || return 1
+  actual=$(parse_run_config_options; printf '%s/%s/%s\n' "$PROFILE" "$PROFILE_ONLY" "$REPEAT") || return 1
+  [[ "$actual" == '0/0/3' ]] || return 1
   local -a case_args=()
-  for args in '--repeat' '--repeat 0' '--repeat 10' '--repeat 1.5' '--repeat 1 --repeat 2' '--profile --profile' '--unknown'; do
+  for args in '--repeat' '--repeat 0' '--repeat 10' '--repeat 1.5' '--repeat 1 --repeat 2' '--profile --profile' '--profile-only --profile-only' '--profile --profile-only' '--unknown'; do
     read -r -a case_args <<< "$args"
     if ( parse_run_config_options "${case_args[@]}" ) >/dev/null 2>&1; then
       return 1
@@ -94,6 +102,7 @@ if (( SELF_TEST )); then
   SHOST=self-test-server
   CHOST=self-test-client
   PROFILE=1
+  PROFILE_ONLY=0
   REPEAT=3
 else
   [[ $# -ge 9 ]] || usage
@@ -109,8 +118,8 @@ else
   shift 9
   parse_run_config_options "$@" || exit $?
 fi
-if (( PROFILE )) && [[ "$CONFIG" != rs-tun ]]; then
-  echo "--profile is only valid for rs-tun" >&2
+if (( PROFILE || PROFILE_ONLY )) && [[ "$CONFIG" != rs-tun ]]; then
+  echo "--profile and --profile-only are only valid for rs-tun" >&2
   exit 2
 fi
 
@@ -273,11 +282,22 @@ tun_ping_invocation() {
   local cli="$1" socket="$2" path_tag="$3" server_ip="$4"
   local ping_args
   if [[ "$path_tag" == direct ]]; then
-    ping_args="--until-direct --c=30"
+    ping_args="--until-direct --c=0"
   else
     ping_args="--until-direct=false --c=1"
   fi
   printf '%s --socket=%s ping %s %s' "$cli" "$socket" "$ping_args" "$server_ip"
+}
+
+# Direct gates get one bounded product-CLI invocation. GNU timeout's short
+# kill grace prevents a stuck CLI from holding a benchmark VM indefinitely.
+tun_path_gate_command() {
+  local ping_command="$1" path_tag="$2"
+  if [[ "$path_tag" == direct ]]; then
+    printf '%s' "timeout --kill-after=5s 180s $ping_command"
+  else
+    printf '%s' "$ping_command"
+  fi
 }
 
 command_shape_self_test() {
@@ -286,28 +306,59 @@ command_shape_self_test() {
   rs_direct=$(tun_ping_invocation /opt/rustscale/target/release/rustscale /tmp/rs.sock direct 100.64.0.1)
   ts_derp=$(tun_ping_invocation tailscale /tmp/ts.sock derp 100.64.0.1)
   rs_derp=$(tun_ping_invocation /opt/rustscale/target/release/rustscale /tmp/rs.sock derp 100.64.0.1)
-  [[ "$ts_direct" == 'tailscale --socket=/tmp/ts.sock ping --until-direct --c=30 100.64.0.1' ]] || return 1
-  [[ "$rs_direct" == '/opt/rustscale/target/release/rustscale --socket=/tmp/rs.sock ping --until-direct --c=30 100.64.0.1' ]] || return 1
+  [[ "$ts_direct" == 'tailscale --socket=/tmp/ts.sock ping --until-direct --c=0 100.64.0.1' ]] || return 1
+  [[ "$rs_direct" == '/opt/rustscale/target/release/rustscale --socket=/tmp/rs.sock ping --until-direct --c=0 100.64.0.1' ]] || return 1
   [[ "${ts_direct#* ping }" == "${rs_direct#* ping }" ]] || return 1
   [[ "$ts_derp" == 'tailscale --socket=/tmp/ts.sock ping --until-direct=false --c=1 100.64.0.1' ]] || return 1
   [[ "$rs_derp" == '/opt/rustscale/target/release/rustscale --socket=/tmp/rs.sock ping --until-direct=false --c=1 100.64.0.1' ]] || return 1
   [[ "${ts_derp#* ping }" == "${rs_derp#* ping }" ]] || return 1
+  [[ "$(tun_path_gate_command "$ts_direct" direct)" == "timeout --kill-after=5s 180s $ts_direct" ]] || return 1
+  [[ "$(tun_path_gate_command "$rs_direct" direct)" == "timeout --kill-after=5s 180s $rs_direct" ]] || return 1
 }
 
 # Gate kernel benchmarks on a product CLI ping and return its observed class.
 # Args: AS_ROOT VM ZONE CLI SOCKET SERVER_IP PATH_TAG PATH_LOG
 tun_path_gate() {
   local as_root="$1" vm="$2" zone="$3" cli="$4" socket="$5" server_ip="$6" path_tag="$7" path_log="$8"
-  local ping_command
+  local ping_command command status transcript observed
   ping_command=$(tun_ping_invocation "$cli" "$socket" "$path_tag" "$server_ip")
-  run_tun_command "$as_root" "$vm" "$zone" \
-    "$ping_command >$path_log 2>&1" || return 1
-  local transcript observed
+  command=$(tun_path_gate_command "$ping_command" "$path_tag")
+  if run_tun_command "$as_root" "$vm" "$zone" "$command >$path_log 2>&1"; then
+    :
+  else
+    status=$?
+    return "$status"
+  fi
   transcript=$(run_tun_command "$as_root" "$vm" "$zone" "cat $path_log" 2>/dev/null || true)
   observed=$(printf '%s\n' "$transcript" | classify_cli_path)
   [[ "$path_tag" != direct || "$observed" == direct ]] || return 1
   [[ "$path_tag" != derp || "$observed" == derp ]] || return 1
   printf '%s\n' "$observed"
+}
+
+path_gate_self_test() {
+  local result status original_run_tun_command
+  original_run_tun_command=$(declare -f run_tun_command)
+  PATH_GATE_TEST_TRANSCRIPT='pong from node (100.64.0.1) via 192.0.2.1:41641 in 1ms'
+  PATH_GATE_TEST_STATUS=0
+  run_tun_command() {
+    [[ "$4" == "cat "* ]] && { printf '%s\n' "$PATH_GATE_TEST_TRANSCRIPT"; return 0; }
+    return "$PATH_GATE_TEST_STATUS"
+  }
+  result=$(tun_path_gate 1 vm zone tailscale /tmp/ts.sock 100.64.0.1 direct /tmp/path.log) || return 1
+  [[ "$result" == direct ]] || return 1
+  PATH_GATE_TEST_STATUS=124
+  if tun_path_gate 1 vm zone tailscale /tmp/ts.sock 100.64.0.1 direct /tmp/path.log >/dev/null; then return 1; else status=$?; fi
+  (( status == 124 )) || return 1
+  PATH_GATE_TEST_STATUS=7
+  if tun_path_gate 1 vm zone /opt/rustscale/target/release/rustscale /tmp/rs.sock 100.64.0.1 direct /tmp/path.log >/dev/null; then return 1; else status=$?; fi
+  (( status == 7 )) || return 1
+  PATH_GATE_TEST_STATUS=0
+  PATH_GATE_TEST_TRANSCRIPT='pong from node (100.64.0.1) via DERP(ord) in 1ms'
+  if tun_path_gate 1 vm zone tailscale /tmp/ts.sock 100.64.0.1 direct /tmp/path.log >/dev/null; then return 1; else status=$?; fi
+  (( status == 1 )) || return 1
+  eval "$original_run_tun_command"
+  unset PATH_GATE_TEST_TRANSCRIPT PATH_GATE_TEST_STATUS
 }
 
 cleanup_rs_tun() {
@@ -325,8 +376,8 @@ cleanup_rs_tun() {
     status=1
   fi
 
-  # Run both endpoints even if one remains dirty.  ssh_cmd retries a nonzero
-  # remote result, so the remote action is deliberately idempotent.
+  # Run both endpoints even if one remains dirty. Remote statuses are returned
+  # immediately, so each cleanup action is deliberately idempotent.
   if ! ssh_sudo "$SVM" "$SZONE" "$(rs_tun_cleanup_command srv)"; then
     echo "[gcp] ERROR: rs-tun cleanup failed on server $SVM" >&2
     status=1
@@ -478,6 +529,10 @@ ts_tun_measurement_preflight() {
 emit_stub() {
   local err="${1:-dry-run}"
   local log_tail="${2:-}"
+  if (( PROFILE_ONLY )); then
+    echo "[gcp] profile-only rs-tun failed: $err" >&2
+    return
+  fi
   local tool mode
   case "$CONFIG" in
     rs-*) tool=rustscale; mode=userspace ;;
@@ -744,6 +799,7 @@ rs_tun_lifecycle_self_test() {
 
 classifier_self_test
 command_shape_self_test
+path_gate_self_test
 run_config_option_parsing_self_test
 
 if (( SELF_TEST )); then
@@ -756,6 +812,10 @@ fi
 
 if [[ -n "${GCP_DRY_RUN:-}" ]]; then
   echo "[dry-run] would run $CONFIG on $SVM/$CVM ($TOPOLOGY/$PATH_TAG)" >&2
+  if (( PROFILE_ONLY )); then
+    echo "[dry-run] would profile rs-tun without writing metrics" >&2
+    exit 0
+  fi
   (( PROFILE )) && echo "[dry-run] would profile rs-tun after normal metrics" >&2
   emit_stub "dry-run"
   exit 0
@@ -780,31 +840,59 @@ else:
 '
 }
 
-# Helper: parse ping rtt percentiles from ping stdout on stdin.
-# Emits JSON: {"p50_us":..,"p95_us":..,"p99_us":..,"count":..}
+# Helper: parse a complete production ping sample from stdin.
+# Args: REQUESTED. Emits requested/transmitted/received/loss/count plus RTTs.
 ping_latency() {
+  local requested="$1"
   python3 -c '
-import json,sys,re
+import json, re, sys
+requested = int(sys.argv[1])
 rtts=[]
+transmitted = received = None
+loss = None
 for line in sys.stdin:
-    m=re.search(r"time=([0-9.]+ ms|([0-9.]+))", line)
+    m = re.search(r"time=([0-9.]+)\s*ms", line)
     if m:
-        s=m.group(1)
-        if "ms" in s:
-            rtts.append(float(s.replace(" ms",""))*1000)
-        else:
-            rtts.append(float(s)*1000)
+        rtts.append(float(m.group(1)) * 1000)
+    summary = re.search(r"(\d+) packets transmitted, (\d+) (?:packets )?received, ([0-9.]+)% packet loss", line)
+    if summary:
+        transmitted, received, loss = int(summary.group(1)), int(summary.group(2)), float(summary.group(3))
 rtts.sort()
 n=len(rtts)
 def pct(p):
     return rtts[min(int(round((n-1)*p)), n-1)] if rtts else 0
 print(json.dumps({
+    "requested": requested,
+    "transmitted": transmitted,
+    "received": received,
+    "loss": loss,
     "p50_us": round(pct(0.50)),
     "p95_us": round(pct(0.95)),
     "p99_us": round(pct(0.99)),
     "count": n,
 }))
-'
+' "$requested"
+}
+
+# A TUN latency result is production data only when every requested reply and
+# the ping summary agree. This rejects partial samples before result emission.
+complete_tun_latency() {
+  python3 -c '
+import json, math, sys
+expected = int(sys.argv[1])
+try:
+    sample = json.load(sys.stdin)
+except (ValueError, TypeError):
+    raise SystemExit(1)
+numbers = ("p50_us", "p95_us", "p99_us")
+if (sample.get("requested") != expected or sample.get("transmitted") != expected or
+        sample.get("received") != expected or sample.get("count") != expected or
+        sample.get("loss") != 0 or
+        not all(isinstance(sample.get(k), (int, float)) and not isinstance(sample[k], bool) and math.isfinite(sample[k]) and sample[k] > 0 for k in numbers) or
+        [sample[k] for k in numbers] != sorted(sample[k] for k in numbers)):
+    raise SystemExit(1)
+print(json.dumps(sample))
+' "$LATENCY_COUNT"
 }
 
 # Extract one positive, finite iperf3 throughput sample.  This is deliberately
@@ -921,7 +1009,8 @@ tun_measure() {
   echo "[gcp] $label: latency" >&2
   TUN_MEASURE_FAILURE_STAGE=latency
   TUN_MEASURE_LATENCY=$(run_tun_command "$as_root" "$CVM" "$CZONE" \
-    "ping -i $LATENCY_INTERVAL -c $LATENCY_COUNT $server_ip 2>/dev/null" | ping_latency) || {
+    "ping -i $LATENCY_INTERVAL -c $LATENCY_COUNT $server_ip 2>/dev/null" \
+    | ping_latency "$LATENCY_COUNT" | complete_tun_latency) || {
       remote_stop_footprint "$SVM" "$SZONE" "$footprint_file" >/dev/null || true
       return 1
     }
@@ -1012,7 +1101,13 @@ tun_measure_self_test() {
           3) printf '%s' '{"total_mbps": 300}' ;;
           4) printf '%s' '{"total_mbps": 400}' ;;
         esac ;;
-      *'ping '*) printf '%s\n' '64 bytes from test: time=1 ms' ;;
+      *'ping '*)
+        local replies="$LATENCY_COUNT"
+        [[ "${TUN_TEST_PARTIAL_LATENCY:-0}" == 1 ]] && replies=$((LATENCY_COUNT - 1))
+        for ((i = 1; i <= replies; i++)); do
+          printf '%s\n' '64 bytes from test: time=1 ms'
+        done
+        printf '%s\n' "$LATENCY_COUNT packets transmitted, $replies received, $((100 - (100 * replies / LATENCY_COUNT)))% packet loss" ;;
     esac
   }
   remote_start_footprint() { printf '%s\n' 'footprint-start' >>"$log_file"; }
@@ -1055,6 +1150,17 @@ assert result["repeat"] == 2
 assert result["parallelism_requested"] == [1, 10]
 assert result["runtime_stats"] == {"server": "", "client": ""}
 PYEOF
+
+  # A partial reply set has a successful ping transport status but is not a
+  # production latency sample and must fail before a result can be emitted.
+  : >"$log_file"
+  printf '0' >"$count_file"
+  TUN_TEST_PARTIAL_LATENCY=1
+  if tun_measure self-test 0 100.64.0.1 /tmp/test-daemon.pid /tmp/test.footprint /bin/test; then
+    return 1
+  fi
+  unset TUN_TEST_PARTIAL_LATENCY
+  [[ "$TUN_MEASURE_FAILURE_STAGE" == latency ]] || return 1
 
   # A zero-valued JSON sample is a measurement failure, not a transport
   # failure: stop the sampler once, make no later measured sample, and leave
@@ -1398,7 +1504,7 @@ run_rs_userspace() {
     sleep 5
     elapsed=$((elapsed + 5))
   done
-  if (( elapsed >= 180 )); then
+  if (( elapsed >= timeout )); then
     echo "[gcp] ERROR: rustscale-bench server never became ready" >&2
     local _lt
     _lt=$(capture_log_tail "$SVM" "$SZONE" /tmp/rs-srv.log)
@@ -1485,7 +1591,7 @@ PYEOF
 # ===========================================================================
 run_rs_tun() {
   echo "[gcp] rs-tun: starting production rustscaled daemons" >&2
-  if (( PROFILE )) && ! profile_prepare; then
+  if (( PROFILE || PROFILE_ONLY )) && ! profile_prepare; then
     emit_stub "rs-tun-perf-prepare-failed"
     profile_remote_cleanup || true
     cleanup_rs_tun || return "$FATAL_HANDOFF_STATUS"
@@ -1516,11 +1622,28 @@ run_rs_tun() {
   echo "[gcp] rs-tun: server tailnet IP=$server_ip" >&2
 
   local path_class
-  path_class=$(tun_path_gate 1 "$CVM" "$CZONE" /opt/rustscale/target/release/rustscale /tmp/rs-tun-cli.sock "$server_ip" "$PATH_TAG" /tmp/rs-tun-cli.path.log) || {
-    emit_stub "rs-cli-path-gate-failed" "$(capture_log_tail "$CVM" "$CZONE" /tmp/rs-tun-cli.path.log)"
+  if path_class=$(tun_path_gate 1 "$CVM" "$CZONE" /opt/rustscale/target/release/rustscale /tmp/rs-tun-cli.sock "$server_ip" "$PATH_TAG" /tmp/rs-tun-cli.path.log); then
+    :
+  else
+    local path_status=$?
+    local path_error=path-cli-failed
+    [[ "$PATH_TAG" == direct && $path_status -eq 124 ]] && path_error=direct-path-timeout
+    emit_stub "rs-$path_error" "$(capture_log_tail "$CVM" "$CZONE" /tmp/rs-tun-cli.path.log)"
     if ! cleanup_rs_tun; then return "$FATAL_HANDOFF_STATUS"; fi
     return 1
-  }
+  fi
+
+  # The matrix invokes this diagnostic only after every normal selected cell.
+  # It deliberately bypasses tun_measure and result emission, preserving the
+  # already accepted rs-tun measurement JSON while reusing setup and gating.
+  if (( PROFILE_ONLY )); then
+    if ! profile_rs_tun; then
+      cleanup_rs_tun || return "$FATAL_HANDOFF_STATUS"
+      return 1
+    fi
+    cleanup_rs_tun || return "$FATAL_HANDOFF_STATUS"
+    return 0
+  fi
 
   if ! rs_tun_measurement_preflight; then
     echo "[gcp] ERROR: could not clear rs-tun iperf3 leftovers on $SVM" >&2
@@ -1805,8 +1928,14 @@ run_ts_tun() {
   fi
 
   local path_class
-  path_class=$(tun_path_gate 1 "$CVM" "$CZONE" tailscale /tmp/ts-tun-cli.sock "$server_ip" "$PATH_TAG" /tmp/ts-tun-cli.path.log) || {
-    emit_stub "ts-cli-path-gate-failed" "$(capture_log_tail "$CVM" "$CZONE" /tmp/ts-tun-cli.path.log)"; cleanup_ts_tun; return 1; }
+  if path_class=$(tun_path_gate 1 "$CVM" "$CZONE" tailscale /tmp/ts-tun-cli.sock "$server_ip" "$PATH_TAG" /tmp/ts-tun-cli.path.log); then
+    :
+  else
+    local path_status=$?
+    local path_error=path-cli-failed
+    [[ "$PATH_TAG" == direct && $path_status -eq 124 ]] && path_error=direct-path-timeout
+    emit_stub "ts-$path_error" "$(capture_log_tail "$CVM" "$CZONE" /tmp/ts-tun-cli.path.log)"; cleanup_ts_tun; return 1
+  fi
 
   if ! ts_tun_measurement_preflight; then
     emit_stub "ts-tun-iperf-preflight-failed" "$(capture_log_tail "$SVM" "$SZONE" "$(tun_iperf_server_log_path ts-tun)")"

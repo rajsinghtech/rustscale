@@ -253,6 +253,8 @@ wait_for_startup() {
 # ---------------------------------------------------------------------------
 # Run a command on a VM via gcloud ssh. Args: NAME ZONE COMMAND
 # Prints stdout of the remote command to stdout. SSH errors go to stderr.
+# Remote command statuses are returned immediately. Only SSH's transport
+# status 255 is retried, at most three times in total.
 # Honors GCP_DRY_RUN (just echoes the command).
 # ---------------------------------------------------------------------------
 ssh_cmd() {
@@ -272,19 +274,56 @@ ssh_cmd() {
     _SSH_KEY="$HOME/.ssh/google_compute_engine"
   fi
   local ip="${_SSH_IP[$name]}" user="${_SSH_USER[$name]}"
-  local attempt=0 max=3
+  local attempt=0 max=3 status
   while (( attempt < max )); do
     if ssh -i "$_SSH_KEY" \
       -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes \
       -o ConnectTimeout=30 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 \
       "$user@$ip" "$cmd"; then
-      return 0
+      status=0
+    else
+      status=$?
     fi
+    (( status == 0 )) && return 0
+    (( status == 255 )) || return "$status"
     attempt=$((attempt + 1))
+    (( attempt < max )) || return 255
     echo "[gcp] ssh retry $attempt/$max for $name" >&2
     sleep 5
   done
-  return 1
+  return 255
+}
+
+# Exercise ssh_cmd without gcloud or a network connection. The fake ssh and
+# sleep functions make retry behavior deterministic and never sleep.
+ssh_cmd_self_test() {
+  local status
+  _SSH_IP[self-test]=192.0.2.1
+  _SSH_USER[self-test]=tester
+  SSH_TEST_SLEPT=0
+  ssh() {
+    local next="${SSH_TEST_STATUSES[$SSH_TEST_ATTEMPTS]}"
+    SSH_TEST_ATTEMPTS=$((SSH_TEST_ATTEMPTS + 1))
+    return "$next"
+  }
+  sleep() { SSH_TEST_SLEPT=1; }
+
+  for expected in 1 124; do
+    SSH_TEST_STATUSES=("$expected")
+    SSH_TEST_ATTEMPTS=0; SSH_TEST_SLEPT=0
+    if ssh_cmd self-test zone command >/dev/null 2>&1; then return 1; else status=$?; fi
+    (( status == expected && SSH_TEST_ATTEMPTS == 1 && SSH_TEST_SLEPT == 0 )) || return 1
+  done
+  SSH_TEST_STATUSES=(255 0)
+  SSH_TEST_ATTEMPTS=0; SSH_TEST_SLEPT=0
+  ssh_cmd self-test zone command >/dev/null 2>&1 || return 1
+  (( SSH_TEST_ATTEMPTS == 2 && SSH_TEST_SLEPT == 1 )) || return 1
+  SSH_TEST_STATUSES=(255 255 255)
+  SSH_TEST_ATTEMPTS=0; SSH_TEST_SLEPT=0
+  if ssh_cmd self-test zone command >/dev/null 2>&1; then return 1; else status=$?; fi
+  (( status == 255 && SSH_TEST_ATTEMPTS == 3 && SSH_TEST_SLEPT == 1 )) || return 1
+  unset -f ssh sleep
+  unset SSH_TEST_STATUSES SSH_TEST_ATTEMPTS SSH_TEST_SLEPT
 }
 
 # ---------------------------------------------------------------------------

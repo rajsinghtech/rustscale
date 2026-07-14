@@ -1,97 +1,18 @@
-name: Bench
+name: Bench harness
 
 on:
   workflow_dispatch:
+  pull_request:
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
-env:
-  CARGO_TERM_COLOR: always
+permissions:
+  contents: read
 
 jobs:
-  bench:
-    name: Throughput + latency benchmarks
-    if: github.repository == 'rajsinghtech/rustscale'
+  validate:
+    name: Credential-free harness validation
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    permissions:
-      id-token: write
-      contents: read
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
-
-      - name: Install system tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y iperf3 socat ncat jq
-
-      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
-
-      - name: Mint Tailscale org token via GitHub OIDC (WIF)
-        id: tsauth
-        run: |
-          AUD="api.tailscale.com/TbqNGJkY5611CNTRL-kz4CwX2LK721CNTRL"
-          # The exchange endpoint intermittently 500s, after which the JWT is
-          # rejected with 400s — so re-mint a fresh JWT on every attempt.
-          TOKEN=""
-          for i in 1 2 3 4 5; do
-            JWT=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-              "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$AUD" | jq -r '.value')
-            echo "::add-mask::$JWT"
-            TOKEN=$(curl -sS -X POST https://api.tailscale.com/api/v2/oauth/token-exchange \
-              -H 'Content-Type: application/x-www-form-urlencoded' \
-              -d 'client_id=TbqNGJkY5611CNTRL-kz4CwX2LK721CNTRL' -d "jwt=$JWT" | jq -r '.access_token')
-            if [ -n "$TOKEN" ] && [ "$TOKEN" != "null" ]; then break; fi
-            echo "token-exchange attempt $i failed; retrying" >&2
-            sleep $((i * 5))
-          done
-          if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then echo "OIDC token-exchange failed" >&2; exit 1; fi
-          echo "::add-mask::$TOKEN"
-          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
-
-      - name: Build rustscale-bench
-        run: cargo build -p rustscale-bench --release --locked
-
-      - name: Run rustscale benchmark
-        env:
-          TS_ORG_TOKEN: ${{ steps.tsauth.outputs.token }}
-          BENCH_DURATION: "10"
-          BENCH_PARALLEL: "1"
-          BENCH_DIRECTION: "down"
-        run: tools/bench/run-local.sh
-
-      - name: Install tailscaled
-        run: |
-          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/jammy.noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
-          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/jammy.tailscale-keyring.list | sudo tee /etc/apt/sources.list.d/tailscale.list
-          sudo apt-get update
-          sudo apt-get install -y tailscale
-
-      - name: Run tailscaled benchmark
-        env:
-          TS_ORG_TOKEN: ${{ steps.tsauth.outputs.token }}
-          BENCH_DURATION: "10"
-          BENCH_PARALLEL: "1"
-          BENCH_DIRECTION: "down"
-        run: tools/bench/run-tailscaled.sh
-
-      - name: Build tsrs-bench
-        run: cargo build --manifest-path crates/bench-tsrs/Cargo.toml --release
-
-      - name: Run tailscale-rs benchmark
-        env:
-          TS_ORG_TOKEN: ${{ steps.tsauth.outputs.token }}
-          BENCH_DURATION: "10"
-          BENCH_PARALLEL: "1"
-          BENCH_DIRECTION: "down"
-        run: tools/bench/run-tailscale-rs.sh
-
-      - name: Upload bench results
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: bench-results
-          path: bench-results/
-          retention-days: 30
+      - name: Validate benchmark harness
+        run: tools/bench/check.sh

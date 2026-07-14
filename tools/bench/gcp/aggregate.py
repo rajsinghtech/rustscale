@@ -19,6 +19,8 @@ DEFAULT_PARALLELISM = [1, 10, 100]
 DEFAULT_MATRIX = {"topologies": list(TOPO_ORDER), "paths": list(PATH_ORDER), "configs": list(CONFIG_ORDER),
                   "parallelism": DEFAULT_PARALLELISM}
 RESULT_SCHEMA_VERSION = 2
+CONFIG_MODE = {"rs-userspace": "userspace", "rs-tun": "tun",
+               "ts-userspace": "userspace", "ts-tun": "tun"}
 # Results are written by Python JSON and retain full binary64 precision.  This
 # tolerance allows only JSON/float round-off, not a materially different value.
 MEDIAN_REL_TOL = 1e-12
@@ -87,6 +89,9 @@ def validate_ok(obj: dict, key: tuple[str, str, str], matrix: dict) -> list[str]
     for field, expected in zip(("topology", "path", "config"), key):
         if obj.get(field) != expected:
             errors.append(f"{field}={obj.get(field)!r}, expected {expected!r}")
+    expected_mode = CONFIG_MODE[config]
+    if obj.get("mode") != expected_mode:
+        errors.append(f"mode={obj.get('mode')!r}, expected {expected_mode!r} for {config}")
     if obj.get("path_class_reported") != path:
         errors.append(f"path_class_reported={obj.get('path_class_reported')!r}, expected {path!r}")
     repeat = obj.get("repeat")
@@ -135,6 +140,14 @@ def validate_ok(obj: dict, key: tuple[str, str, str], matrix: dict) -> list[str]
         percentiles = [latency.get(name) for name in ("p50_us", "p95_us", "p99_us")]
         if not all(finite_positive(value) for value in percentiles) or percentiles != sorted(percentiles):
             errors.append("latency percentiles must be finite, positive, and ordered")
+        if expected_mode == "tun":
+            expected = 50
+            complete_fields = ("requested", "transmitted", "received", "count")
+            if any(latency.get(name) != expected for name in complete_fields):
+                errors.append("TUN latency must contain all 50 requested replies")
+            loss = latency.get("loss")
+            if not isinstance(loss, (int, float)) or isinstance(loss, bool) or not math.isfinite(loss) or loss != 0:
+                errors.append("TUN latency loss must be zero")
     footprint = obj.get("footprint")
     if not isinstance(footprint, dict):
         errors.append("footprint must be an object")

@@ -3205,7 +3205,6 @@ dependencies = [
 name = "rustscale-memnet"
 version = "0.1.1"
 dependencies = [
- "bytes",
  "tokio",
 ]
 

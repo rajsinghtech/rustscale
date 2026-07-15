@@ -1,6 +1,6 @@
 [package]
 name = "rustscale-memnet"
-description = "In-memory TCP network for tests — name-addressed listen/accept/dial"
+description = "Deterministic bounded in-memory TCP network for async tests"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -11,7 +11,6 @@ workspace = true
 
 [dependencies]
 tokio.workspace = true
-bytes.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true

@@ -925,6 +925,9 @@ pub(crate) struct RunningState {
     pub(crate) prefs: Arc<RwLock<rustscale_ipn::Prefs>>,
     /// Serializes profile/preference commits and callback enqueue order.
     pub(crate) profile_mutations: Arc<tokio::sync::Mutex<()>>,
+    /// Mutation epoch shared by socket, loopback, and in-memory LocalAPI.
+    pub(crate) localapi_mutation_fence: Arc<localapi::LocalApiMutationFence>,
+    pub(crate) localapi_mutation_generation: u64,
     /// Tracks the one persisted exit-node selection that may be retried after
     /// a map update. Explicit API/config choices clear this pending state.
     pub(crate) exit_node_selection: Arc<RwLock<ExitNodeSelection>>,
@@ -1244,6 +1247,8 @@ pub(crate) struct PreStartedLocalApi {
     pub(crate) command_tx: Option<mpsc::UnboundedSender<localapi::DaemonCommand>>,
     /// Logout trigger shared with LocalApiState, so up() can reuse it.
     pub(crate) logout_trigger: Arc<tokio::sync::Notify>,
+    pub(crate) mutation_fence: Arc<localapi::LocalApiMutationFence>,
+    pub(crate) mutation_generation: u64,
     #[allow(dead_code)]
     pub(crate) socket_path: PathBuf,
 }

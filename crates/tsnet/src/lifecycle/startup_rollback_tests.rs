@@ -252,6 +252,7 @@ async fn cancellation_after_each_spawn_is_joined_before_immediate_retry() {
             Arc::clone(&cancel),
             watchdog,
             MapSessionTasks::new(map_task),
+            None,
         );
         rollback.localapi_socket = Some(socket.clone());
 
@@ -316,6 +317,7 @@ async fn committed_startup_tasks_transfer_to_running_ownership() {
         cancel,
         watchdog,
         Arc::clone(&map_tasks),
+        None,
     );
     let tasks = rollback.commit_tasks();
     drop(rollback);
@@ -352,6 +354,7 @@ async fn startup_rollback_joins_late_route_update_before_final_close() {
         Arc::clone(&cancel),
         watchdog,
         MapSessionTasks::new(map_task),
+        None,
     );
     rollback.router = Some(Arc::clone(&router));
     let task_cancel = Arc::clone(&cancel);
@@ -461,6 +464,47 @@ async fn publication_callback_during_close_is_drained_before_extension_shutdown(
 }
 
 #[tokio::test]
+async fn post_bootstrap_rollback_stops_and_joins_netlog() {
+    let logger = Arc::new(rustscale_netlog::Logger::new());
+    let source: Arc<dyn rustscale_netlog::NodeSource> = Arc::new(TsnetNetlogNodeSource {
+        self_node: None,
+        peers: Arc::new(RwLock::new(Vec::new())),
+    });
+    logger
+        .start(
+            source,
+            rustscale_logtail::LogTail::new(rustscale_logtail::Config::default()),
+        )
+        .await
+        .unwrap();
+    assert!(logger.running().await);
+
+    let supervisor = Arc::new(BootstrapSupervisor::default());
+    let watchdog = Watchdog::new(
+        Tracker::new(),
+        "netlog-startup-rollback",
+        "netlog startup rollback",
+        Severity::Low,
+        "not stopped",
+        std::time::Duration::from_secs(60),
+    );
+    let map_task = tokio::spawn(std::future::pending::<()>());
+    let rollback = StartupRollback::new(
+        Arc::clone(&supervisor),
+        Arc::new(CancelToken::new()),
+        watchdog,
+        MapSessionTasks::new(map_task),
+        Some(Arc::clone(&logger)),
+    );
+    drop(rollback);
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), supervisor.wait())
+        .await
+        .expect("startup rollback did not join netlog");
+    assert!(!logger.running().await);
+}
+
+#[tokio::test]
 async fn startup_supervisor_waits_for_magicsock_socket_release() {
     let probe = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let addr = probe.local_addr().unwrap();
@@ -500,6 +544,7 @@ async fn startup_supervisor_waits_for_magicsock_socket_release() {
         cancel,
         watchdog,
         MapSessionTasks::new(map_task),
+        None,
     );
     rollback.magicsock = Some(Arc::clone(&magicsock));
     drop(magicsock);
@@ -512,6 +557,57 @@ async fn startup_supervisor_waits_for_magicsock_socket_release() {
         .await
         .expect("startup generation retained fixed magicsock UDP port");
     drop(retry);
+}
+
+#[tokio::test]
+async fn terminal_drop_cleanup_has_global_attempt_bound() {
+    struct RefusesShutdown(Arc<AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl rustscale_ipnext::Extension for RefusesShutdown {
+        fn name(&self) -> &'static str {
+            "refuses-shutdown"
+        }
+
+        async fn init(&self, _: rustscale_ipnext::Host) -> rustscale_ipnext::ExtensionResult {
+            Ok(())
+        }
+
+        async fn shutdown(&self) -> rustscale_ipnext::ExtensionResult {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(Box::new(std::io::Error::other("injected terminal leak")))
+        }
+    }
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let registry = rustscale_ipnext::ExtensionRegistry::new();
+    let factory_calls = Arc::clone(&calls);
+    registry
+        .register(rustscale_ipnext::Definition::new(
+            "refuses-shutdown",
+            move |_| Ok(Arc::new(RefusesShutdown(Arc::clone(&factory_calls)))),
+        ))
+        .unwrap();
+    let host =
+        rustscale_ipnext::ExtensionHost::new(&registry, Arc::new(rustscale_tsd::System::new()))
+            .unwrap();
+    host.start().await.unwrap();
+
+    let started = tokio::time::Instant::now();
+    finish_dropped_cleanup(
+        CleanupOwner {
+            extension_host: Some(host),
+            inner: None,
+            pre_started: None,
+        },
+        crate::drive::Runtime::new(),
+        Arc::new(BootstrapSupervisor::default()),
+        Arc::new(BootstrapSupervisor::default()),
+        Arc::new(BootstrapSupervisor::default()),
+    )
+    .await;
+    assert!(started.elapsed() <= DROP_CLEANUP_DEADLINE + std::time::Duration::from_millis(100));
+    assert_eq!(calls.load(Ordering::SeqCst), DROP_CLEANUP_ATTEMPTS);
 }
 
 #[tokio::test]
@@ -551,6 +647,7 @@ async fn dropped_startup_transaction_rolls_back_owned_resources() {
         Arc::clone(&cancel),
         watchdog,
         MapSessionTasks::new(map_task),
+        None,
     );
     rollback.track(task);
     let dns_closed = Arc::new(AtomicBool::new(false));

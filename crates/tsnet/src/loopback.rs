@@ -567,6 +567,8 @@ impl Server {
     ) -> Result<Arc<LocalApiState>, TsnetError> {
         let inner = self.inner.as_ref().expect("server must be up");
         let state = Arc::new(LocalApiState {
+            mutation_fence: Arc::clone(&inner.localapi_mutation_fence),
+            mutation_generation: inner.localapi_mutation_generation,
             peers: inner.peers.clone(),
             routecheck: Some(inner.routecheck.clone()),
             user_profiles: inner.user_profiles.clone(),

@@ -1889,6 +1889,14 @@ impl Magicsock {
         Ok(())
     }
 
+    /// Synchronously close transport admission and abort owned tasks without
+    /// requiring a Tokio runtime. A later [`Self::shutdown`] call can still
+    /// take and join their retained handles.
+    pub fn request_shutdown(&self) {
+        self.inner.begin_shutdown();
+        self.tasks.abort_now();
+    }
+
     /// Stop every magicsock-owned task and transport. The first caller starts
     /// an owned shutdown flight; cancelling a waiter cannot cancel cleanup.
     /// Later callers join the same flight, making shutdown idempotent.

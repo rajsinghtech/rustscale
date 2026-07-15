@@ -162,11 +162,13 @@ impl BootstrapRollback {
         self.map_tasks = Some(MapSessionTasks::new(map_task));
     }
 
-    fn commit(mut self) -> Arc<MapSessionTasks> {
+    fn commit(mut self) -> (Arc<MapSessionTasks>, Option<Arc<rustscale_netlog::Logger>>) {
         self.armed = false;
-        self.map_tasks
+        let map_tasks = self
+            .map_tasks
             .take()
-            .expect("bootstrap map task ownership missing")
+            .expect("bootstrap map task ownership missing");
+        (map_tasks, self.netlog.take())
     }
 }
 
@@ -268,12 +270,14 @@ struct StartupRollback {
     tasks: Vec<JoinHandle<()>>,
     map_tasks: Arc<MapSessionTasks>,
     audit_logger: Option<Arc<rustscale_auditlog::Logger>>,
+    netlog: Option<Arc<rustscale_netlog::Logger>>,
     monitor: Option<rustscale_netmon::MonitorHandle>,
     magicsock: Option<Arc<Magicsock>>,
     router: Option<SharedRouter>,
     localapi: Option<localapi::LocalApiHandle>,
     localapi_start: Option<tokio::sync::oneshot::Sender<()>>,
     localapi_handoff: Option<localapi::LocalApiPathHandoff>,
+    localapi_generation_handoff: Option<localapi::LocalApiGenerationHandoff>,
     serve: Option<Arc<serve::ServeRunner>>,
     localapi_socket: Option<PathBuf>,
     os_dns_configurator: Option<Box<dyn OsConfigurator + Send>>,
@@ -286,6 +290,7 @@ impl StartupRollback {
         cancel: Arc<CancelToken>,
         watchdog: Watchdog,
         map_tasks: Arc<MapSessionTasks>,
+        netlog: Option<Arc<rustscale_netlog::Logger>>,
     ) -> Self {
         Self {
             armed: true,
@@ -295,12 +300,14 @@ impl StartupRollback {
             tasks: Vec::new(),
             map_tasks,
             audit_logger: None,
+            netlog,
             monitor: None,
             magicsock: None,
             router: None,
             localapi: None,
             localapi_start: None,
             localapi_handoff: None,
+            localapi_generation_handoff: None,
             serve: None,
             localapi_socket: None,
             os_dns_configurator: None,
@@ -326,14 +333,32 @@ impl StartupRollback {
     /// same poll.
     fn commit_localapi_handoff(&mut self) -> Result<(), TsnetError> {
         let Some(start) = self.localapi_start.take() else {
+            if let Some(handoff) = self.localapi_generation_handoff.take() {
+                handoff.commit();
+            }
             return Ok(());
         };
+        // This is the final synchronous commit section. Acceptance may begin
+        // on the private pathname, then one rename publishes the replacement;
+        // no advertised-path operation occurs during preparation.
         start.send(()).map_err(|()| {
             TsnetError::Builder("LocalAPI replacement stopped before activation".into())
         })?;
-        self.localapi_handoff
+        let handoff = self
+            .localapi_handoff
+            .as_mut()
+            .expect("LocalAPI activation missing path handoff");
+        let handle = self
+            .localapi
+            .as_mut()
+            .expect("LocalAPI activation missing listener handle");
+        handoff
+            .commit(handle)
+            .map_err(|error| TsnetError::Builder(format!("publishing LocalAPI: {error}")))?;
+        self.localapi_handoff.take();
+        self.localapi_generation_handoff
             .take()
-            .expect("LocalAPI activation missing path handoff")
+            .expect("LocalAPI activation missing mutation handoff")
             .commit();
         Ok(())
     }
@@ -367,9 +392,11 @@ impl Drop for StartupRollback {
         let map_tasks = Arc::clone(&self.map_tasks);
         let tasks = std::mem::take(&mut self.tasks);
         let router = self.router.take();
-        // Restore the old advertised LocalAPI path synchronously before the
-        // replacement listener is stopped asynchronously.
+        // Neither prepared transaction has touched the advertised pathname.
+        // Dropping the generation handoff re-admits the old listener before
+        // the private replacement is stopped asynchronously.
         let had_localapi_handoff = self.localapi_handoff.is_some();
+        drop(self.localapi_generation_handoff.take());
         drop(self.localapi_handoff.take());
         self.localapi_start.take();
         let localapi_socket = self.localapi_socket.take();
@@ -380,11 +407,15 @@ impl Drop for StartupRollback {
         }
         let mut configurator = self.os_dns_configurator.take();
         let audit_logger = self.audit_logger.take();
+        let netlog = self.netlog.take();
         let monitor = self.monitor.take();
         let magicsock = self.magicsock.take();
         let localapi = self.localapi.take();
         let serve = self.serve.take();
         if let Some(logger) = audit_logger.as_ref() {
+            logger.request_stop();
+        }
+        if let Some(logger) = netlog.as_ref() {
             logger.request_stop();
         }
         let watchdog = self.watchdog.clone();
@@ -393,15 +424,12 @@ impl Drop for StartupRollback {
             runtime.spawn(async move {
                 let _completion = completion;
                 if let Some(localapi) = localapi {
-                    if had_localapi_handoff {
-                        localapi.shutdown_preserving_path().await;
-                    } else {
-                        localapi.shutdown().await;
-                    }
+                    // A prepared handoff still owns only its private staging
+                    // pathname, so ordinary shutdown removes exactly that.
+                    localapi.shutdown().await;
                 }
-                // A rolled-back handoff has already republished the old
-                // generation, while a non-handoff path was removed
-                // synchronously above.
+                // A rolled-back handoff never changed the old advertised
+                // generation, while a non-handoff path was removed above.
                 drop(localapi_socket);
                 if let Some(serve) = serve {
                     serve.stop().await;
@@ -425,6 +453,11 @@ impl Drop for StartupRollback {
                     }
                 }
                 watchdog.stop_and_wait().await;
+                if let Some(logger) = netlog {
+                    if let Err(error) = logger.stop().await {
+                        log::warn!("tsnet: startup rollback netlog shutdown: {error}");
+                    }
+                }
                 if let Some(logger) = audit_logger {
                     logger
                         .flush_and_stop(std::time::Duration::from_secs(5))
@@ -918,8 +951,26 @@ impl Server {
             b.cancel.clone(),
             b.health_watchdog.clone(),
             Arc::clone(&b.map_tasks),
+            b.netlog.clone(),
         );
         rollback.magicsock = Some(Arc::clone(&b.magicsock));
+        let (localapi_mutation_fence, localapi_mutation_generation) =
+            if let Some(pre_started) = self.pre_started.as_ref() {
+                let fence = Arc::clone(&pre_started.mutation_fence);
+                let handoff = fence
+                    .advance(pre_started.mutation_generation)
+                    .await
+                    .map_err(TsnetError::Builder)?;
+                let generation = handoff.replacement();
+                rollback.localapi_generation_handoff = Some(handoff);
+                (fence, generation)
+            } else {
+                let fence = localapi::LocalApiMutationFence::new();
+                let generation = fence.generation();
+                (fence, generation)
+            };
+        // Advance the old listener's mutation gate before this snapshot. An
+        // accepted stale handler either completed first or now gets conflict.
         let prefs = Arc::new(RwLock::new(self.load_prefs().unwrap_or_default()));
         let profile_mutations = Arc::new(tokio::sync::Mutex::new(()));
         let exit_node_selection = Arc::new(RwLock::new(ExitNodeSelection::from_prefs(
@@ -1272,6 +1323,8 @@ impl Server {
                 localapi::default_socket_path(&dir)
             });
             let state = localapi::LocalApiState {
+                mutation_fence: Arc::clone(&localapi_mutation_fence),
+                mutation_generation: localapi_mutation_generation,
                 peers: b.peers.clone(),
                 user_profiles: b.user_profiles.clone(),
                 health: b.health.clone(),
@@ -1391,7 +1444,11 @@ impl Server {
                 localapi::spawn_localapi(state, path.clone())
             };
             if let Some(handle) = handle {
-                let socket_path = handle.socket_path.clone();
+                let socket_path = if replacing_prestarted {
+                    path.clone()
+                } else {
+                    handle.socket_path.clone()
+                };
                 rollback.localapi = Some(handle);
                 log::info!("tsnet: LocalAPI prepared at {}", path.display());
                 Some(socket_path)
@@ -1497,6 +1554,8 @@ impl Server {
             fallback_next_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             prefs: prefs.clone(),
             profile_mutations,
+            localapi_mutation_fence,
+            localapi_mutation_generation,
             exit_node_selection: exit_node_selection.clone(),
             proxy_mapper,
             portlist_ports,
@@ -1543,8 +1602,26 @@ impl Server {
             b.cancel.clone(),
             b.health_watchdog.clone(),
             Arc::clone(&b.map_tasks),
+            b.netlog.clone(),
         );
         rollback.magicsock = Some(Arc::clone(&b.magicsock));
+        let (localapi_mutation_fence, localapi_mutation_generation) =
+            if let Some(pre_started) = self.pre_started.as_ref() {
+                let fence = Arc::clone(&pre_started.mutation_fence);
+                let handoff = fence
+                    .advance(pre_started.mutation_generation)
+                    .await
+                    .map_err(TsnetError::Builder)?;
+                let generation = handoff.replacement();
+                rollback.localapi_generation_handoff = Some(handoff);
+                (fence, generation)
+            } else {
+                let fence = localapi::LocalApiMutationFence::new();
+                let generation = fence.generation();
+                (fence, generation)
+            };
+        // Advance the old listener's mutation gate before this snapshot. An
+        // accepted stale handler either completed first or now gets conflict.
         let prefs = Arc::new(RwLock::new(self.load_prefs().unwrap_or_default()));
         let profile_mutations = Arc::new(tokio::sync::Mutex::new(()));
         let exit_node_selection = Arc::new(RwLock::new(ExitNodeSelection::from_prefs(
@@ -1904,6 +1981,8 @@ impl Server {
                 localapi::default_socket_path(&dir)
             });
             let state = localapi::LocalApiState {
+                mutation_fence: Arc::clone(&localapi_mutation_fence),
+                mutation_generation: localapi_mutation_generation,
                 peers: b.peers.clone(),
                 user_profiles: b.user_profiles.clone(),
                 health: b.health.clone(),
@@ -2023,7 +2102,11 @@ impl Server {
                 localapi::spawn_localapi(state, path.clone())
             };
             if let Some(handle) = handle {
-                let socket_path = handle.socket_path.clone();
+                let socket_path = if replacing_prestarted {
+                    path.clone()
+                } else {
+                    handle.socket_path.clone()
+                };
                 rollback.localapi = Some(handle);
                 log::info!("tsnet: LocalAPI prepared at {}", path.display());
                 Some(socket_path)
@@ -2140,6 +2223,8 @@ impl Server {
             fallback_next_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             prefs: prefs.clone(),
             profile_mutations,
+            localapi_mutation_fence,
+            localapi_mutation_generation,
             exit_node_selection: exit_node_selection.clone(),
             proxy_mapper,
             portlist_ports,
@@ -2398,7 +2483,11 @@ impl Server {
             localapi::default_socket_path(&std::env::temp_dir().join("rustscale"))
         };
 
+        let mutation_fence = localapi::LocalApiMutationFence::new();
+        let mutation_generation = mutation_fence.generation();
         let api_state = Arc::new(localapi::LocalApiState {
+            mutation_fence: Arc::clone(&mutation_fence),
+            mutation_generation,
             peers: Arc::new(RwLock::new(vec![])),
             routecheck: None,
             user_profiles: Arc::new(RwLock::new(BTreeMap::new())),
@@ -2491,6 +2580,8 @@ impl Server {
             command_rx: Some(command_rx),
             command_tx: Some(command_tx_clone),
             logout_trigger,
+            mutation_fence,
+            mutation_generation,
             socket_path,
         });
 
@@ -3372,12 +3463,17 @@ impl Server {
         bootstrap_rollback.set_map_task(map_task);
 
         // Control knobs created earlier (before magicsock construction).
+        // Transfer the logger and map task out of bootstrap compensation as
+        // one ownership commit. Every subsequent await is covered by
+        // StartupRollback, which requests and joins netlog shutdown.
+        let (map_tasks, bootstrap_netlog) = bootstrap_rollback.commit();
+        debug_assert_eq!(bootstrap_netlog.is_some(), netlog.is_some());
 
         Ok(Bootstrap {
             tailscale_ips: tailscale_ips.clone(),
             our_v4,
             magicsock,
-            netlog,
+            netlog: bootstrap_netlog,
             wg_recv,
             wg_tunnels,
             raw_peers,
@@ -3388,7 +3484,7 @@ impl Server {
             exit_map_gate,
             cancel,
             map_rx,
-            map_tasks: bootstrap_rollback.commit(),
+            map_tasks,
             node_key: state.node_key.clone(),
             filter,
             named_filters,
@@ -3709,36 +3805,150 @@ impl Server {
     }
 }
 
+#[cfg(test)]
+const DROP_CLEANUP_DEADLINE: std::time::Duration = std::time::Duration::from_millis(500);
+#[cfg(not(test))]
+const DROP_CLEANUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
+const DROP_CLEANUP_ATTEMPTS: usize = 3;
+
+/// Fail closed without awaiting user code. Graceful cleanup still gets bounded
+/// attempts afterwards, but no LocalAPI, map task, Taildrive grant, magicsock
+/// transport, or extension publication authority remains live while Drop
+/// waits. A router or user callback that ignores cancellation can only survive
+/// as a logged OS/user-code leak; the Drop cleanup thread never waits forever.
+fn revoke_owner_authority_terminal(owner: &mut CleanupOwner, drive: &crate::drive::Runtime) {
+    drive.disable_terminal();
+    if let Some(host) = owner.extension_host.as_ref() {
+        if host.revoke_publications_now() {
+            log::error!(
+                "tsnet: terminal cleanup: extension publication callback still executing; \
+                 callback is leaked rather than waited forever"
+            );
+        }
+    }
+    if let Some(inner) = owner.inner.as_mut() {
+        inner.cancel.cancel();
+        inner.health_watchdog.stop();
+        inner.extension_subscription.take();
+        inner.hostinfo_hooks.clear();
+        inner.map_tasks.begin_shutdown();
+        for abort in inner
+            .task_aborts
+            .lock()
+            .expect("server task abort lock poisoned")
+            .iter()
+        {
+            abort.abort();
+        }
+        if let Some(path) = inner.localapi_socket.take() {
+            let _ = std::fs::remove_file(path);
+        }
+        // Drop aborts the accept task and every child; no user handler is
+        // called from this terminal path.
+        inner.localapi_handle.take();
+        inner.magicsock.set_connection_counter(None);
+        inner.magicsock.request_shutdown();
+        inner.audit_logger.request_stop();
+        if let Some(netlog) = inner.netlog.as_ref() {
+            netlog.request_stop();
+        }
+    }
+    if let Some(pre_started) = owner.pre_started.as_mut() {
+        if let Some(path) = pre_started
+            .handle
+            .as_ref()
+            .map(|handle| handle.socket_path.clone())
+        {
+            let _ = std::fs::remove_file(path);
+        }
+        pre_started.handle.take();
+        let _ = std::fs::remove_file(&pre_started.socket_path);
+        if let Some(magicsock) = pre_started.magicsock.as_ref() {
+            magicsock.request_shutdown();
+        }
+    }
+}
+
+async fn wait_cleanup_supervisor_until(
+    supervisor: &BootstrapSupervisor,
+    deadline: tokio::time::Instant,
+) -> bool {
+    tokio::time::timeout_at(deadline, supervisor.wait())
+        .await
+        .is_ok()
+}
+
 async fn finish_dropped_cleanup(
-    owner: CleanupOwner,
+    mut owner: CleanupOwner,
     drive: Arc<crate::drive::Runtime>,
     bootstrap_supervisor: Arc<BootstrapSupervisor>,
     startup_supervisor: Arc<BootstrapSupervisor>,
     shutdown_supervisor: Arc<BootstrapSupervisor>,
 ) {
-    bootstrap_supervisor.wait().await;
-    startup_supervisor.wait().await;
-    shutdown_supervisor.wait().await;
+    let deadline = tokio::time::Instant::now() + DROP_CLEANUP_DEADLINE;
+    revoke_owner_authority_terminal(&mut owner, &drive);
+
+    for (name, supervisor) in [
+        ("bootstrap", &bootstrap_supervisor),
+        ("startup", &startup_supervisor),
+        ("shutdown", &shutdown_supervisor),
+    ] {
+        if !wait_cleanup_supervisor_until(supervisor, deadline).await {
+            log::error!(
+                "tsnet: terminal cleanup deadline waiting for {name} owner; \
+                 authority was revoked, remaining resources are intentionally leaked"
+            );
+            return;
+        }
+    }
 
     let mut owners = Vec::new();
     if !owner.is_empty() {
         owners.push(owner);
     }
-    while let Some(owner) = shutdown_supervisor.take_retained_owner() {
-        owners.push(owner);
+    while let Some(mut retained) = shutdown_supervisor.take_retained_owner() {
+        revoke_owner_authority_terminal(&mut retained, &drive);
+        owners.push(retained);
     }
 
     for mut owner in owners {
         let _completion = shutdown_supervisor.begin_cleanup();
-        loop {
+        for attempt in 1..=DROP_CLEANUP_ATTEMPTS {
+            revoke_owner_authority_terminal(&mut owner, &drive);
             drive.disable().await;
-            match cleanup_server_state(owner).await {
-                Ok(()) => break,
-                Err(retained) => {
+            match tokio::time::timeout_at(deadline, cleanup_server_state(owner)).await {
+                Ok(Ok(())) => break,
+                Ok(Err(mut retained)) => {
+                    revoke_owner_authority_terminal(&mut retained, &drive);
                     owner = retained;
-                    // Drop is the final owner: keep dependencies alive and
-                    // retry rather than discarding a failed extension graph.
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    if attempt == DROP_CLEANUP_ATTEMPTS {
+                        log::error!(
+                            "tsnet: terminal cleanup exhausted {DROP_CLEANUP_ATTEMPTS} attempts; \
+                             leaking only revoked resources (router/extension cleanup incomplete)"
+                        );
+                        break;
+                    }
+                    let backoff = std::time::Duration::from_millis(25 * (1 << (attempt - 1)));
+                    if tokio::time::timeout_at(deadline, tokio::time::sleep(backoff))
+                        .await
+                        .is_err()
+                    {
+                        log::error!(
+                            "tsnet: terminal cleanup global deadline reached during backoff; \
+                             leaking only revoked resources"
+                        );
+                        break;
+                    }
+                }
+                Err(_) => {
+                    // The cleanup future (and its owner) is dropped here. All
+                    // admission was synchronously revoked before it started;
+                    // dropping this runtime aborts remaining cooperative tasks.
+                    log::error!(
+                        "tsnet: terminal cleanup global deadline reached; aborted joinable work \
+                         and leaked any non-cooperative user callback/router cleanup"
+                    );
+                    break;
                 }
             }
         }
@@ -3747,7 +3957,7 @@ async fn finish_dropped_cleanup(
 
 impl Drop for Server {
     fn drop(&mut self) {
-        let owner = CleanupOwner::take_from(self);
+        let mut owner = CleanupOwner::take_from(self);
         if owner.is_empty()
             && !self.shutdown_supervisor.has_active_cleanup()
             && !self.shutdown_supervisor.has_retained_owner()
@@ -3756,10 +3966,13 @@ impl Drop for Server {
         }
 
         let drive = Arc::clone(&self.drive);
+        // Revoke synchronously before relying on thread creation. Even an OS
+        // refusal to spawn the bounded worker cannot leave network authority.
+        revoke_owner_authority_terminal(&mut owner, &drive);
         let bootstrap_supervisor = Arc::clone(&self.bootstrap_supervisor);
         let startup_supervisor = Arc::clone(&self.startup_supervisor);
         let shutdown_supervisor = Arc::clone(&self.shutdown_supervisor);
-        std::thread::Builder::new()
+        if let Err(error) = std::thread::Builder::new()
             .name("rustscale-server-drop".into())
             .spawn(move || {
                 let runtime = tokio::runtime::Builder::new_current_thread()
@@ -3774,7 +3987,12 @@ impl Drop for Server {
                     shutdown_supervisor,
                 ));
             })
-            .expect("spawn server drop cleanup thread");
+        {
+            log::error!(
+                "tsnet: failed to spawn bounded Drop cleanup worker: {error}; \
+                 resources were revoked and are terminally leaked"
+            );
+        }
     }
 }
 

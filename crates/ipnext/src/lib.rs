@@ -364,6 +364,13 @@ impl PublicationQueue {
         }
     }
 
+    fn stop_now(&self) -> bool {
+        let mut state = lock_unpoisoned(&self.state);
+        state.accepting = false;
+        state.queue.clear();
+        state.draining
+    }
+
     fn stop_and_wait(&self) {
         let mut state = lock_unpoisoned(&self.state);
         state.accepting = false;
@@ -715,6 +722,13 @@ impl ExtensionHost {
         }
     }
 
+    /// Revoke publication authority synchronously without invoking or waiting
+    /// for user callbacks. Returns true when a callback was already executing;
+    /// terminal Drop cleanup logs that callback as an unjoinable user leak.
+    pub fn revoke_publications_now(&self) -> bool {
+        self.core.publications.stop_now()
+    }
+
     /// Stop accepting publications and wait for the active publication
     /// callback/queue to drain. The blocking waiter is independently owned,
     /// so cancelling this future does not re-enable or detach publication work.
@@ -845,8 +859,20 @@ async fn run_start<T>(
     };
     for extension in extensions.iter() {
         let init_result = match invoke_init(extension.clone(), host.clone(), result_tx).await {
-            InitOutcome::Completed(result) => result,
-            InitOutcome::CallerCancelled => {
+            InitOutcome::Completed { result, retain } => {
+                if retain {
+                    // A failed init may still have acquired resources. If its
+                    // compensating shutdown failed or timed out, retain it in
+                    // the same ordered registry as successful predecessors so
+                    // every later shutdown retries it before its dependencies.
+                    lock_unpoisoned(&core.active).push(extension.clone());
+                }
+                result
+            }
+            InitOutcome::CallerCancelled { retain } => {
+                if retain {
+                    lock_unpoisoned(&core.active).push(extension.clone());
+                }
                 core.set_lifecycle_state(SHUTTING_DOWN);
                 let _ = shutdown_active(&core).await;
                 return Err(StrictStartupError::Cancelled);
@@ -886,8 +912,13 @@ async fn run_start<T>(
 }
 
 enum InitOutcome {
-    Completed(ExtensionResult),
-    CallerCancelled,
+    Completed {
+        result: ExtensionResult,
+        retain: bool,
+    },
+    CallerCancelled {
+        retain: bool,
+    },
 }
 
 async fn invoke_init<T>(
@@ -903,16 +934,23 @@ async fn invoke_init<T>(
             let result = result.map_err(join_error).and_then(std::convert::identity);
             if let Err(source) = result {
                 let cleanup = cleanup_partial_init(cleanup_extension).await;
-                InitOutcome::Completed(Err(combine_init_cleanup(source, cleanup)))
+                let retain = cleanup.is_some();
+                InitOutcome::Completed {
+                    result: Err(combine_init_cleanup(source, cleanup)),
+                    retain,
+                }
             } else {
-                InitOutcome::Completed(Ok(()))
+                InitOutcome::Completed {
+                    result: Ok(()),
+                    retain: false,
+                }
             }
         }
         () = result_tx.closed() => {
             task.abort();
             let _ = task.await;
-            let _ = cleanup_partial_init(cleanup_extension).await;
-            InitOutcome::CallerCancelled
+            let retain = cleanup_partial_init(cleanup_extension).await.is_some();
+            InitOutcome::CallerCancelled { retain }
         }
     }
 }
@@ -1709,8 +1747,8 @@ mod tests {
                 Err(Box::new(std::io::Error::other("init failed")))
             }
             async fn shutdown(&self) -> ExtensionResult {
-                self.shutdowns.fetch_add(1, Ordering::SeqCst);
-                if self.block_cleanup {
+                let call = self.shutdowns.fetch_add(1, Ordering::SeqCst);
+                if self.block_cleanup && call == 0 {
                     let _drop = DropFlag(Arc::clone(&self.cleanup_dropped));
                     std::future::pending::<()>().await;
                 }
@@ -1745,8 +1783,92 @@ mod tests {
                 assert!(cleanup_dropped.load(Ordering::SeqCst));
             }
             host.shutdown().await.unwrap();
-            assert_eq!(shutdowns.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                shutdowns.load(Ordering::SeqCst),
+                if block_cleanup { 2 } else { 1 }
+            );
         }
+    }
+
+    #[tokio::test]
+    async fn failed_partial_cleanup_is_retained_in_dependency_order() {
+        struct OrderedExtension {
+            name: &'static str,
+            fail_init: bool,
+            shutdowns: AtomicUsize,
+            events: Arc<Mutex<Vec<String>>>,
+        }
+        #[async_trait]
+        impl Extension for OrderedExtension {
+            fn name(&self) -> &str {
+                self.name
+            }
+            async fn init(&self, _: Host) -> ExtensionResult {
+                self.events
+                    .lock()
+                    .unwrap()
+                    .push(format!("init:{}", self.name));
+                if self.fail_init {
+                    Err(Box::new(std::io::Error::other("injected init failure")))
+                } else {
+                    Ok(())
+                }
+            }
+            async fn shutdown(&self) -> ExtensionResult {
+                let call = self.shutdowns.fetch_add(1, Ordering::SeqCst);
+                self.events
+                    .lock()
+                    .unwrap()
+                    .push(format!("shutdown:{}:{call}", self.name));
+                if self.fail_init && call == 0 {
+                    Err(Box::new(std::io::Error::other(
+                        "injected compensation failure",
+                    )))
+                } else {
+                    Ok(())
+                }
+            }
+            fn permit_duplicate_type(&self) -> bool {
+                true
+            }
+        }
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let registry = ExtensionRegistry::new();
+        for (name, fail_init) in [
+            ("dependency", false),
+            ("partial", true),
+            ("dependent", false),
+        ] {
+            let events = Arc::clone(&events);
+            registry
+                .register(Definition::new(name, move |_| {
+                    Ok(Arc::new(OrderedExtension {
+                        name,
+                        fail_init,
+                        shutdowns: AtomicUsize::new(0),
+                        events: Arc::clone(&events),
+                    }))
+                }))
+                .unwrap();
+        }
+        let host = ExtensionHost::new(&registry, Arc::new(System::new())).unwrap();
+        let report = host.start().await.unwrap();
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(host.active_names(), ["dependency", "partial", "dependent"]);
+        host.shutdown().await.unwrap();
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                "init:dependency",
+                "init:partial",
+                "shutdown:partial:0",
+                "init:dependent",
+                "shutdown:dependent:0",
+                "shutdown:partial:1",
+                "shutdown:dependency:0",
+            ]
+        );
     }
 
     #[tokio::test]

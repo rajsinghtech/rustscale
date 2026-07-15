@@ -139,6 +139,16 @@ impl Runtime {
         Ok(self.config.commit(prepared))
     }
 
+    /// Synchronously revoke all request authority for terminal Drop cleanup.
+    /// This deliberately bypasses the async serialization gate: Drop has
+    /// already removed the owning Server generation and must fail closed even
+    /// if a stale request is holding that gate forever.
+    pub(crate) fn disable_terminal(&self) {
+        self.server.revoke_authority();
+        self.sharing_allowed.store(false, Ordering::Release);
+        self.config.disable();
+    }
+
     /// Disable sharing and cancel every active Taildrive request.
     pub(crate) async fn disable(&self) {
         let mut epoch = self.authorization.write().await;

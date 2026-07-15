@@ -155,10 +155,91 @@ pub(crate) fn new_routecheck_client(
     ))
 }
 
+/// Serializes mutation admission across LocalAPI listener generations.
+///
+/// A handoff advances `epoch` while holding `gate`, before the replacement
+/// snapshots preferences. Accepted handlers from the old listener must obtain
+/// the same gate and match their generation before persisting any mutation.
+#[derive(Debug)]
+pub(crate) struct LocalApiMutationFence {
+    epoch: std::sync::atomic::AtomicU64,
+    gate: tokio::sync::Mutex<()>,
+}
+
+impl LocalApiMutationFence {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            epoch: std::sync::atomic::AtomicU64::new(1),
+            gate: tokio::sync::Mutex::new(()),
+        })
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.epoch.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) async fn advance(
+        self: &Arc<Self>,
+        expected: u64,
+    ) -> Result<LocalApiGenerationHandoff, String> {
+        let _gate = self.gate.lock().await;
+        if self.generation() != expected {
+            return Err("LocalAPI mutation generation changed during handoff".into());
+        }
+        let replacement = expected.checked_add(1).unwrap_or(1);
+        self.epoch
+            .store(replacement, std::sync::atomic::Ordering::Release);
+        Ok(LocalApiGenerationHandoff {
+            fence: Arc::clone(self),
+            previous: expected,
+            replacement,
+            committed: false,
+        })
+    }
+
+    async fn admit(&self, expected: u64) -> Option<tokio::sync::MutexGuard<'_, ()>> {
+        let gate = self.gate.lock().await;
+        (self.generation() == expected).then_some(gate)
+    }
+}
+
+/// Rollback owner for a prepared mutation-generation transition.
+pub(crate) struct LocalApiGenerationHandoff {
+    fence: Arc<LocalApiMutationFence>,
+    previous: u64,
+    replacement: u64,
+    committed: bool,
+}
+
+impl LocalApiGenerationHandoff {
+    pub(crate) fn replacement(&self) -> u64 {
+        self.replacement
+    }
+
+    pub(crate) fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for LocalApiGenerationHandoff {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = self.fence.epoch.compare_exchange(
+                self.replacement,
+                self.previous,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            );
+        }
+    }
+}
+
 /// Shared state for the LocalAPI server — all fields are Arc clones of the
 /// same state held by [`crate::RunningState`], so the API always sees live
 /// data without explicit refresh.
 pub(crate) struct LocalApiState {
+    pub mutation_fence: Arc<LocalApiMutationFence>,
+    pub mutation_generation: u64,
     pub peers: Arc<RwLock<Vec<Node>>>,
     /// HA subnet-router reachability checker. Unavailable before the first netmap.
     pub routecheck: Option<Arc<rustscale_routecheck::Client>>,
@@ -402,49 +483,33 @@ pub(crate) struct LocalApiPathHandoff {
     #[cfg(unix)]
     advertised_path: PathBuf,
     #[cfg(unix)]
-    old_link: PathBuf,
-    committed: bool,
+    staging_path: PathBuf,
 }
 
 impl LocalApiPathHandoff {
-    /// Make the replacement permanent. Until this synchronous commit, dropping
-    /// the handoff atomically republishes the old listener.
-    pub(crate) fn commit(mut self) {
+    /// Atomically publish the already-bound paused listener. Preparation never
+    /// renames, unlinks, or hard-links the advertised endpoint; therefore any
+    /// error leaves the old listener published and rollback only removes the
+    /// private staging socket.
+    pub(crate) fn commit(&mut self, handle: &mut LocalApiHandle) -> std::io::Result<()> {
         #[cfg(unix)]
         {
-            let _ = std::fs::remove_file(&self.old_link);
+            std::fs::rename(&self.staging_path, &self.advertised_path)?;
+            handle.socket_path.clone_from(&self.advertised_path);
         }
-        self.committed = true;
+        #[cfg(not(unix))]
+        let _ = handle;
+        Ok(())
     }
 }
 
-impl Drop for LocalApiPathHandoff {
-    fn drop(&mut self) {
-        if self.committed {
-            return;
-        }
-        #[cfg(unix)]
-        {
-            // The old listener remains bound to old_link. Renaming it over the
-            // replacement is atomic, so the advertised path always names one
-            // complete generation.
-            if let Err(error) = std::fs::rename(&self.old_link, &self.advertised_path) {
-                log::error!(
-                    "localapi: failed to roll back listener handoff at {}: {error}",
-                    self.advertised_path.display()
-                );
-            }
-        }
-    }
-}
-
-/// Bind a paused replacement without first unlinking the live listener.
+/// Bind a paused replacement without modifying the live advertised endpoint.
 ///
-/// On Unix the replacement is bound at a private sibling path, the live socket
-/// is retained through a hard link, and one atomic rename publishes the new
-/// listener. Dropping the returned transaction republishes the old listener.
-/// Windows named pipes support multiple server instances under one name, so a
-/// second paused instance can be created directly without changing a path.
+/// On Unix the replacement remains at a private sibling path until final
+/// synchronous commit atomically renames it over the old pathname. Dropping a
+/// prepared transaction leaves the old pathname untouched. Windows named
+/// pipes support multiple server instances under one name, so a second paused
+/// instance can be created directly without changing a path.
 pub(crate) fn spawn_localapi_paused(
     state: Arc<LocalApiState>,
     socket_path: PathBuf,
@@ -457,17 +522,19 @@ pub(crate) fn spawn_localapi_paused(
     {
         static NEXT_HANDOFF: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let nonce = NEXT_HANDOFF.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let suffix = format!("handoff-{}-{nonce}", std::process::id());
-        let staging_path = socket_path.with_extension(format!("{suffix}.new"));
-        let old_link = socket_path.with_extension(format!("{suffix}.old"));
-        spawn_localapi_paused_at_paths(state, socket_path, staging_path, old_link)
+        let staging_name = format!(".rustscale-handoff-{}-{nonce}.sock", std::process::id());
+        let staging_path = socket_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join(staging_name);
+        spawn_localapi_paused_at_paths(state, socket_path, staging_path)
     }
 
     #[cfg(not(unix))]
     {
         let (start_tx, start_rx) = tokio::sync::oneshot::channel();
         let handle = spawn_localapi_inner(state, socket_path, Some(start_rx))?;
-        Some((handle, start_tx, LocalApiPathHandoff { committed: false }))
+        Some((handle, start_tx, LocalApiPathHandoff {}))
     }
 }
 
@@ -476,45 +543,22 @@ fn spawn_localapi_paused_at_paths(
     state: Arc<LocalApiState>,
     socket_path: PathBuf,
     staging_path: PathBuf,
-    old_link: PathBuf,
 ) -> Option<(
     LocalApiHandle,
     tokio::sync::oneshot::Sender<()>,
     LocalApiPathHandoff,
 )> {
-    let _ = std::fs::remove_file(&old_link);
     let (start_tx, start_rx) = tokio::sync::oneshot::channel();
 
-    // Binding the complete replacement is the first irreversible-looking
-    // operation. The advertised live path is untouched on bind failure.
-    let mut handle = spawn_localapi_inner(state, staging_path.clone(), Some(start_rx))?;
-    if let Err(error) = std::fs::hard_link(&socket_path, &old_link) {
-        log::warn!(
-            "localapi: could not retain live listener {} for handoff: {error}",
-            socket_path.display()
-        );
-        drop(handle);
-        let _ = std::fs::remove_file(staging_path);
-        return None;
-    }
-    if let Err(error) = std::fs::rename(&staging_path, &socket_path) {
-        log::warn!(
-            "localapi: could not publish replacement listener {}: {error}",
-            socket_path.display()
-        );
-        drop(handle);
-        let _ = std::fs::remove_file(staging_path);
-        let _ = std::fs::remove_file(old_link);
-        return None;
-    }
-    handle.socket_path.clone_from(&socket_path);
+    // Only the private staging pathname is created during preparation. The
+    // advertised live path remains byte-for-byte untouched until commit.
+    let handle = spawn_localapi_inner(state, staging_path.clone(), Some(start_rx))?;
     Some((
         handle,
         start_tx,
         LocalApiPathHandoff {
             advertised_path: socket_path,
-            old_link,
-            committed: false,
+            staging_path,
         },
     ))
 }
@@ -1494,6 +1538,23 @@ async fn write_access_denied<W: AsyncWrite + Unpin>(conn: &mut W) -> Result<(), 
     write_json_response(conn, 403, "Forbidden", &body).await
 }
 
+async fn admit_mutation<'a, W: AsyncWrite + Unpin>(
+    conn: &mut W,
+    state: &'a LocalApiState,
+) -> Result<Option<tokio::sync::MutexGuard<'a, ()>>, std::io::Error> {
+    let permit = state.mutation_fence.admit(state.mutation_generation).await;
+    if permit.is_none() {
+        write_json_response(
+            conn,
+            409,
+            "Conflict",
+            &serde_json::json!({"error": "stale LocalAPI listener generation"}),
+        )
+        .await?;
+    }
+    Ok(permit)
+}
+
 pub(crate) async fn dispatch<W: AsyncRead + AsyncWrite + Unpin>(
     conn: &mut W,
     req: &HttpRequest,
@@ -1582,6 +1643,9 @@ pub(crate) async fn dispatch<W: AsyncRead + AsyncWrite + Unpin>(
                 write_access_denied(conn).await?;
                 return Ok(());
             }
+            let Some(_mutation) = admit_mutation(conn, state).await? else {
+                return Ok(());
+            };
             handle_patch_prefs(conn, &req.body, state).await?;
         }
 
@@ -1591,6 +1655,9 @@ pub(crate) async fn dispatch<W: AsyncRead + AsyncWrite + Unpin>(
                 write_access_denied(conn).await?;
                 return Ok(());
             }
+            let Some(_mutation) = admit_mutation(conn, state).await? else {
+                return Ok(());
+            };
             handle_start(conn, &req.body, state).await?;
         }
 
@@ -1610,6 +1677,9 @@ pub(crate) async fn dispatch<W: AsyncRead + AsyncWrite + Unpin>(
                 write_access_denied(conn).await?;
                 return Ok(());
             }
+            let Some(_mutation) = admit_mutation(conn, state).await? else {
+                return Ok(());
+            };
             handle_logout(conn, state).await?;
         }
 
@@ -4162,7 +4232,10 @@ mod tests {
         ipn_backend.set_engine_status(1, 1);
         assert_eq!(ipn_backend.state(), rustscale_ipn::State::Running);
 
+        let mutation_fence = LocalApiMutationFence::new();
         Arc::new(LocalApiState {
+            mutation_generation: mutation_fence.generation(),
+            mutation_fence,
             peers,
             routecheck: None,
             user_profiles: Arc::new(RwLock::new(profiles)),
@@ -5109,10 +5182,17 @@ mod tests {
         let old = spawn_localapi(Arc::clone(&state), path.clone()).expect("old bind");
         let old_idle = UnixStream::connect(&path).await.expect("old connection");
         old.wait_for_accept().await;
+        use std::os::unix::fs::MetadataExt;
+        let advertised_inode = std::fs::metadata(&path).unwrap().ino();
 
-        let (replacement, start, handoff) =
+        let (mut replacement, start, mut handoff) =
             spawn_localapi_paused(state, path.clone()).expect("replacement bind");
-        let replacement_idle = UnixStream::connect(&path)
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().ino(),
+            advertised_inode,
+            "handoff preparation changed the advertised endpoint"
+        );
+        let replacement_idle = UnixStream::connect(&replacement.socket_path)
             .await
             .expect("replacement backlog connection");
         assert!(
@@ -5125,9 +5205,9 @@ mod tests {
             "replacement accepted before the old generation drained"
         );
 
-        old.shutdown().await;
         start.send(()).unwrap();
-        handoff.commit();
+        handoff.commit(&mut replacement).unwrap();
+        old.shutdown_preserving_path().await;
         tokio::time::timeout(
             std::time::Duration::from_secs(1),
             replacement.wait_for_accept(),
@@ -5151,16 +5231,14 @@ mod tests {
             std::process::id()
         ));
         let staging = path.with_extension("forced-stage");
-        let backup = path.with_extension("forced-old");
-        for candidate in [&path, &staging, &backup] {
+        for candidate in [&path, &staging] {
             let _ = std::fs::remove_file(candidate);
         }
         let old = spawn_localapi(Arc::clone(&state), path.clone()).expect("old bind");
         let blocker = UnixListener::bind(&staging).expect("staging blocker");
 
         assert!(
-            spawn_localapi_paused_at_paths(state, path.clone(), staging.clone(), backup.clone())
-                .is_none(),
+            spawn_localapi_paused_at_paths(state, path.clone(), staging.clone()).is_none(),
             "replacement unexpectedly replaced a live staging bind"
         );
         let client = UnixStream::connect(&path)
@@ -5172,9 +5250,38 @@ mod tests {
 
         drop((client, blocker));
         old.shutdown().await;
-        for candidate in [&path, &staging, &backup] {
+        for candidate in [&path, &staging] {
             let _ = std::fs::remove_file(candidate);
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn final_publish_failure_leaves_advertised_listener_untouched() {
+        use tokio::net::UnixStream;
+
+        let state = make_test_state().await;
+        let path =
+            std::env::temp_dir().join(format!("rs-localapi-pubfail-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let old = spawn_localapi(Arc::clone(&state), path.clone()).expect("old bind");
+        let (mut replacement, start, mut handoff) =
+            spawn_localapi_paused(state, path.clone()).expect("replacement bind");
+        // Unlink only the hidden socket to deterministically make final rename
+        // fail. The bound listener remains owned by its handle.
+        std::fs::remove_file(&replacement.socket_path).unwrap();
+        start.send(()).unwrap();
+        assert!(handoff.commit(&mut replacement).is_err());
+
+        let client = UnixStream::connect(&path)
+            .await
+            .expect("old advertised listener was removed on publish failure");
+        tokio::time::timeout(std::time::Duration::from_secs(1), old.wait_for_accept())
+            .await
+            .expect("old listener stopped accepting on publish failure");
+        drop(client);
+        replacement.shutdown().await;
+        old.shutdown().await;
     }
 
     #[cfg(unix)]
@@ -5193,11 +5300,11 @@ mod tests {
         let (replacement, start, handoff) =
             spawn_localapi_paused(state, path.clone()).expect("replacement bind");
 
-        // Model cancellation/failure after publication but before the later
-        // startup and extension commit.
+        // Model cancellation/failure during preparation. The advertised path
+        // was never modified, so rollback only removes the staging listener.
         drop(start);
         drop(handoff);
-        replacement.shutdown_preserving_path().await;
+        replacement.shutdown().await;
 
         let mut client = UnixStream::connect(&path).await.expect("restored old path");
         client
@@ -5218,6 +5325,30 @@ mod tests {
 
         old.shutdown().await;
         let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn stale_listener_generation_cannot_persist_start_prefs_or_logout() {
+        let state = make_test_state().await;
+        let old_prefs = state.prefs.read().await.clone();
+        let handoff = state
+            .mutation_fence
+            .advance(state.mutation_generation)
+            .await
+            .unwrap();
+        handoff.commit();
+
+        let requests: [&[u8]; 3] = [
+            b"PATCH /localapi/v0/prefs HTTP/1.1\r\nHost: localhost\r\nContent-Length: 49\r\nConnection: close\r\n\r\n{\"Prefs\":{\"Hostname\":\"stale\"},\"HostnameSet\":true}",
+            b"POST /localapi/v0/start HTTP/1.1\r\nHost: localhost\r\nContent-Length: 65\r\nConnection: close\r\n\r\n{\"UpdatePrefs\":{\"Prefs\":{\"Hostname\":\"stale\"},\"HostnameSet\":true}}",
+            b"POST /localapi/v0/logout HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        ];
+        for request in requests {
+            let response = send_request_to_state(request, &state).await;
+            assert!(response.contains("409 Conflict"), "{response}");
+        }
+        assert_eq!(*state.prefs.read().await, old_prefs);
+        assert!(!state.ipn_backend.logged_out());
     }
 
     #[cfg(unix)]
@@ -5648,6 +5779,8 @@ mod tests {
         // We need to modify the state — but it's Arc. So instead, create
         // a state with state_dir set.
         let state2 = Arc::new(LocalApiState {
+            mutation_fence: Arc::clone(&state.mutation_fence),
+            mutation_generation: state.mutation_generation,
             peers: state.peers.clone(),
             routecheck: state.routecheck.clone(),
             user_profiles: state.user_profiles.clone(),
@@ -5883,6 +6016,8 @@ mod tests {
         let mk_pub = mk.public();
         let nk = rustscale_key::NodePrivate::generate();
         Arc::new(LocalApiState {
+            mutation_fence: Arc::clone(&base.mutation_fence),
+            mutation_generation: base.mutation_generation,
             peers: base.peers.clone(),
             routecheck: base.routecheck.clone(),
             user_profiles: base.user_profiles.clone(),

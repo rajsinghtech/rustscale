@@ -55,7 +55,7 @@ fn set_user_timeout_impl(fd: RawSocketHandle, timeout: Duration) -> io::Result<(
             fd,
             libc::SOL_TCP,
             libc::TCP_USER_TIMEOUT,
-            &timeout_ms as *const _ as *const libc::c_void,
+            (&raw const timeout_ms).cast::<libc::c_void>(),
             std::mem::size_of::<libc::c_int>() as libc::socklen_t,
         )
     };

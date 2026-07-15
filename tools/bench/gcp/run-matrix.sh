@@ -20,6 +20,7 @@
 #   MATRIX_RESULTS_DIR                        — parent/root for the run-ID directory override
 #   RS_TUN_INBOUND_PIPELINE / RS_TUN_OUTBOUND_SEND_PIPELINE — rs-tun pipeline toggles: 0 (default) or 1
 #   RS_LINUX_UDP_BATCH / RS_LINUX_UDP_GRO     — Linux receive modes: 0 (disabled) or 1 (default)
+#   RS_LINUX_UDP_GSO                          — Linux TX-GSO mode: 0 (plain sendmmsg) or 1 (default/probed; requires batch=1)
 
 set -euo pipefail
 
@@ -351,7 +352,7 @@ run = {"id":"gcp-20260714-000000-dirtytest", "started_at_utc":"2026-07-14T00:00:
        "source":{"commit":"a"*40,"delivery":"git-archive-head","includes_uncommitted_changes":False,"launch_worktree_dirty":True},
        "cloud":{"provider":"gcp","project":"dry-run","requested_image_project":"ubuntu-os-cloud","requested_image_family":"ubuntu-2204-lts","requested_machine_type":"n1-standard-4","network":"default","disk_type":"pd-standard","disk_gb":200},
        "build":{"command":"","rustflags":"","cargo_profile_release_lto":"","cargo_profile_release_codegen_units":""},
-       "runtime":{"rs_tun_inbound_pipeline":False,"rs_tun_outbound_send_pipeline":False,"linux_udp_batch":True,"linux_udp_gro":True}}
+       "runtime":{"rs_tun_inbound_pipeline":False,"rs_tun_outbound_send_pipeline":False,"linux_udp_batch":True,"linux_udp_gro":True,"linux_udp_gso":True}}
 provenance.validate_run(run)
 PYEOF
 }
@@ -530,7 +531,7 @@ matrix_write_manifest() {
     --disk-gb "$GCP_DISK_GB" --build-command "${RUST_BUILD_COMMAND:-}" --rustflags "${RUSTFLAGS:-}" \
     --lto "${CARGO_PROFILE_RELEASE_LTO:-}" --codegen-units "${CARGO_PROFILE_RELEASE_CODEGEN_UNITS:-}" \
     --rs-tun-inbound-pipeline "$RS_TUN_INBOUND_PIPELINE" --rs-tun-outbound-send-pipeline "$RS_TUN_OUTBOUND_SEND_PIPELINE" \
-    --linux-udp-batch "$RS_LINUX_UDP_BATCH" --linux-udp-gro "$RS_LINUX_UDP_GRO" \
+    --linux-udp-batch "$RS_LINUX_UDP_BATCH" --linux-udp-gro "$RS_LINUX_UDP_GRO" --linux-udp-gso "$RS_LINUX_UDP_GSO" \
     "${dry_flag[@]}" --topologies "${topologies[@]}" --paths "${paths[@]}" \
     --configs "${configs[@]}" --parallelism "${parallelism[@]}" --repeat "$repeat"
 }
@@ -614,13 +615,14 @@ matrix_finalization_self_test() {
   MATRIX_RUN_ID=$(basename "$prod_dir")
   MATRIX_PROJECT=fixture-project
   MATRIX_MANIFEST_DRY_RUN=0 matrix_write_manifest "$prod_dir/matrix.json" 1 same-zone -- direct -- rs-tun -- 1
-  if ! python3 - "$dry_dir" "$prod_dir" <<'PYEOF'
+  if ! python3 - "$dry_dir" "$prod_dir" "$GCP_MACHINE" <<'PYEOF'
 import json
 import sys
 from pathlib import Path
 
-dry, prod = map(Path, sys.argv[1:])
-def endpoint(zone): return {"zone":zone,"machine_type":"n1-standard-4","cpu_platform":"fixture","cpu_model":"fixture","logical_cpus":4,"kernel_release":"fixture","os_pretty_name":"fixture"}
+machine = sys.argv[3]
+dry, prod = map(Path, sys.argv[1:3])
+def endpoint(zone): return {"zone":zone,"machine_type":machine,"cpu_platform":"fixture","cpu_model":"fixture","logical_cpus":4,"kernel_release":"fixture","os_pretty_name":"fixture"}
 def observed(dry_run):
     if dry_run: return {"resolved_image":"dry-run","server":"dry-run","client":"dry-run","toolchain":"dry-run","product":"dry-run"}
     products=[{"path":"/opt/rustscale/target/release/rustscale","version":"rustscale 1.0","version_source":"executable --version","sha256":"a"*64},{"path":"/opt/rustscale/target/release/rustscaled","version":"rustscaled 1.0","version_source":"executable --version","sha256":"b"*64}]
@@ -675,9 +677,9 @@ matrix_manifest_self_test() {
   invalid_manifest="$temp_dir/invalid.json"
   matrix_write_manifest "$manifest" 3 same-zone -- direct -- rs-tun -- 1 10 100 || { rm -rf "$temp_dir"; return 1; }
   python3 tools/bench/gcp/provenance.py validate --manifest "$manifest" || { rm -rf "$temp_dir"; return 1; }
-  python3 - "$manifest" "$RS_TUN_INBOUND_PIPELINE" "$RS_TUN_OUTBOUND_SEND_PIPELINE" "$RS_LINUX_UDP_BATCH" "$RS_LINUX_UDP_GRO" <<'PYEOF' || { rm -rf "$temp_dir"; return 1; }
+  python3 - "$manifest" "$GCP_MACHINE" "$RS_TUN_INBOUND_PIPELINE" "$RS_TUN_OUTBOUND_SEND_PIPELINE" "$RS_LINUX_UDP_BATCH" "$RS_LINUX_UDP_GRO" "$RS_LINUX_UDP_GSO" <<'PYEOF' || { rm -rf "$temp_dir"; return 1; }
 import json, sys
-data=json.load(open(sys.argv[1])); runtime=data["run"]["runtime"]; assert data["schema_version"] == 2 and data["parallelism"] == [1,10,100] and data["run"]["cloud"]["disk_gb"] == 200 and runtime == {"rs_tun_inbound_pipeline": sys.argv[2] == "1", "rs_tun_outbound_send_pipeline": sys.argv[3] == "1", "linux_udp_batch": sys.argv[4] == "1", "linux_udp_gro": sys.argv[5] == "1"}
+data=json.load(open(sys.argv[1])); runtime=data["run"]["runtime"]; assert data["schema_version"] == 2 and data["parallelism"] == [1,10,100] and data["run"]["cloud"]["disk_gb"] == 200 and data["run"]["cloud"]["requested_machine_type"] == sys.argv[2] and runtime == {"rs_tun_inbound_pipeline": sys.argv[3] == "1", "rs_tun_outbound_send_pipeline": sys.argv[4] == "1", "linux_udp_batch": sys.argv[5] == "1", "linux_udp_gro": sys.argv[6] == "1", "linux_udp_gso": sys.argv[7] == "1"}
 PYEOF
   if matrix_write_manifest "$invalid_manifest" 3 same-zone -- direct -- rs-tun -- 0 >/dev/null 2>&1 || [[ -e "$invalid_manifest" ]]; then
     rm -rf "$temp_dir"; return 1
@@ -729,9 +731,27 @@ matrix_linux_udp_receive_modes_self_test() {
   done
 }
 
+matrix_linux_udp_tx_gso_mode_self_test() {
+  local actual status
+  # Every case sets its complete mode explicitly. These startup self-tests
+  # also run before a scalar/plain/GSO-off matrix invocation, so they must not
+  # inherit a caller's selected runtime mode as their supposed default.
+  actual=$(export RS_LINUX_UDP_BATCH=1 RS_LINUX_UDP_GRO=1 RS_LINUX_UDP_GSO=0; configure_linux_udp_tx_gso_mode; printf '%s' "$RS_LINUX_UDP_GSO") || return 1
+  [[ "$actual" == 0 ]] || return 1
+  actual=$(export RS_LINUX_UDP_BATCH=1 RS_LINUX_UDP_GRO=1; unset RS_LINUX_UDP_GSO; configure_linux_udp_tx_gso_mode; printf '%s' "$RS_LINUX_UDP_GSO") || return 1
+  [[ "$actual" == 1 ]] || return 1
+  actual=$(export RS_LINUX_UDP_BATCH=0 RS_LINUX_UDP_GRO=0; unset RS_LINUX_UDP_GSO; configure_linux_udp_tx_gso_mode; printf '%s' "$RS_LINUX_UDP_GSO") || return 1
+  [[ "$actual" == 0 ]] || return 1
+  if ( export RS_LINUX_UDP_BATCH=1 RS_LINUX_UDP_GRO=1 RS_LINUX_UDP_GSO=invalid; configure_linux_udp_tx_gso_mode ) >/dev/null 2>&1; then return 1; else status=$?; fi
+  (( status == 2 )) || return 1
+  if ( export RS_LINUX_UDP_BATCH=0 RS_LINUX_UDP_GRO=0 RS_LINUX_UDP_GSO=1; configure_linux_udp_tx_gso_mode ) >/dev/null 2>&1; then return 1; else status=$?; fi
+  (( status == 2 ))
+}
+
 configure_rs_tun_inbound_pipeline || exit $?
 configure_rs_tun_outbound_send_pipeline || exit $?
 configure_linux_udp_receive_modes || exit $?
+configure_linux_udp_tx_gso_mode || exit $?
 
 matrix_command_shape_self_test
 matrix_remote_build_aggregation_self_test
@@ -747,6 +767,7 @@ matrix_manifest_self_test
 matrix_inbound_pipeline_self_test
 matrix_outbound_send_pipeline_self_test
 matrix_linux_udp_receive_modes_self_test
+matrix_linux_udp_tx_gso_mode_self_test
 matrix_finalization_self_test
 
 if (( MATRIX_SELF_TEST )); then

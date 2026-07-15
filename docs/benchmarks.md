@@ -225,6 +225,11 @@ immutable `0`/`1` runtime modes and translates `0` into the corresponding
 presence-based daemon rollback control. This permits scalar, plain-batch, and
 GRO candidates to be compared from one delivered binary.
 
+The GCP matrix also records independent immutable `RS_LINUX_UDP_GSO=0|1`
+(default `1`) and translates `0` to `RUSTSCALE_DISABLE_UDP_GSO` on both
+RustScale endpoints. TX GSO is independent of GRO but requires batching, so
+scalar mode records `RS_LINUX_UDP_GSO=0` because batch disable forces GSO off.
+
 #### Remaining gap vs tailscaled
 
 ~~rustscale's p50 latency (10.1 ms) is ~40x higher than tailscaled's (257 us).~~

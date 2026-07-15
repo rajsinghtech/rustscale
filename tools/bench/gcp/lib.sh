@@ -61,6 +61,28 @@ configure_linux_udp_receive_modes() {
   fi
 }
 
+# TX GSO is independent of GRO, but requires Linux UDP batching. A scalar
+# rollback therefore records GSO off because the production sender disables it.
+configure_linux_udp_tx_gso_mode() {
+  if [[ -z "${RS_LINUX_UDP_GSO+x}" ]]; then
+    # Preserve legacy scalar invocations: production batch rollback disables
+    # GSO, so an unrecorded mode must become the physically effective mode.
+    if [[ "${RS_LINUX_UDP_BATCH:-1}" == 0 ]]; then
+      RS_LINUX_UDP_GSO=0
+    else
+      RS_LINUX_UDP_GSO=1
+    fi
+  fi
+  case "$RS_LINUX_UDP_GSO" in
+    0|1) export RS_LINUX_UDP_GSO ;;
+    *) echo "RS_LINUX_UDP_GSO must be 0 or 1" >&2; return 2 ;;
+  esac
+  if [[ "${RS_LINUX_UDP_BATCH:-1}" == 0 && "$RS_LINUX_UDP_GSO" == 1 ]]; then
+    echo "RS_LINUX_UDP_GSO=1 requires RS_LINUX_UDP_BATCH=1" >&2
+    return 2
+  fi
+}
+
 # SSH connection cache (populated by ssh_cmd on first use per VM).
 declare -A _SSH_IP=()
 declare -A _SSH_USER=()

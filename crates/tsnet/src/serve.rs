@@ -349,6 +349,7 @@ pub(crate) struct ServeRunner {
     /// The active generation's cancel token. Replaced on each `set_config`.
     cancel: std::sync::Mutex<Arc<CancelToken>>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
+    task_aborts: std::sync::Mutex<Vec<tokio::task::AbortHandle>>,
 }
 
 /// Simple cancellation token (mirrors the one in lib.rs but local to serve).
@@ -392,6 +393,7 @@ impl ServeRunner {
             self_cap_map,
             cancel: std::sync::Mutex::new(Arc::new(CancelToken::new())),
             tasks: Mutex::new(vec![]),
+            task_aborts: std::sync::Mutex::new(vec![]),
         }
     }
 
@@ -421,17 +423,10 @@ impl ServeRunner {
             *self.cert_provider.lock().expect("cert mutex") = Some(cp);
         }
 
-        // Cancel the old generation and abort its tasks.
-        {
-            let old = self.cancel.lock().expect("cancel mutex").clone();
-            old.cancel();
-        }
-        {
-            let mut tasks = self.tasks.lock().await;
-            for t in tasks.drain(..) {
-                t.abort();
-            }
-        }
+        // Cancel and join the old generation without ever taking task
+        // ownership across an await. A cancelled reconfiguration can retry.
+        self.begin_stop();
+        self.join_tasks().await;
 
         // Install a fresh cancel token for the new generation.
         let new_cancel = Arc::new(CancelToken::new());
@@ -525,23 +520,47 @@ impl ServeRunner {
             }
         }
 
+        let new_aborts = new_tasks.iter().map(JoinHandle::abort_handle).collect();
         {
             let mut tasks = self.tasks.lock().await;
             *tasks = new_tasks;
         }
+        *self
+            .task_aborts
+            .lock()
+            .expect("serve task abort lock poisoned") = new_aborts;
         Ok(started)
     }
 
-    /// Stop all serve listeners.
-    pub(crate) async fn stop(&self) {
+    /// Signal every serve listener to stop without awaiting a task lock.
+    pub(crate) fn begin_stop(&self) {
+        self.cancel.lock().expect("cancel mutex").cancel();
+        for abort in self
+            .task_aborts
+            .lock()
+            .expect("serve task abort lock poisoned")
+            .iter()
         {
-            let cancel = self.cancel.lock().expect("cancel mutex").clone();
-            cancel.cancel();
+            abort.abort();
         }
+    }
+
+    async fn join_tasks(&self) {
         let mut tasks = self.tasks.lock().await;
-        for t in tasks.drain(..) {
-            t.abort();
+        while let Some(task) = tasks.first_mut() {
+            let _ = (&mut *task).await;
+            tasks.swap_remove(0);
         }
+        self.task_aborts
+            .lock()
+            .expect("serve task abort lock poisoned")
+            .clear();
+    }
+
+    /// Stop and join all serve listeners.
+    pub(crate) async fn stop(&self) {
+        self.begin_stop();
+        self.join_tasks().await;
     }
 }
 

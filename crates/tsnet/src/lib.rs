@@ -769,6 +769,8 @@ impl ServerBuilder {
             drive: drive::Runtime::new(),
             inner: None,
             pre_started: None,
+            #[cfg(test)]
+            logout_test_hook: None,
         })
     }
 }
@@ -791,6 +793,10 @@ pub(crate) struct RunningState {
     pub(crate) router: Option<SharedRouter>,
     pub(crate) cancel: Arc<CancelToken>,
     pub(crate) tasks: Mutex<Vec<JoinHandle<()>>>,
+    /// Synchronously usable cancellation handles for every task in `tasks`.
+    /// Teardown aborts these before its first await, while `tasks` retains the
+    /// join ownership needed for cancellation-safe cleanup retries.
+    pub(crate) task_aborts: std::sync::Mutex<Vec<tokio::task::AbortHandle>>,
     pub(crate) packet_drops: Arc<AtomicU64>,
     /// Optional packet-capture sink. Disabled capture costs pumps one cheap
     /// read-lock/Option check per observed packet.
@@ -892,6 +898,9 @@ pub(crate) struct RunningState {
     pub(crate) client_updater: Arc<std::sync::Mutex<rustscale_clientupdate::ClientUpdater>>,
     /// Persistent client audit logger for this profile/control client.
     pub(crate) audit_logger: Arc<rustscale_auditlog::Logger>,
+    /// Prevents cancellation/retry from enqueueing duplicate logout audit
+    /// records after teardown has started.
+    pub(crate) logout_audit_enqueued: bool,
     /// Tailnet Lock authority shared by map filtering and LocalAPI.
     pub(crate) tailnet_lock: Arc<tailnet_lock::TailnetLock>,
 }
@@ -1017,6 +1026,63 @@ pub struct Server {
     pub(crate) drive: Arc<drive::Runtime>,
     pub(crate) inner: Option<RunningState>,
     pub(crate) pre_started: Option<PreStartedLocalApi>,
+    #[cfg(test)]
+    pub(crate) logout_test_hook: Option<Arc<LogoutTestHook>>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(crate) enum LogoutAwaitPoint {
+    DriveDisable = 1,
+    PreLocalApi = 2,
+    RunningLocalApi = 3,
+    Serve = 4,
+    Monitor = 5,
+    Tasks = 6,
+    Netlog = 7,
+    Audit = 8,
+    ControlLogout = 9,
+    PrePortmapper = 10,
+    PreMagicsock = 11,
+    RunningPortmapper = 12,
+    RunningMagicsock = 13,
+}
+
+#[cfg(test)]
+pub(crate) struct LogoutTestHook {
+    pause_at: std::sync::atomic::AtomicU8,
+    reached: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl LogoutTestHook {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            pause_at: std::sync::atomic::AtomicU8::new(0),
+            reached: tokio::sync::Notify::new(),
+        })
+    }
+
+    pub(crate) fn pause_at(&self, point: LogoutAwaitPoint) {
+        self.pause_at
+            .store(point as u8, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn clear(&self) {
+        self.pause_at.store(0, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) async fn wait_reached(&self) {
+        self.reached.notified().await;
+    }
+
+    pub(crate) async fn checkpoint(&self, point: LogoutAwaitPoint) {
+        if self.pause_at.load(std::sync::atomic::Ordering::Acquire) == point as u8 {
+            self.reached.notify_one();
+            std::future::pending::<()>().await;
+        }
+    }
 }
 
 /// State from `start_localapi_only()` — used by `up()` to reuse the

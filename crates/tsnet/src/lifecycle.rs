@@ -121,15 +121,19 @@ impl Server {
     #[allow(clippy::large_futures)]
     ///
     /// **Idempotent**: calling `up()` on an already-running server returns
-    /// `Ok(ServerStatus)` immediately without re-starting. Mirrors Go's
-    /// `sync.Once`-guarded `Start()`.
+    /// `Ok(ServerStatus)` immediately without re-starting. A retained state
+    /// whose teardown has begun returns [`TsnetError::AlreadyUp`] until close
+    /// or logout is retried. Mirrors Go's `sync.Once`-guarded `Start()`.
     ///
     /// Returns the current [`ServerStatus`] after startup (or the existing
     /// status if already up). Mirrors Go's `Up()` which returns
     /// `(*ipnstate.Status, error)`.
     #[allow(clippy::large_futures)]
     pub async fn up(&mut self) -> Result<ServerStatus, TsnetError> {
-        if self.inner.is_some() {
+        if let Some(inner) = self.inner.as_ref() {
+            if inner.cancel.is_cancelled() {
+                return Err(TsnetError::AlreadyUp);
+            }
             return Ok(self.status());
         }
 
@@ -576,6 +580,7 @@ impl Server {
             (None, None)
         };
 
+        let task_aborts = tasks.iter().map(JoinHandle::abort_handle).collect();
         self.inner = Some(RunningState {
             tailscale_ips: b.tailscale_ips,
             magicsock: b.magicsock,
@@ -589,6 +594,7 @@ impl Server {
             router: None,
             cancel: b.cancel,
             tasks: Mutex::new(tasks),
+            task_aborts: std::sync::Mutex::new(task_aborts),
             packet_drops: b.packet_drops,
             capture,
             capture_handles: std::sync::Mutex::new(vec![]),
@@ -629,6 +635,7 @@ impl Server {
             portlist_ports,
             client_updater: client_updater.clone(),
             audit_logger,
+            logout_audit_enqueued: false,
             tailnet_lock: b.tailnet_lock.clone(),
         });
 
@@ -662,7 +669,10 @@ impl Server {
     /// requiring root.
     #[allow(clippy::large_futures)]
     pub async fn up_tun(&mut self, config: TunModeConfig) -> Result<ServerStatus, TsnetError> {
-        if self.inner.is_some() {
+        if let Some(inner) = self.inner.as_ref() {
+            if inner.cancel.is_cancelled() {
+                return Err(TsnetError::AlreadyUp);
+            }
             return Ok(self.status());
         }
 
@@ -1134,6 +1144,7 @@ impl Server {
             None
         };
 
+        let task_aborts = tasks.iter().map(JoinHandle::abort_handle).collect();
         self.inner = Some(RunningState {
             tailscale_ips: b.tailscale_ips,
             magicsock: b.magicsock,
@@ -1147,6 +1158,7 @@ impl Server {
             router,
             cancel: b.cancel,
             tasks: Mutex::new(tasks),
+            task_aborts: std::sync::Mutex::new(task_aborts),
             packet_drops: b.packet_drops,
             capture,
             capture_handles: std::sync::Mutex::new(vec![]),
@@ -1187,6 +1199,7 @@ impl Server {
             portlist_ports,
             client_updater: client_updater.clone(),
             audit_logger,
+            logout_audit_enqueued: false,
             tailnet_lock: b.tailnet_lock.clone(),
         });
 
@@ -1234,6 +1247,13 @@ impl Server {
     /// called by `Dial`/`Listen`. If the server is already up, this is a
     /// no-op (idempotent).
     pub async fn ensure_up(&mut self) -> Result<ServerStatus, TsnetError> {
+        if self
+            .inner
+            .as_ref()
+            .is_some_and(|inner| inner.cancel.is_cancelled())
+        {
+            return Err(TsnetError::AlreadyUp);
+        }
         if self.inner.is_none() {
             Box::pin(self.up()).await?;
         }
@@ -1277,6 +1297,13 @@ impl Server {
     pub async fn start_localapi_only(
         &mut self,
     ) -> Result<mpsc::UnboundedReceiver<localapi::DaemonCommand>, TsnetError> {
+        // Retained running/pre-login ownership means a close or logout was
+        // cancelled or failed and must be retried before anything can publish
+        // a replacement LocalAPI socket or profile identity.
+        if self.inner.is_some() || self.pre_started.is_some() {
+            return Err(TsnetError::AlreadyUp);
+        }
+
         let ipn_backend = Arc::new(IpnBackend::new("rustscale"));
         ipn_backend.set_want_running();
         ipn_backend.set_auth_cant_continue(true);
@@ -2349,11 +2376,9 @@ impl Server {
         })
     }
 
-    /// Shut down the server.
-    pub async fn close(&mut self) -> CloseResult {
-        // Revoke LocalAPI publication before the first await. Keep every
-        // handle in Server state until its task has been joined: cancelling
-        // this future must leave close retryable, not detach the old profile.
+    /// Revoke all externally visible profile work synchronously. Join handles
+    /// remain in `self`, so cancelling any later await cannot detach cleanup.
+    fn begin_profile_shutdown(&mut self) {
         if let Some(pre_started) = self.pre_started.as_mut() {
             if let Some(handle) = pre_started.handle.as_mut() {
                 handle.begin_shutdown();
@@ -2367,7 +2392,91 @@ impl Server {
             if let Some(path) = inner.localapi_socket.as_ref() {
                 let _ = std::fs::remove_file(path);
             }
+            if let Some(serve) = inner.serve.as_ref() {
+                serve.begin_stop();
+            }
+            inner.cancel.cancel();
+            inner.health_watchdog.stop();
+            if let Some(monitor) = inner.monitor.as_ref() {
+                monitor.shutdown();
+            }
+            for abort in inner
+                .task_aborts
+                .lock()
+                .expect("server task abort lock poisoned")
+                .iter()
+            {
+                abort.abort();
+            }
         }
+    }
+
+    async fn join_running_tasks(inner: &mut RunningState) -> Result<(), TsnetError> {
+        let join_result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut tasks = inner.tasks.lock().await;
+            while let Some(task) = tasks.first_mut() {
+                let _ = (&mut *task).await;
+                tasks.swap_remove(0);
+            }
+        })
+        .await;
+        if join_result.is_err() {
+            return Err(TsnetError::Io(std::io::Error::other(
+                "server task cleanup incomplete",
+            )));
+        }
+        inner
+            .task_aborts
+            .lock()
+            .expect("server task abort lock poisoned")
+            .clear();
+        Ok(())
+    }
+
+    /// Release profile ownership only after all asynchronous cleanup has
+    /// completed. This method deliberately contains no await points.
+    fn finish_profile_shutdown(&mut self) {
+        if let Some(inner) = self.inner.as_mut() {
+            if let Some(router) = inner.router.take() {
+                match router.lock() {
+                    Ok(mut router) => {
+                        if let Err(error) = router.close() {
+                            eprintln!("tsnet: route cleanup failed (non-fatal): {error}");
+                        }
+                    }
+                    Err(_) => eprintln!("tsnet: route cleanup skipped (router lock poisoned)"),
+                }
+            }
+            crate::capture::clear(&inner.capture);
+            inner
+                .capture_handles
+                .lock()
+                .expect("capture handles lock poisoned")
+                .clear();
+            if let Some(mut cfg) = inner.os_dns_configurator.take() {
+                if let Err(e) = cfg.close() {
+                    log::warn!("tsnet: OS DNS cleanup failed (non-fatal): {e}");
+                }
+            }
+        }
+        if let Some(pre_started) = self.pre_started.as_mut() {
+            pre_started.command_tx.take();
+            pre_started.command_rx.take();
+        }
+        self.inner.take();
+        self.pre_started.take();
+    }
+
+    #[cfg(test)]
+    async fn logout_checkpoint(&self, point: LogoutAwaitPoint) {
+        if let Some(hook) = self.logout_test_hook.as_ref() {
+            hook.checkpoint(point).await;
+        }
+    }
+
+    /// Shut down the server.
+    pub async fn close(&mut self) -> CloseResult {
+        self.begin_profile_shutdown();
 
         // Runtime shares are intentionally not persisted across shutdown or
         // profile changes. This is also the Taildrive publication barrier:
@@ -2391,27 +2500,11 @@ impl Server {
             if let Some(serve) = inner.serve.as_ref() {
                 serve.stop().await;
             }
-            inner.cancel.cancel();
-            inner.health_watchdog.stop();
             if let Some(monitor) = inner.monitor.as_mut() {
                 monitor.shutdown_and_wait().await;
             }
-
-            let join_result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                let mut tasks = inner.tasks.lock().await;
-                for task in tasks.iter() {
-                    task.abort();
-                }
-                while let Some(task) = tasks.first_mut() {
-                    let _ = (&mut *task).await;
-                    tasks.swap_remove(0);
-                }
-            })
-            .await;
-            if join_result.is_err() {
-                return CloseResult(Err(TsnetError::Io(std::io::Error::other(
-                    "server task cleanup incomplete",
-                ))));
+            if let Err(error) = Self::join_running_tasks(inner).await {
+                return CloseResult(Err(error));
             }
 
             inner.magicsock.set_connection_counter(None);
@@ -2465,36 +2558,9 @@ impl Server {
             }
         }
 
-        // No awaits after this point: commit synchronous platform cleanup and
-        // release the fully stopped profile state atomically with respect to
-        // cancellation.
-        if let Some(mut inner) = self.inner.take() {
-            if let Some(router) = inner.router.take() {
-                match router.lock() {
-                    Ok(mut router) => {
-                        if let Err(error) = router.close() {
-                            eprintln!("tsnet: route cleanup failed (non-fatal): {error}");
-                        }
-                    }
-                    Err(_) => eprintln!("tsnet: route cleanup skipped (router lock poisoned)"),
-                }
-            }
-            crate::capture::clear(&inner.capture);
-            inner
-                .capture_handles
-                .lock()
-                .expect("capture handles lock poisoned")
-                .clear();
-            if let Some(mut cfg) = inner.os_dns_configurator.take() {
-                if let Err(e) = cfg.close() {
-                    log::warn!("tsnet: OS DNS cleanup failed (non-fatal): {e}");
-                }
-            }
-        }
-        if let Some(mut pre_started) = self.pre_started.take() {
-            pre_started.command_tx.take();
-            pre_started.command_rx.take();
-        }
+        // No awaits after this point: release fully stopped state atomically
+        // with respect to cancellation.
+        self.finish_profile_shutdown();
         CloseResult(Ok(()))
     }
 
@@ -2524,147 +2590,217 @@ impl Server {
     /// After logout, the server is in a `NeedsLogin` state. The daemon
     /// should call `start_localapi_only()` again to accept a new login.
     pub async fn logout(&mut self) -> Result<(), TsnetError> {
-        self.drive.disable().await;
-        let mut inner = match self.inner.take() {
-            Some(inner) => inner,
-            None => return Ok(()), // already down
-        };
-
-        if let Err(error) = inner
-            .magicsock
-            .shutdown_portmapper(std::time::Duration::from_secs(5))
-            .await
-        {
-            self.inner = Some(inner);
-            return Err(TsnetError::Io(std::io::Error::other(format!(
-                "portmapper cleanup incomplete: {error}"
-            ))));
-        }
-        if let Err(error) = inner
-            .magicsock
-            .shutdown(std::time::Duration::from_secs(5))
-            .await
-        {
-            self.inner = Some(inner);
-            return Err(TsnetError::Io(std::io::Error::other(format!(
-                "magicsock cleanup incomplete: {error}"
-            ))));
+        if self.inner.is_none() {
+            return Ok(());
         }
 
-        if let Some(router) = inner.router.take() {
-            match router.lock() {
-                Ok(mut router) => {
-                    if let Err(error) = router.close() {
-                        eprintln!("tsnet: route cleanup failed (non-fatal): {error}");
-                    }
+        // Revoke publication and synchronously abort map/control/TKA and all
+        // other outer consumers before the first await. Their join ownership
+        // stays in RunningState until the final no-await commit below.
+        self.begin_profile_shutdown();
+        if let Some(inner) = self.inner.as_mut() {
+            if !inner.logout_audit_enqueued {
+                if let Err(error) = inner
+                    .audit_logger
+                    .enqueue(rustscale_tailcfg::AuditNodeDisconnect, "logout")
+                {
+                    log::warn!("tsnet: failed to persist audit log (non-fatal): {error}");
                 }
-                Err(_) => eprintln!("tsnet: route cleanup skipped (router lock poisoned)"),
+                inner.logout_audit_enqueued = true;
             }
         }
 
-        if let Err(error) = inner
-            .audit_logger
-            .enqueue(rustscale_tailcfg::AuditNodeDisconnect, "logout")
-        {
-            log::warn!("tsnet: failed to persist audit log (non-fatal): {error}");
-        }
-        inner
-            .audit_logger
-            .flush_and_stop(std::time::Duration::from_secs(5))
-            .await;
+        #[cfg(test)]
+        self.logout_checkpoint(LogoutAwaitPoint::DriveDisable).await;
+        self.drive.disable().await;
 
-        // 1. Send a logout register request (Expiry = far past) to expire
-        //    the node key on the control server. Best-effort: network
-        //    errors don't prevent local cleanup.
-        let cc = ControlClient::new(
-            &self.config.control_url,
-            inner.machine_key.clone(),
-            inner.server_pub_key.clone(),
-            PROTOCOL_VERSION,
-        );
-        let node_pub = inner.node_key.public();
-        let logout_req = RegisterRequest {
-            Version: CAPABILITY_VERSION,
-            NodeKey: node_pub,
-            Expiry: Some(
-                chrono::DateTime::parse_from_rfc3339("1970-01-01T00:00:00Z")
-                    .unwrap()
-                    .with_timezone(&chrono::Utc),
-            ),
-            Hostinfo: Some(Hostinfo {
-                OS: std::env::consts::OS.to_string(),
-                Hostname: self.config.hostname.clone(),
+        #[cfg(test)]
+        self.logout_checkpoint(LogoutAwaitPoint::PreLocalApi).await;
+        if let Some(pre_started) = self.pre_started.as_mut() {
+            if let Some(handle) = pre_started.handle.as_mut() {
+                handle.shutdown().await;
+            }
+        }
+
+        #[cfg(test)]
+        self.logout_checkpoint(LogoutAwaitPoint::RunningLocalApi)
+            .await;
+        if let Some(inner) = self.inner.as_mut() {
+            if let Some(handle) = inner.localapi_handle.as_mut() {
+                handle.shutdown().await;
+            }
+        }
+
+        #[cfg(test)]
+        self.logout_checkpoint(LogoutAwaitPoint::Serve).await;
+        if let Some(serve) = self.inner.as_ref().and_then(|inner| inner.serve.as_ref()) {
+            serve.stop().await;
+        }
+
+        #[cfg(test)]
+        self.logout_checkpoint(LogoutAwaitPoint::Monitor).await;
+        if let Some(inner) = self.inner.as_mut() {
+            if let Some(monitor) = inner.monitor.as_mut() {
+                monitor.shutdown_and_wait().await;
+            }
+        }
+
+        #[cfg(test)]
+        self.logout_checkpoint(LogoutAwaitPoint::Tasks).await;
+        if let Some(inner) = self.inner.as_mut() {
+            Self::join_running_tasks(inner).await?;
+            inner.magicsock.set_connection_counter(None);
+        }
+
+        #[cfg(test)]
+        self.logout_checkpoint(LogoutAwaitPoint::Netlog).await;
+        if let Some(netlog) = self.inner.as_ref().and_then(|inner| inner.netlog.as_ref()) {
+            if let Err(error) = netlog.stop().await {
+                log::warn!("tsnet: netlog shutdown failed (non-fatal): {error}");
+            }
+        }
+
+        #[cfg(test)]
+        self.logout_checkpoint(LogoutAwaitPoint::Audit).await;
+        if let Some(inner) = self.inner.as_ref() {
+            inner
+                .audit_logger
+                .flush_and_stop(std::time::Duration::from_secs(5))
+                .await;
+        }
+
+        // Expire the old node only after its map/TKA/control consumers have
+        // been joined. This standalone request is best effort and does not
+        // own any profile background task.
+        let (cc, logout_req) = {
+            let inner = self.inner.as_ref().expect("running state retained");
+            let cc = ControlClient::new(
+                &self.config.control_url,
+                inner.machine_key.clone(),
+                inner.server_pub_key.clone(),
+                PROTOCOL_VERSION,
+            );
+            let request = RegisterRequest {
+                Version: CAPABILITY_VERSION,
+                NodeKey: inner.node_key.public(),
+                Expiry: Some(
+                    chrono::DateTime::parse_from_rfc3339("1970-01-01T00:00:00Z")
+                        .unwrap()
+                        .with_timezone(&chrono::Utc),
+                ),
+                Hostinfo: Some(Hostinfo {
+                    OS: std::env::consts::OS.to_string(),
+                    Hostname: self.config.hostname.clone(),
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }),
-            ..Default::default()
+            };
+            (cc, request)
         };
+        #[cfg(test)]
+        self.logout_checkpoint(LogoutAwaitPoint::ControlLogout)
+            .await;
         if let Err(e) = cc.register(&logout_req).await {
             log::warn!("tsnet: logout register failed (non-fatal): {e}");
         }
 
-        // 2. Clear persisted state: regenerate keys, clear netmap cache.
-        if self.config.state_dir.is_some() {
-            let fresh = PersistedState::generate();
-            if let Err(e) = self.save_state(&fresh) {
-                log::warn!("tsnet: failed to clear state on logout: {e}");
-            }
+        let pre_started_magicsock = self
+            .pre_started
+            .as_ref()
+            .map(|pre_started| pre_started.magicsock.clone());
+        #[cfg(test)]
+        self.logout_checkpoint(LogoutAwaitPoint::PrePortmapper)
+            .await;
+        if let Some(magicsock) = pre_started_magicsock.as_ref() {
+            magicsock
+                .shutdown_portmapper(std::time::Duration::from_secs(5))
+                .await
+                .map_err(|error| {
+                    TsnetError::Io(std::io::Error::other(format!(
+                        "pre-login portmapper cleanup incomplete: {error}"
+                    )))
+                })?;
+        }
+        #[cfg(test)]
+        self.logout_checkpoint(LogoutAwaitPoint::PreMagicsock).await;
+        if let Some(magicsock) = pre_started_magicsock {
+            magicsock
+                .shutdown(std::time::Duration::from_secs(5))
+                .await
+                .map_err(|error| {
+                    TsnetError::Io(std::io::Error::other(format!(
+                        "pre-login magicsock cleanup incomplete: {error}"
+                    )))
+                })?;
+        }
+
+        let magicsock = self
+            .inner
+            .as_ref()
+            .expect("running state retained")
+            .magicsock
+            .clone();
+        #[cfg(test)]
+        self.logout_checkpoint(LogoutAwaitPoint::RunningPortmapper)
+            .await;
+        magicsock
+            .shutdown_portmapper(std::time::Duration::from_secs(5))
+            .await
+            .map_err(|error| {
+                TsnetError::Io(std::io::Error::other(format!(
+                    "portmapper cleanup incomplete: {error}"
+                )))
+            })?;
+        #[cfg(test)]
+        self.logout_checkpoint(LogoutAwaitPoint::RunningMagicsock)
+            .await;
+        magicsock
+            .shutdown(std::time::Duration::from_secs(5))
+            .await
+            .map_err(|error| {
+                TsnetError::Io(std::io::Error::other(format!(
+                    "magicsock cleanup incomplete: {error}"
+                )))
+            })?;
+
+        // Durable local commit point. There are intentionally no awaits from
+        // the LoggedOut marker through key/cache clearing, backend transition,
+        // and RunningState removal. Any persistence failure retains the fully
+        // stopped state, blocking startup until logout or close is retried.
+        let mut prefs = self.load_prefs()?;
+        prefs.LoggedOut = true;
+        prefs.WantRunning = false;
+        if let Some(ref dir) = self.config.state_dir {
+            prefs
+                .save(dir)
+                .map_err(|error| TsnetError::Builder(error.to_string()))?;
+            self.save_state(&PersistedState::generate())?;
             if let Some(scope) = self.profile_state_scope() {
                 NetMapCache::new_scoped(&scope, "").clear();
             }
         }
 
-        // 3. Set prefs LoggedOut=true, WantRunning=false.
-        let mut prefs = self.load_prefs().unwrap_or_default();
-        prefs.LoggedOut = true;
-        prefs.WantRunning = false;
-        if let Some(ref dir) = self.config.state_dir {
-            let _ = prefs.save(dir);
-        }
-
-        // 4. Transition IPN backend to NeedsLogin.
-        inner.ipn_backend.set_logged_out(true);
-        inner.ipn_backend.set_blocked(true);
-        inner.ipn_backend.update_inputs(|i| {
-            i.want_running = false;
-            i.has_node_key = false;
-            i.auth_cant_continue = true;
-            i.netmap_present = false;
+        let backend = self
+            .inner
+            .as_ref()
+            .expect("running state retained")
+            .ipn_backend
+            .clone();
+        backend.set_logged_out(true);
+        backend.set_blocked(true);
+        backend.update_inputs(|inputs| {
+            inputs.want_running = false;
+            inputs.has_node_key = false;
+            inputs.auth_cant_continue = true;
+            inputs.netmap_present = false;
         });
-        inner.ipn_backend.bus().send(rustscale_ipn::Notify {
+        backend.bus().send(rustscale_ipn::Notify {
             State: Some(rustscale_ipn::State::NeedsLogin),
             Prefs: Some(serde_json::to_value(&prefs).unwrap_or_default()),
             ..Default::default()
         });
 
-        // 5. Tear down the running state (stop tasks, cancel, close sockets).
-        if let Some(serve) = inner.serve.take() {
-            serve.stop().await;
-        }
-        inner.cancel.cancel();
-        inner.health_watchdog.stop();
-        if let Some(m) = inner.monitor.take() {
-            m.shutdown();
-        }
-        let mut tasks = inner.tasks.lock().await;
-        for task in tasks.drain(..) {
-            task.abort();
-        }
-        drop(tasks);
-        inner.magicsock.set_connection_counter(None);
-        if let Some(netlog) = inner.netlog.take() {
-            if let Err(error) = netlog.stop().await {
-                log::warn!("tsnet: netlog shutdown failed (non-fatal): {error}");
-            }
-        }
-        if let Some(ref path) = inner.localapi_socket {
-            let _ = std::fs::remove_file(path);
-        }
-        if let Some(mut cfg) = inner.os_dns_configurator.take() {
-            if let Err(e) = cfg.close() {
-                log::warn!("tsnet: OS DNS cleanup failed (non-fatal): {e}");
-            }
-        }
-
+        self.finish_profile_shutdown();
         Ok(())
     }
 

@@ -88,7 +88,7 @@ real JSON).
 | Ring buffer logger | `util/ringlog/` | ✅ `crates/ringlog`: `RingLog<T>` generic fixed-capacity ring buffer (Mutex<VecDeque<T>>), `add`/`get_all`/`len`/`clear`, nil-safe via `Option`; full Go test suite ported |
 | QR code rendering | `util/qrcodes/` | ✅ qrcode crate + hand-rolled 1-bit PNG encoder; `up --qr` / `login --qr` terminal half-block QR + data:image/png data URL |
 | Dependency injection / tsd | `tsd/` | ⬜ |
-| Feature gate system | `feature/` | 🔶 `crates/controlknobs` provides runtime feature flags from control plane CapMap; no compile-time gate system |
+| Feature gate system | `feature/` | ✅ `crates/feature`: deterministic thread-safe feature registration, comparable unavailable error, single-assignment `Hook`, ordered multi-party `Hooks`, and race-safe scoped test overrides |
 | Safe atomic file writes | `atomicfile/` | ✅ `crates/atomicfile`: write-temp+fsync+rename utility with perms 0o600 |
 | Metrics registry | `metrics/` | ✅ via `crates/clientmetric`: Registry with Counter/Gauge, Prometheus text format, wired into LocalAPI /metrics replacing 4 hardcoded metrics |
 | File path constants | `paths/` | ✅ `crates/paths`: default_state_dir/log_dir/config_dir/socket_path per platform (macOS/Linux/Windows) |

@@ -16,6 +16,21 @@ use std::sync::{Condvar, OnceLock, RwLock};
 use std::thread::{self, ThreadId};
 use std::{sync::Mutex, vec::Vec};
 
+/// Error returned when an optional feature is not included in the build.
+///
+/// This unit struct is also a comparable sentinel value, so callers can match
+/// or compare it directly when handling optional feature results.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct Unavailable;
+
+impl fmt::Display for Unavailable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("feature not included in this build")
+    }
+}
+
+impl Error for Unavailable {}
+
 /// A thread-safe collection of linked feature names.
 ///
 /// Registration is normally performed during startup. Snapshot reads are safe
@@ -383,7 +398,23 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    use super::{is_registered, register, registered, Hook, HookAlreadySet, Hooks, Registry};
+    use super::{
+        is_registered, register, registered, Hook, HookAlreadySet, Hooks, Registry, Unavailable,
+    };
+
+    #[test]
+    fn unavailable_is_a_comparable_standard_error() {
+        fn optional_feature() -> Result<(), Unavailable> {
+            Err(Unavailable)
+        }
+
+        let error = optional_feature().unwrap_err();
+        assert_eq!(error, Unavailable);
+        assert_eq!(error.to_string(), "feature not included in this build");
+
+        let standard_error: &dyn std::error::Error = &error;
+        assert!(standard_error.source().is_none());
+    }
 
     #[test]
     fn process_registry_uses_the_same_sorted_snapshot_semantics() {

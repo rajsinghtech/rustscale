@@ -64,6 +64,7 @@ async fn boot_node(
     relay_config: Option<ServerConfig>,
 ) -> TsnetServer {
     let mut builder = TsnetServer::builder()
+        .disable_portmapping(true)
         .hostname(hostname)
         .auth_key("tskey-test")
         .control_url(control_url)
@@ -325,9 +326,9 @@ async fn peer_relay_e2e() {
     );
 
     // ── Cleanup ────────────────────────────────────────────────────────
-    node_a.close().await;
-    node_b.close().await;
-    node_r.close().await;
+    node_a.close().await.unwrap();
+    node_b.close().await.unwrap();
+    node_r.close().await.unwrap();
     derp_handle.shutdown();
     eprintln!("peer_relay_e2e: all scenarios passed");
 }

@@ -11,7 +11,9 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Write;
+use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::pin::Pin;
 use std::sync::Arc;
 
 use base64::Engine;
@@ -325,87 +327,83 @@ pub(crate) async fn spawn_peerapi_netstack(
     filter: Arc<std::sync::Mutex<Filter>>,
     drive: Arc<crate::drive::Runtime>,
     peer_map: Arc<crate::peer_map::Runtime>,
-) -> (JoinHandle<()>, Option<u16>) {
+) -> (Vec<JoinHandle<()>>, Option<u16>) {
     let admission = PeerApiAdmission::new();
-    // Derive the port from the primary IPv4 address.
     let v4 = tailscale_ips.iter().find_map(|ip| match ip {
         IpAddr::V4(v4) => Some(*v4),
         _ => None,
     });
 
-    let port = if let Some(v4) = v4 {
-        // Try the deterministic port. Netstack::listen will fail if the port
-        // is already in use; try the 5 deterministic candidates, then fall
-        // back to an ephemeral port.
-        let mut chosen: Option<u16> = None;
+    let mut bound = None;
+    if let Some(v4) = v4 {
+        // Complete the bind before spawning. Cancellation during a candidate
+        // bind leaves no detached task or retained listener.
         for try_offset in 0u8..5 {
             let candidate = deterministic_port(IpAddr::V4(v4), try_offset);
-            match netstack.listen(candidate).await {
-                Ok(listener) => {
-                    chosen = Some(candidate);
-                    let state = Arc::new(PeerApiState {
-                        peers: peers.clone(),
-                        user_profiles: user_profiles.clone(),
-                        resolver: resolver.clone(),
-                        dns_config: dns_config.clone(),
-                        tailscale_ips: tailscale_ips.clone(),
-                        offering_exit_node,
-                        taildrop: taildrop.clone(),
-                        sockstats: sockstats.clone(),
-                        filter: filter.clone(),
-                        drive: drive.clone(),
-                        peer_map: peer_map.clone(),
-                        admission: admission.clone(),
-                    });
-                    let handle = tokio::spawn(serve_netstack_listener(listener, state));
-                    // Keep the listener task alive; we return the port.
-                    // The handle is stored but the listener lives for the
-                    // lifetime of the netstack.
-                    std::mem::forget(handle);
-                    break;
-                }
-                Err(_) => continue,
+            if let Ok(listener) = netstack.listen(candidate).await {
+                bound = Some((listener, candidate));
+                break;
             }
         }
-        if chosen.is_none() {
-            // Fall back to an ephemeral port.
+        if bound.is_none() {
             match netstack.listen(0).await {
-                Ok(listener) => {
-                    // port 0 with netstack doesn't give us the actual port back.
-                    // Use a high ephemeral port instead.
-                    chosen = Some(0);
-                    let state = Arc::new(PeerApiState {
-                        peers: peers.clone(),
-                        user_profiles: user_profiles.clone(),
-                        resolver: resolver.clone(),
-                        dns_config: dns_config.clone(),
-                        tailscale_ips: tailscale_ips.clone(),
-                        offering_exit_node,
-                        taildrop: taildrop.clone(),
-                        sockstats: sockstats.clone(),
-                        filter: filter.clone(),
-                        drive: drive.clone(),
-                        peer_map: peer_map.clone(),
-                        admission: admission.clone(),
-                    });
-                    let handle = tokio::spawn(serve_netstack_listener(listener, state));
-                    std::mem::forget(handle);
-                }
-                Err(e) => {
-                    log::warn!("peerapi: failed to listen on netstack (non-fatal): {e}");
+                Ok(listener) => bound = Some((listener, 0)),
+                Err(error) => {
+                    log::warn!("peerapi: failed to listen on netstack (non-fatal): {error}");
                 }
             }
         }
-        chosen
-    } else {
-        None
-    };
+    }
 
-    // Return a dummy handle — the real listener task is spawned above and
-    // tied to the netstack's lifetime. We return a no-op handle for the
-    // RunningState task list.
-    let dummy = tokio::spawn(async {});
-    (dummy, port)
+    let Some((listener, port)) = bound else {
+        return (Vec::new(), None);
+    };
+    let state = Arc::new(PeerApiState {
+        peers,
+        user_profiles,
+        resolver,
+        dns_config,
+        tailscale_ips,
+        offering_exit_node,
+        taildrop,
+        filter,
+        drive,
+        peer_map,
+        admission,
+        sockstats,
+    });
+    (
+        vec![tokio::spawn(serve_netstack_listener(listener, state))],
+        Some(port),
+    )
+}
+
+type BindHook = Arc<dyn Fn(IpAddr, u16) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
+async fn bind_peerapi_tcp_listeners(
+    tailscale_ips: &[IpAddr],
+    after_bind: BindHook,
+) -> (Vec<TcpListener>, Option<u16>, Option<u16>) {
+    let mut listeners = Vec::new();
+    let mut v4_port = None;
+    let mut v6_port = None;
+    for ip in tailscale_ips {
+        match bind_peerapi_tcp(*ip).await {
+            Ok((listener, port)) => {
+                log::info!("peerapi: listening on {ip}:{port}");
+                match ip {
+                    IpAddr::V4(_) => v4_port = Some(port),
+                    IpAddr::V6(_) => v6_port = Some(port),
+                }
+                listeners.push(listener);
+                after_bind(*ip, port).await;
+            }
+            Err(error) => {
+                log::warn!("peerapi: failed to bind on {ip}: {error} (non-fatal)");
+            }
+        }
+    }
+    (listeners, v4_port, v6_port)
 }
 
 /// Spawn the PeerAPI server in **TUN mode**.
@@ -424,7 +422,7 @@ pub(crate) async fn spawn_peerapi_tun(
     filter: Arc<std::sync::Mutex<Filter>>,
     drive: Arc<crate::drive::Runtime>,
     peer_map: Arc<crate::peer_map::Runtime>,
-) -> (JoinHandle<()>, Option<u16>) {
+) -> (Vec<JoinHandle<()>>, Option<u16>) {
     let admission = PeerApiAdmission::new();
     let state = Arc::new(PeerApiState {
         peers,
@@ -441,34 +439,20 @@ pub(crate) async fn spawn_peerapi_tun(
         admission,
     });
 
-    let mut v4_port: Option<u16> = None;
-    let mut v6_port: Option<u16> = None;
-    let mut handles: Vec<JoinHandle<()>> = Vec::new();
+    // Bind every address before spawning. Cancelling between per-IP binds
+    // drops all earlier listeners, so fixed ports are immediately reusable.
+    let (listeners, v4_port, v6_port) = bind_peerapi_tcp_listeners(
+        &tailscale_ips,
+        Arc::new(|_, _| Box::pin(std::future::ready(()))),
+    )
+    .await;
 
-    for ip in &tailscale_ips {
-        match bind_peerapi_tcp(*ip).await {
-            Ok((listener, port)) => {
-                log::info!("peerapi: listening on {ip}:{port}");
-                match ip {
-                    IpAddr::V4(_) => v4_port = Some(port),
-                    IpAddr::V6(_) => v6_port = Some(port),
-                }
-                let state = state.clone();
-                handles.push(tokio::spawn(serve_tcp_listener(listener, state)));
-            }
-            Err(e) => {
-                log::warn!("peerapi: failed to bind on {ip}: {e} (non-fatal)");
-            }
-        }
-    }
+    let handles = listeners
+        .into_iter()
+        .map(|listener| tokio::spawn(serve_tcp_listener(listener, Arc::clone(&state))))
+        .collect();
 
-    let handle = tokio::spawn(async move {
-        for h in handles {
-            let _ = h.await;
-        }
-    });
-
-    (handle, v4_port.or(v6_port))
+    (handles, v4_port.or(v6_port))
 }
 
 /// Serve a netstack listener: accept connections and dispatch to handlers.
@@ -480,8 +464,7 @@ async fn serve_netstack_listener(
         match listener.accept().await {
             Ok(stream) => {
                 let remote_addr = stream.peer_addr();
-                let state = state.clone();
-                tokio::spawn(handle_connection_netstack(stream, remote_addr, state));
+                handle_connection_netstack(stream, remote_addr, Arc::clone(&state)).await;
             }
             Err(e) => {
                 log::warn!("peerapi: netstack accept error: {e}");
@@ -496,8 +479,7 @@ async fn serve_tcp_listener(listener: TcpListener, state: Arc<PeerApiState>) {
     loop {
         match listener.accept().await {
             Ok((stream, addr)) => {
-                let state = state.clone();
-                tokio::spawn(handle_connection_tcp(stream, addr, state));
+                handle_connection_tcp(stream, addr, Arc::clone(&state)).await;
             }
             Err(e) => {
                 log::warn!("peerapi: tcp accept error: {e}");
@@ -2146,6 +2128,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn netstack_listener_handle_is_real_and_fixed_port_retries() {
+        let ip: Ipv4Addr = "100.64.0.55".parse().unwrap();
+        let netstack = Arc::new(Netstack::new(ip, 1280));
+        let spawn = |netstack: Arc<Netstack>| async move {
+            spawn_peerapi_netstack(
+                netstack,
+                Arc::new(RwLock::new(Vec::new())),
+                Arc::new(RwLock::new(BTreeMap::new())),
+                Arc::new(RwLock::new(MagicDnsResolver::default())),
+                Arc::new(RwLock::new(None)),
+                vec![IpAddr::V4(ip)],
+                false,
+                None,
+                None,
+                Arc::new(std::sync::Mutex::new(Filter::allow_none())),
+                crate::drive::Runtime::new(),
+                crate::peer_map::Runtime::new(&[]).expect("empty peer map"),
+            )
+            .await
+        };
+
+        let (handles, first_port) = spawn(Arc::clone(&netstack)).await;
+        assert_eq!(handles.len(), 1);
+        assert!(!handles[0].is_finished(), "peerapi returned a dummy task");
+        for handle in &handles {
+            handle.abort();
+        }
+        for handle in handles {
+            let _ = handle.await;
+        }
+
+        let (retry_handles, retry_port) = spawn(netstack).await;
+        assert_eq!(
+            retry_port, first_port,
+            "fixed port was retained by old task"
+        );
+        for handle in &retry_handles {
+            handle.abort();
+        }
+        for handle in retry_handles {
+            let _ = handle.await;
+        }
+    }
+
+    #[tokio::test]
     async fn request_head_parser_leaves_taildrive_body_unread() {
         let (mut client, mut server) = tokio::io::duplex(1024);
         client
@@ -2522,6 +2549,49 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.contains("request body exceeds"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn cancellation_between_each_bind_releases_fixed_ports() {
+        let ip = "127.0.0.1".parse::<IpAddr>().unwrap();
+        let ips = vec![ip, ip];
+        for cancel_at in 1..=ips.len() {
+            let (bound_tx, mut bound_rx) = tokio::sync::mpsc::unbounded_channel();
+            let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let hook_count = Arc::clone(&count);
+            let hook: BindHook = Arc::new(move |ip, port| {
+                let index = hook_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                let _ = bound_tx.send((ip, port));
+                Box::pin(async move {
+                    if index == cancel_at {
+                        std::future::pending::<()>().await;
+                    }
+                })
+            });
+            let bind_ips = ips.clone();
+            let bind =
+                tokio::spawn(async move { bind_peerapi_tcp_listeners(&bind_ips, hook).await });
+            let mut bound = Vec::new();
+            for _ in 0..cancel_at {
+                bound.push(
+                    tokio::time::timeout(std::time::Duration::from_secs(1), bound_rx.recv())
+                        .await
+                        .expect("bind hook did not run")
+                        .unwrap(),
+                );
+            }
+            bind.abort();
+            let _ = bind.await;
+
+            for (ip, port) in bound {
+                let listener = TcpListener::bind(SocketAddr::new(ip, port))
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!("fixed-port retry failed after bind {cancel_at}: {error}")
+                    });
+                drop(listener);
+            }
+        }
     }
 
     #[test]

@@ -240,10 +240,15 @@ impl Logger {
         Ok(())
     }
 
+    /// Request worker cancellation without relinquishing join ownership.
+    pub fn request_stop(&self) {
+        self.cancel.cancel();
+    }
+
     /// Cancel the worker and make one bounded final flush attempt. Any events
     /// left unsent remain in the store.
     pub async fn flush_and_stop(&self, timeout: Duration) {
-        self.cancel.cancel();
+        self.request_stop();
         let mut worker_guard = self.worker.lock().await;
         if let Some(worker) = worker_guard.as_mut() {
             // Retain join ownership until the await completes. Cancellation

@@ -23,6 +23,7 @@ async fn testcontrol_full_flow() {
     // 2. Build a tsnet Server pointing at testcontrol.
     let tmp = tempfile::tempdir().expect("tempdir");
     let mut server = rustscale_tsnet::Server::builder()
+        .disable_portmapping(true)
         .hostname("testcontrol-selftest")
         .auth_key("tskey-test")
         .control_url(&control_url)
@@ -99,6 +100,6 @@ async fn testcontrol_full_flow() {
     }
 
     // 9. Clean up.
-    server.close().await;
+    server.close().await.unwrap();
     eprintln!("tsnet node closed; test passed");
 }

@@ -68,7 +68,7 @@ real JSON).
 | IPN audit logging | `ipn/auditlog/` | ✅ `crates/auditlog`: profile-scoped persistent queue, EventID deduplication, retry/backoff and final flush; Noise `/machine/audit-log` transport plus LocalAPI disconnect/logout wiring |
 | Service policy | `ipn/policy/` | ✅ Go's package is a single `IsInterestingService` function — ported as `crates/portlist/src/policy.rs::is_interesting_service` (wired into portlist `to_services()`) |
 | Config file format | `ipn/conffile/` | ✅ `crates/conffile` — `ConfigVAlpha` schema with `Load`/`ToPrefs`/`WantRunning`, `deny_unknown_fields`, version `"alpha0"` validation; `--config <path>` flag on rustscaled, `POST /localapi/v0/reload-config` endpoint, SIGHUP reload handler |
-| IPN extension system | `ipn/ipnext/` | ⬜ |
+| IPN extension system | `ipn/ipnext/` | 🔶 `crates/ipnext`: deterministic registration, async startup rollback, reverse shutdown, and state/profile notifications are wired into tsnet; control/netmap/filter/router and direct LocalAPI hooks remain deferred |
 | Cloud log shipping | `logtail/` | ✅ `crates/logtail` — async upload loop (background tokio task), HTTP POST to `{base_url}/c/{collection}/{private_id}`, zstd compression (>256B, >64B savings), Retry-After/30–60s backoff, RFC3339Nano `client_time`, buffer cap + drop_count, upload metrics |
 | Port enumeration | `portlist/` | ✅ `crates/portlist`: `Poller` (same-count shortcut, 1s Linux / 5s macOS), Linux `/proc/net/{tcp,tcp6,udp,udp6}` hex parser + `/proc/*/fd` PID resolution, macOS `netstat -na` + `lsof -F` parser with sandbox-failure cache, `to_services()` with is_interesting_service policy; wired into tsnet via HostinfoHook + background poller task |
 | Network flow logging | `wgengine/netlog/` | ✅ `crates/netlogtype` wire types plus `crates/netlog` aggregation/logtail upload; virtual traffic is counted by the filter and physical direct UDP, peer-relay, and DERP traffic is counted by an optional nonblocking magicsock hook with batch-aware tests |
@@ -87,7 +87,7 @@ real JSON).
 | Rate limiter | `util/limiter/` | 🔶 inline in `crates/derp/src/client.rs` (token-bucket for DERP send path); no standalone crate |
 | Ring buffer logger | `util/ringlog/` | ✅ `crates/ringlog`: `RingLog<T>` generic fixed-capacity ring buffer (Mutex<VecDeque<T>>), `add`/`get_all`/`len`/`clear`, nil-safe via `Option`; full Go test suite ported |
 | QR code rendering | `util/qrcodes/` | ✅ qrcode crate + hand-rolled 1-bit PNG encoder; `up --qr` / `login --qr` terminal half-block QR + data:image/png data URL |
-| Dependency injection / tsd | `tsd/` | ⬜ |
+| Dependency injection / tsd | `tsd/` | ✅ `crates/tsd`: concurrent typed and named set-once dependency container with snapshots and duplicate/type-safety tests |
 | Feature gate system | `feature/` | ✅ `crates/feature`: deterministic thread-safe feature registration, comparable unavailable error, single-assignment `Hook`, ordered multi-party `Hooks`, and race-safe scoped test overrides |
 | Safe atomic file writes | `atomicfile/` | ✅ `crates/atomicfile`: write-temp+fsync+rename utility with perms 0o600 |
 | Metrics registry | `metrics/` | ✅ via `crates/clientmetric`: Registry with Counter/Gauge, Prometheus text format, wired into LocalAPI /metrics replacing 4 hardcoded metrics |

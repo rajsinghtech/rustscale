@@ -27,7 +27,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
 use crate::c2n::{answer_c2n_ping, C2nReplyError, C2nReplyTransport, C2nRouter};
-use crate::controlbase::{NoiseIo, ProtocolVersion};
+use crate::controlbase::{NoiseIo, NoiseIoHandle, ProtocolVersion};
 use crate::controlhttp::dial_control;
 
 /// Shared map-session state for delta-tracking across reconnections.
@@ -425,6 +425,58 @@ impl From<H2SetupError> for StreamMapError {
     }
 }
 
+struct H2Runtime {
+    connection: Option<tokio::task::JoinHandle<()>>,
+    bridge: Option<tokio::task::JoinHandle<()>>,
+    noise: Option<NoiseIoHandle>,
+}
+
+impl H2Runtime {
+    async fn close(mut self) {
+        if let Some(connection) = self.connection.take() {
+            connection.abort();
+            let _ = connection.await;
+        }
+        if let Some(bridge) = self.bridge.take() {
+            bridge.abort();
+            let _ = bridge.await;
+        }
+        if let Some(noise) = self.noise.take() {
+            noise.close().await;
+        }
+    }
+}
+
+impl Drop for H2Runtime {
+    fn drop(&mut self) {
+        let connection = self.connection.take();
+        let bridge = self.bridge.take();
+        let noise = self.noise.take();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                if let Some(connection) = connection {
+                    connection.abort();
+                    let _ = connection.await;
+                }
+                if let Some(bridge) = bridge {
+                    bridge.abort();
+                    let _ = bridge.await;
+                }
+                if let Some(noise) = noise {
+                    noise.close().await;
+                }
+            });
+        } else {
+            if let Some(connection) = connection {
+                connection.abort();
+            }
+            if let Some(bridge) = bridge {
+                bridge.abort();
+            }
+        }
+    }
+}
+
 /// The high-level control-plane client.
 ///
 /// Legacy convenience methods dial per operation; [`connect`](Self::connect)
@@ -518,7 +570,7 @@ impl ControlClient {
 
         let (conn, stream) = noise_stream.into_parts();
         let noise_io = NoiseIo::new(conn, stream);
-        let (mut h2_send, h2_conn) = establish_h2(noise_io).await?;
+        let (mut h2_send, h2_conn, _bridge) = establish_h2(noise_io).await?;
         tokio::spawn(async move {
             let _ = h2_conn.await;
         });
@@ -559,40 +611,49 @@ impl ControlClient {
         .await?;
 
         let (conn, stream) = noise_stream.into_parts();
-        let noise_io = NoiseIo::new(conn, stream);
+        let (noise_io, noise) = NoiseIo::new_owned(conn, stream);
 
-        let (mut h2_send, h2_conn) = establish_h2(noise_io).await?;
-        tokio::spawn(async move {
-            let _ = h2_conn.await;
-        });
+        let (mut h2_send, h2_conn, bridge) = establish_h2(noise_io).await?;
+        let runtime = H2Runtime {
+            connection: Some(tokio::spawn(async move {
+                let _ = h2_conn.await;
+            })),
+            bridge: Some(bridge),
+            noise: Some(noise),
+        };
 
-        let body = serde_json::to_vec(req)?;
-        let request = http::Request::builder()
-            .method("POST")
-            .uri("/machine/register")
-            .header("content-type", "application/json")
-            .body(())
-            .unwrap();
+        let result = async {
+            let body = serde_json::to_vec(req)?;
+            let request = http::Request::builder()
+                .method("POST")
+                .uri("/machine/register")
+                .header("content-type", "application/json")
+                .body(())
+                .unwrap();
 
-        // h2 returns (ResponseFuture, SendStream).
-        let (resp_future, mut send_stream) = h2_send.send_request(request, false)?;
-        send_stream.send_data(bytes::Bytes::from(body), true)?;
+            // h2 returns (ResponseFuture, SendStream).
+            let (resp_future, mut send_stream) = h2_send.send_request(request, false)?;
+            send_stream.send_data(bytes::Bytes::from(body), true)?;
 
-        let resp = resp_future.await?;
-        let status = resp.status().as_u16();
-        let mut body = resp.into_body();
+            let resp = resp_future.await?;
+            let status = resp.status().as_u16();
+            let mut body = resp.into_body();
 
-        let data = read_h2_body(&mut body).await?;
+            let data = read_h2_body(&mut body).await?;
 
-        if status != 200 {
-            return Err(RegisterError::HttpStatus(
-                status,
-                String::from_utf8_lossy(&data).to_string(),
-            ));
+            if status != 200 {
+                return Err(RegisterError::HttpStatus(
+                    status,
+                    String::from_utf8_lossy(&data).to_string(),
+                ));
+            }
+
+            let resp: RegisterResponse = serde_json::from_slice(&data)?;
+            Ok(resp)
         }
-
-        let resp: RegisterResponse = serde_json::from_slice(&data)?;
-        Ok(resp)
+        .await;
+        runtime.close().await;
+        result
     }
 
     /// Send a `MapRequest` to `/machine/map` and stream `MapResponse` updates
@@ -635,118 +696,127 @@ impl ControlClient {
         .await?;
 
         let (conn, stream) = noise_stream.into_parts();
-        let noise_io = NoiseIo::new(conn, stream);
+        let (noise_io, noise) = NoiseIo::new_owned(conn, stream);
 
-        let (mut h2_send, h2_conn) = establish_h2(noise_io).await?;
-        tokio::spawn(async move {
-            let _ = h2_conn.await;
-        });
+        let (mut h2_send, h2_conn, bridge) = establish_h2(noise_io).await?;
+        let runtime = H2Runtime {
+            connection: Some(tokio::spawn(async move {
+                let _ = h2_conn.await;
+            })),
+            bridge: Some(bridge),
+            noise: Some(noise),
+        };
 
-        let body = serde_json::to_vec(req)?;
-        let request = http::Request::builder()
-            .method("POST")
-            .uri("/machine/map")
-            .header("content-type", "application/json")
-            .body(())
-            .unwrap();
+        let result = async {
+            let body = serde_json::to_vec(req)?;
+            let request = http::Request::builder()
+                .method("POST")
+                .uri("/machine/map")
+                .header("content-type", "application/json")
+                .body(())
+                .unwrap();
 
-        let (resp_future, mut send_stream) = h2_send.send_request(request, false)?;
-        send_stream.send_data(bytes::Bytes::from(body), true)?;
-        let mut c2n_tasks = c2n_router.zip(last_c2n_url).map(|(router, last_url)| {
-            C2nTaskSet::new(
-                router,
-                Arc::new(H2C2nReplyTransport {
-                    sender: h2_send.clone(),
-                }),
-                last_url,
-            )
-        });
+            let (resp_future, mut send_stream) = h2_send.send_request(request, false)?;
+            send_stream.send_data(bytes::Bytes::from(body), true)?;
+            let mut c2n_tasks = c2n_router.zip(last_c2n_url).map(|(router, last_url)| {
+                C2nTaskSet::new(
+                    router,
+                    Arc::new(H2C2nReplyTransport {
+                        sender: h2_send.clone(),
+                    }),
+                    last_url,
+                )
+            });
 
-        let resp = resp_future.await?;
-        let status = resp.status().as_u16();
-        let mut resp_body = resp.into_body();
+            let resp = resp_future.await?;
+            let status = resp.status().as_u16();
+            let mut resp_body = resp.into_body();
 
-        if status != 200 {
-            let data = read_h2_body(&mut resp_body).await?;
-            return Err(StreamMapError::HttpStatus(
-                status,
-                String::from_utf8_lossy(&data).to_string(),
-            ));
-        }
+            if status != 200 {
+                let data = read_h2_body(&mut resp_body).await?;
+                return Err(StreamMapError::HttpStatus(
+                    status,
+                    String::from_utf8_lossy(&data).to_string(),
+                ));
+            }
 
-        // Read 4-byte LE size-prefixed MapResponse messages from the body.
-        // h2::RecvStream doesn't impl AsyncRead, so we read frames and
-        // buffer them.
-        let mut read_buf: Vec<u8> = Vec::new();
-        loop {
-            // Ensure we have at least 4 bytes for the size header.
-            while read_buf.len() < 4 {
-                match resp_body.data().await {
-                    Some(Ok(frame)) => {
-                        let _ = resp_body.flow_control().release_capacity(frame.len());
-                        read_buf.extend_from_slice(&frame);
-                    }
-                    Some(Err(e)) => {
-                        let _ = updates.send(Err(StreamMapError::H2(e))).await;
-                        return Ok(());
-                    }
-                    None => {
-                        // Stream ended.
-                        if read_buf.is_empty() {
+            // Read 4-byte LE size-prefixed MapResponse messages from the body.
+            // h2::RecvStream doesn't impl AsyncRead, so we read frames and
+            // buffer them.
+            let mut read_buf: Vec<u8> = Vec::new();
+            loop {
+                // Ensure we have at least 4 bytes for the size header.
+                while read_buf.len() < 4 {
+                    match resp_body.data().await {
+                        Some(Ok(frame)) => {
+                            let _ = resp_body.flow_control().release_capacity(frame.len());
+                            read_buf.extend_from_slice(&frame);
+                        }
+                        Some(Err(e)) => {
+                            let _ = updates.send(Err(StreamMapError::H2(e))).await;
                             return Ok(());
                         }
-                        // Partial data — treat as EOF.
-                        return Ok(());
+                        None => {
+                            // Stream ended.
+                            if read_buf.is_empty() {
+                                return Ok(());
+                            }
+                            // Partial data — treat as EOF.
+                            return Ok(());
+                        }
                     }
                 }
-            }
 
-            let size =
-                u32::from_le_bytes([read_buf[0], read_buf[1], read_buf[2], read_buf[3]]) as usize;
-            read_buf.drain(..4);
+                let size = u32::from_le_bytes([read_buf[0], read_buf[1], read_buf[2], read_buf[3]])
+                    as usize;
+                read_buf.drain(..4);
 
-            if size > 4 * 1024 * 1024 {
-                let _ = updates
-                    .send(Err(StreamMapError::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "map response too large",
-                    ))))
-                    .await;
-                return Ok(());
-            }
+                if size > 4 * 1024 * 1024 {
+                    let _ = updates
+                        .send(Err(StreamMapError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "map response too large",
+                        ))))
+                        .await;
+                    return Ok(());
+                }
 
-            // Read until we have `size` bytes.
-            while read_buf.len() < size {
-                match resp_body.data().await {
-                    Some(Ok(frame)) => {
-                        let _ = resp_body.flow_control().release_capacity(frame.len());
-                        read_buf.extend_from_slice(&frame);
-                    }
-                    Some(Err(e)) => {
-                        let _ = updates.send(Err(StreamMapError::H2(e))).await;
-                        return Ok(());
-                    }
-                    None => {
-                        // Stream ended prematurely.
-                        return Ok(());
+                // Read until we have `size` bytes.
+                while read_buf.len() < size {
+                    match resp_body.data().await {
+                        Some(Ok(frame)) => {
+                            let _ = resp_body.flow_control().release_capacity(frame.len());
+                            read_buf.extend_from_slice(&frame);
+                        }
+                        Some(Err(e)) => {
+                            let _ = updates.send(Err(StreamMapError::H2(e))).await;
+                            return Ok(());
+                        }
+                        None => {
+                            // Stream ended prematurely.
+                            return Ok(());
+                        }
                     }
                 }
-            }
 
-            let msg: Vec<u8> = read_buf.drain(..size).collect();
-            match serde_json::from_slice::<MapResponse>(&msg) {
-                Ok(mr) => {
-                    if !forward_map_response(&updates, mr, c2n_tasks.as_mut()).await {
+                let msg: Vec<u8> = read_buf.drain(..size).collect();
+                match serde_json::from_slice::<MapResponse>(&msg) {
+                    Ok(mr) => {
+                        if !forward_map_response(&updates, mr, c2n_tasks.as_mut()).await {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = updates.send(Err(StreamMapError::Json(e))).await;
                         break;
                     }
                 }
-                Err(e) => {
-                    let _ = updates.send(Err(StreamMapError::Json(e))).await;
-                    break;
-                }
             }
+            Ok(())
         }
-        Ok(())
+        .await;
+        runtime.close().await;
+        result
     }
 
     /// Stream `MapResponse` updates with automatic reconnection.
@@ -849,40 +919,49 @@ impl ControlClient {
         .await?;
 
         let (conn, stream) = noise_stream.into_parts();
-        let noise_io = NoiseIo::new(conn, stream);
+        let (noise_io, noise) = NoiseIo::new_owned(conn, stream);
 
-        let (mut h2_send, h2_conn) = establish_h2(noise_io).await?;
-        tokio::spawn(async move {
-            let _ = h2_conn.await;
-        });
+        let (mut h2_send, h2_conn, bridge) = establish_h2(noise_io).await?;
+        let runtime = H2Runtime {
+            connection: Some(tokio::spawn(async move {
+                let _ = h2_conn.await;
+            })),
+            bridge: Some(bridge),
+            noise: Some(noise),
+        };
 
-        let body = serde_json::to_vec(req)?;
-        let request = http::Request::builder()
-            .method("POST")
-            .uri("/machine/map")
-            .header("content-type", "application/json")
-            .body(())
-            .unwrap();
+        let result = async {
+            let body = serde_json::to_vec(req)?;
+            let request = http::Request::builder()
+                .method("POST")
+                .uri("/machine/map")
+                .header("content-type", "application/json")
+                .body(())
+                .unwrap();
 
-        let (resp_future, mut send_stream) = h2_send.send_request(request, false)?;
-        send_stream.send_data(bytes::Bytes::from(body), true)?;
+            let (resp_future, mut send_stream) = h2_send.send_request(request, false)?;
+            send_stream.send_data(bytes::Bytes::from(body), true)?;
 
-        let resp = resp_future.await?;
-        let status = resp.status().as_u16();
-        let mut body = resp.into_body();
+            let resp = resp_future.await?;
+            let status = resp.status().as_u16();
+            let mut body = resp.into_body();
 
-        if status != 200 {
-            let data = read_h2_body(&mut body).await?;
-            return Err(StreamMapError::HttpStatus(
-                status,
-                String::from_utf8_lossy(&data).to_string(),
-            ));
+            if status != 200 {
+                let data = read_h2_body(&mut body).await?;
+                return Err(StreamMapError::HttpStatus(
+                    status,
+                    String::from_utf8_lossy(&data).to_string(),
+                ));
+            }
+
+            // Drain and discard the response body (expected to be empty).
+            while body.data().await.is_some() {}
+
+            Ok(())
         }
-
-        // Drain and discard the response body (expected to be empty).
-        while body.data().await.is_some() {}
-
-        Ok(())
+        .await;
+        runtime.close().await;
+        result
     }
 
     /// Convenience: send a `MapRequest` and read the first `MapResponse`.
@@ -912,42 +991,51 @@ impl ControlClient {
         .await?;
 
         let (conn, stream) = noise_stream.into_parts();
-        let noise_io = NoiseIo::new(conn, stream);
+        let (noise_io, noise) = NoiseIo::new_owned(conn, stream);
 
-        let (mut h2_send, h2_conn) = establish_h2(noise_io).await?;
-        tokio::spawn(async move {
-            let _ = h2_conn.await;
-        });
+        let (mut h2_send, h2_conn, bridge) = establish_h2(noise_io).await?;
+        let runtime = H2Runtime {
+            connection: Some(tokio::spawn(async move {
+                let _ = h2_conn.await;
+            })),
+            bridge: Some(bridge),
+            noise: Some(noise),
+        };
 
-        let body = serde_json::to_vec(req)?;
-        let request = http::Request::builder()
-            .method("POST")
-            .uri("/machine/set-dns")
-            .header("content-type", "application/json")
-            .body(())
-            .unwrap();
+        let result = async {
+            let body = serde_json::to_vec(req)?;
+            let request = http::Request::builder()
+                .method("POST")
+                .uri("/machine/set-dns")
+                .header("content-type", "application/json")
+                .body(())
+                .unwrap();
 
-        let (resp_future, mut send_stream) = h2_send.send_request(request, false)?;
-        send_stream.send_data(bytes::Bytes::from(body), true)?;
+            let (resp_future, mut send_stream) = h2_send.send_request(request, false)?;
+            send_stream.send_data(bytes::Bytes::from(body), true)?;
 
-        let resp = resp_future.await?;
-        let status = resp.status().as_u16();
-        let mut body = resp.into_body();
-        let data = read_h2_body(&mut body).await?;
+            let resp = resp_future.await?;
+            let status = resp.status().as_u16();
+            let mut body = resp.into_body();
+            let data = read_h2_body(&mut body).await?;
 
-        if status != 200 {
-            return Err(RegisterError::HttpStatus(
-                status,
-                String::from_utf8_lossy(&data).to_string(),
-            ));
+            if status != 200 {
+                return Err(RegisterError::HttpStatus(
+                    status,
+                    String::from_utf8_lossy(&data).to_string(),
+                ));
+            }
+
+            // SetDNSResponse is empty; tolerate an empty body.
+            if data.is_empty() {
+                Ok(SetDNSResponse::default())
+            } else {
+                Ok(serde_json::from_slice(&data)?)
+            }
         }
-
-        // SetDNSResponse is empty; tolerate an empty body.
-        if data.is_empty() {
-            Ok(SetDNSResponse::default())
-        } else {
-            Ok(serde_json::from_slice(&data)?)
-        }
+        .await;
+        runtime.close().await;
+        result
     }
 
     /// Request an OIDC ID token from `/machine/id-token` over Noise.
@@ -962,33 +1050,42 @@ impl ControlClient {
         .await?;
 
         let (conn, stream) = noise_stream.into_parts();
-        let noise_io = NoiseIo::new(conn, stream);
-        let (mut h2_send, h2_conn) = establish_h2(noise_io).await?;
-        tokio::spawn(async move {
-            let _ = h2_conn.await;
-        });
+        let (noise_io, noise) = NoiseIo::new_owned(conn, stream);
+        let (mut h2_send, h2_conn, bridge) = establish_h2(noise_io).await?;
+        let runtime = H2Runtime {
+            connection: Some(tokio::spawn(async move {
+                let _ = h2_conn.await;
+            })),
+            bridge: Some(bridge),
+            noise: Some(noise),
+        };
 
-        let body = serde_json::to_vec(req)?;
-        let request = http::Request::builder()
-            .method("POST")
-            .uri("/machine/id-token")
-            .header("content-type", "application/json")
-            .body(())
-            .unwrap();
-        let (resp_future, mut send_stream) = h2_send.send_request(request, false)?;
-        send_stream.send_data(bytes::Bytes::from(body), true)?;
+        let result = async {
+            let body = serde_json::to_vec(req)?;
+            let request = http::Request::builder()
+                .method("POST")
+                .uri("/machine/id-token")
+                .header("content-type", "application/json")
+                .body(())
+                .unwrap();
+            let (resp_future, mut send_stream) = h2_send.send_request(request, false)?;
+            send_stream.send_data(bytes::Bytes::from(body), true)?;
 
-        let response = resp_future.await?;
-        let status = response.status().as_u16();
-        let mut body = response.into_body();
-        let data = read_h2_body(&mut body).await?;
-        if status != 200 {
-            return Err(RegisterError::HttpStatus(
-                status,
-                String::from_utf8_lossy(&data).to_string(),
-            ));
+            let response = resp_future.await?;
+            let status = response.status().as_u16();
+            let mut body = response.into_body();
+            let data = read_h2_body(&mut body).await?;
+            if status != 200 {
+                return Err(RegisterError::HttpStatus(
+                    status,
+                    String::from_utf8_lossy(&data).to_string(),
+                ));
+            }
+            Ok(serde_json::from_slice(&data)?)
         }
-        Ok(serde_json::from_slice(&data)?)
+        .await;
+        runtime.close().await;
+        result
     }
 
     /// Post an audit event to `/machine/audit-log` over a Noise connection.
@@ -1017,44 +1114,53 @@ impl ControlClient {
         .map_err(|error| audit_transport_error(RegisterError::Dial(error)))?;
 
         let (conn, stream) = noise_stream.into_parts();
-        let noise_io = NoiseIo::new(conn, stream);
-        let (mut h2_send, h2_conn) = establish_h2(noise_io)
+        let (noise_io, noise) = NoiseIo::new_owned(conn, stream);
+        let (mut h2_send, h2_conn, bridge) = establish_h2(noise_io)
             .await
             .map_err(|error| audit_transport_error(error.into()))?;
-        tokio::spawn(async move {
-            let _ = h2_conn.await;
-        });
+        let runtime = H2Runtime {
+            connection: Some(tokio::spawn(async move {
+                let _ = h2_conn.await;
+            })),
+            bridge: Some(bridge),
+            noise: Some(noise),
+        };
 
-        let body = serde_json::to_vec(&request)
-            .map_err(|error| audit_transport_error(RegisterError::Json(error)))?;
-        let request = http::Request::builder()
-            .method("POST")
-            .uri("/machine/audit-log")
-            .header("content-type", "application/json")
-            .body(())
-            .unwrap();
-        let (resp_future, mut send_stream) = h2_send
-            .send_request(request, false)
-            .map_err(|error| audit_transport_error(RegisterError::H2(error)))?;
-        send_stream
-            .send_data(bytes::Bytes::from(body), true)
-            .map_err(|error| audit_transport_error(RegisterError::H2(error)))?;
+        let result = async {
+            let body = serde_json::to_vec(&request)
+                .map_err(|error| audit_transport_error(RegisterError::Json(error)))?;
+            let request = http::Request::builder()
+                .method("POST")
+                .uri("/machine/audit-log")
+                .header("content-type", "application/json")
+                .body(())
+                .unwrap();
+            let (resp_future, mut send_stream) = h2_send
+                .send_request(request, false)
+                .map_err(|error| audit_transport_error(RegisterError::H2(error)))?;
+            send_stream
+                .send_data(bytes::Bytes::from(body), true)
+                .map_err(|error| audit_transport_error(RegisterError::H2(error)))?;
 
-        let response = resp_future
-            .await
-            .map_err(|error| audit_transport_error(RegisterError::H2(error)))?;
-        let status = response.status().as_u16();
-        let mut body = response.into_body();
-        let data = read_h2_body(&mut body)
-            .await
-            .map_err(|error| audit_transport_error(RegisterError::H2(error)))?;
-        if status != 200 {
-            return Err(TransportError::new(
-                format!("http status {status}: {}", String::from_utf8_lossy(&data)),
-                status == 429 || status >= 500,
-            ));
+            let response = resp_future
+                .await
+                .map_err(|error| audit_transport_error(RegisterError::H2(error)))?;
+            let status = response.status().as_u16();
+            let mut body = response.into_body();
+            let data = read_h2_body(&mut body)
+                .await
+                .map_err(|error| audit_transport_error(RegisterError::H2(error)))?;
+            if status != 200 {
+                return Err(TransportError::new(
+                    format!("http status {status}: {}", String::from_utf8_lossy(&data)),
+                    status == 429 || status >= 500,
+                ));
+            }
+            Ok(())
         }
-        Ok(())
+        .await;
+        runtime.close().await;
+        result
     }
 }
 
@@ -1082,18 +1188,18 @@ const EARLY_PAYLOAD_MAGIC: &[u8] = b"\xff\xff\xffTS";
 /// Handle the optional "early payload" and establish an HTTP/2 connection
 /// over the Noise stream.
 ///
-/// Returns (SendRequest, Connection) from the `h2` crate.
+/// Returns the h2 sender/connection plus the owned Noise bridge task.
 async fn establish_h2(
     noise_io: NoiseIo,
 ) -> Result<
     (
         h2::client::SendRequest<bytes::Bytes>,
         h2::client::Connection<tokio::io::DuplexStream, bytes::Bytes>,
+        tokio::task::JoinHandle<()>,
     ),
     H2SetupError,
 > {
-    let (sender, connection, _bridge_task) = establish_h2_closeable(noise_io).await?;
-    Ok((sender, connection))
+    establish_h2_closeable(noise_io).await
 }
 
 async fn establish_h2_closeable(
@@ -1132,7 +1238,7 @@ async fn establish_h2_closeable(
         server.write_all(&prepend).await?;
     }
 
-    let bridge_task = tokio::spawn(async move {
+    let bridge = tokio::spawn(async move {
         let mut io = noise_io;
         let mut read_buf = vec![0u8; 8192];
         let mut write_buf = vec![0u8; 8192];
@@ -1160,8 +1266,14 @@ async fn establish_h2_closeable(
         }
     });
 
-    let (h2_send, h2_conn) = h2::client::handshake(client).await?;
-    Ok((h2_send, h2_conn, bridge_task))
+    match h2::client::handshake(client).await {
+        Ok((h2_send, h2_conn)) => Ok((h2_send, h2_conn, bridge)),
+        Err(error) => {
+            bridge.abort();
+            let _ = bridge.await;
+            Err(H2SetupError::H2(error))
+        }
+    }
 }
 
 fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {

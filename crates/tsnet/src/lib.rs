@@ -21,7 +21,7 @@
 //! // loop { let stream = listener.accept().await?; ... }
 //!
 //! let stream = server.dial("100.64.0.2:443").await?;
-//! server.close().await;
+//! server.close().await?;
 //! # Ok(())
 //! # }
 //! ```
@@ -231,6 +231,10 @@ pub enum TsnetError {
     NotSupported(String),
     #[error("Tailnet Lock state failed closed: {0}")]
     TailnetLock(String),
+    #[error("extension host error: {0}")]
+    Extension(String),
+    #[error("server shutdown incomplete: {0}")]
+    ShutdownIncomplete(String),
     #[error("timeout waiting for first map response")]
     MapTimeout,
     #[error("tls error: {0}")]
@@ -241,24 +245,6 @@ pub enum TsnetError {
     Funnel(#[from] FunnelError),
     #[error("service error: {0}")]
     Service(#[from] ServiceError),
-}
-
-/// Explicit outcome of [`Server::close`].
-#[derive(Debug)]
-pub struct CloseResult(pub(crate) Result<(), TsnetError>);
-
-impl CloseResult {
-    pub fn is_ok(&self) -> bool {
-        self.0.is_ok()
-    }
-
-    pub fn is_err(&self) -> bool {
-        self.0.is_err()
-    }
-
-    pub fn into_result(self) -> Result<(), TsnetError> {
-        self.0
-    }
 }
 
 /// A builder for configuring a [`Server`].
@@ -358,6 +344,11 @@ pub struct ServerBuilder {
     /// Optional daemon policy reconciler applied to every persisted preference
     /// mutation. Embedding users leave this unset.
     pub(crate) preference_policy: Option<Arc<dyn PreferencePolicy>>,
+    /// Optional extension registry override. The process-wide ipnext registry
+    /// is used when this is unset.
+    pub(crate) extension_registry: Option<Arc<rustscale_ipnext::ExtensionRegistry>>,
+    /// Optional daemon dependency container supplied by the embedding.
+    pub(crate) system: Option<Arc<rustscale_tsd::System>>,
 }
 
 /// A pluggable logger callback for diagnostic messages. Implementations
@@ -728,6 +719,22 @@ impl ServerBuilder {
         self
     }
 
+    /// Use an explicit extension registry instead of the process-wide
+    /// [`rustscale_ipnext::global_registry`].
+    pub fn extension_registry(
+        mut self,
+        registry: Arc<rustscale_ipnext::ExtensionRegistry>,
+    ) -> Self {
+        self.extension_registry = Some(registry);
+        self
+    }
+
+    /// Use an explicit typed daemon dependency container.
+    pub fn system(mut self, system: Arc<rustscale_tsd::System>) -> Self {
+        self.system = Some(system);
+        self
+    }
+
     /// Enable OS-level DNS configuration in TUN mode (default: `false`).
     ///
     /// When enabled, [`Server::up_tun`] writes `/etc/resolver/` entries on
@@ -770,13 +777,32 @@ impl ServerBuilder {
         if self.hostname.is_empty() {
             return Err(TsnetError::Builder("hostname must not be empty".into()));
         }
+        let system = self
+            .system
+            .clone()
+            .unwrap_or_else(|| Arc::new(rustscale_tsd::System::new()));
+        let extension_host = match self.extension_registry.as_deref() {
+            Some(registry) => rustscale_ipnext::ExtensionHost::new(registry, Arc::clone(&system)),
+            None => rustscale_ipnext::ExtensionHost::new(
+                rustscale_ipnext::global_registry(),
+                Arc::clone(&system),
+            ),
+        }
+        .map_err(|error| TsnetError::Extension(error.to_string()))?;
         Ok(Server {
             config: self,
             drive: drive::Runtime::new(),
             inner: None,
             pre_started: None,
+            system,
+            extension_host: Some(extension_host),
+            bootstrap_supervisor: Arc::new(BootstrapSupervisor::default()),
+            startup_supervisor: Arc::new(BootstrapSupervisor::default()),
+            shutdown_supervisor: Arc::new(BootstrapSupervisor::default()),
             #[cfg(test)]
             logout_test_hook: None,
+            #[cfg(test)]
+            startup_localapi_test_hook: None,
         })
     }
 }
@@ -808,13 +834,15 @@ pub(crate) struct RunningState {
     pub(crate) router: Option<SharedRouter>,
     pub(crate) cancel: Arc<CancelToken>,
     pub(crate) tasks: Mutex<Vec<JoinHandle<()>>>,
-    /// Dynamically rebound map stream task, retained separately so every key
-    /// rotation generation is cancelled and joined under profile ownership.
+    /// Dynamically rebound control-map stream generations. This remains
+    /// separate from the outer task vector so key rotation can replace one
+    /// generation without losing profile cleanup ownership.
     pub(crate) map_tasks: Arc<MapSessionTasks>,
-    /// Synchronously usable cancellation handles for every task in `tasks`.
-    /// Teardown aborts these before its first await, while `tasks` retains the
-    /// join ownership needed for cancellation-safe cleanup retries.
+    /// Synchronous cancellation handles for every outer task. Join ownership
+    /// remains in `tasks` and transfers with the transactional cleanup owner.
     pub(crate) task_aborts: std::sync::Mutex<Vec<tokio::task::AbortHandle>>,
+    pub(crate) loopback_controls: std::sync::Mutex<Vec<Arc<loopback::LoopbackControl>>>,
+    pub(crate) in_memory_clients: std::sync::Mutex<Vec<Arc<loopback::InMemoryClientControl>>>,
     pub(crate) packet_drops: Arc<AtomicU64>,
     /// Optional packet-capture sink. Disabled capture costs pumps one cheap
     /// read-lock/Option check per observed packet.
@@ -864,13 +892,10 @@ pub(crate) struct RunningState {
     pub(crate) peerapi_port: Option<u16>,
     /// Runtime Hostinfo field overrides (shared with the update loop).
     pub(crate) overrides: SharedOverrides,
-    /// LocalAPI accept-loop ownership. Kept separate from the generic task
-    /// set so shutdown can revoke publication and join every connection before
-    /// releasing profile identity and magicsock ownership.
-    pub(crate) localapi_handle: Option<localapi::LocalApiHandle>,
-    /// LocalAPI socket path (if the server was spawned). Used for diagnostics
-    /// and cleanup on close().
+    /// LocalAPI socket path (if the server was spawned). Used for cleanup on
+    /// close().
     pub(crate) localapi_socket: Option<PathBuf>,
+    pub(crate) localapi_handle: Option<localapi::LocalApiHandle>,
     /// Node key expired flag — set when the control server signals
     /// `NodeKeyExpired` in a MapResponse. The client should transition to
     /// a "NeedsLogin" state; un-expiring clears it.
@@ -898,6 +923,8 @@ pub(crate) struct RunningState {
     /// direct access for SIGHUP-driven config reload without going through
     /// the LocalAPI endpoint.
     pub(crate) prefs: Arc<RwLock<rustscale_ipn::Prefs>>,
+    /// Serializes profile/preference commits and callback enqueue order.
+    pub(crate) profile_mutations: Arc<tokio::sync::Mutex<()>>,
     /// Tracks the one persisted exit-node selection that may be retried after
     /// a map update. Explicit API/config choices clear this pending state.
     pub(crate) exit_node_selection: Arc<RwLock<ExitNodeSelection>>,
@@ -916,11 +943,12 @@ pub(crate) struct RunningState {
     pub(crate) client_updater: Arc<std::sync::Mutex<rustscale_clientupdate::ClientUpdater>>,
     /// Persistent client audit logger for this profile/control client.
     pub(crate) audit_logger: Arc<rustscale_auditlog::Logger>,
-    /// Prevents cancellation/retry from enqueueing duplicate logout audit
-    /// records after teardown has started.
-    pub(crate) logout_audit_enqueued: bool,
     /// Tailnet Lock authority shared by map filtering and LocalAPI.
     pub(crate) tailnet_lock: Arc<tailnet_lock::TailnetLock>,
+    /// Startup-scoped hostinfo registrations removed on rollback/shutdown.
+    pub(crate) hostinfo_hooks: Vec<hostinfo::HostinfoHookHandle>,
+    /// Atomic backend/profile subscription feeding extension hooks.
+    pub(crate) extension_subscription: Option<rustscale_ipn::CallbackSubscription>,
 }
 
 /// A fallback TCP handler: called when an incoming TCP flow doesn't match any
@@ -1039,69 +1067,165 @@ pub(crate) struct Bootstrap {
     pub(crate) peer_snapshot_fresh: bool,
 }
 
+#[derive(Default)]
+pub(crate) struct BootstrapSupervisor {
+    state: std::sync::Mutex<CleanupGenerationState>,
+    changed: tokio::sync::Notify,
+}
+
+pub(crate) struct CleanupOwner {
+    extension_host: Option<rustscale_ipnext::ExtensionHost>,
+    inner: Option<RunningState>,
+    pre_started: Option<PreStartedLocalApi>,
+}
+
+impl CleanupOwner {
+    fn take_from(server: &mut Server) -> Self {
+        Self {
+            extension_host: server.extension_host.take(),
+            inner: server.inner.take(),
+            pre_started: server.pre_started.take(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.extension_host.is_none() && self.inner.is_none() && self.pre_started.is_none()
+    }
+}
+
+#[derive(Default)]
+struct CleanupGenerationState {
+    active: usize,
+    epoch: u64,
+    retained_owners: Vec<CleanupOwner>,
+}
+
+pub(crate) struct CleanupCompletion(Arc<BootstrapSupervisor>);
+
+impl Drop for CleanupCompletion {
+    fn drop(&mut self) {
+        self.0.finish_cleanup();
+    }
+}
+
+impl BootstrapSupervisor {
+    pub(crate) async fn wait(&self) {
+        self.wait_for_at_most(0).await;
+    }
+
+    pub(crate) async fn wait_for_at_most(&self, maximum: usize) {
+        loop {
+            let observed_epoch = {
+                let state = self.state.lock().expect("cleanup generation lock poisoned");
+                if state.active <= maximum {
+                    return;
+                }
+                state.epoch
+            };
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            {
+                let state = self.state.lock().expect("cleanup generation lock poisoned");
+                if state.active <= maximum {
+                    return;
+                }
+                if state.epoch != observed_epoch {
+                    continue;
+                }
+            }
+            changed.await;
+        }
+    }
+
+    pub(crate) fn begin_cleanup(self: &Arc<Self>) -> CleanupCompletion {
+        let mut state = self.state.lock().expect("cleanup generation lock poisoned");
+        state.active = state.active.checked_add(1).expect("cleanup count overflow");
+        state.epoch = state.epoch.wrapping_add(1);
+        drop(state);
+        self.changed.notify_waiters();
+        CleanupCompletion(Arc::clone(self))
+    }
+
+    pub(crate) fn finish_cleanup(&self) {
+        let mut state = self.state.lock().expect("cleanup generation lock poisoned");
+        debug_assert!(state.active > 0, "cleanup completion underflow");
+        state.active = state.active.saturating_sub(1);
+        state.epoch = state.epoch.wrapping_add(1);
+        drop(state);
+        self.changed.notify_waiters();
+    }
+
+    pub(crate) fn retain_owner(&self, owner: CleanupOwner) {
+        debug_assert!(!owner.is_empty());
+        self.state
+            .lock()
+            .expect("cleanup generation lock poisoned")
+            .retained_owners
+            .push(owner);
+    }
+
+    pub(crate) fn take_retained_owner(&self) -> Option<CleanupOwner> {
+        self.state
+            .lock()
+            .expect("cleanup generation lock poisoned")
+            .retained_owners
+            .pop()
+    }
+
+    pub(crate) fn has_retained_owner(&self) -> bool {
+        !self
+            .state
+            .lock()
+            .expect("cleanup generation lock poisoned")
+            .retained_owners
+            .is_empty()
+    }
+
+    pub(crate) fn has_active_cleanup(&self) -> bool {
+        self.state
+            .lock()
+            .expect("cleanup generation lock poisoned")
+            .active
+            > 0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_extension_host_count(&self) -> usize {
+        self.state
+            .lock()
+            .expect("cleanup generation lock poisoned")
+            .retained_owners
+            .iter()
+            .filter(|owner| owner.extension_host.is_some())
+            .count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_count(&self) -> usize {
+        self.state
+            .lock()
+            .expect("cleanup generation lock poisoned")
+            .active
+    }
+}
+
 /// An embedded Tailscale server.
 pub struct Server {
     pub(crate) config: ServerBuilder,
     pub(crate) drive: Arc<drive::Runtime>,
     pub(crate) inner: Option<RunningState>,
     pub(crate) pre_started: Option<PreStartedLocalApi>,
+    pub(crate) system: Arc<rustscale_tsd::System>,
+    pub(crate) extension_host: Option<rustscale_ipnext::ExtensionHost>,
+    pub(crate) bootstrap_supervisor: Arc<BootstrapSupervisor>,
+    pub(crate) startup_supervisor: Arc<BootstrapSupervisor>,
+    pub(crate) shutdown_supervisor: Arc<BootstrapSupervisor>,
     #[cfg(test)]
-    pub(crate) logout_test_hook: Option<Arc<LogoutTestHook>>,
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(u8)]
-pub(crate) enum LogoutAwaitPoint {
-    DriveDisable = 1,
-    PreLocalApi = 2,
-    RunningLocalApi = 3,
-    Serve = 4,
-    Monitor = 5,
-    Tasks = 6,
-    Netlog = 7,
-    Audit = 8,
-    ControlLogout = 9,
-    PrePortmapper = 10,
-    PreMagicsock = 11,
-    RunningPortmapper = 12,
-    RunningMagicsock = 13,
-}
-
-#[cfg(test)]
-pub(crate) struct LogoutTestHook {
-    pause_at: std::sync::atomic::AtomicU8,
-    reached: tokio::sync::Notify,
-}
-
-#[cfg(test)]
-impl LogoutTestHook {
-    pub(crate) fn new() -> Arc<Self> {
-        Arc::new(Self {
-            pause_at: std::sync::atomic::AtomicU8::new(0),
-            reached: tokio::sync::Notify::new(),
-        })
-    }
-
-    pub(crate) fn pause_at(&self, point: LogoutAwaitPoint) {
-        self.pause_at
-            .store(point as u8, std::sync::atomic::Ordering::Release);
-    }
-
-    pub(crate) fn clear(&self) {
-        self.pause_at.store(0, std::sync::atomic::Ordering::Release);
-    }
-
-    pub(crate) async fn wait_reached(&self) {
-        self.reached.notified().await;
-    }
-
-    pub(crate) async fn checkpoint(&self, point: LogoutAwaitPoint) {
-        if self.pause_at.load(std::sync::atomic::Ordering::Acquire) == point as u8 {
-            self.reached.notify_one();
-            std::future::pending::<()>().await;
-        }
-    }
+    pub(crate) logout_test_hook: Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>,
+    #[cfg(test)]
+    pub(crate) startup_localapi_test_hook:
+        Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>, bool)>,
 }
 
 /// State from `start_localapi_only()` — used by `up()` to reuse the
@@ -1109,10 +1233,8 @@ impl LogoutTestHook {
 /// pre-started LocalAPI server.
 pub(crate) struct PreStartedLocalApi {
     pub(crate) backend: Arc<IpnBackend>,
-    /// Pre-login magicsock ownership, retained for future IPNext startup
-    /// paths and explicit close/shutdown.
-    pub(crate) magicsock: Arc<Magicsock>,
     pub(crate) handle: Option<localapi::LocalApiHandle>,
+    pub(crate) magicsock: Option<Arc<Magicsock>>,
     pub(crate) login_trigger: Arc<tokio::sync::Notify>,
     #[allow(dead_code)]
     pub(crate) auth_url: Arc<std::sync::Mutex<Option<String>>>,
@@ -1140,6 +1262,18 @@ impl Server {
     /// Whether the server is up.
     pub fn is_up(&self) -> bool {
         self.inner.is_some()
+    }
+
+    /// Returns the typed daemon dependency container shared with extensions.
+    pub fn system(&self) -> &Arc<rustscale_tsd::System> {
+        &self.system
+    }
+
+    /// Returns a weak API handle to the server's extension host.
+    pub fn extension_host(&self) -> Option<rustscale_ipnext::Host> {
+        self.extension_host
+            .as_ref()
+            .map(rustscale_ipnext::ExtensionHost::host)
     }
 
     /// The node's public key, if the server is up. Used by test harnesses
@@ -1304,105 +1438,118 @@ impl Server {
         } else {
             None
         };
-        let mut prefs_guard = inner.prefs.write().await;
-        let old_prefs = prefs_guard.clone();
-        let mut next_prefs = old_prefs.clone();
-        masked.apply_to(&mut next_prefs);
-        if let Some(policy) = &self.config.preference_policy {
-            policy.reconcile(&mut next_prefs)?;
-        }
-        let exit_changed =
-            masked.ExitNodeAllowLANAccessSet || masked.ExitNodeIDSet || masked.ExitNodeIPSet;
-        if let Some(ref dir) = self.config.state_dir {
-            next_prefs
-                .save(dir)
-                .map_err(|error| format!("prefs save: {error}"))?;
-        }
-        if exit_changed {
-            let selected_exit = if let Some(selector) = exit_node_pref(&next_prefs) {
-                let peers = inner.peers.read().await;
-                localapi::resolve_exit_node_peer(&peers, &selector)
-            } else {
-                None
-            };
-            let requested = exit_node_pref(&next_prefs).is_some();
-            let pending = requested && selected_exit.is_none();
-            let mut selection = inner.exit_node_selection.write().await;
-            let mut routes = inner.route_table.write().await;
-            let old_exit_state = routes.exit_route_state();
-            let selected_exit = selected_exit.or_else(|| {
-                if pending {
-                    routes.exit_node().cloned()
+        let notification = {
+            let _commit = inner.profile_mutations.lock().await;
+            let profile = self
+                .config
+                .state_dir
+                .as_ref()
+                .and_then(|dir| {
+                    let current = rustscale_ipn::LoginProfile::load_current_id(dir).ok()??;
+                    rustscale_ipn::LoginProfile::load_all(dir)
+                        .ok()?
+                        .into_iter()
+                        .find(|profile| profile.ID == current)
+                })
+                .unwrap_or_default();
+            let mut prefs_guard = inner.prefs.write().await;
+            let old_prefs = prefs_guard.clone();
+            let mut next_prefs = old_prefs.clone();
+            masked.apply_to(&mut next_prefs);
+            if let Some(policy) = &self.config.preference_policy {
+                policy.reconcile(&mut next_prefs)?;
+            }
+            let exit_changed =
+                masked.ExitNodeAllowLANAccessSet || masked.ExitNodeIDSet || masked.ExitNodeIPSet;
+            if let Some(ref dir) = self.config.state_dir {
+                next_prefs
+                    .save(dir)
+                    .map_err(|error| format!("prefs save: {error}"))?;
+            }
+            if exit_changed {
+                let selected_exit = if let Some(selector) = exit_node_pref(&next_prefs) {
+                    let peers = inner.peers.read().await;
+                    localapi::resolve_exit_node_peer(&peers, &selector)
                 } else {
                     None
-                }
-            });
-            set_exit_route_state_latch_aware(
-                &mut routes,
-                inner.router.as_ref(),
-                selected_exit,
-                requested,
-            );
-            if let Some(router) = inner.router.as_ref() {
-                let control_url = if next_prefs.ControlURL.is_empty() {
-                    DEFAULT_CONTROL_URL
-                } else {
-                    &next_prefs.ControlURL
                 };
-                if let Err(error) = sync_router(
-                    router,
-                    &inner.tailscale_ips,
-                    &routes,
-                    &inner.magicsock,
-                    control_url,
-                    next_prefs.ExitNodeAllowLANAccess,
-                ) {
-                    routes.restore_exit_route_state(old_exit_state);
-                    if let Some(ref dir) = self.config.state_dir {
-                        if let Err(rollback_error) = old_prefs.save(dir) {
-                            return Err(format!(
-                                "router update failed: {error}; prefs rollback failed: {rollback_error}"
-                            ));
-                        }
+                let requested = exit_node_pref(&next_prefs).is_some();
+                let pending = requested && selected_exit.is_none();
+                let mut selection = inner.exit_node_selection.write().await;
+                let mut routes = inner.route_table.write().await;
+                let old_exit_state = routes.exit_route_state();
+                let selected_exit = selected_exit.or_else(|| {
+                    if pending {
+                        routes.exit_node().cloned()
+                    } else {
+                        None
                     }
-                    return Err(error.to_string());
+                });
+                set_exit_route_state_latch_aware(
+                    &mut routes,
+                    inner.router.as_ref(),
+                    selected_exit,
+                    requested,
+                );
+                if let Some(router) = inner.router.as_ref() {
+                    let control_url = if next_prefs.ControlURL.is_empty() {
+                        DEFAULT_CONTROL_URL
+                    } else {
+                        &next_prefs.ControlURL
+                    };
+                    if let Err(error) = sync_router(
+                        router,
+                        &inner.tailscale_ips,
+                        &routes,
+                        &inner.magicsock,
+                        control_url,
+                        next_prefs.ExitNodeAllowLANAccess,
+                    ) {
+                        routes.restore_exit_route_state(old_exit_state);
+                        if let Some(ref dir) = self.config.state_dir {
+                            if let Err(rollback_error) = old_prefs.save(dir) {
+                                return Err(format!(
+                                    "router update failed: {error}; prefs rollback failed: {rollback_error}"
+                                ));
+                            }
+                        }
+                        return Err(error.to_string());
+                    }
+                }
+                let committed_peer = routes.exit_node().cloned();
+                set_exit_route_state_latch_aware(
+                    &mut routes,
+                    inner.router.as_ref(),
+                    committed_peer,
+                    requested,
+                );
+                if pending {
+                    selection.replace_from_prefs(&next_prefs);
+                } else {
+                    selection.clear_pending();
                 }
             }
-            let committed_peer = routes.exit_node().cloned();
-            set_exit_route_state_latch_aware(
-                &mut routes,
-                inner.router.as_ref(),
-                committed_peer,
-                requested,
+            *prefs_guard = next_prefs.clone();
+            inner.posture_checking.store(
+                next_prefs.PostureChecking,
+                std::sync::atomic::Ordering::Release,
             );
-            if pending {
-                selection.replace_from_prefs(&next_prefs);
-            } else {
-                selection.clear_pending();
+            if masked.ShieldsUpSet {
+                inner
+                    .filter
+                    .lock()
+                    .unwrap()
+                    .set_shields_up(next_prefs.ShieldsUp);
+                inner.peer_map.advance_authorization_epoch_locked();
             }
-        }
-        *prefs_guard = next_prefs.clone();
-        inner.posture_checking.store(
-            next_prefs.PostureChecking,
-            std::sync::atomic::Ordering::Release,
-        );
-        let updated = serde_json::to_value(&next_prefs).unwrap_or_default();
-        drop(prefs_guard);
-
-        if masked.ShieldsUpSet {
-            inner
-                .filter
-                .lock()
-                .unwrap()
-                .set_shields_up(masked.Prefs.ShieldsUp);
-            inner.peer_map.advance_authorization_epoch_locked();
-        }
+            let notification = inner
+                .ipn_backend
+                .queue_profile_state(profile, next_prefs, true);
+            drop(prefs_guard);
+            notification
+        };
+        inner.ipn_backend.dispatch_profile_state(notification);
         drop(map_commit);
-
-        inner.ipn_backend.bus().send(rustscale_ipn::Notify {
-            Prefs: Some(updated),
-            ..Default::default()
-        });
 
         Ok(())
     }

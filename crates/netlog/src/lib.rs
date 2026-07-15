@@ -186,6 +186,11 @@ impl Logger {
         Ok(())
     }
 
+    /// Request shutdown without relinquishing the retained worker handle.
+    pub fn request_stop(&self) {
+        self.inner.shutdown.notify_one();
+    }
+
     /// Stop the logger, flush pending records, and wait for the
     /// background task to exit.
     ///
@@ -196,7 +201,7 @@ impl Logger {
         // Signal the background task to do a final flush and exit.
         // `notify_one` stores a permit so the shutdown is not lost if
         // the task hasn't yet entered the `select!` loop.
-        self.inner.shutdown.notify_one();
+        self.request_stop();
         // Keep the handle in shared state while awaiting it. If this stop
         // future is cancelled, a later call can await the same worker rather
         // than losing join ownership and detaching final-flush cleanup.

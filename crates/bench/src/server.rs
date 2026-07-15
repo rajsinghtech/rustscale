@@ -67,7 +67,7 @@ pub async fn run(
         });
     }
 
-    server.close().await;
+    server.close().await.unwrap();
     Ok(())
 }
 

@@ -25,12 +25,28 @@ const COPY_V86_DEVICE_MODEL: &str = "copy-v86";
 /// A callback invoked on a `Hostinfo` before `collect_hostinfo` returns it.
 /// Hooks may inspect and mutate the `Hostinfo` — e.g. adding services,
 /// setting cloud metadata, or recording posture attributes.
-pub type HostinfoHook = Box<dyn Fn(&mut Hostinfo) + Send + Sync>;
+pub type HostinfoHook = Arc<dyn Fn(&mut Hostinfo) + Send + Sync>;
 
-static HOOKS: OnceLock<Mutex<Vec<HostinfoHook>>> = OnceLock::new();
+type RegisteredHook = (u64, HostinfoHook);
 
-fn hook_slot() -> &'static Mutex<Vec<HostinfoHook>> {
+static HOOKS: OnceLock<Mutex<Vec<RegisteredHook>>> = OnceLock::new();
+static NEXT_HOOK_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn hook_slot() -> &'static Mutex<Vec<RegisteredHook>> {
     HOOKS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Registration guard. Dropping it unregisters the hook.
+pub struct HostinfoHookHandle {
+    id: u64,
+}
+
+impl Drop for HostinfoHookHandle {
+    fn drop(&mut self) {
+        if let Ok(mut hooks) = hook_slot().lock() {
+            hooks.retain(|(id, _)| *id != self.id);
+        }
+    }
 }
 
 /// Register a hostinfo hook — a callback that runs at the end of
@@ -40,17 +56,28 @@ fn hook_slot() -> &'static Mutex<Vec<HostinfoHook>> {
 /// Thread-safe: the hook list is guarded by a `Mutex`. Hooks are called in
 /// registration order.
 #[allow(dead_code)]
-pub fn register_hostinfo_hook(hook: impl Fn(&mut Hostinfo) + Send + Sync + 'static) {
-    hook_slot().lock().unwrap().push(Box::new(hook));
+pub fn register_hostinfo_hook(
+    hook: impl Fn(&mut Hostinfo) + Send + Sync + 'static,
+) -> HostinfoHookHandle {
+    let id = NEXT_HOOK_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    hook_slot().lock().unwrap().push((id, Arc::new(hook)));
+    HostinfoHookHandle { id }
 }
 
 /// Run all registered hooks against `hi`. Called internally by
 /// `collect_hostinfo` before returning.
 fn run_hostinfo_hooks(hi: &mut Hostinfo) {
-    if let Ok(hooks) = hook_slot().lock() {
-        for h in hooks.iter() {
-            h(hi);
-        }
+    let hooks = hook_slot()
+        .lock()
+        .map(|hooks| {
+            hooks
+                .iter()
+                .map(|(_, hook)| Arc::clone(hook))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    for hook in hooks {
+        hook(hi);
     }
 }
 
@@ -1799,7 +1826,7 @@ VERSION_ID='11'"#;
         // Register a hook that sets App to a unique marker and verify
         // run_hostinfo_hooks applies it. Guard on a unique hostname so
         // the hook only fires for this test.
-        register_hostinfo_hook(|hi| {
+        let _hook = register_hostinfo_hook(|hi| {
             if hi.Hostname == "hook-can-mutate-host" {
                 hi.App = "hook-test-app-marker".to_string();
             }
@@ -1816,7 +1843,7 @@ VERSION_ID='11'"#;
     #[test]
     fn test_hook_runs_in_collect_hostinfo() {
         // Register a hook that adds a unique tag to RequestTags.
-        register_hostinfo_hook(|hi| {
+        let _hook = register_hostinfo_hook(|hi| {
             if hi.Hostname == "hook-collect-host" {
                 hi.RequestTags.push("tag:hook-collect-marker".to_string());
             }
@@ -1835,6 +1862,49 @@ VERSION_ID='11'"#;
     }
 
     #[test]
+    fn dropped_hook_does_not_survive_startup_retry() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hook_calls = Arc::clone(&calls);
+        let hook = register_hostinfo_hook(move |hi| {
+            if hi.Hostname == "hook-retry-host" {
+                hook_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        let mut hi = Hostinfo {
+            Hostname: "hook-retry-host".into(),
+            ..Default::default()
+        };
+        run_hostinfo_hooks(&mut hi);
+        drop(hook);
+        run_hostinfo_hooks(&mut hi);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn hook_can_register_and_unregister_a_child_hook() {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let hook = register_hostinfo_hook(move |hi| {
+            if hi.Hostname == "hook-reentrant-host" {
+                let child = register_hostinfo_hook(|_| {});
+                drop(child);
+                done_tx.send(()).unwrap();
+            }
+        });
+        let worker = std::thread::spawn(move || {
+            let mut hi = Hostinfo {
+                Hostname: "hook-reentrant-host".into(),
+                ..Default::default()
+            };
+            run_hostinfo_hooks(&mut hi);
+        });
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("hostinfo hook ran under the registry lock");
+        worker.join().unwrap();
+        drop(hook);
+    }
+
+    #[test]
     fn test_multiple_hooks_run_in_order() {
         // Hook-1 sets PushDeviceToken to a unique marker. Hook-2 only sets
         // DeviceModel if PushDeviceToken matches the marker, proving hook-1
@@ -1843,12 +1913,12 @@ VERSION_ID='11'"#;
         let sentinel = "hook-order-sentinel-9f3a";
         let m1 = "hook-order-m1-9f3a";
         let m2 = "hook-order-m2-9f3a";
-        register_hostinfo_hook(move |hi| {
+        let _first = register_hostinfo_hook(move |hi| {
             if hi.Hostname == sentinel && hi.PushDeviceToken.is_empty() {
                 hi.PushDeviceToken = m1.to_string();
             }
         });
-        register_hostinfo_hook(move |hi| {
+        let _second = register_hostinfo_hook(move |hi| {
             if hi.Hostname == sentinel && hi.PushDeviceToken == m1 {
                 hi.DeviceModel = m2.to_string();
             }

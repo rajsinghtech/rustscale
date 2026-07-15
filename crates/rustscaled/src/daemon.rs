@@ -214,7 +214,7 @@ async fn run_with_auth_key(
     }
 
     log::info!("rustscaled: shutting down...");
-    server.close().await;
+    server.close().await?;
     Ok(())
 }
 
@@ -377,7 +377,7 @@ async fn run_interactive(
     }
 
     log::info!("rustscaled: shutting down...");
-    server.close().await;
+    server.close().await?;
     Ok(())
 }
 

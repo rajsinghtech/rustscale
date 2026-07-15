@@ -61,6 +61,7 @@ async fn setup() -> TestEnv {
 
     // 3. Build tsnet Server with LocalAPI.
     let server = Server::builder()
+        .disable_portmapping(true)
         .hostname("cli-test")
         .auth_key("tskey-test")
         .control_url(&control_url)
@@ -133,7 +134,7 @@ async fn cli_id_token_via_noise_control() {
         expected_token
     );
 
-    env.server.close().await;
+    env.server.close().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -157,7 +158,7 @@ async fn cli_status_via_localclient() {
 
     eprintln!("localclient status OK: BackendState=Running");
 
-    env.server.close().await;
+    env.server.close().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -202,7 +203,7 @@ async fn cli_status_json_via_binary() {
 
     eprintln!("binary status --json OK: BackendState=Running");
 
-    env.server.close().await;
+    env.server.close().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -246,7 +247,7 @@ async fn cli_status_table_via_binary() {
 
     eprintln!("binary status table OK:\n{stdout}");
 
-    env.server.close().await;
+    env.server.close().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -273,7 +274,7 @@ async fn cli_ip_via_localclient() {
 
     eprintln!("localclient ip OK: self IPs = {:?}", self_ips);
 
-    env.server.close().await;
+    env.server.close().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -290,7 +291,7 @@ async fn cli_health_via_localclient() {
         health.as_array().unwrap().len()
     );
 
-    env.server.close().await;
+    env.server.close().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -311,7 +312,7 @@ async fn cli_metrics_via_localclient() {
 
     eprintln!("localclient metrics OK");
 
-    env.server.close().await;
+    env.server.close().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -330,7 +331,7 @@ async fn cli_netmap_includes_derp_map() {
 
     eprintln!("localclient netmap OK: DERPMap present");
 
-    env.server.close().await;
+    env.server.close().await.unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -360,6 +361,7 @@ async fn interactive_auth_flow() {
 
     // 3. Build tsnet Server WITHOUT auth_key — start_localapi_only().
     let mut server = Server::builder()
+        .disable_portmapping(true)
         .hostname("auth-test")
         .control_url(&control_url)
         .ephemeral(true)
@@ -426,7 +428,7 @@ async fn interactive_auth_flow() {
                         eprintln!("up() completed");
                         let _ = shutdown_rx.await;
                         eprintln!("shutting down server...");
-                        server.close().await;
+                        server.close().await.unwrap();
                         eprintln!("server closed");
                     }
                     _ => {

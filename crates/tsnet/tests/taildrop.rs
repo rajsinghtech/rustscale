@@ -43,6 +43,7 @@ async fn boot_node(
 ) -> Server {
     let _ = std::fs::remove_file(&socket_path);
     let mut server = Server::builder()
+        .disable_portmapping(true)
         .hostname(hostname)
         .auth_key("tskey-test")
         .control_url(control_url)
@@ -116,7 +117,7 @@ async fn taildrop_localapi_files_roundtrip() {
     assert!(files.is_empty(), "inbox should be empty after delete");
     eprintln!("deleted {filename} from inbox");
 
-    server.close().await;
+    server.close().await.unwrap();
     eprintln!("localapi files roundtrip test passed");
 }
 
@@ -173,7 +174,7 @@ async fn taildrop_file_targets_with_cap() {
     assert!(!targets.is_empty(), "A should see B as a file target");
     assert!(targets.iter().any(|t| t.Name.contains("node-b")));
 
-    server_a.close().await;
+    server_a.close().await.unwrap();
     drop(server_b);
     eprintln!("file targets test passed");
 }
@@ -280,6 +281,6 @@ async fn taildrop_file_get_multiple_files() {
         assert_eq!(data, *expected_content, "disk content mismatch for {name}");
     }
 
-    server.close().await;
+    server.close().await.unwrap();
     eprintln!("multiple files get test passed");
 }

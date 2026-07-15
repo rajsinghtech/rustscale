@@ -3,8 +3,10 @@
 //! and emitting `Notify{State}` on transitions) and to emit one-shot
 //! notifications (`BrowseToURL`, `LoginFinished`, `ErrMessage`, `Engine`).
 
-use std::sync::Mutex;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex, MutexGuard};
 
+use rustscale_feature::Hooks;
 use rustscale_health::Tracker;
 use rustscale_netcheck::Detector;
 use rustscale_tailcfg::DERPMap;
@@ -12,7 +14,77 @@ use tokio::sync::watch;
 
 use crate::captiveportal::CaptivePortalWatcher;
 use crate::machine::StateMachineInputs;
-use crate::{next_state, Notify, NotifyBus, State};
+use crate::{next_state, LoginProfile, Notify, NotifyBus, Prefs, State};
+
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+pub type StateCallback = Arc<dyn Fn(State) + Send + Sync>;
+pub type ProfileCallback = Arc<dyn Fn(LoginProfile, Prefs, bool) + Send + Sync>;
+
+#[derive(Clone)]
+enum PendingNotification {
+    State(State),
+    Profile(Box<(LoginProfile, Prefs, bool)>),
+}
+
+#[derive(Clone)]
+enum BackendNotification {
+    State(State, Vec<StateCallback>),
+    Profile(Box<(LoginProfile, Prefs, bool)>, Vec<ProfileCallback>),
+}
+
+#[derive(Default)]
+struct NotificationState {
+    draining: bool,
+    queue: VecDeque<BackendNotification>,
+    latest_profile: Option<(LoginProfile, Prefs, bool)>,
+}
+
+#[derive(Default)]
+struct NotificationQueue {
+    state: Mutex<NotificationState>,
+}
+
+/// Guard for an atomic callback subscription.
+pub struct CallbackSubscription {
+    active: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for CallbackSubscription {
+    fn drop(&mut self) {
+        self.active
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// A queued profile notification that must be dispatched after releasing the
+/// state lock used to commit its profile and preference snapshot.
+pub struct ProfileNotification<'a> {
+    backend: &'a IpnBackend,
+    is_drainer: bool,
+    dispatched: bool,
+}
+
+impl ProfileNotification<'_> {
+    fn dispatch(mut self) {
+        self.dispatched = true;
+        if self.is_drainer {
+            self.backend.drain_notifications();
+        }
+    }
+}
+
+impl Drop for ProfileNotification<'_> {
+    fn drop(&mut self) {
+        if !self.dispatched && self.is_drainer {
+            self.backend.drain_notifications();
+        }
+    }
+}
 
 /// Inputs that can be updated externally. This is a subset of
 /// [`StateMachineInputs`] representing the fields the backend exposes for
@@ -58,6 +130,9 @@ struct BackendInner {
 pub struct IpnBackend {
     inner: Mutex<BackendInner>,
     bus: NotifyBus,
+    state_change_callbacks: Hooks<StateCallback>,
+    profile_state_callbacks: Hooks<ProfileCallback>,
+    notification_queue: NotificationQueue,
     /// Version string included in the initial Notify message.
     version: String,
     /// Retains the background captive-portal watcher when this backend was
@@ -76,6 +151,9 @@ impl IpnBackend {
                 logged_out: false,
             }),
             bus: NotifyBus::new(),
+            state_change_callbacks: Hooks::new(),
+            profile_state_callbacks: Hooks::new(),
+            notification_queue: NotificationQueue::default(),
             version: version.into(),
             captive_portal_watcher: Mutex::new(None),
         }
@@ -118,9 +196,171 @@ impl IpnBackend {
         self.bus.clone()
     }
 
-    /// Get the current state (lock-free read of a snapshot).
+    /// Register a callback invoked after each backend state transition.
+    ///
+    /// Callbacks run in registration order without the backend mutex held.
+    pub fn add_state_change_callback(&self, callback: StateCallback) {
+        let _queue = lock_unpoisoned(&self.notification_queue.state);
+        self.state_change_callbacks.add(callback);
+    }
+
+    /// Register a callback invoked after profile or preference changes.
+    ///
+    /// Callbacks run in registration order without the backend mutex held.
+    pub fn add_profile_state_callback(&self, callback: ProfileCallback) {
+        let _queue = lock_unpoisoned(&self.notification_queue.state);
+        self.profile_state_callbacks.add(callback);
+    }
+
+    /// Install the startup profile snapshot if no profile mutation has been
+    /// observed yet.
+    pub fn seed_profile_state(&self, profile: LoginProfile, prefs: Prefs) {
+        let mut queue = lock_unpoisoned(&self.notification_queue.state);
+        queue.latest_profile.get_or_insert((profile, prefs, false));
+    }
+
+    /// Atomically subscribe to future state/profile commits and return the
+    /// exact snapshots at the subscription boundary. Notifications committed
+    /// before this call retain their old callback snapshot and cannot be
+    /// duplicated into the new subscription.
+    pub fn subscribe_with_snapshot(
+        &self,
+        state_callback: StateCallback,
+        profile_callback: ProfileCallback,
+    ) -> (
+        State,
+        Option<(LoginProfile, Prefs, bool)>,
+        CallbackSubscription,
+    ) {
+        let active = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let state_active = Arc::clone(&active);
+        let wrapped_state: StateCallback = Arc::new(move |state| {
+            if state_active.load(std::sync::atomic::Ordering::Acquire) {
+                state_callback(state);
+            }
+        });
+        let profile_active = Arc::clone(&active);
+        let wrapped_profile: ProfileCallback = Arc::new(move |profile, prefs, same_node| {
+            if profile_active.load(std::sync::atomic::Ordering::Acquire) {
+                profile_callback(profile, prefs, same_node);
+            }
+        });
+
+        let inner = lock_unpoisoned(&self.inner);
+        let queue = lock_unpoisoned(&self.notification_queue.state);
+        self.state_change_callbacks.add(wrapped_state);
+        self.profile_state_callbacks.add(wrapped_profile);
+        (
+            inner.state,
+            queue.latest_profile.clone(),
+            CallbackSubscription { active },
+        )
+    }
+
+    /// Queue an exact profile/preference snapshot while holding the lock that
+    /// commits it. Call [`dispatch_profile_state`](Self::dispatch_profile_state)
+    /// after releasing that lock.
+    pub fn queue_profile_state(
+        &self,
+        profile: LoginProfile,
+        prefs: Prefs,
+        same_node: bool,
+    ) -> ProfileNotification<'_> {
+        self.queue_notification(PendingNotification::Profile(Box::new((
+            profile, prefs, same_node,
+        ))))
+    }
+
+    /// Dispatch a previously queued profile notification in commit order.
+    pub fn dispatch_profile_state(&self, notification: ProfileNotification<'_>) {
+        debug_assert!(std::ptr::eq(self, notification.backend));
+        notification.dispatch();
+    }
+
+    /// Publish a profile or preference change to registered callbacks.
+    pub fn notify_profile_state(&self, profile: LoginProfile, prefs: Prefs, same_node: bool) {
+        let notification = self.queue_profile_state(profile, prefs, same_node);
+        self.dispatch_profile_state(notification);
+    }
+
+    /// Get the current state.
     pub fn state(&self) -> State {
         self.inner.lock().unwrap().state
+    }
+
+    fn queue_notification(&self, pending: PendingNotification) -> ProfileNotification<'_> {
+        let mut state = lock_unpoisoned(&self.notification_queue.state);
+        let notification = match pending {
+            PendingNotification::State(value) => {
+                BackendNotification::State(value, self.state_change_callbacks.snapshot())
+            }
+            PendingNotification::Profile(snapshot) => {
+                state.latest_profile = Some((*snapshot).clone());
+                self.bus.send(Notify {
+                    Prefs: Some(serde_json::to_value(&snapshot.1).unwrap_or_default()),
+                    ..Default::default()
+                });
+                BackendNotification::Profile(snapshot, self.profile_state_callbacks.snapshot())
+            }
+        };
+        state.queue.push_back(notification);
+        let is_drainer = if state.draining {
+            false
+        } else {
+            state.draining = true;
+            true
+        };
+        ProfileNotification {
+            backend: self,
+            is_drainer,
+            dispatched: false,
+        }
+    }
+
+    fn dispatch_notification(&self, dispatch: ProfileNotification<'_>) {
+        debug_assert!(std::ptr::eq(self, dispatch.backend));
+        dispatch.dispatch();
+    }
+
+    fn drain_notifications(&self) {
+        let mut first_panic = None;
+        loop {
+            let notification = {
+                let mut state = lock_unpoisoned(&self.notification_queue.state);
+                if let Some(notification) = state.queue.pop_front() {
+                    notification
+                } else {
+                    state.draining = false;
+                    break;
+                }
+            };
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.invoke_notification(notification);
+            }));
+            if first_panic.is_none() {
+                first_panic = result.err();
+            }
+        }
+        if let Some(payload) = first_panic {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    fn invoke_notification(&self, notification: BackendNotification) {
+        match notification {
+            BackendNotification::State(state, callbacks) => {
+                self.bus.send(Notify::state(state));
+                for callback in callbacks {
+                    callback(state);
+                }
+            }
+            BackendNotification::Profile(snapshot, callbacks) => {
+                let (profile, prefs, same_node) = *snapshot;
+                for callback in callbacks {
+                    callback(profile.clone(), prefs.clone(), same_node);
+                }
+            }
+        }
     }
 
     /// Get a snapshot of the current inputs.
@@ -167,8 +407,9 @@ impl IpnBackend {
         let new_state = next_state(&sm_inputs, inner.state);
         if new_state != inner.state {
             inner.state = new_state;
+            let notification = self.queue_notification(PendingNotification::State(new_state));
             drop(inner);
-            self.bus.send(Notify::state(new_state));
+            self.dispatch_notification(notification);
         }
         new_state
     }
@@ -238,8 +479,9 @@ impl IpnBackend {
             drop(inner);
         } else {
             inner.state = new_state;
+            let notification = self.queue_notification(PendingNotification::State(new_state));
             drop(inner);
-            self.bus.send(Notify::state(new_state));
+            self.dispatch_notification(notification);
         }
         new_state
     }
@@ -270,8 +512,9 @@ impl IpnBackend {
             drop(inner);
         } else {
             inner.state = new_state;
+            let notification = self.queue_notification(PendingNotification::State(new_state));
             drop(inner);
-            self.bus.send(Notify::state(new_state));
+            self.dispatch_notification(notification);
         }
         new_state
     }
@@ -337,6 +580,176 @@ impl IpnBackend {
 mod tests {
     use super::*;
     use crate::{State, NOTIFY_INITIAL_PREFS, NOTIFY_INITIAL_STATE, NOTIFY_INITIAL_STATUS};
+
+    #[test]
+    fn state_callbacks_run_after_releasing_backend_lock() {
+        let backend = Arc::new(IpnBackend::new("test"));
+        let callback_backend = Arc::clone(&backend);
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let callback_observed = Arc::clone(&observed);
+        backend.add_state_change_callback(Arc::new(move |state| {
+            assert_eq!(callback_backend.state(), state);
+            callback_observed.lock().unwrap().push(state);
+        }));
+
+        backend.set_want_running();
+        backend.set_has_node_key(true);
+        backend.set_machine_authorized(true);
+        backend.set_netmap_present(true);
+        backend.set_engine_status(1, 0);
+
+        assert_eq!(*observed.lock().unwrap(), [State::Starting, State::Running]);
+    }
+
+    #[test]
+    fn concurrent_state_notifications_follow_commit_order() {
+        let backend = Arc::new(IpnBackend::new("test"));
+        backend.set_want_running();
+        backend.set_has_node_key(true);
+        backend.set_machine_authorized(true);
+        backend.set_netmap_present(true);
+        assert_eq!(backend.state(), State::Starting);
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let callback_observed = Arc::clone(&observed);
+        let callback_release = Arc::clone(&release_rx);
+        backend.add_state_change_callback(Arc::new(move |state| {
+            callback_observed.lock().unwrap().push(state);
+            if state == State::Running {
+                entered_tx.send(()).unwrap();
+                callback_release.lock().unwrap().recv().unwrap();
+            }
+        }));
+
+        let first_backend = Arc::clone(&backend);
+        let first = std::thread::spawn(move || first_backend.set_engine_status(1, 0));
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("first state callback did not start");
+        let second_backend = Arc::clone(&backend);
+        let second = std::thread::spawn(move || second_backend.set_blocked(true));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while backend.state() != State::NeedsLogin {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "second state did not commit"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(*observed.lock().unwrap(), [State::Running]);
+        release_tx.send(()).unwrap();
+        first.join().unwrap();
+        second.join().unwrap();
+        assert_eq!(
+            *observed.lock().unwrap(),
+            [State::Running, State::NeedsLogin]
+        );
+    }
+
+    #[test]
+    fn atomic_subscription_excludes_committed_queued_notifications() {
+        let backend = Arc::new(IpnBackend::new("test"));
+        backend.set_want_running();
+        backend.set_has_node_key(true);
+        backend.set_machine_authorized(true);
+        backend.set_netmap_present(true);
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let blocked_once = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        backend.add_state_change_callback(Arc::new(move |state| {
+            if state == State::Running
+                && !blocked_once.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                entered_tx.send(()).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+            }
+        }));
+        let first_backend = Arc::clone(&backend);
+        let first = std::thread::spawn(move || first_backend.set_engine_status(1, 0));
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        let second_backend = Arc::clone(&backend);
+        let second = std::thread::spawn(move || second_backend.set_blocked(true));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while backend.state() != State::NeedsLogin {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let callback_observed = Arc::clone(&observed);
+        let (snapshot, _, subscription) = backend.subscribe_with_snapshot(
+            Arc::new(move |state| callback_observed.lock().unwrap().push(state)),
+            Arc::new(|_, _, _| {}),
+        );
+        assert_eq!(snapshot, State::NeedsLogin);
+        release_tx.send(()).unwrap();
+        first.join().unwrap();
+        second.join().unwrap();
+        assert!(observed.lock().unwrap().is_empty());
+
+        let final_state = backend.set_blocked(false);
+        assert_eq!(*observed.lock().unwrap(), [final_state]);
+        drop(subscription);
+    }
+
+    #[test]
+    fn dropped_profile_dispatch_token_drains_and_does_not_stall_queue() {
+        let backend = IpnBackend::new("test");
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let callback_observed = Arc::clone(&observed);
+        backend.add_profile_state_callback(Arc::new(move |_, prefs, _| {
+            callback_observed.lock().unwrap().push(prefs.Hostname);
+        }));
+
+        let first = Prefs {
+            Hostname: "first".into(),
+            ..Default::default()
+        };
+        drop(backend.queue_profile_state(LoginProfile::default(), first, true));
+        let second = Prefs {
+            Hostname: "second".into(),
+            ..Default::default()
+        };
+        backend.notify_profile_state(LoginProfile::default(), second, true);
+
+        assert_eq!(*observed.lock().unwrap(), ["first", "second"]);
+    }
+
+    #[test]
+    fn callback_may_join_a_child_notification_without_deadlock() {
+        let backend = Arc::new(IpnBackend::new("test"));
+        backend.set_want_running();
+        backend.set_has_node_key(true);
+        backend.set_machine_authorized(true);
+        backend.set_netmap_present(true);
+
+        let callback_backend = Arc::clone(&backend);
+        backend.add_state_change_callback(Arc::new(move |state| {
+            if state == State::Running {
+                let child_backend = Arc::clone(&callback_backend);
+                std::thread::spawn(move || child_backend.set_blocked(true))
+                    .join()
+                    .unwrap();
+            }
+        }));
+        let worker_backend = Arc::clone(&backend);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            worker_backend.set_engine_status(1, 0);
+            done_tx.send(()).unwrap();
+        });
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("callback deadlocked on its child notification");
+        assert_eq!(backend.state(), State::NeedsLogin);
+    }
 
     #[tokio::test]
     async fn backend_transitions_from_nostate_to_starting_to_running() {

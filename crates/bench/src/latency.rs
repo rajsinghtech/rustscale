@@ -126,7 +126,7 @@ pub async fn run(
     let final_status = server.status();
     let path_class = super::throughput::extract_path_class(&final_status, &target);
 
-    server.close().await;
+    server.close().await.unwrap();
 
     Ok(LatencyResult {
         count,

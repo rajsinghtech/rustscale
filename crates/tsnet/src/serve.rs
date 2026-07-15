@@ -348,8 +348,8 @@ pub(crate) struct ServeRunner {
     self_cap_map: std::sync::Arc<std::sync::RwLock<NodeCapMap>>,
     /// The active generation's cancel token. Replaced on each `set_config`.
     cancel: std::sync::Mutex<Arc<CancelToken>>,
+    lifecycle: Mutex<()>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
-    task_aborts: std::sync::Mutex<Vec<tokio::task::AbortHandle>>,
 }
 
 /// Simple cancellation token (mirrors the one in lib.rs but local to serve).
@@ -392,8 +392,8 @@ impl ServeRunner {
             netstack,
             self_cap_map,
             cancel: std::sync::Mutex::new(Arc::new(CancelToken::new())),
+            lifecycle: Mutex::new(()),
             tasks: Mutex::new(vec![]),
-            task_aborts: std::sync::Mutex::new(vec![]),
         }
     }
 
@@ -418,15 +418,21 @@ impl ServeRunner {
         cfg: ServeConfig,
         cert_provider: Option<Arc<dyn CertProvider>>,
     ) -> Result<Vec<u16>, ServeError> {
+        let _lifecycle = self.lifecycle.lock().await;
         // Install the cert provider (if provided; None keeps the existing one).
         if let Some(cp) = cert_provider {
             *self.cert_provider.lock().expect("cert mutex") = Some(cp);
         }
 
-        // Cancel and join the old generation without ever taking task
-        // ownership across an await. A cancelled reconfiguration can retry.
-        self.begin_stop();
-        self.join_tasks().await;
+        // Cancel the old generation and abort its tasks.
+        {
+            let old = self.cancel.lock().expect("cancel mutex").clone();
+            old.cancel();
+        }
+        {
+            let mut tasks = self.tasks.lock().await;
+            drain_listener_tasks(&mut tasks).await;
+        }
 
         // Install a fresh cancel token for the new generation.
         let new_cancel = Arc::new(CancelToken::new());
@@ -437,7 +443,7 @@ impl ServeRunner {
 
         // Start listeners for each configured port.
         let mut started = Vec::new();
-        let mut new_tasks = Vec::new();
+        let mut active_tasks = self.tasks.lock().await;
         for port in cfg.ports() {
             let handler = cfg.tcp_handler(port).cloned();
             let Some(handler) = handler else { continue };
@@ -454,7 +460,7 @@ impl ServeRunner {
             let peers = self.peers.clone();
             let ups = self.user_profiles.clone();
             let fqdn = self.our_fqdn.clone();
-            new_tasks.push(tokio::spawn(serve_listener_loop(
+            active_tasks.push(tokio::spawn(serve_listener_loop(
                 listener,
                 port,
                 handler,
@@ -497,7 +503,7 @@ impl ServeRunner {
                                 let ups = self.user_profiles.clone();
                                 let fqdn = self.our_fqdn.clone();
                                 let handler = handler.clone();
-                                new_tasks.push(tokio::spawn(serve_listener_loop(
+                                active_tasks.push(tokio::spawn(serve_listener_loop(
                                     ln,
                                     *port,
                                     handler,
@@ -520,47 +526,41 @@ impl ServeRunner {
             }
         }
 
-        let new_aborts = new_tasks.iter().map(JoinHandle::abort_handle).collect();
-        {
-            let mut tasks = self.tasks.lock().await;
-            *tasks = new_tasks;
-        }
-        *self
-            .task_aborts
-            .lock()
-            .expect("serve task abort lock poisoned") = new_aborts;
+        drop(active_tasks);
         Ok(started)
     }
 
-    /// Signal every serve listener to stop without awaiting a task lock.
-    pub(crate) fn begin_stop(&self) {
-        self.cancel.lock().expect("cancel mutex").cancel();
-        for abort in self
-            .task_aborts
-            .lock()
-            .expect("serve task abort lock poisoned")
-            .iter()
-        {
-            abort.abort();
-        }
-    }
-
-    async fn join_tasks(&self) {
-        let mut tasks = self.tasks.lock().await;
-        while let Some(task) = tasks.first_mut() {
-            let _ = (&mut *task).await;
-            tasks.swap_remove(0);
-        }
-        self.task_aborts
-            .lock()
-            .expect("serve task abort lock poisoned")
-            .clear();
-    }
-
-    /// Stop and join all serve listeners.
+    /// Stop all serve listeners.
     pub(crate) async fn stop(&self) {
-        self.begin_stop();
-        self.join_tasks().await;
+        let _lifecycle = self.lifecycle.lock().await;
+        {
+            let cancel = self.cancel.lock().expect("cancel mutex").clone();
+            cancel.cancel();
+        }
+        let mut tasks = self.tasks.lock().await;
+        drain_listener_tasks(&mut tasks).await;
+    }
+}
+
+async fn drain_listener_tasks(tasks: &mut Vec<tokio::task::JoinHandle<()>>) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !tasks.is_empty() {
+        if tokio::time::timeout_at(deadline, &mut tasks[0])
+            .await
+            .is_err()
+        {
+            break;
+        }
+        // timeout_at already drove this JoinHandle to completion; polling it
+        // again would panic with "JoinHandle polled after completion".
+        drop(tasks.remove(0));
+    }
+    for task in tasks.iter() {
+        task.abort();
+    }
+    while !tasks.is_empty() {
+        let _ = (&mut tasks[0]).await;
+        drop(tasks.remove(0));
     }
 }
 
@@ -577,19 +577,23 @@ async fn serve_listener_loop(
     fqdn: String,
     cancel: Arc<CancelToken>,
 ) {
+    let mut children = tokio::task::JoinSet::new();
     loop {
         if cancel.is_cancelled() {
             break;
         }
         let accept =
-            tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept()).await;
+            tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept()).await;
         let stream = match accept {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => {
                 log::warn!("tsnet: serve accept on port {port} failed: {e}");
                 continue;
             }
-            Err(_) => continue, // periodic cancel check
+            Err(_) => {
+                while children.try_join_next().is_some() {}
+                continue;
+            }
         };
         let cfg = cfg.clone();
         let cert = cert.clone();
@@ -597,13 +601,21 @@ async fn serve_listener_loop(
         let ups = ups.clone();
         let fqdn = fqdn.clone();
         let handler = handler.clone();
-        tokio::spawn(async move {
+        children.spawn(async move {
             if let Err(e) =
                 dispatch_serve(stream, port, &handler, &cfg, cert, &peers, &ups, &fqdn).await
             {
                 log::warn!("tsnet: serve dispatch on port {port} failed: {e}");
             }
         });
+    }
+    let drain = async { while children.join_next().await.is_some() {} };
+    if tokio::time::timeout(std::time::Duration::from_secs(1), drain)
+        .await
+        .is_err()
+    {
+        children.abort_all();
+        while children.join_next().await.is_some() {}
     }
 }
 

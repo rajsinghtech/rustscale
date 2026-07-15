@@ -103,6 +103,7 @@ async fn exit_node_prefs_apply_routing() {
     let _ = std::fs::remove_file(&socket_path);
 
     let mut server = Server::builder()
+        .disable_portmapping(true)
         .hostname("exitnode-prefs-test")
         .auth_key("tskey-test")
         .control_url(&control_url)
@@ -173,7 +174,7 @@ async fn exit_node_prefs_apply_routing() {
         "ExitNodeIP should be cleared"
     );
 
-    server.close().await;
+    server.close().await.unwrap();
 }
 
 /// Gap 1: ExitNodeAllowLANAccess pref field roundtrips through PATCH/prefs.
@@ -189,6 +190,7 @@ async fn exit_node_allow_lan_access_pref() {
     let _ = std::fs::remove_file(&socket_path);
 
     let mut server = Server::builder()
+        .disable_portmapping(true)
         .hostname("allowlan-test")
         .auth_key("tskey-test")
         .control_url(&control_url)
@@ -223,7 +225,7 @@ async fn exit_node_allow_lan_access_pref() {
         "ExitNodeAllowLANAccess should be saved"
     );
 
-    server.close().await;
+    server.close().await.unwrap();
 }
 
 /// Gap 2: Logout clears state → NeedsLogin, control server sees logout.
@@ -241,6 +243,7 @@ async fn logout_clears_state_to_needs_login() {
     let state_dir = state_tmp.path().to_path_buf();
 
     let mut server = Server::builder()
+        .disable_portmapping(true)
         .hostname("logout-test")
         .auth_key("tskey-test")
         .control_url(&control_url)
@@ -302,7 +305,7 @@ async fn logout_clears_state_to_needs_login() {
         "netmap cache should be cleared after logout"
     );
 
-    server.close().await;
+    server.close().await.unwrap();
 }
 
 fn find_named_file(root: &std::path::Path, name: &str) -> Option<PathBuf> {
@@ -335,6 +338,7 @@ async fn localapi_post_logout_triggers_needs_login() {
     let _ = std::fs::remove_file(&socket_path);
 
     let mut server = Server::builder()
+        .disable_portmapping(true)
         .hostname("post-logout-test")
         .auth_key("tskey-test")
         .control_url(&control_url)
@@ -377,5 +381,5 @@ async fn localapi_post_logout_triggers_needs_login() {
         "WantRunning should be false after POST /logout"
     );
 
-    server.close().await;
+    server.close().await.unwrap();
 }

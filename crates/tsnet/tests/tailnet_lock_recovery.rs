@@ -19,6 +19,7 @@ async fn commit_then_drop_keeps_receipt_and_resumes_without_new_secrets() {
     let sockets = tempfile::tempdir().unwrap();
     let socket = sockets.path().join("lock-recovery.sock");
     let mut server = Server::builder()
+        .disable_portmapping(true)
         .hostname("lock-recovery")
         .auth_key("tskey-test")
         .control_url(control.base_url())
@@ -116,7 +117,7 @@ async fn commit_then_drop_keeps_receipt_and_resumes_without_new_secrets() {
         resumed["InitReceipt"]["TransactionID"], pending_transaction,
         "resume must not create a replacement transaction"
     );
-    server.close().await;
+    server.close().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -129,6 +130,7 @@ async fn cached_locked_netmap_stays_revoked_until_fresh_control_confirmation() {
     let sockets = tempfile::tempdir().unwrap();
     let socket = sockets.path().join("cached-lock.sock");
     let mut server = Server::builder()
+        .disable_portmapping(true)
         .hostname("cached-lock")
         .auth_key("tskey-test")
         .control_url(control.base_url())
@@ -180,9 +182,10 @@ async fn cached_locked_netmap_stays_revoked_until_fresh_control_confirmation() {
         },
     ));
     tokio::time::sleep(Duration::from_millis(100)).await;
-    server.close().await;
+    server.close().await.unwrap();
 
     let mut restarted = Server::builder()
+        .disable_portmapping(true)
         .hostname("cached-lock")
         .control_url(control.base_url())
         .state_dir(state.path())
@@ -215,7 +218,87 @@ async fn cached_locked_netmap_stays_revoked_until_fresh_control_confirmation() {
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    restarted.close().await;
+    restarted.close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn logout_relogin_preserves_lock_key_authority_and_receipt() {
+    let mut control = TestControlServer::new();
+    control.start().await.unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let sockets = tempfile::tempdir().unwrap();
+    let socket = sockets.path().join("lock-logout.sock");
+    let mut server = Server::builder()
+        .disable_portmapping(true)
+        .hostname("lock-logout")
+        .auth_key("tskey-test")
+        .control_url(control.base_url())
+        .state_dir(state.path())
+        .localapi_path(&socket)
+        .build()
+        .unwrap();
+    Box::pin(tokio::time::timeout(Duration::from_secs(60), server.up()))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let client = LocalClient::new(&socket);
+    let initial = client.tailnet_lock_status().await.unwrap();
+    let public: NLPublic = initial["PublicKey"].as_str().unwrap().parse().unwrap();
+    let secret = vec![0x57; 32];
+    client
+        .tailnet_lock_init(&serde_json::json!({
+            "Keys": [Key {
+                kind: KeyKind::Key25519,
+                votes: 1,
+                public: public.raw32().to_vec(),
+                meta: None,
+            }],
+            "DisablementValues": [disablement_kdf(&secret)],
+            "DisablementSecrets": [secret],
+            "SupportDisablement": [],
+            "Resume": false,
+        }))
+        .await
+        .unwrap();
+    let before = client.tailnet_lock_status().await.unwrap();
+    let state_path = walk_files(state.path())
+        .into_iter()
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|name| name == "tsnet-state.json")
+        })
+        .unwrap();
+    let identity_before = rustscale_tsnet::PersistedState::load(&state_path).unwrap();
+
+    server.logout().await.unwrap();
+    let identity_after_logout = rustscale_tsnet::PersistedState::load(&state_path).unwrap();
+    assert_ne!(identity_after_logout.node_key, identity_before.node_key);
+    assert_ne!(
+        identity_after_logout.machine_key,
+        identity_before.machine_key
+    );
+    assert_ne!(identity_after_logout.disco_key, identity_before.disco_key);
+    assert_eq!(
+        identity_after_logout.network_lock_key,
+        identity_before.network_lock_key
+    );
+
+    let _commands = server.start_localapi_only().await.unwrap();
+    server.set_auth_key("tskey-test");
+    Box::pin(tokio::time::timeout(Duration::from_secs(60), server.up()))
+        .await
+        .unwrap()
+        .unwrap();
+    let after = LocalClient::new(&socket)
+        .tailnet_lock_status()
+        .await
+        .unwrap();
+    assert_eq!(after["PublicKey"], before["PublicKey"]);
+    assert_eq!(after["Head"], before["Head"]);
+    assert_eq!(after["InitReceipt"], before["InitReceipt"]);
+    assert_ne!(after["NodeKey"], before["NodeKey"]);
+    server.close().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -229,12 +312,12 @@ async fn profile_switches_isolate_identity_cache_signing_key_and_chonk() {
 
     rustscale_ipn::LoginProfile::save_current_id(state.path(), "profile-a").unwrap();
     let mut first = Server::builder()
+        .disable_portmapping(true)
         .hostname("profile-a")
         .auth_key("tskey-test")
         .control_url(control.base_url())
         .state_dir(state.path())
         .localapi_path(&socket)
-        .disable_portmapping(true)
         .build()
         .unwrap();
     Box::pin(tokio::time::timeout(Duration::from_secs(60), first.up()))
@@ -255,16 +338,16 @@ async fn profile_switches_isolate_identity_cache_signing_key_and_chonk() {
         }))
         .await
         .unwrap();
-    first.close().await.into_result().expect("close profile-a");
+    first.close().await.unwrap();
 
     rustscale_ipn::LoginProfile::save_current_id(state.path(), "profile-b").unwrap();
     let mut second = Server::builder()
+        .disable_portmapping(true)
         .hostname("profile-b")
         .auth_key("tskey-test")
         .control_url(control.base_url())
         .state_dir(state.path())
         .localapi_path(&socket)
-        .disable_portmapping(true)
         .build()
         .unwrap();
     Box::pin(tokio::time::timeout(Duration::from_secs(60), second.up()))
@@ -280,15 +363,15 @@ async fn profile_switches_isolate_identity_cache_signing_key_and_chonk() {
         "profiles reused a signing key"
     );
     assert!(b["Enabled"].as_bool().unwrap());
-    second.close().await.into_result().expect("close profile-b");
+    second.close().await.unwrap();
 
     rustscale_ipn::LoginProfile::save_current_id(state.path(), "profile-a").unwrap();
     let mut restored = Server::builder()
+        .disable_portmapping(true)
         .hostname("profile-a")
         .control_url(control.base_url())
         .state_dir(state.path())
         .localapi_path(&socket)
-        .disable_portmapping(true)
         .build()
         .unwrap();
     Box::pin(tokio::time::timeout(Duration::from_secs(60), restored.up()))
@@ -322,11 +405,7 @@ async fn profile_switches_isolate_identity_cache_signing_key_and_chonk() {
             >= 2,
         "each profile must own a distinct authority store"
     );
-    restored
-        .close()
-        .await
-        .into_result()
-        .expect("close restored profile-a");
+    restored.close().await.unwrap();
 }
 
 fn walk_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {

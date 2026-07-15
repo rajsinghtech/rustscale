@@ -103,6 +103,7 @@ async fn serve_config_persists_across_restart() {
 
     // Start server.
     let mut server = Server::builder()
+        .disable_portmapping(true)
         .hostname("serve-persist-test")
         .auth_key("tskey-test")
         .control_url(&control_url)
@@ -137,7 +138,7 @@ async fn serve_config_persists_across_restart() {
     );
 
     // Close the server.
-    server.close().await;
+    server.close().await.unwrap();
     eprintln!("server closed");
 
     // Restart with the same state dir.
@@ -145,6 +146,7 @@ async fn serve_config_persists_across_restart() {
     let _ = std::fs::remove_file(&socket_path2);
 
     let mut server2 = Server::builder()
+        .disable_portmapping(true)
         .hostname("serve-persist-test")
         .auth_key("tskey-test")
         .control_url(&control_url)
@@ -176,7 +178,7 @@ async fn serve_config_persists_across_restart() {
         "config should still have port 8080 after restart"
     );
 
-    server2.close().await;
+    server2.close().await.unwrap();
     eprintln!("serve config persistence test passed");
 }
 
@@ -194,6 +196,7 @@ async fn profile_switch_integration() {
     let _ = std::fs::remove_file(&socket_path);
 
     let mut server = Server::builder()
+        .disable_portmapping(true)
         .hostname("profile-test")
         .auth_key("tskey-test")
         .control_url(&control_url)
@@ -279,6 +282,6 @@ async fn profile_switch_integration() {
         "should have 1 profile after delete"
     );
 
-    server.close().await;
+    server.close().await.unwrap();
     eprintln!("profile switch integration test passed");
 }

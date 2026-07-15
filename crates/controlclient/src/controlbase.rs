@@ -751,13 +751,70 @@ impl NoiseConn {
 /// transparently encrypting/decrypting records.
 pub struct NoiseIo {
     inner: tokio::io::DuplexStream,
-    _pump: tokio::task::JoinHandle<()>,
+    pumps: Option<Vec<tokio::task::JoinHandle<()>>>,
+}
+
+/// Owned supervision for the read/write Noise pumps.
+pub struct NoiseIoHandle {
+    pumps: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl NoiseIoHandle {
+    /// Cancel and join both pump tasks.
+    pub async fn close(mut self) {
+        for task in &self.pumps {
+            task.abort();
+        }
+        for task in self.pumps.drain(..) {
+            let _ = task.await;
+        }
+    }
+}
+
+impl Drop for NoiseIoHandle {
+    fn drop(&mut self) {
+        let mut pumps = std::mem::take(&mut self.pumps);
+        for task in &pumps {
+            task.abort();
+        }
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                for task in pumps.drain(..) {
+                    let _ = task.await;
+                }
+            });
+        }
+    }
 }
 
 impl NoiseIo {
     /// Create a NoiseIo from a completed NoiseConn and the underlying async
     /// stream. Spawns background pump tasks.
     pub fn new<S>(conn: NoiseConn, stream: S) -> Self
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let (mut io, mut handle) = Self::new_owned(conn, stream);
+        io.pumps = Some(std::mem::take(&mut handle.pumps));
+        io
+    }
+
+    /// Close the adapter and join pumps owned by [`NoiseIo::new`].
+    pub async fn close(mut self) {
+        use tokio::io::AsyncWriteExt;
+        let _ = self.inner.shutdown().await;
+        if let Some(mut pumps) = self.pumps.take() {
+            for task in &pumps {
+                task.abort();
+            }
+            for task in pumps.drain(..) {
+                let _ = task.await;
+            }
+        }
+    }
+
+    /// Create a Noise adapter plus an external owner for both pump tasks.
+    pub fn new_owned<S>(conn: NoiseConn, stream: S) -> (Self, NoiseIoHandle)
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
@@ -826,13 +883,24 @@ impl NoiseIo {
             let _ = stream_tx.shutdown().await;
         });
 
-        // Keep both pumps alive. We store one handle; the other is leaked
-        // (it will be cleaned up when the streams close).
-        drop(pump2);
+        (
+            Self {
+                inner: plain_side,
+                pumps: None,
+            },
+            NoiseIoHandle {
+                pumps: vec![pump, pump2],
+            },
+        )
+    }
+}
 
-        Self {
-            inner: plain_side,
-            _pump: pump,
+impl Drop for NoiseIo {
+    fn drop(&mut self) {
+        if let Some(pumps) = self.pumps.as_ref() {
+            for task in pumps {
+                task.abort();
+            }
         }
     }
 }

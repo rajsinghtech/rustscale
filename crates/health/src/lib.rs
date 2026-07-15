@@ -682,6 +682,9 @@ pub struct Watchdog {
     id: String,
     last_fed: Arc<Mutex<DateTime<Utc>>>,
     shutdown: Arc<AtomicBool>,
+    owners: Arc<()>,
+    task: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    abort: tokio::task::AbortHandle,
 }
 
 impl Clone for Watchdog {
@@ -691,6 +694,9 @@ impl Clone for Watchdog {
             id: self.id.clone(),
             last_fed: self.last_fed.clone(),
             shutdown: self.shutdown.clone(),
+            owners: Arc::clone(&self.owners),
+            task: Arc::clone(&self.task),
+            abort: self.abort.clone(),
         }
     }
 }
@@ -728,7 +734,7 @@ impl Watchdog {
         let chrono_interval =
             chrono::Duration::from_std(interval).unwrap_or(chrono::Duration::seconds(180));
 
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_millis(250));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
@@ -743,11 +749,15 @@ impl Watchdog {
             }
         });
 
+        let abort = task.abort_handle();
         Self {
             tracker,
             id: id.to_string(),
             last_fed,
             shutdown,
+            owners: Arc::new(()),
+            task: Arc::new(tokio::sync::Mutex::new(Some(task))),
+            abort,
         }
     }
 
@@ -760,12 +770,23 @@ impl Watchdog {
     /// Stop the background polling task.
     pub fn stop(&self) {
         self.shutdown.store(true, Ordering::Relaxed);
+        self.abort.abort();
+    }
+
+    /// Stop and join the background polling task.
+    pub async fn stop_and_wait(&self) {
+        self.stop();
+        if let Some(task) = self.task.lock().await.take() {
+            let _ = task.await;
+        }
     }
 }
 
 impl Drop for Watchdog {
     fn drop(&mut self) {
-        self.stop();
+        if Arc::strong_count(&self.owners) == 1 {
+            self.stop();
+        }
     }
 }
 

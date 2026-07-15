@@ -445,7 +445,7 @@ async fn testcontrol_register_and_node_count() {
         nodes.count
     );
 
-    server.close().await;
+    server.close().await.unwrap();
 }
 
 /// Scenario B: two tsnet nodes see each other as peers, ping over local DERP.
@@ -481,8 +481,8 @@ async fn testcontrol_two_nodes_peer_visibility() {
     assert!(!s1_peers.is_empty(), "server1 should have peers");
     assert!(!s2_peers.is_empty(), "server2 should have peers");
 
-    server1.close().await;
-    server2.close().await;
+    server1.close().await.unwrap();
+    server2.close().await.unwrap();
 }
 
 /// Scenario C: add_fake_node -> peer appears in netmap.
@@ -512,7 +512,7 @@ async fn testcontrol_add_fake_node_appears_as_peer() {
         server.status().peer_count
     );
 
-    server.close().await;
+    server.close().await.unwrap();
 }
 
 /// Scenario D: expire-all -> client observes key expiry, un-expire -> recovers.
@@ -552,7 +552,7 @@ async fn testcontrol_key_expiry_and_recovery() {
     .await;
 
     eprintln!("interop-testcontrol: PASS — key expiry + recovery cycle complete");
-    server.close().await;
+    server.close().await.unwrap();
 }
 
 /// Scenario E: raw MapResponse with PeersRemoved -> peer disappears.
@@ -624,6 +624,6 @@ async fn testcontrol_raw_map_response_peers_removed() {
         server1.status().peer_count
     );
 
-    server1.close().await;
-    server2.close().await;
+    server1.close().await.unwrap();
+    server2.close().await.unwrap();
 }

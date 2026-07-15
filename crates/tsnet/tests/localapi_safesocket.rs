@@ -74,6 +74,7 @@ async fn close_prestarted_localapi_allows_immediate_rebind() {
     let sock_tmp = tempfile::tempdir().expect("socket tempdir");
     let socket_path = sock_tmp.path().join("prestarted.sock");
     let mut server = Server::builder()
+        .disable_portmapping(true)
         .hostname("prestarted-close-test")
         .state_dir(state_tmp.path().to_path_buf())
         .localapi_path(&socket_path)
@@ -86,11 +87,7 @@ async fn close_prestarted_localapi_allows_immediate_rebind() {
         .expect("start pre-login LocalAPI");
     let live_connection = connect(&socket_path).expect("connect pre-login LocalAPI");
     drop(first_commands);
-    server
-        .close()
-        .await
-        .into_result()
-        .expect("close pre-login state");
+    server.close().await.expect("close pre-login state");
     drop(live_connection);
     assert!(connect(&socket_path).is_err());
 
@@ -104,7 +101,6 @@ async fn close_prestarted_localapi_allows_immediate_rebind() {
         server
             .close()
             .await
-            .into_result()
             .unwrap_or_else(|error| panic!("NeedsLogin close {attempt}: {error}"));
         assert!(connect(&socket_path).is_err());
     }
@@ -126,6 +122,7 @@ async fn localapi_status_and_health_over_safesocket() {
 
     // 3. Build a tsnet Server with LocalAPI enabled on the safesocket path.
     let mut server = Server::builder()
+        .disable_portmapping(true)
         .hostname("localapi-test")
         .auth_key("tskey-test")
         .control_url(&control_url)
@@ -198,6 +195,6 @@ async fn localapi_status_and_health_over_safesocket() {
     );
 
     // 8. Clean up.
-    server.close().await;
+    server.close().await.unwrap();
     eprintln!("test passed: LocalAPI status + health over safesocket");
 }

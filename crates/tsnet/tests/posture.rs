@@ -47,6 +47,7 @@ async fn posture_response(control: &TestControlServer, server: &Server) -> serde
 
 fn server(control_url: &str, state_dir: &std::path::Path, hostname: &str) -> Server {
     Server::builder()
+        .disable_portmapping(true)
         .hostname(hostname)
         .auth_key("tskey-test")
         .control_url(control_url)
@@ -81,7 +82,7 @@ async fn sensitive_c2n_has_no_loopback_listener_and_noise_session_works() {
         serde_json::json!({"PostureDisabled": true})
     );
 
-    server.close().await;
+    server.close().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -151,5 +152,5 @@ async fn in_memory_clients_share_one_transactional_prefs_state() {
     );
 
     drop((client_a, client_b));
-    running.close().await;
+    running.close().await.unwrap();
 }

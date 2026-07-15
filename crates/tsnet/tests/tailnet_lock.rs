@@ -28,6 +28,7 @@ async fn lock_init_filters_unsigned_recovers_and_disables() {
     let sockets = tempfile::tempdir().unwrap();
     let socket = sockets.path().join("lock.sock");
     let mut server = Server::builder()
+        .disable_portmapping(true)
         .hostname("lock-e2e")
         .auth_key("tskey-test")
         .control_url(control.base_url())
@@ -153,13 +154,14 @@ async fn lock_init_filters_unsigned_recovers_and_disables() {
     // locked netmap must trigger authenticated bootstrap+sync before peers are
     // accepted, rebuilding durable state from canonical CBOR.
     control.resume_auto_map(&self_node);
-    server.close().await;
+    server.close().await.unwrap();
     if let Some(cache) = find_file(state.path(), "netmap-cache.json") {
         std::fs::remove_file(cache).unwrap();
     }
     std::fs::remove_dir_all(&authority_root).unwrap();
     let tka_requests_before_recovery = control.tka_request_connections().len();
     let mut recovered = Server::builder()
+        .disable_portmapping(true)
         .hostname("lock-e2e")
         .control_url(control.base_url())
         .state_dir(state.path())
@@ -224,7 +226,7 @@ async fn lock_init_filters_unsigned_recovers_and_disables() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(!recovered_authority_root.exists());
-    recovered.close().await;
+    recovered.close().await.unwrap();
 }
 
 fn find_dir(root: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {

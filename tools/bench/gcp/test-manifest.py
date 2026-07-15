@@ -27,7 +27,7 @@ def run_identity():
                       "requested_image_family": "ubuntu-2204-lts", "requested_machine_type": "n1-standard-4",
                       "network": "default", "disk_type": "pd-standard", "disk_gb": 200},
             "build": {"command": "cargo build --release", "rustflags": "", "cargo_profile_release_lto": "", "cargo_profile_release_codegen_units": ""},
-            "runtime": {"rs_tun_inbound_pipeline": False, "linux_udp_batch": True, "linux_udp_gro": True}}
+            "runtime": {"rs_tun_inbound_pipeline": False, "rs_tun_outbound_send_pipeline": False, "linux_udp_batch": True, "linux_udp_gro": True}}
 
 
 def observed():
@@ -145,6 +145,16 @@ with tempfile.TemporaryDirectory() as tmp:
     legacy_runtime_summary = run("python3", GCP / "aggregate.py", legacy_runtime)
     assert len(json.loads(legacy_runtime_summary.stdout)) == 1
 
+    # The prior complete receive-mode shape also remains readable after the
+    # outbound sender mode was added, but cannot launch a paid cell.
+    pre_outbound = Path(tmp) / "pre-outbound" / run_identity()["id"]; pre_outbound.mkdir(parents=True)
+    pre_outbound_identity = run_identity()
+    pre_outbound_identity["runtime"].pop("rs_tun_outbound_send_pipeline")
+    matrix(pre_outbound, identity=pre_outbound_identity)
+    pre_outbound_cell = write_cell(pre_outbound, valid(identity=pre_outbound_identity))
+    run("python3", GCP / "provenance.py", "validate", "--manifest", pre_outbound / "matrix.json", "--result", pre_outbound_cell)
+    assert len(json.loads(run("python3", GCP / "aggregate.py", pre_outbound).stdout)) == 1
+
     # Semantic current-manifest validation rejects impossible timestamps,
     # duplicate sweeps, and any warmup contract drift.
     for mutate in (
@@ -204,24 +214,27 @@ with tempfile.TemporaryDirectory() as tmp:
     # Preflight is a paid-work gate, so all three selected-cell dimensions are
     # checked before run-config can start a daemon or profile a VM.
     run("python3", GCP / "provenance.py", "preflight", "--manifest", root / "matrix.json", "--observed", selected,
-        "--config", "rs-tun", "--topology", "same-zone", "--path", "direct", "--server-zone", "us-central1-a", "--client-zone", "us-central1-b", "--rs-tun-inbound-pipeline", "0", "--linux-udp-batch", "1", "--linux-udp-gro", "1")
+        "--config", "rs-tun", "--topology", "same-zone", "--path", "direct", "--server-zone", "us-central1-a", "--client-zone", "us-central1-b", "--rs-tun-inbound-pipeline", "0", "--rs-tun-outbound-send-pipeline", "0", "--linux-udp-batch", "1", "--linux-udp-gro", "1")
     unbound = run("python3", GCP / "provenance.py", "preflight", "--manifest", root / "matrix.json", "--observed", selected,
                   "--config", "rs-tun", "--topology", "same-zone", "--path", "direct", "--server-zone", "us-central1-a", "--client-zone", "us-central1-b", ok=False)
     assert unbound.returncode == 2 and "--rs-tun-inbound-pipeline" in unbound.stderr
     missing_runtime = run("python3", GCP / "provenance.py", "preflight", "--manifest", historical / "matrix.json", "--observed", selected,
-                  "--config", "rs-tun", "--topology", "same-zone", "--path", "direct", "--server-zone", "us-central1-a", "--client-zone", "us-central1-b", "--rs-tun-inbound-pipeline", "0", "--linux-udp-batch", "1", "--linux-udp-gro", "1", ok=False)
+                  "--config", "rs-tun", "--topology", "same-zone", "--path", "direct", "--server-zone", "us-central1-a", "--client-zone", "us-central1-b", "--rs-tun-inbound-pipeline", "0", "--rs-tun-outbound-send-pipeline", "0", "--linux-udp-batch", "1", "--linux-udp-gro", "1", ok=False)
     assert "complete runtime modes are required" in missing_runtime.stderr
     legacy_runtime_preflight = run("python3", GCP / "provenance.py", "preflight", "--manifest", legacy_runtime / "matrix.json", "--observed", selected,
-                  "--config", "rs-tun", "--topology", "same-zone", "--path", "direct", "--server-zone", "us-central1-a", "--client-zone", "us-central1-b", "--rs-tun-inbound-pipeline", "1", "--linux-udp-batch", "1", "--linux-udp-gro", "1", ok=False)
+                  "--config", "rs-tun", "--topology", "same-zone", "--path", "direct", "--server-zone", "us-central1-a", "--client-zone", "us-central1-b", "--rs-tun-inbound-pipeline", "1", "--rs-tun-outbound-send-pipeline", "0", "--linux-udp-batch", "1", "--linux-udp-gro", "1", ok=False)
     assert "complete runtime modes are required" in legacy_runtime_preflight.stderr
     excluded = run("python3", GCP / "provenance.py", "preflight", "--manifest", root / "matrix.json", "--observed", selected,
-                   "--config", "rs-tun", "--topology", "same-zone", "--path", "derp", "--server-zone", "us-central1-a", "--client-zone", "us-central1-b", "--rs-tun-inbound-pipeline", "0", "--linux-udp-batch", "1", "--linux-udp-gro", "1", ok=False)
+                   "--config", "rs-tun", "--topology", "same-zone", "--path", "derp", "--server-zone", "us-central1-a", "--client-zone", "us-central1-b", "--rs-tun-inbound-pipeline", "0", "--rs-tun-outbound-send-pipeline", "0", "--linux-udp-batch", "1", "--linux-udp-gro", "1", ok=False)
     assert "not selected" in excluded.stderr
     mismatch = run("python3", GCP / "provenance.py", "preflight", "--manifest", root / "matrix.json", "--observed", selected,
-                   "--config", "rs-tun", "--topology", "same-zone", "--path", "direct", "--server-zone", "us-central1-a", "--client-zone", "us-central1-b", "--rs-tun-inbound-pipeline", "1", "--linux-udp-batch", "1", "--linux-udp-gro", "1", ok=False)
+                   "--config", "rs-tun", "--topology", "same-zone", "--path", "direct", "--server-zone", "us-central1-a", "--client-zone", "us-central1-b", "--rs-tun-inbound-pipeline", "1", "--rs-tun-outbound-send-pipeline", "0", "--linux-udp-batch", "1", "--linux-udp-gro", "1", ok=False)
     assert "runtime modes" in mismatch.stderr
     mismatch = run("python3", GCP / "provenance.py", "preflight", "--manifest", root / "matrix.json", "--observed", selected,
-                   "--config", "rs-tun", "--topology", "same-zone", "--path", "direct", "--server-zone", "us-central1-a", "--client-zone", "us-central1-b", "--rs-tun-inbound-pipeline", "0", "--linux-udp-batch", "0", "--linux-udp-gro", "1", ok=False)
+                   "--config", "rs-tun", "--topology", "same-zone", "--path", "direct", "--server-zone", "us-central1-a", "--client-zone", "us-central1-b", "--rs-tun-inbound-pipeline", "0", "--rs-tun-outbound-send-pipeline", "1", "--linux-udp-batch", "1", "--linux-udp-gro", "1", ok=False)
+    assert "runtime modes" in mismatch.stderr
+    mismatch = run("python3", GCP / "provenance.py", "preflight", "--manifest", root / "matrix.json", "--observed", selected,
+                   "--config", "rs-tun", "--topology", "same-zone", "--path", "direct", "--server-zone", "us-central1-a", "--client-zone", "us-central1-b", "--rs-tun-inbound-pipeline", "0", "--rs-tun-outbound-send-pipeline", "0", "--linux-udp-batch", "0", "--linux-udp-gro", "1", ok=False)
     assert "runtime modes" in mismatch.stderr
 
     # Two current cells share endpoint environment/toolchain identity but have
@@ -261,6 +274,7 @@ with tempfile.TemporaryDirectory() as tmp:
         ("run.started_at_utc", lambda o: o["run"].__setitem__("started_at_utc", "2026-07-14T01:02:04Z")),
         ("cloud.machine", lambda o: o["run"]["cloud"].__setitem__("requested_machine_type", "n2-standard-4")),
         ("runtime.pipeline", lambda o: o["run"]["runtime"].__setitem__("rs_tun_inbound_pipeline", True)),
+        ("runtime.outbound_pipeline", lambda o: o["run"]["runtime"].__setitem__("rs_tun_outbound_send_pipeline", True)),
         ("endpoint zone", lambda o: o["observed"]["client"].__setitem__("zone", "us-central1-a")),
         ("endpoint machine", lambda o: o["observed"]["server"].__setitem__("machine_type", "n2-standard-4")),
         ("environment", lambda o: o["observed"]["server"].__setitem__("kernel_release", "")),

@@ -32,6 +32,14 @@ configure_rs_tun_inbound_pipeline() {
   esac
 }
 
+configure_rs_tun_outbound_send_pipeline() {
+  [[ -n "${RS_TUN_OUTBOUND_SEND_PIPELINE+x}" ]] || RS_TUN_OUTBOUND_SEND_PIPELINE=0
+  case "$RS_TUN_OUTBOUND_SEND_PIPELINE" in
+    0|1) export RS_TUN_OUTBOUND_SEND_PIPELINE ;;
+    *) echo "RS_TUN_OUTBOUND_SEND_PIPELINE must be 0 or 1" >&2; return 2 ;;
+  esac
+}
+
 # Benchmark runtime modes are explicit 0/1 values so one delivered binary can
 # measure the scalar baseline, plain batch, or guarded-GRO candidate. The
 # daemon's production controls are presence-based disable switches, so `0`

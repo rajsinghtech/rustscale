@@ -2,6 +2,16 @@
 use super::*;
 use crate::routing::resolve_control_server_ips;
 
+fn tun_outbound_send_pipeline_enabled() -> bool {
+    tun_outbound_send_pipeline_enabled_for(
+        std::env::var_os("RUSTSCALE_TUN_OUTBOUND_SEND_PIPELINE").is_some(),
+    )
+}
+
+fn tun_outbound_send_pipeline_enabled_for(env_present: bool) -> bool {
+    cfg!(target_os = "linux") && env_present
+}
+
 /// TUN data-plane pump: TUN device <-> WG <-> magicsock.
 ///
 /// Inbound (from network): magicsock recv -> WG decapsulate -> TUN write.
@@ -18,6 +28,9 @@ pub(crate) async fn run_tun_pump(
     cancel: Arc<CancelToken>,
     capture: crate::capture::CaptureSlot,
 ) {
+    // Read once so a running pump cannot change scheduling or buffer
+    // ownership mid-flight.  Presence is deliberately the opt-in contract.
+    let outbound_send_pipeline = tun_outbound_send_pipeline_enabled();
     // This is deliberately read once.  The scalar scheduler below is kept
     // byte-for-byte independent while the spike is opt-in.
     if std::env::var_os("RUSTSCALE_TUN_INBOUND_PIPELINE").is_some() {
@@ -31,6 +44,7 @@ pub(crate) async fn run_tun_pump(
             packet_drops,
             cancel,
             capture,
+            outbound_send_pipeline,
         )
         .await;
         return;
@@ -39,6 +53,8 @@ pub(crate) async fn run_tun_pump(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut batch = rustscale_tun::TunPacketBatch::new();
     let mut outbound = OutboundBatchScratch::default();
+    let mut outbound_sender = outbound_send_pipeline
+        .then(|| OutboundSendPipeline::start(magicsock.clone(), cancel.clone()));
     let mut inbound = InboundBatchScratch::default();
     // A whole receive item that did not fit after a smaller item. Keeping it
     // here instead of splitting it preserves both batch ordering and the
@@ -66,6 +82,7 @@ pub(crate) async fn run_tun_pump(
                 &capture,
                 &cancel,
                 &mut inbound,
+                outbound_sender.as_mut(),
             )
             .await
             {
@@ -79,9 +96,9 @@ pub(crate) async fn run_tun_pump(
             result = tun.read_batch(&mut batch) => {
                 match result {
                     Ok(()) => {
-                        send_tun_batch(
+                        send_tun_batch_maybe_pipelined(
                             &magicsock, &wg_tunnels, &route_table, &filter,
-                            batch.packets(), &mut outbound, &capture,
+                            batch.packets(), &mut outbound, &capture, outbound_sender.as_mut(),
                         ).await;
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -109,6 +126,7 @@ pub(crate) async fn run_tun_pump(
                         &capture,
                         &cancel,
                         &mut inbound,
+                        outbound_sender.as_mut(),
                     )
                     .await {
                         break;
@@ -119,9 +137,15 @@ pub(crate) async fn run_tun_pump(
                 }
             }
             _ = ticker.tick() => {
+                if !flush_outbound_before_competing_send(outbound_sender.as_mut()).await {
+                    break;
+                }
                 tick_wg_timers(&magicsock, &wg_tunnels).await;
             }
         }
+    }
+    if let Some(sender) = outbound_sender {
+        sender.shutdown().await;
     }
 }
 
@@ -154,11 +178,18 @@ async fn process_tun_inbound_batch(
     capture: &crate::capture::CaptureSlot,
     cancel: &CancelToken,
     inbound: &mut InboundBatchScratch,
+    outbound_sender: Option<&mut OutboundSendPipeline>,
 ) -> bool {
     if !collect_tun_inbound_batch(wg_tunnels, inbound, cancel).await {
         return false;
     }
     filter_tun_inbound_batch(filter, packet_drops, capture, inbound);
+    // Normal transport data only writes the TUN and must not serialize the
+    // outbound pipeline. Fence precisely before a generated reply could
+    // bypass the sender task.
+    if !flush_outbound_before_replies(outbound_sender, inbound).await {
+        return false;
+    }
     // Datagrams are ciphertext ownership; release their nested buffers before
     // reply I/O or a blocked TUN write.
     inbound.datagrams.clear();
@@ -186,6 +217,7 @@ async fn run_tun_pump_pipeline(
     packet_drops: Arc<AtomicU64>,
     cancel: Arc<CancelToken>,
     capture: crate::capture::CaptureSlot,
+    outbound_send_pipeline: bool,
 ) {
     run_tun_pump_pipeline_inner(
         magicsock,
@@ -197,6 +229,7 @@ async fn run_tun_pump_pipeline(
         packet_drops,
         cancel,
         capture,
+        outbound_send_pipeline,
         #[cfg(test)]
         None,
         #[cfg(test)]
@@ -216,6 +249,7 @@ async fn run_tun_pump_pipeline_inner(
     packet_drops: Arc<AtomicU64>,
     cancel: Arc<CancelToken>,
     capture: crate::capture::CaptureSlot,
+    outbound_send_pipeline: bool,
     #[cfg(test)] opened_observer: Option<mpsc::UnboundedSender<()>>,
     #[cfg(test)] timer_entered_observer: Option<mpsc::UnboundedSender<()>>,
 ) {
@@ -246,6 +280,8 @@ async fn run_tun_pump_pipeline_inner(
     let _ = ticker.tick().await;
     let mut batch = rustscale_tun::TunPacketBatch::new();
     let mut outbound = OutboundBatchScratch::default();
+    let mut outbound_sender = outbound_send_pipeline
+        .then(|| OutboundSendPipeline::start(magicsock.clone(), cancel.clone()));
     // These are the only inbound scratch objects.  They circulate as whole
     // values through job/opened/recycle/available capacity-one channels.
     let mut free = Some(InboundBatchScratch::default());
@@ -262,8 +298,8 @@ async fn run_tun_pump_pipeline_inner(
             tokio::select! {
                 result = tun.read_batch(&mut batch) => match result {
                     Ok(()) => {
-                        send_tun_batch(&magicsock, &wg_tunnels, &route_table, &filter,
-                            batch.packets(), &mut outbound, &capture).await;
+                        send_tun_batch_maybe_pipelined(&magicsock, &wg_tunnels, &route_table, &filter,
+                            batch.packets(), &mut outbound, &capture, outbound_sender.as_mut()).await;
                         continue;
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
@@ -276,6 +312,9 @@ async fn run_tun_pump_pipeline_inner(
                     break 'pump;
                 },
                 _ = ticker.tick() => {
+                    if !flush_outbound_before_competing_send(outbound_sender.as_mut()).await {
+                        break 'pump;
+                    }
                     if !tick_wg_timers_pipeline_inner(&magicsock, &wg_tunnels, &cancel,
                         #[cfg(test)] timer_entered_observer.as_ref()).await {
                         break 'pump;
@@ -334,6 +373,9 @@ async fn run_tun_pump_pipeline_inner(
             }
             filter_tun_inbound_batch(&filter, &packet_drops, &capture, &mut current);
             current.datagrams.clear();
+            if !flush_outbound_before_replies(outbound_sender.as_mut(), &current).await {
+                break 'pump;
+            }
             let flushed = {
                 let flush = flush_inbound_burst_pipeline(
                     tun.as_ref(),
@@ -421,8 +463,8 @@ async fn run_tun_pump_pipeline_inner(
             {
                 PostEmptyReady::Read(Ok(())) => {
                     tokio::select! {
-                        () = send_tun_batch(&magicsock, &wg_tunnels, &route_table, &filter,
-                            batch.packets(), &mut outbound, &capture) => {}
+                        () = send_tun_batch_maybe_pipelined(&magicsock, &wg_tunnels, &route_table, &filter,
+                            batch.packets(), &mut outbound, &capture, outbound_sender.as_mut()) => {}
                         () = cancel.cancelled() => break 'pump,
                     }
                 }
@@ -433,6 +475,9 @@ async fn run_tun_pump_pipeline_inner(
                     break 'pump;
                 }
                 PostEmptyReady::Timer => {
+                    if !flush_outbound_before_competing_send(outbound_sender.as_mut()).await {
+                        break 'pump;
+                    }
                     if !tick_wg_timers_pipeline_inner(
                         &magicsock,
                         &wg_tunnels,
@@ -464,6 +509,9 @@ async fn run_tun_pump_pipeline_inner(
     drop(recycle_tx);
     worker.abort();
     let _ = worker.await;
+    if let Some(sender) = outbound_sender {
+        sender.shutdown().await;
+    }
 }
 
 /// Persistent worker: exactly one whole burst is opened at a time.  The
@@ -1005,7 +1053,233 @@ fn filter_tun_inbound_batch(
 struct OutboundBatchScratch {
     routes: Vec<Option<NodePublic>>,
     runs: Vec<BatchRun>,
+    // Created only by the scalar path. The opt-in sender owns exactly its two
+    // ciphertext batches and never retains a hidden third batch in the pump.
+    scalar_datagrams: Option<rustscale_wg::WgDatagramBatch>,
+}
+
+/// One owned, completely encrypted peer run. These are the only objects that
+/// may cross from the ordered pump into the transport task.
+struct OutboundDatagramRun {
+    peer: Option<NodePublic>,
     datagrams: rustscale_wg::WgDatagramBatch,
+}
+
+enum OutboundSendJob {
+    Run(OutboundDatagramRun),
+    /// A FIFO fence for a pump-originated send that would otherwise bypass
+    /// this task (inbound WG replies and timer packets).
+    Barrier(tokio::sync::oneshot::Sender<()>),
+}
+
+/// Default-off, depth-one queued outbound sender. The pump begins with two
+/// reusable ciphertext batches: one can be in `send_batch` while it encrypts
+/// the next run into the other. No packet task or per-packet channel exists.
+struct OutboundSendPipeline {
+    jobs: Option<mpsc::Sender<OutboundSendJob>>,
+    available: mpsc::Receiver<OutboundDatagramRun>,
+    local: Vec<OutboundDatagramRun>,
+    cancel: Arc<CancelToken>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl OutboundSendPipeline {
+    fn start(magicsock: Arc<Magicsock>, cancel: Arc<CancelToken>) -> Self {
+        Self::start_with(cancel, move |run| {
+            let magicsock = magicsock.clone();
+            Box::pin(async move {
+                let _ = magicsock
+                    .send_batch(
+                        run.peer.clone().expect("queued outbound run has a peer"),
+                        run.datagrams.packets(),
+                    )
+                    .await;
+            })
+        })
+    }
+
+    fn start_with<F>(cancel: Arc<CancelToken>, send: F) -> Self
+    where
+        F: for<'a> FnMut(&'a OutboundDatagramRun) -> OutboundSendFuture<'a> + Send + 'static,
+    {
+        let (jobs, job_rx) = mpsc::channel(1);
+        let (available_tx, available) = mpsc::channel(2);
+        let worker_cancel = cancel.clone();
+        let task = tokio::spawn(outbound_send_worker(
+            job_rx,
+            available_tx,
+            worker_cancel,
+            send,
+        ));
+        Self {
+            jobs: Some(jobs),
+            available,
+            local: vec![
+                OutboundDatagramRun {
+                    peer: None,
+                    datagrams: rustscale_wg::WgDatagramBatch::new(),
+                },
+                OutboundDatagramRun {
+                    peer: None,
+                    datagrams: rustscale_wg::WgDatagramBatch::new(),
+                },
+            ],
+            cancel,
+            task: Some(task),
+        }
+    }
+
+    async fn acquire(&mut self) -> Option<OutboundDatagramRun> {
+        if let Some(run) = self.local.pop() {
+            return Some(run);
+        }
+        tokio::select! {
+            run = self.available.recv() => run,
+            () = self.cancel.cancelled() => None,
+        }
+    }
+
+    async fn queue(&mut self, run: OutboundDatagramRun) -> bool {
+        let Some(jobs) = self.jobs.as_ref() else {
+            return false;
+        };
+        tokio::select! {
+            result = jobs.send(OutboundSendJob::Run(run)) => result.is_ok(),
+            () = self.cancel.cancelled() => false,
+        }
+    }
+
+    /// Wait for all previously queued outbound TUN ciphertext to reach
+    /// Magicsock before a reply/timer send bypasses this sender. This is not
+    /// used between ordinary TUN batches, which retain the intended overlap.
+    async fn flush(&mut self) -> bool {
+        let Some(jobs) = self.jobs.as_ref() else {
+            return false;
+        };
+        let (complete_tx, complete_rx) = tokio::sync::oneshot::channel();
+        tokio::select! {
+            result = jobs.send(OutboundSendJob::Barrier(complete_tx)) => {
+                if result.is_err() { return false; }
+            }
+            () = self.cancel.cancelled() => return false,
+        }
+        tokio::select! {
+            result = complete_rx => result.is_ok(),
+            () = self.cancel.cancelled() => false,
+        }
+    }
+
+    async fn shutdown(mut self) {
+        drop(self.jobs.take());
+        // Do not cancel the shared lifecycle token here: a fatal TUN error is
+        // local to this pump. Give queued sends a small orderly-drain window,
+        // then deterministically abort a transport operation that cannot be
+        // cancelled by dropping its future.
+        const OUTBOUND_SENDER_SHUTDOWN_DRAIN: std::time::Duration =
+            std::time::Duration::from_secs(1);
+        let Some(task) = self.task.as_mut() else {
+            return;
+        };
+        if tokio::time::timeout(OUTBOUND_SENDER_SHUTDOWN_DRAIN, task)
+            .await
+            .is_err()
+        {
+            // Keep the handle in `self` until this join completes. If this
+            // shutdown future itself is aborted at either await point, Drop
+            // still sees the handle and aborts the blocked sender.
+            if let Some(task) = self.task.as_ref() {
+                task.abort();
+            }
+            if let Some(task) = self.task.as_mut() {
+                let _ = task.await;
+            }
+        }
+        self.task.take();
+        // Keep the recycle receiver alive during the bounded drain. Once the
+        // sender is joined (or aborted), this value drops its remaining
+        // channel and local batch owners immediately on return.
+    }
+}
+
+impl Drop for OutboundSendPipeline {
+    fn drop(&mut self) {
+        // An aborted pump cannot await orderly shutdown. Aborting the one
+        // sender releases a blocked Magicsock future and its owned batches;
+        // this deliberately does not touch the shared lifecycle token.
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
+type OutboundSendFuture<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>;
+
+/// The sole sender-side transport loop. FIFO channel order plus one sender
+/// preserves input run, peer, and packet order across direct and DERP paths.
+async fn outbound_send_worker<F>(
+    mut jobs: mpsc::Receiver<OutboundSendJob>,
+    available: mpsc::Sender<OutboundDatagramRun>,
+    cancel: Arc<CancelToken>,
+    mut send: F,
+) where
+    F: for<'a> FnMut(&'a OutboundDatagramRun) -> OutboundSendFuture<'a> + Send + 'static,
+{
+    loop {
+        let Some(job) = (tokio::select! {
+            job = jobs.recv() => job,
+            () = cancel.cancelled() => None,
+        }) else {
+            return;
+        };
+        let mut run = match job {
+            OutboundSendJob::Run(run) => run,
+            OutboundSendJob::Barrier(complete) => {
+                let _ = complete.send(());
+                continue;
+            }
+        };
+        tokio::select! {
+            () = send(&run) => {}
+            () = cancel.cancelled() => return,
+        }
+        run.datagrams.clear();
+        if !pipeline_send_outbound(&available, run, &cancel).await {
+            return;
+        }
+    }
+}
+
+async fn pipeline_send_outbound(
+    sender: &mpsc::Sender<OutboundDatagramRun>,
+    run: OutboundDatagramRun,
+    cancel: &CancelToken,
+) -> bool {
+    tokio::select! {
+        result = sender.send(run) => result.is_ok(),
+        () = cancel.cancelled() => false,
+    }
+}
+
+/// Scalar sends were awaited inline, so a pump reply or timer packet could
+/// never overtake earlier TUN ciphertext. Preserve that ordering scope when
+/// the sender is enabled. It intentionally says nothing about sends made by
+/// other Magicsock tasks; it fences only this pump's ordered protocol work.
+async fn flush_outbound_before_competing_send(sender: Option<&mut OutboundSendPipeline>) -> bool {
+    match sender {
+        Some(sender) => sender.flush().await,
+        None => true,
+    }
+}
+
+async fn flush_outbound_before_replies(
+    sender: Option<&mut OutboundSendPipeline>,
+    inbound: &InboundBatchScratch,
+) -> bool {
+    if inbound.replies.is_empty() {
+        true
+    } else {
+        flush_outbound_before_competing_send(sender).await
+    }
 }
 
 struct OutboundRun {
@@ -1057,9 +1331,42 @@ async fn send_tun_batch(
     scratch: &mut OutboundBatchScratch,
     capture: &crate::capture::CaptureSlot,
 ) {
+    prepare_outbound_batch(wg_tunnels, route_table, filter, packets, scratch, capture).await;
+    let mut datagrams = scratch.scalar_datagrams.take().unwrap_or_default();
+
+    for run in scratch.runs.drain(..) {
+        let run = match run {
+            BatchRun::Skip { start, end } => {
+                debug_assert!(start <= end && end <= packets.len());
+                continue;
+            }
+            BatchRun::Routed(run) => run,
+        };
+        datagrams.clear();
+        {
+            let mut tunnel = run.tunnel.lock().await;
+            for packet in &packets[run.start..run.end] {
+                let _ = tunnel.encapsulate_into(packet, &mut datagrams);
+            }
+        }
+        let _ = magicsock
+            .send_batch(run.peer.clone(), datagrams.packets())
+            .await;
+    }
+    scratch.scalar_datagrams = Some(datagrams);
+}
+
+/// Shared ordered protocol work for scalar and pipelined outbound sends.
+async fn prepare_outbound_batch(
+    wg_tunnels: &RwLock<HashMap<NodePublic, Arc<Mutex<WgTunn>>>>,
+    route_table: &RwLock<RouteTable>,
+    filter: &std::sync::Mutex<Filter>,
+    packets: &[Vec<u8>],
+    scratch: &mut OutboundBatchScratch,
+    capture: &crate::capture::CaptureSlot,
+) {
     scratch.routes.clear();
     scratch.runs.clear();
-    scratch.datagrams.clear();
 
     // Keep filtering and route lookup in input order under one acquisition of
     // each guard. Invalid packets deliberately get filtered before routing.
@@ -1079,7 +1386,20 @@ async fn send_tun_batch(
     // missing tunnel are boundaries, so they cannot merge routed runs.
     let tunnels = wg_tunnels.read().await;
     build_batch_runs(&scratch.routes, &tunnels, &mut scratch.runs);
-    drop(tunnels);
+}
+
+/// Encrypt in pump order but hand completed owned peer runs to the persistent
+/// sender. At most one run waits in the FIFO while another is in transport.
+async fn send_tun_batch_pipeline(
+    wg_tunnels: &RwLock<HashMap<NodePublic, Arc<Mutex<WgTunn>>>>,
+    route_table: &RwLock<RouteTable>,
+    filter: &std::sync::Mutex<Filter>,
+    packets: &[Vec<u8>],
+    scratch: &mut OutboundBatchScratch,
+    capture: &crate::capture::CaptureSlot,
+    sender: &mut OutboundSendPipeline,
+) {
+    prepare_outbound_batch(wg_tunnels, route_table, filter, packets, scratch, capture).await;
 
     for run in scratch.runs.drain(..) {
         let run = match run {
@@ -1089,16 +1409,55 @@ async fn send_tun_batch(
             }
             BatchRun::Routed(run) => run,
         };
-        scratch.datagrams.clear();
+        let Some(mut datagram_run) = sender.acquire().await else {
+            return;
+        };
+        datagram_run.peer = Some(run.peer);
+        datagram_run.datagrams.clear();
         {
             let mut tunnel = run.tunnel.lock().await;
             for packet in &packets[run.start..run.end] {
-                let _ = tunnel.encapsulate_into(packet, &mut scratch.datagrams);
+                let _ = tunnel.encapsulate_into(packet, &mut datagram_run.datagrams);
             }
         }
-        let _ = magicsock
-            .send_batch(run.peer.clone(), scratch.datagrams.packets())
-            .await;
+        if !sender.queue(datagram_run).await {
+            return;
+        }
+    }
+}
+
+async fn send_tun_batch_maybe_pipelined(
+    magicsock: &Magicsock,
+    wg_tunnels: &RwLock<HashMap<NodePublic, Arc<Mutex<WgTunn>>>>,
+    route_table: &RwLock<RouteTable>,
+    filter: &std::sync::Mutex<Filter>,
+    packets: &[Vec<u8>],
+    scratch: &mut OutboundBatchScratch,
+    capture: &crate::capture::CaptureSlot,
+    sender: Option<&mut OutboundSendPipeline>,
+) {
+    if let Some(sender) = sender {
+        send_tun_batch_pipeline(
+            wg_tunnels,
+            route_table,
+            filter,
+            packets,
+            scratch,
+            capture,
+            sender,
+        )
+        .await;
+    } else {
+        send_tun_batch(
+            magicsock,
+            wg_tunnels,
+            route_table,
+            filter,
+            packets,
+            scratch,
+            capture,
+        )
+        .await;
     }
 }
 
@@ -1316,6 +1675,18 @@ mod tests {
         outbound_packet: Vec<u8>,
     }
 
+    /// Lets a test observe that aborting the sender dropped the *transport
+    /// future*, rather than merely dropping its join handle.
+    struct DropNotify(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl Drop for DropNotify {
+        fn drop(&mut self) {
+            if let Some(notify) = self.0.take() {
+                let _ = notify.send(());
+            }
+        }
+    }
+
     #[test]
     fn exit_node_router_config_respects_lan_access_preference() {
         let exit_key = NodePrivate::generate().public();
@@ -1392,6 +1763,16 @@ mod tests {
         assert_eq!(
             resolve_control_server_ips("https://127.0.0.1:8443"),
             vec!["127.0.0.1".parse::<IpAddr>().unwrap()]
+        );
+    }
+
+    #[test]
+    fn outbound_send_pipeline_activation_is_linux_only() {
+        assert!(!tun_outbound_send_pipeline_enabled_for(false));
+        assert_eq!(
+            tun_outbound_send_pipeline_enabled_for(true),
+            cfg!(target_os = "linux"),
+            "an environment opt-in must retain the scalar path off Linux"
         );
     }
 
@@ -2145,6 +2526,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             cancel.clone(),
             crate::capture::new_slot(),
+            false,
         ));
         tokio::task::yield_now().await;
         wg_tx
@@ -2306,6 +2688,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             cancel.clone(),
             crate::capture::new_slot(),
+            false,
             Some(opened_tx),
             Some(timer_tx),
         ));
@@ -3042,5 +3425,304 @@ mod tests {
                 .unwrap();
         assert_eq!(replies_at_write, 2);
         task.abort();
+    }
+
+    fn outbound_test_run(peer: NodePublic, packet: &[u8]) -> OutboundDatagramRun {
+        let mut datagrams = rustscale_wg::WgDatagramBatch::new();
+        datagrams.push_copy(packet);
+        OutboundDatagramRun {
+            peer: Some(peer),
+            datagrams,
+        }
+    }
+
+    #[tokio::test]
+    async fn outbound_sender_overlaps_next_encryption_without_reordering_or_extra_ownership() {
+        let source_private = NodePrivate::generate();
+        let target_private = NodePrivate::generate();
+        let peer = target_private.public();
+        let source = Arc::new(Mutex::new(
+            WgTunn::new(&source_private, &peer, 61).expect("source tunnel"),
+        ));
+        let target = Arc::new(Mutex::new(
+            WgTunn::new(&target_private, &source_private.public(), 62).expect("target tunnel"),
+        ));
+        establish_tunnels(&source, &target).await;
+        let first_packet = [
+            0x45, 0, 0, 20, 0, 1, 0, 0, 64, 17, 0, 0, 100, 64, 0, 1, 100, 64, 0, 2,
+        ];
+        let second_packet = [
+            0x45, 0, 0, 20, 0, 2, 0, 0, 64, 17, 0, 0, 100, 64, 0, 1, 100, 64, 0, 2,
+        ];
+        let tunnels = RwLock::new(HashMap::from([(peer.clone(), source.clone())]));
+        let mut routes = RouteTable::default();
+        routes.set_exit_node(peer.clone());
+        let routes = RwLock::new(routes);
+        let filter = std::sync::Mutex::new(Filter::allow_all());
+        let capture = crate::capture::new_slot();
+        let mut scratch = OutboundBatchScratch::default();
+        let cancel = Arc::new(CancelToken::new());
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let transmitted = Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+        let (completed_tx, mut completed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let first_send = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut pipeline = OutboundSendPipeline::start_with(cancel.clone(), {
+            let release = release.clone();
+            let transmitted = transmitted.clone();
+            let first_send = first_send.clone();
+            let completed_tx = completed_tx.clone();
+            let mut entered = Some(entered_tx);
+            move |run| {
+                let release = release.clone();
+                let transmitted = transmitted.clone();
+                let completed_tx = completed_tx.clone();
+                let block = first_send.swap(false, std::sync::atomic::Ordering::SeqCst);
+                let entered = if block { entered.take() } else { None };
+                Box::pin(async move {
+                    if let Some(entered) = entered {
+                        let _ = entered.send(());
+                        release.notified().await;
+                    }
+                    transmitted
+                        .lock()
+                        .unwrap()
+                        .extend(run.datagrams.packets().iter().cloned());
+                    let _ = completed_tx.send(());
+                })
+            }
+        });
+
+        send_tun_batch_pipeline(
+            &tunnels,
+            &routes,
+            &filter,
+            &[first_packet.to_vec()],
+            &mut scratch,
+            &capture,
+            &mut pipeline,
+        )
+        .await;
+        entered_rx.await.expect("first send did not block");
+        // N+1 returns only after the production route/filter/encapsulate path
+        // has assigned its WG counter and handed the second owned batch to the
+        // FIFO while N remains blocked in transport.
+        send_tun_batch_pipeline(
+            &tunnels,
+            &routes,
+            &filter,
+            &[second_packet.to_vec()],
+            &mut scratch,
+            &capture,
+            &mut pipeline,
+        )
+        .await;
+        assert_eq!(
+            pipeline.jobs.as_ref().expect("live sender").capacity(),
+            0,
+            "N+1 was not queued behind N"
+        );
+        assert!(
+            transmitted.lock().unwrap().is_empty(),
+            "N+1 transmitted before N"
+        );
+        assert!(
+            pipeline.local.is_empty()
+                && matches!(
+                    pipeline.available.try_recv(),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+                ),
+            "a third owned WgDatagramBatch bypassed the two-buffer bound"
+        );
+
+        release.notify_one();
+        // Completion notifications, rather than a short scheduling timeout,
+        // prove that both FIFO sends reached transport before recycling.
+        tokio::time::timeout(std::time::Duration::from_secs(2), completed_rx.recv())
+            .await
+            .expect("first transport send hung")
+            .expect("first transport completion observer closed");
+        tokio::time::timeout(std::time::Duration::from_secs(2), completed_rx.recv())
+            .await
+            .expect("second transport send hung")
+            .expect("second transport completion observer closed");
+        let first_recycled =
+            tokio::time::timeout(std::time::Duration::from_secs(2), pipeline.acquire())
+                .await
+                .expect("first owned batch was not recycled")
+                .expect("sender closed before recycle");
+        let second_recycled =
+            tokio::time::timeout(std::time::Duration::from_secs(2), pipeline.acquire())
+                .await
+                .expect("second owned batch was not recycled")
+                .expect("sender closed before second recycle");
+        assert!(first_recycled.datagrams.packets().is_empty());
+        assert!(second_recycled.datagrams.packets().is_empty());
+        assert_eq!(
+            transmitted.lock().unwrap().len(),
+            2,
+            "both production-pipeline ciphertext runs were not transmitted"
+        );
+        let transmitted = transmitted.lock().unwrap().clone();
+        assert_ne!(
+            transmitted[0], transmitted[1],
+            "distinct packets reused ciphertext"
+        );
+        assert_eq!(
+            transmitted[0][..4],
+            transmitted[1][..4],
+            "WireGuard data packet framing changed"
+        );
+        assert!(
+            u64::from_le_bytes(transmitted[0][8..16].try_into().unwrap())
+                < u64::from_le_bytes(transmitted[1][8..16].try_into().unwrap()),
+            "ciphertext and assigned counter order changed"
+        );
+        drop(first_recycled);
+        drop(second_recycled);
+        tokio::time::timeout(std::time::Duration::from_secs(2), pipeline.shutdown())
+            .await
+            .expect("sender leaked after its input closed");
+    }
+
+    #[tokio::test]
+    async fn outbound_sender_cancels_while_transport_is_blocked() {
+        let cancel = Arc::new(CancelToken::new());
+        let (jobs_tx, jobs_rx) = mpsc::channel(1);
+        let (available_tx, _available_rx) = mpsc::channel(2);
+        let worker = tokio::spawn(outbound_send_worker(
+            jobs_rx,
+            available_tx,
+            cancel.clone(),
+            |_run| Box::pin(std::future::pending()),
+        ));
+        jobs_tx
+            .send(OutboundSendJob::Run(outbound_test_run(
+                NodePrivate::generate().public(),
+                &[1],
+            )))
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        cancel.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(2), worker)
+            .await
+            .expect("blocked outbound sender ignored cancellation")
+            .expect("sender panicked");
+    }
+
+    #[tokio::test]
+    async fn outbound_pipeline_shutdown_aborts_blocked_transport_without_shared_cancel() {
+        let cancel = Arc::new(CancelToken::new());
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let mut entered = Some(entered_tx);
+        let mut pipeline = OutboundSendPipeline::start_with(cancel.clone(), move |_run| {
+            let entered = entered.take();
+            Box::pin(async move {
+                if let Some(entered) = entered {
+                    let _ = entered.send(());
+                }
+                std::future::pending::<()>().await;
+            })
+        });
+        let mut run = pipeline.acquire().await.expect("owned batch");
+        run.peer = Some(NodePrivate::generate().public());
+        run.datagrams.push_copy(&[1]);
+        assert!(pipeline.queue(run).await);
+        entered_rx.await.expect("blocked transport was not entered");
+        tokio::time::timeout(std::time::Duration::from_secs(2), pipeline.shutdown())
+            .await
+            .expect("shutdown waited forever for blocked transport");
+        assert!(
+            !cancel.is_cancelled(),
+            "pump shutdown must not cancel the shared lifecycle token"
+        );
+    }
+
+    #[tokio::test]
+    async fn outbound_pipeline_drop_aborts_blocked_transport_without_shared_cancel() {
+        let cancel = Arc::new(CancelToken::new());
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let mut entered = Some(entered_tx);
+        let mut dropped = Some(dropped_tx);
+        let mut pipeline = OutboundSendPipeline::start_with(cancel.clone(), move |_run| {
+            let entered = entered.take();
+            let future_drop = DropNotify(dropped.take());
+            Box::pin(async move {
+                let _future_drop = future_drop;
+                if let Some(entered) = entered {
+                    let _ = entered.send(());
+                }
+                std::future::pending::<()>().await;
+            })
+        });
+        let mut run = pipeline.acquire().await.expect("owned batch");
+        run.peer = Some(NodePrivate::generate().public());
+        run.datagrams.push_copy(&[1]);
+        assert!(pipeline.queue(run).await);
+        entered_rx.await.expect("blocked transport was not entered");
+
+        drop(pipeline);
+        tokio::time::timeout(std::time::Duration::from_secs(2), dropped_rx)
+            .await
+            .expect("dropping the pump leaked its blocked transport future")
+            .expect("transport future drop observer was lost");
+        assert!(
+            !cancel.is_cancelled(),
+            "pump drop must not cancel the shared lifecycle token"
+        );
+    }
+
+    #[tokio::test]
+    async fn outbound_pipeline_barrier_prevents_reply_or_timer_overtake() {
+        let cancel = Arc::new(CancelToken::new());
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut pipeline = OutboundSendPipeline::start_with(cancel, {
+            let release = release.clone();
+            let sent = sent.clone();
+            let mut entered = Some(entered_tx);
+            move |_run| {
+                let release = release.clone();
+                let sent = sent.clone();
+                let entered = entered.take();
+                Box::pin(async move {
+                    sent.lock().unwrap().push("tun");
+                    if let Some(entered) = entered {
+                        let _ = entered.send(());
+                        release.notified().await;
+                    }
+                })
+            }
+        });
+        let mut run = pipeline.acquire().await.expect("owned batch");
+        run.peer = Some(NodePrivate::generate().public());
+        run.datagrams.push_copy(&[1]);
+        assert!(pipeline.queue(run).await);
+        entered_rx.await.expect("TUN send did not block");
+        let no_reply = InboundBatchScratch::default();
+        assert!(
+            flush_outbound_before_replies(Some(&mut pipeline), &no_reply).await,
+            "ordinary inbound data must not fence the outbound sender"
+        );
+        let mut reply = InboundBatchScratch::default();
+        reply
+            .replies
+            .push((NodePrivate::generate().public(), vec![1]));
+        {
+            let barrier = flush_outbound_before_replies(Some(&mut pipeline), &reply);
+            tokio::pin!(barrier);
+            tokio::select! {
+                _ = &mut barrier => panic!("actual inbound reply passed a blocked TUN send"),
+                () = tokio::task::yield_now() => {}
+            }
+            release.notify_one();
+            assert!(barrier.await);
+        }
+        sent.lock().unwrap().push("reply-or-timer");
+        assert_eq!(*sent.lock().unwrap(), ["tun", "reply-or-timer"]);
+        pipeline.shutdown().await;
     }
 }

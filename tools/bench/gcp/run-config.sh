@@ -11,7 +11,7 @@
 # Environment:
 #   BENCH_MATRIX  — optional, set by run-matrix.sh; "topo/path" for tagging.
 #   GCP_DRY_RUN   — when set, commands are echoed not executed (still emits a stub JSON).
-#   RS_TUN_INBOUND_PIPELINE — rs-tun inbound pipeline toggle: 0 (default) or 1.
+#   RS_TUN_INBOUND_PIPELINE / RS_TUN_OUTBOUND_SEND_PIPELINE — rs-tun pipeline toggles: 0 (default) or 1.
 #   RS_LINUX_UDP_BATCH / RS_LINUX_UDP_GRO — Linux receive modes: 0 (disabled) or 1 (default).
 #
 # Returns 0 on success.
@@ -118,6 +118,16 @@ rs_tun_inbound_pipeline_self_test() {
   (( status == 2 ))
 }
 
+rs_tun_outbound_send_pipeline_self_test() {
+  local actual status
+  actual=$(export RS_TUN_OUTBOUND_SEND_PIPELINE=1; configure_rs_tun_outbound_send_pipeline; printf '%s' "$RS_TUN_OUTBOUND_SEND_PIPELINE") || return 1
+  [[ "$actual" == 1 ]] || return 1
+  actual=$(unset RS_TUN_OUTBOUND_SEND_PIPELINE; configure_rs_tun_outbound_send_pipeline; printf '%s' "$RS_TUN_OUTBOUND_SEND_PIPELINE") || return 1
+  [[ "$actual" == 0 ]] || return 1
+  if ( export RS_TUN_OUTBOUND_SEND_PIPELINE=enabled; configure_rs_tun_outbound_send_pipeline ) >/dev/null 2>&1; then return 1; else status=$?; fi
+  (( status == 2 ))
+}
+
 linux_udp_receive_modes_self_test() {
   local actual status
   for actual in 0/0 1/0 1/1; do
@@ -198,6 +208,7 @@ else
   parse_run_config_options "$@" || exit $?
 fi
 configure_rs_tun_inbound_pipeline || exit $?
+configure_rs_tun_outbound_send_pipeline || exit $?
 configure_linux_udp_receive_modes || exit $?
 if (( PROFILE || PROFILE_ONLY )) && [[ "$CONFIG" != rs-tun ]]; then
   echo "--profile and --profile-only are only valid for rs-tun" >&2
@@ -241,7 +252,7 @@ if (( SELF_TEST )); then
   python3 "$PROVENANCE_HELPER" manifest "$RESULT_MANIFEST" --run-id gcp-20260714-000000-selftest \
     --started-at-utc 2026-07-14T00:00:00Z --commit "$self_commit" --dirty 0 --project dry-run \
     --image-project ubuntu-os-cloud --image-family ubuntu-2204-lts --machine n1-standard-4 --network default \
-    --disk-type pd-standard --disk-gb 200 --rs-tun-inbound-pipeline "$RS_TUN_INBOUND_PIPELINE" --linux-udp-batch "$RS_LINUX_UDP_BATCH" --linux-udp-gro "$RS_LINUX_UDP_GRO" --dry-run --topologies same-zone --paths direct --configs rs-tun --parallelism 1 10 100 --repeat 3
+    --disk-type pd-standard --disk-gb 200 --rs-tun-inbound-pipeline "$RS_TUN_INBOUND_PIPELINE" --rs-tun-outbound-send-pipeline "$RS_TUN_OUTBOUND_SEND_PIPELINE" --linux-udp-batch "$RS_LINUX_UDP_BATCH" --linux-udp-gro "$RS_LINUX_UDP_GRO" --dry-run --topologies same-zone --paths direct --configs rs-tun --parallelism 1 10 100 --repeat 3
   # The self-test config intentionally uses a non-production topology; the
   # provenance helper only validates endpoint identity when it is non-dry.
   python3 "$PROVENANCE_HELPER" dry-observed "$OBSERVED_METADATA"
@@ -251,7 +262,7 @@ preflight_current_metadata() {
   [[ -n "$RESULT_MANIFEST" && -n "$OBSERVED_METADATA" ]] || return 1
   python3 "$PROVENANCE_HELPER" preflight --manifest "$RESULT_MANIFEST" --observed "$OBSERVED_METADATA" \
     --config "$CONFIG" --topology "$TOPOLOGY" --path "$PATH_TAG" --server-zone "$SZONE" --client-zone "$CZONE" \
-    --rs-tun-inbound-pipeline "$RS_TUN_INBOUND_PIPELINE" --linux-udp-batch "$RS_LINUX_UDP_BATCH" --linux-udp-gro "$RS_LINUX_UDP_GRO"
+    --rs-tun-inbound-pipeline "$RS_TUN_INBOUND_PIPELINE" --rs-tun-outbound-send-pipeline "$RS_TUN_OUTBOUND_SEND_PIPELINE" --linux-udp-batch "$RS_LINUX_UDP_BATCH" --linux-udp-gro "$RS_LINUX_UDP_GRO"
 }
 
 if ! preflight_current_metadata; then
@@ -455,21 +466,23 @@ linux_udp_receive_environment() {
 }
 
 rs_tun_daemon_start_command() {
-  local pipeline="$1" batch="$2" gro="$3" authkey="$4" statedir="$5" socket="$6" hostname="$7" logfile="$8" pidfile="$9" environment
+  local pipeline="$1" batch="$2" gro="$3" authkey="$4" statedir="$5" socket="$6" hostname="$7" logfile="$8" pidfile="$9" outbound="${10:-0}" environment
   [[ "$pipeline" == 0 || "$pipeline" == 1 ]] || return 2
+  [[ "$outbound" == 0 || "$outbound" == 1 ]] || return 2
   [[ "$batch" == 0 || "$batch" == 1 ]] || return 2
   [[ "$gro" == 0 || "$gro" == 1 ]] || return 2
   [[ "$batch" != 0 || "$gro" == 0 ]] || return 2
   validate_rs_tun_daemon_input "$authkey" "$hostname" || return $?
   environment="$(linux_udp_receive_environment "$batch" "$gro")TS_AUTHKEY=$authkey "
   [[ "$pipeline" == 1 ]] && environment="RUSTSCALE_TUN_INBOUND_PIPELINE=1 $environment"
+  [[ "$outbound" == 1 ]] && environment="RUSTSCALE_TUN_OUTBOUND_SEND_PIPELINE=1 $environment"
   nohup_background_command "$environment" \
     "/opt/rustscale/target/release/rustscaled run --tun --statedir $statedir --socket $socket --hostname $hostname" \
     "$logfile" "$pidfile"
 }
 
 command_shape_self_test() {
-  local ts_direct rs_direct ts_derp rs_derp rs_server_off rs_client_off rs_server_on rs_client_on rs_server_scalar rs_server_plain
+  local ts_direct rs_direct ts_derp rs_derp rs_server_off rs_client_off rs_server_on rs_client_on rs_server_outbound rs_server_scalar rs_server_plain
   ts_direct=$(tun_ping_invocation tailscale /tmp/ts.sock direct 100.64.0.1)
   rs_direct=$(tun_ping_invocation /opt/rustscale/target/release/rustscale /tmp/rs.sock direct 100.64.0.1)
   ts_derp=$(tun_ping_invocation tailscale /tmp/ts.sock derp 100.64.0.1)
@@ -492,6 +505,8 @@ command_shape_self_test() {
   [[ "$rs_server_on" == 'RUSTSCALE_TUN_INBOUND_PIPELINE=1 TS_AUTHKEY=tskey-auth-selftest nohup /opt/rustscale/target/release/rustscaled run --tun --statedir /tmp/srv --socket /tmp/srv.sock --hostname srv > /tmp/srv.log 2>&1 & echo $! > /tmp/srv.pid' ]] || return 1
   [[ "$rs_client_on" == 'RUSTSCALE_TUN_INBOUND_PIPELINE=1 TS_AUTHKEY=tskey-auth-selftest nohup /opt/rustscale/target/release/rustscaled run --tun --statedir /tmp/cli --socket /tmp/cli.sock --hostname cli > /tmp/cli.log 2>&1 & echo $! > /tmp/cli.pid' ]] || return 1
   [[ "${rs_server_on#RUSTSCALE_TUN_INBOUND_PIPELINE=1 }" != *RUSTSCALE_TUN_INBOUND_PIPELINE* && "${rs_client_on#RUSTSCALE_TUN_INBOUND_PIPELINE=1 }" != *RUSTSCALE_TUN_INBOUND_PIPELINE* ]] || return 1
+  rs_server_outbound=$(rs_tun_daemon_start_command 0 1 1 tskey-auth-selftest /tmp/srv /tmp/srv.sock srv /tmp/srv.log /tmp/srv.pid 1)
+  [[ "$rs_server_outbound" == 'RUSTSCALE_TUN_OUTBOUND_SEND_PIPELINE=1 TS_AUTHKEY=tskey-auth-selftest nohup /opt/rustscale/target/release/rustscaled run --tun --statedir /tmp/srv --socket /tmp/srv.sock --hostname srv > /tmp/srv.log 2>&1 & echo $! > /tmp/srv.pid' ]] || return 1
   rs_server_scalar=$(rs_tun_daemon_start_command 0 0 0 tskey-auth-selftest /tmp/srv /tmp/srv.sock srv /tmp/srv.log /tmp/srv.pid)
   [[ "$rs_server_scalar" == 'RUSTSCALE_DISABLE_UDP_GRO=1 RUSTSCALE_DISABLE_LINUX_UDP_BATCH=1 TS_AUTHKEY=tskey-auth-selftest nohup /opt/rustscale/target/release/rustscaled run --tun --statedir /tmp/srv --socket /tmp/srv.sock --hostname srv > /tmp/srv.log 2>&1 & echo $! > /tmp/srv.pid' ]] || return 1
   rs_server_plain=$(rs_tun_daemon_start_command 0 1 0 tskey-auth-selftest /tmp/srv /tmp/srv.sock srv /tmp/srv.log /tmp/srv.pid)
@@ -629,6 +644,29 @@ rs_tun_iperf_cleanup_command() {
 rs_tun_measurement_preflight() {
   ssh_sudo "$SVM" "$SZONE" "$(rs_tun_iperf_cleanup_command server)" \
     && ssh_sudo "$CVM" "$CZONE" "$(rs_tun_iperf_cleanup_command client)"
+}
+
+# Profile-only emits no metrics, but its reverse workload must use the exact
+# same labeled rs-tun iperf server contract as a production measurement.
+tun_start_iperf_server() {
+  local label="$1" as_root="$2" server_pid_path server_log_path
+  server_pid_path=$(tun_iperf_server_pid_path "$label")
+  server_log_path=$(tun_iperf_server_log_path "$label")
+  run_tun_command "$as_root" "$SVM" "$SZONE" \
+    "pkill -x iperf3 2>/dev/null; nohup iperf3 -s -p $PORT > $server_log_path 2>&1 & echo \$! > $server_pid_path" || return 1
+  # Match production measurement: a reverse client must not race the server
+  # bind/listen transition (the historical profile-only bad-FD failure).
+  sleep 2
+}
+
+# Profile-only is a diagnostic, not a second measurement implementation. Keep
+# its preflight, labeled server, readiness settle, and profile workload in the
+# same production helper so it cannot regress into racing a server bind.
+# Cleanup intentionally remains the caller's fail-closed responsibility.
+profile_only_rs_tun_workload() {
+  rs_tun_measurement_preflight || return 1
+  tun_start_iperf_server rs-tun 0 || return 1
+  profile_rs_tun
 }
 
 # Print the root-side cleanup program for one rs-tun endpoint.  It intentionally
@@ -917,14 +955,14 @@ cleanup_self_test() {
 
 result_shape_self_test() {
   emit_stub self-test
-  python3 - "$OUT" "$DURATION" "$LATENCY_COUNT" "$RS_TUN_INBOUND_PIPELINE" "$RS_LINUX_UDP_BATCH" "$RS_LINUX_UDP_GRO" "${PARALLELS[@]}" <<'PYEOF'
+  python3 - "$OUT" "$DURATION" "$LATENCY_COUNT" "$RS_TUN_INBOUND_PIPELINE" "$RS_TUN_OUTBOUND_SEND_PIPELINE" "$RS_LINUX_UDP_BATCH" "$RS_LINUX_UDP_GRO" "${PARALLELS[@]}" <<'PYEOF'
 import json, sys
-path, duration, latency_count, inbound_pipeline, udp_batch, udp_gro, *parallels = sys.argv[1:]
+path, duration, latency_count, inbound_pipeline, outbound_pipeline, udp_batch, udp_gro, *parallels = sys.argv[1:]
 with open(path) as f:
     result = json.load(f)
 assert result["schema_version"] == 3 and result["status"] == "failed"
 assert result["run"]["source"]["includes_uncommitted_changes"] is False
-assert result["run"]["runtime"] == {"rs_tun_inbound_pipeline": inbound_pipeline == "1", "linux_udp_batch": udp_batch == "1", "linux_udp_gro": udp_gro == "1"}
+assert result["run"]["runtime"] == {"rs_tun_inbound_pipeline": inbound_pipeline == "1", "rs_tun_outbound_send_pipeline": outbound_pipeline == "1", "linux_udp_batch": udp_batch == "1", "linux_udp_gro": udp_gro == "1"}
 assert result["observed"]["resolved_image"] == "dry-run"
 assert result["parallelism_requested"] == [int(p) for p in parallels]
 assert result["throughput"] is None and result["latency"] is None and result["footprint"] is None
@@ -1012,12 +1050,43 @@ rs_tun_lifecycle_self_test() {
   unset -f capture_rs_tun_runtime_stats cleanup_rs_tun tun_emit_result
 }
 
+profile_only_server_contract_self_test() {
+  local calls=""
+  ssh_sudo() { calls+="$1|$2|$3"$'\n'; }
+  run_tun_command() { calls+="$1|$2|$3|$4"$'\n'; }
+  sleep() { calls+="sleep|$1"$'\n'; }
+  profile_rs_tun() { calls+="profile"$'\n'; }
+  local expected="$SVM|$SZONE|$(rs_tun_iperf_cleanup_command server)"$'\n'"$CVM|$CZONE|$(rs_tun_iperf_cleanup_command client)"$'\n'"0|$SVM|$SZONE|pkill -x iperf3 2>/dev/null; nohup iperf3 -s -p $PORT > /tmp/rs-tun-iperf3-srv.log 2>&1 & echo \$! > /tmp/rs-tun-iperf3-srv.pid"$'\n''sleep|2'$'\n''profile'$'\n'
+  profile_only_rs_tun_workload || return 1
+  [[ "$calls" == "$expected" ]] || return 1
+
+  # A profile failure must be returned to run_rs_tun, which owns the
+  # fail-closed cleanup path; the helper itself must not continue or emit.
+  calls=""
+  profile_rs_tun() { calls+="profile-failed"$'\n'; return 1; }
+  if profile_only_rs_tun_workload; then
+    return 1
+  fi
+  expected="${expected%profile$'\n'}profile-failed"$'\n'
+  [[ "$calls" == "$expected" ]] || return 1
+
+  # A failed paid preflight must stop before server start or profiling.
+  calls=""
+  ssh_sudo() { calls+="preflight-failed"$'\n'; return 1; }
+  if profile_only_rs_tun_workload; then
+    return 1
+  fi
+  [[ "$calls" == $'preflight-failed\n' ]] || return 1
+  unset -f ssh_sudo run_tun_command sleep profile_rs_tun
+}
+
 classifier_self_test
 command_shape_self_test
 pid_capture_semantics_self_test
 path_gate_self_test
 run_config_option_parsing_self_test
 rs_tun_inbound_pipeline_self_test
+rs_tun_outbound_send_pipeline_self_test
 linux_udp_receive_modes_self_test
 rs_tun_daemon_input_self_test
 
@@ -1027,6 +1096,7 @@ if (( SELF_TEST )); then
   result_shape_self_test
   runtime_stats_self_test
   rs_tun_lifecycle_self_test
+  profile_only_server_contract_self_test
 fi
 
 if [[ -n "${GCP_DRY_RUN:-}" ]]; then
@@ -1178,9 +1248,7 @@ tun_measure() {
   TUN_MEASURE_FAILURE_STAGE=""
 
   TUN_MEASURE_FAILURE_STAGE=server-start
-  run_tun_command "$as_root" "$SVM" "$SZONE" \
-    "pkill -x iperf3 2>/dev/null; nohup iperf3 -s -p $PORT > $server_log_path 2>&1 & echo \$! > $server_pid_path" || return 1
-  sleep 2
+  tun_start_iperf_server "$label" "$as_root" || return 1
 
   # This reverse P1 primes the established TUN/TCP path, but is intentionally
   # before footprint sampling and never added to normal result data.
@@ -1825,8 +1893,8 @@ run_rs_tun() {
   fi
   ssh_sudo "$SVM" "$SZONE"  'rm -rf /tmp/rs-tun-srv; rm -f /tmp/rs-tun-srv.log /tmp/rs-tun-srv.pid /tmp/rs-tun-srv.sock'
   ssh_sudo "$CVM" "$CZONE"  'rm -rf /tmp/rs-tun-cli; rm -f /tmp/rs-tun-cli.log /tmp/rs-tun-cli.pid /tmp/rs-tun-cli.sock'
-  ssh_sudo "$SVM" "$SZONE" "$(rs_tun_daemon_start_command "$RS_TUN_INBOUND_PIPELINE" "$RS_LINUX_UDP_BATCH" "$RS_LINUX_UDP_GRO" "$AUTHKEY" /tmp/rs-tun-srv /tmp/rs-tun-srv.sock "$SHOST" /tmp/rs-tun-srv.log /tmp/rs-tun-srv.pid)"
-  ssh_sudo "$CVM" "$CZONE" "$(rs_tun_daemon_start_command "$RS_TUN_INBOUND_PIPELINE" "$RS_LINUX_UDP_BATCH" "$RS_LINUX_UDP_GRO" "$AUTHKEY" /tmp/rs-tun-cli /tmp/rs-tun-cli.sock "$CHOST" /tmp/rs-tun-cli.log /tmp/rs-tun-cli.pid)"
+  ssh_sudo "$SVM" "$SZONE" "$(rs_tun_daemon_start_command "$RS_TUN_INBOUND_PIPELINE" "$RS_LINUX_UDP_BATCH" "$RS_LINUX_UDP_GRO" "$AUTHKEY" /tmp/rs-tun-srv /tmp/rs-tun-srv.sock "$SHOST" /tmp/rs-tun-srv.log /tmp/rs-tun-srv.pid "$RS_TUN_OUTBOUND_SEND_PIPELINE")"
+  ssh_sudo "$CVM" "$CZONE" "$(rs_tun_daemon_start_command "$RS_TUN_INBOUND_PIPELINE" "$RS_LINUX_UDP_BATCH" "$RS_LINUX_UDP_GRO" "$AUTHKEY" /tmp/rs-tun-cli /tmp/rs-tun-cli.sock "$CHOST" /tmp/rs-tun-cli.log /tmp/rs-tun-cli.pid "$RS_TUN_OUTBOUND_SEND_PIPELINE")"
 
   local server_ip
   server_ip=$(wait_tun_ip 1 "$SVM" "$SZONE" /opt/rustscale/target/release/rustscale /tmp/rs-tun-srv.sock /tmp/rs-tun-srv.log) || {
@@ -1855,9 +1923,10 @@ run_rs_tun() {
 
   # The matrix invokes this diagnostic only after every normal selected cell.
   # It deliberately bypasses tun_measure and result emission, preserving the
-  # already accepted rs-tun measurement JSON while reusing setup and gating.
+  # already accepted rs-tun measurement JSON while reusing setup, gating, and
+  # the labeled iperf server lifecycle.
   if (( PROFILE_ONLY )); then
-    if ! profile_rs_tun; then
+    if ! profile_only_rs_tun_workload; then
       cleanup_rs_tun || return "$FATAL_HANDOFF_STATUS"
       return 1
     fi

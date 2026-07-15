@@ -3888,6 +3888,7 @@ dependencies = [
  "rustscale-derp",
  "rustscale-dns",
  "rustscale-dnsname",
+ "rustscale-drive",
  "rustscale-envknob",
  "rustscale-feature",
  "rustscale-filter",

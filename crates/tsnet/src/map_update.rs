@@ -94,6 +94,8 @@ pub(crate) fn spawn_map_update_task(
     exit_node_selection: Arc<RwLock<ExitNodeSelection>>,
     mut node_key: NodePrivate,
     filter_arc: Arc<std::sync::Mutex<Filter>>,
+    mut named_filters: BTreeMap<String, Vec<FilterRule>>,
+    drive: Arc<crate::drive::Runtime>,
     tailscale_ips: Vec<IpAddr>,
     control_url: String,
     accept_routes: bool,
@@ -116,7 +118,6 @@ pub(crate) fn spawn_map_update_task(
     suggested_exit_node: Arc<RwLock<String>>,
     client_updater: Arc<std::sync::Mutex<rustscale_clientupdate::ClientUpdater>>,
 ) -> JoinHandle<()> {
-    let mut named_filters: BTreeMap<String, Vec<FilterRule>> = BTreeMap::new();
     // Create the netmap cache helper once so that save_if_changed can
     // dedup identical writes via the in-memory SHA-256 hash.
     let netmap_cache = state_dir.as_ref().map(|dir| NetMapCache::new(dir));
@@ -313,6 +314,21 @@ pub(crate) fn spawn_map_update_task(
                         }
                     }
 
+                    // Serialize Taildrive authorization decisions with all
+                    // peer/filter changes. Requests admitted under the old
+                    // signed map are cancelled before this guard is released.
+                    let mut drive_epoch = drive.authorization_write().await;
+                    if let Some(ref node) = resp.Node {
+                        let sharing_allowed = node
+                            .Capabilities
+                            .iter()
+                            .any(|cap| cap == rustscale_drive::NODE_CAPABILITY_TAILDRIVE_SHARE)
+                            || node
+                                .CapMap
+                                .contains_key(rustscale_drive::NODE_CAPABILITY_TAILDRIVE_SHARE);
+                        drive.set_sharing_allowed_locked(sharing_allowed, &mut drive_epoch);
+                    }
+
                     // Merge peer deltas. Track whether the peer set changed
                     // so the filter's capability map can be refreshed.
                     let peers_changed = !resp.Peers.is_empty()
@@ -355,6 +371,26 @@ pub(crate) fn spawn_map_update_task(
                             }
                         }
                     }
+
+                    // Install packet-filter capability deltas before allowing
+                    // another Taildrive authorization decision. Keeping the
+                    // initial named filters is required for deltas that update
+                    // peers without repeating the full filter.
+                    let filter_changed = process_filter_deltas(&resp, &mut named_filters);
+                    if filter_changed || peers_changed {
+                        let shields_up = filter_arc.lock().unwrap().shields_up();
+                        let peers_snapshot = peers_arc.read().await.clone();
+                        rebuild_filter(
+                            &filter_arc,
+                            &named_filters,
+                            &tailscale_ips,
+                            &advertise_routes,
+                            &peers_snapshot,
+                            shields_up,
+                        );
+                    }
+                    crate::drive::Runtime::rotate_authorization_locked(&mut drive_epoch);
+                    drop(drive_epoch);
 
                     // Forward peer deltas to the IPN notify bus so
                     // watch-ipn-bus subscribers receive PeersChanged /
@@ -508,27 +544,6 @@ pub(crate) fn spawn_map_update_task(
                         }
                     }
                     drop(tunnels);
-
-                    // Process PacketFilter / PacketFilters deltas and rebuild
-                    // the filter if anything changed. The peer list supplies
-                    // the capability map; the existing shields-up state is
-                    // preserved across the rebuild (mirrors Go passing
-                    // `oldFilter` to `filter.New`). A peer-set change also
-                    // triggers a rebuild so `cap:<name>` source predicates
-                    // see the latest peer `CapMap`s.
-                    let filter_changed = process_filter_deltas(&resp, &mut named_filters);
-                    if filter_changed || peers_changed {
-                        let shields_up = filter_arc.lock().unwrap().shields_up();
-                        let peers_snapshot = peers_arc.read().await.clone();
-                        rebuild_filter(
-                            &filter_arc,
-                            &named_filters,
-                            &tailscale_ips,
-                            &advertise_routes,
-                            &peers_snapshot,
-                            shields_up,
-                        );
-                    }
 
                     // Save the updated netmap to disk (best-effort) so a
                     // restart can skip the blocking first fetch. Dedup via

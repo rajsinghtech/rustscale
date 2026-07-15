@@ -304,8 +304,8 @@ impl Server {
             "GET" => self.get(root, &parsed, false, control),
             "HEAD" => self.get(root, &parsed, true, control),
             "PUT" => Self::put(root, &parsed, &request.body, control),
-            "MKCOL" => Self::mkcol(root, &parsed, &request.body),
-            "DELETE" => Self::delete(root, &parsed),
+            "MKCOL" => Self::mkcol(root, &parsed, &request.body, control),
+            "DELETE" => Self::delete(root, &parsed, control),
             "MOVE" => self.move_or_copy(peer, &snapshot, root, &parsed, &request, false, control),
             "COPY" => self.move_or_copy(peer, &snapshot, root, &parsed, &request, true, control),
             _ => return Response::text(405, "method not allowed").header("allow", ALLOW),
@@ -378,6 +378,7 @@ impl Server {
         root: &ShareRoot,
         parsed: &ParsedPath,
         body: &[u8],
+        control: &RequestControl,
     ) -> Result<Response, OperationError> {
         if parsed.relative.as_os_str().is_empty() {
             return Err(OperationError::MethodNotAllowed);
@@ -386,11 +387,16 @@ impl Server {
             return Err(OperationError::UnsupportedMediaType);
         }
         let (parent, leaf) = open_parent_nofollow(&root.dir, &parsed.relative)?;
+        control.check()?;
         parent.create_dir(&leaf)?;
         Ok(Response::new(201).header("content-length", "0"))
     }
 
-    fn delete(root: &ShareRoot, parsed: &ParsedPath) -> Result<Response, OperationError> {
+    fn delete(
+        root: &ShareRoot,
+        parsed: &ParsedPath,
+        control: &RequestControl,
+    ) -> Result<Response, OperationError> {
         if parsed.relative.as_os_str().is_empty() {
             return Err(OperationError::Forbidden);
         }
@@ -399,6 +405,7 @@ impl Server {
         if metadata.file_type().is_symlink() {
             return Err(OperationError::Forbidden);
         }
+        control.check()?;
         if metadata.is_dir() {
             // Deliberately avoid recursive deletion in this bounded slice.
             parent.remove_dir(&leaf)?;
@@ -498,6 +505,7 @@ impl Server {
             }
             atomic_write(&destination_parent, &destination_leaf, &bytes, control)?;
         } else {
+            control.check()?;
             source_parent.rename(&source_leaf, &destination_parent, &destination_leaf)?;
         }
         Ok(Response::new(if destination_exists { 204 } else { 201 }).header("content-length", "0"))

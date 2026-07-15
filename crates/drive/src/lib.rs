@@ -28,3 +28,9 @@ pub const CAPABILITY_TAILDRIVE: &str = "tailscale.com/cap/drive";
 
 /// Peer capability advertising that a peer can share folders with us.
 pub const CAPABILITY_TAILDRIVE_SHARER: &str = "tailscale.com/cap/drive-sharer";
+
+/// Self-node attribute allowing this node to expose Taildrive shares.
+pub const NODE_CAPABILITY_TAILDRIVE_SHARE: &str = "drive:share";
+
+/// Self-node attribute allowing this node to compose remote Taildrive shares.
+pub const NODE_CAPABILITY_TAILDRIVE_ACCESS: &str = "drive:access";

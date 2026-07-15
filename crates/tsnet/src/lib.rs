@@ -34,6 +34,7 @@ mod appc;
 mod c2n;
 mod capture;
 mod dns_resolve;
+mod drive;
 mod filter_build;
 mod hostinfo;
 mod lifecycle;
@@ -729,6 +730,7 @@ impl ServerBuilder {
         }
         Ok(Server {
             config: self,
+            drive: drive::Runtime::new(),
             inner: None,
             pre_started: None,
         })
@@ -887,6 +889,8 @@ pub(crate) struct Bootstrap {
     pub(crate) map_task: JoinHandle<()>,
     pub(crate) node_key: NodePrivate,
     pub(crate) filter: Arc<std::sync::Mutex<Filter>>,
+    /// Complete named packet-filter state from the initial signed netmap.
+    pub(crate) named_filters: BTreeMap<String, Vec<FilterRule>>,
     pub(crate) packet_drops: Arc<AtomicU64>,
     /// Shared MagicDNS resolver (dial path + DNS responder).
     pub(crate) resolver: Arc<RwLock<MagicDnsResolver>>,
@@ -952,6 +956,7 @@ pub(crate) struct Bootstrap {
 /// An embedded Tailscale server.
 pub struct Server {
     pub(crate) config: ServerBuilder,
+    pub(crate) drive: Arc<drive::Runtime>,
     pub(crate) inner: Option<RunningState>,
     pub(crate) pre_started: Option<PreStartedLocalApi>,
 }

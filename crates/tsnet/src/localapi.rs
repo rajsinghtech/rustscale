@@ -204,6 +204,8 @@ pub(crate) struct LocalApiState {
     pub control_params: Option<ControlParams>,
     /// Taildrop file manager (None if taildrop is disabled or not yet up).
     pub taildrop: Option<Arc<crate::taildrop::TaildropManager>>,
+    /// Disabled-by-default Taildrive runtime shared with PeerAPI.
+    pub drive: Arc<crate::drive::Runtime>,
     /// Netstack handle for dialing peer PeerAPIs (None in TUN mode or
     /// before `up()`). Used by the `file-put` endpoint to proxy uploads
     /// through the tailnet.
@@ -414,6 +416,16 @@ pub(crate) async fn read_request<R: AsyncRead + Unpin>(
             let header_text =
                 std::str::from_utf8(head).map_err(|_| "non-utf8 header".to_string())?;
             let cl = extract_content_length(header_text);
+            let request_target = header_text
+                .split("\r\n")
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .unwrap_or_default();
+            if request_target.starts_with("/localapi/v0/drive/config")
+                && cl > crate::drive::MAX_CONFIG_BODY
+            {
+                return Err("Taildrive configuration body too large".into());
+            }
             while body.len() < cl {
                 let n = conn
                     .read(&mut tmp)
@@ -1009,6 +1021,8 @@ pub(crate) async fn dispatch<W: AsyncRead + AsyncWrite + Unpin>(
                     "/localapi/v0/login-interactive",
                     "/localapi/v0/logout",
                     "/localapi/v0/serve-config",
+                    "/localapi/v0/drive/status",
+                    "/localapi/v0/drive/config",
                     "/localapi/v0/profiles",
                     "/localapi/v0/cert/<domain>",
                     "/localapi/v0/file-targets",
@@ -1163,6 +1177,27 @@ pub(crate) async fn dispatch<W: AsyncRead + AsyncWrite + Unpin>(
             handle_post_serve_config(conn, req, state).await?;
         }
 
+        // --- GET /localapi/v0/drive/status ---
+        "drive/status" if method == "GET" => {
+            handle_drive_status(conn, state).await?;
+        }
+
+        // --- GET/PUT /localapi/v0/drive/config ---
+        "drive/config" if method == "GET" => {
+            handle_get_drive_config(conn, state).await?;
+        }
+        "drive/config" if method == "PUT" => {
+            if !require_readwrite(peer_identity) {
+                write_access_denied(conn).await?;
+                return Ok(());
+            }
+            handle_put_drive_config(conn, &req.body, state).await?;
+        }
+        "drive/config" | "drive/status" => {
+            let body = serde_json::json!({"error": "method not allowed"});
+            write_json_response(conn, 405, "Method Not Allowed", &body).await?;
+        }
+
         // --- GET /localapi/v0/profiles ---
         "profiles" if method == "GET" => {
             handle_list_profiles(conn, state).await?;
@@ -1299,6 +1334,56 @@ pub(crate) async fn dispatch<W: AsyncRead + AsyncWrite + Unpin>(
     }
 
     Ok(())
+}
+
+async fn handle_drive_status<W: AsyncWrite + Unpin>(
+    conn: &mut W,
+    state: &Arc<LocalApiState>,
+) -> Result<(), std::io::Error> {
+    let status = serde_json::to_value(state.drive.status()).unwrap_or_default();
+    write_json_response(conn, 200, "OK", &status).await
+}
+
+async fn handle_get_drive_config<W: AsyncWrite + Unpin>(
+    conn: &mut W,
+    state: &Arc<LocalApiState>,
+) -> Result<(), std::io::Error> {
+    let status = state.drive.status();
+    let config = serde_json::json!({
+        "enabled": status.enabled,
+        "shares": status.shares,
+    });
+    write_json_response(conn, 200, "OK", &config).await
+}
+
+async fn handle_put_drive_config<W: AsyncWrite + Unpin>(
+    conn: &mut W,
+    body: &[u8],
+    state: &Arc<LocalApiState>,
+) -> Result<(), std::io::Error> {
+    if body.len() > crate::drive::MAX_CONFIG_BODY {
+        let error = serde_json::json!({"error": "Taildrive configuration body too large"});
+        return write_json_response(conn, 413, "Content Too Large", &error).await;
+    }
+    let config: crate::drive::RuntimeConfig = match serde_json::from_slice(body) {
+        Ok(config) => config,
+        Err(error) => {
+            let body =
+                serde_json::json!({"error": format!("invalid Taildrive configuration: {error}")});
+            return write_json_response(conn, 400, "Bad Request", &body).await;
+        }
+    };
+    match state.drive.replace(config).await {
+        Ok(_) => handle_drive_status(conn, state).await,
+        Err(crate::drive::ReplaceError::SharingNotAllowed) => {
+            let body = serde_json::json!({"error": "Taildrive sharing is not allowed by the signed netmap"});
+            write_json_response(conn, 403, "Forbidden", &body).await
+        }
+        Err(error) => {
+            let body = serde_json::json!({"error": error.to_string()});
+            write_json_response(conn, 400, "Bad Request", &body).await
+        }
+    }
 }
 
 /// Handle POST /localapi/v0/debug-capture.
@@ -3541,6 +3626,7 @@ mod tests {
             cert_params: None,
             control_params: None,
             taildrop: None,
+            drive: crate::drive::Runtime::new(),
             netstack: None,
             filter: std::sync::OnceLock::new(),
             route_table: None,
@@ -4674,6 +4760,7 @@ mod tests {
             cert_params: None,
             control_params: None,
             taildrop: None,
+            drive: state.drive.clone(),
             netstack: None,
             filter: std::sync::OnceLock::new(),
             route_table: None,
@@ -4915,6 +5002,7 @@ mod tests {
             }),
             control_params: None,
             taildrop: None,
+            drive: base.drive.clone(),
             netstack: None,
             filter: std::sync::OnceLock::new(),
             route_table: None,
@@ -5226,6 +5314,84 @@ mod tests {
             String::from_utf8(buf).unwrap_or_default()
         });
         read_task.await.unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn taildrive_localapi_reports_disabled_startup() {
+        let state = make_test_state().await;
+        let status = send_request_with_identity(
+            b"GET /localapi/v0/drive/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            &state,
+            test_ro_identity(),
+        )
+        .await;
+        assert!(status.contains("200 OK"), "response: {status}");
+        assert!(status.contains("\"enabled\":false"), "response: {status}");
+        assert!(
+            status.contains("\"sharingAllowed\":false"),
+            "response: {status}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn taildrive_localapi_mutation_requires_readwrite_and_is_atomic() {
+        let state = make_test_state().await;
+        {
+            let mut epoch = state.drive.authorization_write().await;
+            state.drive.set_sharing_allowed_locked(true, &mut epoch);
+            crate::drive::Runtime::rotate_authorization_locked(&mut epoch);
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let body = serde_json::to_vec(&crate::drive::RuntimeConfig {
+            enabled: true,
+            shares: vec![rustscale_drive::Share::new("docs", root)],
+        })
+        .unwrap();
+        let request = format!(
+            "PUT /localapi/v0/drive/config HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            String::from_utf8(body).unwrap()
+        );
+        let read_only = ConnIdentity {
+            uid: None,
+            pid: None,
+            is_unix_sock: true,
+        };
+        let denied = send_request_with_identity(request.as_bytes(), &state, read_only).await;
+        assert!(denied.contains("403 Forbidden"), "response: {denied}");
+        assert!(!state.drive.status().enabled);
+
+        let accepted =
+            send_request_with_identity(request.as_bytes(), &state, test_rw_identity()).await;
+        assert!(accepted.contains("200 OK"), "response: {accepted}");
+        let status = state.drive.status();
+        assert!(status.enabled);
+        assert_eq!(status.shares.len(), 1);
+
+        let bad_body = br#"{"enabled":true,"shares":[{"name":"bad","path":"relative"}]}"#;
+        let bad_request = format!(
+            "PUT /localapi/v0/drive/config HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            bad_body.len(),
+            String::from_utf8_lossy(bad_body)
+        );
+        let rejected =
+            send_request_with_identity(bad_request.as_bytes(), &state, test_rw_identity()).await;
+        assert!(rejected.contains("400 Bad Request"), "response: {rejected}");
+        let after = state.drive.status();
+        assert!(after.enabled);
+        assert_eq!(after.generation, status.generation);
+        assert_eq!(after.shares[0].name, "docs");
+
+        let readable = send_request_with_identity(
+            b"GET /localapi/v0/drive/config HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            &state,
+            test_ro_identity(),
+        )
+        .await;
+        assert!(readable.contains("200 OK"), "response: {readable}");
+        assert!(readable.contains("\"name\":\"docs\""));
     }
 
     #[tokio::test]

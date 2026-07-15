@@ -62,6 +62,8 @@ pub struct SessionInit {
     pub window_change_rx: mpsc::Receiver<Window>,
     /// TCP peer address of the SSH client (used for SSH_CLIENT/SSH_CONNECTION).
     pub peer_addr: Option<SocketAddr>,
+    #[cfg(test)]
+    pub(crate) fail_pty_setup: bool,
 }
 
 pub struct Session {
@@ -88,6 +90,8 @@ pub struct Session {
     signal_rx: mpsc::Receiver<Sig>,
     window_change_rx: mpsc::Receiver<Window>,
     peer_addr: Option<SocketAddr>,
+    #[cfg(test)]
+    fail_pty_setup: bool,
 }
 
 impl Session {
@@ -116,6 +120,8 @@ impl Session {
             signal_rx: init.signal_rx,
             window_change_rx: init.window_change_rx,
             peer_addr: init.peer_addr,
+            #[cfg(test)]
+            fail_pty_setup: init.fail_pty_setup,
         }
     }
     pub fn user(&self) -> &str {
@@ -144,6 +150,10 @@ impl Session {
     }
     pub fn pty(&self) -> Option<&Pty> {
         self.pty.as_ref()
+    }
+    #[cfg(test)]
+    pub(crate) fn fail_pty_setup(&self) -> bool {
+        self.fail_pty_setup
     }
     /// Returns the session recorder, if recording is enabled.
     pub fn recorder(&self) -> Option<&SessionRecorder> {
@@ -196,10 +206,10 @@ impl Session {
         if self.closed {
             return;
         }
-        self.closed = true;
         let _ = self.handle.exit_status_request(self.channel_id, code).await;
         let _ = self.handle.eof(self.channel_id).await;
         let _ = self.handle.close(self.channel_id).await;
+        self.closed = true;
         if let Some(tx) = self.done_tx.take() {
             let _ = tx.send(()).await;
         }
@@ -302,6 +312,17 @@ impl AsyncWrite for Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
+        if !self.closed {
+            let handle = self.handle.clone();
+            let channel_id = self.channel_id;
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(async move {
+                    let _ = handle.exit_status_request(channel_id, 1).await;
+                    let _ = handle.eof(channel_id).await;
+                    let _ = handle.close(channel_id).await;
+                });
+            }
+        }
         if let Some(tx) = self.done_tx.take() {
             let _ = tx.try_send(());
         }

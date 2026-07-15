@@ -379,6 +379,18 @@ fn allocate_pty(
 
 /// Set the window size on a fd via `TIOCSWINSZ` ioctl.
 #[cfg(unix)]
+fn pty_eof_byte(fd: RawFd) -> u8 {
+    // SAFETY: termios is initialized before ioctl writes it, and fd is an
+    // owned PTY master kept alive by the caller.
+    let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+    if unsafe { libc::tcgetattr(fd, &raw mut termios) } == 0 {
+        termios.c_cc[libc::VEOF]
+    } else {
+        4 // POSIX default Ctrl-D.
+    }
+}
+
+#[cfg(unix)]
 fn set_winsize(fd: RawFd, win: &Window) -> Result<(), SessionHandlerError> {
     let ws = libc::winsize {
         ws_row: win.height as libc::c_ushort,
@@ -612,7 +624,13 @@ pub(crate) async fn run_session_with(
         .await
     {
         Ok(Ok(permit)) => permit,
-        Ok(Err(_)) => return Err(io::Error::other("SSH blocker limit closed").into()),
+        Ok(Err(_)) => {
+            return finish_prelaunch_error(
+                &mut session,
+                io::Error::other("SSH blocker limit closed").into(),
+            )
+            .await;
+        }
         Err(cause) => return finish_prelaunch_cancellation(&mut session, cause).await,
     };
     let mut resolve_task = tokio::task::spawn_blocking(move || {
@@ -620,8 +638,15 @@ pub(crate) async fn run_session_with(
         resolve_user(local_user_name)
     });
     let local_user = match lifecycle.supervise_blocker(&mut resolve_task).await {
-        Ok(Ok(result)) => result?,
-        Ok(Err(error)) => return Err(io::Error::other(error.to_string()).into()),
+        Ok(Ok(Ok(user))) => user,
+        Ok(Ok(Err(error))) => return finish_prelaunch_error(&mut session, error).await,
+        Ok(Err(error)) => {
+            return finish_prelaunch_error(
+                &mut session,
+                io::Error::other(error.to_string()).into(),
+            )
+            .await;
+        }
         Err(cause) => {
             tokio::spawn(async move {
                 let _ = resolve_task.await;
@@ -640,8 +665,20 @@ pub(crate) async fn run_session_with(
         |address| (address.ip(), address.port(), address.ip(), address.port()),
     );
 
+    #[cfg(test)]
+    if session.fail_pty_setup() {
+        return finish_prelaunch_error(
+            &mut session,
+            SessionHandlerError::Pty("injected PTY setup failure".into()),
+        )
+        .await;
+    }
+
     let (pty_master_fd, pty_slave_fd, tty_name, term) = if let Some(pty) = session.pty() {
-        let (master, slave, name) = allocate_pty(pty)?;
+        let (master, slave, name) = match allocate_pty(pty) {
+            Ok(pty) => pty,
+            Err(error) => return finish_prelaunch_error(&mut session, error).await,
+        };
         (
             Some(master),
             Some(slave),
@@ -721,12 +758,26 @@ pub(crate) async fn run_session_with(
     // Duplicate all parent PTY roles before launch. Any allocation/duplication
     // error therefore drops every OwnedFd without spawning an orphan process.
     let pty_handles = if let Some(fd) = pty_master_fd {
-        let read_fd = fd.try_clone().map_err(|error| {
-            SessionHandlerError::Pty(format!("failed to duplicate PTY output: {error}"))
-        })?;
-        let ioctl_fd = fd.try_clone().map_err(|error| {
-            SessionHandlerError::Pty(format!("failed to duplicate PTY control: {error}"))
-        })?;
+        let read_fd = match fd.try_clone() {
+            Ok(fd) => fd,
+            Err(error) => {
+                return finish_prelaunch_error(
+                    &mut session,
+                    SessionHandlerError::Pty(format!("failed to duplicate PTY output: {error}")),
+                )
+                .await;
+            }
+        };
+        let ioctl_fd = match fd.try_clone() {
+            Ok(fd) => fd,
+            Err(error) => {
+                return finish_prelaunch_error(
+                    &mut session,
+                    SessionHandlerError::Pty(format!("failed to duplicate PTY control: {error}")),
+                )
+                .await;
+            }
+        };
         Some((fd, read_fd, ioctl_fd))
     } else {
         None
@@ -747,7 +798,13 @@ pub(crate) async fn run_session_with(
         .await
     {
         Ok(Ok(permit)) => permit,
-        Ok(Err(_)) => return Err(io::Error::other("SSH blocker limit closed").into()),
+        Ok(Err(_)) => {
+            return finish_prelaunch_error(
+                &mut session,
+                io::Error::other("SSH blocker limit closed").into(),
+            )
+            .await;
+        }
         Err(cause) => return finish_prelaunch_cancellation(&mut session, cause).await,
     };
     let runtime = tokio::runtime::Handle::current();
@@ -780,8 +837,15 @@ pub(crate) async fn run_session_with(
         }
     };
     let mut launched = match launch_result {
-        Ok(Ok(result)) => result?,
-        Ok(Err(error)) => return Err(io::Error::other(error.to_string()).into()),
+        Ok(Ok(Ok(launched))) => launched,
+        Ok(Ok(Err(error))) => return finish_prelaunch_error(&mut session, error).await,
+        Ok(Err(error)) => {
+            return finish_prelaunch_error(
+                &mut session,
+                io::Error::other(error.to_string()).into(),
+            )
+            .await;
+        }
         Err(cause) => {
             tokio::spawn(supervise_canceled_launch(
                 started_control,
@@ -854,7 +918,22 @@ pub(crate) async fn run_session_with(
         tokio::select! {
             input = session.read(&mut session_buf), if process_input.is_some() && pending_input.is_empty() && term_deadline.is_none() => {
                 match input {
-                    Ok(0) | Err(_) => {
+                    Ok(0) => {
+                        // SSH EOF is only an input half-close. The Session
+                        // yields it after all queued frames have drained, so
+                        // close child stdin without canceling the process or
+                        // suppressing its remaining output. PTYs have no true
+                        // close-write operation; send their configured VEOF.
+                        if let (Some(input), Some(fd)) =
+                            (process_input.as_mut(), pty_ioctl_fd.as_ref())
+                        {
+                            let eof = pty_eof_byte(fd.as_raw_fd());
+                            let _ = input.write_all(&[eof]).await;
+                            let _ = input.flush().await;
+                        }
+                        process_input = None;
+                    }
+                    Err(_) => {
                         process_input = None;
                         forced_failure = true;
                         pumps_aborted = true;
@@ -1077,6 +1156,15 @@ pub(crate) async fn run_session_with(
     };
     session.exit(exit_code.max(0) as u32).await;
     Ok(exit_code)
+}
+
+#[cfg(unix)]
+async fn finish_prelaunch_error(
+    session: &mut Session,
+    error: SessionHandlerError,
+) -> Result<i32, SessionHandlerError> {
+    session.exit(1).await;
+    Err(error)
 }
 
 #[cfg(unix)]

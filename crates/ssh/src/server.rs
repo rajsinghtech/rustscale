@@ -9,15 +9,17 @@ use russh::keys::PrivateKey;
 use russh::server::{Auth, Msg, Server as RusshServer, Session};
 use russh::{Channel, ChannelId, MethodSet};
 use rustscale_tailcfg::{Node, SSHPolicy, UserProfile};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 const MAX_SESSION_CHANNELS: usize = 16;
 const CHANNEL_STDIN_FRAMES: usize = 64;
+const PRESTART_STDIN_BYTES: usize = 256 * 1024;
+const GLOBAL_PRESTART_STDIN_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_ENV_VARS: usize = 64;
 pub(crate) const MAX_ENV_NAME_BYTES: usize = 128;
 pub(crate) const MAX_ENV_VALUE_BYTES: usize = 4 * 1024;
@@ -72,7 +74,7 @@ impl RusshServer for SshServer {
             local_user: String::new(),
             accept_env: Vec::new(),
             peer_identity: None,
-            channels: HashMap::new(),
+            channels: Arc::new(Mutex::new(HashMap::new())),
             recording_config: None,
             session_duration: std::time::Duration::ZERO,
             revalidate: None,
@@ -114,6 +116,9 @@ struct ChannelState {
     cancel: Option<tokio::sync::watch::Sender<bool>>,
     signal_tx: Option<mpsc::Sender<russh::Sig>>,
     window_change_tx: Option<mpsc::Sender<Window>>,
+    pending_data: VecDeque<Vec<u8>>,
+    pending_bytes: usize,
+    input_eof: bool,
 }
 
 impl ChannelState {
@@ -166,11 +171,21 @@ pub struct SshHandler {
     local_user: String,
     accept_env: Vec<String>,
     peer_identity: Option<PeerIdentity>,
-    channels: HashMap<ChannelId, ChannelState>,
+    channels: Arc<Mutex<HashMap<ChannelId, ChannelState>>>,
     recording_config: Option<RecordingConfig>,
     session_duration: std::time::Duration,
     revalidate: Option<RevalidateCallback>,
     connection_id: String,
+}
+
+impl Drop for SshHandler {
+    fn drop(&mut self) {
+        for (_, mut state) in self.channels.lock().unwrap().drain() {
+            if let Some(cancel) = state.cancel.take() {
+                cancel.send_replace(true);
+            }
+        }
+    }
 }
 
 impl SshHandler {
@@ -277,28 +292,54 @@ impl SshHandler {
         channel_id: ChannelId,
         session: &mut Session,
     ) -> Result<(), russh::Error> {
-        let Some(channel) = self.channels.get_mut(&channel_id) else {
-            let _ = session.channel_failure(channel_id);
-            return Ok(());
-        };
-        if channel.started {
-            let _ = session.channel_failure(channel_id);
-            return Ok(());
-        }
-        channel.started = true;
-
         let (data_tx, data_rx) = mpsc::channel::<Vec<u8>>(CHANNEL_STDIN_FRAMES);
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-        let (done_tx, _done_rx) = mpsc::channel::<()>(1);
+        let (done_tx, mut done_rx) = mpsc::channel::<()>(1);
         let (signal_tx, signal_rx) = mpsc::channel::<russh::Sig>(16);
         let (window_change_tx, window_change_rx) = mpsc::channel::<Window>(16);
-        channel.data_tx = Some(data_tx);
-        channel.cancel = Some(cancel_tx);
-        channel.signal_tx = Some(signal_tx);
-        channel.window_change_tx = Some(window_change_tx);
-        let env_vars = channel.env_vars.clone();
-        let pty = channel.pty.clone();
-        let command = channel.command.clone();
+        let (env_vars, pty, command, input_eof) = {
+            let mut channels = self.channels.lock().unwrap();
+            let Some(channel) = channels.get_mut(&channel_id) else {
+                let _ = session.channel_failure(channel_id);
+                return Ok(());
+            };
+            if channel.started {
+                let _ = session.channel_failure(channel_id);
+                return Ok(());
+            }
+            channel.started = true;
+            while let Some(data) = channel.pending_data.pop_front() {
+                // The pre-start queue has the same frame cap as this fresh
+                // channel, so every accepted packet must fit in order.
+                if data_tx.try_send(data).is_err() {
+                    let _ = session.exit_status_request(channel_id, 1);
+                    let _ = session.eof(channel_id);
+                    let _ = session.close(channel_id);
+                    channels.remove(&channel_id);
+                    return Ok(());
+                }
+            }
+            channel.pending_bytes = 0;
+            channel.data_tx = (!channel.input_eof).then(|| data_tx.clone());
+            channel.cancel = Some(cancel_tx);
+            channel.signal_tx = Some(signal_tx);
+            channel.window_change_tx = Some(window_change_tx);
+            (
+                channel.env_vars.clone(),
+                channel.pty.clone(),
+                channel.command.clone(),
+                channel.input_eof,
+            )
+        };
+        if input_eof {
+            drop(data_tx);
+        }
+
+        let channels = self.channels.clone();
+        tokio::spawn(async move {
+            let _ = done_rx.recv().await;
+            channels.lock().unwrap().remove(&channel_id);
+        });
 
         let handle = session.handle();
         let peer = self.peer_identity.clone().unwrap_or_default();
@@ -374,6 +415,8 @@ impl SshHandler {
             signal_rx,
             window_change_rx,
             peer_addr,
+            #[cfg(test)]
+            fail_pty_setup: false,
         };
 
         if self.config.session_tx.send(init).await.is_err() {
@@ -418,13 +461,21 @@ impl russh::server::Handler for SshHandler {
         reply: russh::server::ChannelOpenHandle,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        if self.channels.len() >= MAX_SESSION_CHANNELS {
+        let accepted = {
+            let mut channels = self.channels.lock().unwrap();
+            if channels.len() >= MAX_SESSION_CHANNELS {
+                false
+            } else {
+                channels.insert(channel.id(), ChannelState::default());
+                true
+            }
+        };
+        if accepted {
+            reply.accept().await;
+        } else {
             reply
                 .reject(russh::ChannelOpenFailure::ResourceShortage)
                 .await;
-        } else {
-            self.channels.insert(channel.id(), ChannelState::default());
-            reply.accept().await;
         }
         Ok(())
     }
@@ -440,6 +491,8 @@ impl russh::server::Handler for SshHandler {
         let accepted = permitted
             && self
                 .channels
+                .lock()
+                .unwrap()
                 .get_mut(&channel)
                 .is_some_and(|state| state.store_env(name, value));
         if accepted {
@@ -461,7 +514,7 @@ impl russh::server::Handler for SshHandler {
         _modes: &[(russh::Pty, u32)],
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        if let Some(state) = self.channels.get_mut(&channel) {
+        if let Some(state) = self.channels.lock().unwrap().get_mut(&channel) {
             if !state.started {
                 state.pty = Some(Pty {
                     term: term.to_string(),
@@ -482,7 +535,7 @@ impl russh::server::Handler for SshHandler {
         channel: ChannelId,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        if let Some(state) = self.channels.get_mut(&channel) {
+        if let Some(state) = self.channels.lock().unwrap().get_mut(&channel) {
             state.command.clear();
         }
         let _ = session.channel_success(channel);
@@ -496,7 +549,7 @@ impl russh::server::Handler for SshHandler {
         data: &[u8],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        if let Some(state) = self.channels.get_mut(&channel) {
+        if let Some(state) = self.channels.lock().unwrap().get_mut(&channel) {
             state.command = String::from_utf8_lossy(data).to_string();
         }
         let _ = session.channel_success(channel);
@@ -511,7 +564,7 @@ impl russh::server::Handler for SshHandler {
         session: &mut Session,
     ) -> Result<(), Self::Error> {
         if name == "sftp" {
-            if let Some(state) = self.channels.get_mut(&channel) {
+            if let Some(state) = self.channels.lock().unwrap().get_mut(&channel) {
                 state.command.clear();
             }
             let _ = session.channel_success(channel);
@@ -528,25 +581,56 @@ impl russh::server::Handler for SshHandler {
         data: &[u8],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        let enqueue_failed = self
-            .channels
-            .get(&channel)
-            .and_then(|state| state.data_tx.as_ref())
-            .is_some_and(|tx| tx.try_send(data.to_vec()).is_err());
-        if enqueue_failed {
-            // russh has already accepted this SSH data packet. Never wait on
-            // the bounded application queue (which would stall every channel)
-            // and never silently discard it: fail and close only the offending
-            // channel, while cancellation tears down its process.
-            if let Some(state) = self.channels.get_mut(&channel) {
+        if data.is_empty() {
+            return Ok(());
+        }
+        let close_channel = {
+            let mut channels = self.channels.lock().unwrap();
+            let global_pending: usize = channels.values().map(|state| state.pending_bytes).sum();
+            let Some(state) = channels.get_mut(&channel) else {
+                return Ok(());
+            };
+            let overflow = if state.input_eof {
+                true
+            } else if state.started {
+                state
+                    .data_tx
+                    .as_ref()
+                    .is_none_or(|tx| tx.try_send(data.to_vec()).is_err())
+            } else if state.pending_data.len() >= CHANNEL_STDIN_FRAMES
+                || state.pending_bytes.saturating_add(data.len()) > PRESTART_STDIN_BYTES
+                || global_pending.saturating_add(data.len()) > GLOBAL_PRESTART_STDIN_BYTES
+            {
+                true
+            } else {
+                state.pending_data.push_back(data.to_vec());
+                state.pending_bytes += data.len();
+                false
+            };
+
+            if overflow {
+                let started = state.started;
+                state.input_eof = true;
                 if let Some(cancel) = state.cancel.take() {
                     cancel.send_replace(true);
                 }
                 state.data_tx = None;
                 state.signal_tx = None;
                 state.window_change_tx = None;
+                if !started {
+                    channels.remove(&channel);
+                }
+                true
+            } else {
+                false
             }
-            let _ = session.data(channel, "SSH input buffer exceeded\r\n");
+        };
+        if close_channel {
+            // russh has already accepted this SSH data packet. Never wait on
+            // an application queue and never silently discard it: report a
+            // protocol failure and close only the offending channel.
+            let _ = session.data(channel, "SSH input buffer exceeded or closed\r\n");
+            let _ = session.exit_status_request(channel, 1);
             let _ = session.eof(channel);
             let _ = session.close(channel);
         }
@@ -568,7 +652,7 @@ impl russh::server::Handler for SshHandler {
             width_pixels: pix_width,
             height_pixels: pix_height,
         };
-        if let Some(state) = self.channels.get_mut(&channel) {
+        if let Some(state) = self.channels.lock().unwrap().get_mut(&channel) {
             if let Some(pty) = state.pty.as_mut() {
                 pty.window = win.clone();
             }
@@ -588,8 +672,10 @@ impl russh::server::Handler for SshHandler {
         log::debug!("SSH signal: {signal:?}");
         if let Some(tx) = self
             .channels
+            .lock()
+            .unwrap()
             .get(&channel)
-            .and_then(|state| state.signal_tx.as_ref())
+            .and_then(|state| state.signal_tx.clone())
         {
             let _ = tx.try_send(signal);
         }
@@ -601,13 +687,12 @@ impl russh::server::Handler for SshHandler {
         channel: ChannelId,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        if let Some(state) = self.channels.get_mut(&channel) {
-            if let Some(cancel) = state.cancel.take() {
-                cancel.send_replace(true);
-            }
+        if let Some(state) = self.channels.lock().unwrap().get_mut(&channel) {
+            // SSH EOF is a half-close. Dropping only the input sender causes
+            // Session::read to drain every queued frame before yielding EOF;
+            // signals, window changes, output, and process lifetime continue.
+            state.input_eof = true;
             state.data_tx = None;
-            state.signal_tx = None;
-            state.window_change_tx = None;
         }
         Ok(())
     }
@@ -617,7 +702,7 @@ impl russh::server::Handler for SshHandler {
         channel: ChannelId,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        if let Some(mut state) = self.channels.remove(&channel) {
+        if let Some(mut state) = self.channels.lock().unwrap().remove(&channel) {
             if let Some(cancel) = state.cancel.take() {
                 cancel.send_replace(true);
             }
@@ -846,7 +931,10 @@ mod tests {
             handler.auth_none("alice").await.unwrap(),
             Auth::Accept
         ));
-        assert_eq!(handler.recording_config.unwrap().recorders, vec![recorder]);
+        assert_eq!(
+            handler.recording_config.as_ref().unwrap().recorders,
+            vec![recorder]
+        );
     }
 
     #[tokio::test]

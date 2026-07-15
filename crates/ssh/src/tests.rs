@@ -115,7 +115,7 @@ async fn run_pipeline_custom(
     policy: Arc<dyn Fn() -> Option<SSHPolicy> + Send + Sync>,
     injected: Option<(Arc<UserResolver>, Arc<dyn SessionLauncher>)>,
     mutate_session: Option<&dyn Fn(&mut crate::session::SessionInit)>,
-    client_eof_before_run: bool,
+    client_close_before_run: bool,
     request_pty: bool,
 ) -> (i32, Vec<u8>) {
     let host_key = host_key_from_node_key(&NodePrivate::generate());
@@ -179,8 +179,8 @@ async fn run_pipeline_custom(
         .exec(true, command.as_bytes())
         .await
         .expect("exec request");
-    if client_eof_before_run {
-        channel.eof().await.expect("channel eof");
+    if client_close_before_run {
+        channel.close().await.expect("channel close");
     }
 
     // Accept the session on the server side and run it.
@@ -192,9 +192,9 @@ async fn run_pipeline_custom(
     let result = if let Some((resolver, launcher)) = injected {
         run_session_with(session, None, resolver, launcher)
             .await
-            .expect("run_session_with")
+            .unwrap_or(1)
     } else {
-        run_session(session, None).await.expect("run_session")
+        run_session(session, None).await.unwrap_or(1)
     };
 
     // Wait for all output and the exit status on the client side. The server
@@ -211,6 +211,118 @@ async fn run_pipeline_custom(
     }
 
     (reported.unwrap_or(result), output)
+}
+
+#[tokio::test]
+async fn data_before_start_and_eof_are_drained_as_an_input_half_close() {
+    let host_key = host_key_from_node_key(&NodePrivate::generate());
+    let (session_tx, mut session_rx) = mpsc::channel::<crate::session::SessionInit>(4);
+    let config = SshServerConfig {
+        host_keys: vec![host_key],
+        session_tx,
+        whois: whois_finds_peer(),
+        policy: policy_allow_any(),
+        state_dir: None,
+        dial_fn: None,
+    };
+    let mut server = SshServer::new(config);
+    let server_config = server.russh_config();
+    let (client_io, server_io) = tokio::io::duplex(32 * 1024);
+    let handler = server.new_client(Some(SocketAddr::new(peer_ip(), 22)));
+    tokio::spawn(async move {
+        let running = russh::server::run_stream(server_config, server_io, handler)
+            .await
+            .unwrap();
+        let _ = running.await;
+    });
+    let mut client = russh::client::connect_stream(
+        Arc::new(russh::client::Config::default()),
+        client_io,
+        ClientHandler,
+    )
+    .await
+    .unwrap();
+    let requested_user = std::env::var("USER").unwrap_or_else(|_| "testuser".into());
+    assert!(client
+        .authenticate_password(&requested_user, "")
+        .await
+        .unwrap()
+        .success());
+
+    let mut channel = client.channel_open_session().await.unwrap();
+    channel.data_bytes(b"first-".as_slice()).await.unwrap();
+    channel.data_bytes(b"second".as_slice()).await.unwrap();
+    channel
+        .exec(true, b"cat; printf ':after-eof'")
+        .await
+        .unwrap();
+    channel.eof().await.unwrap();
+
+    let init = session_rx.recv().await.unwrap();
+    let result = run_session(Session::from_init(init), None).await.unwrap();
+    let mut output = Vec::new();
+    let mut exit = None;
+    while let Some(message) = channel.wait().await {
+        match message {
+            ChannelMsg::Data { data } => output.extend_from_slice(&data),
+            ChannelMsg::ExitStatus { exit_status } => exit = Some(exit_status as i32),
+            _ => {}
+        }
+    }
+    assert_eq!(exit.unwrap_or(result), 0);
+    assert_eq!(output, b"first-second:after-eof");
+}
+
+#[tokio::test]
+async fn dropping_unfinished_session_reports_failure_and_closes_channel() {
+    let host_key = host_key_from_node_key(&NodePrivate::generate());
+    let (session_tx, mut session_rx) = mpsc::channel::<crate::session::SessionInit>(2);
+    let config = SshServerConfig {
+        host_keys: vec![host_key],
+        session_tx,
+        whois: whois_finds_peer(),
+        policy: policy_allow_any(),
+        state_dir: None,
+        dial_fn: None,
+    };
+    let mut server = SshServer::new(config);
+    let server_config = server.russh_config();
+    let (client_io, server_io) = tokio::io::duplex(16 * 1024);
+    let handler = server.new_client(Some(SocketAddr::new(peer_ip(), 22)));
+    tokio::spawn(async move {
+        let running = russh::server::run_stream(server_config, server_io, handler)
+            .await
+            .unwrap();
+        let _ = running.await;
+    });
+    let mut client = russh::client::connect_stream(
+        Arc::new(russh::client::Config::default()),
+        client_io,
+        ClientHandler,
+    )
+    .await
+    .unwrap();
+    assert!(client
+        .authenticate_password("alice", "")
+        .await
+        .unwrap()
+        .success());
+    let mut channel = client.channel_open_session().await.unwrap();
+    channel.exec(true, b"ignored").await.unwrap();
+    drop(Session::from_init(session_rx.recv().await.unwrap()));
+
+    let exit = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        let mut exit = None;
+        while let Some(message) = channel.wait().await {
+            if let ChannelMsg::ExitStatus { exit_status } = message {
+                exit = Some(exit_status);
+            }
+        }
+        exit
+    })
+    .await
+    .expect("Session drop did not close the SSH channel");
+    assert_eq!(exit, Some(1));
 }
 
 #[tokio::test]
@@ -367,15 +479,22 @@ async fn stalled_stdin_overflow_does_not_block_other_multiplexed_channel_state()
 
     // Stop consuming channel one's stdin and overflow only its bounded queue.
     // The handler must close/cancel it without blocking callbacks for channel two.
-    for _ in 0..=64 {
-        if channel_one.data_bytes(b"stalled".as_slice()).await.is_err() {
-            break;
+    let saturate = async {
+        for _ in 0..128 {
+            if channel_one.data_bytes(b"stalled".as_slice()).await.is_err() {
+                break;
+            }
         }
-    }
-    tokio::time::timeout(std::time::Duration::from_secs(1), one.cancel_rx.changed())
-        .await
-        .expect("stalled channel overflow blocked cancellation")
-        .unwrap();
+    };
+    tokio::pin!(saturate);
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        tokio::select! {
+            changed = one.cancel_rx.changed() => changed.unwrap(),
+            () = &mut saturate => one.cancel_rx.changed().await.unwrap(),
+        }
+    })
+    .await
+    .expect("stalled channel overflow blocked cancellation");
     assert!(*one.cancel_rx.borrow());
     assert!(!*two.cancel_rx.borrow());
 
@@ -388,7 +507,7 @@ async fn stalled_stdin_overflow_does_not_block_other_multiplexed_channel_state()
     assert_eq!(two.data_rx.recv().await.unwrap(), b"still-responsive");
     assert!(matches!(two.signal_rx.recv().await, Some(russh::Sig::KILL)));
     assert_eq!(two.window_change_rx.recv().await.unwrap().width, 122);
-    channel_two.eof().await.unwrap();
+    channel_two.close().await.unwrap();
     two.cancel_rx.changed().await.unwrap();
     assert!(*two.cancel_rx.borrow());
 }
@@ -424,6 +543,18 @@ impl ProcessControl for NoopProcessControl {
     }
 }
 
+struct FailingLauncher;
+
+impl SessionLauncher for FailingLauncher {
+    fn launch(
+        &self,
+        _args: crate::incubator::IncubatorArgs,
+        _started: LaunchStarted,
+    ) -> Result<LaunchedSession, SessionHandlerError> {
+        Err(io::Error::other("injected launcher failure").into())
+    }
+}
+
 #[derive(Default)]
 struct CapturingLauncher {
     args: Mutex<Vec<crate::incubator::IncubatorArgs>>,
@@ -446,6 +577,130 @@ impl SessionLauncher for CapturingLauncher {
             control,
         })
     }
+}
+
+fn mapped_test_user() -> LocalUser {
+    LocalUser {
+        uid: 1000,
+        gid: 1000,
+        gids: vec![1000],
+        name: "mapped".into(),
+        home_dir: "/tmp".into(),
+        shell: "/bin/sh".into(),
+    }
+}
+
+fn mapped_test_resolver() -> Arc<UserResolver> {
+    Arc::new(|_name: String| Ok(mapped_test_user()))
+}
+
+#[tokio::test]
+async fn injected_prelaunch_failures_report_nonzero_and_close_channels() {
+    let user_error: Arc<UserResolver> = Arc::new(|_name: String| {
+        Err(SessionHandlerError::LocalUser(
+            "injected user lookup failure".into(),
+        ))
+    });
+    let (code, _) = run_pipeline_custom(
+        "ignored",
+        "requested",
+        policy_map_any("mapped"),
+        Some((user_error, Arc::new(CapturingLauncher::default()))),
+        None,
+        false,
+        false,
+    )
+    .await;
+    assert_eq!(code, 1);
+
+    let pty_failure = |init: &mut crate::session::SessionInit| {
+        init.fail_pty_setup = true;
+    };
+    let launcher = Arc::new(CapturingLauncher::default());
+    let (code, _) = run_pipeline_custom(
+        "ignored",
+        "requested",
+        policy_map_any("mapped"),
+        Some((mapped_test_resolver(), launcher.clone())),
+        Some(&pty_failure),
+        false,
+        true,
+    )
+    .await;
+    assert_eq!(code, 1);
+    assert!(launcher.args.lock().unwrap().is_empty());
+
+    let (code, _) = run_pipeline_custom(
+        "ignored",
+        "requested",
+        policy_map_any("mapped"),
+        Some((mapped_test_resolver(), Arc::new(FailingLauncher))),
+        None,
+        false,
+        false,
+    )
+    .await;
+    assert_eq!(code, 1);
+
+    let recorder_failure = |init: &mut crate::session::SessionInit| {
+        init.recording_config = Some(crate::RecordingConfig {
+            recorders: vec!["100.64.0.9:80".parse().unwrap()],
+            fail_open: false,
+            on_failure: Some(rustscale_tailcfg::SSHRecorderFailureAction {
+                RejectSessionWithMessage: "recording unavailable".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        init.recording_header = Some(crate::CastHeader::new(
+            (0, 0),
+            "ignored".into(),
+            std::collections::HashMap::new(),
+            "requested".into(),
+            "mapped".into(),
+            "connection".into(),
+        ));
+        init.recording_dial = Some(Arc::new(|_| {
+            Box::pin(async { Err(io::Error::other("injected recorder failure")) })
+        }));
+    };
+    let (code, output) = run_pipeline_custom(
+        "ignored",
+        "requested",
+        policy_map_any("mapped"),
+        Some((
+            mapped_test_resolver(),
+            Arc::new(CapturingLauncher::default()),
+        )),
+        Some(&recorder_failure),
+        false,
+        false,
+    )
+    .await;
+    assert_eq!(code, 1);
+    assert!(String::from_utf8_lossy(&output).contains("recording unavailable"));
+}
+
+#[tokio::test]
+async fn blocker_timeout_reports_nonzero_and_closes_channel() {
+    let resolver: Arc<UserResolver> = Arc::new(|_name: String| {
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        Ok(mapped_test_user())
+    });
+    let launcher = Arc::new(CapturingLauncher::default());
+    let (code, output) = run_pipeline_custom(
+        "ignored",
+        "requested",
+        policy_map_any("mapped"),
+        Some((resolver, launcher.clone())),
+        None,
+        false,
+        false,
+    )
+    .await;
+    assert_eq!(code, 1);
+    assert!(String::from_utf8_lossy(&output).contains("initialization timed out"));
+    assert!(launcher.args.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -1303,7 +1558,7 @@ async fn duration_cancels_hung_recorder_initialization_before_launch() {
 }
 
 #[tokio::test]
-async fn client_eof_cancels_hung_recorder_initialization_before_launch() {
+async fn client_close_cancels_hung_recorder_initialization_before_launch() {
     let launcher = Arc::new(CapturingLauncher::default());
     let resolver: Arc<UserResolver> = Arc::new(|_name: String| {
         Ok(LocalUser {
@@ -1512,7 +1767,7 @@ async fn live_policy_revocation_terminates_existing_session() {
 }
 
 #[tokio::test]
-async fn client_eof_closes_stdin_and_cleans_up_term_ignoring_process() {
+async fn client_close_cleans_up_term_ignoring_process() {
     let launcher = Arc::new(TermIgnoringLauncher::new(Vec::new()));
     let resolver: Arc<UserResolver> = Arc::new(|_name: String| {
         Ok(LocalUser {

@@ -79,7 +79,7 @@ pub(crate) async fn resolve_addr_with(
 
 /// Resolve an exit-node identifier (tailnet IP or MagicDNS hostname) to the
 /// peer's node key, verifying that the peer is exit-node-capable (its
-/// `AllowedIPs` contain `0.0.0.0/0`).
+/// `AllowedIPs` contain both normalized IPv4 and IPv6 defaults).
 ///
 /// `ip_or_name` may be:
 /// - A tailnet IP (e.g. `"100.64.0.5"`) — matched against peer `Addresses`.

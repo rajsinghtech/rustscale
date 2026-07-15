@@ -586,25 +586,25 @@ async fn handle_reload_config<W: AsyncWrite + Unpin>(
     write_json_response(conn, 200, "OK", &updated).await?;
     Ok(())
 }
-/// or stable node ID. Returns the peer's NodePublic key on success.
+
+/// Resolve an exit node by address, hostname, or stable node ID.
+///
+/// Only peers satisfying [`crate::peer_is_exit_capable`] are selectable.
 /// Mirrors Go's `resolveExitNodeIPLocked` / `peerWithStableID` lookup.
 pub(crate) fn resolve_exit_node_peer(peers: &[Node], ip_or_name: &str) -> Option<NodePublic> {
     // Try parsing as an IP address first.
     if let Ok(ip) = ip_or_name.parse::<IpAddr>() {
         for peer in peers {
+            if peer.Key.is_zero() || !crate::peer_is_exit_capable(peer) {
+                continue;
+            }
             for addr in &peer.Addresses {
                 if let Some(peer_ip_str) = addr.split('/').next() {
-                    if let Ok(peer_ip) = peer_ip_str.parse::<IpAddr>() {
-                        if peer_ip == ip {
-                            // Verify the peer is exit-node-capable.
-                            if peer
-                                .AllowedIPs
-                                .iter()
-                                .any(|r| r == "0.0.0.0/0" || r == "::/0")
-                            {
-                                return Some(peer.Key.clone());
-                            }
-                        }
+                    if peer_ip_str
+                        .parse::<IpAddr>()
+                        .is_ok_and(|peer_ip| peer_ip == ip)
+                    {
+                        return Some(peer.Key.clone());
                     }
                 }
             }
@@ -616,24 +616,14 @@ pub(crate) fn resolve_exit_node_peer(peers: &[Node], ip_or_name: &str) -> Option
     let name_lc = ip_or_name.trim_end_matches('.').to_lowercase();
     for peer in peers {
         let peer_name = peer.Name.trim_end_matches('.').to_lowercase();
-        if peer_name == name_lc
-            && peer
-                .AllowedIPs
-                .iter()
-                .any(|r| r == "0.0.0.0/0" || r == "::/0")
-        {
+        if !peer.Key.is_zero() && peer_name == name_lc && crate::peer_is_exit_capable(peer) {
             return Some(peer.Key.clone());
         }
     }
 
     // Try matching by StableID.
     for peer in peers {
-        if peer.StableID == ip_or_name
-            && peer
-                .AllowedIPs
-                .iter()
-                .any(|r| r == "0.0.0.0/0" || r == "::/0")
-        {
+        if !peer.Key.is_zero() && peer.StableID == ip_or_name && crate::peer_is_exit_capable(peer) {
             return Some(peer.Key.clone());
         }
     }
@@ -1348,10 +1338,7 @@ async fn build_status_json(state: &LocalApiState) -> serde_json::Value {
             _ => String::new(),
         };
 
-        let exit_node_option = peer
-            .AllowedIPs
-            .iter()
-            .any(|r| r == "0.0.0.0/0" || r == "::/0");
+        let exit_node_option = crate::peer_is_exit_capable(peer);
 
         let ps = PeerStatus {
             HostName: peer.Name.trim_end_matches('.').to_string(),
@@ -1373,6 +1360,14 @@ async fn build_status_json(state: &LocalApiState) -> serde_json::Value {
     for (id, profile) in user_profiles.iter() {
         sb.add_user(*id, profile.clone());
     }
+
+    let exit_node_status = if let Some(routes) = state.route_table.as_ref() {
+        let routes = routes.read().await;
+        crate::status::selected_exit_node_status(&peers, routes.exit_node())
+    } else {
+        None
+    };
+    sb.mutate_status(|status| status.ExitNodeStatus = exit_node_status);
 
     serde_json::to_value(sb.status()).unwrap_or(serde_json::Value::Null)
 }
@@ -4041,6 +4036,34 @@ mod tests {
         assert!(json["Peer"].is_object());
         assert!(json["Health"].is_array());
         assert!(json["CurrentTailnet"].is_object());
+    }
+
+    #[tokio::test]
+    async fn test_status_json_tracks_selected_exit_node() {
+        let mut state = make_test_state().await;
+        let exit_key = state.peers.read().await[0].Key.clone();
+
+        let json = build_status_json(&state).await;
+        assert!(json.get("ExitNodeStatus").is_none());
+
+        let mut routes = crate::RouteTable::default();
+        routes.set_exit_node(exit_key.clone());
+        let routes = Arc::new(RwLock::new(routes));
+        Arc::get_mut(&mut state)
+            .expect("test owns state")
+            .route_table = Some(routes.clone());
+
+        let json = build_status_json(&state).await;
+        assert_eq!(json["ExitNodeStatus"]["ID"], exit_key.to_string());
+        assert_eq!(json["ExitNodeStatus"]["Online"], true);
+        assert_eq!(
+            json["ExitNodeStatus"]["TailscaleIPs"],
+            serde_json::json!(["100.64.0.2"])
+        );
+
+        routes.write().await.clear_exit_node();
+        let json = build_status_json(&state).await;
+        assert!(json.get("ExitNodeStatus").is_none());
     }
 
     // --- watch-ipn-bus tests ---

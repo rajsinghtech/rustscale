@@ -9,7 +9,13 @@
 
 mod stride_table;
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::{
+    cmp::Ordering,
+    collections::BTreeMap,
+    fmt,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    str::FromStr,
+};
 
 use stride_table::RouteId;
 
@@ -63,6 +69,12 @@ impl IpPrefix {
         Self::from_octets(octets, self.is_ipv6(), self.bits)
     }
 
+    /// Parses an `address/bits` CIDR prefix.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        value.parse().ok()
+    }
+
     /// Reports whether this prefix contains `addr`.
     #[must_use]
     pub fn contains(self, addr: IpAddr) -> bool {
@@ -106,6 +118,50 @@ impl IpPrefix {
     }
 }
 
+impl Ord for IpPrefix {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.is_ipv6()
+            .cmp(&other.is_ipv6())
+            .then_with(|| self.octets().cmp(&other.octets()))
+            .then_with(|| self.bits.cmp(&other.bits))
+    }
+}
+
+impl PartialOrd for IpPrefix {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl fmt::Display for IpPrefix {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}/{}", self.addr, self.bits)
+    }
+}
+
+/// Error returned when parsing an [`IpPrefix`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParsePrefixError;
+
+impl fmt::Display for ParsePrefixError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("invalid IP prefix")
+    }
+}
+
+impl std::error::Error for ParsePrefixError {}
+
+impl FromStr for IpPrefix {
+    type Err = ParsePrefixError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (addr, bits) = value.split_once('/').ok_or(ParsePrefixError)?;
+        let addr = addr.parse().map_err(|_| ParsePrefixError)?;
+        let bits = bits.parse().map_err(|_| ParsePrefixError)?;
+        Self::new(addr, bits).ok_or(ParsePrefixError)
+    }
+}
+
 /// Compatibility alias for [`IpPrefix`].
 pub type Prefix = IpPrefix;
 
@@ -114,7 +170,21 @@ pub type Prefix = IpPrefix;
 pub struct Table<V> {
     v4: StrideTable<V>,
     v6: StrideTable<V>,
-    values: Vec<Option<Box<V>>>,
+    routes: BTreeMap<IpPrefix, RouteId>,
+    values: Vec<Option<V>>,
+    free_values: Vec<RouteId>,
+}
+
+impl<V: Clone> Clone for Table<V> {
+    fn clone(&self) -> Self {
+        Self {
+            v4: self.v4.clone(),
+            v6: self.v6.clone(),
+            routes: self.routes.clone(),
+            values: self.values.clone(),
+            free_values: self.free_values.clone(),
+        }
+    }
 }
 
 impl<V> Default for Table<V> {
@@ -134,24 +204,32 @@ impl<V> Table<V> {
             v6: StrideTable::new(
                 IpPrefix::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0).expect("valid IPv6 default"),
             ),
+            routes: BTreeMap::new(),
             values: Vec::new(),
+            free_values: Vec::new(),
         }
     }
 
-    /// Inserts `prefix -> value`, replacing the value of an existing prefix.
+    /// Inserts `prefix -> value`, returning the previous value when replacing
+    /// an existing prefix.
     ///
-    /// Host bits in `prefix` are ignored.
-    pub fn insert(&mut self, prefix: IpPrefix, value: V) {
+    /// Host bits in `prefix` are ignored. Replacement reuses the existing
+    /// route slot, so repeated updates cannot grow the table's backing storage.
+    pub fn insert(&mut self, prefix: IpPrefix, value: V) -> Option<V> {
         let prefix = prefix.masked();
+        if let Some(route) = self.routes.get(&prefix).copied() {
+            return self.values[route].replace(value);
+        }
+
         let route = self.allocate(value);
         let replaced = if prefix.is_ipv6() {
             Self::insert_into(&mut self.v6, prefix, route)
         } else {
             Self::insert_into(&mut self.v4, prefix, route)
         };
-        if let Some(route) = replaced {
-            self.values[route] = None;
-        }
+        assert!(replaced.is_none(), "ART route metadata is out of sync");
+        self.routes.insert(prefix, route);
+        None
     }
 
     /// Returns the value associated with the most-specific prefix containing
@@ -161,12 +239,14 @@ impl<V> Table<V> {
         let root = if addr.is_ipv6() { &self.v6 } else { &self.v4 };
         let mut stride = root;
         let mut byte_index = 0;
-        let mut matches = Vec::with_capacity(16);
+        let mut matches = [None; 16];
+        let mut match_count = 0;
 
         loop {
             let (route, child) = stride.get_val_and_child(addr_byte_at(addr, byte_index));
             if let Some(route) = route {
-                matches.push((stride.prefix, route));
+                matches[match_count] = Some((stride.prefix, route));
+                match_count += 1;
             }
             let Some(child) = child else {
                 break;
@@ -175,11 +255,11 @@ impl<V> Table<V> {
             byte_index = usize::from(stride.prefix.bits() / 8);
         }
 
-        matches.into_iter().rev().find_map(|(prefix, route)| {
-            prefix
-                .contains(addr)
-                .then(|| self.values[route].as_deref().expect("live route entry"))
-        })
+        matches[..match_count]
+            .iter()
+            .rev()
+            .flatten()
+            .find_map(|&(prefix, route)| prefix.contains(addr).then(|| self.value(route)))
     }
 
     /// Alias for [`Self::get`].
@@ -188,17 +268,62 @@ impl<V> Table<V> {
         self.get(addr)
     }
 
-    /// Removes `prefix`, if it exists. Host bits in `prefix` are ignored.
-    pub fn delete(&mut self, prefix: IpPrefix) {
+    /// Returns the value for exactly `prefix`, without longest-prefix matching.
+    /// Host bits in `prefix` are ignored.
+    #[must_use]
+    pub fn get_prefix(&self, prefix: IpPrefix) -> Option<&V> {
+        self.routes
+            .get(&prefix.masked())
+            .copied()
+            .map(|route| self.value(route))
+    }
+
+    /// Removes exactly `prefix` and returns its value, if present. Host bits in
+    /// `prefix` are ignored.
+    pub fn delete(&mut self, prefix: IpPrefix) -> Option<V> {
         let prefix = prefix.masked();
+        let expected = self.routes.remove(&prefix)?;
         let removed = if prefix.is_ipv6() {
             Self::delete_from(&mut self.v6, prefix)
         } else {
             Self::delete_from(&mut self.v4, prefix)
         };
-        if let Some(route) = removed {
-            self.values[route] = None;
-        }
+        assert_eq!(removed, Some(expected), "ART route metadata is out of sync");
+        Some(self.release(expected))
+    }
+
+    /// Returns all prefix-value pairs in canonical CIDR order: IPv4 before
+    /// IPv6, then network address, then prefix length. Prefixes are normalized.
+    pub fn iter(&self) -> impl Iterator<Item = (IpPrefix, &V)> {
+        self.routes
+            .iter()
+            .map(|(&prefix, &route)| (prefix, self.value(route)))
+    }
+
+    /// Returns an independent snapshot of this table.
+    #[must_use]
+    pub fn snapshot(&self) -> Self
+    where
+        V: Clone,
+    {
+        self.clone()
+    }
+
+    /// Removes all routes and releases all route and stride storage.
+    pub fn clear(&mut self) {
+        *self = Self::new();
+    }
+
+    /// Returns the number of installed prefixes.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.routes.len()
+    }
+
+    /// Reports whether no prefixes are installed.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.routes.is_empty()
     }
 
     /// Returns the number of allocated stride tables across both families.
@@ -208,8 +333,24 @@ impl<V> Table<V> {
     }
 
     fn allocate(&mut self, value: V) -> RouteId {
-        self.values.push(Some(Box::new(value)));
-        self.values.len() - 1
+        if let Some(route) = self.free_values.pop() {
+            debug_assert!(self.values[route].is_none());
+            self.values[route] = Some(value);
+            route
+        } else {
+            self.values.push(Some(value));
+            self.values.len() - 1
+        }
+    }
+
+    fn release(&mut self, route: RouteId) -> V {
+        let value = self.values[route].take().expect("live route entry");
+        self.free_values.push(route);
+        value
+    }
+
+    fn value(&self, route: RouteId) -> &V {
+        self.values[route].as_ref().expect("live route entry")
     }
 
     fn insert_into(
@@ -289,7 +430,7 @@ impl<V> Table<V> {
             let child = current.children[usize::from(addr)].as_deref_mut()?;
             path.push(addr);
             byte_index = child.prefix.bits() / 8;
-            bits_remaining = prefix.bits() - child.prefix.bits();
+            bits_remaining = prefix.bits().checked_sub(child.prefix.bits())?;
             current = child;
         }
 
@@ -344,7 +485,7 @@ fn addr_byte_at(addr: IpAddr, index: usize) -> u8 {
 }
 
 fn prefix_at_byte_boundary(prefix: IpPrefix, bits: u8) -> IpPrefix {
-    IpPrefix::from_octets(prefix.masked().octets(), prefix.is_ipv6(), bits)
+    IpPrefix::from_octets(prefix.masked().octets(), prefix.is_ipv6(), bits).masked()
 }
 
 fn prefix_strictly_contains(parent: IpPrefix, child: IpPrefix) -> bool {
@@ -352,11 +493,13 @@ fn prefix_strictly_contains(parent: IpPrefix, child: IpPrefix) -> bool {
 }
 
 fn compute_prefix_split(a: IpPrefix, b: IpPrefix) -> (IpPrefix, u8, u8) {
+    let a = a.masked();
+    let b = b.masked();
     debug_assert_ne!(a.bits(), 0);
     debug_assert_ne!(b.bits(), 0);
     debug_assert_eq!(a.is_ipv6(), b.is_ipv6());
     let min_bits = a.bits().min(b.bits());
-    let mut shared = common_bits(a.masked(), b.masked(), min_bits);
+    let mut shared = common_bits(a, b, min_bits);
     if shared == min_bits {
         shared -= 1;
     }

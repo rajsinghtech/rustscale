@@ -847,7 +847,7 @@ fn exit_peer(name: &str, ip: &str, key: NodePublic) -> Node {
         Name: name.to_string(),
         Key: key,
         Addresses: vec![format!("{ip}/32")],
-        AllowedIPs: vec![format!("{ip}/32"), "0.0.0.0/0".into()],
+        AllowedIPs: vec![format!("{ip}/32"), "0.0.0.0/0".into(), "::/0".into()],
         ..Default::default()
     }
 }
@@ -2187,15 +2187,15 @@ async fn e2e_exit_node() {
         let st = server_a.status();
         if st.peers.iter().any(|p| p.ips.contains(&ip_b)) {
             // Peer is visible — try selecting B as exit node. If B's
-            // AllowedIPs don't yet contain 0.0.0.0/0, set_exit_node returns
-            // NotExitCapable and we wait for the next map update.
+            // AllowedIPs don't yet contain both default routes, so
+            // set_exit_node returns NotExitCapable until a map update does.
             match server_a.set_exit_node(&ip_b.to_string()).await {
                 Ok(()) => {
                     log::debug!("A selected B as exit node");
                     break;
                 }
                 Err(TsnetError::NotExitCapable(_)) => {
-                    // B's AllowedIPs don't yet contain 0.0.0.0/0 — wait.
+                    // B's AllowedIPs don't yet contain both defaults — wait.
                 }
                 Err(e) => panic!("set_exit_node failed unexpectedly: {e}"),
             }

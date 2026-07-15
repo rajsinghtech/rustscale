@@ -3854,6 +3854,7 @@ dependencies = [
  "russh",
  "rustls",
  "rustscale-appc",
+ "rustscale-art",
  "rustscale-auditlog",
  "rustscale-bakedroots",
  "rustscale-c2n",

@@ -8,6 +8,7 @@
 
 use std::net::{IpAddr, ToSocketAddrs};
 
+use rustscale_art::{IpPrefix as ArtPrefix, Table as ArtTable};
 use rustscale_key::NodePublic;
 use rustscale_tailcfg::Node;
 
@@ -51,8 +52,7 @@ fn control_server_host(control_url: &str) -> Option<&str> {
 /// One route entry: a CIDR network owned by a peer.
 #[derive(Clone)]
 struct RouteEntry {
-    net: IpAddr,
-    prefix: u8,
+    prefix: ArtPrefix,
     peer: NodePublic,
 }
 
@@ -65,6 +65,7 @@ struct RouteEntry {
 #[derive(Clone, Default)]
 pub struct RouteTable {
     entries: Vec<RouteEntry>,
+    index: ArtTable<NodePublic>,
     accept_routes: bool,
     /// The selected exit node peer, if any. Acts as a catch-all fallback for
     /// destinations not matched by a more-specific entry. Independent of
@@ -76,49 +77,50 @@ pub struct RouteTable {
 impl RouteTable {
     /// Build a table from a peer list. Each peer's `AllowedIPs` are used, or
     /// `Addresses` as a fallback when `AllowedIPs` is empty. Peers with a zero
-    /// node key are skipped. All prefixes are installed (equivalent to
-    /// `accept_routes = true`).
+    /// node key are skipped. All non-default prefixes are installed
+    /// (equivalent to `accept_routes = true`); advertised defaults require an
+    /// explicit exit-node selection.
     pub fn from_peers(peers: &[Node]) -> Self {
         Self::from_peers_with_opts(peers, true)
     }
 
     /// Build a table from a peer list with an `accept_routes` flag.
     ///
-    /// When `accept_routes` is true, every `AllowedIPs`/`Addresses` prefix is
-    /// installed (tailnet IPs + peer-advertised subnet routes). When false,
-    /// only prefixes within the tailnet ranges (100.64.0.0/10 for IPv4,
-    /// fd7a:115c:a1e0::/48 for IPv6) are installed — peer subnet routes are
-    /// ignored, matching Go's `--accept-routes=false` behavior.
+    /// When `accept_routes` is true, host and non-default subnet prefixes are
+    /// installed. When false, only IPv4 `/32` and IPv6 `/128` host prefixes
+    /// are installed. Peer-advertised default routes are never ordinary table
+    /// entries; defaults are enabled only by [`Self::set_exit_node`].
     pub fn from_peers_with_opts(peers: &[Node], accept_routes: bool) -> Self {
         let mut entries = Vec::new();
+        let mut index = ArtTable::new();
         for peer in peers {
             if peer.Key.is_zero() {
                 continue;
             }
-            let cidrs: &[String] = if peer.AllowedIPs.is_empty() {
-                &peer.Addresses
-            } else {
-                &peer.AllowedIPs
-            };
-            for cidr in cidrs {
-                let Some((net, prefix)) = parse_cidr(cidr) else {
+            for cidr in peer_routes(peer) {
+                let Some(prefix) = parse_cidr(cidr) else {
                     continue;
                 };
-                if !accept_routes && !rustscale_tsaddr::is_tailscale_ip(net) {
+                if prefix.bits() == 0
+                    || (!accept_routes && !is_host_prefix(prefix))
+                    || index.get_prefix(prefix).is_some()
+                {
                     continue;
                 }
+                let _ = index.insert(prefix, peer.Key.clone());
                 entries.push(RouteEntry {
-                    net,
                     prefix,
                     peer: peer.Key.clone(),
                 });
             }
         }
-        // Sort by prefix descending so the first match in `lookup` is the
-        // longest prefix (avoids a max-scan each call).
-        entries.sort_by_key(|e| std::cmp::Reverse(e.prefix));
+        // Keep the diagnostic/OS-routing view longest-prefix first. Equal
+        // normalized prefixes were already deduplicated while walking peers,
+        // so every view retains the first owner in netmap order.
+        entries.sort_by_key(|entry| std::cmp::Reverse(entry.prefix.bits()));
         Self {
             entries,
+            index,
             accept_routes,
             exit_node: None,
         }
@@ -132,15 +134,10 @@ impl RouteTable {
     /// IPs and accepted subnet routes (more specific than `0.0.0.0/0`) always
     /// win over the exit fallback.
     pub fn lookup(&self, ip: IpAddr) -> Option<NodePublic> {
-        // Entries are sorted by descending prefix, so the first containing
-        // entry is the longest-prefix match.
-        for entry in &self.entries {
-            if cidr_match(ip, entry.net, entry.prefix) {
-                return Some(entry.peer.clone());
-            }
-        }
-        // Fall back to the exit node default route.
-        self.exit_node.clone()
+        self.index
+            .get(ip)
+            .cloned()
+            .or_else(|| self.exit_node.clone())
     }
 
     /// Rebuild the table from a new peer list (e.g. on a map-stream delta).
@@ -161,7 +158,7 @@ impl RouteTable {
         self.exit_node = exit;
     }
 
-    /// Number of route entries (for diagnostics/testing).
+    /// Number of distinct normalized route entries (for diagnostics/testing).
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -171,10 +168,13 @@ impl RouteTable {
         self.entries.is_empty() && self.exit_node.is_none()
     }
 
-    /// Iterate over all route entries as `(network_ip, prefix, peer_key)`. Used
-    /// by TUN mode to install accepted subnet routes as OS routes.
+    /// Iterate over distinct normalized routes as `(network_ip, prefix,
+    /// peer_key)`. Used by TUN mode to install accepted subnet routes as OS
+    /// routes.
     pub fn entries(&self) -> impl Iterator<Item = (IpAddr, u8, &NodePublic)> {
-        self.entries.iter().map(|e| (e.net, e.prefix, &e.peer))
+        self.entries
+            .iter()
+            .map(|entry| (entry.prefix.addr(), entry.prefix.bits(), &entry.peer))
     }
 
     /// Whether `accept_routes` is enabled for this table.
@@ -202,67 +202,43 @@ impl RouteTable {
     }
 }
 
-/// Parse a `"ip/prefix"` CIDR string into its network address and prefix len.
-fn parse_cidr(cidr: &str) -> Option<(IpAddr, u8)> {
-    let (net_str, prefix_str) = cidr.split_once('/')?;
-    let net: IpAddr = net_str.parse().ok()?;
-    let prefix: u8 = prefix_str.parse().ok()?;
-    let max = match net {
-        IpAddr::V4(_) => 32,
-        IpAddr::V6(_) => 128,
-    };
-    if prefix > max {
-        return None;
-    }
-    Some((net, prefix))
-}
-
-/// Whether `ip` falls within `net`/`prefix`. Only matches within the same
-/// address family.
-fn cidr_match(ip: IpAddr, net: IpAddr, prefix: u8) -> bool {
-    match (ip, net) {
-        (IpAddr::V4(ip), IpAddr::V4(net)) => {
-            if prefix > 32 {
-                return false;
-            }
-            let mask = if prefix == 0 {
-                0u32
-            } else {
-                u32::MAX << (32 - prefix)
-            };
-            (u32::from(ip) & mask) == (u32::from(net) & mask)
-        }
-        (IpAddr::V6(ip), IpAddr::V6(net)) => {
-            if prefix > 128 {
-                return false;
-            }
-            let mask = if prefix == 0 {
-                0u128
-            } else {
-                u128::MAX << (128 - prefix)
-            };
-            (u128::from(ip) & mask) == (u128::from(net) & mask)
-        }
-        _ => false,
-    }
-}
-
-/// Whether a peer is exit-node-capable: its `AllowedIPs` (or `Addresses` as a
-/// fallback) contain `0.0.0.0/0`. Mirrors Go's `tsaddr.ContainsExitRoutes`.
-/// A peer advertises exit-node capability by adding `0.0.0.0/0` (and `::/0`)
-/// to its `Hostinfo.RoutableIPs`; once approved by the tailnet admin, control
-/// includes those prefixes in the peer's `AllowedIPs` seen by other nodes.
-pub fn peer_is_exit_capable(peer: &Node) -> bool {
-    let cidrs: &[String] = if peer.AllowedIPs.is_empty() {
+fn peer_routes(peer: &Node) -> &[String] {
+    if peer.AllowedIPs.is_empty() {
         &peer.Addresses
     } else {
         &peer.AllowedIPs
-    };
-    cidrs.iter().any(|c| {
-        parse_cidr(c).is_some_and(
-            |(net, prefix)| matches!(net, IpAddr::V4(v4) if v4.is_unspecified() && prefix == 0),
-        )
-    })
+    }
+}
+
+/// Parse and normalize an `"ip/prefix"` CIDR string.
+fn parse_cidr(cidr: &str) -> Option<ArtPrefix> {
+    ArtPrefix::parse(cidr).map(ArtPrefix::masked)
+}
+
+fn is_host_prefix(prefix: ArtPrefix) -> bool {
+    prefix.bits() == if prefix.addr().is_ipv4() { 32 } else { 128 }
+}
+
+/// Whether a peer advertises both normalized IPv4 and IPv6 default routes.
+///
+/// The same exact predicate is used by all exit-node selection paths. A
+/// single-family default is insufficient. `AllowedIPs` is authoritative when
+/// present; `Addresses` is used only as the existing empty-`AllowedIPs`
+/// fallback.
+pub fn peer_is_exit_capable(peer: &Node) -> bool {
+    let mut has_v4_default = false;
+    let mut has_v6_default = false;
+    for prefix in peer_routes(peer).iter().filter_map(|cidr| parse_cidr(cidr)) {
+        if prefix.bits() != 0 {
+            continue;
+        }
+        if prefix.addr().is_ipv4() {
+            has_v4_default = true;
+        } else {
+            has_v6_default = true;
+        }
+    }
+    has_v4_default && has_v6_default
 }
 
 #[cfg(test)]
@@ -341,11 +317,35 @@ mod tests {
     }
 
     #[test]
-    fn default_route_matches_everything() {
-        let peers = vec![peer("a", &["0.0.0.0/0"])];
+    fn equal_normalized_prefix_is_deduplicated_across_views() {
+        let first = NodePrivate::generate().public();
+        let second = NodePrivate::generate().public();
+        let peers = vec![
+            peer_with_key(&["192.0.2.99/24"], first.clone()),
+            peer_with_key(&["192.0.2.0/24"], second),
+        ];
         let rt = RouteTable::from_peers(&peers);
-        assert!(rt.lookup(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))).is_some());
+        assert_eq!(
+            rt.lookup(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))),
+            Some(first.clone())
+        );
         assert_eq!(rt.len(), 1);
+        let entries: Vec<_> = rt.entries().collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0],
+            (IpAddr::V4(Ipv4Addr::new(192, 0, 2, 0)), 24, &first)
+        );
+    }
+
+    #[test]
+    fn advertised_defaults_are_not_ordinary_routes() {
+        let peers = vec![peer("a", &["192.0.2.99/0", "2001:db8::1/0"])];
+        let rt = RouteTable::from_peers(&peers);
+        assert!(rt.lookup("8.8.8.8".parse().unwrap()).is_none());
+        assert!(rt.lookup("2001:4860:4860::8888".parse().unwrap()).is_none());
+        assert_eq!(rt.len(), 0);
+        assert_eq!(rt.entries().count(), 0);
     }
 
     #[test]
@@ -422,7 +422,7 @@ mod tests {
     }
 
     #[test]
-    fn accept_routes_false_ignores_subnet_routes() {
+    fn accept_routes_false_keeps_only_host_prefixes() {
         let key = NodePrivate::generate().public();
         let node = Node {
             ID: 1,
@@ -430,19 +430,26 @@ mod tests {
             Key: key.clone(),
             AllowedIPs: vec![
                 "100.64.0.5/32".into(),
-                "192.0.2.0/24".into(),
                 "fd7a:115c:a1e0::5/128".into(),
+                // The supplied addresses are Tailscale IPs, but filtering is
+                // based on the normalized prefix length, not the host bits.
+                "100.64.99.99/10".into(),
+                "fd7a:115c:a1e0:abcd::5/48".into(),
+                "192.0.2.9/24".into(),
             ],
             ..Default::default()
         };
-        // accept_routes=false: only the tailnet /32 and /128 are installed.
         let rt = RouteTable::from_peers_with_opts(&[node], false);
         assert_eq!(rt.len(), 2);
-        assert_eq!(
-            rt.lookup(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 5))),
-            Some(key.clone())
-        );
-        assert!(rt.lookup(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))).is_none());
+        assert_eq!(rt.lookup("100.64.0.5".parse().unwrap()), Some(key.clone()));
+        assert_eq!(rt.lookup("fd7a:115c:a1e0::5".parse().unwrap()), Some(key));
+        assert!(rt.lookup("100.64.0.6".parse().unwrap()).is_none());
+        assert!(rt.lookup("fd7a:115c:a1e0::6".parse().unwrap()).is_none());
+        assert!(rt.lookup("192.0.2.9".parse().unwrap()).is_none());
+        assert!(rt.entries().all(|(net, bits, _)| matches!(
+            (net, bits),
+            (IpAddr::V4(_), 32) | (IpAddr::V6(_), 128)
+        )));
     }
 
     #[test]
@@ -452,16 +459,27 @@ mod tests {
             ID: 1,
             Name: "router".into(),
             Key: key.clone(),
-            AllowedIPs: vec!["100.64.0.5/32".into(), "192.0.2.0/24".into()],
+            AllowedIPs: vec![
+                "100.64.0.5/32".into(),
+                "192.0.2.99/24".into(),
+                "0.0.0.0/0".into(),
+                "::/0".into(),
+            ],
             ..Default::default()
         };
         let rt = RouteTable::from_peers_with_opts(&[node], true);
         assert_eq!(rt.len(), 2);
-        // Subnet route is now reachable.
+        // The normalized subnet route is reachable, but advertised defaults
+        // remain inactive until the peer is explicitly selected.
         assert_eq!(
             rt.lookup(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 42))),
             Some(key)
         );
+        assert!(rt.lookup("8.8.8.8".parse().unwrap()).is_none());
+        assert!(rt.lookup("2001:4860:4860::8888".parse().unwrap()).is_none());
+        assert!(rt
+            .entries()
+            .any(|(net, bits, _)| net == IpAddr::V4(Ipv4Addr::new(192, 0, 2, 0)) && bits == 24));
     }
 
     #[test]
@@ -544,7 +562,7 @@ mod tests {
                 Name: "exit".into(),
                 Key: exit_key.clone(),
                 Addresses: vec!["100.64.0.1/32".into()],
-                AllowedIPs: vec!["100.64.0.1/32".into(), "0.0.0.0/0".into()],
+                AllowedIPs: vec!["100.64.0.1/32".into(), "0.0.0.0/0".into(), "::/0".into()],
                 ..Default::default()
             },
             Node {
@@ -556,16 +574,19 @@ mod tests {
                 ..Default::default()
             },
         ];
-        // accept_routes=false: 0.0.0.0/0 is NOT installed from AllowedIPs.
         let mut rt = RouteTable::from_peers_with_opts(&peers, false);
-        // Without exit node: 8.8.8.8 has no route.
-        assert!(rt.lookup(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))).is_none());
+        // Advertised defaults remain inactive before explicit selection.
+        assert!(rt.lookup("8.8.8.8".parse().unwrap()).is_none());
+        assert!(rt.lookup("2001:4860:4860::8888".parse().unwrap()).is_none());
 
-        // Select the exit node.
         rt.set_exit_node(exit_key.clone());
-        // Public IP now routes to the exit node.
+        // One explicit selection supplies defaults for both families.
         assert_eq!(
-            rt.lookup(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
+            rt.lookup("8.8.8.8".parse().unwrap()),
+            Some(exit_key.clone())
+        );
+        assert_eq!(
+            rt.lookup("2001:4860:4860::8888".parse().unwrap()),
             Some(exit_key.clone())
         );
         // Tailnet IPs still route to their owning peers (more specific).
@@ -587,7 +608,7 @@ mod tests {
             Name: "exit".into(),
             Key: exit_key.clone(),
             Addresses: vec!["100.64.0.1/32".into()],
-            AllowedIPs: vec!["100.64.0.1/32".into(), "0.0.0.0/0".into()],
+            AllowedIPs: vec!["100.64.0.1/32".into(), "0.0.0.0/0".into(), "::/0".into()],
             ..Default::default()
         }];
         let mut rt = RouteTable::from_peers_with_opts(&peers, false);
@@ -609,6 +630,7 @@ mod tests {
             Name: "exit".into(),
             Key: exit_key.clone(),
             Addresses: vec!["100.64.0.1/32".into()],
+            AllowedIPs: vec!["100.64.0.1/32".into(), "0.0.0.0/0".into(), "::/0".into()],
             ..Default::default()
         }];
         let mut rt = RouteTable::from_peers_with_opts(&peers, false);
@@ -620,6 +642,12 @@ mod tests {
             Name: "exit".into(),
             Key: exit_key.clone(),
             Addresses: vec!["100.64.0.1/32".into(), "100.64.0.3/32".into()],
+            AllowedIPs: vec![
+                "100.64.0.1/32".into(),
+                "100.64.0.3/32".into(),
+                "0.0.0.0/0".into(),
+                "::/0".into(),
+            ],
             ..Default::default()
         }];
         rt.rebuild(&new_peers);
@@ -631,25 +659,29 @@ mod tests {
     }
 
     #[test]
-    fn exit_node_with_accept_routes_does_not_duplicate() {
-        // When accept_routes=true, the exit-capable peer's 0.0.0.0/0 is
-        // already in entries. Setting the exit node provides a fallback that
-        // is shadowed by the more-specific (well, same-prefix) entry. The
-        // lookup should still return the exit peer either way.
+    fn accept_routes_true_still_requires_exit_selection() {
         let exit_key = NodePrivate::generate().public();
         let peers = vec![Node {
             ID: 1,
             Name: "exit".into(),
             Key: exit_key.clone(),
             Addresses: vec!["100.64.0.1/32".into()],
-            AllowedIPs: vec!["100.64.0.1/32".into(), "0.0.0.0/0".into()],
+            AllowedIPs: vec!["100.64.0.1/32".into(), "0.0.0.0/0".into(), "::/0".into()],
             ..Default::default()
         }];
-        let rt = RouteTable::from_peers_with_opts(&peers, true);
-        // 0.0.0.0/0 is already installed → lookup works without set_exit_node.
+        let mut rt = RouteTable::from_peers_with_opts(&peers, true);
+        assert_eq!(rt.len(), 1);
+        assert!(rt.lookup("8.8.8.8".parse().unwrap()).is_none());
+        assert!(rt.lookup("2001:4860:4860::8888".parse().unwrap()).is_none());
+
+        rt.set_exit_node(exit_key.clone());
         assert_eq!(
-            rt.lookup(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
+            rt.lookup("8.8.8.8".parse().unwrap()),
             Some(exit_key.clone())
+        );
+        assert_eq!(
+            rt.lookup("2001:4860:4860::8888".parse().unwrap()),
+            Some(exit_key)
         );
     }
 
@@ -661,6 +693,7 @@ mod tests {
             Name: "exit".into(),
             Key: exit_key.clone(),
             Addresses: vec!["100.64.0.1/32".into()],
+            AllowedIPs: vec!["0.0.0.0/0".into(), "::/0".into()],
             ..Default::default()
         }];
         let mut rt = RouteTable::from_peers_with_opts(&peers, false);
@@ -670,36 +703,24 @@ mod tests {
     }
 
     #[test]
-    fn peer_is_exit_capable_checks_allowed_ips() {
-        let exit_peer = Node {
+    fn peer_is_exit_capable_requires_both_normalized_defaults() {
+        let mut peer = Node {
             ID: 1,
             Name: "exit".into(),
             Key: NodePrivate::generate().public(),
             Addresses: vec!["100.64.0.1/32".into()],
-            AllowedIPs: vec!["100.64.0.1/32".into(), "0.0.0.0/0".into()],
+            AllowedIPs: vec!["192.0.2.99/0".into()],
             ..Default::default()
         };
-        assert!(peer_is_exit_capable(&exit_peer));
+        assert!(!peer_is_exit_capable(&peer), "IPv4-only default");
 
-        let normal_peer = Node {
-            ID: 2,
-            Name: "host".into(),
-            Key: NodePrivate::generate().public(),
-            Addresses: vec!["100.64.0.2/32".into()],
-            AllowedIPs: vec!["100.64.0.2/32".into()],
-            ..Default::default()
-        };
-        assert!(!peer_is_exit_capable(&normal_peer));
+        peer.AllowedIPs = vec!["2001:db8::1/0".into()];
+        assert!(!peer_is_exit_capable(&peer), "IPv6-only default");
 
-        // Subnet router is NOT an exit node.
-        let subnet_peer = Node {
-            ID: 3,
-            Name: "router".into(),
-            Key: NodePrivate::generate().public(),
-            Addresses: vec!["100.64.0.3/32".into()],
-            AllowedIPs: vec!["100.64.0.3/32".into(), "192.0.2.0/24".into()],
-            ..Default::default()
-        };
-        assert!(!peer_is_exit_capable(&subnet_peer));
+        peer.AllowedIPs = vec!["192.0.2.99/0".into(), "2001:db8::1/0".into()];
+        assert!(peer_is_exit_capable(&peer), "normalized dual defaults");
+
+        peer.AllowedIPs = vec!["0.0.0.0/1".into(), "::/1".into()];
+        assert!(!peer_is_exit_capable(&peer), "non-default prefixes");
     }
 }

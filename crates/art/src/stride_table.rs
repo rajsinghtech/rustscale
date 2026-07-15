@@ -24,6 +24,19 @@ pub struct StrideTable<V> {
     marker: PhantomData<fn() -> V>,
 }
 
+impl<V> Clone for StrideTable<V> {
+    fn clone(&self) -> Self {
+        Self {
+            prefix: self.prefix,
+            entries: self.entries,
+            children: std::array::from_fn(|index| self.children[index].clone()),
+            route_refs: self.route_refs,
+            child_refs: self.child_refs,
+            marker: PhantomData,
+        }
+    }
+}
+
 impl<V> StrideTable<V> {
     pub(crate) fn new(prefix: IpPrefix) -> Self {
         Self {

@@ -867,13 +867,17 @@ mod tests {
         selection.retry(&[], &mut routes);
         assert!(routes.exit_node().is_none());
 
-        let peer = Node {
+        let mut peer = Node {
             Key: exit_key.clone(),
             Addresses: vec!["100.64.0.9/32".into()],
             AllowedIPs: vec!["0.0.0.0/0".into()],
             ..Default::default()
         };
-        selection.retry(&[peer], &mut routes);
+        assert!(!selection.retry(std::slice::from_ref(&peer), &mut routes));
+        assert!(routes.exit_node().is_none());
+
+        peer.AllowedIPs.push("::/0".into());
+        assert!(selection.retry(&[peer], &mut routes));
         assert_eq!(routes.exit_node(), Some(&exit_key));
     }
 
@@ -888,7 +892,7 @@ mod tests {
         let peer = Node {
             Key: persisted,
             Addresses: vec!["100.64.0.9/32".into()],
-            AllowedIPs: vec!["0.0.0.0/0".into()],
+            AllowedIPs: vec!["0.0.0.0/0".into(), "::/0".into()],
             ..Default::default()
         };
         let mut selection = ExitNodeSelection::from_prefs(&prefs);
@@ -911,7 +915,7 @@ mod tests {
         let peer = Node {
             Key: persisted,
             Addresses: vec!["100.64.0.9/32".into()],
-            AllowedIPs: vec!["0.0.0.0/0".into()],
+            AllowedIPs: vec!["0.0.0.0/0".into(), "::/0".into()],
             ..Default::default()
         };
         let mut selection = ExitNodeSelection::from_prefs(&prefs);

@@ -5,6 +5,30 @@ use std::net::IpAddr;
 use rustscale_health::Warning;
 use rustscale_key::NodePublic;
 use rustscale_magicsock::PathClass;
+use rustscale_tailcfg::Node;
+
+/// Build the active exit-node status shared by in-process and LocalAPI views.
+pub(crate) fn selected_exit_node_status(
+    peers: &[Node],
+    exit_key: Option<&NodePublic>,
+) -> Option<Box<rustscale_ipnstate::ExitNodeStatus>> {
+    let exit_key = exit_key?;
+    let peer = peers.iter().find(|peer| &peer.Key == exit_key);
+    let online = peer.and_then(|peer| peer.Online).unwrap_or(false);
+    let tailscale_ips = peer
+        .map(|peer| {
+            peer.Addresses
+                .iter()
+                .filter_map(|address| address.split('/').next().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(Box::new(rustscale_ipnstate::ExitNodeStatus {
+        ID: exit_key.to_string(),
+        Online: online,
+        TailscaleIPs: tailscale_ips,
+    }))
+}
 
 /// Information about a single peer in the netmap.
 ///

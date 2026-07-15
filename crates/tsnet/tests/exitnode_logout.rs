@@ -133,8 +133,8 @@ async fn exit_node_prefs_apply_routing() {
     };
     eprintln!("peer IP: {peer_ip}");
 
-    // The fake peer from add_fake_node is NOT exit-node-capable (no
-    // 0.0.0.0/0 in AllowedIPs). We test the route_table directly instead.
+    // The fake peer from add_fake_node is NOT exit-node-capable (it does not
+    // advertise both IPv4 and IPv6 defaults). We test prefs handling instead.
     // PATCH prefs with ExitNodeIP — the route table should be updated
     // (resolve_exit_node_peer returns None for non-exit peers, so the
     // route is cleared — but the prefs are still saved).

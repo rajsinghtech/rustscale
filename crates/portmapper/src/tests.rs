@@ -43,8 +43,8 @@ struct FakeIgd {
     pmp_external_ip: Ipv4Addr,
     pcp_mutation: Option<PcpMutation>,
     upnp_permanent_malformed: bool,
-    upnp_add_fault_code: Option<u32>,
-    upnp_broken_status: bool,
+    upnp_add_fault_code: Option<&'static str>,
+    upnp_status_line: Option<&'static str>,
     upnp_delete_fault: bool,
     closed: Arc<AtomicBool>,
     pmp_recv_count: Arc<AtomicU32>,
@@ -78,7 +78,7 @@ impl FakeIgd {
             pcp_mutation: opts.pcp_mutation,
             upnp_permanent_malformed: opts.upnp_permanent_malformed,
             upnp_add_fault_code: opts.upnp_add_fault_code,
-            upnp_broken_status: opts.upnp_broken_status,
+            upnp_status_line: opts.upnp_status_line,
             upnp_delete_fault: opts.upnp_delete_fault,
             closed: closed.clone(),
             pmp_recv_count: Arc::new(AtomicU32::new(0)),
@@ -323,8 +323,8 @@ impl FakeIgd {
                     let fault = format!(
                         r#"<!--before-envelope--><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><!--in-envelope--><s:Body><!--in-body--><s:Fault><!--in-fault--><detail><!--in-detail--><UPnPError xmlns="urn:schemas-upnp-org:control-1-0"><!--in-upnp-error--><errorCode>{code}</errorCode></UPnPError></detail></s:Fault></s:Body></s:Envelope><!--after-envelope-->"#
                     );
-                    if self.upnp_broken_status {
-                        write_soap_response_with_status(stream, "BROKEN 200 OK", &fault).await;
+                    if let Some(status) = self.upnp_status_line {
+                        write_soap_response_with_status(stream, status, &fault).await;
                     } else {
                         write_soap_response(stream, &fault).await;
                     }
@@ -396,8 +396,8 @@ struct IgdOpts {
     pmp_external_ip: Ipv4Addr,
     pcp_mutation: Option<PcpMutation>,
     upnp_permanent_malformed: bool,
-    upnp_add_fault_code: Option<u32>,
-    upnp_broken_status: bool,
+    upnp_add_fault_code: Option<&'static str>,
+    upnp_status_line: Option<&'static str>,
     upnp_delete_fault: bool,
 }
 
@@ -411,7 +411,7 @@ impl Default for IgdOpts {
             pcp_mutation: None,
             upnp_permanent_malformed: false,
             upnp_add_fault_code: None,
-            upnp_broken_status: false,
+            upnp_status_line: None,
             upnp_delete_fault: false,
         }
     }
@@ -743,7 +743,7 @@ async fn ambiguous_upnp_add_is_compensated_before_key_reuse() {
 
 #[tokio::test]
 async fn valid_add_rejections_clear_ownership_without_compensating_delete() {
-    for code in [718, 799] {
+    for code in ["718", "799"] {
         let igd = FakeIgd::start(IgdOpts {
             upnp: true,
             upnp_add_fault_code: Some(code),
@@ -773,11 +773,10 @@ async fn valid_add_rejections_clear_ownership_without_compensating_delete() {
 }
 
 #[tokio::test]
-async fn broken_http_status_keeps_valid_fault_body_ambiguous() {
+async fn nbsp_fault_value_remains_ambiguous() {
     let igd = FakeIgd::start(IgdOpts {
         upnp: true,
-        upnp_add_fault_code: Some(718),
-        upnp_broken_status: true,
+        upnp_add_fault_code: Some("\u{00A0}718\u{00A0}"),
         upnp_delete_fault: true,
         ..Default::default()
     })
@@ -789,11 +788,41 @@ async fn broken_http_status_keeps_valid_fault_body_ambiguous() {
     assert_eq!(
         igd.upnp_delete_count.load(Ordering::SeqCst),
         1,
-        "malformed status must prevent the fault body resolving ownership"
+        "NBSP must not be accepted as XML S around a fault value"
     );
     assert!(client.shutdown(Duration::from_secs(2)).await.is_err());
-    assert!(igd.upnp_delete_count.load(Ordering::SeqCst) >= 2);
     igd.close();
+}
+
+#[tokio::test]
+async fn invalid_http_status_keeps_valid_fault_body_ambiguous() {
+    for status in [
+        "BROKEN 200 OK",
+        "HTTP/1.1 600 Out Of Range",
+        "HTTP/1.1 999 Out Of Range",
+        "HTTP/1.1 205 Reset Content",
+    ] {
+        let igd = FakeIgd::start(IgdOpts {
+            upnp: true,
+            upnp_add_fault_code: Some("718"),
+            upnp_status_line: Some(status),
+            upnp_delete_fault: true,
+            ..Default::default()
+        })
+        .await;
+        let client = make_test_client(&igd);
+
+        assert!(client.create_or_get_mapping().await.is_err());
+        assert_eq!(igd.upnp_add_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            igd.upnp_delete_count.load(Ordering::SeqCst),
+            1,
+            "status {status} must prevent the fault body resolving ownership"
+        );
+        assert!(client.shutdown(Duration::from_secs(2)).await.is_err());
+        assert!(igd.upnp_delete_count.load(Ordering::SeqCst) >= 2);
+        igd.close();
+    }
 }
 
 #[tokio::test]

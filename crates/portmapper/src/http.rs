@@ -131,6 +131,9 @@ fn split_response(raw: &[u8]) -> Result<(u16, Vec<u8>), std::io::Error> {
     let status = code
         .parse::<u16>()
         .map_err(|_| invalid("invalid HTTP status code"))?;
+    if !(100..=599).contains(&status) {
+        return Err(invalid("HTTP status code out of range"));
+    }
 
     let mut content_length = None;
     for line in lines {
@@ -153,7 +156,7 @@ fn split_response(raw: &[u8]) -> Result<(u16, Vec<u8>), std::io::Error> {
             return Err(invalid("unsupported Transfer-Encoding"));
         }
         if name.eq_ignore_ascii_case("content-length") {
-            let value = value.trim();
+            let value = value.trim_matches([' ', '\t']);
             if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
                 return Err(invalid("invalid Content-Length"));
             }
@@ -175,8 +178,10 @@ fn split_response(raw: &[u8]) -> Result<(u16, Vec<u8>), std::io::Error> {
     if content_length.is_some_and(|length| length != body.len()) {
         return Err(invalid("Content-Length mismatch"));
     }
-    if ((100..200).contains(&status) || matches!(status, 204 | 304)) && !body.is_empty() {
-        return Err(invalid("HTTP status forbids a response body"));
+    if ((100..200).contains(&status) || matches!(status, 204 | 205 | 304))
+        && (content_length.is_some() || !body.is_empty())
+    {
+        return Err(invalid("HTTP status forbids body framing"));
     }
     Ok((status, body))
 }
@@ -282,10 +287,12 @@ mod tests {
             &b"HTTP/1.1 100 Continue\r\n\r\nx"[..],
             &b"HTTP/1.1 204 No Content\r\n\r\nx"[..],
             &b"HTTP/1.1 304 Not Modified\r\nContent-Length: 1\r\n\r\nx"[..],
+            &b"HTTP/1.1 205 Reset Content\r\nContent-Length: 0\r\n\r\n"[..],
+            &b"HTTP/1.1 205 Reset Content\r\n\r\n<s:Envelope/>"[..],
         ] {
             assert!(split_response(raw).is_err(), "accepted {raw:?}");
         }
-        assert!(split_response(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n").is_ok());
+        assert!(split_response(b"HTTP/1.1 204 No Content\r\n\r\n").is_ok());
     }
 
     #[test]
@@ -295,6 +302,8 @@ mod tests {
             &b"HTTP/2 200 OK\r\nContent-Length: 0\r\n\r\n"[..],
             &b"HTTP/1.1 20 OK\r\nContent-Length: 0\r\n\r\n"[..],
             &b"HTTP/1.1 abc OK\r\nContent-Length: 0\r\n\r\n"[..],
+            &b"HTTP/1.1 600 Out Of Range\r\n\r\n<s:Envelope/>"[..],
+            &b"HTTP/1.1 999 Out Of Range\r\n\r\n<s:Envelope/>"[..],
             &b"HTTP/1.1 200 OK\nContent-Length: 0\n\n"[..],
             &b"HTTP/1.1 200 OK\r\nBad Header: x\r\n\r\n"[..],
             &b"HTTP/1.1 200 OK\r\n folded: x\r\n\r\n"[..],

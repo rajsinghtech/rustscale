@@ -417,7 +417,7 @@ fn soap_fault_code(body: &str) -> Option<SoapFaultCode> {
         return None;
     }
 
-    let value = code.text.trim();
+    let value = trim_xml_s(&code.text);
     if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
     }
@@ -509,6 +509,30 @@ fn has_strict_soap_body(elements: &[XmlElement], expected: &str) -> bool {
             || body_children[0].name.namespace == envelope_children[0].name.namespace)
 }
 
+fn xml_s(ch: char) -> bool {
+    matches!(ch, ' ' | '\t' | '\r' | '\n')
+}
+
+fn non_xml_unicode_whitespace(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{0085}' | '\u{00A0}' | '\u{1680}' | '\u{2000}'
+            ..='\u{200A}' | '\u{2028}' | '\u{2029}' | '\u{202F}' | '\u{205F}' | '\u{3000}'
+    )
+}
+
+fn trim_xml_s(value: &str) -> &str {
+    value.trim_matches(xml_s)
+}
+
+fn trim_xml_s_start(value: &str) -> &str {
+    value.trim_start_matches(xml_s)
+}
+
+fn trim_xml_s_end(value: &str) -> &str {
+    value.trim_end_matches(xml_s)
+}
+
 fn parse_xml_elements(xml: &str) -> Option<Vec<XmlElement>> {
     let mut stack = Vec::<XmlFrame>::new();
     let mut elements = Vec::<XmlElement>::new();
@@ -522,7 +546,7 @@ fn parse_xml_elements(xml: &str) -> Option<Vec<XmlElement>> {
         let decoded_text = decode_xml_entities(character_data)?;
         if let Some(frame) = stack.last() {
             elements[frame.element_index].text.push_str(&decoded_text);
-        } else if !decoded_text.trim().is_empty() {
+        } else if !trim_xml_s(&decoded_text).is_empty() {
             return None;
         }
         rest = &rest[start + 1..];
@@ -552,7 +576,7 @@ fn parse_xml_elements(xml: &str) -> Option<Vec<XmlElement>> {
         let end = find_xml_tag_end(rest)?;
         let mut token = &rest[..end];
         rest = &rest[end + 1..];
-        if token.starts_with(char::is_whitespace) {
+        if token.starts_with(xml_s) {
             return None;
         }
         // DTDs, entity declarations, CDATA, and other declarations are not
@@ -562,7 +586,7 @@ fn parse_xml_elements(xml: &str) -> Option<Vec<XmlElement>> {
             return None;
         }
         if let Some(qualified) = token.strip_prefix('/') {
-            if qualified.is_empty() || qualified.chars().any(char::is_whitespace) {
+            if qualified.is_empty() || qualified.chars().any(xml_s) {
                 return None;
             }
             let frame = stack.pop()?;
@@ -578,7 +602,7 @@ fn parse_xml_elements(xml: &str) -> Option<Vec<XmlElement>> {
 
         let self_closing = token.ends_with('/');
         if self_closing {
-            token = token[..token.len() - 1].trim_end();
+            token = trim_xml_s_end(&token[..token.len() - 1]);
         }
         let (qualified, attributes) = split_xml_name(token)?;
         let mut namespaces = stack
@@ -650,7 +674,7 @@ fn parse_xml_elements(xml: &str) -> Option<Vec<XmlElement>> {
     let trailing = decode_xml_entities(rest)?;
     if let Some(frame) = stack.last() {
         elements[frame.element_index].text.push_str(&trailing);
-    } else if !trailing.trim().is_empty() {
+    } else if !trim_xml_s(&trailing).is_empty() {
         return None;
     }
     (stack.is_empty() && !elements.is_empty()).then_some(elements)
@@ -663,7 +687,7 @@ fn processing_instruction_is_valid(token: &str, declaration_allowed: bool) -> bo
     else {
         return false;
     };
-    let target_end = inner.find(char::is_whitespace).unwrap_or(inner.len());
+    let target_end = inner.find(xml_s).unwrap_or(inner.len());
     let target = &inner[..target_end];
     if !xml_qname_is_valid(target) {
         return false;
@@ -676,10 +700,10 @@ fn processing_instruction_is_valid(token: &str, declaration_allowed: bool) -> bo
 }
 
 fn xml_declaration_is_valid(data: &str) -> bool {
-    if data.is_empty() || !data.starts_with(char::is_whitespace) || data.contains('&') {
+    if data.is_empty() || !data.starts_with(xml_s) || data.contains('&') {
         return false;
     }
-    let Some(attributes) = parse_xml_attributes(data.trim_start()) else {
+    let Some(attributes) = parse_xml_attributes(trim_xml_s_start(data)) else {
         return false;
     };
     if attributes.first().map(|(name, _)| name.as_str()) != Some("version")
@@ -726,9 +750,9 @@ fn find_xml_tag_end(token: &str) -> Option<usize> {
 }
 
 fn split_xml_name(token: &str) -> Option<(&str, &str)> {
-    let end = token.find(char::is_whitespace).unwrap_or(token.len());
+    let end = token.find(xml_s).unwrap_or(token.len());
     let name = &token[..end];
-    (!name.is_empty()).then_some((name, token[end..].trim_start()))
+    (!name.is_empty()).then_some((name, trim_xml_s_start(&token[end..])))
 }
 
 fn parse_xml_attributes(mut attributes: &str) -> Option<Vec<(String, String)>> {
@@ -736,7 +760,7 @@ fn parse_xml_attributes(mut attributes: &str) -> Option<Vec<(String, String)>> {
     let mut seen = HashSet::new();
     while !attributes.is_empty() {
         let name_end = attributes
-            .find(|ch: char| ch.is_whitespace() || ch == '=')
+            .find(|ch: char| xml_s(ch) || ch == '=')
             .unwrap_or(attributes.len());
         let name = &attributes[..name_end];
         if name.is_empty()
@@ -746,8 +770,8 @@ fn parse_xml_attributes(mut attributes: &str) -> Option<Vec<(String, String)>> {
         {
             return None;
         }
-        attributes = attributes[name_end..].trim_start();
-        attributes = attributes.strip_prefix('=')?.trim_start();
+        attributes = trim_xml_s_start(&attributes[name_end..]);
+        attributes = trim_xml_s_start(attributes.strip_prefix('=')?);
         let quote = attributes.chars().next()?;
         if quote != '\'' && quote != '"' {
             return None;
@@ -760,10 +784,10 @@ fn parse_xml_attributes(mut attributes: &str) -> Option<Vec<(String, String)>> {
         }
         parsed.push((name.to_string(), decode_xml_entities(raw_value)?));
         let remainder = &attributes[value_end + quote.len_utf8()..];
-        if !remainder.is_empty() && !remainder.chars().next().is_some_and(char::is_whitespace) {
+        if !remainder.is_empty() && !remainder.chars().next().is_some_and(xml_s) {
             return None;
         }
-        attributes = remainder.trim_start();
+        attributes = trim_xml_s_start(remainder);
     }
     Some(parsed)
 }
@@ -811,7 +835,9 @@ fn default_xml_namespaces() -> HashMap<String, String> {
 
 fn xml_namespace_value_is_valid(value: &str, allow_empty: bool) -> bool {
     (allow_empty || !value.is_empty())
-        && !value.chars().any(char::is_whitespace)
+        && !value
+            .chars()
+            .any(|ch| xml_s(ch) || non_xml_unicode_whitespace(ch))
         && !value.contains(['<', '>', '"', '\''])
 }
 
@@ -912,7 +938,7 @@ fn parse_external_ip_response(resp: &str, service_type: &str) -> Result<Ipv4Addr
             "invalid GetExternalIPAddress response fields",
         ));
     }
-    let ip_str = response_children[0].text.trim();
+    let ip_str = trim_xml_s(&response_children[0].text);
     if ip_str.is_empty()
         || elements.iter().any(|element| {
             element
@@ -1171,6 +1197,12 @@ mod tests {
             "<?XML version=\"1.0\"?><root/>",
             "<?xml?><root/>",
             "<?pi data?<root/>",
+            "<root\u{00A0}a=\"x\"/>",
+            "<root a\u{00A0}=\"x\"/>",
+            "<root a=\"x\"\u{00A0}b=\"y\"/>",
+            "<root xmlns:p\u{00A0}=\"urn:x\"/>",
+            "<root></root\u{00A0}>",
+            "<?xml\u{00A0}version=\"1.0\"?><root/>",
         ] {
             assert!(
                 parse_xml_elements(invalid).is_none(),
@@ -1255,6 +1287,7 @@ mod tests {
             r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" xmlns:u="urn:schemas-upnp-org:control-1-0"><s:Body><s:Fault><detail><u:UPnPError><?xml version="1.0"?><u:errorCode>718</u:errorCode></u:UPnPError></detail></s:Fault></s:Body></s:Envelope>"#,
             r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" xmlns:u="urn:schemas-upnp-org:control-1-0"><s:Body><s:Fault><detail><u:UPnPError><marker/ ><u:errorCode>718</u:errorCode></u:UPnPError></detail></s:Fault></s:Body></s:Envelope>"#,
             r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" xmlns:u="urn:schemas-upnp-org:control-1-0"><s:Body><s:Fault><detail>]]><u:UPnPError><u:errorCode>718</u:errorCode></u:UPnPError></detail></s:Fault></s:Body></s:Envelope>"#,
+            "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:u=\"urn:schemas-upnp-org:control-1-0\"><s:Body><s:Fault><detail><u:UPnPError><u:errorCode>\u{00A0}718\u{00A0}</u:errorCode></u:UPnPError></detail></s:Fault></s:Body></s:Envelope>",
         ] {
             assert_eq!(soap_fault_code(invalid), None, "accepted {invalid}");
         }

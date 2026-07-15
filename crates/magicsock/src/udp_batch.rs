@@ -164,7 +164,7 @@ impl ReceiveBufferPool {
                 self.recycler.free.fetch_sub(1, Ordering::Relaxed);
                 packet
             }
-            Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => {
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => {
                 self.unavailable.fetch_add(1, Ordering::Relaxed);
                 panic!("receive buffer pool exhausted despite inventory reservation");
             }
@@ -688,6 +688,7 @@ pub(crate) struct ReceiveBatch {
     /// Boxed fixed slots keep the kernel target stable even while an ordinary
     /// direct packet is detached for the consumer. `detach_datagram` replaces
     /// a slot before the next syscall and refreshes its iovec.
+    #[allow(clippy::vec_box)]
     packets: Vec<Box<Packet>>,
     pool: ReceiveBufferPool,
     /// Present only while GRO is active. Dropping this after a permanent
@@ -929,7 +930,7 @@ impl ReceiveBatch {
         self.count = 0;
         for index in 0..received {
             self.validate_message(index, LOGICAL_PACKET_CAPACITY)?;
-            let control_len = self.headers[index].msg_hdr.msg_controllen as usize;
+            let control_len = self.headers[index].msg_hdr.msg_controllen;
             if control_len > RECEIVE_CONTROL_SPACE {
                 return invalid_data("kernel returned oversized ancillary data");
             }
@@ -957,7 +958,7 @@ impl ReceiveBatch {
             self.validate_message(index, GRO_PACKET_CAPACITY)?;
             let length = self.headers[index].msg_len as usize;
             let source = socket_addr(&self.names[index], self.headers[index].msg_hdr.msg_namelen)?;
-            let control_len = self.headers[index].msg_hdr.msg_controllen as usize;
+            let control_len = self.headers[index].msg_hdr.msg_controllen;
             if control_len > RECEIVE_CONTROL_SPACE {
                 return invalid_data("kernel returned oversized ancillary data");
             }

@@ -30,6 +30,9 @@ tokio.workspace = true
 thiserror.workspace = true
 qrcode = { version = "0.13", default-features = false }
 base64.workspace = true
+rand.workspace = true
+subtle = "2"
+url = "2"
 flate2 = "1"
 crc32fast.workspace = true
 async-trait.workspace = true

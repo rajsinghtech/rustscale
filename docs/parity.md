@@ -139,7 +139,7 @@ real JSON).
 | DNS cache + fallback (`net/dnscache/`, `net/dnsfallback/`) | ✅ `crates/dnscache` (TTL, singleflight-inline, UseLastGood stale fallback, happy-eyeballs dialer); `crates/dnsfallback` (bootstrap-dns over DERP IPs, static + cached DERP map); wired into controlclient dial |
 | C2N debug endpoints | ✅ 10+ handlers (echo, prefs, netmap, health, metrics, dns, goroutines, component-logging, sockstats, logtail/flush); only /debug/pprof/* remains 501 |
 | Netmap disk cache | ✅ versioned envelope (v1), SHA-256 write dedup, save per MapResponse (`map_update.rs`), clear on auth failure/key expiry/logout (`lifecycle.rs`); `load_netmap` before register skips blocking first fetch (streaming poll in parallel); single-blob design; 8 tests (roundtrip, wrong-node-key, version mismatch, corrupt file, dedup, clear) verified 2026-07-13 |
-| Web client UI | ✅ `rustscale web` with embedded HTML/JS, /api/status/up/down/logout handlers, loopback-only, --readonly, --unsafe-any-addr |
+| Web client UI | ✅ `rustscale web` with embedded HTML/JS, /api/status/up/down/logout handlers, explicit loopback default with post-bind enforcement, per-run CSRF and Host/Origin validation, --readonly, --unsafe-any-addr |
 | Control knobs (`control/controlknobs/`) | ✅ HashMap<String,String> behind RwLock, typed accessors (get_bool/float/string), change-detection merge, on_change callbacks |
 | PeerAPI (`ipn/ipnlocal/peerapi.go`) | ✅ DoH /dns-query (GET + POST), /v0/* endpoints (goroutines, env, metrics, magicsock, dnsfwd, interfaces, sockstats), WhoIs auth, CRC32 port [32768, 65535], Taildrop PUT handler, netstack + TUN spawners |
 | Hostinfo | ✅ ~41 fields populated: platform/runtime fields plus persisted `BackendLogID` (derived from the same `logid-private` used for logtail auth), override-supplied `FrontendLogID`, `WoLMACs`, `StateEncrypted`, and SSH host keys when the SSH listener is enabled. Intentional skips: PushDeviceToken, TPM, Location, ShareeNode, PeerRelay |
@@ -248,7 +248,7 @@ state-dir fallback probing), `--json`.
 | `cert` | `cli/cert.go` | ✅ `cert [--cert-file] [--key-file] [--min-validity] <domain>`; writes files, `-`=stdout; no-domain prints cert domains from status |
 | `file` | `cli/file.go` | ✅ `file cp [--name] [--verbose] [--targets] <files...> <target>:`; `file get [--wait] [--conflict=skip\|overwrite\|rename] [--verbose] <dir>` |
 | `ssh` | `cli/ssh.go` | ✅ `ssh [user@]host [args...]`; resolves peer, writes known_hosts, execs system ssh; 29 unit tests |
-| `web` | `cli/web.go` | ✅ embedded single-file HTML; endpoints: /api/status/up/down/logout; --readonly, --unsafe-any-addr; Linux loopback browser opening through the bounded freedesktop transport (`--browser=false` disables); 23 unit tests |
+| `web` | `cli/web.go` | ✅ embedded single-file HTML; endpoints: /api/status/up/down/logout; explicit loopback default plus post-bind address enforcement; per-run cryptographic CSRF token; strict Host/Origin checks and bounded HTTP parsing; --readonly, --unsafe-any-addr; Linux loopback browser opening through the bounded freedesktop transport (`--browser=false` disables) |
 | `debug` | `cli/debug.go` | ✅ `debug <status\|metrics\|ipconfig>` |
 | `exit-node` | `cli/exitnode.go` | ✅ lists exit-node-capable peers; `--suggest` for SuggestedExitNode; cannot select exit node via CLI |
 | `dns` | `cli/dns.go` | ✅ queries daemon DNS resolver or prints MagicDNS status; `--type`, `--json` |

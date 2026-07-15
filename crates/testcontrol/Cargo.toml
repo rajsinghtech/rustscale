@@ -23,6 +23,7 @@ base64.workspace = true
 rand.workspace = true
 chrono.workspace = true
 thiserror.workspace = true
+zstd = "0.13"
 
 [dev-dependencies]
 # Intentionally path-only: keeping this dev-only back-edge out of the published

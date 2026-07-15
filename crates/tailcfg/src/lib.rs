@@ -39,7 +39,7 @@ pub use caps::{
 pub use derpmap::{DERPHomeParams, DERPMap, DERPNode, DERPRegion};
 pub use dns::{DNSConfig, DNSRecord, Resolver, SetDNSRequest, SetDNSResponse, UserProfile};
 pub use filter::{filter_allow_all, CapGrant, FilterRule, NetPortRange, PeerCapMap, PortRange};
-pub use map::{ClientVersion, MapRequest, MapResponse, PeerChange};
+pub use map::{ClientVersion, MapRequest, MapResponse, PeerChange, PingRequest};
 pub use node::{
     Endpoint, EndpointType, Hostinfo, Location, NetInfo, Node, NodeCapMap, Service, ServiceProto,
     TPMInfo,
@@ -243,6 +243,32 @@ pub mod base64_bytes {
                     .map_err(serde::de::Error::custom)
             }
         }
+    }
+}
+
+/// Serde helpers for `Vec<u8>` fields that Go marshals as base64 strings.
+pub mod base64_vec {
+    use base64::Engine as _;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&base64::engine::general_purpose::STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let encoded = Option::<String>::deserialize(deserializer)?.unwrap_or_default();
+        if encoded.is_empty() {
+            return Ok(Vec::new());
+        }
+        base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(serde::de::Error::custom)
     }
 }
 

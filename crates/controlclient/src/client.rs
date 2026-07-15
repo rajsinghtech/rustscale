@@ -21,6 +21,7 @@ use rustscale_tailcfg::{
     AuditLogRequest, MapRequest, MapResponse, RegisterRequest, RegisterResponse, SetDNSRequest,
     SetDNSResponse, TokenRequest, TokenResponse,
 };
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
@@ -104,6 +105,163 @@ pub enum H2SetupError {
     Io(#[from] std::io::Error),
 }
 
+/// Errors from a generic HTTP request sent over the Noise control channel.
+#[derive(Debug, thiserror::Error)]
+pub enum NoiseRequestError {
+    #[error("dial: {0}")]
+    Dial(#[from] crate::controlhttp::DialError),
+    #[error("noise: {0}")]
+    Noise(#[from] crate::controlbase::NoiseError),
+    #[error("h2: {0}")]
+    H2(#[from] h2::Error),
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+impl From<H2SetupError> for NoiseRequestError {
+    fn from(error: H2SetupError) -> Self {
+        match error {
+            H2SetupError::Noise(error) => Self::Noise(error),
+            H2SetupError::H2(error) => Self::H2(error),
+            H2SetupError::Io(error) => Self::Io(error),
+        }
+    }
+}
+
+/// A streaming HTTP response received over the Noise control channel.
+pub struct NoiseResponse {
+    status: u16,
+    body: NoiseResponseBody,
+}
+
+impl NoiseResponse {
+    /// The HTTP status code.
+    pub fn status(&self) -> u16 {
+        self.status
+    }
+
+    /// Consume the response and return its streaming body.
+    pub fn into_body(self) -> NoiseResponseBody {
+        self.body
+    }
+}
+
+/// A streaming HTTP/2 response body with the transport details hidden.
+pub struct NoiseResponseBody {
+    inner: h2::RecvStream,
+    cancel: h2::SendStream<bytes::Bytes>,
+}
+
+impl NoiseResponseBody {
+    /// Read the next body chunk, releasing HTTP/2 flow-control capacity.
+    pub async fn data(&mut self) -> Result<Option<bytes::Bytes>, h2::Error> {
+        let Some(chunk) = self.inner.data().await else {
+            return Ok(None);
+        };
+        let chunk = chunk?;
+        let _ = self.inner.flow_control().release_capacity(chunk.len());
+        Ok(Some(chunk))
+    }
+
+    /// Cancel the response stream and unblock a pending body read.
+    pub fn cancel(&mut self) {
+        self.cancel.send_reset(h2::Reason::CANCEL);
+    }
+}
+
+/// A reusable HTTP/2 client over one closeable ts2021 Noise connection.
+///
+/// Clones of the underlying h2 request handle multiplex requests onto the same
+/// connection, including callbacks made while a streaming map response is
+/// active. Calling [`close`](Self::close) tears down the Noise bridge and all
+/// streams immediately.
+pub struct NoiseHttpClient {
+    sender: h2::client::SendRequest<bytes::Bytes>,
+    bridge_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    driver_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    closed: AtomicBool,
+}
+
+impl NoiseHttpClient {
+    /// Send an arbitrary HTTP request over this Noise connection.
+    pub async fn request(
+        &self,
+        request: http::Request<Vec<u8>>,
+    ) -> Result<NoiseResponse, NoiseRequestError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(NoiseRequestError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "Noise HTTP client is closed",
+            )));
+        }
+
+        let (parts, body) = request.into_parts();
+        let request = http::Request::from_parts(parts, ());
+        let mut sender = self.sender.clone().ready().await?;
+        if self.closed.load(Ordering::Acquire) {
+            return Err(NoiseRequestError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "Noise HTTP client is closed",
+            )));
+        }
+        let (response, mut send_stream) = sender.send_request(request, false)?;
+        send_stream.send_data(bytes::Bytes::from(body), true)?;
+        let response = response.await?;
+        let status = response.status().as_u16();
+        Ok(NoiseResponse {
+            status,
+            body: NoiseResponseBody {
+                inner: response.into_body(),
+                cancel: send_stream,
+            },
+        })
+    }
+
+    /// Send a JSON POST request over this Noise connection.
+    pub async fn post_json(
+        &self,
+        path: &str,
+        body: Vec<u8>,
+        node_key: Option<&NodePublic>,
+    ) -> Result<NoiseResponse, NoiseRequestError> {
+        let mut builder = http::Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("content-type", "application/json");
+        if let Some(node_key) = node_key.filter(|key| !key.is_zero()) {
+            builder = builder.header("Ts-Lb", node_key.to_string());
+        }
+        let request = builder
+            .body(body)
+            .map_err(|error| NoiseRequestError::Io(std::io::Error::other(error)))?;
+        self.request(request).await
+    }
+
+    /// Close the shared Noise connection and all active response streams.
+    pub fn close(&self) {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Some(task) = lock_unpoisoned(&self.bridge_task).take() {
+            task.abort();
+        }
+        if let Some(task) = lock_unpoisoned(&self.driver_task).take() {
+            task.abort();
+        }
+    }
+
+    /// Whether [`close`](Self::close) has been called.
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for NoiseHttpClient {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
 impl From<H2SetupError> for RegisterError {
     fn from(e: H2SetupError) -> Self {
         match e {
@@ -126,8 +284,8 @@ impl From<H2SetupError> for StreamMapError {
 
 /// The high-level control-plane client.
 ///
-/// Each request dials a fresh Noise + HTTP/2 connection (matching Go's
-/// `ts2021.Client` which pools at most one connection).
+/// Legacy convenience methods dial per operation; [`connect`](Self::connect)
+/// creates the reusable closeable transport used by additive protocol clients.
 pub struct ControlClient {
     host: String,
     machine_key: MachinePrivate,
@@ -169,6 +327,81 @@ impl ControlClient {
     /// Set the persisted node key used when delivering audit events.
     pub fn set_audit_node_key(&mut self, node_key: NodePublic) {
         self.audit_node_key = Some(node_key);
+    }
+
+    /// Establish one reusable, explicitly closeable HTTP/2-in-Noise client.
+    pub async fn connect(&self) -> Result<NoiseHttpClient, NoiseRequestError> {
+        let noise_stream = dial_control(
+            &self.host,
+            &self.machine_key,
+            &self.control_key,
+            self.version,
+            self.extra_root_certs.as_deref(),
+        )
+        .await?;
+        let (conn, stream) = noise_stream.into_parts();
+        let noise_io = NoiseIo::new(conn, stream);
+        let (sender, connection, bridge_task) = establish_h2_closeable(noise_io).await?;
+        let driver_task = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        Ok(NoiseHttpClient {
+            sender,
+            bridge_task: Mutex::new(Some(bridge_task)),
+            driver_task: Mutex::new(Some(driver_task)),
+            closed: AtomicBool::new(false),
+        })
+    }
+
+    /// Send a JSON request over a fresh HTTP/2-in-Noise connection.
+    ///
+    /// This low-level entry point lets additive control protocol clients reuse
+    /// the established ts2021 transport without duplicating Noise or TLS.
+    /// When `node_key` is present, the `Ts-Lb` load-balancer header is added.
+    pub async fn post_json(
+        &self,
+        path: &str,
+        body: Vec<u8>,
+        node_key: Option<&NodePublic>,
+    ) -> Result<NoiseResponse, NoiseRequestError> {
+        let noise_stream = dial_control(
+            &self.host,
+            &self.machine_key,
+            &self.control_key,
+            self.version,
+            self.extra_root_certs.as_deref(),
+        )
+        .await?;
+
+        let (conn, stream) = noise_stream.into_parts();
+        let noise_io = NoiseIo::new(conn, stream);
+        let (mut h2_send, h2_conn) = establish_h2(noise_io).await?;
+        tokio::spawn(async move {
+            let _ = h2_conn.await;
+        });
+
+        let mut builder = http::Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("content-type", "application/json");
+        if let Some(node_key) = node_key.filter(|key| !key.is_zero()) {
+            builder = builder.header("Ts-Lb", node_key.to_string());
+        }
+        let request = builder
+            .body(())
+            .map_err(|error| NoiseRequestError::Io(std::io::Error::other(error)))?;
+        let (response, mut send_stream) = h2_send.send_request(request, false)?;
+        send_stream.send_data(bytes::Bytes::from(body), true)?;
+
+        let response = response.await?;
+        let status = response.status().as_u16();
+        Ok(NoiseResponse {
+            status,
+            body: NoiseResponseBody {
+                inner: response.into_body(),
+                cancel: send_stream,
+            },
+        })
     }
 
     /// Send a `RegisterRequest` to `/machine/register` and return the response.
@@ -640,11 +873,25 @@ const EARLY_PAYLOAD_MAGIC: &[u8] = b"\xff\xff\xffTS";
 ///
 /// Returns (SendRequest, Connection) from the `h2` crate.
 async fn establish_h2(
+    noise_io: NoiseIo,
+) -> Result<
+    (
+        h2::client::SendRequest<bytes::Bytes>,
+        h2::client::Connection<tokio::io::DuplexStream, bytes::Bytes>,
+    ),
+    H2SetupError,
+> {
+    let (sender, connection, _bridge_task) = establish_h2_closeable(noise_io).await?;
+    Ok((sender, connection))
+}
+
+async fn establish_h2_closeable(
     mut noise_io: NoiseIo,
 ) -> Result<
     (
         h2::client::SendRequest<bytes::Bytes>,
         h2::client::Connection<tokio::io::DuplexStream, bytes::Bytes>,
+        tokio::task::JoinHandle<()>,
     ),
     H2SetupError,
 > {
@@ -674,7 +921,7 @@ async fn establish_h2(
         server.write_all(&prepend).await?;
     }
 
-    tokio::spawn(async move {
+    let bridge_task = tokio::spawn(async move {
         let mut io = noise_io;
         let mut read_buf = vec![0u8; 8192];
         let mut write_buf = vec![0u8; 8192];
@@ -703,7 +950,13 @@ async fn establish_h2(
     });
 
     let (h2_send, h2_conn) = h2::client::handshake(client).await?;
-    Ok((h2_send, h2_conn))
+    Ok((h2_send, h2_conn, bridge_task))
+}
+
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Read the full HTTP/2 response body.

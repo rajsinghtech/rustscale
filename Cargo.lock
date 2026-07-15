@@ -3477,6 +3477,7 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+ "zstd",
 ]
 
 [[package]]
@@ -3611,6 +3612,26 @@ dependencies = [
  "tokio-rustls",
  "tokio-util",
  "webpki-roots 0.26.11",
+]
+
+[[package]]
+name = "rustscale-tsp"
+version = "0.1.1"
+dependencies = [
+ "bytes",
+ "http",
+ "httparse",
+ "rustscale-atomicfile",
+ "rustscale-controlclient",
+ "rustscale-key",
+ "rustscale-tailcfg",
+ "rustscale-testcontrol",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "zstd",
 ]
 
 [[package]]

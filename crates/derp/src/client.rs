@@ -1,7 +1,5 @@
 //! Async DERP client over tokio + rustls.
 
-use std::sync::Arc;
-
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use url::Url;
 
@@ -58,79 +56,15 @@ async fn write_frame_async<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-/// Ensure the rustls ring crypto provider is installed process-wide.
-fn ensure_ring_provider() {
-    use std::sync::Once;
-    static INIT: Once = Once::new();
-    INIT.call_once(|| {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-    });
-}
-
-/// Build a rustls ClientConfig with webpki + baked ISRG roots.
-fn tls_config() -> rustls::ClientConfig {
-    ensure_ring_provider();
-    let roots = rustscale_bakedroots::combined_root_store(None);
-    rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth()
-}
-
-/// Build a rustls ClientConfig that skips certificate verification.
-/// Used for DERP servers with `InsecureForTests: true` in the DERPMap.
-fn insecure_tls_config() -> rustls::ClientConfig {
-    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-
-    #[derive(Debug)]
-    struct NoVerify;
-
-    impl ServerCertVerifier for NoVerify {
-        fn verify_server_cert(
-            &self,
-            _end_entity: &rustls::pki_types::CertificateDer<'_>,
-            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-            _server_name: &rustls::pki_types::ServerName<'_>,
-            _ocsp_response: &[u8],
-            _now: rustls::pki_types::UnixTime,
-        ) -> Result<ServerCertVerified, rustls::Error> {
-            Ok(ServerCertVerified::assertion())
-        }
-
-        fn verify_tls12_signature(
-            &self,
-            _message: &[u8],
-            _cert: &rustls::pki_types::CertificateDer<'_>,
-            _dss: &rustls::DigitallySignedStruct,
-        ) -> Result<HandshakeSignatureValid, rustls::Error> {
-            Ok(HandshakeSignatureValid::assertion())
-        }
-
-        fn verify_tls13_signature(
-            &self,
-            _message: &[u8],
-            _cert: &rustls::pki_types::CertificateDer<'_>,
-            _dss: &rustls::DigitallySignedStruct,
-        ) -> Result<HandshakeSignatureValid, rustls::Error> {
-            Ok(HandshakeSignatureValid::assertion())
-        }
-
-        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-            vec![
-                rustls::SignatureScheme::RSA_PKCS1_SHA256,
-                rustls::SignatureScheme::RSA_PKCS1_SHA384,
-                rustls::SignatureScheme::RSA_PKCS1_SHA512,
-                rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-                rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
-                rustls::SignatureScheme::ED25519,
-            ]
-        }
-    }
-
-    ensure_ring_provider();
-    rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(NoVerify))
-        .with_no_client_auth()
+/// Apply the shared TLS policy to an established DERP TCP connection.
+async fn tls_stream(
+    tcp: tokio::net::TcpStream,
+    tls_host: &str,
+    insecure: bool,
+) -> Result<Box<dyn DerpStream>, DerpError> {
+    let options = rustscale_tlsdial::Config::default().dangerous_insecure_for_tests(insecure);
+    let tls = rustscale_tlsdial::connect(tcp, tls_host, &options).await?;
+    Ok(Box::new(tls))
 }
 
 /// An async DERP client connected to a DERP server.
@@ -226,20 +160,12 @@ impl DerpClient {
         };
         tcp.set_nodelay(true).ok();
 
-        if use_tls {
-            let config = if insecure {
-                insecure_tls_config()
-            } else {
-                tls_config()
-            };
-            let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
-            let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
-                .map_err(|e| DerpError::BadFrame(format!("invalid server name: {e}")))?;
-            let tls = connector.connect(server_name, tcp).await?;
-            Self::from_stream(Box::new(tls), private_key, expected_server_key).await
+        let stream: Box<dyn DerpStream> = if use_tls {
+            tls_stream(tcp, host, insecure).await?
         } else {
-            Self::from_stream(Box::new(tcp), private_key, expected_server_key).await
-        }
+            Box::new(tcp)
+        };
+        Self::from_stream(stream, private_key, expected_server_key).await
     }
 
     /// Connect with an HTTP upgrade request (for servers that expect it).
@@ -305,16 +231,7 @@ impl DerpClient {
             tcp.set_nodelay(true).ok();
 
             let stream: Box<dyn DerpStream> = if use_tls {
-                let config = if insecure {
-                    insecure_tls_config()
-                } else {
-                    tls_config()
-                };
-                let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
-                let server_name = rustls::pki_types::ServerName::try_from(tls_host.to_string())
-                    .map_err(|e| DerpError::BadFrame(format!("invalid server name: {e}")))?;
-                let tls = connector.connect(server_name, tcp).await?;
-                Box::new(tls)
+                tls_stream(tcp, tls_host, insecure).await?
             } else {
                 Box::new(tcp)
             };
@@ -326,16 +243,7 @@ impl DerpClient {
         tcp.set_nodelay(true).ok();
 
         let mut stream: Box<dyn DerpStream> = if use_tls {
-            let config = if insecure {
-                insecure_tls_config()
-            } else {
-                tls_config()
-            };
-            let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
-            let server_name = rustls::pki_types::ServerName::try_from(tls_host.to_string())
-                .map_err(|e| DerpError::BadFrame(format!("invalid server name: {e}")))?;
-            let tls = connector.connect(server_name, tcp).await?;
-            Box::new(tls)
+            tls_stream(tcp, tls_host, insecure).await?
         } else {
             Box::new(tcp)
         };

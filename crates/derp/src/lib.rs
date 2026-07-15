@@ -28,7 +28,7 @@ pub enum DerpError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
     #[error("TLS error: {0}")]
-    Tls(#[from] rustls::Error),
+    Tls(#[from] rustscale_tlsdial::Error),
     #[error("bad frame: {0}")]
     BadFrame(String),
     #[error("bad DERP magic")]

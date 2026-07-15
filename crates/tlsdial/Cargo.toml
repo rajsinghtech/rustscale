@@ -1,0 +1,26 @@
+[package]
+name = "rustscale-tlsdial"
+description = "Unified TLS client configuration, verification, dialing, and diagnostics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rustscale-bakedroots = { path = "../bakedroots", version = "0.1.1" }
+rustscale-dnscache.workspace = true
+rustscale-tsdial = { path = "../tsdial", version = "0.1.1" }
+rustls.workspace = true
+rustls-native-certs = "0.8"
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+x509-parser = "0.17"
+
+[dev-dependencies]
+rcgen.workspace = true

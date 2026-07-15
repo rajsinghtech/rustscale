@@ -1,42 +1,76 @@
-use std::{
-    fmt, io,
-    net::{Ipv4Addr, SocketAddr, ToSocketAddrs},
-};
+use std::{fmt, io, net::SocketAddr, str::FromStr};
 
-/// A logical address in an in-memory network.
+/// The address reported by an in-memory connection or listener.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct MemAddr(String);
+pub struct MemAddr {
+    text: String,
+    network: AddressNetwork,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum AddressNetwork {
+    Mem,
+    Tcp,
+}
 
 impl MemAddr {
-    /// Creates a logical in-memory address from `name`.
+    /// Creates a logical address whose network name is `mem`.
     #[must_use]
-    pub fn new(name: &str) -> Self {
-        Self(name.to_owned())
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            text: name.into(),
+            network: AddressNetwork::Mem,
+        }
     }
 
-    /// Returns the logical address name.
+    pub(crate) fn tcp(address: SocketAddr) -> Self {
+        Self {
+            text: address.to_string(),
+            network: AddressNetwork::Tcp,
+        }
+    }
+
+    /// Returns the address text.
     #[must_use]
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.text
     }
 
-    /// Returns the name of this address family.
+    /// Returns `mem` for logical addresses and `tcp` for addresses supplied to
+    /// [`crate::MemConn::new_tcp_pair`].
     #[must_use]
     pub const fn network(&self) -> &'static str {
-        "mem"
+        match self.network {
+            AddressNetwork::Mem => "mem",
+            AddressNetwork::Tcp => "tcp",
+        }
+    }
+
+    /// Returns the socket address when this is a TCP address.
+    #[must_use]
+    pub fn as_socket_addr(&self) -> Option<SocketAddr> {
+        (self.network == AddressNetwork::Tcp)
+            .then(|| SocketAddr::from_str(&self.text).ok())
+            .flatten()
     }
 }
 
 impl fmt::Display for MemAddr {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
+        self.text.fmt(formatter)
     }
 }
 
-impl ToSocketAddrs for MemAddr {
-    type Iter = std::array::IntoIter<SocketAddr, 1>;
+impl FromStr for MemAddr {
+    type Err = io::Error;
 
-    fn to_socket_addrs(&self) -> io::Result<Self::Iter> {
-        Ok([SocketAddr::from((Ipv4Addr::LOCALHOST, 0))].into_iter())
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "memnet address is empty",
+            ));
+        }
+        Ok(Self::new(value))
     }
 }

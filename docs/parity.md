@@ -78,7 +78,7 @@ real JSON).
 | Captive portal detection | `net/captivedetection/` | ✅ `Detector` concurrent HTTP GETs, DERPMap endpoints, response validation (status + challenge + body), wired into netcheck prober + health Tracker |
 | ICMP ping | `net/ping/` | ✅ `crates/netcheck/src/icmp.rs` — public `Pinger` (unprivileged DGRAM+ICMP → raw fallback); CLI `ping --icmp` uses it; disco/tsmp/peerapi dispatch via LocalAPI |
 | Socket statistics | `net/sockstats/` | ✅ `crates/sockstats`: per-label TX/RX byte counters (Label enum, SockStats registry, LabelHandle atomics, CountedStream); magicsock UDP4/UDP6 instrumented; C2N /sockstats + PeerAPI /v0/sockstats emit real JSON |
-| In-memory test net | `net/memnet/` | ⬜ |
+| In-memory test net | `net/memnet/` | ✅ `crates/memnet`: deterministic bounded FIFO connection pairs, TCP/logical address reporting, rendezvous listener dial/accept with cancellation, close wakeups and drain-before-EOF, cross-endpoint block injection, read/write deadlines, concurrent listener registry, deterministic port-0 allocation/reuse, and teardown tests. Rust `AsyncWrite::shutdown` intentionally provides idiomatic half-close; Go's custom listener connection factory hook is not exposed because no current caller uses it. |
 | Event bus | `util/eventbus/` | ✅ `crates/ipn/src/bus.rs`: NotifyBus backed by tokio::sync::broadcast (128-cap), NotifyBusReceiver for async streaming |
 | Client metrics | `util/clientmetric/` | ✅ `crates/clientmetric`: Registry with Counter/Gauge (atomic-backed), to_prometheus_text() + to_json(); wired into LocalAPI /metrics |
 | Deep hash / change detection | `util/deephash/` | ⬜ |

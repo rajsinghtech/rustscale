@@ -40,6 +40,11 @@ use std::sync::Arc;
 /// Conventional Unix policy file path.
 pub const DEFAULT_POLICY_PATH: &str = "/etc/tailscale/policy.json";
 
+#[cfg(target_os = "macos")]
+const NATIVE_POSTURE_PRECEDENCE: ProviderPrecedence = ProviderPrecedence::Platform;
+#[cfg(target_os = "windows")]
+const NATIVE_POSTURE_PRECEDENCE: ProviderPrecedence = ProviderPrecedence::Managed;
+
 /// Kinds of policy read and conversion failures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PolicyErrorKind {
@@ -94,9 +99,11 @@ impl PolicyError {
 /// Creates a platform-default engine.
 ///
 /// Unix uses an optional bounded JSON file and environment policy. macOS and
-/// Windows additionally use a bounded native managed-policy provider for the
-/// posture preference. Native provider failures abort construction rather than
-/// silently installing an empty, permissive snapshot.
+/// Windows additionally use a bounded native posture provider. Windows reads
+/// machine policy at managed precedence. macOS `defaults` is an effective
+/// preference source but cannot prove a value is MDM-forced, so it remains
+/// below protected root-owned policy. Provider failures abort construction
+/// rather than silently installing an empty, permissive snapshot.
 pub fn default_engine(scope: PolicyScope) -> Result<PolicyEngine, PolicyError> {
     let engine = PolicyEngine::well_known(scope)?;
 
@@ -110,9 +117,9 @@ pub fn default_engine(scope: PolicyScope) -> Result<PolicyEngine, PolicyError> {
 
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     engine.add_provider_with_precedence(
-        "native managed posture policy",
+        "native posture policy",
         PolicyScope::Device,
-        ProviderPrecedence::Managed,
+        NATIVE_POSTURE_PRECEDENCE,
         Arc::new(NativePostureProvider::new()),
     )?;
 

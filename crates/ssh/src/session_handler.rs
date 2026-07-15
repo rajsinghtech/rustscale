@@ -121,22 +121,23 @@ const EXTENDED_DATA_STDERR: u32 = 1;
 
 /// Default PATH when the SSH client doesn't provide one.
 const DEFAULT_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
-#[cfg(not(test))]
+#[cfg(all(unix, not(test)))]
 const RECORDING_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-#[cfg(test)]
+#[cfg(all(unix, test))]
 const RECORDING_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
+#[cfg(unix)]
 const OUTPUT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
-#[cfg(not(test))]
+#[cfg(all(unix, not(test)))]
 const PROCESS_TERM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
-#[cfg(test)]
+#[cfg(all(unix, test))]
 const PROCESS_TERM_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
-#[cfg(not(test))]
+#[cfg(all(unix, not(test)))]
 const PROCESS_KILL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
-#[cfg(test)]
+#[cfg(all(unix, test))]
 const PROCESS_KILL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
-#[cfg(not(test))]
+#[cfg(all(unix, not(test)))]
 const BLOCKING_PHASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-#[cfg(test)]
+#[cfg(all(unix, test))]
 const BLOCKING_PHASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Errors from session handling.
@@ -1546,6 +1547,7 @@ async fn wait_for_child(wait: &mut Option<ChildWait>) -> io::Result<i32> {
     }
 }
 
+#[cfg(unix)]
 async fn wait_for_upload_result(
     result_rx: &mut Option<tokio::sync::oneshot::Receiver<io::Result<()>>>,
 ) {
@@ -1809,6 +1811,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_sig_to_libc_mapping() {
         assert_eq!(sig_to_libc(&Sig::INT), libc::SIGINT);

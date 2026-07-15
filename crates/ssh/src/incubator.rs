@@ -97,6 +97,7 @@ pub struct SpawnedProcess {
 /// Safe controller for the dedicated process group created for an SSH shell.
 #[derive(Clone, Debug)]
 pub struct ProcessGroup {
+    #[cfg(unix)]
     pid: u32,
 }
 
@@ -305,6 +306,7 @@ impl Incubator {
 
         // Working-directory setup is deliberately performed in pre_exec only
         // after the process-group handle has been published to the parent.
+        #[cfg(unix)]
         let dir = if self.args.home_dir.is_empty() {
             "/".to_string()
         } else {

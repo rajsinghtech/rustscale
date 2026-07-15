@@ -145,6 +145,9 @@ async fn handle_inbound_wg(
     dgram: &rustscale_magicsock::WgDatagram,
     deliver: impl Fn(NodePublic, Vec<u8>),
 ) {
+    if !magicsock.is_authorization_current(&dgram.peer, dgram.authorization_generation()) {
+        return;
+    }
     let tunn = {
         let tunnels = wg_tunnels.read().await;
         tunnels.get(&dgram.peer).cloned()
@@ -158,10 +161,26 @@ async fn handle_inbound_wg(
             t.decapsulate(&dgram.data)
         };
         if let Ok(decap) = decap_result {
-            if let Some(pt) = decap.plaintext {
-                deliver(dgram.peer.clone(), pt);
+            {
+                // Keep both provenance authorities stable through plaintext
+                // handoff: the caller holds peer_map.gate, and this guard
+                // prevents a magicsock generation commit from crossing it.
+                let _delivery = magicsock.authorization_delivery_guard().await;
+                if !magicsock
+                    .is_authorization_current(&dgram.peer, dgram.authorization_generation())
+                {
+                    return;
+                }
+                if let Some(pt) = decap.plaintext {
+                    deliver(dgram.peer.clone(), pt);
+                }
             }
             for reply in decap.replies {
+                if !magicsock
+                    .is_authorization_current(&dgram.peer, dgram.authorization_generation())
+                {
+                    break;
+                }
                 let _ = magicsock.send(dgram.peer.clone(), &reply).await;
             }
         }
@@ -364,6 +383,29 @@ mod tests {
         })
         .await
         .expect("magicsock without network I/O");
+        magicsock
+            .set_netmap(vec![rustscale_tailcfg::Node {
+                Key: source_public.clone(),
+                ..Default::default()
+            }])
+            .await
+            .unwrap();
+        batch = batch
+            .into_iter()
+            .map(|datagram| {
+                magicsock
+                    .authorized_wg_datagram(datagram.peer, datagram.data.as_ref().to_vec())
+                    .unwrap()
+            })
+            .collect();
+        scalar = scalar
+            .into_iter()
+            .map(|datagram| {
+                magicsock
+                    .authorized_wg_datagram(datagram.peer, datagram.data.as_ref().to_vec())
+                    .unwrap()
+            })
+            .collect();
         let tunnels = RwLock::new(HashMap::from([(source_public, receiver)]));
         let batched_plaintext = Arc::new(std::sync::Mutex::new(Vec::new()));
         let batched_delivery = batched_plaintext.clone();
@@ -406,10 +448,7 @@ mod tests {
         let packet = vec![
             0x45, 0, 0, 20, 0, 1, 0, 0, 64, 17, 0, 0, 100, 64, 0, 1, 100, 64, 0, 2,
         ];
-        let stale = rustscale_magicsock::WgDatagram {
-            peer: old_public.clone(),
-            data: encrypt(&old_sender, &packet).await.into(),
-        };
+        let stale_data = encrypt(&old_sender, &packet).await;
 
         let new_private = NodePrivate::generate();
         let new_public = new_private.public();
@@ -420,10 +459,7 @@ mod tests {
             WgTunn::new(&local_private, &new_public, 13).expect("new receiver"),
         ));
         establish_tunnels(&new_sender, &new_receiver).await;
-        let fresh = rustscale_magicsock::WgDatagram {
-            peer: new_public.clone(),
-            data: encrypt(&new_sender, &packet).await.into(),
-        };
+        let fresh_data = encrypt(&new_sender, &packet).await;
 
         let (magicsock, _receive) = Magicsock::new(rustscale_magicsock::MagicsockConfig {
             private_key: local_private,
@@ -443,6 +479,25 @@ mod tests {
         })
         .await
         .expect("magicsock without network I/O");
+        magicsock
+            .set_netmap(vec![
+                rustscale_tailcfg::Node {
+                    Key: old_public.clone(),
+                    ..Default::default()
+                },
+                rustscale_tailcfg::Node {
+                    Key: new_public.clone(),
+                    ..Default::default()
+                },
+            ])
+            .await
+            .unwrap();
+        let stale = magicsock
+            .authorized_wg_datagram(old_public.clone(), stale_data)
+            .unwrap();
+        let fresh = magicsock
+            .authorized_wg_datagram(new_public.clone(), fresh_data)
+            .unwrap();
         let tunnels = RwLock::new(HashMap::from([(new_public, new_receiver)]));
         let delivered = Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = delivered.clone();
@@ -454,5 +509,66 @@ mod tests {
         assert_eq!(delivered.len(), 1);
         assert_eq!(delivered[0].1, packet);
         assert_ne!(delivered[0].0, old_public);
+    }
+
+    #[tokio::test]
+    async fn queued_ciphertext_is_dropped_after_revocation_commit() {
+        let source_private = NodePrivate::generate();
+        let target_private = NodePrivate::generate();
+        let source_public = source_private.public();
+        let sender = Arc::new(Mutex::new(
+            WgTunn::new(&source_private, &target_private.public(), 11).unwrap(),
+        ));
+        let receiver = Arc::new(Mutex::new(
+            WgTunn::new(&target_private, &source_public, 12).unwrap(),
+        ));
+        establish_tunnels(&sender, &receiver).await;
+        let (magicsock, _receive) = Magicsock::new(rustscale_magicsock::MagicsockConfig {
+            private_key: target_private,
+            disco_key: DiscoPrivate::generate(),
+            derp_client: None,
+            derp_map: None,
+            home_derp_region: 0,
+            udp_bind: None,
+            udp_socket: None,
+            portmapper: None,
+            health: None,
+            disable_direct_paths: false,
+            peer_relay_server: false,
+            relay_server_config: None,
+            sockstats: None,
+            control_knobs: None,
+        })
+        .await
+        .unwrap();
+        let node = rustscale_tailcfg::Node {
+            Key: source_public.clone(),
+            ..Default::default()
+        };
+        magicsock.set_netmap(vec![node.clone()]).await.unwrap();
+        let old_generation = magicsock.authorization_generation(&source_public).unwrap();
+        let plaintext = vec![
+            0x45, 0, 0, 20, 0, 9, 0, 0, 64, 17, 0, 0, 100, 64, 0, 1, 100, 64, 0, 2,
+        ];
+        let queued = magicsock
+            .authorized_wg_datagram(source_public.clone(), encrypt(&sender, &plaintext).await)
+            .unwrap();
+        magicsock.set_netmap(Vec::new()).await.unwrap();
+
+        let tunnels = RwLock::new(HashMap::from([(source_public.clone(), receiver)]));
+        let delivered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = delivered.clone();
+        handle_inbound_wg(&magicsock, &tunnels, &queued, move |_peer, _plaintext| {
+            observed.store(true, std::sync::atomic::Ordering::SeqCst);
+        })
+        .await;
+        assert!(!delivered.load(std::sync::atomic::Ordering::SeqCst));
+
+        magicsock.set_netmap(vec![node]).await.unwrap();
+        assert_ne!(
+            magicsock.authorization_generation(&source_public),
+            Some(old_generation),
+            "reauthorization must use a fresh generation"
+        );
     }
 }

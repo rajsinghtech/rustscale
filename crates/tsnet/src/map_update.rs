@@ -109,7 +109,7 @@ pub(crate) fn spawn_map_update_task(
     cancel: Arc<CancelToken>,
     health: Tracker,
     health_watchdog: Watchdog,
-    state_dir: Option<PathBuf>,
+    state_scope: Option<crate::state::StateScope>,
     mut node_pub: NodePublic,
     control_knobs: Arc<ControlKnobs>,
     key_expired: Arc<std::sync::atomic::AtomicBool>,
@@ -120,10 +120,13 @@ pub(crate) fn spawn_map_update_task(
     suggested_exit_node: Arc<RwLock<String>>,
     client_updater: Arc<std::sync::Mutex<rustscale_clientupdate::ClientUpdater>>,
     tailnet_lock: Arc<crate::tailnet_lock::TailnetLock>,
+    tailnet_identity: String,
 ) -> JoinHandle<()> {
     // Create the netmap cache helper once so that save_if_changed can
     // dedup identical writes via the in-memory SHA-256 hash.
-    let netmap_cache = state_dir.as_ref().map(|dir| NetMapCache::new(dir));
+    let netmap_cache = state_scope
+        .as_ref()
+        .map(|scope| NetMapCache::new_scoped(scope, ""));
     // Watchdog for map-response timeout: fires if no MapResponse for >2m5s
     // (matching Go's MapResponseTimeout duration). Fed on each response.
     let map_timeout_watchdog = Watchdog::new(
@@ -178,6 +181,23 @@ pub(crate) fn spawn_map_update_task(
                         continue;
                     }
 
+                    if !resp.Domain.is_empty() && resp.Domain != tailnet_identity {
+                        log::error!(
+                            "tsnet: control changed tailnet identity for the active profile; failing closed"
+                        );
+                        tailnet_lock.require_fresh_control_state();
+                        raw_peers.clear();
+                        peers_arc.write().await.clear();
+                        wg_tunnels.write().await.clear();
+                        route_table
+                            .write()
+                            .await
+                            .rebuild_with_opts(&[], accept_routes);
+                        let _ = magicsock.set_netmap(Vec::new()).await;
+                        ipn_backend.set_blocked(true);
+                        break;
+                    }
+
                     let tka_state_may_change = first_non_keepalive || resp.TKAInfo.is_some();
                     let tka_sync =
                         tailnet_lock.apply_control_info(resp.TKAInfo.as_ref(), first_non_keepalive);
@@ -221,8 +241,8 @@ pub(crate) fn spawn_map_update_task(
                     ipn_backend.set_key_expired(expired);
                     if expired {
                         log::info!("tsnet: node key expired (signalled by control)");
-                        if let Some(ref dir) = state_dir {
-                            PersistedState::clear_netmap(dir);
+                        if let Some(scope) = state_scope.as_ref() {
+                            NetMapCache::new_scoped(scope, "").clear();
                         }
 
                         // Attempt key rotation: re-register with
@@ -234,7 +254,7 @@ pub(crate) fn spawn_map_update_task(
                                 &node_key,
                                 &magicsock,
                                 &wg_tunnels,
-                                state_dir.as_deref(),
+                                state_scope.as_ref().map(|scope| scope.dir.as_path()),
                                 &ipn_backend,
                             )
                             .await

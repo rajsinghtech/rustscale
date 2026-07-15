@@ -41,6 +41,8 @@ pub(crate) enum TailnetLockError {
     Authority(#[source] rustscale_tka::AuthorityError),
     #[error("Tailnet Lock synchronization failed: {0}")]
     Sync(String),
+    #[error("Tailnet Lock initialization outcome is ambiguous; disablement secrets remain in the durable receipt; check lock status or resume the same transaction")]
+    InitAmbiguous,
     #[error("Tailnet Lock persistence failed")]
     Persistence(#[source] std::io::Error),
 }
@@ -104,10 +106,41 @@ struct FilteredPeer {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub(crate) struct InitRequest {
+    #[serde(default)]
     pub keys: Vec<Key>,
+    #[serde(default)]
     pub disablement_values: Vec<Vec<u8>>,
+    /// Raw one-time secrets corresponding exactly to `disablement_values`.
+    /// They are persisted privately before the first irreversible RPC.
+    #[serde(default)]
+    pub disablement_secrets: Vec<Vec<u8>>,
     #[serde(default)]
     pub support_disablement: Vec<u8>,
+    #[serde(default)]
+    pub resume: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum InitReceiptPhase {
+    Prepared,
+    BeginAccepted,
+    Ambiguous,
+    ControlCommitted,
+    LocalCommitted,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct InitReceipt {
+    version: u32,
+    transaction_id: String,
+    created_unix: u64,
+    phase: InitReceiptPhase,
+    keys: Vec<Key>,
+    disablement_values: Vec<Vec<u8>>,
+    disablement_secrets: Vec<Vec<u8>>,
+    support_disablement: Vec<u8>,
+    genesis_aum: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -116,6 +149,12 @@ pub(crate) struct SignRequest {
     pub node_key: NodePublic,
     #[serde(default)]
     pub rotation_public: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub(crate) struct InitReceiptAck {
+    pub transaction_id: String,
 }
 
 struct NlSigner<'a>(&'a NLPrivate);
@@ -135,6 +174,10 @@ impl TailnetLock {
             dir.join("tailnet-lock")
                 .join(hex::encode(params.signing_key.public().raw32()))
         });
+        if let Some(existing) = path.as_ref().filter(|path| path.exists()) {
+            rustscale_atomicfile::ensure_private_dir(existing)
+                .map_err(TailnetLockError::Persistence)?;
+        }
         let (authority, storage) = match path.as_ref().filter(|path| path.is_dir()) {
             Some(path) => {
                 let storage = Arc::new(
@@ -335,6 +378,39 @@ impl TailnetLock {
         Ok(())
     }
 
+    fn receipt_path(&self) -> Result<PathBuf, TailnetLockError> {
+        self.params
+            .state_dir
+            .as_ref()
+            .map(|dir| dir.join("tailnet-lock-init-receipt.json"))
+            .ok_or(TailnetLockError::NoStateDirectory)
+    }
+
+    fn load_init_receipt(&self) -> Result<Option<InitReceipt>, TailnetLockError> {
+        let path = self.receipt_path()?;
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes =
+            rustscale_atomicfile::read_private(&path).map_err(TailnetLockError::Persistence)?;
+        let receipt = serde_json::from_slice::<InitReceipt>(&bytes).map_err(|_| {
+            TailnetLockError::InvalidRequest("durable initialization receipt is corrupt".into())
+        })?;
+        if receipt.version != 1 {
+            return Err(TailnetLockError::InvalidRequest(
+                "durable initialization receipt version is unsupported".into(),
+            ));
+        }
+        Ok(Some(receipt))
+    }
+
+    fn save_init_receipt(&self, receipt: &InitReceipt) -> Result<(), TailnetLockError> {
+        let bytes = serde_json::to_vec_pretty(receipt)
+            .map_err(|error| TailnetLockError::Persistence(std::io::Error::other(error)))?;
+        rustscale_atomicfile::write_private(&self.receipt_path()?, &bytes)
+            .map_err(TailnetLockError::Persistence)
+    }
+
     fn persist_genesis(
         &self,
         genesis: &Aum,
@@ -344,7 +420,7 @@ impl TailnetLock {
             .as_ref()
             .ok_or(TailnetLockError::NoStateDirectory)?;
         let parent = path.parent().ok_or(TailnetLockError::NoStateDirectory)?;
-        std::fs::create_dir_all(parent).map_err(TailnetLockError::Persistence)?;
+        rustscale_atomicfile::ensure_private_dir(parent).map_err(TailnetLockError::Persistence)?;
         let pending = path.with_extension("pending");
         if pending.exists() {
             std::fs::remove_dir_all(&pending).map_err(TailnetLockError::Persistence)?;
@@ -352,6 +428,8 @@ impl TailnetLock {
         if path.exists() {
             return Err(TailnetLockError::AlreadyEnabled);
         }
+        rustscale_atomicfile::ensure_private_dir(&pending)
+            .map_err(TailnetLockError::Persistence)?;
         let pending_storage = FsChonk::open(&pending)
             .map_err(rustscale_tka::AuthorityError::from)
             .map_err(TailnetLockError::Authority)?;
@@ -488,56 +566,146 @@ impl TailnetLock {
         Ok(())
     }
 
-    /// Initialize control first using an in-memory genesis, then atomically
-    /// publish verified local state. No partial local authority is retained if
-    /// either control phase fails.
-    pub(crate) async fn init(&self, request: InitRequest) -> Result<(), TailnetLockError> {
+    /// Persist the complete disablement receipt before contacting control,
+    /// then perform both irreversible phases on one authenticated session.
+    /// The receipt intentionally survives success until an operator retrieves
+    /// it, so a dropped LocalAPI/control response cannot destroy the secrets.
+    pub(crate) async fn init(
+        &self,
+        request: InitRequest,
+    ) -> Result<Vec<Vec<u8>>, TailnetLockError> {
         let _operation = self.operation.lock().await;
-        if self.authority_snapshot().is_some() {
-            return Err(TailnetLockError::AlreadyEnabled);
-        }
         if self.path.is_none() {
             return Err(TailnetLockError::NoStateDirectory);
         }
-        if !request.support_disablement.is_empty() && request.support_disablement.len() != 32 {
-            return Err(TailnetLockError::InvalidRequest(
-                "support disablement secret must be empty or 32 bytes".into(),
-            ));
-        }
-        let local_id = self.params.signing_key.public().raw32();
-        if !request
-            .keys
-            .iter()
-            .any(|key| key.id().is_ok_and(|id| id == local_id))
-        {
-            return Err(TailnetLockError::InvalidRequest(
-                "the current node's signing key must be trusted".into(),
-            ));
-        }
-        let mut entropy = [0u8; 16];
-        rand_core::OsRng.fill_bytes(&mut entropy);
-        let state = State {
-            last_aum_hash: None,
-            disablement_values: request.disablement_values,
-            keys: request.keys,
-            state_id1: u64::from_le_bytes(entropy[..8].try_into().unwrap()),
-            state_id2: u64::from_le_bytes(entropy[8..].try_into().unwrap()),
+
+        let mut receipt = if request.resume {
+            self.load_init_receipt()?.ok_or_else(|| {
+                TailnetLockError::InvalidRequest(
+                    "there is no durable initialization transaction to resume".into(),
+                )
+            })?
+        } else {
+            if self.authority_snapshot().is_some() {
+                return Err(TailnetLockError::AlreadyEnabled);
+            }
+            if self.load_init_receipt()?.is_some() {
+                return Err(TailnetLockError::InvalidRequest(
+                    "an initialization receipt already exists; resume it instead of generating replacement secrets".into(),
+                ));
+            }
+            if !request.support_disablement.is_empty() && request.support_disablement.len() != 32 {
+                return Err(TailnetLockError::InvalidRequest(
+                    "support disablement secret must be empty or 32 bytes".into(),
+                ));
+            }
+            if request.disablement_secrets.len() != request.disablement_values.len()
+                || request.disablement_secrets.is_empty()
+                || request
+                    .disablement_secrets
+                    .iter()
+                    .zip(&request.disablement_values)
+                    .any(|(secret, value)| rustscale_tka::disablement_kdf(secret) != *value)
+            {
+                return Err(TailnetLockError::InvalidRequest(
+                    "disablement secrets must correspond exactly to their verification values"
+                        .into(),
+                ));
+            }
+            let local_id = self.params.signing_key.public().raw32();
+            if !request
+                .keys
+                .iter()
+                .any(|key| key.id().is_ok_and(|id| id == local_id))
+            {
+                return Err(TailnetLockError::InvalidRequest(
+                    "the current node's signing key must be trusted".into(),
+                ));
+            }
+            let mut entropy = [0u8; 16];
+            rand_core::OsRng.fill_bytes(&mut entropy);
+            let state = State {
+                last_aum_hash: None,
+                disablement_values: request.disablement_values.clone(),
+                keys: request.keys.clone(),
+                state_id1: u64::from_le_bytes(entropy[..8].try_into().unwrap()),
+                state_id2: u64::from_le_bytes(entropy[8..].try_into().unwrap()),
+            };
+            state
+                .validate_checkpoint()
+                .map_err(TailnetLockError::InvalidRequest)?;
+            let memory = MemChonk::new();
+            let signer = NlSigner(&self.params.signing_key);
+            let (_, genesis) = Authority::create(&memory, state, &signer)?;
+            let mut transaction_id = [0u8; 16];
+            rand_core::OsRng.fill_bytes(&mut transaction_id);
+            let receipt = InitReceipt {
+                version: 1,
+                transaction_id: hex::encode(transaction_id),
+                created_unix: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |duration| duration.as_secs()),
+                phase: InitReceiptPhase::Prepared,
+                keys: request.keys,
+                disablement_values: request.disablement_values,
+                disablement_secrets: request.disablement_secrets,
+                support_disablement: request.support_disablement,
+                genesis_aum: genesis.encode(),
+            };
+            // This durable write is the precondition for the first RPC.
+            self.save_init_receipt(&receipt)?;
+            receipt
         };
-        state
-            .validate_checkpoint()
-            .map_err(TailnetLockError::InvalidRequest)?;
-        let memory = MemChonk::new();
-        let signer = NlSigner(&self.params.signing_key);
-        let (_, genesis) = Authority::create(&memory, state, &signer)?;
+
+        if self.authority_snapshot().is_some() {
+            receipt.phase = InitReceiptPhase::LocalCommitted;
+            self.save_init_receipt(&receipt)?;
+            return Ok(receipt.disablement_secrets);
+        }
+        let genesis = Aum::decode(&receipt.genesis_aum).map_err(|_| {
+            TailnetLockError::InvalidRequest("receipt contains malformed genesis state".into())
+        })?;
         let control = self.control();
         let session = TkaClient::new(&control).connect().await?;
+
+        // A prior finish response may have been dropped after control commit.
+        // Confirm the exact genesis instead of issuing replacement init RPCs.
+        if request.resume {
+            if let Ok(bootstrap) = session
+                .bootstrap(&TKABootstrapRequest {
+                    Version: self.params.capability_version,
+                    NodeKey: self.node_public(),
+                    Head: String::new(),
+                })
+                .await
+            {
+                if bootstrap.GenesisAUM == receipt.genesis_aum {
+                    let (authority, storage) = self.persist_genesis(&genesis)?;
+                    let mut inner = self
+                        .inner
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    inner.authority = Some(authority);
+                    inner.storage = Some(storage);
+                    inner.required = true;
+                    inner.ready = true;
+                    drop(inner);
+                    receipt.phase = InitReceiptPhase::LocalCommitted;
+                    self.save_init_receipt(&receipt)?;
+                    return Ok(receipt.disablement_secrets);
+                }
+            }
+        }
+
         let begin = session
             .init_begin(&TKAInitBeginRequest {
                 Version: self.params.capability_version,
                 NodeKey: self.node_public(),
-                GenesisAUM: genesis.encode(),
+                GenesisAUM: receipt.genesis_aum.clone(),
             })
             .await?;
+        receipt.phase = InitReceiptPhase::BeginAccepted;
+        self.save_init_receipt(&receipt)?;
         if begin.NeedSignatures.len() > MAX_INIT_NODES {
             return Err(TailnetLockError::InvalidRequest(
                 "control requested too many initial node signatures".into(),
@@ -555,14 +723,22 @@ impl TailnetLock {
                 self.make_node_signature(&node.NodePublic, &node.RotationPubkey)?,
             );
         }
-        session
+        if session
             .init_finish(&TKAInitFinishRequest {
                 Version: self.params.capability_version,
                 NodeKey: self.node_public(),
                 Signatures: signatures,
-                SupportDisablement: request.support_disablement,
+                SupportDisablement: receipt.support_disablement.clone(),
             })
-            .await?;
+            .await
+            .is_err()
+        {
+            receipt.phase = InitReceiptPhase::Ambiguous;
+            self.save_init_receipt(&receipt)?;
+            return Err(TailnetLockError::InitAmbiguous);
+        }
+        receipt.phase = InitReceiptPhase::ControlCommitted;
+        self.save_init_receipt(&receipt)?;
 
         let (authority, storage) = self.persist_genesis(&genesis)?;
         let mut inner = self
@@ -573,7 +749,29 @@ impl TailnetLock {
         inner.storage = Some(storage);
         inner.required = true;
         inner.ready = true;
-        Ok(())
+        drop(inner);
+        receipt.phase = InitReceiptPhase::LocalCommitted;
+        self.save_init_receipt(&receipt)?;
+        Ok(receipt.disablement_secrets)
+    }
+
+    pub(crate) async fn acknowledge_init_receipt(
+        &self,
+        request: InitReceiptAck,
+    ) -> Result<(), TailnetLockError> {
+        let _operation = self.operation.lock().await;
+        let receipt = self.load_init_receipt()?.ok_or_else(|| {
+            TailnetLockError::InvalidRequest("initialization receipt does not exist".into())
+        })?;
+        if receipt.transaction_id != request.transaction_id
+            || !matches!(receipt.phase, InitReceiptPhase::LocalCommitted)
+        {
+            return Err(TailnetLockError::InvalidRequest(
+                "initialization receipt is not committed or does not match".into(),
+            ));
+        }
+        rustscale_atomicfile::remove_private(&self.receipt_path()?)
+            .map_err(TailnetLockError::Persistence)
     }
 
     pub(crate) async fn sign(&self, request: SignRequest) -> Result<(), TailnetLockError> {
@@ -745,6 +943,14 @@ impl TailnetLock {
     }
 
     pub(crate) fn status_json(&self) -> serde_json::Value {
+        let receipt = self.load_init_receipt().ok().flatten().map(|receipt| {
+            serde_json::json!({
+                "TransactionID": receipt.transaction_id,
+                "Phase": format!("{:?}", receipt.phase),
+                "CreatedUnix": receipt.created_unix,
+                "ResumeCommand": "rustscale lock init --resume --confirm",
+            })
+        });
         let inner = self
             .inner
             .lock()
@@ -789,6 +995,7 @@ impl TailnetLock {
             "NodeKeySigned": self_signed,
             "TrustedKeys": trusted,
             "FilteredPeers": inner.filtered,
+            "InitReceipt": receipt,
         })
     }
 }

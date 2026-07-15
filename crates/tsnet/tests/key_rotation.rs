@@ -91,7 +91,7 @@ async fn key_rotation_reregisters_with_old_node_key() {
     );
 
     // Verify: persisted state has old_node_key set.
-    let state_path: PathBuf = state_tmp.path().join("tsnet-state.json");
+    let state_path: PathBuf = find_state_file(state_tmp.path()).expect("scoped state file");
     let state_json = std::fs::read_to_string(&state_path).expect("read state file");
     assert!(
         state_json.contains("old_node_key"),
@@ -100,6 +100,25 @@ async fn key_rotation_reregisters_with_old_node_key() {
 
     server.close().await;
     eprintln!("key rotation integration test passed");
+}
+
+fn find_state_file(root: &std::path::Path) -> Option<PathBuf> {
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        for entry in std::fs::read_dir(path).ok()?.flatten() {
+            let path = entry.path();
+            if path
+                .file_name()
+                .is_some_and(|name| name == "tsnet-state.json")
+            {
+                return Some(path);
+            }
+            if path.is_dir() {
+                pending.push(path);
+            }
+        }
+    }
+    None
 }
 
 /// Verify that LoginFlags constants exist and have correct values.

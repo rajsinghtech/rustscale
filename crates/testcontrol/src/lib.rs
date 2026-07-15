@@ -111,7 +111,8 @@ struct ServerInner {
     tka_storage: MemChonk,
     tka_authority: Option<Authority>,
     tka_genesis: Option<Aum>,
-    pending_tka_genesis: Option<Aum>,
+    pending_tka_genesis: Option<(u64, Aum)>,
+    drop_next_tka_init_finish_response: bool,
     tka_disabled: bool,
     tka_disablement_secret: Vec<u8>,
     tka_requests: Vec<(String, u64)>,
@@ -184,6 +185,7 @@ impl Server {
                 tka_authority: None,
                 tka_genesis: None,
                 pending_tka_genesis: None,
+                drop_next_tka_init_finish_response: false,
                 tka_disabled: false,
                 tka_disablement_secret: Vec::new(),
                 tka_requests: Vec::new(),
@@ -426,6 +428,14 @@ impl Server {
     /// each request. No request bodies or secret material are retained.
     pub fn tka_request_connections(&self) -> Vec<(String, u64)> {
         self.inner.lock().unwrap().tka_requests.clone()
+    }
+
+    /// Commit the next TKA init finish request, then drop its HTTP response.
+    pub fn drop_next_tka_init_finish_response(&self) {
+        self.inner
+            .lock()
+            .unwrap()
+            .drop_next_tka_init_finish_response = true;
     }
 
     /// Resume generated map responses after `add_raw_map_response` suppressed
@@ -741,11 +751,18 @@ async fn serve_noise_upgrade(
         notify.clone(),
     )
     .await;
-    inner
-        .lock()
-        .unwrap()
-        .active_noise_connections
-        .remove(&connection_id);
+    {
+        let mut state = inner.lock().unwrap();
+        state.active_noise_connections.remove(&connection_id);
+        if state
+            .pending_tka_genesis
+            .as_ref()
+            .is_some_and(|(pending_connection, _)| *pending_connection == connection_id)
+            && state.tka_authority.is_none()
+        {
+            state.pending_tka_genesis = None;
+        }
+    }
     notify.notify_waiters();
 }
 
@@ -909,7 +926,13 @@ async fn handle_h2_request(
                 let _ = respond.send_response(response, true);
                 return Ok(());
             };
-            let (status, response_body) = serve_tka(path, &body, peer_machine_key, inner, notify);
+            let (status, response_body) =
+                serve_tka(path, &body, peer_machine_key, connection_id, inner, notify);
+            if path == "/machine/tka/init/finish"
+                && std::mem::take(&mut inner.lock().unwrap().drop_next_tka_init_finish_response)
+            {
+                return Ok(());
+            }
             let response = http::Response::builder()
                 .status(status)
                 .header("content-type", "application/json")
@@ -957,6 +980,7 @@ fn serve_tka(
     path: &str,
     body: &[u8],
     peer_machine_key: &MachinePublic,
+    connection_id: u64,
     inner: &Arc<Mutex<ServerInner>>,
     notify: &Arc<Notify>,
 ) -> (u16, Vec<u8>) {
@@ -1007,7 +1031,7 @@ fn serve_tka(
             }
             let need_signatures = {
                 let mut state = inner.lock().unwrap();
-                state.pending_tka_genesis = Some(genesis);
+                state.pending_tka_genesis = Some((connection_id, genesis));
                 state
                     .nodes
                     .values()
@@ -1030,9 +1054,12 @@ fn serve_tka(
             if !authenticated(&state, &request.NodeKey, peer_machine_key) {
                 return error(403);
             }
-            let Some(genesis) = state.pending_tka_genesis.clone() else {
+            let Some((begin_connection, genesis)) = state.pending_tka_genesis.clone() else {
                 return error(409);
             };
+            if begin_connection != connection_id {
+                return error(409);
+            }
             let storage = MemChonk::new();
             let Ok(authority) = Authority::bootstrap(&storage, genesis.clone()) else {
                 return error(400);

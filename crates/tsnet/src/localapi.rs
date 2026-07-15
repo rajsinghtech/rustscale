@@ -941,7 +941,38 @@ async fn handle_tka_init<W: AsyncRead + AsyncWrite + Unpin>(
         _ = conn.read(&mut disconnect) => return Ok(()),
     };
     match result {
-        Ok(()) => write_json_response(conn, 200, "OK", &lock.status_json()).await?,
+        Ok(secrets) => {
+            let mut status = lock.status_json();
+            if let Some(object) = status.as_object_mut() {
+                object.insert(
+                    "DisablementSecrets".into(),
+                    serde_json::to_value(secrets).unwrap_or_default(),
+                );
+            }
+            write_json_response(conn, 200, "OK", &status).await?;
+        }
+        Err(error) => write_tka_error(conn, &error).await?,
+    }
+    Ok(())
+}
+
+async fn handle_tka_init_ack<W: AsyncWrite + Unpin>(
+    conn: &mut W,
+    body: &[u8],
+    state: &Arc<LocalApiState>,
+) -> Result<(), std::io::Error> {
+    let Ok(request) = serde_json::from_slice::<crate::tailnet_lock::InitReceiptAck>(body) else {
+        let body = serde_json::json!({"error": "invalid receipt acknowledgement"});
+        write_json_response(conn, 400, "Bad Request", &body).await?;
+        return Ok(());
+    };
+    let Some(lock) = state.tailnet_lock.as_ref() else {
+        let body = serde_json::json!({"error": "Tailnet Lock state is unavailable"});
+        write_json_response(conn, 409, "Conflict", &body).await?;
+        return Ok(());
+    };
+    match lock.acknowledge_init_receipt(request).await {
+        Ok(()) => write_no_content_response(conn, 204, "No Content").await?,
         Err(error) => write_tka_error(conn, &error).await?,
     }
     Ok(())
@@ -1007,6 +1038,11 @@ async fn write_tka_error<W: AsyncWrite + Unpin>(
     use crate::tailnet_lock::TailnetLockError;
     let (status, reason, message) = match error {
         TailnetLockError::InvalidRequest(message) => (400, "Bad Request", message.as_str()),
+        TailnetLockError::InitAmbiguous => (
+            409,
+            "Conflict",
+            "Tailnet Lock initialization outcome is ambiguous; secrets are safe in the durable receipt; check status or resume",
+        ),
         TailnetLockError::AlreadyEnabled
         | TailnetLockError::NotEnabled
         | TailnetLockError::SigningKeyNotTrusted
@@ -1165,6 +1201,7 @@ pub(crate) async fn dispatch<W: AsyncRead + AsyncWrite + Unpin>(
                     "/localapi/v0/reload-config",
                     "/localapi/v0/tka/status",
                     "/localapi/v0/tka/init",
+                    "/localapi/v0/tka/init/ack",
                     "/localapi/v0/tka/sign",
                     "/localapi/v0/tka/disable",
                 ]);
@@ -1248,6 +1285,13 @@ pub(crate) async fn dispatch<W: AsyncRead + AsyncWrite + Unpin>(
                 return Ok(());
             }
             handle_tka_init(conn, &req.body, state).await?;
+        }
+        "tka/init/ack" if method == "POST" => {
+            if !require_readwrite(peer_identity) {
+                write_access_denied(conn).await?;
+                return Ok(());
+            }
+            handle_tka_init_ack(conn, &req.body, state).await?;
         }
         "tka/sign" if method == "POST" => {
             if !require_readwrite(peer_identity) {

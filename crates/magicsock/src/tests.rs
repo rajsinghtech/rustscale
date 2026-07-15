@@ -758,7 +758,8 @@ async fn netmap_refreshes_peer_disco_key_and_reverse_map() {
         assert_eq!(d2p.get(&rotated_disco), Some(&peer_key));
     }
 
-    // A stale mapping must not be removed if another peer now owns the key.
+    // A reverse mapping owned by a peer absent from the new authoritative
+    // netmap must be removed during reconciliation.
     magicsock
         .inner
         .disco_to_peer
@@ -793,8 +794,105 @@ async fn netmap_refreshes_peer_disco_key_and_reverse_map() {
             .read()
             .unwrap()
             .get(&rotated_disco),
-        Some(&other_peer)
+        None
     );
+
+    let old_generation = magicsock.authorization_generation(&peer_key).unwrap();
+    let learned: SocketAddr = "127.0.0.1:4242".parse().unwrap();
+    magicsock
+        .inner
+        .addr_to_peer
+        .write()
+        .unwrap()
+        .insert(learned, peer_key.clone());
+    magicsock.set_netmap(Vec::new()).await.unwrap();
+    assert!(!magicsock
+        .inner
+        .endpoints
+        .read()
+        .unwrap()
+        .contains_key(&peer_key));
+    assert!(!magicsock
+        .inner
+        .addr_to_peer
+        .read()
+        .unwrap()
+        .contains_key(&learned));
+    assert!(magicsock.authorization_generation(&peer_key).is_none());
+
+    magicsock
+        .set_netmap(vec![make_peer(
+            peer_key.clone(),
+            DiscoPrivate::generate().public(),
+            vec![],
+            0,
+        )])
+        .await
+        .unwrap();
+    assert_ne!(
+        magicsock.authorization_generation(&peer_key),
+        Some(old_generation),
+        "reauthorization must create a fresh generation"
+    );
+    assert_eq!(
+        magicsock
+            .inner
+            .endpoints
+            .read()
+            .unwrap()
+            .get(&peer_key)
+            .unwrap()
+            .pending_pings_count(),
+        0,
+        "reauthorization must not inherit probe state"
+    );
+}
+
+#[tokio::test]
+async fn revocation_commit_waits_for_plaintext_delivery_barrier() {
+    let peer = NodePrivate::generate().public();
+    let (magicsock, _rx) = Magicsock::new(MagicsockConfig {
+        private_key: NodePrivate::generate(),
+        disco_key: DiscoPrivate::generate(),
+        derp_client: None,
+        derp_map: None,
+        home_derp_region: 0,
+        udp_bind: None,
+        udp_socket: None,
+        portmapper: None,
+        health: None,
+        disable_direct_paths: false,
+        peer_relay_server: false,
+        relay_server_config: None,
+        sockstats: None,
+        control_knobs: None,
+    })
+    .await
+    .unwrap();
+    magicsock
+        .set_netmap(vec![make_peer(
+            peer.clone(),
+            DiscoPrivate::generate().public(),
+            vec![],
+            0,
+        )])
+        .await
+        .unwrap();
+    let generation = magicsock.authorization_generation(&peer).unwrap();
+    let magicsock = Arc::new(magicsock);
+    let delivery = magicsock.authorization_delivery_guard().await;
+    assert!(magicsock.is_authorization_current(&peer, generation));
+
+    let revoke_socket = magicsock.clone();
+    let revoke = tokio::spawn(async move { revoke_socket.set_netmap(Vec::new()).await.unwrap() });
+    tokio::task::yield_now().await;
+    assert!(
+        magicsock.is_authorization_current(&peer, generation),
+        "commit published while plaintext delivery held the barrier"
+    );
+    drop(delivery);
+    revoke.await.unwrap();
+    assert!(!magicsock.is_authorization_current(&peer, generation));
 }
 
 // ---- Test (a): DERP data path fallback ----

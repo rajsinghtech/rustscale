@@ -319,7 +319,8 @@ const WG_RECEIVE_PACKET_CAPACITY: usize = 256;
 async fn publish_wg_batch(
     sender: &mpsc::Sender<WgReceiveBatch>,
     credits: &Arc<Semaphore>,
-    datagrams: Vec<WgDatagram>,
+    mut datagrams: Vec<WgDatagram>,
+    authorization: Option<(&PeerAuthorization, &Arc<tokio::sync::RwLock<()>>)>,
 ) {
     if datagrams.is_empty() {
         return;
@@ -331,6 +332,20 @@ async fn publish_wg_batch(
     let count = u32::try_from(datagrams.len()).expect("receive batch count fits u32");
     let Ok(permit) = credits.clone().acquire_many_owned(count).await else {
         return;
+    };
+    // Revalidate after backpressure and hold the enqueue side through send;
+    // a revocation commit cannot linearize between this check and queuing.
+    let _enqueue = if let Some((authorization, barrier)) = authorization {
+        let guard = barrier.clone().read_owned().await;
+        datagrams.retain(|datagram| {
+            authorization.is_current(&datagram.peer, datagram.authorization_generation())
+        });
+        if datagrams.is_empty() {
+            return;
+        }
+        Some(guard)
+    } else {
+        None
     };
     // If this await is cancelled or the receiver is closed, `batch` is
     // dropped and its owned permit returns all packet credits.
@@ -344,11 +359,20 @@ async fn publish_wg_batch(
 #[cfg(target_os = "linux")]
 async fn publish_reserved_wg_batch(
     sender: &mpsc::Sender<WgReceiveBatch>,
-    datagrams: Vec<WgDatagram>,
+    mut datagrams: Vec<WgDatagram>,
     channel_permit: OwnedSemaphorePermit,
     pool_reservation: Arc<PoolInventoryReservation>,
+    authorization: &PeerAuthorization,
+    barrier: &Arc<tokio::sync::RwLock<()>>,
 ) {
     debug_assert!(!datagrams.is_empty());
+    let _enqueue = barrier.clone().read_owned().await;
+    datagrams.retain(|datagram| {
+        authorization.is_current(&datagram.peer, datagram.authorization_generation())
+    });
+    if datagrams.is_empty() {
+        return;
+    }
     let batch = WgReceiveBatch::new_pooled(datagrams, channel_permit, pool_reservation);
     let _ = sender.send(batch).await;
 }
@@ -361,7 +385,7 @@ async fn publish_linux_wg_batch(
     pending: &mut Vec<WgDatagram>,
 ) {
     let datagrams = std::mem::take(pending);
-    publish_wg_batch(sender, credits, datagrams).await;
+    publish_wg_batch(sender, credits, datagrams, None).await;
 }
 
 /// Identify ordinary direct WireGuard source runs before awaiting capacity.
@@ -371,6 +395,8 @@ async fn publish_linux_wg_batch(
 #[cfg(any(target_os = "linux", test))]
 struct IdentifiedLinuxWg {
     peers: Vec<Option<NodePublic>>,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    generations: Vec<Option<u64>>,
     received_at: std::time::Instant,
 }
 
@@ -390,8 +416,10 @@ fn identify_linux_wg_peers(
         }
         identified.push(peer.clone());
     }
+    let generations = vec![None; identified.len()];
     IdentifiedLinuxWg {
         peers: identified,
+        generations,
         received_at,
     }
 }
@@ -414,6 +442,7 @@ fn detach_linux_wg_datagrams(
     mut record_phys_rx: impl FnMut(Option<IpAddr>, SocketAddr, u64, u64),
 ) {
     debug_assert_eq!(identified.peers.len(), count);
+    debug_assert_eq!(identified.generations.len(), count);
     let (mut udp4_rx_bytes, mut udp6_rx_bytes) = (0, 0);
     let mut previous = None;
     let mut physical_run: Option<(Option<IpAddr>, SocketAddr, u64, u64)> = None;
@@ -456,7 +485,12 @@ fn detach_linux_wg_datagrams(
             debug_assert_eq!(addr, detached_source);
             pending.push(WgDatagram {
                 peer: peer.clone(),
-                data: WgCiphertext::from_pooled(packet, pool_reservation.clone()),
+                data: WgCiphertext::from_pooled(
+                    packet,
+                    pool_reservation.clone(),
+                    identified.generations[index]
+                        .expect("only authorized packets reserve and detach storage"),
+                ),
             });
         } else if let Some((node, destination, packets, bytes)) = physical_run.take() {
             record_phys_rx(node, destination, packets, bytes);
@@ -651,6 +685,7 @@ pub struct MagicsockConfig {
 /// would either copy a packet or make its lifetime surprising.
 pub struct WgCiphertext {
     storage: WgCiphertextStorage,
+    authorization_generation: u64,
 }
 
 enum WgCiphertextStorage {
@@ -698,6 +733,7 @@ impl WgCiphertext {
         );
         Self {
             storage: WgCiphertextStorage::Vec { bytes, range },
+            authorization_generation: 0,
         }
     }
 
@@ -705,13 +741,20 @@ impl WgCiphertext {
     fn from_pooled(
         packet: udp_batch::PooledPacket,
         pool_reservation: Arc<PoolInventoryReservation>,
+        authorization_generation: u64,
     ) -> Self {
         Self {
             storage: WgCiphertextStorage::Pooled {
                 packet,
                 _pool_reservation: pool_reservation,
             },
+            authorization_generation,
         }
+    }
+
+    fn authorized(mut self, generation: u64) -> Self {
+        self.authorization_generation = generation;
+        self
     }
 
     /// Clone only ordinary owned-vector storage without copying a pooled
@@ -719,9 +762,10 @@ impl WgCiphertext {
     /// uniquely owned until processing completes.
     pub fn try_clone(&self) -> Option<Self> {
         match &self.storage {
-            WgCiphertextStorage::Vec { bytes, range } => {
-                Some(Self::from_vec_range(bytes.clone(), range.clone()))
-            }
+            WgCiphertextStorage::Vec { bytes, range } => Some(
+                Self::from_vec_range(bytes.clone(), range.clone())
+                    .authorized(self.authorization_generation),
+            ),
             #[cfg(target_os = "linux")]
             WgCiphertextStorage::Pooled { .. } => None,
         }
@@ -791,12 +835,60 @@ impl<const N: usize> PartialEq<&[u8; N]> for WgCiphertext {
     }
 }
 
-/// A received WG datagram with its sender identified.
+#[derive(Default)]
+struct PeerAuthorization {
+    state: RwLock<PeerAuthorizationState>,
+}
+
+#[derive(Default)]
+struct PeerAuthorizationState {
+    next_generation: u64,
+    generations: HashMap<NodePublic, u64>,
+}
+
+impl PeerAuthorization {
+    fn generation(&self, peer: &NodePublic) -> Option<u64> {
+        self.state
+            .read()
+            .expect("peer authorization lock poisoned")
+            .generations
+            .get(peer)
+            .copied()
+    }
+
+    fn reconcile(&self, desired: &HashSet<NodePublic>) {
+        let mut state = self
+            .state
+            .write()
+            .expect("peer authorization lock poisoned");
+        state.generations.retain(|peer, _| desired.contains(peer));
+        for peer in desired {
+            if !state.generations.contains_key(peer) {
+                state.next_generation = state.next_generation.wrapping_add(1).max(1);
+                let generation = state.next_generation;
+                state.generations.insert(peer.clone(), generation);
+            }
+        }
+    }
+
+    fn is_current(&self, peer: &NodePublic, generation: u64) -> bool {
+        self.generation(peer) == Some(generation)
+    }
+}
+
+/// A received WG datagram with its sender and authorization generation.
 pub struct WgDatagram {
     /// The peer's WireGuard public key.
     pub peer: NodePublic,
-    /// The raw WG ciphertext datagram.
+    /// The raw WG ciphertext datagram. It privately carries the generation
+    /// stamped by magicsock, so external constructors cannot forge one.
     pub data: WgCiphertext,
+}
+
+impl WgDatagram {
+    pub fn authorization_generation(&self) -> u64 {
+        self.data.authorization_generation
+    }
 }
 
 /// Ordered WireGuard receive burst handed to one tsnet consumer.
@@ -899,6 +991,13 @@ struct Inner {
     /// Multi-region DERP connection manager.
     derp: DerpManager,
     endpoints: RwLock<HashMap<NodePublic, Endpoint>>,
+    /// Linearizable authorization generations published by verified netmaps.
+    /// A queued ciphertext is valid only while its peer retains the exact
+    /// generation stamped before enqueue.
+    peer_authorization: PeerAuthorization,
+    /// Delivery readers hold this across the final plaintext handoff; map
+    /// commits take the writer before publishing generations.
+    authorization_delivery_barrier: Arc<tokio::sync::RwLock<()>>,
     disco_to_peer: RwLock<HashMap<DiscoPublic, NodePublic>>,
     addr_to_peer: RwLock<HashMap<SocketAddr, NodePublic>>,
     wg_send: mpsc::Sender<WgReceiveBatch>,
@@ -1430,6 +1529,8 @@ impl Magicsock {
             local_udp_addrs: RwLock::new(local_udp_addrs),
             derp,
             endpoints: RwLock::new(HashMap::new()),
+            peer_authorization: PeerAuthorization::default(),
+            authorization_delivery_barrier: Arc::new(tokio::sync::RwLock::new(())),
             disco_to_peer: RwLock::new(HashMap::new()),
             addr_to_peer: RwLock::new(HashMap::new()),
             wg_send,
@@ -1720,15 +1821,15 @@ impl Magicsock {
             .write()
             .expect("cli_ping_callbacks lock poisoned")
             .retain(|key, _| desired.contains(key));
-        if let Some(relay) = self
+        let relay_manager = self
             .inner
             .relay_manager
             .read()
             .expect("relay_manager lock poisoned")
-            .as_ref()
-        {
+            .clone();
+        if let Some(relay) = relay_manager {
             for key in &removed {
-                relay.cancel_work(key.clone());
+                relay.cancel_work_and_wait(key.clone()).await;
             }
         }
 
@@ -1805,13 +1906,13 @@ impl Magicsock {
 
         // Discover relay server candidates from the netmap and update the
         // relay manager. Ports Go's `updateRelayServersSet`.
-        if let Some(rm) = self
+        let relay_manager = self
             .inner
             .relay_manager
             .read()
             .expect("relay_manager lock poisoned")
-            .as_ref()
-        {
+            .clone();
+        if let Some(rm) = relay_manager {
             let servers = relay_manager::discover_relay_servers(
                 &rustscale_tailcfg::Node {
                     Key: self
@@ -1827,7 +1928,7 @@ impl Magicsock {
                 &peers,
             );
 
-            rm.handle_relay_servers_set(servers);
+            rm.handle_relay_servers_set_and_wait(servers).await;
 
             // Start relay path discovery for peers that don't already have
             // active relay work.
@@ -1839,7 +1940,44 @@ impl Magicsock {
             }
         }
 
+        // This is the map-application linearization point. Every removed key
+        // has already lost its endpoint, reverse maps, probes, relay work, and
+        // callbacks. Added keys have fresh endpoint state. Ciphertexts stamped
+        // before this publication are rejected by the consumer.
+        let _commit = self.inner.authorization_delivery_barrier.write().await;
+        self.inner.peer_authorization.reconcile(&desired);
         Ok(())
+    }
+
+    /// Return the current authorization generation for an allowed peer.
+    pub fn authorization_generation(&self, peer: &NodePublic) -> Option<u64> {
+        self.inner.peer_authorization.generation(peer)
+    }
+
+    /// Revalidate a queued ciphertext immediately before decapsulation or
+    /// plaintext delivery.
+    pub fn is_authorization_current(&self, peer: &NodePublic, generation: u64) -> bool {
+        self.inner.peer_authorization.is_current(peer, generation)
+    }
+
+    /// Acquire the delivery side of the map-commit barrier. Revalidate while
+    /// this guard is held, then keep it through the final plaintext handoff.
+    pub async fn authorization_delivery_guard(&self) -> tokio::sync::OwnedRwLockReadGuard<()> {
+        self.inner
+            .authorization_delivery_barrier
+            .clone()
+            .read_owned()
+            .await
+    }
+
+    /// Stamp owned ciphertext for an already-authorized peer. Transport
+    /// adapters and tests use this instead of constructing forgeable tokens.
+    pub fn authorized_wg_datagram(&self, peer: NodePublic, data: Vec<u8>) -> Option<WgDatagram> {
+        let generation = self.inner.peer_authorization.generation(&peer)?;
+        Some(WgDatagram {
+            peer,
+            data: WgCiphertext::from(data).authorized(generation),
+        })
     }
 
     /// Install or remove the physical transport connection counter.
@@ -1863,6 +2001,9 @@ impl Magicsock {
     ) -> Result<(), MagicsockError> {
         if datagrams.is_empty() {
             return Ok(());
+        }
+        if self.inner.peer_authorization.generation(&peer).is_none() {
+            return Err(MagicsockError::PeerNotFound);
         }
         // Note TX activity before path lookup. Only an inactive-to-active
         // transition arms the independent heartbeat cadence.
@@ -3406,7 +3547,7 @@ impl Inner {
             return true;
         }
 
-        let identified = {
+        let mut identified = {
             let peers = self
                 .addr_to_peer
                 .read()
@@ -3422,10 +3563,22 @@ impl Inner {
                 received_at,
             )
         };
-        let known = identified
+        for (peer, generation) in identified
             .peers
+            .iter_mut()
+            .zip(identified.generations.iter_mut())
+        {
+            *generation = peer
+                .as_ref()
+                .and_then(|peer| self.peer_authorization.generation(peer));
+            if generation.is_none() {
+                *peer = None;
+            }
+        }
+        let known = identified
+            .generations
             .iter()
-            .filter(|peer| peer.is_some())
+            .filter(|generation| generation.is_some())
             .count();
         if known == 0 {
             pending.clear();
@@ -3484,7 +3637,15 @@ impl Inner {
         }
         debug_assert_eq!(pending.len(), known);
         let datagrams = std::mem::take(pending);
-        publish_reserved_wg_batch(&self.wg_send, datagrams, channel_permit, pool_reservation).await;
+        publish_reserved_wg_batch(
+            &self.wg_send,
+            datagrams,
+            channel_permit,
+            pool_reservation,
+            &self.peer_authorization,
+            &self.authorization_delivery_barrier,
+        )
+        .await;
         false
     }
 
@@ -3539,15 +3700,21 @@ impl Inner {
                     );
                 }
             }
-            publish_wg_batch(
-                &self.wg_send,
-                &self.wg_receive_credits,
-                vec![WgDatagram {
-                    peer: source,
-                    data: WgCiphertext::from_vec_range(frame, payload),
-                }],
-            )
-            .await;
+            if let Some(generation) = self.peer_authorization.generation(&source) {
+                publish_wg_batch(
+                    &self.wg_send,
+                    &self.wg_receive_credits,
+                    vec![WgDatagram {
+                        peer: source,
+                        data: WgCiphertext::from_vec_range(frame, payload).authorized(generation),
+                    }],
+                    Some((
+                        &self.peer_authorization,
+                        &self.authorization_delivery_barrier,
+                    )),
+                )
+                .await;
+            }
         }
     }
 
@@ -3579,6 +3746,11 @@ impl Inner {
             map.get(&src).cloned()
         };
         if let Some(peer) = peer {
+            // Authorize before any queue-credit await. A concurrent revoke
+            // changes the generation and makes this ciphertext stale.
+            let Some(generation) = self.peer_authorization.generation(&peer) else {
+                return;
+            };
             // Note UDP recv activity for heartbeat / UDP lifetime probe.
             let node_addr = {
                 let mut endpoints = self.endpoints.write().expect("endpoints lock poisoned");
@@ -3595,8 +3767,12 @@ impl Inner {
                 &self.wg_receive_credits,
                 vec![WgDatagram {
                     peer,
-                    data: data.to_vec().into(),
+                    data: WgCiphertext::from(data.to_vec()).authorized(generation),
                 }],
+                Some((
+                    &self.peer_authorization,
+                    &self.authorization_delivery_barrier,
+                )),
             )
             .await;
         }
@@ -3672,15 +3848,21 @@ impl Inner {
             // upstream's geneveInclusivePacketLen behavior.
             self.connection_counter
                 .record(node_addr, src, 1, physical_len as u64, true);
-            publish_wg_batch(
-                &self.wg_send,
-                &self.wg_receive_credits,
-                vec![WgDatagram {
-                    peer,
-                    data: data.to_vec().into(),
-                }],
-            )
-            .await;
+            if let Some(generation) = self.peer_authorization.generation(&peer) {
+                publish_wg_batch(
+                    &self.wg_send,
+                    &self.wg_receive_credits,
+                    vec![WgDatagram {
+                        peer,
+                        data: WgCiphertext::from(data.to_vec()).authorized(generation),
+                    }],
+                    Some((
+                        &self.peer_authorization,
+                        &self.authorization_delivery_barrier,
+                    )),
+                )
+                .await;
+            }
         }
     }
 
@@ -4794,6 +4976,7 @@ mod linux_batch_tests {
                 &queued_direct_sender,
                 &queued_direct_credits,
                 pending(WG_RECEIVE_BATCH_MAX_PACKETS),
+                None,
             )
             .await;
         });
@@ -4810,6 +4993,7 @@ mod linux_batch_tests {
                     peer: derp_peer,
                     data: b"derp".to_vec().into(),
                 }],
+                None,
             )
             .await;
         });
@@ -4824,6 +5008,7 @@ mod linux_batch_tests {
                 &sustained_direct_sender,
                 &sustained_direct_credits,
                 pending(WG_RECEIVE_BATCH_MAX_PACKETS),
+                None,
             )
             .await;
         });
@@ -4895,7 +5080,7 @@ mod linux_batch_tests {
         let cancelled_sender = sender.clone();
         let cancelled_credits = credits.clone();
         let cancelled = tokio::spawn(async move {
-            publish_wg_batch(&cancelled_sender, &cancelled_credits, pending(1)).await;
+            publish_wg_batch(&cancelled_sender, &cancelled_credits, pending(1), None).await;
         });
         tokio::task::yield_now().await;
         cancelled.abort();
@@ -4910,7 +5095,7 @@ mod linux_batch_tests {
 
         let (closed_sender, closed_receiver) = mpsc::channel(WG_RECEIVE_PACKET_CAPACITY);
         drop(closed_receiver);
-        publish_wg_batch(&closed_sender, &credits, pending(1)).await;
+        publish_wg_batch(&closed_sender, &credits, pending(1), None).await;
         assert_eq!(credits.available_permits(), WG_RECEIVE_PACKET_CAPACITY);
     }
 }

@@ -85,6 +85,7 @@ async fn status(client: &LocalClient, args: &[String], json: bool) -> Result<(),
 
 async fn init(client: &LocalClient, args: &[String], json: bool) -> Result<(), CliError> {
     let mut confirm = false;
+    let mut resume = false;
     let mut count = 1usize;
     let mut key_args = Vec::new();
     let mut index = 0;
@@ -92,6 +93,8 @@ async fn init(client: &LocalClient, args: &[String], json: bool) -> Result<(), C
         let argument = &args[index];
         if argument == "--confirm" {
             confirm = true;
+        } else if argument == "--resume" {
+            resume = true;
         } else if let Some(value) = argument.strip_prefix("--gen-disablements=") {
             count = parse_count(value)?;
         } else if argument == "--gen-disablements" {
@@ -109,6 +112,30 @@ async fn init(client: &LocalClient, args: &[String], json: bool) -> Result<(), C
     }
 
     let current = client.tailnet_lock_status().await?;
+    let receipt_pending = !current["InitReceipt"].is_null();
+    if resume {
+        if !confirm {
+            return Err(CliError(
+                "resuming returns stored disablement secrets; re-run with --resume --confirm"
+                    .into(),
+            ));
+        }
+        if !receipt_pending {
+            return Err(CliError(
+                "there is no durable Tailnet Lock initialization receipt".into(),
+            ));
+        }
+        let response = client
+            .tailnet_lock_init(&serde_json::json!({"Resume": true}))
+            .await?;
+        return print_init_result(client, response, json).await;
+    }
+    if receipt_pending {
+        return Err(CliError(
+            "a durable initialization receipt already exists; use lock status and lock init --resume --confirm, never generate replacements"
+                .into(),
+        ));
+    }
     if current["Enabled"].as_bool().unwrap_or(false) {
         return Err(CliError("Tailnet Lock is already enabled".into()));
     }
@@ -158,28 +185,61 @@ async fn init(client: &LocalClient, args: &[String], json: bool) -> Result<(), C
     let request = serde_json::json!({
         "Keys": keys,
         "DisablementValues": values,
+        "DisablementSecrets": secrets,
         "SupportDisablement": [],
+        "Resume": false,
     });
-    let response = client.tailnet_lock_init(&request).await?;
-    let encoded_secrets = secrets
-        .into_iter()
-        .map(|secret| format!("disablement-secret:{}", hex::encode_upper(secret)))
-        .collect::<Vec<_>>();
+    let response = match client.tailnet_lock_init(&request).await {
+        Ok(response) => response,
+        Err(error) => {
+            eprintln!(
+                "Tailnet Lock initialization may be ambiguous. The original secrets were durably receipted before control was contacted; run `rustscale lock status` and `rustscale lock init --resume --confirm`. Do not generate replacements."
+            );
+            return Err(error.into());
+        }
+    };
+    print_init_result(client, response, json).await
+}
+
+async fn print_init_result(
+    client: &LocalClient,
+    response: serde_json::Value,
+    json: bool,
+) -> Result<(), CliError> {
+    let secrets = response["DisablementSecrets"]
+        .as_array()
+        .ok_or_else(|| CliError("daemon did not return the durable disablement receipt".into()))?
+        .iter()
+        .map(|secret| {
+            let bytes = secret
+                .as_array()
+                .ok_or_else(|| CliError("daemon returned an invalid disablement receipt".into()))?
+                .iter()
+                .map(|byte| {
+                    byte.as_u64()
+                        .and_then(|byte| u8::try_from(byte).ok())
+                        .ok_or_else(|| {
+                            CliError("daemon returned an invalid disablement receipt".into())
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(format!("disablement-secret:{}", hex::encode_upper(bytes)))
+        })
+        .collect::<Result<Vec<_>, CliError>>()?;
     if json {
-        let output = serde_json::json!({
-            "Status": response,
-            "DisablementSecrets": encoded_secrets,
-        });
         println!(
             "{}",
-            serde_json::to_string_pretty(&output).map_err(|error| CliError(error.to_string()))?
+            serde_json::to_string_pretty(&response).map_err(|error| CliError(error.to_string()))?
         );
     } else {
-        println!("Tailnet Lock initialization complete.");
-        println!("Store these secrets now; they will not be shown again:");
-        for secret in encoded_secrets {
+        println!("Tailnet Lock initialization complete or recovered.");
+        println!("Store these secrets now; the owner-only recovery receipt will be acknowledged after this output:");
+        for secret in secrets {
             println!("  {secret}");
         }
+    }
+    if let Some(transaction_id) = response["InitReceipt"]["TransactionID"].as_str() {
+        client.tailnet_lock_ack_init(transaction_id).await?;
     }
     Ok(())
 }

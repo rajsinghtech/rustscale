@@ -110,6 +110,18 @@ impl LocalClient {
         serde_json::from_slice(&response).map_err(|error| LocalClientError::Json(error.to_string()))
     }
 
+    /// POST /localapi/v0/tka/init/ack — acknowledge receipt recovery.
+    pub async fn tailnet_lock_ack_init(
+        &self,
+        transaction_id: &str,
+    ) -> Result<(), LocalClientError> {
+        let body = serde_json::to_vec(&serde_json::json!({"TransactionID": transaction_id}))
+            .map_err(|error| LocalClientError::Json(error.to_string()))?;
+        self.send_request_with_body("POST", "/localapi/v0/tka/init/ack", &body)
+            .await?;
+        Ok(())
+    }
+
     /// POST /localapi/v0/tka/sign — sign and publish a node key.
     pub async fn tailnet_lock_sign(
         &self,

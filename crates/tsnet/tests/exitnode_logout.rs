@@ -259,8 +259,8 @@ async fn logout_clears_state_to_needs_login() {
     wait_for_state(&socket_path, State::Running, Duration::from_secs(30)).await;
 
     // Verify state file exists before logout.
-    let state_file = state_dir.join("tsnet-state.json");
-    assert!(state_file.exists(), "state file should exist before logout");
+    let state_file = find_named_file(&state_dir, "tsnet-state.json")
+        .expect("scoped state file should exist before logout");
 
     // Call logout on the server.
     server.logout().await.expect("logout");
@@ -297,11 +297,27 @@ async fn logout_clears_state_to_needs_login() {
 
     // Verify: netmap cache was cleared.
     assert!(
-        !state_dir.join("netmap-cache.json").exists(),
+        find_named_file(&state_dir, "netmap-cache.json").is_none(),
         "netmap cache should be cleared after logout"
     );
 
     server.close().await;
+}
+
+fn find_named_file(root: &std::path::Path, name: &str) -> Option<PathBuf> {
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        for entry in std::fs::read_dir(path).ok()?.flatten() {
+            let path = entry.path();
+            if path.is_file() && path.file_name().is_some_and(|candidate| candidate == name) {
+                return Some(path);
+            }
+            if path.is_dir() {
+                pending.push(path);
+            }
+        }
+    }
+    None
 }
 
 /// Gap 2: POST /logout via LocalAPI fires the logout_trigger and

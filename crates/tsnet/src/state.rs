@@ -11,7 +11,44 @@ use sha2::{Digest, Sha256};
 /// Cache file format version. Bumped on breaking changes to the envelope
 /// structure; mismatched versions are rejected on load so a stale cache
 /// from an older format is discarded cleanly rather than partially parsed.
-const NETMAP_CACHE_VERSION: u32 = 1;
+const NETMAP_CACHE_VERSION: u32 = 2;
+
+/// Durable profile/control namespace for identity, netmap, and TKA state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StateScope {
+    pub profile_id: String,
+    pub control_identity: String,
+    pub dir: PathBuf,
+}
+
+impl StateScope {
+    pub(crate) fn new(root: &Path, control_url: &str) -> Self {
+        let profile_id = rustscale_ipn::LoginProfile::load_current_id(root)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "default".to_string());
+        let control_identity = hex::encode(sha256(control_url.as_bytes()));
+        let mut binding = Sha256::new();
+        binding.update(profile_id.as_bytes());
+        binding.update([0]);
+        binding.update(control_identity.as_bytes());
+        let namespace = hex::encode(binding.finalize());
+        Self {
+            profile_id,
+            control_identity,
+            dir: root.join("profile-state").join(namespace),
+        }
+    }
+
+    pub(crate) fn bind(&self, state: &mut PersistedState) {
+        state.profile_id.clone_from(&self.profile_id);
+        state.control_identity.clone_from(&self.control_identity);
+    }
+
+    pub(crate) fn matches(&self, state: &PersistedState) -> bool {
+        state.profile_id == self.profile_id && state.control_identity == self.control_identity
+    }
+}
 
 /// Errors from state file operations.
 #[derive(Debug, thiserror::Error)]
@@ -27,6 +64,16 @@ pub enum StateError {
 /// Serialized as JSON in `state_dir/tsnet-state.json`.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PersistedState {
+    /// Durable profile and exact control namespace this identity belongs to.
+    #[serde(default)]
+    pub profile_id: String,
+    #[serde(default)]
+    pub control_identity: String,
+    /// Tailnet identity learned from the netmap. It is informational until
+    /// registration, but once set prevents accepting a cache for another
+    /// tailnet served by the same control URL.
+    #[serde(default)]
+    pub tailnet_identity: String,
     /// The WireGuard node private key (serialized as `privkey:<hex>`).
     pub node_key: NodePrivate,
     /// The machine private key (control plane).
@@ -57,6 +104,9 @@ pub struct PersistedState {
 impl Default for PersistedState {
     fn default() -> Self {
         Self {
+            profile_id: String::new(),
+            control_identity: String::new(),
+            tailnet_identity: String::new(),
             node_key: NodePrivate::from_raw32([0u8; 32]),
             machine_key: MachinePrivate::from_raw32([0u8; 32]),
             disco_key: DiscoPrivate::from_raw32([0u8; 32]),
@@ -73,6 +123,9 @@ impl PersistedState {
     /// Generate fresh keys for a new server.
     pub fn generate() -> Self {
         Self {
+            profile_id: String::new(),
+            control_identity: String::new(),
+            tailnet_identity: String::new(),
             node_key: NodePrivate::generate(),
             machine_key: MachinePrivate::generate(),
             disco_key: DiscoPrivate::generate(),
@@ -98,19 +151,15 @@ impl PersistedState {
 
     /// Load state from a JSON file.
     pub fn load(path: &Path) -> Result<Self, StateError> {
-        let data = std::fs::read_to_string(path)?;
-        Ok(serde_json::from_str(&data)?)
+        let data = rustscale_atomicfile::read_private(path)?;
+        Ok(serde_json::from_slice(&data)?)
     }
 
-    /// Save state to a JSON file (atomic: write to tmp + rename).
+    /// Save state using an owner-only atomic replacement with durable parent
+    /// fsync. Symlink and non-regular targets are rejected.
     pub fn save(&self, path: &Path) -> Result<(), StateError> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let data = serde_json::to_string_pretty(self)?;
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, data)?;
-        std::fs::rename(&tmp, path)?;
+        let data = serde_json::to_vec_pretty(self)?;
+        rustscale_atomicfile::write_private(path, &data)?;
         Ok(())
     }
 
@@ -168,6 +217,12 @@ pub struct NetMapCacheData {
     #[serde(default)]
     pub version: u32,
     pub node_key: NodePublic,
+    #[serde(default)]
+    pub profile_id: String,
+    #[serde(default)]
+    pub control_identity: String,
+    #[serde(default)]
+    pub tailnet_identity: String,
     pub map_response: MapResponse,
 }
 
@@ -178,6 +233,9 @@ pub struct NetMapCacheData {
 /// skipped (dedup), avoiding unnecessary disk I/O on every MapResponse.
 pub struct NetMapCache {
     path: PathBuf,
+    profile_id: String,
+    control_identity: String,
+    expected_tailnet_identity: String,
     last_hash: Mutex<Option<[u8; 32]>>,
 }
 
@@ -186,6 +244,19 @@ impl NetMapCache {
     pub fn new(dir: &Path) -> Self {
         Self {
             path: dir.join("netmap-cache.json"),
+            profile_id: String::new(),
+            control_identity: String::new(),
+            expected_tailnet_identity: String::new(),
+            last_hash: Mutex::new(None),
+        }
+    }
+
+    pub(crate) fn new_scoped(scope: &StateScope, expected_tailnet_identity: &str) -> Self {
+        Self {
+            path: scope.dir.join("netmap-cache.json"),
+            profile_id: scope.profile_id.clone(),
+            control_identity: scope.control_identity.clone(),
+            expected_tailnet_identity: expected_tailnet_identity.to_string(),
             last_hash: Mutex::new(None),
         }
     }
@@ -195,12 +266,23 @@ impl NetMapCache {
     pub fn load(&self) -> Option<NetMapCacheData> {
         let data = std::fs::read(&self.path).ok()?;
         match serde_json::from_slice::<NetMapCacheData>(&data) {
-            Ok(c) => {
+            Ok(c)
+                if (self.profile_id.is_empty() || c.profile_id == self.profile_id)
+                    && (self.control_identity.is_empty()
+                        || c.control_identity == self.control_identity)
+                    && (self.expected_tailnet_identity.is_empty()
+                        || c.tailnet_identity == self.expected_tailnet_identity) =>
+            {
                 // Seed the in-memory hash so a subsequent save_if_changed
                 // of the same content is deduped.
                 let digest = sha256(&data);
                 *self.last_hash.lock().unwrap() = Some(digest);
                 Some(c)
+            }
+            Ok(_) => {
+                log::warn!("tsnet: netmap cache identity binding mismatch; discarding");
+                let _ = std::fs::remove_file(&self.path);
+                None
             }
             Err(e) => {
                 log::warn!("tsnet: netmap cache corrupt ({e}); discarding");
@@ -222,6 +304,9 @@ impl NetMapCache {
         let data = serde_json::to_vec(&NetMapCacheData {
             version: NETMAP_CACHE_VERSION,
             node_key: node_key.clone(),
+            profile_id: self.profile_id.clone(),
+            control_identity: self.control_identity.clone(),
+            tailnet_identity: resp.Domain.clone(),
             map_response: resp.clone(),
         })
         .map_err(std::io::Error::other)?;
@@ -236,9 +321,7 @@ impl NetMapCache {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, &data)?;
-        std::fs::rename(&tmp, &self.path)?;
+        rustscale_atomicfile::write(&self.path, &data)?;
 
         *self.last_hash.lock().unwrap() = Some(digest);
         Ok(())
@@ -260,6 +343,63 @@ fn sha256(data: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profile_and_control_scopes_do_not_share_identity_or_cache() {
+        let root = tempfile::tempdir().unwrap();
+        rustscale_ipn::LoginProfile::save_current_id(root.path(), "a").unwrap();
+        let a = StateScope::new(root.path(), "https://control-a.example");
+        rustscale_ipn::LoginProfile::save_current_id(root.path(), "b").unwrap();
+        let b = StateScope::new(root.path(), "https://control-a.example");
+        let other_control = StateScope::new(root.path(), "https://control-b.example");
+        assert_ne!(a.dir, b.dir);
+        assert_ne!(b.dir, other_control.dir);
+
+        let mut a_state = PersistedState::generate();
+        a.bind(&mut a_state);
+        a_state.tailnet_identity = "tailnet-a".into();
+        a_state.save(&a.dir.join("tsnet-state.json")).unwrap();
+        assert!(PersistedState::load(&b.dir.join("tsnet-state.json")).is_err());
+
+        let response = MapResponse {
+            Domain: "tailnet-a".into(),
+            ..Default::default()
+        };
+        NetMapCache::new_scoped(&a, "tailnet-a")
+            .save_if_changed(&a_state.node_key.public(), &response)
+            .unwrap();
+        assert!(NetMapCache::new_scoped(&a, "tailnet-b").load().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_load_repairs_legacy_owner_modes_and_rejects_symlink() {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+        let root = tempfile::tempdir().unwrap();
+        let private = root.path().join("scope");
+        std::fs::create_dir(&private).unwrap();
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = private.join("tsnet-state.json");
+        let state = PersistedState::generate();
+        std::fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        PersistedState::load(&path).unwrap();
+        assert_eq!(
+            std::fs::metadata(&private).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        std::fs::remove_file(&path).unwrap();
+        let target = private.join("target");
+        std::fs::write(&target, serde_json::to_vec(&state).unwrap()).unwrap();
+        symlink(target, &path).unwrap();
+        assert!(PersistedState::load(&path).is_err());
+    }
 
     #[test]
     fn state_save_load_roundtrip() {
@@ -482,6 +622,9 @@ mod tests {
         let bad = NetMapCacheData {
             version: 999,
             node_key: node_pub.clone(),
+            profile_id: String::new(),
+            control_identity: String::new(),
+            tailnet_identity: resp.Domain.clone(),
             map_response: resp.clone(),
         };
         let data = serde_json::to_vec(&bad).expect("serialize");

@@ -54,7 +54,9 @@ async fn lock_init_filters_unsigned_recovers_and_disables() {
             meta: None,
         }],
         "DisablementValues": [disablement_kdf(&secret)],
+        "DisablementSecrets": [secret.clone()],
         "SupportDisablement": [],
+        "Resume": false,
     });
     let initialized = client.tailnet_lock_init(&request).await.unwrap();
     let init_request_snapshot = control.tka_request_connections();
@@ -71,7 +73,8 @@ async fn lock_init_filters_unsigned_recovers_and_disables() {
         "init phases must share one authenticated Noise session"
     );
     assert!(initialized["Enabled"].as_bool().unwrap());
-    assert!(state.path().join("tailnet-lock").is_dir());
+    let authority_root = find_dir(state.path(), "tailnet-lock").expect("authority root");
+    assert!(authority_root.is_dir());
 
     // The node present during init was signed atomically. A node introduced
     // later has no signature and must never reach magicsock/routes/status.
@@ -151,8 +154,10 @@ async fn lock_init_filters_unsigned_recovers_and_disables() {
     // accepted, rebuilding durable state from canonical CBOR.
     control.resume_auto_map(&self_node);
     server.close().await;
-    rustscale_tsnet::PersistedState::clear_netmap(state.path());
-    std::fs::remove_dir_all(state.path().join("tailnet-lock")).unwrap();
+    if let Some(cache) = find_file(state.path(), "netmap-cache.json") {
+        std::fs::remove_file(cache).unwrap();
+    }
+    std::fs::remove_dir_all(&authority_root).unwrap();
     let tka_requests_before_recovery = control.tka_request_connections().len();
     let mut recovered = Server::builder()
         .hostname("lock-e2e")
@@ -196,7 +201,9 @@ async fn lock_init_filters_unsigned_recovers_and_disables() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
     assert!(recovered_status["Enabled"].as_bool().unwrap());
-    assert!(state.path().join("tailnet-lock").is_dir());
+    let recovered_authority_root =
+        find_dir(state.path(), "tailnet-lock").expect("recovered authority root");
+    assert!(recovered_authority_root.is_dir());
 
     // Disablement is checked locally, sent over Noise, and only removes local
     // durable state after the confirming disabled netmap supplies the proof.
@@ -216,6 +223,32 @@ async fn lock_init_filters_unsigned_recovers_and_disables() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert!(!state.path().join("tailnet-lock").exists());
+    assert!(!recovered_authority_root.exists());
     recovered.close().await;
+}
+
+fn find_dir(root: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
+    find_entry(root, name, true)
+}
+
+fn find_file(root: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
+    find_entry(root, name, false)
+}
+
+fn find_entry(root: &std::path::Path, name: &str, directory: bool) -> Option<std::path::PathBuf> {
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        for entry in std::fs::read_dir(path).ok()?.flatten() {
+            let path = entry.path();
+            if path.file_name().is_some_and(|candidate| candidate == name)
+                && path.is_dir() == directory
+            {
+                return Some(path);
+            }
+            if path.is_dir() {
+                pending.push(path);
+            }
+        }
+    }
+    None
 }

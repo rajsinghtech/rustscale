@@ -248,7 +248,7 @@ impl Server {
             b.cancel.clone(),
             b.health.clone(),
             b.health_watchdog.clone(),
-            self.config.state_dir.clone(),
+            b.state_scope.clone(),
             b.node_key.public(),
             b.control_knobs.clone(),
             b.key_expired.clone(),
@@ -259,6 +259,7 @@ impl Server {
             suggested_exit_node.clone(),
             client_updater.clone(),
             b.tailnet_lock.clone(),
+            b.domain.clone(),
         );
 
         // MagicDNS responder: best-effort UDP server at 100.100.100.100:53.
@@ -793,7 +794,7 @@ impl Server {
             b.cancel.clone(),
             b.health.clone(),
             b.health_watchdog.clone(),
-            self.config.state_dir.clone(),
+            b.state_scope.clone(),
             b.node_key.public(),
             b.control_knobs.clone(),
             b.key_expired.clone(),
@@ -804,6 +805,7 @@ impl Server {
             suggested_exit_node.clone(),
             client_updater.clone(),
             b.tailnet_lock.clone(),
+            b.domain.clone(),
         );
 
         // Taildrop file manager (shared between PeerAPI receive handler
@@ -1505,6 +1507,7 @@ impl Server {
         // is enabled. Used for Hostinfo.RoutableIPs, the filter's localNets,
         // and link-change endpoint updates.
         let advertise = self.config.effective_advertise_routes();
+        let state_scope = self.profile_state_scope();
 
         // Health tracker + map-poll staleness watchdog (fires if no
         // MapResponse for more than 3 minutes).
@@ -1546,8 +1549,8 @@ impl Server {
             self.save_state(&state)?;
         }
 
-        let private_log_id = if let Some(dir) = self.config.state_dir.as_ref() {
-            rustscale_logid::PrivateID::load_or_create(&dir.join("logid-private"))?
+        let private_log_id = if let Some(scope) = state_scope.as_ref() {
+            rustscale_logid::PrivateID::load_or_create(&scope.dir.join("logid-private"))?
         } else {
             rustscale_logid::PrivateID::new()
         };
@@ -1563,11 +1566,11 @@ impl Server {
         // with an existing state dir, this lets us skip the blocking first
         // MapResponse fetch (2-5s) and use the cached peers immediately —
         // the streaming long-poll delivers fresh updates in the background.
-        let cached_netmap = self
-            .config
-            .state_dir
-            .as_ref()
-            .and_then(|dir| PersistedState::load_netmap(dir, &node_pub));
+        let cached_netmap = state_scope.as_ref().and_then(|scope| {
+            let cache = NetMapCache::new_scoped(scope, &state.tailnet_identity);
+            let cached = cache.load()?;
+            (cached.version == 2 && cached.node_key == node_pub).then_some(cached.map_response)
+        });
 
         // 2. Fetch the server's Noise public key (GET /key?v=<version>).
         let server_pub_key = controlhttp::fetch_server_pub_key(
@@ -1612,8 +1615,8 @@ impl Server {
         let reg_resp = register_result.map_err(|e| {
             // Auth/network failure is ambiguous. The key is not retained, so
             // a fresh WIF key is minted if the caller starts again.
-            if let Some(ref dir) = self.config.state_dir {
-                PersistedState::clear_netmap(dir);
+            if let Some(scope) = state_scope.as_ref() {
+                NetMapCache::new_scoped(scope, &state.tailnet_identity).clear();
                 log::warn!("tsnet: cleared netmap cache after register error: {e}");
             }
             ipn_backend.emit_err_message(e.to_string());
@@ -1622,8 +1625,8 @@ impl Server {
 
         // Server-side error string (e.g. "invalid auth key", "node key revoked").
         if !reg_resp.Error.is_empty() {
-            if let Some(ref dir) = self.config.state_dir {
-                PersistedState::clear_netmap(dir);
+            if let Some(scope) = state_scope.as_ref() {
+                NetMapCache::new_scoped(scope, &state.tailnet_identity).clear();
                 log::warn!(
                     "tsnet: cleared netmap cache after register error: {}",
                     reg_resp.Error
@@ -1639,8 +1642,8 @@ impl Server {
         // Node key expired — the server says our key is no longer valid.
         // Clear the cache so we don't reuse a netmap bound to the old key.
         if reg_resp.NodeKeyExpired {
-            if let Some(ref dir) = self.config.state_dir {
-                PersistedState::clear_netmap(dir);
+            if let Some(scope) = state_scope.as_ref() {
+                NetMapCache::new_scoped(scope, &state.tailnet_identity).clear();
                 log::info!("tsnet: cleared netmap cache: node key expired");
             }
             ipn_backend.set_key_expired(true);
@@ -1687,8 +1690,8 @@ impl Server {
                     ..Default::default()
                 };
                 let followup_resp = cc.register(&followup_req).await.map_err(|e| {
-                    if let Some(ref dir) = self.config.state_dir {
-                        PersistedState::clear_netmap(dir);
+                    if let Some(scope) = state_scope.as_ref() {
+                        NetMapCache::new_scoped(scope, &state.tailnet_identity).clear();
                     }
                     ipn_backend.emit_err_message(e.to_string());
                     TsnetError::Register(e)
@@ -1807,6 +1810,18 @@ impl Server {
             .map_err(|_| TsnetError::MapTimeout)??
         };
 
+        if !map_resp.Domain.is_empty() {
+            if !state.tailnet_identity.is_empty() && state.tailnet_identity != map_resp.Domain {
+                return Err(TsnetError::TailnetLock(
+                    "control returned a different tailnet for this durable profile identity".into(),
+                ));
+            }
+            if state.tailnet_identity != map_resp.Domain {
+                state.tailnet_identity.clone_from(&map_resp.Domain);
+                self.save_state(&state)?;
+            }
+        }
+
         let tailnet_lock = tailnet_lock::TailnetLock::open(tailnet_lock::TailnetLockParams {
             control_url: self.config.control_url.clone(),
             machine_key: state.machine_key.clone(),
@@ -1815,7 +1830,7 @@ impl Server {
             signing_key: state.network_lock_key.clone(),
             capability_version: CAPABILITY_VERSION,
             protocol_version: PROTOCOL_VERSION,
-            state_dir: self.config.state_dir.clone(),
+            state_dir: state_scope.as_ref().map(|scope| scope.dir.clone()),
             extra_root_certs: self.config.extra_root_certs.clone(),
         })
         .map_err(|error| TsnetError::TailnetLock(error.to_string()))?;
@@ -2298,6 +2313,7 @@ impl Server {
             backend_log_id,
             private_log_id,
             tailnet_lock,
+            state_scope,
         })
     }
 
@@ -2445,12 +2461,14 @@ impl Server {
         }
 
         // 2. Clear persisted state: regenerate keys, clear netmap cache.
-        if let Some(ref dir) = self.config.state_dir {
+        if self.config.state_dir.is_some() {
             let fresh = PersistedState::generate();
             if let Err(e) = self.save_state(&fresh) {
                 log::warn!("tsnet: failed to clear state on logout: {e}");
             }
-            PersistedState::clear_netmap(dir);
+            if let Some(scope) = self.profile_state_scope() {
+                NetMapCache::new_scoped(&scope, "").clear();
+            }
         }
 
         // 3. Set prefs LoggedOut=true, WantRunning=false.
@@ -2600,20 +2618,61 @@ impl Server {
         logger
     }
 
+    pub(crate) fn profile_state_scope(&self) -> Option<crate::state::StateScope> {
+        self.config
+            .state_dir
+            .as_deref()
+            .map(|root| crate::state::StateScope::new(root, &self.config.control_url))
+    }
+
     pub(crate) fn load_or_create_state(&self) -> Result<PersistedState, TsnetError> {
-        if let Some(ref dir) = self.config.state_dir {
-            let path = dir.join("tsnet-state.json");
+        if let Some(scope) = self.profile_state_scope() {
+            let path = scope.dir.join("tsnet-state.json");
             if path.exists() {
-                return Ok(PersistedState::load(&path)?);
+                let state = PersistedState::load(&path)?;
+                if !scope.matches(&state) {
+                    return Err(TsnetError::Builder(
+                        "persisted identity profile/control binding mismatch".into(),
+                    ));
+                }
+                return Ok(state);
+            }
+
+            // Migrate the historical unscoped identity only when ownership is
+            // unambiguous. Multi-profile legacy state cannot be attributed
+            // safely and is intentionally left unused rather than crossed.
+            let root = self.config.state_dir.as_deref().expect("scope has root");
+            let legacy = root.join("tsnet-state.json");
+            if legacy.exists() {
+                let profiles = rustscale_ipn::LoginProfile::load_all(root).unwrap_or_default();
+                let current = rustscale_ipn::LoginProfile::load_current_id(root)
+                    .ok()
+                    .flatten();
+                let unambiguous = (profiles.is_empty() && current.is_none())
+                    || (profiles.len() == 1
+                        && current.as_deref() == Some(profiles[0].ID.as_str())
+                        && (profiles[0].ControlURL.is_empty()
+                            || profiles[0].ControlURL == self.config.control_url));
+                if unambiguous {
+                    let mut state = PersistedState::load(&legacy)?;
+                    scope.bind(&mut state);
+                    state.save(&path)?;
+                    rustscale_atomicfile::remove_private(&legacy)?;
+                    return Ok(state);
+                }
+                return Err(TsnetError::Builder(
+                    "legacy identity cannot be safely attributed to the active profile".into(),
+                ));
             }
         }
         Ok(PersistedState::default())
     }
 
     pub(crate) fn save_state(&self, state: &PersistedState) -> Result<(), TsnetError> {
-        if let Some(ref dir) = self.config.state_dir {
-            let path = dir.join("tsnet-state.json");
-            state.save(&path)?;
+        if let Some(scope) = self.profile_state_scope() {
+            let mut state = state.clone();
+            scope.bind(&mut state);
+            state.save(&scope.dir.join("tsnet-state.json"))?;
         }
         Ok(())
     }

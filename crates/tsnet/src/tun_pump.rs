@@ -187,6 +187,9 @@ async fn process_tun_inbound_batch(
     outbound_sender: Option<&mut OutboundSendPipeline>,
 ) -> bool {
     let map_guard = peer_map.gate.read().await;
+    inbound.datagrams.retain(|datagram| {
+        magicsock.is_authorization_current(&datagram.peer, datagram.authorization_generation())
+    });
     if !collect_tun_inbound_batch(wg_tunnels, inbound, cancel).await {
         return false;
     }
@@ -203,7 +206,7 @@ async fn process_tun_inbound_batch(
     // reply I/O or a blocked TUN write.
     inbound.datagrams.clear();
     let reply_socket = magicsock.clone();
-    flush_inbound_burst(tun, inbound, move |peer, reply| {
+    flush_inbound_burst_authorized(tun, inbound, magicsock.as_ref(), move |peer, reply| {
         let magicsock = reply_socket.clone();
         async move {
             let _ = magicsock.send(peer, &reply).await;
@@ -382,7 +385,13 @@ async fn run_tun_pump_pipeline_inner(
             };
 
             let map_guard = peer_map.gate.read().await;
-            if !commit_or_scalar_tun_inbound_batch(&wg_tunnels, &mut current, &cancel).await {
+            if current.datagrams.iter().any(|datagram| {
+                !magicsock
+                    .is_authorization_current(&datagram.peer, datagram.authorization_generation())
+            }) {
+                current.clear();
+            } else if !commit_or_scalar_tun_inbound_batch(&wg_tunnels, &mut current, &cancel).await
+            {
                 break 'pump;
             }
             authorize_tun_inbound_batch(&peer_map, &packet_drops, &mut current);
@@ -393,9 +402,10 @@ async fn run_tun_pump_pipeline_inner(
                 break 'pump;
             }
             let flushed = {
-                let flush = flush_inbound_burst_pipeline(
+                let flush = flush_inbound_burst_pipeline_authorized(
                     tun.as_ref(),
                     &mut current,
+                    magicsock.as_ref(),
                     |peer, reply| {
                         let magicsock = magicsock.clone();
                         async move {
@@ -680,17 +690,22 @@ async fn tick_wg_timers_pipeline_inner(
 
 /// Send replies before the one batch write, then reset the logical plaintext
 /// length. The owned plaintext slots remain available for the next burst.
-async fn flush_inbound_burst<F, Fut>(
+async fn flush_inbound_burst_authorized<F, Fut>(
     tun: &dyn Tun,
     inbound: &mut InboundBatchScratch,
+    magicsock: &Magicsock,
     mut send_reply: F,
 ) where
     F: FnMut(NodePublic, Vec<u8>) -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
-    for (peer, reply) in inbound.replies.drain(..) {
-        send_reply(peer, reply).await;
+    for (peer, generation, reply) in inbound.replies.drain(..) {
+        if magicsock.is_authorization_current(&peer, generation) {
+            send_reply(peer, reply).await;
+        }
     }
+    let _delivery = magicsock.authorization_delivery_guard().await;
+    retain_current_authorization(magicsock, inbound);
     if !inbound.plaintext.is_empty() {
         if let Err(error) = tun.write_batch(inbound.plaintext.packets_mut()).await {
             log::warn!("tun batch write error: {error}");
@@ -702,14 +717,16 @@ async fn flush_inbound_burst<F, Fut>(
     inbound.plaintext.clear();
     inbound.plaintext.release_oversized_slots();
     inbound.plaintext_peers.clear();
+    inbound.plaintext_generations.clear();
 }
 
 /// Cancellation-aware pipeline flush. Dropping the in-flight reply/write
 /// future on cancellation releases the scratch rather than leaving the pump
 /// parked behind a device or transport operation.
-async fn flush_inbound_burst_pipeline<F, Fut>(
+async fn flush_inbound_burst_pipeline_authorized<F, Fut>(
     tun: &dyn Tun,
     inbound: &mut InboundBatchScratch,
+    magicsock: &Magicsock,
     mut send_reply: F,
     cancel: &CancelToken,
 ) -> bool
@@ -717,12 +734,16 @@ where
     F: FnMut(NodePublic, Vec<u8>) -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
-    for (peer, reply) in inbound.replies.drain(..) {
-        tokio::select! {
-            () = send_reply(peer, reply) => {}
-            () = cancel.cancelled() => return false,
+    for (peer, generation, reply) in inbound.replies.drain(..) {
+        if magicsock.is_authorization_current(&peer, generation) {
+            tokio::select! {
+                () = send_reply(peer, reply) => {}
+                () = cancel.cancelled() => return false,
+            }
         }
     }
+    let _delivery = magicsock.authorization_delivery_guard().await;
+    retain_current_authorization(magicsock, inbound);
     if !inbound.plaintext.is_empty() {
         let result = {
             let packets = inbound.plaintext.packets_mut();
@@ -741,7 +762,84 @@ where
     inbound.plaintext.clear();
     inbound.plaintext.release_oversized_slots();
     inbound.plaintext_peers.clear();
+    inbound.plaintext_generations.clear();
     true
+}
+
+#[cfg(test)]
+async fn flush_inbound_burst<F, Fut>(
+    tun: &dyn Tun,
+    inbound: &mut InboundBatchScratch,
+    mut send_reply: F,
+) where
+    F: FnMut(NodePublic, Vec<u8>) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    for (peer, _, reply) in inbound.replies.drain(..) {
+        send_reply(peer, reply).await;
+    }
+    if !inbound.plaintext.is_empty() {
+        let _ = tun.write_batch(inbound.plaintext.packets_mut()).await;
+    }
+    inbound.plaintext.clear();
+    inbound.plaintext.release_oversized_slots();
+    inbound.plaintext_peers.clear();
+    inbound.plaintext_generations.clear();
+}
+
+#[cfg(test)]
+async fn flush_inbound_burst_pipeline<F, Fut>(
+    tun: &dyn Tun,
+    inbound: &mut InboundBatchScratch,
+    mut send_reply: F,
+    cancel: &CancelToken,
+) -> bool
+where
+    F: FnMut(NodePublic, Vec<u8>) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    for (peer, _, reply) in inbound.replies.drain(..) {
+        tokio::select! {
+            () = send_reply(peer, reply) => {}
+            () = cancel.cancelled() => return false,
+        }
+    }
+    if !inbound.plaintext.is_empty() {
+        let result = tokio::select! {
+            result = tun.write_batch(inbound.plaintext.packets_mut()) => result,
+            () = cancel.cancelled() => return false,
+        };
+        let _ = result;
+    }
+    inbound.plaintext.clear();
+    inbound.plaintext.release_oversized_slots();
+    inbound.plaintext_peers.clear();
+    inbound.plaintext_generations.clear();
+    true
+}
+
+fn retain_current_authorization(magicsock: &Magicsock, inbound: &mut InboundBatchScratch) {
+    debug_assert_eq!(inbound.plaintext.len(), inbound.plaintext_peers.len());
+    debug_assert_eq!(inbound.plaintext.len(), inbound.plaintext_generations.len());
+    let mut source = 0;
+    let mut retained = 0;
+    inbound.plaintext.retain_mut(|_| {
+        let keep = magicsock.is_authorization_current(
+            &inbound.plaintext_peers[source],
+            inbound.plaintext_generations[source],
+        );
+        if keep {
+            if retained != source {
+                inbound.plaintext_peers[retained] = inbound.plaintext_peers[source].clone();
+                inbound.plaintext_generations[retained] = inbound.plaintext_generations[source];
+            }
+            retained += 1;
+        }
+        source += 1;
+        keep
+    });
+    inbound.plaintext_peers.truncate(retained);
+    inbound.plaintext_generations.truncate(retained);
 }
 
 /// Reused state for one bounded inbound WireGuard burst.
@@ -750,9 +848,11 @@ struct InboundBatchScratch {
     datagrams: Vec<rustscale_magicsock::WgDatagram>,
     runs: Vec<InboundBatchRun>,
     plaintext: rustscale_wg::WgPlaintextBatch,
-    /// Identity aligned with each initialized `plaintext` slot.
+    /// Identity and authorization generation aligned with each initialized
+    /// `plaintext` slot.
     plaintext_peers: Vec<NodePublic>,
-    replies: Vec<(NodePublic, Vec<u8>)>,
+    plaintext_generations: Vec<u64>,
+    replies: Vec<(NodePublic, u64, Vec<u8>)>,
     /// One opaque entry per ciphertext datagram while this scratch is OPENED.
     opened: Vec<Option<rustscale_wg::WgOpenedPacket>>,
     /// Reused only by the ordered pump commit; always empty before this owned
@@ -780,6 +880,7 @@ impl InboundBatchScratch {
         self.runs.clear();
         self.plaintext.clear();
         self.plaintext_peers.clear();
+        self.plaintext_generations.clear();
         self.replies.clear();
     }
 }
@@ -859,10 +960,13 @@ async fn collect_tun_inbound_batch(
                 {
                     for _ in plaintext_start..inbound.plaintext.len() {
                         inbound.plaintext_peers.push(run.peer.clone());
+                        inbound
+                            .plaintext_generations
+                            .push(datagram.authorization_generation());
                     }
-                    inbound
-                        .replies
-                        .extend(replies.into_iter().map(|reply| (run.peer.clone(), reply)));
+                    inbound.replies.extend(replies.into_iter().map(|reply| {
+                        (run.peer.clone(), datagram.authorization_generation(), reply)
+                    }));
                 }
             }
         }
@@ -1015,6 +1119,9 @@ async fn commit_or_scalar_tun_inbound_batch(
             match tunnel.commit_opened(opened, &mut inbound.plaintext) {
                 Ok(rustscale_wg::WgCommitResult::Accepted) => {
                     inbound.plaintext_peers.push(run.peer.clone());
+                    inbound
+                        .plaintext_generations
+                        .push(inbound.datagrams[index].authorization_generation());
                 }
                 Ok(rustscale_wg::WgCommitResult::Dropped) => {}
                 // A complete prevalidation makes this structurally
@@ -1070,7 +1177,15 @@ fn filter_tun_inbound_batch(
     capture: &crate::capture::CaptureSlot,
     inbound: &mut InboundBatchScratch,
 ) {
+    #[cfg(test)]
+    if inbound.plaintext_generations.is_empty() && !inbound.plaintext.is_empty() {
+        // Filter-only unit tests construct post-decryption scratch directly.
+        inbound
+            .plaintext_generations
+            .resize(inbound.plaintext.len(), 0);
+    }
     debug_assert_eq!(inbound.plaintext.len(), inbound.plaintext_peers.len());
+    debug_assert_eq!(inbound.plaintext.len(), inbound.plaintext_generations.len());
     let mut source = 0;
     let mut retained = 0;
     let mut filt = filter.lock().unwrap();
@@ -1082,6 +1197,7 @@ fn filter_tun_inbound_batch(
             crate::capture::log_packet(capture, crate::capture::CapturePath::FromPeer, packet);
             if retained != source {
                 inbound.plaintext_peers[retained] = inbound.plaintext_peers[source].clone();
+                inbound.plaintext_generations[retained] = inbound.plaintext_generations[source];
             }
             retained += 1;
         } else {
@@ -1092,6 +1208,7 @@ fn filter_tun_inbound_batch(
     });
     drop(filt);
     inbound.plaintext_peers.truncate(retained);
+    inbound.plaintext_generations.truncate(retained);
 }
 
 /// Reused state for one outbound kernel-TUN read.
@@ -2554,6 +2671,19 @@ mod tests {
         })
         .await
         .expect("magicsock");
+        magicsock
+            .set_netmap(vec![Node {
+                Key: source_public.clone(),
+                ..Default::default()
+            }])
+            .await
+            .unwrap();
+        let first_datagram = magicsock
+            .authorized_wg_datagram(source_public.clone(), first)
+            .unwrap();
+        let second_datagram = magicsock
+            .authorized_wg_datagram(source_public.clone(), second.clone())
+            .unwrap();
         let (wg_tx, wg_rx) = mpsc::channel(2);
         let tunnels = Arc::new(RwLock::new(HashMap::from([(
             source_public.clone(),
@@ -2586,12 +2716,7 @@ mod tests {
         tokio::task::yield_now().await;
         wg_tx
             .send(
-                rustscale_magicsock::WgReceiveBatch::from_datagrams_for_test(vec![
-                    rustscale_magicsock::WgDatagram {
-                        peer: source_public.clone(),
-                        data: first.into(),
-                    },
-                ]),
+                rustscale_magicsock::WgReceiveBatch::from_datagrams_for_test(vec![first_datagram]),
             )
             .await
             .expect("first batch");
@@ -2601,12 +2726,7 @@ mod tests {
             .expect("N write signal closed");
         wg_tx
             .send(
-                rustscale_magicsock::WgReceiveBatch::from_datagrams_for_test(vec![
-                    rustscale_magicsock::WgDatagram {
-                        peer: source_public.clone(),
-                        data: second.clone().into(),
-                    },
-                ]),
+                rustscale_magicsock::WgReceiveBatch::from_datagrams_for_test(vec![second_datagram]),
             )
             .await
             .expect("second batch");
@@ -2725,6 +2845,25 @@ mod tests {
         })
         .await
         .expect("magicsock");
+        magicsock
+            .set_netmap(vec![
+                Node {
+                    Key: source_public.clone(),
+                    ..Default::default()
+                },
+                Node {
+                    Key: dummy_key.clone(),
+                    ..Default::default()
+                },
+            ])
+            .await
+            .unwrap();
+        let n_datagram = magicsock
+            .authorized_wg_datagram(source_public.clone(), n)
+            .unwrap();
+        let n_plus_one_datagram = magicsock
+            .authorized_wg_datagram(source_public.clone(), n_plus_one.clone())
+            .unwrap();
         let (wg_tx, wg_rx) = mpsc::channel(2);
         let tunnels = Arc::new(RwLock::new(HashMap::from([
             (source_public.clone(), receiver.clone()),
@@ -2755,14 +2894,7 @@ mod tests {
             Some(timer_tx),
         ));
         wg_tx
-            .send(
-                rustscale_magicsock::WgReceiveBatch::from_datagrams_for_test(vec![
-                    rustscale_magicsock::WgDatagram {
-                        peer: source_public.clone(),
-                        data: n.into(),
-                    },
-                ]),
-            )
+            .send(rustscale_magicsock::WgReceiveBatch::from_datagrams_for_test(vec![n_datagram]))
             .await
             .unwrap();
         opened_rx.recv().await.expect("N opened");
@@ -2773,10 +2905,7 @@ mod tests {
         wg_tx
             .send(
                 rustscale_magicsock::WgReceiveBatch::from_datagrams_for_test(vec![
-                    rustscale_magicsock::WgDatagram {
-                        peer: source_public.clone(),
-                        data: n_plus_one.clone().into(),
-                    },
+                    n_plus_one_datagram,
                 ]),
             )
             .await
@@ -3405,7 +3534,7 @@ mod tests {
         let mut inbound = InboundBatchScratch::default();
         inbound.plaintext.push_copy(&[1]).unwrap();
         inbound.plaintext.push_copy(&[2]).unwrap();
-        inbound.replies = vec![(peer.clone(), vec![3]), (peer, vec![4])];
+        inbound.replies = vec![(peer.clone(), 0, vec![3]), (peer, 0, vec![4])];
         let reply_events = events.clone();
         flush_inbound_burst(&tun, &mut inbound, move |_peer, _reply| {
             let events = reply_events.clone();
@@ -3470,7 +3599,7 @@ mod tests {
         let peer = NodePrivate::generate().public();
         let mut inbound = InboundBatchScratch::default();
         inbound.plaintext.push_copy(&[1]).unwrap();
-        inbound.replies = vec![(peer.clone(), vec![2]), (peer, vec![3])];
+        inbound.replies = vec![(peer.clone(), 0, vec![2]), (peer, 0, vec![3])];
         let task = tokio::spawn(async move {
             flush_inbound_burst(&tun, &mut inbound, move |_peer, _reply| {
                 let seen = seen.clone();

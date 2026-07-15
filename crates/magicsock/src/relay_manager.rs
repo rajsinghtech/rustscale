@@ -114,8 +114,12 @@ enum RelayEvent {
     },
     CancelWork {
         peer_key: NodePublic,
+        done: Option<tokio::sync::oneshot::Sender<()>>,
     },
-    ServersUpdate(Vec<CandidatePeerRelay>),
+    ServersUpdate {
+        servers: Vec<CandidatePeerRelay>,
+        done: Option<tokio::sync::oneshot::Sender<()>>,
+    },
     ServerUpsert(CandidatePeerRelay),
     ServerRemove(NodePublic),
     NewServerEndpoint {
@@ -248,11 +252,45 @@ impl RelayManagerHandle {
     }
 
     pub fn cancel_work(&self, peer_key: NodePublic) {
-        let _ = self.tx.send(RelayEvent::CancelWork { peer_key });
+        let _ = self.tx.send(RelayEvent::CancelWork {
+            peer_key,
+            done: None,
+        });
+    }
+
+    pub async fn cancel_work_and_wait(&self, peer_key: NodePublic) {
+        let (done, wait) = tokio::sync::oneshot::channel();
+        if self
+            .tx
+            .send(RelayEvent::CancelWork {
+                peer_key,
+                done: Some(done),
+            })
+            .is_ok()
+        {
+            let _ = wait.await;
+        }
     }
 
     pub fn handle_relay_servers_set(&self, servers: Vec<CandidatePeerRelay>) {
-        let _ = self.tx.send(RelayEvent::ServersUpdate(servers));
+        let _ = self.tx.send(RelayEvent::ServersUpdate {
+            servers,
+            done: None,
+        });
+    }
+
+    pub async fn handle_relay_servers_set_and_wait(&self, servers: Vec<CandidatePeerRelay>) {
+        let (done, wait) = tokio::sync::oneshot::channel();
+        if self
+            .tx
+            .send(RelayEvent::ServersUpdate {
+                servers,
+                done: Some(done),
+            })
+            .is_ok()
+        {
+            let _ = wait.await;
+        }
     }
 
     pub fn handle_relay_server_upsert(&self, server: CandidatePeerRelay) {
@@ -369,11 +407,17 @@ async fn run_event_loop<RM: RelayManagerContext>(
                     allocate_all_servers(&mut state, &ctx, &event_tx, peer_key, peer_disco);
                 }
             }
-            RelayEvent::CancelWork { peer_key } => {
+            RelayEvent::CancelWork { peer_key, done } => {
                 stop_work(&mut state, &peer_key);
+                if let Some(done) = done {
+                    let _ = done.send(());
+                }
             }
-            RelayEvent::ServersUpdate(servers) => {
+            RelayEvent::ServersUpdate { servers, done } => {
                 handle_servers_update(&mut state, servers);
+                if let Some(done) = done {
+                    let _ = done.send(());
+                }
             }
             RelayEvent::ServerUpsert(server) => {
                 state

@@ -967,6 +967,8 @@ pub(crate) struct Bootstrap {
     pub(crate) private_log_id: rustscale_logid::PrivateID,
     /// Tailnet Lock authority and fail-closed peer verifier.
     pub(crate) tailnet_lock: Arc<tailnet_lock::TailnetLock>,
+    /// Durable profile/control namespace for identity, netmap, and TKA data.
+    pub(crate) state_scope: Option<state::StateScope>,
 }
 
 /// An embedded Tailscale server.

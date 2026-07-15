@@ -226,58 +226,61 @@ where
 
     // Only a structurally valid SOAP Fault proves that Add was rejected.
     // Malformed HTTP responses remain ambiguous and retain ownership.
-    if let Some(code) = soap_fault_code(&resp) {
+    if matches!(
+        soap_fault_code(&resp),
+        Some(SoapFaultCode::OnlyPermanentLeasesSupported | SoapFaultCode::InvalidArgs)
+    ) {
         rejected(port, false);
-        if code == 725 || code == 402 {
-            let body = build_add_port_mapping_soap(
-                service_type,
-                "",
-                port,
-                "UDP",
-                internal_port,
-                internal_client,
-                true,
-                "rustscale-portmap",
-                0,
-            );
-            drop(send_permit);
-            let _send_permit = before_send(port, true).map_err(|source| AmbiguousAddError {
-                port,
-                permanent: true,
-                source,
-            })?;
-            let (status, resp) = http::http_post_soap(
-                &svc.control_url,
-                &soap_action,
-                SOAP_CONTENT_TYPE,
-                &body,
-                deadline,
-            )
-            .await
-            .map_err(|source| AmbiguousAddError {
-                port,
-                permanent: true,
-                source,
-            })?;
-            if status == 200
-                && soap_response_is_success(&resp, "AddPortMappingResponse", service_type)
-            {
-                return Ok(UpnpAllocation {
-                    port,
-                    permanent: true,
-                });
-            }
-            if soap_fault_code(&resp).is_some() {
-                rejected(port, true);
-            }
-            return Err(AmbiguousAddError {
+        let body = build_add_port_mapping_soap(
+            service_type,
+            "",
+            port,
+            "UDP",
+            internal_port,
+            internal_client,
+            true,
+            "rustscale-portmap",
+            0,
+        );
+        drop(send_permit);
+        let _send_permit = before_send(port, true).map_err(|source| AmbiguousAddError {
+            port,
+            permanent: true,
+            source,
+        })?;
+        let (status, resp) = http::http_post_soap(
+            &svc.control_url,
+            &soap_action,
+            SOAP_CONTENT_TYPE,
+            &body,
+            deadline,
+        )
+        .await
+        .map_err(|source| AmbiguousAddError {
+            port,
+            permanent: true,
+            source,
+        })?;
+        if status == 200 && soap_response_is_success(&resp, "AddPortMappingResponse", service_type)
+        {
+            return Ok(UpnpAllocation {
                 port,
                 permanent: true,
-                source: std::io::Error::other(format!(
-                    "permanent AddPortMapping malformed/fault (status={status})"
-                )),
             });
         }
+        if matches!(
+            soap_fault_code(&resp),
+            Some(SoapFaultCode::OnlyPermanentLeasesSupported | SoapFaultCode::InvalidArgs)
+        ) {
+            rejected(port, true);
+        }
+        return Err(AmbiguousAddError {
+            port,
+            permanent: true,
+            source: std::io::Error::other(format!(
+                "permanent AddPortMapping malformed/fault (status={status})"
+            )),
+        });
     }
 
     Err(AmbiguousAddError {
@@ -332,22 +335,87 @@ fn delete_response_is_success(status: u16, response: &str, service_type: &str) -
 }
 
 fn soap_not_found(body: &str) -> bool {
-    soap_fault_code(body) == Some(714)
+    soap_fault_code(body) == Some(SoapFaultCode::NoSuchEntryInArray)
 }
 
-fn soap_fault_code(body: &str) -> Option<u32> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SoapFaultCode {
+    InvalidArgs,
+    NoSuchEntryInArray,
+    OnlyPermanentLeasesSupported,
+}
+
+fn soap_fault_code(body: &str) -> Option<SoapFaultCode> {
+    const CONTROL_ERROR_NAMESPACE: &str = "urn:schemas-upnp-org:control-1-0";
+
     let elements = parse_xml_elements(body)?;
     if !has_strict_soap_body(&elements, "Fault") {
         return None;
     }
-    let mut codes = elements
+    let codes: Vec<_> = elements
         .iter()
-        .filter(|element| element.name.local == "errorCode");
-    let code = codes.next()?;
-    if codes.next().is_some() {
+        .enumerate()
+        .filter(|(_, element)| element.name.local == "errorCode")
+        .collect();
+    if codes.len() != 1 {
         return None;
     }
-    code.text.trim().parse().ok()
+    let (code_index, code) = codes[0];
+    if code.name.namespace.as_deref() != Some(CONTROL_ERROR_NAMESPACE)
+        || elements
+            .iter()
+            .any(|element| element.parent_index == Some(code_index))
+    {
+        return None;
+    }
+
+    let upnp_error_index = code.parent_index?;
+    let upnp_error = elements.get(upnp_error_index)?;
+    if upnp_error.name.local != "UPnPError"
+        || upnp_error.name.namespace.as_deref() != Some(CONTROL_ERROR_NAMESPACE)
+    {
+        return None;
+    }
+    let detail_index = upnp_error.parent_index?;
+    let detail = elements.get(detail_index)?;
+    let fault_index = detail.parent_index?;
+    let fault = elements.get(fault_index)?;
+    let body_index = fault.parent_index?;
+    let soap_body = elements.get(body_index)?;
+    let envelope_index = soap_body.parent_index?;
+    let envelope = elements.get(envelope_index)?;
+    let soap_namespace = envelope.name.namespace.as_deref()?;
+    let detail_is_standard = match soap_namespace {
+        "http://schemas.xmlsoap.org/soap/envelope/" => {
+            detail.name.local == "detail" && detail.name.namespace.is_none()
+        }
+        "http://www.w3.org/2003/05/soap-envelope" => {
+            detail.name.local == "Detail"
+                && detail.name.namespace.as_deref() == Some(soap_namespace)
+        }
+        _ => false,
+    };
+    if !detail_is_standard
+        || fault.name.local != "Fault"
+        || fault.name.namespace.as_deref() != Some(soap_namespace)
+        || soap_body.name.local != "Body"
+        || soap_body.name.namespace.as_deref() != Some(soap_namespace)
+        || envelope.name.local != "Envelope"
+        || envelope.parent_index.is_some()
+    {
+        return None;
+    }
+
+    let value = code.text.trim();
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    match value.parse::<u32>().ok()? {
+        402 => Some(SoapFaultCode::InvalidArgs),
+        714 => Some(SoapFaultCode::NoSuchEntryInArray),
+        725 => Some(SoapFaultCode::OnlyPermanentLeasesSupported),
+        _ => None,
+    }
 }
 
 fn soap_response_is_success(body: &str, response_element: &str, service_type: &str) -> bool {
@@ -375,6 +443,7 @@ struct XmlName {
 struct XmlElement {
     name: XmlName,
     parent: Option<XmlName>,
+    parent_index: Option<usize>,
     text: String,
 }
 
@@ -514,6 +583,7 @@ fn parse_xml_elements(xml: &str) -> Option<Vec<XmlElement>> {
         elements.push(XmlElement {
             name: name.clone(),
             parent: stack.last().map(|frame| frame.name.clone()),
+            parent_index: stack.last().map(|frame| frame.element_index),
             text: String::new(),
         });
         if !self_closing {
@@ -878,7 +948,7 @@ mod tests {
         ));
         assert!(delete_response_is_success(
             500,
-            r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" xmlns:x="urn:error"><s:Body><s:Fault><x:errorCode>714</x:errorCode></s:Fault></s:Body></s:Envelope>"#,
+            r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><s:Fault><detail><UPnPError xmlns="urn:schemas-upnp-org:control-1-0"><errorCode>714</errorCode></UPnPError></detail></s:Fault></s:Body></s:Envelope>"#,
             "urn:upnp"
         ));
         assert!(!delete_response_is_success(
@@ -985,23 +1055,50 @@ mod tests {
     }
 
     #[test]
-    fn fallback_fault_requires_direct_soap_structure() {
+    fn fault_code_requires_exact_upnp_error_path_and_namespace() {
+        let valid_725 = r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+<s:Body><s:Fault><detail><UPnPError xmlns="urn:schemas-upnp-org:control-1-0">
+<errorCode>7&#50;5</errorCode></UPnPError></detail></s:Fault></s:Body></s:Envelope>"#;
         assert_eq!(
-            soap_fault_code("<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body><s:Fault><errorCode>7&#50;5</errorCode></s:Fault></s:Body></s:Envelope>"),
-            Some(725)
+            soap_fault_code(valid_725),
+            Some(SoapFaultCode::OnlyPermanentLeasesSupported)
         );
+        assert!(!soap_not_found(valid_725));
+
+        let valid_714 = r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+<s:Body><s:Fault><detail><u:UPnPError xmlns:u="urn:schemas-upnp-org:control-1-0">
+<u:errorCode>714</u:errorCode></u:UPnPError></detail></s:Fault></s:Body></s:Envelope>"#;
         assert_eq!(
-            soap_fault_code("<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body><s:Fault><errorCode>7&bad;5</errorCode></s:Fault></s:Body></s:Envelope>"),
-            None
+            soap_fault_code(valid_714),
+            Some(SoapFaultCode::NoSuchEntryInArray)
         );
+        assert!(soap_not_found(valid_714));
+
+        let valid_402_soap12 = r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">
+<s:Body><s:Fault><s:Detail><u:UPnPError xmlns:u="urn:schemas-upnp-org:control-1-0">
+<u:errorCode>402</u:errorCode></u:UPnPError></s:Detail></s:Fault></s:Body></s:Envelope>"#;
         assert_eq!(
-            soap_fault_code("<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body><wrapper><s:Fault><errorCode>725</errorCode></s:Fault></wrapper></s:Body></s:Envelope>"),
-            None
+            soap_fault_code(valid_402_soap12),
+            Some(SoapFaultCode::InvalidArgs)
         );
-        assert_eq!(
-            soap_fault_code("<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body><s:Fault/><extra><errorCode>725</errorCode></extra></s:Body></s:Envelope>"),
-            None
-        );
+        assert!(!soap_not_found(valid_402_soap12));
+
+        for invalid in [
+            // Wrong ancestry.
+            r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" xmlns:u="urn:schemas-upnp-org:control-1-0"><s:Body><s:Fault><u:errorCode>725</u:errorCode></s:Fault></s:Body></s:Envelope>"#,
+            r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" xmlns:u="urn:schemas-upnp-org:control-1-0"><s:Body><s:Fault><detail><wrapper><u:UPnPError><u:errorCode>725</u:errorCode></u:UPnPError></wrapper></detail></s:Fault></s:Body></s:Envelope>"#,
+            // evil:errorCode and wrong UPnP control namespaces.
+            r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" xmlns:u="urn:schemas-upnp-org:control-1-0" xmlns:evil="urn:evil"><s:Body><s:Fault><detail><u:UPnPError><evil:errorCode>725</evil:errorCode></u:UPnPError></detail></s:Fault></s:Body></s:Envelope>"#,
+            r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" xmlns:u="urn:wrong"><s:Body><s:Fault><detail><u:UPnPError><u:errorCode>725</u:errorCode></u:UPnPError></detail></s:Fault></s:Body></s:Envelope>"#,
+            r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" xmlns:u="urn:schemas-upnp-org:control-1-0"><s:Body><s:Fault><detail><u:UPnPError><errorCode>725</errorCode></u:UPnPError></detail></s:Fault></s:Body></s:Envelope>"#,
+            // Duplicate, malformed, nested, and unrecognized values.
+            r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" xmlns:u="urn:schemas-upnp-org:control-1-0"><s:Body><s:Fault><detail><u:UPnPError><u:errorCode>725</u:errorCode><u:errorCode>725</u:errorCode></u:UPnPError></detail></s:Fault></s:Body></s:Envelope>"#,
+            r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" xmlns:u="urn:schemas-upnp-org:control-1-0"><s:Body><s:Fault><detail><u:UPnPError><u:errorCode>7&bad;5</u:errorCode></u:UPnPError></detail></s:Fault></s:Body></s:Envelope>"#,
+            r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" xmlns:u="urn:schemas-upnp-org:control-1-0"><s:Body><s:Fault><detail><u:UPnPError><u:errorCode>7<x/>25</u:errorCode></u:UPnPError></detail></s:Fault></s:Body></s:Envelope>"#,
+            r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" xmlns:u="urn:schemas-upnp-org:control-1-0"><s:Body><s:Fault><detail><u:UPnPError><u:errorCode>501</u:errorCode></u:UPnPError></detail></s:Fault></s:Body></s:Envelope>"#,
+        ] {
+            assert_eq!(soap_fault_code(invalid), None, "accepted {invalid}");
+        }
     }
 
     #[test]

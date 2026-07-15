@@ -319,7 +319,7 @@ impl FakeIgd {
                     if req.contains("<NewLeaseDuration>0</NewLeaseDuration>") {
                         write_soap_response(stream, "").await;
                     } else {
-                        write_soap_response(stream, r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><s:Fault><errorCode>725</errorCode></s:Fault></s:Body></s:Envelope>"#).await;
+                        write_soap_response(stream, r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><s:Fault><detail><UPnPError xmlns="urn:schemas-upnp-org:control-1-0"><errorCode>725</errorCode></UPnPError></detail></s:Fault></s:Body></s:Envelope>"#).await;
                     }
                 } else {
                     write_soap_response(stream, TEST_ADD_PORT_MAPPING_RESPONSE).await;
@@ -338,7 +338,7 @@ impl FakeIgd {
             if action.contains("DeletePortMapping") {
                 self.upnp_delete_count.fetch_add(1, Ordering::Relaxed);
                 if self.upnp_delete_fault {
-                    write_soap_response(stream, r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><s:Fault><errorCode>501</errorCode></s:Fault></s:Body></s:Envelope>"#).await;
+                    write_soap_response(stream, r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><s:Fault><detail><UPnPError xmlns="urn:schemas-upnp-org:control-1-0"><errorCode>501</errorCode></UPnPError></detail></s:Fault></s:Body></s:Envelope>"#).await;
                     return;
                 }
                 write_soap_response(stream, r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:DeletePortMappingResponse xmlns:u="urn:schemas-upnp-org:service:WANIPConnection:1"/></s:Body></s:Envelope>"#).await;

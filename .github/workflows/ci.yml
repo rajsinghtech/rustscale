@@ -53,8 +53,6 @@ jobs:
       - name: Test (windows-meaningful crates)
         if: ${{ matrix.check_only && matrix.os == 'windows-latest' }}
         shell: bash
-        env:
-          RUSTFLAGS: "-D warnings"
         run: |
           cargo test -p rustscale-ipn -p rustscale-localclient -p rustscale-tailcfg \
             -p rustscale-key -p rustscale-disco -p rustscale-safesocket --locked

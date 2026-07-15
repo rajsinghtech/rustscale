@@ -560,8 +560,7 @@ pub(crate) fn spawn_map_update_task(
 /// Re-register with the control server after a key expiry.
 ///
 /// Mirrors Go's `doLogin` with `regen=true` (`direct.go:739-926`):
-/// 1. Refresh the current key. If control still reports it expired, wait for
-///    a later control update instead of transferring the node repeatedly.
+/// 1. Refresh the current key. If control reports it expired, regenerate it.
 /// 2. Save current key as `OldPrivateNodeKey` and generate a fresh node key.
 /// 3. Send `RegisterRequest` with `OldNodeKey` + `NodeKey`.
 /// 4. If `resp.AuthURL` is non-empty, send a followup and block until
@@ -569,8 +568,9 @@ pub(crate) fn spawn_map_update_task(
 /// 5. On success, persist the new key, re-key magicsock, and clear WG
 ///    tunnels so they are recreated with the new key.
 ///
-/// `Ok(None)` means the existing key is globally expired but still valid;
-/// the current map stream remains active so an un-expire update can recover.
+/// `Ok(None)` means control also rejected the fresh replacement key, which
+/// indicates a global expiry policy. The current map stream remains active so
+/// an un-expire update can recover.
 async fn perform_key_rotation(
     ctx: &KeyRotationCtx,
     current_key: &NodePrivate,
@@ -582,10 +582,9 @@ async fn perform_key_rotation(
     let old_key = current_key.clone();
     let old_pub = old_key.public();
 
-    // Match the upstream client's refresh-before-regenerate behavior. This
-    // distinguishes an individually expired node key from a control policy
-    // that currently marks every key expired. Rotating during a global expiry
-    // would transfer the node on every retry and strand the active map poll.
+    // Match the upstream client's refresh-before-regenerate behavior. An
+    // expired current key requires regeneration; a replacement that is also
+    // expired indicates a global expiry policy and must not be promoted.
     let refresh_req = RegisterRequest {
         Version: ctx.capability_version,
         NodeKey: old_pub.clone(),
@@ -622,10 +621,11 @@ async fn perform_key_rotation(
             refresh.Error
         ));
     }
-    if refresh.NodeKeyExpired {
-        return Ok(None);
+    if !refresh.NodeKeyExpired {
+        // The expiry was cleared between the map update and registration.
+        // Keep the current identity and let the caller restart its map poll.
+        return Ok(Some(old_key));
     }
-
     let trying_key = NodePrivate::generate();
     let old_node_key = old_pub.clone();
 
@@ -672,9 +672,8 @@ async fn perform_key_rotation(
         }
 
         if resp.NodeKeyExpired {
-            log::info!(
-            "tsnet: rotated key is also marked expired; promoting it so the map stream can recover"
-        );
+            log::info!("tsnet: replacement key is also expired; retaining current map stream");
+            return Ok(None);
         }
 
         // If interactive auth is required, emit BrowseToURL and block on
@@ -721,8 +720,9 @@ async fn perform_key_rotation(
             }
             if followup_resp.NodeKeyExpired {
                 log::info!(
-                "tsnet: followup key is marked expired; promoting it so the map stream can recover"
-            );
+                    "tsnet: authenticated replacement key is expired; retaining current map stream"
+                );
+                return Ok(None);
             }
         }
 

@@ -930,7 +930,7 @@ impl ReceiveBatch {
         self.count = 0;
         for index in 0..received {
             self.validate_message(index, LOGICAL_PACKET_CAPACITY)?;
-            let control_len = self.headers[index].msg_hdr.msg_controllen;
+            let control_len = normalize_control_len(self.headers[index].msg_hdr.msg_controllen)?;
             if control_len > RECEIVE_CONTROL_SPACE {
                 return invalid_data("kernel returned oversized ancillary data");
             }
@@ -958,7 +958,7 @@ impl ReceiveBatch {
             self.validate_message(index, GRO_PACKET_CAPACITY)?;
             let length = self.headers[index].msg_len as usize;
             let source = socket_addr(&self.names[index], self.headers[index].msg_hdr.msg_namelen)?;
-            let control_len = self.headers[index].msg_hdr.msg_controllen;
+            let control_len = normalize_control_len(self.headers[index].msg_hdr.msg_controllen)?;
             if control_len > RECEIVE_CONTROL_SPACE {
                 return invalid_data("kernel returned oversized ancillary data");
             }
@@ -1226,6 +1226,13 @@ fn parse_gro_size(data: &[u8]) -> io::Result<u16> {
 
 fn invalid_data<T>(message: &'static str) -> io::Result<T> {
     Err(io::Error::new(io::ErrorKind::InvalidData, message))
+}
+
+fn normalize_control_len<T: TryInto<usize>>(value: T) -> io::Result<usize> {
+    match value.try_into() {
+        Ok(value) => Ok(value),
+        Err(_) => invalid_data("kernel returned unrepresentable ancillary data length"),
+    }
 }
 
 /// Send an ordered batch with per-message UDP_SEGMENT control data.

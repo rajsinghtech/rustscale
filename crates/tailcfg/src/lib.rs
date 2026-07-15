@@ -20,6 +20,7 @@ mod node;
 mod register;
 mod service;
 mod ssh;
+mod token;
 
 pub use appctype::{
     AppConnectorAttr, AppConnectorConfig, ConfigID, Conn25Attr, Conn25PoolsAttr, DNATConfig,
@@ -52,6 +53,7 @@ pub use ssh::{
     SSHAction, SSHEventNotifyRequest, SSHEventType, SSHPolicy, SSHPrincipal,
     SSHRecorderFailureAction, SSHRecordingAttempt, SSHRule,
 };
+pub use token::{TokenRequest, TokenResponse};
 
 pub use rustscale_key::{
     DiscoPublic as DiscoKey, MachinePublic as MachineKey, NodePublic as NodeKey,

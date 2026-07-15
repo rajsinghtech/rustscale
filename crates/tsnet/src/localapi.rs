@@ -87,6 +87,17 @@ pub(crate) struct CertParams {
     pub protocol_version: u16,
 }
 
+/// Credentials for authenticated control-plane requests made by LocalAPI.
+#[derive(Clone)]
+pub(crate) struct ControlParams {
+    pub control_url: String,
+    pub machine_key: MachinePrivate,
+    pub server_pub_key: MachinePublic,
+    pub node_key: NodePrivate,
+    pub capability_version: i32,
+    pub protocol_version: u16,
+}
+
 /// Shared state for the LocalAPI server — all fields are Arc clones of the
 /// same state held by [`crate::RunningState`], so the API always sees live
 /// data without explicit refresh.
@@ -130,6 +141,8 @@ pub(crate) struct LocalApiState {
     /// Credentials for the cert endpoint (`GET /cert/<domain>`). `None` when
     /// the server hasn't joined a tailnet yet (no machine/node keys).
     pub cert_params: Option<CertParams>,
+    /// Credentials for LocalAPI requests forwarded to the Noise control API.
+    pub control_params: Option<ControlParams>,
     /// Taildrop file manager (None if taildrop is disabled or not yet up).
     pub taildrop: Option<Arc<crate::taildrop::TaildropManager>>,
     /// Netstack handle for dialing peer PeerAPIs (None in TUN mode or
@@ -724,13 +737,44 @@ fn parse_query(query: &str) -> std::collections::HashMap<String, String> {
         if pair.is_empty() {
             continue;
         }
-        if let Some((k, v)) = pair.split_once('=') {
-            params.insert(k.to_string(), v.to_string());
+        if let Some((key, value)) = pair.split_once('=') {
+            params.insert(percent_decode_query(key), percent_decode_query(value));
         } else {
-            params.insert(pair.to_string(), String::new());
+            params.insert(percent_decode_query(pair), String::new());
         }
     }
     params
+}
+
+fn percent_decode_query(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                decoded.push(b' ');
+                index += 1;
+            }
+            b'%' if index + 2 < bytes.len() => {
+                if let (Some(high), Some(low)) = (
+                    hex_val_local(bytes[index + 1]),
+                    hex_val_local(bytes[index + 2]),
+                ) {
+                    decoded.push(high * 16 + low);
+                    index += 3;
+                } else {
+                    decoded.push(bytes[index]);
+                    index += 1;
+                }
+            }
+            byte => {
+                decoded.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
 }
 
 // ---------------------------------------------------------------------------
@@ -1015,7 +1059,11 @@ pub(crate) async fn dispatch<W: AsyncRead + AsyncWrite + Unpin>(
 
         // --- GET /localapi/v0/id-token ---
         "id-token" if method == "GET" => {
-            handle_id_token(conn, &req.query).await?;
+            if !require_readwrite(peer_identity) {
+                write_access_denied(conn).await?;
+                return Ok(());
+            }
+            handle_id_token(conn, &req.query, state).await?;
         }
 
         // --- POST /localapi/v0/reload-config ---
@@ -2480,27 +2528,60 @@ async fn handle_shutdown<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-/// Handle GET /localapi/v0/id-token
-///
-/// Fetch an OIDC ID token from the control plane for the given audience.
-/// **Stub**: OIDC ID token support requires Noise-protocol control plane
-/// integration (`DoNoiseRequest`) not yet implemented in rustscale.
-/// Returns 501 Not Implemented.
+/// Handle GET /localapi/v0/id-token by forwarding a token request over the
+/// authenticated Noise control channel.
 async fn handle_id_token<W: AsyncWrite + Unpin>(
     conn: &mut W,
     query: &str,
+    state: &Arc<LocalApiState>,
 ) -> Result<(), std::io::Error> {
     let params = parse_query(query);
-    let aud = params.get("aud").map(String::as_str).unwrap_or("");
+    let aud = params.get("aud").map_or("", String::as_str).trim();
     if aud.is_empty() {
         let body = serde_json::json!({"error": "no audience requested"});
         write_json_response(conn, 400, "Bad Request", &body).await?;
         return Ok(());
     }
-    let body = serde_json::json!({
-        "error": "id-token not yet supported: OIDC Noise request not implemented"
-    });
-    write_json_response(conn, 501, "Not Implemented", &body).await?;
+    let Some(cp) = state.control_params.as_ref() else {
+        let body = serde_json::json!({"error": "no netmap"});
+        write_json_response(conn, 503, "Service Unavailable", &body).await?;
+        return Ok(());
+    };
+
+    let client = rustscale_controlclient::ControlClient::new(
+        &cp.control_url,
+        cp.machine_key.clone(),
+        cp.server_pub_key.clone(),
+        cp.protocol_version,
+    );
+    let request = rustscale_tailcfg::TokenRequest {
+        CapVersion: cp.capability_version,
+        NodeKey: cp.node_key.public(),
+        Audience: aud.to_owned(),
+    };
+    match client.id_token(&request).await {
+        Ok(response) => {
+            let body = serde_json::to_value(response).unwrap_or_default();
+            write_json_response(conn, 200, "OK", &body).await?;
+        }
+        Err(rustscale_controlclient::RegisterError::HttpStatus(status, message)) => {
+            let reason = match status {
+                400 => "Bad Request",
+                401 => "Unauthorized",
+                403 => "Forbidden",
+                404 => "Not Found",
+                429 => "Too Many Requests",
+                503 => "Service Unavailable",
+                _ => "Control Error",
+            };
+            let body = serde_json::json!({"error": message});
+            write_json_response(conn, status, reason, &body).await?;
+        }
+        Err(error) => {
+            let body = serde_json::json!({"error": error.to_string()});
+            write_json_response(conn, 500, "Internal Server Error", &body).await?;
+        }
+    }
     Ok(())
 }
 
@@ -3185,6 +3266,7 @@ mod tests {
             profiles: Arc::new(RwLock::new(vec![])),
             current_profile: Arc::new(RwLock::new(None)),
             cert_params: None,
+            control_params: None,
             taildrop: None,
             netstack: None,
             filter: std::sync::OnceLock::new(),
@@ -3211,9 +3293,11 @@ mod tests {
 
     #[test]
     fn test_parse_query() {
-        let q = parse_query("addr=100.64.0.1:80&proto=tcp");
+        let q =
+            parse_query("addr=100.64.0.1%3A80&proto=tcp&aud=https%3A%2F%2Fexample.com%2F%C3%A9+x");
         assert_eq!(q.get("addr"), Some(&"100.64.0.1:80".to_string()));
         assert_eq!(q.get("proto"), Some(&"tcp".to_string()));
+        assert_eq!(q.get("aud"), Some(&"https://example.com/é x".to_string()));
     }
 
     #[tokio::test]
@@ -3948,6 +4032,7 @@ mod tests {
             profiles: Arc::new(RwLock::new(vec![])),
             current_profile: Arc::new(RwLock::new(None)),
             cert_params: None,
+            control_params: None,
             taildrop: None,
             netstack: None,
             filter: std::sync::OnceLock::new(),
@@ -4184,6 +4269,7 @@ mod tests {
                 capability_version: 141,
                 protocol_version: 141,
             }),
+            control_params: None,
             taildrop: None,
             netstack: None,
             filter: std::sync::OnceLock::new(),
@@ -4433,6 +4519,30 @@ mod tests {
         assert_eq!(domains[0], "node.ts.net");
     }
 
+    #[tokio::test]
+    async fn test_id_token_requires_audience() {
+        let state = make_test_state().await;
+        let resp = send_request_to_state(
+            b"GET /localapi/v0/id-token HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            &state,
+        )
+        .await;
+        assert!(resp.contains("400 Bad Request"), "response: {resp}");
+        assert!(resp.contains("no audience requested"));
+    }
+
+    #[tokio::test]
+    async fn test_id_token_requires_netmap_control_credentials() {
+        let state = make_test_state().await;
+        let resp = send_request_to_state(
+            b"GET /localapi/v0/id-token?aud=example HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            &state,
+        )
+        .await;
+        assert!(resp.contains("503 Service Unavailable"), "response: {resp}");
+        assert!(resp.contains("no netmap"));
+    }
+
     // --- IPNAUTH: peer-credential enforcement tests ---
 
     async fn send_request_with_identity(
@@ -4537,6 +4647,18 @@ mod tests {
             "read-only peer should get 403: {resp}"
         );
         assert!(resp.contains("access denied"));
+    }
+
+    #[tokio::test]
+    async fn test_readonly_identity_blocked_from_id_token() {
+        let state = make_test_state().await;
+        let resp = send_request_with_identity(
+            b"GET /localapi/v0/id-token?aud=example HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            &state,
+            test_ro_identity(),
+        )
+        .await;
+        assert!(resp.contains("403 Forbidden"));
     }
 
     #[tokio::test]

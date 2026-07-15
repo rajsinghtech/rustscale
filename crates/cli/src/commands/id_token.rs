@@ -1,20 +1,24 @@
 //! `rustscale id-token` — fetch an OIDC ID token from control.
-//!
-//! Not yet implemented. The Go version requests an OIDC ID token
-//! from the control server for the given audience.
 
 use std::path::Path;
 
+use rustscale_localclient::LocalClient;
+
 use crate::CliError;
 
-#[allow(clippy::unused_async)]
-pub async fn run(args: Vec<String>, _socket: &Path, _json: bool) -> Result<(), CliError> {
-    let audience = args
-        .iter()
-        .find(|a| !a.starts_with("--"))
-        .map_or("<audience>", String::as_str);
+pub async fn run(args: Vec<String>, socket: &Path, json: bool) -> Result<(), CliError> {
+    if args.len() != 1 || args[0].starts_with('-') {
+        return Err(CliError("usage: rustscale id-token <audience>".into()));
+    }
 
-    eprintln!("rustscale id-token: not yet supported (audience={audience})");
-    eprintln!("OIDC ID token fetching requires control protocol support not yet ported.");
+    let response = LocalClient::new(socket).id_token(&args[0]).await?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string(&response).map_err(|error| CliError(error.to_string()))?
+        );
+    } else {
+        println!("{}", response.IDToken);
+    }
     Ok(())
 }

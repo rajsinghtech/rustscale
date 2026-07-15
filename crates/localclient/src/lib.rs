@@ -32,7 +32,7 @@ use std::path::PathBuf;
 
 use rustscale_ipn::{LoginProfile, MaskedPrefs, NotifyWatchOpt, Prefs, StartOptions, WaitingFile};
 use rustscale_ipnstate::PingResult;
-use rustscale_tailcfg::DERPMap;
+use rustscale_tailcfg::{DERPMap, TokenResponse};
 use rustscale_tsnet::{FileTarget, ServeConfig};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
@@ -83,6 +83,13 @@ impl LocalClient {
     /// GET /localapi/v0/prefs — returns the prefs JSON.
     pub async fn prefs(&self) -> Result<serde_json::Value, LocalClientError> {
         self.get_json("/localapi/v0/prefs").await
+    }
+
+    /// GET /localapi/v0/id-token?aud=<audience> — request an OIDC ID token.
+    pub async fn id_token(&self, audience: &str) -> Result<TokenResponse, LocalClientError> {
+        let path = format!("/localapi/v0/id-token?aud={}", url_encode(audience));
+        let body = self.get_json(&path).await?;
+        serde_json::from_value(body).map_err(|e| LocalClientError::Json(e.to_string()))
     }
 
     /// GET /localapi/v0/netmap — returns the netmap JSON (including DERPMap).

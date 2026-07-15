@@ -162,6 +162,9 @@ impl ReleaseTestGate {
     }
 }
 
+#[cfg(test)]
+pub(crate) type SendTestGate = ReleaseTestGate;
+
 struct ClientInner {
     gateway_lookup: RwLock<Box<dyn Fn() -> Option<GatewayInfo> + Send + Sync>>,
     local_port: RwLock<u16>,
@@ -176,8 +179,11 @@ struct ClientInner {
     running_create: AtomicBool,
     work: Mutex<WorkGate>,
     release_progress_tx: tokio::sync::watch::Sender<ReleaseProgress>,
+    send_progress_tx: tokio::sync::watch::Sender<u64>,
     #[cfg(test)]
     release_test_gate: Mutex<Option<Arc<ReleaseTestGate>>>,
+    #[cfg(test)]
+    send_test_gate: Mutex<Option<Arc<SendTestGate>>>,
     closed: AtomicBool,
 }
 
@@ -187,7 +193,10 @@ struct WorkGate {
     generation: u64,
     allocation: Option<AllocationFlight>,
     shutdown: Option<ShutdownFlight>,
+    send_in_flight: u64,
+    send_terminal: bool,
     allocation_tasks: JoinSet<()>,
+    probe_tasks: JoinSet<()>,
     release_tasks: JoinSet<()>,
     launcher_tasks: JoinSet<()>,
     shutdown_tasks: JoinSet<()>,
@@ -210,7 +219,10 @@ impl Default for WorkGate {
             generation: 0,
             allocation: None,
             shutdown: None,
+            send_in_flight: 0,
+            send_terminal: false,
             allocation_tasks: JoinSet::new(),
+            probe_tasks: JoinSet::new(),
             release_tasks: JoinSet::new(),
             launcher_tasks: JoinSet::new(),
             shutdown_tasks: JoinSet::new(),
@@ -222,6 +234,19 @@ impl Default for WorkGate {
 struct ReleaseProgress {
     pending: u64,
     generation: u64,
+}
+
+struct SendPermit(Client);
+
+impl Drop for SendPermit {
+    fn drop(&mut self) {
+        let mut work = self.0.inner.work.lock().expect("work gate lock");
+        work.send_in_flight = work.send_in_flight.checked_sub(1).expect("send underflow");
+        self.0
+            .inner
+            .send_progress_tx
+            .send_replace(work.send_in_flight);
+    }
 }
 
 struct PendingReleaseGuard(Client);
@@ -283,6 +308,7 @@ impl Client {
             .gateway_lookup
             .unwrap_or_else(|| Box::new(likely_home_router_ip));
         let (release_progress_tx, _) = tokio::sync::watch::channel(ReleaseProgress::default());
+        let (send_progress_tx, _) = tokio::sync::watch::channel(0);
         Self {
             inner: Arc::new(ClientInner {
                 gateway_lookup: RwLock::new(gateway_lookup),
@@ -296,8 +322,11 @@ impl Client {
                 running_create: AtomicBool::new(false),
                 work: Mutex::new(WorkGate::default()),
                 release_progress_tx,
+                send_progress_tx,
                 #[cfg(test)]
                 release_test_gate: Mutex::new(None),
+                #[cfg(test)]
+                send_test_gate: Mutex::new(None),
                 closed: AtomicBool::new(false),
             }),
         }
@@ -333,6 +362,11 @@ impl Client {
             .release_test_gate
             .lock()
             .expect("release gate lock") = gate;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_send_gate(&self, gate: Option<Arc<SendTestGate>>) {
+        *self.inner.send_test_gate.lock().expect("send gate lock") = gate;
     }
 
     fn now(&self) -> Instant {
@@ -470,6 +504,61 @@ impl Client {
         Some(f(&mut state))
     }
 
+    fn acquire_send_permit(
+        &self,
+        snapshot: Option<GatewaySnapshot>,
+        cleanup: bool,
+    ) -> Result<SendPermit, crate::PortMapError> {
+        let state = self.inner.state.lock().expect("state lock");
+        if snapshot.is_some_and(|snapshot| {
+            state.gateway_generation != snapshot.generation || state.gateway != snapshot.info
+        }) {
+            return Err(crate::PortMapError::GatewayRange);
+        }
+        let mut work = self.inner.work.lock().expect("work gate lock");
+        if work.send_terminal || (work.closing && !cleanup) {
+            return Err(crate::PortMapError::Disabled);
+        }
+        work.send_in_flight = work
+            .send_in_flight
+            .checked_add(1)
+            .expect("send permit overflow");
+        self.inner
+            .send_progress_tx
+            .send_replace(work.send_in_flight);
+        drop(work);
+        drop(state);
+        Ok(SendPermit(self.clone()))
+    }
+
+    async fn send_udp(
+        &self,
+        socket: &UdpSocket,
+        packet: &[u8],
+        destination: SocketAddr,
+        snapshot: Option<GatewaySnapshot>,
+        cleanup: bool,
+    ) -> Result<usize, crate::PortMapError> {
+        let _permit = self.acquire_send_permit(snapshot, cleanup)?;
+        #[cfg(test)]
+        {
+            let gate = self
+                .inner
+                .send_test_gate
+                .lock()
+                .expect("send gate lock")
+                .clone();
+            if let Some(gate) = gate {
+                gate.reached.wait().await;
+                gate.resume.wait().await;
+            }
+        }
+        socket
+            .send_to(packet, destination)
+            .await
+            .map_err(crate::PortMapError::Io)
+    }
+
     fn reserve_release(&self, state: &mut ClientState, cached: &CachedMapping) {
         if !state
             .uncertain_releases
@@ -592,7 +681,11 @@ impl Client {
                 let socket = socket.expect("PMP release socket");
                 let external_port = cached.mapping.external.port();
                 let packet = pmp::build_delete_request(internal_port, external_port);
-                if socket.send_to(&packet, destination).await.is_err() {
+                if self
+                    .send_udp(&socket, &packet, destination, None, true)
+                    .await
+                    .is_err()
+                {
                     false
                 } else {
                     let mut response = [0_u8; 64];
@@ -629,7 +722,11 @@ impl Client {
                     requested_ip,
                     nonce,
                 );
-                if socket.send_to(&packet, destination).await.is_err() {
+                if self
+                    .send_udp(&socket, &packet, destination, None, true)
+                    .await
+                    .is_err()
+                {
                     false
                 } else {
                     let mut response = [0_u8; 128];
@@ -647,13 +744,18 @@ impl Client {
                     )
                 }
             }
-            ReleaseIdentity::Upnp { service } => upnp::delete_port_mapping(
-                &service,
-                cached.mapping.external.port(),
-                Duration::from_secs(1),
-            )
-            .await
-            .is_ok(),
+            ReleaseIdentity::Upnp { service } => {
+                let Ok(_permit) = self.acquire_send_permit(None, true) else {
+                    return false;
+                };
+                upnp::delete_port_mapping(
+                    &service,
+                    cached.mapping.external.port(),
+                    Duration::from_secs(1),
+                )
+                .await
+                .is_ok()
+            }
         };
 
         confirmed
@@ -718,16 +820,20 @@ impl Client {
         // holding this lock, and later public work is rejected by the gate.
         self.invalidate_mappings(true);
 
-        let (allocations, launchers) = {
+        let (allocations, probes, launchers) = {
             let mut work = self.inner.work.lock().expect("work gate lock");
             work.allocation = None;
             (
                 std::mem::take(&mut work.allocation_tasks),
+                std::mem::take(&mut work.probe_tasks),
                 std::mem::take(&mut work.launcher_tasks),
             )
         };
         let deadline = tokio::time::Instant::now() + deadline;
         let mut shutdown_error = self.await_join_set(allocations, deadline).await.err();
+        if let Err(error) = self.await_join_set(probes, deadline).await {
+            shutdown_error.get_or_insert(error);
+        }
         if let Err(error) = self.await_join_set(launchers, deadline).await {
             shutdown_error.get_or_insert(error);
         }
@@ -783,7 +889,30 @@ impl Client {
                 "portmapper cleanup remains uncertain".into(),
             ));
         }
+        self.finish_send_gate(deadline).await?;
         Ok(())
+    }
+
+    async fn finish_send_gate(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), crate::PortMapError> {
+        let mut progress = self.inner.send_progress_tx.subscribe();
+        loop {
+            {
+                let mut work = self.inner.work.lock().expect("work gate lock");
+                if work.send_in_flight == 0 {
+                    work.send_terminal = true;
+                    return Ok(());
+                }
+            }
+            tokio::time::timeout_at(deadline, progress.changed())
+                .await
+                .map_err(|_| crate::PortMapError::Protocol("portmapper shutdown deadline".into()))?
+                .map_err(|_| {
+                    crate::PortMapError::Protocol("send progress channel closed".into())
+                })?;
+        }
     }
 
     fn reap_join_set(tasks: &mut JoinSet<()>) {
@@ -793,6 +922,7 @@ impl Client {
     fn reap_completed_tasks(&self) {
         let mut work = self.inner.work.lock().expect("work gate lock");
         Self::reap_join_set(&mut work.allocation_tasks);
+        Self::reap_join_set(&mut work.probe_tasks);
         Self::reap_join_set(&mut work.release_tasks);
         Self::reap_join_set(&mut work.launcher_tasks);
         Self::reap_join_set(&mut work.shutdown_tasks);
@@ -927,12 +1057,29 @@ impl Client {
     /// PCP, and UPnP probes in parallel on a shared socket and collects
     /// responses within `probe_timeout` (250 ms by default).
     pub async fn probe(&self) -> Result<ProbeResult, crate::PortMapError> {
-        if self.inner.closed.load(Ordering::Relaxed) {
-            return Err(crate::PortMapError::Disabled);
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let client = self.clone();
+        {
+            let mut work = self.inner.work.lock().expect("work gate lock");
+            Self::reap_join_set(&mut work.probe_tasks);
+            if work.closing {
+                return Err(crate::PortMapError::Disabled);
+            }
+            work.probe_tasks.spawn(async move {
+                let snapshot = client.observe_gateway();
+                let result = if snapshot.info.is_none() {
+                    Err(crate::PortMapError::GatewayRange)
+                } else {
+                    client.probe_with_snapshot(snapshot).await
+                };
+                let _ = result_tx.send(result);
+            });
         }
-        let snapshot = self.observe_gateway();
-        snapshot.info.ok_or(crate::PortMapError::GatewayRange)?;
-        self.probe_with_snapshot(snapshot).await
+        result_rx.await.unwrap_or_else(|_| {
+            Err(crate::PortMapError::Protocol(
+                "probe supervisor terminated".into(),
+            ))
+        })
     }
 
     async fn probe_with_snapshot(
@@ -965,14 +1112,24 @@ impl Client {
 
         // Send all probes.
         let pmp_pkt = pmp::build_external_addr_request();
-        let _ = sock.send_to(&pmp_pkt, pxp_addr).await;
+        let _ = self
+            .send_udp(&sock, &pmp_pkt, pxp_addr, Some(snapshot), false)
+            .await;
         let pcp_pkt = pcp::build_announce_request(gi.self_ip);
-        let _ = sock.send_to(&pcp_pkt, pxp_addr).await;
+        let _ = self
+            .send_udp(&sock, &pcp_pkt, pxp_addr, Some(snapshot), false)
+            .await;
         let upnp_all = upnp::ssdp_packet();
         let upnp_igd = upnp::ssdp_igd_packet();
-        let _ = sock.send_to(&upnp_all, upnp_unicast).await;
-        let _ = sock.send_to(&upnp_all, upnp_multicast).await;
-        let _ = sock.send_to(&upnp_igd, upnp_multicast).await;
+        let _ = self
+            .send_udp(&sock, &upnp_all, upnp_unicast, Some(snapshot), false)
+            .await;
+        let _ = self
+            .send_udp(&sock, &upnp_all, upnp_multicast, Some(snapshot), false)
+            .await;
+        let _ = self
+            .send_udp(&sock, &upnp_igd, upnp_multicast, Some(snapshot), false)
+            .await;
 
         // Collect responses in a single loop.
         let deadline = Instant::now() + crate::PROBE_TIMEOUT;
@@ -1035,6 +1192,9 @@ impl Client {
         if !upnp_disco_responses.is_empty() {
             let deduped = upnp::process_responses(upnp_disco_responses);
             for resp in &deduped {
+                let Ok(_permit) = self.acquire_send_permit(Some(snapshot), false) else {
+                    return Err(crate::PortMapError::Disabled);
+                };
                 if let Some(svc) =
                     upnp::fetch_and_select_service(&resp.location, Duration::from_secs(1)).await
                 {
@@ -1402,21 +1562,27 @@ impl Client {
                 .expect("state lock")
                 .uncertain_releases
                 .push(provisional.clone());
-            if let Err(e) = sock.send_to(&pkt, pxp_addr).await {
-                if treat_as_lost_udp(&e) {
+            if let Err(error) = self
+                .send_udp(&sock, &pkt, pxp_addr, Some(snapshot), false)
+                .await
+            {
+                if matches!(&error, crate::PortMapError::Io(io) if treat_as_lost_udp(io)) {
                     return Err(crate::PortMapError::NoServices);
                 }
-                return Err(crate::PortMapError::Io(e));
+                return Err(error);
             }
         } else {
             // PMP: request external address first if not cached.
             if cached_pub_ip.is_none() {
                 let req = pmp::build_external_addr_request();
-                if let Err(e) = sock.send_to(&req, pxp_addr).await {
-                    if treat_as_lost_udp(&e) {
+                if let Err(error) = self
+                    .send_udp(&sock, &req, pxp_addr, Some(snapshot), false)
+                    .await
+                {
+                    if matches!(&error, crate::PortMapError::Io(io) if treat_as_lost_udp(io)) {
                         return Err(crate::PortMapError::NoServices);
                     }
-                    return Err(crate::PortMapError::Io(e));
+                    return Err(error);
                 }
             }
             let pkt = pmp::build_map_request(local_port, prev_port, crate::MAP_LIFETIME_SECS);
@@ -1426,11 +1592,14 @@ impl Client {
                 .expect("state lock")
                 .uncertain_releases
                 .push(provisional.clone());
-            if let Err(e) = sock.send_to(&pkt, pxp_addr).await {
-                if treat_as_lost_udp(&e) {
+            if let Err(error) = self
+                .send_udp(&sock, &pkt, pxp_addr, Some(snapshot), false)
+                .await
+            {
+                if matches!(&error, crate::PortMapError::Io(io) if treat_as_lost_udp(io)) {
                     return Err(crate::PortMapError::NoServices);
                 }
-                return Err(crate::PortMapError::Io(e));
+                return Err(error);
             }
         }
 
@@ -1718,10 +1887,12 @@ impl Client {
             let expired = candidate.lease_expires.is_some_and(|expiry| now >= expiry);
             let confirmed = if expired {
                 true
-            } else {
+            } else if let Ok(_permit) = self.acquire_send_permit(None, true) {
                 upnp::delete_port_mapping(service, candidate.mapping.external.port(), deadline)
                     .await
                     .is_ok()
+            } else {
+                false
             };
             if confirmed {
                 let _ = self.with_current_gateway(snapshot, |state| {
@@ -1782,9 +1953,13 @@ impl Client {
                 crate::MAP_LIFETIME_SECS,
                 deadline,
                 |port, permanent| {
+                    let permit = self
+                        .acquire_send_permit(Some(snapshot), false)
+                        .map_err(|error| std::io::Error::other(error.to_string()))?;
                     let ownership_id = self.next_ownership_id();
                     self.track_uncertain_upnp(ownership_id, snapshot, svc, port, permanent);
                     pending_ownership.store(ownership_id, Ordering::SeqCst);
+                    Ok(permit)
                 },
                 |_port, _permanent| {
                     let ownership_id = pending_ownership.swap(0, Ordering::SeqCst);
@@ -1824,7 +1999,12 @@ impl Client {
                 continue;
             }
 
-            let ext_ip = if let Ok(ip) = upnp::get_external_ip(svc, deadline).await {
+            let external_ip = if let Ok(_permit) = self.acquire_send_permit(Some(snapshot), false) {
+                upnp::get_external_ip(svc, deadline).await
+            } else {
+                Err(std::io::Error::other("portmapper closed"))
+            };
+            let ext_ip = if let Ok(ip) = external_ip {
                 ip
             } else {
                 if let Some(cached) = self.uncertain_ownership(ownership_id) {
@@ -1904,7 +2084,7 @@ mod tests {
 
     use super::{
         CachedMapping, Client, ClientConfig, GatewayInfo, Mapping, MappingKind, ReleaseIdentity,
-        ReleaseTestGate,
+        ReleaseTestGate, SendTestGate,
     };
     use crate::upnp::UpnpService;
     use crate::{pcp, pmp};
@@ -2055,6 +2235,54 @@ mod tests {
             .await
             .expect("watch waiter missed terminal state")
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_check_to_send_permit_and_closes_gate() {
+        let router = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let gateway = GatewayInfo {
+            gateway: Ipv4Addr::LOCALHOST,
+            self_ip: Ipv4Addr::new(192, 0, 2, 2),
+        };
+        let client = Client::with_config(ClientConfig {
+            gateway_lookup: Some(Box::new(move || Some(gateway))),
+        });
+        client.set_test_pxp_port(router.local_addr().unwrap().port());
+        client.set_test_upnp_port(router.local_addr().unwrap().port());
+        let gate = SendTestGate::new();
+        client.set_test_send_gate(Some(gate.clone()));
+
+        let probe_client = client.clone();
+        let probe = tokio::spawn(async move { probe_client.probe().await });
+        gate.wait_reached().await;
+        let shutdown_client = client.clone();
+        let shutdown =
+            tokio::spawn(async move { shutdown_client.shutdown(Duration::from_secs(2)).await });
+        tokio::task::yield_now().await;
+        assert!(!shutdown.is_finished(), "shutdown skipped an acquired send");
+
+        gate.resume().await;
+        let mut packet = [0_u8; 64];
+        tokio::time::timeout(Duration::from_secs(1), router.recv_from(&mut packet))
+            .await
+            .expect("permitted packet was not sent")
+            .unwrap();
+        let _ = probe.await;
+        shutdown.await.unwrap().unwrap();
+        client.set_test_send_gate(None);
+
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        assert!(matches!(
+            client
+                .send_udp(&socket, &[0], router.local_addr().unwrap(), None, false,)
+                .await,
+            Err(crate::PortMapError::Disabled)
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), router.recv_from(&mut packet))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

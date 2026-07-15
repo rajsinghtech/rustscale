@@ -164,16 +164,19 @@ pub(crate) struct AmbiguousAddError {
 /// <1024, a random port >=1024 is chosen (some routers reject privileged
 /// ports). If the router returns error 725 (OnlyPermanentLeasesSupported) or
 /// 402 (InvalidArgs), retries with a permanent lease (lifetime=0).
-pub(crate) async fn add_port_mapping(
+pub(crate) async fn add_port_mapping<P>(
     svc: &UpnpService,
     internal_client: &str,
     internal_port: u16,
     external_port: u16,
     lease_duration: u32,
     deadline: Duration,
-    mut before_send: impl FnMut(u16, bool),
+    mut before_send: impl FnMut(u16, bool) -> Result<P, std::io::Error>,
     mut rejected: impl FnMut(u16, bool),
-) -> Result<UpnpAllocation, AmbiguousAddError> {
+) -> Result<UpnpAllocation, AmbiguousAddError>
+where
+    P: Send,
+{
     let port = if external_port < 1024 {
         random_port()
     } else {
@@ -195,7 +198,11 @@ pub(crate) async fn add_port_mapping(
         "rustscale-portmap",
         lease_duration,
     );
-    before_send(port, false);
+    let send_permit = before_send(port, false).map_err(|source| AmbiguousAddError {
+        port,
+        permanent: false,
+        source,
+    })?;
     let (status, resp) = http::http_post_soap(
         &svc.control_url,
         &soap_action,
@@ -210,7 +217,7 @@ pub(crate) async fn add_port_mapping(
         source,
     })?;
 
-    if status == 200 && soap_response_is_success(&resp, "AddPortMappingResponse") {
+    if status == 200 && soap_response_is_success(&resp, "AddPortMappingResponse", service_type) {
         return Ok(UpnpAllocation {
             port,
             permanent: false,
@@ -233,7 +240,12 @@ pub(crate) async fn add_port_mapping(
                 "rustscale-portmap",
                 0,
             );
-            before_send(port, true);
+            drop(send_permit);
+            let _send_permit = before_send(port, true).map_err(|source| AmbiguousAddError {
+                port,
+                permanent: true,
+                source,
+            })?;
             let (status, resp) = http::http_post_soap(
                 &svc.control_url,
                 &soap_action,
@@ -247,7 +259,9 @@ pub(crate) async fn add_port_mapping(
                 permanent: true,
                 source,
             })?;
-            if status == 200 && soap_response_is_success(&resp, "AddPortMappingResponse") {
+            if status == 200
+                && soap_response_is_success(&resp, "AddPortMappingResponse", service_type)
+            {
                 return Ok(UpnpAllocation {
                     port,
                     permanent: true,
@@ -301,7 +315,7 @@ pub(crate) async fn delete_port_mapping(
         deadline,
     )
     .await?;
-    if delete_response_is_success(status, &response) {
+    if delete_response_is_success(status, &response, service_type) {
         return Ok(());
     }
     Err(std::io::Error::other(format!(
@@ -309,8 +323,9 @@ pub(crate) async fn delete_port_mapping(
     )))
 }
 
-fn delete_response_is_success(status: u16, response: &str) -> bool {
-    (status == 200 && soap_response_is_success(response, "DeletePortMappingResponse"))
+fn delete_response_is_success(status: u16, response: &str, service_type: &str) -> bool {
+    (status == 200
+        && soap_response_is_success(response, "DeletePortMappingResponse", service_type))
         // 714 NoSuchEntryInArray positively verifies that no mapping remains,
         // but only when carried in a structurally valid SOAP fault.
         || soap_not_found(response)
@@ -322,14 +337,31 @@ fn soap_not_found(body: &str) -> bool {
 
 fn soap_fault_code(body: &str) -> Option<u32> {
     let elements = parse_xml_elements(body)?;
-    has_strict_soap_body(&elements, "Fault")
-        .then(|| extract_upnp_error_code(body))
-        .flatten()
+    if !has_strict_soap_body(&elements, "Fault") {
+        return None;
+    }
+    let mut codes = elements
+        .iter()
+        .filter(|element| element.name.local == "errorCode");
+    let code = codes.next()?;
+    if codes.next().is_some() {
+        return None;
+    }
+    code.text.trim().parse().ok()
 }
 
-fn soap_response_is_success(body: &str, response_element: &str) -> bool {
-    parse_xml_elements(body)
-        .is_some_and(|elements| has_strict_soap_body(&elements, response_element))
+fn soap_response_is_success(body: &str, response_element: &str, service_type: &str) -> bool {
+    parse_xml_elements(body).is_some_and(|elements| {
+        has_strict_soap_body(&elements, response_element)
+            && elements.iter().any(|element| {
+                element.name.local == response_element
+                    && element.name.namespace.as_deref() == Some(service_type)
+                    && element
+                        .parent
+                        .as_ref()
+                        .is_some_and(|parent| parent.local == "Body")
+            })
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -343,11 +375,13 @@ struct XmlName {
 struct XmlElement {
     name: XmlName,
     parent: Option<XmlName>,
+    text: String,
 }
 
 struct XmlFrame {
     name: XmlName,
     namespaces: HashMap<String, String>,
+    element_index: usize,
 }
 
 fn has_strict_soap_body(elements: &[XmlElement], expected: &str) -> bool {
@@ -358,7 +392,16 @@ fn has_strict_soap_body(elements: &[XmlElement], expected: &str) -> bool {
         .iter()
         .filter(|element| element.parent.is_none())
         .collect();
-    if roots.len() != 1 || roots[0].name.local != "Envelope" {
+    if roots.len() != 1
+        || roots[0].name.local != "Envelope"
+        || !matches!(
+            roots[0].name.namespace.as_deref(),
+            Some(
+                "http://schemas.xmlsoap.org/soap/envelope/"
+                    | "http://www.w3.org/2003/05/soap-envelope"
+            )
+        )
+    {
         return false;
     }
     let envelope_children: Vec<_> = elements
@@ -393,10 +436,13 @@ fn has_strict_soap_body(elements: &[XmlElement], expected: &str) -> bool {
 
 fn parse_xml_elements(xml: &str) -> Option<Vec<XmlElement>> {
     let mut stack = Vec::<XmlFrame>::new();
-    let mut elements = Vec::new();
+    let mut elements = Vec::<XmlElement>::new();
     let mut rest = xml;
     while let Some(start) = rest.find('<') {
-        if stack.is_empty() && !rest[..start].trim().is_empty() {
+        let decoded_text = decode_xml_entities(&rest[..start])?;
+        if let Some(frame) = stack.last() {
+            elements[frame.element_index].text.push_str(&decoded_text);
+        } else if !decoded_text.trim().is_empty() {
             return None;
         }
         rest = &rest[start + 1..];
@@ -464,15 +510,27 @@ fn parse_xml_elements(xml: &str) -> Option<Vec<XmlElement>> {
             }
         }
         let name = resolve_xml_name(qualified, &namespaces)?;
+        let element_index = elements.len();
         elements.push(XmlElement {
             name: name.clone(),
             parent: stack.last().map(|frame| frame.name.clone()),
+            text: String::new(),
         });
         if !self_closing {
-            stack.push(XmlFrame { name, namespaces });
+            stack.push(XmlFrame {
+                name,
+                namespaces,
+                element_index,
+            });
         }
     }
-    (stack.is_empty() && !elements.is_empty() && rest.trim().is_empty()).then_some(elements)
+    let trailing = decode_xml_entities(rest)?;
+    if let Some(frame) = stack.last() {
+        elements[frame.element_index].text.push_str(&trailing);
+    } else if !trailing.trim().is_empty() {
+        return None;
+    }
+    (stack.is_empty() && !elements.is_empty()).then_some(elements)
 }
 
 fn find_xml_tag_end(token: &str) -> Option<usize> {
@@ -502,7 +560,11 @@ fn parse_xml_attributes(mut attributes: &str) -> Option<Vec<(String, String)>> {
             .find(|ch: char| ch.is_whitespace() || ch == '=')
             .unwrap_or(attributes.len());
         let name = &attributes[..name_end];
-        if name.is_empty() || !seen.insert(name.to_string()) {
+        if name.is_empty()
+            || !name.split(':').all(xml_ncname_is_valid)
+            || name.matches(':').count() > 1
+            || !seen.insert(name.to_string())
+        {
             return None;
         }
         attributes = attributes[name_end..].trim_start();
@@ -513,10 +575,47 @@ fn parse_xml_attributes(mut attributes: &str) -> Option<Vec<(String, String)>> {
         }
         attributes = &attributes[quote.len_utf8()..];
         let value_end = attributes.find(quote)?;
-        parsed.push((name.to_string(), attributes[..value_end].to_string()));
+        parsed.push((
+            name.to_string(),
+            decode_xml_entities(&attributes[..value_end])?,
+        ));
         attributes = attributes[value_end + quote.len_utf8()..].trim_start();
     }
     Some(parsed)
+}
+
+fn decode_xml_entities(text: &str) -> Option<String> {
+    let mut decoded = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(amp) = rest.find('&') {
+        decoded.push_str(&rest[..amp]);
+        rest = &rest[amp + 1..];
+        let end = rest.find(';')?;
+        let entity = &rest[..end];
+        let ch = match entity {
+            "amp" => '&',
+            "lt" => '<',
+            "gt" => '>',
+            "apos" => '\'',
+            "quot" => '"',
+            value if value.starts_with("#x") => {
+                char::from_u32(u32::from_str_radix(&value[2..], 16).ok()?)?
+            }
+            value if value.starts_with('#') => char::from_u32(value[1..].parse().ok()?)?,
+            _ => return None,
+        };
+        decoded.push(ch);
+        rest = &rest[end + 1..];
+    }
+    decoded.push_str(rest);
+    decoded.chars().all(xml_char_is_allowed).then_some(decoded)
+}
+
+fn xml_char_is_allowed(ch: char) -> bool {
+    matches!(ch, '\u{9}' | '\u{A}' | '\u{D}')
+        || ('\u{20}'..='\u{D7FF}').contains(&ch)
+        || ('\u{E000}'..='\u{FFFD}').contains(&ch)
+        || ('\u{10000}'..='\u{10FFFF}').contains(&ch)
 }
 
 fn default_xml_namespaces() -> HashMap<String, String> {
@@ -524,6 +623,14 @@ fn default_xml_namespaces() -> HashMap<String, String> {
         "xml".to_string(),
         "http://www.w3.org/XML/1998/namespace".to_string(),
     )])
+}
+
+fn xml_ncname_is_valid(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|ch| ch == '_' || ch.is_alphabetic())
+        && chars.all(|ch| ch == '_' || ch == '-' || ch == '.' || ch.is_alphanumeric())
 }
 
 fn resolve_xml_name(qualified: &str, namespaces: &HashMap<String, String>) -> Option<XmlName> {
@@ -535,7 +642,7 @@ fn resolve_xml_name(qualified: &str, namespaces: &HashMap<String, String>) -> Op
     } else {
         (None, qualified)
     };
-    if local.is_empty() {
+    if !xml_ncname_is_valid(local) || prefix.is_some_and(|prefix| !xml_ncname_is_valid(prefix)) {
         return None;
     }
     let namespace = match prefix {
@@ -578,14 +685,23 @@ pub(crate) async fn get_external_ip(
             "GetExternalIPAddress failed (status={status})"
         )));
     }
-    parse_external_ip_response(&resp)
+    parse_external_ip_response(&resp, service_type)
 }
 
-fn parse_external_ip_response(resp: &str) -> Result<Ipv4Addr, std::io::Error> {
+fn parse_external_ip_response(resp: &str, service_type: &str) -> Result<Ipv4Addr, std::io::Error> {
     let elements = parse_xml_elements(resp).ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidData, "malformed SOAP response")
     })?;
-    if !has_strict_soap_body(&elements, "GetExternalIPAddressResponse") {
+    if !has_strict_soap_body(&elements, "GetExternalIPAddressResponse")
+        || !elements.iter().any(|element| {
+            element.name.local == "GetExternalIPAddressResponse"
+                && element.name.namespace.as_deref() == Some(service_type)
+                && element
+                    .parent
+                    .as_ref()
+                    .is_some_and(|parent| parent.local == "Body")
+        })
+    {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "invalid GetExternalIPAddress SOAP structure",
@@ -606,14 +722,20 @@ fn parse_external_ip_response(resp: &str) -> Result<Ipv4Addr, std::io::Error> {
             "invalid GetExternalIPAddress response fields",
         ));
     }
-    let ip_str = extract_tag_text(resp, "NewExternalIPAddress")
-        .filter(|ip| !ip.is_empty())
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "no NewExternalIPAddress in response",
-            )
-        })?;
+    let ip_str = response_children[0].text.trim();
+    if ip_str.is_empty()
+        || elements.iter().any(|element| {
+            element
+                .parent
+                .as_ref()
+                .is_some_and(|parent| parent.local == "NewExternalIPAddress")
+        })
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "no NewExternalIPAddress in response",
+        ));
+    }
     let ip: Ipv4Addr = ip_str.parse().map_err(|_| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -667,37 +789,6 @@ fn build_add_port_mapping_soap(
 #[cfg(test)]
 fn is_soap_fault(body: &str) -> bool {
     parse_xml_elements(body).is_some_and(|elements| has_strict_soap_body(&elements, "Fault"))
-}
-
-/// Extract the UPnP error code from a SOAP fault response.
-fn extract_upnp_error_code(body: &str) -> Option<u32> {
-    let code_str = extract_tag_text(body, "errorCode")?;
-    code_str.parse().ok()
-}
-
-/// Extract the text content of an XML tag from a string (first occurrence).
-fn extract_tag_text(s: &str, tag: &str) -> Option<String> {
-    let mut offset = 0;
-    while let Some(relative) = s[offset..].find('<') {
-        let start = offset + relative;
-        let end = start + s[start..].find('>')?;
-        let token = s[start + 1..end].trim();
-        if !token.starts_with('/') {
-            let qualified = token.split_whitespace().next()?.trim_end_matches('/');
-            if qualified.rsplit(':').next() == Some(tag) {
-                let close = format!("</{qualified}>");
-                let text_start = end + 1;
-                let relative_close = s[text_start..].find(&close)?;
-                return Some(
-                    s[text_start..text_start + relative_close]
-                        .trim()
-                        .to_string(),
-                );
-            }
-        }
-        offset = end + 1;
-    }
-    None
 }
 
 /// Pick a random external port in [1024, 65535].
@@ -779,58 +870,63 @@ mod tests {
     }
 
     #[test]
-    fn extract_tag_text_works() {
-        let resp = r#"<?xml version="1.0"?>
-<s:Envelope><s:Body>
-  <u:GetExternalIPAddressResponse xmlns:u="urn:schemas-upnp-org:service:WANIPConnection:1">
-    <NewExternalIPAddress>123.123.123.123</NewExternalIPAddress>
-  </u:GetExternalIPAddressResponse>
-</s:Body></s:Envelope>"#;
-        assert_eq!(
-            extract_tag_text(resp, "NewExternalIPAddress"),
-            Some("123.123.123.123".to_string())
-        );
-    }
-
-    #[test]
     fn delete_requires_success_or_not_found() {
         assert!(delete_response_is_success(
             200,
-            r#"<x:Envelope xmlns:x="urn:soap" xmlns:m="urn:upnp"><x:Body><m:DeletePortMappingResponse/></x:Body></x:Envelope>"#
+            r#"<x:Envelope xmlns:x="http://schemas.xmlsoap.org/soap/envelope/" xmlns:m="urn:upnp"><x:Body><m:DeletePortMappingResponse/></x:Body></x:Envelope>"#,
+            "urn:upnp"
         ));
         assert!(delete_response_is_success(
             500,
-            r#"<s:Envelope xmlns:s="urn:soap" xmlns:x="urn:error"><s:Body><s:Fault><x:errorCode>714</x:errorCode></s:Fault></s:Body></s:Envelope>"#
+            r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" xmlns:x="urn:error"><s:Body><s:Fault><x:errorCode>714</x:errorCode></s:Fault></s:Body></s:Envelope>"#,
+            "urn:upnp"
         ));
         assert!(!delete_response_is_success(
             200,
-            "<s:Fault><errorCode>501</errorCode></s:Fault>"
+            "<s:Fault><errorCode>501</errorCode></s:Fault>",
+            "urn:upnp"
         ));
-        assert!(!delete_response_is_success(500, "server error"));
-        assert!(!delete_response_is_success(200, ""));
+        assert!(!delete_response_is_success(500, "server error", "urn:upnp"));
+        assert!(!delete_response_is_success(200, "", "urn:upnp"));
         assert!(!delete_response_is_success(
             200,
-            "<Envelope><Body><DeletePortMappingResponse></Body></Envelope>"
+            "<Envelope><Body><DeletePortMappingResponse></Body></Envelope>",
+            "urn:upnp"
         ));
         assert!(soap_response_is_success(
-            r#"<soap:Envelope xmlns:soap="urn:soap" xmlns:z="urn:upnp"><soap:Body><z:AddPortMappingResponse/></soap:Body></soap:Envelope>"#,
-            "AddPortMappingResponse"
+            r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/" xmlns:z="urn:upnp"><soap:Body><z:AddPortMappingResponse/></soap:Body></soap:Envelope>"#,
+            "AddPortMappingResponse",
+            "urn:upnp"
+        ));
+        assert!(!soap_response_is_success(
+            r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><AddPortMappingResponse/></soap:Body></soap:Envelope>"#,
+            "AddPortMappingResponse",
+            "urn:upnp"
+        ));
+        assert!(!soap_response_is_success(
+            r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/" xmlns:z="urn:wrong"><soap:Body><z:AddPortMappingResponse/></soap:Body></soap:Envelope>"#,
+            "AddPortMappingResponse",
+            "urn:upnp"
         ));
         assert!(!soap_response_is_success(
             "<Envelope><Body><Fault/><AddPortMappingResponse/></Body></Envelope>",
-            "AddPortMappingResponse"
+            "AddPortMappingResponse",
+            "urn:upnp"
         ));
         assert!(!soap_response_is_success(
             "<Envelope><Body><AddPortMappingResponse><Fault/></AddPortMappingResponse></Body></Envelope>",
-            "AddPortMappingResponse"
+            "AddPortMappingResponse",
+            "urn:upnp"
         ));
         assert!(!soap_response_is_success(
             "<Envelope><Body/><AddPortMappingResponse/></Envelope>",
-            "AddPortMappingResponse"
+            "AddPortMappingResponse",
+            "urn:upnp"
         ));
         assert!(!soap_response_is_success(
             "<Envelope><Body><AddPortMappingResponse/><AddPortMappingResponse/></Body></Envelope>",
-            "AddPortMappingResponse"
+            "AddPortMappingResponse",
+            "urn:upnp"
         ));
     }
 
@@ -851,17 +947,23 @@ mod tests {
         )
         .is_some());
         assert!(!soap_response_is_success(
-            "<s:Envelope xmlns:s=\"urn:soap\"><s:Body xmlns:s=\"urn:other\"><Response/></s:Body></s:Envelope>",
-            "Response"
+            "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body xmlns:s=\"urn:other\"><Response/></s:Body></s:Envelope>",
+            "Response",
+            "urn:upnp"
         ));
     }
 
     #[test]
     fn external_ip_requires_exact_soap_structure() {
-        let valid = "<x:Envelope xmlns:x=\"urn:soap\" xmlns:u=\"urn:upnp\" xmlns:z=\"urn:field\"><x:Body><u:GetExternalIPAddressResponse><z:NewExternalIPAddress>198.51.100.7</z:NewExternalIPAddress></u:GetExternalIPAddressResponse></x:Body></x:Envelope>";
+        let valid = "<x:Envelope xmlns:x=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:u=\"urn:upnp\" xmlns:z=\"urn:field\"><x:Body><u:GetExternalIPAddressResponse><z:NewExternalIPAddress>198.51.100.7</z:NewExternalIPAddress></u:GetExternalIPAddressResponse></x:Body></x:Envelope>";
         assert_eq!(
-            parse_external_ip_response(valid).unwrap(),
+            parse_external_ip_response(valid, "urn:upnp").unwrap(),
             Ipv4Addr::new(198, 51, 100, 7)
+        );
+        let encoded = "<x:Envelope xmlns:x=\"http://www.w3.org/2003/05/soap-envelope\" xmlns:u=\"urn:upnp\"><x:Body><u:GetExternalIPAddressResponse><NewExternalIPAddress>198&#46;51.100.8</NewExternalIPAddress></u:GetExternalIPAddressResponse></x:Body></x:Envelope>";
+        assert_eq!(
+            parse_external_ip_response(encoded, "urn:upnp").unwrap(),
+            Ipv4Addr::new(198, 51, 100, 8)
         );
         for invalid in [
             "<Envelope><Body><NewExternalIPAddress>198.51.100.7</NewExternalIPAddress></Body></Envelope>",
@@ -869,23 +971,35 @@ mod tests {
             "<Envelope><Body><GetExternalIPAddressResponse><NewExternalIPAddress>198.51.100.7</NewExternalIPAddress><extra/></GetExternalIPAddressResponse></Body></Envelope>",
             "<Envelope><Body><GetExternalIPAddressResponse><NewExternalIPAddress/></GetExternalIPAddressResponse></Body></Envelope>",
             "<Envelope><Body><Fault><NewExternalIPAddress>198.51.100.7</NewExternalIPAddress></Fault></Body></Envelope>",
+            "<x:Envelope xmlns:x=\"urn:not-soap\" xmlns:u=\"urn:upnp\"><x:Body><u:GetExternalIPAddressResponse><NewExternalIPAddress>198.51.100.7</NewExternalIPAddress></u:GetExternalIPAddressResponse></x:Body></x:Envelope>",
+            "<x:Envelope xmlns:x=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:u=\"urn:wrong\"><x:Body><u:GetExternalIPAddressResponse><NewExternalIPAddress>198.51.100.7</NewExternalIPAddress></u:GetExternalIPAddressResponse></x:Body></x:Envelope>",
+            "<x:Envelope xmlns:x=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:u=\"urn:upnp\"><x:Body><u:GetExternalIPAddressResponse><NewExternalIPAddress>198&bogus;51.100.7</NewExternalIPAddress></u:GetExternalIPAddressResponse></x:Body></x:Envelope>",
+            "<x:Envelope xmlns:x=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:u=\"urn:upnp\"><x:Body><u:GetExternalIPAddressResponse><NewExternalIPAddress>&#x110000;</NewExternalIPAddress></u:GetExternalIPAddressResponse></x:Body></x:Envelope>",
+            "<x:Envelope xmlns:x=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:u=\"urn:upnp\"><x:Body><u:GetExternalIPAddressResponse><NewExternalIPAddress>&#0;</NewExternalIPAddress></u:GetExternalIPAddressResponse></x:Body></x:Envelope>",
         ] {
-            assert!(parse_external_ip_response(invalid).is_err(), "accepted {invalid}");
+            assert!(
+                parse_external_ip_response(invalid, "urn:upnp").is_err(),
+                "accepted {invalid}"
+            );
         }
     }
 
     #[test]
     fn fallback_fault_requires_direct_soap_structure() {
         assert_eq!(
-            soap_fault_code("<s:Envelope xmlns:s=\"urn:soap\"><s:Body><s:Fault><errorCode>725</errorCode></s:Fault></s:Body></s:Envelope>"),
+            soap_fault_code("<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body><s:Fault><errorCode>7&#50;5</errorCode></s:Fault></s:Body></s:Envelope>"),
             Some(725)
         );
         assert_eq!(
-            soap_fault_code("<s:Envelope xmlns:s=\"urn:soap\"><s:Body><wrapper><s:Fault><errorCode>725</errorCode></s:Fault></wrapper></s:Body></s:Envelope>"),
+            soap_fault_code("<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body><s:Fault><errorCode>7&bad;5</errorCode></s:Fault></s:Body></s:Envelope>"),
             None
         );
         assert_eq!(
-            soap_fault_code("<s:Envelope xmlns:s=\"urn:soap\"><s:Body><s:Fault/><extra><errorCode>725</errorCode></extra></s:Body></s:Envelope>"),
+            soap_fault_code("<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body><wrapper><s:Fault><errorCode>725</errorCode></s:Fault></wrapper></s:Body></s:Envelope>"),
+            None
+        );
+        assert_eq!(
+            soap_fault_code("<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body><s:Fault/><extra><errorCode>725</errorCode></extra></s:Body></s:Envelope>"),
             None
         );
     }
@@ -893,22 +1007,10 @@ mod tests {
     #[test]
     fn is_soap_fault_detects_fault() {
         let fault = r#"<?xml version="1.0"?>
-<s:Envelope xmlns:s="urn:soap"><s:Body><s:Fault><faultCode>s:Client</faultCode></s:Fault></s:Body></s:Envelope>"#;
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><s:Fault><faultCode>s:Client</faultCode></s:Fault></s:Body></s:Envelope>"#;
         assert!(is_soap_fault(fault));
         let ok = r#"<?xml version="1.0"?>
-<s:Envelope xmlns:s="urn:soap" xmlns:u="urn:upnp"><s:Body><u:AddPortMappingResponse/></s:Body></s:Envelope>"#;
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" xmlns:u="urn:upnp"><s:Body><u:AddPortMappingResponse/></s:Body></s:Envelope>"#;
         assert!(!is_soap_fault(ok));
-    }
-
-    #[test]
-    fn extract_upnp_error_code_works() {
-        let fault = r#"<?xml version="1.0"?>
-<s:Envelope><s:Body><s:Fault><detail>
-  <UPnPError xmlns="urn:schemas-upnp-org:control-1-0">
-    <errorCode>725</errorCode>
-    <errorDescription>OnlyPermanentLeasesSupported</errorDescription>
-  </UPnPError>
-</detail></s:Fault></s:Body></s:Envelope>"#;
-        assert_eq!(extract_upnp_error_code(fault), Some(725));
     }
 }

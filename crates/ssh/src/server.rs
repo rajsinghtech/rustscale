@@ -9,11 +9,14 @@ use russh::keys::PrivateKey;
 use russh::server::{Auth, Msg, Server as RusshServer, Session};
 use russh::{Channel, ChannelId, MethodSet};
 use rustscale_tailcfg::{Node, SSHPolicy, UserProfile};
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
+
+const MAX_SESSION_CHANNELS: usize = 16;
 
 pub type WhoIsCallback = Arc<dyn Fn(IpAddr) -> Option<(Node, UserProfile)> + Send + Sync>;
 pub type PolicyCallback = Arc<dyn Fn() -> Option<SSHPolicy> + Send + Sync>;
@@ -64,13 +67,7 @@ impl RusshServer for SshServer {
             local_user: String::new(),
             accept_env: Vec::new(),
             peer_identity: None,
-            channel_data_tx: None,
-            session_cancel: None,
-            env_vars: Vec::new(),
-            pty: None,
-            command: String::new(),
-            signal_tx: None,
-            window_change_tx: None,
+            channels: HashMap::new(),
             recording_config: None,
             session_duration: std::time::Duration::ZERO,
             revalidate: None,
@@ -101,6 +98,18 @@ fn next_connection_id() -> String {
     )
 }
 
+#[derive(Default)]
+struct ChannelState {
+    env_vars: Vec<(String, String)>,
+    pty: Option<Pty>,
+    command: String,
+    started: bool,
+    data_tx: Option<mpsc::Sender<Vec<u8>>>,
+    cancel: Option<tokio::sync::watch::Sender<bool>>,
+    signal_tx: Option<mpsc::Sender<russh::Sig>>,
+    window_change_tx: Option<mpsc::Sender<Window>>,
+}
+
 pub struct SshHandler {
     config: Arc<SshServerConfig>,
     peer_addr: Option<SocketAddr>,
@@ -108,13 +117,7 @@ pub struct SshHandler {
     local_user: String,
     accept_env: Vec<String>,
     peer_identity: Option<PeerIdentity>,
-    channel_data_tx: Option<mpsc::Sender<Vec<u8>>>,
-    session_cancel: Option<tokio::sync::watch::Sender<bool>>,
-    env_vars: Vec<(String, String)>,
-    pty: Option<Pty>,
-    command: String,
-    signal_tx: Option<mpsc::Sender<russh::Sig>>,
-    window_change_tx: Option<mpsc::Sender<Window>>,
+    channels: HashMap<ChannelId, ChannelState>,
     recording_config: Option<RecordingConfig>,
     session_duration: std::time::Duration,
     revalidate: Option<RevalidateCallback>,
@@ -225,15 +228,28 @@ impl SshHandler {
         channel_id: ChannelId,
         session: &mut Session,
     ) -> Result<(), russh::Error> {
+        let Some(channel) = self.channels.get_mut(&channel_id) else {
+            let _ = session.channel_failure(channel_id);
+            return Ok(());
+        };
+        if channel.started {
+            let _ = session.channel_failure(channel_id);
+            return Ok(());
+        }
+        channel.started = true;
+
         let (data_tx, data_rx) = mpsc::channel::<Vec<u8>>(64);
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
         let (done_tx, _done_rx) = mpsc::channel::<()>(1);
         let (signal_tx, signal_rx) = mpsc::channel::<russh::Sig>(16);
         let (window_change_tx, window_change_rx) = mpsc::channel::<Window>(16);
-        self.channel_data_tx = Some(data_tx);
-        self.session_cancel = Some(cancel_tx);
-        self.signal_tx = Some(signal_tx);
-        self.window_change_tx = Some(window_change_tx);
+        channel.data_tx = Some(data_tx);
+        channel.cancel = Some(cancel_tx);
+        channel.signal_tx = Some(signal_tx);
+        channel.window_change_tx = Some(window_change_tx);
+        let env_vars = channel.env_vars.clone();
+        let pty = channel.pty.clone();
+        let command = channel.command.clone();
 
         let handle = session.handle();
         let peer = self.peer_identity.clone().unwrap_or_default();
@@ -257,12 +273,11 @@ impl SshHandler {
                 }
             }
         }
-        let term = self
-            .pty
+        let term = pty
             .as_ref()
             .map(|pty| pty.term.clone())
             .or_else(|| {
-                self.env_vars
+                env_vars
                     .iter()
                     .find(|(name, _)| name == "TERM")
                     .map(|(_, value)| value.clone())
@@ -270,10 +285,9 @@ impl SshHandler {
             .filter(|term| !term.is_empty())
             .unwrap_or_else(|| "xterm-256color".into());
         let mut cast_header = CastHeader::new(
-            self.pty
-                .as_ref()
+            pty.as_ref()
                 .map_or((0, 0), |pty| (pty.window.width, pty.window.height)),
-            self.command.clone(),
+            command.clone(),
             [("TERM".to_string(), term)].into_iter().collect(),
             self.ssh_user.clone(),
             self.local_user.clone(),
@@ -294,9 +308,9 @@ impl SshHandler {
             peer,
             ssh_user: self.ssh_user.clone(),
             local_user: self.local_user.clone(),
-            command: self.command.clone(),
-            env: self.env_vars.clone(),
-            pty: self.pty.clone(),
+            command,
+            env: env_vars,
+            pty,
             handle,
             channel_id,
             data_rx,
@@ -351,31 +365,42 @@ impl russh::server::Handler for SshHandler {
 
     async fn channel_open_session(
         &mut self,
-        _channel: Channel<Msg>,
+        channel: Channel<Msg>,
         reply: russh::server::ChannelOpenHandle,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        reply.accept().await;
+        if self.channels.len() >= MAX_SESSION_CHANNELS {
+            reply
+                .reject(russh::ChannelOpenFailure::ResourceShortage)
+                .await;
+        } else {
+            self.channels.insert(channel.id(), ChannelState::default());
+            reply.accept().await;
+        }
         Ok(())
     }
 
     async fn env_request(
         &mut self,
-        _channel: ChannelId,
+        channel: ChannelId,
         name: &str,
         value: &str,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         let kv = format!("{name}={value}");
         if accept_env_pair(&kv) || self.accept_env.iter().any(|p| p == name) {
-            self.env_vars.push((name.to_string(), value.to_string()));
+            if let Some(state) = self.channels.get_mut(&channel) {
+                if !state.started {
+                    state.env_vars.push((name.to_string(), value.to_string()));
+                }
+            }
         }
         Ok(())
     }
 
     async fn pty_request(
         &mut self,
-        _channel: ChannelId,
+        channel: ChannelId,
         term: &str,
         col_width: u32,
         row_height: u32,
@@ -384,15 +409,19 @@ impl russh::server::Handler for SshHandler {
         _modes: &[(russh::Pty, u32)],
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        self.pty = Some(Pty {
-            term: term.to_string(),
-            window: Window {
-                width: col_width,
-                height: row_height,
-                width_pixels: pix_width,
-                height_pixels: pix_height,
-            },
-        });
+        if let Some(state) = self.channels.get_mut(&channel) {
+            if !state.started {
+                state.pty = Some(Pty {
+                    term: term.to_string(),
+                    window: Window {
+                        width: col_width,
+                        height: row_height,
+                        width_pixels: pix_width,
+                        height_pixels: pix_height,
+                    },
+                });
+            }
+        }
         Ok(())
     }
 
@@ -401,7 +430,9 @@ impl russh::server::Handler for SshHandler {
         channel: ChannelId,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        self.command.clear();
+        if let Some(state) = self.channels.get_mut(&channel) {
+            state.command.clear();
+        }
         let _ = session.channel_success(channel);
         self.send_session(channel, session).await?;
         Ok(())
@@ -413,7 +444,9 @@ impl russh::server::Handler for SshHandler {
         data: &[u8],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        self.command = String::from_utf8_lossy(data).to_string();
+        if let Some(state) = self.channels.get_mut(&channel) {
+            state.command = String::from_utf8_lossy(data).to_string();
+        }
         let _ = session.channel_success(channel);
         self.send_session(channel, session).await?;
         Ok(())
@@ -426,7 +459,9 @@ impl russh::server::Handler for SshHandler {
         session: &mut Session,
     ) -> Result<(), Self::Error> {
         if name == "sftp" {
-            self.command.clear();
+            if let Some(state) = self.channels.get_mut(&channel) {
+                state.command.clear();
+            }
             let _ = session.channel_success(channel);
             self.send_session(channel, session).await?;
         } else {
@@ -437,11 +472,15 @@ impl russh::server::Handler for SshHandler {
 
     async fn data(
         &mut self,
-        _channel: ChannelId,
+        channel: ChannelId,
         data: &[u8],
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        if let Some(tx) = &self.channel_data_tx {
+        if let Some(tx) = self
+            .channels
+            .get(&channel)
+            .and_then(|state| state.data_tx.clone())
+        {
             let _ = tx.send(data.to_vec()).await;
         }
         Ok(())
@@ -449,7 +488,7 @@ impl russh::server::Handler for SshHandler {
 
     async fn window_change_request(
         &mut self,
-        _channel: ChannelId,
+        channel: ChannelId,
         col_width: u32,
         row_height: u32,
         pix_width: u32,
@@ -462,23 +501,29 @@ impl russh::server::Handler for SshHandler {
             width_pixels: pix_width,
             height_pixels: pix_height,
         };
-        if let Some(ref mut pty) = self.pty {
-            pty.window = win.clone();
-        }
-        if let Some(tx) = &self.window_change_tx {
-            let _ = tx.try_send(win);
+        if let Some(state) = self.channels.get_mut(&channel) {
+            if let Some(pty) = state.pty.as_mut() {
+                pty.window = win.clone();
+            }
+            if let Some(tx) = &state.window_change_tx {
+                let _ = tx.try_send(win);
+            }
         }
         Ok(())
     }
 
     async fn signal(
         &mut self,
-        _channel: ChannelId,
+        channel: ChannelId,
         signal: russh::Sig,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         log::debug!("SSH signal: {signal:?}");
-        if let Some(tx) = &self.signal_tx {
+        if let Some(tx) = self
+            .channels
+            .get(&channel)
+            .and_then(|state| state.signal_tx.as_ref())
+        {
             let _ = tx.try_send(signal);
         }
         Ok(())
@@ -486,29 +531,30 @@ impl russh::server::Handler for SshHandler {
 
     async fn channel_eof(
         &mut self,
-        _channel: ChannelId,
+        channel: ChannelId,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        if let Some(cancel) = self.session_cancel.take() {
-            cancel.send_replace(true);
+        if let Some(state) = self.channels.get_mut(&channel) {
+            if let Some(cancel) = state.cancel.take() {
+                cancel.send_replace(true);
+            }
+            state.data_tx = None;
+            state.signal_tx = None;
+            state.window_change_tx = None;
         }
-        self.channel_data_tx = None;
-        self.signal_tx = None;
-        self.window_change_tx = None;
         Ok(())
     }
 
     async fn channel_close(
         &mut self,
-        _channel: ChannelId,
+        channel: ChannelId,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        if let Some(cancel) = self.session_cancel.take() {
-            cancel.send_replace(true);
+        if let Some(mut state) = self.channels.remove(&channel) {
+            if let Some(cancel) = state.cancel.take() {
+                cancel.send_replace(true);
+            }
         }
-        self.channel_data_tx = None;
-        self.signal_tx = None;
-        self.window_change_tx = None;
         Ok(())
     }
 }

@@ -14,12 +14,14 @@
 //! privilege dropping, SELinux, networked home directories, etc.
 
 use crate::session::Pty;
+#[cfg(unix)]
+use std::ffi::CString;
 use std::ffi::OsString;
 use std::io;
 use std::process::Stdio;
 
 #[cfg(unix)]
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 #[cfg(unix)]
 #[allow(unused_imports)]
 use std::os::unix::process::CommandExt;
@@ -245,6 +247,25 @@ impl Incubator {
     /// If `has_tty` is true, the caller should have already allocated a PTY
     /// and pass the slave end as stdin/stdout/stderr. Otherwise, pipes are used.
     pub fn spawn(self) -> Result<SpawnedProcess, IncubatorError> {
+        self.spawn_inner(None)
+    }
+
+    /// Spawn while publishing the child's process-group handle immediately
+    /// after fork/setpgid, before cwd, credential, PTY, or exec setup can
+    /// block. The callback runs on a small pipe-monitor thread.
+    #[cfg(unix)]
+    pub fn spawn_with_start_notify<F>(self, notify: F) -> Result<SpawnedProcess, IncubatorError>
+    where
+        F: FnOnce(ProcessGroup) + Send + 'static,
+    {
+        self.spawn_inner(Some(Box::new(notify)))
+    }
+
+    fn spawn_inner(
+        self,
+        #[cfg(unix)] start_notify: Option<Box<dyn FnOnce(ProcessGroup) + Send>>,
+        #[cfg(not(unix))] _start_notify: Option<()>,
+    ) -> Result<SpawnedProcess, IncubatorError> {
         if self.args.is_sftp {
             // SFTP requires the embedded SFTP server (Go uses tailscaled's
             // built-in handler). In standalone mode we can't serve SFTP.
@@ -282,13 +303,13 @@ impl Incubator {
             .collect();
         cmd.envs(env_pairs);
 
-        // Set working directory to home, falling back to / if inaccessible.
+        // Working-directory setup is deliberately performed in pre_exec only
+        // after the process-group handle has been published to the parent.
         let dir = if self.args.home_dir.is_empty() {
             "/".to_string()
         } else {
             self.args.home_dir.clone()
         };
-        cmd.current_dir(&dir);
 
         // PTY mode: dup2 slave fd onto stdin/stdout/stderr in pre_exec.
         // Pipe mode: use Stdio::piped() for I/O pumping.
@@ -312,10 +333,62 @@ impl Incubator {
         // On Unix, set uid/gid before exec, and dup2 PTY slave if present.
         #[cfg(unix)]
         {
+            let start_write = if let Some(notify) = start_notify {
+                let mut fds = [-1; 2];
+                // SAFETY: pipe initializes both integer descriptors on success.
+                if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+                    return Err(io::Error::last_os_error().into());
+                }
+                // SAFETY: successful pipe returned two newly owned descriptors.
+                let read_fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+                let write_fd = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+                for fd in [&read_fd, &write_fd] {
+                    // SAFETY: fcntl operates on a valid owned descriptor.
+                    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+                        return Err(io::Error::last_os_error().into());
+                    }
+                }
+                std::thread::Builder::new()
+                    .name("ssh-launch-monitor".into())
+                    .spawn(move || {
+                        let mut pid_bytes = [0_u8; std::mem::size_of::<libc::pid_t>()];
+                        let mut offset = 0;
+                        while offset < pid_bytes.len() {
+                            // SAFETY: the destination is valid for the requested remainder.
+                            let count = unsafe {
+                                libc::read(
+                                    read_fd.as_raw_fd(),
+                                    pid_bytes[offset..].as_mut_ptr().cast(),
+                                    pid_bytes.len() - offset,
+                                )
+                            };
+                            if count > 0 {
+                                offset += count as usize;
+                            } else if count < 0
+                                && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted
+                            {
+                                continue;
+                            } else {
+                                return;
+                            }
+                        }
+                        let pid = libc::pid_t::from_ne_bytes(pid_bytes);
+                        if pid > 0 {
+                            notify(ProcessGroup { pid: pid as u32 });
+                        }
+                    })
+                    .map_err(IncubatorError::from)?;
+                Some(write_fd)
+            } else {
+                None
+            };
+            let start_fd = start_write.as_ref().map(AsRawFd::as_raw_fd);
             let gids = self.args.gids.clone();
             let uid = self.args.uid;
             let gid = self.args.gid;
             let pty_slave = self.args.pty_slave_fd.as_ref().map(AsRawFd::as_raw_fd);
+            let working_dir = CString::new(dir)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "home contains NUL"))?;
             // Every SSH shell gets a dedicated process group so cancellation
             // cannot leave TERM-ignoring descendants behind.
             let current_uid = unsafe { libc::getuid() };
@@ -329,6 +402,16 @@ impl Incubator {
                 cmd.pre_exec(move || {
                     if libc::setpgid(0, 0) != 0 {
                         return Err(io::Error::last_os_error());
+                    }
+                    if let Some(fd) = start_fd {
+                        let pid = libc::getpid();
+                        let pid_bytes = pid.to_ne_bytes();
+                        if libc::write(fd, pid_bytes.as_ptr().cast(), pid_bytes.len())
+                            != pid_bytes.len() as isize
+                        {
+                            return Err(io::Error::last_os_error());
+                        }
+                        libc::close(fd);
                     }
                     // If a PTY slave fd is set, dup2 it onto
                     // stdin/stdout/stderr.
@@ -367,15 +450,27 @@ impl Incubator {
                             return Err(io::Error::last_os_error());
                         }
                     }
+                    if libc::chdir(working_dir.as_ptr()) != 0 {
+                        let root = c"/";
+                        if libc::chdir(root.as_ptr()) != 0 {
+                            return Err(io::Error::last_os_error());
+                        }
+                    }
                     Ok(())
                 });
             }
+
+            let child = cmd.spawn();
+            drop(start_write);
+            let child = child?;
+            Ok(SpawnedProcess { child })
         }
 
-        let child = cmd.spawn()?;
-        // `self` is consumed, so the parent's OwnedFd for the PTY slave is
-        // closed exactly once here after spawn (and on every error path).
-        Ok(SpawnedProcess { child })
+        #[cfg(not(unix))]
+        {
+            let child = cmd.spawn()?;
+            Ok(SpawnedProcess { child })
+        }
     }
 
     /// The local user this incubator will run as.
@@ -497,6 +592,33 @@ mod tests {
         .await;
         let _ = std::fs::remove_file(pid_file);
         assert!(gone.is_ok(), "TERM-ignoring descendant remained alive");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_publishes_process_group_before_session_completion() {
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let inc = Incubator::new(IncubatorArgs {
+            login_shell: "/bin/sh".into(),
+            is_shell: false,
+            cmd: "sleep 30".into(),
+            env: vec![OsString::from("PATH=/usr/bin:/bin")],
+            ..Default::default()
+        });
+        let mut process = inc
+            .spawn_with_start_notify(move |group| {
+                let _ = started_tx.send(group);
+            })
+            .expect("spawn failed");
+        let started = started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("process group was not published");
+        assert_eq!(Some(started.pid), process.pid());
+        started.signal(libc::SIGKILL).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), process.wait())
+            .await
+            .expect("process did not exit")
+            .expect("wait failed");
     }
 
     #[tokio::test]

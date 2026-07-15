@@ -9,8 +9,8 @@
 
 use crate::host_key_from_node_key;
 use crate::session_handler::{
-    run_session, run_session_with, LaunchedSession, LocalUser, ProcessControl, SessionHandlerError,
-    SessionLauncher, UserResolver,
+    run_session, run_session_with, LaunchStarted, LaunchedSession, LocalUser, ProcessControl,
+    SessionHandlerError, SessionLauncher, UserResolver,
 };
 use crate::{Session, SshServer, SshServerConfig};
 use russh::server::Server as _;
@@ -213,6 +213,130 @@ async fn run_pipeline_custom(
     (reported.unwrap_or(result), output)
 }
 
+#[tokio::test]
+async fn multiplexed_channels_keep_data_eof_signals_windows_and_recorders_independent() {
+    let host_key = host_key_from_node_key(&NodePrivate::generate());
+    let (session_tx, mut session_rx) = mpsc::channel::<crate::session::SessionInit>(16);
+    let mut policy = policy_for("=", std::time::Duration::ZERO);
+    policy.Rules[0].Action.as_mut().unwrap().Recorders = vec!["100.64.0.9:80".parse().unwrap()];
+    let config = SshServerConfig {
+        host_keys: vec![host_key],
+        session_tx,
+        whois: whois_finds_peer(),
+        policy: Arc::new(move || Some(policy.clone())),
+        state_dir: None,
+        dial_fn: None,
+    };
+    let mut server = SshServer::new(config);
+    let server_config = server.russh_config();
+    let (client_io, server_io) = tokio::io::duplex(32 * 1024);
+    let handler = server.new_client(Some(SocketAddr::new(peer_ip(), 22)));
+    tokio::spawn(async move {
+        let running = russh::server::run_stream(server_config, server_io, handler)
+            .await
+            .unwrap();
+        let _ = running.await;
+    });
+    let mut client = russh::client::connect_stream(
+        Arc::new(russh::client::Config::default()),
+        client_io,
+        ClientHandler,
+    )
+    .await
+    .unwrap();
+    assert!(client
+        .authenticate_password("alice", "")
+        .await
+        .unwrap()
+        .success());
+
+    let channel_one = client.channel_open_session().await.unwrap();
+    let channel_two = client.channel_open_session().await.unwrap();
+    let mut extra_channels = Vec::new();
+    for _ in 0..14 {
+        extra_channels.push(client.channel_open_session().await.unwrap());
+    }
+    assert!(client.channel_open_session().await.is_err());
+    for channel in &extra_channels {
+        channel.close().await.unwrap();
+    }
+    drop(extra_channels);
+    let replacement = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if let Ok(channel) = client.channel_open_session().await {
+                break channel;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("closed channels were not removed from the bounded map");
+    replacement.close().await.unwrap();
+    drop(replacement);
+
+    channel_one.set_env(false, "LANG", "one").await.unwrap();
+    channel_two.set_env(false, "LANG", "two").await.unwrap();
+    channel_one
+        .request_pty(false, "term-one", 80, 24, 0, 0, &[])
+        .await
+        .unwrap();
+    channel_two
+        .request_pty(false, "term-two", 120, 40, 0, 0, &[])
+        .await
+        .unwrap();
+    channel_one.exec(true, b"command-one").await.unwrap();
+    channel_two.exec(true, b"command-two").await.unwrap();
+
+    let mut one = session_rx.recv().await.unwrap();
+    let mut two = session_rx.recv().await.unwrap();
+    if one.command == "command-two" {
+        std::mem::swap(&mut one, &mut two);
+    }
+    assert_eq!(one.command, "command-one");
+    assert_eq!(two.command, "command-two");
+    assert_eq!(one.env, [("LANG".into(), "one".into())]);
+    assert_eq!(two.env, [("LANG".into(), "two".into())]);
+    assert_eq!(one.pty.as_ref().unwrap().term, "term-one");
+    assert_eq!(two.pty.as_ref().unwrap().term, "term-two");
+    assert_eq!(one.recording_config.as_ref().unwrap().recorders.len(), 1);
+    assert_eq!(two.recording_config.as_ref().unwrap().recorders.len(), 1);
+    assert_eq!(
+        one.recording_header.as_ref().unwrap().command,
+        "command-one"
+    );
+    assert_eq!(
+        two.recording_header.as_ref().unwrap().command,
+        "command-two"
+    );
+
+    channel_one
+        .data_bytes(b"input-one".as_slice())
+        .await
+        .unwrap();
+    channel_two
+        .data_bytes(b"input-two".as_slice())
+        .await
+        .unwrap();
+    channel_one.signal(russh::Sig::INT).await.unwrap();
+    channel_two.signal(russh::Sig::TERM).await.unwrap();
+    channel_one.window_change(81, 25, 1, 2).await.unwrap();
+    channel_two.window_change(121, 41, 3, 4).await.unwrap();
+    assert_eq!(one.data_rx.recv().await.unwrap(), b"input-one");
+    assert_eq!(two.data_rx.recv().await.unwrap(), b"input-two");
+    assert!(matches!(one.signal_rx.recv().await, Some(russh::Sig::INT)));
+    assert!(matches!(two.signal_rx.recv().await, Some(russh::Sig::TERM)));
+    assert_eq!(one.window_change_rx.recv().await.unwrap().width, 81);
+    assert_eq!(two.window_change_rx.recv().await.unwrap().width, 121);
+
+    channel_one.eof().await.unwrap();
+    one.cancel_rx.changed().await.unwrap();
+    assert!(*one.cancel_rx.borrow());
+    assert!(!*two.cancel_rx.borrow());
+    channel_two.eof().await.unwrap();
+    two.cancel_rx.changed().await.unwrap();
+    assert!(*two.cancel_rx.borrow());
+}
+
 async fn run_pipeline_output(command: &str) -> (i32, Vec<u8>) {
     let requested_user = std::env::var("USER").unwrap_or_else(|_| "testuser".to_string());
     run_pipeline_custom(
@@ -253,14 +377,17 @@ impl SessionLauncher for CapturingLauncher {
     fn launch(
         &self,
         args: crate::incubator::IncubatorArgs,
+        started: LaunchStarted,
     ) -> Result<LaunchedSession, SessionHandlerError> {
         self.args.lock().unwrap().push(args);
+        let control: Arc<dyn ProcessControl> = Arc::new(NoopProcessControl);
+        started(control.clone());
         Ok(LaunchedSession {
             input: Some(Box::new(tokio::io::sink())),
             output: Some(Box::new(tokio::io::empty())),
             stderr: Some(Box::new(tokio::io::empty())),
             wait: Box::pin(async { Ok(0) }),
-            control: Arc::new(NoopProcessControl),
+            control,
         })
     }
 }
@@ -413,12 +540,16 @@ impl SessionLauncher for GatedLauncher {
     fn launch(
         &self,
         args: crate::incubator::IncubatorArgs,
+        started: LaunchStarted,
     ) -> Result<LaunchedSession, SessionHandlerError> {
+        // Model a child that exists and has a process group, then hangs in
+        // post-fork setup before the launch call can return.
+        started(self.inner.control.clone());
         if let Some(entered) = self.entered.lock().unwrap().take() {
             let _ = entered.send(());
         }
         self.gate.wait();
-        self.inner.launch(args)
+        self.inner.launch(args, Box::new(|_| {}))
     }
 }
 
@@ -470,7 +601,9 @@ impl SessionLauncher for CompletedLauncher {
     fn launch(
         &self,
         _args: crate::incubator::IncubatorArgs,
+        started: LaunchStarted,
     ) -> Result<LaunchedSession, SessionHandlerError> {
+        started(self.control.clone());
         Ok(LaunchedSession {
             input: Some(Box::new(tokio::io::sink())),
             output: Some(Box::new(tokio::io::empty())),
@@ -489,7 +622,9 @@ impl SessionLauncher for PersistentLauncher {
     fn launch(
         &self,
         _args: crate::incubator::IncubatorArgs,
+        started: LaunchStarted,
     ) -> Result<LaunchedSession, SessionHandlerError> {
+        started(self.control.clone());
         Ok(LaunchedSession {
             input: Some(Box::new(tokio::io::sink())),
             output: Some(Box::new(tokio::io::empty())),
@@ -539,7 +674,9 @@ impl SessionLauncher for TermIgnoringLauncher {
     fn launch(
         &self,
         _args: crate::incubator::IncubatorArgs,
+        started: LaunchStarted,
     ) -> Result<LaunchedSession, SessionHandlerError> {
+        started(self.control.clone());
         let (mut output_writer, output_reader) = tokio::io::duplex(4096);
         let output = self.output.lock().unwrap().take().unwrap_or_default();
         tokio::spawn(async move {
@@ -1000,7 +1137,7 @@ async fn duration_cancels_hung_nss_resolution_without_launching() {
 }
 
 #[tokio::test]
-async fn canceled_hung_launcher_is_supervised_when_it_completes() {
+async fn duration_kills_post_fork_child_while_launch_return_is_blocked() {
     let inner = Arc::new(TermIgnoringLauncher::new(Vec::new()));
     let gate = Arc::new(BlockingGate::default());
     let (entered_tx, entered_rx) = oneshot::channel();
@@ -1041,7 +1178,6 @@ async fn canceled_hung_launcher_is_supervised_when_it_completes() {
     .await
     .expect("launcher did not start");
     let result = tokio::time::timeout(std::time::Duration::from_secs(1), &mut run).await;
-    gate.release();
     let (code, _) = result.expect("duration did not cancel process launch");
     assert_eq!(code, 1);
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -1059,7 +1195,8 @@ async fn canceled_hung_launcher_is_supervised_when_it_completes() {
         }
     })
     .await
-    .expect("late launched process was not supervised");
+    .expect("post-fork child was not killed while launch remained blocked");
+    gate.release();
 }
 
 #[tokio::test]

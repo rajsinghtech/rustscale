@@ -265,7 +265,6 @@ async fn connect_v1(
         let result = loop {
             tokio::select! {
                 biased;
-                response_result = &mut response => break response_result,
                 upload_result = &mut upload, if !upload_done => {
                     match upload_result {
                         Ok(()) => {
@@ -274,6 +273,16 @@ async fn connect_v1(
                         }
                         Err(error) => break Err(error),
                     }
+                }
+                response_result = &mut response => {
+                    break match response_result {
+                        Ok(()) if upload_done => Ok(()),
+                        Ok(()) => Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "recorder returned a final response before upload drain",
+                        )),
+                        Err(error) => Err(error),
+                    };
                 }
                 changed = cancel_rx.changed() => {
                     if changed.is_err() || *cancel_rx.borrow() {
@@ -428,6 +437,12 @@ async fn connect_v2(
         let result = 'monitor: loop {
             tokio::select! {
                 biased;
+                upload_result = &mut upload, if !upload_done => {
+                    match upload_result {
+                        Ok(()) => upload_done = true,
+                        Err(error) => break Err(error),
+                    }
+                }
                 maybe_data = ack_body.data() => match maybe_data {
                     Some(Ok(data)) => {
                         let received = data.len();
@@ -458,15 +473,15 @@ async fn connect_v2(
                         if ack_buffer.iter().any(|byte| !byte.is_ascii_whitespace()) {
                             break Err(io::Error::new(io::ErrorKind::InvalidData, "truncated recorder acknowledgement"));
                         }
-                        break Ok(());
+                        if upload_done {
+                            break Ok(());
+                        }
+                        break Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "recorder closed acknowledgements before upload drain",
+                        ));
                     }
                 },
-                upload_result = &mut upload, if !upload_done => {
-                    match upload_result {
-                        Ok(()) => upload_done = true,
-                        Err(error) => break Err(error),
-                    }
-                }
                 changed = cancel_rx.changed() => {
                     if changed.is_err() || *cancel_rx.borrow() {
                         break Err(io::Error::new(io::ErrorKind::Interrupted, "recorder upload aborted"));
@@ -662,6 +677,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn v1_early_success_before_queued_frames_drain_is_failure() {
+        let (client, stream) = tokio::io::duplex(512);
+        let (respond_tx, respond_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let (read, mut write) = tokio::io::split(stream);
+            let mut read = BufReader::new(read);
+            loop {
+                let mut line = String::new();
+                read.read_line(&mut line).await.unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            write
+                .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+                .await
+                .unwrap();
+            let _ = respond_rx.await;
+            write
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        });
+
+        let (mut writer, result_rx, _) = connect_v1(addr(20, 80), &duplex_dial(vec![client]))
+            .await
+            .unwrap();
+        for _ in 0..32 {
+            writer.write_all(&[b'z'; 128]).unwrap();
+        }
+        respond_tx.send(()).unwrap();
+        let error = result_rx.await.unwrap().unwrap_err();
+        assert!(
+            matches!(
+                error.kind(),
+                io::ErrorKind::UnexpectedEof | io::ErrorKind::BrokenPipe
+            ),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
     async fn v2_recorder_accepts_stream_and_exact_path() {
         let (client, stream) = tokio::io::duplex(2 * 1024 * 1024);
         let server = tokio::spawn(async move {
@@ -706,6 +763,49 @@ mod tests {
         drop(writer);
         result_rx.await.unwrap().unwrap();
         assert_eq!(server.await.unwrap(), payload);
+    }
+
+    #[tokio::test]
+    async fn v2_early_ack_eof_before_queued_frames_drain_is_failure() {
+        let (client, stream) = tokio::io::duplex(2 * 1024 * 1024);
+        let (close_tx, close_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let mut connection = server::handshake(stream).await.unwrap();
+            let (request, mut respond) = connection.accept().await.unwrap().unwrap();
+            tokio::spawn(async move {
+                let _body = request.into_body();
+                let mut send = respond
+                    .send_response(http::Response::new(()), false)
+                    .unwrap();
+                let _ = close_rx.await;
+                send.send_data(Bytes::new(), true).unwrap();
+            });
+            while connection.accept().await.is_some() {}
+        });
+
+        let (mut writer, result_rx, _) = connect_v2(addr(21, 80), &duplex_dial(vec![client]))
+            .await
+            .unwrap();
+        let frame = [b'q'; 16 * 1024];
+        let mut queued = 0;
+        while queued < 8 {
+            match writer.write_all(&frame) {
+                Ok(()) => queued += 1,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => panic!("unexpected upload error: {error}"),
+            }
+        }
+        close_tx.send(()).unwrap();
+        let error = result_rx.await.unwrap().unwrap_err();
+        assert!(
+            matches!(
+                error.kind(),
+                io::ErrorKind::UnexpectedEof | io::ErrorKind::BrokenPipe
+            ),
+            "{error}"
+        );
     }
 
     #[tokio::test]

@@ -27,6 +27,8 @@ use std::net::IpAddr;
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 #[cfg(unix)]
+use std::sync::Arc;
+#[cfg(unix)]
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Initialize the recording backend before the shell is started.
@@ -430,8 +432,17 @@ pub(crate) struct LaunchedSession {
 /// Injectable launcher. Tests can validate identity and lifecycle behavior
 /// without changing the test runner's uid.
 #[cfg(unix)]
+pub(crate) type LaunchStarted = Box<dyn FnOnce(Arc<dyn ProcessControl>) + Send>;
+
+#[cfg(unix)]
 pub(crate) trait SessionLauncher: Send + Sync {
-    fn launch(&self, args: IncubatorArgs) -> Result<LaunchedSession, SessionHandlerError>;
+    /// Begin launch and publish process-group control immediately after fork,
+    /// before child setup/exec can block.
+    fn launch(
+        &self,
+        args: IncubatorArgs,
+        started: LaunchStarted,
+    ) -> Result<LaunchedSession, SessionHandlerError>;
 }
 
 #[cfg(unix)]
@@ -539,8 +550,14 @@ struct IncubatorSessionLauncher;
 
 #[cfg(unix)]
 impl SessionLauncher for IncubatorSessionLauncher {
-    fn launch(&self, args: IncubatorArgs) -> Result<LaunchedSession, SessionHandlerError> {
-        let mut process = Incubator::new(args).spawn()?;
+    fn launch(
+        &self,
+        args: IncubatorArgs,
+        started: LaunchStarted,
+    ) -> Result<LaunchedSession, SessionHandlerError> {
+        let mut process = Incubator::new(args).spawn_with_start_notify(move |group| {
+            started(Arc::new(group));
+        })?;
         let control: std::sync::Arc<dyn ProcessControl> = std::sync::Arc::new(
             process
                 .process_group()
@@ -734,20 +751,43 @@ pub(crate) async fn run_session_with(
         Err(cause) => return finish_prelaunch_cancellation(&mut session, cause).await,
     };
     let runtime = tokio::runtime::Handle::current();
+    let (started_tx, mut started_rx) = tokio::sync::oneshot::channel();
     let mut launch_task = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let _runtime = runtime.enter();
-        launcher.launch(args)
+        launcher.launch(
+            args,
+            Box::new(move |control| {
+                let _ = started_tx.send(control);
+            }),
+        )
     });
-    let mut launched = match lifecycle.supervise_blocker(&mut launch_task).await {
+    let launch_timeout = tokio::time::sleep(BLOCKING_PHASE_TIMEOUT);
+    tokio::pin!(launch_timeout);
+    let mut started_control = None;
+    let mut started_open = true;
+    let launch_result = loop {
+        tokio::select! {
+            result = &mut launch_task => break Ok(result),
+            started = &mut started_rx, if started_open => {
+                started_open = false;
+                if let Ok(control) = started {
+                    started_control = Some(control);
+                }
+            }
+            cause = lifecycle.cancellation() => break Err(cause),
+            () = &mut launch_timeout => break Err(CancellationCause::BlockerTimeout),
+        }
+    };
+    let mut launched = match launch_result {
         Ok(Ok(result)) => result?,
         Ok(Err(error)) => return Err(io::Error::other(error.to_string()).into()),
         Err(cause) => {
-            tokio::spawn(async move {
-                if let Ok(Ok(launched)) = launch_task.await {
-                    supervise_late_launch(launched).await;
-                }
-            });
+            tokio::spawn(supervise_canceled_launch(
+                started_control,
+                started_open.then_some(started_rx),
+                launch_task,
+            ));
             return finish_prelaunch_cancellation(&mut session, cause).await;
         }
     };
@@ -1076,6 +1116,67 @@ async fn send_cancellation(
                 .await;
         }
         CancellationCause::Client => {}
+    }
+}
+
+#[cfg(unix)]
+async fn supervise_canceled_launch(
+    mut control: Option<Arc<dyn ProcessControl>>,
+    started_rx: Option<tokio::sync::oneshot::Receiver<Arc<dyn ProcessControl>>>,
+    mut launch_task: tokio::task::JoinHandle<Result<LaunchedSession, SessionHandlerError>>,
+) {
+    if control.is_none() {
+        if let Some(mut started_rx) = started_rx {
+            tokio::select! {
+                started = &mut started_rx => {
+                    control = started.ok();
+                }
+                result = &mut launch_task => {
+                    if let Ok(Ok(launched)) = result {
+                        supervise_late_launch(launched).await;
+                    }
+                    return;
+                }
+            }
+        }
+    }
+
+    let Some(control) = control else {
+        let _ = launch_task.await;
+        return;
+    };
+    let _ = control.signal_group(libc::SIGTERM);
+    tokio::time::sleep(PROCESS_TERM_TIMEOUT).await;
+    let _ = control.signal_group(libc::SIGKILL);
+    let verify = async {
+        loop {
+            if matches!(control.group_exists(), Ok(false)) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    };
+    if tokio::time::timeout(PROCESS_KILL_TIMEOUT, verify)
+        .await
+        .is_err()
+    {
+        log::warn!("canceled SSH setup left a persistent process group after SIGKILL");
+    }
+
+    match tokio::time::timeout(PROCESS_KILL_TIMEOUT, &mut launch_task).await {
+        Ok(Ok(Ok(mut launched))) => {
+            launched.input = None;
+            launched.output = None;
+            launched.stderr = None;
+            if tokio::time::timeout(PROCESS_KILL_TIMEOUT, &mut launched.wait)
+                .await
+                .is_err()
+            {
+                log::warn!("canceled SSH setup child could not be reaped");
+            }
+        }
+        Err(_) => log::warn!("canceled SSH setup did not return after process-group cleanup"),
+        Ok(_) => {}
     }
 }
 

@@ -195,6 +195,10 @@ pub fn get_local_user(username: &str) -> Result<LocalUser, SessionHandlerError> 
 /// Get the supplementary group list for a user via `getgrouplist`.
 #[cfg(unix)]
 fn get_group_list(cname: &CString, base_gid: libc::gid_t) -> Vec<u32> {
+    fn checked_gid<T: TryInto<u32>>(gid: T) -> Option<u32> {
+        gid.try_into().ok()
+    }
+
     // On macOS, getgrouplist takes c_int for groups; on Linux it takes gid_t.
     #[cfg(target_os = "macos")]
     type GidT = libc::c_int;
@@ -231,7 +235,8 @@ fn get_group_list(cname: &CString, base_gid: libc::gid_t) -> Vec<u32> {
 
     groups[..ngroups as usize]
         .iter()
-        .map(|&g| g as u32)
+        .copied()
+        .filter_map(checked_gid)
         .collect()
 }
 

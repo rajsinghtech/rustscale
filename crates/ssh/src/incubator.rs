@@ -22,6 +22,15 @@ use std::process::Stdio;
 #[allow(unused_imports)]
 use std::os::unix::process::CommandExt;
 
+#[cfg(unix)]
+fn checked_group_count<T>(len: usize) -> io::Result<T>
+where
+    T: TryFrom<usize>,
+{
+    T::try_from(len)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "too many supplementary groups"))
+}
+
 /// Arguments for spawning an incubated process — mirrors Go's `incubatorArgs`.
 #[derive(Clone, Debug, Default)]
 pub struct IncubatorArgs {
@@ -291,12 +300,7 @@ impl Incubator {
                             // libc uses size_t on Linux and c_int on BSD-derived
                             // platforms, so let the target signature select the
                             // checked conversion type.
-                            let group_count = gids_v.len().try_into().map_err(|_| {
-                                io::Error::new(
-                                    io::ErrorKind::InvalidInput,
-                                    "too many supplementary groups",
-                                )
-                            })?;
+                            let group_count = checked_group_count(gids_v.len())?;
                             let ret = libc::setgroups(group_count, gids_v.as_ptr());
                             if ret != 0 {
                                 return Err(io::Error::last_os_error());

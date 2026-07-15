@@ -593,6 +593,7 @@ mod tests {
 
     #[test]
     fn test_set_self_proxy_clears_previous() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         set_self_proxy(&["127.0.0.1:1234".to_string()]);
         set_self_proxy(&["10.0.0.1:5678".to_string()]);
         let addrs = self_proxy_addrs_lock().lock().unwrap();
@@ -749,6 +750,7 @@ mod tests {
 
     #[test]
     fn test_is_self_proxy_true() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         set_self_proxy(&["127.0.0.1:8080".to_string()]);
         assert!(is_self_proxy("127.0.0.1:8080"));
         assert!(is_self_proxy("http://127.0.0.1:8080"));
@@ -757,6 +759,7 @@ mod tests {
 
     #[test]
     fn test_is_self_proxy_false() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         set_self_proxy(&["127.0.0.1:8080".to_string()]);
         assert!(!is_self_proxy("10.0.0.1:8080"));
         set_self_proxy(&[]);

@@ -250,7 +250,7 @@ async fn block_exit_on_map_loss(
     }
     routes.block_exit_traffic();
     let kernel = router
-        .and_then(|router| engage_kernel_security_block(router).err())
+        .and_then(|router| engage_kernel_security_block(router, SecurityBlockReason::MapLoss).err())
         .map(|error| format!("; kernel block: {error}"))
         .unwrap_or_default();
     health.set_unhealthy(WARN_EXIT_ROUTE_SECURITY, format!("{reason}{kernel}"));
@@ -371,15 +371,27 @@ pub(crate) fn spawn_map_update_task(
                                     exit_node_allow_lan_access,
                                 ) {
                                     Ok(()) => {
-                                        routes.unblock_exit_traffic();
-                                        health.set_healthy(WARN_EXIT_ROUTE_SECURITY);
+                                        let still_latched = clear_kernel_security_block_reason(
+                                            router,
+                                            SecurityBlockReason::MapLoss,
+                                        )
+                                        .unwrap_or(true);
+                                        if still_latched {
+                                            routes.block_exit_traffic();
+                                        } else {
+                                            routes.unblock_exit_traffic();
+                                            health.set_healthy(WARN_EXIT_ROUTE_SECURITY);
+                                        }
                                     }
                                     Err(error) if !exit_node_allow_lan_access => {
                                         routes.block_exit_traffic();
-                                        let kernel = engage_kernel_security_block(router)
-                                            .err()
-                                            .map(|failure| format!("; kernel block: {failure}"))
-                                            .unwrap_or_default();
+                                        let kernel = engage_kernel_security_block(
+                                            router,
+                                            SecurityBlockReason::MapLoss,
+                                        )
+                                        .err()
+                                        .map(|failure| format!("; kernel block: {failure}"))
+                                        .unwrap_or_default();
                                         health.set_unhealthy(
                                             WARN_EXIT_ROUTE_SECURITY,
                                             format!("map route refresh failed: {error}{kernel}"),
@@ -784,7 +796,13 @@ pub(crate) fn spawn_map_update_task(
                             routes.block_exit_traffic();
                             let kernel = router
                                 .as_ref()
-                                .and_then(|router| engage_kernel_security_block(router).err())
+                                .and_then(|router| {
+                                    engage_kernel_security_block(
+                                        router,
+                                        SecurityBlockReason::MapLoss,
+                                    )
+                                    .err()
+                                })
                                 .map(|failure| format!("; kernel block: {failure}"))
                                 .unwrap_or_default();
                             health.set_unhealthy(
@@ -796,8 +814,16 @@ pub(crate) fn spawn_map_update_task(
                             log::warn!("tsnet: map route refresh failed: {error}");
                         }
                     } else {
-                        routes.unblock_exit_traffic();
-                        health.set_healthy(WARN_EXIT_ROUTE_SECURITY);
+                        let still_latched = router.as_ref().is_some_and(|router| {
+                            clear_kernel_security_block_reason(router, SecurityBlockReason::MapLoss)
+                                .unwrap_or(true)
+                        });
+                        if still_latched {
+                            routes.block_exit_traffic();
+                        } else {
+                            routes.unblock_exit_traffic();
+                            health.set_healthy(WARN_EXIT_ROUTE_SECURITY);
+                        }
                     }
                     drop(routes);
                     drop(exit_map_guard);
@@ -1220,7 +1246,9 @@ mod tests {
             router: Box::new(BlockRouter(blocks.clone())),
             tun_name: "rustscale-test0".into(),
             exit_node: true,
-            security_blocked: false,
+            security_block_attempted: false,
+            security_block_verified: false,
+            security_block_reasons: 0,
         }));
         let mut routes = RouteTable::default();
         routes.set_exit_node(NodePrivate::generate().public());
@@ -1344,7 +1372,9 @@ mod tests {
                 router: Box::new(RecordingRouter { seen: seen.clone() }),
                 tun_name: "rustscale-test0".into(),
                 exit_node: true,
-                security_blocked: false,
+                security_block_attempted: false,
+                security_block_verified: false,
+                security_block_reasons: 0,
             }));
         let (magicsock, _wg_rx) = Magicsock::new(rustscale_magicsock::MagicsockConfig {
             private_key: NodePrivate::generate(),

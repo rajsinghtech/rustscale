@@ -3,6 +3,7 @@ use super::*;
 
 #[derive(Clone)]
 pub(crate) struct LinkRouteSync {
+    pub exit_map_gate: crate::ExitMapGate,
     pub router: SharedRouter,
     pub route_table: Arc<RwLock<RouteTable>>,
     pub tailscale_ips: Vec<IpAddr>,
@@ -114,7 +115,7 @@ fn security_prefixes_from_state(
 /// change, up/down transition, or wall-clock time jump), re-gathers local
 /// endpoints, resets peer direct paths, closes DERP connections, re-STUNs,
 /// and pushes a lightweight non-streaming MapRequest to the control plane.
-pub(crate) fn spawn_link_monitor(
+pub(crate) async fn spawn_link_monitor(
     magicsock: Arc<Magicsock>,
     cancel: Arc<CancelToken>,
     control_url: String,
@@ -133,22 +134,18 @@ pub(crate) fn spawn_link_monitor(
     let (monitor, initial_enumeration_failed) = rustscale_netmon::Monitor::new_fail_closed();
     if initial_enumeration_failed {
         if let Some(route_sync) = route_sync.as_ref() {
-            let security_required = route_sync
-                .route_table
-                .try_read()
-                .map_or(true, |routes| routes.exit_node_requested())
-                && route_sync
-                    .prefs
-                    .try_read()
-                    .map_or(true, |prefs| !prefs.ExitNodeAllowLANAccess);
+            let _exit_map_guard = route_sync.exit_map_gate.lock().await;
+            let security_required = route_sync.route_table.read().await.exit_node_requested()
+                && !route_sync.prefs.read().await.ExitNodeAllowLANAccess;
             if security_required {
-                let kernel_error = engage_kernel_security_block(&route_sync.router)
-                    .err()
-                    .map(|error| format!("; kernel block: {error}"))
-                    .unwrap_or_default();
-                if let Ok(mut routes) = route_sync.route_table.try_write() {
-                    routes.block_exit_traffic();
-                }
+                let kernel_error = engage_kernel_security_block(
+                    &route_sync.router,
+                    SecurityBlockReason::Enumeration,
+                )
+                .err()
+                .map(|error| format!("; kernel block: {error}"))
+                .unwrap_or_default();
+                route_sync.route_table.write().await.block_exit_traffic();
                 health.set_unhealthy(
                     WARN_EXIT_ROUTE_SECURITY,
                     format!("initial connected-interface enumeration failed{kernel_error}"),
@@ -183,6 +180,10 @@ pub(crate) fn spawn_link_monitor(
             // contains the successfully enumerated connected-prefix snapshot,
             // so security refresh does not perform a second fallible scan.
             if let Some(route_sync) = route_sync {
+                // Global lock order: exit_map_gate -> prefs/snapshots -> route
+                // table -> router. Hold the gate through the complete link
+                // route commit so API/map mutations cannot be overwritten.
+                let _exit_map_guard = route_sync.exit_map_gate.lock().await;
                 let tun_name = {
                     match route_sync.router.lock() {
                         Ok(router) => Some(router.tun_name.clone()),
@@ -218,8 +219,11 @@ pub(crate) fn spawn_link_monitor(
                     let connected_prefixes = match &prefix_snapshot {
                         Ok(prefixes) => prefixes.clone(),
                         Err(error) if security_critical => {
-                            let kernel_error = engage_kernel_security_block(&route_sync.router)
-                                .err()
+                            let kernel_error = engage_kernel_security_block(
+                                &route_sync.router,
+                                SecurityBlockReason::Enumeration,
+                            )
+                            .err()
                                 .map(|failure| format!("{error}; {failure}"))
                                 .unwrap_or_else(|| error.clone());
                             block_and_report_exit_route_failure(
@@ -247,7 +251,10 @@ pub(crate) fn spawn_link_monitor(
                         // direct-traffic block before touching OS routes;
                         // successful sync is the only operation that reopens it.
                         routes.block_exit_traffic();
-                        if let Err(error) = engage_kernel_security_block(&route_sync.router) {
+                        if let Err(error) = engage_kernel_security_block(
+                            &route_sync.router,
+                            SecurityBlockReason::LinkRefresh,
+                        ) {
                             block_and_report_exit_route_failure(&mut routes, &health, error);
                             drop(routes);
                             tokio::select! {
@@ -272,8 +279,23 @@ pub(crate) fn spawn_link_monitor(
                         connected_prefixes,
                     ) {
                         Ok(()) => {
-                            routes.unblock_exit_traffic();
-                            if security_critical {
+                            let enumeration_latched = clear_kernel_security_block_reason(
+                                &route_sync.router,
+                                SecurityBlockReason::Enumeration,
+                            )
+                            .unwrap_or(true);
+                            let link_latched = clear_kernel_security_block_reason(
+                                &route_sync.router,
+                                SecurityBlockReason::LinkRefresh,
+                            )
+                            .unwrap_or(true);
+                            if enumeration_latched
+                                || link_latched
+                                || kernel_security_block_latched(&route_sync.router)
+                            {
+                                routes.block_exit_traffic();
+                            } else {
+                                routes.unblock_exit_traffic();
                                 health.set_healthy(WARN_EXIT_ROUTE_SECURITY);
                             }
                             break;
@@ -734,6 +756,44 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn link_route_sync_cannot_commit_after_newer_api_mutation() {
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let prefs = Arc::new(RwLock::new(rustscale_ipn::Prefs {
+            ExitNodeAllowLANAccess: true,
+            ..Default::default()
+        }));
+        let applied = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let link = {
+            let gate = gate.clone();
+            let prefs = prefs.clone();
+            let applied = applied.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                let _guard = gate.lock().await;
+                let snapshot = prefs.read().await.ExitNodeAllowLANAccess;
+                barrier.wait().await;
+                applied.lock().await.push(("link", snapshot));
+            })
+        };
+        barrier.wait().await;
+        let api = {
+            let gate = gate.clone();
+            let prefs = prefs.clone();
+            let applied = applied.clone();
+            tokio::spawn(async move {
+                let _guard = gate.lock().await;
+                prefs.write().await.ExitNodeAllowLANAccess = false;
+                applied.lock().await.push(("api", false));
+            })
+        };
+        link.await.unwrap();
+        api.await.unwrap();
+        assert_eq!(*applied.lock().await, [("link", true), ("api", false)]);
+        assert!(!prefs.read().await.ExitNodeAllowLANAccess);
+    }
+
     #[test]
     fn churn_snapshot_prevents_enumeration_failure_lan_leak() {
         let mut interface_ips = BTreeMap::new();
@@ -801,9 +861,11 @@ mod tests {
             router: Box::new(BlockCountingRouter(blocks.clone())),
             tun_name: "rustscale0".into(),
             exit_node: true,
-            security_blocked: false,
+            security_block_attempted: false,
+            security_block_verified: false,
+            security_block_reasons: 0,
         }));
-        engage_kernel_security_block(&router).unwrap();
+        engage_kernel_security_block(&router, SecurityBlockReason::Enumeration).unwrap();
         assert_eq!(blocks.load(Ordering::SeqCst), 1);
         let health = Tracker::new();
         block_and_report_exit_route_failure(&mut routes, &health, "injected route failure");

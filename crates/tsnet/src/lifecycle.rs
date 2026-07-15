@@ -121,6 +121,9 @@ impl Server {
             .router
             .close()
             .map_err(|error| TsnetError::Builder(format!("route cleanup failed: {error}")))?;
+        managed.security_block_attempted = false;
+        managed.security_block_verified = false;
+        managed.security_block_reasons = 0;
         if managed.exit_node {
             rustscale_netns::release_physical_underlay_bypass(&managed.tun_name);
             managed.exit_node = false;
@@ -233,7 +236,8 @@ impl Server {
             b.home_derp,
             b.health.clone(),
             None,
-        );
+        )
+        .await;
 
         // Userspace netstack bound to our tailnet IPv4.
         let netstack = Arc::new(Netstack::new(b.our_v4, DEFAULT_MTU));
@@ -826,12 +830,14 @@ impl Server {
             b.home_derp,
             b.health.clone(),
             router.as_ref().map(|router| LinkRouteSync {
+                exit_map_gate: b.exit_map_gate.clone(),
                 router: router.clone(),
                 route_table: b.route_table.clone(),
                 tailscale_ips: b.tailscale_ips.clone(),
                 prefs: prefs.clone(),
             }),
-        );
+        )
+        .await;
 
         let capture = crate::capture::new_slot();
 
@@ -3109,7 +3115,9 @@ mod exit_cleanup_tests {
             }),
             tun_name: "rustscale-test0".into(),
             exit_node: false,
-            security_blocked: false,
+            security_block_attempted: false,
+            security_block_verified: false,
+            security_block_reasons: 0,
         }));
         Server::router_cleanup_supervisor().lock().unwrap().clear();
         assert!(Server::cleanup_or_supervise(owner).is_err());

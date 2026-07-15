@@ -1734,11 +1734,44 @@ pub(crate) fn filtered_outbound_packets<'a>(
 /// A router shared by the TUN lifecycle, API calls, and map-update task.
 pub(crate) type SharedRouter = Arc<std::sync::Mutex<ManagedRouter>>;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SecurityBlockReason {
+    MapLoss = 1,
+    Enumeration = 2,
+    LinkRefresh = 4,
+    Transition = 8,
+}
+
+impl SecurityBlockReason {
+    const fn bit(self) -> u8 {
+        self as u8
+    }
+}
+
 pub(crate) struct ManagedRouter {
     pub(crate) router: Box<dyn rustscale_router::Router>,
     pub(crate) tun_name: String,
     pub(crate) exit_node: bool,
-    pub(crate) security_blocked: bool,
+    /// A block command was attempted and may have partially changed state.
+    pub(crate) security_block_attempted: bool,
+    /// The platform-specific verifier confirmed the block is active.
+    pub(crate) security_block_verified: bool,
+    /// Provenance latch; success clears only the reason owned by its producer.
+    pub(crate) security_block_reasons: u8,
+}
+
+impl ManagedRouter {
+    fn add_security_reason(&mut self, reason: SecurityBlockReason) {
+        self.security_block_reasons |= reason.bit();
+    }
+
+    fn clear_security_reason(&mut self, reason: SecurityBlockReason) {
+        self.security_block_reasons &= !reason.bit();
+    }
+
+    fn has_security_reasons(&self) -> bool {
+        self.security_block_reasons != 0
+    }
 }
 
 /// Build the one OS-level routing configuration from current TUN state.
@@ -1884,19 +1917,76 @@ fn normalize_ip(ip: IpAddr) -> IpAddr {
     }
 }
 
-pub(crate) fn engage_kernel_security_block(router: &SharedRouter) -> Result<(), TsnetError> {
+fn ensure_managed_security_block(
+    managed: &mut ManagedRouter,
+    reason: SecurityBlockReason,
+) -> Result<(), TsnetError> {
+    managed.add_security_reason(reason);
+    if managed.security_block_verified {
+        return Ok(());
+    }
+    // Attempted and verified are deliberately separate. A failed command may
+    // be partial, but it must never authorize route mutation or unblocking.
+    managed.security_block_attempted = true;
+    managed.router.block_direct().map_err(|error| {
+        TsnetError::Builder(format!("install kernel direct-traffic block: {error}"))
+    })?;
+    managed.security_block_verified = true;
+    Ok(())
+}
+
+pub(crate) fn engage_kernel_security_block(
+    router: &SharedRouter,
+    reason: SecurityBlockReason,
+) -> Result<(), TsnetError> {
     let mut managed = router
         .lock()
         .map_err(|_| TsnetError::Builder("router lock poisoned".into()))?;
-    if !managed.security_blocked {
-        // Track ownership before attempting the command: a verification or
-        // rollback error may still have left a live kernel block.
-        managed.security_blocked = true;
+    ensure_managed_security_block(&mut managed, reason)
+}
+
+fn clear_managed_security_block_reason(
+    managed: &mut ManagedRouter,
+    reason: SecurityBlockReason,
+) -> Result<bool, TsnetError> {
+    managed.clear_security_reason(reason);
+    if managed.has_security_reasons() {
+        return Ok(true);
+    }
+    if managed.security_block_attempted && !managed.security_block_verified {
+        // Establish a known active state before removing a possibly partial
+        // block. Never issue unblock from an unverified state.
         managed.router.block_direct().map_err(|error| {
-            TsnetError::Builder(format!("install kernel direct-traffic block: {error}"))
+            TsnetError::Builder(format!("verify kernel direct-traffic block: {error}"))
+        })?;
+        managed.security_block_verified = true;
+    }
+    if managed.security_block_verified {
+        managed.router.unblock_direct().map_err(|error| {
+            TsnetError::Builder(format!("remove kernel direct-traffic block: {error}"))
         })?;
     }
-    Ok(())
+    managed.security_block_attempted = false;
+    managed.security_block_verified = false;
+    Ok(false)
+}
+
+pub(crate) fn clear_kernel_security_block_reason(
+    router: &SharedRouter,
+    reason: SecurityBlockReason,
+) -> Result<bool, TsnetError> {
+    let mut managed = router
+        .lock()
+        .map_err(|_| TsnetError::Builder("router lock poisoned".into()))?;
+    clear_managed_security_block_reason(&mut managed, reason)
+}
+
+pub(crate) fn kernel_security_block_latched(router: &SharedRouter) -> bool {
+    router.lock().map_or(true, |managed| {
+        managed.has_security_reasons()
+            || managed.security_block_attempted
+            || managed.security_block_verified
+    })
 }
 
 /// Synchronize a shared router after a route-table change.
@@ -2017,16 +2107,19 @@ fn apply_managed_router_config(
     entering_exit_node: bool,
     lan_denied: bool,
 ) -> Result<(), TsnetError> {
-    // The verified emergency block must precede the first catch-all/policy
-    // mutation. It is independent router state, so set rollback cannot remove
-    // it; failures leave `security_blocked` set for the next retry/close.
-    if entering_exit_node && lan_denied && !managed.security_blocked {
-        // Set ownership first because command/verification failure can be
-        // partial. A later successful sync or close must attempt removal.
-        managed.security_blocked = true;
+    // A prior failed block attempt is always retried before any route or
+    // unblock operation, even if the desired configuration has since changed.
+    if managed.security_block_attempted && !managed.security_block_verified {
         managed.router.block_direct().map_err(|error| {
-            TsnetError::Builder(format!("install kernel direct-traffic block: {error}"))
+            TsnetError::Builder(format!("verify kernel direct-traffic block: {error}"))
         })?;
+        managed.security_block_verified = true;
+    }
+    // Every LAN-denied apply, including allow->deny and refresh, verifies the
+    // emergency block before any catch-all/rule mutation. Failed verification
+    // returns before `set` and is retried on the next synchronization.
+    if config.exit_node && lan_denied {
+        ensure_managed_security_block(managed, SecurityBlockReason::Transition)?;
     }
     if let Err(error) = managed.router.set(config) {
         if entering_exit_node {
@@ -2040,12 +2133,12 @@ fn apply_managed_router_config(
         )));
     }
     managed.exit_node = config.exit_node;
-    if managed.security_blocked {
-        managed.router.unblock_direct().map_err(|error| {
-            TsnetError::Builder(format!("remove kernel direct-traffic block: {error}"))
-        })?;
-        managed.security_blocked = false;
+    if !config.exit_node {
+        // Explicit no-exit configuration makes all exit-security provenance
+        // inapplicable, but cleanup still proceeds only from verified state.
+        managed.security_block_reasons = SecurityBlockReason::Transition.bit();
     }
+    clear_managed_security_block_reason(managed, SecurityBlockReason::Transition)?;
     Ok(())
 }
 
@@ -2068,7 +2161,9 @@ pub(crate) async fn create_tun_device(
                 router,
                 tun_name: dev.name().to_owned(),
                 exit_node: false,
-                security_blocked: false,
+                security_block_attempted: false,
+                security_block_verified: false,
+                security_block_reasons: 0,
             }));
             let cleanup = Server::cleanup_or_supervise(owner).err();
             return Err(TsnetError::Builder(match cleanup {
@@ -2082,7 +2177,7 @@ pub(crate) async fn create_tun_device(
             let route_table = b.route_table.read().await;
             route_table.exit_node_requested() && !exit_node_allow_lan_access
         };
-        let mut security_blocked = false;
+        let mut security_block_verified = false;
         if security_required {
             if let Err(error) = router.block_direct() {
                 let owner = Arc::new(std::sync::Mutex::new(ManagedRouter {
@@ -2090,7 +2185,9 @@ pub(crate) async fn create_tun_device(
                     tun_name: dev.name().to_owned(),
                     exit_node: false,
                     // Verification failure may still leave the block live.
-                    security_blocked: true,
+                    security_block_attempted: true,
+                    security_block_verified: false,
+                    security_block_reasons: SecurityBlockReason::Transition.bit(),
                 }));
                 let cleanup = Server::cleanup_or_supervise(owner).err();
                 return Err(TsnetError::Builder(match cleanup {
@@ -2100,7 +2197,7 @@ pub(crate) async fn create_tun_device(
                     None => format!("install startup direct-traffic block: {error}"),
                 }));
             }
-            security_blocked = true;
+            security_block_verified = true;
         }
         let route_config = {
             let route_table = b.route_table.read().await;
@@ -2117,7 +2214,13 @@ pub(crate) async fn create_tun_device(
                         router,
                         tun_name: dev.name().to_owned(),
                         exit_node: false,
-                        security_blocked,
+                        security_block_attempted: security_block_verified,
+                        security_block_verified,
+                        security_block_reasons: if security_block_verified {
+                            SecurityBlockReason::Transition.bit()
+                        } else {
+                            0
+                        },
                     }));
                     let cleanup = Server::cleanup_or_supervise(owner).err();
                     return Err(TsnetError::Builder(match cleanup {
@@ -2133,7 +2236,13 @@ pub(crate) async fn create_tun_device(
                     router,
                     tun_name: dev.name().to_owned(),
                     exit_node: false,
-                    security_blocked,
+                    security_block_attempted: security_block_verified,
+                    security_block_verified,
+                    security_block_reasons: if security_block_verified {
+                        SecurityBlockReason::Transition.bit()
+                    } else {
+                        0
+                    },
                 }));
                 let cleanup = Server::cleanup_or_supervise(owner).err();
                 return Err(TsnetError::Builder(match cleanup {
@@ -2149,7 +2258,13 @@ pub(crate) async fn create_tun_device(
                     router,
                     tun_name: dev.name().to_owned(),
                     exit_node: false,
-                    security_blocked,
+                    security_block_attempted: security_block_verified,
+                    security_block_verified,
+                    security_block_reasons: if security_block_verified {
+                        SecurityBlockReason::Transition.bit()
+                    } else {
+                        0
+                    },
                 }));
                 let cleanup = Server::cleanup_or_supervise(owner).err();
                 return Err(TsnetError::Builder(match cleanup {
@@ -2166,7 +2281,13 @@ pub(crate) async fn create_tun_device(
                 router,
                 tun_name: dev.name().to_owned(),
                 exit_node: route_config.exit_node,
-                security_blocked,
+                security_block_attempted: security_block_verified,
+                security_block_verified,
+                security_block_reasons: if security_block_verified {
+                    SecurityBlockReason::Transition.bit()
+                } else {
+                    0
+                },
             }));
             let cleanup = Server::cleanup_or_supervise(owner).err();
             return Err(TsnetError::Builder(match cleanup {
@@ -2176,13 +2297,15 @@ pub(crate) async fn create_tun_device(
                 None => format!("install TUN routes: {error}"),
             }));
         }
-        if security_blocked {
+        if security_block_verified {
             if let Err(error) = router.unblock_direct() {
                 let owner = Arc::new(std::sync::Mutex::new(ManagedRouter {
                     router,
                     tun_name: dev.name().to_owned(),
                     exit_node: route_config.exit_node,
-                    security_blocked: true,
+                    security_block_attempted: true,
+                    security_block_verified: true,
+                    security_block_reasons: SecurityBlockReason::Transition.bit(),
                 }));
                 let cleanup = Server::cleanup_or_supervise(owner).err();
                 return Err(TsnetError::Builder(match cleanup {
@@ -2192,13 +2315,15 @@ pub(crate) async fn create_tun_device(
                     None => format!("remove startup direct-traffic block: {error}"),
                 }));
             }
-            security_blocked = false;
+            security_block_verified = false;
         }
         Some(Arc::new(std::sync::Mutex::new(ManagedRouter {
             router,
             tun_name: dev.name().to_owned(),
             exit_node: route_config.exit_node,
-            security_blocked,
+            security_block_attempted: false,
+            security_block_verified,
+            security_block_reasons: 0,
         })))
     } else {
         None
@@ -2288,6 +2413,46 @@ mod tests {
         }
     }
 
+    struct RetryBlockRouter {
+        events: Arc<std::sync::Mutex<Vec<&'static str>>>,
+        remaining_failures: usize,
+    }
+
+    impl rustscale_router::Router for RetryBlockRouter {
+        fn up(&mut self) -> Result<(), rustscale_router::RouterError> {
+            Ok(())
+        }
+
+        fn set(
+            &mut self,
+            _config: &rustscale_router::RouterConfig,
+        ) -> Result<(), rustscale_router::RouterError> {
+            self.events.lock().unwrap().push("set");
+            Ok(())
+        }
+
+        fn block_direct(&mut self) -> Result<(), rustscale_router::RouterError> {
+            self.events.lock().unwrap().push("block");
+            if self.remaining_failures > 0 {
+                self.remaining_failures -= 1;
+                Err(rustscale_router::RouterError::InvalidConfig(
+                    "injected first block failure".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn unblock_direct(&mut self) -> Result<(), rustscale_router::RouterError> {
+            self.events.lock().unwrap().push("unblock");
+            Ok(())
+        }
+
+        fn close(&mut self) -> Result<(), rustscale_router::RouterError> {
+            Ok(())
+        }
+    }
+
     struct PendingProbe {
         replies_seen: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         polled: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<usize>>>,
@@ -2338,7 +2503,9 @@ mod tests {
                 }),
                 tun_name: "rustscale-test0".into(),
                 exit_node: false,
-                security_blocked: false,
+                security_block_attempted: false,
+                security_block_verified: false,
+                security_block_reasons: 0,
             },
             events,
         )
@@ -2354,7 +2521,20 @@ mod tests {
         apply_managed_router_config(&mut managed, &config, true, true).unwrap();
         assert_eq!(*events.lock().unwrap(), ["block", "set", "unblock"]);
         assert!(managed.exit_node);
-        assert!(!managed.security_blocked);
+        assert!(!managed.security_block_attempted);
+        assert!(!managed.security_block_verified);
+    }
+
+    #[test]
+    fn lan_allow_to_deny_refresh_also_blocks_before_route_mutation() {
+        let (mut managed, events) = ordered_managed_router(RouterFailure::None);
+        managed.exit_node = true;
+        let config = rustscale_router::RouterConfig {
+            exit_node: true,
+            ..Default::default()
+        };
+        apply_managed_router_config(&mut managed, &config, false, true).unwrap();
+        assert_eq!(*events.lock().unwrap(), ["block", "set", "unblock"]);
     }
 
     #[test]
@@ -2367,7 +2547,72 @@ mod tests {
         assert!(apply_managed_router_config(&mut managed, &config, true, true).is_err());
         assert_eq!(*events.lock().unwrap(), ["block"]);
         assert!(!managed.exit_node);
-        assert!(managed.security_blocked);
+        assert!(managed.security_block_attempted);
+        assert!(!managed.security_block_verified);
+    }
+
+    #[test]
+    fn failed_block_is_retried_before_route_or_unblock() {
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut managed = ManagedRouter {
+            router: Box::new(RetryBlockRouter {
+                events: events.clone(),
+                remaining_failures: 1,
+            }),
+            tun_name: "rustscale-test0".into(),
+            exit_node: false,
+            security_block_attempted: false,
+            security_block_verified: false,
+            security_block_reasons: 0,
+        };
+        let config = rustscale_router::RouterConfig {
+            exit_node: true,
+            ..Default::default()
+        };
+        assert!(apply_managed_router_config(&mut managed, &config, true, true).is_err());
+        assert_eq!(*events.lock().unwrap(), ["block"]);
+        assert!(managed.security_block_attempted);
+        assert!(!managed.security_block_verified);
+
+        apply_managed_router_config(&mut managed, &config, true, true).unwrap();
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["block", "block", "set", "unblock"]
+        );
+        assert!(!managed.security_block_attempted);
+        assert!(!managed.security_block_verified);
+    }
+
+    #[test]
+    fn map_loss_latch_survives_link_success_until_map_recovery() {
+        let (mut managed, events) = ordered_managed_router(RouterFailure::None);
+        let mut routes = RouteTable::default();
+        routes.set_exit_node(NodePrivate::generate().public());
+        routes.block_exit_traffic();
+        ensure_managed_security_block(&mut managed, SecurityBlockReason::MapLoss).unwrap();
+        ensure_managed_security_block(&mut managed, SecurityBlockReason::LinkRefresh).unwrap();
+        let config = rustscale_router::RouterConfig {
+            exit_node: true,
+            ..Default::default()
+        };
+        apply_managed_router_config(&mut managed, &config, true, true).unwrap();
+        assert!(clear_managed_security_block_reason(
+            &mut managed,
+            SecurityBlockReason::LinkRefresh
+        )
+        .unwrap());
+        routes.block_exit_traffic();
+        assert!(managed.security_block_verified);
+        assert!(routes.exit_traffic_blocked());
+        assert_eq!(*events.lock().unwrap(), ["block", "set"]);
+
+        assert!(
+            !clear_managed_security_block_reason(&mut managed, SecurityBlockReason::MapLoss)
+                .unwrap()
+        );
+        routes.unblock_exit_traffic();
+        assert!(!routes.exit_traffic_blocked());
+        assert_eq!(*events.lock().unwrap(), ["block", "set", "unblock"]);
     }
 
     #[test]
@@ -2384,7 +2629,8 @@ mod tests {
             assert!(apply_managed_router_config(&mut managed, &config, true, true).is_err());
             assert_eq!(*events.lock().unwrap(), expected);
             assert!(managed.exit_node);
-            assert!(managed.security_blocked);
+            assert!(managed.security_block_attempted);
+            assert!(managed.security_block_verified);
         }
     }
 

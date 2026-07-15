@@ -2,16 +2,28 @@ use std::time::Duration;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-pub const BLOCK_SIZE: usize = 2_097_152;
+/// Size of each unframed data block on the wire.
+pub const BLOCK_SIZE: usize = 2 * 1024 * 1024;
+/// Smallest test accepted by either endpoint.
 pub const MIN_DURATION: Duration = Duration::from_secs(5);
-pub const DEFAULT_DURATION: Duration = Duration::from_secs(5);
+/// Upstream's default test duration.
+pub const DEFAULT_DURATION: Duration = MIN_DURATION;
+/// Largest test accepted by either endpoint.
 pub const MAX_DURATION: Duration = Duration::from_secs(30);
+/// Target reporting interval.
 pub const INCREMENT: Duration = Duration::from_secs(1);
+/// Final intervals no longer than this are omitted.
 pub const MIN_INTERVAL: Duration = Duration::from_millis(10);
+/// Default TCP port used by the standalone upstream speedtest command.
 pub const DEFAULT_PORT: u16 = 20333;
+/// Tailscale speedtest protocol version.
 pub const PROTOCOL_VERSION: i32 = 2;
+/// Largest JSON control frame, excluding its newline delimiter.
+pub const MAX_CONTROL_FRAME_SIZE: usize = 1024;
+/// Maximum number of interval and total results from one bounded test.
+pub const MAX_RESULT_COUNT: usize = 40;
 
-/// Data-flow direction from the perspective of the endpoint running a test.
+/// Data-flow direction from the perspective of an endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
     Download,
@@ -23,11 +35,10 @@ impl Serialize for Direction {
     where
         S: Serializer,
     {
-        let value = match self {
-            Self::Download => 0_u8,
-            Self::Upload => 1_u8,
-        };
-        serializer.serialize_u8(value)
+        serializer.serialize_u8(match self {
+            Self::Download => 0,
+            Self::Upload => 1,
+        })
     }
 }
 
@@ -36,7 +47,7 @@ impl<'de> Deserialize<'de> for Direction {
     where
         D: Deserializer<'de>,
     {
-        match u8::deserialize(deserializer)? {
+        match i64::deserialize(deserializer)? {
             0 => Ok(Self::Download),
             1 => Ok(Self::Upload),
             value => Err(serde::de::Error::custom(format!(
@@ -55,19 +66,37 @@ impl Direction {
     }
 }
 
-/// Client-to-server handshake.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl std::fmt::Display for Direction {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Download => "download",
+            Self::Upload => "upload",
+        })
+    }
+}
+
+/// Client-to-server newline-delimited JSON handshake.
+///
+/// The declaration order is wire-significant for byte-for-byte parity with
+/// Go's `encoding/json` output for the upstream struct.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
     pub version: i32,
     #[serde(rename = "time")]
-    pub test_duration_ns: u64,
+    pub test_duration_ns: i64,
     pub direction: Direction,
 }
 
-/// Server-to-client handshake response.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::ref_option)] // serde's skip_serializing_if callback receives &T.
+fn response_error_is_empty(error: &Option<String>) -> bool {
+    error.as_deref().is_none_or(str::is_empty)
+}
+
+/// Server-to-client newline-delimited JSON handshake response.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigResponse {
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// An absent, null, or empty error means that the test was accepted.
+    #[serde(default, skip_serializing_if = "response_error_is_empty")]
     pub error: Option<String>,
 }
 
@@ -81,30 +110,28 @@ pub struct Result {
 }
 
 impl Result {
-    /// Duration of this result interval in seconds.
-    pub fn interval_secs(&self) -> f64 {
-        self.interval_end
-            .duration_since(self.interval_start)
-            .as_secs_f64()
+    /// Duration of this result interval.
+    pub fn interval(&self) -> Duration {
+        self.interval_end.duration_since(self.interval_start)
     }
 
-    /// Transferred data in decimal megabytes.
+    /// Duration of this result interval in seconds.
+    pub fn interval_secs(&self) -> f64 {
+        self.interval().as_secs_f64()
+    }
+
+    /// Transferred data in decimal megabytes, matching upstream.
     pub fn megabytes(&self) -> f64 {
         self.bytes as f64 / 1_000_000.0
     }
 
-    /// Transferred data in decimal megabits.
+    /// Transferred data in decimal megabits, matching upstream.
     pub fn megabits(&self) -> f64 {
         self.megabytes() * 8.0
     }
 
     /// Bandwidth in decimal megabits per second.
     pub fn mbits_per_sec(&self) -> f64 {
-        let secs = self.interval_secs();
-        if secs <= 0.0 {
-            0.0
-        } else {
-            self.megabits() / secs
-        }
+        self.megabits() / self.interval_secs()
     }
 }

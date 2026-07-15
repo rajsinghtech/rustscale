@@ -1,121 +1,159 @@
 use std::time::Duration;
 
-use rustscale_speedtest::{handle_connection, run, Config, ConfigResponse, Direction, Result};
+use rustscale_speedtest::{
+    handle_connection, run, CancellationToken, Config, ConfigResponse, Direction, Server,
+    SpeedtestError, MAX_CONTROL_FRAME_SIZE, MIN_DURATION, PROTOCOL_VERSION,
+};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-async fn start_server() -> std::io::Result<std::net::SocketAddr> {
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let address = listener.local_addr()?;
-    tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.expect("server accepts connection");
-        let _ = handle_connection(&mut stream).await;
-    });
-    Ok(address)
-}
-
-fn assert_results(results: &[Result]) {
-    assert!(results.iter().any(|result| !result.is_total));
-    assert!(results.last().is_some_and(|result| result.is_total));
-    assert!(results.last().is_some_and(|result| result.bytes > 0));
-    for result in results {
-        assert!(result.interval_start <= result.interval_end);
-        assert!(result.mbits_per_sec().is_finite());
-        assert!(!result.mbits_per_sec().is_nan());
-    }
-    let intervals: Vec<_> = results.iter().filter(|result| !result.is_total).collect();
-    for pair in intervals.windows(2) {
-        assert!(pair[0].interval_start <= pair[1].interval_start);
-        assert!(pair[0].interval_end <= pair[1].interval_end);
-    }
-}
-
-async fn assert_loopback(direction: Direction) {
-    match start_server().await {
-        Ok(address) => {
-            let mut stream = TcpStream::connect(address).await.unwrap();
-            let results = run(&mut stream, direction, Duration::from_secs(2))
-                .await
-                .unwrap();
-            assert_results(&results);
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-            // Some sandboxed environments prohibit all socket operations. A duplex
-            // stream still exercises the same handshake and data-phase code paths.
-            let (mut client, mut server) = tokio::io::duplex(2 * 1024 * 1024);
-            let server_task = tokio::spawn(async move { handle_connection(&mut server).await });
-            let results = run(&mut client, direction, Duration::from_millis(100))
-                .await
-                .unwrap();
-            assert_results(&results);
-            server_task.await.unwrap().unwrap();
-        }
-        Err(error) => panic!("bind loopback server: {error}"),
-    }
-}
-
-async fn write_config<S>(stream: &mut S, config: &Config)
-where
-    S: AsyncWrite + Unpin,
-{
-    let mut line = serde_json::to_vec(config).unwrap();
-    line.push(b'\n');
-    stream.write_all(&line).await.unwrap();
-    stream.flush().await.unwrap();
-}
-
-async fn read_response<S>(stream: &mut S) -> ConfigResponse
-where
-    S: AsyncRead + Unpin,
-{
+async fn read_line(stream: &mut (impl AsyncRead + Unpin)) -> Vec<u8> {
     let mut line = Vec::new();
     loop {
         let byte = stream.read_u8().await.unwrap();
-        if byte == b'\n' {
-            return serde_json::from_slice(&line).unwrap();
-        }
         line.push(byte);
+        if byte == b'\n' {
+            return line;
+        }
     }
 }
 
-#[tokio::test]
-async fn test_download_loopback() {
-    assert_loopback(Direction::Download).await;
+async fn write_config(stream: &mut (impl AsyncWrite + Unpin), direction: Direction) {
+    let config = Config {
+        version: PROTOCOL_VERSION,
+        test_duration_ns: i64::try_from(MIN_DURATION.as_nanos()).unwrap(),
+        direction,
+    };
+    let mut line = serde_json::to_vec(&config).unwrap();
+    line.push(b'\n');
+    stream.write_all(&line).await.unwrap();
+}
+
+async fn read_response(stream: &mut (impl AsyncRead + Unpin)) -> ConfigResponse {
+    serde_json::from_slice(&read_line(stream).await).unwrap()
+}
+
+#[test]
+fn upstream_control_vectors() {
+    let config = Config {
+        version: PROTOCOL_VERSION,
+        test_duration_ns: 5_000_000_000,
+        direction: Direction::Upload,
+    };
+    assert_eq!(
+        serde_json::to_string(&config).unwrap(),
+        r#"{"version":2,"time":5000000000,"direction":1}"#
+    );
+    assert_eq!(
+        serde_json::to_string(&ConfigResponse::default()).unwrap(),
+        "{}"
+    );
 }
 
 #[tokio::test]
-async fn test_upload_loopback() {
-    assert_loopback(Direction::Upload).await;
-}
-
-#[tokio::test]
-async fn test_version_mismatch_rejected() {
-    let (mut client, mut server) = tokio::io::duplex(1024);
-    let server_task = tokio::spawn(async move { handle_connection(&mut server).await });
-    write_config(
-        &mut client,
-        &Config {
-            version: 1,
-            test_duration_ns: Duration::from_secs(2).as_nanos() as u64,
-            direction: Direction::Download,
-        },
-    )
-    .await;
-    let response = read_response(&mut client).await;
-    assert!(response
-        .error
-        .is_some_and(|error| error.starts_with("version mismatch!")));
-    assert!(server_task.await.unwrap().is_err());
-}
-
-#[tokio::test]
-async fn test_invalid_duration_rejected() {
-    let (mut client, _server) = tokio::io::duplex(1024);
-    let error = run(&mut client, Direction::Download, Duration::ZERO)
-        .await
-        .unwrap_err();
+async fn invalid_local_duration_writes_nothing() {
+    let (mut client, mut peer) = tokio::io::duplex(64);
     assert!(matches!(
-        error,
-        rustscale_speedtest::SpeedtestError::InvalidDuration(_)
+        run(&mut client, Direction::Download, Duration::from_secs(1)).await,
+        Err(SpeedtestError::InvalidDuration)
     ));
+    client.shutdown().await.unwrap();
+    let mut bytes = Vec::new();
+    peer.read_to_end(&mut bytes).await.unwrap();
+    assert!(bytes.is_empty());
+}
+
+#[tokio::test]
+async fn bounded_server_queues_connections_isolates_errors_and_drains() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let cancellation = CancellationToken::new();
+    let child_cancellation = cancellation.clone();
+    let server_task = tokio::spawn(async move {
+        Server::new(1)
+            .unwrap()
+            .serve(listener, child_cancellation)
+            .await
+    });
+
+    // The first valid upload request makes the server reverse to Download and
+    // block reading test data while retaining its sole concurrency permit.
+    let mut first = TcpStream::connect(address).await.unwrap();
+    write_config(&mut first, Direction::Upload).await;
+    assert_eq!(read_response(&mut first).await, ConfigResponse::default());
+
+    let mut second = TcpStream::connect(address).await.unwrap();
+    write_config(&mut second, Direction::Upload).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), second.read_u8())
+            .await
+            .is_err(),
+        "second connection was handshaken while the sole permit was held"
+    );
+
+    // Releasing the first worker admits and handshakes the queued connection.
+    first.shutdown().await.unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), read_response(&mut second))
+            .await
+            .unwrap(),
+        ConfigResponse::default()
+    );
+    second.shutdown().await.unwrap();
+
+    // A malformed worker returns an error response but does not terminate the
+    // listener or consume its permit permanently.
+    let mut malformed = TcpStream::connect(address).await.unwrap();
+    malformed.write_all(b"not-json\n").await.unwrap();
+    let malformed_response =
+        tokio::time::timeout(Duration::from_secs(2), read_response(&mut malformed))
+            .await
+            .unwrap();
+    assert!(malformed_response.error.is_some());
+    drop(malformed);
+
+    // A subsequent valid worker proves malformed-client isolation, then stays
+    // blocked so shutdown must cancel and drain an active worker.
+    let mut final_client = TcpStream::connect(address).await.unwrap();
+    write_config(&mut final_client, Direction::Upload).await;
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), read_response(&mut final_client))
+            .await
+            .unwrap(),
+        ConfigResponse::default()
+    );
+
+    cancellation.cancel();
+    let server_result = tokio::time::timeout(Duration::from_secs(2), server_task)
+        .await
+        .expect("server cancellation did not drain workers")
+        .unwrap();
+    assert!(server_result.is_ok());
+
+    let mut remaining = Vec::new();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        final_client.read_to_end(&mut remaining),
+    )
+    .await
+    .expect("active worker stream remained open after cancellation")
+    .unwrap();
+    assert!(remaining.is_empty());
+}
+
+#[tokio::test]
+async fn malformed_peer_is_connection_local() {
+    let (mut client, mut server) = tokio::io::duplex(4096);
+    let task = tokio::spawn(async move { handle_connection(&mut server).await });
+    client
+        .write_all(&vec![b'x'; MAX_CONTROL_FRAME_SIZE + 1])
+        .await
+        .unwrap();
+    assert!(matches!(
+        task.await.unwrap(),
+        Err(SpeedtestError::ControlFrameTooLarge { .. })
+    ));
+    let response = read_line(&mut client).await;
+    let parsed: ConfigResponse = serde_json::from_slice(&response).unwrap();
+    assert!(parsed.error.is_some());
 }

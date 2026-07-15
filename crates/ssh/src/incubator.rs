@@ -196,8 +196,14 @@ impl SpawnedProcess {
         self.child.id()
     }
 
+    #[cfg(unix)]
     pub fn process_group(&self) -> Option<ProcessGroup> {
         self.child.id().map(|pid| ProcessGroup { pid })
+    }
+
+    #[cfg(not(unix))]
+    pub fn process_group(&self) -> Option<ProcessGroup> {
+        None
     }
 
     /// Take the stdin handle (for writing to the shell).

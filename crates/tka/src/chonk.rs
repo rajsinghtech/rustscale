@@ -694,6 +694,7 @@ impl FsChonk {
     }
 
     fn remove_transaction_record(&self, hash: &AumHash) -> Result<(), ChonkError> {
+        #[cfg(unix)]
         let name = hash.to_string();
         #[cfg(unix)]
         let prefix = &name[..2];

@@ -403,8 +403,8 @@ mod tests {
 
     #[test]
     fn state_save_load_roundtrip() {
-        let tmp = std::env::temp_dir().join("tsnet-state-roundtrip.json");
-        let _ = std::fs::remove_file(&tmp);
+        let root = tempfile::tempdir().unwrap();
+        let tmp = root.path().join("tsnet-state-roundtrip.json");
 
         let state = PersistedState::generate();
         state.save(&tmp).expect("save");
@@ -412,14 +412,12 @@ mod tests {
         assert_eq!(loaded.node_key.raw32(), state.node_key.raw32());
         assert_eq!(loaded.machine_key.raw32(), state.machine_key.raw32());
         assert_eq!(loaded.disco_key.raw32(), state.disco_key.raw32());
-
-        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
     fn state_with_node_id_roundtrips() {
-        let tmp = std::env::temp_dir().join("tsnet-state-nodeid.json");
-        let _ = std::fs::remove_file(&tmp);
+        let root = tempfile::tempdir().unwrap();
+        let tmp = root.path().join("tsnet-state-nodeid.json");
 
         let state = PersistedState {
             node_id: 12345,
@@ -431,8 +429,6 @@ mod tests {
         assert_eq!(loaded.node_id, 12345);
         assert_eq!(loaded.stable_node_id, "nodeABC");
         assert!(loaded.is_enrolled());
-
-        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]

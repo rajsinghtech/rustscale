@@ -11,7 +11,7 @@ mod types;
 pub use reachability::{
     routers_by_prefix, Client, Error, Node, NodeSet, Prefix, PrefixParseError, ProbeError,
     ProbeProvider, ProbeResponse, Report, RoutablePrefixes, RouteProvider, RouteProviderError,
-    RouteSnapshot, RoutersByPrefix, DEFAULT_CONCURRENCY, DEFAULT_TIMEOUT,
+    RouteSnapshot, RoutersByPrefix, DEFAULT_CONCURRENCY, DEFAULT_REPORT_DEADLINE, DEFAULT_TIMEOUT,
 };
 pub use types::{Conflict, ConflictKind, RouteCheckReport, Severity};
 

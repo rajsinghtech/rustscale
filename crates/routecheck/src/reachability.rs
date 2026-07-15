@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rustscale_tailcfg::{Node as TailcfgNode, NodeID};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
@@ -18,6 +19,8 @@ use tokio_util::sync::CancellationToken;
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Default maximum number of probes in flight.
 pub const DEFAULT_CONCURRENCY: usize = 5;
+/// Absolute limit for one complete report, including gate wait and snapshots.
+pub const DEFAULT_REPORT_DEADLINE: Duration = Duration::from_secs(60);
 
 /// A canonical IP network prefix.
 ///
@@ -222,6 +225,8 @@ pub enum Error {
     Closed,
     #[error("routecheck cancelled")]
     Cancelled,
+    #[error("routecheck report deadline exceeded")]
+    DeadlineExceeded,
     #[error(transparent)]
     Routes(#[from] RouteProviderError),
 }
@@ -231,6 +236,9 @@ pub struct Client {
     routes: Arc<dyn RouteProvider>,
     prober: Arc<dyn ProbeProvider>,
     closed: CancellationToken,
+    /// A shared client is server-wide, so this gate prevents concurrent
+    /// callers from multiplying the per-report probe concurrency.
+    refresh_gate: Semaphore,
     latest: RwLock<Option<Report>>,
 }
 
@@ -240,6 +248,7 @@ impl Client {
             routes,
             prober,
             closed: CancellationToken::new(),
+            refresh_gate: Semaphore::new(1),
             latest: RwLock::new(None),
         }
     }
@@ -268,15 +277,40 @@ impl Client {
         timeout: Duration,
         cancelled: &CancellationToken,
     ) -> Result<Report, Error> {
+        self.probe_all_ha_routers_with_deadline(limit, timeout, DEFAULT_REPORT_DEADLINE, cancelled)
+            .await
+    }
+
+    /// Probe HA routers with separate per-peer and whole-report deadlines.
+    /// The single shared gate is included in the report deadline.
+    pub async fn probe_all_ha_routers_with_deadline(
+        &self,
+        limit: usize,
+        timeout: Duration,
+        report_deadline: Duration,
+        cancelled: &CancellationToken,
+    ) -> Result<Report, Error> {
+        let deadline = tokio::time::Instant::now() + report_deadline;
+        let _permit = tokio::select! {
+            biased;
+            () = self.closed.cancelled() => return Err(Error::Closed),
+            () = cancelled.cancelled() => return Err(Error::Cancelled),
+            () = tokio::time::sleep_until(deadline) => return Err(Error::DeadlineExceeded),
+            permit = self.refresh_gate.acquire() => permit.expect("routecheck gate closed"),
+        };
         let snapshot = tokio::select! {
             biased;
             () = self.closed.cancelled() => return Err(Error::Closed),
             () = cancelled.cancelled() => return Err(Error::Cancelled),
+            () = tokio::time::sleep_until(deadline) => return Err(Error::DeadlineExceeded),
             snapshot = self.routes.snapshot() => snapshot?,
         };
         let candidates = ha_router_candidates(&snapshot);
+        if tokio::time::Instant::now() >= deadline {
+            return Err(Error::DeadlineExceeded);
+        }
         let report = self
-            .probe_candidates(candidates, limit, timeout, cancelled)
+            .probe_candidates(candidates, limit, timeout, deadline, cancelled)
             .await?;
         *self.latest.write().expect("latest report lock poisoned") = Some(report.clone());
         Ok(report)
@@ -300,6 +334,7 @@ impl Client {
         candidates: Vec<Probed>,
         limit: usize,
         timeout: Duration,
+        deadline: tokio::time::Instant,
         cancelled: &CancellationToken,
     ) -> Result<Report, Error> {
         let mut reachable = NodeSet::new();
@@ -310,6 +345,11 @@ impl Client {
 
         loop {
             while tasks.len() < max_in_flight {
+                if tokio::time::Instant::now() >= deadline {
+                    tasks.abort_all();
+                    while tasks.join_next().await.is_some() {}
+                    return Err(Error::DeadlineExceeded);
+                }
                 let Some(candidate) = pending.next() else {
                     break;
                 };
@@ -349,6 +389,11 @@ impl Client {
                     while tasks.join_next().await.is_some() {}
                     return Err(Error::Cancelled);
                 }
+                () = tokio::time::sleep_until(deadline) => {
+                    tasks.abort_all();
+                    while tasks.join_next().await.is_some() {}
+                    return Err(Error::DeadlineExceeded);
+                }
                 joined = tasks.join_next() => joined,
             };
 
@@ -360,6 +405,16 @@ impl Client {
                         .or_insert_with(|| candidate.report_node());
                 }
             }
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            return Err(Error::DeadlineExceeded);
+        }
+        if self.closed.is_cancelled() {
+            return Err(Error::Closed);
+        }
+        if cancelled.is_cancelled() {
+            return Err(Error::Cancelled);
         }
 
         Ok(Report {
@@ -684,6 +739,58 @@ mod tests {
         assert!(report.reachable.is_empty());
         assert_eq!(report.last_probed.len(), 6);
         assert!(prober.max_active.load(Ordering::SeqCst) <= 2);
+    }
+
+    #[tokio::test]
+    async fn concurrent_refreshes_share_one_global_probe_cap() {
+        let peers: Vec<_> = (1..=10)
+            .map(|id| node(id, &[&format!("100.64.0.{id}/32")], &["192.0.2.0/24"]))
+            .collect();
+        let mut inner = Prober::new([]);
+        inner.delay = Duration::from_millis(20);
+        let prober = Arc::new(inner);
+        let client = Arc::new(Client::new(
+            Arc::new(Routes(snapshot(peers))),
+            prober.clone(),
+        ));
+
+        let first = {
+            let client = client.clone();
+            tokio::spawn(async move { client.refresh(Duration::from_secs(1)).await })
+        };
+        let second = {
+            let client = client.clone();
+            tokio::spawn(async move { client.refresh(Duration::from_secs(1)).await })
+        };
+        assert!(first.await.unwrap().is_ok());
+        assert!(second.await.unwrap().is_ok());
+        assert!(
+            prober.max_active.load(Ordering::SeqCst) <= DEFAULT_CONCURRENCY,
+            "concurrent reports multiplied the global probe cap"
+        );
+    }
+
+    #[tokio::test]
+    async fn whole_report_deadline_cancels_large_peer_set_without_partial_report() {
+        let peers: Vec<_> = (1..=100)
+            .map(|id| node(id, &[&format!("100.64.1.{id}/32")], &["198.51.100.0/24"]))
+            .collect();
+        let mut inner = Prober::new([]);
+        inner.delay = Duration::from_millis(100);
+        let prober = Arc::new(inner);
+        let client = Client::new(Arc::new(Routes(snapshot(peers))), prober.clone());
+
+        let result = client
+            .probe_all_ha_routers_with_deadline(
+                DEFAULT_CONCURRENCY,
+                Duration::from_secs(1),
+                Duration::from_millis(20),
+                &CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(result, Err(Error::DeadlineExceeded));
+        assert!(client.latest_report().is_none());
+        assert_eq!(prober.active.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

@@ -901,6 +901,7 @@ pub(crate) async fn dispatch<W: AsyncRead + AsyncWrite + Unpin>(
                     "/localapi/v0/whois",
                     "/localapi/v0/prefs",
                     "/localapi/v0/netmap",
+                    "/localapi/v0/routecheck",
                     "/localapi/v0/metrics",
                     "/localapi/v0/health",
                     "/localapi/v0/ping",
@@ -1002,6 +1003,10 @@ pub(crate) async fn dispatch<W: AsyncRead + AsyncWrite + Unpin>(
 
         // --- POST /localapi/v0/routecheck?probe=true&timeout=5s ---
         "routecheck" if method == "POST" => {
+            if routecheck_probe_requested(&req.query) && !require_readwrite(peer_identity) {
+                write_access_denied(conn).await?;
+                return Ok(());
+            }
             handle_routecheck(conn, &req.query, state).await?;
         }
         "routecheck" => {
@@ -1568,7 +1573,7 @@ fn build_health_json(state: &LocalApiState) -> serde_json::Value {
 // Routecheck handler
 // ---------------------------------------------------------------------------
 
-async fn handle_routecheck<W: AsyncWrite + Unpin>(
+async fn handle_routecheck<W: AsyncRead + AsyncWrite + Unpin>(
     conn: &mut W,
     query: &str,
     state: &Arc<LocalApiState>,
@@ -1578,20 +1583,40 @@ async fn handle_routecheck<W: AsyncWrite + Unpin>(
         return write_json_response(conn, 503, "Service Unavailable", &body).await;
     };
     let params = parse_query(query);
-    let probe = params
-        .get("probe")
-        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes"));
+    let probe = routecheck_probe_requested(query);
     let report = if probe {
         let timeout = params
             .get("timeout")
             .and_then(|value| parse_routecheck_duration(value))
             .unwrap_or(rustscale_routecheck::DEFAULT_TIMEOUT)
             .min(std::time::Duration::from_secs(60));
-        match client.refresh(timeout).await {
+        let cancelled = tokio_util::sync::CancellationToken::new();
+        let refresh = client.refresh_with_cancel(timeout, &cancelled);
+        tokio::pin!(refresh);
+        let mut disconnect = [0_u8; 1];
+        let result = tokio::select! {
+            result = &mut refresh => result,
+            read = conn.read(&mut disconnect) => {
+                cancelled.cancel();
+                // Wait for the refresh to drain its tasks and magicsock drop
+                // guards before releasing the request's server-wide permit.
+                let _ = refresh.await;
+                return match read {
+                    Ok(_) => Ok(()),
+                    Err(error) => Err(error),
+                };
+            }
+        };
+        match result {
             Ok(report) => Some(report),
             Err(error) => {
                 let body = serde_json::json!({"error": error.to_string()});
-                return write_json_response(conn, 503, "Service Unavailable", &body).await;
+                let (status, reason) = if error == rustscale_routecheck::Error::DeadlineExceeded {
+                    (504, "Gateway Timeout")
+                } else {
+                    (503, "Service Unavailable")
+                };
+                return write_json_response(conn, status, reason, &body).await;
             }
         }
     } else {
@@ -1604,6 +1629,12 @@ async fn handle_routecheck<W: AsyncWrite + Unpin>(
     } else {
         write_no_content_response(conn, 204, "No Content").await
     }
+}
+
+fn routecheck_probe_requested(query: &str) -> bool {
+    parse_query(query)
+        .get("probe")
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes"))
 }
 
 fn parse_routecheck_duration(value: &str) -> Option<std::time::Duration> {
@@ -3303,6 +3334,8 @@ mod tests {
     use rustscale_key::{DiscoPrivate, NodePrivate};
     use rustscale_magicsock::{Magicsock, MagicsockConfig};
     use rustscale_tailcfg::{Node, UserProfile};
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
     use tokio::io::AsyncWriteExt;
 
     /// Build a test LocalApiState with mock data. The IPN backend is
@@ -3411,6 +3444,88 @@ mod tests {
             )),
             audit_logger: None,
         })
+    }
+
+    struct TestRouteProvider(rustscale_routecheck::RouteSnapshot);
+
+    #[async_trait::async_trait]
+    impl rustscale_routecheck::RouteProvider for TestRouteProvider {
+        async fn snapshot(
+            &self,
+        ) -> Result<rustscale_routecheck::RouteSnapshot, rustscale_routecheck::RouteProviderError>
+        {
+            Ok(self.0.clone())
+        }
+    }
+
+    struct TestProbeGuard<'a>(&'a AtomicUsize);
+
+    impl Drop for TestProbeGuard<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    struct TestProbeProvider {
+        calls: AtomicUsize,
+        active: AtomicUsize,
+        max_active: AtomicUsize,
+        delay: Duration,
+        started: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl rustscale_routecheck::ProbeProvider for TestProbeProvider {
+        async fn probe(
+            &self,
+            _peer: &Node,
+            _address: IpAddr,
+        ) -> Result<rustscale_routecheck::ProbeResponse, rustscale_routecheck::ProbeError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            let _guard = TestProbeGuard(&self.active);
+            self.max_active.fetch_max(active, Ordering::SeqCst);
+            self.started.notify_waiters();
+            tokio::time::sleep(self.delay).await;
+            Ok(rustscale_routecheck::ProbeResponse {
+                latency: self.delay,
+            })
+        }
+    }
+
+    fn test_routecheck_client(
+        peer_count: u8,
+        delay: Duration,
+    ) -> (Arc<rustscale_routecheck::Client>, Arc<TestProbeProvider>) {
+        let self_node = Node {
+            ID: 999,
+            Addresses: vec!["100.64.0.254/32".into()],
+            ..Default::default()
+        };
+        let peers = (1..=peer_count)
+            .map(|id| Node {
+                ID: i64::from(id),
+                Name: format!("router-{id}.example.test."),
+                Addresses: vec![format!("100.64.0.{id}/32")],
+                AllowedIPs: vec![format!("100.64.0.{id}/32"), "192.0.2.0/24".into()],
+                ..Default::default()
+            })
+            .collect();
+        let prober = Arc::new(TestProbeProvider {
+            calls: AtomicUsize::new(0),
+            active: AtomicUsize::new(0),
+            max_active: AtomicUsize::new(0),
+            delay,
+            started: tokio::sync::Notify::new(),
+        });
+        let client = Arc::new(rustscale_routecheck::Client::new(
+            Arc::new(TestRouteProvider(rustscale_routecheck::RouteSnapshot {
+                self_node,
+                peers,
+            })),
+            prober.clone(),
+        ));
+        (client, prober)
     }
 
     // --- HTTP parsing tests ---
@@ -3549,6 +3664,107 @@ mod tests {
             Some(std::time::Duration::ZERO)
         );
         assert!(parse_routecheck_duration("later").is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_routecheck_probe_requires_readwrite_without_starting_probes() {
+        let mut state = make_test_state().await;
+        let (routecheck, prober) = test_routecheck_client(2, Duration::ZERO);
+        Arc::get_mut(&mut state).unwrap().routecheck = Some(routecheck);
+        let identity = ConnIdentity {
+            uid: None,
+            pid: None,
+            is_unix_sock: true,
+        };
+        let resp = send_request_with_identity(
+            b"POST /localapi/v0/routecheck?probe=true HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            &state,
+            identity,
+        )
+        .await;
+        assert!(resp.contains("403 Forbidden"), "response: {resp}");
+        assert_eq!(prober.calls.load(Ordering::SeqCst), 0);
+    }
+
+    async fn send_live_request_with_identity(
+        raw: &[u8],
+        state: Arc<LocalApiState>,
+        identity: ConnIdentity,
+    ) -> String {
+        let (mut client, mut server) = tokio::io::duplex(8192);
+        client.write_all(raw).await.unwrap();
+        client.flush().await.unwrap();
+        let server_task = tokio::spawn(async move {
+            let req = read_request(&mut server).await.unwrap();
+            dispatch(&mut server, &req, &state, &identity).await
+        });
+
+        let mut response = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut client, &mut response)
+            .await
+            .unwrap();
+        server_task.await.unwrap().unwrap();
+        String::from_utf8(response).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_routecheck_disconnect_cancels_without_partial_report() {
+        let mut state = make_test_state().await;
+        let (routecheck, prober) = test_routecheck_client(10, Duration::from_secs(30));
+        Arc::get_mut(&mut state).unwrap().routecheck = Some(routecheck.clone());
+        let (mut client_io, mut server_io) = tokio::io::duplex(8192);
+        client_io
+            .write_all(
+                b"POST /localapi/v0/routecheck?probe=true&timeout=30s HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let task = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                let req = read_request(&mut server_io).await.unwrap();
+                dispatch(&mut server_io, &req, &state, &test_rw_identity()).await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while prober.calls.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("routecheck probe start");
+        client_io.shutdown().await.unwrap();
+        assert!(task.await.unwrap().is_ok());
+        assert_eq!(prober.active.load(Ordering::SeqCst), 0);
+        assert!(routecheck.latest_report().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_authorized_routecheck_requests_share_global_cap() {
+        let mut state = make_test_state().await;
+        let (routecheck, prober) = test_routecheck_client(10, Duration::from_millis(10));
+        Arc::get_mut(&mut state).unwrap().routecheck = Some(routecheck);
+        let mut requests = Vec::new();
+        for _ in 0..8 {
+            let state = state.clone();
+            requests.push(tokio::spawn(async move {
+                send_live_request_with_identity(
+                    b"POST /localapi/v0/routecheck?probe=true&timeout=1s HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                    state,
+                    test_rw_identity(),
+                )
+                .await
+            }));
+        }
+        for request in requests {
+            let response = request.await.unwrap();
+            assert!(response.contains("200 OK"), "response: {response}");
+        }
+        assert_eq!(prober.calls.load(Ordering::SeqCst), 80);
+        assert!(
+            prober.max_active.load(Ordering::SeqCst) <= rustscale_routecheck::DEFAULT_CONCURRENCY
+        );
     }
 
     #[tokio::test]

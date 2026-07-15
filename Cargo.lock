@@ -3159,6 +3159,7 @@ dependencies = [
 name = "rustscale-magicsock"
 version = "0.1.1"
 dependencies = [
+ "async-trait",
  "bytes",
  "hex",
  "if-addrs",
@@ -3174,6 +3175,7 @@ dependencies = [
  "rustscale-neterror",
  "rustscale-netns",
  "rustscale-portmapper",
+ "rustscale-routecheck",
  "rustscale-sockstats",
  "rustscale-tailcfg",
  "rustscale-udprelay",

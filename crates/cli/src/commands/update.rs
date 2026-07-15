@@ -111,16 +111,21 @@ fn usage() {
     eprintln!("  --version <ver>   install an explicit GitHub release version");
 }
 
-#[allow(clippy::unused_async)]
 pub async fn run(args: Vec<String>, _socket: &Path, json: bool) -> Result<(), CliError> {
+    let stdin_is_terminal = io::stdin().is_terminal();
+    tokio::task::spawn_blocking(move || run_blocking(args, json, stdin_is_terminal))
+        .await
+        .map_err(|error| CliError(format!("update worker failed: {error}")))?
+}
+
+fn run_blocking(args: Vec<String>, json: bool, stdin_is_terminal: bool) -> Result<(), CliError> {
     let Some(flags) = parse_flags(&args)? else {
         usage();
         return Ok(());
     };
+    validate_interaction(&flags, stdin_is_terminal)?;
 
-    validate_interaction(&flags, io::stdin().is_terminal())?;
-
-    let selector = if let Some(version) = flags.version {
+    let selector = if let Some(version) = flags.version.clone() {
         VersionSelector::Version(version)
     } else {
         VersionSelector::Track(flags.track.unwrap_or_else(|| {
@@ -133,7 +138,7 @@ pub async fn run(args: Vec<String>, _socket: &Path, json: bool) -> Result<(), Cl
         .map_err(|error| CliError(format!("cannot locate the rustscale executable: {error}")))?;
     let filesystem = SystemFileSystem;
     let install_method = detect_install_method(&executable, Platform::current(), &filesystem);
-    let http = HttpClient;
+    let http = HttpClient::new().map_err(update_error)?;
     let commands = SystemCommandRunner;
     let updater = ReleaseUpdater::new(
         version::CLIENT_VERSION,
@@ -148,15 +153,7 @@ pub async fn run(args: Vec<String>, _socket: &Path, json: bool) -> Result<(), Cl
     let yes = flags.yes;
     let (plan, outcome) = updater
         .execute(selector, flags.dry_run, |plan| {
-            if yes {
-                println!(
-                    "Updating RustScale from {} to {}; --yes given, continuing without prompts.",
-                    plan.current_version, plan.target_version
-                );
-                true
-            } else {
-                confirm(plan.current_version.as_str(), plan.target_version.as_str())
-            }
+            yes || confirm(plan.current_version.as_str(), plan.target_version.as_str())
         })
         .map_err(update_error)?;
 
@@ -167,9 +164,11 @@ pub async fn run(args: Vec<String>, _socket: &Path, json: bool) -> Result<(), Cl
                 "currentVersion": plan.current_version,
                 "targetVersion": plan.target_version,
                 "track": plan.track.as_str(),
+                "dryRun": flags.dry_run,
                 "plan": plan.description(),
                 "outcome": match outcome {
                     UpdateOutcome::AlreadyCurrent => "already-current",
+                    UpdateOutcome::NewerLocal => "newer-local",
                     UpdateOutcome::DryRun => "dry-run",
                     UpdateOutcome::Declined => "declined",
                     UpdateOutcome::Applied => "applied",
@@ -185,6 +184,17 @@ pub async fn run(args: Vec<String>, _socket: &Path, json: bool) -> Result<(), Cl
             plan.current_version,
             plan.track.as_str()
         ),
+        UpdateOutcome::NewerLocal => {
+            println!(
+                "Local RustScale {} is newer than the selected {} release {}.",
+                plan.current_version,
+                plan.track.as_str(),
+                plan.target_version
+            );
+            if flags.dry_run {
+                println!("No files or commands were changed (dry run).");
+            }
+        }
         UpdateOutcome::DryRun => {
             println!("Current: {}", plan.current_version);
             println!(
@@ -199,7 +209,7 @@ pub async fn run(args: Vec<String>, _socket: &Path, json: bool) -> Result<(), Cl
             println!("Update cancelled; the current installation was not changed.");
         }
         UpdateOutcome::Applied => println!(
-            "RustScale {} update applied successfully. Restart rustscaled to run the new daemon.",
+            "RustScale {} update applied and version-verified. Restart rustscaled to run the new daemon.",
             plan.target_version
         ),
     }
@@ -207,8 +217,8 @@ pub async fn run(args: Vec<String>, _socket: &Path, json: bool) -> Result<(), Cl
 }
 
 fn confirm(current: &str, target: &str) -> bool {
-    print!("This will update RustScale from {current} to {target}. Continue? [y/N] ");
-    if io::stdout().flush().is_err() {
+    eprint!("This will update RustScale from {current} to {target}. Continue? [y/N] ");
+    if io::stderr().flush().is_err() {
         return false;
     }
     let mut answer = String::new();

@@ -449,6 +449,7 @@ install_files() {
     for bin in rustscale rustscaled; do
         run_as_root install -m 755 "$WORKDIR/$bin" "$PREFIX/bin/"
     done
+    write_install_receipt
     install_aliases
 
     # Libraries and header are optional — present in macOS/Linux archives,
@@ -469,6 +470,22 @@ install_files() {
     if [ "$OS" = linux ] && command -v ldconfig >/dev/null 2>&1; then
         case "$PREFIX" in /usr/local|/usr) run_as_root ldconfig 2>/dev/null || true ;; esac
     fi
+}
+
+# Record ownership of exactly the binaries installed by this script. The
+# updater requires this receipt and verifies both hashes before replacing
+# anything, so merely colocated/package-managed binaries are never adopted.
+write_install_receipt() {
+    cli_sha=$(sha256_file "$WORKDIR/rustscale")
+    daemon_sha=$(sha256_file "$WORKDIR/rustscaled")
+    receipt="$WORKDIR/rustscale-install-receipt-v1"
+    {
+        echo "rustscale-install-receipt-v1"
+        echo "installer=scripts/install.sh"
+        echo "rustscale_sha256=$cli_sha"
+        echo "rustscaled_sha256=$daemon_sha"
+    } > "$receipt"
+    run_as_root install -m 644 "$receipt" "$PREFIX/bin/.rustscale-install-receipt-v1"
 }
 
 post_install() {
@@ -514,6 +531,7 @@ do_uninstall() {
             ;;
     esac
     for f in "$PREFIX/bin/rustscale" "$PREFIX/bin/rustscaled" \
+             "$PREFIX/bin/.rustscale-install-receipt-v1" \
              "$PREFIX/lib/librustscale.$DYEXT" "$PREFIX/lib/librustscale.a" \
              "$PREFIX/include/rustscale.h"; do
         if [ -e "$f" ] || [ -L "$f" ]; then

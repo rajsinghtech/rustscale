@@ -31,7 +31,7 @@ Statuses below were checked against the source and tests in `crates/*` as of
 | Tailscale Services (ListenService, PROXY protocol) | `tsnet.Server.ListenService` | ✅ listen_service(svc_name, ServiceMode) with VIP v4 addrs from CapMap (ServiceIPMappings); PROXY protocol v2 binary header encoder (byte-exact IPv4/IPv6/LOCAL); ServiceStream wrapping (Plain/WithProxy/Tls/TlsWithProxy); IPv6 VIPs skipped (smoltcp proto-ipv4 only); TLS termination for service FQDN via ControlCertProvider (HTTPS mode with cert fallback to self-signed); serve-config Services TCP forwarding path (TCPForward/TerminateTLS on service VIPs via ServeRunner) |
 | SOCKS5 proxy | `net/socks5/` | ✅ RFC 1928 CONNECT (v4/domain/v6); RFC 1929 username/password auth; pluggable SocksDialer; FFI; e2e tests |
 | LocalAPI | `ipn/localapi/` | ✅ 18+ endpoints (status, whois, prefs GET+PATCH, netmap, metrics, health, ping (disco/icmp/tsmp/peerapi), watch-ipn-bus, start, login-interactive, logout, serve-config, profiles, cert, id-token (Noise control forwarding), file-targets, debug, dial, dns-query, check-ip-forwarding) |
-| Auto-update / ClientVersion | — | 🔶 control-plane ClientVersion notifications and status are wired; `crates/clientupdate` now provides safe manual GitHub release selection, checksum verification, archive rollback, and Homebrew planning, while unattended `auto_apply` remains intentionally unsupported pending daemon policy |
+| Auto-update / ClientVersion | — | 🔶 control-plane ClientVersion notifications and status are wired; `crates/clientupdate` provides fail-closed manual GitHub release selection, bounded archive parsing, receipt-gated binary replacement, and journaled rollback. Homebrew is planning-only and unattended `auto_apply` remains intentionally unsupported. |
 | Multi-profile/login management | `ipn/ipnlocal/profiles.go` | ✅ ProfileManager with profiles.json + current-profile persistence; LocalAPI CRUD endpoints; CLI switch command; backend teardown+restart on switch (`Server::switch_profile` → close + reload prefs + `up()`, `DaemonCommand::SwitchProfile` wired through daemon loop); remaining: Windows LocalUserID |
 
 ## macOS platform parity (phases 32–40, 2026-07-11)
@@ -188,7 +188,10 @@ a UDP impairment shim; Go-testcontrol interoperability is covered in CI.
 `release.yml` ✅ tag-triggered (v*) multi-platform build. macOS universal
 (aarch64 + x86_64 lipo'd dylib/.a + binaries). Linux matrix (x86_64-gnu,
 aarch64-gnu, x86_64-musl). Windows x86_64-msvc. Docker multi-arch image
-pushed to GHCR. Homebrew formula. SHA256SUMS + GitHub Release.
+pushed to GHCR. Homebrew formula. SHA256SUMS + GitHub Release. The current
+same-release SHA256SUMS provides download integrity, not independent offline
+signature authenticity; a reproducible public-key signed-manifest pipeline is
+deferred.
 `audit.yml` ✅ weekly cargo-audit (RUSTSEC) + cargo-deny (licenses/bans),
 also on PRs touching Cargo.lock or deny.toml. Version stamping ✅ via
 build.rs (`git describe --tags --long --always --dirty` → RUSTSCALE_VERSION_LONG).
@@ -251,7 +254,7 @@ state-dir fallback probing), `--json`.
 | `bugreport` | `cli/bugreport.go` | ✅ prints version/state/health summary |
 | `nc` | `cli/nc.go` | 🔶 stub (not-yet-supported) |
 | `id-token` | `cli/id-token.go` | ✅ OIDC machine ID token via LocalAPI and Noise `POST /machine/id-token`; raw JWT and `--json` output |
-| `update` | `cli/update.go` | ✅ `--yes`, `--dry-run`, `--track`, and `--version`; verified Linux/macOS release archives with rollback plus Homebrew stable updates; unsupported install layouts fail explicitly without elevation |
+| `update` | `cli/update.go` | 🔶 `--yes`, `--dry-run`, `--track`, and `--version`; Linux/macOS archive apply is limited to intact `scripts/install.sh` ownership receipts with checksum integrity, bounded parsing, post-install version verification, and journaled rollback. Homebrew is dry-run planning only; other layouts fail explicitly without elevation. |
 | `drive` | `cli/drive.go` | ⬜ |
 | `lock` | `cli/lock.go` | ⬜ |
 | completion/man | `cli/ffcomplete/` | ✅ bash, zsh, and fish script generation plus hidden, side-effect-free runtime completion protocol; man pages are not provided upstream |

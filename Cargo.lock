@@ -2806,14 +2806,16 @@ dependencies = [
 name = "rustscale-clientupdate"
 version = "0.1.1"
 dependencies = [
+ "flate2",
  "reqwest",
  "rustscale-tailcfg",
  "semver",
  "serde",
  "serde_json",
- "sha2",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 1.0.69",
+ "wait-timeout",
 ]
 
 [[package]]

@@ -37,7 +37,7 @@ make_unix_archive() {
         cp "$ROOT/packaging/systemd/rustscaled.service" "$stage/"
         cp "$ROOT/packaging/systemd/rustscaled.default" "$stage/"
     fi
-    tar czf "$RELEASE_DIR/$archive" -C "$stage" .
+    tar --format=ustar -czf "$RELEASE_DIR/$archive" -C "$stage" .
 }
 
 make_unix_archive rustscale-universal-apple-darwin.tar.gz dylib
@@ -65,6 +65,10 @@ run_case() {
 
     test -x "$prefix/bin/rustscale"
     test -x "$prefix/bin/rustscaled"
+    test -f "$prefix/bin/.rustscale-install-receipt-v1"
+    grep -q '^installer=scripts/install.sh$' "$prefix/bin/.rustscale-install-receipt-v1"
+    test "$(awk -F= '/^rustscale_sha256=/ { print $2 }' "$prefix/bin/.rustscale-install-receipt-v1")" = "$(sha256_file "$prefix/bin/rustscale")"
+    test "$(awk -F= '/^rustscaled_sha256=/ { print $2 }' "$prefix/bin/.rustscale-install-receipt-v1")" = "$(sha256_file "$prefix/bin/rustscaled")"
     test -L "$prefix/bin/tailscale"
     test -L "$prefix/bin/tailscaled"
     test -f "$prefix/lib/librustscale.a"
@@ -73,6 +77,7 @@ run_case() {
     INSTALL_SERVICE=0 PREFIX="$prefix" RUSTSCALE_UNAME_S="$uname_s" \
         RUSTSCALE_UNAME_M="$uname_m" sh "$ROOT/scripts/install.sh" --uninstall >/dev/null
     test ! -e "$prefix/bin/rustscale"
+    test ! -e "$prefix/bin/.rustscale-install-receipt-v1"
     test ! -e "$prefix/bin/tailscale"
 }
 

@@ -566,6 +566,14 @@ impl<P: Platform, R: CommandRunner> StatefulRouter<P, R> {
         first_error.map_or(Ok(()), Err)
     }
 
+    fn forget_superseded_cleanup(&mut self, replacements: &[CommandSpec]) {
+        // A verified rebuild owns the exact replacement now. Retire only
+        // byte-for-byte matching inverses; nearby family, priority, protocol,
+        // or unrelated rollback commands still need their original retry.
+        self.pending_cleanup
+            .retain(|pending| !replacements.contains(pending));
+    }
+
     fn rollback_startup(&mut self, rollback: Vec<CommandSpec>) -> Vec<RouterError> {
         let mut errors = Vec::new();
         for (program, args) in rollback.into_iter().rev() {
@@ -652,9 +660,12 @@ impl<P: Platform, R: CommandRunner> Router for StatefulRouter<P, R> {
             self.apply(&[RouterOperation::DisableDirectBlock])?;
             self.direct_blocked = false;
         }
+        let replacements = self.platform.commands(&RouterOperation::EnableDirectBlock);
         self.apply(&[RouterOperation::EnableDirectBlock])?;
         self.direct_blocked = true;
-        self.verify_direct_block(true)
+        self.verify_direct_block(true)?;
+        self.forget_superseded_cleanup(&replacements);
+        Ok(())
     }
 
     fn unblock_direct(&mut self) -> Result<(), RouterError> {
@@ -992,58 +1003,25 @@ impl DarwinPlatform {
         expected_token: &str,
     ) -> Result<(), RouterError> {
         let owner = self.owned_record()?;
-        let was_pending = match &owner.pf_token {
+        match &owner.pf_token {
             DarwinPfTokenState::Active(token) if token == expected_token => {
                 // This durable transition must precede pfctl -X. A crash or
                 // uncertain command can then retry exactly this token.
                 self.record_pf_token(&DarwinPfTokenState::ReleasePending(token.clone()))?;
-                false
             }
-            DarwinPfTokenState::ReleasePending(token) if token == expected_token => true,
+            DarwinPfTokenState::ReleasePending(token) if token == expected_token => {}
             state => {
                 return Err(RouterError::InvalidConfig(format!(
                     "Darwin PF token state changed before retirement: {state:?}"
                 )));
             }
-        };
-
-        if let Err(release_error) = runner.run("pfctl", &["-X".into(), expected_token.into()]) {
-            if !was_pending {
-                return Err(release_error);
-            }
-            // A prior -X may have consumed the token before its result or the
-            // following owner-record write became durable. Treat that retry as
-            // benign only after proving our exact anchor has no rules. Any
-            // exact remnant or foreign rule remains fatal and untouched.
-            let query = vec!["-a".into(), self.block_anchor.clone(), "-sr".into()];
-            let rules = match runner.output("pfctl", &query) {
-                Ok(rules) => rules,
-                Err(proof_error) => {
-                    return Err(RouterError::Transaction {
-                        primary: Box::new(release_error),
-                        rollback: vec![proof_error],
-                    });
-                }
-            };
-            if !rules.trim().is_empty() {
-                let proof_error = if pf_block_rules_exact(&rules, &self.tun_name) {
-                    RouterError::InvalidConfig(
-                        "refusing to retire consumed PF token while exact anchor rules remain"
-                            .into(),
-                    )
-                } else {
-                    RouterError::InvalidConfig(
-                        "refusing to retire consumed PF token in presence of foreign anchor rules"
-                            .into(),
-                    )
-                };
-                return Err(RouterError::Transaction {
-                    primary: Box::new(release_error),
-                    rollback: vec![proof_error],
-                });
-            }
         }
 
+        // Anchor state says nothing about whether PF consumed this enable
+        // reference. Keep release-pending on every uncertain failure. A retry
+        // may clear it only after -X succeeds or reports the exact token is no
+        // longer present.
+        release_pf_token_once(runner, expected_token)?;
         self.record_pf_token(&DarwinPfTokenState::None)
     }
 }
@@ -1270,6 +1248,43 @@ fn pf_enable_token(output: &str) -> Option<String> {
 }
 
 #[cfg(target_os = "macos")]
+fn pf_token_definitively_absent(error: &RouterError, expected_token: &str) -> bool {
+    let RouterError::Command {
+        program,
+        args,
+        stderr,
+        ..
+    } = error
+    else {
+        return false;
+    };
+    if program != "pfctl" || args.len() != 2 || args[0] != "-X" || args[1] != expected_token {
+        return false;
+    }
+    let stderr = stderr.trim().to_ascii_lowercase();
+    let outcome = stderr.strip_prefix("pfctl: ").unwrap_or(&stderr);
+    matches!(
+        outcome,
+        "pf: token invalid"
+            | "pf: token invalid: invalid argument"
+            | "pf not enabled"
+            | "no pf_enabled references"
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn release_pf_token_once(
+    runner: &mut dyn CommandRunner,
+    expected_token: &str,
+) -> Result<(), RouterError> {
+    match runner.run("pfctl", &["-X".into(), expected_token.into()]) {
+        Ok(()) => Ok(()),
+        Err(error) if pf_token_definitively_absent(&error, expected_token) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn pf_block_rules_exact(rules: &str, tun_name: &str) -> bool {
     let lines: Vec<_> = rules
         .lines()
@@ -1334,11 +1349,7 @@ impl DarwinRouter {
             .platform
             .record_pf_token(&DarwinPfTokenState::Active(token.clone()))
         {
-            match self
-                .inner
-                .runner
-                .run("pfctl", &["-X".into(), token.clone()])
-            {
+            match release_pf_token_once(&mut self.inner.runner, &token) {
                 Ok(()) => {
                     // The failed active write may have become visible before
                     // its directory fsync failed. Clear that consumed token;
@@ -2557,12 +2568,19 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
+    #[derive(Clone, Copy)]
+    enum PfReleaseFault {
+        Transient,
+        TokenAbsent,
+    }
+
+    #[cfg(target_os = "macos")]
     struct PfFaultRunner {
         rules: String,
         fail_query_at: Option<usize>,
         query_calls: usize,
         fail_flush: bool,
-        fail_release: bool,
+        release_fault: Option<PfReleaseFault>,
         commands: Vec<CommandSpec>,
     }
 
@@ -2570,10 +2588,26 @@ mod tests {
     impl CommandRunner for PfFaultRunner {
         fn run(&mut self, program: &str, args: &[String]) -> Result<(), RouterError> {
             self.commands.push((program.into(), args.to_vec()));
-            if args.first().is_some_and(|arg| arg == "-X") && self.fail_release {
-                return Err(RouterError::InvalidConfig(
-                    "injected pfctl -X failure".into(),
-                ));
+            if args.first().is_some_and(|arg| arg == "-X") {
+                match self.release_fault {
+                    Some(PfReleaseFault::Transient) => {
+                        return Err(RouterError::Command {
+                            program: program.into(),
+                            args: args.to_vec(),
+                            exit_code: Some(1),
+                            stderr: "pfctl: /dev/pf: Device busy".into(),
+                        });
+                    }
+                    Some(PfReleaseFault::TokenAbsent) => {
+                        return Err(RouterError::Command {
+                            program: program.into(),
+                            args: args.to_vec(),
+                            exit_code: Some(1),
+                            stderr: "pfctl: pf: token invalid: Invalid argument".into(),
+                        });
+                    }
+                    None => {}
+                }
             }
             if args.windows(2).any(|pair| pair == ["-F", "rules"]) {
                 if self.fail_flush {
@@ -2615,7 +2649,7 @@ mod tests {
             fail_query_at: None,
             query_calls: 0,
             fail_flush: false,
-            fail_release: false,
+            release_fault: None,
             commands: Vec::new(),
         }
     }
@@ -2693,7 +2727,7 @@ mod tests {
                 "query" => runner.fail_query_at = Some(1),
                 "flush" => runner.fail_flush = true,
                 "verify" => runner.fail_query_at = Some(2),
-                "release" => runner.fail_release = true,
+                "release" => runner.release_fault = Some(PfReleaseFault::Transient),
                 _ => unreachable!(),
             }
 
@@ -2729,23 +2763,34 @@ mod tests {
         assert!(runner.commands.is_empty());
         assert_eq!(platform.owned_record().unwrap().pf_token, active);
 
-        // A command failure leaves release-pending durable. The retry may
-        // accept an already-consumed token only after an empty-anchor proof.
-        runner.fail_release = true;
-        assert!(platform.retire_pf_token(&mut runner, "12345").is_err());
-        assert_eq!(
-            platform.owned_record().unwrap().pf_token,
-            DarwinPfTokenState::ReleasePending("12345".into())
-        );
-        runner.commands.clear();
+        // Transient command failures retain the durable release ownership,
+        // regardless of the empty anchor. A successful retry clears it.
+        runner.release_fault = Some(PfReleaseFault::Transient);
+        for _ in 0..2 {
+            assert!(platform.retire_pf_token(&mut runner, "12345").is_err());
+            assert_eq!(
+                platform.owned_record().unwrap().pf_token,
+                DarwinPfTokenState::ReleasePending("12345".into())
+            );
+        }
+        runner.release_fault = None;
         platform.retire_pf_token(&mut runner, "12345").unwrap();
         assert_eq!(
             platform.owned_record().unwrap().pf_token,
             DarwinPfTokenState::None
         );
-        assert_eq!(runner.commands.len(), 2);
-        assert!(runner.commands[0].1.iter().any(|arg| arg == "-X"));
-        assert!(runner.commands[1].1.iter().any(|arg| arg == "-sr"));
+        assert_eq!(
+            runner
+                .commands
+                .iter()
+                .filter(|(_, args)| args.first().is_some_and(|arg| arg == "-X"))
+                .count(),
+            3
+        );
+        assert!(runner
+            .commands
+            .iter()
+            .all(|(_, args)| !args.iter().any(|arg| arg == "-sr")));
 
         platform.release_ownership();
     }
@@ -2768,7 +2813,7 @@ mod tests {
             platform.owned_record().unwrap().pf_token,
             DarwinPfTokenState::ReleasePending("67890".into())
         );
-        runner.fail_release = true;
+        runner.release_fault = Some(PfReleaseFault::TokenAbsent);
         platform.retire_pf_token(&mut runner, "67890").unwrap();
         assert_eq!(
             platform.owned_record().unwrap().pf_token,
@@ -2779,28 +2824,49 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn darwin_consumed_token_recovery_never_accepts_exact_or_foreign_rules() {
-        for rules in [
-            "block drop out quick on ! utun-proof all flags S/SA\n",
-            "pass out all\n",
+    fn darwin_only_definitive_token_absence_completes_pending_release() {
+        for stderr in [
+            "pfctl: pf: token invalid: Invalid argument",
+            "pfctl: pf not enabled",
+            "pfctl: No pf_enabled references",
         ] {
-            let state_dir = darwin_test_state("pf-proof");
-            let platform = DarwinPlatform::new("utun-proof", Some(&state_dir));
-            platform.claim_ownership().unwrap();
-            platform
-                .record_pf_token(&DarwinPfTokenState::ReleasePending("24680".into()))
-                .unwrap();
-            let mut runner = pf_fault_runner(rules);
-            runner.fail_release = true;
-
-            assert!(platform.retire_pf_token(&mut runner, "24680").is_err());
-            assert_eq!(runner.rules, rules);
-            assert_eq!(
-                platform.owned_record().unwrap().pf_token,
-                DarwinPfTokenState::ReleasePending("24680".into())
-            );
-            platform.release_ownership();
+            let error = RouterError::Command {
+                program: "pfctl".into(),
+                args: vec!["-X".into(), "24680".into()],
+                exit_code: Some(1),
+                stderr: stderr.into(),
+            };
+            assert!(pf_token_definitively_absent(&error, "24680"));
+            assert!(!pf_token_definitively_absent(&error, "13579"));
         }
+
+        for stderr in [
+            "pfctl: /dev/pf: Device busy",
+            "pfctl: pf: token invalid: retry interrupted",
+        ] {
+            let transient = RouterError::Command {
+                program: "pfctl".into(),
+                args: vec!["-X".into(), "24680".into()],
+                exit_code: Some(1),
+                stderr: stderr.into(),
+            };
+            assert!(!pf_token_definitively_absent(&transient, "24680"));
+        }
+
+        let state_dir = darwin_test_state("pf-absent");
+        let platform = DarwinPlatform::new("utun-proof", Some(&state_dir));
+        platform.claim_ownership().unwrap();
+        platform
+            .record_pf_token(&DarwinPfTokenState::ReleasePending("24680".into()))
+            .unwrap();
+        let mut runner = pf_fault_runner("");
+        runner.release_fault = Some(PfReleaseFault::TokenAbsent);
+        platform.retire_pf_token(&mut runner, "24680").unwrap();
+        assert_eq!(
+            platform.owned_record().unwrap().pf_token,
+            DarwinPfTokenState::None
+        );
+        platform.release_ownership();
     }
 
     #[cfg(target_os = "macos")]
@@ -2918,6 +2984,147 @@ mod tests {
                 .cloned()
                 .unwrap_or_default())
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[derive(Default)]
+    struct DirectBlockFaultRunner {
+        active_families: std::collections::HashSet<String>,
+        commands: Vec<CommandSpec>,
+        fail_next_v6_delete: bool,
+        fail_next_v4_add: bool,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl DirectBlockFaultRunner {
+        fn is_owned_block(args: &[String]) -> bool {
+            args.windows(2).any(|pair| pair == ["protocol", "201"])
+                && args.windows(2).any(|pair| pair == ["pref", "5250"])
+                && args.iter().any(|arg| arg == "not")
+                && args.iter().any(|arg| arg == "unreachable")
+        }
+
+        fn command_error(program: &str, args: &[String], stderr: &str) -> RouterError {
+            RouterError::Command {
+                program: program.into(),
+                args: args.to_vec(),
+                exit_code: Some(2),
+                stderr: stderr.into(),
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl CommandRunner for DirectBlockFaultRunner {
+        fn run(&mut self, program: &str, args: &[String]) -> Result<(), RouterError> {
+            self.commands.push((program.into(), args.to_vec()));
+            if !Self::is_owned_block(args) {
+                return Ok(());
+            }
+            let family = args.first().cloned().unwrap_or_default();
+            if args.iter().any(|arg| arg == "del") {
+                if family == "-6" && self.fail_next_v6_delete {
+                    self.fail_next_v6_delete = false;
+                    return Err(Self::command_error(
+                        program,
+                        args,
+                        "RTNETLINK answers: Operation not permitted",
+                    ));
+                }
+                if !self.active_families.remove(&family) {
+                    return Err(Self::command_error(
+                        program,
+                        args,
+                        "RTNETLINK answers: No such process",
+                    ));
+                }
+            } else if args.iter().any(|arg| arg == "add") {
+                if family == "-4" && self.fail_next_v4_add {
+                    self.fail_next_v4_add = false;
+                    return Err(Self::command_error(
+                        program,
+                        args,
+                        "RTNETLINK answers: Operation not permitted",
+                    ));
+                }
+                if !self.active_families.insert(family) {
+                    return Err(Self::command_error(
+                        program,
+                        args,
+                        "RTNETLINK answers: File exists",
+                    ));
+                }
+            }
+            Ok(())
+        }
+
+        fn output(&mut self, program: &str, args: &[String]) -> Result<String, RouterError> {
+            self.commands.push((program.into(), args.to_vec()));
+            let family = args.first().cloned().unwrap_or_default();
+            if self.active_families.contains(&family) {
+                Ok(format!(
+                    "5250: not from all fwmark 0x80000/0xff0000 unreachable proto {}\n",
+                    LinuxPlatform::RULE_PROTOCOL
+                ))
+            } else {
+                Ok(String::new())
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_verified_reblock_retires_only_exact_pending_enables() {
+        let platform = LinuxPlatform::new_with_interface_index("tailscale0", 2);
+        let enables = platform.commands(&RouterOperation::EnableDirectBlock);
+        let mut router = StatefulRouter::new(platform, DirectBlockFaultRunner::default());
+        router.block_direct().unwrap();
+
+        let mut wrong_family = enables[0].clone();
+        wrong_family.1[0] = "-5".into();
+        let mut wrong_pref = enables[0].clone();
+        wrong_pref.1[4] = "5251".into();
+        let mut wrong_protocol = enables[0].clone();
+        wrong_protocol.1[9] = "99".into();
+        let unrelated = (
+            "ip".into(),
+            vec!["route".into(), "del".into(), "192.0.2.0/24".into()],
+        );
+        let retained = vec![wrong_family, wrong_pref, wrong_protocol, unrelated];
+        router.pending_cleanup.extend(retained.clone());
+
+        router.runner.fail_next_v6_delete = true;
+        router.runner.fail_next_v4_add = true;
+        assert!(router.unblock_direct().is_err());
+        assert!(router.direct_blocked);
+        assert_eq!(router.pending_cleanup, retained);
+
+        let before_set = router.runner.commands.len();
+        router.set(&RouterConfig::default()).unwrap();
+        assert!(router.pending_cleanup.is_empty());
+        assert!(router.runner.commands[before_set..]
+            .iter()
+            .all(|(_, args)| !DirectBlockFaultRunner::is_owned_block(args)));
+
+        let adds_before_close = router
+            .runner
+            .commands
+            .iter()
+            .filter(|(_, args)| {
+                DirectBlockFaultRunner::is_owned_block(args) && args.iter().any(|arg| arg == "add")
+            })
+            .count();
+        router.close().unwrap();
+        let adds_after_close = router
+            .runner
+            .commands
+            .iter()
+            .filter(|(_, args)| {
+                DirectBlockFaultRunner::is_owned_block(args) && args.iter().any(|arg| arg == "add")
+            })
+            .count();
+        assert_eq!(adds_after_close, adds_before_close);
+        assert!(router.runner.active_families.is_empty());
     }
 
     #[cfg(target_os = "linux")]

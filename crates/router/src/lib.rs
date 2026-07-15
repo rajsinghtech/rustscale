@@ -7,6 +7,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod ipset;
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::process::{Command, Stdio};
 use std::{fmt, net::IpAddr};

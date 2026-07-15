@@ -59,7 +59,7 @@ async fn commit_then_drop_keeps_receipt_and_resumes_without_new_secrets() {
     assert_eq!(init[1].0, "/machine/tka/init/finish");
     assert_eq!(init[0].1, init[1].1, "init must be session-bound");
 
-    let receipt = walk_files(state.path())
+    let _receipt = walk_files(state.path())
         .into_iter()
         .find(|path| {
             path.file_name()
@@ -70,11 +70,11 @@ async fn commit_then_drop_keeps_receipt_and_resumes_without_new_secrets() {
     {
         use std::os::unix::fs::PermissionsExt as _;
         assert_eq!(
-            std::fs::metadata(&receipt).unwrap().permissions().mode() & 0o777,
+            std::fs::metadata(&_receipt).unwrap().permissions().mode() & 0o777,
             0o600
         );
         assert_eq!(
-            std::fs::metadata(receipt.parent().unwrap())
+            std::fs::metadata(_receipt.parent().unwrap())
                 .unwrap()
                 .permissions()
                 .mode()

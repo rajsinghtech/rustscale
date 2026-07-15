@@ -2113,6 +2113,7 @@ fn sync_router_inner(
         &mut managed,
         &config,
         entering_exit_node,
+        leaving_exit_node,
         !exit_node_allow_lan_access,
     )?;
     if leaving_exit_node {
@@ -2127,6 +2128,7 @@ fn apply_managed_router_config(
     managed: &mut ManagedRouter,
     config: &rustscale_router::RouterConfig,
     entering_exit_node: bool,
+    leaving_exit_node: bool,
     lan_denied: bool,
 ) -> Result<(), TsnetError> {
     // A prior failed block attempt is always retried before any route or
@@ -2140,7 +2142,10 @@ fn apply_managed_router_config(
     // Every LAN-denied apply, including allow->deny and refresh, verifies the
     // emergency block before any catch-all/rule mutation. Failed verification
     // returns before `set` and is retried on the next synchronization.
-    if config.exit_node && lan_denied {
+    if (config.exit_node && lan_denied) || leaving_exit_node {
+        // Removal is security-critical even when LAN access was allowed: the
+        // catch-all must not disappear until a verified kernel block covers
+        // the complete router transaction and every attempted inverse.
         ensure_managed_security_block(managed, SecurityBlockReason::Transition)?;
     }
     if let Err(error) = managed.router.set(config) {
@@ -2376,6 +2381,7 @@ mod tests {
         None,
         Block,
         Set,
+        Rollback,
         Unblock,
     }
 
@@ -2394,10 +2400,19 @@ mod tests {
             _config: &rustscale_router::RouterConfig,
         ) -> Result<(), rustscale_router::RouterError> {
             self.events.lock().unwrap().push("set");
-            if matches!(self.failure, RouterFailure::Set) {
-                Err(rustscale_router::RouterError::InvalidConfig(
-                    "injected set failure".into(),
-                ))
+            if matches!(self.failure, RouterFailure::Set | RouterFailure::Rollback) {
+                let primary =
+                    rustscale_router::RouterError::InvalidConfig("injected set failure".into());
+                if matches!(self.failure, RouterFailure::Rollback) {
+                    Err(rustscale_router::RouterError::Transaction {
+                        primary: Box::new(primary),
+                        rollback: vec![rustscale_router::RouterError::InvalidConfig(
+                            "injected inverse failure".into(),
+                        )],
+                    })
+                } else {
+                    Err(primary)
+                }
             } else {
                 Ok(())
             }
@@ -2575,7 +2590,7 @@ mod tests {
             exit_node: true,
             ..Default::default()
         };
-        apply_managed_router_config(&mut managed, &config, true, true).unwrap();
+        apply_managed_router_config(&mut managed, &config, true, false, true).unwrap();
         assert_eq!(*events.lock().unwrap(), ["block", "set", "unblock"]);
         assert!(managed.exit_node);
         assert!(!managed.security_block_attempted);
@@ -2590,7 +2605,7 @@ mod tests {
             exit_node: true,
             ..Default::default()
         };
-        apply_managed_router_config(&mut managed, &config, false, true).unwrap();
+        apply_managed_router_config(&mut managed, &config, false, false, true).unwrap();
         assert_eq!(*events.lock().unwrap(), ["block", "set", "unblock"]);
     }
 
@@ -2601,7 +2616,7 @@ mod tests {
             exit_node: true,
             ..Default::default()
         };
-        assert!(apply_managed_router_config(&mut managed, &config, true, true).is_err());
+        assert!(apply_managed_router_config(&mut managed, &config, true, false, true).is_err());
         assert_eq!(*events.lock().unwrap(), ["block"]);
         assert!(!managed.exit_node);
         assert!(managed.security_block_attempted);
@@ -2626,12 +2641,12 @@ mod tests {
             exit_node: true,
             ..Default::default()
         };
-        assert!(apply_managed_router_config(&mut managed, &config, true, true).is_err());
+        assert!(apply_managed_router_config(&mut managed, &config, true, false, true).is_err());
         assert_eq!(*events.lock().unwrap(), ["block"]);
         assert!(managed.security_block_attempted);
         assert!(!managed.security_block_verified);
 
-        apply_managed_router_config(&mut managed, &config, true, true).unwrap();
+        apply_managed_router_config(&mut managed, &config, true, false, true).unwrap();
         assert_eq!(
             *events.lock().unwrap(),
             ["block", "block", "set", "unblock"]
@@ -2677,13 +2692,13 @@ mod tests {
             exit_node: true,
             ..Default::default()
         };
-        assert!(apply_managed_router_config(&mut managed, &config, true, true).is_err());
+        assert!(apply_managed_router_config(&mut managed, &config, true, false, true).is_err());
         assert_eq!(*events.lock().unwrap(), ["block", "set", "unblock"]);
         assert!(managed.security_block_attempted);
         assert!(!managed.security_block_verified);
         assert!(managed.has_security_reasons());
 
-        apply_managed_router_config(&mut managed, &config, false, true).unwrap();
+        apply_managed_router_config(&mut managed, &config, false, false, true).unwrap();
         assert_eq!(
             *events.lock().unwrap(),
             ["block", "set", "unblock", "block", "set", "unblock"]
@@ -2702,7 +2717,7 @@ mod tests {
             exit_node: true,
             ..Default::default()
         };
-        apply_managed_router_config(&mut managed, &config, true, true).unwrap();
+        apply_managed_router_config(&mut managed, &config, true, false, true).unwrap();
         assert!(clear_managed_security_block_reason(
             &mut managed,
             SecurityBlockReason::LinkRefresh
@@ -2733,7 +2748,7 @@ mod tests {
                 exit_node: true,
                 ..Default::default()
             };
-            assert!(apply_managed_router_config(&mut managed, &config, true, true).is_err());
+            assert!(apply_managed_router_config(&mut managed, &config, true, false, true).is_err());
             assert_eq!(*events.lock().unwrap(), expected);
             assert!(managed.exit_node);
             assert!(managed.security_block_attempted);
@@ -2742,6 +2757,35 @@ mod tests {
                 matches!(failure, RouterFailure::Set)
             );
         }
+    }
+
+    #[test]
+    fn exit_removal_rollback_failure_retains_verified_kernel_and_userspace_blocks() {
+        let (mut managed, events) = ordered_managed_router(RouterFailure::Rollback);
+        managed.exit_node = true;
+        let exit = NodePrivate::generate().public();
+        let mut routes = RouteTable::default();
+        routes.set_exit_node(exit.clone());
+        let old_state = routes.exit_route_state();
+        routes.clear_exit_node();
+        let config = rustscale_router::RouterConfig::default();
+
+        let error = apply_managed_router_config(&mut managed, &config, false, true, false)
+            .expect_err("injected route rollback must fail");
+        assert!(error.to_string().contains("rollback failed"));
+        routes.restore_exit_route_state(old_state);
+        if managed.has_security_reasons() {
+            routes.block_exit_traffic();
+        }
+
+        assert_eq!(*events.lock().unwrap(), ["block", "set"]);
+        assert!(managed.exit_node);
+        assert!(managed.security_block_attempted);
+        assert!(managed.security_block_verified);
+        assert!(managed.has_security_reasons());
+        assert!(routes.exit_traffic_blocked());
+        assert_eq!(routes.exit_node(), Some(&exit));
+        assert!(routes.lookup("8.8.8.8".parse().unwrap()).is_none());
     }
 
     #[test]

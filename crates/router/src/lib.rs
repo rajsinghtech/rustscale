@@ -414,6 +414,18 @@ trait Platform: Send + Sync {
 
     fn release_ownership(&self) {}
 
+    /// Whether ownership adoption found emergency state left by a dead
+    /// process. Recovery is attempted only after the ownership claim.
+    fn stale_recovery_pending(&self) -> bool {
+        false
+    }
+
+    /// Verify and remove only the exact emergency state belonging to the
+    /// adopted owner. Foreign state must be left untouched and rejected.
+    fn recover_stale_state(&self, _runner: &mut dyn CommandRunner) -> Result<(), RouterError> {
+        Ok(())
+    }
+
     /// Idempotent stale-state cleanup performed before startup transaction.
     fn up_cleanup_commands(&self) -> Vec<CommandSpec> {
         Vec::new()
@@ -442,6 +454,7 @@ struct StatefulRouter<P, R> {
     is_up: bool,
     pending_cleanup: Vec<CommandSpec>,
     ownership_claimed: bool,
+    stale_recovery_pending: bool,
     direct_blocked: bool,
 }
 
@@ -455,6 +468,7 @@ impl<P: Platform, R: CommandRunner> StatefulRouter<P, R> {
             is_up: false,
             pending_cleanup: Vec::new(),
             ownership_claimed: false,
+            stale_recovery_pending: false,
             direct_blocked: false,
         }
     }
@@ -567,7 +581,14 @@ impl<P: Platform, R: CommandRunner> StatefulRouter<P, R> {
 
     fn apply_up(&mut self) -> Result<(), RouterError> {
         self.retry_pending_cleanup()?;
+        // Tear down exact stale routing state while an adopted emergency
+        // block is still active. Only then may recovery remove the block and
+        // begin the fresh startup transaction.
         self.apply_commands(self.platform.up_cleanup_commands())?;
+        if self.stale_recovery_pending {
+            self.platform.recover_stale_state(&mut self.runner)?;
+            self.stale_recovery_pending = false;
+        }
         let mut rollback = Vec::new();
         for ((program, args), inverse) in self.platform.up_transaction_commands() {
             match self.runner.run(&program, &args) {
@@ -599,9 +620,10 @@ impl<P: Platform, R: CommandRunner> Router for StatefulRouter<P, R> {
         if !self.ownership_claimed {
             self.platform.claim_ownership()?;
             self.ownership_claimed = true;
+            self.stale_recovery_pending = self.platform.stale_recovery_pending();
         }
         if let Err(error) = self.apply_up() {
-            if self.pending_cleanup.is_empty() {
+            if self.pending_cleanup.is_empty() && !self.stale_recovery_pending {
                 self.platform.release_ownership();
                 self.ownership_claimed = false;
             }
@@ -646,11 +668,20 @@ impl<P: Platform, R: CommandRunner> Router for StatefulRouter<P, R> {
     }
 
     fn close(&mut self) -> Result<(), RouterError> {
+        if self.stale_recovery_pending {
+            self.apply_commands(self.platform.up_cleanup_commands())?;
+            self.platform.recover_stale_state(&mut self.runner)?;
+            self.stale_recovery_pending = false;
+        }
         if !self.is_up
             && self.config.is_none()
             && self.pending_cleanup.is_empty()
             && !self.direct_blocked
         {
+            if self.ownership_claimed {
+                self.platform.release_ownership();
+                self.ownership_claimed = false;
+            }
             return Ok(());
         }
         // A shutdown is itself a security transition: establish the emergency
@@ -682,9 +713,13 @@ impl<P: Platform, R: CommandRunner> Router for StatefulRouter<P, R> {
 #[cfg(target_os = "macos")]
 struct DarwinPlatform {
     tun_name: String,
+    owner_token: String,
+    owner_file: std::path::PathBuf,
     block_anchor: String,
     block_file: std::path::PathBuf,
     block_file_error: Option<String>,
+    adopted_stale_owner: std::sync::atomic::AtomicBool,
+    adopted_pf_token: std::sync::Mutex<Option<String>>,
 }
 
 #[cfg(target_os = "macos")]
@@ -721,11 +756,115 @@ impl DarwinPlatform {
         })();
         Self {
             tun_name: tun_name.to_owned(),
+            owner_token: token.clone(),
+            owner_file: private_dir.join(format!("owner-{token}")),
             // macOS's system PF ruleset evaluates the com.apple/* wildcard.
             block_anchor: format!("com.apple/rustscale.{token}"),
             block_file,
             block_file_error: create_result.err().map(|error| error.to_string()),
+            adopted_stale_owner: std::sync::atomic::AtomicBool::new(false),
+            adopted_pf_token: std::sync::Mutex::new(None),
         }
+    }
+
+    fn owner_record(&self, pf_token: Option<&str>) -> String {
+        format!(
+            "1 {} {} {} {} {}\n",
+            std::process::id(),
+            self.owner_token,
+            self.tun_name,
+            self.block_anchor,
+            pf_token.unwrap_or("-")
+        )
+    }
+
+    fn write_owner_record(
+        &self,
+        pf_token: Option<&str>,
+        create_new: bool,
+    ) -> Result<(), RouterError> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let target = if create_new {
+            self.owner_file.clone()
+        } else {
+            self.owner_file.with_extension(format!(
+                "replace-{}-{}",
+                std::process::id(),
+                self.owner_token
+            ))
+        };
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&target)
+            .map_err(RouterError::Io)?;
+        if let Err(error) = file
+            .write_all(self.owner_record(pf_token).as_bytes())
+            .and_then(|()| file.sync_all())
+        {
+            let _ = std::fs::remove_file(&target);
+            return Err(RouterError::Io(error));
+        }
+        if !create_new {
+            if let Err(error) = std::fs::rename(&target, &self.owner_file) {
+                let _ = std::fs::remove_file(target);
+                return Err(RouterError::Io(error));
+            }
+        }
+        Ok(())
+    }
+
+    fn parse_owner_record(&self, record: &str) -> Result<(u32, Option<String>), RouterError> {
+        let fields: Vec<_> = record.split_whitespace().collect();
+        if fields.len() != 6
+            || fields[0] != "1"
+            || fields[2] != self.owner_token
+            || fields[3] != self.tun_name
+            || fields[4] != self.block_anchor
+        {
+            return Err(RouterError::InvalidConfig(
+                "foreign or malformed Darwin PF ownership record".into(),
+            ));
+        }
+        let pid = fields[1].parse::<u32>().map_err(|_| {
+            RouterError::InvalidConfig("malformed Darwin PF owner process ID".into())
+        })?;
+        let pf_token = match fields[5] {
+            "-" => None,
+            token if token.bytes().all(|byte| byte.is_ascii_digit()) => Some(token.to_owned()),
+            _ => {
+                return Err(RouterError::InvalidConfig(
+                    "malformed Darwin PF enable token".into(),
+                ));
+            }
+        };
+        Ok((pid, pf_token))
+    }
+
+    fn record_pf_token(&self, token: Option<&str>) -> Result<(), RouterError> {
+        if token.is_some_and(|token| !token.bytes().all(|byte| byte.is_ascii_digit())) {
+            return Err(RouterError::InvalidConfig(
+                "pfctl returned a non-numeric enable token".into(),
+            ));
+        }
+        let metadata = std::fs::symlink_metadata(&self.owner_file).map_err(RouterError::Io)?;
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            return Err(RouterError::InvalidConfig(
+                "Darwin PF owner record is not a regular file".into(),
+            ));
+        }
+        let record = std::fs::read_to_string(&self.owner_file).map_err(RouterError::Io)?;
+        if !self
+            .parse_owner_record(&record)
+            .is_ok_and(|(pid, _)| pid == std::process::id())
+        {
+            return Err(RouterError::InvalidConfig(
+                "Darwin PF owner record changed before token update".into(),
+            ));
+        }
+        self.write_owner_record(token, false)
     }
 
     fn route(&self, verb: &str, prefix: IpPrefix) -> (String, Vec<String>) {
@@ -798,10 +937,117 @@ impl Platform for DarwinPlatform {
                 "PF rules file is not a private owner-only regular file".into(),
             ));
         }
+
+        match self.write_owner_record(None, true) {
+            Ok(()) => Ok(()),
+            Err(RouterError::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let owner_metadata =
+                    std::fs::symlink_metadata(&self.owner_file).map_err(RouterError::Io)?;
+                if !owner_metadata.file_type().is_file()
+                    || owner_metadata.file_type().is_symlink()
+                    || owner_metadata.uid() != parent_metadata.uid()
+                    || owner_metadata.permissions().mode() & 0o077 != 0
+                {
+                    return Err(RouterError::InvalidConfig(
+                        "Darwin PF ownership record is not private owner state".into(),
+                    ));
+                }
+                let record = std::fs::read_to_string(&self.owner_file).map_err(RouterError::Io)?;
+                let (pid, pf_token) = self.parse_owner_record(&record)?;
+                if pid == std::process::id() {
+                    return Ok(());
+                }
+                let live = Command::new("kill")
+                    .args(["-0", &pid.to_string()])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .is_ok_and(|status| status.success());
+                if live {
+                    return Err(RouterError::InvalidConfig(format!(
+                        "Darwin PF owner {pid} is still active for {}",
+                        self.tun_name
+                    )));
+                }
+                // Atomically replace the dead owner's record while
+                // carrying its PF token forward. A second crash before
+                // anchor recovery must still leave enough durable state
+                // for the next process to release that token.
+                self.write_owner_record(pf_token.as_deref(), false)?;
+                self.adopted_stale_owner
+                    .store(true, std::sync::atomic::Ordering::Release);
+                *self.adopted_pf_token.lock().map_err(|_| {
+                    RouterError::InvalidConfig("Darwin PF token ownership lock poisoned".into())
+                })? = pf_token;
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn release_ownership(&self) {
+        let Ok(record) = std::fs::read_to_string(&self.owner_file) else {
+            return;
+        };
+        if self
+            .parse_owner_record(&record)
+            .is_ok_and(|(pid, _)| pid == std::process::id())
+        {
+            let _ = std::fs::remove_file(&self.owner_file);
+        }
+    }
+
+    fn stale_recovery_pending(&self) -> bool {
+        self.adopted_stale_owner
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn recover_stale_state(&self, runner: &mut dyn CommandRunner) -> Result<(), RouterError> {
+        if !self.stale_recovery_pending() {
+            return Ok(());
+        }
+        let query = vec!["-a".into(), self.block_anchor.clone(), "-sr".into()];
+        let rules = runner.output("pfctl", &query)?;
+        if !rules.trim().is_empty() {
+            if !pf_block_rules_exact(&rules, &self.tun_name) {
+                return Err(RouterError::InvalidConfig(
+                    "refusing to remove foreign rules from adopted Darwin PF anchor".into(),
+                ));
+            }
+            let (program, args) = self.commands(&RouterOperation::DisableDirectBlock)[0].clone();
+            runner.run(&program, &args)?;
+            if !runner.output("pfctl", &query)?.trim().is_empty() {
+                return Err(RouterError::InvalidConfig(
+                    "adopted Darwin PF anchor remained non-empty after cleanup".into(),
+                ));
+            }
+        }
+        let token = self
+            .adopted_pf_token
+            .lock()
+            .map_err(|_| {
+                RouterError::InvalidConfig("Darwin PF token ownership lock poisoned".into())
+            })?
+            .clone();
+        if let Some(token) = token {
+            runner.run("pfctl", &["-X".into(), token])?;
+        }
+        self.record_pf_token(None)?;
+        *self.adopted_pf_token.lock().map_err(|_| {
+            RouterError::InvalidConfig("Darwin PF token ownership lock poisoned".into())
+        })? = None;
+        self.adopted_stale_owner
+            .store(false, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 
-    fn release_ownership(&self) {}
+    fn up_cleanup_commands(&self) -> Vec<CommandSpec> {
+        if self.stale_recovery_pending() {
+            self.exit_routes("delete")
+        } else {
+            Vec::new()
+        }
+    }
 
     fn commands(&self, operation: &RouterOperation) -> Vec<(String, Vec<String>)> {
         match operation {
@@ -876,8 +1122,22 @@ fn pf_enable_token(output: &str) -> Option<String> {
 }
 
 #[cfg(target_os = "macos")]
+fn pf_block_rules_exact(rules: &str, tun_name: &str) -> bool {
+    let lines: Vec<_> = rules
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    if lines.len() != 1 {
+        return false;
+    }
+    let base = format!("block drop out quick on ! {tun_name} all");
+    lines[0] == base || lines[0] == format!("{base} flags S/SA")
+}
+
+#[cfg(target_os = "macos")]
 fn pf_block_active(rules: &str, tun_name: &str) -> bool {
-    rules.contains("block drop out quick") && rules.contains(&format!("! {tun_name}"))
+    pf_block_rules_exact(rules, tun_name)
 }
 
 #[cfg(target_os = "macos")]
@@ -909,6 +1169,10 @@ impl DarwinRouter {
         let token = pf_enable_token(&enabled).ok_or_else(|| {
             RouterError::InvalidConfig("pfctl enabled PF without returning a teardown token".into())
         })?;
+        if let Err(error) = self.inner.platform.record_pf_token(Some(&token)) {
+            let _ = self.inner.runner.run("pfctl", &["-X".into(), token]);
+            return Err(error);
+        }
         self.pf_enable_token = Some(token);
         Ok(())
     }
@@ -935,6 +1199,7 @@ impl DarwinRouter {
     fn release_pf_enable_token(&mut self) -> Result<(), RouterError> {
         if let Some(token) = self.pf_enable_token.clone() {
             self.inner.runner.run("pfctl", &["-X".into(), token])?;
+            self.inner.platform.record_pf_token(None)?;
             self.pf_enable_token = None;
         }
         Ok(())
@@ -970,14 +1235,29 @@ impl Router for DarwinRouter {
     }
     fn close(&mut self) -> Result<(), RouterError> {
         self.block_direct()?;
-        self.inner.close()?;
-        self.verify_pf_block(false)?;
-        self.release_pf_enable_token()?;
-        match std::fs::remove_file(&self.inner.platform.block_file) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(RouterError::Io(error)),
+        // StatefulRouter normally releases ownership after its final unblock.
+        // Darwin must retain the owner record until the PF enable token has
+        // also been released and durably cleared.
+        let owned = self.inner.ownership_claimed;
+        self.inner.ownership_claimed = false;
+        let result = (|| {
+            self.inner.close()?;
+            self.verify_pf_block(false)?;
+            self.release_pf_enable_token()?;
+            match std::fs::remove_file(&self.inner.platform.block_file) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(RouterError::Io(error)),
+            }
+        })();
+        if result.is_ok() {
+            if owned {
+                self.inner.platform.release_ownership();
+            }
+        } else {
+            self.inner.ownership_claimed = owned;
         }
+        result
     }
 }
 
@@ -985,6 +1265,7 @@ impl Router for DarwinRouter {
 struct LinuxPlatform {
     tun_name: String,
     rule_base: Option<u32>,
+    adopted_stale_owner: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(target_os = "linux")]
@@ -999,6 +1280,7 @@ impl LinuxPlatform {
         Self {
             tun_name: tun_name.to_owned(),
             rule_base: interface_index.map(Self::rule_base_for_index),
+            adopted_stale_owner: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -1007,6 +1289,7 @@ impl LinuxPlatform {
         Self {
             tun_name: tun_name.to_owned(),
             rule_base: Some(Self::rule_base_for_index(interface_index)),
+            adopted_stale_owner: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -1084,6 +1367,23 @@ impl LinuxPlatform {
 }
 
 #[cfg(target_os = "linux")]
+fn linux_direct_block_line_exact(line: &str, pref: u32) -> bool {
+    let expected = [
+        format!("{pref}:"),
+        "not".into(),
+        "from".into(),
+        "all".into(),
+        "fwmark".into(),
+        "0x80000/0xff0000".into(),
+        "unreachable".into(),
+        "proto".into(),
+        LinuxPlatform::RULE_PROTOCOL.to_string(),
+    ];
+    line.split_whitespace()
+        .eq(expected.iter().map(String::as_str))
+}
+
+#[cfg(target_os = "linux")]
 fn linux_rule_owner_dir() -> std::path::PathBuf {
     #[cfg(test)]
     return std::env::temp_dir().join(format!("rustscale-rule-owners-{}", std::process::id()));
@@ -1092,47 +1392,83 @@ fn linux_rule_owner_dir() -> std::path::PathBuf {
 }
 
 #[cfg(target_os = "linux")]
-fn claim_linux_rule_owner_file(base: u32, tun_name: &str) -> Result<(), RouterError> {
+fn claim_linux_rule_owner_file(base: u32, tun_name: &str) -> Result<bool, RouterError> {
     use std::io::Write;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
     let dir = linux_rule_owner_dir();
     std::fs::create_dir_all(&dir).map_err(RouterError::Io)?;
+    let dir_metadata = std::fs::symlink_metadata(&dir).map_err(RouterError::Io)?;
+    if !dir_metadata.file_type().is_dir() || dir_metadata.file_type().is_symlink() {
+        return Err(RouterError::InvalidConfig(
+            "Linux rule owner registry is not a directory".into(),
+        ));
+    }
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+        .map_err(RouterError::Io)?;
     let path = dir.join(base.to_string());
     let identity = format!("{} {tun_name}\n", std::process::id());
-    for _ in 0..2 {
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(mut file) => {
-                file.write_all(identity.as_bytes())
-                    .map_err(RouterError::Io)?;
-                return Ok(());
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let existing = std::fs::read_to_string(&path).unwrap_or_default();
-                if existing == identity {
-                    return Ok(());
-                }
-                let live = existing
-                    .split_whitespace()
-                    .next()
-                    .and_then(|pid| pid.parse::<u32>().ok())
-                    .is_some_and(|pid| std::path::Path::new(&format!("/proc/{pid}")).exists());
-                if live {
-                    return Err(RouterError::InvalidConfig(format!(
-                        "Linux policy-rule ownership collision at base {base}: {}",
-                        existing.trim()
-                    )));
-                }
-                std::fs::remove_file(&path).map_err(RouterError::Io)?;
-            }
-            Err(error) => return Err(RouterError::Io(error)),
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+    {
+        Ok(mut file) => {
+            file.write_all(identity.as_bytes())
+                .map_err(RouterError::Io)?;
+            file.sync_all().map_err(RouterError::Io)?;
+            Ok(false)
         }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata = std::fs::symlink_metadata(&path).map_err(RouterError::Io)?;
+            if !metadata.file_type().is_file()
+                || metadata.file_type().is_symlink()
+                || metadata.uid() != dir_metadata.uid()
+                || metadata.permissions().mode() & 0o077 != 0
+            {
+                return Err(RouterError::InvalidConfig(
+                    "Linux rule owner record is not private owner state".into(),
+                ));
+            }
+            let existing = std::fs::read_to_string(&path).map_err(RouterError::Io)?;
+            if existing == identity {
+                return Ok(false);
+            }
+            let fields: Vec<_> = existing.split_whitespace().collect();
+            if fields.len() != 2 || fields[1].is_empty() {
+                return Err(RouterError::InvalidConfig(
+                    "malformed Linux policy-rule ownership record".into(),
+                ));
+            }
+            let pid = fields[0].parse::<u32>().map_err(|_| {
+                RouterError::InvalidConfig("malformed Linux policy-rule owner process ID".into())
+            })?;
+            let live = std::path::Path::new(&format!("/proc/{pid}")).exists();
+            if live {
+                return Err(RouterError::InvalidConfig(format!(
+                    "Linux policy-rule ownership collision at base {base}: {}",
+                    existing.trim()
+                )));
+            }
+            let replacement = dir.join(format!(".{base}.replace-{}", std::process::id()));
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&replacement)
+                .map_err(RouterError::Io)?;
+            if let Err(error) = file
+                .write_all(identity.as_bytes())
+                .and_then(|()| file.sync_all())
+                .and_then(|()| std::fs::rename(&replacement, &path))
+            {
+                let _ = std::fs::remove_file(replacement);
+                return Err(RouterError::Io(error));
+            }
+            Ok(true)
+        }
+        Err(error) => Err(RouterError::Io(error)),
     }
-    Err(RouterError::InvalidConfig(format!(
-        "could not claim Linux policy-rule base {base}"
-    )))
 }
 
 #[cfg(target_os = "linux")]
@@ -1158,7 +1494,9 @@ impl Platform for LinuxPlatform {
             .map_err(|_| RouterError::InvalidConfig("Linux rule owner registry poisoned".into()))?;
         match owners.get_mut(&base) {
             None => {
-                claim_linux_rule_owner_file(base, &self.tun_name)?;
+                let adopted = claim_linux_rule_owner_file(base, &self.tun_name)?;
+                self.adopted_stale_owner
+                    .store(adopted, std::sync::atomic::Ordering::Release);
                 owners.insert(base, (self.tun_name.clone(), 1));
                 Ok(())
             }
@@ -1205,6 +1543,75 @@ impl Platform for LinuxPlatform {
                 }
             }
         }
+    }
+
+    fn stale_recovery_pending(&self) -> bool {
+        self.adopted_stale_owner
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn recover_stale_state(&self, runner: &mut dyn CommandRunner) -> Result<(), RouterError> {
+        if !self.stale_recovery_pending() {
+            return Ok(());
+        }
+        let checks = self.direct_block_checks();
+        let disables = self.commands(&RouterOperation::DisableDirectBlock);
+        let enables = self.commands(&RouterOperation::EnableDirectBlock);
+        let pref = self.rule_base.unwrap_or(5_200);
+        let mut active = Vec::with_capacity(checks.len());
+        for ((program, args), _) in &checks {
+            let output = runner.output(program, args)?;
+            active.push(
+                output
+                    .lines()
+                    .any(|line| linux_direct_block_line_exact(line, pref)),
+            );
+        }
+
+        let mut rollback = Vec::new();
+        for (index, is_active) in active.into_iter().enumerate() {
+            if !is_active {
+                continue;
+            }
+            let (program, args) = &disables[index];
+            match runner.run(program, args) {
+                Ok(()) => rollback.push(enables[index].clone()),
+                Err(error) if error.non_fatal() => {}
+                Err(error) => {
+                    let mut rollback_errors = Vec::new();
+                    for (program, args) in rollback.into_iter().rev() {
+                        if let Err(rollback_error) = runner.run(&program, &args) {
+                            if !rollback_error.non_fatal() {
+                                rollback_errors.push(rollback_error);
+                            }
+                        }
+                    }
+                    return if rollback_errors.is_empty() {
+                        Err(error)
+                    } else {
+                        Err(RouterError::Transaction {
+                            primary: Box::new(error),
+                            rollback: rollback_errors,
+                        })
+                    };
+                }
+            }
+        }
+
+        for ((program, args), _) in checks {
+            let output = runner.output(&program, &args)?;
+            if output
+                .lines()
+                .any(|line| linux_direct_block_line_exact(line, pref))
+            {
+                return Err(RouterError::InvalidConfig(
+                    "stale Linux direct-traffic block remained after exact cleanup".into(),
+                ));
+            }
+        }
+        self.adopted_stale_owner
+            .store(false, std::sync::atomic::Ordering::Release);
+        Ok(())
     }
 
     fn direct_block_checks(&self) -> Vec<(CommandSpec, Vec<String>)> {
@@ -1362,8 +1769,14 @@ impl Platform for LinuxPlatform {
 
     fn up_cleanup_commands(&self) -> Vec<CommandSpec> {
         // Delete broadly-selected managed priorities before the transaction.
-        // These commands remove only rustscale's reserved priorities.
-        self.policy_rules(false)
+        // These commands remove only rustscale's reserved priorities. When a
+        // dead owner was adopted, remove its exact catch-alls while the
+        // emergency rule still blocks direct fallback.
+        let mut commands = self.policy_rules(false);
+        if self.stale_recovery_pending() {
+            commands.extend(self.commands(&RouterOperation::RemoveExitRoutes));
+        }
+        commands
     }
 
     fn up_transaction_commands(&self) -> Vec<(CommandSpec, CommandSpec)> {
@@ -1737,6 +2150,40 @@ mod tests {
         assert!(!ipv4.non_fatal());
     }
 
+    struct StaleRecoveryPlatform;
+
+    impl Platform for StaleRecoveryPlatform {
+        fn commands(&self, _operation: &RouterOperation) -> Vec<CommandSpec> {
+            Vec::new()
+        }
+
+        fn stale_recovery_pending(&self) -> bool {
+            true
+        }
+
+        fn up_cleanup_commands(&self) -> Vec<CommandSpec> {
+            vec![("order".into(), vec!["cleanup".into()])]
+        }
+
+        fn recover_stale_state(&self, runner: &mut dyn CommandRunner) -> Result<(), RouterError> {
+            runner.run("order", &["recover".into()])
+        }
+    }
+
+    #[test]
+    fn stale_routes_are_cleaned_before_emergency_block_recovery() {
+        let mut router = StatefulRouter::new(
+            StaleRecoveryPlatform,
+            TransactionRunner {
+                commands: Vec::new(),
+                fail_at: None,
+                fail_also_at: None,
+            },
+        );
+        router.up().unwrap();
+        assert_eq!(router.runner.commands, ["cleanup", "recover"]);
+    }
+
     #[test]
     fn no_op_set_records_no_operations() {
         let mut router = FakeRouter::default();
@@ -1840,6 +2287,94 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
+    struct PfStateRunner {
+        rules: String,
+        commands: Vec<CommandSpec>,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl CommandRunner for PfStateRunner {
+        fn run(&mut self, program: &str, args: &[String]) -> Result<(), RouterError> {
+            self.commands.push((program.into(), args.to_vec()));
+            if args.windows(2).any(|pair| pair == ["-F", "rules"]) {
+                self.rules.clear();
+            }
+            Ok(())
+        }
+
+        fn output(&mut self, program: &str, args: &[String]) -> Result<String, RouterError> {
+            self.commands.push((program.into(), args.to_vec()));
+            Ok(self.rules.clone())
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_adopts_exact_stale_anchor_and_enable_token() {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let state_dir = std::env::temp_dir().join(format!(
+            "rustscale-router-stale-pf-test-{}",
+            std::process::id()
+        ));
+        let platform = DarwinPlatform::new("utun40", Some(&state_dir));
+        let mut owner = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&platform.owner_file)
+            .unwrap();
+        writeln!(
+            owner,
+            "1 {} {} {} {} 12345",
+            u32::MAX,
+            platform.owner_token,
+            platform.tun_name,
+            platform.block_anchor
+        )
+        .unwrap();
+        drop(owner);
+
+        platform.claim_ownership().unwrap();
+        assert!(platform.stale_recovery_pending());
+        let mut runner = PfStateRunner {
+            rules: "block drop out quick on ! utun40 all flags S/SA\n".into(),
+            commands: Vec::new(),
+        };
+        platform.recover_stale_state(&mut runner).unwrap();
+        assert!(runner.rules.is_empty());
+        assert!(runner
+            .commands
+            .iter()
+            .any(|(_, args)| args.windows(2).any(|pair| pair == ["-X", "12345"])));
+        platform.release_ownership();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_stale_recovery_refuses_foreign_anchor_rules() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "rustscale-router-foreign-pf-test-{}",
+            std::process::id()
+        ));
+        let platform = DarwinPlatform::new("utun41", Some(&state_dir));
+        platform
+            .adopted_stale_owner
+            .store(true, std::sync::atomic::Ordering::Release);
+        let foreign = "block drop out quick on ! utun41 all\npass out all\n";
+        let mut runner = PfStateRunner {
+            rules: foreign.into(),
+            commands: Vec::new(),
+        };
+        assert!(platform.recover_stale_state(&mut runner).is_err());
+        assert_eq!(runner.rules, foreign);
+        assert!(runner
+            .commands
+            .iter()
+            .all(|(_, args)| !args.windows(2).any(|pair| pair == ["-F", "rules"])));
+    }
+
+    #[cfg(target_os = "macos")]
     #[test]
     fn darwin_emergency_block_uses_evaluated_pf_anchor_and_all_non_tun_interfaces() {
         let state_dir =
@@ -1891,6 +2426,131 @@ mod tests {
             let foreign = format!("{pref}: from all unreachable proto 99\n");
             assert!(!fragments.iter().all(|fragment| foreign.contains(fragment)));
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    struct RuleStateRunner {
+        rules: std::collections::HashMap<String, String>,
+        commands: Vec<CommandSpec>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl CommandRunner for RuleStateRunner {
+        fn run(&mut self, program: &str, args: &[String]) -> Result<(), RouterError> {
+            self.commands.push((program.into(), args.to_vec()));
+            let family = args.first().cloned().unwrap_or_default();
+            if args.iter().any(|arg| arg == "del") {
+                self.rules.remove(&family);
+            } else if args.iter().any(|arg| arg == "add") {
+                let pref = args
+                    .windows(2)
+                    .find_map(|pair| (pair[0] == "pref").then_some(pair[1].clone()))
+                    .unwrap_or_default();
+                self.rules.insert(
+                    family,
+                    format!(
+                        "{pref}: not from all fwmark 0x80000/0xff0000 unreachable proto {}\n",
+                        LinuxPlatform::RULE_PROTOCOL
+                    ),
+                );
+            }
+            Ok(())
+        }
+
+        fn output(&mut self, program: &str, args: &[String]) -> Result<String, RouterError> {
+            self.commands.push((program.into(), args.to_vec()));
+            Ok(args
+                .first()
+                .and_then(|family| self.rules.get(family))
+                .cloned()
+                .unwrap_or_default())
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_startup_claim_marks_dead_owner_for_recovery() {
+        use std::io::Write as _;
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        let platform = LinuxPlatform::new_with_interface_index("stale-owner0", 177);
+        let base = platform.rule_base.unwrap();
+        let dir = linux_rule_owner_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.join(base.to_string());
+        let _ = std::fs::remove_file(&path);
+        let mut owner = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        writeln!(owner, "{} stale-owner0", u32::MAX).unwrap();
+        owner.sync_all().unwrap();
+
+        platform.claim_ownership().unwrap();
+        assert!(platform.stale_recovery_pending());
+        platform.release_ownership();
+        assert!(!path.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_adopts_and_removes_only_exact_stale_direct_blocks() {
+        let platform = LinuxPlatform::new_with_interface_index("tailscale0", 2);
+        platform
+            .adopted_stale_owner
+            .store(true, std::sync::atomic::Ordering::Release);
+        let pref = platform.rule_base.unwrap();
+        let owned = format!(
+            "{pref}: not from all fwmark 0x80000/0xff0000 unreachable proto {}\n",
+            LinuxPlatform::RULE_PROTOCOL
+        );
+        let mut runner = RuleStateRunner {
+            rules: std::collections::HashMap::from([
+                ("-4".into(), owned.clone()),
+                ("-6".into(), owned),
+            ]),
+            commands: Vec::new(),
+        };
+
+        platform.recover_stale_state(&mut runner).unwrap();
+        assert!(runner.rules.is_empty());
+        assert!(!platform.stale_recovery_pending());
+        assert_eq!(
+            runner
+                .commands
+                .iter()
+                .filter(|(_, args)| args.iter().any(|arg| arg == "del"))
+                .count(),
+            2
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_stale_recovery_preserves_foreign_same_base_rules() {
+        let platform = LinuxPlatform::new_with_interface_index("tailscale0", 2);
+        platform
+            .adopted_stale_owner
+            .store(true, std::sync::atomic::Ordering::Release);
+        let pref = platform.rule_base.unwrap();
+        let foreign = format!("{pref}: from all unreachable proto 99\n");
+        let mut runner = RuleStateRunner {
+            rules: std::collections::HashMap::from([
+                ("-4".into(), foreign.clone()),
+                ("-6".into(), foreign.clone()),
+            ]),
+            commands: Vec::new(),
+        };
+
+        platform.recover_stale_state(&mut runner).unwrap();
+        assert_eq!(runner.rules.get("-4"), Some(&foreign));
+        assert_eq!(runner.rules.get("-6"), Some(&foreign));
+        assert!(runner
+            .commands
+            .iter()
+            .all(|(_, args)| !args.iter().any(|arg| arg == "del")));
     }
 
     #[cfg(target_os = "linux")]

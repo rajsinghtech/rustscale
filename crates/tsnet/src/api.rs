@@ -69,6 +69,7 @@ impl Server {
     /// Returns `None` if the server is not up.
     pub async fn ipn_status(&self) -> Option<rustscale_ipnstate::Status> {
         let inner = self.inner.as_ref()?;
+        let _map_snapshot = inner.peer_map.gate.read().await;
         let peers = inner.peers.read().await;
         let user_profiles = inner.user_profiles.read().await;
         let dns_config = inner.dns_config.read().await;
@@ -135,6 +136,7 @@ impl Server {
             ps.InEngine = true;
         });
 
+        let selected_exit_key = inner.route_table.read().await.exit_node().cloned();
         for peer in peers.iter() {
             if peer.Key.is_zero() {
                 continue;
@@ -156,11 +158,15 @@ impl Server {
             let exit_node_option = crate::peer_is_exit_capable(peer);
 
             let ps = rustscale_ipnstate::PeerStatus {
+                ID: peer.StableID.clone(),
+                NodeID: peer.ID,
+                PublicKey: peer.Key.to_string(),
                 HostName: peer.Name.trim_end_matches('.').to_string(),
                 DNSName: peer.Name.clone(),
                 TailscaleIPs: ips,
                 Online: peer.Online.unwrap_or(false),
                 Relay: relay,
+                ExitNode: selected_exit_key.as_ref() == Some(&peer.Key),
                 ExitNodeOption: exit_node_option,
                 InNetworkMap: true,
                 InMagicSock: true,
@@ -175,10 +181,8 @@ impl Server {
             sb.add_user(*id, profile.clone());
         }
 
-        let exit_node_status = {
-            let routes = inner.route_table.read().await;
-            crate::status::selected_exit_node_status(&peers, routes.exit_node())
-        };
+        let exit_node_status =
+            crate::status::selected_exit_node_status(&peers, selected_exit_key.as_ref());
         sb.mutate_status(|status| status.ExitNodeStatus = exit_node_status);
 
         Some(sb.status())
@@ -464,6 +468,9 @@ impl Server {
                 next_prefs.ExitNodeAllowLANAccess,
             ) {
                 routes.restore_exit_route_state(old_exit_state);
+                if kernel_security_block_latched(router) {
+                    routes.block_exit_traffic();
+                }
                 return Err(route_error_with_prefs_rollback(
                     self.config.state_dir.as_ref(),
                     &old_prefs,
@@ -518,6 +525,9 @@ impl Server {
                 next_prefs.ExitNodeAllowLANAccess,
             ) {
                 routes.restore_exit_route_state(old_exit_state);
+                if kernel_security_block_latched(router) {
+                    routes.block_exit_traffic();
+                }
                 return Err(route_error_with_prefs_rollback(
                     self.config.state_dir.as_ref(),
                     &old_prefs,

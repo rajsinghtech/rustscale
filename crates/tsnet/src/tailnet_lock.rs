@@ -255,6 +255,47 @@ impl TailnetLock {
         control
     }
 
+    /// Whether applying this control state can change peer authorization.
+    /// Callers use this before any network await to revoke the currently
+    /// published data plane. Repeated ready advertisements at the same head
+    /// deliberately return false.
+    pub(crate) fn control_change_requires_revocation(
+        &self,
+        info: Option<&TKAInfo>,
+        initial: bool,
+    ) -> bool {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match info {
+            Some(info) if !info.Disabled => {
+                if !inner.required || !inner.ready {
+                    return true;
+                }
+                let Ok(wanted) = info.Head.parse::<rustscale_tka::AumHash>() else {
+                    return true;
+                };
+                inner.authority.as_ref().map(Authority::head) != Some(wanted)
+            }
+            Some(_) => inner.required || inner.authority.is_some(),
+            None if initial => inner.required || inner.authority.is_some(),
+            None => false,
+        }
+    }
+
+    pub(crate) fn authorization_ready(&self) -> bool {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if inner.required || inner.authority.is_some() {
+            inner.ready && inner.authority.is_some()
+        } else {
+            inner.ready
+        }
+    }
+
     /// Apply an initial or delta TKAInfo. The caller must filter peers after
     /// this returns regardless of success.
     pub(crate) async fn apply_control_info(
@@ -1008,5 +1049,56 @@ fn filtered_peer(peer: &Node, reason: &'static str) -> FilteredPeer {
         node_key: peer.Key.clone(),
         tailscale_ips: peer.Addresses.clone(),
         reason,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustscale_key::{MachinePrivate, NLPrivate, NodePrivate};
+
+    fn unlocked_runtime() -> Arc<TailnetLock> {
+        TailnetLock::open(TailnetLockParams {
+            control_url: "http://127.0.0.1:1".into(),
+            machine_key: MachinePrivate::generate(),
+            server_pub_key: MachinePrivate::generate().public(),
+            node_key: NodePrivate::generate(),
+            signing_key: NLPrivate::generate(),
+            capability_version: 141,
+            protocol_version: 141,
+            state_dir: None,
+            extra_root_certs: None,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn control_change_revocation_predicate_is_fail_closed_without_churn() {
+        let lock = unlocked_runtime();
+        assert!(!lock.control_change_requires_revocation(None, false));
+        assert!(!lock.control_change_requires_revocation(None, true));
+        assert!(!lock.control_change_requires_revocation(
+            Some(&TKAInfo {
+                Disabled: true,
+                ..Default::default()
+            }),
+            false,
+        ));
+        assert!(lock.control_change_requires_revocation(
+            Some(&TKAInfo {
+                Head: "malformed-new-head".into(),
+                Disabled: false,
+            }),
+            false,
+        ));
+
+        lock.require_fresh_control_state();
+        assert!(lock.control_change_requires_revocation(
+            Some(&TKAInfo {
+                Disabled: true,
+                ..Default::default()
+            }),
+            false,
+        ));
     }
 }

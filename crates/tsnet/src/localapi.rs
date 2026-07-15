@@ -957,6 +957,9 @@ async fn apply_exit_node_prefs_locked(
             prefs.ExitNodeAllowLANAccess,
         ) {
             routes.restore_exit_route_state(old_exit_state);
+            if crate::kernel_security_block_latched(router) {
+                routes.block_exit_traffic();
+            }
             return Err(error.to_string());
         }
     }
@@ -1831,14 +1834,14 @@ async fn handle_debug_capture<W: AsyncWrite + Unpin>(
 ///   `AllowedIPs`, `Tags`, `PrimaryRoutes`, `Capabilities`, `CapMap`,
 ///   `PeerAPIURL`, `SSH_HostKeys`, `KeyExpiry`, `Location`.
 /// - `ExitNodeStatus`: included when an exit node is selected via the
-///   route table, but `ID` is derived from the peer's node key (not a
-///   stable node ID, which rustscale does not track).
+///   route table and identifies it by its control-stable node ID.
 /// - `ClientVersion`, `ExtraRecords`, `AuthURL`: omitted.
 /// - `CertDomains`: included (from the live DNSConfig).
 /// - `Peer` is a JSON object keyed by node public key string (same as Go).
 /// - `TUN`: true when the server was started via `up_tun()`.
 /// - `SuggestedExitNode`: omitted (Go does not emit it in ipnstate.Status).
 async fn build_status_json(state: &LocalApiState) -> serde_json::Value {
+    let _map_snapshot = state.peer_map.gate.read().await;
     let peers = state.peers.read().await;
     let user_profiles = state.user_profiles.read().await;
     let dns_config = state.dns_config.read().await;
@@ -1905,6 +1908,11 @@ async fn build_status_json(state: &LocalApiState) -> serde_json::Value {
     });
 
     // Peers.
+    let selected_exit_key = if let Some(routes) = state.route_table.as_ref() {
+        routes.read().await.exit_node().cloned()
+    } else {
+        None
+    };
     for peer in peers.iter() {
         if peer.Key.is_zero() {
             continue;
@@ -1924,11 +1932,15 @@ async fn build_status_json(state: &LocalApiState) -> serde_json::Value {
         let exit_node_option = crate::peer_is_exit_capable(peer);
 
         let ps = PeerStatus {
+            ID: peer.StableID.clone(),
+            NodeID: peer.ID,
+            PublicKey: peer.Key.to_string(),
             HostName: peer.Name.trim_end_matches('.').to_string(),
             DNSName: peer.Name.clone(),
             TailscaleIPs: ips,
             Online: peer.Online.unwrap_or(false),
             Relay: relay,
+            ExitNode: selected_exit_key.as_ref() == Some(&peer.Key),
             ExitNodeOption: exit_node_option,
             InNetworkMap: true,
             InMagicSock: true,
@@ -1944,12 +1956,8 @@ async fn build_status_json(state: &LocalApiState) -> serde_json::Value {
         sb.add_user(*id, profile.clone());
     }
 
-    let exit_node_status = if let Some(routes) = state.route_table.as_ref() {
-        let routes = routes.read().await;
-        crate::status::selected_exit_node_status(&peers, routes.exit_node())
-    } else {
-        None
-    };
+    let exit_node_status =
+        crate::status::selected_exit_node_status(&peers, selected_exit_key.as_ref());
     sb.mutate_status(|status| status.ExitNodeStatus = exit_node_status);
 
     serde_json::to_value(sb.status()).unwrap_or(serde_json::Value::Null)
@@ -3950,6 +3958,7 @@ mod tests {
 
         let peer = Node {
             ID: 1,
+            StableID: "n-stable-peer1".into(),
             Name: "peer1.tailnet.ts.net.".into(),
             Key: node_key.public(),
             Addresses: vec!["100.64.0.2/32".into()],
@@ -4805,8 +4814,9 @@ mod tests {
             .route_table = Some(routes.clone());
 
         let json = build_status_json(&state).await;
-        assert_eq!(json["ExitNodeStatus"]["ID"], exit_key.to_string());
+        assert_eq!(json["ExitNodeStatus"]["ID"], "n-stable-peer1");
         assert_eq!(json["ExitNodeStatus"]["Online"], true);
+        assert_eq!(json["Peer"][exit_key.to_string()]["ExitNode"], true);
         assert_eq!(
             json["ExitNodeStatus"]["TailscaleIPs"],
             serde_json::json!(["100.64.0.2"])

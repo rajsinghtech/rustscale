@@ -13,18 +13,15 @@ pub(crate) fn selected_exit_node_status(
     exit_key: Option<&NodePublic>,
 ) -> Option<Box<rustscale_ipnstate::ExitNodeStatus>> {
     let exit_key = exit_key?;
-    let peer = peers.iter().find(|peer| &peer.Key == exit_key);
-    let online = peer.and_then(|peer| peer.Online).unwrap_or(false);
+    let peer = peers.iter().find(|peer| &peer.Key == exit_key)?;
+    let online = peer.Online.unwrap_or(false);
     let tailscale_ips = peer
-        .map(|peer| {
-            peer.Addresses
-                .iter()
-                .filter_map(|address| address.split('/').next().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
+        .Addresses
+        .iter()
+        .filter_map(|address| address.split('/').next().map(String::from))
+        .collect();
     Some(Box::new(rustscale_ipnstate::ExitNodeStatus {
-        ID: exit_key.to_string(),
+        ID: peer.StableID.clone(),
         Online: online,
         TailscaleIPs: tailscale_ips,
     }))
@@ -87,4 +84,30 @@ pub struct WhoIsInfo {
     pub login_name: String,
     /// The owning user's display name (from `UserProfile.DisplayName`).
     pub display_name: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustscale_key::NodePrivate;
+
+    #[test]
+    fn exit_status_uses_stable_id_across_node_key_rotation() {
+        let old_key = NodePrivate::generate().public();
+        let new_key = NodePrivate::generate().public();
+        let peer = |key| Node {
+            ID: 42,
+            StableID: "n-stable-exit".into(),
+            Key: key,
+            Addresses: vec!["100.64.0.9/32".into()],
+            Online: Some(true),
+            ..Default::default()
+        };
+
+        let old = selected_exit_node_status(&[peer(old_key.clone())], Some(&old_key)).unwrap();
+        let rotated = selected_exit_node_status(&[peer(new_key.clone())], Some(&new_key)).unwrap();
+        assert_eq!(old.ID, "n-stable-exit");
+        assert_eq!(rotated.ID, old.ID);
+        assert!(selected_exit_node_status(&[peer(new_key)], Some(&old_key)).is_none());
+    }
 }

@@ -133,7 +133,7 @@ jobs:
       - name: Bundle
         run: |
           cp include/rustscale.h LICENSE dist/
-          tar czf rustscale-universal-apple-darwin.tar.gz -C dist .
+          tar --format=ustar -czf rustscale-universal-apple-darwin.tar.gz -C dist .
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -225,7 +225,7 @@ jobs:
             bin="${entry##*:}"
             cp "$libdir/$bin" dist/ 2>/dev/null || true
           done
-          tar czf rustscale-${{ matrix.target }}.tar.gz -C dist .
+          tar --format=ustar -czf rustscale-${{ matrix.target }}.tar.gz -C dist .
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

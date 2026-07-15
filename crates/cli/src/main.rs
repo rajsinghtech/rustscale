@@ -219,9 +219,7 @@ fn usage(bin: &str) {
     eprintln!("  dns [name] [--type <type>]           query the daemon DNS resolver");
     eprintln!("  nc <host:port>                       netcat via tailnet (not yet supported)");
     eprintln!("  id-token <audience>                  fetch an OIDC ID token for this machine");
-    eprintln!(
-        "  update                               check for client updates (not yet supported)"
-    );
+    eprintln!("  update [--yes|--dry-run] [flags]   update from RustScale GitHub releases");
     eprintln!("  wait [--timeout <duration>]          wait for backend to reach Running state");
     eprintln!("  lock [status|init|add|remove|disable]  manage tailnet lock (not yet supported)");
     eprintln!("  drive [list|share|unshare]           manage Taildrive shares (not yet supported)");

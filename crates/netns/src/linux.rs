@@ -25,6 +25,9 @@ pub fn configure_udp_socket(socket: &UdpSocket) -> Result<(), std::io::Error> {
 }
 
 fn configure_socket(fd: std::os::fd::RawFd) -> Result<(), std::io::Error> {
+    if super::DISABLE_BIND_CONN_TO_INTERFACE.load(std::sync::atomic::Ordering::Relaxed) {
+        return Ok(());
+    }
     if use_socket_mark() {
         let mark: libc::c_int = LINUX_BYPASS_MARK as libc::c_int;
         let ret = unsafe {

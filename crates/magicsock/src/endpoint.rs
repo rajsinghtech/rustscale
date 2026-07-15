@@ -5,7 +5,7 @@
 //! best confirmed direct path with a trust expiry, an optional peer-relay path,
 //! and a DERP fallback (the peer's home region).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
@@ -271,6 +271,7 @@ pub struct Endpoint {
     candidates: Vec<(SocketAddr, EndpointType)>,
     best_addr: Option<(SocketAddr, Instant)>,
     relay: Option<RelayPath>,
+    relay_history: HashMap<(rustscale_key::NodePublic, u64), HashSet<SocketAddr>>,
     home_derp: i32,
     /// The DERP region from which the most recent packet from this peer
     /// arrived. Used for reply routing when HomeDERP is 0 or stale.
@@ -313,6 +314,7 @@ impl Endpoint {
             candidates: Vec::new(),
             best_addr: None,
             relay: None,
+            relay_history: HashMap::new(),
             home_derp,
             last_recv_derp_region: 0,
             last_recv_derp_at: None,
@@ -520,6 +522,10 @@ impl Endpoint {
         server_key: rustscale_key::NodePublic,
         server_generation: u64,
     ) {
+        self.relay_history
+            .entry((server_key.clone(), server_generation))
+            .or_default()
+            .insert(addr);
         self.relay = Some(RelayPath {
             addr,
             vni,
@@ -528,24 +534,46 @@ impl Endpoint {
         });
     }
 
-    /// Clear the relay path.
-    pub fn clear_relay(&mut self) {
-        self.relay = None;
+    /// Return the current relay path and its server identity.
+    pub fn current_relay(&self) -> Option<(SocketAddr, u32, &rustscale_key::NodePublic, u64)> {
+        self.relay.as_ref().map(|relay| {
+            (
+                relay.addr,
+                relay.vni,
+                &relay.server_key,
+                relay.server_generation,
+            )
+        })
     }
 
-    /// Clear and return a relay path installed by this exact server identity.
+    /// Clear the relay path and its retained reverse-map history.
+    pub fn clear_relay(&mut self) {
+        self.relay = None;
+        self.relay_history.clear();
+    }
+
+    /// Clear and return every relay address associated with this exact server
+    /// identity, including addresses replaced by newer relay paths.
     pub fn clear_relay_server(
         &mut self,
         server_key: &rustscale_key::NodePublic,
         server_generation: u64,
-    ) -> Option<SocketAddr> {
-        let matches = self.relay.as_ref().is_some_and(|relay| {
+    ) -> Vec<SocketAddr> {
+        let identity = (server_key.clone(), server_generation);
+        let mut addresses = self.relay_history.remove(&identity).unwrap_or_default();
+        let matches_current = self.relay.as_ref().is_some_and(|relay| {
             &relay.server_key == server_key && relay.server_generation == server_generation
         });
-        if matches {
-            return self.relay.take().map(|relay| relay.addr);
+        if matches_current {
+            if let Some(relay) = self.relay.take() {
+                addresses.insert(relay.addr);
+            }
+        } else if let Some(current) = self.relay.as_ref() {
+            // An address can be reused by a newer server identity. Its single
+            // reverse-map slot now belongs to the current path, not history.
+            addresses.remove(&current.addr);
         }
-        None
+        addresses.into_iter().collect()
     }
 
     /// Whether the direct path has expired at `now`.

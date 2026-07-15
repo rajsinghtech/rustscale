@@ -3399,11 +3399,18 @@ impl relay_manager::RelayManagerContext for Inner {
             if ep.peer_disco_key() != peer_disco {
                 return;
             }
-            ep.set_relay(addr, vni, relay_server_key.clone(), relay_server_generation);
-            self.addr_to_peer
+            let previous_addr = ep.current_relay().map(|(addr, _, _, _)| addr);
+            let mut addr_to_peer = self
+                .addr_to_peer
                 .write()
-                .expect("addr_to_peer lock poisoned")
-                .insert(addr, peer_key.clone());
+                .expect("addr_to_peer lock poisoned");
+            if let Some(previous_addr) = previous_addr {
+                if addr_to_peer.get(&previous_addr) == Some(peer_key) {
+                    addr_to_peer.remove(&previous_addr);
+                }
+            }
+            ep.set_relay(addr, vni, relay_server_key.clone(), relay_server_generation);
+            addr_to_peer.insert(addr, peer_key.clone());
             if debug_enabled() {
                 eprintln!(
                     "DBG relay_set peer={} addr={addr} vni={vni}",
@@ -3419,27 +3426,20 @@ impl relay_manager::RelayManagerContext for Inner {
         relay_server_disco: &DiscoPublic,
         relay_server_generation: u64,
     ) {
-        let removed_paths = {
+        {
             let mut endpoints = self.endpoints.write().expect("endpoints lock poisoned");
-            endpoints
-                .iter_mut()
-                .filter_map(|(peer, endpoint)| {
-                    endpoint
-                        .clear_relay_server(relay_server_key, relay_server_generation)
-                        .map(|addr| (peer.clone(), addr))
-                })
-                .collect::<Vec<_>>()
-        };
-        let mut addr_to_peer = self
-            .addr_to_peer
-            .write()
-            .expect("addr_to_peer lock poisoned");
-        for (peer, addr) in removed_paths {
-            if addr_to_peer.get(&addr) == Some(&peer) {
-                addr_to_peer.remove(&addr);
+            let mut addr_to_peer = self
+                .addr_to_peer
+                .write()
+                .expect("addr_to_peer lock poisoned");
+            for (peer, endpoint) in endpoints.iter_mut() {
+                for addr in endpoint.clear_relay_server(relay_server_key, relay_server_generation) {
+                    if addr_to_peer.get(&addr) == Some(peer) {
+                        addr_to_peer.remove(&addr);
+                    }
+                }
             }
         }
-        drop(addr_to_peer);
         let mut disco_to_peer = self
             .disco_to_peer
             .write()
@@ -4039,13 +4039,12 @@ impl Inner {
         &self,
         data: &[u8],
         src: SocketAddr,
-        _vni: u32,
+        vni: u32,
         physical_len: usize,
     ) {
-        // Look up the peer by source address. In the relay path, the source
-        // is the relay server, not the peer — but we record the relay addr
-        // → peer mapping when set_relay is called. For now, use the
-        // addr_to_peer map.
+        // The reverse map is only an index. Authorization below also requires
+        // this exact address+VNI to be the endpoint's current relay path and
+        // its relay-server generation to remain current.
         let peer = {
             let map = self
                 .addr_to_peer
@@ -4072,6 +4071,19 @@ impl Inner {
                 let Some(endpoint) = endpoints.get(&peer) else {
                     return;
                 };
+                let Some((relay_addr, relay_vni, relay_server, relay_server_generation)) =
+                    endpoint.current_relay()
+                else {
+                    return;
+                };
+                if relay_addr != src
+                    || relay_vni != vni
+                    || !self
+                        .peer_authorization
+                        .is_current(relay_server, relay_server_generation)
+                {
+                    return;
+                }
                 (generation, endpoint.node_addr())
             };
             // Receive accounting includes the Geneve header, matching

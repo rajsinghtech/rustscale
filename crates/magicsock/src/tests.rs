@@ -998,9 +998,11 @@ async fn queued_disco_handler_cannot_reinsert_state_after_revocation() {
 async fn relay_server_role_revocation_clears_paths_and_reverse_mappings() {
     let target_key = NodePrivate::generate().public();
     let target_disco = DiscoPrivate::generate().public();
-    let server_key = NodePrivate::generate().public();
-    let server_disco = DiscoPrivate::generate().public();
-    let (magicsock, _rx) = Magicsock::new(MagicsockConfig {
+    let server_a_key = NodePrivate::generate().public();
+    let server_a_disco = DiscoPrivate::generate().public();
+    let server_b_key = NodePrivate::generate().public();
+    let server_b_disco = DiscoPrivate::generate().public();
+    let (magicsock, mut rx) = Magicsock::new(MagicsockConfig {
         private_key: NodePrivate::generate(),
         disco_key: DiscoPrivate::generate(),
         derp_client: None,
@@ -1019,110 +1021,159 @@ async fn relay_server_role_revocation_clears_paths_and_reverse_mappings() {
     .await
     .unwrap();
     let target = make_peer(target_key.clone(), target_disco.clone(), vec![], 1);
-    let mut relay_server = make_peer(server_key.clone(), server_disco.clone(), vec![], 1);
-    relay_server.Cap = rustscale_tailcfg::CAP_VERSION_RELAY;
-    relay_server.CapMap.insert(
-        rustscale_tailcfg::PEER_CAPABILITY_RELAY_TARGET.into(),
-        vec![rustscale_tailcfg::RawMessage::default()],
-    );
-    relay_server.Hostinfo = Some(rustscale_tailcfg::Hostinfo {
-        PeerRelay: true,
-        ..Default::default()
-    });
+    let make_relay_server = |key: NodePublic, disco| {
+        let mut node = make_peer(key, disco, vec![], 1);
+        node.Cap = rustscale_tailcfg::CAP_VERSION_RELAY;
+        node.CapMap.insert(
+            rustscale_tailcfg::PEER_CAPABILITY_RELAY_TARGET.into(),
+            vec![rustscale_tailcfg::RawMessage::default()],
+        );
+        node.Hostinfo = Some(rustscale_tailcfg::Hostinfo {
+            PeerRelay: true,
+            ..Default::default()
+        });
+        node
+    };
+    let mut server_a = make_relay_server(server_a_key.clone(), server_a_disco.clone());
+    let server_b = make_relay_server(server_b_key.clone(), server_b_disco);
     magicsock
-        .set_netmap(vec![target.clone(), relay_server.clone()])
+        .set_netmap(vec![target.clone(), server_a.clone(), server_b.clone()])
         .await
         .unwrap();
 
     let target_generation = magicsock.authorization_generation(&target_key).unwrap();
-    let server_generation = magicsock.authorization_generation(&server_key).unwrap();
-    let relay_addr: SocketAddr = "127.0.0.1:4545".parse().unwrap();
+    let addr_a: SocketAddr = "127.0.0.1:4545".parse().unwrap();
+    let addr_b: SocketAddr = "127.0.0.1:4646".parse().unwrap();
     RelayManagerContext::set_relay(
         &*magicsock.inner,
         &target_key,
         &target_disco,
         target_generation,
-        &server_key,
-        server_generation,
-        relay_addr,
+        &server_a_key,
+        magicsock.authorization_generation(&server_a_key).unwrap(),
+        addr_a,
         77,
     );
-    assert_eq!(
-        magicsock.peer_path_class(&target_key),
-        endpoint::PathClass::Relay
+    RelayManagerContext::set_relay(
+        &*magicsock.inner,
+        &target_key,
+        &target_disco,
+        target_generation,
+        &server_b_key,
+        magicsock.authorization_generation(&server_b_key).unwrap(),
+        addr_b,
+        78,
     );
-    assert_eq!(
-        magicsock
+    assert!(
+        !magicsock
             .inner
             .addr_to_peer
             .read()
             .unwrap()
-            .get(&relay_addr),
+            .contains_key(&addr_a),
+        "installing B must atomically remove A's old reverse mapping"
+    );
+    assert_eq!(
+        magicsock.inner.addr_to_peer.read().unwrap().get(&addr_b),
         Some(&target_key)
     );
 
-    // The relay server remains an authorized ordinary peer but loses its
-    // relay-server identity. The map writer waits for manager cancellation
-    // and path cleanup before returning.
-    relay_server.CapMap.clear();
-    relay_server.Hostinfo = Some(rustscale_tailcfg::Hostinfo::default());
+    // Simulate a late stale reverse-map write before the revoke transaction.
+    // A's retained history must let revocation remove it even though B is the
+    // endpoint's current path.
     magicsock
-        .set_netmap(vec![target.clone(), relay_server.clone()])
+        .inner
+        .addr_to_peer
+        .write()
+        .unwrap()
+        .insert(addr_a, target_key.clone());
+
+    // A remains an authorized ordinary peer but loses its relay-server role.
+    // Revocation must consume A's retained path history without clearing B.
+    server_a.CapMap.clear();
+    server_a.Hostinfo = Some(rustscale_tailcfg::Hostinfo::default());
+    magicsock
+        .set_netmap(vec![target, server_a, server_b])
         .await
         .unwrap();
-    assert_ne!(
-        magicsock.peer_path_class(&target_key),
-        endpoint::PathClass::Relay
-    );
     assert!(!magicsock
         .inner
         .addr_to_peer
         .read()
         .unwrap()
-        .contains_key(&relay_addr));
+        .contains_key(&addr_a));
+    assert_eq!(
+        magicsock.inner.addr_to_peer.read().unwrap().get(&addr_b),
+        Some(&target_key)
+    );
     assert!(!magicsock
         .inner
         .disco_to_peer
         .read()
         .unwrap()
-        .contains_key(&server_disco));
-
-    // A newly authorized relay-server identity can install a fresh path.
-    relay_server.CapMap.insert(
-        rustscale_tailcfg::PEER_CAPABILITY_RELAY_TARGET.into(),
-        vec![rustscale_tailcfg::RawMessage::default()],
-    );
-    relay_server.Hostinfo = Some(rustscale_tailcfg::Hostinfo {
-        PeerRelay: true,
-        ..Default::default()
-    });
-    magicsock
-        .set_netmap(vec![target, relay_server])
-        .await
-        .unwrap();
-    RelayManagerContext::set_relay(
-        &*magicsock.inner,
-        &target_key,
-        &target_disco,
-        magicsock.authorization_generation(&target_key).unwrap(),
-        &server_key,
-        magicsock.authorization_generation(&server_key).unwrap(),
-        relay_addr,
-        78,
-    );
+        .contains_key(&server_a_disco));
     assert_eq!(
         magicsock.peer_path_class(&target_key),
         endpoint::PathClass::Relay
     );
-    assert_eq!(
-        magicsock
-            .inner
-            .addr_to_peer
-            .read()
-            .unwrap()
-            .get(&relay_addr),
-        Some(&target_key)
+
+    // Even a raced/stale reverse-map insertion cannot authorize packets from
+    // A: receive validation requires B's exact current address, VNI, and
+    // relay-server generation.
+    magicsock
+        .inner
+        .addr_to_peer
+        .write()
+        .unwrap()
+        .insert(addr_a, target_key.clone());
+    magicsock
+        .inner
+        .handle_wg_udp_relay(b"from-a", addr_a, 77, 6)
+        .await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), rx.recv())
+            .await
+            .is_err(),
+        "replaced relay address A must be denied"
     );
+    magicsock
+        .inner
+        .addr_to_peer
+        .write()
+        .unwrap()
+        .remove(&addr_a);
+    assert!(!magicsock
+        .inner
+        .addr_to_peer
+        .read()
+        .unwrap()
+        .contains_key(&addr_a));
+
+    magicsock
+        .inner
+        .handle_wg_udp_relay(b"wrong-vni", addr_b, 77, 9)
+        .await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), rx.recv())
+            .await
+            .is_err(),
+        "current relay address with a stale VNI must be denied"
+    );
+
+    magicsock
+        .inner
+        .handle_wg_udp_relay(b"from-b", addr_b, 78, 6)
+        .await;
+    let received = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        .await
+        .expect("current relay packet deadline")
+        .expect("current relay packet")
+        .into_datagrams()
+        .into_iter()
+        .next()
+        .expect("one current relay datagram");
+    assert_eq!(received.peer, target_key);
+    assert_eq!(received.data.as_ref(), b"from-b");
 }
 
 // ---- Test (a): DERP data path fallback ----

@@ -136,6 +136,14 @@ impl ExitNodeSelection {
         self.pending_persisted = None;
     }
 
+    /// Put an unresolved persisted request into capture/no-connect state when
+    /// there is no prior working exit peer to retain.
+    pub(crate) fn ensure_fail_closed(&self, routes: &mut RouteTable) {
+        if self.pending_persisted.is_some() && routes.exit_node().is_none() {
+            routes.capture_exit_node();
+        }
+    }
+
     /// Retry an unresolved persisted selection. This deliberately does not
     /// clear the route table when the peer is absent: an explicit selection
     /// owns the table once it has superseded the persisted preference.
@@ -148,6 +156,7 @@ impl ExitNodeSelection {
             self.pending_persisted = None;
             true
         } else {
+            self.ensure_fail_closed(routes);
             false
         }
     }
@@ -160,12 +169,15 @@ impl ExitNodeSelection {
     ) -> Result<bool, E> {
         let old_selection = self.clone();
         let old_exit = routes.exit_node().cloned();
+        let old_requested = routes.exit_node_requested();
         if !self.retry(peers, routes) {
             return Ok(false);
         }
         if let Err(error) = apply(routes) {
             if let Some(old_exit) = old_exit {
                 routes.set_exit_node(old_exit);
+            } else if old_requested {
+                routes.capture_exit_node();
             } else {
                 routes.clear_exit_node();
             }
@@ -312,7 +324,7 @@ pub(crate) fn spawn_map_update_task(
                     if resp.KeepAlive {
                         if let Some(router) = router.as_ref() {
                             let routes = route_table.read().await;
-                            if routes.exit_node().is_some() {
+                            if routes.exit_node_requested() {
                                 let exit_node_allow_lan_access =
                                     prefs.read().await.ExitNodeAllowLANAccess;
                                 if let Err(error) = sync_router(
@@ -1148,6 +1160,7 @@ mod tests {
         let router: SharedRouter =
             Arc::new(std::sync::Mutex::new(crate::tun_pump::ManagedRouter {
                 router: Box::new(RecordingRouter { seen: seen.clone() }),
+                tun_name: "rustscale-test0".into(),
                 exit_node: true,
             }));
         let (magicsock, _wg_rx) = Magicsock::new(rustscale_magicsock::MagicsockConfig {
@@ -1277,6 +1290,8 @@ mod tests {
         let mut selection = ExitNodeSelection::from_prefs(&prefs);
         selection.retry(&[], &mut routes);
         assert!(routes.exit_node().is_none());
+        assert!(routes.exit_node_requested());
+        assert!(routes.lookup("8.8.8.8".parse().unwrap()).is_none());
 
         let mut peer = Node {
             Key: exit_key.clone(),
@@ -1319,6 +1334,30 @@ mod tests {
             .retry_transactional(&[peer], &mut routes, |_| Ok::<(), &str>(()))
             .unwrap());
         assert_eq!(routes.exit_node(), Some(&pending_exit));
+    }
+
+    #[test]
+    fn pending_exit_router_failure_restores_capture_state() {
+        let pending_exit = NodePrivate::generate().public();
+        let prefs = Prefs {
+            ExitNodeIP: "100.64.0.9".into(),
+            ..Default::default()
+        };
+        let peer = Node {
+            Key: pending_exit,
+            Addresses: vec!["100.64.0.9/32".into()],
+            AllowedIPs: vec!["0.0.0.0/0".into()],
+            ..Default::default()
+        };
+        let mut routes = RouteTable::default();
+        routes.capture_exit_node();
+        let mut selection = ExitNodeSelection::from_prefs(&prefs);
+
+        let result = selection.retry_transactional(&[peer], &mut routes, |_| Err("injected"));
+        assert_eq!(result, Err("injected"));
+        assert!(routes.exit_node().is_none());
+        assert!(routes.exit_node_requested());
+        assert!(selection.pending_persisted.is_some());
     }
 
     #[test]

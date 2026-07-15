@@ -1,11 +1,29 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
-fn restore_exit_node(routes: &mut RouteTable, exit_node: Option<NodePublic>) {
+fn restore_exit_node(routes: &mut RouteTable, exit_node: Option<NodePublic>, exit_requested: bool) {
     if let Some(exit_node) = exit_node {
         routes.set_exit_node(exit_node);
+    } else if exit_requested {
+        routes.capture_exit_node();
     } else {
         routes.clear_exit_node();
+    }
+}
+
+fn route_error_with_prefs_rollback(
+    state_dir: Option<&std::path::PathBuf>,
+    old_prefs: &rustscale_ipn::Prefs,
+    route_error: TsnetError,
+) -> TsnetError {
+    let Some(dir) = state_dir else {
+        return route_error;
+    };
+    match old_prefs.save(dir) {
+        Ok(()) => route_error,
+        Err(rollback_error) => TsnetError::Builder(format!(
+            "route update failed: {route_error}; prefs rollback failed: {rollback_error}"
+        )),
     }
 }
 
@@ -443,6 +461,7 @@ impl Server {
         }
         let mut routes = inner.route_table.write().await;
         let old_exit = routes.exit_node().cloned();
+        let old_requested = routes.exit_node_requested();
         routes.set_exit_node(peer_key);
         if let Some(router) = inner.router.as_ref() {
             if let Err(error) = sync_router(
@@ -453,11 +472,12 @@ impl Server {
                 &self.config.control_url,
                 next_prefs.ExitNodeAllowLANAccess,
             ) {
-                restore_exit_node(&mut routes, old_exit);
-                if let Some(ref dir) = self.config.state_dir {
-                    let _ = old_prefs.save(dir);
-                }
-                return Err(error);
+                restore_exit_node(&mut routes, old_exit, old_requested);
+                return Err(route_error_with_prefs_rollback(
+                    self.config.state_dir.as_ref(),
+                    &old_prefs,
+                    error,
+                ));
             }
         }
         *inner.prefs.write().await = next_prefs;
@@ -492,6 +512,7 @@ impl Server {
         }
         let mut routes = inner.route_table.write().await;
         let old_exit = routes.exit_node().cloned();
+        let old_requested = routes.exit_node_requested();
         routes.clear_exit_node();
         if let Some(router) = inner.router.as_ref() {
             if let Err(error) = sync_router(
@@ -502,11 +523,12 @@ impl Server {
                 &self.config.control_url,
                 next_prefs.ExitNodeAllowLANAccess,
             ) {
-                restore_exit_node(&mut routes, old_exit);
-                if let Some(ref dir) = self.config.state_dir {
-                    let _ = old_prefs.save(dir);
-                }
-                return Err(error);
+                restore_exit_node(&mut routes, old_exit, old_requested);
+                return Err(route_error_with_prefs_rollback(
+                    self.config.state_dir.as_ref(),
+                    &old_prefs,
+                    error,
+                ));
             }
         }
         *inner.prefs.write().await = next_prefs;

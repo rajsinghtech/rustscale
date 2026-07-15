@@ -1312,8 +1312,13 @@ impl Server {
             let mut selection = inner.exit_node_selection.write().await;
             let mut routes = inner.route_table.write().await;
             let old_exit = routes.exit_node().cloned();
+            let old_requested = routes.exit_node_requested();
             if let Some(peer) = selected_exit {
                 routes.set_exit_node(peer);
+            } else if pending {
+                if old_exit.is_none() {
+                    routes.capture_exit_node();
+                }
             } else {
                 routes.clear_exit_node();
             }
@@ -1333,6 +1338,8 @@ impl Server {
                 ) {
                     if let Some(old_exit) = old_exit {
                         routes.set_exit_node(old_exit);
+                    } else if old_requested {
+                        routes.capture_exit_node();
                     } else {
                         routes.clear_exit_node();
                     }

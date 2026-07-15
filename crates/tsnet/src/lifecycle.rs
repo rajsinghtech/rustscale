@@ -113,6 +113,68 @@ fn netlog_node(node: &Node) -> rustscale_netlogtype::Node {
 }
 
 impl Server {
+    fn cleanup_router_owner(router: &SharedRouter) -> Result<(), TsnetError> {
+        let mut managed = router
+            .lock()
+            .map_err(|_| TsnetError::Builder("router cleanup lock poisoned".into()))?;
+        managed
+            .router
+            .close()
+            .map_err(|error| TsnetError::Builder(format!("route cleanup failed: {error}")))?;
+        if managed.exit_node {
+            rustscale_netns::release_physical_underlay_bypass(&managed.tun_name);
+            managed.exit_node = false;
+        }
+        Ok(())
+    }
+
+    fn router_cleanup_supervisor() -> &'static std::sync::Mutex<Vec<SharedRouter>> {
+        static SUPERVISOR: std::sync::OnceLock<std::sync::Mutex<Vec<SharedRouter>>> =
+            std::sync::OnceLock::new();
+        SUPERVISOR.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+    }
+
+    fn supervise_router_cleanup(router: SharedRouter) {
+        match Self::router_cleanup_supervisor().lock() {
+            Ok(mut supervisor) => supervisor.push(router),
+            Err(poisoned) => poisoned.into_inner().push(router),
+        }
+    }
+
+    pub(crate) fn cleanup_or_supervise(router: SharedRouter) -> Result<(), TsnetError> {
+        match Self::cleanup_router_owner(&router) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                Self::supervise_router_cleanup(router);
+                Err(error)
+            }
+        }
+    }
+
+    fn retry_pending_router_cleanup() -> Result<(), TsnetError> {
+        // Hold the supervisor lock through cleanup so a concurrent close cannot
+        // enqueue a stale owner between the final check and startup admission.
+        let mut supervisor = Self::router_cleanup_supervisor()
+            .lock()
+            .map_err(|_| TsnetError::Builder("router cleanup supervisor poisoned".into()))?;
+        let pending = std::mem::take(&mut *supervisor);
+        let mut errors = Vec::new();
+        for router in pending {
+            if let Err(error) = Self::cleanup_router_owner(&router) {
+                errors.push(error.to_string());
+                supervisor.push(router);
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(TsnetError::Builder(format!(
+                "pending route cleanup blocks restart: {}",
+                errors.join("; ")
+            )))
+        }
+    }
+
     /// Bring the server online in userspace netstack mode (tsnet listen/dial).
     ///
     /// This is the classic tsnet embedding path: an in-process smoltcp netstack
@@ -136,6 +198,7 @@ impl Server {
             }
             return Ok(self.status());
         }
+        Self::retry_pending_router_cleanup()?;
 
         ensure_ring_provider();
         let state = self.load_or_create_state()?;
@@ -169,6 +232,7 @@ impl Server {
             b.derp_map.clone(),
             b.home_derp,
             b.health.clone(),
+            None,
         );
 
         // Userspace netstack bound to our tailnet IPv4.
@@ -677,6 +741,7 @@ impl Server {
             }
             return Ok(self.status());
         }
+        Self::retry_pending_router_cleanup()?;
 
         ensure_ring_provider();
         let state = self.load_or_create_state()?;
@@ -710,9 +775,31 @@ impl Server {
             let mut live_prefs = prefs.write().await;
             set_exit_node_pref(&mut live_prefs, exit);
             if let Some(ref dir) = self.config.state_dir {
-                let _ = live_prefs.save(dir);
+                live_prefs.save(dir).map_err(|error| {
+                    TsnetError::Builder(format!("persist startup exit selection: {error}"))
+                })?;
             }
         }
+
+        // Resolve persisted exit intent before the TUN can carry ordinary
+        // traffic. If the peer is absent, retry installs capture/no-connect
+        // defaults and never exposes the physical default route.
+        {
+            let peers = b.peers.read().await;
+            let mut routes = b.route_table.write().await;
+            exit_node_selection.write().await.retry(&peers, &mut routes);
+        }
+
+        // Real TUN device (macOS/Linux only; on other platforms
+        // `create_tun_device` returns an error and `?` propagates it).
+        let exit_node_allow_lan_access = prefs.read().await.ExitNodeAllowLANAccess;
+        let (tun, router) = create_tun_device(
+            &config,
+            &b,
+            self.config.accept_routes,
+            exit_node_allow_lan_access,
+        )
+        .await?;
 
         let monitor = spawn_link_monitor(
             b.magicsock.clone(),
@@ -728,18 +815,13 @@ impl Server {
             b.derp_map.clone(),
             b.home_derp,
             b.health.clone(),
+            router.as_ref().map(|router| LinkRouteSync {
+                router: router.clone(),
+                route_table: b.route_table.clone(),
+                tailscale_ips: b.tailscale_ips.clone(),
+                prefs: prefs.clone(),
+            }),
         );
-
-        // Real TUN device (macOS/Linux only; on other platforms
-        // `create_tun_device` returns an error and `?` propagates it).
-        let exit_node_allow_lan_access = prefs.read().await.ExitNodeAllowLANAccess;
-        let (tun, router) = create_tun_device(
-            &config,
-            &b,
-            self.config.accept_routes,
-            exit_node_allow_lan_access,
-        )
-        .await?;
 
         let capture = crate::capture::new_slot();
 
@@ -1306,6 +1388,7 @@ impl Server {
         if self.inner.is_some() || self.pre_started.is_some() {
             return Err(TsnetError::AlreadyUp);
         }
+        Self::retry_pending_router_cleanup()?;
 
         let ipn_backend = Arc::new(IpnBackend::new("rustscale"));
         ipn_backend.set_want_running();
@@ -2441,30 +2524,8 @@ impl Server {
 
     /// Release profile ownership only after all asynchronous cleanup has
     /// completed. This method deliberately contains no await points.
-    fn finish_profile_shutdown(&mut self) {
+    fn finish_profile_shutdown(&mut self) -> Result<(), TsnetError> {
         if let Some(inner) = self.inner.as_mut() {
-            if let Some(router) = inner.router.take() {
-                let (cleaned, used_exit_node) = if let Ok(mut router) = router.lock() {
-                    let used_exit_node = router.exit_node;
-                    let cleaned = match router.router.close() {
-                        Ok(()) => true,
-                        Err(_) => match router.router.close() {
-                            Ok(()) => true,
-                            Err(error) => {
-                                eprintln!("tsnet: route cleanup failed (non-fatal): {error}");
-                                false
-                            }
-                        },
-                    };
-                    (cleaned, used_exit_node)
-                } else {
-                    eprintln!("tsnet: route cleanup skipped (router lock poisoned)");
-                    (false, false)
-                };
-                if cleaned && used_exit_node {
-                    rustscale_netns::release_physical_underlay_bypass();
-                }
-            }
             crate::capture::clear(&inner.capture);
             inner
                 .capture_handles
@@ -2476,6 +2537,12 @@ impl Server {
                     log::warn!("tsnet: OS DNS cleanup failed (non-fatal): {e}");
                 }
             }
+            // Route cleanup is last, after every task capable of reapplying a
+            // map/interface diff has stopped. Failed ownership moves to the
+            // global supervisor before profile state is released.
+            if let Some(router) = inner.router.take() {
+                Self::cleanup_or_supervise(router)?;
+            }
         }
         if let Some(pre_started) = self.pre_started.as_mut() {
             pre_started.command_tx.take();
@@ -2483,6 +2550,7 @@ impl Server {
         }
         self.inner.take();
         self.pre_started.take();
+        Ok(())
     }
 
     #[cfg(test)]
@@ -2578,8 +2646,7 @@ impl Server {
 
         // No awaits after this point: release fully stopped state atomically
         // with respect to cancellation.
-        self.finish_profile_shutdown();
-        CloseResult(Ok(()))
+        CloseResult(self.finish_profile_shutdown())
     }
 
     /// Returns the logout trigger Notify, if the server is running.
@@ -2818,8 +2885,7 @@ impl Server {
             ..Default::default()
         });
 
-        self.finish_profile_shutdown();
-        Ok(())
+        self.finish_profile_shutdown()
     }
 
     /// Switch to profile `profile_id`, tearing down the running backend and
@@ -2839,6 +2905,7 @@ impl Server {
     pub async fn switch_profile(&mut self, profile_id: &str) -> Result<(), TsnetError> {
         // 1. Stop the running engine (like close() but keep the config).
         self.close().await.into_result()?;
+        Self::retry_pending_router_cleanup()?;
 
         // 2. Update current profile + prefs from the ProfileManager.
         //    (ProfileManager lives in state_dir on disk; reload it.)
@@ -2971,5 +3038,64 @@ impl Server {
             state.save(&scope.dir.join("tsnet-state.json"))?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod exit_cleanup_tests {
+    use super::*;
+    use crate::tun_pump::ManagedRouter;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct RetryCleanupRouter {
+        closes: Arc<AtomicUsize>,
+    }
+
+    impl rustscale_router::Router for RetryCleanupRouter {
+        fn up(&mut self) -> Result<(), rustscale_router::RouterError> {
+            Ok(())
+        }
+
+        fn set(
+            &mut self,
+            _config: &rustscale_router::RouterConfig,
+        ) -> Result<(), rustscale_router::RouterError> {
+            Ok(())
+        }
+
+        fn close(&mut self) -> Result<(), rustscale_router::RouterError> {
+            if self.closes.fetch_add(1, Ordering::SeqCst) < 2 {
+                Err(rustscale_router::RouterError::InvalidConfig(
+                    "injected cleanup failure".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn cleanup_owner_survives_failure_and_blocks_until_retry_succeeds() {
+        let closes = Arc::new(AtomicUsize::new(0));
+        let owner = Arc::new(std::sync::Mutex::new(ManagedRouter {
+            router: Box::new(RetryCleanupRouter {
+                closes: closes.clone(),
+            }),
+            tun_name: "rustscale-test0".into(),
+            exit_node: false,
+        }));
+        Server::router_cleanup_supervisor().lock().unwrap().clear();
+        assert!(Server::cleanup_or_supervise(owner).is_err());
+        assert_eq!(Server::router_cleanup_supervisor().lock().unwrap().len(), 1);
+
+        // Restart admission remains blocked while cleanup is still dirty.
+        assert!(Server::retry_pending_router_cleanup().is_err());
+        assert_eq!(Server::router_cleanup_supervisor().lock().unwrap().len(), 1);
+        Server::retry_pending_router_cleanup().unwrap();
+        assert!(Server::router_cleanup_supervisor()
+            .lock()
+            .unwrap()
+            .is_empty());
+        assert_eq!(closes.load(Ordering::SeqCst), 3);
     }
 }

@@ -252,6 +252,10 @@ pub enum RouterError {
         stderr: String,
     },
     Io(std::io::Error),
+    Transaction {
+        primary: Box<RouterError>,
+        rollback: Vec<RouterError>,
+    },
     Unsupported,
 }
 
@@ -318,6 +322,13 @@ impl fmt::Display for RouterError {
                 stderr,
             } => write!(f, "{program} {args:?} failed ({exit_code:?}): {stderr}"),
             Self::Io(error) => write!(f, "router command failed to start: {error}"),
+            Self::Transaction { primary, rollback } => {
+                write!(f, "router transaction failed: {primary}")?;
+                for error in rollback {
+                    write!(f, "; rollback failed: {error}")?;
+                }
+                Ok(())
+            }
             Self::Unsupported => f.write_str("OS route management is unsupported on this platform"),
         }
     }
@@ -436,10 +447,25 @@ impl<P: Platform, R: CommandRunner> StatefulRouter<P, R> {
                     Err(error) => {
                         // Restore every command that this transaction changed,
                         // including an earlier command from the same operation.
+                        // Failed inverses remain owned and are retried before
+                        // another set() or during close().
+                        let mut rollback_errors = Vec::new();
                         for (program, args) in rollback.into_iter().rev() {
-                            let _ = self.runner.run(&program, &args);
+                            if let Err(rollback_error) = self.runner.run(&program, &args) {
+                                if !rollback_error.non_fatal() {
+                                    self.pending_cleanup.push((program, args));
+                                    rollback_errors.push(rollback_error);
+                                }
+                            }
                         }
-                        return Err(error);
+                        return if rollback_errors.is_empty() {
+                            Err(error)
+                        } else {
+                            Err(RouterError::Transaction {
+                                primary: Box::new(error),
+                                rollback: rollback_errors,
+                            })
+                        };
                     }
                 }
             }
@@ -471,14 +497,17 @@ impl<P: Platform, R: CommandRunner> StatefulRouter<P, R> {
         first_error.map_or(Ok(()), Err)
     }
 
-    fn rollback_startup(&mut self, rollback: Vec<CommandSpec>) {
+    fn rollback_startup(&mut self, rollback: Vec<CommandSpec>) -> Vec<RouterError> {
+        let mut errors = Vec::new();
         for (program, args) in rollback.into_iter().rev() {
             if let Err(error) = self.runner.run(&program, &args) {
                 if !error.non_fatal() {
                     self.pending_cleanup.push((program, args));
+                    errors.push(error);
                 }
             }
         }
+        errors
     }
 
     fn apply_up(&mut self) -> Result<(), RouterError> {
@@ -490,8 +519,15 @@ impl<P: Platform, R: CommandRunner> StatefulRouter<P, R> {
                 Ok(()) => rollback.push(inverse),
                 Err(error) if error.non_fatal() => {}
                 Err(error) => {
-                    self.rollback_startup(rollback);
-                    return Err(error);
+                    let rollback = self.rollback_startup(rollback);
+                    return if rollback.is_empty() {
+                        Err(error)
+                    } else {
+                        Err(RouterError::Transaction {
+                            primary: Box::new(error),
+                            rollback,
+                        })
+                    };
                 }
             }
         }
@@ -511,6 +547,7 @@ impl<P: Platform, R: CommandRunner> Router for StatefulRouter<P, R> {
     }
 
     fn set(&mut self, config: &RouterConfig) -> Result<(), RouterError> {
+        self.retry_pending_cleanup()?;
         let config = config.normalized()?;
         let delta = diff(self.config.as_ref(), &config);
         self.apply(&delta.operations())?;
@@ -1640,7 +1677,11 @@ mod tests {
         outcomes.extend([RunnerOutcome::Fatal, RunnerOutcome::Fatal]);
         let mut router = linux_router_with(outcomes);
 
-        assert!(router.up().is_err());
+        let error = router.up().unwrap_err();
+        assert!(matches!(
+            error,
+            RouterError::Transaction { ref rollback, .. } if rollback.len() == 1
+        ));
         assert_eq!(router.pending_cleanup.len(), 1);
         assert!(!router.is_up);
         router.close().unwrap();
@@ -1725,13 +1766,14 @@ mod tests {
     struct TransactionRunner {
         commands: Vec<String>,
         fail_at: Option<usize>,
+        fail_also_at: Option<usize>,
     }
 
     impl CommandRunner for TransactionRunner {
         fn run(&mut self, _program: &str, args: &[String]) -> Result<(), RouterError> {
             let index = self.commands.len();
             self.commands.push(args.join(" "));
-            if self.fail_at == Some(index) {
+            if self.fail_at == Some(index) || self.fail_also_at == Some(index) {
                 return Err(RouterError::Command {
                     program: "route-test".into(),
                     args: args.to_vec(),
@@ -1834,6 +1876,40 @@ mod tests {
                 "remove 192.0.2.10/32",
                 "remove 192.0.2.20/32",
             ]
+        );
+    }
+
+    #[test]
+    fn inverse_failure_is_aggregated_owned_and_retried_before_next_set() {
+        let mut router = StatefulRouter::new(TransactionPlatform, TransactionRunner::default());
+        let previous = RouterConfig {
+            local_routes: vec![prefix("192.0.2.10/32")],
+            ..Default::default()
+        };
+        router.set(&previous).unwrap();
+        let start = router.runner.commands.len();
+        router.runner.fail_at = Some(start + 1);
+        router.runner.fail_also_at = Some(start + 2);
+        let next = RouterConfig {
+            local_routes: vec![prefix("192.0.2.20/32")],
+            ..Default::default()
+        };
+
+        let error = router.set(&next).unwrap_err();
+        assert!(matches!(
+            error,
+            RouterError::Transaction { ref rollback, .. } if rollback.len() == 1
+        ));
+        assert_eq!(router.config, Some(previous.clone()));
+        assert_eq!(router.pending_cleanup.len(), 1);
+
+        router.runner.fail_at = None;
+        router.runner.fail_also_at = None;
+        router.set(&previous).unwrap();
+        assert!(router.pending_cleanup.is_empty());
+        assert_eq!(
+            router.runner.commands.last().unwrap(),
+            "remove 192.0.2.20/32"
         );
     }
 

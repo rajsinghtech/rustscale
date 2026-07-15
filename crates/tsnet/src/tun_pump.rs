@@ -1736,6 +1736,7 @@ pub(crate) type SharedRouter = Arc<std::sync::Mutex<ManagedRouter>>;
 
 pub(crate) struct ManagedRouter {
     pub(crate) router: Box<dyn rustscale_router::Router>,
+    pub(crate) tun_name: String,
     pub(crate) exit_node: bool,
 }
 
@@ -1744,22 +1745,32 @@ pub(crate) fn build_router_config(
     local_addrs: &[IpAddr],
     route_table: &RouteTable,
     exit_node_allow_lan_access: bool,
-) -> rustscale_router::RouterConfig {
-    build_router_config_with_local_routes(
+    tun_name: &str,
+) -> Result<rustscale_router::RouterConfig, TsnetError> {
+    let prefixes = if route_table.exit_node_requested() {
+        rustscale_tsaddr::local_interface_prefixes(tun_name).map_err(|error| {
+            TsnetError::Builder(format!("enumerate connected interface prefixes: {error}"))
+        })?
+    } else {
+        Vec::new()
+    };
+    Ok(build_router_config_with_local_routes(
         local_addrs,
         route_table,
         exit_node_allow_lan_access,
-        rustscale_tsaddr::local_interface_prefixes(),
-    )
+        prefixes,
+    ))
 }
 
 fn build_router_config_with_local_routes(
     local_addrs: &[IpAddr],
     route_table: &RouteTable,
     exit_node_allow_lan_access: bool,
-    local_interface_prefixes: Vec<rustscale_tsaddr::IpPrefix>,
+    mut local_interface_prefixes: Vec<rustscale_tsaddr::IpPrefix>,
 ) -> rustscale_router::RouterConfig {
-    let exit_node = route_table.exit_node().is_some();
+    rustscale_tsaddr::sort_prefixes(&mut local_interface_prefixes);
+    local_interface_prefixes.dedup();
+    let exit_node = route_table.exit_node_requested();
     // Linux table 52 needs explicit throw routes to preserve LAN access.
     // Darwin's connected routes already remain direct, so its LocalRoute
     // operations are intentionally no-ops. No DNS/control/peer destination
@@ -1795,14 +1806,14 @@ fn build_router_config_with_local_routes(
         local_addrs: local_addrs.iter().copied().map(normalize_ip).collect(),
         routes,
         local_routes,
-        exit_node: route_table.exit_node().is_some(),
+        exit_node: route_table.exit_node_requested(),
     }
 }
 
 fn more_specific_children(prefix: &rustscale_tsaddr::IpPrefix) -> Vec<rustscale_tsaddr::IpPrefix> {
     let max = if prefix.ip.is_ipv4() { 32 } else { 128 };
     if prefix.bits >= max {
-        return Vec::new();
+        return vec![*prefix];
     }
     let bits = prefix.bits + 1;
     match prefix.ip {
@@ -1859,19 +1870,29 @@ pub(crate) fn sync_router(
     let mut managed = router
         .lock()
         .map_err(|_| TsnetError::Builder("router lock poisoned".into()))?;
-    let exit_node = route_table.exit_node().is_some();
+    let exit_node = route_table.exit_node_requested();
     let entering_exit_node = exit_node && !managed.exit_node;
     let leaving_exit_node = !exit_node && managed.exit_node;
+    // Interface enumeration is part of the fail-closed desired-state build;
+    // do it before acquiring process policy or touching the live router.
+    let config = build_router_config(
+        local_addrs,
+        route_table,
+        exit_node_allow_lan_access,
+        &managed.tun_name,
+    )?;
     if exit_node {
         // Match upstream netns call sites: control/DERP TCP and magicsock UDP
         // bypass the tunnel at the socket layer. Reapply to the existing UDP
         // socket before installing a catch-all route.
         if entering_exit_node {
-            rustscale_netns::acquire_physical_underlay_bypass();
+            rustscale_netns::acquire_physical_underlay_bypass(&managed.tun_name).map_err(
+                |error| TsnetError::Builder(format!("underlay bypass unavailable: {error}")),
+            )?;
         }
         if let Err(error) = magicsock.refresh_underlay_binding() {
             if entering_exit_node {
-                rustscale_netns::release_physical_underlay_bypass();
+                rustscale_netns::release_physical_underlay_bypass(&managed.tun_name);
             }
             return Err(TsnetError::Builder(format!(
                 "configure underlay UDP socket: {error}"
@@ -1883,10 +1904,12 @@ pub(crate) fn sync_router(
             magicsock.link_changed();
         }
     }
-    let config = build_router_config(local_addrs, route_table, exit_node_allow_lan_access);
     if let Err(error) = managed.router.set(&config) {
         if entering_exit_node {
-            rustscale_netns::release_physical_underlay_bypass();
+            // A failed inverse may have left a catch-all owned by the router.
+            // Retain underlay capability until a later set/close proves the
+            // route state clean; releasing here could strand cleanup traffic.
+            managed.exit_node = true;
         }
         return Err(TsnetError::Builder(format!(
             "route configuration failed: {error}"
@@ -1896,7 +1919,7 @@ pub(crate) fn sync_router(
     if leaving_exit_node {
         // Release only after catch-all teardown, so no underlay packet can
         // briefly recurse through the TUN during the transition.
-        rustscale_netns::release_physical_underlay_bypass();
+        rustscale_netns::release_physical_underlay_bypass(&managed.tun_name);
     }
     Ok(())
 }
@@ -1915,38 +1938,92 @@ pub(crate) async fn create_tun_device(
     let router = if config.apply_routes {
         let mut router = rustscale_router::new(dev.name());
         if let Err(error) = router.up() {
-            let cleanup = router.close().err();
+            let owner = Arc::new(std::sync::Mutex::new(ManagedRouter {
+                router,
+                tun_name: dev.name().to_owned(),
+                exit_node: false,
+            }));
+            let cleanup = Server::cleanup_or_supervise(owner).err();
             return Err(TsnetError::Builder(match cleanup {
-                Some(cleanup) => format!(
-                    "bring TUN interface up: {error}; startup cleanup also failed: {cleanup}"
-                ),
+                Some(cleanup) => {
+                    format!("bring TUN interface up: {error}; startup cleanup retained: {cleanup}")
+                }
                 None => format!("bring TUN interface up: {error}"),
             }));
         }
         let route_config = {
             let route_table = b.route_table.read().await;
-            if route_table.exit_node().is_some() {
-                rustscale_netns::acquire_physical_underlay_bypass();
-                if let Err(error) = b.magicsock.refresh_underlay_binding() {
-                    rustscale_netns::release_physical_underlay_bypass();
-                    let _ = router.close();
-                    return Err(TsnetError::Builder(format!(
-                        "configure underlay UDP socket: {error}"
-                    )));
+            match build_router_config(
+                &b.tailscale_ips,
+                &route_table,
+                exit_node_allow_lan_access,
+                dev.name(),
+            ) {
+                Ok(config) => config,
+                Err(error) => {
+                    drop(route_table);
+                    let owner = Arc::new(std::sync::Mutex::new(ManagedRouter {
+                        router,
+                        tun_name: dev.name().to_owned(),
+                        exit_node: false,
+                    }));
+                    let cleanup = Server::cleanup_or_supervise(owner).err();
+                    return Err(TsnetError::Builder(match cleanup {
+                        Some(cleanup) => format!("{error}; startup cleanup retained: {cleanup}"),
+                        None => error.to_string(),
+                    }));
                 }
-                b.magicsock.link_changed();
             }
-            build_router_config(&b.tailscale_ips, &route_table, exit_node_allow_lan_access)
         };
-        if let Err(error) = router.set(&route_config) {
-            let _ = router.close();
-            if route_config.exit_node {
-                rustscale_netns::release_physical_underlay_bypass();
+        if route_config.exit_node {
+            if let Err(error) = rustscale_netns::acquire_physical_underlay_bypass(dev.name()) {
+                let owner = Arc::new(std::sync::Mutex::new(ManagedRouter {
+                    router,
+                    tun_name: dev.name().to_owned(),
+                    exit_node: false,
+                }));
+                let cleanup = Server::cleanup_or_supervise(owner).err();
+                return Err(TsnetError::Builder(match cleanup {
+                    Some(cleanup) => format!(
+                        "underlay bypass unavailable: {error}; startup cleanup retained: {cleanup}"
+                    ),
+                    None => format!("underlay bypass unavailable: {error}"),
+                }));
             }
-            return Err(TsnetError::Builder(format!("install TUN routes: {error}")));
+            if let Err(error) = b.magicsock.refresh_underlay_binding() {
+                rustscale_netns::release_physical_underlay_bypass(dev.name());
+                let owner = Arc::new(std::sync::Mutex::new(ManagedRouter {
+                    router,
+                    tun_name: dev.name().to_owned(),
+                    exit_node: false,
+                }));
+                let cleanup = Server::cleanup_or_supervise(owner).err();
+                return Err(TsnetError::Builder(match cleanup {
+                    Some(cleanup) => format!(
+                        "configure underlay UDP socket: {error}; startup cleanup retained: {cleanup}"
+                    ),
+                    None => format!("configure underlay UDP socket: {error}"),
+                }));
+            }
+            b.magicsock.link_changed();
+        }
+        if let Err(error) = router.set(&route_config) {
+            let owner = Arc::new(std::sync::Mutex::new(ManagedRouter {
+                router,
+                tun_name: dev.name().to_owned(),
+                exit_node: route_config.exit_node,
+            }));
+            let cleanup = Server::cleanup_or_supervise(owner).err();
+            return Err(TsnetError::Builder(match cleanup {
+                Some(cleanup) => {
+                    format!("install TUN routes: {error}; startup cleanup retained: {cleanup}")
+                }
+                None => format!("install TUN routes: {error}"),
+            }));
         }
         Some(Arc::new(std::sync::Mutex::new(ManagedRouter {
             router,
+            tun_name: dev.name().to_owned(),
             exit_node: route_config.exit_node,
         })))
     } else {
@@ -2021,9 +2098,14 @@ mod tests {
         route_table.set_exit_node(NodePrivate::generate().public());
         let lan_v4 = rustscale_tsaddr::IpPrefix::parse("192.168.0.0/16").unwrap();
         let lan_v6 = rustscale_tsaddr::IpPrefix::parse("fd00:1234::/64").unwrap();
+        let vpn_host = rustscale_tsaddr::IpPrefix::parse("100.100.2.3/32").unwrap();
 
-        let denied =
-            build_router_config_with_local_routes(&[], &route_table, false, vec![lan_v4, lan_v6]);
+        let denied = build_router_config_with_local_routes(
+            &[],
+            &route_table,
+            false,
+            vec![lan_v4, lan_v6, vpn_host],
+        );
         for child in ["192.168.0.0/17", "192.168.128.0/17"] {
             assert!(denied
                 .routes
@@ -2036,13 +2118,18 @@ mod tests {
         }
         assert!(!denied.routes.contains(&lan_v4));
         assert!(!denied.routes.contains(&lan_v6));
+        assert!(denied.routes.contains(&vpn_host));
         assert!(denied.local_routes.is_empty());
 
-        let allowed =
-            build_router_config_with_local_routes(&[], &route_table, true, vec![lan_v4, lan_v6]);
+        let allowed = build_router_config_with_local_routes(
+            &[],
+            &route_table,
+            true,
+            vec![lan_v4, lan_v6, vpn_host],
+        );
         assert!(!allowed.routes.contains(&lan_v4));
         assert!(!allowed.routes.contains(&lan_v6));
-        assert_eq!(allowed.local_routes, [lan_v4, lan_v6]);
+        assert_eq!(allowed.local_routes, [vpn_host, lan_v4, lan_v6]);
     }
 
     #[test]

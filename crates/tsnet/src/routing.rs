@@ -35,6 +35,10 @@ pub struct RouteTable {
     /// `accept_routes`: the exit node's default routes are installed even when
     /// `accept_routes` is false.
     exit_node: Option<NodePublic>,
+    /// Whether ordinary traffic must remain captured even while the requested
+    /// exit peer is unresolved. With no `exit_node`, lookup deliberately drops
+    /// the captured packet instead of permitting direct physical routing.
+    exit_capture: bool,
 }
 
 impl RouteTable {
@@ -86,6 +90,7 @@ impl RouteTable {
             index,
             accept_routes,
             exit_node: None,
+            exit_capture: false,
         }
     }
 
@@ -109,16 +114,20 @@ impl RouteTable {
     pub fn rebuild(&mut self, peers: &[Node]) {
         let accept = self.accept_routes;
         let exit = self.exit_node.clone();
+        let capture = self.exit_capture;
         *self = Self::from_peers_with_opts(peers, accept);
         self.exit_node = exit;
+        self.exit_capture = capture;
     }
 
     /// Rebuild the table from a new peer list with an explicit `accept_routes`
     /// flag. Preserves the selected exit node of the previous table.
     pub fn rebuild_with_opts(&mut self, peers: &[Node], accept_routes: bool) {
         let exit = self.exit_node.clone();
+        let capture = self.exit_capture;
         *self = Self::from_peers_with_opts(peers, accept_routes);
         self.exit_node = exit;
+        self.exit_capture = capture;
     }
 
     /// Number of distinct normalized route entries (for diagnostics/testing).
@@ -128,7 +137,7 @@ impl RouteTable {
 
     /// Whether the table is empty and no exit node is set.
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty() && self.exit_node.is_none()
+        self.entries.is_empty() && !self.exit_node_requested()
     }
 
     /// Iterate over distinct normalized routes as `(network_ip, prefix,
@@ -151,17 +160,32 @@ impl RouteTable {
     /// `accept_routes` is false.
     pub fn set_exit_node(&mut self, peer: NodePublic) {
         self.exit_node = Some(peer);
+        self.exit_capture = true;
+    }
+
+    /// Capture default traffic without forwarding it to any peer. This is the
+    /// fail-closed state for an unresolved requested exit selection.
+    pub fn capture_exit_node(&mut self) {
+        self.exit_node = None;
+        self.exit_capture = true;
     }
 
     /// Clear the selected exit node. After this, destinations not matched by
     /// any entry return `None` from [`lookup`](Self::lookup).
     pub fn clear_exit_node(&mut self) {
         self.exit_node = None;
+        self.exit_capture = false;
     }
 
     /// The currently selected exit node peer, if any.
     pub fn exit_node(&self) -> Option<&NodePublic> {
         self.exit_node.as_ref()
+    }
+
+    /// Whether OS catch-all routes must remain installed, either for a working
+    /// exit peer or for unresolved-selection capture.
+    pub fn exit_node_requested(&self) -> bool {
+        self.exit_capture
     }
 }
 
@@ -561,6 +585,17 @@ mod tests {
             rt.lookup(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2))),
             Some(host_key)
         );
+    }
+
+    #[test]
+    fn unresolved_exit_capture_keeps_defaults_installed_but_drops_ordinary_traffic() {
+        let mut rt = RouteTable::default();
+        rt.capture_exit_node();
+        assert!(rt.exit_node_requested());
+        assert!(rt.exit_node().is_none());
+        assert!(rt.lookup("8.8.8.8".parse().unwrap()).is_none());
+        rt.rebuild(&[]);
+        assert!(rt.exit_node_requested());
     }
 
     #[test]

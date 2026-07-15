@@ -1738,7 +1738,8 @@ impl Magicsock {
     /// Used when exit-node mode starts or the physical default interface
     /// changes after the socket was created.
     pub fn refresh_underlay_binding(&self) -> std::io::Result<()> {
-        if let Some(socket) = self.inner.udp.as_deref() {
+        let udp = self.inner.udp.read().expect("udp socket lock poisoned");
+        if let Some(socket) = udp.as_deref() {
             rustscale_netns::configure_udp_socket(socket)?;
         }
         Ok(())

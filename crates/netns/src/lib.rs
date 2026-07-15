@@ -9,24 +9,26 @@ mod socks;
 #[cfg(target_os = "linux")]
 use linux::{
     configure_udp_socket as configure_platform_udp_socket, control_and_connect,
-    system_control_and_connect,
+    system_control_and_connect, validate_underlay_bypass,
 };
 #[cfg(target_os = "macos")]
 use macos::{
     configure_udp_socket as configure_platform_udp_socket, control_and_connect,
-    system_control_and_connect,
+    system_control_and_connect, validate_underlay_bypass,
 };
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 use other::{
     configure_udp_socket as configure_platform_udp_socket, control_and_connect,
-    system_control_and_connect,
+    system_control_and_connect, validate_underlay_bypass,
 };
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 static ENABLED: AtomicBool = AtomicBool::new(true);
 static PHYSICAL_UNDERLAY_USERS: AtomicUsize = AtomicUsize::new(0);
+static PHYSICAL_UNDERLAY_TUNS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 static BIND_TO_INTERFACE_BY_ROUTE: AtomicBool = AtomicBool::new(false);
 // Binding magicsock's own UDP sockets to the default physical interface is a
 // route-loop bypass that is only needed when the OS route table sends the
@@ -56,13 +58,34 @@ pub fn set_disable_bind_conn_to_interface(v: bool) {
 /// Acquire process-wide UDP physical-underlay binding for one full-tunnel
 /// owner. Calls are reference-counted so multiple embedded TUN servers cannot
 /// disable each other's bypass policy.
-pub fn acquire_physical_underlay_bypass() {
+pub fn acquire_physical_underlay_bypass(rustscale_tun_name: &str) -> Result<(), std::io::Error> {
+    validate_underlay_bypass(rustscale_tun_name)?;
+    PHYSICAL_UNDERLAY_TUNS
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .map_err(|_| std::io::Error::other("underlay TUN registry poisoned"))?
+        .push(rustscale_tun_name.to_owned());
     PHYSICAL_UNDERLAY_USERS.fetch_add(1, Ordering::AcqRel);
     set_disable_bind_conn_to_interface(false);
+    Ok(())
 }
 
 /// Release one full-tunnel owner's UDP physical-underlay binding.
-pub fn release_physical_underlay_bypass() {
+pub fn release_physical_underlay_bypass(rustscale_tun_name: &str) {
+    let Some(tuns) = PHYSICAL_UNDERLAY_TUNS.get() else {
+        return;
+    };
+    let removed = match tuns.lock() {
+        Ok(mut tuns) => tuns
+            .iter()
+            .position(|name| name == rustscale_tun_name)
+            .map(|index| tuns.remove(index))
+            .is_some(),
+        Err(_) => false,
+    };
+    if !removed {
+        return;
+    }
     let released_last = PHYSICAL_UNDERLAY_USERS
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |users| {
             users.checked_sub(1)
@@ -71,6 +94,14 @@ pub fn release_physical_underlay_bypass() {
     if released_last {
         set_disable_bind_conn_to_interface(true);
     }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn is_managed_tun_name(name: &str) -> bool {
+    PHYSICAL_UNDERLAY_TUNS
+        .get()
+        .and_then(|tuns| tuns.lock().ok())
+        .is_some_and(|tuns| tuns.iter().any(|tun| tun == name))
 }
 
 pub fn is_localhost(addr: &str) -> bool {
@@ -181,6 +212,23 @@ pub fn configure_udp_socket(socket: &tokio::net::UdpSocket) -> Result<(), std::i
 #[cfg(test)]
 mod tests {
     use super::is_localhost;
+    #[cfg(target_os = "macos")]
+    use super::{is_managed_tun_name, PHYSICAL_UNDERLAY_TUNS};
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn managed_tun_identity_is_exact_not_a_name_pattern() {
+        let registry = PHYSICAL_UNDERLAY_TUNS.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+        {
+            let mut names = registry.lock().unwrap();
+            names.clear();
+            names.push("rustscale0".into());
+        }
+        assert!(is_managed_tun_name("rustscale0"));
+        assert!(!is_managed_tun_name("rustscale01"));
+        assert!(!is_managed_tun_name("utun9"));
+        registry.lock().unwrap().clear();
+    }
+
     #[test]
     fn test_localhost_str() {
         assert!(is_localhost("localhost"));

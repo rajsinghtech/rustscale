@@ -32,6 +32,10 @@ pub fn configure_udp_socket(socket: &UdpSocket) -> Result<(), std::io::Error> {
     configure_socket(socket.as_raw_fd(), false)
 }
 
+pub fn validate_underlay_bypass(_rustscale_tun_name: &str) -> Result<(), std::io::Error> {
+    Ok(())
+}
+
 fn configure_socket(fd: std::os::fd::RawFd, force_bypass: bool) -> Result<(), std::io::Error> {
     if !force_bypass
         && super::DISABLE_BIND_CONN_TO_INTERFACE.load(std::sync::atomic::Ordering::Relaxed)

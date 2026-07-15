@@ -145,6 +145,8 @@ impl Monitor {
 
         let shared_clone = shared.clone();
         let shutdown_clone = shutdown.clone();
+        let callback_tasks = Arc::new(tokio::sync::Mutex::new(Vec::<JoinHandle<()>>::new()));
+        let debounce_callback_tasks = callback_tasks.clone();
 
         let debounce_task = tokio::spawn(async move {
             let mut last_instant = Instant::now();
@@ -213,9 +215,12 @@ impl Monitor {
                 };
                 for cb in callbacks {
                     let d = delta.clone();
-                    tokio::spawn(async move {
+                    let task = tokio::spawn(async move {
                         cb(d).await;
                     });
+                    let mut tasks = debounce_callback_tasks.lock().await;
+                    tasks.retain(|task| !task.is_finished());
+                    tasks.push(task);
                 }
 
                 tokio::time::sleep(DEBOUNCE).await;
@@ -228,7 +233,8 @@ impl Monitor {
             shared,
             shutdown,
             stopped,
-            debounce_task,
+            debounce_task: Some(debounce_task),
+            callback_tasks,
         }
     }
 }
@@ -238,7 +244,8 @@ pub struct MonitorHandle {
     shared: Arc<MonitorShared>,
     shutdown: Arc<Notify>,
     stopped: Arc<AtomicBool>,
-    debounce_task: JoinHandle<()>,
+    debounce_task: Option<JoinHandle<()>>,
+    callback_tasks: Arc<tokio::sync::Mutex<Vec<JoinHandle<()>>>>,
 }
 
 /// RAII handle for a registered change callback. Dropping it unregisters
@@ -344,12 +351,40 @@ impl MonitorHandle {
         self.stopped.store(true, Ordering::SeqCst);
         self.shutdown.notify_one();
     }
+
+    /// Stop and join the monitor loop and every callback it launched.
+    /// Handles stay in this value across each await, so cancellation leaves a
+    /// retryable owner instead of detaching callbacks from their resources.
+    pub async fn shutdown_and_wait(&mut self) {
+        self.shutdown();
+        if let Some(task) = self.debounce_task.as_mut() {
+            task.abort();
+            let _ = (&mut *task).await;
+        }
+        self.debounce_task.take();
+
+        let mut tasks = self.callback_tasks.lock().await;
+        for task in tasks.iter() {
+            task.abort();
+        }
+        while let Some(task) = tasks.first_mut() {
+            let _ = (&mut *task).await;
+            tasks.swap_remove(0);
+        }
+    }
 }
 
 impl Drop for MonitorHandle {
     fn drop(&mut self) {
         self.stopped.store(true, Ordering::SeqCst);
         self.shutdown.notify_waiters();
-        self.debounce_task.abort();
+        if let Some(task) = &self.debounce_task {
+            task.abort();
+        }
+        if let Ok(tasks) = self.callback_tasks.try_lock() {
+            for task in tasks.iter() {
+                task.abort();
+            }
+        }
     }
 }

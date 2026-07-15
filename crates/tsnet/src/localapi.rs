@@ -333,15 +333,16 @@ pub struct LocalApiHandle {
 }
 
 impl LocalApiHandle {
-    pub(crate) fn into_task_and_path(mut self) -> (JoinHandle<()>, PathBuf) {
-        let task = self.task.take().expect("LocalAPI task already taken");
-        let path = std::mem::take(&mut self.socket_path);
-        self.armed = false;
-        (task, path)
+    /// Revoke the published socket before any asynchronous shutdown work.
+    /// The task handle remains owned here so a cancelled caller can retry and
+    /// still join the accept loop and all connection tasks.
+    pub(crate) fn begin_shutdown(&mut self) {
+        self.shutdown_tx.send_replace(true);
+        let _ = std::fs::remove_file(&self.socket_path);
     }
 
-    pub(crate) async fn shutdown(mut self) {
-        self.shutdown_tx.send_replace(true);
+    pub(crate) async fn shutdown(&mut self) {
+        self.begin_shutdown();
         if let Some(task) = self.task.as_mut() {
             if tokio::time::timeout(std::time::Duration::from_secs(5), &mut *task)
                 .await
@@ -352,7 +353,7 @@ impl LocalApiHandle {
             }
         }
         self.task.take();
-        let _ = std::fs::remove_file(&self.socket_path);
+        self.armed = false;
     }
 }
 
@@ -4669,7 +4670,7 @@ mod tests {
         );
 
         // Clean up: stop the task and remove the socket.
-        if let Some(h) = handle {
+        if let Some(mut h) = handle {
             h.shutdown().await;
         }
         let _ = std::fs::remove_file(&tmp);
@@ -4802,7 +4803,7 @@ mod tests {
         assert_eq!(notify["State"], 6); // Running
 
         // Clean up.
-        if let Some(h) = handle {
+        if let Some(mut h) = handle {
             h.shutdown().await;
         }
         let _ = std::fs::remove_file(&tmp);
@@ -4871,7 +4872,7 @@ mod tests {
                 || transition_notify["SessionID"].is_null()
         );
 
-        if let Some(h) = handle {
+        if let Some(mut h) = handle {
             h.shutdown().await;
         }
         let _ = std::fs::remove_file(&tmp);
@@ -4941,7 +4942,7 @@ mod tests {
         // No State field (no initial state notify was sent).
         assert!(notify.get("State").is_none() || notify["State"].is_null());
 
-        if let Some(h) = handle {
+        if let Some(mut h) = handle {
             h.shutdown().await;
         }
         let _ = std::fs::remove_file(&tmp);

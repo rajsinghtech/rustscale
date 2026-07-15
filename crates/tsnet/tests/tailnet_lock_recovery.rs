@@ -234,6 +234,7 @@ async fn profile_switches_isolate_identity_cache_signing_key_and_chonk() {
         .control_url(control.base_url())
         .state_dir(state.path())
         .localapi_path(&socket)
+        .disable_portmapping(true)
         .build()
         .unwrap();
     Box::pin(tokio::time::timeout(Duration::from_secs(60), first.up()))
@@ -254,7 +255,7 @@ async fn profile_switches_isolate_identity_cache_signing_key_and_chonk() {
         }))
         .await
         .unwrap();
-    first.close().await;
+    first.close().await.into_result().expect("close profile-a");
 
     rustscale_ipn::LoginProfile::save_current_id(state.path(), "profile-b").unwrap();
     let mut second = Server::builder()
@@ -263,6 +264,7 @@ async fn profile_switches_isolate_identity_cache_signing_key_and_chonk() {
         .control_url(control.base_url())
         .state_dir(state.path())
         .localapi_path(&socket)
+        .disable_portmapping(true)
         .build()
         .unwrap();
     Box::pin(tokio::time::timeout(Duration::from_secs(60), second.up()))
@@ -278,7 +280,7 @@ async fn profile_switches_isolate_identity_cache_signing_key_and_chonk() {
         "profiles reused a signing key"
     );
     assert!(b["Enabled"].as_bool().unwrap());
-    second.close().await;
+    second.close().await.into_result().expect("close profile-b");
 
     rustscale_ipn::LoginProfile::save_current_id(state.path(), "profile-a").unwrap();
     let mut restored = Server::builder()
@@ -286,6 +288,7 @@ async fn profile_switches_isolate_identity_cache_signing_key_and_chonk() {
         .control_url(control.base_url())
         .state_dir(state.path())
         .localapi_path(&socket)
+        .disable_portmapping(true)
         .build()
         .unwrap();
     Box::pin(tokio::time::timeout(Duration::from_secs(60), restored.up()))
@@ -319,7 +322,11 @@ async fn profile_switches_isolate_identity_cache_signing_key_and_chonk() {
             >= 2,
         "each profile must own a distinct authority store"
     );
-    restored.close().await;
+    restored
+        .close()
+        .await
+        .into_result()
+        .expect("close restored profile-a");
 }
 
 fn walk_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {

@@ -447,7 +447,7 @@ impl Server {
         tasks.push(hostinfo_loop);
 
         // LocalAPI Unix-domain-socket server (optional, default OFF).
-        let localapi_socket = if self.config.localapi {
+        let (localapi_handle, localapi_socket) = if self.config.localapi {
             let path = self.config.localapi_path.clone().unwrap_or_else(|| {
                 let dir = self
                     .config
@@ -557,27 +557,23 @@ impl Server {
             localapi::activate_preference_policy(&state)
                 .await
                 .map_err(TsnetError::Builder)?;
-            if let Some(h) = localapi::spawn_localapi(state, path.clone()) {
-                let (task, socket_path) = h.into_task_and_path();
-                tasks.push(task);
-                if let Some(ref ps) = self.pre_started {
-                    if let Some(ref handle) = ps.handle {
-                        if let Some(task) = &handle.task {
-                            task.abort();
-                        }
-                    }
+            if let Some(pre_started) = self.pre_started.as_mut() {
+                if let Some(handle) = pre_started.handle.as_mut() {
+                    handle.shutdown().await;
                 }
+            }
+            if let Some(h) = localapi::spawn_localapi(state, path.clone()) {
                 log::info!("tsnet: LocalAPI listening at {}", path.display());
-                Some(socket_path)
+                (Some(h), Some(path))
             } else {
                 log::warn!(
                     "tsnet: LocalAPI failed to bind socket at {}",
                     path.display()
                 );
-                None
+                (None, None)
             }
         } else {
-            None
+            (None, None)
         };
 
         self.inner = Some(RunningState {
@@ -615,6 +611,7 @@ impl Server {
             control_knobs: b.control_knobs,
             peerapi_port,
             overrides: b.overrides,
+            localapi_handle,
             localapi_socket,
             key_expired: b.key_expired,
             os_dns_configurator: None,
@@ -964,7 +961,7 @@ impl Server {
             self.config.preference_policy.clone(),
         );
 
-        let mut tasks = vec![
+        let tasks = vec![
             b.map_task,
             pump,
             map_update,
@@ -975,7 +972,7 @@ impl Server {
         ];
 
         // LocalAPI Unix-domain-socket server (optional, default OFF).
-        let localapi_socket = if self.config.localapi {
+        let (localapi_handle, localapi_socket) = if self.config.localapi {
             let path = self.config.localapi_path.clone().unwrap_or_else(|| {
                 let dir = self
                     .config
@@ -1085,27 +1082,23 @@ impl Server {
             localapi::activate_preference_policy(&state)
                 .await
                 .map_err(TsnetError::Builder)?;
-            if let Some(h) = localapi::spawn_localapi(state, path.clone()) {
-                let (task, socket_path) = h.into_task_and_path();
-                tasks.push(task);
-                if let Some(ref ps) = self.pre_started {
-                    if let Some(ref handle) = ps.handle {
-                        if let Some(task) = &handle.task {
-                            task.abort();
-                        }
-                    }
+            if let Some(pre_started) = self.pre_started.as_mut() {
+                if let Some(handle) = pre_started.handle.as_mut() {
+                    handle.shutdown().await;
                 }
+            }
+            if let Some(h) = localapi::spawn_localapi(state, path.clone()) {
                 log::info!("tsnet: LocalAPI listening at {}", path.display());
-                Some(socket_path)
+                (Some(h), Some(path))
             } else {
                 log::warn!(
                     "tsnet: LocalAPI failed to bind socket at {}",
                     path.display()
                 );
-                None
+                (None, None)
             }
         } else {
-            None
+            (None, None)
         };
 
         // OS DNS configuration (macOS: /etc/resolver entries pointing at
@@ -1176,6 +1169,7 @@ impl Server {
             control_knobs: b.control_knobs,
             peerapi_port,
             overrides: b.overrides,
+            localapi_handle,
             localapi_socket,
             key_expired: b.key_expired,
             os_dns_configurator,
@@ -1760,8 +1754,13 @@ impl Server {
         // publish a port-mapped external endpoint alongside local/STUN
         // endpoints. Best-effort: if the gateway doesn't support any
         // port-mapping protocol, this silently produces no endpoint.
-        let portmapper = rustscale_portmapper::Client::new();
-        portmapper.set_local_port(udp_port);
+        let portmapper = if self.config.disable_portmapping {
+            None
+        } else {
+            let portmapper = rustscale_portmapper::Client::new();
+            portmapper.set_local_port(udp_port);
+            Some(portmapper)
+        };
 
         // 3c. Send a lightweight non-streaming MapRequest to push our
         // DiscoKey + Endpoints to the control server BEFORE starting the
@@ -2106,7 +2105,7 @@ impl Server {
             home_derp_region: home_derp,
             udp_bind: None,
             udp_socket: Some(udp_socket),
-            portmapper: Some(portmapper),
+            portmapper,
             health: Some(health.clone()),
             disable_direct_paths: self.config.disable_direct_paths,
             peer_relay_server: self.config.peer_relay_server,
@@ -2120,7 +2119,9 @@ impl Server {
         // Start a background port-mapping probe + creation (best-effort, 2s
         // timeout). The cached mapping will be picked up by subsequent
         // `all_endpoints()` calls and published to the control plane.
-        magicsock.start_portmap();
+        if !self.config.disable_portmapping {
+            magicsock.start_portmap();
+        }
 
         // The server may send peers via Peers (full list) or PeersChanged
         // (delta). The first response often uses PeersChanged.
@@ -2350,66 +2351,124 @@ impl Server {
 
     /// Shut down the server.
     pub async fn close(&mut self) -> CloseResult {
-        // Take pre-login ownership before the first await. If this future is
-        // cancelled, LocalApiHandle::drop still aborts the listener and all
-        // connection tasks instead of resurrecting detached NeedsLogin state.
-        let mut pre_started = self.pre_started.take();
+        // Revoke LocalAPI publication before the first await. Keep every
+        // handle in Server state until its task has been joined: cancelling
+        // this future must leave close retryable, not detach the old profile.
+        if let Some(pre_started) = self.pre_started.as_mut() {
+            if let Some(handle) = pre_started.handle.as_mut() {
+                handle.begin_shutdown();
+            }
+            let _ = std::fs::remove_file(&pre_started.socket_path);
+        }
+        if let Some(inner) = self.inner.as_mut() {
+            if let Some(handle) = inner.localapi_handle.as_mut() {
+                handle.begin_shutdown();
+            }
+            if let Some(path) = inner.localapi_socket.as_ref() {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+
         // Runtime shares are intentionally not persisted across shutdown or
-        // profile changes; drop pinned roots and cancel active requests first.
+        // profile changes. This is also the Taildrive publication barrier:
+        // revoke grants and wait for active requests before stopping pumps.
         self.drive.disable().await;
-        if let Some(mut pre_started_state) = pre_started.take() {
-            if let Err(error) = pre_started_state
-                .magicsock
+
+        if let Some(pre_started) = self.pre_started.as_mut() {
+            if let Some(handle) = pre_started.handle.as_mut() {
+                handle.shutdown().await;
+            }
+        }
+
+        // Cancel and join all server-owned consumers before asking magicsock
+        // to join its internal DERP/relay/UDP tasks. The task vector remains
+        // behind RunningState's mutex at every await, so timeout or caller
+        // cancellation retains ownership for a later close retry.
+        if let Some(inner) = self.inner.as_mut() {
+            if let Some(handle) = inner.localapi_handle.as_mut() {
+                handle.shutdown().await;
+            }
+            if let Some(serve) = inner.serve.as_ref() {
+                serve.stop().await;
+            }
+            inner.cancel.cancel();
+            inner.health_watchdog.stop();
+            if let Some(monitor) = inner.monitor.as_mut() {
+                monitor.shutdown_and_wait().await;
+            }
+
+            let join_result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let mut tasks = inner.tasks.lock().await;
+                for task in tasks.iter() {
+                    task.abort();
+                }
+                while let Some(task) = tasks.first_mut() {
+                    let _ = (&mut *task).await;
+                    tasks.swap_remove(0);
+                }
+            })
+            .await;
+            if join_result.is_err() {
+                return CloseResult(Err(TsnetError::Io(std::io::Error::other(
+                    "server task cleanup incomplete",
+                ))));
+            }
+
+            inner.magicsock.set_connection_counter(None);
+            if let Some(netlog) = inner.netlog.as_ref() {
+                if let Err(error) = netlog.stop().await {
+                    log::warn!("tsnet: netlog shutdown failed (non-fatal): {error}");
+                }
+            }
+            inner
+                .audit_logger
+                .flush_and_stop(std::time::Duration::from_secs(5))
+                .await;
+        }
+
+        let pre_started_magicsock = self
+            .pre_started
+            .as_ref()
+            .map(|pre_started| pre_started.magicsock.clone());
+        if let Some(magicsock) = pre_started_magicsock {
+            if let Err(error) = magicsock
                 .shutdown_portmapper(std::time::Duration::from_secs(5))
                 .await
             {
-                self.pre_started = Some(pre_started_state);
                 return CloseResult(Err(TsnetError::Io(std::io::Error::other(format!(
                     "pre-login portmapper cleanup incomplete: {error}"
                 )))));
             }
-            if let Err(error) = pre_started_state
-                .magicsock
-                .shutdown(std::time::Duration::from_secs(5))
-                .await
-            {
-                self.pre_started = Some(pre_started_state);
+            if let Err(error) = magicsock.shutdown(std::time::Duration::from_secs(5)).await {
                 return CloseResult(Err(TsnetError::Io(std::io::Error::other(format!(
                     "pre-login magicsock cleanup incomplete: {error}"
                 )))));
             }
-            // Stop accepting before dropping command and magicsock ownership;
-            // shutdown joins the accept loop and every spawned connection.
-            if let Some(handle) = pre_started_state.handle.take() {
-                handle.shutdown().await;
-            }
-            pre_started_state.command_tx.take();
-            pre_started_state.command_rx.take();
-            let _ = std::fs::remove_file(&pre_started_state.socket_path);
         }
-        if let Some(mut inner) = self.inner.take() {
-            if let Err(error) = inner
-                .magicsock
+
+        let magicsock = self.inner.as_ref().map(|inner| inner.magicsock.clone());
+        if let Some(magicsock) = magicsock {
+            if let Err(error) = magicsock
                 .shutdown_portmapper(std::time::Duration::from_secs(5))
                 .await
             {
                 log::warn!("tsnet: retaining running state for portmapper cleanup retry: {error}");
-                self.inner = Some(inner);
                 return CloseResult(Err(TsnetError::Io(std::io::Error::other(format!(
                     "portmapper cleanup incomplete: {error}"
                 )))));
             }
-            if let Err(error) = inner
-                .magicsock
-                .shutdown(std::time::Duration::from_secs(5))
-                .await
-            {
+            if let Err(error) = magicsock.shutdown(std::time::Duration::from_secs(5)).await {
                 log::warn!("tsnet: retaining running state for magicsock cleanup retry: {error}");
-                self.inner = Some(inner);
                 return CloseResult(Err(TsnetError::Io(std::io::Error::other(format!(
                     "magicsock cleanup incomplete: {error}"
                 )))));
             }
+        }
+
+        // No awaits after this point: commit synchronous platform cleanup and
+        // release the fully stopped profile state atomically with respect to
+        // cancellation.
+        if let Some(mut inner) = self.inner.take() {
             if let Some(router) = inner.router.take() {
                 match router.lock() {
                     Ok(mut router) => {
@@ -2426,41 +2485,15 @@ impl Server {
                 .lock()
                 .expect("capture handles lock poisoned")
                 .clear();
-            inner
-                .audit_logger
-                .flush_and_stop(std::time::Duration::from_secs(5))
-                .await;
-            // Stop serve listeners first (graceful).
-            if let Some(serve) = inner.serve.take() {
-                serve.stop().await;
-            }
-            inner.cancel.cancel();
-            inner.health_watchdog.stop();
-            if let Some(m) = inner.monitor.take() {
-                m.shutdown();
-            }
-            let mut tasks = inner.tasks.lock().await;
-            for task in tasks.drain(..) {
-                task.abort();
-            }
-            drop(tasks);
-            inner.magicsock.set_connection_counter(None);
-            if let Some(netlog) = inner.netlog.take() {
-                if let Err(error) = netlog.stop().await {
-                    log::warn!("tsnet: netlog shutdown failed (non-fatal): {error}");
-                }
-            }
-            // Clean up the LocalAPI socket file if it was created.
-            if let Some(ref path) = inner.localapi_socket {
-                let _ = std::fs::remove_file(path);
-            }
-            // Remove OS DNS configuration (e.g. /etc/resolver entries) if
-            // we installed it. Best-effort: log on error.
             if let Some(mut cfg) = inner.os_dns_configurator.take() {
                 if let Err(e) = cfg.close() {
                     log::warn!("tsnet: OS DNS cleanup failed (non-fatal): {e}");
                 }
             }
+        }
+        if let Some(mut pre_started) = self.pre_started.take() {
+            pre_started.command_tx.take();
+            pre_started.command_rx.take();
         }
         CloseResult(Ok(()))
     }

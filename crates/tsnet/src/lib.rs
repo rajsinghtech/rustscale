@@ -293,6 +293,9 @@ pub struct ServerBuilder {
     /// [`MagicsockConfig::disable_direct_paths`]. Production code should
     /// leave this false.
     pub(crate) disable_direct_paths: bool,
+    /// Whether NAT-PMP/PCP/UPnP endpoint discovery is disabled. Production
+    /// defaults to false; hermetic tests can opt out of host gateway state.
+    pub(crate) disable_portmapping: bool,
     /// Runtime Hostinfo field overrides (mirror Go's
     /// `hostinfo.SetDeviceModel`/`SetApp`/`SetOSVersion`/`SetPackage`).
     /// Applied before platform detection so they win over auto-detected
@@ -410,6 +413,7 @@ impl std::fmt::Debug for ServerBuilder {
             .field("accept_routes", &self.accept_routes)
             .field("advertise_exit_node", &self.advertise_exit_node)
             .field("disable_direct_paths", &self.disable_direct_paths)
+            .field("disable_portmapping", &self.disable_portmapping)
             .field("localapi", &self.localapi)
             .field("localapi_path", &self.localapi_path)
             .field("configure_os_dns", &self.configure_os_dns)
@@ -550,6 +554,14 @@ impl ServerBuilder {
     /// connectivity in isolation. See [`MagicsockConfig::disable_direct_paths`].
     pub fn disable_direct_paths(mut self, on: bool) -> Self {
         self.disable_direct_paths = on;
+        self
+    }
+
+    /// Disable NAT-PMP, PCP, and UPnP endpoint discovery. This is primarily
+    /// useful for hermetic tests that must not inspect or modify the host's
+    /// gateway. Production callers should leave port mapping enabled.
+    pub fn disable_portmapping(mut self, on: bool) -> Self {
+        self.disable_portmapping = on;
         self
     }
 
@@ -828,8 +840,12 @@ pub(crate) struct RunningState {
     pub(crate) peerapi_port: Option<u16>,
     /// Runtime Hostinfo field overrides (shared with the update loop).
     pub(crate) overrides: SharedOverrides,
-    /// LocalAPI socket path (if the server was spawned). Used for cleanup on
-    /// close().
+    /// LocalAPI accept-loop ownership. Kept separate from the generic task
+    /// set so shutdown can revoke publication and join every connection before
+    /// releasing profile identity and magicsock ownership.
+    pub(crate) localapi_handle: Option<localapi::LocalApiHandle>,
+    /// LocalAPI socket path (if the server was spawned). Used for diagnostics
+    /// and cleanup on close().
     pub(crate) localapi_socket: Option<PathBuf>,
     /// Node key expired flag — set when the control server signals
     /// `NodeKeyExpired` in a MapResponse. The client should transition to

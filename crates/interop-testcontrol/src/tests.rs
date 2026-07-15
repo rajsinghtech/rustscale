@@ -317,11 +317,15 @@ struct NodeEntry {
 
 /// Build a tsnet Server pointing at the testcontrol URL.
 fn make_server(tc: &TestControl, hostname: &str) -> Server {
+    make_server_with_ephemeral(tc, hostname, true)
+}
+
+fn make_server_with_ephemeral(tc: &TestControl, hostname: &str, ephemeral: bool) -> Server {
     ServerBuilder::default()
         .hostname(hostname)
         .control_url(tc.url())
         .auth_key(AUTH_KEY)
-        .ephemeral(true)
+        .ephemeral(ephemeral)
         .disable_direct_paths(true)
         .build()
         .expect("failed to build server")
@@ -482,7 +486,9 @@ async fn testcontrol_key_expiry_and_recovery() {
         eprintln!("skip: testcontrol binary not available");
         return;
     };
-    let mut server = make_server(&tc, "node-d");
+    // Expired ephemeral nodes are removed by testcontrol, so use a persistent
+    // node to exercise the intended expire/recover stream lifecycle.
+    let mut server = make_server_with_ephemeral(&tc, "node-d", false);
     wait_for_up(&mut server, "node-d").await;
 
     assert!(

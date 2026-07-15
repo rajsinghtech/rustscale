@@ -718,7 +718,9 @@ impl ReceiveBatch {
     pub(crate) fn new(socket: &UdpSocket, disable_gro: bool) -> Self {
         let gro_enabled = !disable_gro && try_enable_udp_gro(socket);
         if disable_gro {
-            eprintln!("rustscale: Linux UDP GRO receive disabled by RUSTSCALE_DISABLE_UDP_GRO");
+            eprintln!(
+                "rustscale: Linux UDP GRO receive disabled (set RUSTSCALE_ENABLE_UDP_GRO=1 to opt in)"
+            );
         }
         // Queue-overflow accounting is independent and remains useful after a
         // GRO circuit break or when GRO was disabled by the startup knob.
@@ -1356,6 +1358,7 @@ mod tests {
         batch.headers[index].msg_len = packet.len() as _;
         batch.headers[index].msg_hdr.msg_namelen = mem::size_of::<libc::sockaddr_in>() as _;
         batch.headers[index].msg_hdr.msg_flags = 0;
+        batch.headers[index].msg_hdr.msg_controllen = 0;
         batch.headers[index].msg_hdr.msg_controllen = control_len as _;
     }
 

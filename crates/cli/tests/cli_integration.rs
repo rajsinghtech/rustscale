@@ -30,15 +30,9 @@ fn wait_for_socket(path: &std::path::Path, timeout: Duration) {
     }
 }
 
-/// Path to the built `rustscale` binary (same target dir as this test).
+/// Path to the `rustscale` binary Cargo built for this integration test.
 fn rustscale_bin() -> PathBuf {
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    PathBuf::from(manifest_dir)
-        .join("..")
-        .join("..")
-        .join("target")
-        .join("debug")
-        .join("rustscale")
+    PathBuf::from(env!("CARGO_BIN_EXE_rustscale"))
 }
 
 /// Set up the test environment: start testcontrol, bring up a tsnet server

@@ -43,6 +43,7 @@ struct FakeIgd {
     pmp_external_ip: Ipv4Addr,
     pcp_mutation: Option<PcpMutation>,
     upnp_permanent_malformed: bool,
+    upnp_add_fault_code: Option<u32>,
     upnp_delete_fault: bool,
     closed: Arc<AtomicBool>,
     pmp_recv_count: Arc<AtomicU32>,
@@ -75,6 +76,7 @@ impl FakeIgd {
             pmp_external_ip: opts.pmp_external_ip,
             pcp_mutation: opts.pcp_mutation,
             upnp_permanent_malformed: opts.upnp_permanent_malformed,
+            upnp_add_fault_code: opts.upnp_add_fault_code,
             upnp_delete_fault: opts.upnp_delete_fault,
             closed: closed.clone(),
             pmp_recv_count: Arc::new(AtomicU32::new(0)),
@@ -315,7 +317,12 @@ impl FakeIgd {
                     gate.reached.wait().await;
                     gate.resume.wait().await;
                 }
-                if self.upnp_permanent_malformed {
+                if let Some(code) = self.upnp_add_fault_code {
+                    let fault = format!(
+                        r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><s:Fault><detail><UPnPError xmlns="urn:schemas-upnp-org:control-1-0"><errorCode>{code}</errorCode></UPnPError></detail></s:Fault></s:Body></s:Envelope>"#
+                    );
+                    write_soap_response(stream, &fault).await;
+                } else if self.upnp_permanent_malformed {
                     if req.contains("<NewLeaseDuration>0</NewLeaseDuration>") {
                         write_soap_response(stream, "").await;
                     } else {
@@ -375,6 +382,7 @@ struct IgdOpts {
     pmp_external_ip: Ipv4Addr,
     pcp_mutation: Option<PcpMutation>,
     upnp_permanent_malformed: bool,
+    upnp_add_fault_code: Option<u32>,
     upnp_delete_fault: bool,
 }
 
@@ -387,6 +395,7 @@ impl Default for IgdOpts {
             pmp_external_ip: Ipv4Addr::new(123, 123, 123, 123),
             pcp_mutation: None,
             upnp_permanent_malformed: false,
+            upnp_add_fault_code: None,
             upnp_delete_fault: false,
         }
     }
@@ -714,6 +723,37 @@ async fn ambiguous_upnp_add_is_compensated_before_key_reuse() {
     assert_eq!(mapping.kind, MappingKind::Upnp);
     client.close();
     igd.close();
+}
+
+#[tokio::test]
+async fn valid_add_rejections_clear_ownership_without_compensating_delete() {
+    for code in [718, 799] {
+        let igd = FakeIgd::start(IgdOpts {
+            upnp: true,
+            upnp_add_fault_code: Some(code),
+            ..Default::default()
+        })
+        .await;
+        let client = make_test_client(&igd);
+
+        assert!(client.create_or_get_mapping().await.is_err());
+        assert_eq!(
+            igd.upnp_add_count.load(Ordering::SeqCst),
+            1,
+            "valid fault {code} must not trigger fallback Add"
+        );
+        assert_eq!(
+            igd.upnp_delete_count.load(Ordering::SeqCst),
+            0,
+            "valid fault {code} must not delete a preexisting mapping"
+        );
+        client
+            .shutdown(Duration::from_secs(2))
+            .await
+            .expect("definitive Add rejection must clear provisional ownership");
+        assert_eq!(igd.upnp_delete_count.load(Ordering::SeqCst), 0);
+        igd.close();
+    }
 }
 
 #[tokio::test]

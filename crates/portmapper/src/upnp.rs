@@ -226,11 +226,21 @@ where
 
     // Only a structurally valid SOAP Fault proves that Add was rejected.
     // Malformed HTTP responses remain ambiguous and retain ownership.
-    if matches!(
-        soap_fault_code(&resp),
-        Some(SoapFaultCode::OnlyPermanentLeasesSupported | SoapFaultCode::InvalidArgs)
-    ) {
+    if let Some(code) = soap_fault_code(&resp) {
+        // A structurally valid UPnP fault is a definitive rejection: this Add
+        // did not create our mapping. Resolve provisional ownership before
+        // deciding whether this particular code permits a fallback retry.
         rejected(port, false);
+        if !code.allows_permanent_add_retry() {
+            return Err(AmbiguousAddError {
+                port,
+                permanent: false,
+                source: std::io::Error::other(format!(
+                    "AddPortMapping rejected with UPnP error {}",
+                    code.0
+                )),
+            });
+        }
         let body = build_add_port_mapping_soap(
             service_type,
             "",
@@ -268,10 +278,9 @@ where
                 permanent: true,
             });
         }
-        if matches!(
-            soap_fault_code(&resp),
-            Some(SoapFaultCode::OnlyPermanentLeasesSupported | SoapFaultCode::InvalidArgs)
-        ) {
+        if soap_fault_code(&resp).is_some() {
+            // Any valid fault proves the permanent Add was rejected. Unknown
+            // codes must not trigger compensation against another owner.
             rejected(port, true);
         }
         return Err(AmbiguousAddError {
@@ -335,14 +344,16 @@ fn delete_response_is_success(status: u16, response: &str, service_type: &str) -
 }
 
 fn soap_not_found(body: &str) -> bool {
-    soap_fault_code(body) == Some(SoapFaultCode::NoSuchEntryInArray)
+    soap_fault_code(body) == Some(SoapFaultCode(714))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SoapFaultCode {
-    InvalidArgs,
-    NoSuchEntryInArray,
-    OnlyPermanentLeasesSupported,
+struct SoapFaultCode(u32);
+
+impl SoapFaultCode {
+    fn allows_permanent_add_retry(self) -> bool {
+        matches!(self.0, 402 | 725)
+    }
 }
 
 fn soap_fault_code(body: &str) -> Option<SoapFaultCode> {
@@ -410,12 +421,7 @@ fn soap_fault_code(body: &str) -> Option<SoapFaultCode> {
     if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
     }
-    match value.parse::<u32>().ok()? {
-        402 => Some(SoapFaultCode::InvalidArgs),
-        714 => Some(SoapFaultCode::NoSuchEntryInArray),
-        725 => Some(SoapFaultCode::OnlyPermanentLeasesSupported),
-        _ => None,
-    }
+    Some(SoapFaultCode(value.parse::<u32>().ok()?))
 }
 
 fn soap_response_is_success(body: &str, response_element: &str, service_type: &str) -> bool {
@@ -1059,29 +1065,27 @@ mod tests {
         let valid_725 = r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
 <s:Body><s:Fault><detail><UPnPError xmlns="urn:schemas-upnp-org:control-1-0">
 <errorCode>7&#50;5</errorCode></UPnPError></detail></s:Fault></s:Body></s:Envelope>"#;
-        assert_eq!(
-            soap_fault_code(valid_725),
-            Some(SoapFaultCode::OnlyPermanentLeasesSupported)
-        );
+        assert_eq!(soap_fault_code(valid_725), Some(SoapFaultCode(725)));
         assert!(!soap_not_found(valid_725));
 
         let valid_714 = r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
 <s:Body><s:Fault><detail><u:UPnPError xmlns:u="urn:schemas-upnp-org:control-1-0">
 <u:errorCode>714</u:errorCode></u:UPnPError></detail></s:Fault></s:Body></s:Envelope>"#;
-        assert_eq!(
-            soap_fault_code(valid_714),
-            Some(SoapFaultCode::NoSuchEntryInArray)
-        );
+        assert_eq!(soap_fault_code(valid_714), Some(SoapFaultCode(714)));
         assert!(soap_not_found(valid_714));
 
         let valid_402_soap12 = r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">
 <s:Body><s:Fault><s:Detail><u:UPnPError xmlns:u="urn:schemas-upnp-org:control-1-0">
 <u:errorCode>402</u:errorCode></u:UPnPError></s:Detail></s:Fault></s:Body></s:Envelope>"#;
-        assert_eq!(
-            soap_fault_code(valid_402_soap12),
-            Some(SoapFaultCode::InvalidArgs)
-        );
+        assert_eq!(soap_fault_code(valid_402_soap12), Some(SoapFaultCode(402)));
         assert!(!soap_not_found(valid_402_soap12));
+
+        let valid_unknown = r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" xmlns:u="urn:schemas-upnp-org:control-1-0"><s:Body><s:Fault><detail><u:UPnPError><u:errorCode>799</u:errorCode></u:UPnPError></detail></s:Fault></s:Body></s:Envelope>"#;
+        assert_eq!(soap_fault_code(valid_unknown), Some(SoapFaultCode(799)));
+        assert!(!SoapFaultCode(718).allows_permanent_add_retry());
+        assert!(!SoapFaultCode(799).allows_permanent_add_retry());
+        assert!(SoapFaultCode(402).allows_permanent_add_retry());
+        assert!(SoapFaultCode(725).allows_permanent_add_retry());
 
         for invalid in [
             // Wrong ancestry.
@@ -1095,7 +1099,6 @@ mod tests {
             r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" xmlns:u="urn:schemas-upnp-org:control-1-0"><s:Body><s:Fault><detail><u:UPnPError><u:errorCode>725</u:errorCode><u:errorCode>725</u:errorCode></u:UPnPError></detail></s:Fault></s:Body></s:Envelope>"#,
             r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" xmlns:u="urn:schemas-upnp-org:control-1-0"><s:Body><s:Fault><detail><u:UPnPError><u:errorCode>7&bad;5</u:errorCode></u:UPnPError></detail></s:Fault></s:Body></s:Envelope>"#,
             r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" xmlns:u="urn:schemas-upnp-org:control-1-0"><s:Body><s:Fault><detail><u:UPnPError><u:errorCode>7<x/>25</u:errorCode></u:UPnPError></detail></s:Fault></s:Body></s:Envelope>"#,
-            r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" xmlns:u="urn:schemas-upnp-org:control-1-0"><s:Body><s:Fault><detail><u:UPnPError><u:errorCode>501</u:errorCode></u:UPnPError></detail></s:Fault></s:Body></s:Envelope>"#,
         ] {
             assert_eq!(soap_fault_code(invalid), None, "accepted {invalid}");
         }

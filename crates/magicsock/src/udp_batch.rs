@@ -14,10 +14,15 @@ use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::Semaphore;
 
+use crate::NEVER_GSO_EQUAL_TAIL_SENTINEL;
+
 /// Matches the TUN batch cap. Keeping these arrays on the stack avoids a
 /// header allocation for each WireGuard microburst.
 pub(crate) const MAX_BATCH: usize = 128;
 const MAX_GSO_SEGMENTS: usize = 64;
+/// Match upstream's threshold: below this, the workaround uses plain
+/// `sendmmsg` rather than paying for a sentinel packet.
+const SENTINEL_TAIL_BATCH_THRESHOLD: usize = 8;
 const MAX_IPV4_PAYLOAD: usize = 65_507;
 const MAX_IPV6_PAYLOAD: usize = 65_527;
 /// Direct WireGuard, disco, and Geneve packets normally fit comfortably in
@@ -490,8 +495,11 @@ pub(crate) fn send<T: AsRef<[u8]>>(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PlannedMessage {
     first: usize,
+    /// Original caller datagrams represented by this kernel message. The
+    /// optional sentinel is never included in progress or netlog accounting.
     datagrams: usize,
     segment_size: Option<u16>,
+    append_sentinel: bool,
 }
 
 impl PlannedMessage {
@@ -499,7 +507,16 @@ impl PlannedMessage {
         first: 0,
         datagrams: 0,
         segment_size: None,
+        append_sentinel: false,
     };
+
+    fn wire_bytes<T: AsRef<[u8]>>(&self, datagrams: &[T]) -> usize {
+        datagrams[self.first..self.first + self.datagrams]
+            .iter()
+            .map(|datagram| datagram.as_ref().len())
+            .sum::<usize>()
+            + usize::from(self.append_sentinel) * NEVER_GSO_EQUAL_TAIL_SENTINEL.len()
+    }
 }
 
 /// Returns whether this socket supports per-message UDP GSO control data.
@@ -630,12 +647,22 @@ pub(crate) fn sendmmsg_is_unsupported(error: &io::Error) -> bool {
     matches!(error.raw_os_error(), Some(libc::ENOSYS | libc::EOPNOTSUPP))
 }
 
-fn plan<T: AsRef<[u8]>>(addr: SocketAddr, datagrams: &[T]) -> ([PlannedMessage; MAX_BATCH], usize) {
-    let max_payload = if addr.is_ipv4() {
+fn plan<T: AsRef<[u8]>>(
+    addr: SocketAddr,
+    datagrams: &[T],
+    never_gso_equal_tail: bool,
+) -> ([PlannedMessage; MAX_BATCH], usize) {
+    let mut max_payload = if addr.is_ipv4() {
         MAX_IPV4_PAYLOAD
     } else {
         MAX_IPV6_PAYLOAD
     };
+    let mut max_datagrams = MAX_GSO_SEGMENTS;
+    if never_gso_equal_tail {
+        // Reserve both one segment and one byte for a possible sentinel.
+        max_datagrams -= 1;
+        max_payload -= NEVER_GSO_EQUAL_TAIL_SENTINEL.len();
+    }
     let mut messages = [PlannedMessage::EMPTY; MAX_BATCH];
     let mut message_count = 0;
     let mut first = 0;
@@ -649,22 +676,30 @@ fn plan<T: AsRef<[u8]>>(addr: SocketAddr, datagrams: &[T]) -> ([PlannedMessage; 
         let mut total = segment_len;
         let mut has_smaller_tail = false;
         while first + count < datagrams.len()
-            && count < MAX_GSO_SEGMENTS
+            && count < max_datagrams
             && !has_smaller_tail
             && gso_eligible
         {
             let next_len = datagrams[first + count].as_ref().len();
-            if next_len == 0 || next_len > segment_len || total + next_len > max_payload {
+            let sentinel_can_be_smaller =
+                !never_gso_equal_tail || next_len > NEVER_GSO_EQUAL_TAIL_SENTINEL.len();
+            if next_len == 0
+                || next_len > segment_len
+                || total + next_len > max_payload
+                || !sentinel_can_be_smaller
+            {
                 break;
             }
             total += next_len;
             count += 1;
             has_smaller_tail = next_len < segment_len;
         }
+        let segment_size = (count > 1 && gso_eligible).then_some(segment_len as u16);
         messages[message_count] = PlannedMessage {
             first,
             datagrams: count,
-            segment_size: (count > 1 && gso_eligible).then_some(segment_len as u16),
+            segment_size,
+            append_sentinel: never_gso_equal_tail && segment_size.is_some() && !has_smaller_tail,
         };
         message_count += 1;
         first += count;
@@ -1364,15 +1399,25 @@ fn normalize_control_len<T: TryInto<usize>>(value: T) -> io::Result<usize> {
     }
 }
 
+/// Successful GSO send progress. `datagrams` excludes mitigation sentinels;
+/// `wire_bytes` includes them for physical socket accounting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SendOutcome {
+    pub(crate) datagrams: usize,
+    pub(crate) wire_bytes: usize,
+}
+
 /// Send an ordered batch with per-message UDP_SEGMENT control data.
 ///
 /// The successful prefix is returned in original datagram units, not planned
-/// kernel-message units.
+/// kernel-message units. When the equal-tail mitigation is live, batches below
+/// the upstream threshold conservatively use plain `sendmmsg`.
 pub(crate) fn send_gso<T: AsRef<[u8]>>(
     socket: &UdpSocket,
     addr: SocketAddr,
     datagrams: &[T],
-) -> io::Result<usize> {
+    never_gso_equal_tail: bool,
+) -> io::Result<SendOutcome> {
     if datagrams.is_empty() || datagrams.len() > MAX_BATCH {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1380,13 +1425,23 @@ pub(crate) fn send_gso<T: AsRef<[u8]>>(
         ));
     }
 
-    let (messages, message_count) = plan(addr, datagrams);
+    if never_gso_equal_tail && datagrams.len() < SENTINEL_TAIL_BATCH_THRESHOLD {
+        return send(socket, addr, datagrams).map(|sent| SendOutcome {
+            datagrams: sent,
+            wire_bytes: datagrams[..sent]
+                .iter()
+                .map(|datagram| datagram.as_ref().len())
+                .sum(),
+        });
+    }
+
+    let (messages, message_count) = plan(addr, datagrams, never_gso_equal_tail);
     let sockaddr = SockAddr::from_socket_addr(addr);
     let (name, name_len) = sockaddr.as_ptr_len();
     let mut iovecs = [libc::iovec {
         iov_base: ptr::null_mut(),
         iov_len: 0,
-    }; MAX_BATCH];
+    }; MAX_BATCH * 2];
     let mut controls = [Control::ZERO; MAX_BATCH];
     // SAFETY: zeroed `msghdr` is valid; fields below initialize each used one.
     let mut empty_hdr: libc::msghdr = unsafe { mem::zeroed() };
@@ -1397,17 +1452,27 @@ pub(crate) fn send_gso<T: AsRef<[u8]>>(
         msg_len: 0,
     }; MAX_BATCH];
 
-    for (index, datagram) in datagrams.iter().enumerate() {
-        let data = datagram.as_ref();
-        iovecs[index] = libc::iovec {
-            iov_base: data.as_ptr().cast_mut().cast(),
-            iov_len: data.len(),
-        };
-    }
+    let mut iovec_count = 0;
     for (index, message) in messages[..message_count].iter().enumerate() {
+        let first_iovec = iovec_count;
+        for datagram in &datagrams[message.first..message.first + message.datagrams] {
+            let data = datagram.as_ref();
+            iovecs[iovec_count] = libc::iovec {
+                iov_base: data.as_ptr().cast_mut().cast(),
+                iov_len: data.len(),
+            };
+            iovec_count += 1;
+        }
+        if message.append_sentinel {
+            iovecs[iovec_count] = libc::iovec {
+                iov_base: NEVER_GSO_EQUAL_TAIL_SENTINEL.as_ptr().cast_mut().cast(),
+                iov_len: NEVER_GSO_EQUAL_TAIL_SENTINEL.len(),
+            };
+            iovec_count += 1;
+        }
         let header = &mut headers[index].msg_hdr;
-        header.msg_iov = ptr::addr_of_mut!(iovecs[message.first]);
-        header.msg_iovlen = message.datagrams as _;
+        header.msg_iov = ptr::addr_of_mut!(iovecs[first_iovec]);
+        header.msg_iovlen = (message.datagrams + usize::from(message.append_sentinel)) as _;
         if let Some(segment_size) = message.segment_size {
             set_segment_control(&mut controls[index], segment_size);
             header.msg_control = controls[index].as_mut_ptr();
@@ -1416,8 +1481,9 @@ pub(crate) fn send_gso<T: AsRef<[u8]>>(
     }
 
     // SAFETY: all mmsghdr/iovec/control pointers refer to initialized stack
-    // storage that remains live through the syscall; packet bytes are borrowed
-    // from the caller and are neither copied nor retained by the kernel.
+    // storage that remains live through the syscall; packet and static
+    // sentinel bytes are read-only despite iovec's C mut pointer type, and are
+    // neither modified nor retained by the kernel.
     let sent = unsafe {
         libc::sendmmsg(
             socket.as_raw_fd(),
@@ -1427,10 +1493,16 @@ pub(crate) fn send_gso<T: AsRef<[u8]>>(
         )
     };
     match sent.cmp(&0) {
-        std::cmp::Ordering::Greater => Ok(messages[..sent as usize]
-            .iter()
-            .map(|message| message.datagrams)
-            .sum()),
+        std::cmp::Ordering::Greater => {
+            let sent_messages = &messages[..sent as usize];
+            Ok(SendOutcome {
+                datagrams: sent_messages.iter().map(|message| message.datagrams).sum(),
+                wire_bytes: sent_messages
+                    .iter()
+                    .map(|message| message.wire_bytes(datagrams))
+                    .sum(),
+            })
+        }
         std::cmp::Ordering::Equal => Err(io::Error::from(io::ErrorKind::WouldBlock)),
         std::cmp::Ordering::Less => Err(io::Error::last_os_error()),
     }
@@ -1630,10 +1702,18 @@ mod tests {
         lengths.iter().map(|&len| vec![0; len]).collect()
     }
 
-    fn planned(lengths: &[usize], addr: SocketAddr) -> Vec<PlannedMessage> {
+    fn planned_with_mitigation(
+        lengths: &[usize],
+        addr: SocketAddr,
+        never_gso_equal_tail: bool,
+    ) -> Vec<PlannedMessage> {
         let packets = packets(lengths);
-        let (messages, count) = plan(addr, &packets);
+        let (messages, count) = plan(addr, &packets, never_gso_equal_tail);
         messages[..count].to_vec()
+    }
+
+    fn planned(lengths: &[usize], addr: SocketAddr) -> Vec<PlannedMessage> {
+        planned_with_mitigation(lengths, addr, false)
     }
 
     #[test]
@@ -2029,6 +2109,7 @@ mod tests {
                 first: 0,
                 datagrams: 3,
                 segment_size: Some(1200),
+                append_sentinel: false,
             }]
         );
         assert_eq!(
@@ -2066,14 +2147,65 @@ mod tests {
                     first: 0,
                     datagrams: 3,
                     segment_size: Some(1200),
+                    append_sentinel: false,
                 },
                 PlannedMessage {
                     first: 3,
                     datagrams: 1,
                     segment_size: None,
+                    append_sentinel: false,
                 },
             ]
         );
+    }
+
+    #[test]
+    fn planner_matches_never_gso_equal_tail_packet_vectors() {
+        let addr = "127.0.0.1:1".parse().unwrap();
+
+        let one = planned_with_mitigation(&[32], addr, true);
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].segment_size, None);
+        assert!(!one[0].append_sentinel);
+
+        let equal = planned_with_mitigation(&[32, 32], addr, true);
+        assert_eq!(equal.len(), 1);
+        assert_eq!(equal[0].datagrams, 2);
+        assert_eq!(equal[0].segment_size, Some(32));
+        assert!(equal[0].append_sentinel);
+        assert_eq!(equal[0].wire_bytes(&packets(&[32, 32])), 65);
+
+        let smaller_tail = planned_with_mitigation(&[32, 32, 24], addr, true);
+        assert_eq!(smaller_tail.len(), 1);
+        assert_eq!(smaller_tail[0].datagrams, 3);
+        assert!(!smaller_tail[0].append_sentinel);
+
+        let one_byte_tail = planned_with_mitigation(&[32, 1], addr, true);
+        assert_eq!(one_byte_tail.len(), 2);
+        assert!(one_byte_tail
+            .iter()
+            .all(|message| message.segment_size.is_none() && !message.append_sentinel));
+
+        let mixed = planned_with_mitigation(&[32, 32, 24, 32], addr, true);
+        assert_eq!(mixed.len(), 2);
+        assert_eq!(mixed[0].datagrams, 3);
+        assert!(!mixed[0].append_sentinel);
+        assert_eq!(mixed[1].datagrams, 1);
+        assert!(!mixed[1].append_sentinel);
+
+        let larger_boundary = planned_with_mitigation(&[32, 32, 40], addr, true);
+        assert_eq!(larger_boundary.len(), 2);
+        assert_eq!(larger_boundary[0].datagrams, 2);
+        assert!(larger_boundary[0].append_sentinel);
+        assert_eq!(larger_boundary[1].datagrams, 1);
+        assert!(!larger_boundary[1].append_sentinel);
+
+        let boundary = planned_with_mitigation(&vec![32; MAX_GSO_SEGMENTS], addr, true);
+        assert_eq!(boundary.len(), 2);
+        assert_eq!(boundary[0].datagrams, MAX_GSO_SEGMENTS - 1);
+        assert!(boundary[0].append_sentinel);
+        assert_eq!(boundary[1].datagrams, 1);
+        assert!(!boundary[1].append_sentinel);
     }
 
     #[test]
@@ -2529,32 +2661,38 @@ mod tests {
                 PlannedMessage {
                     first: 0,
                     datagrams: 1,
-                    segment_size: None
+                    segment_size: None,
+                    append_sentinel: false,
                 },
                 PlannedMessage {
                     first: 1,
                     datagrams: 1,
-                    segment_size: None
+                    segment_size: None,
+                    append_sentinel: false,
                 },
                 PlannedMessage {
                     first: 2,
                     datagrams: 2,
-                    segment_size: Some(1200)
+                    segment_size: Some(1200),
+                    append_sentinel: false,
                 },
                 PlannedMessage {
                     first: 4,
                     datagrams: 1,
-                    segment_size: None
+                    segment_size: None,
+                    append_sentinel: false,
                 },
                 PlannedMessage {
                     first: 5,
                     datagrams: 1,
-                    segment_size: None
+                    segment_size: None,
+                    append_sentinel: false,
                 },
                 PlannedMessage {
                     first: 6,
                     datagrams: 1,
-                    segment_size: None
+                    segment_size: None,
+                    append_sentinel: false,
                 },
             ]
         );
@@ -2595,7 +2733,9 @@ mod tests {
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let packets = [b"one".as_slice(), b"two", b"three", b"four"];
         assert_eq!(
-            send_gso(&sender, receiver.local_addr().unwrap(), &packets).unwrap(),
+            send_gso(&sender, receiver.local_addr().unwrap(), &packets, false,)
+                .unwrap()
+                .datagrams,
             packets.len()
         );
         let mut buf = [0; 16];
@@ -2603,6 +2743,48 @@ mod tests {
             let (n, _) = receiver.recv_from(&mut buf).await.unwrap();
             assert_eq!(&buf[..n], expected);
         }
+    }
+
+    #[tokio::test]
+    async fn equal_tail_mitigation_preserves_vectors_and_reports_physical_bytes() {
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        if probe_gso(&sender).is_err() {
+            return;
+        }
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let receiver_addr = receiver.local_addr().unwrap();
+
+        // Upstream avoids GSO below eight packets rather than paying for a
+        // sentinel. Two equal WireGuard-sized payloads remain byte-exact.
+        let small = [vec![1; 32], vec![2; 32]];
+        let outcome = send_gso(&sender, receiver_addr, &small, true).unwrap();
+        assert_eq!(
+            outcome,
+            SendOutcome {
+                datagrams: 2,
+                wire_bytes: 64,
+            }
+        );
+        let mut buf = [0; 64];
+        for expected in &small {
+            let (len, _) = receiver.recv_from(&mut buf).await.unwrap();
+            assert_eq!(&buf[..len], expected);
+        }
+
+        // At the threshold an all-equal GSO message gains exactly one smaller
+        // invalid-WireGuard tail; every original payload remains unchanged.
+        let equal: Vec<_> = (0..SENTINEL_TAIL_BATCH_THRESHOLD)
+            .map(|value| vec![value as u8; 32])
+            .collect();
+        let outcome = send_gso(&sender, receiver_addr, &equal, true).unwrap();
+        assert_eq!(outcome.datagrams, equal.len());
+        assert_eq!(outcome.wire_bytes, equal.len() * 32 + 1);
+        for expected in &equal {
+            let (len, _) = receiver.recv_from(&mut buf).await.unwrap();
+            assert_eq!(&buf[..len], expected);
+        }
+        let (len, _) = receiver.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..len], NEVER_GSO_EQUAL_TAIL_SENTINEL);
     }
 
     #[tokio::test]
@@ -2627,7 +2809,9 @@ mod tests {
         }
         let packets = [vec![1; 1200], vec![2; 1200], vec![3; 1200], vec![4; 1000]];
         assert_eq!(
-            send_gso(&sender, receiver.local_addr().unwrap(), &packets).unwrap(),
+            send_gso(&sender, receiver.local_addr().unwrap(), &packets, false,)
+                .unwrap()
+                .datagrams,
             packets.len()
         );
         receiver.readable().await.unwrap();

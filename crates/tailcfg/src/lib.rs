@@ -34,7 +34,7 @@ pub use c2n::C2NPostureIdentityResponse;
 pub use caps::{
     cap_ver_is_relay_capable, has_capability, relay_client_disabled, relay_server_disabled,
     CAP_VERSION_RELAY, NODE_ATTR_DISABLE_RELAY_CLIENT, NODE_ATTR_DISABLE_RELAY_SERVER,
-    PEER_CAPABILITY_RELAY, PEER_CAPABILITY_RELAY_TARGET,
+    NODE_ATTR_NEVER_GSO_EQUAL_TAIL, PEER_CAPABILITY_RELAY, PEER_CAPABILITY_RELAY_TARGET,
 };
 pub use derpmap::{DERPHomeParams, DERPMap, DERPNode, DERPRegion};
 pub use dns::{DNSConfig, DNSRecord, Resolver, SetDNSRequest, SetDNSResponse, UserProfile};

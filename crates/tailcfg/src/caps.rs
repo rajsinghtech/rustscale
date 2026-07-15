@@ -27,6 +27,10 @@ pub const NODE_ATTR_DISABLE_RELAY_SERVER: &str = "disable-relay-server";
 /// and from using endpoints allocated by its peers.
 pub const NODE_ATTR_DISABLE_RELAY_CLIENT: &str = "disable-relay-client";
 
+/// Enables the Linux UDP GSO smaller-sentinel-tail workaround. Capability
+/// version 141 advertises support for this live node attribute.
+pub const NODE_ATTR_NEVER_GSO_EQUAL_TAIL: &str = "never-gso-equal-tail";
+
 /// Minimum capability version for relay support. Clients with `Cap` < this
 /// value are not relay-capable and will be skipped during relay server
 /// discovery.
@@ -117,5 +121,6 @@ mod tests {
         );
         assert_eq!(NODE_ATTR_DISABLE_RELAY_SERVER, "disable-relay-server");
         assert_eq!(NODE_ATTR_DISABLE_RELAY_CLIENT, "disable-relay-client");
+        assert_eq!(NODE_ATTR_NEVER_GSO_EQUAL_TAIL, "never-gso-equal-tail");
     }
 }

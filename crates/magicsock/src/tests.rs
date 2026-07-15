@@ -1484,6 +1484,11 @@ async fn direct_path_upgrade_over_udp() {
 
     let a_priv = NodePrivate::generate();
     let b_priv = NodePrivate::generate();
+    let a_knobs = Arc::new(rustscale_controlknobs::ControlKnobs::new());
+    a_knobs.apply(HashMap::from([(
+        rustscale_tailcfg::NODE_ATTR_NEVER_GSO_EQUAL_TAIL.to_string(),
+        "true".to_string(),
+    )]));
 
     let a_derp = connect_to_relay(&relay, a_priv.clone()).await;
     let (a, _a_rx) = Magicsock::new(MagicsockConfig {
@@ -1500,7 +1505,7 @@ async fn direct_path_upgrade_over_udp() {
         peer_relay_server: false,
         relay_server_config: None,
         sockstats: None,
-        control_knobs: None,
+        control_knobs: Some(a_knobs),
     })
     .await
     .expect("A magicsock");
@@ -1576,10 +1581,13 @@ async fn direct_path_upgrade_over_udp() {
 
     // A direct UDP burst remains ordered in one receive-batch item, using the
     // already-established direct path snapshot.
-    let datagrams = [
-        b"\x08\x07\x06\x05 direct wg packet one".as_slice(),
-        b"\x08\x07\x06\x05 direct wg packet two".as_slice(),
-    ];
+    let datagrams: Vec<Vec<u8>> = (0..8)
+        .map(|index| {
+            let mut packet = vec![0x08; 32];
+            packet[1] = index;
+            packet
+        })
+        .collect();
     a.send_batch(b.node_public(), &datagrams)
         .await
         .expect("A batch send");
@@ -1594,14 +1602,14 @@ async fn direct_path_upgrade_over_udp() {
         );
     }
     assert_eq!(received.len(), datagrams.len());
-    for (received, datagram) in received.into_iter().zip(datagrams) {
+    for (received, datagram) in received.into_iter().zip(&datagrams) {
         assert_eq!(received.peer, a.node_public());
-        assert_eq!(received.data, datagram);
+        assert_eq!(received.data, *datagram);
     }
 
     let a_counts = a_counts.lock().unwrap();
     assert_eq!(a_counts.len(), 1, "one callback for one sent batch");
-    assert_eq!(a_counts[0].packets, 2);
+    assert_eq!(a_counts[0].packets, datagrams.len() as u64);
     assert_eq!(
         a_counts[0].bytes,
         datagrams
@@ -1611,7 +1619,10 @@ async fn direct_path_upgrade_over_udp() {
     );
     assert!(!a_counts[0].recv);
     let b_counts = b_counts.lock().unwrap();
-    assert_eq!(b_counts.iter().map(|call| call.packets).sum::<u64>(), 2);
+    assert_eq!(
+        b_counts.iter().map(|call| call.packets).sum::<u64>(),
+        datagrams.len() as u64
+    );
     assert_eq!(
         b_counts.iter().map(|call| call.bytes).sum::<u64>(),
         datagrams

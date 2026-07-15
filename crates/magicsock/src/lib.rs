@@ -166,6 +166,14 @@ impl ConnectionCounterHook {
     }
 }
 
+/// Smaller final UDP GSO segment used by upstream's equal-tail workaround.
+/// It is not a WireGuard message and must never be published to consumers.
+const NEVER_GSO_EQUAL_TAIL_SENTINEL: &[u8] = &[0x07];
+
+fn is_never_gso_equal_tail_sentinel(data: &[u8]) -> bool {
+    data == NEVER_GSO_EQUAL_TAIL_SENTINEL
+}
+
 #[cfg(any(target_os = "linux", test))]
 fn batch_counts<T: AsRef<[u8]>>(datagrams: &[T]) -> (u64, u64) {
     (
@@ -175,6 +183,18 @@ fn batch_counts<T: AsRef<[u8]>>(datagrams: &[T]) -> (u64, u64) {
             .map(|datagram| datagram.as_ref().len() as u64)
             .sum(),
     )
+}
+
+/// Keep upstream netlog in original-datagram units while sockstats reflects
+/// every physical payload byte submitted to the UDP socket.
+#[cfg(any(target_os = "linux", test))]
+fn linux_udp_send_accounting<T: AsRef<[u8]>>(
+    datagrams: &[T],
+    wire_bytes: usize,
+) -> (u64, u64, usize) {
+    let (packets, logical_bytes) = batch_counts(datagrams);
+    debug_assert!(wire_bytes >= logical_bytes as usize);
+    (packets, logical_bytes, wire_bytes)
 }
 
 fn first_node_addr(node: &Node) -> Option<IpAddr> {
@@ -191,10 +211,13 @@ fn first_node_addr(node: &Node) -> Option<IpAddr> {
 /// handler. The fast handoff only applies to ordinary direct WireGuard UDP.
 #[cfg(any(target_os = "linux", test))]
 fn udp_batch_needs_scalar_handler(data: &[u8]) -> bool {
+    // The mitigation sentinel must be filtered before pooled WireGuard
+    // publication. Keeping its whole GRO burst sequential preserves order.
     // Jumbo packets are fully received in bounded kernel scratch, but do not
     // fit a detachable pooled ciphertext slot. Keep the whole received burst
     // sequential so packet order and ownership remain exact.
-    data.len() > LINUX_UDP_FAST_PACKET_CAPACITY
+    is_never_gso_equal_tail_sentinel(data)
+        || data.len() > LINUX_UDP_FAST_PACKET_CAPACITY
         || DiscoIo::looks_like_disco(data)
         || relay::looks_like_geneve_disco(data)
         || relay::looks_like_geneve_wireguard(data)
@@ -220,6 +243,13 @@ fn linux_batch_requires_scalar_handler<'a>(
 struct LinuxUdpSendConfig {
     use_batch: bool,
     disable_udp_gso: bool,
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn never_gso_equal_tail(control_knobs: Option<&rustscale_controlknobs::ControlKnobs>) -> bool {
+    control_knobs.is_some_and(|knobs| {
+        knobs.get_bool(rustscale_tailcfg::NODE_ATTR_NEVER_GSO_EQUAL_TAIL, false)
+    })
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -1950,6 +1980,9 @@ impl Magicsock {
         node_addr: Option<IpAddr>,
         datagrams: &[T],
     ) -> Result<(), MagicsockError> {
+        // Match upstream's per-write atomic snapshot: a live knob update takes
+        // effect on the next API batch, never halfway through this one.
+        let never_gso_equal_tail = never_gso_equal_tail(self.inner.control_knobs.as_deref());
         let mut head = 0;
         let mut first_error = None;
         let (mut sent_packets, mut sent_bytes) = (0, 0);
@@ -1960,9 +1993,17 @@ impl Magicsock {
                 let end = (head + udp_batch::MAX_BATCH).min(datagrams.len());
                 udp.async_io(Interest::WRITABLE, || {
                     if use_gso {
-                        udp_batch::send_gso(udp, addr, &datagrams[head..end])
+                        udp_batch::send_gso(udp, addr, &datagrams[head..end], never_gso_equal_tail)
                     } else {
-                        udp_batch::send(udp, addr, &datagrams[head..end])
+                        udp_batch::send(udp, addr, &datagrams[head..end]).map(|sent| {
+                            udp_batch::SendOutcome {
+                                datagrams: sent,
+                                wire_bytes: datagrams[head..head + sent]
+                                    .iter()
+                                    .map(|datagram| datagram.as_ref().len())
+                                    .sum(),
+                            }
+                        })
                     }
                 })
                 .await
@@ -1970,7 +2011,10 @@ impl Magicsock {
                 let datagram = datagrams[head].as_ref();
                 udp.send_to(datagram, addr).await.and_then(|sent| {
                     if sent == datagram.len() {
-                        Ok(1)
+                        Ok(udp_batch::SendOutcome {
+                            datagrams: 1,
+                            wire_bytes: sent,
+                        })
                     } else {
                         Err(io::Error::new(
                             io::ErrorKind::WriteZero,
@@ -2004,12 +2048,17 @@ impl Magicsock {
                 // Tokio's ordinary UDP path, preserving ordering and accounting.
                 continue;
             }
-            let sent = advance_direct_batch(&mut head, datagrams.len(), &mut first_error, result);
+            let wire_bytes = result.as_ref().map_or(0, |outcome| outcome.wire_bytes);
+            let sent = advance_direct_batch(
+                &mut head,
+                datagrams.len(),
+                &mut first_error,
+                result.map(|outcome| outcome.datagrams),
+            );
             let sent_datagrams = &datagrams[head - sent..head];
-            for datagram in sent_datagrams {
-                self.inner.record_udp_tx(addr, datagram.as_ref().len());
-            }
-            let (packets, bytes) = batch_counts(sent_datagrams);
+            let (packets, bytes, sockstats_bytes) =
+                linux_udp_send_accounting(sent_datagrams, wire_bytes);
+            self.inner.record_udp_tx(addr, sockstats_bytes);
             sent_packets += packets;
             sent_bytes += bytes;
         }
@@ -3270,6 +3319,12 @@ impl Inner {
     }
 
     async fn handle_udp_packet(&self, data: &[u8], src: SocketAddr) {
+        // Linux's equal-tail workaround intentionally emits this invalid
+        // one-byte WireGuard packet. Sockstats already counted its physical
+        // byte; do not publish or netlog it as an original peer datagram.
+        if is_never_gso_equal_tail_sentinel(data) {
+            return;
+        }
         // Check for Geneve-encapsulated packets first (relay path).
         if relay::looks_like_geneve_disco(data) {
             if let Some((_proto, vni, _control, inner)) = relay::decode_geneve_full(data) {
@@ -4209,6 +4264,21 @@ mod linux_batch_tests {
     }
 
     #[test]
+    fn equal_tail_accounting_separates_original_netlog_and_physical_sockstats() {
+        let datagrams = vec![vec![0x08; 32]; 8];
+        assert_eq!(
+            linux_udp_send_accounting(&datagrams, 8 * 32 + 1),
+            (8, 8 * 32, 8 * 32 + 1),
+            "sentinel is physical sockstats only"
+        );
+        assert_eq!(
+            linux_udp_send_accounting(&datagrams, 8 * 32),
+            (8, 8 * 32, 8 * 32),
+            "plain fallback has no sentinel byte"
+        );
+    }
+
+    #[test]
     fn direct_batch_advancement_accounts_successful_prefixes() {
         let (head, accounted, error) = advance_sequence(&[3, 5, 7, 11], [Ok(4)]);
         assert_eq!(head, 4);
@@ -4275,6 +4345,12 @@ mod linux_batch_tests {
         assert!(DiscoIo::looks_like_disco(&disco));
         assert!(udp_batch_needs_scalar_handler(&disco));
         assert!(udp_batch_needs_scalar_handler(&geneve_wg));
+        assert!(udp_batch_needs_scalar_handler(
+            NEVER_GSO_EQUAL_TAIL_SENTINEL
+        ));
+        assert!(is_never_gso_equal_tail_sentinel(
+            NEVER_GSO_EQUAL_TAIL_SENTINEL
+        ));
         assert!(!udp_batch_needs_scalar_handler(b"ordinary-wireguard"));
         assert!(linux_batch_requires_scalar_handler([
             Some(b"ordinary-wireguard-before".as_slice()),
@@ -4330,6 +4406,22 @@ mod linux_batch_tests {
                 disable_udp_gso: true,
             }
         );
+    }
+
+    #[test]
+    fn never_gso_equal_tail_reads_each_live_knob_update() {
+        let knobs = rustscale_controlknobs::ControlKnobs::new();
+        assert!(!never_gso_equal_tail(Some(&knobs)));
+        knobs.apply(HashMap::from([(
+            rustscale_tailcfg::NODE_ATTR_NEVER_GSO_EQUAL_TAIL.to_string(),
+            "true".to_string(),
+        )]));
+        assert!(never_gso_equal_tail(Some(&knobs)));
+        knobs.apply(HashMap::from([(
+            rustscale_tailcfg::NODE_ATTR_NEVER_GSO_EQUAL_TAIL.to_string(),
+            "false".to_string(),
+        )]));
+        assert!(!never_gso_equal_tail(Some(&knobs)));
     }
 
     #[test]

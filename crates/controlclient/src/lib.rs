@@ -27,7 +27,7 @@ pub use login_flags::{LoginFlags, LOGIN_DEFAULT, LOGIN_EPHEMERAL, LOGIN_INTERACT
 
 use std::collections::HashMap;
 
-use rustscale_tailcfg::MapResponse;
+use rustscale_tailcfg::{MapResponse, NODE_ATTR_NEVER_GSO_EQUAL_TAIL};
 
 /// Extract control knobs from a [`MapResponse`]'s self-node `CapMap`.
 ///
@@ -38,6 +38,8 @@ use rustscale_tailcfg::MapResponse;
 ///   `capMap.Contains(...)` semantics).
 /// - Capabilities with argument values (e.g. `"one-cgnat?v=true"`) → the
 ///   first argument's raw JSON string, or `"true"` if the arg list is empty.
+/// - Presence-based live booleans whose removal matters are emitted as
+///   `"false"` when absent, matching Go's full CapMap snapshot update.
 ///
 /// Returns an empty map when `MapResponse.Node` is absent.
 pub fn extract_knobs_from_map_response(resp: &MapResponse) -> HashMap<String, String> {
@@ -58,6 +60,12 @@ pub fn extract_knobs_from_map_response(resp: &MapResponse) -> HashMap<String, St
             };
             knobs.insert(cap.clone(), value);
         }
+        knobs.insert(
+            NODE_ATTR_NEVER_GSO_EQUAL_TAIL.to_string(),
+            node.CapMap
+                .contains_key(NODE_ATTR_NEVER_GSO_EQUAL_TAIL)
+                .to_string(),
+        );
     }
     knobs
 }
@@ -129,6 +137,29 @@ mod knob_tests {
         ck.apply(extracted);
         assert!(ck.get_bool("debug-always-stun", false));
         assert!(ck.has("debug-always-stun"));
+    }
+
+    #[test]
+    fn never_gso_equal_tail_presence_updates_live_in_both_directions() {
+        let ck = ControlKnobs::new();
+        let mut enabled_cap_map = rustscale_tailcfg::NodeCapMap::new();
+        enabled_cap_map.insert(NODE_ATTR_NEVER_GSO_EQUAL_TAIL.into(), vec![]);
+        let enabled = MapResponse {
+            Node: Some(Node {
+                CapMap: enabled_cap_map,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        ck.apply(extract_knobs_from_map_response(&enabled));
+        assert!(ck.get_bool(NODE_ATTR_NEVER_GSO_EQUAL_TAIL, false));
+
+        let disabled = MapResponse {
+            Node: Some(Node::default()),
+            ..Default::default()
+        };
+        ck.apply(extract_knobs_from_map_response(&disabled));
+        assert!(!ck.get_bool(NODE_ATTR_NEVER_GSO_EQUAL_TAIL, true));
     }
 
     #[test]

@@ -217,6 +217,8 @@ ordinary sends and the established scalar receiver, set
 implies no GSO/GRO; unset the variable and restart the daemon to re-enable the
 default mode. Unsupported mmsg syscalls and offload errors also permanently
 fall back at runtime without changing logical or physical-byte accounting.
+The live `never-gso-equal-tail` node capability enables the upstream smaller
+sentinel-tail workaround; sub-eight-packet batches conservatively skip GSO.
 
 The GCP matrix records `RS_LINUX_UDP_BATCH` and `RS_LINUX_UDP_GRO` as explicit
 immutable `0`/`1` runtime modes and translates `0` into the corresponding

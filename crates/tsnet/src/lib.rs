@@ -310,9 +310,9 @@ pub struct ServerBuilder {
     pub(crate) logtail: Option<rustscale_logtail::LogTail>,
     /// Optional tailtraffic logtail client for network flow logging.
     pub(crate) netlog: Option<rustscale_logtail::LogTail>,
-    /// Additional DER-encoded root CAs to trust alongside the webpki and
-    /// baked ISRG roots for control-plane and DERP TLS connections. Mirrors
-    /// Go's `tsnet.Server.ExtraRootCAs`.
+    /// Additional DER-encoded root CAs to trust alongside native and baked
+    /// ISRG roots for control-plane TLS connections. Mirrors Go's
+    /// `tsnet.Server.ExtraRootCAs`.
     pub(crate) extra_root_certs: Option<Vec<Vec<u8>>>,
     /// Path to the declarative config file (`--config` flag), if set.
     /// Threaded through to `LocalApiState` so `POST /reload-config` can
@@ -608,10 +608,9 @@ impl ServerBuilder {
         self
     }
 
-    /// Set additional DER-encoded root CAs to trust for control-plane and
-    /// DERP TLS connections. These are concatenated with the webpki roots
-    /// and baked ISRG roots (see `rustscale_bakedroots::combined_root_store`).
-    /// Mirrors Go's `tsnet.Server.ExtraRootCAs`.
+    /// Set additional DER-encoded root CAs to trust for control-plane TLS
+    /// connections. These are combined with native roots and the baked ISRG
+    /// fallback roots. Mirrors Go's `tsnet.Server.ExtraRootCAs`.
     pub fn extra_root_certs(mut self, certs: Vec<Vec<u8>>) -> Self {
         self.extra_root_certs = Some(certs);
         self

@@ -1,10 +1,10 @@
 // Command testcontrol wraps Tailscale's tstest/integration/testcontrol.Server
-// as a standalone HTTPS server for wire-format interop testing against
-// rustscale's tsnet client. It also runs an in-process DERP+STUN server so
+// as a standalone HTTP server for wire-format interop testing against
+// rustscale's tsnet client. It also runs an in-process HTTPS DERP+STUN server so
 // that clients get a fully local DERPMap and can relay traffic without
 // external dependencies.
 //
-// The first line of stdout is the control URL (e.g. https://127.0.0.1:PORT).
+// The first line of stdout is the control URL (e.g. http://127.0.0.1:PORT).
 // A side-channel JSON API is served under /testapi/ on the same listener for
 // test orchestration: add-fake-node, expire-all, nodes, raw-map-response.
 package main
@@ -43,7 +43,7 @@ func main() {
 	log.SetFlags(log.Lmicroseconds | log.Lmsgprefix)
 	log.SetPrefix("testcontrol: ")
 
-	// 1. Generate a self-signed cert (shared by control + DERP servers).
+	// 1. Generate a self-signed cert for the test-only DERP server.
 	cert, err := generateSelfSignedCert()
 	if err != nil {
 		log.Fatalf("cert: %v", err)
@@ -68,30 +68,28 @@ func main() {
 	mux.HandleFunc("/testapi/raw-map-response", handleRawMapResponse(control))
 	mux.HandleFunc("/testapi/health", handleHealth)
 
-	// 5. Start a TLS server with the self-signed cert on 127.0.0.1:0.
+	// 5. Start the plain-HTTP test control server on 127.0.0.1:0.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		log.Fatalf("listen: %v", err)
 	}
 
-	srv := &http.Server{
-		Handler:   mux,
-		TLSConfig: makeTLSConfig(cert),
-	}
+	srv := &http.Server{Handler: mux}
 
 	// Set ExplicitBaseURL so control.BaseURL() works (needed for auth URLs).
 	port := ln.Addr().(*net.TCPAddr).Port
-	controlURL := fmt.Sprintf("https://127.0.0.1:%d", port)
+	controlURL := fmt.Sprintf("http://127.0.0.1:%d", port)
 	control.ExplicitBaseURL = controlURL
 
 	go func() {
-		if err := srv.ServeTLS(ln, "", ""); err != nil {
-			log.Fatalf("ServeTLS: %v", err)
+		if err := srv.Serve(ln); err != nil {
+			log.Fatalf("Serve: %v", err)
 		}
 	}()
 
-	// 5. Print the control URL as the first stdout line (consumed by the
-	// Rust harness).
+	// 5. Print the plain-HTTP control URL as the first stdout line consumed
+	// by the Rust harness. Test servers must opt into HTTP rather than infer
+	// insecure TLS merely because they listen on loopback.
 	fmt.Println(controlURL)
 	os.Stdout.Sync()
 
@@ -342,13 +340,6 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 // ---------------------------------------------------------------------------
 // Self-signed TLS certificate
 // ---------------------------------------------------------------------------
-
-func makeTLSConfig(cert tls.Certificate) *tls.Config {
-	return &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		NextProtos:   []string{"h2", "http/1.1"},
-	}
-}
 
 func generateSelfSignedCert() (tls.Certificate, error) {
 	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)

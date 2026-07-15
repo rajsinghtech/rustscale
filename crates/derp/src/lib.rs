@@ -20,6 +20,7 @@ pub use frame::{
     PROTOCOL_VERSION,
 };
 pub use protocol::{ClientInfo, MeshKey, Received, ServerInfo};
+pub use rustscale_tlsdial::CertificatePolicy;
 pub use server::{DerpServer, DerpServerHandle};
 
 /// Errors from the DERP client.
@@ -28,7 +29,7 @@ pub enum DerpError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
     #[error("TLS error: {0}")]
-    Tls(#[from] rustls::Error),
+    Tls(#[from] rustscale_tlsdial::Error),
     #[error("bad frame: {0}")]
     BadFrame(String),
     #[error("bad DERP magic")]

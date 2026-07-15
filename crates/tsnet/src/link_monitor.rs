@@ -373,12 +373,15 @@ pub(crate) async fn connect_home_derp(
         node.HostName.clone()
     };
 
-    DerpClient::connect_with_upgrade_dial_insecure(
+    let certificate_policy =
+        rustscale_derp::CertificatePolicy::from_derp_cert_name(&node.CertName)?;
+    DerpClient::connect_with_upgrade_dial_policy(
         &dial_addr,
         &tls_host,
         port,
         !node.InsecureForTests,
         node.InsecureForTests,
+        certificate_policy,
         node_key.clone(),
         None,
     )

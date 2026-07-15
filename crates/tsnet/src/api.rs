@@ -137,10 +137,7 @@ impl Server {
                 _ => String::new(),
             };
 
-            let exit_node_option = peer
-                .AllowedIPs
-                .iter()
-                .any(|r| r == "0.0.0.0/0" || r == "::/0");
+            let exit_node_option = crate::peer_is_exit_capable(peer);
 
             let ps = rustscale_ipnstate::PeerStatus {
                 HostName: peer.Name.trim_end_matches('.').to_string(),
@@ -430,8 +427,8 @@ impl Server {
     ///
     /// `ip_or_name` may be a tailnet IP (e.g. `"100.64.0.5"`) or a MagicDNS
     /// hostname (e.g. `"peer"` or `"peer.tailnet.ts.net"`). The peer must be
-    /// exit-node-capable (its `AllowedIPs` must contain `0.0.0.0/0`); otherwise
-    /// returns [`TsnetError::NotExitCapable`]. Returns
+    /// exit-node-capable (its `AllowedIPs` must contain both IPv4 and IPv6
+    /// default routes); otherwise returns [`TsnetError::NotExitCapable`]. Returns
     /// [`TsnetError::ExitNodeNotFound`] if no peer matches.
     ///
     /// In TUN mode, existing TCP connections are broken best-effort after the

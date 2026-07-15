@@ -204,7 +204,7 @@ pub enum TsnetError {
     HostnameNotFound(String),
     #[error("exit node not found: {0}")]
     ExitNodeNotFound(String),
-    #[error("peer is not exit-node-capable (no 0.0.0.0/0 in AllowedIPs): {0}")]
+    #[error("peer is not exit-node-capable (both IPv4 and IPv6 defaults are required): {0}")]
     NotExitCapable(String),
     #[error("derp error: {0}")]
     Derp(#[from] rustscale_derp::DerpError),

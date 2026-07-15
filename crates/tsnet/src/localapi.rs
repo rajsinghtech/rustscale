@@ -586,25 +586,25 @@ async fn handle_reload_config<W: AsyncWrite + Unpin>(
     write_json_response(conn, 200, "OK", &updated).await?;
     Ok(())
 }
-/// or stable node ID. Returns the peer's NodePublic key on success.
+
+/// Resolve an exit node by address, hostname, or stable node ID.
+///
+/// Only peers satisfying [`crate::peer_is_exit_capable`] are selectable.
 /// Mirrors Go's `resolveExitNodeIPLocked` / `peerWithStableID` lookup.
 pub(crate) fn resolve_exit_node_peer(peers: &[Node], ip_or_name: &str) -> Option<NodePublic> {
     // Try parsing as an IP address first.
     if let Ok(ip) = ip_or_name.parse::<IpAddr>() {
         for peer in peers {
+            if peer.Key.is_zero() || !crate::peer_is_exit_capable(peer) {
+                continue;
+            }
             for addr in &peer.Addresses {
                 if let Some(peer_ip_str) = addr.split('/').next() {
-                    if let Ok(peer_ip) = peer_ip_str.parse::<IpAddr>() {
-                        if peer_ip == ip {
-                            // Verify the peer is exit-node-capable.
-                            if peer
-                                .AllowedIPs
-                                .iter()
-                                .any(|r| r == "0.0.0.0/0" || r == "::/0")
-                            {
-                                return Some(peer.Key.clone());
-                            }
-                        }
+                    if peer_ip_str
+                        .parse::<IpAddr>()
+                        .is_ok_and(|peer_ip| peer_ip == ip)
+                    {
+                        return Some(peer.Key.clone());
                     }
                 }
             }
@@ -616,24 +616,14 @@ pub(crate) fn resolve_exit_node_peer(peers: &[Node], ip_or_name: &str) -> Option
     let name_lc = ip_or_name.trim_end_matches('.').to_lowercase();
     for peer in peers {
         let peer_name = peer.Name.trim_end_matches('.').to_lowercase();
-        if peer_name == name_lc
-            && peer
-                .AllowedIPs
-                .iter()
-                .any(|r| r == "0.0.0.0/0" || r == "::/0")
-        {
+        if !peer.Key.is_zero() && peer_name == name_lc && crate::peer_is_exit_capable(peer) {
             return Some(peer.Key.clone());
         }
     }
 
     // Try matching by StableID.
     for peer in peers {
-        if peer.StableID == ip_or_name
-            && peer
-                .AllowedIPs
-                .iter()
-                .any(|r| r == "0.0.0.0/0" || r == "::/0")
-        {
+        if !peer.Key.is_zero() && peer.StableID == ip_or_name && crate::peer_is_exit_capable(peer) {
             return Some(peer.Key.clone());
         }
     }
@@ -1348,10 +1338,7 @@ async fn build_status_json(state: &LocalApiState) -> serde_json::Value {
             _ => String::new(),
         };
 
-        let exit_node_option = peer
-            .AllowedIPs
-            .iter()
-            .any(|r| r == "0.0.0.0/0" || r == "::/0");
+        let exit_node_option = crate::peer_is_exit_capable(peer);
 
         let ps = PeerStatus {
             HostName: peer.Name.trim_end_matches('.').to_string(),

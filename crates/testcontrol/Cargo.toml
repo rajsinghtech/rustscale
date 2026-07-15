@@ -13,6 +13,7 @@ workspace = true
 rustscale-key = { path = "../key", version = "0.1.1" }
 rustscale-tailcfg = { path = "../tailcfg", version = "0.1.1" }
 rustscale-controlclient = { path = "../controlclient", version = "0.1.1" }
+rustscale-tka = { path = "../tka", version = "0.1.1" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

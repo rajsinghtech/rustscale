@@ -53,6 +53,7 @@ mod socks5;
 mod state;
 mod status;
 mod taildrop;
+mod tailnet_lock;
 mod tls;
 mod tun_pump;
 mod util;
@@ -222,6 +223,8 @@ pub enum TsnetError {
     NotAvailableInTunMode,
     #[error("feature not supported: {0}")]
     NotSupported(String),
+    #[error("Tailnet Lock state failed closed: {0}")]
+    TailnetLock(String),
     #[error("timeout waiting for first map response")]
     MapTimeout,
     #[error("tls error: {0}")]
@@ -853,6 +856,8 @@ pub(crate) struct RunningState {
     pub(crate) client_updater: Arc<std::sync::Mutex<rustscale_clientupdate::ClientUpdater>>,
     /// Persistent client audit logger for this profile/control client.
     pub(crate) audit_logger: Arc<rustscale_auditlog::Logger>,
+    /// Tailnet Lock authority shared by map filtering and LocalAPI.
+    pub(crate) tailnet_lock: Arc<tailnet_lock::TailnetLock>,
 }
 
 /// A fallback TCP handler: called when an incoming TCP flow doesn't match any
@@ -886,6 +891,9 @@ pub(crate) struct Bootstrap {
     pub(crate) netlog: Option<Arc<rustscale_netlog::Logger>>,
     pub(crate) wg_recv: mpsc::Receiver<rustscale_magicsock::WgReceiveBatch>,
     pub(crate) wg_tunnels: Arc<RwLock<HashMap<NodePublic, Arc<Mutex<WgTunn>>>>>,
+    /// Unfiltered control peer set retained so authority changes can
+    /// re-evaluate peers that were previously withdrawn.
+    pub(crate) raw_peers: Vec<Node>,
     pub(crate) peers: Arc<RwLock<Vec<Node>>>,
     pub(crate) peer_map: Arc<peer_map::Runtime>,
     pub(crate) routecheck: Arc<rustscale_routecheck::Client>,
@@ -957,6 +965,8 @@ pub(crate) struct Bootstrap {
     /// exact persisted identity that hostinfo advertises publicly.
     #[allow(dead_code)]
     pub(crate) private_log_id: rustscale_logid::PrivateID,
+    /// Tailnet Lock authority and fail-closed peer verifier.
+    pub(crate) tailnet_lock: Arc<tailnet_lock::TailnetLock>,
 }
 
 /// An embedded Tailscale server.

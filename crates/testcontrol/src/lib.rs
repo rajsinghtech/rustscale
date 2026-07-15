@@ -33,9 +33,13 @@ use rustscale_controlclient::controlbase::{server_handshake, NoiseIo};
 use rustscale_key::{DiscoPrivate, MachinePrivate, MachinePublic, NodePrivate, NodePublic};
 use rustscale_tailcfg::{
     filter_allow_all, DERPMap, DNSConfig, FilterRule, Login, MapRequest, MapResponse, Node,
-    NodeCapMap, NodeID, RegisterRequest, RegisterResponse, TokenRequest, TokenResponse, User,
-    UserProfile,
+    NodeCapMap, NodeID, RegisterRequest, RegisterResponse, TKABootstrapRequest,
+    TKABootstrapResponse, TKADisableRequest, TKAInfo, TKAInitBeginRequest, TKAInitBeginResponse,
+    TKAInitFinishRequest, TKASignInfo, TKASubmitSignatureRequest, TKASyncOfferRequest,
+    TKASyncOfferResponse, TKASyncSendRequest, TKASyncSendResponse, TokenRequest, TokenResponse,
+    User, UserProfile,
 };
+use rustscale_tka::{Aum, Authority, MemChonk, NodeKeySignature, SyncOffer};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, Notify};
@@ -104,6 +108,13 @@ struct ServerInner {
     token_response: TokenResponse,
     last_token_request: Option<TokenRequest>,
     base_url: String,
+    tka_storage: MemChonk,
+    tka_authority: Option<Authority>,
+    tka_genesis: Option<Aum>,
+    pending_tka_genesis: Option<Aum>,
+    tka_disabled: bool,
+    tka_disablement_secret: Vec<u8>,
+    tka_requests: Vec<(String, u64)>,
 }
 
 /// An in-process fake Tailscale control server.
@@ -169,6 +180,13 @@ impl Server {
                 },
                 last_token_request: None,
                 base_url: String::new(),
+                tka_storage: MemChonk::new(),
+                tka_authority: None,
+                tka_genesis: None,
+                pending_tka_genesis: None,
+                tka_disabled: false,
+                tka_disablement_secret: Vec::new(),
+                tka_requests: Vec::new(),
             })),
             notify: Arc::new(Notify::new()),
             addr: None,
@@ -402,6 +420,18 @@ impl Server {
             let _ = tx.try_send(UpdateType::DebugInjection);
         }
         true
+    }
+
+    /// Snapshot Tailnet Lock RPC paths and the Noise connection that carried
+    /// each request. No request bodies or secret material are retained.
+    pub fn tka_request_connections(&self) -> Vec<(String, u64)> {
+        self.inner.lock().unwrap().tka_requests.clone()
+    }
+
+    /// Resume generated map responses after `add_raw_map_response` suppressed
+    /// them for deterministic delta testing.
+    pub fn resume_auto_map(&self, node_key: &NodePublic) {
+        self.inner.lock().unwrap().suppress_auto.remove(node_key);
     }
 
     /// Wait until the given node key has an active streaming map poll, or
@@ -763,10 +793,20 @@ async fn handle_h2_connection(
 
 /// Read the full h2 request body.
 async fn read_h2_body(body: &mut h2::RecvStream) -> Result<Vec<u8>, h2::Error> {
+    read_h2_body_bounded(body, 16 * 1024 * 1024).await
+}
+
+async fn read_h2_body_bounded(
+    body: &mut h2::RecvStream,
+    limit: usize,
+) -> Result<Vec<u8>, h2::Error> {
     let mut data = Vec::new();
     while let Some(frame) = body.data().await {
         let frame = frame?;
         let _ = body.flow_control().release_capacity(frame.len());
+        if data.len().saturating_add(frame.len()) > limit {
+            return Err(h2::Error::from(h2::Reason::ENHANCE_YOUR_CALM));
+        }
         data.extend_from_slice(&frame);
     }
     Ok(data)
@@ -783,7 +823,8 @@ async fn handle_h2_request(
     connection_id: u64,
     notify: &Arc<Notify>,
 ) -> Result<(), ()> {
-    if method != "POST" {
+    let tka_get = method == "GET" && path.starts_with("/machine/tka/");
+    if method != "POST" && !tka_get {
         let resp = http::Response::builder().status(400).body(()).unwrap();
         let _ = respond.send_response(resp, true);
         return Ok(());
@@ -857,6 +898,27 @@ async fn handle_h2_request(
             send.send_data(bytes::Bytes::from(response), true)
                 .map_err(|_| ())?;
         }
+        path if path.starts_with("/machine/tka/") => {
+            inner
+                .lock()
+                .unwrap()
+                .tka_requests
+                .push((path.to_string(), connection_id));
+            let Ok(body) = read_h2_body_bounded(&mut req_body, 8 * 1024 * 1024).await else {
+                let response = http::Response::builder().status(413).body(()).unwrap();
+                let _ = respond.send_response(response, true);
+                return Ok(());
+            };
+            let (status, response_body) = serve_tka(path, &body, peer_machine_key, inner, notify);
+            let response = http::Response::builder()
+                .status(status)
+                .header("content-type", "application/json")
+                .body(())
+                .unwrap();
+            let mut send = respond.send_response(response, false).map_err(|_| ())?;
+            send.send_data(bytes::Bytes::from(response_body), true)
+                .map_err(|_| ())?;
+        }
         path if path.starts_with("/c2n/") => {
             let body = read_h2_body(&mut req_body).await.map_err(|_| ())?;
             let accepted = {
@@ -885,6 +947,286 @@ async fn handle_h2_request(
         }
     }
     Ok(())
+}
+
+// -----------------------------------------------------------------
+// /machine/tka/*
+// -----------------------------------------------------------------
+
+fn serve_tka(
+    path: &str,
+    body: &[u8],
+    peer_machine_key: &MachinePublic,
+    inner: &Arc<Mutex<ServerInner>>,
+    notify: &Arc<Notify>,
+) -> (u16, Vec<u8>) {
+    fn json<T: serde::Serialize>(value: &T) -> (u16, Vec<u8>) {
+        (
+            200,
+            serde_json::to_vec(value).unwrap_or_else(|_| b"{}".to_vec()),
+        )
+    }
+    fn error(status: u16) -> (u16, Vec<u8>) {
+        (
+            status,
+            b"{\"error\":\"Tailnet Lock request rejected\"}".to_vec(),
+        )
+    }
+    fn authenticated(
+        inner: &ServerInner,
+        node_key: &NodePublic,
+        machine_key: &MachinePublic,
+    ) -> bool {
+        !node_key.is_zero()
+            && inner
+                .nodes
+                .get(node_key)
+                .is_some_and(|node| node.Machine == *machine_key)
+    }
+
+    match path {
+        "/machine/tka/init/begin" => {
+            let Ok(request) = serde_json::from_slice::<TKAInitBeginRequest>(body) else {
+                return error(400);
+            };
+            {
+                let state = inner.lock().unwrap();
+                if !authenticated(&state, &request.NodeKey, peer_machine_key)
+                    || state.tka_authority.is_some()
+                    || state.pending_tka_genesis.is_some()
+                {
+                    return error(409);
+                }
+            }
+            let Ok(genesis) = Aum::decode(&request.GenesisAUM) else {
+                return error(400);
+            };
+            let temporary = MemChonk::new();
+            if Authority::bootstrap(&temporary, genesis.clone()).is_err() {
+                return error(400);
+            }
+            let need_signatures = {
+                let mut state = inner.lock().unwrap();
+                state.pending_tka_genesis = Some(genesis);
+                state
+                    .nodes
+                    .values()
+                    .map(|node| TKASignInfo {
+                        NodeID: node.ID,
+                        NodePublic: node.Key.clone(),
+                        RotationPubkey: Vec::new(),
+                    })
+                    .collect()
+            };
+            json(&TKAInitBeginResponse {
+                NeedSignatures: need_signatures,
+            })
+        }
+        "/machine/tka/init/finish" => {
+            let Ok(request) = serde_json::from_slice::<TKAInitFinishRequest>(body) else {
+                return error(400);
+            };
+            let mut state = inner.lock().unwrap();
+            if !authenticated(&state, &request.NodeKey, peer_machine_key) {
+                return error(403);
+            }
+            let Some(genesis) = state.pending_tka_genesis.clone() else {
+                return error(409);
+            };
+            let storage = MemChonk::new();
+            let Ok(authority) = Authority::bootstrap(&storage, genesis.clone()) else {
+                return error(400);
+            };
+            if request.Signatures.len() != state.nodes.len() {
+                return error(400);
+            }
+            let node_signatures = state
+                .nodes
+                .values()
+                .map(|node| {
+                    let signature = request.Signatures.get(&node.ID)?;
+                    authority
+                        .node_key_authorized(&node.Key.raw32(), signature)
+                        .ok()?;
+                    Some((node.Key.clone(), signature.clone()))
+                })
+                .collect::<Option<Vec<_>>>();
+            let Some(node_signatures) = node_signatures else {
+                return error(400);
+            };
+            for (node_key, signature) in node_signatures {
+                if let Some(node) = state.nodes.get_mut(&node_key) {
+                    node.KeySignature = Some(signature);
+                }
+            }
+            state.tka_storage = storage;
+            state.tka_authority = Some(authority);
+            state.tka_genesis = Some(genesis);
+            state.pending_tka_genesis = None;
+            state.tka_disabled = false;
+            state.tka_disablement_secret.clear();
+            for sender in state.updates.values() {
+                let _ = sender.try_send(UpdateType::PeerChanged);
+            }
+            drop(state);
+            notify.notify_waiters();
+            json(&serde_json::json!({}))
+        }
+        "/machine/tka/bootstrap" => {
+            let Ok(request) = serde_json::from_slice::<TKABootstrapRequest>(body) else {
+                return error(400);
+            };
+            let state = inner.lock().unwrap();
+            if !authenticated(&state, &request.NodeKey, peer_machine_key) {
+                return error(403);
+            }
+            if state.tka_disabled {
+                return json(&TKABootstrapResponse {
+                    GenesisAUM: Vec::new(),
+                    DisablementSecret: state.tka_disablement_secret.clone(),
+                });
+            }
+            let Some(genesis) = state.tka_genesis.as_ref() else {
+                return error(409);
+            };
+            json(&TKABootstrapResponse {
+                GenesisAUM: genesis.encode(),
+                DisablementSecret: Vec::new(),
+            })
+        }
+        "/machine/tka/sync/offer" => {
+            let Ok(request) = serde_json::from_slice::<TKASyncOfferRequest>(body) else {
+                return error(400);
+            };
+            let state = inner.lock().unwrap();
+            if !authenticated(&state, &request.NodeKey, peer_machine_key) {
+                return error(403);
+            }
+            let Some(authority) = state.tka_authority.as_ref() else {
+                return error(409);
+            };
+            let Ok(remote) = SyncOffer::from_strings(&request.Head, &request.Ancestors) else {
+                return error(400);
+            };
+            let Ok(local) = authority.sync_offer(&state.tka_storage) else {
+                return error(500);
+            };
+            let missing = if local.head == remote.head {
+                Vec::new()
+            } else {
+                let Ok(missing) = authority.missing_aums(&state.tka_storage, &remote) else {
+                    return error(409);
+                };
+                missing.into_iter().map(|aum| aum.encode()).collect()
+            };
+            let (head, ancestors) = local.to_strings();
+            json(&TKASyncOfferResponse {
+                Head: head,
+                Ancestors: ancestors,
+                MissingAUMs: missing,
+            })
+        }
+        "/machine/tka/sync/send" => {
+            let Ok(request) = serde_json::from_slice::<TKASyncSendRequest>(body) else {
+                return error(400);
+            };
+            if request.MissingAUMs.len() > 2000 {
+                return error(413);
+            }
+            let updates = match request
+                .MissingAUMs
+                .iter()
+                .map(|bytes| Aum::decode(bytes))
+                .collect::<Result<Vec<_>, _>>()
+            {
+                Ok(updates) => updates,
+                Err(_) => return error(400),
+            };
+            let mut state = inner.lock().unwrap();
+            if !authenticated(&state, &request.NodeKey, peer_machine_key) {
+                return error(403);
+            }
+            let Some(mut authority) = state.tka_authority.clone() else {
+                return error(409);
+            };
+            if !updates.is_empty() && authority.inform(&state.tka_storage, &updates).is_err() {
+                return error(400);
+            }
+            state.tka_authority = Some(authority.clone());
+            for sender in state.updates.values() {
+                let _ = sender.try_send(UpdateType::PeerChanged);
+            }
+            json(&TKASyncSendResponse {
+                Head: authority.head().to_string(),
+            })
+        }
+        "/machine/tka/sign" => {
+            let Ok(request) = serde_json::from_slice::<TKASubmitSignatureRequest>(body) else {
+                return error(400);
+            };
+            let mut state = inner.lock().unwrap();
+            if !authenticated(&state, &request.NodeKey, peer_machine_key) {
+                return error(403);
+            }
+            let Some(authority) = state.tka_authority.as_ref() else {
+                return error(409);
+            };
+            let Ok(signature) = NodeKeySignature::decode(&request.Signature) else {
+                return error(400);
+            };
+            let Some(public) = signature
+                .pubkey
+                .as_deref()
+                .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+                .map(NodePublic::from_raw32)
+            else {
+                return error(400);
+            };
+            if authority
+                .node_key_authorized(&public.raw32(), &request.Signature)
+                .is_err()
+                || !state.nodes.contains_key(&public)
+            {
+                return error(400);
+            }
+            state.nodes.get_mut(&public).unwrap().KeySignature = Some(request.Signature);
+            for sender in state.updates.values() {
+                let _ = sender.try_send(UpdateType::PeerChanged);
+            }
+            json(&serde_json::json!({}))
+        }
+        "/machine/tka/disable" => {
+            let Ok(request) = serde_json::from_slice::<TKADisableRequest>(body) else {
+                return error(400);
+            };
+            if request.DisablementSecret.len() > 1024 {
+                return error(413);
+            }
+            let mut state = inner.lock().unwrap();
+            if !authenticated(&state, &request.NodeKey, peer_machine_key) {
+                return error(403);
+            }
+            let Some(authority) = state.tka_authority.as_ref() else {
+                return error(409);
+            };
+            if request.Head != authority.head().to_string()
+                || !authority.valid_disablement(&request.DisablementSecret)
+            {
+                return error(400);
+            }
+            state.tka_disablement_secret = request.DisablementSecret;
+            state.tka_authority = None;
+            state.tka_storage = MemChonk::new();
+            state.tka_disabled = true;
+            for sender in state.updates.values() {
+                let _ = sender.try_send(UpdateType::PeerChanged);
+            }
+            drop(state);
+            notify.notify_waiters();
+            json(&serde_json::json!({}))
+        }
+        _ => error(404),
+    }
 }
 
 // -----------------------------------------------------------------
@@ -1437,6 +1779,19 @@ fn build_map_response(
     };
 
     let packet_filter: Vec<FilterRule> = filter_allow_all();
+    let tka_info = if let Some(authority) = g.tka_authority.as_ref() {
+        Some(TKAInfo {
+            Head: authority.head().to_string(),
+            Disabled: false,
+        })
+    } else if g.tka_disabled {
+        Some(TKAInfo {
+            Head: String::new(),
+            Disabled: true,
+        })
+    } else {
+        None
+    };
 
     Some(MapResponse {
         Node: Some(node),
@@ -1446,6 +1801,7 @@ fn build_map_response(
         PacketFilter: Some(packet_filter),
         DNSConfig: dns_config,
         UserProfiles: user_profiles,
+        TKAInfo: tka_info,
         ..Default::default()
     })
 }

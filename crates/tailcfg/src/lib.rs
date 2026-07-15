@@ -20,6 +20,7 @@ mod node;
 mod register;
 mod service;
 mod ssh;
+mod tka;
 mod token;
 
 pub use appctype::{
@@ -52,6 +53,12 @@ pub use service::{
 pub use ssh::{
     SSHAction, SSHEventNotifyRequest, SSHEventType, SSHPolicy, SSHPrincipal,
     SSHRecorderFailureAction, SSHRecordingAttempt, SSHRule,
+};
+pub use tka::{
+    TKABootstrapRequest, TKABootstrapResponse, TKADisableRequest, TKADisableResponse, TKAInfo,
+    TKAInitBeginRequest, TKAInitBeginResponse, TKAInitFinishRequest, TKAInitFinishResponse,
+    TKASignInfo, TKASubmitSignatureRequest, TKASubmitSignatureResponse, TKASyncOfferRequest,
+    TKASyncOfferResponse, TKASyncSendRequest, TKASyncSendResponse,
 };
 pub use token::{TokenRequest, TokenResponse};
 

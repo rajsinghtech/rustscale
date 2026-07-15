@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use rustscale_key::{DiscoPrivate, MachinePrivate, NodePrivate, NodePublic};
+use rustscale_key::{DiscoPrivate, MachinePrivate, NLPrivate, NodePrivate, NodePublic};
 use rustscale_tailcfg::MapResponse;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -48,6 +48,10 @@ pub struct PersistedState {
     /// Go's `persist.OldPrivateNodeKey` (`types/persist/persist.go:25`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub old_node_key: Option<NodePrivate>,
+    /// Persisted-identity Ed25519 signing key for Tailnet Lock. Older state files
+    /// receive a fresh key on the next successful state save.
+    #[serde(default)]
+    pub network_lock_key: NLPrivate,
 }
 
 impl Default for PersistedState {
@@ -60,6 +64,7 @@ impl Default for PersistedState {
             stable_node_id: String::new(),
             enrolled: false,
             old_node_key: None,
+            network_lock_key: NLPrivate::default(),
         }
     }
 }
@@ -75,6 +80,7 @@ impl PersistedState {
             stable_node_id: String::new(),
             enrolled: false,
             old_node_key: None,
+            network_lock_key: NLPrivate::generate(),
         }
     }
 

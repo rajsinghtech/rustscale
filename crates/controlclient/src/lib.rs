@@ -15,6 +15,7 @@ pub mod client;
 pub mod controlbase;
 pub mod controlhttp;
 pub mod login_flags;
+pub mod tka;
 
 pub use c2n::{
     answer_c2n_ping, C2nHandler, C2nReplyError, C2nReplyTransport, C2nRequest, C2nResponse,
@@ -27,6 +28,7 @@ pub use client::{
 pub use controlbase::{NoiseConn, NoiseError, NoiseIo, ProtocolVersion};
 pub use controlhttp::{dial_control, fetch_server_pub_key, DialError, NoiseStream};
 pub use login_flags::{LoginFlags, LOGIN_DEFAULT, LOGIN_EPHEMERAL, LOGIN_INTERACTIVE};
+pub use tka::{TkaClient, TkaRpcError, TkaSession};
 
 use std::collections::HashMap;
 

@@ -48,6 +48,7 @@ map_unwrap_or = "allow"
 [dependencies]
 rustscale-key = { path = "../key", version = "0.1.1" }
 rustscale-tailcfg = { path = "../tailcfg", version = "0.1.1" }
+rustscale-tka = { path = "../tka", version = "0.1.1" }
 rustscale-controlclient = { path = "../controlclient", version = "0.1.1" }
 rustscale-controlknobs = { path = "../controlknobs", version = "0.1.1" }
 rustscale-magicsock = { path = "../magicsock", version = "0.1.1" }

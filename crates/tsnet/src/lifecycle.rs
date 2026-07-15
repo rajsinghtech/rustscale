@@ -226,6 +226,7 @@ impl Server {
             b.map_rx,
             b.magicsock.clone(),
             b.wg_tunnels.clone(),
+            b.raw_peers.clone(),
             b.peers.clone(),
             b.route_table.clone(),
             None,
@@ -257,6 +258,7 @@ impl Server {
             b.c2n_router.clone(),
             suggested_exit_node.clone(),
             client_updater.clone(),
+            b.tailnet_lock.clone(),
         );
 
         // MagicDNS responder: best-effort UDP server at 100.100.100.100:53.
@@ -528,6 +530,7 @@ impl Server {
                 }),
                 taildrop: Some(taildrop.clone()),
                 drive: self.drive.clone(),
+                tailnet_lock: Some(b.tailnet_lock.clone()),
                 netstack: Some(netstack.clone()),
                 filter: std::sync::OnceLock::new(),
                 route_table: Some(b.route_table.clone()),
@@ -622,6 +625,7 @@ impl Server {
             portlist_ports,
             client_updater: client_updater.clone(),
             audit_logger,
+            tailnet_lock: b.tailnet_lock.clone(),
         });
 
         // A persisted selection retries only while it is unresolved. Once it
@@ -767,6 +771,7 @@ impl Server {
             b.map_rx,
             b.magicsock.clone(),
             b.wg_tunnels.clone(),
+            b.raw_peers.clone(),
             b.peers.clone(),
             b.route_table.clone(),
             router.clone(),
@@ -798,6 +803,7 @@ impl Server {
             b.c2n_router.clone(),
             suggested_exit_node.clone(),
             client_updater.clone(),
+            b.tailnet_lock.clone(),
         );
 
         // Taildrop file manager (shared between PeerAPI receive handler
@@ -1038,6 +1044,7 @@ impl Server {
                 }),
                 taildrop: Some(taildrop.clone()),
                 drive: self.drive.clone(),
+                tailnet_lock: Some(b.tailnet_lock.clone()),
                 netstack: None, // TUN mode has no netstack
                 filter: std::sync::OnceLock::new(),
                 route_table: Some(b.route_table.clone()),
@@ -1165,6 +1172,7 @@ impl Server {
             portlist_ports,
             client_updater: client_updater.clone(),
             audit_logger,
+            tailnet_lock: b.tailnet_lock.clone(),
         });
 
         // TUN config owns a selection made above; otherwise retry only an
@@ -1358,6 +1366,7 @@ impl Server {
             control_params: None,
             taildrop: None,
             drive: self.drive.clone(),
+            tailnet_lock: None,
             netstack: None,
             filter: std::sync::OnceLock::new(),
             route_table: None,
@@ -1529,6 +1538,11 @@ impl Server {
         let was_fresh = state.is_zero();
         if was_fresh {
             state = PersistedState::generate();
+            self.save_state(&state)?;
+        } else if state.network_lock_key.is_zero() {
+            // Upgrade older persisted identities with a profile-local Tailnet
+            // Lock key before exposing it through LocalAPI status.
+            state.network_lock_key = rustscale_key::NLPrivate::generate();
             self.save_state(&state)?;
         }
 
@@ -1761,6 +1775,7 @@ impl Server {
         // the blocking fetch and use the cached data — the streaming
         // long-poll (started below) will deliver fresh updates in the
         // background. This eliminates the 2-5s startup delay on restarts.
+        let used_cached_netmap = cached_netmap.is_some();
         let map_resp: MapResponse = if let Some(ref cached) = cached_netmap {
             let peer_count = cached.Peers.len();
             log::debug!(
@@ -1791,6 +1806,33 @@ impl Server {
             .await
             .map_err(|_| TsnetError::MapTimeout)??
         };
+
+        let tailnet_lock = tailnet_lock::TailnetLock::open(tailnet_lock::TailnetLockParams {
+            control_url: self.config.control_url.clone(),
+            machine_key: state.machine_key.clone(),
+            server_pub_key: server_pub_key.clone(),
+            node_key: state.node_key.clone(),
+            signing_key: state.network_lock_key.clone(),
+            capability_version: CAPABILITY_VERSION,
+            protocol_version: PROTOCOL_VERSION,
+            state_dir: self.config.state_dir.clone(),
+            extra_root_certs: self.config.extra_root_certs.clone(),
+        })
+        .map_err(|error| TsnetError::TailnetLock(error.to_string()))?;
+        if used_cached_netmap && map_resp.TKAInfo.as_ref().is_none_or(|info| info.Disabled) {
+            // A cached disabled/absent TKAInfo cannot prove that an
+            // administrator did not enable locking while this node was
+            // offline. Withdraw peers until the new map stream confirms it.
+            tailnet_lock.require_fresh_control_state();
+        } else if let Err(error) = tailnet_lock
+            .apply_control_info(map_resp.TKAInfo.as_ref(), true)
+            .await
+        {
+            // Peer filtering below remains active and drops every peer while
+            // authority state is incomplete.
+            log::warn!("tsnet: Tailnet Lock synchronization failed closed: {error}");
+        }
+        tailnet_lock.set_self_node(map_resp.Node.clone());
 
         let tailscale_ips = extract_tailscale_ips(&map_resp);
         if tailscale_ips.is_empty() {
@@ -1984,11 +2026,13 @@ impl Server {
                 PeerRelay: self.config.peer_relay_server,
                 ..Default::default()
             }),
+            TKAHead: tailnet_lock.head(),
             ..Default::default()
         };
 
         let (map_tx, map_rx) = mpsc::channel(32);
         let map_session = Arc::new(MapSessionState::new());
+        map_session.set_tka_head(tailnet_lock.head());
         let cc2 = ControlClient::new(
             self.config.control_url.clone(),
             state.machine_key.clone(),
@@ -2040,8 +2084,12 @@ impl Server {
         if peers.is_empty() && !map_resp.PeersChanged.is_empty() {
             peers = map_resp.PeersChanged.clone();
         }
-        // Validate stable IDs, keys, addresses, and address ownership before
-        // any peer-derived transport state becomes live.
+        // Keep the stable-ID-reconciled control view separate from the TKA
+        // verified intersection. Authority changes may reauthorize a raw peer
+        // without control repeating it, but only verified peers own addresses,
+        // tunnels, PeerAPI provenance, or Taildrive grants.
+        let raw_peers = peers.clone();
+        tailnet_lock.filter_peers(&mut peers);
         let peer_map = crate::peer_map::Runtime::new(&peers)
             .map_err(|error| TsnetError::InvalidNetmap(error.to_string()))?;
 
@@ -2209,6 +2257,7 @@ impl Server {
             netlog,
             wg_recv,
             wg_tunnels,
+            raw_peers,
             peers: peers_arc,
             peer_map,
             routecheck,
@@ -2248,6 +2297,7 @@ impl Server {
             sockstats,
             backend_log_id,
             private_log_id,
+            tailnet_lock,
         })
     }
 

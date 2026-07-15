@@ -404,6 +404,7 @@ fn sample_map_response() -> MapResponse {
         NetInfo: None,
         ClientVersion: None,
         SuggestedExitNode: String::new(),
+        TKAInfo: None,
     }
 }
 

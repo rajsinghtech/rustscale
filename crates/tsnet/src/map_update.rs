@@ -87,6 +87,7 @@ pub(crate) fn spawn_map_update_task(
     mut map_rx: mpsc::Receiver<Result<MapResponse, StreamMapError>>,
     magicsock: Arc<Magicsock>,
     wg_tunnels: Arc<RwLock<HashMap<NodePublic, Arc<Mutex<WgTunn>>>>>,
+    mut raw_peers: Vec<Node>,
     peers_arc: Arc<RwLock<Vec<Node>>>,
     route_table: Arc<RwLock<RouteTable>>,
     router: Option<SharedRouter>,
@@ -118,6 +119,7 @@ pub(crate) fn spawn_map_update_task(
     c2n_router: Arc<C2nRouter>,
     suggested_exit_node: Arc<RwLock<String>>,
     client_updater: Arc<std::sync::Mutex<rustscale_clientupdate::ClientUpdater>>,
+    tailnet_lock: Arc<crate::tailnet_lock::TailnetLock>,
 ) -> JoinHandle<()> {
     // Create the netmap cache helper once so that save_if_changed can
     // dedup identical writes via the in-memory SHA-256 hash.
@@ -133,6 +135,7 @@ pub(crate) fn spawn_map_update_task(
         std::time::Duration::from_secs(125),
     );
     tokio::spawn(async move {
+        let mut first_non_keepalive = true;
         loop {
             if cancel.is_cancelled() {
                 break;
@@ -173,6 +176,25 @@ pub(crate) fn spawn_map_update_task(
                             }
                         }
                         continue;
+                    }
+
+                    let tka_state_may_change = first_non_keepalive || resp.TKAInfo.is_some();
+                    let tka_sync =
+                        tailnet_lock.apply_control_info(resp.TKAInfo.as_ref(), first_non_keepalive);
+                    tokio::select! {
+                        () = cancel.cancelled() => break,
+                        result = tka_sync => {
+                            if let Err(error) = result {
+                                // The verifier remains in its fail-closed state;
+                                // do not retain peers using stale/partial state.
+                                log::warn!("tsnet: Tailnet Lock synchronization failed closed: {error}");
+                            }
+                        }
+                    }
+                    first_non_keepalive = false;
+                    map_session.set_tka_head(tailnet_lock.head());
+                    if resp.Node.is_some() {
+                        tailnet_lock.set_self_node(resp.Node.clone());
                     }
 
                     // Track map session handle + seq for delta resumption.
@@ -220,6 +242,7 @@ pub(crate) fn spawn_map_update_task(
                                 Ok(Some(new_key)) => {
                                     node_key = new_key.clone();
                                     node_pub = new_key.public();
+                                    tailnet_lock.set_node_key(new_key);
                                     key_expired.store(false, std::sync::atomic::Ordering::Relaxed);
                                     ipn_backend.set_key_expired(false);
                                     ipn_backend.set_blocked(false);
@@ -315,24 +338,27 @@ pub(crate) fn spawn_map_update_task(
                         }
                     }
 
-                    // Reconcile by stable Node.ID before touching live state.
-                    // A malformed map (especially duplicate address ownership)
-                    // fails closed to an empty peer set rather than retaining
-                    // stale keys or grants.
+                    // Reconcile the raw control view by stable Node.ID before
+                    // intersecting it with TKA authorization. Invalid identity
+                    // or address ownership withdraws all peers and grants.
                     let current_peers = peers_arc.read().await.clone();
-                    let (next_peers, invalid_peer_map) =
-                        match crate::peer_map::reconcile(&current_peers, &resp) {
+                    let (next_raw_peers, invalid_peer_map) =
+                        match crate::peer_map::reconcile(&raw_peers, &resp) {
                             Ok(peers) => (peers, false),
                             Err(error) => {
                                 log::warn!("tsnet: rejecting invalid peer map update: {error}");
                                 (Vec::new(), true)
                             }
                         };
-                    let peers_changed = invalid_peer_map || next_peers != current_peers;
+                    raw_peers = next_raw_peers;
+                    let mut next_peers = raw_peers.clone();
+                    tailnet_lock.filter_peers(&mut next_peers);
+                    let peers_changed =
+                        tka_state_may_change || invalid_peer_map || next_peers != current_peers;
 
                     // Construct replacement tunnels and routes before the
-                    // commit gate. Unchanged current keys keep their WG state;
-                    // rotated/removed keys cannot survive in the new map.
+                    // commit gate. Unchanged verified keys keep WG state;
+                    // stable-ID rotations and TKA withdrawals cannot.
                     let old_tunnels = wg_tunnels.read().await;
                     let next_tunnels = build_peer_tunnels(&node_key, &next_peers, &old_tunnels);
                     drop(old_tunnels);
@@ -350,14 +376,13 @@ pub(crate) fn spawn_map_update_task(
                         .await
                         .retry(&next_peers, &mut next_routes);
 
-                    // Data-plane readers and PeerAPI provenance checks hold the
-                    // read side. This writer makes peers, ownership, tunnels,
-                    // magicsock endpoints, routes, filter grants, and Taildrive
-                    // revocation one observable commit.
+                    // One writer commit replaces every peer-derived authority:
+                    // authenticated source ownership, tunnels, magicsock and
+                    // relay generations, ACL capability grants, routes, and
+                    // Taildrive publication epochs all use the TKA-verified
+                    // stable-ID intersection.
                     let map_commit = peer_map.gate.write().await;
                     let mut drive_epoch = drive.authorization_write().await;
-                    // Cancel staging and drain old-authority publication before
-                    // changing any grant/config-visible map state.
                     drive.rotate_authorization_locked(&mut drive_epoch);
                     if invalid_peer_map {
                         drive.set_sharing_allowed_locked(false, &mut drive_epoch);
@@ -395,26 +420,20 @@ pub(crate) fn spawn_map_update_task(
                     *route_table.write().await = next_routes;
                     peer_map
                         .install_locked(&next_peers)
-                        .expect("validated peer map installs");
+                        .expect("validated verified peer map installs");
                     drop(drive_epoch);
                     drop(map_commit);
+                    let peers = next_peers;
 
                     // Forward peer deltas to the IPN notify bus so
                     // watch-ipn-bus subscribers receive PeersChanged /
                     // PeersRemoved / NetMap. Mirrors Go's `ipnlocal.send`
                     // in the full-netmap and delta notify paths.
                     if !resp.PeersChanged.is_empty() || !resp.Peers.is_empty() {
-                        let changed_nodes: Vec<serde_json::Value> = if resp.Peers.is_empty() {
-                            resp.PeersChanged
-                                .iter()
-                                .filter_map(|p| serde_json::to_value(p).ok())
-                                .collect()
-                        } else {
-                            resp.Peers
-                                .iter()
-                                .filter_map(|p| serde_json::to_value(p).ok())
-                                .collect()
-                        };
+                        let changed_nodes: Vec<serde_json::Value> = peers
+                            .iter()
+                            .filter_map(|peer| serde_json::to_value(peer).ok())
+                            .collect();
                         if !changed_nodes.is_empty() {
                             ipn_backend.bus().send(rustscale_ipn::Notify {
                                 PeersChanged: Some(changed_nodes),
@@ -427,10 +446,9 @@ pub(crate) fn spawn_map_update_task(
                     // full-netmap notify path for legacy/initial-netmap
                     // watchers.
                     if !resp.Peers.is_empty() {
-                        let peers_json: Vec<serde_json::Value> = resp
-                            .Peers
+                        let peers_json: Vec<serde_json::Value> = peers
                             .iter()
-                            .filter_map(|p| serde_json::to_value(p).ok())
+                            .filter_map(|peer| serde_json::to_value(peer).ok())
                             .collect();
                         let netmap_json = serde_json::json!({
                             "Peers": peers_json,
@@ -458,7 +476,6 @@ pub(crate) fn spawn_map_update_task(
                     // Apply the already-built route snapshot to the OS after
                     // releasing the packet gate so shell/native router work
                     // cannot stall data-plane readers.
-                    let peers = peers_arc.read().await.clone();
                     let live_prefs = prefs.read().await.clone();
                     if let Some(router) = router.as_ref() {
                         let derp_map = magicsock.get_derp_map();

@@ -1,53 +1,146 @@
-//! Network-lock (tailnet-lock) public keys — ed25519 keys serialized as
-//! `nlpub:<hex>` on the wire, matching Go's `key.NLPublic`.
+//! Network-lock (Tailnet Lock) Ed25519 keys.
+//!
+//! Public keys use `nlpub:<hex>` on the wire and accept the CLI spelling
+//! `tlpub:<hex>`. Private keys use the existing persistence-only
+//! `privkey:<hex>` spelling and are always redacted from Display and Debug.
 
 use std::fmt;
 use std::str::FromStr;
 
+use ed25519_dalek::{Signer as _, SigningKey};
+use rand::RngCore as _;
 use serde::{Deserialize, Serialize};
 
-use crate::{append_hex_key, ct_eq, KeyError, KEY_LEN};
+use crate::{append_hex_key, ct_eq, parse_typed_hex, redacted, KeyError, KEY_LEN, PRIV_PREFIX};
 
-/// The public prefix for network-lock public keys (`nlpub:<hex>`).
 pub(crate) const NL_PUB_PREFIX: &str = "nlpub:";
-/// The CLI prefix for network-lock public keys (`tlpub:<hex>`).
 pub(crate) const NL_PUB_PREFIX_CLI: &str = "tlpub:";
 
-/// A network-lock public key (ed25519), serialized as `nlpub:<hex>`.
-///
-/// Matches Go's `key.NLPublic`. This is an ed25519 public key used for
-/// tailnet lock signatures. Only serialization/deserialization is
-/// implemented here; verification requires the ed25519 crate and will be
-/// added when tailnet-lock support is ported.
-#[derive(Clone, PartialEq, Eq, Hash)]
+/// An Ed25519 private key used to sign Tailnet Lock AUMs and node keys.
+#[derive(Clone, PartialEq, Eq)]
+pub struct NLPrivate {
+    k: [u8; KEY_LEN],
+}
+
+impl NLPrivate {
+    /// Generate a fresh key using the operating system RNG.
+    pub fn generate() -> Self {
+        let mut k = [0u8; KEY_LEN];
+        rand::rngs::OsRng.fill_bytes(&mut k);
+        Self { k }
+    }
+
+    pub fn from_raw32(k: [u8; KEY_LEN]) -> Self {
+        Self { k }
+    }
+
+    pub fn raw32(&self) -> [u8; KEY_LEN] {
+        self.k
+    }
+
+    pub fn is_zero(&self) -> bool {
+        self.k.iter().all(|byte| *byte == 0)
+    }
+
+    /// Derive the corresponding public key.
+    pub fn public(&self) -> NLPublic {
+        assert!(!self.is_zero(), "can't derive a zero NLPrivate");
+        NLPublic::from_raw32(SigningKey::from_bytes(&self.k).verifying_key().to_bytes())
+    }
+
+    /// Sign an already-domain-separated 32-byte TKA digest.
+    pub fn sign(&self, digest: &[u8; 32]) -> Result<Vec<u8>, KeyError> {
+        if self.is_zero() {
+            return Err(KeyError::ZeroKey);
+        }
+        Ok(SigningKey::from_bytes(&self.k)
+            .sign(digest)
+            .to_bytes()
+            .to_vec())
+    }
+
+    pub fn marshal_text(&self) -> String {
+        append_hex_key(PRIV_PREFIX, &self.k)
+    }
+}
+
+impl Default for NLPrivate {
+    fn default() -> Self {
+        Self::from_raw32([0; KEY_LEN])
+    }
+}
+
+impl FromStr for NLPrivate {
+    type Err = KeyError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let mut k = [0u8; KEY_LEN];
+        parse_typed_hex(value, PRIV_PREFIX, &mut k)?;
+        Ok(Self { k })
+    }
+}
+
+impl fmt::Display for NLPrivate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        redacted(formatter, "NLPrivate")
+    }
+}
+
+impl fmt::Debug for NLPrivate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        redacted(formatter, "NLPrivate")
+    }
+}
+
+impl Serialize for NLPrivate {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.marshal_text())
+    }
+}
+
+impl<'de> Deserialize<'de> for NLPrivate {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Self::from_str(&raw).map_err(serde::de::Error::custom)
+    }
+}
+
+/// A Tailnet Lock Ed25519 public key.
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NLPublic {
     k: [u8; KEY_LEN],
 }
 
 impl NLPublic {
-    /// Construct from 32 raw bytes.
     pub fn from_raw32(bytes: [u8; KEY_LEN]) -> Self {
         Self { k: bytes }
     }
 
-    /// The 32 raw bytes.
     pub fn raw32(&self) -> [u8; KEY_LEN] {
         self.k
     }
 
-    /// Whether this is the all-zero key.
     pub fn is_zero(&self) -> bool {
         self.k.iter().all(|&b| b == 0)
     }
 
-    /// Constant-time-ish equality.
     pub fn equal(&self, other: &Self) -> bool {
         ct_eq(&self.k, &other.k)
     }
 
-    /// Typed hex text form (`nlpub:<hex>`).
     pub fn marshal_text(&self) -> String {
         append_hex_key(NL_PUB_PREFIX, &self.k)
+    }
+
+    /// User-facing `tlpub:<hex>` spelling used by lock commands.
+    pub fn cli_string(&self) -> String {
+        append_hex_key(NL_PUB_PREFIX_CLI, &self.k)
     }
 }
 
@@ -59,6 +152,7 @@ impl Default for NLPublic {
 
 impl FromStr for NLPublic {
     type Err = KeyError;
+
     fn from_str(s: &str) -> Result<Self, KeyError> {
         let mut k = [0u8; KEY_LEN];
         if let Some(rest) = s.strip_prefix(NL_PUB_PREFIX) {
@@ -118,49 +212,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn nl_public_text_form() {
-        let bytes = [0xab; KEY_LEN];
-        let key = NLPublic::from_raw32(bytes);
-        let s = key.to_string();
-        assert!(s.starts_with("nlpub:"));
-        assert_eq!(s.len(), "nlpub:".len() + 64);
-        let parsed: NLPublic = s.parse().unwrap();
-        assert_eq!(parsed, key);
-    }
+    fn private_signs_and_stays_redacted() {
+        use ed25519_dalek::{Signature, VerifyingKey};
 
-    #[test]
-    fn nl_public_cli_prefix() {
-        let bytes = [0xcd; KEY_LEN];
-        let key = NLPublic::from_raw32(bytes);
-        let cli = format!("tlpub:{}", hex::encode(bytes));
-        let parsed: NLPublic = cli.parse().unwrap();
-        assert_eq!(parsed, key);
-    }
-
-    #[test]
-    fn nl_public_zero_default() {
-        let z = NLPublic::default();
-        assert!(z.is_zero());
-        let s = z.to_string();
+        let private = NLPrivate::generate();
+        let digest = [7; 32];
+        let signature = Signature::from_slice(&private.sign(&digest).unwrap()).unwrap();
+        VerifyingKey::from_bytes(&private.public().raw32())
+            .unwrap()
+            .verify_strict(&digest, &signature)
+            .unwrap();
+        assert!(!private.to_string().contains(&hex::encode(private.raw32())));
+        assert!(!format!("{private:?}").contains(&hex::encode(private.raw32())));
+        let encoded = serde_json::to_string(&private).unwrap();
         assert_eq!(
-            s,
-            "nlpub:0000000000000000000000000000000000000000000000000000000000000000"
+            serde_json::from_str::<NLPrivate>(&encoded).unwrap(),
+            private
         );
     }
 
     #[test]
-    fn nl_public_serde_roundtrip() {
-        let bytes = [0x42; KEY_LEN];
-        let key = NLPublic::from_raw32(bytes);
-        let j = serde_json::to_string(&key).unwrap();
-        assert!(j.starts_with("\"nlpub:"));
-        let back: NLPublic = serde_json::from_str(&j).unwrap();
-        assert_eq!(back, key);
-    }
-
-    #[test]
-    fn nl_public_rejects_bad_prefix() {
-        let result: Result<NLPublic, _> = "nodekey:ab".parse();
-        assert!(result.is_err());
+    fn public_wire_and_cli_forms_roundtrip() {
+        let key = NLPublic::from_raw32([0xcd; KEY_LEN]);
+        assert_eq!(key.to_string().parse::<NLPublic>().unwrap(), key);
+        assert_eq!(key.cli_string().parse::<NLPublic>().unwrap(), key);
+        let json = serde_json::to_string(&key).unwrap();
+        assert_eq!(serde_json::from_str::<NLPublic>(&json).unwrap(), key);
+        assert!(NLPublic::default().is_zero());
+        assert!("nodekey:ab".parse::<NLPublic>().is_err());
     }
 }

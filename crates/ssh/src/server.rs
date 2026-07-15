@@ -5,7 +5,6 @@ use crate::env::accept_env_pair;
 use crate::recording::{default_recording_path, CastHeader, RecordingConfig};
 use crate::recording_upload::DialFn;
 use crate::session::{PeerIdentity, Pty, SessionInit, Window};
-use crate::session_handler::init_recording;
 use russh::keys::PrivateKey;
 use russh::server::{Auth, Msg, Server as RusshServer, Session};
 use russh::{Channel, ChannelId, MethodSet};
@@ -66,6 +65,7 @@ impl RusshServer for SshServer {
             accept_env: Vec::new(),
             peer_identity: None,
             channel_data_tx: None,
+            session_cancel: None,
             env_vars: Vec::new(),
             pty: None,
             command: String::new(),
@@ -107,6 +107,7 @@ pub struct SshHandler {
     accept_env: Vec<String>,
     peer_identity: Option<PeerIdentity>,
     channel_data_tx: Option<mpsc::Sender<Vec<u8>>>,
+    session_cancel: Option<tokio::sync::watch::Sender<bool>>,
     env_vars: Vec<(String, String)>,
     pty: Option<Pty>,
     command: String,
@@ -150,37 +151,20 @@ impl SshHandler {
         match &result {
             EvalResult::Accept {
                 action,
-                action0,
                 local_user,
                 accept_env,
             } => {
                 if !action.Message.is_empty() {
                     log::info!("SSH auth: {}", action.Message);
                 }
-                // A matched rule may carry a Reject action (Go's
-                // `tailssh.go` checks `action.Reject` after evalSSHPolicy
-                // returns `accepted`). Honour it here.
-                if action.Reject {
-                    log::warn!("SSH: policy rejects connection (reject action)");
-                    return Auth::reject();
-                }
                 self.ssh_user = ssh_user;
                 self.local_user.clone_from(local_user);
                 self.accept_env.clone_from(accept_env);
                 self.peer_identity = Some(PeerIdentity { node, user_profile });
-                let (recorders, on_failure) = if action.Recorders.is_empty() {
-                    action0.as_ref().map_or_else(
-                        || (Vec::new(), None),
-                        |initial| {
-                            (
-                                initial.Recorders.clone(),
-                                initial.OnRecordingFailure.clone(),
-                            )
-                        },
-                    )
-                } else {
-                    (action.Recorders.clone(), action.OnRecordingFailure.clone())
-                };
+                // This is the final terminal action. Never inherit recorder
+                // policy from an earlier/delegating action.
+                let recorders = action.Recorders.clone();
+                let on_failure = action.OnRecordingFailure.clone();
                 if on_failure
                     .as_ref()
                     .is_some_and(|failure| !failure.NotifyURL.is_empty())
@@ -225,10 +209,12 @@ impl SshHandler {
         session: &mut Session,
     ) -> Result<(), russh::Error> {
         let (data_tx, data_rx) = mpsc::channel::<Vec<u8>>(64);
-        let (done_tx, mut done_rx) = mpsc::channel::<()>(1);
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let (done_tx, _done_rx) = mpsc::channel::<()>(1);
         let (signal_tx, signal_rx) = mpsc::channel::<russh::Sig>(16);
         let (window_change_tx, window_change_rx) = mpsc::channel::<Window>(16);
         self.channel_data_tx = Some(data_tx);
+        self.session_cancel = Some(cancel_tx);
         self.signal_tx = Some(signal_tx);
         self.window_change_tx = Some(window_change_tx);
 
@@ -286,31 +272,23 @@ impl SshHandler {
         } else {
             cast_header.src_node_tags.clone_from(&peer.node.Tags);
         }
-        let recorder = match &recording_config {
-            Some(config) => {
-                match init_recording(config, cast_header, self.config.dial_fn.clone()).await {
-                    Ok(recorder) => recorder,
-                    Err(message) => {
-                        let _ = session.data(channel_id, message);
-                        let _ = session.channel_failure(channel_id);
-                        return Ok(());
-                    }
-                }
-            }
-            None => None,
-        };
+        let recording_header = recording_config.as_ref().map(|_| cast_header);
         let init = SessionInit {
             peer,
             ssh_user: self.ssh_user.clone(),
+            local_user: self.local_user.clone(),
             command: self.command.clone(),
             env: self.env_vars.clone(),
             pty: self.pty.clone(),
             handle,
             channel_id,
             data_rx,
+            cancel_rx,
             done_tx,
-            recorder,
+            recorder: None,
             recording_config,
+            recording_header,
+            recording_dial: self.config.dial_fn.clone(),
             signal_rx,
             window_change_rx,
             peer_addr,
@@ -319,7 +297,9 @@ impl SshHandler {
         if self.config.session_tx.send(init).await.is_err() {
             return Err(russh::Error::Disconnect);
         }
-        let _ = done_rx.recv().await;
+        // Do not block the russh handler on process completion. It must remain
+        // available to deliver channel data, EOF, close, signals, and window
+        // changes to the orchestrator.
         Ok(())
     }
 }
@@ -490,6 +470,9 @@ impl russh::server::Handler for SshHandler {
         _channel: ChannelId,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
+        if let Some(cancel) = self.session_cancel.take() {
+            cancel.send_replace(true);
+        }
         self.channel_data_tx = None;
         self.signal_tx = None;
         self.window_change_tx = None;
@@ -501,6 +484,9 @@ impl russh::server::Handler for SshHandler {
         _channel: ChannelId,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
+        if let Some(cancel) = self.session_cancel.take() {
+            cancel.send_replace(true);
+        }
         self.channel_data_tx = None;
         self.signal_tx = None;
         self.window_change_tx = None;
@@ -654,6 +640,32 @@ mod tests {
         );
         assert_eq!(h.ssh_user, "alice");
         assert_eq!(h.local_user, "alice");
+    }
+
+    #[tokio::test]
+    async fn recorder_policy_is_taken_from_terminal_accept_action() {
+        let recorder: std::net::SocketAddr = "100.64.0.9:80".parse().unwrap();
+        let policy = SSHPolicy {
+            Rules: vec![SSHRule {
+                Principals: vec![SSHPrincipal {
+                    Any: true,
+                    ..Default::default()
+                }],
+                SSHUsers: BTreeMap::from([("*".into(), "=".into())]),
+                Action: Some(SSHAction {
+                    Accept: true,
+                    Recorders: vec![recorder],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+        };
+        let mut handler = make_handler(Arc::new(move || Some(policy.clone())), whois_finds_peer());
+        assert!(matches!(
+            handler.auth_none("alice").await.unwrap(),
+            Auth::Accept
+        ));
+        assert_eq!(handler.recording_config.unwrap().recorders, vec![recorder]);
     }
 
     #[tokio::test]

@@ -1,12 +1,13 @@
 //! SSH session type — ports Go's `ssh/tailssh/session.go`.
 #![allow(dead_code)]
 
-use crate::recording::{RecordDir, RecordResult, RecordingConfig, SessionRecorder};
+use crate::recording::{CastHeader, RecordDir, RecordResult, RecordingConfig, SessionRecorder};
+use crate::recording_upload::DialFn;
 use russh::{ChannelId, Sig};
 use rustscale_tailcfg::{Node, UserProfile};
 use std::net::SocketAddr;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 #[derive(Clone, Debug, Default)]
 pub struct Window {
@@ -31,16 +32,22 @@ pub struct PeerIdentity {
 pub struct SessionInit {
     pub peer: PeerIdentity,
     pub ssh_user: String,
+    /// Policy-mapped local account. This, never `ssh_user`, is resolved and
+    /// launched by the orchestrator.
+    pub local_user: String,
     pub command: String,
     pub env: Vec<(String, String)>,
     pub pty: Option<Pty>,
     pub handle: russh::server::Handle,
     pub channel_id: ChannelId,
     pub data_rx: mpsc::Receiver<Vec<u8>>,
+    pub cancel_rx: watch::Receiver<bool>,
     pub done_tx: mpsc::Sender<()>,
     /// Optional session recorder for capturing PTY output.
     pub recorder: Option<SessionRecorder>,
     pub recording_config: Option<RecordingConfig>,
+    pub recording_header: Option<CastHeader>,
+    pub recording_dial: Option<DialFn>,
     /// Receiver for SSH signals (SIGINT, SIGTERM, etc.) forwarded by
     /// SshHandler::signal. Mirrors Go's signal handling in handleSession.
     pub signal_rx: mpsc::Receiver<Sig>,
@@ -54,17 +61,22 @@ pub struct SessionInit {
 pub struct Session {
     peer: PeerIdentity,
     ssh_user: String,
+    local_user: String,
     command: String,
     env: Vec<(String, String)>,
     pty: Option<Pty>,
     handle: russh::server::Handle,
     channel_id: ChannelId,
     data_rx: mpsc::Receiver<Vec<u8>>,
+    cancel_rx: watch::Receiver<bool>,
     read_buf: Vec<u8>,
     done_tx: Option<mpsc::Sender<()>>,
     closed: bool,
+    input_eof: bool,
     recorder: Option<SessionRecorder>,
     recording_config: Option<RecordingConfig>,
+    recording_header: Option<CastHeader>,
+    recording_dial: Option<DialFn>,
     signal_rx: mpsc::Receiver<Sig>,
     window_change_rx: mpsc::Receiver<Window>,
     peer_addr: Option<SocketAddr>,
@@ -75,17 +87,22 @@ impl Session {
         Self {
             peer: init.peer,
             ssh_user: init.ssh_user,
+            local_user: init.local_user,
             command: init.command,
             env: init.env,
             pty: init.pty,
             handle: init.handle,
             channel_id: init.channel_id,
             data_rx: init.data_rx,
+            cancel_rx: init.cancel_rx,
             read_buf: Vec::new(),
             done_tx: Some(init.done_tx),
             closed: false,
+            input_eof: false,
             recorder: init.recorder,
             recording_config: init.recording_config,
+            recording_header: init.recording_header,
+            recording_dial: init.recording_dial,
             signal_rx: init.signal_rx,
             window_change_rx: init.window_change_rx,
             peer_addr: init.peer_addr,
@@ -93,6 +110,9 @@ impl Session {
     }
     pub fn user(&self) -> &str {
         &self.ssh_user
+    }
+    pub fn local_user(&self) -> &str {
+        &self.local_user
     }
     pub fn peer(&self) -> &PeerIdentity {
         &self.peer
@@ -126,6 +146,12 @@ impl Session {
     pub fn take_recording_config(&mut self) -> Option<RecordingConfig> {
         self.recording_config.take()
     }
+    pub fn take_recording_header(&mut self) -> Option<CastHeader> {
+        self.recording_header.take()
+    }
+    pub fn take_recording_dial(&mut self) -> Option<DialFn> {
+        self.recording_dial.take()
+    }
     /// Returns the russh server handle (for sending data/extended_data/exit).
     pub fn handle(&self) -> &russh::server::Handle {
         &self.handle
@@ -139,6 +165,9 @@ impl Session {
         self.peer_addr
     }
     /// Takes the signal receiver out of the Session.
+    pub fn take_cancel_rx(&mut self) -> watch::Receiver<bool> {
+        self.cancel_rx.clone()
+    }
     pub fn take_signal_rx(&mut self) -> mpsc::Receiver<Sig> {
         std::mem::replace(&mut self.signal_rx, mpsc::channel(1).1)
     }
@@ -171,7 +200,7 @@ impl AsyncRead for Session {
         buf: &mut ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         let this = self.get_mut();
-        if this.closed {
+        if this.closed || this.input_eof {
             return std::task::Poll::Ready(Ok(()));
         }
         if !this.read_buf.is_empty() {
@@ -193,7 +222,7 @@ impl AsyncRead for Session {
                 std::task::Poll::Ready(Ok(()))
             }
             std::task::Poll::Ready(None) => {
-                this.closed = true;
+                this.input_eof = true;
                 std::task::Poll::Ready(Ok(()))
             }
             std::task::Poll::Pending => std::task::Poll::Pending,
@@ -204,7 +233,7 @@ impl AsyncRead for Session {
 impl AsyncWrite for Session {
     fn poll_write(
         self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
+        _cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
         if self.closed {
@@ -224,12 +253,12 @@ impl AsyncWrite for Session {
         let handle = this.handle.clone();
         let channel_id = this.channel_id;
         let data = buf.to_vec();
-        let waker = cx.waker().clone();
         tokio::spawn(async move {
             let _ = handle.data(channel_id, data).await;
-            waker.wake();
         });
-        std::task::Poll::Pending
+        // The bytes are owned by the spawned send. Returning Pending here
+        // causes AsyncWrite callers to resubmit and duplicate output.
+        std::task::Poll::Ready(Ok(buf.len()))
     }
     fn poll_flush(
         self: std::pin::Pin<&mut Self>,

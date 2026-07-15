@@ -92,6 +92,40 @@ pub struct SpawnedProcess {
     args: IncubatorArgs,
 }
 
+/// Safe controller for the dedicated process group created for an SSH shell.
+#[derive(Clone, Debug)]
+pub struct ProcessGroup {
+    pid: u32,
+}
+
+impl ProcessGroup {
+    /// Signal the whole shell process group, including descendants.
+    #[cfg(unix)]
+    pub fn signal(&self, signal: libc::c_int) -> io::Result<()> {
+        // SAFETY: `pid` came from a successfully spawned child which calls
+        // setpgid(0, 0) before exec. kill does not dereference memory.
+        let result = unsafe { libc::kill(-(self.pid as libc::pid_t), signal) };
+        if result == 0 {
+            Ok(())
+        } else {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    pub fn signal(&self, _signal: libc::c_int) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "process groups are only supported on Unix",
+        ))
+    }
+}
+
 impl SpawnedProcess {
     /// Send a signal to the process (SIGTERM, SIGKILL, etc.).
     ///
@@ -143,6 +177,10 @@ impl SpawnedProcess {
     /// The PID of the spawned process, if still running.
     pub fn pid(&self) -> Option<u32> {
         self.child.id()
+    }
+
+    pub fn process_group(&self) -> Option<ProcessGroup> {
+        self.child.id().map(|pid| ProcessGroup { pid })
     }
 
     /// Take the stdin handle (for writing to the shell).
@@ -264,35 +302,37 @@ impl Incubator {
             let uid = self.args.uid;
             let gid = self.args.gid;
             let pty_slave = self.args.pty_slave_fd;
-            // Only set pre_exec if we need to drop privileges or dup2 a PTY.
-            // Skip if we're already the target user (avoids EPERM and lets
-            // std use posix_spawn instead of fork+exec).
+            // Every SSH shell gets a dedicated process group so cancellation
+            // cannot leave TERM-ignoring descendants behind.
             let current_uid = unsafe { libc::getuid() };
             let current_gid = unsafe { libc::getgid() };
+            let credentials_specified = !self.args.local_user.is_empty();
             let need_priv_drop =
-                (uid != 0 && uid != current_uid) || (gid != 0 && gid != current_gid);
-            if need_priv_drop || pty_slave.is_some() {
-                // SAFETY: pre_exec closures run after fork before exec.
-                // The dup2/setgroups/setgid/setuid calls are safe with
-                // valid fds and ids.
-                unsafe {
-                    cmd.pre_exec(move || {
-                        // If a PTY slave fd is set, dup2 it onto
-                        // stdin/stdout/stderr.
-                        if let Some(sfd) = pty_slave {
-                            if libc::dup2(sfd, 0) < 0 {
-                                return Err(io::Error::last_os_error());
-                            }
-                            if libc::dup2(sfd, 1) < 0 {
-                                return Err(io::Error::last_os_error());
-                            }
-                            if libc::dup2(sfd, 2) < 0 {
-                                return Err(io::Error::last_os_error());
-                            }
-                            if sfd > 2 {
-                                libc::close(sfd);
-                            }
+                credentials_specified && (uid != current_uid || gid != current_gid);
+            // SAFETY: pre_exec closures run after fork before exec. The
+            // setpgid/dup2/credential calls use values prepared above.
+            unsafe {
+                cmd.pre_exec(move || {
+                    if libc::setpgid(0, 0) != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    // If a PTY slave fd is set, dup2 it onto
+                    // stdin/stdout/stderr.
+                    if let Some(sfd) = pty_slave {
+                        if libc::dup2(sfd, 0) < 0 {
+                            return Err(io::Error::last_os_error());
                         }
+                        if libc::dup2(sfd, 1) < 0 {
+                            return Err(io::Error::last_os_error());
+                        }
+                        if libc::dup2(sfd, 2) < 0 {
+                            return Err(io::Error::last_os_error());
+                        }
+                        if sfd > 2 {
+                            libc::close(sfd);
+                        }
+                    }
+                    if need_priv_drop {
                         // Set supplementary groups first.
                         if !gids.is_empty() {
                             let gids_v: Vec<libc::gid_t> =
@@ -312,13 +352,22 @@ impl Incubator {
                         if libc::setuid(uid as libc::uid_t) != 0 {
                             return Err(io::Error::last_os_error());
                         }
-                        Ok(())
-                    });
-                }
+                    }
+                    Ok(())
+                });
             }
         }
 
-        let child = cmd.spawn()?;
+        let child = cmd.spawn();
+        #[cfg(unix)]
+        if let Some(slave) = self.args.pty_slave_fd {
+            // The child inherited/duplicated its copy during spawn. Keeping the
+            // parent copy open would prevent PTY EOF and output draining.
+            unsafe {
+                libc::close(slave);
+            }
+        }
+        let child = child?;
         Ok(SpawnedProcess {
             child,
             args: self.args.clone(),
@@ -382,6 +431,68 @@ mod tests {
         });
         let result = inc.spawn();
         assert!(matches!(result, Err(IncubatorError::NoShell(_))));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_group_kill_reaps_term_ignoring_descendant() {
+        let pid_file =
+            std::env::temp_dir().join(format!("rustscale-ssh-descendant-{}", std::process::id()));
+        let _ = std::fs::remove_file(&pid_file);
+        let command = format!(
+            "trap '' TERM; (trap '' TERM; sleep 30) & echo $! > {}; wait",
+            pid_file.display()
+        );
+        let inc = Incubator::new(IncubatorArgs {
+            login_shell: "/bin/sh".into(),
+            is_shell: false,
+            cmd: command,
+            env: vec![OsString::from("PATH=/usr/bin:/bin")],
+            ..Default::default()
+        });
+        let mut process = inc.spawn().expect("spawn failed");
+        drop(process.take_stdin());
+        let group = process.process_group().expect("process group");
+
+        let descendant = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Ok(pid) = std::fs::read_to_string(&pid_file) {
+                    if let Ok(pid) = pid.trim().parse::<u32>() {
+                        break pid;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("descendant pid");
+
+        group.signal(libc::SIGTERM).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        group.signal(libc::SIGKILL).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), process.wait())
+            .await
+            .expect("process group did not exit")
+            .expect("wait failed");
+
+        let gone = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let status = tokio::process::Command::new("kill")
+                    .args(["-0", &descendant.to_string()])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .await
+                    .expect("kill -0");
+                if !status.success() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        let _ = std::fs::remove_file(pid_file);
+        assert!(gone.is_ok(), "TERM-ignoring descendant remained alive");
     }
 
     #[tokio::test]

@@ -5,8 +5,13 @@
 //! in-memory, then verify that `run_session` correctly spawns the shell,
 //! pumps I/O, and reports exit status.
 
+#![cfg(unix)]
+
 use crate::host_key_from_node_key;
-use crate::session_handler::run_session;
+use crate::session_handler::{
+    run_session, run_session_with, LaunchedSession, LocalUser, ProcessControl, SessionHandlerError,
+    SessionLauncher,
+};
 use crate::{Session, SshServer, SshServerConfig};
 use russh::server::Server as _;
 use russh::{ChannelMsg, MethodSet};
@@ -15,9 +20,10 @@ use rustscale_tailcfg::{
     Node, SSHAction, SSHPolicy, SSHPrincipal, SSHRule, StableNodeID, UserProfile,
 };
 use std::collections::BTreeMap;
+use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
-use tokio::sync::mpsc;
+use std::sync::{Arc, Mutex};
+use tokio::sync::{mpsc, oneshot};
 
 fn peer_ip() -> IpAddr {
     "100.64.0.2".parse().unwrap()
@@ -41,7 +47,8 @@ fn test_profile() -> UserProfile {
     }
 }
 
-fn policy_allow_any() -> Arc<dyn Fn() -> Option<SSHPolicy> + Send + Sync> {
+fn policy_map_any(local_user: &str) -> Arc<dyn Fn() -> Option<SSHPolicy> + Send + Sync> {
+    let mapping = local_user.to_string();
     let policy = SSHPolicy {
         Rules: vec![SSHRule {
             Principals: vec![SSHPrincipal {
@@ -50,7 +57,7 @@ fn policy_allow_any() -> Arc<dyn Fn() -> Option<SSHPolicy> + Send + Sync> {
             }],
             SSHUsers: {
                 let mut m = BTreeMap::new();
-                m.insert("*".into(), "=".into());
+                m.insert("*".into(), mapping);
                 m
             },
             Action: Some(SSHAction {
@@ -61,6 +68,10 @@ fn policy_allow_any() -> Arc<dyn Fn() -> Option<SSHPolicy> + Send + Sync> {
         }],
     };
     Arc::new(move || Some(policy.clone()))
+}
+
+fn policy_allow_any() -> Arc<dyn Fn() -> Option<SSHPolicy> + Send + Sync> {
+    policy_map_any("=")
 }
 
 fn whois_finds_peer() -> Arc<dyn Fn(IpAddr) -> Option<(Node, UserProfile)> + Send + Sync> {
@@ -93,14 +104,25 @@ impl russh::client::Handler for ClientHandler {
 ///
 /// `command` is sent as an exec request. The function returns the exit code
 /// reported by `run_session`.
-async fn run_pipeline(command: &str) -> i32 {
+async fn run_pipeline_custom(
+    command: &str,
+    requested_user: &str,
+    policy: Arc<dyn Fn() -> Option<SSHPolicy> + Send + Sync>,
+    injected: Option<(
+        &(dyn Fn(&str) -> Result<LocalUser, SessionHandlerError> + Send + Sync),
+        &dyn SessionLauncher,
+    )>,
+    mutate_session: Option<&dyn Fn(&mut crate::session::SessionInit)>,
+    client_eof_before_run: bool,
+    request_pty: bool,
+) -> (i32, Vec<u8>) {
     let host_key = host_key_from_node_key(&NodePrivate::generate());
     let (session_tx, mut session_rx) = mpsc::channel::<crate::session::SessionInit>(16);
     let config = SshServerConfig {
         host_keys: vec![host_key],
         session_tx,
         whois: whois_finds_peer(),
-        policy: policy_allow_any(),
+        policy,
         state_dir: None,
         dial_fn: None,
     };
@@ -137,10 +159,7 @@ async fn run_pipeline(command: &str) -> i32 {
 
     // Authenticate (the server's tailscale_auth accepts any peer in the policy).
     let authed = client
-        .authenticate_password(
-            std::env::var("USER").unwrap_or_else(|_| "testuser".to_string()),
-            "",
-        )
+        .authenticate_password(requested_user, "")
         .await
         .expect("auth")
         .success();
@@ -148,32 +167,386 @@ async fn run_pipeline(command: &str) -> i32 {
 
     // Open a channel and send the exec request.
     let mut channel = client.channel_open_session().await.expect("channel open");
+    if request_pty {
+        channel
+            .request_pty(false, "xterm", 80, 24, 0, 0, &[])
+            .await
+            .expect("pty request");
+    }
     channel
         .exec(true, command.as_bytes())
         .await
         .expect("exec request");
+    if client_eof_before_run {
+        channel.eof().await.expect("channel eof");
+    }
 
     // Accept the session on the server side and run it.
-    let session_init = session_rx.recv().await.expect("session init received");
+    let mut session_init = session_rx.recv().await.expect("session init received");
+    if let Some(mutate_session) = mutate_session {
+        mutate_session(&mut session_init);
+    }
     let session = Session::from_init(session_init);
-    let result = run_session(session, None).await.expect("run_session");
+    let result = if let Some((resolver, launcher)) = injected {
+        run_session_with(session, None, resolver, launcher)
+            .await
+            .expect("run_session_with")
+    } else {
+        run_session(session, None).await.expect("run_session")
+    };
 
-    // Wait for the exit status on the client side.
-    loop {
-        match channel.wait().await {
-            Some(ChannelMsg::ExitStatus { exit_status }) => {
-                return exit_status as i32;
-            }
-            Some(_) => continue,
-            None => break,
+    // Wait for all output and the exit status on the client side. The server
+    // must not close the channel until trailing process output has drained.
+    let mut output = Vec::new();
+    let mut reported = None;
+    while let Some(message) = channel.wait().await {
+        match message {
+            ChannelMsg::Data { data } => output.extend_from_slice(&data),
+            ChannelMsg::ExtendedData { data, .. } => output.extend_from_slice(&data),
+            ChannelMsg::ExitStatus { exit_status } => reported = Some(exit_status as i32),
+            _ => {}
         }
     }
 
-    result
+    (reported.unwrap_or(result), output)
+}
+
+async fn run_pipeline_output(command: &str) -> (i32, Vec<u8>) {
+    let requested_user = std::env::var("USER").unwrap_or_else(|_| "testuser".to_string());
+    run_pipeline_custom(
+        command,
+        &requested_user,
+        policy_allow_any(),
+        None,
+        None,
+        false,
+        false,
+    )
+    .await
+}
+
+async fn run_pipeline(command: &str) -> i32 {
+    run_pipeline_output(command).await.0
+}
+
+#[derive(Default)]
+struct NoopProcessControl;
+
+impl ProcessControl for NoopProcessControl {
+    fn signal_group(&self, _signal: libc::c_int) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct CapturingLauncher {
+    args: Mutex<Vec<crate::incubator::IncubatorArgs>>,
+}
+
+impl SessionLauncher for CapturingLauncher {
+    fn launch(
+        &self,
+        args: crate::incubator::IncubatorArgs,
+    ) -> Result<LaunchedSession, SessionHandlerError> {
+        self.args.lock().unwrap().push(args);
+        Ok(LaunchedSession {
+            input: Some(Box::new(tokio::io::sink())),
+            output: Some(Box::new(tokio::io::empty())),
+            stderr: Some(Box::new(tokio::io::empty())),
+            wait: Box::pin(async { Ok(0) }),
+            control: Arc::new(NoopProcessControl),
+        })
+    }
+}
+
+#[tokio::test]
+async fn policy_mapped_local_user_is_resolved_and_launched_not_requested_user() {
+    let launcher = CapturingLauncher::default();
+    let resolved = Arc::new(Mutex::new(Vec::new()));
+    let resolver = {
+        let resolved = resolved.clone();
+        move |name: &str| {
+            resolved.lock().unwrap().push(name.to_string());
+            Ok(LocalUser {
+                uid: 65_534,
+                gid: 65_534,
+                gids: vec![65_534],
+                name: "nobody".into(),
+                home_dir: "/nonexistent".into(),
+                shell: "/bin/sh".into(),
+            })
+        }
+    };
+
+    let recording_path = std::env::temp_dir().join(format!(
+        "rustscale-mapped-user-recording-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&recording_path);
+    let mutate = |init: &mut crate::session::SessionInit| {
+        init.recording_config = Some(crate::RecordingConfig {
+            local_path: Some(recording_path.clone()),
+            ..Default::default()
+        });
+        init.recording_header = Some(crate::CastHeader::new(
+            (0, 0),
+            "exit 0".into(),
+            std::collections::HashMap::new(),
+            "root".into(),
+            "unresolved".into(),
+            "connection".into(),
+        ));
+    };
+    let (code, _) = run_pipeline_custom(
+        "exit 0",
+        "root",
+        policy_map_any("nobody"),
+        Some((&resolver, &launcher)),
+        Some(&mutate),
+        false,
+        false,
+    )
+    .await;
+    assert_eq!(code, 0);
+    assert_eq!(&*resolved.lock().unwrap(), &["nobody"]);
+    let args = launcher.args.lock().unwrap();
+    assert_eq!(args.len(), 1);
+    assert_eq!(args[0].local_user, "nobody");
+    assert_eq!(args[0].uid, 65_534);
+    assert_eq!(args[0].remote_user, "root");
+    let recording = std::fs::read_to_string(&recording_path).unwrap();
+    let header: serde_json::Value =
+        serde_json::from_str(recording.lines().next().unwrap()).unwrap();
+    assert_eq!(header["localUser"], "nobody");
+    let _ = std::fs::remove_file(recording_path);
 }
 
 /// Watcher test: verifies the full pipeline (SshServer → SshHandler →
 /// Session → run_session) without network I/O, using in-memory duplex.
+struct EscalatingControl {
+    signals: Mutex<Vec<libc::c_int>>,
+    exit: Mutex<Option<oneshot::Sender<i32>>>,
+}
+
+impl ProcessControl for EscalatingControl {
+    fn signal_group(&self, signal: libc::c_int) -> io::Result<()> {
+        self.signals.lock().unwrap().push(signal);
+        if signal == libc::SIGKILL {
+            if let Some(exit) = self.exit.lock().unwrap().take() {
+                let _ = exit.send(137);
+            }
+        }
+        Ok(())
+    }
+}
+
+struct TermIgnoringLauncher {
+    control: Arc<EscalatingControl>,
+    exit_rx: Mutex<Option<oneshot::Receiver<i32>>>,
+    output: Mutex<Option<Vec<u8>>>,
+    input_dropped: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl TermIgnoringLauncher {
+    fn new(output: Vec<u8>) -> Self {
+        let (exit, exit_rx) = oneshot::channel();
+        Self {
+            control: Arc::new(EscalatingControl {
+                signals: Mutex::new(Vec::new()),
+                exit: Mutex::new(Some(exit)),
+            }),
+            exit_rx: Mutex::new(Some(exit_rx)),
+            output: Mutex::new(Some(output)),
+            input_dropped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+}
+
+struct TrackingInput {
+    dropped: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl tokio::io::AsyncWrite for TrackingInput {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        data: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        std::task::Poll::Ready(Ok(data.len()))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+impl Drop for TrackingInput {
+    fn drop(&mut self) {
+        self.dropped
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl SessionLauncher for TermIgnoringLauncher {
+    fn launch(
+        &self,
+        _args: crate::incubator::IncubatorArgs,
+    ) -> Result<LaunchedSession, SessionHandlerError> {
+        let (mut output_writer, output_reader) = tokio::io::duplex(4096);
+        let output = self.output.lock().unwrap().take().unwrap_or_default();
+        tokio::spawn(async move {
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut output_writer, &output).await;
+        });
+        let exit_rx = self.exit_rx.lock().unwrap().take().unwrap();
+        Ok(LaunchedSession {
+            input: Some(Box::new(TrackingInput {
+                dropped: self.input_dropped.clone(),
+            })),
+            output: Some(Box::new(output_reader)),
+            stderr: Some(Box::new(tokio::io::empty())),
+            wait: Box::pin(async move {
+                exit_rx
+                    .await
+                    .map_err(|_| io::Error::other("fake process waiter closed"))
+            }),
+            control: self.control.clone(),
+        })
+    }
+}
+
+struct FailAfterHeader {
+    wrote_header: bool,
+}
+
+impl io::Write for FailAfterHeader {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        if self.wrote_header {
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "injected recorder failure",
+            ))
+        } else {
+            self.wrote_header = true;
+            Ok(data.len())
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn fail_closed_drops_failed_chunk_and_escalates_whole_group() {
+    let launcher = TermIgnoringLauncher::new(b"must-not-be-delivered".to_vec());
+    let recorder = crate::SessionRecorder::with_test_writer(
+        Box::new(FailAfterHeader {
+            wrote_header: false,
+        }),
+        crate::CastHeader::new(
+            (0, 0),
+            "command".into(),
+            std::collections::HashMap::new(),
+            "requested".into(),
+            "mapped".into(),
+            "connection".into(),
+        ),
+        false,
+    )
+    .unwrap();
+    let recorder = Mutex::new(Some(recorder));
+    let mutate = |init: &mut crate::session::SessionInit| {
+        init.recorder = recorder.lock().unwrap().take();
+        init.recording_config = Some(crate::RecordingConfig {
+            on_failure: Some(rustscale_tailcfg::SSHRecorderFailureAction {
+                TerminateSessionWithMessage: "recording required".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+    };
+    let resolver = |_name: &str| {
+        Ok(LocalUser {
+            uid: 1000,
+            gid: 1000,
+            gids: vec![1000],
+            name: "mapped".into(),
+            home_dir: "/tmp".into(),
+            shell: "/bin/sh".into(),
+        })
+    };
+
+    let (code, output) = run_pipeline_custom(
+        "ignored",
+        "requested",
+        policy_map_any("mapped"),
+        Some((&resolver, &launcher)),
+        Some(&mutate),
+        false,
+        false,
+    )
+    .await;
+    assert_eq!(code, 1);
+    assert!(!output
+        .windows(b"must-not-be-delivered".len())
+        .any(|window| window == b"must-not-be-delivered"));
+    assert!(output
+        .windows(b"recording required".len())
+        .any(|window| window == b"recording required"));
+    assert_eq!(
+        &*launcher.control.signals.lock().unwrap(),
+        &[libc::SIGTERM, libc::SIGKILL]
+    );
+}
+
+#[tokio::test]
+async fn client_eof_closes_stdin_and_cleans_up_term_ignoring_process() {
+    let launcher = TermIgnoringLauncher::new(Vec::new());
+    let resolver = |_name: &str| {
+        Ok(LocalUser {
+            uid: 1000,
+            gid: 1000,
+            gids: vec![1000],
+            name: "mapped".into(),
+            home_dir: "/tmp".into(),
+            shell: "/bin/sh".into(),
+        })
+    };
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(7),
+        run_pipeline_custom(
+            "ignored",
+            "requested",
+            policy_map_any("mapped"),
+            Some((&resolver, &launcher)),
+            None,
+            true,
+            false,
+        ),
+    )
+    .await
+    .expect("EOF cleanup must be bounded");
+    assert_eq!(result.0, 1);
+    assert!(launcher
+        .input_dropped
+        .load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(
+        &*launcher.control.signals.lock().unwrap(),
+        &[libc::SIGTERM, libc::SIGKILL]
+    );
+}
+
 #[tokio::test]
 async fn watcher_full_pipeline() {
     // "echo hello" should exit 0.
@@ -191,4 +564,41 @@ async fn test_run_session_shell_command() {
 async fn test_run_session_exit_code() {
     let code = run_pipeline("exit 42").await;
     assert_eq!(code, 42);
+}
+
+#[tokio::test]
+async fn normal_exit_drains_trailing_output_before_channel_close() {
+    let (code, output) = run_pipeline_output("printf 'trailing-output'").await;
+    assert_eq!(code, 0);
+    assert!(
+        output
+            .windows(b"trailing-output".len())
+            .any(|window| window == b"trailing-output"),
+        "missing trailing output: {:?}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn normal_exit_drains_trailing_pty_output_before_channel_close() {
+    let requested_user = std::env::var("USER").unwrap_or_else(|_| "testuser".to_string());
+    let (code, output) = run_pipeline_custom(
+        "printf 'trailing-pty'",
+        &requested_user,
+        policy_allow_any(),
+        None,
+        None,
+        false,
+        true,
+    )
+    .await;
+    assert_eq!(code, 0);
+    assert!(
+        output
+            .windows(b"trailing-pty".len())
+            .any(|window| window == b"trailing-pty"),
+        "missing trailing PTY output: {:?}",
+        String::from_utf8_lossy(&output)
+    );
 }

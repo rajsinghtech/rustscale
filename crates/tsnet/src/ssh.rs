@@ -66,8 +66,9 @@ impl Server {
             crate::DataPlane::Netstack(netstack) => netstack.clone(),
             crate::DataPlane::Tun => return Err(crate::TsnetError::NotAvailableInTunMode),
         };
-        let state_dir = self.config.state_dir.clone();
-        let source_node = inner.our_fqdn.clone();
+        let state_dir = debug_local_recording_enabled()
+            .then(|| self.config.state_dir.clone())
+            .flatten();
         let user_profiles = inner.user_profiles.clone();
         let ssh_policy = inner.ssh_policy.clone();
 
@@ -93,41 +94,23 @@ impl Server {
         let policy: rustscale_ssh::PolicyCallback =
             Arc::new(move || ssh_policy.try_read().ok().and_then(|guard| guard.clone()));
 
-        // Recorder addresses normally contain a tailnet IP. Resolve a
-        // MagicDNS name from the current peer map as well, then dial directly
-        // through the netstack so recorder traffic stays on the tailnet.
-        let dial_fn: rustscale_ssh::DialFn = Arc::new(move |host, port| {
+        // Recorder endpoints are capability-derived values in the matched SSH
+        // policy. Require each endpoint IP to identify a current, non-expired
+        // netmap peer, then dial that exact address through the userspace
+        // tailnet. There is deliberately no DNS or host-network fallback.
+        let dial_fn: rustscale_ssh::DialFn = Arc::new(move |recorder| {
             let netstack = recorder_netstack.clone();
             let peers = recorder_peers.clone();
-            let host = host.to_string();
             Box::pin(async move {
-                let ip = host.parse().or_else(|_| {
-                    peers
-                        .try_read()
-                        .ok()
-                        .and_then(|peers| {
-                            peers.iter().find_map(|node| {
-                                let name = node.Name.trim_end_matches('.');
-                                let short_name = name.split('.').next().unwrap_or(name);
-                                if host == name || host == short_name {
-                                    node.Addresses
-                                        .first()
-                                        .and_then(|address| address.split('/').next())
-                                        .and_then(|address| address.parse().ok())
-                                } else {
-                                    None
-                                }
-                            })
-                        })
-                        .ok_or_else(|| {
-                            std::io::Error::new(
-                                std::io::ErrorKind::NotFound,
-                                "recorder hostname not in peer map",
-                            )
-                        })
-                })?;
+                let authorized = recorder_is_authorized(&peers.read().await, recorder);
+                if !authorized {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "recorder endpoint is not an authorized netmap peer",
+                    ));
+                }
                 let stream = netstack
-                    .dial(std::net::SocketAddr::new(ip, port))
+                    .dial(recorder)
                     .await
                     .map_err(std::io::Error::other)?;
                 Ok(Box::new(stream) as rustscale_ssh::BoxedIo)
@@ -153,7 +136,6 @@ impl Server {
         let host_keys_clone = host_keys.clone();
         let dial_fn_clone = dial_fn.clone();
         let state_dir_clone = state_dir.clone();
-        let source_node_clone = source_node.clone();
 
         let task = tokio::spawn(async move {
             let mut tcp_listener = tcp_listener;
@@ -168,7 +150,6 @@ impl Server {
                         let hk = host_keys_clone.clone();
                         let dial_fn = dial_fn_clone.clone();
                         let state_dir = state_dir_clone.clone();
-                        let source_node = source_node_clone.clone();
 
                         tokio::spawn(async move {
                             let ssh_config = SshServerConfig {
@@ -178,7 +159,6 @@ impl Server {
                                 policy,
                                 state_dir,
                                 dial_fn: Some(dial_fn),
-                                source_node,
                             };
                             let mut server = SshServer::new(ssh_config);
                             let _ = handle_ssh_conn(config, &mut server, stream, peer_addr).await;
@@ -196,12 +176,57 @@ impl Server {
     }
 }
 
+fn recorder_is_authorized(
+    peers: &[rustscale_tailcfg::Node],
+    recorder: std::net::SocketAddr,
+) -> bool {
+    peers.iter().any(|node| {
+        !node.Expired
+            && !node.UnsignedPeerAPIOnly
+            && crate::extract_node_ips(node).contains(&recorder.ip())
+    })
+}
+
+fn debug_local_recording_enabled() -> bool {
+    std::env::var("TS_DEBUG_LOG_SSH").is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustscale_tailcfg::{SSHAction, SSHPolicy, SSHPrincipal, SSHRule};
+    use rustscale_tailcfg::{Node, SSHAction, SSHPolicy, SSHPrincipal, SSHRule};
     use std::collections::BTreeMap;
     use tokio::sync::RwLock;
+
+    #[test]
+    fn recorder_selection_requires_current_full_netmap_peer() {
+        let recorder: std::net::SocketAddr = "100.64.0.9:80".parse().unwrap();
+        let peer = Node {
+            Addresses: vec!["100.64.0.9/32".into()],
+            ..Default::default()
+        };
+        assert!(recorder_is_authorized(
+            std::slice::from_ref(&peer),
+            recorder
+        ));
+        assert!(!recorder_is_authorized(
+            std::slice::from_ref(&peer),
+            "100.64.0.10:80".parse().unwrap()
+        ));
+
+        let mut expired = peer.clone();
+        expired.Expired = true;
+        assert!(!recorder_is_authorized(&[expired], recorder));
+
+        let mut peerapi_only = peer;
+        peerapi_only.UnsignedPeerAPIOnly = true;
+        assert!(!recorder_is_authorized(&[peerapi_only], recorder));
+    }
 
     /// The policy callback installed by `listen_ssh` reads the current
     /// SSHPolicy from the shared netmap state (`inner.ssh_policy`). This

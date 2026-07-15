@@ -9,10 +9,9 @@ use std::net::IpAddr;
 #[allow(clippy::large_enum_variant)]
 pub enum EvalResult {
     Accept {
+        /// The terminal, explicit Accept action. Recorder and lifecycle policy
+        /// must be read only from this action.
         action: SSHAction,
-        /// First matching action, used as recorder fallback when the final
-        /// action doesn't name recorder nodes.
-        action0: Option<SSHAction>,
         local_user: String,
         accept_env: Vec<String>,
     },
@@ -32,7 +31,6 @@ pub struct ConnInfo {
 
 pub fn eval_ssh_policy(policy: &SSHPolicy, info: &ConnInfo) -> EvalResult {
     let mut failed_on_user = false;
-    let mut action0 = None;
     for rule in &policy.Rules {
         match match_rule(rule, info) {
             Ok(MatchedRule {
@@ -40,17 +38,14 @@ pub fn eval_ssh_policy(policy: &SSHPolicy, info: &ConnInfo) -> EvalResult {
                 local_user,
                 accept_env,
             }) => {
-                if action0.is_none() {
-                    action0 = Some(action.clone());
-                }
                 return EvalResult::Accept {
                     action,
-                    action0,
                     local_user,
                     accept_env,
                 };
             }
             Err(MatchError::UserMatch) => failed_on_user = true,
+            Err(MatchError::TerminalAction) => return EvalResult::Rejected,
             Err(_) => {}
         }
     }
@@ -67,14 +62,13 @@ struct MatchedRule {
     accept_env: Vec<String>,
 }
 enum MatchError {
-    NilAction,
     RuleExpired,
     PrincipalMatch,
     UserMatch,
+    TerminalAction,
 }
 
 fn match_rule(rule: &SSHRule, info: &ConnInfo) -> Result<MatchedRule, MatchError> {
-    let action = rule.Action.as_ref().ok_or(MatchError::NilAction)?;
     if let Some(expiry) = &rule.RuleExpires {
         if expiry < &Utc::now() {
             return Err(MatchError::RuleExpired);
@@ -83,15 +77,20 @@ fn match_rule(rule: &SSHRule, info: &ConnInfo) -> Result<MatchedRule, MatchError
     if !any_principal_matches(&rule.Principals, info) {
         return Err(MatchError::PrincipalMatch);
     }
-    let local_user = if action.Reject {
-        String::new()
-    } else {
-        let lu = map_local_user(&rule.SSHUsers, &info.ssh_user);
-        if lu.is_empty() {
-            return Err(MatchError::UserMatch);
-        }
-        lu
-    };
+    let action = rule.Action.as_ref().ok_or(MatchError::TerminalAction)?;
+    // Authentication succeeds only for one unambiguous terminal Accept.
+    // Reject, HoldAndDelegate (not implemented), combinations of terminal
+    // fields, and empty actions all fail closed.
+    let terminal_fields = usize::from(action.Accept)
+        + usize::from(action.Reject)
+        + usize::from(!action.HoldAndDelegate.is_empty());
+    if terminal_fields != 1 || !action.Accept {
+        return Err(MatchError::TerminalAction);
+    }
+    let local_user = map_local_user(&rule.SSHUsers, &info.ssh_user);
+    if local_user.is_empty() {
+        return Err(MatchError::UserMatch);
+    }
     Ok(MatchedRule {
         action: action.clone(),
         local_user,
@@ -190,6 +189,99 @@ mod tests {
             _ => panic!("expected Accept"),
         }
     }
+    #[test]
+    fn terminal_action_variants_fail_closed_except_explicit_accept() {
+        let evaluate = |action: SSHAction| {
+            eval_ssh_policy(
+                &SSHPolicy {
+                    Rules: vec![SSHRule {
+                        Principals: vec![SSHPrincipal {
+                            Any: true,
+                            ..Default::default()
+                        }],
+                        SSHUsers: BTreeMap::from([("*".into(), "=".into())]),
+                        Action: Some(action),
+                        ..Default::default()
+                    }],
+                },
+                &make_info("alice", "100.64.0.2"),
+            )
+        };
+
+        assert!(matches!(
+            evaluate(SSHAction {
+                Accept: true,
+                ..Default::default()
+            }),
+            EvalResult::Accept { .. }
+        ));
+        for action in [
+            SSHAction {
+                Reject: true,
+                ..Default::default()
+            },
+            SSHAction {
+                HoldAndDelegate: "https://control/delegate".into(),
+                ..Default::default()
+            },
+            SSHAction::default(),
+            SSHAction {
+                Accept: true,
+                Reject: true,
+                ..Default::default()
+            },
+            SSHAction {
+                Accept: true,
+                HoldAndDelegate: "https://control/delegate".into(),
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(evaluate(action), EvalResult::Rejected);
+        }
+    }
+
+    #[test]
+    fn terminal_reject_or_malformed_action_cannot_fall_through_to_accept() {
+        let accepting_rule = SSHRule {
+            Principals: vec![SSHPrincipal {
+                Any: true,
+                ..Default::default()
+            }],
+            SSHUsers: BTreeMap::from([("*".into(), "=".into())]),
+            Action: Some(SSHAction {
+                Accept: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        for first_action in [
+            Some(SSHAction {
+                Reject: true,
+                ..Default::default()
+            }),
+            None,
+        ] {
+            let first = SSHRule {
+                Principals: vec![SSHPrincipal {
+                    Any: true,
+                    ..Default::default()
+                }],
+                SSHUsers: BTreeMap::new(),
+                Action: first_action,
+                ..Default::default()
+            };
+            assert_eq!(
+                eval_ssh_policy(
+                    &SSHPolicy {
+                        Rules: vec![first, accepting_rule.clone()]
+                    },
+                    &make_info("alice", "100.64.0.2")
+                ),
+                EvalResult::Rejected
+            );
+        }
+    }
+
     #[test]
     fn test_reject_user() {
         let p = SSHPolicy {

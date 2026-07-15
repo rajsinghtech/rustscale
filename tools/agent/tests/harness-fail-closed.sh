@@ -33,7 +33,7 @@ new_repo() {
   git -C "$REPO" config user.name harness-test
   git -C "$REPO" config user.email harness@example.invalid
   mkdir -p "$REPO/tools/agent"
-  cp "$ROOT/tools/agent/codex-task.sh" "$ROOT/tools/agent/opencode-task.sh" \
+  cp "$ROOT/tools/agent/codex-task.sh" "$ROOT/tools/agent/pi-research.sh" \
     "$ROOT/tools/agent/worktree-merge.sh" "$ROOT/tools/agent/agent-review.sh" \
     "$ROOT/tools/agent/run-with-deadline.py" "$ROOT/tools/agent/check.sh" "$REPO/tools/agent/"
   cp "$ROOT/tools/worktree-status.sh" "$REPO/tools/"
@@ -56,7 +56,7 @@ new_repo() {
 
 test_production_wrappers_are_executable() {
   local wrapper
-  for wrapper in codex-task.sh opencode-task.sh agent-review.sh check.sh; do
+  for wrapper in codex-task.sh pi-research.sh agent-review.sh check.sh; do
     [[ -x "$ROOT/tools/agent/$wrapper" ]] || fail "production wrapper is not executable: $wrapper"
   done
 }
@@ -81,70 +81,25 @@ test_check_failure_runs_once() {
   assert_contains "$output" 'intentional failure'
 }
 
-# shellcheck disable=SC2016 # The temporary curl stub must retain its variables.
-test_model_override() {
-  new_repo model-override
+test_pi_arguments_and_model_override() {
+  new_repo pi-arguments
   mkdir "$REPO/bin"
+  # shellcheck disable=SC2016 # The temporary Pi stub must retain its variables.
   printf '%s\n' '#!/usr/bin/env bash' \
-    'set -eu' \
-    'args="$*"' \
-    'printf "%s\\n" "$args" >>"$CURL_LOG"' \
-    'case "$args" in' \
-    '  *api/health*) exit 0 ;;' \
-    '  *"/session?"*) printf "%s\\n" "{\"id\":\"ses_test\"}" ;;' \
-    '  *prompt_async*) exit 0 ;;' \
-    '  *session/status*) printf "%s\\n" "{}" ;;' \
-    '  *"/message?"*) printf "%s\\n" "[{\"info\":{\"role\":\"assistant\"},\"parts\":[{\"type\":\"text\",\"text\":\"research complete\"}]}]" ;;' \
-    '  *) exit 1 ;;' \
-    'esac' >"$REPO/bin/curl"
-  chmod +x "$REPO/bin/curl"
-  : >"$REPO/curl.log"
-  output=$(env PATH="$REPO/bin:$PATH" CURL_LOG="$REPO/curl.log" OPENCODE_MODEL=example/model \
-    "$REPO/tools/agent/opencode-task.sh" research prompt)
-  [[ "$output" == 'research complete' ]] || fail 'OpenCode model override did not return its result'
-  assert_contains "$(cat "$REPO/curl.log")" 'example/model'
-}
-
-# shellcheck disable=SC2016 # The temporary curl stub must retain its variables.
-test_opencode_default_model() {
-  new_repo opencode-default
-  mkdir "$REPO/bin"
-  printf '%s\n' '#!/usr/bin/env bash' \
-    'set -eu' \
-    'args="$*"' \
-    'printf "%s\\n" "$args" >>"$CURL_LOG"' \
-    'case "$args" in' \
-    '  *api/health*) exit 0 ;;' \
-    '  *"/session?"*) printf "%s\\n" "{\"id\":\"ses_test\"}" ;;' \
-    '  *prompt_async*) exit 0 ;;' \
-    '  *session/status*) printf "%s\\n" "{}" ;;' \
-    '  *"/message?"*) printf "%s\\n" "[{\"info\":{\"role\":\"assistant\"},\"parts\":[{\"type\":\"text\",\"text\":\"research complete\"}]}]" ;;' \
-    '  *) exit 1 ;;' \
-    'esac' >"$REPO/bin/curl"
-  chmod +x "$REPO/bin/curl"
-  : >"$REPO/curl.log"
-  output=$(env PATH="$REPO/bin:$PATH" CURL_LOG="$REPO/curl.log" "$REPO/tools/agent/opencode-task.sh" research prompt)
-  [[ "$output" == 'research complete' ]] || fail 'OpenCode default path did not return its result'
-  assert_contains "$(cat "$REPO/curl.log")" 'deepseek/deepseek-v4-flash'
-  assert_contains "$(cat "$REPO/curl.log")" '"bash"'
-  assert_contains "$(cat "$REPO/curl.log")" '"deny"'
-}
-
-test_opencode_continue_rejected() {
-  new_repo opencode-continue
-  mkdir "$REPO/bin"
-  # shellcheck disable=SC2016 # The temporary curl stub must retain its variables.
-  printf '%s\n' '#!/usr/bin/env bash' 'printf called >>"$CURL_LOG"; exit 1' >"$REPO/bin/curl"
-  chmod +x "$REPO/bin/curl"
-  : >"$REPO/curl.log"
-  set +e
-  output=$(env PATH="$REPO/bin:$PATH" CURL_LOG="$REPO/curl.log" \
-    "$REPO/tools/agent/opencode-task.sh" --continue ses_old prompt 2>&1)
-  status=$?
-  set -e
-  [[ "$status" == 2 ]] || fail "OpenCode --continue exit was $status, expected 2"
-  assert_contains "$output" '--continue is not permitted'
-  [[ ! -s "$REPO/curl.log" ]] || fail 'rejected OpenCode continuation contacted the server'
+    'printf "%s\\n" "$@" >"$PI_ARGS"' \
+    'printf "%s\\n" "research complete"' >"$REPO/bin/pi"
+  chmod +x "$REPO/bin/pi"
+  output=$(env PATH="$REPO/bin:$PATH" PI_ARGS="$REPO/args" PI_PROVIDER=example-provider \
+    PI_MODEL=example/model "$REPO/tools/agent/pi-research.sh" research 'compare behavior')
+  [[ "$output" == 'research complete' ]] || fail 'Pi wrapper did not return its result'
+  assert_contains "$(cat "$REPO/args")" '--print'
+  assert_contains "$(cat "$REPO/args")" '--no-session'
+  assert_contains "$(cat "$REPO/args")" '--no-extensions'
+  assert_contains "$(cat "$REPO/args")" 'read,grep,find,ls'
+  assert_contains "$(cat "$REPO/args")" 'example-provider'
+  assert_contains "$(cat "$REPO/args")" 'example/model'
+  assert_contains "$(cat "$REPO/args")" 'Do not modify files'
+  assert_contains "$(cat "$REPO/args")" 'compare behavior'
 }
 
 # shellcheck disable=SC2016 # The temporary Codex stub must retain its variables.
@@ -380,113 +335,53 @@ test_codex_diverged_master_refusal() {
   [[ ! -e "$REPO/.worktrees/stale" ]] || fail 'diverged master created a worktree'
 }
 
-test_opencode_stuck_and_dirty_rejection() {
-  new_repo opencode-stuck
+test_pi_dirty_rejection() {
+  new_repo pi-dirty
   mkdir "$REPO/bin"
-  # shellcheck disable=SC2016 # The temporary curl stub must retain its variables.
-  printf '%s\n' '#!/usr/bin/env bash' \
-    'args="$*"' \
-    'case "$args" in' \
-    '  *api/health*) exit 0 ;;' \
-    '  *"/session?"*) printf "%s\\n" "$SESSION_JSON" ;;' \
-    '  *prompt_async*) exit 0 ;;' \
-    '  *session/status*) printf "%s\\n" "{}" ;;' \
-    '  *"/message?"*) printf "%s\\n" "[]" ;;' \
-    '  *) exit 1 ;;' \
-    'esac' >"$REPO/bin/curl"
-  chmod +x "$REPO/bin/curl"
-  set +e
-  output=$(env PATH="$REPO/bin:$PATH" OPENCODE_WARMUP=0 SESSION_JSON='{"id":"ses_stuck"}' \
-    "$REPO/tools/agent/opencode-task.sh" stuck prompt 2>&1)
-  status=$?
-  set -e
-  [[ "$status" == 4 ]] || fail "OpenCode STUCK exit was $status, expected 4"
-  assert_contains "$output" '##STATUS:STUCK'
-
-  new_repo opencode-dirty
-  mkdir "$REPO/bin"
-  # shellcheck disable=SC2016 # The temporary curl stub must retain its variables.
-  printf '%s\n' '#!/usr/bin/env bash' \
-    'args="$*"' \
-    'case "$args" in' \
-    '  *api/health*) exit 0 ;;' \
-    '  *"/session?"*) printf "%s\\n" "$SESSION_JSON" ;;' \
-    '  *prompt_async*) printf changed >>"$RESEARCH_FILE" ;;' \
-    '  *session/status*) printf "%s\\n" "{}" ;;' \
-    '  *"/message?"*) printf "%s\\n" "$MESSAGES_JSON" ;;' \
-    '  *) exit 1 ;;' \
-    'esac' >"$REPO/bin/curl"
-  chmod +x "$REPO/bin/curl"
-  output=$(expect_failure env PATH="$REPO/bin:$PATH" RESEARCH_FILE="$REPO/shared.txt" \
-    SESSION_JSON='{"id":"ses_dirty"}' \
-    MESSAGES_JSON='[{"info":{"role":"assistant"},"parts":[{"type":"text","text":"done"}]}]' \
-    "$REPO/tools/agent/opencode-task.sh" dirty prompt)
+  # shellcheck disable=SC2016 # The temporary Pi stub must retain its variables.
+  printf '%s\n' '#!/usr/bin/env bash' 'printf changed >>"$RESEARCH_FILE"' 'printf "%s\\n" done' >"$REPO/bin/pi"
+  chmod +x "$REPO/bin/pi"
+  output=$(expect_failure env PATH="$REPO/bin:$PATH" RESEARCH_FILE="$REPO/shared.txt" "$REPO/tools/agent/pi-research.sh" dirty prompt)
   assert_contains "$output" 'repository changed during research'
 }
 
-test_opencode_initial_dirty_refusal() {
-  new_repo opencode-initial-dirty
+test_pi_initial_dirty_refusal() {
+  new_repo pi-initial-dirty
   mkdir "$REPO/bin"
-  # shellcheck disable=SC2016 # The temporary curl stub must retain its variables.
-  printf '%s\n' '#!/usr/bin/env bash' 'printf called >>"$CURL_LOG"; exit 1' >"$REPO/bin/curl"
-  chmod +x "$REPO/bin/curl"
-  : >"$REPO/curl.log"
+  # shellcheck disable=SC2016 # The temporary Pi stub must retain its variables.
+  printf '%s\n' '#!/usr/bin/env bash' 'printf called >>"$PI_LOG"; exit 1' >"$REPO/bin/pi"
+  chmod +x "$REPO/bin/pi"
+  : >"$REPO/pi.log"
   printf 'already dirty\n' >>"$REPO/shared.txt"
-  output=$(expect_failure env PATH="$REPO/bin:$PATH" CURL_LOG="$REPO/curl.log" \
-    "$REPO/tools/agent/opencode-task.sh" research prompt)
+  output=$(expect_failure env PATH="$REPO/bin:$PATH" PI_LOG="$REPO/pi.log" "$REPO/tools/agent/pi-research.sh" research prompt)
   assert_contains "$output" 'repository is already dirty'
-  [[ ! -s "$REPO/curl.log" ]] || fail 'dirty research contacted the server'
+  [[ ! -s "$REPO/pi.log" ]] || fail 'dirty research started Pi'
 }
 
-test_opencode_head_change_rejection() {
-  new_repo opencode-head-change
+test_pi_head_change_rejection() {
+  new_repo pi-head-change
   mkdir "$REPO/bin"
-  # shellcheck disable=SC2016 # The temporary curl stub must retain its variables.
-  printf '%s\n' '#!/usr/bin/env bash' \
-    'args="$*"' \
-    'case "$args" in' \
-    '  *api/health*) exit 0 ;;' \
-    '  *"/session?"*) printf "%s\\n" "$SESSION_JSON" ;;' \
-    '  *prompt_async*) git -C "$RESEARCH_DIR" commit --allow-empty -qm research-mutation ;;' \
-    '  *session/status*) printf "%s\\n" "{}" ;;' \
-    '  *"/message?"*) printf "%s\\n" "$MESSAGES_JSON" ;;' \
-    '  *) exit 1 ;;' \
-    'esac' >"$REPO/bin/curl"
-  chmod +x "$REPO/bin/curl"
-  output=$(expect_failure env PATH="$REPO/bin:$PATH" RESEARCH_DIR="$REPO" \
-    SESSION_JSON='{"id":"ses_head"}' \
-    MESSAGES_JSON='[{"info":{"role":"assistant"},"parts":[{"type":"text","text":"done"}]}]' \
-    "$REPO/tools/agent/opencode-task.sh" head-change prompt)
+  # shellcheck disable=SC2016 # The temporary Pi stub must retain its variables.
+  printf '%s\n' '#!/usr/bin/env bash' 'git -C "$RESEARCH_DIR" commit --allow-empty -qm research-mutation' 'printf "%s\\n" done' >"$REPO/bin/pi"
+  chmod +x "$REPO/bin/pi"
+  output=$(expect_failure env PATH="$REPO/bin:$PATH" RESEARCH_DIR="$REPO" "$REPO/tools/agent/pi-research.sh" head-change prompt)
   assert_contains "$output" 'repository changed during research'
 }
 
-test_opencode_deadline_waits_for_idle() {
-  new_repo opencode-deadline
+test_pi_deadline() {
+  new_repo pi-deadline
   mkdir "$REPO/bin"
-  # shellcheck disable=SC2016 # The temporary curl stub must retain its variables.
-  printf '%s\n' '#!/usr/bin/env bash' \
-    'args="$*"' \
-    'case "$args" in' \
-    '  *api/health*) exit 0 ;;' \
-    '  *"/session?"*) printf "%s\\n" "$SESSION_JSON" ;;' \
-    '  *prompt_async*) exit 0 ;;' \
-    '  *"/abort?"*) touch "$ABORT_MARKER" ;;' \
-    '  *session/status*) if [[ -e "$ABORT_MARKER" ]]; then printf "%s\\n" "{}"; else printf "%s\\n" "$BUSY_JSON"; fi ;;' \
-    '  *) exit 1 ;;' \
-    'esac' >"$REPO/bin/curl"
-  chmod +x "$REPO/bin/curl"
+  printf '%s\n' '#!/usr/bin/env bash' 'sleep 20' >"$REPO/bin/pi"
+  chmod +x "$REPO/bin/pi"
   set +e
-  output=$(env PATH="$REPO/bin:$PATH" ABORT_MARKER="$TMP/opencode-aborted" OPENCODE_ABORT_GRACE=2 \
-    SESSION_JSON='{"id":"ses_deadline"}' BUSY_JSON='{"ses_deadline":{}}' \
-    "$REPO/tools/agent/opencode-task.sh" deadline prompt 1 2>&1)
+  output=$(env PATH="$REPO/bin:$PATH" "$REPO/tools/agent/pi-research.sh" deadline prompt 1 2>&1)
   status=$?
   set -e
-  if [[ "$status" != 3 ]]; then
+  if [[ "$status" != 124 ]]; then
     printf '%s\n' "$output" >&2
-    fail "OpenCode deadline exit was $status, expected 3"
+    fail "Pi deadline exit was $status, expected 124"
   fi
-  [[ -e "$TMP/opencode-aborted" ]] || fail 'OpenCode deadline did not request abort'
-  assert_contains "$output" '##STATUS:ABORTED'
+  assert_contains "$output" '##STATUS:TIMED_OUT'
 }
 
 test_review_next_action() {
@@ -632,9 +527,7 @@ test_final_gate_preserves_worktree() {
 
 test_production_wrappers_are_executable
 test_check_failure_runs_once
-test_model_override
-test_opencode_default_model
-test_opencode_continue_rejected
+test_pi_arguments_and_model_override
 test_codex_arguments_and_dirty_main
 test_codex_resume_and_deadline
 test_codex_missing_session_id_fails
@@ -642,10 +535,10 @@ test_codex_resume_session_mismatch_fails
 test_codex_wrapper_signal_updates_metadata
 test_deadline_process_group_cleanup
 test_codex_diverged_master_refusal
-test_opencode_stuck_and_dirty_rejection
-test_opencode_initial_dirty_refusal
-test_opencode_head_change_rejection
-test_opencode_deadline_waits_for_idle
+test_pi_dirty_rejection
+test_pi_initial_dirty_refusal
+test_pi_head_change_rejection
+test_pi_deadline
 test_review_next_action
 test_review_harness_policy_selection
 test_review_stale_branch_refusal

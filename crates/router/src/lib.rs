@@ -3063,8 +3063,9 @@ mod tests {
             self.commands.push((program.into(), args.to_vec()));
             let family = args.first().cloned().unwrap_or_default();
             if self.active_families.contains(&family) {
+                let pref = args.get(4).map(String::as_str).unwrap_or("5200");
                 Ok(format!(
-                    "5250: not from all fwmark 0x80000/0xff0000 unreachable proto {}\n",
+                    "{pref}: not from all fwmark 0x80000/0xff0000 unreachable proto {}\n",
                     LinuxPlatform::RULE_PROTOCOL
                 ))
             } else {

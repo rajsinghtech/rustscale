@@ -1008,6 +1008,9 @@ pub struct Server {
 /// pre-started LocalAPI server.
 pub(crate) struct PreStartedLocalApi {
     pub(crate) backend: Arc<IpnBackend>,
+    /// Pre-login magicsock ownership, retained for future IPNext startup
+    /// paths and explicit close/shutdown.
+    pub(crate) magicsock: Arc<Magicsock>,
     pub(crate) handle: Option<localapi::LocalApiHandle>,
     pub(crate) login_trigger: Arc<tokio::sync::Notify>,
     #[allow(dead_code)]

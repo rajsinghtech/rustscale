@@ -326,8 +326,47 @@ async fn commit_prefs_update(
 }
 
 pub struct LocalApiHandle {
-    pub task: JoinHandle<()>,
+    pub task: Option<JoinHandle<()>>,
     pub socket_path: PathBuf,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    armed: bool,
+}
+
+impl LocalApiHandle {
+    pub(crate) fn into_task_and_path(mut self) -> (JoinHandle<()>, PathBuf) {
+        let task = self.task.take().expect("LocalAPI task already taken");
+        let path = std::mem::take(&mut self.socket_path);
+        self.armed = false;
+        (task, path)
+    }
+
+    pub(crate) async fn shutdown(mut self) {
+        self.shutdown_tx.send_replace(true);
+        if let Some(task) = self.task.as_mut() {
+            if tokio::time::timeout(std::time::Duration::from_secs(5), &mut *task)
+                .await
+                .is_err()
+            {
+                task.abort();
+                let _ = (&mut *task).await;
+            }
+        }
+        self.task.take();
+        let _ = std::fs::remove_file(&self.socket_path);
+    }
+}
+
+impl Drop for LocalApiHandle {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.shutdown_tx.send_replace(true);
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+        let _ = std::fs::remove_file(&self.socket_path);
+    }
 }
 
 /// Spawn the LocalAPI Unix-domain-socket server.
@@ -346,29 +385,47 @@ pub(crate) fn spawn_localapi(
     let listener = rustscale_safesocket::listen(&socket_path).ok()?;
 
     let path = socket_path.clone();
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let task_shutdown_tx = shutdown_tx.clone();
     let task = tokio::spawn(async move {
+        // Keep the channel open when ownership is transferred into the normal
+        // RunningState task list, which intentionally drops LocalApiHandle.
+        let _task_shutdown_tx = task_shutdown_tx;
+        let mut connections = tokio::task::JoinSet::new();
         loop {
-            match listener.accept().await {
-                Ok(stream) => {
-                    let peer_identity = peer_identity_from_stream(&stream);
-                    let state = state.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = handle_connection(stream, &state, peer_identity).await {
-                            log::warn!("localapi: connection error: {e}");
+            tokio::select! {
+                biased;
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+                result = listener.accept() => {
+                    match result {
+                        Ok(stream) => {
+                            let peer_identity = peer_identity_from_stream(&stream);
+                            let state = state.clone();
+                            connections.spawn(async move {
+                                if let Err(e) = handle_connection(stream, &state, peer_identity).await {
+                                    log::warn!("localapi: connection error: {e}");
+                                }
+                            });
                         }
-                    });
+                        Err(e) => log::warn!("localapi: accept error: {e}"),
+                    }
                 }
-                Err(e) => {
-                    log::warn!("localapi: accept error: {e}");
-                    continue;
-                }
+                _ = connections.join_next(), if !connections.is_empty() => {}
             }
         }
+        connections.abort_all();
+        while connections.join_next().await.is_some() {}
     });
 
     Some(LocalApiHandle {
-        task,
+        task: Some(task),
         socket_path: path,
+        shutdown_tx,
+        armed: true,
     })
 }
 
@@ -4611,9 +4668,9 @@ mod tests {
             "socket permissions should be {expected:o}, got {mode:o}"
         );
 
-        // Clean up: abort the task and remove the socket.
+        // Clean up: stop the task and remove the socket.
         if let Some(h) = handle {
-            h.task.abort();
+            h.shutdown().await;
         }
         let _ = std::fs::remove_file(&tmp);
     }
@@ -4746,7 +4803,7 @@ mod tests {
 
         // Clean up.
         if let Some(h) = handle {
-            h.task.abort();
+            h.shutdown().await;
         }
         let _ = std::fs::remove_file(&tmp);
     }
@@ -4815,7 +4872,7 @@ mod tests {
         );
 
         if let Some(h) = handle {
-            h.task.abort();
+            h.shutdown().await;
         }
         let _ = std::fs::remove_file(&tmp);
     }
@@ -4885,7 +4942,7 @@ mod tests {
         assert!(notify.get("State").is_none() || notify["State"].is_null());
 
         if let Some(h) = handle {
-            h.task.abort();
+            h.shutdown().await;
         }
         let _ = std::fs::remove_file(&tmp);
     }

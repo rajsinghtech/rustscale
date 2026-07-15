@@ -558,14 +558,17 @@ impl Server {
                 .await
                 .map_err(TsnetError::Builder)?;
             if let Some(h) = localapi::spawn_localapi(state, path.clone()) {
-                tasks.push(h.task);
+                let (task, socket_path) = h.into_task_and_path();
+                tasks.push(task);
                 if let Some(ref ps) = self.pre_started {
                     if let Some(ref handle) = ps.handle {
-                        handle.task.abort();
+                        if let Some(task) = &handle.task {
+                            task.abort();
+                        }
                     }
                 }
                 log::info!("tsnet: LocalAPI listening at {}", path.display());
-                Some(h.socket_path)
+                Some(socket_path)
             } else {
                 log::warn!(
                     "tsnet: LocalAPI failed to bind socket at {}",
@@ -1083,14 +1086,17 @@ impl Server {
                 .await
                 .map_err(TsnetError::Builder)?;
             if let Some(h) = localapi::spawn_localapi(state, path.clone()) {
-                tasks.push(h.task);
+                let (task, socket_path) = h.into_task_and_path();
+                tasks.push(task);
                 if let Some(ref ps) = self.pre_started {
                     if let Some(ref handle) = ps.handle {
-                        handle.task.abort();
+                        if let Some(task) = &handle.task {
+                            task.abort();
+                        }
                     }
                 }
                 log::info!("tsnet: LocalAPI listening at {}", path.display());
-                Some(h.socket_path)
+                Some(socket_path)
             } else {
                 log::warn!(
                     "tsnet: LocalAPI failed to bind socket at {}",
@@ -1416,6 +1422,7 @@ impl Server {
 
         self.pre_started = Some(PreStartedLocalApi {
             backend: ipn_backend,
+            magicsock,
             handle,
             login_trigger,
             auth_url,
@@ -2343,9 +2350,33 @@ impl Server {
 
     /// Shut down the server.
     pub async fn close(&mut self) -> CloseResult {
+        // Take pre-login ownership before the first await. If this future is
+        // cancelled, LocalApiHandle::drop still aborts the listener and all
+        // connection tasks instead of resurrecting detached NeedsLogin state.
+        let mut pre_started = self.pre_started.take();
         // Runtime shares are intentionally not persisted across shutdown or
         // profile changes; drop pinned roots and cancel active requests first.
         self.drive.disable().await;
+        if let Some(mut pre_started_state) = pre_started.take() {
+            if let Err(error) = pre_started_state
+                .magicsock
+                .shutdown_portmapper(std::time::Duration::from_secs(5))
+                .await
+            {
+                self.pre_started = Some(pre_started_state);
+                return CloseResult(Err(TsnetError::Io(std::io::Error::other(format!(
+                    "pre-login portmapper cleanup incomplete: {error}"
+                )))));
+            }
+            // Stop accepting before dropping command and magicsock ownership;
+            // shutdown joins the accept loop and every spawned connection.
+            if let Some(handle) = pre_started_state.handle.take() {
+                handle.shutdown().await;
+            }
+            pre_started_state.command_tx.take();
+            pre_started_state.command_rx.take();
+            let _ = std::fs::remove_file(&pre_started_state.socket_path);
+        }
         if let Some(mut inner) = self.inner.take() {
             if let Err(error) = inner
                 .magicsock

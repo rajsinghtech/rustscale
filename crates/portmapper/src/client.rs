@@ -183,7 +183,11 @@ struct ClientInner {
     #[cfg(test)]
     release_test_gate: Mutex<Option<Arc<ReleaseTestGate>>>,
     #[cfg(test)]
+    pre_send_test_gate: Mutex<Option<Arc<SendTestGate>>>,
+    #[cfg(test)]
     send_test_gate: Mutex<Option<Arc<SendTestGate>>>,
+    #[cfg(test)]
+    test_send_error: AtomicBool,
     closed: AtomicBool,
 }
 
@@ -326,7 +330,11 @@ impl Client {
                 #[cfg(test)]
                 release_test_gate: Mutex::new(None),
                 #[cfg(test)]
+                pre_send_test_gate: Mutex::new(None),
+                #[cfg(test)]
                 send_test_gate: Mutex::new(None),
+                #[cfg(test)]
+                test_send_error: AtomicBool::new(false),
                 closed: AtomicBool::new(false),
             }),
         }
@@ -367,6 +375,20 @@ impl Client {
     #[cfg(test)]
     pub(crate) fn set_test_send_gate(&self, gate: Option<Arc<SendTestGate>>) {
         *self.inner.send_test_gate.lock().expect("send gate lock") = gate;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_pre_send_gate(&self, gate: Option<Arc<SendTestGate>>) {
+        *self
+            .inner
+            .pre_send_test_gate
+            .lock()
+            .expect("pre-send gate lock") = gate;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_send_error(&self, enabled: bool) {
+        self.inner.test_send_error.store(enabled, Ordering::SeqCst);
     }
 
     fn now(&self) -> Instant {
@@ -539,6 +561,19 @@ impl Client {
         snapshot: Option<GatewaySnapshot>,
         cleanup: bool,
     ) -> Result<usize, crate::PortMapError> {
+        #[cfg(test)]
+        {
+            let gate = self
+                .inner
+                .pre_send_test_gate
+                .lock()
+                .expect("pre-send gate lock")
+                .clone();
+            if let Some(gate) = gate {
+                gate.reached.wait().await;
+                gate.resume.wait().await;
+            }
+        }
         let _permit = self.acquire_send_permit(snapshot, cleanup)?;
         #[cfg(test)]
         {
@@ -552,6 +587,12 @@ impl Client {
                 gate.reached.wait().await;
                 gate.resume.wait().await;
             }
+        }
+        #[cfg(test)]
+        if self.inner.test_send_error.load(Ordering::SeqCst) {
+            return Err(crate::PortMapError::Io(std::io::Error::other(
+                "injected UDP send failure",
+            )));
         }
         socket
             .send_to(packet, destination)
@@ -1566,6 +1607,9 @@ impl Client {
                 .send_udp(&sock, &pkt, pxp_addr, Some(snapshot), false)
                 .await
             {
+                // The send future returned an error before accepting a
+                // datagram, so this request cannot have created a mapping.
+                self.clear_uncertain_ownership(ownership_id);
                 if matches!(&error, crate::PortMapError::Io(io) if treat_as_lost_udp(io)) {
                     return Err(crate::PortMapError::NoServices);
                 }
@@ -1596,6 +1640,8 @@ impl Client {
                 .send_udp(&sock, &pkt, pxp_addr, Some(snapshot), false)
                 .await
             {
+                // No PMP mapping request was accepted by the socket.
+                self.clear_uncertain_ownership(ownership_id);
                 if matches!(&error, crate::PortMapError::Io(io) if treat_as_lost_udp(io)) {
                     return Err(crate::PortMapError::NoServices);
                 }
@@ -2090,6 +2136,59 @@ mod tests {
     use crate::{pcp, pmp};
     use tokio::net::UdpSocket;
 
+    fn prepare_pcp_client(router_port: u16, self_ip: Ipv4Addr) -> Client {
+        let gateway = GatewayInfo {
+            gateway: Ipv4Addr::LOCALHOST,
+            self_ip,
+        };
+        let client = Client::with_config(ClientConfig {
+            gateway_lookup: Some(Box::new(move || Some(gateway))),
+        });
+        client.set_test_pxp_port(router_port);
+        client.set_local_port(41641);
+        client.observe_gateway();
+        {
+            let mut state = client.inner.state.lock().unwrap();
+            state.needs_probe = false;
+            state.last_probe = Some(client.now());
+            state.pcp_saw_time = Some(client.now());
+        }
+        client
+    }
+
+    fn prepare_pmp_client(router_port: u16) -> Client {
+        let gateway = GatewayInfo {
+            gateway: Ipv4Addr::LOCALHOST,
+            self_ip: Ipv4Addr::new(192, 0, 2, 2),
+        };
+        let client = Client::with_config(ClientConfig {
+            gateway_lookup: Some(Box::new(move || Some(gateway))),
+        });
+        client.set_test_pxp_port(router_port);
+        client.set_local_port(41641);
+        client.observe_gateway();
+        {
+            let mut state = client.inner.state.lock().unwrap();
+            state.needs_probe = false;
+            state.last_probe = Some(client.now());
+            state.pmp_pub_ip = Some(Ipv4Addr::new(198, 51, 100, 7));
+            state.pmp_pub_ip_time = Some(client.now());
+        }
+        client
+    }
+
+    async fn complete_pcp_request(
+        router: &UdpSocket,
+        operation: tokio::task::JoinHandle<Result<Mapping, crate::PortMapError>>,
+    ) -> Mapping {
+        let mut request = [0_u8; 128];
+        let (size, source) = router.recv_from(&mut request).await.unwrap();
+        assert_eq!(size, 60);
+        let response = pcp::build_map_response(&request[..size]);
+        router.send_to(&response, source).await.unwrap();
+        operation.await.unwrap().unwrap()
+    }
+
     fn test_mapping(external: SocketAddr) -> Mapping {
         test_mapping_at(external, Instant::now())
     }
@@ -2283,6 +2382,160 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn closed_before_pcp_send_clears_provisional_ownership() {
+        let router = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = prepare_pcp_client(
+            router.local_addr().unwrap().port(),
+            Ipv4Addr::new(192, 0, 2, 2),
+        );
+        let gate = SendTestGate::new();
+        client.set_test_pre_send_gate(Some(gate.clone()));
+        let operation_client = client.clone();
+        let operation = tokio::spawn(async move { operation_client.create_or_get_mapping().await });
+        gate.wait_reached().await;
+        client.close();
+        gate.resume().await;
+        assert!(operation.await.unwrap().is_err());
+        assert!(client
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .uncertain_releases
+            .is_empty());
+        assert!(tokio::time::timeout(
+            Duration::from_millis(50),
+            router.recv_from(&mut [0_u8; 128])
+        )
+        .await
+        .is_err());
+
+        let retry = prepare_pcp_client(
+            router.local_addr().unwrap().port(),
+            Ipv4Addr::new(192, 0, 2, 3),
+        );
+        let retry_client = retry.clone();
+        let retry_operation =
+            tokio::spawn(async move { retry_client.create_or_get_mapping().await });
+        assert_eq!(
+            complete_pcp_request(&router, retry_operation).await.kind,
+            MappingKind::Pcp
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_generation_before_pcp_send_clears_and_retries() {
+        let router = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = prepare_pcp_client(
+            router.local_addr().unwrap().port(),
+            Ipv4Addr::new(192, 0, 2, 2),
+        );
+        let gate = SendTestGate::new();
+        client.set_test_pre_send_gate(Some(gate.clone()));
+        let operation_client = client.clone();
+        let operation = tokio::spawn(async move { operation_client.create_or_get_mapping().await });
+        gate.wait_reached().await;
+        client.set_gateway_lookup(Box::new(|| {
+            Some(GatewayInfo {
+                gateway: Ipv4Addr::LOCALHOST,
+                self_ip: Ipv4Addr::new(192, 0, 2, 9),
+            })
+        }));
+        client.observe_gateway();
+        gate.resume().await;
+        assert!(operation.await.unwrap().is_err());
+        assert!(client
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .uncertain_releases
+            .is_empty());
+        client.set_test_pre_send_gate(None);
+        {
+            let mut state = client.inner.state.lock().unwrap();
+            state.needs_probe = false;
+            state.last_probe = Some(client.now());
+            state.pcp_saw_time = Some(client.now());
+        }
+        let retry_client = client.clone();
+        let retry_operation =
+            tokio::spawn(async move { retry_client.create_or_get_mapping().await });
+        assert_eq!(
+            complete_pcp_request(&router, retry_operation).await.kind,
+            MappingKind::Pcp
+        );
+    }
+
+    #[tokio::test]
+    async fn synchronous_pcp_send_error_clears_and_retries_without_cleanup() {
+        let router = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = prepare_pcp_client(
+            router.local_addr().unwrap().port(),
+            Ipv4Addr::new(192, 0, 2, 2),
+        );
+        client.set_test_send_error(true);
+        assert!(client.create_or_get_mapping().await.is_err());
+        assert!(client
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .uncertain_releases
+            .is_empty());
+        assert!(tokio::time::timeout(
+            Duration::from_millis(50),
+            router.recv_from(&mut [0_u8; 128])
+        )
+        .await
+        .is_err());
+
+        client.set_test_send_error(false);
+        let retry_client = client.clone();
+        let retry_operation =
+            tokio::spawn(async move { retry_client.create_or_get_mapping().await });
+        assert_eq!(
+            complete_pcp_request(&router, retry_operation).await.kind,
+            MappingKind::Pcp
+        );
+    }
+
+    #[tokio::test]
+    async fn synchronous_pmp_send_error_clears_provisional_ownership() {
+        let router = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = prepare_pmp_client(router.local_addr().unwrap().port());
+        client.set_test_send_error(true);
+        assert!(client.create_or_get_mapping().await.is_err());
+        assert!(client
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .uncertain_releases
+            .is_empty());
+        assert!(tokio::time::timeout(
+            Duration::from_millis(50),
+            router.recv_from(&mut [0_u8; 128])
+        )
+        .await
+        .is_err());
+
+        client.set_test_send_error(false);
+        let retry_client = client.clone();
+        let retry = tokio::spawn(async move { retry_client.create_or_get_mapping().await });
+        let mut request = [0_u8; 64];
+        let (size, source) = router.recv_from(&mut request).await.unwrap();
+        assert_eq!(size, 12);
+        let mut response = [0_u8; 16];
+        response[1] = pmp::PMP_OP_REPLY | pmp::PMP_OP_MAP_UDP;
+        response[8..10].copy_from_slice(&41641_u16.to_be_bytes());
+        response[10..12].copy_from_slice(&4242_u16.to_be_bytes());
+        response[12..16].copy_from_slice(&crate::MAP_LIFETIME_SECS.to_be_bytes());
+        router.send_to(&response, source).await.unwrap();
+        assert_eq!(retry.await.unwrap().unwrap().kind, MappingKind::Pmp);
     }
 
     #[tokio::test]

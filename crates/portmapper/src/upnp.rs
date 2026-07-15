@@ -7,7 +7,7 @@
 //! from the LOCATION URL, find the best WAN connection service, and make SOAP
 //! calls to create/delete mappings and get the external IP.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::net::Ipv4Addr;
 use std::time::Duration;
 
@@ -359,7 +359,7 @@ impl SoapFaultCode {
 fn soap_fault_code(body: &str) -> Option<SoapFaultCode> {
     const CONTROL_ERROR_NAMESPACE: &str = "urn:schemas-upnp-org:control-1-0";
 
-    let elements = parse_xml_elements(body)?;
+    let elements = parse_xml_elements(body).ok()?;
     if !has_strict_soap_body(&elements, "Fault") {
         return None;
     }
@@ -425,7 +425,7 @@ fn soap_fault_code(body: &str) -> Option<SoapFaultCode> {
 }
 
 fn soap_response_is_success(body: &str, response_element: &str, service_type: &str) -> bool {
-    parse_xml_elements(body).is_some_and(|elements| {
+    parse_xml_elements(body).ok().is_some_and(|elements| {
         has_strict_soap_body(&elements, response_element)
             && elements.iter().any(|element| {
                 element.name.local == response_element
@@ -455,9 +455,34 @@ struct XmlElement {
 
 struct XmlFrame {
     name: XmlName,
-    namespaces: HashMap<String, String>,
+    namespace_declarations: Vec<(String, Option<String>)>,
     element_index: usize,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum XmlParseError {
+    Malformed,
+    TooLarge,
+}
+
+#[derive(Default)]
+struct XmlLimits {
+    elements: usize,
+    namespace_declarations: usize,
+    attributes: usize,
+    attribute_bytes: usize,
+    exceeded: bool,
+}
+
+const MAX_XML_DEPTH: usize = 64;
+const MAX_XML_ELEMENTS: usize = 4096;
+const MAX_XML_NAMESPACES_PER_ELEMENT: usize = 32;
+const MAX_XML_NAMESPACES_TOTAL: usize = 512;
+const MAX_XML_ATTRIBUTES_PER_ELEMENT: usize = 64;
+const MAX_XML_ATTRIBUTES_TOTAL: usize = 4096;
+const MAX_XML_ATTRIBUTE_BYTES_PER_ELEMENT: usize = 16 * 1024;
+const MAX_XML_ATTRIBUTE_BYTES_TOTAL: usize = 64 * 1024;
+const MAX_XML_ATTRIBUTE_VALUE_BYTES: usize = 8 * 1024;
 
 fn has_strict_soap_body(elements: &[XmlElement], expected: &str) -> bool {
     if expected != "Fault" && elements.iter().any(|element| element.name.local == "Fault") {
@@ -533,7 +558,17 @@ fn trim_xml_s_end(value: &str) -> &str {
     value.trim_end_matches(xml_s)
 }
 
-fn parse_xml_elements(xml: &str) -> Option<Vec<XmlElement>> {
+fn parse_xml_elements(xml: &str) -> Result<Vec<XmlElement>, XmlParseError> {
+    let mut limits = XmlLimits::default();
+    let parsed = parse_xml_elements_inner(xml, &mut limits);
+    parsed.ok_or(if limits.exceeded {
+        XmlParseError::TooLarge
+    } else {
+        XmlParseError::Malformed
+    })
+}
+
+fn parse_xml_elements_inner(xml: &str, limits: &mut XmlLimits) -> Option<Vec<XmlElement>> {
     let mut stack = Vec::<XmlFrame>::new();
     let mut elements = Vec::<XmlElement>::new();
     let mut rest = xml;
@@ -567,7 +602,7 @@ fn parse_xml_elements(xml: &str) -> Option<Vec<XmlElement>> {
             let end = rest.find("?>")?;
             let token = &rest[..=end];
             rest = &rest[end + 2..];
-            if !processing_instruction_is_valid(token, !saw_markup && start == 0) {
+            if !processing_instruction_is_valid(token, !saw_markup && start == 0, limits) {
                 return None;
             }
             saw_markup = true;
@@ -590,10 +625,12 @@ fn parse_xml_elements(xml: &str) -> Option<Vec<XmlElement>> {
                 return None;
             }
             let frame = stack.pop()?;
-            let closing = resolve_xml_name(qualified, &frame.namespaces)?;
-            // XML end tags must use the same qualified prefix, local name,
-            // and in-scope binding as their opening tag.
-            if closing != frame.name {
+            let (closing_prefix, closing_local) = split_xml_qname(qualified)?;
+            // XML end tags must use the exact prefix and local name from the
+            // opening tag; namespace declarations are forbidden on end tags.
+            if closing_prefix.map(str::to_string) != frame.name.prefix
+                || closing_local != frame.name.local
+            {
                 return None;
             }
             saw_markup = true;
@@ -605,10 +642,15 @@ fn parse_xml_elements(xml: &str) -> Option<Vec<XmlElement>> {
             token = trim_xml_s_end(&token[..token.len() - 1]);
         }
         let (qualified, attributes) = split_xml_name(token)?;
-        let mut namespaces = stack
-            .last()
-            .map_or_else(default_xml_namespaces, |frame| frame.namespaces.clone());
-        let parsed_attributes = parse_xml_attributes(attributes)?;
+        if attributes.len() > MAX_XML_ATTRIBUTE_BYTES_PER_ELEMENT
+            || limits.attribute_bytes + attributes.len() > MAX_XML_ATTRIBUTE_BYTES_TOTAL
+        {
+            limits.exceeded = true;
+            return None;
+        }
+        limits.attribute_bytes += attributes.len();
+        let parsed_attributes = parse_xml_attributes(attributes, limits)?;
+        let mut namespace_declarations = Vec::new();
         for (name, value) in &parsed_attributes {
             if name == "xmlns" {
                 if !xml_namespace_value_is_valid(value, true)
@@ -619,11 +661,8 @@ fn parse_xml_elements(xml: &str) -> Option<Vec<XmlElement>> {
                 {
                     return None;
                 }
-                if value.is_empty() {
-                    namespaces.remove("");
-                } else {
-                    namespaces.insert(String::new(), value.clone());
-                }
+                namespace_declarations
+                    .push((String::new(), (!value.is_empty()).then(|| value.clone())));
             } else if let Some(prefix) = name.strip_prefix("xmlns:") {
                 if prefix.is_empty()
                     || prefix == "xmlns"
@@ -634,24 +673,41 @@ fn parse_xml_elements(xml: &str) -> Option<Vec<XmlElement>> {
                 {
                     return None;
                 }
-                namespaces.insert(prefix.to_string(), value.clone());
+                namespace_declarations.push((prefix.to_string(), Some(value.clone())));
             }
         }
+        if namespace_declarations.len() > MAX_XML_NAMESPACES_PER_ELEMENT
+            || limits.namespace_declarations + namespace_declarations.len()
+                > MAX_XML_NAMESPACES_TOTAL
+        {
+            limits.exceeded = true;
+            return None;
+        }
+        limits.namespace_declarations += namespace_declarations.len();
+
         let mut expanded_attributes = HashSet::new();
-        for (name, _) in &parsed_attributes {
-            if name == "xmlns" || name.starts_with("xmlns:") {
+        for (attribute_name, _) in &parsed_attributes {
+            if attribute_name == "xmlns" || attribute_name.starts_with("xmlns:") {
                 continue;
             }
-            let (namespace, local) = if let Some((prefix, local)) = name.split_once(':') {
-                (Some(namespaces.get(prefix)?.clone()), local)
+            let (namespace, local) = if let Some((prefix, local)) = attribute_name.split_once(':') {
+                (
+                    Some(resolve_namespace(prefix, &stack, &namespace_declarations)?),
+                    local,
+                )
             } else {
-                (None, name.as_str())
+                (None, attribute_name.as_str())
             };
             if !expanded_attributes.insert((namespace, local.to_string())) {
                 return None;
             }
         }
-        let name = resolve_xml_name(qualified, &namespaces)?;
+        if limits.elements == MAX_XML_ELEMENTS {
+            limits.exceeded = true;
+            return None;
+        }
+        limits.elements += 1;
+        let name = resolve_xml_name(qualified, &stack, &namespace_declarations)?;
         let element_index = elements.len();
         elements.push(XmlElement {
             name: name.clone(),
@@ -660,9 +716,13 @@ fn parse_xml_elements(xml: &str) -> Option<Vec<XmlElement>> {
             text: String::new(),
         });
         if !self_closing {
+            if stack.len() == MAX_XML_DEPTH {
+                limits.exceeded = true;
+                return None;
+            }
             stack.push(XmlFrame {
                 name,
-                namespaces,
+                namespace_declarations,
                 element_index,
             });
         }
@@ -680,7 +740,11 @@ fn parse_xml_elements(xml: &str) -> Option<Vec<XmlElement>> {
     (stack.is_empty() && !elements.is_empty()).then_some(elements)
 }
 
-fn processing_instruction_is_valid(token: &str, declaration_allowed: bool) -> bool {
+fn processing_instruction_is_valid(
+    token: &str,
+    declaration_allowed: bool,
+    limits: &mut XmlLimits,
+) -> bool {
     let Some(inner) = token
         .strip_prefix('?')
         .and_then(|value| value.strip_suffix('?'))
@@ -694,16 +758,24 @@ fn processing_instruction_is_valid(token: &str, declaration_allowed: bool) -> bo
     }
     let data = &inner[target_end..];
     if target.eq_ignore_ascii_case("xml") {
-        return target == "xml" && declaration_allowed && xml_declaration_is_valid(data);
+        return target == "xml" && declaration_allowed && xml_declaration_is_valid(data, limits);
     }
     data.chars().all(xml_char_is_allowed)
 }
 
-fn xml_declaration_is_valid(data: &str) -> bool {
+fn xml_declaration_is_valid(data: &str, limits: &mut XmlLimits) -> bool {
     if data.is_empty() || !data.starts_with(xml_s) || data.contains('&') {
         return false;
     }
-    let Some(attributes) = parse_xml_attributes(trim_xml_s_start(data)) else {
+    let data = trim_xml_s_start(data);
+    if data.len() > MAX_XML_ATTRIBUTE_BYTES_PER_ELEMENT
+        || limits.attribute_bytes + data.len() > MAX_XML_ATTRIBUTE_BYTES_TOTAL
+    {
+        limits.exceeded = true;
+        return false;
+    }
+    limits.attribute_bytes += data.len();
+    let Some(attributes) = parse_xml_attributes(data, limits) else {
         return false;
     };
     if attributes.first().map(|(name, _)| name.as_str()) != Some("version")
@@ -755,7 +827,10 @@ fn split_xml_name(token: &str) -> Option<(&str, &str)> {
     (!name.is_empty()).then_some((name, trim_xml_s_start(&token[end..])))
 }
 
-fn parse_xml_attributes(mut attributes: &str) -> Option<Vec<(String, String)>> {
+fn parse_xml_attributes(
+    mut attributes: &str,
+    limits: &mut XmlLimits,
+) -> Option<Vec<(String, String)>> {
     let mut parsed = Vec::new();
     let mut seen = HashSet::new();
     while !attributes.is_empty() {
@@ -779,6 +854,14 @@ fn parse_xml_attributes(mut attributes: &str) -> Option<Vec<(String, String)>> {
         attributes = &attributes[quote.len_utf8()..];
         let value_end = attributes.find(quote)?;
         let raw_value = &attributes[..value_end];
+        if parsed.len() == MAX_XML_ATTRIBUTES_PER_ELEMENT
+            || limits.attributes == MAX_XML_ATTRIBUTES_TOTAL
+            || raw_value.len() > MAX_XML_ATTRIBUTE_VALUE_BYTES
+        {
+            limits.exceeded = true;
+            return None;
+        }
+        limits.attributes += 1;
         if raw_value.contains('<') {
             return None;
         }
@@ -826,13 +909,6 @@ fn xml_char_is_allowed(ch: char) -> bool {
         || ('\u{10000}'..='\u{10FFFF}').contains(&ch)
 }
 
-fn default_xml_namespaces() -> HashMap<String, String> {
-    HashMap::from([(
-        "xml".to_string(),
-        "http://www.w3.org/XML/1998/namespace".to_string(),
-    )])
-}
-
 fn xml_namespace_value_is_valid(value: &str, allow_empty: bool) -> bool {
     (allow_empty || !value.is_empty())
         && !value
@@ -849,7 +925,7 @@ fn xml_ncname_is_valid(name: &str) -> bool {
         && chars.all(|ch| ch == '_' || ch == '-' || ch == '.' || ch.is_alphanumeric())
 }
 
-fn resolve_xml_name(qualified: &str, namespaces: &HashMap<String, String>) -> Option<XmlName> {
+fn split_xml_qname(qualified: &str) -> Option<(Option<&str>, &str)> {
     let (prefix, local) = if let Some((prefix, local)) = qualified.split_once(':') {
         if prefix.is_empty() || local.is_empty() || local.contains(':') {
             return None;
@@ -861,9 +937,52 @@ fn resolve_xml_name(qualified: &str, namespaces: &HashMap<String, String>) -> Op
     if !xml_ncname_is_valid(local) || prefix.is_some_and(|prefix| !xml_ncname_is_valid(prefix)) {
         return None;
     }
+    Some((prefix, local))
+}
+
+fn lookup_namespace(
+    prefix: &str,
+    stack: &[XmlFrame],
+    current: &[(String, Option<String>)],
+) -> Result<Option<String>, ()> {
+    for (declared, namespace) in current.iter().rev() {
+        if declared == prefix {
+            return Ok(namespace.clone());
+        }
+    }
+    for frame in stack.iter().rev() {
+        for (declared, namespace) in frame.namespace_declarations.iter().rev() {
+            if declared == prefix {
+                return Ok(namespace.clone());
+            }
+        }
+    }
+    if prefix == "xml" {
+        Ok(Some("http://www.w3.org/XML/1998/namespace".to_string()))
+    } else if prefix.is_empty() {
+        Ok(None)
+    } else {
+        Err(())
+    }
+}
+
+fn resolve_namespace(
+    prefix: &str,
+    stack: &[XmlFrame],
+    current: &[(String, Option<String>)],
+) -> Option<String> {
+    lookup_namespace(prefix, stack, current).ok()?
+}
+
+fn resolve_xml_name(
+    qualified: &str,
+    stack: &[XmlFrame],
+    current: &[(String, Option<String>)],
+) -> Option<XmlName> {
+    let (prefix, local) = split_xml_qname(qualified)?;
     let namespace = match prefix {
-        Some(prefix) => Some(namespaces.get(prefix)?.clone()),
-        None => namespaces.get("").cloned(),
+        Some(prefix) => Some(resolve_namespace(prefix, stack, current)?),
+        None => lookup_namespace("", stack, current).ok()?,
     };
     Some(XmlName {
         prefix: prefix.map(str::to_string),
@@ -905,8 +1024,14 @@ pub(crate) async fn get_external_ip(
 }
 
 fn parse_external_ip_response(resp: &str, service_type: &str) -> Result<Ipv4Addr, std::io::Error> {
-    let elements = parse_xml_elements(resp).ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, "malformed SOAP response")
+    let elements = parse_xml_elements(resp).map_err(|error| match error {
+        XmlParseError::Malformed => {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "malformed SOAP response")
+        }
+        XmlParseError::TooLarge => std::io::Error::new(
+            std::io::ErrorKind::FileTooLarge,
+            "SOAP XML exceeds structural limits",
+        ),
     })?;
     if !has_strict_soap_body(&elements, "GetExternalIPAddressResponse")
         || !elements.iter().any(|element| {
@@ -1004,7 +1129,9 @@ fn build_add_port_mapping_soap(
 /// Whether a SOAP response body is structurally a SOAP Fault.
 #[cfg(test)]
 fn is_soap_fault(body: &str) -> bool {
-    parse_xml_elements(body).is_some_and(|elements| has_strict_soap_body(&elements, "Fault"))
+    parse_xml_elements(body)
+        .ok()
+        .is_some_and(|elements| has_strict_soap_body(&elements, "Fault"))
 }
 
 /// Pick a random external port in [1024, 65535].
@@ -1156,12 +1283,12 @@ mod tests {
             "<s:Envelope xmlns:s=\"urn:soap\"><s:Body><u:Response/></s:Body></s:Envelope>",
             "<s:Envelope xmlns:s=\"urn:soap\"><s:Body></s:Envelope></s:Body>",
         ] {
-            assert!(parse_xml_elements(invalid).is_none(), "accepted {invalid}");
+            assert!(parse_xml_elements(invalid).is_err(), "accepted {invalid}");
         }
         assert!(parse_xml_elements(
             "<a:Envelope xmlns:a=\"urn:soap\"><b:Body xmlns:b=\"urn:soap\"/></a:Envelope>"
         )
-        .is_some());
+        .is_ok());
         assert!(!soap_response_is_success(
             "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body xmlns:s=\"urn:other\"><Response/></s:Body></s:Envelope>",
             "Response",
@@ -1174,7 +1301,7 @@ mod tests {
         assert!(parse_xml_elements(
             "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><!--before--><?pre data?><root a=\"x&amp;y\"><!--inside--><?inside data?><child /></root><?post?><!--after-->"
         )
-        .is_some());
+        .is_ok());
         for invalid in [
             "<!DOCTYPE root><root/>",
             "<!DOCTYPE root [<!ENTITY x 'evil'>]><root/>",
@@ -1204,13 +1331,45 @@ mod tests {
             "<root></root\u{00A0}>",
             "<?xml\u{00A0}version=\"1.0\"?><root/>",
         ] {
-            assert!(
-                parse_xml_elements(invalid).is_none(),
-                "accepted {invalid:?}"
-            );
+            assert!(parse_xml_elements(invalid).is_err(), "accepted {invalid:?}");
         }
         let control = format!("<root a=\"{}\"/>", '\u{1}');
-        assert!(parse_xml_elements(&control).is_none());
+        assert!(parse_xml_elements(&control).is_err());
+    }
+
+    #[test]
+    fn xml_structural_limits_reject_large_namespace_nesting() {
+        use std::fmt::Write as _;
+
+        let mut adversarial = String::with_capacity(256 * 1024);
+        adversarial.push_str("<root>");
+        for index in 0..10_000 {
+            let _ = write!(
+                adversarial,
+                "<n{index}:x xmlns:n{index}=\"urn:namespace:{index}\">"
+            );
+            if adversarial.len() >= 256 * 1024 {
+                break;
+            }
+        }
+        assert!(adversarial.len() >= 256 * 1024);
+        assert!(matches!(
+            parse_xml_elements(&adversarial),
+            Err(XmlParseError::TooLarge)
+        ));
+        assert!(soap_fault_code(&adversarial).is_none());
+
+        let too_many_attributes = format!(
+            "<root {}/>",
+            (0..=MAX_XML_ATTRIBUTES_PER_ELEMENT)
+                .map(|index| format!("a{index}=\"x\""))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        assert!(matches!(
+            parse_xml_elements(&too_many_attributes),
+            Err(XmlParseError::TooLarge)
+        ));
     }
 
     #[test]

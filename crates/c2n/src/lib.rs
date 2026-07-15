@@ -1,13 +1,20 @@
 #![forbid(unsafe_code)]
 
+//! Shared C2N backend types only. The legacy TCP loopback harness is compiled
+//! exclusively for this crate's unit tests and is not part of the public API.
+
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
+#[cfg(test)]
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use async_trait::async_trait;
 use rustscale_tailcfg::C2NPostureIdentityResponse;
+#[cfg(test)]
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+#[cfg(test)]
 use tokio::net::TcpListener;
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -143,52 +150,23 @@ pub trait C2nBackend: Send + Sync {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, thiserror::Error)]
-pub enum C2nError {
+enum C2nError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("bind error: {0}")]
-    Bind(String),
 }
 
-pub struct C2NServer {
+#[cfg(test)]
+struct C2NServer {
     backend: Arc<dyn C2nBackend>,
     log_id: String,
-    log_level_state: LogLevelState,
 }
 
+#[cfg(test)]
 impl C2NServer {
-    pub fn new(backend: Arc<dyn C2nBackend>, log_id: String) -> Self {
-        Self {
-            backend,
-            log_id,
-            log_level_state: LogLevelState::new(),
-        }
-    }
-
-    /// Like [`new`](Self::new) but with a shared [`LogLevelState`] so callers
-    /// can query per-component verbose flags from outside the server.
-    pub fn new_with_log_level(
-        backend: Arc<dyn C2nBackend>,
-        log_id: String,
-        log_level_state: LogLevelState,
-    ) -> Self {
-        Self {
-            backend,
-            log_id,
-            log_level_state,
-        }
-    }
-
-    /// Shared log-level state (for external query of verbose components).
-    pub fn log_level_state(&self) -> LogLevelState {
-        self.log_level_state.clone()
-    }
-
-    pub async fn bind() -> Result<(TcpListener, SocketAddr), C2nError> {
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
-        let addr = listener.local_addr()?;
-        Ok((listener, addr))
+    fn new(backend: Arc<dyn C2nBackend>, log_id: String) -> Self {
+        Self { backend, log_id }
     }
 
     pub async fn serve(self, listener: TcpListener) -> Result<(), C2nError> {
@@ -212,6 +190,7 @@ impl C2NServer {
     }
 }
 
+#[cfg(test)]
 async fn handle_connection(
     stream: &mut tokio::net::TcpStream,
     peer_addr: SocketAddr,
@@ -240,6 +219,7 @@ async fn handle_connection(
     dispatch(stream, &req, backend).await
 }
 
+#[cfg(test)]
 async fn check_auth(ip: IpAddr, backend: &Arc<dyn C2nBackend>) -> bool {
     if is_loopback(ip) {
         return true;
@@ -250,6 +230,7 @@ async fn check_auth(ip: IpAddr, backend: &Arc<dyn C2nBackend>) -> bool {
     false
 }
 
+#[cfg(test)]
 fn is_loopback(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => v4.is_loopback(),
@@ -257,6 +238,7 @@ fn is_loopback(ip: IpAddr) -> bool {
     }
 }
 
+#[cfg(test)]
 struct HttpRequest {
     method: String,
     path: String,
@@ -266,6 +248,7 @@ struct HttpRequest {
     body: Vec<u8>,
 }
 
+#[cfg(test)]
 async fn read_request<R: AsyncRead + Unpin>(conn: &mut R) -> Result<HttpRequest, String> {
     let mut buf = Vec::with_capacity(4096);
     let mut tmp = [0u8; 4096];
@@ -289,10 +272,12 @@ async fn read_request<R: AsyncRead + Unpin>(conn: &mut R) -> Result<HttpRequest,
     }
 }
 
+#[cfg(test)]
 fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
+#[cfg(test)]
 fn parse_request_head(head: &[u8], body_preview: Vec<u8>) -> Result<HttpRequest, String> {
     let text = std::str::from_utf8(head).map_err(|_| "non-utf8 header".to_string())?;
     let mut lines = text.split("\r\n");
@@ -342,6 +327,7 @@ fn parse_request_head(head: &[u8], body_preview: Vec<u8>) -> Result<HttpRequest,
 // Response writers
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
 async fn write_json_response<W: AsyncWrite + Unpin>(
     conn: &mut W,
     status: u16,
@@ -360,6 +346,7 @@ async fn write_json_response<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
+#[cfg(test)]
 async fn write_text_response<W: AsyncWrite + Unpin>(
     conn: &mut W,
     status: u16,
@@ -378,6 +365,7 @@ async fn write_text_response<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
+#[cfg(test)]
 async fn write_raw_response<W: AsyncWrite + Unpin>(
     conn: &mut W,
     status: u16,
@@ -396,6 +384,7 @@ async fn write_raw_response<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
+#[cfg(test)]
 async fn write_no_content<W: AsyncWrite + Unpin>(conn: &mut W) -> Result<(), std::io::Error> {
     conn.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
         .await?;
@@ -407,6 +396,7 @@ async fn write_no_content<W: AsyncWrite + Unpin>(conn: &mut W) -> Result<(), std
 // Query string parsing
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
 fn parse_query(query: &str) -> HashMap<String, String> {
     let mut params = HashMap::new();
     for pair in query.split('&') {
@@ -422,6 +412,7 @@ fn parse_query(query: &str) -> HashMap<String, String> {
     params
 }
 
+#[cfg(test)]
 fn parse_omit_fields(query: &str) -> Vec<String> {
     let params = parse_query(query);
     params
@@ -434,6 +425,7 @@ fn parse_omit_fields(query: &str) -> Vec<String> {
 // Known paths
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
 const KNOWN_PATHS: &[&str] = &[
     "/",
     "/echo",
@@ -457,6 +449,7 @@ const KNOWN_PATHS: &[&str] = &[
     "/posture/identity",
 ];
 
+#[cfg(test)]
 fn known_paths() -> serde_json::Value {
     serde_json::json!(KNOWN_PATHS)
 }
@@ -465,6 +458,7 @@ fn known_paths() -> serde_json::Value {
 // Dispatch
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
 async fn dispatch<W: AsyncWrite + Unpin>(
     conn: &mut W,
     req: &HttpRequest,
@@ -705,6 +699,7 @@ async fn dispatch<W: AsyncWrite + Unpin>(
 }
 
 /// POST body for /debug/netmap (matches Go's C2NDebugNetmapRequest).
+#[cfg(test)]
 #[derive(serde::Deserialize)]
 #[allow(non_snake_case)]
 struct NetmapOmitRequest {
@@ -954,7 +949,7 @@ mod tests {
         let backend: Arc<dyn C2nBackend> = Arc::new(MockBackend {
             log_level: log_level.clone(),
         });
-        let server = C2NServer::new_with_log_level(backend, "test".into(), log_level.clone());
+        let server = C2NServer::new(backend, "test".into());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(server.serve(listener));

@@ -14,7 +14,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use rustscale_ipn::{LoginProfile, Prefs, StartOptions, WaitingFile};
+use rustscale_ipn::{LoginProfile, MaskedPrefs, Prefs, StartOptions, WaitingFile};
 use rustscale_safesocket::peercred::ConnIdentity;
 use rustscale_tailcfg::DERPMap;
 
@@ -241,6 +241,15 @@ impl InMemoryLocalClient {
         serde_json::from_slice(&body).map_err(|e| InMemoryClientError::Json(e.to_string()))
     }
 
+    /// PATCH `/localapi/v0/prefs` transactionally.
+    pub async fn edit_prefs(&self, prefs: &MaskedPrefs) -> Result<Prefs, InMemoryClientError> {
+        let body = serde_json::to_vec(prefs).unwrap_or_default();
+        let (_, body) = self
+            .request_with_body("PATCH", "/localapi/v0/prefs", &body)
+            .await?;
+        serde_json::from_slice(&body).map_err(|error| InMemoryClientError::Json(error.to_string()))
+    }
+
     /// GET /localapi/v0/profiles
     pub async fn list_profiles(&self) -> Result<Vec<LoginProfile>, InMemoryClientError> {
         let (_, body) = self.request("GET", "/localapi/v0/profiles").await?;
@@ -447,7 +456,7 @@ impl Server {
             packet_drops: inner.packet_drops.clone(),
             capture: inner.capture.clone(),
             metrics: crate::localapi::default_metric_registry(),
-            prefs: Arc::new(RwLock::new(self.load_prefs().unwrap_or_default())),
+            prefs: inner.prefs.clone(),
             posture_checking: inner.posture_checking.clone(),
             exit_node_selection: inner.exit_node_selection.clone(),
             tailscale_ips: inner.tailscale_ips.clone(),

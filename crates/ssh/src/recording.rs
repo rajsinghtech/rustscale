@@ -165,7 +165,7 @@ impl SessionRecorder {
         )
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn with_test_writer_result(
         writer: Box<dyn Write + Send>,
         result_rx: oneshot::Receiver<io::Result<()>>,
@@ -181,7 +181,7 @@ impl SessionRecorder {
         )
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn with_test_writer(
         writer: Box<dyn Write + Send>,
         header: CastHeader,

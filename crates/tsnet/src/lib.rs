@@ -792,8 +792,6 @@ pub(crate) struct RunningState {
     pub(crate) c2n_router: Arc<C2nRouter>,
     /// Live posture preference shared with LocalAPI and C2N.
     pub(crate) posture_checking: Arc<AtomicBool>,
-    /// C2N HTTP server address (loopback, bound on up()).
-    pub(crate) c2n_addr: Option<SocketAddr>,
     /// Control-plane feature flags extracted from netmap updates.
     pub(crate) control_knobs: Arc<ControlKnobs>,
     /// PeerAPI listen port (deterministic, from tailscale IPs).
@@ -928,8 +926,6 @@ pub(crate) struct Bootstrap {
     pub(crate) health_watchdog: Watchdog,
     /// C2N request router (control-to-node handler dispatch).
     pub(crate) c2n_router: Arc<C2nRouter>,
-    /// C2N backend (shared by HTTP server + Noise-channel router).
-    pub(crate) c2n_backend: Arc<c2n::TsnetC2nBackend>,
     /// Live persisted posture preference used by C2N collection.
     pub(crate) posture_checking: Arc<AtomicBool>,
     /// Control-plane feature flags extracted from netmap updates.
@@ -1015,9 +1011,11 @@ impl Server {
         self.inner.as_ref().map(|i| i.c2n_router.clone())
     }
 
-    /// The C2N HTTP server address (loopback), if the server is up.
-    pub fn c2n_addr(&self) -> Option<SocketAddr> {
-        self.inner.as_ref().and_then(|i| i.c2n_addr)
+    /// C2N is never exposed on an unauthenticated loopback listener.
+    /// Control-to-node requests are accepted only on the authenticated Noise
+    /// map session, so this compatibility accessor always returns `None`.
+    pub const fn c2n_addr(&self) -> Option<SocketAddr> {
+        None
     }
 
     /// The PeerAPI listen port, if the server is up. The PeerAPI listens on
@@ -1145,7 +1143,6 @@ impl Server {
         let config =
             rustscale_conffile::Config::load(path).map_err(|e| format!("config load: {e}"))?;
 
-        let masked = config.parsed.to_prefs();
         let updated = {
             let mut prefs = inner.prefs.write().await;
             let mut candidate = prefs.clone();
@@ -1161,6 +1158,9 @@ impl Server {
                 }
                 *prefs = candidate;
             }
+            inner
+                .posture_checking
+                .store(prefs.PostureChecking, std::sync::atomic::Ordering::Release);
             serde_json::to_value(&*prefs).unwrap_or_default()
         };
 

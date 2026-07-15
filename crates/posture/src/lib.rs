@@ -115,14 +115,17 @@ impl PosturePolicy for UserDecidesPolicy {
 }
 
 /// Live OS-backed posture policy. Linux policy is re-read from the standard
-/// bounded JSON policy path on every collection. Other current RustScale
-/// targets have no default managed-policy reader here. Missing policy means
-/// `user-decides`.
+/// bounded JSON path; macOS and Windows use hardened platform stores. Missing
+/// policy means `user-decides`. Platforms without a trustworthy provider
+/// return an error, which [`IdentityService`] treats as disabled.
 #[derive(Debug, Default)]
 pub struct SystemPolicy;
 
 impl PosturePolicy for SystemPolicy {
     fn preference(&self) -> Result<PreferenceOption, PolicyError> {
+        #[cfg(target_os = "linux")]
+        use rustscale_syspolicy::PolicyStore;
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
         use rustscale_syspolicy::{PolicyErrorKind, PolicyKey};
 
         #[cfg(target_os = "linux")]
@@ -148,15 +151,20 @@ impl PosturePolicy for SystemPolicy {
             rustscale_syspolicy::LinuxPolicyStore::from_json(json)
                 .map_err(|_| PolicyError::Unavailable)?
         };
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         let store = rustscale_syspolicy::default_store();
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+        return Err(PolicyError::Unavailable);
 
-        match store.get_string(PolicyKey::PostureChecking) {
-            Ok(value) => PreferenceOption::parse(&value),
-            Err(error) if error.kind == PolicyErrorKind::NotConfigured => {
-                Ok(PreferenceOption::UserDecides)
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+        {
+            match store.get_string(PolicyKey::PostureChecking) {
+                Ok(value) => PreferenceOption::parse(&value),
+                Err(error) if error.kind == PolicyErrorKind::NotConfigured => {
+                    Ok(PreferenceOption::UserDecides)
+                }
+                Err(_) => Err(PolicyError::Unavailable),
             }
-            Err(_) => Err(PolicyError::Unavailable),
         }
     }
 }
@@ -224,7 +232,7 @@ impl IdentityService {
     pub fn collect(&self, user_enabled: bool, include_hardware_addrs: bool) -> CollectionResult {
         let (preference, policy_error) = match self.policy.preference() {
             Ok(preference) => (preference, None),
-            Err(error) => (PreferenceOption::UserDecides, Some(error)),
+            Err(error) => (PreferenceOption::Never, Some(error)),
         };
         if !preference.should_enable(user_enabled) {
             return CollectionResult {
@@ -351,6 +359,13 @@ mod tests {
         }
     }
 
+    struct ErrorPolicy;
+    impl PosturePolicy for ErrorPolicy {
+        fn preference(&self) -> Result<PreferenceOption, PolicyError> {
+            Err(PolicyError::Unavailable)
+        }
+    }
+
     struct MutablePolicy(Arc<AtomicU8>);
     impl PosturePolicy for MutablePolicy {
         fn preference(&self) -> Result<PreferenceOption, PolicyError> {
@@ -395,6 +410,36 @@ mod tests {
 
         let (user_service, serial_calls, _) = service(PreferenceOption::UserDecides);
         assert!(user_service.collect(false, false).identity.posture_disabled);
+        assert_eq!(serial_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn managed_platform_always_and_never_gate_collection() {
+        let (never, serial_calls, _) = service(PreferenceOption::Never);
+        assert!(never.collect(true, true).identity.posture_disabled);
+        assert_eq!(serial_calls.load(Ordering::Relaxed), 0);
+
+        let (always, serial_calls, _) = service(PreferenceOption::Always);
+        assert!(!always.collect(false, false).identity.posture_disabled);
+        assert_eq!(serial_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn policy_provider_failure_fails_closed() {
+        let serial_calls = Arc::new(AtomicUsize::new(0));
+        let service = IdentityService::new(
+            Box::new(FakeCollector {
+                serial_calls: serial_calls.clone(),
+                hardware_calls: Arc::new(AtomicUsize::new(0)),
+                serials: vec!["serial-1".into()],
+                hardware: Mutex::new(Vec::new()),
+            }),
+            Box::new(ErrorPolicy),
+        );
+        let result = service.collect(true, true);
+        assert!(result.identity.posture_disabled);
+        assert_eq!(result.policy_error, Some(PolicyError::Unavailable));
         assert_eq!(serial_calls.load(Ordering::Relaxed), 0);
     }
 

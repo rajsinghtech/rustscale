@@ -286,10 +286,6 @@ impl Server {
             b.magicsock.self_cap_map_arc(),
         )));
 
-        let (c2n_task, c2n_addr) =
-            c2n::spawn_c2n_server(b.c2n_backend.clone(), "rustscale".into()).await;
-        tasks.push(c2n_task);
-
         // Taildrop file manager (shared between PeerAPI receive handler
         // and LocalAPI endpoints). Created from the state directory; if
         // no state dir, taildrop is disabled.
@@ -597,7 +593,6 @@ impl Server {
             health_watchdog: b.health_watchdog,
             c2n_router: b.c2n_router,
             posture_checking: b.posture_checking,
-            c2n_addr: Some(c2n_addr),
             control_knobs: b.control_knobs,
             peerapi_port,
             overrides: b.overrides,
@@ -792,9 +787,6 @@ impl Server {
             client_updater.clone(),
         );
 
-        let (c2n_task, c2n_addr) =
-            c2n::spawn_c2n_server(b.c2n_backend.clone(), "rustscale".into()).await;
-
         // Taildrop file manager (shared between PeerAPI receive handler
         // and LocalAPI endpoints). Created from the state directory.
         let taildrop = Arc::new(taildrop::TaildropManager::new(
@@ -939,7 +931,6 @@ impl Server {
             pump,
             map_update,
             periodic_ep,
-            c2n_task,
             peerapi_task,
             hostinfo_loop,
             portlist_task,
@@ -1136,7 +1127,6 @@ impl Server {
             health_watchdog: b.health_watchdog,
             c2n_router: b.c2n_router,
             posture_checking: b.posture_checking,
-            c2n_addr: Some(c2n_addr),
             control_knobs: b.control_knobs,
             peerapi_port,
             overrides: b.overrides,
@@ -2211,7 +2201,6 @@ impl Server {
             health,
             health_watchdog,
             c2n_router,
-            c2n_backend,
             posture_checking,
             control_knobs,
             overrides: self.config.overrides.clone(),

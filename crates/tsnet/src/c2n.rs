@@ -1,18 +1,16 @@
 use std::collections::BTreeMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
 
 use async_trait::async_trait;
-use rustscale_c2n::{C2NServer, C2nBackend, LogLevelState, WhoIsResult};
+use rustscale_c2n::{C2nBackend, LogLevelState, WhoIsResult};
 use rustscale_controlclient::c2n::{C2nHandler, C2nRequest, C2nResponse, C2nRouter};
 use rustscale_health::{Severity, Tracker};
 use rustscale_magicsock::Magicsock;
 use rustscale_tailcfg::{C2NPostureIdentityResponse, DNSConfig, Node, UserID, UserProfile};
-use tokio::net::TcpListener;
 use tokio::sync::RwLock;
-use tokio::task::JoinHandle;
 
 pub struct EchoHandler;
 
@@ -125,10 +123,6 @@ impl TsnetC2nBackend {
             iface_hardware_addrs: identity.iface_hardware_addrs,
             posture_disabled: identity.posture_disabled,
         })
-    }
-
-    pub fn log_level(&self) -> LogLevelState {
-        self.log_level.clone()
     }
 }
 
@@ -574,26 +568,4 @@ pub(crate) fn register_c2n_handlers(router: &mut C2nRouter, backend: Arc<TsnetC2
             backend: backend.clone(),
         }),
     );
-}
-
-/// Spawn the loopback C2N HTTP server using a pre-created backend.
-pub(crate) async fn spawn_c2n_server(
-    backend: Arc<TsnetC2nBackend>,
-    log_id: String,
-) -> (JoinHandle<()>, SocketAddr) {
-    let log_level = backend.log_level();
-    let server = C2NServer::new_with_log_level(backend, log_id, log_level);
-
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("c2n: failed to bind loopback listener");
-    let addr = listener.local_addr().expect("c2n: no local addr");
-
-    let handle = tokio::spawn(async move {
-        if let Err(e) = server.serve(listener).await {
-            log::warn!("c2n server error: {e}");
-        }
-    });
-
-    (handle, addr)
 }

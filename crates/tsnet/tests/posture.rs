@@ -7,7 +7,7 @@ use rustscale_testcontrol::Server as TestControlServer;
 use rustscale_tsnet::Server;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn control_c2n_reports_disabled_posture_on_same_noise_session() {
+async fn sensitive_c2n_has_no_loopback_listener_and_noise_session_works() {
     let mut control = TestControlServer::new();
     control.start().await.expect("start test control");
     let state = tempfile::tempdir().expect("state dir");
@@ -24,6 +24,11 @@ async fn control_c2n_reports_disabled_posture_on_same_noise_session() {
         .await
         .expect("up deadline")
         .expect("up server");
+    assert_eq!(
+        server.c2n_addr(),
+        None,
+        "posture, netmap, and prefs must not have an unauthenticated loopback listener"
+    );
     let node_key = server.node_key().expect("node key");
     let callback = control.c2n_callback_url(&node_key);
     let payload = b"GET /posture/identity?hwaddrs=true HTTP/1.1\r\nHost: node\r\n\r\n".to_vec();

@@ -24,6 +24,7 @@ use rustscale_tailcfg::{
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 
 use crate::c2n::{answer_c2n_ping, C2nReplyError, C2nReplyTransport, C2nRouter};
 use crate::controlbase::{NoiseIo, ProtocolVersion};
@@ -263,6 +264,9 @@ impl Drop for NoiseHttpClient {
     }
 }
 
+const MAX_C2N_IN_FLIGHT: usize = 4;
+
+#[derive(Clone)]
 struct H2C2nReplyTransport {
     sender: h2::client::SendRequest<bytes::Bytes>,
 }
@@ -308,6 +312,83 @@ impl C2nReplyTransport for H2C2nReplyTransport {
         }
         Ok(())
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum C2nDispatch {
+    Started,
+    DuplicateOrInvalid,
+    AtCapacity,
+}
+
+struct C2nTaskSet {
+    router: Arc<C2nRouter>,
+    transport: Arc<dyn C2nReplyTransport>,
+    last_url: Arc<Mutex<String>>,
+    tasks: JoinSet<()>,
+}
+
+impl C2nTaskSet {
+    fn new(
+        router: Arc<C2nRouter>,
+        transport: Arc<dyn C2nReplyTransport>,
+        last_url: Arc<Mutex<String>>,
+    ) -> Self {
+        Self {
+            router,
+            transport,
+            last_url,
+            tasks: JoinSet::new(),
+        }
+    }
+
+    fn dispatch(&mut self, ping: rustscale_tailcfg::PingRequest) -> C2nDispatch {
+        while self.tasks.try_join_next().is_some() {}
+        let unique = {
+            let mut last = lock_unpoisoned(&self.last_url);
+            if ping.URL.is_empty() || *last == ping.URL {
+                false
+            } else {
+                last.clone_from(&ping.URL);
+                true
+            }
+        };
+        if !unique {
+            return C2nDispatch::DuplicateOrInvalid;
+        }
+        if self.tasks.len() >= MAX_C2N_IN_FLIGHT {
+            return C2nDispatch::AtCapacity;
+        }
+        let router = self.router.clone();
+        let transport = self.transport.clone();
+        self.tasks.spawn(async move {
+            if let Err(error) = answer_c2n_ping(&router, transport.as_ref(), &ping).await {
+                log::warn!("control: failed to answer C2N request: {error}");
+            }
+        });
+        C2nDispatch::Started
+    }
+}
+
+async fn forward_map_response(
+    updates: &mpsc::Sender<Result<MapResponse, StreamMapError>>,
+    response: MapResponse,
+    c2n_tasks: Option<&mut C2nTaskSet>,
+) -> bool {
+    let c2n_ping = response
+        .PingRequest
+        .as_ref()
+        .filter(|ping| ping.Types == "c2n")
+        .cloned();
+    if updates.send(Ok(response)).await.is_err() {
+        return false;
+    }
+    if let (Some(tasks), Some(ping)) = (c2n_tasks, c2n_ping) {
+        if tasks.dispatch(ping) == C2nDispatch::AtCapacity {
+            log::warn!("control: dropping C2N request at per-session concurrency limit");
+        }
+    }
+    true
 }
 
 impl From<H2SetupError> for RegisterError {
@@ -557,9 +638,15 @@ impl ControlClient {
 
         let (resp_future, mut send_stream) = h2_send.send_request(request, false)?;
         send_stream.send_data(bytes::Bytes::from(body), true)?;
-        let c2n_transport = H2C2nReplyTransport {
-            sender: h2_send.clone(),
-        };
+        let mut c2n_tasks = c2n_router.zip(last_c2n_url).map(|(router, last_url)| {
+            C2nTaskSet::new(
+                router,
+                Arc::new(H2C2nReplyTransport {
+                    sender: h2_send.clone(),
+                }),
+                last_url,
+            )
+        });
 
         let resp = resp_future.await?;
         let status = resp.status().as_u16();
@@ -635,28 +722,7 @@ impl ControlClient {
             let msg: Vec<u8> = read_buf.drain(..size).collect();
             match serde_json::from_slice::<MapResponse>(&msg) {
                 Ok(mr) => {
-                    if let (Some(router), Some(last_url), Some(ping)) = (
-                        c2n_router.as_ref(),
-                        last_c2n_url.as_ref(),
-                        mr.PingRequest.as_ref().filter(|ping| ping.Types == "c2n"),
-                    ) {
-                        let unique = {
-                            let mut last = lock_unpoisoned(last_url);
-                            if ping.URL.is_empty() || *last == ping.URL {
-                                false
-                            } else {
-                                last.clone_from(&ping.URL);
-                                true
-                            }
-                        };
-                        if unique {
-                            if let Err(error) = answer_c2n_ping(router, &c2n_transport, ping).await
-                            {
-                                log::warn!("control: failed to answer C2N request: {error}");
-                            }
-                        }
-                    }
-                    if updates.send(Ok(mr)).await.is_err() {
+                    if !forward_map_response(&updates, mr, c2n_tasks.as_mut()).await {
                         break;
                     }
                 }

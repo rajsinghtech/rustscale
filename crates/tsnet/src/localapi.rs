@@ -224,6 +224,8 @@ pub(crate) struct LocalApiState {
     /// Shared route table (for applying exit-node pref changes directly).
     /// None when the server is not fully up (e.g. start_localapi_only).
     pub route_table: Option<Arc<RwLock<crate::routing::RouteTable>>>,
+    /// Shared serialization gate for map and explicit exit mutations.
+    pub exit_map_gate: crate::ExitMapGate,
     /// OS router when TUN mode owns system routes.
     pub router: Option<crate::SharedRouter>,
     /// Notify fired by POST /logout so the daemon can tear down the server
@@ -760,6 +762,7 @@ async fn handle_reload_config<W: AsyncWrite + Unpin>(
     };
 
     let masked = config.parsed.to_prefs();
+    let _exit_map_guard = state.exit_map_gate.lock().await;
     let authorization_changed = masked.ShieldsUpSet
         || masked.ExitNodeAllowLANAccessSet
         || masked.ExitNodeIDSet
@@ -887,6 +890,7 @@ pub(crate) fn resolve_exit_node_peer(peers: &[Node], ip_or_name: &str) -> Option
 /// locked helper below so route and authorization changes commit together.
 #[cfg(test)]
 pub(crate) async fn apply_exit_node_prefs(state: &Arc<LocalApiState>) {
+    let _exit_map_guard = state.exit_map_gate.lock().await;
     let _map_commit = state.peer_map.gate.write().await;
     let prefs = state.prefs.read().await.clone();
     apply_exit_node_prefs_locked(state, &prefs)
@@ -914,7 +918,8 @@ fn stage_exit_route(
 
 /// Transactionally apply an explicit LocalAPI/config exit preference.
 /// Persistence and the live prefs lock are committed by the caller only after
-/// this succeeds.
+/// this succeeds. Production callers must hold `state.exit_map_gate` before
+/// the prefs lock and retain both through this route synchronization.
 async fn apply_exit_node_prefs_locked(
     state: &Arc<LocalApiState>,
     prefs: &Prefs,
@@ -996,12 +1001,12 @@ async fn handle_patch_prefs<W: AsyncWrite + Unpin>(
         masked.ExitNodeIDSet || masked.ExitNodeIPSet || masked.ExitNodeAllowLANAccessSet;
     let disconnect_requested = masked.WantRunningSet && !masked.Prefs.WantRunning;
     let authorization_changed = exit_node_changed || masked.ShieldsUpSet;
+    let _exit_map_guard = state.exit_map_gate.lock().await;
     let map_commit = if authorization_changed {
         Some(state.peer_map.gate.write().await)
     } else {
         None
     };
-
     let mut prefs_guard = state.prefs.write().await;
     let old_prefs = prefs_guard.clone();
     let mut next_prefs = old_prefs.clone();
@@ -4027,6 +4032,7 @@ mod tests {
             netstack: None,
             filter: std::sync::OnceLock::new(),
             route_table: Some(Arc::new(RwLock::new(crate::routing::RouteTable::default()))),
+            exit_map_gate: Arc::new(tokio::sync::Mutex::new(())),
             router: None,
             logout_trigger: Arc::new(tokio::sync::Notify::new()),
             suggested_exit_node: Arc::new(RwLock::new(String::new())),
@@ -5196,6 +5202,7 @@ mod tests {
             netstack: None,
             filter: std::sync::OnceLock::new(),
             route_table: None,
+            exit_map_gate: Arc::new(tokio::sync::Mutex::new(())),
             router: None,
             logout_trigger: Arc::new(tokio::sync::Notify::new()),
             suggested_exit_node: Arc::new(RwLock::new(String::new())),
@@ -5440,6 +5447,7 @@ mod tests {
             netstack: None,
             filter: std::sync::OnceLock::new(),
             route_table: None,
+            exit_map_gate: Arc::new(tokio::sync::Mutex::new(())),
             router: None,
             logout_trigger: Arc::new(tokio::sync::Notify::new()),
             suggested_exit_node: Arc::new(RwLock::new(String::new())),

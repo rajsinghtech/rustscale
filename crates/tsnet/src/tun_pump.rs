@@ -1889,10 +1889,12 @@ pub(crate) fn engage_kernel_security_block(router: &SharedRouter) -> Result<(), 
         .lock()
         .map_err(|_| TsnetError::Builder("router lock poisoned".into()))?;
     if !managed.security_blocked {
+        // Track ownership before attempting the command: a verification or
+        // rollback error may still have left a live kernel block.
+        managed.security_blocked = true;
         managed.router.block_direct().map_err(|error| {
             TsnetError::Builder(format!("install kernel direct-traffic block: {error}"))
         })?;
-        managed.security_blocked = true;
     }
     Ok(())
 }
@@ -1995,7 +1997,38 @@ fn sync_router_inner(
             magicsock.link_changed();
         }
     }
-    if let Err(error) = managed.router.set(&config) {
+    apply_managed_router_config(
+        &mut managed,
+        &config,
+        entering_exit_node,
+        !exit_node_allow_lan_access,
+    )?;
+    if leaving_exit_node {
+        // Release only after catch-all teardown, so no underlay packet can
+        // briefly recurse through the TUN during the transition.
+        rustscale_netns::release_physical_underlay_bypass(&managed.tun_name);
+    }
+    Ok(())
+}
+
+fn apply_managed_router_config(
+    managed: &mut ManagedRouter,
+    config: &rustscale_router::RouterConfig,
+    entering_exit_node: bool,
+    lan_denied: bool,
+) -> Result<(), TsnetError> {
+    // The verified emergency block must precede the first catch-all/policy
+    // mutation. It is independent router state, so set rollback cannot remove
+    // it; failures leave `security_blocked` set for the next retry/close.
+    if entering_exit_node && lan_denied && !managed.security_blocked {
+        // Set ownership first because command/verification failure can be
+        // partial. A later successful sync or close must attempt removal.
+        managed.security_blocked = true;
+        managed.router.block_direct().map_err(|error| {
+            TsnetError::Builder(format!("install kernel direct-traffic block: {error}"))
+        })?;
+    }
+    if let Err(error) = managed.router.set(config) {
         if entering_exit_node {
             // A failed inverse may have left a catch-all owned by the router.
             // Retain underlay capability until a later set/close proves the
@@ -2006,17 +2039,12 @@ fn sync_router_inner(
             "route configuration failed: {error}"
         )));
     }
-    managed.exit_node = exit_node;
+    managed.exit_node = config.exit_node;
     if managed.security_blocked {
         managed.router.unblock_direct().map_err(|error| {
             TsnetError::Builder(format!("remove kernel direct-traffic block: {error}"))
         })?;
         managed.security_blocked = false;
-    }
-    if leaving_exit_node {
-        // Release only after catch-all teardown, so no underlay packet can
-        // briefly recurse through the TUN during the transition.
-        rustscale_netns::release_physical_underlay_bypass(&managed.tun_name);
     }
     Ok(())
 }
@@ -2061,7 +2089,8 @@ pub(crate) async fn create_tun_device(
                     router,
                     tun_name: dev.name().to_owned(),
                     exit_node: false,
-                    security_blocked: false,
+                    // Verification failure may still leave the block live.
+                    security_blocked: true,
                 }));
                 let cleanup = Server::cleanup_or_supervise(owner).err();
                 return Err(TsnetError::Builder(match cleanup {
@@ -2200,6 +2229,65 @@ mod tests {
         events: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
     }
 
+    #[derive(Clone, Copy)]
+    enum RouterFailure {
+        None,
+        Block,
+        Set,
+        Unblock,
+    }
+
+    struct OrderedRouter {
+        events: Arc<std::sync::Mutex<Vec<&'static str>>>,
+        failure: RouterFailure,
+    }
+
+    impl rustscale_router::Router for OrderedRouter {
+        fn up(&mut self) -> Result<(), rustscale_router::RouterError> {
+            Ok(())
+        }
+
+        fn set(
+            &mut self,
+            _config: &rustscale_router::RouterConfig,
+        ) -> Result<(), rustscale_router::RouterError> {
+            self.events.lock().unwrap().push("set");
+            if matches!(self.failure, RouterFailure::Set) {
+                Err(rustscale_router::RouterError::InvalidConfig(
+                    "injected set failure".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn block_direct(&mut self) -> Result<(), rustscale_router::RouterError> {
+            self.events.lock().unwrap().push("block");
+            if matches!(self.failure, RouterFailure::Block) {
+                Err(rustscale_router::RouterError::InvalidConfig(
+                    "injected block failure".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn unblock_direct(&mut self) -> Result<(), rustscale_router::RouterError> {
+            self.events.lock().unwrap().push("unblock");
+            if matches!(self.failure, RouterFailure::Unblock) {
+                Err(rustscale_router::RouterError::InvalidConfig(
+                    "injected unblock failure".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn close(&mut self) -> Result<(), rustscale_router::RouterError> {
+            Ok(())
+        }
+    }
+
     struct PendingProbe {
         replies_seen: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         polled: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<usize>>>,
@@ -2235,6 +2323,68 @@ mod tests {
             if let Some(notify) = self.0.take() {
                 let _ = notify.send(());
             }
+        }
+    }
+
+    fn ordered_managed_router(
+        failure: RouterFailure,
+    ) -> (ManagedRouter, Arc<std::sync::Mutex<Vec<&'static str>>>) {
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        (
+            ManagedRouter {
+                router: Box::new(OrderedRouter {
+                    events: events.clone(),
+                    failure,
+                }),
+                tun_name: "rustscale-test0".into(),
+                exit_node: false,
+                security_blocked: false,
+            },
+            events,
+        )
+    }
+
+    #[test]
+    fn lan_denied_exit_blocks_before_catch_all_and_unblocks_after_success() {
+        let (mut managed, events) = ordered_managed_router(RouterFailure::None);
+        let config = rustscale_router::RouterConfig {
+            exit_node: true,
+            ..Default::default()
+        };
+        apply_managed_router_config(&mut managed, &config, true, true).unwrap();
+        assert_eq!(*events.lock().unwrap(), ["block", "set", "unblock"]);
+        assert!(managed.exit_node);
+        assert!(!managed.security_blocked);
+    }
+
+    #[test]
+    fn emergency_block_failure_prevents_catch_all_mutation() {
+        let (mut managed, events) = ordered_managed_router(RouterFailure::Block);
+        let config = rustscale_router::RouterConfig {
+            exit_node: true,
+            ..Default::default()
+        };
+        assert!(apply_managed_router_config(&mut managed, &config, true, true).is_err());
+        assert_eq!(*events.lock().unwrap(), ["block"]);
+        assert!(!managed.exit_node);
+        assert!(managed.security_blocked);
+    }
+
+    #[test]
+    fn route_or_unblock_failure_retains_emergency_block() {
+        for (failure, expected) in [
+            (RouterFailure::Set, vec!["block", "set"]),
+            (RouterFailure::Unblock, vec!["block", "set", "unblock"]),
+        ] {
+            let (mut managed, events) = ordered_managed_router(failure);
+            let config = rustscale_router::RouterConfig {
+                exit_node: true,
+                ..Default::default()
+            };
+            assert!(apply_managed_router_config(&mut managed, &config, true, true).is_err());
+            assert_eq!(*events.lock().unwrap(), expected);
+            assert!(managed.exit_node);
+            assert!(managed.security_blocked);
         }
     }
 

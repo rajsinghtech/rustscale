@@ -418,6 +418,12 @@ trait Platform: Send + Sync {
         Vec::new()
     }
 
+    /// Commands and exact output fragments used to verify the emergency
+    /// direct-traffic block. Empty means the platform has its own verifier.
+    fn direct_block_checks(&self) -> Vec<(CommandSpec, Vec<String>)> {
+        Vec::new()
+    }
+
     /// Startup commands paired with their exact rollback commands.
     fn up_transaction_commands(&self) -> Vec<(CommandSpec, CommandSpec)> {
         self.commands(&RouterOperation::Up)
@@ -514,6 +520,21 @@ impl<P: Platform, R: CommandRunner> StatefulRouter<P, R> {
         self.apply_commands(commands)
     }
 
+    fn verify_direct_block(&mut self, expected: bool) -> Result<(), RouterError> {
+        for ((program, args), fragments) in self.platform.direct_block_checks() {
+            let output = self.runner.output(&program, &args)?;
+            let active = output
+                .lines()
+                .any(|line| fragments.iter().all(|fragment| line.contains(fragment)));
+            if active != expected {
+                return Err(RouterError::InvalidConfig(format!(
+                    "kernel direct-traffic block verification expected {expected} for {program} {args:?}: {output:?}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn retry_pending_cleanup(&mut self) -> Result<(), RouterError> {
         let pending = std::mem::take(&mut self.pending_cleanup);
         let mut first_error = None;
@@ -600,11 +621,11 @@ impl<P: Platform, R: CommandRunner> Router for StatefulRouter<P, R> {
 
     fn block_direct(&mut self) -> Result<(), RouterError> {
         if self.direct_blocked {
-            return Ok(());
+            return self.verify_direct_block(true);
         }
         self.apply(&[RouterOperation::EnableDirectBlock])?;
         self.direct_blocked = true;
-        Ok(())
+        self.verify_direct_block(true)
     }
 
     fn unblock_direct(&mut self) -> Result<(), RouterError> {
@@ -612,6 +633,7 @@ impl<P: Platform, R: CommandRunner> Router for StatefulRouter<P, R> {
             return Ok(());
         }
         self.apply(&[RouterOperation::DisableDirectBlock])?;
+        self.verify_direct_block(false)?;
         self.direct_blocked = false;
         Ok(())
     }
@@ -1167,6 +1189,34 @@ impl Platform for LinuxPlatform {
                 }
             }
         }
+    }
+
+    fn direct_block_checks(&self) -> Vec<(CommandSpec, Vec<String>)> {
+        let pref = self.rule_base.unwrap_or(5_200).to_string();
+        ["-4", "-6"]
+            .into_iter()
+            .map(|family| {
+                (
+                    (
+                        "ip".into(),
+                        vec![
+                            family.into(),
+                            "rule".into(),
+                            "show".into(),
+                            "pref".into(),
+                            pref.clone(),
+                        ],
+                    ),
+                    vec![
+                        format!("{pref}:"),
+                        "not".into(),
+                        "fwmark 0x80000/0xff0000".into(),
+                        format!("proto {}", Self::RULE_PROTOCOL),
+                        "unreachable".into(),
+                    ],
+                )
+            })
+            .collect()
     }
 
     fn commands(&self, operation: &RouterOperation) -> Vec<CommandSpec> {
@@ -1807,6 +1857,24 @@ mod tests {
         symlink("/etc/passwd", &platform.block_file).unwrap();
         assert!(platform.claim_ownership().is_err());
         std::fs::remove_file(&platform.block_file).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_direct_block_checks_match_only_exact_owned_rule() {
+        let platform = LinuxPlatform::new("tailscale0");
+        let pref = platform.rule_base.unwrap().to_string();
+        let owned = format!(
+            "{pref}: not from all fwmark 0x80000/0xff0000 unreachable proto {}\n",
+            LinuxPlatform::RULE_PROTOCOL
+        );
+        for ((program, args), fragments) in platform.direct_block_checks() {
+            assert_eq!(program, "ip");
+            assert!(args.windows(2).any(|pair| pair == ["pref", &pref]));
+            assert!(fragments.iter().all(|fragment| owned.contains(fragment)));
+            let foreign = format!("{pref}: from all unreachable proto 99\n");
+            assert!(!fragments.iter().all(|fragment| foreign.contains(fragment)));
+        }
     }
 
     #[cfg(target_os = "linux")]

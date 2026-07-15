@@ -781,6 +781,14 @@ impl ServerBuilder {
 }
 
 /// Internal running state.
+/// Serializes every map-driven and explicit exit-route mutation.
+///
+/// Lock order is `exit_map_gate` -> prefs/peer snapshots -> `peer_map.gate`
+/// -> route table -> synchronous router. Map code releases `peer_map.gate`
+/// before taking the route-table/router locks. No caller may acquire
+/// `exit_map_gate` while holding any of those inner locks.
+pub(crate) type ExitMapGate = Arc<tokio::sync::Mutex<()>>;
+
 pub(crate) struct RunningState {
     pub(crate) tailscale_ips: Vec<IpAddr>,
     pub(crate) magicsock: Arc<Magicsock>,
@@ -794,6 +802,7 @@ pub(crate) struct RunningState {
     pub(crate) route_table: Arc<RwLock<RouteTable>>,
     /// Live signed packet filter, mutated only under `peer_map.gate.write()`.
     pub(crate) filter: Arc<std::sync::Mutex<Filter>>,
+    pub(crate) exit_map_gate: ExitMapGate,
     /// OS-route manager in TUN mode when `TunModeConfig::apply_routes` is set.
     pub(crate) router: Option<SharedRouter>,
     pub(crate) cancel: Arc<CancelToken>,
@@ -951,6 +960,7 @@ pub(crate) struct Bootstrap {
     pub(crate) peer_map: Arc<peer_map::Runtime>,
     pub(crate) routecheck: Arc<rustscale_routecheck::Client>,
     pub(crate) route_table: Arc<RwLock<RouteTable>>,
+    pub(crate) exit_map_gate: ExitMapGate,
     pub(crate) cancel: Arc<CancelToken>,
     pub(crate) map_rx: mpsc::Receiver<Result<MapResponse, StreamMapError>>,
     pub(crate) map_tasks: Arc<MapSessionTasks>,
@@ -1283,6 +1293,7 @@ impl Server {
         let config =
             rustscale_conffile::Config::load(path).map_err(|e| format!("config load: {e}"))?;
         let masked = config.parsed.to_prefs();
+        let _exit_map_guard = inner.exit_map_gate.lock().await;
         let authorization_changed = masked.ShieldsUpSet
             || masked.ExitNodeAllowLANAccessSet
             || masked.ExitNodeIDSet

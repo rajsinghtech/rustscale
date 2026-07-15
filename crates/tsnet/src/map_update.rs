@@ -235,12 +235,14 @@ async fn clear_exit_routes_for_identity_mismatch(
 
 async fn block_exit_on_map_loss(
     router: Option<&SharedRouter>,
+    exit_map_gate: &crate::ExitMapGate,
     prefs: &Arc<RwLock<rustscale_ipn::Prefs>>,
     route_table: &Arc<RwLock<RouteTable>>,
     health: &Tracker,
     ipn_backend: &Arc<IpnBackend>,
     reason: &str,
 ) {
+    let _exit_map_guard = exit_map_gate.lock().await;
     let allow_lan = prefs.read().await.ExitNodeAllowLANAccess;
     let mut routes = route_table.write().await;
     if !routes.exit_node_requested() || allow_lan {
@@ -266,6 +268,7 @@ pub(crate) fn spawn_map_update_task(
     mut raw_peers: Vec<Node>,
     peers_arc: Arc<RwLock<Vec<Node>>>,
     route_table: Arc<RwLock<RouteTable>>,
+    exit_map_gate: crate::ExitMapGate,
     router: Option<SharedRouter>,
     prefs: Arc<RwLock<rustscale_ipn::Prefs>>,
     exit_node_selection: Arc<RwLock<ExitNodeSelection>>,
@@ -327,6 +330,7 @@ pub(crate) fn spawn_map_update_task(
                 () = tokio::time::sleep(std::time::Duration::from_secs(125)) => {
                     block_exit_on_map_loss(
                         router.as_ref(),
+                        &exit_map_gate,
                         &prefs,
                         &route_table,
                         &health,
@@ -353,6 +357,7 @@ pub(crate) fn spawn_map_update_task(
 
                     if resp.KeepAlive {
                         if let Some(router) = router.as_ref() {
+                            let _exit_map_guard = exit_map_gate.lock().await;
                             let exit_node_allow_lan_access =
                                 prefs.read().await.ExitNodeAllowLANAccess;
                             let mut routes = route_table.write().await;
@@ -402,6 +407,7 @@ pub(crate) fn spawn_map_update_task(
                         // rotating Taildrive under the same gate cancels and
                         // drains its publication epoch before any empty state
                         // becomes observable.
+                        let _exit_map_guard = exit_map_gate.lock().await;
                         let map_commit = peer_map.gate.write().await;
                         let mut drive_epoch = drive.authorization_write().await;
                         drive.rotate_authorization_locked(&mut drive_epoch);
@@ -596,6 +602,12 @@ pub(crate) fn spawn_map_update_task(
                         }
                     }
 
+                    // Serialize the peer/exit snapshot through route commit
+                    // and OS synchronization. Lock order is exit_map_gate,
+                    // then peer_map.gate, then route table, then router; the
+                    // peer-map writer is released before route/router locks.
+                    let exit_map_guard = exit_map_gate.lock().await;
+
                     // Reconcile the raw control view by stable Node.ID before
                     // intersecting it with TKA authorization. Presence of a
                     // full snapshot is significant: Some([]) revokes all,
@@ -787,6 +799,8 @@ pub(crate) fn spawn_map_update_task(
                         routes.unblock_exit_traffic();
                         health.set_healthy(WARN_EXIT_ROUTE_SECURITY);
                     }
+                    drop(routes);
+                    drop(exit_map_guard);
 
                     // Update IPN engine status: peer count as NumLive, DERP
                     // home connection as LiveDERPs. This may transition the
@@ -863,6 +877,7 @@ pub(crate) fn spawn_map_update_task(
                 Some(Err(e)) => {
                     block_exit_on_map_loss(
                         router.as_ref(),
+                        &exit_map_gate,
                         &prefs,
                         &route_table,
                         &health,
@@ -881,6 +896,7 @@ pub(crate) fn spawn_map_update_task(
                 None => {
                     block_exit_on_map_loss(
                         router.as_ref(),
+                        &exit_map_gate,
                         &prefs,
                         &route_table,
                         &health,
@@ -1217,6 +1233,7 @@ mod tests {
         let backend = Arc::new(IpnBackend::new("test"));
         block_exit_on_map_loss(
             Some(&router),
+            &Arc::new(tokio::sync::Mutex::new(())),
             &prefs,
             &routes,
             &health,
@@ -1443,6 +1460,73 @@ mod tests {
         let replace = rotation_register_request(&ctx, replacement, Some(current.clone()));
         assert!(replace.Auth.is_none());
         assert_eq!(replace.OldNodeKey, current);
+    }
+
+    #[tokio::test]
+    async fn exit_map_gate_serializes_map_against_select_and_clear() {
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let routes = Arc::new(RwLock::new(RouteTable::default()));
+        let selected = NodePrivate::generate().public();
+
+        // A map already holding the gate may commit its snapshot first, but a
+        // newer selection queued behind it must be the final state.
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let map = {
+            let gate = gate.clone();
+            let routes = routes.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                let _guard = gate.lock().await;
+                let snapshot = routes.read().await.exit_route_state();
+                barrier.wait().await;
+                let mut replacement = RouteTable::default();
+                replacement.restore_exit_route_state(snapshot);
+                *routes.write().await = replacement;
+            })
+        };
+        barrier.wait().await;
+        let select = {
+            let gate = gate.clone();
+            let routes = routes.clone();
+            let selected = selected.clone();
+            tokio::spawn(async move {
+                let _guard = gate.lock().await;
+                routes.write().await.set_exit_node(selected);
+            })
+        };
+        map.await.unwrap();
+        select.await.unwrap();
+        assert_eq!(routes.read().await.exit_node(), Some(&selected));
+
+        // Conversely, a clear that owns the gate finishes before a queued map
+        // takes its snapshot, so that map cannot resurrect the old selection.
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let clear = {
+            let gate = gate.clone();
+            let routes = routes.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                let _guard = gate.lock().await;
+                routes.write().await.clear_exit_node();
+                barrier.wait().await;
+            })
+        };
+        barrier.wait().await;
+        let map = {
+            let gate = gate.clone();
+            let routes = routes.clone();
+            tokio::spawn(async move {
+                let _guard = gate.lock().await;
+                let snapshot = routes.read().await.exit_route_state();
+                let mut replacement = RouteTable::default();
+                replacement.restore_exit_route_state(snapshot);
+                *routes.write().await = replacement;
+            })
+        };
+        clear.await.unwrap();
+        map.await.unwrap();
+        assert!(routes.read().await.exit_node().is_none());
+        assert!(!routes.read().await.exit_node_requested());
     }
 
     #[test]

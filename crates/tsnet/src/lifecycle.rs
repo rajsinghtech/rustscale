@@ -297,6 +297,7 @@ impl Server {
             b.raw_peers.clone(),
             b.peers.clone(),
             b.route_table.clone(),
+            b.exit_map_gate.clone(),
             None,
             prefs.clone(),
             exit_node_selection.clone(),
@@ -606,6 +607,7 @@ impl Server {
                 netstack: Some(netstack.clone()),
                 filter: std::sync::OnceLock::new(),
                 route_table: Some(b.route_table.clone()),
+                exit_map_gate: b.exit_map_gate.clone(),
                 router: None,
                 logout_trigger: self
                     .pre_started
@@ -656,6 +658,7 @@ impl Server {
             routecheck: b.routecheck,
             route_table: b.route_table,
             filter: b.filter,
+            exit_map_gate: b.exit_map_gate,
             router: None,
             cancel: b.cancel,
             tasks: Mutex::new(tasks),
@@ -707,14 +710,16 @@ impl Server {
 
         // A persisted selection retries only while it is unresolved. Once it
         // resolves, later map rebuilds retain the route-table owner.
-        let (peers, route_table, peer_map) = match self.inner.as_ref() {
+        let (peers, route_table, exit_map_gate, peer_map) = match self.inner.as_ref() {
             Some(inner) => (
                 inner.peers.clone(),
                 inner.route_table.clone(),
+                inner.exit_map_gate.clone(),
                 inner.peer_map.clone(),
             ),
             None => return Ok(self.status()),
         };
+        let _exit_map_guard = exit_map_gate.lock().await;
         let _map_commit = peer_map.gate.write().await;
         let peers = peers.read().await;
         let mut selection = exit_node_selection.write().await;
@@ -761,6 +766,9 @@ impl Server {
         )
         .await;
 
+        // Serialize startup selection with the same mutation domain used once
+        // the map task starts.
+        let exit_map_guard = b.exit_map_gate.lock().await;
         // Resolve and apply the exit node selection from TunModeConfig, if
         // set. This sets the in-process RouteTable's exit node so the data
         // pump routes non-tailnet traffic to the exit peer. OS-level
@@ -789,6 +797,7 @@ impl Server {
             let mut routes = b.route_table.write().await;
             exit_node_selection.write().await.retry(&peers, &mut routes);
         }
+        drop(exit_map_guard);
 
         // Real TUN device (macOS/Linux only; on other platforms
         // `create_tun_device` returns an error and `?` propagates it).
@@ -880,6 +889,7 @@ impl Server {
             b.raw_peers.clone(),
             b.peers.clone(),
             b.route_table.clone(),
+            b.exit_map_gate.clone(),
             router.clone(),
             prefs.clone(),
             exit_node_selection.clone(),
@@ -1157,6 +1167,7 @@ impl Server {
                 netstack: None, // TUN mode has no netstack
                 filter: std::sync::OnceLock::new(),
                 route_table: Some(b.route_table.clone()),
+                exit_map_gate: b.exit_map_gate.clone(),
                 router: router.clone(),
                 logout_trigger: self
                     .pre_started
@@ -1240,6 +1251,7 @@ impl Server {
             routecheck: b.routecheck,
             route_table: b.route_table,
             filter: b.filter,
+            exit_map_gate: b.exit_map_gate,
             router,
             cancel: b.cancel,
             tasks: Mutex::new(tasks),
@@ -1291,19 +1303,29 @@ impl Server {
 
         // TUN config owns a selection made above; otherwise retry only an
         // unresolved persisted selection.
-        let (peers, route_table, router, tailscale_ips, magicsock, live_prefs, peer_map) =
-            match self.inner.as_ref() {
-                Some(inner) => (
-                    inner.peers.clone(),
-                    inner.route_table.clone(),
-                    inner.router.clone(),
-                    inner.tailscale_ips.clone(),
-                    inner.magicsock.clone(),
-                    inner.prefs.clone(),
-                    inner.peer_map.clone(),
-                ),
-                None => return Ok(self.status()),
-            };
+        let (
+            peers,
+            route_table,
+            router,
+            tailscale_ips,
+            magicsock,
+            live_prefs,
+            exit_map_gate,
+            peer_map,
+        ) = match self.inner.as_ref() {
+            Some(inner) => (
+                inner.peers.clone(),
+                inner.route_table.clone(),
+                inner.router.clone(),
+                inner.tailscale_ips.clone(),
+                inner.magicsock.clone(),
+                inner.prefs.clone(),
+                inner.exit_map_gate.clone(),
+                inner.peer_map.clone(),
+            ),
+            None => return Ok(self.status()),
+        };
+        let _exit_map_guard = exit_map_gate.lock().await;
         let _map_commit = peer_map.gate.write().await;
         let peers = peers.read().await;
         let exit_node_allow_lan_access = live_prefs.read().await.ExitNodeAllowLANAccess;
@@ -1503,6 +1525,7 @@ impl Server {
             netstack: None,
             filter: std::sync::OnceLock::new(),
             route_table: None,
+            exit_map_gate: Arc::new(tokio::sync::Mutex::new(())),
             router: None,
             logout_trigger: logout_trigger.clone(),
             suggested_exit_node: Arc::new(RwLock::new(String::new())),
@@ -2295,6 +2318,7 @@ impl Server {
             &peers,
             self.config.accept_routes,
         )));
+        let exit_map_gate = Arc::new(tokio::sync::Mutex::new(()));
         let cancel = Arc::new(CancelToken::new());
 
         // Build the initial packet filter from the first MapResponse. Add our
@@ -2422,6 +2446,7 @@ impl Server {
             peer_map,
             routecheck,
             route_table,
+            exit_map_gate,
             cancel,
             map_rx,
             map_tasks,

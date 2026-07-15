@@ -71,6 +71,8 @@ def runtime_metadata(run):
     legacy = {"rs_tun_inbound_pipeline"}
     if not isinstance(runtime, dict) or set(runtime) not in (required, legacy) or any(type(value) is not bool for value in runtime.values()):
         raise ValueError("invalid runtime metadata")
+    if set(runtime) == required and not runtime["linux_udp_batch"] and runtime["linux_udp_gro"]:
+        raise ValueError("linux_udp_gro requires linux_udp_batch")
     return runtime
 
 

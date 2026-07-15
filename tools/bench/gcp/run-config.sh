@@ -120,10 +120,12 @@ rs_tun_inbound_pipeline_self_test() {
 
 linux_udp_receive_modes_self_test() {
   local actual status
-  actual=$(export RS_LINUX_UDP_BATCH=1 RS_LINUX_UDP_GRO=0; configure_linux_udp_receive_modes; printf '%s/%s' "$RS_LINUX_UDP_BATCH" "$RS_LINUX_UDP_GRO") || return 1
-  [[ "$actual" == 1/0 ]] || return 1
-  actual=$(unset RS_LINUX_UDP_BATCH RS_LINUX_UDP_GRO; configure_linux_udp_receive_modes; printf '%s/%s' "$RS_LINUX_UDP_BATCH" "$RS_LINUX_UDP_GRO") || return 1
-  [[ "$actual" == 1/1 ]] || return 1
+  for actual in 0/0 1/0 1/1; do
+    local batch="${actual%/*}" gro="${actual#*/}"
+    [[ "$(export RS_LINUX_UDP_BATCH="$batch" RS_LINUX_UDP_GRO="$gro"; configure_linux_udp_receive_modes; printf '%s/%s' "$RS_LINUX_UDP_BATCH" "$RS_LINUX_UDP_GRO")" == "$actual" ]] || return 1
+  done
+  if ( export RS_LINUX_UDP_BATCH=0 RS_LINUX_UDP_GRO=1; configure_linux_udp_receive_modes ) >/dev/null 2>&1; then return 1; else status=$?; fi
+  (( status == 2 )) || return 1
   for variable in RS_LINUX_UDP_BATCH RS_LINUX_UDP_GRO; do
     if ( export "$variable"=invalid; configure_linux_udp_receive_modes ) >/dev/null 2>&1; then return 1; else status=$?; fi
     (( status == 2 )) || return 1
@@ -446,6 +448,7 @@ linux_udp_receive_environment() {
   local batch="$1" gro="$2" environment=""
   [[ "$batch" == 0 || "$batch" == 1 ]] || return 2
   [[ "$gro" == 0 || "$gro" == 1 ]] || return 2
+  [[ "$batch" != 0 || "$gro" == 0 ]] || return 2
   [[ "$batch" == 0 ]] && environment="RUSTSCALE_DISABLE_LINUX_UDP_BATCH=1 $environment"
   [[ "$gro" == 0 ]] && environment="RUSTSCALE_DISABLE_UDP_GRO=1 $environment"
   printf '%s' "$environment"
@@ -456,6 +459,7 @@ rs_tun_daemon_start_command() {
   [[ "$pipeline" == 0 || "$pipeline" == 1 ]] || return 2
   [[ "$batch" == 0 || "$batch" == 1 ]] || return 2
   [[ "$gro" == 0 || "$gro" == 1 ]] || return 2
+  [[ "$batch" != 0 || "$gro" == 0 ]] || return 2
   validate_rs_tun_daemon_input "$authkey" "$hostname" || return $?
   environment="$(linux_udp_receive_environment "$batch" "$gro")TS_AUTHKEY=$authkey "
   [[ "$pipeline" == 1 ]] && environment="RUSTSCALE_TUN_INBOUND_PIPELINE=1 $environment"
@@ -492,6 +496,8 @@ command_shape_self_test() {
   [[ "$rs_server_scalar" == 'RUSTSCALE_DISABLE_UDP_GRO=1 RUSTSCALE_DISABLE_LINUX_UDP_BATCH=1 TS_AUTHKEY=tskey-auth-selftest nohup /opt/rustscale/target/release/rustscaled run --tun --statedir /tmp/srv --socket /tmp/srv.sock --hostname srv > /tmp/srv.log 2>&1 & echo $! > /tmp/srv.pid' ]] || return 1
   rs_server_plain=$(rs_tun_daemon_start_command 0 1 0 tskey-auth-selftest /tmp/srv /tmp/srv.sock srv /tmp/srv.log /tmp/srv.pid)
   [[ "$rs_server_plain" == 'RUSTSCALE_DISABLE_UDP_GRO=1 TS_AUTHKEY=tskey-auth-selftest nohup /opt/rustscale/target/release/rustscaled run --tun --statedir /tmp/srv --socket /tmp/srv.sock --hostname srv > /tmp/srv.log 2>&1 & echo $! > /tmp/srv.pid' ]] || return 1
+  if rs_tun_daemon_start_command 0 0 1 tskey-auth-selftest /tmp/srv /tmp/srv.sock srv /tmp/srv.log /tmp/srv.pid >/dev/null 2>&1; then return 1; else status=$?; fi
+  (( status == 2 )) || return 1
 }
 
 pid_capture_semantics_self_test() {

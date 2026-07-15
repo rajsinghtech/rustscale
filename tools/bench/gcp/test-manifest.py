@@ -112,6 +112,14 @@ with tempfile.TemporaryDirectory() as tmp:
     assert all(type(value) is int for value in manifest["parallelism"])
     assert len(json.loads(result.stdout)) == 1
 
+    # A full current runtime object must still describe a realizable receive
+    # mode. Scalar batch mode cannot claim that GRO was active.
+    impossible = Path(tmp) / "impossible-runtime" / run_identity()["id"]; impossible.mkdir(parents=True)
+    impossible_identity = run_identity()
+    impossible_identity["runtime"] = {"rs_tun_inbound_pipeline": False, "linux_udp_batch": False, "linux_udp_gro": True}
+    matrix(impossible, identity=impossible_identity)
+    assert "linux_udp_gro requires linux_udp_batch" in run("python3", GCP / "provenance.py", "validate", "--manifest", impossible / "matrix.json", ok=False).stderr
+
     # Historical schema-v2 manifests can omit runtime metadata entirely. They
     # remain readable and aggregate without assigning unrecorded modes, but
     # cannot be used to launch a new paid cell.

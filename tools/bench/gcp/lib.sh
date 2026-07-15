@@ -47,6 +47,10 @@ configure_linux_udp_receive_modes() {
     0|1) export RS_LINUX_UDP_GRO ;;
     *) echo "RS_LINUX_UDP_GRO must be 0 or 1" >&2; return 2 ;;
   esac
+  if [[ "$RS_LINUX_UDP_BATCH" == 0 && "$RS_LINUX_UDP_GRO" == 1 ]]; then
+    echo "RS_LINUX_UDP_GRO=1 requires RS_LINUX_UDP_BATCH=1" >&2
+    return 2
+  fi
 }
 
 # SSH connection cache (populated by ssh_cmd on first use per VM).

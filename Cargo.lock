@@ -3532,6 +3532,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustscale-netstat"
+version = "0.1.1"
+dependencies = [
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "rustscale-packet"
 version = "0.1.1"
 

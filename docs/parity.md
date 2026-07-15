@@ -99,7 +99,7 @@ real JSON).
 | Log policy / logtail setup | `logpolicy/` | ✅ `crates/logpolicy`: Go-compatible persisted `rustscaled.log.conf`, state-dir `logid-private` reuse, `TS_LOGS_DIR`/`TS_LOG_TARGET`, and daemon startup/shutdown wiring |
 | Packet parsing (headers) | `net/packet/` | ✅ `crates/packet`: IPv4Header, IPv6Header, ICMPHeader, UDPHeader, TCPFlag, Parsed rich decoded view, parse_packet(); GENEVE in udprelay |
 | DNS name utilities | `util/dnsname/` | ✅ `crates/dnsname`: `Fqdn` type (always-dot-terminated), `to_fqdn`/`valid_label`/`valid_hostname`/`sanitize_label`/`sanitize_hostname`/`has_suffix`/`trim_suffix`/`trim_common_suffixes`/`first_label`/`num_labels`/`contains`/`parent`; full Go table tests ported; adopted by `tailcfg::service::validate_dns_label`, `dns::peer_matches`, and `tsnet` first-label call sites |
-| TLS dial config | `net/tlsdial/` | 🔶 tls_config() in DERP client + controlhttp + ACME; no unified tlsdial module |
+| TLS dial config | `net/tlsdial/` | ✅ `crates/tlsdial`: unified roots, ALPN, SNI/expected-name verification, optional certificate pinning, handshake deadlines, error classification, and certificate diagnostics adopted by control HTTP and DERP; ACME remains protocol-specific |
 | Network utility functions | `net/netutil/` | 🔶 proxy protocol detection in service.rs; interface helpers in netmon/netns; no consolidated crate |
 | Socket options | `net/sockopts/` | ✅ SO_MARK + SO_BINDTODEVICE in `crates/netns/src/linux.rs` |
 | TCP connection table | `net/netstat/` | 🔶 `crates/tcpinfo` iterates FDs 0..1000 on macOS; no full OS TCP connection enumeration |

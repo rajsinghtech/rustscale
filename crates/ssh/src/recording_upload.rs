@@ -48,6 +48,17 @@ impl UploadAbort {
     pub fn abort(&self) {
         self.cancel.send_replace(true);
     }
+
+    #[cfg(test)]
+    pub(crate) fn test_handle() -> Self {
+        let (cancel, _) = watch::channel(false);
+        Self { cancel }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_aborted(&self) -> bool {
+        *self.cancel.borrow()
+    }
 }
 
 pub struct RecordingConnection {

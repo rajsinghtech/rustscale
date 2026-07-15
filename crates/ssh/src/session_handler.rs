@@ -54,15 +54,7 @@ pub async fn init_recording(
         return recording_connect_failed(config, "no recorder dialer configured");
     };
     match crate::recording_upload::connect_to_recorder(&config.recorders, dial).await {
-        Ok(connection) => SessionRecorder::with_upload(
-            connection.writer,
-            connection.result_rx,
-            connection.abort,
-            cast_header,
-            config.fail_open,
-        )
-        .map(Some)
-        .map_err(|_| "remote recording could not start".to_string()),
+        Ok(connection) => initialize_upload_recording(config, cast_header, connection),
         Err((attempts, error)) => {
             let _ = error;
             log::warn!(
@@ -71,6 +63,29 @@ pub async fn init_recording(
             );
             recording_connect_failed(config, "recorder connection failed")
         }
+    }
+}
+
+fn initialize_upload_recording(
+    config: &RecordingConfig,
+    cast_header: CastHeader,
+    connection: crate::recording_upload::RecordingConnection,
+) -> Result<Option<SessionRecorder>, String> {
+    let abort = connection.abort.clone();
+    if let Ok(recorder) = SessionRecorder::with_upload(
+        connection.writer,
+        connection.result_rx,
+        connection.abort,
+        cast_header,
+        config.fail_open,
+    ) {
+        Ok(Some(recorder))
+    } else {
+        // Header/enqueue initialization can fail after transport connection.
+        // Abort the partial upload before applying the same fail-open/
+        // fail-closed policy as connect failures.
+        abort.abort();
+        recording_connect_failed(config, "remote recording could not start")
     }
 }
 
@@ -458,6 +473,7 @@ pub(crate) struct LaunchedSession {
 struct ProcessCleanupCommand {
     control: Arc<dyn ProcessControl>,
     wait: Option<ChildWait>,
+    signal_group: bool,
 }
 
 #[cfg(unix)]
@@ -477,18 +493,21 @@ fn process_cleanup_supervisor() -> &'static tokio::sync::mpsc::UnboundedSender<P
                 runtime.block_on(async move {
                     while let Some(mut command) = rx.recv().await {
                         tokio::spawn(async move {
-                            let _ = command.control.signal_group(libc::SIGTERM);
-                            tokio::time::sleep(PROCESS_TERM_TIMEOUT).await;
-                            let _ = command.control.signal_group(libc::SIGKILL);
-                            let disappear = async {
-                                loop {
-                                    if matches!(command.control.group_exists(), Ok(false)) {
-                                        break;
+                            if command.signal_group {
+                                let _ = command.control.signal_group(libc::SIGTERM);
+                                tokio::time::sleep(PROCESS_TERM_TIMEOUT).await;
+                                let _ = command.control.signal_group(libc::SIGKILL);
+                                let disappear = async {
+                                    loop {
+                                        if matches!(command.control.group_exists(), Ok(false)) {
+                                            break;
+                                        }
+                                        tokio::time::sleep(std::time::Duration::from_millis(25))
+                                            .await;
                                     }
-                                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-                                }
-                            };
-                            let _ = tokio::time::timeout(PROCESS_KILL_TIMEOUT, disappear).await;
+                                };
+                                let _ = tokio::time::timeout(PROCESS_KILL_TIMEOUT, disappear).await;
+                            }
                             if let Some(wait) = command.wait.as_mut() {
                                 let _ = tokio::time::timeout(PROCESS_KILL_TIMEOUT, wait).await;
                             }
@@ -531,6 +550,7 @@ impl Drop for ProcessCleanupGuard {
             let _ = process_cleanup_supervisor().send(ProcessCleanupCommand {
                 control: self.control.clone(),
                 wait: self.wait.take(),
+                signal_group: true,
             });
         }
     }
@@ -540,6 +560,7 @@ impl Drop for ProcessCleanupGuard {
 #[derive(Default)]
 struct LaunchOwnershipState {
     canceled: bool,
+    cleanup_signaled: bool,
     control: Option<Arc<dyn ProcessControl>>,
 }
 
@@ -566,6 +587,15 @@ impl LaunchAbortGuard {
         self.armed = false;
         self.state.lock().unwrap().control = None;
     }
+
+    fn transfer_to_cleanup(&mut self) -> LaunchCleanupOwner {
+        self.armed = false;
+        let owner = LaunchCleanupOwner {
+            state: self.state.clone(),
+        };
+        owner.cancel();
+        owner
+    }
 }
 
 #[cfg(unix)]
@@ -573,14 +603,77 @@ fn publish_launch_control(
     state: &Arc<Mutex<LaunchOwnershipState>>,
     control: Arc<dyn ProcessControl>,
 ) {
-    let mut state = state.lock().unwrap();
-    if state.canceled {
+    let cleanup = {
+        let mut state = state.lock().unwrap();
+        if state.canceled {
+            if state.cleanup_signaled {
+                None
+            } else {
+                state.cleanup_signaled = true;
+                Some(control)
+            }
+        } else if state.control.is_none() {
+            state.control = Some(control);
+            None
+        } else {
+            None
+        }
+    };
+    if let Some(control) = cleanup {
         let _ = process_cleanup_supervisor().send(ProcessCleanupCommand {
             control,
             wait: None,
+            signal_group: true,
         });
-    } else {
-        state.control = Some(control);
+    }
+}
+
+#[cfg(unix)]
+struct LaunchCleanupOwner {
+    state: Arc<Mutex<LaunchOwnershipState>>,
+}
+
+#[cfg(unix)]
+impl LaunchCleanupOwner {
+    fn cancel(&self) {
+        let cleanup = {
+            let mut state = self.state.lock().unwrap();
+            state.canceled = true;
+            if state.cleanup_signaled {
+                None
+            } else {
+                let control = state.control.take();
+                if control.is_some() {
+                    state.cleanup_signaled = true;
+                }
+                control
+            }
+        };
+        if let Some(control) = cleanup {
+            let _ = process_cleanup_supervisor().send(ProcessCleanupCommand {
+                control,
+                wait: None,
+                signal_group: true,
+            });
+        }
+    }
+
+    fn adopt_result(&self, launched: LaunchedSession) {
+        let signal_group = {
+            let mut state = self.state.lock().unwrap();
+            state.control = None;
+            if state.cleanup_signaled {
+                false
+            } else {
+                state.cleanup_signaled = true;
+                true
+            }
+        };
+        let _ = process_cleanup_supervisor().send(ProcessCleanupCommand {
+            control: launched.control,
+            wait: Some(launched.wait),
+            signal_group,
+        });
     }
 }
 
@@ -588,14 +681,10 @@ fn publish_launch_control(
 impl Drop for LaunchAbortGuard {
     fn drop(&mut self) {
         if self.armed {
-            let mut state = self.state.lock().unwrap();
-            state.canceled = true;
-            if let Some(control) = state.control.take() {
-                let _ = process_cleanup_supervisor().send(ProcessCleanupCommand {
-                    control,
-                    wait: None,
-                });
+            LaunchCleanupOwner {
+                state: self.state.clone(),
             }
+            .cancel();
         }
     }
 }
@@ -982,30 +1071,26 @@ pub(crate) async fn run_session_with(
         )
     });
     let (launch_result_tx, mut launch_result_rx) = tokio::sync::oneshot::channel();
+    let result_cleanup = LaunchCleanupOwner {
+        state: launch_abort.publisher(),
+    };
     tokio::spawn(async move {
         let result = match raw_launch_task.await {
             Ok(result) => result,
             Err(error) => Err(io::Error::other(error.to_string()).into()),
         };
         if let Err(Ok(launched)) = launch_result_tx.send(result) {
-            let _ = process_cleanup_supervisor().send(ProcessCleanupCommand {
-                control: launched.control,
-                wait: Some(launched.wait),
-            });
+            result_cleanup.adopt_result(launched);
         }
     });
     let launch_timeout = tokio::time::sleep(BLOCKING_PHASE_TIMEOUT);
     tokio::pin!(launch_timeout);
-    let mut started_control = None;
     let mut started_open = true;
     let launch_result = loop {
         tokio::select! {
             result = &mut launch_result_rx => break Ok(result),
-            started = &mut started_rx, if started_open => {
+            _ = &mut started_rx, if started_open => {
                 started_open = false;
-                if let Ok(control) = started {
-                    started_control = Some(control);
-                }
             }
             cause = lifecycle.cancellation() => break Err(cause),
             () = &mut launch_timeout => break Err(CancellationCause::BlockerTimeout),
@@ -1025,11 +1110,8 @@ pub(crate) async fn run_session_with(
             .await;
         }
         Err(cause) => {
-            tokio::spawn(supervise_canceled_launch(
-                started_control,
-                started_open.then_some(started_rx),
-                launch_result_rx,
-            ));
+            let cleanup_owner = launch_abort.transfer_to_cleanup();
+            tokio::spawn(supervise_canceled_launch(cleanup_owner, launch_result_rx));
             return finish_prelaunch_cancellation(&mut session, cause).await;
         }
     };
@@ -1398,97 +1480,22 @@ async fn send_cancellation(
 
 #[cfg(unix)]
 async fn supervise_canceled_launch(
-    mut control: Option<Arc<dyn ProcessControl>>,
-    started_rx: Option<tokio::sync::oneshot::Receiver<Arc<dyn ProcessControl>>>,
+    cleanup: LaunchCleanupOwner,
     mut launch_result_rx: tokio::sync::oneshot::Receiver<
         Result<LaunchedSession, SessionHandlerError>,
     >,
 ) {
-    if control.is_none() {
-        if let Some(mut started_rx) = started_rx {
-            tokio::select! {
-                started = &mut started_rx => {
-                    control = started.ok();
-                }
-                result = &mut launch_result_rx => {
-                    if let Ok(Ok(launched)) = result {
-                        supervise_late_launch(launched).await;
-                    }
-                    return;
-                }
-            }
-        }
-    }
-
-    let Some(control) = control else {
-        let _ = launch_result_rx.await;
-        return;
-    };
-    let _ = control.signal_group(libc::SIGTERM);
-    tokio::time::sleep(PROCESS_TERM_TIMEOUT).await;
-    let _ = control.signal_group(libc::SIGKILL);
-    let verify = async {
-        loop {
-            if matches!(control.group_exists(), Ok(false)) {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
-    };
-    if tokio::time::timeout(PROCESS_KILL_TIMEOUT, verify)
-        .await
-        .is_err()
-    {
-        log::warn!("canceled SSH setup left a persistent process group after SIGKILL");
-    }
-
-    match tokio::time::timeout(PROCESS_KILL_TIMEOUT, &mut launch_result_rx).await {
-        Ok(Ok(Ok(mut launched))) => {
-            launched.input = None;
-            launched.output = None;
-            launched.stderr = None;
-            if tokio::time::timeout(PROCESS_KILL_TIMEOUT, &mut launched.wait)
-                .await
-                .is_err()
-            {
-                log::warn!("canceled SSH setup child could not be reaped");
-            }
-        }
-        Err(_) => log::warn!("canceled SSH setup did not return after process-group cleanup"),
+    match tokio::time::timeout(BLOCKING_PHASE_TIMEOUT, &mut launch_result_rx).await {
+        Ok(Ok(Ok(launched))) => cleanup.adopt_result(launched),
         Ok(_) => {}
-    }
-}
-
-#[cfg(unix)]
-async fn supervise_late_launch(mut launched: LaunchedSession) {
-    launched.input = None;
-    launched.output = None;
-    launched.stderr = None;
-    let _ = launched.control.signal_group(libc::SIGTERM);
-    tokio::time::sleep(PROCESS_TERM_TIMEOUT).await;
-    let _ = launched.control.signal_group(libc::SIGKILL);
-
-    let verify = async {
-        loop {
-            match launched.control.group_exists() {
-                Ok(false) => break,
-                Ok(true) | Err(_) => {
-                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-                }
+        Err(_) => {
+            // If completion raced the timeout, atomically claim its result;
+            // otherwise dropping the receiver transfers any later result to
+            // the sender-side cleanup owner.
+            if let Ok(Ok(launched)) = launch_result_rx.try_recv() {
+                cleanup.adopt_result(launched);
             }
         }
-    };
-    if tokio::time::timeout(PROCESS_KILL_TIMEOUT, verify)
-        .await
-        .is_err()
-    {
-        log::warn!("canceled SSH launch left a persistent process group after SIGKILL");
-    }
-    if tokio::time::timeout(PROCESS_KILL_TIMEOUT, &mut launched.wait)
-        .await
-        .is_err()
-    {
-        log::warn!("canceled SSH launch child could not be reaped");
     }
 }
 
@@ -1710,6 +1717,62 @@ mod tests {
             after <= baseline + 3,
             "PTY descriptors grew across recorder failures: {baseline} -> {after}"
         );
+    }
+
+    #[tokio::test]
+    async fn upload_header_failure_honors_fail_open_without_partial_recorder() {
+        struct ClosedWriter;
+        impl std::io::Write for ClosedWriter {
+            fn write(&mut self, _data: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed recorder"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed recorder"))
+            }
+        }
+        let header = || {
+            CastHeader::new(
+                (0, 0),
+                "command".into(),
+                std::collections::HashMap::new(),
+                "requested".into(),
+                "mapped".into(),
+                "connection".into(),
+            )
+        };
+        let connection = || {
+            let (_result_tx, result_rx) = tokio::sync::oneshot::channel();
+            let abort = crate::recording_upload::UploadAbort::test_handle();
+            (
+                crate::recording_upload::RecordingConnection {
+                    writer: Box::new(ClosedWriter),
+                    result_rx,
+                    attempts: Vec::new(),
+                    abort: abort.clone(),
+                },
+                abort,
+            )
+        };
+        let fail_open = RecordingConfig {
+            fail_open: true,
+            ..Default::default()
+        };
+        let (connected, abort) = connection();
+        assert!(initialize_upload_recording(&fail_open, header(), connected)
+            .unwrap()
+            .is_none());
+        assert!(abort.is_aborted());
+
+        let fail_closed = RecordingConfig {
+            fail_open: false,
+            ..Default::default()
+        };
+        let (connected, abort) = connection();
+        match initialize_upload_recording(&fail_closed, header(), connected) {
+            Err(error) => assert_eq!(error, "recording required"),
+            Ok(_) => panic!("partial fail-closed recorder unexpectedly succeeded"),
+        }
+        assert!(abort.is_aborted());
     }
 
     #[tokio::test]

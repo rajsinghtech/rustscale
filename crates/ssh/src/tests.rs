@@ -1645,6 +1645,22 @@ async fn duration_kills_post_fork_child_while_launch_return_is_blocked() {
     .await
     .expect("post-fork child was not killed while launch remained blocked");
     gate.release();
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while !inner
+            .input_dropped
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("late launch result was not transferred to cleanup");
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert_eq!(
+        &*inner.control.signals.lock().unwrap(),
+        &[libc::SIGTERM, libc::SIGKILL],
+        "launch cancellation must have exactly one signaling owner"
+    );
 }
 
 #[tokio::test]

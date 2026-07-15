@@ -104,7 +104,7 @@ real JSON).
 | Socket options | `net/sockopts/` | ✅ SO_MARK + SO_BINDTODEVICE in `crates/netns/src/linux.rs` |
 | TCP connection table | `net/netstat/` | 🔶 `crates/tcpinfo` iterates FDs 0..1000 on macOS; no full OS TCP connection enumeration |
 | TCP keepalive timeout | `net/ktimeout/` | ✅ `crates/ktimeout` applies Linux `TCP_USER_TIMEOUT=15s` to each accepted in-process DERP server connection (no-op on other platforms) |
-| Speedtest protocol | `net/speedtest/` | ✅ `crates/speedtest`: v2 newline-JSON control messages and raw 2 MiB data blocks, upload/download direction reversal, 1s interval plus total measurement semantics, decimal throughput helpers; strict 5–30s/control-frame/result/concurrency bounds, monotonic deadlines, cancellation, partial-I/O and malformed/truncated-peer handling; hermetic duplex/wire-vector tests. Live Go-process interop is deferred; no CLI was added because upstream keeps its command separate and experimental. |
+| Speedtest protocol | `net/speedtest/` | ✅ `crates/speedtest`: v2 newline-JSON control messages and raw 2 MiB data blocks, upload/download direction reversal, 1s interval plus total measurement semantics, decimal throughput helpers; strict 5–30s/control-frame/result/concurrency bounds, monotonic deadlines, cancellation, partial-I/O and malformed/truncated-peer handling; hermetic duplex/wire-vector tests plus bounded-server admission/isolation/drain coverage. `rustscale speedtest` provides client and bounded server modes. Live Go-process interop is deferred. |
 | Desktop integration | `ipn/desktop/` | ✅ `crates/tsnet/src/hostinfo.rs`: reads `/proc/net/unix` for .X11-unix / wayland-1 socket detection |
 | Alternative routing table | `net/art/` | ⬜ |
 | BIRD routing client | `chirp/` | ✅ `crates/chirp`: async BIRD control-socket client with response framing, protocol enable/disable, validated IPv4/IPv6 route updates, reconnects, deadlines, and hermetic partial-I/O/error tests |
@@ -237,6 +237,7 @@ state-dir fallback probing), `--json`.
 | `health` | — | ✅ health warnings from daemon; `--json` |
 | `down` | `cli/down.go` | ✅ EditPrefs WantRunning=false via PATCH /prefs |
 | `ping` | `cli/ping.go` | ✅ disco/icmp/tsmp/peerapi via LocalAPI /ping; DERP bootstrap + forced direct discovery (2026-07-13) |
+| `speedtest` | `cmd/speedtest/` | ✅ standalone client/server command; server uses `speedtest::Server` bounded admission and Ctrl-C cancellation/draining |
 | `up` | `cli/up.go` | ✅ full runUp sequence (status → build prefs → watch-ipn-bus → /start → login-interactive → BrowseToURL → Running); flags: --auth-key, --hostname, --advertise-routes, --advertise-exit-node, --exit-node, --shields-up, --accept-routes, --accept-dns, --reset, --force-reauth, --timeout, --json, --qr |
 | `login` | `cli/login.go` | ✅ login-interactive + watch-ipn-bus for BrowseToURL/Running; --qr |
 | `logout` | `cli/logout.go` | ✅ POST /logout |

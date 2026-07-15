@@ -183,12 +183,20 @@ pub async fn run(args: Vec<String>, _socket: &Path) -> Result<(), CliError> {
     if parsed.server {
         let listener = TcpListener::bind(&parsed.host).await?;
         println!("listening on {}", listener.local_addr()?);
-        loop {
-            let (mut stream, _) = listener.accept().await?;
-            tokio::spawn(async move {
-                let _ = speedtest::handle_connection(&mut stream).await;
-            });
-        }
+
+        let server = speedtest::Server::default();
+        let cancellation = speedtest::CancellationToken::new();
+        let serving = server.serve(listener, cancellation.clone());
+        tokio::pin!(serving);
+        return tokio::select! {
+            result = &mut serving => result.map_err(|error| CliError(error.to_string())),
+            signal = tokio::signal::ctrl_c() => {
+                cancellation.cancel();
+                let server_result = serving.await.map_err(|error| CliError(error.to_string()));
+                signal?;
+                server_result
+            }
+        };
     }
 
     if !(speedtest::MIN_DURATION..=speedtest::MAX_DURATION).contains(&parsed.duration) {

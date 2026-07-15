@@ -16,6 +16,7 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use url::Url;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Default API/control base used when no URL is supplied.
 pub const DEFAULT_CONTROL_URL: &str = "https://controlplane.tailscale.com";
@@ -209,6 +210,7 @@ pub enum Error {
         status: u16,
     },
     MalformedResponse(&'static str),
+    OAuthError,
     EmptyAccessToken,
     EmptyAuthKey,
     TokenExchange(String),
@@ -240,6 +242,7 @@ impl fmt::Display for Error {
             Self::MalformedResponse(operation) => {
                 write!(f, "malformed {operation} response")
             }
+            Self::OAuthError => f.write_str("token exchange returned an OAuth error"),
             Self::EmptyAccessToken => f.write_str("received empty access token from Tailscale"),
             Self::EmptyAuthKey => f.write_str("received empty authkey from control server"),
             Self::TokenExchange(error) => {
@@ -311,7 +314,7 @@ impl FederationClient {
             return Ok(String::new());
         }
 
-        let token = if id_token.is_empty() {
+        let token = Zeroizing::new(if id_token.is_empty() {
             if audience.is_empty() {
                 return Err(Error::MissingTokenOrAudience);
             }
@@ -326,7 +329,7 @@ impl FederationClient {
             }
         } else {
             id_token.to_owned()
-        };
+        });
 
         if tags.is_empty() {
             return Err(Error::MissingTags);
@@ -334,10 +337,11 @@ impl FederationClient {
 
         let attributes = parse_optional_attributes(client_id)
             .map_err(|error| Error::InvalidOptionalAttributes(error.to_string()))?;
-        let access_token = self
-            .exchange_jwt_for_token(base_url, &attributes.client_id, &token)
-            .await
-            .map_err(|error| Error::TokenExchange(error.to_string()))?;
+        let access_token = Zeroizing::new(
+            self.exchange_jwt_for_token(base_url, &attributes.client_id, &token)
+                .await
+                .map_err(|error| Error::TokenExchange(error.to_string()))?,
+        );
         if access_token.is_empty() {
             return Err(Error::EmptyAccessToken);
         }
@@ -508,9 +512,21 @@ impl HttpClient for UnavailableHttpClient {
 struct TokenResponse {
     #[serde(default)]
     access_token: String,
+    #[serde(default)]
+    error: String,
+    #[serde(default)]
+    error_description: String,
+    #[serde(default)]
+    error_uri: String,
 }
 
-fn parse_token_response(response: HttpResponse) -> Result<String, Error> {
+fn parse_token_response(mut response: HttpResponse) -> Result<String, Error> {
+    let result = parse_token_response_inner(&response);
+    response.body.zeroize();
+    result
+}
+
+fn parse_token_response_inner(response: &HttpResponse) -> Result<String, Error> {
     if !(200..=299).contains(&response.status) {
         return Err(Error::HttpStatus {
             operation: "token exchange",
@@ -526,17 +542,44 @@ fn parse_token_response(response: HttpResponse) -> Result<String, Error> {
         .unwrap_or_default()
         .trim()
         .to_ascii_lowercase();
-    if matches!(
+    let access_token = if matches!(
         media_type.as_str(),
         "application/x-www-form-urlencoded" | "text/plain"
     ) {
-        let values =
+        let mut values =
             parse_query(&response.body).map_err(|_| Error::MalformedResponse("token exchange"))?;
-        return Ok(values.get("access_token").cloned().unwrap_or_default());
+        let has_error = values.get("error").is_some_and(|error| !error.is_empty());
+        let mut access_token = values.remove("access_token").unwrap_or_default();
+        for value in values.values_mut() {
+            value.zeroize();
+        }
+        if has_error {
+            access_token.zeroize();
+            return Err(Error::OAuthError);
+        }
+        access_token
+    } else {
+        let TokenResponse {
+            mut access_token,
+            mut error,
+            mut error_description,
+            mut error_uri,
+        } = serde_json::from_slice(&response.body)
+            .map_err(|_| Error::MalformedResponse("token exchange"))?;
+        let has_error = !error.is_empty();
+        error.zeroize();
+        error_description.zeroize();
+        error_uri.zeroize();
+        if has_error {
+            access_token.zeroize();
+            return Err(Error::OAuthError);
+        }
+        access_token
+    };
+    if access_token.is_empty() {
+        return Err(Error::EmptyAccessToken);
     }
-    let token: TokenResponse = serde_json::from_slice(&response.body)
-        .map_err(|_| Error::MalformedResponse("token exchange"))?;
-    Ok(token.access_token)
+    Ok(access_token)
 }
 
 #[derive(Serialize)]

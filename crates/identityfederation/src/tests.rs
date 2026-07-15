@@ -353,6 +353,99 @@ async fn oauth_auth_style_fallback_removes_basic_header() {
 }
 
 #[tokio::test]
+async fn oauth_2xx_errors_are_rejected_and_sanitized() {
+    let http = FakeHttp::new(vec![
+        response(
+            200,
+            "application/json",
+            br#"{"error":"invalid_grant","error_description":"secret-jwt","error_uri":"https://errors.example/secret","access_token":"must-not-win"}"#,
+        ),
+        response(
+            200,
+            "application/json",
+            br#"{"access_token":"fallback-token"}"#,
+        ),
+    ]);
+    let client = test_client(http.clone());
+    assert_eq!(
+        client
+            .exchange_jwt_for_token("http://127.0.0.1:1234", "client", "secret-jwt")
+            .await
+            .unwrap(),
+        "fallback-token"
+    );
+    assert_eq!(http.take_requests().len(), 2);
+
+    let http = FakeHttp::new(vec![
+        response(
+            200,
+            "application/json",
+            br#"{"error":"first-secret","error_description":"secret-jwt","error_uri":"https://errors.example/secret"}"#,
+        ),
+        response(
+            200,
+            "application/x-www-form-urlencoded",
+            b"error=second-secret&error_description=secret-access-token&error_uri=https%3A%2F%2Ferrors.example%2Fsecret&access_token=must-not-win".to_vec(),
+        ),
+    ]);
+    let client = test_client(http.clone());
+    let error = client
+        .exchange_jwt_for_token("http://127.0.0.1:1234", "client", "secret-jwt")
+        .await
+        .unwrap_err();
+    assert_eq!(error, Error::OAuthError);
+    let displayed = error.to_string();
+    let debug = format!("{error:?}");
+    assert_eq!(displayed, "token exchange returned an OAuth error");
+    assert_eq!(debug, "OAuthError");
+    for secret in [
+        "first-secret",
+        "second-secret",
+        "secret-jwt",
+        "secret-access-token",
+        "must-not-win",
+    ] {
+        assert!(!displayed.contains(secret));
+        assert!(!debug.contains(secret));
+    }
+    assert_eq!(http.take_requests().len(), 2);
+}
+
+#[tokio::test]
+async fn empty_access_token_triggers_fallback_and_then_fails_closed() {
+    let http = FakeHttp::new(vec![
+        response(200, "application/json", br#"{"access_token":""}"#),
+        response(
+            200,
+            "application/x-www-form-urlencoded",
+            b"access_token=fallback-token".to_vec(),
+        ),
+    ]);
+    let client = test_client(http.clone());
+    assert_eq!(
+        client
+            .exchange_jwt_for_token("http://127.0.0.1:1234", "client", "jwt")
+            .await
+            .unwrap(),
+        "fallback-token"
+    );
+    assert_eq!(http.take_requests().len(), 2);
+
+    let http = FakeHttp::new(vec![
+        response(200, "application/json", br#"{"access_token":""}"#),
+        response(200, "text/plain", b"access_token=".to_vec()),
+    ]);
+    let client = test_client(http);
+    assert_eq!(
+        client
+            .exchange_jwt_for_token("http://127.0.0.1:1234", "client", "jwt")
+            .await
+            .unwrap_err(),
+        Error::EmptyAccessToken
+    );
+}
+
+#[tokio::test]
 async fn untrusted_control_urls_are_rejected_before_http() {
     let http = FakeHttp::new(vec![]);
     let client = FederationClient::new(http.clone(), Arc::new(NoProviderTokenSource));
@@ -376,27 +469,7 @@ async fn untrusted_control_urls_are_rejected_before_http() {
 }
 
 #[tokio::test]
-async fn empty_tokens_and_auth_keys_fail_closed() {
-    let http = FakeHttp::new(vec![response(
-        200,
-        "application/json",
-        br#"{"access_token":""}"#,
-    )]);
-    let client = test_client(http);
-    assert_eq!(
-        client
-            .resolve_auth_key(
-                "http://127.0.0.1:1234",
-                "client",
-                "jwt",
-                "",
-                &["tag:test".into()],
-            )
-            .await
-            .unwrap_err(),
-        Error::EmptyAccessToken
-    );
-
+async fn empty_auth_keys_fail_closed() {
     let http = FakeHttp::new(vec![
         response(
             200,

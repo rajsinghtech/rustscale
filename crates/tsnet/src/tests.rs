@@ -89,12 +89,22 @@ async fn workload_identity_hook_resolves_builder_config() {
         .advertise_tags(vec!["tag:workload".into()])
         .build()
         .unwrap();
-    server.resolve_configured_auth_key().await.unwrap();
+    let mut transient = server
+        .initial_registration_auth(&PersistedState::default())
+        .await
+        .unwrap();
 
     assert_eq!(
-        server.config.auth_key.as_deref(),
+        transient
+            .as_ref()
+            .map(crate::lifecycle::TransientAuthKey::as_str),
         Some("tskey-auth-federated")
     );
+    assert_eq!(
+        format!("{:?}", transient.as_ref().unwrap()),
+        "TransientAuthKey(<redacted>)"
+    );
+    assert!(server.config.auth_key.is_none());
     assert_eq!(
         observed.lock().unwrap().take().unwrap(),
         (
@@ -106,6 +116,86 @@ async fn workload_identity_hook_resolves_builder_config() {
         )
     );
     assert!(!format!("{:?}", server.config).contains("secret-id-token"));
+
+    let mut request = RegisterRequest {
+        Auth: crate::lifecycle::take_initial_register_auth(&mut transient),
+        ..Default::default()
+    };
+    assert_eq!(
+        request.Auth.as_ref().map(|auth| auth.AuthKey.as_str()),
+        Some("tskey-auth-federated")
+    );
+    assert!(transient.is_none());
+    crate::lifecycle::clear_register_auth(&mut request);
+    assert!(request.Auth.is_none());
+}
+
+#[cfg(feature = "identity-federation")]
+#[tokio::test]
+async fn workload_identity_enrollment_and_remint_semantics() {
+    rustscale_identityfederation::install().unwrap();
+    let calls = Arc::new(AtomicU64::new(0));
+    let hook_calls = calls.clone();
+    let resolver: rustscale_feature::IdentityFederationResolver = Arc::new(move |_| {
+        let sequence = hook_calls.fetch_add(1, Ordering::SeqCst) + 1;
+        Box::pin(async move { Ok(format!("federated-key-{sequence}")) })
+    });
+    let _override = rustscale_feature::RESOLVE_AUTH_KEY_VIA_WIF.override_for_test(resolver);
+
+    let mut server = Server::builder()
+        .client_id("client")
+        .id_token("id-token")
+        .advertise_tags(vec!["tag:workload".into()])
+        .build()
+        .unwrap();
+    let fresh = PersistedState::generate();
+    let first = server
+        .initial_registration_auth(&fresh)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.as_str(), "federated-key-1");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    let enrolled = PersistedState {
+        node_id: 1,
+        ..fresh.clone()
+    };
+    assert!(server
+        .initial_registration_auth(&enrolled)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    let mut forced = Server::builder()
+        .client_id("client")
+        .id_token("id-token")
+        .advertise_tags(vec!["tag:workload".into()])
+        .force_login(true)
+        .build()
+        .unwrap();
+    let force_key = forced
+        .initial_registration_auth(&enrolled)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(force_key.as_str(), "federated-key-2");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+    // A dropped register response leaves generated keys but no enrollment
+    // marker. Dropping the first transient key and preparing another attempt
+    // must mint a distinct one instead of replaying it.
+    drop(first);
+    let retry = server
+        .initial_registration_auth(&fresh)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(retry.as_str(), "federated-key-3");
+    assert_ne!(retry.as_str(), force_key.as_str());
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    assert!(server.config.auth_key.is_none());
 }
 
 #[cfg(feature = "identity-federation")]
@@ -145,7 +235,7 @@ async fn workload_identity_builder_config_is_validated_before_hook() {
     ];
     for (mut server, expected) in cases {
         let error = server
-            .resolve_configured_auth_key()
+            .initial_registration_auth(&PersistedState::default())
             .await
             .unwrap_err()
             .to_string();

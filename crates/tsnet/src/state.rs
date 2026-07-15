@@ -39,6 +39,10 @@ pub struct PersistedState {
     /// The stable node ID (string form, empty until registered).
     #[serde(default)]
     pub stable_node_id: String,
+    /// Whether a register response completed enrollment. Older state files
+    /// infer this from their existing ID fields.
+    #[serde(default)]
+    pub enrolled: bool,
     /// The previous node private key, saved during key rotation so
     /// `OldNodeKey` can be sent in the next `RegisterRequest`. Matches
     /// Go's `persist.OldPrivateNodeKey` (`types/persist/persist.go:25`).
@@ -54,6 +58,7 @@ impl Default for PersistedState {
             disco_key: DiscoPrivate::from_raw32([0u8; 32]),
             node_id: 0,
             stable_node_id: String::new(),
+            enrolled: false,
             old_node_key: None,
         }
     }
@@ -68,6 +73,7 @@ impl PersistedState {
             disco_key: DiscoPrivate::generate(),
             node_id: 0,
             stable_node_id: String::new(),
+            enrolled: false,
             old_node_key: None,
         }
     }
@@ -75,6 +81,13 @@ impl PersistedState {
     /// Whether all keys are zero (uninitialized).
     pub fn is_zero(&self) -> bool {
         self.node_key.is_zero() && self.machine_key.is_zero() && self.disco_key.is_zero()
+    }
+
+    /// Whether control has completed enrollment for this persisted identity.
+    /// Generated keys alone are not enrollment: a register response can be
+    /// lost, leaving non-zero keys that must still authenticate on retry.
+    pub fn is_enrolled(&self) -> bool {
+        self.enrolled || self.node_id != 0 || !self.stable_node_id.is_empty()
     }
 
     /// Load state from a JSON file.
@@ -271,6 +284,7 @@ mod tests {
         let loaded = PersistedState::load(&tmp).expect("load");
         assert_eq!(loaded.node_id, 12345);
         assert_eq!(loaded.stable_node_id, "nodeABC");
+        assert!(loaded.is_enrolled());
 
         let _ = std::fs::remove_file(&tmp);
     }
@@ -288,9 +302,16 @@ mod tests {
     fn generated_state_is_not_zero() {
         let state = PersistedState::generate();
         assert!(!state.is_zero());
+        assert!(!state.is_enrolled());
         assert!(!state.node_key.is_zero());
         assert!(!state.machine_key.is_zero());
         assert!(!state.disco_key.is_zero());
+
+        let enrolled = PersistedState {
+            enrolled: true,
+            ..state
+        };
+        assert!(enrolled.is_enrolled());
     }
 
     #[test]

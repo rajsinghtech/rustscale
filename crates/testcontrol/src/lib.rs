@@ -24,6 +24,7 @@
 #![allow(non_snake_case)]
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
@@ -91,6 +92,15 @@ struct ServerInner {
     /// `RegisterResponse.NodeKeyExpired = true`. Used by key-rotation
     /// tests to force expiry on a specific node.
     expired_nodes: HashSet<NodePublic>,
+    /// Whether each valid register request carried an Auth key. Values only,
+    /// never credentials, are retained for security-sensitive client tests.
+    register_auth_present: Vec<bool>,
+    /// Test-only fingerprints used to detect replay without retaining raw
+    /// auth keys.
+    register_auth_fingerprints: Vec<Option<u64>>,
+    /// Process the next register request but drop its response, simulating an
+    /// ambiguous network failure after control may have consumed a one-use key.
+    drop_next_register_response: bool,
     token_response: TokenResponse,
     last_token_request: Option<TokenRequest>,
     base_url: String,
@@ -151,6 +161,9 @@ impl Server {
                 last_auth_url: None,
                 logged_out_nodes: HashSet::new(),
                 expired_nodes: HashSet::new(),
+                register_auth_present: Vec::new(),
+                register_auth_fingerprints: Vec::new(),
+                drop_next_register_response: false,
                 token_response: TokenResponse {
                     IDToken: "test.header.payload.signature".into(),
                 },
@@ -194,6 +207,25 @@ impl Server {
     // -----------------------------------------------------------------
     // Test API
     // -----------------------------------------------------------------
+
+    /// Process the next register request but close its response stream.
+    pub fn drop_next_register_response(&self) {
+        self.inner.lock().unwrap().drop_next_register_response = true;
+    }
+
+    /// Snapshot whether each valid register request carried an auth key.
+    pub fn register_auth_presence(&self) -> Vec<bool> {
+        self.inner.lock().unwrap().register_auth_present.clone()
+    }
+
+    /// Snapshot fingerprints of register auth keys without retaining them.
+    pub fn register_auth_fingerprints(&self) -> Vec<Option<u64>> {
+        self.inner
+            .lock()
+            .unwrap()
+            .register_auth_fingerprints
+            .clone()
+    }
 
     /// Configure the response returned by `POST /machine/id-token`.
     pub fn set_id_token(&self, token: impl Into<String>) {
@@ -761,6 +793,13 @@ async fn handle_h2_request(
         "/machine/register" => {
             let body = read_h2_body(&mut req_body).await.map_err(|_| ())?;
             let resp_body = serve_register(&body, peer_machine_key, inner, notify).await;
+            let drop_response = {
+                let mut state = inner.lock().unwrap();
+                std::mem::take(&mut state.drop_next_register_response)
+            };
+            if drop_response {
+                return Ok(());
+            }
             let resp = http::Response::builder()
                 .status(200)
                 .header("content-type", "application/json")
@@ -877,6 +916,16 @@ async fn serve_register(
             ..Default::default()
         })
         .unwrap_or_default();
+    }
+    let auth_fingerprint = req.Auth.as_ref().map(|auth| {
+        let mut hasher = DefaultHasher::new();
+        auth.AuthKey.hash(&mut hasher);
+        hasher.finish()
+    });
+    {
+        let mut state = inner.lock().unwrap();
+        state.register_auth_present.push(req.Auth.is_some());
+        state.register_auth_fingerprints.push(auth_fingerprint);
     }
 
     let nk = req.NodeKey.clone();

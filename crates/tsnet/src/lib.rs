@@ -242,6 +242,9 @@ pub struct ServerBuilder {
     /// Audience passed to an injected provider token source when no ID token
     /// is supplied.
     pub(crate) audience: String,
+    /// Explicitly re-authenticate an already enrolled node. Workload identity
+    /// credentials are otherwise ignored for persisted enrollments.
+    pub(crate) force_login: bool,
     pub(crate) control_url: String,
     pub(crate) state_dir: Option<PathBuf>,
     pub(crate) ephemeral: bool,
@@ -341,6 +344,7 @@ impl std::fmt::Debug for ServerBuilder {
                 },
             )
             .field("audience", &self.audience)
+            .field("force_login", &self.force_login)
             .field("control_url", &self.control_url)
             .field("state_dir", &self.state_dir)
             .field("ephemeral", &self.ephemeral)
@@ -399,6 +403,15 @@ impl ServerBuilder {
     /// `up()`.
     pub fn audience(mut self, audience: impl Into<String>) -> Self {
         self.audience = audience.into();
+        self
+    }
+
+    /// Force an already enrolled node through login again.
+    ///
+    /// Without this flag, configured auth credentials are omitted for a
+    /// persisted enrollment and workload identity federation is not invoked.
+    pub fn force_login(mut self, force: bool) -> Self {
+        self.force_login = force;
         self
     }
 

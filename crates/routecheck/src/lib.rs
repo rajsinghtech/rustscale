@@ -1,12 +1,18 @@
-//! Local subnet-route conflict detection for advertised Tailscale routes.
+//! Subnet-route validation and high-availability router reachability checks.
 //!
-//! The crate accepts caller-provided snapshots rather than querying the live
-//! network, making route validation deterministic and straightforward to test.
+//! All route and probe inputs are injectable. Reachability checks use existing
+//! Tailscale disco paths rather than privileged ICMP or platform route tools.
 
 mod conflict;
 pub mod forwarding;
+mod reachability;
 mod types;
 
+pub use reachability::{
+    routers_by_prefix, Client, Error, Node, NodeSet, Prefix, PrefixParseError, ProbeError,
+    ProbeProvider, ProbeResponse, Report, RoutablePrefixes, RouteProvider, RouteProviderError,
+    RouteSnapshot, RoutersByPrefix, DEFAULT_CONCURRENCY, DEFAULT_TIMEOUT,
+};
 pub use types::{Conflict, ConflictKind, RouteCheckReport, Severity};
 
 use rustscale_netmon::State as NetState;

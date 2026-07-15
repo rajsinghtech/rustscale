@@ -416,6 +416,7 @@ impl Server {
                 hostname: self.config.hostname.clone(),
                 magicsock: b.magicsock.clone(),
                 tun_mode: false,
+                routecheck: Some(b.routecheck.clone()),
                 home_derp: b.home_derp,
                 ipn_backend: b.ipn_backend.clone(),
                 derp_map: b.derp_map.clone(),
@@ -517,6 +518,7 @@ impl Server {
             netlog: b.netlog,
             data_plane: DataPlane::Netstack(netstack),
             peers: b.peers,
+            routecheck: b.routecheck,
             route_table: b.route_table,
             router: None,
             cancel: b.cancel,
@@ -909,6 +911,7 @@ impl Server {
                 hostname: self.config.hostname.clone(),
                 magicsock: b.magicsock.clone(),
                 tun_mode: true,
+                routecheck: Some(b.routecheck.clone()),
                 home_derp: b.home_derp,
                 ipn_backend: b.ipn_backend.clone(),
                 derp_map: b.derp_map.clone(),
@@ -1043,6 +1046,7 @@ impl Server {
             netlog: b.netlog,
             data_plane: DataPlane::Tun,
             peers: b.peers,
+            routecheck: b.routecheck,
             route_table: b.route_table,
             router,
             cancel: b.cancel,
@@ -1218,6 +1222,7 @@ impl Server {
 
         let api_state = Arc::new(localapi::LocalApiState {
             peers: Arc::new(RwLock::new(vec![])),
+            routecheck: None,
             user_profiles: Arc::new(RwLock::new(BTreeMap::new())),
             health: Tracker::new(),
             dns_config: Arc::new(RwLock::new(None)),
@@ -1893,6 +1898,11 @@ impl Server {
         }
 
         let peers_arc = Arc::new(RwLock::new(peers.clone()));
+        let routecheck = localapi::new_routecheck_client(
+            map_resp.Node.clone(),
+            peers_arc.clone(),
+            magicsock.clone(),
+        );
         let route_table = Arc::new(RwLock::new(RouteTable::from_peers_with_opts(
             &peers,
             self.config.accept_routes,
@@ -2004,6 +2014,7 @@ impl Server {
             wg_recv,
             wg_tunnels,
             peers: peers_arc,
+            routecheck,
             route_table,
             cancel,
             map_rx,

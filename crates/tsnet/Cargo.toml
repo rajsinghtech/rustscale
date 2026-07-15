@@ -53,6 +53,7 @@ rustscale-controlknobs = { path = "../controlknobs", version = "0.1.1" }
 rustscale-magicsock = { path = "../magicsock", version = "0.1.1" }
 rustscale-derp = { path = "../derp", version = "0.1.1" }
 rustscale-netcheck = { path = "../netcheck", version = "0.1.1" }
+rustscale-routecheck.workspace = true
 rustscale-wg = { path = "../wg", version = "0.1.1" }
 rustscale-netstack = { path = "../netstack", version = "0.1.1" }
 rustscale-tun = { path = "../tun", version = "0.1.1" }

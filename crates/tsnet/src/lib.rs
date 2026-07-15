@@ -642,6 +642,7 @@ pub(crate) struct RunningState {
     pub(crate) netlog: Option<Arc<rustscale_netlog::Logger>>,
     pub(crate) data_plane: DataPlane,
     pub(crate) peers: Arc<RwLock<Vec<Node>>>,
+    pub(crate) routecheck: Arc<rustscale_routecheck::Client>,
     pub(crate) route_table: Arc<RwLock<RouteTable>>,
     /// OS-route manager in TUN mode when `TunModeConfig::apply_routes` is set.
     pub(crate) router: Option<SharedRouter>,
@@ -778,6 +779,7 @@ pub(crate) struct Bootstrap {
     pub(crate) wg_recv: mpsc::Receiver<rustscale_magicsock::WgReceiveBatch>,
     pub(crate) wg_tunnels: Arc<RwLock<HashMap<NodePublic, Arc<Mutex<WgTunn>>>>>,
     pub(crate) peers: Arc<RwLock<Vec<Node>>>,
+    pub(crate) routecheck: Arc<rustscale_routecheck::Client>,
     pub(crate) route_table: Arc<RwLock<RouteTable>>,
     pub(crate) cancel: Arc<CancelToken>,
     pub(crate) map_rx: mpsc::Receiver<Result<MapResponse, StreamMapError>>,

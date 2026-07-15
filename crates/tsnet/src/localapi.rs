@@ -98,11 +98,70 @@ pub(crate) struct ControlParams {
     pub protocol_version: u16,
 }
 
+struct TsnetRouteProvider {
+    self_node: Option<Node>,
+    peers: Arc<RwLock<Vec<Node>>>,
+}
+
+#[async_trait::async_trait]
+impl rustscale_routecheck::RouteProvider for TsnetRouteProvider {
+    async fn snapshot(
+        &self,
+    ) -> Result<rustscale_routecheck::RouteSnapshot, rustscale_routecheck::RouteProviderError> {
+        let self_node = self
+            .self_node
+            .clone()
+            .ok_or(rustscale_routecheck::RouteProviderError::Unavailable)?;
+        Ok(rustscale_routecheck::RouteSnapshot {
+            self_node,
+            peers: self.peers.read().await.clone(),
+        })
+    }
+}
+
+struct TsnetProbeProvider {
+    magicsock: Arc<Magicsock>,
+}
+
+#[async_trait::async_trait]
+impl rustscale_routecheck::ProbeProvider for TsnetProbeProvider {
+    async fn probe(
+        &self,
+        peer: &Node,
+        address: IpAddr,
+    ) -> Result<rustscale_routecheck::ProbeResponse, rustscale_routecheck::ProbeError> {
+        let result = self
+            .magicsock
+            .cli_ping(&peer.Key, &peer.Name, address, 0)
+            .await
+            .map_err(|error| rustscale_routecheck::ProbeError::Failed(error.to_string()))?;
+        let latency = if result.LatencySeconds.is_finite() && result.LatencySeconds >= 0.0 {
+            std::time::Duration::from_secs_f64(result.LatencySeconds)
+        } else {
+            std::time::Duration::ZERO
+        };
+        Ok(rustscale_routecheck::ProbeResponse { latency })
+    }
+}
+
+pub(crate) fn new_routecheck_client(
+    self_node: Option<Node>,
+    peers: Arc<RwLock<Vec<Node>>>,
+    magicsock: Arc<Magicsock>,
+) -> Arc<rustscale_routecheck::Client> {
+    Arc::new(rustscale_routecheck::Client::new(
+        Arc::new(TsnetRouteProvider { self_node, peers }),
+        Arc::new(TsnetProbeProvider { magicsock }),
+    ))
+}
+
 /// Shared state for the LocalAPI server — all fields are Arc clones of the
 /// same state held by [`crate::RunningState`], so the API always sees live
 /// data without explicit refresh.
 pub(crate) struct LocalApiState {
     pub peers: Arc<RwLock<Vec<Node>>>,
+    /// HA subnet-router reachability checker. Unavailable before the first netmap.
+    pub routecheck: Option<Arc<rustscale_routecheck::Client>>,
     pub user_profiles: Arc<RwLock<BTreeMap<UserID, UserProfile>>>,
     pub health: Tracker,
     pub dns_config: Arc<RwLock<Option<DNSConfig>>>,
@@ -941,6 +1000,15 @@ pub(crate) async fn dispatch<W: AsyncRead + AsyncWrite + Unpin>(
             write_json_response(conn, 200, "OK", &netmap).await?;
         }
 
+        // --- POST /localapi/v0/routecheck?probe=true&timeout=5s ---
+        "routecheck" if method == "POST" => {
+            handle_routecheck(conn, &req.query, state).await?;
+        }
+        "routecheck" => {
+            let body = serde_json::json!({"error": "want POST"});
+            write_json_response(conn, 405, "Method Not Allowed", &body).await?;
+        }
+
         // --- GET /localapi/v0/metrics ---
         "metrics" if method == "GET" => {
             let text = build_metrics_text(state);
@@ -1497,6 +1565,68 @@ fn build_health_json(state: &LocalApiState) -> serde_json::Value {
 }
 
 // ---------------------------------------------------------------------------
+// Routecheck handler
+// ---------------------------------------------------------------------------
+
+async fn handle_routecheck<W: AsyncWrite + Unpin>(
+    conn: &mut W,
+    query: &str,
+    state: &Arc<LocalApiState>,
+) -> Result<(), std::io::Error> {
+    let Some(client) = state.routecheck.as_ref() else {
+        let body = serde_json::json!({"error": "routecheck is not enabled"});
+        return write_json_response(conn, 503, "Service Unavailable", &body).await;
+    };
+    let params = parse_query(query);
+    let probe = params
+        .get("probe")
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes"));
+    let report = if probe {
+        let timeout = params
+            .get("timeout")
+            .and_then(|value| parse_routecheck_duration(value))
+            .unwrap_or(rustscale_routecheck::DEFAULT_TIMEOUT)
+            .min(std::time::Duration::from_secs(60));
+        match client.refresh(timeout).await {
+            Ok(report) => Some(report),
+            Err(error) => {
+                let body = serde_json::json!({"error": error.to_string()});
+                return write_json_response(conn, 503, "Service Unavailable", &body).await;
+            }
+        }
+    } else {
+        client.latest_report()
+    };
+
+    if let Some(report) = report {
+        let body = serde_json::to_value(report).map_err(std::io::Error::other)?;
+        write_json_response(conn, 200, "OK", &body).await
+    } else {
+        write_no_content_response(conn, 204, "No Content").await
+    }
+}
+
+fn parse_routecheck_duration(value: &str) -> Option<std::time::Duration> {
+    let (number, multiplier) = if let Some(value) = value.strip_suffix("ms") {
+        (value, 0.001)
+    } else if let Some(value) = value.strip_suffix('s') {
+        (value, 1.0)
+    } else if let Some(value) = value.strip_suffix('m') {
+        (value, 60.0)
+    } else {
+        (value, 1.0)
+    };
+    let seconds = number.parse::<f64>().ok()? * multiplier;
+    if !seconds.is_finite() {
+        return None;
+    }
+    Some(if seconds <= 0.0 {
+        std::time::Duration::ZERO
+    } else {
+        std::time::Duration::from_secs_f64(seconds)
+    })
+}
+
 // Ping handler
 // ---------------------------------------------------------------------------
 
@@ -3236,6 +3366,7 @@ mod tests {
 
         Arc::new(LocalApiState {
             peers,
+            routecheck: None,
             user_profiles: Arc::new(RwLock::new(profiles)),
             health: Tracker::new(),
             dns_config: Arc::new(RwLock::new(None)),
@@ -3397,6 +3528,42 @@ mod tests {
             pid: Some(99999),
             is_unix_sock: true,
         }
+    }
+
+    #[test]
+    fn test_parse_routecheck_duration() {
+        assert_eq!(
+            parse_routecheck_duration("250ms"),
+            Some(std::time::Duration::from_millis(250))
+        );
+        assert_eq!(
+            parse_routecheck_duration("1.5s"),
+            Some(std::time::Duration::from_millis(1500))
+        );
+        assert_eq!(
+            parse_routecheck_duration("2m"),
+            Some(std::time::Duration::from_secs(120))
+        );
+        assert_eq!(
+            parse_routecheck_duration("-1s"),
+            Some(std::time::Duration::ZERO)
+        );
+        assert!(parse_routecheck_duration("later").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_routecheck_endpoint_unavailable_before_netmap() {
+        let state = make_test_state().await;
+        let resp = send_request_to_state(
+            b"POST /localapi/v0/routecheck?probe=true HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            &state,
+        )
+        .await;
+        assert!(resp.contains("503 Service Unavailable"), "response: {resp}");
+        assert!(
+            resp.contains("routecheck is not enabled"),
+            "response: {resp}"
+        );
     }
 
     #[tokio::test]
@@ -4007,6 +4174,7 @@ mod tests {
         // a state with state_dir set.
         let state2 = Arc::new(LocalApiState {
             peers: state.peers.clone(),
+            routecheck: state.routecheck.clone(),
             user_profiles: state.user_profiles.clone(),
             health: state.health.clone(),
             dns_config: state.dns_config.clone(),
@@ -4233,6 +4401,7 @@ mod tests {
         let nk = rustscale_key::NodePrivate::generate();
         Arc::new(LocalApiState {
             peers: base.peers.clone(),
+            routecheck: base.routecheck.clone(),
             user_profiles: base.user_profiles.clone(),
             health: base.health.clone(),
             dns_config: Arc::new(RwLock::new(Some(rustscale_tailcfg::DNSConfig {

@@ -276,7 +276,16 @@ impl Incubator {
                         if !gids.is_empty() {
                             let gids_v: Vec<libc::gid_t> =
                                 gids.iter().map(|&g| g as libc::gid_t).collect();
-                            let ret = libc::setgroups(gids_v.len(), gids_v.as_ptr());
+                            // libc uses size_t on Linux and c_int on BSD-derived
+                            // platforms, so let the target signature select the
+                            // checked conversion type.
+                            let group_count = gids_v.len().try_into().map_err(|_| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidInput,
+                                    "too many supplementary groups",
+                                )
+                            })?;
+                            let ret = libc::setgroups(group_count, gids_v.as_ptr());
                             if ret != 0 {
                                 return Err(io::Error::last_os_error());
                             }

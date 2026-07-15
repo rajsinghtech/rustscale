@@ -7,8 +7,8 @@
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
@@ -592,6 +592,72 @@ async fn pcp_only_gateway_recovers_after_reappearance() {
 #[tokio::test]
 async fn upnp_only_gateway_recovers_after_reappearance() {
     assert_gateway_reappearance_reprobes(
+        IgdOpts {
+            upnp: true,
+            ..Default::default()
+        },
+        MappingKind::Upnp,
+    )
+    .await;
+}
+
+// --- Trust-expired renewals force a complete protocol reprobe ---
+
+async fn assert_trust_expiry_reprobes(opts: IgdOpts, expected: MappingKind) {
+    let igd = FakeIgd::start(opts).await;
+    let client = make_test_client(&igd);
+    let clock = Arc::new(Mutex::new(Instant::now()));
+    client.set_test_clock(Box::new({
+        let clock = clock.clone();
+        move || *clock.lock().unwrap()
+    }));
+
+    let first = client.create_or_get_mapping().await.expect("first mapping");
+    assert_eq!(first.kind, expected);
+
+    let pmp_before = igd.pmp_recv_count.load(Ordering::SeqCst);
+    let pcp_before = igd.pcp_recv_count.load(Ordering::SeqCst);
+    let upnp_before = igd.upnp_disco_count.load(Ordering::SeqCst);
+    *clock.lock().unwrap() += Duration::from_secs(3601);
+
+    let renewed = client
+        .create_or_get_mapping()
+        .await
+        .expect("mapping renewal after trust expiry");
+    assert_eq!(renewed.kind, expected);
+    assert!(
+        igd.pmp_recv_count.load(Ordering::SeqCst) > pmp_before,
+        "trust expiry must reprobe PMP (before={pmp_before}, after={})",
+        igd.pmp_recv_count.load(Ordering::SeqCst)
+    );
+    assert!(
+        igd.pcp_recv_count.load(Ordering::SeqCst) > pcp_before,
+        "trust expiry must reprobe PCP"
+    );
+    assert!(
+        igd.upnp_disco_count.load(Ordering::SeqCst) > upnp_before,
+        "trust expiry must reprobe UPnP"
+    );
+
+    client.close();
+    igd.close();
+}
+
+#[tokio::test]
+async fn pcp_only_mapping_renews_after_trust_expiry() {
+    assert_trust_expiry_reprobes(
+        IgdOpts {
+            pcp: true,
+            ..Default::default()
+        },
+        MappingKind::Pcp,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn upnp_only_mapping_renews_after_trust_expiry() {
+    assert_trust_expiry_reprobes(
         IgdOpts {
             upnp: true,
             ..Default::default()

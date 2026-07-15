@@ -191,8 +191,8 @@ pub(crate) fn build_map_response(req: &[u8]) -> Vec<u8> {
     out[0] = PCP_VERSION;
     out[1] = req[1] | PCP_OP_REPLY;
     out[3] = 0; // result OK
-    out[4..8].copy_from_slice(&(1u32 << 30).to_be_bytes()); // lifetime
-                                                            // Echo nonce + protocol + internal port from the request.
+    out[4..8].copy_from_slice(&req[4..8]); // echo requested lifetime
+                                           // Echo nonce + protocol + internal port from the request.
     if req.len() >= 60 {
         out[24..37].copy_from_slice(&req[24..37]); // nonce (12) + protocol (1)
         out[40..42].copy_from_slice(&req[40..42]); // internal port

@@ -8,6 +8,7 @@
 
 use std::net::{IpAddr, ToSocketAddrs};
 
+use rustscale_art::{IpPrefix as ArtPrefix, Table as ArtTable};
 use rustscale_key::NodePublic;
 use rustscale_tailcfg::Node;
 
@@ -65,6 +66,7 @@ struct RouteEntry {
 #[derive(Clone, Default)]
 pub struct RouteTable {
     entries: Vec<RouteEntry>,
+    index: ArtTable<NodePublic>,
     accept_routes: bool,
     /// The selected exit node peer, if any. Acts as a catch-all fallback for
     /// destinations not matched by a more-specific entry. Independent of
@@ -114,11 +116,20 @@ impl RouteTable {
                 });
             }
         }
-        // Sort by prefix descending so the first match in `lookup` is the
-        // longest prefix (avoids a max-scan each call).
+        // Keep the diagnostic/OS-routing view longest-prefix first. The sort
+        // is stable, which also defines equal-prefix ownership as the first
+        // peer in the netmap.
         entries.sort_by_key(|e| std::cmp::Reverse(e.prefix));
+        let mut index = ArtTable::new();
+        for entry in &entries {
+            let prefix = ArtPrefix::new(entry.net, entry.prefix).expect("validated route prefix");
+            if index.get_prefix(prefix).is_none() {
+                let _ = index.insert(prefix, entry.peer.clone());
+            }
+        }
         Self {
             entries,
+            index,
             accept_routes,
             exit_node: None,
         }
@@ -132,15 +143,10 @@ impl RouteTable {
     /// IPs and accepted subnet routes (more specific than `0.0.0.0/0`) always
     /// win over the exit fallback.
     pub fn lookup(&self, ip: IpAddr) -> Option<NodePublic> {
-        // Entries are sorted by descending prefix, so the first containing
-        // entry is the longest-prefix match.
-        for entry in &self.entries {
-            if cidr_match(ip, entry.net, entry.prefix) {
-                return Some(entry.peer.clone());
-            }
-        }
-        // Fall back to the exit node default route.
-        self.exit_node.clone()
+        self.index
+            .get(ip)
+            .cloned()
+            .or_else(|| self.exit_node.clone())
     }
 
     /// Rebuild the table from a new peer list (e.g. on a map-stream delta).
@@ -215,36 +221,6 @@ fn parse_cidr(cidr: &str) -> Option<(IpAddr, u8)> {
         return None;
     }
     Some((net, prefix))
-}
-
-/// Whether `ip` falls within `net`/`prefix`. Only matches within the same
-/// address family.
-fn cidr_match(ip: IpAddr, net: IpAddr, prefix: u8) -> bool {
-    match (ip, net) {
-        (IpAddr::V4(ip), IpAddr::V4(net)) => {
-            if prefix > 32 {
-                return false;
-            }
-            let mask = if prefix == 0 {
-                0u32
-            } else {
-                u32::MAX << (32 - prefix)
-            };
-            (u32::from(ip) & mask) == (u32::from(net) & mask)
-        }
-        (IpAddr::V6(ip), IpAddr::V6(net)) => {
-            if prefix > 128 {
-                return false;
-            }
-            let mask = if prefix == 0 {
-                0u128
-            } else {
-                u128::MAX << (128 - prefix)
-            };
-            (u128::from(ip) & mask) == (u128::from(net) & mask)
-        }
-        _ => false,
-    }
 }
 
 /// Whether a peer is exit-node-capable: its `AllowedIPs` (or `Addresses` as a
@@ -337,6 +313,21 @@ mod tests {
         assert_eq!(
             rt.lookup(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 10))),
             Some(broad)
+        );
+    }
+
+    #[test]
+    fn equal_normalized_prefix_keeps_first_peer() {
+        let first = NodePrivate::generate().public();
+        let second = NodePrivate::generate().public();
+        let peers = vec![
+            peer_with_key(&["192.0.2.99/24"], first.clone()),
+            peer_with_key(&["192.0.2.0/24"], second),
+        ];
+        let rt = RouteTable::from_peers(&peers);
+        assert_eq!(
+            rt.lookup(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))),
+            Some(first)
         );
     }
 

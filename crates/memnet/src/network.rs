@@ -11,8 +11,8 @@ const FIRST_EPHEMERAL_PORT: u16 = 33_000;
 
 /// A concurrency-safe registry of in-memory TCP listeners.
 ///
-/// Clones refer to the same registry. Dropping the final `Network` closes all
-/// registered listeners, waking their pending accepts and dials.
+/// Clones refer to the same registry. As in Tailscale memnet, a listener kept
+/// by its caller remains usable after the final `Network` handle is dropped.
 #[derive(Clone, Default)]
 pub struct Network {
     registry: Arc<Registry>,
@@ -112,19 +112,6 @@ impl Network {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .len()
-    }
-}
-
-impl Drop for Registry {
-    fn drop(&mut self) {
-        let listeners = self
-            .listeners
-            .get_mut()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for listener in listeners.values() {
-            listener.close();
-        }
-        listeners.clear();
     }
 }
 

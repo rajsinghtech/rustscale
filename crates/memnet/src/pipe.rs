@@ -30,11 +30,15 @@ struct State {
     blocked: bool,
     read_deadline: Option<Instant>,
     write_deadline: Option<Instant>,
-    read_timer: Option<Pin<Box<Sleep>>>,
-    write_timer: Option<Pin<Box<Sleep>>>,
     next_waiter_id: u64,
-    readers: HashMap<u64, Waker>,
-    writers: HashMap<u64, Waker>,
+    readers: HashMap<u64, Waiter>,
+    writers: HashMap<u64, Waiter>,
+}
+
+#[derive(Debug)]
+struct Waiter {
+    waker: Waker,
+    timer: Option<Pin<Box<Sleep>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -56,19 +60,9 @@ impl Drop for WaitRegistration<'_> {
         };
         let mut state = self.pipe.lock_state();
         match self.kind {
-            WaitKind::Read => {
-                state.readers.remove(&id);
-                if state.readers.is_empty() {
-                    state.read_timer = None;
-                }
-            }
-            WaitKind::Write => {
-                state.writers.remove(&id);
-                if state.writers.is_empty() {
-                    state.write_timer = None;
-                }
-            }
-        }
+            WaitKind::Read => state.readers.remove(&id),
+            WaitKind::Write => state.writers.remove(&id),
+        };
     }
 }
 
@@ -128,8 +122,6 @@ impl MemPipe {
             let mut state = self.lock_state();
             state.closed = true;
             state.blocked = false;
-            state.read_timer = None;
-            state.write_timer = None;
             (
                 std::mem::take(&mut state.readers),
                 std::mem::take(&mut state.writers),
@@ -202,7 +194,6 @@ impl MemPipe {
         let readers = {
             let mut state = self.lock_state();
             state.read_deadline = deadline;
-            state.read_timer = None;
             std::mem::take(&mut state.readers)
         };
         wake_all(readers);
@@ -213,7 +204,6 @@ impl MemPipe {
         let writers = {
             let mut state = self.lock_state();
             state.write_deadline = deadline;
-            state.write_timer = None;
             std::mem::take(&mut state.writers)
         };
         wake_all(writers);
@@ -233,7 +223,6 @@ impl MemPipe {
 
         if deadline_elapsed(state.read_deadline) {
             clear_waiter(&mut state.readers, waiter_id);
-            state.read_timer = None;
             let readers = std::mem::take(&mut state.readers);
             drop(state);
             wake_all(readers);
@@ -245,7 +234,6 @@ impl MemPipe {
             for byte in &mut output[..count] {
                 *byte = state.buf.pop_front().expect("buffer length was checked");
             }
-            state.read_timer = None;
             let writers = std::mem::take(&mut state.writers);
             drop(state);
             wake_all(writers);
@@ -253,18 +241,25 @@ impl MemPipe {
         }
         if !state.blocked && state.closed {
             clear_waiter(&mut state.readers, waiter_id);
-            state.read_timer = None;
             return Poll::Ready(Ok(0));
         }
         let read_deadline = state.read_deadline;
-        if poll_deadline(&mut state.read_timer, read_deadline, cx).is_ready() {
+        if poll_waiter(
+            &mut state,
+            WaitKind::Read,
+            waiter_id,
+            cx.waker(),
+            read_deadline,
+            cx,
+        )
+        .is_ready()
+        {
             clear_waiter(&mut state.readers, waiter_id);
             let readers = std::mem::take(&mut state.readers);
             drop(state);
             wake_all(readers);
             return Poll::Ready(Err(deadline_error("read")));
         }
-        register(&mut state, WaitKind::Read, waiter_id, cx.waker());
         Poll::Pending
     }
 
@@ -282,7 +277,6 @@ impl MemPipe {
 
         if state.closed {
             clear_waiter(&mut state.writers, waiter_id);
-            state.write_timer = None;
             return Poll::Ready(Err(pipe_error(
                 ErrorKind::BrokenPipe,
                 &self.name,
@@ -291,7 +285,6 @@ impl MemPipe {
         }
         if deadline_elapsed(state.write_deadline) {
             clear_waiter(&mut state.writers, waiter_id);
-            state.write_timer = None;
             let writers = std::mem::take(&mut state.writers);
             drop(state);
             wake_all(writers);
@@ -299,21 +292,28 @@ impl MemPipe {
         }
         if state.blocked || state.buf.len() == self.max_buf {
             let write_deadline = state.write_deadline;
-            if poll_deadline(&mut state.write_timer, write_deadline, cx).is_ready() {
+            if poll_waiter(
+                &mut state,
+                WaitKind::Write,
+                waiter_id,
+                cx.waker(),
+                write_deadline,
+                cx,
+            )
+            .is_ready()
+            {
                 clear_waiter(&mut state.writers, waiter_id);
                 let writers = std::mem::take(&mut state.writers);
                 drop(state);
                 wake_all(writers);
                 return Poll::Ready(Err(deadline_error("write")));
             }
-            register(&mut state, WaitKind::Write, waiter_id, cx.waker());
             return Poll::Pending;
         }
 
         clear_waiter(&mut state.writers, waiter_id);
         let count = input.len().min(self.max_buf - state.buf.len());
         state.buf.extend(&input[..count]);
-        state.write_timer = None;
         let readers = std::mem::take(&mut state.readers);
         drop(state);
         wake_all(readers);
@@ -348,7 +348,14 @@ fn deadline_elapsed(deadline: Option<Instant>) -> bool {
     deadline.is_some_and(|deadline| deadline <= Instant::now())
 }
 
-fn register(state: &mut State, kind: WaitKind, waiter_id: &mut Option<u64>, waker: &Waker) {
+fn poll_waiter(
+    state: &mut State,
+    kind: WaitKind,
+    waiter_id: &mut Option<u64>,
+    waker: &Waker,
+    deadline: Option<Instant>,
+    cx: &mut Context<'_>,
+) -> Poll<()> {
     let id = waiter_id.unwrap_or_else(|| {
         let id = state.next_waiter_id;
         state.next_waiter_id = state.next_waiter_id.wrapping_add(1);
@@ -359,20 +366,25 @@ fn register(state: &mut State, kind: WaitKind, waiter_id: &mut Option<u64>, wake
         WaitKind::Read => &mut state.readers,
         WaitKind::Write => &mut state.writers,
     };
-    if waiters.get(&id).is_none_or(|old| !old.will_wake(waker)) {
-        waiters.insert(id, waker.clone());
+    let waiter = waiters.entry(id).or_insert_with(|| Waiter {
+        waker: waker.clone(),
+        timer: None,
+    });
+    if !waiter.waker.will_wake(waker) {
+        waiter.waker.clone_from(waker);
     }
+    poll_deadline(&mut waiter.timer, deadline, cx)
 }
 
-fn clear_waiter(waiters: &mut HashMap<u64, Waker>, waiter_id: &mut Option<u64>) {
+fn clear_waiter(waiters: &mut HashMap<u64, Waiter>, waiter_id: &mut Option<u64>) {
     if let Some(id) = waiter_id.take() {
         waiters.remove(&id);
     }
 }
 
-fn wake_all(waiters: HashMap<u64, Waker>) {
-    for waker in waiters.into_values() {
-        waker.wake();
+fn wake_all(waiters: HashMap<u64, Waiter>) {
+    for waiter in waiters.into_values() {
+        waiter.waker.wake();
     }
 }
 
@@ -389,40 +401,90 @@ fn pipe_error(kind: ErrorKind, name: &str, detail: &str) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{
+        io::ErrorKind,
+        sync::Arc,
+        time::{Duration, Instant},
+    };
 
     use super::MemPipe;
 
+    const DEADLINE: Duration = Duration::from_secs(1);
+    const TEST_TIMEOUT: Duration = Duration::from_secs(3);
+
     #[tokio::test]
-    async fn cancellation_unregisters_read_and_write_waiters() {
-        let pipe = Arc::new(MemPipe::new("cancel", 1));
-
-        let reading = Arc::clone(&pipe);
-        let reader = tokio::spawn(async move {
+    async fn canceling_latest_waiter_does_not_strand_other_deadlines() {
+        let read_pipe = Arc::new(MemPipe::new("cancel-read", 1));
+        let first_pipe = Arc::clone(&read_pipe);
+        let first_reader = tokio::spawn(async move {
             let mut byte = [0];
-            reading.read(&mut byte).await
+            first_pipe.read(&mut byte).await
         });
-        while pipe.lock_state().readers.is_empty() {
+        while read_pipe.lock_state().readers.len() != 1 {
             tokio::task::yield_now().await;
-        }
-        reader.abort();
-        let _ = reader.await;
-        {
-            let state = pipe.lock_state();
-            assert!(state.readers.is_empty());
-            assert!(state.read_timer.is_none());
         }
 
-        pipe.write(b"x").await.unwrap();
-        let writing = Arc::clone(&pipe);
-        let writer = tokio::spawn(async move { writing.write(b"y").await });
-        while pipe.lock_state().writers.is_empty() {
+        read_pipe.set_read_deadline(Some(Instant::now() + DEADLINE));
+        while !read_pipe
+            .lock_state()
+            .readers
+            .values()
+            .all(|waiter| waiter.timer.is_some())
+            || read_pipe.lock_state().readers.len() != 1
+        {
             tokio::task::yield_now().await;
         }
-        writer.abort();
-        let _ = writer.await;
-        let state = pipe.lock_state();
-        assert!(state.writers.is_empty());
-        assert!(state.write_timer.is_none());
+        let latest_pipe = Arc::clone(&read_pipe);
+        let latest_reader = tokio::spawn(async move {
+            let mut byte = [0];
+            latest_pipe.read(&mut byte).await
+        });
+        while read_pipe.lock_state().readers.len() != 2 {
+            tokio::task::yield_now().await;
+        }
+        latest_reader.abort();
+        let _ = latest_reader.await;
+        assert_eq!(read_pipe.lock_state().readers.len(), 1);
+
+        let error = tokio::time::timeout(TEST_TIMEOUT, first_reader)
+            .await
+            .expect("first reader was stranded after latest reader cancellation")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::TimedOut);
+
+        let write_pipe = Arc::new(MemPipe::new("cancel-write", 1));
+        write_pipe.write(b"x").await.unwrap();
+        let first_pipe = Arc::clone(&write_pipe);
+        let first_writer = tokio::spawn(async move { first_pipe.write(b"first").await });
+        while write_pipe.lock_state().writers.len() != 1 {
+            tokio::task::yield_now().await;
+        }
+
+        write_pipe.set_write_deadline(Some(Instant::now() + DEADLINE));
+        while !write_pipe
+            .lock_state()
+            .writers
+            .values()
+            .all(|waiter| waiter.timer.is_some())
+            || write_pipe.lock_state().writers.len() != 1
+        {
+            tokio::task::yield_now().await;
+        }
+        let latest_pipe = Arc::clone(&write_pipe);
+        let latest_writer = tokio::spawn(async move { latest_pipe.write(b"latest").await });
+        while write_pipe.lock_state().writers.len() != 2 {
+            tokio::task::yield_now().await;
+        }
+        latest_writer.abort();
+        let _ = latest_writer.await;
+        assert_eq!(write_pipe.lock_state().writers.len(), 1);
+
+        let error = tokio::time::timeout(TEST_TIMEOUT, first_writer)
+            .await
+            .expect("first writer was stranded after latest writer cancellation")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::TimedOut);
     }
 }

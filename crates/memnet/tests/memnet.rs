@@ -423,17 +423,19 @@ fn only_one_concurrent_listener_claims_an_address() {
 }
 
 #[tokio::test]
-async fn dropping_last_network_closes_registered_listeners() {
+async fn externally_retained_listener_survives_network_drop() {
     let network = Network::new();
     let listener = network.listen("tcp", "127.0.0.1:34567").unwrap();
-    let waiting = Arc::clone(&listener);
-    let accept = tokio::spawn(async move { waiting.accept().await });
-    tokio::task::yield_now().await;
-
     drop(network);
-    assert!(listener.is_closed());
-    assert_eq!(
-        accept.await.unwrap().unwrap_err().kind(),
-        ErrorKind::ConnectionAborted
-    );
+    assert!(!listener.is_closed());
+
+    let accepting = Arc::clone(&listener);
+    let accept = tokio::spawn(async move { accepting.accept().await.unwrap() });
+    let mut client = listener.dial("tcp", "127.0.0.1:34567").await.unwrap();
+    let mut server = accept.await.unwrap();
+
+    client.write_all(b"still-open").await.unwrap();
+    let mut message = [0; 10];
+    server.read_exact(&mut message).await.unwrap();
+    assert_eq!(&message, b"still-open");
 }

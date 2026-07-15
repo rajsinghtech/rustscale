@@ -33,6 +33,7 @@ WORKDIR /build
 # Copy only manifests first for layer caching.
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ ./crates/
+COPY vendor/boringtun/ ./vendor/boringtun/
 COPY include/ ./include/
 
 # Build release binaries. --locked ensures reproducible builds.

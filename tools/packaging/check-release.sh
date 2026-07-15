@@ -70,6 +70,7 @@ if grep -Eq -- '--(state|statedir|socket)=' packaging/systemd/rustscaled.service
     echo "systemd unit uses unsupported --flag=value daemon syntax" >&2
     exit 1
 fi
+grep -Fq 'COPY vendor/boringtun/ ./vendor/boringtun/' Dockerfile
 grep -q 'ln -s rustscale /usr/local/bin/tailscale' Dockerfile
 grep -q 'org.opencontainers.image.version' Dockerfile
 test "$(grep -c '^FROM .*@sha256:[0-9a-f]\{64\}' Dockerfile)" -eq 2

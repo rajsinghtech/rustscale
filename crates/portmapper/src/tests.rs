@@ -14,6 +14,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::time::timeout;
 
+use crate::client::ReleaseTestGate;
 use crate::{pcp, Client, GatewayInfo, MappingKind};
 
 /// A fake Internet Gateway Device for testing. Supports fake PMP, PCP,
@@ -26,11 +27,16 @@ struct FakeIgd {
     do_pcp: bool,
     do_upnp: bool,
     pmp_external_ip: Ipv4Addr,
+    pcp_mutation: Option<PcpMutation>,
     closed: Arc<AtomicBool>,
     pmp_recv_count: Arc<AtomicU32>,
+    pmp_map_count: Arc<AtomicU32>,
     pcp_recv_count: Arc<AtomicU32>,
+    pcp_map_count: Arc<AtomicU32>,
+    pcp_nonces: Arc<Mutex<Vec<[u8; 12]>>>,
     upnp_disco_count: Arc<AtomicU32>,
     upnp_add_count: Arc<AtomicU32>,
+    upnp_delete_count: Arc<AtomicU32>,
 }
 
 impl FakeIgd {
@@ -49,11 +55,16 @@ impl FakeIgd {
             do_pcp: opts.pcp,
             do_upnp: opts.upnp,
             pmp_external_ip: opts.pmp_external_ip,
+            pcp_mutation: opts.pcp_mutation,
             closed: closed.clone(),
             pmp_recv_count: Arc::new(AtomicU32::new(0)),
+            pmp_map_count: Arc::new(AtomicU32::new(0)),
             pcp_recv_count: Arc::new(AtomicU32::new(0)),
+            pcp_map_count: Arc::new(AtomicU32::new(0)),
+            pcp_nonces: Arc::new(Mutex::new(Vec::new())),
             upnp_disco_count: Arc::new(AtomicU32::new(0)),
             upnp_add_count: Arc::new(AtomicU32::new(0)),
+            upnp_delete_count: Arc::new(AtomicU32::new(0)),
         });
 
         // Spawn handlers.
@@ -126,6 +137,7 @@ impl FakeIgd {
             resp[11] = ip[3];
             let _ = self.pxp_sock.send_to(&resp, src).await;
         } else if op == 1 {
+            self.pmp_map_count.fetch_add(1, Ordering::Relaxed);
             let mut resp = [0u8; 16];
             resp[1] = 0x81; // reply | op 1
             resp[4..8].copy_from_slice(&12345u32.to_be_bytes());
@@ -150,8 +162,25 @@ impl FakeIgd {
                 let _ = self.pxp_sock.send_to(&resp, src).await;
             }
             1 if self.do_pcp && pkt.len() >= 60 => {
-                let resp = pcp::build_map_response(pkt);
-                let _ = self.pxp_sock.send_to(&resp, src).await;
+                self.pcp_map_count.fetch_add(1, Ordering::Relaxed);
+                let mut nonce = [0_u8; 12];
+                nonce.copy_from_slice(&pkt[24..36]);
+                self.pcp_nonces.lock().unwrap().push(nonce);
+                let mut resp = pcp::build_map_response(pkt);
+                match self.pcp_mutation {
+                    Some(PcpMutation::Nonce) => resp[24] ^= 1,
+                    Some(PcpMutation::Protocol) => resp[36] = 6,
+                    Some(PcpMutation::InternalPort) => {
+                        resp[40..42].copy_from_slice(&1u16.to_be_bytes());
+                    }
+                    _ => {}
+                }
+                let socket = if self.pcp_mutation == Some(PcpMutation::Source) {
+                    &self.upnp_sock
+                } else {
+                    &self.pxp_sock
+                };
+                let _ = socket.send_to(&resp, src).await;
             }
             _ => {}
         }
@@ -251,6 +280,7 @@ impl FakeIgd {
                 return;
             }
             if action.contains("DeletePortMapping") {
+                self.upnp_delete_count.fetch_add(1, Ordering::Relaxed);
                 write_soap_response(stream, "<?xml version=\"1.0\"?><s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body><u:DeletePortMappingResponse/></s:Body></s:Envelope>").await;
                 return;
             }
@@ -270,11 +300,20 @@ async fn write_soap_response(stream: &mut (impl AsyncWriteExt + Unpin), body: &s
     let _ = stream.write_all(resp.as_bytes()).await;
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PcpMutation {
+    Nonce,
+    Protocol,
+    InternalPort,
+    Source,
+}
+
 struct IgdOpts {
     pmp: bool,
     pcp: bool,
     upnp: bool,
     pmp_external_ip: Ipv4Addr,
+    pcp_mutation: Option<PcpMutation>,
 }
 
 impl Default for IgdOpts {
@@ -284,6 +323,7 @@ impl Default for IgdOpts {
             pcp: false,
             upnp: false,
             pmp_external_ip: Ipv4Addr::new(123, 123, 123, 123),
+            pcp_mutation: None,
         }
     }
 }
@@ -412,6 +452,65 @@ async fn test_pcp_probe_and_mapping() {
     igd.close();
 }
 
+#[tokio::test]
+async fn pcp_map_identity_mismatches_fail_closed() {
+    for mutation in [
+        PcpMutation::Nonce,
+        PcpMutation::Protocol,
+        PcpMutation::InternalPort,
+        PcpMutation::Source,
+    ] {
+        let igd = FakeIgd::start(IgdOpts {
+            pcp: true,
+            pcp_mutation: Some(mutation),
+            ..Default::default()
+        })
+        .await;
+        let client = make_test_client(&igd);
+        assert!(
+            client.create_or_get_mapping().await.is_err(),
+            "{mutation:?} response must fail"
+        );
+        assert!(client.cached_mapping().is_none());
+        igd.close();
+    }
+}
+
+#[tokio::test]
+async fn pcp_nonce_is_reused_for_renewal_and_delete() {
+    let igd = FakeIgd::start(IgdOpts {
+        pcp: true,
+        ..Default::default()
+    })
+    .await;
+    let client = make_test_client(&igd);
+    let clock = Arc::new(Mutex::new(Instant::now()));
+    client.set_test_clock(Box::new({
+        let clock = clock.clone();
+        move || *clock.lock().unwrap()
+    }));
+
+    client.create_or_get_mapping().await.expect("PCP create");
+    *clock.lock().unwrap() += Duration::from_secs(3601);
+    client.create_or_get_mapping().await.expect("PCP renewal");
+    client.close();
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if igd.pcp_nonces.lock().unwrap().len() >= 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("PCP deletion");
+    let nonces = igd.pcp_nonces.lock().unwrap();
+    assert_eq!(nonces.len(), 3);
+    assert_ne!(nonces[0], [0; 12]);
+    assert!(nonces.iter().all(|nonce| *nonce == nonces[0]));
+    igd.close();
+}
+
 // --- UPnP probe + mapping test ---
 
 #[tokio::test]
@@ -484,6 +583,77 @@ async fn test_cached_mapping_or_start_creating() {
 
     client.close();
     igd.close();
+}
+
+// --- Concurrent create calls are singleflight per client ---
+
+async fn assert_concurrent_create_singleflight(opts: IgdOpts, expected: MappingKind) {
+    let igd = FakeIgd::start(opts).await;
+    let client = make_test_client(&igd);
+    let barrier = Arc::new(tokio::sync::Barrier::new(4));
+    let mut workers = Vec::new();
+    for _ in 0..3 {
+        let client = client.clone();
+        let barrier = barrier.clone();
+        workers.push(tokio::spawn(async move {
+            barrier.wait().await;
+            client.create_or_get_mapping().await
+        }));
+    }
+    barrier.wait().await;
+
+    let mut mappings = Vec::new();
+    for worker in workers {
+        mappings.push(worker.await.unwrap().expect("singleflight mapping"));
+    }
+    assert!(mappings.iter().all(|mapping| mapping.kind == expected));
+    assert!(mappings
+        .iter()
+        .all(|mapping| mapping.external == mappings[0].external));
+    match expected {
+        MappingKind::Pmp => assert_eq!(igd.pmp_map_count.load(Ordering::SeqCst), 1),
+        MappingKind::Pcp => assert_eq!(igd.pcp_map_count.load(Ordering::SeqCst), 1),
+        MappingKind::Upnp => assert_eq!(igd.upnp_add_count.load(Ordering::SeqCst), 1),
+    }
+
+    client.close();
+    igd.close();
+}
+
+#[tokio::test]
+async fn concurrent_pmp_create_is_singleflight() {
+    assert_concurrent_create_singleflight(
+        IgdOpts {
+            pmp: true,
+            ..Default::default()
+        },
+        MappingKind::Pmp,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn concurrent_pcp_create_is_singleflight() {
+    assert_concurrent_create_singleflight(
+        IgdOpts {
+            pcp: true,
+            ..Default::default()
+        },
+        MappingKind::Pcp,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn concurrent_upnp_create_is_singleflight() {
+    assert_concurrent_create_singleflight(
+        IgdOpts {
+            upnp: true,
+            ..Default::default()
+        },
+        MappingKind::Upnp,
+    )
+    .await;
 }
 
 // --- Gateway change invalidates mappings ---
@@ -592,6 +762,91 @@ async fn pcp_only_gateway_recovers_after_reappearance() {
 #[tokio::test]
 async fn upnp_only_gateway_recovers_after_reappearance() {
     assert_gateway_reappearance_reprobes(
+        IgdOpts {
+            upnp: true,
+            ..Default::default()
+        },
+        MappingKind::Upnp,
+    )
+    .await;
+}
+
+// --- Identical reappearance waits for old release completion ---
+
+async fn assert_identical_replacement_waits_for_release(opts: IgdOpts, expected: MappingKind) {
+    let igd = FakeIgd::start(opts).await;
+    let client = make_test_client(&igd);
+    let first = client.create_or_get_mapping().await.expect("first mapping");
+    assert_eq!(first.kind, expected);
+
+    let gate = ReleaseTestGate::new();
+    client.set_test_release_gate(Some(gate.clone()));
+    client.set_gateway_lookup(Box::new(|| None));
+    assert_eq!(
+        client.get_cached_mapping_or_start_creating_one(),
+        (None, false)
+    );
+    gate.wait_reached().await;
+
+    let pmp_maps_before = igd.pmp_map_count.load(Ordering::SeqCst);
+    let upnp_adds_before = igd.upnp_add_count.load(Ordering::SeqCst);
+    client.set_gateway_lookup(Box::new(|| {
+        Some(GatewayInfo {
+            gateway: Ipv4Addr::LOCALHOST,
+            self_ip: Ipv4Addr::new(1, 2, 3, 4),
+        })
+    }));
+    let replacement_client = client.clone();
+    let replacement = tokio::spawn(async move { replacement_client.create_or_get_mapping().await });
+
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    assert!(
+        !replacement.is_finished(),
+        "replacement bypassed old release"
+    );
+    assert_eq!(igd.pmp_map_count.load(Ordering::SeqCst), pmp_maps_before);
+    assert_eq!(igd.upnp_add_count.load(Ordering::SeqCst), upnp_adds_before);
+
+    gate.resume().await;
+    let second = replacement.await.unwrap().expect("replacement mapping");
+    assert_eq!(second.kind, expected);
+    match expected {
+        MappingKind::Pmp => {
+            assert_eq!(
+                igd.pmp_map_count.load(Ordering::SeqCst),
+                pmp_maps_before + 2
+            );
+        }
+        MappingKind::Upnp => {
+            assert_eq!(igd.upnp_delete_count.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                igd.upnp_add_count.load(Ordering::SeqCst),
+                upnp_adds_before + 1
+            );
+        }
+        MappingKind::Pcp => unreachable!(),
+    }
+
+    client.set_test_release_gate(None);
+    client.close();
+    igd.close();
+}
+
+#[tokio::test]
+async fn identical_pmp_mapping_waits_for_delayed_delete() {
+    assert_identical_replacement_waits_for_release(
+        IgdOpts {
+            pmp: true,
+            ..Default::default()
+        },
+        MappingKind::Pmp,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn identical_upnp_mapping_waits_for_delayed_delete() {
+    assert_identical_replacement_waits_for_release(
         IgdOpts {
             upnp: true,
             ..Default::default()

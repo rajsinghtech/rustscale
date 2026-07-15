@@ -18,6 +18,8 @@ pub(crate) const PCP_OP_REPLY: u8 = 0x80;
 
 /// Protocol number for UDP (IANA).
 pub(crate) const PCP_UDP: u8 = 17;
+/// RFC 6887 MAP operation nonce.
+pub(crate) type PcpNonce = [u8; 12];
 
 /// Result codes (RFC 6887 §7.4).
 #[allow(dead_code)]
@@ -43,6 +45,9 @@ pub struct PcpMapResponse {
     pub lifetime: u32,
     #[allow(dead_code)]
     pub epoch: u32,
+    pub nonce: PcpNonce,
+    pub protocol: u8,
+    pub internal_port: u16,
     pub external: SocketAddr,
 }
 
@@ -63,14 +68,15 @@ pub(crate) fn build_announce_request(self_ip: Ipv4Addr) -> [u8; 24] {
 /// `self_ip` is our local IPv4. `local_port` is the internal port to map.
 /// `prev_port` is the previously assigned external port (0 = any).
 /// `lifetime_sec` is the desired lease (0 = delete). `prev_external_ip` is
-/// the previous external IP if known (0.0.0.0 if not). A random 96-bit nonce
-/// is generated for the request.
+/// the previous external IP if known (0.0.0.0 if not). `nonce` identifies the
+/// mapping and must be reused for renewals and deletion.
 pub(crate) fn build_map_request(
     self_ip: Ipv4Addr,
     local_port: u16,
     prev_port: u16,
     lifetime_sec: u32,
     prev_external_ip: Ipv4Addr,
+    nonce: PcpNonce,
 ) -> [u8; 60] {
     let mut pkt = [0u8; 60];
     // Common header (24 bytes).
@@ -81,11 +87,8 @@ pub(crate) fn build_map_request(
 
     // MAP option (36 bytes, starting at offset 24).
     let map_op = &mut pkt[24..60];
-    // 96-bit mapping nonce (random).
-    {
-        use rand::RngCore;
-        rand::rngs::OsRng.fill_bytes(&mut map_op[0..12]);
-    }
+    // 96-bit mapping nonce.
+    map_op[0..12].copy_from_slice(&nonce);
     // map_op[12] = protocol (UDP)
     map_op[12] = PCP_UDP;
     // map_op[13..16] = reserved
@@ -165,10 +168,15 @@ pub fn parse_map_response(resp: &[u8]) -> Option<PcpMapResponse> {
     ext_ip_bytes.copy_from_slice(&resp[44..60]);
     let external = ip16_to_socketaddr(&ext_ip_bytes, external_port);
 
+    let mut nonce = [0_u8; 12];
+    nonce.copy_from_slice(&resp[24..36]);
     Some(PcpMapResponse {
         result_code: hdr.result_code,
         lifetime: hdr.lifetime,
         epoch: hdr.epoch,
+        nonce,
+        protocol: resp[36],
+        internal_port: u16::from_be_bytes([resp[40], resp[41]]),
         external,
     })
 }
@@ -250,6 +258,7 @@ mod tests {
             4242,
             7200,
             Ipv4Addr::UNSPECIFIED,
+            [7; 12],
         );
         assert_eq!(pkt[0], PCP_VERSION);
         assert_eq!(pkt[1], PCP_OP_MAP);
@@ -270,10 +279,20 @@ mod tests {
 
     #[test]
     fn roundtrip_map_response_via_fake_igd() {
-        let req = build_map_request(Ipv4Addr::LOCALHOST, 12345, 0, 7200, Ipv4Addr::UNSPECIFIED);
+        let req = build_map_request(
+            Ipv4Addr::LOCALHOST,
+            12345,
+            0,
+            7200,
+            Ipv4Addr::UNSPECIFIED,
+            [9; 12],
+        );
         let resp = build_map_response(&req);
         let m = parse_map_response(&resp).expect("parse fake map response");
         assert_eq!(m.result_code, 0);
+        assert_eq!(m.nonce, [9; 12]);
+        assert_eq!(m.protocol, PCP_UDP);
+        assert_eq!(m.internal_port, 12345);
         assert_eq!(m.external.port(), 4242);
     }
 }

@@ -112,6 +112,7 @@ pub(crate) fn spawn_map_update_task(
     ipn_backend: Arc<IpnBackend>,
     key_rotation_ctx: Option<KeyRotationCtx>,
     map_session: Arc<MapSessionState>,
+    c2n_router: Arc<C2nRouter>,
     suggested_exit_node: Arc<RwLock<String>>,
     client_updater: Arc<std::sync::Mutex<rustscale_clientupdate::ClientUpdater>>,
 ) -> JoinHandle<()> {
@@ -252,9 +253,15 @@ pub(crate) fn spawn_map_update_task(
                                         ..Default::default()
                                     };
                                     let ss = map_session.clone();
+                                    let router = c2n_router.clone();
                                     tokio::spawn(async move {
                                         cc_new
-                                            .stream_map_loop(&new_map_req, new_tx, Some(ss))
+                                            .stream_map_loop_with_c2n(
+                                                &new_map_req,
+                                                new_tx,
+                                                Some(ss),
+                                                router,
+                                            )
                                             .await;
                                     });
                                     map_rx = new_rx;

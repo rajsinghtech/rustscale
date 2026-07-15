@@ -576,11 +576,9 @@ fn notifications_are_nonblocking_coalesced_and_subscription_drop_is_reentrant_sa
 
 #[cfg(windows)]
 #[test]
-fn windows_default_policy_fails_closed_without_registry_backend() {
-    assert_eq!(
-        default_engine(PolicyScope::Device).err().unwrap().kind,
-        PolicyErrorKind::Unsupported
-    );
+fn windows_native_posture_provider_uses_current_provider_contract() {
+    fn assert_provider<T: PolicyProvider>() {}
+    assert_provider::<NativePostureProvider>();
 }
 
 #[test]

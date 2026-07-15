@@ -7,8 +7,12 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(any(test, target_os = "macos", target_os = "windows"))]
+mod command;
 mod engine;
 mod keys;
+#[cfg(any(test, target_os = "macos", target_os = "windows"))]
+mod platform;
 mod provider;
 mod value;
 
@@ -19,6 +23,8 @@ pub use engine::{
 pub use keys::{
     well_known_definitions, PolicyKey, PolicyScope, Scope, SettingDefinition, ValueType,
 };
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub use platform::NativePostureProvider;
 pub use provider::{
     environment_variable_name, EnvironmentProvider, JsonFileProvider, MemoryProvider,
     PolicyProvider, ProviderSubscription, ProviderValues, StubPolicyProvider, MAX_ENV_VALUE_SIZE,
@@ -29,7 +35,6 @@ pub use value::{
 };
 
 use serde::{Deserialize, Serialize};
-#[cfg(not(windows))]
 use std::sync::Arc;
 
 /// Conventional Unix policy file path.
@@ -88,48 +93,46 @@ impl PolicyError {
 
 /// Creates a platform-default engine.
 ///
-/// Unix uses an optional bounded JSON file followed by environment policy, so
-/// environment settings win same-scope conflicts. Windows currently uses a
-/// cfg-safe empty provider until a registry implementation can be added without
-/// introducing unsafe code or a new platform dependency.
+/// Unix uses an optional bounded JSON file and environment policy. macOS and
+/// Windows additionally use a bounded native managed-policy provider for the
+/// posture preference. Native provider failures abort construction rather than
+/// silently installing an empty, permissive snapshot.
 pub fn default_engine(scope: PolicyScope) -> Result<PolicyEngine, PolicyError> {
-    #[cfg(windows)]
-    {
-        // Until a safe registry backend is available, do not start with an
-        // empty policy and silently permit settings that HKLM/HKCU might deny.
-        let _ = scope;
-        Err(PolicyError::new(PolicyErrorKind::Unsupported))
-    }
+    let engine = PolicyEngine::well_known(scope)?;
 
-    #[cfg(not(windows))]
-    {
-        let engine = PolicyEngine::well_known(scope)?;
-        #[cfg(unix)]
-        {
-            engine.add_provider_with_precedence(
-                "system policy file",
-                PolicyScope::Device,
-                ProviderPrecedence::Managed,
-                Arc::new(JsonFileProvider::optional(DEFAULT_POLICY_PATH)),
-            )?;
-            engine.add_provider_with_precedence(
-                "debug environment",
-                PolicyScope::Device,
-                ProviderPrecedence::Debug,
-                Arc::new(EnvironmentProvider::new()),
-            )?;
-        }
-        #[cfg(not(any(unix, windows)))]
-        {
-            engine.add_provider_with_precedence(
-                "platform policy (unsupported)",
-                PolicyScope::Device,
-                ProviderPrecedence::Platform,
-                Arc::new(StubPolicyProvider::new()),
-            )?;
-        }
-        Ok(engine)
-    }
+    #[cfg(unix)]
+    engine.add_provider_with_precedence(
+        "system policy file",
+        PolicyScope::Device,
+        ProviderPrecedence::Managed,
+        Arc::new(JsonFileProvider::optional(DEFAULT_POLICY_PATH)),
+    )?;
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    engine.add_provider_with_precedence(
+        "native managed posture policy",
+        PolicyScope::Device,
+        ProviderPrecedence::Managed,
+        Arc::new(NativePostureProvider::new()),
+    )?;
+
+    #[cfg(unix)]
+    engine.add_provider_with_precedence(
+        "debug environment",
+        PolicyScope::Device,
+        ProviderPrecedence::Debug,
+        Arc::new(EnvironmentProvider::new()),
+    )?;
+
+    #[cfg(not(any(unix, windows)))]
+    engine.add_provider_with_precedence(
+        "platform policy (unsupported)",
+        PolicyScope::Device,
+        ProviderPrecedence::Platform,
+        Arc::new(StubPolicyProvider::new()),
+    )?;
+
+    Ok(engine)
 }
 
 /// Backwards-compatible names for the original single-store skeleton.

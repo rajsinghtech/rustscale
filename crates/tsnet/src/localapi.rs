@@ -213,6 +213,8 @@ pub(crate) struct LocalApiState {
     /// value is swapped — so a `OnceLock` suffices). Used to apply shields-up
     /// mode changes from `PATCH /prefs` without a full filter rebuild.
     pub filter: std::sync::OnceLock<Arc<std::sync::Mutex<Filter>>>,
+    /// Live posture preference mirrored into the C2N posture service.
+    pub posture_checking: Arc<std::sync::atomic::AtomicBool>,
     /// Shared route table (for applying exit-node pref changes directly).
     /// None when the server is not fully up (e.g. start_localapi_only).
     pub route_table: Option<Arc<RwLock<crate::routing::RouteTable>>>,
@@ -311,6 +313,9 @@ async fn commit_prefs_update(
         }
         *prefs = candidate;
     }
+    state
+        .posture_checking
+        .store(prefs.PostureChecking, std::sync::atomic::Ordering::Release);
     Ok((serde_json::to_value(&*prefs).unwrap_or_default(), changed))
 }
 
@@ -3440,6 +3445,10 @@ mod tests {
     /// Build a test LocalApiState with mock data. The IPN backend is
     /// initialized to the Running state to match the pre-IPN behavior.
     async fn make_test_state() -> Arc<LocalApiState> {
+        make_test_state_with_state_dir(None).await
+    }
+
+    async fn make_test_state_with_state_dir(state_dir: Option<PathBuf>) -> Arc<LocalApiState> {
         let node_key = NodePrivate::generate();
         let disco_key = DiscoPrivate::generate();
 
@@ -3511,6 +3520,7 @@ mod tests {
                 WantRunning: true,
                 ..Default::default()
             })),
+            posture_checking: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             exit_node_selection: Arc::new(RwLock::new(crate::ExitNodeSelection::default())),
             tailscale_ips: vec!["100.64.0.1".parse().unwrap()],
             our_fqdn: "test.tailnet.ts.net.".into(),
@@ -3521,7 +3531,7 @@ mod tests {
             ipn_backend,
             derp_map: rustscale_tailcfg::DERPMap::default(),
             command_tx: None,
-            state_dir: None,
+            state_dir,
             auth_url: Arc::new(std::sync::Mutex::new(None)),
             login_trigger: Arc::new(tokio::sync::Notify::new()),
             serve_config: Arc::new(RwLock::new(ServeConfig::default())),
@@ -4643,6 +4653,7 @@ mod tests {
             capture: state.capture.clone(),
             metrics: default_metric_registry(),
             prefs: state.prefs.clone(),
+            posture_checking: state.posture_checking.clone(),
             exit_node_selection: state.exit_node_selection.clone(),
             tailscale_ips: state.tailscale_ips.clone(),
             our_fqdn: state.our_fqdn.clone(),
@@ -4875,6 +4886,7 @@ mod tests {
             capture: base.capture.clone(),
             metrics: default_metric_registry(),
             prefs: base.prefs.clone(),
+            posture_checking: base.posture_checking.clone(),
             exit_node_selection: base.exit_node_selection.clone(),
             tailscale_ips: base.tailscale_ips.clone(),
             our_fqdn: base.our_fqdn.clone(),
@@ -5347,6 +5359,119 @@ mod tests {
         );
     }
 
+    fn posture_mask(enabled: bool) -> MaskedPrefs {
+        MaskedPrefs {
+            Prefs: Prefs {
+                PostureChecking: enabled,
+                ..Prefs::default()
+            },
+            PostureCheckingSet: true,
+            ..MaskedPrefs::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn posture_transaction_rolls_back_on_persistence_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let not_a_directory = temp.path().join("state-file");
+        std::fs::write(&not_a_directory, b"not a directory").unwrap();
+        let state = make_test_state_with_state_dir(Some(not_a_directory)).await;
+        let mask = posture_mask(true);
+
+        assert!(commit_prefs_update(&state, |prefs| mask.apply_to(prefs))
+            .await
+            .is_err());
+        assert!(!state.prefs.read().await.PostureChecking);
+        assert!(!state
+            .posture_checking
+            .load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn patch_prefs_returns_failure_when_persistence_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let not_a_directory = temp.path().join("state-file");
+        std::fs::write(&not_a_directory, b"not a directory").unwrap();
+        let state = make_test_state_with_state_dir(Some(not_a_directory)).await;
+        let body = r#"{"PostureChecking":true,"PostureCheckingSet":true}"#;
+        let request = format!(
+            "PATCH /localapi/v0/prefs HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+
+        let response =
+            send_request_with_identity(request.as_bytes(), &state, test_rw_identity()).await;
+        assert!(response.contains("500 Internal Server Error"));
+        assert!(!state.prefs.read().await.PostureChecking);
+        assert!(!state
+            .posture_checking
+            .load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn concurrent_posture_edits_publish_in_serial_order() {
+        let state = make_test_state().await;
+        let held = state.prefs.write().await;
+
+        let (enable_ready_tx, enable_ready_rx) = tokio::sync::oneshot::channel();
+        let enable = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                let _ = enable_ready_tx.send(());
+                let mask = posture_mask(true);
+                commit_prefs_update(&state, |prefs| mask.apply_to(prefs)).await
+            })
+        };
+        enable_ready_rx.await.unwrap();
+        tokio::task::yield_now().await; // queue enable behind the held writer
+
+        let (disable_ready_tx, disable_ready_rx) = tokio::sync::oneshot::channel();
+        let disable = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                let _ = disable_ready_tx.send(());
+                let mask = posture_mask(false);
+                commit_prefs_update(&state, |prefs| mask.apply_to(prefs)).await
+            })
+        };
+        disable_ready_rx.await.unwrap();
+        tokio::task::yield_now().await; // queue disable after enable
+
+        drop(held);
+
+        enable.await.unwrap().unwrap();
+        disable.await.unwrap().unwrap();
+        assert!(!state.prefs.read().await.PostureChecking);
+        assert!(!state
+            .posture_checking
+            .load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn config_reload_mask_persists_and_publishes_same_posture_value() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.json");
+        std::fs::write(
+            &config_path,
+            br#"{"Version":"alpha0","PostureChecking":true}"#,
+        )
+        .unwrap();
+        let config = rustscale_conffile::Config::load(config_path.to_str().unwrap()).unwrap();
+        let mask = config.parsed.to_prefs();
+        let state_dir = temp.path().join("state");
+        let state = make_test_state_with_state_dir(Some(state_dir.clone())).await;
+
+        commit_prefs_update(&state, |prefs| mask.apply_to(prefs))
+            .await
+            .unwrap();
+        assert!(state.prefs.read().await.PostureChecking);
+        assert!(state
+            .posture_checking
+            .load(std::sync::atomic::Ordering::Acquire));
+        assert!(Prefs::load(&state_dir).unwrap().PostureChecking);
+    }
+
     #[tokio::test]
     async fn test_patch_prefs_cannot_bypass_preference_policy() {
         let state = make_policy_test_state().await;
@@ -5391,6 +5516,23 @@ mod tests {
         });
         let state = make_policy_test_state_with(policy).await;
         assert_eq!(state.prefs.read().await.AutoUpdate, Some(true));
+    }
+
+    #[tokio::test]
+    async fn test_patch_prefs_updates_live_posture_choice() {
+        let state = make_test_state().await;
+        let body = r#"{"PostureChecking":true,"PostureCheckingSet":true}"#;
+        let req = format!(
+            "PATCH /localapi/v0/prefs HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let response = send_request_with_identity(req.as_bytes(), &state, test_rw_identity()).await;
+        assert!(response.contains("200 OK"), "response: {response}");
+        assert!(state
+            .posture_checking
+            .load(std::sync::atomic::Ordering::Acquire));
+        assert!(state.prefs.read().await.PostureChecking);
     }
 
     #[tokio::test]

@@ -213,6 +213,33 @@ fn linux_batch_requires_scalar_handler<'a>(
     })
 }
 
+/// Linux UDP send configuration sampled once when the socket is installed.
+/// Runtime capability failures may only turn these features off.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LinuxUdpSendConfig {
+    use_batch: bool,
+    disable_udp_gso: bool,
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl LinuxUdpSendConfig {
+    #[cfg(target_os = "linux")]
+    fn from_environment() -> Self {
+        Self::from_environment_presence(
+            std::env::var_os("RUSTSCALE_DISABLE_LINUX_UDP_BATCH").is_some(),
+            std::env::var_os("RUSTSCALE_DISABLE_UDP_GSO").is_some(),
+        )
+    }
+
+    fn from_environment_presence(disable_batch: bool, disable_gso: bool) -> Self {
+        Self {
+            use_batch: !disable_batch,
+            disable_udp_gso: disable_batch || disable_gso,
+        }
+    }
+}
+
 /// Linux UDP receive configuration sampled once when the receive task starts.
 ///
 /// The bounded `recvmmsg` receive and handoff path, including its guarded UDP
@@ -840,8 +867,13 @@ struct Inner {
     node_public: RwLock<NodePublic>,
     disco: DiscoIo,
     udp: Option<Arc<UdpSocket>>,
+    /// TX `sendmmsg` availability. Linux starts batched when permitted by the
+    /// process configuration, then permanently falls back to ordinary Tokio
+    /// sends if the syscall is unavailable or blocked.
+    #[cfg(target_os = "linux")]
+    udp_tx_batch: AtomicBool,
     /// TX UDP GSO availability, probed once per direct UDP socket and disabled
-    /// permanently if Linux reports EIO for a GSO send.
+    /// permanently if a GSO send reports an unsupported/checksum-offload error.
     #[cfg(target_os = "linux")]
     udp_tx_gso: AtomicBool,
     local_udp_addrs: RwLock<Vec<String>>,
@@ -1327,9 +1359,15 @@ impl Magicsock {
         configure_selected_udp_socket(udp.as_deref(), udp_socket_buffers::configure);
 
         #[cfg(target_os = "linux")]
-        let udp_tx_gso = udp
-            .as_ref()
-            .is_some_and(|socket| udp_batch::supports_gso(socket));
+        let udp_send_config = LinuxUdpSendConfig::from_environment();
+        #[cfg(target_os = "linux")]
+        let udp_tx_batch = udp_send_config.use_batch;
+        #[cfg(target_os = "linux")]
+        let udp_tx_gso = udp_tx_batch
+            && !udp_send_config.disable_udp_gso
+            && udp
+                .as_ref()
+                .is_some_and(|socket| udp_batch::supports_gso(socket));
 
         // Create the DERP manager with the home region connection + DERPMap.
         let (derp, derp_recv_rx, reconnect_rx) = DerpManager::new(
@@ -1366,6 +1404,8 @@ impl Magicsock {
             node_public: RwLock::new(node_public),
             disco,
             udp,
+            #[cfg(target_os = "linux")]
+            udp_tx_batch: AtomicBool::new(udp_tx_batch),
             #[cfg(target_os = "linux")]
             udp_tx_gso: AtomicBool::new(udp_tx_gso),
             local_udp_addrs: RwLock::new(local_udp_addrs),
@@ -1914,22 +1954,54 @@ impl Magicsock {
         let mut first_error = None;
         let (mut sent_packets, mut sent_bytes) = (0, 0);
         while head < datagrams.len() {
-            let end = (head + udp_batch::MAX_BATCH).min(datagrams.len());
-            let use_gso = self.inner.udp_tx_gso.load(Ordering::Relaxed);
-            let result = udp
-                .async_io(Interest::WRITABLE, || {
+            let use_batch = self.inner.udp_tx_batch.load(Ordering::Relaxed);
+            let use_gso = use_batch && self.inner.udp_tx_gso.load(Ordering::Relaxed);
+            let result = if use_batch {
+                let end = (head + udp_batch::MAX_BATCH).min(datagrams.len());
+                udp.async_io(Interest::WRITABLE, || {
                     if use_gso {
                         udp_batch::send_gso(udp, addr, &datagrams[head..end])
                     } else {
                         udp_batch::send(udp, addr, &datagrams[head..end])
                     }
                 })
-                .await;
+                .await
+            } else {
+                let datagram = datagrams[head].as_ref();
+                udp.send_to(datagram, addr).await.and_then(|sent| {
+                    if sent == datagram.len() {
+                        Ok(1)
+                    } else {
+                        Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "UDP send reported a partial datagram",
+                        ))
+                    }
+                })
+            };
             if use_gso && result.as_ref().is_err_and(should_disable_udp_gso) {
-                self.inner.udp_tx_gso.store(false, Ordering::Relaxed);
+                if self.inner.udp_tx_gso.swap(false, Ordering::Relaxed) {
+                    eprintln!(
+                        "rustscale: Linux UDP GSO send failed; permanently falling back to plain sends"
+                    );
+                }
                 // `sendmmsg` reports no progress with an error, so retry this
-                // exact unsent suffix through the independently exercised
-                // plain path while retaining AsyncFd readiness ownership.
+                // exact unsent suffix without UDP_SEGMENT metadata.
+                continue;
+            }
+            if use_batch
+                && result
+                    .as_ref()
+                    .is_err_and(udp_batch::sendmmsg_is_unsupported)
+            {
+                if self.inner.udp_tx_batch.swap(false, Ordering::Relaxed) {
+                    self.inner.udp_tx_gso.store(false, Ordering::Relaxed);
+                    eprintln!(
+                        "rustscale: Linux sendmmsg unavailable; permanently falling back to ordinary UDP sends"
+                    );
+                }
+                // The failed batch made no progress. Retry its exact head with
+                // Tokio's ordinary UDP path, preserving ordering and accounting.
                 continue;
             }
             let sent = advance_direct_batch(&mut head, datagrams.len(), &mut first_error, result);
@@ -4233,6 +4305,31 @@ mod linux_batch_tests {
                 Some(b"ordinary-after".as_slice()),
             ]));
         }
+    }
+
+    #[test]
+    fn linux_send_configuration_preserves_independent_fallbacks() {
+        assert_eq!(
+            LinuxUdpSendConfig::from_environment_presence(false, false),
+            LinuxUdpSendConfig {
+                use_batch: true,
+                disable_udp_gso: false,
+            }
+        );
+        assert_eq!(
+            LinuxUdpSendConfig::from_environment_presence(false, true),
+            LinuxUdpSendConfig {
+                use_batch: true,
+                disable_udp_gso: true,
+            }
+        );
+        assert_eq!(
+            LinuxUdpSendConfig::from_environment_presence(true, false),
+            LinuxUdpSendConfig {
+                use_batch: false,
+                disable_udp_gso: true,
+            }
+        );
     }
 
     #[test]

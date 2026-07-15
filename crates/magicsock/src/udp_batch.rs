@@ -529,11 +529,16 @@ fn probe_gso(socket: &UdpSocket) -> io::Result<()> {
             ptr::from_mut(&mut len),
         )
     };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
+    if result != 0 {
+        return Err(io::Error::last_os_error());
     }
+    if len as usize != mem::size_of_val(&segment_size) {
+        return invalid_data("UDP_SEGMENT capability probe returned an unexpected value size");
+    }
+    if segment_size != 0 {
+        return invalid_data("UDP_SEGMENT socket-wide default is unexpectedly nonzero");
+    }
+    Ok(())
 }
 
 /// Best-effort UDP GRO enablement. Receive and send offloads are independent
@@ -615,6 +620,14 @@ pub(crate) fn recvmmsg_is_unsupported(error: &io::Error) -> bool {
         error.raw_os_error(),
         Some(libc::ENOSYS | libc::EPERM | libc::EACCES)
     )
+}
+
+/// True when batched transmit is unambiguously unavailable to this process.
+/// `EPERM`/`EACCES` are deliberately excluded because outbound firewall rules
+/// can report them; those remain ordinary lost-UDP results rather than
+/// permanently changing the socket mode.
+pub(crate) fn sendmmsg_is_unsupported(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(libc::ENOSYS | libc::EOPNOTSUPP))
 }
 
 fn plan<T: AsRef<[u8]>>(addr: SocketAddr, datagrams: &[T]) -> ([PlannedMessage; MAX_BATCH], usize) {
@@ -1069,9 +1082,10 @@ impl ReceiveBatch {
             if let Some(payload_len) = parsed.gro_payload_len {
                 self.last_gro_payload_len = Some(payload_len);
             }
-            let segments = parsed
-                .gro_size
-                .map_or(1, |size| length.div_ceil(usize::from(size)).max(1));
+            let segments = match parsed.gro_size {
+                Some(size) => validate_gro_segments(length, size)?,
+                None => 1,
+            };
             if output + segments > MAX_BATCH {
                 return invalid_data("splitting UDP GRO packet would overflow batch");
             }
@@ -1274,6 +1288,9 @@ fn parse_control(control: &[u8]) -> io::Result<ParsedControl> {
             parsed.gro_size = Some(parse_gro_size(data)?);
             parsed.gro_payload_len = Some(data.len());
         } else if header.cmsg_level == libc::SOL_SOCKET && header.cmsg_type == libc::SO_RXQ_OVFL {
+            if parsed.rxq_overflow.is_some() {
+                return invalid_data("duplicate SO_RXQ_OVFL control message");
+            }
             if data.len() != RXQ_OVFL_DATA_LEN {
                 return invalid_data("SO_RXQ_OVFL control payload is not exactly a u32");
             }
@@ -1302,6 +1319,17 @@ fn parse_control(control: &[u8]) -> io::Result<ParsedControl> {
         offset += next;
     }
     Ok(parsed)
+}
+
+fn validate_gro_segments(length: usize, segment_size: u16) -> io::Result<usize> {
+    if length == 0 {
+        return invalid_data("UDP_GRO control accompanied an empty payload");
+    }
+    let segments = length.div_ceil(usize::from(segment_size));
+    if segments > MAX_GSO_SEGMENTS {
+        return invalid_data("UDP_GRO control exceeds the Linux segment limit");
+    }
+    Ok(segments)
 }
 
 fn parse_gro_size(data: &[u8]) -> io::Result<u16> {
@@ -1572,14 +1600,27 @@ mod tests {
     }
 
     #[test]
-    fn recvmmsg_seccomp_rejections_fall_back_but_socket_failures_do_not() {
+    fn mmsg_seccomp_rejections_fall_back_but_socket_failures_do_not() {
         for errno in [libc::ENOSYS, libc::EPERM, libc::EACCES] {
             assert!(recvmmsg_is_unsupported(&io::Error::from_raw_os_error(
                 errno
             )));
         }
-        for errno in [libc::EBADF, libc::ECONNREFUSED, libc::EIO] {
-            assert!(!recvmmsg_is_unsupported(&io::Error::from_raw_os_error(
+        for errno in [libc::ENOSYS, libc::EOPNOTSUPP] {
+            assert!(sendmmsg_is_unsupported(&io::Error::from_raw_os_error(
+                errno
+            )));
+        }
+        assert!(!recvmmsg_is_unsupported(&io::Error::from_raw_os_error(
+            libc::EOPNOTSUPP
+        )));
+        for errno in [libc::EBADF, libc::ECONNREFUSED, libc::EIO, libc::EINVAL] {
+            let error = io::Error::from_raw_os_error(errno);
+            assert!(!recvmmsg_is_unsupported(&error));
+            assert!(!sendmmsg_is_unsupported(&error));
+        }
+        for errno in [libc::EPERM, libc::EACCES] {
+            assert!(!sendmmsg_is_unsupported(&io::Error::from_raw_os_error(
                 errno
             )));
         }
@@ -2155,6 +2196,28 @@ mod tests {
             io::ErrorKind::InvalidData
         );
 
+        let mut duplicate_rxq = Control::ZERO;
+        let len = append_control(
+            &mut duplicate_rxq,
+            0,
+            libc::SOL_SOCKET,
+            libc::SO_RXQ_OVFL,
+            &overflow,
+        );
+        let len = append_control(
+            &mut duplicate_rxq,
+            len,
+            libc::SOL_SOCKET,
+            libc::SO_RXQ_OVFL,
+            &overflow,
+        );
+        assert_eq!(
+            parse_control(&duplicate_rxq.as_bytes()[..len])
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+
         let mut oversized_rxq = Control::ZERO;
         let len = append_control(
             &mut oversized_rxq,
@@ -2290,6 +2353,20 @@ mod tests {
             .unwrap();
         assert!(!fallback.gro_enabled);
         assert!(fallback.gro_packets.is_none());
+    }
+
+    #[test]
+    fn gro_segment_metadata_requires_payload_and_stays_within_kernel_limit() {
+        assert_eq!(
+            validate_gro_segments(0, 1).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(validate_gro_segments(64, 1).unwrap(), 64);
+        assert_eq!(
+            validate_gro_segments(65, 1).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(validate_gro_segments(65_507, u16::MAX).unwrap(), 1);
     }
 
     #[test]

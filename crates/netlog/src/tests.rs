@@ -67,6 +67,7 @@ async fn test_logger_start_stop() {
     assert!(!logger.running().await);
 
     let lt = test_logtail();
+    let observed_logtail = lt.clone();
     logger.start(source, lt).await.unwrap();
     assert!(logger.running().await);
 
@@ -85,13 +86,8 @@ async fn test_logger_start_stop() {
     logger.stop().await.unwrap();
     assert!(!logger.running().await);
 
-    // At least one message should have been buffered in logtail.
-    // (The final flush in stop() writes the record.)
-    // Note: buffered_count may be 0 if the record was empty (no self node
-    // at init time), but we set a self node so it should be >= 1.
-    // We don't assert on buffered_count here because the timing of
-    // channel send vs. stop's final flush is racy. Instead, verify the
-    // logger cleanly starts and stops.
+    // Shutdown drains all queued callbacks before the final flush.
+    assert_eq!(observed_logtail.buffered_count(), 1);
 }
 
 #[tokio::test]

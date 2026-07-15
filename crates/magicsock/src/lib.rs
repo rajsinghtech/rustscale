@@ -53,9 +53,10 @@ use std::collections::HashMap;
 use std::fmt;
 #[cfg(any(target_os = "linux", test))]
 use std::io;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::ops::Deref;
 use std::ops::Range;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -102,6 +103,87 @@ const UDP_LIFETIME_CLIFF_SLACK: Duration = Duration::from_secs(2);
 /// MTU sizes to probe when PMTUD is enabled. Mirrors Go's
 /// `tstun.WireMTUsToProbe` (net/tstun/mtu.go:85).
 const WIRE_MTUS_TO_PROBE: &[usize] = &[1280, 1320, 1400, 1500, 8000, 9000];
+
+/// Fake endpoint address used to identify DERP regions in physical netlog
+/// tuples. Mirrors `tailcfg.DerpMagicIPAddr`.
+const DERP_MAGIC_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 3, 3, 40));
+
+/// Callback for physical transport accounting.
+///
+/// The tuple and count semantics match `netlogfunc.ConnectionCounter`:
+/// protocol, source, destination, packets, bytes, and receive direction.
+/// Magicsock always reports protocol 0 and source port 0. Implementations
+/// must be cheap and nonblocking; the netlog implementation only enqueues an
+/// event on an unbounded channel.
+pub type ConnectionCounter =
+    Arc<dyn Fn(u8, (IpAddr, u16), (IpAddr, u16), u64, u64, bool) + Send + Sync>;
+
+/// Dynamically replaceable connection counter. Callback panics are contained
+/// outside the lock so a faulty optional observer cannot poison transport
+/// state or unwind a send/receive task.
+#[derive(Default)]
+struct ConnectionCounterHook {
+    counter: RwLock<Option<ConnectionCounter>>,
+}
+
+impl ConnectionCounterHook {
+    fn set(&self, counter: Option<ConnectionCounter>) {
+        if let Ok(mut current) = self.counter.write() {
+            *current = counter;
+        }
+    }
+
+    fn record(
+        &self,
+        source: Option<IpAddr>,
+        destination: SocketAddr,
+        packets: u64,
+        bytes: u64,
+        recv: bool,
+    ) {
+        if packets == 0 {
+            return;
+        }
+        let Some(source) = source else {
+            return;
+        };
+        let counter = self.counter.read().ok().and_then(|counter| counter.clone());
+        let Some(counter) = counter else {
+            return;
+        };
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            counter(
+                0,
+                (source, 0),
+                (destination.ip(), destination.port()),
+                packets,
+                bytes,
+                recv,
+            );
+        }));
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn batch_counts<T: AsRef<[u8]>>(datagrams: &[T]) -> (u64, u64) {
+    (
+        datagrams.len() as u64,
+        datagrams
+            .iter()
+            .map(|datagram| datagram.as_ref().len() as u64)
+            .sum(),
+    )
+}
+
+fn first_node_addr(node: &Node) -> Option<IpAddr> {
+    node.Addresses.first().and_then(|prefix| {
+        prefix
+            .split_once('/')
+            .map_or(prefix.as_str(), |(addr, _)| addr)
+            .parse()
+            .ok()
+    })
+}
 
 /// Whether a kernel-received UDP packet must use the established scalar
 /// handler. The fast handoff only applies to ordinary direct WireGuard UDP.
@@ -231,10 +313,12 @@ fn detach_linux_wg_datagrams(
     pending: &mut Vec<WgDatagram>,
     mut note_recv_udp: impl FnMut(&NodePublic, &mut Endpoint, std::time::Instant),
     mut record_rx: impl FnMut(usize, usize),
+    mut record_phys_rx: impl FnMut(Option<IpAddr>, SocketAddr, u64, u64),
 ) {
     debug_assert_eq!(identified.peers.len(), count);
     let (mut udp4_rx_bytes, mut udp6_rx_bytes) = (0, 0);
     let mut previous = None;
+    let mut physical_run: Option<(Option<IpAddr>, SocketAddr, u64, u64)> = None;
 
     for (index, peer) in identified.peers.iter().enumerate() {
         let (len, addr) = batch
@@ -253,6 +337,21 @@ fn detach_linux_wg_datagrams(
             SocketAddr::V6(_) => udp6_rx_bytes += len,
         }
         if let Some(peer) = peer {
+            let node_addr = endpoints.get(peer).and_then(Endpoint::node_addr);
+            match physical_run.as_mut() {
+                Some((run_node, run_addr, packets, bytes))
+                    if *run_node == node_addr && *run_addr == addr =>
+                {
+                    *packets += 1;
+                    *bytes += len as u64;
+                }
+                _ => {
+                    if let Some((node, destination, packets, bytes)) = physical_run.take() {
+                        record_phys_rx(node, destination, packets, bytes);
+                    }
+                    physical_run = Some((node_addr, addr, 1, len as u64));
+                }
+            }
             let (packet, detached_source) = batch
                 .detach_datagram(index)
                 .expect("reserved receive credit always has fixed pooled replacement");
@@ -261,9 +360,14 @@ fn detach_linux_wg_datagrams(
                 peer: peer.clone(),
                 data: WgCiphertext::from_pooled(packet, pool_reservation.clone()),
             });
+        } else if let Some((node, destination, packets, bytes)) = physical_run.take() {
+            record_phys_rx(node, destination, packets, bytes);
         }
     }
 
+    if let Some((node, destination, packets, bytes)) = physical_run {
+        record_phys_rx(node, destination, packets, bytes);
+    }
     record_rx(udp4_rx_bytes, udp6_rx_bytes);
 }
 
@@ -733,6 +837,8 @@ struct Inner {
     /// is a relaxed atomic increment and never affects send/recv error paths.
     sockstats_udp4: Option<rustscale_sockstats::LabelHandle>,
     sockstats_udp6: Option<rustscale_sockstats::LabelHandle>,
+    /// Optional physical-transport accounting observer.
+    connection_counter: ConnectionCounterHook,
     /// Pending CLI-initiated pings, keyed by peer node key. When a pong
     /// arrives with `DiscoPingPurpose::CLI`, the matching sender is fired
     /// with the latency and endpoint info. Mirrors Go's callback-based
@@ -1187,6 +1293,7 @@ impl Magicsock {
             net_info: RwLock::new(None),
             sockstats_udp4,
             sockstats_udp6,
+            connection_counter: ConnectionCounterHook::default(),
             cli_ping_callbacks: RwLock::new(HashMap::new()),
             next_cli_ping_id: AtomicU64::new(1),
         });
@@ -1385,7 +1492,9 @@ impl Magicsock {
                     }
                 }
 
-                // Update HomeDERP if it changed.
+                // Update the physical-netlog identity and HomeDERP from the
+                // latest netmap without disturbing path state.
+                ep.set_node_addr(first_node_addr(peer));
                 if peer.HomeDERP != ep.home_derp() {
                     ep.set_home_derp(peer.HomeDERP);
                 }
@@ -1526,6 +1635,14 @@ impl Magicsock {
         Ok(())
     }
 
+    /// Install or remove the physical transport connection counter.
+    ///
+    /// The hook is optional and may be changed while I/O tasks are running.
+    /// Callback panics are contained and a missing/poisoned hook is a no-op.
+    pub fn set_connection_counter(&self, counter: Option<ConnectionCounter>) {
+        self.inner.connection_counter.set(counter);
+    }
+
     /// Send a WG datagram to `peer` over the best available path.
     pub async fn send(&self, peer: NodePublic, datagram: &[u8]) -> Result<(), MagicsockError> {
         self.send_batch(peer, std::slice::from_ref(&datagram)).await
@@ -1542,7 +1659,7 @@ impl Magicsock {
         }
         // Note TX activity before path lookup. Only an inactive-to-active
         // transition arms the independent heartbeat cadence.
-        let (arm_heartbeat, path, derp_region) = {
+        let (arm_heartbeat, path, derp_region, node_addr) = {
             let mut endpoints = self
                 .inner
                 .endpoints
@@ -1556,6 +1673,7 @@ impl Magicsock {
                 ep.note_tx_activity_transition(now, SESSION_ACTIVE_TIMEOUT),
                 ep.best_path(now),
                 ep.derp_send_region(),
+                ep.node_addr(),
             )
         };
         if arm_heartbeat {
@@ -1580,7 +1698,12 @@ impl Magicsock {
                 if self.inner.disable_direct_paths {
                     for datagram in datagrams {
                         if let Err(e) = self
-                            .send_via_derp(peer.clone(), derp_region, datagram.as_ref())
+                            .send_data_via_derp(
+                                peer.clone(),
+                                node_addr,
+                                derp_region,
+                                datagram.as_ref(),
+                            )
                             .await
                         {
                             first_error.get_or_insert(e);
@@ -1591,10 +1714,13 @@ impl Magicsock {
                 if let Some(ref udp) = self.inner.udp {
                     #[cfg(target_os = "linux")]
                     {
-                        return self.send_direct_batch_linux(udp, addr, datagrams).await;
+                        return self
+                            .send_direct_batch_linux(udp, addr, node_addr, datagrams)
+                            .await;
                     }
                     #[cfg(not(target_os = "linux"))]
                     {
+                        let (mut sent_packets, mut sent_bytes) = (0, 0);
                         for datagram in datagrams {
                             let datagram = datagram.as_ref();
                             if let Err(e) = udp.send_to(datagram, addr).await {
@@ -1603,14 +1729,23 @@ impl Magicsock {
                                 }
                             } else {
                                 self.inner.record_udp_tx(addr, datagram.len());
+                                sent_packets += 1;
+                                sent_bytes += datagram.len() as u64;
                             }
                         }
+                        self.inner.connection_counter.record(
+                            node_addr,
+                            addr,
+                            sent_packets,
+                            sent_bytes,
+                            false,
+                        );
                         return first_error.map_or(Ok(()), Err);
                     }
                 }
                 for datagram in datagrams {
                     if let Err(e) = self
-                        .send_via_derp(peer.clone(), derp_region, datagram.as_ref())
+                        .send_data_via_derp(peer.clone(), node_addr, derp_region, datagram.as_ref())
                         .await
                     {
                         first_error.get_or_insert(e);
@@ -1622,21 +1757,34 @@ impl Magicsock {
                 // the relay path is established by the relay manager, not
                 // by direct disco pinging.
                 if let Some(ref udp) = self.inner.udp {
+                    let (mut sent_packets, mut sent_bytes) = (0, 0);
                     for datagram in datagrams {
-                        let framed = relay::encode_geneve(vni, datagram.as_ref());
+                        let datagram = datagram.as_ref();
+                        let framed = relay::encode_geneve(vni, datagram);
                         if let Err(e) = udp.send_to(&framed, addr).await {
                             if !treat_as_lost_udp(&e) {
                                 first_error.get_or_insert(MagicsockError::Io(e));
                             }
                         } else {
                             self.inner.record_udp_tx(addr, framed.len());
+                            sent_packets += 1;
+                            // Upstream physical netlog excludes the Geneve
+                            // header on transmit.
+                            sent_bytes += datagram.len() as u64;
                         }
                     }
+                    self.inner.connection_counter.record(
+                        node_addr,
+                        addr,
+                        sent_packets,
+                        sent_bytes,
+                        false,
+                    );
                     return first_error.map_or(Ok(()), Err);
                 }
                 for datagram in datagrams {
                     if let Err(e) = self
-                        .send_via_derp(peer.clone(), derp_region, datagram.as_ref())
+                        .send_data_via_derp(peer.clone(), node_addr, derp_region, datagram.as_ref())
                         .await
                     {
                         first_error.get_or_insert(e);
@@ -1646,7 +1794,7 @@ impl Magicsock {
             endpoint::BestPath::Derp { .. } | endpoint::BestPath::None => {
                 for datagram in datagrams {
                     if let Err(e) = self
-                        .send_via_derp(peer.clone(), derp_region, datagram.as_ref())
+                        .send_data_via_derp(peer.clone(), node_addr, derp_region, datagram.as_ref())
                         .await
                     {
                         first_error.get_or_insert(e);
@@ -1664,10 +1812,12 @@ impl Magicsock {
         &self,
         udp: &Arc<UdpSocket>,
         addr: SocketAddr,
+        node_addr: Option<IpAddr>,
         datagrams: &[T],
     ) -> Result<(), MagicsockError> {
         let mut head = 0;
         let mut first_error = None;
+        let (mut sent_packets, mut sent_bytes) = (0, 0);
         while head < datagrams.len() {
             let end = (head + udp_batch::MAX_BATCH).min(datagrams.len());
             let use_gso = self.inner.udp_tx_gso.load(Ordering::Relaxed);
@@ -1688,10 +1838,17 @@ impl Magicsock {
                 continue;
             }
             let sent = advance_direct_batch(&mut head, datagrams.len(), &mut first_error, result);
-            for datagram in &datagrams[head - sent..head] {
+            let sent_datagrams = &datagrams[head - sent..head];
+            for datagram in sent_datagrams {
                 self.inner.record_udp_tx(addr, datagram.as_ref().len());
             }
+            let (packets, bytes) = batch_counts(sent_datagrams);
+            sent_packets += packets;
+            sent_bytes += bytes;
         }
+        self.inner
+            .connection_counter
+            .record(node_addr, addr, sent_packets, sent_bytes, false);
         first_error.map_or(Ok(()), |error| Err(MagicsockError::Io(error)))
     }
 
@@ -2114,6 +2271,31 @@ impl Magicsock {
         }
     }
 
+    /// Send one user WireGuard datagram through DERP and account it once.
+    /// Discovery/control callers use [`Self::send_via_derp`] directly and are
+    /// deliberately excluded from physical traffic.
+    async fn send_data_via_derp(
+        &self,
+        peer: NodePublic,
+        node_addr: Option<IpAddr>,
+        region: i32,
+        datagram: &[u8],
+    ) -> Result<(), MagicsockError> {
+        let accounting_region = self.send_via_derp(peer, region, datagram).await?;
+        if let Ok(region) = u16::try_from(accounting_region) {
+            if region != 0 {
+                self.inner.connection_counter.record(
+                    node_addr,
+                    SocketAddr::new(DERP_MAGIC_IP, region),
+                    1,
+                    datagram.len() as u64,
+                    false,
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Send a packet to `peer` via DERP region `region`.
     /// If `region` is 0 (unknown), fans out to ALL connected DERP regions
     /// so the peer receives the packet on whichever region it's on.
@@ -2124,7 +2306,7 @@ impl Magicsock {
         peer: NodePublic,
         region: i32,
         datagram: &[u8],
-    ) -> Result<(), MagicsockError> {
+    ) -> Result<i32, MagicsockError> {
         if region > 0 {
             // Known region — send directly.
             if self
@@ -2141,7 +2323,7 @@ impl Magicsock {
                         datagram.len()
                     );
                 }
-                return Ok(());
+                return Ok(region);
             }
             return Err(MagicsockError::NoPath);
         }
@@ -2192,13 +2374,21 @@ impl Magicsock {
             return Err(MagicsockError::NoPath);
         }
 
+        let mut accounting_region = 0;
         for r in all_regions {
-            self.inner
+            if self
+                .inner
                 .derp
                 .send_packet(r, peer.clone(), datagram.to_vec())
-                .await;
+                .await
+                && accounting_region == 0
+            {
+                // Fanout is bootstrap duplication of one logical packet.
+                // Attribute it once, to the first region that accepted it.
+                accounting_region = r;
+            }
         }
-        Ok(())
+        Ok(accounting_region)
     }
 }
 
@@ -2923,7 +3113,7 @@ impl Inner {
         }
         if relay::looks_like_geneve_wireguard(data) {
             if let Some((_proto, vni, _control, inner)) = relay::decode_geneve_full(data) {
-                self.handle_wg_udp_relay(inner, src, vni).await;
+                self.handle_wg_udp_relay(inner, src, vni, data.len()).await;
                 return;
             }
         }
@@ -3029,6 +3219,10 @@ impl Inner {
                 |udp4_rx_bytes, udp6_rx_bytes| {
                     self.record_linux_udp_batch_rx(udp4_rx_bytes, udp6_rx_bytes);
                 },
+                |node_addr, source, packets, bytes| {
+                    self.connection_counter
+                        .record(node_addr, source, packets, bytes, true);
+                },
             );
         }
         debug_assert_eq!(pending.len(), known);
@@ -3051,12 +3245,14 @@ impl Inner {
 
         // Record the arrival DERP region on the peer's endpoint so future
         // replies route to this region (Go's derpRoute caching).
-        {
+        let node_addr = {
             let mut endpoints = self.endpoints.write().expect("endpoints lock poisoned");
-            if let Some(ep) = endpoints.get_mut(&source) {
+            endpoints.get_mut(&source).map(|ep| {
                 ep.set_last_recv_derp_region(region_id);
-            }
+                ep.node_addr()
+            })
         }
+        .flatten();
 
         let data = &frame[payload.clone()];
         let is_disco = DiscoIo::looks_like_disco(data);
@@ -3073,7 +3269,19 @@ impl Inner {
         if is_disco {
             self.handle_disco_derp(data, source).await;
         } else {
-            // WG datagram via DERP — deliver to caller.
+            // WG datagram via DERP — account only after peer lookup and before
+            // delivery. Disco/control frames took the branch above.
+            if let Ok(region) = u16::try_from(region_id) {
+                if region != 0 {
+                    self.connection_counter.record(
+                        node_addr,
+                        SocketAddr::new(DERP_MAGIC_IP, region),
+                        1,
+                        data.len() as u64,
+                        true,
+                    );
+                }
+            }
             publish_wg_batch(
                 &self.wg_send,
                 &self.wg_receive_credits,
@@ -3115,12 +3323,16 @@ impl Inner {
         };
         if let Some(peer) = peer {
             // Note UDP recv activity for heartbeat / UDP lifetime probe.
-            {
+            let node_addr = {
                 let mut endpoints = self.endpoints.write().expect("endpoints lock poisoned");
-                if let Some(ep) = endpoints.get_mut(&peer) {
+                endpoints.get_mut(&peer).map(|ep| {
                     ep.note_recv_udp(std::time::Instant::now());
-                }
+                    ep.node_addr()
+                })
             }
+            .flatten();
+            self.connection_counter
+                .record(node_addr, src, 1, data.len() as u64, true);
             publish_wg_batch(
                 &self.wg_send,
                 &self.wg_receive_credits,
@@ -3175,7 +3387,13 @@ impl Inner {
     /// Handle a Geneve-encapsulated WireGuard data packet received via UDP
     /// (relay path). The Geneve header has already been stripped; `data` is
     /// the raw WG datagram.
-    async fn handle_wg_udp_relay(&self, data: &[u8], src: SocketAddr, _vni: u32) {
+    async fn handle_wg_udp_relay(
+        &self,
+        data: &[u8],
+        src: SocketAddr,
+        _vni: u32,
+        physical_len: usize,
+    ) {
         // Look up the peer by source address. In the relay path, the source
         // is the relay server, not the peer — but we record the relay addr
         // → peer mapping when set_relay is called. For now, use the
@@ -3188,6 +3406,15 @@ impl Inner {
             map.get(&src).cloned()
         };
         if let Some(peer) = peer {
+            let node_addr = self
+                .endpoints
+                .read()
+                .ok()
+                .and_then(|endpoints| endpoints.get(&peer).and_then(Endpoint::node_addr));
+            // Receive accounting includes the Geneve header, matching
+            // upstream's geneveInclusivePacketLen behavior.
+            self.connection_counter
+                .record(node_addr, src, 1, physical_len as u64, true);
             publish_wg_batch(
                 &self.wg_send,
                 &self.wg_receive_credits,

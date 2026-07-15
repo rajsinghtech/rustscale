@@ -1,6 +1,72 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
+/// Nonblocking node lookup view used by the netlog aggregation task.
+struct TsnetNetlogNodeSource {
+    self_node: Option<Node>,
+    peers: Arc<RwLock<Vec<Node>>>,
+}
+
+impl rustscale_netlog::NodeSource for TsnetNetlogNodeSource {
+    fn self_node(&self) -> Option<rustscale_netlogtype::Node> {
+        self.self_node.as_ref().map(netlog_node)
+    }
+
+    fn node_by_addr(&self, addr: IpAddr) -> Option<rustscale_netlogtype::Node> {
+        if let Some(node) = self
+            .self_node
+            .as_ref()
+            .filter(|node| node_has_addr(node, addr))
+        {
+            return Some(netlog_node(node));
+        }
+        // NodeSource is synchronous by design. Avoid blocking a runtime worker
+        // if a map update briefly owns the peer list.
+        self.peers
+            .try_read()
+            .ok()?
+            .iter()
+            .find(|node| node_has_addr(node, addr))
+            .map(netlog_node)
+    }
+}
+
+fn node_has_addr(node: &Node, addr: IpAddr) -> bool {
+    node.Addresses.iter().any(|prefix| {
+        prefix
+            .split_once('/')
+            .map_or(prefix.as_str(), |(ip, _)| ip)
+            .parse::<IpAddr>()
+            .is_ok_and(|node_addr| node_addr == addr)
+    })
+}
+
+fn netlog_node(node: &Node) -> rustscale_netlogtype::Node {
+    rustscale_netlogtype::Node {
+        node_id: node.StableID.clone(),
+        name: node.Name.trim_end_matches('.').to_string(),
+        addresses: node
+            .Addresses
+            .iter()
+            .filter_map(|prefix| {
+                prefix
+                    .split_once('/')
+                    .map_or(prefix.as_str(), |(ip, _)| ip)
+                    .parse::<IpAddr>()
+                    .ok()
+                    .map(|ip| ip.to_string())
+            })
+            .collect(),
+        os: node
+            .Hostinfo
+            .as_ref()
+            .map(|hostinfo| hostinfo.OS.clone())
+            .unwrap_or_default(),
+        tags: node.Tags.clone(),
+        ..Default::default()
+    }
+}
+
 impl Server {
     /// Bring the server online in userspace netstack mode (tsnet listen/dial).
     ///
@@ -448,6 +514,7 @@ impl Server {
         self.inner = Some(RunningState {
             tailscale_ips: b.tailscale_ips,
             magicsock: b.magicsock,
+            netlog: b.netlog,
             data_plane: DataPlane::Netstack(netstack),
             peers: b.peers,
             route_table: b.route_table,
@@ -973,6 +1040,7 @@ impl Server {
         self.inner = Some(RunningState {
             tailscale_ips: b.tailscale_ips,
             magicsock: b.magicsock,
+            netlog: b.netlog,
             data_plane: DataPlane::Tun,
             peers: b.peers,
             route_table: b.route_table,
@@ -1845,6 +1913,27 @@ impl Server {
         let filter = Arc::new(std::sync::Mutex::new(filter));
         let packet_drops = Arc::new(AtomicU64::new(0));
 
+        // Netlog is opt-in with the embedding's tailtraffic configuration. Keep
+        // the existing virtual filter counter and add the physical magicsock
+        // counter from the same logger so their traffic remains in distinct
+        // aggregation maps.
+        let netlog = if let Some(logtail) = self.config.netlog.clone() {
+            let logger = Arc::new(rustscale_netlog::Logger::new());
+            let source: Arc<dyn rustscale_netlog::NodeSource> = Arc::new(TsnetNetlogNodeSource {
+                self_node: map_resp.Node.clone(),
+                peers: peers_arc.clone(),
+            });
+            logger.start(source, logtail).await?;
+            let virtual_counter = logger.make_counter(true).await;
+            if let Ok(mut filter) = filter.lock() {
+                filter.set_connection_counter(Some(virtual_counter));
+            }
+            magicsock.set_connection_counter(Some(logger.make_counter(false).await));
+            Some(logger)
+        } else {
+            None
+        };
+
         // MagicDNS: build the shared resolver from the first map response.
         // `Domain` is the tailnet domain (e.g. "tailnet.ts.net"); `DNSConfig`
         // carries `Proxied` and `CertDomains`; peer `Name`s are FQDNs.
@@ -1911,6 +2000,7 @@ impl Server {
             tailscale_ips: tailscale_ips.clone(),
             our_v4,
             magicsock,
+            netlog,
             wg_recv,
             wg_tunnels,
             peers: peers_arc,
@@ -1987,6 +2077,13 @@ impl Server {
             let mut tasks = inner.tasks.lock().await;
             for task in tasks.drain(..) {
                 task.abort();
+            }
+            drop(tasks);
+            inner.magicsock.set_connection_counter(None);
+            if let Some(netlog) = inner.netlog.take() {
+                if let Err(error) = netlog.stop().await {
+                    log::warn!("tsnet: netlog shutdown failed (non-fatal): {error}");
+                }
             }
             // Clean up the LocalAPI socket file if it was created.
             if let Some(ref path) = inner.localapi_socket {
@@ -2128,6 +2225,13 @@ impl Server {
         let mut tasks = inner.tasks.lock().await;
         for task in tasks.drain(..) {
             task.abort();
+        }
+        drop(tasks);
+        inner.magicsock.set_connection_counter(None);
+        if let Some(netlog) = inner.netlog.take() {
+            if let Err(error) = netlog.stop().await {
+                log::warn!("tsnet: netlog shutdown failed (non-fatal): {error}");
+            }
         }
         if let Some(ref path) = inner.localapi_socket {
             let _ = std::fs::remove_file(path);

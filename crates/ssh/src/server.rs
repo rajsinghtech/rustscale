@@ -1,7 +1,7 @@
 //! SSH server — ports Go's `ssh/tailssh/tailssh.go` and `listen.go`.
 
 use crate::auth::{eval_ssh_policy, ConnInfo, EvalResult};
-use crate::env::accept_env_pair;
+use crate::env::accept_env_name;
 use crate::recording::{default_recording_path, CastHeader, RecordingConfig};
 use crate::recording_upload::DialFn;
 use crate::session::{PeerIdentity, Pty, RevalidateCallback, SessionInit, Window};
@@ -17,6 +17,11 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 const MAX_SESSION_CHANNELS: usize = 16;
+const CHANNEL_STDIN_FRAMES: usize = 64;
+pub(crate) const MAX_ENV_VARS: usize = 64;
+pub(crate) const MAX_ENV_NAME_BYTES: usize = 128;
+pub(crate) const MAX_ENV_VALUE_BYTES: usize = 4 * 1024;
+pub(crate) const MAX_ENV_BYTES: usize = 16 * 1024;
 
 pub type WhoIsCallback = Arc<dyn Fn(IpAddr) -> Option<(Node, UserProfile)> + Send + Sync>;
 pub type PolicyCallback = Arc<dyn Fn() -> Option<SSHPolicy> + Send + Sync>;
@@ -101,6 +106,7 @@ fn next_connection_id() -> String {
 #[derive(Default)]
 struct ChannelState {
     env_vars: Vec<(String, String)>,
+    env_bytes: usize,
     pty: Option<Pty>,
     command: String,
     started: bool,
@@ -108,6 +114,49 @@ struct ChannelState {
     cancel: Option<tokio::sync::watch::Sender<bool>>,
     signal_tx: Option<mpsc::Sender<russh::Sig>>,
     window_change_tx: Option<mpsc::Sender<Window>>,
+}
+
+impl ChannelState {
+    fn store_env(&mut self, name: &str, value: &str) -> bool {
+        if self.started
+            || !valid_env_name(name)
+            || value.len() > MAX_ENV_VALUE_BYTES
+            || value.chars().any(char::is_control)
+        {
+            return false;
+        }
+
+        let existing = self.env_vars.iter().position(|(key, _)| key == name);
+        if existing.is_none() && self.env_vars.len() >= MAX_ENV_VARS {
+            return false;
+        }
+        let old_bytes = existing.map_or(0, |index| {
+            let (old_name, old_value) = &self.env_vars[index];
+            old_name.len() + old_value.len()
+        });
+        let new_bytes = name.len() + value.len();
+        let aggregate = self.env_bytes - old_bytes + new_bytes;
+        if aggregate > MAX_ENV_BYTES {
+            return false;
+        }
+
+        if let Some(index) = existing {
+            self.env_vars[index].1 = value.to_string();
+        } else {
+            self.env_vars.push((name.to_string(), value.to_string()));
+        }
+        self.env_bytes = aggregate;
+        true
+    }
+}
+
+fn valid_env_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > MAX_ENV_NAME_BYTES {
+        return false;
+    }
+    let mut bytes = name.bytes();
+    matches!(bytes.next(), Some(b'A'..=b'Z' | b'a'..=b'z' | b'_'))
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
 pub struct SshHandler {
@@ -238,7 +287,7 @@ impl SshHandler {
         }
         channel.started = true;
 
-        let (data_tx, data_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (data_tx, data_rx) = mpsc::channel::<Vec<u8>>(CHANNEL_STDIN_FRAMES);
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
         let (done_tx, _done_rx) = mpsc::channel::<()>(1);
         let (signal_tx, signal_rx) = mpsc::channel::<russh::Sig>(16);
@@ -385,15 +434,18 @@ impl russh::server::Handler for SshHandler {
         channel: ChannelId,
         name: &str,
         value: &str,
-        _session: &mut Session,
+        session: &mut Session,
     ) -> Result<(), Self::Error> {
-        let kv = format!("{name}={value}");
-        if accept_env_pair(&kv) || self.accept_env.iter().any(|p| p == name) {
-            if let Some(state) = self.channels.get_mut(&channel) {
-                if !state.started {
-                    state.env_vars.push((name.to_string(), value.to_string()));
-                }
-            }
+        let permitted = accept_env_name(name) || self.accept_env.iter().any(|p| p == name);
+        let accepted = permitted
+            && self
+                .channels
+                .get_mut(&channel)
+                .is_some_and(|state| state.store_env(name, value));
+        if accepted {
+            let _ = session.channel_success(channel);
+        } else {
+            let _ = session.channel_failure(channel);
         }
         Ok(())
     }
@@ -474,14 +526,29 @@ impl russh::server::Handler for SshHandler {
         &mut self,
         channel: ChannelId,
         data: &[u8],
-        _session: &mut Session,
+        session: &mut Session,
     ) -> Result<(), Self::Error> {
-        if let Some(tx) = self
+        let enqueue_failed = self
             .channels
             .get(&channel)
-            .and_then(|state| state.data_tx.clone())
-        {
-            let _ = tx.send(data.to_vec()).await;
+            .and_then(|state| state.data_tx.as_ref())
+            .is_some_and(|tx| tx.try_send(data.to_vec()).is_err());
+        if enqueue_failed {
+            // russh has already accepted this SSH data packet. Never wait on
+            // the bounded application queue (which would stall every channel)
+            // and never silently discard it: fail and close only the offending
+            // channel, while cancellation tears down its process.
+            if let Some(state) = self.channels.get_mut(&channel) {
+                if let Some(cancel) = state.cancel.take() {
+                    cancel.send_replace(true);
+                }
+                state.data_tx = None;
+                state.signal_tx = None;
+                state.window_change_tx = None;
+            }
+            let _ = session.data(channel, "SSH input buffer exceeded\r\n");
+            let _ = session.eof(channel);
+            let _ = session.close(channel);
         }
         Ok(())
     }
@@ -670,6 +737,55 @@ mod tests {
             }],
         };
         Arc::new(move || Some(policy.clone()))
+    }
+
+    #[test]
+    fn channel_environment_is_bounded_and_duplicates_replace() {
+        let mut state = ChannelState::default();
+        assert!(state.store_env("LANG", "first"));
+        for index in 0..(MAX_ENV_VARS - 1) {
+            assert!(state.store_env(&format!("LC_FLOOD_{index}"), "value"));
+        }
+        assert_eq!(state.env_vars.len(), MAX_ENV_VARS);
+        let bytes_before = state.env_bytes;
+        assert!(state.store_env("LANG", "x"));
+        assert_eq!(state.env_vars.len(), MAX_ENV_VARS);
+        assert_eq!(state.env_bytes, bytes_before - 4);
+        assert_eq!(
+            state
+                .env_vars
+                .iter()
+                .find(|(name, _)| name == "LANG")
+                .unwrap()
+                .1,
+            "x"
+        );
+        assert!(!state.store_env("LC_EXCESS", "value"));
+    }
+
+    #[test]
+    fn channel_environment_rejects_invalid_and_aggregate_floods() {
+        let mut state = ChannelState::default();
+        assert!(!state.store_env("", "value"));
+        assert!(!state.store_env("1BAD", "value"));
+        assert!(!state.store_env("BAD-NAME", "value"));
+        assert!(!state.store_env("LC_BAD\n", "value"));
+        assert!(!state.store_env("LC_BAD\0", "value"));
+        assert!(!state.store_env("LC_BAD", "line\nvalue"));
+        assert!(!state.store_env("LC_BAD", "nul\0value"));
+        assert!(!state.store_env(&format!("L{}", "X".repeat(MAX_ENV_NAME_BYTES)), "value"));
+        assert!(!state.store_env("LANG", &"x".repeat(MAX_ENV_VALUE_BYTES + 1)));
+
+        let large = "x".repeat(MAX_ENV_VALUE_BYTES);
+        assert!(state.store_env("LC_ONE", &large));
+        assert!(state.store_env("LC_TWO", &large));
+        assert!(state.store_env("LC_THREE", &large));
+        assert!(!state.store_env("LC_FOUR", &large));
+        assert!(state.store_env("LC_ONE", "x"));
+        assert!(state.store_env("LC_FOUR", &large));
+        assert_eq!(state.env_vars.len(), 4);
+        assert!(!state.store_env("LC_FIVE", &large));
+        assert!(state.env_bytes <= MAX_ENV_BYTES);
     }
 
     fn policy_reject_action() -> PolicyCallback {

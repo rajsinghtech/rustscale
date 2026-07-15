@@ -64,12 +64,13 @@ fn match_pattern(pattern: &str, target: &str) -> bool {
     }
 }
 
+pub fn accept_env_name(name: &str) -> bool {
+    name == "TERM" || name == "LANG" || name.starts_with("LC_")
+}
+
 pub fn accept_env_pair(kv: &str) -> bool {
-    let (key, _) = match kv.split_once('=') {
-        Some(p) => p,
-        None => return false,
-    };
-    key == "TERM" || key == "LANG" || key.starts_with("LC_")
+    kv.split_once('=')
+        .is_some_and(|(name, _)| accept_env_name(name))
 }
 
 #[cfg(test)]

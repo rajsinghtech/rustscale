@@ -214,7 +214,7 @@ async fn run_pipeline_custom(
 }
 
 #[tokio::test]
-async fn multiplexed_channels_keep_data_eof_signals_windows_and_recorders_independent() {
+async fn stalled_stdin_overflow_does_not_block_other_multiplexed_channel_state() {
     let host_key = host_key_from_node_key(&NodePrivate::generate());
     let (session_tx, mut session_rx) = mpsc::channel::<crate::session::SessionInit>(16);
     let mut policy = policy_for("=", std::time::Duration::ZERO);
@@ -275,6 +275,38 @@ async fn multiplexed_channels_keep_data_eof_signals_windows_and_recorders_indepe
     drop(replacement);
 
     channel_one.set_env(false, "LANG", "one").await.unwrap();
+    for index in 0..100 {
+        channel_one
+            .set_env(false, "LANG", format!("replacement-{index}"))
+            .await
+            .unwrap();
+    }
+    for index in 0..63 {
+        channel_one
+            .set_env(false, format!("LC_FLOOD_{index}"), "value")
+            .await
+            .unwrap();
+    }
+    channel_one
+        .set_env(false, "LC_EXCESS", "must-not-be-stored")
+        .await
+        .unwrap();
+    channel_one
+        .set_env(false, "LC_BAD\n", "must-not-be-stored")
+        .await
+        .unwrap();
+    channel_one
+        .set_env(false, "LC_BAD", "line\nvalue")
+        .await
+        .unwrap();
+    channel_one
+        .set_env(false, format!("LC_{}", "X".repeat(128)), "too-long")
+        .await
+        .unwrap();
+    channel_one
+        .set_env(false, "LC_TOO_LARGE", "x".repeat(4097))
+        .await
+        .unwrap();
     channel_two.set_env(false, "LANG", "two").await.unwrap();
     channel_one
         .request_pty(false, "term-one", 80, 24, 0, 0, &[])
@@ -294,7 +326,12 @@ async fn multiplexed_channels_keep_data_eof_signals_windows_and_recorders_indepe
     }
     assert_eq!(one.command, "command-one");
     assert_eq!(two.command, "command-two");
-    assert_eq!(one.env, [("LANG".into(), "one".into())]);
+    assert_eq!(one.env.len(), 64);
+    assert_eq!(
+        one.env.iter().find(|(name, _)| name == "LANG").unwrap().1,
+        "replacement-99"
+    );
+    assert!(!one.env.iter().any(|(name, _)| name == "LC_EXCESS"));
     assert_eq!(two.env, [("LANG".into(), "two".into())]);
     assert_eq!(one.pty.as_ref().unwrap().term, "term-one");
     assert_eq!(two.pty.as_ref().unwrap().term, "term-two");
@@ -328,10 +365,29 @@ async fn multiplexed_channels_keep_data_eof_signals_windows_and_recorders_indepe
     assert_eq!(one.window_change_rx.recv().await.unwrap().width, 81);
     assert_eq!(two.window_change_rx.recv().await.unwrap().width, 121);
 
-    channel_one.eof().await.unwrap();
-    one.cancel_rx.changed().await.unwrap();
+    // Stop consuming channel one's stdin and overflow only its bounded queue.
+    // The handler must close/cancel it without blocking callbacks for channel two.
+    for _ in 0..=64 {
+        if channel_one.data_bytes(b"stalled".as_slice()).await.is_err() {
+            break;
+        }
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(1), one.cancel_rx.changed())
+        .await
+        .expect("stalled channel overflow blocked cancellation")
+        .unwrap();
     assert!(*one.cancel_rx.borrow());
     assert!(!*two.cancel_rx.borrow());
+
+    channel_two
+        .data_bytes(b"still-responsive".as_slice())
+        .await
+        .unwrap();
+    channel_two.signal(russh::Sig::KILL).await.unwrap();
+    channel_two.window_change(122, 42, 5, 6).await.unwrap();
+    assert_eq!(two.data_rx.recv().await.unwrap(), b"still-responsive");
+    assert!(matches!(two.signal_rx.recv().await, Some(russh::Sig::KILL)));
+    assert_eq!(two.window_change_rx.recv().await.unwrap().width, 122);
     channel_two.eof().await.unwrap();
     two.cancel_rx.changed().await.unwrap();
     assert!(*two.cancel_rx.borrow());

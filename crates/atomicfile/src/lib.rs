@@ -28,7 +28,16 @@ fn unique_suffix() -> String {
 #[cfg(unix)]
 fn set_owner_only_perms(file: &mut fs::File) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    file.set_permissions(fs::Permissions::from_mode(0o600))
+
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    let mode = file.metadata()?.permissions().mode() & 0o777;
+    if mode != 0o600 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("temporary file mode is {mode:o}, want 600"),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(not(unix))]
@@ -53,12 +62,26 @@ fn sync_parent(path: &Path) {
 fn create_temp(dir: &Path, base: &str) -> io::Result<(fs::File, PathBuf)> {
     for _ in 0..16 {
         let tmp = dir.join(format!("{base}.tmp.{}", unique_suffix()));
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        // The creation mode closes the pre-chmod confidentiality window: even
+        // if the process crashes immediately after open(2), no group/other
+        // read bits were ever present. The explicit permission update below
+        // also normalizes unusual umasks/filesystem behavior before any write.
+        #[cfg(unix)]
         {
-            Ok(f) => return Ok((f, tmp)),
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        match options.open(&tmp) {
+            Ok(mut file) => {
+                if let Err(error) = set_owner_only_perms(&mut file) {
+                    drop(file);
+                    let _ = fs::remove_file(&tmp);
+                    return Err(error);
+                }
+                return Ok((file, tmp));
+            }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
         }
@@ -146,6 +169,20 @@ mod tests {
         fn deref(&self) -> &Path {
             &self.0
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temp_file_is_owner_only_before_any_write() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = TempDir::new();
+        let (file, path) = create_temp(&dir, "secret").unwrap();
+        let metadata = file.metadata().unwrap();
+        assert_eq!(metadata.len(), 0, "test must inspect the pre-write file");
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        drop(file);
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

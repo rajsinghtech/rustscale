@@ -1,5 +1,50 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
+use zeroize::{Zeroize, Zeroizing};
+
+/// One-attempt auth material. It cannot be cloned and its formatting is always
+/// redacted; dropping it zeroizes the allocation.
+pub(crate) struct TransientAuthKey(Zeroizing<String>);
+
+impl TransientAuthKey {
+    fn new(secret: String) -> Self {
+        Self(Zeroizing::new(secret))
+    }
+
+    fn take(&mut self) -> String {
+        std::mem::take(&mut *self.0)
+    }
+
+    #[cfg(all(test, feature = "identity-federation"))]
+    pub(crate) fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl std::fmt::Debug for TransientAuthKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("TransientAuthKey(<redacted>)")
+    }
+}
+
+pub(crate) fn take_initial_register_auth(
+    auth: &mut Option<TransientAuthKey>,
+) -> Option<rustscale_tailcfg::RegisterResponseAuth> {
+    let mut secret = auth.take()?;
+    if secret.0.is_empty() {
+        return None;
+    }
+    Some(rustscale_tailcfg::RegisterResponseAuth {
+        AuthKey: secret.take(),
+    })
+}
+
+pub(crate) fn clear_register_auth(request: &mut RegisterRequest) {
+    if let Some(auth) = request.Auth.as_mut() {
+        auth.AuthKey.zeroize();
+    }
+    request.Auth = None;
+}
 
 /// Nonblocking node lookup view used by the netlog aggregation task.
 struct TsnetNetlogNodeSource {
@@ -89,8 +134,10 @@ impl Server {
         }
 
         ensure_ring_provider();
+        let state = self.load_or_create_state()?;
+        let initial_auth = self.initial_registration_auth(&state).await?;
 
-        let b = self.bootstrap().await?;
+        let b = self.bootstrap(state, initial_auth).await?;
         let prefs = Arc::new(RwLock::new(self.load_prefs().unwrap_or_default()));
         let exit_node_selection = Arc::new(RwLock::new(ExitNodeSelection::from_prefs(
             &*prefs.read().await,
@@ -166,7 +213,6 @@ impl Server {
             machine_key: b.machine_key.clone(),
             server_pub_key: b.server_pub_key.clone(),
             hostname: self.config.hostname.clone(),
-            auth_key: self.config.auth_key.clone().unwrap_or_default(),
             ephemeral: self.config.ephemeral,
             advertise_routes: b.advertise_routes.clone(),
             peer_relay_server: self.config.peer_relay_server,
@@ -591,8 +637,10 @@ impl Server {
         }
 
         ensure_ring_provider();
+        let state = self.load_or_create_state()?;
+        let initial_auth = self.initial_registration_auth(&state).await?;
 
-        let b = self.bootstrap().await?;
+        let b = self.bootstrap(state, initial_auth).await?;
         let prefs = Arc::new(RwLock::new(self.load_prefs().unwrap_or_default()));
         let exit_node_selection = Arc::new(RwLock::new(ExitNodeSelection::from_prefs(
             &*prefs.read().await,
@@ -690,7 +738,6 @@ impl Server {
             machine_key: b.machine_key.clone(),
             server_pub_key: b.server_pub_key.clone(),
             hostname: self.config.hostname.clone(),
-            auth_key: self.config.auth_key.clone().unwrap_or_default(),
             ephemeral: self.config.ephemeral,
             advertise_routes: b.advertise_routes.clone(),
             peer_relay_server: self.config.peer_relay_server,
@@ -1308,12 +1355,91 @@ impl Server {
             .unwrap())
     }
 
+    /// Select transient credentials for the initial register request.
+    /// Persisted enrollments authenticate by node identity unless force-login
+    /// was explicitly requested.
+    pub(crate) async fn initial_registration_auth(
+        &mut self,
+        state: &PersistedState,
+    ) -> Result<Option<TransientAuthKey>, TsnetError> {
+        if state.is_enrolled() && !self.config.force_login {
+            return Ok(None);
+        }
+        if self
+            .config
+            .auth_key
+            .as_deref()
+            .is_some_and(|key| !key.is_empty())
+        {
+            return Ok(self.config.auth_key.clone().map(TransientAuthKey::new));
+        }
+
+        #[cfg(feature = "identity-federation")]
+        rustscale_identityfederation::install()
+            .map_err(|error| TsnetError::IdentityFederation(error.to_string()))?;
+
+        let Some(resolve) = rustscale_feature::RESOLVE_AUTH_KEY_VIA_WIF.try_get() else {
+            return Ok(None);
+        };
+        let client_id = &self.config.client_id;
+        let id_token = &self.config.id_token;
+        let audience = &self.config.audience;
+        if client_id.is_empty() && id_token.is_empty() && audience.is_empty() {
+            return Ok(None);
+        }
+        if !client_id.is_empty() && id_token.is_empty() && audience.is_empty() {
+            return Err(TsnetError::IdentityFederation(
+                "client ID for workload identity federation found, but ID token and audience are empty"
+                    .into(),
+            ));
+        }
+        if !id_token.is_empty() && !audience.is_empty() {
+            return Err(TsnetError::IdentityFederation(
+                "only one of ID token and audience should be for workload identity federation"
+                    .into(),
+            ));
+        }
+        if client_id.is_empty() {
+            if !id_token.is_empty() {
+                return Err(TsnetError::IdentityFederation(
+                    "ID token for workload identity federation found, but client ID is empty"
+                        .into(),
+                ));
+            }
+            if !audience.is_empty() {
+                return Err(TsnetError::IdentityFederation(
+                    "audience for workload identity federation found, but client ID is empty"
+                        .into(),
+                ));
+            }
+        }
+
+        let auth_key = resolve(rustscale_feature::IdentityFederationRequest {
+            base_url: self.config.control_url.clone(),
+            client_id: client_id.clone(),
+            id_token: id_token.clone(),
+            audience: audience.clone(),
+            tags: self.config.advertise_tags.clone(),
+        })
+        .await
+        .map_err(|error| TsnetError::IdentityFederation(error.to_string()))?;
+        if auth_key.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(TransientAuthKey::new(auth_key)))
+        }
+    }
+
     /// Shared bootstrapping for `up()` and `up_tun()`: load state, register
     /// with control, start the map long-poll, wait for the first `MapResponse`,
     /// netcheck for a home DERP, connect it, build magicsock + per-peer WG
     /// tunnels + the routing table. Returns the shared handles plus the
     /// still-open map receiver for the update task.
-    async fn bootstrap(&mut self) -> Result<Bootstrap, TsnetError> {
+    async fn bootstrap(
+        &mut self,
+        mut state: PersistedState,
+        mut initial_auth: Option<TransientAuthKey>,
+    ) -> Result<Bootstrap, TsnetError> {
         // Effective advertised routes: user-specified subnet routes plus the
         // exit-node default routes (0.0.0.0/0, ::/0) when advertise_exit_node
         // is enabled. Used for Hostinfo.RoutableIPs, the filter's localNets,
@@ -1348,8 +1474,7 @@ impl Server {
         };
         ipn_backend.set_want_running();
 
-        // 1. Load or generate persistent state.
-        let mut state = self.load_or_create_state()?;
+        // 1. Generate persistent key material when no state was loaded.
         let was_fresh = state.is_zero();
         if was_fresh {
             state = PersistedState::generate();
@@ -1388,9 +1513,8 @@ impl Server {
         .await
         .map_err(|e| TsnetError::Register(rustscale_controlclient::RegisterError::Dial(e)))?;
 
-        // 3. Register with the control plane.
-        let auth_key = self.config.auth_key.clone().unwrap_or_default();
-
+        // 3. Register with the control plane. Authentication is consumed by
+        // this one request and omitted from followups and all later refreshes.
         let mut cc = ControlClient::new(
             self.config.control_url.clone(),
             state.machine_key.clone(),
@@ -1401,16 +1525,10 @@ impl Server {
             cc.set_extra_root_certs(certs);
         }
 
-        let reg_req = RegisterRequest {
+        let mut reg_req = RegisterRequest {
             Version: CAPABILITY_VERSION,
             NodeKey: node_pub.clone(),
-            Auth: if auth_key.is_empty() {
-                None
-            } else {
-                Some(rustscale_tailcfg::RegisterResponseAuth {
-                    AuthKey: auth_key.clone(),
-                })
-            },
+            Auth: take_initial_register_auth(&mut initial_auth),
             Hostinfo: Some(Hostinfo {
                 OS: std::env::consts::OS.to_string(),
                 Hostname: self.config.hostname.clone(),
@@ -1423,11 +1541,12 @@ impl Server {
             ..Default::default()
         };
 
-        let reg_resp = cc.register(&reg_req).await.map_err(|e| {
-            // Auth/network failure: the cached netmap may be stale or the
-            // node key may have been revoked. Clear it so a restart doesn't
-            // boot from a stale cache. Mirrors Go's discardDiskCacheLocked
-            // call on register failures (ipn/ipnlocal/local.go:7415).
+        drop(initial_auth);
+        let register_result = cc.register(&reg_req).await;
+        clear_register_auth(&mut reg_req);
+        let reg_resp = register_result.map_err(|e| {
+            // Auth/network failure is ambiguous. The key is not retained, so
+            // a fresh WIF key is minted if the caller starts again.
             if let Some(ref dir) = self.config.state_dir {
                 PersistedState::clear_netmap(dir);
                 log::warn!("tsnet: cleared netmap cache after register error: {e}");
@@ -1467,6 +1586,7 @@ impl Server {
             ipn_backend.set_blocked(false);
             ipn_backend.emit_login_finished();
             state.node_id = reg_resp.User.ID;
+            state.enrolled = true;
             self.save_state(&state)?;
         } else {
             ipn_backend.set_auth_cant_continue(true);
@@ -1514,6 +1634,7 @@ impl Server {
                     ipn_backend.set_blocked(false);
                     ipn_backend.emit_login_finished();
                     state.node_id = followup_resp.User.ID;
+                    state.enrolled = true;
                     self.save_state(&state)?;
                 } else {
                     ipn_backend.emit_err_message(&followup_resp.Error);

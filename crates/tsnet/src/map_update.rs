@@ -9,7 +9,6 @@ pub(crate) struct KeyRotationCtx {
     pub machine_key: MachinePrivate,
     pub server_pub_key: MachinePublic,
     pub hostname: String,
-    pub auth_key: String,
     pub ephemeral: bool,
     pub advertise_routes: Vec<String>,
     pub peer_relay_server: bool,
@@ -557,6 +556,32 @@ pub(crate) fn spawn_map_update_task(
     })
 }
 
+fn rotation_register_request(
+    ctx: &KeyRotationCtx,
+    node_key: NodePublic,
+    old_node_key: Option<NodePublic>,
+) -> RegisterRequest {
+    RegisterRequest {
+        Version: ctx.capability_version,
+        NodeKey: node_key,
+        OldNodeKey: old_node_key.unwrap_or_default(),
+        // Auth keys are initial-login credentials. Refresh and replacement
+        // registrations prove continuity with node keys and must never replay
+        // a one-use federated key.
+        Auth: None,
+        Hostinfo: Some(Hostinfo {
+            OS: std::env::consts::OS.to_string(),
+            Hostname: ctx.hostname.clone(),
+            RoutableIPs: ctx.advertise_routes.clone(),
+            PeerRelay: ctx.peer_relay_server,
+            ShieldsUp: ctx.shields_up,
+            ..Default::default()
+        }),
+        Ephemeral: ctx.ephemeral,
+        ..Default::default()
+    }
+}
+
 /// Re-register with the control server after a key expiry.
 ///
 /// Mirrors Go's `doLogin` with `regen=true` (`direct.go:739-926`):
@@ -585,27 +610,7 @@ async fn perform_key_rotation(
     // Match the upstream client's refresh-before-regenerate behavior. An
     // expired current key requires regeneration; a replacement that is also
     // expired indicates a global expiry policy and must not be promoted.
-    let refresh_req = RegisterRequest {
-        Version: ctx.capability_version,
-        NodeKey: old_pub.clone(),
-        Auth: if ctx.auth_key.is_empty() {
-            None
-        } else {
-            Some(rustscale_tailcfg::RegisterResponseAuth {
-                AuthKey: ctx.auth_key.clone(),
-            })
-        },
-        Hostinfo: Some(Hostinfo {
-            OS: std::env::consts::OS.to_string(),
-            Hostname: ctx.hostname.clone(),
-            RoutableIPs: ctx.advertise_routes.clone(),
-            PeerRelay: ctx.peer_relay_server,
-            ShieldsUp: ctx.shields_up,
-            ..Default::default()
-        }),
-        Ephemeral: ctx.ephemeral,
-        ..Default::default()
-    };
+    let refresh_req = rotation_register_request(ctx, old_pub.clone(), None);
     let refresh = ControlClient::new(
         ctx.control_url.clone(),
         ctx.machine_key.clone(),
@@ -632,28 +637,7 @@ async fn perform_key_rotation(
     {
         let new_pub = trying_key.public();
 
-        let reg_req = RegisterRequest {
-            Version: ctx.capability_version,
-            NodeKey: new_pub.clone(),
-            OldNodeKey: old_node_key.clone(),
-            Auth: if ctx.auth_key.is_empty() {
-                None
-            } else {
-                Some(rustscale_tailcfg::RegisterResponseAuth {
-                    AuthKey: ctx.auth_key.clone(),
-                })
-            },
-            Hostinfo: Some(Hostinfo {
-                OS: std::env::consts::OS.to_string(),
-                Hostname: ctx.hostname.clone(),
-                RoutableIPs: ctx.advertise_routes.clone(),
-                PeerRelay: ctx.peer_relay_server,
-                ShieldsUp: ctx.shields_up,
-                ..Default::default()
-            }),
-            Ephemeral: ctx.ephemeral,
-            ..Default::default()
-        };
+        let reg_req = rotation_register_request(ctx, new_pub.clone(), Some(old_node_key.clone()));
 
         let cc = ControlClient::new(
             ctx.control_url.clone(),
@@ -842,6 +826,33 @@ mod tests {
             Cap: 50,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn key_rotation_refresh_and_replacement_omit_auth() {
+        let ctx = KeyRotationCtx {
+            control_url: "https://control.example".into(),
+            machine_key: MachinePrivate::generate(),
+            server_pub_key: MachinePrivate::generate().public(),
+            hostname: "node".into(),
+            ephemeral: true,
+            advertise_routes: vec![],
+            peer_relay_server: false,
+            disco_key: DiscoPrivate::generate(),
+            capability_version: 141,
+            protocol_version: 141,
+            shields_up: false,
+        };
+        let current = NodePrivate::generate().public();
+        let replacement = NodePrivate::generate().public();
+
+        let refresh = rotation_register_request(&ctx, current.clone(), None);
+        assert!(refresh.Auth.is_none());
+        assert!(refresh.OldNodeKey.is_zero());
+
+        let replace = rotation_register_request(&ctx, replacement, Some(current.clone()));
+        assert!(replace.Auth.is_none());
+        assert_eq!(replace.OldNodeKey, current);
     }
 
     #[test]

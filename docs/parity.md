@@ -122,7 +122,7 @@ real JSON).
 | App connector (`appc/`) | ✅ crates/appc: domain/wildcard matching, DNS response observation with CNAME resolution, dynamic route advertisement (RouteAdvertiser trait), Conn25 peer selection + split-DNS resolver map, RouteInfo persistence; tsnet wiring with TsnetRouteAdvertiser |
 | NetNS socket binding (`net/netns/`) | ✅ `crates/netns`: dial_tcp/dial_tcp_addr with host resolution, SOCKS5 proxy fallback, localhost bypass; macOS IP_BOUND_IF; Linux SO_MARK + SO_BINDTODEVICE |
 | Session recording (`sessionrecording/`) | ✅ asciicast v2 format write to local file (`<state_dir>/ssh-sessions/`); remote upload to recorder nodes ⬜ |
-| Workload identity federation (`feature/identityfederation/`) | ⬜ |
+| Workload identity federation (`feature/identityfederation/`) | 🔶 `crates/identityfederation`: workload JWT exchange, tagged one-use auth-key creation, validation, feature hooks, and tsnet startup integration; cloud-specific provider discovery and expanded CLI plumbing remain deferred |
 
 ## Tier 4: Optimization & tools
 

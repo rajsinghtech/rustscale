@@ -194,6 +194,8 @@ pub enum TsnetError {
     Wg(#[from] WgError),
     #[error("auth required: visit {0}")]
     AuthRequired(String),
+    #[error("workload identity federation: {0}")]
+    IdentityFederation(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("json error: {0}")]
@@ -233,6 +235,16 @@ pub enum TsnetError {
 pub struct ServerBuilder {
     pub(crate) hostname: String,
     pub(crate) auth_key: Option<String>,
+    /// OAuth client ID configured for workload identity federation.
+    pub(crate) client_id: String,
+    /// Provider ID token. Never included in Debug output or logs.
+    pub(crate) id_token: String,
+    /// Audience passed to an injected provider token source when no ID token
+    /// is supplied.
+    pub(crate) audience: String,
+    /// Explicitly re-authenticate an already enrolled node. Workload identity
+    /// credentials are otherwise ignored for persisted enrollments.
+    pub(crate) force_login: bool,
     pub(crate) control_url: String,
     pub(crate) state_dir: Option<PathBuf>,
     pub(crate) ephemeral: bool,
@@ -321,7 +333,18 @@ impl std::fmt::Debug for ServerBuilder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ServerBuilder")
             .field("hostname", &self.hostname)
-            .field("auth_key", &self.auth_key)
+            .field("auth_key", &self.auth_key.as_ref().map(|_| "<redacted>"))
+            .field("client_id", &self.client_id)
+            .field(
+                "id_token",
+                &if self.id_token.is_empty() {
+                    None
+                } else {
+                    Some("<redacted>")
+                },
+            )
+            .field("audience", &self.audience)
+            .field("force_login", &self.force_login)
             .field("control_url", &self.control_url)
             .field("state_dir", &self.state_dir)
             .field("ephemeral", &self.ephemeral)
@@ -353,6 +376,42 @@ impl ServerBuilder {
     /// Set the auth key.
     pub fn auth_key(mut self, k: impl Into<String>) -> Self {
         self.auth_key = Some(k.into());
+        self
+    }
+
+    /// Set the OAuth client ID used for workload identity federation.
+    ///
+    /// The `identity-federation` Cargo feature must be enabled. A client ID
+    /// may include `?ephemeral=` and `?preauthorized=` attributes matching the
+    /// Tailscale client configuration format.
+    pub fn client_id(mut self, client_id: impl Into<String>) -> Self {
+        self.client_id = client_id.into();
+        self
+    }
+
+    /// Set an identity-provider ID token for workload identity federation.
+    /// This is mutually exclusive with [`audience`](Self::audience).
+    pub fn id_token(mut self, id_token: impl Into<String>) -> Self {
+        self.id_token = id_token.into();
+        self
+    }
+
+    /// Set the audience used by the workload identity provider token source.
+    /// This is mutually exclusive with [`id_token`](Self::id_token). Install a
+    /// client configured with a provider source through
+    /// `rustscale_identityfederation::install_with_client` before calling
+    /// `up()`.
+    pub fn audience(mut self, audience: impl Into<String>) -> Self {
+        self.audience = audience.into();
+        self
+    }
+
+    /// Force an already enrolled node through login again.
+    ///
+    /// Without this flag, configured auth credentials are omitted for a
+    /// persisted enrollment and workload identity federation is not invoked.
+    pub fn force_login(mut self, force: bool) -> Self {
+        self.force_login = force;
         self
     }
 

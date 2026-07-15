@@ -80,6 +80,8 @@ rustscale-proxymap = { path = "../proxymap", version = "0.1.1" }
 rustscale-portlist = { path = "../portlist", version = "0.1.1" }
 rustscale-clientupdate = { path = "../clientupdate", version = "0.1.1" }
 rustscale-envknob = { path = "../envknob", version = "0.1.1" }
+rustscale-feature = { path = "../feature", version = "0.1.1" }
+rustscale-identityfederation = { path = "../identityfederation", version = "0.1.1", optional = true }
 rustscale-logid = { path = "../logid", version = "0.1.1" }
 rustscale-logtail = { path = "../logtail", version = "0.1.1" }
 rustscale-netlog = { path = "../netlog", version = "0.1.1" }
@@ -106,6 +108,7 @@ async-trait.workspace = true
 rand_core.workspace = true
 libc.workspace = true
 log.workspace = true
+zeroize = "1"
 
 [dev-dependencies]
 tokio.workspace = true
@@ -120,6 +123,7 @@ rustscale-ipn = { path = "../ipn", version = "0.1.1" }
 tempfile = "3"
 
 [features]
+identity-federation = ["dep:rustscale-identityfederation"]
 ssh = ["dep:rustscale-ssh", "dep:russh"]
 
 [dependencies.rustscale-ssh]

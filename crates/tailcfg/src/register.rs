@@ -2,6 +2,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroize;
 
 use rustscale_key::{NLPublic, NodePublic};
 
@@ -95,7 +96,7 @@ pub struct RegisterResponse {
 
 /// Auth information returned by the server (subset of Go's
 /// `tailcfg.RegisterResponseAuth`).
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegisterResponseAuth {
     /// An auth key (the deprecated Android OAuth2 token path is omitted).
     #[serde(
@@ -104,6 +105,21 @@ pub struct RegisterResponseAuth {
         deserialize_with = "deserialize_null_to_default"
     )]
     pub AuthKey: String,
+}
+
+impl std::fmt::Debug for RegisterResponseAuth {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RegisterResponseAuth")
+            .field("AuthKey", &"<redacted>")
+            .finish()
+    }
+}
+
+impl Drop for RegisterResponseAuth {
+    fn drop(&mut self) {
+        self.AuthKey.zeroize();
+    }
 }
 
 /// A Tailscale user (matches Go's `tailcfg.User`).
@@ -203,6 +219,16 @@ mod tests {
         assert!(j.contains("\"NodeKeySignature\":null"));
         let back: RegisterRequest = serde_json::from_str(&j).unwrap();
         assert_eq!(back, req);
+    }
+
+    #[test]
+    fn register_auth_debug_is_redacted() {
+        let auth = RegisterResponseAuth {
+            AuthKey: "secret-one-use-auth-key".into(),
+        };
+        let debug = format!("{auth:?}");
+        assert_eq!(debug, "RegisterResponseAuth { AuthKey: \"<redacted>\" }");
+        assert!(!debug.contains("secret-one-use-auth-key"));
     }
 
     #[test]

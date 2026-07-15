@@ -166,6 +166,22 @@ impl SessionRecorder {
     }
 
     #[cfg(test)]
+    pub(crate) fn with_test_writer_result(
+        writer: Box<dyn Write + Send>,
+        result_rx: oneshot::Receiver<io::Result<()>>,
+        header: CastHeader,
+        fail_open: bool,
+    ) -> io::Result<Self> {
+        Self::with_output(
+            RecordingOutput::Upload(writer),
+            header,
+            fail_open,
+            Some(result_rx),
+            None,
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn with_test_writer(
         writer: Box<dyn Write + Send>,
         header: CastHeader,

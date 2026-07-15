@@ -10,7 +10,7 @@
 use crate::host_key_from_node_key;
 use crate::session_handler::{
     run_session, run_session_with, LaunchedSession, LocalUser, ProcessControl, SessionHandlerError,
-    SessionLauncher,
+    SessionLauncher, UserResolver,
 };
 use crate::{Session, SshServer, SshServerConfig};
 use russh::server::Server as _;
@@ -113,10 +113,7 @@ async fn run_pipeline_custom(
     command: &str,
     requested_user: &str,
     policy: Arc<dyn Fn() -> Option<SSHPolicy> + Send + Sync>,
-    injected: Option<(
-        &(dyn Fn(&str) -> Result<LocalUser, SessionHandlerError> + Send + Sync),
-        &dyn SessionLauncher,
-    )>,
+    injected: Option<(Arc<UserResolver>, Arc<dyn SessionLauncher>)>,
     mutate_session: Option<&dyn Fn(&mut crate::session::SessionInit)>,
     client_eof_before_run: bool,
     request_pty: bool,
@@ -241,6 +238,10 @@ impl ProcessControl for NoopProcessControl {
     fn signal_group(&self, _signal: libc::c_int) -> io::Result<bool> {
         Ok(false)
     }
+
+    fn group_exists(&self) -> io::Result<bool> {
+        Ok(false)
+    }
 }
 
 #[derive(Default)]
@@ -266,12 +267,12 @@ impl SessionLauncher for CapturingLauncher {
 
 #[tokio::test]
 async fn policy_mapped_local_user_is_resolved_and_launched_not_requested_user() {
-    let launcher = CapturingLauncher::default();
+    let launcher = Arc::new(CapturingLauncher::default());
     let resolved = Arc::new(Mutex::new(Vec::new()));
-    let resolver = {
+    let resolver: Arc<UserResolver> = {
         let resolved = resolved.clone();
-        move |name: &str| {
-            resolved.lock().unwrap().push(name.to_string());
+        Arc::new(move |name: String| {
+            resolved.lock().unwrap().push(name.clone());
             Ok(LocalUser {
                 uid: 65_534,
                 gid: 65_534,
@@ -280,7 +281,7 @@ async fn policy_mapped_local_user_is_resolved_and_launched_not_requested_user() 
                 home_dir: "/nonexistent".into(),
                 shell: "/bin/sh".into(),
             })
-        }
+        })
     };
 
     let recording_path = std::env::temp_dir().join(format!(
@@ -306,7 +307,7 @@ async fn policy_mapped_local_user_is_resolved_and_launched_not_requested_user() 
         "exit 0",
         "root",
         policy_map_any("nobody"),
-        Some((&resolver, &launcher)),
+        Some((resolver.clone(), launcher.clone())),
         Some(&mutate),
         false,
         false,
@@ -343,6 +344,10 @@ impl ProcessControl for EscalatingControl {
         }
         Ok(true)
     }
+
+    fn group_exists(&self) -> io::Result<bool> {
+        Ok(self.exit.lock().unwrap().is_some())
+    }
 }
 
 struct TermIgnoringLauncher {
@@ -372,6 +377,126 @@ impl TermIgnoringLauncher {
         let launcher = Self::new(Vec::new());
         *launcher.stderr.lock().unwrap() = Some(stderr);
         launcher
+    }
+}
+
+#[derive(Default)]
+struct BlockingGate {
+    released: Mutex<bool>,
+    changed: std::sync::Condvar,
+}
+
+impl BlockingGate {
+    fn wait(&self) {
+        let released = self.released.lock().unwrap();
+        let _ = self
+            .changed
+            .wait_timeout_while(released, std::time::Duration::from_secs(5), |released| {
+                !*released
+            })
+            .unwrap();
+    }
+
+    fn release(&self) {
+        *self.released.lock().unwrap() = true;
+        self.changed.notify_all();
+    }
+}
+
+struct GatedLauncher {
+    inner: Arc<TermIgnoringLauncher>,
+    gate: Arc<BlockingGate>,
+    entered: Mutex<Option<oneshot::Sender<()>>>,
+}
+
+impl SessionLauncher for GatedLauncher {
+    fn launch(
+        &self,
+        args: crate::incubator::IncubatorArgs,
+    ) -> Result<LaunchedSession, SessionHandlerError> {
+        if let Some(entered) = self.entered.lock().unwrap().take() {
+            let _ = entered.send(());
+        }
+        self.gate.wait();
+        self.inner.launch(args)
+    }
+}
+
+#[derive(Default)]
+struct PersistentControl {
+    signals: Mutex<Vec<libc::c_int>>,
+}
+
+impl ProcessControl for PersistentControl {
+    fn signal_group(&self, signal: libc::c_int) -> io::Result<bool> {
+        self.signals.lock().unwrap().push(signal);
+        Ok(true)
+    }
+
+    fn group_exists(&self) -> io::Result<bool> {
+        Ok(true)
+    }
+}
+
+#[derive(Default)]
+struct KillFailureControl {
+    signals: Mutex<Vec<libc::c_int>>,
+    exists: std::sync::atomic::AtomicBool,
+}
+
+impl ProcessControl for KillFailureControl {
+    fn signal_group(&self, signal: libc::c_int) -> io::Result<bool> {
+        self.signals.lock().unwrap().push(signal);
+        if signal == libc::SIGKILL {
+            self.exists
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            Err(io::Error::other("injected SIGKILL failure"))
+        } else {
+            self.exists.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(true)
+        }
+    }
+
+    fn group_exists(&self) -> io::Result<bool> {
+        Ok(self.exists.load(std::sync::atomic::Ordering::SeqCst))
+    }
+}
+
+struct CompletedLauncher {
+    control: Arc<KillFailureControl>,
+}
+
+impl SessionLauncher for CompletedLauncher {
+    fn launch(
+        &self,
+        _args: crate::incubator::IncubatorArgs,
+    ) -> Result<LaunchedSession, SessionHandlerError> {
+        Ok(LaunchedSession {
+            input: Some(Box::new(tokio::io::sink())),
+            output: Some(Box::new(tokio::io::empty())),
+            stderr: Some(Box::new(tokio::io::empty())),
+            wait: Box::pin(std::future::ready(Ok(0))),
+            control: self.control.clone(),
+        })
+    }
+}
+
+struct PersistentLauncher {
+    control: Arc<PersistentControl>,
+}
+
+impl SessionLauncher for PersistentLauncher {
+    fn launch(
+        &self,
+        _args: crate::incubator::IncubatorArgs,
+    ) -> Result<LaunchedSession, SessionHandlerError> {
+        Ok(LaunchedSession {
+            input: Some(Box::new(tokio::io::sink())),
+            output: Some(Box::new(tokio::io::empty())),
+            stderr: Some(Box::new(tokio::io::empty())),
+            wait: Box::pin(std::future::pending()),
+            control: self.control.clone(),
+        })
     }
 }
 
@@ -458,6 +583,48 @@ impl io::Write for CaptureWriter {
     }
 }
 
+#[derive(Default)]
+struct FailFinalFlush {
+    flushes: usize,
+}
+
+impl io::Write for FailFinalFlush {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.flushes += 1;
+        if self.flushes == 1 {
+            Ok(())
+        } else {
+            Err(io::Error::other("injected final recorder close failure"))
+        }
+    }
+}
+
+struct FinalErrorWriter {
+    result: Option<oneshot::Sender<io::Result<()>>>,
+}
+
+impl io::Write for FinalErrorWriter {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for FinalErrorWriter {
+    fn drop(&mut self) {
+        if let Some(result) = self.result.take() {
+            let _ = result.send(Err(io::Error::other("injected final upload failure")));
+        }
+    }
+}
+
 struct FailAfterHeader {
     wrote_header: bool,
 }
@@ -478,6 +645,139 @@ impl io::Write for FailAfterHeader {
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
+}
+
+#[tokio::test]
+async fn mandatory_final_recorder_close_failure_returns_non_success() {
+    let recorder = crate::SessionRecorder::with_test_writer(
+        Box::new(FailFinalFlush::default()),
+        crate::CastHeader::new(
+            (0, 0),
+            "command".into(),
+            std::collections::HashMap::new(),
+            "requested".into(),
+            "mapped".into(),
+            "connection".into(),
+        ),
+        false,
+    )
+    .unwrap();
+    let recorder = Mutex::new(Some(recorder));
+    let mutate = |init: &mut crate::session::SessionInit| {
+        init.recorder = recorder.lock().unwrap().take();
+        init.recording_config = Some(crate::RecordingConfig {
+            fail_open: false,
+            on_failure: Some(rustscale_tailcfg::SSHRecorderFailureAction {
+                TerminateSessionWithMessage: "recording required".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+    };
+    let requested_user = std::env::var("USER").unwrap_or_else(|_| "testuser".to_string());
+    let (code, output) = run_pipeline_custom(
+        "exit 0",
+        &requested_user,
+        policy_allow_any(),
+        None,
+        Some(&mutate),
+        false,
+        false,
+    )
+    .await;
+    assert_eq!(code, 1);
+    assert!(String::from_utf8_lossy(&output).contains("recording required"));
+}
+
+#[tokio::test]
+async fn mandatory_final_upload_failure_returns_non_success() {
+    let (result_tx, result_rx) = oneshot::channel();
+    let recorder = crate::SessionRecorder::with_test_writer_result(
+        Box::new(FinalErrorWriter {
+            result: Some(result_tx),
+        }),
+        result_rx,
+        crate::CastHeader::new(
+            (0, 0),
+            "command".into(),
+            std::collections::HashMap::new(),
+            "requested".into(),
+            "mapped".into(),
+            "connection".into(),
+        ),
+        false,
+    )
+    .unwrap();
+    let recorder = Mutex::new(Some(recorder));
+    let mutate = |init: &mut crate::session::SessionInit| {
+        init.recorder = recorder.lock().unwrap().take();
+        init.recording_config = Some(crate::RecordingConfig {
+            fail_open: false,
+            on_failure: Some(rustscale_tailcfg::SSHRecorderFailureAction {
+                TerminateSessionWithMessage: "recording required".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+    };
+    let requested_user = std::env::var("USER").unwrap_or_else(|_| "testuser".to_string());
+    let (code, output) = run_pipeline_custom(
+        "printf 'recorded-before-finalize'",
+        &requested_user,
+        policy_allow_any(),
+        None,
+        Some(&mutate),
+        false,
+        false,
+    )
+    .await;
+    assert_eq!(code, 1);
+    assert!(String::from_utf8_lossy(&output).contains("recording required"));
+}
+
+#[tokio::test]
+async fn mandatory_final_upload_timeout_returns_non_success() {
+    let (result_tx, result_rx) = oneshot::channel();
+    let recorder = crate::SessionRecorder::with_test_writer_result(
+        Box::new(CaptureWriter::default()),
+        result_rx,
+        crate::CastHeader::new(
+            (0, 0),
+            "command".into(),
+            std::collections::HashMap::new(),
+            "requested".into(),
+            "mapped".into(),
+            "connection".into(),
+        ),
+        false,
+    )
+    .unwrap();
+    let recorder = Mutex::new(Some(recorder));
+    let mutate = |init: &mut crate::session::SessionInit| {
+        init.recorder = recorder.lock().unwrap().take();
+        init.recording_config = Some(crate::RecordingConfig {
+            fail_open: false,
+            on_failure: Some(rustscale_tailcfg::SSHRecorderFailureAction {
+                TerminateSessionWithMessage: "recording required".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+    };
+    let requested_user = std::env::var("USER").unwrap_or_else(|_| "testuser".to_string());
+    let (code, output) = run_pipeline_custom(
+        "exit 0",
+        &requested_user,
+        policy_allow_any(),
+        None,
+        Some(&mutate),
+        false,
+        false,
+    )
+    .await;
+    drop(result_tx);
+    assert_eq!(code, 1);
+    assert!(String::from_utf8_lossy(&output).contains("recording required"));
 }
 
 #[tokio::test]
@@ -523,7 +823,7 @@ async fn non_pty_stderr_is_recorded_before_client_forwarding() {
 
 #[tokio::test]
 async fn fail_closed_drops_failed_chunk_and_escalates_whole_group() {
-    let launcher = TermIgnoringLauncher::new(b"must-not-be-delivered".to_vec());
+    let launcher = Arc::new(TermIgnoringLauncher::new(b"must-not-be-delivered".to_vec()));
     let recorder = crate::SessionRecorder::with_test_writer(
         Box::new(FailAfterHeader {
             wrote_header: false,
@@ -550,7 +850,7 @@ async fn fail_closed_drops_failed_chunk_and_escalates_whole_group() {
             ..Default::default()
         });
     };
-    let resolver = |_name: &str| {
+    let resolver: Arc<UserResolver> = Arc::new(|_name: String| {
         Ok(LocalUser {
             uid: 1000,
             gid: 1000,
@@ -559,13 +859,13 @@ async fn fail_closed_drops_failed_chunk_and_escalates_whole_group() {
             home_dir: "/tmp".into(),
             shell: "/bin/sh".into(),
         })
-    };
+    });
 
     let (code, output) = run_pipeline_custom(
         "ignored",
         "requested",
         policy_map_any("mapped"),
-        Some((&resolver, &launcher)),
+        Some((resolver.clone(), launcher.clone())),
         Some(&mutate),
         false,
         false,
@@ -586,7 +886,9 @@ async fn fail_closed_drops_failed_chunk_and_escalates_whole_group() {
 
 #[tokio::test]
 async fn fail_closed_stderr_chunk_is_suppressed() {
-    let launcher = TermIgnoringLauncher::with_stderr(b"stderr-must-not-be-delivered".to_vec());
+    let launcher = Arc::new(TermIgnoringLauncher::with_stderr(
+        b"stderr-must-not-be-delivered".to_vec(),
+    ));
     let recorder = crate::SessionRecorder::with_test_writer(
         Box::new(FailAfterHeader {
             wrote_header: false,
@@ -613,7 +915,7 @@ async fn fail_closed_stderr_chunk_is_suppressed() {
             ..Default::default()
         });
     };
-    let resolver = |_name: &str| {
+    let resolver: Arc<UserResolver> = Arc::new(|_name: String| {
         Ok(LocalUser {
             uid: 1000,
             gid: 1000,
@@ -622,13 +924,13 @@ async fn fail_closed_stderr_chunk_is_suppressed() {
             home_dir: "/tmp".into(),
             shell: "/bin/sh".into(),
         })
-    };
+    });
 
     let (code, output) = run_pipeline_custom(
         "ignored",
         "requested",
         policy_map_any("mapped"),
-        Some((&resolver, &launcher)),
+        Some((resolver.clone(), launcher.clone())),
         Some(&mutate),
         false,
         false,
@@ -645,15 +947,69 @@ async fn fail_closed_stderr_chunk_is_suppressed() {
 }
 
 #[tokio::test]
-async fn zero_session_duration_does_not_cancel_session() {
-    let code = run_pipeline("sleep 0.1; exit 0").await;
-    assert_eq!(code, 0);
+async fn duration_cancels_hung_nss_resolution_without_launching() {
+    let launcher = Arc::new(CapturingLauncher::default());
+    let gate = Arc::new(BlockingGate::default());
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let entered = Arc::new(Mutex::new(Some(entered_tx)));
+    let resolver: Arc<UserResolver> = {
+        let entered = entered.clone();
+        let gate = gate.clone();
+        Arc::new(move |_name: String| {
+            if let Some(entered) = entered.lock().unwrap().take() {
+                let _ = entered.send(());
+            }
+            gate.wait();
+            Ok(LocalUser {
+                uid: 1000,
+                gid: 1000,
+                gids: vec![1000],
+                name: "mapped".into(),
+                home_dir: "/tmp".into(),
+                shell: "/bin/sh".into(),
+            })
+        })
+    };
+    let policy = policy_for("mapped", std::time::Duration::from_millis(100));
+    let policy: Arc<dyn Fn() -> Option<SSHPolicy> + Send + Sync> =
+        Arc::new(move || Some(policy.clone()));
+    let run = run_pipeline_custom(
+        "ignored",
+        "requested",
+        policy,
+        Some((resolver, launcher.clone())),
+        None,
+        false,
+        false,
+    );
+    tokio::pin!(run);
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        tokio::select! {
+            entered = entered_rx => entered.expect("NSS resolver entry signal dropped"),
+            _ = &mut run => panic!("SSH pipeline completed before NSS resolver blocked"),
+        }
+    })
+    .await
+    .expect("NSS resolver did not start");
+    let result = tokio::time::timeout(std::time::Duration::from_secs(1), &mut run).await;
+    gate.release();
+    let (code, output) = result.expect("duration did not cancel NSS resolution");
+    assert_eq!(code, 1);
+    assert!(String::from_utf8_lossy(&output).contains("Session timeout"));
+    assert!(launcher.args.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
-async fn session_duration_terminates_and_escalates_process_group() {
-    let launcher = TermIgnoringLauncher::new(Vec::new());
-    let resolver = |_name: &str| {
+async fn canceled_hung_launcher_is_supervised_when_it_completes() {
+    let inner = Arc::new(TermIgnoringLauncher::new(Vec::new()));
+    let gate = Arc::new(BlockingGate::default());
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let launcher: Arc<dyn SessionLauncher> = Arc::new(GatedLauncher {
+        inner: inner.clone(),
+        gate: gate.clone(),
+        entered: Mutex::new(Some(entered_tx)),
+    });
+    let resolver: Arc<UserResolver> = Arc::new(|_name: String| {
         Ok(LocalUser {
             uid: 1000,
             gid: 1000,
@@ -662,7 +1018,163 @@ async fn session_duration_terminates_and_escalates_process_group() {
             home_dir: "/tmp".into(),
             shell: "/bin/sh".into(),
         })
+    });
+    let policy = policy_for("mapped", std::time::Duration::from_millis(100));
+    let policy: Arc<dyn Fn() -> Option<SSHPolicy> + Send + Sync> =
+        Arc::new(move || Some(policy.clone()));
+    let run = run_pipeline_custom(
+        "ignored",
+        "requested",
+        policy,
+        Some((resolver, launcher)),
+        None,
+        false,
+        false,
+    );
+    tokio::pin!(run);
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        tokio::select! {
+            entered = entered_rx => entered.expect("launcher entry signal dropped"),
+            _ = &mut run => panic!("SSH pipeline completed before launcher blocked"),
+        }
+    })
+    .await
+    .expect("launcher did not start");
+    let result = tokio::time::timeout(std::time::Duration::from_secs(1), &mut run).await;
+    gate.release();
+    let (code, _) = result.expect("duration did not cancel process launch");
+    assert_eq!(code, 1);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if inner
+                .control
+                .signals
+                .lock()
+                .unwrap()
+                .contains(&libc::SIGKILL)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("late launched process was not supervised");
+}
+
+#[tokio::test]
+async fn duration_cancels_hung_recorder_initialization_before_launch() {
+    let launcher = Arc::new(CapturingLauncher::default());
+    let resolver: Arc<UserResolver> = Arc::new(|_name: String| {
+        Ok(LocalUser {
+            uid: 1000,
+            gid: 1000,
+            gids: vec![1000],
+            name: "mapped".into(),
+            home_dir: "/tmp".into(),
+            shell: "/bin/sh".into(),
+        })
+    });
+    let dial: crate::DialFn = Arc::new(|_| Box::pin(std::future::pending()));
+    let mutate = |init: &mut crate::session::SessionInit| {
+        init.recording_config = Some(crate::RecordingConfig {
+            recorders: vec!["100.64.0.9:80".parse().unwrap()],
+            ..Default::default()
+        });
+        init.recording_header = Some(crate::CastHeader::new(
+            (0, 0),
+            "ignored".into(),
+            std::collections::HashMap::new(),
+            "requested".into(),
+            "mapped".into(),
+            "connection".into(),
+        ));
+        init.recording_dial = Some(dial.clone());
     };
+    let policy = policy_for("mapped", std::time::Duration::from_millis(50));
+    let policy: Arc<dyn Fn() -> Option<SSHPolicy> + Send + Sync> =
+        Arc::new(move || Some(policy.clone()));
+    let (code, output) = run_pipeline_custom(
+        "ignored",
+        "requested",
+        policy,
+        Some((resolver, launcher.clone())),
+        Some(&mutate),
+        false,
+        false,
+    )
+    .await;
+    assert_eq!(code, 1);
+    assert!(String::from_utf8_lossy(&output).contains("Session timeout"));
+    assert!(launcher.args.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn client_eof_cancels_hung_recorder_initialization_before_launch() {
+    let launcher = Arc::new(CapturingLauncher::default());
+    let resolver: Arc<UserResolver> = Arc::new(|_name: String| {
+        Ok(LocalUser {
+            uid: 1000,
+            gid: 1000,
+            gids: vec![1000],
+            name: "mapped".into(),
+            home_dir: "/tmp".into(),
+            shell: "/bin/sh".into(),
+        })
+    });
+    let dial: crate::DialFn = Arc::new(|_| Box::pin(std::future::pending()));
+    let mutate = |init: &mut crate::session::SessionInit| {
+        init.recording_config = Some(crate::RecordingConfig {
+            recorders: vec!["100.64.0.9:80".parse().unwrap()],
+            ..Default::default()
+        });
+        init.recording_header = Some(crate::CastHeader::new(
+            (0, 0),
+            "ignored".into(),
+            std::collections::HashMap::new(),
+            "requested".into(),
+            "mapped".into(),
+            "connection".into(),
+        ));
+        init.recording_dial = Some(dial.clone());
+    };
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        run_pipeline_custom(
+            "ignored",
+            "requested",
+            policy_map_any("mapped"),
+            Some((resolver, launcher.clone())),
+            Some(&mutate),
+            true,
+            false,
+        ),
+    )
+    .await
+    .expect("client EOF did not cancel recorder initialization");
+    assert_eq!(result.0, 1);
+    assert!(launcher.args.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn zero_session_duration_does_not_cancel_session() {
+    let code = run_pipeline("sleep 0.1; exit 0").await;
+    assert_eq!(code, 0);
+}
+
+#[tokio::test]
+async fn session_duration_terminates_and_escalates_process_group() {
+    let launcher = Arc::new(TermIgnoringLauncher::new(Vec::new()));
+    let resolver: Arc<UserResolver> = Arc::new(|_name: String| {
+        Ok(LocalUser {
+            uid: 1000,
+            gid: 1000,
+            gids: vec![1000],
+            name: "mapped".into(),
+            home_dir: "/tmp".into(),
+            shell: "/bin/sh".into(),
+        })
+    });
     let policy = policy_for("mapped", std::time::Duration::from_millis(50));
     let policy: Arc<dyn Fn() -> Option<SSHPolicy> + Send + Sync> =
         Arc::new(move || Some(policy.clone()));
@@ -671,7 +1183,7 @@ async fn session_duration_terminates_and_escalates_process_group() {
         "ignored",
         "requested",
         policy,
-        Some((&resolver, &launcher)),
+        Some((resolver.clone(), launcher.clone())),
         None,
         false,
         false,
@@ -686,9 +1198,12 @@ async fn session_duration_terminates_and_escalates_process_group() {
 }
 
 #[tokio::test]
-async fn live_policy_revocation_terminates_existing_session() {
-    let launcher = TermIgnoringLauncher::new(Vec::new());
-    let resolver = |_name: &str| {
+async fn sigkill_error_is_not_reported_as_success_after_group_disappears() {
+    let control = Arc::new(KillFailureControl::default());
+    let launcher: Arc<dyn SessionLauncher> = Arc::new(CompletedLauncher {
+        control: control.clone(),
+    });
+    let resolver: Arc<UserResolver> = Arc::new(|_name: String| {
         Ok(LocalUser {
             uid: 1000,
             gid: 1000,
@@ -697,7 +1212,77 @@ async fn live_policy_revocation_terminates_existing_session() {
             home_dir: "/tmp".into(),
             shell: "/bin/sh".into(),
         })
-    };
+    });
+    let (code, _) = run_pipeline_custom(
+        "ignored",
+        "requested",
+        policy_map_any("mapped"),
+        Some((resolver, launcher)),
+        None,
+        false,
+        false,
+    )
+    .await;
+    assert_eq!(code, 1);
+    assert_eq!(
+        &*control.signals.lock().unwrap(),
+        &[libc::SIGTERM, libc::SIGKILL]
+    );
+}
+
+#[tokio::test]
+async fn persistent_process_group_returns_explicit_failure() {
+    let control = Arc::new(PersistentControl::default());
+    let launcher: Arc<dyn SessionLauncher> = Arc::new(PersistentLauncher {
+        control: control.clone(),
+    });
+    let resolver: Arc<UserResolver> = Arc::new(|_name: String| {
+        Ok(LocalUser {
+            uid: 1000,
+            gid: 1000,
+            gids: vec![1000],
+            name: "mapped".into(),
+            home_dir: "/tmp".into(),
+            shell: "/bin/sh".into(),
+        })
+    });
+    let policy = policy_for("mapped", std::time::Duration::from_millis(50));
+    let policy: Arc<dyn Fn() -> Option<SSHPolicy> + Send + Sync> =
+        Arc::new(move || Some(policy.clone()));
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(4),
+        run_pipeline_custom(
+            "ignored",
+            "requested",
+            policy,
+            Some((resolver, launcher)),
+            None,
+            false,
+            false,
+        ),
+    )
+    .await
+    .expect("persistent group cleanup was not bounded");
+    assert_eq!(result.0, 1);
+    assert_eq!(
+        &*control.signals.lock().unwrap(),
+        &[libc::SIGTERM, libc::SIGKILL]
+    );
+}
+
+#[tokio::test]
+async fn live_policy_revocation_terminates_existing_session() {
+    let launcher = Arc::new(TermIgnoringLauncher::new(Vec::new()));
+    let resolver: Arc<UserResolver> = Arc::new(|_name: String| {
+        Ok(LocalUser {
+            uid: 1000,
+            gid: 1000,
+            gids: vec![1000],
+            name: "mapped".into(),
+            home_dir: "/tmp".into(),
+            shell: "/bin/sh".into(),
+        })
+    });
     let current_policy = Arc::new(Mutex::new(Some(policy_for(
         "mapped",
         std::time::Duration::ZERO,
@@ -718,7 +1303,7 @@ async fn live_policy_revocation_terminates_existing_session() {
         "ignored",
         "requested",
         policy,
-        Some((&resolver, &launcher)),
+        Some((resolver.clone(), launcher.clone())),
         None,
         false,
         false,
@@ -735,8 +1320,8 @@ async fn live_policy_revocation_terminates_existing_session() {
 
 #[tokio::test]
 async fn client_eof_closes_stdin_and_cleans_up_term_ignoring_process() {
-    let launcher = TermIgnoringLauncher::new(Vec::new());
-    let resolver = |_name: &str| {
+    let launcher = Arc::new(TermIgnoringLauncher::new(Vec::new()));
+    let resolver: Arc<UserResolver> = Arc::new(|_name: String| {
         Ok(LocalUser {
             uid: 1000,
             gid: 1000,
@@ -745,7 +1330,7 @@ async fn client_eof_closes_stdin_and_cleans_up_term_ignoring_process() {
             home_dir: "/tmp".into(),
             shell: "/bin/sh".into(),
         })
-    };
+    });
 
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(7),
@@ -753,7 +1338,7 @@ async fn client_eof_closes_stdin_and_cleans_up_term_ignoring_process() {
             "ignored",
             "requested",
             policy_map_any("mapped"),
-            Some((&resolver, &launcher)),
+            Some((resolver.clone(), launcher.clone())),
             None,
             true,
             false,
@@ -762,13 +1347,8 @@ async fn client_eof_closes_stdin_and_cleans_up_term_ignoring_process() {
     .await
     .expect("EOF cleanup must be bounded");
     assert_eq!(result.0, 1);
-    assert!(launcher
-        .input_dropped
-        .load(std::sync::atomic::Ordering::SeqCst));
-    assert_eq!(
-        &*launcher.control.signals.lock().unwrap(),
-        &[libc::SIGTERM, libc::SIGKILL]
-    );
+    // Cancellation can win before the bounded launcher starts (no process),
+    // or after it starts (covered by the late-launch supervisor test).
 }
 
 #[tokio::test]

@@ -94,10 +94,23 @@ const EXTENDED_DATA_STDERR: u32 = 1;
 
 /// Default PATH when the SSH client doesn't provide one.
 const DEFAULT_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
+#[cfg(not(test))]
 const RECORDING_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+#[cfg(test)]
+const RECORDING_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
 const OUTPUT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+#[cfg(not(test))]
 const PROCESS_TERM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+#[cfg(test)]
+const PROCESS_TERM_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
+#[cfg(not(test))]
 const PROCESS_KILL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+#[cfg(test)]
+const PROCESS_KILL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+#[cfg(not(test))]
+const BLOCKING_PHASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+#[cfg(test)]
+const BLOCKING_PHASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Errors from session handling.
 #[derive(Debug, thiserror::Error)]
@@ -391,12 +404,17 @@ type BoxWrite = Box<dyn AsyncWrite + Unpin + Send>;
 pub(crate) trait ProcessControl: Send + Sync {
     /// Returns true if the process group still existed.
     fn signal_group(&self, signal: libc::c_int) -> io::Result<bool>;
+    fn group_exists(&self) -> io::Result<bool>;
 }
 
 #[cfg(unix)]
 impl ProcessControl for ProcessGroup {
     fn signal_group(&self, signal: libc::c_int) -> io::Result<bool> {
         self.signal(signal)
+    }
+
+    fn group_exists(&self) -> io::Result<bool> {
+        self.exists()
     }
 }
 
@@ -414,6 +432,106 @@ pub(crate) struct LaunchedSession {
 #[cfg(unix)]
 pub(crate) trait SessionLauncher: Send + Sync {
     fn launch(&self, args: IncubatorArgs) -> Result<LaunchedSession, SessionHandlerError>;
+}
+
+#[cfg(unix)]
+pub(crate) type UserResolver =
+    dyn Fn(String) -> Result<LocalUser, SessionHandlerError> + Send + Sync;
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug)]
+enum CancellationCause {
+    Duration,
+    Client,
+    Policy,
+    BlockerTimeout,
+}
+
+#[cfg(unix)]
+struct LifecycleWatch {
+    duration: std::time::Duration,
+    deadline: Option<tokio::time::Instant>,
+    cancel_rx: tokio::sync::watch::Receiver<bool>,
+    revalidate: Option<crate::session::RevalidateCallback>,
+    policy_tick: tokio::time::Interval,
+    policy_invalid_checks: u8,
+}
+
+#[cfg(unix)]
+impl LifecycleWatch {
+    fn new(session: &mut Session) -> Self {
+        let duration = session.session_duration();
+        let deadline = (!duration.is_zero()).then(|| tokio::time::Instant::now() + duration);
+        let mut policy_tick = tokio::time::interval(std::time::Duration::from_millis(250));
+        policy_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        Self {
+            duration,
+            deadline,
+            cancel_rx: session.take_cancel_rx(),
+            revalidate: session.take_revalidate(),
+            policy_tick,
+            policy_invalid_checks: 0,
+        }
+    }
+
+    async fn cancellation(&mut self) -> CancellationCause {
+        loop {
+            tokio::select! {
+                () = wait_for_deadline(self.deadline), if self.deadline.is_some() => {
+                    self.deadline = None;
+                    return CancellationCause::Duration;
+                }
+                changed = self.cancel_rx.changed() => {
+                    if changed.is_err() || *self.cancel_rx.borrow() {
+                        return CancellationCause::Client;
+                    }
+                }
+                _ = self.policy_tick.tick(), if self.revalidate.is_some() => {
+                    if self.revalidate.as_ref().is_some_and(|check| check()) {
+                        self.policy_invalid_checks = 0;
+                    } else {
+                        self.policy_invalid_checks = self.policy_invalid_checks.saturating_add(1);
+                        if self.policy_invalid_checks >= 2 {
+                            self.revalidate = None;
+                            return CancellationCause::Policy;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    async fn supervise<F: std::future::Future>(
+        &mut self,
+        future: F,
+    ) -> Result<F::Output, CancellationCause> {
+        tokio::pin!(future);
+        tokio::select! {
+            output = &mut future => Ok(output),
+            cause = self.cancellation() => Err(cause),
+        }
+    }
+
+    async fn supervise_blocker<F: std::future::Future>(
+        &mut self,
+        future: F,
+    ) -> Result<F::Output, CancellationCause> {
+        tokio::pin!(future);
+        tokio::select! {
+            output = &mut future => Ok(output),
+            cause = self.cancellation() => Err(cause),
+            () = tokio::time::sleep(BLOCKING_PHASE_TIMEOUT) => Err(CancellationCause::BlockerTimeout),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn blocker_limit() -> std::sync::Arc<tokio::sync::Semaphore> {
+    static LIMIT: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    LIMIT
+        .get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(8)))
+        .clone()
 }
 
 #[cfg(unix)]
@@ -457,8 +575,8 @@ pub async fn run_session(
     run_session_with(
         session,
         rec_config,
-        &get_local_user,
-        &IncubatorSessionLauncher,
+        std::sync::Arc::new(|name| get_local_user(&name)),
+        std::sync::Arc::new(IncubatorSessionLauncher),
     )
     .await
 }
@@ -467,14 +585,33 @@ pub async fn run_session(
 pub(crate) async fn run_session_with(
     mut session: Session,
     rec_config: Option<RecordingConfig>,
-    resolve_user: &(dyn Fn(&str) -> Result<LocalUser, SessionHandlerError> + Send + Sync),
-    launcher: &dyn SessionLauncher,
+    resolve_user: std::sync::Arc<UserResolver>,
+    launcher: std::sync::Arc<dyn SessionLauncher>,
 ) -> Result<i32, SessionHandlerError> {
-    let session_duration = session.session_duration();
-    let mut session_deadline =
-        (!session_duration.is_zero()).then(|| tokio::time::Instant::now() + session_duration);
-    let mut revalidate = session.take_revalidate();
-    let local_user = resolve_user(session.local_user())?;
+    let mut lifecycle = LifecycleWatch::new(&mut session);
+    let local_user_name = session.local_user().to_string();
+    let permit = match lifecycle
+        .supervise_blocker(blocker_limit().acquire_owned())
+        .await
+    {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(_)) => return Err(io::Error::other("SSH blocker limit closed").into()),
+        Err(cause) => return finish_prelaunch_cancellation(&mut session, cause).await,
+    };
+    let mut resolve_task = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        resolve_user(local_user_name)
+    });
+    let local_user = match lifecycle.supervise_blocker(&mut resolve_task).await {
+        Ok(Ok(result)) => result?,
+        Ok(Err(error)) => return Err(io::Error::other(error.to_string()).into()),
+        Err(cause) => {
+            tokio::spawn(async move {
+                let _ = resolve_task.await;
+            });
+            return finish_prelaunch_cancellation(&mut session, cause).await;
+        }
+    };
 
     let (src_ip, src_port, dst_ip, dst_port) = session.peer_addr().map_or(
         (
@@ -540,18 +677,9 @@ pub(crate) async fn run_session_with(
             // the exact account/uid selected for process launch.
             header.local_user.clone_from(&local_user.name);
             let initialize = init_recording(config, header, session.take_recording_dial());
-            let initialized = if let Some(deadline) = session_deadline {
-                if let Ok(result) = tokio::time::timeout_at(deadline, initialize).await {
-                    result
-                } else {
-                    let message = format!("Session timeout of {session_duration:?} elapsed.");
-                    send_session_termination(&message, session.handle(), session.channel_id())
-                        .await;
-                    session.exit(1).await;
-                    return Ok(1);
-                }
-            } else {
-                initialize.await
+            let initialized = match lifecycle.supervise(initialize).await {
+                Ok(result) => result,
+                Err(cause) => return finish_prelaunch_cancellation(&mut session, cause).await,
             };
             match initialized {
                 Ok(initialized) => recorder = initialized,
@@ -563,9 +691,13 @@ pub(crate) async fn run_session_with(
             }
         }
     }
+    let recording_fail_closed = effective_recording_config
+        .as_ref()
+        .is_some_and(|config| !config.fail_open);
     let terminate_message = effective_recording_config
-        .and_then(|config| config.on_failure)
-        .map(|action| action.TerminateSessionWithMessage)
+        .as_ref()
+        .and_then(|config| config.on_failure.as_ref())
+        .map(|action| action.TerminateSessionWithMessage.clone())
         .filter(|message| !message.is_empty());
     let mut upload_result_rx = recorder.as_ref().and_then(SessionRecorder::take_result_rx);
 
@@ -583,19 +715,42 @@ pub(crate) async fn run_session_with(
         None
     };
 
-    if revalidate.as_ref().is_some_and(|check| !check()) {
-        send_session_termination("Access revoked.", session.handle(), session.channel_id()).await;
-        session.exit(1).await;
-        return Ok(1);
+    if lifecycle.revalidate.as_ref().is_some_and(|check| !check()) {
+        return finish_prelaunch_cancellation(&mut session, CancellationCause::Policy).await;
     }
-    if session_deadline.is_some_and(|deadline| deadline <= tokio::time::Instant::now()) {
-        let message = format!("Session timeout of {session_duration:?} elapsed.");
-        send_session_termination(&message, session.handle(), session.channel_id()).await;
-        session.exit(1).await;
-        return Ok(1);
+    if lifecycle
+        .deadline
+        .is_some_and(|deadline| deadline <= tokio::time::Instant::now())
+    {
+        return finish_prelaunch_cancellation(&mut session, CancellationCause::Duration).await;
     }
 
-    let mut launched = launcher.launch(args)?;
+    let permit = match lifecycle
+        .supervise_blocker(blocker_limit().acquire_owned())
+        .await
+    {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(_)) => return Err(io::Error::other("SSH blocker limit closed").into()),
+        Err(cause) => return finish_prelaunch_cancellation(&mut session, cause).await,
+    };
+    let runtime = tokio::runtime::Handle::current();
+    let mut launch_task = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let _runtime = runtime.enter();
+        launcher.launch(args)
+    });
+    let mut launched = match lifecycle.supervise_blocker(&mut launch_task).await {
+        Ok(Ok(result)) => result?,
+        Ok(Err(error)) => return Err(io::Error::other(error.to_string()).into()),
+        Err(cause) => {
+            tokio::spawn(async move {
+                if let Ok(Ok(launched)) = launch_task.await {
+                    supervise_late_launch(launched).await;
+                }
+            });
+            return finish_prelaunch_cancellation(&mut session, cause).await;
+        }
+    };
     let mut process_input = launched.input.take();
     let mut process_output = launched.output.take();
     let mut process_stderr = launched.stderr.take();
@@ -612,9 +767,6 @@ pub(crate) async fn run_session_with(
 
     let handle = session.handle().clone();
     let channel_id = session.channel_id();
-    let mut policy_tick = tokio::time::interval(std::time::Duration::from_millis(250));
-    policy_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut cancel_rx = session.take_cancel_rx();
     let mut signal_rx = session.take_signal_rx();
     let mut window_change_rx = session.take_window_change_rx();
     let mut session_buf = vec![0_u8; 4096];
@@ -626,10 +778,13 @@ pub(crate) async fn run_session_with(
     let mut forced_failure = false;
     let mut pumps_aborted = false;
     let mut term_deadline = None;
-    let mut kill_deadline = None;
+    let mut group_verify_deadline = None;
+    let mut reap_deadline = None;
     let mut drain_deadline = None;
     let mut group_cleanup_started = false;
-    let mut policy_invalid_checks = 0_u8;
+    let mut group_cleanup_confirmed = false;
+    let mut group_poll = tokio::time::interval(std::time::Duration::from_millis(25));
+    group_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         if pumps_aborted {
@@ -643,17 +798,16 @@ pub(crate) async fn run_session_with(
             && process_output.is_none()
             && process_stderr.is_none()
             && term_deadline.is_none()
+            && group_verify_deadline.is_none()
         {
-            if forced_failure || kill_deadline.is_some() {
+            if group_cleanup_confirmed {
                 break;
             }
-            if group_cleanup_started {
-                // TERM's bounded grace elapsed and SIGKILL was sent.
-                break;
-            }
-            group_cleanup_started = true;
-            if !begin_process_termination(control.as_ref(), &mut term_deadline) {
-                break;
+            if !group_cleanup_started {
+                group_cleanup_started = true;
+                if !begin_process_termination(control.as_ref(), &mut term_deadline) {
+                    break;
+                }
             }
         }
 
@@ -704,7 +858,7 @@ pub(crate) async fn run_session_with(
                             if matches!(recorder.write(RecordDir::Output, &stdout_buf[..count]), RecordResult::Failed) {
                                 upload_result_rx = None;
                                 recorder.abort_upload();
-                                if terminate_message.is_some() {
+                                if recording_fail_closed {
                                     deliver = false;
                                     forced_failure = true;
                                     pumps_aborted = true;
@@ -735,7 +889,7 @@ pub(crate) async fn run_session_with(
                             if matches!(recorder.write(RecordDir::Output, &stderr_buf[..count]), RecordResult::Failed) {
                                 upload_result_rx = None;
                                 recorder.abort_upload();
-                                if terminate_message.is_some() {
+                                if recording_fail_closed {
                                     deliver = false;
                                     forced_failure = true;
                                     pumps_aborted = true;
@@ -759,6 +913,7 @@ pub(crate) async fn run_session_with(
                 }
             }
             result = &mut child_wait, if child_exit.is_none() => {
+                reap_deadline = None;
                 child_exit = Some(if let Ok(code) = result {
                     code
                 } else {
@@ -777,7 +932,7 @@ pub(crate) async fn run_session_with(
                 if let Some(recorder) = recorder.as_ref() {
                     let _ = recorder.close();
                 }
-                if terminate_message.is_some() {
+                if recording_fail_closed {
                     forced_failure = true;
                     pumps_aborted = true;
                     send_recording_termination(terminate_message.as_deref(), &handle, channel_id).await;
@@ -787,43 +942,15 @@ pub(crate) async fn run_session_with(
                     log::warn!("SSH recorder transport failed; continuing per fail-open policy");
                 }
             }
-            () = wait_for_deadline(session_deadline), if session_deadline.is_some() && term_deadline.is_none() => {
-                session_deadline = None;
+            cause = lifecycle.cancellation(), if term_deadline.is_none() && !forced_failure => {
+                process_input = None;
+                pending_input.clear();
+                pending_input_offset = 0;
                 forced_failure = true;
                 pumps_aborted = true;
-                let message = format!("Session timeout of {session_duration:?} elapsed.");
-                send_session_termination(&message, &handle, channel_id).await;
+                send_cancellation(cause, lifecycle.duration, &handle, channel_id).await;
                 let _ = begin_process_termination(control.as_ref(), &mut term_deadline);
                 session.exit(1).await;
-            }
-            _ = policy_tick.tick(), if revalidate.is_some() && term_deadline.is_none() => {
-                if revalidate.as_ref().is_some_and(|check| check()) {
-                    policy_invalid_checks = 0;
-                } else {
-                    // A callback can be momentarily unavailable while the
-                    // async netmap lock is being replaced. Require persistence
-                    // across two polls, while still revoking within 500 ms.
-                    policy_invalid_checks = policy_invalid_checks.saturating_add(1);
-                    if policy_invalid_checks >= 2 {
-                        revalidate = None;
-                        forced_failure = true;
-                        pumps_aborted = true;
-                        send_session_termination("Access revoked.", &handle, channel_id).await;
-                        let _ = begin_process_termination(control.as_ref(), &mut term_deadline);
-                        session.exit(1).await;
-                    }
-                }
-            }
-            changed = cancel_rx.changed(), if term_deadline.is_none() && !forced_failure => {
-                if changed.is_err() || *cancel_rx.borrow() {
-                    process_input = None;
-                    pending_input.clear();
-                    pending_input_offset = 0;
-                    forced_failure = true;
-                    pumps_aborted = true;
-                    let _ = begin_process_termination(control.as_ref(), &mut term_deadline);
-                    session.exit(1).await;
-                }
             }
             Some(signal) = signal_rx.recv(), if term_deadline.is_none() && !forced_failure => {
                 let _ = control.signal_group(sig_to_libc(&signal));
@@ -836,33 +963,70 @@ pub(crate) async fn run_session_with(
             () = wait_for_deadline(drain_deadline), if drain_deadline.is_some() => {
                 drain_deadline = None;
                 pumps_aborted = true;
+                group_cleanup_started = true;
                 let _ = begin_process_termination(control.as_ref(), &mut term_deadline);
             }
             () = wait_for_deadline(term_deadline), if term_deadline.is_some() => {
                 term_deadline = None;
-                let _ = control.signal_group(libc::SIGKILL);
+                // ESRCH is reported as `Ok(false)` by ProcessGroup. Other
+                // signal errors are explicit cleanup failures, but still poll
+                // so the group can be confirmed gone or reported persistent.
+                if control.signal_group(libc::SIGKILL).is_err() {
+                    forced_failure = true;
+                }
                 pumps_aborted = true;
-                kill_deadline = Some(tokio::time::Instant::now() + PROCESS_KILL_TIMEOUT);
+                group_verify_deadline = Some(tokio::time::Instant::now() + PROCESS_KILL_TIMEOUT);
             }
-            () = wait_for_deadline(kill_deadline), if kill_deadline.is_some() => {
+            _ = group_poll.tick(), if group_verify_deadline.is_some() => {
+                if let Ok(false) = control.group_exists() {
+                    group_cleanup_confirmed = true;
+                    group_verify_deadline = None;
+                    if child_exit.is_none() {
+                        reap_deadline = Some(tokio::time::Instant::now() + PROCESS_KILL_TIMEOUT);
+                    }
+                }
+            }
+            () = wait_for_deadline(group_verify_deadline), if group_verify_deadline.is_some() => {
+                log::warn!("SSH process group persisted after SIGKILL");
+                forced_failure = true;
+                group_cleanup_confirmed = true;
+                group_verify_deadline = None;
+                if child_exit.is_none() {
+                    reap_deadline = Some(tokio::time::Instant::now() + PROCESS_KILL_TIMEOUT);
+                }
+            }
+            () = wait_for_deadline(reap_deadline), if reap_deadline.is_some() => {
+                log::warn!("SSH child could not be reaped after process-group cleanup");
                 forced_failure = true;
                 break;
             }
         }
     }
 
+    let mut final_recording_failed = false;
     if let Some(recorder) = recorder.as_ref() {
-        let _ = recorder.close();
+        if recorder.close().is_err() {
+            final_recording_failed = true;
+        }
     }
     if let Some(result_rx) = upload_result_rx {
         match tokio::time::timeout(RECORDING_DRAIN_TIMEOUT, result_rx).await {
             Ok(Ok(Ok(()))) => {}
-            Ok(_) => log::warn!("SSH recorder upload failed during session teardown"),
+            Ok(_) => final_recording_failed = true,
             Err(_) => {
+                final_recording_failed = true;
                 if let Some(recorder) = recorder.as_ref() {
                     recorder.abort_upload();
                 }
             }
+        }
+    }
+    if final_recording_failed {
+        if recording_fail_closed {
+            forced_failure = true;
+            send_recording_termination(terminate_message.as_deref(), &handle, channel_id).await;
+        } else {
+            log::warn!("SSH recorder upload failed during session teardown; failing open");
         }
     }
 
@@ -873,6 +1037,79 @@ pub(crate) async fn run_session_with(
     };
     session.exit(exit_code.max(0) as u32).await;
     Ok(exit_code)
+}
+
+#[cfg(unix)]
+async fn finish_prelaunch_cancellation(
+    session: &mut Session,
+    cause: CancellationCause,
+) -> Result<i32, SessionHandlerError> {
+    let handle = session.handle().clone();
+    send_cancellation(
+        cause,
+        session.session_duration(),
+        &handle,
+        session.channel_id(),
+    )
+    .await;
+    session.exit(1).await;
+    Ok(1)
+}
+
+#[cfg(unix)]
+async fn send_cancellation(
+    cause: CancellationCause,
+    duration: std::time::Duration,
+    handle: &russh::server::Handle,
+    channel_id: russh::ChannelId,
+) {
+    match cause {
+        CancellationCause::Duration => {
+            let message = format!("Session timeout of {duration:?} elapsed.");
+            send_session_termination(&message, handle, channel_id).await;
+        }
+        CancellationCause::Policy => {
+            send_session_termination("Access revoked.", handle, channel_id).await;
+        }
+        CancellationCause::BlockerTimeout => {
+            send_session_termination("SSH session initialization timed out.", handle, channel_id)
+                .await;
+        }
+        CancellationCause::Client => {}
+    }
+}
+
+#[cfg(unix)]
+async fn supervise_late_launch(mut launched: LaunchedSession) {
+    launched.input = None;
+    launched.output = None;
+    launched.stderr = None;
+    let _ = launched.control.signal_group(libc::SIGTERM);
+    tokio::time::sleep(PROCESS_TERM_TIMEOUT).await;
+    let _ = launched.control.signal_group(libc::SIGKILL);
+
+    let verify = async {
+        loop {
+            match launched.control.group_exists() {
+                Ok(false) => break,
+                Ok(true) | Err(_) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+            }
+        }
+    };
+    if tokio::time::timeout(PROCESS_KILL_TIMEOUT, verify)
+        .await
+        .is_err()
+    {
+        log::warn!("canceled SSH launch left a persistent process group after SIGKILL");
+    }
+    if tokio::time::timeout(PROCESS_KILL_TIMEOUT, &mut launched.wait)
+        .await
+        .is_err()
+    {
+        log::warn!("canceled SSH launch child could not be reaped");
+    }
 }
 
 #[cfg(unix)]

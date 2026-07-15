@@ -99,6 +99,20 @@ pub struct ProcessGroup {
 }
 
 impl ProcessGroup {
+    /// Whether any process still belongs to this group.
+    #[cfg(unix)]
+    pub fn exists(&self) -> io::Result<bool> {
+        self.signal(0)
+    }
+
+    #[cfg(not(unix))]
+    pub fn exists(&self) -> io::Result<bool> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "process groups are only supported on Unix",
+        ))
+    }
+
     /// Signal the whole shell process group, including descendants.
     #[cfg(unix)]
     pub fn signal(&self, signal: libc::c_int) -> io::Result<bool> {

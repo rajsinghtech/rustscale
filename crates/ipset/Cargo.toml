@@ -1,0 +1,17 @@
+[package]
+name = "rustscale-ipset"
+description = "Optimized in-process IP prefix membership predicates"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rustscale-art = { path = "../art", version = "0.1.1" }
+
+[dev-dependencies]
+rand.workspace = true

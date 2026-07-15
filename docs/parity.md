@@ -148,7 +148,7 @@ real JSON).
 | Watchdog | ✅ tokio-based interval task, auto-fires warning if not feed() within interval, Drop-safe |
 | Syspolicy | ⬜ |
 | BIRD routing (`chirp/`) | ✅ standalone `rustscale-chirp` client; integration into a routing deployment remains opt-in |
-| Linux ipset | ⬜ |
+| In-process IP prefix set (`net/ipset`) | ✅ `crates/ipset` ports the actual cross-platform upstream package: `false_contains_ip_func` and `new_contains_ip_func` build immutable IPv4/IPv6 membership predicates with the same empty, one/two-host, host-map, small linear-prefix, and larger ART-backed strategy selection. Prefix host bits are normalized for membership and address families remain distinct. The API exposes no iteration or serialization order. All upstream vectors and deterministic randomized differential tests against linear prefix containment pass; no kernel `ipset` command management is included. |
 | envknob | ✅ wired: `TS_NO_LOGS_NO_SUPPORT`, `TS_ALLOW_ADMIN_CONSOLE_REMOTE_UPDATE`, `TS_WAKE_MAC`, `TS_DEBUG_USE_DERP_HTTP`, `TS_DNS_FORWARD_SKIP_TCP_RETRY`, `TS_PANIC_IF_HIT_MAIN_CONTROL`; `TSNET_FORCE_LOGIN` is intentionally skipped because tsnet has no cached-Running-state auth bypass |
 | Version package | ✅ build.rs git describe --tags --long --always --dirty → RUSTSCALE_VERSION_LONG; fallback CARGO_PKG_VERSION |
 | Freedesktop/DBus | ⬜ |

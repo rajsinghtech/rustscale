@@ -92,6 +92,7 @@ impl RouteTable {
     /// entries; defaults are enabled only by [`Self::set_exit_node`].
     pub fn from_peers_with_opts(peers: &[Node], accept_routes: bool) -> Self {
         let mut entries = Vec::new();
+        let mut index = ArtTable::new();
         for peer in peers {
             if peer.Key.is_zero() {
                 continue;
@@ -100,25 +101,23 @@ impl RouteTable {
                 let Some(prefix) = parse_cidr(cidr) else {
                     continue;
                 };
-                if prefix.bits() == 0 || (!accept_routes && !is_host_prefix(prefix)) {
+                if prefix.bits() == 0
+                    || (!accept_routes && !is_host_prefix(prefix))
+                    || index.get_prefix(prefix).is_some()
+                {
                     continue;
                 }
+                let _ = index.insert(prefix, peer.Key.clone());
                 entries.push(RouteEntry {
                     prefix,
                     peer: peer.Key.clone(),
                 });
             }
         }
-        // Keep the diagnostic/OS-routing view longest-prefix first. The sort
-        // is stable, which also defines equal-prefix ownership as the first
-        // peer in the netmap.
+        // Keep the diagnostic/OS-routing view longest-prefix first. Equal
+        // normalized prefixes were already deduplicated while walking peers,
+        // so every view retains the first owner in netmap order.
         entries.sort_by_key(|entry| std::cmp::Reverse(entry.prefix.bits()));
-        let mut index = ArtTable::new();
-        for entry in &entries {
-            if index.get_prefix(entry.prefix).is_none() {
-                let _ = index.insert(entry.prefix, entry.peer.clone());
-            }
-        }
         Self {
             entries,
             index,
@@ -159,7 +158,7 @@ impl RouteTable {
         self.exit_node = exit;
     }
 
-    /// Number of route entries (for diagnostics/testing).
+    /// Number of distinct normalized route entries (for diagnostics/testing).
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -169,8 +168,9 @@ impl RouteTable {
         self.entries.is_empty() && self.exit_node.is_none()
     }
 
-    /// Iterate over all route entries as `(network_ip, prefix, peer_key)`. Used
-    /// by TUN mode to install accepted subnet routes as OS routes.
+    /// Iterate over distinct normalized routes as `(network_ip, prefix,
+    /// peer_key)`. Used by TUN mode to install accepted subnet routes as OS
+    /// routes.
     pub fn entries(&self) -> impl Iterator<Item = (IpAddr, u8, &NodePublic)> {
         self.entries
             .iter()
@@ -317,7 +317,7 @@ mod tests {
     }
 
     #[test]
-    fn equal_normalized_prefix_keeps_first_peer() {
+    fn equal_normalized_prefix_is_deduplicated_across_views() {
         let first = NodePrivate::generate().public();
         let second = NodePrivate::generate().public();
         let peers = vec![
@@ -327,11 +327,15 @@ mod tests {
         let rt = RouteTable::from_peers(&peers);
         assert_eq!(
             rt.lookup(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))),
-            Some(first)
+            Some(first.clone())
         );
-        assert!(rt
-            .entries()
-            .all(|(net, bits, _)| net == IpAddr::V4(Ipv4Addr::new(192, 0, 2, 0)) && bits == 24));
+        assert_eq!(rt.len(), 1);
+        let entries: Vec<_> = rt.entries().collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0],
+            (IpAddr::V4(Ipv4Addr::new(192, 0, 2, 0)), 24, &first)
+        );
     }
 
     #[test]

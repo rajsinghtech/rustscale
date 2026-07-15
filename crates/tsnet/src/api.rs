@@ -159,34 +159,11 @@ impl Server {
             sb.add_user(*id, profile.clone());
         }
 
-        // Check for exit node.
-        let rt = inner.route_table.read().await;
-        if let Some(exit_key) = rt.exit_node() {
-            let exit_id = exit_key.to_string();
-            let online = peers
-                .iter()
-                .find(|p| &p.Key == exit_key)
-                .and_then(|p| p.Online)
-                .unwrap_or(false);
-            let exit_ips: Vec<String> = peers
-                .iter()
-                .find(|p| &p.Key == exit_key)
-                .map(|p| {
-                    p.Addresses
-                        .iter()
-                        .filter_map(|s| s.split('/').next().map(String::from))
-                        .collect()
-                })
-                .unwrap_or_default();
-            sb.mutate_status(|s| {
-                s.ExitNodeStatus = Some(Box::new(rustscale_ipnstate::ExitNodeStatus {
-                    ID: exit_id,
-                    Online: online,
-                    TailscaleIPs: exit_ips,
-                }));
-            });
-        }
-        drop(rt);
+        let exit_node_status = {
+            let routes = inner.route_table.read().await;
+            crate::status::selected_exit_node_status(&peers, routes.exit_node())
+        };
+        sb.mutate_status(|status| status.ExitNodeStatus = exit_node_status);
 
         Some(sb.status())
     }

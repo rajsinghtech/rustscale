@@ -1361,6 +1361,14 @@ async fn build_status_json(state: &LocalApiState) -> serde_json::Value {
         sb.add_user(*id, profile.clone());
     }
 
+    let exit_node_status = if let Some(routes) = state.route_table.as_ref() {
+        let routes = routes.read().await;
+        crate::status::selected_exit_node_status(&peers, routes.exit_node())
+    } else {
+        None
+    };
+    sb.mutate_status(|status| status.ExitNodeStatus = exit_node_status);
+
     serde_json::to_value(sb.status()).unwrap_or(serde_json::Value::Null)
 }
 
@@ -4028,6 +4036,34 @@ mod tests {
         assert!(json["Peer"].is_object());
         assert!(json["Health"].is_array());
         assert!(json["CurrentTailnet"].is_object());
+    }
+
+    #[tokio::test]
+    async fn test_status_json_tracks_selected_exit_node() {
+        let mut state = make_test_state().await;
+        let exit_key = state.peers.read().await[0].Key.clone();
+
+        let json = build_status_json(&state).await;
+        assert!(json.get("ExitNodeStatus").is_none());
+
+        let mut routes = crate::RouteTable::default();
+        routes.set_exit_node(exit_key.clone());
+        let routes = Arc::new(RwLock::new(routes));
+        Arc::get_mut(&mut state)
+            .expect("test owns state")
+            .route_table = Some(routes.clone());
+
+        let json = build_status_json(&state).await;
+        assert_eq!(json["ExitNodeStatus"]["ID"], exit_key.to_string());
+        assert_eq!(json["ExitNodeStatus"]["Online"], true);
+        assert_eq!(
+            json["ExitNodeStatus"]["TailscaleIPs"],
+            serde_json::json!(["100.64.0.2"])
+        );
+
+        routes.write().await.clear_exit_node();
+        let json = build_status_json(&state).await;
+        assert!(json.get("ExitNodeStatus").is_none());
     }
 
     // --- watch-ipn-bus tests ---

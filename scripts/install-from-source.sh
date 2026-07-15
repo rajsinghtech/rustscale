@@ -138,7 +138,7 @@ acquire_source() {
         exit 1
     fi
 
-    WORKDIR=$(mktemp -d -t rustscale-install)
+    WORKDIR=$(mktemp -d "${TMPDIR:-/tmp}/rustscale-install.XXXXXX")
     SRCDIR="$WORKDIR/rustscale"
     echo "rustscale: cloning $RUSTSCALE_REPO"
     if [ -n "$RUSTSCALE_REF" ]; then

@@ -361,7 +361,7 @@ validate_archive() {
 
 download_and_install() {
     pick_http_client
-    WORKDIR=$(mktemp -d -t rustscale-install)
+    WORKDIR=$(mktemp -d "${TMPDIR:-/tmp}/rustscale-install.XXXXXX")
     resolve_url
 
     echo "rustscale: downloading $ARCHIVE from $DISPLAY_VERSION release"

@@ -2,7 +2,7 @@
 //!
 //! Mirrors Go's peermtu_unix.go (connControl, getIPProto).
 
-use std::os::unix::io::RawFd;
+use std::os::fd::RawFd;
 
 /// Error returned when the socket is not a real UDP socket (e.g. in tests
 /// where the pconn is wrapped or the fd is invalid). Mirrors Go's

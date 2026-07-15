@@ -1,11 +1,16 @@
 //! Stubs for platforms without PMTUD support.
 //! Mirrors Go's peermtu_stubs.go.
 
-use std::os::unix::io::RawFd;
+#[cfg(unix)]
+type RawSocketHandle = std::os::fd::RawFd;
+#[cfg(windows)]
+type RawSocketHandle = std::os::windows::io::RawSocket;
+#[cfg(not(any(unix, windows)))]
+type RawSocketHandle = usize;
 
 /// Enable/disable DF — always fails on unsupported platforms.
 pub(crate) fn set_dont_fragment(
-    _fd: RawFd,
+    _fd: RawSocketHandle,
     _network: &str,
     _enable: bool,
 ) -> Result<(), SetDfError> {
@@ -13,7 +18,7 @@ pub(crate) fn set_dont_fragment(
 }
 
 /// Query DF state — always returns false on unsupported platforms.
-pub(crate) fn get_dont_fragment(_fd: RawFd, _network: &str) -> Result<bool, SetDfError> {
+pub(crate) fn get_dont_fragment(_fd: RawSocketHandle, _network: &str) -> Result<bool, SetDfError> {
     Ok(false)
 }
 

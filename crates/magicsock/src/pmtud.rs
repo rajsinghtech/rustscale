@@ -9,6 +9,10 @@
 //! `update_pmtud` orchestration function that integrates with control knobs
 //! and endpoint state resets.
 
+#[cfg(any(
+    all(target_os = "linux", not(target_os = "android")),
+    all(target_os = "macos", not(target_os = "ios")),
+))]
 mod platform;
 
 #[cfg(all(target_os = "linux", not(target_os = "android")))]
@@ -33,7 +37,10 @@ mod stubs;
 use stubs as sys;
 
 use std::net::SocketAddr;
-use std::os::unix::io::AsRawFd;
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+#[cfg(windows)]
+use std::os::windows::io::AsRawSocket;
 
 use rustscale_controlknobs::ControlKnobs;
 use rustscale_disco::Message as DiscoMessage;
@@ -52,7 +59,12 @@ fn set_df_on_socket(
         Ok(SocketAddr::V6(_)) => "udp6",
         Err(_) => "udp4",
     };
+    #[cfg(unix)]
     let fd = socket.as_raw_fd();
+    #[cfg(windows)]
+    let fd = socket.as_raw_socket();
+    #[cfg(not(any(unix, windows)))]
+    let fd = 0;
     let result = sys::set_dont_fragment(fd, network, enable);
     (network.to_string(), result)
 }
@@ -65,7 +77,12 @@ fn get_df_on_socket(socket: &tokio::net::UdpSocket) -> Result<bool, SetDfError> 
         Ok(SocketAddr::V6(_)) => "udp6",
         Err(_) => "udp4",
     };
+    #[cfg(unix)]
     let fd = socket.as_raw_fd();
+    #[cfg(windows)]
+    let fd = socket.as_raw_socket();
+    #[cfg(not(any(unix, windows)))]
+    let fd = 0;
     sys::get_dont_fragment(fd, network)
 }
 
@@ -156,6 +173,10 @@ pub fn should_log_disco_tx_err(msg: &DiscoMessage, err: &std::io::Error) -> bool
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(any(
+        all(target_os = "linux", not(target_os = "android")),
+        all(target_os = "macos", not(target_os = "ios")),
+    ))]
     use std::net::UdpSocket as StdUdpSocket;
     use std::sync::Mutex;
 
@@ -233,6 +254,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(
+        all(target_os = "linux", not(target_os = "android")),
+        all(target_os = "macos", not(target_os = "ios")),
+    ))]
     fn test_dont_fragment_set_get_roundtrip() {
         let sock = StdUdpSocket::bind("127.0.0.1:0").unwrap();
         let fd = std::os::unix::io::AsRawFd::as_raw_fd(&sock);

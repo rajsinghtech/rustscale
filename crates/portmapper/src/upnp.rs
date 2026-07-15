@@ -307,25 +307,48 @@ fn delete_response_is_success(status: u16, response: &str) -> bool {
 }
 
 fn soap_not_found(body: &str) -> bool {
-    parse_xml_element_names(body).is_some_and(|elements| {
-        elements.iter().any(|name| name == "Envelope")
-            && elements.iter().any(|name| name == "Body")
-            && elements.iter().any(|name| name == "Fault")
-            && extract_upnp_error_code(body) == Some(714)
+    parse_xml_elements(body).is_some_and(|elements| {
+        has_strict_soap_body(&elements, "Fault") && extract_upnp_error_code(body) == Some(714)
     })
 }
 
 fn soap_response_is_success(body: &str, response_element: &str) -> bool {
-    let Some(elements) = parse_xml_element_names(body) else {
-        return false;
-    };
-    elements.iter().any(|name| name == "Envelope")
-        && elements.iter().any(|name| name == "Body")
-        && elements.iter().any(|name| name == response_element)
-        && !elements.iter().any(|name| name == "Fault")
+    parse_xml_elements(body)
+        .is_some_and(|elements| has_strict_soap_body(&elements, response_element))
 }
 
-fn parse_xml_element_names(xml: &str) -> Option<Vec<String>> {
+#[derive(Debug)]
+struct XmlElement {
+    name: String,
+    parent: Option<String>,
+}
+
+fn has_strict_soap_body(elements: &[XmlElement], expected: &str) -> bool {
+    if expected != "Fault" && elements.iter().any(|element| element.name == "Fault") {
+        return false;
+    }
+    let roots: Vec<_> = elements
+        .iter()
+        .filter(|element| element.parent.is_none())
+        .collect();
+    if roots.len() != 1 || roots[0].name != "Envelope" {
+        return false;
+    }
+    let envelope_children: Vec<_> = elements
+        .iter()
+        .filter(|element| element.parent.as_deref() == Some("Envelope"))
+        .collect();
+    if envelope_children.len() != 1 || envelope_children[0].name != "Body" {
+        return false;
+    }
+    let body_children: Vec<_> = elements
+        .iter()
+        .filter(|element| element.parent.as_deref() == Some("Body"))
+        .collect();
+    body_children.len() == 1 && body_children[0].name == expected
+}
+
+fn parse_xml_elements(xml: &str) -> Option<Vec<XmlElement>> {
     let mut stack = Vec::<String>::new();
     let mut elements = Vec::new();
     let mut rest = xml;
@@ -350,7 +373,10 @@ fn parse_xml_element_names(xml: &str) -> Option<Vec<String>> {
                 return None;
             }
         } else {
-            elements.push(local.clone());
+            elements.push(XmlElement {
+                name: local.clone(),
+                parent: stack.last().cloned(),
+            });
             if !self_closing {
                 stack.push(local);
             }
@@ -598,6 +624,18 @@ mod tests {
         ));
         assert!(!soap_response_is_success(
             "<Envelope><Body><Fault/><AddPortMappingResponse/></Body></Envelope>",
+            "AddPortMappingResponse"
+        ));
+        assert!(!soap_response_is_success(
+            "<Envelope><Body><AddPortMappingResponse><Fault/></AddPortMappingResponse></Body></Envelope>",
+            "AddPortMappingResponse"
+        ));
+        assert!(!soap_response_is_success(
+            "<Envelope><Body/><AddPortMappingResponse/></Envelope>",
+            "AddPortMappingResponse"
+        ));
+        assert!(!soap_response_is_success(
+            "<Envelope><Body><AddPortMappingResponse/><AddPortMappingResponse/></Body></Envelope>",
             "AddPortMappingResponse"
         ));
     }

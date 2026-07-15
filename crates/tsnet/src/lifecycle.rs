@@ -2342,7 +2342,7 @@ impl Server {
     }
 
     /// Shut down the server.
-    pub async fn close(&mut self) {
+    pub async fn close(&mut self) -> CloseResult {
         // Runtime shares are intentionally not persisted across shutdown or
         // profile changes; drop pinned roots and cancel active requests first.
         self.drive.disable().await;
@@ -2354,7 +2354,9 @@ impl Server {
             {
                 log::warn!("tsnet: retaining running state for portmapper cleanup retry: {error}");
                 self.inner = Some(inner);
-                return;
+                return CloseResult(Err(TsnetError::Io(std::io::Error::other(format!(
+                    "portmapper cleanup incomplete: {error}"
+                )))));
             }
             if let Some(router) = inner.router.take() {
                 match router.lock() {
@@ -2408,6 +2410,7 @@ impl Server {
                 }
             }
         }
+        CloseResult(Ok(()))
     }
 
     /// Returns the logout trigger Notify, if the server is running.
@@ -2586,7 +2589,7 @@ impl Server {
     /// 4. `up()` — re-bootstrap the engine, control client, and netstack.
     pub async fn switch_profile(&mut self, profile_id: &str) -> Result<(), TsnetError> {
         // 1. Stop the running engine (like close() but keep the config).
-        self.close().await;
+        self.close().await.into_result()?;
 
         // 2. Update current profile + prefs from the ProfileManager.
         //    (ProfileManager lives in state_dir on disk; reload it.)

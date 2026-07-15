@@ -416,7 +416,10 @@ impl Client {
         f: impl FnOnce(&mut ClientState) -> R,
     ) -> Option<R> {
         let mut state = self.inner.state.lock().expect("state lock");
-        if state.gateway_generation != snapshot.generation || state.gateway != snapshot.info {
+        if self.inner.closed.load(Ordering::SeqCst)
+            || state.gateway_generation != snapshot.generation
+            || state.gateway != snapshot.info
+        {
             return None;
         }
         Some(f(&mut state))
@@ -430,17 +433,14 @@ impl Client {
         }
         let client = self.clone();
         let captured = cached.clone();
+        let mut tasks = self.inner.release_tasks.lock().expect("release tasks lock");
         let task = tokio::spawn(async move {
             if client.do_release(captured.clone()).await {
                 client.clear_uncertain_release(&captured);
             }
             client.complete_release();
         });
-        self.inner
-            .release_tasks
-            .lock()
-            .expect("release tasks lock")
-            .push(task);
+        tasks.push(task);
     }
 
     fn register_release(&self) {
@@ -597,16 +597,25 @@ impl Client {
 
     /// Stop new mapping work and await active allocation/release supervisors.
     pub async fn shutdown(&self, deadline: Duration) -> Result<(), crate::PortMapError> {
-        self.inner.closed.store(true, Ordering::SeqCst);
-        // Invalidate first so an already-running supervisor cannot commit.
-        self.invalidate_mappings(true);
+        // Closing and supervisor registration share this gate. Once closed is
+        // published, no task can be registered after this drain point.
+        let supervisors = {
+            let mut tasks = self
+                .inner
+                .supervisor_tasks
+                .lock()
+                .expect("supervisor tasks lock");
+            self.inner.closed.store(true, Ordering::SeqCst);
+            self.invalidate_mappings(true);
+            std::mem::take(&mut *tasks)
+        };
         let deadline = tokio::time::Instant::now() + deadline;
-        self.await_owned_tasks(&self.inner.supervisor_tasks, deadline)
-            .await?;
-        if let Err(error) = self
-            .await_owned_tasks(&self.inner.release_tasks, deadline)
-            .await
-        {
+        self.await_owned_task_vec(supervisors, deadline).await?;
+        let releases = {
+            let mut tasks = self.inner.release_tasks.lock().expect("release tasks lock");
+            std::mem::take(&mut *tasks)
+        };
+        if let Err(error) = self.await_owned_task_vec(releases, deadline).await {
             let mut progress = self.inner.release_progress.lock().expect("release lock");
             progress.pending = 0;
             progress.generation = progress.generation.saturating_add(1);
@@ -648,21 +657,20 @@ impl Client {
         Ok(())
     }
 
-    async fn await_owned_tasks(
+    async fn await_owned_task_vec(
         &self,
-        tasks: &Mutex<Vec<tokio::task::JoinHandle<()>>>,
+        mut tasks: Vec<tokio::task::JoinHandle<()>>,
         deadline: tokio::time::Instant,
     ) -> Result<(), crate::PortMapError> {
-        let mut tasks = {
-            let mut guard = tasks.lock().expect("portmapper tasks lock");
-            std::mem::take(&mut *guard)
-        };
         while let Some(mut task) = tasks.pop() {
             if tokio::time::timeout_at(deadline, &mut task).await.is_err() {
                 task.abort();
                 let _ = task.await;
-                for task in tasks {
+                for task in &tasks {
                     task.abort();
+                }
+                for task in tasks {
+                    let _ = task.await;
                 }
                 return Err(crate::PortMapError::Protocol(
                     "portmapper shutdown deadline".into(),
@@ -903,24 +911,27 @@ impl Client {
     /// Create or renew a port mapping. Returns the external endpoint if
     /// successful.
     pub async fn create_or_get_mapping(&self) -> Result<Mapping, crate::PortMapError> {
-        if self.inner.closed.load(Ordering::Relaxed) {
-            return Err(crate::PortMapError::Disabled);
-        }
         // The supervisor owns all allocation identity and outlives the caller.
         // Dropping this future only drops the receiver; the operation still
         // commits a validated mapping or releases any allocation it obtained.
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         let client = self.clone();
-        let task = tokio::spawn(async move {
-            let _create_guard = client.inner.create_lock.lock().await;
-            let result = client.create_or_get_mapping_serialized().await;
-            let _ = result_tx.send(result);
-        });
-        self.inner
-            .supervisor_tasks
-            .lock()
-            .expect("supervisor tasks lock")
-            .push(task);
+        {
+            let mut tasks = self
+                .inner
+                .supervisor_tasks
+                .lock()
+                .expect("supervisor tasks lock");
+            if self.inner.closed.load(Ordering::SeqCst) {
+                return Err(crate::PortMapError::Disabled);
+            }
+            let task = tokio::spawn(async move {
+                let _create_guard = client.inner.create_lock.lock().await;
+                let result = client.create_or_get_mapping_serialized().await;
+                let _ = result_tx.send(result);
+            });
+            tasks.push(task);
+        }
         result_rx.await.unwrap_or_else(|_| {
             Err(crate::PortMapError::Protocol(
                 "mapping supervisor terminated".into(),
@@ -1237,6 +1248,10 @@ impl Client {
                                 },
                                 lease_expires: Some(mapping.good_until),
                             };
+                            if self.retained_port_conflicts(mapping.external.port()) {
+                                self.do_release(cached).await;
+                                return Ok(None);
+                            }
                             if self
                                 .with_current_gateway(snapshot, |state| {
                                     state.mapping = Some(cached.clone());
@@ -1285,6 +1300,10 @@ impl Client {
                             },
                             lease_expires: Some(mapping.good_until),
                         };
+                        if self.retained_port_conflicts(mapping.external.port()) {
+                            self.do_release(cached).await;
+                            return Ok(None);
+                        }
                         if self
                             .with_current_gateway(snapshot, |state| {
                                 state.pmp_pub_ip = Some(pub_ip);
@@ -1303,6 +1322,36 @@ impl Client {
             }
         }
         Ok(None)
+    }
+
+    fn retained_port_conflicts(&self, port: u16) -> bool {
+        self.inner
+            .state
+            .lock()
+            .expect("state lock")
+            .uncertain_releases
+            .iter()
+            .any(|cached| cached.mapping.external.port() == port)
+    }
+
+    fn retained_key_conflicts(&self, service: &upnp::UpnpService, port: u16) -> bool {
+        self.inner
+            .state
+            .lock()
+            .expect("state lock")
+            .uncertain_releases
+            .iter()
+            .any(|cached| {
+                cached.mapping.external.port() == port
+                    && match &cached.release {
+                        ReleaseIdentity::Upnp { service: old } => {
+                            old.control_url == service.control_url && old.kind == service.kind
+                        }
+                        // PMP/PCP and UPnP can address the same UDP mapping;
+                        // without positive router identity equivalence, fail closed.
+                        ReleaseIdentity::Pmp { .. } | ReleaseIdentity::Pcp { .. } => true,
+                    }
+            })
     }
 
     fn track_uncertain_upnp(
@@ -1327,9 +1376,14 @@ impl Client {
             },
             lease_expires: (!permanent).then_some(mapping.good_until),
         };
-        let _ = self.with_current_gateway(snapshot, |state| {
-            state.uncertain_releases.push(uncertain);
-        });
+        // Ownership transfers to the client-wide cleanup ledger even if the
+        // originating gateway generation became stale while Add was in flight.
+        self.inner
+            .state
+            .lock()
+            .expect("state lock")
+            .uncertain_releases
+            .push(uncertain);
     }
 
     fn clear_uncertain_upnp(
@@ -1451,6 +1505,15 @@ impl Client {
                 }
             };
             let ext_port = allocation.port;
+            if self.retained_key_conflicts(svc, ext_port) {
+                if upnp::delete_port_mapping(svc, ext_port, deadline)
+                    .await
+                    .is_err()
+                {
+                    self.track_uncertain_upnp(snapshot, svc, ext_port, allocation.permanent);
+                }
+                continue;
+            }
             // From this point onward the router may own the mapping. Persist
             // the cleanup identity before the next await so supervisor abort
             // or shutdown cannot lose the AddPortMapping result.
@@ -1857,6 +1920,35 @@ mod tests {
             }
             _ => panic!("expected captured UPnP release"),
         }
+    }
+
+    #[test]
+    fn remapped_external_port_is_checked_against_retained_cleanup_key() {
+        let client = Client::new();
+        client
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .uncertain_releases
+            .push(CachedMapping {
+                mapping: Mapping {
+                    external: "198.51.100.10:4242".parse().unwrap(),
+                    kind: MappingKind::Pcp,
+                    good_until: Instant::now() + Duration::from_secs(3600),
+                    renew_after: Instant::now(),
+                },
+                generation: 1,
+                release: ReleaseIdentity::Pcp {
+                    destination: "192.0.2.1:5351".parse().unwrap(),
+                    self_ip: Ipv4Addr::new(192, 0, 2, 2),
+                    internal_port: 41641,
+                    nonce: [8; 12],
+                },
+                lease_expires: Some(Instant::now() + Duration::from_secs(3600)),
+            });
+        assert!(client.retained_port_conflicts(4242));
+        assert!(!client.retained_port_conflicts(4243));
     }
 
     #[tokio::test]

@@ -237,6 +237,24 @@ pub enum TsnetError {
     Service(#[from] ServiceError),
 }
 
+/// Explicit outcome of [`Server::close`].
+#[derive(Debug)]
+pub struct CloseResult(pub(crate) Result<(), TsnetError>);
+
+impl CloseResult {
+    pub fn is_ok(&self) -> bool {
+        self.0.is_ok()
+    }
+
+    pub fn is_err(&self) -> bool {
+        self.0.is_err()
+    }
+
+    pub fn into_result(self) -> Result<(), TsnetError> {
+        self.0
+    }
+}
+
 /// A builder for configuring a [`Server`].
 #[derive(Clone, Default)]
 pub struct ServerBuilder {

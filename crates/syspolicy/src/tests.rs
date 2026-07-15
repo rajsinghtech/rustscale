@@ -631,3 +631,21 @@ fn scoped_test_override_restores_previous_snapshot() {
     }
     assert_eq!(engine.get_string(PolicyKey::Tailnet, ""), Ok("base".into()));
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_effective_posture_preference_is_not_managed_policy() {
+    assert_eq!(
+        super::NATIVE_POSTURE_PRECEDENCE,
+        ProviderPrecedence::Platform
+    );
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn windows_machine_posture_policy_is_managed() {
+    assert_eq!(
+        super::NATIVE_POSTURE_PRECEDENCE,
+        ProviderPrecedence::Managed
+    );
+}

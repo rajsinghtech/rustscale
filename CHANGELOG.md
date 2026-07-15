@@ -7,7 +7,7 @@ the first tagged release.
 
 ### Compatibility and client surface
 
-- Expanded the workspace from 36 to 75 crates, including TKA, audit logging,
+- Expanded the workspace from 36 to 85 crates, including TKA, audit logging,
   baked roots, config files, flow tracking, network logging, proxy discovery,
   socket statistics, route management, and additional upstream utility ports.
 - Filled out the CLI and LocalAPI surface with ping, wait, lock, drive, web,

@@ -14,12 +14,13 @@ use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::Semaphore;
 
-use crate::NEVER_GSO_EQUAL_TAIL_SENTINEL;
-
 /// Matches the TUN batch cap. Keeping these arrays on the stack avoids a
 /// header allocation for each WireGuard microburst.
 pub(crate) const MAX_BATCH: usize = 128;
 const MAX_GSO_SEGMENTS: usize = 64;
+/// Upstream's invalid WireGuard tail. It is sender-only metadata: receivers
+/// must not infer provenance from this forgeable one-byte payload.
+const NEVER_GSO_EQUAL_TAIL_SENTINEL: &[u8] = &[0x07];
 /// Match upstream's threshold: below this, the workaround uses plain
 /// `sendmmsg` rather than paying for a sentinel packet.
 const SENTINEL_TAIL_BATCH_THRESHOLD: usize = 8;
@@ -496,7 +497,8 @@ pub(crate) fn send<T: AsRef<[u8]>>(
 struct PlannedMessage {
     first: usize,
     /// Original caller datagrams represented by this kernel message. The
-    /// optional sentinel is never included in progress or netlog accounting.
+    /// optional sentinel is excluded from sender progress/netlog accounting;
+    /// receivers cannot infer that provenance and account it physically.
     datagrams: usize,
     segment_size: Option<u16>,
     append_sentinel: bool,
@@ -1821,6 +1823,30 @@ mod tests {
     }
 
     #[test]
+    fn plain_receive_preserves_one_byte_values_across_mixed_sources_and_order() {
+        let mut batch = ReceiveBatch::with_gro(false);
+        set_plain_message(&mut batch, 0, b"\x07", 1234);
+        set_plain_message(&mut batch, 1, b"ordinary", 4321);
+        set_plain_message(&mut batch, 2, b"\x07", 1234);
+        batch.finish_plain(3).unwrap();
+
+        let received: Vec<_> = (0..batch.len())
+            .map(|index| {
+                let (data, source) = batch.datagram(index).unwrap();
+                (data.to_vec(), source.port())
+            })
+            .collect();
+        assert_eq!(
+            received,
+            [
+                (b"\x07".to_vec(), 1234),
+                (b"ordinary".to_vec(), 4321),
+                (b"\x07".to_vec(), 1234),
+            ]
+        );
+    }
+
+    #[test]
     fn plain_recvmmsg_truncation_is_rejected_atomically() {
         let mut batch = ReceiveBatch::with_gro(false);
         set_plain_message(&mut batch, 0, b"first", 1234);
@@ -2441,6 +2467,37 @@ mod tests {
     }
 
     #[test]
+    fn gro_receive_preserves_standalone_and_smaller_tail_07_with_source_order() {
+        let mut batch = ReceiveBatch::with_gro(true);
+        set_tail_message(&mut batch, 0, b"\x07", 0);
+        let control_len = append_control(
+            &mut batch.controls[MAX_BATCH - 1],
+            0,
+            libc::SOL_UDP,
+            UDP_GRO,
+            &2i32.to_ne_bytes(),
+        );
+        set_tail_message(&mut batch, 1, b"aabb\x07", control_len);
+
+        batch.split_gro_tail(MAX_BATCH - GRO_TAIL_SLOTS, 2).unwrap();
+        let received: Vec<_> = (0..batch.len())
+            .map(|index| {
+                let (data, source) = batch.datagram(index).unwrap();
+                (data.to_vec(), source.port())
+            })
+            .collect();
+        assert_eq!(
+            received,
+            [
+                (b"\x07".to_vec(), 1234),
+                (b"aa".to_vec(), 1235),
+                (b"bb".to_vec(), 1235),
+                (b"\x07".to_vec(), 1235),
+            ]
+        );
+    }
+
+    #[test]
     fn plain_receive_after_gro_fallback_accepts_rxq_control_and_accounts_from_zero() {
         let mut batch = ReceiveBatch::with_gro(true);
         batch.finish_disabling_gro(Ok(()), "test fallback").unwrap();
@@ -2753,6 +2810,21 @@ mod tests {
         }
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let receiver_addr = receiver.local_addr().unwrap();
+        let mut buf = [0; 64];
+
+        // The small-batch fallback cannot attach provenance to a one-byte
+        // value, so a real standalone 0x07 datagram remains byte-exact.
+        let standalone = [b"\x07".as_slice()];
+        let outcome = send_gso(&sender, receiver_addr, &standalone, true).unwrap();
+        assert_eq!(
+            outcome,
+            SendOutcome {
+                datagrams: 1,
+                wire_bytes: 1,
+            }
+        );
+        let (len, _) = receiver.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..len], b"\x07");
 
         // Upstream avoids GSO below eight packets rather than paying for a
         // sentinel. Two equal WireGuard-sized payloads remain byte-exact.
@@ -2765,7 +2837,6 @@ mod tests {
                 wire_bytes: 64,
             }
         );
-        let mut buf = [0; 64];
         for expected in &small {
             let (len, _) = receiver.recv_from(&mut buf).await.unwrap();
             assert_eq!(&buf[..len], expected);

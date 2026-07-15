@@ -166,14 +166,6 @@ impl ConnectionCounterHook {
     }
 }
 
-/// Smaller final UDP GSO segment used by upstream's equal-tail workaround.
-/// It is not a WireGuard message and must never be published to consumers.
-const NEVER_GSO_EQUAL_TAIL_SENTINEL: &[u8] = &[0x07];
-
-fn is_never_gso_equal_tail_sentinel(data: &[u8]) -> bool {
-    data == NEVER_GSO_EQUAL_TAIL_SENTINEL
-}
-
 #[cfg(any(target_os = "linux", test))]
 fn batch_counts<T: AsRef<[u8]>>(datagrams: &[T]) -> (u64, u64) {
     (
@@ -211,13 +203,10 @@ fn first_node_addr(node: &Node) -> Option<IpAddr> {
 /// handler. The fast handoff only applies to ordinary direct WireGuard UDP.
 #[cfg(any(target_os = "linux", test))]
 fn udp_batch_needs_scalar_handler(data: &[u8]) -> bool {
-    // The mitigation sentinel must be filtered before pooled WireGuard
-    // publication. Keeping its whole GRO burst sequential preserves order.
     // Jumbo packets are fully received in bounded kernel scratch, but do not
     // fit a detachable pooled ciphertext slot. Keep the whole received burst
     // sequential so packet order and ownership remain exact.
-    is_never_gso_equal_tail_sentinel(data)
-        || data.len() > LINUX_UDP_FAST_PACKET_CAPACITY
+    data.len() > LINUX_UDP_FAST_PACKET_CAPACITY
         || DiscoIo::looks_like_disco(data)
         || relay::looks_like_geneve_disco(data)
         || relay::looks_like_geneve_wireguard(data)
@@ -3319,12 +3308,6 @@ impl Inner {
     }
 
     async fn handle_udp_packet(&self, data: &[u8], src: SocketAddr) {
-        // Linux's equal-tail workaround intentionally emits this invalid
-        // one-byte WireGuard packet. Sockstats already counted its physical
-        // byte; do not publish or netlog it as an original peer datagram.
-        if is_never_gso_equal_tail_sentinel(data) {
-            return;
-        }
         // Check for Geneve-encapsulated packets first (relay path).
         if relay::looks_like_geneve_disco(data) {
             if let Some((_proto, vni, _control, inner)) = relay::decode_geneve_full(data) {
@@ -4345,12 +4328,7 @@ mod linux_batch_tests {
         assert!(DiscoIo::looks_like_disco(&disco));
         assert!(udp_batch_needs_scalar_handler(&disco));
         assert!(udp_batch_needs_scalar_handler(&geneve_wg));
-        assert!(udp_batch_needs_scalar_handler(
-            NEVER_GSO_EQUAL_TAIL_SENTINEL
-        ));
-        assert!(is_never_gso_equal_tail_sentinel(
-            NEVER_GSO_EQUAL_TAIL_SENTINEL
-        ));
+        assert!(!udp_batch_needs_scalar_handler(b"\x07"));
         assert!(!udp_batch_needs_scalar_handler(b"ordinary-wireguard"));
         assert!(linux_batch_requires_scalar_handler([
             Some(b"ordinary-wireguard-before".as_slice()),
@@ -4606,6 +4584,44 @@ mod linux_batch_tests {
                 b"b-1".to_vec(),
                 b"a-3".to_vec(),
             ],
+        );
+    }
+
+    #[test]
+    fn one_byte_07_stays_attached_to_mixed_reordered_peer_sources() {
+        let a = NodePrivate::generate().public();
+        let b = NodePrivate::generate().public();
+        let a_addr: SocketAddr = "127.0.0.1:10001".parse().unwrap();
+        let b_addr: SocketAddr = "127.0.0.1:10002".parse().unwrap();
+        let peers = HashMap::from([(a_addr, a.clone()), (b_addr, b.clone())]);
+        let packets = [
+            (b"\x07".to_vec(), a_addr),
+            (b"peer-b".to_vec(), b_addr),
+            (b"\x07".to_vec(), a_addr),
+        ];
+        let mut pending = Vec::new();
+        let mut accounted = Vec::new();
+
+        stage_linux_wg_datagrams(
+            packets.iter().map(|(data, addr)| (data.as_slice(), *addr)),
+            &peers,
+            &mut HashMap::new(),
+            &mut pending,
+            |_, _, _| {},
+            |udp4_bytes, udp6_bytes| accounted.push((udp4_bytes, udp6_bytes)),
+        );
+
+        assert_eq!(accounted, [(8, 0)]);
+        assert_eq!(
+            pending
+                .into_iter()
+                .map(|datagram| (datagram.peer, datagram.data.as_ref().to_vec()))
+                .collect::<Vec<_>>(),
+            [
+                (a.clone(), b"\x07".to_vec()),
+                (b, b"peer-b".to_vec()),
+                (a, b"\x07".to_vec()),
+            ]
         );
     }
 

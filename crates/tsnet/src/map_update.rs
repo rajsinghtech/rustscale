@@ -361,46 +361,46 @@ pub(crate) fn spawn_map_update_task(
                             let exit_node_allow_lan_access =
                                 prefs.read().await.ExitNodeAllowLANAccess;
                             let mut routes = route_table.write().await;
-                            if routes.exit_node_requested() {
-                                match sync_router(
-                                    router,
-                                    &tailscale_ips,
-                                    &routes,
-                                    &magicsock,
-                                    &control_url,
-                                    exit_node_allow_lan_access,
-                                ) {
-                                    Ok(()) => {
-                                        let still_latched = clear_kernel_security_block_reason(
-                                            router,
-                                            SecurityBlockReason::MapLoss,
-                                        )
-                                        .unwrap_or(true);
-                                        if still_latched {
-                                            routes.block_exit_traffic();
-                                        } else {
-                                            routes.unblock_exit_traffic();
-                                            health.set_healthy(WARN_EXIT_ROUTE_SECURITY);
-                                        }
-                                    }
-                                    Err(error) if !exit_node_allow_lan_access => {
+                            let security_critical =
+                                routes.exit_node_requested() && !exit_node_allow_lan_access;
+                            match sync_router(
+                                router,
+                                &tailscale_ips,
+                                &routes,
+                                &magicsock,
+                                &control_url,
+                                exit_node_allow_lan_access,
+                            ) {
+                                Ok(()) => {
+                                    let still_latched = clear_kernel_security_block_reason(
+                                        router,
+                                        SecurityBlockReason::MapLoss,
+                                    )
+                                    .unwrap_or(true);
+                                    if still_latched {
                                         routes.block_exit_traffic();
-                                        let kernel = engage_kernel_security_block(
-                                            router,
-                                            SecurityBlockReason::MapLoss,
-                                        )
-                                        .err()
-                                        .map(|failure| format!("; kernel block: {failure}"))
-                                        .unwrap_or_default();
-                                        health.set_unhealthy(
-                                            WARN_EXIT_ROUTE_SECURITY,
-                                            format!("map route refresh failed: {error}{kernel}"),
-                                        );
-                                        send_health_notify(&health, &ipn_backend);
+                                    } else {
+                                        routes.unblock_exit_traffic();
+                                        health.set_healthy(WARN_EXIT_ROUTE_SECURITY);
                                     }
-                                    Err(error) => {
-                                        log::warn!("tsnet: map route refresh failed: {error}");
-                                    }
+                                }
+                                Err(error) if security_critical => {
+                                    routes.block_exit_traffic();
+                                    let kernel = engage_kernel_security_block(
+                                        router,
+                                        SecurityBlockReason::MapLoss,
+                                    )
+                                    .err()
+                                    .map(|failure| format!("; kernel block: {failure}"))
+                                    .unwrap_or_default();
+                                    health.set_unhealthy(
+                                        WARN_EXIT_ROUTE_SECURITY,
+                                        format!("map route refresh failed: {error}{kernel}"),
+                                    );
+                                    send_health_notify(&health, &ipn_backend);
+                                }
+                                Err(error) => {
+                                    log::warn!("tsnet: map route refresh failed: {error}");
                                 }
                             }
                         }
@@ -675,6 +675,10 @@ pub(crate) fn spawn_map_update_task(
                         .write()
                         .await
                         .retry(&next_peers, &mut next_routes);
+                    if router.as_ref().is_some_and(kernel_security_block_latched) {
+                        next_routes.block_exit_traffic();
+                    }
+
                     let mut drive_epoch = drive.authorization_write().await;
                     drive.rotate_authorization_locked(&mut drive_epoch);
                     if invalid_peer_map {

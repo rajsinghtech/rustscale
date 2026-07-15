@@ -186,6 +186,21 @@ impl RouteTable {
         self.exit_blocked = state.blocked;
     }
 
+    /// Atomically apply explicit exit intent while preserving an authoritative
+    /// persistent security latch. API, LocalAPI, and config mutations use this
+    /// single setter so selecting or clearing cannot transiently publish an
+    /// unblocked table while map-loss/enumeration provenance remains active.
+    pub(crate) fn set_exit_state_latch_aware(
+        &mut self,
+        peer: Option<NodePublic>,
+        requested: bool,
+        security_latched: bool,
+    ) {
+        self.exit_node = peer;
+        self.exit_capture = requested;
+        self.exit_blocked = security_latched;
+    }
+
     /// Select an exit node peer. After this, any destination not matched by a
     /// more-specific entry routes to `peer`. This is independent of
     /// `accept_routes`: the exit node's default routes apply even when

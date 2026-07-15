@@ -453,7 +453,7 @@ impl Server {
         }
         let mut routes = inner.route_table.write().await;
         let old_exit_state = routes.exit_route_state();
-        routes.set_exit_node(peer_key);
+        set_exit_route_state_latch_aware(&mut routes, inner.router.as_ref(), Some(peer_key), true);
         if let Some(router) = inner.router.as_ref() {
             if let Err(error) = sync_router(
                 router,
@@ -471,6 +471,8 @@ impl Server {
                 ));
             }
         }
+        let committed_peer = routes.exit_node().cloned();
+        set_exit_route_state_latch_aware(&mut routes, inner.router.as_ref(), committed_peer, true);
         *prefs_guard = next_prefs;
         inner.exit_node_selection.write().await.clear_pending();
         if matches!(inner.data_plane, DataPlane::Tun) {
@@ -505,7 +507,7 @@ impl Server {
         }
         let mut routes = inner.route_table.write().await;
         let old_exit_state = routes.exit_route_state();
-        routes.clear_exit_node();
+        set_exit_route_state_latch_aware(&mut routes, inner.router.as_ref(), None, false);
         if let Some(router) = inner.router.as_ref() {
             if let Err(error) = sync_router(
                 router,
@@ -523,6 +525,7 @@ impl Server {
                 ));
             }
         }
+        set_exit_route_state_latch_aware(&mut routes, inner.router.as_ref(), None, false);
         *prefs_guard = next_prefs;
         inner.exit_node_selection.write().await.clear_pending();
         if matches!(inner.data_plane, DataPlane::Tun) {

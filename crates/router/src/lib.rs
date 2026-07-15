@@ -621,7 +621,13 @@ impl<P: Platform, R: CommandRunner> Router for StatefulRouter<P, R> {
 
     fn block_direct(&mut self) -> Result<(), RouterError> {
         if self.direct_blocked {
-            return self.verify_direct_block(true);
+            if self.verify_direct_block(true).is_ok() {
+                return Ok(());
+            }
+            // An uncertain/partial unblock invalidates prior verification.
+            // Remove any exact remnants, then establish a fresh full block.
+            self.apply(&[RouterOperation::DisableDirectBlock])?;
+            self.direct_blocked = false;
         }
         self.apply(&[RouterOperation::EnableDirectBlock])?;
         self.direct_blocked = true;
@@ -943,6 +949,15 @@ impl Router for DarwinRouter {
         self.inner.set(config)
     }
     fn block_direct(&mut self) -> Result<(), RouterError> {
+        self.ensure_pf_enabled()?;
+        self.inner.block_direct()?;
+        if self.verify_pf_block(true).is_ok() {
+            return Ok(());
+        }
+        // A prior partial unblock may leave the inner state marked active
+        // while the evaluated anchor is incomplete. Flush and freshly load
+        // the exact anchor before authorizing route mutation.
+        self.inner.unblock_direct()?;
         self.ensure_pf_enabled()?;
         self.inner.block_direct()?;
         self.verify_pf_block(true)

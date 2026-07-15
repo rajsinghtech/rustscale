@@ -116,8 +116,8 @@ pub(crate) use netstack_pump::collect_tun_inbound;
 pub(crate) use netstack_pump::{run_netstack_pump, tick_wg_timers};
 pub(crate) use tun_pump::{
     clear_kernel_security_block_reason, create_tun_device, engage_kernel_security_block,
-    kernel_security_block_latched, run_tun_pump, sync_router, sync_router_with_connected_prefixes,
-    SecurityBlockReason, SharedRouter,
+    kernel_security_block_latched, run_tun_pump, set_exit_route_state_latch_aware, sync_router,
+    sync_router_with_connected_prefixes, SecurityBlockReason, SharedRouter,
 };
 pub use util::TunModeConfig;
 pub(crate) use util::{
@@ -1325,20 +1325,24 @@ impl Server {
             } else {
                 None
             };
-            let pending = exit_node_pref(&next_prefs).is_some() && selected_exit.is_none();
+            let requested = exit_node_pref(&next_prefs).is_some();
+            let pending = requested && selected_exit.is_none();
             let mut selection = inner.exit_node_selection.write().await;
             let mut routes = inner.route_table.write().await;
-            let old_exit = routes.exit_node().cloned();
-            let old_requested = routes.exit_node_requested();
-            if let Some(peer) = selected_exit {
-                routes.set_exit_node(peer);
-            } else if pending {
-                if old_exit.is_none() {
-                    routes.capture_exit_node();
+            let old_exit_state = routes.exit_route_state();
+            let selected_exit = selected_exit.or_else(|| {
+                if pending {
+                    routes.exit_node().cloned()
+                } else {
+                    None
                 }
-            } else {
-                routes.clear_exit_node();
-            }
+            });
+            set_exit_route_state_latch_aware(
+                &mut routes,
+                inner.router.as_ref(),
+                selected_exit,
+                requested,
+            );
             if let Some(router) = inner.router.as_ref() {
                 let control_url = if next_prefs.ControlURL.is_empty() {
                     DEFAULT_CONTROL_URL
@@ -1353,13 +1357,7 @@ impl Server {
                     control_url,
                     next_prefs.ExitNodeAllowLANAccess,
                 ) {
-                    if let Some(old_exit) = old_exit {
-                        routes.set_exit_node(old_exit);
-                    } else if old_requested {
-                        routes.capture_exit_node();
-                    } else {
-                        routes.clear_exit_node();
-                    }
+                    routes.restore_exit_route_state(old_exit_state);
                     if let Some(ref dir) = self.config.state_dir {
                         if let Err(rollback_error) = old_prefs.save(dir) {
                             return Err(format!(
@@ -1370,6 +1368,13 @@ impl Server {
                     return Err(error.to_string());
                 }
             }
+            let committed_peer = routes.exit_node().cloned();
+            set_exit_route_state_latch_aware(
+                &mut routes,
+                inner.router.as_ref(),
+                committed_peer,
+                requested,
+            );
             if pending {
                 selection.replace_from_prefs(&next_prefs);
             } else {

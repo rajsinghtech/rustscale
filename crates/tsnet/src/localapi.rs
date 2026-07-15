@@ -900,20 +900,12 @@ pub(crate) async fn apply_exit_node_prefs(state: &Arc<LocalApiState>) {
 
 fn stage_exit_route(
     routes: &mut crate::routing::RouteTable,
+    router: Option<&crate::SharedRouter>,
     desired_exit: Option<rustscale_key::NodePublic>,
     requested: bool,
 ) {
-    if let Some(exit_node) = desired_exit {
-        routes.set_exit_node(exit_node);
-    } else if requested {
-        // Retain a prior working exit. With no prior exit, install an explicit
-        // capture/no-connect state rather than exposing the physical default.
-        if routes.exit_node().is_none() {
-            routes.capture_exit_node();
-        }
-    } else {
-        routes.clear_exit_node();
-    }
+    let peer = desired_exit.or_else(|| requested.then(|| routes.exit_node().cloned()).flatten());
+    crate::set_exit_route_state_latch_aware(routes, router, peer, requested);
 }
 
 /// Transactionally apply an explicit LocalAPI/config exit preference.
@@ -943,9 +935,13 @@ async fn apply_exit_node_prefs_locked(
     let pending = selector.is_some() && desired_exit.is_none();
 
     let mut routes = rt.write().await;
-    let old_exit = routes.exit_node().cloned();
-    let old_requested = routes.exit_node_requested();
-    stage_exit_route(&mut routes, desired_exit, selector.is_some());
+    let old_exit_state = routes.exit_route_state();
+    stage_exit_route(
+        &mut routes,
+        state.router.as_ref(),
+        desired_exit,
+        selector.is_some(),
+    );
     if let Some(router) = state.router.as_ref() {
         let control_url = if prefs.ControlURL.is_empty() {
             crate::DEFAULT_CONTROL_URL
@@ -960,16 +956,17 @@ async fn apply_exit_node_prefs_locked(
             control_url,
             prefs.ExitNodeAllowLANAccess,
         ) {
-            if let Some(exit_node) = old_exit {
-                routes.set_exit_node(exit_node);
-            } else if old_requested {
-                routes.capture_exit_node();
-            } else {
-                routes.clear_exit_node();
-            }
+            routes.restore_exit_route_state(old_exit_state);
             return Err(error.to_string());
         }
     }
+    let committed_peer = routes.exit_node().cloned();
+    stage_exit_route(
+        &mut routes,
+        state.router.as_ref(),
+        committed_peer,
+        selector.is_some(),
+    );
     let mut selection = state.exit_node_selection.write().await;
     if pending {
         selection.replace_from_prefs(prefs);
@@ -6010,15 +6007,15 @@ mod tests {
     fn unresolved_requested_exit_retains_working_peer_or_captures() {
         let working = rustscale_key::NodePrivate::generate().public();
         let mut routes = RouteTable::default();
-        stage_exit_route(&mut routes, None, true);
+        stage_exit_route(&mut routes, None, None, true);
         assert!(routes.exit_node_requested());
         assert!(routes.exit_node().is_none());
 
         routes.set_exit_node(working.clone());
-        stage_exit_route(&mut routes, None, true);
+        stage_exit_route(&mut routes, None, None, true);
         assert_eq!(routes.exit_node(), Some(&working));
 
-        stage_exit_route(&mut routes, None, false);
+        stage_exit_route(&mut routes, None, None, false);
         assert!(!routes.exit_node_requested());
     }
 

@@ -10,4 +10,5 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+if-addrs.workspace = true
 rustscale-tsaddr = { path = "../tsaddr", version = "0.1.1" }

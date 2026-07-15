@@ -115,7 +115,8 @@ pub(crate) use map_update::{
 pub(crate) use netstack_pump::collect_tun_inbound;
 pub(crate) use netstack_pump::{run_netstack_pump, tick_wg_timers};
 pub(crate) use tun_pump::{
-    create_tun_device, run_tun_pump, sync_router, sync_router_with_connected_prefixes, SharedRouter,
+    create_tun_device, engage_kernel_security_block, run_tun_pump, sync_router,
+    sync_router_with_connected_prefixes, SharedRouter,
 };
 pub use util::TunModeConfig;
 pub(crate) use util::{

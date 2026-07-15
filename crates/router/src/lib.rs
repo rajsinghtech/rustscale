@@ -39,6 +39,8 @@ pub enum RouterOperation {
     RemoveLocalRoute(IpPrefix),
     AddExitRoutes,
     RemoveExitRoutes,
+    EnableDirectBlock,
+    DisableDirectBlock,
 }
 
 impl RouterOperation {
@@ -54,6 +56,8 @@ impl RouterOperation {
             Self::RemoveLocalRoute(prefix) => Self::AddLocalRoute(*prefix),
             Self::AddExitRoutes => Self::RemoveExitRoutes,
             Self::RemoveExitRoutes => Self::AddExitRoutes,
+            Self::EnableDirectBlock => Self::DisableDirectBlock,
+            Self::DisableDirectBlock => Self::EnableDirectBlock,
         }
     }
 }
@@ -342,6 +346,14 @@ pub trait Router: Send + Sync {
     fn up(&mut self) -> Result<(), RouterError>;
     /// Incrementally apply a configuration.
     fn set(&mut self, config: &RouterConfig) -> Result<(), RouterError>;
+    /// Install a kernel-level emergency block for unprotected direct traffic.
+    fn block_direct(&mut self) -> Result<(), RouterError> {
+        Err(RouterError::Unsupported)
+    }
+    /// Remove the emergency block after route synchronization succeeds.
+    fn unblock_direct(&mut self) -> Result<(), RouterError> {
+        Err(RouterError::Unsupported)
+    }
     /// Remove all installed state and bring the interface down.
     fn close(&mut self) -> Result<(), RouterError>;
 }
@@ -384,6 +396,12 @@ type CommandSpec = (String, Vec<String>);
 trait Platform: Send + Sync {
     fn commands(&self, operation: &RouterOperation) -> Vec<CommandSpec>;
 
+    fn claim_ownership(&self) -> Result<(), RouterError> {
+        Ok(())
+    }
+
+    fn release_ownership(&self) {}
+
     /// Idempotent stale-state cleanup performed before startup transaction.
     fn up_cleanup_commands(&self) -> Vec<CommandSpec> {
         Vec::new()
@@ -405,6 +423,8 @@ struct StatefulRouter<P, R> {
     config: Option<RouterConfig>,
     is_up: bool,
     pending_cleanup: Vec<CommandSpec>,
+    ownership_claimed: bool,
+    direct_blocked: bool,
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
@@ -416,6 +436,8 @@ impl<P: Platform, R: CommandRunner> StatefulRouter<P, R> {
             config: None,
             is_up: false,
             pending_cleanup: Vec::new(),
+            ownership_claimed: false,
+            direct_blocked: false,
         }
     }
 
@@ -541,7 +563,17 @@ impl<P: Platform, R: CommandRunner> Router for StatefulRouter<P, R> {
         if self.is_up {
             return Ok(());
         }
-        self.apply_up()?;
+        if !self.ownership_claimed {
+            self.platform.claim_ownership()?;
+            self.ownership_claimed = true;
+        }
+        if let Err(error) = self.apply_up() {
+            if self.pending_cleanup.is_empty() {
+                self.platform.release_ownership();
+                self.ownership_claimed = false;
+            }
+            return Err(error);
+        }
         self.is_up = true;
         Ok(())
     }
@@ -555,18 +587,45 @@ impl<P: Platform, R: CommandRunner> Router for StatefulRouter<P, R> {
         Ok(())
     }
 
-    fn close(&mut self) -> Result<(), RouterError> {
-        if !self.is_up && self.config.is_none() && self.pending_cleanup.is_empty() {
+    fn block_direct(&mut self) -> Result<(), RouterError> {
+        if self.direct_blocked {
             return Ok(());
         }
+        self.apply(&[RouterOperation::EnableDirectBlock])?;
+        self.direct_blocked = true;
+        Ok(())
+    }
+
+    fn unblock_direct(&mut self) -> Result<(), RouterError> {
+        if !self.direct_blocked {
+            return Ok(());
+        }
+        self.apply(&[RouterOperation::DisableDirectBlock])?;
+        self.direct_blocked = false;
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<(), RouterError> {
+        if !self.is_up
+            && self.config.is_none()
+            && self.pending_cleanup.is_empty()
+            && !self.direct_blocked
+        {
+            return Ok(());
+        }
+        let block_result = self.unblock_direct();
         let pending_result = self.retry_pending_cleanup();
         let empty = RouterConfig::default();
         let delta = diff(self.config.as_ref(), &empty);
         let teardown_result = self.apply_teardown(&delta.teardown_operations());
-        let result = pending_result.and(teardown_result);
+        let result = block_result.and(pending_result).and(teardown_result);
         if result.is_ok() && self.pending_cleanup.is_empty() {
             self.config = None;
             self.is_up = false;
+            if self.ownership_claimed {
+                self.platform.release_ownership();
+                self.ownership_claimed = false;
+            }
         }
         result
     }
@@ -575,13 +634,27 @@ impl<P: Platform, R: CommandRunner> Router for StatefulRouter<P, R> {
 #[cfg(target_os = "macos")]
 struct DarwinPlatform {
     tun_name: String,
+    block_anchor: String,
+    block_file: std::path::PathBuf,
 }
 
 #[cfg(target_os = "macos")]
 impl DarwinPlatform {
     fn new(tun_name: &str) -> Self {
+        let token: String = tun_name
+            .chars()
+            .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+            .collect();
+        let block_file = std::env::temp_dir().join(format!("rustscale-{token}-block.pf"));
+        let _ = std::fs::write(
+            &block_file,
+            format!("block drop out quick on ! {tun_name} all\n"),
+        );
         Self {
             tun_name: tun_name.to_owned(),
+            // macOS's system PF ruleset evaluates the com.apple/* wildcard.
+            block_anchor: format!("com.apple/rustscale.{token}"),
+            block_file,
         }
     }
 
@@ -640,6 +713,24 @@ impl Platform for DarwinPlatform {
             RouterOperation::AddLocalRoute(_) | RouterOperation::RemoveLocalRoute(_) => vec![],
             RouterOperation::AddExitRoutes => self.exit_routes("add"),
             RouterOperation::RemoveExitRoutes => self.exit_routes("delete"),
+            RouterOperation::EnableDirectBlock => vec![(
+                "pfctl".into(),
+                vec![
+                    "-a".into(),
+                    self.block_anchor.clone(),
+                    "-f".into(),
+                    self.block_file.display().to_string(),
+                ],
+            )],
+            RouterOperation::DisableDirectBlock => vec![(
+                "pfctl".into(),
+                vec![
+                    "-a".into(),
+                    self.block_anchor.clone(),
+                    "-F".into(),
+                    "rules".into(),
+                ],
+            )],
         }
     }
 }
@@ -677,6 +768,12 @@ impl Router for DarwinRouter {
     fn set(&mut self, config: &RouterConfig) -> Result<(), RouterError> {
         self.0.set(config)
     }
+    fn block_direct(&mut self) -> Result<(), RouterError> {
+        self.0.block_direct()
+    }
+    fn unblock_direct(&mut self) -> Result<(), RouterError> {
+        self.0.unblock_direct()
+    }
     fn close(&mut self) -> Result<(), RouterError> {
         self.0.close()
     }
@@ -685,14 +782,37 @@ impl Router for DarwinRouter {
 #[cfg(target_os = "linux")]
 struct LinuxPlatform {
     tun_name: String,
+    rule_base: Option<u32>,
 }
 
 #[cfg(target_os = "linux")]
 impl LinuxPlatform {
     fn new(tun_name: &str) -> Self {
+        let interface_index = if_addrs::get_if_addrs().ok().and_then(|interfaces| {
+            interfaces
+                .into_iter()
+                .find(|interface| interface.name == tun_name)
+                .and_then(|interface| interface.index)
+        });
         Self {
             tun_name: tun_name.to_owned(),
+            rule_base: interface_index.map(Self::rule_base_for_index),
         }
+    }
+
+    #[cfg(test)]
+    fn new_with_interface_index(tun_name: &str, interface_index: u32) -> Self {
+        Self {
+            tun_name: tun_name.to_owned(),
+            rule_base: Some(Self::rule_base_for_index(interface_index)),
+        }
+    }
+
+    fn rule_base_for_index(interface_index: u32) -> u32 {
+        // Keep the chain ahead of Linux's built-in main rule (32766). There
+        // are 200 disjoint per-instance slots; a live collision is detected
+        // and refused rather than sharing/deleting ownership.
+        5_000 + (interface_index % 200) * 100
     }
 
     fn route(&self, verb: &str, prefix: IpPrefix) -> (String, Vec<String>) {
@@ -712,26 +832,17 @@ impl LinuxPlatform {
         ("ip".into(), args)
     }
 
-    fn rule_protocol(&self) -> u8 {
-        // Linux rule protocol is ownership metadata and is included in exact
-        // deletion selectors. Derive a stable per-TUN token so two instances
-        // do not claim each other's same-priority rules.
-        let mut hash = 0x811c_9dc5_u32;
-        for byte in self.tun_name.as_bytes() {
-            hash ^= u32::from(*byte);
-            hash = hash.wrapping_mul(0x0100_0193);
-        }
-        64 + (hash % 190) as u8
-    }
+    const RULE_PROTOCOL: u8 = 201;
 
     fn policy_rules(&self, add: bool) -> Vec<(String, Vec<String>)> {
         let verb = if add { "add" } else { "del" };
-        let protocol = self.rule_protocol().to_string();
+        let protocol = Self::RULE_PROTOCOL.to_string();
+        let base = self.rule_base.unwrap_or(5_200);
         let rules = [
-            (5210, Some("main")),
-            (5230, Some("default")),
-            (5250, None),
-            (5270, Some("52")),
+            (base + 10, Some("main")),
+            (base + 30, Some("default")),
+            (base + 50, None),
+            (base + 70, Some("52")),
         ];
         let mut commands = Vec::with_capacity(8);
         for family in ["-4", "-6"] {
@@ -754,7 +865,7 @@ impl LinuxPlatform {
                 ];
                 // Deletions repeat every selector used for installation;
                 // never delete by shared priority/table alone.
-                if pref != 5270 {
+                if pref != base + 70 {
                     args.extend(["fwmark".into(), "0x80000/0xff0000".into()]);
                 }
                 args.extend(["protocol".into(), protocol.clone()]);
@@ -771,7 +882,116 @@ impl LinuxPlatform {
 }
 
 #[cfg(target_os = "linux")]
+fn linux_rule_owner_dir() -> std::path::PathBuf {
+    #[cfg(test)]
+    return std::env::temp_dir().join(format!("rustscale-rule-owners-{}", std::process::id()));
+    #[cfg(not(test))]
+    return std::path::PathBuf::from("/run/rustscale/rule-owners");
+}
+
+#[cfg(target_os = "linux")]
+fn claim_linux_rule_owner_file(base: u32, tun_name: &str) -> Result<(), RouterError> {
+    use std::io::Write;
+    let dir = linux_rule_owner_dir();
+    std::fs::create_dir_all(&dir).map_err(RouterError::Io)?;
+    let path = dir.join(base.to_string());
+    let identity = format!("{} {tun_name}\n", std::process::id());
+    for _ in 0..2 {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                file.write_all(identity.as_bytes())
+                    .map_err(RouterError::Io)?;
+                return Ok(());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let existing = std::fs::read_to_string(&path).unwrap_or_default();
+                if existing == identity {
+                    return Ok(());
+                }
+                let live = existing
+                    .split_whitespace()
+                    .next()
+                    .and_then(|pid| pid.parse::<u32>().ok())
+                    .is_some_and(|pid| std::path::Path::new(&format!("/proc/{pid}")).exists());
+                if live {
+                    return Err(RouterError::InvalidConfig(format!(
+                        "Linux policy-rule ownership collision at base {base}: {}",
+                        existing.trim()
+                    )));
+                }
+                std::fs::remove_file(&path).map_err(RouterError::Io)?;
+            }
+            Err(error) => return Err(RouterError::Io(error)),
+        }
+    }
+    Err(RouterError::InvalidConfig(format!(
+        "could not claim Linux policy-rule base {base}"
+    )))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_rule_owners() -> &'static std::sync::Mutex<std::collections::HashMap<u32, (String, usize)>>
+{
+    static OWNERS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<u32, (String, usize)>>,
+    > = std::sync::OnceLock::new();
+    OWNERS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(target_os = "linux")]
 impl Platform for LinuxPlatform {
+    fn claim_ownership(&self) -> Result<(), RouterError> {
+        let base = self.rule_base.ok_or_else(|| {
+            RouterError::InvalidConfig(format!(
+                "cannot determine interface index for {}",
+                self.tun_name
+            ))
+        })?;
+        let mut owners = linux_rule_owners()
+            .lock()
+            .map_err(|_| RouterError::InvalidConfig("Linux rule owner registry poisoned".into()))?;
+        match owners.get_mut(&base) {
+            None => {
+                claim_linux_rule_owner_file(base, &self.tun_name)?;
+                owners.insert(base, (self.tun_name.clone(), 1));
+                Ok(())
+            }
+            Some((owner, refs)) if owner == &self.tun_name => {
+                *refs += 1;
+                Ok(())
+            }
+            Some((owner, _)) => Err(RouterError::InvalidConfig(format!(
+                "Linux policy-rule ownership collision: {} and {} map to base {base}",
+                owner, self.tun_name
+            ))),
+        }
+    }
+
+    fn release_ownership(&self) {
+        let Some(base) = self.rule_base else {
+            return;
+        };
+        let Ok(mut owners) = linux_rule_owners().lock() else {
+            return;
+        };
+        if let Some((owner, refs)) = owners.get_mut(&base) {
+            if owner == &self.tun_name && *refs > 1 {
+                *refs -= 1;
+            } else if owner == &self.tun_name {
+                owners.remove(&base);
+                let path = linux_rule_owner_dir().join(base.to_string());
+                let identity = format!("{} {}\n", std::process::id(), self.tun_name);
+                if std::fs::read_to_string(&path).ok().as_deref() == Some(identity.as_str()) {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
+    }
+
     fn commands(&self, operation: &RouterOperation) -> Vec<CommandSpec> {
         match operation {
             RouterOperation::Up => self
@@ -864,6 +1084,36 @@ impl Platform for LinuxPlatform {
                 self.route("del", rustscale_tsaddr::all_ipv4()),
                 self.route("del", rustscale_tsaddr::all_ipv6()),
             ],
+            RouterOperation::EnableDirectBlock | RouterOperation::DisableDirectBlock => {
+                let verb = if matches!(operation, RouterOperation::EnableDirectBlock) {
+                    "add"
+                } else {
+                    "del"
+                };
+                let pref = self.rule_base.unwrap_or(5_200).to_string();
+                ["-4", "-6"]
+                    .into_iter()
+                    .map(|family| {
+                        (
+                            "ip".into(),
+                            vec![
+                                family.into(),
+                                "rule".into(),
+                                verb.into(),
+                                "pref".into(),
+                                pref.clone(),
+                                "not".into(),
+                                "fwmark".into(),
+                                "0x80000/0xff0000".into(),
+                                "protocol".into(),
+                                Self::RULE_PROTOCOL.to_string(),
+                                "type".into(),
+                                "unreachable".into(),
+                            ],
+                        )
+                    })
+                    .collect()
+            }
         }
     }
 
@@ -929,6 +1179,12 @@ impl Router for LinuxRouter {
     fn set(&mut self, config: &RouterConfig) -> Result<(), RouterError> {
         self.0.set(config)
     }
+    fn block_direct(&mut self) -> Result<(), RouterError> {
+        self.0.block_direct()
+    }
+    fn unblock_direct(&mut self) -> Result<(), RouterError> {
+        self.0.unblock_direct()
+    }
     fn close(&mut self) -> Result<(), RouterError> {
         self.0.close()
     }
@@ -969,6 +1225,7 @@ pub fn new(tun_name: &str) -> Box<dyn Router> {
 pub struct FakeRouter {
     config: Option<RouterConfig>,
     is_up: bool,
+    direct_blocked: bool,
     operations: Vec<RouterOperation>,
 }
 
@@ -1000,10 +1257,27 @@ impl Router for FakeRouter {
         Ok(())
     }
 
+    fn block_direct(&mut self) -> Result<(), RouterError> {
+        if !self.direct_blocked {
+            self.operations.push(RouterOperation::EnableDirectBlock);
+            self.direct_blocked = true;
+        }
+        Ok(())
+    }
+
+    fn unblock_direct(&mut self) -> Result<(), RouterError> {
+        if self.direct_blocked {
+            self.operations.push(RouterOperation::DisableDirectBlock);
+            self.direct_blocked = false;
+        }
+        Ok(())
+    }
+
     fn close(&mut self) -> Result<(), RouterError> {
-        if !self.is_up && self.config.is_none() {
+        if !self.is_up && self.config.is_none() && !self.direct_blocked {
             return Ok(());
         }
+        self.unblock_direct()?;
         self.operations
             .extend(diff(self.config.as_ref(), &RouterConfig::default()).teardown_operations());
         self.config = None;
@@ -1296,6 +1570,23 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_emergency_block_uses_evaluated_pf_anchor_and_all_non_tun_interfaces() {
+        let platform = DarwinPlatform::new("utun42");
+        let commands = platform.commands(&RouterOperation::EnableDirectBlock);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].0, "pfctl");
+        assert!(commands[0]
+            .1
+            .windows(2)
+            .any(|pair| { pair == ["-a", "com.apple/rustscale.utun42"] }));
+        let rules = std::fs::read_to_string(&platform.block_file).unwrap();
+        assert_eq!(rules, "block drop out quick on ! utun42 all\n");
+        let disable = platform.commands(&RouterOperation::DisableDirectBlock);
+        assert!(disable[0].1.windows(2).any(|pair| pair == ["-F", "rules"]));
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_routes_use_tailscale_table_52() {
@@ -1353,7 +1644,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_policy_rules_match_tailscale_base_chain() {
-        let platform = LinuxPlatform::new("rustscale0");
+        let platform = LinuxPlatform::new_with_interface_index("rustscale0", 2);
         let mut commands = platform.policy_rules(true);
         for (_, args) in &mut commands {
             if let Some(index) = args.iter().position(|arg| arg == "protocol") {
@@ -1589,31 +1880,42 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_rule_cleanup_selects_only_exact_owned_rules() {
-        let first = LinuxPlatform::new("rustscale0");
-        let second = LinuxPlatform::new("rustscale1");
-        assert_ne!(first.rule_protocol(), second.rule_protocol());
+        let first = LinuxPlatform::new_with_interface_index("rustscale0", 2);
+        let second = LinuxPlatform::new_with_interface_index("rustscale1", 3);
+        assert_ne!(first.rule_base, second.rule_base);
 
-        let first_delete = first.policy_rules(false);
-        let second_add = second.policy_rules(true);
-        for ((_, delete), (_, foreign)) in first_delete.iter().zip(second_add.iter().rev()) {
-            assert_eq!(delete[3..5], foreign[3..5]); // same shared priority
-            let owned_protocol = delete
-                .windows(2)
-                .find(|pair| pair[0] == "protocol")
-                .map(|pair| pair[1].clone())
-                .unwrap();
-            let foreign_protocol = foreign
-                .windows(2)
-                .find(|pair| pair[0] == "protocol")
-                .map(|pair| pair[1].clone())
-                .unwrap();
-            assert_ne!(owned_protocol, foreign_protocol);
+        for (_, delete) in first.policy_rules(false) {
+            assert!(delete.windows(2).any(|pair| pair == ["protocol", "201"]));
             if delete.iter().any(|arg| arg == "fwmark") {
                 assert!(delete
                     .windows(2)
                     .any(|pair| pair == ["fwmark", "0x80000/0xff0000"]));
             }
+            // A foreign rule can use the same priority/table, but without our
+            // exact ownership protocol it is not selected by this deletion.
+            let mut foreign = delete.clone();
+            let protocol = foreign.iter().position(|arg| arg == "protocol").unwrap();
+            foreign[protocol + 1] = "99".into();
+            assert_ne!(delete, foreign);
         }
+        for (_, block) in first.commands(&RouterOperation::EnableDirectBlock) {
+            assert!(block.windows(2).any(|pair| pair == ["protocol", "201"]));
+            assert!(block.windows(2).any(|pair| pair == ["not", "fwmark"]));
+            assert_eq!(block[4], first.rule_base.unwrap().to_string());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_rule_owner_collision_is_refused_without_cleanup() {
+        let first = LinuxPlatform::new_with_interface_index("collision-a", 199);
+        let colliding = LinuxPlatform::new_with_interface_index("collision-b", 399);
+        first.claim_ownership().unwrap();
+        let error = colliding.claim_ownership().unwrap_err();
+        assert!(error.to_string().contains("ownership collision"));
+        first.release_ownership();
+        colliding.claim_ownership().unwrap();
+        colliding.release_ownership();
     }
 
     #[cfg(target_os = "linux")]
@@ -1666,7 +1968,7 @@ mod tests {
         outcomes: Vec<RunnerOutcome>,
     ) -> StatefulRouter<LinuxPlatform, RecordingRunner> {
         StatefulRouter::new(
-            LinuxPlatform::new("tailscale0"),
+            LinuxPlatform::new_with_interface_index("tailscale0", 2),
             RecordingRunner {
                 outcomes,
                 ..Default::default()

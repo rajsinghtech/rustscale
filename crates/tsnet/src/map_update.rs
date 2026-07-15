@@ -168,23 +168,12 @@ impl ExitNodeSelection {
         apply: impl FnOnce(&RouteTable) -> Result<(), E>,
     ) -> Result<bool, E> {
         let old_selection = self.clone();
-        let old_exit = routes.exit_node().cloned();
-        let old_requested = routes.exit_node_requested();
-        let old_blocked = routes.exit_traffic_blocked();
+        let old_exit_state = routes.exit_route_state();
         if !self.retry(peers, routes) {
             return Ok(false);
         }
         if let Err(error) = apply(routes) {
-            if let Some(old_exit) = old_exit {
-                routes.set_exit_node(old_exit);
-            } else if old_requested {
-                routes.capture_exit_node();
-            } else {
-                routes.clear_exit_node();
-            }
-            if old_blocked {
-                routes.block_exit_traffic();
-            }
+            routes.restore_exit_route_state(old_exit_state);
             *self = old_selection;
             return Err(error);
         }
@@ -327,11 +316,11 @@ pub(crate) fn spawn_map_update_task(
 
                     if resp.KeepAlive {
                         if let Some(router) = router.as_ref() {
-                            let routes = route_table.read().await;
+                            let exit_node_allow_lan_access =
+                                prefs.read().await.ExitNodeAllowLANAccess;
+                            let mut routes = route_table.write().await;
                             if routes.exit_node_requested() {
-                                let exit_node_allow_lan_access =
-                                    prefs.read().await.ExitNodeAllowLANAccess;
-                                if let Err(error) = sync_router(
+                                match sync_router(
                                     router,
                                     &tailscale_ips,
                                     &routes,
@@ -339,9 +328,25 @@ pub(crate) fn spawn_map_update_task(
                                     &control_url,
                                     exit_node_allow_lan_access,
                                 ) {
-                                    eprintln!(
-                                        "tsnet: bypass-route update failed (non-fatal): {error}"
-                                    );
+                                    Ok(()) => {
+                                        routes.unblock_exit_traffic();
+                                        health.set_healthy(WARN_EXIT_ROUTE_SECURITY);
+                                    }
+                                    Err(error) if !exit_node_allow_lan_access => {
+                                        routes.block_exit_traffic();
+                                        let kernel = engage_kernel_security_block(router)
+                                            .err()
+                                            .map(|failure| format!("; kernel block: {failure}"))
+                                            .unwrap_or_default();
+                                        health.set_unhealthy(
+                                            WARN_EXIT_ROUTE_SECURITY,
+                                            format!("map route refresh failed: {error}{kernel}"),
+                                        );
+                                        send_health_notify(&health, &ipn_backend);
+                                    }
+                                    Err(error) => {
+                                        log::warn!("tsnet: map route refresh failed: {error}");
+                                    }
                                 }
                             }
                         }
@@ -711,18 +716,39 @@ pub(crate) fn spawn_map_update_task(
                     // releasing the packet gate so shell/native router work
                     // cannot stall data-plane readers.
                     let live_prefs = prefs.read().await.clone();
-                    if let Some(router) = router.as_ref() {
-                        let routes = route_table.read().await;
-                        if let Err(error) = sync_router(
+                    let mut routes = route_table.write().await;
+                    let security_critical =
+                        routes.exit_node_requested() && !live_prefs.ExitNodeAllowLANAccess;
+                    let refresh_error = router.as_ref().and_then(|router| {
+                        sync_router(
                             router,
                             &tailscale_ips,
                             &routes,
                             &magicsock,
                             &control_url,
                             live_prefs.ExitNodeAllowLANAccess,
-                        ) {
-                            eprintln!("tsnet: route update failed (non-fatal): {error}");
+                        )
+                        .err()
+                    });
+                    if let Some(error) = refresh_error {
+                        if security_critical {
+                            routes.block_exit_traffic();
+                            let kernel = router
+                                .as_ref()
+                                .and_then(|router| engage_kernel_security_block(router).err())
+                                .map(|failure| format!("; kernel block: {failure}"))
+                                .unwrap_or_default();
+                            health.set_unhealthy(
+                                WARN_EXIT_ROUTE_SECURITY,
+                                format!("map route refresh failed: {error}{kernel}"),
+                            );
+                            send_health_notify(&health, &ipn_backend);
+                        } else {
+                            log::warn!("tsnet: map route refresh failed: {error}");
                         }
+                    } else {
+                        routes.unblock_exit_traffic();
+                        health.set_healthy(WARN_EXIT_ROUTE_SECURITY);
                     }
 
                     // Update IPN engine status: peer count as NumLive, DERP
@@ -1166,6 +1192,7 @@ mod tests {
                 router: Box::new(RecordingRouter { seen: seen.clone() }),
                 tun_name: "rustscale-test0".into(),
                 exit_node: true,
+                security_blocked: false,
             }));
         let (magicsock, _wg_rx) = Magicsock::new(rustscale_magicsock::MagicsockConfig {
             private_key: NodePrivate::generate(),
@@ -1328,12 +1355,14 @@ mod tests {
         let mut selection = ExitNodeSelection::from_prefs(&prefs);
         let mut routes = RouteTable::default();
         routes.set_exit_node(old_exit.clone());
+        routes.block_exit_traffic();
 
         let result = selection.retry_transactional(&[peer.clone()], &mut routes, |_| {
             Err::<(), _>("injected router failure")
         });
         assert!(result.is_err());
         assert_eq!(routes.exit_node(), Some(&old_exit));
+        assert!(routes.exit_traffic_blocked());
         assert!(selection
             .retry_transactional(&[peer], &mut routes, |_| Ok::<(), &str>(()))
             .unwrap());

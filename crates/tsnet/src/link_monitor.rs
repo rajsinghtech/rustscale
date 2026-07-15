@@ -88,7 +88,32 @@ pub(crate) fn spawn_link_monitor(
     health: Tracker,
     route_sync: Option<LinkRouteSync>,
 ) -> Option<rustscale_netmon::MonitorHandle> {
-    let monitor = rustscale_netmon::Monitor::new().ok()?;
+    let (monitor, initial_enumeration_failed) = rustscale_netmon::Monitor::new_fail_closed();
+    if initial_enumeration_failed {
+        if let Some(route_sync) = route_sync.as_ref() {
+            let security_required = route_sync
+                .route_table
+                .try_read()
+                .map_or(true, |routes| routes.exit_node_requested())
+                && route_sync
+                    .prefs
+                    .try_read()
+                    .map_or(true, |prefs| !prefs.ExitNodeAllowLANAccess);
+            if security_required {
+                let kernel_error = engage_kernel_security_block(&route_sync.router)
+                    .err()
+                    .map(|error| format!("; kernel block: {error}"))
+                    .unwrap_or_default();
+                if let Ok(mut routes) = route_sync.route_table.try_write() {
+                    routes.block_exit_traffic();
+                }
+                health.set_unhealthy(
+                    WARN_EXIT_ROUTE_SECURITY,
+                    format!("initial connected-interface enumeration failed{kernel_error}"),
+                );
+            }
+        }
+    }
 
     let handle = monitor.start();
     handle.register_owned_change_callback(move |delta| {
@@ -134,7 +159,11 @@ pub(crate) fn spawn_link_monitor(
                     }
                     return;
                 };
-                let mut prefix_snapshot = connected_prefixes_from_state(&delta.new, &tun_name);
+                let mut prefix_snapshot = if delta.enumeration_failed {
+                    Err("connected-interface enumeration failed".to_string())
+                } else {
+                    connected_prefixes_from_state(&delta.new, &tun_name)
+                };
                 loop {
                     if cancel.is_cancelled() {
                         return;
@@ -147,7 +176,15 @@ pub(crate) fn spawn_link_monitor(
                     let connected_prefixes = match &prefix_snapshot {
                         Ok(prefixes) => prefixes.clone(),
                         Err(error) if security_critical => {
-                            block_and_report_exit_route_failure(&mut routes, &health, error);
+                            let kernel_error = engage_kernel_security_block(&route_sync.router)
+                                .err()
+                                .map(|failure| format!("{error}; {failure}"))
+                                .unwrap_or_else(|| error.clone());
+                            block_and_report_exit_route_failure(
+                                &mut routes,
+                                &health,
+                                kernel_error,
+                            );
                             drop(routes);
                             tokio::select! {
                                 () = cancel.cancelled() => return,
@@ -164,9 +201,19 @@ pub(crate) fn spawn_link_monitor(
                         }
                     };
                     if security_critical {
-                        // Block fallback forwarding before touching OS routes;
-                        // success below is the only operation that reopens it.
+                        // Block fallback forwarding and install a kernel-level
+                        // direct-traffic block before touching OS routes;
+                        // successful sync is the only operation that reopens it.
                         routes.block_exit_traffic();
+                        if let Err(error) = engage_kernel_security_block(&route_sync.router) {
+                            block_and_report_exit_route_failure(&mut routes, &health, error);
+                            drop(routes);
+                            tokio::select! {
+                                () = cancel.cancelled() => return,
+                                () = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                            }
+                            continue;
+                        }
                     }
                     // Locks above can yield; check cancellation immediately
                     // before every possible sync_router call.
@@ -581,8 +628,34 @@ pub(crate) async fn connect_home_derp(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tun_pump::ManagedRouter;
     use rustscale_key::NodePrivate;
     use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct BlockCountingRouter(Arc<AtomicUsize>);
+
+    impl rustscale_router::Router for BlockCountingRouter {
+        fn up(&mut self) -> Result<(), rustscale_router::RouterError> {
+            Ok(())
+        }
+        fn set(
+            &mut self,
+            _config: &rustscale_router::RouterConfig,
+        ) -> Result<(), rustscale_router::RouterError> {
+            Ok(())
+        }
+        fn block_direct(&mut self) -> Result<(), rustscale_router::RouterError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn unblock_direct(&mut self) -> Result<(), rustscale_router::RouterError> {
+            Ok(())
+        }
+        fn close(&mut self) -> Result<(), rustscale_router::RouterError> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn churn_snapshot_prevents_enumeration_failure_lan_leak() {
@@ -646,6 +719,15 @@ mod tests {
             .routes
             .contains(&rustscale_tsaddr::IpPrefix::parse("100.100.2.128/25").unwrap()));
 
+        let blocks = Arc::new(AtomicUsize::new(0));
+        let router = Arc::new(std::sync::Mutex::new(ManagedRouter {
+            router: Box::new(BlockCountingRouter(blocks.clone())),
+            tun_name: "rustscale0".into(),
+            exit_node: true,
+            security_blocked: false,
+        }));
+        engage_kernel_security_block(&router).unwrap();
+        assert_eq!(blocks.load(Ordering::SeqCst), 1);
         let health = Tracker::new();
         block_and_report_exit_route_failure(&mut routes, &health, "injected route failure");
         assert!(routes.exit_traffic_blocked());

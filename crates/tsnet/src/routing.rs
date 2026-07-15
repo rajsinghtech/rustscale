@@ -45,6 +45,13 @@ pub struct RouteTable {
     exit_blocked: bool,
 }
 
+#[derive(Clone)]
+pub(crate) struct ExitRouteState {
+    peer: Option<NodePublic>,
+    requested: bool,
+    blocked: bool,
+}
+
 impl RouteTable {
     /// Build a table from a peer list. Each peer's `AllowedIPs` are used, or
     /// `Addresses` as a fallback when `AllowedIPs` is empty. Peers with a zero
@@ -165,6 +172,20 @@ impl RouteTable {
         self.accept_routes
     }
 
+    pub(crate) fn exit_route_state(&self) -> ExitRouteState {
+        ExitRouteState {
+            peer: self.exit_node.clone(),
+            requested: self.exit_capture,
+            blocked: self.exit_blocked,
+        }
+    }
+
+    pub(crate) fn restore_exit_route_state(&mut self, state: ExitRouteState) {
+        self.exit_node = state.peer;
+        self.exit_capture = state.requested;
+        self.exit_blocked = state.blocked;
+    }
+
     /// Select an exit node peer. After this, any destination not matched by a
     /// more-specific entry routes to `peer`. This is independent of
     /// `accept_routes`: the exit node's default routes apply even when
@@ -212,6 +233,7 @@ impl RouteTable {
         self.exit_blocked = false;
     }
 
+    #[cfg(test)]
     pub(crate) fn exit_traffic_blocked(&self) -> bool {
         self.exit_blocked
     }

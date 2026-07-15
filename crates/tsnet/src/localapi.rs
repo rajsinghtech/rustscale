@@ -6181,6 +6181,7 @@ mod tests {
                 router: Box::new(RejectingRouter),
                 tun_name: "rustscale-test0".into(),
                 exit_node: false,
+                security_blocked: false,
             },
         )));
         state_mut.tun_mode = true;

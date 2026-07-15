@@ -1,16 +1,6 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
-fn restore_exit_node(routes: &mut RouteTable, exit_node: Option<NodePublic>, exit_requested: bool) {
-    if let Some(exit_node) = exit_node {
-        routes.set_exit_node(exit_node);
-    } else if exit_requested {
-        routes.capture_exit_node();
-    } else {
-        routes.clear_exit_node();
-    }
-}
-
 fn route_error_with_prefs_rollback(
     state_dir: Option<&std::path::PathBuf>,
     old_prefs: &rustscale_ipn::Prefs,
@@ -460,8 +450,7 @@ impl Server {
                 .map_err(|error| TsnetError::Builder(format!("save exit-node prefs: {error}")))?;
         }
         let mut routes = inner.route_table.write().await;
-        let old_exit = routes.exit_node().cloned();
-        let old_requested = routes.exit_node_requested();
+        let old_exit_state = routes.exit_route_state();
         routes.set_exit_node(peer_key);
         if let Some(router) = inner.router.as_ref() {
             if let Err(error) = sync_router(
@@ -472,7 +461,7 @@ impl Server {
                 &self.config.control_url,
                 next_prefs.ExitNodeAllowLANAccess,
             ) {
-                restore_exit_node(&mut routes, old_exit, old_requested);
+                routes.restore_exit_route_state(old_exit_state);
                 return Err(route_error_with_prefs_rollback(
                     self.config.state_dir.as_ref(),
                     &old_prefs,
@@ -511,8 +500,7 @@ impl Server {
                 .map_err(|error| TsnetError::Builder(format!("save exit-node prefs: {error}")))?;
         }
         let mut routes = inner.route_table.write().await;
-        let old_exit = routes.exit_node().cloned();
-        let old_requested = routes.exit_node_requested();
+        let old_exit_state = routes.exit_route_state();
         routes.clear_exit_node();
         if let Some(router) = inner.router.as_ref() {
             if let Err(error) = sync_router(
@@ -523,7 +511,7 @@ impl Server {
                 &self.config.control_url,
                 next_prefs.ExitNodeAllowLANAccess,
             ) {
-                restore_exit_node(&mut routes, old_exit, old_requested);
+                routes.restore_exit_route_state(old_exit_state);
                 return Err(route_error_with_prefs_rollback(
                     self.config.state_dir.as_ref(),
                     &old_prefs,

@@ -48,6 +48,9 @@ type ChangeFunc = Arc<
 /// Describes the difference between two network states.
 #[derive(Clone)]
 pub struct ChangeDelta {
+    /// Whether interface enumeration failed. `new` is then the last known
+    /// state and consumers must not treat it as a successful refresh.
+    pub enumeration_failed: bool,
     /// Whether this is a major change (interface/IP change or major time jump
     /// >= 10 min). Maps to Go's `RebindLikelyRequired`.
     pub major: bool,
@@ -87,6 +90,30 @@ struct MonitorShared {
     provider: StateProvider,
 }
 
+async fn dispatch_callbacks(
+    shared: &Arc<MonitorShared>,
+    stopped: &AtomicBool,
+    callback_tasks: &Arc<tokio::sync::Mutex<Vec<JoinHandle<()>>>>,
+    delta: ChangeDelta,
+) {
+    let callbacks: Vec<ChangeFunc> = {
+        let guard = shared.callbacks.read().expect("callback lock poisoned");
+        guard.values().cloned().collect()
+    };
+    for callback in callbacks {
+        if stopped.load(Ordering::SeqCst) {
+            break;
+        }
+        let delta = delta.clone();
+        let task = tokio::spawn(async move {
+            callback(delta).await;
+        });
+        let mut tasks = callback_tasks.lock().await;
+        tasks.retain(|task| !task.is_finished());
+        tasks.push(task);
+    }
+}
+
 /// The network change monitor.
 ///
 /// Owns the initial [`State`] and, once [`start`](Monitor::start)ed, a
@@ -103,6 +130,37 @@ impl Monitor {
     pub fn new() -> Result<Self, NetmonError> {
         let provider: StateProvider = Arc::new(gather_state);
         Self::with_state_provider(provider)
+    }
+
+    /// Create the real monitor even when the initial enumeration fails.
+    /// The returned flag requires security-sensitive consumers to enter their
+    /// fail-closed state until a later callback reports a successful snapshot.
+    pub fn new_fail_closed() -> (Self, bool) {
+        let provider: StateProvider = Arc::new(gather_state);
+        match provider() {
+            Some(initial_state) => (
+                Self {
+                    initial_state,
+                    provider,
+                    poll_interval: DEFAULT_POLL_INTERVAL,
+                },
+                false,
+            ),
+            None => (
+                Self {
+                    initial_state: State {
+                        interface_ips: BTreeMap::new(),
+                        interface_meta: BTreeMap::new(),
+                        have_v4: false,
+                        have_v6: false,
+                        default_route_interface: String::new(),
+                    },
+                    provider,
+                    poll_interval: DEFAULT_POLL_INTERVAL,
+                },
+                true,
+            ),
+        }
     }
 
     /// Create a new monitor with a custom state provider (for tests).
@@ -167,6 +225,26 @@ impl Monitor {
                 }
 
                 let Some(new_state) = (shared_clone.provider)() else {
+                    let old = shared_clone
+                        .current
+                        .read()
+                        .expect("state lock poisoned")
+                        .clone();
+                    dispatch_callbacks(
+                        &shared_clone,
+                        &callback_stopped,
+                        &debounce_callback_tasks,
+                        ChangeDelta {
+                            enumeration_failed: true,
+                            major: true,
+                            time_jumped: false,
+                            jump_duration: Duration::ZERO,
+                            old: Some(old.clone()),
+                            new: old,
+                        },
+                    )
+                    .await;
+                    tokio::time::sleep(DEBOUNCE).await;
                     continue;
                 };
 
@@ -202,6 +280,7 @@ impl Monitor {
                 }
 
                 let delta = ChangeDelta {
+                    enumeration_failed: false,
                     major,
                     time_jumped,
                     jump_duration: if time_jumped {
@@ -213,25 +292,13 @@ impl Monitor {
                     new: new_state,
                 };
 
-                let callbacks: Vec<ChangeFunc> = {
-                    let guard = shared_clone
-                        .callbacks
-                        .read()
-                        .expect("callback lock poisoned");
-                    guard.values().cloned().collect()
-                };
-                for cb in callbacks {
-                    if callback_stopped.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    let d = delta.clone();
-                    let task = tokio::spawn(async move {
-                        cb(d).await;
-                    });
-                    let mut tasks = debounce_callback_tasks.lock().await;
-                    tasks.retain(|task| !task.is_finished());
-                    tasks.push(task);
-                }
+                dispatch_callbacks(
+                    &shared_clone,
+                    &callback_stopped,
+                    &debounce_callback_tasks,
+                    delta,
+                )
+                .await;
 
                 tokio::time::sleep(DEBOUNCE).await;
             }

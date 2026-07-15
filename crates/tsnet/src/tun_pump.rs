@@ -1738,6 +1738,7 @@ pub(crate) struct ManagedRouter {
     pub(crate) router: Box<dyn rustscale_router::Router>,
     pub(crate) tun_name: String,
     pub(crate) exit_node: bool,
+    pub(crate) security_blocked: bool,
 }
 
 /// Build the one OS-level routing configuration from current TUN state.
@@ -1855,6 +1856,19 @@ fn normalize_ip(ip: IpAddr) -> IpAddr {
     }
 }
 
+pub(crate) fn engage_kernel_security_block(router: &SharedRouter) -> Result<(), TsnetError> {
+    let mut managed = router
+        .lock()
+        .map_err(|_| TsnetError::Builder("router lock poisoned".into()))?;
+    if !managed.security_blocked {
+        managed.router.block_direct().map_err(|error| {
+            TsnetError::Builder(format!("install kernel direct-traffic block: {error}"))
+        })?;
+        managed.security_blocked = true;
+    }
+    Ok(())
+}
+
 /// Synchronize a shared router after a route-table change.
 pub(crate) fn sync_router(
     router: &SharedRouter,
@@ -1965,6 +1979,12 @@ fn sync_router_inner(
         )));
     }
     managed.exit_node = exit_node;
+    if managed.security_blocked {
+        managed.router.unblock_direct().map_err(|error| {
+            TsnetError::Builder(format!("remove kernel direct-traffic block: {error}"))
+        })?;
+        managed.security_blocked = false;
+    }
     if leaving_exit_node {
         // Release only after catch-all teardown, so no underlay packet can
         // briefly recurse through the TUN during the transition.
@@ -1991,6 +2011,7 @@ pub(crate) async fn create_tun_device(
                 router,
                 tun_name: dev.name().to_owned(),
                 exit_node: false,
+                security_blocked: false,
             }));
             let cleanup = Server::cleanup_or_supervise(owner).err();
             return Err(TsnetError::Builder(match cleanup {
@@ -1999,6 +2020,29 @@ pub(crate) async fn create_tun_device(
                 }
                 None => format!("bring TUN interface up: {error}"),
             }));
+        }
+        let security_required = {
+            let route_table = b.route_table.read().await;
+            route_table.exit_node_requested() && !exit_node_allow_lan_access
+        };
+        let mut security_blocked = false;
+        if security_required {
+            if let Err(error) = router.block_direct() {
+                let owner = Arc::new(std::sync::Mutex::new(ManagedRouter {
+                    router,
+                    tun_name: dev.name().to_owned(),
+                    exit_node: false,
+                    security_blocked: false,
+                }));
+                let cleanup = Server::cleanup_or_supervise(owner).err();
+                return Err(TsnetError::Builder(match cleanup {
+                    Some(cleanup) => format!(
+                        "install startup direct-traffic block: {error}; cleanup retained: {cleanup}"
+                    ),
+                    None => format!("install startup direct-traffic block: {error}"),
+                }));
+            }
+            security_blocked = true;
         }
         let route_config = {
             let route_table = b.route_table.read().await;
@@ -2015,6 +2059,7 @@ pub(crate) async fn create_tun_device(
                         router,
                         tun_name: dev.name().to_owned(),
                         exit_node: false,
+                        security_blocked,
                     }));
                     let cleanup = Server::cleanup_or_supervise(owner).err();
                     return Err(TsnetError::Builder(match cleanup {
@@ -2030,6 +2075,7 @@ pub(crate) async fn create_tun_device(
                     router,
                     tun_name: dev.name().to_owned(),
                     exit_node: false,
+                    security_blocked,
                 }));
                 let cleanup = Server::cleanup_or_supervise(owner).err();
                 return Err(TsnetError::Builder(match cleanup {
@@ -2045,6 +2091,7 @@ pub(crate) async fn create_tun_device(
                     router,
                     tun_name: dev.name().to_owned(),
                     exit_node: false,
+                    security_blocked,
                 }));
                 let cleanup = Server::cleanup_or_supervise(owner).err();
                 return Err(TsnetError::Builder(match cleanup {
@@ -2061,6 +2108,7 @@ pub(crate) async fn create_tun_device(
                 router,
                 tun_name: dev.name().to_owned(),
                 exit_node: route_config.exit_node,
+                security_blocked,
             }));
             let cleanup = Server::cleanup_or_supervise(owner).err();
             return Err(TsnetError::Builder(match cleanup {
@@ -2070,10 +2118,29 @@ pub(crate) async fn create_tun_device(
                 None => format!("install TUN routes: {error}"),
             }));
         }
+        if security_blocked {
+            if let Err(error) = router.unblock_direct() {
+                let owner = Arc::new(std::sync::Mutex::new(ManagedRouter {
+                    router,
+                    tun_name: dev.name().to_owned(),
+                    exit_node: route_config.exit_node,
+                    security_blocked: true,
+                }));
+                let cleanup = Server::cleanup_or_supervise(owner).err();
+                return Err(TsnetError::Builder(match cleanup {
+                    Some(cleanup) => format!(
+                        "remove startup direct-traffic block: {error}; cleanup retained: {cleanup}"
+                    ),
+                    None => format!("remove startup direct-traffic block: {error}"),
+                }));
+            }
+            security_blocked = false;
+        }
         Some(Arc::new(std::sync::Mutex::new(ManagedRouter {
             router,
             tun_name: dev.name().to_owned(),
             exit_node: route_config.exit_node,
+            security_blocked,
         })))
     } else {
         None

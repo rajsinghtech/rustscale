@@ -3083,6 +3083,7 @@ mod exit_cleanup_tests {
             }),
             tun_name: "rustscale-test0".into(),
             exit_node: false,
+            security_blocked: false,
         }));
         Server::router_cleanup_supervisor().lock().unwrap().clear();
         assert!(Server::cleanup_or_supervise(owner).is_err());

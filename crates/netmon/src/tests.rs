@@ -392,6 +392,42 @@ async fn test_monitor_detects_change_with_fake_provider() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn enumeration_failure_is_dispatched_not_silently_skipped() {
+    let state = state_en0_up("192.168.1.10/24");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let provider: StateProvider = {
+        let calls = calls.clone();
+        Arc::new(move || {
+            if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                Some(state.clone())
+            } else {
+                None
+            }
+        })
+    };
+    let monitor = Monitor::with_state_provider(provider)
+        .unwrap()
+        .with_poll_interval(Duration::from_millis(10));
+    let mut handle = monitor.start();
+    let failed = Arc::new(tokio::sync::Notify::new());
+    handle.register_owned_change_callback({
+        let failed = failed.clone();
+        move |delta| {
+            let failed = failed.clone();
+            async move {
+                if delta.enumeration_failed {
+                    failed.notify_one();
+                }
+            }
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(5), failed.notified())
+        .await
+        .unwrap();
+    handle.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_cancels_and_joins_inflight_callbacks() {
     let state_a = state_en0_up("192.168.1.10/24");
     let mut state_b = state_a.clone();

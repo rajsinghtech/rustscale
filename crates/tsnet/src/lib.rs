@@ -34,6 +34,7 @@ mod appc;
 mod c2n;
 mod capture;
 mod dns_resolve;
+mod drive;
 mod filter_build;
 mod hostinfo;
 mod lifecycle;
@@ -42,6 +43,7 @@ pub mod localapi;
 mod loopback;
 mod map_update;
 mod netstack_pump;
+mod peer_map;
 mod peerapi;
 mod proxyproto;
 mod routing;
@@ -186,6 +188,8 @@ pub enum TsnetError {
     Register(#[from] RegisterError),
     #[error("map stream error: {0}")]
     MapStream(#[from] StreamMapError),
+    #[error("invalid network map: {0}")]
+    InvalidNetmap(String),
     #[error("magicsock error: {0}")]
     Magicsock(#[from] MagicsockError),
     #[error("netstack error: {0}")]
@@ -729,6 +733,7 @@ impl ServerBuilder {
         }
         Ok(Server {
             config: self,
+            drive: drive::Runtime::new(),
             inner: None,
             pre_started: None,
         })
@@ -743,6 +748,8 @@ pub(crate) struct RunningState {
     pub(crate) netlog: Option<Arc<rustscale_netlog::Logger>>,
     pub(crate) data_plane: DataPlane,
     pub(crate) peers: Arc<RwLock<Vec<Node>>>,
+    #[allow(dead_code)]
+    pub(crate) peer_map: Arc<peer_map::Runtime>,
     pub(crate) routecheck: Arc<rustscale_routecheck::Client>,
     pub(crate) route_table: Arc<RwLock<RouteTable>>,
     /// OS-route manager in TUN mode when `TunModeConfig::apply_routes` is set.
@@ -880,6 +887,7 @@ pub(crate) struct Bootstrap {
     pub(crate) wg_recv: mpsc::Receiver<rustscale_magicsock::WgReceiveBatch>,
     pub(crate) wg_tunnels: Arc<RwLock<HashMap<NodePublic, Arc<Mutex<WgTunn>>>>>,
     pub(crate) peers: Arc<RwLock<Vec<Node>>>,
+    pub(crate) peer_map: Arc<peer_map::Runtime>,
     pub(crate) routecheck: Arc<rustscale_routecheck::Client>,
     pub(crate) route_table: Arc<RwLock<RouteTable>>,
     pub(crate) cancel: Arc<CancelToken>,
@@ -887,6 +895,8 @@ pub(crate) struct Bootstrap {
     pub(crate) map_task: JoinHandle<()>,
     pub(crate) node_key: NodePrivate,
     pub(crate) filter: Arc<std::sync::Mutex<Filter>>,
+    /// Complete named packet-filter state from the initial signed netmap.
+    pub(crate) named_filters: BTreeMap<String, Vec<FilterRule>>,
     pub(crate) packet_drops: Arc<AtomicU64>,
     /// Shared MagicDNS resolver (dial path + DNS responder).
     pub(crate) resolver: Arc<RwLock<MagicDnsResolver>>,
@@ -952,6 +962,7 @@ pub(crate) struct Bootstrap {
 /// An embedded Tailscale server.
 pub struct Server {
     pub(crate) config: ServerBuilder,
+    pub(crate) drive: Arc<drive::Runtime>,
     pub(crate) inner: Option<RunningState>,
     pub(crate) pre_started: Option<PreStartedLocalApi>,
 }

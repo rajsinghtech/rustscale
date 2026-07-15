@@ -6,11 +6,12 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use cap_fs_ext::{DirExt, FileTypeExt, FollowSymlinks, OpenOptionsFollowExt, OpenOptionsSyncExt};
 use cap_std::fs::{Dir, File, OpenOptions};
+use tokio::sync::mpsc as tokio_mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::auth::{AuthenticatedPeer, Permission};
@@ -21,6 +22,28 @@ const ALLOW: &str = "OPTIONS, GET, HEAD, PROPFIND, PUT, MKCOL, DELETE, MOVE, COP
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 pub type HeaderMap = BTreeMap<String, String>;
+
+/// Bounded producer/consumer pair for a streamed request body. The receiver is
+/// consumed only on Taildrive's blocking filesystem pool; the async producer
+/// applies backpressure through the bounded channel.
+pub struct StreamingBody {
+    receiver: tokio_mpsc::Receiver<Vec<u8>>,
+    expected_length: usize,
+}
+
+pub fn streaming_body_channel(
+    expected_length: usize,
+    capacity: usize,
+) -> (tokio_mpsc::Sender<Vec<u8>>, StreamingBody) {
+    let (sender, receiver) = tokio_mpsc::channel(capacity.max(1));
+    (
+        sender,
+        StreamingBody {
+            receiver,
+            expected_length,
+        },
+    )
+}
 
 /// A bounded request supplied by an HTTP/PeerAPI adapter.
 #[derive(Clone, Debug)]
@@ -91,36 +114,100 @@ impl Response {
     }
 }
 
-/// Per-request cancellation and deadline supplied by the connection adapter.
-#[derive(Clone)]
-pub struct RequestControl {
-    cancellation: CancellationToken,
-    deadline: Instant,
-    #[cfg(test)]
-    after_sync: Option<Arc<dyn Fn() + Send + Sync>>,
+/// Shared linearization barrier for configuration and signed grant epochs.
+struct CommitBarrier {
+    gate: RwLock<()>,
+    epoch: AtomicU64,
+    cancellation: Mutex<CancellationToken>,
 }
 
-impl RequestControl {
-    pub fn new(cancellation: CancellationToken, deadline: Instant) -> Self {
-        Self {
+impl CommitBarrier {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            gate: RwLock::new(()),
+            epoch: AtomicU64::new(0),
+            cancellation: Mutex::new(CancellationToken::new()),
+        })
+    }
+
+    fn authority(self: &Arc<Self>) -> RequestAuthority {
+        let _gate = self
+            .gate
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let epoch = self.epoch.load(Ordering::Acquire);
+        let cancellation = self
+            .cancellation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .child_token();
+        RequestAuthority {
+            barrier: self.clone(),
+            epoch,
             cancellation,
-            deadline,
-            #[cfg(test)]
-            after_sync: None,
         }
     }
 
-    pub fn for_limits(limits: &Limits) -> Self {
+    /// Cancel staging work, drain any short publication critical section, and
+    /// advance the authority epoch before returning.
+    fn revoke(&self) {
+        self.cancellation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .cancel();
+        let _gate = self
+            .gate
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.epoch.fetch_add(1, Ordering::AcqRel);
+        *self
+            .cancellation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = CancellationToken::new();
+    }
+}
+
+/// Request-scoped authority captured while the signed grant/config epoch is
+/// stable. Mutations can publish only while this epoch is still current.
+#[derive(Clone)]
+pub struct RequestAuthority {
+    barrier: Arc<CommitBarrier>,
+    epoch: u64,
+    cancellation: CancellationToken,
+}
+
+impl RequestAuthority {
+    pub fn cancellation(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
+}
+
+/// Per-request cancellation, deadline, and publication authority supplied by
+/// the connection adapter.
+#[derive(Clone)]
+pub struct RequestControl {
+    authority: RequestAuthority,
+    deadline: Instant,
+    #[cfg(test)]
+    after_sync: Option<Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(test)]
+    before_commit: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+impl RequestControl {
+    pub fn new(authority: RequestAuthority, deadline: Instant) -> Self {
         Self {
-            cancellation: CancellationToken::new(),
-            deadline: Instant::now() + limits.request_timeout,
+            authority,
+            deadline,
             #[cfg(test)]
             after_sync: None,
+            #[cfg(test)]
+            before_commit: None,
         }
     }
 
     fn check(&self) -> Result<(), Interrupted> {
-        if self.cancellation.is_cancelled() {
+        if self.authority.cancellation.is_cancelled() {
             Err(Interrupted::Cancelled)
         } else if Instant::now() >= self.deadline {
             Err(Interrupted::Deadline)
@@ -135,9 +222,37 @@ impl RequestControl {
             .min(Duration::from_millis(10))
     }
 
+    fn commit<T>(
+        &self,
+        action: impl FnOnce() -> Result<T, OperationError>,
+    ) -> Result<T, OperationError> {
+        self.check()?;
+        #[cfg(test)]
+        if let Some(hook) = &self.before_commit {
+            hook();
+        }
+        let _gate = self
+            .authority
+            .barrier
+            .gate
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.check()?;
+        if self.authority.epoch != self.authority.barrier.epoch.load(Ordering::Acquire) {
+            return Err(OperationError::Interrupted(Interrupted::Cancelled));
+        }
+        action()
+    }
+
     #[cfg(test)]
     fn with_after_sync(mut self, hook: Arc<dyn Fn() + Send + Sync>) -> Self {
         self.after_sync = Some(hook);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_before_commit(mut self, hook: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.before_commit = Some(hook);
         self
     }
 
@@ -153,7 +268,7 @@ impl std::fmt::Debug for RequestControl {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("RequestControl")
-            .field("cancelled", &self.cancellation.is_cancelled())
+            .field("cancelled", &self.authority.cancellation.is_cancelled())
             .field("deadline", &self.deadline)
             .finish_non_exhaustive()
     }
@@ -197,6 +312,7 @@ impl WorkerPool {
 pub struct Server {
     config: Arc<ConfigStore>,
     workers: Arc<WorkerPool>,
+    commits: Arc<CommitBarrier>,
 }
 
 impl Server {
@@ -205,19 +321,117 @@ impl Server {
             config.limits().filesystem_workers,
             config.limits().filesystem_queue,
         ));
-        Self { config, workers }
+        Self {
+            config,
+            workers,
+            commits: CommitBarrier::new(),
+        }
+    }
+
+    /// Capture the current configuration/grant authority for one request.
+    pub fn request_authority(&self) -> RequestAuthority {
+        self.commits.authority()
+    }
+
+    /// Revoke the old epoch and wait for any publication already linearized
+    /// under it to leave its short commit section.
+    pub fn revoke_authority(&self) {
+        self.commits.revoke();
+    }
+
+    /// Authorize method, path, share, and destination without touching a
+    /// request body or filesystem object. PeerAPI adapters call this before
+    /// accepting upload bytes; [`Self::handle`] repeats all checks.
+    pub fn preflight(&self, peer: &AuthenticatedPeer, request: &Request) -> Result<(), Response> {
+        let limits = self.config.limits();
+        let snapshot = self.config.snapshot();
+        if !snapshot.enabled() {
+            return Err(Response::text(404, "taildrive not enabled"));
+        }
+        let parsed = parse_request_path(&request.path, limits.max_path_bytes)
+            .map_err(|_| Response::text(400, "invalid WebDAV path"))?;
+        if !matches!(
+            request.method.as_str(),
+            "OPTIONS" | "PROPFIND" | "GET" | "HEAD" | "PUT" | "MKCOL" | "DELETE" | "MOVE" | "COPY"
+        ) {
+            return Err(Response::text(405, "method not allowed").header("allow", ALLOW));
+        }
+        if request.method == "OPTIONS" {
+            return Ok(());
+        }
+        let Some(share_name) = parsed.share.as_deref() else {
+            return if request.method == "PROPFIND" {
+                Ok(())
+            } else {
+                Err(Response::text(405, "method not allowed").header("allow", ALLOW))
+            };
+        };
+        let permission = peer.permissions().for_share(share_name);
+        if permission == Permission::None {
+            return Err(Response::text(404, "not found"));
+        }
+        if required_permission(&request.method) == Permission::ReadWrite
+            && permission != Permission::ReadWrite
+        {
+            return Err(Response::text(403, "permission denied"));
+        }
+        if !snapshot.shares.contains_key(share_name) {
+            return Err(Response::text(404, "not found"));
+        }
+        if matches!(request.method.as_str(), "MOVE" | "COPY") {
+            let destination = request
+                .header("destination")
+                .ok_or_else(|| Response::text(400, "bad WebDAV request"))?;
+            let destination = parse_request_path(destination, limits.max_path_bytes)
+                .map_err(|_| Response::text(400, "bad WebDAV request"))?;
+            let destination_share = destination
+                .share
+                .as_deref()
+                .ok_or_else(|| Response::text(400, "bad WebDAV request"))?;
+            if destination_share != share_name {
+                return Err(Response::text(502, "cross-share operation is forbidden"));
+            }
+            if peer.permissions().for_share(destination_share) != Permission::ReadWrite {
+                return Err(Response::text(403, "permission denied"));
+            }
+        }
+        Ok(())
     }
 
     /// Handle one request using one immutable configuration snapshot.
-    ///
-    /// `peer` must have been produced from the authenticated connection's
-    /// netmap node and capability values, never from HTTP request data.
     pub fn handle(
         &self,
         peer: &AuthenticatedPeer,
         request: Request,
         control: &RequestControl,
     ) -> Response {
+        self.handle_with_stream(peer, request, None, control)
+    }
+
+    /// Handle a PUT whose body arrives through a bounded channel.
+    pub fn handle_streaming_put(
+        &self,
+        peer: &AuthenticatedPeer,
+        request: Request,
+        body: StreamingBody,
+        control: &RequestControl,
+    ) -> Response {
+        if request.method != "PUT" {
+            return Response::text(400, "streaming body is only valid for PUT");
+        }
+        self.handle_with_stream(peer, request, Some(body), control)
+    }
+
+    fn handle_with_stream(
+        &self,
+        peer: &AuthenticatedPeer,
+        request: Request,
+        streaming_body: Option<StreamingBody>,
+        control: &RequestControl,
+    ) -> Response {
+        if !Arc::ptr_eq(&control.authority.barrier, &self.commits) {
+            return Response::text(403, "invalid request authority");
+        }
         if let Err(interrupted) = control.check() {
             return interrupted.response();
         }
@@ -226,7 +440,7 @@ impl Server {
         let peer = peer.clone();
         let worker_control = control.clone();
         let job = Box::new(move || {
-            let response = server.handle_on_worker(&peer, request, &worker_control);
+            let response = server.handle_on_worker(&peer, request, streaming_body, &worker_control);
             let _ = sender.send(response);
         });
         match self.workers.try_execute(job) {
@@ -256,13 +470,18 @@ impl Server {
         &self,
         peer: &AuthenticatedPeer,
         request: Request,
+        streaming_body: Option<StreamingBody>,
         control: &RequestControl,
     ) -> Response {
         if let Err(interrupted) = control.check() {
             return interrupted.response();
         }
         let limits = self.config.limits();
-        if request.body.len() > limits.max_request_body {
+        if request.body.len() > limits.max_request_body
+            || streaming_body
+                .as_ref()
+                .is_some_and(|body| body.expected_length > limits.max_request_body)
+        {
             return Response::text(413, "request body too large");
         }
         let snapshot = self.config.snapshot();
@@ -303,9 +522,12 @@ impl Server {
         let result = match request.method.as_str() {
             "GET" => self.get(root, &parsed, false, control),
             "HEAD" => self.get(root, &parsed, true, control),
-            "PUT" => Self::put(root, &parsed, &request.body, control),
-            "MKCOL" => Self::mkcol(root, &parsed, &request.body),
-            "DELETE" => Self::delete(root, &parsed),
+            "PUT" => match streaming_body {
+                Some(body) => Self::put_streaming(root, &parsed, body, control),
+                None => Self::put(root, &parsed, &request.body, control),
+            },
+            "MKCOL" => Self::mkcol(root, &parsed, &request.body, control),
+            "DELETE" => Self::delete(root, &parsed, control),
             "MOVE" => self.move_or_copy(peer, &snapshot, root, &parsed, &request, false, control),
             "COPY" => self.move_or_copy(peer, &snapshot, root, &parsed, &request, true, control),
             _ => return Response::text(405, "method not allowed").header("allow", ALLOW),
@@ -374,10 +596,33 @@ impl Server {
         Ok(Response::new(if existed { 204 } else { 201 }).header("content-length", "0"))
     }
 
+    fn put_streaming(
+        root: &ShareRoot,
+        parsed: &ParsedPath,
+        body: StreamingBody,
+        control: &RequestControl,
+    ) -> Result<Response, OperationError> {
+        if parsed.relative.as_os_str().is_empty() {
+            return Err(OperationError::MethodNotAllowed);
+        }
+        let (parent, leaf) = open_parent_nofollow(&root.dir, &parsed.relative)?;
+        let existed = match parent.symlink_metadata(&leaf) {
+            Ok(metadata) if metadata.file_type().is_symlink() || metadata.is_dir() => {
+                return Err(OperationError::Forbidden)
+            }
+            Ok(_) => true,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error.into()),
+        };
+        atomic_write_streaming(&parent, &leaf, body, control)?;
+        Ok(Response::new(if existed { 204 } else { 201 }).header("content-length", "0"))
+    }
+
     fn mkcol(
         root: &ShareRoot,
         parsed: &ParsedPath,
         body: &[u8],
+        control: &RequestControl,
     ) -> Result<Response, OperationError> {
         if parsed.relative.as_os_str().is_empty() {
             return Err(OperationError::MethodNotAllowed);
@@ -386,11 +631,18 @@ impl Server {
             return Err(OperationError::UnsupportedMediaType);
         }
         let (parent, leaf) = open_parent_nofollow(&root.dir, &parsed.relative)?;
-        parent.create_dir(&leaf)?;
+        control.commit(|| {
+            parent.create_dir(&leaf)?;
+            Ok(())
+        })?;
         Ok(Response::new(201).header("content-length", "0"))
     }
 
-    fn delete(root: &ShareRoot, parsed: &ParsedPath) -> Result<Response, OperationError> {
+    fn delete(
+        root: &ShareRoot,
+        parsed: &ParsedPath,
+        control: &RequestControl,
+    ) -> Result<Response, OperationError> {
         if parsed.relative.as_os_str().is_empty() {
             return Err(OperationError::Forbidden);
         }
@@ -399,12 +651,15 @@ impl Server {
         if metadata.file_type().is_symlink() {
             return Err(OperationError::Forbidden);
         }
-        if metadata.is_dir() {
-            // Deliberately avoid recursive deletion in this bounded slice.
-            parent.remove_dir(&leaf)?;
-        } else {
-            parent.remove_file(&leaf)?;
-        }
+        control.commit(|| {
+            if metadata.is_dir() {
+                // Deliberately avoid recursive deletion in this bounded slice.
+                parent.remove_dir(&leaf)?;
+            } else {
+                parent.remove_file(&leaf)?;
+            }
+            Ok(())
+        })?;
         Ok(Response::new(204).header("content-length", "0"))
     }
 
@@ -498,7 +753,10 @@ impl Server {
             }
             atomic_write(&destination_parent, &destination_leaf, &bytes, control)?;
         } else {
-            source_parent.rename(&source_leaf, &destination_parent, &destination_leaf)?;
+            control.commit(|| {
+                source_parent.rename(&source_leaf, &destination_parent, &destination_leaf)?;
+                Ok(())
+            })?;
         }
         Ok(Response::new(if destination_exists { 204 } else { 201 }).header("content-length", "0"))
     }
@@ -629,11 +887,59 @@ fn atomic_write(
         file.sync_all()?;
         #[cfg(test)]
         control.notify_after_sync();
-        // Cancellation/deadline after durable temp-file creation must not
-        // publish the destination.
-        control.check()?;
+        // Cancellation/deadline or epoch revocation after durable staging
+        // must not publish the destination.
         drop(file);
-        parent.rename(&temp, parent, destination)?;
+        control.commit(|| {
+            parent.rename(&temp, parent, destination)?;
+            Ok(())
+        })?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = parent.remove_file(&temp);
+    }
+    write_result
+}
+
+fn atomic_write_streaming(
+    parent: &Dir,
+    destination: &OsStr,
+    mut body: StreamingBody,
+    control: &RequestControl,
+) -> Result<(), OperationError> {
+    let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temp = OsString::from(format!(
+        ".rustscale-taildrive-{}-{sequence}.tmp",
+        std::process::id()
+    ));
+    let mut options = OpenOptions::new();
+    options
+        .write(true)
+        .create_new(true)
+        .follow(FollowSymlinks::No);
+    let mut file = parent.open_with(&temp, &options)?;
+    let write_result = (|| {
+        let mut received = 0usize;
+        while let Some(chunk) = body.receiver.blocking_recv() {
+            control.check()?;
+            received = received
+                .checked_add(chunk.len())
+                .ok_or(OperationError::RequestTooLarge)?;
+            if received > body.expected_length {
+                return Err(OperationError::RequestTooLarge);
+            }
+            file.write_all(&chunk)?;
+        }
+        if received != body.expected_length {
+            return Err(OperationError::IncompleteBody);
+        }
+        file.sync_all()?;
+        drop(file);
+        control.commit(|| {
+            parent.rename(&temp, parent, destination)?;
+            Ok(())
+        })?;
         Ok(())
     })();
     if write_result.is_err() {
@@ -807,6 +1113,8 @@ enum OperationError {
     UnsupportedMediaType,
     PreconditionFailed,
     CrossShare,
+    RequestTooLarge,
+    IncompleteBody,
     ResponseTooLarge,
     TooManyEntries,
 }
@@ -837,6 +1145,8 @@ impl OperationError {
             Self::UnsupportedMediaType => Response::text(415, "MKCOL body is not supported"),
             Self::PreconditionFailed => Response::text(412, "destination exists"),
             Self::CrossShare => Response::text(502, "cross-share operation is forbidden"),
+            Self::RequestTooLarge => Response::text(413, "request body too large"),
+            Self::IncompleteBody => Response::text(400, "incomplete request body"),
             Self::ResponseTooLarge => Response::text(507, "response exceeds configured limit"),
             Self::TooManyEntries => Response::text(507, "directory contains too many entries"),
             Self::Io(error) => match error.kind() {
@@ -905,7 +1215,10 @@ mod tests {
             self.server.handle(
                 peer,
                 request,
-                &RequestControl::for_limits(self.server.config.limits()),
+                &RequestControl::new(
+                    self.server.request_authority(),
+                    Instant::now() + self.server.config.limits().request_timeout,
+                ),
             )
         }
     }
@@ -1029,12 +1342,15 @@ mod tests {
         );
         assert_eq!(oversized.status, 413);
 
-        let token = CancellationToken::new();
-        token.cancel();
+        let authority = harness.server.request_authority();
+        authority.cancellation().cancel();
         let cancelled = harness.server.handle(
             &harness.read_write,
             Request::new("PUT", "/docs/cancelled").with_body(b"no"),
-            &RequestControl::new(token, Instant::now() + std::time::Duration::from_secs(1)),
+            &RequestControl::new(
+                authority,
+                Instant::now() + std::time::Duration::from_secs(1),
+            ),
         );
         assert_eq!(cancelled.status, 408);
         assert!(!harness.root.join("cancelled").exists());
@@ -1042,7 +1358,7 @@ mod tests {
         let expired = harness.server.handle(
             &harness.read_write,
             Request::new("PUT", "/docs/expired").with_body(b"no"),
-            &RequestControl::new(CancellationToken::new(), Instant::now()),
+            &RequestControl::new(harness.server.request_authority(), Instant::now()),
         );
         assert_eq!(expired.status, 408);
         assert!(!harness.root.join("expired").exists());
@@ -1051,9 +1367,9 @@ mod tests {
     #[test]
     fn cancellation_after_sync_never_publishes_temp_file() {
         let harness = Harness::new();
-        let cancellation = CancellationToken::new();
-        let hook_cancellation = cancellation.clone();
-        let control = RequestControl::new(cancellation, Instant::now() + Duration::from_secs(2))
+        let authority = harness.server.request_authority();
+        let hook_cancellation = authority.cancellation();
+        let control = RequestControl::new(authority, Instant::now() + Duration::from_secs(2))
             .with_after_sync(Arc::new(move || hook_cancellation.cancel()));
         let response = harness.server.handle(
             &harness.read_write,
@@ -1109,6 +1425,244 @@ mod tests {
             );
             assert_eq!(copy.status, 403);
             assert!(started.elapsed() < Duration::from_secs(1));
+        }
+    }
+
+    fn paused_before_commit(
+        server: &Server,
+    ) -> (
+        RequestControl,
+        std::sync::mpsc::Receiver<()>,
+        Arc<(Mutex<bool>, std::sync::Condvar)>,
+    ) {
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let entered_tx = Mutex::new(Some(entered_tx));
+        let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let hook_release = release.clone();
+        let control = RequestControl::new(
+            server.request_authority(),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .with_before_commit(Arc::new(move || {
+            if let Some(sender) = entered_tx.lock().unwrap().take() {
+                sender.send(()).unwrap();
+            }
+            let (lock, condition) = &*hook_release;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = condition.wait(released).unwrap();
+            }
+        }));
+        (control, entered_rx, release)
+    }
+
+    fn revoke_then_release(
+        server: &Server,
+        entered: std::sync::mpsc::Receiver<()>,
+        release: &Arc<(Mutex<bool>, std::sync::Condvar)>,
+    ) {
+        entered.recv_timeout(Duration::from_secs(2)).unwrap();
+        server.revoke_authority();
+        let (lock, condition) = &**release;
+        *lock.lock().unwrap() = true;
+        condition.notify_all();
+    }
+
+    #[test]
+    fn revocation_linearizes_every_webdav_publication() {
+        let harness = Harness::new();
+
+        // Buffered PUT stages fully, but its old epoch cannot rename.
+        let (control, entered, release) = paused_before_commit(&harness.server);
+        let server = harness.server.clone();
+        let peer = harness.read_write.clone();
+        let worker = std::thread::spawn(move || {
+            server.handle(
+                &peer,
+                Request::new("PUT", "/docs/blocked-put").with_body(b"old"),
+                &control,
+            )
+        });
+        revoke_then_release(&harness.server, entered, &release);
+        assert_eq!(worker.join().unwrap().status, 408);
+        assert!(!harness.root.join("blocked-put").exists());
+        assert_eq!(
+            harness
+                .request(
+                    &harness.read_write,
+                    Request::new("PUT", "/docs/blocked-put").with_body(b"new"),
+                )
+                .status,
+            201
+        );
+
+        // Streaming PUT has the same guarded publication after bounded staging.
+        let (control, entered, release) = paused_before_commit(&harness.server);
+        let (sender, body) = streaming_body_channel(3, 1);
+        sender.try_send(b"old".to_vec()).unwrap();
+        drop(sender);
+        let server = harness.server.clone();
+        let peer = harness.read_write.clone();
+        let worker = std::thread::spawn(move || {
+            server.handle_streaming_put(
+                &peer,
+                Request::new("PUT", "/docs/blocked-stream"),
+                body,
+                &control,
+            )
+        });
+        revoke_then_release(&harness.server, entered, &release);
+        assert_eq!(worker.join().unwrap().status, 408);
+        assert!(!harness.root.join("blocked-stream").exists());
+        let (sender, body) = streaming_body_channel(3, 1);
+        sender.try_send(b"new".to_vec()).unwrap();
+        drop(sender);
+        let response = harness.server.handle_streaming_put(
+            &harness.read_write,
+            Request::new("PUT", "/docs/blocked-stream"),
+            body,
+            &RequestControl::new(
+                harness.server.request_authority(),
+                Instant::now() + Duration::from_secs(2),
+            ),
+        );
+        assert_eq!(response.status, 201);
+
+        // MKCOL cannot create after the old epoch is revoked.
+        let (control, entered, release) = paused_before_commit(&harness.server);
+        let server = harness.server.clone();
+        let peer = harness.read_write.clone();
+        let worker = std::thread::spawn(move || {
+            server.handle(&peer, Request::new("MKCOL", "/docs/blocked-dir"), &control)
+        });
+        revoke_then_release(&harness.server, entered, &release);
+        assert_eq!(worker.join().unwrap().status, 408);
+        assert!(!harness.root.join("blocked-dir").exists());
+        assert_eq!(
+            harness
+                .request(
+                    &harness.read_write,
+                    Request::new("MKCOL", "/docs/blocked-dir"),
+                )
+                .status,
+            201
+        );
+
+        // DELETE cannot remove the pre-opened object after revocation.
+        std::fs::write(harness.root.join("blocked-delete"), b"keep").unwrap();
+        let (control, entered, release) = paused_before_commit(&harness.server);
+        let server = harness.server.clone();
+        let peer = harness.read_write.clone();
+        let worker = std::thread::spawn(move || {
+            server.handle(
+                &peer,
+                Request::new("DELETE", "/docs/blocked-delete"),
+                &control,
+            )
+        });
+        revoke_then_release(&harness.server, entered, &release);
+        assert_eq!(worker.join().unwrap().status, 408);
+        assert!(harness.root.join("blocked-delete").exists());
+        assert_eq!(
+            harness
+                .request(
+                    &harness.read_write,
+                    Request::new("DELETE", "/docs/blocked-delete"),
+                )
+                .status,
+            204
+        );
+
+        // MOVE cannot publish the destination or remove the source.
+        std::fs::write(harness.root.join("blocked-move-src"), b"move").unwrap();
+        let move_request = Request::new("MOVE", "/docs/blocked-move-src")
+            .with_header("Destination", "/docs/blocked-move-dst");
+        let (control, entered, release) = paused_before_commit(&harness.server);
+        let server = harness.server.clone();
+        let peer = harness.read_write.clone();
+        let old_move = move_request.clone();
+        let worker = std::thread::spawn(move || server.handle(&peer, old_move, &control));
+        revoke_then_release(&harness.server, entered, &release);
+        assert_eq!(worker.join().unwrap().status, 408);
+        assert!(harness.root.join("blocked-move-src").exists());
+        assert!(!harness.root.join("blocked-move-dst").exists());
+        assert_eq!(
+            harness.request(&harness.read_write, move_request).status,
+            201
+        );
+
+        // COPY staging cannot publish its destination after revocation.
+        std::fs::write(harness.root.join("blocked-copy-src"), b"copy").unwrap();
+        let copy_request = Request::new("COPY", "/docs/blocked-copy-src")
+            .with_header("Destination", "/docs/blocked-copy-dst");
+        let (control, entered, release) = paused_before_commit(&harness.server);
+        let server = harness.server.clone();
+        let peer = harness.read_write.clone();
+        let old_copy = copy_request.clone();
+        let worker = std::thread::spawn(move || server.handle(&peer, old_copy, &control));
+        revoke_then_release(&harness.server, entered, &release);
+        assert_eq!(worker.join().unwrap().status, 408);
+        assert!(!harness.root.join("blocked-copy-dst").exists());
+        assert_eq!(
+            harness.request(&harness.read_write, copy_request).status,
+            201
+        );
+        assert_eq!(
+            std::fs::read(harness.root.join("blocked-copy-dst")).unwrap(),
+            b"copy"
+        );
+        assert!(!std::fs::read_dir(&harness.root).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".rustscale-taildrive-")
+        }));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn many_max_sized_puts_stream_through_bounded_queues() {
+        const REQUESTS: usize = 8;
+        const BODY_SIZE: usize = 16 * 1024 * 1024;
+        const CHUNK_SIZE: usize = 64 * 1024;
+
+        let harness = Harness::new();
+        let mut workers = Vec::new();
+        let mut producers = Vec::new();
+        for index in 0..REQUESTS {
+            let (sender, body) = streaming_body_channel(BODY_SIZE, 2);
+            let server = harness.server.clone();
+            let peer = harness.read_write.clone();
+            workers.push(tokio::task::spawn_blocking(move || {
+                server.handle_streaming_put(
+                    &peer,
+                    Request::new("PUT", format!("/docs/stress-{index}.bin")),
+                    body,
+                    &RequestControl::new(
+                        server.request_authority(),
+                        Instant::now() + server.config.limits().request_timeout,
+                    ),
+                )
+            }));
+            producers.push(tokio::spawn(async move {
+                for _ in 0..BODY_SIZE / CHUNK_SIZE {
+                    if sender.send(vec![0x5a; CHUNK_SIZE]).await.is_err() {
+                        break;
+                    }
+                }
+            }));
+        }
+        for producer in producers {
+            producer.await.unwrap();
+        }
+        for (index, worker) in workers.into_iter().enumerate() {
+            assert_eq!(worker.await.unwrap().status, 201);
+            assert_eq!(
+                std::fs::metadata(harness.root.join(format!("stress-{index}.bin")))
+                    .unwrap()
+                    .len(),
+                BODY_SIZE as u64
+            );
         }
     }
 

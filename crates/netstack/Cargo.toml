@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 rustscale-wg = { path = "../wg", version = "0.1.1" }
 rustscale-key = { path = "../key", version = "0.1.1" }
+rustscale-packet = { path = "../packet", version = "0.1.1" }
 smoltcp.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

@@ -515,6 +515,7 @@ impl Server {
                 protocol_version: PROTOCOL_VERSION,
             }),
             taildrop: None,
+            drive: self.drive.clone(),
             netstack: match &inner.data_plane {
                 DataPlane::Netstack(ns) => Some(ns.clone()),
                 DataPlane::Tun => None,

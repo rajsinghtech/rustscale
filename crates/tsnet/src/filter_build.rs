@@ -57,8 +57,10 @@ pub(crate) fn build_filter_from_map_response(
     };
 
     let cap_holders = build_cap_holders(peers);
-    let mut filter =
-        Filter::new(&all_rules, local_ips, &cap_holders).unwrap_or_else(|_| Filter::allow_all());
+    let mut filter = Filter::new(&all_rules, local_ips, &cap_holders).unwrap_or_else(|error| {
+        log::warn!("tsnet: rejecting malformed initial packet filter: {error}");
+        Filter::allow_none()
+    });
     filter.set_shields_up(shields_up);
     (filter, named)
 }
@@ -127,15 +129,22 @@ pub(crate) fn rebuild_filter(
         named.values().flatten().cloned().collect()
     };
     let cap_holders = build_cap_holders(peers);
-    if let Ok(mut new_filter) = Filter::new(&all_rules, local_ips, &cap_holders) {
-        if !advertise_routes.is_empty() {
-            new_filter.add_local_cidrs(advertise_routes);
+    let mut new_filter = match Filter::new(&all_rules, local_ips, &cap_holders) {
+        Ok(filter) => filter,
+        Err(error) => {
+            // A malformed signed filter delta must not retain stale packet or
+            // capability grants. Fail closed until control sends a valid map.
+            log::warn!("tsnet: rejecting malformed packet filter update: {error}");
+            Filter::allow_none()
         }
-        new_filter.set_shields_up(shields_up);
-        let mut old_filter = filter_arc.lock().unwrap();
-        new_filter.share_state_with(&mut old_filter);
-        *old_filter = new_filter;
+    };
+    if !advertise_routes.is_empty() {
+        new_filter.add_local_cidrs(advertise_routes);
     }
+    new_filter.set_shields_up(shields_up);
+    let mut old_filter = filter_arc.lock().unwrap();
+    new_filter.share_state_with(&mut old_filter);
+    *old_filter = new_filter;
 }
 
 // ---------------------------------------------------------------------------

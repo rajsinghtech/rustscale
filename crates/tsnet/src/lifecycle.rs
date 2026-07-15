@@ -201,6 +201,7 @@ impl Server {
             b.packet_drops.clone(),
             b.cancel.clone(),
             capture.clone(),
+            b.peer_map.clone(),
         ));
 
         // Map-stream update task (peer/route deltas).
@@ -232,6 +233,9 @@ impl Server {
             exit_node_selection.clone(),
             b.node_key.clone(),
             b.filter.clone(),
+            b.named_filters.clone(),
+            self.drive.clone(),
+            b.peer_map.clone(),
             b.tailscale_ips.clone(),
             b.control_url.clone(),
             self.config.accept_routes,
@@ -307,6 +311,9 @@ impl Server {
             offering_exit_node,
             Some(taildrop.clone()),
             Some(b.sockstats.clone()),
+            b.filter.clone(),
+            self.drive.clone(),
+            b.peer_map.clone(),
         )
         .await;
         tasks.push(peerapi_task);
@@ -520,6 +527,7 @@ impl Server {
                     protocol_version: PROTOCOL_VERSION,
                 }),
                 taildrop: Some(taildrop.clone()),
+                drive: self.drive.clone(),
                 netstack: Some(netstack.clone()),
                 filter: std::sync::OnceLock::new(),
                 route_table: Some(b.route_table.clone()),
@@ -569,6 +577,7 @@ impl Server {
             netlog: b.netlog,
             data_plane: DataPlane::Netstack(netstack),
             peers: b.peers,
+            peer_map: b.peer_map,
             routecheck: b.routecheck,
             route_table: b.route_table,
             router: None,
@@ -718,6 +727,7 @@ impl Server {
             b.packet_drops.clone(),
             b.cancel.clone(),
             capture.clone(),
+            b.peer_map.clone(),
         ));
 
         // Periodic endpoint update (Bug 4).
@@ -764,6 +774,9 @@ impl Server {
             exit_node_selection.clone(),
             b.node_key.clone(),
             b.filter.clone(),
+            b.named_filters.clone(),
+            self.drive.clone(),
+            b.peer_map.clone(),
             b.tailscale_ips.clone(),
             b.control_url.clone(),
             self.config.accept_routes,
@@ -806,6 +819,9 @@ impl Server {
             offering_exit_node,
             Some(taildrop.clone()),
             Some(b.sockstats.clone()),
+            b.filter.clone(),
+            self.drive.clone(),
+            b.peer_map.clone(),
         )
         .await;
 
@@ -1021,6 +1037,7 @@ impl Server {
                     protocol_version: PROTOCOL_VERSION,
                 }),
                 taildrop: Some(taildrop.clone()),
+                drive: self.drive.clone(),
                 netstack: None, // TUN mode has no netstack
                 filter: std::sync::OnceLock::new(),
                 route_table: Some(b.route_table.clone()),
@@ -1103,6 +1120,7 @@ impl Server {
             netlog: b.netlog,
             data_plane: DataPlane::Tun,
             peers: b.peers,
+            peer_map: b.peer_map,
             routecheck: b.routecheck,
             route_table: b.route_table,
             router,
@@ -1339,6 +1357,7 @@ impl Server {
             cert_params: None,
             control_params: None,
             taildrop: None,
+            drive: self.drive.clone(),
             netstack: None,
             filter: std::sync::OnceLock::new(),
             route_table: None,
@@ -2021,10 +2040,27 @@ impl Server {
         if peers.is_empty() && !map_resp.PeersChanged.is_empty() {
             peers = map_resp.PeersChanged.clone();
         }
-        // Update the self node's CapMap from the first MapResponse so the
-        // relay server extension can check NODE_ATTR_DISABLE_RELAY_SERVER.
+        // Validate stable IDs, keys, addresses, and address ownership before
+        // any peer-derived transport state becomes live.
+        let peer_map = crate::peer_map::Runtime::new(&peers)
+            .map_err(|error| TsnetError::InvalidNetmap(error.to_string()))?;
+
+        // Install self-node capabilities from the first signed netmap before
+        // PeerAPI starts. Taildrive remains disabled unless `drive:share` is
+        // present; a needs-login LocalAPI cannot pre-authorize itself.
         if let Some(ref node) = map_resp.Node {
             magicsock.set_self_cap_map(node.CapMap.clone());
+            let sharing_allowed = node
+                .Capabilities
+                .iter()
+                .any(|cap| cap == rustscale_drive::NODE_CAPABILITY_TAILDRIVE_SHARE)
+                || node
+                    .CapMap
+                    .contains_key(rustscale_drive::NODE_CAPABILITY_TAILDRIVE_SHARE);
+            let mut epoch = self.drive.authorization_write().await;
+            self.drive.rotate_authorization_locked(&mut epoch);
+            self.drive
+                .set_sharing_allowed_locked(sharing_allowed, &mut epoch);
         }
         magicsock.set_netmap(peers.clone()).await?;
 
@@ -2059,7 +2095,7 @@ impl Server {
         // The peer list supplies the capability map for `cap:<name>` source
         // predicates, and the ShieldsUp pref enables shields-up mode.
         let shields_up = self.load_prefs().unwrap_or_default().ShieldsUp;
-        let (mut filter, _named_filters) =
+        let (mut filter, named_filters) =
             build_filter_from_map_response(&map_resp, &tailscale_ips, &peers, shields_up);
         if !advertise.is_empty() {
             filter.add_local_cidrs(&advertise);
@@ -2174,6 +2210,7 @@ impl Server {
             wg_recv,
             wg_tunnels,
             peers: peers_arc,
+            peer_map,
             routecheck,
             route_table,
             cancel,
@@ -2181,6 +2218,7 @@ impl Server {
             map_task,
             node_key: state.node_key.clone(),
             filter,
+            named_filters,
             packet_drops,
             resolver,
             our_fqdn,
@@ -2215,6 +2253,9 @@ impl Server {
 
     /// Shut down the server.
     pub async fn close(&mut self) {
+        // Runtime shares are intentionally not persisted across shutdown or
+        // profile changes; drop pinned roots and cancel active requests first.
+        self.drive.disable().await;
         if let Some(mut inner) = self.inner.take() {
             if let Some(router) = inner.router.take() {
                 match router.lock() {
@@ -2296,6 +2337,7 @@ impl Server {
     /// After logout, the server is in a `NeedsLogin` state. The daemon
     /// should call `start_localapi_only()` again to accept a new login.
     pub async fn logout(&mut self) -> Result<(), TsnetError> {
+        self.drive.disable().await;
         let mut inner = match self.inner.take() {
             Some(inner) => inner,
             None => return Ok(()), // already down

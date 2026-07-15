@@ -19,8 +19,11 @@ mod http;
 mod path;
 
 pub use auth::{AuthError, AuthenticatedPeer, Permission, Permissions};
-pub use config::{ConfigError, ConfigStore, Limits, Share, Snapshot};
-pub use http::{HeaderMap, Request, RequestControl, Response, Server};
+pub use config::{ConfigError, ConfigStore, Limits, PreparedConfig, Share, Snapshot};
+pub use http::{
+    streaming_body_channel, HeaderMap, Request, RequestAuthority, RequestControl, Response, Server,
+    StreamingBody,
+};
 pub use path::{encode_path_component, PathError};
 
 /// Peer capability carrying Taildrive share grants.
@@ -28,3 +31,9 @@ pub const CAPABILITY_TAILDRIVE: &str = "tailscale.com/cap/drive";
 
 /// Peer capability advertising that a peer can share folders with us.
 pub const CAPABILITY_TAILDRIVE_SHARER: &str = "tailscale.com/cap/drive-sharer";
+
+/// Self-node attribute allowing this node to expose Taildrive shares.
+pub const NODE_CAPABILITY_TAILDRIVE_SHARE: &str = "drive:share";
+
+/// Self-node attribute allowing this node to compose remote Taildrive shares.
+pub const NODE_CAPABILITY_TAILDRIVE_ACCESS: &str = "drive:access";

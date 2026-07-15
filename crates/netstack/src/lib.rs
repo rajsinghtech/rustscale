@@ -42,6 +42,8 @@ use tokio::sync::{mpsc, oneshot, Notify};
 use tokio_util::sync::PollSender;
 
 use bytes::Bytes;
+use rustscale_key::NodePublic;
+use rustscale_packet::{Parsed, TCPFlag, TCP};
 
 use device::LoopbackDevice;
 
@@ -113,6 +115,7 @@ pub enum NetstackError {
 pub struct Netstack {
     rx_queue: Arc<std::sync::Mutex<VecDeque<Vec<u8>>>>,
     tx_queue: Arc<std::sync::Mutex<VecDeque<Vec<u8>>>>,
+    inbound_flows: Arc<std::sync::Mutex<HashMap<TcpFlow, NodePublic>>>,
     cmd_tx: mpsc::Sender<Command>,
     notify: Arc<Notify>,
     tx_notify: Arc<Notify>,
@@ -138,6 +141,12 @@ impl Listener {
     pub fn into_receiver(self) -> mpsc::Receiver<Result<NetstackStream, NetstackError>> {
         self.accept_rx
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct TcpFlow {
+    remote: SocketAddr,
+    local: SocketAddr,
 }
 
 /// A received UDP packet.
@@ -205,6 +214,7 @@ pub struct NetstackStream {
     remote_closed: bool,
     notify: Arc<Notify>,
     remote_addr: Option<SocketAddr>,
+    peer_node_key: Option<NodePublic>,
 }
 
 impl NetstackStream {
@@ -213,6 +223,7 @@ impl NetstackStream {
         tx: PollSender<Bytes>,
         notify: Arc<Notify>,
         remote_addr: Option<SocketAddr>,
+        peer_node_key: Option<NodePublic>,
     ) -> Self {
         Self {
             rx,
@@ -221,6 +232,7 @@ impl NetstackStream {
             remote_closed: false,
             notify,
             remote_addr,
+            peer_node_key,
         }
     }
 
@@ -229,6 +241,12 @@ impl NetstackStream {
     /// requested destination). Returns `None` if the address is unavailable.
     pub fn peer_addr(&self) -> Option<SocketAddr> {
         self.remote_addr
+    }
+
+    /// WireGuard node key that authenticated the inbound TCP flow. Outbound
+    /// dials and legacy packets injected without provenance return `None`.
+    pub fn peer_node_key(&self) -> Option<&NodePublic> {
+        self.peer_node_key.as_ref()
     }
 }
 
@@ -340,24 +358,58 @@ impl Netstack {
         let notify = Arc::new(Notify::new());
         let tx_notify = Arc::new(Notify::new());
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
+        let inbound_flows = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
         let device =
             LoopbackDevice::new(rx_queue.clone(), tx_queue.clone(), mtu, tx_notify.clone());
-        tokio::spawn(poll_loop(addr, device, cmd_rx, notify.clone()));
+        tokio::spawn(poll_loop(
+            addr,
+            device,
+            cmd_rx,
+            notify.clone(),
+            inbound_flows.clone(),
+        ));
 
         Self {
             rx_queue,
             tx_queue,
+            inbound_flows,
             cmd_tx,
             notify,
             tx_notify,
         }
     }
 
-    /// Feed a decapsulated plaintext IP packet from the WireGuard data plane.
+    /// Feed a decapsulated plaintext IP packet without peer provenance.
+    /// Production WireGuard delivery should use [`Self::push_rx_from`].
     pub fn push_rx(&self, packet: Vec<u8>) {
-        if let Ok(mut q) = self.rx_queue.lock() {
-            q.push_back(packet);
+        self.push_rx_inner(packet, None);
+    }
+
+    /// Feed a decapsulated packet together with the WireGuard key that opened
+    /// it. TCP SYN provenance is attached to the resulting accepted stream.
+    pub fn push_rx_from(&self, packet: Vec<u8>, peer: NodePublic) {
+        self.push_rx_inner(packet, Some(peer));
+    }
+
+    fn push_rx_inner(&self, packet: Vec<u8>, peer: Option<NodePublic>) {
+        if let Some(peer) = peer {
+            let parsed = Parsed::decode(&packet);
+            if parsed.ip_proto == TCP && parsed.tcp_flags.contains(TCPFlag::SYN) {
+                let flow = TcpFlow {
+                    remote: SocketAddr::new(parsed.src, parsed.src_port),
+                    local: SocketAddr::new(parsed.dst, parsed.dst_port),
+                };
+                if let Ok(mut flows) = self.inbound_flows.lock() {
+                    if flows.len() >= 4096 && !flows.contains_key(&flow) {
+                        flows.clear();
+                    }
+                    flows.insert(flow, peer);
+                }
+            }
+        }
+        if let Ok(mut queue) = self.rx_queue.lock() {
+            queue.push_back(packet);
         }
         self.notify.notify_one();
     }
@@ -618,11 +670,12 @@ fn to_smoltcp_v4(addr: Ipv4Addr) -> IpAddress {
 fn make_stream_and_conn(
     notify: Arc<Notify>,
     remote_addr: Option<SocketAddr>,
+    peer_node_key: Option<NodePublic>,
 ) -> (NetstackStream, ConnState) {
     let (app_tx, stream_rx) = mpsc::channel(64);
     let (stream_tx, app_rx) = mpsc::channel(64);
     let poll_sender = PollSender::new(stream_tx);
-    let stream = NetstackStream::new(stream_rx, poll_sender, notify, remote_addr);
+    let stream = NetstackStream::new(stream_rx, poll_sender, notify, remote_addr, peer_node_key);
     let conn = ConnState {
         app_tx,
         app_rx,
@@ -637,6 +690,7 @@ async fn poll_loop(
     mut device: LoopbackDevice,
     mut cmd_rx: mpsc::Receiver<Command>,
     notify: Arc<Notify>,
+    inbound_flows: Arc<std::sync::Mutex<HashMap<TcpFlow, NodePublic>>>,
 ) {
     let start = std::time::Instant::now();
     let smol_now = || SmolInstant::from_millis(start.elapsed().as_millis() as i64);
@@ -779,7 +833,14 @@ async fn poll_loop(
                             });
                     let accepted = sockets.remove(lh);
                     let conn_handle = sockets.add(accepted);
-                    let (stream, conn) = make_stream_and_conn(notify.clone(), remote_addr);
+                    let peer_node_key = remote_addr.and_then(|remote| {
+                        inbound_flows.lock().ok()?.remove(&TcpFlow {
+                            remote,
+                            local: SocketAddr::new(listen_ip, port),
+                        })
+                    });
+                    let (stream, conn) =
+                        make_stream_and_conn(notify.clone(), remote_addr, peer_node_key);
                     conns.insert(conn_handle, conn);
 
                     if let Some(entry) = listeners.get(&key) {
@@ -820,7 +881,8 @@ async fn poll_loop(
                 State::Established => {
                     let pd = pending_dials.remove(&handle);
                     if let Some(pd) = pd {
-                        let (stream, conn) = make_stream_and_conn(notify.clone(), Some(pd.remote));
+                        let (stream, conn) =
+                            make_stream_and_conn(notify.clone(), Some(pd.remote), None);
                         conns.insert(handle, conn);
                         let _ = pd.reply.send(Ok(stream));
                     }

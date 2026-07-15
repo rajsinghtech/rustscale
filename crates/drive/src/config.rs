@@ -101,6 +101,12 @@ impl Snapshot {
     }
 }
 
+/// Validated and capability-opened replacement awaiting a short commit.
+pub struct PreparedConfig {
+    enabled: bool,
+    shares: BTreeMap<String, ShareRoot>,
+}
+
 /// Atomically replaced Taildrive configuration.
 pub struct ConfigStore {
     limits: Limits,
@@ -131,11 +137,12 @@ impl ConfigStore {
         }
     }
 
-    /// Validate and replace all shares in one commit.
-    ///
-    /// Validation and capability opening happen before taking the write lock.
-    /// A failed replacement leaves the prior snapshot untouched.
-    pub fn replace(&self, enabled: bool, shares: Vec<Share>) -> Result<u64, ConfigError> {
+    /// Validate and capability-open all shares without changing live state.
+    pub fn prepare(
+        &self,
+        enabled: bool,
+        shares: Vec<Share>,
+    ) -> Result<PreparedConfig, ConfigError> {
         if shares.len() > self.limits.max_shares {
             return Err(ConfigError::TooManyShares);
         }
@@ -161,6 +168,15 @@ impl ConfigStore {
             }
         }
 
+        Ok(PreparedConfig {
+            enabled,
+            shares: validated,
+        })
+    }
+
+    /// Publish one fully prepared replacement under the caller's authority
+    /// barrier. This section performs no path traversal or blocking root open.
+    pub fn commit(&self, prepared: PreparedConfig) -> u64 {
         let mut current = match self.current.write() {
             Ok(current) => current,
             Err(poisoned) => poisoned.into_inner(),
@@ -168,10 +184,17 @@ impl ConfigStore {
         let generation = current.generation.saturating_add(1);
         *current = Arc::new(Snapshot {
             generation,
-            enabled,
-            shares: validated,
+            enabled: prepared.enabled,
+            shares: prepared.shares,
         });
-        Ok(generation)
+        generation
+    }
+
+    /// Validate and replace all shares. Callers coordinating external grant
+    /// epochs should use [`Self::prepare`] and [`Self::commit`] explicitly.
+    pub fn replace(&self, enabled: bool, shares: Vec<Share>) -> Result<u64, ConfigError> {
+        let prepared = self.prepare(enabled, shares)?;
+        Ok(self.commit(prepared))
     }
 
     pub fn disable(&self) -> u64 {

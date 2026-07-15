@@ -80,6 +80,7 @@ rustscale-sockstats = { path = "../sockstats", version = "0.1.1" }
 rustscale-conffile = { path = "../conffile", version = "0.1.1" }
 rustscale-proxymap = { path = "../proxymap", version = "0.1.1" }
 rustscale-portlist = { path = "../portlist", version = "0.1.1" }
+rustscale-packet = { path = "../packet", version = "0.1.1" }
 rustscale-clientupdate = { path = "../clientupdate", version = "0.1.1" }
 rustscale-envknob = { path = "../envknob", version = "0.1.1" }
 rustscale-feature = { path = "../feature", version = "0.1.1" }
@@ -91,6 +92,7 @@ rustscale-netlogtype = { path = "../netlogtype", version = "0.1.1" }
 rustscale-netns.workspace = true
 rustscale-tsdial = { path = "../tsdial", version = "0.1.1" }
 rustscale-dnsname = { path = "../dnsname", version = "0.1.1" }
+rustscale-drive = { path = "../drive", version = "0.1.1" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

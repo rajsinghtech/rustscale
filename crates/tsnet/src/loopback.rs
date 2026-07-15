@@ -493,6 +493,14 @@ impl Server {
                     capability_version: CAPABILITY_VERSION,
                     protocol_version: PROTOCOL_VERSION,
                 }),
+            control_params: Some(localapi::ControlParams {
+                control_url: self.config.control_url.clone(),
+                machine_key: inner.machine_key.clone(),
+                server_pub_key: inner.server_pub_key.clone(),
+                node_key: inner.node_key.clone(),
+                capability_version: CAPABILITY_VERSION,
+                protocol_version: PROTOCOL_VERSION,
+            }),
             taildrop: None,
             netstack: match &inner.data_plane {
                 DataPlane::Netstack(ns) => Some(ns.clone()),

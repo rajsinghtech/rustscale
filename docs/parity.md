@@ -30,7 +30,7 @@ Statuses below were checked against the source and tests in `crates/*` as of
 | Serve/Funnel (ListenFunnel, ServeConfig, TCP fwd, reverse proxy) | `tsnet`, `ipn/serve*` | ✅ ServeConfig serde + ETag + persistence; TCP/HTTP/HTTPS dispatch; reverse proxy with WhoIs headers (Tailscale-User-Login/Name); TLS-terminate via ControlCertProvider; HTTP-to-HTTPS redirect; HTTPHandler.Redirect with `${HOST}`/`${REQUEST_URI}` expansion; Ingress-Target header dispatch; listen_funnel port validation (443/8443/10000); LocalAPI GET/POST serve-config; CLI serve/funnel with status/reset |
 | Tailscale Services (ListenService, PROXY protocol) | `tsnet.Server.ListenService` | ✅ listen_service(svc_name, ServiceMode) with VIP v4 addrs from CapMap (ServiceIPMappings); PROXY protocol v2 binary header encoder (byte-exact IPv4/IPv6/LOCAL); ServiceStream wrapping (Plain/WithProxy/Tls/TlsWithProxy); IPv6 VIPs skipped (smoltcp proto-ipv4 only); TLS termination for service FQDN via ControlCertProvider (HTTPS mode with cert fallback to self-signed); serve-config Services TCP forwarding path (TCPForward/TerminateTLS on service VIPs via ServeRunner) |
 | SOCKS5 proxy | `net/socks5/` | ✅ RFC 1928 CONNECT (v4/domain/v6); RFC 1929 username/password auth; pluggable SocksDialer; FFI; e2e tests |
-| LocalAPI | `ipn/localapi/` | ✅ 17+ endpoints (status, whois, prefs GET+PATCH, netmap, metrics, health, ping (disco/icmp/tsmp/peerapi), watch-ipn-bus, start, login-interactive, logout, serve-config, profiles, cert, file-targets, debug, dial, dns-query, check-ip-forwarding) |
+| LocalAPI | `ipn/localapi/` | ✅ 18+ endpoints (status, whois, prefs GET+PATCH, netmap, metrics, health, ping (disco/icmp/tsmp/peerapi), watch-ipn-bus, start, login-interactive, logout, serve-config, profiles, cert, id-token (Noise control forwarding), file-targets, debug, dial, dns-query, check-ip-forwarding) |
 | Auto-update / ClientVersion | — | ✅ `crates/clientupdate` API complete (ClientUpdater, CheckResult, version_to_track); wired into map-update loop (`spawn_map_update_task` calls `set_client_version`, fires `Notify.ClientVersion`); `ipnstate::Status.ClientVersion` populated via `ClientVersionStatus` in `build_status_json` and `ipn_status()`; CLI `status` shows "Update available: ..."; `auto_apply` still returns `AutoUpdateNotImplemented` (platform-specific install logic not ported) |
 | Multi-profile/login management | `ipn/ipnlocal/profiles.go` | ✅ ProfileManager with profiles.json + current-profile persistence; LocalAPI CRUD endpoints; CLI switch command; backend teardown+restart on switch (`Server::switch_profile` → close + reload prefs + `up()`, `DaemonCommand::SwitchProfile` wired through daemon loop); remaining: Windows LocalUserID |
 
@@ -250,7 +250,7 @@ state-dir fallback probing), `--json`.
 | `dns` | `cli/dns.go` | ✅ queries daemon DNS resolver or prints MagicDNS status; `--type`, `--json` |
 | `bugreport` | `cli/bugreport.go` | ✅ prints version/state/health summary |
 | `nc` | `cli/nc.go` | 🔶 stub (not-yet-supported) |
-| `id-token` | `cli/id-token.go` | 🔶 stub (not-yet-supported) |
+| `id-token` | `cli/id-token.go` | ✅ OIDC machine ID token via LocalAPI and Noise `POST /machine/id-token`; raw JWT and `--json` output |
 | `update` | `cli/update.go` | 🔶 stub (not-yet-supported) |
 | `drive` | `cli/drive.go` | ⬜ |
 | `lock` | `cli/lock.go` | ⬜ |

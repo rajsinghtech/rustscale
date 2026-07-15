@@ -2,8 +2,8 @@
 //!
 //! Mirrors Go's `tstest/integration/testcontrol` package. A single-tailnet
 //! control server that speaks the ts2021 Noise protocol, serves `/key`,
-//! `/ts2021` (Noise upgrade), and h2c routes `/machine/register` and
-//! `/machine/map` (streaming long-poll).
+//! `/ts2021` (Noise upgrade), and h2c routes including `/machine/register`,
+//! `/machine/map` (streaming long-poll), and `/machine/id-token`.
 //!
 //! # Usage
 //!
@@ -32,7 +32,8 @@ use rustscale_controlclient::controlbase::{server_handshake, NoiseIo};
 use rustscale_key::{DiscoPrivate, MachinePrivate, MachinePublic, NodePrivate, NodePublic};
 use rustscale_tailcfg::{
     filter_allow_all, DERPMap, DNSConfig, FilterRule, Login, MapRequest, MapResponse, Node,
-    NodeCapMap, NodeID, RegisterRequest, RegisterResponse, User, UserProfile,
+    NodeCapMap, NodeID, RegisterRequest, RegisterResponse, TokenRequest, TokenResponse, User,
+    UserProfile,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -82,6 +83,8 @@ struct ServerInner {
     /// `RegisterResponse.NodeKeyExpired = true`. Used by key-rotation
     /// tests to force expiry on a specific node.
     expired_nodes: HashSet<NodePublic>,
+    token_response: TokenResponse,
+    last_token_request: Option<TokenRequest>,
     base_url: String,
 }
 
@@ -132,6 +135,10 @@ impl Server {
                 last_auth_url: None,
                 logged_out_nodes: HashSet::new(),
                 expired_nodes: HashSet::new(),
+                token_response: TokenResponse {
+                    IDToken: "test.header.payload.signature".into(),
+                },
+                last_token_request: None,
                 base_url: String::new(),
             })),
             notify: Arc::new(Notify::new()),
@@ -171,6 +178,16 @@ impl Server {
     // -----------------------------------------------------------------
     // Test API
     // -----------------------------------------------------------------
+
+    /// Configure the response returned by `POST /machine/id-token`.
+    pub fn set_id_token(&self, token: impl Into<String>) {
+        self.inner.lock().unwrap().token_response.IDToken = token.into();
+    }
+
+    /// Return the most recent identity-token request received by control.
+    pub fn last_token_request(&self) -> Option<TokenRequest> {
+        self.inner.lock().unwrap().last_token_request.clone()
+    }
 
     /// Number of registered nodes (real + fake).
     pub fn num_nodes(&self) -> usize {
@@ -650,6 +667,36 @@ async fn handle_h2_request(
             while req_body.data().await.is_some() {}
             let resp = http::Response::builder().status(204).body(()).unwrap();
             let _ = respond.send_response(resp, true);
+        }
+        "/machine/id-token" => {
+            let body = read_h2_body(&mut req_body).await.map_err(|_| ())?;
+            let request: TokenRequest = match serde_json::from_slice(&body) {
+                Ok(request) => request,
+                Err(error) => {
+                    let resp = http::Response::builder()
+                        .status(400)
+                        .header("content-type", "text/plain")
+                        .body(())
+                        .unwrap();
+                    let mut send = respond.send_response(resp, false).map_err(|_| ())?;
+                    send.send_data(bytes::Bytes::from(error.to_string()), true)
+                        .map_err(|_| ())?;
+                    return Ok(());
+                }
+            };
+            let response = {
+                let mut inner = inner.lock().unwrap();
+                inner.last_token_request = Some(request);
+                serde_json::to_vec(&inner.token_response).map_err(|_| ())?
+            };
+            let resp = http::Response::builder()
+                .status(200)
+                .header("content-type", "application/json")
+                .body(())
+                .unwrap();
+            let mut send = respond.send_response(resp, false).map_err(|_| ())?;
+            send.send_data(bytes::Bytes::from(response), true)
+                .map_err(|_| ())?;
         }
         _ => {
             let resp = http::Response::builder().status(404).body(()).unwrap();

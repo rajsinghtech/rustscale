@@ -19,7 +19,7 @@ use rustscale_auditlog::{Transport, TransportError};
 use rustscale_key::{MachinePrivate, MachinePublic, NodePublic};
 use rustscale_tailcfg::{
     AuditLogRequest, MapRequest, MapResponse, RegisterRequest, RegisterResponse, SetDNSRequest,
-    SetDNSResponse,
+    SetDNSResponse, TokenRequest, TokenResponse,
 };
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
@@ -504,6 +504,47 @@ impl ControlClient {
         } else {
             Ok(serde_json::from_slice(&data)?)
         }
+    }
+
+    /// Request an OIDC ID token from `/machine/id-token` over Noise.
+    pub async fn id_token(&self, req: &TokenRequest) -> Result<TokenResponse, RegisterError> {
+        let noise_stream = dial_control(
+            &self.host,
+            &self.machine_key,
+            &self.control_key,
+            self.version,
+            self.extra_root_certs.as_deref(),
+        )
+        .await?;
+
+        let (conn, stream) = noise_stream.into_parts();
+        let noise_io = NoiseIo::new(conn, stream);
+        let (mut h2_send, h2_conn) = establish_h2(noise_io).await?;
+        tokio::spawn(async move {
+            let _ = h2_conn.await;
+        });
+
+        let body = serde_json::to_vec(req)?;
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("/machine/id-token")
+            .header("content-type", "application/json")
+            .body(())
+            .unwrap();
+        let (resp_future, mut send_stream) = h2_send.send_request(request, false)?;
+        send_stream.send_data(bytes::Bytes::from(body), true)?;
+
+        let response = resp_future.await?;
+        let status = response.status().as_u16();
+        let mut body = response.into_body();
+        let data = read_h2_body(&mut body).await?;
+        if status != 200 {
+            return Err(RegisterError::HttpStatus(
+                status,
+                String::from_utf8_lossy(&data).to_string(),
+            ));
+        }
+        Ok(serde_json::from_slice(&data)?)
     }
 
     /// Post an audit event to `/machine/audit-log` over a Noise connection.

@@ -39,7 +39,7 @@ fn rustscale_bin() -> PathBuf {
 /// with LocalAPI, and return the socket path. The caller must call
 /// `server.close()` when done.
 struct TestEnv {
-    _tc: TestControlServer,
+    tc: TestControlServer,
     server: Server,
     socket_path: PathBuf,
     _state_tmp: tempfile::TempDir,
@@ -86,12 +86,54 @@ async fn setup() -> TestEnv {
     eprintln!("LocalAPI socket ready at {}", socket_path.display());
 
     TestEnv {
-        _tc: tc,
+        tc,
         server,
         socket_path,
         _state_tmp: state_tmp,
         _sock_tmp: sock_tmp,
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_id_token_via_noise_control() {
+    let mut env = setup().await;
+    let audience = "https://service.example/resource?tenant=rustscale";
+    let expected_token = "header.payload.signature";
+    env.tc.set_id_token(expected_token);
+
+    let client = LocalClient::new(&env.socket_path);
+    let response = client
+        .id_token(audience)
+        .await
+        .expect("id-token via localclient");
+    assert_eq!(response.IDToken, expected_token);
+
+    let request = env
+        .tc
+        .last_token_request()
+        .expect("testcontrol should receive a token request");
+    assert_eq!(request.Audience, audience);
+    assert_eq!(request.CapVersion, 141);
+    assert!(!request.NodeKey.is_zero());
+
+    let output = std::process::Command::new(rustscale_bin())
+        .arg("--socket")
+        .arg(&env.socket_path)
+        .arg("id-token")
+        .arg(audience)
+        .output()
+        .expect("failed to spawn rustscale id-token");
+    assert!(
+        output.status.success(),
+        "id-token failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        expected_token
+    );
+
+    env.server.close().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

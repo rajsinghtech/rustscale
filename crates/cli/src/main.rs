@@ -194,7 +194,7 @@ fn usage(bin: &str) {
     eprintln!("  exit-node [--list] [--suggest]       list or select exit nodes");
     eprintln!("  dns [name] [--type <type>]           query the daemon DNS resolver");
     eprintln!("  nc <host:port>                       netcat via tailnet (not yet supported)");
-    eprintln!("  id-token <audience>                  fetch OIDC ID token (not yet supported)");
+    eprintln!("  id-token <audience>                  fetch an OIDC ID token for this machine");
     eprintln!(
         "  update                               check for client updates (not yet supported)"
     );

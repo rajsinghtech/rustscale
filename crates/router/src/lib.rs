@@ -531,7 +531,16 @@ impl LinuxPlatform {
         ];
         let mut commands = Vec::with_capacity(8);
         for family in ["-4", "-6"] {
-            for (pref, table) in rules {
+            for offset in 0..rules.len() {
+                // Remove each family's rules in the reverse order from
+                // installation, without reversing the IPv4/IPv6 family
+                // order itself.
+                let index = if add {
+                    offset
+                } else {
+                    rules.len() - 1 - offset
+                };
+                let (pref, table) = rules[index];
                 let mut args = vec![
                     family.into(),
                     "rule".into(),
@@ -1202,7 +1211,7 @@ mod tests {
             ]
         );
 
-        let down: Vec<_> = platform.policy_rules(false).into_iter().rev().collect();
+        let down = platform.policy_rules(false);
         assert_eq!(
             &down[..8],
             [
@@ -1431,14 +1440,14 @@ mod tests {
         assert_eq!(
             actual,
             [
-                "ip -4 rule del pref 5210 table main",
-                "ip -4 rule del pref 5230 table default",
-                "ip -4 rule del pref 5250 type unreachable",
                 "ip -4 rule del pref 5270 table 52",
-                "ip -6 rule del pref 5210 table main",
-                "ip -6 rule del pref 5230 table default",
-                "ip -6 rule del pref 5250 type unreachable",
+                "ip -4 rule del pref 5250 type unreachable",
+                "ip -4 rule del pref 5230 table default",
+                "ip -4 rule del pref 5210 table main",
                 "ip -6 rule del pref 5270 table 52",
+                "ip -6 rule del pref 5250 type unreachable",
+                "ip -6 rule del pref 5230 table default",
+                "ip -6 rule del pref 5210 table main",
                 "ip -4 rule add pref 5210 fwmark 0x80000/0xff0000 table main",
                 "ip -4 rule add pref 5230 fwmark 0x80000/0xff0000 table default",
                 "ip -4 rule add pref 5250 fwmark 0x80000/0xff0000 type unreachable",

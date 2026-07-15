@@ -17,7 +17,13 @@ const MAX_BODY: usize = 256 * 1024;
 pub(crate) async fn http_get(url: &str, deadline: Duration) -> Result<String, std::io::Error> {
     let (host, port, path) = parse_url(url)?;
     let req = format!("GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n");
-    let body = do_request(&host, port, &req, deadline).await?;
+    let response = do_request(&host, port, &req, deadline).await?;
+    let (status, body) = split_response(&response)?;
+    if status != 200 {
+        return Err(std::io::Error::other(format!(
+            "HTTP GET failed (status={status})"
+        )));
+    }
     String::from_utf8(body).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
@@ -35,7 +41,7 @@ pub(crate) async fn http_post_soap(
         body.len()
     );
     let resp = do_request(&host, port, &req, deadline).await?;
-    let (status, body_text) = split_response(&resp);
+    let (status, body_text) = split_response(&resp)?;
     Ok((
         status,
         String::from_utf8(body_text)
@@ -89,23 +95,102 @@ async fn do_request(
     Ok(buf)
 }
 
-/// Split a raw HTTP response into (status_code, body_bytes).
-fn split_response(raw: &[u8]) -> (u16, Vec<u8>) {
-    // Find the end of headers (\r\n\r\n).
-    let header_end = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap_or(0);
-    let header_str = String::from_utf8_lossy(&raw[..header_end]);
-    let status = header_str
-        .lines()
+/// Strictly split a raw HTTP/1.x response into status and body.
+fn split_response(raw: &[u8]) -> Result<(u16, Vec<u8>), std::io::Error> {
+    let invalid =
+        |message: &'static str| std::io::Error::new(std::io::ErrorKind::InvalidData, message);
+    let header_end = raw
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(|| invalid("missing HTTP header terminator"))?;
+    let header = std::str::from_utf8(&raw[..header_end])
+        .map_err(|_| invalid("HTTP headers are not UTF-8"))?;
+    let mut lines = header.split("\r\n");
+    let status_line = lines
         .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(500);
-    let body = if header_end > 0 {
-        raw[header_end + 4..].to_vec()
-    } else {
-        Vec::new()
-    };
-    (status, body)
+        .ok_or_else(|| invalid("missing HTTP status line"))?;
+    let mut status_parts = status_line.splitn(3, ' ');
+    let version = status_parts.next().unwrap_or_default();
+    let code = status_parts.next().unwrap_or_default();
+    let reason = status_parts
+        .next()
+        .ok_or_else(|| invalid("malformed HTTP status line"))?;
+    let version_bytes = version.as_bytes();
+    if version_bytes.len() != 8
+        || &version_bytes[..7] != b"HTTP/1."
+        || !version_bytes[7].is_ascii_digit()
+        || code.len() != 3
+        || !code.bytes().all(|byte| byte.is_ascii_digit())
+        || code.starts_with('0')
+        || !reason
+            .bytes()
+            .all(|byte| byte == b'\t' || (byte >= b' ' && byte != 0x7f))
+    {
+        return Err(invalid("malformed HTTP status line"));
+    }
+    let status = code
+        .parse::<u16>()
+        .map_err(|_| invalid("invalid HTTP status code"))?;
+
+    let mut content_length = None;
+    for line in lines {
+        if line.is_empty() || line.starts_with([' ', '\t']) {
+            return Err(invalid("malformed HTTP header"));
+        }
+        let (name, value) = line
+            .split_once(':')
+            .ok_or_else(|| invalid("malformed HTTP header"))?;
+        if name.is_empty() || !name.bytes().all(is_http_token_byte) {
+            return Err(invalid("invalid HTTP header name"));
+        }
+        if !value
+            .bytes()
+            .all(|byte| byte == b'\t' || (byte >= b' ' && byte != 0x7f))
+        {
+            return Err(invalid("invalid HTTP header value"));
+        }
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            return Err(invalid("unsupported Transfer-Encoding"));
+        }
+        if name.eq_ignore_ascii_case("content-length") {
+            let value = value.trim();
+            if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(invalid("invalid Content-Length"));
+            }
+            let length = value
+                .parse::<usize>()
+                .map_err(|_| invalid("invalid Content-Length"))?;
+            if content_length.replace(length).is_some() {
+                return Err(invalid("duplicate Content-Length"));
+            }
+        }
+    }
+    let body = raw[header_end + 4..].to_vec();
+    if content_length.is_some_and(|length| length != body.len()) {
+        return Err(invalid("Content-Length mismatch"));
+    }
+    Ok((status, body))
+}
+
+fn is_http_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
 }
 
 #[cfg(test)]
@@ -139,8 +224,24 @@ mod tests {
     #[test]
     fn split_response_extracts_status_and_body() {
         let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
-        let (status, body) = split_response(raw);
+        let (status, body) = split_response(raw).unwrap();
         assert_eq!(status, 200);
         assert_eq!(&body, b"hello");
+    }
+
+    #[test]
+    fn split_response_rejects_malformed_status_and_headers() {
+        for raw in [
+            &b"BROKEN 200 OK\r\nContent-Length: 0\r\n\r\n"[..],
+            &b"HTTP/2 200 OK\r\nContent-Length: 0\r\n\r\n"[..],
+            &b"HTTP/1.1 20 OK\r\nContent-Length: 0\r\n\r\n"[..],
+            &b"HTTP/1.1 abc OK\r\nContent-Length: 0\r\n\r\n"[..],
+            &b"HTTP/1.1 200 OK\nContent-Length: 0\n\n"[..],
+            &b"HTTP/1.1 200 OK\r\nBad Header: x\r\n\r\n"[..],
+            &b"HTTP/1.1 200 OK\r\n folded: x\r\n\r\n"[..],
+            &b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n"[..],
+        ] {
+            assert!(split_response(raw).is_err(), "accepted {raw:?}");
+        }
     }
 }

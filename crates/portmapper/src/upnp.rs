@@ -521,6 +521,18 @@ fn parse_xml_elements(xml: &str) -> Option<Vec<XmlElement>> {
             return None;
         }
         rest = &rest[start + 1..];
+        if let Some(comment) = rest.strip_prefix("!--") {
+            let end = comment.find("-->")?;
+            let contents = &comment[..end];
+            if contents.contains("--")
+                || contents.ends_with('-')
+                || !contents.chars().all(xml_char_is_allowed)
+            {
+                return None;
+            }
+            rest = &comment[end + 3..];
+            continue;
+        }
         let end = find_xml_tag_end(rest)?;
         let mut token = rest[..end].trim();
         rest = &rest[end + 1..];
@@ -530,9 +542,9 @@ fn parse_xml_elements(xml: &str) -> Option<Vec<XmlElement>> {
             }
             continue;
         }
-        // SOAP responses do not need DTDs or comments. Rejecting declarations
-        // keeps this small parser fail-closed rather than partially parsing
-        // namespace-affecting XML syntax.
+        // DTDs, entity declarations, CDATA, and other declarations are not
+        // needed for SOAP and are rejected fail-closed. Comments were fully
+        // consumed and validated above.
         if token.starts_with('!') {
             return None;
         }
@@ -562,26 +574,44 @@ fn parse_xml_elements(xml: &str) -> Option<Vec<XmlElement>> {
         let parsed_attributes = parse_xml_attributes(attributes)?;
         for (name, value) in &parsed_attributes {
             if name == "xmlns" {
-                namespaces.insert(String::new(), value.clone());
+                if !xml_namespace_value_is_valid(value, true)
+                    || matches!(
+                        value.as_str(),
+                        "http://www.w3.org/2000/xmlns/" | "http://www.w3.org/XML/1998/namespace"
+                    )
+                {
+                    return None;
+                }
+                if value.is_empty() {
+                    namespaces.remove("");
+                } else {
+                    namespaces.insert(String::new(), value.clone());
+                }
             } else if let Some(prefix) = name.strip_prefix("xmlns:") {
                 if prefix.is_empty()
                     || prefix == "xmlns"
-                    || value.is_empty()
+                    || !xml_namespace_value_is_valid(value, false)
+                    || value == "http://www.w3.org/2000/xmlns/"
                     || (prefix == "xml" && value != "http://www.w3.org/XML/1998/namespace")
+                    || (prefix != "xml" && value == "http://www.w3.org/XML/1998/namespace")
                 {
                     return None;
                 }
                 namespaces.insert(prefix.to_string(), value.clone());
             }
         }
+        let mut expanded_attributes = HashSet::new();
         for (name, _) in &parsed_attributes {
             if name == "xmlns" || name.starts_with("xmlns:") {
                 continue;
             }
-            if let Some((prefix, _)) = name.split_once(':') {
-                if !namespaces.contains_key(prefix) {
-                    return None;
-                }
+            let (namespace, local) = if let Some((prefix, local)) = name.split_once(':') {
+                (Some(namespaces.get(prefix)?.clone()), local)
+            } else {
+                (None, name.as_str())
+            };
+            if !expanded_attributes.insert((namespace, local.to_string())) {
+                return None;
             }
         }
         let name = resolve_xml_name(qualified, &namespaces)?;
@@ -651,11 +681,16 @@ fn parse_xml_attributes(mut attributes: &str) -> Option<Vec<(String, String)>> {
         }
         attributes = &attributes[quote.len_utf8()..];
         let value_end = attributes.find(quote)?;
-        parsed.push((
-            name.to_string(),
-            decode_xml_entities(&attributes[..value_end])?,
-        ));
-        attributes = attributes[value_end + quote.len_utf8()..].trim_start();
+        let raw_value = &attributes[..value_end];
+        if raw_value.contains('<') {
+            return None;
+        }
+        parsed.push((name.to_string(), decode_xml_entities(raw_value)?));
+        let remainder = &attributes[value_end + quote.len_utf8()..];
+        if !remainder.is_empty() && !remainder.chars().next().is_some_and(char::is_whitespace) {
+            return None;
+        }
+        attributes = remainder.trim_start();
     }
     Some(parsed)
 }
@@ -699,6 +734,12 @@ fn default_xml_namespaces() -> HashMap<String, String> {
         "xml".to_string(),
         "http://www.w3.org/XML/1998/namespace".to_string(),
     )])
+}
+
+fn xml_namespace_value_is_valid(value: &str, allow_empty: bool) -> bool {
+    (allow_empty || !value.is_empty())
+        && !value.chars().any(char::is_whitespace)
+        && !value.contains(['<', '>', '"', '\''])
 }
 
 fn xml_ncname_is_valid(name: &str) -> bool {
@@ -1027,6 +1068,35 @@ mod tests {
             "Response",
             "urn:upnp"
         ));
+    }
+
+    #[test]
+    fn xml_comments_and_attributes_are_well_formed() {
+        assert!(parse_xml_elements(
+            "<!--before--><root a=\"x&amp;y\"><!--inside--><child/></root><!--after-->"
+        )
+        .is_some());
+        for invalid in [
+            "<!DOCTYPE root><root/>",
+            "<!DOCTYPE root [<!ENTITY x 'evil'>]><root/>",
+            "<!-- broken -- comment --><root/>",
+            "<!--ends-with---><root/>",
+            "<root a=\"raw<value\"/>",
+            "<root a=\"unterminated/>",
+            "<root a=\"&unknown;\"/>",
+            "<root a=\"&#0;\"/>",
+            "<root a=\"x\"b=\"y\"/>",
+            "<root xmlns:p=\"http://www.w3.org/2000/xmlns/\"/>",
+            "<root xmlns:p=\"http://www.w3.org/XML/1998/namespace\"/>",
+            "<root xmlns:a=\"urn:x\" xmlns:b=\"urn:x\" a:q=\"1\" b:q=\"2\"/>",
+        ] {
+            assert!(
+                parse_xml_elements(invalid).is_none(),
+                "accepted {invalid:?}"
+            );
+        }
+        let control = format!("<root a=\"{}\"/>", '\u{1}');
+        assert!(parse_xml_elements(&control).is_none());
     }
 
     #[test]

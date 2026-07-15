@@ -44,6 +44,7 @@ struct FakeIgd {
     pcp_mutation: Option<PcpMutation>,
     upnp_permanent_malformed: bool,
     upnp_add_fault_code: Option<u32>,
+    upnp_broken_status: bool,
     upnp_delete_fault: bool,
     closed: Arc<AtomicBool>,
     pmp_recv_count: Arc<AtomicU32>,
@@ -77,6 +78,7 @@ impl FakeIgd {
             pcp_mutation: opts.pcp_mutation,
             upnp_permanent_malformed: opts.upnp_permanent_malformed,
             upnp_add_fault_code: opts.upnp_add_fault_code,
+            upnp_broken_status: opts.upnp_broken_status,
             upnp_delete_fault: opts.upnp_delete_fault,
             closed: closed.clone(),
             pmp_recv_count: Arc::new(AtomicU32::new(0)),
@@ -319,9 +321,13 @@ impl FakeIgd {
                 }
                 if let Some(code) = self.upnp_add_fault_code {
                     let fault = format!(
-                        r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><s:Fault><detail><UPnPError xmlns="urn:schemas-upnp-org:control-1-0"><errorCode>{code}</errorCode></UPnPError></detail></s:Fault></s:Body></s:Envelope>"#
+                        r#"<!--before-envelope--><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><!--in-envelope--><s:Body><!--in-body--><s:Fault><!--in-fault--><detail><!--in-detail--><UPnPError xmlns="urn:schemas-upnp-org:control-1-0"><!--in-upnp-error--><errorCode>{code}</errorCode></UPnPError></detail></s:Fault></s:Body></s:Envelope><!--after-envelope-->"#
                     );
-                    write_soap_response(stream, &fault).await;
+                    if self.upnp_broken_status {
+                        write_soap_response_with_status(stream, "BROKEN 200 OK", &fault).await;
+                    } else {
+                        write_soap_response(stream, &fault).await;
+                    }
                 } else if self.upnp_permanent_malformed {
                     if req.contains("<NewLeaseDuration>0</NewLeaseDuration>") {
                         write_soap_response(stream, "").await;
@@ -360,8 +366,16 @@ impl FakeIgd {
 }
 
 async fn write_soap_response(stream: &mut (impl AsyncWriteExt + Unpin), body: &str) {
+    write_soap_response_with_status(stream, "HTTP/1.1 200 OK", body).await;
+}
+
+async fn write_soap_response_with_status(
+    stream: &mut (impl AsyncWriteExt + Unpin),
+    status: &str,
+    body: &str,
+) {
     let resp = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "{status}\r\nContent-Type: text/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     let _ = stream.write_all(resp.as_bytes()).await;
@@ -383,6 +397,7 @@ struct IgdOpts {
     pcp_mutation: Option<PcpMutation>,
     upnp_permanent_malformed: bool,
     upnp_add_fault_code: Option<u32>,
+    upnp_broken_status: bool,
     upnp_delete_fault: bool,
 }
 
@@ -396,6 +411,7 @@ impl Default for IgdOpts {
             pcp_mutation: None,
             upnp_permanent_malformed: false,
             upnp_add_fault_code: None,
+            upnp_broken_status: false,
             upnp_delete_fault: false,
         }
     }
@@ -754,6 +770,30 @@ async fn valid_add_rejections_clear_ownership_without_compensating_delete() {
         assert_eq!(igd.upnp_delete_count.load(Ordering::SeqCst), 0);
         igd.close();
     }
+}
+
+#[tokio::test]
+async fn broken_http_status_keeps_valid_fault_body_ambiguous() {
+    let igd = FakeIgd::start(IgdOpts {
+        upnp: true,
+        upnp_add_fault_code: Some(718),
+        upnp_broken_status: true,
+        upnp_delete_fault: true,
+        ..Default::default()
+    })
+    .await;
+    let client = make_test_client(&igd);
+
+    assert!(client.create_or_get_mapping().await.is_err());
+    assert_eq!(igd.upnp_add_count.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        igd.upnp_delete_count.load(Ordering::SeqCst),
+        1,
+        "malformed status must prevent the fault body resolving ownership"
+    );
+    assert!(client.shutdown(Duration::from_secs(2)).await.is_err());
+    assert!(igd.upnp_delete_count.load(Ordering::SeqCst) >= 2);
+    igd.close();
 }
 
 #[tokio::test]

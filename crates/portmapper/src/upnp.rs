@@ -513,8 +513,13 @@ fn parse_xml_elements(xml: &str) -> Option<Vec<XmlElement>> {
     let mut stack = Vec::<XmlFrame>::new();
     let mut elements = Vec::<XmlElement>::new();
     let mut rest = xml;
+    let mut saw_markup = false;
     while let Some(start) = rest.find('<') {
-        let decoded_text = decode_xml_entities(&rest[..start])?;
+        let character_data = &rest[..start];
+        if character_data.contains("]]>") {
+            return None;
+        }
+        let decoded_text = decode_xml_entities(character_data)?;
         if let Some(frame) = stack.last() {
             elements[frame.element_index].text.push_str(&decoded_text);
         } else if !decoded_text.trim().is_empty() {
@@ -531,16 +536,24 @@ fn parse_xml_elements(xml: &str) -> Option<Vec<XmlElement>> {
                 return None;
             }
             rest = &comment[end + 3..];
+            saw_markup = true;
+            continue;
+        }
+        if rest.starts_with('?') {
+            let end = rest.find("?>")?;
+            let token = &rest[..=end];
+            rest = &rest[end + 2..];
+            if !processing_instruction_is_valid(token, !saw_markup && start == 0) {
+                return None;
+            }
+            saw_markup = true;
             continue;
         }
         let end = find_xml_tag_end(rest)?;
-        let mut token = rest[..end].trim();
+        let mut token = &rest[..end];
         rest = &rest[end + 1..];
-        if token.starts_with('?') {
-            if !stack.is_empty() || !token.ends_with('?') {
-                return None;
-            }
-            continue;
+        if token.starts_with(char::is_whitespace) {
+            return None;
         }
         // DTDs, entity declarations, CDATA, and other declarations are not
         // needed for SOAP and are rejected fail-closed. Comments were fully
@@ -548,8 +561,7 @@ fn parse_xml_elements(xml: &str) -> Option<Vec<XmlElement>> {
         if token.starts_with('!') {
             return None;
         }
-        if let Some(close) = token.strip_prefix('/') {
-            let qualified = close.trim();
+        if let Some(qualified) = token.strip_prefix('/') {
             if qualified.is_empty() || qualified.chars().any(char::is_whitespace) {
                 return None;
             }
@@ -560,6 +572,7 @@ fn parse_xml_elements(xml: &str) -> Option<Vec<XmlElement>> {
             if closing != frame.name {
                 return None;
             }
+            saw_markup = true;
             continue;
         }
 
@@ -629,6 +642,10 @@ fn parse_xml_elements(xml: &str) -> Option<Vec<XmlElement>> {
                 element_index,
             });
         }
+        saw_markup = true;
+    }
+    if rest.contains("]]>") {
+        return None;
     }
     let trailing = decode_xml_entities(rest)?;
     if let Some(frame) = stack.last() {
@@ -637,6 +654,62 @@ fn parse_xml_elements(xml: &str) -> Option<Vec<XmlElement>> {
         return None;
     }
     (stack.is_empty() && !elements.is_empty()).then_some(elements)
+}
+
+fn processing_instruction_is_valid(token: &str, declaration_allowed: bool) -> bool {
+    let Some(inner) = token
+        .strip_prefix('?')
+        .and_then(|value| value.strip_suffix('?'))
+    else {
+        return false;
+    };
+    let target_end = inner.find(char::is_whitespace).unwrap_or(inner.len());
+    let target = &inner[..target_end];
+    if !xml_qname_is_valid(target) {
+        return false;
+    }
+    let data = &inner[target_end..];
+    if target.eq_ignore_ascii_case("xml") {
+        return target == "xml" && declaration_allowed && xml_declaration_is_valid(data);
+    }
+    data.chars().all(xml_char_is_allowed)
+}
+
+fn xml_declaration_is_valid(data: &str) -> bool {
+    if data.is_empty() || !data.starts_with(char::is_whitespace) || data.contains('&') {
+        return false;
+    }
+    let Some(attributes) = parse_xml_attributes(data.trim_start()) else {
+        return false;
+    };
+    if attributes.first().map(|(name, _)| name.as_str()) != Some("version")
+        || !matches!(attributes[0].1.as_str(), "1.0" | "1.1")
+        || attributes.len() > 3
+    {
+        return false;
+    }
+    let mut position = 1;
+    if attributes.get(position).map(|(name, _)| name.as_str()) == Some("encoding") {
+        let encoding = &attributes[position].1;
+        let mut chars = encoding.chars();
+        if !chars.next().is_some_and(|ch| ch.is_ascii_alphabetic())
+            || !chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+        {
+            return false;
+        }
+        position += 1;
+    }
+    if attributes.get(position).map(|(name, _)| name.as_str()) == Some("standalone") {
+        if !matches!(attributes[position].1.as_str(), "yes" | "no") {
+            return false;
+        }
+        position += 1;
+    }
+    position == attributes.len()
+}
+
+fn xml_qname_is_valid(name: &str) -> bool {
+    name.matches(':').count() <= 1 && name.split(':').all(xml_ncname_is_valid)
 }
 
 fn find_xml_tag_end(token: &str) -> Option<usize> {
@@ -1073,7 +1146,7 @@ mod tests {
     #[test]
     fn xml_comments_and_attributes_are_well_formed() {
         assert!(parse_xml_elements(
-            "<!--before--><root a=\"x&amp;y\"><!--inside--><child/></root><!--after-->"
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><!--before--><?pre data?><root a=\"x&amp;y\"><!--inside--><?inside data?><child /></root><?post?><!--after-->"
         )
         .is_some());
         for invalid in [
@@ -1089,6 +1162,15 @@ mod tests {
             "<root xmlns:p=\"http://www.w3.org/2000/xmlns/\"/>",
             "<root xmlns:p=\"http://www.w3.org/XML/1998/namespace\"/>",
             "<root xmlns:a=\"urn:x\" xmlns:b=\"urn:x\" a:q=\"1\" b:q=\"2\"/>",
+            "<root><child></child ></root>",
+            "<root><child/ ></root>",
+            "<root>literal ]]></root>",
+            "<!--before--><?xml version=\"1.0\"?><root/>",
+            "<?xml encoding=\"UTF-8\" version=\"1.0\"?><root/>",
+            "<?xml version=\"2.0\"?><root/>",
+            "<?XML version=\"1.0\"?><root/>",
+            "<?xml?><root/>",
+            "<?pi data?<root/>",
         ] {
             assert!(
                 parse_xml_elements(invalid).is_none(),
@@ -1169,6 +1251,10 @@ mod tests {
             r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" xmlns:u="urn:schemas-upnp-org:control-1-0"><s:Body><s:Fault><detail><u:UPnPError><u:errorCode>725</u:errorCode><u:errorCode>725</u:errorCode></u:UPnPError></detail></s:Fault></s:Body></s:Envelope>"#,
             r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" xmlns:u="urn:schemas-upnp-org:control-1-0"><s:Body><s:Fault><detail><u:UPnPError><u:errorCode>7&bad;5</u:errorCode></u:UPnPError></detail></s:Fault></s:Body></s:Envelope>"#,
             r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" xmlns:u="urn:schemas-upnp-org:control-1-0"><s:Body><s:Fault><detail><u:UPnPError><u:errorCode>7<x/>25</u:errorCode></u:UPnPError></detail></s:Fault></s:Body></s:Envelope>"#,
+            r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" xmlns:u="urn:schemas-upnp-org:control-1-0"><s:Body><s:Fault><detail><u:UPnPError><u:errorCode>718</u:errorCode ></u:UPnPError></detail></s:Fault></s:Body></s:Envelope>"#,
+            r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" xmlns:u="urn:schemas-upnp-org:control-1-0"><s:Body><s:Fault><detail><u:UPnPError><?xml version="1.0"?><u:errorCode>718</u:errorCode></u:UPnPError></detail></s:Fault></s:Body></s:Envelope>"#,
+            r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" xmlns:u="urn:schemas-upnp-org:control-1-0"><s:Body><s:Fault><detail><u:UPnPError><marker/ ><u:errorCode>718</u:errorCode></u:UPnPError></detail></s:Fault></s:Body></s:Envelope>"#,
+            r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" xmlns:u="urn:schemas-upnp-org:control-1-0"><s:Body><s:Fault><detail>]]><u:UPnPError><u:errorCode>718</u:errorCode></u:UPnPError></detail></s:Fault></s:Body></s:Envelope>"#,
         ] {
             assert_eq!(soap_fault_code(invalid), None, "accepted {invalid}");
         }

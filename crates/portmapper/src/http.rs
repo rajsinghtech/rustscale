@@ -82,14 +82,14 @@ async fn do_request(
     .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timeout"))??;
     stream.write_all(req.as_bytes()).await?;
     let mut buf = Vec::with_capacity(4096);
-    let mut limited = stream.take(MAX_BODY as u64);
+    let mut limited = stream.take((MAX_BODY + 1) as u64);
     timeout(deadline, limited.read_to_end(&mut buf))
         .await
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "read timeout"))??;
     if buf.len() > MAX_BODY {
         return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "response too large",
+            std::io::ErrorKind::FileTooLarge,
+            "HTTP response exceeds size limit",
         ));
     }
     Ok(buf)
@@ -166,8 +166,17 @@ fn split_response(raw: &[u8]) -> Result<(u16, Vec<u8>), std::io::Error> {
         }
     }
     let body = raw[header_end + 4..].to_vec();
+    if body.len() > MAX_BODY {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::FileTooLarge,
+            "HTTP response body exceeds size limit",
+        ));
+    }
     if content_length.is_some_and(|length| length != body.len()) {
         return Err(invalid("Content-Length mismatch"));
+    }
+    if ((100..200).contains(&status) || matches!(status, 204 | 304)) && !body.is_empty() {
+        return Err(invalid("HTTP status forbids a response body"));
     }
     Ok((status, body))
 }
@@ -227,6 +236,56 @@ mod tests {
         let (status, body) = split_response(raw).unwrap();
         assert_eq!(status, 200);
         assert_eq!(&body, b"hello");
+    }
+
+    #[tokio::test]
+    async fn reader_detects_oversized_close_framed_response() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).await;
+            let mut response = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n<s:Envelope>".to_vec();
+            response.resize(MAX_BODY + 1, b'x');
+            stream.write_all(&response).await.unwrap();
+        });
+        let error = http_post_soap(
+            &format!("http://{address}/control"),
+            "urn:test#AddPortMapping",
+            "text/xml",
+            "<request/>",
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::FileTooLarge);
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn split_response_enforces_body_framing_and_limits() {
+        let visible_fault_prefix = b"<s:Envelope><s:Body><s:Fault>";
+        let mut oversized = b"HTTP/1.1 200 OK\r\n\r\n".to_vec();
+        oversized.extend_from_slice(visible_fault_prefix);
+        oversized.resize(oversized.len() + MAX_BODY, b'x');
+        assert_eq!(
+            split_response(&oversized).unwrap_err().kind(),
+            std::io::ErrorKind::FileTooLarge
+        );
+
+        assert!(split_response(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhell").is_err());
+        assert!(
+            split_response(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello-trailing").is_err()
+        );
+        for raw in [
+            &b"HTTP/1.1 100 Continue\r\n\r\nx"[..],
+            &b"HTTP/1.1 204 No Content\r\n\r\nx"[..],
+            &b"HTTP/1.1 304 Not Modified\r\nContent-Length: 1\r\n\r\nx"[..],
+        ] {
+            assert!(split_response(raw).is_err(), "accepted {raw:?}");
+        }
+        assert!(split_response(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n").is_ok());
     }
 
     #[test]

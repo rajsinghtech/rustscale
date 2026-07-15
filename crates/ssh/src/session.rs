@@ -226,7 +226,7 @@ impl AsyncWrite for Session {
         let data = buf.to_vec();
         let waker = cx.waker().clone();
         tokio::spawn(async move {
-            let _ = handle.data(channel_id, russh::CryptoVec::from(data)).await;
+            let _ = handle.data(channel_id, data).await;
             waker.wake();
         });
         std::task::Poll::Pending

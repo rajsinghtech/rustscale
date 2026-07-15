@@ -55,8 +55,10 @@ ed25519-dalek.workspace = true
 sha2.workspace = true
 base64.workspace = true
 chrono.workspace = true
-russh = "0.50"
-russh-keys = "0.50.0-beta.7"
+# RustScale derives Ed25519 host keys, and Tailscale SSH authenticates tailnet
+# identities rather than RSA user keys. RSA-only clients are intentionally not
+# supported, so keep russh's optional RSA stack disabled.
+russh = { version = "0.62.2", default-features = false, features = ["flate2", "ring"] }
 log = "0.4"
 libc.workspace = true
 h2.workspace = true

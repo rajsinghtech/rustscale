@@ -122,33 +122,23 @@ impl SshHandler {
         let ssh_user = user.trim_end_matches("+password").to_string();
         if !ssh_user.is_empty() && ssh_user.chars().all(|c| c.is_ascii_digit()) {
             log::warn!("rejecting numeric username {ssh_user:?}");
-            return Auth::Reject {
-                proceed_with_methods: None,
-            };
+            return Auth::reject();
         }
         let peer_ip = match self.peer_addr {
             Some(addr) => addr.ip(),
-            None => {
-                return Auth::Reject {
-                    proceed_with_methods: None,
-                }
-            }
+            None => return Auth::reject(),
         };
         let (node, user_profile) = if let Some(ident) = (self.config.whois)(peer_ip) {
             ident
         } else {
             log::warn!("SSH: unknown identity from {peer_ip}");
-            return Auth::Reject {
-                proceed_with_methods: None,
-            };
+            return Auth::reject();
         };
         let policy = if let Some(p) = (self.config.policy)() {
             p
         } else {
             log::warn!("SSH: no policy configured");
-            return Auth::Reject {
-                proceed_with_methods: None,
-            };
+            return Auth::reject();
         };
         let info = ConnInfo {
             ssh_user: ssh_user.clone(),
@@ -173,9 +163,7 @@ impl SshHandler {
                 // returns `accepted`). Honour it here.
                 if action.Reject {
                     log::warn!("SSH: policy rejects connection (reject action)");
-                    return Auth::Reject {
-                        proceed_with_methods: None,
-                    };
+                    return Auth::reject();
                 }
                 self.ssh_user = ssh_user;
                 self.local_user.clone_from(local_user);
@@ -223,15 +211,11 @@ impl SshHandler {
             }
             EvalResult::RejectedUser => {
                 log::warn!("SSH: policy rejects user {ssh_user:?}");
-                Auth::Reject {
-                    proceed_with_methods: None,
-                }
+                Auth::reject()
             }
             EvalResult::Rejected | EvalResult::NoPolicy => {
                 log::warn!("SSH: policy rejects connection");
-                Auth::Reject {
-                    proceed_with_methods: None,
-                }
+                Auth::reject()
             }
         }
     }
@@ -270,7 +254,7 @@ impl SshHandler {
                 match init_recording(config, cast_header, self.config.dial_fn.clone()).await {
                     Ok(recorder) => recorder,
                     Err(message) => {
-                        let _ = session.data(channel_id, russh::CryptoVec::from(message));
+                        let _ = session.data(channel_id, message);
                         let _ = session.channel_failure(channel_id);
                         return Ok(());
                     }
@@ -332,9 +316,11 @@ impl russh::server::Handler for SshHandler {
     async fn channel_open_session(
         &mut self,
         _channel: Channel<Msg>,
+        reply: russh::server::ChannelOpenHandle,
         _session: &mut Session,
-    ) -> Result<bool, Self::Error> {
-        Ok(true)
+    ) -> Result<(), Self::Error> {
+        reply.accept().await;
+        Ok(())
     }
 
     async fn env_request(

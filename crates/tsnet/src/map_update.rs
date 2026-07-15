@@ -188,14 +188,36 @@ pub(crate) fn spawn_map_update_task(
                             "tsnet: control changed tailnet identity for the active profile; failing closed"
                         );
                         tailnet_lock.require_fresh_control_state();
+
+                        // Treat a profile/tailnet binding change as one peer-
+                        // authority revocation. Taking the writer first drains
+                        // every TUN delivery and ordinary PeerAPI side effect;
+                        // rotating Taildrive under the same gate cancels and
+                        // drains its publication epoch before any empty state
+                        // becomes observable.
+                        let map_commit = peer_map.gate.write().await;
+                        let mut drive_epoch = drive.authorization_write().await;
+                        drive.rotate_authorization_locked(&mut drive_epoch);
+                        drive.set_sharing_allowed_locked(false, &mut drive_epoch);
                         raw_peers.clear();
+                        *filter_arc.lock().unwrap() = Filter::allow_none();
                         peers_arc.write().await.clear();
                         wg_tunnels.write().await.clear();
                         route_table
                             .write()
                             .await
                             .rebuild_with_opts(&[], accept_routes);
-                        let _ = magicsock.set_netmap(Vec::new()).await;
+                        peer_map
+                            .install_locked(&[])
+                            .expect("empty peer map is valid");
+                        if let Err(error) = magicsock.set_netmap(Vec::new()).await {
+                            log::warn!(
+                                "tsnet: failed to clear magicsock after identity mismatch: {error}"
+                            );
+                        }
+                        resolver.write().await.set_peers(Vec::new());
+                        drop(drive_epoch);
+                        drop(map_commit);
                         ipn_backend.set_blocked(true);
                         break;
                     }

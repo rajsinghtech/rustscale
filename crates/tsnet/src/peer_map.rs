@@ -7,6 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -28,6 +29,7 @@ struct IdentitySnapshot {
 pub(crate) struct Runtime {
     pub(crate) gate: tokio::sync::RwLock<()>,
     identity: RwLock<Arc<IdentitySnapshot>>,
+    authorization_epoch: AtomicU64,
     flows: Mutex<HashMap<Flow, FlowIdentity>>,
 }
 
@@ -37,6 +39,7 @@ impl Runtime {
         Ok(Arc::new(Self {
             gate: tokio::sync::RwLock::new(()),
             identity: RwLock::new(Arc::new(identity)),
+            authorization_epoch: AtomicU64::new(1),
             flows: Mutex::new(HashMap::new()),
         }))
     }
@@ -45,7 +48,12 @@ impl Runtime {
         let identity = IdentitySnapshot::from_peers(peers)?;
         *self.identity.write().expect("peer identity lock poisoned") = Arc::new(identity);
         self.flows.lock().expect("peer flow lock poisoned").clear();
+        self.authorization_epoch.fetch_add(1, Ordering::AcqRel);
         Ok(())
+    }
+
+    pub(crate) fn authorization_epoch(&self) -> u64 {
+        self.authorization_epoch.load(Ordering::Acquire)
     }
 
     pub(crate) fn packet_source_matches(&self, peer: &NodePublic, packet: &[u8]) -> bool {

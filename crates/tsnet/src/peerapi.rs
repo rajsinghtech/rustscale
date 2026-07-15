@@ -547,6 +547,11 @@ struct PeerApiConn<S> {
     remote_addr: Option<SocketAddr>,
     authenticated_key: Option<NodePublic>,
     state: Arc<PeerApiState>,
+    #[cfg(test)]
+    staged_before_body: Option<(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> PeerApiConn<S> {
@@ -561,6 +566,26 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerApiConn<S> {
             remote_addr,
             authenticated_key,
             state,
+            #[cfg(test)]
+            staged_before_body: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn new_staged_for_test(
+        stream: S,
+        remote_addr: SocketAddr,
+        authenticated_key: NodePublic,
+        state: Arc<PeerApiState>,
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) -> Self {
+        Self {
+            stream,
+            remote_addr: Some(remote_addr),
+            authenticated_key: Some(authenticated_key),
+            state,
+            staged_before_body: Some((entered, release)),
         }
     }
 
@@ -591,7 +616,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerApiConn<S> {
             self.state.authenticated_whois(ip, key)
         });
 
-        let (whois, node_key, is_self) = match (&authenticated, remote_ip) {
+        let (_whois, node_key, _is_self) = match (&authenticated, remote_ip) {
             (Some((info, node_key)), _) if info.found => {
                 // Check if the peer is owned by the same user as us.
                 // We determine "is_self" by checking if the peer's user_id
@@ -659,10 +684,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerApiConn<S> {
             node_key.as_str(),
         );
 
-        let resp = if is_drive {
+        #[cfg(test)]
+        if let Some((entered, release)) = self.staged_before_body.take() {
+            let _ = entered.send(());
+            let _ = release.await;
+        }
+
+        let mut response_map_guard = None;
+        let mut resp = if is_drive {
             match authorize_drive(&req, Some(source), &self.state).await {
                 Err(response) => response,
-                Ok(mut authorized) => {
+                Ok(authorized) => {
                     let body_limit = self.state.drive.limits().max_request_body;
                     if body_length > body_limit {
                         PeerApiResponse::new(
@@ -690,8 +722,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerApiConn<S> {
                             .await
                             {
                                 Ok(Ok(body)) => {
-                                    authorized.request.body = body;
-                                    run_authorized_drive(authorized, &self.state).await
+                                    req.body = body;
+                                    match authorize_drive(&req, Some(source), &self.state).await {
+                                        Ok(authorized) => {
+                                            run_authorized_drive(authorized, &self.state).await
+                                        }
+                                        Err(response) => response,
+                                    }
                                 }
                                 Ok(Err(error)) => PeerApiResponse::new(
                                     400,
@@ -721,15 +758,39 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerApiConn<S> {
                 {
                     Ok(Ok(body)) => {
                         req.body = body;
-                        dispatch_authenticated(
-                            &req,
-                            &whois,
-                            is_self,
-                            source.0,
-                            source.1,
-                            &self.state,
-                        )
-                        .await
+                        let map_guard = self.state.peer_map.gate.read().await;
+                        let current = self.authenticated_key.as_ref().and_then(|key| {
+                            if self.state.peer_map.current_owner(source.0).as_ref() != Some(key) {
+                                return None;
+                            }
+                            self.state.authenticated_whois(source.0, key)
+                        });
+                        match current {
+                            Some((current_whois, current_node_key))
+                                if current_node_key == source.1 =>
+                            {
+                                let current_is_self = self.state.tailscale_ips.contains(&source.0);
+                                response_map_guard = Some(map_guard);
+                                dispatch_authenticated(
+                                    &req,
+                                    &current_whois,
+                                    current_is_self,
+                                    source.0,
+                                    source.1,
+                                    &self.state,
+                                )
+                                .await
+                            }
+                            _ => {
+                                response_map_guard = Some(map_guard);
+                                PeerApiResponse::new(
+                                    403,
+                                    "Forbidden",
+                                    "text/plain; charset=utf-8",
+                                    b"authenticated peer is no longer authorized".to_vec(),
+                                )
+                            }
+                        }
                     }
                     Ok(Err(error)) => PeerApiResponse::new(
                         400,
@@ -747,9 +808,40 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerApiConn<S> {
             }
         };
 
+        // Every handler re-enters the current map immediately before its
+        // response. Ordinary handlers retain this guard from dispatch through
+        // side effects and write; Taildrive uses its cancellable publication
+        // epoch for long work, then revalidates exact identity and grants here.
+        if response_map_guard.is_none() {
+            let map_guard = self.state.peer_map.gate.read().await;
+            let identity_valid = self.authenticated_key.as_ref().is_some_and(|key| {
+                self.state.peer_map.current_owner(source.0).as_ref() == Some(key)
+                    && self
+                        .state
+                        .authenticated_whois(source.0, key)
+                        .is_some_and(|(_, current_node_key)| current_node_key == source.1)
+            });
+            if !identity_valid {
+                resp = PeerApiResponse::new(
+                    403,
+                    "Forbidden",
+                    "text/plain; charset=utf-8",
+                    b"authenticated peer is no longer authorized".to_vec(),
+                );
+            } else if is_drive {
+                if let Err(response) = authorize_drive_locked(&req, Some(source), &self.state).await
+                {
+                    resp = response;
+                }
+            }
+            response_map_guard = Some(map_guard);
+        }
+
         // Bound response writes so a stalled peer cannot retain a handler or
-        // its request-scoped authorization indefinitely.
+        // its request-scoped authorization indefinitely. The map guard makes
+        // response publication part of the same revocation barrier.
         let _ = tokio::time::timeout(PEERAPI_IO_TIMEOUT, resp.write(&mut self.stream)).await;
+        drop(response_map_guard);
     }
 
     fn try_body_budget(
@@ -1179,7 +1271,14 @@ async fn dispatch_inner(
 
     // Taildrop receive: /v0/put/<filename>
     if path.starts_with("/v0/put/") {
-        let resp = handle_peer_put(req, whois, is_self, state).await;
+        let resp = handle_peer_put(
+            req,
+            whois,
+            is_self,
+            authenticated_source.map(|source| source.0),
+            state,
+        )
+        .await;
         return add_security_headers(resp, req);
     }
 
@@ -1215,6 +1314,18 @@ async fn authorize_drive(
     authenticated_source: Option<(IpAddr, &str)>,
     state: &Arc<PeerApiState>,
 ) -> Result<AuthorizedDriveRequest, PeerApiResponse> {
+    let _map = state.peer_map.gate.read().await;
+    authorize_drive_locked(req, authenticated_source, state).await
+}
+
+/// Authorize against one map snapshot. The caller holds `peer_map.gate` so
+/// key/address provenance and signed grants cannot change before authority is
+/// captured.
+async fn authorize_drive_locked(
+    req: &PeerApiRequest,
+    authenticated_source: Option<(IpAddr, &str)>,
+    state: &Arc<PeerApiState>,
+) -> Result<AuthorizedDriveRequest, PeerApiResponse> {
     let Some((remote_ip, connection_node_key)) = authenticated_source else {
         return Err(PeerApiResponse::new(
             403,
@@ -1224,7 +1335,6 @@ async fn authorize_drive(
         ));
     };
 
-    let _map = state.peer_map.gate.read().await;
     let epoch = state.drive.authorization_read().await;
     if !state.drive.sharing_allowed() || !state.drive.snapshot().enabled() {
         return Err(PeerApiResponse::new(
@@ -1615,8 +1725,9 @@ fn parse_doh_query(req: &PeerApiRequest) -> Result<Vec<u8>, String> {
 /// enabled (file-sharing cap + spool directory).
 async fn handle_peer_put(
     req: &PeerApiRequest,
-    _whois: &WhoIsInfo,
+    whois: &WhoIsInfo,
     is_self: bool,
+    authenticated_source_ip: Option<IpAddr>,
     state: &Arc<PeerApiState>,
 ) -> PeerApiResponse {
     // Must have a taildrop manager.
@@ -1629,17 +1740,36 @@ async fn handle_peer_put(
         );
     };
 
-    // Auth: same user (is_self) or file-send cap. We approximate "same
-    // user" with is_self since we don't track our own user_id in
-    // PeerApiState. Tagged peers would need the file-send cap check
-    // against the peer's CapMap; for now we allow same-user sends.
+    // Auth: self or an exact current signed `file-send` grant from this
+    // source address to one of our same-family node addresses. The connection
+    // dispatcher holds the peer-map gate across this lookup and file commit.
     if !is_self {
-        return PeerApiResponse::new(
-            403,
-            "Forbidden",
-            "text/plain; charset=utf-8",
-            b"taildrop: peer not authorized".to_vec(),
-        );
+        let source_ip =
+            authenticated_source_ip.filter(|source| whois.tailscale_ips.contains(source));
+        let destination_ip = source_ip.and_then(|source| {
+            state
+                .tailscale_ips
+                .iter()
+                .copied()
+                .find(|destination| destination.is_ipv4() == source.is_ipv4())
+        });
+        let allowed = source_ip
+            .zip(destination_ip)
+            .is_some_and(|(source, destination)| {
+                state.filter.lock().is_ok_and(|filter| {
+                    filter
+                        .caps_with_values(source, destination)
+                        .contains_key(crate::taildrop::CAP_PEER_FILE_SHARING_SEND)
+                })
+            });
+        if !allowed {
+            return PeerApiResponse::new(
+                403,
+                "Forbidden",
+                "text/plain; charset=utf-8",
+                b"taildrop: peer not authorized".to_vec(),
+            );
+        }
     }
 
     if req.method != "PUT" {
@@ -2030,6 +2160,85 @@ mod tests {
         assert_eq!(&body, b"secret");
     }
 
+    #[tokio::test]
+    async fn staged_taildrop_revalidates_current_peer_and_grant_before_commit() {
+        let source: IpAddr = "100.64.0.2".parse().unwrap();
+        let destination: IpAddr = "100.64.0.1".parse().unwrap();
+        let key = rustscale_key::NodePrivate::generate().public();
+        let peer = Node {
+            ID: 1,
+            Key: key.clone(),
+            Addresses: vec![format!("{source}/32")],
+            ..Default::default()
+        };
+        let mut state = make_test_state(vec![peer], vec![destination], false);
+        let temp = tempfile::tempdir().unwrap();
+        Arc::get_mut(&mut state).unwrap().taildrop = Some(Arc::new(
+            crate::taildrop::TaildropManager::new(Some(temp.path()), None),
+        ));
+        let mut cap_map = PeerCapMap::new();
+        cap_map.insert(
+            crate::taildrop::CAP_PEER_FILE_SHARING_SEND.into(),
+            Vec::new(),
+        );
+        *state.filter.lock().unwrap() = Filter::new(
+            &[FilterRule {
+                SrcIPs: vec![source.to_string()],
+                CapGrant: vec![CapGrant {
+                    Dsts: vec![destination.to_string()],
+                    CapMap: cap_map,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            &[destination],
+            &BTreeMap::new(),
+        )
+        .unwrap();
+
+        let (mut client, server) = tokio::io::duplex(4096);
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let connection = PeerApiConn::new_staged_for_test(
+            server,
+            SocketAddr::new(source, 12345),
+            key,
+            state.clone(),
+            entered_tx,
+            release_rx,
+        );
+        let task = tokio::spawn(connection.serve());
+        client
+            .write_all(b"PUT /v0/put/staged.txt HTTP/1.1\r\nContent-Length: 6\r\n\r\nsecret")
+            .await
+            .unwrap();
+        entered_rx.await.expect("request reached pre-body stage");
+
+        // This is the same lock order and authority withdrawal used by the
+        // tailnet-identity mismatch transaction.
+        let map_commit = state.peer_map.gate.write().await;
+        let mut drive_epoch = state.drive.authorization_write().await;
+        state.drive.rotate_authorization_locked(&mut drive_epoch);
+        state
+            .drive
+            .set_sharing_allowed_locked(false, &mut drive_epoch);
+        *state.filter.lock().unwrap() = Filter::allow_none();
+        state.peers.write().await.clear();
+        state.peer_map.install_locked(&[]).unwrap();
+        drop(drive_epoch);
+        drop(map_commit);
+        let _ = release_tx.send(());
+
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        task.await.unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 403 Forbidden\r\n"));
+        assert!(
+            !temp.path().join("files/staged.txt").exists(),
+            "staged Taildrop request published after peer revocation"
+        );
+    }
+
     #[test]
     fn global_body_budget_bounds_parallel_max_sized_requests() {
         const MAX_BODY: u32 = 16 * 1024 * 1024;
@@ -2174,6 +2383,70 @@ mod tests {
                 .status,
             200
         );
+    }
+
+    #[tokio::test]
+    async fn identity_mismatch_cancels_staged_taildrive_mutation_atomically() {
+        let (state, temp, src, node_key) =
+            enabled_taildrive_state(Some(r#"{"shares":["docs"],"access":"rw"}"#)).await;
+        let request = PeerApiRequest {
+            method: "PUT".into(),
+            path: "/v0/drive/docs/staged.txt".into(),
+            headers: vec![],
+            body: vec![],
+        };
+        let authorized = match authorize_drive(&request, Some((src, &node_key)), &state).await {
+            Ok(authorized) => authorized,
+            Err(response) => panic!(
+                "initial signed authorization failed with status {}",
+                response.status
+            ),
+        };
+        let AuthorizedDriveRequest {
+            peer,
+            request,
+            authority,
+        } = authorized;
+        let control = RequestControl::new(
+            authority,
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        );
+        let (body_tx, body) = rustscale_drive::streaming_body_channel(6, 1);
+        let worker_drive = state.drive.clone();
+        let worker = tokio::task::spawn_blocking(move || {
+            worker_drive.handle_streaming_put(&peer, request, body, &control)
+        });
+        body_tx.send(b"sec".to_vec()).await.unwrap();
+        tokio::task::yield_now().await;
+
+        // Tailnet identity mismatch is a single map-writer transaction: no
+        // ordinary PeerAPI reader can remain, and Taildrive's old publication
+        // epoch is revoked before empty identity/filter state is installed.
+        let map_commit = state.peer_map.gate.write().await;
+        let mut drive_epoch = state.drive.authorization_write().await;
+        state.drive.rotate_authorization_locked(&mut drive_epoch);
+        state
+            .drive
+            .set_sharing_allowed_locked(false, &mut drive_epoch);
+        *state.filter.lock().unwrap() = Filter::allow_none();
+        state.peers.write().await.clear();
+        state.peer_map.install_locked(&[]).unwrap();
+        drop(drive_epoch);
+        drop(map_commit);
+
+        let _ = body_tx.send(b"ret".to_vec()).await;
+        drop(body_tx);
+        let response = worker.await.unwrap();
+        assert!(
+            response.status >= 400,
+            "revoked mutation unexpectedly succeeded"
+        );
+        assert!(
+            !temp.path().join("staged.txt").exists(),
+            "identity mismatch allowed Taildrive publication"
+        );
+        assert!(state.peer_map.current_owner(src).is_none());
+        assert!(!state.drive.sharing_allowed());
     }
 
     #[cfg(unix)]

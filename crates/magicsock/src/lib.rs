@@ -2215,8 +2215,29 @@ fn spawn_recv_tasks(
         let udp = udp.clone();
         let inner = inner.clone();
         tokio::spawn(async move {
-            // UDP GRO remains opt-in after a live direct-path regression. The
-            // stable 128-slot recvmmsg path is still the default.
+            // Keep the known-good scalar receiver as the release default while
+            // the bounded batch handoff remains available for public testing.
+            // Sample the opt-in once so the hot path never reads the process
+            // environment.
+            if std::env::var_os("RUSTSCALE_ENABLE_LINUX_UDP_BATCH").is_none() {
+                let mut buf = vec![0u8; 65_536];
+                loop {
+                    match udp.recv_from(&mut buf).await {
+                        Ok((len, addr)) => {
+                            inner.record_udp_rx(addr, len);
+                            inner.handle_udp_packet(&buf[..len], addr).await;
+                            while let Ok((len2, addr2)) = udp.try_recv_from(&mut buf) {
+                                inner.record_udp_rx(addr2, len2);
+                                inner.handle_udp_packet(&buf[..len2], addr2).await;
+                            }
+                        }
+                        Err(_) => return,
+                    }
+                }
+            }
+
+            // Within the batch receiver, UDP GRO is a separate opt-in; the
+            // 128-slot plain recvmmsg path is used otherwise.
             let disable_udp_gro = std::env::var_os("RUSTSCALE_ENABLE_UDP_GRO").is_none();
             let mut batch = udp_batch::ReceiveBatch::new(&udp, disable_udp_gro);
             // `pending` only stages ownership; pooled ciphertext ownership moves

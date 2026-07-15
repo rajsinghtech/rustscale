@@ -222,6 +222,7 @@ pub fn create(config: &TunConfig) -> Result<TunDevice, TunError> {
 /// Clearing first is important: [`Vec::reserve`] guarantees capacity relative
 /// to the current length, so after this call `packet.capacity() >= read_len`
 /// regardless of its previous length and capacity.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 pub(crate) fn prepare_read_buffer(packet: &mut Vec<u8>, read_len: usize) {
     packet.clear();
     packet.reserve(read_len);

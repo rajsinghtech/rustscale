@@ -7,11 +7,9 @@
 
 #![forbid(unsafe_code)]
 
-use std::{
-    fmt,
-    net::IpAddr,
-    process::{Command, Stdio},
-};
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+use std::process::{Command, Stdio};
+use std::{fmt, net::IpAddr};
 
 use rustscale_tsaddr::IpPrefix;
 
@@ -171,6 +169,7 @@ pub enum RouterError {
 }
 
 impl RouterError {
+    #[cfg(any(target_os = "macos", target_os = "linux", test))]
     fn non_fatal(&self) -> bool {
         let Self::Command {
             program,
@@ -257,13 +256,16 @@ pub trait Router: Send + Sync {
     fn close(&mut self) -> Result<(), RouterError>;
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 trait CommandRunner: Send + Sync {
     fn run(&mut self, program: &str, args: &[String]) -> Result<(), RouterError>;
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 #[derive(Default)]
 struct SystemCommandRunner;
 
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 impl CommandRunner for SystemCommandRunner {
     fn run(&mut self, program: &str, args: &[String]) -> Result<(), RouterError> {
         let output = Command::new(program)
@@ -285,8 +287,10 @@ impl CommandRunner for SystemCommandRunner {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 type CommandSpec = (String, Vec<String>);
 
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 trait Platform: Send + Sync {
     fn commands(&self, operation: &RouterOperation) -> Vec<CommandSpec>;
 
@@ -296,6 +300,7 @@ trait Platform: Send + Sync {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 struct StatefulRouter<P, R> {
     platform: P,
     runner: R,
@@ -303,6 +308,7 @@ struct StatefulRouter<P, R> {
     is_up: bool,
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 impl<P: Platform, R: CommandRunner> StatefulRouter<P, R> {
     fn new(platform: P, runner: R) -> Self {
         Self {
@@ -344,6 +350,7 @@ impl<P: Platform, R: CommandRunner> StatefulRouter<P, R> {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 impl<P: Platform, R: CommandRunner> Router for StatefulRouter<P, R> {
     fn up(&mut self) -> Result<(), RouterError> {
         if self.is_up {

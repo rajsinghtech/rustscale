@@ -94,6 +94,7 @@ fn recording_connect_failed(
 }
 
 /// Extended data type code for stderr (RFC 4254 section 5.2).
+#[cfg(unix)]
 const EXTENDED_DATA_STDERR: u32 = 1;
 
 /// Default PATH when the SSH client doesn't provide one.

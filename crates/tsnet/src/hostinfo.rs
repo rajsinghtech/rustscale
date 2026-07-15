@@ -385,8 +385,8 @@ pub(crate) fn wol_macs() -> Vec<String> {
         .map(|interface| WolInterface {
             is_up: interface.meta.is_up,
             is_loopback: interface.meta.is_loopback,
-            is_running: interface.meta.flags & libc::IFF_RUNNING as u32 != 0,
-            has_broadcast: interface.meta.flags & libc::IFF_BROADCAST as u32 != 0,
+            is_running: interface_is_running(interface.meta.flags),
+            has_broadcast: interface_has_broadcast(interface.meta.flags),
             mac: interface.meta.hw_addr,
         })
         .collect::<Vec<_>>();
@@ -394,6 +394,26 @@ pub(crate) fn wol_macs() -> Vec<String> {
         rustscale_envknob::string("TS_WAKE_MAC").as_deref(),
         &interfaces,
     )
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn interface_is_running(flags: u32) -> bool {
+    flags & libc::IFF_RUNNING as u32 != 0
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn interface_is_running(_flags: u32) -> bool {
+    false
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn interface_has_broadcast(flags: u32) -> bool {
+    flags & libc::IFF_BROADCAST as u32 != 0
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn interface_has_broadcast(_flags: u32) -> bool {
+    false
 }
 
 fn parse_mac(value: &str) -> Option<[u8; 6]> {

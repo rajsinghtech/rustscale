@@ -367,6 +367,7 @@ impl BirdClient {
 
     /// Return an unsupported-platform error for Unix sockets on non-Unix hosts.
     #[cfg(not(unix))]
+    #[allow(clippy::unused_async)]
     pub async fn with_timeout(
         _socket: impl AsRef<Path>,
         _operation_timeout: Duration,

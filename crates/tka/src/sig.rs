@@ -39,7 +39,7 @@ impl SigKind {
         self as u8
     }
 
-    fn from_u8(v: u8) -> Option<Self> {
+    fn from_u64(v: u64) -> Option<Self> {
         match v {
             0 => Some(Self::Invalid),
             1 => Some(Self::Direct),
@@ -173,7 +173,7 @@ impl NodeKeySignature {
                     let n = expect_uint(v)?;
                     set_unique(
                         &mut sig_kind,
-                        SigKind::from_u8(n as u8).ok_or(DecodeError::InvalidSigKind(n))?,
+                        SigKind::from_u64(n).ok_or(DecodeError::InvalidSigKind(n))?,
                     )?;
                 }
                 2 => set_unique(&mut pubkey, expect_bytes(v)?)?,
@@ -305,17 +305,15 @@ impl NodeKeySignature {
                     .verify(&sig_hash, &sig)
                     .map_err(|_| VerifyError::SignatureFailed)?;
 
-                // Recurse into the nested signature.
-                let nested_pubkey = nested.pubkey.as_deref().ok_or(VerifyError::MissingPubkey)?;
-                let nested_result =
-                    nested.verify_inner(nested_pubkey, verification_key, depth + 1)?;
-
-                // Collect previous node keys from the chain.
-                let mut prev_node_keys = vec![nested_pubkey.to_vec()];
-                if let Some(details) = nested_result {
-                    prev_node_keys.extend(details.prev_node_keys);
-                }
-                Ok(Some(RotationDetails { prev_node_keys }))
+                // Credential signatures certify the wrapping key rather than
+                // a node key, so they intentionally have no pubkey field.
+                let nested_pubkey = if nested.sig_kind == SigKind::Credential {
+                    &[][..]
+                } else {
+                    nested.pubkey.as_deref().ok_or(VerifyError::MissingPubkey)?
+                };
+                nested.verify_inner(nested_pubkey, verification_key, depth + 1)?;
+                Ok(Some(self.rotation_details()))
             }
             SigKind::Invalid => Err(VerifyError::InvalidSigKind),
         }
@@ -329,8 +327,33 @@ impl NodeKeySignature {
 /// Details extracted from a verified SigRotation chain.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RotationDetails {
-    /// Previous node keys that were rotated away (oldest last).
+    /// Previous node keys that were rotated away (newest first).
     pub prev_node_keys: Vec<Vec<u8>>,
+    /// The first non-rotation signature that established the chain.
+    pub initial_sig: Option<Box<NodeKeySignature>>,
+}
+
+impl NodeKeySignature {
+    fn rotation_details(&self) -> RotationDetails {
+        let mut details = RotationDetails {
+            prev_node_keys: Vec::new(),
+            initial_sig: None,
+        };
+        let mut nested = self.nested.as_deref();
+        while let Some(signature) = nested {
+            if let Some(pubkey) = &signature.pubkey {
+                if !pubkey.is_empty() {
+                    details.prev_node_keys.push(pubkey.clone());
+                }
+            }
+            if signature.sig_kind != SigKind::Rotation {
+                details.initial_sig = Some(Box::new(signature.clone()));
+                break;
+            }
+            nested = signature.nested.as_deref();
+        }
+        details
+    }
 }
 
 /// Maximum rotation chain depth (15 prev keys, to stay under CBOR nesting limit of 16).
@@ -615,6 +638,7 @@ mod tests {
         assert!(result.is_ok(), "{result:?}");
         let details = result.unwrap().unwrap();
         assert_eq!(details.prev_node_keys, vec![old_node_key.clone()]);
+        assert_eq!(details.initial_sig.as_deref(), outer.nested.as_deref());
     }
 
     #[test]
@@ -678,6 +702,70 @@ mod tests {
         let result = sig.verify_signature(&[0u8; 32], &tka_vk.to_bytes());
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(result.unwrap(), None);
+    }
+
+    #[test]
+    fn verify_wrapped_credential_and_rotation_details() {
+        let authority_key = make_signing_key(0x03);
+        let authority_public = authority_key.verifying_key();
+        let delegated_key = make_signing_key(0x04);
+        let node_key = vec![0x55; 32];
+
+        let mut credential = NodeKeySignature {
+            sig_kind: SigKind::Credential,
+            pubkey: None,
+            key_id: Some(authority_public.to_bytes().to_vec()),
+            signature: None,
+            nested: None,
+            wrapping_pubkey: Some(delegated_key.verifying_key().to_bytes().to_vec()),
+        };
+        credential.signature = Some(
+            authority_key
+                .sign(&credential.sig_hash())
+                .to_bytes()
+                .to_vec(),
+        );
+
+        let mut wrapped = NodeKeySignature {
+            sig_kind: SigKind::Rotation,
+            pubkey: Some(node_key.clone()),
+            key_id: None,
+            signature: None,
+            nested: Some(Box::new(credential.clone())),
+            wrapping_pubkey: None,
+        };
+        wrapped.signature = Some(delegated_key.sign(&wrapped.sig_hash()).to_bytes().to_vec());
+
+        let details = wrapped
+            .verify_signature(&node_key, &authority_public.to_bytes())
+            .unwrap()
+            .unwrap();
+        assert!(details.prev_node_keys.is_empty());
+        assert_eq!(details.initial_sig.as_deref(), Some(&credential));
+
+        let mut bad_inner = wrapped.clone();
+        bad_inner
+            .nested
+            .as_mut()
+            .unwrap()
+            .signature
+            .as_mut()
+            .unwrap()[0] ^= 1;
+        assert_eq!(
+            bad_inner.verify_signature(&node_key, &authority_public.to_bytes()),
+            Err(VerifyError::SignatureFailed)
+        );
+
+        let mut bad_outer = wrapped.clone();
+        bad_outer.signature.as_mut().unwrap()[0] ^= 1;
+        assert_eq!(
+            bad_outer.verify_signature(&node_key, &authority_public.to_bytes()),
+            Err(VerifyError::SignatureFailed)
+        );
+        assert_eq!(
+            wrapped.verify_signature(&[0x99; 32], &authority_public.to_bytes()),
+            Err(VerifyError::PubkeyMismatch)
+        );
     }
 
     #[test]

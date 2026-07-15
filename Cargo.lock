@@ -3481,7 +3481,10 @@ dependencies = [
  "data-encoding",
  "ed25519-dalek 2.2.0",
  "rand 0.8.7",
+ "rustix",
+ "rustscale-atomicfile",
  "serde",
+ "tempfile",
  "thiserror 1.0.69",
 ]
 

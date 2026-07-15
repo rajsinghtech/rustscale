@@ -36,6 +36,109 @@ pub struct State {
 }
 
 impl State {
+    /// Return a trusted key by its key ID.
+    pub fn key(&self, key_id: &[u8]) -> Option<&Key> {
+        self.keys
+            .iter()
+            .find(|key| key.id().is_ok_and(|id| id == key_id))
+    }
+
+    /// Validate a state embedded in a checkpoint AUM.
+    pub fn validate_checkpoint(&self) -> Result<(), String> {
+        if self.last_aum_hash.is_some() {
+            return Err("checkpoint state cannot specify a last AUM hash".into());
+        }
+        if self.disablement_values.is_empty() || self.disablement_values.len() > 32 {
+            return Err("checkpoint must contain 1..=32 disablement values".into());
+        }
+        for (index, value) in self.disablement_values.iter().enumerate() {
+            if value.len() != 32 {
+                return Err(format!(
+                    "disablement value {index} has length {}, want 32",
+                    value.len()
+                ));
+            }
+            if self.disablement_values[..index].contains(value) {
+                return Err(format!("disablement value {index} is duplicated"));
+            }
+        }
+        if self.keys.is_empty() || self.keys.len() > 512 {
+            return Err("checkpoint must contain 1..=512 keys".into());
+        }
+        for (index, key) in self.keys.iter().enumerate() {
+            key.validate()
+                .map_err(|error| format!("key {index}: {error}"))?;
+            let id = key.id()?;
+            if self.keys[..index]
+                .iter()
+                .any(|other| other.id().is_ok_and(|other_id| other_id == id))
+            {
+                return Err(format!("key {index} is duplicated"));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn with_last_aum(mut self, aum: &crate::aum::Aum) -> Self {
+        self.last_aum_hash = Some(aum.hash().0.to_vec());
+        self
+    }
+
+    pub(crate) fn apply_verified(&self, update: &crate::aum::Aum) -> Result<Self, String> {
+        if let Some(last) = &self.last_aum_hash {
+            if update.prev_aum_hash.as_deref() != Some(last.as_slice()) {
+                return Err("parent AUM hash mismatch".into());
+            }
+        }
+
+        let mut out = self.clone();
+        match update.message_kind {
+            crate::aum::AumKind::NoOp => {}
+            crate::aum::AumKind::Checkpoint => {
+                let checkpoint = update.state.as_ref().ok_or("missing checkpoint state")?;
+                if checkpoint.state_id1 != self.state_id1 || checkpoint.state_id2 != self.state_id2
+                {
+                    return Err("checkpoint state has incorrect state IDs".into());
+                }
+                out = checkpoint.clone();
+            }
+            crate::aum::AumKind::AddKey => {
+                let key = update.key.as_ref().ok_or("missing key")?;
+                if self.key(key.id()?).is_some() {
+                    return Err("key already exists".into());
+                }
+                out.keys.push(key.clone());
+            }
+            crate::aum::AumKind::RemoveKey => {
+                let key_id = update.key_id.as_deref().ok_or("missing key ID")?;
+                let index = out
+                    .keys
+                    .iter()
+                    .position(|key| key.id().is_ok_and(|id| id == key_id))
+                    .ok_or("key not found")?;
+                out.keys.remove(index);
+            }
+            crate::aum::AumKind::UpdateKey => {
+                let key_id = update.key_id.as_deref().ok_or("missing key ID")?;
+                let key = out
+                    .keys
+                    .iter_mut()
+                    .find(|key| key.id().is_ok_and(|id| id == key_id))
+                    .ok_or("key not found")?;
+                if let Some(votes) = update.votes {
+                    key.votes = votes;
+                }
+                if let Some(meta) = &update.meta {
+                    key.meta = Some(meta.clone());
+                }
+                key.validate()
+                    .map_err(|error| format!("updated key is invalid: {error}"))?;
+            }
+            crate::aum::AumKind::Invalid => return Err("invalid AUM kind".into()),
+        }
+        Ok(out.with_last_aum(update))
+    }
+
     /// Encode to CTAP2 canonical CBOR bytes.
     pub fn encode(&self) -> Vec<u8> {
         encode_value(&self.to_value())

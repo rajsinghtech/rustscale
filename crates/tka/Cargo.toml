@@ -17,6 +17,11 @@ blake2.workspace = true
 ed25519-dalek.workspace = true
 argon2.workspace = true
 data-encoding.workspace = true
+rustscale-atomicfile = { path = "../atomicfile", version = "0.1.1" }
 
 [dev-dependencies]
 rand.workspace = true
+tempfile = "3"
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs"] }

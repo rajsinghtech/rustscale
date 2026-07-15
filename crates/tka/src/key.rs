@@ -36,7 +36,7 @@ impl KeyKind {
         self as u8
     }
 
-    fn from_u8(v: u8) -> Option<Self> {
+    fn from_u64(v: u64) -> Option<Self> {
         match v {
             0 => Some(Self::Invalid),
             1 => Some(Self::Key25519),
@@ -59,6 +59,38 @@ pub struct Key {
 }
 
 impl Key {
+    /// Return the key ID. Key25519 IDs are their 32-byte public keys.
+    pub fn id(&self) -> Result<&[u8], String> {
+        match self.kind {
+            KeyKind::Key25519 => Ok(&self.public),
+            KeyKind::Invalid => Err("invalid key kind".into()),
+        }
+    }
+
+    /// Validate key material and resource bounds.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.kind != KeyKind::Key25519 {
+            return Err("unrecognized key kind".into());
+        }
+        if self.public.len() != 32 {
+            return Err(format!(
+                "ed25519 public key has length {}, want 32",
+                self.public.len()
+            ));
+        }
+        if self.votes == 0 || self.votes > 4096 {
+            return Err(format!("key votes {} outside 1..=4096", self.votes));
+        }
+        let meta_bytes = self
+            .meta
+            .as_ref()
+            .map_or(0, |meta| meta.iter().map(|(k, v)| k.len() + v.len()).sum());
+        if meta_bytes > 512 {
+            return Err(format!("key metadata too large ({meta_bytes} > 512)"));
+        }
+        Ok(())
+    }
+
     /// Encode to CTAP2 canonical CBOR bytes.
     pub fn encode(&self) -> Vec<u8> {
         encode_value(&self.to_value())
@@ -82,10 +114,11 @@ impl Key {
 
         if let Some(meta) = &self.meta {
             if !meta.is_empty() {
-                let entries: Vec<(Value, Value)> = meta
+                let mut entries: Vec<(Value, Value)> = meta
                     .iter()
                     .map(|(k, v)| (Value::Text(k.clone()), Value::Text(v.clone())))
                     .collect();
+                entries.sort_by(|left, right| canonical_key_cmp(&left.0, &right.0));
                 map.push((Value::Integer(12.into()), Value::Map(entries)));
             }
         }
@@ -107,7 +140,7 @@ impl Key {
                     let n = expect_uint(v)?;
                     set_unique(
                         &mut kind,
-                        KeyKind::from_u8(n as u8).ok_or(DecodeError::InvalidKeyKind(n))?,
+                        KeyKind::from_u64(n).ok_or(DecodeError::InvalidKeyKind(n))?,
                     )?;
                 }
                 2 => set_unique(&mut votes, expect_uint(v)?)?,
@@ -172,6 +205,23 @@ mod tests {
         let enc = key.encode();
         let dec = Key::decode(&enc).unwrap();
         assert_eq!(key, dec);
+    }
+
+    #[test]
+    fn key_metadata_uses_ctap2_encoded_key_order() {
+        let key = Key {
+            kind: KeyKind::Key25519,
+            votes: 1,
+            public: vec![0; 32],
+            meta: Some(BTreeMap::from([
+                ("aa".into(), "2".into()),
+                ("z".into(), "1".into()),
+            ])),
+        };
+        let expected = data_encoding::HEXLOWER
+            .decode(b"a40101020103582000000000000000000000000000000000000000000000000000000000000000000ca2617a61316261616132")
+            .unwrap();
+        assert_eq!(key.encode(), expected);
     }
 
     #[test]

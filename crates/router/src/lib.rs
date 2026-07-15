@@ -521,7 +521,7 @@ impl LinuxPlatform {
         ("ip".into(), args)
     }
 
-    fn policy_rules(&self, add: bool) -> Vec<(String, Vec<String>)> {
+    fn policy_rules(add: bool) -> Vec<(String, Vec<String>)> {
         let verb = if add { "add" } else { "del" };
         let rules = [
             (5210, Some("main")),
@@ -578,7 +578,7 @@ impl Platform for LinuxPlatform {
                         "down".into(),
                     ],
                 )];
-                commands.extend(self.policy_rules(false));
+                commands.extend(Self::policy_rules(false));
                 commands
             }
             RouterOperation::AddAddr(address) => vec![("ip".into(), {
@@ -657,8 +657,8 @@ impl Platform for LinuxPlatform {
         // priorities first, then add the current rules. The unmarked deletes
         // also remove stale fwmark variants after a crash or an upgrade.
         vec![
-            self.policy_rules(false),
-            self.policy_rules(true),
+            Self::policy_rules(false),
+            Self::policy_rules(true),
             vec![(
                 "ip".into(),
                 vec![
@@ -1095,8 +1095,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_policy_rules_match_tailscale_base_chain() {
-        let platform = LinuxPlatform::new("tailscale0");
-        let commands = platform.policy_rules(true);
+        let commands = LinuxPlatform::policy_rules(true);
         assert_eq!(
             &commands[..],
             [
@@ -1211,7 +1210,7 @@ mod tests {
             ]
         );
 
-        let down = platform.policy_rules(false);
+        let down = LinuxPlatform::policy_rules(false);
         assert_eq!(
             &down[..8],
             [

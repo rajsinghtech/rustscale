@@ -378,7 +378,7 @@ impl TunDevice {
                 }
                 let error = io::Error::last_os_error();
                 match classify_write_error(&error) {
-                    WriteRetry::Immediate => continue,
+                    WriteRetry::Immediate => {}
                     WriteRetry::WaitWritable | WriteRetry::Terminal => return Err(error),
                 }
             }) {
@@ -433,7 +433,7 @@ impl TunDevice {
 
 /// Descriptor failures cannot make progress by polling a later frame.
 fn terminal_write_error(error: &io::Error) -> bool {
-    matches!(error.raw_os_error(), Some(libc::EBADF) | Some(libc::EBADFD))
+    matches!(error.raw_os_error(), Some(libc::EBADF | libc::EBADFD))
 }
 
 /// Return the allocation size for one TUN packet read.

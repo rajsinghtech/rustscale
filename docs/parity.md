@@ -107,7 +107,7 @@ real JSON).
 | Speedtest protocol | `net/speedtest/` | ⬜ |
 | Desktop integration | `ipn/desktop/` | ✅ `crates/tsnet/src/hostinfo.rs`: reads `/proc/net/unix` for .X11-unix / wayland-1 socket detection |
 | Alternative routing table | `net/art/` | ⬜ |
-| BIRD routing client | `chirp/` | ⬜ |
+| BIRD routing client | `chirp/` | ✅ `crates/chirp`: async BIRD control-socket client with response framing, protocol enable/disable, validated IPv4/IPv6 route updates, reconnects, deadlines, and hermetic partial-I/O/error tests |
 | Cloud env detection | `util/cloudenv/` | ✅ `crates/tsnet/src/hostinfo.rs`: reads DMI sysfs for AWS/GCP/DigitalOcean; Azure detection constant defined but not wired |
 
 ## Tier 3: Specialized
@@ -147,7 +147,7 @@ real JSON).
 | Logtail | ✅ `crates/logtail` upload loop (HTTP POST, zstd, backoff), `log` facade adapter with stderr mirroring/level gating, per-client disable switch, and live C2N flush; uploads are opt-in for tsnet and enabled by rustscaled — see Tier 2.5 row |
 | Watchdog | ✅ tokio-based interval task, auto-fires warning if not feed() within interval, Drop-safe |
 | Syspolicy | ⬜ |
-| BIRD routing (`chirp/`) | ⬜ |
+| BIRD routing (`chirp/`) | ✅ standalone `rustscale-chirp` client; integration into a routing deployment remains opt-in |
 | Linux ipset | ⬜ |
 | envknob | ✅ wired: `TS_NO_LOGS_NO_SUPPORT`, `TS_ALLOW_ADMIN_CONSOLE_REMOTE_UPDATE`, `TS_WAKE_MAC`, `TS_DEBUG_USE_DERP_HTTP`, `TS_DNS_FORWARD_SKIP_TCP_RETRY`, `TS_PANIC_IF_HIT_MAIN_CONTROL`; `TSNET_FORCE_LOGIN` is intentionally skipped because tsnet has no cached-Running-state auth bypass |
 | Version package | ✅ build.rs git describe --tags --long --always --dirty → RUSTSCALE_VERSION_LONG; fallback CARGO_PKG_VERSION |

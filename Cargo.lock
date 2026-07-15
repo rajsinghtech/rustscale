@@ -2758,6 +2758,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustscale-chirp"
+version = "0.1.1"
+dependencies = [
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
 name = "rustscale-cli"
 version = "0.1.1"
 dependencies = [

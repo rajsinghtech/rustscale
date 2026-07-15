@@ -233,7 +233,6 @@ impl RouteTable {
         self.exit_blocked = false;
     }
 
-    #[cfg(test)]
     pub(crate) fn exit_traffic_blocked(&self) -> bool {
         self.exit_blocked
     }

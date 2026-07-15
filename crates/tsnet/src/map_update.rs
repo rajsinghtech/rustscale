@@ -640,13 +640,13 @@ pub(crate) fn spawn_map_update_task(
                     // Taildrive publication epochs all use the TKA-verified
                     // stable-ID intersection.
                     let map_commit = peer_map.gate.write().await;
-                    if let Some(selected) = route_table.read().await.exit_node().cloned() {
-                        if let Some(replacement) =
-                            rotated_peer_key(&current_peers, &next_peers, &selected)
-                        {
-                            next_routes.set_exit_node(replacement);
-                        }
-                    }
+                    let current_exit_state = route_table.read().await.exit_route_state();
+                    restore_exit_state_for_map(
+                        &mut next_routes,
+                        current_exit_state,
+                        &current_peers,
+                        &next_peers,
+                    );
                     exit_node_selection
                         .write()
                         .await
@@ -1106,6 +1106,26 @@ async fn perform_key_rotation(
 
 /// Send a Notify with the current health warnings so frontend consumers
 /// can surface health state changes. Mirrors Go's `LocalBackend.sendHealthNotify`.
+fn restore_exit_state_for_map(
+    routes: &mut RouteTable,
+    state: crate::routing::ExitRouteState,
+    current_peers: &[Node],
+    next_peers: &[Node],
+) {
+    routes.restore_exit_route_state(state);
+    let Some(selected) = routes.exit_node().cloned() else {
+        return;
+    };
+    let Some(replacement) = rotated_peer_key(current_peers, next_peers, &selected) else {
+        return;
+    };
+    let was_blocked = routes.exit_traffic_blocked();
+    routes.set_exit_node(replacement);
+    if was_blocked {
+        routes.block_exit_traffic();
+    }
+}
+
 fn rotated_peer_key(current: &[Node], next: &[Node], selected: &NodePublic) -> Option<NodePublic> {
     let stable_id = current.iter().find(|peer| &peer.Key == selected)?.ID;
     next.iter()
@@ -1426,6 +1446,37 @@ mod tests {
     }
 
     #[test]
+    fn peer_map_rebuild_preserves_blocked_exit_and_rotates_stable_peer_key() {
+        let old_key = NodePrivate::generate().public();
+        let new_key = NodePrivate::generate().public();
+        let peer = |key| Node {
+            ID: 42,
+            StableID: "stable-exit".into(),
+            Key: key,
+            Addresses: vec!["100.64.0.9/32".into()],
+            AllowedIPs: vec!["0.0.0.0/0".into(), "::/0".into()],
+            ..Default::default()
+        };
+        let current_peers = vec![peer(old_key.clone())];
+        let next_peers = vec![peer(new_key.clone())];
+        let mut current_routes = RouteTable::from_peers(&current_peers);
+        current_routes.set_exit_node(old_key);
+        current_routes.block_exit_traffic();
+        let mut next_routes = RouteTable::from_peers(&next_peers);
+
+        restore_exit_state_for_map(
+            &mut next_routes,
+            current_routes.exit_route_state(),
+            &current_peers,
+            &next_peers,
+        );
+
+        assert_eq!(next_routes.exit_node(), Some(&new_key));
+        assert!(next_routes.exit_node_requested());
+        assert!(next_routes.exit_traffic_blocked());
+    }
+
+    #[test]
     fn unresolved_persisted_exit_node_is_retried_when_peer_arrives() {
         let exit_key = NodePrivate::generate().public();
         let prefs = Prefs {
@@ -1464,7 +1515,7 @@ mod tests {
         let peer = Node {
             Key: pending_exit.clone(),
             Addresses: vec!["100.64.0.9/32".into()],
-            AllowedIPs: vec!["0.0.0.0/0".into()],
+            AllowedIPs: vec!["0.0.0.0/0".into(), "::/0".into()],
             ..Default::default()
         };
         let mut selection = ExitNodeSelection::from_prefs(&prefs);
@@ -1494,7 +1545,7 @@ mod tests {
         let peer = Node {
             Key: pending_exit,
             Addresses: vec!["100.64.0.9/32".into()],
-            AllowedIPs: vec!["0.0.0.0/0".into()],
+            AllowedIPs: vec!["0.0.0.0/0".into(), "::/0".into()],
             ..Default::default()
         };
         let mut routes = RouteTable::default();

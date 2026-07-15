@@ -1292,7 +1292,8 @@ impl Server {
         } else {
             None
         };
-        let old_prefs = inner.prefs.read().await.clone();
+        let mut prefs_guard = inner.prefs.write().await;
+        let old_prefs = prefs_guard.clone();
         let mut next_prefs = old_prefs.clone();
         masked.apply_to(&mut next_prefs);
         if let Some(policy) = &self.config.preference_policy {
@@ -1363,12 +1364,13 @@ impl Server {
                 selection.clear_pending();
             }
         }
-        *inner.prefs.write().await = next_prefs.clone();
+        *prefs_guard = next_prefs.clone();
         inner.posture_checking.store(
             next_prefs.PostureChecking,
             std::sync::atomic::Ordering::Release,
         );
         let updated = serde_json::to_value(&next_prefs).unwrap_or_default();
+        drop(prefs_guard);
 
         if masked.ShieldsUpSet {
             inner

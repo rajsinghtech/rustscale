@@ -318,7 +318,7 @@ impl ControlClient {
         }
     }
 
-    /// Set additional root CAs (DER-encoded) to trust alongside the webpki and
+    /// Set additional root CAs (DER-encoded) to trust alongside native and
     /// baked ISRG roots. Mirrors Go's `tsnet.Server.ExtraRootCAs` plumbing.
     pub fn set_extra_root_certs(&mut self, certs: Vec<Vec<u8>>) {
         self.extra_root_certs = Some(certs);

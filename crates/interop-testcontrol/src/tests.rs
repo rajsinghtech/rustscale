@@ -26,7 +26,7 @@ const POLL_TIMEOUT: Duration = Duration::from_secs(20);
 // ---------------------------------------------------------------------------
 
 /// A spawned testcontrol server process. The `url` field holds the
-/// `https://127.0.0.1:PORT` control URL printed on the first stdout line.
+/// `http://127.0.0.1:PORT` control URL printed on the first stdout line.
 struct TestControl {
     url: String,
     child: Child,
@@ -80,7 +80,7 @@ impl TestControl {
         Some(TestControl { url, child })
     }
 
-    /// The control URL (e.g. `https://127.0.0.1:12345`).
+    /// The control URL (e.g. `http://127.0.0.1:12345`).
     fn url(&self) -> &str {
         &self.url
     }
@@ -133,22 +133,32 @@ impl Drop for TestControl {
 // ---------------------------------------------------------------------------
 
 async fn reqwest_post_body(url: &str, body: &str) -> bool {
-    let (_, host, port) = parse_url(url);
+    let (scheme, host, port) = parse_url(url);
     let path = url_path(url);
-    tokio_tls_request(host, port, "POST", &path, body, true)
-        .await
-        .is_ok()
+    if scheme == "http" {
+        tokio_plain_request(host, port, "POST", &path, body)
+            .await
+            .is_ok()
+    } else {
+        tokio_tls_request(host, port, "POST", &path, body, true)
+            .await
+            .is_ok()
+    }
 }
 
 async fn reqwest_get(url: &str) -> Option<String> {
-    let (_, host, port) = parse_url(url);
+    let (scheme, host, port) = parse_url(url);
     let path = url_path(url);
-    tokio_tls_request(host, port, "GET", &path, "", true)
-        .await
-        .ok()
+    if scheme == "http" {
+        tokio_plain_request(host, port, "GET", &path, "").await.ok()
+    } else {
+        tokio_tls_request(host, port, "GET", &path, "", true)
+            .await
+            .ok()
+    }
 }
 
-/// Parse a URL into (scheme, host, port). Only handles `https://host:port/path`.
+/// Parse an HTTP(S) URL into `(scheme, host, port)`.
 fn parse_url(url: &str) -> (&str, &str, u16) {
     let scheme = if url.starts_with("https://") {
         "https"
@@ -183,8 +193,21 @@ fn url_path(url: &str) -> String {
     }
 }
 
-/// Make a TLS request to the testcontrol side-channel API. Uses an
-/// insecure TLS config (self-signed cert) matching the control client.
+/// Make a plain HTTP request to a test-only control side-channel.
+async fn tokio_plain_request(
+    host: &str,
+    port: u16,
+    method: &str,
+    path: &str,
+    body: &str,
+) -> Result<String, String> {
+    let tcp = tokio::net::TcpStream::connect((host, port))
+        .await
+        .map_err(|e| format!("tcp: {e}"))?;
+    request_over_stream(tcp, host, method, path, body).await
+}
+
+/// Make a TLS request to a testcontrol side-channel API.
 async fn tokio_tls_request(
     host: &str,
     port: u16,
@@ -193,7 +216,6 @@ async fn tokio_tls_request(
     body: &str,
     insecure: bool,
 ) -> Result<String, String> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_rustls::rustls::pki_types::ServerName;
 
     let tcp = tokio::net::TcpStream::connect((host, port))
@@ -213,10 +235,22 @@ async fn tokio_tls_request(
     let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));
     let server_name =
         ServerName::try_from(host.to_string()).map_err(|e| format!("server name: {e}"))?;
-    let mut tls = connector
+    let tls = connector
         .connect(server_name, tcp)
         .await
         .map_err(|e| format!("tls: {e}"))?;
+
+    request_over_stream(tls, host, method, path, body).await
+}
+
+async fn request_over_stream(
+    mut stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    host: &str,
+    method: &str,
+    path: &str,
+    body: &str,
+) -> Result<String, String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let content_length = body.len();
     let request = format!(
@@ -227,12 +261,14 @@ async fn tokio_tls_request(
          Connection: close\r\n\
          \r\n{body}"
     );
-    tls.write_all(request.as_bytes())
+    stream
+        .write_all(request.as_bytes())
         .await
         .map_err(|e| format!("write: {e}"))?;
 
     let mut buf = Vec::with_capacity(4096);
-    tls.read_to_end(&mut buf)
+    stream
+        .read_to_end(&mut buf)
         .await
         .map_err(|e| format!("read: {e}"))?;
 

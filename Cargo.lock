@@ -2976,6 +2976,8 @@ dependencies = [
  "h2",
  "http",
  "rand 0.8.7",
+ "rcgen",
+ "rustls",
  "rustscale-auditlog",
  "rustscale-controlknobs",
  "rustscale-dnscache",

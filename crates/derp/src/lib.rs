@@ -20,6 +20,7 @@ pub use frame::{
     PROTOCOL_VERSION,
 };
 pub use protocol::{ClientInfo, MeshKey, Received, ServerInfo};
+pub use rustscale_tlsdial::CertificatePolicy;
 pub use server::{DerpServer, DerpServerHandle};
 
 /// Errors from the DERP client.

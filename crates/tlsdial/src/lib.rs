@@ -1,7 +1,7 @@
 //! Unified outbound TLS policy for rustscale control and DERP clients.
 //!
-//! This crate is the single place that combines platform, Mozilla, optional
-//! caller-provided, and baked ISRG roots; constructs rustls client configs;
+//! This crate is the single place that combines platform, optional caller-
+//! provided, and baked ISRG fallback roots; constructs rustls client configs;
 //! applies SNI and certificate-name policy; enforces handshake timeouts; and
 //! reports certificate diagnostics. TCP dialing remains selectable between
 //! [`rustscale_tsdial`] and a caller-provided [`rustscale_dnscache::Resolver`].
@@ -34,6 +34,8 @@ pub enum ErrorClass {
     InvalidAlpn,
     /// A pinned certificate hash was malformed.
     InvalidCertificatePin,
+    /// Insecure test mode was combined with a certificate constraint.
+    InsecurePolicyConflict,
     /// DNS resolution failed before TLS started.
     Dns,
     /// The TCP or TLS transport failed for a non-certificate reason.
@@ -58,6 +60,7 @@ pub enum CertificateFailure {
     BadSignature,
     InvalidPurpose,
     PinMismatch,
+    UnexpectedCertificate,
     Other,
 }
 
@@ -90,15 +93,70 @@ pub struct VerificationDiagnostic {
 /// Certificate verification diagnostic callback.
 pub type DiagnosticHook = Arc<dyn Fn(VerificationDiagnostic) + Send + Sync>;
 
+/// Certificate identity policy, independent of the SNI sent on the wire.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum CertificatePolicy {
+    /// Verify the certificate against the SNI name and configured roots.
+    #[default]
+    ServerName,
+    /// Keep the dialed SNI but verify the certificate against this name.
+    ExpectedName(String),
+    /// Require the exact leaf DER hash and verify its SNI hostname and validity.
+    /// The exact pin is its trust anchor, matching upstream DERP pin semantics.
+    /// Additional certificates are rejected except for DERP's metadata cert.
+    PinnedLeafSha256([u8; 32]),
+}
+
+impl CertificatePolicy {
+    /// Parse a DERP `CertName`: empty uses SNI, `sha256-raw:<hex>` pins the
+    /// exact leaf, and any other value is an alternate certificate name.
+    pub fn from_derp_cert_name(cert_name: &str) -> Result<Self, Error> {
+        if cert_name.is_empty() {
+            return Ok(Self::ServerName);
+        }
+        if let Some(digest) = cert_name.strip_prefix("sha256-raw:") {
+            return parse_sha256(digest).map(Self::PinnedLeafSha256);
+        }
+        Ok(Self::ExpectedName(cert_name.to_owned()))
+    }
+
+    fn is_constrained(&self) -> bool {
+        !matches!(self, Self::ServerName)
+    }
+}
+
+/// Native-root loading diagnostic category.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RootDiagnosticKind {
+    /// The platform root loader reported an error.
+    NativeLoad,
+    /// A certificate returned by the platform loader could not be added.
+    NativeCertificate,
+}
+
+/// Non-fatal native-root loading diagnostic.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RootDiagnostic {
+    /// Root loading or parsing stage that failed.
+    pub kind: RootDiagnosticKind,
+    /// Index of the native certificate, when parsing a loaded certificate.
+    pub certificate_index: Option<usize>,
+    /// Stable, path-free summary of the failure.
+    pub message: String,
+}
+
+/// Native-root diagnostic callback.
+pub type RootDiagnosticHook = Arc<dyn Fn(RootDiagnostic) + Send + Sync>;
+
 /// Shared TLS client policy.
 #[derive(Clone)]
 pub struct Config {
     extra_roots: Vec<Vec<u8>>,
     alpn_protocols: Vec<Vec<u8>>,
-    expected_certificate_name: Option<String>,
-    expected_certificate_sha256: Option<[u8; 32]>,
+    certificate_policy: CertificatePolicy,
     handshake_timeout: Duration,
     diagnostic_hook: Option<DiagnosticHook>,
+    root_diagnostic_hook: Option<RootDiagnosticHook>,
     dangerous_insecure_for_tests: bool,
 }
 
@@ -107,13 +165,13 @@ impl fmt::Debug for Config {
         f.debug_struct("Config")
             .field("extra_root_count", &self.extra_roots.len())
             .field("alpn_protocols", &self.alpn_protocols)
-            .field("expected_certificate_name", &self.expected_certificate_name)
-            .field(
-                "has_expected_certificate_sha256",
-                &self.expected_certificate_sha256.is_some(),
-            )
+            .field("certificate_policy", &self.certificate_policy)
             .field("handshake_timeout", &self.handshake_timeout)
             .field("has_diagnostic_hook", &self.diagnostic_hook.is_some())
+            .field(
+                "has_root_diagnostic_hook",
+                &self.root_diagnostic_hook.is_some(),
+            )
             .field(
                 "dangerous_insecure_for_tests",
                 &self.dangerous_insecure_for_tests,
@@ -127,10 +185,10 @@ impl Default for Config {
         Self {
             extra_roots: Vec::new(),
             alpn_protocols: Vec::new(),
-            expected_certificate_name: None,
-            expected_certificate_sha256: None,
+            certificate_policy: CertificatePolicy::ServerName,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             diagnostic_hook: None,
+            root_diagnostic_hook: None,
             dangerous_insecure_for_tests: false,
         }
     }
@@ -153,30 +211,27 @@ impl Config {
     /// for SNI. This supports explicit domain-fronting configurations without
     /// disabling chain, validity, or hostname verification.
     pub fn with_expected_certificate_name(mut self, name: impl Into<String>) -> Self {
-        self.expected_certificate_name = Some(name.into());
+        self.certificate_policy = CertificatePolicy::ExpectedName(name.into());
         self
     }
 
-    /// Require the verified leaf certificate to have this full-DER SHA-256
-    /// digest. Normal chain, validity, and hostname verification still apply.
+    /// Require the exact leaf DER SHA-256 while still validating the SNI name
+    /// and validity period. The pin itself is the trust anchor.
     pub fn with_expected_certificate_sha256(mut self, digest: [u8; 32]) -> Self {
-        self.expected_certificate_sha256 = Some(digest);
+        self.certificate_policy = CertificatePolicy::PinnedLeafSha256(digest);
         self
     }
 
     /// Parse and require a 64-character hexadecimal full-certificate digest.
     pub fn with_expected_certificate_sha256_hex(mut self, digest: &str) -> Result<Self, Error> {
-        if digest.len() != 64 {
-            return Err(Error::InvalidCertificatePin);
-        }
-        let mut decoded = [0u8; 32];
-        for (index, chunk) in digest.as_bytes().chunks_exact(2).enumerate() {
-            let high = hex_nibble(chunk[0]).ok_or(Error::InvalidCertificatePin)?;
-            let low = hex_nibble(chunk[1]).ok_or(Error::InvalidCertificatePin)?;
-            decoded[index] = (high << 4) | low;
-        }
-        self.expected_certificate_sha256 = Some(decoded);
+        self.certificate_policy = CertificatePolicy::PinnedLeafSha256(parse_sha256(digest)?);
         Ok(self)
+    }
+
+    /// Set a typed certificate policy.
+    pub fn with_certificate_policy(mut self, policy: CertificatePolicy) -> Self {
+        self.certificate_policy = policy;
+        self
     }
 
     /// Set the TLS handshake deadline.
@@ -188,6 +243,12 @@ impl Config {
     /// Observe deterministic certificate verification diagnostics.
     pub fn with_diagnostic_hook(mut self, hook: DiagnosticHook) -> Self {
         self.diagnostic_hook = Some(hook);
+        self
+    }
+
+    /// Observe non-fatal platform root loading and parsing failures.
+    pub fn with_root_diagnostic_hook(mut self, hook: RootDiagnosticHook) -> Self {
+        self.root_diagnostic_hook = Some(hook);
         self
     }
 
@@ -214,6 +275,8 @@ pub enum Error {
     InvalidAlpn { index: usize },
     #[error("expected certificate SHA-256 must be exactly 64 hexadecimal characters")]
     InvalidCertificatePin,
+    #[error("insecure test mode cannot be combined with an expected certificate name or pin")]
+    InsecurePolicyConflict,
     #[error("DNS dial failed: {0}")]
     Dns(String),
     #[error("TCP dial failed: {0}")]
@@ -234,6 +297,7 @@ impl Error {
             Self::InvalidRoot { .. } => ErrorClass::InvalidRoot,
             Self::InvalidAlpn { .. } => ErrorClass::InvalidAlpn,
             Self::InvalidCertificatePin => ErrorClass::InvalidCertificatePin,
+            Self::InsecurePolicyConflict => ErrorClass::InsecurePolicyConflict,
             Self::Dns(_) => ErrorClass::Dns,
             Self::Dial(_) => ErrorClass::Io,
             Self::Timeout(_) => ErrorClass::Timeout,
@@ -255,14 +319,24 @@ pub fn server_name(name: &str) -> Result<ServerName<'static>, Error> {
 
 /// Build a rustls client config from the shared policy.
 pub fn client_config(options: &Config) -> Result<rustls::ClientConfig, Error> {
+    client_config_with_roots(options, &SystemRootSource)
+}
+
+fn client_config_with_roots(
+    options: &Config,
+    root_source: &dyn NativeRootSource,
+) -> Result<rustls::ClientConfig, Error> {
     ensure_ring_provider();
     for (index, protocol) in options.alpn_protocols.iter().enumerate() {
         if protocol.is_empty() || protocol.len() > u8::MAX as usize {
             return Err(Error::InvalidAlpn { index });
         }
     }
+    if options.dangerous_insecure_for_tests && options.certificate_policy.is_constrained() {
+        return Err(Error::InsecurePolicyConflict);
+    }
 
-    let roots = root_store(&options.extra_roots)?;
+    let roots = root_store(options, root_source)?;
     let provider = rustls::crypto::ring::default_provider();
     let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
         Arc::new(roots),
@@ -276,15 +350,15 @@ pub fn client_config(options: &Config) -> Result<rustls::ClientConfig, Error> {
             signatures: verifier,
         })
     } else {
-        let expected_name = options
-            .expected_certificate_name
-            .as_deref()
-            .map(server_name)
-            .transpose()?;
+        let policy = match &options.certificate_policy {
+            CertificatePolicy::ExpectedName(name) => {
+                CertificatePolicy::ExpectedName(server_name(name)?.to_str().into_owned())
+            }
+            policy => policy.clone(),
+        };
         Arc::new(DiagnosticVerifier {
             inner: verifier,
-            expected_name,
-            expected_sha256: options.expected_certificate_sha256,
+            policy,
             hook: options.diagnostic_hook.clone(),
         })
     };
@@ -352,38 +426,89 @@ fn ensure_ring_provider() {
     });
 }
 
-fn root_store(extra_roots: &[Vec<u8>]) -> Result<rustls::RootCertStore, Error> {
-    // Validate extras before passing them to bakedroots' combined store, whose
-    // historical API expects valid DER and panics on malformed caller input.
-    for (index, der) in extra_roots.iter().enumerate() {
-        let mut validation = rustls::RootCertStore::empty();
-        validation
+struct NativeRoots {
+    certs: Vec<CertificateDer<'static>>,
+    errors: Vec<String>,
+}
+
+trait NativeRootSource {
+    fn load(&self) -> NativeRoots;
+}
+
+struct SystemRootSource;
+
+impl NativeRootSource for SystemRootSource {
+    fn load(&self) -> NativeRoots {
+        let loaded = rustls_native_certs::load_native_certs();
+        NativeRoots {
+            certs: loaded.certs,
+            errors: loaded
+                .errors
+                .into_iter()
+                .map(|error| error.to_string())
+                .collect(),
+        }
+    }
+}
+
+fn root_store(
+    options: &Config,
+    source: &dyn NativeRootSource,
+) -> Result<rustls::RootCertStore, Error> {
+    let mut roots = rustls::RootCertStore::empty();
+    let native = source.load();
+    for _error in native.errors {
+        emit_root_diagnostic(
+            options,
+            RootDiagnostic {
+                kind: RootDiagnosticKind::NativeLoad,
+                certificate_index: None,
+                // Platform loader errors can contain certificate-store paths.
+                // The classified stage is actionable without exposing them.
+                message: "platform root loader reported an error".to_owned(),
+            },
+        );
+    }
+    for (index, cert) in native.certs.into_iter().enumerate() {
+        if roots.add(cert).is_err() {
+            emit_root_diagnostic(
+                options,
+                RootDiagnostic {
+                    kind: RootDiagnosticKind::NativeCertificate,
+                    certificate_index: Some(index),
+                    // Keep diagnostics stable and free of platform details.
+                    message: "platform root certificate was invalid".to_owned(),
+                },
+            );
+        }
+    }
+    for (index, der) in options.extra_roots.iter().enumerate() {
+        roots
             .add(CertificateDer::from(der.clone()))
             .map_err(|source| Error::InvalidRoot { index, source })?;
     }
-
-    // Reuse bakedroots for Mozilla + caller-provided + baked ISRG roots, then
-    // add platform roots that are not represented by the Mozilla bundle.
-    let mut roots = rustscale_bakedroots::combined_root_store(Some(extra_roots));
-    let native = rustls_native_certs::load_native_certs();
-    for cert in native.certs {
-        let _ = roots.add(cert);
-    }
+    roots
+        .roots
+        .extend(rustscale_bakedroots::get().roots.iter().cloned());
     Ok(roots)
+}
+
+fn emit_root_diagnostic(options: &Config, diagnostic: RootDiagnostic) {
+    if let Some(hook) = &options.root_diagnostic_hook {
+        hook(diagnostic);
+    }
 }
 
 struct DiagnosticVerifier {
     inner: Arc<rustls::client::WebPkiServerVerifier>,
-    expected_name: Option<ServerName<'static>>,
-    expected_sha256: Option<[u8; 32]>,
+    policy: CertificatePolicy,
     hook: Option<DiagnosticHook>,
 }
 
 impl fmt::Debug for DiagnosticVerifier {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DiagnosticVerifier")
-            .field("expected_name", &self.expected_name)
-            .field("has_expected_sha256", &self.expected_sha256.is_some())
+            .field("policy", &self.policy)
             .field("has_hook", &self.hook.is_some())
             .finish_non_exhaustive()
     }
@@ -398,29 +523,32 @@ impl ServerCertVerifier for DiagnosticVerifier {
         ocsp_response: &[u8],
         now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        let certificate_name = self.expected_name.as_ref().unwrap_or(wire_name);
-        let result = self
-            .inner
-            .verify_server_cert(
+        let expected_name = match &self.policy {
+            CertificatePolicy::ExpectedName(name) => {
+                Some(ServerName::try_from(name.as_str()).expect("certificate policy was validated"))
+            }
+            _ => None,
+        };
+        let certificate_name = expected_name.as_ref().unwrap_or(wire_name);
+        let result = match &self.policy {
+            CertificatePolicy::ServerName | CertificatePolicy::ExpectedName(_) => {
+                self.inner.verify_server_cert(
+                    end_entity,
+                    intermediates,
+                    certificate_name,
+                    ocsp_response,
+                    now,
+                )
+            }
+            CertificatePolicy::PinnedLeafSha256(expected) => verify_pinned_leaf(
                 end_entity,
                 intermediates,
-                certificate_name,
+                wire_name,
                 ocsp_response,
                 now,
-            )
-            .and_then(|verified| {
-                if self.expected_sha256.is_some_and(|expected| {
-                    let actual: [u8; 32] = Sha256::digest(end_entity.as_ref()).into();
-                    actual != expected
-                }) {
-                    Err(CertificateError::Other(rustls::OtherError(Arc::new(
-                        CertificatePinMismatch,
-                    )))
-                    .into())
-                } else {
-                    Ok(verified)
-                }
-            });
+                *expected,
+            ),
+        };
         if let Some(hook) = &self.hook {
             let failure = result.as_ref().err().and_then(certificate_failure);
             let (self_signed_issuer, block_blame) = if failure.is_some() {
@@ -537,13 +665,89 @@ fn certificate_failure(error: &rustls::Error) -> Option<CertificateFailure> {
         CertificateError::Other(error) if error.0.is::<CertificatePinMismatch>() => {
             CertificateFailure::PinMismatch
         }
+        CertificateError::Other(error) if error.0.is::<UnexpectedCertificate>() => {
+            CertificateFailure::UnexpectedCertificate
+        }
         _ => CertificateFailure::Other,
     })
+}
+
+fn verify_pinned_leaf(
+    end_entity: &CertificateDer<'_>,
+    intermediates: &[CertificateDer<'_>],
+    server_name: &ServerName<'_>,
+    _ocsp_response: &[u8],
+    now: UnixTime,
+    expected: [u8; 32],
+) -> Result<ServerCertVerified, rustls::Error> {
+    if is_derp_meta_cert(end_entity) {
+        return Err(
+            CertificateError::Other(rustls::OtherError(Arc::new(UnexpectedCertificate))).into(),
+        );
+    }
+    let actual: [u8; 32] = Sha256::digest(end_entity.as_ref()).into();
+    if actual != expected {
+        return Err(
+            CertificateError::Other(rustls::OtherError(Arc::new(CertificatePinMismatch))).into(),
+        );
+    }
+    if intermediates.iter().any(|cert| !is_derp_meta_cert(cert)) {
+        return Err(
+            CertificateError::Other(rustls::OtherError(Arc::new(UnexpectedCertificate))).into(),
+        );
+    }
+
+    // The exact pin replaces chain validation, but not certificate parsing,
+    // SNI hostname/IP-SAN matching, validity checks, or TLS handshake
+    // signature verification. DERP metadata certs are deliberately ignored.
+    let parsed = rustls::server::ParsedCertificate::try_from(end_entity)?;
+    rustls::client::verify_server_name(&parsed, server_name)?;
+    let (_, parsed) = x509_parser::parse_x509_certificate(end_entity.as_ref())
+        .map_err(|_| rustls::Error::InvalidCertificate(CertificateError::BadEncoding))?;
+    let now = i64::try_from(now.as_secs())
+        .map_err(|_| rustls::Error::InvalidCertificate(CertificateError::Expired))?;
+    if now < parsed.validity().not_before.timestamp() {
+        return Err(CertificateError::NotValidYet.into());
+    }
+    if now > parsed.validity().not_after.timestamp() {
+        return Err(CertificateError::Expired.into());
+    }
+    Ok(ServerCertVerified::assertion())
+}
+
+fn is_derp_meta_cert(cert: &CertificateDer<'_>) -> bool {
+    const COMMON_NAME_PREFIX: &str = "derpkey";
+
+    x509_parser::parse_x509_certificate(cert.as_ref())
+        .ok()
+        .is_some_and(|(_, cert)| {
+            cert.subject().iter_common_name().any(|name| {
+                name.as_str()
+                    .is_ok_and(|name| name.starts_with(COMMON_NAME_PREFIX))
+            })
+        })
 }
 
 #[derive(Debug, thiserror::Error)]
 #[error("certificate hash does not match the expected SHA-256")]
 struct CertificatePinMismatch;
+
+#[derive(Debug, thiserror::Error)]
+#[error("unexpected additional certificate presented with an exact leaf pin")]
+struct UnexpectedCertificate;
+
+fn parse_sha256(digest: &str) -> Result<[u8; 32], Error> {
+    if digest.len() != 64 {
+        return Err(Error::InvalidCertificatePin);
+    }
+    let mut decoded = [0u8; 32];
+    for (index, chunk) in digest.as_bytes().chunks_exact(2).enumerate() {
+        let high = hex_nibble(chunk[0]).ok_or(Error::InvalidCertificatePin)?;
+        let low = hex_nibble(chunk[1]).ok_or(Error::InvalidCertificatePin)?;
+        decoded[index] = (high << 4) | low;
+    }
+    Ok(decoded)
+}
 
 const fn hex_nibble(byte: u8) -> Option<u8> {
     match byte {

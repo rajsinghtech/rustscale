@@ -38,4 +38,6 @@ url = "2"
 async-trait.workspace = true
 
 [dev-dependencies]
+rcgen.workspace = true
+rustls.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

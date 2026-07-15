@@ -1058,17 +1058,25 @@ impl DerpManager {
             );
         }
 
-        let client = match DerpClient::connect_with_upgrade_dial_insecure(
-            &dial_addr,
-            &tls_host,
-            port,
-            !node.InsecureForTests,
-            node.InsecureForTests,
-            self.node_private.clone(),
-            None,
-        )
-        .await
-        {
+        let certificate_policy =
+            rustscale_derp::CertificatePolicy::from_derp_cert_name(&node.CertName);
+        let connect_result = match certificate_policy {
+            Ok(policy) => {
+                DerpClient::connect_with_upgrade_dial_policy(
+                    &dial_addr,
+                    &tls_host,
+                    port,
+                    !node.InsecureForTests,
+                    node.InsecureForTests,
+                    policy,
+                    self.node_private.clone(),
+                    None,
+                )
+                .await
+            }
+            Err(error) => Err(rustscale_derp::DerpError::Tls(error)),
+        };
+        let client = match connect_result {
             Ok(c) => c,
             Err(e) => {
                 if debug_enabled() {

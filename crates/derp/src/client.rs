@@ -5,6 +5,7 @@ use url::Url;
 
 use rustscale_key::{NodePrivate, NodePublic};
 use rustscale_limiter::Bucket;
+use rustscale_tlsdial::CertificatePolicy;
 
 use crate::frame::{self, decode_frame_header, encode_frame_header, frame_type, MAX_PACKET_SIZE};
 use crate::protocol::{parse_received, ClientInfo, Received, ServerInfo};
@@ -61,8 +62,11 @@ async fn tls_stream(
     tcp: tokio::net::TcpStream,
     tls_host: &str,
     insecure: bool,
+    certificate_policy: CertificatePolicy,
 ) -> Result<Box<dyn DerpStream>, DerpError> {
-    let options = rustscale_tlsdial::Config::default().dangerous_insecure_for_tests(insecure);
+    let options = rustscale_tlsdial::Config::default()
+        .with_certificate_policy(certificate_policy)
+        .dangerous_insecure_for_tests(insecure);
     let tls = rustscale_tlsdial::connect(tcp, tls_host, &options).await?;
     Ok(Box::new(tls))
 }
@@ -161,7 +165,7 @@ impl DerpClient {
         tcp.set_nodelay(true).ok();
 
         let stream: Box<dyn DerpStream> = if use_tls {
-            tls_stream(tcp, host, insecure).await?
+            tls_stream(tcp, host, insecure, CertificatePolicy::ServerName).await?
         } else {
             Box::new(tcp)
         };
@@ -217,6 +221,33 @@ impl DerpClient {
         private_key: NodePrivate,
         expected_server_key: Option<NodePublic>,
     ) -> Result<Self, DerpError> {
+        Self::connect_with_upgrade_dial_policy(
+            dial_addr,
+            tls_host,
+            port,
+            use_tls,
+            insecure,
+            CertificatePolicy::ServerName,
+            private_key,
+            expected_server_key,
+        )
+        .await
+    }
+
+    /// Connect with an explicit typed TLS certificate identity policy.
+    pub async fn connect_with_upgrade_dial_policy(
+        dial_addr: &str,
+        tls_host: &str,
+        port: u16,
+        use_tls: bool,
+        insecure: bool,
+        certificate_policy: CertificatePolicy,
+        private_key: NodePrivate,
+        expected_server_key: Option<NodePublic>,
+    ) -> Result<Self, DerpError> {
+        if insecure && !matches!(certificate_policy, CertificatePolicy::ServerName) {
+            return Err(rustscale_tlsdial::Error::InsecurePolicyConflict.into());
+        }
         let use_tls =
             use_tls && !rustscale_envknob::bool("TS_DEBUG_USE_DERP_HTTP").unwrap_or(false);
         // When an HTTP proxy is configured for this region (checked via the
@@ -231,7 +262,7 @@ impl DerpClient {
             tcp.set_nodelay(true).ok();
 
             let stream: Box<dyn DerpStream> = if use_tls {
-                tls_stream(tcp, tls_host, insecure).await?
+                tls_stream(tcp, tls_host, insecure, certificate_policy).await?
             } else {
                 Box::new(tcp)
             };
@@ -243,7 +274,7 @@ impl DerpClient {
         tcp.set_nodelay(true).ok();
 
         let mut stream: Box<dyn DerpStream> = if use_tls {
-            tls_stream(tcp, tls_host, insecure).await?
+            tls_stream(tcp, tls_host, insecure, certificate_policy).await?
         } else {
             Box::new(tcp)
         };
@@ -589,6 +620,26 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn insecure_mode_rejects_certificate_constraints_before_dialing() {
+        let error = DerpClient::connect_with_upgrade_dial_policy(
+            "127.0.0.1",
+            "derp.test",
+            1,
+            false,
+            true,
+            CertificatePolicy::ExpectedName("certificate.test".to_owned()),
+            NodePrivate::generate(),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            DerpError::Tls(rustscale_tlsdial::Error::InsecurePolicyConflict)
+        ));
     }
 
     #[tokio::test]

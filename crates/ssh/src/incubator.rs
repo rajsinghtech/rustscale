@@ -91,13 +91,25 @@ impl SpawnedProcess {
         let Some(pid) = self.child.id() else {
             return Err(IncubatorError::NotRunning);
         };
-        // SAFETY: kill() is safe for any pid/signal combination; it just
-        // sends a signal. We're not dereferencing any pointers.
-        let ret = unsafe { libc::kill(pid as libc::pid_t, sig) };
-        if ret == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error().into())
+        #[cfg(unix)]
+        {
+            // SAFETY: kill() is safe for any pid/signal combination; it just
+            // sends a signal. We're not dereferencing any pointers.
+            let ret = unsafe { libc::kill(pid as libc::pid_t, sig) };
+            if ret == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error().into())
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (pid, sig);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "process signals are only supported on Unix",
+            )
+            .into())
         }
     }
 

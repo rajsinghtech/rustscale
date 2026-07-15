@@ -722,9 +722,12 @@ impl ReceiveBatch {
                 "rustscale: Linux UDP GRO receive disabled (set RUSTSCALE_ENABLE_UDP_GRO=1 to opt in)"
             );
         }
-        // Queue-overflow accounting is independent and remains useful after a
-        // GRO circuit break or when GRO was disabled by the startup knob.
-        let _ = enable_rxq_overflow(socket);
+        // Keep the default plain recvmmsg path identical to the last
+        // known-good implementation: no ancillary messages are requested.
+        // Queue-overflow accounting is part of the explicit GRO opt-in.
+        if gro_enabled {
+            let _ = enable_rxq_overflow(socket);
+        }
         Self::with_gro(gro_enabled)
     }
 
@@ -912,12 +915,10 @@ impl ReceiveBatch {
         hdr.msg_namelen = mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
         hdr.msg_iov = ptr::addr_of_mut!(self.iovecs[index]);
         hdr.msg_iovlen = 1;
-        // Keep RXQ ancillary capacity in the plain 128-slot reader too.
-        // SO_RXQ_OVFL stays enabled after a GRO circuit break, and without
-        // this buffer a nonzero loss notification could cause MSG_CTRUNC and
-        // turn a valid plain packet into a persistent drop loop.
-        hdr.msg_control = self.controls[index].as_mut_ptr();
-        hdr.msg_controllen = RECEIVE_CONTROL_SPACE as _;
+        if self.gro_enabled {
+            hdr.msg_control = self.controls[index].as_mut_ptr();
+            hdr.msg_controllen = RECEIVE_CONTROL_SPACE as _;
+        }
         self.headers[index] = libc::mmsghdr {
             msg_hdr: hdr,
             msg_len: 0,
@@ -1358,7 +1359,6 @@ mod tests {
         batch.headers[index].msg_len = packet.len() as _;
         batch.headers[index].msg_hdr.msg_namelen = mem::size_of::<libc::sockaddr_in>() as _;
         batch.headers[index].msg_hdr.msg_flags = 0;
-        batch.headers[index].msg_hdr.msg_controllen = 0;
         batch.headers[index].msg_hdr.msg_controllen = control_len as _;
     }
 
@@ -1375,6 +1375,7 @@ mod tests {
         batch.headers[index].msg_len = packet.len() as _;
         batch.headers[index].msg_hdr.msg_namelen = mem::size_of::<libc::sockaddr_in>() as _;
         batch.headers[index].msg_hdr.msg_flags = 0;
+        batch.headers[index].msg_hdr.msg_controllen = 0;
     }
 
     fn pooled_publication_parts(

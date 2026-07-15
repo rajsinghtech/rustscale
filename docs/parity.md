@@ -73,7 +73,7 @@ real JSON).
 | Port enumeration | `portlist/` | ✅ `crates/portlist`: `Poller` (same-count shortcut, 1s Linux / 5s macOS), Linux `/proc/net/{tcp,tcp6,udp,udp6}` hex parser + `/proc/*/fd` PID resolution, macOS `netstat -na` + `lsof -F` parser with sandbox-failure cache, `to_services()` with is_interesting_service policy; wired into tsnet via HostinfoHook + background poller task |
 | Network flow logging | `wgengine/netlog/` | ✅ `crates/netlogtype` wire types plus `crates/netlog` aggregation/logtail upload; virtual traffic is counted by the filter and physical direct UDP, peer-relay, and DERP traffic is counted by an optional nonblocking magicsock hook with batch-aware tests |
 | Network error classification | `net/neterror/` | ✅ `rustscale-neterror` crate with `treat_as_lost_udp`, `packet_was_truncated`, `should_disable_udp_gso`, `is_closed_pipe_error`; wired into magicsock (send/disco paths), portmapper (PMP/PCP mapping sends), dns forwarder (UDP recv) |
-| Network traffic steering | `net/traffic/` | 🔶 split DNS OS config exists (macOS); no general traffic-steering abstraction |
+| Network traffic steering | `net/traffic/` | ✅ `crates/traffic`: location-priority scoring, memoization, and Go-vector-compatible FNV-1a rendezvous ordering; `tailcfg::Location.Priority` is wired into the model |
 | Subnet route health check | `net/routecheck/` | ⬜ |
 | Captive portal detection | `net/captivedetection/` | ✅ `Detector` concurrent HTTP GETs, DERPMap endpoints, response validation (status + challenge + body), wired into netcheck prober + health Tracker |
 | ICMP ping | `net/ping/` | ✅ `crates/netcheck/src/icmp.rs` — public `Pinger` (unprivileged DGRAM+ICMP → raw fallback); CLI `ping --icmp` uses it; disco/tsmp/peerapi dispatch via LocalAPI |

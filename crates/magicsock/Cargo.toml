@@ -73,5 +73,7 @@ libc.workspace = true
 socket2.workspace = true
 
 [dev-dependencies]
+async-trait.workspace = true
 tokio.workspace = true
 rustscale-key = { path = "../key", version = "0.1.1" }
+rustscale-routecheck.workspace = true

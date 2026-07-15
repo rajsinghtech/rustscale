@@ -558,6 +558,13 @@ impl Endpoint {
         self.pending_pings.contains_key(tx_id)
     }
 
+    /// Remove every pending transaction owned by one CLI ping request.
+    /// Called by the request's drop guard so cancellation cannot leak state.
+    pub fn remove_cli_request_pings(&mut self, request_id: u64) {
+        self.pending_pings
+            .retain(|_, ping| ping.cli_request_id != Some(request_id));
+    }
+
     /// Whether we should send a CallMeMaybe to this peer (once per netmap set).
     pub fn should_send_call_me_maybe(&mut self) -> bool {
         if self.call_me_maybe_sent {
@@ -819,6 +826,14 @@ impl Endpoint {
     /// Number of pending disco pings (for testing PMTUD burst).
     pub fn pending_pings_count(&self) -> usize {
         self.pending_pings.len()
+    }
+
+    #[cfg(test)]
+    pub fn pending_cli_pings_count(&self) -> usize {
+        self.pending_pings
+            .values()
+            .filter(|ping| ping.cli_request_id.is_some())
+            .count()
     }
 }
 

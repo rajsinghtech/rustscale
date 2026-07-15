@@ -443,6 +443,56 @@ fn make_peer(
     }
 }
 
+fn cli_ping_state_counts(magicsock: &Magicsock) -> (usize, usize) {
+    let callbacks = magicsock
+        .inner
+        .cli_ping_callbacks
+        .read()
+        .unwrap()
+        .values()
+        .map(HashMap::len)
+        .sum();
+    let pending = magicsock
+        .inner
+        .endpoints
+        .read()
+        .unwrap()
+        .values()
+        .map(super::endpoint::Endpoint::pending_pings_count)
+        .sum();
+    (callbacks, pending)
+}
+
+struct RouteSnapshotProvider(rustscale_routecheck::RouteSnapshot);
+
+#[async_trait::async_trait]
+impl rustscale_routecheck::RouteProvider for RouteSnapshotProvider {
+    async fn snapshot(
+        &self,
+    ) -> Result<rustscale_routecheck::RouteSnapshot, rustscale_routecheck::RouteProviderError> {
+        Ok(self.0.clone())
+    }
+}
+
+struct CliPingProbeProvider(Arc<Magicsock>);
+
+#[async_trait::async_trait]
+impl rustscale_routecheck::ProbeProvider for CliPingProbeProvider {
+    async fn probe(
+        &self,
+        peer: &Node,
+        address: IpAddr,
+    ) -> Result<rustscale_routecheck::ProbeResponse, rustscale_routecheck::ProbeError> {
+        self.0
+            .cli_ping(&peer.Key, &peer.Name, address, 0)
+            .await
+            .map(|result| rustscale_routecheck::ProbeResponse {
+                latency: Duration::from_secs_f64(result.LatencySeconds),
+            })
+            .map_err(|error| rustscale_routecheck::ProbeError::Failed(error.to_string()))
+    }
+}
+
 async fn magicsock_with_idle_peer() -> (Magicsock, NodePublic) {
     let private_key = NodePrivate::generate();
     let peer_key = NodePrivate::generate().public();
@@ -1066,15 +1116,138 @@ async fn cli_ping_fans_out_udp_and_derp() {
         .await
         .expect("DERP CLI pong");
     assert_eq!(result.DERPRegionID, 1);
-    let pending_udp = a
+    let pending_cli = a
         .inner
         .endpoints
         .read()
         .unwrap()
         .get(&b.node_public())
         .unwrap()
-        .pending_pings_count();
-    assert!(pending_udp > 0, "UDP candidate ping should also be pending");
+        .pending_cli_pings_count();
+    assert_eq!(
+        pending_cli, 0,
+        "winning DERP response must clean the other CLI transactions"
+    );
+}
+
+#[tokio::test]
+async fn cancelled_cli_ping_cleans_callbacks_and_transactions() {
+    let a_priv = NodePrivate::generate();
+    let (a, _a_rx) = Magicsock::new(MagicsockConfig {
+        private_key: a_priv,
+        disco_key: DiscoPrivate::generate(),
+        derp_client: None,
+        derp_map: None,
+        home_derp_region: 0,
+        udp_bind: Some("127.0.0.1:0".parse().unwrap()),
+        udp_socket: None,
+        portmapper: None,
+        health: None,
+        disable_direct_paths: false,
+        peer_relay_server: false,
+        relay_server_config: None,
+        sockstats: None,
+        control_knobs: None,
+    })
+    .await
+    .unwrap();
+    let peer_key = NodePrivate::generate().public();
+    a.set_netmap(vec![make_peer(
+        peer_key.clone(),
+        DiscoPrivate::generate().public(),
+        vec!["127.0.0.1:9".to_owned()],
+        0,
+    )])
+    .await
+    .unwrap();
+    let a = Arc::new(a);
+    let baseline = cli_ping_state_counts(&a);
+
+    for _ in 0..8 {
+        let result = tokio::time::timeout(
+            Duration::from_millis(5),
+            a.cli_ping(&peer_key, "peer", "100.64.0.2".parse().unwrap(), 0),
+        )
+        .await;
+        assert!(result.is_err(), "outer timeout should cancel cli_ping");
+        assert_eq!(cli_ping_state_counts(&a), baseline);
+    }
+
+    let task = {
+        let a = a.clone();
+        let peer_key = peer_key.clone();
+        tokio::spawn(async move {
+            a.cli_ping(&peer_key, "peer", "100.64.0.2".parse().unwrap(), 0)
+                .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while cli_ping_state_counts(&a).0 == baseline.0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cli_ping callback registration");
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert_eq!(cli_ping_state_counts(&a), baseline);
+}
+
+#[tokio::test]
+async fn repeated_timed_out_routechecks_do_not_leak_cli_ping_state() {
+    let private_key = NodePrivate::generate();
+    let (magicsock, _rx) = Magicsock::new(MagicsockConfig {
+        private_key,
+        disco_key: DiscoPrivate::generate(),
+        derp_client: None,
+        derp_map: None,
+        home_derp_region: 0,
+        udp_bind: Some("127.0.0.1:0".parse().unwrap()),
+        udp_socket: None,
+        portmapper: None,
+        health: None,
+        disable_direct_paths: false,
+        peer_relay_server: false,
+        relay_server_config: None,
+        sockstats: None,
+        control_knobs: None,
+    })
+    .await
+    .unwrap();
+
+    let mut peers = Vec::new();
+    for id in 1..=2 {
+        let mut peer = make_peer(
+            NodePrivate::generate().public(),
+            DiscoPrivate::generate().public(),
+            vec!["127.0.0.1:9".to_owned()],
+            0,
+        );
+        peer.ID = id;
+        peer.Name = format!("router-{id}.example.test.");
+        peer.Addresses = vec![format!("100.64.0.{id}/32")];
+        peer.AllowedIPs = vec![format!("100.64.0.{id}/32"), "192.0.2.0/24".into()];
+        peers.push(peer);
+    }
+    magicsock.set_netmap(peers.clone()).await.unwrap();
+    let magicsock = Arc::new(magicsock);
+    let baseline = cli_ping_state_counts(&magicsock);
+    let routecheck = rustscale_routecheck::Client::new(
+        Arc::new(RouteSnapshotProvider(rustscale_routecheck::RouteSnapshot {
+            self_node: Node {
+                ID: 99,
+                Addresses: vec!["100.64.0.99/32".into()],
+                ..Default::default()
+            },
+            peers,
+        })),
+        Arc::new(CliPingProbeProvider(magicsock.clone())),
+    );
+
+    for _ in 0..8 {
+        routecheck.refresh(Duration::from_millis(5)).await.unwrap();
+        assert_eq!(cli_ping_state_counts(&magicsock), baseline);
+    }
 }
 
 #[tokio::test]

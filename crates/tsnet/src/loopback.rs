@@ -438,6 +438,7 @@ impl Server {
         let inner = self.inner.as_ref().expect("server must be up");
         Arc::new(LocalApiState {
             peers: inner.peers.clone(),
+            routecheck: Some(inner.routecheck.clone()),
             user_profiles: inner.user_profiles.clone(),
             health: inner.health.clone(),
             dns_config: inner.dns_config.clone(),

@@ -904,6 +904,41 @@ struct Inner {
     next_cli_ping_id: AtomicU64,
 }
 
+/// Owns all state registered by one `cli_ping` call. Synchronous cleanup in
+/// `Drop` makes the async operation cancellation-safe, including task aborts
+/// and timeouts imposed by callers outside magicsock.
+struct CliPingRegistration {
+    inner: Arc<Inner>,
+    peer_key: NodePublic,
+    request_id: u64,
+}
+
+impl Drop for CliPingRegistration {
+    fn drop(&mut self) {
+        {
+            let mut callbacks = self
+                .inner
+                .cli_ping_callbacks
+                .write()
+                .expect("cli_ping_callbacks lock poisoned");
+            if let Some(requests) = callbacks.get_mut(&self.peer_key) {
+                requests.remove(&self.request_id);
+                if requests.is_empty() {
+                    callbacks.remove(&self.peer_key);
+                }
+            }
+        }
+        let mut endpoints = self
+            .inner
+            .endpoints
+            .write()
+            .expect("endpoints lock poisoned");
+        for endpoint in endpoints.values_mut() {
+            endpoint.remove_cli_request_pings(self.request_id);
+        }
+    }
+}
+
 /// Manages DERP connections across multiple regions.
 ///
 /// The home region connection is provided at construction time (from the
@@ -2148,6 +2183,14 @@ impl Magicsock {
                 .or_default()
                 .insert(request_id, tx);
         }
+        // This must be created immediately after callback registration. Every
+        // subsequent return, panic unwind, timeout, or future cancellation
+        // drops it and removes both callback and transaction state.
+        let _registration = CliPingRegistration {
+            inner: self.inner.clone(),
+            peer_key: peer_key.clone(),
+            request_id,
+        };
 
         // Send direct and DERP CLI pings independently. A relay pong is a
         // useful result even if direct candidates were advertised.
@@ -2229,7 +2272,7 @@ impl Magicsock {
 
         // Wait for the pong callback or timeout.
         let result = tokio::time::timeout(Duration::from_secs(5), rx).await;
-        let result = match result {
+        match result {
             Ok(Ok(mut pr)) => {
                 pr.IP = peer_ip.to_string();
                 pr.NodeName = peer_name.to_string();
@@ -2240,23 +2283,8 @@ impl Magicsock {
                 // timeout-style error.
                 Err(MagicsockError::NoPath)
             }
-            Err(_) => {
-                // Timeout — remove the callback so a stale pong doesn't fire later.
-                let mut callbacks = self
-                    .inner
-                    .cli_ping_callbacks
-                    .write()
-                    .expect("cli_ping_callbacks lock poisoned");
-                if let Some(requests) = callbacks.get_mut(peer_key) {
-                    requests.remove(&request_id);
-                    if requests.is_empty() {
-                        callbacks.remove(peer_key);
-                    }
-                }
-                Err(MagicsockError::Timeout)
-            }
-        };
-        result
+            Err(_) => Err(MagicsockError::Timeout),
+        }
     }
 
     /// Arm (or re-arm) the per-peer background task for heartbeats and UDP

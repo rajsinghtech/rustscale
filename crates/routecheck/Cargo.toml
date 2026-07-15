@@ -1,6 +1,6 @@
 [package]
 name = "rustscale-routecheck"
-description = "Local subnet-route conflict detection for rustscale"
+description = "Subnet-route validation and HA router reachability checks for rustscale"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -13,4 +13,15 @@ workspace = true
 rustscale-tsaddr.workspace = true
 rustscale-routetable.workspace = true
 rustscale-netmon.workspace = true
+rustscale-tailcfg = { path = "../tailcfg", version = "0.1.1" }
+rustscale-traffic = { path = "../traffic", version = "0.1.1" }
+async-trait.workspace = true
+chrono.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
 log.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

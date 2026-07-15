@@ -3176,6 +3176,7 @@ dependencies = [
 name = "rustscale-magicsock"
 version = "0.1.1"
 dependencies = [
+ "async-trait",
  "bytes",
  "hex",
  "if-addrs",
@@ -3191,6 +3192,7 @@ dependencies = [
  "rustscale-neterror",
  "rustscale-netns",
  "rustscale-portmapper",
+ "rustscale-routecheck",
  "rustscale-sockstats",
  "rustscale-tailcfg",
  "rustscale-udprelay",
@@ -3353,10 +3355,19 @@ version = "0.1.1"
 name = "rustscale-routecheck"
 version = "0.1.1"
 dependencies = [
+ "async-trait",
+ "chrono",
  "log",
  "rustscale-netmon",
  "rustscale-routetable",
+ "rustscale-tailcfg",
+ "rustscale-traffic",
  "rustscale-tsaddr",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -3622,6 +3633,7 @@ dependencies = [
  "rustscale-portmapper",
  "rustscale-posture",
  "rustscale-proxymap",
+ "rustscale-routecheck",
  "rustscale-router",
  "rustscale-safesocket",
  "rustscale-sockstats",

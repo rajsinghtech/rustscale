@@ -2371,6 +2371,10 @@ impl Server {
             if let Some(serve) = inner.serve.take() {
                 serve.stop().await;
             }
+            inner
+                .magicsock
+                .shutdown_portmapper(std::time::Duration::from_secs(5))
+                .await;
             inner.cancel.cancel();
             inner.health_watchdog.stop();
             if let Some(m) = inner.monitor.take() {
@@ -2522,6 +2526,10 @@ impl Server {
         if let Some(serve) = inner.serve.take() {
             serve.stop().await;
         }
+        inner
+            .magicsock
+            .shutdown_portmapper(std::time::Duration::from_secs(5))
+            .await;
         inner.cancel.cancel();
         inner.health_watchdog.stop();
         if let Some(m) = inner.monitor.take() {

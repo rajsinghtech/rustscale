@@ -1702,6 +1702,15 @@ impl Magicsock {
         }
     }
 
+    /// Shut down port mapping and await bounded release/cleanup work.
+    pub async fn shutdown_portmapper(&self, deadline: std::time::Duration) {
+        if let Some(portmapper) = &self.inner.portmapper {
+            if let Err(error) = portmapper.shutdown(deadline).await {
+                log::warn!("portmapper shutdown incomplete: {error}");
+            }
+        }
+    }
+
     /// Update the peer set from a netmap. Creates/updates per-peer endpoints,
     /// starts disco probing, and sends CallMeMaybe via the peer's home DERP.
     pub async fn set_netmap(&self, peers: Vec<Node>) -> Result<(), MagicsockError> {

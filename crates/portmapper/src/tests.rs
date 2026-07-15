@@ -51,6 +51,7 @@ struct FakeIgd {
     upnp_disco_count: Arc<AtomicU32>,
     upnp_add_count: Arc<AtomicU32>,
     upnp_delete_count: Arc<AtomicU32>,
+    add_mapping_gate: Mutex<Option<Arc<AsyncGate>>>,
     external_ip_gate: Mutex<Option<Arc<AsyncGate>>>,
 }
 
@@ -80,6 +81,7 @@ impl FakeIgd {
             upnp_disco_count: Arc::new(AtomicU32::new(0)),
             upnp_add_count: Arc::new(AtomicU32::new(0)),
             upnp_delete_count: Arc::new(AtomicU32::new(0)),
+            add_mapping_gate: Mutex::new(None),
             external_ip_gate: Mutex::new(None),
         });
 
@@ -110,8 +112,12 @@ impl FakeIgd {
         )
     }
 
-    fn gate_external_ip(&self, gate: Arc<AsyncGate>) {
-        *self.external_ip_gate.lock().unwrap() = Some(gate);
+    fn gate_add_mapping(&self, gate: Option<Arc<AsyncGate>>) {
+        *self.add_mapping_gate.lock().unwrap() = gate;
+    }
+
+    fn gate_external_ip(&self, gate: Option<Arc<AsyncGate>>) {
+        *self.external_ip_gate.lock().unwrap() = gate;
     }
 
     fn set_protocols(&self, pmp: bool, pcp: bool, upnp: bool) {
@@ -300,6 +306,11 @@ impl FakeIgd {
 
             if action.contains("AddPortMapping") {
                 self.upnp_add_count.fetch_add(1, Ordering::Relaxed);
+                let gate = self.add_mapping_gate.lock().unwrap().clone();
+                if let Some(gate) = gate {
+                    gate.reached.wait().await;
+                    gate.resume.wait().await;
+                }
                 write_soap_response(stream, TEST_ADD_PORT_MAPPING_RESPONSE).await;
                 return;
             }
@@ -580,7 +591,7 @@ async fn dropped_upnp_caller_is_supervised_through_external_ip_commit() {
     })
     .await;
     let gate = AsyncGate::new();
-    igd.gate_external_ip(gate.clone());
+    igd.gate_external_ip(Some(gate.clone()));
     let client = make_test_client(&igd);
     let caller_client = client.clone();
     let caller = tokio::spawn(async move { caller_client.create_or_get_mapping().await });
@@ -602,6 +613,46 @@ async fn dropped_upnp_caller_is_supervised_through_external_ip_commit() {
     assert_eq!(mapping.kind, MappingKind::Upnp);
     assert_eq!(igd.upnp_add_count.load(Ordering::SeqCst), 1);
 
+    client.close();
+    igd.close();
+}
+
+#[tokio::test]
+async fn ambiguous_upnp_add_is_compensated_before_key_reuse() {
+    let igd = FakeIgd::start(IgdOpts {
+        upnp: true,
+        ..Default::default()
+    })
+    .await;
+    let gate = AsyncGate::new();
+    igd.gate_add_mapping(Some(gate.clone()));
+    let client = make_test_client(&igd);
+    let caller_client = client.clone();
+    let caller = tokio::spawn(async move { caller_client.create_or_get_mapping().await });
+
+    gate.reached.wait().await;
+    caller.abort();
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    igd.gate_add_mapping(None);
+    gate.resume.wait().await;
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if igd.upnp_delete_count.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("ambiguous allocation compensation");
+    assert!(client.cached_mapping().is_none());
+
+    // Confirmed compensation removes the permanent same-key gate.
+    let mapping = client
+        .create_or_get_mapping()
+        .await
+        .expect("safe key reuse");
+    assert_eq!(mapping.kind, MappingKind::Upnp);
     client.close();
     igd.close();
 }

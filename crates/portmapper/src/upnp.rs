@@ -144,6 +144,19 @@ fn resolve_url(base: &str, path: &str) -> String {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct UpnpAllocation {
+    pub port: u16,
+    pub permanent: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct AmbiguousAddError {
+    pub port: u16,
+    pub permanent: bool,
+    pub source: std::io::Error,
+}
+
 /// Create a UDP port mapping via SOAP AddPortMapping.
 ///
 /// Returns the external port assigned by the router. If `external_port` is
@@ -157,7 +170,7 @@ pub(crate) async fn add_port_mapping(
     external_port: u16,
     lease_duration: u32,
     deadline: Duration,
-) -> Result<u16, std::io::Error> {
+) -> Result<UpnpAllocation, AmbiguousAddError> {
     let port = if external_port < 1024 {
         random_port()
     } else {
@@ -186,10 +199,18 @@ pub(crate) async fn add_port_mapping(
         &body,
         deadline,
     )
-    .await?;
+    .await
+    .map_err(|source| AmbiguousAddError {
+        port,
+        permanent: false,
+        source,
+    })?;
 
     if status == 200 && !is_soap_fault(&resp) {
-        return Ok(port);
+        return Ok(UpnpAllocation {
+            port,
+            permanent: false,
+        });
     }
 
     // Check for UPnP error codes 725 or 402 — retry with permanent lease.
@@ -213,16 +234,26 @@ pub(crate) async fn add_port_mapping(
                 &body,
                 deadline,
             )
-            .await?;
+            .await
+            .map_err(|source| AmbiguousAddError {
+                port,
+                permanent: true,
+                source,
+            })?;
             if status == 200 && !is_soap_fault(&resp) {
-                return Ok(port);
+                return Ok(UpnpAllocation {
+                    port,
+                    permanent: true,
+                });
             }
         }
     }
 
-    Err(std::io::Error::other(format!(
-        "AddPortMapping failed (status={status})"
-    )))
+    Err(AmbiguousAddError {
+        port,
+        permanent: false,
+        source: std::io::Error::other(format!("AddPortMapping failed (status={status})")),
+    })
 }
 
 /// Delete a UDP port mapping via SOAP DeletePortMapping.
@@ -245,15 +276,26 @@ pub(crate) async fn delete_port_mapping(
   </s:Body>
 </s:Envelope>"#
     );
-    http::http_post_soap(
+    let (status, response) = http::http_post_soap(
         &svc.control_url,
         &soap_action,
         SOAP_CONTENT_TYPE,
         &body,
         deadline,
     )
-    .await
-    .map(|_| ())
+    .await?;
+    if delete_response_is_success(status, &response) {
+        return Ok(());
+    }
+    Err(std::io::Error::other(format!(
+        "DeletePortMapping failed (status={status})"
+    )))
+}
+
+fn delete_response_is_success(status: u16, response: &str) -> bool {
+    (status == 200 && !is_soap_fault(response))
+        // 714 NoSuchEntryInArray positively verifies that no mapping remains.
+        || extract_upnp_error_code(response) == Some(714)
 }
 
 /// Get the external IP address via SOAP GetExternalIPAddress.
@@ -466,6 +508,23 @@ mod tests {
             extract_tag_text(resp, "NewExternalIPAddress"),
             Some("123.123.123.123".to_string())
         );
+    }
+
+    #[test]
+    fn delete_requires_success_or_not_found() {
+        assert!(delete_response_is_success(
+            200,
+            "<DeletePortMappingResponse/>"
+        ));
+        assert!(delete_response_is_success(
+            500,
+            "<s:Fault><errorCode>714</errorCode></s:Fault>"
+        ));
+        assert!(!delete_response_is_success(
+            200,
+            "<s:Fault><errorCode>501</errorCode></s:Fault>"
+        ));
+        assert!(!delete_response_is_success(500, "server error"));
     }
 
     #[test]

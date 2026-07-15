@@ -6,5 +6,4 @@ tools/testcontrol/bin/
 .DS_Store
 .worktrees/
 .agent-runs/
-.opencode/
 __pycache__/

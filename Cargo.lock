@@ -3497,6 +3497,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustscale-traffic"
+version = "0.1.1"
+dependencies = [
+ "rustscale-tailcfg",
+]
+
+[[package]]
 name = "rustscale-tsaddr"
 version = "0.1.1"
 dependencies = [

@@ -20,10 +20,10 @@ pub(crate) fn get_serial_numbers_impl() -> Result<Vec<String>, PostureError> {
         }
     }
     let serials = dedup_serials(serials);
-    if !serials.is_empty() {
-        Ok(serials)
-    } else {
+    if serials.is_empty() {
         Err(saw_io_error.unwrap_or(PostureError::CollectionFailed))
+    } else {
+        Ok(serials)
     }
 }
 

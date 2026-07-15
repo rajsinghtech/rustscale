@@ -792,6 +792,7 @@ impl ReceiveBatch {
         Self::with_gro_and_rxq(gro_enabled, rxq_overflow_enabled)
     }
 
+    #[cfg(test)]
     fn with_gro(gro_enabled: bool) -> Self {
         Self::with_gro_and_rxq(gro_enabled, gro_enabled)
     }

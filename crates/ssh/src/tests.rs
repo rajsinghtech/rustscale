@@ -47,9 +47,9 @@ fn test_profile() -> UserProfile {
     }
 }
 
-fn policy_map_any(local_user: &str) -> Arc<dyn Fn() -> Option<SSHPolicy> + Send + Sync> {
+fn policy_for(local_user: &str, session_duration: std::time::Duration) -> SSHPolicy {
     let mapping = local_user.to_string();
-    let policy = SSHPolicy {
+    SSHPolicy {
         Rules: vec![SSHRule {
             Principals: vec![SSHPrincipal {
                 Any: true,
@@ -62,11 +62,16 @@ fn policy_map_any(local_user: &str) -> Arc<dyn Fn() -> Option<SSHPolicy> + Send 
             },
             Action: Some(SSHAction {
                 Accept: true,
+                SessionDuration: session_duration,
                 ..Default::default()
             }),
             ..Default::default()
         }],
-    };
+    }
+}
+
+fn policy_map_any(local_user: &str) -> Arc<dyn Fn() -> Option<SSHPolicy> + Send + Sync> {
+    let policy = policy_for(local_user, std::time::Duration::ZERO);
     Arc::new(move || Some(policy.clone()))
 }
 
@@ -233,8 +238,8 @@ async fn run_pipeline(command: &str) -> i32 {
 struct NoopProcessControl;
 
 impl ProcessControl for NoopProcessControl {
-    fn signal_group(&self, _signal: libc::c_int) -> io::Result<()> {
-        Ok(())
+    fn signal_group(&self, _signal: libc::c_int) -> io::Result<bool> {
+        Ok(false)
     }
 }
 
@@ -329,14 +334,14 @@ struct EscalatingControl {
 }
 
 impl ProcessControl for EscalatingControl {
-    fn signal_group(&self, signal: libc::c_int) -> io::Result<()> {
+    fn signal_group(&self, signal: libc::c_int) -> io::Result<bool> {
         self.signals.lock().unwrap().push(signal);
         if signal == libc::SIGKILL {
             if let Some(exit) = self.exit.lock().unwrap().take() {
                 let _ = exit.send(137);
             }
         }
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -344,6 +349,7 @@ struct TermIgnoringLauncher {
     control: Arc<EscalatingControl>,
     exit_rx: Mutex<Option<oneshot::Receiver<i32>>>,
     output: Mutex<Option<Vec<u8>>>,
+    stderr: Mutex<Option<Vec<u8>>>,
     input_dropped: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -357,8 +363,15 @@ impl TermIgnoringLauncher {
             }),
             exit_rx: Mutex::new(Some(exit_rx)),
             output: Mutex::new(Some(output)),
+            stderr: Mutex::new(None),
             input_dropped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    fn with_stderr(stderr: Vec<u8>) -> Self {
+        let launcher = Self::new(Vec::new());
+        *launcher.stderr.lock().unwrap() = Some(stderr);
+        launcher
     }
 }
 
@@ -407,13 +420,18 @@ impl SessionLauncher for TermIgnoringLauncher {
         tokio::spawn(async move {
             let _ = tokio::io::AsyncWriteExt::write_all(&mut output_writer, &output).await;
         });
+        let (mut stderr_writer, stderr_reader) = tokio::io::duplex(4096);
+        let stderr = self.stderr.lock().unwrap().take().unwrap_or_default();
+        tokio::spawn(async move {
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut stderr_writer, &stderr).await;
+        });
         let exit_rx = self.exit_rx.lock().unwrap().take().unwrap();
         Ok(LaunchedSession {
             input: Some(Box::new(TrackingInput {
                 dropped: self.input_dropped.clone(),
             })),
             output: Some(Box::new(output_reader)),
-            stderr: Some(Box::new(tokio::io::empty())),
+            stderr: Some(Box::new(stderr_reader)),
             wait: Box::pin(async move {
                 exit_rx
                     .await
@@ -421,6 +439,22 @@ impl SessionLauncher for TermIgnoringLauncher {
             }),
             control: self.control.clone(),
         })
+    }
+}
+
+#[derive(Clone, Default)]
+struct CaptureWriter {
+    bytes: Arc<Mutex<Vec<u8>>>,
+}
+
+impl io::Write for CaptureWriter {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        self.bytes.lock().unwrap().extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -444,6 +478,47 @@ impl io::Write for FailAfterHeader {
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
+}
+
+#[tokio::test]
+async fn non_pty_stderr_is_recorded_before_client_forwarding() {
+    let writer = CaptureWriter::default();
+    let captured = writer.bytes.clone();
+    let recorder = crate::SessionRecorder::with_test_writer(
+        Box::new(writer),
+        crate::CastHeader::new(
+            (0, 0),
+            "command".into(),
+            std::collections::HashMap::new(),
+            "requested".into(),
+            "mapped".into(),
+            "connection".into(),
+        ),
+        true,
+    )
+    .unwrap();
+    let recorder = Mutex::new(Some(recorder));
+    let mutate = |init: &mut crate::session::SessionInit| {
+        init.recorder = recorder.lock().unwrap().take();
+    };
+    let requested_user = std::env::var("USER").unwrap_or_else(|_| "testuser".to_string());
+    let (code, output) = run_pipeline_custom(
+        "printf 'stdout-transcript'; printf 'stderr-transcript' >&2",
+        &requested_user,
+        policy_allow_any(),
+        None,
+        Some(&mutate),
+        false,
+        false,
+    )
+    .await;
+    assert_eq!(code, 0);
+    let transcript = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+    assert!(transcript.contains("stdout-transcript"));
+    assert!(transcript.contains("stderr-transcript"));
+    assert!(output
+        .windows(b"stderr-transcript".len())
+        .any(|window| window == b"stderr-transcript"));
 }
 
 #[tokio::test]
@@ -503,6 +578,155 @@ async fn fail_closed_drops_failed_chunk_and_escalates_whole_group() {
     assert!(output
         .windows(b"recording required".len())
         .any(|window| window == b"recording required"));
+    assert_eq!(
+        &*launcher.control.signals.lock().unwrap(),
+        &[libc::SIGTERM, libc::SIGKILL]
+    );
+}
+
+#[tokio::test]
+async fn fail_closed_stderr_chunk_is_suppressed() {
+    let launcher = TermIgnoringLauncher::with_stderr(b"stderr-must-not-be-delivered".to_vec());
+    let recorder = crate::SessionRecorder::with_test_writer(
+        Box::new(FailAfterHeader {
+            wrote_header: false,
+        }),
+        crate::CastHeader::new(
+            (0, 0),
+            "command".into(),
+            std::collections::HashMap::new(),
+            "requested".into(),
+            "mapped".into(),
+            "connection".into(),
+        ),
+        false,
+    )
+    .unwrap();
+    let recorder = Mutex::new(Some(recorder));
+    let mutate = |init: &mut crate::session::SessionInit| {
+        init.recorder = recorder.lock().unwrap().take();
+        init.recording_config = Some(crate::RecordingConfig {
+            on_failure: Some(rustscale_tailcfg::SSHRecorderFailureAction {
+                TerminateSessionWithMessage: "recording required".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+    };
+    let resolver = |_name: &str| {
+        Ok(LocalUser {
+            uid: 1000,
+            gid: 1000,
+            gids: vec![1000],
+            name: "mapped".into(),
+            home_dir: "/tmp".into(),
+            shell: "/bin/sh".into(),
+        })
+    };
+
+    let (code, output) = run_pipeline_custom(
+        "ignored",
+        "requested",
+        policy_map_any("mapped"),
+        Some((&resolver, &launcher)),
+        Some(&mutate),
+        false,
+        false,
+    )
+    .await;
+    assert_eq!(code, 1);
+    assert!(!output
+        .windows(b"stderr-must-not-be-delivered".len())
+        .any(|window| window == b"stderr-must-not-be-delivered"));
+    assert_eq!(
+        &*launcher.control.signals.lock().unwrap(),
+        &[libc::SIGTERM, libc::SIGKILL]
+    );
+}
+
+#[tokio::test]
+async fn zero_session_duration_does_not_cancel_session() {
+    let code = run_pipeline("sleep 0.1; exit 0").await;
+    assert_eq!(code, 0);
+}
+
+#[tokio::test]
+async fn session_duration_terminates_and_escalates_process_group() {
+    let launcher = TermIgnoringLauncher::new(Vec::new());
+    let resolver = |_name: &str| {
+        Ok(LocalUser {
+            uid: 1000,
+            gid: 1000,
+            gids: vec![1000],
+            name: "mapped".into(),
+            home_dir: "/tmp".into(),
+            shell: "/bin/sh".into(),
+        })
+    };
+    let policy = policy_for("mapped", std::time::Duration::from_millis(50));
+    let policy: Arc<dyn Fn() -> Option<SSHPolicy> + Send + Sync> =
+        Arc::new(move || Some(policy.clone()));
+
+    let (code, output) = run_pipeline_custom(
+        "ignored",
+        "requested",
+        policy,
+        Some((&resolver, &launcher)),
+        None,
+        false,
+        false,
+    )
+    .await;
+    assert_eq!(code, 1);
+    assert!(String::from_utf8_lossy(&output).contains("Session timeout"));
+    assert_eq!(
+        &*launcher.control.signals.lock().unwrap(),
+        &[libc::SIGTERM, libc::SIGKILL]
+    );
+}
+
+#[tokio::test]
+async fn live_policy_revocation_terminates_existing_session() {
+    let launcher = TermIgnoringLauncher::new(Vec::new());
+    let resolver = |_name: &str| {
+        Ok(LocalUser {
+            uid: 1000,
+            gid: 1000,
+            gids: vec![1000],
+            name: "mapped".into(),
+            home_dir: "/tmp".into(),
+            shell: "/bin/sh".into(),
+        })
+    };
+    let current_policy = Arc::new(Mutex::new(Some(policy_for(
+        "mapped",
+        std::time::Duration::ZERO,
+    ))));
+    let policy: Arc<dyn Fn() -> Option<SSHPolicy> + Send + Sync> = {
+        let current_policy = current_policy.clone();
+        Arc::new(move || current_policy.lock().unwrap().clone())
+    };
+    let revoke = {
+        let current_policy = current_policy.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            *current_policy.lock().unwrap() = Some(SSHPolicy::default());
+        })
+    };
+
+    let (code, output) = run_pipeline_custom(
+        "ignored",
+        "requested",
+        policy,
+        Some((&resolver, &launcher)),
+        None,
+        false,
+        false,
+    )
+    .await;
+    revoke.await.unwrap();
+    assert_eq!(code, 1);
+    assert!(String::from_utf8_lossy(&output).contains("Access revoked"));
     assert_eq!(
         &*launcher.control.signals.lock().unwrap(),
         &[libc::SIGTERM, libc::SIGKILL]
@@ -576,6 +800,33 @@ async fn normal_exit_drains_trailing_output_before_channel_close() {
             .any(|window| window == b"trailing-output"),
         "missing trailing output: {:?}",
         String::from_utf8_lossy(&output)
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn normal_exit_drains_output_then_kills_background_descendant() {
+    let (code, output) = run_pipeline_output(
+        "printf 'before-background\\n'; (trap '' TERM; sleep 30) >/dev/null 2>&1 & echo $!",
+    )
+    .await;
+    assert_eq!(code, 0);
+    let output = String::from_utf8_lossy(&output);
+    assert!(output.contains("before-background"));
+    let descendant = output
+        .lines()
+        .find_map(|line| line.trim().parse::<u32>().ok())
+        .expect("background pid in drained output");
+    let status = tokio::process::Command::new("kill")
+        .args(["-0", &descendant.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+        .expect("kill -0");
+    assert!(
+        !status.success(),
+        "background descendant survived normal exit"
     );
 }
 

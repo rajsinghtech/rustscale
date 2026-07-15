@@ -4,7 +4,7 @@ use crate::auth::{eval_ssh_policy, ConnInfo, EvalResult};
 use crate::env::accept_env_pair;
 use crate::recording::{default_recording_path, CastHeader, RecordingConfig};
 use crate::recording_upload::DialFn;
-use crate::session::{PeerIdentity, Pty, SessionInit, Window};
+use crate::session::{PeerIdentity, Pty, RevalidateCallback, SessionInit, Window};
 use russh::keys::PrivateKey;
 use russh::server::{Auth, Msg, Server as RusshServer, Session};
 use russh::{Channel, ChannelId, MethodSet};
@@ -72,6 +72,8 @@ impl RusshServer for SshServer {
             signal_tx: None,
             window_change_tx: None,
             recording_config: None,
+            session_duration: std::time::Duration::ZERO,
+            revalidate: None,
             connection_id: next_connection_id(),
         }
     }
@@ -114,6 +116,8 @@ pub struct SshHandler {
     signal_tx: Option<mpsc::Sender<russh::Sig>>,
     window_change_tx: Option<mpsc::Sender<Window>>,
     recording_config: Option<RecordingConfig>,
+    session_duration: std::time::Duration,
+    revalidate: Option<RevalidateCallback>,
     connection_id: String,
 }
 
@@ -161,6 +165,19 @@ impl SshHandler {
                 self.local_user.clone_from(local_user);
                 self.accept_env.clone_from(accept_env);
                 self.peer_identity = Some(PeerIdentity { node, user_profile });
+                self.session_duration = action.SessionDuration;
+                let expected_local_user = local_user.clone();
+                let policy = self.config.policy.clone();
+                let info = info.clone();
+                self.revalidate = Some(Arc::new(move || {
+                    let Some(policy) = policy() else {
+                        return false;
+                    };
+                    matches!(
+                        eval_ssh_policy(&policy, &info),
+                        EvalResult::Accept { local_user, .. } if local_user == expected_local_user
+                    )
+                }));
                 // This is the final terminal action. Never inherit recorder
                 // policy from an earlier/delegating action.
                 let recorders = action.Recorders.clone();
@@ -289,6 +306,8 @@ impl SshHandler {
             recording_config,
             recording_header,
             recording_dial: self.config.dial_fn.clone(),
+            session_duration: self.session_duration,
+            revalidate: self.revalidate.clone(),
             signal_rx,
             window_change_rx,
             peer_addr,

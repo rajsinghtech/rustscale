@@ -19,6 +19,8 @@ use std::io;
 use std::process::Stdio;
 
 #[cfg(unix)]
+use std::os::fd::{AsRawFd, OwnedFd};
+#[cfg(unix)]
 #[allow(unused_imports)]
 use std::os::unix::process::CommandExt;
 
@@ -32,7 +34,7 @@ where
 }
 
 /// Arguments for spawning an incubated process — mirrors Go's `incubatorArgs`.
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub struct IncubatorArgs {
     /// Path to the user's preferred login shell (e.g. `/bin/bash`).
     pub login_shell: String,
@@ -65,7 +67,7 @@ pub struct IncubatorArgs {
     /// PTY slave fd — when set, the child's stdin/stdout/stderr are dup2'd
     /// onto this fd in pre_exec instead of using pipes.
     #[cfg(unix)]
-    pub pty_slave_fd: Option<std::os::fd::RawFd>,
+    pub pty_slave_fd: Option<OwnedFd>,
 }
 
 /// Error from the incubator.
@@ -88,8 +90,6 @@ pub enum IncubatorError {
 /// the SSH channel and the process stdin/stdout/stderr.
 pub struct SpawnedProcess {
     child: tokio::process::Child,
-    #[allow(dead_code)]
-    args: IncubatorArgs,
 }
 
 /// Safe controller for the dedicated process group created for an SSH shell.
@@ -101,16 +101,16 @@ pub struct ProcessGroup {
 impl ProcessGroup {
     /// Signal the whole shell process group, including descendants.
     #[cfg(unix)]
-    pub fn signal(&self, signal: libc::c_int) -> io::Result<()> {
+    pub fn signal(&self, signal: libc::c_int) -> io::Result<bool> {
         // SAFETY: `pid` came from a successfully spawned child which calls
         // setpgid(0, 0) before exec. kill does not dereference memory.
         let result = unsafe { libc::kill(-(self.pid as libc::pid_t), signal) };
         if result == 0 {
-            Ok(())
+            Ok(true)
         } else {
             let error = io::Error::last_os_error();
             if error.raw_os_error() == Some(libc::ESRCH) {
-                Ok(())
+                Ok(false)
             } else {
                 Err(error)
             }
@@ -118,7 +118,7 @@ impl ProcessGroup {
     }
 
     #[cfg(not(unix))]
-    pub fn signal(&self, _signal: libc::c_int) -> io::Result<()> {
+    pub fn signal(&self, _signal: libc::c_int) -> io::Result<bool> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "process groups are only supported on Unix",
@@ -230,7 +230,7 @@ impl Incubator {
     ///
     /// If `has_tty` is true, the caller should have already allocated a PTY
     /// and pass the slave end as stdin/stdout/stderr. Otherwise, pipes are used.
-    pub fn spawn(&self) -> Result<SpawnedProcess, IncubatorError> {
+    pub fn spawn(self) -> Result<SpawnedProcess, IncubatorError> {
         if self.args.is_sftp {
             // SFTP requires the embedded SFTP server (Go uses tailscaled's
             // built-in handler). In standalone mode we can't serve SFTP.
@@ -301,7 +301,7 @@ impl Incubator {
             let gids = self.args.gids.clone();
             let uid = self.args.uid;
             let gid = self.args.gid;
-            let pty_slave = self.args.pty_slave_fd;
+            let pty_slave = self.args.pty_slave_fd.as_ref().map(AsRawFd::as_raw_fd);
             // Every SSH shell gets a dedicated process group so cancellation
             // cannot leave TERM-ignoring descendants behind.
             let current_uid = unsafe { libc::getuid() };
@@ -358,20 +358,10 @@ impl Incubator {
             }
         }
 
-        let child = cmd.spawn();
-        #[cfg(unix)]
-        if let Some(slave) = self.args.pty_slave_fd {
-            // The child inherited/duplicated its copy during spawn. Keeping the
-            // parent copy open would prevent PTY EOF and output draining.
-            unsafe {
-                libc::close(slave);
-            }
-        }
-        let child = child?;
-        Ok(SpawnedProcess {
-            child,
-            args: self.args.clone(),
-        })
+        let child = cmd.spawn()?;
+        // `self` is consumed, so the parent's OwnedFd for the PTY slave is
+        // closed exactly once here after spawn (and on every error path).
+        Ok(SpawnedProcess { child })
     }
 
     /// The local user this incubator will run as.

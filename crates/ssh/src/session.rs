@@ -6,6 +6,8 @@ use crate::recording_upload::DialFn;
 use russh::{ChannelId, Sig};
 use rustscale_tailcfg::{Node, UserProfile};
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{mpsc, watch};
 
@@ -29,6 +31,8 @@ pub struct PeerIdentity {
     pub user_profile: UserProfile,
 }
 
+pub type RevalidateCallback = Arc<dyn Fn() -> bool + Send + Sync>;
+
 pub struct SessionInit {
     pub peer: PeerIdentity,
     pub ssh_user: String,
@@ -48,6 +52,8 @@ pub struct SessionInit {
     pub recording_config: Option<RecordingConfig>,
     pub recording_header: Option<CastHeader>,
     pub recording_dial: Option<DialFn>,
+    pub session_duration: Duration,
+    pub revalidate: Option<RevalidateCallback>,
     /// Receiver for SSH signals (SIGINT, SIGTERM, etc.) forwarded by
     /// SshHandler::signal. Mirrors Go's signal handling in handleSession.
     pub signal_rx: mpsc::Receiver<Sig>,
@@ -77,6 +83,8 @@ pub struct Session {
     recording_config: Option<RecordingConfig>,
     recording_header: Option<CastHeader>,
     recording_dial: Option<DialFn>,
+    max_duration: Duration,
+    revalidate: Option<RevalidateCallback>,
     signal_rx: mpsc::Receiver<Sig>,
     window_change_rx: mpsc::Receiver<Window>,
     peer_addr: Option<SocketAddr>,
@@ -103,6 +111,8 @@ impl Session {
             recording_config: init.recording_config,
             recording_header: init.recording_header,
             recording_dial: init.recording_dial,
+            max_duration: init.session_duration,
+            revalidate: init.revalidate,
             signal_rx: init.signal_rx,
             window_change_rx: init.window_change_rx,
             peer_addr: init.peer_addr,
@@ -151,6 +161,12 @@ impl Session {
     }
     pub fn take_recording_dial(&mut self) -> Option<DialFn> {
         self.recording_dial.take()
+    }
+    pub fn session_duration(&self) -> Duration {
+        self.max_duration
+    }
+    pub fn take_revalidate(&mut self) -> Option<RevalidateCallback> {
+        self.revalidate.take()
     }
     /// Returns the russh server handle (for sending data/extended_data/exit).
     pub fn handle(&self) -> &russh::server::Handle {

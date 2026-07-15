@@ -25,7 +25,7 @@ use std::ffi::CString;
 use std::io;
 use std::net::IpAddr;
 #[cfg(unix)]
-use std::os::fd::{FromRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 #[cfg(unix)]
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -95,7 +95,7 @@ const EXTENDED_DATA_STDERR: u32 = 1;
 /// Default PATH when the SSH client doesn't provide one.
 const DEFAULT_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 const RECORDING_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-const OUTPUT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const OUTPUT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 const PROCESS_TERM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const PROCESS_KILL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
@@ -310,7 +310,9 @@ fn sig_to_libc(sig: &Sig) -> libc::c_int {
 ///
 /// Returns `(master_fd, slave_fd, tty_name)`. Mirrors Go's `setupPTY`.
 #[cfg(unix)]
-fn allocate_pty(pty: &crate::session::Pty) -> Result<(RawFd, RawFd, String), SessionHandlerError> {
+fn allocate_pty(
+    pty: &crate::session::Pty,
+) -> Result<(OwnedFd, OwnedFd, String), SessionHandlerError> {
     let mut master: RawFd = -1;
     let mut slave: RawFd = -1;
 
@@ -332,21 +334,22 @@ fn allocate_pty(pty: &crate::session::Pty) -> Result<(RawFd, RawFd, String), Ses
         ));
     }
 
-    set_winsize(slave, &pty.window)?;
+    // Own both descriptors immediately. Every subsequent `?` now closes both
+    // exactly once, including window/name and recorder rejection paths.
+    let master = unsafe { OwnedFd::from_raw_fd(master) };
+    let slave = unsafe { OwnedFd::from_raw_fd(slave) };
+
+    set_winsize(slave.as_raw_fd(), &pty.window)?;
 
     let mut name_buf = vec![0u8; 256];
     let ret = unsafe {
         libc::ttyname_r(
-            slave,
+            slave.as_raw_fd(),
             name_buf.as_mut_ptr().cast::<libc::c_char>(),
             name_buf.len(),
         )
     };
     if ret != 0 {
-        unsafe {
-            libc::close(master);
-            libc::close(slave);
-        }
         return Err(SessionHandlerError::Pty(
             io::Error::from_raw_os_error(ret).to_string(),
         ));
@@ -386,12 +389,13 @@ type BoxWrite = Box<dyn AsyncWrite + Unpin + Send>;
 /// Injectable process-group control used by the lifecycle state machine.
 #[cfg(unix)]
 pub(crate) trait ProcessControl: Send + Sync {
-    fn signal_group(&self, signal: libc::c_int) -> io::Result<()>;
+    /// Returns true if the process group still existed.
+    fn signal_group(&self, signal: libc::c_int) -> io::Result<bool>;
 }
 
 #[cfg(unix)]
 impl ProcessControl for ProcessGroup {
-    fn signal_group(&self, signal: libc::c_int) -> io::Result<()> {
+    fn signal_group(&self, signal: libc::c_int) -> io::Result<bool> {
         self.signal(signal)
     }
 }
@@ -466,6 +470,10 @@ pub(crate) async fn run_session_with(
     resolve_user: &(dyn Fn(&str) -> Result<LocalUser, SessionHandlerError> + Send + Sync),
     launcher: &dyn SessionLauncher,
 ) -> Result<i32, SessionHandlerError> {
+    let session_duration = session.session_duration();
+    let mut session_deadline =
+        (!session_duration.is_zero()).then(|| tokio::time::Instant::now() + session_duration);
+    let mut revalidate = session.take_revalidate();
     let local_user = resolve_user(session.local_user())?;
 
     let (src_ip, src_port, dst_ip, dst_port) = session.peer_addr().map_or(
@@ -531,7 +539,21 @@ pub(crate) async fn run_session_with(
             // Resolve first, then commit the header, so recorder metadata is
             // the exact account/uid selected for process launch.
             header.local_user.clone_from(&local_user.name);
-            match init_recording(config, header, session.take_recording_dial()).await {
+            let initialize = init_recording(config, header, session.take_recording_dial());
+            let initialized = if let Some(deadline) = session_deadline {
+                if let Ok(result) = tokio::time::timeout_at(deadline, initialize).await {
+                    result
+                } else {
+                    let message = format!("Session timeout of {session_duration:?} elapsed.");
+                    send_session_termination(&message, session.handle(), session.channel_id())
+                        .await;
+                    session.exit(1).await;
+                    return Ok(1);
+                }
+            } else {
+                initialize.await
+            };
+            match initialized {
                 Ok(initialized) => recorder = initialized,
                 Err(message) => {
                     let _ = session.handle().data(session.channel_id(), message).await;
@@ -547,6 +569,32 @@ pub(crate) async fn run_session_with(
         .filter(|message| !message.is_empty());
     let mut upload_result_rx = recorder.as_ref().and_then(SessionRecorder::take_result_rx);
 
+    // Duplicate all parent PTY roles before launch. Any allocation/duplication
+    // error therefore drops every OwnedFd without spawning an orphan process.
+    let pty_handles = if let Some(fd) = pty_master_fd {
+        let read_fd = fd.try_clone().map_err(|error| {
+            SessionHandlerError::Pty(format!("failed to duplicate PTY output: {error}"))
+        })?;
+        let ioctl_fd = fd.try_clone().map_err(|error| {
+            SessionHandlerError::Pty(format!("failed to duplicate PTY control: {error}"))
+        })?;
+        Some((fd, read_fd, ioctl_fd))
+    } else {
+        None
+    };
+
+    if revalidate.as_ref().is_some_and(|check| !check()) {
+        send_session_termination("Access revoked.", session.handle(), session.channel_id()).await;
+        session.exit(1).await;
+        return Ok(1);
+    }
+    if session_deadline.is_some_and(|deadline| deadline <= tokio::time::Instant::now()) {
+        let message = format!("Session timeout of {session_duration:?} elapsed.");
+        send_session_termination(&message, session.handle(), session.channel_id()).await;
+        session.exit(1).await;
+        return Ok(1);
+    }
+
     let mut launched = launcher.launch(args)?;
     let mut process_input = launched.input.take();
     let mut process_output = launched.output.take();
@@ -555,25 +603,17 @@ pub(crate) async fn run_session_with(
     let mut child_wait = launched.wait;
 
     let mut pty_ioctl_fd = None;
-    if let Some(fd) = pty_master_fd {
-        let read_fd = unsafe { libc::dup(fd) };
-        if read_fd < 0 {
-            return Err(SessionHandlerError::Pty(
-                io::Error::last_os_error().to_string(),
-            ));
-        }
-        process_output = Some(Box::new(tokio::fs::File::from_std(unsafe {
-            std::fs::File::from_raw_fd(read_fd)
-        })));
-        process_input = Some(Box::new(tokio::fs::File::from_std(unsafe {
-            std::fs::File::from_raw_fd(fd)
-        })));
+    if let Some((write_fd, read_fd, ioctl_fd)) = pty_handles {
+        process_output = Some(Box::new(tokio::fs::File::from_std(read_fd.into())));
+        process_input = Some(Box::new(tokio::fs::File::from_std(write_fd.into())));
         process_stderr = None;
-        pty_ioctl_fd = Some(read_fd);
+        pty_ioctl_fd = Some(ioctl_fd);
     }
 
     let handle = session.handle().clone();
     let channel_id = session.channel_id();
+    let mut policy_tick = tokio::time::interval(std::time::Duration::from_millis(250));
+    policy_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut cancel_rx = session.take_cancel_rx();
     let mut signal_rx = session.take_signal_rx();
     let mut window_change_rx = session.take_window_change_rx();
@@ -588,6 +628,8 @@ pub(crate) async fn run_session_with(
     let mut term_deadline = None;
     let mut kill_deadline = None;
     let mut drain_deadline = None;
+    let mut group_cleanup_started = false;
+    let mut policy_invalid_checks = 0_u8;
 
     loop {
         if pumps_aborted {
@@ -602,7 +644,17 @@ pub(crate) async fn run_session_with(
             && process_stderr.is_none()
             && term_deadline.is_none()
         {
-            break;
+            if forced_failure || kill_deadline.is_some() {
+                break;
+            }
+            if group_cleanup_started {
+                // TERM's bounded grace elapsed and SIGKILL was sent.
+                break;
+            }
+            group_cleanup_started = true;
+            if !begin_process_termination(control.as_ref(), &mut term_deadline) {
+                break;
+            }
         }
 
         tokio::select! {
@@ -612,7 +664,7 @@ pub(crate) async fn run_session_with(
                         process_input = None;
                         forced_failure = true;
                         pumps_aborted = true;
-                        begin_process_termination(control.as_ref(), &mut term_deadline);
+                        let _ = begin_process_termination(control.as_ref(), &mut term_deadline);
                         session.exit(1).await;
                     }
                     Ok(count) => {
@@ -658,7 +710,7 @@ pub(crate) async fn run_session_with(
                                     pumps_aborted = true;
                                     let _ = recorder.close();
                                     send_recording_termination(terminate_message.as_deref(), &handle, channel_id).await;
-                                    begin_process_termination(control.as_ref(), &mut term_deadline);
+                                    let _ = begin_process_termination(control.as_ref(), &mut term_deadline);
                                     session.exit(1).await;
                                 } else {
                                     log::warn!("SSH recorder transport failed; continuing per fail-open policy");
@@ -668,6 +720,9 @@ pub(crate) async fn run_session_with(
                         if deliver {
                             let _ = handle.data(channel_id, bytes::Bytes::copy_from_slice(&stdout_buf[..count])).await;
                         }
+                        if child_exit.is_some() {
+                            drain_deadline = Some(tokio::time::Instant::now() + OUTPUT_DRAIN_TIMEOUT);
+                        }
                     }
                 }
             }
@@ -675,8 +730,31 @@ pub(crate) async fn run_session_with(
                 match stderr {
                     Ok(0) | Err(_) => process_stderr = None,
                     Ok(count) => {
-                        let data = bytes::Bytes::copy_from_slice(&stderr_buf[..count]);
-                        let _ = handle.extended_data(channel_id, EXTENDED_DATA_STDERR, data).await;
+                        let mut deliver = true;
+                        if let Some(recorder) = recorder.as_ref() {
+                            if matches!(recorder.write(RecordDir::Output, &stderr_buf[..count]), RecordResult::Failed) {
+                                upload_result_rx = None;
+                                recorder.abort_upload();
+                                if terminate_message.is_some() {
+                                    deliver = false;
+                                    forced_failure = true;
+                                    pumps_aborted = true;
+                                    let _ = recorder.close();
+                                    send_recording_termination(terminate_message.as_deref(), &handle, channel_id).await;
+                                    let _ = begin_process_termination(control.as_ref(), &mut term_deadline);
+                                    session.exit(1).await;
+                                } else {
+                                    log::warn!("SSH recorder transport failed; continuing per fail-open policy");
+                                }
+                            }
+                        }
+                        if deliver {
+                            let data = bytes::Bytes::copy_from_slice(&stderr_buf[..count]);
+                            let _ = handle.extended_data(channel_id, EXTENDED_DATA_STDERR, data).await;
+                        }
+                        if child_exit.is_some() {
+                            drain_deadline = Some(tokio::time::Instant::now() + OUTPUT_DRAIN_TIMEOUT);
+                        }
                     }
                 }
             }
@@ -703,35 +781,62 @@ pub(crate) async fn run_session_with(
                     forced_failure = true;
                     pumps_aborted = true;
                     send_recording_termination(terminate_message.as_deref(), &handle, channel_id).await;
-                    begin_process_termination(control.as_ref(), &mut term_deadline);
+                    let _ = begin_process_termination(control.as_ref(), &mut term_deadline);
                     session.exit(1).await;
                 } else {
                     log::warn!("SSH recorder transport failed; continuing per fail-open policy");
                 }
             }
-            changed = cancel_rx.changed(), if term_deadline.is_none() => {
+            () = wait_for_deadline(session_deadline), if session_deadline.is_some() && term_deadline.is_none() => {
+                session_deadline = None;
+                forced_failure = true;
+                pumps_aborted = true;
+                let message = format!("Session timeout of {session_duration:?} elapsed.");
+                send_session_termination(&message, &handle, channel_id).await;
+                let _ = begin_process_termination(control.as_ref(), &mut term_deadline);
+                session.exit(1).await;
+            }
+            _ = policy_tick.tick(), if revalidate.is_some() && term_deadline.is_none() => {
+                if revalidate.as_ref().is_some_and(|check| check()) {
+                    policy_invalid_checks = 0;
+                } else {
+                    // A callback can be momentarily unavailable while the
+                    // async netmap lock is being replaced. Require persistence
+                    // across two polls, while still revoking within 500 ms.
+                    policy_invalid_checks = policy_invalid_checks.saturating_add(1);
+                    if policy_invalid_checks >= 2 {
+                        revalidate = None;
+                        forced_failure = true;
+                        pumps_aborted = true;
+                        send_session_termination("Access revoked.", &handle, channel_id).await;
+                        let _ = begin_process_termination(control.as_ref(), &mut term_deadline);
+                        session.exit(1).await;
+                    }
+                }
+            }
+            changed = cancel_rx.changed(), if term_deadline.is_none() && !forced_failure => {
                 if changed.is_err() || *cancel_rx.borrow() {
                     process_input = None;
                     pending_input.clear();
                     pending_input_offset = 0;
                     forced_failure = true;
                     pumps_aborted = true;
-                    begin_process_termination(control.as_ref(), &mut term_deadline);
+                    let _ = begin_process_termination(control.as_ref(), &mut term_deadline);
                     session.exit(1).await;
                 }
             }
-            Some(signal) = signal_rx.recv(), if term_deadline.is_none() => {
+            Some(signal) = signal_rx.recv(), if term_deadline.is_none() && !forced_failure => {
                 let _ = control.signal_group(sig_to_libc(&signal));
             }
             Some(window) = window_change_rx.recv() => {
-                if let Some(fd) = pty_ioctl_fd {
-                    let _ = set_winsize(fd, &window);
+                if let Some(fd) = pty_ioctl_fd.as_ref() {
+                    let _ = set_winsize(fd.as_raw_fd(), &window);
                 }
             }
             () = wait_for_deadline(drain_deadline), if drain_deadline.is_some() => {
                 drain_deadline = None;
                 pumps_aborted = true;
-                begin_process_termination(control.as_ref(), &mut term_deadline);
+                let _ = begin_process_termination(control.as_ref(), &mut term_deadline);
             }
             () = wait_for_deadline(term_deadline), if term_deadline.is_some() => {
                 term_deadline = None;
@@ -774,11 +879,26 @@ pub(crate) async fn run_session_with(
 fn begin_process_termination(
     control: &dyn ProcessControl,
     term_deadline: &mut Option<tokio::time::Instant>,
-) {
-    if term_deadline.is_none() {
-        let _ = control.signal_group(libc::SIGTERM);
-        *term_deadline = Some(tokio::time::Instant::now() + PROCESS_TERM_TIMEOUT);
+) -> bool {
+    if term_deadline.is_some() {
+        return true;
     }
+    if let Ok(false) = control.signal_group(libc::SIGTERM) {
+        false
+    } else {
+        *term_deadline = Some(tokio::time::Instant::now() + PROCESS_TERM_TIMEOUT);
+        true
+    }
+}
+
+#[cfg(unix)]
+async fn send_session_termination(
+    message: &str,
+    handle: &russh::server::Handle,
+    channel_id: russh::ChannelId,
+) {
+    let message = format!("\r\n\r\n{message}\r\n\r\n");
+    let _ = handle.data(channel_id, message).await;
 }
 
 #[cfg(unix)]
@@ -789,8 +909,7 @@ async fn send_recording_termination(
 ) {
     log::warn!("SSH recorder transport failed; terminating session");
     if let Some(message) = message {
-        let message = format!("\r\n\r\n{message}\r\n\r\n");
-        let _ = handle.data(channel_id, message).await;
+        send_session_termination(message, handle, channel_id).await;
     }
 }
 
@@ -910,6 +1029,64 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recorder_rejection_does_not_leak_pty_descriptors() {
+        fn fd_count() -> usize {
+            std::fs::read_dir("/dev/fd").map_or(0, Iterator::count)
+        }
+
+        // Other SSH tests also open PTYs and sockets. Let those parallel tests
+        // settle before taking the process-wide descriptor baseline.
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        let baseline = fd_count();
+        let dial: DialFn = std::sync::Arc::new(|_| {
+            Box::pin(async { Err(io::Error::other("injected recorder rejection")) })
+        });
+        let config = RecordingConfig {
+            recorders: vec!["100.64.0.9:80".parse().unwrap()],
+            on_failure: Some(rustscale_tailcfg::SSHRecorderFailureAction {
+                RejectSessionWithMessage: "recording required".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        for _ in 0..32 {
+            let (master, slave, _) = allocate_pty(&crate::session::Pty {
+                term: "xterm".into(),
+                window: Window {
+                    width: 80,
+                    height: 24,
+                    ..Default::default()
+                },
+            })
+            .unwrap();
+            let result = init_recording(
+                &config,
+                CastHeader::new(
+                    (80, 24),
+                    "command".into(),
+                    std::collections::HashMap::new(),
+                    "requested".into(),
+                    "mapped".into(),
+                    "connection".into(),
+                ),
+                Some(dial.clone()),
+            )
+            .await;
+            match result {
+                Err(message) => assert_eq!(message, "recording required"),
+                Ok(_) => panic!("recorder rejection unexpectedly succeeded"),
+            }
+            drop((master, slave));
+        }
+        let after = fd_count();
+        assert!(
+            after <= baseline + 3,
+            "PTY descriptors grew across recorder failures: {baseline} -> {after}"
+        );
+    }
+
     #[test]
     fn test_sig_to_libc_mapping() {
         assert_eq!(sig_to_libc(&Sig::INT), libc::SIGINT);

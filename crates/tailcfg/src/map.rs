@@ -106,6 +106,13 @@ pub struct MapRequest {
         deserialize_with = "deserialize_null_to_default"
     )]
     pub MapSessionSeq: i64,
+    /// Local Tailnet Lock authority head, if enabled.
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
+    pub TKAHead: String,
 }
 
 /// A control-plane ping request, including C2N HTTP callbacks.
@@ -168,13 +175,11 @@ pub struct MapResponse {
         deserialize_with = "deserialize_null_to_default"
     )]
     pub DERPMap: Option<DERPMap>,
-    /// Complete peer list (first response); sorted by `Node.ID`.
-    #[serde(
-        default,
-        skip_serializing_if = "skip_default",
-        deserialize_with = "deserialize_null_to_default"
-    )]
-    pub Peers: Vec<Node>,
+    /// Complete peer list (first response); sorted by `Node.ID`. Presence is
+    /// significant: `Some([])` revokes every peer, while absent or JSON null
+    /// means this delta does not replace the current snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub Peers: Option<Vec<Node>>,
     /// Changed/added peers since the last update; sorted by `Node.ID`.
     #[serde(
         default,
@@ -255,6 +260,10 @@ pub struct MapResponse {
         deserialize_with = "deserialize_null_to_default"
     )]
     pub SuggestedExitNode: StableNodeID,
+    /// Control's Tailnet Lock state. `None` in a delta means unchanged; on
+    /// the initial map it means disabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub TKAInfo: Option<crate::TKAInfo>,
 }
 
 /// Incremental update to a single peer (mirrors Go's `tailcfg.PeerChange`).
@@ -378,6 +387,7 @@ mod tests {
             DebugFlags: vec![],
             MapSessionHandle: String::new(),
             MapSessionSeq: 0,
+            TKAHead: String::new(),
         };
         let j = serde_json::to_string(&req).unwrap();
         assert!(j.contains("\"NodeKey\":\"nodekey:"));

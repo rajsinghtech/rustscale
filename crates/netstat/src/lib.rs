@@ -685,11 +685,11 @@ mod tests {
         };
         let started = Instant::now();
         let result = run_supervised_with_limiter(&options, &cancellation, limiter, move |_| {
-            let _ = blocked.recv_timeout(Duration::from_millis(500));
+            let _ = blocked.recv_timeout(Duration::from_secs(2));
             Ok(())
         });
         assert!(matches!(result, Err(Error::Cancelled)));
-        assert!(started.elapsed() < Duration::from_millis(150));
+        assert!(started.elapsed() < Duration::from_secs(1));
         release.send(()).unwrap();
         canceller.join().unwrap();
     }

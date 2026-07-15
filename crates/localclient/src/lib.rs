@@ -92,6 +92,55 @@ impl LocalClient {
         serde_json::from_value(body).map_err(|e| LocalClientError::Json(e.to_string()))
     }
 
+    /// GET /localapi/v0/tka/status — return Tailnet Lock status.
+    pub async fn tailnet_lock_status(&self) -> Result<serde_json::Value, LocalClientError> {
+        self.get_json("/localapi/v0/tka/status").await
+    }
+
+    /// POST /localapi/v0/tka/init — atomically initialize Tailnet Lock.
+    pub async fn tailnet_lock_init(
+        &self,
+        request: &serde_json::Value,
+    ) -> Result<serde_json::Value, LocalClientError> {
+        let body = serde_json::to_vec(request)
+            .map_err(|error| LocalClientError::Json(error.to_string()))?;
+        let (_, response) = self
+            .send_request_with_body("POST", "/localapi/v0/tka/init", &body)
+            .await?;
+        serde_json::from_slice(&response).map_err(|error| LocalClientError::Json(error.to_string()))
+    }
+
+    /// POST /localapi/v0/tka/init/ack — acknowledge receipt recovery.
+    pub async fn tailnet_lock_ack_init(
+        &self,
+        transaction_id: &str,
+    ) -> Result<(), LocalClientError> {
+        let body = serde_json::to_vec(&serde_json::json!({"TransactionID": transaction_id}))
+            .map_err(|error| LocalClientError::Json(error.to_string()))?;
+        self.send_request_with_body("POST", "/localapi/v0/tka/init/ack", &body)
+            .await?;
+        Ok(())
+    }
+
+    /// POST /localapi/v0/tka/sign — sign and publish a node key.
+    pub async fn tailnet_lock_sign(
+        &self,
+        request: &serde_json::Value,
+    ) -> Result<(), LocalClientError> {
+        let body = serde_json::to_vec(request)
+            .map_err(|error| LocalClientError::Json(error.to_string()))?;
+        self.send_request_with_body("POST", "/localapi/v0/tka/sign", &body)
+            .await?;
+        Ok(())
+    }
+
+    /// POST /localapi/v0/tka/disable — submit one raw disablement secret.
+    pub async fn tailnet_lock_disable(&self, secret: &[u8]) -> Result<(), LocalClientError> {
+        self.send_request_with_body("POST", "/localapi/v0/tka/disable", secret)
+            .await?;
+        Ok(())
+    }
+
     /// GET /localapi/v0/netmap — returns the netmap JSON (including DERPMap).
     pub async fn netmap(&self) -> Result<serde_json::Value, LocalClientError> {
         self.get_json("/localapi/v0/netmap").await

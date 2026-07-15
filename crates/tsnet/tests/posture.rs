@@ -9,6 +9,10 @@ use rustscale_tsnet::Server;
 
 async fn posture_response(control: &TestControlServer, server: &Server) -> serde_json::Value {
     let node_key = server.node_key().expect("node key");
+    control
+        .await_node_in_map_request(&node_key, Duration::from_secs(10))
+        .await
+        .expect("active map request");
     let callback = control.c2n_callback_url(&node_key);
     assert!(control.add_raw_map_response(
         &node_key,

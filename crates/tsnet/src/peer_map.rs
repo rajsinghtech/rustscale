@@ -7,6 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -28,6 +29,7 @@ struct IdentitySnapshot {
 pub(crate) struct Runtime {
     pub(crate) gate: tokio::sync::RwLock<()>,
     identity: RwLock<Arc<IdentitySnapshot>>,
+    authorization_epoch: AtomicU64,
     flows: Mutex<HashMap<Flow, FlowIdentity>>,
 }
 
@@ -37,6 +39,7 @@ impl Runtime {
         Ok(Arc::new(Self {
             gate: tokio::sync::RwLock::new(()),
             identity: RwLock::new(Arc::new(identity)),
+            authorization_epoch: AtomicU64::new(1),
             flows: Mutex::new(HashMap::new()),
         }))
     }
@@ -44,8 +47,20 @@ impl Runtime {
     pub(crate) fn install_locked(&self, peers: &[Node]) -> Result<(), ReconcileError> {
         let identity = IdentitySnapshot::from_peers(peers)?;
         *self.identity.write().expect("peer identity lock poisoned") = Arc::new(identity);
-        self.flows.lock().expect("peer flow lock poisoned").clear();
+        self.advance_authorization_epoch_locked();
         Ok(())
+    }
+
+    pub(crate) fn authorization_epoch(&self) -> u64 {
+        self.authorization_epoch.load(Ordering::Acquire)
+    }
+
+    /// Publish a non-identity authorization change (for example ShieldsUp)
+    /// while the caller holds `gate.write()`. Final plaintext delivery rejects
+    /// work staged against the preceding epoch.
+    pub(crate) fn advance_authorization_epoch_locked(&self) {
+        self.authorization_epoch.fetch_add(1, Ordering::AcqRel);
+        self.flows.lock().expect("peer flow lock poisoned").clear();
     }
 
     pub(crate) fn packet_source_matches(&self, peer: &NodePublic, packet: &[u8]) -> bool {
@@ -182,11 +197,10 @@ pub(crate) fn reconcile(
     current: &[Node],
     response: &MapResponse,
 ) -> Result<Vec<Node>, ReconcileError> {
-    let mut peers = if response.Peers.is_empty() {
-        current.to_vec()
-    } else {
-        response.Peers.clone()
-    };
+    let mut peers = response
+        .Peers
+        .as_ref()
+        .map_or_else(|| current.to_vec(), Clone::clone);
 
     let mut changed_ids = HashSet::new();
     for changed in &response.PeersChanged {
@@ -307,15 +321,31 @@ mod tests {
     }
 
     #[test]
+    fn absent_full_snapshot_preserves_and_present_empty_revokes() {
+        let key = NodePrivate::generate().public();
+        let current = vec![node(7, &key, "100.64.0.7")];
+        assert_eq!(
+            reconcile(&current, &MapResponse::default()).unwrap(),
+            current,
+            "an omitted Peers field is a delta omission"
+        );
+        let empty = MapResponse {
+            Peers: Some(Vec::new()),
+            ..Default::default()
+        };
+        assert!(reconcile(&current, &empty).unwrap().is_empty());
+    }
+
+    #[test]
     fn malformed_address_prefix_is_rejected() {
         let key = NodePrivate::generate().public();
         let response = MapResponse {
-            Peers: vec![Node {
+            Peers: Some(vec![Node {
                 ID: 1,
                 Key: key,
                 Addresses: vec!["100.64.0.1/garbage".into()],
                 ..Default::default()
-            }],
+            }]),
             ..Default::default()
         };
         assert!(matches!(
@@ -329,10 +359,10 @@ mod tests {
         let first = NodePrivate::generate().public();
         let second = NodePrivate::generate().public();
         let response = MapResponse {
-            Peers: vec![
+            Peers: Some(vec![
                 node(1, &first, "100.64.0.1"),
                 node(2, &second, "100.64.0.1"),
-            ],
+            ]),
             ..Default::default()
         };
         assert!(matches!(

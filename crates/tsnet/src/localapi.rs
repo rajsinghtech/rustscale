@@ -206,6 +206,10 @@ pub(crate) struct LocalApiState {
     pub taildrop: Option<Arc<crate::taildrop::TaildropManager>>,
     /// Disabled-by-default Taildrive runtime shared with PeerAPI.
     pub drive: Arc<crate::drive::Runtime>,
+    /// Shared authorization/route/filter commit gate.
+    pub peer_map: Arc<crate::peer_map::Runtime>,
+    /// Tailnet Lock authority and control operations. Unavailable before login.
+    pub(crate) tailnet_lock: Option<Arc<crate::tailnet_lock::TailnetLock>>,
     /// Netstack handle for dialing peer PeerAPIs (None in TUN mode or
     /// before `up()`). Used by the `file-put` endpoint to proxy uploads
     /// through the tailnet.
@@ -417,7 +421,7 @@ pub(crate) async fn read_request<R: AsyncRead + Unpin>(
                 std::str::from_utf8(head).map_err(|_| "non-utf8 header".to_string())?;
             let cl = extract_content_length(header_text);
             let request_target = header_text
-                .split("\r\n")
+                .lines()
                 .next()
                 .and_then(|line| line.split_whitespace().nth(1))
                 .unwrap_or_default();
@@ -425,6 +429,9 @@ pub(crate) async fn read_request<R: AsyncRead + Unpin>(
                 && cl > crate::drive::MAX_CONFIG_BODY
             {
                 return Err("Taildrive configuration body too large".into());
+            }
+            if request_target.starts_with("/localapi/v0/tka/") && cl > 1024 * 1024 {
+                return Err("Tailnet Lock request body too large".into());
             }
             while body.len() < cl {
                 let n = conn
@@ -675,6 +682,15 @@ async fn handle_reload_config<W: AsyncWrite + Unpin>(
     };
 
     let masked = config.parsed.to_prefs();
+    let authorization_changed = masked.ShieldsUpSet
+        || masked.ExitNodeAllowLANAccessSet
+        || masked.ExitNodeIDSet
+        || masked.ExitNodeIPSet;
+    let map_commit = if authorization_changed {
+        Some(state.peer_map.gate.write().await)
+    } else {
+        None
+    };
     let updated = match commit_prefs_update(state, |prefs| masked.apply_to(prefs)).await {
         Ok((updated, _)) => updated,
         Err(error) => {
@@ -689,9 +705,19 @@ async fn handle_reload_config<W: AsyncWrite + Unpin>(
         }
     };
 
-    if masked.ExitNodeAllowLANAccessSet || masked.ExitNodeIDSet || masked.ExitNodeIPSet {
-        apply_exit_node_prefs(state).await;
+    if masked.ShieldsUpSet {
+        if let Some(filter) = state.filter.get() {
+            filter
+                .lock()
+                .unwrap()
+                .set_shields_up(masked.Prefs.ShieldsUp);
+            state.peer_map.advance_authorization_epoch_locked();
+        }
     }
+    if masked.ExitNodeAllowLANAccessSet || masked.ExitNodeIDSet || masked.ExitNodeIPSet {
+        apply_exit_node_prefs_locked(state).await;
+    }
+    drop(map_commit);
 
     state.ipn_backend.bus().send(rustscale_ipn::Notify {
         Prefs: Some(updated.clone()),
@@ -750,7 +776,13 @@ pub(crate) fn resolve_exit_node_peer(peers: &[Node], ip_or_name: &str) -> Option
 /// Apply an explicit LocalAPI/config preference to the route table. An
 /// unresolved value becomes the sole pending persisted selection for map
 /// updates to retry; a resolved or cleared value has no later prefs reapply.
+#[cfg(test)]
 pub(crate) async fn apply_exit_node_prefs(state: &Arc<LocalApiState>) {
+    let _map_commit = state.peer_map.gate.write().await;
+    apply_exit_node_prefs_locked(state).await;
+}
+
+async fn apply_exit_node_prefs_locked(state: &Arc<LocalApiState>) {
     let prefs = state.prefs.read().await.clone();
     let Some(ref rt) = state.route_table else {
         return;
@@ -762,9 +794,9 @@ pub(crate) async fn apply_exit_node_prefs(state: &Arc<LocalApiState>) {
         &prefs.ExitNodeID
     } else {
         // No exit node selected — clear it.
+        state.exit_node_selection.write().await.clear_pending();
         let mut routes = rt.write().await;
         routes.clear_exit_node();
-        state.exit_node_selection.write().await.clear_pending();
         if let Some(router) = state.router.as_ref() {
             let derp_map = state.magicsock.get_derp_map();
             let control_url = state.prefs.read().await.ControlURL.clone();
@@ -788,20 +820,20 @@ pub(crate) async fn apply_exit_node_prefs(state: &Arc<LocalApiState>) {
     };
 
     let peers = state.peers.read().await;
+    let resolved = resolve_exit_node_peer(&peers, ip_or_name);
+    drop(peers);
+    let mut selection = state.exit_node_selection.write().await;
     let mut routes = rt.write().await;
-    if let Some(peer_key) = resolve_exit_node_peer(&peers, ip_or_name) {
+    if let Some(peer_key) = resolved {
         routes.set_exit_node(peer_key);
-        state.exit_node_selection.write().await.clear_pending();
+        selection.clear_pending();
     } else {
         // Peer not found (may not be in the netmap yet). Clear for now and
         // retain only this unresolved explicit preference for a future map.
         routes.clear_exit_node();
-        state
-            .exit_node_selection
-            .write()
-            .await
-            .replace_from_prefs(&prefs);
+        selection.replace_from_prefs(&prefs);
     }
+    drop(selection);
     if let Some(router) = state.router.as_ref() {
         let derp_map = state.magicsock.get_derp_map();
         let control_url = state.prefs.read().await.ControlURL.clone();
@@ -844,6 +876,12 @@ async fn handle_patch_prefs<W: AsyncWrite + Unpin>(
     let exit_node_changed =
         masked.ExitNodeIDSet || masked.ExitNodeIPSet || masked.ExitNodeAllowLANAccessSet;
     let disconnect_requested = masked.WantRunningSet && !masked.Prefs.WantRunning;
+    let authorization_changed = exit_node_changed || masked.ShieldsUpSet;
+    let map_commit = if authorization_changed {
+        Some(state.peer_map.gate.write().await)
+    } else {
+        None
+    };
 
     let updated = match commit_prefs_update(state, |prefs| masked.apply_to(prefs)).await {
         Ok((updated, _)) => updated,
@@ -868,6 +906,7 @@ async fn handle_patch_prefs<W: AsyncWrite + Unpin>(
                 .lock()
                 .unwrap()
                 .set_shields_up(masked.Prefs.ShieldsUp);
+            state.peer_map.advance_authorization_epoch_locked();
         }
     }
 
@@ -875,8 +914,9 @@ async fn handle_patch_prefs<W: AsyncWrite + Unpin>(
     // When ExitNodeIP or ExitNodeID is patched, resolve the peer and
     // update the route table — mirroring Go's applyPrefsToEngine.
     if exit_node_changed {
-        apply_exit_node_prefs(state).await;
+        apply_exit_node_prefs_locked(state).await;
     }
+    drop(map_commit);
 
     if disconnect_requested {
         if let Some(logger) = &state.audit_logger {
@@ -895,6 +935,163 @@ async fn handle_patch_prefs<W: AsyncWrite + Unpin>(
     });
     write_json_response(conn, 200, "OK", &updated).await?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tailnet Lock handlers
+// ---------------------------------------------------------------------------
+
+async fn handle_tka_status<W: AsyncWrite + Unpin>(
+    conn: &mut W,
+    state: &Arc<LocalApiState>,
+) -> Result<(), std::io::Error> {
+    let Some(lock) = state.tailnet_lock.as_ref() else {
+        let body = serde_json::json!({"error": "Tailnet Lock state is unavailable before login"});
+        write_json_response(conn, 409, "Conflict", &body).await?;
+        return Ok(());
+    };
+    write_json_response(conn, 200, "OK", &lock.status_json()).await
+}
+
+async fn handle_tka_init<W: AsyncRead + AsyncWrite + Unpin>(
+    conn: &mut W,
+    body: &[u8],
+    state: &Arc<LocalApiState>,
+) -> Result<(), std::io::Error> {
+    let Ok(request) = serde_json::from_slice::<crate::tailnet_lock::InitRequest>(body) else {
+        let body = serde_json::json!({"error": "invalid Tailnet Lock initialization request"});
+        write_json_response(conn, 400, "Bad Request", &body).await?;
+        return Ok(());
+    };
+    let Some(lock) = state.tailnet_lock.as_ref() else {
+        let body = serde_json::json!({"error": "Tailnet Lock state is unavailable"});
+        write_json_response(conn, 409, "Conflict", &body).await?;
+        return Ok(());
+    };
+    let mut disconnect = [0u8; 1];
+    let operation = lock.init(request);
+    tokio::pin!(operation);
+    let result = tokio::select! {
+        result = &mut operation => result,
+        _ = conn.read(&mut disconnect) => return Ok(()),
+    };
+    match result {
+        Ok(secrets) => {
+            let mut status = lock.status_json();
+            if let Some(object) = status.as_object_mut() {
+                object.insert(
+                    "DisablementSecrets".into(),
+                    serde_json::to_value(secrets).unwrap_or_default(),
+                );
+            }
+            write_json_response(conn, 200, "OK", &status).await?;
+        }
+        Err(error) => write_tka_error(conn, &error).await?,
+    }
+    Ok(())
+}
+
+async fn handle_tka_init_ack<W: AsyncWrite + Unpin>(
+    conn: &mut W,
+    body: &[u8],
+    state: &Arc<LocalApiState>,
+) -> Result<(), std::io::Error> {
+    let Ok(request) = serde_json::from_slice::<crate::tailnet_lock::InitReceiptAck>(body) else {
+        let body = serde_json::json!({"error": "invalid receipt acknowledgement"});
+        write_json_response(conn, 400, "Bad Request", &body).await?;
+        return Ok(());
+    };
+    let Some(lock) = state.tailnet_lock.as_ref() else {
+        let body = serde_json::json!({"error": "Tailnet Lock state is unavailable"});
+        write_json_response(conn, 409, "Conflict", &body).await?;
+        return Ok(());
+    };
+    match lock.acknowledge_init_receipt(request).await {
+        Ok(()) => write_no_content_response(conn, 204, "No Content").await?,
+        Err(error) => write_tka_error(conn, &error).await?,
+    }
+    Ok(())
+}
+
+async fn handle_tka_sign<W: AsyncRead + AsyncWrite + Unpin>(
+    conn: &mut W,
+    body: &[u8],
+    state: &Arc<LocalApiState>,
+) -> Result<(), std::io::Error> {
+    let Ok(request) = serde_json::from_slice::<crate::tailnet_lock::SignRequest>(body) else {
+        let body = serde_json::json!({"error": "invalid Tailnet Lock signing request"});
+        write_json_response(conn, 400, "Bad Request", &body).await?;
+        return Ok(());
+    };
+    let Some(lock) = state.tailnet_lock.as_ref() else {
+        let body = serde_json::json!({"error": "Tailnet Lock state is unavailable"});
+        write_json_response(conn, 409, "Conflict", &body).await?;
+        return Ok(());
+    };
+    let mut disconnect = [0u8; 1];
+    let operation = lock.sign(request);
+    tokio::pin!(operation);
+    let result = tokio::select! {
+        result = &mut operation => result,
+        _ = conn.read(&mut disconnect) => return Ok(()),
+    };
+    match result {
+        Ok(()) => write_no_content_response(conn, 204, "No Content").await?,
+        Err(error) => write_tka_error(conn, &error).await?,
+    }
+    Ok(())
+}
+
+async fn handle_tka_disable<W: AsyncRead + AsyncWrite + Unpin>(
+    conn: &mut W,
+    secret: &[u8],
+    state: &Arc<LocalApiState>,
+) -> Result<(), std::io::Error> {
+    let Some(lock) = state.tailnet_lock.as_ref() else {
+        let body = serde_json::json!({"error": "Tailnet Lock state is unavailable"});
+        write_json_response(conn, 409, "Conflict", &body).await?;
+        return Ok(());
+    };
+    let mut disconnect = [0u8; 1];
+    let operation = lock.disable(secret.to_vec());
+    tokio::pin!(operation);
+    let result = tokio::select! {
+        result = &mut operation => result,
+        _ = conn.read(&mut disconnect) => return Ok(()),
+    };
+    match result {
+        Ok(()) => write_no_content_response(conn, 204, "No Content").await?,
+        Err(error) => write_tka_error(conn, &error).await?,
+    }
+    Ok(())
+}
+
+async fn write_tka_error<W: AsyncWrite + Unpin>(
+    conn: &mut W,
+    error: &crate::tailnet_lock::TailnetLockError,
+) -> Result<(), std::io::Error> {
+    use crate::tailnet_lock::TailnetLockError;
+    let (status, reason, message) = match error {
+        TailnetLockError::InvalidRequest(message) => (400, "Bad Request", message.as_str()),
+        TailnetLockError::InitAmbiguous => (
+            409,
+            "Conflict",
+            "Tailnet Lock initialization outcome is ambiguous; secrets are safe in the durable receipt; check status or resume",
+        ),
+        TailnetLockError::AlreadyEnabled
+        | TailnetLockError::NotEnabled
+        | TailnetLockError::SigningKeyNotTrusted
+        | TailnetLockError::NoStateDirectory
+        | TailnetLockError::StateUnavailable => {
+            (409, "Conflict", "Tailnet Lock precondition failed")
+        }
+        TailnetLockError::Control(_)
+        | TailnetLockError::Authority(_)
+        | TailnetLockError::Sync(_)
+        | TailnetLockError::Persistence(_) => (502, "Bad Gateway", "Tailnet Lock operation failed"),
+    };
+    let body = serde_json::json!({"error": message});
+    write_json_response(conn, status, reason, &body).await
 }
 
 // ---------------------------------------------------------------------------
@@ -1037,6 +1234,11 @@ pub(crate) async fn dispatch<W: AsyncRead + AsyncWrite + Unpin>(
                     "/localapi/v0/shutdown",
                     "/localapi/v0/id-token",
                     "/localapi/v0/reload-config",
+                    "/localapi/v0/tka/status",
+                    "/localapi/v0/tka/init",
+                    "/localapi/v0/tka/init/ack",
+                    "/localapi/v0/tka/sign",
+                    "/localapi/v0/tka/disable",
                 ]);
                 write_json_response(conn, 200, "OK", &endpoints).await?;
             } else {
@@ -1106,6 +1308,43 @@ pub(crate) async fn dispatch<W: AsyncRead + AsyncWrite + Unpin>(
                 return Ok(());
             }
             handle_logout(conn, state).await?;
+        }
+
+        // --- Tailnet Lock status/init/sign/disable ---
+        "tka/status" if method == "GET" => {
+            handle_tka_status(conn, state).await?;
+        }
+        "tka/init" if method == "POST" => {
+            if !require_readwrite(peer_identity) {
+                write_access_denied(conn).await?;
+                return Ok(());
+            }
+            handle_tka_init(conn, &req.body, state).await?;
+        }
+        "tka/init/ack" if method == "POST" => {
+            if !require_readwrite(peer_identity) {
+                write_access_denied(conn).await?;
+                return Ok(());
+            }
+            handle_tka_init_ack(conn, &req.body, state).await?;
+        }
+        "tka/sign" if method == "POST" => {
+            if !require_readwrite(peer_identity) {
+                write_access_denied(conn).await?;
+                return Ok(());
+            }
+            handle_tka_sign(conn, &req.body, state).await?;
+        }
+        "tka/disable" if method == "POST" => {
+            if !require_readwrite(peer_identity) {
+                write_access_denied(conn).await?;
+                return Ok(());
+            }
+            handle_tka_disable(conn, &req.body, state).await?;
+        }
+        endpoint if endpoint.starts_with("tka/") => {
+            let body = serde_json::json!({"error": "bad Tailnet Lock method or endpoint"});
+            write_json_response(conn, 405, "Method Not Allowed", &body).await?;
         }
 
         // --- GET /localapi/v0/netmap ---
@@ -3559,6 +3798,7 @@ mod tests {
         let magicsock = Arc::new(magicsock_inner);
 
         let peer = Node {
+            ID: 1,
             Name: "peer1.tailnet.ts.net.".into(),
             Key: node_key.public(),
             Addresses: vec!["100.64.0.2/32".into()],
@@ -3627,9 +3867,17 @@ mod tests {
             control_params: None,
             taildrop: None,
             drive: crate::drive::Runtime::new(),
+            peer_map: crate::peer_map::Runtime::new(&[Node {
+                ID: 1,
+                Key: node_key.public(),
+                Addresses: vec!["100.64.0.2/32".into()],
+                ..Default::default()
+            }])
+            .unwrap(),
+            tailnet_lock: None,
             netstack: None,
             filter: std::sync::OnceLock::new(),
-            route_table: None,
+            route_table: Some(Arc::new(RwLock::new(crate::routing::RouteTable::default()))),
             router: None,
             logout_trigger: Arc::new(tokio::sync::Notify::new()),
             suggested_exit_node: Arc::new(RwLock::new(String::new())),
@@ -3641,6 +3889,39 @@ mod tests {
             preference_policy: None,
             policy_subscription: std::sync::Mutex::new(None),
         })
+    }
+
+    #[tokio::test]
+    async fn concurrent_exit_api_waits_for_peer_map_commit_gate() {
+        let state = make_test_state().await;
+        {
+            let mut peers = state.peers.write().await;
+            peers[0].AllowedIPs = vec!["0.0.0.0/0".into(), "::/0".into()];
+        }
+        state.prefs.write().await.ExitNodeIP = "100.64.0.2".into();
+
+        let in_flight_map = state.peer_map.gate.read().await;
+        let update_state = state.clone();
+        let update = tokio::spawn(async move {
+            apply_exit_node_prefs(&update_state).await;
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !update.is_finished(),
+            "exit API bypassed the route/map commit gate"
+        );
+        drop(in_flight_map);
+        update.await.unwrap();
+
+        let selected = state
+            .route_table
+            .as_ref()
+            .unwrap()
+            .read()
+            .await
+            .exit_node()
+            .cloned();
+        assert_eq!(selected, Some(state.peers.read().await[0].Key.clone()));
     }
 
     struct TestRouteProvider(rustscale_routecheck::RouteSnapshot);
@@ -4761,6 +5042,8 @@ mod tests {
             control_params: None,
             taildrop: None,
             drive: state.drive.clone(),
+            peer_map: state.peer_map.clone(),
+            tailnet_lock: None,
             netstack: None,
             filter: std::sync::OnceLock::new(),
             route_table: None,
@@ -5003,6 +5286,8 @@ mod tests {
             control_params: None,
             taildrop: None,
             drive: base.drive.clone(),
+            peer_map: base.peer_map.clone(),
+            tailnet_lock: None,
             netstack: None,
             filter: std::sync::OnceLock::new(),
             route_table: None,
@@ -5459,6 +5744,18 @@ mod tests {
             "read-only peer should get 403: {resp}"
         );
         assert!(resp.contains("access denied"));
+    }
+
+    #[tokio::test]
+    async fn test_readonly_identity_blocked_from_tailnet_lock_mutation() {
+        let state = make_test_state().await;
+        let resp = send_request_with_identity(
+            b"POST /localapi/v0/tka/disable HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\nConnection: close\r\n\r\nx",
+            &state,
+            test_ro_identity(),
+        )
+        .await;
+        assert!(resp.contains("403 Forbidden"));
     }
 
     #[tokio::test]

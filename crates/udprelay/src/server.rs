@@ -80,6 +80,7 @@ impl Server {
             max_vni: config.max_vni,
             udp4: Arc::new(udp4),
             closed: AtomicBool::new(false),
+            delivery_gate: tokio::sync::RwLock::new(()),
             state: Mutex::new(ServerState {
                 mac_secrets: Vec::new(),
                 mac_secret_rotated_at: None,
@@ -151,15 +152,56 @@ impl Server {
         self.inner.get_mac_secrets(Instant::now())
     }
 
+    /// Whether the server currently accepts fresh allocations.
+    pub fn is_enabled(&self) -> bool {
+        !self.inner.closed.load(Ordering::Acquire)
+            && !self.inner.state.lock().unwrap().server_closed
+    }
+
     /// Number of active endpoints (for testing/diagnostics).
     pub fn endpoint_count(&self) -> usize {
         let state = self.inner.state.lock().unwrap();
         state.endpoints_by_vni.len()
     }
 
-    /// Close the server, stopping all background tasks.
+    /// Stop accepting allocations and synchronously revoke every active VNI.
+    /// Socket tasks remain alive so a later freshly authorized map/config can
+    /// re-enable the same extension without retaining any prior allocation.
+    pub async fn disable_and_drain(&self) {
+        let _delivery = self.inner.delivery_gate.write().await;
+        let mut state = self.inner.state.lock().unwrap();
+        state.server_closed = true;
+        for endpoint in state.endpoints_by_vni.values() {
+            endpoint.inner.lock().unwrap().closed = true;
+        }
+        state.endpoints_by_vni.clear();
+        state.endpoints_by_disco.clear();
+        state.mac_secrets.clear();
+        state.mac_secret_rotated_at = None;
+    }
+
+    /// Re-enable allocation only after the embedding has validated a fresh
+    /// matching map/config. Disabled allocations are never restored.
+    pub fn enable(&self) {
+        if self.inner.closed.load(Ordering::Acquire) {
+            return;
+        }
+        self.inner.state.lock().unwrap().server_closed = false;
+    }
+
+    /// Close the server, synchronously draining allocations and stopping all
+    /// background tasks.
     pub fn close(&self) {
         self.inner.closed.store(true, Ordering::SeqCst);
+        let mut state = self.inner.state.lock().unwrap();
+        state.server_closed = true;
+        for endpoint in state.endpoints_by_vni.values() {
+            endpoint.inner.lock().unwrap().closed = true;
+        }
+        state.endpoints_by_vni.clear();
+        state.endpoints_by_disco.clear();
+        state.mac_secrets.clear();
+        drop(state);
         let tasks = self.tasks.lock().unwrap();
         for task in tasks.iter() {
             task.abort();
@@ -195,6 +237,7 @@ struct ServerInner {
     max_vni: u32,
     udp4: Arc<UdpSocket>,
     closed: AtomicBool,
+    delivery_gate: tokio::sync::RwLock<()>,
     state: Mutex<ServerState>,
 }
 
@@ -360,6 +403,10 @@ impl ServerInner {
             match self.udp4.recv_from(&mut buf).await {
                 Ok((n, from)) => {
                     if n == 0 {
+                        continue;
+                    }
+                    let _delivery = self.delivery_gate.read().await;
+                    if self.state.lock().unwrap().server_closed {
                         continue;
                     }
                     if let Some((reply, to)) = self.handle_packet(from, &buf[..n]) {

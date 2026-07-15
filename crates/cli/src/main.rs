@@ -221,7 +221,7 @@ fn usage(bin: &str) {
     eprintln!("  id-token <audience>                  fetch an OIDC ID token for this machine");
     eprintln!("  update [--yes|--dry-run] [flags]   update from RustScale GitHub releases");
     eprintln!("  wait [--timeout <duration>]          wait for backend to reach Running state");
-    eprintln!("  lock [status|init|add|remove|disable]  manage tailnet lock (not yet supported)");
+    eprintln!("  lock [status|init|sign|disable]       manage the supported Tailnet Lock flows");
     eprintln!("  drive [list|share|unshare]           manage Taildrive shares (not yet supported)");
     eprintln!("  completion <bash|zsh|fish>           generate shell completion script");
 }

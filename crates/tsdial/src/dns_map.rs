@@ -37,7 +37,7 @@ impl DnsMap {
         if let Some(ref node) = nm.Node {
             add_node(&mut map, node, &domain);
         }
-        for peer in &nm.Peers {
+        for peer in nm.Peers.iter().flatten() {
             add_node(&mut map, peer, &domain);
         }
         if let Some(ref dns) = nm.DNSConfig {
@@ -267,7 +267,7 @@ mod tests {
 
         let nm = MapResponse {
             Node: Some(node),
-            Peers: vec![peer],
+            Peers: Some(vec![peer]),
             Domain: "example.ts.net".into(),
             ..Default::default()
         };
@@ -338,7 +338,7 @@ mod tests {
         };
 
         let nm = MapResponse {
-            Peers: vec![peer],
+            Peers: Some(vec![peer]),
             ..Default::default()
         };
 

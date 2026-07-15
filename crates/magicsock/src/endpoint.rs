@@ -5,7 +5,7 @@
 //! best confirmed direct path with a trust expiry, an optional peer-relay path,
 //! and a DERP fallback (the peer's home region).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
@@ -17,6 +17,10 @@ pub const TRUST_BEST_ADDR_DURATION: Duration = Duration::from_millis(6500);
 /// DERP route stale and clear it. Mirrors Go's derpRoute inactivity
 /// semantics — the route is cleaned up after this timeout.
 pub const DERP_ROUTE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Maximum current/recent relay addresses retained per exact server
+/// generation for revocation cleanup.
+pub(crate) const MAX_RELAY_PATH_HISTORY_PER_SERVER: usize = 8;
 
 /// Endpoint type, mirroring Go's `tailcfg.EndpointType` (tailcfg.go:1332).
 /// Used for ranking candidate paths: higher-ranked types are preferred.
@@ -254,6 +258,14 @@ impl BestPath {
 }
 
 /// Per-peer endpoint state.
+#[derive(Clone)]
+struct RelayPath {
+    addr: SocketAddr,
+    vni: u32,
+    server_key: rustscale_key::NodePublic,
+    server_generation: u64,
+}
+
 pub struct Endpoint {
     peer_node_key: rustscale_key::NodePublic,
     /// The peer's first Tailscale address, used as the source of physical
@@ -262,7 +274,8 @@ pub struct Endpoint {
     peer_disco_key: rustscale_key::DiscoPublic,
     candidates: Vec<(SocketAddr, EndpointType)>,
     best_addr: Option<(SocketAddr, Instant)>,
-    relay: Option<(SocketAddr, u32)>,
+    relay: Option<RelayPath>,
+    relay_history: HashMap<(rustscale_key::NodePublic, u64), VecDeque<SocketAddr>>,
     home_derp: i32,
     /// The DERP region from which the most recent packet from this peer
     /// arrived. Used for reply routing when HomeDERP is 0 or stale.
@@ -305,6 +318,7 @@ impl Endpoint {
             candidates: Vec::new(),
             best_addr: None,
             relay: None,
+            relay_history: HashMap::new(),
             home_derp,
             last_recv_derp_region: 0,
             last_recv_derp_at: None,
@@ -479,8 +493,11 @@ impl Endpoint {
                 };
             }
         }
-        if let Some((addr, vni)) = self.relay {
-            return BestPath::Relay { addr, vni };
+        if let Some(relay) = self.relay.as_ref() {
+            return BestPath::Relay {
+                addr: relay.addr,
+                vni: relay.vni,
+            };
         }
         // Check derp route validity without mutating (best_path is &self).
         let derp_region = if self.derp_route_valid() {
@@ -502,13 +519,95 @@ impl Endpoint {
     }
 
     /// Record a peer relay path.
-    pub fn set_relay(&mut self, addr: SocketAddr, vni: u32) {
-        self.relay = Some((addr, vni));
+    pub fn set_relay(
+        &mut self,
+        addr: SocketAddr,
+        vni: u32,
+        server_key: rustscale_key::NodePublic,
+        server_generation: u64,
+    ) -> Vec<SocketAddr> {
+        let history = self
+            .relay_history
+            .entry((server_key.clone(), server_generation))
+            .or_default();
+        if let Some(existing) = history.iter().position(|existing| *existing == addr) {
+            history.remove(existing);
+        }
+        history.push_back(addr);
+        let mut evicted = Vec::new();
+        while history.len() > MAX_RELAY_PATH_HISTORY_PER_SERVER {
+            if let Some(oldest) = history.pop_front() {
+                debug_assert_ne!(oldest, addr, "current relay address must not be evicted");
+                evicted.push(oldest);
+            }
+        }
+        self.relay = Some(RelayPath {
+            addr,
+            vni,
+            server_key,
+            server_generation,
+        });
+        evicted
     }
 
-    /// Clear the relay path.
+    /// Return the current relay path and its server identity.
+    pub fn current_relay(&self) -> Option<(SocketAddr, u32, &rustscale_key::NodePublic, u64)> {
+        self.relay.as_ref().map(|relay| {
+            (
+                relay.addr,
+                relay.vni,
+                &relay.server_key,
+                relay.server_generation,
+            )
+        })
+    }
+
+    /// Clear the relay path and its retained reverse-map history.
     pub fn clear_relay(&mut self) {
         self.relay = None;
+        self.relay_history.clear();
+    }
+
+    /// Clear and return every relay address associated with this exact server
+    /// identity, including addresses replaced by newer relay paths.
+    pub fn clear_relay_server(
+        &mut self,
+        server_key: &rustscale_key::NodePublic,
+        server_generation: u64,
+    ) -> Vec<SocketAddr> {
+        let identity = (server_key.clone(), server_generation);
+        let mut addresses = self
+            .relay_history
+            .remove(&identity)
+            .unwrap_or_default()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let matches_current = self.relay.as_ref().is_some_and(|relay| {
+            &relay.server_key == server_key && relay.server_generation == server_generation
+        });
+        if matches_current {
+            if let Some(relay) = self.relay.take() {
+                if !addresses.contains(&relay.addr) {
+                    addresses.push(relay.addr);
+                }
+            }
+        } else if let Some(current) = self.relay.as_ref() {
+            // An address can be reused by a newer server identity. Its single
+            // reverse-map slot now belongs to the current path, not history.
+            addresses.retain(|address| *address != current.addr);
+        }
+        addresses
+    }
+
+    #[cfg(test)]
+    pub fn relay_history_len(
+        &self,
+        server_key: &rustscale_key::NodePublic,
+        server_generation: u64,
+    ) -> usize {
+        self.relay_history
+            .get(&(server_key.clone(), server_generation))
+            .map_or(0, VecDeque::len)
     }
 
     /// Whether the direct path has expired at `now`.
@@ -893,7 +992,7 @@ mod tests {
         let mut e = ep();
         let now = Instant::now();
 
-        e.set_relay(sa(4000), 42);
+        e.set_relay(sa(4000), 42, NodePrivate::generate().public(), 1);
         assert_eq!(e.best_path(now).class(), PathClass::Relay);
 
         e.confirm_direct(sa(5000), now);
@@ -904,7 +1003,7 @@ mod tests {
     fn trust_expires_to_relay() {
         let mut e = ep();
         let now = Instant::now();
-        e.set_relay(sa(4000), 42);
+        e.set_relay(sa(4000), 42, NodePrivate::generate().public(), 1);
         e.confirm_direct(sa(5000), now);
 
         assert_eq!(e.best_path(now).class(), PathClass::Direct);

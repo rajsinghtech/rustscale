@@ -733,6 +733,7 @@ async fn netmap_refreshes_peer_disco_key_and_reverse_map() {
         magicsock.inner.peer_disco_key(&peer_key),
         Some(first_disco.clone())
     );
+    let first_disco_generation = magicsock.authorization_generation(&peer_key).unwrap();
     assert_eq!(
         magicsock
             .inner
@@ -752,13 +753,19 @@ async fn netmap_refreshes_peer_disco_key_and_reverse_map() {
         )])
         .await
         .unwrap();
+    assert_ne!(
+        magicsock.authorization_generation(&peer_key),
+        Some(first_disco_generation),
+        "disco-key rotation must invalidate callbacks stamped for the old source key"
+    );
     {
         let d2p = magicsock.inner.disco_to_peer.read().unwrap();
         assert!(!d2p.contains_key(&first_disco));
         assert_eq!(d2p.get(&rotated_disco), Some(&peer_key));
     }
 
-    // A stale mapping must not be removed if another peer now owns the key.
+    // A reverse mapping owned by a peer absent from the new authoritative
+    // netmap must be removed during reconciliation.
     magicsock
         .inner
         .disco_to_peer
@@ -793,8 +800,547 @@ async fn netmap_refreshes_peer_disco_key_and_reverse_map() {
             .read()
             .unwrap()
             .get(&rotated_disco),
-        Some(&other_peer)
+        None
     );
+
+    let old_generation = magicsock.authorization_generation(&peer_key).unwrap();
+    let learned: SocketAddr = "127.0.0.1:4242".parse().unwrap();
+    magicsock
+        .inner
+        .addr_to_peer
+        .write()
+        .unwrap()
+        .insert(learned, peer_key.clone());
+    magicsock.set_netmap(Vec::new()).await.unwrap();
+    assert!(!magicsock
+        .inner
+        .endpoints
+        .read()
+        .unwrap()
+        .contains_key(&peer_key));
+    assert!(!magicsock
+        .inner
+        .addr_to_peer
+        .read()
+        .unwrap()
+        .contains_key(&learned));
+    assert!(magicsock.authorization_generation(&peer_key).is_none());
+
+    magicsock
+        .set_netmap(vec![make_peer(
+            peer_key.clone(),
+            DiscoPrivate::generate().public(),
+            vec![],
+            0,
+        )])
+        .await
+        .unwrap();
+    assert_ne!(
+        magicsock.authorization_generation(&peer_key),
+        Some(old_generation),
+        "reauthorization must create a fresh generation"
+    );
+    assert_eq!(
+        magicsock
+            .inner
+            .endpoints
+            .read()
+            .unwrap()
+            .get(&peer_key)
+            .unwrap()
+            .pending_pings_count(),
+        0,
+        "reauthorization must not inherit probe state"
+    );
+}
+
+#[tokio::test]
+async fn revocation_commit_waits_for_plaintext_delivery_barrier() {
+    let peer = NodePrivate::generate().public();
+    let (magicsock, _rx) = Magicsock::new(MagicsockConfig {
+        private_key: NodePrivate::generate(),
+        disco_key: DiscoPrivate::generate(),
+        derp_client: None,
+        derp_map: None,
+        home_derp_region: 0,
+        udp_bind: None,
+        udp_socket: None,
+        portmapper: None,
+        health: None,
+        disable_direct_paths: false,
+        peer_relay_server: false,
+        relay_server_config: None,
+        sockstats: None,
+        control_knobs: None,
+    })
+    .await
+    .unwrap();
+    magicsock
+        .set_netmap(vec![make_peer(
+            peer.clone(),
+            DiscoPrivate::generate().public(),
+            vec![],
+            0,
+        )])
+        .await
+        .unwrap();
+    let generation = magicsock.authorization_generation(&peer).unwrap();
+    let magicsock = Arc::new(magicsock);
+    let delivery = magicsock.authorization_delivery_guard().await;
+    assert!(magicsock.is_authorization_current(&peer, generation));
+
+    let revoke_socket = magicsock.clone();
+    let revoke = tokio::spawn(async move { revoke_socket.set_netmap(Vec::new()).await.unwrap() });
+    tokio::task::yield_now().await;
+    assert!(
+        magicsock.is_authorization_current(&peer, generation),
+        "commit published while plaintext delivery held the barrier"
+    );
+    drop(delivery);
+    revoke.await.unwrap();
+    assert!(!magicsock.is_authorization_current(&peer, generation));
+}
+
+#[tokio::test]
+async fn queued_disco_handler_cannot_reinsert_state_after_revocation() {
+    let peer_key = NodePrivate::generate().public();
+    let peer_disco = DiscoPrivate::generate();
+    let peer_disco_public = peer_disco.public();
+    let (magicsock, _rx) = Magicsock::new(MagicsockConfig {
+        private_key: NodePrivate::generate(),
+        disco_key: DiscoPrivate::generate(),
+        derp_client: None,
+        derp_map: None,
+        home_derp_region: 0,
+        udp_bind: None,
+        udp_socket: None,
+        portmapper: None,
+        health: None,
+        disable_direct_paths: false,
+        peer_relay_server: false,
+        relay_server_config: None,
+        sockstats: None,
+        control_knobs: None,
+    })
+    .await
+    .unwrap();
+    magicsock
+        .set_netmap(vec![make_peer(
+            peer_key.clone(),
+            peer_disco_public.clone(),
+            vec![],
+            0,
+        )])
+        .await
+        .unwrap();
+
+    // Force the Ping fallback path to try to learn the reverse mapping. Hold
+    // an existing reader, queue revoke's writer, and only then queue the
+    // packet handler. Tokio's fair RwLock must run the revoke transaction
+    // before this stale callback can acquire its read side.
+    magicsock
+        .inner
+        .disco_to_peer
+        .write()
+        .unwrap()
+        .remove(&peer_disco_public);
+    let packet = DiscoIo::new(peer_disco)
+        .seal(
+            &magicsock.disco_public(),
+            &Message::Ping(Ping {
+                tx_id: [7; 12],
+                node_key: peer_key.clone(),
+                padding: 0,
+            }),
+        )
+        .unwrap();
+    let socket = Arc::new(magicsock);
+    let held_reader = socket.inner.authorization_delivery_barrier.read().await;
+    let revoke_socket = socket.clone();
+    let revoke = tokio::spawn(async move {
+        revoke_socket.set_netmap(Vec::new()).await.unwrap();
+    });
+    tokio::task::yield_now().await;
+    let handler_socket = socket.clone();
+    let handler = tokio::spawn(async move {
+        handler_socket
+            .inner
+            .handle_disco_udp(&packet, "127.0.0.1:4242".parse().unwrap())
+            .await;
+    });
+    tokio::task::yield_now().await;
+    drop(held_reader);
+    revoke.await.unwrap();
+    handler.await.unwrap();
+
+    assert!(!socket
+        .inner
+        .endpoints
+        .read()
+        .unwrap()
+        .contains_key(&peer_key));
+    assert!(!socket
+        .inner
+        .disco_to_peer
+        .read()
+        .unwrap()
+        .contains_key(&peer_disco_public));
+    assert!(!socket
+        .inner
+        .addr_to_peer
+        .read()
+        .unwrap()
+        .values()
+        .any(|key| key == &peer_key));
+}
+
+#[tokio::test]
+async fn relay_server_role_revocation_clears_paths_and_reverse_mappings() {
+    let target_key = NodePrivate::generate().public();
+    let target_disco = DiscoPrivate::generate().public();
+    let server_a_key = NodePrivate::generate().public();
+    let server_a_disco = DiscoPrivate::generate().public();
+    let server_b_key = NodePrivate::generate().public();
+    let server_b_disco = DiscoPrivate::generate().public();
+    let (magicsock, mut rx) = Magicsock::new(MagicsockConfig {
+        private_key: NodePrivate::generate(),
+        disco_key: DiscoPrivate::generate(),
+        derp_client: None,
+        derp_map: None,
+        home_derp_region: 0,
+        udp_bind: None,
+        udp_socket: None,
+        portmapper: None,
+        health: None,
+        disable_direct_paths: false,
+        peer_relay_server: false,
+        relay_server_config: None,
+        sockstats: None,
+        control_knobs: None,
+    })
+    .await
+    .unwrap();
+    let target = make_peer(target_key.clone(), target_disco.clone(), vec![], 1);
+    let make_relay_server = |key: NodePublic, disco| {
+        let mut node = make_peer(key, disco, vec![], 1);
+        node.Cap = rustscale_tailcfg::CAP_VERSION_RELAY;
+        node.CapMap.insert(
+            rustscale_tailcfg::PEER_CAPABILITY_RELAY_TARGET.into(),
+            vec![rustscale_tailcfg::RawMessage::default()],
+        );
+        node.Hostinfo = Some(rustscale_tailcfg::Hostinfo {
+            PeerRelay: true,
+            ..Default::default()
+        });
+        node
+    };
+    let mut server_a = make_relay_server(server_a_key.clone(), server_a_disco.clone());
+    let server_b = make_relay_server(server_b_key.clone(), server_b_disco);
+    magicsock
+        .set_netmap(vec![target.clone(), server_a.clone(), server_b.clone()])
+        .await
+        .unwrap();
+
+    let target_generation = magicsock.authorization_generation(&target_key).unwrap();
+    let addr_a: SocketAddr = "127.0.0.1:4545".parse().unwrap();
+    let addr_b: SocketAddr = "127.0.0.1:4646".parse().unwrap();
+    RelayManagerContext::set_relay(
+        &*magicsock.inner,
+        &target_key,
+        &target_disco,
+        target_generation,
+        &server_a_key,
+        magicsock.authorization_generation(&server_a_key).unwrap(),
+        addr_a,
+        77,
+    );
+    RelayManagerContext::set_relay(
+        &*magicsock.inner,
+        &target_key,
+        &target_disco,
+        target_generation,
+        &server_b_key,
+        magicsock.authorization_generation(&server_b_key).unwrap(),
+        addr_b,
+        78,
+    );
+    assert!(
+        !magicsock
+            .inner
+            .addr_to_peer
+            .read()
+            .unwrap()
+            .contains_key(&addr_a),
+        "installing B must atomically remove A's old reverse mapping"
+    );
+    assert_eq!(
+        magicsock.inner.addr_to_peer.read().unwrap().get(&addr_b),
+        Some(&target_key)
+    );
+
+    // Simulate a late stale reverse-map write before the revoke transaction.
+    // A's retained history must let revocation remove it even though B is the
+    // endpoint's current path.
+    magicsock
+        .inner
+        .addr_to_peer
+        .write()
+        .unwrap()
+        .insert(addr_a, target_key.clone());
+
+    // A remains an authorized ordinary peer but loses its relay-server role.
+    // Revocation must consume A's retained path history without clearing B.
+    server_a.CapMap.clear();
+    server_a.Hostinfo = Some(rustscale_tailcfg::Hostinfo::default());
+    magicsock
+        .set_netmap(vec![target, server_a, server_b])
+        .await
+        .unwrap();
+    assert!(!magicsock
+        .inner
+        .addr_to_peer
+        .read()
+        .unwrap()
+        .contains_key(&addr_a));
+    assert_eq!(
+        magicsock.inner.addr_to_peer.read().unwrap().get(&addr_b),
+        Some(&target_key)
+    );
+    assert!(!magicsock
+        .inner
+        .disco_to_peer
+        .read()
+        .unwrap()
+        .contains_key(&server_a_disco));
+    assert_eq!(
+        magicsock.peer_path_class(&target_key),
+        endpoint::PathClass::Relay
+    );
+
+    // Even a raced/stale reverse-map insertion cannot authorize packets from
+    // A: receive validation requires B's exact current address, VNI, and
+    // relay-server generation.
+    magicsock
+        .inner
+        .addr_to_peer
+        .write()
+        .unwrap()
+        .insert(addr_a, target_key.clone());
+    magicsock
+        .inner
+        .handle_wg_udp_relay(b"from-a", addr_a, 77, 6)
+        .await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), rx.recv())
+            .await
+            .is_err(),
+        "replaced relay address A must be denied"
+    );
+    magicsock
+        .inner
+        .addr_to_peer
+        .write()
+        .unwrap()
+        .remove(&addr_a);
+    assert!(!magicsock
+        .inner
+        .addr_to_peer
+        .read()
+        .unwrap()
+        .contains_key(&addr_a));
+
+    magicsock
+        .inner
+        .handle_wg_udp_relay(b"wrong-vni", addr_b, 77, 9)
+        .await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), rx.recv())
+            .await
+            .is_err(),
+        "current relay address with a stale VNI must be denied"
+    );
+
+    magicsock
+        .inner
+        .handle_wg_udp_relay(b"from-b", addr_b, 78, 6)
+        .await;
+    let received = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        .await
+        .expect("current relay packet deadline")
+        .expect("current relay packet")
+        .into_datagrams()
+        .into_iter()
+        .next()
+        .expect("one current relay datagram");
+    assert_eq!(received.peer, target_key);
+    assert_eq!(received.data.as_ref(), b"from-b");
+}
+
+#[tokio::test]
+async fn relay_history_eviction_is_bounded_and_fail_closed() {
+    let target_key = NodePrivate::generate().public();
+    let target_disco = DiscoPrivate::generate().public();
+    let server_key = NodePrivate::generate().public();
+    let server_disco = DiscoPrivate::generate().public();
+    let (magicsock, mut rx) = Magicsock::new(MagicsockConfig {
+        private_key: NodePrivate::generate(),
+        disco_key: DiscoPrivate::generate(),
+        derp_client: None,
+        derp_map: None,
+        home_derp_region: 0,
+        udp_bind: None,
+        udp_socket: None,
+        portmapper: None,
+        health: None,
+        disable_direct_paths: false,
+        peer_relay_server: false,
+        relay_server_config: None,
+        sockstats: None,
+        control_knobs: None,
+    })
+    .await
+    .unwrap();
+    let target = make_peer(target_key.clone(), target_disco.clone(), vec![], 1);
+    let mut server = make_peer(server_key.clone(), server_disco, vec![], 1);
+    server.Cap = rustscale_tailcfg::CAP_VERSION_RELAY;
+    server.CapMap.insert(
+        rustscale_tailcfg::PEER_CAPABILITY_RELAY_TARGET.into(),
+        vec![rustscale_tailcfg::RawMessage::default()],
+    );
+    server.Hostinfo = Some(rustscale_tailcfg::Hostinfo {
+        PeerRelay: true,
+        ..Default::default()
+    });
+    magicsock
+        .set_netmap(vec![target.clone(), server.clone()])
+        .await
+        .unwrap();
+    let target_generation = magicsock.authorization_generation(&target_key).unwrap();
+    let server_generation = magicsock.authorization_generation(&server_key).unwrap();
+    let first_addr: SocketAddr = "127.0.0.1:10000".parse().unwrap();
+    let mut current_addr = first_addr;
+
+    for index in 0..5_000u16 {
+        current_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 10_000 + index);
+        RelayManagerContext::set_relay(
+            &*magicsock.inner,
+            &target_key,
+            &target_disco,
+            target_generation,
+            &server_key,
+            server_generation,
+            current_addr,
+            u32::from(index) + 1,
+        );
+        if usize::from(index) + 1 == endpoint::MAX_RELAY_PATH_HISTORY_PER_SERVER {
+            // Model a stale callback restoring the oldest reverse mapping.
+            // The next replacement deterministically evicts and removes it.
+            magicsock
+                .inner
+                .addr_to_peer
+                .write()
+                .unwrap()
+                .insert(first_addr, target_key.clone());
+        }
+        if usize::from(index) == endpoint::MAX_RELAY_PATH_HISTORY_PER_SERVER {
+            assert!(!magicsock
+                .inner
+                .addr_to_peer
+                .read()
+                .unwrap()
+                .contains_key(&first_addr));
+        }
+    }
+
+    let history_len = magicsock
+        .inner
+        .endpoints
+        .read()
+        .unwrap()
+        .get(&target_key)
+        .unwrap()
+        .relay_history_len(&server_key, server_generation);
+    assert_eq!(
+        history_len,
+        endpoint::MAX_RELAY_PATH_HISTORY_PER_SERVER,
+        "thousands of replacements must retain only a strict bounded history"
+    );
+    assert_eq!(
+        magicsock.inner.addr_to_peer.read().unwrap().len(),
+        1,
+        "only the current relay address may remain reverse-mapped"
+    );
+    assert_eq!(
+        magicsock
+            .inner
+            .addr_to_peer
+            .read()
+            .unwrap()
+            .get(&current_addr),
+        Some(&target_key)
+    );
+
+    // A raced mapping for a deterministically evicted address is still denied
+    // by exact current-path validation.
+    magicsock
+        .inner
+        .addr_to_peer
+        .write()
+        .unwrap()
+        .insert(first_addr, target_key.clone());
+    magicsock
+        .inner
+        .handle_wg_udp_relay(b"evicted", first_addr, 1, 7)
+        .await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), rx.recv())
+            .await
+            .is_err(),
+        "evicted relay address must not receive"
+    );
+    magicsock
+        .inner
+        .addr_to_peer
+        .write()
+        .unwrap()
+        .remove(&first_addr);
+
+    magicsock
+        .inner
+        .handle_wg_udp_relay(b"current", current_addr, 5_000, 7)
+        .await;
+    let current = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        .await
+        .expect("current relay receive deadline")
+        .expect("current relay receive")
+        .into_datagrams()
+        .into_iter()
+        .next()
+        .expect("one current relay datagram");
+    assert_eq!(current.peer, target_key);
+    assert_eq!(current.data.as_ref(), b"current");
+
+    server.CapMap.clear();
+    server.Hostinfo = Some(rustscale_tailcfg::Hostinfo::default());
+    magicsock.set_netmap(vec![target, server]).await.unwrap();
+    assert_eq!(
+        magicsock
+            .inner
+            .endpoints
+            .read()
+            .unwrap()
+            .get(&target_key)
+            .unwrap()
+            .relay_history_len(&server_key, server_generation),
+        0,
+        "revocation must clear all retained history"
+    );
+    assert!(!magicsock
+        .inner
+        .addr_to_peer
+        .read()
+        .unwrap()
+        .contains_key(&current_addr));
 }
 
 // ---- Test (a): DERP data path fallback ----

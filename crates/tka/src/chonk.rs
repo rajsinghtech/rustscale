@@ -29,6 +29,8 @@ use crate::aum::{
 };
 
 const MAX_RECORD_BYTES: usize = MAX_CBOR_BYTES + 1024;
+const TRANSACTION_FILE: &str = "pending_transaction";
+const MAX_TRANSACTION_AUMS: usize = 2000;
 #[cfg(unix)]
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -264,14 +266,19 @@ impl FsChonk {
             Mode::empty(),
         )
         .map_err(|error| rustix_error(&root, error))?;
-        Ok(Self {
+        let storage = Self {
             root,
             #[cfg(unix)]
             root_fd,
             root_identity: root_identity(&metadata),
             observed: Mutex::new(HashSet::new()),
             lock: RwLock::new(()),
-        })
+        };
+        // A batch marker is written before any member record. If a process
+        // stopped mid-commit, remove only records that were absent before the
+        // transaction, restoring the prior authority before it can be opened.
+        storage.recover_transaction_unlocked()?;
+        Ok(storage)
     }
 
     fn aum_path(&self, hash: &AumHash) -> PathBuf {
@@ -642,6 +649,138 @@ impl FsChonk {
         result
     }
 
+    fn write_transaction_marker(&self, hashes: &[AumHash]) -> Result<(), ChonkError> {
+        if hashes.len() > MAX_TRANSACTION_AUMS {
+            return Err(ChonkError::Corrupt {
+                path: self.root.join(TRANSACTION_FILE),
+                reason: format!("transaction contains too many AUMs: {}", hashes.len()),
+            });
+        }
+        let data: Vec<u8> = hashes
+            .iter()
+            .flat_map(|hash| hash.as_bytes().iter().copied())
+            .collect();
+        let path = self.root.join(TRANSACTION_FILE);
+        #[cfg(unix)]
+        {
+            self.atomic_write_at(&self.root_fd, None, TRANSACTION_FILE, &data, &path)
+        }
+        #[cfg(not(unix))]
+        {
+            rustscale_atomicfile::write(&path, &data).map_err(|error| io_error(&path, error))
+        }
+    }
+
+    fn clear_transaction_marker(&self) -> Result<(), ChonkError> {
+        let path = self.root.join(TRANSACTION_FILE);
+        #[cfg(unix)]
+        {
+            match rustix::fs::unlinkat(&self.root_fd, TRANSACTION_FILE, AtFlags::empty()) {
+                Ok(()) => {
+                    rustix::fs::fsync(&self.root_fd).map_err(|error| rustix_error(&path, error))
+                }
+                Err(rustix::io::Errno::NOENT) => Ok(()),
+                Err(error) => Err(rustix_error(&path, error)),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            match fs::remove_file(&path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(io_error(&path, error)),
+            }
+        }
+    }
+
+    fn remove_transaction_record(&self, hash: &AumHash) -> Result<(), ChonkError> {
+        #[cfg(unix)]
+        let name = hash.to_string();
+        #[cfg(unix)]
+        let prefix = &name[..2];
+        let path = self.aum_path(hash);
+        #[cfg(unix)]
+        {
+            let prefix_fd = match self.open_prefix_fd(prefix, false) {
+                Ok(fd) => fd,
+                Err(ChonkError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
+                    return Ok(())
+                }
+                Err(error) => return Err(error),
+            };
+            match rustix::fs::unlinkat(&prefix_fd, &name, AtFlags::empty()) {
+                Ok(()) => {
+                    rustix::fs::fsync(&prefix_fd).map_err(|error| rustix_error(&path, error))?;
+                }
+                Err(rustix::io::Errno::NOENT) => {}
+                Err(error) => return Err(rustix_error(&path, error)),
+            }
+            self.verify_prefix_fd(prefix, &prefix_fd)?;
+        }
+        #[cfg(not(unix))]
+        {
+            if let Some(parent) = path.parent() {
+                match fs::symlink_metadata(parent) {
+                    Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                        return Err(ChonkError::Corrupt {
+                            path: parent.to_path_buf(),
+                            reason: "transaction prefix is not a real directory".into(),
+                        });
+                    }
+                    Ok(_) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+                    Err(error) => return Err(io_error(parent, error)),
+                }
+            }
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(io_error(&path, error)),
+            }
+        }
+        self.observed
+            .lock()
+            .map_err(|_| ChonkError::LockPoisoned)?
+            .remove(hash);
+        Ok(())
+    }
+
+    fn recover_transaction_unlocked(&self) -> Result<(), ChonkError> {
+        let path = self.root.join(TRANSACTION_FILE);
+        #[cfg(unix)]
+        let bytes = match self.checked_root_read(TRANSACTION_FILE, MAX_TRANSACTION_AUMS * 32) {
+            Ok(bytes) => bytes,
+            Err(ChonkError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
+                return Ok(())
+            }
+            Err(error) => return Err(error),
+        };
+        #[cfg(not(unix))]
+        let bytes = match Self::checked_path_read(&path, MAX_TRANSACTION_AUMS * 32) {
+            Ok(bytes) => bytes,
+            Err(ChonkError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
+                return Ok(())
+            }
+            Err(error) => return Err(error),
+        };
+        if bytes.len() % 32 != 0 || bytes.len() / 32 > MAX_TRANSACTION_AUMS {
+            return Err(ChonkError::Corrupt {
+                path,
+                reason: "invalid pending transaction marker".into(),
+            });
+        }
+        let hashes = bytes
+            .chunks_exact(32)
+            .map(|bytes| {
+                AumHash::from_slice(bytes).expect("chunks_exact guarantees a 32-byte hash")
+            })
+            .collect::<Vec<_>>();
+        for hash in &hashes {
+            self.remove_transaction_record(hash)?;
+        }
+        self.clear_transaction_marker()
+    }
+
     fn all_hashes_unlocked(&self) -> Result<Vec<AumHash>, ChonkError> {
         self.verify_root()?;
         let mut hashes = Vec::new();
@@ -840,7 +979,8 @@ impl Chonk for FsChonk {
 
     fn store_verified_aums(&self, aums: &[Aum]) -> Result<usize, ChonkError> {
         let _guard = self.lock.write().map_err(|_| ChonkError::LockPoisoned)?;
-        let mut inserted = 0;
+        let mut pending = Vec::new();
+        let mut pending_hashes = HashSet::new();
         for aum in aums {
             let hash = aum.hash();
             let path = self.aum_path(&hash);
@@ -852,30 +992,61 @@ impl Chonk for FsChonk {
                         reason: "existing AUM differs despite equal hash".into(),
                     });
                 }
-                Err(error) if error.is_not_found() => {}
+                Err(error) if error.is_not_found() => {
+                    if pending_hashes.insert(hash) {
+                        pending.push((hash, aum));
+                    }
+                }
                 Err(error) => return Err(error),
             }
-            let encoded = Self::encode_record(aum);
-            #[cfg(unix)]
-            {
-                let name = hash.to_string();
-                let prefix = &name[..2];
-                let prefix_fd = self.open_prefix_fd(prefix, true)?;
-                self.atomic_write_at(&prefix_fd, Some(prefix), &name, &encoded, &path)?;
-            }
-            #[cfg(not(unix))]
-            {
-                let parent = path.parent().expect("hash path always has a parent");
-                self.ensure_prefix_dir(parent)?;
-                rustscale_atomicfile::write(&path, &encoded)
-                    .map_err(|error| io_error(&path, error))?;
-            }
-            // Descriptor-relative read-after-write catches substitution and
-            // storage corruption before returning.
-            self.read_aum_unlocked(&hash)?;
-            inserted += 1;
         }
-        Ok(inserted)
+        if pending.is_empty() {
+            return Ok(0);
+        }
+        let hashes = pending.iter().map(|(hash, _)| *hash).collect::<Vec<_>>();
+        self.write_transaction_marker(&hashes)?;
+
+        let result = (|| {
+            for (hash, aum) in &pending {
+                let path = self.aum_path(hash);
+                let encoded = Self::encode_record(aum);
+                #[cfg(unix)]
+                {
+                    let name = hash.to_string();
+                    let prefix = &name[..2];
+                    let prefix_fd = self.open_prefix_fd(prefix, true)?;
+                    self.atomic_write_at(&prefix_fd, Some(prefix), &name, &encoded, &path)?;
+                }
+                #[cfg(not(unix))]
+                {
+                    let parent = path.parent().expect("hash path always has a parent");
+                    self.ensure_prefix_dir(parent)?;
+                    rustscale_atomicfile::write(&path, &encoded)
+                        .map_err(|error| io_error(&path, error))?;
+                }
+                self.read_aum_unlocked(hash)?;
+            }
+            self.clear_transaction_marker()
+        })();
+        if let Err(error) = result {
+            // Re-establish the marker in case its unlink succeeded but parent
+            // fsync failed, then roll back the exact preflight set.
+            let rollback = (|| {
+                self.write_transaction_marker(&hashes)?;
+                for hash in &hashes {
+                    self.remove_transaction_record(hash)?;
+                }
+                self.clear_transaction_marker()
+            })();
+            if let Err(rollback) = rollback {
+                return Err(ChonkError::Corrupt {
+                    path: self.root.join(TRANSACTION_FILE),
+                    reason: format!("transaction failed ({error}); rollback failed ({rollback})"),
+                });
+            }
+            return Err(error);
+        }
+        Ok(pending.len())
     }
 }
 
@@ -1067,6 +1238,28 @@ mod tests {
             chonk.store_verified_aums(&[update]),
             Err(ChonkError::Corrupt { .. })
         ));
+    }
+
+    #[test]
+    fn incomplete_batch_is_rolled_back_on_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = aum(AumKind::NoOp, None);
+        let child = aum(AumKind::NoOp, Some(parent.hash()));
+        {
+            let chonk = FsChonk::open(dir.path()).unwrap();
+            chonk
+                .store_verified_aums(std::slice::from_ref(&parent))
+                .unwrap();
+            chonk.write_transaction_marker(&[child.hash()]).unwrap();
+            let path = chonk.aum_path(&child.hash());
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, FsChonk::encode_record(&child)).unwrap();
+        }
+
+        let reopened = FsChonk::open(dir.path()).unwrap();
+        assert_eq!(reopened.heads().unwrap(), vec![parent]);
+        assert!(reopened.aum(&child.hash()).unwrap_err().is_not_found());
+        assert!(!dir.path().join(TRANSACTION_FILE).exists());
     }
 
     #[test]

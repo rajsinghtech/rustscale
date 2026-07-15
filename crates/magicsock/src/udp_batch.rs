@@ -1514,10 +1514,11 @@ pub(crate) fn send_gso<T: AsRef<[u8]>>(
 mod tests {
     use super::*;
     use crate::{
-        PoolInventoryReservation, WgCiphertext, WgDatagram, WgReceiveBatch,
+        PeerAuthorization, PoolInventoryReservation, WgCiphertext, WgDatagram, WgReceiveBatch,
         WG_RECEIVE_PACKET_CAPACITY,
     };
     use rustscale_key::NodePrivate;
+    use std::collections::HashSet;
     use std::net::{Ipv4Addr, Ipv6Addr};
     use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -1620,7 +1621,7 @@ mod tests {
                 let (packet, _) = batch.detach_datagram(index).unwrap();
                 WgDatagram {
                     peer: peer.clone(),
-                    data: WgCiphertext::from_pooled(packet, pool_reservation.clone()),
+                    data: WgCiphertext::from_pooled(packet, pool_reservation.clone(), 1),
                 }
             })
             .collect();
@@ -1987,6 +1988,9 @@ mod tests {
         let mut batch = ReceiveBatch::with_gro(false);
         let peer = NodePrivate::generate().public();
         let credits = Arc::new(Semaphore::new(WG_RECEIVE_PACKET_CAPACITY));
+        let authorization = Arc::new(PeerAuthorization::default());
+        authorization.reconcile(&HashSet::from([peer.clone()]), &HashSet::new());
+        let barrier = Arc::new(tokio::sync::RwLock::new(()));
         set_plain_message(&mut batch, 0, b"cancelled", 3000);
         batch.finish_plain(1).unwrap();
 
@@ -1998,12 +2002,16 @@ mod tests {
         let (datagrams, channel_permit, pool_reservation) =
             pooled_publication_parts(&mut batch, &credits, &peer, 1);
         let cancelled_sender = sender.clone();
+        let cancelled_authorization = authorization.clone();
+        let cancelled_barrier = barrier.clone();
         let cancelled = tokio::spawn(async move {
             crate::publish_reserved_wg_batch(
                 &cancelled_sender,
                 datagrams,
                 channel_permit,
                 pool_reservation,
+                &cancelled_authorization,
+                &cancelled_barrier,
             )
             .await;
         });
@@ -2027,6 +2035,8 @@ mod tests {
             datagrams,
             channel_permit,
             pool_reservation,
+            &authorization,
+            &barrier,
         )
         .await;
         assert_eq!(credits.available_permits(), WG_RECEIVE_PACKET_CAPACITY);

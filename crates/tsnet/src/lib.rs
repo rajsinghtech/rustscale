@@ -53,6 +53,7 @@ mod socks5;
 mod state;
 mod status;
 mod taildrop;
+mod tailnet_lock;
 mod tls;
 mod tun_pump;
 mod util;
@@ -222,6 +223,8 @@ pub enum TsnetError {
     NotAvailableInTunMode,
     #[error("feature not supported: {0}")]
     NotSupported(String),
+    #[error("Tailnet Lock state failed closed: {0}")]
+    TailnetLock(String),
     #[error("timeout waiting for first map response")]
     MapTimeout,
     #[error("tls error: {0}")]
@@ -752,6 +755,8 @@ pub(crate) struct RunningState {
     pub(crate) peer_map: Arc<peer_map::Runtime>,
     pub(crate) routecheck: Arc<rustscale_routecheck::Client>,
     pub(crate) route_table: Arc<RwLock<RouteTable>>,
+    /// Live signed packet filter, mutated only under `peer_map.gate.write()`.
+    pub(crate) filter: Arc<std::sync::Mutex<Filter>>,
     /// OS-route manager in TUN mode when `TunModeConfig::apply_routes` is set.
     pub(crate) router: Option<SharedRouter>,
     pub(crate) cancel: Arc<CancelToken>,
@@ -853,6 +858,8 @@ pub(crate) struct RunningState {
     pub(crate) client_updater: Arc<std::sync::Mutex<rustscale_clientupdate::ClientUpdater>>,
     /// Persistent client audit logger for this profile/control client.
     pub(crate) audit_logger: Arc<rustscale_auditlog::Logger>,
+    /// Tailnet Lock authority shared by map filtering and LocalAPI.
+    pub(crate) tailnet_lock: Arc<tailnet_lock::TailnetLock>,
 }
 
 /// A fallback TCP handler: called when an incoming TCP flow doesn't match any
@@ -886,6 +893,9 @@ pub(crate) struct Bootstrap {
     pub(crate) netlog: Option<Arc<rustscale_netlog::Logger>>,
     pub(crate) wg_recv: mpsc::Receiver<rustscale_magicsock::WgReceiveBatch>,
     pub(crate) wg_tunnels: Arc<RwLock<HashMap<NodePublic, Arc<Mutex<WgTunn>>>>>,
+    /// Unfiltered control peer set retained so authority changes can
+    /// re-evaluate peers that were previously withdrawn.
+    pub(crate) raw_peers: Vec<Node>,
     pub(crate) peers: Arc<RwLock<Vec<Node>>>,
     pub(crate) peer_map: Arc<peer_map::Runtime>,
     pub(crate) routecheck: Arc<rustscale_routecheck::Client>,
@@ -895,7 +905,8 @@ pub(crate) struct Bootstrap {
     pub(crate) map_task: JoinHandle<()>,
     pub(crate) node_key: NodePrivate,
     pub(crate) filter: Arc<std::sync::Mutex<Filter>>,
-    /// Complete named packet-filter state from the initial signed netmap.
+    /// Last successfully received named ACL fragments, including the initial
+    /// map, for safe delta reconstruction.
     pub(crate) named_filters: BTreeMap<String, Vec<FilterRule>>,
     pub(crate) packet_drops: Arc<AtomicU64>,
     /// Shared MagicDNS resolver (dial path + DNS responder).
@@ -957,6 +968,13 @@ pub(crate) struct Bootstrap {
     /// exact persisted identity that hostinfo advertises publicly.
     #[allow(dead_code)]
     pub(crate) private_log_id: rustscale_logid::PrivateID,
+    /// Tailnet Lock authority and fail-closed peer verifier.
+    pub(crate) tailnet_lock: Arc<tailnet_lock::TailnetLock>,
+    /// Durable profile/control namespace for identity, netmap, and TKA data.
+    pub(crate) state_scope: Option<state::StateScope>,
+    /// False when the bootstrap peer set came from cache; only a present full
+    /// snapshot from fresh control may make it eligible for activation.
+    pub(crate) peer_snapshot_fresh: bool,
 }
 
 /// An embedded Tailscale server.
@@ -1154,6 +1172,15 @@ impl Server {
         let config =
             rustscale_conffile::Config::load(path).map_err(|e| format!("config load: {e}"))?;
         let masked = config.parsed.to_prefs();
+        let authorization_changed = masked.ShieldsUpSet
+            || masked.ExitNodeAllowLANAccessSet
+            || masked.ExitNodeIDSet
+            || masked.ExitNodeIPSet;
+        let map_commit = if authorization_changed {
+            Some(inner.peer_map.gate.write().await)
+        } else {
+            None
+        };
 
         let updated = {
             let mut prefs = inner.prefs.write().await;
@@ -1176,6 +1203,15 @@ impl Server {
             serde_json::to_value(&*prefs).unwrap_or_default()
         };
 
+        if masked.ShieldsUpSet {
+            inner
+                .filter
+                .lock()
+                .unwrap()
+                .set_shields_up(masked.Prefs.ShieldsUp);
+            inner.peer_map.advance_authorization_epoch_locked();
+        }
+
         if masked.ExitNodeAllowLANAccessSet || masked.ExitNodeIDSet || masked.ExitNodeIPSet {
             let prefs = inner.prefs.read().await.clone();
             let exit_node_changed = masked.ExitNodeIDSet || masked.ExitNodeIPSet;
@@ -1189,14 +1225,14 @@ impl Server {
             } else {
                 None
             };
+            let mut selection = inner.exit_node_selection.write().await;
             let mut routes = inner.route_table.write().await;
             if let Some(selected_exit_node) = selected_exit_node {
                 if let Some(peer) = selected_exit_node {
                     routes.set_exit_node(peer);
-                    inner.exit_node_selection.write().await.clear_pending();
+                    selection.clear_pending();
                 } else {
                     routes.clear_exit_node();
-                    let mut selection = inner.exit_node_selection.write().await;
                     if exit_node_pref(&prefs).is_some() {
                         selection.replace_from_prefs(&prefs);
                     } else {
@@ -1204,6 +1240,7 @@ impl Server {
                     }
                 }
             }
+            drop(selection);
             if let Some(router) = inner.router.as_ref() {
                 let derp_map = inner.magicsock.get_derp_map();
                 let control_url = if prefs.ControlURL.is_empty() {
@@ -1222,6 +1259,8 @@ impl Server {
                 .map_err(|error| error.to_string())?;
             }
         }
+
+        drop(map_commit);
 
         inner.ipn_backend.bus().send(rustscale_ipn::Notify {
             Prefs: Some(updated),

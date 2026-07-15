@@ -319,7 +319,8 @@ const WG_RECEIVE_PACKET_CAPACITY: usize = 256;
 async fn publish_wg_batch(
     sender: &mpsc::Sender<WgReceiveBatch>,
     credits: &Arc<Semaphore>,
-    datagrams: Vec<WgDatagram>,
+    mut datagrams: Vec<WgDatagram>,
+    authorization: Option<(&PeerAuthorization, &Arc<tokio::sync::RwLock<()>>)>,
 ) {
     if datagrams.is_empty() {
         return;
@@ -331,6 +332,20 @@ async fn publish_wg_batch(
     let count = u32::try_from(datagrams.len()).expect("receive batch count fits u32");
     let Ok(permit) = credits.clone().acquire_many_owned(count).await else {
         return;
+    };
+    // Revalidate after backpressure and hold the enqueue side through send;
+    // a revocation commit cannot linearize between this check and queuing.
+    let _enqueue = if let Some((authorization, barrier)) = authorization {
+        let guard = barrier.clone().read_owned().await;
+        datagrams.retain(|datagram| {
+            authorization.is_current(&datagram.peer, datagram.authorization_generation())
+        });
+        if datagrams.is_empty() {
+            return;
+        }
+        Some(guard)
+    } else {
+        None
     };
     // If this await is cancelled or the receiver is closed, `batch` is
     // dropped and its owned permit returns all packet credits.
@@ -344,11 +359,20 @@ async fn publish_wg_batch(
 #[cfg(target_os = "linux")]
 async fn publish_reserved_wg_batch(
     sender: &mpsc::Sender<WgReceiveBatch>,
-    datagrams: Vec<WgDatagram>,
+    mut datagrams: Vec<WgDatagram>,
     channel_permit: OwnedSemaphorePermit,
     pool_reservation: Arc<PoolInventoryReservation>,
+    authorization: &PeerAuthorization,
+    barrier: &Arc<tokio::sync::RwLock<()>>,
 ) {
     debug_assert!(!datagrams.is_empty());
+    let _enqueue = barrier.clone().read_owned().await;
+    datagrams.retain(|datagram| {
+        authorization.is_current(&datagram.peer, datagram.authorization_generation())
+    });
+    if datagrams.is_empty() {
+        return;
+    }
     let batch = WgReceiveBatch::new_pooled(datagrams, channel_permit, pool_reservation);
     let _ = sender.send(batch).await;
 }
@@ -361,7 +385,7 @@ async fn publish_linux_wg_batch(
     pending: &mut Vec<WgDatagram>,
 ) {
     let datagrams = std::mem::take(pending);
-    publish_wg_batch(sender, credits, datagrams).await;
+    publish_wg_batch(sender, credits, datagrams, None).await;
 }
 
 /// Identify ordinary direct WireGuard source runs before awaiting capacity.
@@ -371,6 +395,8 @@ async fn publish_linux_wg_batch(
 #[cfg(any(target_os = "linux", test))]
 struct IdentifiedLinuxWg {
     peers: Vec<Option<NodePublic>>,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    generations: Vec<Option<u64>>,
     received_at: std::time::Instant,
 }
 
@@ -390,8 +416,10 @@ fn identify_linux_wg_peers(
         }
         identified.push(peer.clone());
     }
+    let generations = vec![None; identified.len()];
     IdentifiedLinuxWg {
         peers: identified,
+        generations,
         received_at,
     }
 }
@@ -414,6 +442,7 @@ fn detach_linux_wg_datagrams(
     mut record_phys_rx: impl FnMut(Option<IpAddr>, SocketAddr, u64, u64),
 ) {
     debug_assert_eq!(identified.peers.len(), count);
+    debug_assert_eq!(identified.generations.len(), count);
     let (mut udp4_rx_bytes, mut udp6_rx_bytes) = (0, 0);
     let mut previous = None;
     let mut physical_run: Option<(Option<IpAddr>, SocketAddr, u64, u64)> = None;
@@ -456,7 +485,12 @@ fn detach_linux_wg_datagrams(
             debug_assert_eq!(addr, detached_source);
             pending.push(WgDatagram {
                 peer: peer.clone(),
-                data: WgCiphertext::from_pooled(packet, pool_reservation.clone()),
+                data: WgCiphertext::from_pooled(
+                    packet,
+                    pool_reservation.clone(),
+                    identified.generations[index]
+                        .expect("only authorized packets reserve and detach storage"),
+                ),
             });
         } else if let Some((node, destination, packets, bytes)) = physical_run.take() {
             record_phys_rx(node, destination, packets, bytes);
@@ -651,6 +685,7 @@ pub struct MagicsockConfig {
 /// would either copy a packet or make its lifetime surprising.
 pub struct WgCiphertext {
     storage: WgCiphertextStorage,
+    authorization_generation: u64,
 }
 
 enum WgCiphertextStorage {
@@ -698,6 +733,7 @@ impl WgCiphertext {
         );
         Self {
             storage: WgCiphertextStorage::Vec { bytes, range },
+            authorization_generation: 0,
         }
     }
 
@@ -705,13 +741,20 @@ impl WgCiphertext {
     fn from_pooled(
         packet: udp_batch::PooledPacket,
         pool_reservation: Arc<PoolInventoryReservation>,
+        authorization_generation: u64,
     ) -> Self {
         Self {
             storage: WgCiphertextStorage::Pooled {
                 packet,
                 _pool_reservation: pool_reservation,
             },
+            authorization_generation,
         }
+    }
+
+    fn authorized(mut self, generation: u64) -> Self {
+        self.authorization_generation = generation;
+        self
     }
 
     /// Clone only ordinary owned-vector storage without copying a pooled
@@ -719,9 +762,10 @@ impl WgCiphertext {
     /// uniquely owned until processing completes.
     pub fn try_clone(&self) -> Option<Self> {
         match &self.storage {
-            WgCiphertextStorage::Vec { bytes, range } => {
-                Some(Self::from_vec_range(bytes.clone(), range.clone()))
-            }
+            WgCiphertextStorage::Vec { bytes, range } => Some(
+                Self::from_vec_range(bytes.clone(), range.clone())
+                    .authorized(self.authorization_generation),
+            ),
             #[cfg(target_os = "linux")]
             WgCiphertextStorage::Pooled { .. } => None,
         }
@@ -791,12 +835,60 @@ impl<const N: usize> PartialEq<&[u8; N]> for WgCiphertext {
     }
 }
 
-/// A received WG datagram with its sender identified.
+#[derive(Default)]
+struct PeerAuthorization {
+    state: RwLock<PeerAuthorizationState>,
+}
+
+#[derive(Default)]
+struct PeerAuthorizationState {
+    next_generation: u64,
+    generations: HashMap<NodePublic, u64>,
+}
+
+impl PeerAuthorization {
+    fn generation(&self, peer: &NodePublic) -> Option<u64> {
+        self.state
+            .read()
+            .expect("peer authorization lock poisoned")
+            .generations
+            .get(peer)
+            .copied()
+    }
+
+    fn reconcile(&self, desired: &HashSet<NodePublic>, refresh: &HashSet<NodePublic>) {
+        let mut state = self
+            .state
+            .write()
+            .expect("peer authorization lock poisoned");
+        state.generations.retain(|peer, _| desired.contains(peer));
+        for peer in desired {
+            if refresh.contains(peer) || !state.generations.contains_key(peer) {
+                state.next_generation = state.next_generation.wrapping_add(1).max(1);
+                let generation = state.next_generation;
+                state.generations.insert(peer.clone(), generation);
+            }
+        }
+    }
+
+    fn is_current(&self, peer: &NodePublic, generation: u64) -> bool {
+        self.generation(peer) == Some(generation)
+    }
+}
+
+/// A received WG datagram with its sender and authorization generation.
 pub struct WgDatagram {
     /// The peer's WireGuard public key.
     pub peer: NodePublic,
-    /// The raw WG ciphertext datagram.
+    /// The raw WG ciphertext datagram. It privately carries the generation
+    /// stamped by magicsock, so external constructors cannot forge one.
     pub data: WgCiphertext,
+}
+
+impl WgDatagram {
+    pub fn authorization_generation(&self) -> u64 {
+        self.data.authorization_generation
+    }
 }
 
 /// Ordered WireGuard receive burst handed to one tsnet consumer.
@@ -899,6 +991,13 @@ struct Inner {
     /// Multi-region DERP connection manager.
     derp: DerpManager,
     endpoints: RwLock<HashMap<NodePublic, Endpoint>>,
+    /// Linearizable authorization generations published by verified netmaps.
+    /// A queued ciphertext is valid only while its peer retains the exact
+    /// generation stamped before enqueue.
+    peer_authorization: PeerAuthorization,
+    /// Delivery readers hold this across the final plaintext handoff; map
+    /// commits take the writer before publishing generations.
+    authorization_delivery_barrier: Arc<tokio::sync::RwLock<()>>,
     disco_to_peer: RwLock<HashMap<DiscoPublic, NodePublic>>,
     addr_to_peer: RwLock<HashMap<SocketAddr, NodePublic>>,
     wg_send: mpsc::Sender<WgReceiveBatch>,
@@ -1430,6 +1529,8 @@ impl Magicsock {
             local_udp_addrs: RwLock::new(local_udp_addrs),
             derp,
             endpoints: RwLock::new(HashMap::new()),
+            peer_authorization: PeerAuthorization::default(),
+            authorization_delivery_barrier: Arc::new(tokio::sync::RwLock::new(())),
             disco_to_peer: RwLock::new(HashMap::new()),
             addr_to_peer: RwLock::new(HashMap::new()),
             wg_send,
@@ -1609,6 +1710,83 @@ impl Magicsock {
             .filter(|peer| !peer.Key.is_zero())
             .map(|peer| peer.Key.clone())
             .collect();
+        let desired_disco = peers
+            .iter()
+            .filter(|peer| !peer.Key.is_zero())
+            .map(|peer| (peer.Key.clone(), peer.DiscoKey.clone()))
+            .collect::<HashMap<_, _>>();
+        // All endpoint/reverse-map mutation and generation publication is one
+        // ordered transaction against disco handlers.
+        let _map_ordering = self.inner.authorization_delivery_barrier.write().await;
+        let (removed, refreshed) = {
+            let mut endpoints = self
+                .inner
+                .endpoints
+                .write()
+                .expect("endpoints lock poisoned");
+            let removed = endpoints
+                .keys()
+                .filter(|peer| !desired.contains(*peer))
+                .cloned()
+                .collect::<Vec<_>>();
+            let refreshed = endpoints
+                .iter()
+                .filter(|(key, endpoint)| {
+                    desired_disco
+                        .get(*key)
+                        .is_some_and(|disco| endpoint.peer_disco_key() != disco)
+                })
+                .map(|(key, _)| key.clone())
+                .collect::<HashSet<_>>();
+            endpoints.retain(|peer, _| desired.contains(peer) && !refreshed.contains(peer));
+            (removed, refreshed)
+        };
+        self.inner
+            .disco_to_peer
+            .write()
+            .expect("disco_to_peer lock poisoned")
+            .retain(|disco, peer| {
+                !refreshed.contains(peer)
+                    && desired_disco
+                        .get(peer)
+                        .is_some_and(|current| !current.is_zero() && current == disco)
+            });
+        self.inner
+            .addr_to_peer
+            .write()
+            .expect("addr_to_peer lock poisoned")
+            .retain(|_, peer| desired.contains(peer) && !refreshed.contains(peer));
+        {
+            let mut tasks = self
+                .inner
+                .background_tasks
+                .write()
+                .expect("background_tasks lock poisoned");
+            tasks.retain(|peer, task| {
+                if desired.contains(peer) && !refreshed.contains(peer) {
+                    true
+                } else {
+                    task.abort();
+                    false
+                }
+            });
+        }
+        self.inner
+            .cli_ping_callbacks
+            .write()
+            .expect("cli_ping_callbacks lock poisoned")
+            .retain(|peer, _| desired.contains(peer) && !refreshed.contains(peer));
+        let relay_manager = self
+            .inner
+            .relay_manager
+            .read()
+            .expect("relay_manager lock poisoned")
+            .clone();
+        if let Some(relay) = relay_manager {
+            for peer in removed.iter().chain(&refreshed) {
+                relay.cancel_work_and_wait(peer.clone()).await;
+            }
+        }
 
         // Phase 1: replace endpoint state under the lock. Keys absent from the
         // new stable-node snapshot are removed before any new path can use
@@ -1720,15 +1898,15 @@ impl Magicsock {
             .write()
             .expect("cli_ping_callbacks lock poisoned")
             .retain(|key, _| desired.contains(key));
-        if let Some(relay) = self
+        let relay_manager = self
             .inner
             .relay_manager
             .read()
             .expect("relay_manager lock poisoned")
-            .as_ref()
-        {
+            .clone();
+        if let Some(relay) = relay_manager {
             for key in &removed {
-                relay.cancel_work(key.clone());
+                relay.cancel_work_and_wait(key.clone()).await;
             }
         }
 
@@ -1803,16 +1981,22 @@ impl Magicsock {
             }
         }
 
+        // Publish generations while the map-ordering writer is still held;
+        // relay work started below captures the exact new generation.
+        self.inner
+            .peer_authorization
+            .reconcile(&desired, &refreshed);
+
         // Discover relay server candidates from the netmap and update the
         // relay manager. Ports Go's `updateRelayServersSet`.
-        if let Some(rm) = self
+        let relay_manager = self
             .inner
             .relay_manager
             .read()
             .expect("relay_manager lock poisoned")
-            .as_ref()
-        {
-            let servers = relay_manager::discover_relay_servers(
+            .clone();
+        if let Some(rm) = relay_manager {
+            let mut servers = relay_manager::discover_relay_servers(
                 &rustscale_tailcfg::Node {
                     Key: self
                         .inner
@@ -1826,8 +2010,16 @@ impl Magicsock {
                 },
                 &peers,
             );
+            servers.retain_mut(|server| {
+                let Some(generation) = self.inner.peer_authorization.generation(&server.node_key)
+                else {
+                    return false;
+                };
+                server.authorization_generation = generation;
+                true
+            });
 
-            rm.handle_relay_servers_set(servers);
+            rm.handle_relay_servers_set_and_wait(servers).await;
 
             // Start relay path discovery for peers that don't already have
             // active relay work.
@@ -1835,11 +2027,48 @@ impl Magicsock {
                 if peer.Key.is_zero() || peer.DiscoKey.is_zero() {
                     continue;
                 }
-                rm.start_discovery(peer.Key.clone(), peer.DiscoKey.clone());
+                if let Some(generation) = self.inner.peer_authorization.generation(&peer.Key) {
+                    rm.start_discovery(peer.Key.clone(), peer.DiscoKey.clone(), generation);
+                }
             }
         }
 
+        // This is the map-application linearization point. Every removed key
+        // has already lost its endpoint, reverse maps, probes, relay work, and
+        // callbacks. Added keys have fresh endpoint state. Ciphertexts stamped
+        // before this publication are rejected by the consumer.
         Ok(())
+    }
+
+    /// Return the current authorization generation for an allowed peer.
+    pub fn authorization_generation(&self, peer: &NodePublic) -> Option<u64> {
+        self.inner.peer_authorization.generation(peer)
+    }
+
+    /// Revalidate a queued ciphertext immediately before decapsulation or
+    /// plaintext delivery.
+    pub fn is_authorization_current(&self, peer: &NodePublic, generation: u64) -> bool {
+        self.inner.peer_authorization.is_current(peer, generation)
+    }
+
+    /// Acquire the delivery side of the map-commit barrier. Revalidate while
+    /// this guard is held, then keep it through the final plaintext handoff.
+    pub async fn authorization_delivery_guard(&self) -> tokio::sync::OwnedRwLockReadGuard<()> {
+        self.inner
+            .authorization_delivery_barrier
+            .clone()
+            .read_owned()
+            .await
+    }
+
+    /// Stamp owned ciphertext for an already-authorized peer. Transport
+    /// adapters and tests use this instead of constructing forgeable tokens.
+    pub fn authorized_wg_datagram(&self, peer: NodePublic, data: Vec<u8>) -> Option<WgDatagram> {
+        let generation = self.inner.peer_authorization.generation(&peer)?;
+        Some(WgDatagram {
+            peer,
+            data: WgCiphertext::from(data).authorized(generation),
+        })
     }
 
     /// Install or remove the physical transport connection counter.
@@ -1863,6 +2092,9 @@ impl Magicsock {
     ) -> Result<(), MagicsockError> {
         if datagrams.is_empty() {
             return Ok(());
+        }
+        if self.inner.peer_authorization.generation(&peer).is_none() {
+            return Err(MagicsockError::PeerNotFound);
         }
         // Note TX activity before path lookup. Only an inactive-to-active
         // transition arms the independent heartbeat cadence.
@@ -2168,13 +2400,26 @@ impl Magicsock {
 
     /// Update the self node's CapMap from the latest MapResponse. Used to
     /// check `NODE_ATTR_DISABLE_RELAY_SERVER` for the relay server extension.
-    pub fn set_self_cap_map(&self, cap_map: rustscale_tailcfg::NodeCapMap) {
-        let mut guard = self
-            .inner
-            .self_cap_map
-            .write()
-            .expect("self_cap_map lock poisoned");
-        *guard = cap_map;
+    pub async fn set_self_cap_map(&self, cap_map: rustscale_tailcfg::NodeCapMap) {
+        if let Some(relay_server) = self.inner.relay_server.as_ref() {
+            relay_server.set_self_cap_map(cap_map).await;
+        } else {
+            let mut guard = self
+                .inner
+                .self_cap_map
+                .write()
+                .expect("self_cap_map lock poisoned");
+            *guard = cap_map;
+        }
+    }
+
+    /// Fail closed for a tailnet identity withdrawal. This synchronously
+    /// disables the relay server and removes all active UDP relay allocations;
+    /// only `set_self_cap_map` from a fresh matching map can re-enable it.
+    pub async fn disable_relay_server_and_drain(&self) {
+        if let Some(relay_server) = self.inner.relay_server.as_ref() {
+            relay_server.disable_and_drain().await;
+        }
     }
 
     /// Snapshot of the self node's CapMap. Used by service listeners to
@@ -3135,16 +3380,96 @@ impl relay_manager::RelayManagerContext for Inner {
             .map_or(0, endpoint::Endpoint::derp_send_region)
     }
 
-    fn set_relay(&self, peer_key: &NodePublic, addr: SocketAddr, vni: u32) {
+    fn peer_authorization_generation(&self, peer_key: &NodePublic) -> Option<u64> {
+        self.peer_authorization.generation(peer_key)
+    }
+
+    fn set_relay(
+        &self,
+        peer_key: &NodePublic,
+        peer_disco: &DiscoPublic,
+        authorization_generation: u64,
+        relay_server_key: &NodePublic,
+        relay_server_generation: u64,
+        addr: SocketAddr,
+        vni: u32,
+    ) {
+        if !self
+            .peer_authorization
+            .is_current(peer_key, authorization_generation)
+            || !self
+                .peer_authorization
+                .is_current(relay_server_key, relay_server_generation)
+        {
+            return;
+        }
         let mut endpoints = self.endpoints.write().expect("endpoints lock poisoned");
+        if !self
+            .peer_authorization
+            .is_current(peer_key, authorization_generation)
+            || !self
+                .peer_authorization
+                .is_current(relay_server_key, relay_server_generation)
+        {
+            return;
+        }
         if let Some(ep) = endpoints.get_mut(peer_key) {
-            ep.set_relay(addr, vni);
+            if ep.peer_disco_key() != peer_disco {
+                return;
+            }
+            let previous_addr = ep.current_relay().map(|(addr, _, _, _)| addr);
+            let mut addr_to_peer = self
+                .addr_to_peer
+                .write()
+                .expect("addr_to_peer lock poisoned");
+            if let Some(previous_addr) = previous_addr {
+                if addr_to_peer.get(&previous_addr) == Some(peer_key) {
+                    addr_to_peer.remove(&previous_addr);
+                }
+            }
+            let evicted =
+                ep.set_relay(addr, vni, relay_server_key.clone(), relay_server_generation);
+            for evicted_addr in evicted {
+                if evicted_addr != addr && addr_to_peer.get(&evicted_addr) == Some(peer_key) {
+                    addr_to_peer.remove(&evicted_addr);
+                }
+            }
+            addr_to_peer.insert(addr, peer_key.clone());
             if debug_enabled() {
                 eprintln!(
                     "DBG relay_set peer={} addr={addr} vni={vni}",
                     short_key(peer_key)
                 );
             }
+        }
+    }
+
+    fn clear_relay_server(
+        &self,
+        relay_server_key: &NodePublic,
+        relay_server_disco: &DiscoPublic,
+        relay_server_generation: u64,
+    ) {
+        {
+            let mut endpoints = self.endpoints.write().expect("endpoints lock poisoned");
+            let mut addr_to_peer = self
+                .addr_to_peer
+                .write()
+                .expect("addr_to_peer lock poisoned");
+            for (peer, endpoint) in endpoints.iter_mut() {
+                for addr in endpoint.clear_relay_server(relay_server_key, relay_server_generation) {
+                    if addr_to_peer.get(&addr) == Some(peer) {
+                        addr_to_peer.remove(&addr);
+                    }
+                }
+            }
+        }
+        let mut disco_to_peer = self
+            .disco_to_peer
+            .write()
+            .expect("disco_to_peer lock poisoned");
+        if disco_to_peer.get(relay_server_disco) == Some(relay_server_key) {
+            disco_to_peer.remove(relay_server_disco);
         }
     }
 
@@ -3183,6 +3508,19 @@ impl relay_manager::RelayManagerContext for Inner {
 }
 
 impl Inner {
+    fn authorized_disco_generation(
+        &self,
+        peer_key: &NodePublic,
+        sender_disco: &DiscoPublic,
+    ) -> Option<u64> {
+        let endpoints = self.endpoints.read().expect("endpoints lock poisoned");
+        let endpoint = endpoints.get(peer_key)?;
+        if endpoint.peer_disco_key() != sender_disco {
+            return None;
+        }
+        self.peer_authorization.generation(peer_key)
+    }
+
     /// Probe every current UDP candidate and, once per discovery cycle, tell
     /// the peer our observed addresses via DERP. Called from a detached,
     /// rate-limited task started by the WireGuard send path.
@@ -3364,7 +3702,7 @@ impl Inner {
         // Check for Geneve-encapsulated packets first (relay path).
         if relay::looks_like_geneve_disco(data) {
             if let Some((_proto, vni, _control, inner)) = relay::decode_geneve_full(data) {
-                self.handle_disco_udp_relay(inner, src, vni);
+                self.handle_disco_udp_relay(inner, src, vni).await;
                 return;
             }
         }
@@ -3406,7 +3744,7 @@ impl Inner {
             return true;
         }
 
-        let identified = {
+        let mut identified = {
             let peers = self
                 .addr_to_peer
                 .read()
@@ -3422,10 +3760,22 @@ impl Inner {
                 received_at,
             )
         };
-        let known = identified
+        for (peer, generation) in identified
             .peers
+            .iter_mut()
+            .zip(identified.generations.iter_mut())
+        {
+            *generation = peer
+                .as_ref()
+                .and_then(|peer| self.peer_authorization.generation(peer));
+            if generation.is_none() {
+                *peer = None;
+            }
+        }
+        let known = identified
+            .generations
             .iter()
-            .filter(|peer| peer.is_some())
+            .filter(|generation| generation.is_some())
             .count();
         if known == 0 {
             pending.clear();
@@ -3484,7 +3834,15 @@ impl Inner {
         }
         debug_assert_eq!(pending.len(), known);
         let datagrams = std::mem::take(pending);
-        publish_reserved_wg_batch(&self.wg_send, datagrams, channel_permit, pool_reservation).await;
+        publish_reserved_wg_batch(
+            &self.wg_send,
+            datagrams,
+            channel_permit,
+            pool_reservation,
+            &self.peer_authorization,
+            &self.authorization_delivery_barrier,
+        )
+        .await;
         false
     }
 
@@ -3500,16 +3858,20 @@ impl Inner {
             health.note_derp_region_frame(region_id);
         }
 
-        // Record the arrival DERP region on the peer's endpoint so future
-        // replies route to this region (Go's derpRoute caching).
-        let node_addr = {
+        // Record the route only while source authorization is ordered against
+        // map replacement. The generation is rechecked again at enqueue.
+        let (node_addr, generation) = {
+            let _ordering = self.authorization_delivery_barrier.read().await;
+            let Some(generation) = self.peer_authorization.generation(&source) else {
+                return;
+            };
             let mut endpoints = self.endpoints.write().expect("endpoints lock poisoned");
-            endpoints.get_mut(&source).map(|ep| {
-                ep.set_last_recv_derp_region(region_id);
-                ep.node_addr()
-            })
-        }
-        .flatten();
+            let Some(endpoint) = endpoints.get_mut(&source) else {
+                return;
+            };
+            endpoint.set_last_recv_derp_region(region_id);
+            (endpoint.node_addr(), generation)
+        };
 
         let data = &frame[payload.clone()];
         let is_disco = DiscoIo::looks_like_disco(data);
@@ -3544,8 +3906,12 @@ impl Inner {
                 &self.wg_receive_credits,
                 vec![WgDatagram {
                     peer: source,
-                    data: WgCiphertext::from_vec_range(frame, payload),
+                    data: WgCiphertext::from_vec_range(frame, payload).authorized(generation),
                 }],
+                Some((
+                    &self.peer_authorization,
+                    &self.authorization_delivery_barrier,
+                )),
             )
             .await;
         }
@@ -3579,15 +3945,29 @@ impl Inner {
             map.get(&src).cloned()
         };
         if let Some(peer) = peer {
-            // Note UDP recv activity for heartbeat / UDP lifetime probe.
-            let node_addr = {
+            // Validate the reverse map and mutate endpoint activity under the
+            // same ordering read side as set_netmap's purge+commit.
+            let (generation, node_addr) = {
+                let _ordering = self.authorization_delivery_barrier.read().await;
+                if self
+                    .addr_to_peer
+                    .read()
+                    .expect("addr_to_peer lock poisoned")
+                    .get(&src)
+                    != Some(&peer)
+                {
+                    return;
+                }
+                let Some(generation) = self.peer_authorization.generation(&peer) else {
+                    return;
+                };
                 let mut endpoints = self.endpoints.write().expect("endpoints lock poisoned");
-                endpoints.get_mut(&peer).map(|ep| {
-                    ep.note_recv_udp(std::time::Instant::now());
-                    ep.node_addr()
-                })
-            }
-            .flatten();
+                let Some(endpoint) = endpoints.get_mut(&peer) else {
+                    return;
+                };
+                endpoint.note_recv_udp(std::time::Instant::now());
+                (generation, endpoint.node_addr())
+            };
             self.connection_counter
                 .record(node_addr, src, 1, data.len() as u64, true);
             publish_wg_batch(
@@ -3595,8 +3975,12 @@ impl Inner {
                 &self.wg_receive_credits,
                 vec![WgDatagram {
                     peer,
-                    data: data.to_vec().into(),
+                    data: WgCiphertext::from(data.to_vec()).authorized(generation),
                 }],
+                Some((
+                    &self.peer_authorization,
+                    &self.authorization_delivery_barrier,
+                )),
             )
             .await;
         }
@@ -3606,7 +3990,7 @@ impl Inner {
     /// Handle a Geneve-encapsulated disco message received via UDP (relay
     /// path). The Geneve header has already been stripped; `data` is the
     /// raw disco envelope.
-    fn handle_disco_udp_relay(&self, data: &[u8], src: SocketAddr, vni: u32) {
+    async fn handle_disco_udp_relay(&self, data: &[u8], src: SocketAddr, vni: u32) {
         let (sender_disco, msg) = match self.disco.open(data) {
             Some(v) => v,
             None => return,
@@ -3618,24 +4002,55 @@ impl Inner {
                 msg.summary()
             );
         }
-
+        let _ordering = self.authorization_delivery_barrier.read().await;
+        let Some(rm) = self
+            .relay_manager
+            .read()
+            .expect("relay_manager lock poisoned")
+            .clone()
+        else {
+            return;
+        };
         match &msg {
-            Message::BindUdpRelayEndpointChallenge(_) | Message::Ping(_) | Message::Pong(_) => {
-                if let Some(rm) = self
-                    .relay_manager
+            Message::BindUdpRelayEndpointChallenge(_) => {
+                // Relay allocation disco keys are ephemeral and do not equal
+                // the relay server node's netmap disco key. The manager
+                // validates this exact key+VNI against current generation-
+                // stamped handshake work before routing the challenge.
+                rm.handle_rx_disco_msg(relay_manager::RelayDiscoMsg {
+                    msg,
+                    disco: sender_disco,
+                    from: src,
+                    vni,
+                    relay_server_node_key: None,
+                    source_node_key: None,
+                    authorization_generation: None,
+                });
+            }
+            Message::Ping(_) | Message::Pong(_) => {
+                let sender_key = self
+                    .disco_to_peer
                     .read()
-                    .expect("relay_manager lock poisoned")
-                    .as_ref()
-                {
-                    rm.handle_rx_disco_msg(relay_manager::RelayDiscoMsg {
-                        msg,
-                        disco: sender_disco,
-                        from: src,
-                        vni,
-                        relay_server_node_key: None,
-                        source_node_key: None,
-                    });
-                }
+                    .expect("disco_to_peer lock poisoned")
+                    .get(&sender_disco)
+                    .cloned();
+                let Some(sender_key) = sender_key else {
+                    return;
+                };
+                let Some(sender_generation) =
+                    self.authorized_disco_generation(&sender_key, &sender_disco)
+                else {
+                    return;
+                };
+                rm.handle_rx_disco_msg(relay_manager::RelayDiscoMsg {
+                    msg,
+                    disco: sender_disco,
+                    from: src,
+                    vni,
+                    relay_server_node_key: None,
+                    source_node_key: Some(sender_key),
+                    authorization_generation: Some(sender_generation),
+                });
             }
             _ => {}
         }
@@ -3648,13 +4063,12 @@ impl Inner {
         &self,
         data: &[u8],
         src: SocketAddr,
-        _vni: u32,
+        vni: u32,
         physical_len: usize,
     ) {
-        // Look up the peer by source address. In the relay path, the source
-        // is the relay server, not the peer — but we record the relay addr
-        // → peer mapping when set_relay is called. For now, use the
-        // addr_to_peer map.
+        // The reverse map is only an index. Authorization below also requires
+        // this exact address+VNI to be the endpoint's current relay path and
+        // its relay-server generation to remain current.
         let peer = {
             let map = self
                 .addr_to_peer
@@ -3663,11 +4077,39 @@ impl Inner {
             map.get(&src).cloned()
         };
         if let Some(peer) = peer {
-            let node_addr = self
-                .endpoints
-                .read()
-                .ok()
-                .and_then(|endpoints| endpoints.get(&peer).and_then(Endpoint::node_addr));
+            let (generation, node_addr) = {
+                let _ordering = self.authorization_delivery_barrier.read().await;
+                if self
+                    .addr_to_peer
+                    .read()
+                    .expect("addr_to_peer lock poisoned")
+                    .get(&src)
+                    != Some(&peer)
+                {
+                    return;
+                }
+                let Some(generation) = self.peer_authorization.generation(&peer) else {
+                    return;
+                };
+                let endpoints = self.endpoints.read().expect("endpoints lock poisoned");
+                let Some(endpoint) = endpoints.get(&peer) else {
+                    return;
+                };
+                let Some((relay_addr, relay_vni, relay_server, relay_server_generation)) =
+                    endpoint.current_relay()
+                else {
+                    return;
+                };
+                if relay_addr != src
+                    || relay_vni != vni
+                    || !self
+                        .peer_authorization
+                        .is_current(relay_server, relay_server_generation)
+                {
+                    return;
+                }
+                (generation, endpoint.node_addr())
+            };
             // Receive accounting includes the Geneve header, matching
             // upstream's geneveInclusivePacketLen behavior.
             self.connection_counter
@@ -3677,8 +4119,12 @@ impl Inner {
                 &self.wg_receive_credits,
                 vec![WgDatagram {
                     peer,
-                    data: data.to_vec().into(),
+                    data: WgCiphertext::from(data.to_vec()).authorized(generation),
                 }],
+                Some((
+                    &self.peer_authorization,
+                    &self.authorization_delivery_barrier,
+                )),
             )
             .await;
         }
@@ -3689,6 +4135,7 @@ impl Inner {
             Some(v) => v,
             None => return,
         };
+        let _ordering = self.authorization_delivery_barrier.read().await;
 
         // Try to identify the peer by disco key first.
         let peer = {
@@ -3703,27 +4150,30 @@ impl Inner {
         // identify the peer by other means. Mirrors Go's
         // `unambiguousNodeKeyOfPingLocked` for pings (magicsock.go:2511)
         // and `forEachEndpointWithDiscoKey` for pongs (magicsock.go:2320).
-        let peer = match peer {
-            Some(p) => p,
+        let peer = match peer.filter(|peer| {
+            self.authorized_disco_generation(peer, &sender_disco)
+                .is_some()
+        }) {
+            Some(peer) => peer,
             None => match &msg {
                 Message::Ping(ping) => {
                     // Use the ping's node_key to look up the endpoint.
                     if ping.node_key.is_zero() {
                         return;
                     }
-                    let endpoints = self.endpoints.read().expect("endpoints lock poisoned");
-                    if endpoints.contains_key(&ping.node_key) {
-                        // Record the disco→peer mapping for future lookups.
-                        drop(endpoints);
-                        let mut d2p = self
-                            .disco_to_peer
-                            .write()
-                            .expect("disco_to_peer lock poisoned");
-                        d2p.insert(sender_disco.clone(), ping.node_key.clone());
-                        ping.node_key.clone()
-                    } else {
+                    if self
+                        .authorized_disco_generation(&ping.node_key, &sender_disco)
+                        .is_none()
+                    {
                         return;
                     }
+                    // The map-ordering read guard prevents this authenticated
+                    // reverse-map insertion from crossing a revoke commit.
+                    self.disco_to_peer
+                        .write()
+                        .expect("disco_to_peer lock poisoned")
+                        .insert(sender_disco.clone(), ping.node_key.clone());
+                    ping.node_key.clone()
                 }
                 Message::Pong(pong) => {
                     // Search all endpoints for one with a matching pending
@@ -3733,7 +4183,10 @@ impl Inner {
                     let mut found_peer: Option<NodePublic> = None;
                     let endpoints = self.endpoints.read().expect("endpoints lock poisoned");
                     for (node_key, ep) in endpoints.iter() {
-                        if ep.has_pending_ping(&pong.tx_id) {
+                        if ep.peer_disco_key() == &sender_disco
+                            && self.peer_authorization.generation(node_key).is_some()
+                            && ep.has_pending_ping(&pong.tx_id)
+                        {
                             found_peer = Some(node_key.clone());
                             break;
                         }
@@ -3874,6 +4327,12 @@ impl Inner {
             Some(v) => v,
             None => return,
         };
+        let _ordering = self.authorization_delivery_barrier.read().await;
+        let Some(authorization_generation) =
+            self.authorized_disco_generation(&source, &sender_disco)
+        else {
+            return;
+        };
 
         // Look up the peer's DERP send region (last-recv-region > HomeDERP).
         let derp_region = {
@@ -4003,7 +4462,12 @@ impl Inner {
                             .map(|ep| ep.peer_disco_key().clone())
                             .unwrap_or(sender_disco.clone())
                     };
-                    rm.handle_call_me_maybe_via(source.clone(), peer_disco, &cmmv);
+                    rm.handle_call_me_maybe_via(
+                        source.clone(),
+                        peer_disco,
+                        authorization_generation,
+                        &cmmv,
+                    );
                 }
             }
             Message::AllocateUdpRelayEndpointResponse(_) => {
@@ -4025,6 +4489,7 @@ impl Inner {
                         vni: 0,
                         relay_server_node_key: Some(source.clone()),
                         source_node_key: Some(source.clone()),
+                        authorization_generation: Some(authorization_generation),
                     });
                 }
             }
@@ -4038,13 +4503,12 @@ impl Inner {
                     // via DERP, the `source` NodePublic is the DERP-claimed
                     // sender, and `sender_disco` is the authenticated disco
                     // key from the NaCl box. Both must match a known peer.
-                    let peer_known = {
-                        let d2p = self
-                            .disco_to_peer
-                            .read()
-                            .expect("disco_to_peer lock poisoned");
-                        d2p.contains_key(&sender_disco)
-                    };
+                    let peer_known = self
+                        .disco_to_peer
+                        .read()
+                        .expect("disco_to_peer lock poisoned")
+                        .get(&sender_disco)
+                        == Some(&source);
                     if !peer_known {
                         return;
                     }
@@ -4794,6 +5258,7 @@ mod linux_batch_tests {
                 &queued_direct_sender,
                 &queued_direct_credits,
                 pending(WG_RECEIVE_BATCH_MAX_PACKETS),
+                None,
             )
             .await;
         });
@@ -4810,6 +5275,7 @@ mod linux_batch_tests {
                     peer: derp_peer,
                     data: b"derp".to_vec().into(),
                 }],
+                None,
             )
             .await;
         });
@@ -4824,6 +5290,7 @@ mod linux_batch_tests {
                 &sustained_direct_sender,
                 &sustained_direct_credits,
                 pending(WG_RECEIVE_BATCH_MAX_PACKETS),
+                None,
             )
             .await;
         });
@@ -4895,7 +5362,7 @@ mod linux_batch_tests {
         let cancelled_sender = sender.clone();
         let cancelled_credits = credits.clone();
         let cancelled = tokio::spawn(async move {
-            publish_wg_batch(&cancelled_sender, &cancelled_credits, pending(1)).await;
+            publish_wg_batch(&cancelled_sender, &cancelled_credits, pending(1), None).await;
         });
         tokio::task::yield_now().await;
         cancelled.abort();
@@ -4910,7 +5377,7 @@ mod linux_batch_tests {
 
         let (closed_sender, closed_receiver) = mpsc::channel(WG_RECEIVE_PACKET_CAPACITY);
         drop(closed_receiver);
-        publish_wg_batch(&closed_sender, &credits, pending(1)).await;
+        publish_wg_batch(&closed_sender, &credits, pending(1), None).await;
         assert_eq!(credits.available_permits(), WG_RECEIVE_PACKET_CAPACITY);
     }
 }

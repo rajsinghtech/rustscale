@@ -379,7 +379,7 @@ fn sample_map_response() -> MapResponse {
         KeepAlive: false,
         Node: Some(sample_node()),
         DERPMap: Some(sample_derpmap()),
-        Peers: vec![sample_node()],
+        Peers: Some(vec![sample_node()]),
         PeersChanged: vec![sample_node()],
         PeersRemoved: vec![3, 7],
         Domain: "tail-scale.ts.net".into(),
@@ -404,6 +404,7 @@ fn sample_map_response() -> MapResponse {
         NetInfo: None,
         ClientVersion: None,
         SuggestedExitNode: String::new(),
+        TKAInfo: None,
     }
 }
 
@@ -654,7 +655,7 @@ fn realistic_map_response_fixture_with_nulls() {
         BTreeMap::new(),
         "null CapMap -> empty map"
     );
-    assert!(resp.Peers.is_empty(), "null Peers -> empty vec");
+    assert!(resp.Peers.is_none(), "null Peers -> absent snapshot");
     assert!(
         resp.PeersChanged.is_empty(),
         "null PeersChanged -> empty vec"

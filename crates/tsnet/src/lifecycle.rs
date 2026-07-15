@@ -226,6 +226,7 @@ impl Server {
             b.map_rx,
             b.magicsock.clone(),
             b.wg_tunnels.clone(),
+            b.raw_peers.clone(),
             b.peers.clone(),
             b.route_table.clone(),
             None,
@@ -247,7 +248,7 @@ impl Server {
             b.cancel.clone(),
             b.health.clone(),
             b.health_watchdog.clone(),
-            self.config.state_dir.clone(),
+            b.state_scope.clone(),
             b.node_key.public(),
             b.control_knobs.clone(),
             b.key_expired.clone(),
@@ -257,6 +258,9 @@ impl Server {
             b.c2n_router.clone(),
             suggested_exit_node.clone(),
             client_updater.clone(),
+            b.tailnet_lock.clone(),
+            b.domain.clone(),
+            b.peer_snapshot_fresh,
         );
 
         // MagicDNS responder: best-effort UDP server at 100.100.100.100:53.
@@ -528,6 +532,8 @@ impl Server {
                 }),
                 taildrop: Some(taildrop.clone()),
                 drive: self.drive.clone(),
+                peer_map: b.peer_map.clone(),
+                tailnet_lock: Some(b.tailnet_lock.clone()),
                 netstack: Some(netstack.clone()),
                 filter: std::sync::OnceLock::new(),
                 route_table: Some(b.route_table.clone()),
@@ -580,6 +586,7 @@ impl Server {
             peer_map: b.peer_map,
             routecheck: b.routecheck,
             route_table: b.route_table,
+            filter: b.filter,
             router: None,
             cancel: b.cancel,
             tasks: Mutex::new(tasks),
@@ -622,17 +629,24 @@ impl Server {
             portlist_ports,
             client_updater: client_updater.clone(),
             audit_logger,
+            tailnet_lock: b.tailnet_lock.clone(),
         });
 
         // A persisted selection retries only while it is unresolved. Once it
         // resolves, later map rebuilds retain the route-table owner.
-        let (peers, route_table) = match self.inner.as_ref() {
-            Some(inner) => (inner.peers.clone(), inner.route_table.clone()),
+        let (peers, route_table, peer_map) = match self.inner.as_ref() {
+            Some(inner) => (
+                inner.peers.clone(),
+                inner.route_table.clone(),
+                inner.peer_map.clone(),
+            ),
             None => return Ok(self.status()),
         };
+        let _map_commit = peer_map.gate.write().await;
         let peers = peers.read().await;
+        let mut selection = exit_node_selection.write().await;
         let mut routes = route_table.write().await;
-        exit_node_selection.write().await.retry(&peers, &mut routes);
+        selection.retry(&peers, &mut routes);
 
         Ok(self.status())
     }
@@ -675,11 +689,12 @@ impl Server {
         // pump routes non-tailnet traffic to the exit peer. OS-level
         // default-route overrides are installed after the TUN is created.
         if let Some(ref exit) = config.exit_node {
+            let _map_commit = b.peer_map.gate.write().await;
             let peers = b.peers.read().await;
             let peer_key = resolve_exit_node(&peers, exit)?;
             drop(peers);
-            b.route_table.write().await.set_exit_node(peer_key);
             exit_node_selection.write().await.clear_pending();
+            b.route_table.write().await.set_exit_node(peer_key);
             let mut live_prefs = prefs.write().await;
             set_exit_node_pref(&mut live_prefs, exit);
             if let Some(ref dir) = self.config.state_dir {
@@ -767,6 +782,7 @@ impl Server {
             b.map_rx,
             b.magicsock.clone(),
             b.wg_tunnels.clone(),
+            b.raw_peers.clone(),
             b.peers.clone(),
             b.route_table.clone(),
             router.clone(),
@@ -788,7 +804,7 @@ impl Server {
             b.cancel.clone(),
             b.health.clone(),
             b.health_watchdog.clone(),
-            self.config.state_dir.clone(),
+            b.state_scope.clone(),
             b.node_key.public(),
             b.control_knobs.clone(),
             b.key_expired.clone(),
@@ -798,6 +814,9 @@ impl Server {
             b.c2n_router.clone(),
             suggested_exit_node.clone(),
             client_updater.clone(),
+            b.tailnet_lock.clone(),
+            b.domain.clone(),
+            b.peer_snapshot_fresh,
         );
 
         // Taildrop file manager (shared between PeerAPI receive handler
@@ -1038,6 +1057,8 @@ impl Server {
                 }),
                 taildrop: Some(taildrop.clone()),
                 drive: self.drive.clone(),
+                peer_map: b.peer_map.clone(),
+                tailnet_lock: Some(b.tailnet_lock.clone()),
                 netstack: None, // TUN mode has no netstack
                 filter: std::sync::OnceLock::new(),
                 route_table: Some(b.route_table.clone()),
@@ -1123,6 +1144,7 @@ impl Server {
             peer_map: b.peer_map,
             routecheck: b.routecheck,
             route_table: b.route_table,
+            filter: b.filter,
             router,
             cancel: b.cancel,
             tasks: Mutex::new(tasks),
@@ -1165,11 +1187,12 @@ impl Server {
             portlist_ports,
             client_updater: client_updater.clone(),
             audit_logger,
+            tailnet_lock: b.tailnet_lock.clone(),
         });
 
         // TUN config owns a selection made above; otherwise retry only an
         // unresolved persisted selection.
-        let (peers, route_table, router, tailscale_ips, magicsock, live_prefs) =
+        let (peers, route_table, router, tailscale_ips, magicsock, live_prefs, peer_map) =
             match self.inner.as_ref() {
                 Some(inner) => (
                     inner.peers.clone(),
@@ -1178,12 +1201,15 @@ impl Server {
                     inner.tailscale_ips.clone(),
                     inner.magicsock.clone(),
                     inner.prefs.clone(),
+                    inner.peer_map.clone(),
                 ),
                 None => return Ok(self.status()),
             };
+        let _map_commit = peer_map.gate.write().await;
         let peers = peers.read().await;
+        let mut selection = exit_node_selection.write().await;
         let mut routes = route_table.write().await;
-        if exit_node_selection.write().await.retry(&peers, &mut routes) {
+        if selection.retry(&peers, &mut routes) {
             if let Some(router) = router.as_ref() {
                 let derp_map = magicsock.get_derp_map();
                 let exit_node_allow_lan_access = live_prefs.read().await.ExitNodeAllowLANAccess;
@@ -1358,6 +1384,8 @@ impl Server {
             control_params: None,
             taildrop: None,
             drive: self.drive.clone(),
+            peer_map: crate::peer_map::Runtime::new(&[]).expect("empty localapi peer map"),
+            tailnet_lock: None,
             netstack: None,
             filter: std::sync::OnceLock::new(),
             route_table: None,
@@ -1496,6 +1524,7 @@ impl Server {
         // is enabled. Used for Hostinfo.RoutableIPs, the filter's localNets,
         // and link-change endpoint updates.
         let advertise = self.config.effective_advertise_routes();
+        let state_scope = self.profile_state_scope();
 
         // Health tracker + map-poll staleness watchdog (fires if no
         // MapResponse for more than 3 minutes).
@@ -1530,10 +1559,15 @@ impl Server {
         if was_fresh {
             state = PersistedState::generate();
             self.save_state(&state)?;
+        } else if state.network_lock_key.is_zero() {
+            // Upgrade older persisted identities with a profile-local Tailnet
+            // Lock key before exposing it through LocalAPI status.
+            state.network_lock_key = rustscale_key::NLPrivate::generate();
+            self.save_state(&state)?;
         }
 
-        let private_log_id = if let Some(dir) = self.config.state_dir.as_ref() {
-            rustscale_logid::PrivateID::load_or_create(&dir.join("logid-private"))?
+        let private_log_id = if let Some(scope) = state_scope.as_ref() {
+            rustscale_logid::PrivateID::load_or_create(&scope.dir.join("logid-private"))?
         } else {
             rustscale_logid::PrivateID::new()
         };
@@ -1549,11 +1583,11 @@ impl Server {
         // with an existing state dir, this lets us skip the blocking first
         // MapResponse fetch (2-5s) and use the cached peers immediately —
         // the streaming long-poll delivers fresh updates in the background.
-        let cached_netmap = self
-            .config
-            .state_dir
-            .as_ref()
-            .and_then(|dir| PersistedState::load_netmap(dir, &node_pub));
+        let cached_netmap = state_scope.as_ref().and_then(|scope| {
+            let cache = NetMapCache::new_scoped(scope, &state.tailnet_identity);
+            let cached = cache.load()?;
+            (cached.version == 2 && cached.node_key == node_pub).then_some(cached.map_response)
+        });
 
         // 2. Fetch the server's Noise public key (GET /key?v=<version>).
         let server_pub_key = controlhttp::fetch_server_pub_key(
@@ -1598,8 +1632,8 @@ impl Server {
         let reg_resp = register_result.map_err(|e| {
             // Auth/network failure is ambiguous. The key is not retained, so
             // a fresh WIF key is minted if the caller starts again.
-            if let Some(ref dir) = self.config.state_dir {
-                PersistedState::clear_netmap(dir);
+            if let Some(scope) = state_scope.as_ref() {
+                NetMapCache::new_scoped(scope, &state.tailnet_identity).clear();
                 log::warn!("tsnet: cleared netmap cache after register error: {e}");
             }
             ipn_backend.emit_err_message(e.to_string());
@@ -1608,8 +1642,8 @@ impl Server {
 
         // Server-side error string (e.g. "invalid auth key", "node key revoked").
         if !reg_resp.Error.is_empty() {
-            if let Some(ref dir) = self.config.state_dir {
-                PersistedState::clear_netmap(dir);
+            if let Some(scope) = state_scope.as_ref() {
+                NetMapCache::new_scoped(scope, &state.tailnet_identity).clear();
                 log::warn!(
                     "tsnet: cleared netmap cache after register error: {}",
                     reg_resp.Error
@@ -1625,8 +1659,8 @@ impl Server {
         // Node key expired — the server says our key is no longer valid.
         // Clear the cache so we don't reuse a netmap bound to the old key.
         if reg_resp.NodeKeyExpired {
-            if let Some(ref dir) = self.config.state_dir {
-                PersistedState::clear_netmap(dir);
+            if let Some(scope) = state_scope.as_ref() {
+                NetMapCache::new_scoped(scope, &state.tailnet_identity).clear();
                 log::info!("tsnet: cleared netmap cache: node key expired");
             }
             ipn_backend.set_key_expired(true);
@@ -1673,8 +1707,8 @@ impl Server {
                     ..Default::default()
                 };
                 let followup_resp = cc.register(&followup_req).await.map_err(|e| {
-                    if let Some(ref dir) = self.config.state_dir {
-                        PersistedState::clear_netmap(dir);
+                    if let Some(scope) = state_scope.as_ref() {
+                        NetMapCache::new_scoped(scope, &state.tailnet_identity).clear();
                     }
                     ipn_backend.emit_err_message(e.to_string());
                     TsnetError::Register(e)
@@ -1761,8 +1795,9 @@ impl Server {
         // the blocking fetch and use the cached data — the streaming
         // long-poll (started below) will deliver fresh updates in the
         // background. This eliminates the 2-5s startup delay on restarts.
+        let used_cached_netmap = cached_netmap.is_some();
         let map_resp: MapResponse = if let Some(ref cached) = cached_netmap {
-            let peer_count = cached.Peers.len();
+            let peer_count = cached.Peers.as_ref().map_or(0, Vec::len);
             log::debug!(
                 "tsnet: using cached netmap ({peer_count} peers); streaming poll will refresh in background"
             );
@@ -1792,6 +1827,45 @@ impl Server {
             .map_err(|_| TsnetError::MapTimeout)??
         };
 
+        if !map_resp.Domain.is_empty() {
+            if !state.tailnet_identity.is_empty() && state.tailnet_identity != map_resp.Domain {
+                return Err(TsnetError::TailnetLock(
+                    "control returned a different tailnet for this durable profile identity".into(),
+                ));
+            }
+            if state.tailnet_identity != map_resp.Domain {
+                state.tailnet_identity.clone_from(&map_resp.Domain);
+                self.save_state(&state)?;
+            }
+        }
+
+        let tailnet_lock = tailnet_lock::TailnetLock::open(tailnet_lock::TailnetLockParams {
+            control_url: self.config.control_url.clone(),
+            machine_key: state.machine_key.clone(),
+            server_pub_key: server_pub_key.clone(),
+            node_key: state.node_key.clone(),
+            signing_key: state.network_lock_key.clone(),
+            capability_version: CAPABILITY_VERSION,
+            protocol_version: PROTOCOL_VERSION,
+            state_dir: state_scope.as_ref().map(|scope| scope.dir.clone()),
+            extra_root_certs: self.config.extra_root_certs.clone(),
+        })
+        .map_err(|error| TsnetError::TailnetLock(error.to_string()))?;
+        if used_cached_netmap {
+            // No cached TKA state proves that its head or peer snapshot is
+            // still current. Even a cached enabled head remains withdrawn
+            // until a fresh control response confirms and synchronizes it.
+            tailnet_lock.require_fresh_control_state();
+        } else if let Err(error) = tailnet_lock
+            .apply_control_info(map_resp.TKAInfo.as_ref(), true)
+            .await
+        {
+            // Peer filtering below remains active and drops every peer while
+            // authority state is incomplete.
+            log::warn!("tsnet: Tailnet Lock synchronization failed closed: {error}");
+        }
+        tailnet_lock.set_self_node(map_resp.Node.clone());
+
         let tailscale_ips = extract_tailscale_ips(&map_resp);
         if tailscale_ips.is_empty() {
             return Err(TsnetError::Builder("no tailscale IPs assigned".into()));
@@ -1801,7 +1875,12 @@ impl Server {
         // We have a netmap — update the IPN state machine. Set netmap_present
         // and engine status (peer count + DERP home as a proxy for live
         // connections). This may transition the state from Starting to Running.
-        let peer_count = map_resp.Peers.iter().filter(|p| !p.Key.is_zero()).count() as i32;
+        let peer_count = map_resp
+            .Peers
+            .iter()
+            .flatten()
+            .filter(|peer| !peer.Key.is_zero())
+            .count() as i32;
         let has_derp_home = map_resp.Node.as_ref().is_some_and(|n| n.HomeDERP > 0);
         ipn_backend.set_netmap_present(true);
         ipn_backend.set_engine_status(peer_count, i32::from(has_derp_home));
@@ -1984,11 +2063,13 @@ impl Server {
                 PeerRelay: self.config.peer_relay_server,
                 ..Default::default()
             }),
+            TKAHead: tailnet_lock.head(),
             ..Default::default()
         };
 
         let (map_tx, map_rx) = mpsc::channel(32);
         let map_session = Arc::new(MapSessionState::new());
+        map_session.set_tka_head(tailnet_lock.head());
         let cc2 = ControlClient::new(
             self.config.control_url.clone(),
             state.machine_key.clone(),
@@ -2036,12 +2117,17 @@ impl Server {
 
         // The server may send peers via Peers (full list) or PeersChanged
         // (delta). The first response often uses PeersChanged.
-        let mut peers = map_resp.Peers.clone();
-        if peers.is_empty() && !map_resp.PeersChanged.is_empty() {
-            peers = map_resp.PeersChanged.clone();
-        }
-        // Validate stable IDs, keys, addresses, and address ownership before
-        // any peer-derived transport state becomes live.
+        let peers = map_resp
+            .Peers
+            .clone()
+            .unwrap_or_else(|| map_resp.PeersChanged.clone());
+        let mut peers = peers;
+        // Keep the stable-ID-reconciled control view separate from the TKA
+        // verified intersection. Authority changes may reauthorize a raw peer
+        // without control repeating it, but only verified peers own addresses,
+        // tunnels, PeerAPI provenance, or Taildrive grants.
+        let raw_peers = peers.clone();
+        tailnet_lock.filter_peers(&mut peers);
         let peer_map = crate::peer_map::Runtime::new(&peers)
             .map_err(|error| TsnetError::InvalidNetmap(error.to_string()))?;
 
@@ -2049,7 +2135,7 @@ impl Server {
         // PeerAPI starts. Taildrive remains disabled unless `drive:share` is
         // present; a needs-login LocalAPI cannot pre-authorize itself.
         if let Some(ref node) = map_resp.Node {
-            magicsock.set_self_cap_map(node.CapMap.clone());
+            magicsock.set_self_cap_map(node.CapMap.clone()).await;
             let sharing_allowed = node
                 .Capabilities
                 .iter()
@@ -2209,6 +2295,7 @@ impl Server {
             netlog,
             wg_recv,
             wg_tunnels,
+            raw_peers,
             peers: peers_arc,
             peer_map,
             routecheck,
@@ -2248,6 +2335,9 @@ impl Server {
             sockstats,
             backend_log_id,
             private_log_id,
+            tailnet_lock,
+            state_scope,
+            peer_snapshot_fresh: !used_cached_netmap,
         })
     }
 
@@ -2395,12 +2485,14 @@ impl Server {
         }
 
         // 2. Clear persisted state: regenerate keys, clear netmap cache.
-        if let Some(ref dir) = self.config.state_dir {
+        if self.config.state_dir.is_some() {
             let fresh = PersistedState::generate();
             if let Err(e) = self.save_state(&fresh) {
                 log::warn!("tsnet: failed to clear state on logout: {e}");
             }
-            PersistedState::clear_netmap(dir);
+            if let Some(scope) = self.profile_state_scope() {
+                NetMapCache::new_scoped(&scope, "").clear();
+            }
         }
 
         // 3. Set prefs LoggedOut=true, WantRunning=false.
@@ -2550,20 +2642,61 @@ impl Server {
         logger
     }
 
+    pub(crate) fn profile_state_scope(&self) -> Option<crate::state::StateScope> {
+        self.config
+            .state_dir
+            .as_deref()
+            .map(|root| crate::state::StateScope::new(root, &self.config.control_url))
+    }
+
     pub(crate) fn load_or_create_state(&self) -> Result<PersistedState, TsnetError> {
-        if let Some(ref dir) = self.config.state_dir {
-            let path = dir.join("tsnet-state.json");
+        if let Some(scope) = self.profile_state_scope() {
+            let path = scope.dir.join("tsnet-state.json");
             if path.exists() {
-                return Ok(PersistedState::load(&path)?);
+                let state = PersistedState::load(&path)?;
+                if !scope.matches(&state) {
+                    return Err(TsnetError::Builder(
+                        "persisted identity profile/control binding mismatch".into(),
+                    ));
+                }
+                return Ok(state);
+            }
+
+            // Migrate the historical unscoped identity only when ownership is
+            // unambiguous. Multi-profile legacy state cannot be attributed
+            // safely and is intentionally left unused rather than crossed.
+            let root = self.config.state_dir.as_deref().expect("scope has root");
+            let legacy = root.join("tsnet-state.json");
+            if legacy.exists() {
+                let profiles = rustscale_ipn::LoginProfile::load_all(root).unwrap_or_default();
+                let current = rustscale_ipn::LoginProfile::load_current_id(root)
+                    .ok()
+                    .flatten();
+                let unambiguous = (profiles.is_empty() && current.is_none())
+                    || (profiles.len() == 1
+                        && current.as_deref() == Some(profiles[0].ID.as_str())
+                        && (profiles[0].ControlURL.is_empty()
+                            || profiles[0].ControlURL == self.config.control_url));
+                if unambiguous {
+                    let mut state = PersistedState::load(&legacy)?;
+                    scope.bind(&mut state);
+                    state.save(&path)?;
+                    rustscale_atomicfile::remove_private(&legacy)?;
+                    return Ok(state);
+                }
+                return Err(TsnetError::Builder(
+                    "legacy identity cannot be safely attributed to the active profile".into(),
+                ));
             }
         }
         Ok(PersistedState::default())
     }
 
     pub(crate) fn save_state(&self, state: &PersistedState) -> Result<(), TsnetError> {
-        if let Some(ref dir) = self.config.state_dir {
-            let path = dir.join("tsnet-state.json");
-            state.save(&path)?;
+        if let Some(scope) = self.profile_state_scope() {
+            let mut state = state.clone();
+            scope.bind(&mut state);
+            state.save(&scope.dir.join("tsnet-state.json"))?;
         }
         Ok(())
     }

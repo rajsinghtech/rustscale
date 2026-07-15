@@ -45,14 +45,22 @@ fn set_owner_only_perms(_file: &mut fs::File) -> io::Result<()> {
     Ok(())
 }
 
-/// Fsync the parent directory of `path` so the rename is durable (Unix only;
-/// silently ignored on platforms where directory fsync is unavailable).
-fn sync_parent(path: &Path) {
+/// Fsync the parent directory of `path` so a rename or permission repair is
+/// durable. Failure is never ignored: callers use this for key material.
+#[cfg(unix)]
+fn sync_parent(path: &Path) -> io::Result<()> {
     if let Some(parent) = path.parent() {
-        if let Ok(dir_file) = fs::File::open(parent) {
-            let _ = dir_file.sync_all();
-        }
+        fs::File::open(parent)?.sync_all()?;
     }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_parent(_path: &Path) -> io::Result<()> {
+    // Private writes fail closed before reaching this path. Generic atomic
+    // writes preserve existing Windows behavior where directories cannot be
+    // opened for fsync through std::fs.
+    Ok(())
 }
 
 /// Create a uniquely-named temp file in `dir` prefixed with `base`.
@@ -106,17 +114,21 @@ pub fn write(path: &Path, data: &[u8]) -> io::Result<()> {
         .to_string_lossy()
         .into_owned();
 
-    // If the target exists it must be a regular file (not a dir, symlink, etc).
-    if let Ok(meta) = fs::metadata(path) {
-        if !meta.is_file() {
+    // Inspect the directory entry itself. `metadata` follows symlinks and
+    // would permit replacing a link that happened to target a regular file.
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() || !meta.is_file() => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
-                    "{} already exists and is not a regular file",
+                    "{} already exists and is not a regular, non-symlink file",
                     path.display()
                 ),
             ));
         }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
     }
 
     let (mut file, tmp_path) = create_temp(dir, &base)?;
@@ -128,14 +140,171 @@ pub fn write(path: &Path, data: &[u8]) -> io::Result<()> {
         // Close the file before rename (required on Windows; harmless on Unix).
         drop(file);
         fs::rename(&tmp_path, path)?;
-        sync_parent(path);
-        Ok(())
+        sync_parent(path)
     })();
 
     if result.is_err() {
         let _ = fs::remove_file(&tmp_path);
     }
     result
+}
+
+/// Create or repair an owner-only directory used for private key material.
+/// Existing symlinks, non-directories, and directories owned by another user
+/// are rejected. Windows fails closed until an owner-only ACL implementation
+/// is available.
+#[cfg(unix)]
+pub fn ensure_private_dir(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("{} is not a real directory", path.display()),
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let parent = path.parent().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "private directory has no parent",
+                )
+            })?;
+            if !parent.exists() {
+                ensure_private_dir(parent)?;
+            }
+            use std::os::unix::fs::DirBuilderExt as _;
+            let mut builder = fs::DirBuilder::new();
+            builder.mode(0o700).create(path)?;
+            sync_parent(path)?;
+        }
+        Err(error) => return Err(error),
+    }
+
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} is not a real directory", path.display()),
+        ));
+    }
+    let current_uid = rustix::process::getuid().as_raw();
+    if metadata.uid() != current_uid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} is not owned by the current user", path.display()),
+        ));
+    }
+    if metadata.permissions().mode() & 0o1000 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "refusing to repurpose sticky shared directory {}",
+                path.display()
+            ),
+        ));
+    }
+    if metadata.permissions().mode() & 0o777 != 0o700 {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        fs::File::open(path)?.sync_all()?;
+        sync_parent(path)?;
+    }
+    let repaired = fs::symlink_metadata(path)?;
+    if repaired.permissions().mode() & 0o777 != 0o700 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} mode is not owner-only", path.display()),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn ensure_private_dir(_path: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "owner-only private state ACLs are not implemented on this platform",
+    ))
+}
+
+/// Atomically persist private data after validating its directory and target.
+pub fn write_private(path: &Path, data: &[u8]) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "private file has no parent"))?;
+    ensure_private_dir(parent)?;
+    validate_private_target(path, true)?;
+    write(path, data)?;
+    validate_private_target(path, false)?;
+    Ok(())
+}
+
+/// Read private data only from an owner-only regular file. Legacy Unix mode
+/// bits are repaired to 0600 before bytes are returned.
+pub fn read_private(path: &Path) -> io::Result<Vec<u8>> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "private file has no parent"))?;
+    ensure_private_dir(parent)?;
+    validate_private_target(path, false)?;
+    fs::read(path)
+}
+
+/// Durably remove an owner-only regular private file.
+pub fn remove_private(path: &Path) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "private file has no parent"))?;
+    ensure_private_dir(parent)?;
+    validate_private_target(path, false)?;
+    fs::remove_file(path)?;
+    sync_parent(path)
+}
+
+#[cfg(unix)]
+fn validate_private_target(path: &Path, allow_missing: bool) -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if allow_missing && error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} is not a regular, non-symlink file", path.display()),
+        ));
+    }
+    if metadata.uid() != rustix::process::getuid().as_raw() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} is not owned by the current user", path.display()),
+        ));
+    }
+    if metadata.permissions().mode() & 0o777 != 0o600 {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        fs::File::open(path)?.sync_all()?;
+        sync_parent(path)?;
+    }
+    let repaired = fs::symlink_metadata(path)?;
+    if repaired.permissions().mode() & 0o777 != 0o600 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} mode is not owner-only", path.display()),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_private_target(_path: &Path, _allow_missing: bool) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "owner-only private state ACLs are not implemented on this platform",
+    ))
 }
 
 /// Write a string atomically to `path`. Convenience wrapper around [`write`].
@@ -183,6 +352,43 @@ mod tests {
         assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
         drop(file);
         fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_write_repairs_modes_and_rejects_symlink_target() {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+        let root = TempDir::new();
+        let private = root.join("private");
+        fs::create_dir(&private).unwrap();
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o755)).unwrap();
+        let path = private.join("state.json");
+        fs::write(&path, b"legacy").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        write_private(&path, b"secret").unwrap();
+        assert_eq!(
+            fs::metadata(&private).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(read_private(&path).unwrap(), b"secret");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        fs::remove_file(&path).unwrap();
+        let target = private.join("target");
+        fs::write(&target, b"target").unwrap();
+        symlink(&target, &path).unwrap();
+        assert!(write_private(&path, b"replacement").is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"target");
     }
 
     #[test]

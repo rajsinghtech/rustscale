@@ -41,6 +41,7 @@ use crate::controlhttp::dial_control;
 #[derive(Debug, Default)]
 pub struct MapSessionState {
     inner: Mutex<(String, i64)>,
+    tka_head: Mutex<String>,
 }
 
 impl MapSessionState {
@@ -56,6 +57,19 @@ impl MapSessionState {
     /// Snapshot the current handle and sequence number.
     pub fn get(&self) -> (String, i64) {
         self.inner
+            .lock()
+            .expect("MapSessionState lock poisoned")
+            .clone()
+    }
+
+    /// Update the Tailnet Lock head advertised on the next map connection.
+    pub fn set_tka_head(&self, head: String) {
+        *self.tka_head.lock().expect("MapSessionState lock poisoned") = head;
+    }
+
+    /// Snapshot the latest Tailnet Lock head.
+    pub fn tka_head(&self) -> String {
+        self.tka_head
             .lock()
             .expect("MapSessionState lock poisoned")
             .clone()
@@ -788,6 +802,7 @@ impl ControlClient {
                 let mut r = req.clone();
                 r.MapSessionHandle = handle;
                 r.MapSessionSeq = seq;
+                r.TKAHead = ss.tka_head();
                 r
             } else {
                 req.clone()

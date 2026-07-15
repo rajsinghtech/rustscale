@@ -23,12 +23,16 @@ rustscale-tsnet = { path = "../tsnet", version = "0.1.1" }
 rustscale-ipnstate = { path = "../ipnstate", version = "0.1.1" }
 rustscale-speedtest = { path = "../speedtest", version = "0.1.1" }
 rustscale-clientupdate = { path = "../clientupdate", version = "0.1.1" }
+rustscale-freedesktop = { path = "../freedesktop", version = "0.1.1" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 qrcode = { version = "0.13", default-features = false }
 base64.workspace = true
+rand.workspace = true
+subtle = "2"
+url = "2"
 flate2 = "1"
 crc32fast.workspace = true
 async-trait.workspace = true

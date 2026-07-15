@@ -2997,7 +2997,9 @@ dependencies = [
  "flate2",
  "if-addrs",
  "qrcode",
+ "rand 0.8.7",
  "rustscale-clientupdate",
+ "rustscale-freedesktop",
  "rustscale-ipn",
  "rustscale-ipnstate",
  "rustscale-localclient",
@@ -3009,9 +3011,11 @@ dependencies = [
  "rustscale-tsnet",
  "serde",
  "serde_json",
+ "subtle",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+ "url",
 ]
 
 [[package]]
@@ -3253,6 +3257,15 @@ version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "rustscale-freedesktop"
+version = "0.1.1"
+dependencies = [
+ "thiserror 1.0.69",
+ "url",
+ "wait-timeout",
 ]
 
 [[package]]

@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -110,6 +110,7 @@ struct ClientInner {
     /// Test override for the UPnP port (0 = use default 1900).
     test_upnp_port: AtomicU16,
     state: Mutex<ClientState>,
+    next_gateway_observation: AtomicU64,
     running_create: AtomicBool,
     closed: AtomicBool,
 }
@@ -130,8 +131,23 @@ struct ClientState {
     upnp_saw_time: Option<Instant>,
     /// UPnP: cached discovery responses (Location -> UpnpService).
     upnp_services: HashMap<String, upnp::UpnpService>,
-    /// Hash of the last gateway/self-IP we saw (to detect changes).
+    /// Hash and identity of the last gateway/self-IP observation.
     gw_hash: Sum,
+    gateway: Option<GatewayInfo>,
+    /// Monotonic epoch for gateway changes and mapping invalidations. Async
+    /// work may only commit results captured in the current generation.
+    gateway_generation: u64,
+    /// Sequence of the latest gateway lookup to finish. This prevents an
+    /// older, slow lookup from overwriting a newer observation.
+    gateway_observation: u64,
+    /// Whether this gateway generation still needs a full protocol probe.
+    needs_probe: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GatewaySnapshot {
+    info: Option<GatewayInfo>,
+    generation: u64,
 }
 
 impl Client {
@@ -154,6 +170,7 @@ impl Client {
                 test_pxp_port: AtomicU16::new(0),
                 test_upnp_port: AtomicU16::new(0),
                 state: Mutex::new(ClientState::default()),
+                next_gateway_observation: AtomicU64::new(0),
                 running_create: AtomicBool::new(false),
                 closed: AtomicBool::new(false),
             }),
@@ -204,35 +221,100 @@ impl Client {
         }
     }
 
-    fn gateway_and_self_ip(&self) -> Option<GatewayInfo> {
-        let gi = (self.inner.gateway_lookup.read().expect("gw lock"))();
-        let changed = {
+    fn observe_gateway(&self) -> GatewaySnapshot {
+        // Number the lookup before running it. If this lookup stalls while a
+        // newer one completes, its stale result is discarded below.
+        let observation = self
+            .inner
+            .next_gateway_observation
+            .fetch_add(1, Ordering::SeqCst)
+            .checked_add(1)
+            .expect("gateway observation counter overflow");
+        let info = (self.inner.gateway_lookup.read().expect("gw lock"))();
+
+        let (snapshot, old_mapping) = {
             let mut state = self.inner.state.lock().expect("state lock");
-            deephash_update(&mut state.gw_hash, &gi)
+            if observation <= state.gateway_observation {
+                (
+                    GatewaySnapshot {
+                        info: state.gateway,
+                        generation: state.gateway_generation,
+                    },
+                    None,
+                )
+            } else {
+                state.gateway_observation = observation;
+                let identity_changed = state.gateway != info;
+                let hash_changed = deephash_update(&mut state.gw_hash, &info);
+                let old_mapping = if identity_changed || hash_changed {
+                    state.gateway_generation = state
+                        .gateway_generation
+                        .checked_add(1)
+                        .expect("gateway generation overflow");
+                    state.gateway = info;
+                    state.needs_probe = info.is_some();
+                    Self::reset_mapping_state(&mut state)
+                } else {
+                    None
+                };
+                (
+                    GatewaySnapshot {
+                        info: state.gateway,
+                        generation: state.gateway_generation,
+                    },
+                    old_mapping,
+                )
+            }
         };
-        if changed {
-            self.invalidate_mappings(true);
+
+        if let Some(mapping) = old_mapping {
+            self.release_mapping(&mapping);
         }
-        gi
+        snapshot
+    }
+
+    fn gateway_and_self_ip(&self) -> Option<GatewayInfo> {
+        self.observe_gateway().info
     }
 
     fn invalidate_mappings(&self, release: bool) {
         let old_mapping = {
             let mut state = self.inner.state.lock().expect("state lock");
-            let old = state.mapping.take();
-            state.last_probe = None;
-            state.pmp_pub_ip = None;
-            state.pmp_pub_ip_time = None;
-            state.pcp_saw_time = None;
-            state.upnp_saw_time = None;
-            state.upnp_services.clear();
-            old
+            state.gateway_generation = state
+                .gateway_generation
+                .checked_add(1)
+                .expect("gateway generation overflow");
+            state.needs_probe = state.gateway.is_some();
+            Self::reset_mapping_state(&mut state)
         };
         if release {
-            if let Some(m) = old_mapping {
-                self.release_mapping(&m);
+            if let Some(mapping) = old_mapping {
+                self.release_mapping(&mapping);
             }
         }
+    }
+
+    fn reset_mapping_state(state: &mut ClientState) -> Option<Mapping> {
+        let old_mapping = state.mapping.take();
+        state.last_probe = None;
+        state.pmp_pub_ip = None;
+        state.pmp_pub_ip_time = None;
+        state.pcp_saw_time = None;
+        state.upnp_saw_time = None;
+        state.upnp_services.clear();
+        old_mapping
+    }
+
+    fn with_current_gateway<R>(
+        &self,
+        snapshot: GatewaySnapshot,
+        f: impl FnOnce(&mut ClientState) -> R,
+    ) -> Option<R> {
+        let mut state = self.inner.state.lock().expect("state lock");
+        if state.gateway_generation != snapshot.generation || state.gateway != snapshot.info {
+            return None;
+        }
+        Some(f(&mut state))
     }
 
     fn release_mapping(&self, mapping: &Mapping) {
@@ -287,11 +369,14 @@ impl Client {
 
     /// Whether we have a valid (non-expired) cached mapping.
     pub fn have_mapping(&self) -> bool {
-        if self.gateway_and_self_ip().is_none() {
+        let snapshot = self.observe_gateway();
+        if snapshot.info.is_none() {
             return false;
         }
-        let state = self.inner.state.lock().expect("state lock");
-        state.mapping.as_ref().is_some_and(Mapping::is_valid)
+        self.with_current_gateway(snapshot, |state| {
+            state.mapping.as_ref().is_some_and(Mapping::is_valid)
+        })
+        .unwrap_or(false)
     }
 
     /// Get the cached mapping if it's still valid, or start creating one in
@@ -303,17 +388,19 @@ impl Client {
         // Validate the gateway before returning an external address. This is
         // the path magicsock uses while gathering advertised endpoints, so a
         // lost default route must hide and invalidate the old mapping at once.
-        if self.gateway_and_self_ip().is_none() {
+        let snapshot = self.observe_gateway();
+        if snapshot.info.is_none() {
             return (None, false);
         }
 
-        let cached = {
-            let state = self.inner.state.lock().expect("state lock");
+        let Some(cached) = self.with_current_gateway(snapshot, |state| {
             state
                 .mapping
                 .as_ref()
                 .filter(|m| m.is_valid())
                 .map(|m| (m.external, m.needs_renewal()))
+        }) else {
+            return (None, false);
         };
         if let Some((external, needs_renewal)) = cached {
             if needs_renewal {
@@ -331,9 +418,26 @@ impl Client {
         }
         let client = self.clone();
         tokio::spawn(async move {
+            let started_generation = client.current_gateway_state().0;
             let _ = client.create_or_get_mapping().await;
             client.inner.running_create.store(false, Ordering::SeqCst);
+
+            // If this worker crossed a gateway invalidation, a cache read may
+            // have seen running_create=true and declined to launch the fresh
+            // worker. Close that handoff race after publishing false.
+            let (current_generation, gateway_available) = client.current_gateway_state();
+            if gateway_available
+                && current_generation != started_generation
+                && !client.inner.closed.load(Ordering::Relaxed)
+            {
+                client.maybe_start_create();
+            }
         });
+    }
+
+    fn current_gateway_state(&self) -> (u64, bool) {
+        let state = self.inner.state.lock().expect("state lock");
+        (state.gateway_generation, state.gateway.is_some())
     }
 
     /// Probe the gateway for supported port-mapping protocols. Sends PMP,
@@ -343,9 +447,19 @@ impl Client {
         if self.inner.closed.load(Ordering::Relaxed) {
             return Err(crate::PortMapError::Disabled);
         }
-        let gi = self
-            .gateway_and_self_ip()
-            .ok_or(crate::PortMapError::GatewayRange)?;
+        let snapshot = self.observe_gateway();
+        snapshot.info.ok_or(crate::PortMapError::GatewayRange)?;
+        self.probe_with_snapshot(snapshot).await
+    }
+
+    async fn probe_with_snapshot(
+        &self,
+        snapshot: GatewaySnapshot,
+    ) -> Result<ProbeResult, crate::PortMapError> {
+        let gi = snapshot.info.ok_or(crate::PortMapError::GatewayRange)?;
+        if self.with_current_gateway(snapshot, |_| ()).is_none() {
+            return Err(crate::PortMapError::GatewayRange);
+        }
         let pxp_port = self.pxp_port();
         let upnp_port = self.upnp_port();
 
@@ -386,8 +500,14 @@ impl Client {
                         if let Some(pcp_resp) = pcp::parse_common_header(pkt) {
                             if pcp_resp.op_code == pcp::PCP_OP_REPLY | pcp::PCP_OP_ANNOUNCE {
                                 result.pcp = true;
-                                let mut state = self.inner.state.lock().expect("state lock");
-                                state.pcp_saw_time = Some(Instant::now());
+                                if self
+                                    .with_current_gateway(snapshot, |state| {
+                                        state.pcp_saw_time = Some(Instant::now());
+                                    })
+                                    .is_none()
+                                {
+                                    return Err(crate::PortMapError::GatewayRange);
+                                }
                                 continue;
                             }
                         }
@@ -396,9 +516,15 @@ impl Client {
                                 && pmp_resp.result_code == 0
                             {
                                 result.pmp = true;
-                                let mut state = self.inner.state.lock().expect("state lock");
-                                state.pmp_pub_ip = pmp_resp.public_addr;
-                                state.pmp_pub_ip_time = Some(Instant::now());
+                                if self
+                                    .with_current_gateway(snapshot, |state| {
+                                        state.pmp_pub_ip = pmp_resp.public_addr;
+                                        state.pmp_pub_ip_time = Some(Instant::now());
+                                    })
+                                    .is_none()
+                                {
+                                    return Err(crate::PortMapError::GatewayRange);
+                                }
                                 continue;
                             }
                         }
@@ -415,18 +541,29 @@ impl Client {
                 if let Some(svc) =
                     upnp::fetch_and_select_service(&resp.location, Duration::from_secs(1)).await
                 {
-                    let mut state = self.inner.state.lock().expect("state lock");
-                    state.upnp_services.insert(resp.location.clone(), svc);
+                    if self
+                        .with_current_gateway(snapshot, |state| {
+                            state.upnp_services.insert(resp.location.clone(), svc);
+                            state.upnp_saw_time = Some(Instant::now());
+                        })
+                        .is_none()
+                    {
+                        return Err(crate::PortMapError::GatewayRange);
+                    }
                     result.upnp = true;
-                    state.upnp_saw_time = Some(Instant::now());
                     break;
                 }
             }
         }
 
+        if self
+            .with_current_gateway(snapshot, |state| {
+                state.last_probe = Some(Instant::now());
+                state.needs_probe = false;
+            })
+            .is_none()
         {
-            let mut state = self.inner.state.lock().expect("state lock");
-            state.last_probe = Some(Instant::now());
+            return Err(crate::PortMapError::GatewayRange);
         }
 
         Ok(result)
@@ -441,18 +578,29 @@ impl Client {
 
         // Check the gateway before the cache fast path. Otherwise a mapping
         // from a disappeared network can be returned until its lease expires.
-        let gi = self
-            .gateway_and_self_ip()
+        let snapshot = self.observe_gateway();
+        let gi = snapshot.info.ok_or(crate::PortMapError::GatewayRange)?;
+        let needs_probe = self
+            .with_current_gateway(snapshot, |state| state.needs_probe)
             .ok_or(crate::PortMapError::GatewayRange)?;
+        if needs_probe {
+            // A new or reappeared gateway has no trustworthy protocol cache.
+            // Probe PMP, PCP, and UPnP before selecting a mapping method.
+            self.probe_with_snapshot(snapshot).await?;
+        }
 
         // Fast path: return cached mapping if valid and not needing renewal.
+        if let Some(mapping) = self
+            .with_current_gateway(snapshot, |state| {
+                state
+                    .mapping
+                    .as_ref()
+                    .filter(|mapping| mapping.is_valid() && !mapping.needs_renewal())
+                    .cloned()
+            })
+            .ok_or(crate::PortMapError::GatewayRange)?
         {
-            let state = self.inner.state.lock().expect("state lock");
-            if let Some(ref m) = state.mapping {
-                if m.is_valid() && !m.needs_renewal() {
-                    return Ok(m.clone());
-                }
-            }
+            return Ok(mapping);
         }
 
         let local_port = *self.inner.local_port.read().expect("port lock");
@@ -462,32 +610,34 @@ impl Client {
 
         let internal_addr = SocketAddr::V4(SocketAddrV4::new(gi.self_ip, local_port));
         let pxp_port = self.pxp_port();
-        let prev_port = {
-            let state = self.inner.state.lock().expect("state lock");
-            state.mapping.as_ref().map_or(0, |m| m.external.port())
-        };
+        let prev_port = self
+            .with_current_gateway(snapshot, |state| {
+                state.mapping.as_ref().map_or(0, |m| m.external.port())
+            })
+            .ok_or(crate::PortMapError::GatewayRange)?;
 
-        let (have_recent_pmp, have_recent_pcp, have_recent_upnp) = {
-            let state = self.inner.state.lock().expect("state lock");
-            let now = Instant::now();
-            (
-                state
-                    .pmp_pub_ip_time
-                    .is_some_and(|t| now.duration_since(t) < crate::TRUST_DURATION),
-                state
-                    .pcp_saw_time
-                    .is_some_and(|t| now.duration_since(t) < crate::TRUST_DURATION),
-                state
-                    .upnp_saw_time
-                    .is_some_and(|t| now.duration_since(t) < crate::TRUST_DURATION),
-            )
-        };
+        let (have_recent_pmp, have_recent_pcp, have_recent_upnp) = self
+            .with_current_gateway(snapshot, |state| {
+                let now = Instant::now();
+                (
+                    state
+                        .pmp_pub_ip_time
+                        .is_some_and(|t| now.duration_since(t) < crate::TRUST_DURATION),
+                    state
+                        .pcp_saw_time
+                        .is_some_and(|t| now.duration_since(t) < crate::TRUST_DURATION),
+                    state
+                        .upnp_saw_time
+                        .is_some_and(|t| now.duration_since(t) < crate::TRUST_DURATION),
+                )
+            })
+            .ok_or(crate::PortMapError::GatewayRange)?;
 
         // Try PMP/PCP first (faster, share port 5351).
         if have_recent_pmp || have_recent_pcp || !have_recent_upnp {
             match self
                 .try_pxp_mapping(
-                    &gi,
+                    snapshot,
                     internal_addr,
                     local_port,
                     prev_port,
@@ -505,7 +655,7 @@ impl Client {
 
         // Fallback to UPnP.
         if have_recent_upnp {
-            if let Some(m) = self.try_upnp_mapping(&gi, local_port, prev_port).await {
+            if let Some(m) = self.try_upnp_mapping(snapshot, local_port, prev_port).await {
                 return Ok(m);
             }
         }
@@ -517,7 +667,7 @@ impl Client {
     #[allow(clippy::too_many_arguments)]
     async fn try_pxp_mapping(
         &self,
-        gi: &GatewayInfo,
+        snapshot: GatewaySnapshot,
         _internal_addr: SocketAddr,
         local_port: u16,
         prev_port: u16,
@@ -525,6 +675,10 @@ impl Client {
         have_recent_pmp: bool,
         have_recent_pcp: bool,
     ) -> Result<Option<Mapping>, crate::PortMapError> {
+        let gi = snapshot.info.ok_or(crate::PortMapError::GatewayRange)?;
+        if self.with_current_gateway(snapshot, |_| ()).is_none() {
+            return Ok(None);
+        }
         let sock = UdpSocket::bind("0.0.0.0:0")
             .await
             .map_err(crate::PortMapError::Io)?;
@@ -533,9 +687,9 @@ impl Client {
         let prefer_pcp = have_recent_pcp && !have_recent_pmp;
 
         // Get the cached PMP pub IP (if any) so we don't need to re-request it.
-        let cached_pub_ip = {
-            let state = self.inner.state.lock().expect("state lock");
-            state.pmp_pub_ip
+        let cached_pub_ip = match self.with_current_gateway(snapshot, |state| state.pmp_pub_ip) {
+            Some(ip) => ip,
+            None => return Ok(None),
         };
 
         if prefer_pcp {
@@ -598,8 +752,14 @@ impl Client {
                                 good_until: now + lifetime,
                                 renew_after: now + lifetime / 2,
                             };
-                            let mut state = self.inner.state.lock().expect("state lock");
-                            state.mapping = Some(mapping.clone());
+                            if self
+                                .with_current_gateway(snapshot, |state| {
+                                    state.mapping = Some(mapping.clone());
+                                })
+                                .is_none()
+                            {
+                                return Ok(None);
+                            }
                             return Ok(Some(mapping));
                         }
                         return Ok(None);
@@ -630,10 +790,16 @@ impl Client {
                             good_until: now + lifetime,
                             renew_after: now + lifetime / 2,
                         };
-                        let mut state = self.inner.state.lock().expect("state lock");
-                        state.pmp_pub_ip = Some(pub_ip);
-                        state.pmp_pub_ip_time = Some(now);
-                        state.mapping = Some(mapping.clone());
+                        if self
+                            .with_current_gateway(snapshot, |state| {
+                                state.pmp_pub_ip = Some(pub_ip);
+                                state.pmp_pub_ip_time = Some(now);
+                                state.mapping = Some(mapping.clone());
+                            })
+                            .is_none()
+                        {
+                            return Ok(None);
+                        }
                         return Ok(Some(mapping));
                     }
                 }
@@ -646,14 +812,14 @@ impl Client {
     /// Try to create a mapping via UPnP.
     async fn try_upnp_mapping(
         &self,
-        gi: &GatewayInfo,
+        snapshot: GatewaySnapshot,
         local_port: u16,
         prev_port: u16,
     ) -> Option<Mapping> {
-        let services: Vec<upnp::UpnpService> = {
-            let state = self.inner.state.lock().expect("state lock");
+        let gi = snapshot.info?;
+        let services: Vec<upnp::UpnpService> = self.with_current_gateway(snapshot, |state| {
             state.upnp_services.values().cloned().collect()
-        };
+        })?;
         if services.is_empty() {
             return None;
         }
@@ -689,8 +855,9 @@ impl Client {
                 good_until: now + lifetime,
                 renew_after: now + lifetime / 2,
             };
-            let mut state = self.inner.state.lock().expect("state lock");
-            state.mapping = Some(mapping.clone());
+            self.with_current_gateway(snapshot, |state| {
+                state.mapping = Some(mapping.clone());
+            })?;
             return Some(mapping);
         }
         None
@@ -698,9 +865,10 @@ impl Client {
 
     /// Get the cached mapping, if any (without starting creation).
     pub fn cached_mapping(&self) -> Option<Mapping> {
-        self.gateway_and_self_ip()?;
-        let state = self.inner.state.lock().expect("state lock");
-        state.mapping.clone()
+        let snapshot = self.observe_gateway();
+        snapshot.info?;
+        self.with_current_gateway(snapshot, |state| state.mapping.clone())
+            .flatten()
     }
 }
 
@@ -716,11 +884,51 @@ impl Default for Client {
 #[cfg(test)]
 mod tests {
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{mpsc, Arc, Mutex};
     use std::time::{Duration, Instant};
 
     use super::{Client, ClientConfig, GatewayInfo, Mapping, MappingKind};
     use crate::upnp::UpnpService;
+
+    fn test_mapping(external: SocketAddr) -> Mapping {
+        let now = Instant::now();
+        Mapping {
+            external,
+            kind: MappingKind::Pcp,
+            good_until: now + Duration::from_secs(3600),
+            renew_after: now + Duration::from_secs(1800),
+        }
+    }
+
+    fn seed_mapping_state(client: &Client, external: SocketAddr) {
+        let now = Instant::now();
+        let mut state = client.inner.state.lock().unwrap();
+        state.mapping = Some(test_mapping(external));
+        state.last_probe = Some(now);
+        state.pmp_pub_ip = Some(Ipv4Addr::new(198, 51, 100, 10));
+        state.pmp_pub_ip_time = Some(now);
+        state.pcp_saw_time = Some(now);
+        state.upnp_saw_time = Some(now);
+        state.upnp_services.insert(
+            "router".into(),
+            UpnpService {
+                control_url: "http://192.168.1.1/control".into(),
+                kind: 0,
+            },
+        );
+    }
+
+    fn assert_mapping_state_empty(client: &Client) {
+        let state = client.inner.state.lock().unwrap();
+        assert!(state.mapping.is_none());
+        assert!(state.last_probe.is_none());
+        assert!(state.pmp_pub_ip.is_none());
+        assert!(state.pmp_pub_ip_time.is_none());
+        assert!(state.pcp_saw_time.is_none());
+        assert!(state.upnp_saw_time.is_none());
+        assert!(state.upnp_services.is_empty());
+    }
 
     #[test]
     fn gateway_deephash_detects_changes() {
@@ -760,28 +968,7 @@ mod tests {
         assert_eq!(client.gateway_and_self_ip(), Some(gateway));
 
         let external = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 10), 41641));
-        let now = Instant::now();
-        {
-            let mut state = client.inner.state.lock().unwrap();
-            state.mapping = Some(Mapping {
-                external,
-                kind: MappingKind::Pcp,
-                good_until: now + Duration::from_secs(3600),
-                renew_after: now + Duration::from_secs(1800),
-            });
-            state.last_probe = Some(now);
-            state.pmp_pub_ip = Some(Ipv4Addr::new(198, 51, 100, 10));
-            state.pmp_pub_ip_time = Some(now);
-            state.pcp_saw_time = Some(now);
-            state.upnp_saw_time = Some(now);
-            state.upnp_services.insert(
-                "router".into(),
-                UpnpService {
-                    control_url: "http://192.168.1.1/control".into(),
-                    kind: 0,
-                },
-            );
-        }
+        seed_mapping_state(&client, external);
 
         client.set_gateway_lookup(Box::new(|| None));
 
@@ -791,16 +978,10 @@ mod tests {
             client.get_cached_mapping_or_start_creating_one(),
             (None, false)
         );
-        let none_hash = {
+        assert_mapping_state_empty(&client);
+        let (none_hash, none_generation) = {
             let state = client.inner.state.lock().unwrap();
-            assert!(state.mapping.is_none());
-            assert!(state.last_probe.is_none());
-            assert!(state.pmp_pub_ip.is_none());
-            assert!(state.pmp_pub_ip_time.is_none());
-            assert!(state.pcp_saw_time.is_none());
-            assert!(state.upnp_saw_time.is_none());
-            assert!(state.upnp_services.is_empty());
-            state.gw_hash
+            (state.gw_hash, state.gateway_generation)
         };
         assert!(!client.inner.running_create.load(Ordering::SeqCst));
 
@@ -810,8 +991,126 @@ mod tests {
             client.get_cached_mapping_or_start_creating_one(),
             (None, false)
         );
-        assert_eq!(client.inner.state.lock().unwrap().gw_hash, none_hash);
+        let state = client.inner.state.lock().unwrap();
+        assert_eq!(state.gw_hash, none_hash);
+        assert_eq!(state.gateway_generation, none_generation);
+        drop(state);
         assert!(!client.inner.running_create.load(Ordering::SeqCst));
         assert!(client.cached_mapping().is_none());
+    }
+
+    #[tokio::test]
+    async fn stale_async_completion_cannot_repopulate_invalidated_generation() {
+        let gateway = GatewayInfo {
+            gateway: Ipv4Addr::new(192, 168, 1, 1),
+            self_ip: Ipv4Addr::new(192, 168, 1, 2),
+        };
+        let client = Client::with_config(ClientConfig {
+            gateway_lookup: Some(Box::new(move || Some(gateway))),
+        });
+        let stale_snapshot = client.observe_gateway();
+        assert_eq!(stale_snapshot.info, Some(gateway));
+
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        let stale_client = client.clone();
+        let stale_commit = tokio::spawn(async move {
+            ready_tx.send(()).unwrap();
+            resume_rx.await.unwrap();
+            stale_client.with_current_gateway(stale_snapshot, |state| {
+                let now = Instant::now();
+                state.mapping = Some(test_mapping(SocketAddr::V4(SocketAddrV4::new(
+                    Ipv4Addr::new(203, 0, 113, 9),
+                    41641,
+                ))));
+                state.last_probe = Some(now);
+                state.pmp_pub_ip = Some(Ipv4Addr::new(203, 0, 113, 9));
+                state.pmp_pub_ip_time = Some(now);
+                state.pcp_saw_time = Some(now);
+                state.upnp_saw_time = Some(now);
+                state.upnp_services.insert(
+                    "stale-router".into(),
+                    UpnpService {
+                        control_url: "http://192.168.1.1/stale".into(),
+                        kind: 0,
+                    },
+                );
+            })
+        });
+
+        ready_rx.await.unwrap();
+        client.set_gateway_lookup(Box::new(|| None));
+        let missing = client.observe_gateway();
+        assert!(missing.info.is_none());
+        assert!(missing.generation > stale_snapshot.generation);
+        assert_mapping_state_empty(&client);
+
+        let new_gateway = GatewayInfo {
+            gateway: Ipv4Addr::new(10, 0, 0, 1),
+            self_ip: Ipv4Addr::new(10, 0, 0, 2),
+        };
+        client.set_gateway_lookup(Box::new(move || Some(new_gateway)));
+        let current = client.observe_gateway();
+        assert_eq!(current.info, Some(new_gateway));
+        assert!(current.generation > missing.generation);
+
+        resume_tx.send(()).unwrap();
+        assert!(stale_commit.await.unwrap().is_none());
+        assert_mapping_state_empty(&client);
+        let state = client.inner.state.lock().unwrap();
+        assert_eq!(state.gateway, Some(new_gateway));
+        assert!(state.needs_probe);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn newer_gateway_observation_closes_cache_read_gap() {
+        let gateway = GatewayInfo {
+            gateway: Ipv4Addr::new(192, 168, 1, 1),
+            self_ip: Ipv4Addr::new(192, 168, 1, 2),
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (lookup_started_tx, lookup_started_rx) = mpsc::sync_channel(1);
+        let (resume_lookup_tx, resume_lookup_rx) = mpsc::sync_channel(1);
+        let resume_lookup_rx = Arc::new(Mutex::new(resume_lookup_rx));
+        let client = Client::with_config(ClientConfig {
+            gateway_lookup: Some(Box::new({
+                let calls = calls.clone();
+                let resume_lookup_rx = resume_lookup_rx.clone();
+                move || match calls.fetch_add(1, Ordering::SeqCst) {
+                    0 => Some(gateway),
+                    1 => {
+                        lookup_started_tx.send(()).unwrap();
+                        resume_lookup_rx.lock().unwrap().recv().unwrap();
+                        Some(gateway)
+                    }
+                    _ => None,
+                }
+            })),
+        });
+        let initial = client.observe_gateway();
+        assert_eq!(initial.info, Some(gateway));
+        let external = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 20), 41641));
+        seed_mapping_state(&client, external);
+
+        let reader_client = client.clone();
+        let reader =
+            std::thread::spawn(move || reader_client.get_cached_mapping_or_start_creating_one());
+        lookup_started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+
+        // A newer lookup observes route loss and atomically advances the
+        // generation plus clears state while the older lookup is paused.
+        let missing = client.observe_gateway();
+        assert!(missing.info.is_none());
+        assert!(missing.generation > initial.generation);
+        assert_mapping_state_empty(&client);
+
+        resume_lookup_tx.send(()).unwrap();
+        assert_eq!(reader.join().unwrap(), (None, false));
+        let state = client.inner.state.lock().unwrap();
+        assert!(state.gateway.is_none());
+        assert_eq!(state.gateway_generation, missing.generation);
+        assert!(state.mapping.is_none());
     }
 }

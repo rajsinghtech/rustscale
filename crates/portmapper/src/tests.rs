@@ -518,6 +518,89 @@ async fn test_gateway_change_invalidates() {
     igd.close();
 }
 
+// --- Gateway reappearance forces a complete protocol reprobe ---
+
+async fn assert_gateway_reappearance_reprobes(opts: IgdOpts, expected: MappingKind) {
+    let igd = FakeIgd::start(opts).await;
+    let client = make_test_client(&igd);
+
+    // Mapping creation itself must perform the initial all-protocol probe.
+    let first = client.create_or_get_mapping().await.expect("first mapping");
+    assert_eq!(first.kind, expected);
+
+    client.set_gateway_lookup(Box::new(|| None));
+    assert_eq!(
+        client.get_cached_mapping_or_start_creating_one(),
+        (None, false)
+    );
+
+    let pmp_before = igd.pmp_recv_count.load(Ordering::SeqCst);
+    let pcp_before = igd.pcp_recv_count.load(Ordering::SeqCst);
+    let upnp_before = igd.upnp_disco_count.load(Ordering::SeqCst);
+    client.set_gateway_lookup(Box::new(|| {
+        Some(GatewayInfo {
+            gateway: Ipv4Addr::LOCALHOST,
+            self_ip: Ipv4Addr::new(1, 2, 3, 4),
+        })
+    }));
+
+    assert_eq!(
+        client.get_cached_mapping_or_start_creating_one(),
+        (None, false),
+        "reappearance must start fresh mapping work"
+    );
+    let second = timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(mapping) = client.cached_mapping() {
+                break mapping;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("mapping after gateway reappearance");
+    assert_eq!(second.kind, expected);
+    assert!(
+        igd.pmp_recv_count.load(Ordering::SeqCst) > pmp_before,
+        "reappearance must reprobe PMP"
+    );
+    assert!(
+        igd.pcp_recv_count.load(Ordering::SeqCst) > pcp_before,
+        "reappearance must reprobe PCP"
+    );
+    assert!(
+        igd.upnp_disco_count.load(Ordering::SeqCst) > upnp_before,
+        "reappearance must reprobe UPnP"
+    );
+
+    client.close();
+    igd.close();
+}
+
+#[tokio::test]
+async fn pcp_only_gateway_recovers_after_reappearance() {
+    assert_gateway_reappearance_reprobes(
+        IgdOpts {
+            pcp: true,
+            ..Default::default()
+        },
+        MappingKind::Pcp,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn upnp_only_gateway_recovers_after_reappearance() {
+    assert_gateway_reappearance_reprobes(
+        IgdOpts {
+            upnp: true,
+            ..Default::default()
+        },
+        MappingKind::Upnp,
+    )
+    .await;
+}
+
 // --- Real gateway probe test (marked #[ignore]) ---
 
 #[tokio::test]

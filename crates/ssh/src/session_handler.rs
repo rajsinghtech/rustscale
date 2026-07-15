@@ -20,7 +20,7 @@ use crate::session::Session;
 use crate::session::Window;
 
 #[cfg(unix)]
-use russh::{CryptoVec, Sig};
+use russh::Sig;
 #[cfg(unix)]
 use std::ffi::CString;
 use std::io;
@@ -488,7 +488,7 @@ pub async fn run_session(
                                 let _ = libc::kill(pid as libc::pid_t, libc::SIGTERM);
                             }
                         }
-                        let _ = handle.data(channel_id, CryptoVec::from(message)).await;
+                        let _ = handle.data(channel_id, message).await;
                     }
                 });
             } else {
@@ -570,7 +570,7 @@ pub async fn run_session(
                                     log::warn!("SSH session recording failed; continuing");
                                 }
                             }
-                            let _ = handle.data(channel_id, CryptoVec::from(&stdout_buf[..n])).await;
+                            let _ = handle.data(channel_id, bytes::Bytes::copy_from_slice(&stdout_buf[..n])).await;
                         }
                         Err(_) => {}
                     }
@@ -627,7 +627,7 @@ pub async fn run_session(
                                     log::warn!("SSH session recording failed; continuing");
                                 }
                             }
-                            let _ = handle.data(channel_id, CryptoVec::from(&stdout_buf[..n])).await;
+                            let _ = handle.data(channel_id, bytes::Bytes::copy_from_slice(&stdout_buf[..n])).await;
                         }
                         Err(_) => {}
                     }
@@ -643,7 +643,8 @@ pub async fn run_session(
                     match r {
                         Ok(0) => {}
                         Ok(n) => {
-                            let _ = handle.extended_data(channel_id, EXTENDED_DATA_STDERR, CryptoVec::from(&stderr_buf[..n])).await;
+                            let data = bytes::Bytes::copy_from_slice(&stderr_buf[..n]);
+                            let _ = handle.extended_data(channel_id, EXTENDED_DATA_STDERR, data).await;
                         }
                         Err(_) => {}
                     }
@@ -693,7 +694,8 @@ pub async fn run_session(
                     match r {
                         Ok(0) => {}
                         Ok(n) => {
-                            let _ = handle.data(channel_id, CryptoVec::from(&stdout_buf[..n])).await;
+                            let data = bytes::Bytes::copy_from_slice(&stdout_buf[..n]);
+                            let _ = handle.data(channel_id, data).await;
                         }
                         Err(_) => {}
                     }

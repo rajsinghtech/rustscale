@@ -57,4 +57,22 @@ mod tests {
         let s = host_key_public_string(&key);
         assert!(s.starts_with("ssh-ed25519 "));
     }
+
+    #[test]
+    fn host_key_openssh_roundtrip_and_signing() {
+        use russh::keys::signature::{Signer, Verifier};
+        use russh::keys::ssh_key::LineEnding;
+
+        let key = host_key_from_node_key(&NodePrivate::generate());
+        let encoded = key.to_openssh(LineEnding::LF).unwrap();
+        let loaded = PrivateKey::from_openssh(encoded.as_bytes()).unwrap();
+        assert_eq!(loaded.public_key(), key.public_key());
+        assert_eq!(loaded.algorithm(), russh::keys::Algorithm::Ed25519);
+
+        let message = b"rustscale SSH host-key signing test";
+        let signature: russh::keys::ssh_key::Signature =
+            Signer::try_sign(&loaded, message).unwrap();
+        Verifier::verify(loaded.public_key(), message, &signature).unwrap();
+        assert!(Verifier::verify(loaded.public_key(), b"modified message", &signature).is_err());
+    }
 }

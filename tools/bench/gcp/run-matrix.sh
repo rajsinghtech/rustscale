@@ -393,8 +393,9 @@ matrix_remote_observation_program() {
   cat <<'PYEOF'
 python3 - <<'PY'
 import hashlib, json, os, platform, subprocess
-def output(argv):
-    return subprocess.check_output(argv, text=True, stderr=subprocess.STDOUT, timeout=15).strip()
+toolchain_env = {**os.environ, "RUSTUP_HOME": "/opt/rust", "CARGO_HOME": "/opt/rust/cargo"}
+def output(argv, env=None):
+    return subprocess.check_output(argv, text=True, stderr=subprocess.STDOUT, timeout=15, env=env).strip()
 products=[]
 for name, explicit in (
     ("rustscale-bench", "/opt/rustscale/target/release/rustscale-bench"),
@@ -412,7 +413,7 @@ for line in open("/etc/os-release", encoding="utf-8"):
 cpu=output(["lscpu", "-J"])
 try: cpu_model=next(x["data"] for x in json.loads(cpu)["lscpu"] if x["field"].strip()=="Model name:")
 except Exception: raise SystemExit("unable to determine CPU model")
-print(json.dumps({"cpu_model":cpu_model,"logical_cpus":os.cpu_count(),"kernel_release":platform.release(),"os_pretty_name":os_name,"cargo":output(["cargo","--version"]),"rustc_verbose":output(["rustc","-Vv"]),"product":products}))
+print(json.dumps({"cpu_model":cpu_model,"logical_cpus":os.cpu_count(),"kernel_release":platform.release(),"os_pretty_name":os_name,"cargo":output(["/opt/rust/cargo/bin/cargo","--version"], env=toolchain_env),"rustc_verbose":output(["/opt/rust/cargo/bin/rustc","-Vv"], env=toolchain_env),"product":products}))
 PY
 PYEOF
 }
@@ -424,6 +425,13 @@ matrix_product_observation_self_test() {
   [[ "$program" == *'("rustscale", "/opt/rustscale/target/release/rustscale")'* ]] || return 1
   [[ "$program" == *'("rustscaled", "/opt/rustscale/target/release/rustscaled")'* ]] || return 1
   [[ "$program" == *'output(["timeout", "15", explicit, "--version"])'* ]] || return 1
+  # On a fresh VM /usr/local/bin/cargo is a rustup shim and the SSH user's
+  # default rustup home is empty. Observation must use the provisioned
+  # toolchain and preserve its homes just as the remote build does.
+  [[ "$program" == *'toolchain_env = {**os.environ, "RUSTUP_HOME": "/opt/rust", "CARGO_HOME": "/opt/rust/cargo"}'* ]] || return 1
+  [[ "$program" == *'output(["/opt/rust/cargo/bin/cargo","--version"], env=toolchain_env)'* ]] || return 1
+  [[ "$program" == *'output(["/opt/rust/cargo/bin/rustc","-Vv"], env=toolchain_env)'* ]] || return 1
+  [[ "$program" != *'output(["cargo","--version"])'* && "$program" != *'output(["rustc","-Vv"])'* ]] || return 1
   [[ "$program" != *cargo*metadata* && "$program" != *'--help'* && "$program" != *'exit 1'* ]] || return 1
   # The fast shell suite does not compile or execute benchmarks. Shared target
   # directories can hold another worktree's stale binary, so only the source

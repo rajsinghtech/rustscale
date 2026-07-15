@@ -209,11 +209,10 @@ fn linux_batch_requires_scalar_handler<'a>(
 
 /// Linux UDP receive configuration sampled once when the receive task starts.
 ///
-/// The bounded `recvmmsg` receive and handoff path is the normal mode. UDP
-/// GRO remains separately opt-in because it has a distinct kernel behavior
-/// and operational risk profile. `RUSTSCALE_ENABLE_LINUX_UDP_BATCH` is kept
-/// as a compatibility no-op for deployments that previously set it; the
-/// explicit scalar kill switch always wins.
+/// The bounded `recvmmsg` receive and handoff path, including its guarded UDP
+/// GRO receiver, is the normal mode. `RUSTSCALE_ENABLE_LINUX_UDP_BATCH` and
+/// `RUSTSCALE_ENABLE_UDP_GRO` remain compatibility no-ops for deployments
+/// that already set them. Explicit disable switches always win.
 #[cfg(any(target_os = "linux", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LinuxUdpReceiveConfig {
@@ -222,26 +221,34 @@ struct LinuxUdpReceiveConfig {
 }
 
 #[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, Copy)]
+struct LinuxUdpReceiveEnvironment {
+    disable_linux_udp_batch: bool,
+    _enable_linux_udp_batch: bool,
+    disable_udp_gro: bool,
+    _enable_udp_gro: bool,
+}
+
+#[cfg(any(target_os = "linux", test))]
 impl LinuxUdpReceiveConfig {
     #[cfg(target_os = "linux")]
     fn from_environment() -> Self {
-        Self::from_environment_presence(
-            std::env::var_os("RUSTSCALE_DISABLE_LINUX_UDP_BATCH").is_some(),
-            std::env::var_os("RUSTSCALE_ENABLE_LINUX_UDP_BATCH").is_some(),
-            std::env::var_os("RUSTSCALE_ENABLE_UDP_GRO").is_some(),
-        )
+        Self::from_environment_presence(LinuxUdpReceiveEnvironment {
+            disable_linux_udp_batch: std::env::var_os("RUSTSCALE_DISABLE_LINUX_UDP_BATCH")
+                .is_some(),
+            _enable_linux_udp_batch: std::env::var_os("RUSTSCALE_ENABLE_LINUX_UDP_BATCH").is_some(),
+            disable_udp_gro: std::env::var_os("RUSTSCALE_DISABLE_UDP_GRO").is_some(),
+            _enable_udp_gro: std::env::var_os("RUSTSCALE_ENABLE_UDP_GRO").is_some(),
+        })
     }
 
-    fn from_environment_presence(
-        disable_linux_udp_batch: bool,
-        _enable_linux_udp_batch: bool,
-        enable_udp_gro: bool,
-    ) -> Self {
+    fn from_environment_presence(environment: LinuxUdpReceiveEnvironment) -> Self {
         Self {
-            // An explicit safety switch must remain effective even in a
-            // deployment that still carries the old batch opt-in variable.
-            use_batch: !disable_linux_udp_batch,
-            disable_udp_gro: !enable_udp_gro,
+            // Explicit safety switches remain effective even in deployments
+            // that still carry the old opt-in variables. Scalar mode never
+            // constructs a batch receiver, so it necessarily has no GRO.
+            use_batch: !environment.disable_linux_udp_batch,
+            disable_udp_gro: environment.disable_linux_udp_batch || environment.disable_udp_gro,
         }
     }
 }
@@ -2465,8 +2472,9 @@ fn spawn_recv_tasks(
                 }
             }
 
-            // Within the batch receiver, UDP GRO is a separate opt-in; the
-            // 128-slot plain recvmmsg path is used otherwise.
+            // The guarded, circuit-broken GRO receiver is the batch default.
+            // The explicit GRO kill switch keeps the 128-slot plain recvmmsg
+            // path available without changing batch handoff behavior.
             let mut batch = udp_batch::ReceiveBatch::new(&udp, receive_config.disable_udp_gro);
             // `pending` only stages ownership; pooled ciphertext ownership moves
             // into the channel or is dropped before the next receive.
@@ -4165,24 +4173,51 @@ mod linux_batch_tests {
     }
 
     #[test]
-    fn linux_receive_defaults_to_plain_recvmmsg_without_gro() {
-        let config = LinuxUdpReceiveConfig::from_environment_presence(false, false, false);
+    fn linux_receive_defaults_to_batched_gro() {
+        let config = LinuxUdpReceiveConfig::from_environment_presence(LinuxUdpReceiveEnvironment {
+            disable_linux_udp_batch: false,
+            _enable_linux_udp_batch: false,
+            disable_udp_gro: false,
+            _enable_udp_gro: false,
+        });
         assert!(config.use_batch);
-        assert!(config.disable_udp_gro);
-    }
-
-    #[test]
-    fn linux_receive_scalar_kill_switch_overrides_legacy_batch_opt_in() {
-        let config = LinuxUdpReceiveConfig::from_environment_presence(true, true, true);
-        assert!(!config.use_batch);
         assert!(!config.disable_udp_gro);
     }
 
     #[test]
-    fn linux_receive_legacy_batch_opt_in_remains_batch_compatible() {
-        let config = LinuxUdpReceiveConfig::from_environment_presence(false, true, false);
+    fn linux_receive_scalar_kill_switch_disables_batch_and_gro() {
+        let config = LinuxUdpReceiveConfig::from_environment_presence(LinuxUdpReceiveEnvironment {
+            disable_linux_udp_batch: true,
+            _enable_linux_udp_batch: true,
+            disable_udp_gro: false,
+            _enable_udp_gro: true,
+        });
+        assert!(!config.use_batch);
+        assert!(config.disable_udp_gro);
+    }
+
+    #[test]
+    fn linux_receive_gro_kill_switch_overrides_legacy_gro_opt_in() {
+        let config = LinuxUdpReceiveConfig::from_environment_presence(LinuxUdpReceiveEnvironment {
+            disable_linux_udp_batch: false,
+            _enable_linux_udp_batch: true,
+            disable_udp_gro: true,
+            _enable_udp_gro: true,
+        });
         assert!(config.use_batch);
         assert!(config.disable_udp_gro);
+    }
+
+    #[test]
+    fn linux_receive_legacy_opt_ins_remain_compatible_with_defaults() {
+        let config = LinuxUdpReceiveConfig::from_environment_presence(LinuxUdpReceiveEnvironment {
+            disable_linux_udp_batch: false,
+            _enable_linux_udp_batch: true,
+            disable_udp_gro: false,
+            _enable_udp_gro: true,
+        });
+        assert!(config.use_batch);
+        assert!(!config.disable_udp_gro);
     }
 
     #[test]

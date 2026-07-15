@@ -719,13 +719,11 @@ impl ReceiveBatch {
     pub(crate) fn new(socket: &UdpSocket, disable_gro: bool) -> Self {
         let gro_enabled = !disable_gro && try_enable_udp_gro(socket);
         if disable_gro {
-            eprintln!(
-                "rustscale: Linux UDP GRO receive disabled (set RUSTSCALE_ENABLE_UDP_GRO=1 to opt in)"
-            );
+            eprintln!("rustscale: Linux UDP GRO receive disabled by RUSTSCALE_DISABLE_UDP_GRO");
         }
-        // Keep the default plain recvmmsg path identical to the last
-        // known-good implementation: no ancillary messages are requested.
-        // Queue-overflow accounting is part of the explicit GRO opt-in.
+        // The GRO path remains guarded by setup failure handling and its
+        // receive-time circuit breaker. Queue-overflow accounting is only
+        // requested when GRO is active.
         if gro_enabled {
             let _ = enable_rxq_overflow(socket);
         }
@@ -2274,7 +2272,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kill_switch_keeps_recvmmsg_active_without_enabling_gro() {
+    async fn disabled_gro_keeps_plain_recvmmsg_active() {
         let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let mut batch = ReceiveBatch::new(&receiver, true);

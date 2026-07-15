@@ -206,6 +206,20 @@ data when the smoltcp TCP send buffer was full. Fix:
 - Magicsock UDP recv batches a burst of packets per wakeup using
   `try_recv_from` drain loop after the first `recv_from`.
 
+#### Linux UDP receive rollback controls
+
+Linux direct receive defaults to bounded batching and guarded UDP GRO. Both
+rollback controls use presence semantics and are sampled when the receive task
+starts: set `RUSTSCALE_DISABLE_LINUX_UDP_BATCH` to force the established scalar
+receiver, or set `RUSTSCALE_DISABLE_UDP_GRO` to retain bounded plain
+`recvmmsg`. The scalar switch implies no GRO; unset the variable and restart
+the daemon to re-enable the default mode.
+
+The GCP matrix records `RS_LINUX_UDP_BATCH` and `RS_LINUX_UDP_GRO` as explicit
+immutable `0`/`1` runtime modes and translates `0` into the corresponding
+presence-based daemon rollback control. This permits scalar, plain-batch, and
+GRO candidates to be compared from one delivered binary.
+
 #### Remaining gap vs tailscaled
 
 ~~rustscale's p50 latency (10.1 ms) is ~40x higher than tailscaled's (257 us).~~

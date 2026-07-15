@@ -103,6 +103,8 @@ const UDP_LIFETIME_CLIFF_SLACK: Duration = Duration::from_secs(2);
 /// MTU sizes to probe when PMTUD is enabled. Mirrors Go's
 /// `tstun.WireMTUsToProbe` (net/tstun/mtu.go:85).
 const WIRE_MTUS_TO_PROBE: &[usize] = &[1280, 1320, 1400, 1500, 8000, 9000];
+#[cfg(any(target_os = "linux", test))]
+const LINUX_UDP_FAST_PACKET_CAPACITY: usize = 2_048;
 
 /// Fake endpoint address used to identify DERP regions in physical netlog
 /// tuples. Mirrors `tailcfg.DerpMagicIPAddr`.
@@ -189,7 +191,11 @@ fn first_node_addr(node: &Node) -> Option<IpAddr> {
 /// handler. The fast handoff only applies to ordinary direct WireGuard UDP.
 #[cfg(any(target_os = "linux", test))]
 fn udp_batch_needs_scalar_handler(data: &[u8]) -> bool {
-    DiscoIo::looks_like_disco(data)
+    // Jumbo packets are fully received in bounded kernel scratch, but do not
+    // fit a detachable pooled ciphertext slot. Keep the whole received burst
+    // sequential so packet order and ownership remain exact.
+    data.len() > LINUX_UDP_FAST_PACKET_CAPACITY
+        || DiscoIo::looks_like_disco(data)
         || relay::looks_like_geneve_disco(data)
         || relay::looks_like_geneve_wireguard(data)
 }
@@ -2456,6 +2462,9 @@ fn spawn_recv_tasks(
             // path.
             let receive_config = LinuxUdpReceiveConfig::from_environment();
             if !receive_config.use_batch {
+                eprintln!(
+                    "rustscale: Linux UDP receive mode=scalar (RUSTSCALE_DISABLE_LINUX_UDP_BATCH present)"
+                );
                 let mut buf = vec![0u8; 65_536];
                 loop {
                     match udp.recv_from(&mut buf).await {
@@ -2500,6 +2509,9 @@ fn spawn_recv_tasks(
                         }
                     }
                     Err(error) if udp_batch::recvmmsg_is_unsupported(&error) => {
+                        eprintln!(
+                            "rustscale: Linux UDP batch receive unavailable; falling back to scalar: {error}"
+                        );
                         break;
                     }
                     Err(error) if error.kind() == io::ErrorKind::InvalidData => {
@@ -4170,6 +4182,21 @@ mod linux_batch_tests {
         // `spawn_recv_tasks` handles the true branch by iterating the same
         // receive indexes in ascending order through `handle_udp_packet`;
         // ordinary packets therefore cannot leap over disco/Geneve control.
+    }
+
+    #[test]
+    fn jumbo_pmtud_disco_packets_stay_on_the_sequential_path() {
+        for length in [8 * 1024, 9 * 1024] {
+            let mut disco = vec![0; length];
+            disco[..rustscale_disco::MAGIC.len()].copy_from_slice(&rustscale_disco::MAGIC);
+            assert!(DiscoIo::looks_like_disco(&disco));
+            assert!(udp_batch_needs_scalar_handler(&disco));
+            assert!(linux_batch_requires_scalar_handler([
+                Some(b"ordinary-before".as_slice()),
+                Some(disco.as_slice()),
+                Some(b"ordinary-after".as_slice()),
+            ]));
+        }
     }
 
     #[test]

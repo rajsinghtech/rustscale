@@ -1,0 +1,14 @@
+[package]
+name = "rustscale-chirp"
+description = "Async client for the BIRD control-socket protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+tokio.workspace = true
+thiserror.workspace = true

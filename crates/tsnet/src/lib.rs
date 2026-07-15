@@ -903,7 +903,8 @@ pub(crate) struct Bootstrap {
     pub(crate) map_task: JoinHandle<()>,
     pub(crate) node_key: NodePrivate,
     pub(crate) filter: Arc<std::sync::Mutex<Filter>>,
-    /// Complete named packet-filter state from the initial signed netmap.
+    /// Last successfully received named ACL fragments, including the initial
+    /// map, for safe delta reconstruction.
     pub(crate) named_filters: BTreeMap<String, Vec<FilterRule>>,
     pub(crate) packet_drops: Arc<AtomicU64>,
     /// Shared MagicDNS resolver (dial path + DNS responder).
@@ -969,6 +970,9 @@ pub(crate) struct Bootstrap {
     pub(crate) tailnet_lock: Arc<tailnet_lock::TailnetLock>,
     /// Durable profile/control namespace for identity, netmap, and TKA data.
     pub(crate) state_scope: Option<state::StateScope>,
+    /// False when the bootstrap peer set came from cache; only a present full
+    /// snapshot from fresh control may make it eligible for activation.
+    pub(crate) peer_snapshot_fresh: bool,
 }
 
 /// An embedded Tailscale server.

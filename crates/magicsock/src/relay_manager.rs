@@ -111,6 +111,7 @@ enum RelayEvent {
     StartDiscovery {
         peer_key: NodePublic,
         peer_disco: DiscoPublic,
+        authorization_generation: u64,
     },
     CancelWork {
         peer_key: NodePublic,
@@ -125,6 +126,7 @@ enum RelayEvent {
     NewServerEndpoint {
         peer_key: NodePublic,
         peer_disco: DiscoPublic,
+        authorization_generation: u64,
         server_endpoint: ServerEndpoint,
         server: Option<CandidatePeerRelay>,
     },
@@ -144,11 +146,13 @@ pub struct RelayDiscoMsg {
     pub vni: u32,
     pub relay_server_node_key: Option<NodePublic>,
     pub source_node_key: Option<NodePublic>,
+    pub authorization_generation: Option<u64>,
 }
 
 struct AllocWorkResult {
     peer_key: NodePublic,
     peer_disco: DiscoPublic,
+    authorization_generation: u64,
     server: CandidatePeerRelay,
     #[allow(dead_code)]
     disco_keys: [DiscoPublic; 2],
@@ -157,6 +161,8 @@ struct AllocWorkResult {
 
 struct HandshakeWorkResult {
     peer_key: NodePublic,
+    peer_disco: DiscoPublic,
+    authorization_generation: u64,
     server_disco: DiscoPublic,
     vni: u32,
     pong_from: Option<SocketAddr>,
@@ -170,6 +176,7 @@ struct HandshakeWorkResult {
 struct AllocWork {
     #[allow(dead_code)]
     server: CandidatePeerRelay,
+    authorization_generation: u64,
     disco_keys: [DiscoPublic; 2],
     #[allow(dead_code)]
     alloc_gen: u32,
@@ -180,6 +187,7 @@ struct AllocWork {
 struct HandshakeWork {
     #[allow(dead_code)]
     server_disco: DiscoPublic,
+    authorization_generation: u64,
     vni: u32,
     lamport_id: u64,
     cancel: tokio::sync::oneshot::Sender<()>,
@@ -244,10 +252,16 @@ pub struct RelayManagerHandle {
 }
 
 impl RelayManagerHandle {
-    pub fn start_discovery(&self, peer_key: NodePublic, peer_disco: DiscoPublic) {
+    pub fn start_discovery(
+        &self,
+        peer_key: NodePublic,
+        peer_disco: DiscoPublic,
+        authorization_generation: u64,
+    ) {
         let _ = self.tx.send(RelayEvent::StartDiscovery {
             peer_key,
             peer_disco,
+            authorization_generation,
         });
     }
 
@@ -305,12 +319,14 @@ impl RelayManagerHandle {
         &self,
         peer_key: NodePublic,
         peer_disco: DiscoPublic,
+        authorization_generation: u64,
         dm: &CallMeMaybeVia,
     ) {
         let se = ServerEndpoint::from_udp_relay_endpoint(&dm.endpoint);
         let _ = self.tx.send(RelayEvent::NewServerEndpoint {
             peer_key,
             peer_disco,
+            authorization_generation,
             server_endpoint: se,
             server: None,
         });
@@ -365,7 +381,15 @@ pub trait RelayManagerContext: Send + Sync + 'static {
     fn our_node_public(&self) -> NodePublic;
     fn peer_disco_key(&self, peer_key: &NodePublic) -> Option<DiscoPublic>;
     fn peer_derp_region(&self, peer_key: &NodePublic) -> i32;
-    fn set_relay(&self, peer_key: &NodePublic, addr: SocketAddr, vni: u32);
+    fn peer_authorization_generation(&self, peer_key: &NodePublic) -> Option<u64>;
+    fn set_relay(
+        &self,
+        peer_key: &NodePublic,
+        peer_disco: &DiscoPublic,
+        authorization_generation: u64,
+        addr: SocketAddr,
+        vni: u32,
+    );
     fn send_pong_via_relay(
         &self,
         addr: SocketAddr,
@@ -402,9 +426,19 @@ async fn run_event_loop<RM: RelayManagerContext>(
             RelayEvent::StartDiscovery {
                 peer_key,
                 peer_disco,
+                authorization_generation,
             } => {
-                if !state.has_active_work_for(&peer_key) {
-                    allocate_all_servers(&mut state, &ctx, &event_tx, peer_key, peer_disco);
+                if ctx.peer_authorization_generation(&peer_key) == Some(authorization_generation)
+                    && !state.has_active_work_for(&peer_key)
+                {
+                    allocate_all_servers(
+                        &mut state,
+                        &ctx,
+                        &event_tx,
+                        peer_key,
+                        peer_disco,
+                        authorization_generation,
+                    );
                 }
             }
             RelayEvent::CancelWork { peer_key, done } => {
@@ -430,6 +464,7 @@ async fn run_event_loop<RM: RelayManagerContext>(
             RelayEvent::NewServerEndpoint {
                 peer_key,
                 peer_disco,
+                authorization_generation,
                 server_endpoint,
                 server,
             } => {
@@ -439,6 +474,7 @@ async fn run_event_loop<RM: RelayManagerContext>(
                     &event_tx,
                     peer_key,
                     peer_disco,
+                    authorization_generation,
                     server_endpoint,
                     server,
                 );
@@ -484,6 +520,7 @@ fn allocate_all_servers<RM: RelayManagerContext>(
     event_tx: &tokio::sync::mpsc::UnboundedSender<RelayEvent>,
     peer_key: NodePublic,
     peer_disco: DiscoPublic,
+    authorization_generation: u64,
 ) {
     if state.servers_by_node_key.is_empty() {
         return;
@@ -499,6 +536,7 @@ fn allocate_all_servers<RM: RelayManagerContext>(
 
         let work = AllocWork {
             server: server.clone(),
+            authorization_generation,
             disco_keys: disco_keys.clone(),
             alloc_gen,
             cancel: cancel_tx,
@@ -521,6 +559,7 @@ fn allocate_all_servers<RM: RelayManagerContext>(
             event_tx2,
             peer_key2,
             peer_disco2,
+            authorization_generation,
             server2,
             disco_keys.clone(),
             alloc_gen,
@@ -535,6 +574,7 @@ async fn spawn_alloc_work<RM: RelayManagerContext>(
     event_tx: tokio::sync::mpsc::UnboundedSender<RelayEvent>,
     peer_key: NodePublic,
     peer_disco: DiscoPublic,
+    authorization_generation: u64,
     server: CandidatePeerRelay,
     disco_keys: [DiscoPublic; 2],
     alloc_gen: u32,
@@ -560,6 +600,7 @@ async fn spawn_alloc_work<RM: RelayManagerContext>(
                     let _ = event_tx.send(RelayEvent::AllocWorkDone(AllocWorkResult {
                         peer_key,
                         peer_disco,
+                        authorization_generation,
                         server,
                         disco_keys,
                         server_endpoint: Some(se),
@@ -571,6 +612,7 @@ async fn spawn_alloc_work<RM: RelayManagerContext>(
         let _ = event_tx.send(RelayEvent::AllocWorkDone(AllocWorkResult {
             peer_key,
             peer_disco,
+            authorization_generation,
             server,
             disco_keys,
             server_endpoint: None,
@@ -587,6 +629,7 @@ async fn spawn_alloc_work<RM: RelayManagerContext>(
         let _ = event_tx.send(RelayEvent::AllocWorkDone(AllocWorkResult {
             peer_key,
             peer_disco,
+            authorization_generation,
             server,
             disco_keys,
             server_endpoint: None,
@@ -624,6 +667,7 @@ async fn spawn_alloc_work<RM: RelayManagerContext>(
                         let _ = event_tx.send(RelayEvent::AllocWorkDone(AllocWorkResult {
                             peer_key,
                             peer_disco,
+                            authorization_generation,
                             server,
                             disco_keys,
                             server_endpoint: Some(se),
@@ -638,6 +682,7 @@ async fn spawn_alloc_work<RM: RelayManagerContext>(
     let _ = event_tx.send(RelayEvent::AllocWorkDone(AllocWorkResult {
         peer_key,
         peer_disco,
+        authorization_generation,
         server,
         disco_keys,
         server_endpoint: None,
@@ -653,11 +698,25 @@ fn handle_alloc_work_done<RM: RelayManagerContext>(
     let peer_key = &result.peer_key;
     let peer_disco = &result.peer_disco;
 
+    let matches_current_work = state
+        .alloc_work
+        .get(peer_key)
+        .and_then(|by_server| by_server.get(&result.server))
+        .is_some_and(|work| work.authorization_generation == result.authorization_generation);
+    if !matches_current_work {
+        return;
+    }
     if let Some(by_server) = state.alloc_work.get_mut(peer_key) {
         by_server.remove(&result.server);
         if by_server.is_empty() {
             state.alloc_work.remove(peer_key);
         }
+    }
+
+    if ctx.peer_authorization_generation(peer_key) != Some(result.authorization_generation)
+        || ctx.peer_disco_key(peer_key).as_ref() != Some(peer_disco)
+    {
+        return;
     }
 
     if let Some(se) = &result.server_endpoint {
@@ -667,6 +726,7 @@ fn handle_alloc_work_done<RM: RelayManagerContext>(
             event_tx,
             peer_key.clone(),
             peer_disco.clone(),
+            result.authorization_generation,
             se.clone(),
             Some(result.server.clone()),
         );
@@ -683,9 +743,15 @@ fn handle_new_server_endpoint<RM: RelayManagerContext>(
     event_tx: &tokio::sync::mpsc::UnboundedSender<RelayEvent>,
     peer_key: NodePublic,
     peer_disco: DiscoPublic,
+    authorization_generation: u64,
     se: ServerEndpoint,
     server: Option<CandidatePeerRelay>,
 ) {
+    if ctx.peer_authorization_generation(&peer_key) != Some(authorization_generation)
+        || ctx.peer_disco_key(&peer_key).as_ref() != Some(&peer_disco)
+    {
+        return;
+    }
     let sdv = ServerDiscoVni {
         server_disco: se.server_disco.clone(),
         vni: se.vni,
@@ -724,6 +790,7 @@ fn handle_new_server_endpoint<RM: RelayManagerContext>(
     let handshake_gen = state.next_handshake_gen();
     let work = HandshakeWork {
         server_disco: se.server_disco.clone(),
+        authorization_generation,
         vni: se.vni,
         lamport_id: se.lamport_id,
         cancel: cancel_tx,
@@ -745,6 +812,7 @@ fn handle_new_server_endpoint<RM: RelayManagerContext>(
         event_tx2,
         peer_key,
         peer_disco,
+        authorization_generation,
         se,
         handshake_gen,
         cancel_rx,
@@ -788,6 +856,7 @@ async fn spawn_handshake_work<RM: RelayManagerContext>(
     event_tx: tokio::sync::mpsc::UnboundedSender<RelayEvent>,
     peer_key: NodePublic,
     peer_disco: DiscoPublic,
+    authorization_generation: u64,
     se: ServerEndpoint,
     handshake_gen: u32,
     mut cancel_rx: tokio::sync::oneshot::Receiver<()>,
@@ -810,6 +879,8 @@ async fn spawn_handshake_work<RM: RelayManagerContext>(
     } else {
         let _ = event_tx.send(RelayEvent::HandshakeWorkDone(HandshakeWorkResult {
             peer_key,
+            peer_disco,
+            authorization_generation,
             server_disco: se.server_disco,
             vni: se.vni,
             pong_from: None,
@@ -832,6 +903,8 @@ async fn spawn_handshake_work<RM: RelayManagerContext>(
     tokio::pin!(ping_retry);
     let mut result = HandshakeWorkResult {
         peer_key: peer_key.clone(),
+        peer_disco: peer_disco.clone(),
+        authorization_generation,
         server_disco: se.server_disco.clone(),
         vni: se.vni,
         pong_from: None,
@@ -967,7 +1040,13 @@ fn handle_handshake_work_done<RM: RelayManagerContext>(
     state.handshake_awaiting_pong.retain(|_, pk| pk != peer_key);
 
     if let Some(pong_from) = result.pong_from {
-        ctx.set_relay(peer_key, pong_from, result.vni);
+        ctx.set_relay(
+            peer_key,
+            &result.peer_disco,
+            result.authorization_generation,
+            pong_from,
+            result.vni,
+        );
     }
 }
 
@@ -980,6 +1059,14 @@ fn handle_rx_disco_msg<RM: RelayManagerContext>(
     ctx: &std::sync::Arc<RM>,
     msg: RelayDiscoMsg,
 ) {
+    if let Some(source) = msg.source_node_key.as_ref() {
+        let Some(generation) = msg.authorization_generation else {
+            return;
+        };
+        if ctx.peer_authorization_generation(source) != Some(generation) {
+            return;
+        }
+    }
     let apv = AddrPortVni {
         addr: msg.from,
         vni: msg.vni,
@@ -989,8 +1076,8 @@ fn handle_rx_disco_msg<RM: RelayManagerContext>(
         Message::AllocateUdpRelayEndpointResponse(resp) => {
             // Route to the matching alloc work's response channel.
             let relay_server_node_key = match &msg.relay_server_node_key {
-                Some(k) => k.clone(),
-                None => return,
+                Some(key) if msg.source_node_key.as_ref() == Some(key) => key.clone(),
+                _ => return,
             };
             let sorted = sort_pair(
                 &resp.endpoint.client_disco[0],
@@ -998,9 +1085,13 @@ fn handle_rx_disco_msg<RM: RelayManagerContext>(
             );
 
             // Find the alloc work for this server + disco key pair.
-            for by_server in state.alloc_work.values() {
+            for (peer_key, by_server) in &state.alloc_work {
                 for (server, work) in by_server {
-                    if server.node_key == relay_server_node_key && work.disco_keys == sorted {
+                    if ctx.peer_authorization_generation(peer_key)
+                        == Some(work.authorization_generation)
+                        && server.node_key == relay_server_node_key
+                        && work.disco_keys == sorted
+                    {
                         let _ = work.response_tx.try_send(resp.clone());
                         return;
                     }
@@ -1017,21 +1108,21 @@ fn handle_rx_disco_msg<RM: RelayManagerContext>(
                 Some(k) => k,
                 None => return,
             };
-            if state.handshake_awaiting_pong.contains_key(&apv) {
+            let Some(work) = state
+                .handshake_work
+                .get(&peer_key)
+                .and_then(|by_server| by_server.get(&msg.disco))
+            else {
+                return;
+            };
+            if ctx.peer_authorization_generation(&peer_key) != Some(work.authorization_generation)
+                || state.handshake_awaiting_pong.contains_key(&apv)
+            {
                 return;
             }
-            state
-                .handshake_awaiting_pong
-                .insert(apv.clone(), peer_key.clone());
-
-            // Route to the handshake work's disco message channel.
-            if let Some(by_sd) = state.handshake_work.get(&peer_key) {
-                if let Some(work) = by_sd.get(&msg.disco) {
-                    let _ = work
-                        .disco_msg_tx
-                        .try_send((msg.msg.clone(), msg.from, msg.vni));
-                }
-            }
+            let disco_msg_tx = work.disco_msg_tx.clone();
+            state.handshake_awaiting_pong.insert(apv.clone(), peer_key);
+            let _ = disco_msg_tx.try_send((msg.msg.clone(), msg.from, msg.vni));
         }
 
         Message::Ping(ping) => {
@@ -1044,7 +1135,10 @@ fn handle_rx_disco_msg<RM: RelayManagerContext>(
             if let Some(peer_key) = state.handshake_awaiting_pong.get(&apv).cloned() {
                 if let Some(by_sd) = state.handshake_work.get(&peer_key) {
                     for work in by_sd.values() {
-                        if work.vni == msg.vni {
+                        if work.vni == msg.vni
+                            && ctx.peer_authorization_generation(&peer_key)
+                                == Some(work.authorization_generation)
+                        {
                             let _ =
                                 work.disco_msg_tx
                                     .try_send((msg.msg.clone(), msg.from, msg.vni));
@@ -1063,7 +1157,10 @@ fn handle_rx_disco_msg<RM: RelayManagerContext>(
                     // match the server_disco key. Route to the work whose
                     // VNI matches.
                     for work in by_sd.values() {
-                        if work.vni == msg.vni {
+                        if work.vni == msg.vni
+                            && ctx.peer_authorization_generation(&peer_key)
+                                == Some(work.authorization_generation)
+                        {
                             let _ =
                                 work.disco_msg_tx
                                     .try_send((msg.msg.clone(), msg.from, msg.vni));
@@ -1259,6 +1356,7 @@ mod tests {
             .insert(
                 server_disco.clone(),
                 HandshakeWork {
+                    authorization_generation: 1,
                     server_disco: server_disco.clone(),
                     vni: 100,
                     lamport_id: 5,
@@ -1304,6 +1402,7 @@ mod tests {
                 server.clone(),
                 AllocWork {
                     server: server.clone(),
+                    authorization_generation: 1,
                     disco_keys: [
                         DiscoPrivate::generate().public(),
                         DiscoPrivate::generate().public(),
@@ -1323,6 +1422,7 @@ mod tests {
             .insert(
                 server_disco.clone(),
                 HandshakeWork {
+                    authorization_generation: 1,
                     server_disco: server_disco.clone(),
                     vni: 42,
                     lamport_id: 1,
@@ -1415,6 +1515,7 @@ mod tests {
                 server,
                 AllocWork {
                     server: make_candidate(),
+                    authorization_generation: 1,
                     disco_keys: [
                         DiscoPrivate::generate().public(),
                         DiscoPrivate::generate().public(),
@@ -1489,6 +1590,7 @@ mod tests {
             .insert(
                 server_disco.clone(),
                 HandshakeWork {
+                    authorization_generation: 1,
                     server_disco: server_disco.clone(),
                     vni,
                     lamport_id: 1,
@@ -1520,6 +1622,7 @@ mod tests {
             vni,
             relay_server_node_key: None,
             source_node_key: None,
+            authorization_generation: None,
         };
 
         let ctx = MockCtx;
@@ -1546,6 +1649,7 @@ mod tests {
             .insert(
                 server_disco.clone(),
                 HandshakeWork {
+                    authorization_generation: 1,
                     server_disco: server_disco.clone(),
                     vni,
                     lamport_id: 1,
@@ -1580,6 +1684,7 @@ mod tests {
             vni,
             relay_server_node_key: None,
             source_node_key: None,
+            authorization_generation: None,
         };
 
         let ctx = MockCtx;
@@ -1608,7 +1713,10 @@ mod tests {
         fn peer_derp_region(&self, _: &NodePublic) -> i32 {
             0
         }
-        fn set_relay(&self, _: &NodePublic, _: SocketAddr, _: u32) {}
+        fn peer_authorization_generation(&self, _: &NodePublic) -> Option<u64> {
+            Some(1)
+        }
+        fn set_relay(&self, _: &NodePublic, _: &DiscoPublic, _: u64, _: SocketAddr, _: u32) {}
         fn send_pong_via_relay(&self, _: SocketAddr, _: u32, _: &DiscoPublic, _: [u8; 12]) {}
         fn is_self_node(&self, _: &NodePublic) -> bool {
             false

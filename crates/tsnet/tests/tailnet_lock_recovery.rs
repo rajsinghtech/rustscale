@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use rustscale_key::NLPublic;
 use rustscale_localclient::LocalClient;
+use rustscale_tailcfg::MapResponse;
 use rustscale_testcontrol::Server as TestControlServer;
 use rustscale_tka::{disablement_kdf, Key, KeyKind};
 use rustscale_tsnet::Server;
@@ -114,6 +115,105 @@ async fn commit_then_drop_keeps_receipt_and_resumes_without_new_secrets() {
         "resume must not create a replacement transaction"
     );
     server.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cached_locked_netmap_stays_revoked_until_fresh_control_confirmation() {
+    let mut control = TestControlServer::new();
+    control.start().await.unwrap();
+    control.add_fake_node();
+
+    let state = tempfile::tempdir().unwrap();
+    let sockets = tempfile::tempdir().unwrap();
+    let socket = sockets.path().join("cached-lock.sock");
+    let mut server = Server::builder()
+        .hostname("cached-lock")
+        .auth_key("tskey-test")
+        .control_url(control.base_url())
+        .state_dir(state.path())
+        .localapi_path(&socket)
+        .build()
+        .unwrap();
+    Box::pin(tokio::time::timeout(Duration::from_secs(60), server.up()))
+        .await
+        .expect("startup deadline")
+        .expect("startup");
+
+    let client = LocalClient::new(&socket);
+    let status = client.tailnet_lock_status().await.unwrap();
+    let public: NLPublic = status["PublicKey"].as_str().unwrap().parse().unwrap();
+    let secret = vec![0x29; 32];
+    let initialized = client
+        .tailnet_lock_init(&serde_json::json!({
+            "Keys": [Key {
+                kind: KeyKind::Key25519,
+                votes: 1,
+                public: public.raw32().to_vec(),
+                meta: None,
+            }],
+            "DisablementValues": [disablement_kdf(&secret)],
+            "DisablementSecrets": [secret],
+            "SupportDisablement": [],
+            "Resume": false,
+        }))
+        .await
+        .unwrap();
+    let self_key = initialized["NodeKey"].as_str().unwrap().parse().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while server.status().peer_count != 1 {
+        assert!(
+            Instant::now() < deadline,
+            "locked peer did not become visible"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // Preserve the last complete locked netmap in the cache while preventing
+    // the restarted stream from immediately racing the fail-closed assertion.
+    assert!(control.add_raw_map_response(
+        &self_key,
+        MapResponse {
+            KeepAlive: true,
+            ..Default::default()
+        },
+    ));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    server.close().await;
+
+    let mut restarted = Server::builder()
+        .hostname("cached-lock")
+        .control_url(control.base_url())
+        .state_dir(state.path())
+        .localapi_path(&socket)
+        .build()
+        .unwrap();
+    Box::pin(tokio::time::timeout(
+        Duration::from_secs(60),
+        restarted.up(),
+    ))
+    .await
+    .expect("cached startup deadline")
+    .expect("cached startup");
+    assert_eq!(
+        restarted.status().peer_count,
+        0,
+        "a cached locked authority/head must never reactivate cached peers"
+    );
+
+    // A fresh generated full snapshot carries the current TKA head. The
+    // previously signed peer then recovers, while the newly added unsigned
+    // peer remains filtered.
+    control.resume_auto_map(&self_key);
+    control.add_fake_node();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while restarted.status().peer_count != 1 {
+        assert!(
+            Instant::now() < deadline,
+            "fresh control confirmation did not recover signed peers"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    restarted.close().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

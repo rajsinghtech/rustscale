@@ -182,11 +182,10 @@ pub(crate) fn reconcile(
     current: &[Node],
     response: &MapResponse,
 ) -> Result<Vec<Node>, ReconcileError> {
-    let mut peers = if response.Peers.is_empty() {
-        current.to_vec()
-    } else {
-        response.Peers.clone()
-    };
+    let mut peers = response
+        .Peers
+        .as_ref()
+        .map_or_else(|| current.to_vec(), Clone::clone);
 
     let mut changed_ids = HashSet::new();
     for changed in &response.PeersChanged {
@@ -310,12 +309,12 @@ mod tests {
     fn malformed_address_prefix_is_rejected() {
         let key = NodePrivate::generate().public();
         let response = MapResponse {
-            Peers: vec![Node {
+            Peers: Some(vec![Node {
                 ID: 1,
                 Key: key,
                 Addresses: vec!["100.64.0.1/garbage".into()],
                 ..Default::default()
-            }],
+            }]),
             ..Default::default()
         };
         assert!(matches!(
@@ -329,10 +328,10 @@ mod tests {
         let first = NodePrivate::generate().public();
         let second = NodePrivate::generate().public();
         let response = MapResponse {
-            Peers: vec![
+            Peers: Some(vec![
                 node(1, &first, "100.64.0.1"),
                 node(2, &second, "100.64.0.1"),
-            ],
+            ]),
             ..Default::default()
         };
         assert!(matches!(

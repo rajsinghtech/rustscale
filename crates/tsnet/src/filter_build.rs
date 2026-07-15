@@ -48,17 +48,13 @@ pub(crate) fn build_filter_from_map_response(
         }
     }
 
-    // If no rules at all, default to allow-all (matches Go behavior when
-    // the control server sends no filter).
-    let all_rules: Vec<FilterRule> = if named.is_empty() {
-        rustscale_tailcfg::filter_allow_all()
-    } else {
-        named.values().flatten().cloned().collect()
-    };
+    // An absent/cleared ACL and malformed ACL are both deny-all. There is no
+    // safe basis for synthesizing allow-all from an untrusted parse failure.
+    let all_rules: Vec<FilterRule> = named.values().flatten().cloned().collect();
 
     let cap_holders = build_cap_holders(peers);
     let mut filter = Filter::new(&all_rules, local_ips, &cap_holders).unwrap_or_else(|error| {
-        log::warn!("tsnet: rejecting malformed initial packet filter: {error}");
+        log::error!("tsnet: initial packet filter parse failed closed: {error}");
         Filter::allow_none()
     });
     filter.set_shields_up(shields_up);
@@ -123,28 +119,27 @@ pub(crate) fn rebuild_filter(
     peers: &[Node],
     shields_up: bool,
 ) {
-    let all_rules: Vec<FilterRule> = if named.is_empty() {
-        rustscale_tailcfg::filter_allow_all()
-    } else {
-        named.values().flatten().cloned().collect()
-    };
+    let all_rules: Vec<FilterRule> = named.values().flatten().cloned().collect();
     let cap_holders = build_cap_holders(peers);
-    let mut new_filter = match Filter::new(&all_rules, local_ips, &cap_holders) {
-        Ok(filter) => filter,
-        Err(error) => {
-            // A malformed signed filter delta must not retain stale packet or
-            // capability grants. Fail closed until control sends a valid map.
-            log::warn!("tsnet: rejecting malformed packet filter update: {error}");
-            Filter::allow_none()
+    match Filter::new(&all_rules, local_ips, &cap_holders) {
+        Ok(mut new_filter) => {
+            if !advertise_routes.is_empty() {
+                new_filter.add_local_cidrs(advertise_routes);
+            }
+            new_filter.set_shields_up(shields_up);
+            let mut old_filter = filter_arc.lock().unwrap();
+            new_filter.share_state_with(&mut old_filter);
+            *old_filter = new_filter;
         }
-    };
-    if !advertise_routes.is_empty() {
-        new_filter.add_local_cidrs(advertise_routes);
+        Err(error) => {
+            // A malformed mutation is not proven monotonic, so retaining old
+            // ACL, Taildrive grants, or established flow state is unsafe.
+            log::error!("tsnet: packet filter update parse failed closed: {error}");
+            let mut deny = Filter::allow_none();
+            deny.set_shields_up(shields_up);
+            *filter_arc.lock().unwrap() = deny;
+        }
     }
-    new_filter.set_shields_up(shields_up);
-    let mut old_filter = filter_arc.lock().unwrap();
-    new_filter.share_state_with(&mut old_filter);
-    *old_filter = new_filter;
 }
 
 // ---------------------------------------------------------------------------
@@ -206,4 +201,108 @@ pub(crate) fn whois_lookup(
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustscale_filter::Response;
+    use rustscale_tailcfg::{NetPortRange, PortRange};
+
+    fn rule(source: &str, destination: &str, port: u16) -> FilterRule {
+        FilterRule {
+            SrcIPs: vec![source.into()],
+            DstPorts: vec![NetPortRange {
+                IP: destination.into(),
+                Bits: None,
+                Ports: PortRange {
+                    First: port,
+                    Last: port,
+                },
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn initial_named_filters_survive_unrelated_deltas() {
+        let local: IpAddr = "100.64.0.1".parse().unwrap();
+        let mut initial_named = BTreeMap::new();
+        initial_named.insert(
+            "initial".into(),
+            Some(vec![rule("100.64.0.2", "100.64.0.1", 80)]),
+        );
+        let initial = MapResponse {
+            PacketFilters: Some(initial_named),
+            ..Default::default()
+        };
+        let (filter, mut named) = build_filter_from_map_response(&initial, &[local], &[], false);
+        let filter = Arc::new(std::sync::Mutex::new(filter));
+        assert_eq!(
+            filter
+                .lock()
+                .unwrap()
+                .check("100.64.0.2".parse().unwrap(), local, 6, 80,),
+            Response::Accept
+        );
+
+        let mut delta_named = BTreeMap::new();
+        delta_named.insert(
+            "later".into(),
+            Some(vec![rule("100.64.0.3", "100.64.0.1", 443)]),
+        );
+        let delta = MapResponse {
+            PacketFilters: Some(delta_named),
+            ..Default::default()
+        };
+        assert!(process_filter_deltas(&delta, &mut named));
+        rebuild_filter(&filter, &named, &[local], &[], &[], false);
+
+        let mut active = filter.lock().unwrap();
+        assert_eq!(
+            active.check("100.64.0.2".parse().unwrap(), local, 6, 80),
+            Response::Accept,
+            "the initial named ACL must not disappear on the first update"
+        );
+        assert_eq!(
+            active.check("100.64.0.3".parse().unwrap(), local, 6, 443),
+            Response::Accept
+        );
+    }
+
+    #[test]
+    fn malformed_initial_and_update_filters_deny_all() {
+        let local: IpAddr = "100.64.0.1".parse().unwrap();
+        let malformed = rule("not-an-ip", "100.64.0.1", 80);
+        let initial = MapResponse {
+            PacketFilter: Some(vec![malformed.clone()]),
+            ..Default::default()
+        };
+        let (mut filter, _) = build_filter_from_map_response(&initial, &[local], &[], false);
+        assert_eq!(
+            filter.check("100.64.0.2".parse().unwrap(), local, 6, 80),
+            Response::Drop
+        );
+
+        let valid = MapResponse {
+            PacketFilter: Some(vec![rule("100.64.0.2", "100.64.0.1", 80)]),
+            ..Default::default()
+        };
+        let (filter, mut named) = build_filter_from_map_response(&valid, &[local], &[], false);
+        let filter = Arc::new(std::sync::Mutex::new(filter));
+        let bad_update = MapResponse {
+            PacketFilter: Some(vec![malformed]),
+            ..Default::default()
+        };
+        assert!(process_filter_deltas(&bad_update, &mut named));
+        rebuild_filter(&filter, &named, &[local], &[], &[], false);
+        assert_eq!(
+            filter
+                .lock()
+                .unwrap()
+                .check("100.64.0.2".parse().unwrap(), local, 6, 80,),
+            Response::Drop,
+            "a malformed update must replace active and established allow state with deny-all"
+        );
+    }
 }

@@ -488,19 +488,19 @@ mod tests {
         let node_pub = node_key.public();
         let resp = MapResponse {
             Domain: "test.tailnet.ts.net".into(),
-            Peers: vec![rustscale_tailcfg::Node {
+            Peers: Some(vec![rustscale_tailcfg::Node {
                 ID: 42,
                 Name: "peer.test.tailnet.ts.net.".into(),
                 ..Default::default()
-            }],
+            }]),
             ..Default::default()
         };
 
         PersistedState::save_netmap(&dir, &node_pub, &resp).expect("save_netmap");
         let loaded = PersistedState::load_netmap(&dir, &node_pub).expect("load_netmap");
         assert_eq!(loaded.Domain, "test.tailnet.ts.net");
-        assert_eq!(loaded.Peers.len(), 1);
-        assert_eq!(loaded.Peers[0].ID, 42);
+        assert_eq!(loaded.Peers.as_ref().unwrap().len(), 1);
+        assert_eq!(loaded.Peers.as_ref().unwrap()[0].ID, 42);
 
         std::fs::remove_dir_all(&dir).ok();
     }

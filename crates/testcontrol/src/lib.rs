@@ -1824,7 +1824,7 @@ fn build_map_response(
         Node: Some(node),
         DERPMap: derp_map,
         Domain: DOMAIN.to_string(),
-        Peers: peers,
+        Peers: Some(peers),
         PacketFilter: Some(packet_filter),
         DNSConfig: dns_config,
         UserProfiles: user_profiles,

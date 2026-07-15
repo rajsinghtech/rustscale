@@ -733,6 +733,7 @@ async fn netmap_refreshes_peer_disco_key_and_reverse_map() {
         magicsock.inner.peer_disco_key(&peer_key),
         Some(first_disco.clone())
     );
+    let first_disco_generation = magicsock.authorization_generation(&peer_key).unwrap();
     assert_eq!(
         magicsock
             .inner
@@ -752,6 +753,11 @@ async fn netmap_refreshes_peer_disco_key_and_reverse_map() {
         )])
         .await
         .unwrap();
+    assert_ne!(
+        magicsock.authorization_generation(&peer_key),
+        Some(first_disco_generation),
+        "disco-key rotation must invalidate callbacks stamped for the old source key"
+    );
     {
         let d2p = magicsock.inner.disco_to_peer.read().unwrap();
         assert!(!d2p.contains_key(&first_disco));
@@ -893,6 +899,99 @@ async fn revocation_commit_waits_for_plaintext_delivery_barrier() {
     drop(delivery);
     revoke.await.unwrap();
     assert!(!magicsock.is_authorization_current(&peer, generation));
+}
+
+#[tokio::test]
+async fn queued_disco_handler_cannot_reinsert_state_after_revocation() {
+    let peer_key = NodePrivate::generate().public();
+    let peer_disco = DiscoPrivate::generate();
+    let peer_disco_public = peer_disco.public();
+    let (magicsock, _rx) = Magicsock::new(MagicsockConfig {
+        private_key: NodePrivate::generate(),
+        disco_key: DiscoPrivate::generate(),
+        derp_client: None,
+        derp_map: None,
+        home_derp_region: 0,
+        udp_bind: None,
+        udp_socket: None,
+        portmapper: None,
+        health: None,
+        disable_direct_paths: false,
+        peer_relay_server: false,
+        relay_server_config: None,
+        sockstats: None,
+        control_knobs: None,
+    })
+    .await
+    .unwrap();
+    magicsock
+        .set_netmap(vec![make_peer(
+            peer_key.clone(),
+            peer_disco_public.clone(),
+            vec![],
+            0,
+        )])
+        .await
+        .unwrap();
+
+    // Force the Ping fallback path to try to learn the reverse mapping. Hold
+    // an existing reader, queue revoke's writer, and only then queue the
+    // packet handler. Tokio's fair RwLock must run the revoke transaction
+    // before this stale callback can acquire its read side.
+    magicsock
+        .inner
+        .disco_to_peer
+        .write()
+        .unwrap()
+        .remove(&peer_disco_public);
+    let packet = DiscoIo::new(peer_disco)
+        .seal(
+            &magicsock.disco_public(),
+            &Message::Ping(Ping {
+                tx_id: [7; 12],
+                node_key: peer_key.clone(),
+                padding: 0,
+            }),
+        )
+        .unwrap();
+    let socket = Arc::new(magicsock);
+    let held_reader = socket.inner.authorization_delivery_barrier.read().await;
+    let revoke_socket = socket.clone();
+    let revoke = tokio::spawn(async move {
+        revoke_socket.set_netmap(Vec::new()).await.unwrap();
+    });
+    tokio::task::yield_now().await;
+    let handler_socket = socket.clone();
+    let handler = tokio::spawn(async move {
+        handler_socket
+            .inner
+            .handle_disco_udp(&packet, "127.0.0.1:4242".parse().unwrap())
+            .await;
+    });
+    tokio::task::yield_now().await;
+    drop(held_reader);
+    revoke.await.unwrap();
+    handler.await.unwrap();
+
+    assert!(!socket
+        .inner
+        .endpoints
+        .read()
+        .unwrap()
+        .contains_key(&peer_key));
+    assert!(!socket
+        .inner
+        .disco_to_peer
+        .read()
+        .unwrap()
+        .contains_key(&peer_disco_public));
+    assert!(!socket
+        .inner
+        .addr_to_peer
+        .read()
+        .unwrap()
+        .values()
+        .any(|key| key == &peer_key));
 }
 
 // ---- Test (a): DERP data path fallback ----

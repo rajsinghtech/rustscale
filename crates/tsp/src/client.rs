@@ -744,7 +744,11 @@ mod tests {
         let session = Arc::new(client_a.map(map_options).await.unwrap());
         let first = session.next().await.unwrap().unwrap();
         assert_eq!(first.Node.unwrap().Key, node_a.public());
-        assert!(first.Peers.iter().any(|peer| peer.Key == node_b.public()));
+        assert!(first
+            .Peers
+            .iter()
+            .flatten()
+            .any(|peer| peer.Key == node_b.public()));
         assert_eq!(
             server.noise_connection_count(),
             connections_before_a + 1,

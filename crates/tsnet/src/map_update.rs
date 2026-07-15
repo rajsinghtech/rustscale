@@ -98,6 +98,7 @@ pub(crate) fn spawn_map_update_task(
     mut named_filters: BTreeMap<String, Vec<FilterRule>>,
     drive: Arc<crate::drive::Runtime>,
     peer_map: Arc<crate::peer_map::Runtime>,
+
     tailscale_ips: Vec<IpAddr>,
     control_url: String,
     accept_routes: bool,
@@ -121,6 +122,7 @@ pub(crate) fn spawn_map_update_task(
     client_updater: Arc<std::sync::Mutex<rustscale_clientupdate::ClientUpdater>>,
     tailnet_lock: Arc<crate::tailnet_lock::TailnetLock>,
     tailnet_identity: String,
+    mut peer_snapshot_fresh: bool,
 ) -> JoinHandle<()> {
     // Create the netmap cache helper once so that save_if_changed can
     // dedup identical writes via the in-memory SHA-256 hash.
@@ -359,8 +361,13 @@ pub(crate) fn spawn_map_update_task(
                     }
 
                     // Reconcile the raw control view by stable Node.ID before
-                    // intersecting it with TKA authorization. Invalid identity
-                    // or address ownership withdraws all peers and grants.
+                    // intersecting it with TKA authorization. Presence of a
+                    // full snapshot is significant: Some([]) revokes all,
+                    // while omission leaves the current raw set unchanged.
+                    let full_peers_present = resp.Peers.is_some();
+                    if full_peers_present {
+                        peer_snapshot_fresh = true;
+                    }
                     let current_peers = peers_arc.read().await.clone();
                     let (next_raw_peers, invalid_peer_map) =
                         match crate::peer_map::reconcile(&raw_peers, &resp) {
@@ -371,10 +378,16 @@ pub(crate) fn spawn_map_update_task(
                             }
                         };
                     raw_peers = next_raw_peers;
-                    let mut next_peers = raw_peers.clone();
+                    let mut next_peers = if peer_snapshot_fresh {
+                        raw_peers.clone()
+                    } else {
+                        Vec::new()
+                    };
                     tailnet_lock.filter_peers(&mut next_peers);
-                    let peers_changed =
-                        tka_state_may_change || invalid_peer_map || next_peers != current_peers;
+                    let peers_changed = tka_state_may_change
+                        || full_peers_present
+                        || invalid_peer_map
+                        || next_peers != current_peers;
 
                     // Construct replacement tunnels and routes before the
                     // commit gate. Unchanged verified keys keep WG state;
@@ -449,7 +462,7 @@ pub(crate) fn spawn_map_update_task(
                     // watch-ipn-bus subscribers receive PeersChanged /
                     // PeersRemoved / NetMap. Mirrors Go's `ipnlocal.send`
                     // in the full-netmap and delta notify paths.
-                    if !resp.PeersChanged.is_empty() || !resp.Peers.is_empty() {
+                    if !resp.PeersChanged.is_empty() || full_peers_present {
                         let changed_nodes: Vec<serde_json::Value> = peers
                             .iter()
                             .filter_map(|peer| serde_json::to_value(peer).ok())
@@ -465,7 +478,7 @@ pub(crate) fn spawn_map_update_task(
                     // NetMap notify with a summary JSON. This mirrors Go's
                     // full-netmap notify path for legacy/initial-netmap
                     // watchers.
-                    if !resp.Peers.is_empty() {
+                    if full_peers_present {
                         let peers_json: Vec<serde_json::Value> = peers
                             .iter()
                             .filter_map(|peer| serde_json::to_value(peer).ok())

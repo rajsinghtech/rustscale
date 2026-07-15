@@ -260,6 +260,7 @@ impl Server {
             client_updater.clone(),
             b.tailnet_lock.clone(),
             b.domain.clone(),
+            b.peer_snapshot_fresh,
         );
 
         // MagicDNS responder: best-effort UDP server at 100.100.100.100:53.
@@ -806,6 +807,7 @@ impl Server {
             client_updater.clone(),
             b.tailnet_lock.clone(),
             b.domain.clone(),
+            b.peer_snapshot_fresh,
         );
 
         // Taildrop file manager (shared between PeerAPI receive handler
@@ -1780,7 +1782,7 @@ impl Server {
         // background. This eliminates the 2-5s startup delay on restarts.
         let used_cached_netmap = cached_netmap.is_some();
         let map_resp: MapResponse = if let Some(ref cached) = cached_netmap {
-            let peer_count = cached.Peers.len();
+            let peer_count = cached.Peers.as_ref().map_or(0, Vec::len);
             log::debug!(
                 "tsnet: using cached netmap ({peer_count} peers); streaming poll will refresh in background"
             );
@@ -1834,10 +1836,10 @@ impl Server {
             extra_root_certs: self.config.extra_root_certs.clone(),
         })
         .map_err(|error| TsnetError::TailnetLock(error.to_string()))?;
-        if used_cached_netmap && map_resp.TKAInfo.as_ref().is_none_or(|info| info.Disabled) {
-            // A cached disabled/absent TKAInfo cannot prove that an
-            // administrator did not enable locking while this node was
-            // offline. Withdraw peers until the new map stream confirms it.
+        if used_cached_netmap {
+            // No cached TKA state proves that its head or peer snapshot is
+            // still current. Even a cached enabled head remains withdrawn
+            // until a fresh control response confirms and synchronizes it.
             tailnet_lock.require_fresh_control_state();
         } else if let Err(error) = tailnet_lock
             .apply_control_info(map_resp.TKAInfo.as_ref(), true)
@@ -1858,7 +1860,12 @@ impl Server {
         // We have a netmap — update the IPN state machine. Set netmap_present
         // and engine status (peer count + DERP home as a proxy for live
         // connections). This may transition the state from Starting to Running.
-        let peer_count = map_resp.Peers.iter().filter(|p| !p.Key.is_zero()).count() as i32;
+        let peer_count = map_resp
+            .Peers
+            .iter()
+            .flatten()
+            .filter(|peer| !peer.Key.is_zero())
+            .count() as i32;
         let has_derp_home = map_resp.Node.as_ref().is_some_and(|n| n.HomeDERP > 0);
         ipn_backend.set_netmap_present(true);
         ipn_backend.set_engine_status(peer_count, i32::from(has_derp_home));
@@ -2095,10 +2102,11 @@ impl Server {
 
         // The server may send peers via Peers (full list) or PeersChanged
         // (delta). The first response often uses PeersChanged.
-        let mut peers = map_resp.Peers.clone();
-        if peers.is_empty() && !map_resp.PeersChanged.is_empty() {
-            peers = map_resp.PeersChanged.clone();
-        }
+        let peers = map_resp
+            .Peers
+            .clone()
+            .unwrap_or_else(|| map_resp.PeersChanged.clone());
+        let mut peers = peers;
         // Keep the stable-ID-reconciled control view separate from the TKA
         // verified intersection. Authority changes may reauthorize a raw peer
         // without control repeating it, but only verified peers own addresses,
@@ -2314,6 +2322,7 @@ impl Server {
             private_log_id,
             tailnet_lock,
             state_scope,
+            peer_snapshot_fresh: !used_cached_netmap,
         })
     }
 

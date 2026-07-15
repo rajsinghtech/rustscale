@@ -673,6 +673,26 @@ async fn perform_key_rotation(
 
         if resp.NodeKeyExpired {
             log::info!("tsnet: replacement key is also expired; retaining current map stream");
+
+            // Some control implementations transfer the node record to
+            // OldNodeKey's replacement before reporting global expiry. Roll
+            // that tentative transfer back so the current map stream can
+            // reconnect after the global policy is cleared.
+            let mut rollback_req = reg_req.clone();
+            rollback_req.NodeKey = old_pub.clone();
+            rollback_req.OldNodeKey = new_pub;
+            match cc.register(&rollback_req).await {
+                Ok(rollback) if !rollback.Error.is_empty() => {
+                    log::warn!(
+                        "tsnet: control rejected expired-key rollback: {}",
+                        rollback.Error
+                    );
+                }
+                Err(error) => {
+                    log::warn!("tsnet: expired-key rollback failed: {error}");
+                }
+                _ => {}
+            }
             return Ok(None);
         }
 

@@ -644,6 +644,45 @@ async fn abort_background_tasks_drains_all_peer_records() {
 }
 
 #[tokio::test]
+async fn netmap_key_rotation_removes_every_old_send_path() {
+    let (magicsock, old_key) = magicsock_with_idle_peer().await;
+    let new_key = NodePrivate::generate().public();
+    magicsock
+        .set_netmap(vec![make_peer(
+            new_key.clone(),
+            DiscoPrivate::generate().public(),
+            vec![],
+            0,
+        )])
+        .await
+        .expect("rotated netmap");
+
+    assert!(matches!(
+        magicsock.send(old_key.clone(), b"stale").await,
+        Err(MagicsockError::PeerNotFound)
+    ));
+    assert!(!magicsock
+        .inner
+        .endpoints
+        .read()
+        .unwrap()
+        .contains_key(&old_key));
+    assert!(!magicsock
+        .inner
+        .addr_to_peer
+        .read()
+        .unwrap()
+        .values()
+        .any(|key| key == &old_key));
+    assert!(magicsock
+        .inner
+        .endpoints
+        .read()
+        .unwrap()
+        .contains_key(&new_key));
+}
+
+#[tokio::test]
 async fn netmap_refreshes_peer_disco_key_and_reverse_map() {
     let private_key = NodePrivate::generate();
     let peer_key = NodePrivate::generate().public();
@@ -727,12 +766,20 @@ async fn netmap_refreshes_peer_disco_key_and_reverse_map() {
         .unwrap()
         .insert(rotated_disco.clone(), other_peer.clone());
     magicsock
-        .set_netmap(vec![make_peer(
-            peer_key.clone(),
-            rustscale_key::DiscoPublic::from_raw32([0; 32]),
-            vec![],
-            0,
-        )])
+        .set_netmap(vec![
+            make_peer(
+                peer_key.clone(),
+                rustscale_key::DiscoPublic::from_raw32([0; 32]),
+                vec![],
+                0,
+            ),
+            make_peer(
+                other_peer.clone(),
+                rustscale_key::DiscoPublic::from_raw32([0; 32]),
+                vec![],
+                0,
+            ),
+        ])
         .await
         .unwrap();
     assert_eq!(

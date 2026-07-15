@@ -49,7 +49,7 @@ pub use relay_manager::{
 };
 pub use relay_server::RelayServerExtension;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 #[cfg(any(target_os = "linux", test))]
 use std::io;
@@ -1604,8 +1604,19 @@ impl Magicsock {
     /// Update the peer set from a netmap. Creates/updates per-peer endpoints,
     /// starts disco probing, and sends CallMeMaybe via the peer's home DERP.
     pub async fn set_netmap(&self, peers: Vec<Node>) -> Result<(), MagicsockError> {
-        // Phase 1: update endpoint state under the lock.
-        let probe_list: Vec<(NodePublic, DiscoPublic, Vec<SocketAddr>, i32)> = {
+        let desired: HashSet<NodePublic> = peers
+            .iter()
+            .filter(|peer| !peer.Key.is_zero())
+            .map(|peer| peer.Key.clone())
+            .collect();
+
+        // Phase 1: replace endpoint state under the lock. Keys absent from the
+        // new stable-node snapshot are removed before any new path can use
+        // their direct/DERP routing state.
+        let (probe_list, removed): (
+            Vec<(NodePublic, DiscoPublic, Vec<SocketAddr>, i32)>,
+            Vec<NodePublic>,
+        ) = {
             let mut endpoints = self
                 .inner
                 .endpoints
@@ -1616,6 +1627,14 @@ impl Magicsock {
                 .disco_to_peer
                 .write()
                 .expect("disco_to_peer lock poisoned");
+
+            let removed: Vec<_> = endpoints
+                .keys()
+                .filter(|key| !desired.contains(*key))
+                .cloned()
+                .collect();
+            endpoints.retain(|key, _| desired.contains(key));
+            d2p.retain(|_, key| desired.contains(key));
 
             let mut probes = Vec::new();
             for peer in &peers {
@@ -1676,8 +1695,42 @@ impl Magicsock {
                     );
                 }
             }
-            probes
+            (probes, removed)
         };
+
+        self.inner
+            .addr_to_peer
+            .write()
+            .expect("addr_to_peer lock poisoned")
+            .retain(|_, key| desired.contains(key));
+        {
+            let mut tasks = self
+                .inner
+                .background_tasks
+                .write()
+                .expect("background_tasks lock poisoned");
+            for key in &removed {
+                if let Some(task) = tasks.remove(key) {
+                    task.abort();
+                }
+            }
+        }
+        self.inner
+            .cli_ping_callbacks
+            .write()
+            .expect("cli_ping_callbacks lock poisoned")
+            .retain(|key, _| desired.contains(key));
+        if let Some(relay) = self
+            .inner
+            .relay_manager
+            .read()
+            .expect("relay_manager lock poisoned")
+            .as_ref()
+        {
+            for key in &removed {
+                relay.cancel_work(key.clone());
+            }
+        }
 
         // Phase 2: send disco pings and CallMeMaybe (async, outside the lock).
         // When disable_direct_paths is set, skip all direct-path probing —

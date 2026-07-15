@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use rustscale_drive::{
     AuthenticatedPeer, ConfigError, ConfigStore, Limits, Request, RequestControl, Response, Server,
-    Share, Snapshot,
+    Share, Snapshot, StreamingBody,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -143,6 +143,14 @@ impl Runtime {
         Self::rotate_authorization_locked(&mut epoch);
     }
 
+    pub(crate) fn preflight(
+        &self,
+        peer: &AuthenticatedPeer,
+        request: &Request,
+    ) -> Result<(), Response> {
+        self.server.preflight(peer, request)
+    }
+
     pub(crate) fn handle(
         &self,
         peer: &AuthenticatedPeer,
@@ -150,6 +158,17 @@ impl Runtime {
         control: &RequestControl,
     ) -> Response {
         self.server.handle(peer, request, control)
+    }
+
+    pub(crate) fn handle_streaming_put(
+        &self,
+        peer: &AuthenticatedPeer,
+        request: Request,
+        body: StreamingBody,
+        control: &RequestControl,
+    ) -> Response {
+        self.server
+            .handle_streaming_put(peer, request, body, control)
     }
 }
 

@@ -26,6 +26,7 @@ use rustscale_dns::{
 };
 use rustscale_drive::{AuthenticatedPeer, RequestControl, CAPABILITY_TAILDRIVE};
 use rustscale_filter::Filter;
+use rustscale_key::NodePublic;
 use rustscale_netstack::{Netstack, NetstackStream};
 use rustscale_tailcfg::{DNSConfig, Node, Service, UserID, UserProfile};
 
@@ -42,6 +43,10 @@ const PEERAPI_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3
 /// Existing Taildrop supports files up to 1 GiB; all PeerAPI bodies are
 /// rejected before allocation beyond that protocol limit.
 const MAX_PEERAPI_BODY: usize = 1 << 30;
+const MAX_PEERAPI_CONNECTIONS: usize = 16;
+const MAX_PEERAPI_INFLIGHT_BYTES: usize = 64 * 1024 * 1024;
+const TAILDRIVE_STREAM_CHUNK: usize = 64 * 1024;
+const TAILDRIVE_STREAM_QUEUE: usize = 2;
 
 // ---------------------------------------------------------------------------
 // Port derivation
@@ -147,25 +152,49 @@ pub(crate) struct PeerApiState {
     filter: Arc<std::sync::Mutex<Filter>>,
     /// Disabled-by-default Taildrive configuration and authorization epoch.
     drive: Arc<crate::drive::Runtime>,
+    /// Stable-ID map commit gate and WireGuard source provenance.
+    peer_map: Arc<crate::peer_map::Runtime>,
+    /// Global PeerAPI connection and declared-body admission limits.
+    admission: Arc<PeerApiAdmission>,
     /// Per-label socket TX/RX counter registry (for the `/v0/sockstats`
     /// debug endpoint). `None` when no registry was injected.
     sockstats: Option<Arc<rustscale_sockstats::SockStats>>,
+}
+
+struct PeerApiAdmission {
+    connections: Arc<tokio::sync::Semaphore>,
+    bytes: Arc<tokio::sync::Semaphore>,
+}
+
+impl PeerApiAdmission {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            connections: Arc::new(tokio::sync::Semaphore::new(MAX_PEERAPI_CONNECTIONS)),
+            bytes: Arc::new(tokio::sync::Semaphore::new(MAX_PEERAPI_INFLIGHT_BYTES)),
+        })
+    }
 }
 
 impl PeerApiState {
     /// WhoIs lookup: resolve a remote IP to peer identity.
     #[cfg(test)]
     fn whois(&self, remote_ip: IpAddr) -> Option<WhoIsInfo> {
-        self.authenticated_whois(remote_ip).map(|(whois, _)| whois)
+        let key = self.peer_map.current_owner(remote_ip)?;
+        self.authenticated_whois(remote_ip, &key)
+            .map(|(whois, _)| whois)
     }
 
     /// Resolve identity and node key from the same live peer snapshot. A zero
     /// key is never an authenticated PeerAPI principal.
-    fn authenticated_whois(&self, remote_ip: IpAddr) -> Option<(WhoIsInfo, String)> {
+    fn authenticated_whois(
+        &self,
+        remote_ip: IpAddr,
+        authenticated_key: &NodePublic,
+    ) -> Option<(WhoIsInfo, String)> {
         let peers = self.peers.try_read().ok()?;
-        let peer = peers
-            .iter()
-            .find(|peer| extract_node_ips(peer).contains(&remote_ip))?;
+        let peer = peers.iter().find(|peer| {
+            &peer.Key == authenticated_key && extract_node_ips(peer).contains(&remote_ip)
+        })?;
         if peer.Key.is_zero() {
             return None;
         }
@@ -295,7 +324,9 @@ pub(crate) async fn spawn_peerapi_netstack(
     sockstats: Option<Arc<rustscale_sockstats::SockStats>>,
     filter: Arc<std::sync::Mutex<Filter>>,
     drive: Arc<crate::drive::Runtime>,
+    peer_map: Arc<crate::peer_map::Runtime>,
 ) -> (JoinHandle<()>, Option<u16>) {
+    let admission = PeerApiAdmission::new();
     // Derive the port from the primary IPv4 address.
     let v4 = tailscale_ips.iter().find_map(|ip| match ip {
         IpAddr::V4(v4) => Some(*v4),
@@ -323,6 +354,8 @@ pub(crate) async fn spawn_peerapi_netstack(
                         sockstats: sockstats.clone(),
                         filter: filter.clone(),
                         drive: drive.clone(),
+                        peer_map: peer_map.clone(),
+                        admission: admission.clone(),
                     });
                     let handle = tokio::spawn(serve_netstack_listener(listener, state));
                     // Keep the listener task alive; we return the port.
@@ -352,6 +385,8 @@ pub(crate) async fn spawn_peerapi_netstack(
                         sockstats: sockstats.clone(),
                         filter: filter.clone(),
                         drive: drive.clone(),
+                        peer_map: peer_map.clone(),
+                        admission: admission.clone(),
                     });
                     let handle = tokio::spawn(serve_netstack_listener(listener, state));
                     std::mem::forget(handle);
@@ -388,7 +423,9 @@ pub(crate) async fn spawn_peerapi_tun(
     sockstats: Option<Arc<rustscale_sockstats::SockStats>>,
     filter: Arc<std::sync::Mutex<Filter>>,
     drive: Arc<crate::drive::Runtime>,
+    peer_map: Arc<crate::peer_map::Runtime>,
 ) -> (JoinHandle<()>, Option<u16>) {
+    let admission = PeerApiAdmission::new();
     let state = Arc::new(PeerApiState {
         peers,
         user_profiles,
@@ -400,6 +437,8 @@ pub(crate) async fn spawn_peerapi_tun(
         sockstats,
         filter,
         drive,
+        peer_map,
+        admission,
     });
 
     let mut v4_port: Option<u16> = None;
@@ -480,7 +519,8 @@ async fn handle_connection_netstack(
             return;
         }
     }
-    let conn = PeerApiConn::new(stream, remote_addr, state);
+    let authenticated_key = stream.peer_node_key().cloned();
+    let conn = PeerApiConn::new(stream, remote_addr, authenticated_key, state);
     conn.serve().await;
 }
 
@@ -493,7 +533,11 @@ async fn handle_connection_tcp(
     if !rustscale_tsaddr::is_tailscale_ip(remote_addr.ip()) {
         return;
     }
-    let conn = PeerApiConn::new(stream, Some(remote_addr), state);
+    let authenticated_key = stream
+        .local_addr()
+        .ok()
+        .and_then(|local| state.peer_map.flow_owner(remote_addr, local));
+    let conn = PeerApiConn::new(stream, Some(remote_addr), authenticated_key, state);
     conn.serve().await;
 }
 
@@ -501,23 +545,51 @@ async fn handle_connection_tcp(
 struct PeerApiConn<S> {
     stream: S,
     remote_addr: Option<SocketAddr>,
+    authenticated_key: Option<NodePublic>,
     state: Arc<PeerApiState>,
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> PeerApiConn<S> {
-    fn new(stream: S, remote_addr: Option<SocketAddr>, state: Arc<PeerApiState>) -> Self {
+    fn new(
+        stream: S,
+        remote_addr: Option<SocketAddr>,
+        authenticated_key: Option<NodePublic>,
+        state: Arc<PeerApiState>,
+    ) -> Self {
         Self {
             stream,
             remote_addr,
+            authenticated_key,
             state,
         }
     }
 
     /// Serve a single HTTP request: parse, auth, dispatch, respond.
     async fn serve(mut self) {
-        // WhoIs auth: resolve the remote IP against the netmap.
-        let remote_ip = self.remote_addr.map(|a| a.ip());
-        let authenticated = remote_ip.and_then(|ip| self.state.authenticated_whois(ip));
+        let Ok(_connection_permit) = self.state.admission.connections.clone().try_acquire_owned()
+        else {
+            let _ = write_error_response(
+                &mut self.stream,
+                503,
+                "Service Unavailable",
+                "peerapi connection limit reached",
+            )
+            .await;
+            return;
+        };
+
+        // Bind the transport-authenticated WireGuard key to its current source
+        // address immediately before WhoIs. Source IP alone is never an
+        // identity, including during stable-node key rotation.
+        let map_guard = self.state.peer_map.gate.read().await;
+        let remote_ip = self.remote_addr.map(|address| address.ip());
+        let authenticated = remote_ip.and_then(|ip| {
+            let key = self.authenticated_key.as_ref()?;
+            if self.state.peer_map.current_owner(ip).as_ref() != Some(key) {
+                return None;
+            }
+            self.state.authenticated_whois(ip, key)
+        });
 
         let (whois, node_key, is_self) = match (&authenticated, remote_ip) {
             (Some((info, node_key)), _) if info.found => {
@@ -544,54 +616,167 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerApiConn<S> {
                 return;
             }
         };
+        drop(map_guard);
 
-        // Parse the HTTP request.
-        let req = match tokio::time::timeout(
-            PEERAPI_IO_TIMEOUT,
-            read_request_with_drive_limit(
-                &mut self.stream,
-                self.state.drive.limits().max_request_body,
-            ),
-        )
-        .await
-        {
-            Ok(Ok(r)) => r,
-            Ok(Err(e)) => {
-                let _ = write_error_response(
-                    &mut self.stream,
-                    400,
-                    "Bad Request",
-                    &format!("bad request: {e}"),
-                )
-                .await;
-                return;
-            }
-            Err(_) => {
-                let _ = write_error_response(
-                    &mut self.stream,
-                    408,
-                    "Request Timeout",
-                    "peerapi request deadline exceeded",
-                )
-                .await;
+        // Read only the request head. Taildrive method/path/grants are
+        // authorized before a single body byte is consumed.
+        let mut req =
+            match tokio::time::timeout(PEERAPI_IO_TIMEOUT, read_request_head(&mut self.stream))
+                .await
+            {
+                Ok(Ok(request)) => request,
+                Ok(Err(error)) => {
+                    let _ = write_error_response(
+                        &mut self.stream,
+                        400,
+                        "Bad Request",
+                        &format!("bad request: {error}"),
+                    )
+                    .await;
+                    return;
+                }
+                Err(_) => {
+                    let _ = write_error_response(
+                        &mut self.stream,
+                        408,
+                        "Request Timeout",
+                        "peerapi request deadline exceeded",
+                    )
+                    .await;
+                    return;
+                }
+            };
+        let body_length = match request_content_length(&req) {
+            Ok(length) => length,
+            Err(error) => {
+                let _ = write_error_response(&mut self.stream, 400, "Bad Request", &error).await;
                 return;
             }
         };
-
-        // Dispatch.
-        let resp = dispatch_authenticated(
-            &req,
-            &whois,
-            is_self,
+        let is_drive = req.path_only() == "/v0/drive" || req.path_only().starts_with("/v0/drive/");
+        let source = (
             remote_ip.expect("authenticated PeerAPI connection has a source IP"),
-            &node_key,
-            &self.state,
-        )
-        .await;
+            node_key.as_str(),
+        );
+
+        let resp = if is_drive {
+            match authorize_drive(&req, Some(source), &self.state).await {
+                Err(response) => response,
+                Ok(mut authorized) => {
+                    let body_limit = self.state.drive.limits().max_request_body;
+                    if body_length > body_limit {
+                        PeerApiResponse::new(
+                            413,
+                            "Content Too Large",
+                            "text/plain; charset=utf-8",
+                            b"request body too large".to_vec(),
+                        )
+                    } else {
+                        match self.try_body_budget(body_length) {
+                            Err(response) => response,
+                            Ok(_permit) if req.method == "PUT" => {
+                                stream_authorized_put(
+                                    &mut self.stream,
+                                    authorized,
+                                    body_length,
+                                    &self.state,
+                                )
+                                .await
+                            }
+                            Ok(_permit) => match tokio::time::timeout(
+                                PEERAPI_IO_TIMEOUT,
+                                read_request_body(&mut self.stream, body_length, body_limit),
+                            )
+                            .await
+                            {
+                                Ok(Ok(body)) => {
+                                    authorized.request.body = body;
+                                    run_authorized_drive(authorized, &self.state).await
+                                }
+                                Ok(Err(error)) => PeerApiResponse::new(
+                                    400,
+                                    "Bad Request",
+                                    "text/plain; charset=utf-8",
+                                    error.into_bytes(),
+                                ),
+                                Err(_) => PeerApiResponse::new(
+                                    408,
+                                    "Request Timeout",
+                                    "text/plain; charset=utf-8",
+                                    b"peerapi request deadline exceeded".to_vec(),
+                                ),
+                            },
+                        }
+                    }
+                }
+            }
+        } else {
+            match self.try_body_budget(body_length) {
+                Err(response) => response,
+                Ok(_permit) => match tokio::time::timeout(
+                    PEERAPI_IO_TIMEOUT,
+                    read_request_body(&mut self.stream, body_length, MAX_PEERAPI_BODY),
+                )
+                .await
+                {
+                    Ok(Ok(body)) => {
+                        req.body = body;
+                        dispatch_authenticated(
+                            &req,
+                            &whois,
+                            is_self,
+                            source.0,
+                            source.1,
+                            &self.state,
+                        )
+                        .await
+                    }
+                    Ok(Err(error)) => PeerApiResponse::new(
+                        400,
+                        "Bad Request",
+                        "text/plain; charset=utf-8",
+                        error.into_bytes(),
+                    ),
+                    Err(_) => PeerApiResponse::new(
+                        408,
+                        "Request Timeout",
+                        "text/plain; charset=utf-8",
+                        b"peerapi request deadline exceeded".to_vec(),
+                    ),
+                },
+            }
+        };
 
         // Bound response writes so a stalled peer cannot retain a handler or
         // its request-scoped authorization indefinitely.
         let _ = tokio::time::timeout(PEERAPI_IO_TIMEOUT, resp.write(&mut self.stream)).await;
+    }
+
+    fn try_body_budget(
+        &self,
+        length: usize,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, PeerApiResponse> {
+        let permits = u32::try_from(length).map_err(|_| {
+            PeerApiResponse::new(
+                413,
+                "Content Too Large",
+                "text/plain; charset=utf-8",
+                b"request body too large".to_vec(),
+            )
+        })?;
+        self.state
+            .admission
+            .bytes
+            .clone()
+            .try_acquire_many_owned(permits)
+            .map_err(|_| {
+                PeerApiResponse::new(
+                    503,
+                    "Service Unavailable",
+                    "text/plain; charset=utf-8",
+                    b"peerapi body budget exhausted".to_vec(),
+                )
+            })
     }
 }
 
@@ -693,63 +878,79 @@ async fn read_request<R: AsyncRead + Unpin>(conn: &mut R) -> Result<PeerApiReque
     read_request_with_drive_limit(conn, rustscale_drive::Limits::default().max_request_body).await
 }
 
+#[cfg(test)]
 async fn read_request_with_drive_limit<R: AsyncRead + Unpin>(
     conn: &mut R,
     max_drive_body: usize,
 ) -> Result<PeerApiRequest, String> {
-    let mut buf = Vec::with_capacity(4096);
-    let mut tmp = [0u8; 4096];
+    let mut request = read_request_head(conn).await?;
+    let limit =
+        if request.path_only() == "/v0/drive" || request.path_only().starts_with("/v0/drive/") {
+            max_drive_body
+        } else {
+            MAX_PEERAPI_BODY
+        };
+    request.body = read_request_body(conn, request_content_length(&request)?, limit).await?;
+    Ok(request)
+}
+
+/// Read exactly the HTTP head, one byte at a time, so no request-body byte is
+/// consumed before method/path/capability authorization.
+async fn read_request_head<R: AsyncRead + Unpin>(conn: &mut R) -> Result<PeerApiRequest, String> {
+    let mut head = Vec::with_capacity(1024);
+    let mut byte = [0u8; 1];
     loop {
-        let n = conn
-            .read(&mut tmp)
+        let count = conn
+            .read(&mut byte)
             .await
-            .map_err(|e| format!("read: {e}"))?;
-        if n == 0 {
+            .map_err(|error| format!("read: {error}"))?;
+        if count == 0 {
             return Err("connection closed before headers".into());
         }
-        buf.extend_from_slice(&tmp[..n]);
-        if let Some(end) = find_header_end(&buf) {
-            let head = &buf[..end + 4];
-            let mut body = buf[end + 4..].to_vec();
-            // Read the full Content-Length body if the preview is short.
-            let header_text =
-                std::str::from_utf8(head).map_err(|_| "non-utf8 header".to_string())?;
-            let cl = extract_content_length(header_text)?;
-            let request_target = header_text
-                .split("\r\n")
-                .next()
-                .and_then(|line| line.split_whitespace().nth(1))
-                .ok_or_else(|| "missing request target".to_string())?;
-            let body_limit = if request_target == "/v0/drive"
-                || request_target.starts_with("/v0/drive/")
-                || request_target.starts_with("/v0/drive?")
-            {
-                max_drive_body
-            } else {
-                MAX_PEERAPI_BODY
-            };
-            if cl > body_limit {
-                return Err(format!("request body exceeds {body_limit} bytes"));
-            }
-            while body.len() < cl {
-                let remaining = cl - body.len();
-                let chunk_len = remaining.min(tmp.len());
-                let n = conn
-                    .read(&mut tmp[..chunk_len])
-                    .await
-                    .map_err(|e| format!("read body: {e}"))?;
-                if n == 0 {
-                    return Err("connection closed before complete request body".into());
-                }
-                body.extend_from_slice(&tmp[..n]);
-            }
-            body.truncate(cl);
-            return parse_request_head(head, body);
+        head.push(byte[0]);
+        if head.ends_with(b"\r\n\r\n") {
+            break;
         }
-        if buf.len() > 256 * 1024 {
+        if head.len() > 256 * 1024 {
             return Err("header too large".into());
         }
     }
+    let text = std::str::from_utf8(&head).map_err(|_| "non-utf8 header".to_string())?;
+    let _ = extract_content_length(text)?;
+    parse_request_head(&head, Vec::new())
+}
+
+fn request_content_length(request: &PeerApiRequest) -> Result<usize, String> {
+    match request.header("content-length") {
+        Some(value) => value
+            .parse::<usize>()
+            .map_err(|_| "invalid content-length".to_string()),
+        None => Ok(0),
+    }
+}
+
+async fn read_request_body<R: AsyncRead + Unpin>(
+    conn: &mut R,
+    length: usize,
+    limit: usize,
+) -> Result<Vec<u8>, String> {
+    if length > limit {
+        return Err(format!("request body exceeds {limit} bytes"));
+    }
+    let mut body = Vec::with_capacity(length);
+    let mut chunk = vec![0u8; TAILDRIVE_STREAM_CHUNK];
+    while body.len() < length {
+        let remaining = length - body.len();
+        let count = conn
+            .read(&mut chunk[..remaining.min(TAILDRIVE_STREAM_CHUNK)])
+            .await
+            .map_err(|error| format!("read body: {error}"))?;
+        if count == 0 {
+            return Err("connection closed before complete request body".into());
+        }
+        body.extend_from_slice(&chunk[..count]);
+    }
+    Ok(body)
 }
 
 /// Extract one valid Content-Length value. An absent length means zero;
@@ -777,10 +978,6 @@ fn extract_content_length(header_text: &str) -> Result<usize, String> {
         }
     }
     Ok(content_length.unwrap_or(0))
-}
-
-fn find_header_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
 fn parse_request_head(head: &[u8], body_preview: Vec<u8>) -> Result<PeerApiRequest, String> {
@@ -816,10 +1013,13 @@ fn parse_request_head(head: &[u8], body_preview: Vec<u8>) -> Result<PeerApiReque
         let length = value
             .parse::<usize>()
             .map_err(|_| "invalid content-length".to_string())?;
-        if body_preview.len() != length {
+        if body_preview.is_empty() {
+            Vec::new()
+        } else if body_preview.len() == length {
+            body_preview
+        } else {
             return Err("request body length does not match content-length".into());
         }
-        body_preview
     } else if body_preview.is_empty() {
         Vec::new()
     } else {
@@ -1004,103 +1204,99 @@ async fn dispatch_inner(
     add_security_headers(resp, req)
 }
 
-async fn handle_drive(
+struct AuthorizedDriveRequest {
+    peer: AuthenticatedPeer,
+    request: rustscale_drive::Request,
+    cancellation: tokio_util::sync::CancellationToken,
+}
+
+async fn authorize_drive(
     req: &PeerApiRequest,
     authenticated_source: Option<(IpAddr, &str)>,
     state: &Arc<PeerApiState>,
-) -> PeerApiResponse {
+) -> Result<AuthorizedDriveRequest, PeerApiResponse> {
     let Some((remote_ip, connection_node_key)) = authenticated_source else {
-        return PeerApiResponse::new(
+        return Err(PeerApiResponse::new(
             403,
             "Forbidden",
             "text/plain; charset=utf-8",
             b"Taildrive requires an authenticated peer".to_vec(),
-        );
+        ));
     };
 
-    // Keep identity, peer list, packet-filter grants, and the revocation token
-    // in one map epoch. A map update cannot interleave with this derivation.
+    let _map = state.peer_map.gate.read().await;
     let epoch = state.drive.authorization_read().await;
     if !state.drive.sharing_allowed() || !state.drive.snapshot().enabled() {
-        return PeerApiResponse::new(
+        return Err(PeerApiResponse::new(
             404,
             "Not Found",
             "text/plain; charset=utf-8",
             b"taildrive not enabled".to_vec(),
-        );
+        ));
     }
-
-    let current_node_key = {
-        let peers = state.peers.read().await;
-        peers
-            .iter()
-            .find(|peer| extract_node_ips(peer).contains(&remote_ip) && !peer.Key.is_zero())
-            .map(|peer| peer.Key.to_string())
-    };
-    if current_node_key.as_deref() != Some(connection_node_key) {
-        return PeerApiResponse::new(
+    if state
+        .peer_map
+        .current_owner(remote_ip)
+        .is_none_or(|key| key.to_string() != connection_node_key)
+    {
+        return Err(PeerApiResponse::new(
             403,
             "Forbidden",
             "text/plain; charset=utf-8",
             b"authenticated peer is no longer in the netmap".to_vec(),
-        );
+        ));
     }
-
     let Some(destination_ip) = state
         .tailscale_ips
         .iter()
         .copied()
         .find(|ip| ip.is_ipv4() == remote_ip.is_ipv4())
     else {
-        return PeerApiResponse::new(
+        return Err(PeerApiResponse::new(
             403,
             "Forbidden",
             "text/plain; charset=utf-8",
             b"no matching local Taildrive address".to_vec(),
-        );
+        ));
     };
-    let cap_map = match state.filter.lock() {
-        Ok(filter) => filter.caps_with_values(remote_ip, destination_ip),
-        Err(_) => {
-            return PeerApiResponse::new(
+    let cap_map = state
+        .filter
+        .lock()
+        .map_err(|_| {
+            PeerApiResponse::new(
                 503,
                 "Service Unavailable",
                 "text/plain; charset=utf-8",
                 b"Taildrive authorization is unavailable".to_vec(),
             )
-        }
-    };
-    let Some(grants) = cap_map.get(CAPABILITY_TAILDRIVE) else {
-        return PeerApiResponse::new(
+        })?
+        .caps_with_values(remote_ip, destination_ip);
+    let grants = cap_map.get(CAPABILITY_TAILDRIVE).ok_or_else(|| {
+        PeerApiResponse::new(
             403,
             "Forbidden",
             "text/plain; charset=utf-8",
             b"taildrive not permitted".to_vec(),
-        );
-    };
+        )
+    })?;
     let raw_grants: Vec<Vec<u8>> = grants
         .iter()
         .map(|grant| grant.0.as_bytes().to_vec())
         .collect();
-    let peer = match AuthenticatedPeer::from_capability_grants(
+    let peer = AuthenticatedPeer::from_capability_grants(
         connection_node_key,
         &raw_grants,
         state.drive.limits(),
-    ) {
-        Ok(peer) => peer,
-        Err(error) => {
-            log::warn!("peerapi: rejected malformed signed Taildrive grants: {error}");
-            return PeerApiResponse::new(
-                403,
-                "Forbidden",
-                "text/plain; charset=utf-8",
-                b"invalid Taildrive authorization".to_vec(),
-            );
-        }
-    };
-    let cancellation = crate::drive::Runtime::child_cancellation(&epoch);
-    drop(epoch);
-
+    )
+    .map_err(|error| {
+        log::warn!("peerapi: rejected malformed signed Taildrive grants: {error}");
+        PeerApiResponse::new(
+            403,
+            "Forbidden",
+            "text/plain; charset=utf-8",
+            b"invalid Taildrive authorization".to_vec(),
+        )
+    })?;
     let path = req.path.strip_prefix("/v0/drive").unwrap_or_default();
     let request = rustscale_drive::Request {
         method: req.method.clone(),
@@ -1124,36 +1320,149 @@ async fn handle_drive(
             .collect(),
         body: req.body.clone(),
     };
+    state
+        .drive
+        .preflight(&peer, &request)
+        .map_err(adapt_drive_response)?;
+    let cancellation = crate::drive::Runtime::child_cancellation(&epoch);
+    Ok(AuthorizedDriveRequest {
+        peer,
+        request,
+        cancellation,
+    })
+}
+
+async fn handle_drive(
+    req: &PeerApiRequest,
+    authenticated_source: Option<(IpAddr, &str)>,
+    state: &Arc<PeerApiState>,
+) -> PeerApiResponse {
+    match authorize_drive(req, authenticated_source, state).await {
+        Ok(authorized) => run_authorized_drive(authorized, state).await,
+        Err(response) => response,
+    }
+}
+
+async fn run_authorized_drive(
+    authorized: AuthorizedDriveRequest,
+    state: &Arc<PeerApiState>,
+) -> PeerApiResponse {
+    let AuthorizedDriveRequest {
+        peer,
+        request,
+        cancellation,
+    } = authorized;
     let timeout = state.drive.limits().request_timeout;
     let control = RequestControl::new(cancellation.clone(), std::time::Instant::now() + timeout);
-    // Dropping the dispatch future (connection shutdown/task abort) cancels
-    // the filesystem job even though it runs on the bounded blocking pool.
     let cancellation_guard = cancellation.drop_guard();
     let drive = state.drive.clone();
     let worker = tokio::task::spawn_blocking(move || drive.handle(&peer, request, &control));
-    let response =
-        match tokio::time::timeout(timeout + std::time::Duration::from_secs(1), worker).await {
-            Ok(Ok(response)) => response,
-            Ok(Err(error)) => {
-                log::warn!("peerapi: Taildrive worker failed: {error}");
-                return PeerApiResponse::new(
-                    500,
-                    "Internal Server Error",
-                    "text/plain; charset=utf-8",
-                    b"Taildrive worker failed".to_vec(),
-                );
-            }
-            Err(_) => {
-                return PeerApiResponse::new(
-                    408,
-                    "Request Timeout",
-                    "text/plain; charset=utf-8",
-                    b"Taildrive request deadline exceeded".to_vec(),
-                );
+    let response = await_drive_worker(worker, timeout).await;
+    drop(cancellation_guard);
+    response
+}
+
+async fn stream_authorized_put<R: AsyncRead + Unpin>(
+    stream: &mut R,
+    authorized: AuthorizedDriveRequest,
+    body_length: usize,
+    state: &Arc<PeerApiState>,
+) -> PeerApiResponse {
+    let AuthorizedDriveRequest {
+        peer,
+        request,
+        cancellation,
+    } = authorized;
+    let timeout = state.drive.limits().request_timeout;
+    let deadline = std::time::Instant::now() + timeout;
+    let control = RequestControl::new(cancellation.clone(), deadline);
+    let cancellation_guard = cancellation.clone().drop_guard();
+    let (sender, body) =
+        rustscale_drive::streaming_body_channel(body_length, TAILDRIVE_STREAM_QUEUE);
+    let drive = state.drive.clone();
+    let worker = tokio::task::spawn_blocking(move || {
+        drive.handle_streaming_put(&peer, request, body, &control)
+    });
+    let mut sender = Some(sender);
+    let mut received = 0usize;
+    let mut chunk = vec![0u8; TAILDRIVE_STREAM_CHUNK];
+    let read_result = loop {
+        if received == body_length {
+            break Ok(());
+        }
+        let remaining = body_length - received;
+        let read = tokio::select! {
+            () = cancellation.cancelled() => break Err("Taildrive authorization was revoked".to_string()),
+            result = tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                stream.read(&mut chunk[..remaining.min(TAILDRIVE_STREAM_CHUNK)]),
+            ) => match result {
+                Ok(result) => result.map_err(|error| format!("read body: {error}")),
+                Err(_) => break Err("Taildrive request deadline exceeded".to_string()),
+            },
+        };
+        let count = match read {
+            Ok(0) => break Err("connection closed before complete request body".to_string()),
+            Ok(count) => count,
+            Err(error) => break Err(error),
+        };
+        received += count;
+        let send = sender
+            .as_ref()
+            .expect("stream sender exists")
+            .send(chunk[..count].to_vec());
+        let sent = tokio::select! {
+            () = cancellation.cancelled() => false,
+            result = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), send) => {
+                matches!(result, Ok(Ok(())))
             }
         };
+        if !sent {
+            break Err("Taildrive upload worker stopped or was revoked".to_string());
+        }
+    };
+    drop(sender.take());
+    if let Err(error) = read_result {
+        cancellation.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), worker).await;
+        drop(cancellation_guard);
+        return PeerApiResponse::new(
+            400,
+            "Bad Request",
+            "text/plain; charset=utf-8",
+            error.into_bytes(),
+        );
+    }
+    let response = await_drive_worker(worker, timeout).await;
     drop(cancellation_guard);
+    response
+}
 
+async fn await_drive_worker(
+    worker: tokio::task::JoinHandle<rustscale_drive::Response>,
+    timeout: std::time::Duration,
+) -> PeerApiResponse {
+    match tokio::time::timeout(timeout + std::time::Duration::from_secs(1), worker).await {
+        Ok(Ok(response)) => adapt_drive_response(response),
+        Ok(Err(error)) => {
+            log::warn!("peerapi: Taildrive worker failed: {error}");
+            PeerApiResponse::new(
+                500,
+                "Internal Server Error",
+                "text/plain; charset=utf-8",
+                b"Taildrive worker failed".to_vec(),
+            )
+        }
+        Err(_) => PeerApiResponse::new(
+            408,
+            "Request Timeout",
+            "text/plain; charset=utf-8",
+            b"Taildrive request deadline exceeded".to_vec(),
+        ),
+    }
+}
+
+fn adapt_drive_response(response: rustscale_drive::Response) -> PeerApiResponse {
     let content_type = response
         .headers
         .get("content-type")
@@ -1605,7 +1914,17 @@ mod tests {
     use rustscale_tailcfg::{CapGrant, FilterRule, Node, PeerCapMap, RawMessage, UserProfile};
 
     /// Make a fake `PeerApiState` for testing.
-    fn make_test_state(peers: Vec<Node>, ips: Vec<IpAddr>, exit_node: bool) -> Arc<PeerApiState> {
+    fn make_test_state(
+        mut peers: Vec<Node>,
+        ips: Vec<IpAddr>,
+        exit_node: bool,
+    ) -> Arc<PeerApiState> {
+        for (index, peer) in peers.iter_mut().enumerate() {
+            if peer.ID == 0 {
+                peer.ID = i64::try_from(index + 1).expect("test peer ID");
+            }
+        }
+        let peer_map = crate::peer_map::Runtime::new(&peers).expect("valid test peers");
         Arc::new(PeerApiState {
             peers: Arc::new(RwLock::new(peers)),
             user_profiles: Arc::new(RwLock::new(BTreeMap::new())),
@@ -1617,6 +1936,8 @@ mod tests {
             sockstats: None,
             filter: Arc::new(std::sync::Mutex::new(Filter::allow_none())),
             drive: crate::drive::Runtime::new(),
+            peer_map,
+            admission: PeerApiAdmission::new(),
         })
     }
 
@@ -1693,6 +2014,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn request_head_parser_leaves_taildrive_body_unread() {
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        client
+            .write_all(b"PUT /v0/drive/docs/file HTTP/1.1\r\nContent-Length: 6\r\n\r\nsecret")
+            .await
+            .unwrap();
+        let request = read_request_head(&mut server).await.unwrap();
+        assert_eq!(request.method, "PUT");
+        assert!(request.body.is_empty());
+        let mut body = [0u8; 6];
+        server.read_exact(&mut body).await.unwrap();
+        assert_eq!(&body, b"secret");
+    }
+
+    #[test]
+    fn global_body_budget_bounds_parallel_max_sized_requests() {
+        const MAX_BODY: u32 = 16 * 1024 * 1024;
+        let admission = PeerApiAdmission::new();
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            held.push(
+                admission
+                    .bytes
+                    .clone()
+                    .try_acquire_many_owned(MAX_BODY)
+                    .expect("four max-sized requests fit the global budget"),
+            );
+        }
+        assert!(admission
+            .bytes
+            .clone()
+            .try_acquire_many_owned(MAX_BODY)
+            .is_err());
+        held.pop();
+        assert!(admission
+            .bytes
+            .clone()
+            .try_acquire_many_owned(MAX_BODY)
+            .is_ok());
+    }
+
+    #[tokio::test]
     async fn taildrive_grants_narrow_and_revoke_without_trusting_headers() {
         let (state, _temp, src, node_key) =
             enabled_taildrive_state(Some(r#"{"shares":["docs"],"access":"rw"}"#)).await;
@@ -1763,6 +2126,51 @@ mod tests {
                 .await
                 .status,
             403
+        );
+    }
+
+    #[tokio::test]
+    async fn taildrive_key_rotation_denies_old_key_and_accepts_new_key() {
+        let (state, _temp, src, old_node_key) =
+            enabled_taildrive_state(Some(r#"{"shares":["docs"],"access":"ro"}"#)).await;
+        let whois = drive_whois(src);
+        let request = PeerApiRequest {
+            method: "GET".into(),
+            path: "/v0/drive/docs/hello.txt".into(),
+            headers: vec![],
+            body: vec![],
+        };
+        assert_eq!(
+            dispatch_authenticated(&request, &whois, false, src, &old_node_key, &state)
+                .await
+                .status,
+            200
+        );
+
+        let new_key = rustscale_key::NodePrivate::generate().public();
+        let new_node_key = new_key.to_string();
+        let map_guard = state.peer_map.gate.write().await;
+        let mut epoch = state.drive.authorization_write().await;
+        {
+            let mut peers = state.peers.write().await;
+            peers[0].Key = new_key;
+            state.peer_map.install_locked(&peers).unwrap();
+        }
+        crate::drive::Runtime::rotate_authorization_locked(&mut epoch);
+        drop(epoch);
+        drop(map_guard);
+
+        assert_eq!(
+            dispatch_authenticated(&request, &whois, false, src, &old_node_key, &state)
+                .await
+                .status,
+            403
+        );
+        assert_eq!(
+            dispatch_authenticated(&request, &whois, false, src, &new_node_key, &state)
+                .await
+                .status,
+            200
         );
     }
 
@@ -2340,6 +2748,8 @@ mod tests {
             sockstats: Some(stats),
             filter: Arc::new(std::sync::Mutex::new(Filter::allow_none())),
             drive: crate::drive::Runtime::new(),
+            peer_map: crate::peer_map::Runtime::new(&[]).expect("empty peer map"),
+            admission: PeerApiAdmission::new(),
         });
         let whois = WhoIsInfo {
             found: true,
@@ -2423,6 +2833,7 @@ mod tests {
     #[test]
     fn test_auth_finds_known_peer() {
         let peer = Node {
+            ID: 1,
             Name: "peer.tailnet.ts.net.".into(),
             Key: rustscale_key::NodePrivate::generate().public(),
             Addresses: vec!["100.64.0.2/32".into()],
@@ -2439,6 +2850,8 @@ mod tests {
                 ..Default::default()
             },
         );
+        let peer_map =
+            crate::peer_map::Runtime::new(std::slice::from_ref(&peer)).expect("valid peer map");
         let state = Arc::new(PeerApiState {
             peers: Arc::new(RwLock::new(vec![peer])),
             user_profiles: Arc::new(RwLock::new(profiles)),
@@ -2450,6 +2863,8 @@ mod tests {
             sockstats: None,
             filter: Arc::new(std::sync::Mutex::new(Filter::allow_none())),
             drive: crate::drive::Runtime::new(),
+            peer_map,
+            admission: PeerApiAdmission::new(),
         });
         let result = state.whois("100.64.0.2".parse().unwrap());
         assert!(result.is_some());

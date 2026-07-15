@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use cap_fs_ext::{DirExt, FileTypeExt, FollowSymlinks, OpenOptionsFollowExt, OpenOptionsSyncExt};
 use cap_std::fs::{Dir, File, OpenOptions};
+use tokio::sync::mpsc as tokio_mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::auth::{AuthenticatedPeer, Permission};
@@ -21,6 +22,28 @@ const ALLOW: &str = "OPTIONS, GET, HEAD, PROPFIND, PUT, MKCOL, DELETE, MOVE, COP
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 pub type HeaderMap = BTreeMap<String, String>;
+
+/// Bounded producer/consumer pair for a streamed request body. The receiver is
+/// consumed only on Taildrive's blocking filesystem pool; the async producer
+/// applies backpressure through the bounded channel.
+pub struct StreamingBody {
+    receiver: tokio_mpsc::Receiver<Vec<u8>>,
+    expected_length: usize,
+}
+
+pub fn streaming_body_channel(
+    expected_length: usize,
+    capacity: usize,
+) -> (tokio_mpsc::Sender<Vec<u8>>, StreamingBody) {
+    let (sender, receiver) = tokio_mpsc::channel(capacity.max(1));
+    (
+        sender,
+        StreamingBody {
+            receiver,
+            expected_length,
+        },
+    )
+}
 
 /// A bounded request supplied by an HTTP/PeerAPI adapter.
 #[derive(Clone, Debug)]
@@ -208,14 +231,94 @@ impl Server {
         Self { config, workers }
     }
 
+    /// Authorize method, path, share, and destination without touching a
+    /// request body or filesystem object. PeerAPI adapters call this before
+    /// accepting upload bytes; [`Self::handle`] repeats all checks.
+    pub fn preflight(&self, peer: &AuthenticatedPeer, request: &Request) -> Result<(), Response> {
+        let limits = self.config.limits();
+        let snapshot = self.config.snapshot();
+        if !snapshot.enabled() {
+            return Err(Response::text(404, "taildrive not enabled"));
+        }
+        let parsed = parse_request_path(&request.path, limits.max_path_bytes)
+            .map_err(|_| Response::text(400, "invalid WebDAV path"))?;
+        if !matches!(
+            request.method.as_str(),
+            "OPTIONS" | "PROPFIND" | "GET" | "HEAD" | "PUT" | "MKCOL" | "DELETE" | "MOVE" | "COPY"
+        ) {
+            return Err(Response::text(405, "method not allowed").header("allow", ALLOW));
+        }
+        if request.method == "OPTIONS" {
+            return Ok(());
+        }
+        let Some(share_name) = parsed.share.as_deref() else {
+            return if request.method == "PROPFIND" {
+                Ok(())
+            } else {
+                Err(Response::text(405, "method not allowed").header("allow", ALLOW))
+            };
+        };
+        let permission = peer.permissions().for_share(share_name);
+        if permission == Permission::None {
+            return Err(Response::text(404, "not found"));
+        }
+        if required_permission(&request.method) == Permission::ReadWrite
+            && permission != Permission::ReadWrite
+        {
+            return Err(Response::text(403, "permission denied"));
+        }
+        if !snapshot.shares.contains_key(share_name) {
+            return Err(Response::text(404, "not found"));
+        }
+        if matches!(request.method.as_str(), "MOVE" | "COPY") {
+            let destination = request
+                .header("destination")
+                .ok_or_else(|| Response::text(400, "bad WebDAV request"))?;
+            let destination = parse_request_path(destination, limits.max_path_bytes)
+                .map_err(|_| Response::text(400, "bad WebDAV request"))?;
+            let destination_share = destination
+                .share
+                .as_deref()
+                .ok_or_else(|| Response::text(400, "bad WebDAV request"))?;
+            if destination_share != share_name {
+                return Err(Response::text(502, "cross-share operation is forbidden"));
+            }
+            if peer.permissions().for_share(destination_share) != Permission::ReadWrite {
+                return Err(Response::text(403, "permission denied"));
+            }
+        }
+        Ok(())
+    }
+
     /// Handle one request using one immutable configuration snapshot.
-    ///
-    /// `peer` must have been produced from the authenticated connection's
-    /// netmap node and capability values, never from HTTP request data.
     pub fn handle(
         &self,
         peer: &AuthenticatedPeer,
         request: Request,
+        control: &RequestControl,
+    ) -> Response {
+        self.handle_with_stream(peer, request, None, control)
+    }
+
+    /// Handle a PUT whose body arrives through a bounded channel.
+    pub fn handle_streaming_put(
+        &self,
+        peer: &AuthenticatedPeer,
+        request: Request,
+        body: StreamingBody,
+        control: &RequestControl,
+    ) -> Response {
+        if request.method != "PUT" {
+            return Response::text(400, "streaming body is only valid for PUT");
+        }
+        self.handle_with_stream(peer, request, Some(body), control)
+    }
+
+    fn handle_with_stream(
+        &self,
+        peer: &AuthenticatedPeer,
+        request: Request,
+        streaming_body: Option<StreamingBody>,
         control: &RequestControl,
     ) -> Response {
         if let Err(interrupted) = control.check() {
@@ -226,7 +329,7 @@ impl Server {
         let peer = peer.clone();
         let worker_control = control.clone();
         let job = Box::new(move || {
-            let response = server.handle_on_worker(&peer, request, &worker_control);
+            let response = server.handle_on_worker(&peer, request, streaming_body, &worker_control);
             let _ = sender.send(response);
         });
         match self.workers.try_execute(job) {
@@ -256,13 +359,18 @@ impl Server {
         &self,
         peer: &AuthenticatedPeer,
         request: Request,
+        streaming_body: Option<StreamingBody>,
         control: &RequestControl,
     ) -> Response {
         if let Err(interrupted) = control.check() {
             return interrupted.response();
         }
         let limits = self.config.limits();
-        if request.body.len() > limits.max_request_body {
+        if request.body.len() > limits.max_request_body
+            || streaming_body
+                .as_ref()
+                .is_some_and(|body| body.expected_length > limits.max_request_body)
+        {
             return Response::text(413, "request body too large");
         }
         let snapshot = self.config.snapshot();
@@ -303,7 +411,10 @@ impl Server {
         let result = match request.method.as_str() {
             "GET" => self.get(root, &parsed, false, control),
             "HEAD" => self.get(root, &parsed, true, control),
-            "PUT" => Self::put(root, &parsed, &request.body, control),
+            "PUT" => match streaming_body {
+                Some(body) => Self::put_streaming(root, &parsed, body, control),
+                None => Self::put(root, &parsed, &request.body, control),
+            },
             "MKCOL" => Self::mkcol(root, &parsed, &request.body, control),
             "DELETE" => Self::delete(root, &parsed, control),
             "MOVE" => self.move_or_copy(peer, &snapshot, root, &parsed, &request, false, control),
@@ -371,6 +482,28 @@ impl Server {
             Err(error) => return Err(error.into()),
         };
         atomic_write(&parent, &leaf, body, control)?;
+        Ok(Response::new(if existed { 204 } else { 201 }).header("content-length", "0"))
+    }
+
+    fn put_streaming(
+        root: &ShareRoot,
+        parsed: &ParsedPath,
+        body: StreamingBody,
+        control: &RequestControl,
+    ) -> Result<Response, OperationError> {
+        if parsed.relative.as_os_str().is_empty() {
+            return Err(OperationError::MethodNotAllowed);
+        }
+        let (parent, leaf) = open_parent_nofollow(&root.dir, &parsed.relative)?;
+        let existed = match parent.symlink_metadata(&leaf) {
+            Ok(metadata) if metadata.file_type().is_symlink() || metadata.is_dir() => {
+                return Err(OperationError::Forbidden)
+            }
+            Ok(_) => true,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error.into()),
+        };
+        atomic_write_streaming(&parent, &leaf, body, control)?;
         Ok(Response::new(if existed { 204 } else { 201 }).header("content-length", "0"))
     }
 
@@ -650,6 +783,50 @@ fn atomic_write(
     write_result
 }
 
+fn atomic_write_streaming(
+    parent: &Dir,
+    destination: &OsStr,
+    mut body: StreamingBody,
+    control: &RequestControl,
+) -> Result<(), OperationError> {
+    let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temp = OsString::from(format!(
+        ".rustscale-taildrive-{}-{sequence}.tmp",
+        std::process::id()
+    ));
+    let mut options = OpenOptions::new();
+    options
+        .write(true)
+        .create_new(true)
+        .follow(FollowSymlinks::No);
+    let mut file = parent.open_with(&temp, &options)?;
+    let write_result = (|| {
+        let mut received = 0usize;
+        while let Some(chunk) = body.receiver.blocking_recv() {
+            control.check()?;
+            received = received
+                .checked_add(chunk.len())
+                .ok_or(OperationError::RequestTooLarge)?;
+            if received > body.expected_length {
+                return Err(OperationError::RequestTooLarge);
+            }
+            file.write_all(&chunk)?;
+        }
+        if received != body.expected_length {
+            return Err(OperationError::IncompleteBody);
+        }
+        file.sync_all()?;
+        control.check()?;
+        drop(file);
+        parent.rename(&temp, parent, destination)?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = parent.remove_file(&temp);
+    }
+    write_result
+}
+
 #[derive(Clone)]
 struct Property {
     href: String,
@@ -815,6 +992,8 @@ enum OperationError {
     UnsupportedMediaType,
     PreconditionFailed,
     CrossShare,
+    RequestTooLarge,
+    IncompleteBody,
     ResponseTooLarge,
     TooManyEntries,
 }
@@ -845,6 +1024,8 @@ impl OperationError {
             Self::UnsupportedMediaType => Response::text(415, "MKCOL body is not supported"),
             Self::PreconditionFailed => Response::text(412, "destination exists"),
             Self::CrossShare => Response::text(502, "cross-share operation is forbidden"),
+            Self::RequestTooLarge => Response::text(413, "request body too large"),
+            Self::IncompleteBody => Response::text(400, "incomplete request body"),
             Self::ResponseTooLarge => Response::text(507, "response exceeds configured limit"),
             Self::TooManyEntries => Response::text(507, "directory contains too many entries"),
             Self::Io(error) => match error.kind() {
@@ -1117,6 +1298,49 @@ mod tests {
             );
             assert_eq!(copy.status, 403);
             assert!(started.elapsed() < Duration::from_secs(1));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn many_max_sized_puts_stream_through_bounded_queues() {
+        const REQUESTS: usize = 8;
+        const BODY_SIZE: usize = 16 * 1024 * 1024;
+        const CHUNK_SIZE: usize = 64 * 1024;
+
+        let harness = Harness::new();
+        let mut workers = Vec::new();
+        let mut producers = Vec::new();
+        for index in 0..REQUESTS {
+            let (sender, body) = streaming_body_channel(BODY_SIZE, 2);
+            let server = harness.server.clone();
+            let peer = harness.read_write.clone();
+            workers.push(tokio::task::spawn_blocking(move || {
+                server.handle_streaming_put(
+                    &peer,
+                    Request::new("PUT", format!("/docs/stress-{index}.bin")),
+                    body,
+                    &RequestControl::for_limits(server.config.limits()),
+                )
+            }));
+            producers.push(tokio::spawn(async move {
+                for _ in 0..BODY_SIZE / CHUNK_SIZE {
+                    if sender.send(vec![0x5a; CHUNK_SIZE]).await.is_err() {
+                        break;
+                    }
+                }
+            }));
+        }
+        for producer in producers {
+            producer.await.unwrap();
+        }
+        for (index, worker) in workers.into_iter().enumerate() {
+            assert_eq!(worker.await.unwrap().status, 201);
+            assert_eq!(
+                std::fs::metadata(harness.root.join(format!("stress-{index}.bin")))
+                    .unwrap()
+                    .len(),
+                BODY_SIZE as u64
+            );
         }
     }
 

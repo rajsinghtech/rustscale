@@ -27,6 +27,7 @@ pub(crate) async fn run_tun_pump(
     packet_drops: Arc<AtomicU64>,
     cancel: Arc<CancelToken>,
     capture: crate::capture::CaptureSlot,
+    peer_map: Arc<crate::peer_map::Runtime>,
 ) {
     // Read once so a running pump cannot change scheduling or buffer
     // ownership mid-flight.  Presence is deliberately the opt-in contract.
@@ -44,6 +45,7 @@ pub(crate) async fn run_tun_pump(
             packet_drops,
             cancel,
             capture,
+            peer_map,
             outbound_send_pipeline,
         )
         .await;
@@ -81,6 +83,7 @@ pub(crate) async fn run_tun_pump(
                 &packet_drops,
                 &capture,
                 &cancel,
+                &peer_map,
                 &mut inbound,
                 outbound_sender.as_mut(),
             )
@@ -98,7 +101,7 @@ pub(crate) async fn run_tun_pump(
                     Ok(()) => {
                         send_tun_batch_maybe_pipelined(
                             &magicsock, &wg_tunnels, &route_table, &filter,
-                            batch.packets(), &mut outbound, &capture, outbound_sender.as_mut(),
+                            batch.packets(), &mut outbound, &capture, &peer_map, outbound_sender.as_mut(),
                         ).await;
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -125,6 +128,7 @@ pub(crate) async fn run_tun_pump(
                         &packet_drops,
                         &capture,
                         &cancel,
+                        &peer_map,
                         &mut inbound,
                         outbound_sender.as_mut(),
                     )
@@ -140,6 +144,7 @@ pub(crate) async fn run_tun_pump(
                 if !flush_outbound_before_competing_send(outbound_sender.as_mut()).await {
                     break;
                 }
+                let _map = peer_map.gate.read().await;
                 tick_wg_timers(&magicsock, &wg_tunnels).await;
             }
         }
@@ -177,13 +182,17 @@ async fn process_tun_inbound_batch(
     packet_drops: &Arc<AtomicU64>,
     capture: &crate::capture::CaptureSlot,
     cancel: &CancelToken,
+    peer_map: &crate::peer_map::Runtime,
     inbound: &mut InboundBatchScratch,
     outbound_sender: Option<&mut OutboundSendPipeline>,
 ) -> bool {
+    let map_guard = peer_map.gate.read().await;
     if !collect_tun_inbound_batch(wg_tunnels, inbound, cancel).await {
         return false;
     }
+    authorize_tun_inbound_batch(peer_map, packet_drops, inbound);
     filter_tun_inbound_batch(filter, packet_drops, capture, inbound);
+    drop(map_guard);
     // Normal transport data only writes the TUN and must not serialize the
     // outbound pipeline. Fence precisely before a generated reply could
     // bypass the sender task.
@@ -217,6 +226,7 @@ async fn run_tun_pump_pipeline(
     packet_drops: Arc<AtomicU64>,
     cancel: Arc<CancelToken>,
     capture: crate::capture::CaptureSlot,
+    peer_map: Arc<crate::peer_map::Runtime>,
     outbound_send_pipeline: bool,
 ) {
     run_tun_pump_pipeline_inner(
@@ -229,6 +239,7 @@ async fn run_tun_pump_pipeline(
         packet_drops,
         cancel,
         capture,
+        peer_map,
         outbound_send_pipeline,
         #[cfg(test)]
         None,
@@ -249,6 +260,7 @@ async fn run_tun_pump_pipeline_inner(
     packet_drops: Arc<AtomicU64>,
     cancel: Arc<CancelToken>,
     capture: crate::capture::CaptureSlot,
+    peer_map: Arc<crate::peer_map::Runtime>,
     outbound_send_pipeline: bool,
     #[cfg(test)] opened_observer: Option<mpsc::UnboundedSender<()>>,
     #[cfg(test)] timer_entered_observer: Option<mpsc::UnboundedSender<()>>,
@@ -299,7 +311,7 @@ async fn run_tun_pump_pipeline_inner(
                 result = tun.read_batch(&mut batch) => match result {
                     Ok(()) => {
                         send_tun_batch_maybe_pipelined(&magicsock, &wg_tunnels, &route_table, &filter,
-                            batch.packets(), &mut outbound, &capture, outbound_sender.as_mut()).await;
+                            batch.packets(), &mut outbound, &capture, &peer_map, outbound_sender.as_mut()).await;
                         continue;
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
@@ -315,6 +327,7 @@ async fn run_tun_pump_pipeline_inner(
                     if !flush_outbound_before_competing_send(outbound_sender.as_mut()).await {
                         break 'pump;
                     }
+                    let _map = peer_map.gate.read().await;
                     if !tick_wg_timers_pipeline_inner(&magicsock, &wg_tunnels, &cancel,
                         #[cfg(test)] timer_entered_observer.as_ref()).await {
                         break 'pump;
@@ -368,10 +381,13 @@ async fn run_tun_pump_pipeline_inner(
                 false
             };
 
+            let map_guard = peer_map.gate.read().await;
             if !commit_or_scalar_tun_inbound_batch(&wg_tunnels, &mut current, &cancel).await {
                 break 'pump;
             }
+            authorize_tun_inbound_batch(&peer_map, &packet_drops, &mut current);
             filter_tun_inbound_batch(&filter, &packet_drops, &capture, &mut current);
+            drop(map_guard);
             current.datagrams.clear();
             if !flush_outbound_before_replies(outbound_sender.as_mut(), &current).await {
                 break 'pump;
@@ -464,7 +480,7 @@ async fn run_tun_pump_pipeline_inner(
                 PostEmptyReady::Read(Ok(())) => {
                     tokio::select! {
                         () = send_tun_batch_maybe_pipelined(&magicsock, &wg_tunnels, &route_table, &filter,
-                            batch.packets(), &mut outbound, &capture, outbound_sender.as_mut()) => {}
+                            batch.packets(), &mut outbound, &capture, &peer_map, outbound_sender.as_mut()) => {}
                         () = cancel.cancelled() => break 'pump,
                     }
                 }
@@ -478,6 +494,7 @@ async fn run_tun_pump_pipeline_inner(
                     if !flush_outbound_before_competing_send(outbound_sender.as_mut()).await {
                         break 'pump;
                     }
+                    let _map = peer_map.gate.read().await;
                     if !tick_wg_timers_pipeline_inner(
                         &magicsock,
                         &wg_tunnels,
@@ -1015,6 +1032,35 @@ async fn commit_or_scalar_tun_inbound_batch(
     !cancel.is_cancelled()
 }
 
+/// Enforce that each decrypted packet's source address is currently owned by
+/// the exact WireGuard key that opened it, then retain TCP SYN provenance for
+/// TUN PeerAPI accepts. This runs immediately before the packet filter.
+fn authorize_tun_inbound_batch(
+    peer_map: &crate::peer_map::Runtime,
+    packet_drops: &Arc<AtomicU64>,
+    inbound: &mut InboundBatchScratch,
+) {
+    debug_assert_eq!(inbound.plaintext.len(), inbound.plaintext_peers.len());
+    let mut source = 0;
+    let mut retained = 0;
+    inbound.plaintext.retain_mut(|packet| {
+        let peer = &inbound.plaintext_peers[source];
+        let keep = peer_map.packet_source_matches(peer, packet);
+        if keep {
+            peer_map.record_packet(peer, packet);
+            if retained != source {
+                inbound.plaintext_peers[retained] = peer.clone();
+            }
+            retained += 1;
+        } else {
+            packet_drops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        source += 1;
+        keep
+    });
+    inbound.plaintext_peers.truncate(retained);
+}
+
 /// Filter and stably compact plaintext after every tunnel lock has been
 /// released. Capture sees each accepted packet before a Linux GRO write can
 /// mutate it; the parallel peer vector is compacted in the same stable order.
@@ -1434,8 +1480,10 @@ async fn send_tun_batch_maybe_pipelined(
     packets: &[Vec<u8>],
     scratch: &mut OutboundBatchScratch,
     capture: &crate::capture::CaptureSlot,
+    peer_map: &crate::peer_map::Runtime,
     sender: Option<&mut OutboundSendPipeline>,
 ) {
+    let _map = peer_map.gate.read().await;
     if let Some(sender) = sender {
         send_tun_batch_pipeline(
             wg_tunnels,
@@ -2526,6 +2574,13 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             cancel.clone(),
             crate::capture::new_slot(),
+            crate::peer_map::Runtime::new(&[rustscale_tailcfg::Node {
+                ID: 1,
+                Key: source_public.clone(),
+                Addresses: vec!["100.64.0.1/32".into()],
+                ..Default::default()
+            }])
+            .expect("peer map"),
             false,
         ));
         tokio::task::yield_now().await;
@@ -2688,6 +2743,13 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             cancel.clone(),
             crate::capture::new_slot(),
+            crate::peer_map::Runtime::new(&[rustscale_tailcfg::Node {
+                ID: 1,
+                Key: source_public.clone(),
+                Addresses: vec!["100.64.0.1/32".into()],
+                ..Default::default()
+            }])
+            .expect("peer map"),
             false,
             Some(opened_tx),
             Some(timer_tx),

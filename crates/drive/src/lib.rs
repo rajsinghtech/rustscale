@@ -20,7 +20,9 @@ mod path;
 
 pub use auth::{AuthError, AuthenticatedPeer, Permission, Permissions};
 pub use config::{ConfigError, ConfigStore, Limits, Share, Snapshot};
-pub use http::{HeaderMap, Request, RequestControl, Response, Server};
+pub use http::{
+    streaming_body_channel, HeaderMap, Request, RequestControl, Response, Server, StreamingBody,
+};
 pub use path::{encode_path_component, PathError};
 
 /// Peer capability carrying Taildrive share grants.

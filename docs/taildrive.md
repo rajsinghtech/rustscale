@@ -31,7 +31,15 @@ surface. It was compared with Tailscale's `drive/`, `feature/drive`,
 ### Authorization and revocation
 
 - `/v0/drive` is dispatched by both netstack and TUN PeerAPI servers only after
-  connection WhoIs resolves a non-zero node key from the live peer map.
+  the WireGuard key that decrypted the TCP SYN is preserved through the
+  userspace stack/TUN flow table and exactly matches the live owner of the
+  source address. Source IP, WhoIs output, and client headers alone cannot
+  establish peer identity.
+- Peer updates reconcile by stable `Node.ID`. Key/address rotation atomically
+  replaces address ownership, WireGuard tunnels, magicsock direct/DERP/relay
+  state, routes, filter grants, and Taildrive authorization. Duplicate IDs,
+  keys, invalid addresses, and duplicate address ownership fail closed. Old
+  keys lose their tunnel and send paths and cannot authorize after rotation.
 - Access grants come exclusively from the signed packet filter's
   `CapGrant.CapMap["tailscale.com/cap/drive"]` values for the authenticated
   source IP and a same-family local node IP, matching upstream `PeerCaps` flow.
@@ -57,17 +65,22 @@ surface. It was compared with Tailscale's `drive/`, `feature/drive`,
 - Strict origin-form, UTF-8, and percent-decoded path handling rejects
   traversal, encoded separators, ambiguous share aliases, non-portable device
   names, symbolic links, and absolute/cross-share destinations.
-- PeerAPI enforces strict Content-Length framing, rejects transfer encoding,
-  duplicate or malformed lengths, incomplete bodies, and oversized Taildrive
-  bodies before allocation. Connection reads/writes and filesystem operations
-  have deadlines; map change, task cancellation, and connection-task teardown
-  cancel request-scoped work.
+- PeerAPI reads only the HTTP head until Taildrive method, path, destination,
+  live key/address ownership, and signed grant checks pass. It enforces strict
+  Content-Length framing, rejects transfer encoding, duplicate or malformed
+  lengths, incomplete bodies, and oversized Taildrive bodies before upload.
+  Global connection and declared-body semaphores bound aggregate PeerAPI work.
+  Connection reads/writes and filesystem operations have deadlines; map
+  change, task cancellation, and connection-task teardown cancel
+  request-scoped work.
 - Configurable request/grant/path/body/response/directory limits are enforced.
   Blocking filesystem work uses a fixed worker count and bounded queue.
   FIFOs, devices, sockets, reparse points, and symlink sources are rejected.
-- Uploads use same-directory temporary files, `sync_all`, a final cancellation
-  check, and rename. Cancellation after sync cannot publish the destination,
-  and failed uploads remove their temporary file.
+- PUT bodies stream in 64 KiB chunks through a two-slot channel to the bounded
+  filesystem pool; a full-body clone is never made. Uploads use same-directory
+  temporary files, `sync_all`, a final cancellation check, and rename.
+  Cancellation after sync cannot publish the destination, and failed or
+  truncated uploads remove their temporary file.
 
 ### LocalAPI
 
@@ -92,7 +105,10 @@ complete capability revocation, forged grant headers, disabled startup,
 read-only LocalAPI mutation denial, failed-config atomicity, bounded parsing,
 request cancellation, deterministic root replacement, FIFO/socket rejection,
 worker saturation, post-sync cancellation, traversal, symlink escape,
-oversized requests, and malicious `Destination` values.
+oversized requests, malicious `Destination` values, body-before-authorization
+framing, aggregate byte admission, old-key denial/new-key success, tunnel/send
+path removal on rotation, duplicate address ownership, and eight concurrent
+16 MiB streaming uploads.
 
 ## Deferred
 

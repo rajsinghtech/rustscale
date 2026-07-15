@@ -3537,6 +3537,7 @@ version = "0.1.1"
 dependencies = [
  "bytes",
  "rustscale-key",
+ "rustscale-packet",
  "rustscale-wg",
  "smoltcp",
  "thiserror 1.0.69",
@@ -3907,6 +3908,7 @@ dependencies = [
  "rustscale-netmon",
  "rustscale-netns",
  "rustscale-netstack",
+ "rustscale-packet",
  "rustscale-portlist",
  "rustscale-portmapper",
  "rustscale-posture",

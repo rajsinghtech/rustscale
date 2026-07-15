@@ -201,6 +201,7 @@ impl Server {
             b.packet_drops.clone(),
             b.cancel.clone(),
             capture.clone(),
+            b.peer_map.clone(),
         ));
 
         // Map-stream update task (peer/route deltas).
@@ -234,6 +235,7 @@ impl Server {
             b.filter.clone(),
             b.named_filters.clone(),
             self.drive.clone(),
+            b.peer_map.clone(),
             b.tailscale_ips.clone(),
             b.control_url.clone(),
             self.config.accept_routes,
@@ -311,6 +313,7 @@ impl Server {
             Some(b.sockstats.clone()),
             b.filter.clone(),
             self.drive.clone(),
+            b.peer_map.clone(),
         )
         .await;
         tasks.push(peerapi_task);
@@ -574,6 +577,7 @@ impl Server {
             netlog: b.netlog,
             data_plane: DataPlane::Netstack(netstack),
             peers: b.peers,
+            peer_map: b.peer_map,
             routecheck: b.routecheck,
             route_table: b.route_table,
             router: None,
@@ -723,6 +727,7 @@ impl Server {
             b.packet_drops.clone(),
             b.cancel.clone(),
             capture.clone(),
+            b.peer_map.clone(),
         ));
 
         // Periodic endpoint update (Bug 4).
@@ -771,6 +776,7 @@ impl Server {
             b.filter.clone(),
             b.named_filters.clone(),
             self.drive.clone(),
+            b.peer_map.clone(),
             b.tailscale_ips.clone(),
             b.control_url.clone(),
             self.config.accept_routes,
@@ -815,6 +821,7 @@ impl Server {
             Some(b.sockstats.clone()),
             b.filter.clone(),
             self.drive.clone(),
+            b.peer_map.clone(),
         )
         .await;
 
@@ -1113,6 +1120,7 @@ impl Server {
             netlog: b.netlog,
             data_plane: DataPlane::Tun,
             peers: b.peers,
+            peer_map: b.peer_map,
             routecheck: b.routecheck,
             route_table: b.route_table,
             router,
@@ -2032,6 +2040,11 @@ impl Server {
         if peers.is_empty() && !map_resp.PeersChanged.is_empty() {
             peers = map_resp.PeersChanged.clone();
         }
+        // Validate stable IDs, keys, addresses, and address ownership before
+        // any peer-derived transport state becomes live.
+        let peer_map = crate::peer_map::Runtime::new(&peers)
+            .map_err(|error| TsnetError::InvalidNetmap(error.to_string()))?;
+
         // Install self-node capabilities from the first signed netmap before
         // PeerAPI starts. Taildrive remains disabled unless `drive:share` is
         // present; a needs-login LocalAPI cannot pre-authorize itself.
@@ -2197,6 +2210,7 @@ impl Server {
             wg_recv,
             wg_tunnels,
             peers: peers_arc,
+            peer_map,
             routecheck,
             route_table,
             cancel,

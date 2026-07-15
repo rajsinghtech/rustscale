@@ -20,6 +20,7 @@ pub(crate) async fn run_netstack_pump(
     packet_drops: Arc<AtomicU64>,
     cancel: Arc<CancelToken>,
     capture: crate::capture::CaptureSlot,
+    peer_map: Arc<crate::peer_map::Runtime>,
 ) {
     let tx_notify = netstack.tx_notify();
     let mut wg_timer = tokio::time::interval(std::time::Duration::from_millis(250));
@@ -37,7 +38,7 @@ pub(crate) async fn run_netstack_pump(
                 if let Some(batch) = result {
                     handle_inbound_wg_batch(
                         &magicsock, &wg_tunnels, batch, &netstack, &filter,
-                        &packet_drops, &capture,
+                        &packet_drops, &capture, &peer_map,
                     ).await;
 
                     // Preserve the former scheduler-turn burst drain, now in
@@ -46,7 +47,7 @@ pub(crate) async fn run_netstack_pump(
                     while let Ok(more) = wg_recv.try_recv() {
                         handle_inbound_wg_batch(
                             &magicsock, &wg_tunnels, more, &netstack, &filter,
-                            &packet_drops, &capture,
+                            &packet_drops, &capture, &peer_map,
                         ).await;
                     }
                 } else {
@@ -73,10 +74,12 @@ pub(crate) async fn run_netstack_pump(
                 crate::capture::CapturePath::SynthesizedToPeer,
                 &pkt,
             );
+            let _map = peer_map.gate.read().await;
             encapsulate_and_send(&magicsock, &wg_tunnels, &route_table, &pkt).await;
             drained += 1;
         }
 
+        let _map = peer_map.gate.read().await;
         tick_wg_timers(&magicsock, &wg_tunnels).await;
     }
 }
@@ -91,9 +94,15 @@ async fn handle_inbound_wg_batch(
     filter: &std::sync::Mutex<Filter>,
     packet_drops: &AtomicU64,
     capture: &crate::capture::CaptureSlot,
+    peer_map: &crate::peer_map::Runtime,
 ) {
+    let _map = peer_map.gate.read().await;
     let datagrams = batch.into_datagrams();
-    handle_inbound_wg_datagrams(magicsock, wg_tunnels, &datagrams, |pt| {
+    handle_inbound_wg_datagrams(magicsock, wg_tunnels, &datagrams, |peer, pt| {
+        if !peer_map.packet_source_matches(&peer, &pt) {
+            packet_drops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
         let dropped = {
             let mut filt = filter.lock().unwrap();
             filt.check_in(&pt).is_drop()
@@ -107,7 +116,7 @@ async fn handle_inbound_wg_batch(
             crate::capture::CapturePath::SynthesizedToLocal,
             &pt,
         );
-        netstack.push_rx(pt);
+        netstack.push_rx_from(pt, peer);
     })
     .await;
 }
@@ -119,11 +128,11 @@ async fn handle_inbound_wg_datagrams(
     magicsock: &Magicsock,
     wg_tunnels: &RwLock<HashMap<NodePublic, Arc<Mutex<WgTunn>>>>,
     datagrams: &[rustscale_magicsock::WgDatagram],
-    deliver: impl Fn(Vec<u8>),
+    deliver: impl Fn(NodePublic, Vec<u8>),
 ) {
     for dgram in datagrams {
-        handle_inbound_wg(magicsock, wg_tunnels, dgram, |pt| {
-            deliver(pt);
+        handle_inbound_wg(magicsock, wg_tunnels, dgram, |peer, pt| {
+            deliver(peer, pt);
         })
         .await;
     }
@@ -134,7 +143,7 @@ async fn handle_inbound_wg(
     magicsock: &Magicsock,
     wg_tunnels: &RwLock<HashMap<NodePublic, Arc<Mutex<WgTunn>>>>,
     dgram: &rustscale_magicsock::WgDatagram,
-    deliver: impl Fn(Vec<u8>),
+    deliver: impl Fn(NodePublic, Vec<u8>),
 ) {
     let tunn = {
         let tunnels = wg_tunnels.read().await;
@@ -150,7 +159,7 @@ async fn handle_inbound_wg(
         };
         if let Ok(decap) = decap_result {
             if let Some(pt) = decap.plaintext {
-                deliver(pt);
+                deliver(dgram.peer.clone(), pt);
             }
             for reply in decap.replies {
                 let _ = magicsock.send(dgram.peer.clone(), &reply).await;
@@ -358,7 +367,7 @@ mod tests {
         let tunnels = RwLock::new(HashMap::from([(source_public, receiver)]));
         let batched_plaintext = Arc::new(std::sync::Mutex::new(Vec::new()));
         let batched_delivery = batched_plaintext.clone();
-        handle_inbound_wg_datagrams(&magicsock, &tunnels, &batch, move |packet| {
+        handle_inbound_wg_datagrams(&magicsock, &tunnels, &batch, move |_node_key, packet| {
             batched_delivery.lock().unwrap().push(packet);
         })
         .await;
@@ -366,13 +375,84 @@ mod tests {
         let scalar_plaintext = Arc::new(std::sync::Mutex::new(Vec::new()));
         for datagram in scalar {
             let scalar_delivery = scalar_plaintext.clone();
-            handle_inbound_wg_datagrams(&magicsock, &tunnels, &[datagram], move |packet| {
-                scalar_delivery.lock().unwrap().push(packet);
-            })
+            handle_inbound_wg_datagrams(
+                &magicsock,
+                &tunnels,
+                &[datagram],
+                move |_node_key, packet| {
+                    scalar_delivery.lock().unwrap().push(packet);
+                },
+            )
             .await;
         }
 
         assert_eq!(*batched_plaintext.lock().unwrap(), plaintext);
         assert_eq!(*scalar_plaintext.lock().unwrap(), plaintext);
+    }
+
+    #[tokio::test]
+    async fn wireguard_rotation_drops_old_ciphertext_and_opens_new_key() {
+        let local_private = NodePrivate::generate();
+        let old_private = NodePrivate::generate();
+        let old_public = old_private.public();
+        let local_public = local_private.public();
+        let old_sender = Arc::new(Mutex::new(
+            WgTunn::new(&old_private, &local_public, 10).expect("old sender"),
+        ));
+        let old_receiver = Arc::new(Mutex::new(
+            WgTunn::new(&local_private, &old_public, 11).expect("old receiver"),
+        ));
+        establish_tunnels(&old_sender, &old_receiver).await;
+        let packet = vec![
+            0x45, 0, 0, 20, 0, 1, 0, 0, 64, 17, 0, 0, 100, 64, 0, 1, 100, 64, 0, 2,
+        ];
+        let stale = rustscale_magicsock::WgDatagram {
+            peer: old_public.clone(),
+            data: encrypt(&old_sender, &packet).await.into(),
+        };
+
+        let new_private = NodePrivate::generate();
+        let new_public = new_private.public();
+        let new_sender = Arc::new(Mutex::new(
+            WgTunn::new(&new_private, &local_public, 12).expect("new sender"),
+        ));
+        let new_receiver = Arc::new(Mutex::new(
+            WgTunn::new(&local_private, &new_public, 13).expect("new receiver"),
+        ));
+        establish_tunnels(&new_sender, &new_receiver).await;
+        let fresh = rustscale_magicsock::WgDatagram {
+            peer: new_public.clone(),
+            data: encrypt(&new_sender, &packet).await.into(),
+        };
+
+        let (magicsock, _receive) = Magicsock::new(rustscale_magicsock::MagicsockConfig {
+            private_key: local_private,
+            disco_key: DiscoPrivate::generate(),
+            derp_client: None,
+            derp_map: None,
+            home_derp_region: 0,
+            udp_bind: None,
+            udp_socket: None,
+            portmapper: None,
+            health: None,
+            disable_direct_paths: false,
+            peer_relay_server: false,
+            relay_server_config: None,
+            sockstats: None,
+            control_knobs: None,
+        })
+        .await
+        .expect("magicsock without network I/O");
+        let tunnels = RwLock::new(HashMap::from([(new_public, new_receiver)]));
+        let delivered = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = delivered.clone();
+        handle_inbound_wg_datagrams(&magicsock, &tunnels, &[stale, fresh], move |key, body| {
+            sink.lock().unwrap().push((key, body));
+        })
+        .await;
+        let delivered = delivered.lock().unwrap();
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].1, packet);
+        assert_ne!(delivered[0].0, old_public);
     }
 }

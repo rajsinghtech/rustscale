@@ -80,6 +80,7 @@ rustscale-sockstats = { path = "../sockstats", version = "0.1.1" }
 rustscale-conffile = { path = "../conffile", version = "0.1.1" }
 rustscale-proxymap = { path = "../proxymap", version = "0.1.1" }
 rustscale-portlist = { path = "../portlist", version = "0.1.1" }
+rustscale-packet = { path = "../packet", version = "0.1.1" }
 rustscale-clientupdate = { path = "../clientupdate", version = "0.1.1" }
 rustscale-envknob = { path = "../envknob", version = "0.1.1" }
 rustscale-feature = { path = "../feature", version = "0.1.1" }

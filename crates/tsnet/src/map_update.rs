@@ -96,6 +96,7 @@ pub(crate) fn spawn_map_update_task(
     filter_arc: Arc<std::sync::Mutex<Filter>>,
     mut named_filters: BTreeMap<String, Vec<FilterRule>>,
     drive: Arc<crate::drive::Runtime>,
+    peer_map: Arc<crate::peer_map::Runtime>,
     tailscale_ips: Vec<IpAddr>,
     control_url: String,
     accept_routes: bool,
@@ -314,11 +315,50 @@ pub(crate) fn spawn_map_update_task(
                         }
                     }
 
-                    // Serialize Taildrive authorization decisions with all
-                    // peer/filter changes. Requests admitted under the old
-                    // signed map are cancelled before this guard is released.
+                    // Reconcile by stable Node.ID before touching live state.
+                    // A malformed map (especially duplicate address ownership)
+                    // fails closed to an empty peer set rather than retaining
+                    // stale keys or grants.
+                    let current_peers = peers_arc.read().await.clone();
+                    let (next_peers, invalid_peer_map) =
+                        match crate::peer_map::reconcile(&current_peers, &resp) {
+                            Ok(peers) => (peers, false),
+                            Err(error) => {
+                                log::warn!("tsnet: rejecting invalid peer map update: {error}");
+                                (Vec::new(), true)
+                            }
+                        };
+                    let peers_changed = invalid_peer_map || next_peers != current_peers;
+
+                    // Construct replacement tunnels and routes before the
+                    // commit gate. Unchanged current keys keep their WG state;
+                    // rotated/removed keys cannot survive in the new map.
+                    let old_tunnels = wg_tunnels.read().await;
+                    let next_tunnels = build_peer_tunnels(&node_key, &next_peers, &old_tunnels);
+                    drop(old_tunnels);
+                    let mut next_routes =
+                        RouteTable::from_peers_with_opts(&next_peers, accept_routes);
+                    if let Some(selected) = route_table.read().await.exit_node().cloned() {
+                        if let Some(replacement) =
+                            rotated_peer_key(&current_peers, &next_peers, &selected)
+                        {
+                            next_routes.set_exit_node(replacement);
+                        }
+                    }
+                    exit_node_selection
+                        .write()
+                        .await
+                        .retry(&next_peers, &mut next_routes);
+
+                    // Data-plane readers and PeerAPI provenance checks hold the
+                    // read side. This writer makes peers, ownership, tunnels,
+                    // magicsock endpoints, routes, filter grants, and Taildrive
+                    // revocation one observable commit.
+                    let map_commit = peer_map.gate.write().await;
                     let mut drive_epoch = drive.authorization_write().await;
-                    if let Some(ref node) = resp.Node {
+                    if invalid_peer_map {
+                        drive.set_sharing_allowed_locked(false, &mut drive_epoch);
+                    } else if let Some(ref node) = resp.Node {
                         let sharing_allowed = node
                             .Capabilities
                             .iter()
@@ -329,68 +369,33 @@ pub(crate) fn spawn_map_update_task(
                         drive.set_sharing_allowed_locked(sharing_allowed, &mut drive_epoch);
                     }
 
-                    // Merge peer deltas. Track whether the peer set changed
-                    // so the filter's capability map can be refreshed.
-                    let peers_changed = !resp.Peers.is_empty()
-                        || !resp.PeersChanged.is_empty()
-                        || !resp.PeersRemoved.is_empty()
-                        || resp
-                            .PeersChangedPatch
-                            .as_ref()
-                            .is_some_and(|p| !p.is_empty());
-                    {
-                        let mut peers = peers_arc.write().await;
-                        if !resp.Peers.is_empty() {
-                            peers.clone_from(&resp.Peers);
-                        }
-                        if !resp.PeersChanged.is_empty() {
-                            for changed in &resp.PeersChanged {
-                                if let Some(existing) =
-                                    peers.iter_mut().find(|p| p.Key == changed.Key)
-                                {
-                                    *existing = changed.clone();
-                                } else {
-                                    peers.push(changed.clone());
-                                }
-                            }
-                        }
-                        if !resp.PeersRemoved.is_empty() {
-                            peers.retain(|p| !resp.PeersRemoved.contains(&p.ID));
-                        }
-                        // Apply incremental peer patches (PeersChangedPatch).
-                        // These are lighter-weight updates that only modify
-                        // individual fields (Online, LastSeen, DERPRegion,
-                        // Endpoints, Key, DiscoKey, KeyExpiry, Cap, CapMap).
-                        if let Some(ref patches) = resp.PeersChangedPatch {
-                            for patch in patches {
-                                if let Some(existing) =
-                                    peers.iter_mut().find(|p| p.ID == patch.NodeID)
-                                {
-                                    apply_peer_change(existing, patch);
-                                }
-                            }
-                        }
-                    }
-
-                    // Install packet-filter capability deltas before allowing
-                    // another Taildrive authorization decision. Keeping the
-                    // initial named filters is required for deltas that update
-                    // peers without repeating the full filter.
                     let filter_changed = process_filter_deltas(&resp, &mut named_filters);
-                    if filter_changed || peers_changed {
+                    if invalid_peer_map {
+                        named_filters.clear();
+                        *filter_arc.lock().unwrap() = Filter::allow_none();
+                    } else if filter_changed || peers_changed {
                         let shields_up = filter_arc.lock().unwrap().shields_up();
-                        let peers_snapshot = peers_arc.read().await.clone();
                         rebuild_filter(
                             &filter_arc,
                             &named_filters,
                             &tailscale_ips,
                             &advertise_routes,
-                            &peers_snapshot,
+                            &next_peers,
                             shields_up,
                         );
                     }
+                    if let Err(error) = magicsock.set_netmap(next_peers.clone()).await {
+                        log::warn!("tsnet: magicsock peer-map update failed: {error}");
+                    }
+                    peers_arc.write().await.clone_from(&next_peers);
+                    *wg_tunnels.write().await = next_tunnels;
+                    *route_table.write().await = next_routes;
+                    peer_map
+                        .install_locked(&next_peers)
+                        .expect("validated peer map installs");
                     crate::drive::Runtime::rotate_authorization_locked(&mut drive_epoch);
                     drop(drive_epoch);
+                    drop(map_commit);
 
                     // Forward peer deltas to the IPN notify bus so
                     // watch-ipn-bus subscribers receive PeersChanged /
@@ -447,15 +452,15 @@ pub(crate) fn spawn_map_update_task(
                     // PeerChangedPatch field. That path will be wired when
                     // the netmap delta subscription system is ported.
 
-                    // Feed the updated peer list to magicsock + rebuild routes.
+                    // Peer-derived in-process state was committed above.
+                    // Apply the already-built route snapshot to the OS after
+                    // releasing the packet gate so shell/native router work
+                    // cannot stall data-plane readers.
                     let peers = peers_arc.read().await.clone();
-                    let _ = magicsock.set_netmap(peers.clone()).await;
                     let live_prefs = prefs.read().await.clone();
-                    let mut routes = route_table.write().await;
-                    routes.rebuild_with_opts(&peers, accept_routes);
-                    exit_node_selection.write().await.retry(&peers, &mut routes);
                     if let Some(router) = router.as_ref() {
                         let derp_map = magicsock.get_derp_map();
+                        let routes = route_table.read().await;
                         if let Err(error) = sync_router(
                             router,
                             &tailscale_ips,
@@ -467,7 +472,6 @@ pub(crate) fn spawn_map_update_task(
                             eprintln!("tsnet: route update failed (non-fatal): {error}");
                         }
                     }
-                    drop(routes);
 
                     // Update IPN engine status: peer count as NumLive, DERP
                     // home connection as LiveDERPs. This may transition the
@@ -530,20 +534,6 @@ pub(crate) fn spawn_map_update_task(
                             ..Default::default()
                         });
                     }
-
-                    // Create WG tunnels for new peers.
-                    let mut tunnels = wg_tunnels.write().await;
-                    for peer in &peers {
-                        if peer.Key.is_zero() {
-                            continue;
-                        }
-                        if !tunnels.contains_key(&peer.Key) {
-                            if let Ok(t) = WgTunn::new(&node_key, &peer.Key, rand_index()) {
-                                tunnels.insert(peer.Key.clone(), Arc::new(Mutex::new(t)));
-                            }
-                        }
-                    }
-                    drop(tunnels);
 
                     // Save the updated netmap to disk (best-effort) so a
                     // restart can skip the blocking first fetch. Dedup via
@@ -781,44 +771,36 @@ async fn perform_key_rotation(
     }
 }
 
-/// Apply an incremental [`PeerChange`] patch to an existing [`Node`].
-/// Only fields that are `Some` / non-default are applied; the rest are left
-/// unchanged. Mirrors Go's `(*Node).ApplyPatch` in `tailcfg/tailcfg.go`.
-fn apply_peer_change(node: &mut Node, patch: &PeerChange) {
-    if patch.DERPRegion != 0 {
-        node.HomeDERP = patch.DERPRegion;
-    }
-    if patch.Cap != 0 {
-        node.Cap = patch.Cap;
-    }
-    if !patch.CapMap.is_empty() {
-        node.CapMap = patch.CapMap.clone();
-    }
-    if !patch.Endpoints.is_empty() {
-        node.Endpoints.clone_from(&patch.Endpoints);
-    }
-    if let Some(ref key) = patch.Key {
-        node.Key = key.clone();
-    }
-    if let Some(ref sig) = patch.KeySignature {
-        node.KeySignature = Some(sig.clone());
-    }
-    if let Some(ref disco) = patch.DiscoKey {
-        node.DiscoKey = disco.clone();
-    }
-    if let Some(online) = patch.Online {
-        node.Online = Some(online);
-    }
-    if let Some(last_seen) = patch.LastSeen {
-        node.LastSeen = Some(last_seen);
-    }
-    if let Some(key_expiry) = patch.KeyExpiry {
-        node.KeyExpiry = Some(key_expiry);
-    }
-}
-
 /// Send a Notify with the current health warnings so frontend consumers
 /// can surface health state changes. Mirrors Go's `LocalBackend.sendHealthNotify`.
+fn rotated_peer_key(current: &[Node], next: &[Node], selected: &NodePublic) -> Option<NodePublic> {
+    let stable_id = current.iter().find(|peer| &peer.Key == selected)?.ID;
+    next.iter()
+        .find(|peer| peer.ID == stable_id)
+        .map(|peer| peer.Key.clone())
+}
+
+fn build_peer_tunnels(
+    node_key: &NodePrivate,
+    peers: &[Node],
+    current: &HashMap<NodePublic, Arc<Mutex<WgTunn>>>,
+) -> HashMap<NodePublic, Arc<Mutex<WgTunn>>> {
+    peers
+        .iter()
+        .filter_map(|peer| {
+            current
+                .get(&peer.Key)
+                .cloned()
+                .or_else(|| {
+                    WgTunn::new(node_key, &peer.Key, rand_index())
+                        .ok()
+                        .map(|tunnel| Arc::new(Mutex::new(tunnel)))
+                })
+                .map(|tunnel| (peer.Key.clone(), tunnel))
+        })
+        .collect()
+}
+
 fn send_health_notify(health: &Tracker, ipn_backend: &IpnBackend) {
     let warnings: Vec<String> = health
         .current_warnings()
@@ -848,6 +830,49 @@ mod tests {
             Cap: 50,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn peer_key_rotation_preserves_exit_selection_by_stable_id() {
+        let old_key = NodePrivate::generate().public();
+        let new_key = NodePrivate::generate().public();
+        let old_peer = Node {
+            ID: 10,
+            Key: old_key.clone(),
+            ..Default::default()
+        };
+        let new_peer = Node {
+            ID: 10,
+            Key: new_key.clone(),
+            ..Default::default()
+        };
+        assert_eq!(
+            rotated_peer_key(&[old_peer], &[new_peer], &old_key),
+            Some(new_key)
+        );
+    }
+
+    #[test]
+    fn peer_key_rotation_removes_old_decryption_tunnel() {
+        let local = NodePrivate::generate();
+        let old_key = NodePrivate::generate().public();
+        let new_key = NodePrivate::generate().public();
+        let old_tunnel = Arc::new(Mutex::new(
+            WgTunn::new(&local, &old_key, 1).expect("old tunnel"),
+        ));
+        let current = HashMap::from([(old_key.clone(), old_tunnel)]);
+        let rotated = build_peer_tunnels(
+            &local,
+            &[Node {
+                ID: 10,
+                Key: new_key.clone(),
+                Addresses: vec!["100.64.0.2/32".into()],
+                ..Default::default()
+            }],
+            &current,
+        );
+        assert!(!rotated.contains_key(&old_key));
+        assert!(rotated.contains_key(&new_key));
     }
 
     #[test]
@@ -969,7 +994,7 @@ mod tests {
             Online: Some(false),
             ..Default::default()
         };
-        apply_peer_change(&mut peer, &patch);
+        crate::peer_map::apply_patch(&mut peer, &patch);
         assert_eq!(peer.HomeDERP, 7);
         assert_eq!(peer.Online, Some(false));
         // Unchanged fields stay the same.
@@ -987,7 +1012,7 @@ mod tests {
             Key: Some(new_key.clone()),
             ..Default::default()
         };
-        apply_peer_change(&mut peer, &patch);
+        crate::peer_map::apply_patch(&mut peer, &patch);
         assert_eq!(peer.Endpoints, vec!["5.6.7.8:9", "[::1]:10"]);
         assert_eq!(peer.Key, new_key);
         // DERPRegion 0 means unchanged.
@@ -1006,7 +1031,7 @@ mod tests {
             KeyExpiry: Some(ts),
             ..Default::default()
         };
-        apply_peer_change(&mut peer, &patch);
+        crate::peer_map::apply_patch(&mut peer, &patch);
         assert_eq!(peer.LastSeen, Some(ts));
         assert_eq!(peer.KeyExpiry, Some(ts));
     }
@@ -1016,15 +1041,14 @@ mod tests {
         let mut peer = sample_peer();
         let original = peer.clone();
         // Patch for a different NodeID — should not be applied by the caller,
-        // but apply_peer_change itself doesn't check NodeID.
+        // but the patch helper itself doesn't check NodeID.
         let patch = PeerChange {
             NodeID: 999,
             DERPRegion: 42,
             ..Default::default()
         };
-        // In the map_update task, the caller checks NodeID before calling
-        // apply_peer_change. Here we just verify the helper is correct.
-        apply_peer_change(&mut peer, &patch);
+        // Reconciliation checks NodeID before calling the patch helper.
+        crate::peer_map::apply_patch(&mut peer, &patch);
         assert_eq!(peer.HomeDERP, 42);
         // Verify the original is different
         assert_ne!(peer.HomeDERP, original.HomeDERP);

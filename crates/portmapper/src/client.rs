@@ -457,17 +457,29 @@ impl Client {
             ReleaseIdentity::Upnp { .. } => None,
         };
 
-        match cached.release {
+        let confirmed = match cached.release {
             ReleaseIdentity::Pmp {
                 destination,
                 internal_port,
             } => {
-                let packet =
-                    pmp::build_delete_request(internal_port, cached.mapping.external.port());
-                let _ = socket
-                    .expect("PMP release socket")
-                    .send_to(&packet, destination)
-                    .await;
+                let socket = socket.expect("PMP release socket");
+                let external_port = cached.mapping.external.port();
+                let packet = pmp::build_delete_request(internal_port, external_port);
+                if socket.send_to(&packet, destination).await.is_err() {
+                    false
+                } else {
+                    let mut response = [0_u8; 64];
+                    matches!(
+                        timeout(crate::PROBE_TIMEOUT, socket.recv_from(&mut response)).await,
+                        Ok(Ok((size, source))) if source == destination
+                            && pmp::parse_response(&response[..size]).is_some_and(|reply|
+                                reply.op_code == pmp::PMP_OP_REPLY | pmp::PMP_OP_MAP_UDP
+                                    && reply.result_code == 0
+                                    && reply.internal_port == internal_port
+                                    && reply.external_port == external_port
+                                    && reply.mapping_valid_seconds == 0)
+                    )
+                }
             }
             ReleaseIdentity::Pcp {
                 destination,
@@ -475,6 +487,8 @@ impl Client {
                 internal_port,
                 nonce,
             } => {
+                let socket = socket.expect("PCP release socket");
+                let external_port = cached.mapping.external.port();
                 let requested_ip = match cached.mapping.external.ip() {
                     std::net::IpAddr::V4(ip) => ip,
                     std::net::IpAddr::V6(_) => Ipv4Addr::UNSPECIFIED,
@@ -482,24 +496,42 @@ impl Client {
                 let packet = pcp::build_map_request(
                     self_ip,
                     internal_port,
-                    cached.mapping.external.port(),
+                    external_port,
                     0,
                     requested_ip,
                     nonce,
                 );
-                let _ = socket
-                    .expect("PCP release socket")
-                    .send_to(&packet, destination)
-                    .await;
+                if socket.send_to(&packet, destination).await.is_err() {
+                    false
+                } else {
+                    let mut response = [0_u8; 128];
+                    matches!(
+                        timeout(crate::PROBE_TIMEOUT, socket.recv_from(&mut response)).await,
+                        Ok(Ok((size, source))) if source == destination
+                            && pcp::parse_map_response(&response[..size]).is_some_and(|reply|
+                                reply.result_code == 0
+                                    && reply.lifetime == 0
+                                    && reply.nonce == nonce
+                                    && reply.protocol == pcp::PCP_UDP
+                                    && reply.internal_port == internal_port
+                                    && reply.external.port() == external_port)
+                    )
+                }
             }
-            ReleaseIdentity::Upnp { service } => {
-                upnp::delete_port_mapping(
-                    &service,
-                    cached.mapping.external.port(),
-                    Duration::from_secs(1),
-                )
-                .await;
-            }
+            ReleaseIdentity::Upnp { service } => upnp::delete_port_mapping(
+                &service,
+                cached.mapping.external.port(),
+                Duration::from_secs(1),
+            )
+            .await
+            .is_ok(),
+        };
+
+        if !confirmed {
+            // A timed-out datagram or SOAP request can still be processed by
+            // the router. Keep replacement blocked for a bounded settle window
+            // so a late same-key delete cannot race a new allocation.
+            tokio::time::sleep(crate::PROBE_TIMEOUT).await;
         }
     }
 
@@ -611,7 +643,19 @@ impl Client {
         snapshot: GatewaySnapshot,
     ) -> Result<ProbeResult, crate::PortMapError> {
         let gi = snapshot.info.ok_or(crate::PortMapError::GatewayRange)?;
-        if self.with_current_gateway(snapshot, |_| ()).is_none() {
+        if self
+            .with_current_gateway(snapshot, |state| {
+                // A full probe replaces, rather than merges, protocol
+                // observations. The active mapping retains its own release
+                // identity independently of these discovery caches.
+                state.pmp_pub_ip = None;
+                state.pmp_pub_ip_time = None;
+                state.pcp_saw_time = None;
+                state.upnp_saw_time = None;
+                state.upnp_services.clear();
+            })
+            .is_none()
+        {
             return Err(crate::PortMapError::GatewayRange);
         }
         let pxp_port = self.pxp_port();
@@ -730,8 +774,21 @@ impl Client {
     /// Create or renew a port mapping. Returns the external endpoint if
     /// successful.
     pub async fn create_or_get_mapping(&self) -> Result<Mapping, crate::PortMapError> {
-        let _create_guard = self.inner.create_lock.lock().await;
-        self.create_or_get_mapping_serialized().await
+        // The supervisor owns all allocation identity and outlives the caller.
+        // Dropping this future only drops the receiver; the operation still
+        // commits a validated mapping or releases any allocation it obtained.
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let client = self.clone();
+        tokio::spawn(async move {
+            let _create_guard = client.inner.create_lock.lock().await;
+            let result = client.create_or_get_mapping_serialized().await;
+            let _ = result_tx.send(result);
+        });
+        result_rx.await.unwrap_or_else(|_| {
+            Err(crate::PortMapError::Protocol(
+                "mapping supervisor terminated".into(),
+            ))
+        })
     }
 
     async fn create_or_get_mapping_serialized(&self) -> Result<Mapping, crate::PortMapError> {
@@ -826,6 +883,19 @@ impl Client {
 
         // Try PMP/PCP first (faster, share port 5351).
         if have_recent_pmp || have_recent_pcp || !have_recent_upnp {
+            let desired_kind = if have_recent_pcp && !have_recent_pmp {
+                MappingKind::Pcp
+            } else {
+                MappingKind::Pmp
+            };
+            self.release_incompatible_mapping(snapshot, |identity| {
+                matches!(
+                    (desired_kind, identity),
+                    (MappingKind::Pmp, ReleaseIdentity::Pmp { .. })
+                        | (MappingKind::Pcp, ReleaseIdentity::Pcp { .. })
+                )
+            })
+            .await?;
             match self
                 .try_pxp_mapping(
                     snapshot,
@@ -856,6 +926,38 @@ impl Client {
 
     fn observation_is_recent(observed: Option<Instant>, now: Instant) -> bool {
         observed.is_some_and(|time| now.saturating_duration_since(time) < crate::TRUST_DURATION)
+    }
+
+    async fn release_incompatible_mapping(
+        &self,
+        snapshot: GatewaySnapshot,
+        compatible: impl FnOnce(&ReleaseIdentity) -> bool,
+    ) -> Result<(), crate::PortMapError> {
+        let old_mapping = {
+            let mut state = self.inner.state.lock().expect("state lock");
+            if state.gateway_generation != snapshot.generation || state.gateway != snapshot.info {
+                return Err(crate::PortMapError::GatewayRange);
+            }
+            if state
+                .mapping
+                .as_ref()
+                .is_some_and(|cached| !compatible(&cached.release))
+            {
+                let old = state.mapping.take();
+                self.inner.pending_releases.fetch_add(1, Ordering::SeqCst);
+                old
+            } else {
+                None
+            }
+        };
+        if let Some(old) = old_mapping {
+            self.release_mapping(&old);
+            self.wait_for_pending_releases().await;
+            if self.with_current_gateway(snapshot, |_| ()).is_none() {
+                return Err(crate::PortMapError::GatewayRange);
+            }
+        }
+        Ok(())
     }
 
     /// Try to create a mapping via PMP or PCP (they share port 5351).
@@ -1067,6 +1169,16 @@ impl Client {
         let deadline = Duration::from_secs(2);
 
         for svc in &services {
+            if self
+                .release_incompatible_mapping(snapshot, |identity| {
+                    matches!(identity, ReleaseIdentity::Upnp { service }
+                        if service.control_url == svc.control_url && service.kind == svc.kind)
+                })
+                .await
+                .is_err()
+            {
+                return None;
+            }
             let ext_port = match upnp::add_port_mapping(
                 svc,
                 &internal_client,
@@ -1081,9 +1193,11 @@ impl Client {
                 Err(_) => continue,
             };
 
-            let ext_ip = match upnp::get_external_ip(svc, deadline).await {
-                Ok(ip) => ip,
-                Err(_) => continue,
+            let ext_ip = if let Ok(ip) = upnp::get_external_ip(svc, deadline).await {
+                ip
+            } else {
+                let _ = upnp::delete_port_mapping(svc, ext_port, deadline).await;
+                continue;
             };
 
             let now = self.now();

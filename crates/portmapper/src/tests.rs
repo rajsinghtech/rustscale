@@ -17,15 +17,29 @@ use tokio::time::timeout;
 use crate::client::ReleaseTestGate;
 use crate::{pcp, Client, GatewayInfo, MappingKind};
 
+struct AsyncGate {
+    reached: tokio::sync::Barrier,
+    resume: tokio::sync::Barrier,
+}
+
+impl AsyncGate {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            reached: tokio::sync::Barrier::new(2),
+            resume: tokio::sync::Barrier::new(2),
+        })
+    }
+}
+
 /// A fake Internet Gateway Device for testing. Supports fake PMP, PCP,
 /// and/or UPnP. All listeners are on localhost.
 struct FakeIgd {
     pxp_sock: Arc<UdpSocket>,
     upnp_sock: Arc<UdpSocket>,
     http_addr: SocketAddr,
-    do_pmp: bool,
-    do_pcp: bool,
-    do_upnp: bool,
+    do_pmp: AtomicBool,
+    do_pcp: AtomicBool,
+    do_upnp: AtomicBool,
     pmp_external_ip: Ipv4Addr,
     pcp_mutation: Option<PcpMutation>,
     closed: Arc<AtomicBool>,
@@ -37,6 +51,7 @@ struct FakeIgd {
     upnp_disco_count: Arc<AtomicU32>,
     upnp_add_count: Arc<AtomicU32>,
     upnp_delete_count: Arc<AtomicU32>,
+    external_ip_gate: Mutex<Option<Arc<AsyncGate>>>,
 }
 
 impl FakeIgd {
@@ -51,9 +66,9 @@ impl FakeIgd {
             pxp_sock,
             upnp_sock,
             http_addr,
-            do_pmp: opts.pmp,
-            do_pcp: opts.pcp,
-            do_upnp: opts.upnp,
+            do_pmp: AtomicBool::new(opts.pmp),
+            do_pcp: AtomicBool::new(opts.pcp),
+            do_upnp: AtomicBool::new(opts.upnp),
             pmp_external_ip: opts.pmp_external_ip,
             pcp_mutation: opts.pcp_mutation,
             closed: closed.clone(),
@@ -65,6 +80,7 @@ impl FakeIgd {
             upnp_disco_count: Arc::new(AtomicU32::new(0)),
             upnp_add_count: Arc::new(AtomicU32::new(0)),
             upnp_delete_count: Arc::new(AtomicU32::new(0)),
+            external_ip_gate: Mutex::new(None),
         });
 
         // Spawn handlers.
@@ -92,6 +108,16 @@ impl FakeIgd {
             self.http_addr.ip(),
             self.http_addr.port()
         )
+    }
+
+    fn gate_external_ip(&self, gate: Arc<AsyncGate>) {
+        *self.external_ip_gate.lock().unwrap() = Some(gate);
+    }
+
+    fn set_protocols(&self, pmp: bool, pcp: bool, upnp: bool) {
+        self.do_pmp.store(pmp, Ordering::SeqCst);
+        self.do_pcp.store(pcp, Ordering::SeqCst);
+        self.do_upnp.store(upnp, Ordering::SeqCst);
     }
 
     fn close(&self) {
@@ -122,7 +148,7 @@ impl FakeIgd {
 
     async fn handle_pmp(self: Arc<Self>, pkt: &[u8], src: SocketAddr) {
         self.pmp_recv_count.fetch_add(1, Ordering::Relaxed);
-        if !self.do_pmp || pkt.len() < 2 {
+        if !self.do_pmp.load(Ordering::Relaxed) || pkt.len() < 2 {
             return;
         }
         let op = pkt[1];
@@ -145,7 +171,7 @@ impl FakeIgd {
                 resp[8..10].copy_from_slice(&pkt[4..6]);
             }
             resp[10..12].copy_from_slice(&4242u16.to_be_bytes());
-            resp[12..16].copy_from_slice(&7200u32.to_be_bytes());
+            resp[12..16].copy_from_slice(&pkt[8..12]);
             let _ = self.pxp_sock.send_to(&resp, src).await;
         }
     }
@@ -156,16 +182,18 @@ impl FakeIgd {
             return;
         }
         let op = pkt[1];
+        if op == 1 && pkt.len() >= 60 {
+            self.pcp_map_count.fetch_add(1, Ordering::Relaxed);
+            let mut nonce = [0_u8; 12];
+            nonce.copy_from_slice(&pkt[24..36]);
+            self.pcp_nonces.lock().unwrap().push(nonce);
+        }
         match op {
-            0 if self.do_pcp => {
+            0 if self.do_pcp.load(Ordering::Relaxed) => {
                 let resp = pcp::build_disco_response(op);
                 let _ = self.pxp_sock.send_to(&resp, src).await;
             }
-            1 if self.do_pcp && pkt.len() >= 60 => {
-                self.pcp_map_count.fetch_add(1, Ordering::Relaxed);
-                let mut nonce = [0_u8; 12];
-                nonce.copy_from_slice(&pkt[24..36]);
-                self.pcp_nonces.lock().unwrap().push(nonce);
+            1 if self.do_pcp.load(Ordering::Relaxed) && pkt.len() >= 60 => {
                 let mut resp = pcp::build_map_response(pkt);
                 match self.pcp_mutation {
                     Some(PcpMutation::Nonce) => resp[24] ^= 1,
@@ -201,7 +229,7 @@ impl FakeIgd {
                 let pkt = &buf[..n];
                 if pkt.windows(8).any(|w| w == b"M-SEARCH") {
                     self.upnp_disco_count.fetch_add(1, Ordering::Relaxed);
-                    if self.do_upnp {
+                    if self.do_upnp.load(Ordering::Relaxed) {
                         let location = self.http_url();
                         let resp = format!(
                             "HTTP/1.1 200 OK\r\n\
@@ -276,6 +304,11 @@ impl FakeIgd {
                 return;
             }
             if action.contains("GetExternalIPAddress") {
+                let gate = self.external_ip_gate.lock().unwrap().clone();
+                if let Some(gate) = gate {
+                    gate.reached.wait().await;
+                    gate.resume.wait().await;
+                }
                 write_soap_response(stream, TEST_GET_EXTERNAL_IP_RESPONSE).await;
                 return;
             }
@@ -534,6 +567,40 @@ async fn test_upnp_probe_and_mapping() {
         std::net::IpAddr::V4(Ipv4Addr::new(123, 123, 123, 123))
     );
     assert!(igd.upnp_add_count.load(Ordering::Relaxed) > 0);
+
+    client.close();
+    igd.close();
+}
+
+#[tokio::test]
+async fn dropped_upnp_caller_is_supervised_through_external_ip_commit() {
+    let igd = FakeIgd::start(IgdOpts {
+        upnp: true,
+        ..Default::default()
+    })
+    .await;
+    let gate = AsyncGate::new();
+    igd.gate_external_ip(gate.clone());
+    let client = make_test_client(&igd);
+    let caller_client = client.clone();
+    let caller = tokio::spawn(async move { caller_client.create_or_get_mapping().await });
+
+    gate.reached.wait().await;
+    caller.abort();
+    gate.resume.wait().await;
+
+    let mapping = timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(mapping) = client.cached_mapping() {
+                break mapping;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("supervisor must finish UPnP allocation");
+    assert_eq!(mapping.kind, MappingKind::Upnp);
+    assert_eq!(igd.upnp_add_count.load(Ordering::SeqCst), 1);
 
     client.close();
     igd.close();
@@ -920,6 +987,75 @@ async fn upnp_only_mapping_renews_after_trust_expiry() {
         MappingKind::Upnp,
     )
     .await;
+}
+
+#[tokio::test]
+async fn protocol_switch_releases_old_mapping_before_replacement() {
+    let igd = FakeIgd::start(IgdOpts {
+        pcp: true,
+        ..Default::default()
+    })
+    .await;
+    let client = make_test_client(&igd);
+    let clock = Arc::new(Mutex::new(Instant::now()));
+    client.set_test_clock(Box::new({
+        let clock = clock.clone();
+        move || *clock.lock().unwrap()
+    }));
+    let first = client.create_or_get_mapping().await.expect("PCP mapping");
+    assert_eq!(first.kind, MappingKind::Pcp);
+
+    igd.set_protocols(true, false, false);
+    *clock.lock().unwrap() += Duration::from_secs(3601);
+    let switch_started = Instant::now();
+    let second = client
+        .create_or_get_mapping()
+        .await
+        .expect("PMP replacement");
+    assert_eq!(second.kind, MappingKind::Pmp);
+    assert!(
+        switch_started.elapsed() >= crate::PROBE_TIMEOUT * 2,
+        "unconfirmed PCP deletion must hold the safe terminal delay"
+    );
+    assert_eq!(igd.pcp_map_count.load(Ordering::SeqCst), 2);
+    assert_eq!(igd.pmp_map_count.load(Ordering::SeqCst), 1);
+    assert_eq!(client.cached_mapping().unwrap().kind, MappingKind::Pmp);
+
+    client.close();
+    igd.close();
+}
+
+#[tokio::test]
+async fn upnp_service_switch_releases_old_service_before_replacement() {
+    let igd_a = FakeIgd::start(IgdOpts {
+        upnp: true,
+        ..Default::default()
+    })
+    .await;
+    let client = make_test_client(&igd_a);
+    let clock = Arc::new(Mutex::new(Instant::now()));
+    client.set_test_clock(Box::new({
+        let clock = clock.clone();
+        move || *clock.lock().unwrap()
+    }));
+    client.create_or_get_mapping().await.expect("service A");
+
+    let igd_b = FakeIgd::start(IgdOpts {
+        upnp: true,
+        ..Default::default()
+    })
+    .await;
+    client.set_test_pxp_port(igd_b.pxp_port());
+    client.set_test_upnp_port(igd_b.upnp_port());
+    *clock.lock().unwrap() += Duration::from_secs(3601);
+    let replacement = client.create_or_get_mapping().await.expect("service B");
+    assert_eq!(replacement.kind, MappingKind::Upnp);
+    assert_eq!(igd_a.upnp_delete_count.load(Ordering::SeqCst), 1);
+    assert_eq!(igd_b.upnp_add_count.load(Ordering::SeqCst), 1);
+
+    client.close();
+    igd_a.close();
+    igd_b.close();
 }
 
 // --- Real gateway probe test (marked #[ignore]) ---

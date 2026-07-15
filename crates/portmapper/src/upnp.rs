@@ -226,7 +226,11 @@ pub(crate) async fn add_port_mapping(
 }
 
 /// Delete a UDP port mapping via SOAP DeletePortMapping.
-pub(crate) async fn delete_port_mapping(svc: &UpnpService, external_port: u16, deadline: Duration) {
+pub(crate) async fn delete_port_mapping(
+    svc: &UpnpService,
+    external_port: u16,
+    deadline: Duration,
+) -> Result<(), std::io::Error> {
     let service_type = xml::soap_service_type(svc.kind);
     let soap_action = format!("{service_type}#DeletePortMapping");
     let body = format!(
@@ -241,14 +245,15 @@ pub(crate) async fn delete_port_mapping(svc: &UpnpService, external_port: u16, d
   </s:Body>
 </s:Envelope>"#
     );
-    let _ = http::http_post_soap(
+    http::http_post_soap(
         &svc.control_url,
         &soap_action,
         SOAP_CONTENT_TYPE,
         &body,
         deadline,
     )
-    .await;
+    .await
+    .map(|_| ())
 }
 
 /// Get the external IP address via SOAP GetExternalIPAddress.

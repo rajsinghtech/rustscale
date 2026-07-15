@@ -16,6 +16,7 @@ use rustscale_tka::{
     Aum, AumSigner, Authority, FsChonk, Key, MemChonk, NodeKeySignature, SigKind, State,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
 const MAX_SYNC_AUMS: usize = 2000;
 const MAX_INIT_NODES: usize = 4096;
@@ -89,8 +90,37 @@ pub(crate) struct TailnetLock {
     params: TailnetLockParams,
     path: Option<PathBuf>,
     operation: tokio::sync::Mutex<()>,
+    init_flight: Mutex<Option<InitFlightState>>,
     peer_authority: Mutex<Option<Arc<crate::map_update::PeerAuthorityRuntime>>>,
     inner: Mutex<Inner>,
+}
+
+/// A LocalAPI initialization waiter. Dropping this value only disconnects the
+/// caller: the retained flight continues to own the TKA operation lock and
+/// peer-publication barriers until initialization finishes fail-closed.
+pub(crate) struct InitFlight {
+    result: tokio::sync::watch::Receiver<Option<SharedInitResult>>,
+}
+
+type SharedInitResult = Arc<Result<Vec<Vec<u8>>, TailnetLockError>>;
+
+struct InitFlightState {
+    request_hash: [u8; 32],
+    result: tokio::sync::watch::Receiver<Option<SharedInitResult>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl InitFlight {
+    pub(crate) async fn wait(mut self) -> SharedInitResult {
+        loop {
+            if let Some(result) = self.result.borrow().clone() {
+                return result;
+            }
+            if self.result.changed().await.is_err() {
+                return Arc::new(Err(TailnetLockError::StateUnavailable));
+            }
+        }
+    }
 }
 
 /// Holds the one ordered TKA operation across a control-state decision,
@@ -224,6 +254,7 @@ impl TailnetLock {
             params,
             path,
             operation: tokio::sync::Mutex::new(()),
+            init_flight: Mutex::new(None),
             peer_authority: Mutex::new(None),
             inner: Mutex::new(Inner {
                 authority,
@@ -675,14 +706,71 @@ impl TailnetLock {
         Ok(())
     }
 
+    /// Admit one lifecycle-retained LocalAPI initialization flight. The
+    /// request body is fingerprinted so concurrent retries can join only the
+    /// exact same transaction; a disconnected waiter never owns cancellation
+    /// of authority withdrawal or local commit.
+    pub(crate) fn start_init(
+        self: &Arc<Self>,
+        request: InitRequest,
+    ) -> Result<InitFlight, TailnetLockError> {
+        let encoded = serde_json::to_vec(&request).map_err(|error| {
+            TailnetLockError::InvalidRequest(format!(
+                "initialization request could not be encoded: {error}"
+            ))
+        })?;
+        let request_hash: [u8; 32] = Sha256::digest(encoded).into();
+        let mut retained = self
+            .init_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(flight) = retained
+            .as_ref()
+            .filter(|flight| !flight.task.is_finished())
+        {
+            if flight.request_hash != request_hash {
+                return Err(TailnetLockError::InvalidRequest(
+                    "another Tailnet Lock initialization request is already running".into(),
+                ));
+            }
+            return Ok(InitFlight {
+                result: flight.result.clone(),
+            });
+        }
+
+        let (result_tx, result) = tokio::sync::watch::channel(None);
+        let lock = self.clone();
+        let task = tokio::spawn(async move {
+            let result = Arc::new(lock.init(request).await);
+            result_tx.send_replace(Some(result));
+        });
+        *retained = Some(InitFlightState {
+            request_hash,
+            result: result.clone(),
+            task,
+        });
+        Ok(InitFlight { result })
+    }
+
+    /// Join a retained initialization during close/logout before tearing down
+    /// the peer-authority runtime it still owns. If this join future itself is
+    /// dropped, Tokio retains the spawned operation and it still completes.
+    pub(crate) async fn join_init_flight(&self) {
+        let flight = self
+            .init_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(flight) = flight {
+            let _ = flight.task.await;
+        }
+    }
+
     /// Persist the complete disablement receipt before contacting control,
     /// then perform both irreversible phases on one authenticated session.
     /// The receipt intentionally survives success until an operator retrieves
     /// it, so a dropped LocalAPI/control response cannot destroy the secrets.
-    pub(crate) async fn init(
-        &self,
-        request: InitRequest,
-    ) -> Result<Vec<Vec<u8>>, TailnetLockError> {
+    async fn init(&self, request: InitRequest) -> Result<Vec<Vec<u8>>, TailnetLockError> {
         let _operation = self.operation().await;
         if self.path.is_none() {
             return Err(TailnetLockError::NoStateDirectory);

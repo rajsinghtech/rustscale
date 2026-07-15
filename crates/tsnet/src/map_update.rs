@@ -339,29 +339,62 @@ impl PeerAuthorityRuntime {
     /// derived from the previously accepted peer map before any TKA network
     /// operation can commit a new authority.
     pub(crate) async fn withdraw(&self) -> Vec<Node> {
+        #[cfg(test)]
+        self.pause_before_withdrawal_await(WithdrawalAwait::ExitMapGate)
+            .await;
         let _exit_map_guard = self.exit_map_gate.lock().await;
+        #[cfg(test)]
+        self.pause_before_withdrawal_await(WithdrawalAwait::PeerMapGate)
+            .await;
         let map_commit = self.peer_map.gate.write().await;
+        #[cfg(test)]
+        self.pause_before_withdrawal_await(WithdrawalAwait::PeerSnapshot)
+            .await;
         let previous_peers = self.peers.read().await.clone();
 
+        #[cfg(test)]
+        self.pause_before_withdrawal_await(WithdrawalAwait::DriveAuthorization)
+            .await;
         let mut drive_epoch = self.drive.authorization_write().await;
         self.drive.rotate_authorization_locked(&mut drive_epoch);
         self.drive
             .set_sharing_allowed_locked(false, &mut drive_epoch);
+        #[cfg(test)]
+        self.pause_before_withdrawal_await(WithdrawalAwait::RelayDrain)
+            .await;
         self.magicsock.disable_relay_server_and_drain().await;
         *self.filter.lock().unwrap() = Filter::allow_none();
+        #[cfg(test)]
+        self.pause_before_withdrawal_await(WithdrawalAwait::PeersWrite)
+            .await;
         self.peers.write().await.clear();
+        #[cfg(test)]
+        self.pause_before_withdrawal_await(WithdrawalAwait::TunnelsWrite)
+            .await;
         self.wg_tunnels.write().await.clear();
         self.peer_map
             .install_locked(&[])
             .expect("empty peer map is valid");
+        #[cfg(test)]
+        self.pause_before_withdrawal_await(WithdrawalAwait::MagicsockNetmap)
+            .await;
         if let Err(error) = self.magicsock.set_netmap(Vec::new()).await {
             log::warn!(
                 "tsnet: failed to revoke magicsock generations before Tailnet Lock sync: {error}"
             );
         }
+        #[cfg(test)]
+        self.pause_before_withdrawal_await(WithdrawalAwait::ResolverWrite)
+            .await;
         self.resolver.write().await.set_peers(Vec::new());
 
+        #[cfg(test)]
+        self.pause_before_withdrawal_await(WithdrawalAwait::PrefsRead)
+            .await;
         let live_prefs = self.prefs.read().await.clone();
+        #[cfg(test)]
+        self.pause_before_withdrawal_await(WithdrawalAwait::RoutesWrite)
+            .await;
         let mut routes = self.route_table.write().await;
         routes.rebuild_with_opts(&[], self.accept_routes);
         if routes.exit_node_requested() {
@@ -390,7 +423,7 @@ impl PeerAuthorityRuntime {
                 let guard = self.withdrawal_pause.lock().unwrap();
                 guard.clone()
             };
-            if let Some(pause) = pause {
+            if let Some(pause) = pause.filter(|pause| pause.point.is_none()) {
                 pause.entered.add_permits(1);
                 let _permit = pause.release.acquire().await.unwrap();
             }
@@ -408,8 +441,29 @@ impl PeerAuthorityRuntime {
     }
 
     #[cfg(test)]
+    async fn pause_before_withdrawal_await(&self, point: WithdrawalAwait) {
+        let pause = self.withdrawal_pause.lock().unwrap().clone();
+        if let Some(pause) = pause.filter(|pause| pause.point == Some(point)) {
+            pause.entered.add_permits(1);
+            let _permit = pause.release.acquire().await.unwrap();
+        }
+    }
+
+    #[cfg(test)]
+    fn pause_withdrawal_at(&self, point: WithdrawalAwait) -> Arc<WithdrawalPause> {
+        let pause = Arc::new(WithdrawalPause {
+            point: Some(point),
+            entered: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        *self.withdrawal_pause.lock().unwrap() = Some(pause.clone());
+        pause
+    }
+
+    #[cfg(test)]
     fn pause_after_withdrawal(&self) -> Arc<WithdrawalPause> {
         let pause = Arc::new(WithdrawalPause {
+            point: None,
             entered: tokio::sync::Semaphore::new(0),
             release: tokio::sync::Semaphore::new(0),
         });
@@ -419,7 +473,41 @@ impl PeerAuthorityRuntime {
 }
 
 #[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WithdrawalAwait {
+    ExitMapGate,
+    PeerMapGate,
+    PeerSnapshot,
+    DriveAuthorization,
+    RelayDrain,
+    PeersWrite,
+    TunnelsWrite,
+    MagicsockNetmap,
+    ResolverWrite,
+    PrefsRead,
+    RoutesWrite,
+}
+
+#[cfg(test)]
+impl WithdrawalAwait {
+    const ALL: [Self; 11] = [
+        Self::ExitMapGate,
+        Self::PeerMapGate,
+        Self::PeerSnapshot,
+        Self::DriveAuthorization,
+        Self::RelayDrain,
+        Self::PeersWrite,
+        Self::TunnelsWrite,
+        Self::MagicsockNetmap,
+        Self::ResolverWrite,
+        Self::PrefsRead,
+        Self::RoutesWrite,
+    ];
+}
+
+#[cfg(test)]
 struct WithdrawalPause {
+    point: Option<WithdrawalAwait>,
     entered: tokio::sync::Semaphore,
     release: tokio::sync::Semaphore,
 }
@@ -1827,31 +1915,21 @@ mod tests {
         let stale_operation = lock.operation().await;
         assert!(!stale_operation.control_change_requires_revocation(Some(&disabled), false));
         let secret = vec![0x5a; 32];
-        let init_task = {
-            let lock = lock.clone();
-            let signing_public = signing_key.public().raw32().to_vec();
-            let secret = secret.clone();
-            tokio::spawn(async move {
-                lock.init(crate::tailnet_lock::InitRequest {
-                    keys: vec![Key {
-                        kind: KeyKind::Key25519,
-                        votes: 1,
-                        public: signing_public,
-                        meta: None,
-                    }],
-                    disablement_values: vec![disablement_kdf(&secret)],
-                    disablement_secrets: vec![secret],
-                    support_disablement: Vec::new(),
-                    resume: false,
-                })
-                .await
+        let init_waiter = lock
+            .start_init(crate::tailnet_lock::InitRequest {
+                keys: vec![Key {
+                    kind: KeyKind::Key25519,
+                    votes: 1,
+                    public: signing_key.public().raw32().to_vec(),
+                    meta: None,
+                }],
+                disablement_values: vec![disablement_kdf(&secret)],
+                disablement_secrets: vec![secret],
+                support_disablement: Vec::new(),
+                resume: false,
             })
-        };
+            .unwrap();
         tokio::task::yield_now().await;
-        assert!(
-            !init_task.is_finished(),
-            "init must wait between decision/apply"
-        );
         stale_operation
             .apply_control_info(Some(&disabled), false)
             .await
@@ -1876,8 +1954,9 @@ mod tests {
         drop(routes_guard);
 
         // Another stale disabled map cannot publish while init owns the TKA
-        // operation. Once init is cancelled, its fail-closed required state
-        // forces that map through revocation rather than the old false branch.
+        // operation. Dropping the LocalAPI waiter does not cancel the retained
+        // flight; its fail-closed required state forces that map through
+        // revocation rather than the old false branch.
         let stale_publish = {
             let lock = lock.clone();
             let peer_map = peer_map.clone();
@@ -1901,8 +1980,9 @@ mod tests {
             !stale_publish.is_finished(),
             "stale publication must remain behind concurrent init"
         );
-        init_task.abort();
-        let _ = init_task.await;
+        drop(init_waiter);
+        pause.release.add_permits(1);
+        lock.join_init_flight().await;
         assert!(
             stale_publish.await.unwrap(),
             "stale disabled map skipped revoke"
@@ -1911,6 +1991,174 @@ mod tests {
         assert!(peer_map
             .current_owner("100.64.0.88".parse().unwrap())
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn localapi_eof_at_every_withdraw_await_cannot_cancel_revocation() {
+        for point in WithdrawalAwait::ALL {
+            let local_key = NodePrivate::generate();
+            let peer = Node {
+                ID: 99,
+                StableID: format!("n-disconnect-{point:?}"),
+                Key: NodePrivate::generate().public(),
+                DiscoKey: DiscoPrivate::generate().public(),
+                Addresses: vec!["100.64.0.99/32".into()],
+                AllowedIPs: vec!["100.64.0.99/32".into(), "0.0.0.0/0".into()],
+                ..Default::default()
+            };
+            let peer_map = crate::peer_map::Runtime::new(std::slice::from_ref(&peer)).unwrap();
+            let peers = Arc::new(RwLock::new(vec![peer.clone()]));
+            let tunnels = Arc::new(RwLock::new(HashMap::from([(
+                peer.Key.clone(),
+                Arc::new(Mutex::new(WgTunn::new(&local_key, &peer.Key, 1).unwrap())),
+            )])));
+            let mut initial_routes =
+                RouteTable::from_peers_with_opts(std::slice::from_ref(&peer), false);
+            initial_routes.set_exit_node(peer.Key.clone());
+            let routes = Arc::new(RwLock::new(initial_routes));
+            let filter = Arc::new(std::sync::Mutex::new(Filter::allow_none()));
+            let drive = crate::drive::Runtime::new();
+            {
+                let mut epoch = drive.authorization_write().await;
+                drive.set_sharing_allowed_locked(true, &mut epoch);
+            }
+            let (magicsock, _wg_rx) = Magicsock::new(rustscale_magicsock::MagicsockConfig {
+                private_key: local_key.clone(),
+                disco_key: DiscoPrivate::generate(),
+                derp_client: None,
+                derp_map: None,
+                home_derp_region: 0,
+                udp_bind: None,
+                udp_socket: None,
+                portmapper: None,
+                health: None,
+                disable_direct_paths: false,
+                peer_relay_server: false,
+                relay_server_config: None,
+                sockstats: None,
+                control_knobs: None,
+            })
+            .await
+            .unwrap();
+            let magicsock = Arc::new(magicsock);
+            magicsock.set_netmap(vec![peer.clone()]).await.unwrap();
+            let resolver = Arc::new(RwLock::new(MagicDnsResolver::default()));
+            resolver.write().await.set_peers(vec![peer.clone()]);
+            let runtime = PeerAuthorityRuntime::new(
+                Arc::new(tokio::sync::Mutex::new(())),
+                peer_map.clone(),
+                drive.clone(),
+                magicsock.clone(),
+                filter,
+                peers.clone(),
+                tunnels.clone(),
+                resolver,
+                Arc::new(RwLock::new(Prefs::default())),
+                routes.clone(),
+                None,
+                Vec::new(),
+                "http://127.0.0.1:1".into(),
+                false,
+            );
+            let pause = runtime.pause_withdrawal_at(point);
+
+            let state = tempfile::tempdir().unwrap();
+            let signing_key = NLPrivate::generate();
+            let lock =
+                crate::tailnet_lock::TailnetLock::open(crate::tailnet_lock::TailnetLockParams {
+                    control_url: "http://127.0.0.1:1".into(),
+                    machine_key: MachinePrivate::generate(),
+                    server_pub_key: MachinePrivate::generate().public(),
+                    node_key: local_key,
+                    signing_key: signing_key.clone(),
+                    capability_version: 141,
+                    protocol_version: 141,
+                    state_dir: Some(state.path().into()),
+                    extra_root_certs: None,
+                })
+                .unwrap();
+            lock.attach_peer_authority(runtime).unwrap();
+            let secret = vec![0x6b; 32];
+            let request = crate::tailnet_lock::InitRequest {
+                keys: vec![Key {
+                    kind: KeyKind::Key25519,
+                    votes: 1,
+                    public: signing_key.public().raw32().to_vec(),
+                    meta: None,
+                }],
+                disablement_values: vec![disablement_kdf(&secret)],
+                disablement_secrets: vec![secret],
+                support_disablement: Vec::new(),
+                resume: false,
+            };
+
+            let (client, mut server) = tokio::io::duplex(64);
+            let handler = {
+                let lock = lock.clone();
+                tokio::spawn(async move {
+                    crate::localapi::handle_admitted_tka_init(&mut server, &lock, request).await
+                })
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(5), pause.entered.acquire())
+                .await
+                .unwrap_or_else(|_| panic!("init did not reach withdrawal await {point:?}"))
+                .unwrap()
+                .forget();
+
+            // EOF ends only the authorized client's waiter. The lifecycle
+            // flight still owns the operation lock at every withdrawal await.
+            drop(client);
+            tokio::time::timeout(std::time::Duration::from_secs(5), handler)
+                .await
+                .unwrap_or_else(|_| panic!("LocalAPI handler ignored EOF at {point:?}"))
+                .unwrap()
+                .unwrap();
+            let stale_map = {
+                let lock = lock.clone();
+                tokio::spawn(async move {
+                    let operation = lock.operation().await;
+                    operation.control_change_requires_revocation(
+                        Some(&TKAInfo {
+                            Disabled: true,
+                            ..Default::default()
+                        }),
+                        false,
+                    )
+                })
+            };
+            tokio::task::yield_now().await;
+            assert!(
+                !stale_map.is_finished(),
+                "operation lock escaped at withdrawal await {point:?}"
+            );
+
+            pause.release.add_permits(1);
+            lock.join_init_flight().await;
+            assert!(
+                stale_map.await.unwrap(),
+                "stale disabled map could republish after EOF at {point:?}"
+            );
+            assert!(!lock.authorization_ready(), "authority opened at {point:?}");
+            assert!(peers.read().await.is_empty(), "peers survived at {point:?}");
+            assert!(
+                tunnels.read().await.is_empty(),
+                "tunnels survived at {point:?}"
+            );
+            assert!(
+                peer_map
+                    .current_owner("100.64.0.99".parse().unwrap())
+                    .is_none(),
+                "peer ownership survived at {point:?}"
+            );
+            assert!(
+                magicsock.authorization_generation(&peer.Key).is_none(),
+                "magicsock generation survived at {point:?}"
+            );
+            assert!(!drive.sharing_allowed(), "Taildrive survived at {point:?}");
+            let routes = routes.read().await;
+            assert_eq!(routes.entries().count(), 0, "routes survived at {point:?}");
+            assert!(routes.exit_traffic_blocked(), "exit opened at {point:?}");
+        }
     }
 
     #[test]

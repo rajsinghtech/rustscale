@@ -2660,6 +2660,10 @@ impl Server {
             if let Err(error) = Self::join_running_tasks(inner).await {
                 return CloseResult(Err(error));
             }
+            // LocalAPI EOF or connection-task cancellation never owns an
+            // admitted TKA init. Join its retained flight while every peer
+            // authority surface and route owner are still alive.
+            inner.tailnet_lock.join_init_flight().await;
 
             inner.magicsock.set_connection_counter(None);
             if let Some(netlog) = inner.netlog.as_ref() {
@@ -2802,6 +2806,10 @@ impl Server {
         self.logout_checkpoint(LogoutAwaitPoint::Tasks).await;
         if let Some(inner) = self.inner.as_mut() {
             Self::join_running_tasks(inner).await?;
+            // Complete any admitted init before logout removes identity or
+            // route ownership. Its operation and publication barriers remain
+            // intact while the retained flight is joined.
+            inner.tailnet_lock.join_init_flight().await;
             inner.magicsock.set_connection_counter(None);
         }
 

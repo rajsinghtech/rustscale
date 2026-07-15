@@ -1121,14 +1121,30 @@ async fn handle_tka_init<W: AsyncRead + AsyncWrite + Unpin>(
         write_json_response(conn, 409, "Conflict", &body).await?;
         return Ok(());
     };
+    handle_admitted_tka_init(conn, lock, request).await
+}
+
+/// Run an already-authorized initialization request through the retained
+/// single flight. EOF only drops this waiter; it cannot cancel withdrawal or
+/// authority commit owned by `TailnetLock`.
+pub(crate) async fn handle_admitted_tka_init<W: AsyncRead + AsyncWrite + Unpin>(
+    conn: &mut W,
+    lock: &Arc<crate::tailnet_lock::TailnetLock>,
+    request: crate::tailnet_lock::InitRequest,
+) -> Result<(), std::io::Error> {
+    let flight = match lock.start_init(request) {
+        Ok(flight) => flight,
+        Err(error) => {
+            write_tka_error(conn, &error).await?;
+            return Ok(());
+        }
+    };
     let mut disconnect = [0u8; 1];
-    let operation = lock.init(request);
-    tokio::pin!(operation);
     let result = tokio::select! {
-        result = &mut operation => result,
+        result = flight.wait() => result,
         _ = conn.read(&mut disconnect) => return Ok(()),
     };
-    match result {
+    match result.as_ref() {
         Ok(secrets) => {
             let mut status = lock.status_json();
             if let Some(object) = status.as_object_mut() {
@@ -1139,7 +1155,7 @@ async fn handle_tka_init<W: AsyncRead + AsyncWrite + Unpin>(
             }
             write_json_response(conn, 200, "OK", &status).await?;
         }
-        Err(error) => write_tka_error(conn, &error).await?,
+        Err(error) => write_tka_error(conn, error).await?,
     }
     Ok(())
 }

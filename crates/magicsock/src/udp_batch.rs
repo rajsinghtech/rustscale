@@ -7,7 +7,7 @@ use std::mem;
 use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::fd::AsRawFd;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::Arc;
 
@@ -79,6 +79,7 @@ impl Drop for PooledPacket {
         };
         match self.recycler.sender.try_send(packet) {
             Ok(()) => {
+                self.recycler.free.fetch_add(1, Ordering::Relaxed);
                 self.recycler.recycled.fetch_add(1, Ordering::Relaxed);
             }
             Err(TrySendError::Disconnected(_)) => {
@@ -99,6 +100,7 @@ impl Drop for PooledPacket {
 /// clones this one Arc, rather than a sender plus several counter Arcs.
 struct RecyclerState {
     sender: SyncSender<Box<Packet>>,
+    free: AtomicUsize,
     recycled: AtomicU64,
     recycle_overflow: AtomicU64,
 }
@@ -136,6 +138,7 @@ impl ReceiveBufferPool {
         Self {
             recycler: Arc::new(RecyclerState {
                 sender,
+                free: AtomicUsize::new(RECEIVE_BUFFER_POOL_CAPACITY),
                 recycled: AtomicU64::new(0),
                 recycle_overflow: AtomicU64::new(0),
             }),
@@ -147,14 +150,20 @@ impl ReceiveBufferPool {
     }
 
     fn take_scratch(&self) -> Box<Packet> {
-        self.available
+        let packet = self
+            .available
             .recv()
-            .expect("new receive pool contains its 128 scratch buffers")
+            .expect("new receive pool contains its 128 scratch buffers");
+        self.recycler.free.fetch_sub(1, Ordering::Relaxed);
+        packet
     }
 
     fn replace_and_detach(&self, slot: &mut Box<Packet>, len: usize) -> PooledPacket {
         let replacement = match self.available.try_recv() {
-            Ok(packet) => packet,
+            Ok(packet) => {
+                self.recycler.free.fetch_sub(1, Ordering::Relaxed);
+                packet
+            }
             Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => {
                 self.unavailable.fetch_add(1, Ordering::Relaxed);
                 panic!("receive buffer pool exhausted despite inventory reservation");
@@ -173,7 +182,7 @@ impl ReceiveBufferPool {
     fn snapshot(&self) -> ReceiveBufferPoolSnapshot {
         ReceiveBufferPoolSnapshot {
             capacity: RECEIVE_BUFFER_POOL_CAPACITY,
-            free: self.available.len(),
+            free: self.recycler.free.load(Ordering::Relaxed),
             inventory: self.inventory.available_permits(),
             detached: self.detached.load(Ordering::Relaxed),
             recycled: self.recycler.recycled.load(Ordering::Relaxed),

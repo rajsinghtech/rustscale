@@ -624,7 +624,9 @@ fn unique_token() -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::collections::VecDeque;
+    #[cfg(unix)]
     use std::sync::Mutex;
 
     use super::*;
@@ -670,10 +672,12 @@ mod tests {
         assert!(!version_output_matches("rustscaled 1.2.4\n", "1.2.3", true));
     }
 
+    #[cfg(unix)]
     struct VersionRunner {
         outputs: Mutex<VecDeque<Result<CommandOutput, UpdateError>>>,
     }
 
+    #[cfg(unix)]
     impl VersionRunner {
         fn successful() -> Self {
             Self {
@@ -699,12 +703,14 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     impl CommandRunner for VersionRunner {
         fn run(&self, _command: &CommandSpec) -> Result<CommandOutput, UpdateError> {
             self.outputs.lock().unwrap().pop_front().unwrap()
         }
     }
 
+    #[cfg(unix)]
     #[derive(Clone, Copy)]
     enum Fault {
         Rename(usize),
@@ -713,6 +719,7 @@ mod tests {
         RollbackSync,
     }
 
+    #[cfg(unix)]
     struct FaultFs {
         inner: SystemFileSystem,
         fault: Option<Fault>,
@@ -721,6 +728,7 @@ mod tests {
         rollback_started: Mutex<bool>,
     }
 
+    #[cfg(unix)]
     impl FaultFs {
         fn new(fault: Option<Fault>) -> Self {
             Self {
@@ -733,6 +741,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     impl FileSystem for FaultFs {
         fn is_regular_file(&self, path: &Path) -> bool {
             self.inner.is_regular_file(path)
@@ -858,6 +867,7 @@ mod tests {
         drop(temp);
     }
 
+    #[cfg(unix)]
     fn assert_old(cli: &Path, daemon: &Path, receipt: &Path) {
         assert_eq!(fs::read(cli).unwrap(), b"old-cli");
         assert_eq!(fs::read(daemon).unwrap(), b"old-daemon");

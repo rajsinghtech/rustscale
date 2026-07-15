@@ -170,6 +170,12 @@ rustscale down                   # disconnect
 rustscale logout                 # disconnect and log out
 ```
 
+## Performance
+
+See [`PERFORMANCE.md`](PERFORMANCE.md) for the maintained, reproducible
+RustScale-versus-tailscaled TUN comparison, throughput-oriented runtime
+settings, raw benchmark samples, latency, CPU, RSS, and binary footprint.
+
 ## Build and test
 
 ```sh

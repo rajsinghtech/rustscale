@@ -437,6 +437,19 @@ impl PreferencePolicy for InstallUpdatesPolicy {
         Ok(true)
     }
 
+    fn generation(&self) -> u64 {
+        self.engine.snapshot().generation()
+    }
+
+    fn allows_update(&self, lower_precedence_choice: bool) -> Result<bool, String> {
+        use rustscale_syspolicy::{PolicyKey, PreferenceOption};
+
+        self.engine
+            .get_preference_option(PolicyKey::ApplyUpdates, PreferenceOption::UserDecides)
+            .map(|option| option.should_enable(lower_precedence_choice))
+            .map_err(|error| error.to_string())
+    }
+
     fn subscribe(
         &self,
         callback: Arc<dyn Fn() + Send + Sync>,
@@ -624,6 +637,29 @@ mod tests {
         };
         assert!(policy.reconcile(&mut prefs).unwrap());
         assert_eq!(prefs.AutoUpdate, Some(true));
+    }
+
+    #[test]
+    fn managed_never_denies_hostinfo_update_even_when_lower_precedence_allows() {
+        let engine = PolicyEngine::well_known(PolicyScope::Device).unwrap();
+        engine
+            .add_provider(
+                "managed",
+                PolicyScope::Device,
+                Arc::new(MemoryProvider::from_values(BTreeMap::from([(
+                    PolicyKey::ApplyUpdates,
+                    RawValue::String("never".into()),
+                )]))),
+            )
+            .unwrap();
+        let policy = InstallUpdatesPolicy { engine };
+        assert!(!policy.allows_update(true).unwrap());
+
+        let undecided = InstallUpdatesPolicy {
+            engine: PolicyEngine::well_known(PolicyScope::Device).unwrap(),
+        };
+        assert!(undecided.allows_update(true).unwrap());
+        assert!(!undecided.allows_update(false).unwrap());
     }
 
     #[test]

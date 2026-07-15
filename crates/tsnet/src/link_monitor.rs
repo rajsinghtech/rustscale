@@ -219,8 +219,15 @@ pub(crate) fn spawn_hostinfo_update_loop(
     backend_log_id: String,
     ssh_host_keys: Arc<RwLock<Vec<String>>>,
     posture_checking: bool,
+    preference_policy: Option<Arc<dyn crate::PreferencePolicy>>,
 ) -> JoinHandle<()> {
+    let policy_changed = Arc::new(tokio::sync::Notify::new());
+    let policy_subscription = preference_policy.as_ref().map(|policy| {
+        let policy_changed = policy_changed.clone();
+        policy.subscribe(Arc::new(move || policy_changed.notify_one()))
+    });
     tokio::spawn(async move {
+        let _policy_subscription = policy_subscription;
         let node_pub = node_key.public();
         let disco_pub = disco_key.public();
 
@@ -285,6 +292,16 @@ pub(crate) fn spawn_hostinfo_update_loop(
                 .as_ref()
                 .and_then(|d| rustscale_ipn::Prefs::load(d).ok())
                 .unwrap_or_default();
+            let lower_precedence_allows_update = prefs.AutoUpdate.unwrap_or(false)
+                || rustscale_envknob::bool("TS_ALLOW_ADMIN_CONSOLE_REMOTE_UPDATE").unwrap_or(false);
+            let allows_update = preference_policy.as_ref().map_or_else(
+                || lower_precedence_allows_update,
+                |policy| {
+                    policy
+                        .allows_update(lower_precedence_allows_update)
+                        .unwrap_or(false)
+                },
+            );
             let rt = RuntimeHostinfo {
                 posture_checking,
                 backend_log_id: backend_log_id.clone(),
@@ -295,7 +312,7 @@ pub(crate) fn spawn_hostinfo_update_loop(
                 app_connector: prefs.AppConnector.Advertise,
                 request_tags: prefs.AdvertiseTags.clone(),
                 no_logs_no_support: prefs.NoLogsNoSupport,
-                allows_update: prefs.AutoUpdate.unwrap_or(false),
+                allows_update,
                 sharee_node: false,
                 ssh_host_keys: ssh_host_keys.read().await.clone(),
                 wol_macs: hostinfo::wol_macs(),
@@ -335,7 +352,10 @@ pub(crate) fn spawn_hostinfo_update_loop(
                 }
             }
 
-            tokio::time::sleep(std::time::Duration::from_mins(10)).await;
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_mins(10)) => {}
+                () = policy_changed.notified(), if preference_policy.is_some() => {}
+            }
         }
     })
 }

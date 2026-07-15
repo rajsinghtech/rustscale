@@ -434,6 +434,7 @@ impl Server {
             b.backend_log_id.clone(),
             b.ssh_host_keys.clone(),
             self.config.posture_checking,
+            self.config.preference_policy.clone(),
         );
         tasks.push(hostinfo_loop);
 
@@ -541,7 +542,9 @@ impl Server {
             // shields-up mode without a full rebuild.
             let _ = state.filter.set(b.filter.clone());
             let state = Arc::new(state);
-            localapi::activate_preference_policy(&state);
+            localapi::activate_preference_policy(&state)
+                .await
+                .map_err(TsnetError::Builder)?;
             if let Some(h) = localapi::spawn_localapi(state, path.clone()) {
                 tasks.push(h.task);
                 if let Some(ref ps) = self.pre_started {
@@ -924,6 +927,7 @@ impl Server {
             b.backend_log_id.clone(),
             b.ssh_host_keys.clone(),
             self.config.posture_checking,
+            self.config.preference_policy.clone(),
         );
 
         let mut tasks = vec![
@@ -1041,7 +1045,9 @@ impl Server {
             // shields-up mode without a full rebuild.
             let _ = state.filter.set(b.filter.clone());
             let state = Arc::new(state);
-            localapi::activate_preference_policy(&state);
+            localapi::activate_preference_policy(&state)
+                .await
+                .map_err(TsnetError::Builder)?;
             if let Some(h) = localapi::spawn_localapi(state, path.clone()) {
                 tasks.push(h.task);
                 if let Some(ref ps) = self.pre_started {
@@ -1350,7 +1356,9 @@ impl Server {
             preference_policy: self.config.preference_policy.clone(),
             policy_subscription: std::sync::Mutex::new(None),
         });
-        localapi::activate_preference_policy(&api_state);
+        localapi::activate_preference_policy(&api_state)
+            .await
+            .map_err(TsnetError::Builder)?;
 
         let handle = localapi::spawn_localapi(api_state.clone(), socket_path.clone());
         if handle.is_some() {

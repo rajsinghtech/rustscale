@@ -312,8 +312,10 @@ pub fn apply_runtime_fields(hi: &mut Hostinfo, rt: &RuntimeHostinfo) {
     // funnel is active, IngressEnabled implies the wiring is done.
     hi.WireIngress = !rt.ingress_enabled && rt.wire_ingress;
     hi.ShieldsUp = rt.shields_up;
-    hi.AllowsUpdate = rt.allows_update
-        || rustscale_envknob::bool("TS_ALLOW_ADMIN_CONSOLE_REMOTE_UPDATE").unwrap_or(false);
+    // `allows_update` is already the final precedence-resolved decision.
+    // In particular, a managed InstallUpdates=never decision must not be
+    // reopened by a process environment knob here.
+    hi.AllowsUpdate = rt.allows_update;
     if rt.app_connector {
         hi.AppConnector = OptBool::True;
     }
@@ -2325,6 +2327,29 @@ VERSION_ID='11'"#;
         };
         let hi = collect_hostinfo(base, &ov, &rt);
         assert!(hi.ShieldsUp);
+    }
+
+    #[test]
+    fn test_apply_runtime_fields_uses_precedence_resolved_update_decision() {
+        let mut denied = Hostinfo::default();
+        apply_runtime_fields(
+            &mut denied,
+            &RuntimeHostinfo {
+                allows_update: false,
+                ..Default::default()
+            },
+        );
+        assert!(!denied.AllowsUpdate);
+
+        let mut allowed = Hostinfo::default();
+        apply_runtime_fields(
+            &mut allowed,
+            &RuntimeHostinfo {
+                allows_update: true,
+                ..Default::default()
+            },
+        );
+        assert!(allowed.AllowsUpdate);
     }
 
     #[test]

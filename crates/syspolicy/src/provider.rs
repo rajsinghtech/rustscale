@@ -443,10 +443,13 @@ impl ProviderSubscription for MemorySubscription {}
 impl Drop for MemorySubscription {
     fn drop(&mut self) {
         if let Some(callbacks) = self.callbacks.upgrade() {
-            callbacks
+            let callback = callbacks
                 .lock()
                 .expect("memory callback lock poisoned")
                 .remove(&self.id);
+            // A callback may own another subscription whose Drop re-enters
+            // this map. Release the mutex before dropping the closure.
+            drop(callback);
         }
     }
 }

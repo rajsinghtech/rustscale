@@ -584,6 +584,32 @@ fn windows_default_policy_fails_closed_without_registry_backend() {
 }
 
 #[test]
+fn callback_and_memory_subscription_drop_can_reenter_without_deadlock() {
+    let engine = PolicyEngine::well_known(PolicyScope::Device).unwrap();
+    let inner_registration = engine.register_change_callback(|_| {});
+    let outer_registration = engine.register_change_callback(move |_| {
+        let _keep_alive = &inner_registration;
+    });
+    // Removing the outer closure drops its captured inner registration. Both
+    // removals target the same callback map and must happen without its mutex
+    // being held across closure destruction.
+    drop(outer_registration);
+
+    let provider = MemoryProvider::new();
+    let inner_subscription = provider
+        .subscribe(Arc::new(|| {}))
+        .unwrap()
+        .expect("memory subscription");
+    let outer_subscription = provider
+        .subscribe(Arc::new(move || {
+            let _keep_alive = &inner_subscription;
+        }))
+        .unwrap()
+        .expect("memory subscription");
+    drop(outer_subscription);
+}
+
+#[test]
 fn scoped_test_override_restores_previous_snapshot() {
     let engine = PolicyEngine::well_known(PolicyScope::Device).unwrap();
     engine

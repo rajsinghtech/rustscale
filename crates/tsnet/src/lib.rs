@@ -343,6 +343,17 @@ pub trait PreferencePolicy: Send + Sync {
     /// Reconciles managed settings into `prefs`, returning whether it changed.
     fn reconcile(&self, prefs: &mut rustscale_ipn::Prefs) -> Result<bool, String>;
 
+    /// Returns the effective policy generation used for startup handshakes.
+    fn generation(&self) -> u64 {
+        0
+    }
+
+    /// Applies managed update policy to lower-precedence user/environment
+    /// permission. A managed denial must return `false`.
+    fn allows_update(&self, lower_precedence_choice: bool) -> Result<bool, String> {
+        Ok(lower_precedence_choice)
+    }
+
     /// Registers a non-blocking policy-change callback.
     fn subscribe(
         &self,

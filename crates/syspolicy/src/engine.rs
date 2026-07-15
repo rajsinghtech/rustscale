@@ -679,11 +679,14 @@ pub struct CallbackRegistration {
 impl Drop for CallbackRegistration {
     fn drop(&mut self) {
         if let Some(engine) = self.engine.upgrade() {
-            engine
+            let callback = engine
                 .callbacks
                 .lock()
                 .expect("policy callbacks lock poisoned")
                 .remove(&self.id);
+            // The callback may own another registration whose Drop re-enters
+            // this map. Release the mutex before dropping the closure.
+            drop(callback);
         }
     }
 }

@@ -1732,8 +1732,15 @@ impl Client {
                         return Ok(None);
                     }
 
-                    // PMP response.
+                    // PMP response. MAP replies are correlated by the
+                    // requested internal port; another client's valid reply
+                    // is unrelated and must not resolve our ownership.
                     if let Some(pmp_resp) = pmp::parse_response(pkt) {
+                        if pmp_resp.op_code == pmp::PMP_OP_REPLY | pmp::PMP_OP_MAP_UDP
+                            && pmp_resp.internal_port != local_port
+                        {
+                            continue;
+                        }
                         if pmp_resp.result_code != 0 {
                             if pmp_resp.op_code == pmp::PMP_OP_REPLY | pmp::PMP_OP_MAP_UDP {
                                 self.clear_uncertain_ownership(ownership_id);
@@ -2189,6 +2196,16 @@ mod tests {
         operation.await.unwrap().unwrap()
     }
 
+    fn pmp_map_response(result_code: u16, internal_port: u16, external_port: u16) -> [u8; 16] {
+        let mut response = [0_u8; 16];
+        response[1] = pmp::PMP_OP_REPLY | pmp::PMP_OP_MAP_UDP;
+        response[2..4].copy_from_slice(&result_code.to_be_bytes());
+        response[8..10].copy_from_slice(&internal_port.to_be_bytes());
+        response[10..12].copy_from_slice(&external_port.to_be_bytes());
+        response[12..16].copy_from_slice(&crate::MAP_LIFETIME_SECS.to_be_bytes());
+        response
+    }
+
     fn test_mapping(external: SocketAddr) -> Mapping {
         test_mapping_at(external, Instant::now())
     }
@@ -2536,6 +2553,63 @@ mod tests {
         response[12..16].copy_from_slice(&crate::MAP_LIFETIME_SECS.to_be_bytes());
         router.send_to(&response, source).await.unwrap();
         assert_eq!(retry.await.unwrap().unwrap().kind, MappingKind::Pmp);
+    }
+
+    #[tokio::test]
+    async fn pmp_ignores_mismatched_reject_before_matching_success() {
+        let router = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = prepare_pmp_client(router.local_addr().unwrap().port());
+        let operation_client = client.clone();
+        let operation = tokio::spawn(async move { operation_client.create_or_get_mapping().await });
+        let mut request = [0_u8; 64];
+        let (size, source) = router.recv_from(&mut request).await.unwrap();
+        assert_eq!(size, 12);
+
+        router
+            .send_to(&pmp_map_response(2, 41642, 0), source)
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        assert!(!operation.is_finished());
+        assert_eq!(
+            client.inner.state.lock().unwrap().uncertain_releases.len(),
+            1
+        );
+
+        router
+            .send_to(&pmp_map_response(0, 41641, 4242), source)
+            .await
+            .unwrap();
+        let mapping = operation.await.unwrap().unwrap();
+        assert_eq!(mapping.kind, MappingKind::Pmp);
+        assert_eq!(mapping.external.port(), 4242);
+        assert!(client.inner.state.lock().unwrap().mapping.is_some());
+    }
+
+    #[tokio::test]
+    async fn pmp_mismatched_success_never_commits() {
+        let router = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = prepare_pmp_client(router.local_addr().unwrap().port());
+        let operation_client = client.clone();
+        let operation = tokio::spawn(async move { operation_client.create_or_get_mapping().await });
+        let mut request = [0_u8; 64];
+        let (size, source) = router.recv_from(&mut request).await.unwrap();
+        assert_eq!(size, 12);
+        router
+            .send_to(&pmp_map_response(0, 41642, 4242), source)
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!operation.is_finished());
+        assert!(client.inner.state.lock().unwrap().mapping.is_none());
+        assert_eq!(
+            client.inner.state.lock().unwrap().uncertain_releases.len(),
+            1
+        );
+        operation.abort();
+        let _ = operation.await;
+        assert!(client.inner.state.lock().unwrap().mapping.is_none());
     }
 
     #[tokio::test]

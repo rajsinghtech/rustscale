@@ -94,13 +94,20 @@ async fn close_prestarted_localapi_allows_immediate_rebind() {
     drop(live_connection);
     assert!(connect(&socket_path).is_err());
 
-    let second_commands = server
-        .start_localapi_only()
-        .await
-        .expect("immediate LocalAPI rebind");
-    assert!(connect(&socket_path).is_ok());
-    drop(second_commands);
-    server.close().await.into_result().expect("second close");
+    for attempt in 0..3 {
+        let commands = server
+            .start_localapi_only()
+            .await
+            .unwrap_or_else(|error| panic!("NeedsLogin rebind {attempt}: {error}"));
+        assert!(connect(&socket_path).is_ok());
+        drop(commands);
+        server
+            .close()
+            .await
+            .into_result()
+            .unwrap_or_else(|error| panic!("NeedsLogin close {attempt}: {error}"));
+        assert!(connect(&socket_path).is_err());
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

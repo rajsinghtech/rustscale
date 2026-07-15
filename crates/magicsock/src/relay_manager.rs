@@ -27,6 +27,8 @@ use rustscale_tailcfg::{
     cap_ver_is_relay_capable, has_capability, Node, PEER_CAPABILITY_RELAY_TARGET,
 };
 
+use crate::{TaskRegistry, TrackedTask};
+
 #[cfg(test)]
 use rustscale_disco::BindUdpRelayEndpointChallenge;
 
@@ -184,7 +186,7 @@ struct AllocWork {
     #[allow(dead_code)]
     alloc_gen: u32,
     cancel: tokio::sync::oneshot::Sender<()>,
-    task: Option<tokio::task::JoinHandle<()>>,
+    task: Option<TrackedTask>,
     response_tx: tokio::sync::mpsc::Sender<AllocateUdpRelayEndpointResponse>,
 }
 
@@ -197,7 +199,7 @@ struct HandshakeWork {
     vni: u32,
     lamport_id: u64,
     cancel: tokio::sync::oneshot::Sender<()>,
-    task: Option<tokio::task::JoinHandle<()>>,
+    task: Option<TrackedTask>,
     disco_msg_tx: tokio::sync::mpsc::Sender<(Message, SocketAddr, u32)>,
 }
 
@@ -256,6 +258,9 @@ impl RelayManagerState {
 #[derive(Clone)]
 pub struct RelayManagerHandle {
     tx: tokio::sync::mpsc::UnboundedSender<RelayEvent>,
+    // Standalone callers retain their private task registry here. Magicsock
+    // uses its own lifecycle registry and leaves this as None.
+    _task_owner: Option<std::sync::Arc<TaskRegistry>>,
 }
 
 impl RelayManagerHandle {
@@ -415,9 +420,33 @@ pub trait RelayManagerContext: Send + Sync + 'static {
 
 /// Spawn the relay manager event loop.
 pub fn spawn_relay_manager<RM: RelayManagerContext>(ctx: std::sync::Arc<RM>) -> RelayManagerHandle {
+    let tasks = std::sync::Arc::new(TaskRegistry::default());
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let handle = RelayManagerHandle { tx: tx.clone() };
-    tokio::spawn(run_event_loop(rx, tx, ctx));
+    let handle = RelayManagerHandle {
+        tx: tx.clone(),
+        _task_owner: Some(tasks.clone()),
+    };
+    tasks.spawn(run_event_loop(
+        rx,
+        tx,
+        ctx,
+        std::sync::Arc::downgrade(&tasks),
+    ));
+    handle
+}
+
+pub(crate) fn spawn_relay_manager_tracked<RM: RelayManagerContext>(
+    ctx: std::sync::Arc<RM>,
+    tasks: std::sync::Weak<TaskRegistry>,
+) -> RelayManagerHandle {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let handle = RelayManagerHandle {
+        tx: tx.clone(),
+        _task_owner: None,
+    };
+    if let Some(registry) = tasks.upgrade() {
+        registry.spawn(run_event_loop(rx, tx, ctx, tasks));
+    }
     handle
 }
 
@@ -426,6 +455,7 @@ async fn run_event_loop<RM: RelayManagerContext>(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<RelayEvent>,
     event_tx: tokio::sync::mpsc::UnboundedSender<RelayEvent>,
     ctx: std::sync::Arc<RM>,
+    tasks: std::sync::Weak<TaskRegistry>,
 ) {
     let mut state = RelayManagerState::new();
 
@@ -443,6 +473,7 @@ async fn run_event_loop<RM: RelayManagerContext>(
                         &mut state,
                         &ctx,
                         &event_tx,
+                        &tasks,
                         peer_key,
                         peer_disco,
                         authorization_generation,
@@ -483,6 +514,7 @@ async fn run_event_loop<RM: RelayManagerContext>(
                     authorization_generation,
                     server_endpoint,
                     server,
+                    &tasks,
                 )
                 .await;
             }
@@ -495,7 +527,7 @@ async fn run_event_loop<RM: RelayManagerContext>(
                 }
             }
             RelayEvent::AllocWorkDone(result) => {
-                handle_alloc_work_done(&mut state, &ctx, &event_tx, result).await;
+                handle_alloc_work_done(&mut state, &ctx, &event_tx, &tasks, result).await;
             }
             RelayEvent::HandshakeWorkDone(result) => {
                 handle_handshake_work_done(&mut state, &ctx, result);
@@ -576,6 +608,7 @@ fn allocate_all_servers<RM: RelayManagerContext>(
     state: &mut RelayManagerState,
     ctx: &std::sync::Arc<RM>,
     event_tx: &tokio::sync::mpsc::UnboundedSender<RelayEvent>,
+    tasks: &std::sync::Weak<TaskRegistry>,
     peer_key: NodePublic,
     peer_disco: DiscoPublic,
     authorization_generation: u64,
@@ -597,32 +630,37 @@ fn allocate_all_servers<RM: RelayManagerContext>(
         let peer_key2 = peer_key.clone();
         let peer_disco2 = peer_disco.clone();
         let server2 = server.clone();
-        let task = tokio::spawn(spawn_alloc_work(
-            ctx2,
-            event_tx2,
-            peer_key2,
-            peer_disco2,
-            authorization_generation,
-            server2,
-            disco_keys.clone(),
-            alloc_gen,
-            cancel_rx,
-            resp_rx,
-        ));
-        let work = AllocWork {
-            server: server.clone(),
-            authorization_generation,
-            disco_keys: disco_keys.clone(),
-            alloc_gen,
-            cancel: cancel_tx,
-            task: Some(task),
-            response_tx: resp_tx,
-        };
-        state
-            .alloc_work
-            .entry(peer_key.clone())
-            .or_default()
-            .insert(server, work);
+        if let Some(tasks) = tasks.upgrade() {
+            let task = tasks.spawn_joinable(spawn_alloc_work(
+                ctx2,
+                event_tx2,
+                peer_key2,
+                peer_disco2,
+                authorization_generation,
+                server2,
+                disco_keys.clone(),
+                alloc_gen,
+                cancel_rx,
+                resp_rx,
+            ));
+            let Some(task) = task else {
+                continue;
+            };
+            let work = AllocWork {
+                server: server.clone(),
+                authorization_generation,
+                disco_keys: disco_keys.clone(),
+                alloc_gen,
+                cancel: cancel_tx,
+                task: Some(task),
+                response_tx: resp_tx,
+            };
+            state
+                .alloc_work
+                .entry(peer_key.clone())
+                .or_default()
+                .insert(server, work);
+        }
     }
 }
 
@@ -751,6 +789,7 @@ async fn handle_alloc_work_done<RM: RelayManagerContext>(
     state: &mut RelayManagerState,
     ctx: &std::sync::Arc<RM>,
     event_tx: &tokio::sync::mpsc::UnboundedSender<RelayEvent>,
+    tasks: &std::sync::Weak<TaskRegistry>,
     result: AllocWorkResult,
 ) {
     let peer_key = &result.peer_key;
@@ -788,6 +827,7 @@ async fn handle_alloc_work_done<RM: RelayManagerContext>(
             result.authorization_generation,
             se.clone(),
             Some(result.server.clone()),
+            tasks,
         )
         .await;
     }
@@ -806,6 +846,7 @@ async fn handle_new_server_endpoint<RM: RelayManagerContext>(
     authorization_generation: u64,
     se: ServerEndpoint,
     server: Option<CandidatePeerRelay>,
+    tasks: &std::sync::Weak<TaskRegistry>,
 ) {
     if ctx.peer_authorization_generation(&peer_key) != Some(authorization_generation)
         || ctx.peer_disco_key(&peer_key).as_ref() != Some(&peer_disco)
@@ -862,11 +903,12 @@ async fn handle_new_server_endpoint<RM: RelayManagerContext>(
     let (disco_msg_tx, disco_msg_rx) = tokio::sync::mpsc::channel::<(Message, SocketAddr, u32)>(16);
 
     let handshake_gen = state.next_handshake_gen();
-    let ctx2 = ctx.clone();
-    let event_tx2 = event_tx.clone();
-    let task = tokio::spawn(spawn_handshake_work(
-        ctx2,
-        event_tx2,
+    let Some(tasks) = tasks.upgrade() else {
+        return;
+    };
+    let Some(task) = tasks.spawn_joinable(spawn_handshake_work(
+        ctx.clone(),
+        event_tx.clone(),
         peer_key.clone(),
         peer_disco,
         authorization_generation,
@@ -875,7 +917,9 @@ async fn handle_new_server_endpoint<RM: RelayManagerContext>(
         handshake_gen,
         cancel_rx,
         disco_msg_rx,
-    ));
+    )) else {
+        return;
+    };
     let work = HandshakeWork {
         server_disco: se.server_disco.clone(),
         authorization_generation,
@@ -1280,7 +1324,7 @@ fn handle_rx_disco_msg<RM: RelayManagerContext>(
 // Cancellation
 // ---------------------------------------------------------------------------
 
-fn cancel_work(work: impl Into<CancelledWork>) -> Option<tokio::task::JoinHandle<()>> {
+fn cancel_work(work: impl Into<CancelledWork>) -> Option<TrackedTask> {
     let work = work.into();
     let _ = work.cancel.send(());
     work.task
@@ -1288,7 +1332,7 @@ fn cancel_work(work: impl Into<CancelledWork>) -> Option<tokio::task::JoinHandle
 
 struct CancelledWork {
     cancel: tokio::sync::oneshot::Sender<()>,
-    task: Option<tokio::task::JoinHandle<()>>,
+    task: Option<TrackedTask>,
 }
 
 impl From<AllocWork> for CancelledWork {
@@ -1309,16 +1353,13 @@ impl From<HandshakeWork> for CancelledWork {
     }
 }
 
-async fn join_cancelled(tasks: Vec<tokio::task::JoinHandle<()>>) {
+async fn join_cancelled(tasks: Vec<TrackedTask>) {
     for task in tasks {
-        let _ = task.await;
+        task.join().await;
     }
 }
 
-fn stop_work(
-    state: &mut RelayManagerState,
-    peer_key: &NodePublic,
-) -> Vec<tokio::task::JoinHandle<()>> {
+fn stop_work(state: &mut RelayManagerState, peer_key: &NodePublic) -> Vec<TrackedTask> {
     let mut tasks = Vec::new();
     if let Some(by_server) = state.alloc_work.remove(peer_key) {
         tasks.extend(by_server.into_values().filter_map(cancel_work));
@@ -1342,7 +1383,7 @@ fn stop_work(
 fn stop_server_work(
     state: &mut RelayManagerState,
     server: &CandidatePeerRelay,
-) -> Vec<tokio::task::JoinHandle<()>> {
+) -> Vec<TrackedTask> {
     let mut tasks = Vec::new();
     let peer_keys = state.alloc_work.keys().cloned().collect::<Vec<_>>();
     for peer_key in peer_keys {
@@ -1392,7 +1433,7 @@ fn cancel_handshake(
     state: &mut RelayManagerState,
     peer_key: &NodePublic,
     server_disco: &DiscoPublic,
-) -> Vec<tokio::task::JoinHandle<()>> {
+) -> Vec<TrackedTask> {
     let mut tasks = Vec::new();
     if let Some(by_sd) = state.handshake_work.get_mut(peer_key) {
         if let Some(work) = by_sd.remove(server_disco) {
@@ -1927,6 +1968,7 @@ mod tests {
         let mut mock = MockCtx::with_servers(&[removed_server.clone(), fresh_server.clone()]);
         mock.discos.insert(target_key.clone(), target_disco.clone());
         let ctx = std::sync::Arc::new(mock);
+        let tasks = std::sync::Arc::new(TaskRegistry::default());
         let mut state = RelayManagerState::new();
         state
             .servers_by_node_key
@@ -1935,11 +1977,13 @@ mod tests {
         let (alloc_cancel, alloc_cancelled) = tokio::sync::oneshot::channel();
         let alloc_joined = std::sync::Arc::new(AtomicUsize::new(0));
         let alloc_joined_task = alloc_joined.clone();
-        let alloc_task = tokio::spawn(async move {
-            let _ = alloc_cancelled.await;
-            tokio::task::yield_now().await;
-            alloc_joined_task.store(1, Ordering::SeqCst);
-        });
+        let alloc_task = tasks
+            .spawn_joinable(async move {
+                let _ = alloc_cancelled.await;
+                tokio::task::yield_now().await;
+                alloc_joined_task.store(1, Ordering::SeqCst);
+            })
+            .unwrap();
         let (response_tx, _response_rx) = tokio::sync::mpsc::channel(1);
         let client_discos = sort_pair(&DiscoPrivate::generate().public(), &target_disco);
         state
@@ -1973,11 +2017,13 @@ mod tests {
         let (handshake_cancel, handshake_cancelled) = tokio::sync::oneshot::channel();
         let handshake_joined = std::sync::Arc::new(AtomicUsize::new(0));
         let handshake_joined_task = handshake_joined.clone();
-        let handshake_task = tokio::spawn(async move {
-            let _ = handshake_cancelled.await;
-            tokio::task::yield_now().await;
-            handshake_joined_task.store(1, Ordering::SeqCst);
-        });
+        let handshake_task = tasks
+            .spawn_joinable(async move {
+                let _ = handshake_cancelled.await;
+                tokio::task::yield_now().await;
+                handshake_joined_task.store(1, Ordering::SeqCst);
+            })
+            .unwrap();
         let (disco_msg_tx, _disco_msg_rx) = tokio::sync::mpsc::channel(1);
         state
             .handshake_work
@@ -2032,6 +2078,7 @@ mod tests {
             &mut state,
             &ctx,
             &event_tx,
+            &std::sync::Arc::downgrade(&tasks),
             AllocWorkResult {
                 peer_key: target_key.clone(),
                 peer_disco: target_disco.clone(),

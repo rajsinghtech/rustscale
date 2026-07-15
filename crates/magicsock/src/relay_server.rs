@@ -152,6 +152,13 @@ impl RelayServerExtension {
             server.close();
         }
     }
+
+    /// Close and join the relay server's socket and maintenance loops.
+    pub async fn shutdown(&self) {
+        if let Some(ref server) = self.server {
+            server.shutdown().await;
+        }
+    }
 }
 
 impl Drop for RelayServerExtension {

@@ -972,12 +972,133 @@ impl WgReceiveBatch {
 /// The path-selection engine.
 pub struct Magicsock {
     inner: Arc<Inner>,
+    tasks: Arc<TaskRegistry>,
+    shutdown: Arc<MagicsockShutdown>,
+}
+
+#[derive(Default)]
+struct TaskRegistry {
+    state: std::sync::Mutex<TaskRegistryState>,
+}
+
+#[derive(Default)]
+struct TaskRegistryState {
+    closed: bool,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for TaskRegistry {
+    fn drop(&mut self) {
+        if let Ok(state) = self.state.get_mut() {
+            for task in state.tasks.drain(..) {
+                task.abort();
+            }
+            state.closed = true;
+        }
+    }
+}
+
+struct TrackedTask {
+    done: tokio::sync::oneshot::Receiver<()>,
+}
+
+impl TrackedTask {
+    async fn join(self) {
+        let _ = self.done.await;
+    }
+}
+
+impl TaskRegistry {
+    fn spawn<F>(&self, future: F) -> Option<tokio::task::AbortHandle>
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let mut state = self.state.lock().expect("magicsock task registry lock");
+        state.tasks.retain(|task| !task.is_finished());
+        if state.closed {
+            return None;
+        }
+        let task = tokio::spawn(future);
+        let abort = task.abort_handle();
+        state.tasks.push(task);
+        Some(abort)
+    }
+
+    fn spawn_joinable<F>(&self, future: F) -> Option<TrackedTask>
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let (done, wait) = tokio::sync::oneshot::channel();
+        self.spawn(async move {
+            future.await;
+            let _ = done.send(());
+        })?;
+        Some(TrackedTask { done: wait })
+    }
+
+    fn is_closed(&self) -> bool {
+        self.state
+            .lock()
+            .expect("magicsock task registry lock")
+            .closed
+    }
+
+    fn close_registration(&self) {
+        self.state
+            .lock()
+            .expect("magicsock task registry lock")
+            .closed = true;
+    }
+
+    fn close_and_take(&self) -> Vec<tokio::task::JoinHandle<()>> {
+        let mut state = self.state.lock().expect("magicsock task registry lock");
+        state.closed = true;
+        std::mem::take(&mut state.tasks)
+    }
+
+    fn abort_now(&self) {
+        for task in self.close_and_take() {
+            task.abort();
+        }
+    }
+
+    #[cfg(test)]
+    fn task_count(&self) -> usize {
+        self.state
+            .lock()
+            .expect("magicsock task registry lock")
+            .tasks
+            .iter()
+            .filter(|task| !task.is_finished())
+            .count()
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ShutdownPhase {
+    Running,
+    ShuttingDown,
+    Complete,
+}
+
+struct MagicsockShutdown {
+    phase: std::sync::Mutex<ShutdownPhase>,
+    complete: tokio::sync::Notify,
+}
+
+impl Default for MagicsockShutdown {
+    fn default() -> Self {
+        Self {
+            phase: std::sync::Mutex::new(ShutdownPhase::Running),
+            complete: tokio::sync::Notify::new(),
+        }
+    }
 }
 
 struct Inner {
     node_public: RwLock<NodePublic>,
     disco: DiscoIo,
-    udp: Option<Arc<UdpSocket>>,
+    udp: RwLock<Option<Arc<UdpSocket>>>,
     /// TX `sendmmsg` availability. Linux starts batched when permitted by the
     /// process configuration, then permanently falls back to ordinary Tokio
     /// sends if the syscall is unavailable or blocked.
@@ -1027,7 +1148,7 @@ struct Inner {
     control_knobs: Option<Arc<rustscale_controlknobs::ControlKnobs>>,
     /// Per-peer background task handles (heartbeat + UDP lifetime probe).
     /// At most one task per peer; replaced when TX resumes an idle session.
-    background_tasks: RwLock<HashMap<NodePublic, tokio::task::JoinHandle<()>>>,
+    background_tasks: RwLock<HashMap<NodePublic, tokio::task::AbortHandle>>,
     /// Number of heartbeat tasks armed, used to verify TX coalescing.
     #[cfg(test)]
     heartbeat_task_generations: AtomicUsize,
@@ -1052,6 +1173,11 @@ struct Inner {
         >,
     >,
     next_cli_ping_id: AtomicU64,
+    /// Weak by design: tracked tasks own `Inner`, while the registry owns
+    /// their join handles. Keeping only a weak back-reference avoids an Arc
+    /// cycle and lets explicit shutdown own every task to completion.
+    tasks: std::sync::Weak<TaskRegistry>,
+    closed: AtomicBool,
 }
 
 /// Owns all state registered by one `cli_ping` call. Synchronous cleanup in
@@ -1116,6 +1242,7 @@ struct DerpManager {
     reconnect_tx: mpsc::UnboundedSender<i32>,
     /// Optional health tracker for reporting DERP home reachability.
     health: Option<rustscale_health::Tracker>,
+    tasks: std::sync::Weak<TaskRegistry>,
 }
 
 impl DerpManager {
@@ -1125,6 +1252,7 @@ impl DerpManager {
         node_private: NodePrivate,
         home_region: i32,
         health: Option<rustscale_health::Tracker>,
+        tasks: std::sync::Weak<TaskRegistry>,
     ) -> (
         Self,
         mpsc::Receiver<(i32, DerpEvent)>,
@@ -1138,12 +1266,13 @@ impl DerpManager {
         // Register the pre-connected home region client.
         if let Some(client) = home_client {
             let region = if home_region > 0 { home_region } else { 1 };
-            let io = Arc::new(DerpIo::spawn(client));
+            let io = Arc::new(DerpIo::spawn(client, &tasks));
             spawn_derp_recv_consumer(
                 region,
                 io.clone(),
                 derp_recv_tx.clone(),
                 reconnect_tx.clone(),
+                &tasks,
             );
             connections.insert(region, io);
         }
@@ -1156,6 +1285,7 @@ impl DerpManager {
             derp_recv_tx,
             reconnect_tx,
             health,
+            tasks,
         };
 
         (mgr, derp_recv_rx, reconnect_rx)
@@ -1164,6 +1294,9 @@ impl DerpManager {
     /// Get the DerpIo for a region, lazily connecting if needed.
     /// Returns None if the region is unknown or connection fails.
     async fn get_or_connect(&self, region_id: i32) -> Option<Arc<DerpIo>> {
+        if self.tasks.upgrade().is_none_or(|tasks| tasks.is_closed()) {
+            return None;
+        }
         // Fast path: already connected.
         {
             let conns = self
@@ -1274,7 +1407,11 @@ impl DerpManager {
             health.set_healthy(rustscale_health::WARN_NO_DERP_CONNECTION);
         }
 
-        let io = Arc::new(DerpIo::spawn(client));
+        let io = Arc::new(DerpIo::spawn(client, &self.tasks));
+        if self.tasks.upgrade().is_none_or(|tasks| tasks.is_closed()) {
+            io.close();
+            return None;
+        }
 
         // Insert and spawn recv consumer.
         {
@@ -1294,6 +1431,7 @@ impl DerpManager {
             io.clone(),
             self.derp_recv_tx.clone(),
             self.reconnect_tx.clone(),
+            &self.tasks,
         );
 
         Some(io)
@@ -1412,8 +1550,12 @@ fn spawn_derp_recv_consumer(
     io: Arc<DerpIo>,
     tx: mpsc::Sender<(i32, DerpEvent)>,
     reconnect_tx: mpsc::UnboundedSender<i32>,
+    tasks: &std::sync::Weak<TaskRegistry>,
 ) {
-    tokio::spawn(async move {
+    let Some(tasks) = tasks.upgrade() else {
+        return;
+    };
+    tasks.spawn(async move {
         while let Some(event) = io.try_recv().await {
             if tx.send((region_id, event)).await.is_err() {
                 break;
@@ -1487,6 +1629,10 @@ impl Magicsock {
                 .as_ref()
                 .is_some_and(|socket| udp_batch::supports_gso(socket));
 
+        // The registry lives outside Inner. Inner keeps only a Weak pointer,
+        // so task futures may own Inner without creating a reference cycle.
+        let tasks = Arc::new(TaskRegistry::default());
+
         // Create the DERP manager with the home region connection + DERPMap.
         let (derp, derp_recv_rx, reconnect_rx) = DerpManager::new(
             config.derp_client,
@@ -1494,6 +1640,7 @@ impl Magicsock {
             config.private_key.clone(),
             config.home_derp_region,
             config.health.clone(),
+            Arc::downgrade(&tasks),
         );
 
         // Self node's CapMap — shared between Inner and RelayServerExtension.
@@ -1521,7 +1668,7 @@ impl Magicsock {
         let inner = Arc::new(Inner {
             node_public: RwLock::new(node_public),
             disco,
-            udp,
+            udp: RwLock::new(udp),
             #[cfg(target_os = "linux")]
             udp_tx_batch: AtomicBool::new(udp_tx_batch),
             #[cfg(target_os = "linux")]
@@ -1551,13 +1698,16 @@ impl Magicsock {
             connection_counter: ConnectionCounterHook::default(),
             cli_ping_callbacks: RwLock::new(HashMap::new()),
             next_cli_ping_id: AtomicU64::new(1),
+            tasks: Arc::downgrade(&tasks),
+            closed: AtomicBool::new(false),
         });
 
         // Spawn the relay manager event loop. The handle is stored in Inner
         // for use by set_netmap and disco receive paths. We use RwLock
         // because spawn_relay_manager takes an Arc<Inner> clone (for the
         // RelayManagerContext impl), preventing Arc::get_mut.
-        let rm_handle = relay_manager::spawn_relay_manager(inner.clone());
+        let rm_handle =
+            relay_manager::spawn_relay_manager_tracked(inner.clone(), Arc::downgrade(&tasks));
         {
             let mut guard = inner
                 .relay_manager
@@ -1567,9 +1717,21 @@ impl Magicsock {
         }
 
         // Launch background recv tasks (UDP + DERP demux + reconnect supervisor).
-        spawn_recv_tasks(inner.clone(), derp_recv_rx, reconnect_rx);
+        spawn_recv_tasks(
+            inner.clone(),
+            derp_recv_rx,
+            reconnect_rx,
+            Arc::downgrade(&tasks),
+        );
 
-        Ok((Self { inner }, wg_recv))
+        Ok((
+            Self {
+                inner,
+                tasks,
+                shutdown: Arc::new(MagicsockShutdown::default()),
+            },
+            wg_recv,
+        ))
     }
 
     /// Our node public key.
@@ -1640,7 +1802,7 @@ impl Magicsock {
     /// `local_udp_addrs`, which enumerates all host interface IPs paired
     /// with the port for control-plane advertisement.
     pub fn bound_udp_addr(&self) -> Option<std::net::SocketAddr> {
-        self.inner.udp.as_ref()?.local_addr().ok()
+        self.inner.udp_socket()?.local_addr().ok()
     }
 
     /// Local interface endpoints (IP:port) to advertise in the MapRequest
@@ -1691,7 +1853,10 @@ impl Magicsock {
             // Probe in the background; the result populates the cache that
             // `portmap_endpoint` reads.
             let pm = pm.clone();
-            tokio::spawn(async move {
+            let Some(tasks) = self.inner.tasks.upgrade() else {
+                return;
+            };
+            tasks.spawn(async move {
                 let _ = tokio::time::timeout(std::time::Duration::from_secs(2), pm.probe()).await;
                 let _ = tokio::time::timeout(
                     std::time::Duration::from_secs(2),
@@ -1713,9 +1878,72 @@ impl Magicsock {
         Ok(())
     }
 
+    /// Stop every magicsock-owned task and transport. The first caller starts
+    /// an owned shutdown flight; cancelling a waiter cannot cancel cleanup.
+    /// Later callers join the same flight, making shutdown idempotent.
+    pub async fn shutdown(&self, deadline: Duration) -> Result<(), MagicsockError> {
+        self.start_shutdown();
+        let wait = async {
+            loop {
+                let notified = self.shutdown.complete.notified();
+                if *self.shutdown.phase.lock().expect("magicsock shutdown lock")
+                    == ShutdownPhase::Complete
+                {
+                    return;
+                }
+                notified.await;
+            }
+        };
+        tokio::time::timeout(deadline, wait)
+            .await
+            .map_err(|_| MagicsockError::Timeout)
+    }
+
+    fn start_shutdown(&self) {
+        let should_start = {
+            let mut phase = self.shutdown.phase.lock().expect("magicsock shutdown lock");
+            if *phase == ShutdownPhase::Running {
+                *phase = ShutdownPhase::ShuttingDown;
+                true
+            } else {
+                false
+            }
+        };
+        if !should_start {
+            return;
+        }
+
+        // Close registration and transport gates synchronously before the
+        // owned flight is spawned, so cancellation at the first await cannot
+        // allow new background work or leave listeners reachable.
+        self.inner.begin_shutdown();
+        let inner = self.inner.clone();
+        let tasks = self.tasks.clone();
+        let shutdown = self.shutdown.clone();
+        tokio::spawn(async move {
+            if let Some(relay_server) = &inner.relay_server {
+                relay_server.shutdown().await;
+            }
+
+            let mut owned = tasks.close_and_take();
+            for task in &owned {
+                task.abort();
+            }
+            for task in owned.drain(..) {
+                let _ = task.await;
+            }
+
+            *shutdown.phase.lock().expect("magicsock shutdown lock") = ShutdownPhase::Complete;
+            shutdown.complete.notify_waiters();
+        });
+    }
+
     /// Update the peer set from a netmap. Creates/updates per-peer endpoints,
     /// starts disco probing, and sends CallMeMaybe via the peer's home DERP.
     pub async fn set_netmap(&self, peers: Vec<Node>) -> Result<(), MagicsockError> {
+        if self.inner.closed.load(Ordering::Acquire) {
+            return Err(MagicsockError::NoPath);
+        }
         let desired: HashSet<NodePublic> = peers
             .iter()
             .filter(|peer| !peer.Key.is_zero())
@@ -1926,7 +2154,7 @@ impl Magicsock {
         // both sides stay on DERP.
         for (peer_key, peer_disco, candidates, derp_region) in probe_list {
             // Send disco Pings to each candidate over UDP.
-            if !self.inner.disable_direct_paths && self.inner.udp.is_some() {
+            if !self.inner.disable_direct_paths && self.inner.udp_socket().is_some() {
                 for addr in &candidates {
                     self.inner
                         .send_disco_ping(
@@ -2101,6 +2329,9 @@ impl Magicsock {
         peer: NodePublic,
         datagrams: &[T],
     ) -> Result<(), MagicsockError> {
+        if self.inner.closed.load(Ordering::Acquire) {
+            return Err(MagicsockError::NoPath);
+        }
         if datagrams.is_empty() {
             return Ok(());
         }
@@ -2161,11 +2392,11 @@ impl Magicsock {
                     }
                     return first_error.map_or(Ok(()), Err);
                 }
-                if let Some(ref udp) = self.inner.udp {
+                if let Some(udp) = self.inner.udp_socket() {
                     #[cfg(target_os = "linux")]
                     {
                         return self
-                            .send_direct_batch_linux(udp, addr, node_addr, datagrams)
+                            .send_direct_batch_linux(&udp, addr, node_addr, datagrams)
                             .await;
                     }
                     #[cfg(not(target_os = "linux"))]
@@ -2206,7 +2437,7 @@ impl Magicsock {
                 // Relay paths work even when direct paths are disabled —
                 // the relay path is established by the relay manager, not
                 // by direct disco pinging.
-                if let Some(ref udp) = self.inner.udp {
+                if let Some(udp) = self.inner.udp_socket() {
                     let (mut sent_packets, mut sent_bytes) = (0, 0);
                     for datagram in datagrams {
                         let datagram = datagram.as_ref();
@@ -2370,7 +2601,7 @@ impl Magicsock {
     /// the bound UDP port, reset all peers' confirmed direct paths (so disco
     /// re-probes), and close all DERP connections (so they reconnect fresh).
     pub fn link_changed(&self) {
-        if let Some(ref udp) = self.inner.udp {
+        if let Some(udp) = self.inner.udp_socket() {
             if let Ok(port) = udp.local_addr().map(|a| a.port()) {
                 let eps = gather_local_endpoints(port);
                 *self
@@ -2479,11 +2710,9 @@ impl Magicsock {
     /// state so discovery re-probes path MTUs.
     pub fn update_pmtud(&self) {
         let current = self.inner.peer_mtu_enabled.load(Ordering::Relaxed);
-        let (new_enabled, changed) = pmtud::update_pmtud(
-            self.inner.udp.as_deref(),
-            self.inner.control_knobs.as_deref(),
-            current,
-        );
+        let udp = self.inner.udp_socket();
+        let (new_enabled, changed) =
+            pmtud::update_pmtud(udp.as_deref(), self.inner.control_knobs.as_deref(), current);
         self.inner
             .peer_mtu_enabled
             .store(new_enabled, Ordering::Relaxed);
@@ -2501,7 +2730,8 @@ impl Magicsock {
     /// Query the DF bit state on the UDP socket.
     /// Mirrors Go's `Conn.DontFragSetting()`.
     pub fn dont_frag_setting(&self) -> Result<bool, pmtud::SetDfError> {
-        pmtud::dont_frag_setting(self.inner.udp.as_deref())
+        let udp = self.inner.udp_socket();
+        pmtud::dont_frag_setting(udp.as_deref())
     }
 
     /// Reset per-peer PMTU values and endpoint state so discovery re-probes.
@@ -2729,7 +2959,14 @@ impl Magicsock {
         self.inner
             .heartbeat_task_generations
             .fetch_add(1, Ordering::Relaxed);
-        let handle = tokio::spawn(peer_background_task(self.inner.clone(), peer_key.clone()));
+        let Some(task_registry) = self.inner.tasks.upgrade() else {
+            return;
+        };
+        let Some(handle) =
+            task_registry.spawn(peer_background_task(self.inner.clone(), peer_key.clone()))
+        else {
+            return;
+        };
         if let Some(old) = tasks.insert(peer_key.clone(), handle) {
             old.abort();
         }
@@ -2757,11 +2994,19 @@ impl Magicsock {
         };
         if let Some((peer_disco, candidates, derp_region, send_cmm)) = work {
             let inner = self.inner.clone();
-            tokio::spawn(async move {
-                inner
-                    .send_discovery_round(peer_key, peer_disco, candidates, derp_region, send_cmm)
-                    .await;
-            });
+            if let Some(tasks) = inner.tasks.upgrade() {
+                tasks.spawn(async move {
+                    inner
+                        .send_discovery_round(
+                            peer_key,
+                            peer_disco,
+                            candidates,
+                            derp_region,
+                            send_cmm,
+                        )
+                        .await;
+                });
+            }
         }
     }
 
@@ -2899,19 +3144,27 @@ impl Magicsock {
     }
 }
 
+impl Drop for Magicsock {
+    fn drop(&mut self) {
+        self.inner.begin_shutdown();
+        self.tasks.abort_now();
+    }
+}
+
 /// Launch background UDP recv task + DERP demux task.
 fn spawn_recv_tasks(
     inner: Arc<Inner>,
     derp_recv_rx: mpsc::Receiver<(i32, DerpEvent)>,
     reconnect_rx: mpsc::UnboundedReceiver<i32>,
+    tasks: std::sync::Weak<TaskRegistry>,
 ) {
     // Linux owns one reusable recvmmsg batch for this task. Tokio owns socket
     // readiness; the raw helper only performs one nonblocking receive syscall.
     #[cfg(target_os = "linux")]
-    if let Some(ref udp) = inner.udp {
-        let udp = udp.clone();
+    if let Some(udp) = inner.udp.read().expect("udp socket lock").clone() {
         let inner = inner.clone();
-        tokio::spawn(async move {
+        if let Some(tasks) = tasks.upgrade() {
+            tasks.spawn(async move {
             // Read deployment configuration once. Neither receive mode nor
             // UDP GRO selection consults the process environment on the hot
             // path.
@@ -2996,92 +3249,100 @@ fn spawn_recv_tasks(
                 }
             }
         });
+        }
     }
 
     // Keep the established awaited receive plus immediate drain path exactly
     // as-is on platforms without Linux recvmmsg support.
     #[cfg(not(target_os = "linux"))]
-    if let Some(ref udp) = inner.udp {
-        let udp = udp.clone();
+    if let Some(udp) = inner.udp.read().expect("udp socket lock").clone() {
         let inner = inner.clone();
-        tokio::spawn(async move {
-            let mut buf = vec![0u8; 65_536];
-            loop {
-                match udp.recv_from(&mut buf).await {
-                    Ok((len, addr)) => {
-                        inner.record_udp_rx(addr, len);
-                        inner.handle_udp_packet(&buf[..len], addr).await;
-                        // Drain the rest of the currently-ready packet burst
-                        // without another await on the socket.
-                        while let Ok((len2, addr2)) = udp.try_recv_from(&mut buf) {
-                            inner.record_udp_rx(addr2, len2);
-                            inner.handle_udp_packet(&buf[..len2], addr2).await;
+        if let Some(tasks) = tasks.upgrade() {
+            tasks.spawn(async move {
+                let mut buf = vec![0u8; 65_536];
+                loop {
+                    match udp.recv_from(&mut buf).await {
+                        Ok((len, addr)) => {
+                            inner.record_udp_rx(addr, len);
+                            inner.handle_udp_packet(&buf[..len], addr).await;
+                            // Drain the rest of the currently-ready packet burst
+                            // without another await on the socket.
+                            while let Ok((len2, addr2)) = udp.try_recv_from(&mut buf) {
+                                inner.record_udp_rx(addr2, len2);
+                                inner.handle_udp_packet(&buf[..len2], addr2).await;
+                            }
                         }
+                        Err(_) => break,
                     }
-                    Err(_) => break,
                 }
-            }
-        });
+            });
+        }
     }
 
     // DERP demux task: consumes from all DERP region recv consumers and
     // dispatches to handle_derp_packet / handle_derp_peer_gone. This single
     // task handles packets from ALL connected regions (home + lazy).
     let inner2 = inner.clone();
-    tokio::spawn(async move {
-        let mut derp_recv_rx = derp_recv_rx;
-        while let Some((region_id, event)) = derp_recv_rx.recv().await {
-            match event {
-                DerpEvent::RecvPacket {
-                    source,
-                    frame,
-                    payload,
-                } => {
-                    inner2
-                        .handle_derp_packet(frame, payload, source, region_id)
-                        .await;
-                }
-                DerpEvent::PeerGone { peer, reason } => {
-                    inner2.handle_derp_peer_gone(peer, region_id, reason);
-                }
-                DerpEvent::Health { problem } => {
-                    // Update DERP region health. Empty problem = healthy.
-                    if let Some(ref health) = inner2.derp.health {
-                        health.set_derp_region_health(region_id, problem.is_empty());
-                        if problem.is_empty() {
-                            health.set_healthy(rustscale_health::WARN_DERP_REGION_ERROR);
-                        } else {
-                            health.set_unhealthy(
-                                rustscale_health::WARN_DERP_REGION_ERROR,
-                                format!(
-                                    "{{\"{}\":{},\"{}\":\"{}\"}}",
-                                    rustscale_health::ARG_DERP_REGION_ID,
-                                    region_id,
-                                    rustscale_health::ARG_ERROR,
-                                    problem,
-                                ),
-                            );
+    if let Some(task_registry) = tasks.upgrade() {
+        task_registry.spawn(async move {
+            let mut derp_recv_rx = derp_recv_rx;
+            while let Some((region_id, event)) = derp_recv_rx.recv().await {
+                match event {
+                    DerpEvent::RecvPacket {
+                        source,
+                        frame,
+                        payload,
+                    } => {
+                        inner2
+                            .handle_derp_packet(frame, payload, source, region_id)
+                            .await;
+                    }
+                    DerpEvent::PeerGone { peer, reason } => {
+                        inner2.handle_derp_peer_gone(peer, region_id, reason);
+                    }
+                    DerpEvent::Health { problem } => {
+                        // Update DERP region health. Empty problem = healthy.
+                        if let Some(ref health) = inner2.derp.health {
+                            health.set_derp_region_health(region_id, problem.is_empty());
+                            if problem.is_empty() {
+                                health.set_healthy(rustscale_health::WARN_DERP_REGION_ERROR);
+                            } else {
+                                health.set_unhealthy(
+                                    rustscale_health::WARN_DERP_REGION_ERROR,
+                                    format!(
+                                        "{{\"{}\":{},\"{}\":\"{}\"}}",
+                                        rustscale_health::ARG_DERP_REGION_ID,
+                                        region_id,
+                                        rustscale_health::ARG_ERROR,
+                                        problem,
+                                    ),
+                                );
+                            }
                         }
                     }
                 }
             }
-        }
-    });
+        });
+    }
 
     // DERP reconnect supervisor: listens for dead-connection signals from
     // recv consumers and spawns a per-region reconnect task with
     // exponential backoff. Each region gets its own task so multiple
     // regions can reconnect in parallel without blocking each other.
     let inner3 = inner;
-    tokio::spawn(async move {
-        let mut reconnect_rx = reconnect_rx;
-        while let Some(region_id) = reconnect_rx.recv().await {
-            let inner = inner3.clone();
-            tokio::spawn(async move {
-                inner.derp.reconnect_region(region_id).await;
-            });
-        }
-    });
+    if let Some(task_registry) = tasks.upgrade() {
+        task_registry.spawn(async move {
+            let mut reconnect_rx = reconnect_rx;
+            while let Some(region_id) = reconnect_rx.recv().await {
+                let inner = inner3.clone();
+                if let Some(tasks) = inner.tasks.upgrade() {
+                    tasks.spawn(async move {
+                        inner.derp.reconnect_region(region_id).await;
+                    });
+                }
+            }
+        });
+    }
 }
 
 /// Per-peer background task: heartbeat pings + UDP lifetime probing.
@@ -3326,7 +3587,7 @@ impl relay_manager::RelayManagerContext for Inner {
     }
 
     fn send_disco_udp(&self, addr: SocketAddr, vni: u32, control: bool, packet: &[u8]) {
-        if let Some(ref udp) = self.udp {
+        if let Some(udp) = self.udp_socket() {
             let framed = if control {
                 relay::encode_geneve_disco_control(vni, packet)
             } else {
@@ -3338,15 +3599,17 @@ impl relay_manager::RelayManagerContext for Inner {
                 SocketAddr::V4(_) => self.sockstats_udp4.clone(),
                 SocketAddr::V6(_) => self.sockstats_udp6.clone(),
             };
-            tokio::spawn(async move {
-                if let Err(e) = udp.send_to(&framed, addr).await {
-                    if !treat_as_lost_udp(&e) {
-                        log::debug!("magicsock: disco UDP send failed: {e}");
+            if let Some(tasks) = self.tasks.upgrade() {
+                tasks.spawn(async move {
+                    if let Err(e) = udp.send_to(&framed, addr).await {
+                        if !treat_as_lost_udp(&e) {
+                            log::debug!("magicsock: disco UDP send failed: {e}");
+                        }
+                    } else if let Some(ref h) = handle {
+                        h.record_tx(framed.len());
                     }
-                } else if let Some(ref h) = handle {
-                    h.record_tx(framed.len());
-                }
-            });
+                });
+            }
         }
     }
 
@@ -3360,9 +3623,11 @@ impl relay_manager::RelayManagerContext for Inner {
             conns.get(&region).cloned()
         };
         if let Some(io) = io {
-            tokio::spawn(async move {
-                io.send_packet(dst_key, packet).await;
-            });
+            if let Some(tasks) = self.tasks.upgrade() {
+                tasks.spawn(async move {
+                    io.send_packet(dst_key, packet).await;
+                });
+            }
         }
     }
 
@@ -3519,6 +3784,38 @@ impl relay_manager::RelayManagerContext for Inner {
 }
 
 impl Inner {
+    fn begin_shutdown(&self) {
+        if self.closed.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        if let Some(tasks) = self.tasks.upgrade() {
+            tasks.close_registration();
+        }
+        self.relay_manager
+            .write()
+            .expect("relay_manager lock poisoned")
+            .take();
+        self.derp.close_all();
+        for (_, task) in self
+            .background_tasks
+            .write()
+            .expect("background_tasks lock poisoned")
+            .drain()
+        {
+            task.abort();
+        }
+        // Removing Inner's socket ownership closes the listener once the
+        // tracked receive/send tasks have been joined.
+        self.udp.write().expect("udp socket lock poisoned").take();
+        if let Some(relay_server) = &self.relay_server {
+            relay_server.close();
+        }
+    }
+
+    fn udp_socket(&self) -> Option<Arc<UdpSocket>> {
+        self.udp.read().expect("udp socket lock poisoned").clone()
+    }
+
     fn authorized_disco_generation(
         &self,
         peer_key: &NodePublic,
@@ -3689,7 +3986,7 @@ impl Inner {
                 padding,
             });
             if let Some(packet) = self.disco.seal(peer_disco, &ping) {
-                if let Some(ref udp) = self.udp {
+                if let Some(udp) = self.udp_socket() {
                     if debug_enabled() {
                         eprintln!(
                             "DBG disco_ping send to {addr} peer={} purpose={:?} size={s}",
@@ -4239,7 +4536,7 @@ impl Inner {
                     src: rustscale_disco::AddrPort::from(src),
                 });
                 if let Some(reply) = self.disco.seal(&sender_disco, &pong) {
-                    if let Some(ref udp) = self.udp {
+                    if let Some(udp) = self.udp_socket() {
                         if debug_enabled() {
                             eprintln!("DBG disco_pong send to {src} peer={}", short_key(&peer));
                         }

@@ -2368,6 +2368,16 @@ impl Server {
                     "pre-login portmapper cleanup incomplete: {error}"
                 )))));
             }
+            if let Err(error) = pre_started_state
+                .magicsock
+                .shutdown(std::time::Duration::from_secs(5))
+                .await
+            {
+                self.pre_started = Some(pre_started_state);
+                return CloseResult(Err(TsnetError::Io(std::io::Error::other(format!(
+                    "pre-login magicsock cleanup incomplete: {error}"
+                )))));
+            }
             // Stop accepting before dropping command and magicsock ownership;
             // shutdown joins the accept loop and every spawned connection.
             if let Some(handle) = pre_started_state.handle.take() {
@@ -2387,6 +2397,17 @@ impl Server {
                 self.inner = Some(inner);
                 return CloseResult(Err(TsnetError::Io(std::io::Error::other(format!(
                     "portmapper cleanup incomplete: {error}"
+                )))));
+            }
+            if let Err(error) = inner
+                .magicsock
+                .shutdown(std::time::Duration::from_secs(5))
+                .await
+            {
+                log::warn!("tsnet: retaining running state for magicsock cleanup retry: {error}");
+                self.inner = Some(inner);
+                return CloseResult(Err(TsnetError::Io(std::io::Error::other(format!(
+                    "magicsock cleanup incomplete: {error}"
                 )))));
             }
             if let Some(router) = inner.router.take() {
@@ -2484,6 +2505,16 @@ impl Server {
             self.inner = Some(inner);
             return Err(TsnetError::Io(std::io::Error::other(format!(
                 "portmapper cleanup incomplete: {error}"
+            ))));
+        }
+        if let Err(error) = inner
+            .magicsock
+            .shutdown(std::time::Duration::from_secs(5))
+            .await
+        {
+            self.inner = Some(inner);
+            return Err(TsnetError::Io(std::io::Error::other(format!(
+                "magicsock cleanup incomplete: {error}"
             ))));
         }
 

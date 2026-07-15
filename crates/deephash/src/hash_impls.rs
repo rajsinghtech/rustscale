@@ -1,17 +1,19 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{BuildHasher, Hash};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Offset, TimeZone};
 use rustscale_ipn::{AppConnectorPrefs, MaskedPrefs, Prefs, State};
 use rustscale_key::{DiscoPublic, MachinePublic, NodePublic};
 use rustscale_tailcfg::{
-    CapGrant, ClientVersion, DNSConfig, DNSRecord, EndpointType, FilterRule, Hostinfo, Location,
-    MapResponse, NetInfo, NetPortRange, OptBool, PeerChange, PortRange, RawMessage, Resolver,
-    Service, TPMInfo,
+    CapGrant, ClientVersion, DERPHomeParams, DERPMap, DERPNode, DERPRegion, DNSConfig, DNSRecord,
+    EndpointType, FilterRule, Hostinfo, Location, MapResponse, NetInfo, NetPortRange, OptBool,
+    PeerChange, PingRequest, PortRange, RawMessage, Resolver, SSHAction, SSHPolicy, SSHPrincipal,
+    SSHRecorderFailureAction, SSHRule, Service, TPMInfo, UserProfile,
 };
-use serde::Serialize;
 
 use crate::{DeepHash, Hasher, Sum};
 
@@ -40,6 +42,9 @@ macro_rules! impl_bytes {
 }
 impl_bytes!(u128, i128, usize, isize, f32, f64);
 
+impl DeepHash for () {
+    fn deep_hash(&self, _hasher: &mut Hasher) {}
+}
 impl DeepHash for bool {
     fn deep_hash(&self, hasher: &mut Hasher) {
         hasher.hash_uint8(u8::from(*self));
@@ -68,6 +73,11 @@ impl<T: DeepHash + ?Sized> DeepHash for &T {
 }
 impl<T: DeepHash> DeepHash for Vec<T> {
     fn deep_hash(&self, hasher: &mut Hasher) {
+        self.as_slice().deep_hash(hasher);
+    }
+}
+impl<T: DeepHash> DeepHash for [T] {
+    fn deep_hash(&self, hasher: &mut Hasher) {
         hasher.hash_uint8(1);
         hasher.hash_uint64(self.len() as u64);
         for value in self {
@@ -75,16 +85,11 @@ impl<T: DeepHash> DeepHash for Vec<T> {
         }
     }
 }
-impl<T: DeepHash> DeepHash for [T] {
+impl<T: DeepHash, const N: usize> DeepHash for [T; N] {
     fn deep_hash(&self, hasher: &mut Hasher) {
         for value in self {
             value.deep_hash(hasher);
         }
-    }
-}
-impl<T: DeepHash, const N: usize> DeepHash for [T; N] {
-    fn deep_hash(&self, hasher: &mut Hasher) {
-        self.as_slice().deep_hash(hasher);
     }
 }
 impl<T: DeepHash> DeepHash for Option<T> {
@@ -98,47 +103,105 @@ impl<T: DeepHash> DeepHash for Option<T> {
         }
     }
 }
-impl<T: DeepHash> DeepHash for Box<T> {
+impl<T: DeepHash + ?Sized> DeepHash for Box<T> {
     fn deep_hash(&self, hasher: &mut Hasher) {
-        hasher.hash_uint8(1);
-        (**self).deep_hash(hasher);
+        hash_non_null_pointer(hasher, &**self);
+    }
+}
+impl<T: DeepHash + ?Sized> DeepHash for Rc<T> {
+    fn deep_hash(&self, hasher: &mut Hasher) {
+        hash_non_null_pointer(hasher, &**self);
     }
 }
 impl<T: DeepHash + ?Sized> DeepHash for Arc<T> {
     fn deep_hash(&self, hasher: &mut Hasher) {
-        (**self).deep_hash(hasher);
+        hash_non_null_pointer(hasher, &**self);
+    }
+}
+impl<T: DeepHash, E: DeepHash> DeepHash for Result<T, E> {
+    fn deep_hash(&self, hasher: &mut Hasher) {
+        match self {
+            Ok(value) => {
+                hasher.hash_uint8(0);
+                value.deep_hash(hasher);
+            }
+            Err(error) => {
+                hasher.hash_uint8(1);
+                error.deep_hash(hasher);
+            }
+        }
+    }
+}
+impl<A: DeepHash, B: DeepHash> DeepHash for (A, B) {
+    fn deep_hash(&self, hasher: &mut Hasher) {
+        self.0.deep_hash(hasher);
+        self.1.deep_hash(hasher);
+    }
+}
+impl<A: DeepHash, B: DeepHash, C: DeepHash> DeepHash for (A, B, C) {
+    fn deep_hash(&self, hasher: &mut Hasher) {
+        self.0.deep_hash(hasher);
+        self.1.deep_hash(hasher);
+        self.2.deep_hash(hasher);
     }
 }
 impl<K: DeepHash + Hash + Eq, V: DeepHash, S: BuildHasher> DeepHash for HashMap<K, V, S> {
     fn deep_hash(&self, hasher: &mut Hasher) {
-        hasher.hash_uint8(1);
-        hasher.hash_uint64(self.len() as u64);
-        let mut entries = Sum([0; 32]);
-        for (key, value) in self {
-            let mut entry_hasher = Hasher::new();
-            key.deep_hash(&mut entry_hasher);
-            value.deep_hash(&mut entry_hasher);
-            entries.xor(&entry_hasher.finalize());
-        }
-        hasher.hash_sum(&entries);
+        hash_map(hasher, self.len(), self.iter());
     }
 }
 impl<K: DeepHash + Ord, V: DeepHash> DeepHash for BTreeMap<K, V> {
     fn deep_hash(&self, hasher: &mut Hasher) {
-        hasher.hash_uint64(self.len() as u64);
-        for (key, value) in self {
-            key.deep_hash(hasher);
-            value.deep_hash(hasher);
-        }
+        hash_map(hasher, self.len(), self.iter());
+    }
+}
+impl<T: DeepHash + Hash + Eq, S: BuildHasher> DeepHash for HashSet<T, S> {
+    fn deep_hash(&self, hasher: &mut Hasher) {
+        hash_set(hasher, self.len(), self.iter());
     }
 }
 impl<T: DeepHash + Ord> DeepHash for BTreeSet<T> {
     fn deep_hash(&self, hasher: &mut Hasher) {
-        hasher.hash_uint64(self.len() as u64);
-        for value in self {
-            value.deep_hash(hasher);
-        }
+        hash_set(hasher, self.len(), self.iter());
     }
+}
+
+fn hash_non_null_pointer<T: DeepHash + ?Sized>(hasher: &mut Hasher, value: &T) {
+    hasher.hash_uint8(1);
+    value.deep_hash(hasher);
+}
+
+fn hash_map<'a, K: DeepHash + 'a, V: DeepHash + 'a>(
+    hasher: &mut Hasher,
+    len: usize,
+    entries: impl Iterator<Item = (&'a K, &'a V)>,
+) {
+    hasher.hash_uint8(1);
+    hasher.hash_uint64(len as u64);
+    let mut sum = Sum([0; 32]);
+    for (key, value) in entries {
+        let mut entry_hasher = Hasher::new();
+        key.deep_hash(&mut entry_hasher);
+        value.deep_hash(&mut entry_hasher);
+        sum.xor(&entry_hasher.finalize());
+    }
+    hasher.hash_sum(&sum);
+}
+
+fn hash_set<'a, T: DeepHash + 'a>(
+    hasher: &mut Hasher,
+    len: usize,
+    entries: impl Iterator<Item = &'a T>,
+) {
+    hasher.hash_uint8(1);
+    hasher.hash_uint64(len as u64);
+    let mut sum = Sum([0; 32]);
+    for value in entries {
+        let mut entry_hasher = Hasher::new();
+        value.deep_hash(&mut entry_hasher);
+        sum.xor(&entry_hasher.finalize());
+    }
+    hasher.hash_sum(&sum);
 }
 impl DeepHash for IpAddr {
     fn deep_hash(&self, hasher: &mut Hasher) {
@@ -150,20 +213,49 @@ impl DeepHash for IpAddr {
 }
 impl DeepHash for Ipv4Addr {
     fn deep_hash(&self, hasher: &mut Hasher) {
-        hasher.hash_uint8(4);
+        hasher.hash_uint64(4);
         hasher.hash_bytes(&self.octets());
     }
 }
 impl DeepHash for Ipv6Addr {
     fn deep_hash(&self, hasher: &mut Hasher) {
-        hasher.hash_uint8(16);
+        hasher.hash_uint64(16);
         hasher.hash_bytes(&self.octets());
     }
 }
-impl DeepHash for DateTime<Utc> {
+impl DeepHash for SocketAddr {
+    fn deep_hash(&self, hasher: &mut Hasher) {
+        match self {
+            Self::V4(value) => value.deep_hash(hasher),
+            Self::V6(value) => value.deep_hash(hasher),
+        }
+    }
+}
+impl DeepHash for SocketAddrV4 {
+    fn deep_hash(&self, hasher: &mut Hasher) {
+        self.ip().deep_hash(hasher);
+        self.port().deep_hash(hasher);
+    }
+}
+impl DeepHash for SocketAddrV6 {
+    fn deep_hash(&self, hasher: &mut Hasher) {
+        self.ip().deep_hash(hasher);
+        self.port().deep_hash(hasher);
+        self.flowinfo().deep_hash(hasher);
+        self.scope_id().deep_hash(hasher);
+    }
+}
+impl<Tz: TimeZone> DeepHash for DateTime<Tz> {
     fn deep_hash(&self, hasher: &mut Hasher) {
         hasher.hash_uint64(self.timestamp() as u64);
         hasher.hash_uint32(self.timestamp_subsec_nanos());
+        hasher.hash_uint32(self.offset().fix().local_minus_utc() as u32);
+    }
+}
+impl DeepHash for Duration {
+    fn deep_hash(&self, hasher: &mut Hasher) {
+        self.as_secs().deep_hash(hasher);
+        self.subsec_nanos().deep_hash(hasher);
     }
 }
 impl DeepHash for NodePublic {
@@ -243,6 +335,54 @@ impl DeepHash for DNSConfig {
         self.CertDomains.deep_hash(h);
         self.ExtraRecords.deep_hash(h);
         self.Nameservers.deep_hash(h);
+    }
+}
+impl DeepHash for UserProfile {
+    fn deep_hash(&self, h: &mut Hasher) {
+        self.ID.deep_hash(h);
+        self.LoginName.deep_hash(h);
+        self.DisplayName.deep_hash(h);
+        self.ProfilePicURL.deep_hash(h);
+    }
+}
+impl DeepHash for DERPHomeParams {
+    fn deep_hash(&self, h: &mut Hasher) {
+        self.RegionScore.deep_hash(h);
+    }
+}
+impl DeepHash for DERPMap {
+    fn deep_hash(&self, h: &mut Hasher) {
+        self.HomeParams.deep_hash(h);
+        self.Regions.deep_hash(h);
+        self.OmitDefaultRegions.deep_hash(h);
+    }
+}
+impl DeepHash for DERPRegion {
+    fn deep_hash(&self, h: &mut Hasher) {
+        self.RegionID.deep_hash(h);
+        self.RegionCode.deep_hash(h);
+        self.RegionName.deep_hash(h);
+        self.Latitude.deep_hash(h);
+        self.Longitude.deep_hash(h);
+        self.Avoid.deep_hash(h);
+        self.NoMeasureNoHome.deep_hash(h);
+        self.Nodes.deep_hash(h);
+    }
+}
+impl DeepHash for DERPNode {
+    fn deep_hash(&self, h: &mut Hasher) {
+        self.Name.deep_hash(h);
+        self.RegionID.deep_hash(h);
+        self.HostName.deep_hash(h);
+        self.CertName.deep_hash(h);
+        self.IPv4.deep_hash(h);
+        self.IPv6.deep_hash(h);
+        self.STUNPort.deep_hash(h);
+        self.STUNOnly.deep_hash(h);
+        self.DERPPort.deep_hash(h);
+        self.InsecureForTests.deep_hash(h);
+        self.STUNTestIP.deep_hash(h);
+        self.CanPort80.deep_hash(h);
     }
 }
 impl DeepHash for Service {
@@ -377,6 +517,59 @@ impl DeepHash for PeerChange {
         self.KeyExpiry.deep_hash(h);
     }
 }
+impl DeepHash for PingRequest {
+    fn deep_hash(&self, h: &mut Hasher) {
+        self.URL.deep_hash(h);
+        self.URLIsNoise.deep_hash(h);
+        self.Log.deep_hash(h);
+        self.Types.deep_hash(h);
+        self.IP.deep_hash(h);
+        self.Payload.deep_hash(h);
+    }
+}
+impl DeepHash for SSHPolicy {
+    fn deep_hash(&self, h: &mut Hasher) {
+        self.Rules.deep_hash(h);
+    }
+}
+impl DeepHash for SSHRule {
+    fn deep_hash(&self, h: &mut Hasher) {
+        self.RuleExpires.deep_hash(h);
+        self.Principals.deep_hash(h);
+        self.SSHUsers.deep_hash(h);
+        self.Action.deep_hash(h);
+        self.AcceptEnv.deep_hash(h);
+    }
+}
+impl DeepHash for SSHPrincipal {
+    fn deep_hash(&self, h: &mut Hasher) {
+        self.Node.deep_hash(h);
+        self.NodeIP.deep_hash(h);
+        self.UserLogin.deep_hash(h);
+        self.Any.deep_hash(h);
+    }
+}
+impl DeepHash for SSHAction {
+    fn deep_hash(&self, h: &mut Hasher) {
+        self.Message.deep_hash(h);
+        self.Reject.deep_hash(h);
+        self.Accept.deep_hash(h);
+        self.SessionDuration.deep_hash(h);
+        self.AllowAgentForwarding.deep_hash(h);
+        self.HoldAndDelegate.deep_hash(h);
+        self.AllowLocalPortForwarding.deep_hash(h);
+        self.AllowRemotePortForwarding.deep_hash(h);
+        self.Recorders.deep_hash(h);
+        self.OnRecordingFailure.deep_hash(h);
+    }
+}
+impl DeepHash for SSHRecorderFailureAction {
+    fn deep_hash(&self, h: &mut Hasher) {
+        self.RejectSessionWithMessage.deep_hash(h);
+        self.TerminateSessionWithMessage.deep_hash(h);
+        self.NotifyURL.deep_hash(h);
+    }
+}
 impl DeepHash for AppConnectorPrefs {
     fn deep_hash(&self, h: &mut Hasher) {
         self.Advertise.deep_hash(h);
@@ -467,28 +660,23 @@ impl DeepHash for MapResponse {
         self.Seq.deep_hash(h);
         self.KeepAlive.deep_hash(h);
         self.Node.deep_hash(h);
-        hash_json(h, &self.DERPMap);
+        self.DERPMap.deep_hash(h);
         self.Peers.deep_hash(h);
         self.PeersChanged.deep_hash(h);
         self.PeersRemoved.deep_hash(h);
         self.Domain.deep_hash(h);
         self.DNSConfig.deep_hash(h);
-        hash_json(h, &self.UserProfiles);
+        self.UserProfiles.deep_hash(h);
         self.PacketFilter.deep_hash(h);
         self.PacketFilters.deep_hash(h);
         self.NodeKeyExpired.deep_hash(h);
+        self.PingRequest.deep_hash(h);
         self.ControlTime.deep_hash(h);
         self.CollectServices.deep_hash(h);
-        hash_json(h, &self.SSHPolicy);
+        self.SSHPolicy.deep_hash(h);
         self.PeersChangedPatch.deep_hash(h);
         self.NetInfo.deep_hash(h);
-        hash_json(h, &self.ClientVersion);
+        self.ClientVersion.deep_hash(h);
         self.SuggestedExitNode.deep_hash(h);
     }
-}
-
-fn hash_json<T: Serialize>(hasher: &mut Hasher, value: &T) {
-    let bytes = serde_json::to_vec(value).expect("rustscale wire type must serialize to JSON");
-    hasher.hash_uint64(bytes.len() as u64);
-    hasher.hash_bytes(&bytes);
 }

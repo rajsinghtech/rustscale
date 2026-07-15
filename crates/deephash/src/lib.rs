@@ -1,7 +1,9 @@
 //! Process-local structural SHA-256 hashes for inexpensive change detection.
 //!
-//! [`Sum`] values are deliberately not stable across processes or releases;
-//! use them only to compare values while a process is running.
+//! Values are hashed by logical content: maps and sets do not depend on
+//! iteration order, and smart pointers are dereferenced rather than hashing
+//! their addresses. [`Sum`] values are deliberately seeded per process and
+//! include Rust type names, so they must not be persisted or sent on the wire.
 
 #![forbid(unsafe_code)]
 
@@ -9,19 +11,23 @@ mod hash_impls;
 mod hasher;
 mod sum;
 
-use std::any::TypeId;
-use std::collections::HashMap;
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Mutex, OnceLock,
-};
+use std::any::type_name;
+use std::sync::OnceLock;
 
 pub use hasher::Hasher;
 pub use sum::Sum;
 
 /// Types that can write their logical structure into a [`Hasher`].
 ///
-/// Implementations must write fields in a deterministic, stable order.
+/// Implementations must write fields in a deterministic, stable order and
+/// must frame variable-length data. Enums must hash an explicit discriminant
+/// before variant data. Implementations for pointers hash the pointee, never
+/// its address.
+///
+/// Unsupported types fail at compile time because they do not implement this
+/// trait. Safe owning Rust values cannot normally contain a cycle; custom
+/// implementations for interior-mutable cyclic graphs must detect cycles
+/// themselves rather than recursively calling `deep_hash` without a bound.
 pub trait DeepHash {
     /// Feed this value's logical representation to `hasher`.
     fn deep_hash(&self, hasher: &mut Hasher);
@@ -32,7 +38,9 @@ pub trait DeepHash {
 pub fn hash<T: DeepHash + ?Sized + 'static>(value: &T) -> Sum {
     let mut hasher = Hasher::new();
     hasher.hash_uint64(*process_seed());
-    hasher.hash_uint64(type_hash::<T>());
+    let type_name = type_name::<T>();
+    hasher.hash_uint64(type_name.len() as u64);
+    hasher.hash_string(type_name);
     value.deep_hash(&mut hasher);
     hasher.finalize()
 }
@@ -41,22 +49,15 @@ pub fn hash<T: DeepHash + ?Sized + 'static>(value: &T) -> Sum {
 pub fn update<T: DeepHash + ?Sized + 'static>(last: &mut Sum, value: &T) -> bool {
     let current = hash(value);
     let changed = *last != current;
-    *last = current;
+    if changed {
+        *last = current;
+    }
     changed
 }
 
 fn process_seed() -> &'static u64 {
     static SEED: OnceLock<u64> = OnceLock::new();
     SEED.get_or_init(rand::random)
-}
-
-fn type_hash<T: ?Sized + 'static>() -> u64 {
-    static NEXT: AtomicU64 = AtomicU64::new(1);
-    static MAP: OnceLock<Mutex<HashMap<TypeId, u64>>> = OnceLock::new();
-    let map = MAP.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut map = map.lock().expect("deephash type-id map mutex poisoned");
-    *map.entry(TypeId::of::<T>())
-        .or_insert_with(|| NEXT.fetch_add(1, Ordering::Relaxed))
 }
 
 #[cfg(test)]

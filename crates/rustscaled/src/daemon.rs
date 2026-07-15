@@ -77,6 +77,11 @@ pub async fn run(
     if let Some(ref cfg) = config {
         apply_config_prefs_to_disk(cfg, &state_dir)?;
     }
+    // Prove the syspolicy path on one existing preference without changing
+    // unrelated daemon configuration: InstallUpdates can force AutoUpdate at
+    // startup. Invalid or unreadable managed policy is not silently treated as
+    // absent.
+    apply_system_policy_prefs_to_disk(&state_dir)?;
 
     // Go creates logpolicy before its local backend. Keep that order here so
     // the private ID used by upload is the same persisted ID tsnet exposes as
@@ -387,6 +392,34 @@ fn apply_config_prefs_to_disk(
     Ok(())
 }
 
+fn apply_system_policy_prefs_to_disk(state_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let policy = rustscale_syspolicy::default_engine(rustscale_syspolicy::PolicyScope::Device)?;
+    let mut prefs = rustscale_ipn::Prefs::load(state_dir)?;
+    if apply_auto_update_policy(&mut prefs, &policy)? {
+        prefs.save(state_dir)?;
+    }
+    Ok(())
+}
+
+fn apply_auto_update_policy(
+    prefs: &mut rustscale_ipn::Prefs,
+    policy: &rustscale_syspolicy::PolicyEngine,
+) -> Result<bool, rustscale_syspolicy::PolicyError> {
+    use rustscale_syspolicy::{PolicyKey, PreferenceOption};
+
+    let option =
+        policy.get_preference_option(PolicyKey::ApplyUpdates, PreferenceOption::UserDecides)?;
+    if option == PreferenceOption::UserDecides {
+        return Ok(false);
+    }
+    let desired = option.should_enable(prefs.AutoUpdate.unwrap_or(false));
+    if prefs.AutoUpdate == Some(desired) {
+        return Ok(false);
+    }
+    prefs.AutoUpdate = Some(desired);
+    Ok(true)
+}
+
 fn print_status(server: &Server, socket_path: &Path) {
     let status = server.status();
     let ips: Vec<String> = status
@@ -504,4 +537,55 @@ async fn wait_for_shutdown_signal(config_path: Option<&PathBuf>) {
 #[cfg(not(unix))]
 async fn wait_for_shutdown_signal(_config_path: Option<&PathBuf>) {
     let _ = tokio::signal::ctrl_c().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::BTreeMap, sync::Arc};
+
+    use rustscale_syspolicy::{
+        MemoryProvider, PolicyEngine, PolicyErrorKind, PolicyKey, PolicyScope, RawValue,
+    };
+
+    use super::apply_auto_update_policy;
+
+    #[test]
+    fn install_updates_policy_forces_existing_preference() {
+        let policy = PolicyEngine::well_known(PolicyScope::Device).unwrap();
+        policy
+            .add_provider(
+                "test",
+                PolicyScope::Device,
+                Arc::new(MemoryProvider::from_values(BTreeMap::from([(
+                    PolicyKey::ApplyUpdates,
+                    RawValue::String("always".into()),
+                )]))),
+            )
+            .unwrap();
+        let mut prefs = rustscale_ipn::Prefs {
+            AutoUpdate: Some(false),
+            ..Default::default()
+        };
+        assert!(apply_auto_update_policy(&mut prefs, &policy).unwrap());
+        assert_eq!(prefs.AutoUpdate, Some(true));
+    }
+
+    #[test]
+    fn invalid_install_updates_policy_is_not_defaulted() {
+        let policy = PolicyEngine::well_known(PolicyScope::Device).unwrap();
+        policy
+            .add_provider(
+                "test",
+                PolicyScope::Device,
+                Arc::new(MemoryProvider::from_values(BTreeMap::from([(
+                    PolicyKey::ApplyUpdates,
+                    RawValue::String("sometimes".into()),
+                )]))),
+            )
+            .unwrap();
+        let mut prefs = rustscale_ipn::Prefs::default();
+        let error = apply_auto_update_policy(&mut prefs, &policy).unwrap_err();
+        assert_eq!(error.kind, PolicyErrorKind::Parse);
+        assert_eq!(prefs.AutoUpdate, None);
+    }
 }

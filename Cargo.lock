@@ -3631,6 +3631,7 @@ dependencies = [
  "rustscale-logpolicy",
  "rustscale-logtail",
  "rustscale-safesocket",
+ "rustscale-syspolicy",
  "rustscale-tsnet",
  "thiserror 1.0.69",
  "tokio",
@@ -3703,7 +3704,6 @@ dependencies = [
 name = "rustscale-syspolicy"
 version = "0.1.1"
 dependencies = [
- "log",
  "serde",
  "serde_json",
  "tempfile",

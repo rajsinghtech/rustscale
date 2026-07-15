@@ -20,6 +20,7 @@ rustscale-conffile = { path = "../conffile", version = "0.1.1" }
 rustscale-ipn = { path = "../ipn", version = "0.1.1" }
 rustscale-logpolicy = { path = "../logpolicy", version = "0.1.1" }
 rustscale-logtail = { path = "../logtail", version = "0.1.1" }
+rustscale-syspolicy.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 log.workspace = true

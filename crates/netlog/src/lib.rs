@@ -10,9 +10,8 @@
 //! pairs are serialized as a [`Message`] JSON blob and written to
 //! logtail.
 //!
-//! Phase 1: crate structure, types, logger with virtual traffic only
-//! (tun path via the filter). Physical traffic from magicsock and
-//! exit-node anonymization wiring are deferred to Phase 2.
+//! Virtual traffic arrives from the packet filter and physical transport
+//! traffic arrives from magicsock through separate counters.
 
 pub mod record;
 pub mod traffic;
@@ -278,7 +277,12 @@ async fn aggregation_task(inner: Arc<LoggerInner>, mut rx: mpsc::UnboundedReceiv
         tokio::select! {
             biased; // check shutdown first
             _ = inner.shutdown.notified() => {
-                // Final flush, then exit.
+                // Drain callbacks that completed before shutdown so the final
+                // record is deterministic even though hot-path accounting is
+                // queued asynchronously.
+                while let Ok(ev) = rx.try_recv() {
+                    process_event(&inner, &mut record, ev).await;
+                }
                 flush_record(&inner, &mut record).await;
                 break;
             }

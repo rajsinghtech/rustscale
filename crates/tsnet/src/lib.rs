@@ -208,6 +208,8 @@ pub enum TsnetError {
     Derp(#[from] rustscale_derp::DerpError),
     #[error("netcheck error: {0}")]
     Netcheck(#[from] rustscale_netcheck::NetcheckError),
+    #[error("netlog error: {0}")]
+    Netlog(#[from] rustscale_netlog::NetlogError),
     #[error("tun device error: {0}")]
     Tun(#[from] rustscale_tun::TunError),
     #[error("listen/dial not available in TUN mode (no userspace netstack)")]
@@ -294,6 +296,8 @@ pub struct ServerBuilder {
     /// Optional daemon logtail client. Embeddings leave this unset by default;
     /// rustscaled supplies it so C2N can request an immediate upload.
     pub(crate) logtail: Option<rustscale_logtail::LogTail>,
+    /// Optional tailtraffic logtail client for network flow logging.
+    pub(crate) netlog: Option<rustscale_logtail::LogTail>,
     /// Additional DER-encoded root CAs to trust alongside the webpki and
     /// baked ISRG roots for control-plane and DERP TLS connections. Mirrors
     /// Go's `tsnet.Server.ExtraRootCAs`.
@@ -334,6 +338,7 @@ impl std::fmt::Debug for ServerBuilder {
             .field("posture_checking", &self.posture_checking)
             .field("logger", &self.logger.as_ref().map(|_| "<logger>"))
             .field("logtail", &self.logtail.as_ref().map(|_| "<logtail>"))
+            .field("netlog", &self.netlog.as_ref().map(|_| "<netlog>"))
             .finish()
     }
 }
@@ -534,6 +539,16 @@ impl ServerBuilder {
         self
     }
 
+    /// Enable network flow logging with a tailtraffic logtail client.
+    ///
+    /// This is separate from [`Self::logtail`] so configuring diagnostic logs
+    /// never implicitly enables traffic accounting or sends flow records to
+    /// the wrong collection.
+    pub fn netlog(mut self, logtail: rustscale_logtail::LogTail) -> Self {
+        self.netlog = Some(logtail);
+        self
+    }
+
     /// Set additional DER-encoded root CAs to trust for control-plane and
     /// DERP TLS connections. These are concatenated with the webpki roots
     /// and baked ISRG roots (see `rustscale_bakedroots::combined_root_store`).
@@ -623,6 +638,8 @@ impl ServerBuilder {
 pub(crate) struct RunningState {
     pub(crate) tailscale_ips: Vec<IpAddr>,
     pub(crate) magicsock: Arc<Magicsock>,
+    /// Network flow logger when the embedding configured tailtraffic logging.
+    pub(crate) netlog: Option<Arc<rustscale_netlog::Logger>>,
     pub(crate) data_plane: DataPlane,
     pub(crate) peers: Arc<RwLock<Vec<Node>>>,
     pub(crate) route_table: Arc<RwLock<RouteTable>>,
@@ -757,6 +774,7 @@ pub(crate) struct Bootstrap {
     pub(crate) tailscale_ips: Vec<IpAddr>,
     pub(crate) our_v4: Ipv4Addr,
     pub(crate) magicsock: Arc<Magicsock>,
+    pub(crate) netlog: Option<Arc<rustscale_netlog::Logger>>,
     pub(crate) wg_recv: mpsc::Receiver<rustscale_magicsock::WgReceiveBatch>,
     pub(crate) wg_tunnels: Arc<RwLock<HashMap<NodePublic, Arc<Mutex<WgTunn>>>>>,
     pub(crate) peers: Arc<RwLock<Vec<Node>>>,

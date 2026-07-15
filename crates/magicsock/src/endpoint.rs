@@ -6,7 +6,7 @@
 //! and a DERP fallback (the peer's home region).
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
 /// How long to trust a direct path after receiving a pong.
@@ -256,6 +256,9 @@ impl BestPath {
 /// Per-peer endpoint state.
 pub struct Endpoint {
     peer_node_key: rustscale_key::NodePublic,
+    /// The peer's first Tailscale address, used as the source of physical
+    /// netlog tuples, matching upstream magicsock's `nodeAddr`.
+    node_addr: Option<IpAddr>,
     peer_disco_key: rustscale_key::DiscoPublic,
     candidates: Vec<(SocketAddr, EndpointType)>,
     best_addr: Option<(SocketAddr, Instant)>,
@@ -297,6 +300,7 @@ impl Endpoint {
     ) -> Self {
         Self {
             peer_node_key,
+            node_addr: None,
             peer_disco_key,
             candidates: Vec::new(),
             best_addr: None,
@@ -317,6 +321,16 @@ impl Endpoint {
     /// The peer's WireGuard public key.
     pub fn peer_node_key(&self) -> &rustscale_key::NodePublic {
         &self.peer_node_key
+    }
+
+    /// The peer's first Tailscale address.
+    pub fn node_addr(&self) -> Option<IpAddr> {
+        self.node_addr
+    }
+
+    /// Refresh the peer's first Tailscale address.
+    pub fn set_node_addr(&mut self, node_addr: Option<IpAddr>) {
+        self.node_addr = node_addr;
     }
 
     /// The peer's disco public key.

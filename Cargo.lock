@@ -3563,6 +3563,8 @@ dependencies = [
  "rustscale-logtail",
  "rustscale-magicsock",
  "rustscale-netcheck",
+ "rustscale-netlog",
+ "rustscale-netlogtype",
  "rustscale-netmon",
  "rustscale-netns",
  "rustscale-netstack",

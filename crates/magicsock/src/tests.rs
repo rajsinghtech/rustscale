@@ -21,6 +21,160 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, Mutex, Notify};
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CountCall {
+    proto: u8,
+    source: (IpAddr, u16),
+    destination: (IpAddr, u16),
+    packets: u64,
+    bytes: u64,
+    recv: bool,
+}
+
+fn recording_counter() -> (Arc<std::sync::Mutex<Vec<CountCall>>>, ConnectionCounter) {
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let calls_for_counter = calls.clone();
+    let counter = Arc::new(move |proto, source, destination, packets, bytes, recv| {
+        calls_for_counter.lock().unwrap().push(CountCall {
+            proto,
+            source,
+            destination,
+            packets,
+            bytes,
+            recv,
+        });
+    });
+    (calls, counter)
+}
+
+#[test]
+fn physical_counter_records_direct_and_derp_directions() {
+    let hook = ConnectionCounterHook::default();
+    let (calls, counter) = recording_counter();
+    hook.set(Some(counter));
+    let node_addr = "100.64.0.2".parse().unwrap();
+    let direct: SocketAddr = "203.0.113.7:41641".parse().unwrap();
+    let derp = SocketAddr::new(DERP_MAGIC_IP, 12);
+
+    hook.record(Some(node_addr), direct, 2, 300, false);
+    hook.record(Some(node_addr), direct, 3, 450, true);
+    hook.record(Some(node_addr), derp, 1, 120, false);
+    hook.record(Some(node_addr), derp, 4, 480, true);
+
+    assert_eq!(
+        *calls.lock().unwrap(),
+        vec![
+            CountCall {
+                proto: 0,
+                source: (node_addr, 0),
+                destination: (direct.ip(), direct.port()),
+                packets: 2,
+                bytes: 300,
+                recv: false,
+            },
+            CountCall {
+                proto: 0,
+                source: (node_addr, 0),
+                destination: (direct.ip(), direct.port()),
+                packets: 3,
+                bytes: 450,
+                recv: true,
+            },
+            CountCall {
+                proto: 0,
+                source: (node_addr, 0),
+                destination: (DERP_MAGIC_IP, 12),
+                packets: 1,
+                bytes: 120,
+                recv: false,
+            },
+            CountCall {
+                proto: 0,
+                source: (node_addr, 0),
+                destination: (DERP_MAGIC_IP, 12),
+                packets: 4,
+                bytes: 480,
+                recv: true,
+            },
+        ]
+    );
+}
+
+#[test]
+fn physical_counter_disabled_and_missing_node_address_are_noops() {
+    let hook = ConnectionCounterHook::default();
+    let destination = "203.0.113.7:41641".parse().unwrap();
+    hook.record(
+        Some("100.64.0.2".parse().unwrap()),
+        destination,
+        1,
+        10,
+        false,
+    );
+
+    let (calls, counter) = recording_counter();
+    hook.set(Some(counter));
+    hook.record(None, destination, 1, 10, false);
+    hook.set(None);
+    hook.record(
+        Some("100.64.0.2".parse().unwrap()),
+        destination,
+        1,
+        10,
+        false,
+    );
+    assert!(calls.lock().unwrap().is_empty());
+}
+
+#[test]
+fn physical_counter_batches_logical_packets_once() {
+    let hook = ConnectionCounterHook::default();
+    let (calls, counter) = recording_counter();
+    hook.set(Some(counter));
+    let datagrams = [b"one".as_slice(), b"twenty".as_slice(), b"333".as_slice()];
+    let (packets, bytes) = batch_counts(&datagrams);
+    let node_addr = "fd7a:115c:a1e0::2".parse().unwrap();
+    let destination = "[2001:db8::7]:41641".parse().unwrap();
+
+    hook.record(Some(node_addr), destination, packets, bytes, false);
+
+    assert_eq!(
+        *calls.lock().unwrap(),
+        vec![CountCall {
+            proto: 0,
+            source: (node_addr, 0),
+            destination: (destination.ip(), destination.port()),
+            packets: 3,
+            bytes: 12,
+            recv: false,
+        }]
+    );
+}
+
+#[test]
+fn physical_counter_contains_callback_panics() {
+    let hook = ConnectionCounterHook::default();
+    hook.set(Some(Arc::new(|_, _, _, _, _, _| panic!("mock panic"))));
+    hook.record(
+        Some("100.64.0.2".parse().unwrap()),
+        "203.0.113.7:41641".parse().unwrap(),
+        1,
+        10,
+        false,
+    );
+
+    let (calls, counter) = recording_counter();
+    hook.set(Some(counter));
+    hook.record(
+        Some("100.64.0.2".parse().unwrap()),
+        "203.0.113.7:41641".parse().unwrap(),
+        1,
+        10,
+        false,
+    );
+    assert_eq!(calls.lock().unwrap().len(), 1);
+}
+
 #[test]
 fn post_selection_configures_some_socket_from_udp_socket_and_udp_bind() {
     // `Magicsock::new` resolves both constructor alternatives before this
@@ -596,8 +750,14 @@ async fn derp_data_path_fallback() {
     .expect("B magicsock");
 
     // Each knows about the other via the netmap.
-    let b_peer = make_peer(b.node_public(), b.disco_public(), vec![], 1);
-    let a_peer = make_peer(a.node_public(), a.disco_public(), vec![], 1);
+    let mut b_peer = make_peer(b.node_public(), b.disco_public(), vec![], 1);
+    b_peer.Addresses = vec!["100.64.0.2/32".into()];
+    let mut a_peer = make_peer(a.node_public(), a.disco_public(), vec![], 1);
+    a_peer.Addresses = vec!["100.64.0.1/32".into()];
+    let (a_counts, a_counter) = recording_counter();
+    let (b_counts, b_counter) = recording_counter();
+    a.set_connection_counter(Some(a_counter));
+    b.set_connection_counter(Some(b_counter));
 
     // Give relay time to fully register both clients.
     relay.wait_for_clients(2).await;
@@ -642,6 +802,49 @@ async fn derp_data_path_fallback() {
         .expect("one DERP datagram");
     assert_eq!(received.peer, b.node_public());
     assert_eq!(received.data, wg_reply);
+
+    assert_eq!(
+        *a_counts.lock().unwrap(),
+        vec![
+            CountCall {
+                proto: 0,
+                source: ("100.64.0.2".parse().unwrap(), 0),
+                destination: (DERP_MAGIC_IP, 1),
+                packets: 1,
+                bytes: wg_datagram.len() as u64,
+                recv: false,
+            },
+            CountCall {
+                proto: 0,
+                source: ("100.64.0.2".parse().unwrap(), 0),
+                destination: (DERP_MAGIC_IP, 1),
+                packets: 1,
+                bytes: wg_reply.len() as u64,
+                recv: true,
+            },
+        ]
+    );
+    assert_eq!(
+        *b_counts.lock().unwrap(),
+        vec![
+            CountCall {
+                proto: 0,
+                source: ("100.64.0.1".parse().unwrap(), 0),
+                destination: (DERP_MAGIC_IP, 1),
+                packets: 1,
+                bytes: wg_datagram.len() as u64,
+                recv: true,
+            },
+            CountCall {
+                proto: 0,
+                source: ("100.64.0.1".parse().unwrap(), 0),
+                destination: (DERP_MAGIC_IP, 1),
+                packets: 1,
+                bytes: wg_reply.len() as u64,
+                recv: false,
+            },
+        ]
+    );
 }
 
 #[tokio::test]
@@ -1152,8 +1355,14 @@ async fn direct_path_upgrade_over_udp() {
     let a_udp = a.bound_udp_addr().unwrap().to_string();
     let b_udp = b.bound_udp_addr().unwrap().to_string();
 
-    let b_peer = make_peer(b.node_public(), b.disco_public(), vec![b_udp], 1);
-    let a_peer = make_peer(a.node_public(), a.disco_public(), vec![a_udp], 1);
+    let mut b_peer = make_peer(b.node_public(), b.disco_public(), vec![b_udp], 1);
+    b_peer.Addresses = vec!["100.64.0.2/32".into()];
+    let mut a_peer = make_peer(a.node_public(), a.disco_public(), vec![a_udp], 1);
+    a_peer.Addresses = vec!["100.64.0.1/32".into()];
+    let (a_counts, a_counter) = recording_counter();
+    let (b_counts, b_counter) = recording_counter();
+    a.set_connection_counter(Some(a_counter));
+    b.set_connection_counter(Some(b_counter));
     a.set_netmap(vec![b_peer]).await.expect("A set_netmap");
     b.set_netmap(vec![a_peer]).await.expect("B set_netmap");
 
@@ -1176,6 +1385,10 @@ async fn direct_path_upgrade_over_udp() {
     }
     assert!(a_direct, "A should have a trusted direct path to B");
     assert!(b_direct, "B should have a trusted direct path to A");
+    assert!(
+        a_counts.lock().unwrap().is_empty() && b_counts.lock().unwrap().is_empty(),
+        "disco/control packets are not physical user traffic"
+    );
 
     assert_eq!(
         a.peer_path_class(&b.node_public()),
@@ -1212,6 +1425,28 @@ async fn direct_path_upgrade_over_udp() {
         assert_eq!(received.peer, a.node_public());
         assert_eq!(received.data, datagram);
     }
+
+    let a_counts = a_counts.lock().unwrap();
+    assert_eq!(a_counts.len(), 1, "one callback for one sent batch");
+    assert_eq!(a_counts[0].packets, 2);
+    assert_eq!(
+        a_counts[0].bytes,
+        datagrams
+            .iter()
+            .map(|packet| packet.len() as u64)
+            .sum::<u64>()
+    );
+    assert!(!a_counts[0].recv);
+    let b_counts = b_counts.lock().unwrap();
+    assert_eq!(b_counts.iter().map(|call| call.packets).sum::<u64>(), 2);
+    assert_eq!(
+        b_counts.iter().map(|call| call.bytes).sum::<u64>(),
+        datagrams
+            .iter()
+            .map(|packet| packet.len() as u64)
+            .sum::<u64>()
+    );
+    assert!(b_counts.iter().all(|call| call.recv));
 }
 
 // ---- Test: trust expiry downgrades to DERP ----

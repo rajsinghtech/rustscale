@@ -32,6 +32,23 @@ configure_rs_tun_inbound_pipeline() {
   esac
 }
 
+# Benchmark runtime modes are explicit 0/1 values so one delivered binary can
+# measure the scalar baseline, plain batch, or guarded-GRO candidate. The
+# daemon's production controls are presence-based disable switches, so `0`
+# below deliberately adds the corresponding RUSTSCALE_DISABLE_* variable.
+configure_linux_udp_receive_modes() {
+  [[ -n "${RS_LINUX_UDP_BATCH+x}" ]] || RS_LINUX_UDP_BATCH=1
+  [[ -n "${RS_LINUX_UDP_GRO+x}" ]] || RS_LINUX_UDP_GRO=1
+  case "$RS_LINUX_UDP_BATCH" in
+    0|1) export RS_LINUX_UDP_BATCH ;;
+    *) echo "RS_LINUX_UDP_BATCH must be 0 or 1" >&2; return 2 ;;
+  esac
+  case "$RS_LINUX_UDP_GRO" in
+    0|1) export RS_LINUX_UDP_GRO ;;
+    *) echo "RS_LINUX_UDP_GRO must be 0 or 1" >&2; return 2 ;;
+  esac
+}
+
 # SSH connection cache (populated by ssh_cmd on first use per VM).
 declare -A _SSH_IP=()
 declare -A _SSH_USER=()

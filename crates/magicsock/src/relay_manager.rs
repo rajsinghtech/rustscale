@@ -48,6 +48,8 @@ pub struct CandidatePeerRelay {
     pub node_key: NodePublic,
     pub disco_key: DiscoPublic,
     pub derp_home_region: u16,
+    /// Authorization generation of the relay server node in this map commit.
+    pub authorization_generation: u64,
 }
 
 impl CandidatePeerRelay {
@@ -121,8 +123,7 @@ enum RelayEvent {
         servers: Vec<CandidatePeerRelay>,
         done: Option<tokio::sync::oneshot::Sender<()>>,
     },
-    ServerUpsert(CandidatePeerRelay),
-    ServerRemove(NodePublic),
+    ServersUpdateComplete(tokio::sync::oneshot::Sender<()>),
     NewServerEndpoint {
         peer_key: NodePublic,
         peer_disco: DiscoPublic,
@@ -163,6 +164,8 @@ struct HandshakeWorkResult {
     peer_key: NodePublic,
     peer_disco: DiscoPublic,
     authorization_generation: u64,
+    relay_server: CandidatePeerRelay,
+    handshake_generation: u32,
     server_disco: DiscoPublic,
     vni: u32,
     pong_from: Option<SocketAddr>,
@@ -181,6 +184,7 @@ struct AllocWork {
     #[allow(dead_code)]
     alloc_gen: u32,
     cancel: tokio::sync::oneshot::Sender<()>,
+    task: Option<tokio::task::JoinHandle<()>>,
     response_tx: tokio::sync::mpsc::Sender<AllocateUdpRelayEndpointResponse>,
 }
 
@@ -188,9 +192,12 @@ struct HandshakeWork {
     #[allow(dead_code)]
     server_disco: DiscoPublic,
     authorization_generation: u64,
+    relay_server: CandidatePeerRelay,
+    handshake_generation: u32,
     vni: u32,
     lamport_id: u64,
     cancel: tokio::sync::oneshot::Sender<()>,
+    task: Option<tokio::task::JoinHandle<()>>,
     disco_msg_tx: tokio::sync::mpsc::Sender<(Message, SocketAddr, u32)>,
 }
 
@@ -307,14 +314,6 @@ impl RelayManagerHandle {
         }
     }
 
-    pub fn handle_relay_server_upsert(&self, server: CandidatePeerRelay) {
-        let _ = self.tx.send(RelayEvent::ServerUpsert(server));
-    }
-
-    pub fn handle_relay_server_remove(&self, node_key: NodePublic) {
-        let _ = self.tx.send(RelayEvent::ServerRemove(node_key));
-    }
-
     pub fn handle_call_me_maybe_via(
         &self,
         peer_key: NodePublic,
@@ -366,6 +365,7 @@ pub fn discover_relay_servers(self_node: &Node, peers: &[Node]) -> Vec<Candidate
                 node_key: node.Key.clone(),
                 disco_key: node.DiscoKey.clone(),
                 derp_home_region: node.HomeDERP.max(0) as u16,
+                authorization_generation: 0,
             });
         }
     }
@@ -387,8 +387,16 @@ pub trait RelayManagerContext: Send + Sync + 'static {
         peer_key: &NodePublic,
         peer_disco: &DiscoPublic,
         authorization_generation: u64,
+        relay_server_key: &NodePublic,
+        relay_server_generation: u64,
         addr: SocketAddr,
         vni: u32,
+    );
+    fn clear_relay_server(
+        &self,
+        relay_server_key: &NodePublic,
+        relay_server_disco: &DiscoPublic,
+        relay_server_generation: u64,
     );
     fn send_pong_via_relay(
         &self,
@@ -442,24 +450,22 @@ async fn run_event_loop<RM: RelayManagerContext>(
                 }
             }
             RelayEvent::CancelWork { peer_key, done } => {
-                stop_work(&mut state, &peer_key);
+                join_cancelled(stop_work(&mut state, &peer_key)).await;
                 if let Some(done) = done {
                     let _ = done.send(());
                 }
             }
             RelayEvent::ServersUpdate { servers, done } => {
-                handle_servers_update(&mut state, servers);
+                handle_servers_update(&mut state, &ctx, servers).await;
                 if let Some(done) = done {
-                    let _ = done.send(());
+                    // All joined workers enqueue their terminal events before
+                    // this marker. A waiting map commit is acknowledged only
+                    // after those stale completions have been rejected.
+                    let _ = event_tx.send(RelayEvent::ServersUpdateComplete(done));
                 }
             }
-            RelayEvent::ServerUpsert(server) => {
-                state
-                    .servers_by_node_key
-                    .insert(server.node_key.clone(), server);
-            }
-            RelayEvent::ServerRemove(node_key) => {
-                state.servers_by_node_key.remove(&node_key);
+            RelayEvent::ServersUpdateComplete(done) => {
+                let _ = done.send(());
             }
             RelayEvent::NewServerEndpoint {
                 peer_key,
@@ -477,7 +483,8 @@ async fn run_event_loop<RM: RelayManagerContext>(
                     authorization_generation,
                     server_endpoint,
                     server,
-                );
+                )
+                .await;
             }
             RelayEvent::DiscoMsg(msg) => {
                 handle_rx_disco_msg(&mut state, &ctx, msg);
@@ -488,7 +495,7 @@ async fn run_event_loop<RM: RelayManagerContext>(
                 }
             }
             RelayEvent::AllocWorkDone(result) => {
-                handle_alloc_work_done(&mut state, &ctx, &event_tx, result);
+                handle_alloc_work_done(&mut state, &ctx, &event_tx, result).await;
             }
             RelayEvent::HandshakeWorkDone(result) => {
                 handle_handshake_work_done(&mut state, &ctx, result);
@@ -501,13 +508,64 @@ async fn run_event_loop<RM: RelayManagerContext>(
 // Server set management
 // ---------------------------------------------------------------------------
 
-fn handle_servers_update(state: &mut RelayManagerState, servers: Vec<CandidatePeerRelay>) {
+async fn handle_servers_update<RM: RelayManagerContext>(
+    state: &mut RelayManagerState,
+    ctx: &std::sync::Arc<RM>,
+    servers: Vec<CandidatePeerRelay>,
+) {
     let new_set: HashMap<NodePublic, CandidatePeerRelay> = servers
         .into_iter()
-        .filter(CandidatePeerRelay::is_valid)
-        .map(|s| (s.node_key.clone(), s))
+        .filter(|server| server.is_valid() && relay_server_current(ctx, server))
+        .map(|server| (server.node_key.clone(), server))
         .collect();
+    let removed = state
+        .servers_by_node_key
+        .values()
+        .filter(|old| {
+            new_set.get(&old.node_key).is_none_or(|new| {
+                new.disco_key != old.disco_key
+                    || new.authorization_generation != old.authorization_generation
+            })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
     state.servers_by_node_key = new_set;
+
+    let mut cancelled = Vec::new();
+    for server in &removed {
+        cancelled.extend(stop_server_work(state, server));
+        ctx.clear_relay_server(
+            &server.node_key,
+            &server.disco_key,
+            server.authorization_generation,
+        );
+    }
+    join_cancelled(cancelled).await;
+}
+
+fn relay_server_current<RM: RelayManagerContext>(
+    ctx: &std::sync::Arc<RM>,
+    server: &CandidatePeerRelay,
+) -> bool {
+    server.authorization_generation != 0
+        && ctx.peer_authorization_generation(&server.node_key)
+            == Some(server.authorization_generation)
+        && ctx.peer_disco_key(&server.node_key).as_ref() == Some(&server.disco_key)
+}
+
+fn state_has_current_server<RM: RelayManagerContext>(
+    state: &RelayManagerState,
+    ctx: &std::sync::Arc<RM>,
+    server: &CandidatePeerRelay,
+) -> bool {
+    state
+        .servers_by_node_key
+        .get(&server.node_key)
+        .is_some_and(|current| {
+            current.disco_key == server.disco_key
+                && current.authorization_generation == server.authorization_generation
+        })
+        && relay_server_current(ctx, server)
 }
 
 // ---------------------------------------------------------------------------
@@ -534,27 +592,12 @@ fn allocate_all_servers<RM: RelayManagerContext>(
         let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
         let (resp_tx, resp_rx) = tokio::sync::mpsc::channel::<AllocateUdpRelayEndpointResponse>(1);
 
-        let work = AllocWork {
-            server: server.clone(),
-            authorization_generation,
-            disco_keys: disco_keys.clone(),
-            alloc_gen,
-            cancel: cancel_tx,
-            response_tx: resp_tx,
-        };
-
-        state
-            .alloc_work
-            .entry(peer_key.clone())
-            .or_default()
-            .insert(server.clone(), work);
-
         let ctx2 = ctx.clone();
         let event_tx2 = event_tx.clone();
         let peer_key2 = peer_key.clone();
         let peer_disco2 = peer_disco.clone();
         let server2 = server.clone();
-        tokio::spawn(spawn_alloc_work(
+        let task = tokio::spawn(spawn_alloc_work(
             ctx2,
             event_tx2,
             peer_key2,
@@ -566,6 +609,20 @@ fn allocate_all_servers<RM: RelayManagerContext>(
             cancel_rx,
             resp_rx,
         ));
+        let work = AllocWork {
+            server: server.clone(),
+            authorization_generation,
+            disco_keys: disco_keys.clone(),
+            alloc_gen,
+            cancel: cancel_tx,
+            task: Some(task),
+            response_tx: resp_tx,
+        };
+        state
+            .alloc_work
+            .entry(peer_key.clone())
+            .or_default()
+            .insert(server, work);
     }
 }
 
@@ -578,7 +635,7 @@ async fn spawn_alloc_work<RM: RelayManagerContext>(
     server: CandidatePeerRelay,
     disco_keys: [DiscoPublic; 2],
     alloc_gen: u32,
-    cancel_rx: tokio::sync::oneshot::Receiver<()>,
+    mut cancel_rx: tokio::sync::oneshot::Receiver<()>,
     mut resp_rx: tokio::sync::mpsc::Receiver<AllocateUdpRelayEndpointResponse>,
 ) {
     let dm = AllocateUdpRelayEndpointRequest {
@@ -640,23 +697,24 @@ async fn spawn_alloc_work<RM: RelayManagerContext>(
     let derp_region = i32::from(server.derp_home_region);
     ctx.send_disco_derp(derp_region, server.node_key.clone(), sealed.clone());
 
-    let retry_ctx = ctx.clone();
-    let retry_sealed = sealed.clone();
-    let retry_key = server.node_key.clone();
-    let retry_region = derp_region;
-    tokio::spawn(async move {
-        tokio::time::sleep(ALLOC_RETRY).await;
-        retry_ctx.send_disco_derp(retry_region, retry_key, retry_sealed);
-    });
-
     let timeout = tokio::time::sleep(ALLOC_TIMEOUT);
     tokio::pin!(timeout);
+    let retry = tokio::time::sleep(ALLOC_RETRY);
+    tokio::pin!(retry);
+    let mut retried = false;
 
-    tokio::select! {
-        _ = cancel_rx => {}
-        () = &mut timeout => {}
-        resp = resp_rx.recv() => {
-            if let Some(resp) = resp {
+    loop {
+        tokio::select! {
+            _ = &mut cancel_rx => return,
+            () = &mut timeout => break,
+            () = &mut retry, if !retried => {
+                retried = true;
+                ctx.send_disco_derp(derp_region, server.node_key.clone(), sealed.clone());
+            }
+            resp = resp_rx.recv() => {
+                let Some(resp) = resp else {
+                    break;
+                };
                 if resp.generation == alloc_gen {
                     let sorted = sort_pair(
                         &resp.endpoint.client_disco[0],
@@ -689,7 +747,7 @@ async fn spawn_alloc_work<RM: RelayManagerContext>(
     }));
 }
 
-fn handle_alloc_work_done<RM: RelayManagerContext>(
+async fn handle_alloc_work_done<RM: RelayManagerContext>(
     state: &mut RelayManagerState,
     ctx: &std::sync::Arc<RM>,
     event_tx: &tokio::sync::mpsc::UnboundedSender<RelayEvent>,
@@ -715,6 +773,7 @@ fn handle_alloc_work_done<RM: RelayManagerContext>(
 
     if ctx.peer_authorization_generation(peer_key) != Some(result.authorization_generation)
         || ctx.peer_disco_key(peer_key).as_ref() != Some(peer_disco)
+        || !state_has_current_server(state, ctx, &result.server)
     {
         return;
     }
@@ -729,7 +788,8 @@ fn handle_alloc_work_done<RM: RelayManagerContext>(
             result.authorization_generation,
             se.clone(),
             Some(result.server.clone()),
-        );
+        )
+        .await;
     }
 }
 
@@ -737,7 +797,7 @@ fn handle_alloc_work_done<RM: RelayManagerContext>(
 // Handshake
 // ---------------------------------------------------------------------------
 
-fn handle_new_server_endpoint<RM: RelayManagerContext>(
+async fn handle_new_server_endpoint<RM: RelayManagerContext>(
     state: &mut RelayManagerState,
     ctx: &std::sync::Arc<RM>,
     event_tx: &tokio::sync::mpsc::UnboundedSender<RelayEvent>,
@@ -750,6 +810,22 @@ fn handle_new_server_endpoint<RM: RelayManagerContext>(
     if ctx.peer_authorization_generation(&peer_key) != Some(authorization_generation)
         || ctx.peer_disco_key(&peer_key).as_ref() != Some(&peer_disco)
     {
+        return;
+    }
+    let server = server.or_else(|| {
+        state
+            .handshake_work
+            .get(&peer_key)
+            .and_then(|by_server| by_server.get(&se.server_disco))
+            .map(|work| work.relay_server.clone())
+    });
+    let Some(server) = server else {
+        // CallMeMaybeVia does not carry a relay server node key. Accept it
+        // only when it matches work already authenticated from our own
+        // allocation response.
+        return;
+    };
+    if !state_has_current_server(state, ctx, &server) {
         return;
     }
     let sdv = ServerDiscoVni {
@@ -766,7 +842,7 @@ fn handle_new_server_endpoint<RM: RelayManagerContext>(
                 }
             }
         }
-        cancel_handshake(state, &existing_peer, &se.server_disco);
+        join_cancelled(cancel_handshake(state, &existing_peer, &se.server_disco)).await;
     }
 
     // Check existing work for the same (peer, server_disco).
@@ -776,48 +852,47 @@ fn handle_new_server_endpoint<RM: RelayManagerContext>(
                 return;
             }
         }
-        cancel_handshake(state, &peer_key, &se.server_disco);
+        join_cancelled(cancel_handshake(state, &peer_key, &se.server_disco)).await;
     }
 
     // Send CallMeMaybeVia if we allocated this endpoint.
-    if server.as_ref().is_some_and(CandidatePeerRelay::is_valid) {
-        send_call_me_maybe_via(ctx, &peer_key, &se);
-    }
+    send_call_me_maybe_via(ctx, &peer_key, &se);
 
     let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
     let (disco_msg_tx, disco_msg_rx) = tokio::sync::mpsc::channel::<(Message, SocketAddr, u32)>(16);
 
     let handshake_gen = state.next_handshake_gen();
+    let ctx2 = ctx.clone();
+    let event_tx2 = event_tx.clone();
+    let task = tokio::spawn(spawn_handshake_work(
+        ctx2,
+        event_tx2,
+        peer_key.clone(),
+        peer_disco,
+        authorization_generation,
+        server.clone(),
+        se.clone(),
+        handshake_gen,
+        cancel_rx,
+        disco_msg_rx,
+    ));
     let work = HandshakeWork {
         server_disco: se.server_disco.clone(),
         authorization_generation,
+        relay_server: server,
+        handshake_generation: handshake_gen,
         vni: se.vni,
         lamport_id: se.lamport_id,
         cancel: cancel_tx,
+        task: Some(task),
         disco_msg_tx,
     };
-
     state
         .handshake_work
         .entry(peer_key.clone())
         .or_default()
         .insert(se.server_disco.clone(), work);
-
-    state.handshake_by_sdv.insert(sdv, peer_key.clone());
-
-    let ctx2 = ctx.clone();
-    let event_tx2 = event_tx.clone();
-    tokio::spawn(spawn_handshake_work(
-        ctx2,
-        event_tx2,
-        peer_key,
-        peer_disco,
-        authorization_generation,
-        se,
-        handshake_gen,
-        cancel_rx,
-        disco_msg_rx,
-    ));
+    state.handshake_by_sdv.insert(sdv, peer_key);
 }
 
 fn send_call_me_maybe_via<RM: RelayManagerContext>(
@@ -857,6 +932,7 @@ async fn spawn_handshake_work<RM: RelayManagerContext>(
     peer_key: NodePublic,
     peer_disco: DiscoPublic,
     authorization_generation: u64,
+    relay_server: CandidatePeerRelay,
     se: ServerEndpoint,
     handshake_gen: u32,
     mut cancel_rx: tokio::sync::oneshot::Receiver<()>,
@@ -881,6 +957,8 @@ async fn spawn_handshake_work<RM: RelayManagerContext>(
             peer_key,
             peer_disco,
             authorization_generation,
+            relay_server,
+            handshake_generation: handshake_gen,
             server_disco: se.server_disco,
             vni: se.vni,
             pong_from: None,
@@ -905,6 +983,8 @@ async fn spawn_handshake_work<RM: RelayManagerContext>(
         peer_key: peer_key.clone(),
         peer_disco: peer_disco.clone(),
         authorization_generation,
+        relay_server,
+        handshake_generation: handshake_gen,
         server_disco: se.server_disco.clone(),
         vni: se.vni,
         pong_from: None,
@@ -913,7 +993,7 @@ async fn spawn_handshake_work<RM: RelayManagerContext>(
 
     loop {
         tokio::select! {
-            _ = &mut cancel_rx => break,
+            _ = &mut cancel_rx => return,
             () = &mut timeout => break,
             () = &mut ping_retry, if handshake_state >= 1 => {
                 // Periodically resend Pings until we get a Pong or time out.
@@ -1027,23 +1107,40 @@ fn handle_handshake_work_done<RM: RelayManagerContext>(
         vni: result.vni,
     };
 
+    let matches_current_work = state
+        .handshake_work
+        .get(peer_key)
+        .and_then(|by_server| by_server.get(&result.server_disco))
+        .is_some_and(|work| {
+            work.authorization_generation == result.authorization_generation
+                && work.handshake_generation == result.handshake_generation
+                && work.relay_server == result.relay_server
+        });
+    if !matches_current_work {
+        return;
+    }
     state.handshake_by_sdv.remove(&sdv);
-
     if let Some(by_sd) = state.handshake_work.get_mut(peer_key) {
         by_sd.remove(&result.server_disco);
         if by_sd.is_empty() {
             state.handshake_work.remove(peer_key);
         }
     }
-
-    // Also clean up awaiting-pong entries for this work.
     state.handshake_awaiting_pong.retain(|_, pk| pk != peer_key);
 
     if let Some(pong_from) = result.pong_from {
+        if ctx.peer_authorization_generation(peer_key) != Some(result.authorization_generation)
+            || ctx.peer_disco_key(peer_key).as_ref() != Some(&result.peer_disco)
+            || !state_has_current_server(state, ctx, &result.relay_server)
+        {
+            return;
+        }
         ctx.set_relay(
             peer_key,
             &result.peer_disco,
             result.authorization_generation,
+            &result.relay_server.node_key,
+            result.relay_server.authorization_generation,
             pong_from,
             result.vni,
         );
@@ -1090,6 +1187,7 @@ fn handle_rx_disco_msg<RM: RelayManagerContext>(
                     if ctx.peer_authorization_generation(peer_key)
                         == Some(work.authorization_generation)
                         && server.node_key == relay_server_node_key
+                        && state_has_current_server(state, ctx, server)
                         && work.disco_keys == sorted
                     {
                         let _ = work.response_tx.try_send(resp.clone());
@@ -1116,6 +1214,7 @@ fn handle_rx_disco_msg<RM: RelayManagerContext>(
                 return;
             };
             if ctx.peer_authorization_generation(&peer_key) != Some(work.authorization_generation)
+                || !state_has_current_server(state, ctx, &work.relay_server)
                 || state.handshake_awaiting_pong.contains_key(&apv)
             {
                 return;
@@ -1138,6 +1237,7 @@ fn handle_rx_disco_msg<RM: RelayManagerContext>(
                         if work.vni == msg.vni
                             && ctx.peer_authorization_generation(&peer_key)
                                 == Some(work.authorization_generation)
+                            && state_has_current_server(state, ctx, &work.relay_server)
                         {
                             let _ =
                                 work.disco_msg_tx
@@ -1160,6 +1260,7 @@ fn handle_rx_disco_msg<RM: RelayManagerContext>(
                         if work.vni == msg.vni
                             && ctx.peer_authorization_generation(&peer_key)
                                 == Some(work.authorization_generation)
+                            && state_has_current_server(state, ctx, &work.relay_server)
                         {
                             let _ =
                                 work.disco_msg_tx
@@ -1179,11 +1280,48 @@ fn handle_rx_disco_msg<RM: RelayManagerContext>(
 // Cancellation
 // ---------------------------------------------------------------------------
 
-fn stop_work(state: &mut RelayManagerState, peer_key: &NodePublic) {
-    if let Some(by_server) = state.alloc_work.remove(peer_key) {
-        for (_, work) in by_server {
-            let _ = work.cancel.send(());
+fn cancel_work(work: impl Into<CancelledWork>) -> Option<tokio::task::JoinHandle<()>> {
+    let work = work.into();
+    let _ = work.cancel.send(());
+    work.task
+}
+
+struct CancelledWork {
+    cancel: tokio::sync::oneshot::Sender<()>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl From<AllocWork> for CancelledWork {
+    fn from(work: AllocWork) -> Self {
+        Self {
+            cancel: work.cancel,
+            task: work.task,
         }
+    }
+}
+
+impl From<HandshakeWork> for CancelledWork {
+    fn from(work: HandshakeWork) -> Self {
+        Self {
+            cancel: work.cancel,
+            task: work.task,
+        }
+    }
+}
+
+async fn join_cancelled(tasks: Vec<tokio::task::JoinHandle<()>>) {
+    for task in tasks {
+        let _ = task.await;
+    }
+}
+
+fn stop_work(
+    state: &mut RelayManagerState,
+    peer_key: &NodePublic,
+) -> Vec<tokio::task::JoinHandle<()>> {
+    let mut tasks = Vec::new();
+    if let Some(by_server) = state.alloc_work.remove(peer_key) {
+        tasks.extend(by_server.into_values().filter_map(cancel_work));
     }
     if let Some(by_sd) = state.handshake_work.remove(peer_key) {
         for (server_disco, work) in by_sd {
@@ -1192,30 +1330,90 @@ fn stop_work(state: &mut RelayManagerState, peer_key: &NodePublic) {
                 vni: work.vni,
             };
             state.handshake_by_sdv.remove(&sdv);
-            let _ = work.cancel.send(());
+            if let Some(task) = cancel_work(work) {
+                tasks.push(task);
+            }
         }
     }
     state.handshake_awaiting_pong.retain(|_, pk| pk != peer_key);
+    tasks
+}
+
+fn stop_server_work(
+    state: &mut RelayManagerState,
+    server: &CandidatePeerRelay,
+) -> Vec<tokio::task::JoinHandle<()>> {
+    let mut tasks = Vec::new();
+    let peer_keys = state.alloc_work.keys().cloned().collect::<Vec<_>>();
+    for peer_key in peer_keys {
+        if let Some(by_server) = state.alloc_work.get_mut(&peer_key) {
+            let stale = by_server
+                .keys()
+                .filter(|candidate| {
+                    candidate.node_key == server.node_key
+                        && candidate.authorization_generation == server.authorization_generation
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            for candidate in stale {
+                if let Some(work) = by_server.remove(&candidate) {
+                    if let Some(task) = cancel_work(work) {
+                        tasks.push(task);
+                    }
+                }
+            }
+            if by_server.is_empty() {
+                state.alloc_work.remove(&peer_key);
+            }
+        }
+    }
+
+    let peer_keys = state.handshake_work.keys().cloned().collect::<Vec<_>>();
+    for peer_key in peer_keys {
+        let server_discos = state
+            .handshake_work
+            .get(&peer_key)
+            .into_iter()
+            .flat_map(|by_server| by_server.iter())
+            .filter(|(_, work)| {
+                work.relay_server.node_key == server.node_key
+                    && work.relay_server.authorization_generation == server.authorization_generation
+            })
+            .map(|(disco, _)| disco.clone())
+            .collect::<Vec<_>>();
+        for server_disco in server_discos {
+            tasks.extend(cancel_handshake(state, &peer_key, &server_disco));
+        }
+    }
+    tasks
 }
 
 fn cancel_handshake(
     state: &mut RelayManagerState,
     peer_key: &NodePublic,
     server_disco: &DiscoPublic,
-) {
+) -> Vec<tokio::task::JoinHandle<()>> {
+    let mut tasks = Vec::new();
     if let Some(by_sd) = state.handshake_work.get_mut(peer_key) {
         if let Some(work) = by_sd.remove(server_disco) {
+            let vni = work.vni;
             let sdv = ServerDiscoVni {
                 server_disco: server_disco.clone(),
-                vni: work.vni,
+                vni,
             };
             state.handshake_by_sdv.remove(&sdv);
-            let _ = work.cancel.send(());
+            state
+                .handshake_awaiting_pong
+                .retain(|apv, peer| peer != peer_key || apv.vni != vni);
+            if let Some(task) = cancel_work(work) {
+                tasks.push(task);
+            }
         }
         if by_sd.is_empty() {
             state.handshake_work.remove(peer_key);
         }
     }
+    tasks
 }
 
 fn random_tx_id() -> [u8; 12] {
@@ -1236,12 +1434,14 @@ mod tests {
     use rustscale_tailcfg::RawMessage;
     use std::collections::BTreeMap;
     use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn make_candidate() -> CandidatePeerRelay {
         CandidatePeerRelay {
             node_key: NodePrivate::generate().public(),
             disco_key: DiscoPrivate::generate().public(),
             derp_home_region: 1,
+            authorization_generation: 1,
         }
     }
 
@@ -1253,6 +1453,7 @@ mod tests {
             node_key: NodePublic::from_raw32([0u8; 32]),
             disco_key: DiscoPublic::from_raw32([0u8; 32]),
             derp_home_region: 0,
+            authorization_generation: 0,
         };
         assert!(!zero.is_valid());
     }
@@ -1346,6 +1547,7 @@ mod tests {
         let mut state = RelayManagerState::new();
         let peer_key = NodePrivate::generate().public();
         let server_disco = DiscoPrivate::generate().public();
+        let relay_server = make_candidate();
 
         let (cancel, mut cancel_rx) = tokio::sync::oneshot::channel();
         let (dm_tx, _dm_rx) = tokio::sync::mpsc::channel(16);
@@ -1357,10 +1559,13 @@ mod tests {
                 server_disco.clone(),
                 HandshakeWork {
                     authorization_generation: 1,
+                    relay_server: relay_server.clone(),
+                    handshake_generation: 1,
                     server_disco: server_disco.clone(),
                     vni: 100,
                     lamport_id: 5,
                     cancel,
+                    task: None,
                     disco_msg_tx: dm_tx,
                 },
             );
@@ -1372,7 +1577,7 @@ mod tests {
             peer_key.clone(),
         );
 
-        cancel_handshake(&mut state, &peer_key, &server_disco);
+        let _ = cancel_handshake(&mut state, &peer_key, &server_disco);
 
         assert!(cancel_rx.try_recv().is_ok());
         assert!(!state
@@ -1409,6 +1614,7 @@ mod tests {
                     ],
                     alloc_gen: 1,
                     cancel: alloc_cancel,
+                    task: None,
                     response_tx: resp_tx,
                 },
             );
@@ -1423,10 +1629,13 @@ mod tests {
                 server_disco.clone(),
                 HandshakeWork {
                     authorization_generation: 1,
+                    relay_server: server.clone(),
+                    handshake_generation: 1,
                     server_disco: server_disco.clone(),
                     vni: 42,
                     lamport_id: 1,
                     cancel: hs_cancel,
+                    task: None,
                     disco_msg_tx: dm_tx,
                 },
             );
@@ -1445,7 +1654,7 @@ mod tests {
             peer_key.clone(),
         );
 
-        stop_work(&mut state, &peer_key);
+        let _ = stop_work(&mut state, &peer_key);
 
         assert!(alloc_cancel_rx.try_recv().is_ok());
         assert!(hs_cancel_rx.try_recv().is_ok());
@@ -1457,21 +1666,22 @@ mod tests {
             .any(|pk| pk == &peer_key));
     }
 
-    #[test]
-    fn server_set_update_replaces() {
+    #[tokio::test]
+    async fn server_set_update_replaces() {
         let mut state = RelayManagerState::new();
         let s1 = make_candidate();
         let s2 = make_candidate();
+        let ctx = std::sync::Arc::new(MockCtx::with_servers(&[s1.clone(), s2.clone()]));
 
-        handle_servers_update(&mut state, vec![s1.clone()]);
+        handle_servers_update(&mut state, &ctx, vec![s1.clone()]).await;
         assert_eq!(state.servers_by_node_key.len(), 1);
 
-        handle_servers_update(&mut state, vec![s2.clone()]);
+        handle_servers_update(&mut state, &ctx, vec![s2.clone()]).await;
         assert_eq!(state.servers_by_node_key.len(), 1);
         assert!(state.servers_by_node_key.contains_key(&s2.node_key));
         assert!(!state.servers_by_node_key.contains_key(&s1.node_key));
 
-        handle_servers_update(&mut state, vec![]);
+        handle_servers_update(&mut state, &ctx, vec![]).await;
         assert!(state.servers_by_node_key.is_empty());
     }
 
@@ -1522,6 +1732,7 @@ mod tests {
                     ],
                     alloc_gen: 1,
                     cancel,
+                    task: None,
                     response_tx: resp_tx,
                 },
             );
@@ -1578,6 +1789,10 @@ mod tests {
         let mut state = RelayManagerState::new();
         let peer_key = NodePrivate::generate().public();
         let server_disco = DiscoPrivate::generate().public();
+        let relay_server = make_candidate();
+        state
+            .servers_by_node_key
+            .insert(relay_server.node_key.clone(), relay_server.clone());
         let vni = 42;
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4242);
 
@@ -1591,10 +1806,13 @@ mod tests {
                 server_disco.clone(),
                 HandshakeWork {
                     authorization_generation: 1,
+                    relay_server: relay_server.clone(),
+                    handshake_generation: 1,
                     server_disco: server_disco.clone(),
                     vni,
                     lamport_id: 1,
                     cancel,
+                    task: None,
                     disco_msg_tx: dm_tx,
                 },
             );
@@ -1625,7 +1843,7 @@ mod tests {
             authorization_generation: None,
         };
 
-        let ctx = MockCtx;
+        let ctx = MockCtx::with_servers(&[relay_server]);
         handle_rx_disco_msg(&mut state, &std::sync::Arc::new(ctx), msg);
 
         let apv = AddrPortVni { addr, vni };
@@ -1637,6 +1855,10 @@ mod tests {
         let mut state = RelayManagerState::new();
         let peer_key = NodePrivate::generate().public();
         let server_disco = DiscoPrivate::generate().public();
+        let relay_server = make_candidate();
+        state
+            .servers_by_node_key
+            .insert(relay_server.node_key.clone(), relay_server.clone());
         let vni = 42;
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4242);
 
@@ -1650,10 +1872,13 @@ mod tests {
                 server_disco.clone(),
                 HandshakeWork {
                     authorization_generation: 1,
+                    relay_server: relay_server.clone(),
+                    handshake_generation: 1,
                     server_disco: server_disco.clone(),
                     vni,
                     lamport_id: 1,
                     cancel,
+                    task: None,
                     disco_msg_tx: dm_tx,
                 },
             );
@@ -1687,13 +1912,218 @@ mod tests {
             authorization_generation: None,
         };
 
-        let ctx = MockCtx;
+        let ctx = MockCtx::with_servers(&[relay_server]);
         handle_rx_disco_msg(&mut state, &std::sync::Arc::new(ctx), msg);
 
         assert_eq!(state.handshake_awaiting_pong.len(), 1);
     }
 
-    struct MockCtx;
+    #[tokio::test]
+    async fn removed_server_work_is_joined_and_stale_completions_cannot_install() {
+        let target_key = NodePrivate::generate().public();
+        let target_disco = DiscoPrivate::generate().public();
+        let removed_server = make_candidate();
+        let fresh_server = make_candidate();
+        let mut mock = MockCtx::with_servers(&[removed_server.clone(), fresh_server.clone()]);
+        mock.discos.insert(target_key.clone(), target_disco.clone());
+        let ctx = std::sync::Arc::new(mock);
+        let mut state = RelayManagerState::new();
+        state
+            .servers_by_node_key
+            .insert(removed_server.node_key.clone(), removed_server.clone());
+
+        let (alloc_cancel, alloc_cancelled) = tokio::sync::oneshot::channel();
+        let alloc_joined = std::sync::Arc::new(AtomicUsize::new(0));
+        let alloc_joined_task = alloc_joined.clone();
+        let alloc_task = tokio::spawn(async move {
+            let _ = alloc_cancelled.await;
+            tokio::task::yield_now().await;
+            alloc_joined_task.store(1, Ordering::SeqCst);
+        });
+        let (response_tx, _response_rx) = tokio::sync::mpsc::channel(1);
+        let client_discos = sort_pair(&DiscoPrivate::generate().public(), &target_disco);
+        state
+            .alloc_work
+            .entry(target_key.clone())
+            .or_default()
+            .insert(
+                removed_server.clone(),
+                AllocWork {
+                    server: removed_server.clone(),
+                    authorization_generation: 1,
+                    disco_keys: client_discos.clone(),
+                    alloc_gen: 9,
+                    cancel: alloc_cancel,
+                    task: Some(alloc_task),
+                    response_tx,
+                },
+            );
+
+        let server_disco = DiscoPrivate::generate().public();
+        let relay_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4567);
+        let endpoint = ServerEndpoint {
+            server_disco: server_disco.clone(),
+            client_disco: client_discos.clone(),
+            lamport_id: 1,
+            vni: 88,
+            addr_ports: vec![relay_addr],
+            bind_lifetime: Duration::from_secs(30),
+            steady_state_lifetime: Duration::from_secs(300),
+        };
+        let (handshake_cancel, handshake_cancelled) = tokio::sync::oneshot::channel();
+        let handshake_joined = std::sync::Arc::new(AtomicUsize::new(0));
+        let handshake_joined_task = handshake_joined.clone();
+        let handshake_task = tokio::spawn(async move {
+            let _ = handshake_cancelled.await;
+            tokio::task::yield_now().await;
+            handshake_joined_task.store(1, Ordering::SeqCst);
+        });
+        let (disco_msg_tx, _disco_msg_rx) = tokio::sync::mpsc::channel(1);
+        state
+            .handshake_work
+            .entry(target_key.clone())
+            .or_default()
+            .insert(
+                server_disco.clone(),
+                HandshakeWork {
+                    server_disco: server_disco.clone(),
+                    authorization_generation: 1,
+                    relay_server: removed_server.clone(),
+                    handshake_generation: 11,
+                    vni: endpoint.vni,
+                    lamport_id: endpoint.lamport_id,
+                    cancel: handshake_cancel,
+                    task: Some(handshake_task),
+                    disco_msg_tx,
+                },
+            );
+        state.handshake_by_sdv.insert(
+            ServerDiscoVni {
+                server_disco: server_disco.clone(),
+                vni: endpoint.vni,
+            },
+            target_key.clone(),
+        );
+        state.handshake_awaiting_pong.insert(
+            AddrPortVni {
+                addr: relay_addr,
+                vni: endpoint.vni,
+            },
+            target_key.clone(),
+        );
+
+        // Production calls this while holding the map authorization writer.
+        // The acknowledgement is not returned until both worker tasks exit.
+        let map_barrier = tokio::sync::RwLock::new(());
+        let _map_commit = map_barrier.write().await;
+        handle_servers_update(&mut state, &ctx, Vec::new()).await;
+        assert_eq!(alloc_joined.load(Ordering::SeqCst), 1);
+        assert_eq!(handshake_joined.load(Ordering::SeqCst), 1);
+        assert!(state.alloc_work.is_empty());
+        assert!(state.handshake_work.is_empty());
+        assert!(state.handshake_by_sdv.is_empty());
+        assert!(state.handshake_awaiting_pong.is_empty());
+        assert_eq!(ctx.relay_clears.load(Ordering::SeqCst), 1);
+
+        // Results already queued by workers before cancellation cannot revive
+        // control work or install a path for the still-authorized target.
+        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+        handle_alloc_work_done(
+            &mut state,
+            &ctx,
+            &event_tx,
+            AllocWorkResult {
+                peer_key: target_key.clone(),
+                peer_disco: target_disco.clone(),
+                authorization_generation: 1,
+                server: removed_server.clone(),
+                disco_keys: client_discos,
+                server_endpoint: Some(endpoint.clone()),
+            },
+        )
+        .await;
+        handle_handshake_work_done(
+            &mut state,
+            &ctx,
+            HandshakeWorkResult {
+                peer_key: target_key.clone(),
+                peer_disco: target_disco.clone(),
+                authorization_generation: 1,
+                relay_server: removed_server,
+                handshake_generation: 11,
+                server_disco: server_disco.clone(),
+                vni: endpoint.vni,
+                pong_from: Some(relay_addr),
+                latency: Duration::from_millis(1),
+            },
+        );
+        assert_eq!(ctx.relay_sets.load(Ordering::SeqCst), 0);
+
+        // A fresh authorized server identity can complete and install.
+        handle_servers_update(&mut state, &ctx, vec![fresh_server.clone()]).await;
+        let (cancel, _) = tokio::sync::oneshot::channel();
+        let (disco_msg_tx, _) = tokio::sync::mpsc::channel(1);
+        state
+            .handshake_work
+            .entry(target_key.clone())
+            .or_default()
+            .insert(
+                server_disco.clone(),
+                HandshakeWork {
+                    server_disco: server_disco.clone(),
+                    authorization_generation: 1,
+                    relay_server: fresh_server.clone(),
+                    handshake_generation: 12,
+                    vni: endpoint.vni,
+                    lamport_id: endpoint.lamport_id,
+                    cancel,
+                    task: None,
+                    disco_msg_tx,
+                },
+            );
+        state.handshake_by_sdv.insert(
+            ServerDiscoVni {
+                server_disco: server_disco.clone(),
+                vni: endpoint.vni,
+            },
+            target_key.clone(),
+        );
+        handle_handshake_work_done(
+            &mut state,
+            &ctx,
+            HandshakeWorkResult {
+                peer_key: target_key,
+                peer_disco: target_disco,
+                authorization_generation: 1,
+                relay_server: fresh_server,
+                handshake_generation: 12,
+                server_disco,
+                vni: endpoint.vni,
+                pong_from: Some(relay_addr),
+                latency: Duration::from_millis(1),
+            },
+        );
+        assert_eq!(ctx.relay_sets.load(Ordering::SeqCst), 1);
+    }
+
+    struct MockCtx {
+        discos: HashMap<NodePublic, DiscoPublic>,
+        relay_sets: AtomicUsize,
+        relay_clears: AtomicUsize,
+    }
+
+    impl MockCtx {
+        fn with_servers(servers: &[CandidatePeerRelay]) -> Self {
+            Self {
+                discos: servers
+                    .iter()
+                    .map(|server| (server.node_key.clone(), server.disco_key.clone()))
+                    .collect(),
+                relay_sets: AtomicUsize::new(0),
+                relay_clears: AtomicUsize::new(0),
+            }
+        }
+    }
 
     impl RelayManagerContext for MockCtx {
         fn seal_disco(&self, _: &DiscoPublic, _: &Message) -> Option<Vec<u8>> {
@@ -1707,8 +2137,8 @@ mod tests {
         fn our_node_public(&self) -> NodePublic {
             NodePrivate::generate().public()
         }
-        fn peer_disco_key(&self, _: &NodePublic) -> Option<DiscoPublic> {
-            None
+        fn peer_disco_key(&self, peer: &NodePublic) -> Option<DiscoPublic> {
+            self.discos.get(peer).cloned()
         }
         fn peer_derp_region(&self, _: &NodePublic) -> i32 {
             0
@@ -1716,7 +2146,21 @@ mod tests {
         fn peer_authorization_generation(&self, _: &NodePublic) -> Option<u64> {
             Some(1)
         }
-        fn set_relay(&self, _: &NodePublic, _: &DiscoPublic, _: u64, _: SocketAddr, _: u32) {}
+        fn set_relay(
+            &self,
+            _: &NodePublic,
+            _: &DiscoPublic,
+            _: u64,
+            _: &NodePublic,
+            _: u64,
+            _: SocketAddr,
+            _: u32,
+        ) {
+            self.relay_sets.fetch_add(1, Ordering::SeqCst);
+        }
+        fn clear_relay_server(&self, _: &NodePublic, _: &DiscoPublic, _: u64) {
+            self.relay_clears.fetch_add(1, Ordering::SeqCst);
+        }
         fn send_pong_via_relay(&self, _: SocketAddr, _: u32, _: &DiscoPublic, _: [u8; 12]) {}
         fn is_self_node(&self, _: &NodePublic) -> bool {
             false

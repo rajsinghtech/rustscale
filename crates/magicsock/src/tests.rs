@@ -994,6 +994,137 @@ async fn queued_disco_handler_cannot_reinsert_state_after_revocation() {
         .any(|key| key == &peer_key));
 }
 
+#[tokio::test]
+async fn relay_server_role_revocation_clears_paths_and_reverse_mappings() {
+    let target_key = NodePrivate::generate().public();
+    let target_disco = DiscoPrivate::generate().public();
+    let server_key = NodePrivate::generate().public();
+    let server_disco = DiscoPrivate::generate().public();
+    let (magicsock, _rx) = Magicsock::new(MagicsockConfig {
+        private_key: NodePrivate::generate(),
+        disco_key: DiscoPrivate::generate(),
+        derp_client: None,
+        derp_map: None,
+        home_derp_region: 0,
+        udp_bind: None,
+        udp_socket: None,
+        portmapper: None,
+        health: None,
+        disable_direct_paths: false,
+        peer_relay_server: false,
+        relay_server_config: None,
+        sockstats: None,
+        control_knobs: None,
+    })
+    .await
+    .unwrap();
+    let target = make_peer(target_key.clone(), target_disco.clone(), vec![], 1);
+    let mut relay_server = make_peer(server_key.clone(), server_disco.clone(), vec![], 1);
+    relay_server.Cap = rustscale_tailcfg::CAP_VERSION_RELAY;
+    relay_server.CapMap.insert(
+        rustscale_tailcfg::PEER_CAPABILITY_RELAY_TARGET.into(),
+        vec![rustscale_tailcfg::RawMessage::default()],
+    );
+    relay_server.Hostinfo = Some(rustscale_tailcfg::Hostinfo {
+        PeerRelay: true,
+        ..Default::default()
+    });
+    magicsock
+        .set_netmap(vec![target.clone(), relay_server.clone()])
+        .await
+        .unwrap();
+
+    let target_generation = magicsock.authorization_generation(&target_key).unwrap();
+    let server_generation = magicsock.authorization_generation(&server_key).unwrap();
+    let relay_addr: SocketAddr = "127.0.0.1:4545".parse().unwrap();
+    RelayManagerContext::set_relay(
+        &*magicsock.inner,
+        &target_key,
+        &target_disco,
+        target_generation,
+        &server_key,
+        server_generation,
+        relay_addr,
+        77,
+    );
+    assert_eq!(
+        magicsock.peer_path_class(&target_key),
+        endpoint::PathClass::Relay
+    );
+    assert_eq!(
+        magicsock
+            .inner
+            .addr_to_peer
+            .read()
+            .unwrap()
+            .get(&relay_addr),
+        Some(&target_key)
+    );
+
+    // The relay server remains an authorized ordinary peer but loses its
+    // relay-server identity. The map writer waits for manager cancellation
+    // and path cleanup before returning.
+    relay_server.CapMap.clear();
+    relay_server.Hostinfo = Some(rustscale_tailcfg::Hostinfo::default());
+    magicsock
+        .set_netmap(vec![target.clone(), relay_server.clone()])
+        .await
+        .unwrap();
+    assert_ne!(
+        magicsock.peer_path_class(&target_key),
+        endpoint::PathClass::Relay
+    );
+    assert!(!magicsock
+        .inner
+        .addr_to_peer
+        .read()
+        .unwrap()
+        .contains_key(&relay_addr));
+    assert!(!magicsock
+        .inner
+        .disco_to_peer
+        .read()
+        .unwrap()
+        .contains_key(&server_disco));
+
+    // A newly authorized relay-server identity can install a fresh path.
+    relay_server.CapMap.insert(
+        rustscale_tailcfg::PEER_CAPABILITY_RELAY_TARGET.into(),
+        vec![rustscale_tailcfg::RawMessage::default()],
+    );
+    relay_server.Hostinfo = Some(rustscale_tailcfg::Hostinfo {
+        PeerRelay: true,
+        ..Default::default()
+    });
+    magicsock
+        .set_netmap(vec![target, relay_server])
+        .await
+        .unwrap();
+    RelayManagerContext::set_relay(
+        &*magicsock.inner,
+        &target_key,
+        &target_disco,
+        magicsock.authorization_generation(&target_key).unwrap(),
+        &server_key,
+        magicsock.authorization_generation(&server_key).unwrap(),
+        relay_addr,
+        78,
+    );
+    assert_eq!(
+        magicsock.peer_path_class(&target_key),
+        endpoint::PathClass::Relay
+    );
+    assert_eq!(
+        magicsock
+            .inner
+            .addr_to_peer
+            .read()
+            .unwrap()
+            .get(&relay_addr),
+        Some(&target_key)
+    );
+}
+
 // ---- Test (a): DERP data path fallback ----
 
 #[tokio::test]

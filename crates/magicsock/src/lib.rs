@@ -1991,7 +1991,7 @@ impl Magicsock {
             .expect("relay_manager lock poisoned")
             .clone();
         if let Some(rm) = relay_manager {
-            let servers = relay_manager::discover_relay_servers(
+            let mut servers = relay_manager::discover_relay_servers(
                 &rustscale_tailcfg::Node {
                     Key: self
                         .inner
@@ -2005,6 +2005,14 @@ impl Magicsock {
                 },
                 &peers,
             );
+            servers.retain_mut(|server| {
+                let Some(generation) = self.inner.peer_authorization.generation(&server.node_key)
+                else {
+                    return false;
+                };
+                server.authorization_generation = generation;
+                true
+            });
 
             rm.handle_relay_servers_set_and_wait(servers).await;
 
@@ -3363,12 +3371,17 @@ impl relay_manager::RelayManagerContext for Inner {
         peer_key: &NodePublic,
         peer_disco: &DiscoPublic,
         authorization_generation: u64,
+        relay_server_key: &NodePublic,
+        relay_server_generation: u64,
         addr: SocketAddr,
         vni: u32,
     ) {
         if !self
             .peer_authorization
             .is_current(peer_key, authorization_generation)
+            || !self
+                .peer_authorization
+                .is_current(relay_server_key, relay_server_generation)
         {
             return;
         }
@@ -3376,6 +3389,9 @@ impl relay_manager::RelayManagerContext for Inner {
         if !self
             .peer_authorization
             .is_current(peer_key, authorization_generation)
+            || !self
+                .peer_authorization
+                .is_current(relay_server_key, relay_server_generation)
         {
             return;
         }
@@ -3383,7 +3399,7 @@ impl relay_manager::RelayManagerContext for Inner {
             if ep.peer_disco_key() != peer_disco {
                 return;
             }
-            ep.set_relay(addr, vni);
+            ep.set_relay(addr, vni, relay_server_key.clone(), relay_server_generation);
             self.addr_to_peer
                 .write()
                 .expect("addr_to_peer lock poisoned")
@@ -3394,6 +3410,42 @@ impl relay_manager::RelayManagerContext for Inner {
                     short_key(peer_key)
                 );
             }
+        }
+    }
+
+    fn clear_relay_server(
+        &self,
+        relay_server_key: &NodePublic,
+        relay_server_disco: &DiscoPublic,
+        relay_server_generation: u64,
+    ) {
+        let removed_paths = {
+            let mut endpoints = self.endpoints.write().expect("endpoints lock poisoned");
+            endpoints
+                .iter_mut()
+                .filter_map(|(peer, endpoint)| {
+                    endpoint
+                        .clear_relay_server(relay_server_key, relay_server_generation)
+                        .map(|addr| (peer.clone(), addr))
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut addr_to_peer = self
+            .addr_to_peer
+            .write()
+            .expect("addr_to_peer lock poisoned");
+        for (peer, addr) in removed_paths {
+            if addr_to_peer.get(&addr) == Some(&peer) {
+                addr_to_peer.remove(&addr);
+            }
+        }
+        drop(addr_to_peer);
+        let mut disco_to_peer = self
+            .disco_to_peer
+            .write()
+            .expect("disco_to_peer lock poisoned");
+        if disco_to_peer.get(relay_server_disco) == Some(relay_server_key) {
+            disco_to_peer.remove(relay_server_disco);
         }
     }
 

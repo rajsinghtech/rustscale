@@ -206,7 +206,7 @@ pub(crate) async fn add_port_mapping(
         source,
     })?;
 
-    if status == 200 && !is_soap_fault(&resp) {
+    if status == 200 && soap_response_is_success(&resp, "AddPortMappingResponse") {
         return Ok(UpnpAllocation {
             port,
             permanent: false,
@@ -240,12 +240,19 @@ pub(crate) async fn add_port_mapping(
                 permanent: true,
                 source,
             })?;
-            if status == 200 && !is_soap_fault(&resp) {
+            if status == 200 && soap_response_is_success(&resp, "AddPortMappingResponse") {
                 return Ok(UpnpAllocation {
                     port,
                     permanent: true,
                 });
             }
+            return Err(AmbiguousAddError {
+                port,
+                permanent: true,
+                source: std::io::Error::other(format!(
+                    "permanent AddPortMapping malformed/fault (status={status})"
+                )),
+            });
         }
     }
 
@@ -293,9 +300,63 @@ pub(crate) async fn delete_port_mapping(
 }
 
 fn delete_response_is_success(status: u16, response: &str) -> bool {
-    (status == 200 && !is_soap_fault(response))
-        // 714 NoSuchEntryInArray positively verifies that no mapping remains.
-        || extract_upnp_error_code(response) == Some(714)
+    (status == 200 && soap_response_is_success(response, "DeletePortMappingResponse"))
+        // 714 NoSuchEntryInArray positively verifies that no mapping remains,
+        // but only when carried in a structurally valid SOAP fault.
+        || soap_not_found(response)
+}
+
+fn soap_not_found(body: &str) -> bool {
+    parse_xml_element_names(body).is_some_and(|elements| {
+        elements.iter().any(|name| name == "Envelope")
+            && elements.iter().any(|name| name == "Body")
+            && elements.iter().any(|name| name == "Fault")
+            && extract_upnp_error_code(body) == Some(714)
+    })
+}
+
+fn soap_response_is_success(body: &str, response_element: &str) -> bool {
+    let Some(elements) = parse_xml_element_names(body) else {
+        return false;
+    };
+    elements.iter().any(|name| name == "Envelope")
+        && elements.iter().any(|name| name == "Body")
+        && elements.iter().any(|name| name == response_element)
+        && !elements.iter().any(|name| name == "Fault")
+}
+
+fn parse_xml_element_names(xml: &str) -> Option<Vec<String>> {
+    let mut stack = Vec::<String>::new();
+    let mut elements = Vec::new();
+    let mut rest = xml;
+    while let Some(start) = rest.find('<') {
+        rest = &rest[start + 1..];
+        let end = rest.find('>')?;
+        let mut token = rest[..end].trim();
+        rest = &rest[end + 1..];
+        if token.starts_with('?') || token.starts_with('!') {
+            continue;
+        }
+        let closing = token.starts_with('/');
+        if closing {
+            token = token[1..].trim();
+        }
+        let self_closing = token.ends_with('/');
+        token = token.trim_end_matches('/').trim();
+        let qualified = token.split_whitespace().next()?;
+        let local = qualified.rsplit(':').next()?.to_string();
+        if closing {
+            if stack.pop().as_deref() != Some(local.as_str()) {
+                return None;
+            }
+        } else {
+            elements.push(local.clone());
+            if !self_closing {
+                stack.push(local);
+            }
+        }
+    }
+    stack.is_empty().then_some(elements)
 }
 
 /// Get the external IP address via SOAP GetExternalIPAddress.
@@ -383,6 +444,7 @@ fn build_add_port_mapping_soap(
 }
 
 /// Whether a SOAP response body contains a Fault element.
+#[cfg(test)]
 fn is_soap_fault(body: &str) -> bool {
     body.contains("<s:Fault>") || body.contains("<SOAP:Fault>") || body.contains("<Fault>")
 }
@@ -395,25 +457,25 @@ fn extract_upnp_error_code(body: &str) -> Option<u32> {
 
 /// Extract the text content of an XML tag from a string (first occurrence).
 fn extract_tag_text(s: &str, tag: &str) -> Option<String> {
-    // Handle both namespaced and bare tags.
-    for open in [
-        format!("<{tag}>"),
-        format!("<u:{tag}>"),
-        format!("<m:{tag}>"),
-    ] {
-        if let Some(start) = s.find(&open) {
-            let text_start = start + open.len();
-            let close_patterns = [
-                format!("</{tag}>"),
-                format!("</u:{tag}>"),
-                format!("</m:{tag}>"),
-            ];
-            for close in &close_patterns {
-                if let Some(rel) = s[text_start..].find(close.as_str()) {
-                    return Some(s[text_start..text_start + rel].trim().to_string());
-                }
+    let mut offset = 0;
+    while let Some(relative) = s[offset..].find('<') {
+        let start = offset + relative;
+        let end = start + s[start..].find('>')?;
+        let token = s[start + 1..end].trim();
+        if !token.starts_with('/') {
+            let qualified = token.split_whitespace().next()?.trim_end_matches('/');
+            if qualified.rsplit(':').next() == Some(tag) {
+                let close = format!("</{qualified}>");
+                let text_start = end + 1;
+                let relative_close = s[text_start..].find(&close)?;
+                return Some(
+                    s[text_start..text_start + relative_close]
+                        .trim()
+                        .to_string(),
+                );
             }
         }
+        offset = end + 1;
     }
     None
 }
@@ -514,17 +576,30 @@ mod tests {
     fn delete_requires_success_or_not_found() {
         assert!(delete_response_is_success(
             200,
-            "<DeletePortMappingResponse/>"
+            "<x:Envelope><x:Body><m:DeletePortMappingResponse/></x:Body></x:Envelope>"
         ));
         assert!(delete_response_is_success(
             500,
-            "<s:Fault><errorCode>714</errorCode></s:Fault>"
+            "<s:Envelope><s:Body><s:Fault><x:errorCode>714</x:errorCode></s:Fault></s:Body></s:Envelope>"
         ));
         assert!(!delete_response_is_success(
             200,
             "<s:Fault><errorCode>501</errorCode></s:Fault>"
         ));
         assert!(!delete_response_is_success(500, "server error"));
+        assert!(!delete_response_is_success(200, ""));
+        assert!(!delete_response_is_success(
+            200,
+            "<Envelope><Body><DeletePortMappingResponse></Body></Envelope>"
+        ));
+        assert!(soap_response_is_success(
+            "<soap:Envelope><soap:Body><z:AddPortMappingResponse/></soap:Body></soap:Envelope>",
+            "AddPortMappingResponse"
+        ));
+        assert!(!soap_response_is_success(
+            "<Envelope><Body><Fault/><AddPortMappingResponse/></Body></Envelope>",
+            "AddPortMappingResponse"
+        ));
     }
 
     #[test]

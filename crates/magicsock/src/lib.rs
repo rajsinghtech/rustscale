@@ -1703,12 +1703,14 @@ impl Magicsock {
     }
 
     /// Shut down port mapping and await bounded release/cleanup work.
-    pub async fn shutdown_portmapper(&self, deadline: std::time::Duration) {
+    pub async fn shutdown_portmapper(
+        &self,
+        deadline: std::time::Duration,
+    ) -> Result<(), rustscale_portmapper::PortMapError> {
         if let Some(portmapper) = &self.inner.portmapper {
-            if let Err(error) = portmapper.shutdown(deadline).await {
-                log::warn!("portmapper shutdown incomplete: {error}");
-            }
+            portmapper.shutdown(deadline).await?;
         }
+        Ok(())
     }
 
     /// Update the peer set from a netmap. Creates/updates per-peer endpoints,

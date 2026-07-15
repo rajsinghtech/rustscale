@@ -2347,6 +2347,15 @@ impl Server {
         // profile changes; drop pinned roots and cancel active requests first.
         self.drive.disable().await;
         if let Some(mut inner) = self.inner.take() {
+            if let Err(error) = inner
+                .magicsock
+                .shutdown_portmapper(std::time::Duration::from_secs(5))
+                .await
+            {
+                log::warn!("tsnet: retaining running state for portmapper cleanup retry: {error}");
+                self.inner = Some(inner);
+                return;
+            }
             if let Some(router) = inner.router.take() {
                 match router.lock() {
                     Ok(mut router) => {
@@ -2371,10 +2380,6 @@ impl Server {
             if let Some(serve) = inner.serve.take() {
                 serve.stop().await;
             }
-            inner
-                .magicsock
-                .shutdown_portmapper(std::time::Duration::from_secs(5))
-                .await;
             inner.cancel.cancel();
             inner.health_watchdog.stop();
             if let Some(m) = inner.monitor.take() {
@@ -2436,6 +2441,17 @@ impl Server {
             Some(inner) => inner,
             None => return Ok(()), // already down
         };
+
+        if let Err(error) = inner
+            .magicsock
+            .shutdown_portmapper(std::time::Duration::from_secs(5))
+            .await
+        {
+            self.inner = Some(inner);
+            return Err(TsnetError::Io(std::io::Error::other(format!(
+                "portmapper cleanup incomplete: {error}"
+            ))));
+        }
 
         if let Some(router) = inner.router.take() {
             match router.lock() {
@@ -2526,10 +2542,6 @@ impl Server {
         if let Some(serve) = inner.serve.take() {
             serve.stop().await;
         }
-        inner
-            .magicsock
-            .shutdown_portmapper(std::time::Duration::from_secs(5))
-            .await;
         inner.cancel.cancel();
         inner.health_watchdog.stop();
         if let Some(m) = inner.monitor.take() {

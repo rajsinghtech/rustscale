@@ -173,6 +173,8 @@ struct ClientInner {
     create_lock: tokio::sync::Mutex<()>,
     release_progress: Mutex<ReleaseProgress>,
     release_progress_tx: tokio::sync::watch::Sender<ReleaseProgress>,
+    supervisor_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    release_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     #[cfg(test)]
     release_test_gate: Mutex<Option<Arc<ReleaseTestGate>>>,
     closed: AtomicBool,
@@ -248,6 +250,8 @@ impl Client {
                 create_lock: tokio::sync::Mutex::new(()),
                 release_progress: Mutex::new(ReleaseProgress::default()),
                 release_progress_tx,
+                supervisor_tasks: Mutex::new(Vec::new()),
+                release_tasks: Mutex::new(Vec::new()),
                 #[cfg(test)]
                 release_test_gate: Mutex::new(None),
                 closed: AtomicBool::new(false),
@@ -426,12 +430,17 @@ impl Client {
         }
         let client = self.clone();
         let captured = cached.clone();
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             if client.do_release(captured.clone()).await {
                 client.clear_uncertain_release(&captured);
             }
             client.complete_release();
         });
+        self.inner
+            .release_tasks
+            .lock()
+            .expect("release tasks lock")
+            .push(task);
     }
 
     fn register_release(&self) {
@@ -589,28 +598,77 @@ impl Client {
     /// Stop new mapping work and await active allocation/release supervisors.
     pub async fn shutdown(&self, deadline: Duration) -> Result<(), crate::PortMapError> {
         self.inner.closed.store(true, Ordering::SeqCst);
-        timeout(deadline, async {
-            let _create_guard = self.inner.create_lock.lock().await;
-            self.invalidate_mappings(true);
-            self.wait_for_pending_releases().await;
+        // Invalidate first so an already-running supervisor cannot commit.
+        self.invalidate_mappings(true);
+        let deadline = tokio::time::Instant::now() + deadline;
+        self.await_owned_tasks(&self.inner.supervisor_tasks, deadline)
+            .await?;
+        if let Err(error) = self
+            .await_owned_tasks(&self.inner.release_tasks, deadline)
+            .await
+        {
+            let mut progress = self.inner.release_progress.lock().expect("release lock");
+            progress.pending = 0;
+            progress.generation = progress.generation.saturating_add(1);
+            self.inner.release_progress_tx.send_replace(*progress);
+            return Err(error);
+        }
 
-            // Retry uncertain UPnP cleanup, including permanent leases. Any
-            // failure remains retained in state for a later shutdown retry.
-            let uncertain = self
-                .inner
-                .state
-                .lock()
-                .expect("state lock")
-                .uncertain_releases
-                .clone();
-            for cached in uncertain {
-                if self.do_release(cached.clone()).await {
-                    self.clear_uncertain_release(&cached);
-                }
+        // Retry uncertain cleanup, including permanent UPnP leases. Failed
+        // identities remain retained and make shutdown fail for owner retry.
+        let uncertain = self
+            .inner
+            .state
+            .lock()
+            .expect("state lock")
+            .uncertain_releases
+            .clone();
+        for cached in uncertain {
+            let confirmed = tokio::time::timeout_at(deadline, self.do_release(cached.clone()))
+                .await
+                .map_err(|_| {
+                    crate::PortMapError::Protocol("portmapper shutdown deadline".into())
+                })?;
+            if confirmed {
+                self.clear_uncertain_release(&cached);
             }
-        })
-        .await
-        .map_err(|_| crate::PortMapError::Protocol("portmapper shutdown deadline".into()))?;
+        }
+        if !self
+            .inner
+            .state
+            .lock()
+            .expect("state lock")
+            .uncertain_releases
+            .is_empty()
+        {
+            return Err(crate::PortMapError::Protocol(
+                "portmapper cleanup remains uncertain".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn await_owned_tasks(
+        &self,
+        tasks: &Mutex<Vec<tokio::task::JoinHandle<()>>>,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), crate::PortMapError> {
+        let mut tasks = {
+            let mut guard = tasks.lock().expect("portmapper tasks lock");
+            std::mem::take(&mut *guard)
+        };
+        while let Some(mut task) = tasks.pop() {
+            if tokio::time::timeout_at(deadline, &mut task).await.is_err() {
+                task.abort();
+                let _ = task.await;
+                for task in tasks {
+                    task.abort();
+                }
+                return Err(crate::PortMapError::Protocol(
+                    "portmapper shutdown deadline".into(),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -853,11 +911,16 @@ impl Client {
         // commits a validated mapping or releases any allocation it obtained.
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         let client = self.clone();
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let _create_guard = client.inner.create_lock.lock().await;
             let result = client.create_or_get_mapping_serialized().await;
             let _ = result_tx.send(result);
         });
+        self.inner
+            .supervisor_tasks
+            .lock()
+            .expect("supervisor tasks lock")
+            .push(task);
         result_rx.await.unwrap_or_else(|_| {
             Err(crate::PortMapError::Protocol(
                 "mapping supervisor terminated".into(),
@@ -962,7 +1025,7 @@ impl Client {
             } else {
                 MappingKind::Pmp
             };
-            self.release_incompatible_mapping(snapshot, |identity| {
+            self.release_incompatible_mapping(snapshot, prev_port, |identity| {
                 matches!(
                     (desired_kind, identity),
                     (MappingKind::Pmp, ReleaseIdentity::Pmp { .. })
@@ -1005,6 +1068,7 @@ impl Client {
     async fn release_incompatible_mapping(
         &self,
         snapshot: GatewaySnapshot,
+        desired_external_port: u16,
         compatible: impl Fn(&ReleaseIdentity) -> bool,
     ) -> Result<(), crate::PortMapError> {
         let old_mapping = {
@@ -1037,10 +1101,10 @@ impl Client {
                 state
                     .uncertain_releases
                     .retain(|cached| cached.lease_expires.is_none_or(|expiry| now < expiry));
-                state
-                    .uncertain_releases
-                    .iter()
-                    .any(|cached| compatible(&cached.release))
+                state.uncertain_releases.iter().any(|cached| {
+                    desired_external_port == 0
+                        || cached.mapping.external.port() == desired_external_port
+                })
             })
             .ok_or(crate::PortMapError::GatewayRange)?;
         if blocked {
@@ -1268,6 +1332,22 @@ impl Client {
         });
     }
 
+    fn clear_uncertain_upnp(
+        &self,
+        snapshot: GatewaySnapshot,
+        service: &upnp::UpnpService,
+        port: u16,
+    ) {
+        let _ = self.with_current_gateway(snapshot, |state| {
+            state.uncertain_releases.retain(|cached| {
+                cached.generation != snapshot.generation
+                    || cached.mapping.external.port() != port
+                    || !matches!(&cached.release, ReleaseIdentity::Upnp { service: old }
+                        if old.control_url == service.control_url && old.kind == service.kind)
+            });
+        });
+    }
+
     async fn retry_uncertain_upnp(
         &self,
         snapshot: GatewaySnapshot,
@@ -1336,7 +1416,7 @@ impl Client {
 
         for svc in &services {
             if self
-                .release_incompatible_mapping(snapshot, |identity| {
+                .release_incompatible_mapping(snapshot, prev_port, |identity| {
                     matches!(identity, ReleaseIdentity::Upnp { service }
                         if service.control_url == svc.control_url && service.kind == svc.kind)
                 })
@@ -1371,15 +1451,19 @@ impl Client {
                 }
             };
             let ext_port = allocation.port;
+            // From this point onward the router may own the mapping. Persist
+            // the cleanup identity before the next await so supervisor abort
+            // or shutdown cannot lose the AddPortMapping result.
+            self.track_uncertain_upnp(snapshot, svc, ext_port, allocation.permanent);
 
             let ext_ip = if let Ok(ip) = upnp::get_external_ip(svc, deadline).await {
                 ip
             } else {
                 if upnp::delete_port_mapping(svc, ext_port, deadline)
                     .await
-                    .is_err()
+                    .is_ok()
                 {
-                    self.track_uncertain_upnp(snapshot, svc, ext_port, allocation.permanent);
+                    self.clear_uncertain_upnp(snapshot, svc, ext_port);
                 }
                 continue;
             };
@@ -1403,6 +1487,10 @@ impl Client {
             if self
                 .with_current_gateway(snapshot, |state| {
                     state.mapping = Some(cached.clone());
+                    state.uncertain_releases.retain(|uncertain| {
+                        uncertain.generation != snapshot.generation
+                            || uncertain.mapping.external.port() != ext_port
+                    });
                 })
                 .is_none()
             {

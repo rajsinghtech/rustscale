@@ -42,6 +42,8 @@ struct FakeIgd {
     do_upnp: AtomicBool,
     pmp_external_ip: Ipv4Addr,
     pcp_mutation: Option<PcpMutation>,
+    upnp_permanent_malformed: bool,
+    upnp_delete_fault: bool,
     closed: Arc<AtomicBool>,
     pmp_recv_count: Arc<AtomicU32>,
     pmp_map_count: Arc<AtomicU32>,
@@ -72,6 +74,8 @@ impl FakeIgd {
             do_upnp: AtomicBool::new(opts.upnp),
             pmp_external_ip: opts.pmp_external_ip,
             pcp_mutation: opts.pcp_mutation,
+            upnp_permanent_malformed: opts.upnp_permanent_malformed,
+            upnp_delete_fault: opts.upnp_delete_fault,
             closed: closed.clone(),
             pmp_recv_count: Arc::new(AtomicU32::new(0)),
             pmp_map_count: Arc::new(AtomicU32::new(0)),
@@ -311,7 +315,15 @@ impl FakeIgd {
                     gate.reached.wait().await;
                     gate.resume.wait().await;
                 }
-                write_soap_response(stream, TEST_ADD_PORT_MAPPING_RESPONSE).await;
+                if self.upnp_permanent_malformed {
+                    if req.contains("<NewLeaseDuration>0</NewLeaseDuration>") {
+                        write_soap_response(stream, "").await;
+                    } else {
+                        write_soap_response(stream, "<s:Envelope><s:Body><s:Fault><errorCode>725</errorCode></s:Fault></s:Body></s:Envelope>").await;
+                    }
+                } else {
+                    write_soap_response(stream, TEST_ADD_PORT_MAPPING_RESPONSE).await;
+                }
                 return;
             }
             if action.contains("GetExternalIPAddress") {
@@ -325,6 +337,10 @@ impl FakeIgd {
             }
             if action.contains("DeletePortMapping") {
                 self.upnp_delete_count.fetch_add(1, Ordering::Relaxed);
+                if self.upnp_delete_fault {
+                    write_soap_response(stream, "<s:Envelope><s:Body><s:Fault><errorCode>501</errorCode></s:Fault></s:Body></s:Envelope>").await;
+                    return;
+                }
                 write_soap_response(stream, "<?xml version=\"1.0\"?><s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body><u:DeletePortMappingResponse/></s:Body></s:Envelope>").await;
                 return;
             }
@@ -358,6 +374,8 @@ struct IgdOpts {
     upnp: bool,
     pmp_external_ip: Ipv4Addr,
     pcp_mutation: Option<PcpMutation>,
+    upnp_permanent_malformed: bool,
+    upnp_delete_fault: bool,
 }
 
 impl Default for IgdOpts {
@@ -368,6 +386,8 @@ impl Default for IgdOpts {
             upnp: false,
             pmp_external_ip: Ipv4Addr::new(123, 123, 123, 123),
             pcp_mutation: None,
+            upnp_permanent_malformed: false,
+            upnp_delete_fault: false,
         }
     }
 }
@@ -654,6 +674,67 @@ async fn ambiguous_upnp_add_is_compensated_before_key_reuse() {
         .expect("safe key reuse");
     assert_eq!(mapping.kind, MappingKind::Upnp);
     client.close();
+    igd.close();
+}
+
+#[tokio::test]
+async fn malformed_permanent_add_never_expires_or_reuses_key() {
+    let igd = FakeIgd::start(IgdOpts {
+        upnp: true,
+        upnp_permanent_malformed: true,
+        upnp_delete_fault: true,
+        ..Default::default()
+    })
+    .await;
+    let client = make_test_client(&igd);
+    assert!(client.create_or_get_mapping().await.is_err());
+    let adds = igd.upnp_add_count.load(Ordering::SeqCst);
+    assert_eq!(adds, 2, "requested then permanent Add attempts");
+
+    // Even far beyond the finite lease duration, permanent ambiguity remains
+    // gated until DeletePortMapping is positively confirmed.
+    let clock = Arc::new(Mutex::new(Instant::now() + Duration::from_secs(86_400)));
+    client.set_test_clock(Box::new({
+        let clock = clock.clone();
+        move || *clock.lock().unwrap()
+    }));
+    assert!(client.create_or_get_mapping().await.is_err());
+    assert_eq!(igd.upnp_add_count.load(Ordering::SeqCst), adds);
+
+    igd.set_protocols(true, false, false);
+    assert!(client.create_or_get_mapping().await.is_err());
+    assert_eq!(
+        igd.pmp_map_count.load(Ordering::SeqCst),
+        0,
+        "uncertain same-key UPnP cleanup must gate protocol switch"
+    );
+    igd.close();
+}
+
+#[tokio::test]
+async fn shutdown_cancels_blocked_supervisor_without_late_commit() {
+    let igd = FakeIgd::start(IgdOpts {
+        upnp: true,
+        ..Default::default()
+    })
+    .await;
+    let gate = AsyncGate::new();
+    igd.gate_external_ip(Some(gate.clone()));
+    let client = make_test_client(&igd);
+    let operation_client = client.clone();
+    let operation = tokio::spawn(async move { operation_client.create_or_get_mapping().await });
+    gate.reached.wait().await;
+
+    assert!(client.shutdown(Duration::from_millis(50)).await.is_err());
+    gate.resume.wait().await;
+    igd.gate_external_ip(None);
+    let _ = operation.await;
+    assert!(client.cached_mapping().is_none());
+    client
+        .shutdown(Duration::from_secs(2))
+        .await
+        .expect("retained allocation cleanup retry");
+    assert!(igd.upnp_delete_count.load(Ordering::SeqCst) >= 1);
     igd.close();
 }
 
@@ -1059,18 +1140,18 @@ async fn protocol_switch_releases_old_mapping_before_replacement() {
     igd.set_protocols(true, false, false);
     *clock.lock().unwrap() += Duration::from_secs(3601);
     let switch_started = Instant::now();
-    let second = client
-        .create_or_get_mapping()
-        .await
-        .expect("PMP replacement");
-    assert_eq!(second.kind, MappingKind::Pmp);
+    assert!(client.create_or_get_mapping().await.is_err());
     assert!(
-        switch_started.elapsed() >= crate::PROBE_TIMEOUT * 2,
-        "unconfirmed PCP deletion must hold the safe terminal delay"
+        switch_started.elapsed() >= crate::PROBE_TIMEOUT,
+        "PCP deletion confirmation must be attempted"
     );
     assert_eq!(igd.pcp_map_count.load(Ordering::SeqCst), 2);
-    assert_eq!(igd.pmp_map_count.load(Ordering::SeqCst), 1);
-    assert_eq!(client.cached_mapping().unwrap().kind, MappingKind::Pmp);
+    assert_eq!(
+        igd.pmp_map_count.load(Ordering::SeqCst),
+        0,
+        "unconfirmed same-key PCP cleanup must gate PMP replacement"
+    );
+    assert!(client.cached_mapping().is_none());
 
     client.close();
     igd.close();

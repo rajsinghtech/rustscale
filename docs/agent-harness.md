@@ -14,17 +14,42 @@ tools/agent/agent-review.sh "fix-name"
 
 The wrapper currently defaults to the model recorded in the script so resumed runs remain reproducible. Set `CODEX_MODEL` before a new run to use another Codex CLI model.
 
-## OpenCode read-only research
+Each implementation prompt should contain a focused goal, the relevant Rust and upstream Go locations, constraints, and the acceptance gate. Use `--continue` with the same title for compiler errors or review feedback so the saved session and worktree remain the source of truth.
 
-`tools/agent/opencode-task.sh` talks to a local OpenCode server for read-only research. It rejects repository mutations and aborts work that exceeds the deadline.
+## Pi read-only research
+
+`tools/agent/pi-research.sh` runs Pi non-interactively with only its `read`, `grep`, `find`, and `ls` tools enabled. It disables extensions, skills, and prompt templates, does not save a session, enforces a wall-clock deadline, and rejects the result if tracked or untracked repository state changes.
 
 ```bash
-OPENCODE_PROVIDER=provider-id \
-OPENCODE_MODEL=provider/model \
-tools/agent/opencode-task.sh "research-name" "Compare ..." 1200
+tools/agent/pi-research.sh "research-name" "Compare ..." 1200
+
+PI_PROVIDER=anthropic \
+PI_MODEL=claude-sonnet \
+tools/agent/pi-research.sh "research-name" "Compare ..." 1200
 ```
 
-The provider, model, server URL, warmup, and abort grace are configurable with the `OPENCODE_PROVIDER`, `OPENCODE_MODEL`, `OPENCODE_URL`, `OPENCODE_WARMUP`, and `OPENCODE_ABORT_GRACE` environment variables.
+When `PI_PROVIDER` or `PI_MODEL` is unset, Pi uses its normal configured default. The wrapper is deliberately ephemeral and read-only; use interactive Pi directly when a task needs a saved session or implementation tools.
+
+## Review and merge lifecycle
+
+After a run, inspect the preserved worktree and run the task-specific gate:
+
+```bash
+tools/worktree-status.sh
+tools/agent/agent-review.sh "fix-name"
+```
+
+The review command checks staleness, shows a bounded status and diff summary, runs `git diff --check`, and selects `tools/check.sh`, `tools/bench/check.sh`, or `tools/agent/check.sh` based on the changed paths. It does not commit work.
+
+Once the worktree is reviewed and committed, `tools/agent/worktree-merge.sh "fix-name"` validates the branch, merges it, validates the merged tree, and only then removes the worktree and local branch. A conflict or failed gate preserves the worktree for repair.
+
+## Prompting and recovery
+
+- Keep one coherent implementation objective per worktree.
+- Provide exact file or package names and use `tools/go-find.sh` for the pinned upstream `tailscale.com` module.
+- State the expected validation gate in the prompt.
+- On failure, pass the concise compiler or review diagnostic to `--continue`; do not discard the worktree or start broad research again.
+- Treat timeout, interruption, missing session metadata, repository mutation, and stale `master` as failures requiring explicit review.
 
 ## Safety and validation
 

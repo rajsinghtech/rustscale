@@ -88,7 +88,7 @@ if (( ${#changed[@]} > 0 )); then
       crate_dir="multiple"
     fi
     case "$path" in
-      .gitignore|AGENTS.md|CLAUDE.md|tools/check.sh|tools/agent/*) ;;
+      .gitignore|AGENTS.md|CLAUDE.md|docs/agent-harness.md|tools/check.sh|tools/agent/*) ;;
       *) harness_policy_only=0 ;;
     esac
   done

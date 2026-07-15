@@ -3011,6 +3011,7 @@ version = "0.1.1"
 dependencies = [
  "rustscale-deephash",
  "rustscale-flowtrack",
+ "rustscale-ipset",
  "rustscale-packet",
  "rustscale-tailcfg",
  "thiserror 1.0.69",
@@ -3087,6 +3088,14 @@ dependencies = [
  "rustscale-tailcfg",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "rustscale-ipset"
+version = "0.1.1"
+dependencies = [
+ "rand 0.8.7",
+ "rustscale-art",
 ]
 
 [[package]]

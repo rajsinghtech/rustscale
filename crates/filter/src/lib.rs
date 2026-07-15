@@ -25,6 +25,7 @@ use std::sync::Arc;
 
 use r#match::Matches as MatchList;
 use rustscale_deephash::{update as deephash_update, DeepHash, Hasher, Sum};
+use rustscale_ipset::{new_contains_ip_func, ContainsIpFunc, IpPrefix as SetPrefix};
 use rustscale_tailcfg::{FilterRule, PeerCapMap};
 
 /// Callback for counting packets on a connection.
@@ -59,12 +60,39 @@ pub enum FilterError {
     Parse(String),
 }
 
+struct LocalIpSet {
+    prefixes: Vec<SetPrefix>,
+    contains: ContainsIpFunc,
+}
+
+impl LocalIpSet {
+    fn new(prefixes: Vec<SetPrefix>) -> Self {
+        let contains = new_contains_ip_func(&prefixes);
+        Self { prefixes, contains }
+    }
+
+    fn contains(&self, ip: IpAddr) -> bool {
+        self.contains.contains(ip)
+    }
+
+    fn extend(&mut self, prefixes: impl IntoIterator<Item = SetPrefix>) {
+        self.prefixes.extend(prefixes);
+        self.contains = new_contains_ip_func(&self.prefixes);
+    }
+}
+
+impl Default for LocalIpSet {
+    fn default() -> Self {
+        Self::new(Vec::new())
+    }
+}
+
 /// A stateful packet filter.
 pub struct Filter {
     matches4: MatchList,
     matches6: MatchList,
-    local4: Vec<prefix::IpPrefix>,
-    local6: Vec<prefix::IpPrefix>,
+    local4: LocalIpSet,
+    local6: LocalIpSet,
     state: FlowState,
     /// When true, deny all *new* inbound flows. Established traffic
     /// (non-SYN TCP, cached UDP/SCTP flows, ICMP echo replies/errors,
@@ -171,14 +199,16 @@ impl Filter {
         let f = Self::new(&rules, &local, &empty_caps).unwrap_or_else(|_| Self {
             matches4: MatchList::default(),
             matches6: MatchList::default(),
-            local4: vec![prefix::IpPrefix {
-                addr: IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-                bits: 0,
-            }],
-            local6: vec![prefix::IpPrefix {
-                addr: IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
-                bits: 0,
-            }],
+            local4: LocalIpSet::new(vec![SetPrefix::new(
+                IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                0,
+            )
+            .expect("valid IPv4 default")]),
+            local6: LocalIpSet::new(vec![SetPrefix::new(
+                IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+                0,
+            )
+            .expect("valid IPv6 default")]),
             state: FlowState::new(),
             shields_up: false,
             cap_holders: BTreeMap::new(),
@@ -190,14 +220,16 @@ impl Filter {
         // Override local4/local6 with wildcard prefixes (host_prefix would
         // give /32 and /128, but we need /0).
         let mut f = f;
-        f.local4 = vec![prefix::IpPrefix {
-            addr: IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-            bits: 0,
-        }];
-        f.local6 = vec![prefix::IpPrefix {
-            addr: IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
-            bits: 0,
-        }];
+        f.local4 = LocalIpSet::new(vec![SetPrefix::new(
+            IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            0,
+        )
+        .expect("valid IPv4 default")]);
+        f.local6 = LocalIpSet::new(vec![SetPrefix::new(
+            IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+            0,
+        )
+        .expect("valid IPv6 default")]);
         f.input_hash = Sum::default();
         f
     }
@@ -207,8 +239,8 @@ impl Filter {
         Self {
             matches4: MatchList::default(),
             matches6: MatchList::default(),
-            local4: vec![],
-            local6: vec![],
+            local4: LocalIpSet::default(),
+            local6: LocalIpSet::default(),
             state: FlowState::new(),
             shields_up: false,
             cap_holders: BTreeMap::new(),
@@ -317,15 +349,22 @@ impl Filter {
     /// Each entry is a `"ip/prefix"` CIDR string; unparseable entries are
     /// silently skipped (matching Go's tolerant parsing).
     pub fn add_local_cidrs(&mut self, cidrs: &[String]) {
+        let mut v4 = Vec::new();
+        let mut v6 = Vec::new();
         for cidr in cidrs {
-            if let Some(pfx) = parse_cidr_prefix(cidr) {
-                if pfx.is_v4() {
-                    self.local4.push(pfx);
-                } else {
-                    self.local6.push(pfx);
-                }
+            let Some(prefix) =
+                parse_cidr_prefix(cidr).and_then(|prefix| SetPrefix::new(prefix.addr, prefix.bits))
+            else {
+                continue;
+            };
+            if prefix.addr().is_ipv4() {
+                v4.push(prefix);
+            } else {
+                v6.push(prefix);
             }
         }
+        self.local4.extend(v4);
+        self.local6.extend(v6);
     }
 
     /// Check an inbound raw IP packet.
@@ -419,7 +458,7 @@ impl Filter {
     }
 
     fn run_in4(&mut self, q: &PacketInfo) -> Verdict {
-        if !local_contains(&self.local4, q.dst) {
+        if !self.local4.contains(q.dst) {
             return Verdict::NoVerdict;
         }
         let caps = &self.cap_holders;
@@ -472,7 +511,7 @@ impl Filter {
     }
 
     fn run_in6(&mut self, q: &PacketInfo) -> Verdict {
-        if !local_contains(&self.local6, q.dst) {
+        if !self.local6.contains(q.dst) {
             return Verdict::NoVerdict;
         }
         let caps = &self.cap_holders;
@@ -535,22 +574,19 @@ fn has_cap(cap_holders: &BTreeMap<IpAddr, BTreeSet<String>>, src: &IpAddr, cap: 
     cap_holders.get(src).is_some_and(|caps| caps.contains(cap))
 }
 
-fn local_contains(local: &[prefix::IpPrefix], ip: IpAddr) -> bool {
-    local.iter().any(|p| p.contains(ip))
-}
-
-fn partition_local_ips(ips: &[IpAddr]) -> (Vec<prefix::IpPrefix>, Vec<prefix::IpPrefix>) {
+fn partition_local_ips(ips: &[IpAddr]) -> (LocalIpSet, LocalIpSet) {
     let mut v4 = Vec::new();
     let mut v6 = Vec::new();
     for ip in ips {
-        let pfx = prefix::host_prefix(*ip);
-        if pfx.is_v4() {
-            v4.push(pfx);
+        let prefix = SetPrefix::new(*ip, if ip.is_ipv4() { 32 } else { 128 })
+            .expect("host prefix length matches address family");
+        if ip.is_ipv4() {
+            v4.push(prefix);
         } else {
-            v6.push(pfx);
+            v6.push(prefix);
         }
     }
-    (v4, v6)
+    (LocalIpSet::new(v4), LocalIpSet::new(v6))
 }
 
 enum Verdict {

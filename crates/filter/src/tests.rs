@@ -335,6 +335,25 @@ fn test_filter_local_nets_prefilter() {
 }
 
 #[test]
+fn test_add_local_cidrs_rebuilds_ipset_with_normalized_prefixes() {
+    let mut f = new_test_filter();
+    f.add_local_cidrs(&[
+        "16.32.99.1/16".into(),
+        "2602:abcd::1/16".into(),
+        "invalid".into(),
+    ]);
+
+    assert_eq!(
+        f.check_in_info(&parsed(TCP, "8.1.1.1", "16.32.48.64", 0, 443)),
+        Response::Accept
+    );
+    assert_eq!(
+        f.check_in_info(&parsed(TCP, "1::", "2602::1", 0, 443)),
+        Response::Accept
+    );
+}
+
+#[test]
 fn test_filter_sctp() {
     let mut f = new_test_filter();
     // SCTP 8.1.1.1 => 1.2.3.4:22 → Drop (SCTP only for 9.1.1.1/9.2.2.2)

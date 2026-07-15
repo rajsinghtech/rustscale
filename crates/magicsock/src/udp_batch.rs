@@ -1621,7 +1621,7 @@ mod tests {
                 let (packet, _) = batch.detach_datagram(index).unwrap();
                 WgDatagram {
                     peer: peer.clone(),
-                    data: WgCiphertext::from_pooled(packet, pool_reservation.clone(), 0),
+                    data: WgCiphertext::from_pooled(packet, pool_reservation.clone(), 1),
                 }
             })
             .collect();

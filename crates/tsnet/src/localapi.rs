@@ -213,6 +213,8 @@ pub(crate) struct LocalApiState {
     /// value is swapped — so a `OnceLock` suffices). Used to apply shields-up
     /// mode changes from `PATCH /prefs` without a full filter rebuild.
     pub filter: std::sync::OnceLock<Arc<std::sync::Mutex<Filter>>>,
+    /// Live posture preference mirrored into the C2N posture service.
+    pub posture_checking: Arc<std::sync::atomic::AtomicBool>,
     /// Shared route table (for applying exit-node pref changes directly).
     /// None when the server is not fully up (e.g. start_localapi_only).
     pub route_table: Option<Arc<RwLock<crate::routing::RouteTable>>>,
@@ -311,6 +313,10 @@ async fn commit_prefs_update(
         }
         *prefs = candidate;
     }
+    state.posture_checking.store(
+        prefs.PostureChecking,
+        std::sync::atomic::Ordering::Release,
+    );
     Ok((serde_json::to_value(&*prefs).unwrap_or_default(), changed))
 }
 
@@ -3511,6 +3517,7 @@ mod tests {
                 WantRunning: true,
                 ..Default::default()
             })),
+            posture_checking: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             exit_node_selection: Arc::new(RwLock::new(crate::ExitNodeSelection::default())),
             tailscale_ips: vec!["100.64.0.1".parse().unwrap()],
             our_fqdn: "test.tailnet.ts.net.".into(),
@@ -4643,6 +4650,7 @@ mod tests {
             capture: state.capture.clone(),
             metrics: default_metric_registry(),
             prefs: state.prefs.clone(),
+            posture_checking: state.posture_checking.clone(),
             exit_node_selection: state.exit_node_selection.clone(),
             tailscale_ips: state.tailscale_ips.clone(),
             our_fqdn: state.our_fqdn.clone(),
@@ -4875,6 +4883,7 @@ mod tests {
             capture: base.capture.clone(),
             metrics: default_metric_registry(),
             prefs: base.prefs.clone(),
+            posture_checking: base.posture_checking.clone(),
             exit_node_selection: base.exit_node_selection.clone(),
             tailscale_ips: base.tailscale_ips.clone(),
             our_fqdn: base.our_fqdn.clone(),
@@ -5391,6 +5400,23 @@ mod tests {
         });
         let state = make_policy_test_state_with(policy).await;
         assert_eq!(state.prefs.read().await.AutoUpdate, Some(true));
+    }
+
+    #[tokio::test]
+    async fn test_patch_prefs_updates_live_posture_choice() {
+        let state = make_test_state().await;
+        let body = r#"{"PostureChecking":true,"PostureCheckingSet":true}"#;
+        let req = format!(
+            "PATCH /localapi/v0/prefs HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let response = send_request_with_identity(req.as_bytes(), &state, test_rw_identity()).await;
+        assert!(response.contains("200 OK"), "response: {response}");
+        assert!(state
+            .posture_checking
+            .load(std::sync::atomic::Ordering::Acquire));
+        assert!(state.prefs.read().await.PostureChecking);
     }
 
     #[tokio::test]

@@ -1352,8 +1352,8 @@ mod tests {
         )
         .await;
         assert!(resp.contains("200 OK"));
-        assert!(resp.contains("\"serialNumbers\":[\"serial-1\"]"));
-        assert!(resp.contains("\"ifaceHardwareAddrs\":[\"00:11:22:33:44:55\"]"));
+        assert!(resp.contains("\"SerialNumbers\":[\"serial-1\"]"));
+        assert!(resp.contains("\"IfaceHardwareAddrs\":[\"00:11:22:33:44:55\"]"));
     }
 
     #[tokio::test]
@@ -1365,7 +1365,7 @@ mod tests {
         )
         .await;
         assert!(resp.contains("200 OK"));
-        assert!(resp.contains("\"postureDisabled\":true"));
+        assert!(resp.contains("\"PostureDisabled\":true"));
     }
 
     #[tokio::test]

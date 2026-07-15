@@ -25,6 +25,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
+use crate::c2n::{answer_c2n_ping, C2nReplyError, C2nReplyTransport, C2nRouter};
 use crate::controlbase::{NoiseIo, ProtocolVersion};
 use crate::controlhttp::dial_control;
 
@@ -262,6 +263,53 @@ impl Drop for NoiseHttpClient {
     }
 }
 
+struct H2C2nReplyTransport {
+    sender: h2::client::SendRequest<bytes::Bytes>,
+}
+
+#[async_trait::async_trait]
+impl C2nReplyTransport for H2C2nReplyTransport {
+    async fn send(&self, callback_path: &str, response: Vec<u8>) -> Result<(), C2nReplyError> {
+        let request = http::Request::builder()
+            .method("POST")
+            .uri(callback_path)
+            .header("content-type", "application/octet-stream")
+            .body(())
+            .map_err(|_| C2nReplyError::InvalidCallback)?;
+        let mut sender = self
+            .sender
+            .clone()
+            .ready()
+            .await
+            .map_err(|_| C2nReplyError::Transport)?;
+        let (response_future, mut stream) = sender
+            .send_request(request, false)
+            .map_err(|_| C2nReplyError::Transport)?;
+        stream
+            .send_data(bytes::Bytes::from(response), true)
+            .map_err(|_| C2nReplyError::Transport)?;
+        let response = response_future
+            .await
+            .map_err(|_| C2nReplyError::Transport)?;
+        if !response.status().is_success() {
+            return Err(C2nReplyError::Transport);
+        }
+        let mut body = response.into_body();
+        let mut response_bytes = 0usize;
+        while let Some(frame) = body.data().await {
+            let frame = frame.map_err(|_| C2nReplyError::Transport)?;
+            let _ = body.flow_control().release_capacity(frame.len());
+            response_bytes = response_bytes
+                .checked_add(frame.len())
+                .ok_or(C2nReplyError::Transport)?;
+            if response_bytes > 64 * 1024 {
+                return Err(C2nReplyError::Transport);
+            }
+        }
+        Ok(())
+    }
+}
+
 impl From<H2SetupError> for RegisterError {
     fn from(e: H2SetupError) -> Self {
         match e {
@@ -459,6 +507,29 @@ impl ControlClient {
         req: &MapRequest,
         updates: mpsc::Sender<Result<MapResponse, StreamMapError>>,
     ) -> Result<(), StreamMapError> {
+        self.stream_map_inner(req, updates, None, None).await
+    }
+
+    /// Stream map updates and answer control-to-node callbacks over the same
+    /// Noise/H2 session.
+    async fn stream_map_with_c2n(
+        &self,
+        req: &MapRequest,
+        updates: mpsc::Sender<Result<MapResponse, StreamMapError>>,
+        router: Arc<C2nRouter>,
+        last_c2n_url: Arc<Mutex<String>>,
+    ) -> Result<(), StreamMapError> {
+        self.stream_map_inner(req, updates, Some(router), Some(last_c2n_url))
+            .await
+    }
+
+    async fn stream_map_inner(
+        &self,
+        req: &MapRequest,
+        updates: mpsc::Sender<Result<MapResponse, StreamMapError>>,
+        c2n_router: Option<Arc<C2nRouter>>,
+        last_c2n_url: Option<Arc<Mutex<String>>>,
+    ) -> Result<(), StreamMapError> {
         let noise_stream = dial_control(
             &self.host,
             &self.machine_key,
@@ -486,6 +557,9 @@ impl ControlClient {
 
         let (resp_future, mut send_stream) = h2_send.send_request(request, false)?;
         send_stream.send_data(bytes::Bytes::from(body), true)?;
+        let c2n_transport = H2C2nReplyTransport {
+            sender: h2_send.clone(),
+        };
 
         let resp = resp_future.await?;
         let status = resp.status().as_u16();
@@ -561,6 +635,27 @@ impl ControlClient {
             let msg: Vec<u8> = read_buf.drain(..size).collect();
             match serde_json::from_slice::<MapResponse>(&msg) {
                 Ok(mr) => {
+                    if let (Some(router), Some(last_url), Some(ping)) = (
+                        c2n_router.as_ref(),
+                        last_c2n_url.as_ref(),
+                        mr.PingRequest.as_ref().filter(|ping| ping.Types == "c2n"),
+                    ) {
+                        let unique = {
+                            let mut last = lock_unpoisoned(last_url);
+                            if ping.URL.is_empty() || *last == ping.URL {
+                                false
+                            } else {
+                                last.clone_from(&ping.URL);
+                                true
+                            }
+                        };
+                        if unique {
+                            if let Err(error) = answer_c2n_ping(router, &c2n_transport, ping).await
+                            {
+                                log::warn!("control: failed to answer C2N request: {error}");
+                            }
+                        }
+                    }
                     if updates.send(Ok(mr)).await.is_err() {
                         break;
                     }
@@ -593,7 +688,31 @@ impl ControlClient {
         updates: mpsc::Sender<Result<MapResponse, StreamMapError>>,
         session: Option<Arc<MapSessionState>>,
     ) {
+        self.stream_map_loop_inner(req, updates, session, None)
+            .await;
+    }
+
+    /// Map reconnect loop with same-session C2N callback handling.
+    pub async fn stream_map_loop_with_c2n(
+        &self,
+        req: &MapRequest,
+        updates: mpsc::Sender<Result<MapResponse, StreamMapError>>,
+        session: Option<Arc<MapSessionState>>,
+        router: Arc<C2nRouter>,
+    ) {
+        self.stream_map_loop_inner(req, updates, session, Some(router))
+            .await;
+    }
+
+    async fn stream_map_loop_inner(
+        &self,
+        req: &MapRequest,
+        updates: mpsc::Sender<Result<MapResponse, StreamMapError>>,
+        session: Option<Arc<MapSessionState>>,
+        c2n_router: Option<Arc<C2nRouter>>,
+    ) {
         let mut backoff = std::time::Duration::from_secs(2);
+        let last_c2n_url = Arc::new(Mutex::new(String::new()));
         loop {
             if updates.is_closed() {
                 return;
@@ -607,7 +726,18 @@ impl ControlClient {
             } else {
                 req.clone()
             };
-            match self.stream_map(&req_for_iter, updates.clone()).await {
+            let result = if let Some(router) = c2n_router.as_ref() {
+                self.stream_map_with_c2n(
+                    &req_for_iter,
+                    updates.clone(),
+                    router.clone(),
+                    last_c2n_url.clone(),
+                )
+                .await
+            } else {
+                self.stream_map(&req_for_iter, updates.clone()).await
+            };
+            match result {
                 Ok(()) => {
                     backoff = std::time::Duration::from_secs(2);
                     eprintln!("control: map stream ended; reconnecting in {backoff:?}");

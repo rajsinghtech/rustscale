@@ -448,6 +448,7 @@ impl Server {
             capture: inner.capture.clone(),
             metrics: crate::localapi::default_metric_registry(),
             prefs: Arc::new(RwLock::new(self.load_prefs().unwrap_or_default())),
+            posture_checking: inner.posture_checking.clone(),
             exit_node_selection: inner.exit_node_selection.clone(),
             tailscale_ips: inner.tailscale_ips.clone(),
             our_fqdn: inner.our_fqdn.clone(),

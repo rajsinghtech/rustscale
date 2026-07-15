@@ -16,7 +16,10 @@ pub mod controlbase;
 pub mod controlhttp;
 pub mod login_flags;
 
-pub use c2n::{C2nHandler, C2nRequest, C2nResponse, C2nRouter};
+pub use c2n::{
+    answer_c2n_ping, C2nHandler, C2nReplyError, C2nReplyTransport, C2nRequest, C2nResponse,
+    C2nRouter,
+};
 pub use client::{
     ControlClient, MapSessionState, NoiseHttpClient, NoiseRequestError, NoiseResponse,
     NoiseResponseBody, RegisterError, StreamMapError,

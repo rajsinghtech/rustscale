@@ -250,6 +250,7 @@ impl Server {
             b.ipn_backend.clone(),
             Some(key_rotation_ctx),
             b.map_session.clone(),
+            b.c2n_router.clone(),
             suggested_exit_node.clone(),
             client_updater.clone(),
         );
@@ -457,6 +458,7 @@ impl Server {
                 capture: capture.clone(),
                 metrics: localapi::default_metric_registry(),
                 prefs: prefs.clone(),
+                posture_checking: b.posture_checking.clone(),
                 exit_node_selection: exit_node_selection.clone(),
                 tailscale_ips: b.tailscale_ips.clone(),
                 our_fqdn: b.our_fqdn.clone(),
@@ -594,6 +596,7 @@ impl Server {
             health: b.health,
             health_watchdog: b.health_watchdog,
             c2n_router: b.c2n_router,
+            posture_checking: b.posture_checking,
             c2n_addr: Some(c2n_addr),
             control_knobs: b.control_knobs,
             peerapi_port,
@@ -784,6 +787,7 @@ impl Server {
             b.ipn_backend.clone(),
             Some(key_rotation_ctx),
             b.map_session.clone(),
+            b.c2n_router.clone(),
             suggested_exit_node.clone(),
             client_updater.clone(),
         );
@@ -960,6 +964,7 @@ impl Server {
                 capture: capture.clone(),
                 metrics: localapi::default_metric_registry(),
                 prefs: prefs.clone(),
+                posture_checking: b.posture_checking.clone(),
                 exit_node_selection: exit_node_selection.clone(),
                 tailscale_ips: b.tailscale_ips.clone(),
                 our_fqdn: b.our_fqdn.clone(),
@@ -1130,6 +1135,7 @@ impl Server {
             health: b.health,
             health_watchdog: b.health_watchdog,
             c2n_router: b.c2n_router,
+            posture_checking: b.posture_checking,
             c2n_addr: Some(c2n_addr),
             control_knobs: b.control_knobs,
             peerapi_port,
@@ -1302,6 +1308,7 @@ impl Server {
             capture: crate::capture::new_slot(),
             metrics: localapi::default_metric_registry(),
             prefs: prefs.clone(),
+            posture_checking: Arc::new(AtomicBool::new(prefs.read().await.PostureChecking)),
             exit_node_selection: Arc::new(RwLock::new(ExitNodeSelection::from_prefs(
                 &*prefs.read().await,
             ))),
@@ -1979,12 +1986,8 @@ impl Server {
             server_pub_key.clone(),
             PROTOCOL_VERSION,
         );
-        let map_task = tokio::spawn({
-            let ss = map_session.clone();
-            async move {
-                cc2.stream_map_loop(&map_req, map_tx, Some(ss)).await;
-            }
-        });
+        // The task is started after C2N handlers are built below so callbacks
+        // can be answered on this exact streaming Noise session.
 
         // Control knobs: shared feature-flag store updated from each netmap.
         // Created here (before magicsock) so PMTUD can read PeerMTUEnable at
@@ -2131,6 +2134,13 @@ impl Server {
             "accept_routes": self.config.accept_routes,
             "advertise_exit_node": self.config.advertise_exit_node,
         });
+        let persisted_posture = self
+            .load_prefs()
+            .map(|prefs| prefs.PostureChecking)
+            .unwrap_or(false);
+        let posture_checking = Arc::new(AtomicBool::new(
+            self.config.posture_checking || persisted_posture,
+        ));
         let c2n_log_level = rustscale_c2n::LogLevelState::new();
         let c2n_backend = Arc::new(c2n::TsnetC2nBackend::new(
             c2n::C2nBackendData {
@@ -2145,7 +2155,8 @@ impl Server {
                 magicsock: magicsock.clone(),
                 sockstats: sockstats.clone(),
                 logtail: self.config.logtail.clone(),
-                posture_checking: self.config.posture_checking,
+                posture_checking: posture_checking.clone(),
+                posture_service: Arc::new(rustscale_posture::IdentityService::default()),
             },
             c2n_log_level,
         ));
@@ -2154,6 +2165,14 @@ impl Server {
             c2n::register_c2n_handlers(&mut r, c2n_backend.clone());
             Arc::new(r)
         };
+        let map_task = tokio::spawn({
+            let ss = map_session.clone();
+            let router = c2n_router.clone();
+            async move {
+                cc2.stream_map_loop_with_c2n(&map_req, map_tx, Some(ss), router)
+                    .await;
+            }
+        });
 
         // Control knobs created earlier (before magicsock construction).
 
@@ -2193,6 +2212,7 @@ impl Server {
             health_watchdog,
             c2n_router,
             c2n_backend,
+            posture_checking,
             control_knobs,
             overrides: self.config.overrides.clone(),
             key_expired: Arc::new(std::sync::atomic::AtomicBool::new(false)),

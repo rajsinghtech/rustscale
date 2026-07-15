@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -39,7 +39,8 @@ pub(crate) struct C2nBackendData {
     pub magicsock: Arc<Magicsock>,
     pub sockstats: Arc<rustscale_sockstats::SockStats>,
     pub logtail: Option<rustscale_logtail::LogTail>,
-    pub posture_checking: bool,
+    pub posture_checking: Arc<AtomicBool>,
+    pub posture_service: Arc<rustscale_posture::IdentityService>,
 }
 
 pub struct TsnetC2nBackend {
@@ -54,7 +55,8 @@ pub struct TsnetC2nBackend {
     magicsock: Arc<Magicsock>,
     sockstats: Arc<rustscale_sockstats::SockStats>,
     logtail: Option<rustscale_logtail::LogTail>,
-    posture_checking: bool,
+    posture_checking: Arc<AtomicBool>,
+    posture_service: Arc<rustscale_posture::IdentityService>,
     log_level: LogLevelState,
 }
 
@@ -73,8 +75,56 @@ impl TsnetC2nBackend {
             sockstats: data.sockstats,
             logtail: data.logtail,
             posture_checking: data.posture_checking,
+            posture_service: data.posture_service,
             log_level,
         }
+    }
+
+    async fn collect_posture(
+        &self,
+        include_hardware_addrs: bool,
+    ) -> Option<C2NPostureIdentityResponse> {
+        let service = self.posture_service.clone();
+        let user_enabled = self.posture_checking.load(Ordering::Acquire);
+        let collection = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::task::spawn_blocking(move || {
+                service.collect(user_enabled, include_hardware_addrs)
+            }),
+        )
+        .await;
+        let collection = match collection {
+            Ok(Ok(collection)) => collection,
+            Ok(Err(_)) => {
+                log::warn!("posture: collector task failed");
+                return None;
+            }
+            Err(_) => {
+                log::warn!("posture: collection deadline exceeded");
+                return None;
+            }
+        };
+        if let Some(error) = collection.policy_error {
+            log::warn!("posture: policy lookup failed: {error}");
+        }
+        if let Some(error) = collection.serial_error {
+            log::warn!("posture: serial collection failed: {error}");
+        }
+        if let Some(error) = collection.hardware_addr_error {
+            log::warn!("posture: hardware address collection failed: {error}");
+        }
+        let identity = collection.identity;
+        log::debug!(
+            "posture: disabled={} serials={} hardware_addrs={}",
+            identity.posture_disabled,
+            identity.serial_numbers.len(),
+            identity.iface_hardware_addrs.len()
+        );
+        Some(C2NPostureIdentityResponse {
+            serial_numbers: identity.serial_numbers,
+            iface_hardware_addrs: identity.iface_hardware_addrs,
+            posture_disabled: identity.posture_disabled,
+        })
     }
 
     pub fn log_level(&self) -> LogLevelState {
@@ -229,25 +279,7 @@ impl C2nBackend for TsnetC2nBackend {
     }
 
     async fn posture_identity(&self) -> Option<C2NPostureIdentityResponse> {
-        if !self.posture_checking {
-            return Some(C2NPostureIdentityResponse {
-                posture_disabled: true,
-                ..Default::default()
-            });
-        }
-
-        let serial_numbers = match rustscale_posture::get_serial_numbers() {
-            Ok(serial_numbers) => serial_numbers,
-            Err(error) => {
-                log::warn!("posture: serial collection failed: {error}");
-                Vec::new()
-            }
-        };
-        Some(C2NPostureIdentityResponse {
-            serial_numbers,
-            iface_hardware_addrs: rustscale_posture::get_hardware_addrs(),
-            posture_disabled: false,
-        })
+        self.collect_posture(false).await
     }
 }
 
@@ -382,8 +414,18 @@ struct PostureIdentityHandler {
 
 #[async_trait]
 impl C2nHandler for PostureIdentityHandler {
-    async fn handle(&self, _req: C2nRequest) -> C2nResponse {
-        match self.backend.posture_identity().await {
+    async fn handle(&self, req: C2nRequest) -> C2nResponse {
+        let include_hardware_addrs = req
+            .path
+            .split_once('?')
+            .map(|(_, query)| {
+                query
+                    .split('&')
+                    .filter_map(|part| part.split_once('='))
+                    .any(|(key, value)| key == "hwaddrs" && value == "true")
+            })
+            .unwrap_or(false);
+        match self.backend.collect_posture(include_hardware_addrs).await {
             Some(response) => {
                 let body = serde_json::to_value(response).unwrap_or(serde_json::Value::Null);
                 C2nResponse::json(200, &body)

@@ -151,7 +151,7 @@ use {
     std::collections::{BTreeMap, BTreeSet, HashMap},
     std::net::{IpAddr, Ipv4Addr, SocketAddr},
     std::path::PathBuf,
-    std::sync::atomic::AtomicU64,
+    std::sync::atomic::{AtomicBool, AtomicU64},
     std::sync::Arc,
     tokio::sync::{mpsc, Mutex, RwLock},
     tokio::task::JoinHandle,
@@ -790,6 +790,8 @@ pub(crate) struct RunningState {
     pub(crate) health_watchdog: Watchdog,
     /// C2N request router (control-to-node handler dispatch).
     pub(crate) c2n_router: Arc<C2nRouter>,
+    /// Live posture preference shared with LocalAPI and C2N.
+    pub(crate) posture_checking: Arc<AtomicBool>,
     /// C2N HTTP server address (loopback, bound on up()).
     pub(crate) c2n_addr: Option<SocketAddr>,
     /// Control-plane feature flags extracted from netmap updates.
@@ -928,6 +930,8 @@ pub(crate) struct Bootstrap {
     pub(crate) c2n_router: Arc<C2nRouter>,
     /// C2N backend (shared by HTTP server + Noise-channel router).
     pub(crate) c2n_backend: Arc<c2n::TsnetC2nBackend>,
+    /// Live persisted posture preference used by C2N collection.
+    pub(crate) posture_checking: Arc<AtomicBool>,
     /// Control-plane feature flags extracted from netmap updates.
     pub(crate) control_knobs: Arc<ControlKnobs>,
     /// Runtime Hostinfo field overrides (shared with the update loop).

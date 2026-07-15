@@ -3072,6 +3072,7 @@ dependencies = [
  "curve25519-dalek 4.1.3",
  "h2",
  "http",
+ "log",
  "rand 0.8.7",
  "rcgen",
  "rustls",
@@ -3566,6 +3567,7 @@ dependencies = [
  "libc",
  "log",
  "rustscale-netmon",
+ "rustscale-syspolicy",
  "thiserror 1.0.69",
 ]
 

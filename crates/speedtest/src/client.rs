@@ -1,43 +1,68 @@
 use std::time::Duration;
 
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 
-use crate::protocol::{Config, ConfigResponse, Direction, PROTOCOL_VERSION};
-use crate::{do_test, read_json_line, write_json_line, Result as SpeedtestResult, SpeedtestError};
+use crate::{
+    do_test, read_json_line, validate_duration, write_json_line, CancellationToken, Config,
+    ConfigResponse, Direction, SpeedtestError, TokioClock, HANDSHAKE_TIMEOUT, PROTOCOL_VERSION,
+};
+use crate::{Clock, Result as SpeedtestResult};
 
-/// Run a speedtest client over the given stream.
+/// Run a speedtest over an already connected stream.
 ///
-/// `stream` must implement `tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin`.
-/// When composed with `tsnet::Server::dial()`, pass the returned `NetstackStream`.
+/// The duration is checked against the upstream 5–30 second bounds before any
+/// bytes are written. Dropping this future cancels it; use
+/// [`run_with_cancellation`] when cancellation must be signalled explicitly.
 pub async fn run<S>(
     stream: &mut S,
     direction: Direction,
     duration: Duration,
-) -> std::result::Result<Vec<SpeedtestResult>, SpeedtestError>
+) -> Result<Vec<SpeedtestResult>, SpeedtestError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let test_duration_ns = u64::try_from(duration.as_nanos()).map_err(|_| {
-        SpeedtestError::InvalidDuration("duration exceeds the protocol maximum".into())
-    })?;
-    if test_duration_ns == 0 {
-        return Err(SpeedtestError::InvalidDuration(
-            "duration must be greater than zero".into(),
-        ));
-    }
+    run_with_cancellation(stream, direction, duration, &CancellationToken::new()).await
+}
 
+/// Run a speedtest with explicit cancellation.
+pub async fn run_with_cancellation<S>(
+    stream: &mut S,
+    direction: Direction,
+    duration: Duration,
+    cancellation: &CancellationToken,
+) -> Result<Vec<SpeedtestResult>, SpeedtestError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    run_with_clock(stream, direction, duration, cancellation, &TokioClock).await
+}
+
+pub(crate) async fn run_with_clock<S>(
+    stream: &mut S,
+    direction: Direction,
+    duration: Duration,
+    cancellation: &CancellationToken,
+    clock: &dyn Clock,
+) -> Result<Vec<SpeedtestResult>, SpeedtestError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    validate_duration(duration)?;
+    let test_duration_ns =
+        i64::try_from(duration.as_nanos()).map_err(|_| SpeedtestError::InvalidDuration)?;
     let config = Config {
         version: PROTOCOL_VERSION,
         test_duration_ns,
         direction,
     };
-    write_json_line(stream, &config).await?;
-    stream.flush().await?;
+    let handshake_deadline = clock.now() + HANDSHAKE_TIMEOUT;
+    write_json_line(stream, &config, handshake_deadline, cancellation, clock).await?;
 
-    let response: ConfigResponse = read_json_line(stream).await?;
-    if let Some(error) = response.error {
+    let response: ConfigResponse =
+        read_json_line(stream, handshake_deadline, cancellation, clock).await?;
+    if let Some(error) = response.error.filter(|error| !error.is_empty()) {
         return Err(SpeedtestError::ServerRefused(error));
     }
 
-    do_test(stream, config).await
+    do_test(stream, direction, duration, cancellation, clock).await
 }

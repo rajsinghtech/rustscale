@@ -104,7 +104,7 @@ real JSON).
 | Socket options | `net/sockopts/` | ✅ SO_MARK + SO_BINDTODEVICE in `crates/netns/src/linux.rs` |
 | TCP connection table | `net/netstat/` | 🔶 `crates/tcpinfo` iterates FDs 0..1000 on macOS; no full OS TCP connection enumeration |
 | TCP keepalive timeout | `net/ktimeout/` | ✅ `crates/ktimeout` applies Linux `TCP_USER_TIMEOUT=15s` to each accepted in-process DERP server connection (no-op on other platforms) |
-| Speedtest protocol | `net/speedtest/` | ⬜ |
+| Speedtest protocol | `net/speedtest/` | ✅ `crates/speedtest`: v2 newline-JSON control messages and raw 2 MiB data blocks, upload/download direction reversal, 1s interval plus total measurement semantics, decimal throughput helpers; strict 5–30s/control-frame/result/concurrency bounds, monotonic deadlines, cancellation, partial-I/O and malformed/truncated-peer handling; hermetic duplex/wire-vector tests. Live Go-process interop is deferred; no CLI was added because upstream keeps its command separate and experimental. |
 | Desktop integration | `ipn/desktop/` | ✅ `crates/tsnet/src/hostinfo.rs`: reads `/proc/net/unix` for .X11-unix / wayland-1 socket detection |
 | Alternative routing table | `net/art/` | ⬜ |
 | BIRD routing client | `chirp/` | ✅ `crates/chirp`: async BIRD control-socket client with response framing, protocol enable/disable, validated IPv4/IPv6 route updates, reconnects, deadlines, and hermetic partial-I/O/error tests |

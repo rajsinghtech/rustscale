@@ -74,5 +74,6 @@ grep -q 'ln -s rustscale /usr/local/bin/tailscale' Dockerfile
 grep -q 'org.opencontainers.image.version' Dockerfile
 test "$(grep -c '^FROM .*@sha256:[0-9a-f]\{64\}' Dockerfile)" -eq 2
 grep -q "v$version" site/index.html
+python3 tools/packaging/check-pages-performance.py
 
 echo "release contract: v$version ok"

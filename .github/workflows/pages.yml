@@ -16,6 +16,9 @@ on:
       - 'scripts/install.ps1'
       - 'site/**'
       - 'assets/rustscale-logo.svg'
+      - 'PERFORMANCE.md'
+      - 'docs/performance/**'
+      - 'tools/packaging/check-pages-performance.py'
       - 'tools/packaging/test-install.sh'
       - 'LICENSE'
       - '.github/workflows/pages.yml'
@@ -25,6 +28,9 @@ on:
       - 'scripts/install.ps1'
       - 'site/**'
       - 'assets/rustscale-logo.svg'
+      - 'PERFORMANCE.md'
+      - 'docs/performance/**'
+      - 'tools/packaging/check-pages-performance.py'
       - 'tools/packaging/test-install.sh'
       - 'LICENSE'
       - '.github/workflows/pages.yml'
@@ -49,6 +55,7 @@ jobs:
         run: |
           shellcheck scripts/install.sh
           tools/packaging/test-install.sh
+          python3 tools/packaging/check-pages-performance.py
           mkdir -p _site/assets
           cp scripts/install.sh   _site/install.sh
           cp scripts/install.ps1  _site/install.ps1

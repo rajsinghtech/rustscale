@@ -1,11 +1,27 @@
 # rustscale 0.1.1
 
 rustscale 0.1.1 is a large compatibility and production-readiness update. The
-workspace now contains 75 Rust crates and substantially expands client, CLI,
+workspace now contains 85 Rust crates and substantially expands client, CLI,
 LocalAPI, network-monitoring, routing, logging, and TKA coverage. Linux TUN and
 direct-UDP hot paths received extensive batching and allocation work.
 
 See [CHANGELOG.md](../CHANGELOG.md) for the detailed feature summary.
+
+## Performance
+
+The maintained matched direct-TUN comparison is published in
+[PERFORMANCE.md](../PERFORMANCE.md), including raw samples, latency, CPU, RSS,
+binary size, runtime settings, and reproduction guidance. These historical
+pre-release measurements used RustScale commit `ca56c1d`, not the final v0.1.1
+tag. On matched `n1-standard-4` runs, throughput-optimized RustScale measured
+2152, 2238, and 1818 Mbps at 1, 10, and 100 streams, compared with tailscaled
+1.98.9 at 2071, 2356, and 1602 Mbps. RustScale used 36% less average CPU, 65% less average RSS,
+and a 60% smaller daemon binary in that workload.
+
+The throughput profile enables the Linux-only, opt-in outbound send pipeline.
+It is not the default because it trades higher RustScale CPU and a weaker
+latency tail for throughput. The project Pages site presents a compact graph;
+the performance document remains authoritative for methodology and caveats.
 
 ## Install
 

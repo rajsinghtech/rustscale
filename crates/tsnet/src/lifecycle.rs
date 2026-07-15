@@ -2058,9 +2058,9 @@ impl Server {
                     .CapMap
                     .contains_key(rustscale_drive::NODE_CAPABILITY_TAILDRIVE_SHARE);
             let mut epoch = self.drive.authorization_write().await;
+            self.drive.rotate_authorization_locked(&mut epoch);
             self.drive
                 .set_sharing_allowed_locked(sharing_allowed, &mut epoch);
-            crate::drive::Runtime::rotate_authorization_locked(&mut epoch);
         }
         magicsock.set_netmap(peers.clone()).await?;
 

@@ -19,9 +19,10 @@ mod http;
 mod path;
 
 pub use auth::{AuthError, AuthenticatedPeer, Permission, Permissions};
-pub use config::{ConfigError, ConfigStore, Limits, Share, Snapshot};
+pub use config::{ConfigError, ConfigStore, Limits, PreparedConfig, Share, Snapshot};
 pub use http::{
-    streaming_body_channel, HeaderMap, Request, RequestControl, Response, Server, StreamingBody,
+    streaming_body_channel, HeaderMap, Request, RequestAuthority, RequestControl, Response, Server,
+    StreamingBody,
 };
 pub use path::{encode_path_component, PathError};
 

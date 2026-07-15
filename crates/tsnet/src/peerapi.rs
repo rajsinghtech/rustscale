@@ -1207,7 +1207,7 @@ async fn dispatch_inner(
 struct AuthorizedDriveRequest {
     peer: AuthenticatedPeer,
     request: rustscale_drive::Request,
-    cancellation: tokio_util::sync::CancellationToken,
+    authority: rustscale_drive::RequestAuthority,
 }
 
 async fn authorize_drive(
@@ -1324,11 +1324,11 @@ async fn authorize_drive(
         .drive
         .preflight(&peer, &request)
         .map_err(adapt_drive_response)?;
-    let cancellation = crate::drive::Runtime::child_cancellation(&epoch);
+    let authority = state.drive.request_authority_locked(&epoch);
     Ok(AuthorizedDriveRequest {
         peer,
         request,
-        cancellation,
+        authority,
     })
 }
 
@@ -1350,10 +1350,11 @@ async fn run_authorized_drive(
     let AuthorizedDriveRequest {
         peer,
         request,
-        cancellation,
+        authority,
     } = authorized;
     let timeout = state.drive.limits().request_timeout;
-    let control = RequestControl::new(cancellation.clone(), std::time::Instant::now() + timeout);
+    let cancellation = authority.cancellation();
+    let control = RequestControl::new(authority, std::time::Instant::now() + timeout);
     let cancellation_guard = cancellation.drop_guard();
     let drive = state.drive.clone();
     let worker = tokio::task::spawn_blocking(move || drive.handle(&peer, request, &control));
@@ -1371,11 +1372,12 @@ async fn stream_authorized_put<R: AsyncRead + Unpin>(
     let AuthorizedDriveRequest {
         peer,
         request,
-        cancellation,
+        authority,
     } = authorized;
     let timeout = state.drive.limits().request_timeout;
     let deadline = std::time::Instant::now() + timeout;
-    let control = RequestControl::new(cancellation.clone(), deadline);
+    let cancellation = authority.cancellation();
+    let control = RequestControl::new(authority, deadline);
     let cancellation_guard = cancellation.clone().drop_guard();
     let (sender, body) =
         rustscale_drive::streaming_body_channel(body_length, TAILDRIVE_STREAM_QUEUE);
@@ -1965,8 +1967,8 @@ mod tests {
         grant: Option<&str>,
     ) {
         let mut epoch = state.drive.authorization_write().await;
+        state.drive.rotate_authorization_locked(&mut epoch);
         *state.filter.lock().unwrap() = taildrive_filter(src, dst, grant);
-        crate::drive::Runtime::rotate_authorization_locked(&mut epoch);
     }
 
     async fn enabled_taildrive_state(
@@ -1984,8 +1986,8 @@ mod tests {
         let state = make_test_state(vec![peer], vec![dst], false);
         {
             let mut epoch = state.drive.authorization_write().await;
+            state.drive.rotate_authorization_locked(&mut epoch);
             state.drive.set_sharing_allowed_locked(true, &mut epoch);
-            crate::drive::Runtime::rotate_authorization_locked(&mut epoch);
         }
         let temp = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(temp.path()).unwrap();
@@ -2151,12 +2153,12 @@ mod tests {
         let new_node_key = new_key.to_string();
         let map_guard = state.peer_map.gate.write().await;
         let mut epoch = state.drive.authorization_write().await;
+        state.drive.rotate_authorization_locked(&mut epoch);
         {
             let mut peers = state.peers.write().await;
             peers[0].Key = new_key;
             state.peer_map.install_locked(&peers).unwrap();
         }
-        crate::drive::Runtime::rotate_authorization_locked(&mut epoch);
         drop(epoch);
         drop(map_guard);
 

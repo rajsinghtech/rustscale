@@ -5339,8 +5339,8 @@ mod tests {
         let state = make_test_state().await;
         {
             let mut epoch = state.drive.authorization_write().await;
+            state.drive.rotate_authorization_locked(&mut epoch);
             state.drive.set_sharing_allowed_locked(true, &mut epoch);
-            crate::drive::Runtime::rotate_authorization_locked(&mut epoch);
         }
         let temp = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(temp.path()).unwrap();

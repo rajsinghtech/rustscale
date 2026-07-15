@@ -49,11 +49,15 @@ surface. It was compared with Tailscale's `drive/`, `feature/drive`,
   precedence with grant count/size limits and fail-closed errors.
   Non-wildcard selectors must already be canonical; authority selectors are
   never lowercased or trimmed into a broader grant.
-- Identity, peer state, packet-filter grants, and the request cancellation
-  token are derived under one authorization epoch. Every non-keepalive map
-  update installs peer/filter changes atomically for Taildrive, cancels all
-  requests authorized under the prior map, and starts a fresh epoch. Invalid
-  filter updates fail closed rather than retaining stale grants.
+- Identity, peer state, packet-filter grants, and a request commit permit are
+  derived under one authorization epoch. Every non-keepalive map or runtime
+  config update exclusively revokes the old epoch, cancels staging work, and
+  drains any already-linearized publication before installing/releasing the
+  new epoch. PUT, streaming PUT, MKCOL, DELETE, MOVE, and COPY compare the
+  epoch while holding the same short commit barrier across their irreversible
+  mkdir/remove/rename publication. After revocation returns, old authority
+  cannot commit a filesystem change. Invalid filter updates fail closed rather
+  than retaining stale grants.
 - Ungranted shares return 404 inside WebDAV, read-only writes return 403, and a
   peer with no Taildrive capability is rejected before WebDAV dispatch.
 
@@ -79,8 +83,10 @@ surface. It was compared with Tailscale's `drive/`, `feature/drive`,
 - PUT bodies stream in 64 KiB chunks through a two-slot channel to the bounded
   filesystem pool; a full-body clone is never made. Uploads use same-directory
   temporary files, `sync_all`, a final cancellation check, and rename.
-  Cancellation after sync cannot publish the destination, and failed or
-  truncated uploads remove their temporary file.
+  Configuration root opening, upload/copy I/O, and sync happen outside the
+  commit barrier; only the final publication is guarded. Cancellation after
+  sync cannot publish the destination, and failed or truncated uploads remove
+  their temporary file.
 
 ### LocalAPI
 
@@ -107,8 +113,9 @@ request cancellation, deterministic root replacement, FIFO/socket rejection,
 worker saturation, post-sync cancellation, traversal, symlink escape,
 oversized requests, malicious `Destination` values, body-before-authorization
 framing, aggregate byte admission, old-key denial/new-key success, tunnel/send
-path removal on rotation, duplicate address ownership, and eight concurrent
-16 MiB streaming uploads.
+path removal on rotation, duplicate address ownership, eight concurrent 16 MiB
+streaming uploads, and revocation injected immediately before every mutating
+WebDAV publication followed by successful new-epoch retries.
 
 ## Deferred
 

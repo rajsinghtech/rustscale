@@ -8,12 +8,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use rustscale_drive::{
-    AuthenticatedPeer, ConfigError, ConfigStore, Limits, Request, RequestControl, Response, Server,
-    Share, Snapshot, StreamingBody,
+    AuthenticatedPeer, ConfigError, ConfigStore, Limits, Request, RequestAuthority, RequestControl,
+    Response, Server, Share, Snapshot, StreamingBody,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
-use tokio_util::sync::CancellationToken;
 
 /// Maximum encoded LocalAPI configuration body.
 pub(crate) const MAX_CONFIG_BODY: usize = 1024 * 1024;
@@ -41,10 +40,10 @@ pub(crate) struct Runtime {
     config: Arc<ConfigStore>,
     server: Server,
     sharing_allowed: AtomicBool,
-    /// Requests hold a child of the token protected by this lock. A map update
-    /// takes the write lock while replacing peer/filter state, then cancels and
-    /// replaces the token before allowing new authorization decisions.
-    authorization: RwLock<CancellationToken>,
+    /// Serializes signed grant derivation with map/config replacement. The
+    /// synchronous server commit barrier separately linearizes filesystem
+    /// publication without holding this async lock during staging work.
+    authorization: RwLock<()>,
 }
 
 impl Runtime {
@@ -54,7 +53,7 @@ impl Runtime {
             server: Server::new(config.clone()),
             config,
             sharing_allowed: AtomicBool::new(false),
-            authorization: RwLock::new(CancellationToken::new()),
+            authorization: RwLock::new(()),
         })
     }
 
@@ -80,16 +79,21 @@ impl Runtime {
         }
     }
 
-    pub(crate) async fn authorization_read(&self) -> RwLockReadGuard<'_, CancellationToken> {
+    pub(crate) async fn authorization_read(&self) -> RwLockReadGuard<'_, ()> {
         self.authorization.read().await
     }
 
-    pub(crate) async fn authorization_write(&self) -> RwLockWriteGuard<'_, CancellationToken> {
+    pub(crate) async fn authorization_write(&self) -> RwLockWriteGuard<'_, ()> {
         self.authorization.write().await
     }
 
-    pub(crate) fn child_cancellation(epoch: &CancellationToken) -> CancellationToken {
-        epoch.child_token()
+    /// Capture one request authority while the caller holds the authorization
+    /// read lock used for signed map/grant derivation.
+    pub(crate) fn request_authority_locked(
+        &self,
+        _guard: &RwLockReadGuard<'_, ()>,
+    ) -> RequestAuthority {
+        self.server.request_authority()
     }
 
     /// Apply the self-node `drive:share` attribute while a map-update writer
@@ -97,7 +101,7 @@ impl Runtime {
     pub(crate) fn set_sharing_allowed_locked(
         &self,
         allowed: bool,
-        _guard: &mut RwLockWriteGuard<'_, CancellationToken>,
+        _guard: &mut RwLockWriteGuard<'_, ()>,
     ) {
         self.sharing_allowed.store(allowed, Ordering::Release);
         if !allowed {
@@ -105,12 +109,12 @@ impl Runtime {
         }
     }
 
-    /// Cancel all requests authorized under the old map and start a fresh
-    /// epoch. The caller must already have atomically installed the new map
-    /// authorization state while holding `guard`.
-    pub(crate) fn rotate_authorization_locked(guard: &mut RwLockWriteGuard<'_, CancellationToken>) {
-        guard.cancel();
-        **guard = CancellationToken::new();
+    /// Cancel old staging work, drain old publication critical sections, and
+    /// start a fresh commit epoch. The caller holds the authorization writer
+    /// across this call and the following map/config state replacement, so new
+    /// request authority cannot observe a partially installed epoch.
+    pub(crate) fn rotate_authorization_locked(&self, _guard: &mut RwLockWriteGuard<'_, ()>) {
+        self.server.revoke_authority();
     }
 
     /// Replace the complete runtime configuration. Validation and root opening
@@ -121,26 +125,26 @@ impl Runtime {
         self: &Arc<Self>,
         config: RuntimeConfig,
     ) -> Result<u64, ReplaceError> {
+        let store = self.config.clone();
+        let enabled = config.enabled;
+        let prepared = tokio::task::spawn_blocking(move || store.prepare(enabled, config.shares))
+            .await
+            .map_err(|error| ReplaceError::Worker(error.to_string()))??;
+
         let mut epoch = self.authorization.write().await;
-        if config.enabled && !self.sharing_allowed() {
+        if enabled && !self.sharing_allowed() {
             return Err(ReplaceError::SharingNotAllowed);
         }
-        let store = self.config.clone();
-        let result =
-            tokio::task::spawn_blocking(move || store.replace(config.enabled, config.shares))
-                .await
-                .map_err(|error| ReplaceError::Worker(error.to_string()))?;
-        let generation = result?;
-        Self::rotate_authorization_locked(&mut epoch);
-        Ok(generation)
+        self.rotate_authorization_locked(&mut epoch);
+        Ok(self.config.commit(prepared))
     }
 
     /// Disable sharing and cancel every active Taildrive request.
     pub(crate) async fn disable(&self) {
         let mut epoch = self.authorization.write().await;
+        self.rotate_authorization_locked(&mut epoch);
         self.sharing_allowed.store(false, Ordering::Release);
         self.config.disable();
-        Self::rotate_authorization_locked(&mut epoch);
     }
 
     pub(crate) fn preflight(
@@ -196,16 +200,16 @@ mod tests {
 
         let old = {
             let epoch = runtime.authorization_read().await;
-            Runtime::child_cancellation(&epoch)
+            runtime.request_authority_locked(&epoch).cancellation()
         };
         let mut epoch = runtime.authorization_write().await;
-        Runtime::rotate_authorization_locked(&mut epoch);
+        runtime.rotate_authorization_locked(&mut epoch);
         drop(epoch);
         assert!(old.is_cancelled());
 
         let current = {
             let epoch = runtime.authorization_read().await;
-            Runtime::child_cancellation(&epoch)
+            runtime.request_authority_locked(&epoch).cancellation()
         };
         assert!(!current.is_cancelled());
     }
@@ -215,8 +219,8 @@ mod tests {
         let runtime = Runtime::new();
         {
             let mut epoch = runtime.authorization_write().await;
+            runtime.rotate_authorization_locked(&mut epoch);
             runtime.set_sharing_allowed_locked(true, &mut epoch);
-            Runtime::rotate_authorization_locked(&mut epoch);
         }
         let temp = tempfile::tempdir().unwrap();
         runtime
@@ -231,12 +235,12 @@ mod tests {
             .unwrap();
         let active = {
             let epoch = runtime.authorization_read().await;
-            Runtime::child_cancellation(&epoch)
+            runtime.request_authority_locked(&epoch).cancellation()
         };
 
         let mut epoch = runtime.authorization_write().await;
+        runtime.rotate_authorization_locked(&mut epoch);
         runtime.set_sharing_allowed_locked(false, &mut epoch);
-        Runtime::rotate_authorization_locked(&mut epoch);
         drop(epoch);
 
         assert!(active.is_cancelled());

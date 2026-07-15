@@ -356,6 +356,9 @@ pub(crate) fn spawn_map_update_task(
                     // revocation one observable commit.
                     let map_commit = peer_map.gate.write().await;
                     let mut drive_epoch = drive.authorization_write().await;
+                    // Cancel staging and drain old-authority publication before
+                    // changing any grant/config-visible map state.
+                    drive.rotate_authorization_locked(&mut drive_epoch);
                     if invalid_peer_map {
                         drive.set_sharing_allowed_locked(false, &mut drive_epoch);
                     } else if let Some(ref node) = resp.Node {
@@ -393,7 +396,6 @@ pub(crate) fn spawn_map_update_task(
                     peer_map
                         .install_locked(&next_peers)
                         .expect("validated peer map installs");
-                    crate::drive::Runtime::rotate_authorization_locked(&mut drive_epoch);
                     drop(drive_epoch);
                     drop(map_commit);
 

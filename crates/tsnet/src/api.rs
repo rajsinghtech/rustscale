@@ -1,6 +1,14 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
+fn restore_exit_node(routes: &mut RouteTable, exit_node: Option<NodePublic>) {
+    if let Some(exit_node) = exit_node {
+        routes.set_exit_node(exit_node);
+    } else {
+        routes.clear_exit_node();
+    }
+}
+
 impl Server {
     /// Get the current server status.
     pub fn status(&self) -> ServerStatus {
@@ -425,27 +433,35 @@ impl Server {
         let peers = inner.peers.read().await;
         let peer_key = resolve_exit_node(&peers, ip_or_name)?;
         drop(peers);
-        {
-            let mut prefs = inner.prefs.write().await;
-            crate::set_exit_node_pref(&mut prefs, ip_or_name);
-            if let Some(ref dir) = self.config.state_dir {
-                let _ = prefs.save(dir);
-            }
+        let old_prefs = inner.prefs.read().await.clone();
+        let mut next_prefs = old_prefs.clone();
+        crate::set_exit_node_pref(&mut next_prefs, ip_or_name);
+        if let Some(ref dir) = self.config.state_dir {
+            next_prefs
+                .save(dir)
+                .map_err(|error| TsnetError::Builder(format!("save exit-node prefs: {error}")))?;
         }
-        inner.exit_node_selection.write().await.clear_pending();
         let mut routes = inner.route_table.write().await;
+        let old_exit = routes.exit_node().cloned();
         routes.set_exit_node(peer_key);
         if let Some(router) = inner.router.as_ref() {
-            let exit_node_allow_lan_access = inner.prefs.read().await.ExitNodeAllowLANAccess;
-            sync_router(
+            if let Err(error) = sync_router(
                 router,
                 &inner.tailscale_ips,
                 &routes,
                 &inner.magicsock,
                 &self.config.control_url,
-                exit_node_allow_lan_access,
-            )?;
+                next_prefs.ExitNodeAllowLANAccess,
+            ) {
+                restore_exit_node(&mut routes, old_exit);
+                if let Some(ref dir) = self.config.state_dir {
+                    let _ = old_prefs.save(dir);
+                }
+                return Err(error);
+            }
         }
+        *inner.prefs.write().await = next_prefs;
+        inner.exit_node_selection.write().await.clear_pending();
         if matches!(inner.data_plane, DataPlane::Tun) {
             break_tcp_conns_best_effort();
         }
@@ -465,28 +481,36 @@ impl Server {
     pub async fn clear_exit_node(&self) -> Result<(), TsnetError> {
         let inner = self.inner.as_ref().ok_or(TsnetError::NotUp)?;
         let map_commit = inner.peer_map.gate.write().await;
-        {
-            let mut prefs = inner.prefs.write().await;
-            prefs.ExitNodeID.clear();
-            prefs.ExitNodeIP.clear();
-            if let Some(ref dir) = self.config.state_dir {
-                let _ = prefs.save(dir);
-            }
+        let old_prefs = inner.prefs.read().await.clone();
+        let mut next_prefs = old_prefs.clone();
+        next_prefs.ExitNodeID.clear();
+        next_prefs.ExitNodeIP.clear();
+        if let Some(ref dir) = self.config.state_dir {
+            next_prefs
+                .save(dir)
+                .map_err(|error| TsnetError::Builder(format!("save exit-node prefs: {error}")))?;
         }
-        inner.exit_node_selection.write().await.clear_pending();
         let mut routes = inner.route_table.write().await;
+        let old_exit = routes.exit_node().cloned();
         routes.clear_exit_node();
         if let Some(router) = inner.router.as_ref() {
-            let exit_node_allow_lan_access = inner.prefs.read().await.ExitNodeAllowLANAccess;
-            sync_router(
+            if let Err(error) = sync_router(
                 router,
                 &inner.tailscale_ips,
                 &routes,
                 &inner.magicsock,
                 &self.config.control_url,
-                exit_node_allow_lan_access,
-            )?;
+                next_prefs.ExitNodeAllowLANAccess,
+            ) {
+                restore_exit_node(&mut routes, old_exit);
+                if let Some(ref dir) = self.config.state_dir {
+                    let _ = old_prefs.save(dir);
+                }
+                return Err(error);
+            }
         }
+        *inner.prefs.write().await = next_prefs;
+        inner.exit_node_selection.write().await.clear_pending();
         if matches!(inner.data_plane, DataPlane::Tun) {
             break_tcp_conns_best_effort();
         }

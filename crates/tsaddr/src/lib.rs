@@ -152,7 +152,13 @@ pub fn local_interface_prefixes() -> Vec<IpPrefix> {
 
     let mut prefixes = Vec::new();
     for interface in interfaces {
-        if !interface.is_oper_up() || is_tailscale_ip(interface.ip()) {
+        if !interface.is_oper_up()
+            || interface.is_loopback()
+            || is_tailscale_ip(interface.ip())
+            || interface.name.starts_with("utun")
+            || interface.name.starts_with("tun")
+            || interface.name.starts_with("tailscale")
+        {
             continue;
         }
         match interface.addr {

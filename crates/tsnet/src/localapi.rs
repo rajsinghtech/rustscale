@@ -749,9 +749,11 @@ async fn handle_reload_config<W: AsyncWrite + Unpin>(
     } else {
         None
     };
-    let updated = match commit_prefs_update(state, |prefs| masked.apply_to(prefs)).await {
-        Ok((updated, _)) => updated,
-        Err(error) => {
+    let old_prefs = state.prefs.read().await.clone();
+    let mut next_prefs = old_prefs.clone();
+    masked.apply_to(&mut next_prefs);
+    if let Some(policy) = &state.preference_policy {
+        if let Err(error) = policy.reconcile(&mut next_prefs) {
             write_json_response(
                 conn,
                 500,
@@ -761,7 +763,37 @@ async fn handle_reload_config<W: AsyncWrite + Unpin>(
             .await?;
             return Ok(());
         }
-    };
+    }
+    let exit_node_changed =
+        masked.ExitNodeAllowLANAccessSet || masked.ExitNodeIDSet || masked.ExitNodeIPSet;
+    if let Some(ref dir) = state.state_dir {
+        if let Err(error) = next_prefs.save(dir) {
+            let error = serde_json::json!({"error": format!("prefs save failed: {error}")});
+            write_json_response(conn, 500, "Internal Server Error", &error).await?;
+            return Ok(());
+        }
+    }
+    if exit_node_changed {
+        if let Err(error) = apply_exit_node_prefs_locked(state, &next_prefs).await {
+            let rollback_error = state
+                .state_dir
+                .as_ref()
+                .and_then(|dir| old_prefs.save(dir).err())
+                .map(|rollback| format!("; prefs rollback failed: {rollback}"))
+                .unwrap_or_default();
+            let error = serde_json::json!({
+                "error": format!("route update failed: {error}{rollback_error}")
+            });
+            write_json_response(conn, 500, "Internal Server Error", &error).await?;
+            return Ok(());
+        }
+    }
+    *state.prefs.write().await = next_prefs.clone();
+    state.posture_checking.store(
+        next_prefs.PostureChecking,
+        std::sync::atomic::Ordering::Release,
+    );
+    let updated = serde_json::to_value(&next_prefs).unwrap_or_default();
 
     if masked.ShieldsUpSet {
         if let Some(filter) = state.filter.get() {
@@ -771,9 +803,6 @@ async fn handle_reload_config<W: AsyncWrite + Unpin>(
                 .set_shields_up(masked.Prefs.ShieldsUp);
             state.peer_map.advance_authorization_epoch_locked();
         }
-    }
-    if masked.ExitNodeAllowLANAccessSet || masked.ExitNodeIDSet || masked.ExitNodeIPSet {
-        apply_exit_node_prefs_locked(state).await;
     }
     drop(map_commit);
 
@@ -831,72 +860,55 @@ pub(crate) fn resolve_exit_node_peer(peers: &[Node], ip_or_name: &str) -> Option
     None
 }
 
-/// Apply an explicit LocalAPI/config preference to the route table. An
-/// unresolved value becomes the sole pending persisted selection for map
-/// updates to retry; a resolved or cleared value has no later prefs reapply.
+/// Apply an explicit LocalAPI/config preference while serializing it with map
+/// updates. Production callers already holding the map commit gate use the
+/// locked helper below so route and authorization changes commit together.
 #[cfg(test)]
 pub(crate) async fn apply_exit_node_prefs(state: &Arc<LocalApiState>) {
     let _map_commit = state.peer_map.gate.write().await;
-    apply_exit_node_prefs_locked(state).await;
+    let prefs = state.prefs.read().await.clone();
+    apply_exit_node_prefs_locked(state, &prefs)
+        .await
+        .expect("test exit-node route update");
 }
 
-async fn apply_exit_node_prefs_locked(state: &Arc<LocalApiState>) {
-    let prefs = state.prefs.read().await.clone();
+/// Transactionally apply an explicit LocalAPI/config exit preference.
+/// Persistence and the live prefs lock are committed by the caller only after
+/// this succeeds.
+async fn apply_exit_node_prefs_locked(
+    state: &Arc<LocalApiState>,
+    prefs: &Prefs,
+) -> Result<(), String> {
     let Some(ref rt) = state.route_table else {
-        return;
+        return Ok(());
     };
-
-    let ip_or_name = if !prefs.ExitNodeIP.is_empty() {
-        &prefs.ExitNodeIP
+    let selector = if !prefs.ExitNodeIP.is_empty() {
+        Some(prefs.ExitNodeIP.as_str())
     } else if !prefs.ExitNodeID.is_empty() {
-        &prefs.ExitNodeID
+        Some(prefs.ExitNodeID.as_str())
     } else {
-        // No exit node selected — clear it.
-        state.exit_node_selection.write().await.clear_pending();
-        let mut routes = rt.write().await;
-        routes.clear_exit_node();
-        if let Some(router) = state.router.as_ref() {
-            let control_url = state.prefs.read().await.ControlURL.clone();
-            let control_url = if control_url.is_empty() {
-                crate::DEFAULT_CONTROL_URL
-            } else {
-                &control_url
-            };
-            if let Err(error) = crate::sync_router(
-                router,
-                &state.tailscale_ips,
-                &routes,
-                &state.magicsock,
-                control_url,
-                prefs.ExitNodeAllowLANAccess,
-            ) {
-                eprintln!("tsnet: route update failed (non-fatal): {error}");
-            }
-        }
-        return;
+        None
     };
-
-    let peers = state.peers.read().await;
-    let resolved = resolve_exit_node_peer(&peers, ip_or_name);
-    drop(peers);
-    let mut selection = state.exit_node_selection.write().await;
-    let mut routes = rt.write().await;
-    if let Some(peer_key) = resolved {
-        routes.set_exit_node(peer_key);
-        selection.clear_pending();
+    let desired_exit = if let Some(selector) = selector {
+        let peers = state.peers.read().await;
+        resolve_exit_node_peer(&peers, selector)
     } else {
-        // Peer not found (may not be in the netmap yet). Clear for now and
-        // retain only this unresolved explicit preference for a future map.
+        None
+    };
+    let pending = selector.is_some() && desired_exit.is_none();
+
+    let mut routes = rt.write().await;
+    let old_exit = routes.exit_node().cloned();
+    if let Some(exit_node) = desired_exit {
+        routes.set_exit_node(exit_node);
+    } else {
         routes.clear_exit_node();
-        selection.replace_from_prefs(&prefs);
     }
-    drop(selection);
     if let Some(router) = state.router.as_ref() {
-        let control_url = state.prefs.read().await.ControlURL.clone();
-        let control_url = if control_url.is_empty() {
+        let control_url = if prefs.ControlURL.is_empty() {
             crate::DEFAULT_CONTROL_URL
         } else {
-            &control_url
+            &prefs.ControlURL
         };
         if let Err(error) = crate::sync_router(
             router,
@@ -906,9 +918,21 @@ async fn apply_exit_node_prefs_locked(state: &Arc<LocalApiState>) {
             control_url,
             prefs.ExitNodeAllowLANAccess,
         ) {
-            eprintln!("tsnet: route update failed (non-fatal): {error}");
+            if let Some(exit_node) = old_exit {
+                routes.set_exit_node(exit_node);
+            } else {
+                routes.clear_exit_node();
+            }
+            return Err(error.to_string());
         }
     }
+    let mut selection = state.exit_node_selection.write().await;
+    if pending {
+        selection.replace_from_prefs(prefs);
+    } else {
+        selection.clear_pending();
+    }
+    Ok(())
 }
 
 async fn handle_patch_prefs<W: AsyncWrite + Unpin>(
@@ -939,9 +963,11 @@ async fn handle_patch_prefs<W: AsyncWrite + Unpin>(
         None
     };
 
-    let updated = match commit_prefs_update(state, |prefs| masked.apply_to(prefs)).await {
-        Ok((updated, _)) => updated,
-        Err(error) => {
+    let old_prefs = state.prefs.read().await.clone();
+    let mut next_prefs = old_prefs.clone();
+    masked.apply_to(&mut next_prefs);
+    if let Some(policy) = &state.preference_policy {
+        if let Err(error) = policy.reconcile(&mut next_prefs) {
             write_json_response(
                 conn,
                 500,
@@ -951,7 +977,38 @@ async fn handle_patch_prefs<W: AsyncWrite + Unpin>(
             .await?;
             return Ok(());
         }
-    };
+    }
+    // Stage durable prefs before touching routes. A persistence failure then
+    // cannot leave a cleared exit route active. Router failure restores the
+    // staged file while the router transaction retains its prior state.
+    if let Some(ref dir) = state.state_dir {
+        if let Err(error) = next_prefs.save(dir) {
+            let error = serde_json::json!({"error": format!("prefs save failed: {error}")});
+            write_json_response(conn, 500, "Internal Server Error", &error).await?;
+            return Ok(());
+        }
+    }
+    if exit_node_changed {
+        if let Err(error) = apply_exit_node_prefs_locked(state, &next_prefs).await {
+            let rollback_error = state
+                .state_dir
+                .as_ref()
+                .and_then(|dir| old_prefs.save(dir).err())
+                .map(|rollback| format!("; prefs rollback failed: {rollback}"))
+                .unwrap_or_default();
+            let error = serde_json::json!({
+                "error": format!("route update failed: {error}{rollback_error}")
+            });
+            write_json_response(conn, 500, "Internal Server Error", &error).await?;
+            return Ok(());
+        }
+    }
+    *state.prefs.write().await = next_prefs.clone();
+    state.posture_checking.store(
+        next_prefs.PostureChecking,
+        std::sync::atomic::Ordering::Release,
+    );
+    let updated = serde_json::to_value(&next_prefs).unwrap_or_default();
 
     // Apply shields-up changes to the live filter without a full rebuild.
     // The filter's `set_shields_up` toggles the flag that suppresses new
@@ -966,12 +1023,6 @@ async fn handle_patch_prefs<W: AsyncWrite + Unpin>(
         }
     }
 
-    // Apply exit-node routing changes to the route table (Gap 1).
-    // When ExitNodeIP or ExitNodeID is patched, resolve the peer and
-    // update the route table — mirroring Go's applyPrefsToEngine.
-    if exit_node_changed {
-        apply_exit_node_prefs_locked(state).await;
-    }
     drop(map_commit);
 
     if disconnect_requested {
@@ -3814,9 +3865,10 @@ fn hex_val_local(c: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::TCPPortHandler;
+    use crate::{RouteTable, TCPPortHandler};
     use rustscale_key::{DiscoPrivate, NodePrivate};
     use rustscale_magicsock::{Magicsock, MagicsockConfig};
+    use rustscale_router::{Router, RouterConfig, RouterError};
     use rustscale_tailcfg::{Node, UserProfile};
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
@@ -5889,6 +5941,22 @@ mod tests {
         }
     }
 
+    struct RejectingRouter;
+
+    impl Router for RejectingRouter {
+        fn up(&mut self) -> Result<(), RouterError> {
+            Ok(())
+        }
+
+        fn set(&mut self, _config: &RouterConfig) -> Result<(), RouterError> {
+            Err(RouterError::InvalidConfig("injected route failure".into()))
+        }
+
+        fn close(&mut self) -> Result<(), RouterError> {
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn posture_transaction_rolls_back_on_persistence_error() {
         let temp = tempfile::tempdir().unwrap();
@@ -6052,6 +6120,54 @@ mod tests {
             .posture_checking
             .load(std::sync::atomic::Ordering::Acquire));
         assert!(state.prefs.read().await.PostureChecking);
+    }
+
+    #[tokio::test]
+    async fn patch_exit_node_router_failure_is_non_200_and_rolls_back() {
+        let mut state = make_test_state().await;
+        let state_mut = Arc::get_mut(&mut state).expect("unique test state");
+        let exit_key = NodePrivate::generate().public();
+        state_mut.peers = Arc::new(RwLock::new(vec![Node {
+            Name: "exit.tailnet.ts.net.".into(),
+            Key: exit_key,
+            Addresses: vec!["100.64.0.9/32".into()],
+            AllowedIPs: vec!["100.64.0.9/32".into(), "0.0.0.0/0".into(), "::/0".into()],
+            ..Default::default()
+        }]));
+        state_mut.route_table = Some(Arc::new(RwLock::new(RouteTable::default())));
+        let state_dir = tempfile::tempdir().unwrap();
+        state_mut.state_dir = Some(state_dir.path().to_path_buf());
+        state_mut
+            .prefs
+            .try_read()
+            .unwrap()
+            .save(state_dir.path())
+            .unwrap();
+        state_mut.router = Some(Arc::new(std::sync::Mutex::new(
+            crate::tun_pump::ManagedRouter {
+                router: Box::new(RejectingRouter),
+                exit_node: false,
+            },
+        )));
+        state_mut.tun_mode = true;
+
+        let body = r#"{"ExitNodeIP":"100.64.0.9","ExitNodeIPSet":true}"#;
+        let req = format!(
+            "PATCH /localapi/v0/prefs HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(), body
+        );
+        let response = send_request_with_identity(req.as_bytes(), &state, test_rw_identity()).await;
+        assert!(response.contains("500 Internal Server Error"), "{response}");
+        assert!(state.prefs.read().await.ExitNodeIP.is_empty());
+        assert!(Prefs::load(state_dir.path()).unwrap().ExitNodeIP.is_empty());
+        assert!(state
+            .route_table
+            .as_ref()
+            .unwrap()
+            .read()
+            .await
+            .exit_node()
+            .is_none());
     }
 
     #[tokio::test]

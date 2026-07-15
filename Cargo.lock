@@ -3899,7 +3899,6 @@ dependencies = [
  "rustscale-controlknobs",
  "rustscale-derp",
  "rustscale-dns",
- "rustscale-dnsfallback",
  "rustscale-dnsname",
  "rustscale-drive",
  "rustscale-envknob",

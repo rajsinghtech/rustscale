@@ -6,48 +6,11 @@
 //! address family. This mirrors how the kernel routes packets to the right
 //! WireGuard peer, and is used by both the netstack and TUN data-plane pumps.
 
-use std::net::{IpAddr, ToSocketAddrs};
+use std::net::IpAddr;
 
 use rustscale_art::{IpPrefix as ArtPrefix, Table as ArtTable};
 use rustscale_key::NodePublic;
 use rustscale_tailcfg::Node;
-
-/// Resolve the control server from a bare hostname or URL to all of its IPs.
-/// Resolution is deliberately best-effort: a failed lookup must not prevent
-/// routing from being configured.
-pub(crate) fn resolve_control_server_ips(control_url: &str) -> Vec<IpAddr> {
-    let Some(host) = control_server_host(control_url) else {
-        return Vec::new();
-    };
-    if let Ok(ip) = host.parse() {
-        return vec![ip];
-    }
-    let Ok(addrs) = (host, 443).to_socket_addrs() else {
-        return Vec::new();
-    };
-    let mut ips: Vec<IpAddr> = addrs.map(|addr| addr.ip()).collect();
-    ips.sort_unstable();
-    ips.dedup();
-    ips
-}
-
-fn control_server_host(control_url: &str) -> Option<&str> {
-    let authority = control_url
-        .split_once("://")
-        .map_or(control_url, |(_, rest)| rest)
-        .split(['/', '?', '#'])
-        .next()?;
-    let authority = authority
-        .rsplit_once('@')
-        .map_or(authority, |(_, host)| host);
-    if let Some(bracketed) = authority.strip_prefix('[') {
-        return bracketed.split_once(']').map(|(host, _)| host);
-    }
-    if authority.parse::<IpAddr>().is_ok() {
-        return Some(authority);
-    }
-    authority.split(':').next().filter(|host| !host.is_empty())
-}
 
 /// One route entry: a CIDR network owned by a peer.
 #[derive(Clone)]

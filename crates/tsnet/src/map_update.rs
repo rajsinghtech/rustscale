@@ -151,6 +151,29 @@ impl ExitNodeSelection {
             false
         }
     }
+
+    pub(crate) fn retry_transactional<E>(
+        &mut self,
+        peers: &[Node],
+        routes: &mut RouteTable,
+        apply: impl FnOnce(&RouteTable) -> Result<(), E>,
+    ) -> Result<bool, E> {
+        let old_selection = self.clone();
+        let old_exit = routes.exit_node().cloned();
+        if !self.retry(peers, routes) {
+            return Ok(false);
+        }
+        if let Err(error) = apply(routes) {
+            if let Some(old_exit) = old_exit {
+                routes.set_exit_node(old_exit);
+            } else {
+                routes.clear_exit_node();
+            }
+            *self = old_selection;
+            return Err(error);
+        }
+        Ok(true)
+    }
 }
 
 pub(crate) fn exit_node_pref(prefs: &rustscale_ipn::Prefs) -> Option<String> {
@@ -192,12 +215,11 @@ async fn clear_exit_routes_for_identity_mismatch(
     routes.clear_exit_node();
     routes.rebuild_with_opts(&[], accept_routes);
     if let Some(router) = router {
-        let derp_map = magicsock.get_derp_map();
         if let Err(error) = sync_router(
             router,
             tailscale_ips,
             &routes,
-            derp_map.as_ref(),
+            magicsock,
             control_url,
             exit_node_allow_lan_access,
         ) {
@@ -1123,9 +1145,11 @@ mod tests {
         let selection = Arc::new(RwLock::new(ExitNodeSelection::from_prefs(&prefs)));
         let peer_map = crate::peer_map::Runtime::new(&[exit_peer]).unwrap();
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let router: SharedRouter = Arc::new(std::sync::Mutex::new(Box::new(RecordingRouter {
-            seen: seen.clone(),
-        })));
+        let router: SharedRouter =
+            Arc::new(std::sync::Mutex::new(crate::tun_pump::ManagedRouter {
+                router: Box::new(RecordingRouter { seen: seen.clone() }),
+                exit_node: true,
+            }));
         let (magicsock, _wg_rx) = Magicsock::new(rustscale_magicsock::MagicsockConfig {
             private_key: NodePrivate::generate(),
             disco_key: DiscoPrivate::generate(),
@@ -1266,6 +1290,35 @@ mod tests {
         peer.AllowedIPs.push("::/0".into());
         assert!(selection.retry(&[peer], &mut routes));
         assert_eq!(routes.exit_node(), Some(&exit_key));
+    }
+
+    #[test]
+    fn pending_exit_node_router_failure_restores_selection_and_route() {
+        let old_exit = NodePrivate::generate().public();
+        let pending_exit = NodePrivate::generate().public();
+        let prefs = Prefs {
+            ExitNodeIP: "100.64.0.9".into(),
+            ..Default::default()
+        };
+        let peer = Node {
+            Key: pending_exit.clone(),
+            Addresses: vec!["100.64.0.9/32".into()],
+            AllowedIPs: vec!["0.0.0.0/0".into()],
+            ..Default::default()
+        };
+        let mut selection = ExitNodeSelection::from_prefs(&prefs);
+        let mut routes = RouteTable::default();
+        routes.set_exit_node(old_exit.clone());
+
+        let result = selection.retry_transactional(&[peer.clone()], &mut routes, |_| {
+            Err::<(), _>("injected router failure")
+        });
+        assert!(result.is_err());
+        assert_eq!(routes.exit_node(), Some(&old_exit));
+        assert!(selection
+            .retry_transactional(&[peer], &mut routes, |_| Ok::<(), &str>(()))
+            .unwrap());
+        assert_eq!(routes.exit_node(), Some(&pending_exit));
     }
 
     #[test]

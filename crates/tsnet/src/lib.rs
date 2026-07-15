@@ -1288,27 +1288,76 @@ impl Server {
         } else {
             None
         };
-
-        let updated = {
-            let mut prefs = inner.prefs.write().await;
-            let mut candidate = prefs.clone();
-            masked.apply_to(&mut candidate);
-            if let Some(policy) = &self.config.preference_policy {
-                policy.reconcile(&mut candidate)?;
+        let old_prefs = inner.prefs.read().await.clone();
+        let mut next_prefs = old_prefs.clone();
+        masked.apply_to(&mut next_prefs);
+        if let Some(policy) = &self.config.preference_policy {
+            policy.reconcile(&mut next_prefs)?;
+        }
+        let exit_changed =
+            masked.ExitNodeAllowLANAccessSet || masked.ExitNodeIDSet || masked.ExitNodeIPSet;
+        if let Some(ref dir) = self.config.state_dir {
+            next_prefs
+                .save(dir)
+                .map_err(|error| format!("prefs save: {error}"))?;
+        }
+        if exit_changed {
+            let selected_exit = if let Some(selector) = exit_node_pref(&next_prefs) {
+                let peers = inner.peers.read().await;
+                localapi::resolve_exit_node_peer(&peers, &selector)
+            } else {
+                None
+            };
+            let pending = exit_node_pref(&next_prefs).is_some() && selected_exit.is_none();
+            let mut selection = inner.exit_node_selection.write().await;
+            let mut routes = inner.route_table.write().await;
+            let old_exit = routes.exit_node().cloned();
+            if let Some(peer) = selected_exit {
+                routes.set_exit_node(peer);
+            } else {
+                routes.clear_exit_node();
             }
-            if candidate != *prefs {
-                if let Some(ref dir) = self.config.state_dir {
-                    candidate
-                        .save(dir)
-                        .map_err(|error| format!("saving preferences: {error}"))?;
+            if let Some(router) = inner.router.as_ref() {
+                let control_url = if next_prefs.ControlURL.is_empty() {
+                    DEFAULT_CONTROL_URL
+                } else {
+                    &next_prefs.ControlURL
+                };
+                if let Err(error) = sync_router(
+                    router,
+                    &inner.tailscale_ips,
+                    &routes,
+                    &inner.magicsock,
+                    control_url,
+                    next_prefs.ExitNodeAllowLANAccess,
+                ) {
+                    if let Some(old_exit) = old_exit {
+                        routes.set_exit_node(old_exit);
+                    } else {
+                        routes.clear_exit_node();
+                    }
+                    if let Some(ref dir) = self.config.state_dir {
+                        if let Err(rollback_error) = old_prefs.save(dir) {
+                            return Err(format!(
+                                "router update failed: {error}; prefs rollback failed: {rollback_error}"
+                            ));
+                        }
+                    }
+                    return Err(error.to_string());
                 }
-                *prefs = candidate;
             }
-            inner
-                .posture_checking
-                .store(prefs.PostureChecking, std::sync::atomic::Ordering::Release);
-            serde_json::to_value(&*prefs).unwrap_or_default()
-        };
+            if pending {
+                selection.replace_from_prefs(&next_prefs);
+            } else {
+                selection.clear_pending();
+            }
+        }
+        *inner.prefs.write().await = next_prefs.clone();
+        inner.posture_checking.store(
+            next_prefs.PostureChecking,
+            std::sync::atomic::Ordering::Release,
+        );
+        let updated = serde_json::to_value(&next_prefs).unwrap_or_default();
 
         if masked.ShieldsUpSet {
             inner
@@ -1318,54 +1367,6 @@ impl Server {
                 .set_shields_up(masked.Prefs.ShieldsUp);
             inner.peer_map.advance_authorization_epoch_locked();
         }
-
-        if masked.ExitNodeAllowLANAccessSet || masked.ExitNodeIDSet || masked.ExitNodeIPSet {
-            let prefs = inner.prefs.read().await.clone();
-            let exit_node_changed = masked.ExitNodeIDSet || masked.ExitNodeIPSet;
-            let selected_exit_node = if exit_node_changed {
-                if let Some(ip_or_name) = exit_node_pref(&prefs) {
-                    let peers = inner.peers.read().await;
-                    Some(localapi::resolve_exit_node_peer(&peers, &ip_or_name))
-                } else {
-                    Some(None)
-                }
-            } else {
-                None
-            };
-            let mut selection = inner.exit_node_selection.write().await;
-            let mut routes = inner.route_table.write().await;
-            if let Some(selected_exit_node) = selected_exit_node {
-                if let Some(peer) = selected_exit_node {
-                    routes.set_exit_node(peer);
-                    selection.clear_pending();
-                } else {
-                    routes.clear_exit_node();
-                    if exit_node_pref(&prefs).is_some() {
-                        selection.replace_from_prefs(&prefs);
-                    } else {
-                        selection.clear_pending();
-                    }
-                }
-            }
-            drop(selection);
-            if let Some(router) = inner.router.as_ref() {
-                let control_url = if prefs.ControlURL.is_empty() {
-                    DEFAULT_CONTROL_URL
-                } else {
-                    &prefs.ControlURL
-                };
-                sync_router(
-                    router,
-                    &inner.tailscale_ips,
-                    &routes,
-                    &inner.magicsock,
-                    control_url,
-                    prefs.ExitNodeAllowLANAccess,
-                )
-                .map_err(|error| error.to_string())?;
-            }
-        }
-
         drop(map_commit);
 
         inner.ipn_backend.bus().send(rustscale_ipn::Notify {

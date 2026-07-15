@@ -1223,22 +1223,22 @@ impl Server {
             };
         let _map_commit = peer_map.gate.write().await;
         let peers = peers.read().await;
+        let exit_node_allow_lan_access = live_prefs.read().await.ExitNodeAllowLANAccess;
         let mut selection = exit_node_selection.write().await;
         let mut routes = route_table.write().await;
-        if selection.retry(&peers, &mut routes) {
+        selection.retry_transactional(&peers, &mut routes, |routes| {
             if let Some(router) = router.as_ref() {
-                let derp_map = magicsock.get_derp_map();
-                let exit_node_allow_lan_access = live_prefs.read().await.ExitNodeAllowLANAccess;
                 sync_router(
                     router,
                     &tailscale_ips,
-                    &routes,
-                    derp_map.as_ref(),
+                    routes,
+                    &magicsock,
                     &self.config.control_url,
                     exit_node_allow_lan_access,
                 )?;
             }
-        }
+            Ok::<(), TsnetError>(())
+        })?;
 
         Ok(self.status())
     }

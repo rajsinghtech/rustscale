@@ -319,7 +319,7 @@ async fn test_multi_callback_register_unregister() {
     })
     .await;
 
-    handle.shutdown().await;
+    handle.shutdown_and_wait().await;
     assert!(found.is_ok(), "did not receive callbacks in time");
 
     assert!(
@@ -384,7 +384,7 @@ async fn test_monitor_detects_change_with_fake_provider() {
     })
     .await;
 
-    handle.shutdown().await;
+    handle.shutdown_and_wait().await;
     assert!(found.is_ok(), "did not detect a major change in time");
     let recorded = deltas.lock().unwrap();
     assert!(!recorded.is_empty());
@@ -424,7 +424,7 @@ async fn enumeration_failure_is_dispatched_not_silently_skipped() {
     tokio::time::timeout(Duration::from_secs(5), failed.notified())
         .await
         .unwrap();
-    handle.shutdown().await;
+    handle.shutdown_and_wait().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -473,7 +473,7 @@ async fn shutdown_cancels_and_joins_inflight_callbacks() {
         .await
         .unwrap();
 
-    handle.shutdown().await;
+    handle.shutdown_and_wait().await;
     release.notify_waiters();
     tokio::task::yield_now().await;
     assert_eq!(completed.load(std::sync::atomic::Ordering::SeqCst), 0);

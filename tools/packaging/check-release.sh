@@ -71,6 +71,13 @@ if grep -Eq -- '--(state|statedir|socket)=' packaging/systemd/rustscaled.service
     exit 1
 fi
 grep -Fq 'COPY vendor/boringtun/ ./vendor/boringtun/' Dockerfile
+grep -Fq 'ARG RUSTSCALE_LTO=thin' Dockerfile
+grep -Fq "CARGO_PROFILE_RELEASE_LTO=\$RUSTSCALE_LTO cargo build" Dockerfile
+awk '
+    /^  docker:/ { docker = 1; next }
+    docker && /^  [A-Za-z0-9_-]+:/ { exit }
+    docker { print }
+' .github/workflows/release.yml | grep -Fq 'timeout-minutes: 90'
 grep -q 'ln -s rustscale /usr/local/bin/tailscale' Dockerfile
 grep -q 'org.opencontainers.image.version' Dockerfile
 test "$(grep -c '^FROM .*@sha256:[0-9a-f]\{64\}' Dockerfile)" -eq 2

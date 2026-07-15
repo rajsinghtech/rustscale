@@ -283,7 +283,9 @@ jobs:
     name: Docker image
     needs: [metadata]
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    # arm64 is compiled under QEMU; a cold cache can exceed 40 minutes even
+    # with thin LTO. Keep the bound finite without cancelling valid releases.
+    timeout-minutes: 90
     permissions:
       contents: read
       packages: write

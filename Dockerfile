@@ -23,8 +23,9 @@
 # ---------------------------------------------------------------------------
 FROM rust:1.91-alpine@sha256:45c1c35cd364b8055e9e86f8ecd3e8c874b2dcb658d8a4f94b5d111aa0d651a2 AS builder
 
-# Beta images can disable LTO to keep cross-platform build times practical.
-ARG RUSTSCALE_LTO=true
+# Thin LTO keeps release optimization while making emulated arm64 builds
+# practical on the multi-architecture release runner.
+ARG RUSTSCALE_LTO=thin
 
 RUN apk add --no-cache musl-dev
 

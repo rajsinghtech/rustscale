@@ -516,6 +516,7 @@ impl Server {
             }),
             taildrop: None,
             drive: self.drive.clone(),
+            peer_map: inner.peer_map.clone(),
             tailnet_lock: Some(inner.tailnet_lock.clone()),
             netstack: match &inner.data_plane {
                 DataPlane::Netstack(ns) => Some(ns.clone()),

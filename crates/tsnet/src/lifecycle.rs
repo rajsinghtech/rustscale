@@ -532,6 +532,7 @@ impl Server {
                 }),
                 taildrop: Some(taildrop.clone()),
                 drive: self.drive.clone(),
+                peer_map: b.peer_map.clone(),
                 tailnet_lock: Some(b.tailnet_lock.clone()),
                 netstack: Some(netstack.clone()),
                 filter: std::sync::OnceLock::new(),
@@ -585,6 +586,7 @@ impl Server {
             peer_map: b.peer_map,
             routecheck: b.routecheck,
             route_table: b.route_table,
+            filter: b.filter,
             router: None,
             cancel: b.cancel,
             tasks: Mutex::new(tasks),
@@ -632,13 +634,19 @@ impl Server {
 
         // A persisted selection retries only while it is unresolved. Once it
         // resolves, later map rebuilds retain the route-table owner.
-        let (peers, route_table) = match self.inner.as_ref() {
-            Some(inner) => (inner.peers.clone(), inner.route_table.clone()),
+        let (peers, route_table, peer_map) = match self.inner.as_ref() {
+            Some(inner) => (
+                inner.peers.clone(),
+                inner.route_table.clone(),
+                inner.peer_map.clone(),
+            ),
             None => return Ok(self.status()),
         };
+        let _map_commit = peer_map.gate.write().await;
         let peers = peers.read().await;
+        let mut selection = exit_node_selection.write().await;
         let mut routes = route_table.write().await;
-        exit_node_selection.write().await.retry(&peers, &mut routes);
+        selection.retry(&peers, &mut routes);
 
         Ok(self.status())
     }
@@ -681,11 +689,12 @@ impl Server {
         // pump routes non-tailnet traffic to the exit peer. OS-level
         // default-route overrides are installed after the TUN is created.
         if let Some(ref exit) = config.exit_node {
+            let _map_commit = b.peer_map.gate.write().await;
             let peers = b.peers.read().await;
             let peer_key = resolve_exit_node(&peers, exit)?;
             drop(peers);
-            b.route_table.write().await.set_exit_node(peer_key);
             exit_node_selection.write().await.clear_pending();
+            b.route_table.write().await.set_exit_node(peer_key);
             let mut live_prefs = prefs.write().await;
             set_exit_node_pref(&mut live_prefs, exit);
             if let Some(ref dir) = self.config.state_dir {
@@ -1048,6 +1057,7 @@ impl Server {
                 }),
                 taildrop: Some(taildrop.clone()),
                 drive: self.drive.clone(),
+                peer_map: b.peer_map.clone(),
                 tailnet_lock: Some(b.tailnet_lock.clone()),
                 netstack: None, // TUN mode has no netstack
                 filter: std::sync::OnceLock::new(),
@@ -1134,6 +1144,7 @@ impl Server {
             peer_map: b.peer_map,
             routecheck: b.routecheck,
             route_table: b.route_table,
+            filter: b.filter,
             router,
             cancel: b.cancel,
             tasks: Mutex::new(tasks),
@@ -1181,7 +1192,7 @@ impl Server {
 
         // TUN config owns a selection made above; otherwise retry only an
         // unresolved persisted selection.
-        let (peers, route_table, router, tailscale_ips, magicsock, live_prefs) =
+        let (peers, route_table, router, tailscale_ips, magicsock, live_prefs, peer_map) =
             match self.inner.as_ref() {
                 Some(inner) => (
                     inner.peers.clone(),
@@ -1190,12 +1201,15 @@ impl Server {
                     inner.tailscale_ips.clone(),
                     inner.magicsock.clone(),
                     inner.prefs.clone(),
+                    inner.peer_map.clone(),
                 ),
                 None => return Ok(self.status()),
             };
+        let _map_commit = peer_map.gate.write().await;
         let peers = peers.read().await;
+        let mut selection = exit_node_selection.write().await;
         let mut routes = route_table.write().await;
-        if exit_node_selection.write().await.retry(&peers, &mut routes) {
+        if selection.retry(&peers, &mut routes) {
             if let Some(router) = router.as_ref() {
                 let derp_map = magicsock.get_derp_map();
                 let exit_node_allow_lan_access = live_prefs.read().await.ExitNodeAllowLANAccess;
@@ -1370,6 +1384,7 @@ impl Server {
             control_params: None,
             taildrop: None,
             drive: self.drive.clone(),
+            peer_map: crate::peer_map::Runtime::new(&[]).expect("empty localapi peer map"),
             tailnet_lock: None,
             netstack: None,
             filter: std::sync::OnceLock::new(),
@@ -2120,7 +2135,7 @@ impl Server {
         // PeerAPI starts. Taildrive remains disabled unless `drive:share` is
         // present; a needs-login LocalAPI cannot pre-authorize itself.
         if let Some(ref node) = map_resp.Node {
-            magicsock.set_self_cap_map(node.CapMap.clone());
+            magicsock.set_self_cap_map(node.CapMap.clone()).await;
             let sharing_allowed = node
                 .Capabilities
                 .iter()

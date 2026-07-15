@@ -47,13 +47,20 @@ impl Runtime {
     pub(crate) fn install_locked(&self, peers: &[Node]) -> Result<(), ReconcileError> {
         let identity = IdentitySnapshot::from_peers(peers)?;
         *self.identity.write().expect("peer identity lock poisoned") = Arc::new(identity);
-        self.flows.lock().expect("peer flow lock poisoned").clear();
-        self.authorization_epoch.fetch_add(1, Ordering::AcqRel);
+        self.advance_authorization_epoch_locked();
         Ok(())
     }
 
     pub(crate) fn authorization_epoch(&self) -> u64 {
         self.authorization_epoch.load(Ordering::Acquire)
+    }
+
+    /// Publish a non-identity authorization change (for example ShieldsUp)
+    /// while the caller holds `gate.write()`. Final plaintext delivery rejects
+    /// work staged against the preceding epoch.
+    pub(crate) fn advance_authorization_epoch_locked(&self) {
+        self.authorization_epoch.fetch_add(1, Ordering::AcqRel);
+        self.flows.lock().expect("peer flow lock poisoned").clear();
     }
 
     pub(crate) fn packet_source_matches(&self, peer: &NodePublic, packet: &[u8]) -> bool {

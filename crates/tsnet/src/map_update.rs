@@ -79,6 +79,38 @@ pub(crate) fn set_exit_node_pref(prefs: &mut rustscale_ipn::Prefs, selector: &st
     }
 }
 
+/// Withdraw in-process and OS exit routing while the caller holds the shared
+/// peer-map writer. The selection lock always precedes the route-table lock.
+#[allow(clippy::too_many_arguments)]
+async fn clear_exit_routes_for_identity_mismatch(
+    exit_node_selection: &Arc<RwLock<ExitNodeSelection>>,
+    route_table: &Arc<RwLock<RouteTable>>,
+    router: Option<&SharedRouter>,
+    magicsock: &Magicsock,
+    tailscale_ips: &[IpAddr],
+    control_url: &str,
+    exit_node_allow_lan_access: bool,
+    accept_routes: bool,
+) {
+    exit_node_selection.write().await.clear_pending();
+    let mut routes = route_table.write().await;
+    routes.clear_exit_node();
+    routes.rebuild_with_opts(&[], accept_routes);
+    if let Some(router) = router {
+        let derp_map = magicsock.get_derp_map();
+        if let Err(error) = sync_router(
+            router,
+            tailscale_ips,
+            &routes,
+            derp_map.as_ref(),
+            control_url,
+            exit_node_allow_lan_access,
+        ) {
+            log::warn!("tsnet: failed to clear OS routes after identity mismatch: {error}");
+        }
+    }
+}
+
 /// Spawn the map-stream delta update task. Shared by `up()` and `up_tun()`:
 /// processes Peers/PeersChanged/PeersRemoved, feeds the new peer list to
 /// magicsock, rebuilds the route table, and creates WG tunnels for new peers.
@@ -199,14 +231,23 @@ pub(crate) fn spawn_map_update_task(
                         let mut drive_epoch = drive.authorization_write().await;
                         drive.rotate_authorization_locked(&mut drive_epoch);
                         drive.set_sharing_allowed_locked(false, &mut drive_epoch);
+                        magicsock.disable_relay_server_and_drain().await;
                         raw_peers.clear();
                         *filter_arc.lock().unwrap() = Filter::allow_none();
                         peers_arc.write().await.clear();
                         wg_tunnels.write().await.clear();
-                        route_table
-                            .write()
-                            .await
-                            .rebuild_with_opts(&[], accept_routes);
+                        let exit_node_allow_lan_access = prefs.read().await.ExitNodeAllowLANAccess;
+                        clear_exit_routes_for_identity_mismatch(
+                            &exit_node_selection,
+                            &route_table,
+                            router.as_ref(),
+                            magicsock.as_ref(),
+                            &tailscale_ips,
+                            &control_url,
+                            exit_node_allow_lan_access,
+                            accept_routes,
+                        )
+                        .await;
                         peer_map
                             .install_locked(&[])
                             .expect("empty peer map is valid");
@@ -361,12 +402,6 @@ pub(crate) fn spawn_map_update_task(
                         control_knobs.apply(knobs);
                     }
 
-                    // Update the self node's CapMap in magicsock so the relay
-                    // server extension can check NODE_ATTR_DISABLE_RELAY_SERVER.
-                    if let Some(ref node) = resp.Node {
-                        magicsock.set_self_cap_map(node.CapMap.clone());
-                    }
-
                     // Wire NetInfo from control to magicsock. Control may push
                     // updated network probe results (PreferredDERP, connectivity)
                     // that supersede the client's local netcheck. Also check
@@ -419,6 +454,13 @@ pub(crate) fn spawn_map_update_task(
                     drop(old_tunnels);
                     let mut next_routes =
                         RouteTable::from_peers_with_opts(&next_peers, accept_routes);
+
+                    // One writer commit replaces every peer-derived authority:
+                    // authenticated source ownership, tunnels, magicsock and
+                    // relay generations, ACL capability grants, routes, and
+                    // Taildrive publication epochs all use the TKA-verified
+                    // stable-ID intersection.
+                    let map_commit = peer_map.gate.write().await;
                     if let Some(selected) = route_table.read().await.exit_node().cloned() {
                         if let Some(replacement) =
                             rotated_peer_key(&current_peers, &next_peers, &selected)
@@ -430,13 +472,6 @@ pub(crate) fn spawn_map_update_task(
                         .write()
                         .await
                         .retry(&next_peers, &mut next_routes);
-
-                    // One writer commit replaces every peer-derived authority:
-                    // authenticated source ownership, tunnels, magicsock and
-                    // relay generations, ACL capability grants, routes, and
-                    // Taildrive publication epochs all use the TKA-verified
-                    // stable-ID intersection.
-                    let map_commit = peer_map.gate.write().await;
                     let mut drive_epoch = drive.authorization_write().await;
                     drive.rotate_authorization_locked(&mut drive_epoch);
                     if invalid_peer_map {
@@ -466,6 +501,13 @@ pub(crate) fn spawn_map_update_task(
                             &next_peers,
                             shields_up,
                         );
+                    }
+                    if !invalid_peer_map {
+                        if let Some(ref node) = resp.Node {
+                            // A fresh matching map/config is the sole relay-
+                            // server re-enable path after identity withdrawal.
+                            magicsock.set_self_cap_map(node.CapMap.clone()).await;
+                        }
                     }
                     if let Err(error) = magicsock.set_netmap(next_peers.clone()).await {
                         log::warn!("tsnet: magicsock peer-map update failed: {error}");
@@ -893,6 +935,28 @@ mod tests {
     use rustscale_key::{DiscoPrivate, NodePrivate};
     use rustscale_tailcfg::PeerChange;
 
+    struct RecordingRouter {
+        seen: Arc<std::sync::Mutex<Vec<rustscale_router::RouterConfig>>>,
+    }
+
+    impl rustscale_router::Router for RecordingRouter {
+        fn up(&mut self) -> Result<(), rustscale_router::RouterError> {
+            Ok(())
+        }
+
+        fn set(
+            &mut self,
+            config: &rustscale_router::RouterConfig,
+        ) -> Result<(), rustscale_router::RouterError> {
+            self.seen.lock().unwrap().push(config.clone());
+            Ok(())
+        }
+
+        fn close(&mut self) -> Result<(), rustscale_router::RouterError> {
+            Ok(())
+        }
+    }
+
     fn sample_peer() -> Node {
         Node {
             ID: 10,
@@ -904,6 +968,77 @@ mod tests {
             Cap: 50,
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn identity_mismatch_clears_selected_exit_and_os_routes_under_gate() {
+        let exit_key = NodePrivate::generate().public();
+        let exit_peer = Node {
+            ID: 1,
+            Key: exit_key.clone(),
+            Addresses: vec!["100.64.0.2/32".into()],
+            AllowedIPs: vec!["0.0.0.0/0".into(), "::/0".into()],
+            ..Default::default()
+        };
+        let route_table = Arc::new(RwLock::new(RouteTable::from_peers_with_opts(
+            std::slice::from_ref(&exit_peer),
+            false,
+        )));
+        route_table.write().await.set_exit_node(exit_key);
+        let prefs = Prefs {
+            ExitNodeIP: "100.64.0.2".into(),
+            ..Default::default()
+        };
+        let selection = Arc::new(RwLock::new(ExitNodeSelection::from_prefs(&prefs)));
+        let peer_map = crate::peer_map::Runtime::new(&[exit_peer]).unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router: SharedRouter = Arc::new(std::sync::Mutex::new(Box::new(RecordingRouter {
+            seen: seen.clone(),
+        })));
+        let (magicsock, _wg_rx) = Magicsock::new(rustscale_magicsock::MagicsockConfig {
+            private_key: NodePrivate::generate(),
+            disco_key: DiscoPrivate::generate(),
+            derp_client: None,
+            derp_map: None,
+            home_derp_region: 0,
+            udp_bind: None,
+            udp_socket: None,
+            portmapper: None,
+            health: None,
+            disable_direct_paths: false,
+            peer_relay_server: false,
+            relay_server_config: None,
+            sockstats: None,
+            control_knobs: None,
+        })
+        .await
+        .unwrap();
+
+        let _map_commit = peer_map.gate.write().await;
+        clear_exit_routes_for_identity_mismatch(
+            &selection,
+            &route_table,
+            Some(&router),
+            &magicsock,
+            &["100.64.0.1".parse().unwrap()],
+            "https://control.example",
+            false,
+            false,
+        )
+        .await;
+
+        assert!(selection.read().await.pending_persisted.is_none());
+        let routes = route_table.read().await;
+        assert!(routes.exit_node().is_none());
+        assert_eq!(routes.entries().count(), 0);
+        drop(routes);
+        let last = seen.lock().unwrap().last().cloned().expect("router update");
+        assert!(!last.exit_node);
+        assert!(
+            last.routes.iter().all(|route| route.bits != 0),
+            "OS router retained an exit default route: {:?}",
+            last.routes
+        );
     }
 
     #[test]

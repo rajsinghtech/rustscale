@@ -416,6 +416,7 @@ impl Server {
     /// C-representable: string in, error code out (see FFI `ts_set_exit_node`).
     pub async fn set_exit_node(&self, ip_or_name: &str) -> Result<(), TsnetError> {
         let inner = self.inner.as_ref().ok_or(TsnetError::NotUp)?;
+        let map_commit = inner.peer_map.gate.write().await;
         let peers = inner.peers.read().await;
         let peer_key = resolve_exit_node(&peers, ip_or_name)?;
         drop(peers);
@@ -444,6 +445,7 @@ impl Server {
         if matches!(inner.data_plane, DataPlane::Tun) {
             break_tcp_conns_best_effort();
         }
+        drop(map_commit);
         Ok(())
     }
 
@@ -458,6 +460,7 @@ impl Server {
     /// C-representable: no args, error code out (see FFI `ts_clear_exit_node`).
     pub async fn clear_exit_node(&self) -> Result<(), TsnetError> {
         let inner = self.inner.as_ref().ok_or(TsnetError::NotUp)?;
+        let map_commit = inner.peer_map.gate.write().await;
         {
             let mut prefs = inner.prefs.write().await;
             prefs.ExitNodeID.clear();
@@ -484,6 +487,7 @@ impl Server {
         if matches!(inner.data_plane, DataPlane::Tun) {
             break_tcp_conns_best_effort();
         }
+        drop(map_commit);
         Ok(())
     }
 

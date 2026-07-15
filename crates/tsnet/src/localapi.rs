@@ -206,6 +206,8 @@ pub(crate) struct LocalApiState {
     pub taildrop: Option<Arc<crate::taildrop::TaildropManager>>,
     /// Disabled-by-default Taildrive runtime shared with PeerAPI.
     pub drive: Arc<crate::drive::Runtime>,
+    /// Shared authorization/route/filter commit gate.
+    pub peer_map: Arc<crate::peer_map::Runtime>,
     /// Tailnet Lock authority and control operations. Unavailable before login.
     pub(crate) tailnet_lock: Option<Arc<crate::tailnet_lock::TailnetLock>>,
     /// Netstack handle for dialing peer PeerAPIs (None in TUN mode or
@@ -680,6 +682,15 @@ async fn handle_reload_config<W: AsyncWrite + Unpin>(
     };
 
     let masked = config.parsed.to_prefs();
+    let authorization_changed = masked.ShieldsUpSet
+        || masked.ExitNodeAllowLANAccessSet
+        || masked.ExitNodeIDSet
+        || masked.ExitNodeIPSet;
+    let map_commit = if authorization_changed {
+        Some(state.peer_map.gate.write().await)
+    } else {
+        None
+    };
     let updated = match commit_prefs_update(state, |prefs| masked.apply_to(prefs)).await {
         Ok((updated, _)) => updated,
         Err(error) => {
@@ -694,9 +705,19 @@ async fn handle_reload_config<W: AsyncWrite + Unpin>(
         }
     };
 
-    if masked.ExitNodeAllowLANAccessSet || masked.ExitNodeIDSet || masked.ExitNodeIPSet {
-        apply_exit_node_prefs(state).await;
+    if masked.ShieldsUpSet {
+        if let Some(filter) = state.filter.get() {
+            filter
+                .lock()
+                .unwrap()
+                .set_shields_up(masked.Prefs.ShieldsUp);
+            state.peer_map.advance_authorization_epoch_locked();
+        }
     }
+    if masked.ExitNodeAllowLANAccessSet || masked.ExitNodeIDSet || masked.ExitNodeIPSet {
+        apply_exit_node_prefs_locked(state).await;
+    }
+    drop(map_commit);
 
     state.ipn_backend.bus().send(rustscale_ipn::Notify {
         Prefs: Some(updated.clone()),
@@ -755,7 +776,13 @@ pub(crate) fn resolve_exit_node_peer(peers: &[Node], ip_or_name: &str) -> Option
 /// Apply an explicit LocalAPI/config preference to the route table. An
 /// unresolved value becomes the sole pending persisted selection for map
 /// updates to retry; a resolved or cleared value has no later prefs reapply.
+#[cfg(test)]
 pub(crate) async fn apply_exit_node_prefs(state: &Arc<LocalApiState>) {
+    let _map_commit = state.peer_map.gate.write().await;
+    apply_exit_node_prefs_locked(state).await;
+}
+
+async fn apply_exit_node_prefs_locked(state: &Arc<LocalApiState>) {
     let prefs = state.prefs.read().await.clone();
     let Some(ref rt) = state.route_table else {
         return;
@@ -767,9 +794,9 @@ pub(crate) async fn apply_exit_node_prefs(state: &Arc<LocalApiState>) {
         &prefs.ExitNodeID
     } else {
         // No exit node selected — clear it.
+        state.exit_node_selection.write().await.clear_pending();
         let mut routes = rt.write().await;
         routes.clear_exit_node();
-        state.exit_node_selection.write().await.clear_pending();
         if let Some(router) = state.router.as_ref() {
             let derp_map = state.magicsock.get_derp_map();
             let control_url = state.prefs.read().await.ControlURL.clone();
@@ -793,20 +820,20 @@ pub(crate) async fn apply_exit_node_prefs(state: &Arc<LocalApiState>) {
     };
 
     let peers = state.peers.read().await;
+    let resolved = resolve_exit_node_peer(&peers, ip_or_name);
+    drop(peers);
+    let mut selection = state.exit_node_selection.write().await;
     let mut routes = rt.write().await;
-    if let Some(peer_key) = resolve_exit_node_peer(&peers, ip_or_name) {
+    if let Some(peer_key) = resolved {
         routes.set_exit_node(peer_key);
-        state.exit_node_selection.write().await.clear_pending();
+        selection.clear_pending();
     } else {
         // Peer not found (may not be in the netmap yet). Clear for now and
         // retain only this unresolved explicit preference for a future map.
         routes.clear_exit_node();
-        state
-            .exit_node_selection
-            .write()
-            .await
-            .replace_from_prefs(&prefs);
+        selection.replace_from_prefs(&prefs);
     }
+    drop(selection);
     if let Some(router) = state.router.as_ref() {
         let derp_map = state.magicsock.get_derp_map();
         let control_url = state.prefs.read().await.ControlURL.clone();
@@ -849,6 +876,12 @@ async fn handle_patch_prefs<W: AsyncWrite + Unpin>(
     let exit_node_changed =
         masked.ExitNodeIDSet || masked.ExitNodeIPSet || masked.ExitNodeAllowLANAccessSet;
     let disconnect_requested = masked.WantRunningSet && !masked.Prefs.WantRunning;
+    let authorization_changed = exit_node_changed || masked.ShieldsUpSet;
+    let map_commit = if authorization_changed {
+        Some(state.peer_map.gate.write().await)
+    } else {
+        None
+    };
 
     let updated = match commit_prefs_update(state, |prefs| masked.apply_to(prefs)).await {
         Ok((updated, _)) => updated,
@@ -873,6 +906,7 @@ async fn handle_patch_prefs<W: AsyncWrite + Unpin>(
                 .lock()
                 .unwrap()
                 .set_shields_up(masked.Prefs.ShieldsUp);
+            state.peer_map.advance_authorization_epoch_locked();
         }
     }
 
@@ -880,8 +914,9 @@ async fn handle_patch_prefs<W: AsyncWrite + Unpin>(
     // When ExitNodeIP or ExitNodeID is patched, resolve the peer and
     // update the route table — mirroring Go's applyPrefsToEngine.
     if exit_node_changed {
-        apply_exit_node_prefs(state).await;
+        apply_exit_node_prefs_locked(state).await;
     }
+    drop(map_commit);
 
     if disconnect_requested {
         if let Some(logger) = &state.audit_logger {
@@ -3763,6 +3798,7 @@ mod tests {
         let magicsock = Arc::new(magicsock_inner);
 
         let peer = Node {
+            ID: 1,
             Name: "peer1.tailnet.ts.net.".into(),
             Key: node_key.public(),
             Addresses: vec!["100.64.0.2/32".into()],
@@ -3831,10 +3867,17 @@ mod tests {
             control_params: None,
             taildrop: None,
             drive: crate::drive::Runtime::new(),
+            peer_map: crate::peer_map::Runtime::new(&[Node {
+                ID: 1,
+                Key: node_key.public(),
+                Addresses: vec!["100.64.0.2/32".into()],
+                ..Default::default()
+            }])
+            .unwrap(),
             tailnet_lock: None,
             netstack: None,
             filter: std::sync::OnceLock::new(),
-            route_table: None,
+            route_table: Some(Arc::new(RwLock::new(crate::routing::RouteTable::default()))),
             router: None,
             logout_trigger: Arc::new(tokio::sync::Notify::new()),
             suggested_exit_node: Arc::new(RwLock::new(String::new())),
@@ -3846,6 +3889,39 @@ mod tests {
             preference_policy: None,
             policy_subscription: std::sync::Mutex::new(None),
         })
+    }
+
+    #[tokio::test]
+    async fn concurrent_exit_api_waits_for_peer_map_commit_gate() {
+        let state = make_test_state().await;
+        {
+            let mut peers = state.peers.write().await;
+            peers[0].AllowedIPs = vec!["0.0.0.0/0".into(), "::/0".into()];
+        }
+        state.prefs.write().await.ExitNodeIP = "100.64.0.2".into();
+
+        let in_flight_map = state.peer_map.gate.read().await;
+        let update_state = state.clone();
+        let update = tokio::spawn(async move {
+            apply_exit_node_prefs(&update_state).await;
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !update.is_finished(),
+            "exit API bypassed the route/map commit gate"
+        );
+        drop(in_flight_map);
+        update.await.unwrap();
+
+        let selected = state
+            .route_table
+            .as_ref()
+            .unwrap()
+            .read()
+            .await
+            .exit_node()
+            .cloned();
+        assert_eq!(selected, Some(state.peers.read().await[0].Key.clone()));
     }
 
     struct TestRouteProvider(rustscale_routecheck::RouteSnapshot);
@@ -4966,6 +5042,7 @@ mod tests {
             control_params: None,
             taildrop: None,
             drive: state.drive.clone(),
+            peer_map: state.peer_map.clone(),
             tailnet_lock: None,
             netstack: None,
             filter: std::sync::OnceLock::new(),
@@ -5209,6 +5286,7 @@ mod tests {
             control_params: None,
             taildrop: None,
             drive: base.drive.clone(),
+            peer_map: base.peer_map.clone(),
             tailnet_lock: None,
             netstack: None,
             filter: std::sync::OnceLock::new(),

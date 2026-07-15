@@ -62,7 +62,7 @@ impl RelayServerExtension {
 
     /// Whether the relay server is running.
     pub fn is_running(&self) -> bool {
-        self.server.is_some()
+        self.server.as_ref().is_some_and(Server::is_enabled)
     }
 
     /// The server's disco public key, if the server is running.
@@ -117,13 +117,33 @@ impl RelayServerExtension {
         Some(resp)
     }
 
-    /// Update the self node's CapMap (called when the netmap changes).
-    pub fn set_self_cap_map(&self, cap_map: NodeCapMap) {
-        let mut guard = self
-            .self_cap_map
-            .write()
-            .expect("self_cap_map lock poisoned");
-        *guard = cap_map;
+    /// Update the self node's CapMap after a freshly validated matching map.
+    /// This is the only path that re-enables an identity-mismatch-disabled
+    /// server; disabled capability state drains allocations instead.
+    pub async fn set_self_cap_map(&self, cap_map: NodeCapMap) {
+        let disabled = relay_server_disabled(&cap_map);
+        {
+            let mut guard = self
+                .self_cap_map
+                .write()
+                .expect("self_cap_map lock poisoned");
+            *guard = cap_map;
+        }
+        if let Some(server) = self.server.as_ref() {
+            if disabled {
+                server.disable_and_drain().await;
+            } else {
+                server.enable();
+            }
+        }
+    }
+
+    /// Synchronously stop new allocations and remove every active VNI while
+    /// retaining only the socket/config needed for fresh-map reauthorization.
+    pub async fn disable_and_drain(&self) {
+        if let Some(server) = self.server.as_ref() {
+            server.disable_and_drain().await;
+        }
     }
 
     /// Close the relay server.
@@ -233,12 +253,36 @@ mod tests {
             NODE_ATTR_DISABLE_RELAY_SERVER.to_string(),
             vec![RawMessage::default()],
         );
-        ext.set_self_cap_map(m);
+        ext.set_self_cap_map(m).await;
 
         assert!(
             ext.handle_alloc_request([a, b], 1).is_none(),
             "should be disabled after cap map update"
         );
+    }
+
+    #[tokio::test]
+    async fn identity_mismatch_drains_allocations_until_fresh_map_reenables() {
+        let cap_map = Arc::new(RwLock::new(BTreeMap::new()));
+        let ext = RelayServerExtension::new(true, None, cap_map).await;
+        let a = DiscoPrivate::generate().public();
+        let b = DiscoPrivate::generate().public();
+        ext.handle_alloc_request([a.clone(), b.clone()], 1)
+            .expect("initial allocation");
+        assert_eq!(ext.server().unwrap().endpoint_count(), 1);
+
+        ext.disable_and_drain().await;
+        assert!(!ext.is_running());
+        assert_eq!(ext.server().unwrap().endpoint_count(), 0);
+        assert!(ext
+            .handle_alloc_request([a.clone(), b.clone()], 2)
+            .is_none());
+
+        ext.set_self_cap_map(BTreeMap::new()).await;
+        assert!(ext.is_running());
+        ext.handle_alloc_request([a, b], 3)
+            .expect("fresh matching map re-enabled allocation");
+        assert_eq!(ext.server().unwrap().endpoint_count(), 1);
     }
 
     #[tokio::test]

@@ -3575,6 +3575,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shields_up_mutation_waits_for_delivery_and_revokes_staged_packet() {
+        let peer = NodePrivate::generate().public();
+        let node = Node {
+            ID: 1,
+            Key: peer.clone(),
+            Addresses: vec!["100.64.0.1/32".into()],
+            ..Default::default()
+        };
+        let peer_map = crate::peer_map::Runtime::new(&[node]).unwrap();
+        let filter = Arc::new(std::sync::Mutex::new(Filter::allow_all()));
+        let old_epoch = peer_map.authorization_epoch();
+        let delivery = peer_map.gate.read().await;
+        let writer_map = peer_map.clone();
+        let writer_filter = filter.clone();
+        let (committed_tx, mut committed_rx) = tokio::sync::oneshot::channel();
+        let writer = tokio::spawn(async move {
+            let _commit = writer_map.gate.write().await;
+            writer_filter.lock().unwrap().set_shields_up(true);
+            writer_map.advance_authorization_epoch_locked();
+            let _ = committed_tx.send(());
+        });
+        tokio::task::yield_now().await;
+        assert!(committed_rx.try_recv().is_err());
+        drop(delivery);
+        committed_rx.await.unwrap();
+        writer.await.unwrap();
+
+        let packet = vec![
+            0x45, 0, 0, 20, 0, 1, 0, 0, 64, 17, 0, 0, 100, 64, 0, 1, 100, 64, 0, 2,
+        ];
+        let mut inbound = InboundBatchScratch {
+            peer_map_epoch: old_epoch,
+            plaintext_peers: vec![peer],
+            plaintext_generations: vec![7],
+            ..Default::default()
+        };
+        inbound.plaintext.push_copy(&packet).unwrap();
+        let _current = peer_map.gate.read().await;
+        retain_current_peer_map_authorization(
+            &peer_map,
+            &filter,
+            &Arc::new(AtomicU64::new(0)),
+            &crate::capture::new_slot(),
+            &mut inbound,
+        );
+        assert!(
+            inbound.plaintext.is_empty(),
+            "pre-ShieldsUp plaintext survived the filter epoch"
+        );
+    }
+
+    #[tokio::test]
     async fn final_tun_authorization_rejects_acl_and_address_only_revocations() {
         let peer = NodePrivate::generate().public();
         let old_node = Node {

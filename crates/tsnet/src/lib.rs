@@ -755,6 +755,8 @@ pub(crate) struct RunningState {
     pub(crate) peer_map: Arc<peer_map::Runtime>,
     pub(crate) routecheck: Arc<rustscale_routecheck::Client>,
     pub(crate) route_table: Arc<RwLock<RouteTable>>,
+    /// Live signed packet filter, mutated only under `peer_map.gate.write()`.
+    pub(crate) filter: Arc<std::sync::Mutex<Filter>>,
     /// OS-route manager in TUN mode when `TunModeConfig::apply_routes` is set.
     pub(crate) router: Option<SharedRouter>,
     pub(crate) cancel: Arc<CancelToken>,
@@ -1170,6 +1172,15 @@ impl Server {
         let config =
             rustscale_conffile::Config::load(path).map_err(|e| format!("config load: {e}"))?;
         let masked = config.parsed.to_prefs();
+        let authorization_changed = masked.ShieldsUpSet
+            || masked.ExitNodeAllowLANAccessSet
+            || masked.ExitNodeIDSet
+            || masked.ExitNodeIPSet;
+        let map_commit = if authorization_changed {
+            Some(inner.peer_map.gate.write().await)
+        } else {
+            None
+        };
 
         let updated = {
             let mut prefs = inner.prefs.write().await;
@@ -1192,6 +1203,15 @@ impl Server {
             serde_json::to_value(&*prefs).unwrap_or_default()
         };
 
+        if masked.ShieldsUpSet {
+            inner
+                .filter
+                .lock()
+                .unwrap()
+                .set_shields_up(masked.Prefs.ShieldsUp);
+            inner.peer_map.advance_authorization_epoch_locked();
+        }
+
         if masked.ExitNodeAllowLANAccessSet || masked.ExitNodeIDSet || masked.ExitNodeIPSet {
             let prefs = inner.prefs.read().await.clone();
             let exit_node_changed = masked.ExitNodeIDSet || masked.ExitNodeIPSet;
@@ -1205,14 +1225,14 @@ impl Server {
             } else {
                 None
             };
+            let mut selection = inner.exit_node_selection.write().await;
             let mut routes = inner.route_table.write().await;
             if let Some(selected_exit_node) = selected_exit_node {
                 if let Some(peer) = selected_exit_node {
                     routes.set_exit_node(peer);
-                    inner.exit_node_selection.write().await.clear_pending();
+                    selection.clear_pending();
                 } else {
                     routes.clear_exit_node();
-                    let mut selection = inner.exit_node_selection.write().await;
                     if exit_node_pref(&prefs).is_some() {
                         selection.replace_from_prefs(&prefs);
                     } else {
@@ -1220,6 +1240,7 @@ impl Server {
                     }
                 }
             }
+            drop(selection);
             if let Some(router) = inner.router.as_ref() {
                 let derp_map = inner.magicsock.get_derp_map();
                 let control_url = if prefs.ControlURL.is_empty() {
@@ -1238,6 +1259,8 @@ impl Server {
                 .map_err(|error| error.to_string())?;
             }
         }
+
+        drop(map_commit);
 
         inner.ipn_backend.bus().send(rustscale_ipn::Notify {
             Prefs: Some(updated),

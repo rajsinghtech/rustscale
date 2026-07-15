@@ -2400,13 +2400,26 @@ impl Magicsock {
 
     /// Update the self node's CapMap from the latest MapResponse. Used to
     /// check `NODE_ATTR_DISABLE_RELAY_SERVER` for the relay server extension.
-    pub fn set_self_cap_map(&self, cap_map: rustscale_tailcfg::NodeCapMap) {
-        let mut guard = self
-            .inner
-            .self_cap_map
-            .write()
-            .expect("self_cap_map lock poisoned");
-        *guard = cap_map;
+    pub async fn set_self_cap_map(&self, cap_map: rustscale_tailcfg::NodeCapMap) {
+        if let Some(relay_server) = self.inner.relay_server.as_ref() {
+            relay_server.set_self_cap_map(cap_map).await;
+        } else {
+            let mut guard = self
+                .inner
+                .self_cap_map
+                .write()
+                .expect("self_cap_map lock poisoned");
+            *guard = cap_map;
+        }
+    }
+
+    /// Fail closed for a tailnet identity withdrawal. This synchronously
+    /// disables the relay server and removes all active UDP relay allocations;
+    /// only `set_self_cap_map` from a fresh matching map can re-enable it.
+    pub async fn disable_relay_server_and_drain(&self) {
+        if let Some(relay_server) = self.inner.relay_server.as_ref() {
+            relay_server.disable_and_drain().await;
+        }
     }
 
     /// Snapshot of the self node's CapMap. Used by service listeners to

@@ -22,6 +22,7 @@
 #![forbid(unsafe_code)]
 
 mod commands;
+mod completion;
 mod flags;
 mod qrcode;
 mod socket;
@@ -34,6 +35,28 @@ fn main() {
     if args.len() < 2 {
         usage(&args[0]);
         std::process::exit(1);
+    }
+
+    // Completion is handled before socket resolution or runtime creation. The
+    // hidden protocol only reads its static command description and can never
+    // execute a CLI operation while the shell is completing input.
+    if args[1] == "__complete" {
+        let completion_args = if args.get(2).is_some_and(|arg| arg == "--") {
+            &args[3..]
+        } else {
+            &args[2..]
+        };
+        for candidate in completion::complete(completion_args) {
+            println!("{candidate}");
+        }
+        return;
+    }
+    if args[1] == "completion" {
+        if let Err(error) = completion::run_script(&args[2..]) {
+            eprintln!("rustscale: {error}");
+            std::process::exit(1);
+        }
+        return;
     }
 
     // Handle --help / -h / help as a top-level pseudo-subcommand.
@@ -143,6 +166,7 @@ async fn dispatch(
         "wait" => commands::wait::run(args, &socket_path, json).await,
         "lock" => commands::lock::run(args, &socket_path, json).await,
         "drive" => commands::drive::run(args, &socket_path, json).await,
+        "completion" => completion::run_script(&args),
         other => {
             eprintln!("error: unknown subcommand '{other}'");
             usage(&std::env::args().next().unwrap_or_default());
@@ -201,6 +225,7 @@ fn usage(bin: &str) {
     eprintln!("  wait [--timeout <duration>]          wait for backend to reach Running state");
     eprintln!("  lock [status|init|add|remove|disable]  manage tailnet lock (not yet supported)");
     eprintln!("  drive [list|share|unshare]           manage Taildrive shares (not yet supported)");
+    eprintln!("  completion <bash|zsh|fish>           generate shell completion script");
 }
 
 /// Error type for CLI subcommands.

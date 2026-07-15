@@ -164,6 +164,7 @@ fn sample_hostinfo() -> Hostinfo {
         Location: Some(Location {
             Country: "Canada".into(),
             CountryCode: "CA".into(),
+            Priority: 10,
         }),
         TPM: Some(TPMInfo {
             Manufacturer: "MSFT".into(),

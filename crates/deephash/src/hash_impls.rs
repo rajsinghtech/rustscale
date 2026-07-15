@@ -273,6 +273,7 @@ impl DeepHash for Location {
     fn deep_hash(&self, h: &mut Hasher) {
         self.Country.deep_hash(h);
         self.CountryCode.deep_hash(h);
+        self.Priority.deep_hash(h);
     }
 }
 impl DeepHash for TPMInfo {

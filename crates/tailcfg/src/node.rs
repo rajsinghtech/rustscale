@@ -572,6 +572,13 @@ pub struct Location {
         deserialize_with = "deserialize_null_to_default"
     )]
     pub CountryCode: String,
+    /// Relative exit-node preference; a higher value is preferred.
+    #[serde(
+        default,
+        skip_serializing_if = "skip_default",
+        deserialize_with = "deserialize_null_to_default"
+    )]
+    pub Priority: i32,
 }
 
 /// TPM 2.0 device metadata (mirrors Go's `tailcfg.TPMInfo`).
@@ -900,6 +907,7 @@ mod tests {
             Location: Some(Location {
                 Country: "Canada".into(),
                 CountryCode: "CA".into(),
+                Priority: 10,
             }),
             TPM: Some(TPMInfo {
                 Manufacturer: "MSFT".into(),
@@ -924,6 +932,7 @@ mod tests {
         assert!(j.contains("\"Location\":{"));
         assert!(j.contains("\"Country\":\"Canada\""));
         assert!(j.contains("\"CountryCode\":\"CA\""));
+        assert!(j.contains("\"Priority\":10"));
         assert!(j.contains("\"TPM\":{"));
         assert!(j.contains("\"Manufacturer\":\"MSFT\""));
         assert!(j.contains("\"Vendor\":\"MSFT\""));
@@ -935,6 +944,25 @@ mod tests {
         // Round-trip.
         let back: Hostinfo = serde_json::from_str(&j).unwrap();
         assert_eq!(back, hi);
+    }
+
+    #[test]
+    fn location_priority_wire_format() {
+        let location = Location {
+            Priority: 10,
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_string(&location).unwrap(),
+            r#"{"Priority":10}"#
+        );
+
+        let default_location = Location::default();
+        assert_eq!(serde_json::to_string(&default_location).unwrap(), "{}");
+        assert_eq!(
+            serde_json::from_str::<Location>(r#"{"Priority":null}"#).unwrap(),
+            default_location
+        );
     }
 
     #[test]

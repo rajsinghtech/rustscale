@@ -798,6 +798,7 @@ impl Server {
             &b,
             self.config.accept_routes,
             exit_node_allow_lan_access,
+            self.config.state_dir.as_deref(),
         )
         .await?;
 

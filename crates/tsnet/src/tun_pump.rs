@@ -1749,9 +1749,37 @@ pub(crate) fn build_router_config(
     tun_name: &str,
 ) -> Result<rustscale_router::RouterConfig, TsnetError> {
     let prefixes = if route_table.exit_node_requested() {
-        rustscale_tsaddr::local_interface_prefixes(tun_name).map_err(|error| {
-            TsnetError::Builder(format!("enumerate connected interface prefixes: {error}"))
-        })?
+        let mut prefixes =
+            rustscale_tsaddr::local_interface_prefixes(tun_name).map_err(|error| {
+                TsnetError::Builder(format!("enumerate connected interface prefixes: {error}"))
+            })?;
+        #[cfg(target_os = "macos")]
+        {
+            let routes = rustscale_routetable::get_route_table(100_000).map_err(|error| {
+                TsnetError::Builder(format!("enumerate Darwin route table: {error}"))
+            })?;
+            for route in routes {
+                if route.iface.is_empty()
+                    || route.iface == tun_name
+                    || route.dst.bits == 0
+                    || matches!(
+                        route.route_type,
+                        rustscale_routetable::RouteType::Local
+                            | rustscale_routetable::RouteType::Broadcast
+                            | rustscale_routetable::RouteType::Multicast
+                    )
+                {
+                    continue;
+                }
+                prefixes.push(rustscale_tsaddr::IpPrefix {
+                    ip: route.dst.addr,
+                    bits: route.dst.bits,
+                });
+            }
+            rustscale_tsaddr::sort_prefixes(&mut prefixes);
+            prefixes.dedup();
+        }
+        prefixes
     } else {
         Vec::new()
     };
@@ -2002,10 +2030,11 @@ pub(crate) async fn create_tun_device(
     b: &Bootstrap,
     _accept_routes: bool,
     exit_node_allow_lan_access: bool,
+    state_dir: Option<&std::path::Path>,
 ) -> Result<(Arc<dyn Tun>, Option<SharedRouter>), TsnetError> {
     let dev = rustscale_tun::create(&config.tun)?;
     let router = if config.apply_routes {
-        let mut router = rustscale_router::new(dev.name());
+        let mut router = rustscale_router::new_with_state_dir(dev.name(), state_dir);
         if let Err(error) = router.up() {
             let owner = Arc::new(std::sync::Mutex::new(ManagedRouter {
                 router,
@@ -2155,6 +2184,7 @@ pub(crate) async fn create_tun_device(
     _b: &Bootstrap,
     _accept_routes: bool,
     _exit_node_allow_lan_access: bool,
+    _state_dir: Option<&std::path::Path>,
 ) -> Result<(Arc<dyn Tun>, Option<SharedRouter>), TsnetError> {
     Err(TsnetError::Builder(
         "TUN mode not supported on this platform".into(),

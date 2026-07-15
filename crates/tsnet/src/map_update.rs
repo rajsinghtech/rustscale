@@ -233,6 +233,28 @@ async fn clear_exit_routes_for_identity_mismatch(
     }
 }
 
+async fn block_exit_on_map_loss(
+    router: Option<&SharedRouter>,
+    prefs: &Arc<RwLock<rustscale_ipn::Prefs>>,
+    route_table: &Arc<RwLock<RouteTable>>,
+    health: &Tracker,
+    ipn_backend: &Arc<IpnBackend>,
+    reason: &str,
+) {
+    let allow_lan = prefs.read().await.ExitNodeAllowLANAccess;
+    let mut routes = route_table.write().await;
+    if !routes.exit_node_requested() || allow_lan {
+        return;
+    }
+    routes.block_exit_traffic();
+    let kernel = router
+        .and_then(|router| engage_kernel_security_block(router).err())
+        .map(|error| format!("; kernel block: {error}"))
+        .unwrap_or_default();
+    health.set_unhealthy(WARN_EXIT_ROUTE_SECURITY, format!("{reason}{kernel}"));
+    send_health_notify(health, ipn_backend);
+}
+
 /// Spawn the map-stream delta update task. Shared by `up()` and `up_tun()`:
 /// processes Peers/PeersChanged/PeersRemoved, feeds the new peer list to
 /// magicsock, rebuilds the route table, and creates WG tunnels for new peers.
@@ -300,7 +322,22 @@ pub(crate) fn spawn_map_update_task(
             if cancel.is_cancelled() {
                 break;
             }
-            match map_rx.recv().await {
+            let map_event = tokio::select! {
+                event = map_rx.recv() => event,
+                () = tokio::time::sleep(std::time::Duration::from_secs(125)) => {
+                    block_exit_on_map_loss(
+                        router.as_ref(),
+                        &prefs,
+                        &route_table,
+                        &health,
+                        &ipn_backend,
+                        "map response watchdog expired",
+                    ).await;
+                    map_timeout_watchdog.feed();
+                    continue;
+                }
+            };
+            match map_event {
                 Some(Ok(resp)) => {
                     // Map activity: feed the staleness watchdogs + mark
                     // control healthy. Even keep-alive messages count.
@@ -824,6 +861,15 @@ pub(crate) fn spawn_map_update_task(
                     }
                 }
                 Some(Err(e)) => {
+                    block_exit_on_map_loss(
+                        router.as_ref(),
+                        &prefs,
+                        &route_table,
+                        &health,
+                        &ipn_backend,
+                        "map poll stream error",
+                    )
+                    .await;
                     health.set_unhealthy(WARN_CONTROL, format!("control connection lost: {e}"));
                     health.set_unhealthy(
                         WARN_NOT_IN_MAP_POLL,
@@ -833,6 +879,15 @@ pub(crate) fn spawn_map_update_task(
                     break;
                 }
                 None => {
+                    block_exit_on_map_loss(
+                        router.as_ref(),
+                        &prefs,
+                        &route_table,
+                        &health,
+                        &ipn_backend,
+                        "map poll stream closed",
+                    )
+                    .await;
                     health.set_unhealthy(WARN_CONTROL, "control connection lost: stream closed");
                     health.set_unhealthy(
                         WARN_NOT_IN_MAP_POLL,
@@ -1096,6 +1151,66 @@ mod tests {
     use rustscale_ipn::Prefs;
     use rustscale_key::{DiscoPrivate, NodePrivate};
     use rustscale_tailcfg::PeerChange;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct BlockRouter(Arc<AtomicUsize>);
+
+    impl rustscale_router::Router for BlockRouter {
+        fn up(&mut self) -> Result<(), rustscale_router::RouterError> {
+            Ok(())
+        }
+        fn set(
+            &mut self,
+            _: &rustscale_router::RouterConfig,
+        ) -> Result<(), rustscale_router::RouterError> {
+            Ok(())
+        }
+        fn block_direct(&mut self) -> Result<(), rustscale_router::RouterError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn unblock_direct(&mut self) -> Result<(), rustscale_router::RouterError> {
+            Ok(())
+        }
+        fn close(&mut self) -> Result<(), rustscale_router::RouterError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn map_loss_installs_kernel_emergency_block_for_lan_denied_exit() {
+        let blocks = Arc::new(AtomicUsize::new(0));
+        let router = Arc::new(std::sync::Mutex::new(crate::tun_pump::ManagedRouter {
+            router: Box::new(BlockRouter(blocks.clone())),
+            tun_name: "rustscale-test0".into(),
+            exit_node: true,
+            security_blocked: false,
+        }));
+        let mut routes = RouteTable::default();
+        routes.set_exit_node(NodePrivate::generate().public());
+        let routes = Arc::new(RwLock::new(routes));
+        let prefs = Arc::new(RwLock::new(Prefs {
+            ExitNodeAllowLANAccess: false,
+            ..Default::default()
+        }));
+        let health = Tracker::new();
+        let backend = Arc::new(IpnBackend::new("test"));
+        block_exit_on_map_loss(
+            Some(&router),
+            &prefs,
+            &routes,
+            &health,
+            &backend,
+            "injected map closure",
+        )
+        .await;
+        assert_eq!(blocks.load(Ordering::SeqCst), 1);
+        assert!(routes.read().await.exit_traffic_blocked());
+        assert!(health
+            .current_warnings()
+            .iter()
+            .any(|warning| { warning.id == WARN_EXIT_ROUTE_SECURITY }));
+    }
 
     #[tokio::test]
     async fn cancellation_inside_rotated_map_rebind_retains_join_owner() {

@@ -361,6 +361,11 @@ pub trait Router: Send + Sync {
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 trait CommandRunner: Send + Sync {
     fn run(&mut self, program: &str, args: &[String]) -> Result<(), RouterError>;
+
+    fn output(&mut self, program: &str, args: &[String]) -> Result<String, RouterError> {
+        self.run(program, args)?;
+        Ok(String::new())
+    }
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -370,14 +375,20 @@ struct SystemCommandRunner;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 impl CommandRunner for SystemCommandRunner {
     fn run(&mut self, program: &str, args: &[String]) -> Result<(), RouterError> {
+        self.output(program, args).map(|_| ())
+    }
+
+    fn output(&mut self, program: &str, args: &[String]) -> Result<String, RouterError> {
         let output = Command::new(program)
             .args(args)
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output()
             .map_err(RouterError::Io)?;
         if output.status.success() {
-            Ok(())
+            let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+            text.push_str(&String::from_utf8_lossy(&output.stderr));
+            Ok(text)
         } else {
             Err(RouterError::Command {
                 program: program.to_owned(),
@@ -613,21 +624,29 @@ impl<P: Platform, R: CommandRunner> Router for StatefulRouter<P, R> {
         {
             return Ok(());
         }
-        let block_result = self.unblock_direct();
+        // A shutdown is itself a security transition: establish the emergency
+        // block first and retain it until every pending inverse and teardown
+        // command has succeeded. Failed cleanup must never reopen direct paths.
+        self.block_direct()?;
         let pending_result = self.retry_pending_cleanup();
         let empty = RouterConfig::default();
         let delta = diff(self.config.as_ref(), &empty);
         let teardown_result = self.apply_teardown(&delta.teardown_operations());
-        let result = block_result.and(pending_result).and(teardown_result);
-        if result.is_ok() && self.pending_cleanup.is_empty() {
-            self.config = None;
-            self.is_up = false;
-            if self.ownership_claimed {
-                self.platform.release_ownership();
-                self.ownership_claimed = false;
+        let cleanup_result = pending_result.and(teardown_result);
+        if let Err(error) = cleanup_result {
+            if !self.direct_blocked {
+                let _ = self.block_direct();
             }
+            return Err(error);
         }
-        result
+        self.config = None;
+        self.is_up = false;
+        self.unblock_direct()?;
+        if self.ownership_claimed {
+            self.platform.release_ownership();
+            self.ownership_claimed = false;
+        }
+        Ok(())
     }
 }
 
@@ -636,25 +655,47 @@ struct DarwinPlatform {
     tun_name: String,
     block_anchor: String,
     block_file: std::path::PathBuf,
+    block_file_error: Option<String>,
 }
 
 #[cfg(target_os = "macos")]
 impl DarwinPlatform {
-    fn new(tun_name: &str) -> Self {
+    fn new(tun_name: &str, state_dir: Option<&std::path::Path>) -> Self {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        static NEXT_FILE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
         let token: String = tun_name
             .chars()
             .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
             .collect();
-        let block_file = std::env::temp_dir().join(format!("rustscale-{token}-block.pf"));
-        let _ = std::fs::write(
-            &block_file,
-            format!("block drop out quick on ! {tun_name} all\n"),
-        );
+        let private_dir = state_dir
+            .map_or_else(
+                || std::path::PathBuf::from("/var/run/rustscale"),
+                std::path::Path::to_path_buf,
+            )
+            .join("pf");
+        let unique = NEXT_FILE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let block_file =
+            private_dir.join(format!("block-{}-{unique}-{token}.pf", std::process::id()));
+        let create_result = (|| -> std::io::Result<()> {
+            std::fs::create_dir_all(&private_dir)?;
+            std::fs::set_permissions(&private_dir, std::fs::Permissions::from_mode(0o700))?;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&block_file)?;
+            file.write_all(format!("block drop out quick on ! {tun_name} all\n").as_bytes())?;
+            file.sync_all()?;
+            Ok(())
+        })();
         Self {
             tun_name: tun_name.to_owned(),
             // macOS's system PF ruleset evaluates the com.apple/* wildcard.
             block_anchor: format!("com.apple/rustscale.{token}"),
             block_file,
+            block_file_error: create_result.err().map(|error| error.to_string()),
         }
     }
 
@@ -695,7 +736,44 @@ impl DarwinPlatform {
 }
 
 #[cfg(target_os = "macos")]
+impl Drop for DarwinPlatform {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.block_file);
+    }
+}
+
+#[cfg(target_os = "macos")]
 impl Platform for DarwinPlatform {
+    fn claim_ownership(&self) -> Result<(), RouterError> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if let Some(error) = &self.block_file_error {
+            return Err(RouterError::InvalidConfig(format!(
+                "create private PF rules file: {error}"
+            )));
+        }
+        let metadata = std::fs::symlink_metadata(&self.block_file).map_err(RouterError::Io)?;
+        let parent = self
+            .block_file
+            .parent()
+            .ok_or_else(|| RouterError::InvalidConfig("PF rules file has no parent".into()))?;
+        let parent_metadata = std::fs::symlink_metadata(parent).map_err(RouterError::Io)?;
+        if !metadata.file_type().is_file()
+            || metadata.file_type().is_symlink()
+            || !parent_metadata.file_type().is_dir()
+            || parent_metadata.file_type().is_symlink()
+            || metadata.uid() != parent_metadata.uid()
+            || metadata.permissions().mode() & 0o077 != 0
+            || parent_metadata.permissions().mode() & 0o077 != 0
+        {
+            return Err(RouterError::InvalidConfig(
+                "PF rules file is not a private owner-only regular file".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn release_ownership(&self) {}
+
     fn commands(&self, operation: &RouterOperation) -> Vec<(String, Vec<String>)> {
         match operation {
             RouterOperation::Up => {
@@ -737,7 +815,10 @@ impl Platform for DarwinPlatform {
 
 #[cfg(target_os = "macos")]
 /// Shell-command-backed macOS router for phase 1.
-pub struct DarwinRouter(StatefulRouter<DarwinPlatform, SystemCommandRunner>);
+pub struct DarwinRouter {
+    inner: StatefulRouter<DarwinPlatform, SystemCommandRunner>,
+    pf_enable_token: Option<String>,
+}
 
 #[cfg(target_os = "macos")]
 impl DarwinPlatform {
@@ -750,32 +831,115 @@ impl DarwinPlatform {
 }
 
 #[cfg(target_os = "macos")]
+fn pf_is_enabled(status: &str) -> bool {
+    status
+        .lines()
+        .any(|line| line.trim().eq_ignore_ascii_case("status: enabled"))
+}
+
+#[cfg(target_os = "macos")]
+fn pf_enable_token(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        let value = value.trim();
+        (name.trim().eq_ignore_ascii_case("token") && !value.is_empty()).then(|| value.to_owned())
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn pf_block_active(rules: &str, tun_name: &str) -> bool {
+    rules.contains("block drop out quick") && rules.contains(&format!("! {tun_name}"))
+}
+
+#[cfg(target_os = "macos")]
 impl DarwinRouter {
     /// Construct a router for `tun_name`.
     pub fn new(tun_name: &str) -> Self {
-        Self(StatefulRouter::new(
-            DarwinPlatform::new(tun_name),
-            SystemCommandRunner,
-        ))
+        Self::new_with_state_dir(tun_name, None)
+    }
+
+    pub fn new_with_state_dir(tun_name: &str, state_dir: Option<&std::path::Path>) -> Self {
+        Self {
+            inner: StatefulRouter::new(
+                DarwinPlatform::new(tun_name, state_dir),
+                SystemCommandRunner,
+            ),
+            pf_enable_token: None,
+        }
+    }
+
+    fn ensure_pf_enabled(&mut self) -> Result<(), RouterError> {
+        let status = self
+            .inner
+            .runner
+            .output("pfctl", &["-s".into(), "info".into()])?;
+        if pf_is_enabled(&status) {
+            return Ok(());
+        }
+        let enabled = self.inner.runner.output("pfctl", &["-E".into()])?;
+        let token = pf_enable_token(&enabled).ok_or_else(|| {
+            RouterError::InvalidConfig("pfctl enabled PF without returning a teardown token".into())
+        })?;
+        self.pf_enable_token = Some(token);
+        Ok(())
+    }
+
+    fn verify_pf_block(&mut self, expected: bool) -> Result<(), RouterError> {
+        let rules = self.inner.runner.output(
+            "pfctl",
+            &[
+                "-a".into(),
+                self.inner.platform.block_anchor.clone(),
+                "-sr".into(),
+            ],
+        )?;
+        let active = pf_block_active(&rules, &self.inner.platform.tun_name);
+        if active == expected {
+            Ok(())
+        } else {
+            Err(RouterError::InvalidConfig(format!(
+                "PF emergency anchor verification failed (expected active={expected})"
+            )))
+        }
+    }
+
+    fn release_pf_enable_token(&mut self) -> Result<(), RouterError> {
+        if let Some(token) = self.pf_enable_token.clone() {
+            self.inner.runner.run("pfctl", &["-X".into(), token])?;
+            self.pf_enable_token = None;
+        }
+        Ok(())
     }
 }
 
 #[cfg(target_os = "macos")]
 impl Router for DarwinRouter {
     fn up(&mut self) -> Result<(), RouterError> {
-        self.0.up()
+        self.inner.up()
     }
     fn set(&mut self, config: &RouterConfig) -> Result<(), RouterError> {
-        self.0.set(config)
+        self.inner.set(config)
     }
     fn block_direct(&mut self) -> Result<(), RouterError> {
-        self.0.block_direct()
+        self.ensure_pf_enabled()?;
+        self.inner.block_direct()?;
+        self.verify_pf_block(true)
     }
     fn unblock_direct(&mut self) -> Result<(), RouterError> {
-        self.0.unblock_direct()
+        self.inner.unblock_direct()?;
+        self.verify_pf_block(false)?;
+        self.release_pf_enable_token()
     }
     fn close(&mut self) -> Result<(), RouterError> {
-        self.0.close()
+        self.block_direct()?;
+        self.inner.close()?;
+        self.verify_pf_block(false)?;
+        self.release_pf_enable_token()?;
+        match std::fs::remove_file(&self.inner.platform.block_file) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(RouterError::Io(error)),
+        }
     }
 }
 
@@ -961,8 +1125,21 @@ impl Platform for LinuxPlatform {
                 Ok(())
             }
             Some((owner, refs)) if owner == &self.tun_name => {
-                *refs += 1;
-                Ok(())
+                #[cfg(test)]
+                {
+                    // Command-injection unit tests construct parallel mock
+                    // routers with one synthetic name; production is exclusive.
+                    *refs += 1;
+                    Ok(())
+                }
+                #[cfg(not(test))]
+                {
+                    let _ = refs;
+                    Err(RouterError::InvalidConfig(format!(
+                        "Linux policy-rule owner {} is already active at base {base}",
+                        self.tun_name
+                    )))
+                }
             }
             Some((owner, _)) => Err(RouterError::InvalidConfig(format!(
                 "Linux policy-rule ownership collision: {} and {} map to base {base}",
@@ -1208,13 +1385,22 @@ impl Router for UnsupportedRouter {
 
 /// Construct the router appropriate for the current platform.
 pub fn new(tun_name: &str) -> Box<dyn Router> {
+    new_with_state_dir(tun_name, None)
+}
+
+pub fn new_with_state_dir(tun_name: &str, state_dir: Option<&std::path::Path>) -> Box<dyn Router> {
     #[cfg(target_os = "macos")]
-    return Box::new(DarwinRouter::new(tun_name));
+    {
+        Box::new(DarwinRouter::new_with_state_dir(tun_name, state_dir))
+    }
     #[cfg(target_os = "linux")]
-    return Box::new(LinuxRouter::new(tun_name));
+    {
+        let _ = state_dir;
+        Box::new(LinuxRouter::new(tun_name))
+    }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
-        let _ = tun_name;
+        let _ = (tun_name, state_dir);
         Box::new(UnsupportedRouter)
     }
 }
@@ -1277,12 +1463,12 @@ impl Router for FakeRouter {
         if !self.is_up && self.config.is_none() && !self.direct_blocked {
             return Ok(());
         }
-        self.unblock_direct()?;
+        self.block_direct()?;
         self.operations
             .extend(diff(self.config.as_ref(), &RouterConfig::default()).teardown_operations());
         self.config = None;
         self.is_up = false;
-        Ok(())
+        self.unblock_direct()
     }
 }
 
@@ -1572,8 +1758,28 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn darwin_pf_enable_status_and_token_are_verified() {
+        assert!(pf_is_enabled("Status: Enabled\nDebug: Urgent"));
+        assert!(!pf_is_enabled("Status: Disabled"));
+        assert_eq!(
+            pf_enable_token("pf enabled\nToken : 12345\n"),
+            Some("12345".into())
+        );
+        assert_eq!(pf_enable_token("pf enabled without token"), None);
+        assert!(pf_block_active(
+            "block drop out quick on ! utun42 all flags S/SA",
+            "utun42"
+        ));
+        assert!(!pf_block_active("", "utun42"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn darwin_emergency_block_uses_evaluated_pf_anchor_and_all_non_tun_interfaces() {
-        let platform = DarwinPlatform::new("utun42");
+        let state_dir =
+            std::env::temp_dir().join(format!("rustscale-router-test-{}", std::process::id()));
+        let platform = DarwinPlatform::new("utun42", Some(&state_dir));
+        platform.claim_ownership().unwrap();
         let commands = platform.commands(&RouterOperation::EnableDirectBlock);
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].0, "pfctl");
@@ -1585,6 +1791,22 @@ mod tests {
         assert_eq!(rules, "block drop out quick on ! utun42 all\n");
         let disable = platform.commands(&RouterOperation::DisableDirectBlock);
         assert!(disable[0].1.windows(2).any(|pair| pair == ["-F", "rules"]));
+        platform.release_ownership();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_pf_rules_file_rejects_symlink_replacement() {
+        use std::os::unix::fs::symlink;
+        let state_dir = std::env::temp_dir().join(format!(
+            "rustscale-router-symlink-test-{}",
+            std::process::id()
+        ));
+        let platform = DarwinPlatform::new("utun43", Some(&state_dir));
+        std::fs::remove_file(&platform.block_file).unwrap();
+        symlink("/etc/passwd", &platform.block_file).unwrap();
+        assert!(platform.claim_ownership().is_err());
+        std::fs::remove_file(&platform.block_file).unwrap();
     }
 
     #[cfg(target_os = "linux")]
@@ -2301,10 +2523,12 @@ mod tests {
         assert!(router.close().is_err());
         assert_eq!(router.config, Some(installed));
         assert!(router.is_up);
+        assert!(router.direct_blocked);
         router.runner.fail_at = None;
         router.close().unwrap();
         assert!(router.config.is_none());
         assert!(!router.is_up);
+        assert!(!router.direct_blocked);
     }
 
     #[test]
@@ -2340,11 +2564,13 @@ mod tests {
         assert_eq!(
             router.operations(),
             [
+                RouterOperation::EnableDirectBlock,
                 RouterOperation::RemoveExitRoutes,
                 RouterOperation::RemoveRoute(prefix("100.64.0.0/10")),
                 RouterOperation::RemoveLocalRoute(prefix("192.168.0.0/16")),
                 RouterOperation::RemoveAddr(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1))),
                 RouterOperation::Down,
+                RouterOperation::DisableDirectBlock,
             ]
         );
         router.clear_operations();

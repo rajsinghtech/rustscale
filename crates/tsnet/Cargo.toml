@@ -61,6 +61,7 @@ rustscale-tun = { path = "../tun", version = "0.1.1" }
 rustscale-filter = { path = "../filter", version = "0.1.1" }
 rustscale-dns = { path = "../dns", version = "0.1.1" }
 rustscale-netmon = { path = "../netmon", version = "0.1.1" }
+rustscale-routetable = { path = "../routetable", version = "0.1.1" }
 rustscale-portmapper = { path = "../portmapper", version = "0.1.1" }
 rustscale-health = { path = "../health", version = "0.1.1" }
 rustscale-udprelay = { path = "../udprelay", version = "0.1.1" }

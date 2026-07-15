@@ -3927,6 +3927,7 @@ dependencies = [
  "rustscale-proxymap",
  "rustscale-routecheck",
  "rustscale-router",
+ "rustscale-routetable",
  "rustscale-safesocket",
  "rustscale-sockstats",
  "rustscale-ssh",

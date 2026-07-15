@@ -383,9 +383,29 @@ pub(crate) fn spawn_localapi(
     state: Arc<LocalApiState>,
     socket_path: PathBuf,
 ) -> Option<LocalApiHandle> {
-    let listener = rustscale_safesocket::listen(&socket_path).ok()?;
+    #[cfg(unix)]
+    let (listener, path) = {
+        static NEXT_SOCKET: AtomicU64 = AtomicU64::new(0);
+        let sequence = NEXT_SOCKET.fetch_add(1, Ordering::Relaxed);
+        let file_name = socket_path.file_name()?.to_string_lossy();
+        let bind_path = socket_path.with_file_name(format!(
+            ".{file_name}.swap-{}-{sequence}",
+            std::process::id()
+        ));
+        let listener = rustscale_safesocket::listen(&bind_path).ok()?;
+        if std::fs::rename(&bind_path, &socket_path).is_err() {
+            drop(listener);
+            let _ = std::fs::remove_file(bind_path);
+            return None;
+        }
+        (listener, socket_path.clone())
+    };
+    #[cfg(not(unix))]
+    let (listener, path) = (
+        rustscale_safesocket::listen(&socket_path).ok()?,
+        socket_path.clone(),
+    );
 
-    let path = socket_path.clone();
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
     let task_shutdown_tx = shutdown_tx.clone();
     let task = tokio::spawn(async move {

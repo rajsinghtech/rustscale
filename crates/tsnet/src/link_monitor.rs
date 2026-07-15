@@ -68,6 +68,48 @@ fn connected_prefixes_from_state(
     Ok(prefixes)
 }
 
+#[cfg(target_os = "macos")]
+fn append_darwin_route_prefixes(
+    prefixes: &mut Vec<rustscale_tsaddr::IpPrefix>,
+    routes: Vec<rustscale_routetable::RouteEntry>,
+    rustscale_tun_name: &str,
+) {
+    for route in routes {
+        if route.iface.is_empty()
+            || route.iface == rustscale_tun_name
+            || route.dst.bits == 0
+            || matches!(
+                route.route_type,
+                rustscale_routetable::RouteType::Local
+                    | rustscale_routetable::RouteType::Broadcast
+                    | rustscale_routetable::RouteType::Multicast
+            )
+        {
+            continue;
+        }
+        prefixes.push(rustscale_tsaddr::IpPrefix {
+            ip: route.dst.addr,
+            bits: route.dst.bits,
+        });
+    }
+}
+
+fn security_prefixes_from_state(
+    state: &rustscale_netmon::State,
+    rustscale_tun_name: &str,
+) -> Result<Vec<rustscale_tsaddr::IpPrefix>, String> {
+    let mut prefixes = connected_prefixes_from_state(state, rustscale_tun_name)?;
+    #[cfg(target_os = "macos")]
+    {
+        let routes = rustscale_routetable::get_route_table(100_000)
+            .map_err(|error| format!("Darwin route-table enumeration failed: {error}"))?;
+        append_darwin_route_prefixes(&mut prefixes, routes, rustscale_tun_name);
+        rustscale_tsaddr::sort_prefixes(&mut prefixes);
+        prefixes.dedup();
+    }
+    Ok(prefixes)
+}
+
 /// Spawn the network change monitor. On a major link change (interface IP
 /// change, up/down transition, or wall-clock time jump), re-gathers local
 /// endpoints, resets peer direct paths, closes DERP connections, re-STUNs,
@@ -162,7 +204,7 @@ pub(crate) fn spawn_link_monitor(
                 let mut prefix_snapshot = if delta.enumeration_failed {
                     Err("connected-interface enumeration failed".to_string())
                 } else {
-                    connected_prefixes_from_state(&delta.new, &tun_name)
+                    security_prefixes_from_state(&delta.new, &tun_name)
                 };
                 loop {
                     if cancel.is_cancelled() {
@@ -192,7 +234,7 @@ pub(crate) fn spawn_link_monitor(
                             }
                             prefix_snapshot = rustscale_netmon::gather_state()
                                 .ok_or_else(|| "connected-interface enumeration failed".to_string())
-                                .and_then(|state| connected_prefixes_from_state(&state, &tun_name));
+                                .and_then(|state| security_prefixes_from_state(&state, &tun_name));
                             continue;
                         }
                         Err(error) => {
@@ -245,7 +287,7 @@ pub(crate) fn spawn_link_monitor(
                             }
                             prefix_snapshot = rustscale_netmon::gather_state()
                                 .ok_or_else(|| "connected-interface enumeration failed".to_string())
-                                .and_then(|state| connected_prefixes_from_state(&state, &tun_name));
+                                .and_then(|state| security_prefixes_from_state(&state, &tun_name));
                         }
                         Err(error) => {
                             log::warn!("tsnet: interface route refresh failed: {error}");
@@ -655,6 +697,41 @@ mod tests {
         fn close(&mut self) -> Result<(), rustscale_router::RouterError> {
             Ok(())
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_interface_scoped_kernel_routes_are_captured() {
+        let route = |iface: &str, cidr: &str| {
+            let prefix = rustscale_tsaddr::IpPrefix::parse(cidr).unwrap();
+            rustscale_routetable::RouteEntry {
+                family: if prefix.ip.is_ipv4() { 4 } else { 6 },
+                route_type: rustscale_routetable::RouteType::Unicast,
+                dst: rustscale_routetable::RouteDestination {
+                    addr: prefix.ip,
+                    bits: prefix.bits,
+                    zone: String::new(),
+                },
+                gateway: None,
+                gateway_iface: Some(iface.into()),
+                iface: iface.into(),
+                flags: vec!["INTERFACE".into()],
+                raw_flags: 0,
+            }
+        };
+        let mut prefixes = Vec::new();
+        append_darwin_route_prefixes(
+            &mut prefixes,
+            vec![
+                route("en7", "198.51.100.0/24"),
+                route("rustscale0", "203.0.113.0/24"),
+            ],
+            "rustscale0",
+        );
+        assert_eq!(
+            prefixes,
+            [rustscale_tsaddr::IpPrefix::parse("198.51.100.0/24").unwrap()]
+        );
     }
 
     #[test]

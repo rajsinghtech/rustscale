@@ -8,8 +8,10 @@
 //! weakening this workspace's `unsafe_code` policy.
 //!
 //! Snapshotting never closes, duplicates, or calls socket operations on a
-//! process file descriptor. Process races only make association metadata
-//! partial; they do not invalidate connection rows already read from the OS.
+//! process file descriptor. PID metadata is observational only and is emitted
+//! only after validating a stable Linux process start time; it must never be
+//! used to select a destructive action. Process races make association metadata
+//! partial without invalidating connection rows already read from the OS.
 
 #![forbid(unsafe_code)]
 
@@ -18,17 +20,27 @@ mod macos;
 
 use std::fmt;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::IpAddr;
+#[cfg(test)]
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
-pub use linux::{snapshot_linux_with_reader, Directory, LinuxReader, SystemLinuxReader};
+pub use linux::{
+    snapshot_linux_with_reader, snapshot_linux_with_reader_and_decoder, Directory, LinuxReader,
+    ProcAddressDecoder, ProcEndian, SystemLinuxReader,
+};
 pub use macos::{parse_netstat, snapshot_macos_with_reader, NetstatReader};
 
 /// Default whole-snapshot deadline.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(2);
+const SUPERVISOR_POLL_INTERVAL: Duration = Duration::from_millis(5);
+const MAX_SNAPSHOT_WORKERS: usize = 4;
+
+static SNAPSHOT_WORKERS: LazyLock<Arc<WorkerLimiter>> =
+    LazyLock::new(|| Arc::new(WorkerLimiter::new(MAX_SNAPSHOT_WORKERS)));
 
 /// A normalized TCP endpoint.
 ///
@@ -135,6 +147,9 @@ pub enum OsMetadata {
 }
 
 /// One TCP connection table row.
+///
+/// `pid` and `process` are race-checked diagnostic observations, not handles or
+/// authority for signaling, closing, or otherwise modifying a process/socket.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Entry {
     pub local: Endpoint,
@@ -182,6 +197,7 @@ pub struct Limits {
     pub max_fds_per_process: usize,
     pub max_total_fds: usize,
     pub max_process_name_bytes: usize,
+    pub max_process_stat_bytes: usize,
 }
 
 impl Default for Limits {
@@ -195,6 +211,7 @@ impl Default for Limits {
             max_fds_per_process: 4096,
             max_total_fds: 262_144,
             max_process_name_bytes: 256,
+            max_process_stat_bytes: 4096,
         }
     }
 }
@@ -240,6 +257,7 @@ impl CancellationToken {
 pub struct SnapshotContext {
     deadline: Option<Instant>,
     cancellation: CancellationToken,
+    supervisor_cancellation: CancellationToken,
 }
 
 impl SnapshotContext {
@@ -247,6 +265,19 @@ impl SnapshotContext {
         Self {
             deadline,
             cancellation,
+            supervisor_cancellation: CancellationToken::new(),
+        }
+    }
+
+    fn supervised(
+        deadline: Option<Instant>,
+        cancellation: CancellationToken,
+        supervisor_cancellation: CancellationToken,
+    ) -> Self {
+        Self {
+            deadline,
+            cancellation,
+            supervisor_cancellation,
         }
     }
 
@@ -255,7 +286,7 @@ impl SnapshotContext {
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.cancellation.is_cancelled()
+        self.cancellation.is_cancelled() || self.supervisor_cancellation.is_cancelled()
     }
 
     pub fn check(&self) -> Result<(), Error> {
@@ -272,8 +303,9 @@ impl SnapshotContext {
     }
 }
 
-/// Snapshot failures. Per-process disappearance and permission errors are
-/// treated as partial process metadata rather than fatal I/O errors.
+/// Snapshot failures. Per-process disappearance and permission errors during
+/// optional PID association become partial metadata; TCP table read failures
+/// other than an explicitly absent family are fatal.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("TCP table snapshots are unsupported on {platform}")]
@@ -303,6 +335,10 @@ pub enum Error {
     },
     #[error("netstat exited unsuccessfully: {0}")]
     NetstatFailed(String),
+    #[error("TCP table snapshot worker capacity exhausted")]
+    WorkerCapacity,
+    #[error("TCP table snapshot worker terminated without a result")]
+    WorkerTerminated,
 }
 
 impl Error {
@@ -311,12 +347,126 @@ impl Error {
     }
 }
 
+struct WorkerLimiter {
+    active: AtomicUsize,
+    maximum: usize,
+}
+
+impl WorkerLimiter {
+    const fn new(maximum: usize) -> Self {
+        Self {
+            active: AtomicUsize::new(0),
+            maximum,
+        }
+    }
+
+    fn acquire(self: &Arc<Self>) -> Result<WorkerPermit, Error> {
+        self.active
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < self.maximum).then_some(active + 1)
+            })
+            .map_err(|_| Error::WorkerCapacity)?;
+        Ok(WorkerPermit {
+            limiter: self.clone(),
+        })
+    }
+}
+
+struct WorkerPermit {
+    limiter: Arc<WorkerLimiter>,
+}
+
+impl Drop for WorkerPermit {
+    fn drop(&mut self) {
+        self.limiter.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn run_supervised<T, F>(
+    options: &SnapshotOptions,
+    cancellation: &CancellationToken,
+    work: F,
+) -> Result<T, Error>
+where
+    T: Send + 'static,
+    F: FnOnce(SnapshotContext) -> Result<T, Error> + Send + 'static,
+{
+    run_supervised_with_limiter(options, cancellation, SNAPSHOT_WORKERS.clone(), work)
+}
+
+fn run_supervised_with_limiter<T, F>(
+    options: &SnapshotOptions,
+    cancellation: &CancellationToken,
+    limiter: Arc<WorkerLimiter>,
+    work: F,
+) -> Result<T, Error>
+where
+    T: Send + 'static,
+    F: FnOnce(SnapshotContext) -> Result<T, Error> + Send + 'static,
+{
+    let initial_context = SnapshotContext::new(options.deadline, cancellation.clone());
+    initial_context.check()?;
+    let permit = limiter.acquire()?;
+    let supervisor_cancellation = CancellationToken::new();
+    let worker_context = SnapshotContext::supervised(
+        options.deadline,
+        cancellation.clone(),
+        supervisor_cancellation.clone(),
+    );
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("rustscale-netstat-snapshot".into())
+        .spawn(move || {
+            let result = work(worker_context);
+            drop(permit);
+            let _ = sender.send(result);
+        })
+        .map_err(|error| Error::io("starting TCP table snapshot worker", error))?;
+
+    loop {
+        if cancellation.is_cancelled() {
+            supervisor_cancellation.cancel();
+            return Err(Error::Cancelled);
+        }
+        let wait = if let Some(deadline) = options.deadline {
+            let now = Instant::now();
+            if now >= deadline {
+                supervisor_cancellation.cancel();
+                return Err(Error::DeadlineExceeded);
+            }
+            SUPERVISOR_POLL_INTERVAL.min(deadline.duration_since(now))
+        } else {
+            SUPERVISOR_POLL_INTERVAL
+        };
+        match receiver.recv_timeout(wait) {
+            Ok(result) => {
+                if cancellation.is_cancelled() {
+                    supervisor_cancellation.cancel();
+                    return Err(Error::Cancelled);
+                }
+                if options
+                    .deadline
+                    .is_some_and(|deadline| Instant::now() >= deadline)
+                {
+                    supervisor_cancellation.cancel();
+                    return Err(Error::DeadlineExceeded);
+                }
+                return result;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(Error::WorkerTerminated);
+            }
+        }
+    }
+}
+
 /// Take a host TCP connection table snapshot.
 #[cfg(target_os = "linux")]
 pub fn get(options: &SnapshotOptions, cancellation: &CancellationToken) -> Result<Table, Error> {
     let context = SnapshotContext::new(options.deadline, cancellation.clone());
     context.check()?;
-    snapshot_linux_with_reader(&SystemLinuxReader, options, &context)
+    snapshot_linux_with_reader(SystemLinuxReader, options, cancellation)
 }
 
 /// Take a host TCP connection table snapshot.
@@ -324,7 +474,7 @@ pub fn get(options: &SnapshotOptions, cancellation: &CancellationToken) -> Resul
 pub fn get(options: &SnapshotOptions, cancellation: &CancellationToken) -> Result<Table, Error> {
     let context = SnapshotContext::new(options.deadline, cancellation.clone());
     context.check()?;
-    snapshot_macos_with_reader(&macos::SystemNetstatReader, options, &context)
+    snapshot_macos_with_reader(macos::SystemNetstatReader, options, cancellation)
 }
 
 /// Return an explicit unsupported error on platforms without a safe reader.
@@ -344,20 +494,6 @@ fn canonical_ip(address: IpAddr) -> IpAddr {
             .map_or(IpAddr::V6(address), IpAddr::V4),
         address => address,
     }
-}
-
-fn parse_ipv4_hex(value: &str) -> Option<Ipv4Addr> {
-    let bytes = parse_hex_array::<4>(value)?;
-    Some(Ipv4Addr::new(bytes[3], bytes[2], bytes[1], bytes[0]))
-}
-
-fn parse_ipv6_hex(value: &str) -> Option<Ipv6Addr> {
-    let bytes = parse_hex_array::<16>(value)?;
-    let mut address = [0_u8; 16];
-    for (destination, source) in address.chunks_exact_mut(4).zip(bytes.chunks_exact(4)) {
-        destination.copy_from_slice(&[source[3], source[2], source[1], source[0]]);
-    }
-    Some(Ipv6Addr::from(address))
 }
 
 fn parse_hex_array<const N: usize>(value: &str) -> Option<[u8; N]> {
@@ -464,7 +600,19 @@ mod tests {
             associate_processes: false,
             ..SnapshotOptions::default()
         };
-        let table = get(&options, &CancellationToken::new()).unwrap();
+        let table = match get(&options, &CancellationToken::new()) {
+            Ok(table) => table,
+            #[cfg(target_os = "macos")]
+            Err(Error::Malformed {
+                reason: "invalid local endpoint" | "invalid remote endpoint",
+                ..
+            }) => {
+                // Even wide Darwin netstat output can contain non-standard,
+                // ambiguous IPv6 text. Rejecting the snapshot is intentional.
+                return;
+            }
+            Err(error) => panic!("live snapshot failed: {error}"),
+        };
         assert_eq!(table.process_association, ProcessAssociation::NotRequested);
         for entry in table.entries {
             assert!(!entry.state.as_str().is_empty());
@@ -475,6 +623,75 @@ mod tests {
                 assert!(entry.remote.zone.is_none());
             }
         }
+    }
+
+    #[test]
+    fn supervisor_returns_by_deadline_and_caps_abandoned_workers() {
+        let limiter = Arc::new(WorkerLimiter::new(1));
+        let (release, blocked) = std::sync::mpsc::channel();
+        let options = SnapshotOptions {
+            deadline: Some(Instant::now() + Duration::from_millis(30)),
+            ..SnapshotOptions::default()
+        };
+        let started = Instant::now();
+        let result = run_supervised_with_limiter(
+            &options,
+            &CancellationToken::new(),
+            limiter.clone(),
+            move |_| {
+                let _ = blocked.recv_timeout(Duration::from_millis(500));
+                Ok(())
+            },
+        );
+        assert!(matches!(result, Err(Error::DeadlineExceeded)));
+        assert!(started.elapsed() < Duration::from_millis(150));
+
+        let second_options = SnapshotOptions {
+            deadline: Some(Instant::now() + Duration::from_millis(100)),
+            ..SnapshotOptions::default()
+        };
+        assert!(matches!(
+            run_supervised_with_limiter(
+                &second_options,
+                &CancellationToken::new(),
+                limiter.clone(),
+                |_| Ok(())
+            ),
+            Err(Error::WorkerCapacity)
+        ));
+        release.send(()).unwrap();
+        let cleanup_deadline = Instant::now() + Duration::from_secs(1);
+        while limiter.active.load(Ordering::Acquire) != 0 && Instant::now() < cleanup_deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(limiter.active.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn supervisor_returns_promptly_on_cancellation() {
+        let limiter = Arc::new(WorkerLimiter::new(1));
+        let (release, blocked) = std::sync::mpsc::channel();
+        let cancellation = CancellationToken::new();
+        let canceller = {
+            let cancellation = cancellation.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(20));
+                cancellation.cancel();
+            })
+        };
+        let options = SnapshotOptions {
+            deadline: None,
+            ..SnapshotOptions::default()
+        };
+        let started = Instant::now();
+        let result = run_supervised_with_limiter(&options, &cancellation, limiter, move |_| {
+            let _ = blocked.recv_timeout(Duration::from_millis(500));
+            Ok(())
+        });
+        assert!(matches!(result, Err(Error::Cancelled)));
+        assert!(started.elapsed() < Duration::from_millis(150));
+        release.send(()).unwrap();
+        canceller.join().unwrap();
     }
 
     #[test]

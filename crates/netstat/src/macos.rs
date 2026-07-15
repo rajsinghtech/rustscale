@@ -3,17 +3,31 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use crate::{
-    Endpoint, Entry, Error, OsMetadata, ProcessAssociation, SnapshotContext, SnapshotOptions,
-    State, Table,
+    run_supervised, Endpoint, Entry, Error, OsMetadata, ProcessAssociation, SnapshotContext,
+    SnapshotOptions, State, Table,
 };
+
+#[cfg(target_os = "macos")]
+const NETSTAT_ARGS: [&str; 5] = ["-W", "-a", "-n", "-p", "tcp"];
 
 /// Injectable source of numeric macOS `netstat` output.
 pub trait NetstatReader: Send + Sync {
     fn read_netstat(&self, context: &SnapshotContext, max_bytes: usize) -> Result<Vec<u8>, Error>;
 }
 
-/// Build a macOS TCP table using an injected command-output reader.
-pub fn snapshot_macos_with_reader<R: NetstatReader>(
+/// Build a supervised macOS TCP table using an injected command-output reader.
+pub fn snapshot_macos_with_reader<R: NetstatReader + 'static>(
+    reader: R,
+    options: &SnapshotOptions,
+    cancellation: &crate::CancellationToken,
+) -> Result<Table, Error> {
+    let options_for_worker = options.clone();
+    run_supervised(options, cancellation, move |context| {
+        snapshot_macos_inner(&reader, &options_for_worker, &context)
+    })
+}
+
+fn snapshot_macos_inner<R: NetstatReader>(
     reader: &R,
     options: &SnapshotOptions,
     context: &SnapshotContext,
@@ -162,7 +176,12 @@ fn parse_netstat_endpoint(value: &str, family: Family) -> Option<Endpoint> {
             let address = if address == "*" {
                 Ipv6Addr::UNSPECIFIED
             } else {
-                parse_macos_ipv6(address)?
+                // Only standard, complete IPv6 text is accepted. Never repair
+                // Darwin's shortened or truncated presentation.
+                if address.contains("...") {
+                    return None;
+                }
+                address.parse().ok()?
             };
             let zone = match zone {
                 Some(zone) if valid_zone(zone) => Some(zone.to_owned()),
@@ -172,26 +191,6 @@ fn parse_netstat_endpoint(value: &str, family: Family) -> Option<Endpoint> {
             Some(Endpoint::with_zone(IpAddr::V6(address), port, zone))
         }
     }
-}
-
-fn parse_macos_ipv6(address: &str) -> Option<Ipv6Addr> {
-    address
-        .parse()
-        .ok()
-        .or_else(|| {
-            // Darwin netstat can omit a final zero group while leaving one
-            // trailing colon, as in `fe80::1:2:`.
-            (address.ends_with(':') && !address.ends_with("::"))
-                .then(|| format!("{address}0").parse().ok())
-                .flatten()
-        })
-        .or_else(|| {
-            // It can also abbreviate an all-zero suffix without printing the
-            // normal trailing `::`, as in `fd7a:115c:a1e0:4`.
-            (!address.contains("::") && address.bytes().filter(|byte| *byte == b':').count() < 7)
-                .then(|| format!("{address}::").parse().ok())
-                .flatten()
-        })
 }
 
 fn valid_zone(zone: &str) -> bool {
@@ -243,7 +242,7 @@ impl NetstatReader for SystemNetstatReader {
 
         context.check()?;
         let mut child = Command::new("/usr/sbin/netstat")
-            .args(["-an", "-p", "tcp"])
+            .args(NETSTAT_ARGS)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -332,12 +331,14 @@ mod tests {
         SnapshotContext::new(None, CancellationToken::new())
     }
 
+    fn snapshot(output: Vec<u8>, options: &SnapshotOptions) -> Result<Table, Error> {
+        snapshot_macos_inner(&FakeNetstat(output), options, &context())
+    }
+
     #[test]
     fn parses_macos_numeric_vectors() {
         let output = b"Active Internet connections\nProto Recv-Q Send-Q Local Address Foreign Address (state)\ntcp4 0 0 127.0.0.1.8080 10.0.0.2.443 ESTABLISHED\ntcp6 0 0 fe80::1%lo0.22 *.* LISTEN\ntcp6 0 0 ::ffff:127.0.0.1.9000 ::1.1234 FIN_WAIT_1\ntcp46 0 0 *.3033 *.* LISTEN\nudp4 0 0 *.53 *.*\n";
-        let table =
-            snapshot_macos_with_reader(&FakeNetstat(output.to_vec()), &options(), &context())
-                .unwrap();
+        let table = snapshot(output.to_vec(), &options()).unwrap();
         assert_eq!(table.entries.len(), 4);
         assert_eq!(table.process_association, ProcessAssociation::Unavailable);
         let established = table
@@ -373,13 +374,35 @@ mod tests {
     }
 
     #[test]
+    fn supervised_macos_reader_returns_before_blocking_reader_finishes() {
+        struct BlockingNetstat;
+        impl NetstatReader for BlockingNetstat {
+            fn read_netstat(
+                &self,
+                _context: &SnapshotContext,
+                _max_bytes: usize,
+            ) -> Result<Vec<u8>, Error> {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                Ok(Vec::new())
+            }
+        }
+
+        let bounded = SnapshotOptions {
+            deadline: Some(std::time::Instant::now() + std::time::Duration::from_millis(25)),
+            ..options()
+        };
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            snapshot_macos_with_reader(BlockingNetstat, &bounded, &CancellationToken::new()),
+            Err(Error::DeadlineExceeded)
+        ));
+        assert!(started.elapsed() < std::time::Duration::from_millis(150));
+    }
+
+    #[test]
     fn rejects_malformed_tcp_line() {
-        let error = snapshot_macos_with_reader(
-            &FakeNetstat(b"tcp4 0 bad 127.0.0.1.80 *.* LISTEN\n".to_vec()),
-            &options(),
-            &context(),
-        )
-        .unwrap_err();
+        let error =
+            snapshot(b"tcp4 0 bad 127.0.0.1.80 *.* LISTEN\n".to_vec(), &options()).unwrap_err();
         assert!(matches!(error, Error::Malformed { line: 1, .. }));
     }
 
@@ -388,7 +411,7 @@ mod tests {
         let mut constrained = options();
         constrained.limits.max_netstat_bytes = 16;
         assert!(matches!(
-            snapshot_macos_with_reader(&FakeNetstat(vec![b'x'; 17]), &constrained, &context()),
+            snapshot(vec![b'x'; 17], &constrained),
             Err(Error::LimitExceeded { .. })
         ));
 
@@ -396,27 +419,44 @@ mod tests {
         constrained.limits.max_entries = 1;
         let rows = b"tcp4 0 0 *.80 *.* LISTEN\ntcp4 0 0 *.81 *.* LISTEN\n";
         assert!(matches!(
-            snapshot_macos_with_reader(&FakeNetstat(rows.to_vec()), &constrained, &context()),
+            snapshot(rows.to_vec(), &constrained),
             Err(Error::LimitExceeded { .. })
         ));
+    }
+
+    #[test]
+    fn rejects_truncated_ellipsis_and_ambiguous_ipv6() {
+        for endpoint in [
+            "fd4d:4a27:29aa:4.80",
+            "fe80::7563:4198:.80",
+            "2001:db8:...:1.80",
+        ] {
+            let row = format!("tcp6 0 0 {endpoint} *.* LISTEN\n");
+            assert!(matches!(
+                snapshot(row.into_bytes(), &options()),
+                Err(Error::Malformed { .. })
+            ));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn system_command_requests_wide_numeric_output() {
+        assert_eq!(NETSTAT_ARGS, ["-W", "-a", "-n", "-p", "tcp"]);
     }
 
     #[test]
     fn rejects_invalid_zone_and_overlong_line() {
         let invalid_zone = b"tcp6 0 0 fe80::1%bad/zone.80 *.* LISTEN\n";
         assert!(matches!(
-            snapshot_macos_with_reader(&FakeNetstat(invalid_zone.to_vec()), &options(), &context()),
+            snapshot(invalid_zone.to_vec(), &options()),
             Err(Error::Malformed { .. })
         ));
 
         let mut constrained = options();
         constrained.limits.max_line_bytes = 8;
         assert!(matches!(
-            snapshot_macos_with_reader(
-                &FakeNetstat(b"tcp4 0 0 *.80 *.* LISTEN\n".to_vec()),
-                &constrained,
-                &context()
-            ),
+            snapshot(b"tcp4 0 0 *.80 *.* LISTEN\n".to_vec(), &constrained),
             Err(Error::LimitExceeded { .. })
         ));
     }

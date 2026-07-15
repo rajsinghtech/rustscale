@@ -1,11 +1,11 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::io;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 
 use crate::{
-    parse_ipv4_hex, parse_ipv6_hex, path_for_proc, read_file_limited, sorted_directory, Endpoint,
+    parse_hex_array, path_for_proc, read_file_limited, run_supervised, sorted_directory, Endpoint,
     Entry, Error, OsMetadata, ProcessAssociation, SnapshotContext, SnapshotOptions, State, Table,
 };
 
@@ -49,18 +49,95 @@ impl LinuxReader for SystemLinuxReader {
     }
 }
 
-/// Build a Linux TCP table using an injected procfs reader.
-pub fn snapshot_linux_with_reader<R: LinuxReader>(
+/// Byte order used for each kernel-rendered `/proc/net` address lane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProcEndian {
+    Little,
+    Big,
+}
+
+/// Injectable decoder for Linux `/proc/net/tcp{,6}` address vectors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProcAddressDecoder {
+    endian: ProcEndian,
+}
+
+impl ProcAddressDecoder {
+    pub const fn new(endian: ProcEndian) -> Self {
+        Self { endian }
+    }
+
+    pub const fn native() -> Self {
+        #[cfg(target_endian = "little")]
+        {
+            Self::new(ProcEndian::Little)
+        }
+        #[cfg(target_endian = "big")]
+        {
+            Self::new(ProcEndian::Big)
+        }
+    }
+
+    fn decode_v4(self, value: &str) -> Option<Ipv4Addr> {
+        let mut bytes = parse_hex_array::<4>(value)?;
+        if self.endian == ProcEndian::Little {
+            bytes.reverse();
+        }
+        Some(Ipv4Addr::from(bytes))
+    }
+
+    fn decode_v6(self, value: &str) -> Option<Ipv6Addr> {
+        let mut bytes = parse_hex_array::<16>(value)?;
+        if self.endian == ProcEndian::Little {
+            for lane in bytes.chunks_exact_mut(4) {
+                lane.reverse();
+            }
+        }
+        Some(Ipv6Addr::from(bytes))
+    }
+}
+
+/// Build a supervised Linux TCP table using an injected procfs reader.
+pub fn snapshot_linux_with_reader<R: LinuxReader + 'static>(
+    reader: R,
+    options: &SnapshotOptions,
+    cancellation: &crate::CancellationToken,
+) -> Result<Table, Error> {
+    snapshot_linux_with_reader_and_decoder(
+        reader,
+        ProcAddressDecoder::native(),
+        options,
+        cancellation,
+    )
+}
+
+/// Build a supervised Linux TCP table using injected procfs and address readers.
+pub fn snapshot_linux_with_reader_and_decoder<R: LinuxReader + 'static>(
+    reader: R,
+    decoder: ProcAddressDecoder,
+    options: &SnapshotOptions,
+    cancellation: &crate::CancellationToken,
+) -> Result<Table, Error> {
+    let options_for_worker = options.clone();
+    run_supervised(options, cancellation, move |context| {
+        snapshot_linux_inner(&reader, decoder, &options_for_worker, &context)
+    })
+}
+
+fn snapshot_linux_inner<R: LinuxReader>(
     reader: &R,
+    decoder: ProcAddressDecoder,
     options: &SnapshotOptions,
     context: &SnapshotContext,
 ) -> Result<Table, Error> {
     context.check()?;
     let mut entries = Vec::new();
     let mut successful_tables = 0_usize;
-    let mut first_error = None;
 
-    for (path, family) in [(TCP4_PATH, Family::V4), (TCP6_PATH, Family::V6)] {
+    for (path, family, operation) in [
+        (TCP4_PATH, Family::V4, "reading /proc/net/tcp"),
+        (TCP6_PATH, Family::V6, "reading /proc/net/tcp6"),
+    ] {
         context.check()?;
         match reader.read_file(Path::new(path), options.limits.max_table_bytes) {
             Ok(bytes) => {
@@ -71,18 +148,25 @@ pub fn snapshot_linux_with_reader<R: LinuxReader>(
                         limit: options.limits.max_table_bytes,
                     });
                 }
-                parse_proc_table(&bytes, family, path, &options.limits, context, &mut entries)?;
+                parse_proc_table(
+                    &bytes,
+                    family,
+                    decoder,
+                    path,
+                    &options.limits,
+                    context,
+                    &mut entries,
+                )?;
             }
-            Err(error) => {
-                first_error.get_or_insert(error);
-            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(Error::io(operation, error)),
         }
     }
 
     if successful_tables == 0 {
         return Err(Error::io(
             "reading Linux TCP tables",
-            first_error.unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no tables")),
+            io::Error::new(io::ErrorKind::NotFound, "/proc TCP tables are absent"),
         ));
     }
 
@@ -108,6 +192,7 @@ enum Family {
 fn parse_proc_table(
     bytes: &[u8],
     family: Family,
+    decoder: ProcAddressDecoder,
     source_name: &'static str,
     limits: &crate::Limits,
     context: &SnapshotContext,
@@ -133,7 +218,13 @@ fn parse_proc_table(
                 limit: limits.max_entries,
             });
         }
-        entries.push(parse_proc_line(line, family, source_name, line_number)?);
+        entries.push(parse_proc_line(
+            line,
+            family,
+            decoder,
+            source_name,
+            line_number,
+        )?);
     }
     Ok(())
 }
@@ -141,6 +232,7 @@ fn parse_proc_table(
 fn parse_proc_line(
     line: &str,
     family: Family,
+    decoder: ProcAddressDecoder,
     source_name: &'static str,
     line_number: usize,
 ) -> Result<Entry, Error> {
@@ -193,9 +285,9 @@ fn parse_proc_line(
 
     let state_number = parse_fixed_hex_u8(state).ok_or_else(|| malformed("invalid state"))?;
     Ok(Entry {
-        local: parse_proc_endpoint(local, family)
+        local: parse_proc_endpoint(local, family, decoder)
             .ok_or_else(|| malformed("invalid local endpoint"))?,
-        remote: parse_proc_endpoint(remote, family)
+        remote: parse_proc_endpoint(remote, family, decoder)
             .ok_or_else(|| malformed("invalid remote endpoint"))?,
         pid: None,
         process: None,
@@ -204,15 +296,19 @@ fn parse_proc_line(
     })
 }
 
-fn parse_proc_endpoint(value: &str, family: Family) -> Option<Endpoint> {
+fn parse_proc_endpoint(
+    value: &str,
+    family: Family,
+    decoder: ProcAddressDecoder,
+) -> Option<Endpoint> {
     let (address, port) = value.split_once(':')?;
     if port.len() != 4 {
         return None;
     }
     let port = u16::from_str_radix(port, 16).ok()?;
     let address = match family {
-        Family::V4 => IpAddr::V4(parse_ipv4_hex(address)?),
-        Family::V6 => IpAddr::V6(parse_ipv6_hex(address)?),
+        Family::V4 => IpAddr::V4(decoder.decode_v4(address)?),
+        Family::V6 => IpAddr::V6(decoder.decode_v6(address)?),
     };
     Some(Endpoint::new(address, port))
 }
@@ -298,6 +394,10 @@ fn associate_processes<R: LinuxReader>(
         if owners.len() == wanted.len() {
             break;
         }
+        let Some(identity_before) = read_process_start_time(reader, proc_root, pid, options) else {
+            partial = true;
+            continue;
+        };
         let fd_path = path_for_proc(proc_root, pid, "fd");
         let fd_directory = if let Ok(directory) =
             reader.read_directory(&fd_path, options.limits.max_fds_per_process)
@@ -314,6 +414,7 @@ fn associate_processes<R: LinuxReader>(
             });
         }
         partial |= fd_directory.truncated;
+        let mut matched_inodes = HashSet::new();
 
         for fd_name in fd_directory.names {
             context.check()?;
@@ -331,12 +432,27 @@ fn associate_processes<R: LinuxReader>(
             let Some(inode) = socket_inode(&link) else {
                 continue;
             };
-            if !wanted.contains(&inode) || owners.contains_key(&inode) {
-                continue;
+            if wanted.contains(&inode) && !owners.contains_key(&inode) {
+                matched_inodes.insert(inode);
             }
-            let (process, name_partial) = read_process_name(reader, proc_root, pid, options);
-            partial |= name_partial;
-            owners.insert(inode, (pid, process));
+        }
+        if matched_inodes.is_empty() {
+            continue;
+        }
+
+        let (process, name_partial) = read_process_name(reader, proc_root, pid, options);
+        partial |= name_partial;
+        context.check()?;
+        let Some(identity_after) = read_process_start_time(reader, proc_root, pid, options) else {
+            partial = true;
+            continue;
+        };
+        if identity_before != identity_after {
+            partial = true;
+            continue;
+        }
+        for inode in matched_inodes {
+            owners.insert(inode, (pid, process.clone()));
         }
     }
 
@@ -369,6 +485,30 @@ fn socket_inode(link: &Path) -> Option<u64> {
         .ok()
 }
 
+fn read_process_start_time<R: LinuxReader>(
+    reader: &R,
+    proc_root: &Path,
+    pid: u32,
+    options: &SnapshotOptions,
+) -> Option<u64> {
+    let path = path_for_proc(proc_root, pid, "stat");
+    let bytes = reader
+        .read_file(&path, options.limits.max_process_stat_bytes)
+        .ok()?;
+    if bytes.len() > options.limits.max_process_stat_bytes {
+        return None;
+    }
+    parse_process_start_time(&bytes)
+}
+
+fn parse_process_start_time(bytes: &[u8]) -> Option<u64> {
+    let value = std::str::from_utf8(bytes).ok()?.trim_end();
+    let command_end = value.rfind(')')?;
+    let mut fields = value.get(command_end + 1..)?.split_whitespace();
+    // `/proc/<pid>/stat` field 22 is starttime. The suffix starts at field 3.
+    fields.nth(19)?.parse().ok()
+}
+
 fn read_process_name<R: LinuxReader>(
     reader: &R,
     proc_root: &Path,
@@ -395,6 +535,7 @@ fn read_process_name<R: LinuxReader>(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::sync::Mutex;
 
     use super::*;
@@ -410,7 +551,9 @@ mod tests {
         files: HashMap<PathBuf, Vec<u8>>,
         directories: HashMap<PathBuf, Directory>,
         links: HashMap<PathBuf, PathBuf>,
-        failures: HashSet<PathBuf>,
+        failures: HashMap<PathBuf, io::ErrorKind>,
+        raw_failures: HashMap<PathBuf, i32>,
+        file_sequences: Mutex<HashMap<PathBuf, VecDeque<Vec<u8>>>>,
         reads: Mutex<Vec<PathBuf>>,
         cancel_on_read: Option<crate::CancellationToken>,
     }
@@ -421,8 +564,20 @@ mod tests {
             if let Some(cancellation) = &self.cancel_on_read {
                 cancellation.cancel();
             }
-            if self.failures.contains(path) {
-                return Err(io::Error::new(io::ErrorKind::NotFound, "raced"));
+            if let Some(raw_error) = self.raw_failures.get(path) {
+                return Err(io::Error::from_raw_os_error(*raw_error));
+            }
+            if let Some(kind) = self.failures.get(path) {
+                return Err(io::Error::new(*kind, "injected failure"));
+            }
+            if let Some(bytes) = self
+                .file_sequences
+                .lock()
+                .unwrap()
+                .get_mut(path)
+                .and_then(VecDeque::pop_front)
+            {
+                return Ok(bytes[..bytes.len().min(limit.saturating_add(1))].to_vec());
             }
             self.files
                 .get(path)
@@ -432,8 +587,8 @@ mod tests {
 
         fn read_directory(&self, path: &Path, limit: usize) -> io::Result<Directory> {
             self.reads.lock().unwrap().push(path.to_owned());
-            if self.failures.contains(path) {
-                return Err(io::Error::new(io::ErrorKind::NotFound, "raced"));
+            if let Some(kind) = self.failures.get(path) {
+                return Err(io::Error::new(*kind, "injected failure"));
             }
             let directory = self
                 .directories
@@ -447,8 +602,8 @@ mod tests {
 
         fn read_link(&self, path: &Path) -> io::Result<PathBuf> {
             self.reads.lock().unwrap().push(path.to_owned());
-            if self.failures.contains(path) {
-                return Err(io::Error::new(io::ErrorKind::NotFound, "raced"));
+            if let Some(kind) = self.failures.get(path) {
+                return Err(io::Error::new(*kind, "injected failure"));
             }
             self.links
                 .get(path)
@@ -469,38 +624,66 @@ mod tests {
         SnapshotContext::new(None, CancellationToken::new())
     }
 
+    fn snapshot(reader: &FakeReader, options: &SnapshotOptions) -> Result<Table, Error> {
+        snapshot_linux_inner(
+            reader,
+            ProcAddressDecoder::new(ProcEndian::Little),
+            options,
+            &context(),
+        )
+    }
+
+    fn proc_stat(pid: u32, start_time: u64) -> Vec<u8> {
+        format!(
+            "{pid} (demo process) S {} {start_time}\n",
+            vec!["0"; 18].join(" ")
+        )
+        .into_bytes()
+    }
+
+    fn snapshot_with_decoder(
+        reader: &FakeReader,
+        decoder: ProcAddressDecoder,
+    ) -> Result<Table, Error> {
+        snapshot_linux_inner(reader, decoder, &options(), &context())
+    }
+
     #[test]
-    fn parses_linux_ipv4_and_ipv6_vectors() {
-        let mut reader = FakeReader::default();
-        reader.files.insert(
-            PathBuf::from(TCP4_PATH),
-            format!("{HEADER}{V4_ROW}").into_bytes(),
-        );
-        reader.files.insert(
-            PathBuf::from(TCP6_PATH),
-            format!("{HEADER}{V6_ROW}").into_bytes(),
-        );
-        let table = snapshot_linux_with_reader(&reader, &options(), &context()).unwrap();
-        assert_eq!(table.entries.len(), 2);
-
-        let established = table
-            .entries
-            .iter()
-            .find(|entry| entry.state == State::Established)
-            .unwrap();
-        assert_eq!(established.local.to_string(), "127.0.0.1:8080");
-        assert_eq!(established.remote.to_string(), "10.0.0.2:443");
-        assert_eq!(
-            established.os_metadata,
-            OsMetadata::Linux {
-                inode: 12345,
-                uid: 1000
-            }
-        );
-
-        let listening = table.listening().next().unwrap();
-        assert_eq!(listening.local.to_string(), "[::1]:53");
-        assert_eq!(listening.remote.to_string(), "127.0.0.1:5353");
+    fn parses_little_and_big_endian_table_vectors() {
+        for (decoder, v4_row, v6_row) in [
+            (
+                ProcAddressDecoder::new(ProcEndian::Little),
+                V4_ROW,
+                V6_ROW,
+            ),
+            (
+                ProcAddressDecoder::new(ProcEndian::Big),
+                "  0: 7F000001:1F90 0A000002:01BB 01 00000000:00000000 00:00000000 00000000 1000 0 12345 1\n",
+                "  1: 00000000000000000000000000000001:0035 00000000000000000000FFFF7F000001:14E9 0A 00000000:00000000 00:00000000 00000000 0 0 54321 1\n",
+            ),
+        ] {
+            let mut reader = FakeReader::default();
+            reader.files.insert(
+                PathBuf::from(TCP4_PATH),
+                format!("{HEADER}{v4_row}").into_bytes(),
+            );
+            reader.files.insert(
+                PathBuf::from(TCP6_PATH),
+                format!("{HEADER}{v6_row}").into_bytes(),
+            );
+            let table = snapshot_with_decoder(&reader, decoder).unwrap();
+            assert_eq!(table.entries.len(), 2);
+            let established = table
+                .entries
+                .iter()
+                .find(|entry| entry.state == State::Established)
+                .unwrap();
+            assert_eq!(established.local.to_string(), "127.0.0.1:8080");
+            assert_eq!(established.remote.to_string(), "10.0.0.2:443");
+            let listening = table.listening().next().unwrap();
+            assert_eq!(listening.local.to_string(), "[::1]:53");
+            assert_eq!(listening.remote.to_string(), "127.0.0.1:5353");
+        }
     }
 
     #[test]
@@ -526,16 +709,33 @@ mod tests {
     }
 
     #[test]
-    fn one_family_read_race_returns_the_other_family() {
+    fn only_not_found_family_absence_is_tolerated() {
         let mut reader = FakeReader::default();
         reader.files.insert(
             PathBuf::from(TCP4_PATH),
             format!("{HEADER}{V4_ROW}").into_bytes(),
         );
-        reader.failures.insert(PathBuf::from(TCP6_PATH));
-        let table = snapshot_linux_with_reader(&reader, &options(), &context()).unwrap();
+        reader
+            .failures
+            .insert(PathBuf::from(TCP6_PATH), io::ErrorKind::NotFound);
+        let table = snapshot(&reader, &options()).unwrap();
         assert_eq!(table.entries.len(), 1);
-        assert_eq!(table.entries[0].state, State::Established);
+
+        reader
+            .failures
+            .insert(PathBuf::from(TCP6_PATH), io::ErrorKind::PermissionDenied);
+        assert!(matches!(
+            snapshot(&reader, &options()),
+            Err(Error::Io { .. })
+        ));
+
+        reader.failures.remove(Path::new(TCP6_PATH));
+        // EIO is raw OS error 5 on Linux.
+        reader.raw_failures.insert(PathBuf::from(TCP6_PATH), 5);
+        assert!(matches!(
+            snapshot(&reader, &options()),
+            Err(Error::Io { .. })
+        ));
     }
 
     #[test]
@@ -548,7 +748,7 @@ mod tests {
         reader
             .files
             .insert(PathBuf::from(TCP6_PATH), HEADER.as_bytes().to_vec());
-        let error = snapshot_linux_with_reader(&reader, &options(), &context()).unwrap_err();
+        let error = snapshot(&reader, &options()).unwrap_err();
         assert!(matches!(error, Error::Malformed { line: 2, .. }));
     }
 
@@ -564,7 +764,7 @@ mod tests {
         let mut constrained = options();
         constrained.limits.max_table_bytes = 32;
         assert!(matches!(
-            snapshot_linux_with_reader(&reader, &constrained, &context()),
+            snapshot(&reader, &constrained),
             Err(Error::LimitExceeded { .. })
         ));
 
@@ -575,21 +775,12 @@ mod tests {
         constrained.limits.max_table_bytes = 4096;
         constrained.limits.max_entries = 1;
         assert!(matches!(
-            snapshot_linux_with_reader(&reader, &constrained, &context()),
+            snapshot(&reader, &constrained),
             Err(Error::LimitExceeded { .. })
         ));
     }
 
-    #[test]
-    fn bounded_inode_association_does_not_open_fd_targets() {
-        let mut reader = FakeReader::default();
-        reader.files.insert(
-            PathBuf::from(TCP4_PATH),
-            format!("{HEADER}{V4_ROW}").into_bytes(),
-        );
-        reader
-            .files
-            .insert(PathBuf::from(TCP6_PATH), HEADER.as_bytes().to_vec());
+    fn add_process_fixture(reader: &mut FakeReader, start_time: u64) {
         reader.directories.insert(
             PathBuf::from(PROC_ROOT),
             Directory {
@@ -611,9 +802,30 @@ mod tests {
         reader
             .files
             .insert(PathBuf::from("/proc/42/comm"), b"demo\n".to_vec());
+        reader
+            .files
+            .insert(PathBuf::from("/proc/42/stat"), proc_stat(42, start_time));
+    }
+
+    fn reader_with_connection() -> FakeReader {
+        let mut reader = FakeReader::default();
+        reader.files.insert(
+            PathBuf::from(TCP4_PATH),
+            format!("{HEADER}{V4_ROW}").into_bytes(),
+        );
+        reader
+            .files
+            .insert(PathBuf::from(TCP6_PATH), HEADER.as_bytes().to_vec());
+        reader
+    }
+
+    #[test]
+    fn stable_identity_is_required_for_complete_pid_association() {
+        let mut reader = reader_with_connection();
+        add_process_fixture(&mut reader, 9001);
         let mut associated = options();
         associated.associate_processes = true;
-        let table = snapshot_linux_with_reader(&reader, &associated, &context()).unwrap();
+        let table = snapshot(&reader, &associated).unwrap();
         assert_eq!(table.process_association, ProcessAssociation::Complete);
         assert_eq!(table.entries[0].pid, Some(42));
         assert_eq!(table.entries[0].process.as_deref(), Some("demo"));
@@ -626,26 +838,31 @@ mod tests {
     }
 
     #[test]
-    fn process_exit_race_preserves_rows_as_partial() {
-        let mut reader = FakeReader::default();
-        reader.files.insert(
-            PathBuf::from(TCP4_PATH),
-            format!("{HEADER}{V4_ROW}").into_bytes(),
+    fn pid_reuse_race_omits_association_and_marks_partial() {
+        let mut reader = reader_with_connection();
+        add_process_fixture(&mut reader, 9001);
+        reader.file_sequences.lock().unwrap().insert(
+            PathBuf::from("/proc/42/stat"),
+            VecDeque::from([proc_stat(42, 9001), proc_stat(42, 9002)]),
         );
-        reader
-            .files
-            .insert(PathBuf::from(TCP6_PATH), HEADER.as_bytes().to_vec());
-        reader.directories.insert(
-            PathBuf::from(PROC_ROOT),
-            Directory {
-                names: vec![OsString::from("42")],
-                truncated: false,
-            },
-        );
-        reader.failures.insert(PathBuf::from("/proc/42/fd"));
         let mut associated = options();
         associated.associate_processes = true;
-        let table = snapshot_linux_with_reader(&reader, &associated, &context()).unwrap();
+        let table = snapshot(&reader, &associated).unwrap();
+        assert_eq!(table.process_association, ProcessAssociation::Partial);
+        assert_eq!(table.entries[0].pid, None);
+        assert_eq!(table.entries[0].process, None);
+    }
+
+    #[test]
+    fn process_exit_race_preserves_rows_as_partial() {
+        let mut reader = reader_with_connection();
+        add_process_fixture(&mut reader, 9001);
+        reader
+            .failures
+            .insert(PathBuf::from("/proc/42/fd"), io::ErrorKind::NotFound);
+        let mut associated = options();
+        associated.associate_processes = true;
+        let table = snapshot(&reader, &associated).unwrap();
         assert_eq!(table.entries.len(), 1);
         assert_eq!(table.entries[0].pid, None);
         assert_eq!(table.process_association, ProcessAssociation::Partial);
@@ -653,25 +870,11 @@ mod tests {
 
     #[test]
     fn process_and_fd_limits_produce_partial_snapshot() {
-        let mut reader = FakeReader::default();
-        reader.files.insert(
-            PathBuf::from(TCP4_PATH),
-            format!("{HEADER}{V4_ROW}").into_bytes(),
-        );
-        reader
-            .files
-            .insert(PathBuf::from(TCP6_PATH), HEADER.as_bytes().to_vec());
+        let mut reader = reader_with_connection();
         reader.directories.insert(
             PathBuf::from(PROC_ROOT),
             Directory {
                 names: vec![OsString::from("1"), OsString::from("2")],
-                truncated: false,
-            },
-        );
-        reader.directories.insert(
-            PathBuf::from("/proc/1/fd"),
-            Directory {
-                names: vec![OsString::from("3"), OsString::from("4")],
                 truncated: false,
             },
         );
@@ -680,8 +883,50 @@ mod tests {
         associated.limits.max_processes = 1;
         associated.limits.max_fds_per_process = 1;
         associated.limits.max_total_fds = 1;
-        let table = snapshot_linux_with_reader(&reader, &associated, &context()).unwrap();
+        let table = snapshot(&reader, &associated).unwrap();
         assert_eq!(table.process_association, ProcessAssociation::Partial);
+    }
+
+    #[test]
+    fn parses_start_time_after_parenthesized_command() {
+        assert_eq!(
+            parse_process_start_time(&proc_stat(42, 123_456)),
+            Some(123_456)
+        );
+        assert_eq!(
+            parse_process_start_time(b"42 (name with ) chars) S 0 0\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn supervised_linux_reader_returns_before_blocking_read_finishes() {
+        struct BlockingReader;
+        impl LinuxReader for BlockingReader {
+            fn read_file(&self, _path: &Path, _limit: usize) -> io::Result<Vec<u8>> {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                Err(io::Error::new(io::ErrorKind::NotFound, "late"))
+            }
+
+            fn read_directory(&self, _path: &Path, _limit: usize) -> io::Result<Directory> {
+                unreachable!()
+            }
+
+            fn read_link(&self, _path: &Path) -> io::Result<PathBuf> {
+                unreachable!()
+            }
+        }
+
+        let bounded = SnapshotOptions {
+            deadline: Some(std::time::Instant::now() + std::time::Duration::from_millis(25)),
+            ..options()
+        };
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            snapshot_linux_with_reader(BlockingReader, &bounded, &CancellationToken::new()),
+            Err(Error::DeadlineExceeded)
+        ));
+        assert!(started.elapsed() < std::time::Duration::from_millis(150));
     }
 
     #[test]
@@ -697,7 +942,12 @@ mod tests {
         );
         let context = SnapshotContext::new(None, cancellation);
         assert!(matches!(
-            snapshot_linux_with_reader(&reader, &options(), &context),
+            snapshot_linux_inner(
+                &reader,
+                ProcAddressDecoder::new(ProcEndian::Little),
+                &options(),
+                &context
+            ),
             Err(Error::Cancelled)
         ));
     }

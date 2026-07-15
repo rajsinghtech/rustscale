@@ -2,6 +2,7 @@ use std::{
     collections::BTreeMap,
     sync::{
         atomic::{AtomicU64, Ordering},
+        mpsc::{self, SyncSender, TrySendError},
         Arc, Mutex, RwLock, Weak,
     },
     thread,
@@ -125,10 +126,24 @@ impl PolicyChange {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProviderId(u64);
 
+/// Precedence among providers configured at the same management scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ProviderPrecedence {
+    /// Development-only environment overrides.
+    Debug,
+    /// Platform-native policy that is not protected managed policy.
+    Platform,
+    /// Protected policy, such as a root-owned file or machine policy store.
+    Managed,
+    /// Scoped test-only override.
+    TestOverride,
+}
+
 struct SourceEntry {
     id: ProviderId,
     name: String,
     scope: PolicyScope,
+    precedence: ProviderPrecedence,
     provider: Arc<dyn PolicyProvider>,
     _subscription: Option<Box<dyn ProviderSubscription>>,
 }
@@ -138,6 +153,7 @@ struct ReadSource {
     id: ProviderId,
     name: String,
     scope: PolicyScope,
+    precedence: ProviderPrecedence,
     provider: Arc<dyn PolicyProvider>,
 }
 
@@ -152,13 +168,16 @@ struct EngineInner {
     callbacks: Mutex<BTreeMap<u64, ChangeCallback>>,
     next_source: AtomicU64,
     next_callback: AtomicU64,
+    notification_tx: SyncSender<()>,
+    last_reload_error: RwLock<Option<PolicyError>>,
 }
 
 /// Concurrent effective-policy engine.
 ///
 /// Providers are loaded concurrently, then merged deterministically. Device
-/// scope wins over profile scope, which wins over user scope. For providers at
-/// the same scope, the later registration wins.
+/// scope wins over profile scope, which wins over user scope. Explicit
+/// provider precedence resolves same-scope classes; within a class, the later
+/// registration wins.
 #[derive(Clone)]
 pub struct PolicyEngine {
     inner: Arc<EngineInner>,
@@ -182,18 +201,33 @@ impl PolicyEngine {
             }
         }
         let snapshot = Arc::new(Snapshot::empty(scope.clone()));
-        Ok(Self {
-            inner: Arc::new(EngineInner {
-                scope,
-                definitions: definition_map,
-                sources: RwLock::new(Vec::new()),
-                snapshot: RwLock::new(snapshot),
-                reload: Mutex::new(()),
-                callbacks: Mutex::new(BTreeMap::new()),
-                next_source: AtomicU64::new(0),
-                next_callback: AtomicU64::new(0),
-            }),
-        })
+        let (notification_tx, notification_rx) = mpsc::sync_channel(1);
+        let inner = Arc::new(EngineInner {
+            scope,
+            definitions: definition_map,
+            sources: RwLock::new(Vec::new()),
+            snapshot: RwLock::new(snapshot),
+            reload: Mutex::new(()),
+            callbacks: Mutex::new(BTreeMap::new()),
+            next_source: AtomicU64::new(0),
+            next_callback: AtomicU64::new(0),
+            notification_tx,
+            last_reload_error: RwLock::new(None),
+        });
+        let weak = Arc::downgrade(&inner);
+        thread::Builder::new()
+            .name("syspolicy-reload".into())
+            .spawn(move || {
+                while notification_rx.recv().is_ok() {
+                    while notification_rx.try_recv().is_ok() {}
+                    let Some(inner) = weak.upgrade() else {
+                        break;
+                    };
+                    let _ = PolicyEngine { inner }.reload();
+                }
+            })
+            .map_err(|_| PolicyError::new(PolicyErrorKind::Provider))?;
+        Ok(Self { inner })
     }
 
     /// Creates an engine with all built-in definitions.
@@ -201,23 +235,36 @@ impl PolicyEngine {
         Self::new(scope, well_known_definitions())
     }
 
-    /// Registers a named provider and immediately reloads the effective policy.
+    /// Registers a managed provider and immediately reloads effective policy.
     pub fn add_provider(
         &self,
         name: impl Into<String>,
         scope: PolicyScope,
         provider: Arc<dyn PolicyProvider>,
     ) -> Result<ProviderId, PolicyError> {
+        self.add_provider_with_precedence(name, scope, ProviderPrecedence::Managed, provider)
+    }
+
+    /// Registers a provider with explicit same-scope precedence.
+    pub fn add_provider_with_precedence(
+        &self,
+        name: impl Into<String>,
+        scope: PolicyScope,
+        precedence: ProviderPrecedence,
+        provider: Arc<dyn PolicyProvider>,
+    ) -> Result<ProviderId, PolicyError> {
         let id = ProviderId(self.inner.next_source.fetch_add(1, Ordering::Relaxed));
-        let weak = Arc::downgrade(&self.inner);
-        let callback: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-            if let Some(inner) = weak.upgrade() {
-                // Provider notifications are advisory. A failed refresh leaves
-                // the last known-good snapshot installed.
-                let _ = PolicyEngine { inner }.reload();
-            }
-        });
+        let notification_tx = self.inner.notification_tx.clone();
+        let callback: Arc<dyn Fn() + Send + Sync> =
+            Arc::new(move || match notification_tx.try_send(()) {
+                Ok(()) | Err(TrySendError::Full(()) | TrySendError::Disconnected(())) => {}
+            });
         let subscription = provider.subscribe(callback)?;
+        let reload_guard = self
+            .inner
+            .reload
+            .lock()
+            .expect("policy reload lock poisoned");
         self.inner
             .sources
             .write()
@@ -226,28 +273,56 @@ impl PolicyEngine {
                 id,
                 name: name.into(),
                 scope,
+                precedence,
                 provider,
                 _subscription: subscription,
             });
-        if let Err(error) = self.reload() {
-            self.inner
-                .sources
-                .write()
-                .expect("policy sources lock poisoned")
-                .retain(|source| source.id != id);
-            return Err(error);
+        match self.refresh_locked(false) {
+            Ok((_, change)) => {
+                drop(reload_guard);
+                self.invoke_change(change);
+                Ok(id)
+            }
+            Err(error) => {
+                let removed = self.take_source(id);
+                drop(reload_guard);
+                drop(removed);
+                Err(error)
+            }
         }
-        Ok(id)
     }
 
-    /// Unregisters a provider and reloads the remaining sources.
+    /// Unregisters a provider and transactionally removes its effective items.
+    /// Remaining provider-wide failures are skipped so a removed provider can
+    /// never survive as a ghost in the current snapshot.
     pub fn remove_provider(&self, id: ProviderId) -> Result<(), PolicyError> {
-        self.inner
+        let reload_guard = self
+            .inner
+            .reload
+            .lock()
+            .expect("policy reload lock poisoned");
+        let Some(removed) = self.take_source(id) else {
+            drop(reload_guard);
+            return Ok(());
+        };
+        let result = self.refresh_locked(true);
+        drop(reload_guard);
+        // Provider subscriptions may call back while being dropped. Never drop
+        // them while either the source-list or reload mutex is held.
+        drop(removed);
+        let (_, change) = result?;
+        self.invoke_change(change);
+        Ok(())
+    }
+
+    fn take_source(&self, id: ProviderId) -> Option<SourceEntry> {
+        let mut sources = self
+            .inner
             .sources
             .write()
-            .expect("policy sources lock poisoned")
-            .retain(|source| source.id != id);
-        self.reload().map(|_| ())
+            .expect("policy sources lock poisoned");
+        let index = sources.iter().position(|source| source.id == id)?;
+        Some(sources.remove(index))
     }
 
     /// Returns the current immutable snapshot without provider I/O.
@@ -269,6 +344,28 @@ impl PolicyEngine {
             .reload
             .lock()
             .expect("policy reload lock poisoned");
+        let result = self.refresh_locked(false);
+        drop(reload_guard);
+        match result {
+            Ok((snapshot, change)) => {
+                self.invoke_change(change);
+                Ok(snapshot)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn refresh_locked(
+        &self,
+        recover_provider_errors: bool,
+    ) -> Result<(Arc<Snapshot>, Option<PolicyChange>), PolicyError> {
+        if recover_provider_errors {
+            *self
+                .inner
+                .last_reload_error
+                .write()
+                .expect("policy error lock poisoned") = None;
+        }
         let mut sources: Vec<_> = self
             .inner
             .sources
@@ -279,17 +376,19 @@ impl PolicyEngine {
                 id: source.id,
                 name: source.name.clone(),
                 scope: source.scope.clone(),
+                precedence: source.precedence,
                 provider: source.provider.clone(),
             })
             .filter(|source| source.scope.contains(&self.inner.scope))
             .collect();
 
-        // Low precedence first. Stable IDs make same-scope last-registration
-        // wins independent of provider completion or map iteration order.
+        // Low precedence first. Scope precedence remains primary; explicit
+        // provider precedence and stable IDs resolve same-scope conflicts.
         sources.sort_by(|a, b| {
             b.scope
                 .kind()
                 .cmp(&a.scope.kind())
+                .then_with(|| a.precedence.cmp(&b.precedence))
                 .then_with(|| a.id.cmp(&b.id))
         });
 
@@ -306,7 +405,17 @@ impl PolicyEngine {
                             && source.scope.can_configure(definition)
                     })
                     .collect();
-                handles.push(thread_scope.spawn(move || source.provider.load(&definitions)));
+                handles.push(thread_scope.spawn(move || {
+                    let allowed: BTreeMap<_, _> = definitions
+                        .iter()
+                        .map(|definition| (definition.key, *definition))
+                        .collect();
+                    let values = source.provider.load(&definitions)?;
+                    if values.keys().any(|key| !allowed.contains_key(key)) {
+                        return Err(PolicyError::new(PolicyErrorKind::ProviderViolation));
+                    }
+                    Ok(values)
+                }));
             }
             handles
                 .into_iter()
@@ -320,15 +429,35 @@ impl PolicyEngine {
 
         let mut settings = BTreeMap::new();
         for (source, values) in sources.iter().zip(loaded) {
-            let values = values?;
+            let values = match values {
+                Ok(values) => values,
+                Err(error) if recover_provider_errors => {
+                    *self
+                        .inner
+                        .last_reload_error
+                        .write()
+                        .expect("policy error lock poisoned") = Some(error);
+                    continue;
+                }
+                Err(error) => {
+                    *self
+                        .inner
+                        .last_reload_error
+                        .write()
+                        .expect("policy error lock poisoned") = Some(error.clone());
+                    return Err(error);
+                }
+            };
             let origin = Origin {
                 name: source.name.clone(),
                 scope: source.scope.clone(),
             };
             for (key, raw) in values {
-                let Some(definition) = self.inner.definitions.get(&key) else {
-                    continue;
-                };
+                let definition = self
+                    .inner
+                    .definitions
+                    .get(&key)
+                    .expect("provider allowlist validated");
                 let item = match raw
                     .and_then(|raw| PolicyValue::convert(key, definition.value_type, raw))
                 {
@@ -348,6 +477,13 @@ impl PolicyEngine {
             }
         }
 
+        if !recover_provider_errors {
+            *self
+                .inner
+                .last_reload_error
+                .write()
+                .expect("policy error lock poisoned") = None;
+        }
         let old = self.snapshot();
         let new = Arc::new(Snapshot {
             scope: self.inner.scope.clone(),
@@ -359,28 +495,37 @@ impl PolicyEngine {
             .snapshot
             .write()
             .expect("policy snapshot lock poisoned") = new.clone();
-        // Callbacks may request another reload, so never invoke them while the
-        // reload serialization mutex is held.
-        drop(reload_guard);
+        let change = (old.settings != new.settings).then(|| PolicyChange {
+            old,
+            new: new.clone(),
+        });
+        Ok((new, change))
+    }
 
-        if old.settings != new.settings {
-            let callbacks: Vec<_> = self
-                .inner
-                .callbacks
-                .lock()
-                .expect("policy callbacks lock poisoned")
-                .values()
-                .cloned()
-                .collect();
-            let change = PolicyChange {
-                old,
-                new: new.clone(),
-            };
-            for callback in callbacks {
-                callback(change.clone());
-            }
+    fn invoke_change(&self, change: Option<PolicyChange>) {
+        let Some(change) = change else {
+            return;
+        };
+        let callbacks: Vec<_> = self
+            .inner
+            .callbacks
+            .lock()
+            .expect("policy callbacks lock poisoned")
+            .values()
+            .cloned()
+            .collect();
+        for callback in callbacks {
+            callback(change.clone());
         }
-        Ok(new)
+    }
+
+    /// Returns the last provider-wide reload diagnostic, if any.
+    pub fn last_reload_error(&self) -> Option<PolicyError> {
+        self.inner
+            .last_reload_error
+            .read()
+            .expect("policy error lock poisoned")
+            .clone()
     }
 
     /// Registers an effective-policy change callback.
@@ -406,7 +551,12 @@ impl PolicyEngine {
         values: BTreeMap<PolicyKey, RawValue>,
     ) -> Result<TestOverride, PolicyError> {
         let provider = Arc::new(crate::MemoryProvider::from_values(values));
-        let id = self.add_provider("test override", PolicyScope::Device, provider)?;
+        let id = self.add_provider_with_precedence(
+            "test override",
+            PolicyScope::Device,
+            ProviderPrecedence::TestOverride,
+            provider,
+        )?;
         Ok(TestOverride {
             engine: Arc::downgrade(&self.inner),
             id,
@@ -482,9 +632,18 @@ impl PolicyEngine {
         self.definition(key, ValueType::PreferenceOption)?;
         match self.snapshot().get(key) {
             Ok(PolicyValue::PreferenceOption(value)) => Ok(value),
-            Err(error) if error.kind == PolicyErrorKind::NotConfigured => Ok(default),
+            Err(error)
+                if matches!(
+                    error.kind,
+                    PolicyErrorKind::NotConfigured
+                        | PolicyErrorKind::Parse
+                        | PolicyErrorKind::TypeMismatch
+                ) =>
+            {
+                Ok(default)
+            }
             Err(error) => Err(error),
-            _ => Err(PolicyError::for_key(PolicyErrorKind::TypeMismatch, key)),
+            _ => Ok(default),
         }
     }
 

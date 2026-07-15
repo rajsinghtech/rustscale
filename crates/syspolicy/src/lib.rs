@@ -13,8 +13,8 @@ mod provider;
 mod value;
 
 pub use engine::{
-    CallbackRegistration, Origin, PolicyChange, PolicyEngine, PolicyItem, ProviderId, Snapshot,
-    TestOverride,
+    CallbackRegistration, Origin, PolicyChange, PolicyEngine, PolicyItem, ProviderId,
+    ProviderPrecedence, Snapshot, TestOverride,
 };
 pub use keys::{
     well_known_definitions, PolicyKey, PolicyScope, Scope, SettingDefinition, ValueType,
@@ -29,6 +29,7 @@ pub use value::{
 };
 
 use serde::{Deserialize, Serialize};
+#[cfg(not(windows))]
 use std::sync::Arc;
 
 /// Conventional Unix policy file path.
@@ -53,6 +54,10 @@ pub enum PolicyErrorKind {
     InvalidDefinition,
     /// A provider failed or panicked without a more specific error.
     Provider,
+    /// A provider returned a key outside its requested scope/key allowlist.
+    ProviderViolation,
+    /// Managed policy is unavailable on this platform and cannot be bypassed.
+    Unsupported,
 }
 
 /// A policy failure. It deliberately excludes raw values and filesystem paths
@@ -88,37 +93,43 @@ impl PolicyError {
 /// cfg-safe empty provider until a registry implementation can be added without
 /// introducing unsafe code or a new platform dependency.
 pub fn default_engine(scope: PolicyScope) -> Result<PolicyEngine, PolicyError> {
-    let engine = PolicyEngine::well_known(scope)?;
-    #[cfg(unix)]
-    {
-        engine.add_provider(
-            "system policy file",
-            PolicyScope::Device,
-            Arc::new(JsonFileProvider::optional(DEFAULT_POLICY_PATH)),
-        )?;
-        engine.add_provider(
-            "environment",
-            PolicyScope::Device,
-            Arc::new(EnvironmentProvider::new()),
-        )?;
-    }
     #[cfg(windows)]
     {
-        engine.add_provider(
-            "windows policy (unsupported)",
-            PolicyScope::Device,
-            Arc::new(StubPolicyProvider::new()),
-        )?;
+        // Until a safe registry backend is available, do not start with an
+        // empty policy and silently permit settings that HKLM/HKCU might deny.
+        let _ = scope;
+        Err(PolicyError::new(PolicyErrorKind::Unsupported))
     }
-    #[cfg(not(any(unix, windows)))]
+
+    #[cfg(not(windows))]
     {
-        engine.add_provider(
-            "platform policy (unsupported)",
-            PolicyScope::Device,
-            Arc::new(StubPolicyProvider::new()),
-        )?;
+        let engine = PolicyEngine::well_known(scope)?;
+        #[cfg(unix)]
+        {
+            engine.add_provider_with_precedence(
+                "system policy file",
+                PolicyScope::Device,
+                ProviderPrecedence::Managed,
+                Arc::new(JsonFileProvider::optional(DEFAULT_POLICY_PATH)),
+            )?;
+            engine.add_provider_with_precedence(
+                "debug environment",
+                PolicyScope::Device,
+                ProviderPrecedence::Debug,
+                Arc::new(EnvironmentProvider::new()),
+            )?;
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            engine.add_provider_with_precedence(
+                "platform policy (unsupported)",
+                PolicyScope::Device,
+                ProviderPrecedence::Platform,
+                Arc::new(StubPolicyProvider::new()),
+            )?;
+        }
+        Ok(engine)
     }
-    Ok(engine)
 }
 
 /// Backwards-compatible names for the original single-store skeleton.

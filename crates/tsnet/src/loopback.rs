@@ -436,7 +436,7 @@ impl Server {
         _localapi_cred: &str,
     ) -> Arc<LocalApiState> {
         let inner = self.inner.as_ref().expect("server must be up");
-        Arc::new(LocalApiState {
+        let state = Arc::new(LocalApiState {
             peers: inner.peers.clone(),
             routecheck: Some(inner.routecheck.clone()),
             user_profiles: inner.user_profiles.clone(),
@@ -515,7 +515,11 @@ impl Server {
             config_path: None,
             client_updater: inner.client_updater.clone(),
             audit_logger: Some(inner.audit_logger.clone()),
-        })
+            preference_policy: self.config.preference_policy.clone(),
+            policy_subscription: std::sync::Mutex::new(None),
+        });
+        localapi::activate_preference_policy(&state);
+        state
     }
 }
 

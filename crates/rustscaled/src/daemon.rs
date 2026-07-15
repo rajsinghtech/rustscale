@@ -1,10 +1,13 @@
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use rustscale_conffile::Config;
 use rustscale_logpolicy::{Policy, DEFAULT_COLLECTION};
 use rustscale_logtail::{LogTail, LogtailLogger};
 use rustscale_tsnet::localapi::DaemonCommand;
-use rustscale_tsnet::{Server, TunModeConfig};
+use rustscale_tsnet::{PreferencePolicy, PreferencePolicySubscription, Server, TunModeConfig};
 
 #[cfg(target_os = "macos")]
 const DEFAULT_STATE_DIR: &str = "/var/db/rustscale";
@@ -72,16 +75,15 @@ pub async fn run(
     // Resolve auth key: TS_AUTHKEY env, then config file.
     let auth_key = auth_key.or_else(|| config.as_ref().and_then(|c| c.parsed.AuthKey.clone()));
 
+    let system_policy = Arc::new(InstallUpdatesPolicy::new()?);
+
     // Apply config preferences before constructing log policy so a persisted
-    // NoLogsNoSupport preference takes effect from the first upload task.
+    // NoLogsNoSupport preference takes effect from the first upload task. Then
+    // enforce managed preferences over the resulting candidate.
     if let Some(ref cfg) = config {
         apply_config_prefs_to_disk(cfg, &state_dir)?;
     }
-    // Prove the syspolicy path on one existing preference without changing
-    // unrelated daemon configuration: InstallUpdates can force AutoUpdate at
-    // startup. Invalid or unreadable managed policy is not silently treated as
-    // absent.
-    apply_system_policy_prefs_to_disk(&state_dir)?;
+    apply_system_policy_prefs_to_disk(&state_dir, &system_policy)?;
 
     // Go creates logpolicy before its local backend. Keep that order here so
     // the private ID used by upload is the same persisted ID tsnet exposes as
@@ -111,6 +113,7 @@ pub async fn run(
             config_path,
             config,
             logtail,
+            system_policy,
         )
         .await
     } else {
@@ -123,6 +126,7 @@ pub async fn run(
             config_path,
             config,
             logtail,
+            system_policy,
         )
         .await
     };
@@ -144,13 +148,15 @@ async fn run_with_auth_key(
     config_path: Option<PathBuf>,
     config: Option<Config>,
     logtail: LogTail,
+    system_policy: Arc<InstallUpdatesPolicy>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut builder = Server::builder()
         .hostname(hostname)
         .auth_key(auth_key)
         .state_dir(state_dir)
         .localapi_path(socket_path)
-        .logtail(logtail);
+        .logtail(logtail)
+        .preference_policy(system_policy);
 
     // Apply config-file fields to the builder.
     if let Some(ref cfg) = config {
@@ -221,12 +227,14 @@ async fn run_interactive(
     config_path: Option<PathBuf>,
     config: Option<Config>,
     logtail: LogTail,
+    system_policy: Arc<InstallUpdatesPolicy>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut builder = Server::builder()
         .hostname(hostname)
         .state_dir(state_dir)
         .localapi_path(socket_path)
-        .logtail(logtail);
+        .logtail(logtail)
+        .preference_policy(system_policy);
 
     // Apply config-file fields to the builder.
     if let Some(ref cfg) = config {
@@ -392,32 +400,70 @@ fn apply_config_prefs_to_disk(
     Ok(())
 }
 
-fn apply_system_policy_prefs_to_disk(state_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let policy = rustscale_syspolicy::default_engine(rustscale_syspolicy::PolicyScope::Device)?;
+struct InstallUpdatesPolicy {
+    engine: rustscale_syspolicy::PolicyEngine,
+}
+
+impl InstallUpdatesPolicy {
+    fn new() -> Result<Self, rustscale_syspolicy::PolicyError> {
+        Ok(Self {
+            engine: rustscale_syspolicy::default_engine(rustscale_syspolicy::PolicyScope::Device)?,
+        })
+    }
+}
+
+struct InstallUpdatesSubscription {
+    _registration: rustscale_syspolicy::CallbackRegistration,
+}
+
+impl PreferencePolicySubscription for InstallUpdatesSubscription {}
+
+impl PreferencePolicy for InstallUpdatesPolicy {
+    fn reconcile(&self, prefs: &mut rustscale_ipn::Prefs) -> Result<bool, String> {
+        use rustscale_syspolicy::{PolicyKey, PreferenceOption};
+
+        let option = self
+            .engine
+            .get_preference_option(PolicyKey::ApplyUpdates, PreferenceOption::UserDecides)
+            .map_err(|error| error.to_string())?;
+        if option == PreferenceOption::UserDecides {
+            return Ok(false);
+        }
+        let desired = option.should_enable(prefs.AutoUpdate.unwrap_or(false));
+        if prefs.AutoUpdate == Some(desired) {
+            return Ok(false);
+        }
+        prefs.AutoUpdate = Some(desired);
+        Ok(true)
+    }
+
+    fn subscribe(
+        &self,
+        callback: Arc<dyn Fn() + Send + Sync>,
+    ) -> Box<dyn PreferencePolicySubscription> {
+        let registration = self.engine.register_change_callback(move |change| {
+            if change.has_changed(rustscale_syspolicy::PolicyKey::ApplyUpdates) {
+                callback();
+            }
+        });
+        Box::new(InstallUpdatesSubscription {
+            _registration: registration,
+        })
+    }
+}
+
+fn apply_system_policy_prefs_to_disk(
+    state_dir: &Path,
+    policy: &InstallUpdatesPolicy,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut prefs = rustscale_ipn::Prefs::load(state_dir)?;
-    if apply_auto_update_policy(&mut prefs, &policy)? {
+    if policy
+        .reconcile(&mut prefs)
+        .map_err(std::io::Error::other)?
+    {
         prefs.save(state_dir)?;
     }
     Ok(())
-}
-
-fn apply_auto_update_policy(
-    prefs: &mut rustscale_ipn::Prefs,
-    policy: &rustscale_syspolicy::PolicyEngine,
-) -> Result<bool, rustscale_syspolicy::PolicyError> {
-    use rustscale_syspolicy::{PolicyKey, PreferenceOption};
-
-    let option =
-        policy.get_preference_option(PolicyKey::ApplyUpdates, PreferenceOption::UserDecides)?;
-    if option == PreferenceOption::UserDecides {
-        return Ok(false);
-    }
-    let desired = option.should_enable(prefs.AutoUpdate.unwrap_or(false));
-    if prefs.AutoUpdate == Some(desired) {
-        return Ok(false);
-    }
-    prefs.AutoUpdate = Some(desired);
-    Ok(true)
 }
 
 fn print_status(server: &Server, socket_path: &Path) {
@@ -541,18 +587,27 @@ async fn wait_for_shutdown_signal(_config_path: Option<&PathBuf>) {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, sync::Arc};
+    use std::{
+        collections::BTreeMap,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+        thread,
+        time::{Duration, Instant},
+    };
 
     use rustscale_syspolicy::{
         MemoryProvider, PolicyEngine, PolicyErrorKind, PolicyKey, PolicyScope, RawValue,
     };
+    use rustscale_tsnet::PreferencePolicy;
 
-    use super::apply_auto_update_policy;
+    use super::InstallUpdatesPolicy;
 
     #[test]
     fn install_updates_policy_forces_existing_preference() {
-        let policy = PolicyEngine::well_known(PolicyScope::Device).unwrap();
-        policy
+        let engine = PolicyEngine::well_known(PolicyScope::Device).unwrap();
+        engine
             .add_provider(
                 "test",
                 PolicyScope::Device,
@@ -562,18 +617,19 @@ mod tests {
                 )]))),
             )
             .unwrap();
+        let policy = InstallUpdatesPolicy { engine };
         let mut prefs = rustscale_ipn::Prefs {
             AutoUpdate: Some(false),
             ..Default::default()
         };
-        assert!(apply_auto_update_policy(&mut prefs, &policy).unwrap());
+        assert!(policy.reconcile(&mut prefs).unwrap());
         assert_eq!(prefs.AutoUpdate, Some(true));
     }
 
     #[test]
-    fn invalid_install_updates_policy_is_not_defaulted() {
-        let policy = PolicyEngine::well_known(PolicyScope::Device).unwrap();
-        policy
+    fn invalid_install_updates_uses_upstream_default_but_keeps_diagnostic() {
+        let engine = PolicyEngine::well_known(PolicyScope::Device).unwrap();
+        engine
             .add_provider(
                 "test",
                 PolicyScope::Device,
@@ -583,9 +639,49 @@ mod tests {
                 )]))),
             )
             .unwrap();
+        let policy = InstallUpdatesPolicy { engine };
         let mut prefs = rustscale_ipn::Prefs::default();
-        let error = apply_auto_update_policy(&mut prefs, &policy).unwrap_err();
-        assert_eq!(error.kind, PolicyErrorKind::Parse);
+        assert!(!policy.reconcile(&mut prefs).unwrap());
         assert_eq!(prefs.AutoUpdate, None);
+        assert_eq!(
+            policy
+                .engine
+                .snapshot()
+                .item(PolicyKey::ApplyUpdates)
+                .unwrap()
+                .error
+                .as_ref()
+                .unwrap()
+                .kind,
+            PolicyErrorKind::Parse
+        );
+    }
+
+    #[test]
+    fn provider_change_notifies_live_reconciler_asynchronously() {
+        let engine = PolicyEngine::well_known(PolicyScope::Device).unwrap();
+        let provider = Arc::new(MemoryProvider::new());
+        engine
+            .add_provider("test", PolicyScope::Device, provider.clone())
+            .unwrap();
+        let policy = InstallUpdatesPolicy { engine };
+        let notified = Arc::new(AtomicBool::new(false));
+        let notified_by_callback = notified.clone();
+        let _subscription = policy.subscribe(Arc::new(move || {
+            notified_by_callback.store(true, Ordering::SeqCst);
+        }));
+
+        provider.set(PolicyKey::ApplyUpdates, RawValue::String("never".into()));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !notified.load(Ordering::SeqCst) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(notified.load(Ordering::SeqCst));
+        let mut prefs = rustscale_ipn::Prefs {
+            AutoUpdate: Some(true),
+            ..Default::default()
+        };
+        assert!(policy.reconcile(&mut prefs).unwrap());
+        assert_eq!(prefs.AutoUpdate, Some(false));
     }
 }

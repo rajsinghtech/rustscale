@@ -2,10 +2,11 @@ use std::{
     collections::BTreeMap,
     fs,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Barrier, Mutex,
     },
-    time::Duration,
+    thread,
+    time::{Duration, Instant},
 };
 
 use tempfile::NamedTempFile;
@@ -14,6 +15,107 @@ use crate::*;
 
 fn memory(values: impl IntoIterator<Item = (PolicyKey, RawValue)>) -> Arc<MemoryProvider> {
     Arc::new(MemoryProvider::from_values(values.into_iter().collect()))
+}
+
+fn wait_until(mut predicate: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !predicate() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(predicate(), "condition did not become true before timeout");
+}
+
+struct ToggleProvider {
+    fail: AtomicBool,
+    key: PolicyKey,
+    value: RawValue,
+}
+
+impl ToggleProvider {
+    fn new(key: PolicyKey, value: RawValue) -> Self {
+        Self {
+            fail: AtomicBool::new(false),
+            key,
+            value,
+        }
+    }
+}
+
+impl PolicyProvider for ToggleProvider {
+    fn load(&self, _definitions: &[SettingDefinition]) -> Result<ProviderValues, PolicyError> {
+        if self.fail.load(Ordering::SeqCst) {
+            return Err(PolicyError::new(PolicyErrorKind::Provider));
+        }
+        Ok(BTreeMap::from([(self.key, Ok(self.value.clone()))]))
+    }
+}
+
+struct StoredCallbackProvider {
+    callback: Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>,
+    loads: AtomicUsize,
+}
+
+impl StoredCallbackProvider {
+    fn new() -> Self {
+        Self {
+            callback: Arc::new(Mutex::new(None)),
+            loads: AtomicUsize::new(0),
+        }
+    }
+
+    fn notify_many(&self, count: usize) {
+        let callback = self.callback.lock().unwrap().clone().unwrap();
+        for _ in 0..count {
+            callback();
+        }
+    }
+}
+
+struct StoredCallbackSubscription {
+    callback: Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>,
+    notify_on_drop: bool,
+}
+
+impl ProviderSubscription for StoredCallbackSubscription {}
+
+impl Drop for StoredCallbackSubscription {
+    fn drop(&mut self) {
+        let callback = self.callback.lock().unwrap().take();
+        if self.notify_on_drop {
+            if let Some(callback) = callback {
+                callback();
+            }
+        }
+    }
+}
+
+impl PolicyProvider for StoredCallbackProvider {
+    fn load(&self, definitions: &[SettingDefinition]) -> Result<ProviderValues, PolicyError> {
+        self.loads.fetch_add(1, Ordering::SeqCst);
+        thread::sleep(Duration::from_millis(20));
+        if definitions
+            .iter()
+            .any(|definition| definition.key == PolicyKey::Tailnet)
+        {
+            Ok(BTreeMap::from([(
+                PolicyKey::Tailnet,
+                Ok(RawValue::String("stored".into())),
+            )]))
+        } else {
+            Ok(BTreeMap::new())
+        }
+    }
+
+    fn subscribe(
+        &self,
+        callback: Arc<dyn Fn() + Send + Sync>,
+    ) -> Result<Option<Box<dyn ProviderSubscription>>, PolicyError> {
+        *self.callback.lock().unwrap() = Some(callback);
+        Ok(Some(Box::new(StoredCallbackSubscription {
+            callback: self.callback.clone(),
+            notify_on_drop: true,
+        })))
+    }
 }
 
 #[test]
@@ -281,9 +383,17 @@ fn strict_conversion_and_default_semantics() {
         .add_provider("test", PolicyScope::Device, provider)
         .unwrap();
     assert_eq!(
+        engine.get_preference_option(PolicyKey::ApplyUpdates, PreferenceOption::Always),
+        Ok(PreferenceOption::Always)
+    );
+    assert_eq!(
         engine
-            .get_preference_option(PolicyKey::ApplyUpdates, PreferenceOption::Always)
-            .unwrap_err()
+            .snapshot()
+            .item(PolicyKey::ApplyUpdates)
+            .unwrap()
+            .error
+            .as_ref()
+            .unwrap()
             .kind,
         PolicyErrorKind::Parse
     );
@@ -321,8 +431,8 @@ fn memory_changes_publish_snapshots_and_callbacks() {
         changes_for_callback.lock().unwrap().push(change);
     });
     provider.set(PolicyKey::Tailnet, RawValue::String("new".into()));
+    wait_until(|| changes.lock().unwrap().len() == 1);
     let changes = changes.lock().unwrap();
-    assert_eq!(changes.len(), 1);
     assert!(changes[0].has_changed(PolicyKey::Tailnet));
     assert_eq!(engine.get_string(PolicyKey::Tailnet, ""), Ok("new".into()));
     drop(changes);
@@ -330,6 +440,147 @@ fn memory_changes_publish_snapshots_and_callbacks() {
 
     provider.notify();
     assert_eq!(engine.get_string(PolicyKey::Tailnet, ""), Ok("new".into()));
+}
+
+#[test]
+fn managed_provider_beats_later_debug_environment_provider() {
+    let engine = PolicyEngine::well_known(PolicyScope::Device).unwrap();
+    engine
+        .add_provider_with_precedence(
+            "managed",
+            PolicyScope::Device,
+            ProviderPrecedence::Managed,
+            memory([(PolicyKey::Tailnet, RawValue::String("managed".into()))]),
+        )
+        .unwrap();
+    engine
+        .add_provider_with_precedence(
+            "debug",
+            PolicyScope::Device,
+            ProviderPrecedence::Debug,
+            memory([(PolicyKey::Tailnet, RawValue::String("debug".into()))]),
+        )
+        .unwrap();
+    assert_eq!(
+        engine.get_string(PolicyKey::Tailnet, ""),
+        Ok("managed".into())
+    );
+    assert_eq!(
+        engine
+            .snapshot()
+            .item(PolicyKey::Tailnet)
+            .unwrap()
+            .origin
+            .name,
+        "managed"
+    );
+}
+
+#[test]
+fn provider_cannot_return_key_outside_requested_scope_allowlist() {
+    let engine = PolicyEngine::well_known(PolicyScope::User {
+        user_id: None,
+        profile_id: None,
+    })
+    .unwrap();
+    let malicious = Arc::new(ToggleProvider::new(
+        PolicyKey::Tailnet,
+        RawValue::String("bypass".into()),
+    ));
+    let error = engine
+        .add_provider(
+            "user provider",
+            PolicyScope::User {
+                user_id: None,
+                profile_id: None,
+            },
+            malicious,
+        )
+        .unwrap_err();
+    assert_eq!(error.kind, PolicyErrorKind::ProviderViolation);
+    assert!(engine.snapshot().item(PolicyKey::Tailnet).is_none());
+}
+
+#[test]
+fn removal_recovers_from_other_provider_error_without_ghost_items() {
+    let engine = PolicyEngine::well_known(PolicyScope::Device).unwrap();
+    let base = engine
+        .add_provider(
+            "base",
+            PolicyScope::Device,
+            memory([(PolicyKey::Tailnet, RawValue::String("base".into()))]),
+        )
+        .unwrap();
+    let flaky = Arc::new(ToggleProvider::new(
+        PolicyKey::LogTarget,
+        RawValue::String("log.example".into()),
+    ));
+    engine
+        .add_provider("flaky", PolicyScope::Device, flaky.clone())
+        .unwrap();
+    flaky.fail.store(true, Ordering::SeqCst);
+
+    engine.remove_provider(base).unwrap();
+    assert!(engine.snapshot().item(PolicyKey::Tailnet).is_none());
+    assert!(engine.snapshot().item(PolicyKey::LogTarget).is_none());
+    assert_eq!(
+        engine.last_reload_error().unwrap().kind,
+        PolicyErrorKind::Provider
+    );
+}
+
+#[test]
+fn override_drop_cannot_leak_when_remaining_provider_fails() {
+    let engine = PolicyEngine::well_known(PolicyScope::Device).unwrap();
+    let flaky = Arc::new(ToggleProvider::new(
+        PolicyKey::Tailnet,
+        RawValue::String("base".into()),
+    ));
+    engine
+        .add_provider("flaky", PolicyScope::Device, flaky.clone())
+        .unwrap();
+    let policy_override = engine
+        .override_for_test(BTreeMap::from([(
+            PolicyKey::Tailnet,
+            RawValue::String("override".into()),
+        )]))
+        .unwrap();
+    flaky.fail.store(true, Ordering::SeqCst);
+    drop(policy_override);
+    assert!(engine.snapshot().item(PolicyKey::Tailnet).is_none());
+}
+
+#[test]
+fn notifications_are_nonblocking_coalesced_and_subscription_drop_is_reentrant_safe() {
+    let engine = PolicyEngine::well_known(PolicyScope::Device).unwrap();
+    let provider = Arc::new(StoredCallbackProvider::new());
+    let id = engine
+        .add_provider("notifying", PolicyScope::Device, provider.clone())
+        .unwrap();
+    assert_eq!(provider.loads.load(Ordering::SeqCst), 1);
+
+    provider.notify_many(100);
+    wait_until(|| engine.snapshot().generation() >= 2);
+    thread::sleep(Duration::from_millis(80));
+    assert!(
+        provider.loads.load(Ordering::SeqCst) < 10,
+        "notifications were not coalesced"
+    );
+
+    // Dropping the subscription invokes its callback. remove_provider must
+    // drop it after releasing source/reload locks, so this cannot deadlock or
+    // resurrect the removed setting.
+    engine.remove_provider(id).unwrap();
+    assert!(engine.snapshot().item(PolicyKey::Tailnet).is_none());
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_default_policy_fails_closed_without_registry_backend() {
+    assert_eq!(
+        default_engine(PolicyScope::Device).err().unwrap().kind,
+        PolicyErrorKind::Unsupported
+    );
 }
 
 #[test]

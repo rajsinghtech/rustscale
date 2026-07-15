@@ -18,6 +18,101 @@ pub(crate) struct KeyRotationCtx {
     pub shields_up: bool,
 }
 
+struct MapTaskShutdown {
+    stopping: bool,
+    abort: Option<tokio::task::AbortHandle>,
+}
+
+/// Profile-owned join state for the current control map stream.
+///
+/// Key rotation replaces this task dynamically, so it cannot live in the
+/// fixed outer-task vector. Every generation remains here until it has been
+/// joined, including while a rebind or shutdown future is cancelled.
+pub(crate) struct MapSessionTasks {
+    task: Mutex<Option<JoinHandle<()>>>,
+    shutdown: std::sync::Mutex<MapTaskShutdown>,
+}
+
+impl MapSessionTasks {
+    pub(crate) fn new(task: JoinHandle<()>) -> Arc<Self> {
+        let abort = task.abort_handle();
+        Arc::new(Self {
+            task: Mutex::new(Some(task)),
+            shutdown: std::sync::Mutex::new(MapTaskShutdown {
+                stopping: false,
+                abort: Some(abort),
+            }),
+        })
+    }
+
+    /// Cancel and join the previous generation before publishing a replacement.
+    /// The replacement is spawned only after join completion, while holding the
+    /// shutdown lock that prevents a task from appearing behind teardown.
+    pub(crate) async fn rebind<F>(&self, replacement: F) -> bool
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let mut task = self.task.lock().await;
+        if let Some(previous) = task.as_mut() {
+            previous.abort();
+            let _ = (&mut *previous).await;
+            task.take();
+        }
+
+        let mut shutdown = self
+            .shutdown
+            .lock()
+            .expect("map task shutdown lock poisoned");
+        if shutdown.stopping {
+            return false;
+        }
+        let replacement = tokio::spawn(replacement);
+        shutdown.abort = Some(replacement.abort_handle());
+        *task = Some(replacement);
+        true
+    }
+
+    /// Revoke the current generation without awaiting it.
+    pub(crate) fn begin_shutdown(&self) {
+        let mut shutdown = self
+            .shutdown
+            .lock()
+            .expect("map task shutdown lock poisoned");
+        shutdown.stopping = true;
+        if let Some(abort) = shutdown.abort.as_ref() {
+            abort.abort();
+        }
+    }
+
+    /// Join the current generation while retaining it across cancellation.
+    pub(crate) async fn join(&self) {
+        let mut task = self.task.lock().await;
+        if let Some(current) = task.as_mut() {
+            let _ = (&mut *current).await;
+            task.take();
+        }
+        self.shutdown
+            .lock()
+            .expect("map task shutdown lock poisoned")
+            .abort = None;
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn is_empty(&self) -> bool {
+        self.task.lock().await.is_none()
+    }
+}
+
+impl Drop for MapSessionTasks {
+    fn drop(&mut self) {
+        if let Ok(shutdown) = self.shutdown.lock() {
+            if let Some(abort) = shutdown.abort.as_ref() {
+                abort.abort();
+            }
+        }
+    }
+}
+
 /// The only exit-node preference that a map update may apply. Once it
 /// resolves, or an explicit API/config selection supersedes it, route-table
 /// rebuilds preserve their existing selection without consulting prefs again.
@@ -149,6 +244,7 @@ pub(crate) fn spawn_map_update_task(
     ipn_backend: Arc<IpnBackend>,
     key_rotation_ctx: Option<KeyRotationCtx>,
     map_session: Arc<MapSessionState>,
+    map_tasks: Arc<MapSessionTasks>,
     c2n_router: Arc<C2nRouter>,
     suggested_exit_node: Arc<RwLock<String>>,
     client_updater: Arc<std::sync::Mutex<rustscale_clientupdate::ClientUpdater>>,
@@ -364,7 +460,7 @@ pub(crate) fn spawn_map_update_task(
                                     };
                                     let ss = map_session.clone();
                                     let router = c2n_router.clone();
-                                    tokio::spawn(async move {
+                                    if !Box::pin(map_tasks.rebind(async move {
                                         cc_new
                                             .stream_map_loop_with_c2n(
                                                 &new_map_req,
@@ -373,7 +469,11 @@ pub(crate) fn spawn_map_update_task(
                                                 router,
                                             )
                                             .await;
-                                    });
+                                    }))
+                                    .await
+                                    {
+                                        break;
+                                    }
                                     map_rx = new_rx;
                                     log::info!(
                                         "tsnet: key rotation complete, map poll restarted with new node key"
@@ -934,6 +1034,39 @@ mod tests {
     use rustscale_ipn::Prefs;
     use rustscale_key::{DiscoPrivate, NodePrivate};
     use rustscale_tailcfg::PeerChange;
+
+    #[tokio::test]
+    async fn cancellation_inside_rotated_map_rebind_retains_join_owner() {
+        let tasks = MapSessionTasks::new(tokio::spawn(std::future::pending()));
+
+        // Cancel a rebind while it is awaiting the aborted prior generation.
+        // The old JoinHandle must remain in the profile owner for the retry.
+        {
+            let mut rebind = Box::pin(tasks.rebind(std::future::pending()));
+            tokio::select! {
+                biased;
+                rebound = &mut rebind => panic!("rebind completed before cancellation: {rebound}"),
+                () = std::future::ready(()) => {}
+            }
+        }
+        assert!(!tasks.is_empty().await);
+
+        // A retry joins that same generation before registering the new one.
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        assert!(
+            tasks
+                .rebind(async move {
+                    let _ = started_tx.send(());
+                    std::future::pending::<()>().await;
+                })
+                .await
+        );
+        started_rx.await.unwrap();
+
+        tasks.begin_shutdown();
+        tasks.join().await;
+        assert!(tasks.is_empty().await);
+    }
 
     struct RecordingRouter {
         seen: Arc<std::sync::Mutex<Vec<rustscale_router::RouterConfig>>>,

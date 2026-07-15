@@ -192,17 +192,21 @@ impl Logger {
     /// Mirrors Go's `Logger.Shutdown`.
     pub async fn stop(&self) -> Result<(), NetlogError> {
         let mut handle_guard = self.handle.lock().await;
-        let join = handle_guard.take().ok_or(NetlogError::NotRunning)?;
+        let join = handle_guard.as_mut().ok_or(NetlogError::NotRunning)?;
         // Signal the background task to do a final flush and exit.
         // `notify_one` stores a permit so the shutdown is not lost if
         // the task hasn't yet entered the `select!` loop.
         self.inner.shutdown.notify_one();
-        // Wait for it to finish.
-        let _ = join.await;
-        // Purge state.
+        // Keep the handle in shared state while awaiting it. If this stop
+        // future is cancelled, a later call can await the same worker rather
+        // than losing join ownership and detaching final-flush cleanup.
+        let _ = (&mut *join).await;
+        // Purge state before releasing the handle lock so a concurrent start
+        // cannot install a new source that this stop would then erase.
         let mut state = self.inner.state.lock().await;
         state.source = None;
         state.logtail = None;
+        handle_guard.take();
         Ok(())
     }
 

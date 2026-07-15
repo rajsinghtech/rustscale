@@ -109,6 +109,7 @@ pub(crate) use link_monitor::{
 };
 pub(crate) use map_update::{
     exit_node_pref, set_exit_node_pref, spawn_map_update_task, ExitNodeSelection, KeyRotationCtx,
+    MapSessionTasks,
 };
 #[cfg(test)]
 pub(crate) use netstack_pump::collect_tun_inbound;
@@ -793,6 +794,9 @@ pub(crate) struct RunningState {
     pub(crate) router: Option<SharedRouter>,
     pub(crate) cancel: Arc<CancelToken>,
     pub(crate) tasks: Mutex<Vec<JoinHandle<()>>>,
+    /// Dynamically rebound map stream task, retained separately so every key
+    /// rotation generation is cancelled and joined under profile ownership.
+    pub(crate) map_tasks: Arc<MapSessionTasks>,
     /// Synchronously usable cancellation handles for every task in `tasks`.
     /// Teardown aborts these before its first await, while `tasks` retains the
     /// join ownership needed for cancellation-safe cleanup retries.
@@ -945,7 +949,7 @@ pub(crate) struct Bootstrap {
     pub(crate) route_table: Arc<RwLock<RouteTable>>,
     pub(crate) cancel: Arc<CancelToken>,
     pub(crate) map_rx: mpsc::Receiver<Result<MapResponse, StreamMapError>>,
-    pub(crate) map_task: JoinHandle<()>,
+    pub(crate) map_tasks: Arc<MapSessionTasks>,
     pub(crate) node_key: NodePrivate,
     pub(crate) filter: Arc<std::sync::Mutex<Filter>>,
     /// Last successfully received named ACL fragments, including the initial

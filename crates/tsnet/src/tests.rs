@@ -174,7 +174,11 @@ async fn logout_cancellation_retains_every_await_owner_and_allows_clean_rebind()
             let inner = server.inner.as_ref().unwrap();
             assert!(
                 inner.tasks.lock().await.is_empty(),
-                "{point:?} retained an unjoined map/TKA/outer task"
+                "{point:?} retained an unjoined TKA/outer task"
+            );
+            assert!(
+                inner.map_tasks.is_empty().await,
+                "{point:?} retained an unjoined map session"
             );
             assert!(
                 inner

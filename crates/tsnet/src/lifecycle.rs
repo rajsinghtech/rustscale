@@ -259,6 +259,7 @@ impl Server {
             b.ipn_backend.clone(),
             Some(key_rotation_ctx),
             b.map_session.clone(),
+            b.map_tasks.clone(),
             b.c2n_router.clone(),
             suggested_exit_node.clone(),
             client_updater.clone(),
@@ -274,7 +275,7 @@ impl Server {
         // hostnames, handles split-DNS routes, ExtraRecords, .onion NXDOMAIN,
         // 4via6 synthesis, and forwards the rest upstream (with TCP fallback
         // and DoH support).
-        let mut tasks = vec![b.map_task, pump, map_update, periodic_ep];
+        let mut tasks = vec![pump, map_update, periodic_ep];
         let dns_cfg_snapshot = b.dns_config.read().await.clone();
         let forwarder = Arc::new(Forwarder::from_dns_config(dns_cfg_snapshot.as_ref()));
         let responder = DnsResponder::with_forwarder(
@@ -594,6 +595,7 @@ impl Server {
             router: None,
             cancel: b.cancel,
             tasks: Mutex::new(tasks),
+            map_tasks: b.map_tasks,
             task_aborts: std::sync::Mutex::new(task_aborts),
             packet_drops: b.packet_drops,
             capture,
@@ -821,6 +823,7 @@ impl Server {
             b.ipn_backend.clone(),
             Some(key_rotation_ctx),
             b.map_session.clone(),
+            b.map_tasks.clone(),
             b.c2n_router.clone(),
             suggested_exit_node.clone(),
             client_updater.clone(),
@@ -972,7 +975,6 @@ impl Server {
         );
 
         let tasks = vec![
-            b.map_task,
             pump,
             map_update,
             periodic_ep,
@@ -1158,6 +1160,7 @@ impl Server {
             router,
             cancel: b.cancel,
             tasks: Mutex::new(tasks),
+            map_tasks: b.map_tasks,
             task_aborts: std::sync::Mutex::new(task_aborts),
             packet_drops: b.packet_drops,
             capture,
@@ -2312,14 +2315,14 @@ impl Server {
             c2n::register_c2n_handlers(&mut r, c2n_backend.clone());
             Arc::new(r)
         };
-        let map_task = tokio::spawn({
+        let map_tasks = MapSessionTasks::new(tokio::spawn({
             let ss = map_session.clone();
             let router = c2n_router.clone();
             async move {
                 cc2.stream_map_loop_with_c2n(&map_req, map_tx, Some(ss), router)
                     .await;
             }
-        });
+        }));
 
         // Control knobs created earlier (before magicsock construction).
 
@@ -2337,7 +2340,7 @@ impl Server {
             route_table,
             cancel,
             map_rx,
-            map_task,
+            map_tasks,
             node_key: state.node_key.clone(),
             filter,
             named_filters,
@@ -2408,6 +2411,7 @@ impl Server {
             {
                 abort.abort();
             }
+            inner.map_tasks.begin_shutdown();
         }
     }
 
@@ -2418,6 +2422,8 @@ impl Server {
                 let _ = (&mut *task).await;
                 tasks.swap_remove(0);
             }
+            drop(tasks);
+            inner.map_tasks.join().await;
         })
         .await;
         if join_result.is_err() {

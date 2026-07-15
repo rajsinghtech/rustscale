@@ -205,7 +205,7 @@ impl Client {
     }
 
     fn gateway_and_self_ip(&self) -> Option<GatewayInfo> {
-        let gi = (self.inner.gateway_lookup.read().expect("gw lock"))()?;
+        let gi = (self.inner.gateway_lookup.read().expect("gw lock"))();
         let changed = {
             let mut state = self.inner.state.lock().expect("state lock");
             deephash_update(&mut state.gw_hash, &gi)
@@ -213,13 +213,14 @@ impl Client {
         if changed {
             self.invalidate_mappings(true);
         }
-        Some(gi)
+        gi
     }
 
     fn invalidate_mappings(&self, release: bool) {
         let old_mapping = {
             let mut state = self.inner.state.lock().expect("state lock");
             let old = state.mapping.take();
+            state.last_probe = None;
             state.pmp_pub_ip = None;
             state.pmp_pub_ip_time = None;
             state.pcp_saw_time = None;
@@ -286,6 +287,9 @@ impl Client {
 
     /// Whether we have a valid (non-expired) cached mapping.
     pub fn have_mapping(&self) -> bool {
+        if self.gateway_and_self_ip().is_none() {
+            return false;
+        }
         let state = self.inner.state.lock().expect("state lock");
         state.mapping.as_ref().is_some_and(Mapping::is_valid)
     }
@@ -296,6 +300,13 @@ impl Client {
     ///
     /// Mirrors Go's `GetCachedMappingOrStartCreatingOne`.
     pub fn get_cached_mapping_or_start_creating_one(&self) -> (Option<SocketAddr>, bool) {
+        // Validate the gateway before returning an external address. This is
+        // the path magicsock uses while gathering advertised endpoints, so a
+        // lost default route must hide and invalidate the old mapping at once.
+        if self.gateway_and_self_ip().is_none() {
+            return (None, false);
+        }
+
         let cached = {
             let state = self.inner.state.lock().expect("state lock");
             state
@@ -428,6 +439,12 @@ impl Client {
             return Err(crate::PortMapError::Disabled);
         }
 
+        // Check the gateway before the cache fast path. Otherwise a mapping
+        // from a disappeared network can be returned until its lease expires.
+        let gi = self
+            .gateway_and_self_ip()
+            .ok_or(crate::PortMapError::GatewayRange)?;
+
         // Fast path: return cached mapping if valid and not needing renewal.
         {
             let state = self.inner.state.lock().expect("state lock");
@@ -443,9 +460,6 @@ impl Client {
             return Err(crate::PortMapError::NoServices);
         }
 
-        let gi = self
-            .gateway_and_self_ip()
-            .ok_or(crate::PortMapError::GatewayRange)?;
         let internal_addr = SocketAddr::V4(SocketAddrV4::new(gi.self_ip, local_port));
         let pxp_port = self.pxp_port();
         let prev_port = {
@@ -684,6 +698,7 @@ impl Client {
 
     /// Get the cached mapping, if any (without starting creation).
     pub fn cached_mapping(&self) -> Option<Mapping> {
+        self.gateway_and_self_ip()?;
         let state = self.inner.state.lock().expect("state lock");
         state.mapping.clone()
     }
@@ -700,9 +715,12 @@ impl Default for Client {
 
 #[cfg(test)]
 mod tests {
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
 
-    use super::{Client, ClientConfig, GatewayInfo};
+    use super::{Client, ClientConfig, GatewayInfo, Mapping, MappingKind};
+    use crate::upnp::UpnpService;
 
     #[test]
     fn gateway_deephash_detects_changes() {
@@ -728,5 +746,72 @@ mod tests {
         }));
         client.gateway_and_self_ip();
         assert_ne!(client.inner.state.lock().unwrap().gw_hash, first_hash);
+    }
+
+    #[tokio::test]
+    async fn missing_gateway_clears_mapping_and_is_stable() {
+        let gateway = GatewayInfo {
+            gateway: Ipv4Addr::new(192, 168, 1, 1),
+            self_ip: Ipv4Addr::new(192, 168, 1, 2),
+        };
+        let client = Client::with_config(ClientConfig {
+            gateway_lookup: Some(Box::new(move || Some(gateway))),
+        });
+        assert_eq!(client.gateway_and_self_ip(), Some(gateway));
+
+        let external = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 10), 41641));
+        let now = Instant::now();
+        {
+            let mut state = client.inner.state.lock().unwrap();
+            state.mapping = Some(Mapping {
+                external,
+                kind: MappingKind::Pcp,
+                good_until: now + Duration::from_secs(3600),
+                renew_after: now + Duration::from_secs(1800),
+            });
+            state.last_probe = Some(now);
+            state.pmp_pub_ip = Some(Ipv4Addr::new(198, 51, 100, 10));
+            state.pmp_pub_ip_time = Some(now);
+            state.pcp_saw_time = Some(now);
+            state.upnp_saw_time = Some(now);
+            state.upnp_services.insert(
+                "router".into(),
+                UpnpService {
+                    control_url: "http://192.168.1.1/control".into(),
+                    kind: 0,
+                },
+            );
+        }
+
+        client.set_gateway_lookup(Box::new(|| None));
+
+        // This is the cache API used by magicsock endpoint advertisement.
+        // It must never return the old external endpoint after route loss.
+        assert_eq!(
+            client.get_cached_mapping_or_start_creating_one(),
+            (None, false)
+        );
+        let none_hash = {
+            let state = client.inner.state.lock().unwrap();
+            assert!(state.mapping.is_none());
+            assert!(state.last_probe.is_none());
+            assert!(state.pmp_pub_ip.is_none());
+            assert!(state.pmp_pub_ip_time.is_none());
+            assert!(state.pcp_saw_time.is_none());
+            assert!(state.upnp_saw_time.is_none());
+            assert!(state.upnp_services.is_empty());
+            state.gw_hash
+        };
+        assert!(!client.inner.running_create.load(Ordering::SeqCst));
+
+        // Repeated route-loss observations are hash-stable, do not launch a
+        // futile creation task, and still cannot expose a cached endpoint.
+        assert_eq!(
+            client.get_cached_mapping_or_start_creating_one(),
+            (None, false)
+        );
+        assert_eq!(client.inner.state.lock().unwrap().gw_hash, none_hash);
+        assert!(!client.inner.running_create.load(Ordering::SeqCst));
+        assert!(client.cached_mapping().is_none());
     }
 }

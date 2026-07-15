@@ -2185,7 +2185,7 @@ mod tests {
         assert_eq!(batch.headers[index].msg_len, 0);
         assert_eq!(batch.headers[index].msg_hdr.msg_flags, 0);
         assert_eq!(
-            batch.headers[index].msg_hdr.msg_controllen as usize,
+            normalize_control_len(batch.headers[index].msg_hdr.msg_controllen).unwrap(),
             RECEIVE_CONTROL_SPACE
         );
         assert_eq!(batch.names[index].ss_family, 0);
@@ -2343,8 +2343,8 @@ mod tests {
             assert_eq!((*header).cmsg_level, libc::IPPROTO_UDP);
             assert_eq!((*header).cmsg_type, UDP_SEGMENT);
             assert_eq!(
-                (*header).cmsg_len as usize,
-                libc::CMSG_LEN(UDP_SEGMENT_DATA_LEN as _) as usize
+                normalize_control_len((*header).cmsg_len).unwrap(),
+                normalize_control_len(libc::CMSG_LEN(UDP_SEGMENT_DATA_LEN as _)).unwrap()
             );
             let payload = std::slice::from_raw_parts(libc::CMSG_DATA(header), UDP_SEGMENT_DATA_LEN);
             assert_eq!(payload, 1234u16.to_ne_bytes());

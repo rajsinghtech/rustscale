@@ -228,12 +228,16 @@ pub fn packet_was_truncated(_err: &io::Error) -> bool {
 }
 
 /// Returns `true` if `err` indicates that UDP segmentation offload (GSO)
-/// should be disabled — on Linux this is `EIO` from `sendmsg` with
-/// `UDP_SEGMENT`, meaning the NIC does not support tx checksum offload.
+/// should be disabled. Linux reports `EIO` when the selected NIC lacks TX
+/// checksum offload; `ENOPROTOOPT`/`EOPNOTSUPP` cover route- or runtime-level
+/// rejection after the socket capability probe succeeded.
 #[cfg(target_os = "linux")]
 #[must_use]
 pub fn should_disable_udp_gso(err: &io::Error) -> bool {
-    err.raw_os_error() == Some(libc::EIO)
+    matches!(
+        err.raw_os_error(),
+        Some(libc::EIO | libc::ENOPROTOOPT | libc::EOPNOTSUPP)
+    )
 }
 
 #[cfg(not(target_os = "linux"))]

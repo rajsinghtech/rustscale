@@ -423,6 +423,18 @@ fn test_packet_was_truncated() {
 fn test_should_disable_udp_gso() {
     let e = io::Error::other("test");
     assert!(!crate::should_disable_udp_gso(&e));
+
+    #[cfg(target_os = "linux")]
+    {
+        for errno in [libc::EIO, libc::ENOPROTOOPT, libc::EOPNOTSUPP] {
+            assert!(crate::should_disable_udp_gso(
+                &io::Error::from_raw_os_error(errno)
+            ));
+        }
+        assert!(!crate::should_disable_udp_gso(
+            &io::Error::from_raw_os_error(libc::EINVAL)
+        ));
+    }
 }
 
 #[test]

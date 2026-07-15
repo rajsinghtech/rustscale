@@ -1484,6 +1484,11 @@ async fn direct_path_upgrade_over_udp() {
 
     let a_priv = NodePrivate::generate();
     let b_priv = NodePrivate::generate();
+    let a_knobs = Arc::new(rustscale_controlknobs::ControlKnobs::new());
+    a_knobs.apply(HashMap::from([(
+        rustscale_tailcfg::NODE_ATTR_NEVER_GSO_EQUAL_TAIL.to_string(),
+        "true".to_string(),
+    )]));
 
     let a_derp = connect_to_relay(&relay, a_priv.clone()).await;
     let (a, _a_rx) = Magicsock::new(MagicsockConfig {
@@ -1500,7 +1505,7 @@ async fn direct_path_upgrade_over_udp() {
         peer_relay_server: false,
         relay_server_config: None,
         sockstats: None,
-        control_knobs: None,
+        control_knobs: Some(a_knobs),
     })
     .await
     .expect("A magicsock");
@@ -1574,17 +1579,48 @@ async fn direct_path_upgrade_over_udp() {
         "B's path to A should be Direct"
     );
 
+    // A standalone byte equal to the sender's mitigation tail has no trusted
+    // provenance. It must remain ordinary peer traffic on scalar/plain paths.
+    a.send(b.node_public(), b"\x07")
+        .await
+        .expect("standalone one-byte send");
+    let standalone = tokio::time::timeout(Duration::from_secs(2), b_rx.recv())
+        .await
+        .expect("timed out waiting for standalone byte")
+        .expect("standalone receive batch")
+        .into_datagrams();
+    assert_eq!(standalone.len(), 1);
+    assert_eq!(standalone[0].peer, a.node_public());
+    assert_eq!(standalone[0].data, b"\x07".as_slice());
+    let standalone_tx = a_counts.lock().unwrap()[0].clone();
+    assert_eq!((standalone_tx.packets, standalone_tx.bytes), (1, 1));
+    assert!(!standalone_tx.recv);
+    let standalone_rx = b_counts.lock().unwrap()[0].clone();
+    assert_eq!((standalone_rx.packets, standalone_rx.bytes), (1, 1));
+    assert!(standalone_rx.recv);
+    a_counts.lock().unwrap().clear();
+    b_counts.lock().unwrap().clear();
+
     // A direct UDP burst remains ordered in one receive-batch item, using the
     // already-established direct path snapshot.
-    let datagrams = [
-        b"\x08\x07\x06\x05 direct wg packet one".as_slice(),
-        b"\x08\x07\x06\x05 direct wg packet two".as_slice(),
-    ];
+    let datagrams: Vec<Vec<u8>> = (0..8)
+        .map(|index| {
+            let mut packet = vec![0x08; 32];
+            packet[1] = index;
+            packet
+        })
+        .collect();
     a.send_batch(b.node_public(), &datagrams)
         .await
         .expect("A batch send");
+    #[cfg(target_os = "linux")]
+    let expects_protocol_tail =
+        a.inner.udp_tx_batch.load(Ordering::Relaxed) && a.inner.udp_tx_gso.load(Ordering::Relaxed);
+    #[cfg(not(target_os = "linux"))]
+    let expects_protocol_tail = false;
+    let expected_received = datagrams.len() + usize::from(expects_protocol_tail);
     let mut received = Vec::new();
-    while received.len() < datagrams.len() {
+    while received.len() < expected_received {
         received.extend(
             tokio::time::timeout(Duration::from_secs(2), b_rx.recv())
                 .await
@@ -1593,15 +1629,20 @@ async fn direct_path_upgrade_over_udp() {
                 .into_datagrams(),
         );
     }
-    assert_eq!(received.len(), datagrams.len());
-    for (received, datagram) in received.into_iter().zip(datagrams) {
+    assert_eq!(received.len(), expected_received);
+    for (received, datagram) in received.iter().zip(&datagrams) {
         assert_eq!(received.peer, a.node_public());
-        assert_eq!(received.data, datagram);
+        assert_eq!(received.data, *datagram);
+    }
+    if expects_protocol_tail {
+        let tail = received.last().expect("mitigation tail");
+        assert_eq!(tail.peer, a.node_public());
+        assert_eq!(tail.data, b"\x07".as_slice());
     }
 
     let a_counts = a_counts.lock().unwrap();
     assert_eq!(a_counts.len(), 1, "one callback for one sent batch");
-    assert_eq!(a_counts[0].packets, 2);
+    assert_eq!(a_counts[0].packets, datagrams.len() as u64);
     assert_eq!(
         a_counts[0].bytes,
         datagrams
@@ -1611,13 +1652,17 @@ async fn direct_path_upgrade_over_udp() {
     );
     assert!(!a_counts[0].recv);
     let b_counts = b_counts.lock().unwrap();
-    assert_eq!(b_counts.iter().map(|call| call.packets).sum::<u64>(), 2);
+    assert_eq!(
+        b_counts.iter().map(|call| call.packets).sum::<u64>(),
+        expected_received as u64
+    );
     assert_eq!(
         b_counts.iter().map(|call| call.bytes).sum::<u64>(),
         datagrams
             .iter()
             .map(|packet| packet.len() as u64)
             .sum::<u64>()
+            + u64::from(expects_protocol_tail)
     );
     assert!(b_counts.iter().all(|call| call.recv));
 }

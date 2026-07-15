@@ -177,6 +177,18 @@ fn batch_counts<T: AsRef<[u8]>>(datagrams: &[T]) -> (u64, u64) {
     )
 }
 
+/// Keep upstream netlog in original-datagram units while sockstats reflects
+/// every physical payload byte submitted to the UDP socket.
+#[cfg(any(target_os = "linux", test))]
+fn linux_udp_send_accounting<T: AsRef<[u8]>>(
+    datagrams: &[T],
+    wire_bytes: usize,
+) -> (u64, u64, usize) {
+    let (packets, logical_bytes) = batch_counts(datagrams);
+    debug_assert!(wire_bytes >= logical_bytes as usize);
+    (packets, logical_bytes, wire_bytes)
+}
+
 fn first_node_addr(node: &Node) -> Option<IpAddr> {
     node.Addresses.first().and_then(|prefix| {
         prefix
@@ -211,6 +223,40 @@ fn linux_batch_requires_scalar_handler<'a>(
         Some(data) => udp_batch_needs_scalar_handler(data),
         None => true,
     })
+}
+
+/// Linux UDP send configuration sampled once when the socket is installed.
+/// Runtime capability failures may only turn these features off.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LinuxUdpSendConfig {
+    use_batch: bool,
+    disable_udp_gso: bool,
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn never_gso_equal_tail(control_knobs: Option<&rustscale_controlknobs::ControlKnobs>) -> bool {
+    control_knobs.is_some_and(|knobs| {
+        knobs.get_bool(rustscale_tailcfg::NODE_ATTR_NEVER_GSO_EQUAL_TAIL, false)
+    })
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl LinuxUdpSendConfig {
+    #[cfg(target_os = "linux")]
+    fn from_environment() -> Self {
+        Self::from_environment_presence(
+            std::env::var_os("RUSTSCALE_DISABLE_LINUX_UDP_BATCH").is_some(),
+            std::env::var_os("RUSTSCALE_DISABLE_UDP_GSO").is_some(),
+        )
+    }
+
+    fn from_environment_presence(disable_batch: bool, disable_gso: bool) -> Self {
+        Self {
+            use_batch: !disable_batch,
+            disable_udp_gso: disable_batch || disable_gso,
+        }
+    }
 }
 
 /// Linux UDP receive configuration sampled once when the receive task starts.
@@ -840,8 +886,13 @@ struct Inner {
     node_public: RwLock<NodePublic>,
     disco: DiscoIo,
     udp: Option<Arc<UdpSocket>>,
+    /// TX `sendmmsg` availability. Linux starts batched when permitted by the
+    /// process configuration, then permanently falls back to ordinary Tokio
+    /// sends if the syscall is unavailable or blocked.
+    #[cfg(target_os = "linux")]
+    udp_tx_batch: AtomicBool,
     /// TX UDP GSO availability, probed once per direct UDP socket and disabled
-    /// permanently if Linux reports EIO for a GSO send.
+    /// permanently if a GSO send reports an unsupported/checksum-offload error.
     #[cfg(target_os = "linux")]
     udp_tx_gso: AtomicBool,
     local_udp_addrs: RwLock<Vec<String>>,
@@ -1327,9 +1378,15 @@ impl Magicsock {
         configure_selected_udp_socket(udp.as_deref(), udp_socket_buffers::configure);
 
         #[cfg(target_os = "linux")]
-        let udp_tx_gso = udp
-            .as_ref()
-            .is_some_and(|socket| udp_batch::supports_gso(socket));
+        let udp_send_config = LinuxUdpSendConfig::from_environment();
+        #[cfg(target_os = "linux")]
+        let udp_tx_batch = udp_send_config.use_batch;
+        #[cfg(target_os = "linux")]
+        let udp_tx_gso = udp_tx_batch
+            && !udp_send_config.disable_udp_gso
+            && udp
+                .as_ref()
+                .is_some_and(|socket| udp_batch::supports_gso(socket));
 
         // Create the DERP manager with the home region connection + DERPMap.
         let (derp, derp_recv_rx, reconnect_rx) = DerpManager::new(
@@ -1366,6 +1423,8 @@ impl Magicsock {
             node_public: RwLock::new(node_public),
             disco,
             udp,
+            #[cfg(target_os = "linux")]
+            udp_tx_batch: AtomicBool::new(udp_tx_batch),
             #[cfg(target_os = "linux")]
             udp_tx_gso: AtomicBool::new(udp_tx_gso),
             local_udp_addrs: RwLock::new(local_udp_addrs),
@@ -1910,34 +1969,85 @@ impl Magicsock {
         node_addr: Option<IpAddr>,
         datagrams: &[T],
     ) -> Result<(), MagicsockError> {
+        // Match upstream's per-write atomic snapshot: a live knob update takes
+        // effect on the next API batch, never halfway through this one.
+        let never_gso_equal_tail = never_gso_equal_tail(self.inner.control_knobs.as_deref());
         let mut head = 0;
         let mut first_error = None;
         let (mut sent_packets, mut sent_bytes) = (0, 0);
         while head < datagrams.len() {
-            let end = (head + udp_batch::MAX_BATCH).min(datagrams.len());
-            let use_gso = self.inner.udp_tx_gso.load(Ordering::Relaxed);
-            let result = udp
-                .async_io(Interest::WRITABLE, || {
+            let use_batch = self.inner.udp_tx_batch.load(Ordering::Relaxed);
+            let use_gso = use_batch && self.inner.udp_tx_gso.load(Ordering::Relaxed);
+            let result = if use_batch {
+                let end = (head + udp_batch::MAX_BATCH).min(datagrams.len());
+                udp.async_io(Interest::WRITABLE, || {
                     if use_gso {
-                        udp_batch::send_gso(udp, addr, &datagrams[head..end])
+                        udp_batch::send_gso(udp, addr, &datagrams[head..end], never_gso_equal_tail)
                     } else {
-                        udp_batch::send(udp, addr, &datagrams[head..end])
+                        udp_batch::send(udp, addr, &datagrams[head..end]).map(|sent| {
+                            udp_batch::SendOutcome {
+                                datagrams: sent,
+                                wire_bytes: datagrams[head..head + sent]
+                                    .iter()
+                                    .map(|datagram| datagram.as_ref().len())
+                                    .sum(),
+                            }
+                        })
                     }
                 })
-                .await;
+                .await
+            } else {
+                let datagram = datagrams[head].as_ref();
+                udp.send_to(datagram, addr).await.and_then(|sent| {
+                    if sent == datagram.len() {
+                        Ok(udp_batch::SendOutcome {
+                            datagrams: 1,
+                            wire_bytes: sent,
+                        })
+                    } else {
+                        Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "UDP send reported a partial datagram",
+                        ))
+                    }
+                })
+            };
             if use_gso && result.as_ref().is_err_and(should_disable_udp_gso) {
-                self.inner.udp_tx_gso.store(false, Ordering::Relaxed);
+                if self.inner.udp_tx_gso.swap(false, Ordering::Relaxed) {
+                    eprintln!(
+                        "rustscale: Linux UDP GSO send failed; permanently falling back to plain sends"
+                    );
+                }
                 // `sendmmsg` reports no progress with an error, so retry this
-                // exact unsent suffix through the independently exercised
-                // plain path while retaining AsyncFd readiness ownership.
+                // exact unsent suffix without UDP_SEGMENT metadata.
                 continue;
             }
-            let sent = advance_direct_batch(&mut head, datagrams.len(), &mut first_error, result);
-            let sent_datagrams = &datagrams[head - sent..head];
-            for datagram in sent_datagrams {
-                self.inner.record_udp_tx(addr, datagram.as_ref().len());
+            if use_batch
+                && result
+                    .as_ref()
+                    .is_err_and(udp_batch::sendmmsg_is_unsupported)
+            {
+                if self.inner.udp_tx_batch.swap(false, Ordering::Relaxed) {
+                    self.inner.udp_tx_gso.store(false, Ordering::Relaxed);
+                    eprintln!(
+                        "rustscale: Linux sendmmsg unavailable; permanently falling back to ordinary UDP sends"
+                    );
+                }
+                // The failed batch made no progress. Retry its exact head with
+                // Tokio's ordinary UDP path, preserving ordering and accounting.
+                continue;
             }
-            let (packets, bytes) = batch_counts(sent_datagrams);
+            let wire_bytes = result.as_ref().map_or(0, |outcome| outcome.wire_bytes);
+            let sent = advance_direct_batch(
+                &mut head,
+                datagrams.len(),
+                &mut first_error,
+                result.map(|outcome| outcome.datagrams),
+            );
+            let sent_datagrams = &datagrams[head - sent..head];
+            let (packets, bytes, sockstats_bytes) =
+                linux_udp_send_accounting(sent_datagrams, wire_bytes);
+            self.inner.record_udp_tx(addr, sockstats_bytes);
             sent_packets += packets;
             sent_bytes += bytes;
         }
@@ -4137,6 +4247,21 @@ mod linux_batch_tests {
     }
 
     #[test]
+    fn equal_tail_accounting_separates_original_netlog_and_physical_sockstats() {
+        let datagrams = vec![vec![0x08; 32]; 8];
+        assert_eq!(
+            linux_udp_send_accounting(&datagrams, 8 * 32 + 1),
+            (8, 8 * 32, 8 * 32 + 1),
+            "sentinel is physical sockstats only"
+        );
+        assert_eq!(
+            linux_udp_send_accounting(&datagrams, 8 * 32),
+            (8, 8 * 32, 8 * 32),
+            "plain fallback has no sentinel byte"
+        );
+    }
+
+    #[test]
     fn direct_batch_advancement_accounts_successful_prefixes() {
         let (head, accounted, error) = advance_sequence(&[3, 5, 7, 11], [Ok(4)]);
         assert_eq!(head, 4);
@@ -4203,6 +4328,7 @@ mod linux_batch_tests {
         assert!(DiscoIo::looks_like_disco(&disco));
         assert!(udp_batch_needs_scalar_handler(&disco));
         assert!(udp_batch_needs_scalar_handler(&geneve_wg));
+        assert!(!udp_batch_needs_scalar_handler(b"\x07"));
         assert!(!udp_batch_needs_scalar_handler(b"ordinary-wireguard"));
         assert!(linux_batch_requires_scalar_handler([
             Some(b"ordinary-wireguard-before".as_slice()),
@@ -4233,6 +4359,47 @@ mod linux_batch_tests {
                 Some(b"ordinary-after".as_slice()),
             ]));
         }
+    }
+
+    #[test]
+    fn linux_send_configuration_preserves_independent_fallbacks() {
+        assert_eq!(
+            LinuxUdpSendConfig::from_environment_presence(false, false),
+            LinuxUdpSendConfig {
+                use_batch: true,
+                disable_udp_gso: false,
+            }
+        );
+        assert_eq!(
+            LinuxUdpSendConfig::from_environment_presence(false, true),
+            LinuxUdpSendConfig {
+                use_batch: true,
+                disable_udp_gso: true,
+            }
+        );
+        assert_eq!(
+            LinuxUdpSendConfig::from_environment_presence(true, false),
+            LinuxUdpSendConfig {
+                use_batch: false,
+                disable_udp_gso: true,
+            }
+        );
+    }
+
+    #[test]
+    fn never_gso_equal_tail_reads_each_live_knob_update() {
+        let knobs = rustscale_controlknobs::ControlKnobs::new();
+        assert!(!never_gso_equal_tail(Some(&knobs)));
+        knobs.apply(HashMap::from([(
+            rustscale_tailcfg::NODE_ATTR_NEVER_GSO_EQUAL_TAIL.to_string(),
+            "true".to_string(),
+        )]));
+        assert!(never_gso_equal_tail(Some(&knobs)));
+        knobs.apply(HashMap::from([(
+            rustscale_tailcfg::NODE_ATTR_NEVER_GSO_EQUAL_TAIL.to_string(),
+            "false".to_string(),
+        )]));
+        assert!(!never_gso_equal_tail(Some(&knobs)));
     }
 
     #[test]
@@ -4417,6 +4584,44 @@ mod linux_batch_tests {
                 b"b-1".to_vec(),
                 b"a-3".to_vec(),
             ],
+        );
+    }
+
+    #[test]
+    fn one_byte_07_stays_attached_to_mixed_reordered_peer_sources() {
+        let a = NodePrivate::generate().public();
+        let b = NodePrivate::generate().public();
+        let a_addr: SocketAddr = "127.0.0.1:10001".parse().unwrap();
+        let b_addr: SocketAddr = "127.0.0.1:10002".parse().unwrap();
+        let peers = HashMap::from([(a_addr, a.clone()), (b_addr, b.clone())]);
+        let packets = [
+            (b"\x07".to_vec(), a_addr),
+            (b"peer-b".to_vec(), b_addr),
+            (b"\x07".to_vec(), a_addr),
+        ];
+        let mut pending = Vec::new();
+        let mut accounted = Vec::new();
+
+        stage_linux_wg_datagrams(
+            packets.iter().map(|(data, addr)| (data.as_slice(), *addr)),
+            &peers,
+            &mut HashMap::new(),
+            &mut pending,
+            |_, _, _| {},
+            |udp4_bytes, udp6_bytes| accounted.push((udp4_bytes, udp6_bytes)),
+        );
+
+        assert_eq!(accounted, [(8, 0)]);
+        assert_eq!(
+            pending
+                .into_iter()
+                .map(|datagram| (datagram.peer, datagram.data.as_ref().to_vec()))
+                .collect::<Vec<_>>(),
+            [
+                (a.clone(), b"\x07".to_vec()),
+                (b, b"peer-b".to_vec()),
+                (a, b"\x07".to_vec()),
+            ]
         );
     }
 

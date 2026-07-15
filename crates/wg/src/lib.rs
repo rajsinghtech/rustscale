@@ -756,6 +756,16 @@ mod tests {
     }
 
     #[test]
+    fn one_byte_equal_tail_value_is_harmless_protocol_input() {
+        let a_priv = NodePrivate::generate();
+        let b_priv = NodePrivate::generate();
+        let mut a = WgTunn::new(&a_priv, &b_priv.public(), 31).expect("A tunnel");
+        let result = a.decapsulate(&[0x07]).expect("short packet is non-fatal");
+        assert!(result.plaintext.is_none());
+        assert!(result.replies.is_empty());
+    }
+
+    #[test]
     fn dst_address_parses_ipv4() {
         let pkt = make_ipv4_packet(b"x");
         let dst = WgTunn::dst_address(&pkt);

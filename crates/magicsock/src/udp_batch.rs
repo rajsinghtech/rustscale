@@ -18,6 +18,12 @@ use tokio::sync::Semaphore;
 /// header allocation for each WireGuard microburst.
 pub(crate) const MAX_BATCH: usize = 128;
 const MAX_GSO_SEGMENTS: usize = 64;
+/// Upstream's invalid WireGuard tail. It is sender-only metadata: receivers
+/// must not infer provenance from this forgeable one-byte payload.
+const NEVER_GSO_EQUAL_TAIL_SENTINEL: &[u8] = &[0x07];
+/// Match upstream's threshold: below this, the workaround uses plain
+/// `sendmmsg` rather than paying for a sentinel packet.
+const SENTINEL_TAIL_BATCH_THRESHOLD: usize = 8;
 const MAX_IPV4_PAYLOAD: usize = 65_507;
 const MAX_IPV6_PAYLOAD: usize = 65_527;
 /// Direct WireGuard, disco, and Geneve packets normally fit comfortably in
@@ -490,8 +496,12 @@ pub(crate) fn send<T: AsRef<[u8]>>(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PlannedMessage {
     first: usize,
+    /// Original caller datagrams represented by this kernel message. The
+    /// optional sentinel is excluded from sender progress/netlog accounting;
+    /// receivers cannot infer that provenance and account it physically.
     datagrams: usize,
     segment_size: Option<u16>,
+    append_sentinel: bool,
 }
 
 impl PlannedMessage {
@@ -499,7 +509,16 @@ impl PlannedMessage {
         first: 0,
         datagrams: 0,
         segment_size: None,
+        append_sentinel: false,
     };
+
+    fn wire_bytes<T: AsRef<[u8]>>(&self, datagrams: &[T]) -> usize {
+        datagrams[self.first..self.first + self.datagrams]
+            .iter()
+            .map(|datagram| datagram.as_ref().len())
+            .sum::<usize>()
+            + usize::from(self.append_sentinel) * NEVER_GSO_EQUAL_TAIL_SENTINEL.len()
+    }
 }
 
 /// Returns whether this socket supports per-message UDP GSO control data.
@@ -529,11 +548,16 @@ fn probe_gso(socket: &UdpSocket) -> io::Result<()> {
             ptr::from_mut(&mut len),
         )
     };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
+    if result != 0 {
+        return Err(io::Error::last_os_error());
     }
+    if len as usize != mem::size_of_val(&segment_size) {
+        return invalid_data("UDP_SEGMENT capability probe returned an unexpected value size");
+    }
+    if segment_size != 0 {
+        return invalid_data("UDP_SEGMENT socket-wide default is unexpectedly nonzero");
+    }
+    Ok(())
 }
 
 /// Best-effort UDP GRO enablement. Receive and send offloads are independent
@@ -617,12 +641,30 @@ pub(crate) fn recvmmsg_is_unsupported(error: &io::Error) -> bool {
     )
 }
 
-fn plan<T: AsRef<[u8]>>(addr: SocketAddr, datagrams: &[T]) -> ([PlannedMessage; MAX_BATCH], usize) {
-    let max_payload = if addr.is_ipv4() {
+/// True when batched transmit is unambiguously unavailable to this process.
+/// `EPERM`/`EACCES` are deliberately excluded because outbound firewall rules
+/// can report them; those remain ordinary lost-UDP results rather than
+/// permanently changing the socket mode.
+pub(crate) fn sendmmsg_is_unsupported(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(libc::ENOSYS | libc::EOPNOTSUPP))
+}
+
+fn plan<T: AsRef<[u8]>>(
+    addr: SocketAddr,
+    datagrams: &[T],
+    never_gso_equal_tail: bool,
+) -> ([PlannedMessage; MAX_BATCH], usize) {
+    let mut max_payload = if addr.is_ipv4() {
         MAX_IPV4_PAYLOAD
     } else {
         MAX_IPV6_PAYLOAD
     };
+    let mut max_datagrams = MAX_GSO_SEGMENTS;
+    if never_gso_equal_tail {
+        // Reserve both one segment and one byte for a possible sentinel.
+        max_datagrams -= 1;
+        max_payload -= NEVER_GSO_EQUAL_TAIL_SENTINEL.len();
+    }
     let mut messages = [PlannedMessage::EMPTY; MAX_BATCH];
     let mut message_count = 0;
     let mut first = 0;
@@ -636,22 +678,30 @@ fn plan<T: AsRef<[u8]>>(addr: SocketAddr, datagrams: &[T]) -> ([PlannedMessage; 
         let mut total = segment_len;
         let mut has_smaller_tail = false;
         while first + count < datagrams.len()
-            && count < MAX_GSO_SEGMENTS
+            && count < max_datagrams
             && !has_smaller_tail
             && gso_eligible
         {
             let next_len = datagrams[first + count].as_ref().len();
-            if next_len == 0 || next_len > segment_len || total + next_len > max_payload {
+            let sentinel_can_be_smaller =
+                !never_gso_equal_tail || next_len > NEVER_GSO_EQUAL_TAIL_SENTINEL.len();
+            if next_len == 0
+                || next_len > segment_len
+                || total + next_len > max_payload
+                || !sentinel_can_be_smaller
+            {
                 break;
             }
             total += next_len;
             count += 1;
             has_smaller_tail = next_len < segment_len;
         }
+        let segment_size = (count > 1 && gso_eligible).then_some(segment_len as u16);
         messages[message_count] = PlannedMessage {
             first,
             datagrams: count,
-            segment_size: (count > 1 && gso_eligible).then_some(segment_len as u16),
+            segment_size,
+            append_sentinel: never_gso_equal_tail && segment_size.is_some() && !has_smaller_tail,
         };
         message_count += 1;
         first += count;
@@ -1069,9 +1119,10 @@ impl ReceiveBatch {
             if let Some(payload_len) = parsed.gro_payload_len {
                 self.last_gro_payload_len = Some(payload_len);
             }
-            let segments = parsed
-                .gro_size
-                .map_or(1, |size| length.div_ceil(usize::from(size)).max(1));
+            let segments = match parsed.gro_size {
+                Some(size) => validate_gro_segments(length, size)?,
+                None => 1,
+            };
             if output + segments > MAX_BATCH {
                 return invalid_data("splitting UDP GRO packet would overflow batch");
             }
@@ -1274,6 +1325,9 @@ fn parse_control(control: &[u8]) -> io::Result<ParsedControl> {
             parsed.gro_size = Some(parse_gro_size(data)?);
             parsed.gro_payload_len = Some(data.len());
         } else if header.cmsg_level == libc::SOL_SOCKET && header.cmsg_type == libc::SO_RXQ_OVFL {
+            if parsed.rxq_overflow.is_some() {
+                return invalid_data("duplicate SO_RXQ_OVFL control message");
+            }
             if data.len() != RXQ_OVFL_DATA_LEN {
                 return invalid_data("SO_RXQ_OVFL control payload is not exactly a u32");
             }
@@ -1302,6 +1356,17 @@ fn parse_control(control: &[u8]) -> io::Result<ParsedControl> {
         offset += next;
     }
     Ok(parsed)
+}
+
+fn validate_gro_segments(length: usize, segment_size: u16) -> io::Result<usize> {
+    if length == 0 {
+        return invalid_data("UDP_GRO control accompanied an empty payload");
+    }
+    let segments = length.div_ceil(usize::from(segment_size));
+    if segments > MAX_GSO_SEGMENTS {
+        return invalid_data("UDP_GRO control exceeds the Linux segment limit");
+    }
+    Ok(segments)
 }
 
 fn parse_gro_size(data: &[u8]) -> io::Result<u16> {
@@ -1336,15 +1401,25 @@ fn normalize_control_len<T: TryInto<usize>>(value: T) -> io::Result<usize> {
     }
 }
 
+/// Successful GSO send progress. `datagrams` excludes mitigation sentinels;
+/// `wire_bytes` includes them for physical socket accounting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SendOutcome {
+    pub(crate) datagrams: usize,
+    pub(crate) wire_bytes: usize,
+}
+
 /// Send an ordered batch with per-message UDP_SEGMENT control data.
 ///
 /// The successful prefix is returned in original datagram units, not planned
-/// kernel-message units.
+/// kernel-message units. When the equal-tail mitigation is live, batches below
+/// the upstream threshold conservatively use plain `sendmmsg`.
 pub(crate) fn send_gso<T: AsRef<[u8]>>(
     socket: &UdpSocket,
     addr: SocketAddr,
     datagrams: &[T],
-) -> io::Result<usize> {
+    never_gso_equal_tail: bool,
+) -> io::Result<SendOutcome> {
     if datagrams.is_empty() || datagrams.len() > MAX_BATCH {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1352,13 +1427,23 @@ pub(crate) fn send_gso<T: AsRef<[u8]>>(
         ));
     }
 
-    let (messages, message_count) = plan(addr, datagrams);
+    if never_gso_equal_tail && datagrams.len() < SENTINEL_TAIL_BATCH_THRESHOLD {
+        return send(socket, addr, datagrams).map(|sent| SendOutcome {
+            datagrams: sent,
+            wire_bytes: datagrams[..sent]
+                .iter()
+                .map(|datagram| datagram.as_ref().len())
+                .sum(),
+        });
+    }
+
+    let (messages, message_count) = plan(addr, datagrams, never_gso_equal_tail);
     let sockaddr = SockAddr::from_socket_addr(addr);
     let (name, name_len) = sockaddr.as_ptr_len();
     let mut iovecs = [libc::iovec {
         iov_base: ptr::null_mut(),
         iov_len: 0,
-    }; MAX_BATCH];
+    }; MAX_BATCH * 2];
     let mut controls = [Control::ZERO; MAX_BATCH];
     // SAFETY: zeroed `msghdr` is valid; fields below initialize each used one.
     let mut empty_hdr: libc::msghdr = unsafe { mem::zeroed() };
@@ -1369,17 +1454,27 @@ pub(crate) fn send_gso<T: AsRef<[u8]>>(
         msg_len: 0,
     }; MAX_BATCH];
 
-    for (index, datagram) in datagrams.iter().enumerate() {
-        let data = datagram.as_ref();
-        iovecs[index] = libc::iovec {
-            iov_base: data.as_ptr().cast_mut().cast(),
-            iov_len: data.len(),
-        };
-    }
+    let mut iovec_count = 0;
     for (index, message) in messages[..message_count].iter().enumerate() {
+        let first_iovec = iovec_count;
+        for datagram in &datagrams[message.first..message.first + message.datagrams] {
+            let data = datagram.as_ref();
+            iovecs[iovec_count] = libc::iovec {
+                iov_base: data.as_ptr().cast_mut().cast(),
+                iov_len: data.len(),
+            };
+            iovec_count += 1;
+        }
+        if message.append_sentinel {
+            iovecs[iovec_count] = libc::iovec {
+                iov_base: NEVER_GSO_EQUAL_TAIL_SENTINEL.as_ptr().cast_mut().cast(),
+                iov_len: NEVER_GSO_EQUAL_TAIL_SENTINEL.len(),
+            };
+            iovec_count += 1;
+        }
         let header = &mut headers[index].msg_hdr;
-        header.msg_iov = ptr::addr_of_mut!(iovecs[message.first]);
-        header.msg_iovlen = message.datagrams as _;
+        header.msg_iov = ptr::addr_of_mut!(iovecs[first_iovec]);
+        header.msg_iovlen = (message.datagrams + usize::from(message.append_sentinel)) as _;
         if let Some(segment_size) = message.segment_size {
             set_segment_control(&mut controls[index], segment_size);
             header.msg_control = controls[index].as_mut_ptr();
@@ -1388,8 +1483,9 @@ pub(crate) fn send_gso<T: AsRef<[u8]>>(
     }
 
     // SAFETY: all mmsghdr/iovec/control pointers refer to initialized stack
-    // storage that remains live through the syscall; packet bytes are borrowed
-    // from the caller and are neither copied nor retained by the kernel.
+    // storage that remains live through the syscall; packet and static
+    // sentinel bytes are read-only despite iovec's C mut pointer type, and are
+    // neither modified nor retained by the kernel.
     let sent = unsafe {
         libc::sendmmsg(
             socket.as_raw_fd(),
@@ -1399,10 +1495,16 @@ pub(crate) fn send_gso<T: AsRef<[u8]>>(
         )
     };
     match sent.cmp(&0) {
-        std::cmp::Ordering::Greater => Ok(messages[..sent as usize]
-            .iter()
-            .map(|message| message.datagrams)
-            .sum()),
+        std::cmp::Ordering::Greater => {
+            let sent_messages = &messages[..sent as usize];
+            Ok(SendOutcome {
+                datagrams: sent_messages.iter().map(|message| message.datagrams).sum(),
+                wire_bytes: sent_messages
+                    .iter()
+                    .map(|message| message.wire_bytes(datagrams))
+                    .sum(),
+            })
+        }
         std::cmp::Ordering::Equal => Err(io::Error::from(io::ErrorKind::WouldBlock)),
         std::cmp::Ordering::Less => Err(io::Error::last_os_error()),
     }
@@ -1572,14 +1674,27 @@ mod tests {
     }
 
     #[test]
-    fn recvmmsg_seccomp_rejections_fall_back_but_socket_failures_do_not() {
+    fn mmsg_seccomp_rejections_fall_back_but_socket_failures_do_not() {
         for errno in [libc::ENOSYS, libc::EPERM, libc::EACCES] {
             assert!(recvmmsg_is_unsupported(&io::Error::from_raw_os_error(
                 errno
             )));
         }
-        for errno in [libc::EBADF, libc::ECONNREFUSED, libc::EIO] {
-            assert!(!recvmmsg_is_unsupported(&io::Error::from_raw_os_error(
+        for errno in [libc::ENOSYS, libc::EOPNOTSUPP] {
+            assert!(sendmmsg_is_unsupported(&io::Error::from_raw_os_error(
+                errno
+            )));
+        }
+        assert!(!recvmmsg_is_unsupported(&io::Error::from_raw_os_error(
+            libc::EOPNOTSUPP
+        )));
+        for errno in [libc::EBADF, libc::ECONNREFUSED, libc::EIO, libc::EINVAL] {
+            let error = io::Error::from_raw_os_error(errno);
+            assert!(!recvmmsg_is_unsupported(&error));
+            assert!(!sendmmsg_is_unsupported(&error));
+        }
+        for errno in [libc::EPERM, libc::EACCES] {
+            assert!(!sendmmsg_is_unsupported(&io::Error::from_raw_os_error(
                 errno
             )));
         }
@@ -1589,10 +1704,18 @@ mod tests {
         lengths.iter().map(|&len| vec![0; len]).collect()
     }
 
-    fn planned(lengths: &[usize], addr: SocketAddr) -> Vec<PlannedMessage> {
+    fn planned_with_mitigation(
+        lengths: &[usize],
+        addr: SocketAddr,
+        never_gso_equal_tail: bool,
+    ) -> Vec<PlannedMessage> {
         let packets = packets(lengths);
-        let (messages, count) = plan(addr, &packets);
+        let (messages, count) = plan(addr, &packets, never_gso_equal_tail);
         messages[..count].to_vec()
+    }
+
+    fn planned(lengths: &[usize], addr: SocketAddr) -> Vec<PlannedMessage> {
+        planned_with_mitigation(lengths, addr, false)
     }
 
     #[test]
@@ -1697,6 +1820,30 @@ mod tests {
         assert_eq!(batch.datagram(1).unwrap().0, jumbo);
         assert_eq!(batch.datagram(2).unwrap().0, b"after");
         assert!(batch.kernel_backed[1]);
+    }
+
+    #[test]
+    fn plain_receive_preserves_one_byte_values_across_mixed_sources_and_order() {
+        let mut batch = ReceiveBatch::with_gro(false);
+        set_plain_message(&mut batch, 0, b"\x07", 1234);
+        set_plain_message(&mut batch, 1, b"ordinary", 4321);
+        set_plain_message(&mut batch, 2, b"\x07", 1234);
+        batch.finish_plain(3).unwrap();
+
+        let received: Vec<_> = (0..batch.len())
+            .map(|index| {
+                let (data, source) = batch.datagram(index).unwrap();
+                (data.to_vec(), source.port())
+            })
+            .collect();
+        assert_eq!(
+            received,
+            [
+                (b"\x07".to_vec(), 1234),
+                (b"ordinary".to_vec(), 4321),
+                (b"\x07".to_vec(), 1234),
+            ]
+        );
     }
 
     #[test]
@@ -1988,6 +2135,7 @@ mod tests {
                 first: 0,
                 datagrams: 3,
                 segment_size: Some(1200),
+                append_sentinel: false,
             }]
         );
         assert_eq!(
@@ -2025,14 +2173,65 @@ mod tests {
                     first: 0,
                     datagrams: 3,
                     segment_size: Some(1200),
+                    append_sentinel: false,
                 },
                 PlannedMessage {
                     first: 3,
                     datagrams: 1,
                     segment_size: None,
+                    append_sentinel: false,
                 },
             ]
         );
+    }
+
+    #[test]
+    fn planner_matches_never_gso_equal_tail_packet_vectors() {
+        let addr = "127.0.0.1:1".parse().unwrap();
+
+        let one = planned_with_mitigation(&[32], addr, true);
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].segment_size, None);
+        assert!(!one[0].append_sentinel);
+
+        let equal = planned_with_mitigation(&[32, 32], addr, true);
+        assert_eq!(equal.len(), 1);
+        assert_eq!(equal[0].datagrams, 2);
+        assert_eq!(equal[0].segment_size, Some(32));
+        assert!(equal[0].append_sentinel);
+        assert_eq!(equal[0].wire_bytes(&packets(&[32, 32])), 65);
+
+        let smaller_tail = planned_with_mitigation(&[32, 32, 24], addr, true);
+        assert_eq!(smaller_tail.len(), 1);
+        assert_eq!(smaller_tail[0].datagrams, 3);
+        assert!(!smaller_tail[0].append_sentinel);
+
+        let one_byte_tail = planned_with_mitigation(&[32, 1], addr, true);
+        assert_eq!(one_byte_tail.len(), 2);
+        assert!(one_byte_tail
+            .iter()
+            .all(|message| message.segment_size.is_none() && !message.append_sentinel));
+
+        let mixed = planned_with_mitigation(&[32, 32, 24, 32], addr, true);
+        assert_eq!(mixed.len(), 2);
+        assert_eq!(mixed[0].datagrams, 3);
+        assert!(!mixed[0].append_sentinel);
+        assert_eq!(mixed[1].datagrams, 1);
+        assert!(!mixed[1].append_sentinel);
+
+        let larger_boundary = planned_with_mitigation(&[32, 32, 40], addr, true);
+        assert_eq!(larger_boundary.len(), 2);
+        assert_eq!(larger_boundary[0].datagrams, 2);
+        assert!(larger_boundary[0].append_sentinel);
+        assert_eq!(larger_boundary[1].datagrams, 1);
+        assert!(!larger_boundary[1].append_sentinel);
+
+        let boundary = planned_with_mitigation(&vec![32; MAX_GSO_SEGMENTS], addr, true);
+        assert_eq!(boundary.len(), 2);
+        assert_eq!(boundary[0].datagrams, MAX_GSO_SEGMENTS - 1);
+        assert!(boundary[0].append_sentinel);
+        assert_eq!(boundary[1].datagrams, 1);
+        assert!(!boundary[1].append_sentinel);
     }
 
     #[test]
@@ -2155,6 +2354,28 @@ mod tests {
             io::ErrorKind::InvalidData
         );
 
+        let mut duplicate_rxq = Control::ZERO;
+        let len = append_control(
+            &mut duplicate_rxq,
+            0,
+            libc::SOL_SOCKET,
+            libc::SO_RXQ_OVFL,
+            &overflow,
+        );
+        let len = append_control(
+            &mut duplicate_rxq,
+            len,
+            libc::SOL_SOCKET,
+            libc::SO_RXQ_OVFL,
+            &overflow,
+        );
+        assert_eq!(
+            parse_control(&duplicate_rxq.as_bytes()[..len])
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+
         let mut oversized_rxq = Control::ZERO;
         let len = append_control(
             &mut oversized_rxq,
@@ -2246,6 +2467,37 @@ mod tests {
     }
 
     #[test]
+    fn gro_receive_preserves_standalone_and_smaller_tail_07_with_source_order() {
+        let mut batch = ReceiveBatch::with_gro(true);
+        set_tail_message(&mut batch, 0, b"\x07", 0);
+        let control_len = append_control(
+            &mut batch.controls[MAX_BATCH - 1],
+            0,
+            libc::SOL_UDP,
+            UDP_GRO,
+            &2i32.to_ne_bytes(),
+        );
+        set_tail_message(&mut batch, 1, b"aabb\x07", control_len);
+
+        batch.split_gro_tail(MAX_BATCH - GRO_TAIL_SLOTS, 2).unwrap();
+        let received: Vec<_> = (0..batch.len())
+            .map(|index| {
+                let (data, source) = batch.datagram(index).unwrap();
+                (data.to_vec(), source.port())
+            })
+            .collect();
+        assert_eq!(
+            received,
+            [
+                (b"\x07".to_vec(), 1234),
+                (b"aa".to_vec(), 1235),
+                (b"bb".to_vec(), 1235),
+                (b"\x07".to_vec(), 1235),
+            ]
+        );
+    }
+
+    #[test]
     fn plain_receive_after_gro_fallback_accepts_rxq_control_and_accounts_from_zero() {
         let mut batch = ReceiveBatch::with_gro(true);
         batch.finish_disabling_gro(Ok(()), "test fallback").unwrap();
@@ -2290,6 +2542,20 @@ mod tests {
             .unwrap();
         assert!(!fallback.gro_enabled);
         assert!(fallback.gro_packets.is_none());
+    }
+
+    #[test]
+    fn gro_segment_metadata_requires_payload_and_stays_within_kernel_limit() {
+        assert_eq!(
+            validate_gro_segments(0, 1).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(validate_gro_segments(64, 1).unwrap(), 64);
+        assert_eq!(
+            validate_gro_segments(65, 1).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(validate_gro_segments(65_507, u16::MAX).unwrap(), 1);
     }
 
     #[test]
@@ -2452,32 +2718,38 @@ mod tests {
                 PlannedMessage {
                     first: 0,
                     datagrams: 1,
-                    segment_size: None
+                    segment_size: None,
+                    append_sentinel: false,
                 },
                 PlannedMessage {
                     first: 1,
                     datagrams: 1,
-                    segment_size: None
+                    segment_size: None,
+                    append_sentinel: false,
                 },
                 PlannedMessage {
                     first: 2,
                     datagrams: 2,
-                    segment_size: Some(1200)
+                    segment_size: Some(1200),
+                    append_sentinel: false,
                 },
                 PlannedMessage {
                     first: 4,
                     datagrams: 1,
-                    segment_size: None
+                    segment_size: None,
+                    append_sentinel: false,
                 },
                 PlannedMessage {
                     first: 5,
                     datagrams: 1,
-                    segment_size: None
+                    segment_size: None,
+                    append_sentinel: false,
                 },
                 PlannedMessage {
                     first: 6,
                     datagrams: 1,
-                    segment_size: None
+                    segment_size: None,
+                    append_sentinel: false,
                 },
             ]
         );
@@ -2518,7 +2790,9 @@ mod tests {
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let packets = [b"one".as_slice(), b"two", b"three", b"four"];
         assert_eq!(
-            send_gso(&sender, receiver.local_addr().unwrap(), &packets).unwrap(),
+            send_gso(&sender, receiver.local_addr().unwrap(), &packets, false,)
+                .unwrap()
+                .datagrams,
             packets.len()
         );
         let mut buf = [0; 16];
@@ -2526,6 +2800,62 @@ mod tests {
             let (n, _) = receiver.recv_from(&mut buf).await.unwrap();
             assert_eq!(&buf[..n], expected);
         }
+    }
+
+    #[tokio::test]
+    async fn equal_tail_mitigation_preserves_vectors_and_reports_physical_bytes() {
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        if probe_gso(&sender).is_err() {
+            return;
+        }
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let receiver_addr = receiver.local_addr().unwrap();
+        let mut buf = [0; 64];
+
+        // The small-batch fallback cannot attach provenance to a one-byte
+        // value, so a real standalone 0x07 datagram remains byte-exact.
+        let standalone = [b"\x07".as_slice()];
+        let outcome = send_gso(&sender, receiver_addr, &standalone, true).unwrap();
+        assert_eq!(
+            outcome,
+            SendOutcome {
+                datagrams: 1,
+                wire_bytes: 1,
+            }
+        );
+        let (len, _) = receiver.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..len], b"\x07");
+
+        // Upstream avoids GSO below eight packets rather than paying for a
+        // sentinel. Two equal WireGuard-sized payloads remain byte-exact.
+        let small = [vec![1; 32], vec![2; 32]];
+        let outcome = send_gso(&sender, receiver_addr, &small, true).unwrap();
+        assert_eq!(
+            outcome,
+            SendOutcome {
+                datagrams: 2,
+                wire_bytes: 64,
+            }
+        );
+        for expected in &small {
+            let (len, _) = receiver.recv_from(&mut buf).await.unwrap();
+            assert_eq!(&buf[..len], expected);
+        }
+
+        // At the threshold an all-equal GSO message gains exactly one smaller
+        // invalid-WireGuard tail; every original payload remains unchanged.
+        let equal: Vec<_> = (0..SENTINEL_TAIL_BATCH_THRESHOLD)
+            .map(|value| vec![value as u8; 32])
+            .collect();
+        let outcome = send_gso(&sender, receiver_addr, &equal, true).unwrap();
+        assert_eq!(outcome.datagrams, equal.len());
+        assert_eq!(outcome.wire_bytes, equal.len() * 32 + 1);
+        for expected in &equal {
+            let (len, _) = receiver.recv_from(&mut buf).await.unwrap();
+            assert_eq!(&buf[..len], expected);
+        }
+        let (len, _) = receiver.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..len], NEVER_GSO_EQUAL_TAIL_SENTINEL);
     }
 
     #[tokio::test]
@@ -2550,7 +2880,9 @@ mod tests {
         }
         let packets = [vec![1; 1200], vec![2; 1200], vec![3; 1200], vec![4; 1000]];
         assert_eq!(
-            send_gso(&sender, receiver.local_addr().unwrap(), &packets).unwrap(),
+            send_gso(&sender, receiver.local_addr().unwrap(), &packets, false,)
+                .unwrap()
+                .datagrams,
             packets.len()
         );
         receiver.readable().await.unwrap();

@@ -86,7 +86,12 @@ impl AuthenticatedPeer {
                 let share = if share == "*" {
                     share
                 } else {
-                    normalize_share_name(&share).map_err(|_| AuthError::InvalidShare(share))?
+                    let canonical = normalize_share_name(&share)
+                        .map_err(|_| AuthError::InvalidShare(share.clone()))?;
+                    if canonical != share {
+                        return Err(AuthError::NonCanonicalShare(share));
+                    }
+                    share
                 };
                 permissions
                     .0
@@ -127,6 +132,8 @@ pub enum AuthError {
     InvalidAccess(String),
     #[error("invalid share name in Taildrive grant: {0:?}")]
     InvalidShare(String),
+    #[error("Taildrive grant selector is not canonical: {0:?}")]
+    NonCanonicalShare(String),
 }
 
 #[cfg(test)]
@@ -140,13 +147,34 @@ mod tests {
             "nodekey:peer",
             &[
                 br#"{"shares":["*"],"access":"ro"}"#.to_vec(),
-                br#"{"shares":["Docs"],"access":"rw"}"#.to_vec(),
+                br#"{"shares":["docs"],"access":"rw"}"#.to_vec(),
             ],
             &limits,
         )
         .unwrap();
         assert_eq!(peer.permissions().for_share("docs"), Permission::ReadWrite);
         assert_eq!(peer.permissions().for_share("other"), Permission::ReadOnly);
+    }
+
+    #[test]
+    fn noncanonical_selectors_never_broaden_authority() {
+        for selector in ["Docs", " docs", "docs ", "DOCS"] {
+            let raw = format!(r#"{{"shares":["{selector}"],"access":"rw"}}"#);
+            assert!(matches!(
+                AuthenticatedPeer::from_capability_grants(
+                    "nodekey:peer",
+                    &[raw.into_bytes()],
+                    &Limits::default(),
+                ),
+                Err(AuthError::NonCanonicalShare(_))
+            ));
+        }
+        assert!(AuthenticatedPeer::from_capability_grants(
+            "nodekey:peer",
+            &[br#"{"shares":["*"],"access":"ro"}"#.to_vec()],
+            &Limits::default(),
+        )
+        .is_ok());
     }
 
     #[test]

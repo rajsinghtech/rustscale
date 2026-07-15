@@ -1,8 +1,9 @@
 use std::collections::{btree_map::Entry, BTreeMap};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use cap_fs_ext::DirExt;
 use cap_std::ambient_authority;
 use cap_std::fs::Dir;
 use serde::{Deserialize, Serialize};
@@ -48,9 +49,10 @@ pub struct Limits {
     pub max_response_body: usize,
     pub max_propfind_entries: usize,
     pub request_timeout: Duration,
-    /// Filesystem roots such as `/` and `C:\` are rejected unless explicitly
-    /// opted in. The default avoids an accidental whole-host share.
-    pub allow_filesystem_root: bool,
+    /// Fixed number of threads allowed to execute filesystem requests.
+    pub filesystem_workers: usize,
+    /// Maximum queued filesystem requests in addition to active workers.
+    pub filesystem_queue: usize,
 }
 
 impl Default for Limits {
@@ -64,7 +66,8 @@ impl Default for Limits {
             max_response_body: 32 * 1024 * 1024,
             max_propfind_entries: 4096,
             request_timeout: Duration::from_secs(30),
-            allow_filesystem_root: false,
+            filesystem_workers: 4,
+            filesystem_queue: 32,
         }
     }
 }
@@ -149,14 +152,7 @@ impl ConfigStore {
             if !share.bookmark_data.is_empty() {
                 return Err(ConfigError::BookmarkUnavailable);
             }
-            validate_root_path(&share.path, &self.limits)?;
-            let dir =
-                Dir::open_ambient_dir(&share.path, ambient_authority()).map_err(|source| {
-                    ConfigError::OpenRoot {
-                        path: share.path.clone(),
-                        source,
-                    }
-                })?;
+            let dir = open_validated_root(&share.path)?;
             match validated.entry(share.name.clone()) {
                 Entry::Vacant(entry) => {
                     entry.insert(ShareRoot { share, dir });
@@ -185,24 +181,71 @@ impl ConfigStore {
     }
 }
 
-fn validate_root_path(path: &Path, limits: &Limits) -> Result<(), ConfigError> {
+/// Open an absolute share root exactly once, walking every user-controlled
+/// component relative to a pinned parent handle without following links.
+fn open_validated_root(path: &Path) -> Result<Dir, ConfigError> {
     if !path.is_absolute() {
         return Err(ConfigError::RootNotAbsolute(path.to_path_buf()));
     }
-    let metadata = std::fs::symlink_metadata(path).map_err(|source| ConfigError::OpenRoot {
+
+    let mut anchor = PathBuf::new();
+    let mut names = Vec::new();
+    let mut saw_root = false;
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) if !saw_root && names.is_empty() => {
+                anchor.push(component.as_os_str());
+            }
+            Component::RootDir if !saw_root && names.is_empty() => {
+                anchor.push(component.as_os_str());
+                saw_root = true;
+            }
+            Component::Normal(name) if saw_root => names.push(name.to_os_string()),
+            Component::CurDir | Component::ParentDir => {
+                return Err(ConfigError::NonCanonicalRoot(path.to_path_buf()));
+            }
+            _ => return Err(ConfigError::NonCanonicalRoot(path.to_path_buf())),
+        }
+    }
+    if !saw_root {
+        return Err(ConfigError::RootNotAbsolute(path.to_path_buf()));
+    }
+
+    let mut canonical = anchor.clone();
+    for name in &names {
+        canonical.push(name);
+    }
+    if canonical.as_os_str() != path.as_os_str() {
+        return Err(ConfigError::NonCanonicalRoot(path.to_path_buf()));
+    }
+    // Never expose an entire filesystem/volume, even through aliases such as
+    // `/.`, `C:\`, or a UNC share root.
+    if names.is_empty() {
+        return Err(ConfigError::FilesystemRootDenied(path.to_path_buf()));
+    }
+
+    let mut dir = Dir::open_ambient_dir(&anchor, ambient_authority()).map_err(|source| {
+        ConfigError::OpenRoot {
+            path: path.to_path_buf(),
+            source,
+        }
+    })?;
+    for name in names {
+        dir = dir
+            .open_dir_nofollow(&name)
+            .map_err(|source| ConfigError::OpenRoot {
+                path: path.to_path_buf(),
+                source,
+            })?;
+    }
+    let metadata = dir.dir_metadata().map_err(|source| ConfigError::OpenRoot {
         path: path.to_path_buf(),
         source,
     })?;
-    if metadata.file_type().is_symlink() {
-        return Err(ConfigError::RootIsSymlink(path.to_path_buf()));
-    }
     if !metadata.is_dir() {
         return Err(ConfigError::RootNotDirectory(path.to_path_buf()));
     }
-    if !limits.allow_filesystem_root && path.parent().is_none() {
-        return Err(ConfigError::FilesystemRootDenied(path.to_path_buf()));
-    }
-    Ok(())
+    Ok(dir)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -219,9 +262,9 @@ pub enum ConfigError {
     RootNotAbsolute(PathBuf),
     #[error("Taildrive share root is not a directory: {0}")]
     RootNotDirectory(PathBuf),
-    #[error("Taildrive share root must not be a symbolic link: {0}")]
-    RootIsSymlink(PathBuf),
-    #[error("sharing a filesystem root requires an explicit opt-in: {0}")]
+    #[error("Taildrive share root is not a canonical absolute path: {0}")]
+    NonCanonicalRoot(PathBuf),
+    #[error("sharing a filesystem or volume root is forbidden: {0}")]
     FilesystemRootDenied(PathBuf),
     #[error("unable to open Taildrive root {path}: {source}")]
     OpenRoot {
@@ -247,8 +290,9 @@ mod tests {
         assert!(!initial.enabled());
         assert_eq!(initial.shares().count(), 0);
 
+        let canonical_tmp = std::fs::canonicalize(tmp.path()).unwrap();
         store
-            .replace(true, vec![Share::new(" Docs ", tmp.path())])
+            .replace(true, vec![Share::new(" Docs ", &canonical_tmp)])
             .unwrap();
         let before_failed_update = store.snapshot();
         assert_eq!(before_failed_update.shares().next().unwrap().name, "docs");
@@ -256,8 +300,8 @@ mod tests {
             .replace(
                 true,
                 vec![
-                    Share::new("same", tmp.path()),
-                    Share::new("SAME", tmp.path()),
+                    Share::new("same", &canonical_tmp),
+                    Share::new("SAME", &canonical_tmp),
                 ],
             )
             .is_err());
@@ -269,17 +313,67 @@ mod tests {
         assert!(!initial.enabled());
     }
 
+    #[test]
+    fn filesystem_root_and_lexical_aliases_are_rejected() {
+        let store = ConfigStore::new(Limits::default());
+        #[cfg(unix)]
+        for path in [
+            PathBuf::from("/"),
+            PathBuf::from("/."),
+            PathBuf::from("/tmp/../tmp"),
+        ] {
+            assert!(store.replace(true, vec![Share::new("docs", path)]).is_err());
+        }
+        #[cfg(windows)]
+        for path in [PathBuf::from("C:\\"), PathBuf::from("C:\\.")] {
+            assert!(store.replace(true, vec![Share::new("docs", path)]).is_err());
+        }
+    }
+
     #[cfg(unix)]
     #[test]
-    fn root_symlink_is_rejected() {
+    fn root_symlinks_in_any_component_are_rejected() {
         use std::os::unix::fs::symlink;
         let tmp = tempfile::tempdir().unwrap();
-        let link = tmp.path().join("link");
-        symlink(tmp.path(), &link).unwrap();
+        let canonical_tmp = std::fs::canonicalize(tmp.path()).unwrap();
+        let real = canonical_tmp.join("real");
+        let leaf = real.join("leaf");
+        std::fs::create_dir_all(&leaf).unwrap();
+        let intermediate_link = canonical_tmp.join("intermediate-link");
+        symlink(&real, &intermediate_link).unwrap();
+        let final_link = canonical_tmp.join("final-link");
+        symlink(&leaf, &final_link).unwrap();
         let store = ConfigStore::new(Limits::default());
-        assert!(matches!(
-            store.replace(true, vec![Share::new("docs", link)]),
-            Err(ConfigError::RootIsSymlink(_))
-        ));
+        assert!(store
+            .replace(
+                true,
+                vec![Share::new("docs", intermediate_link.join("leaf"))],
+            )
+            .is_err());
+        assert!(store
+            .replace(true, vec![Share::new("docs", final_link)])
+            .is_err());
+    }
+
+    #[test]
+    fn deterministic_root_swap_preserves_pinned_handle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let canonical_tmp = std::fs::canonicalize(tmp.path()).unwrap();
+        let configured = canonical_tmp.join("configured");
+        let moved = canonical_tmp.join("moved");
+        std::fs::create_dir(&configured).unwrap();
+        std::fs::write(configured.join("identity"), b"original").unwrap();
+        let store = ConfigStore::new(Limits::default());
+        store
+            .replace(true, vec![Share::new("docs", &configured)])
+            .unwrap();
+        let snapshot = store.snapshot();
+
+        std::fs::rename(&configured, &moved).unwrap();
+        std::fs::create_dir(&configured).unwrap();
+        std::fs::write(configured.join("identity"), b"replacement").unwrap();
+
+        let root = snapshot.shares.get("docs").unwrap();
+        assert_eq!(root.dir.read("identity").unwrap(), b"original");
     }
 }

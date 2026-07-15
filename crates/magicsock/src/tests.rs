@@ -1176,6 +1176,173 @@ async fn relay_server_role_revocation_clears_paths_and_reverse_mappings() {
     assert_eq!(received.data.as_ref(), b"from-b");
 }
 
+#[tokio::test]
+async fn relay_history_eviction_is_bounded_and_fail_closed() {
+    let target_key = NodePrivate::generate().public();
+    let target_disco = DiscoPrivate::generate().public();
+    let server_key = NodePrivate::generate().public();
+    let server_disco = DiscoPrivate::generate().public();
+    let (magicsock, mut rx) = Magicsock::new(MagicsockConfig {
+        private_key: NodePrivate::generate(),
+        disco_key: DiscoPrivate::generate(),
+        derp_client: None,
+        derp_map: None,
+        home_derp_region: 0,
+        udp_bind: None,
+        udp_socket: None,
+        portmapper: None,
+        health: None,
+        disable_direct_paths: false,
+        peer_relay_server: false,
+        relay_server_config: None,
+        sockstats: None,
+        control_knobs: None,
+    })
+    .await
+    .unwrap();
+    let target = make_peer(target_key.clone(), target_disco.clone(), vec![], 1);
+    let mut server = make_peer(server_key.clone(), server_disco, vec![], 1);
+    server.Cap = rustscale_tailcfg::CAP_VERSION_RELAY;
+    server.CapMap.insert(
+        rustscale_tailcfg::PEER_CAPABILITY_RELAY_TARGET.into(),
+        vec![rustscale_tailcfg::RawMessage::default()],
+    );
+    server.Hostinfo = Some(rustscale_tailcfg::Hostinfo {
+        PeerRelay: true,
+        ..Default::default()
+    });
+    magicsock
+        .set_netmap(vec![target.clone(), server.clone()])
+        .await
+        .unwrap();
+    let target_generation = magicsock.authorization_generation(&target_key).unwrap();
+    let server_generation = magicsock.authorization_generation(&server_key).unwrap();
+    let first_addr: SocketAddr = "127.0.0.1:10000".parse().unwrap();
+    let mut current_addr = first_addr;
+
+    for index in 0..5_000u16 {
+        current_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 10_000 + index);
+        RelayManagerContext::set_relay(
+            &*magicsock.inner,
+            &target_key,
+            &target_disco,
+            target_generation,
+            &server_key,
+            server_generation,
+            current_addr,
+            u32::from(index) + 1,
+        );
+        if usize::from(index) + 1 == endpoint::MAX_RELAY_PATH_HISTORY_PER_SERVER {
+            // Model a stale callback restoring the oldest reverse mapping.
+            // The next replacement deterministically evicts and removes it.
+            magicsock
+                .inner
+                .addr_to_peer
+                .write()
+                .unwrap()
+                .insert(first_addr, target_key.clone());
+        }
+        if usize::from(index) == endpoint::MAX_RELAY_PATH_HISTORY_PER_SERVER {
+            assert!(!magicsock
+                .inner
+                .addr_to_peer
+                .read()
+                .unwrap()
+                .contains_key(&first_addr));
+        }
+    }
+
+    let history_len = magicsock
+        .inner
+        .endpoints
+        .read()
+        .unwrap()
+        .get(&target_key)
+        .unwrap()
+        .relay_history_len(&server_key, server_generation);
+    assert_eq!(
+        history_len,
+        endpoint::MAX_RELAY_PATH_HISTORY_PER_SERVER,
+        "thousands of replacements must retain only a strict bounded history"
+    );
+    assert_eq!(
+        magicsock.inner.addr_to_peer.read().unwrap().len(),
+        1,
+        "only the current relay address may remain reverse-mapped"
+    );
+    assert_eq!(
+        magicsock
+            .inner
+            .addr_to_peer
+            .read()
+            .unwrap()
+            .get(&current_addr),
+        Some(&target_key)
+    );
+
+    // A raced mapping for a deterministically evicted address is still denied
+    // by exact current-path validation.
+    magicsock
+        .inner
+        .addr_to_peer
+        .write()
+        .unwrap()
+        .insert(first_addr, target_key.clone());
+    magicsock
+        .inner
+        .handle_wg_udp_relay(b"evicted", first_addr, 1, 7)
+        .await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), rx.recv())
+            .await
+            .is_err(),
+        "evicted relay address must not receive"
+    );
+    magicsock
+        .inner
+        .addr_to_peer
+        .write()
+        .unwrap()
+        .remove(&first_addr);
+
+    magicsock
+        .inner
+        .handle_wg_udp_relay(b"current", current_addr, 5_000, 7)
+        .await;
+    let current = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        .await
+        .expect("current relay receive deadline")
+        .expect("current relay receive")
+        .into_datagrams()
+        .into_iter()
+        .next()
+        .expect("one current relay datagram");
+    assert_eq!(current.peer, target_key);
+    assert_eq!(current.data.as_ref(), b"current");
+
+    server.CapMap.clear();
+    server.Hostinfo = Some(rustscale_tailcfg::Hostinfo::default());
+    magicsock.set_netmap(vec![target, server]).await.unwrap();
+    assert_eq!(
+        magicsock
+            .inner
+            .endpoints
+            .read()
+            .unwrap()
+            .get(&target_key)
+            .unwrap()
+            .relay_history_len(&server_key, server_generation),
+        0,
+        "revocation must clear all retained history"
+    );
+    assert!(!magicsock
+        .inner
+        .addr_to_peer
+        .read()
+        .unwrap()
+        .contains_key(&current_addr));
+}
+
 // ---- Test (a): DERP data path fallback ----
 
 #[tokio::test]

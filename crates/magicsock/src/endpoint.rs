@@ -5,7 +5,7 @@
 //! best confirmed direct path with a trust expiry, an optional peer-relay path,
 //! and a DERP fallback (the peer's home region).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
@@ -17,6 +17,10 @@ pub const TRUST_BEST_ADDR_DURATION: Duration = Duration::from_millis(6500);
 /// DERP route stale and clear it. Mirrors Go's derpRoute inactivity
 /// semantics — the route is cleaned up after this timeout.
 pub const DERP_ROUTE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Maximum current/recent relay addresses retained per exact server
+/// generation for revocation cleanup.
+pub(crate) const MAX_RELAY_PATH_HISTORY_PER_SERVER: usize = 8;
 
 /// Endpoint type, mirroring Go's `tailcfg.EndpointType` (tailcfg.go:1332).
 /// Used for ranking candidate paths: higher-ranked types are preferred.
@@ -271,7 +275,7 @@ pub struct Endpoint {
     candidates: Vec<(SocketAddr, EndpointType)>,
     best_addr: Option<(SocketAddr, Instant)>,
     relay: Option<RelayPath>,
-    relay_history: HashMap<(rustscale_key::NodePublic, u64), HashSet<SocketAddr>>,
+    relay_history: HashMap<(rustscale_key::NodePublic, u64), VecDeque<SocketAddr>>,
     home_derp: i32,
     /// The DERP region from which the most recent packet from this peer
     /// arrived. Used for reply routing when HomeDERP is 0 or stale.
@@ -521,17 +525,29 @@ impl Endpoint {
         vni: u32,
         server_key: rustscale_key::NodePublic,
         server_generation: u64,
-    ) {
-        self.relay_history
+    ) -> Vec<SocketAddr> {
+        let history = self
+            .relay_history
             .entry((server_key.clone(), server_generation))
-            .or_default()
-            .insert(addr);
+            .or_default();
+        if let Some(existing) = history.iter().position(|existing| *existing == addr) {
+            history.remove(existing);
+        }
+        history.push_back(addr);
+        let mut evicted = Vec::new();
+        while history.len() > MAX_RELAY_PATH_HISTORY_PER_SERVER {
+            if let Some(oldest) = history.pop_front() {
+                debug_assert_ne!(oldest, addr, "current relay address must not be evicted");
+                evicted.push(oldest);
+            }
+        }
         self.relay = Some(RelayPath {
             addr,
             vni,
             server_key,
             server_generation,
         });
+        evicted
     }
 
     /// Return the current relay path and its server identity.
@@ -560,20 +576,38 @@ impl Endpoint {
         server_generation: u64,
     ) -> Vec<SocketAddr> {
         let identity = (server_key.clone(), server_generation);
-        let mut addresses = self.relay_history.remove(&identity).unwrap_or_default();
+        let mut addresses = self
+            .relay_history
+            .remove(&identity)
+            .unwrap_or_default()
+            .into_iter()
+            .collect::<Vec<_>>();
         let matches_current = self.relay.as_ref().is_some_and(|relay| {
             &relay.server_key == server_key && relay.server_generation == server_generation
         });
         if matches_current {
             if let Some(relay) = self.relay.take() {
-                addresses.insert(relay.addr);
+                if !addresses.contains(&relay.addr) {
+                    addresses.push(relay.addr);
+                }
             }
         } else if let Some(current) = self.relay.as_ref() {
             // An address can be reused by a newer server identity. Its single
             // reverse-map slot now belongs to the current path, not history.
-            addresses.remove(&current.addr);
+            addresses.retain(|address| *address != current.addr);
         }
-        addresses.into_iter().collect()
+        addresses
+    }
+
+    #[cfg(test)]
+    pub fn relay_history_len(
+        &self,
+        server_key: &rustscale_key::NodePublic,
+        server_generation: u64,
+    ) -> usize {
+        self.relay_history
+            .get(&(server_key.clone(), server_generation))
+            .map_or(0, VecDeque::len)
     }
 
     /// Whether the direct path has expired at `now`.

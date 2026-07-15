@@ -3409,7 +3409,13 @@ impl relay_manager::RelayManagerContext for Inner {
                     addr_to_peer.remove(&previous_addr);
                 }
             }
-            ep.set_relay(addr, vni, relay_server_key.clone(), relay_server_generation);
+            let evicted =
+                ep.set_relay(addr, vni, relay_server_key.clone(), relay_server_generation);
+            for evicted_addr in evicted {
+                if evicted_addr != addr && addr_to_peer.get(&evicted_addr) == Some(peer_key) {
+                    addr_to_peer.remove(&evicted_addr);
+                }
+            }
             addr_to_peer.insert(addr, peer_key.clone());
             if debug_enabled() {
                 eprintln!(

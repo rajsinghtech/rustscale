@@ -27,7 +27,7 @@ use std::net::IpAddr;
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 #[cfg(unix)]
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 #[cfg(unix)]
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -43,9 +43,10 @@ pub async fn init_recording(
 ) -> Result<Option<SessionRecorder>, String> {
     if config.recorders.is_empty() {
         return match &config.local_path {
-            Some(path) => SessionRecorder::with_file(path, cast_header, config.fail_open)
-                .map(Some)
-                .map_err(|_| "local recording could not start".to_string()),
+            Some(path) => match SessionRecorder::with_file(path, cast_header, config.fail_open) {
+                Ok(recorder) => Ok(Some(recorder)),
+                Err(_) => recording_connect_failed(config, "local recording could not start"),
+            },
             None => Ok(None),
         };
     }
@@ -85,9 +86,18 @@ fn recording_connect_failed(
             return Err(action.RejectSessionWithMessage.clone());
         }
     }
-    let _ = error;
-    log::warn!("SSH recording disabled after a recorder transport failure");
-    Ok(None)
+    if config.fail_open {
+        let _ = error;
+        log::warn!("SSH recording disabled after a recorder transport failure");
+        Ok(None)
+    } else {
+        Err(config
+            .on_failure
+            .as_ref()
+            .map(|action| action.TerminateSessionWithMessage.clone())
+            .filter(|message| !message.is_empty())
+            .unwrap_or_else(|| "recording required".into()))
+    }
 }
 
 /// Extended data type code for stderr (RFC 4254 section 5.2).
@@ -433,12 +443,161 @@ impl ProcessControl for ProcessGroup {
 }
 
 #[cfg(unix)]
+type ChildWait = std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<i32>> + Send>>;
+
+#[cfg(unix)]
 pub(crate) struct LaunchedSession {
     pub input: Option<BoxWrite>,
     pub output: Option<BoxRead>,
     pub stderr: Option<BoxRead>,
-    pub wait: std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<i32>> + Send>>,
+    pub wait: ChildWait,
     pub control: std::sync::Arc<dyn ProcessControl>,
+}
+
+#[cfg(unix)]
+struct ProcessCleanupCommand {
+    control: Arc<dyn ProcessControl>,
+    wait: Option<ChildWait>,
+}
+
+#[cfg(unix)]
+fn process_cleanup_supervisor() -> &'static tokio::sync::mpsc::UnboundedSender<ProcessCleanupCommand>
+{
+    static SUPERVISOR: OnceLock<tokio::sync::mpsc::UnboundedSender<ProcessCleanupCommand>> =
+        OnceLock::new();
+    SUPERVISOR.get_or_init(|| {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ProcessCleanupCommand>();
+        std::thread::Builder::new()
+            .name("ssh-process-cleanup".into())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("SSH process cleanup runtime");
+                runtime.block_on(async move {
+                    while let Some(mut command) = rx.recv().await {
+                        tokio::spawn(async move {
+                            let _ = command.control.signal_group(libc::SIGTERM);
+                            tokio::time::sleep(PROCESS_TERM_TIMEOUT).await;
+                            let _ = command.control.signal_group(libc::SIGKILL);
+                            let disappear = async {
+                                loop {
+                                    if matches!(command.control.group_exists(), Ok(false)) {
+                                        break;
+                                    }
+                                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                                }
+                            };
+                            let _ = tokio::time::timeout(PROCESS_KILL_TIMEOUT, disappear).await;
+                            if let Some(wait) = command.wait.as_mut() {
+                                let _ = tokio::time::timeout(PROCESS_KILL_TIMEOUT, wait).await;
+                            }
+                        });
+                    }
+                });
+            })
+            .expect("SSH process cleanup supervisor");
+        tx
+    })
+}
+
+#[cfg(unix)]
+struct ProcessCleanupGuard {
+    control: Arc<dyn ProcessControl>,
+    wait: Option<ChildWait>,
+    armed: bool,
+}
+
+#[cfg(unix)]
+impl ProcessCleanupGuard {
+    fn new(control: Arc<dyn ProcessControl>, wait: Option<ChildWait>) -> Self {
+        Self {
+            control,
+            wait,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+        self.wait = None;
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ProcessCleanupGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = process_cleanup_supervisor().send(ProcessCleanupCommand {
+                control: self.control.clone(),
+                wait: self.wait.take(),
+            });
+        }
+    }
+}
+
+#[cfg(unix)]
+#[derive(Default)]
+struct LaunchOwnershipState {
+    canceled: bool,
+    control: Option<Arc<dyn ProcessControl>>,
+}
+
+#[cfg(unix)]
+struct LaunchAbortGuard {
+    state: Arc<Mutex<LaunchOwnershipState>>,
+    armed: bool,
+}
+
+#[cfg(unix)]
+impl LaunchAbortGuard {
+    fn new() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(LaunchOwnershipState::default())),
+            armed: true,
+        }
+    }
+
+    fn publisher(&self) -> Arc<Mutex<LaunchOwnershipState>> {
+        self.state.clone()
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+        self.state.lock().unwrap().control = None;
+    }
+}
+
+#[cfg(unix)]
+fn publish_launch_control(
+    state: &Arc<Mutex<LaunchOwnershipState>>,
+    control: Arc<dyn ProcessControl>,
+) {
+    let mut state = state.lock().unwrap();
+    if state.canceled {
+        let _ = process_cleanup_supervisor().send(ProcessCleanupCommand {
+            control,
+            wait: None,
+        });
+    } else {
+        state.control = Some(control);
+    }
+}
+
+#[cfg(unix)]
+impl Drop for LaunchAbortGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let mut state = self.state.lock().unwrap();
+            state.canceled = true;
+            if let Some(control) = state.control.take() {
+                let _ = process_cleanup_supervisor().send(ProcessCleanupCommand {
+                    control,
+                    wait: None,
+                });
+            }
+        }
+    }
 }
 
 /// Injectable launcher. Tests can validate identity and lifecycle behavior
@@ -809,15 +968,31 @@ pub(crate) async fn run_session_with(
     };
     let runtime = tokio::runtime::Handle::current();
     let (started_tx, mut started_rx) = tokio::sync::oneshot::channel();
-    let mut launch_task = tokio::task::spawn_blocking(move || {
+    let mut launch_abort = LaunchAbortGuard::new();
+    let launch_publisher = launch_abort.publisher();
+    let raw_launch_task = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let _runtime = runtime.enter();
         launcher.launch(
             args,
             Box::new(move |control| {
+                publish_launch_control(&launch_publisher, control.clone());
                 let _ = started_tx.send(control);
             }),
         )
+    });
+    let (launch_result_tx, mut launch_result_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let result = match raw_launch_task.await {
+            Ok(result) => result,
+            Err(error) => Err(io::Error::other(error.to_string()).into()),
+        };
+        if let Err(Ok(launched)) = launch_result_tx.send(result) {
+            let _ = process_cleanup_supervisor().send(ProcessCleanupCommand {
+                control: launched.control,
+                wait: Some(launched.wait),
+            });
+        }
     });
     let launch_timeout = tokio::time::sleep(BLOCKING_PHASE_TIMEOUT);
     tokio::pin!(launch_timeout);
@@ -825,7 +1000,7 @@ pub(crate) async fn run_session_with(
     let mut started_open = true;
     let launch_result = loop {
         tokio::select! {
-            result = &mut launch_task => break Ok(result),
+            result = &mut launch_result_rx => break Ok(result),
             started = &mut started_rx, if started_open => {
                 started_open = false;
                 if let Ok(control) = started {
@@ -837,7 +1012,10 @@ pub(crate) async fn run_session_with(
         }
     };
     let mut launched = match launch_result {
-        Ok(Ok(Ok(launched))) => launched,
+        Ok(Ok(Ok(launched))) => {
+            launch_abort.disarm();
+            launched
+        }
         Ok(Ok(Err(error))) => return finish_prelaunch_error(&mut session, error).await,
         Ok(Err(error)) => {
             return finish_prelaunch_error(
@@ -850,7 +1028,7 @@ pub(crate) async fn run_session_with(
             tokio::spawn(supervise_canceled_launch(
                 started_control,
                 started_open.then_some(started_rx),
-                launch_task,
+                launch_result_rx,
             ));
             return finish_prelaunch_cancellation(&mut session, cause).await;
         }
@@ -859,7 +1037,7 @@ pub(crate) async fn run_session_with(
     let mut process_output = launched.output.take();
     let mut process_stderr = launched.stderr.take();
     let control = launched.control.clone();
-    let mut child_wait = launched.wait;
+    let mut process_guard = ProcessCleanupGuard::new(control.clone(), Some(launched.wait));
 
     let mut pty_ioctl_fd = None;
     if let Some((write_fd, read_fd, ioctl_fd)) = pty_handles {
@@ -887,6 +1065,7 @@ pub(crate) async fn run_session_with(
     let mut drain_deadline = None;
     let mut group_cleanup_started = false;
     let mut group_cleanup_confirmed = false;
+    let mut group_cleanup_succeeded = false;
     let mut group_poll = tokio::time::interval(std::time::Duration::from_millis(25));
     group_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -910,6 +1089,7 @@ pub(crate) async fn run_session_with(
             if !group_cleanup_started {
                 group_cleanup_started = true;
                 if !begin_process_termination(control.as_ref(), &mut term_deadline) {
+                    group_cleanup_succeeded = true;
                     break;
                 }
             }
@@ -928,7 +1108,11 @@ pub(crate) async fn run_session_with(
                             (process_input.as_mut(), pty_ioctl_fd.as_ref())
                         {
                             let eof = pty_eof_byte(fd.as_raw_fd());
-                            let _ = input.write_all(&[eof]).await;
+                            // In canonical mode the first VEOF releases an
+                            // unterminated buffered line; the second, now at
+                            // an empty boundary, makes the following read
+                            // return EOF.
+                            let _ = input.write_all(&[eof, eof]).await;
                             let _ = input.flush().await;
                         }
                         process_input = None;
@@ -1031,8 +1215,9 @@ pub(crate) async fn run_session_with(
                     }
                 }
             }
-            result = &mut child_wait, if child_exit.is_none() => {
+            result = wait_for_child(&mut process_guard.wait), if child_exit.is_none() => {
                 reap_deadline = None;
+                process_guard.wait = None;
                 child_exit = Some(if let Ok(code) = result {
                     code
                 } else {
@@ -1099,6 +1284,7 @@ pub(crate) async fn run_session_with(
             _ = group_poll.tick(), if group_verify_deadline.is_some() => {
                 if let Ok(false) = control.group_exists() {
                     group_cleanup_confirmed = true;
+                    group_cleanup_succeeded = true;
                     group_verify_deadline = None;
                     if child_exit.is_none() {
                         reap_deadline = Some(tokio::time::Instant::now() + PROCESS_KILL_TIMEOUT);
@@ -1154,6 +1340,9 @@ pub(crate) async fn run_session_with(
     } else {
         child_exit.unwrap_or(1)
     };
+    if group_cleanup_succeeded && process_guard.wait.is_none() {
+        process_guard.disarm();
+    }
     session.exit(exit_code.max(0) as u32).await;
     Ok(exit_code)
 }
@@ -1211,7 +1400,9 @@ async fn send_cancellation(
 async fn supervise_canceled_launch(
     mut control: Option<Arc<dyn ProcessControl>>,
     started_rx: Option<tokio::sync::oneshot::Receiver<Arc<dyn ProcessControl>>>,
-    mut launch_task: tokio::task::JoinHandle<Result<LaunchedSession, SessionHandlerError>>,
+    mut launch_result_rx: tokio::sync::oneshot::Receiver<
+        Result<LaunchedSession, SessionHandlerError>,
+    >,
 ) {
     if control.is_none() {
         if let Some(mut started_rx) = started_rx {
@@ -1219,7 +1410,7 @@ async fn supervise_canceled_launch(
                 started = &mut started_rx => {
                     control = started.ok();
                 }
-                result = &mut launch_task => {
+                result = &mut launch_result_rx => {
                     if let Ok(Ok(launched)) = result {
                         supervise_late_launch(launched).await;
                     }
@@ -1230,7 +1421,7 @@ async fn supervise_canceled_launch(
     }
 
     let Some(control) = control else {
-        let _ = launch_task.await;
+        let _ = launch_result_rx.await;
         return;
     };
     let _ = control.signal_group(libc::SIGTERM);
@@ -1251,7 +1442,7 @@ async fn supervise_canceled_launch(
         log::warn!("canceled SSH setup left a persistent process group after SIGKILL");
     }
 
-    match tokio::time::timeout(PROCESS_KILL_TIMEOUT, &mut launch_task).await {
+    match tokio::time::timeout(PROCESS_KILL_TIMEOUT, &mut launch_result_rx).await {
         Ok(Ok(Ok(mut launched))) => {
             launched.input = None;
             launched.output = None;
@@ -1340,6 +1531,14 @@ async fn send_recording_termination(
 }
 
 #[cfg(unix)]
+async fn wait_for_child(wait: &mut Option<ChildWait>) -> io::Result<i32> {
+    if let Some(wait) = wait.as_mut() {
+        wait.await
+    } else {
+        std::future::pending().await
+    }
+}
+
 async fn wait_for_upload_result(
     result_rx: &mut Option<tokio::sync::oneshot::Receiver<io::Result<()>>>,
 ) {
@@ -1511,6 +1710,40 @@ mod tests {
             after <= baseline + 3,
             "PTY descriptors grew across recorder failures: {baseline} -> {after}"
         );
+    }
+
+    #[tokio::test]
+    async fn recorder_initialization_honors_explicit_fail_open_for_local_output() {
+        let path = std::env::temp_dir(); // Opening a directory as a cast file fails.
+        let header = || {
+            CastHeader::new(
+                (0, 0),
+                "command".into(),
+                std::collections::HashMap::new(),
+                "requested".into(),
+                "mapped".into(),
+                "connection".into(),
+            )
+        };
+        let fail_open = RecordingConfig {
+            local_path: Some(path.clone()),
+            fail_open: true,
+            ..Default::default()
+        };
+        assert!(init_recording(&fail_open, header(), None)
+            .await
+            .unwrap()
+            .is_none());
+
+        let fail_closed = RecordingConfig {
+            local_path: Some(path),
+            fail_open: false,
+            ..Default::default()
+        };
+        match init_recording(&fail_closed, header(), None).await {
+            Err(error) => assert_eq!(error, "recording required"),
+            Ok(_) => panic!("fail-closed local recording unexpectedly continued"),
+        }
     }
 
     #[test]

@@ -6,7 +6,7 @@ use crate::recording_upload::DialFn;
 use russh::{ChannelId, Sig};
 use rustscale_tailcfg::{Node, UserProfile};
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{mpsc, watch};
@@ -310,18 +310,51 @@ impl AsyncWrite for Session {
     }
 }
 
+struct ChannelCloseCommand {
+    handle: russh::server::Handle,
+    channel_id: ChannelId,
+}
+
+fn channel_close_supervisor() -> &'static tokio::sync::mpsc::UnboundedSender<ChannelCloseCommand> {
+    static SUPERVISOR: OnceLock<tokio::sync::mpsc::UnboundedSender<ChannelCloseCommand>> =
+        OnceLock::new();
+    SUPERVISOR.get_or_init(|| {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ChannelCloseCommand>();
+        std::thread::Builder::new()
+            .name("ssh-channel-close".into())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("SSH channel close runtime");
+                runtime.block_on(async move {
+                    while let Some(command) = rx.recv().await {
+                        tokio::spawn(async move {
+                            let close = async {
+                                let _ = command
+                                    .handle
+                                    .exit_status_request(command.channel_id, 1)
+                                    .await;
+                                let _ = command.handle.eof(command.channel_id).await;
+                                let _ = command.handle.close(command.channel_id).await;
+                            };
+                            let _ = tokio::time::timeout(Duration::from_secs(2), close).await;
+                        });
+                    }
+                });
+            })
+            .expect("SSH channel close supervisor");
+        tx
+    })
+}
+
 impl Drop for Session {
     fn drop(&mut self) {
         if !self.closed {
-            let handle = self.handle.clone();
-            let channel_id = self.channel_id;
-            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-                runtime.spawn(async move {
-                    let _ = handle.exit_status_request(channel_id, 1).await;
-                    let _ = handle.eof(channel_id).await;
-                    let _ = handle.close(channel_id).await;
-                });
-            }
+            let _ = channel_close_supervisor().send(ChannelCloseCommand {
+                handle: self.handle.clone(),
+                channel_id: self.channel_id,
+            });
         }
         if let Some(tx) = self.done_tx.take() {
             let _ = tx.try_send(());

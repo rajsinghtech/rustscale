@@ -972,6 +972,7 @@ mod tests {
     async fn fail_open_and_fail_closed_on_connect_failure() {
         let config = crate::recording::RecordingConfig {
             recorders: vec![addr(8, 1)],
+            fail_open: true,
             ..Default::default()
         };
         assert!(init_recording(&config, header(), Some(duplex_dial(vec![])))

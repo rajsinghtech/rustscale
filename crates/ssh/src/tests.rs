@@ -271,6 +271,111 @@ async fn data_before_start_and_eof_are_drained_as_an_input_half_close() {
     }
     assert_eq!(exit.unwrap_or(result), 0);
     assert_eq!(output, b"first-second:after-eof");
+
+    let mut pty_channel = client.channel_open_session().await.unwrap();
+    pty_channel
+        .request_pty(false, "xterm", 80, 24, 0, 0, &[])
+        .await
+        .unwrap();
+    pty_channel
+        .data_bytes(b"unterminated-canonical-input".as_slice())
+        .await
+        .unwrap();
+    pty_channel
+        .exec(true, b"cat; printf ':pty-after-eof'")
+        .await
+        .unwrap();
+    pty_channel.eof().await.unwrap();
+    let init = session_rx.recv().await.unwrap();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        run_session(Session::from_init(init), None),
+    )
+    .await
+    .expect("PTY EOF did not terminate canonical input")
+    .unwrap();
+    let mut output = Vec::new();
+    let mut exit = None;
+    while let Some(message) = pty_channel.wait().await {
+        match message {
+            ChannelMsg::Data { data } => output.extend_from_slice(&data),
+            ChannelMsg::ExitStatus { exit_status } => exit = Some(exit_status as i32),
+            _ => {}
+        }
+    }
+    assert_eq!(exit.unwrap_or(result), 0);
+    assert!(
+        output
+            .windows(b":pty-after-eof".len())
+            .any(|window| window == b":pty-after-eof"),
+        "PTY response missing: {}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[tokio::test]
+async fn local_recording_path_failure_exits_closes_and_removes_channel_state() {
+    let blocked_root = std::env::temp_dir().join(format!(
+        "rustscale-ssh-recording-root-file-{}",
+        std::process::id()
+    ));
+    std::fs::write(&blocked_root, b"not a directory").unwrap();
+    let host_key = host_key_from_node_key(&NodePrivate::generate());
+    let (session_tx, mut session_rx) = mpsc::channel::<crate::session::SessionInit>(2);
+    let config = SshServerConfig {
+        host_keys: vec![host_key],
+        session_tx,
+        whois: whois_finds_peer(),
+        policy: policy_allow_any(),
+        state_dir: Some(blocked_root.clone()),
+        dial_fn: None,
+    };
+    let mut server = SshServer::new(config);
+    let server_config = server.russh_config();
+    let (client_io, server_io) = tokio::io::duplex(16 * 1024);
+    let handler = server.new_client(Some(SocketAddr::new(peer_ip(), 22)));
+    tokio::spawn(async move {
+        let running = russh::server::run_stream(server_config, server_io, handler)
+            .await
+            .unwrap();
+        let _ = running.await;
+    });
+    let mut client = russh::client::connect_stream(
+        Arc::new(russh::client::Config::default()),
+        client_io,
+        ClientHandler,
+    )
+    .await
+    .unwrap();
+    assert!(client
+        .authenticate_password("alice", "")
+        .await
+        .unwrap()
+        .success());
+    let mut channel = client.channel_open_session().await.unwrap();
+    channel.exec(true, b"ignored").await.unwrap();
+    let exit = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        let mut exit = None;
+        while let Some(message) = channel.wait().await {
+            if let ChannelMsg::ExitStatus { exit_status } = message {
+                exit = Some(exit_status);
+            }
+        }
+        exit
+    })
+    .await
+    .expect("local recording path failure left the channel open");
+    assert_eq!(exit, Some(1));
+    assert!(session_rx.try_recv().is_err());
+
+    let mut channels = Vec::new();
+    for _ in 0..16 {
+        channels.push(client.channel_open_session().await.unwrap());
+    }
+    for channel in &channels {
+        channel.close().await.unwrap();
+    }
+    let _ = std::fs::remove_file(blocked_root);
 }
 
 #[tokio::test]
@@ -309,7 +414,8 @@ async fn dropping_unfinished_session_reports_failure_and_closes_channel() {
         .success());
     let mut channel = client.channel_open_session().await.unwrap();
     channel.exec(true, b"ignored").await.unwrap();
-    drop(Session::from_init(session_rx.recv().await.unwrap()));
+    let unfinished = Session::from_init(session_rx.recv().await.unwrap());
+    std::thread::spawn(move || drop(unfinished)).join().unwrap();
 
     let exit = tokio::time::timeout(std::time::Duration::from_secs(1), async {
         let mut exit = None;
@@ -679,6 +785,37 @@ async fn injected_prelaunch_failures_report_nonzero_and_close_channels() {
     .await;
     assert_eq!(code, 1);
     assert!(String::from_utf8_lossy(&output).contains("recording unavailable"));
+
+    let local_open_failure = |init: &mut crate::session::SessionInit| {
+        init.recording_config = Some(crate::RecordingConfig {
+            local_path: Some(std::env::temp_dir()),
+            fail_open: false,
+            ..Default::default()
+        });
+        init.recording_header = Some(crate::CastHeader::new(
+            (0, 0),
+            "ignored".into(),
+            std::collections::HashMap::new(),
+            "requested".into(),
+            "mapped".into(),
+            "connection".into(),
+        ));
+    };
+    let (code, output) = run_pipeline_custom(
+        "ignored",
+        "requested",
+        policy_map_any("mapped"),
+        Some((
+            mapped_test_resolver(),
+            Arc::new(CapturingLauncher::default()),
+        )),
+        Some(&local_open_failure),
+        false,
+        false,
+    )
+    .await;
+    assert_eq!(code, 1);
+    assert!(String::from_utf8_lossy(&output).contains("recording required"));
 }
 
 #[tokio::test]
@@ -1511,6 +1648,54 @@ async fn duration_kills_post_fork_child_while_launch_return_is_blocked() {
 }
 
 #[tokio::test]
+async fn aborting_session_future_kills_published_child_before_launcher_returns() {
+    let inner = Arc::new(TermIgnoringLauncher::new(Vec::new()));
+    let gate = Arc::new(BlockingGate::default());
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let launcher: Arc<dyn SessionLauncher> = Arc::new(GatedLauncher {
+        inner: inner.clone(),
+        gate: gate.clone(),
+        entered: Mutex::new(Some(entered_tx)),
+    });
+    let mut run = Box::pin(run_pipeline_custom(
+        "ignored",
+        "requested",
+        policy_map_any("mapped"),
+        Some((mapped_test_resolver(), launcher)),
+        None,
+        false,
+        false,
+    ));
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        tokio::select! {
+            entered = entered_rx => entered.expect("launcher entry signal dropped"),
+            _ = &mut run => panic!("session completed before launcher blocked"),
+        }
+    })
+    .await
+    .expect("launcher did not publish its child");
+    drop(run);
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if inner
+                .control
+                .signals
+                .lock()
+                .unwrap()
+                .contains(&libc::SIGKILL)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("aborted session did not clean up its published child");
+    gate.release();
+}
+
+#[tokio::test]
 async fn duration_cancels_hung_recorder_initialization_before_launch() {
     let launcher = Arc::new(CapturingLauncher::default());
     let resolver: Arc<UserResolver> = Arc::new(|_name: String| {
@@ -1712,10 +1897,11 @@ async fn persistent_process_group_returns_explicit_failure() {
     .await
     .expect("persistent group cleanup was not bounded");
     assert_eq!(result.0, 1);
-    assert_eq!(
-        &*control.signals.lock().unwrap(),
-        &[libc::SIGTERM, libc::SIGKILL]
-    );
+    assert!(control
+        .signals
+        .lock()
+        .unwrap()
+        .starts_with(&[libc::SIGTERM, libc::SIGKILL]));
 }
 
 #[tokio::test]

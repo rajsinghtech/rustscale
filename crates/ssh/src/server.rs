@@ -265,11 +265,15 @@ impl SshHandler {
                 self.recording_config = if recorders.is_empty() && local_path.is_none() {
                     None
                 } else {
+                    let debug_local = recorders.is_empty() && local_path.is_some();
                     Some(RecordingConfig {
                         recorders,
-                        fail_open: on_failure
-                            .as_ref()
-                            .is_none_or(|failure| failure.TerminateSessionWithMessage.is_empty()),
+                        // Deprecated debug-local recording is explicitly
+                        // requested by the operator and remains fail-closed.
+                        fail_open: !debug_local
+                            && on_failure.as_ref().is_none_or(|failure| {
+                                failure.TerminateSessionWithMessage.is_empty()
+                            }),
                         on_failure,
                         local_path,
                     })
@@ -358,7 +362,10 @@ impl SshHandler {
                     config.local_path = path;
                 } else {
                     let _ = session.data(channel_id, "can't start new recording\r\n");
-                    let _ = session.channel_failure(channel_id);
+                    let _ = session.exit_status_request(channel_id, 1);
+                    let _ = session.eof(channel_id);
+                    let _ = session.close(channel_id);
+                    self.channels.lock().unwrap().remove(&channel_id);
                     return Ok(());
                 }
             }

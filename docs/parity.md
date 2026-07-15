@@ -254,7 +254,7 @@ state-dir fallback probing), `--json`.
 | `update` | `cli/update.go` | 🔶 stub (not-yet-supported) |
 | `drive` | `cli/drive.go` | ⬜ |
 | `lock` | `cli/lock.go` | ⬜ |
-| completion/man | — | ⬜ |
+| completion/man | `cli/ffcomplete/` | ✅ bash, zsh, and fish script generation plus hidden, side-effect-free runtime completion protocol; man pages are not provided upstream |
 
 `crates/localclient`: async LocalAPI HTTP client over `safesocket::connect`,
 hand-rolled HTTP/1.1 (no hyper), fake Host `local-rustscaled.sock`, typed

@@ -207,6 +207,45 @@ fn linux_batch_requires_scalar_handler<'a>(
     })
 }
 
+/// Linux UDP receive configuration sampled once when the receive task starts.
+///
+/// The bounded `recvmmsg` receive and handoff path is the normal mode. UDP
+/// GRO remains separately opt-in because it has a distinct kernel behavior
+/// and operational risk profile. `RUSTSCALE_ENABLE_LINUX_UDP_BATCH` is kept
+/// as a compatibility no-op for deployments that previously set it; the
+/// explicit scalar kill switch always wins.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LinuxUdpReceiveConfig {
+    use_batch: bool,
+    disable_udp_gro: bool,
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl LinuxUdpReceiveConfig {
+    #[cfg(target_os = "linux")]
+    fn from_environment() -> Self {
+        Self::from_environment_presence(
+            std::env::var_os("RUSTSCALE_DISABLE_LINUX_UDP_BATCH").is_some(),
+            std::env::var_os("RUSTSCALE_ENABLE_LINUX_UDP_BATCH").is_some(),
+            std::env::var_os("RUSTSCALE_ENABLE_UDP_GRO").is_some(),
+        )
+    }
+
+    fn from_environment_presence(
+        disable_linux_udp_batch: bool,
+        _enable_linux_udp_batch: bool,
+        enable_udp_gro: bool,
+    ) -> Self {
+        Self {
+            // An explicit safety switch must remain effective even in a
+            // deployment that still carries the old batch opt-in variable.
+            use_batch: !disable_linux_udp_batch,
+            disable_udp_gro: !enable_udp_gro,
+        }
+    }
+}
+
 /// Maximum number of ordered WireGuard packets carried by one receive item.
 pub const WG_RECEIVE_BATCH_MAX_PACKETS: usize = 128;
 
@@ -2405,11 +2444,11 @@ fn spawn_recv_tasks(
         let udp = udp.clone();
         let inner = inner.clone();
         tokio::spawn(async move {
-            // Keep the known-good scalar receiver as the release default while
-            // the bounded batch handoff remains available for public testing.
-            // Sample the opt-in once so the hot path never reads the process
-            // environment.
-            if std::env::var_os("RUSTSCALE_ENABLE_LINUX_UDP_BATCH").is_none() {
+            // Read deployment configuration once. Neither receive mode nor
+            // UDP GRO selection consults the process environment on the hot
+            // path.
+            let receive_config = LinuxUdpReceiveConfig::from_environment();
+            if !receive_config.use_batch {
                 let mut buf = vec![0u8; 65_536];
                 loop {
                     match udp.recv_from(&mut buf).await {
@@ -2428,8 +2467,7 @@ fn spawn_recv_tasks(
 
             // Within the batch receiver, UDP GRO is a separate opt-in; the
             // 128-slot plain recvmmsg path is used otherwise.
-            let disable_udp_gro = std::env::var_os("RUSTSCALE_ENABLE_UDP_GRO").is_none();
-            let mut batch = udp_batch::ReceiveBatch::new(&udp, disable_udp_gro);
+            let mut batch = udp_batch::ReceiveBatch::new(&udp, receive_config.disable_udp_gro);
             // `pending` only stages ownership; pooled ciphertext ownership moves
             // into the channel or is dropped before the next receive.
             let mut pending = Vec::with_capacity(udp_batch::MAX_BATCH);
@@ -4124,6 +4162,27 @@ mod linux_batch_tests {
         // `spawn_recv_tasks` handles the true branch by iterating the same
         // receive indexes in ascending order through `handle_udp_packet`;
         // ordinary packets therefore cannot leap over disco/Geneve control.
+    }
+
+    #[test]
+    fn linux_receive_defaults_to_plain_recvmmsg_without_gro() {
+        let config = LinuxUdpReceiveConfig::from_environment_presence(false, false, false);
+        assert!(config.use_batch);
+        assert!(config.disable_udp_gro);
+    }
+
+    #[test]
+    fn linux_receive_scalar_kill_switch_overrides_legacy_batch_opt_in() {
+        let config = LinuxUdpReceiveConfig::from_environment_presence(true, true, true);
+        assert!(!config.use_batch);
+        assert!(!config.disable_udp_gro);
+    }
+
+    #[test]
+    fn linux_receive_legacy_batch_opt_in_remains_batch_compatible() {
+        let config = LinuxUdpReceiveConfig::from_environment_presence(false, true, false);
+        assert!(config.use_batch);
+        assert!(config.disable_udp_gro);
     }
 
     #[test]

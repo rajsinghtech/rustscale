@@ -975,6 +975,7 @@ async fn serve_map(
 
     let nk = req.NodeKey.clone();
     let node_id;
+    let compress_zstd = req.Compress == "zstd";
 
     // Validate the node and update its state.
     {
@@ -1041,7 +1042,7 @@ async fn serve_map(
         // Check for injected raw map responses first.
         if streaming {
             if let Some(frame) = take_injected_message(inner, &nk) {
-                if send_map_frame(&mut send_stream, &frame).is_err() {
+                if send_map_frame(&mut send_stream, &frame, compress_zstd).is_err() {
                     break;
                 }
                 continue;
@@ -1058,7 +1059,7 @@ async fn serve_map(
                 // first response (end_of_stream=true). For streaming, keep
                 // the stream open.
                 let eos = !streaming;
-                if send_map_frame_raw(&mut send_stream, &json, eos).is_err() {
+                if send_map_frame_raw(&mut send_stream, &json, eos, compress_zstd).is_err() {
                     break;
                 }
             }
@@ -1085,7 +1086,7 @@ async fn serve_map(
                     ..Default::default()
                 };
                 let json = serde_json::to_vec(&keepalive).unwrap_or_default();
-                if send_map_frame_raw(&mut send_stream, &json, false).is_err() {
+                if send_map_frame_raw(&mut send_stream, &json, false, compress_zstd).is_err() {
                     break;
                 }
             }
@@ -1222,21 +1223,32 @@ fn build_map_response(
 fn send_map_frame(
     send: &mut h2::SendStream<bytes::Bytes>,
     mr: &MapResponse,
-) -> Result<(), h2::Error> {
-    let json = serde_json::to_vec(mr).unwrap_or_default();
-    send_map_frame_raw(send, &json, false)
+    compress_zstd: bool,
+) -> Result<(), ()> {
+    let json = serde_json::to_vec(mr).map_err(|_| ())?;
+    send_map_frame_raw(send, &json, false, compress_zstd)
 }
 
-/// Send raw bytes as a 4-byte LE length-prefixed frame.
+/// Send raw bytes as a 4-byte LE length-prefixed frame, honoring the map
+/// request's zstd compression negotiation.
 fn send_map_frame_raw(
     send: &mut h2::SendStream<bytes::Bytes>,
     payload: &[u8],
     end_of_stream: bool,
-) -> Result<(), h2::Error> {
+    compress_zstd: bool,
+) -> Result<(), ()> {
+    let compressed;
+    let payload = if compress_zstd {
+        compressed = zstd::bulk::compress(payload, 1).map_err(|_| ())?;
+        compressed.as_slice()
+    } else {
+        payload
+    };
     let mut frame = Vec::with_capacity(4 + payload.len());
     frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     frame.extend_from_slice(payload);
     send.send_data(bytes::Bytes::from(frame), end_of_stream)
+        .map_err(|_| ())
 }
 
 #[cfg(test)]

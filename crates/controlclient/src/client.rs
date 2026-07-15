@@ -104,6 +104,70 @@ pub enum H2SetupError {
     Io(#[from] std::io::Error),
 }
 
+/// Errors from a generic HTTP request sent over the Noise control channel.
+#[derive(Debug, thiserror::Error)]
+pub enum NoiseRequestError {
+    #[error("dial: {0}")]
+    Dial(#[from] crate::controlhttp::DialError),
+    #[error("noise: {0}")]
+    Noise(#[from] crate::controlbase::NoiseError),
+    #[error("h2: {0}")]
+    H2(#[from] h2::Error),
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+impl From<H2SetupError> for NoiseRequestError {
+    fn from(error: H2SetupError) -> Self {
+        match error {
+            H2SetupError::Noise(error) => Self::Noise(error),
+            H2SetupError::H2(error) => Self::H2(error),
+            H2SetupError::Io(error) => Self::Io(error),
+        }
+    }
+}
+
+/// A streaming HTTP response received over the Noise control channel.
+pub struct NoiseResponse {
+    status: u16,
+    body: NoiseResponseBody,
+}
+
+impl NoiseResponse {
+    /// The HTTP status code.
+    pub fn status(&self) -> u16 {
+        self.status
+    }
+
+    /// Consume the response and return its streaming body.
+    pub fn into_body(self) -> NoiseResponseBody {
+        self.body
+    }
+}
+
+/// A streaming HTTP/2 response body with the transport details hidden.
+pub struct NoiseResponseBody {
+    inner: h2::RecvStream,
+    cancel: h2::SendStream<bytes::Bytes>,
+}
+
+impl NoiseResponseBody {
+    /// Read the next body chunk, releasing HTTP/2 flow-control capacity.
+    pub async fn data(&mut self) -> Result<Option<bytes::Bytes>, h2::Error> {
+        let Some(chunk) = self.inner.data().await else {
+            return Ok(None);
+        };
+        let chunk = chunk?;
+        let _ = self.inner.flow_control().release_capacity(chunk.len());
+        Ok(Some(chunk))
+    }
+
+    /// Cancel the response stream and unblock a pending body read.
+    pub fn cancel(&mut self) {
+        self.cancel.send_reset(h2::Reason::CANCEL);
+    }
+}
+
 impl From<H2SetupError> for RegisterError {
     fn from(e: H2SetupError) -> Self {
         match e {
@@ -169,6 +233,57 @@ impl ControlClient {
     /// Set the persisted node key used when delivering audit events.
     pub fn set_audit_node_key(&mut self, node_key: NodePublic) {
         self.audit_node_key = Some(node_key);
+    }
+
+    /// Send a JSON request over a fresh HTTP/2-in-Noise connection.
+    ///
+    /// This low-level entry point lets additive control protocol clients reuse
+    /// the established ts2021 transport without duplicating Noise or TLS.
+    /// When `node_key` is present, the `Ts-Lb` load-balancer header is added.
+    pub async fn post_json(
+        &self,
+        path: &str,
+        body: Vec<u8>,
+        node_key: Option<&NodePublic>,
+    ) -> Result<NoiseResponse, NoiseRequestError> {
+        let noise_stream = dial_control(
+            &self.host,
+            &self.machine_key,
+            &self.control_key,
+            self.version,
+            self.extra_root_certs.as_deref(),
+        )
+        .await?;
+
+        let (conn, stream) = noise_stream.into_parts();
+        let noise_io = NoiseIo::new(conn, stream);
+        let (mut h2_send, h2_conn) = establish_h2(noise_io).await?;
+        tokio::spawn(async move {
+            let _ = h2_conn.await;
+        });
+
+        let mut builder = http::Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("content-type", "application/json");
+        if let Some(node_key) = node_key.filter(|key| !key.is_zero()) {
+            builder = builder.header("Ts-Lb", node_key.to_string());
+        }
+        let request = builder
+            .body(())
+            .map_err(|error| NoiseRequestError::Io(std::io::Error::other(error)))?;
+        let (response, mut send_stream) = h2_send.send_request(request, false)?;
+        send_stream.send_data(bytes::Bytes::from(body), true)?;
+
+        let response = response.await?;
+        let status = response.status().as_u16();
+        Ok(NoiseResponse {
+            status,
+            body: NoiseResponseBody {
+                inner: response.into_body(),
+                cancel: send_stream,
+            },
+        })
     }
 
     /// Send a `RegisterRequest` to `/machine/register` and return the response.

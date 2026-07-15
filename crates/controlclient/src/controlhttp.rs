@@ -358,14 +358,22 @@ pub async fn fetch_server_pub_key(
         buf
     };
 
-    // Find the body (after \r\n\r\n).
-    let body_start = read_buf
+    // Validate the status before parsing the key body.
+    let header_end = read_buf
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
-        .map(|p| p + 4)
         .ok_or_else(|| DialError::Malformed("no body in /key response".into()))?;
+    let status_line_end = read_buf[..header_end]
+        .windows(2)
+        .position(|w| w == b"\r\n")
+        .unwrap_or(header_end);
+    let status_line = std::str::from_utf8(&read_buf[..status_line_end])
+        .map_err(|_| DialError::Malformed("non-UTF-8 /key status line".into()))?;
+    if parse_status_code(status_line)? != 200 {
+        return Err(DialError::BadStatus(status_line.to_string()));
+    }
 
-    let body = &read_buf[body_start..];
+    let body = &read_buf[header_end + 4..];
 
     // Parse JSON: {"publicKey":"mkey:...","legacyPublicKey":"mkey:..."}
     let resp: Option<KeyResponse> = serde_json::from_slice(body).ok();

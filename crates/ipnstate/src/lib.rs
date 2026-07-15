@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use rustscale_key::NodePublic;
-use rustscale_tailcfg::{DNSRecord, UserID, UserProfile};
+use rustscale_tailcfg::{DNSRecord, StableNodeID, UserID, UserProfile};
 
 fn deserialize_null_to_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
@@ -223,7 +223,7 @@ pub struct TailnetStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ExitNodeStatus {
     #[serde(default)]
-    pub ID: String,
+    pub ID: StableNodeID,
     #[serde(default)]
     pub Online: bool,
     #[serde(default, deserialize_with = "deserialize_null_to_default")]

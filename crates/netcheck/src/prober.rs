@@ -311,6 +311,7 @@ async fn run_probe(
         ProbeProto::V6 => "[::]:0",
     };
     let sock = UdpSocket::bind(bind).await.ok()?;
+    rustscale_netns::configure_udp_socket(&sock).ok()?;
     let mut buf = [0u8; 1500];
     let mut backoff = INITIAL_RETRANSMIT;
 

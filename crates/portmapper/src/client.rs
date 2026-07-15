@@ -25,6 +25,12 @@ use crate::pcp;
 use crate::pmp;
 use crate::upnp;
 
+async fn bind_underlay_udp() -> std::io::Result<UdpSocket> {
+    let socket = UdpSocket::bind("0.0.0.0:0").await?;
+    rustscale_netns::configure_udp_socket(&socket)?;
+    Ok(socket)
+}
+
 /// Which kind of port mapping was obtained.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MappingKind {
@@ -706,7 +712,7 @@ impl Client {
         // mapping in a newer generation.
         let socket = match &cached.release {
             ReleaseIdentity::Pmp { .. } | ReleaseIdentity::Pcp { .. } => {
-                match UdpSocket::bind("0.0.0.0:0").await {
+                match bind_underlay_udp().await {
                     Ok(socket) => Some(socket),
                     Err(_) => return false,
                 }
@@ -1146,7 +1152,7 @@ impl Client {
         let pxp_port = self.pxp_port();
         let upnp_port = self.upnp_port();
 
-        let sock = UdpSocket::bind("0.0.0.0:0").await?;
+        let sock = bind_underlay_udp().await?;
         let pxp_addr = SocketAddr::V4(SocketAddrV4::new(gi.gateway, pxp_port));
         let upnp_unicast = SocketAddr::V4(SocketAddrV4::new(gi.gateway, upnp_port));
         let upnp_multicast = SocketAddr::V4(SocketAddrV4::new(crate::SSDP_MULTICAST, upnp_port));
@@ -1522,9 +1528,7 @@ impl Client {
         if self.with_current_gateway(snapshot, |_| ()).is_none() {
             return Ok(None);
         }
-        let sock = UdpSocket::bind("0.0.0.0:0")
-            .await
-            .map_err(crate::PortMapError::Io)?;
+        let sock = bind_underlay_udp().await.map_err(crate::PortMapError::Io)?;
         let pxp_addr = SocketAddr::V4(SocketAddrV4::new(gi.gateway, pxp_port));
 
         let prefer_pcp = have_recent_pcp && !have_recent_pmp;

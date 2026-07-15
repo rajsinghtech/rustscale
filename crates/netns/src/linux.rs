@@ -7,13 +7,21 @@ use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 const LINUX_BYPASS_MARK: u32 = 0x80000;
 
 pub async fn control_and_connect(addr: SocketAddr) -> Result<TcpStream, std::io::Error> {
+    connect(addr, false).await
+}
+
+pub async fn system_control_and_connect(addr: SocketAddr) -> Result<TcpStream, std::io::Error> {
+    connect(addr, true).await
+}
+
+async fn connect(addr: SocketAddr, force_bypass: bool) -> Result<TcpStream, std::io::Error> {
     let socket = if addr.is_ipv4() {
         TcpSocket::new_v4()?
     } else {
         TcpSocket::new_v6()?
     };
     let fd = socket.as_raw_fd();
-    configure_socket(fd)?;
+    configure_socket(fd, force_bypass)?;
     let stream = socket.connect(addr).await?;
     stream.set_nodelay(true).ok();
     Ok(stream)
@@ -21,11 +29,17 @@ pub async fn control_and_connect(addr: SocketAddr) -> Result<TcpStream, std::io:
 
 /// Configure a magicsock UDP socket with the same bypass policy as TCP.
 pub fn configure_udp_socket(socket: &UdpSocket) -> Result<(), std::io::Error> {
-    configure_socket(socket.as_raw_fd())
+    configure_socket(socket.as_raw_fd(), false)
 }
 
-fn configure_socket(fd: std::os::fd::RawFd) -> Result<(), std::io::Error> {
-    if super::DISABLE_BIND_CONN_TO_INTERFACE.load(std::sync::atomic::Ordering::Relaxed) {
+pub fn validate_underlay_bypass(_rustscale_tun_name: &str) -> Result<(), std::io::Error> {
+    Ok(())
+}
+
+fn configure_socket(fd: std::os::fd::RawFd, force_bypass: bool) -> Result<(), std::io::Error> {
+    if !force_bypass
+        && super::DISABLE_BIND_CONN_TO_INTERFACE.load(std::sync::atomic::Ordering::Relaxed)
+    {
         return Ok(());
     }
     if use_socket_mark() {

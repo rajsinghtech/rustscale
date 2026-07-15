@@ -1053,6 +1053,9 @@ async fn forward_upstream(query: &[u8], upstream: &[SocketAddr]) -> Option<Vec<u
             Ok(s) => s,
             Err(_) => continue,
         };
+        if rustscale_netns::configure_udp_socket(&sock).is_err() {
+            continue;
+        }
         if sock.send_to(query, server).await.is_err() {
             continue;
         }

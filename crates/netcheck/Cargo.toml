@@ -13,6 +13,7 @@ workspace = true
 rustscale-tailcfg = { path = "../tailcfg", version = "0.1.1" }
 rustscale-health = { path = "../health", version = "0.1.1" }
 rustscale-tsdial = { path = "../tsdial", version = "0.1.1" }
+rustscale-netns.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 rand.workspace = true

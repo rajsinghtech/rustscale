@@ -1,6 +1,22 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
+fn route_error_with_prefs_rollback(
+    state_dir: Option<&std::path::PathBuf>,
+    old_prefs: &rustscale_ipn::Prefs,
+    route_error: TsnetError,
+) -> TsnetError {
+    let Some(dir) = state_dir else {
+        return route_error;
+    };
+    match old_prefs.save(dir) {
+        Ok(()) => route_error,
+        Err(rollback_error) => TsnetError::Builder(format!(
+            "route update failed: {route_error}; prefs rollback failed: {rollback_error}"
+        )),
+    }
+}
+
 impl Server {
     /// Get the current server status.
     pub fn status(&self) -> ServerStatus {
@@ -53,6 +69,7 @@ impl Server {
     /// Returns `None` if the server is not up.
     pub async fn ipn_status(&self) -> Option<rustscale_ipnstate::Status> {
         let inner = self.inner.as_ref()?;
+        let _map_snapshot = inner.peer_map.gate.read().await;
         let peers = inner.peers.read().await;
         let user_profiles = inner.user_profiles.read().await;
         let dns_config = inner.dns_config.read().await;
@@ -119,6 +136,7 @@ impl Server {
             ps.InEngine = true;
         });
 
+        let selected_exit_key = inner.route_table.read().await.exit_node().cloned();
         for peer in peers.iter() {
             if peer.Key.is_zero() {
                 continue;
@@ -140,11 +158,15 @@ impl Server {
             let exit_node_option = crate::peer_is_exit_capable(peer);
 
             let ps = rustscale_ipnstate::PeerStatus {
+                ID: peer.StableID.clone(),
+                NodeID: peer.ID,
+                PublicKey: peer.Key.to_string(),
                 HostName: peer.Name.trim_end_matches('.').to_string(),
                 DNSName: peer.Name.clone(),
                 TailscaleIPs: ips,
                 Online: peer.Online.unwrap_or(false),
                 Relay: relay,
+                ExitNode: selected_exit_key.as_ref() == Some(&peer.Key),
                 ExitNodeOption: exit_node_option,
                 InNetworkMap: true,
                 InMagicSock: true,
@@ -159,10 +181,8 @@ impl Server {
             sb.add_user(*id, profile.clone());
         }
 
-        let exit_node_status = {
-            let routes = inner.route_table.read().await;
-            crate::status::selected_exit_node_status(&peers, routes.exit_node())
-        };
+        let exit_node_status =
+            crate::status::selected_exit_node_status(&peers, selected_exit_key.as_ref());
         sb.mutate_status(|status| status.ExitNodeStatus = exit_node_status);
 
         Some(sb.status())
@@ -421,32 +441,47 @@ impl Server {
     /// C-representable: string in, error code out (see FFI `ts_set_exit_node`).
     pub async fn set_exit_node(&self, ip_or_name: &str) -> Result<(), TsnetError> {
         let inner = self.inner.as_ref().ok_or(TsnetError::NotUp)?;
+        let _exit_map_guard = inner.exit_map_gate.lock().await;
         let map_commit = inner.peer_map.gate.write().await;
         let peers = inner.peers.read().await;
         let peer_key = resolve_exit_node(&peers, ip_or_name)?;
         drop(peers);
-        {
-            let mut prefs = inner.prefs.write().await;
-            crate::set_exit_node_pref(&mut prefs, ip_or_name);
-            if let Some(ref dir) = self.config.state_dir {
-                let _ = prefs.save(dir);
-            }
+        let mut prefs_guard = inner.prefs.write().await;
+        let old_prefs = prefs_guard.clone();
+        let mut next_prefs = old_prefs.clone();
+        crate::set_exit_node_pref(&mut next_prefs, ip_or_name);
+        if let Some(ref dir) = self.config.state_dir {
+            next_prefs
+                .save(dir)
+                .map_err(|error| TsnetError::Builder(format!("save exit-node prefs: {error}")))?;
         }
-        inner.exit_node_selection.write().await.clear_pending();
         let mut routes = inner.route_table.write().await;
-        routes.set_exit_node(peer_key);
+        let old_exit_state = routes.exit_route_state();
+        set_exit_route_state_latch_aware(&mut routes, inner.router.as_ref(), Some(peer_key), true);
         if let Some(router) = inner.router.as_ref() {
-            let derp_map = inner.magicsock.get_derp_map();
-            let exit_node_allow_lan_access = inner.prefs.read().await.ExitNodeAllowLANAccess;
-            sync_router(
+            if let Err(error) = sync_router(
                 router,
                 &inner.tailscale_ips,
                 &routes,
-                derp_map.as_ref(),
+                &inner.magicsock,
                 &self.config.control_url,
-                exit_node_allow_lan_access,
-            )?;
+                next_prefs.ExitNodeAllowLANAccess,
+            ) {
+                routes.restore_exit_route_state(old_exit_state);
+                if kernel_security_block_latched(router) {
+                    routes.block_exit_traffic();
+                }
+                return Err(route_error_with_prefs_rollback(
+                    self.config.state_dir.as_ref(),
+                    &old_prefs,
+                    error,
+                ));
+            }
         }
+        let committed_peer = routes.exit_node().cloned();
+        set_exit_route_state_latch_aware(&mut routes, inner.router.as_ref(), committed_peer, true);
+        *prefs_guard = next_prefs;
+        inner.exit_node_selection.write().await.clear_pending();
         if matches!(inner.data_plane, DataPlane::Tun) {
             break_tcp_conns_best_effort();
         }
@@ -465,30 +500,44 @@ impl Server {
     /// C-representable: no args, error code out (see FFI `ts_clear_exit_node`).
     pub async fn clear_exit_node(&self) -> Result<(), TsnetError> {
         let inner = self.inner.as_ref().ok_or(TsnetError::NotUp)?;
+        let _exit_map_guard = inner.exit_map_gate.lock().await;
         let map_commit = inner.peer_map.gate.write().await;
-        {
-            let mut prefs = inner.prefs.write().await;
-            prefs.ExitNodeID.clear();
-            prefs.ExitNodeIP.clear();
-            if let Some(ref dir) = self.config.state_dir {
-                let _ = prefs.save(dir);
-            }
+        let mut prefs_guard = inner.prefs.write().await;
+        let old_prefs = prefs_guard.clone();
+        let mut next_prefs = old_prefs.clone();
+        next_prefs.ExitNodeID.clear();
+        next_prefs.ExitNodeIP.clear();
+        if let Some(ref dir) = self.config.state_dir {
+            next_prefs
+                .save(dir)
+                .map_err(|error| TsnetError::Builder(format!("save exit-node prefs: {error}")))?;
         }
-        inner.exit_node_selection.write().await.clear_pending();
         let mut routes = inner.route_table.write().await;
-        routes.clear_exit_node();
+        let old_exit_state = routes.exit_route_state();
+        set_exit_route_state_latch_aware(&mut routes, inner.router.as_ref(), None, false);
         if let Some(router) = inner.router.as_ref() {
-            let derp_map = inner.magicsock.get_derp_map();
-            let exit_node_allow_lan_access = inner.prefs.read().await.ExitNodeAllowLANAccess;
-            sync_router(
+            if let Err(error) = sync_router(
                 router,
                 &inner.tailscale_ips,
                 &routes,
-                derp_map.as_ref(),
+                &inner.magicsock,
                 &self.config.control_url,
-                exit_node_allow_lan_access,
-            )?;
+                next_prefs.ExitNodeAllowLANAccess,
+            ) {
+                routes.restore_exit_route_state(old_exit_state);
+                if kernel_security_block_latched(router) {
+                    routes.block_exit_traffic();
+                }
+                return Err(route_error_with_prefs_rollback(
+                    self.config.state_dir.as_ref(),
+                    &old_prefs,
+                    error,
+                ));
+            }
         }
+        set_exit_route_state_latch_aware(&mut routes, inner.router.as_ref(), None, false);
+        *prefs_guard = next_prefs;
+        inner.exit_node_selection.write().await.clear_pending();
         if matches!(inner.data_plane, DataPlane::Tun) {
             break_tcp_conns_best_effort();
         }

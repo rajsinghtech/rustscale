@@ -140,6 +140,7 @@ impl Forwarder {
         if family == "udp" {
             for server in &self.fallback {
                 let sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await.ok()?;
+                rustscale_netns::configure_udp_socket(&sock).ok()?;
                 if sock.send_to(query, server).await.is_err() {
                     continue;
                 }
@@ -200,6 +201,7 @@ impl Forwarder {
     /// Send a DNS query over UDP. Returns `None` on failure.
     async fn send_udp(&self, query: &[u8], server: &SocketAddr) -> Option<Vec<u8>> {
         let sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await.ok()?;
+        rustscale_netns::configure_udp_socket(&sock).ok()?;
         sock.send_to(query, server).await.ok()?;
 
         let mut buf = vec![0u8; 4096];

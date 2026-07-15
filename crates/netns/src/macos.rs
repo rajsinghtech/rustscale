@@ -7,33 +7,25 @@ const IP_BOUND_IF: u32 = 25;
 const IPV6_BOUND_IF: u32 = 125;
 
 pub async fn control_and_connect(addr: SocketAddr) -> Result<TcpStream, std::io::Error> {
+    connect(addr, false).await
+}
+
+pub async fn system_control_and_connect(addr: SocketAddr) -> Result<TcpStream, std::io::Error> {
+    connect(addr, true).await
+}
+
+async fn connect(addr: SocketAddr, force_bypass: bool) -> Result<TcpStream, std::io::Error> {
     let socket = if addr.is_ipv4() {
         TcpSocket::new_v4()?
     } else {
         TcpSocket::new_v6()?
     };
     let fd = socket.as_raw_fd();
-    if !super::DISABLE_BIND_CONN_TO_INTERFACE.load(std::sync::atomic::Ordering::Relaxed) {
-        if let Some(idx) = get_interface_index(addr) {
-            let (level, opt) = if addr.is_ipv4() {
-                (libc::IPPROTO_IP, IP_BOUND_IF)
-            } else {
-                (libc::IPPROTO_IPV6, IPV6_BOUND_IF)
-            };
-            let idx_val: libc::c_uint = idx;
-            let ret = unsafe {
-                libc::setsockopt(
-                    fd,
-                    level as libc::c_int,
-                    opt as libc::c_int,
-                    (&raw const idx_val).cast::<libc::c_void>(),
-                    std::mem::size_of_val(&idx_val) as libc::socklen_t,
-                )
-            };
-            if ret != 0 {
-                eprintln!("netns: setsockopt IP_BOUND_IF failed for idx={idx}");
-            }
-        }
+    if force_bypass
+        || !super::DISABLE_BIND_CONN_TO_INTERFACE.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        let idx = get_interface_index(addr)?;
+        bind_fd_to_interface(fd, addr.is_ipv4(), idx)?;
     }
     let stream = socket.connect(addr).await?;
     stream.set_nodelay(true).ok();
@@ -45,12 +37,13 @@ pub fn configure_udp_socket(socket: &UdpSocket) -> Result<(), std::io::Error> {
     if super::DISABLE_BIND_CONN_TO_INTERFACE.load(std::sync::atomic::Ordering::Relaxed) {
         return Ok(());
     }
-    let Some(idx) = default_interface_index() else {
-        return Ok(());
-    };
-    let fd = socket.as_raw_fd();
+    let idx = default_interface_index(None)?;
+    bind_fd_to_interface(socket.as_raw_fd(), socket.local_addr()?.is_ipv4(), idx)
+}
+
+fn bind_fd_to_interface(fd: std::os::fd::RawFd, ipv4: bool, idx: u32) -> std::io::Result<()> {
     let idx_val: libc::c_uint = idx;
-    let (level, opt) = if socket.local_addr()?.is_ipv4() {
+    let (level, opt) = if ipv4 {
         (libc::IPPROTO_IP, IP_BOUND_IF)
     } else {
         (libc::IPPROTO_IPV6, IPV6_BOUND_IF)
@@ -64,57 +57,70 @@ pub fn configure_udp_socket(socket: &UdpSocket) -> Result<(), std::io::Error> {
             std::mem::size_of_val(&idx_val) as libc::socklen_t,
         )
     };
-    if ret != 0 {
-        return Err(std::io::Error::last_os_error());
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
     }
-
-    Ok(())
 }
 
-fn get_interface_index(addr: SocketAddr) -> Option<u32> {
+/// Verify both Darwin IP_BOUND_IF variants before any full-tunnel route lands.
+pub fn validate_underlay_bypass(rustscale_tun_name: &str) -> std::io::Result<()> {
+    validate_underlay_bypass_with(
+        default_interface_index(Some(rustscale_tun_name)),
+        |ipv4, idx| {
+            let family = if ipv4 { libc::AF_INET } else { libc::AF_INET6 };
+            let fd = unsafe { libc::socket(family, libc::SOCK_DGRAM, 0) };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let result = bind_fd_to_interface(fd, ipv4, idx);
+            unsafe { libc::close(fd) };
+            result
+        },
+    )
+}
+
+fn validate_underlay_bypass_with(
+    index: std::io::Result<u32>,
+    mut bind: impl FnMut(bool, u32) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let idx = index?;
+    bind(true, idx)?;
+    bind(false, idx)
+}
+
+fn get_interface_index(addr: SocketAddr) -> std::io::Result<u32> {
     let by_route_env = std::env::var("TS_BIND_TO_INTERFACE_BY_ROUTE").is_ok();
     if super::BIND_TO_INTERFACE_BY_ROUTE.load(std::sync::atomic::Ordering::Relaxed) || by_route_env
     {
         interface_index_for_route(addr.ip())
     } else {
-        default_interface_index()
+        default_interface_index(None)
     }
 }
 
-fn default_interface_index() -> Option<u32> {
+fn default_interface_index(rustscale_tun_name: Option<&str>) -> std::io::Result<u32> {
     let name = rustscale_netmon::default_route_interface();
     if name.is_empty() {
-        return None;
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "default physical interface is unknown",
+        ));
     }
-    if name.starts_with("utun") {
-        if let Ok(ifaces) = if_addrs::get_if_addrs() {
-            for iface in &ifaces {
-                if iface.name != name {
-                    continue;
-                }
-                let is_ts = match iface.addr {
-                    if_addrs::IfAddr::V4(ref a) => {
-                        rustscale_tsaddr::cgnat_range().contains(IpAddr::V4(a.ip))
-                    }
-                    if_addrs::IfAddr::V6(ref a) => {
-                        rustscale_tsaddr::tailscale_ula_range().contains(IpAddr::V6(a.ip))
-                    }
-                };
-                if is_ts {
-                    return None;
-                }
-            }
-        }
+    if rustscale_tun_name == Some(name.as_str()) || super::is_managed_tun_name(&name) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "default interface is the RustScale tunnel",
+        ));
     }
-    let cname = match CString::new(name.as_str()) {
-        Ok(c) => c,
-        Err(_) => return None,
-    };
+    let cname = CString::new(name.as_str())
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
     let idx = unsafe { libc::if_nametoindex(cname.as_ptr()) };
     if idx == 0 {
-        None
+        Err(std::io::Error::last_os_error())
     } else {
-        Some(idx)
+        Ok(idx)
     }
 }
 
@@ -162,10 +168,10 @@ struct SockaddrIn6 {
     sin6_scope_id: u32,
 }
 
-fn interface_index_for_route(ip: IpAddr) -> Option<u32> {
+fn interface_index_for_route(ip: IpAddr) -> std::io::Result<u32> {
     let fd = unsafe { libc::socket(libc::PF_ROUTE, libc::SOCK_RAW, libc::AF_UNSPEC) };
     if fd < 0 {
-        return None;
+        return Err(std::io::Error::last_os_error());
     }
     let dest_bytes: Vec<u8> = match ip {
         IpAddr::V4(v4) => {
@@ -227,16 +233,22 @@ fn interface_index_for_route(ip: IpAddr) -> Option<u32> {
     msg.extend_from_slice(&dest_bytes);
     let written = unsafe { libc::write(fd, msg.as_ptr().cast(), msg.len()) };
     if written < 0 {
+        let error = std::io::Error::last_os_error();
         unsafe { libc::close(fd) };
-        return None;
+        return Err(error);
     }
     let mut buf = [0u8; 2048];
     let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
     unsafe { libc::close(fd) };
     if n <= 0 {
-        return None;
+        return Err(std::io::Error::last_os_error());
     }
-    parse_route_response(&buf[..n as usize])
+    parse_route_response(&buf[..n as usize]).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "route response contained no physical interface",
+        )
+    })
 }
 
 fn parse_route_response(buf: &[u8]) -> Option<u32> {
@@ -274,4 +286,40 @@ fn parse_route_response(buf: &[u8]) -> Option<u32> {
         offset += aligned;
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_underlay_bypass_with;
+
+    #[test]
+    fn bypass_validation_fails_when_interface_discovery_fails() {
+        let error = validate_underlay_bypass_with(
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "injected discovery failure",
+            )),
+            |_, _| Ok(()),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn bypass_validation_propagates_each_bound_if_failure() {
+        for failing_family in [true, false] {
+            let error = validate_underlay_bypass_with(Ok(7), |ipv4, _| {
+                if ipv4 == failing_family {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "injected IP_BOUND_IF failure",
+                    ))
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        }
+    }
 }

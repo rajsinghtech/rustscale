@@ -113,6 +113,71 @@ fn netlog_node(node: &Node) -> rustscale_netlogtype::Node {
 }
 
 impl Server {
+    fn cleanup_router_owner(router: &SharedRouter) -> Result<(), TsnetError> {
+        let mut managed = router
+            .lock()
+            .map_err(|_| TsnetError::Builder("router cleanup lock poisoned".into()))?;
+        managed
+            .router
+            .close()
+            .map_err(|error| TsnetError::Builder(format!("route cleanup failed: {error}")))?;
+        managed.security_block_attempted = false;
+        managed.security_block_verified = false;
+        managed.security_block_reasons = 0;
+        if managed.exit_node {
+            rustscale_netns::release_physical_underlay_bypass(&managed.tun_name);
+            managed.exit_node = false;
+        }
+        Ok(())
+    }
+
+    fn router_cleanup_supervisor() -> &'static std::sync::Mutex<Vec<SharedRouter>> {
+        static SUPERVISOR: std::sync::OnceLock<std::sync::Mutex<Vec<SharedRouter>>> =
+            std::sync::OnceLock::new();
+        SUPERVISOR.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+    }
+
+    fn supervise_router_cleanup(router: SharedRouter) {
+        match Self::router_cleanup_supervisor().lock() {
+            Ok(mut supervisor) => supervisor.push(router),
+            Err(poisoned) => poisoned.into_inner().push(router),
+        }
+    }
+
+    pub(crate) fn cleanup_or_supervise(router: SharedRouter) -> Result<(), TsnetError> {
+        match Self::cleanup_router_owner(&router) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                Self::supervise_router_cleanup(router);
+                Err(error)
+            }
+        }
+    }
+
+    fn retry_pending_router_cleanup() -> Result<(), TsnetError> {
+        // Hold the supervisor lock through cleanup so a concurrent close cannot
+        // enqueue a stale owner between the final check and startup admission.
+        let mut supervisor = Self::router_cleanup_supervisor()
+            .lock()
+            .map_err(|_| TsnetError::Builder("router cleanup supervisor poisoned".into()))?;
+        let pending = std::mem::take(&mut *supervisor);
+        let mut errors = Vec::new();
+        for router in pending {
+            if let Err(error) = Self::cleanup_router_owner(&router) {
+                errors.push(error.to_string());
+                supervisor.push(router);
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(TsnetError::Builder(format!(
+                "pending route cleanup blocks restart: {}",
+                errors.join("; ")
+            )))
+        }
+    }
+
     /// Bring the server online in userspace netstack mode (tsnet listen/dial).
     ///
     /// This is the classic tsnet embedding path: an in-process smoltcp netstack
@@ -136,6 +201,7 @@ impl Server {
             }
             return Ok(self.status());
         }
+        Self::retry_pending_router_cleanup()?;
 
         ensure_ring_provider();
         let state = self.load_or_create_state()?;
@@ -169,7 +235,9 @@ impl Server {
             b.derp_map.clone(),
             b.home_derp,
             b.health.clone(),
-        );
+            None,
+        )
+        .await;
 
         // Userspace netstack bound to our tailnet IPv4.
         let netstack = Arc::new(Netstack::new(b.our_v4, DEFAULT_MTU));
@@ -226,6 +294,24 @@ impl Server {
             protocol_version: PROTOCOL_VERSION,
             shields_up: prefs.read().await.ShieldsUp,
         };
+        b.tailnet_lock
+            .attach_peer_authority(crate::map_update::PeerAuthorityRuntime::new(
+                b.exit_map_gate.clone(),
+                b.peer_map.clone(),
+                self.drive.clone(),
+                b.magicsock.clone(),
+                b.filter.clone(),
+                b.peers.clone(),
+                b.wg_tunnels.clone(),
+                b.resolver.clone(),
+                prefs.clone(),
+                b.route_table.clone(),
+                None,
+                b.tailscale_ips.clone(),
+                b.control_url.clone(),
+                self.config.accept_routes,
+            ))
+            .map_err(|error| TsnetError::TailnetLock(error.to_string()))?;
         let map_update = spawn_map_update_task(
             b.map_rx,
             b.magicsock.clone(),
@@ -233,6 +319,7 @@ impl Server {
             b.raw_peers.clone(),
             b.peers.clone(),
             b.route_table.clone(),
+            b.exit_map_gate.clone(),
             None,
             prefs.clone(),
             exit_node_selection.clone(),
@@ -542,6 +629,7 @@ impl Server {
                 netstack: Some(netstack.clone()),
                 filter: std::sync::OnceLock::new(),
                 route_table: Some(b.route_table.clone()),
+                exit_map_gate: b.exit_map_gate.clone(),
                 router: None,
                 logout_trigger: self
                     .pre_started
@@ -592,6 +680,7 @@ impl Server {
             routecheck: b.routecheck,
             route_table: b.route_table,
             filter: b.filter,
+            exit_map_gate: b.exit_map_gate,
             router: None,
             cancel: b.cancel,
             tasks: Mutex::new(tasks),
@@ -643,14 +732,16 @@ impl Server {
 
         // A persisted selection retries only while it is unresolved. Once it
         // resolves, later map rebuilds retain the route-table owner.
-        let (peers, route_table, peer_map) = match self.inner.as_ref() {
+        let (peers, route_table, exit_map_gate, peer_map) = match self.inner.as_ref() {
             Some(inner) => (
                 inner.peers.clone(),
                 inner.route_table.clone(),
+                inner.exit_map_gate.clone(),
                 inner.peer_map.clone(),
             ),
             None => return Ok(self.status()),
         };
+        let _exit_map_guard = exit_map_gate.lock().await;
         let _map_commit = peer_map.gate.write().await;
         let peers = peers.read().await;
         let mut selection = exit_node_selection.write().await;
@@ -677,6 +768,7 @@ impl Server {
             }
             return Ok(self.status());
         }
+        Self::retry_pending_router_cleanup()?;
 
         ensure_ring_provider();
         let state = self.load_or_create_state()?;
@@ -696,6 +788,9 @@ impl Server {
         )
         .await;
 
+        // Serialize startup selection with the same mutation domain used once
+        // the map task starts.
+        let exit_map_guard = b.exit_map_gate.lock().await;
         // Resolve and apply the exit node selection from TunModeConfig, if
         // set. This sets the in-process RouteTable's exit node so the data
         // pump routes non-tailnet traffic to the exit peer. OS-level
@@ -710,9 +805,33 @@ impl Server {
             let mut live_prefs = prefs.write().await;
             set_exit_node_pref(&mut live_prefs, exit);
             if let Some(ref dir) = self.config.state_dir {
-                let _ = live_prefs.save(dir);
+                live_prefs.save(dir).map_err(|error| {
+                    TsnetError::Builder(format!("persist startup exit selection: {error}"))
+                })?;
             }
         }
+
+        // Resolve persisted exit intent before the TUN can carry ordinary
+        // traffic. If the peer is absent, retry installs capture/no-connect
+        // defaults and never exposes the physical default route.
+        {
+            let peers = b.peers.read().await;
+            let mut routes = b.route_table.write().await;
+            exit_node_selection.write().await.retry(&peers, &mut routes);
+        }
+        drop(exit_map_guard);
+
+        // Real TUN device (macOS/Linux only; on other platforms
+        // `create_tun_device` returns an error and `?` propagates it).
+        let exit_node_allow_lan_access = prefs.read().await.ExitNodeAllowLANAccess;
+        let (tun, router) = create_tun_device(
+            &config,
+            &b,
+            self.config.accept_routes,
+            exit_node_allow_lan_access,
+            self.config.state_dir.as_deref(),
+        )
+        .await?;
 
         let monitor = spawn_link_monitor(
             b.magicsock.clone(),
@@ -728,18 +847,15 @@ impl Server {
             b.derp_map.clone(),
             b.home_derp,
             b.health.clone(),
-        );
-
-        // Real TUN device (macOS/Linux only; on other platforms
-        // `create_tun_device` returns an error and `?` propagates it).
-        let exit_node_allow_lan_access = prefs.read().await.ExitNodeAllowLANAccess;
-        let (tun, router) = create_tun_device(
-            &config,
-            &b,
-            self.config.accept_routes,
-            exit_node_allow_lan_access,
+            router.as_ref().map(|router| LinkRouteSync {
+                exit_map_gate: b.exit_map_gate.clone(),
+                router: router.clone(),
+                route_table: b.route_table.clone(),
+                tailscale_ips: b.tailscale_ips.clone(),
+                prefs: prefs.clone(),
+            }),
         )
-        .await?;
+        .await;
 
         let capture = crate::capture::new_slot();
 
@@ -790,6 +906,24 @@ impl Server {
             protocol_version: PROTOCOL_VERSION,
             shields_up: prefs.read().await.ShieldsUp,
         };
+        b.tailnet_lock
+            .attach_peer_authority(crate::map_update::PeerAuthorityRuntime::new(
+                b.exit_map_gate.clone(),
+                b.peer_map.clone(),
+                self.drive.clone(),
+                b.magicsock.clone(),
+                b.filter.clone(),
+                b.peers.clone(),
+                b.wg_tunnels.clone(),
+                b.resolver.clone(),
+                prefs.clone(),
+                b.route_table.clone(),
+                router.clone(),
+                b.tailscale_ips.clone(),
+                b.control_url.clone(),
+                self.config.accept_routes,
+            ))
+            .map_err(|error| TsnetError::TailnetLock(error.to_string()))?;
         let map_update = spawn_map_update_task(
             b.map_rx,
             b.magicsock.clone(),
@@ -797,6 +931,7 @@ impl Server {
             b.raw_peers.clone(),
             b.peers.clone(),
             b.route_table.clone(),
+            b.exit_map_gate.clone(),
             router.clone(),
             prefs.clone(),
             exit_node_selection.clone(),
@@ -1074,6 +1209,7 @@ impl Server {
                 netstack: None, // TUN mode has no netstack
                 filter: std::sync::OnceLock::new(),
                 route_table: Some(b.route_table.clone()),
+                exit_map_gate: b.exit_map_gate.clone(),
                 router: router.clone(),
                 logout_trigger: self
                     .pre_started
@@ -1157,6 +1293,7 @@ impl Server {
             routecheck: b.routecheck,
             route_table: b.route_table,
             filter: b.filter,
+            exit_map_gate: b.exit_map_gate,
             router,
             cancel: b.cancel,
             tasks: Mutex::new(tasks),
@@ -1208,37 +1345,47 @@ impl Server {
 
         // TUN config owns a selection made above; otherwise retry only an
         // unresolved persisted selection.
-        let (peers, route_table, router, tailscale_ips, magicsock, live_prefs, peer_map) =
-            match self.inner.as_ref() {
-                Some(inner) => (
-                    inner.peers.clone(),
-                    inner.route_table.clone(),
-                    inner.router.clone(),
-                    inner.tailscale_ips.clone(),
-                    inner.magicsock.clone(),
-                    inner.prefs.clone(),
-                    inner.peer_map.clone(),
-                ),
-                None => return Ok(self.status()),
-            };
+        let (
+            peers,
+            route_table,
+            router,
+            tailscale_ips,
+            magicsock,
+            live_prefs,
+            exit_map_gate,
+            peer_map,
+        ) = match self.inner.as_ref() {
+            Some(inner) => (
+                inner.peers.clone(),
+                inner.route_table.clone(),
+                inner.router.clone(),
+                inner.tailscale_ips.clone(),
+                inner.magicsock.clone(),
+                inner.prefs.clone(),
+                inner.exit_map_gate.clone(),
+                inner.peer_map.clone(),
+            ),
+            None => return Ok(self.status()),
+        };
+        let _exit_map_guard = exit_map_gate.lock().await;
         let _map_commit = peer_map.gate.write().await;
         let peers = peers.read().await;
+        let exit_node_allow_lan_access = live_prefs.read().await.ExitNodeAllowLANAccess;
         let mut selection = exit_node_selection.write().await;
         let mut routes = route_table.write().await;
-        if selection.retry(&peers, &mut routes) {
+        selection.retry_transactional(&peers, &mut routes, |routes| {
             if let Some(router) = router.as_ref() {
-                let derp_map = magicsock.get_derp_map();
-                let exit_node_allow_lan_access = live_prefs.read().await.ExitNodeAllowLANAccess;
                 sync_router(
                     router,
                     &tailscale_ips,
-                    &routes,
-                    derp_map.as_ref(),
+                    routes,
+                    &magicsock,
                     &self.config.control_url,
                     exit_node_allow_lan_access,
                 )?;
             }
-        }
+            Ok::<(), TsnetError>(())
+        })?;
 
         Ok(self.status())
     }
@@ -1306,6 +1453,7 @@ impl Server {
         if self.inner.is_some() || self.pre_started.is_some() {
             return Err(TsnetError::AlreadyUp);
         }
+        Self::retry_pending_router_cleanup()?;
 
         let ipn_backend = Arc::new(IpnBackend::new("rustscale"));
         ipn_backend.set_want_running();
@@ -1419,6 +1567,7 @@ impl Server {
             netstack: None,
             filter: std::sync::OnceLock::new(),
             route_table: None,
+            exit_map_gate: Arc::new(tokio::sync::Mutex::new(())),
             router: None,
             logout_trigger: logout_trigger.clone(),
             suggested_exit_node: Arc::new(RwLock::new(String::new())),
@@ -2211,6 +2360,7 @@ impl Server {
             &peers,
             self.config.accept_routes,
         )));
+        let exit_map_gate = Arc::new(tokio::sync::Mutex::new(()));
         let cancel = Arc::new(CancelToken::new());
 
         // Build the initial packet filter from the first MapResponse. Add our
@@ -2338,6 +2488,7 @@ impl Server {
             peer_map,
             routecheck,
             route_table,
+            exit_map_gate,
             cancel,
             map_rx,
             map_tasks,
@@ -2441,18 +2592,8 @@ impl Server {
 
     /// Release profile ownership only after all asynchronous cleanup has
     /// completed. This method deliberately contains no await points.
-    fn finish_profile_shutdown(&mut self) {
+    fn finish_profile_shutdown(&mut self) -> Result<(), TsnetError> {
         if let Some(inner) = self.inner.as_mut() {
-            if let Some(router) = inner.router.take() {
-                match router.lock() {
-                    Ok(mut router) => {
-                        if let Err(error) = router.close() {
-                            eprintln!("tsnet: route cleanup failed (non-fatal): {error}");
-                        }
-                    }
-                    Err(_) => eprintln!("tsnet: route cleanup skipped (router lock poisoned)"),
-                }
-            }
             crate::capture::clear(&inner.capture);
             inner
                 .capture_handles
@@ -2464,6 +2605,12 @@ impl Server {
                     log::warn!("tsnet: OS DNS cleanup failed (non-fatal): {e}");
                 }
             }
+            // Route cleanup is last, after every task capable of reapplying a
+            // map/interface diff has stopped. Failed ownership moves to the
+            // global supervisor before profile state is released.
+            if let Some(router) = inner.router.take() {
+                Self::cleanup_or_supervise(router)?;
+            }
         }
         if let Some(pre_started) = self.pre_started.as_mut() {
             pre_started.command_tx.take();
@@ -2471,6 +2618,7 @@ impl Server {
         }
         self.inner.take();
         self.pre_started.take();
+        Ok(())
     }
 
     #[cfg(test)]
@@ -2512,6 +2660,10 @@ impl Server {
             if let Err(error) = Self::join_running_tasks(inner).await {
                 return CloseResult(Err(error));
             }
+            // LocalAPI EOF or connection-task cancellation never owns an
+            // admitted TKA init. Join its retained flight while every peer
+            // authority surface and route owner are still alive.
+            inner.tailnet_lock.join_init_flight().await;
 
             inner.magicsock.set_connection_counter(None);
             if let Some(netlog) = inner.netlog.as_ref() {
@@ -2566,8 +2718,7 @@ impl Server {
 
         // No awaits after this point: release fully stopped state atomically
         // with respect to cancellation.
-        self.finish_profile_shutdown();
-        CloseResult(Ok(()))
+        CloseResult(self.finish_profile_shutdown())
     }
 
     /// Returns the logout trigger Notify, if the server is running.
@@ -2655,6 +2806,10 @@ impl Server {
         self.logout_checkpoint(LogoutAwaitPoint::Tasks).await;
         if let Some(inner) = self.inner.as_mut() {
             Self::join_running_tasks(inner).await?;
+            // Complete any admitted init before logout removes identity or
+            // route ownership. Its operation and publication barriers remain
+            // intact while the retained flight is joined.
+            inner.tailnet_lock.join_init_flight().await;
             inner.magicsock.set_connection_counter(None);
         }
 
@@ -2806,8 +2961,7 @@ impl Server {
             ..Default::default()
         });
 
-        self.finish_profile_shutdown();
-        Ok(())
+        self.finish_profile_shutdown()
     }
 
     /// Switch to profile `profile_id`, tearing down the running backend and
@@ -2827,6 +2981,7 @@ impl Server {
     pub async fn switch_profile(&mut self, profile_id: &str) -> Result<(), TsnetError> {
         // 1. Stop the running engine (like close() but keep the config).
         self.close().await.into_result()?;
+        Self::retry_pending_router_cleanup()?;
 
         // 2. Update current profile + prefs from the ProfileManager.
         //    (ProfileManager lives in state_dir on disk; reload it.)
@@ -2959,5 +3114,67 @@ impl Server {
             state.save(&scope.dir.join("tsnet-state.json"))?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod exit_cleanup_tests {
+    use super::*;
+    use crate::tun_pump::ManagedRouter;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct RetryCleanupRouter {
+        closes: Arc<AtomicUsize>,
+    }
+
+    impl rustscale_router::Router for RetryCleanupRouter {
+        fn up(&mut self) -> Result<(), rustscale_router::RouterError> {
+            Ok(())
+        }
+
+        fn set(
+            &mut self,
+            _config: &rustscale_router::RouterConfig,
+        ) -> Result<(), rustscale_router::RouterError> {
+            Ok(())
+        }
+
+        fn close(&mut self) -> Result<(), rustscale_router::RouterError> {
+            if self.closes.fetch_add(1, Ordering::SeqCst) < 2 {
+                Err(rustscale_router::RouterError::InvalidConfig(
+                    "injected cleanup failure".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn cleanup_owner_survives_failure_and_blocks_until_retry_succeeds() {
+        let closes = Arc::new(AtomicUsize::new(0));
+        let owner = Arc::new(std::sync::Mutex::new(ManagedRouter {
+            router: Box::new(RetryCleanupRouter {
+                closes: closes.clone(),
+            }),
+            tun_name: "rustscale-test0".into(),
+            exit_node: false,
+            security_block_attempted: false,
+            security_block_verified: false,
+            security_block_reasons: 0,
+        }));
+        Server::router_cleanup_supervisor().lock().unwrap().clear();
+        assert!(Server::cleanup_or_supervise(owner).is_err());
+        assert_eq!(Server::router_cleanup_supervisor().lock().unwrap().len(), 1);
+
+        // Restart admission remains blocked while cleanup is still dirty.
+        assert!(Server::retry_pending_router_cleanup().is_err());
+        assert_eq!(Server::router_cleanup_supervisor().lock().unwrap().len(), 1);
+        Server::retry_pending_router_cleanup().unwrap();
+        assert!(Server::router_cleanup_supervisor()
+            .lock()
+            .unwrap()
+            .is_empty());
+        assert_eq!(closes.load(Ordering::SeqCst), 3);
     }
 }

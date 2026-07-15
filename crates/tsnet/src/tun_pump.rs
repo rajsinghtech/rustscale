@@ -1,6 +1,5 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
-use crate::routing::resolve_control_server_ips;
 
 fn tun_outbound_send_pipeline_enabled() -> bool {
     tun_outbound_send_pipeline_enabled_for(
@@ -1733,81 +1732,130 @@ pub(crate) fn filtered_outbound_packets<'a>(
 }
 
 /// A router shared by the TUN lifecycle, API calls, and map-update task.
-pub(crate) type SharedRouter = Arc<std::sync::Mutex<Box<dyn rustscale_router::Router>>>;
+pub(crate) type SharedRouter = Arc<std::sync::Mutex<ManagedRouter>>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SecurityBlockReason {
+    MapLoss = 1,
+    Enumeration = 2,
+    LinkRefresh = 4,
+    Transition = 8,
+}
+
+impl SecurityBlockReason {
+    const fn bit(self) -> u8 {
+        self as u8
+    }
+}
+
+pub(crate) struct ManagedRouter {
+    pub(crate) router: Box<dyn rustscale_router::Router>,
+    pub(crate) tun_name: String,
+    pub(crate) exit_node: bool,
+    /// A block command was attempted and may have partially changed state.
+    pub(crate) security_block_attempted: bool,
+    /// The platform-specific verifier confirmed the block is active.
+    pub(crate) security_block_verified: bool,
+    /// Provenance latch; success clears only the reason owned by its producer.
+    pub(crate) security_block_reasons: u8,
+}
+
+impl ManagedRouter {
+    fn add_security_reason(&mut self, reason: SecurityBlockReason) {
+        self.security_block_reasons |= reason.bit();
+    }
+
+    fn clear_security_reason(&mut self, reason: SecurityBlockReason) {
+        self.security_block_reasons &= !reason.bit();
+    }
+
+    fn has_security_reasons(&self) -> bool {
+        self.security_block_reasons != 0
+    }
+}
 
 /// Build the one OS-level routing configuration from current TUN state.
 pub(crate) fn build_router_config(
     local_addrs: &[IpAddr],
     route_table: &RouteTable,
-    derp_map: Option<&DERPMap>,
-    control_url: &str,
     exit_node_allow_lan_access: bool,
-) -> rustscale_router::RouterConfig {
-    build_router_config_with_local_routes(
+    tun_name: &str,
+) -> Result<rustscale_router::RouterConfig, TsnetError> {
+    let prefixes = if route_table.exit_node_requested() {
+        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+        let mut prefixes =
+            rustscale_tsaddr::local_interface_prefixes(tun_name).map_err(|error| {
+                TsnetError::Builder(format!("enumerate connected interface prefixes: {error}"))
+            })?;
+        #[cfg(target_os = "macos")]
+        {
+            let routes = rustscale_routetable::get_route_table(100_000).map_err(|error| {
+                TsnetError::Builder(format!("enumerate Darwin route table: {error}"))
+            })?;
+            for route in routes {
+                if route.iface.is_empty()
+                    || route.iface == tun_name
+                    || route.dst.bits == 0
+                    || matches!(
+                        route.route_type,
+                        rustscale_routetable::RouteType::Local
+                            | rustscale_routetable::RouteType::Broadcast
+                            | rustscale_routetable::RouteType::Multicast
+                    )
+                {
+                    continue;
+                }
+                prefixes.push(rustscale_tsaddr::IpPrefix {
+                    ip: route.dst.addr,
+                    bits: route.dst.bits,
+                });
+            }
+            rustscale_tsaddr::sort_prefixes(&mut prefixes);
+            prefixes.dedup();
+        }
+        prefixes
+    } else {
+        Vec::new()
+    };
+    Ok(build_router_config_with_local_routes(
         local_addrs,
         route_table,
-        derp_map,
-        control_url,
         exit_node_allow_lan_access,
-        rustscale_tsaddr::local_interface_prefixes(),
-    )
+        prefixes,
+    ))
 }
 
-fn build_router_config_with_local_routes(
+pub(crate) fn build_router_config_with_local_routes(
     local_addrs: &[IpAddr],
     route_table: &RouteTable,
-    derp_map: Option<&DERPMap>,
-    control_url: &str,
     exit_node_allow_lan_access: bool,
-    local_interface_prefixes: Vec<rustscale_tsaddr::IpPrefix>,
+    mut local_interface_prefixes: Vec<rustscale_tsaddr::IpPrefix>,
 ) -> rustscale_router::RouterConfig {
-    let mut local_routes = Vec::new();
-    if route_table.exit_node().is_some() {
-        if let Some(derp_map) = derp_map {
-            for region in derp_map.Regions.values() {
-                for node in region.Nodes.iter().flatten() {
-                    if node.STUNOnly {
-                        continue;
-                    }
-                    for address in [&node.IPv4, &node.IPv6] {
-                        if let Ok(ip) = address.parse::<IpAddr>() {
-                            if !ip.is_unspecified() {
-                                local_routes.push(rustscale_tsaddr::IpPrefix {
-                                    ip,
-                                    bits: if ip.is_ipv4() { 32 } else { 128 },
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        local_routes.extend(
-            resolve_control_server_ips(control_url)
-                .into_iter()
-                .map(|ip| rustscale_tsaddr::IpPrefix {
-                    ip,
-                    bits: if ip.is_ipv4() { 32 } else { 128 },
-                }),
-        );
-        if exit_node_allow_lan_access {
-            local_routes.extend(local_interface_prefixes);
-        }
-        local_routes.extend([
-            rustscale_tsaddr::IpPrefix {
-                ip: "127.0.0.0".parse().expect("valid IPv4 loopback prefix"),
-                bits: 8,
-            },
-            rustscale_tsaddr::IpPrefix {
-                ip: "::1".parse().expect("valid IPv6 loopback address"),
-                bits: 128,
-            },
-        ]);
-        local_routes.sort_by_key(|prefix| (prefix.ip, prefix.bits));
-        local_routes.dedup();
-    }
+    rustscale_tsaddr::sort_prefixes(&mut local_interface_prefixes);
+    local_interface_prefixes.dedup();
+    let exit_node = route_table.exit_node_requested();
+    // Linux table 52 needs explicit throw routes to preserve LAN access.
+    // Darwin's connected routes already remain direct, so its LocalRoute
+    // operations are intentionally no-ops. No DNS/control/peer destination
+    // can create a route-level bypass; infrastructure uses socket-scoped
+    // netns marks or interface binding instead.
+    let local_routes = if exit_node && exit_node_allow_lan_access {
+        local_interface_prefixes.clone()
+    } else {
+        Vec::new()
+    };
 
     let mut routes = vec![rustscale_tsaddr::cgnat_range()];
+    if exit_node && !exit_node_allow_lan_access {
+        // Install two child routes for each connected prefix. They cover the
+        // same address set while outranking (and not replacing/claiming) the
+        // kernel-owned connected route on Darwin and Linux.
+        routes.extend(
+            local_interface_prefixes
+                .iter()
+                .flat_map(more_specific_children),
+        );
+    }
     for (net, bits, _) in route_table.entries() {
         // Exit-node defaults are controlled solely by `exit_node`; accepting
         // an exit-capable peer's advertised /0 must not enable it implicitly.
@@ -1815,12 +1863,152 @@ fn build_router_config_with_local_routes(
             routes.push(rustscale_tsaddr::IpPrefix { ip: net, bits });
         }
     }
+    rustscale_tsaddr::sort_prefixes(&mut routes);
+    routes.dedup();
     rustscale_router::RouterConfig {
-        local_addrs: local_addrs.to_vec(),
+        local_addrs: local_addrs.iter().copied().map(normalize_ip).collect(),
         routes,
         local_routes,
-        exit_node: route_table.exit_node().is_some(),
+        exit_node: route_table.exit_node_requested(),
     }
+}
+
+fn more_specific_children(prefix: &rustscale_tsaddr::IpPrefix) -> Vec<rustscale_tsaddr::IpPrefix> {
+    let max = if prefix.ip.is_ipv4() { 32 } else { 128 };
+    if prefix.bits >= max {
+        return vec![*prefix];
+    }
+    let bits = prefix.bits + 1;
+    match prefix.ip {
+        IpAddr::V4(ip) => {
+            let first = u32::from(ip);
+            let second = first | (1_u32 << (32 - bits));
+            vec![
+                rustscale_tsaddr::IpPrefix {
+                    ip: IpAddr::V4(first.into()),
+                    bits,
+                },
+                rustscale_tsaddr::IpPrefix {
+                    ip: IpAddr::V4(second.into()),
+                    bits,
+                },
+            ]
+        }
+        IpAddr::V6(ip) => {
+            let first = u128::from(ip);
+            let second = first | (1_u128 << (128 - bits));
+            vec![
+                rustscale_tsaddr::IpPrefix {
+                    ip: IpAddr::V6(first.into()),
+                    bits,
+                },
+                rustscale_tsaddr::IpPrefix {
+                    ip: IpAddr::V6(second.into()),
+                    bits,
+                },
+            ]
+        }
+    }
+}
+
+fn normalize_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(ip) => ip.to_ipv4_mapped().map_or(IpAddr::V6(ip), IpAddr::V4),
+        ip => ip,
+    }
+}
+
+fn ensure_managed_security_block(
+    managed: &mut ManagedRouter,
+    reason: SecurityBlockReason,
+) -> Result<(), TsnetError> {
+    managed.add_security_reason(reason);
+    if managed.security_block_verified {
+        return Ok(());
+    }
+    // Attempted and verified are deliberately separate. A failed command may
+    // be partial, but it must never authorize route mutation or unblocking.
+    managed.security_block_attempted = true;
+    managed.router.block_direct().map_err(|error| {
+        TsnetError::Builder(format!("install kernel direct-traffic block: {error}"))
+    })?;
+    managed.security_block_verified = true;
+    Ok(())
+}
+
+pub(crate) fn engage_kernel_security_block(
+    router: &SharedRouter,
+    reason: SecurityBlockReason,
+) -> Result<(), TsnetError> {
+    let mut managed = router
+        .lock()
+        .map_err(|_| TsnetError::Builder("router lock poisoned".into()))?;
+    ensure_managed_security_block(&mut managed, reason)
+}
+
+fn clear_managed_security_block_reason(
+    managed: &mut ManagedRouter,
+    reason: SecurityBlockReason,
+) -> Result<bool, TsnetError> {
+    let remaining = managed.security_block_reasons & !reason.bit();
+    if remaining != 0 {
+        managed.security_block_reasons = remaining;
+        return Ok(true);
+    }
+    if !managed.security_block_attempted && !managed.security_block_verified {
+        managed.clear_security_reason(reason);
+        return Ok(false);
+    }
+    // Keep the clearing reason latched until unblock is confirmed. If prior
+    // state is uncertain, first establish a freshly verified active block.
+    managed.add_security_reason(reason);
+    if !managed.security_block_verified {
+        managed.router.block_direct().map_err(|error| {
+            TsnetError::Builder(format!("verify kernel direct-traffic block: {error}"))
+        })?;
+        managed.security_block_verified = true;
+    }
+    // Verification is invalid the instant unblock starts. Any command error
+    // leaves attempted=true, verified=false, and the reason latched, forcing
+    // the next LAN-denied apply to re-block and re-verify before route work.
+    managed.security_block_verified = false;
+    managed.router.unblock_direct().map_err(|error| {
+        TsnetError::Builder(format!("remove kernel direct-traffic block: {error}"))
+    })?;
+    managed.security_block_attempted = false;
+    managed.clear_security_reason(reason);
+    Ok(false)
+}
+
+pub(crate) fn clear_kernel_security_block_reason(
+    router: &SharedRouter,
+    reason: SecurityBlockReason,
+) -> Result<bool, TsnetError> {
+    let mut managed = router
+        .lock()
+        .map_err(|_| TsnetError::Builder("router lock poisoned".into()))?;
+    clear_managed_security_block_reason(&mut managed, reason)
+}
+
+pub(crate) fn kernel_security_block_latched(router: &SharedRouter) -> bool {
+    router.lock().map_or(true, |managed| {
+        managed.has_security_reasons()
+            || managed.security_block_attempted
+            || managed.security_block_verified
+    })
+}
+
+pub(crate) fn set_exit_route_state_latch_aware(
+    routes: &mut RouteTable,
+    router: Option<&SharedRouter>,
+    peer: Option<NodePublic>,
+    requested: bool,
+) {
+    let security_latched = router.map_or_else(
+        || routes.exit_traffic_blocked(),
+        kernel_security_block_latched,
+    );
+    routes.set_exit_state_latch_aware(peer, requested, security_latched);
 }
 
 /// Synchronize a shared router after a route-table change.
@@ -1828,22 +2016,152 @@ pub(crate) fn sync_router(
     router: &SharedRouter,
     local_addrs: &[IpAddr],
     route_table: &RouteTable,
-    derp_map: Option<&DERPMap>,
+    magicsock: &Magicsock,
     control_url: &str,
     exit_node_allow_lan_access: bool,
 ) -> Result<(), TsnetError> {
-    let config = build_router_config(
+    sync_router_inner(
+        router,
         local_addrs,
         route_table,
-        derp_map,
+        magicsock,
         control_url,
         exit_node_allow_lan_access,
-    );
-    router
+        None,
+    )
+}
+
+pub(crate) fn sync_router_with_connected_prefixes(
+    router: &SharedRouter,
+    local_addrs: &[IpAddr],
+    route_table: &RouteTable,
+    magicsock: &Magicsock,
+    control_url: &str,
+    exit_node_allow_lan_access: bool,
+    connected_prefixes: Vec<rustscale_tsaddr::IpPrefix>,
+) -> Result<(), TsnetError> {
+    sync_router_inner(
+        router,
+        local_addrs,
+        route_table,
+        magicsock,
+        control_url,
+        exit_node_allow_lan_access,
+        Some(connected_prefixes),
+    )
+}
+
+fn sync_router_inner(
+    router: &SharedRouter,
+    local_addrs: &[IpAddr],
+    route_table: &RouteTable,
+    magicsock: &Magicsock,
+    _control_url: &str,
+    exit_node_allow_lan_access: bool,
+    connected_prefixes: Option<Vec<rustscale_tsaddr::IpPrefix>>,
+) -> Result<(), TsnetError> {
+    // Serialize source snapshots with application. This prevents an older map
+    // or interface callback from building before the mutex and then replacing
+    // a newer desired state after it.
+    let mut managed = router
         .lock()
-        .map_err(|_| TsnetError::Builder("router lock poisoned".into()))?
-        .set(&config)
-        .map_err(|error| TsnetError::Builder(format!("route configuration failed: {error}")))
+        .map_err(|_| TsnetError::Builder("router lock poisoned".into()))?;
+    let exit_node = route_table.exit_node_requested();
+    let entering_exit_node = exit_node && !managed.exit_node;
+    let leaving_exit_node = !exit_node && managed.exit_node;
+    // Interface enumeration is part of the fail-closed desired-state build;
+    // do it before acquiring process policy or touching the live router.
+    let config = if let Some(prefixes) = connected_prefixes {
+        build_router_config_with_local_routes(
+            local_addrs,
+            route_table,
+            exit_node_allow_lan_access,
+            prefixes,
+        )
+    } else {
+        build_router_config(
+            local_addrs,
+            route_table,
+            exit_node_allow_lan_access,
+            &managed.tun_name,
+        )?
+    };
+    if exit_node {
+        // Match upstream netns call sites: control/DERP TCP and magicsock UDP
+        // bypass the tunnel at the socket layer. Reapply to the existing UDP
+        // socket before installing a catch-all route.
+        if entering_exit_node {
+            rustscale_netns::acquire_physical_underlay_bypass(&managed.tun_name).map_err(
+                |error| TsnetError::Builder(format!("underlay bypass unavailable: {error}")),
+            )?;
+        }
+        if let Err(error) = magicsock.refresh_underlay_binding() {
+            if entering_exit_node {
+                rustscale_netns::release_physical_underlay_bypass(&managed.tun_name);
+            }
+            return Err(TsnetError::Builder(format!(
+                "configure underlay UDP socket: {error}"
+            )));
+        }
+        if entering_exit_node {
+            // Existing DERP TCP sockets predate the netns policy and cannot be
+            // marked retroactively. Reconnect them before the catch-all lands.
+            magicsock.link_changed();
+        }
+    }
+    apply_managed_router_config(
+        &mut managed,
+        &config,
+        entering_exit_node,
+        leaving_exit_node,
+        !exit_node_allow_lan_access,
+    )?;
+    if leaving_exit_node {
+        // Release only after catch-all teardown, so no underlay packet can
+        // briefly recurse through the TUN during the transition.
+        rustscale_netns::release_physical_underlay_bypass(&managed.tun_name);
+    }
+    Ok(())
+}
+
+fn apply_managed_router_config(
+    managed: &mut ManagedRouter,
+    config: &rustscale_router::RouterConfig,
+    entering_exit_node: bool,
+    leaving_exit_node: bool,
+    lan_denied: bool,
+) -> Result<(), TsnetError> {
+    // A prior failed block attempt is always retried before any route or
+    // unblock operation, even if the desired configuration has since changed.
+    if managed.security_block_attempted && !managed.security_block_verified {
+        managed.router.block_direct().map_err(|error| {
+            TsnetError::Builder(format!("verify kernel direct-traffic block: {error}"))
+        })?;
+        managed.security_block_verified = true;
+    }
+    // Every LAN-denied apply, including allow->deny and refresh, verifies the
+    // emergency block before any catch-all/rule mutation. Failed verification
+    // returns before `set` and is retried on the next synchronization.
+    if (config.exit_node && lan_denied) || leaving_exit_node {
+        // Removal is security-critical even when LAN access was allowed: the
+        // catch-all must not disappear until a verified kernel block covers
+        // the complete router transaction and every attempted inverse.
+        ensure_managed_security_block(managed, SecurityBlockReason::Transition)?;
+    }
+    if let Err(error) = managed.router.set(config) {
+        if entering_exit_node {
+            // A failed inverse may have left a catch-all owned by the router.
+            // Retain underlay capability until a later set/close proves the
+            // route state clean; releasing here could strand cleanup traffic.
+            managed.exit_node = true;
+        }
+        return Err(TsnetError::Builder(format!(
+            "route configuration failed: {error}"
+        )));
+    }
+    managed.exit_node = config.exit_node;
+    clear_managed_security_block_reason(managed, SecurityBlockReason::Transition)?;
+    Ok(())
 }
 
 /// Create a TUN device and optionally apply OS routes.
@@ -1855,28 +2173,180 @@ pub(crate) async fn create_tun_device(
     b: &Bootstrap,
     _accept_routes: bool,
     exit_node_allow_lan_access: bool,
+    state_dir: Option<&std::path::Path>,
 ) -> Result<(Arc<dyn Tun>, Option<SharedRouter>), TsnetError> {
     let dev = rustscale_tun::create(&config.tun)?;
     let router = if config.apply_routes {
-        let mut router = rustscale_router::new(dev.name());
-        router
-            .up()
-            .map_err(|error| TsnetError::Builder(format!("bring TUN interface up: {error}")))?;
+        let mut router = rustscale_router::new_with_state_dir(dev.name(), state_dir);
+        if let Err(error) = router.up() {
+            let owner = Arc::new(std::sync::Mutex::new(ManagedRouter {
+                router,
+                tun_name: dev.name().to_owned(),
+                exit_node: false,
+                security_block_attempted: false,
+                security_block_verified: false,
+                security_block_reasons: 0,
+            }));
+            let cleanup = Server::cleanup_or_supervise(owner).err();
+            return Err(TsnetError::Builder(match cleanup {
+                Some(cleanup) => {
+                    format!("bring TUN interface up: {error}; startup cleanup retained: {cleanup}")
+                }
+                None => format!("bring TUN interface up: {error}"),
+            }));
+        }
+        let security_required = {
+            let route_table = b.route_table.read().await;
+            route_table.exit_node_requested() && !exit_node_allow_lan_access
+        };
+        let mut security_block_verified = false;
+        if security_required {
+            if let Err(error) = router.block_direct() {
+                let owner = Arc::new(std::sync::Mutex::new(ManagedRouter {
+                    router,
+                    tun_name: dev.name().to_owned(),
+                    exit_node: false,
+                    // Verification failure may still leave the block live.
+                    security_block_attempted: true,
+                    security_block_verified: false,
+                    security_block_reasons: SecurityBlockReason::Transition.bit(),
+                }));
+                let cleanup = Server::cleanup_or_supervise(owner).err();
+                return Err(TsnetError::Builder(match cleanup {
+                    Some(cleanup) => format!(
+                        "install startup direct-traffic block: {error}; cleanup retained: {cleanup}"
+                    ),
+                    None => format!("install startup direct-traffic block: {error}"),
+                }));
+            }
+            security_block_verified = true;
+        }
         let route_config = {
             let route_table = b.route_table.read().await;
-            build_router_config(
+            match build_router_config(
                 &b.tailscale_ips,
                 &route_table,
-                b.magicsock.get_derp_map().as_ref(),
-                &b.control_url,
                 exit_node_allow_lan_access,
-            )
+                dev.name(),
+            ) {
+                Ok(config) => config,
+                Err(error) => {
+                    drop(route_table);
+                    let owner = Arc::new(std::sync::Mutex::new(ManagedRouter {
+                        router,
+                        tun_name: dev.name().to_owned(),
+                        exit_node: false,
+                        security_block_attempted: security_block_verified,
+                        security_block_verified,
+                        security_block_reasons: if security_block_verified {
+                            SecurityBlockReason::Transition.bit()
+                        } else {
+                            0
+                        },
+                    }));
+                    let cleanup = Server::cleanup_or_supervise(owner).err();
+                    return Err(TsnetError::Builder(match cleanup {
+                        Some(cleanup) => format!("{error}; startup cleanup retained: {cleanup}"),
+                        None => error.to_string(),
+                    }));
+                }
+            }
         };
-        if let Err(error) = router.set(&route_config) {
-            let _ = router.close();
-            return Err(TsnetError::Builder(format!("install TUN routes: {error}")));
+        if route_config.exit_node {
+            if let Err(error) = rustscale_netns::acquire_physical_underlay_bypass(dev.name()) {
+                let owner = Arc::new(std::sync::Mutex::new(ManagedRouter {
+                    router,
+                    tun_name: dev.name().to_owned(),
+                    exit_node: false,
+                    security_block_attempted: security_block_verified,
+                    security_block_verified,
+                    security_block_reasons: if security_block_verified {
+                        SecurityBlockReason::Transition.bit()
+                    } else {
+                        0
+                    },
+                }));
+                let cleanup = Server::cleanup_or_supervise(owner).err();
+                return Err(TsnetError::Builder(match cleanup {
+                    Some(cleanup) => format!(
+                        "underlay bypass unavailable: {error}; startup cleanup retained: {cleanup}"
+                    ),
+                    None => format!("underlay bypass unavailable: {error}"),
+                }));
+            }
+            if let Err(error) = b.magicsock.refresh_underlay_binding() {
+                rustscale_netns::release_physical_underlay_bypass(dev.name());
+                let owner = Arc::new(std::sync::Mutex::new(ManagedRouter {
+                    router,
+                    tun_name: dev.name().to_owned(),
+                    exit_node: false,
+                    security_block_attempted: security_block_verified,
+                    security_block_verified,
+                    security_block_reasons: if security_block_verified {
+                        SecurityBlockReason::Transition.bit()
+                    } else {
+                        0
+                    },
+                }));
+                let cleanup = Server::cleanup_or_supervise(owner).err();
+                return Err(TsnetError::Builder(match cleanup {
+                    Some(cleanup) => format!(
+                        "configure underlay UDP socket: {error}; startup cleanup retained: {cleanup}"
+                    ),
+                    None => format!("configure underlay UDP socket: {error}"),
+                }));
+            }
+            b.magicsock.link_changed();
         }
-        Some(Arc::new(std::sync::Mutex::new(router)))
+        if let Err(error) = router.set(&route_config) {
+            let owner = Arc::new(std::sync::Mutex::new(ManagedRouter {
+                router,
+                tun_name: dev.name().to_owned(),
+                exit_node: route_config.exit_node,
+                security_block_attempted: security_block_verified,
+                security_block_verified,
+                security_block_reasons: if security_block_verified {
+                    SecurityBlockReason::Transition.bit()
+                } else {
+                    0
+                },
+            }));
+            let cleanup = Server::cleanup_or_supervise(owner).err();
+            return Err(TsnetError::Builder(match cleanup {
+                Some(cleanup) => {
+                    format!("install TUN routes: {error}; startup cleanup retained: {cleanup}")
+                }
+                None => format!("install TUN routes: {error}"),
+            }));
+        }
+        if security_block_verified {
+            if let Err(error) = router.unblock_direct() {
+                let owner = Arc::new(std::sync::Mutex::new(ManagedRouter {
+                    router,
+                    tun_name: dev.name().to_owned(),
+                    exit_node: route_config.exit_node,
+                    security_block_attempted: true,
+                    security_block_verified: true,
+                    security_block_reasons: SecurityBlockReason::Transition.bit(),
+                }));
+                let cleanup = Server::cleanup_or_supervise(owner).err();
+                return Err(TsnetError::Builder(match cleanup {
+                    Some(cleanup) => format!(
+                        "remove startup direct-traffic block: {error}; cleanup retained: {cleanup}"
+                    ),
+                    None => format!("remove startup direct-traffic block: {error}"),
+                }));
+            }
+            security_block_verified = false;
+        }
+        Some(Arc::new(std::sync::Mutex::new(ManagedRouter {
+            router,
+            tun_name: dev.name().to_owned(),
+            exit_node: route_config.exit_node,
+            security_block_attempted: false,
+            security_block_verified,
+            security_block_reasons: 0,
+        })))
     } else {
         None
     };
@@ -1890,6 +2360,7 @@ pub(crate) async fn create_tun_device(
     _b: &Bootstrap,
     _accept_routes: bool,
     _exit_node_allow_lan_access: bool,
+    _state_dir: Option<&std::path::Path>,
 ) -> Result<(Arc<dyn Tun>, Option<SharedRouter>), TsnetError> {
     Err(TsnetError::Builder(
         "TUN mode not supported on this platform".into(),
@@ -1900,10 +2371,158 @@ pub(crate) async fn create_tun_device(
 mod tests {
     use super::*;
     use rustscale_key::{DiscoPrivate, NodePrivate};
-    use rustscale_tailcfg::{DERPNode, DERPRegion};
 
     struct BatchProbe {
         events: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+
+    #[derive(Clone, Copy)]
+    enum RouterFailure {
+        None,
+        Block,
+        Set,
+        Rollback,
+        Unblock,
+    }
+
+    struct OrderedRouter {
+        events: Arc<std::sync::Mutex<Vec<&'static str>>>,
+        failure: RouterFailure,
+    }
+
+    impl rustscale_router::Router for OrderedRouter {
+        fn up(&mut self) -> Result<(), rustscale_router::RouterError> {
+            Ok(())
+        }
+
+        fn set(
+            &mut self,
+            _config: &rustscale_router::RouterConfig,
+        ) -> Result<(), rustscale_router::RouterError> {
+            self.events.lock().unwrap().push("set");
+            if matches!(self.failure, RouterFailure::Set | RouterFailure::Rollback) {
+                let primary =
+                    rustscale_router::RouterError::InvalidConfig("injected set failure".into());
+                if matches!(self.failure, RouterFailure::Rollback) {
+                    Err(rustscale_router::RouterError::Transaction {
+                        primary: Box::new(primary),
+                        rollback: vec![rustscale_router::RouterError::InvalidConfig(
+                            "injected inverse failure".into(),
+                        )],
+                    })
+                } else {
+                    Err(primary)
+                }
+            } else {
+                Ok(())
+            }
+        }
+
+        fn block_direct(&mut self) -> Result<(), rustscale_router::RouterError> {
+            self.events.lock().unwrap().push("block");
+            if matches!(self.failure, RouterFailure::Block) {
+                Err(rustscale_router::RouterError::InvalidConfig(
+                    "injected block failure".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn unblock_direct(&mut self) -> Result<(), rustscale_router::RouterError> {
+            self.events.lock().unwrap().push("unblock");
+            if matches!(self.failure, RouterFailure::Unblock) {
+                Err(rustscale_router::RouterError::InvalidConfig(
+                    "injected unblock failure".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn close(&mut self) -> Result<(), rustscale_router::RouterError> {
+            Ok(())
+        }
+    }
+
+    struct RetryBlockRouter {
+        events: Arc<std::sync::Mutex<Vec<&'static str>>>,
+        remaining_failures: usize,
+    }
+
+    impl rustscale_router::Router for RetryBlockRouter {
+        fn up(&mut self) -> Result<(), rustscale_router::RouterError> {
+            Ok(())
+        }
+
+        fn set(
+            &mut self,
+            _config: &rustscale_router::RouterConfig,
+        ) -> Result<(), rustscale_router::RouterError> {
+            self.events.lock().unwrap().push("set");
+            Ok(())
+        }
+
+        fn block_direct(&mut self) -> Result<(), rustscale_router::RouterError> {
+            self.events.lock().unwrap().push("block");
+            if self.remaining_failures > 0 {
+                self.remaining_failures -= 1;
+                Err(rustscale_router::RouterError::InvalidConfig(
+                    "injected first block failure".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn unblock_direct(&mut self) -> Result<(), rustscale_router::RouterError> {
+            self.events.lock().unwrap().push("unblock");
+            Ok(())
+        }
+
+        fn close(&mut self) -> Result<(), rustscale_router::RouterError> {
+            Ok(())
+        }
+    }
+
+    struct RetryUnblockRouter {
+        events: Arc<std::sync::Mutex<Vec<&'static str>>>,
+        fail_unblock_once: bool,
+    }
+
+    impl rustscale_router::Router for RetryUnblockRouter {
+        fn up(&mut self) -> Result<(), rustscale_router::RouterError> {
+            Ok(())
+        }
+
+        fn set(
+            &mut self,
+            _config: &rustscale_router::RouterConfig,
+        ) -> Result<(), rustscale_router::RouterError> {
+            self.events.lock().unwrap().push("set");
+            Ok(())
+        }
+
+        fn block_direct(&mut self) -> Result<(), rustscale_router::RouterError> {
+            self.events.lock().unwrap().push("block");
+            Ok(())
+        }
+
+        fn unblock_direct(&mut self) -> Result<(), rustscale_router::RouterError> {
+            self.events.lock().unwrap().push("unblock");
+            if self.fail_unblock_once {
+                self.fail_unblock_once = false;
+                Err(rustscale_router::RouterError::InvalidConfig(
+                    "injected partial unblock".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn close(&mut self) -> Result<(), rustscale_router::RouterError> {
+            Ok(())
+        }
     }
 
     struct PendingProbe {
@@ -1944,83 +2563,288 @@ mod tests {
         }
     }
 
-    #[test]
-    fn exit_node_router_config_respects_lan_access_preference() {
-        let exit_key = NodePrivate::generate().public();
-        let mut routes = RouteTable::default();
-        routes.set_exit_node(exit_key);
-        let mut derp_map = DERPMap::default();
-        derp_map.Regions.insert(
-            1,
-            DERPRegion {
-                Nodes: Some(vec![DERPNode {
-                    IPv4: "192.0.2.10".into(),
-                    IPv6: "2001:db8::10".into(),
-                    ..Default::default()
-                }]),
-                ..Default::default()
+    fn ordered_managed_router(
+        failure: RouterFailure,
+    ) -> (ManagedRouter, Arc<std::sync::Mutex<Vec<&'static str>>>) {
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        (
+            ManagedRouter {
+                router: Box::new(OrderedRouter {
+                    events: events.clone(),
+                    failure,
+                }),
+                tun_name: "rustscale-test0".into(),
+                exit_node: false,
+                security_block_attempted: false,
+                security_block_verified: false,
+                security_block_reasons: 0,
             },
-        );
+            events,
+        )
+    }
 
-        let lan_prefix = rustscale_tsaddr::IpPrefix::parse("192.168.0.0/16").unwrap();
-        let config = build_router_config_with_local_routes(
-            &[],
-            &routes,
-            Some(&derp_map),
-            "https://127.0.0.1",
-            false,
-            vec![lan_prefix],
+    #[test]
+    fn lan_denied_exit_blocks_before_catch_all_and_unblocks_after_success() {
+        let (mut managed, events) = ordered_managed_router(RouterFailure::None);
+        let config = rustscale_router::RouterConfig {
+            exit_node: true,
+            ..Default::default()
+        };
+        apply_managed_router_config(&mut managed, &config, true, false, true).unwrap();
+        assert_eq!(*events.lock().unwrap(), ["block", "set", "unblock"]);
+        assert!(managed.exit_node);
+        assert!(!managed.security_block_attempted);
+        assert!(!managed.security_block_verified);
+    }
+
+    #[test]
+    fn lan_allow_to_deny_refresh_also_blocks_before_route_mutation() {
+        let (mut managed, events) = ordered_managed_router(RouterFailure::None);
+        managed.exit_node = true;
+        let config = rustscale_router::RouterConfig {
+            exit_node: true,
+            ..Default::default()
+        };
+        apply_managed_router_config(&mut managed, &config, false, false, true).unwrap();
+        assert_eq!(*events.lock().unwrap(), ["block", "set", "unblock"]);
+    }
+
+    #[test]
+    fn emergency_block_failure_prevents_catch_all_mutation() {
+        let (mut managed, events) = ordered_managed_router(RouterFailure::Block);
+        let config = rustscale_router::RouterConfig {
+            exit_node: true,
+            ..Default::default()
+        };
+        assert!(apply_managed_router_config(&mut managed, &config, true, false, true).is_err());
+        assert_eq!(*events.lock().unwrap(), ["block"]);
+        assert!(!managed.exit_node);
+        assert!(managed.security_block_attempted);
+        assert!(!managed.security_block_verified);
+    }
+
+    #[test]
+    fn failed_block_is_retried_before_route_or_unblock() {
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut managed = ManagedRouter {
+            router: Box::new(RetryBlockRouter {
+                events: events.clone(),
+                remaining_failures: 1,
+            }),
+            tun_name: "rustscale-test0".into(),
+            exit_node: false,
+            security_block_attempted: false,
+            security_block_verified: false,
+            security_block_reasons: 0,
+        };
+        let config = rustscale_router::RouterConfig {
+            exit_node: true,
+            ..Default::default()
+        };
+        assert!(apply_managed_router_config(&mut managed, &config, true, false, true).is_err());
+        assert_eq!(*events.lock().unwrap(), ["block"]);
+        assert!(managed.security_block_attempted);
+        assert!(!managed.security_block_verified);
+
+        apply_managed_router_config(&mut managed, &config, true, false, true).unwrap();
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["block", "block", "set", "unblock"]
         );
-        for prefix in [
-            "192.0.2.10/32",
-            "2001:db8::10/128",
-            "127.0.0.1/32",
-            "127.0.0.0/8",
-            "::1/128",
-        ] {
-            assert!(
-                config
-                    .local_routes
-                    .contains(&rustscale_tsaddr::IpPrefix::parse(prefix).unwrap()),
-                "missing bypass route {prefix}",
-            );
-        }
+        assert!(!managed.security_block_attempted);
+        assert!(!managed.security_block_verified);
+    }
+
+    #[test]
+    fn map_loss_then_api_selection_keeps_in_process_forwarding_blocked() {
+        let (managed, _events) = ordered_managed_router(RouterFailure::None);
+        let router = Arc::new(std::sync::Mutex::new(managed));
+        engage_kernel_security_block(&router, SecurityBlockReason::MapLoss).unwrap();
+        let peer = NodePrivate::generate().public();
+        let mut routes = RouteTable::default();
+        set_exit_route_state_latch_aware(&mut routes, Some(&router), Some(peer.clone()), true);
+        assert!(routes.exit_traffic_blocked());
+        assert!(routes.lookup("8.8.8.8".parse().unwrap()).is_none());
+
         assert!(
-            !config.local_routes.contains(&lan_prefix),
-            "LAN route {lan_prefix} must not bypass the exit node by default"
+            !clear_kernel_security_block_reason(&router, SecurityBlockReason::MapLoss).unwrap()
         );
+        set_exit_route_state_latch_aware(&mut routes, Some(&router), Some(peer.clone()), true);
+        assert!(!routes.exit_traffic_blocked());
+        assert_eq!(routes.lookup("8.8.8.8".parse().unwrap()), Some(peer));
+    }
 
-        let config = build_router_config_with_local_routes(
-            &[],
-            &routes,
-            Some(&derp_map),
-            "https://127.0.0.1",
-            true,
-            vec![lan_prefix],
+    #[test]
+    fn partial_unblock_failure_forces_fresh_block_before_refresh_routes() {
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut managed = ManagedRouter {
+            router: Box::new(RetryUnblockRouter {
+                events: events.clone(),
+                fail_unblock_once: true,
+            }),
+            tun_name: "rustscale-test0".into(),
+            exit_node: false,
+            security_block_attempted: false,
+            security_block_verified: false,
+            security_block_reasons: 0,
+        };
+        let config = rustscale_router::RouterConfig {
+            exit_node: true,
+            ..Default::default()
+        };
+        assert!(apply_managed_router_config(&mut managed, &config, true, false, true).is_err());
+        assert_eq!(*events.lock().unwrap(), ["block", "set", "unblock"]);
+        assert!(managed.security_block_attempted);
+        assert!(!managed.security_block_verified);
+        assert!(managed.has_security_reasons());
+
+        apply_managed_router_config(&mut managed, &config, false, false, true).unwrap();
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["block", "set", "unblock", "block", "set", "unblock"]
         );
-        assert!(config.local_routes.contains(&lan_prefix));
-        for prefix in [
-            "192.0.2.10/32",
-            "2001:db8::10/128",
-            "127.0.0.1/32",
-            "127.0.0.0/8",
-            "::1/128",
+    }
+
+    #[test]
+    fn map_loss_latch_survives_link_success_until_map_recovery() {
+        let (mut managed, events) = ordered_managed_router(RouterFailure::None);
+        let mut routes = RouteTable::default();
+        routes.set_exit_node(NodePrivate::generate().public());
+        routes.block_exit_traffic();
+        ensure_managed_security_block(&mut managed, SecurityBlockReason::MapLoss).unwrap();
+        ensure_managed_security_block(&mut managed, SecurityBlockReason::LinkRefresh).unwrap();
+        let config = rustscale_router::RouterConfig {
+            exit_node: true,
+            ..Default::default()
+        };
+        apply_managed_router_config(&mut managed, &config, true, false, true).unwrap();
+        assert!(clear_managed_security_block_reason(
+            &mut managed,
+            SecurityBlockReason::LinkRefresh
+        )
+        .unwrap());
+        routes.block_exit_traffic();
+        assert!(managed.security_block_verified);
+        assert!(routes.exit_traffic_blocked());
+        assert_eq!(*events.lock().unwrap(), ["block", "set"]);
+
+        assert!(
+            !clear_managed_security_block_reason(&mut managed, SecurityBlockReason::MapLoss)
+                .unwrap()
+        );
+        routes.unblock_exit_traffic();
+        assert!(!routes.exit_traffic_blocked());
+        assert_eq!(*events.lock().unwrap(), ["block", "set", "unblock"]);
+    }
+
+    #[test]
+    fn route_or_unblock_failure_retains_emergency_block() {
+        for (failure, expected) in [
+            (RouterFailure::Set, vec!["block", "set"]),
+            (RouterFailure::Unblock, vec!["block", "set", "unblock"]),
         ] {
-            assert!(
-                config
-                    .local_routes
-                    .contains(&rustscale_tsaddr::IpPrefix::parse(prefix).unwrap()),
-                "missing bypass route {prefix}",
+            let (mut managed, events) = ordered_managed_router(failure);
+            let config = rustscale_router::RouterConfig {
+                exit_node: true,
+                ..Default::default()
+            };
+            assert!(apply_managed_router_config(&mut managed, &config, true, false, true).is_err());
+            assert_eq!(*events.lock().unwrap(), expected);
+            assert!(managed.exit_node);
+            assert!(managed.security_block_attempted);
+            assert_eq!(
+                managed.security_block_verified,
+                matches!(failure, RouterFailure::Set)
             );
         }
     }
 
     #[test]
-    fn control_server_resolution_returns_host_prefixes() {
-        assert_eq!(
-            resolve_control_server_ips("https://127.0.0.1:8443"),
-            vec!["127.0.0.1".parse::<IpAddr>().unwrap()]
+    fn exit_removal_rollback_failure_retains_verified_kernel_and_userspace_blocks() {
+        let (mut managed, events) = ordered_managed_router(RouterFailure::Rollback);
+        managed.exit_node = true;
+        let exit = NodePrivate::generate().public();
+        let mut routes = RouteTable::default();
+        routes.set_exit_node(exit.clone());
+        let old_state = routes.exit_route_state();
+        routes.clear_exit_node();
+        let config = rustscale_router::RouterConfig::default();
+
+        let error = apply_managed_router_config(&mut managed, &config, false, true, false)
+            .expect_err("injected route rollback must fail");
+        assert!(error.to_string().contains("rollback failed"));
+        routes.restore_exit_route_state(old_state);
+        if managed.has_security_reasons() {
+            routes.block_exit_traffic();
+        }
+
+        assert_eq!(*events.lock().unwrap(), ["block", "set"]);
+        assert!(managed.exit_node);
+        assert!(managed.security_block_attempted);
+        assert!(managed.security_block_verified);
+        assert!(managed.has_security_reasons());
+        assert!(routes.exit_traffic_blocked());
+        assert_eq!(routes.exit_node(), Some(&exit));
+        assert!(routes.lookup("8.8.8.8".parse().unwrap()).is_none());
+    }
+
+    #[test]
+    fn exit_node_router_config_fails_closed_over_external_lan_prefixes() {
+        let mut route_table = RouteTable::default();
+        route_table.set_exit_node(NodePrivate::generate().public());
+        let lan_v4 = rustscale_tsaddr::IpPrefix::parse("192.168.0.0/16").unwrap();
+        let lan_v6 = rustscale_tsaddr::IpPrefix::parse("fd00:1234::/64").unwrap();
+        let vpn_host = rustscale_tsaddr::IpPrefix::parse("100.100.2.3/32").unwrap();
+
+        let denied = build_router_config_with_local_routes(
+            &[],
+            &route_table,
+            false,
+            vec![lan_v4, lan_v6, vpn_host],
         );
+        for child in ["192.168.0.0/17", "192.168.128.0/17"] {
+            assert!(denied
+                .routes
+                .contains(&rustscale_tsaddr::IpPrefix::parse(child).unwrap()));
+        }
+        for child in ["fd00:1234::/65", "fd00:1234:0:0:8000::/65"] {
+            assert!(denied
+                .routes
+                .contains(&rustscale_tsaddr::IpPrefix::parse(child).unwrap()));
+        }
+        assert!(!denied.routes.contains(&lan_v4));
+        assert!(!denied.routes.contains(&lan_v6));
+        assert!(denied.routes.contains(&vpn_host));
+        assert!(denied.local_routes.is_empty());
+
+        let allowed = build_router_config_with_local_routes(
+            &[],
+            &route_table,
+            true,
+            vec![lan_v4, lan_v6, vpn_host],
+        );
+        assert!(!allowed.routes.contains(&lan_v4));
+        assert!(!allowed.routes.contains(&lan_v6));
+        assert_eq!(allowed.local_routes, [vpn_host, lan_v4, lan_v6]);
+    }
+
+    #[test]
+    fn hostile_control_derp_and_dhcp_dns_never_become_route_bypasses() {
+        let mut route_table = RouteTable::default();
+        route_table.set_exit_node(NodePrivate::generate().public());
+        let hostile_v4 = rustscale_tsaddr::IpPrefix::parse("203.0.113.66/32").unwrap();
+        let hostile_v6 = rustscale_tsaddr::IpPrefix::parse("2001:db8::66/128").unwrap();
+        let hostile_dhcp_dns = rustscale_tsaddr::IpPrefix::parse("198.51.100.53/32").unwrap();
+        // The route builder intentionally has no control, DERP, or DNS source
+        // parameter; none of these unauthenticated destinations can enter the
+        // desired route set.
+        let config = build_router_config_with_local_routes(&[], &route_table, false, vec![]);
+        assert!(!config.local_routes.contains(&hostile_v4));
+        assert!(!config.local_routes.contains(&hostile_v6));
+        assert!(!config.routes.contains(&hostile_v4));
+        assert!(!config.routes.contains(&hostile_v6));
+        assert!(!config.local_routes.contains(&hostile_dhcp_dns));
+        assert!(!config.routes.contains(&hostile_dhcp_dns));
     }
 
     #[test]

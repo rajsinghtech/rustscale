@@ -136,6 +136,14 @@ impl ExitNodeSelection {
         self.pending_persisted = None;
     }
 
+    /// Put an unresolved persisted request into capture/no-connect state when
+    /// there is no prior working exit peer to retain.
+    pub(crate) fn ensure_fail_closed(&self, routes: &mut RouteTable) {
+        if self.pending_persisted.is_some() && routes.exit_node().is_none() {
+            routes.capture_exit_node();
+        }
+    }
+
     /// Retry an unresolved persisted selection. This deliberately does not
     /// clear the route table when the peer is absent: an explicit selection
     /// owns the table once it has superseded the persisted preference.
@@ -148,8 +156,28 @@ impl ExitNodeSelection {
             self.pending_persisted = None;
             true
         } else {
+            self.ensure_fail_closed(routes);
             false
         }
+    }
+
+    pub(crate) fn retry_transactional<E>(
+        &mut self,
+        peers: &[Node],
+        routes: &mut RouteTable,
+        apply: impl FnOnce(&RouteTable) -> Result<(), E>,
+    ) -> Result<bool, E> {
+        let old_selection = self.clone();
+        let old_exit_state = routes.exit_route_state();
+        if !self.retry(peers, routes) {
+            return Ok(false);
+        }
+        if let Err(error) = apply(routes) {
+            routes.restore_exit_route_state(old_exit_state);
+            *self = old_selection;
+            return Err(error);
+        }
+        Ok(true)
     }
 }
 
@@ -189,21 +217,299 @@ async fn clear_exit_routes_for_identity_mismatch(
 ) {
     exit_node_selection.write().await.clear_pending();
     let mut routes = route_table.write().await;
-    routes.clear_exit_node();
+    let had_exit_routes = routes.exit_node_requested();
+    if had_exit_routes {
+        // The peer-map writer already stops in-process delivery. Keep the
+        // userspace table visibly blocked as well, and do not begin kernel
+        // teardown until the exact emergency block has been verified.
+        routes.block_exit_traffic();
+        if let Some(router) = router {
+            if let Err(error) =
+                engage_kernel_security_block(router, SecurityBlockReason::Transition)
+            {
+                log::warn!("tsnet: refusing OS route teardown after identity mismatch: {error}");
+                return;
+            }
+        }
+    }
+    set_exit_route_state_latch_aware(&mut routes, router, None, false);
     routes.rebuild_with_opts(&[], accept_routes);
     if let Some(router) = router {
-        let derp_map = magicsock.get_derp_map();
-        if let Err(error) = sync_router(
+        match sync_router(
             router,
             tailscale_ips,
             &routes,
-            derp_map.as_ref(),
+            magicsock,
             control_url,
             exit_node_allow_lan_access,
         ) {
-            log::warn!("tsnet: failed to clear OS routes after identity mismatch: {error}");
+            Ok(()) => set_exit_route_state_latch_aware(&mut routes, Some(router), None, false),
+            Err(error) => {
+                set_exit_route_state_latch_aware(&mut routes, Some(router), None, false);
+                log::warn!("tsnet: failed to clear OS routes after identity mismatch: {error}");
+            }
         }
     }
+}
+
+async fn block_exit_on_map_loss(
+    router: Option<&SharedRouter>,
+    exit_map_gate: &crate::ExitMapGate,
+    prefs: &Arc<RwLock<rustscale_ipn::Prefs>>,
+    route_table: &Arc<RwLock<RouteTable>>,
+    health: &Tracker,
+    ipn_backend: &Arc<IpnBackend>,
+    reason: &str,
+) {
+    let _exit_map_guard = exit_map_gate.lock().await;
+    let allow_lan = prefs.read().await.ExitNodeAllowLANAccess;
+    let mut routes = route_table.write().await;
+    if !routes.exit_node_requested() || allow_lan {
+        return;
+    }
+    routes.block_exit_traffic();
+    let kernel = router
+        .and_then(|router| engage_kernel_security_block(router, SecurityBlockReason::MapLoss).err())
+        .map(|error| format!("; kernel block: {error}"))
+        .unwrap_or_default();
+    health.set_unhealthy(WARN_EXIT_ROUTE_SECURITY, format!("{reason}{kernel}"));
+    send_health_notify(health, ipn_backend);
+}
+
+/// Every peer-derived publication surface participating in a Tailnet Lock
+/// transition. The TKA operation lock is always acquired before these gates.
+pub(crate) struct PeerAuthorityRuntime {
+    exit_map_gate: crate::ExitMapGate,
+    peer_map: Arc<crate::peer_map::Runtime>,
+    drive: Arc<crate::drive::Runtime>,
+    magicsock: Arc<Magicsock>,
+    filter: Arc<std::sync::Mutex<Filter>>,
+    peers: Arc<RwLock<Vec<Node>>>,
+    wg_tunnels: Arc<RwLock<HashMap<NodePublic, Arc<Mutex<WgTunn>>>>>,
+    resolver: Arc<RwLock<MagicDnsResolver>>,
+    prefs: Arc<RwLock<rustscale_ipn::Prefs>>,
+    route_table: Arc<RwLock<RouteTable>>,
+    router: Option<SharedRouter>,
+    tailscale_ips: Vec<IpAddr>,
+    control_url: String,
+    accept_routes: bool,
+    #[cfg(test)]
+    withdrawal_pause: std::sync::Mutex<Option<Arc<WithdrawalPause>>>,
+}
+
+impl PeerAuthorityRuntime {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        exit_map_gate: crate::ExitMapGate,
+        peer_map: Arc<crate::peer_map::Runtime>,
+        drive: Arc<crate::drive::Runtime>,
+        magicsock: Arc<Magicsock>,
+        filter: Arc<std::sync::Mutex<Filter>>,
+        peers: Arc<RwLock<Vec<Node>>>,
+        wg_tunnels: Arc<RwLock<HashMap<NodePublic, Arc<Mutex<WgTunn>>>>>,
+        resolver: Arc<RwLock<MagicDnsResolver>>,
+        prefs: Arc<RwLock<rustscale_ipn::Prefs>>,
+        route_table: Arc<RwLock<RouteTable>>,
+        router: Option<SharedRouter>,
+        tailscale_ips: Vec<IpAddr>,
+        control_url: String,
+        accept_routes: bool,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            exit_map_gate,
+            peer_map,
+            drive,
+            magicsock,
+            filter,
+            peers,
+            wg_tunnels,
+            resolver,
+            prefs,
+            route_table,
+            router,
+            tailscale_ips,
+            control_url,
+            accept_routes,
+            #[cfg(test)]
+            withdrawal_pause: std::sync::Mutex::new(None),
+        })
+    }
+
+    /// Drain the shared commit barrier and atomically withdraw every authority
+    /// derived from the previously accepted peer map before any TKA network
+    /// operation can commit a new authority.
+    pub(crate) async fn withdraw(&self) -> Vec<Node> {
+        #[cfg(test)]
+        self.pause_before_withdrawal_await(WithdrawalAwait::ExitMapGate)
+            .await;
+        let _exit_map_guard = self.exit_map_gate.lock().await;
+        #[cfg(test)]
+        self.pause_before_withdrawal_await(WithdrawalAwait::PeerMapGate)
+            .await;
+        let map_commit = self.peer_map.gate.write().await;
+        #[cfg(test)]
+        self.pause_before_withdrawal_await(WithdrawalAwait::PeerSnapshot)
+            .await;
+        let previous_peers = self.peers.read().await.clone();
+
+        #[cfg(test)]
+        self.pause_before_withdrawal_await(WithdrawalAwait::DriveAuthorization)
+            .await;
+        let mut drive_epoch = self.drive.authorization_write().await;
+        self.drive.rotate_authorization_locked(&mut drive_epoch);
+        self.drive
+            .set_sharing_allowed_locked(false, &mut drive_epoch);
+        #[cfg(test)]
+        self.pause_before_withdrawal_await(WithdrawalAwait::RelayDrain)
+            .await;
+        self.magicsock.disable_relay_server_and_drain().await;
+        *self.filter.lock().unwrap() = Filter::allow_none();
+        #[cfg(test)]
+        self.pause_before_withdrawal_await(WithdrawalAwait::PeersWrite)
+            .await;
+        self.peers.write().await.clear();
+        #[cfg(test)]
+        self.pause_before_withdrawal_await(WithdrawalAwait::TunnelsWrite)
+            .await;
+        self.wg_tunnels.write().await.clear();
+        self.peer_map
+            .install_locked(&[])
+            .expect("empty peer map is valid");
+        #[cfg(test)]
+        self.pause_before_withdrawal_await(WithdrawalAwait::MagicsockNetmap)
+            .await;
+        if let Err(error) = self.magicsock.set_netmap(Vec::new()).await {
+            log::warn!(
+                "tsnet: failed to revoke magicsock generations before Tailnet Lock sync: {error}"
+            );
+        }
+        #[cfg(test)]
+        self.pause_before_withdrawal_await(WithdrawalAwait::ResolverWrite)
+            .await;
+        self.resolver.write().await.set_peers(Vec::new());
+
+        #[cfg(test)]
+        self.pause_before_withdrawal_await(WithdrawalAwait::PrefsRead)
+            .await;
+        let live_prefs = self.prefs.read().await.clone();
+        #[cfg(test)]
+        self.pause_before_withdrawal_await(WithdrawalAwait::RoutesWrite)
+            .await;
+        let mut routes = self.route_table.write().await;
+        routes.rebuild_with_opts(&[], self.accept_routes);
+        if routes.exit_node_requested() {
+            routes.block_exit_traffic();
+        }
+        if let Some(router) = self.router.as_ref() {
+            if let Err(error) = sync_router(
+                router,
+                &self.tailscale_ips,
+                &routes,
+                &self.magicsock,
+                &self.control_url,
+                live_prefs.ExitNodeAllowLANAccess,
+            ) {
+                routes.block_exit_traffic();
+                log::warn!("tsnet: failed to withdraw OS routes before Tailnet Lock sync: {error}");
+            }
+        }
+        drop(routes);
+        drop(drive_epoch);
+        drop(map_commit);
+
+        #[cfg(test)]
+        {
+            let pause = {
+                let guard = self.withdrawal_pause.lock().unwrap();
+                guard.clone()
+            };
+            if let Some(pause) = pause.filter(|pause| pause.point.is_none()) {
+                pause.entered.add_permits(1);
+                let _permit = pause.release.acquire().await.unwrap();
+            }
+        }
+
+        previous_peers
+    }
+
+    /// Join the same ordered peer commit barrier without withdrawing peers.
+    /// Disable requests retain local enforcement until control proves the
+    /// disablement in a later map.
+    pub(crate) async fn synchronize(&self) {
+        let _exit_map_guard = self.exit_map_gate.lock().await;
+        let _map_commit = self.peer_map.gate.write().await;
+    }
+
+    #[cfg(test)]
+    async fn pause_before_withdrawal_await(&self, point: WithdrawalAwait) {
+        let pause = self.withdrawal_pause.lock().unwrap().clone();
+        if let Some(pause) = pause.filter(|pause| pause.point == Some(point)) {
+            pause.entered.add_permits(1);
+            let _permit = pause.release.acquire().await.unwrap();
+        }
+    }
+
+    #[cfg(test)]
+    fn pause_withdrawal_at(&self, point: WithdrawalAwait) -> Arc<WithdrawalPause> {
+        let pause = Arc::new(WithdrawalPause {
+            point: Some(point),
+            entered: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        *self.withdrawal_pause.lock().unwrap() = Some(pause.clone());
+        pause
+    }
+
+    #[cfg(test)]
+    fn pause_after_withdrawal(&self) -> Arc<WithdrawalPause> {
+        let pause = Arc::new(WithdrawalPause {
+            point: None,
+            entered: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        *self.withdrawal_pause.lock().unwrap() = Some(pause.clone());
+        pause
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WithdrawalAwait {
+    ExitMapGate,
+    PeerMapGate,
+    PeerSnapshot,
+    DriveAuthorization,
+    RelayDrain,
+    PeersWrite,
+    TunnelsWrite,
+    MagicsockNetmap,
+    ResolverWrite,
+    PrefsRead,
+    RoutesWrite,
+}
+
+#[cfg(test)]
+impl WithdrawalAwait {
+    const ALL: [Self; 11] = [
+        Self::ExitMapGate,
+        Self::PeerMapGate,
+        Self::PeerSnapshot,
+        Self::DriveAuthorization,
+        Self::RelayDrain,
+        Self::PeersWrite,
+        Self::TunnelsWrite,
+        Self::MagicsockNetmap,
+        Self::ResolverWrite,
+        Self::PrefsRead,
+        Self::RoutesWrite,
+    ];
+}
+
+#[cfg(test)]
+struct WithdrawalPause {
+    point: Option<WithdrawalAwait>,
+    entered: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
 }
 
 /// Spawn the map-stream delta update task. Shared by `up()` and `up_tun()`:
@@ -217,6 +523,7 @@ pub(crate) fn spawn_map_update_task(
     mut raw_peers: Vec<Node>,
     peers_arc: Arc<RwLock<Vec<Node>>>,
     route_table: Arc<RwLock<RouteTable>>,
+    exit_map_gate: crate::ExitMapGate,
     router: Option<SharedRouter>,
     prefs: Arc<RwLock<rustscale_ipn::Prefs>>,
     exit_node_selection: Arc<RwLock<ExitNodeSelection>>,
@@ -267,13 +574,32 @@ pub(crate) fn spawn_map_update_task(
         "no map response for over 2 minutes",
         std::time::Duration::from_secs(125),
     );
+    let peer_authority = tailnet_lock
+        .peer_authority()
+        .expect("peer authority runtime attached before map updates start");
     tokio::spawn(async move {
         let mut first_non_keepalive = true;
         loop {
             if cancel.is_cancelled() {
                 break;
             }
-            match map_rx.recv().await {
+            let map_event = tokio::select! {
+                event = map_rx.recv() => event,
+                () = tokio::time::sleep(std::time::Duration::from_secs(125)) => {
+                    block_exit_on_map_loss(
+                        router.as_ref(),
+                        &exit_map_gate,
+                        &prefs,
+                        &route_table,
+                        &health,
+                        &ipn_backend,
+                        "map response watchdog expired",
+                    ).await;
+                    map_timeout_watchdog.feed();
+                    continue;
+                }
+            };
+            match map_event {
                 Some(Ok(resp)) => {
                     // Map activity: feed the staleness watchdogs + mark
                     // control healthy. Even keep-alive messages count.
@@ -289,22 +615,50 @@ pub(crate) fn spawn_map_update_task(
 
                     if resp.KeepAlive {
                         if let Some(router) = router.as_ref() {
-                            let routes = route_table.read().await;
-                            if routes.exit_node().is_some() {
-                                let derp_map = magicsock.get_derp_map();
-                                let exit_node_allow_lan_access =
-                                    prefs.read().await.ExitNodeAllowLANAccess;
-                                if let Err(error) = sync_router(
-                                    router,
-                                    &tailscale_ips,
-                                    &routes,
-                                    derp_map.as_ref(),
-                                    &control_url,
-                                    exit_node_allow_lan_access,
-                                ) {
-                                    eprintln!(
-                                        "tsnet: bypass-route update failed (non-fatal): {error}"
+                            let _exit_map_guard = exit_map_gate.lock().await;
+                            let exit_node_allow_lan_access =
+                                prefs.read().await.ExitNodeAllowLANAccess;
+                            let mut routes = route_table.write().await;
+                            let security_critical =
+                                routes.exit_node_requested() && !exit_node_allow_lan_access;
+                            match sync_router(
+                                router,
+                                &tailscale_ips,
+                                &routes,
+                                &magicsock,
+                                &control_url,
+                                exit_node_allow_lan_access,
+                            ) {
+                                Ok(()) => {
+                                    let still_latched = clear_kernel_security_block_reason(
+                                        router,
+                                        SecurityBlockReason::MapLoss,
+                                    )
+                                    .unwrap_or(true);
+                                    if still_latched {
+                                        routes.block_exit_traffic();
+                                    } else {
+                                        routes.unblock_exit_traffic();
+                                        health.set_healthy(WARN_EXIT_ROUTE_SECURITY);
+                                    }
+                                }
+                                Err(error) if security_critical => {
+                                    routes.block_exit_traffic();
+                                    let kernel = engage_kernel_security_block(
+                                        router,
+                                        SecurityBlockReason::MapLoss,
+                                    )
+                                    .err()
+                                    .map(|failure| format!("; kernel block: {failure}"))
+                                    .unwrap_or_default();
+                                    health.set_unhealthy(
+                                        WARN_EXIT_ROUTE_SECURITY,
+                                        format!("map route refresh failed: {error}{kernel}"),
                                     );
+                                    send_health_notify(&health, &ipn_backend);
+                                }
+                                Err(error) => {
+                                    log::warn!("tsnet: map route refresh failed: {error}");
                                 }
                             }
                         }
@@ -323,6 +677,7 @@ pub(crate) fn spawn_map_update_task(
                         // rotating Taildrive under the same gate cancels and
                         // drains its publication epoch before any empty state
                         // becomes observable.
+                        let _exit_map_guard = exit_map_gate.lock().await;
                         let map_commit = peer_map.gate.write().await;
                         let mut drive_epoch = drive.authorization_write().await;
                         drive.rotate_authorization_locked(&mut drive_epoch);
@@ -359,9 +714,29 @@ pub(crate) fn spawn_map_update_task(
                         break;
                     }
 
+                    // Serialize the decision, any revocation, control apply,
+                    // and the resulting peer commit against LocalAPI TKA
+                    // mutations. Without this operation guard, an init can
+                    // commit after a stale disabled-map decision and before
+                    // its apply, incorrectly leaving pre-lock peers published.
+                    let tka_operation = tailnet_lock.operation().await;
                     let tka_state_may_change = first_non_keepalive || resp.TKAInfo.is_some();
-                    let tka_sync =
-                        tailnet_lock.apply_control_info(resp.TKAInfo.as_ref(), first_non_keepalive);
+                    let tka_revocation_required = tka_operation.control_change_requires_revocation(
+                        resp.TKAInfo.as_ref(),
+                        first_non_keepalive,
+                    );
+                    let mut pre_revocation_peers = None;
+                    if tka_revocation_required {
+                        // Acquire the delivery/commit barrier before the first
+                        // synchronization await. Everything derived from the
+                        // old authority is withdrawn in one writer epoch;
+                        // successful sync may republish only through the
+                        // normal atomic map commit below.
+                        pre_revocation_peers = Some(peer_authority.withdraw().await);
+                    }
+
+                    let tka_sync = tka_operation
+                        .apply_control_info(resp.TKAInfo.as_ref(), first_non_keepalive);
                     tokio::select! {
                         () = cancel.cancelled() => break,
                         result = tka_sync => {
@@ -517,6 +892,12 @@ pub(crate) fn spawn_map_update_task(
                         }
                     }
 
+                    // Serialize the peer/exit snapshot through route commit
+                    // and OS synchronization. Lock order is exit_map_gate,
+                    // then peer_map.gate, then route table, then router; the
+                    // peer-map writer is released before route/router locks.
+                    let exit_map_guard = exit_map_gate.lock().await;
+
                     // Reconcile the raw control view by stable Node.ID before
                     // intersecting it with TKA authorization. Presence of a
                     // full snapshot is significant: Some([]) revokes all,
@@ -525,7 +906,11 @@ pub(crate) fn spawn_map_update_task(
                     if full_peers_present {
                         peer_snapshot_fresh = true;
                     }
-                    let current_peers = peers_arc.read().await.clone();
+                    let current_peers = if let Some(peers) = pre_revocation_peers.take() {
+                        peers
+                    } else {
+                        peers_arc.read().await.clone()
+                    };
                     let (next_raw_peers, invalid_peer_map) =
                         match crate::peer_map::reconcile(&raw_peers, &resp) {
                             Ok(peers) => (peers, false),
@@ -541,6 +926,7 @@ pub(crate) fn spawn_map_update_task(
                         Vec::new()
                     };
                     tailnet_lock.filter_peers(&mut next_peers);
+                    let authority_ready = tailnet_lock.authorization_ready();
                     let peers_changed = tka_state_may_change
                         || full_peers_present
                         || invalid_peer_map
@@ -561,20 +947,24 @@ pub(crate) fn spawn_map_update_task(
                     // Taildrive publication epochs all use the TKA-verified
                     // stable-ID intersection.
                     let map_commit = peer_map.gate.write().await;
-                    if let Some(selected) = route_table.read().await.exit_node().cloned() {
-                        if let Some(replacement) =
-                            rotated_peer_key(&current_peers, &next_peers, &selected)
-                        {
-                            next_routes.set_exit_node(replacement);
-                        }
-                    }
+                    let current_exit_state = route_table.read().await.exit_route_state();
+                    restore_exit_state_for_map(
+                        &mut next_routes,
+                        current_exit_state,
+                        &current_peers,
+                        &next_peers,
+                    );
                     exit_node_selection
                         .write()
                         .await
                         .retry(&next_peers, &mut next_routes);
+                    if router.as_ref().is_some_and(kernel_security_block_latched) {
+                        next_routes.block_exit_traffic();
+                    }
+
                     let mut drive_epoch = drive.authorization_write().await;
                     drive.rotate_authorization_locked(&mut drive_epoch);
-                    if invalid_peer_map {
+                    if invalid_peer_map || !authority_ready {
                         drive.set_sharing_allowed_locked(false, &mut drive_epoch);
                     } else if let Some(ref node) = resp.Node {
                         let sharing_allowed = node
@@ -588,8 +978,10 @@ pub(crate) fn spawn_map_update_task(
                     }
 
                     let filter_changed = process_filter_deltas(&resp, &mut named_filters);
-                    if invalid_peer_map {
-                        named_filters.clear();
+                    if invalid_peer_map || !authority_ready {
+                        if invalid_peer_map {
+                            named_filters.clear();
+                        }
                         *filter_arc.lock().unwrap() = Filter::allow_none();
                     } else if filter_changed || peers_changed {
                         let shields_up = filter_arc.lock().unwrap().shields_up();
@@ -602,7 +994,7 @@ pub(crate) fn spawn_map_update_task(
                             shields_up,
                         );
                     }
-                    if !invalid_peer_map {
+                    if !invalid_peer_map && authority_ready {
                         if let Some(ref node) = resp.Node {
                             // A fresh matching map/config is the sole relay-
                             // server re-enable path after identity withdrawal.
@@ -620,6 +1012,10 @@ pub(crate) fn spawn_map_update_task(
                         .expect("validated verified peer map installs");
                     drop(drive_epoch);
                     drop(map_commit);
+                    // A LocalAPI init/resume/disable may proceed only after
+                    // this exact decision has either revoked or committed all
+                    // peer-derived publication surfaces.
+                    drop(tka_operation);
                     let peers = next_peers;
 
                     // Forward peer deltas to the IPN notify bus so
@@ -674,20 +1070,62 @@ pub(crate) fn spawn_map_update_task(
                     // releasing the packet gate so shell/native router work
                     // cannot stall data-plane readers.
                     let live_prefs = prefs.read().await.clone();
-                    if let Some(router) = router.as_ref() {
-                        let derp_map = magicsock.get_derp_map();
-                        let routes = route_table.read().await;
-                        if let Err(error) = sync_router(
+                    let mut routes = route_table.write().await;
+                    let security_critical =
+                        routes.exit_node_requested() && !live_prefs.ExitNodeAllowLANAccess;
+                    let refresh_error = router.as_ref().and_then(|router| {
+                        sync_router(
                             router,
                             &tailscale_ips,
                             &routes,
-                            derp_map.as_ref(),
+                            &magicsock,
                             &control_url,
                             live_prefs.ExitNodeAllowLANAccess,
-                        ) {
-                            eprintln!("tsnet: route update failed (non-fatal): {error}");
+                        )
+                        .err()
+                    });
+                    if let Some(error) = refresh_error {
+                        let transition_latched =
+                            router.as_ref().is_some_and(kernel_security_block_latched);
+                        if security_critical || transition_latched {
+                            routes.block_exit_traffic();
+                            let kernel = if security_critical {
+                                router
+                                    .as_ref()
+                                    .and_then(|router| {
+                                        engage_kernel_security_block(
+                                            router,
+                                            SecurityBlockReason::MapLoss,
+                                        )
+                                        .err()
+                                    })
+                                    .map(|failure| format!("; kernel block: {failure}"))
+                                    .unwrap_or_default()
+                            } else {
+                                String::new()
+                            };
+                            health.set_unhealthy(
+                                WARN_EXIT_ROUTE_SECURITY,
+                                format!("map route refresh failed: {error}{kernel}"),
+                            );
+                            send_health_notify(&health, &ipn_backend);
+                        } else {
+                            log::warn!("tsnet: map route refresh failed: {error}");
+                        }
+                    } else {
+                        let still_latched = router.as_ref().is_some_and(|router| {
+                            clear_kernel_security_block_reason(router, SecurityBlockReason::MapLoss)
+                                .unwrap_or(true)
+                        });
+                        if still_latched {
+                            routes.block_exit_traffic();
+                        } else {
+                            routes.unblock_exit_traffic();
+                            health.set_healthy(WARN_EXIT_ROUTE_SECURITY);
                         }
                     }
+                    drop(routes);
+                    drop(exit_map_guard);
 
                     // Update IPN engine status: peer count as NumLive, DERP
                     // home connection as LiveDERPs. This may transition the
@@ -762,6 +1200,16 @@ pub(crate) fn spawn_map_update_task(
                     }
                 }
                 Some(Err(e)) => {
+                    block_exit_on_map_loss(
+                        router.as_ref(),
+                        &exit_map_gate,
+                        &prefs,
+                        &route_table,
+                        &health,
+                        &ipn_backend,
+                        "map poll stream error",
+                    )
+                    .await;
                     health.set_unhealthy(WARN_CONTROL, format!("control connection lost: {e}"));
                     health.set_unhealthy(
                         WARN_NOT_IN_MAP_POLL,
@@ -771,6 +1219,16 @@ pub(crate) fn spawn_map_update_task(
                     break;
                 }
                 None => {
+                    block_exit_on_map_loss(
+                        router.as_ref(),
+                        &exit_map_gate,
+                        &prefs,
+                        &route_table,
+                        &health,
+                        &ipn_backend,
+                        "map poll stream closed",
+                    )
+                    .await;
                     health.set_unhealthy(WARN_CONTROL, "control connection lost: stream closed");
                     health.set_unhealthy(
                         WARN_NOT_IN_MAP_POLL,
@@ -989,6 +1447,26 @@ async fn perform_key_rotation(
 
 /// Send a Notify with the current health warnings so frontend consumers
 /// can surface health state changes. Mirrors Go's `LocalBackend.sendHealthNotify`.
+fn restore_exit_state_for_map(
+    routes: &mut RouteTable,
+    state: crate::routing::ExitRouteState,
+    current_peers: &[Node],
+    next_peers: &[Node],
+) {
+    routes.restore_exit_route_state(state);
+    let Some(selected) = routes.exit_node().cloned() else {
+        return;
+    };
+    let Some(replacement) = rotated_peer_key(current_peers, next_peers, &selected) else {
+        return;
+    };
+    let was_blocked = routes.exit_traffic_blocked();
+    routes.set_exit_node(replacement);
+    if was_blocked {
+        routes.block_exit_traffic();
+    }
+}
+
 fn rotated_peer_key(current: &[Node], next: &[Node], selected: &NodePublic) -> Option<NodePublic> {
     let stable_id = current.iter().find(|peer| &peer.Key == selected)?.ID;
     next.iter()
@@ -1032,8 +1510,72 @@ fn send_health_notify(health: &Tracker, ipn_backend: &IpnBackend) {
 mod tests {
     use super::*;
     use rustscale_ipn::Prefs;
-    use rustscale_key::{DiscoPrivate, NodePrivate};
-    use rustscale_tailcfg::PeerChange;
+    use rustscale_key::{DiscoPrivate, MachinePrivate, NLPrivate, NodePrivate};
+    use rustscale_tailcfg::{PeerChange, TKAInfo};
+    use rustscale_tka::{disablement_kdf, Key, KeyKind};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct BlockRouter(Arc<AtomicUsize>);
+
+    impl rustscale_router::Router for BlockRouter {
+        fn up(&mut self) -> Result<(), rustscale_router::RouterError> {
+            Ok(())
+        }
+        fn set(
+            &mut self,
+            _: &rustscale_router::RouterConfig,
+        ) -> Result<(), rustscale_router::RouterError> {
+            Ok(())
+        }
+        fn block_direct(&mut self) -> Result<(), rustscale_router::RouterError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn unblock_direct(&mut self) -> Result<(), rustscale_router::RouterError> {
+            Ok(())
+        }
+        fn close(&mut self) -> Result<(), rustscale_router::RouterError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn map_loss_installs_kernel_emergency_block_for_lan_denied_exit() {
+        let blocks = Arc::new(AtomicUsize::new(0));
+        let router = Arc::new(std::sync::Mutex::new(crate::tun_pump::ManagedRouter {
+            router: Box::new(BlockRouter(blocks.clone())),
+            tun_name: "rustscale-test0".into(),
+            exit_node: true,
+            security_block_attempted: false,
+            security_block_verified: false,
+            security_block_reasons: 0,
+        }));
+        let mut routes = RouteTable::default();
+        routes.set_exit_node(NodePrivate::generate().public());
+        let routes = Arc::new(RwLock::new(routes));
+        let prefs = Arc::new(RwLock::new(Prefs {
+            ExitNodeAllowLANAccess: false,
+            ..Default::default()
+        }));
+        let health = Tracker::new();
+        let backend = Arc::new(IpnBackend::new("test"));
+        block_exit_on_map_loss(
+            Some(&router),
+            &Arc::new(tokio::sync::Mutex::new(())),
+            &prefs,
+            &routes,
+            &health,
+            &backend,
+            "injected map closure",
+        )
+        .await;
+        assert_eq!(blocks.load(Ordering::SeqCst), 1);
+        assert!(routes.read().await.exit_traffic_blocked());
+        assert!(health
+            .current_warnings()
+            .iter()
+            .any(|warning| { warning.id == WARN_EXIT_ROUTE_SECURITY }));
+    }
 
     #[tokio::test]
     async fn cancellation_inside_rotated_map_rebind_retains_join_owner() {
@@ -1085,6 +1627,14 @@ mod tests {
             Ok(())
         }
 
+        fn block_direct(&mut self) -> Result<(), rustscale_router::RouterError> {
+            Ok(())
+        }
+
+        fn unblock_direct(&mut self) -> Result<(), rustscale_router::RouterError> {
+            Ok(())
+        }
+
         fn close(&mut self) -> Result<(), rustscale_router::RouterError> {
             Ok(())
         }
@@ -1125,9 +1675,15 @@ mod tests {
         let selection = Arc::new(RwLock::new(ExitNodeSelection::from_prefs(&prefs)));
         let peer_map = crate::peer_map::Runtime::new(&[exit_peer]).unwrap();
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let router: SharedRouter = Arc::new(std::sync::Mutex::new(Box::new(RecordingRouter {
-            seen: seen.clone(),
-        })));
+        let router: SharedRouter =
+            Arc::new(std::sync::Mutex::new(crate::tun_pump::ManagedRouter {
+                router: Box::new(RecordingRouter { seen: seen.clone() }),
+                tun_name: "rustscale-test0".into(),
+                exit_node: true,
+                security_block_attempted: false,
+                security_block_verified: false,
+                security_block_reasons: 0,
+            }));
         let (magicsock, _wg_rx) = Magicsock::new(rustscale_magicsock::MagicsockConfig {
             private_key: NodePrivate::generate(),
             disco_key: DiscoPrivate::generate(),
@@ -1172,6 +1728,437 @@ mod tests {
             "OS router retained an exit default route: {:?}",
             last.routes
         );
+    }
+
+    #[tokio::test]
+    async fn tka_revocation_drains_commit_readers_and_withdraws_all_peer_authority() {
+        let local_key = NodePrivate::generate();
+        let peer = Node {
+            ID: 77,
+            StableID: "n-tka-peer".into(),
+            Key: NodePrivate::generate().public(),
+            DiscoKey: DiscoPrivate::generate().public(),
+            Addresses: vec!["100.64.0.77/32".into()],
+            AllowedIPs: vec!["100.64.0.77/32".into(), "0.0.0.0/0".into(), "::/0".into()],
+            ..Default::default()
+        };
+        let peer_map = crate::peer_map::Runtime::new(std::slice::from_ref(&peer)).unwrap();
+        let peers = Arc::new(RwLock::new(vec![peer.clone()]));
+        let tunnel = Arc::new(Mutex::new(WgTunn::new(&local_key, &peer.Key, 1).unwrap()));
+        let tunnels = Arc::new(RwLock::new(HashMap::from([(peer.Key.clone(), tunnel)])));
+        let mut routes = RouteTable::from_peers_with_opts(std::slice::from_ref(&peer), false);
+        routes.set_exit_node(peer.Key.clone());
+        let routes = Arc::new(RwLock::new(routes));
+        let filter = Arc::new(std::sync::Mutex::new(Filter::allow_none()));
+        let drive = crate::drive::Runtime::new();
+        {
+            let mut epoch = drive.authorization_write().await;
+            drive.set_sharing_allowed_locked(true, &mut epoch);
+        }
+        let (magicsock, _wg_rx) = Magicsock::new(rustscale_magicsock::MagicsockConfig {
+            private_key: local_key,
+            disco_key: DiscoPrivate::generate(),
+            derp_client: None,
+            derp_map: None,
+            home_derp_region: 0,
+            udp_bind: None,
+            udp_socket: None,
+            portmapper: None,
+            health: None,
+            disable_direct_paths: false,
+            peer_relay_server: false,
+            relay_server_config: None,
+            sockstats: None,
+            control_knobs: None,
+        })
+        .await
+        .unwrap();
+        let magicsock = Arc::new(magicsock);
+        magicsock.set_netmap(vec![peer.clone()]).await.unwrap();
+        let resolver = Arc::new(RwLock::new(MagicDnsResolver::default()));
+        let prefs = Arc::new(RwLock::new(Prefs::default()));
+        let runtime = PeerAuthorityRuntime::new(
+            Arc::new(tokio::sync::Mutex::new(())),
+            peer_map.clone(),
+            drive.clone(),
+            magicsock.clone(),
+            filter.clone(),
+            peers.clone(),
+            tunnels.clone(),
+            resolver,
+            prefs,
+            routes.clone(),
+            None,
+            Vec::new(),
+            "https://control.example".into(),
+            false,
+        );
+
+        let reader = peer_map.gate.read().await;
+        let task = {
+            let runtime = runtime.clone();
+            tokio::spawn(async move { runtime.withdraw().await })
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            !task.is_finished(),
+            "writer must drain existing delivery readers"
+        );
+        assert_eq!(peers.read().await.len(), 1);
+        drop(reader);
+
+        let previous = task.await.unwrap();
+        assert_eq!(previous, vec![peer.clone()]);
+        assert!(peers.read().await.is_empty());
+        assert!(tunnels.read().await.is_empty());
+        assert!(peer_map
+            .current_owner("100.64.0.77".parse().unwrap())
+            .is_none());
+        assert!(magicsock.authorization_generation(&peer.Key).is_none());
+        assert!(!drive.sharing_allowed());
+        let routes = routes.read().await;
+        assert_eq!(routes.entries().count(), 0);
+        assert!(routes.exit_node_requested());
+        assert!(routes.exit_traffic_blocked());
+        assert!(routes.lookup("8.8.8.8".parse().unwrap()).is_none());
+    }
+
+    #[tokio::test]
+    async fn concurrent_init_after_stale_disabled_decision_withdraws_and_cannot_publish() {
+        let local_key = NodePrivate::generate();
+        let peer = Node {
+            ID: 88,
+            StableID: "n-pre-lock-peer".into(),
+            Key: NodePrivate::generate().public(),
+            DiscoKey: DiscoPrivate::generate().public(),
+            Addresses: vec!["100.64.0.88/32".into()],
+            AllowedIPs: vec!["100.64.0.88/32".into(), "0.0.0.0/0".into()],
+            ..Default::default()
+        };
+        let peer_map = crate::peer_map::Runtime::new(std::slice::from_ref(&peer)).unwrap();
+        let peers = Arc::new(RwLock::new(vec![peer.clone()]));
+        let tunnels = Arc::new(RwLock::new(HashMap::from([(
+            peer.Key.clone(),
+            Arc::new(Mutex::new(WgTunn::new(&local_key, &peer.Key, 1).unwrap())),
+        )])));
+        let mut initial_routes =
+            RouteTable::from_peers_with_opts(std::slice::from_ref(&peer), false);
+        initial_routes.set_exit_node(peer.Key.clone());
+        let routes = Arc::new(RwLock::new(initial_routes));
+        let filter = Arc::new(std::sync::Mutex::new(Filter::allow_none()));
+        let drive = crate::drive::Runtime::new();
+        {
+            let mut epoch = drive.authorization_write().await;
+            drive.set_sharing_allowed_locked(true, &mut epoch);
+        }
+        let (magicsock, _wg_rx) = Magicsock::new(rustscale_magicsock::MagicsockConfig {
+            private_key: local_key.clone(),
+            disco_key: DiscoPrivate::generate(),
+            derp_client: None,
+            derp_map: None,
+            home_derp_region: 0,
+            udp_bind: None,
+            udp_socket: None,
+            portmapper: None,
+            health: None,
+            disable_direct_paths: false,
+            peer_relay_server: false,
+            relay_server_config: None,
+            sockstats: None,
+            control_knobs: None,
+        })
+        .await
+        .unwrap();
+        let magicsock = Arc::new(magicsock);
+        magicsock.set_netmap(vec![peer.clone()]).await.unwrap();
+        let runtime = PeerAuthorityRuntime::new(
+            Arc::new(tokio::sync::Mutex::new(())),
+            peer_map.clone(),
+            drive.clone(),
+            magicsock.clone(),
+            filter,
+            peers.clone(),
+            tunnels.clone(),
+            Arc::new(RwLock::new(MagicDnsResolver::default())),
+            Arc::new(RwLock::new(Prefs::default())),
+            routes.clone(),
+            None,
+            Vec::new(),
+            "http://127.0.0.1:1".into(),
+            false,
+        );
+        let pause = runtime.pause_after_withdrawal();
+
+        let state = tempfile::tempdir().unwrap();
+        let signing_key = NLPrivate::generate();
+        let lock = crate::tailnet_lock::TailnetLock::open(crate::tailnet_lock::TailnetLockParams {
+            control_url: "http://127.0.0.1:1".into(),
+            machine_key: MachinePrivate::generate(),
+            server_pub_key: MachinePrivate::generate().public(),
+            node_key: local_key,
+            signing_key: signing_key.clone(),
+            capability_version: 141,
+            protocol_version: 141,
+            state_dir: Some(state.path().into()),
+            extra_root_certs: None,
+        })
+        .unwrap();
+        lock.attach_peer_authority(runtime).unwrap();
+        let disabled = TKAInfo {
+            Disabled: true,
+            ..Default::default()
+        };
+
+        // Pause exactly after a stale disabled map decided that the currently
+        // unlocked state did not require revocation. Init queues on the same
+        // operation lock and cannot mutate authority between decision/apply.
+        let stale_operation = lock.operation().await;
+        assert!(!stale_operation.control_change_requires_revocation(Some(&disabled), false));
+        let secret = vec![0x5a; 32];
+        let init_waiter = lock
+            .start_init(crate::tailnet_lock::InitRequest {
+                keys: vec![Key {
+                    kind: KeyKind::Key25519,
+                    votes: 1,
+                    public: signing_key.public().raw32().to_vec(),
+                    meta: None,
+                }],
+                disablement_values: vec![disablement_kdf(&secret)],
+                disablement_secrets: vec![secret],
+                support_disablement: Vec::new(),
+                resume: false,
+            })
+            .unwrap();
+        tokio::task::yield_now().await;
+        stale_operation
+            .apply_control_info(Some(&disabled), false)
+            .await
+            .unwrap();
+        drop(stale_operation);
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), pause.entered.acquire())
+            .await
+            .expect("init did not withdraw promptly")
+            .unwrap()
+            .forget();
+        assert!(peers.read().await.is_empty());
+        assert!(tunnels.read().await.is_empty());
+        assert!(peer_map
+            .current_owner("100.64.0.88".parse().unwrap())
+            .is_none());
+        assert!(magicsock.authorization_generation(&peer.Key).is_none());
+        assert!(!drive.sharing_allowed());
+        let routes_guard = routes.read().await;
+        assert_eq!(routes_guard.entries().count(), 0);
+        assert!(routes_guard.exit_traffic_blocked());
+        drop(routes_guard);
+
+        // Another stale disabled map cannot publish while init owns the TKA
+        // operation. Dropping the LocalAPI waiter does not cancel the retained
+        // flight; its fail-closed required state forces that map through
+        // revocation rather than the old false branch.
+        let stale_publish = {
+            let lock = lock.clone();
+            let peer_map = peer_map.clone();
+            let peers = peers.clone();
+            let peer = peer.clone();
+            tokio::spawn(async move {
+                let operation = lock.operation().await;
+                let revoke = operation.control_change_requires_revocation(Some(&disabled), false);
+                if !revoke {
+                    let _commit = peer_map.gate.write().await;
+                    peer_map
+                        .install_locked(std::slice::from_ref(&peer))
+                        .unwrap();
+                    *peers.write().await = vec![peer];
+                }
+                revoke
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            !stale_publish.is_finished(),
+            "stale publication must remain behind concurrent init"
+        );
+        drop(init_waiter);
+        pause.release.add_permits(1);
+        lock.join_init_flight().await;
+        assert!(
+            stale_publish.await.unwrap(),
+            "stale disabled map skipped revoke"
+        );
+        assert!(peers.read().await.is_empty());
+        assert!(peer_map
+            .current_owner("100.64.0.88".parse().unwrap())
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn localapi_eof_at_every_withdraw_await_cannot_cancel_revocation() {
+        for point in WithdrawalAwait::ALL {
+            let local_key = NodePrivate::generate();
+            let peer = Node {
+                ID: 99,
+                StableID: format!("n-disconnect-{point:?}"),
+                Key: NodePrivate::generate().public(),
+                DiscoKey: DiscoPrivate::generate().public(),
+                Addresses: vec!["100.64.0.99/32".into()],
+                AllowedIPs: vec!["100.64.0.99/32".into(), "0.0.0.0/0".into()],
+                ..Default::default()
+            };
+            let peer_map = crate::peer_map::Runtime::new(std::slice::from_ref(&peer)).unwrap();
+            let peers = Arc::new(RwLock::new(vec![peer.clone()]));
+            let tunnels = Arc::new(RwLock::new(HashMap::from([(
+                peer.Key.clone(),
+                Arc::new(Mutex::new(WgTunn::new(&local_key, &peer.Key, 1).unwrap())),
+            )])));
+            let mut initial_routes =
+                RouteTable::from_peers_with_opts(std::slice::from_ref(&peer), false);
+            initial_routes.set_exit_node(peer.Key.clone());
+            let routes = Arc::new(RwLock::new(initial_routes));
+            let filter = Arc::new(std::sync::Mutex::new(Filter::allow_none()));
+            let drive = crate::drive::Runtime::new();
+            {
+                let mut epoch = drive.authorization_write().await;
+                drive.set_sharing_allowed_locked(true, &mut epoch);
+            }
+            let (magicsock, _wg_rx) = Magicsock::new(rustscale_magicsock::MagicsockConfig {
+                private_key: local_key.clone(),
+                disco_key: DiscoPrivate::generate(),
+                derp_client: None,
+                derp_map: None,
+                home_derp_region: 0,
+                udp_bind: None,
+                udp_socket: None,
+                portmapper: None,
+                health: None,
+                disable_direct_paths: false,
+                peer_relay_server: false,
+                relay_server_config: None,
+                sockstats: None,
+                control_knobs: None,
+            })
+            .await
+            .unwrap();
+            let magicsock = Arc::new(magicsock);
+            magicsock.set_netmap(vec![peer.clone()]).await.unwrap();
+            let resolver = Arc::new(RwLock::new(MagicDnsResolver::default()));
+            resolver.write().await.set_peers(vec![peer.clone()]);
+            let runtime = PeerAuthorityRuntime::new(
+                Arc::new(tokio::sync::Mutex::new(())),
+                peer_map.clone(),
+                drive.clone(),
+                magicsock.clone(),
+                filter,
+                peers.clone(),
+                tunnels.clone(),
+                resolver,
+                Arc::new(RwLock::new(Prefs::default())),
+                routes.clone(),
+                None,
+                Vec::new(),
+                "http://127.0.0.1:1".into(),
+                false,
+            );
+            let pause = runtime.pause_withdrawal_at(point);
+
+            let state = tempfile::tempdir().unwrap();
+            let signing_key = NLPrivate::generate();
+            let lock =
+                crate::tailnet_lock::TailnetLock::open(crate::tailnet_lock::TailnetLockParams {
+                    control_url: "http://127.0.0.1:1".into(),
+                    machine_key: MachinePrivate::generate(),
+                    server_pub_key: MachinePrivate::generate().public(),
+                    node_key: local_key,
+                    signing_key: signing_key.clone(),
+                    capability_version: 141,
+                    protocol_version: 141,
+                    state_dir: Some(state.path().into()),
+                    extra_root_certs: None,
+                })
+                .unwrap();
+            lock.attach_peer_authority(runtime).unwrap();
+            let secret = vec![0x6b; 32];
+            let request = crate::tailnet_lock::InitRequest {
+                keys: vec![Key {
+                    kind: KeyKind::Key25519,
+                    votes: 1,
+                    public: signing_key.public().raw32().to_vec(),
+                    meta: None,
+                }],
+                disablement_values: vec![disablement_kdf(&secret)],
+                disablement_secrets: vec![secret],
+                support_disablement: Vec::new(),
+                resume: false,
+            };
+
+            let (client, mut server) = tokio::io::duplex(64);
+            let handler = {
+                let lock = lock.clone();
+                tokio::spawn(async move {
+                    crate::localapi::handle_admitted_tka_init(&mut server, &lock, request).await
+                })
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(5), pause.entered.acquire())
+                .await
+                .unwrap_or_else(|_| panic!("init did not reach withdrawal await {point:?}"))
+                .unwrap()
+                .forget();
+
+            // EOF ends only the authorized client's waiter. The lifecycle
+            // flight still owns the operation lock at every withdrawal await.
+            drop(client);
+            tokio::time::timeout(std::time::Duration::from_secs(5), handler)
+                .await
+                .unwrap_or_else(|_| panic!("LocalAPI handler ignored EOF at {point:?}"))
+                .unwrap()
+                .unwrap();
+            let stale_map = {
+                let lock = lock.clone();
+                tokio::spawn(async move {
+                    let operation = lock.operation().await;
+                    operation.control_change_requires_revocation(
+                        Some(&TKAInfo {
+                            Disabled: true,
+                            ..Default::default()
+                        }),
+                        false,
+                    )
+                })
+            };
+            tokio::task::yield_now().await;
+            assert!(
+                !stale_map.is_finished(),
+                "operation lock escaped at withdrawal await {point:?}"
+            );
+
+            pause.release.add_permits(1);
+            lock.join_init_flight().await;
+            assert!(
+                stale_map.await.unwrap(),
+                "stale disabled map could republish after EOF at {point:?}"
+            );
+            assert!(!lock.authorization_ready(), "authority opened at {point:?}");
+            assert!(peers.read().await.is_empty(), "peers survived at {point:?}");
+            assert!(
+                tunnels.read().await.is_empty(),
+                "tunnels survived at {point:?}"
+            );
+            assert!(
+                peer_map
+                    .current_owner("100.64.0.99".parse().unwrap())
+                    .is_none(),
+                "peer ownership survived at {point:?}"
+            );
+            assert!(
+                magicsock.authorization_generation(&peer.Key).is_none(),
+                "magicsock generation survived at {point:?}"
+            );
+            assert!(!drive.sharing_allowed(), "Taildrive survived at {point:?}");
+            let routes = routes.read().await;
+            assert_eq!(routes.entries().count(), 0, "routes survived at {point:?}");
+            assert!(routes.exit_traffic_blocked(), "exit opened at {point:?}");
+        }
     }
 
     #[test]
@@ -1244,6 +2231,104 @@ mod tests {
         assert_eq!(replace.OldNodeKey, current);
     }
 
+    #[tokio::test]
+    async fn exit_map_gate_serializes_map_against_select_and_clear() {
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let routes = Arc::new(RwLock::new(RouteTable::default()));
+        let selected = NodePrivate::generate().public();
+
+        // A map already holding the gate may commit its snapshot first, but a
+        // newer selection queued behind it must be the final state.
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let map = {
+            let gate = gate.clone();
+            let routes = routes.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                let _guard = gate.lock().await;
+                let snapshot = routes.read().await.exit_route_state();
+                barrier.wait().await;
+                let mut replacement = RouteTable::default();
+                replacement.restore_exit_route_state(snapshot);
+                *routes.write().await = replacement;
+            })
+        };
+        barrier.wait().await;
+        let select = {
+            let gate = gate.clone();
+            let routes = routes.clone();
+            let selected = selected.clone();
+            tokio::spawn(async move {
+                let _guard = gate.lock().await;
+                routes.write().await.set_exit_node(selected);
+            })
+        };
+        map.await.unwrap();
+        select.await.unwrap();
+        assert_eq!(routes.read().await.exit_node(), Some(&selected));
+
+        // Conversely, a clear that owns the gate finishes before a queued map
+        // takes its snapshot, so that map cannot resurrect the old selection.
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let clear = {
+            let gate = gate.clone();
+            let routes = routes.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                let _guard = gate.lock().await;
+                routes.write().await.clear_exit_node();
+                barrier.wait().await;
+            })
+        };
+        barrier.wait().await;
+        let map = {
+            let gate = gate.clone();
+            let routes = routes.clone();
+            tokio::spawn(async move {
+                let _guard = gate.lock().await;
+                let snapshot = routes.read().await.exit_route_state();
+                let mut replacement = RouteTable::default();
+                replacement.restore_exit_route_state(snapshot);
+                *routes.write().await = replacement;
+            })
+        };
+        clear.await.unwrap();
+        map.await.unwrap();
+        assert!(routes.read().await.exit_node().is_none());
+        assert!(!routes.read().await.exit_node_requested());
+    }
+
+    #[test]
+    fn peer_map_rebuild_preserves_blocked_exit_and_rotates_stable_peer_key() {
+        let old_key = NodePrivate::generate().public();
+        let new_key = NodePrivate::generate().public();
+        let peer = |key| Node {
+            ID: 42,
+            StableID: "stable-exit".into(),
+            Key: key,
+            Addresses: vec!["100.64.0.9/32".into()],
+            AllowedIPs: vec!["0.0.0.0/0".into(), "::/0".into()],
+            ..Default::default()
+        };
+        let current_peers = vec![peer(old_key.clone())];
+        let next_peers = vec![peer(new_key.clone())];
+        let mut current_routes = RouteTable::from_peers(&current_peers);
+        current_routes.set_exit_node(old_key);
+        current_routes.block_exit_traffic();
+        let mut next_routes = RouteTable::from_peers(&next_peers);
+
+        restore_exit_state_for_map(
+            &mut next_routes,
+            current_routes.exit_route_state(),
+            &current_peers,
+            &next_peers,
+        );
+
+        assert_eq!(next_routes.exit_node(), Some(&new_key));
+        assert!(next_routes.exit_node_requested());
+        assert!(next_routes.exit_traffic_blocked());
+    }
+
     #[test]
     fn unresolved_persisted_exit_node_is_retried_when_peer_arrives() {
         let exit_key = NodePrivate::generate().public();
@@ -1255,6 +2340,8 @@ mod tests {
         let mut selection = ExitNodeSelection::from_prefs(&prefs);
         selection.retry(&[], &mut routes);
         assert!(routes.exit_node().is_none());
+        assert!(routes.exit_node_requested());
+        assert!(routes.lookup("8.8.8.8".parse().unwrap()).is_none());
 
         let mut peer = Node {
             Key: exit_key.clone(),
@@ -1268,6 +2355,61 @@ mod tests {
         peer.AllowedIPs.push("::/0".into());
         assert!(selection.retry(&[peer], &mut routes));
         assert_eq!(routes.exit_node(), Some(&exit_key));
+    }
+
+    #[test]
+    fn pending_exit_node_router_failure_restores_selection_and_route() {
+        let old_exit = NodePrivate::generate().public();
+        let pending_exit = NodePrivate::generate().public();
+        let prefs = Prefs {
+            ExitNodeIP: "100.64.0.9".into(),
+            ..Default::default()
+        };
+        let peer = Node {
+            Key: pending_exit.clone(),
+            Addresses: vec!["100.64.0.9/32".into()],
+            AllowedIPs: vec!["0.0.0.0/0".into(), "::/0".into()],
+            ..Default::default()
+        };
+        let mut selection = ExitNodeSelection::from_prefs(&prefs);
+        let mut routes = RouteTable::default();
+        routes.set_exit_node(old_exit.clone());
+        routes.block_exit_traffic();
+
+        let result = selection.retry_transactional(&[peer.clone()], &mut routes, |_| {
+            Err::<(), _>("injected router failure")
+        });
+        assert!(result.is_err());
+        assert_eq!(routes.exit_node(), Some(&old_exit));
+        assert!(routes.exit_traffic_blocked());
+        assert!(selection
+            .retry_transactional(&[peer], &mut routes, |_| Ok::<(), &str>(()))
+            .unwrap());
+        assert_eq!(routes.exit_node(), Some(&pending_exit));
+    }
+
+    #[test]
+    fn pending_exit_router_failure_restores_capture_state() {
+        let pending_exit = NodePrivate::generate().public();
+        let prefs = Prefs {
+            ExitNodeIP: "100.64.0.9".into(),
+            ..Default::default()
+        };
+        let peer = Node {
+            Key: pending_exit,
+            Addresses: vec!["100.64.0.9/32".into()],
+            AllowedIPs: vec!["0.0.0.0/0".into(), "::/0".into()],
+            ..Default::default()
+        };
+        let mut routes = RouteTable::default();
+        routes.capture_exit_node();
+        let mut selection = ExitNodeSelection::from_prefs(&prefs);
+
+        let result = selection.retry_transactional(&[peer], &mut routes, |_| Err("injected"));
+        assert_eq!(result, Err("injected"));
+        assert!(routes.exit_node().is_none());
+        assert!(routes.exit_node_requested());
+        assert!(selection.pending_persisted.is_some());
     }
 
     #[test]

@@ -6,6 +6,14 @@ pub async fn control_and_connect(addr: SocketAddr) -> Result<TcpStream, std::io:
     Ok(stream)
 }
 
+pub async fn system_control_and_connect(addr: SocketAddr) -> Result<TcpStream, std::io::Error> {
+    control_and_connect(addr).await
+}
+
 pub fn configure_udp_socket(_socket: &UdpSocket) -> Result<(), std::io::Error> {
+    Ok(())
+}
+
+pub fn validate_underlay_bypass(_rustscale_tun_name: &str) -> Result<(), std::io::Error> {
     Ok(())
 }

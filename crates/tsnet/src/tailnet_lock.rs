@@ -16,6 +16,7 @@ use rustscale_tka::{
     Aum, AumSigner, Authority, FsChonk, Key, MemChonk, NodeKeySignature, SigKind, State,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
 const MAX_SYNC_AUMS: usize = 2000;
 const MAX_INIT_NODES: usize = 4096;
@@ -89,7 +90,63 @@ pub(crate) struct TailnetLock {
     params: TailnetLockParams,
     path: Option<PathBuf>,
     operation: tokio::sync::Mutex<()>,
+    init_flight: Mutex<Option<InitFlightState>>,
+    peer_authority: Mutex<Option<Arc<crate::map_update::PeerAuthorityRuntime>>>,
     inner: Mutex<Inner>,
+}
+
+/// A LocalAPI initialization waiter. Dropping this value only disconnects the
+/// caller: the retained flight continues to own the TKA operation lock and
+/// peer-publication barriers until initialization finishes fail-closed.
+pub(crate) struct InitFlight {
+    result: tokio::sync::watch::Receiver<Option<SharedInitResult>>,
+}
+
+type SharedInitResult = Arc<Result<Vec<Vec<u8>>, TailnetLockError>>;
+
+struct InitFlightState {
+    request_hash: [u8; 32],
+    result: tokio::sync::watch::Receiver<Option<SharedInitResult>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl InitFlight {
+    pub(crate) async fn wait(mut self) -> SharedInitResult {
+        loop {
+            if let Some(result) = self.result.borrow().clone() {
+                return result;
+            }
+            if self.result.changed().await.is_err() {
+                return Arc::new(Err(TailnetLockError::StateUnavailable));
+            }
+        }
+    }
+}
+
+/// Holds the one ordered TKA operation across a control-state decision,
+/// synchronization, and the peer-map commit derived from that decision.
+pub(crate) struct Operation<'a> {
+    lock: &'a TailnetLock,
+    _guard: tokio::sync::MutexGuard<'a, ()>,
+}
+
+impl Operation<'_> {
+    pub(crate) fn control_change_requires_revocation(
+        &self,
+        info: Option<&TKAInfo>,
+        initial: bool,
+    ) -> bool {
+        self.lock
+            .control_change_requires_revocation_inner(info, initial)
+    }
+
+    pub(crate) async fn apply_control_info(
+        &self,
+        info: Option<&TKAInfo>,
+        initial: bool,
+    ) -> Result<(), TailnetLockError> {
+        self.lock.apply_control_info_inner(info, initial).await
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -197,6 +254,8 @@ impl TailnetLock {
             params,
             path,
             operation: tokio::sync::Mutex::new(()),
+            init_flight: Mutex::new(None),
+            peer_authority: Mutex::new(None),
             inner: Mutex::new(Inner {
                 authority,
                 storage,
@@ -255,6 +314,79 @@ impl TailnetLock {
         control
     }
 
+    pub(crate) fn attach_peer_authority(
+        &self,
+        runtime: Arc<crate::map_update::PeerAuthorityRuntime>,
+    ) -> Result<(), TailnetLockError> {
+        let mut attached = self
+            .peer_authority
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if attached.is_some() {
+            return Err(TailnetLockError::StateUnavailable);
+        }
+        *attached = Some(runtime);
+        Ok(())
+    }
+
+    pub(crate) fn peer_authority(
+        &self,
+    ) -> Result<Arc<crate::map_update::PeerAuthorityRuntime>, TailnetLockError> {
+        self.peer_authority
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .ok_or(TailnetLockError::StateUnavailable)
+    }
+
+    pub(crate) async fn operation(&self) -> Operation<'_> {
+        Operation {
+            lock: self,
+            _guard: self.operation.lock().await,
+        }
+    }
+
+    /// Whether applying this control state can change peer authorization.
+    /// This is called only while holding [`Operation`] through the subsequent
+    /// apply and peer commit. Repeated ready advertisements at the same head
+    /// deliberately return false.
+    fn control_change_requires_revocation_inner(
+        &self,
+        info: Option<&TKAInfo>,
+        initial: bool,
+    ) -> bool {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match info {
+            Some(info) if !info.Disabled => {
+                if !inner.required || !inner.ready {
+                    return true;
+                }
+                let Ok(wanted) = info.Head.parse::<rustscale_tka::AumHash>() else {
+                    return true;
+                };
+                inner.authority.as_ref().map(Authority::head) != Some(wanted)
+            }
+            Some(_) => inner.required || inner.authority.is_some(),
+            None if initial => inner.required || inner.authority.is_some(),
+            None => false,
+        }
+    }
+
+    pub(crate) fn authorization_ready(&self) -> bool {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if inner.required || inner.authority.is_some() {
+            inner.ready && inner.authority.is_some()
+        } else {
+            inner.ready
+        }
+    }
+
     /// Apply an initial or delta TKAInfo. The caller must filter peers after
     /// this returns regardless of success.
     pub(crate) async fn apply_control_info(
@@ -262,7 +394,15 @@ impl TailnetLock {
         info: Option<&TKAInfo>,
         initial: bool,
     ) -> Result<(), TailnetLockError> {
-        let _operation = self.operation.lock().await;
+        let operation = self.operation().await;
+        operation.apply_control_info(info, initial).await
+    }
+
+    async fn apply_control_info_inner(
+        &self,
+        info: Option<&TKAInfo>,
+        initial: bool,
+    ) -> Result<(), TailnetLockError> {
         let desired_enabled = match info {
             Some(info) => !info.Disabled,
             None if initial => false,
@@ -566,15 +706,72 @@ impl TailnetLock {
         Ok(())
     }
 
+    /// Admit one lifecycle-retained LocalAPI initialization flight. The
+    /// request body is fingerprinted so concurrent retries can join only the
+    /// exact same transaction; a disconnected waiter never owns cancellation
+    /// of authority withdrawal or local commit.
+    pub(crate) fn start_init(
+        self: &Arc<Self>,
+        request: InitRequest,
+    ) -> Result<InitFlight, TailnetLockError> {
+        let encoded = serde_json::to_vec(&request).map_err(|error| {
+            TailnetLockError::InvalidRequest(format!(
+                "initialization request could not be encoded: {error}"
+            ))
+        })?;
+        let request_hash: [u8; 32] = Sha256::digest(encoded).into();
+        let mut retained = self
+            .init_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(flight) = retained
+            .as_ref()
+            .filter(|flight| !flight.task.is_finished())
+        {
+            if flight.request_hash != request_hash {
+                return Err(TailnetLockError::InvalidRequest(
+                    "another Tailnet Lock initialization request is already running".into(),
+                ));
+            }
+            return Ok(InitFlight {
+                result: flight.result.clone(),
+            });
+        }
+
+        let (result_tx, result) = tokio::sync::watch::channel(None);
+        let lock = self.clone();
+        let task = tokio::spawn(async move {
+            let result = Arc::new(lock.init(request).await);
+            result_tx.send_replace(Some(result));
+        });
+        *retained = Some(InitFlightState {
+            request_hash,
+            result: result.clone(),
+            task,
+        });
+        Ok(InitFlight { result })
+    }
+
+    /// Join a retained initialization during close/logout before tearing down
+    /// the peer-authority runtime it still owns. If this join future itself is
+    /// dropped, Tokio retains the spawned operation and it still completes.
+    pub(crate) async fn join_init_flight(&self) {
+        let flight = self
+            .init_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(flight) = flight {
+            let _ = flight.task.await;
+        }
+    }
+
     /// Persist the complete disablement receipt before contacting control,
     /// then perform both irreversible phases on one authenticated session.
     /// The receipt intentionally survives success until an operator retrieves
     /// it, so a dropped LocalAPI/control response cannot destroy the secrets.
-    pub(crate) async fn init(
-        &self,
-        request: InitRequest,
-    ) -> Result<Vec<Vec<u8>>, TailnetLockError> {
-        let _operation = self.operation.lock().await;
+    async fn init(&self, request: InitRequest) -> Result<Vec<Vec<u8>>, TailnetLockError> {
+        let _operation = self.operation().await;
         if self.path.is_none() {
             return Err(TailnetLockError::NoStateDirectory);
         }
@@ -657,6 +854,21 @@ impl TailnetLock {
             receipt
         };
 
+        // From this point initialization is locally valid and may commit at
+        // control. Close enforcement before the first RPC, drain every peer
+        // publication generation, and keep map commits behind the operation
+        // lock until the outcome is known. Only a later fresh map carrying a
+        // successfully validated enabled head may set ready again.
+        {
+            let mut inner = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            inner.required = true;
+            inner.ready = false;
+        }
+        self.peer_authority()?.withdraw().await;
+
         if self.authority_snapshot().is_some() {
             receipt.phase = InitReceiptPhase::LocalCommitted;
             self.save_init_receipt(&receipt)?;
@@ -688,7 +900,7 @@ impl TailnetLock {
                     inner.authority = Some(authority);
                     inner.storage = Some(storage);
                     inner.required = true;
-                    inner.ready = true;
+                    inner.ready = false;
                     drop(inner);
                     receipt.phase = InitReceiptPhase::LocalCommitted;
                     self.save_init_receipt(&receipt)?;
@@ -748,7 +960,7 @@ impl TailnetLock {
         inner.authority = Some(authority);
         inner.storage = Some(storage);
         inner.required = true;
-        inner.ready = true;
+        inner.ready = false;
         drop(inner);
         receipt.phase = InitReceiptPhase::LocalCommitted;
         self.save_init_receipt(&receipt)?;
@@ -825,7 +1037,7 @@ impl TailnetLock {
     /// Ask control to disable the tailnet. Local enforcement remains active
     /// until a later map update carries a matching disablement proof.
     pub(crate) async fn disable(&self, secret: Vec<u8>) -> Result<(), TailnetLockError> {
-        let _operation = self.operation.lock().await;
+        let _operation = self.operation().await;
         if secret.len() > MAX_DISABLEMENT_SECRET {
             return Err(TailnetLockError::InvalidRequest(
                 "disablement secret is too large".into(),
@@ -839,6 +1051,10 @@ impl TailnetLock {
                 "disablement secret is invalid".into(),
             ));
         }
+        // Join the same commit/revocation barrier used by map transitions.
+        // Local enforcement remains closed under the existing authority until
+        // a later map supplies and validates the disablement proof.
+        self.peer_authority()?.synchronize().await;
         let control = self.control();
         TkaClient::new(&control)
             .disable(&TKADisableRequest {
@@ -1008,5 +1224,58 @@ fn filtered_peer(peer: &Node, reason: &'static str) -> FilteredPeer {
         node_key: peer.Key.clone(),
         tailscale_ips: peer.Addresses.clone(),
         reason,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustscale_key::{MachinePrivate, NLPrivate, NodePrivate};
+
+    fn unlocked_runtime() -> Arc<TailnetLock> {
+        TailnetLock::open(TailnetLockParams {
+            control_url: "http://127.0.0.1:1".into(),
+            machine_key: MachinePrivate::generate(),
+            server_pub_key: MachinePrivate::generate().public(),
+            node_key: NodePrivate::generate(),
+            signing_key: NLPrivate::generate(),
+            capability_version: 141,
+            protocol_version: 141,
+            state_dir: None,
+            extra_root_certs: None,
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn control_change_revocation_predicate_is_fail_closed_without_churn() {
+        let lock = unlocked_runtime();
+        let operation = lock.operation().await;
+        assert!(!operation.control_change_requires_revocation(None, false));
+        assert!(!operation.control_change_requires_revocation(None, true));
+        assert!(!operation.control_change_requires_revocation(
+            Some(&TKAInfo {
+                Disabled: true,
+                ..Default::default()
+            }),
+            false,
+        ));
+        assert!(operation.control_change_requires_revocation(
+            Some(&TKAInfo {
+                Head: "malformed-new-head".into(),
+                Disabled: false,
+            }),
+            false,
+        ));
+        drop(operation);
+
+        lock.require_fresh_control_state();
+        assert!(lock.operation().await.control_change_requires_revocation(
+            Some(&TKAInfo {
+                Disabled: true,
+                ..Default::default()
+            }),
+            false,
+        ));
     }
 }

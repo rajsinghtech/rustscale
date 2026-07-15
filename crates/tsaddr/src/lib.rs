@@ -140,37 +140,49 @@ pub fn exit_routes() -> Vec<IpPrefix> {
     vec![all_ipv4(), all_ipv6()]
 }
 
-/// Return prefixes assigned to local, non-Tailscale interfaces.
+/// Return every connected prefix assigned to an active external interface.
 ///
-/// Host routes are omitted because they do not protect a local LAN from an
-/// exit-node default route. Tailscale addresses are omitted so the TUN device
-/// cannot add routes that bypass itself.
-pub fn local_interface_prefixes() -> Vec<IpPrefix> {
-    let Ok(interfaces) = if_addrs::get_if_addrs() else {
-        return Vec::new();
-    };
+/// The caller supplies the exact RustScale TUN identity to exclude. Other VPN
+/// interfaces, CGNAT, and ULA assignments are intentionally retained: when LAN
+/// access is denied they must be captured just like physical LAN prefixes.
+/// Enumeration failure is returned so a full-tunnel caller can fail closed.
+pub fn local_interface_prefixes(rustscale_tun_name: &str) -> Result<Vec<IpPrefix>, std::io::Error> {
+    local_interface_prefixes_with(rustscale_tun_name, if_addrs::get_if_addrs)
+}
 
+fn local_interface_prefixes_with(
+    rustscale_tun_name: &str,
+    enumerate: impl FnOnce() -> Result<Vec<if_addrs::Interface>, std::io::Error>,
+) -> Result<Vec<IpPrefix>, std::io::Error> {
+    Ok(interface_prefixes_from(rustscale_tun_name, enumerate()?))
+}
+
+fn interface_prefixes_from(
+    rustscale_tun_name: &str,
+    interfaces: impl IntoIterator<Item = if_addrs::Interface>,
+) -> Vec<IpPrefix> {
     let mut prefixes = Vec::new();
     for interface in interfaces {
-        if !interface.is_oper_up() || is_tailscale_ip(interface.ip()) {
+        if !interface.is_oper_up()
+            || interface.is_loopback()
+            || interface.name == rustscale_tun_name
+        {
             continue;
         }
         match interface.addr {
-            if_addrs::IfAddr::V4(addr) if addr.prefixlen > 0 && addr.prefixlen < 32 => {
-                prefixes.push(IpPrefix {
-                    ip: IpAddr::V4(mask_v4(addr.ip, addr.prefixlen)),
-                    bits: addr.prefixlen,
-                });
-            }
-            if_addrs::IfAddr::V6(addr) if addr.prefixlen > 0 && addr.prefixlen < 128 => {
-                prefixes.push(IpPrefix {
-                    ip: IpAddr::V6(mask_v6(addr.ip, addr.prefixlen)),
-                    bits: addr.prefixlen,
-                });
-            }
+            if_addrs::IfAddr::V4(addr) if addr.prefixlen > 0 => prefixes.push(IpPrefix {
+                ip: IpAddr::V4(mask_v4(addr.ip, addr.prefixlen)),
+                bits: addr.prefixlen,
+            }),
+            if_addrs::IfAddr::V6(addr) if addr.prefixlen > 0 => prefixes.push(IpPrefix {
+                ip: IpAddr::V6(mask_v6(addr.ip, addr.prefixlen)),
+                bits: addr.prefixlen,
+            }),
             _ => {}
         }
     }
+    sort_prefixes(&mut prefixes);
+    prefixes.dedup();
     prefixes
 }
 
@@ -489,6 +501,66 @@ mod tests {
         assert_eq!(o[8..12], [0x48, 0x43, 0xcd, 0x96]);
         assert_eq!(o[12], 0x62);
         assert_eq!(o[13..16], [64, 0, 5]);
+    }
+
+    #[test]
+    fn connected_prefix_enumeration_failure_is_not_converted_to_empty_success() {
+        let error = local_interface_prefixes_with("rustscale0", || {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected enumeration failure",
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn connected_prefixes_include_other_vpns_cgnat_and_ula_only_excluding_exact_tun() {
+        fn iface(name: &str, addr: if_addrs::IfAddr) -> if_addrs::Interface {
+            if_addrs::Interface {
+                name: name.into(),
+                addr,
+                index: Some(1),
+                oper_status: if_addrs::IfOperStatus::Up,
+                is_p2p: false,
+                #[cfg(windows)]
+                adapter_name: String::new(),
+            }
+        }
+        let v4 = |ip, prefixlen| {
+            if_addrs::IfAddr::V4(if_addrs::Ifv4Addr {
+                ip,
+                netmask: Ipv4Addr::UNSPECIFIED,
+                prefixlen,
+                broadcast: None,
+            })
+        };
+        let v6 = |ip, prefixlen| {
+            if_addrs::IfAddr::V6(if_addrs::Ifv6Addr {
+                ip,
+                netmask: Ipv6Addr::UNSPECIFIED,
+                prefixlen,
+                broadcast: None,
+            })
+        };
+        let prefixes = interface_prefixes_from(
+            "rustscale0",
+            [
+                iface("rustscale0", v4(Ipv4Addr::new(100, 64, 0, 1), 32)),
+                iface("tun-corp", v4(Ipv4Addr::new(100, 100, 2, 3), 24)),
+                iface("utun9", v6("fd00:1234::9".parse().unwrap(), 64)),
+                iface("tailscale-foreign", v4(Ipv4Addr::new(10, 4, 5, 6), 16)),
+            ],
+        );
+        assert_eq!(
+            prefixes,
+            [
+                IpPrefix::parse("10.4.0.0/16").unwrap(),
+                IpPrefix::parse("100.100.2.0/24").unwrap(),
+                IpPrefix::parse("fd00:1234::/64").unwrap(),
+            ]
+        );
     }
 
     #[test]

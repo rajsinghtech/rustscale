@@ -39,6 +39,28 @@ pub enum RouterOperation {
     RemoveLocalRoute(IpPrefix),
     AddExitRoutes,
     RemoveExitRoutes,
+    EnableDirectBlock,
+    DisableDirectBlock,
+}
+
+impl RouterOperation {
+    #[cfg(any(target_os = "macos", target_os = "linux", test))]
+    fn inverse(&self) -> Self {
+        match self {
+            Self::Up => Self::Down,
+            Self::Down => Self::Up,
+            Self::AddAddr(address) => Self::RemoveAddr(*address),
+            Self::RemoveAddr(address) => Self::AddAddr(*address),
+            Self::AddRoute(prefix) => Self::RemoveRoute(*prefix),
+            Self::RemoveRoute(prefix) => Self::AddRoute(*prefix),
+            Self::AddLocalRoute(prefix) => Self::RemoveLocalRoute(*prefix),
+            Self::RemoveLocalRoute(prefix) => Self::AddLocalRoute(*prefix),
+            Self::AddExitRoutes => Self::RemoveExitRoutes,
+            Self::RemoveExitRoutes => Self::AddExitRoutes,
+            Self::EnableDirectBlock => Self::DisableDirectBlock,
+            Self::DisableDirectBlock => Self::EnableDirectBlock,
+        }
+    }
 }
 
 /// The pure delta between two router configurations.
@@ -61,11 +83,20 @@ impl RouterDiff {
         if self.remove_exit_routes {
             operations.push(RouterOperation::RemoveExitRoutes);
         }
+        // Add bypasses before removing stale ones to avoid transient loops.
         operations.extend(
-            self.remove_routes
+            self.add_local_routes
                 .iter()
                 .copied()
-                .map(RouterOperation::RemoveRoute),
+                .map(RouterOperation::AddLocalRoute),
+        );
+        // New TUN routes must exist before removing a bypass (LAN allow →
+        // deny); otherwise a connected route can leak during the transition.
+        operations.extend(
+            self.add_routes
+                .iter()
+                .copied()
+                .map(RouterOperation::AddRoute),
         );
         operations.extend(
             self.remove_local_routes
@@ -74,25 +105,20 @@ impl RouterDiff {
                 .map(RouterOperation::RemoveLocalRoute),
         );
         operations.extend(
+            self.remove_routes
+                .iter()
+                .copied()
+                .map(RouterOperation::RemoveRoute),
+        );
+        operations.extend(
             self.remove_addrs
                 .iter()
                 .copied()
                 .map(RouterOperation::RemoveAddr),
         );
         operations.extend(self.add_addrs.iter().copied().map(RouterOperation::AddAddr));
-        operations.extend(
-            self.add_routes
-                .iter()
-                .copied()
-                .map(RouterOperation::AddRoute),
-        );
-        operations.extend(
-            self.add_local_routes
-                .iter()
-                .copied()
-                .map(RouterOperation::AddLocalRoute),
-        );
         if self.add_exit_routes {
+            // Catch-all routes are always last, after every required bypass.
             operations.push(RouterOperation::AddExitRoutes);
         }
         operations
@@ -126,7 +152,72 @@ impl RouterDiff {
     }
 }
 
+impl RouterConfig {
+    fn normalized(&self) -> Result<Self, RouterError> {
+        let mut local_addrs: Vec<_> = self.local_addrs.iter().copied().map(normalize_ip).collect();
+        local_addrs.sort_unstable();
+        local_addrs.dedup();
+
+        let mut routes = normalize_prefixes(&self.routes)?;
+        let mut local_routes = normalize_prefixes(&self.local_routes)?;
+        rustscale_tsaddr::sort_prefixes(&mut routes);
+        rustscale_tsaddr::sort_prefixes(&mut local_routes);
+        routes.dedup();
+        local_routes.dedup();
+
+        Ok(Self {
+            local_addrs,
+            routes,
+            local_routes,
+            exit_node: self.exit_node,
+        })
+    }
+}
+
+fn normalize_prefixes(prefixes: &[IpPrefix]) -> Result<Vec<IpPrefix>, RouterError> {
+    prefixes
+        .iter()
+        .copied()
+        .map(|prefix| {
+            let ip = normalize_ip(prefix.ip);
+            let max = if ip.is_ipv4() { 32 } else { 128 };
+            if prefix.bits > max {
+                return Err(RouterError::InvalidConfig(format!(
+                    "invalid prefix length in {ip}/{}",
+                    prefix.bits
+                )));
+            }
+            let ip = match ip {
+                IpAddr::V4(ip) => {
+                    let mask = u32::MAX
+                        .checked_shl(u32::from(32 - prefix.bits))
+                        .unwrap_or(0);
+                    IpAddr::V4((u32::from(ip) & mask).into())
+                }
+                IpAddr::V6(ip) => {
+                    let mask = u128::MAX
+                        .checked_shl(u32::from(128 - prefix.bits))
+                        .unwrap_or(0);
+                    IpAddr::V6((u128::from(ip) & mask).into())
+                }
+            };
+            Ok(IpPrefix {
+                ip,
+                bits: prefix.bits,
+            })
+        })
+        .collect()
+}
+
+fn normalize_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(ip) => ip.to_ipv4_mapped().map_or(IpAddr::V6(ip), IpAddr::V4),
+        ip => ip,
+    }
+}
+
 /// Compute the configuration delta without performing any OS operation.
+/// Callers that apply the result first normalize with [`RouterConfig::normalized`].
 pub fn diff(previous: Option<&RouterConfig>, next: &RouterConfig) -> RouterDiff {
     let previous = previous.cloned().unwrap_or_default();
     RouterDiff {
@@ -158,6 +249,7 @@ fn prefix_difference(left: &[IpPrefix], right: &[IpPrefix]) -> Vec<IpPrefix> {
 /// An error returned while applying a route operation.
 #[derive(Debug)]
 pub enum RouterError {
+    InvalidConfig(String),
     Command {
         program: String,
         args: Vec<String>,
@@ -165,6 +257,10 @@ pub enum RouterError {
         stderr: String,
     },
     Io(std::io::Error),
+    Transaction {
+        primary: Box<RouterError>,
+        rollback: Vec<RouterError>,
+    },
     Unsupported,
 }
 
@@ -193,19 +289,10 @@ impl RouterError {
         {
             return true;
         }
-        let is_add = args.iter().any(|arg| arg == "add");
         let is_remove = args.iter().any(|arg| arg == "del" || arg == "delete");
-        // addIPRulesWithIPCommand deletes managed policy rules before adding
-        // them, and treats every subsequent `ip rule add` failure as fatal.
-        // Keep duplicate adds idempotent for ordinary address and route work,
-        // but do not mask a failed policy-rule installation.
-        let is_linux_ip_rule_add = program == "ip"
-            && args
-                .windows(2)
-                .any(|args| args[0] == "rule" && args[1] == "add");
-        if is_add && !is_linux_ip_rule_add {
-            return stderr.contains("file exists") || stderr.contains("already exists");
-        }
+        // Duplicate adds are deliberately fatal. Without a native ownership
+        // probe, accepting EEXIST would claim a foreign route and later delete
+        // it during churn or teardown.
         if !is_remove {
             return false;
         }
@@ -232,6 +319,7 @@ impl RouterError {
 impl fmt::Display for RouterError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidConfig(error) => write!(f, "invalid router configuration: {error}"),
             Self::Command {
                 program,
                 args,
@@ -239,6 +327,13 @@ impl fmt::Display for RouterError {
                 stderr,
             } => write!(f, "{program} {args:?} failed ({exit_code:?}): {stderr}"),
             Self::Io(error) => write!(f, "router command failed to start: {error}"),
+            Self::Transaction { primary, rollback } => {
+                write!(f, "router transaction failed: {primary}")?;
+                for error in rollback {
+                    write!(f, "; rollback failed: {error}")?;
+                }
+                Ok(())
+            }
             Self::Unsupported => f.write_str("OS route management is unsupported on this platform"),
         }
     }
@@ -252,6 +347,14 @@ pub trait Router: Send + Sync {
     fn up(&mut self) -> Result<(), RouterError>;
     /// Incrementally apply a configuration.
     fn set(&mut self, config: &RouterConfig) -> Result<(), RouterError>;
+    /// Install a kernel-level emergency block for unprotected direct traffic.
+    fn block_direct(&mut self) -> Result<(), RouterError> {
+        Err(RouterError::Unsupported)
+    }
+    /// Remove the emergency block after route synchronization succeeds.
+    fn unblock_direct(&mut self) -> Result<(), RouterError> {
+        Err(RouterError::Unsupported)
+    }
     /// Remove all installed state and bring the interface down.
     fn close(&mut self) -> Result<(), RouterError>;
 }
@@ -259,6 +362,11 @@ pub trait Router: Send + Sync {
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 trait CommandRunner: Send + Sync {
     fn run(&mut self, program: &str, args: &[String]) -> Result<(), RouterError>;
+
+    fn output(&mut self, program: &str, args: &[String]) -> Result<String, RouterError> {
+        self.run(program, args)?;
+        Ok(String::new())
+    }
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -268,14 +376,20 @@ struct SystemCommandRunner;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 impl CommandRunner for SystemCommandRunner {
     fn run(&mut self, program: &str, args: &[String]) -> Result<(), RouterError> {
+        self.output(program, args).map(|_| ())
+    }
+
+    fn output(&mut self, program: &str, args: &[String]) -> Result<String, RouterError> {
         let output = Command::new(program)
             .args(args)
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output()
             .map_err(RouterError::Io)?;
         if output.status.success() {
-            Ok(())
+            let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+            text.push_str(&String::from_utf8_lossy(&output.stderr));
+            Ok(text)
         } else {
             Err(RouterError::Command {
                 program: program.to_owned(),
@@ -294,9 +408,41 @@ type CommandSpec = (String, Vec<String>);
 trait Platform: Send + Sync {
     fn commands(&self, operation: &RouterOperation) -> Vec<CommandSpec>;
 
-    /// Startup command groups that must complete in order.
-    fn up_command_groups(&self) -> Vec<Vec<CommandSpec>> {
-        vec![self.commands(&RouterOperation::Up)]
+    fn claim_ownership(&self) -> Result<(), RouterError> {
+        Ok(())
+    }
+
+    fn release_ownership(&self) {}
+
+    /// Whether ownership adoption found emergency state left by a dead
+    /// process. Recovery is attempted only after the ownership claim.
+    fn stale_recovery_pending(&self) -> bool {
+        false
+    }
+
+    /// Verify and remove only the exact emergency state belonging to the
+    /// adopted owner. Foreign state must be left untouched and rejected.
+    fn recover_stale_state(&self, _runner: &mut dyn CommandRunner) -> Result<(), RouterError> {
+        Ok(())
+    }
+
+    /// Idempotent stale-state cleanup performed before startup transaction.
+    fn up_cleanup_commands(&self) -> Vec<CommandSpec> {
+        Vec::new()
+    }
+
+    /// Commands and exact output fragments used to verify the emergency
+    /// direct-traffic block. Empty means the platform has its own verifier.
+    fn direct_block_checks(&self) -> Vec<(CommandSpec, Vec<String>)> {
+        Vec::new()
+    }
+
+    /// Startup commands paired with their exact rollback commands.
+    fn up_transaction_commands(&self) -> Vec<(CommandSpec, CommandSpec)> {
+        self.commands(&RouterOperation::Up)
+            .into_iter()
+            .zip(self.commands(&RouterOperation::Down))
+            .collect()
     }
 }
 
@@ -306,6 +452,10 @@ struct StatefulRouter<P, R> {
     runner: R,
     config: Option<RouterConfig>,
     is_up: bool,
+    pending_cleanup: Vec<CommandSpec>,
+    ownership_claimed: bool,
+    stale_recovery_pending: bool,
+    direct_blocked: bool,
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
@@ -316,6 +466,10 @@ impl<P: Platform, R: CommandRunner> StatefulRouter<P, R> {
             runner,
             config: None,
             is_up: false,
+            pending_cleanup: Vec::new(),
+            ownership_claimed: false,
+            stale_recovery_pending: false,
+            direct_blocked: false,
         }
     }
 
@@ -335,6 +489,45 @@ impl<P: Platform, R: CommandRunner> StatefulRouter<P, R> {
     }
 
     fn apply(&mut self, operations: &[RouterOperation]) -> Result<(), RouterError> {
+        let mut rollback = Vec::new();
+        for operation in operations {
+            let commands = self.platform.commands(operation);
+            let inverse = self.platform.commands(&operation.inverse());
+            debug_assert_eq!(commands.len(), inverse.len());
+            for (index, (program, args)) in commands.into_iter().enumerate() {
+                match self.runner.run(&program, &args) {
+                    Ok(()) => rollback.push(inverse[index].clone()),
+                    Err(error) if error.non_fatal() => {}
+                    Err(error) => {
+                        // Restore every command that this transaction changed,
+                        // including an earlier command from the same operation.
+                        // Failed inverses remain owned and are retried before
+                        // another set() or during close().
+                        let mut rollback_errors = Vec::new();
+                        for (program, args) in rollback.into_iter().rev() {
+                            if let Err(rollback_error) = self.runner.run(&program, &args) {
+                                if !rollback_error.non_fatal() {
+                                    self.pending_cleanup.push((program, args));
+                                    rollback_errors.push(rollback_error);
+                                }
+                            }
+                        }
+                        return if rollback_errors.is_empty() {
+                            Err(error)
+                        } else {
+                            Err(RouterError::Transaction {
+                                primary: Box::new(error),
+                                rollback: rollback_errors,
+                            })
+                        };
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_teardown(&mut self, operations: &[RouterOperation]) -> Result<(), RouterError> {
         let commands: Vec<_> = operations
             .iter()
             .flat_map(|operation| self.platform.commands(operation))
@@ -342,9 +535,77 @@ impl<P: Platform, R: CommandRunner> StatefulRouter<P, R> {
         self.apply_commands(commands)
     }
 
+    fn verify_direct_block(&mut self, expected: bool) -> Result<(), RouterError> {
+        for ((program, args), fragments) in self.platform.direct_block_checks() {
+            let output = self.runner.output(&program, &args)?;
+            let active = output
+                .lines()
+                .any(|line| fragments.iter().all(|fragment| line.contains(fragment)));
+            if active != expected {
+                return Err(RouterError::InvalidConfig(format!(
+                    "kernel direct-traffic block verification expected {expected} for {program} {args:?}: {output:?}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn retry_pending_cleanup(&mut self) -> Result<(), RouterError> {
+        let pending = std::mem::take(&mut self.pending_cleanup);
+        let mut first_error = None;
+        for (program, args) in pending {
+            if let Err(error) = self.runner.run(&program, &args) {
+                if !error.non_fatal() {
+                    self.pending_cleanup.push((program, args));
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    fn rollback_startup(&mut self, rollback: Vec<CommandSpec>) -> Vec<RouterError> {
+        let mut errors = Vec::new();
+        for (program, args) in rollback.into_iter().rev() {
+            if let Err(error) = self.runner.run(&program, &args) {
+                if !error.non_fatal() {
+                    self.pending_cleanup.push((program, args));
+                    errors.push(error);
+                }
+            }
+        }
+        errors
+    }
+
     fn apply_up(&mut self) -> Result<(), RouterError> {
-        for commands in self.platform.up_command_groups() {
-            self.apply_commands(commands)?;
+        self.retry_pending_cleanup()?;
+        // Tear down exact stale routing state while an adopted emergency
+        // block is still active. Only then may recovery remove the block and
+        // begin the fresh startup transaction.
+        self.apply_commands(self.platform.up_cleanup_commands())?;
+        if self.stale_recovery_pending {
+            self.platform.recover_stale_state(&mut self.runner)?;
+            self.stale_recovery_pending = false;
+        }
+        let mut rollback = Vec::new();
+        for ((program, args), inverse) in self.platform.up_transaction_commands() {
+            match self.runner.run(&program, &args) {
+                Ok(()) => rollback.push(inverse),
+                Err(error) if error.non_fatal() => {}
+                Err(error) => {
+                    let rollback = self.rollback_startup(rollback);
+                    return if rollback.is_empty() {
+                        Err(error)
+                    } else {
+                        Err(RouterError::Transaction {
+                            primary: Box::new(error),
+                            rollback,
+                        })
+                    };
+                }
+            }
         }
         Ok(())
     }
@@ -356,42 +617,254 @@ impl<P: Platform, R: CommandRunner> Router for StatefulRouter<P, R> {
         if self.is_up {
             return Ok(());
         }
-        self.apply_up()?;
+        if !self.ownership_claimed {
+            self.platform.claim_ownership()?;
+            self.ownership_claimed = true;
+            self.stale_recovery_pending = self.platform.stale_recovery_pending();
+        }
+        if let Err(error) = self.apply_up() {
+            if self.pending_cleanup.is_empty() && !self.stale_recovery_pending {
+                self.platform.release_ownership();
+                self.ownership_claimed = false;
+            }
+            return Err(error);
+        }
         self.is_up = true;
         Ok(())
     }
 
     fn set(&mut self, config: &RouterConfig) -> Result<(), RouterError> {
-        let delta = diff(self.config.as_ref(), config);
+        self.retry_pending_cleanup()?;
+        let config = config.normalized()?;
+        let delta = diff(self.config.as_ref(), &config);
         self.apply(&delta.operations())?;
-        self.config = Some(config.clone());
+        self.config = Some(config);
+        Ok(())
+    }
+
+    fn block_direct(&mut self) -> Result<(), RouterError> {
+        if self.direct_blocked {
+            if self.verify_direct_block(true).is_ok() {
+                return Ok(());
+            }
+            // An uncertain/partial unblock invalidates prior verification.
+            // Remove any exact remnants, then establish a fresh full block.
+            self.apply(&[RouterOperation::DisableDirectBlock])?;
+            self.direct_blocked = false;
+        }
+        self.apply(&[RouterOperation::EnableDirectBlock])?;
+        self.direct_blocked = true;
+        self.verify_direct_block(true)
+    }
+
+    fn unblock_direct(&mut self) -> Result<(), RouterError> {
+        if !self.direct_blocked {
+            return Ok(());
+        }
+        self.apply(&[RouterOperation::DisableDirectBlock])?;
+        self.verify_direct_block(false)?;
+        self.direct_blocked = false;
         Ok(())
     }
 
     fn close(&mut self) -> Result<(), RouterError> {
-        if !self.is_up && self.config.is_none() {
+        if self.stale_recovery_pending {
+            self.apply_commands(self.platform.up_cleanup_commands())?;
+            self.platform.recover_stale_state(&mut self.runner)?;
+            self.stale_recovery_pending = false;
+        }
+        if !self.is_up
+            && self.config.is_none()
+            && self.pending_cleanup.is_empty()
+            && !self.direct_blocked
+        {
+            if self.ownership_claimed {
+                self.platform.release_ownership();
+                self.ownership_claimed = false;
+            }
             return Ok(());
         }
+        // A shutdown is itself a security transition: establish the emergency
+        // block first and retain it until every pending inverse and teardown
+        // command has succeeded. Failed cleanup must never reopen direct paths.
+        self.block_direct()?;
+        let pending_result = self.retry_pending_cleanup();
         let empty = RouterConfig::default();
         let delta = diff(self.config.as_ref(), &empty);
-        let result = self.apply(&delta.teardown_operations());
+        let teardown_result = self.apply_teardown(&delta.teardown_operations());
+        let cleanup_result = pending_result.and(teardown_result);
+        if let Err(error) = cleanup_result {
+            if !self.direct_blocked {
+                let _ = self.block_direct();
+            }
+            return Err(error);
+        }
         self.config = None;
         self.is_up = false;
-        result
+        self.unblock_direct()?;
+        if self.ownership_claimed {
+            self.platform.release_ownership();
+            self.ownership_claimed = false;
+        }
+        Ok(())
     }
 }
 
 #[cfg(target_os = "macos")]
 struct DarwinPlatform {
     tun_name: String,
+    owner_token: String,
+    owner_file: std::path::PathBuf,
+    block_anchor: String,
+    block_file: std::path::PathBuf,
+    block_file_error: Option<String>,
+    adopted_stale_owner: std::sync::atomic::AtomicBool,
+    adopted_pf_token: std::sync::Mutex<Option<String>>,
 }
 
 #[cfg(target_os = "macos")]
 impl DarwinPlatform {
-    fn new(tun_name: &str) -> Self {
+    fn new(tun_name: &str, state_dir: Option<&std::path::Path>) -> Self {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        static NEXT_FILE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+        let token: String = tun_name
+            .chars()
+            .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+            .collect();
+        let private_dir = state_dir
+            .map_or_else(
+                || std::path::PathBuf::from("/var/run/rustscale"),
+                std::path::Path::to_path_buf,
+            )
+            .join("pf");
+        let unique = NEXT_FILE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let block_file =
+            private_dir.join(format!("block-{}-{unique}-{token}.pf", std::process::id()));
+        let create_result = (|| -> std::io::Result<()> {
+            std::fs::create_dir_all(&private_dir)?;
+            std::fs::set_permissions(&private_dir, std::fs::Permissions::from_mode(0o700))?;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&block_file)?;
+            file.write_all(format!("block drop out quick on ! {tun_name} all\n").as_bytes())?;
+            file.sync_all()?;
+            Ok(())
+        })();
         Self {
             tun_name: tun_name.to_owned(),
+            owner_token: token.clone(),
+            owner_file: private_dir.join(format!("owner-{token}")),
+            // macOS's system PF ruleset evaluates the com.apple/* wildcard.
+            block_anchor: format!("com.apple/rustscale.{token}"),
+            block_file,
+            block_file_error: create_result.err().map(|error| error.to_string()),
+            adopted_stale_owner: std::sync::atomic::AtomicBool::new(false),
+            adopted_pf_token: std::sync::Mutex::new(None),
         }
+    }
+
+    fn owner_record(&self, pf_token: Option<&str>) -> String {
+        format!(
+            "1 {} {} {} {} {}\n",
+            std::process::id(),
+            self.owner_token,
+            self.tun_name,
+            self.block_anchor,
+            pf_token.unwrap_or("-")
+        )
+    }
+
+    fn write_owner_record(
+        &self,
+        pf_token: Option<&str>,
+        create_new: bool,
+    ) -> Result<(), RouterError> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let target = if create_new {
+            self.owner_file.clone()
+        } else {
+            self.owner_file.with_extension(format!(
+                "replace-{}-{}",
+                std::process::id(),
+                self.owner_token
+            ))
+        };
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&target)
+            .map_err(RouterError::Io)?;
+        if let Err(error) = file
+            .write_all(self.owner_record(pf_token).as_bytes())
+            .and_then(|()| file.sync_all())
+        {
+            let _ = std::fs::remove_file(&target);
+            return Err(RouterError::Io(error));
+        }
+        if !create_new {
+            if let Err(error) = std::fs::rename(&target, &self.owner_file) {
+                let _ = std::fs::remove_file(target);
+                return Err(RouterError::Io(error));
+            }
+        }
+        Ok(())
+    }
+
+    fn parse_owner_record(&self, record: &str) -> Result<(u32, Option<String>), RouterError> {
+        let fields: Vec<_> = record.split_whitespace().collect();
+        if fields.len() != 6
+            || fields[0] != "1"
+            || fields[2] != self.owner_token
+            || fields[3] != self.tun_name
+            || fields[4] != self.block_anchor
+        {
+            return Err(RouterError::InvalidConfig(
+                "foreign or malformed Darwin PF ownership record".into(),
+            ));
+        }
+        let pid = fields[1].parse::<u32>().map_err(|_| {
+            RouterError::InvalidConfig("malformed Darwin PF owner process ID".into())
+        })?;
+        let pf_token = match fields[5] {
+            "-" => None,
+            token if token.bytes().all(|byte| byte.is_ascii_digit()) => Some(token.to_owned()),
+            _ => {
+                return Err(RouterError::InvalidConfig(
+                    "malformed Darwin PF enable token".into(),
+                ));
+            }
+        };
+        Ok((pid, pf_token))
+    }
+
+    fn record_pf_token(&self, token: Option<&str>) -> Result<(), RouterError> {
+        if token.is_some_and(|token| !token.bytes().all(|byte| byte.is_ascii_digit())) {
+            return Err(RouterError::InvalidConfig(
+                "pfctl returned a non-numeric enable token".into(),
+            ));
+        }
+        let metadata = std::fs::symlink_metadata(&self.owner_file).map_err(RouterError::Io)?;
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            return Err(RouterError::InvalidConfig(
+                "Darwin PF owner record is not a regular file".into(),
+            ));
+        }
+        let record = std::fs::read_to_string(&self.owner_file).map_err(RouterError::Io)?;
+        if !self
+            .parse_owner_record(&record)
+            .is_ok_and(|(pid, _)| pid == std::process::id())
+        {
+            return Err(RouterError::InvalidConfig(
+                "Darwin PF owner record changed before token update".into(),
+            ));
+        }
+        self.write_owner_record(token, false)
     }
 
     fn route(&self, verb: &str, prefix: IpPrefix) -> (String, Vec<String>) {
@@ -431,7 +904,151 @@ impl DarwinPlatform {
 }
 
 #[cfg(target_os = "macos")]
+impl Drop for DarwinPlatform {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.block_file);
+    }
+}
+
+#[cfg(target_os = "macos")]
 impl Platform for DarwinPlatform {
+    fn claim_ownership(&self) -> Result<(), RouterError> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if let Some(error) = &self.block_file_error {
+            return Err(RouterError::InvalidConfig(format!(
+                "create private PF rules file: {error}"
+            )));
+        }
+        let metadata = std::fs::symlink_metadata(&self.block_file).map_err(RouterError::Io)?;
+        let parent = self
+            .block_file
+            .parent()
+            .ok_or_else(|| RouterError::InvalidConfig("PF rules file has no parent".into()))?;
+        let parent_metadata = std::fs::symlink_metadata(parent).map_err(RouterError::Io)?;
+        if !metadata.file_type().is_file()
+            || metadata.file_type().is_symlink()
+            || !parent_metadata.file_type().is_dir()
+            || parent_metadata.file_type().is_symlink()
+            || metadata.uid() != parent_metadata.uid()
+            || metadata.permissions().mode() & 0o077 != 0
+            || parent_metadata.permissions().mode() & 0o077 != 0
+        {
+            return Err(RouterError::InvalidConfig(
+                "PF rules file is not a private owner-only regular file".into(),
+            ));
+        }
+
+        match self.write_owner_record(None, true) {
+            Ok(()) => Ok(()),
+            Err(RouterError::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let owner_metadata =
+                    std::fs::symlink_metadata(&self.owner_file).map_err(RouterError::Io)?;
+                if !owner_metadata.file_type().is_file()
+                    || owner_metadata.file_type().is_symlink()
+                    || owner_metadata.uid() != parent_metadata.uid()
+                    || owner_metadata.permissions().mode() & 0o077 != 0
+                {
+                    return Err(RouterError::InvalidConfig(
+                        "Darwin PF ownership record is not private owner state".into(),
+                    ));
+                }
+                let record = std::fs::read_to_string(&self.owner_file).map_err(RouterError::Io)?;
+                let (pid, pf_token) = self.parse_owner_record(&record)?;
+                if pid == std::process::id() {
+                    return Ok(());
+                }
+                let live = Command::new("kill")
+                    .args(["-0", &pid.to_string()])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .is_ok_and(|status| status.success());
+                if live {
+                    return Err(RouterError::InvalidConfig(format!(
+                        "Darwin PF owner {pid} is still active for {}",
+                        self.tun_name
+                    )));
+                }
+                // Atomically replace the dead owner's record while
+                // carrying its PF token forward. A second crash before
+                // anchor recovery must still leave enough durable state
+                // for the next process to release that token.
+                self.write_owner_record(pf_token.as_deref(), false)?;
+                self.adopted_stale_owner
+                    .store(true, std::sync::atomic::Ordering::Release);
+                *self.adopted_pf_token.lock().map_err(|_| {
+                    RouterError::InvalidConfig("Darwin PF token ownership lock poisoned".into())
+                })? = pf_token;
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn release_ownership(&self) {
+        let Ok(record) = std::fs::read_to_string(&self.owner_file) else {
+            return;
+        };
+        if self
+            .parse_owner_record(&record)
+            .is_ok_and(|(pid, _)| pid == std::process::id())
+        {
+            let _ = std::fs::remove_file(&self.owner_file);
+        }
+    }
+
+    fn stale_recovery_pending(&self) -> bool {
+        self.adopted_stale_owner
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn recover_stale_state(&self, runner: &mut dyn CommandRunner) -> Result<(), RouterError> {
+        if !self.stale_recovery_pending() {
+            return Ok(());
+        }
+        let query = vec!["-a".into(), self.block_anchor.clone(), "-sr".into()];
+        let rules = runner.output("pfctl", &query)?;
+        if !rules.trim().is_empty() {
+            if !pf_block_rules_exact(&rules, &self.tun_name) {
+                return Err(RouterError::InvalidConfig(
+                    "refusing to remove foreign rules from adopted Darwin PF anchor".into(),
+                ));
+            }
+            let (program, args) = self.commands(&RouterOperation::DisableDirectBlock)[0].clone();
+            runner.run(&program, &args)?;
+            if !runner.output("pfctl", &query)?.trim().is_empty() {
+                return Err(RouterError::InvalidConfig(
+                    "adopted Darwin PF anchor remained non-empty after cleanup".into(),
+                ));
+            }
+        }
+        let token = self
+            .adopted_pf_token
+            .lock()
+            .map_err(|_| {
+                RouterError::InvalidConfig("Darwin PF token ownership lock poisoned".into())
+            })?
+            .clone();
+        if let Some(token) = token {
+            runner.run("pfctl", &["-X".into(), token])?;
+        }
+        self.record_pf_token(None)?;
+        *self.adopted_pf_token.lock().map_err(|_| {
+            RouterError::InvalidConfig("Darwin PF token ownership lock poisoned".into())
+        })? = None;
+        self.adopted_stale_owner
+            .store(false, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    fn up_cleanup_commands(&self) -> Vec<CommandSpec> {
+        if self.stale_recovery_pending() {
+            self.exit_routes("delete")
+        } else {
+            Vec::new()
+        }
+    }
+
     fn commands(&self, operation: &RouterOperation) -> Vec<(String, Vec<String>)> {
         match operation {
             RouterOperation::Up => {
@@ -445,17 +1062,38 @@ impl Platform for DarwinPlatform {
             RouterOperation::RemoveAddr(address) => vec![self.address(false, *address)],
             RouterOperation::AddRoute(prefix) => vec![self.route("add", *prefix)],
             RouterOperation::RemoveRoute(prefix) => vec![self.route("delete", *prefix)],
-            // macOS has no phase-1 equivalent of Linux throw routes.
+            // Darwin connected routes preserve explicitly allowed LANs.
             RouterOperation::AddLocalRoute(_) | RouterOperation::RemoveLocalRoute(_) => vec![],
             RouterOperation::AddExitRoutes => self.exit_routes("add"),
             RouterOperation::RemoveExitRoutes => self.exit_routes("delete"),
+            RouterOperation::EnableDirectBlock => vec![(
+                "pfctl".into(),
+                vec![
+                    "-a".into(),
+                    self.block_anchor.clone(),
+                    "-f".into(),
+                    self.block_file.display().to_string(),
+                ],
+            )],
+            RouterOperation::DisableDirectBlock => vec![(
+                "pfctl".into(),
+                vec![
+                    "-a".into(),
+                    self.block_anchor.clone(),
+                    "-F".into(),
+                    "rules".into(),
+                ],
+            )],
         }
     }
 }
 
 #[cfg(target_os = "macos")]
 /// Shell-command-backed macOS router for phase 1.
-pub struct DarwinRouter(StatefulRouter<DarwinPlatform, SystemCommandRunner>);
+pub struct DarwinRouter {
+    inner: StatefulRouter<DarwinPlatform, SystemCommandRunner>,
+    pf_enable_token: Option<String>,
+}
 
 #[cfg(target_os = "macos")]
 impl DarwinPlatform {
@@ -468,40 +1106,198 @@ impl DarwinPlatform {
 }
 
 #[cfg(target_os = "macos")]
+fn pf_is_enabled(status: &str) -> bool {
+    status
+        .lines()
+        .any(|line| line.trim().eq_ignore_ascii_case("status: enabled"))
+}
+
+#[cfg(target_os = "macos")]
+fn pf_enable_token(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        let value = value.trim();
+        (name.trim().eq_ignore_ascii_case("token") && !value.is_empty()).then(|| value.to_owned())
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn pf_block_rules_exact(rules: &str, tun_name: &str) -> bool {
+    let lines: Vec<_> = rules
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    if lines.len() != 1 {
+        return false;
+    }
+    let base = format!("block drop out quick on ! {tun_name} all");
+    lines[0] == base || lines[0] == format!("{base} flags S/SA")
+}
+
+#[cfg(target_os = "macos")]
+fn pf_block_active(rules: &str, tun_name: &str) -> bool {
+    pf_block_rules_exact(rules, tun_name)
+}
+
+#[cfg(target_os = "macos")]
 impl DarwinRouter {
     /// Construct a router for `tun_name`.
     pub fn new(tun_name: &str) -> Self {
-        Self(StatefulRouter::new(
-            DarwinPlatform::new(tun_name),
-            SystemCommandRunner,
-        ))
+        Self::new_with_state_dir(tun_name, None)
+    }
+
+    pub fn new_with_state_dir(tun_name: &str, state_dir: Option<&std::path::Path>) -> Self {
+        Self {
+            inner: StatefulRouter::new(
+                DarwinPlatform::new(tun_name, state_dir),
+                SystemCommandRunner,
+            ),
+            pf_enable_token: None,
+        }
+    }
+
+    fn ensure_pf_enabled(&mut self) -> Result<(), RouterError> {
+        let status = self
+            .inner
+            .runner
+            .output("pfctl", &["-s".into(), "info".into()])?;
+        if pf_is_enabled(&status) {
+            return Ok(());
+        }
+        let enabled = self.inner.runner.output("pfctl", &["-E".into()])?;
+        let token = pf_enable_token(&enabled).ok_or_else(|| {
+            RouterError::InvalidConfig("pfctl enabled PF without returning a teardown token".into())
+        })?;
+        if let Err(error) = self.inner.platform.record_pf_token(Some(&token)) {
+            let _ = self.inner.runner.run("pfctl", &["-X".into(), token]);
+            return Err(error);
+        }
+        self.pf_enable_token = Some(token);
+        Ok(())
+    }
+
+    fn verify_pf_block(&mut self, expected: bool) -> Result<(), RouterError> {
+        let rules = self.inner.runner.output(
+            "pfctl",
+            &[
+                "-a".into(),
+                self.inner.platform.block_anchor.clone(),
+                "-sr".into(),
+            ],
+        )?;
+        let active = pf_block_active(&rules, &self.inner.platform.tun_name);
+        if active == expected {
+            Ok(())
+        } else {
+            Err(RouterError::InvalidConfig(format!(
+                "PF emergency anchor verification failed (expected active={expected})"
+            )))
+        }
+    }
+
+    fn release_pf_enable_token(&mut self) -> Result<(), RouterError> {
+        if let Some(token) = self.pf_enable_token.clone() {
+            self.inner.runner.run("pfctl", &["-X".into(), token])?;
+            self.inner.platform.record_pf_token(None)?;
+            self.pf_enable_token = None;
+        }
+        Ok(())
     }
 }
 
 #[cfg(target_os = "macos")]
 impl Router for DarwinRouter {
     fn up(&mut self) -> Result<(), RouterError> {
-        self.0.up()
+        self.inner.up()
     }
     fn set(&mut self, config: &RouterConfig) -> Result<(), RouterError> {
-        self.0.set(config)
+        self.inner.set(config)
+    }
+    fn block_direct(&mut self) -> Result<(), RouterError> {
+        self.ensure_pf_enabled()?;
+        self.inner.block_direct()?;
+        if self.verify_pf_block(true).is_ok() {
+            return Ok(());
+        }
+        // A prior partial unblock may leave the inner state marked active
+        // while the evaluated anchor is incomplete. Flush and freshly load
+        // the exact anchor before authorizing route mutation.
+        self.inner.unblock_direct()?;
+        self.ensure_pf_enabled()?;
+        self.inner.block_direct()?;
+        self.verify_pf_block(true)
+    }
+    fn unblock_direct(&mut self) -> Result<(), RouterError> {
+        self.inner.unblock_direct()?;
+        self.verify_pf_block(false)?;
+        self.release_pf_enable_token()
     }
     fn close(&mut self) -> Result<(), RouterError> {
-        self.0.close()
+        self.block_direct()?;
+        // StatefulRouter normally releases ownership after its final unblock.
+        // Darwin must retain the owner record until the PF enable token has
+        // also been released and durably cleared.
+        let owned = self.inner.ownership_claimed;
+        self.inner.ownership_claimed = false;
+        let result = (|| {
+            self.inner.close()?;
+            self.verify_pf_block(false)?;
+            self.release_pf_enable_token()?;
+            match std::fs::remove_file(&self.inner.platform.block_file) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(RouterError::Io(error)),
+            }
+        })();
+        if result.is_ok() {
+            if owned {
+                self.inner.platform.release_ownership();
+            }
+        } else {
+            self.inner.ownership_claimed = owned;
+        }
+        result
     }
 }
 
 #[cfg(target_os = "linux")]
 struct LinuxPlatform {
     tun_name: String,
+    rule_base: Option<u32>,
+    adopted_stale_owner: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(target_os = "linux")]
 impl LinuxPlatform {
     fn new(tun_name: &str) -> Self {
+        let interface_index = if_addrs::get_if_addrs().ok().and_then(|interfaces| {
+            interfaces
+                .into_iter()
+                .find(|interface| interface.name == tun_name)
+                .and_then(|interface| interface.index)
+        });
         Self {
             tun_name: tun_name.to_owned(),
+            rule_base: interface_index.map(Self::rule_base_for_index),
+            adopted_stale_owner: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    #[cfg(test)]
+    fn new_with_interface_index(tun_name: &str, interface_index: u32) -> Self {
+        Self {
+            tun_name: tun_name.to_owned(),
+            rule_base: Some(Self::rule_base_for_index(interface_index)),
+            adopted_stale_owner: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn rule_base_for_index(interface_index: u32) -> u32 {
+        // Keep the chain ahead of Linux's built-in main rule (32766). There
+        // are 200 disjoint per-instance slots; a live collision is detected
+        // and refused rather than sharing/deleting ownership.
+        5_000 + (interface_index % 200) * 100
     }
 
     fn route(&self, verb: &str, prefix: IpPrefix) -> (String, Vec<String>) {
@@ -521,13 +1317,17 @@ impl LinuxPlatform {
         ("ip".into(), args)
     }
 
-    fn policy_rules(add: bool) -> Vec<(String, Vec<String>)> {
+    const RULE_PROTOCOL: u8 = 201;
+
+    fn policy_rules(&self, add: bool) -> Vec<(String, Vec<String>)> {
         let verb = if add { "add" } else { "del" };
+        let protocol = Self::RULE_PROTOCOL.to_string();
+        let base = self.rule_base.unwrap_or(5_200);
         let rules = [
-            (5210, Some("main")),
-            (5230, Some("default")),
-            (5250, None),
-            (5270, Some("52")),
+            (base + 10, Some("main")),
+            (base + 30, Some("default")),
+            (base + 50, None),
+            (base + 70, Some("52")),
         ];
         let mut commands = Vec::with_capacity(8);
         for family in ["-4", "-6"] {
@@ -548,9 +1348,12 @@ impl LinuxPlatform {
                     "pref".into(),
                     pref.to_string(),
                 ];
-                if add && pref != 5270 {
+                // Deletions repeat every selector used for installation;
+                // never delete by shared priority/table alone.
+                if pref != base + 70 {
                     args.extend(["fwmark".into(), "0x80000/0xff0000".into()]);
                 }
+                args.extend(["protocol".into(), protocol.clone()]);
                 if let Some(table) = table {
                     args.extend(["table".into(), (*table).into()]);
                 } else {
@@ -564,10 +1367,292 @@ impl LinuxPlatform {
 }
 
 #[cfg(target_os = "linux")]
+fn linux_direct_block_line_exact(line: &str, pref: u32) -> bool {
+    let expected = [
+        format!("{pref}:"),
+        "not".into(),
+        "from".into(),
+        "all".into(),
+        "fwmark".into(),
+        "0x80000/0xff0000".into(),
+        "unreachable".into(),
+        "proto".into(),
+        LinuxPlatform::RULE_PROTOCOL.to_string(),
+    ];
+    line.split_whitespace()
+        .eq(expected.iter().map(String::as_str))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_rule_owner_dir() -> std::path::PathBuf {
+    #[cfg(test)]
+    return std::env::temp_dir().join(format!("rustscale-rule-owners-{}", std::process::id()));
+    #[cfg(not(test))]
+    return std::path::PathBuf::from("/run/rustscale/rule-owners");
+}
+
+#[cfg(target_os = "linux")]
+fn claim_linux_rule_owner_file(base: u32, tun_name: &str) -> Result<bool, RouterError> {
+    use std::io::Write;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    let dir = linux_rule_owner_dir();
+    std::fs::create_dir_all(&dir).map_err(RouterError::Io)?;
+    let dir_metadata = std::fs::symlink_metadata(&dir).map_err(RouterError::Io)?;
+    if !dir_metadata.file_type().is_dir() || dir_metadata.file_type().is_symlink() {
+        return Err(RouterError::InvalidConfig(
+            "Linux rule owner registry is not a directory".into(),
+        ));
+    }
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+        .map_err(RouterError::Io)?;
+    let path = dir.join(base.to_string());
+    let identity = format!("{} {tun_name}\n", std::process::id());
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+    {
+        Ok(mut file) => {
+            file.write_all(identity.as_bytes())
+                .map_err(RouterError::Io)?;
+            file.sync_all().map_err(RouterError::Io)?;
+            Ok(false)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata = std::fs::symlink_metadata(&path).map_err(RouterError::Io)?;
+            if !metadata.file_type().is_file()
+                || metadata.file_type().is_symlink()
+                || metadata.uid() != dir_metadata.uid()
+                || metadata.permissions().mode() & 0o077 != 0
+            {
+                return Err(RouterError::InvalidConfig(
+                    "Linux rule owner record is not private owner state".into(),
+                ));
+            }
+            let existing = std::fs::read_to_string(&path).map_err(RouterError::Io)?;
+            if existing == identity {
+                return Ok(false);
+            }
+            let fields: Vec<_> = existing.split_whitespace().collect();
+            if fields.len() != 2 || fields[1].is_empty() {
+                return Err(RouterError::InvalidConfig(
+                    "malformed Linux policy-rule ownership record".into(),
+                ));
+            }
+            let pid = fields[0].parse::<u32>().map_err(|_| {
+                RouterError::InvalidConfig("malformed Linux policy-rule owner process ID".into())
+            })?;
+            let live = std::path::Path::new(&format!("/proc/{pid}")).exists();
+            if live {
+                return Err(RouterError::InvalidConfig(format!(
+                    "Linux policy-rule ownership collision at base {base}: {}",
+                    existing.trim()
+                )));
+            }
+            let replacement = dir.join(format!(".{base}.replace-{}", std::process::id()));
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&replacement)
+                .map_err(RouterError::Io)?;
+            if let Err(error) = file
+                .write_all(identity.as_bytes())
+                .and_then(|()| file.sync_all())
+                .and_then(|()| std::fs::rename(&replacement, &path))
+            {
+                let _ = std::fs::remove_file(replacement);
+                return Err(RouterError::Io(error));
+            }
+            Ok(true)
+        }
+        Err(error) => Err(RouterError::Io(error)),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_rule_owners() -> &'static std::sync::Mutex<std::collections::HashMap<u32, (String, usize)>>
+{
+    static OWNERS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<u32, (String, usize)>>,
+    > = std::sync::OnceLock::new();
+    OWNERS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(target_os = "linux")]
 impl Platform for LinuxPlatform {
+    fn claim_ownership(&self) -> Result<(), RouterError> {
+        let base = self.rule_base.ok_or_else(|| {
+            RouterError::InvalidConfig(format!(
+                "cannot determine interface index for {}",
+                self.tun_name
+            ))
+        })?;
+        let mut owners = linux_rule_owners()
+            .lock()
+            .map_err(|_| RouterError::InvalidConfig("Linux rule owner registry poisoned".into()))?;
+        match owners.get_mut(&base) {
+            None => {
+                let adopted = claim_linux_rule_owner_file(base, &self.tun_name)?;
+                self.adopted_stale_owner
+                    .store(adopted, std::sync::atomic::Ordering::Release);
+                owners.insert(base, (self.tun_name.clone(), 1));
+                Ok(())
+            }
+            Some((owner, refs)) if owner == &self.tun_name => {
+                #[cfg(test)]
+                {
+                    // Command-injection unit tests construct parallel mock
+                    // routers with one synthetic name; production is exclusive.
+                    *refs += 1;
+                    Ok(())
+                }
+                #[cfg(not(test))]
+                {
+                    let _ = refs;
+                    Err(RouterError::InvalidConfig(format!(
+                        "Linux policy-rule owner {} is already active at base {base}",
+                        self.tun_name
+                    )))
+                }
+            }
+            Some((owner, _)) => Err(RouterError::InvalidConfig(format!(
+                "Linux policy-rule ownership collision: {} and {} map to base {base}",
+                owner, self.tun_name
+            ))),
+        }
+    }
+
+    fn release_ownership(&self) {
+        let Some(base) = self.rule_base else {
+            return;
+        };
+        let Ok(mut owners) = linux_rule_owners().lock() else {
+            return;
+        };
+        if let Some((owner, refs)) = owners.get_mut(&base) {
+            if owner == &self.tun_name && *refs > 1 {
+                *refs -= 1;
+            } else if owner == &self.tun_name {
+                owners.remove(&base);
+                let path = linux_rule_owner_dir().join(base.to_string());
+                let identity = format!("{} {}\n", std::process::id(), self.tun_name);
+                if std::fs::read_to_string(&path).ok().as_deref() == Some(identity.as_str()) {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
+    }
+
+    fn stale_recovery_pending(&self) -> bool {
+        self.adopted_stale_owner
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn recover_stale_state(&self, runner: &mut dyn CommandRunner) -> Result<(), RouterError> {
+        if !self.stale_recovery_pending() {
+            return Ok(());
+        }
+        let checks = self.direct_block_checks();
+        let disables = self.commands(&RouterOperation::DisableDirectBlock);
+        let enables = self.commands(&RouterOperation::EnableDirectBlock);
+        let pref = self.rule_base.unwrap_or(5_200);
+        let mut active = Vec::with_capacity(checks.len());
+        for ((program, args), _) in &checks {
+            let output = runner.output(program, args)?;
+            active.push(
+                output
+                    .lines()
+                    .any(|line| linux_direct_block_line_exact(line, pref)),
+            );
+        }
+
+        let mut rollback = Vec::new();
+        for (index, is_active) in active.into_iter().enumerate() {
+            if !is_active {
+                continue;
+            }
+            let (program, args) = &disables[index];
+            match runner.run(program, args) {
+                Ok(()) => rollback.push(enables[index].clone()),
+                Err(error) if error.non_fatal() => {}
+                Err(error) => {
+                    let mut rollback_errors = Vec::new();
+                    for (program, args) in rollback.into_iter().rev() {
+                        if let Err(rollback_error) = runner.run(&program, &args) {
+                            if !rollback_error.non_fatal() {
+                                rollback_errors.push(rollback_error);
+                            }
+                        }
+                    }
+                    return if rollback_errors.is_empty() {
+                        Err(error)
+                    } else {
+                        Err(RouterError::Transaction {
+                            primary: Box::new(error),
+                            rollback: rollback_errors,
+                        })
+                    };
+                }
+            }
+        }
+
+        for ((program, args), _) in checks {
+            let output = runner.output(&program, &args)?;
+            if output
+                .lines()
+                .any(|line| linux_direct_block_line_exact(line, pref))
+            {
+                return Err(RouterError::InvalidConfig(
+                    "stale Linux direct-traffic block remained after exact cleanup".into(),
+                ));
+            }
+        }
+        self.adopted_stale_owner
+            .store(false, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    fn direct_block_checks(&self) -> Vec<(CommandSpec, Vec<String>)> {
+        let pref = self.rule_base.unwrap_or(5_200).to_string();
+        ["-4", "-6"]
+            .into_iter()
+            .map(|family| {
+                (
+                    (
+                        "ip".into(),
+                        vec![
+                            family.into(),
+                            "rule".into(),
+                            "show".into(),
+                            "pref".into(),
+                            pref.clone(),
+                        ],
+                    ),
+                    vec![
+                        format!("{pref}:"),
+                        "not".into(),
+                        "fwmark 0x80000/0xff0000".into(),
+                        format!("proto {}", Self::RULE_PROTOCOL),
+                        "unreachable".into(),
+                    ],
+                )
+            })
+            .collect()
+    }
+
     fn commands(&self, operation: &RouterOperation) -> Vec<CommandSpec> {
         match operation {
-            RouterOperation::Up => self.up_command_groups().into_iter().flatten().collect(),
+            RouterOperation::Up => self
+                .up_cleanup_commands()
+                .into_iter()
+                .chain(
+                    self.up_transaction_commands()
+                        .into_iter()
+                        .map(|(command, _)| command),
+                )
+                .collect(),
             RouterOperation::Down => {
                 let mut commands = vec![(
                     "ip".into(),
@@ -578,7 +1663,7 @@ impl Platform for LinuxPlatform {
                         "down".into(),
                     ],
                 )];
-                commands.extend(Self::policy_rules(false));
+                commands.extend(self.policy_rules(false));
                 commands
             }
             RouterOperation::AddAddr(address) => vec![("ip".into(), {
@@ -649,17 +1734,62 @@ impl Platform for LinuxPlatform {
                 self.route("del", rustscale_tsaddr::all_ipv4()),
                 self.route("del", rustscale_tsaddr::all_ipv6()),
             ],
+            RouterOperation::EnableDirectBlock | RouterOperation::DisableDirectBlock => {
+                let verb = if matches!(operation, RouterOperation::EnableDirectBlock) {
+                    "add"
+                } else {
+                    "del"
+                };
+                let pref = self.rule_base.unwrap_or(5_200).to_string();
+                ["-4", "-6"]
+                    .into_iter()
+                    .map(|family| {
+                        (
+                            "ip".into(),
+                            vec![
+                                family.into(),
+                                "rule".into(),
+                                verb.into(),
+                                "pref".into(),
+                                pref.clone(),
+                                "not".into(),
+                                "fwmark".into(),
+                                "0x80000/0xff0000".into(),
+                                "protocol".into(),
+                                Self::RULE_PROTOCOL.to_string(),
+                                "type".into(),
+                                "unreachable".into(),
+                            ],
+                        )
+                    })
+                    .collect()
+            }
         }
     }
 
-    fn up_command_groups(&self) -> Vec<Vec<CommandSpec>> {
-        // Match tailscaled's addIPRules: delete broadly-selected managed
-        // priorities first, then add the current rules. The unmarked deletes
-        // also remove stale fwmark variants after a crash or an upgrade.
-        vec![
-            Self::policy_rules(false),
-            Self::policy_rules(true),
-            vec![(
+    fn up_cleanup_commands(&self) -> Vec<CommandSpec> {
+        // Delete broadly-selected managed priorities before the transaction.
+        // These commands remove only rustscale's reserved priorities. When a
+        // dead owner was adopted, remove its exact catch-alls while the
+        // emergency rule still blocks direct fallback.
+        let mut commands = self.policy_rules(false);
+        if self.stale_recovery_pending() {
+            commands.extend(self.commands(&RouterOperation::RemoveExitRoutes));
+        }
+        commands
+    }
+
+    fn up_transaction_commands(&self) -> Vec<(CommandSpec, CommandSpec)> {
+        let mut commands = Vec::new();
+        for (program, args) in self.policy_rules(true) {
+            let mut rollback_args = args.clone();
+            if let Some(add) = rollback_args.iter_mut().find(|arg| arg.as_str() == "add") {
+                *add = "del".into();
+            }
+            commands.push(((program.clone(), args), (program, rollback_args)));
+        }
+        commands.push((
+            (
                 "ip".into(),
                 vec![
                     "link".into(),
@@ -667,8 +1797,18 @@ impl Platform for LinuxPlatform {
                     self.tun_name.clone(),
                     "up".into(),
                 ],
-            )],
-        ]
+            ),
+            (
+                "ip".into(),
+                vec![
+                    "link".into(),
+                    "set".into(),
+                    self.tun_name.clone(),
+                    "down".into(),
+                ],
+            ),
+        ));
+        commands
     }
 }
 
@@ -695,6 +1835,12 @@ impl Router for LinuxRouter {
     fn set(&mut self, config: &RouterConfig) -> Result<(), RouterError> {
         self.0.set(config)
     }
+    fn block_direct(&mut self) -> Result<(), RouterError> {
+        self.0.block_direct()
+    }
+    fn unblock_direct(&mut self) -> Result<(), RouterError> {
+        self.0.unblock_direct()
+    }
     fn close(&mut self) -> Result<(), RouterError> {
         self.0.close()
     }
@@ -718,13 +1864,22 @@ impl Router for UnsupportedRouter {
 
 /// Construct the router appropriate for the current platform.
 pub fn new(tun_name: &str) -> Box<dyn Router> {
+    new_with_state_dir(tun_name, None)
+}
+
+pub fn new_with_state_dir(tun_name: &str, state_dir: Option<&std::path::Path>) -> Box<dyn Router> {
     #[cfg(target_os = "macos")]
-    return Box::new(DarwinRouter::new(tun_name));
+    {
+        Box::new(DarwinRouter::new_with_state_dir(tun_name, state_dir))
+    }
     #[cfg(target_os = "linux")]
-    return Box::new(LinuxRouter::new(tun_name));
+    {
+        let _ = state_dir;
+        Box::new(LinuxRouter::new(tun_name))
+    }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
-        let _ = tun_name;
+        let _ = (tun_name, state_dir);
         Box::new(UnsupportedRouter)
     }
 }
@@ -735,6 +1890,7 @@ pub fn new(tun_name: &str) -> Box<dyn Router> {
 pub struct FakeRouter {
     config: Option<RouterConfig>,
     is_up: bool,
+    direct_blocked: bool,
     operations: Vec<RouterOperation>,
 }
 
@@ -759,21 +1915,39 @@ impl Router for FakeRouter {
     }
 
     fn set(&mut self, config: &RouterConfig) -> Result<(), RouterError> {
+        let config = config.normalized()?;
         self.operations
-            .extend(diff(self.config.as_ref(), config).operations());
-        self.config = Some(config.clone());
+            .extend(diff(self.config.as_ref(), &config).operations());
+        self.config = Some(config);
+        Ok(())
+    }
+
+    fn block_direct(&mut self) -> Result<(), RouterError> {
+        if !self.direct_blocked {
+            self.operations.push(RouterOperation::EnableDirectBlock);
+            self.direct_blocked = true;
+        }
+        Ok(())
+    }
+
+    fn unblock_direct(&mut self) -> Result<(), RouterError> {
+        if self.direct_blocked {
+            self.operations.push(RouterOperation::DisableDirectBlock);
+            self.direct_blocked = false;
+        }
         Ok(())
     }
 
     fn close(&mut self) -> Result<(), RouterError> {
-        if !self.is_up && self.config.is_none() {
+        if !self.is_up && self.config.is_none() && !self.direct_blocked {
             return Ok(());
         }
+        self.block_direct()?;
         self.operations
             .extend(diff(self.config.as_ref(), &RouterConfig::default()).teardown_operations());
         self.config = None;
         self.is_up = false;
-        Ok(())
+        self.unblock_direct()
     }
 }
 
@@ -875,14 +2049,14 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_route_and_address_adds_are_benign() {
+    fn duplicate_route_and_address_adds_are_fatal_without_ownership_proof() {
         let route = RouterError::Command {
             program: "ip".into(),
             args: vec!["route".into(), "add".into(), "192.0.2.0/24".into()],
             exit_code: Some(2),
             stderr: "RTNETLINK answers: File exists".into(),
         };
-        assert!(route.non_fatal());
+        assert!(!route.non_fatal());
 
         let address = RouterError::Command {
             program: "ip".into(),
@@ -896,7 +2070,7 @@ mod tests {
             exit_code: Some(2),
             stderr: "RTNETLINK answers: Already exists".into(),
         };
-        assert!(address.non_fatal());
+        assert!(!address.non_fatal());
     }
 
     #[test]
@@ -976,6 +2150,40 @@ mod tests {
         assert!(!ipv4.non_fatal());
     }
 
+    struct StaleRecoveryPlatform;
+
+    impl Platform for StaleRecoveryPlatform {
+        fn commands(&self, _operation: &RouterOperation) -> Vec<CommandSpec> {
+            Vec::new()
+        }
+
+        fn stale_recovery_pending(&self) -> bool {
+            true
+        }
+
+        fn up_cleanup_commands(&self) -> Vec<CommandSpec> {
+            vec![("order".into(), vec!["cleanup".into()])]
+        }
+
+        fn recover_stale_state(&self, runner: &mut dyn CommandRunner) -> Result<(), RouterError> {
+            runner.run("order", &["recover".into()])
+        }
+    }
+
+    #[test]
+    fn stale_routes_are_cleaned_before_emergency_block_recovery() {
+        let mut router = StatefulRouter::new(
+            StaleRecoveryPlatform,
+            TransactionRunner {
+                commands: Vec::new(),
+                fail_at: None,
+                fail_also_at: None,
+            },
+        );
+        router.up().unwrap();
+        assert_eq!(router.runner.commands, ["cleanup", "recover"]);
+    }
+
     #[test]
     fn no_op_set_records_no_operations() {
         let mut router = FakeRouter::default();
@@ -1015,15 +2223,15 @@ mod tests {
         assert_eq!(
             router.operations(),
             [
-                RouterOperation::RemoveRoute(prefix("100.64.0.0/10")),
-                RouterOperation::AddRoute(prefix("10.0.0.0/8")),
                 RouterOperation::AddLocalRoute(prefix("192.168.0.0/16")),
+                RouterOperation::AddRoute(prefix("10.0.0.0/8")),
+                RouterOperation::RemoveRoute(prefix("100.64.0.0/10")),
             ]
         );
     }
 
     #[test]
-    fn local_route_diff_removes_before_adding_replacements() {
+    fn local_route_diff_adds_before_removing_replacements() {
         let mut previous = config();
         previous.local_routes = vec![prefix("192.168.0.0/16")];
         let mut next = config();
@@ -1032,10 +2240,317 @@ mod tests {
         assert_eq!(
             diff(Some(&previous), &next).operations(),
             [
-                RouterOperation::RemoveLocalRoute(prefix("192.168.0.0/16")),
                 RouterOperation::AddLocalRoute(prefix("10.0.0.0/8")),
+                RouterOperation::RemoveLocalRoute(prefix("192.168.0.0/16")),
             ]
         );
+    }
+
+    #[test]
+    fn tun_route_is_added_before_corresponding_bypass_is_removed() {
+        let lan = prefix("192.168.0.0/16");
+        let child = prefix("192.168.0.0/17");
+        let previous = RouterConfig {
+            local_routes: vec![lan],
+            exit_node: true,
+            ..Default::default()
+        };
+        let next = RouterConfig {
+            routes: vec![child],
+            exit_node: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            diff(Some(&previous), &next).operations(),
+            [
+                RouterOperation::AddRoute(child),
+                RouterOperation::RemoveLocalRoute(lan),
+            ]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_pf_enable_status_and_token_are_verified() {
+        assert!(pf_is_enabled("Status: Enabled\nDebug: Urgent"));
+        assert!(!pf_is_enabled("Status: Disabled"));
+        assert_eq!(
+            pf_enable_token("pf enabled\nToken : 12345\n"),
+            Some("12345".into())
+        );
+        assert_eq!(pf_enable_token("pf enabled without token"), None);
+        assert!(pf_block_active(
+            "block drop out quick on ! utun42 all flags S/SA",
+            "utun42"
+        ));
+        assert!(!pf_block_active("", "utun42"));
+    }
+
+    #[cfg(target_os = "macos")]
+    struct PfStateRunner {
+        rules: String,
+        commands: Vec<CommandSpec>,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl CommandRunner for PfStateRunner {
+        fn run(&mut self, program: &str, args: &[String]) -> Result<(), RouterError> {
+            self.commands.push((program.into(), args.to_vec()));
+            if args.windows(2).any(|pair| pair == ["-F", "rules"]) {
+                self.rules.clear();
+            }
+            Ok(())
+        }
+
+        fn output(&mut self, program: &str, args: &[String]) -> Result<String, RouterError> {
+            self.commands.push((program.into(), args.to_vec()));
+            Ok(self.rules.clone())
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_adopts_exact_stale_anchor_and_enable_token() {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let state_dir = std::env::temp_dir().join(format!(
+            "rustscale-router-stale-pf-test-{}",
+            std::process::id()
+        ));
+        let platform = DarwinPlatform::new("utun40", Some(&state_dir));
+        let mut owner = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&platform.owner_file)
+            .unwrap();
+        writeln!(
+            owner,
+            "1 {} {} {} {} 12345",
+            u32::MAX,
+            platform.owner_token,
+            platform.tun_name,
+            platform.block_anchor
+        )
+        .unwrap();
+        drop(owner);
+
+        platform.claim_ownership().unwrap();
+        assert!(platform.stale_recovery_pending());
+        let mut runner = PfStateRunner {
+            rules: "block drop out quick on ! utun40 all flags S/SA\n".into(),
+            commands: Vec::new(),
+        };
+        platform.recover_stale_state(&mut runner).unwrap();
+        assert!(runner.rules.is_empty());
+        assert!(runner
+            .commands
+            .iter()
+            .any(|(_, args)| args.windows(2).any(|pair| pair == ["-X", "12345"])));
+        platform.release_ownership();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_stale_recovery_refuses_foreign_anchor_rules() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "rustscale-router-foreign-pf-test-{}",
+            std::process::id()
+        ));
+        let platform = DarwinPlatform::new("utun41", Some(&state_dir));
+        platform
+            .adopted_stale_owner
+            .store(true, std::sync::atomic::Ordering::Release);
+        let foreign = "block drop out quick on ! utun41 all\npass out all\n";
+        let mut runner = PfStateRunner {
+            rules: foreign.into(),
+            commands: Vec::new(),
+        };
+        assert!(platform.recover_stale_state(&mut runner).is_err());
+        assert_eq!(runner.rules, foreign);
+        assert!(runner
+            .commands
+            .iter()
+            .all(|(_, args)| !args.windows(2).any(|pair| pair == ["-F", "rules"])));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_emergency_block_uses_evaluated_pf_anchor_and_all_non_tun_interfaces() {
+        let state_dir =
+            std::env::temp_dir().join(format!("rustscale-router-test-{}", std::process::id()));
+        let platform = DarwinPlatform::new("utun42", Some(&state_dir));
+        platform.claim_ownership().unwrap();
+        let commands = platform.commands(&RouterOperation::EnableDirectBlock);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].0, "pfctl");
+        assert!(commands[0]
+            .1
+            .windows(2)
+            .any(|pair| { pair == ["-a", "com.apple/rustscale.utun42"] }));
+        let rules = std::fs::read_to_string(&platform.block_file).unwrap();
+        assert_eq!(rules, "block drop out quick on ! utun42 all\n");
+        let disable = platform.commands(&RouterOperation::DisableDirectBlock);
+        assert!(disable[0].1.windows(2).any(|pair| pair == ["-F", "rules"]));
+        platform.release_ownership();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_pf_rules_file_rejects_symlink_replacement() {
+        use std::os::unix::fs::symlink;
+        let state_dir = std::env::temp_dir().join(format!(
+            "rustscale-router-symlink-test-{}",
+            std::process::id()
+        ));
+        let platform = DarwinPlatform::new("utun43", Some(&state_dir));
+        std::fs::remove_file(&platform.block_file).unwrap();
+        symlink("/etc/passwd", &platform.block_file).unwrap();
+        assert!(platform.claim_ownership().is_err());
+        std::fs::remove_file(&platform.block_file).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_direct_block_checks_match_only_exact_owned_rule() {
+        let platform = LinuxPlatform::new_with_interface_index("tailscale0", 2);
+        let pref = platform.rule_base.unwrap().to_string();
+        let owned = format!(
+            "{pref}: not from all fwmark 0x80000/0xff0000 unreachable proto {}\n",
+            LinuxPlatform::RULE_PROTOCOL
+        );
+        for ((program, args), fragments) in platform.direct_block_checks() {
+            assert_eq!(program, "ip");
+            assert!(args.windows(2).any(|pair| pair == ["pref", &pref]));
+            assert!(fragments.iter().all(|fragment| owned.contains(fragment)));
+            let foreign = format!("{pref}: from all unreachable proto 99\n");
+            assert!(!fragments.iter().all(|fragment| foreign.contains(fragment)));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    struct RuleStateRunner {
+        rules: std::collections::HashMap<String, String>,
+        commands: Vec<CommandSpec>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl CommandRunner for RuleStateRunner {
+        fn run(&mut self, program: &str, args: &[String]) -> Result<(), RouterError> {
+            self.commands.push((program.into(), args.to_vec()));
+            let family = args.first().cloned().unwrap_or_default();
+            if args.iter().any(|arg| arg == "del") {
+                self.rules.remove(&family);
+            } else if args.iter().any(|arg| arg == "add") {
+                let pref = args
+                    .windows(2)
+                    .find_map(|pair| (pair[0] == "pref").then_some(pair[1].clone()))
+                    .unwrap_or_default();
+                self.rules.insert(
+                    family,
+                    format!(
+                        "{pref}: not from all fwmark 0x80000/0xff0000 unreachable proto {}\n",
+                        LinuxPlatform::RULE_PROTOCOL
+                    ),
+                );
+            }
+            Ok(())
+        }
+
+        fn output(&mut self, program: &str, args: &[String]) -> Result<String, RouterError> {
+            self.commands.push((program.into(), args.to_vec()));
+            Ok(args
+                .first()
+                .and_then(|family| self.rules.get(family))
+                .cloned()
+                .unwrap_or_default())
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_startup_claim_marks_dead_owner_for_recovery() {
+        use std::io::Write as _;
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        let platform = LinuxPlatform::new_with_interface_index("stale-owner0", 177);
+        let base = platform.rule_base.unwrap();
+        let dir = linux_rule_owner_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.join(base.to_string());
+        let _ = std::fs::remove_file(&path);
+        let mut owner = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        writeln!(owner, "{} stale-owner0", u32::MAX).unwrap();
+        owner.sync_all().unwrap();
+
+        platform.claim_ownership().unwrap();
+        assert!(platform.stale_recovery_pending());
+        platform.release_ownership();
+        assert!(!path.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_adopts_and_removes_only_exact_stale_direct_blocks() {
+        let platform = LinuxPlatform::new_with_interface_index("tailscale0", 2);
+        platform
+            .adopted_stale_owner
+            .store(true, std::sync::atomic::Ordering::Release);
+        let pref = platform.rule_base.unwrap();
+        let owned = format!(
+            "{pref}: not from all fwmark 0x80000/0xff0000 unreachable proto {}\n",
+            LinuxPlatform::RULE_PROTOCOL
+        );
+        let mut runner = RuleStateRunner {
+            rules: std::collections::HashMap::from([
+                ("-4".into(), owned.clone()),
+                ("-6".into(), owned),
+            ]),
+            commands: Vec::new(),
+        };
+
+        platform.recover_stale_state(&mut runner).unwrap();
+        assert!(runner.rules.is_empty());
+        assert!(!platform.stale_recovery_pending());
+        assert_eq!(
+            runner
+                .commands
+                .iter()
+                .filter(|(_, args)| args.iter().any(|arg| arg == "del"))
+                .count(),
+            2
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_stale_recovery_preserves_foreign_same_base_rules() {
+        let platform = LinuxPlatform::new_with_interface_index("tailscale0", 2);
+        platform
+            .adopted_stale_owner
+            .store(true, std::sync::atomic::Ordering::Release);
+        let pref = platform.rule_base.unwrap();
+        let foreign = format!("{pref}: from all unreachable proto 99\n");
+        let mut runner = RuleStateRunner {
+            rules: std::collections::HashMap::from([
+                ("-4".into(), foreign.clone()),
+                ("-6".into(), foreign.clone()),
+            ]),
+            commands: Vec::new(),
+        };
+
+        platform.recover_stale_state(&mut runner).unwrap();
+        assert_eq!(runner.rules.get("-4"), Some(&foreign));
+        assert_eq!(runner.rules.get("-6"), Some(&foreign));
+        assert!(runner
+            .commands
+            .iter()
+            .all(|(_, args)| !args.iter().any(|arg| arg == "del")));
     }
 
     #[cfg(target_os = "linux")]
@@ -1095,7 +2610,13 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_policy_rules_match_tailscale_base_chain() {
-        let commands = LinuxPlatform::policy_rules(true);
+        let platform = LinuxPlatform::new_with_interface_index("rustscale0", 2);
+        let mut commands = platform.policy_rules(true);
+        for (_, args) in &mut commands {
+            if let Some(index) = args.iter().position(|arg| arg == "protocol") {
+                args.drain(index..=index + 1);
+            }
+        }
         assert_eq!(
             &commands[..],
             [
@@ -1210,7 +2731,15 @@ mod tests {
             ]
         );
 
-        let down = LinuxPlatform::policy_rules(false);
+        let mut down = platform.policy_rules(false);
+        for (_, args) in &mut down {
+            if let Some(index) = args.iter().position(|arg| arg == "protocol") {
+                args.drain(index..=index + 1);
+            }
+            if let Some(index) = args.iter().position(|arg| arg == "fwmark") {
+                args.drain(index..=index + 1);
+            }
+        }
         assert_eq!(
             &down[..8],
             [
@@ -1315,6 +2844,47 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_rule_cleanup_selects_only_exact_owned_rules() {
+        let first = LinuxPlatform::new_with_interface_index("rustscale0", 2);
+        let second = LinuxPlatform::new_with_interface_index("rustscale1", 3);
+        assert_ne!(first.rule_base, second.rule_base);
+
+        for (_, delete) in first.policy_rules(false) {
+            assert!(delete.windows(2).any(|pair| pair == ["protocol", "201"]));
+            if delete.iter().any(|arg| arg == "fwmark") {
+                assert!(delete
+                    .windows(2)
+                    .any(|pair| pair == ["fwmark", "0x80000/0xff0000"]));
+            }
+            // A foreign rule can use the same priority/table, but without our
+            // exact ownership protocol it is not selected by this deletion.
+            let mut foreign = delete.clone();
+            let protocol = foreign.iter().position(|arg| arg == "protocol").unwrap();
+            foreign[protocol + 1] = "99".into();
+            assert_ne!(delete, foreign);
+        }
+        for (_, block) in first.commands(&RouterOperation::EnableDirectBlock) {
+            assert!(block.windows(2).any(|pair| pair == ["protocol", "201"]));
+            assert!(block.windows(2).any(|pair| pair == ["not", "fwmark"]));
+            assert_eq!(block[4], first.rule_base.unwrap().to_string());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_rule_owner_collision_is_refused_without_cleanup() {
+        let first = LinuxPlatform::new_with_interface_index("collision-a", 199);
+        let colliding = LinuxPlatform::new_with_interface_index("collision-b", 399);
+        first.claim_ownership().unwrap();
+        let error = colliding.claim_ownership().unwrap_err();
+        assert!(error.to_string().contains("ownership collision"));
+        first.release_ownership();
+        colliding.claim_ownership().unwrap();
+        colliding.release_ownership();
+    }
+
+    #[cfg(target_os = "linux")]
     #[derive(Clone, Copy)]
     enum RunnerOutcome {
         Success,
@@ -1357,6 +2927,37 @@ mod tests {
                 }),
             }
         }
+
+        fn output(&mut self, program: &str, args: &[String]) -> Result<String, RouterError> {
+            self.run(program, args)?;
+            let Some(family) = args.first() else {
+                return Ok(String::new());
+            };
+            let Some(pref) = args
+                .windows(2)
+                .find_map(|pair| (pair[0] == "pref").then_some(pair[1].as_str()))
+            else {
+                return Ok(String::new());
+            };
+            let active = self.commands[..self.commands.len() - 1]
+                .iter()
+                .rev()
+                .find(|(_, prior)| {
+                    prior.first() == Some(family)
+                        && prior.windows(2).any(|pair| pair == ["pref", pref])
+                        && prior.iter().any(|arg| arg == "not")
+                        && prior.iter().any(|arg| arg == "unreachable")
+                })
+                .is_some_and(|(_, prior)| prior.iter().any(|arg| arg == "add"));
+            if active {
+                Ok(format!(
+                    "{pref}: not from all fwmark 0x80000/0xff0000 unreachable proto {}\n",
+                    LinuxPlatform::RULE_PROTOCOL
+                ))
+            } else {
+                Ok(String::new())
+            }
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -1364,7 +2965,7 @@ mod tests {
         outcomes: Vec<RunnerOutcome>,
     ) -> StatefulRouter<LinuxPlatform, RecordingRunner> {
         StatefulRouter::new(
-            LinuxPlatform::new("tailscale0"),
+            LinuxPlatform::new_with_interface_index("tailscale0", 2),
             RecordingRunner {
                 outcomes,
                 ..Default::default()
@@ -1389,16 +2990,61 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn linux_startup_fatal_add_after_cleanup_prevents_link_up() {
+    fn linux_startup_duplicate_first_add_fails_without_claiming_state() {
         let mut outcomes = vec![RunnerOutcome::Success; 8];
         outcomes.push(RunnerOutcome::FileExists);
         let mut router = linux_router_with(outcomes);
 
         assert!(router.up().is_err());
-        assert_eq!(router.runner.commands.len(), 16);
-        assert!(router.runner.commands[8..]
-            .iter()
-            .all(|(_, args)| args.windows(2).any(|args| args == ["rule", "add"])));
+        assert_eq!(router.runner.commands.len(), 9);
+        assert!(router.runner.commands[8]
+            .1
+            .windows(2)
+            .any(|args| args == ["rule", "add"]));
+        assert!(!router.is_up);
+        assert!(router.pending_cleanup.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_startup_rolls_back_every_success_before_each_later_failure() {
+        for fail_offset in 0..9 {
+            let mut outcomes = vec![RunnerOutcome::Success; 8 + fail_offset];
+            outcomes.push(RunnerOutcome::Fatal);
+            let mut router = linux_router_with(outcomes);
+
+            assert!(router.up().is_err(), "failure offset {fail_offset}");
+            assert_eq!(
+                router.runner.commands.len(),
+                9 + 2 * fail_offset,
+                "failure offset {fail_offset}",
+            );
+            assert!(!router.is_up);
+            assert!(router.pending_cleanup.is_empty());
+            let rollback = &router.runner.commands[9 + fail_offset..];
+            assert_eq!(rollback.len(), fail_offset);
+            assert!(rollback
+                .iter()
+                .all(|(_, args)| { args.windows(2).any(|args| args == ["rule", "del"]) }));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_failed_startup_rollback_is_dirty_and_close_retries() {
+        let mut outcomes = vec![RunnerOutcome::Success; 9];
+        outcomes.extend([RunnerOutcome::Fatal, RunnerOutcome::Fatal]);
+        let mut router = linux_router_with(outcomes);
+
+        let error = router.up().unwrap_err();
+        assert!(matches!(
+            error,
+            RouterError::Transaction { ref rollback, .. } if rollback.len() == 1
+        ));
+        assert_eq!(router.pending_cleanup.len(), 1);
+        assert!(!router.is_up);
+        router.close().unwrap();
+        assert!(router.pending_cleanup.is_empty());
         assert!(!router.is_up);
     }
 
@@ -1434,7 +3080,18 @@ mod tests {
             .runner
             .commands
             .iter()
-            .map(|(program, args)| format!("{program} {}", args.join(" ")))
+            .map(|(program, args)| {
+                let mut args = args.clone();
+                if let Some(index) = args.iter().position(|arg| arg == "protocol") {
+                    args.drain(index..=index + 1);
+                }
+                if args.iter().any(|arg| arg == "del") {
+                    if let Some(index) = args.iter().position(|arg| arg == "fwmark") {
+                        args.drain(index..=index + 1);
+                    }
+                }
+                format!("{program} {}", args.join(" "))
+            })
             .collect();
         assert_eq!(
             actual,
@@ -1475,6 +3132,200 @@ mod tests {
         assert_eq!(router.operations(), [RouterOperation::RemoveExitRoutes]);
     }
 
+    #[derive(Default)]
+    struct TransactionRunner {
+        commands: Vec<String>,
+        fail_at: Option<usize>,
+        fail_also_at: Option<usize>,
+    }
+
+    impl CommandRunner for TransactionRunner {
+        fn run(&mut self, _program: &str, args: &[String]) -> Result<(), RouterError> {
+            let index = self.commands.len();
+            self.commands.push(args.join(" "));
+            if self.fail_at == Some(index) || self.fail_also_at == Some(index) {
+                return Err(RouterError::Command {
+                    program: "route-test".into(),
+                    args: args.to_vec(),
+                    exit_code: Some(1),
+                    stderr: "injected failure".into(),
+                });
+            }
+            Ok(())
+        }
+    }
+
+    struct TransactionPlatform;
+
+    impl Platform for TransactionPlatform {
+        fn commands(&self, operation: &RouterOperation) -> Vec<CommandSpec> {
+            let command = match operation {
+                RouterOperation::AddLocalRoute(prefix) => format!("add {prefix}"),
+                RouterOperation::RemoveLocalRoute(prefix) => format!("remove {prefix}"),
+                _ => return Vec::new(),
+            };
+            vec![("route-test".into(), vec![command])]
+        }
+    }
+
+    #[derive(Default)]
+    struct ForeignRouteRunner {
+        commands: Vec<String>,
+    }
+
+    impl CommandRunner for ForeignRouteRunner {
+        fn run(&mut self, program: &str, args: &[String]) -> Result<(), RouterError> {
+            self.commands.push(args.join(" "));
+            if args.first().is_some_and(|arg| arg.starts_with("add ")) {
+                return Err(RouterError::Command {
+                    program: program.into(),
+                    args: args.to_vec(),
+                    exit_code: Some(2),
+                    stderr: "File exists".into(),
+                });
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn foreign_duplicate_route_is_never_claimed_or_deleted() {
+        let mut router = StatefulRouter::new(TransactionPlatform, ForeignRouteRunner::default());
+        let desired = RouterConfig {
+            local_routes: vec![prefix("192.0.2.10/32")],
+            ..Default::default()
+        };
+        assert!(router.set(&desired).is_err());
+        router.close().unwrap();
+        assert_eq!(router.runner.commands, ["add 192.0.2.10/32"]);
+        assert!(router.config.is_none());
+    }
+
+    #[test]
+    fn endpoint_churn_adds_new_bypass_before_removing_stale() {
+        let mut previous = RouterConfig {
+            local_routes: vec![prefix("192.0.2.10/32")],
+            ..Default::default()
+        };
+        previous.exit_node = true;
+        let mut next = previous.clone();
+        next.local_routes = vec![prefix("192.0.2.20/32")];
+
+        assert_eq!(
+            diff(Some(&previous), &next).operations(),
+            [
+                RouterOperation::AddLocalRoute(prefix("192.0.2.20/32")),
+                RouterOperation::RemoveLocalRoute(prefix("192.0.2.10/32")),
+            ]
+        );
+    }
+
+    #[test]
+    fn partial_endpoint_churn_rolls_back_and_retains_previous_state() {
+        let mut router = StatefulRouter::new(TransactionPlatform, TransactionRunner::default());
+        let previous = RouterConfig {
+            local_routes: vec![prefix("192.0.2.10/32")],
+            exit_node: true,
+            ..Default::default()
+        };
+        router.set(&previous).unwrap();
+        let start = router.runner.commands.len();
+        router.runner.fail_at = Some(start + 1);
+        let next = RouterConfig {
+            local_routes: vec![prefix("192.0.2.20/32")],
+            exit_node: true,
+            ..Default::default()
+        };
+
+        assert!(router.set(&next).is_err());
+        assert_eq!(router.config, Some(previous));
+        assert_eq!(
+            &router.runner.commands[start..],
+            [
+                "add 192.0.2.20/32",
+                "remove 192.0.2.10/32",
+                "remove 192.0.2.20/32",
+            ]
+        );
+    }
+
+    #[test]
+    fn inverse_failure_is_aggregated_owned_and_retried_before_next_set() {
+        let mut router = StatefulRouter::new(TransactionPlatform, TransactionRunner::default());
+        let previous = RouterConfig {
+            local_routes: vec![prefix("192.0.2.10/32")],
+            ..Default::default()
+        };
+        router.set(&previous).unwrap();
+        let start = router.runner.commands.len();
+        router.runner.fail_at = Some(start + 1);
+        router.runner.fail_also_at = Some(start + 2);
+        let next = RouterConfig {
+            local_routes: vec![prefix("192.0.2.20/32")],
+            ..Default::default()
+        };
+
+        let error = router.set(&next).unwrap_err();
+        assert!(matches!(
+            error,
+            RouterError::Transaction { ref rollback, .. } if rollback.len() == 1
+        ));
+        assert_eq!(router.config, Some(previous.clone()));
+        assert_eq!(router.pending_cleanup.len(), 1);
+
+        router.runner.fail_at = None;
+        router.runner.fail_also_at = None;
+        router.set(&previous).unwrap();
+        assert!(router.pending_cleanup.is_empty());
+        assert_eq!(
+            router.runner.commands.last().unwrap(),
+            "remove 192.0.2.20/32"
+        );
+    }
+
+    #[test]
+    fn failed_teardown_retains_state_for_retry() {
+        let mut router = StatefulRouter::new(TransactionPlatform, TransactionRunner::default());
+        let installed = RouterConfig {
+            local_routes: vec![prefix("192.0.2.10/32")],
+            exit_node: true,
+            ..Default::default()
+        };
+        router.is_up = true;
+        router.set(&installed).unwrap();
+        router.runner.fail_at = Some(router.runner.commands.len());
+
+        assert!(router.close().is_err());
+        assert_eq!(router.config, Some(installed));
+        assert!(router.is_up);
+        assert!(router.direct_blocked);
+        router.runner.fail_at = None;
+        router.close().unwrap();
+        assert!(router.config.is_none());
+        assert!(!router.is_up);
+        assert!(!router.direct_blocked);
+    }
+
+    #[test]
+    fn normalization_masks_sorts_deduplicates_and_unmaps_v4() {
+        let mut router = FakeRouter::default();
+        router
+            .set(&RouterConfig {
+                local_addrs: vec!["::ffff:192.0.2.1".parse().unwrap()],
+                local_routes: vec![prefix("192.168.1.99/24"), prefix("192.168.1.0/24")],
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            router.config.unwrap(),
+            RouterConfig {
+                local_addrs: vec!["192.0.2.1".parse().unwrap()],
+                local_routes: vec![prefix("192.168.1.0/24")],
+                ..Default::default()
+            }
+        );
+    }
+
     #[test]
     fn close_removes_everything_and_is_idempotent() {
         let mut router = FakeRouter::default();
@@ -1488,11 +3339,13 @@ mod tests {
         assert_eq!(
             router.operations(),
             [
+                RouterOperation::EnableDirectBlock,
                 RouterOperation::RemoveExitRoutes,
                 RouterOperation::RemoveRoute(prefix("100.64.0.0/10")),
                 RouterOperation::RemoveLocalRoute(prefix("192.168.0.0/16")),
                 RouterOperation::RemoveAddr(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1))),
                 RouterOperation::Down,
+                RouterOperation::DisableDirectBlock,
             ]
         );
         router.clear_operations();

@@ -3163,6 +3163,7 @@ dependencies = [
  "rustscale-envknob",
  "rustscale-key",
  "rustscale-neterror",
+ "rustscale-netns",
  "rustscale-tailcfg",
  "rustscale-tsaddr",
  "rustscale-tsdial",
@@ -3473,6 +3474,7 @@ dependencies = [
  "crc32fast",
  "rand 0.8.7",
  "rustscale-health",
+ "rustscale-netns",
  "rustscale-tailcfg",
  "rustscale-tsdial",
  "socket2",
@@ -3582,6 +3584,7 @@ dependencies = [
  "rand 0.8.7",
  "rustscale-deephash",
  "rustscale-neterror",
+ "rustscale-netns",
  "rustscale-tsdial",
  "thiserror 1.0.69",
  "tokio",
@@ -3640,6 +3643,7 @@ dependencies = [
 name = "rustscale-router"
 version = "0.1.1"
 dependencies = [
+ "if-addrs",
  "rustscale-tsaddr",
 ]
 
@@ -3923,6 +3927,7 @@ dependencies = [
  "rustscale-proxymap",
  "rustscale-routecheck",
  "rustscale-router",
+ "rustscale-routetable",
  "rustscale-safesocket",
  "rustscale-sockstats",
  "rustscale-ssh",

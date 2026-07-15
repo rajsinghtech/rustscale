@@ -105,7 +105,7 @@ pub(crate) use filter_build::{
 };
 pub(crate) use link_monitor::{
     connect_home_derp, spawn_hostinfo_update_loop, spawn_link_monitor,
-    spawn_periodic_endpoint_updates,
+    spawn_periodic_endpoint_updates, LinkRouteSync,
 };
 pub(crate) use map_update::{
     exit_node_pref, set_exit_node_pref, spawn_map_update_task, ExitNodeSelection, KeyRotationCtx,
@@ -114,7 +114,11 @@ pub(crate) use map_update::{
 #[cfg(test)]
 pub(crate) use netstack_pump::collect_tun_inbound;
 pub(crate) use netstack_pump::{run_netstack_pump, tick_wg_timers};
-pub(crate) use tun_pump::{create_tun_device, run_tun_pump, sync_router, SharedRouter};
+pub(crate) use tun_pump::{
+    clear_kernel_security_block_reason, create_tun_device, engage_kernel_security_block,
+    kernel_security_block_latched, run_tun_pump, set_exit_route_state_latch_aware, sync_router,
+    sync_router_with_connected_prefixes, SecurityBlockReason, SharedRouter,
+};
 pub use util::TunModeConfig;
 pub(crate) use util::{
     break_tcp_conns_best_effort, ensure_ring_provider, first_v4, rand_index, CancelToken,
@@ -140,7 +144,8 @@ use {
     rustscale_filter::Filter,
     rustscale_health::{
         Severity, Tracker, Watchdog, WARN_CERT_FALLBACK, WARN_CONTROL, WARN_DERP_HOME,
-        WARN_MAP_RESPONSE_TIMEOUT, WARN_NETMON_CHANGE, WARN_NOT_IN_MAP_POLL,
+        WARN_EXIT_ROUTE_SECURITY, WARN_MAP_RESPONSE_TIMEOUT, WARN_NETMON_CHANGE,
+        WARN_NOT_IN_MAP_POLL,
     },
     rustscale_ipn::IpnBackend,
     rustscale_key::{DiscoPrivate, MachinePrivate, MachinePublic, NodePrivate, NodePublic},
@@ -777,6 +782,14 @@ impl ServerBuilder {
 }
 
 /// Internal running state.
+/// Serializes every map-driven and explicit exit-route mutation.
+///
+/// Lock order is `exit_map_gate` -> prefs/peer snapshots -> `peer_map.gate`
+/// -> route table -> synchronous router. Map code releases `peer_map.gate`
+/// before taking the route-table/router locks. No caller may acquire
+/// `exit_map_gate` while holding any of those inner locks.
+pub(crate) type ExitMapGate = Arc<tokio::sync::Mutex<()>>;
+
 pub(crate) struct RunningState {
     pub(crate) tailscale_ips: Vec<IpAddr>,
     pub(crate) magicsock: Arc<Magicsock>,
@@ -790,6 +803,7 @@ pub(crate) struct RunningState {
     pub(crate) route_table: Arc<RwLock<RouteTable>>,
     /// Live signed packet filter, mutated only under `peer_map.gate.write()`.
     pub(crate) filter: Arc<std::sync::Mutex<Filter>>,
+    pub(crate) exit_map_gate: ExitMapGate,
     /// OS-route manager in TUN mode when `TunModeConfig::apply_routes` is set.
     pub(crate) router: Option<SharedRouter>,
     pub(crate) cancel: Arc<CancelToken>,
@@ -947,6 +961,7 @@ pub(crate) struct Bootstrap {
     pub(crate) peer_map: Arc<peer_map::Runtime>,
     pub(crate) routecheck: Arc<rustscale_routecheck::Client>,
     pub(crate) route_table: Arc<RwLock<RouteTable>>,
+    pub(crate) exit_map_gate: ExitMapGate,
     pub(crate) cancel: Arc<CancelToken>,
     pub(crate) map_rx: mpsc::Receiver<Result<MapResponse, StreamMapError>>,
     pub(crate) map_tasks: Arc<MapSessionTasks>,
@@ -1279,6 +1294,7 @@ impl Server {
         let config =
             rustscale_conffile::Config::load(path).map_err(|e| format!("config load: {e}"))?;
         let masked = config.parsed.to_prefs();
+        let _exit_map_guard = inner.exit_map_gate.lock().await;
         let authorization_changed = masked.ShieldsUpSet
             || masked.ExitNodeAllowLANAccessSet
             || masked.ExitNodeIDSet
@@ -1288,27 +1304,90 @@ impl Server {
         } else {
             None
         };
-
-        let updated = {
-            let mut prefs = inner.prefs.write().await;
-            let mut candidate = prefs.clone();
-            masked.apply_to(&mut candidate);
-            if let Some(policy) = &self.config.preference_policy {
-                policy.reconcile(&mut candidate)?;
-            }
-            if candidate != *prefs {
-                if let Some(ref dir) = self.config.state_dir {
-                    candidate
-                        .save(dir)
-                        .map_err(|error| format!("saving preferences: {error}"))?;
+        let mut prefs_guard = inner.prefs.write().await;
+        let old_prefs = prefs_guard.clone();
+        let mut next_prefs = old_prefs.clone();
+        masked.apply_to(&mut next_prefs);
+        if let Some(policy) = &self.config.preference_policy {
+            policy.reconcile(&mut next_prefs)?;
+        }
+        let exit_changed =
+            masked.ExitNodeAllowLANAccessSet || masked.ExitNodeIDSet || masked.ExitNodeIPSet;
+        if let Some(ref dir) = self.config.state_dir {
+            next_prefs
+                .save(dir)
+                .map_err(|error| format!("prefs save: {error}"))?;
+        }
+        if exit_changed {
+            let selected_exit = if let Some(selector) = exit_node_pref(&next_prefs) {
+                let peers = inner.peers.read().await;
+                localapi::resolve_exit_node_peer(&peers, &selector)
+            } else {
+                None
+            };
+            let requested = exit_node_pref(&next_prefs).is_some();
+            let pending = requested && selected_exit.is_none();
+            let mut selection = inner.exit_node_selection.write().await;
+            let mut routes = inner.route_table.write().await;
+            let old_exit_state = routes.exit_route_state();
+            let selected_exit = selected_exit.or_else(|| {
+                if pending {
+                    routes.exit_node().cloned()
+                } else {
+                    None
                 }
-                *prefs = candidate;
+            });
+            set_exit_route_state_latch_aware(
+                &mut routes,
+                inner.router.as_ref(),
+                selected_exit,
+                requested,
+            );
+            if let Some(router) = inner.router.as_ref() {
+                let control_url = if next_prefs.ControlURL.is_empty() {
+                    DEFAULT_CONTROL_URL
+                } else {
+                    &next_prefs.ControlURL
+                };
+                if let Err(error) = sync_router(
+                    router,
+                    &inner.tailscale_ips,
+                    &routes,
+                    &inner.magicsock,
+                    control_url,
+                    next_prefs.ExitNodeAllowLANAccess,
+                ) {
+                    routes.restore_exit_route_state(old_exit_state);
+                    if let Some(ref dir) = self.config.state_dir {
+                        if let Err(rollback_error) = old_prefs.save(dir) {
+                            return Err(format!(
+                                "router update failed: {error}; prefs rollback failed: {rollback_error}"
+                            ));
+                        }
+                    }
+                    return Err(error.to_string());
+                }
             }
-            inner
-                .posture_checking
-                .store(prefs.PostureChecking, std::sync::atomic::Ordering::Release);
-            serde_json::to_value(&*prefs).unwrap_or_default()
-        };
+            let committed_peer = routes.exit_node().cloned();
+            set_exit_route_state_latch_aware(
+                &mut routes,
+                inner.router.as_ref(),
+                committed_peer,
+                requested,
+            );
+            if pending {
+                selection.replace_from_prefs(&next_prefs);
+            } else {
+                selection.clear_pending();
+            }
+        }
+        *prefs_guard = next_prefs.clone();
+        inner.posture_checking.store(
+            next_prefs.PostureChecking,
+            std::sync::atomic::Ordering::Release,
+        );
+        let updated = serde_json::to_value(&next_prefs).unwrap_or_default();
+        drop(prefs_guard);
 
         if masked.ShieldsUpSet {
             inner
@@ -1318,55 +1397,6 @@ impl Server {
                 .set_shields_up(masked.Prefs.ShieldsUp);
             inner.peer_map.advance_authorization_epoch_locked();
         }
-
-        if masked.ExitNodeAllowLANAccessSet || masked.ExitNodeIDSet || masked.ExitNodeIPSet {
-            let prefs = inner.prefs.read().await.clone();
-            let exit_node_changed = masked.ExitNodeIDSet || masked.ExitNodeIPSet;
-            let selected_exit_node = if exit_node_changed {
-                if let Some(ip_or_name) = exit_node_pref(&prefs) {
-                    let peers = inner.peers.read().await;
-                    Some(localapi::resolve_exit_node_peer(&peers, &ip_or_name))
-                } else {
-                    Some(None)
-                }
-            } else {
-                None
-            };
-            let mut selection = inner.exit_node_selection.write().await;
-            let mut routes = inner.route_table.write().await;
-            if let Some(selected_exit_node) = selected_exit_node {
-                if let Some(peer) = selected_exit_node {
-                    routes.set_exit_node(peer);
-                    selection.clear_pending();
-                } else {
-                    routes.clear_exit_node();
-                    if exit_node_pref(&prefs).is_some() {
-                        selection.replace_from_prefs(&prefs);
-                    } else {
-                        selection.clear_pending();
-                    }
-                }
-            }
-            drop(selection);
-            if let Some(router) = inner.router.as_ref() {
-                let derp_map = inner.magicsock.get_derp_map();
-                let control_url = if prefs.ControlURL.is_empty() {
-                    DEFAULT_CONTROL_URL
-                } else {
-                    &prefs.ControlURL
-                };
-                sync_router(
-                    router,
-                    &inner.tailscale_ips,
-                    &routes,
-                    derp_map.as_ref(),
-                    control_url,
-                    prefs.ExitNodeAllowLANAccess,
-                )
-                .map_err(|error| error.to_string())?;
-            }
-        }
-
         drop(map_commit);
 
         inner.ipn_backend.bus().send(rustscale_ipn::Notify {

@@ -6,48 +6,11 @@
 //! address family. This mirrors how the kernel routes packets to the right
 //! WireGuard peer, and is used by both the netstack and TUN data-plane pumps.
 
-use std::net::{IpAddr, ToSocketAddrs};
+use std::net::IpAddr;
 
 use rustscale_art::{IpPrefix as ArtPrefix, Table as ArtTable};
 use rustscale_key::NodePublic;
 use rustscale_tailcfg::Node;
-
-/// Resolve the control server from a bare hostname or URL to all of its IPs.
-/// Resolution is deliberately best-effort: a failed lookup must not prevent
-/// routing from being configured.
-pub(crate) fn resolve_control_server_ips(control_url: &str) -> Vec<IpAddr> {
-    let Some(host) = control_server_host(control_url) else {
-        return Vec::new();
-    };
-    if let Ok(ip) = host.parse() {
-        return vec![ip];
-    }
-    let Ok(addrs) = (host, 443).to_socket_addrs() else {
-        return Vec::new();
-    };
-    let mut ips: Vec<IpAddr> = addrs.map(|addr| addr.ip()).collect();
-    ips.sort_unstable();
-    ips.dedup();
-    ips
-}
-
-fn control_server_host(control_url: &str) -> Option<&str> {
-    let authority = control_url
-        .split_once("://")
-        .map_or(control_url, |(_, rest)| rest)
-        .split(['/', '?', '#'])
-        .next()?;
-    let authority = authority
-        .rsplit_once('@')
-        .map_or(authority, |(_, host)| host);
-    if let Some(bracketed) = authority.strip_prefix('[') {
-        return bracketed.split_once(']').map(|(host, _)| host);
-    }
-    if authority.parse::<IpAddr>().is_ok() {
-        return Some(authority);
-    }
-    authority.split(':').next().filter(|host| !host.is_empty())
-}
 
 /// One route entry: a CIDR network owned by a peer.
 #[derive(Clone)]
@@ -72,6 +35,21 @@ pub struct RouteTable {
     /// `accept_routes`: the exit node's default routes are installed even when
     /// `accept_routes` is false.
     exit_node: Option<NodePublic>,
+    /// Whether ordinary traffic must remain captured even while the requested
+    /// exit peer is unresolved. With no `exit_node`, lookup deliberately drops
+    /// the captured packet instead of permitting direct physical routing.
+    exit_capture: bool,
+    /// Emergency data-plane block entered when security-critical OS route
+    /// refresh fails. The selected peer is retained for retry, but ordinary
+    /// fallback traffic is dropped until the refresh succeeds.
+    exit_blocked: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct ExitRouteState {
+    peer: Option<NodePublic>,
+    requested: bool,
+    blocked: bool,
 }
 
 impl RouteTable {
@@ -123,6 +101,8 @@ impl RouteTable {
             index,
             accept_routes,
             exit_node: None,
+            exit_capture: false,
+            exit_blocked: false,
         }
     }
 
@@ -134,10 +114,12 @@ impl RouteTable {
     /// IPs and accepted subnet routes (more specific than `0.0.0.0/0`) always
     /// win over the exit fallback.
     pub fn lookup(&self, ip: IpAddr) -> Option<NodePublic> {
-        self.index
-            .get(ip)
-            .cloned()
-            .or_else(|| self.exit_node.clone())
+        let peer = self.index.get(ip).cloned();
+        if self.exit_blocked {
+            peer
+        } else {
+            peer.or_else(|| self.exit_node.clone())
+        }
     }
 
     /// Rebuild the table from a new peer list (e.g. on a map-stream delta).
@@ -146,16 +128,24 @@ impl RouteTable {
     pub fn rebuild(&mut self, peers: &[Node]) {
         let accept = self.accept_routes;
         let exit = self.exit_node.clone();
+        let capture = self.exit_capture;
+        let blocked = self.exit_blocked;
         *self = Self::from_peers_with_opts(peers, accept);
         self.exit_node = exit;
+        self.exit_capture = capture;
+        self.exit_blocked = blocked;
     }
 
     /// Rebuild the table from a new peer list with an explicit `accept_routes`
     /// flag. Preserves the selected exit node of the previous table.
     pub fn rebuild_with_opts(&mut self, peers: &[Node], accept_routes: bool) {
         let exit = self.exit_node.clone();
+        let capture = self.exit_capture;
+        let blocked = self.exit_blocked;
         *self = Self::from_peers_with_opts(peers, accept_routes);
         self.exit_node = exit;
+        self.exit_capture = capture;
+        self.exit_blocked = blocked;
     }
 
     /// Number of distinct normalized route entries (for diagnostics/testing).
@@ -165,7 +155,7 @@ impl RouteTable {
 
     /// Whether the table is empty and no exit node is set.
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty() && self.exit_node.is_none()
+        self.entries.is_empty() && !self.exit_node_requested()
     }
 
     /// Iterate over distinct normalized routes as `(network_ip, prefix,
@@ -182,23 +172,84 @@ impl RouteTable {
         self.accept_routes
     }
 
+    pub(crate) fn exit_route_state(&self) -> ExitRouteState {
+        ExitRouteState {
+            peer: self.exit_node.clone(),
+            requested: self.exit_capture,
+            blocked: self.exit_blocked,
+        }
+    }
+
+    pub(crate) fn restore_exit_route_state(&mut self, state: ExitRouteState) {
+        self.exit_node = state.peer;
+        self.exit_capture = state.requested;
+        self.exit_blocked = state.blocked;
+    }
+
+    /// Atomically apply explicit exit intent while preserving an authoritative
+    /// persistent security latch. API, LocalAPI, and config mutations use this
+    /// single setter so selecting or clearing cannot transiently publish an
+    /// unblocked table while map-loss/enumeration provenance remains active.
+    pub(crate) fn set_exit_state_latch_aware(
+        &mut self,
+        peer: Option<NodePublic>,
+        requested: bool,
+        security_latched: bool,
+    ) {
+        self.exit_node = peer;
+        self.exit_capture = requested;
+        self.exit_blocked = security_latched;
+    }
+
     /// Select an exit node peer. After this, any destination not matched by a
     /// more-specific entry routes to `peer`. This is independent of
     /// `accept_routes`: the exit node's default routes apply even when
     /// `accept_routes` is false.
     pub fn set_exit_node(&mut self, peer: NodePublic) {
         self.exit_node = Some(peer);
+        self.exit_capture = true;
+        self.exit_blocked = false;
+    }
+
+    /// Capture default traffic without forwarding it to any peer. This is the
+    /// fail-closed state for an unresolved requested exit selection.
+    pub fn capture_exit_node(&mut self) {
+        self.exit_node = None;
+        self.exit_capture = true;
+        self.exit_blocked = false;
     }
 
     /// Clear the selected exit node. After this, destinations not matched by
     /// any entry return `None` from [`lookup`](Self::lookup).
     pub fn clear_exit_node(&mut self) {
         self.exit_node = None;
+        self.exit_capture = false;
+        self.exit_blocked = false;
     }
 
     /// The currently selected exit node peer, if any.
     pub fn exit_node(&self) -> Option<&NodePublic> {
         self.exit_node.as_ref()
+    }
+
+    /// Whether OS catch-all routes must remain installed, either for a working
+    /// exit peer or for unresolved-selection capture.
+    pub fn exit_node_requested(&self) -> bool {
+        self.exit_capture
+    }
+
+    pub(crate) fn block_exit_traffic(&mut self) {
+        if self.exit_capture {
+            self.exit_blocked = true;
+        }
+    }
+
+    pub(crate) fn unblock_exit_traffic(&mut self) {
+        self.exit_blocked = false;
+    }
+
+    pub(crate) fn exit_traffic_blocked(&self) -> bool {
+        self.exit_blocked
     }
 }
 
@@ -598,6 +649,30 @@ mod tests {
             rt.lookup(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2))),
             Some(host_key)
         );
+    }
+
+    #[test]
+    fn unresolved_exit_capture_keeps_defaults_installed_but_drops_ordinary_traffic() {
+        let mut rt = RouteTable::default();
+        rt.capture_exit_node();
+        assert!(rt.exit_node_requested());
+        assert!(rt.exit_node().is_none());
+        assert!(rt.lookup("8.8.8.8".parse().unwrap()).is_none());
+        rt.rebuild(&[]);
+        assert!(rt.exit_node_requested());
+    }
+
+    #[test]
+    fn emergency_block_retains_selected_exit_for_retry_but_drops_fallback() {
+        let exit = NodePrivate::generate().public();
+        let mut rt = RouteTable::default();
+        rt.set_exit_node(exit.clone());
+        rt.block_exit_traffic();
+        assert_eq!(rt.exit_node(), Some(&exit));
+        assert!(rt.exit_traffic_blocked());
+        assert!(rt.lookup("8.8.8.8".parse().unwrap()).is_none());
+        rt.unblock_exit_traffic();
+        assert_eq!(rt.lookup("8.8.8.8".parse().unwrap()), Some(exit));
     }
 
     #[test]

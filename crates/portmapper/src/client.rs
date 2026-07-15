@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use tokio::net::UdpSocket;
+use tokio::task::JoinSet;
 use tokio::time::timeout;
 
 use rustscale_deephash::{update as deephash_update, Sum};
@@ -80,7 +81,9 @@ impl Mapping {
 
 #[derive(Clone)]
 struct CachedMapping {
+    ownership_id: u64,
     mapping: Mapping,
+    #[cfg_attr(not(test), allow(dead_code))]
     generation: u64,
     release: ReleaseIdentity,
     lease_expires: Option<Instant>,
@@ -169,21 +172,50 @@ struct ClientInner {
     state: Mutex<ClientState>,
     clock: RwLock<Box<dyn Fn() -> Instant + Send + Sync>>,
     next_gateway_observation: AtomicU64,
+    next_ownership_id: AtomicU64,
     running_create: AtomicBool,
     create_lock: tokio::sync::Mutex<()>,
-    release_progress: Mutex<ReleaseProgress>,
+    work: Mutex<WorkGate>,
     release_progress_tx: tokio::sync::watch::Sender<ReleaseProgress>,
-    supervisor_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
-    release_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     #[cfg(test)]
     release_test_gate: Mutex<Option<Arc<ReleaseTestGate>>>,
     closed: AtomicBool,
+}
+
+struct WorkGate {
+    closing: bool,
+    pending_releases: u64,
+    generation: u64,
+    allocation_tasks: JoinSet<()>,
+    release_tasks: JoinSet<()>,
+    launcher_tasks: JoinSet<()>,
+}
+
+impl Default for WorkGate {
+    fn default() -> Self {
+        Self {
+            closing: false,
+            pending_releases: 0,
+            generation: 0,
+            allocation_tasks: JoinSet::new(),
+            release_tasks: JoinSet::new(),
+            launcher_tasks: JoinSet::new(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct ReleaseProgress {
     pending: u64,
     generation: u64,
+}
+
+struct PendingReleaseGuard(Client);
+
+impl Drop for PendingReleaseGuard {
+    fn drop(&mut self) {
+        self.0.complete_release();
+    }
 }
 
 #[derive(Default)]
@@ -246,12 +278,11 @@ impl Client {
                 state: Mutex::new(ClientState::default()),
                 clock: RwLock::new(Box::new(Instant::now)),
                 next_gateway_observation: AtomicU64::new(0),
+                next_ownership_id: AtomicU64::new(1),
                 running_create: AtomicBool::new(false),
                 create_lock: tokio::sync::Mutex::new(()),
-                release_progress: Mutex::new(ReleaseProgress::default()),
+                work: Mutex::new(WorkGate::default()),
                 release_progress_tx,
-                supervisor_tasks: Mutex::new(Vec::new()),
-                release_tasks: Mutex::new(Vec::new()),
                 #[cfg(test)]
                 release_test_gate: Mutex::new(None),
                 closed: AtomicBool::new(false),
@@ -266,6 +297,9 @@ impl Client {
 
     /// Set the local UDP port to map.
     pub fn set_local_port(&self, port: u16) {
+        if self.inner.closed.load(Ordering::SeqCst) {
+            return;
+        }
         let mut p = self.inner.local_port.write().expect("port lock");
         if *p != port {
             *p = port;
@@ -355,8 +389,8 @@ impl Client {
                     state.gateway = info;
                     state.needs_probe = info.is_some();
                     let old_mapping = Self::reset_mapping_state(&mut state);
-                    if old_mapping.is_some() {
-                        self.register_release();
+                    if let Some(mapping) = old_mapping.as_ref() {
+                        self.reserve_release(&mut state, mapping);
                     }
                     old_mapping
                 } else {
@@ -372,9 +406,7 @@ impl Client {
             }
         };
 
-        if let Some(mapping) = old_mapping {
-            self.release_mapping(&mapping);
-        }
+        let _ = old_mapping;
         snapshot
     }
 
@@ -387,16 +419,16 @@ impl Client {
                 .expect("gateway generation overflow");
             state.needs_probe = state.gateway.is_some();
             let old_mapping = Self::reset_mapping_state(&mut state);
-            if release && old_mapping.is_some() {
-                self.register_release();
+            if let (true, Some(mapping)) = (release, old_mapping.as_ref()) {
+                // The cleanup ledger and pending-operation count become visible
+                // before invalidation unlocks. Shutdown takes this same state
+                // lock after closing the work gate, so it cannot miss the
+                // task-registration gap below.
+                self.reserve_release(&mut state, mapping);
             }
             old_mapping
         };
-        if release {
-            if let Some(mapping) = old_mapping {
-                self.release_mapping(&mapping);
-            }
-        }
+        let _ = old_mapping;
     }
 
     fn reset_mapping_state(state: &mut ClientState) -> Option<CachedMapping> {
@@ -425,45 +457,71 @@ impl Client {
         Some(f(&mut state))
     }
 
-    fn release_mapping(&self, cached: &CachedMapping) {
-        debug_assert!(cached.generation <= self.current_gateway_state().0);
+    fn reserve_release(&self, state: &mut ClientState, cached: &CachedMapping) {
+        if !state
+            .uncertain_releases
+            .iter()
+            .any(|pending| pending.ownership_id == cached.ownership_id)
         {
-            let mut state = self.inner.state.lock().expect("state lock");
             state.uncertain_releases.push(cached.clone());
         }
+        let mut work = self.inner.work.lock().expect("work gate lock");
+        work.pending_releases = work
+            .pending_releases
+            .checked_add(1)
+            .expect("pending release overflow");
+        work.generation = work
+            .generation
+            .checked_add(1)
+            .expect("release generation overflow");
+        self.inner
+            .release_progress_tx
+            .send_replace(ReleaseProgress {
+                pending: work.pending_releases,
+                generation: work.generation,
+            });
+        // Spawn while the invalidating state lock is still held. This closes
+        // the reservation/registration gap for shutdown.
         let client = self.clone();
         let captured = cached.clone();
-        let mut tasks = self.inner.release_tasks.lock().expect("release tasks lock");
-        let task = tokio::spawn(async move {
+        Self::reap_join_set(&mut work.release_tasks);
+        work.release_tasks.spawn(async move {
+            let _completion = PendingReleaseGuard(client.clone());
             if client.do_release(captured.clone()).await {
                 client.clear_uncertain_release(&captured);
             }
-            client.complete_release();
         });
-        tasks.push(task);
     }
 
+    #[cfg(test)]
     fn register_release(&self) {
-        let mut progress = self.inner.release_progress.lock().expect("release lock");
-        progress.pending = progress
-            .pending
-            .checked_add(1)
-            .expect("pending release overflow");
-        progress.generation = progress
-            .generation
-            .checked_add(1)
-            .expect("release generation overflow");
-        self.inner.release_progress_tx.send_replace(*progress);
+        let mut work = self.inner.work.lock().expect("work gate lock");
+        work.pending_releases += 1;
+        work.generation += 1;
+        self.inner
+            .release_progress_tx
+            .send_replace(ReleaseProgress {
+                pending: work.pending_releases,
+                generation: work.generation,
+            });
     }
 
     fn complete_release(&self) {
-        let mut progress = self.inner.release_progress.lock().expect("release lock");
-        progress.pending = progress.pending.checked_sub(1).expect("release underflow");
-        progress.generation = progress
+        let mut work = self.inner.work.lock().expect("work gate lock");
+        work.pending_releases = work
+            .pending_releases
+            .checked_sub(1)
+            .expect("release underflow");
+        work.generation = work
             .generation
             .checked_add(1)
             .expect("release generation overflow");
-        self.inner.release_progress_tx.send_replace(*progress);
+        self.inner
+            .release_progress_tx
+            .send_replace(ReleaseProgress {
+                pending: work.pending_releases,
+                generation: work.generation,
+            });
     }
 
     async fn wait_for_pending_releases(&self) {
@@ -480,10 +538,9 @@ impl Client {
 
     fn clear_uncertain_release(&self, released: &CachedMapping) {
         let mut state = self.inner.state.lock().expect("state lock");
-        state.uncertain_releases.retain(|cached| {
-            cached.generation != released.generation
-                || cached.mapping.external.port() != released.mapping.external.port()
-        });
+        state
+            .uncertain_releases
+            .retain(|cached| cached.ownership_id != released.ownership_id);
     }
 
     async fn do_release(&self, cached: CachedMapping) -> bool {
@@ -533,7 +590,8 @@ impl Client {
                                 reply.op_code == pmp::PMP_OP_REPLY | pmp::PMP_OP_MAP_UDP
                                     && reply.result_code == 0
                                     && reply.internal_port == internal_port
-                                    && reply.external_port == external_port
+                                    && (external_port == 0
+                                        || reply.external_port == external_port)
                                     && reply.mapping_valid_seconds == 0)
                     )
                 }
@@ -571,7 +629,8 @@ impl Client {
                                     && reply.nonce == nonce
                                     && reply.protocol == pcp::PCP_UDP
                                     && reply.internal_port == internal_port
-                                    && reply.external.port() == external_port)
+                                    && (external_port == 0
+                                        || reply.external.port() == external_port))
                     )
                 }
             }
@@ -589,42 +648,66 @@ impl Client {
 
     /// Close the client and release any active mapping.
     pub fn close(&self) {
-        if self.inner.closed.swap(true, Ordering::SeqCst) {
-            return;
+        {
+            let mut work = self.inner.work.lock().expect("work gate lock");
+            if work.closing {
+                return;
+            }
+            work.closing = true;
+            self.inner.closed.store(true, Ordering::SeqCst);
         }
         self.invalidate_mappings(true);
     }
 
     /// Stop new mapping work and await active allocation/release supervisors.
     pub async fn shutdown(&self, deadline: Duration) -> Result<(), crate::PortMapError> {
-        // Closing and supervisor registration share this gate. Once closed is
-        // published, no task can be registered after this drain point.
-        let supervisors = {
-            let mut tasks = self
-                .inner
-                .supervisor_tasks
-                .lock()
-                .expect("supervisor tasks lock");
+        {
+            let mut work = self.inner.work.lock().expect("work gate lock");
+            work.closing = true;
             self.inner.closed.store(true, Ordering::SeqCst);
-            self.invalidate_mappings(true);
-            std::mem::take(&mut *tasks)
+        }
+        // Taking the state lock after closing is the invalidation barrier: any
+        // earlier invalidator has already reserved its cleanup operation while
+        // holding this lock, and later public work is rejected by the gate.
+        self.invalidate_mappings(true);
+
+        let (allocations, launchers) = {
+            let mut work = self.inner.work.lock().expect("work gate lock");
+            (
+                std::mem::take(&mut work.allocation_tasks),
+                std::mem::take(&mut work.launcher_tasks),
+            )
         };
         let deadline = tokio::time::Instant::now() + deadline;
-        self.await_owned_task_vec(supervisors, deadline).await?;
+        let mut shutdown_error = self.await_join_set(allocations, deadline).await.err();
+        if let Err(error) = self.await_join_set(launchers, deadline).await {
+            shutdown_error.get_or_insert(error);
+        }
+
+        // Allocation supervisors are gone, so no new release can now be
+        // reserved. Every prior reservation either has a registered task or
+        // was made synchronously before the invalidation barrier above.
         let releases = {
-            let mut tasks = self.inner.release_tasks.lock().expect("release tasks lock");
-            std::mem::take(&mut *tasks)
+            let mut work = self.inner.work.lock().expect("work gate lock");
+            std::mem::take(&mut work.release_tasks)
         };
-        if let Err(error) = self.await_owned_task_vec(releases, deadline).await {
-            let mut progress = self.inner.release_progress.lock().expect("release lock");
-            progress.pending = 0;
-            progress.generation = progress.generation.saturating_add(1);
-            self.inner.release_progress_tx.send_replace(*progress);
+        if let Err(error) = self.await_join_set(releases, deadline).await {
+            shutdown_error.get_or_insert(error);
+        }
+        if tokio::time::timeout_at(deadline, self.wait_for_pending_releases())
+            .await
+            .is_err()
+        {
+            shutdown_error.get_or_insert_with(|| {
+                crate::PortMapError::Protocol("portmapper shutdown deadline".into())
+            });
+        }
+        if let Some(error) = shutdown_error {
             return Err(error);
         }
 
-        // Retry uncertain cleanup, including permanent UPnP leases. Failed
-        // identities remain retained and make shutdown fail for owner retry.
+        // Retry uncertain cleanup, including pre-send requests and permanent
+        // UPnP leases. Failed identities remain retained for owner retry.
         let uncertain = self
             .inner
             .state
@@ -657,31 +740,54 @@ impl Client {
         Ok(())
     }
 
-    async fn await_owned_task_vec(
+    fn reap_join_set(tasks: &mut JoinSet<()>) {
+        while tasks.try_join_next().is_some() {}
+    }
+
+    fn reap_completed_tasks(&self) {
+        let mut work = self.inner.work.lock().expect("work gate lock");
+        Self::reap_join_set(&mut work.allocation_tasks);
+        Self::reap_join_set(&mut work.release_tasks);
+        Self::reap_join_set(&mut work.launcher_tasks);
+    }
+
+    #[cfg(test)]
+    fn owned_task_counts(&self) -> (usize, usize, usize) {
+        self.reap_completed_tasks();
+        let work = self.inner.work.lock().expect("work gate lock");
+        (
+            work.allocation_tasks.len(),
+            work.release_tasks.len(),
+            work.launcher_tasks.len(),
+        )
+    }
+
+    async fn await_join_set(
         &self,
-        mut tasks: Vec<tokio::task::JoinHandle<()>>,
+        mut tasks: JoinSet<()>,
         deadline: tokio::time::Instant,
     ) -> Result<(), crate::PortMapError> {
-        while let Some(mut task) = tasks.pop() {
-            if tokio::time::timeout_at(deadline, &mut task).await.is_err() {
-                task.abort();
-                let _ = task.await;
-                for task in &tasks {
-                    task.abort();
+        loop {
+            match tokio::time::timeout_at(deadline, tasks.join_next()).await {
+                Ok(Some(_)) => {}
+                Ok(None) => return Ok(()),
+                Err(_) => {
+                    tasks.abort_all();
+                    while tasks.join_next().await.is_some() {}
+                    return Err(crate::PortMapError::Protocol(
+                        "portmapper shutdown deadline".into(),
+                    ));
                 }
-                for task in tasks {
-                    let _ = task.await;
-                }
-                return Err(crate::PortMapError::Protocol(
-                    "portmapper shutdown deadline".into(),
-                ));
             }
         }
-        Ok(())
     }
 
     /// Whether we have a valid (non-expired) cached mapping.
     pub fn have_mapping(&self) -> bool {
+        self.reap_completed_tasks();
+        if self.inner.closed.load(Ordering::SeqCst) {
+            return false;
+        }
         let snapshot = self.observe_gateway();
         if snapshot.info.is_none() {
             return false;
@@ -702,6 +808,10 @@ impl Client {
     ///
     /// Mirrors Go's `GetCachedMappingOrStartCreatingOne`.
     pub fn get_cached_mapping_or_start_creating_one(&self) -> (Option<SocketAddr>, bool) {
+        self.reap_completed_tasks();
+        if self.inner.closed.load(Ordering::SeqCst) {
+            return (None, false);
+        }
         // Validate the gateway before returning an external address. This is
         // the path magicsock uses while gathering advertised endpoints, so a
         // lost default route must hide and invalidate the old mapping at once.
@@ -736,11 +846,14 @@ impl Client {
     }
 
     fn maybe_start_create(&self) {
-        if self.inner.running_create.swap(true, Ordering::SeqCst) {
+        let mut work = self.inner.work.lock().expect("work gate lock");
+        Self::reap_join_set(&mut work.launcher_tasks);
+        Self::reap_join_set(&mut work.allocation_tasks);
+        if work.closing || self.inner.running_create.swap(true, Ordering::SeqCst) {
             return;
         }
         let client = self.clone();
-        tokio::spawn(async move {
+        work.launcher_tasks.spawn(async move {
             let started_generation = client.current_gateway_state().0;
             let _ = client.create_or_get_mapping().await;
             client.inner.running_create.store(false, Ordering::SeqCst);
@@ -917,20 +1030,16 @@ impl Client {
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         let client = self.clone();
         {
-            let mut tasks = self
-                .inner
-                .supervisor_tasks
-                .lock()
-                .expect("supervisor tasks lock");
-            if self.inner.closed.load(Ordering::SeqCst) {
+            let mut work = self.inner.work.lock().expect("work gate lock");
+            Self::reap_join_set(&mut work.allocation_tasks);
+            if work.closing {
                 return Err(crate::PortMapError::Disabled);
             }
-            let task = tokio::spawn(async move {
+            work.allocation_tasks.spawn(async move {
                 let _create_guard = client.inner.create_lock.lock().await;
                 let result = client.create_or_get_mapping_serialized().await;
                 let _ = result_tx.send(result);
             });
-            tasks.push(task);
         }
         result_rx.await.unwrap_or_else(|_| {
             Err(crate::PortMapError::Protocol(
@@ -1093,14 +1202,15 @@ impl Client {
                 .is_some_and(|cached| !compatible(&cached.release))
             {
                 let old = state.mapping.take();
-                self.register_release();
+                if let Some(mapping) = old.as_ref() {
+                    self.reserve_release(&mut state, mapping);
+                }
                 old
             } else {
                 None
             }
         };
-        if let Some(old) = old_mapping {
-            self.release_mapping(&old);
+        if old_mapping.is_some() {
             self.wait_for_pending_releases().await;
             if self.with_current_gateway(snapshot, |_| ()).is_none() {
                 return Err(crate::PortMapError::GatewayRange);
@@ -1169,6 +1279,42 @@ impl Client {
             rand::rngs::OsRng.fill_bytes(&mut nonce);
             nonce
         });
+        let ownership_id = self.next_ownership_id();
+        let provisional_now = self.now();
+        let provisional_mapping = Mapping {
+            external: SocketAddr::V4(SocketAddrV4::new(
+                cached_pub_ip.unwrap_or(Ipv4Addr::UNSPECIFIED),
+                prev_port,
+            )),
+            kind: if prefer_pcp {
+                MappingKind::Pcp
+            } else {
+                MappingKind::Pmp
+            },
+            good_until: provisional_now + Duration::from_secs(u64::from(crate::MAP_LIFETIME_SECS)),
+            renew_after: provisional_now,
+        };
+        let provisional = CachedMapping {
+            ownership_id,
+            mapping: provisional_mapping.clone(),
+            generation: snapshot.generation,
+            release: if prefer_pcp {
+                ReleaseIdentity::Pcp {
+                    destination: pxp_addr,
+                    self_ip: gi.self_ip,
+                    internal_port: local_port,
+                    nonce: pcp_nonce,
+                }
+            } else {
+                ReleaseIdentity::Pmp {
+                    destination: pxp_addr,
+                    internal_port: local_port,
+                }
+            },
+            // Until a response arrives, the granted lifetime is unknown.
+            // Never age an ambiguous pre-send ownership record out.
+            lease_expires: None,
+        };
 
         if prefer_pcp {
             let pkt = pcp::build_map_request(
@@ -1179,6 +1325,12 @@ impl Client {
                 Ipv4Addr::UNSPECIFIED,
                 pcp_nonce,
             );
+            self.inner
+                .state
+                .lock()
+                .expect("state lock")
+                .uncertain_releases
+                .push(provisional.clone());
             if let Err(e) = sock.send_to(&pkt, pxp_addr).await {
                 if treat_as_lost_udp(&e) {
                     return Err(crate::PortMapError::NoServices);
@@ -1197,6 +1349,12 @@ impl Client {
                 }
             }
             let pkt = pmp::build_map_request(local_port, prev_port, crate::MAP_LIFETIME_SECS);
+            self.inner
+                .state
+                .lock()
+                .expect("state lock")
+                .uncertain_releases
+                .push(provisional.clone());
             if let Err(e) = sock.send_to(&pkt, pxp_addr).await {
                 if treat_as_lost_udp(&e) {
                     return Err(crate::PortMapError::NoServices);
@@ -1238,6 +1396,7 @@ impl Client {
                                 renew_after: now + lifetime / 2,
                             };
                             let cached = CachedMapping {
+                                ownership_id,
                                 mapping: mapping.clone(),
                                 generation: snapshot.generation,
                                 release: ReleaseIdentity::Pcp {
@@ -1248,27 +1407,51 @@ impl Client {
                                 },
                                 lease_expires: Some(mapping.good_until),
                             };
-                            if self.retained_port_conflicts(mapping.external.port()) {
-                                self.do_release(cached).await;
+                            {
+                                let mut state = self.inner.state.lock().expect("state lock");
+                                if let Some(pending) = state
+                                    .uncertain_releases
+                                    .iter_mut()
+                                    .find(|pending| pending.ownership_id == ownership_id)
+                                {
+                                    *pending = cached.clone();
+                                }
+                            }
+                            if self.retained_port_conflicts(
+                                mapping.external.port(),
+                                Some(ownership_id),
+                            ) {
+                                if self.do_release(cached.clone()).await {
+                                    self.clear_uncertain_release(&cached);
+                                }
                                 return Ok(None);
                             }
                             if self
                                 .with_current_gateway(snapshot, |state| {
+                                    state
+                                        .uncertain_releases
+                                        .retain(|pending| pending.ownership_id != ownership_id);
                                     state.mapping = Some(cached.clone());
                                 })
                                 .is_none()
                             {
-                                self.do_release(cached).await;
+                                if self.do_release(cached.clone()).await {
+                                    self.clear_uncertain_release(&cached);
+                                }
                                 return Ok(None);
                             }
                             return Ok(Some(mapping));
                         }
+                        self.clear_uncertain_ownership(ownership_id);
                         return Ok(None);
                     }
 
                     // PMP response.
                     if let Some(pmp_resp) = pmp::parse_response(pkt) {
                         if pmp_resp.result_code != 0 {
+                            if pmp_resp.op_code == pmp::PMP_OP_REPLY | pmp::PMP_OP_MAP_UDP {
+                                self.clear_uncertain_ownership(ownership_id);
+                            }
                             return Ok(None);
                         }
                         if pmp_resp.op_code == pmp::PMP_OP_REPLY | pmp::PMP_OP_MAP_PUBLIC_ADDR {
@@ -1292,6 +1475,7 @@ impl Client {
                             renew_after: now + lifetime / 2,
                         };
                         let cached = CachedMapping {
+                            ownership_id,
                             mapping: mapping.clone(),
                             generation: snapshot.generation,
                             release: ReleaseIdentity::Pmp {
@@ -1300,19 +1484,37 @@ impl Client {
                             },
                             lease_expires: Some(mapping.good_until),
                         };
-                        if self.retained_port_conflicts(mapping.external.port()) {
-                            self.do_release(cached).await;
+                        {
+                            let mut state = self.inner.state.lock().expect("state lock");
+                            if let Some(pending) = state
+                                .uncertain_releases
+                                .iter_mut()
+                                .find(|pending| pending.ownership_id == ownership_id)
+                            {
+                                *pending = cached.clone();
+                            }
+                        }
+                        if self.retained_port_conflicts(mapping.external.port(), Some(ownership_id))
+                        {
+                            if self.do_release(cached.clone()).await {
+                                self.clear_uncertain_release(&cached);
+                            }
                             return Ok(None);
                         }
                         if self
                             .with_current_gateway(snapshot, |state| {
+                                state
+                                    .uncertain_releases
+                                    .retain(|pending| pending.ownership_id != ownership_id);
                                 state.pmp_pub_ip = Some(pub_ip);
                                 state.pmp_pub_ip_time = Some(now);
                                 state.mapping = Some(cached.clone());
                             })
                             .is_none()
                         {
-                            self.do_release(cached).await;
+                            if self.do_release(cached.clone()).await {
+                                self.clear_uncertain_release(&cached);
+                            }
                             return Ok(None);
                         }
                         return Ok(Some(mapping));
@@ -1324,17 +1526,7 @@ impl Client {
         Ok(None)
     }
 
-    fn retained_port_conflicts(&self, port: u16) -> bool {
-        self.inner
-            .state
-            .lock()
-            .expect("state lock")
-            .uncertain_releases
-            .iter()
-            .any(|cached| cached.mapping.external.port() == port)
-    }
-
-    fn retained_key_conflicts(&self, service: &upnp::UpnpService, port: u16) -> bool {
+    fn retained_port_conflicts(&self, port: u16, except_ownership: Option<u64>) -> bool {
         self.inner
             .state
             .lock()
@@ -1342,7 +1534,26 @@ impl Client {
             .uncertain_releases
             .iter()
             .any(|cached| {
-                cached.mapping.external.port() == port
+                except_ownership != Some(cached.ownership_id)
+                    && cached.mapping.external.port() == port
+            })
+    }
+
+    fn retained_key_conflicts(
+        &self,
+        service: &upnp::UpnpService,
+        port: u16,
+        except_ownership: Option<u64>,
+    ) -> bool {
+        self.inner
+            .state
+            .lock()
+            .expect("state lock")
+            .uncertain_releases
+            .iter()
+            .any(|cached| {
+                except_ownership != Some(cached.ownership_id)
+                    && cached.mapping.external.port() == port
                     && match &cached.release {
                         ReleaseIdentity::Upnp { service: old } => {
                             old.control_url == service.control_url && old.kind == service.kind
@@ -1354,8 +1565,13 @@ impl Client {
             })
     }
 
+    fn next_ownership_id(&self) -> u64 {
+        self.inner.next_ownership_id.fetch_add(1, Ordering::Relaxed)
+    }
+
     fn track_uncertain_upnp(
         &self,
+        ownership_id: u64,
         snapshot: GatewaySnapshot,
         service: &upnp::UpnpService,
         port: u16,
@@ -1369,6 +1585,7 @@ impl Client {
             renew_after: now,
         };
         let uncertain = CachedMapping {
+            ownership_id,
             mapping: mapping.clone(),
             generation: snapshot.generation,
             release: ReleaseIdentity::Upnp {
@@ -1386,20 +1603,24 @@ impl Client {
             .push(uncertain);
     }
 
-    fn clear_uncertain_upnp(
-        &self,
-        snapshot: GatewaySnapshot,
-        service: &upnp::UpnpService,
-        port: u16,
-    ) {
-        let _ = self.with_current_gateway(snapshot, |state| {
-            state.uncertain_releases.retain(|cached| {
-                cached.generation != snapshot.generation
-                    || cached.mapping.external.port() != port
-                    || !matches!(&cached.release, ReleaseIdentity::Upnp { service: old }
-                        if old.control_url == service.control_url && old.kind == service.kind)
-            });
-        });
+    fn clear_uncertain_ownership(&self, ownership_id: u64) {
+        self.inner
+            .state
+            .lock()
+            .expect("state lock")
+            .uncertain_releases
+            .retain(|cached| cached.ownership_id != ownership_id);
+    }
+
+    fn uncertain_ownership(&self, ownership_id: u64) -> Option<CachedMapping> {
+        self.inner
+            .state
+            .lock()
+            .expect("state lock")
+            .uncertain_releases
+            .iter()
+            .find(|cached| cached.ownership_id == ownership_id)
+            .cloned()
     }
 
     async fn retry_uncertain_upnp(
@@ -1433,10 +1654,9 @@ impl Client {
             };
             if confirmed {
                 let _ = self.with_current_gateway(snapshot, |state| {
-                    state.uncertain_releases.retain(|cached| {
-                        cached.generation != candidate.generation
-                            || cached.mapping.external.port() != candidate.mapping.external.port()
-                    });
+                    state
+                        .uncertain_releases
+                        .retain(|cached| cached.ownership_id != candidate.ownership_id);
                 });
             }
         }
@@ -1482,6 +1702,7 @@ impl Client {
             if !self.retry_uncertain_upnp(snapshot, svc, deadline).await {
                 continue;
             }
+            let pending_ownership = AtomicU64::new(0);
             let allocation = match upnp::add_port_mapping(
                 svc,
                 &internal_client,
@@ -1489,44 +1710,56 @@ impl Client {
                 prev_port,
                 crate::MAP_LIFETIME_SECS,
                 deadline,
+                |port, permanent| {
+                    let ownership_id = self.next_ownership_id();
+                    self.track_uncertain_upnp(ownership_id, snapshot, svc, port, permanent);
+                    pending_ownership.store(ownership_id, Ordering::SeqCst);
+                },
+                |_port, _permanent| {
+                    let ownership_id = pending_ownership.swap(0, Ordering::SeqCst);
+                    if ownership_id != 0 {
+                        self.clear_uncertain_ownership(ownership_id);
+                    }
+                },
             )
             .await
             {
                 Ok(allocation) => allocation,
                 Err(error) => {
-                    let _ = &error.source;
-                    if upnp::delete_port_mapping(svc, error.port, deadline)
-                        .await
-                        .is_err()
-                    {
-                        self.track_uncertain_upnp(snapshot, svc, error.port, error.permanent);
+                    let _ = (&error.source, error.port, error.permanent);
+                    let ownership_id = pending_ownership.load(Ordering::SeqCst);
+                    if ownership_id != 0 {
+                        if let Some(cached) = self.uncertain_ownership(ownership_id) {
+                            if self.do_release(cached.clone()).await {
+                                self.clear_uncertain_release(&cached);
+                            }
+                        }
                     }
                     continue;
                 }
             };
             let ext_port = allocation.port;
-            if self.retained_key_conflicts(svc, ext_port) {
-                if upnp::delete_port_mapping(svc, ext_port, deadline)
-                    .await
-                    .is_err()
-                {
-                    self.track_uncertain_upnp(snapshot, svc, ext_port, allocation.permanent);
+            let ownership_id = pending_ownership.load(Ordering::SeqCst);
+            assert_ne!(
+                ownership_id, 0,
+                "successful UPnP Add owns a cleanup ledger entry"
+            );
+            if self.retained_key_conflicts(svc, ext_port, Some(ownership_id)) {
+                if let Some(cached) = self.uncertain_ownership(ownership_id) {
+                    if self.do_release(cached.clone()).await {
+                        self.clear_uncertain_release(&cached);
+                    }
                 }
                 continue;
             }
-            // From this point onward the router may own the mapping. Persist
-            // the cleanup identity before the next await so supervisor abort
-            // or shutdown cannot lose the AddPortMapping result.
-            self.track_uncertain_upnp(snapshot, svc, ext_port, allocation.permanent);
 
             let ext_ip = if let Ok(ip) = upnp::get_external_ip(svc, deadline).await {
                 ip
             } else {
-                if upnp::delete_port_mapping(svc, ext_port, deadline)
-                    .await
-                    .is_ok()
-                {
-                    self.clear_uncertain_upnp(snapshot, svc, ext_port);
+                if let Some(cached) = self.uncertain_ownership(ownership_id) {
+                    if self.do_release(cached.clone()).await {
+                        self.clear_uncertain_release(&cached);
+                    }
                 }
                 continue;
             };
@@ -1540,6 +1773,7 @@ impl Client {
                 renew_after: now + lifetime / 2,
             };
             let cached = CachedMapping {
+                ownership_id,
                 mapping: mapping.clone(),
                 generation: snapshot.generation,
                 release: ReleaseIdentity::Upnp {
@@ -1550,14 +1784,15 @@ impl Client {
             if self
                 .with_current_gateway(snapshot, |state| {
                     state.mapping = Some(cached.clone());
-                    state.uncertain_releases.retain(|uncertain| {
-                        uncertain.generation != snapshot.generation
-                            || uncertain.mapping.external.port() != ext_port
-                    });
+                    state
+                        .uncertain_releases
+                        .retain(|uncertain| uncertain.ownership_id != ownership_id);
                 })
                 .is_none()
             {
-                self.do_release(cached).await;
+                if self.do_release(cached.clone()).await {
+                    self.clear_uncertain_release(&cached);
+                }
                 return None;
             }
             return Some(mapping);
@@ -1567,6 +1802,10 @@ impl Client {
 
     /// Get the cached mapping, if any (without starting creation).
     pub fn cached_mapping(&self) -> Option<Mapping> {
+        self.reap_completed_tasks();
+        if self.inner.closed.load(Ordering::SeqCst) {
+            return None;
+        }
         let snapshot = self.observe_gateway();
         snapshot.info?;
         self.with_current_gateway(snapshot, |state| {
@@ -1597,6 +1836,8 @@ mod tests {
         ReleaseTestGate,
     };
     use crate::upnp::UpnpService;
+    use crate::{pcp, pmp};
+    use tokio::net::UdpSocket;
 
     fn test_mapping(external: SocketAddr) -> Mapping {
         test_mapping_at(external, Instant::now())
@@ -1617,6 +1858,7 @@ mod tests {
         let mut state = client.inner.state.lock().unwrap();
         let gateway = state.gateway.expect("test gateway");
         state.mapping = Some(CachedMapping {
+            ownership_id: client.next_ownership_id(),
             mapping: test_mapping_at(external, now),
             generation: state.gateway_generation,
             release: ReleaseIdentity::Pcp {
@@ -1679,6 +1921,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn owned_task_sets_stay_bounded_under_cache_and_allocation_churn() {
+        let gateway = GatewayInfo {
+            gateway: Ipv4Addr::LOCALHOST,
+            self_ip: Ipv4Addr::new(192, 0, 2, 2),
+        };
+        let client = Client::with_config(ClientConfig {
+            gateway_lookup: Some(Box::new(move || Some(gateway))),
+        });
+        let snapshot = client.observe_gateway();
+        {
+            let mut state = client.inner.state.lock().unwrap();
+            assert_eq!(state.gateway_generation, snapshot.generation);
+            state.needs_probe = false;
+            state.last_probe = Some(client.now());
+        }
+
+        for iteration in 0..2_000 {
+            let _ = client.create_or_get_mapping().await;
+            let (allocations, releases, launchers) = client.owned_task_counts();
+            assert!(allocations <= 1, "allocation handles grew at {iteration}");
+            assert!(releases <= 1, "release handles grew at {iteration}");
+            assert!(launchers <= 1, "launcher handles grew at {iteration}");
+        }
+        for iteration in 0..5_000 {
+            let _ = client.get_cached_mapping_or_start_creating_one();
+            if iteration % 32 == 0 {
+                tokio::task::yield_now().await;
+            }
+            let (allocations, releases, launchers) = client.owned_task_counts();
+            assert!(allocations <= 1, "allocation handles grew at {iteration}");
+            assert!(releases <= 1, "release handles grew at {iteration}");
+            assert!(launchers <= 1, "launcher handles grew at {iteration}");
+        }
+        for iteration in 0..2_000 {
+            client
+                .inner
+                .work
+                .lock()
+                .unwrap()
+                .release_tasks
+                .spawn(async {});
+            tokio::task::yield_now().await;
+            let (_, releases, _) = client.owned_task_counts();
+            assert!(releases <= 1, "release handles grew at {iteration}");
+        }
+        client.shutdown(Duration::from_secs(2)).await.unwrap();
+        assert_eq!(client.owned_task_counts(), (0, 0, 0));
+    }
+
+    #[tokio::test]
     async fn release_watch_cannot_miss_terminal_transition() {
         let client = Client::new();
         client.register_release();
@@ -1692,6 +1984,156 @@ mod tests {
             .await
             .expect("watch waiter missed terminal state")
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn pmp_request_owns_key_before_response() {
+        let router = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let gateway = GatewayInfo {
+            gateway: Ipv4Addr::LOCALHOST,
+            self_ip: Ipv4Addr::new(192, 0, 2, 2),
+        };
+        let client = Client::with_config(ClientConfig {
+            gateway_lookup: Some(Box::new(move || Some(gateway))),
+        });
+        client.set_test_pxp_port(router.local_addr().unwrap().port());
+        client.set_local_port(41641);
+        client.observe_gateway();
+        {
+            let mut state = client.inner.state.lock().unwrap();
+            state.needs_probe = false;
+            state.last_probe = Some(client.now());
+            state.pmp_pub_ip = Some(Ipv4Addr::new(198, 51, 100, 7));
+            state.pmp_pub_ip_time = Some(client.now());
+        }
+
+        let operation_client = client.clone();
+        let operation = tokio::spawn(async move { operation_client.create_or_get_mapping().await });
+        let mut request = [0_u8; 64];
+        let (size, source) = router.recv_from(&mut request).await.unwrap();
+        assert_eq!(size, 12);
+        {
+            let state = client.inner.state.lock().unwrap();
+            let pending = state
+                .uncertain_releases
+                .iter()
+                .find(|cached| matches!(cached.release, ReleaseIdentity::Pmp { .. }))
+                .expect("PMP ownership must precede send completion");
+            assert_eq!(pending.mapping.external.port(), 0);
+            assert!(matches!(
+                pending.release,
+                ReleaseIdentity::Pmp {
+                    internal_port: 41641,
+                    ..
+                }
+            ));
+        }
+
+        let mut response = [0_u8; 16];
+        response[1] = pmp::PMP_OP_REPLY | pmp::PMP_OP_MAP_UDP;
+        response[8..10].copy_from_slice(&41641_u16.to_be_bytes());
+        response[10..12].copy_from_slice(&4242_u16.to_be_bytes());
+        response[12..16].copy_from_slice(&crate::MAP_LIFETIME_SECS.to_be_bytes());
+        router.send_to(&response, source).await.unwrap();
+        let mapping = operation.await.unwrap().unwrap();
+        assert_eq!(mapping.kind, MappingKind::Pmp);
+        assert!(client
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .uncertain_releases
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn pcp_request_owns_nonce_and_key_before_response() {
+        let router = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let gateway = GatewayInfo {
+            gateway: Ipv4Addr::LOCALHOST,
+            self_ip: Ipv4Addr::new(192, 0, 2, 2),
+        };
+        let client = Client::with_config(ClientConfig {
+            gateway_lookup: Some(Box::new(move || Some(gateway))),
+        });
+        client.set_test_pxp_port(router.local_addr().unwrap().port());
+        client.set_local_port(41641);
+        let snapshot = client.observe_gateway();
+        {
+            let mut state = client.inner.state.lock().unwrap();
+            state.needs_probe = false;
+            state.last_probe = Some(client.now());
+            state.pcp_saw_time = Some(client.now());
+        }
+
+        let operation_client = client.clone();
+        let operation = tokio::spawn(async move { operation_client.create_or_get_mapping().await });
+        let mut request = [0_u8; 128];
+        let (size, source) = router.recv_from(&mut request).await.unwrap();
+        assert_eq!(size, 60);
+        let mut nonce = [0_u8; 12];
+        nonce.copy_from_slice(&request[24..36]);
+        {
+            let state = client.inner.state.lock().unwrap();
+            let pending = state
+                .uncertain_releases
+                .iter()
+                .find(|cached| matches!(cached.release, ReleaseIdentity::Pcp { .. }))
+                .expect("PCP ownership must precede send completion");
+            assert_eq!(pending.generation, snapshot.generation);
+            assert_eq!(pending.mapping.external.port(), 0);
+            match pending.release {
+                ReleaseIdentity::Pcp {
+                    internal_port,
+                    nonce: pending_nonce,
+                    ..
+                } => {
+                    assert_eq!(internal_port, 41641);
+                    assert_eq!(pending_nonce, nonce);
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        let response = pcp::build_map_response(&request[..size]);
+        router.send_to(&response, source).await.unwrap();
+        let mapping = operation.await.unwrap().unwrap();
+        assert_eq!(mapping.kind, MappingKind::Pcp);
+        assert!(client
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .uncertain_releases
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalidation_registers_cleanup_task_before_unlock() {
+        let gateway = GatewayInfo {
+            gateway: Ipv4Addr::LOCALHOST,
+            self_ip: Ipv4Addr::new(192, 168, 1, 2),
+        };
+        let client = Client::with_config(ClientConfig {
+            gateway_lookup: Some(Box::new(move || Some(gateway))),
+        });
+        client.observe_gateway();
+        seed_mapping_state(&client, "198.51.100.9:45000".parse().unwrap());
+        let gate = ReleaseTestGate::new();
+        client.set_test_release_gate(Some(gate.clone()));
+
+        client.invalidate_mappings(true);
+        {
+            let work = client.inner.work.lock().unwrap();
+            assert_eq!(work.pending_releases, 1);
+            assert_eq!(work.release_tasks.len(), 1);
+        }
+        gate.wait_reached().await;
+        gate.resume().await;
+        client.wait_for_pending_releases().await;
+        client.reap_completed_tasks();
+        assert_eq!(client.owned_task_counts().1, 0);
+        client.set_test_release_gate(None);
     }
 
     #[tokio::test]
@@ -1709,6 +2151,7 @@ mod tests {
         {
             let mut state = client.inner.state.lock().unwrap();
             state.mapping = Some(CachedMapping {
+                ownership_id: client.next_ownership_id(),
                 mapping: Mapping {
                     external: "198.51.100.9:45000".parse().unwrap(),
                     kind: MappingKind::Upnp,
@@ -1823,6 +2266,7 @@ mod tests {
         let captured_a = {
             let mut state = client.inner.state.lock().unwrap();
             state.mapping = Some(CachedMapping {
+                ownership_id: client.next_ownership_id(),
                 mapping: mapping_a,
                 generation: snapshot_a.generation,
                 release: ReleaseIdentity::Pcp {
@@ -1837,6 +2281,7 @@ mod tests {
             state.gateway_generation += 1;
             state.gateway = Some(gateway_b);
             state.mapping = Some(CachedMapping {
+                ownership_id: client.next_ownership_id(),
                 mapping: mapping_b.clone(),
                 generation: state.gateway_generation,
                 release: ReleaseIdentity::Pcp {
@@ -1897,6 +2342,7 @@ mod tests {
         state.gateway_generation = 7;
         state.upnp_services.insert("old".into(), service.clone());
         state.mapping = Some(CachedMapping {
+            ownership_id: client.next_ownership_id(),
             mapping: Mapping {
                 external: "198.51.100.3:42000".parse().unwrap(),
                 kind: MappingKind::Upnp,
@@ -1932,6 +2378,7 @@ mod tests {
             .unwrap()
             .uncertain_releases
             .push(CachedMapping {
+                ownership_id: client.next_ownership_id(),
                 mapping: Mapping {
                     external: "198.51.100.10:4242".parse().unwrap(),
                     kind: MappingKind::Pcp,
@@ -1947,8 +2394,8 @@ mod tests {
                 },
                 lease_expires: Some(Instant::now() + Duration::from_secs(3600)),
             });
-        assert!(client.retained_port_conflicts(4242));
-        assert!(!client.retained_port_conflicts(4243));
+        assert!(client.retained_port_conflicts(4242, None));
+        assert!(!client.retained_port_conflicts(4243, None));
     }
 
     #[tokio::test]
@@ -1972,6 +2419,7 @@ mod tests {
             stale_client.with_current_gateway(stale_snapshot, |state| {
                 let now = Instant::now();
                 state.mapping = Some(CachedMapping {
+                    ownership_id: stale_client.next_ownership_id(),
                     mapping: test_mapping(SocketAddr::V4(SocketAddrV4::new(
                         Ipv4Addr::new(203, 0, 113, 9),
                         41641,

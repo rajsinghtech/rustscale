@@ -170,6 +170,8 @@ pub(crate) async fn add_port_mapping(
     external_port: u16,
     lease_duration: u32,
     deadline: Duration,
+    mut before_send: impl FnMut(u16, bool),
+    mut rejected: impl FnMut(u16, bool),
 ) -> Result<UpnpAllocation, AmbiguousAddError> {
     let port = if external_port < 1024 {
         random_port()
@@ -192,6 +194,7 @@ pub(crate) async fn add_port_mapping(
         "rustscale-portmap",
         lease_duration,
     );
+    before_send(port, false);
     let (status, resp) = http::http_post_soap(
         &svc.control_url,
         &soap_action,
@@ -213,8 +216,10 @@ pub(crate) async fn add_port_mapping(
         });
     }
 
-    // Check for UPnP error codes 725 or 402 — retry with permanent lease.
-    if let Some(code) = extract_upnp_error_code(&resp) {
+    // Only a structurally valid SOAP Fault proves that Add was rejected.
+    // Malformed HTTP responses remain ambiguous and retain ownership.
+    if let Some(code) = soap_fault_code(&resp) {
+        rejected(port, false);
         if code == 725 || code == 402 {
             let body = build_add_port_mapping_soap(
                 service_type,
@@ -227,6 +232,7 @@ pub(crate) async fn add_port_mapping(
                 "rustscale-portmap",
                 0,
             );
+            before_send(port, true);
             let (status, resp) = http::http_post_soap(
                 &svc.control_url,
                 &soap_action,
@@ -245,6 +251,9 @@ pub(crate) async fn add_port_mapping(
                     port,
                     permanent: true,
                 });
+            }
+            if soap_fault_code(&resp).is_some() {
+                rejected(port, true);
             }
             return Err(AmbiguousAddError {
                 port,
@@ -307,9 +316,14 @@ fn delete_response_is_success(status: u16, response: &str) -> bool {
 }
 
 fn soap_not_found(body: &str) -> bool {
-    parse_xml_elements(body).is_some_and(|elements| {
-        has_strict_soap_body(&elements, "Fault") && extract_upnp_error_code(body) == Some(714)
-    })
+    soap_fault_code(body) == Some(714)
+}
+
+fn soap_fault_code(body: &str) -> Option<u32> {
+    let elements = parse_xml_elements(body)?;
+    has_strict_soap_body(&elements, "Fault")
+        .then(|| extract_upnp_error_code(body))
+        .flatten()
 }
 
 fn soap_response_is_success(body: &str, response_element: &str) -> bool {
@@ -353,6 +367,9 @@ fn parse_xml_elements(xml: &str) -> Option<Vec<XmlElement>> {
     let mut elements = Vec::new();
     let mut rest = xml;
     while let Some(start) = rest.find('<') {
+        if stack.is_empty() && !rest[..start].trim().is_empty() {
+            return None;
+        }
         rest = &rest[start + 1..];
         let end = rest.find('>')?;
         let mut token = rest[..end].trim();
@@ -382,7 +399,7 @@ fn parse_xml_elements(xml: &str) -> Option<Vec<XmlElement>> {
             }
         }
     }
-    stack.is_empty().then_some(elements)
+    (stack.is_empty() && !elements.is_empty() && rest.trim().is_empty()).then_some(elements)
 }
 
 /// Get the external IP address via SOAP GetExternalIPAddress.
@@ -414,12 +431,37 @@ pub(crate) async fn get_external_ip(
             "GetExternalIPAddress failed (status={status})"
         )));
     }
-    let ip_str = extract_tag_text(&resp, "NewExternalIPAddress").ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "no NewExternalIPAddress in response",
-        )
+    parse_external_ip_response(&resp)
+}
+
+fn parse_external_ip_response(resp: &str) -> Result<Ipv4Addr, std::io::Error> {
+    let elements = parse_xml_elements(resp).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "malformed SOAP response")
     })?;
+    if !has_strict_soap_body(&elements, "GetExternalIPAddressResponse") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid GetExternalIPAddress SOAP structure",
+        ));
+    }
+    let response_children: Vec<_> = elements
+        .iter()
+        .filter(|element| element.parent.as_deref() == Some("GetExternalIPAddressResponse"))
+        .collect();
+    if response_children.len() != 1 || response_children[0].name != "NewExternalIPAddress" {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid GetExternalIPAddress response fields",
+        ));
+    }
+    let ip_str = extract_tag_text(resp, "NewExternalIPAddress")
+        .filter(|ip| !ip.is_empty())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "no NewExternalIPAddress in response",
+            )
+        })?;
     let ip: Ipv4Addr = ip_str.parse().map_err(|_| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -469,10 +511,10 @@ fn build_add_port_mapping_soap(
     )
 }
 
-/// Whether a SOAP response body contains a Fault element.
+/// Whether a SOAP response body is structurally a SOAP Fault.
 #[cfg(test)]
 fn is_soap_fault(body: &str) -> bool {
-    body.contains("<s:Fault>") || body.contains("<SOAP:Fault>") || body.contains("<Fault>")
+    parse_xml_elements(body).is_some_and(|elements| has_strict_soap_body(&elements, "Fault"))
 }
 
 /// Extract the UPnP error code from a SOAP fault response.
@@ -638,6 +680,40 @@ mod tests {
             "<Envelope><Body><AddPortMappingResponse/><AddPortMappingResponse/></Body></Envelope>",
             "AddPortMappingResponse"
         ));
+    }
+
+    #[test]
+    fn external_ip_requires_exact_soap_structure() {
+        let valid = "<x:Envelope><x:Body><u:GetExternalIPAddressResponse><z:NewExternalIPAddress>198.51.100.7</z:NewExternalIPAddress></u:GetExternalIPAddressResponse></x:Body></x:Envelope>";
+        assert_eq!(
+            parse_external_ip_response(valid).unwrap(),
+            Ipv4Addr::new(198, 51, 100, 7)
+        );
+        for invalid in [
+            "<Envelope><Body><NewExternalIPAddress>198.51.100.7</NewExternalIPAddress></Body></Envelope>",
+            "<Envelope><Body><GetExternalIPAddressResponse><wrapper><NewExternalIPAddress>198.51.100.7</NewExternalIPAddress></wrapper></GetExternalIPAddressResponse></Body></Envelope>",
+            "<Envelope><Body><GetExternalIPAddressResponse><NewExternalIPAddress>198.51.100.7</NewExternalIPAddress><extra/></GetExternalIPAddressResponse></Body></Envelope>",
+            "<Envelope><Body><GetExternalIPAddressResponse><NewExternalIPAddress/></GetExternalIPAddressResponse></Body></Envelope>",
+            "<Envelope><Body><Fault><NewExternalIPAddress>198.51.100.7</NewExternalIPAddress></Fault></Body></Envelope>",
+        ] {
+            assert!(parse_external_ip_response(invalid).is_err(), "accepted {invalid}");
+        }
+    }
+
+    #[test]
+    fn fallback_fault_requires_direct_soap_structure() {
+        assert_eq!(
+            soap_fault_code("<s:Envelope><s:Body><s:Fault><errorCode>725</errorCode></s:Fault></s:Body></s:Envelope>"),
+            Some(725)
+        );
+        assert_eq!(
+            soap_fault_code("<s:Envelope><s:Body><wrapper><s:Fault><errorCode>725</errorCode></s:Fault></wrapper></s:Body></s:Envelope>"),
+            None
+        );
+        assert_eq!(
+            soap_fault_code("<s:Envelope><s:Body><s:Fault/><extra><errorCode>725</errorCode></extra></s:Body></s:Envelope>"),
+            None
+        );
     }
 
     #[test]

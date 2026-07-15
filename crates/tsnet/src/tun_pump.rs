@@ -1782,6 +1782,7 @@ pub(crate) fn build_router_config(
     tun_name: &str,
 ) -> Result<rustscale_router::RouterConfig, TsnetError> {
     let prefixes = if route_table.exit_node_requested() {
+        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
         let mut prefixes =
             rustscale_tsaddr::local_interface_prefixes(tun_name).map_err(|error| {
                 TsnetError::Builder(format!("enumerate connected interface prefixes: {error}"))

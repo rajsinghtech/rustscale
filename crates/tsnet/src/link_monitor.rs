@@ -99,6 +99,7 @@ fn security_prefixes_from_state(
     state: &rustscale_netmon::State,
     rustscale_tun_name: &str,
 ) -> Result<Vec<rustscale_tsaddr::IpPrefix>, String> {
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
     let mut prefixes = connected_prefixes_from_state(state, rustscale_tun_name)?;
     #[cfg(target_os = "macos")]
     {

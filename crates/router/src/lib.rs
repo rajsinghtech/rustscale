@@ -1878,7 +1878,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_direct_block_checks_match_only_exact_owned_rule() {
-        let platform = LinuxPlatform::new("tailscale0");
+        let platform = LinuxPlatform::new_with_interface_index("tailscale0", 2);
         let pref = platform.rule_base.unwrap().to_string();
         let owned = format!(
             "{pref}: not from all fwmark 0x80000/0xff0000 unreachable proto {}\n",
@@ -2265,6 +2265,37 @@ mod tests {
                     exit_code: Some(2),
                     stderr: "RTNETLINK answers: File exists".into(),
                 }),
+            }
+        }
+
+        fn output(&mut self, program: &str, args: &[String]) -> Result<String, RouterError> {
+            self.run(program, args)?;
+            let Some(family) = args.first() else {
+                return Ok(String::new());
+            };
+            let Some(pref) = args
+                .windows(2)
+                .find_map(|pair| (pair[0] == "pref").then_some(pair[1].as_str()))
+            else {
+                return Ok(String::new());
+            };
+            let active = self.commands[..self.commands.len() - 1]
+                .iter()
+                .rev()
+                .find(|(_, prior)| {
+                    prior.first() == Some(family)
+                        && prior.windows(2).any(|pair| pair == ["pref", pref])
+                        && prior.iter().any(|arg| arg == "not")
+                        && prior.iter().any(|arg| arg == "unreachable")
+                })
+                .is_some_and(|(_, prior)| prior.iter().any(|arg| arg == "add"));
+            if active {
+                Ok(format!(
+                    "{pref}: not from all fwmark 0x80000/0xff0000 unreachable proto {}\n",
+                    LinuxPlatform::RULE_PROTOCOL
+                ))
+            } else {
+                Ok(String::new())
             }
         }
     }

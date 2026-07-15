@@ -41,7 +41,7 @@ const SENDMMSG_FLAGS: libc::c_int = libc::MSG_DONTWAIT as libc::c_int;
 const SENDMMSG_FLAGS: libc::c_uint = libc::MSG_DONTWAIT as libc::c_uint;
 
 type Packet = [u8; LOGICAL_PACKET_CAPACITY];
-type KernelPacket = [u8; KERNEL_PACKET_CAPACITY];
+type KernelPacket = [u8];
 /// Total fixed receive storage. 128 boxes are always installed in recvmmsg
 /// scratch, leaving exactly 384 independently reserved detachable buffers.
 /// This is exactly 1 MiB of pooled fast-path payload storage; separate
@@ -807,7 +807,7 @@ impl ReceiveBatch {
             packets: (0..MAX_BATCH).map(|_| pool.take_scratch()).collect(),
             pool,
             kernel_packets: (0..MAX_BATCH)
-                .map(|_| Box::new([0; KERNEL_PACKET_CAPACITY]))
+                .map(|_| vec![0; KERNEL_PACKET_CAPACITY].into_boxed_slice())
                 .collect(),
             kernel_backed: vec![false; MAX_BATCH],
             gro_packets: gro_enabled.then(|| vec![vec![0; GRO_PACKET_CAPACITY]; GRO_TAIL_SLOTS]),
@@ -965,11 +965,9 @@ impl ReceiveBatch {
             // Split accounting is complete before a periodic snapshot makes
             // this batch observable to benchmark artifacts.
             GRO_STATS.note_kernel_messages(kernel_messages);
-        } else {
-            if let Err(error) = self.finish_plain(received) {
-                GRO_STATS.note_dropped_batch(received, &error);
-                return Err(error);
-            }
+        } else if let Err(error) = self.finish_plain(received) {
+            GRO_STATS.note_dropped_batch(received, &error);
+            return Err(error);
         }
         Ok(self.len())
     }

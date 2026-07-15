@@ -151,7 +151,7 @@ real JSON).
 | In-process IP prefix set (`net/ipset`) | ✅ `crates/ipset` ports the actual cross-platform upstream package: `false_contains_ip_func` and `new_contains_ip_func` build immutable IPv4/IPv6 membership predicates with the same empty, one/two-host, host-map, small linear-prefix, and larger ART-backed strategy selection. Prefix host bits are normalized for membership and address families remain distinct. The API exposes no iteration or serialization order. All upstream vectors and deterministic randomized differential tests against linear prefix containment pass; no kernel `ipset` command management is included. |
 | envknob | ✅ wired: `TS_NO_LOGS_NO_SUPPORT`, `TS_ALLOW_ADMIN_CONSOLE_REMOTE_UPDATE`, `TS_WAKE_MAC`, `TS_DEBUG_USE_DERP_HTTP`, `TS_DNS_FORWARD_SKIP_TCP_RETRY`, `TS_PANIC_IF_HIT_MAIN_CONTROL`; `TSNET_FORCE_LOGIN` is intentionally skipped because tsnet has no cached-Running-state auth bypass |
 | Version package | ✅ build.rs git describe --tags --long --always --dirty → RUSTSCALE_VERSION_LONG; fallback CARGO_PKG_VERSION |
-| Freedesktop/DBus | ⬜ |
+| Freedesktop/DBus | 🔶 `crates/freedesktop` provides conservative Linux desktop/session detection, Desktop Entry `Exec` quoting, bounded shell-free HTTP(S) URL opening (`xdg-open` with `gio` fallback), and session-bus-aware notifications through `notify-send`, with injectable environment/command transports and hermetic tests. `rustscale web` opens its loopback URL by default (`--browser=false` disables it) and gracefully remains headless. Deferred: direct DBus bindings, systemd-user unit management, tray/GUI, and Linux multi-user desktop-session tracking. |
 | System tray | ⬜ |
 | Captive portal detection | ✅ full Detector with concurrent HTTP GETs, available_endpoints() from DERPMap, response_looks_like_captive(), wired into netcheck prober + health Tracker WARN_CAPTIVE_PORTAL |
 
@@ -248,7 +248,7 @@ state-dir fallback probing), `--json`.
 | `cert` | `cli/cert.go` | ✅ `cert [--cert-file] [--key-file] [--min-validity] <domain>`; writes files, `-`=stdout; no-domain prints cert domains from status |
 | `file` | `cli/file.go` | ✅ `file cp [--name] [--verbose] [--targets] <files...> <target>:`; `file get [--wait] [--conflict=skip\|overwrite\|rename] [--verbose] <dir>` |
 | `ssh` | `cli/ssh.go` | ✅ `ssh [user@]host [args...]`; resolves peer, writes known_hosts, execs system ssh; 29 unit tests |
-| `web` | `cli/web.go` | ✅ embedded single-file HTML; endpoints: /api/status/up/down/logout; --readonly, --unsafe-any-addr; 23 unit tests |
+| `web` | `cli/web.go` | ✅ embedded single-file HTML; endpoints: /api/status/up/down/logout; --readonly, --unsafe-any-addr; Linux loopback browser opening through the bounded freedesktop transport (`--browser=false` disables); 23 unit tests |
 | `debug` | `cli/debug.go` | ✅ `debug <status\|metrics\|ipconfig>` |
 | `exit-node` | `cli/exitnode.go` | ✅ lists exit-node-capable peers; `--suggest` for SuggestedExitNode; cannot select exit node via CLI |
 | `dns` | `cli/dns.go` | ✅ queries daemon DNS resolver or prints MagicDNS status; `--type`, `--json` |

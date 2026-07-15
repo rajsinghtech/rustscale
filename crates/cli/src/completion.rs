@@ -233,6 +233,7 @@ const COMMANDS: &[CommandSpec] = &[
         "web",
         &[
             flag("--listen", FlagValue::Value),
+            flag("--browser", FlagValue::Bool),
             flag("--readonly", FlagValue::Bool),
             flag("--unsafe-any-addr", FlagValue::Bool),
         ],

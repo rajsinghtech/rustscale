@@ -212,7 +212,7 @@ fn usage(bin: &str) {
     eprintln!(
         "  ssh [user@]host [args...]            SSH to a Tailscale machine (execs system ssh)"
     );
-    eprintln!("  web [--listen <addr>] [--readonly]   run a web UI for controlling rustscale");
+    eprintln!("  web [--listen <addr>] [--browser=false] run a web UI for controlling rustscale");
     eprintln!("  debug [status|ipconfig|metrics|capture] call daemon debug endpoints");
     eprintln!("  bugreport                            print diagnostic summary for bug reports");
     eprintln!("  exit-node [--list] [--suggest]       list or select exit nodes");

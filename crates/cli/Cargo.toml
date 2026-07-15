@@ -23,6 +23,7 @@ rustscale-tsnet = { path = "../tsnet", version = "0.1.1" }
 rustscale-ipnstate = { path = "../ipnstate", version = "0.1.1" }
 rustscale-speedtest = { path = "../speedtest", version = "0.1.1" }
 rustscale-clientupdate = { path = "../clientupdate", version = "0.1.1" }
+rustscale-freedesktop = { path = "../freedesktop", version = "0.1.1" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

@@ -71,6 +71,7 @@ pub async fn run(args: Vec<String>, socket: &Path) -> Result<(), CliError> {
     let listen = parse_str_flag(&args, "listen").unwrap_or_else(|| "localhost:8088".to_string());
     let readonly = parse_bool_flag(&args, "readonly").unwrap_or(false);
     let unsafe_any_addr = parse_bool_flag(&args, "unsafe-any-addr").unwrap_or(false);
+    let open_browser = parse_bool_flag(&args, "browser").unwrap_or(true);
 
     if !unsafe_any_addr && !is_loopback_addr(&listen) {
         return Err(CliError(format!(
@@ -87,10 +88,34 @@ pub async fn run(args: Vec<String>, socket: &Path) -> Result<(), CliError> {
     let addr = listener
         .local_addr()
         .map_err(|e| CliError(format!("local_addr: {e}")))?;
+    let url = format!("http://{addr}/");
     eprintln!(
-        "rustscale web listening on http://{addr} ({}readonly)",
+        "rustscale web listening on {url} ({}readonly)",
         if readonly { "" } else { "read-write, " }
     );
+
+    // Match upstream's local web-status behavior narrowly: only try to open a
+    // browser for a loopback listener, and never make desktop integration a
+    // prerequisite for serving. The command transport enforces its own short
+    // deadline and rejects non-HTTP(S) URLs.
+    if cfg!(target_os = "linux") && open_browser && addr.ip().is_loopback() {
+        tokio::task::spawn_blocking(move || {
+            use rustscale_freedesktop::{
+                DesktopSession, DesktopTransport, Freedesktop, IntegrationError,
+            };
+
+            let integration = Freedesktop::default();
+            let session = DesktopSession::detect();
+            if let Err(error) = integration.open_url(&session, &url) {
+                if !matches!(
+                    error,
+                    IntegrationError::NoGraphicalSession | IntegrationError::NoSessionBus
+                ) {
+                    eprintln!("web: could not open browser: {error}");
+                }
+            }
+        });
+    }
 
     serve(listener, client, readonly).await
 }

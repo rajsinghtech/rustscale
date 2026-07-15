@@ -1,0 +1,15 @@
+[package]
+name = "rustscale-freedesktop"
+description = "Bounded Linux freedesktop session, URL, and notification integration"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror.workspace = true
+url = "2"
+wait-timeout = "0.2"

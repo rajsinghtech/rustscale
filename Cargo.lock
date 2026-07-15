@@ -2998,6 +2998,7 @@ dependencies = [
  "if-addrs",
  "qrcode",
  "rustscale-clientupdate",
+ "rustscale-freedesktop",
  "rustscale-ipn",
  "rustscale-ipnstate",
  "rustscale-localclient",
@@ -3253,6 +3254,15 @@ version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "rustscale-freedesktop"
+version = "0.1.1"
+dependencies = [
+ "thiserror 1.0.69",
+ "url",
+ "wait-timeout",
 ]
 
 [[package]]

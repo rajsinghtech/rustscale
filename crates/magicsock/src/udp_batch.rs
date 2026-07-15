@@ -21,9 +21,12 @@ const MAX_GSO_SEGMENTS: usize = 64;
 const MAX_IPV4_PAYLOAD: usize = 65_507;
 const MAX_IPV6_PAYLOAD: usize = 65_527;
 /// Direct WireGuard, disco, and Geneve packets normally fit comfortably in
-/// this buffer. Larger ordinary UDP packets are deliberately rejected rather
-/// than silently truncated before they reach the protocol parsers.
-const LOGICAL_PACKET_CAPACITY: usize = 2_048;
+/// this pooled fast-path buffer.
+pub(crate) const LOGICAL_PACKET_CAPACITY: usize = 2_048;
+/// Matches WireGuard's accepted maximum and the scalar receiver's storage.
+/// Each plain recvmmsg slot uses a small pooled head plus this reusable tail,
+/// so an infrequent jumbo cannot truncate or discard the following packets.
+const KERNEL_PACKET_CAPACITY: usize = 65_536;
 const GRO_PACKET_CAPACITY: usize = 65_536;
 const GRO_TAIL_SLOTS: usize = 2;
 // libc does not expose this on every supported Linux libc target.
@@ -38,9 +41,11 @@ const SENDMMSG_FLAGS: libc::c_int = libc::MSG_DONTWAIT as libc::c_int;
 const SENDMMSG_FLAGS: libc::c_uint = libc::MSG_DONTWAIT as libc::c_uint;
 
 type Packet = [u8; LOGICAL_PACKET_CAPACITY];
+type KernelPacket = [u8];
 /// Total fixed receive storage. 128 boxes are always installed in recvmmsg
 /// scratch, leaving exactly 384 independently reserved detachable buffers.
-/// This is exactly 1 MiB of payload storage.
+/// This is exactly 1 MiB of pooled fast-path payload storage; separate
+/// per-slot kernel scratch is never detached into queued ciphertexts.
 pub(crate) const RECEIVE_BUFFER_POOL_CAPACITY: usize = 512;
 const RECEIVE_BUFFER_POOL_FREE_CAPACITY: usize = RECEIVE_BUFFER_POOL_CAPACITY;
 const RECEIVE_BUFFER_POOL_DETACHABLE_CAPACITY: usize = RECEIVE_BUFFER_POOL_CAPACITY - MAX_BATCH;
@@ -204,6 +209,9 @@ struct GroStats {
     coalesced_messages: AtomicU64,
     parse_failures: AtomicU64,
     permanent_fallbacks: AtomicU64,
+    dropped_batches: AtomicU64,
+    dropped_kernel_messages: AtomicU64,
+    drop_logged: AtomicBool,
     rxq_overflow_delta: AtomicU64,
     rxq_overflow_logged: AtomicBool,
     next_snapshot_kernel_messages: AtomicU64,
@@ -219,6 +227,9 @@ static GRO_STATS: GroStats = GroStats {
     coalesced_messages: AtomicU64::new(0),
     parse_failures: AtomicU64::new(0),
     permanent_fallbacks: AtomicU64::new(0),
+    dropped_batches: AtomicU64::new(0),
+    dropped_kernel_messages: AtomicU64::new(0),
+    drop_logged: AtomicBool::new(false),
     rxq_overflow_delta: AtomicU64::new(0),
     rxq_overflow_logged: AtomicBool::new(false),
     next_snapshot_kernel_messages: AtomicU64::new(GRO_SNAPSHOT_INTERVAL),
@@ -235,6 +246,8 @@ struct GroStatsSnapshot {
     coalesced_messages: u64,
     parse_failures: u64,
     permanent_fallbacks: u64,
+    dropped_batches: u64,
+    dropped_kernel_messages: u64,
     rxq_overflow_delta: u64,
 }
 
@@ -250,6 +263,8 @@ impl GroStats {
             coalesced_messages: self.coalesced_messages.load(Ordering::Relaxed),
             parse_failures: self.parse_failures.load(Ordering::Relaxed),
             permanent_fallbacks: self.permanent_fallbacks.load(Ordering::Relaxed),
+            dropped_batches: self.dropped_batches.load(Ordering::Relaxed),
+            dropped_kernel_messages: self.dropped_kernel_messages.load(Ordering::Relaxed),
             rxq_overflow_delta: self.rxq_overflow_delta.load(Ordering::Relaxed),
         }
     }
@@ -257,7 +272,7 @@ impl GroStats {
     fn emit_snapshot(&self, event: &str) {
         let snapshot = self.snapshot();
         eprintln!(
-            "rustscale: udp_gro_stats event={event} enable_success={} enable_unavailable={} rxq_enable_success={} rxq_enable_unavailable={} kernel_messages={} logical_datagrams={} coalesced_messages={} parse_failures={} permanent_fallbacks={} rxq_overflow_delta={}",
+            "rustscale: udp_gro_stats event={event} enable_success={} enable_unavailable={} rxq_enable_success={} rxq_enable_unavailable={} kernel_messages={} logical_datagrams={} coalesced_messages={} parse_failures={} permanent_fallbacks={} dropped_batches={} dropped_kernel_messages={} rxq_overflow_delta={}",
             snapshot.enable_success,
             snapshot.enable_unavailable,
             snapshot.rxq_enable_success,
@@ -267,6 +282,8 @@ impl GroStats {
             snapshot.coalesced_messages,
             snapshot.parse_failures,
             snapshot.permanent_fallbacks,
+            snapshot.dropped_batches,
+            snapshot.dropped_kernel_messages,
             snapshot.rxq_overflow_delta,
         );
     }
@@ -312,6 +329,24 @@ impl GroStats {
             snapshot.permanent_fallbacks,
             snapshot.rxq_overflow_delta,
         );
+    }
+
+    /// Count every rejected kernel batch but emit only the first diagnostic;
+    /// hostile traffic cannot turn validation failures into an unbounded log.
+    fn note_dropped_batch(&self, kernel_messages: usize, reason: &io::Error) {
+        self.dropped_batches.fetch_add(1, Ordering::Relaxed);
+        self.dropped_kernel_messages
+            .fetch_add(kernel_messages as u64, Ordering::Relaxed);
+        if self
+            .drop_logged
+            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            eprintln!(
+                "rustscale: Linux UDP batch dropped kernel_messages={kernel_messages}: {reason}"
+            );
+            self.emit_snapshot("batch_drop");
+        }
     }
 }
 
@@ -572,11 +607,14 @@ fn log_unsupported_capability(capability: &str, error: &io::Error) {
     eprintln!("rustscale: Linux {capability} unavailable: {error}");
 }
 
-/// True when this process is running against a kernel too old to provide the
-/// `recvmmsg` syscall. It is intentionally narrow: ordinary socket failures
-/// still follow the receive task's existing error handling.
+/// True when `recvmmsg` cannot be used by this process: either the kernel
+/// lacks it, or a seccomp/LSM policy rejects the syscall. Ordinary socket
+/// failures remain terminal receive-task errors.
 pub(crate) fn recvmmsg_is_unsupported(error: &io::Error) -> bool {
-    error.raw_os_error() == Some(libc::ENOSYS)
+    matches!(
+        error.raw_os_error(),
+        Some(libc::ENOSYS | libc::EPERM | libc::EACCES)
+    )
 }
 
 fn plan<T: AsRef<[u8]>>(addr: SocketAddr, datagrams: &[T]) -> ([PlannedMessage; MAX_BATCH], usize) {
@@ -681,20 +719,37 @@ fn set_segment_control(control: &mut Control, segment_size: u16) {
 /// Reusable `recvmmsg` scratch owned by one UDP receive task.
 ///
 /// The storage is allocated once when the task starts. Plain mode submits all
-/// 128 logical slots; GRO mode submits two 64 KiB tail slots and splits them
-/// into the same logical head buffers.
+/// 128 logical slots. Each slot writes into a 2 KiB pooled head and a bounded
+/// 64 KiB kernel tail; ordinary packets remain zero-copy detachable while a
+/// jumbo is retained in its reusable kernel scratch and handled sequentially.
+/// GRO mode submits two 64 KiB tail slots and splits them into the same
+/// logical head buffers.
 pub(crate) struct ReceiveBatch {
     gro_enabled: bool,
+    /// SO_RXQ_OVFL remains active after GRO falls back. Plain slot preparation
+    /// must therefore continue providing ancillary storage until the socket
+    /// is closed, or the kernel can report MSG_CTRUNC and lose a burst.
+    rxq_overflow_enabled: bool,
     /// Boxed fixed slots keep the kernel target stable even while an ordinary
     /// direct packet is detached for the consumer. `detach_datagram` replaces
     /// a slot before the next syscall and refreshes its iovec.
     #[allow(clippy::vec_box)]
     packets: Vec<Box<Packet>>,
     pool: ReceiveBufferPool,
+    /// One bounded kernel tail per plain slot. This is intentionally scratch,
+    /// not detached ownership: it avoids 512 jumbo-sized pooled buffers while
+    /// allowing every valid scalar-sized UDP payload to be received intact.
+    #[allow(clippy::vec_box)]
+    kernel_packets: Vec<Box<KernelPacket>>,
+    /// True when a published logical packet is backed by its kernel scratch
+    /// rather than a pooled fast-path head. Such a batch stays sequential.
+    kernel_backed: Vec<bool>,
     /// Present only while GRO is active. Dropping this after a permanent
     /// fallback immediately releases the two 64 KiB tail buffers; no syscall
     /// retains their pointers after it returns.
     gro_packets: Option<Vec<Vec<u8>>>,
+    /// Two iovecs per plain slot (fast head + kernel tail); GRO uses only the
+    /// first iovec in each of its two tail slots.
     iovecs: Vec<libc::iovec>,
     names: Vec<libc::sockaddr_storage>,
     controls: Vec<Control>,
@@ -719,34 +774,49 @@ impl ReceiveBatch {
     pub(crate) fn new(socket: &UdpSocket, disable_gro: bool) -> Self {
         let gro_enabled = !disable_gro && try_enable_udp_gro(socket);
         if disable_gro {
-            eprintln!(
-                "rustscale: Linux UDP GRO receive disabled (set RUSTSCALE_ENABLE_UDP_GRO=1 to opt in)"
-            );
+            eprintln!("rustscale: Linux UDP GRO receive disabled by RUSTSCALE_DISABLE_UDP_GRO");
         }
-        // Keep the default plain recvmmsg path identical to the last
-        // known-good implementation: no ancillary messages are requested.
-        // Queue-overflow accounting is part of the explicit GRO opt-in.
-        if gro_enabled {
-            let _ = enable_rxq_overflow(socket);
-        }
-        Self::with_gro(gro_enabled)
+        // The GRO path remains guarded by setup failure handling and its
+        // receive-time circuit breaker. Queue-overflow accounting is only
+        // requested when GRO is active.
+        let rxq_overflow_enabled = gro_enabled && enable_rxq_overflow(socket).is_ok();
+        eprintln!(
+            "rustscale: Linux UDP receive mode=batch gro={} rxq_overflow={}",
+            if gro_enabled { "enabled" } else { "plain" },
+            if rxq_overflow_enabled {
+                "enabled"
+            } else {
+                "disabled"
+            },
+        );
+        Self::with_gro_and_rxq(gro_enabled, rxq_overflow_enabled)
     }
 
+    #[cfg(test)]
     fn with_gro(gro_enabled: bool) -> Self {
+        Self::with_gro_and_rxq(gro_enabled, gro_enabled)
+    }
+
+    fn with_gro_and_rxq(gro_enabled: bool, rxq_overflow_enabled: bool) -> Self {
         let pool = ReceiveBufferPool::new();
         // These vectors never change length, so all pointer targets remain
         // stable for every recvmmsg call made by this batch.
         Self {
             gro_enabled,
+            rxq_overflow_enabled,
             packets: (0..MAX_BATCH).map(|_| pool.take_scratch()).collect(),
             pool,
+            kernel_packets: (0..MAX_BATCH)
+                .map(|_| vec![0; KERNEL_PACKET_CAPACITY].into_boxed_slice())
+                .collect(),
+            kernel_backed: vec![false; MAX_BATCH],
             gro_packets: gro_enabled.then(|| vec![vec![0; GRO_PACKET_CAPACITY]; GRO_TAIL_SLOTS]),
             iovecs: vec![
                 libc::iovec {
                     iov_base: ptr::null_mut(),
                     iov_len: 0,
                 };
-                MAX_BATCH
+                MAX_BATCH * 2
             ],
             // SAFETY: sockaddr_storage is a plain C storage struct; an all
             // zero value is valid prior to the kernel filling it.
@@ -776,7 +846,12 @@ impl ReceiveBatch {
         }
         let len = *self.lengths.get(index)?;
         let source = self.sources.get(index).copied().flatten()?;
-        Some((&self.packets[index][..len], source))
+        let data = if self.kernel_backed[index] {
+            &self.kernel_packets[index][..len]
+        } else {
+            &self.packets[index][..len]
+        };
+        Some((data, source))
     }
 
     /// Metadata for a published logical datagram without borrowing packet
@@ -802,6 +877,11 @@ impl ReceiveBatch {
         if index >= self.count {
             return None;
         }
+        // Jumbo packets deliberately stay on the established sequential path;
+        // they cannot consume a small pooled handoff slot.
+        if self.kernel_backed[index] {
+            return None;
+        }
         let len = *self.lengths.get(index)?;
         let source = self.sources.get(index).copied().flatten()?;
         let packet = self.pool.replace_and_detach(&mut self.packets[index], len);
@@ -816,7 +896,7 @@ impl ReceiveBatch {
     }
 
     fn refresh_iovec(&mut self, index: usize) {
-        self.iovecs[index] = libc::iovec {
+        self.iovecs[index * 2] = libc::iovec {
             iov_base: self.packets[index].as_mut_ptr().cast(),
             iov_len: LOGICAL_PACKET_CAPACITY,
         };
@@ -829,7 +909,7 @@ impl ReceiveBatch {
 
     #[cfg(test)]
     pub(crate) fn iovec_base(&self, index: usize) -> *mut libc::c_void {
-        self.iovecs[index].iov_base
+        self.iovecs[index * 2].iov_base
     }
 
     /// Receive one nonblocking kernel batch. `WouldBlock` is returned without
@@ -837,6 +917,7 @@ impl ReceiveBatch {
     pub(crate) fn recv(&mut self, socket: &UdpSocket) -> io::Result<usize> {
         self.lengths.fill(0);
         self.sources.fill(None);
+        self.kernel_backed.fill(false);
         self.count = 0;
         self.last_gro_payload_len = None;
 
@@ -870,6 +951,7 @@ impl ReceiveBatch {
             let kernel_messages = GRO_STATS.add_kernel_messages(received);
             if let Err(error) = self.split_gro_tail(first, received) {
                 GRO_STATS.parse_failures.fetch_add(1, Ordering::Relaxed);
+                GRO_STATS.note_dropped_batch(received, &error);
                 let reason = error.to_string();
                 self.disable_gro(socket, &reason)?;
                 // The failed syscall is unpublished. A bounded number of
@@ -883,8 +965,9 @@ impl ReceiveBatch {
             // Split accounting is complete before a periodic snapshot makes
             // this batch observable to benchmark artifacts.
             GRO_STATS.note_kernel_messages(kernel_messages);
-        } else {
-            self.finish_plain(received)?;
+        } else if let Err(error) = self.finish_plain(received) {
+            GRO_STATS.note_dropped_batch(received, &error);
+            return Err(error);
         }
         Ok(self.len())
     }
@@ -904,19 +987,28 @@ impl ReceiveBatch {
         } else {
             (&mut self.packets[index][..], LOGICAL_PACKET_CAPACITY)
         };
-        self.iovecs[index] = libc::iovec {
+        let first_iovec = index * 2;
+        self.iovecs[first_iovec] = libc::iovec {
             iov_base: data.as_mut_ptr().cast(),
             iov_len: capacity,
         };
+        if !self.gro_enabled {
+            self.iovecs[first_iovec + 1] = libc::iovec {
+                iov_base: self.kernel_packets[index][LOGICAL_PACKET_CAPACITY..]
+                    .as_mut_ptr()
+                    .cast(),
+                iov_len: KERNEL_PACKET_CAPACITY - LOGICAL_PACKET_CAPACITY,
+            };
+        }
         // SAFETY: a zeroed msghdr is valid before its pointer and length fields
         // below are initialized. Resetting it also resets kernel-written flags,
         // name lengths, control lengths, and mmsghdr.msg_len every syscall.
         let mut hdr: libc::msghdr = unsafe { mem::zeroed() };
         hdr.msg_name = ptr::addr_of_mut!(self.names[index]).cast();
         hdr.msg_namelen = mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-        hdr.msg_iov = ptr::addr_of_mut!(self.iovecs[index]);
-        hdr.msg_iovlen = 1;
-        if self.gro_enabled {
+        hdr.msg_iov = ptr::addr_of_mut!(self.iovecs[first_iovec]);
+        hdr.msg_iovlen = if self.gro_enabled { 1 } else { 2 };
+        if self.gro_enabled || self.rxq_overflow_enabled {
             hdr.msg_control = self.controls[index].as_mut_ptr();
             hdr.msg_controllen = RECEIVE_CONTROL_SPACE as _;
         }
@@ -928,8 +1020,9 @@ impl ReceiveBatch {
 
     fn finish_plain(&mut self, received: usize) -> io::Result<()> {
         self.count = 0;
+        self.kernel_backed.fill(false);
         for index in 0..received {
-            self.validate_message(index, LOGICAL_PACKET_CAPACITY)?;
+            self.validate_message(index, KERNEL_PACKET_CAPACITY)?;
             let control_len = normalize_control_len(self.headers[index].msg_hdr.msg_controllen)?;
             if control_len > RECEIVE_CONTROL_SPACE {
                 return invalid_data("kernel returned oversized ancillary data");
@@ -941,7 +1034,13 @@ impl ReceiveBatch {
             if let Some(rxq) = parsed.rxq_overflow {
                 self.record_rxq_overflow(rxq);
             }
-            self.lengths[index] = self.headers[index].msg_len as usize;
+            let length = self.headers[index].msg_len as usize;
+            if length > LOGICAL_PACKET_CAPACITY {
+                self.kernel_packets[index][..LOGICAL_PACKET_CAPACITY]
+                    .copy_from_slice(&self.packets[index][..]);
+                self.kernel_backed[index] = true;
+            }
+            self.lengths[index] = length;
             self.sources[index] = Some(socket_addr(
                 &self.names[index],
                 self.headers[index].msg_hdr.msg_namelen,
@@ -953,6 +1052,7 @@ impl ReceiveBatch {
 
     fn split_gro_tail(&mut self, first: usize, received: usize) -> io::Result<()> {
         self.count = 0;
+        self.kernel_backed.fill(false);
         let mut output = 0;
         for index in first..first + received {
             self.validate_message(index, GRO_PACKET_CAPACITY)?;
@@ -984,16 +1084,17 @@ impl ReceiveBatch {
                     .gro_size
                     .map_or(length, |size| (start + usize::from(size)).min(length));
                 let logical_len = end - start;
+                let input = &self
+                    .gro_packets
+                    .as_ref()
+                    .expect("GRO tail storage exists while GRO is enabled")[index - first]
+                    [start..end];
                 if logical_len > LOGICAL_PACKET_CAPACITY {
-                    return invalid_data("logical UDP packet exceeds receive buffer");
+                    self.kernel_packets[output][..logical_len].copy_from_slice(input);
+                    self.kernel_backed[output] = true;
+                } else {
+                    self.packets[output][..logical_len].copy_from_slice(input);
                 }
-                self.packets[output][..logical_len].copy_from_slice(
-                    &self
-                        .gro_packets
-                        .as_ref()
-                        .expect("GRO tail storage exists while GRO is enabled")[index - first]
-                        [start..end],
-                );
                 self.lengths[output] = logical_len;
                 self.sources[output] = Some(source);
                 output += 1;
@@ -1371,7 +1472,12 @@ mod tests {
     }
 
     fn set_plain_message(batch: &mut ReceiveBatch, index: usize, packet: &[u8], port: u16) {
-        batch.packets[index][..packet.len()].copy_from_slice(packet);
+        assert!(packet.len() <= KERNEL_PACKET_CAPACITY);
+        let head = packet.len().min(LOGICAL_PACKET_CAPACITY);
+        batch.packets[index][..head].copy_from_slice(&packet[..head]);
+        if packet.len() > head {
+            batch.kernel_packets[index][head..packet.len()].copy_from_slice(&packet[head..]);
+        }
         let address = sockaddr_in(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
         // SAFETY: sockaddr_storage is large and aligned enough for sockaddr_in.
         unsafe {
@@ -1465,6 +1571,20 @@ mod tests {
         assert!(!claim_rxq_overflow_event(1, &logged));
     }
 
+    #[test]
+    fn recvmmsg_seccomp_rejections_fall_back_but_socket_failures_do_not() {
+        for errno in [libc::ENOSYS, libc::EPERM, libc::EACCES] {
+            assert!(recvmmsg_is_unsupported(&io::Error::from_raw_os_error(
+                errno
+            )));
+        }
+        for errno in [libc::EBADF, libc::ECONNREFUSED, libc::EIO] {
+            assert!(!recvmmsg_is_unsupported(&io::Error::from_raw_os_error(
+                errno
+            )));
+        }
+    }
+
     fn packets(lengths: &[usize]) -> Vec<Vec<u8>> {
         lengths.iter().map(|&len| vec![0; len]).collect()
     }
@@ -1533,6 +1653,50 @@ mod tests {
             assert_eq!(packet, expected_packet);
             assert_eq!(source, expected_source);
         }
+    }
+
+    #[tokio::test]
+    async fn plain_recvmmsg_keeps_8k_9k_packets_and_neighbors_intact() {
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let receiver_addr = receiver.local_addr().unwrap();
+        let eight_k = vec![8; 8 * 1024];
+        let nine_k = vec![9; 9 * 1024];
+        for packet in [
+            b"before".as_slice(),
+            eight_k.as_slice(),
+            nine_k.as_slice(),
+            b"after",
+        ] {
+            sender.send_to(packet, receiver_addr).await.unwrap();
+        }
+
+        let mut batch = ReceiveBatch::new(&receiver, true);
+        assert_eq!(batch.recv(&receiver).unwrap(), 4);
+        assert_eq!(batch.datagram(0).unwrap().0, b"before");
+        assert_eq!(batch.datagram(1).unwrap().0, eight_k);
+        assert_eq!(batch.datagram(2).unwrap().0, nine_k);
+        assert_eq!(batch.datagram(3).unwrap().0, b"after");
+        assert_eq!(&batch.kernel_backed[..4], [false, true, true, false]);
+        assert!(batch.detach_datagram(1).is_none());
+    }
+
+    #[tokio::test]
+    async fn plain_recvmmsg_isolates_a_hostile_jumbo_without_dropping_neighbors() {
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let receiver_addr = receiver.local_addr().unwrap();
+        let jumbo = vec![0xA5; 65_507];
+        for packet in [b"before".as_slice(), jumbo.as_slice(), b"after"] {
+            sender.send_to(packet, receiver_addr).await.unwrap();
+        }
+
+        let mut batch = ReceiveBatch::new(&receiver, true);
+        assert_eq!(batch.recv(&receiver).unwrap(), 3);
+        assert_eq!(batch.datagram(0).unwrap().0, b"before");
+        assert_eq!(batch.datagram(1).unwrap().0, jumbo);
+        assert_eq!(batch.datagram(2).unwrap().0, b"after");
+        assert!(batch.kernel_backed[1]);
     }
 
     #[test]
@@ -2087,6 +2251,11 @@ mod tests {
         batch.finish_disabling_gro(Ok(()), "test fallback").unwrap();
         assert!(!batch.gro_enabled);
         batch.prepare_slot(0);
+        assert!(!batch.headers[0].msg_hdr.msg_control.is_null());
+        assert_eq!(
+            normalize_control_len(batch.headers[0].msg_hdr.msg_controllen).unwrap(),
+            RECEIVE_CONTROL_SPACE
+        );
         set_plain_message(&mut batch, 0, b"plain", 1234);
         let control_len = append_control(
             &mut batch.controls[0],
@@ -2224,40 +2393,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recv_circuit_breaker_disables_once_then_delivers_next_plain_batch() {
+    async fn gro_receiver_keeps_jumbo_packets_without_circuit_breaking() {
         let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let mut batch = ReceiveBatch::new(&receiver, false);
         if !batch.gro_enabled {
             return;
         }
-        let before = GRO_STATS.permanent_fallbacks.load(Ordering::Relaxed);
+        let jumbo = vec![0; 9 * 1024];
         sender
-            .send_to(
-                &[0; LOGICAL_PACKET_CAPACITY + 1],
-                receiver.local_addr().unwrap(),
-            )
-            .await
-            .unwrap();
-        receiver.readable().await.unwrap();
-        assert_eq!(batch.recv(&receiver).unwrap(), 0);
-        assert!(!batch.gro_enabled);
-        assert_eq!(
-            GRO_STATS.permanent_fallbacks.load(Ordering::Relaxed),
-            before + 1
-        );
-
-        sender
-            .send_to(b"plain", receiver.local_addr().unwrap())
+            .send_to(&jumbo, receiver.local_addr().unwrap())
             .await
             .unwrap();
         receiver.readable().await.unwrap();
         assert_eq!(batch.recv(&receiver).unwrap(), 1);
-        assert_eq!(batch.datagram(0).unwrap().0, b"plain");
-        assert_eq!(
-            GRO_STATS.permanent_fallbacks.load(Ordering::Relaxed),
-            before + 1
-        );
+        assert_eq!(batch.datagram(0).unwrap().0, jumbo);
+        assert!(batch.kernel_backed[0]);
+        assert!(batch.gro_enabled);
     }
 
     #[test]
@@ -2274,7 +2426,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kill_switch_keeps_recvmmsg_active_without_enabling_gro() {
+    async fn disabled_gro_keeps_plain_recvmmsg_active() {
         let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let mut batch = ReceiveBatch::new(&receiver, true);

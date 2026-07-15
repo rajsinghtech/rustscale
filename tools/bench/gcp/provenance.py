@@ -57,14 +57,32 @@ def has_reserved(value):
     return False
 
 
-def inbound_pipeline_enabled(run):
-    """Return the selected pipeline state; missing metadata is historical off."""
+def runtime_metadata(run):
+    """Validate and return recorded runtime metadata without inventing modes.
+
+    Historical manifests either omitted runtime metadata or recorded only the
+    inbound-pipeline flag. Their Linux batch/GRO state is unknown, so callers
+    that merely validate or aggregate them must preserve that absence.
+    """
     if "runtime" not in run:
-        return False
+        return None
     runtime = run["runtime"]
-    if not isinstance(runtime, dict) or set(runtime) != {"rs_tun_inbound_pipeline"} or type(runtime.get("rs_tun_inbound_pipeline")) is not bool:
+    required = {"rs_tun_inbound_pipeline", "linux_udp_batch", "linux_udp_gro"}
+    legacy = {"rs_tun_inbound_pipeline"}
+    if not isinstance(runtime, dict) or set(runtime) not in (required, legacy) or any(type(value) is not bool for value in runtime.values()):
         raise ValueError("invalid runtime metadata")
-    return runtime["rs_tun_inbound_pipeline"]
+    if set(runtime) == required and not runtime["linux_udp_batch"] and runtime["linux_udp_gro"]:
+        raise ValueError("linux_udp_gro requires linux_udp_batch")
+    return runtime
+
+
+def current_runtime_modes(run):
+    """Return complete runtime modes for a newly paid benchmark invocation."""
+    runtime = runtime_metadata(run)
+    required = {"rs_tun_inbound_pipeline", "linux_udp_batch", "linux_udp_gro"}
+    if runtime is None or set(runtime) != required:
+        raise ValueError("complete runtime modes are required for paid preflight")
+    return runtime
 
 
 def validate_run(run):
@@ -83,7 +101,7 @@ def validate_run(run):
     if not isinstance(cloud, dict) or cloud.get("provider") != "gcp" or any(not is_string(cloud.get(k)) for k in required_cloud[1:]) or type(cloud.get("disk_gb")) is not int or cloud["disk_gb"] <= 0: raise ValueError("invalid cloud metadata")
     build = run.get("build")
     if not isinstance(build, dict) or any(type(build.get(k)) is not str for k in ("command", "rustflags", "cargo_profile_release_lto", "cargo_profile_release_codegen_units")): raise ValueError("invalid build metadata")
-    inbound_pipeline_enabled(run)
+    runtime_metadata(run)
 
 
 def validate_manifest(manifest):
@@ -148,7 +166,9 @@ def command_manifest(args):
            "source": {"commit": args.commit, "delivery": "git-archive-head", "includes_uncommitted_changes": False, "launch_worktree_dirty": dirty},
            "cloud": {"provider": "gcp", "project": args.project, "requested_image_project": args.image_project, "requested_image_family": args.image_family, "requested_machine_type": args.machine, "network": args.network, "disk_type": args.disk_type, "disk_gb": args.disk_gb},
            "build": {"command": args.build_command, "rustflags": args.rustflags, "cargo_profile_release_lto": args.lto, "cargo_profile_release_codegen_units": args.codegen_units},
-           "runtime": {"rs_tun_inbound_pipeline": args.rs_tun_inbound_pipeline == "1"}}
+           "runtime": {"rs_tun_inbound_pipeline": args.rs_tun_inbound_pipeline == "1",
+                       "linux_udp_batch": args.linux_udp_batch == "1",
+                       "linux_udp_gro": args.linux_udp_gro == "1"}}
     data = {"schema_version": 2, "topologies": args.topologies, "paths": args.paths, "configs": args.configs, "parallelism": args.parallelism, "repeat": args.repeat, "dry_run": args.dry_run, "warmup": {"parallel": 1, "duration_s": 3, "reverse": True}, "run": run}
     validate_manifest(data); atomic(args.output, data)
 
@@ -227,10 +247,12 @@ def command_validate(args):
 def command_preflight(args):
     manifest, observed = read(args.manifest), read(args.observed)
     validate_manifest(manifest)
-    if "runtime" not in manifest["run"]:
-        raise ValueError("rs-tun inbound pipeline is missing from immutable run metadata")
-    if inbound_pipeline_enabled(manifest["run"]) != (args.rs_tun_inbound_pipeline == "1"):
-        raise ValueError("rs-tun inbound pipeline does not match immutable run metadata")
+    runtime = current_runtime_modes(manifest["run"])
+    expected = {"rs_tun_inbound_pipeline": args.rs_tun_inbound_pipeline == "1",
+                "linux_udp_batch": args.linux_udp_batch == "1",
+                "linux_udp_gro": args.linux_udp_gro == "1"}
+    if runtime != expected:
+        raise ValueError("runtime modes do not match immutable run metadata")
     if (args.config not in manifest["configs"] or args.topology not in manifest["topologies"]
             or args.path not in manifest["paths"]):
         raise ValueError("preflight identity is not selected by manifest")
@@ -254,13 +276,13 @@ def command_profile(args):
 
 def main():
     p = argparse.ArgumentParser(); sub = p.add_subparsers(dest="command", required=True)
-    m = sub.add_parser("manifest"); m.add_argument("output"); m.add_argument("--run-id", required=True); m.add_argument("--started-at-utc", required=True); m.add_argument("--commit", required=True); m.add_argument("--dirty", choices=("0", "1"), required=True); m.add_argument("--project", required=True); m.add_argument("--image-project", required=True); m.add_argument("--image-family", required=True); m.add_argument("--machine", required=True); m.add_argument("--network", required=True); m.add_argument("--disk-type", required=True); m.add_argument("--disk-gb", type=int, required=True); m.add_argument("--build-command", default=""); m.add_argument("--rustflags", default=""); m.add_argument("--lto", default=""); m.add_argument("--codegen-units", default=""); m.add_argument("--rs-tun-inbound-pipeline", choices=("0", "1"), default="0"); m.add_argument("--dry-run", action="store_true"); m.add_argument("--topologies", nargs="+", required=True); m.add_argument("--paths", nargs="+", required=True); m.add_argument("--configs", nargs="+", required=True); m.add_argument("--parallelism", type=int, nargs="+", required=True); m.add_argument("--repeat", type=int, required=True); m.set_defaults(func=command_manifest)
+    m = sub.add_parser("manifest"); m.add_argument("output"); m.add_argument("--run-id", required=True); m.add_argument("--started-at-utc", required=True); m.add_argument("--commit", required=True); m.add_argument("--dirty", choices=("0", "1"), required=True); m.add_argument("--project", required=True); m.add_argument("--image-project", required=True); m.add_argument("--image-family", required=True); m.add_argument("--machine", required=True); m.add_argument("--network", required=True); m.add_argument("--disk-type", required=True); m.add_argument("--disk-gb", type=int, required=True); m.add_argument("--build-command", default=""); m.add_argument("--rustflags", default=""); m.add_argument("--lto", default=""); m.add_argument("--codegen-units", default=""); m.add_argument("--rs-tun-inbound-pipeline", choices=("0", "1"), default="0"); m.add_argument("--linux-udp-batch", choices=("0", "1"), default="1"); m.add_argument("--linux-udp-gro", choices=("0", "1"), default="1"); m.add_argument("--dry-run", action="store_true"); m.add_argument("--topologies", nargs="+", required=True); m.add_argument("--paths", nargs="+", required=True); m.add_argument("--configs", nargs="+", required=True); m.add_argument("--parallelism", type=int, nargs="+", required=True); m.add_argument("--repeat", type=int, required=True); m.set_defaults(func=command_manifest)
     d = sub.add_parser("dry-observed"); d.add_argument("output"); d.set_defaults(func=command_dry_observed)
     o = sub.add_parser("observed-real"); o.add_argument("output"); o.add_argument("--server-instance", required=True); o.add_argument("--client-instance", required=True); o.add_argument("--server-boot-disk", required=True); o.add_argument("--client-boot-disk", required=True); o.add_argument("--server-endpoint", required=True); o.add_argument("--client-endpoint", required=True); o.set_defaults(func=command_observed_real)
     s = sub.add_parser("select-observed"); s.add_argument("output"); s.add_argument("--input", required=True); s.add_argument("--config", required=True, choices=CONFIG_PRODUCTS); s.add_argument("--topology", required=True); s.add_argument("--server-zone", required=True); s.add_argument("--client-zone", required=True); s.add_argument("--machine", required=True); s.add_argument("--dry-run", action="store_true"); s.set_defaults(func=command_select_observed)
     a = sub.add_parser("attach"); a.add_argument("--manifest", required=True); a.add_argument("--observed", required=True); a.add_argument("result"); a.set_defaults(func=command_attach)
     v = sub.add_parser("validate"); v.add_argument("--manifest", required=True); v.add_argument("--result"); v.set_defaults(func=command_validate)
-    f = sub.add_parser("preflight"); f.add_argument("--manifest", required=True); f.add_argument("--observed", required=True); f.add_argument("--config", required=True); f.add_argument("--topology", required=True); f.add_argument("--path", required=True); f.add_argument("--server-zone", required=True); f.add_argument("--client-zone", required=True); f.add_argument("--rs-tun-inbound-pipeline", choices=("0", "1"), required=True); f.set_defaults(func=command_preflight)
+    f = sub.add_parser("preflight"); f.add_argument("--manifest", required=True); f.add_argument("--observed", required=True); f.add_argument("--config", required=True); f.add_argument("--topology", required=True); f.add_argument("--path", required=True); f.add_argument("--server-zone", required=True); f.add_argument("--client-zone", required=True); f.add_argument("--rs-tun-inbound-pipeline", choices=("0", "1"), required=True); f.add_argument("--linux-udp-batch", choices=("0", "1"), required=True); f.add_argument("--linux-udp-gro", choices=("0", "1"), required=True); f.set_defaults(func=command_preflight)
     q = sub.add_parser("profile"); q.add_argument("--manifest", required=True); q.add_argument("--observed", required=True); q.add_argument("--config", required=True); q.add_argument("profile"); q.set_defaults(func=command_profile)
     args = p.parse_args()
     try: args.func(args)

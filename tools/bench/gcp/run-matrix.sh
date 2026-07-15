@@ -19,6 +19,7 @@
 #   SKIP_VM_DELETE=1                         — keep VMs at the end (debugging)
 #   MATRIX_RESULTS_DIR                        — parent/root for the run-ID directory override
 #   RS_TUN_INBOUND_PIPELINE                   — rs-tun inbound pipeline toggle: 0 (default) or 1
+#   RS_LINUX_UDP_BATCH / RS_LINUX_UDP_GRO     — Linux receive modes: 0 (disabled) or 1 (default)
 
 set -euo pipefail
 
@@ -350,7 +351,7 @@ run = {"id":"gcp-20260714-000000-dirtytest", "started_at_utc":"2026-07-14T00:00:
        "source":{"commit":"a"*40,"delivery":"git-archive-head","includes_uncommitted_changes":False,"launch_worktree_dirty":True},
        "cloud":{"provider":"gcp","project":"dry-run","requested_image_project":"ubuntu-os-cloud","requested_image_family":"ubuntu-2204-lts","requested_machine_type":"n1-standard-4","network":"default","disk_type":"pd-standard","disk_gb":200},
        "build":{"command":"","rustflags":"","cargo_profile_release_lto":"","cargo_profile_release_codegen_units":""},
-       "runtime":{"rs_tun_inbound_pipeline":False}}
+       "runtime":{"rs_tun_inbound_pipeline":False,"linux_udp_batch":True,"linux_udp_gro":True}}
 provenance.validate_run(run)
 PYEOF
 }
@@ -393,8 +394,9 @@ matrix_remote_observation_program() {
   cat <<'PYEOF'
 python3 - <<'PY'
 import hashlib, json, os, platform, subprocess
-def output(argv):
-    return subprocess.check_output(argv, text=True, stderr=subprocess.STDOUT, timeout=15).strip()
+toolchain_env = {**os.environ, "RUSTUP_HOME": "/opt/rust", "CARGO_HOME": "/opt/rust/cargo"}
+def output(argv, env=None):
+    return subprocess.check_output(argv, text=True, stderr=subprocess.STDOUT, timeout=15, env=env).strip()
 products=[]
 for name, explicit in (
     ("rustscale-bench", "/opt/rustscale/target/release/rustscale-bench"),
@@ -412,7 +414,7 @@ for line in open("/etc/os-release", encoding="utf-8"):
 cpu=output(["lscpu", "-J"])
 try: cpu_model=next(x["data"] for x in json.loads(cpu)["lscpu"] if x["field"].strip()=="Model name:")
 except Exception: raise SystemExit("unable to determine CPU model")
-print(json.dumps({"cpu_model":cpu_model,"logical_cpus":os.cpu_count(),"kernel_release":platform.release(),"os_pretty_name":os_name,"cargo":output(["cargo","--version"]),"rustc_verbose":output(["rustc","-Vv"]),"product":products}))
+print(json.dumps({"cpu_model":cpu_model,"logical_cpus":os.cpu_count(),"kernel_release":platform.release(),"os_pretty_name":os_name,"cargo":output(["/opt/rust/cargo/bin/cargo","--version"], env=toolchain_env),"rustc_verbose":output(["/opt/rust/cargo/bin/rustc","-Vv"], env=toolchain_env),"product":products}))
 PY
 PYEOF
 }
@@ -424,6 +426,13 @@ matrix_product_observation_self_test() {
   [[ "$program" == *'("rustscale", "/opt/rustscale/target/release/rustscale")'* ]] || return 1
   [[ "$program" == *'("rustscaled", "/opt/rustscale/target/release/rustscaled")'* ]] || return 1
   [[ "$program" == *'output(["timeout", "15", explicit, "--version"])'* ]] || return 1
+  # On a fresh VM /usr/local/bin/cargo is a rustup shim and the SSH user's
+  # default rustup home is empty. Observation must use the provisioned
+  # toolchain and preserve its homes just as the remote build does.
+  [[ "$program" == *'toolchain_env = {**os.environ, "RUSTUP_HOME": "/opt/rust", "CARGO_HOME": "/opt/rust/cargo"}'* ]] || return 1
+  [[ "$program" == *'output(["/opt/rust/cargo/bin/cargo","--version"], env=toolchain_env)'* ]] || return 1
+  [[ "$program" == *'output(["/opt/rust/cargo/bin/rustc","-Vv"], env=toolchain_env)'* ]] || return 1
+  [[ "$program" != *'output(["cargo","--version"])'* && "$program" != *'output(["rustc","-Vv"])'* ]] || return 1
   [[ "$program" != *cargo*metadata* && "$program" != *'--help'* && "$program" != *'exit 1'* ]] || return 1
   # The fast shell suite does not compile or execute benchmarks. Shared target
   # directories can hold another worktree's stale binary, so only the source
@@ -521,6 +530,7 @@ matrix_write_manifest() {
     --disk-gb "$GCP_DISK_GB" --build-command "${RUST_BUILD_COMMAND:-}" --rustflags "${RUSTFLAGS:-}" \
     --lto "${CARGO_PROFILE_RELEASE_LTO:-}" --codegen-units "${CARGO_PROFILE_RELEASE_CODEGEN_UNITS:-}" \
     --rs-tun-inbound-pipeline "$RS_TUN_INBOUND_PIPELINE" \
+    --linux-udp-batch "$RS_LINUX_UDP_BATCH" --linux-udp-gro "$RS_LINUX_UDP_GRO" \
     "${dry_flag[@]}" --topologies "${topologies[@]}" --paths "${paths[@]}" \
     --configs "${configs[@]}" --parallelism "${parallelism[@]}" --repeat "$repeat"
 }
@@ -665,9 +675,9 @@ matrix_manifest_self_test() {
   invalid_manifest="$temp_dir/invalid.json"
   matrix_write_manifest "$manifest" 3 same-zone -- direct -- rs-tun -- 1 10 100 || { rm -rf "$temp_dir"; return 1; }
   python3 tools/bench/gcp/provenance.py validate --manifest "$manifest" || { rm -rf "$temp_dir"; return 1; }
-  python3 - "$manifest" "$RS_TUN_INBOUND_PIPELINE" <<'PYEOF' || { rm -rf "$temp_dir"; return 1; }
+  python3 - "$manifest" "$RS_TUN_INBOUND_PIPELINE" "$RS_LINUX_UDP_BATCH" "$RS_LINUX_UDP_GRO" <<'PYEOF' || { rm -rf "$temp_dir"; return 1; }
 import json, sys
-data=json.load(open(sys.argv[1])); assert data["schema_version"] == 2 and data["parallelism"] == [1,10,100] and data["run"]["cloud"]["disk_gb"] == 200 and data["run"]["runtime"]["rs_tun_inbound_pipeline"] is (sys.argv[2] == "1")
+data=json.load(open(sys.argv[1])); runtime=data["run"]["runtime"]; assert data["schema_version"] == 2 and data["parallelism"] == [1,10,100] and data["run"]["cloud"]["disk_gb"] == 200 and runtime == {"rs_tun_inbound_pipeline": sys.argv[2] == "1", "linux_udp_batch": sys.argv[3] == "1", "linux_udp_gro": sys.argv[4] == "1"}
 PYEOF
   if matrix_write_manifest "$invalid_manifest" 3 same-zone -- direct -- rs-tun -- 0 >/dev/null 2>&1 || [[ -e "$invalid_manifest" ]]; then
     rm -rf "$temp_dir"; return 1
@@ -695,7 +705,22 @@ matrix_inbound_pipeline_self_test() {
   (( status == 2 ))
 }
 
+matrix_linux_udp_receive_modes_self_test() {
+  local actual status
+  for actual in 0/0 1/0 1/1; do
+    local batch="${actual%/*}" gro="${actual#*/}"
+    [[ "$(export RS_LINUX_UDP_BATCH="$batch" RS_LINUX_UDP_GRO="$gro"; configure_linux_udp_receive_modes; printf '%s/%s' "$RS_LINUX_UDP_BATCH" "$RS_LINUX_UDP_GRO")" == "$actual" ]] || return 1
+  done
+  if ( export RS_LINUX_UDP_BATCH=0 RS_LINUX_UDP_GRO=1; configure_linux_udp_receive_modes ) >/dev/null 2>&1; then return 1; else status=$?; fi
+  (( status == 2 )) || return 1
+  for variable in RS_LINUX_UDP_BATCH RS_LINUX_UDP_GRO; do
+    if ( export "$variable"=invalid; configure_linux_udp_receive_modes ) >/dev/null 2>&1; then return 1; else status=$?; fi
+    (( status == 2 )) || return 1
+  done
+}
+
 configure_rs_tun_inbound_pipeline || exit $?
+configure_linux_udp_receive_modes || exit $?
 
 matrix_command_shape_self_test
 matrix_remote_build_aggregation_self_test
@@ -709,6 +734,7 @@ matrix_atomic_capture_self_test
 matrix_instance_metadata_capture_self_test
 matrix_manifest_self_test
 matrix_inbound_pipeline_self_test
+matrix_linux_udp_receive_modes_self_test
 matrix_finalization_self_test
 
 if (( MATRIX_SELF_TEST )); then

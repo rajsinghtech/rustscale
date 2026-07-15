@@ -1,6 +1,7 @@
 //! SSH policy wire types — ported from Go's `tailcfg.go`.
 
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -100,7 +101,7 @@ pub struct SSHAction {
     )]
     pub AllowRemotePortForwarding: bool,
     #[serde(default, rename = "recorders", skip_serializing_if = "skip_default")]
-    pub Recorders: Vec<String>,
+    pub Recorders: Vec<SocketAddr>,
     #[serde(
         default,
         rename = "onRecordingFailure",
@@ -124,10 +125,10 @@ pub struct SSHRecorderFailureAction {
 }
 
 /// A single attempt to start recording at a recorder node.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SSHRecordingAttempt {
     #[serde(rename = "recorder")]
-    pub Recorder: String,
+    pub Recorder: SocketAddr,
     #[serde(
         rename = "failureMessage",
         default,
@@ -229,6 +230,21 @@ mod tests {
         let back: SSHPolicy = serde_json::from_str(&j).unwrap();
         assert_eq!(back, policy);
     }
+    #[test]
+    fn recorder_addresses_match_go_string_wire_format() {
+        let action = SSHAction {
+            Accept: true,
+            Recorders: vec![
+                "100.64.0.8:80".parse().unwrap(),
+                "[fd7a:115c:a1e0::8]:443".parse().unwrap(),
+            ],
+            ..Default::default()
+        };
+        let value = serde_json::to_value(action).unwrap();
+        assert_eq!(value["recorders"][0], "100.64.0.8:80");
+        assert_eq!(value["recorders"][1], "[fd7a:115c:a1e0::8]:443");
+    }
+
     #[test]
     fn ssh_action_reject_roundtrip() {
         let action = SSHAction {

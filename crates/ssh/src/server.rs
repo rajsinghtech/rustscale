@@ -24,12 +24,11 @@ pub struct SshServerConfig {
     pub session_tx: mpsc::Sender<SessionInit>,
     pub whois: WhoIsCallback,
     pub policy: PolicyCallback,
-    /// State directory used for the local recording fallback.
+    /// State directory used only when the deprecated TS_DEBUG_LOG_SSH local
+    /// recording knob is enabled by the embedding.
     pub state_dir: Option<PathBuf>,
     /// Tailnet TCP dialer for recorder nodes.
     pub dial_fn: Option<DialFn>,
-    /// MagicDNS name of this SSH server, included in recording headers.
-    pub source_node: String,
 }
 
 pub struct SshServer {
@@ -169,32 +168,32 @@ impl SshHandler {
                 self.local_user.clone_from(local_user);
                 self.accept_env.clone_from(accept_env);
                 self.peer_identity = Some(PeerIdentity { node, user_profile });
-                let recorders = if action.Recorders.is_empty() {
-                    action0
-                        .as_ref()
-                        .map_or_else(Vec::new, |initial| initial.Recorders.clone())
+                let (recorders, on_failure) = if action.Recorders.is_empty() {
+                    action0.as_ref().map_or_else(
+                        || (Vec::new(), None),
+                        |initial| {
+                            (
+                                initial.Recorders.clone(),
+                                initial.OnRecordingFailure.clone(),
+                            )
+                        },
+                    )
                 } else {
-                    action.Recorders.clone()
+                    (action.Recorders.clone(), action.OnRecordingFailure.clone())
                 };
-                let on_failure = action.OnRecordingFailure.clone().or_else(|| {
-                    action0
-                        .as_ref()
-                        .and_then(|initial| initial.OnRecordingFailure.clone())
-                });
                 if on_failure
                     .as_ref()
                     .is_some_and(|failure| !failure.NotifyURL.is_empty())
                 {
                     log::warn!("SSH recording NotifyURL is not implemented yet");
                 }
-                let local_path = if recorders.is_empty() {
-                    self.config
-                        .state_dir
-                        .as_deref()
-                        .and_then(|state_dir| default_recording_path(state_dir).ok())
-                } else {
-                    None
-                };
+                // Keep the root only as a local-recording marker here. A
+                // unique path is allocated per SSH session below, including
+                // multiplexed sessions on one connection.
+                let local_path = recorders
+                    .is_empty()
+                    .then(|| self.config.state_dir.clone())
+                    .flatten();
                 self.recording_config = if recorders.is_empty() && local_path.is_none() {
                     None
                 } else {
@@ -202,7 +201,7 @@ impl SshHandler {
                         recorders,
                         fail_open: on_failure
                             .as_ref()
-                            .is_none_or(|failure| failure.RejectSessionWithMessage.is_empty()),
+                            .is_none_or(|failure| failure.TerminateSessionWithMessage.is_empty()),
                         on_failure,
                         local_path,
                     })
@@ -237,18 +236,56 @@ impl SshHandler {
         let peer = self.peer_identity.clone().unwrap_or_default();
         let peer_addr = self.peer_addr;
 
-        let recording_config = self.recording_config.clone();
+        let mut recording_config = self.recording_config.clone();
+        if let Some(config) = recording_config.as_mut() {
+            if config.recorders.is_empty() && config.local_path.is_some() {
+                if let Ok(path) = self
+                    .config
+                    .state_dir
+                    .as_deref()
+                    .map(default_recording_path)
+                    .transpose()
+                {
+                    config.local_path = path;
+                } else {
+                    let _ = session.data(channel_id, "can't start new recording\r\n");
+                    let _ = session.channel_failure(channel_id);
+                    return Ok(());
+                }
+            }
+        }
+        let term = self
+            .pty
+            .as_ref()
+            .map(|pty| pty.term.clone())
+            .or_else(|| {
+                self.env_vars
+                    .iter()
+                    .find(|(name, _)| name == "TERM")
+                    .map(|(_, value)| value.clone())
+            })
+            .filter(|term| !term.is_empty())
+            .unwrap_or_else(|| "xterm-256color".into());
         let mut cast_header = CastHeader::new(
             self.pty
                 .as_ref()
                 .map_or((0, 0), |pty| (pty.window.width, pty.window.height)),
             self.command.clone(),
-            self.env_vars.iter().cloned().collect(),
+            [("TERM".to_string(), term)].into_iter().collect(),
             self.ssh_user.clone(),
             self.local_user.clone(),
             self.connection_id.clone(),
         );
-        cast_header.src_node.clone_from(&self.config.source_node);
+        cast_header.src_node = peer.node.Name.trim_end_matches('.').to_string();
+        cast_header.src_node_id.clone_from(&peer.node.StableID);
+        if peer.node.Tags.is_empty() {
+            cast_header.src_node_user_id = (peer.node.User != 0).then_some(peer.node.User);
+            if !peer.user_profile.LoginName.is_empty() {
+                cast_header.src_node_user = Some(peer.user_profile.LoginName.clone());
+            }
+        } else {
+            cast_header.src_node_tags.clone_from(&peer.node.Tags);
+        }
         let recorder = match &recording_config {
             Some(config) => {
                 match init_recording(config, cast_header, self.config.dial_fn.clone()).await {
@@ -515,7 +552,6 @@ mod tests {
             policy,
             state_dir: None,
             dial_fn: None,
-            source_node: String::new(),
         };
         let mut server = SshServer::new(config);
         <SshServer as RusshServer>::new_client(&mut server, Some(SocketAddr::new(peer_ip(), 22)))

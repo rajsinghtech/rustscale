@@ -103,7 +103,6 @@ async fn run_pipeline(command: &str) -> i32 {
         policy: policy_allow_any(),
         state_dir: None,
         dial_fn: None,
-        source_node: String::new(),
     };
     let mut server = SshServer::new(config);
     let russh_config = Arc::new(russh::server::Config {

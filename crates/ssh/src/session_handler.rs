@@ -5,8 +5,7 @@
 //! the glue that `tsnet::SshListener::accept()` users call in a per-session
 //! task.
 //!
-//! Deferred to later phases: session recording upload (PeerAPI stream),
-//! HoldAndDelegate, check/verification URLs, SFTP.
+//! Deferred to later phases: HoldAndDelegate, check/verification URLs, SFTP.
 
 use crate::incubator::IncubatorError;
 #[cfg(unix)]
@@ -42,19 +41,9 @@ pub async fn init_recording(
 ) -> Result<Option<SessionRecorder>, String> {
     if config.recorders.is_empty() {
         return match &config.local_path {
-            Some(path) => SessionRecorder::new(
-                path,
-                (cast_header.width, cast_header.height),
-                &cast_header.command,
-                &cast_header
-                    .env
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect(),
-                config.fail_open,
-            )
-            .map(Some)
-            .map_err(|error| error.to_string()),
+            Some(path) => SessionRecorder::with_file(path, cast_header, config.fail_open)
+                .map(Some)
+                .map_err(|_| "local recording could not start".to_string()),
             None => Ok(None),
         };
     }
@@ -65,14 +54,19 @@ pub async fn init_recording(
         Ok(connection) => SessionRecorder::with_upload(
             connection.writer,
             connection.result_rx,
+            connection.abort,
             cast_header,
             config.fail_open,
         )
         .map(Some)
-        .map_err(|error| error.to_string()),
+        .map_err(|_| "remote recording could not start".to_string()),
         Err((attempts, error)) => {
-            log::warn!("SSH recording could not start ({error}); attempts: {attempts:?}");
-            recording_connect_failed(config, &error.to_string())
+            let _ = error;
+            log::warn!(
+                "SSH recording could not start after {} recorder attempt(s)",
+                attempts.len()
+            );
+            recording_connect_failed(config, "recorder connection failed")
         }
     }
 }
@@ -89,7 +83,8 @@ fn recording_connect_failed(
             return Err(action.RejectSessionWithMessage.clone());
         }
     }
-    log::warn!("SSH recording disabled: {error}");
+    let _ = error;
+    log::warn!("SSH recording disabled after a recorder transport failure");
     Ok(None)
 }
 
@@ -99,6 +94,7 @@ const EXTENDED_DATA_STDERR: u32 = 1;
 
 /// Default PATH when the SSH client doesn't provide one.
 const DEFAULT_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
+const RECORDING_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Errors from session handling.
 #[derive(Debug, thiserror::Error)]
@@ -465,37 +461,16 @@ pub async fn run_session(
     let mut spawned = incubator.spawn()?;
     let pid = spawned.pid();
 
-    // Upload completion is watched independently from output writes. A V2
-    // recorder can report an error while the shell is still running.
+    // Upload completion is watched in the session pump. Any completion before
+    // the process exits is a recording failure, including a clean recorder EOF.
+    // Keeping the receiver here avoids detached teardown races.
     let terminate_message = rec_config
         .or(session_rec_config)
         .and_then(|config| config.on_failure)
         .map(|action| action.TerminateSessionWithMessage)
         .filter(|message| !message.is_empty());
-    let mut upload_result_rx = None;
-    if let Some(recorder) = recorder.as_ref() {
-        if let Some(result_rx) = recorder.take_result_rx() {
-            if let Some(message) = terminate_message {
-                let handle = session.handle().clone();
-                let channel_id = session.channel_id();
-                tokio::spawn(async move {
-                    if !matches!(result_rx.await, Ok(Ok(()))) {
-                        log::warn!("SSH recorder upload failed; terminating session");
-                        if let Some(pid) = pid {
-                            #[cfg(unix)]
-                            unsafe {
-                                let _ = libc::kill(-(pid as libc::pid_t), libc::SIGTERM);
-                                let _ = libc::kill(pid as libc::pid_t, libc::SIGTERM);
-                            }
-                        }
-                        let _ = handle.data(channel_id, message).await;
-                    }
-                });
-            } else {
-                upload_result_rx = Some(result_rx);
-            }
-        }
-    }
+    let mut upload_result_rx = recorder.as_ref().and_then(SessionRecorder::take_result_rx);
+    let mut recording_failure_handled = false;
 
     // 8. Take I/O handles (None in PTY mode since Stdio::null was used).
     let mut child_stdin = spawned.take_stdin();
@@ -566,8 +541,11 @@ pub async fn run_session(
                         Ok(0) => {}
                         Ok(n) => {
                             if let Some(ref rec) = recorder {
-                                if matches!(rec.write(RecordDir::Output, &stdout_buf[..n]), RecordResult::Failed) {
-                                    log::warn!("SSH session recording failed; continuing");
+                                if matches!(rec.write(RecordDir::Output, &stdout_buf[..n]), RecordResult::Failed)
+                                    && !recording_failure_handled
+                                {
+                                    recording_failure_handled = true;
+                                    handle_recording_failure(pid, terminate_message.as_deref(), &handle, channel_id).await;
                                 }
                             }
                             let _ = handle.data(channel_id, bytes::Bytes::copy_from_slice(&stdout_buf[..n])).await;
@@ -589,6 +567,17 @@ pub async fn run_session(
                 Some(win) = window_change_rx.recv() => {
                     if let Some(fd) = pty_ioctl_fd {
                         let _ = set_winsize(fd, &win);
+                    }
+                }
+                // Recorder disconnected or ended while the process is live.
+                () = wait_for_upload_result(&mut upload_result_rx), if upload_result_rx.is_some() => {
+                    upload_result_rx = None;
+                    if let Some(ref rec) = recorder {
+                        let _ = rec.close();
+                    }
+                    if !recording_failure_handled {
+                        recording_failure_handled = true;
+                        handle_recording_failure(pid, terminate_message.as_deref(), &handle, channel_id).await;
                     }
                 }
                 // Child exited
@@ -623,8 +612,11 @@ pub async fn run_session(
                         Ok(0) => {}
                         Ok(n) => {
                             if let Some(ref rec) = recorder {
-                                if matches!(rec.write(RecordDir::Output, &stdout_buf[..n]), RecordResult::Failed) {
-                                    log::warn!("SSH session recording failed; continuing");
+                                if matches!(rec.write(RecordDir::Output, &stdout_buf[..n]), RecordResult::Failed)
+                                    && !recording_failure_handled
+                                {
+                                    recording_failure_handled = true;
+                                    handle_recording_failure(pid, terminate_message.as_deref(), &handle, channel_id).await;
                                 }
                             }
                             let _ = handle.data(channel_id, bytes::Bytes::copy_from_slice(&stdout_buf[..n])).await;
@@ -661,6 +653,17 @@ pub async fn run_session(
                 }
                 // Window change (no PTY in pipe mode — ignore)
                 Some(_) = window_change_rx.recv() => {}
+                // Recorder disconnected or ended while the process is live.
+                () = wait_for_upload_result(&mut upload_result_rx), if upload_result_rx.is_some() => {
+                    upload_result_rx = None;
+                    if let Some(ref rec) = recorder {
+                        let _ = rec.close();
+                    }
+                    if !recording_failure_handled {
+                        recording_failure_handled = true;
+                        handle_recording_failure(pid, terminate_message.as_deref(), &handle, channel_id).await;
+                    }
+                }
                 // Child exited
                 status = &mut child_wait => {
                     exit_code = status?;
@@ -708,23 +711,64 @@ pub async fn run_session(
         }
     }
 
-    // 14. Flush the recorder if present.
+    // 14. Close the producer, then give the bounded queue and transport a
+    // finite interval to drain. Abort on timeout so no upload task outlives an
+    // SSH session indefinitely.
     if let Some(ref rec) = recorder {
         let _ = rec.close();
     }
-
-    // 15. Report exit status to the SSH client.
-    session.exit(exit_code as u32).await;
-
-    if let Some(recorder) = recorder {
-        let _ = recorder.close();
-    }
     if let Some(result_rx) = upload_result_rx {
-        if !matches!(result_rx.await, Ok(Ok(()))) {
-            log::warn!("SSH recorder upload failed; continuing per recording policy");
+        match tokio::time::timeout(RECORDING_DRAIN_TIMEOUT, result_rx).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(_) => log::warn!("SSH recorder upload failed during session teardown"),
+            Err(_) => {
+                log::warn!("SSH recorder upload drain timed out; aborting upload");
+                if let Some(ref rec) = recorder {
+                    rec.abort_upload();
+                }
+            }
         }
     }
+
+    // 15. Report exit status to the SSH client after recorder teardown is
+    // deterministic.
+    session.exit(exit_code as u32).await;
     Ok(exit_code)
+}
+
+#[cfg(unix)]
+async fn wait_for_upload_result(
+    result_rx: &mut Option<tokio::sync::oneshot::Receiver<io::Result<()>>>,
+) {
+    if let Some(result_rx) = result_rx.as_mut() {
+        let _ = result_rx.await;
+    } else {
+        std::future::pending::<()>().await;
+    }
+}
+
+#[cfg(unix)]
+async fn handle_recording_failure(
+    pid: Option<u32>,
+    terminate_message: Option<&str>,
+    handle: &russh::server::Handle,
+    channel_id: russh::ChannelId,
+) {
+    if let Some(message) = terminate_message {
+        log::warn!("SSH recorder transport failed; terminating session");
+        if let Some(pid) = pid {
+            // SAFETY: kill only receives integer process IDs returned by the
+            // child spawner. Try the process group first, then the child.
+            unsafe {
+                let _ = libc::kill(-(pid as libc::pid_t), libc::SIGTERM);
+                let _ = libc::kill(pid as libc::pid_t, libc::SIGTERM);
+            }
+        }
+        let message = format!("\r\n\r\n{message}\r\n\r\n");
+        let _ = handle.data(channel_id, message).await;
+    } else {
+        log::warn!("SSH recorder transport failed; continuing per fail-open policy");
+    }
 }
 
 /// Tailscale SSH sessions require Unix user, process, and PTY primitives.

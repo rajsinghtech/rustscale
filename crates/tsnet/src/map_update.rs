@@ -170,6 +170,7 @@ impl ExitNodeSelection {
         let old_selection = self.clone();
         let old_exit = routes.exit_node().cloned();
         let old_requested = routes.exit_node_requested();
+        let old_blocked = routes.exit_traffic_blocked();
         if !self.retry(peers, routes) {
             return Ok(false);
         }
@@ -180,6 +181,9 @@ impl ExitNodeSelection {
                 routes.capture_exit_node();
             } else {
                 routes.clear_exit_node();
+            }
+            if old_blocked {
+                routes.block_exit_traffic();
             }
             *self = old_selection;
             return Err(error);

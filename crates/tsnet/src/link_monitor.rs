@@ -9,6 +9,65 @@ pub(crate) struct LinkRouteSync {
     pub prefs: Arc<RwLock<rustscale_ipn::Prefs>>,
 }
 
+fn block_and_report_exit_route_failure(
+    routes: &mut RouteTable,
+    health: &Tracker,
+    error: impl std::fmt::Display,
+) {
+    routes.block_exit_traffic();
+    health.set_unhealthy(
+        WARN_EXIT_ROUTE_SECURITY,
+        format!("exit-route security refresh failed: {error}"),
+    );
+}
+
+fn connected_prefixes_from_state(
+    state: &rustscale_netmon::State,
+    rustscale_tun_name: &str,
+) -> Result<Vec<rustscale_tsaddr::IpPrefix>, String> {
+    let mut prefixes = Vec::new();
+    for (name, addresses) in &state.interface_ips {
+        let Some(meta) = state.interface_meta.get(name) else {
+            return Err(format!("missing metadata for connected interface {name}"));
+        };
+        if !meta.is_up || meta.is_loopback || name == rustscale_tun_name {
+            continue;
+        }
+        for prefix in addresses {
+            if prefix.bits == 0 {
+                continue;
+            }
+            let ip = match prefix.ip {
+                IpAddr::V4(ip) if prefix.bits <= 32 => {
+                    let mask = u32::MAX
+                        .checked_shl(u32::from(32 - prefix.bits))
+                        .unwrap_or(0);
+                    IpAddr::V4((u32::from(ip) & mask).into())
+                }
+                IpAddr::V6(ip) if prefix.bits <= 128 => {
+                    let mask = u128::MAX
+                        .checked_shl(u32::from(128 - prefix.bits))
+                        .unwrap_or(0);
+                    IpAddr::V6((u128::from(ip) & mask).into())
+                }
+                _ => {
+                    return Err(format!(
+                        "invalid connected prefix {}/{}",
+                        prefix.ip, prefix.bits
+                    ))
+                }
+            };
+            prefixes.push(rustscale_tsaddr::IpPrefix {
+                ip,
+                bits: prefix.bits,
+            });
+        }
+    }
+    rustscale_tsaddr::sort_prefixes(&mut prefixes);
+    prefixes.dedup();
+    Ok(prefixes)
+}
+
 /// Spawn the network change monitor. On a major link change (interface IP
 /// change, up/down transition, or wall-clock time jump), re-gathers local
 /// endpoints, resets peer direct paths, closes DERP connections, re-STUNs,
@@ -47,22 +106,105 @@ pub(crate) fn spawn_link_monitor(
         let route_sync = route_sync.clone();
         let home_derp = home_derp;
         async move {
+            // Shutdown may race task scheduling; no callback may enter router
+            // synchronization after owner cancellation.
+            if cancel.is_cancelled() {
+                return;
+            }
             // Route notifications include default-interface-only changes that
-            // are intentionally classified as minor. Refresh bypass host
-            // routes and the long-lived magicsock binding on every delta.
+            // are intentionally classified as minor. The netmon delta already
+            // contains the successfully enumerated connected-prefix snapshot,
+            // so security refresh does not perform a second fallible scan.
             if let Some(route_sync) = route_sync {
-                let routes = route_sync.route_table.read().await;
-                let exit_node_allow_lan_access =
-                    route_sync.prefs.read().await.ExitNodeAllowLANAccess;
-                if let Err(error) = sync_router(
-                    &route_sync.router,
-                    &route_sync.tailscale_ips,
-                    &routes,
-                    &magicsock,
-                    &control_url,
-                    exit_node_allow_lan_access,
-                ) {
-                    log::warn!("tsnet: interface bypass-route refresh failed: {error}");
+                let tun_name = {
+                    match route_sync.router.lock() {
+                        Ok(router) => Some(router.tun_name.clone()),
+                        Err(_) => None,
+                    }
+                };
+                let Some(tun_name) = tun_name else {
+                    let allow_lan = route_sync.prefs.read().await.ExitNodeAllowLANAccess;
+                    let mut routes = route_sync.route_table.write().await;
+                    if routes.exit_node_requested() && !allow_lan {
+                        block_and_report_exit_route_failure(
+                            &mut routes,
+                            &health,
+                            "router lock poisoned",
+                        );
+                    }
+                    return;
+                };
+                let mut prefix_snapshot = connected_prefixes_from_state(&delta.new, &tun_name);
+                loop {
+                    if cancel.is_cancelled() {
+                        return;
+                    }
+                    let exit_node_allow_lan_access =
+                        route_sync.prefs.read().await.ExitNodeAllowLANAccess;
+                    let mut routes = route_sync.route_table.write().await;
+                    let security_critical =
+                        routes.exit_node_requested() && !exit_node_allow_lan_access;
+                    let connected_prefixes = match &prefix_snapshot {
+                        Ok(prefixes) => prefixes.clone(),
+                        Err(error) if security_critical => {
+                            block_and_report_exit_route_failure(&mut routes, &health, error);
+                            drop(routes);
+                            tokio::select! {
+                                () = cancel.cancelled() => return,
+                                () = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                            }
+                            prefix_snapshot = rustscale_netmon::gather_state()
+                                .ok_or_else(|| "connected-interface enumeration failed".to_string())
+                                .and_then(|state| connected_prefixes_from_state(&state, &tun_name));
+                            continue;
+                        }
+                        Err(error) => {
+                            log::warn!("tsnet: interface route snapshot invalid: {error}");
+                            break;
+                        }
+                    };
+                    if security_critical {
+                        // Block fallback forwarding before touching OS routes;
+                        // success below is the only operation that reopens it.
+                        routes.block_exit_traffic();
+                    }
+                    // Locks above can yield; check cancellation immediately
+                    // before every possible sync_router call.
+                    if cancel.is_cancelled() {
+                        return;
+                    }
+                    match sync_router_with_connected_prefixes(
+                        &route_sync.router,
+                        &route_sync.tailscale_ips,
+                        &routes,
+                        &magicsock,
+                        &control_url,
+                        exit_node_allow_lan_access,
+                        connected_prefixes,
+                    ) {
+                        Ok(()) => {
+                            routes.unblock_exit_traffic();
+                            if security_critical {
+                                health.set_healthy(WARN_EXIT_ROUTE_SECURITY);
+                            }
+                            break;
+                        }
+                        Err(error) if security_critical => {
+                            block_and_report_exit_route_failure(&mut routes, &health, error);
+                            drop(routes);
+                            tokio::select! {
+                                () = cancel.cancelled() => return,
+                                () = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                            }
+                            prefix_snapshot = rustscale_netmon::gather_state()
+                                .ok_or_else(|| "connected-interface enumeration failed".to_string())
+                                .and_then(|state| connected_prefixes_from_state(&state, &tun_name));
+                        }
+                        Err(error) => {
+                            log::warn!("tsnet: interface route refresh failed: {error}");
+                            break;
+                        }
+                    }
                 }
             }
             if !delta.major {
@@ -434,4 +576,83 @@ pub(crate) async fn connect_home_derp(
         None,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustscale_key::NodePrivate;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn churn_snapshot_prevents_enumeration_failure_lan_leak() {
+        let mut interface_ips = BTreeMap::new();
+        interface_ips.insert(
+            "corp-vpn0".into(),
+            vec![rustscale_netmon::IpPrefix {
+                ip: "100.100.2.99".parse().unwrap(),
+                bits: 24,
+            }],
+        );
+        interface_ips.insert(
+            "rustscale0".into(),
+            vec![rustscale_netmon::IpPrefix {
+                ip: "100.64.0.1".parse().unwrap(),
+                bits: 32,
+            }],
+        );
+        let mut interface_meta = BTreeMap::new();
+        interface_meta.insert(
+            "corp-vpn0".into(),
+            rustscale_netmon::InterfaceMeta {
+                is_up: true,
+                ..Default::default()
+            },
+        );
+        interface_meta.insert(
+            "rustscale0".into(),
+            rustscale_netmon::InterfaceMeta {
+                is_up: true,
+                ..Default::default()
+            },
+        );
+        let state = rustscale_netmon::State {
+            interface_ips,
+            interface_meta,
+            have_v4: true,
+            have_v6: false,
+            default_route_interface: "corp-vpn0".into(),
+        };
+
+        // A second system scan can fail during churn; security refresh uses
+        // the already-successful netmon snapshot instead.
+        let injected_enumeration: Result<Vec<rustscale_tsaddr::IpPrefix>, _> =
+            Err(std::io::Error::other("injected enumeration failure"));
+        assert!(injected_enumeration.is_err());
+        let connected = connected_prefixes_from_state(&state, "rustscale0").unwrap();
+        assert_eq!(
+            connected,
+            [rustscale_tsaddr::IpPrefix::parse("100.100.2.0/24").unwrap()]
+        );
+
+        let mut routes = RouteTable::default();
+        routes.set_exit_node(NodePrivate::generate().public());
+        let config =
+            crate::tun_pump::build_router_config_with_local_routes(&[], &routes, false, connected);
+        assert!(config
+            .routes
+            .contains(&rustscale_tsaddr::IpPrefix::parse("100.100.2.0/25").unwrap()));
+        assert!(config
+            .routes
+            .contains(&rustscale_tsaddr::IpPrefix::parse("100.100.2.128/25").unwrap()));
+
+        let health = Tracker::new();
+        block_and_report_exit_route_failure(&mut routes, &health, "injected route failure");
+        assert!(routes.exit_traffic_blocked());
+        assert!(routes.lookup("8.8.8.8".parse().unwrap()).is_none());
+        assert!(health
+            .current_warnings()
+            .iter()
+            .any(|warning| warning.id == WARN_EXIT_ROUTE_SECURITY));
+    }
 }

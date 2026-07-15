@@ -712,8 +712,21 @@ impl LinuxPlatform {
         ("ip".into(), args)
     }
 
-    fn policy_rules(add: bool) -> Vec<(String, Vec<String>)> {
+    fn rule_protocol(&self) -> u8 {
+        // Linux rule protocol is ownership metadata and is included in exact
+        // deletion selectors. Derive a stable per-TUN token so two instances
+        // do not claim each other's same-priority rules.
+        let mut hash = 0x811c_9dc5_u32;
+        for byte in self.tun_name.as_bytes() {
+            hash ^= u32::from(*byte);
+            hash = hash.wrapping_mul(0x0100_0193);
+        }
+        64 + (hash % 190) as u8
+    }
+
+    fn policy_rules(&self, add: bool) -> Vec<(String, Vec<String>)> {
         let verb = if add { "add" } else { "del" };
+        let protocol = self.rule_protocol().to_string();
         let rules = [
             (5210, Some("main")),
             (5230, Some("default")),
@@ -739,9 +752,12 @@ impl LinuxPlatform {
                     "pref".into(),
                     pref.to_string(),
                 ];
-                if add && pref != 5270 {
+                // Deletions repeat every selector used for installation;
+                // never delete by shared priority/table alone.
+                if pref != 5270 {
                     args.extend(["fwmark".into(), "0x80000/0xff0000".into()]);
                 }
+                args.extend(["protocol".into(), protocol.clone()]);
                 if let Some(table) = table {
                     args.extend(["table".into(), (*table).into()]);
                 } else {
@@ -777,7 +793,7 @@ impl Platform for LinuxPlatform {
                         "down".into(),
                     ],
                 )];
-                commands.extend(Self::policy_rules(false));
+                commands.extend(self.policy_rules(false));
                 commands
             }
             RouterOperation::AddAddr(address) => vec![("ip".into(), {
@@ -854,12 +870,12 @@ impl Platform for LinuxPlatform {
     fn up_cleanup_commands(&self) -> Vec<CommandSpec> {
         // Delete broadly-selected managed priorities before the transaction.
         // These commands remove only rustscale's reserved priorities.
-        Self::policy_rules(false)
+        self.policy_rules(false)
     }
 
     fn up_transaction_commands(&self) -> Vec<(CommandSpec, CommandSpec)> {
         let mut commands = Vec::new();
-        for (program, args) in Self::policy_rules(true) {
+        for (program, args) in self.policy_rules(true) {
             let mut rollback_args = args.clone();
             if let Some(add) = rollback_args.iter_mut().find(|arg| arg.as_str() == "add") {
                 *add = "del".into();
@@ -1337,7 +1353,13 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_policy_rules_match_tailscale_base_chain() {
-        let commands = LinuxPlatform::policy_rules(true);
+        let platform = LinuxPlatform::new("rustscale0");
+        let mut commands = platform.policy_rules(true);
+        for (_, args) in &mut commands {
+            if let Some(index) = args.iter().position(|arg| arg == "protocol") {
+                args.drain(index..=index + 1);
+            }
+        }
         assert_eq!(
             &commands[..],
             [
@@ -1452,7 +1474,15 @@ mod tests {
             ]
         );
 
-        let down = LinuxPlatform::policy_rules(false);
+        let mut down = platform.policy_rules(false);
+        for (_, args) in &mut down {
+            if let Some(index) = args.iter().position(|arg| arg == "protocol") {
+                args.drain(index..=index + 1);
+            }
+            if let Some(index) = args.iter().position(|arg| arg == "fwmark") {
+                args.drain(index..=index + 1);
+            }
+        }
         assert_eq!(
             &down[..8],
             [
@@ -1554,6 +1584,36 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_rule_cleanup_selects_only_exact_owned_rules() {
+        let first = LinuxPlatform::new("rustscale0");
+        let second = LinuxPlatform::new("rustscale1");
+        assert_ne!(first.rule_protocol(), second.rule_protocol());
+
+        let first_delete = first.policy_rules(false);
+        let second_add = second.policy_rules(true);
+        for ((_, delete), (_, foreign)) in first_delete.iter().zip(second_add.iter().rev()) {
+            assert_eq!(delete[3..5], foreign[3..5]); // same shared priority
+            let owned_protocol = delete
+                .windows(2)
+                .find(|pair| pair[0] == "protocol")
+                .map(|pair| pair[1].clone())
+                .unwrap();
+            let foreign_protocol = foreign
+                .windows(2)
+                .find(|pair| pair[0] == "protocol")
+                .map(|pair| pair[1].clone())
+                .unwrap();
+            assert_ne!(owned_protocol, foreign_protocol);
+            if delete.iter().any(|arg| arg == "fwmark") {
+                assert!(delete
+                    .windows(2)
+                    .any(|pair| pair == ["fwmark", "0x80000/0xff0000"]));
+            }
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -1721,7 +1781,18 @@ mod tests {
             .runner
             .commands
             .iter()
-            .map(|(program, args)| format!("{program} {}", args.join(" ")))
+            .map(|(program, args)| {
+                let mut args = args.clone();
+                if let Some(index) = args.iter().position(|arg| arg == "protocol") {
+                    args.drain(index..=index + 1);
+                }
+                if args.iter().any(|arg| arg == "del") {
+                    if let Some(index) = args.iter().position(|arg| arg == "fwmark") {
+                        args.drain(index..=index + 1);
+                    }
+                }
+                format!("{program} {}", args.join(" "))
+            })
             .collect();
         assert_eq!(
             actual,

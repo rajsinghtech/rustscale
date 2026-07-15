@@ -114,7 +114,9 @@ pub(crate) use map_update::{
 #[cfg(test)]
 pub(crate) use netstack_pump::collect_tun_inbound;
 pub(crate) use netstack_pump::{run_netstack_pump, tick_wg_timers};
-pub(crate) use tun_pump::{create_tun_device, run_tun_pump, sync_router, SharedRouter};
+pub(crate) use tun_pump::{
+    create_tun_device, run_tun_pump, sync_router, sync_router_with_connected_prefixes, SharedRouter,
+};
 pub use util::TunModeConfig;
 pub(crate) use util::{
     break_tcp_conns_best_effort, ensure_ring_provider, first_v4, rand_index, CancelToken,
@@ -140,7 +142,8 @@ use {
     rustscale_filter::Filter,
     rustscale_health::{
         Severity, Tracker, Watchdog, WARN_CERT_FALLBACK, WARN_CONTROL, WARN_DERP_HOME,
-        WARN_MAP_RESPONSE_TIMEOUT, WARN_NETMON_CHANGE, WARN_NOT_IN_MAP_POLL,
+        WARN_EXIT_ROUTE_SECURITY, WARN_MAP_RESPONSE_TIMEOUT, WARN_NETMON_CHANGE,
+        WARN_NOT_IN_MAP_POLL,
     },
     rustscale_ipn::IpnBackend,
     rustscale_key::{DiscoPrivate, MachinePrivate, MachinePublic, NodePrivate, NodePublic},

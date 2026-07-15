@@ -39,6 +39,10 @@ pub struct RouteTable {
     /// exit peer is unresolved. With no `exit_node`, lookup deliberately drops
     /// the captured packet instead of permitting direct physical routing.
     exit_capture: bool,
+    /// Emergency data-plane block entered when security-critical OS route
+    /// refresh fails. The selected peer is retained for retry, but ordinary
+    /// fallback traffic is dropped until the refresh succeeds.
+    exit_blocked: bool,
 }
 
 impl RouteTable {
@@ -91,6 +95,7 @@ impl RouteTable {
             accept_routes,
             exit_node: None,
             exit_capture: false,
+            exit_blocked: false,
         }
     }
 
@@ -102,10 +107,12 @@ impl RouteTable {
     /// IPs and accepted subnet routes (more specific than `0.0.0.0/0`) always
     /// win over the exit fallback.
     pub fn lookup(&self, ip: IpAddr) -> Option<NodePublic> {
-        self.index
-            .get(ip)
-            .cloned()
-            .or_else(|| self.exit_node.clone())
+        let peer = self.index.get(ip).cloned();
+        if self.exit_blocked {
+            peer
+        } else {
+            peer.or_else(|| self.exit_node.clone())
+        }
     }
 
     /// Rebuild the table from a new peer list (e.g. on a map-stream delta).
@@ -115,9 +122,11 @@ impl RouteTable {
         let accept = self.accept_routes;
         let exit = self.exit_node.clone();
         let capture = self.exit_capture;
+        let blocked = self.exit_blocked;
         *self = Self::from_peers_with_opts(peers, accept);
         self.exit_node = exit;
         self.exit_capture = capture;
+        self.exit_blocked = blocked;
     }
 
     /// Rebuild the table from a new peer list with an explicit `accept_routes`
@@ -125,9 +134,11 @@ impl RouteTable {
     pub fn rebuild_with_opts(&mut self, peers: &[Node], accept_routes: bool) {
         let exit = self.exit_node.clone();
         let capture = self.exit_capture;
+        let blocked = self.exit_blocked;
         *self = Self::from_peers_with_opts(peers, accept_routes);
         self.exit_node = exit;
         self.exit_capture = capture;
+        self.exit_blocked = blocked;
     }
 
     /// Number of distinct normalized route entries (for diagnostics/testing).
@@ -161,6 +172,7 @@ impl RouteTable {
     pub fn set_exit_node(&mut self, peer: NodePublic) {
         self.exit_node = Some(peer);
         self.exit_capture = true;
+        self.exit_blocked = false;
     }
 
     /// Capture default traffic without forwarding it to any peer. This is the
@@ -168,6 +180,7 @@ impl RouteTable {
     pub fn capture_exit_node(&mut self) {
         self.exit_node = None;
         self.exit_capture = true;
+        self.exit_blocked = false;
     }
 
     /// Clear the selected exit node. After this, destinations not matched by
@@ -175,6 +188,7 @@ impl RouteTable {
     pub fn clear_exit_node(&mut self) {
         self.exit_node = None;
         self.exit_capture = false;
+        self.exit_blocked = false;
     }
 
     /// The currently selected exit node peer, if any.
@@ -186,6 +200,20 @@ impl RouteTable {
     /// exit peer or for unresolved-selection capture.
     pub fn exit_node_requested(&self) -> bool {
         self.exit_capture
+    }
+
+    pub(crate) fn block_exit_traffic(&mut self) {
+        if self.exit_capture {
+            self.exit_blocked = true;
+        }
+    }
+
+    pub(crate) fn unblock_exit_traffic(&mut self) {
+        self.exit_blocked = false;
+    }
+
+    pub(crate) fn exit_traffic_blocked(&self) -> bool {
+        self.exit_blocked
     }
 }
 
@@ -596,6 +624,19 @@ mod tests {
         assert!(rt.lookup("8.8.8.8".parse().unwrap()).is_none());
         rt.rebuild(&[]);
         assert!(rt.exit_node_requested());
+    }
+
+    #[test]
+    fn emergency_block_retains_selected_exit_for_retry_but_drops_fallback() {
+        let exit = NodePrivate::generate().public();
+        let mut rt = RouteTable::default();
+        rt.set_exit_node(exit.clone());
+        rt.block_exit_traffic();
+        assert_eq!(rt.exit_node(), Some(&exit));
+        assert!(rt.exit_traffic_blocked());
+        assert!(rt.lookup("8.8.8.8".parse().unwrap()).is_none());
+        rt.unblock_exit_traffic();
+        assert_eq!(rt.lookup("8.8.8.8".parse().unwrap()), Some(exit));
     }
 
     #[test]

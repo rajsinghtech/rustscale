@@ -145,6 +145,7 @@ impl Monitor {
 
         let shared_clone = shared.clone();
         let shutdown_clone = shutdown.clone();
+        let callback_stopped = stopped.clone();
         let callback_tasks = Arc::new(tokio::sync::Mutex::new(Vec::<JoinHandle<()>>::new()));
         let debounce_callback_tasks = callback_tasks.clone();
 
@@ -153,10 +154,16 @@ impl Monitor {
             let mut last_wall = SystemTime::now();
             let mut signal_rx = signal_rx;
             loop {
+                if callback_stopped.load(Ordering::SeqCst) {
+                    break;
+                }
                 tokio::select! {
                     () = shutdown_clone.notified() => break,
                     _ = signal_rx.recv() => {}
                     () = tokio::time::sleep(WALL_TICK) => {}
+                }
+                if callback_stopped.load(Ordering::SeqCst) {
+                    break;
                 }
 
                 let Some(new_state) = (shared_clone.provider)() else {
@@ -214,6 +221,9 @@ impl Monitor {
                     guard.values().cloned().collect()
                 };
                 for cb in callbacks {
+                    if callback_stopped.load(Ordering::SeqCst) {
+                        break;
+                    }
                     let d = delta.clone();
                     let task = tokio::spawn(async move {
                         cb(d).await;

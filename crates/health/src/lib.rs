@@ -34,6 +34,8 @@ pub const WARN_DERP_REGION_PREFIX: &str = "derp-region-";
 pub const WARN_CERT_FALLBACK: &str = "cert-fallback";
 /// Network changed, re-probing endpoints. Low severity, transient.
 pub const WARN_NETMON_CHANGE: &str = "network-changed";
+/// Exit-route security refresh failed; ordinary fallback traffic is blocked.
+pub const WARN_EXIT_ROUTE_SECURITY: &str = "exit-route-security";
 /// Captive portal detected — traffic is being intercepted. High severity.
 pub const WARN_CAPTIVE_PORTAL: &str = "captive-portal-detected";
 
@@ -221,6 +223,12 @@ impl Tracker {
             id: WARN_NETMON_CHANGE.into(),
             severity: Severity::Low,
             title: "Network changed".into(),
+            ..Warnable::default()
+        });
+        t.register(Warnable {
+            id: WARN_EXIT_ROUTE_SECURITY.into(),
+            severity: Severity::High,
+            title: "Exit-route security refresh failed".into(),
             ..Warnable::default()
         });
         t.register(Warnable {

@@ -1762,7 +1762,7 @@ pub(crate) fn build_router_config(
     ))
 }
 
-fn build_router_config_with_local_routes(
+pub(crate) fn build_router_config_with_local_routes(
     local_addrs: &[IpAddr],
     route_table: &RouteTable,
     exit_node_allow_lan_access: bool,
@@ -1861,8 +1861,48 @@ pub(crate) fn sync_router(
     local_addrs: &[IpAddr],
     route_table: &RouteTable,
     magicsock: &Magicsock,
+    control_url: &str,
+    exit_node_allow_lan_access: bool,
+) -> Result<(), TsnetError> {
+    sync_router_inner(
+        router,
+        local_addrs,
+        route_table,
+        magicsock,
+        control_url,
+        exit_node_allow_lan_access,
+        None,
+    )
+}
+
+pub(crate) fn sync_router_with_connected_prefixes(
+    router: &SharedRouter,
+    local_addrs: &[IpAddr],
+    route_table: &RouteTable,
+    magicsock: &Magicsock,
+    control_url: &str,
+    exit_node_allow_lan_access: bool,
+    connected_prefixes: Vec<rustscale_tsaddr::IpPrefix>,
+) -> Result<(), TsnetError> {
+    sync_router_inner(
+        router,
+        local_addrs,
+        route_table,
+        magicsock,
+        control_url,
+        exit_node_allow_lan_access,
+        Some(connected_prefixes),
+    )
+}
+
+fn sync_router_inner(
+    router: &SharedRouter,
+    local_addrs: &[IpAddr],
+    route_table: &RouteTable,
+    magicsock: &Magicsock,
     _control_url: &str,
     exit_node_allow_lan_access: bool,
+    connected_prefixes: Option<Vec<rustscale_tsaddr::IpPrefix>>,
 ) -> Result<(), TsnetError> {
     // Serialize source snapshots with application. This prevents an older map
     // or interface callback from building before the mutex and then replacing
@@ -1875,12 +1915,21 @@ pub(crate) fn sync_router(
     let leaving_exit_node = !exit_node && managed.exit_node;
     // Interface enumeration is part of the fail-closed desired-state build;
     // do it before acquiring process policy or touching the live router.
-    let config = build_router_config(
-        local_addrs,
-        route_table,
-        exit_node_allow_lan_access,
-        &managed.tun_name,
-    )?;
+    let config = if let Some(prefixes) = connected_prefixes {
+        build_router_config_with_local_routes(
+            local_addrs,
+            route_table,
+            exit_node_allow_lan_access,
+            prefixes,
+        )
+    } else {
+        build_router_config(
+            local_addrs,
+            route_table,
+            exit_node_allow_lan_access,
+            &managed.tun_name,
+        )?
+    };
     if exit_node {
         // Match upstream netns call sites: control/DERP TCP and magicsock UDP
         // bypass the tunnel at the socket layer. Reapply to the existing UDP

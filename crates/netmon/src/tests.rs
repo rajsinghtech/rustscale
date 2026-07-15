@@ -274,7 +274,7 @@ async fn test_multi_callback_register_unregister() {
         .unwrap()
         .with_poll_interval(Duration::from_millis(50));
 
-    let handle = monitor.start();
+    let mut handle = monitor.start();
 
     let calls1 = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let calls2 = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -319,7 +319,7 @@ async fn test_multi_callback_register_unregister() {
     })
     .await;
 
-    handle.shutdown();
+    handle.shutdown().await;
     assert!(found.is_ok(), "did not receive callbacks in time");
 
     assert!(
@@ -366,7 +366,7 @@ async fn test_monitor_detects_change_with_fake_provider() {
     let deltas: Arc<Mutex<Vec<super::monitor::ChangeDelta>>> = Arc::new(Mutex::new(Vec::new()));
     let deltas_clone = deltas.clone();
 
-    let handle = monitor.start();
+    let mut handle = monitor.start();
     let _cb_handle = handle.register_change_callback(move |delta| {
         let d = deltas_clone.clone();
         async move {
@@ -384,11 +384,63 @@ async fn test_monitor_detects_change_with_fake_provider() {
     })
     .await;
 
-    handle.shutdown();
+    handle.shutdown().await;
     assert!(found.is_ok(), "did not detect a major change in time");
     let recorded = deltas.lock().unwrap();
     assert!(!recorded.is_empty());
     assert!(recorded.iter().any(|d| d.major));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_cancels_and_joins_inflight_callbacks() {
+    let state_a = state_en0_up("192.168.1.10/24");
+    let mut state_b = state_a.clone();
+    state_b
+        .interface_ips
+        .get_mut("en0")
+        .unwrap()
+        .push(ip4("10.0.0.5/8"));
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let provider: StateProvider = {
+        let calls = calls.clone();
+        Arc::new(move || {
+            if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                Some(state_a.clone())
+            } else {
+                Some(state_b.clone())
+            }
+        })
+    };
+    let monitor = Monitor::with_state_provider(provider)
+        .unwrap()
+        .with_poll_interval(Duration::from_millis(10));
+    let mut handle = monitor.start();
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    handle.register_owned_change_callback({
+        let started = started.clone();
+        let release = release.clone();
+        let completed = completed.clone();
+        move |_| {
+            let started = started.clone();
+            let release = release.clone();
+            let completed = completed.clone();
+            async move {
+                started.notify_one();
+                release.notified().await;
+                completed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(5), started.notified())
+        .await
+        .unwrap();
+
+    handle.shutdown().await;
+    release.notify_waiters();
+    tokio::task::yield_now().await;
+    assert_eq!(completed.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
 
 // ---------------------------------------------------------------------------

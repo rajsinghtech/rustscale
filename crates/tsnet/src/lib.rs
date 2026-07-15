@@ -1142,6 +1142,7 @@ impl Server {
 
         let config =
             rustscale_conffile::Config::load(path).map_err(|e| format!("config load: {e}"))?;
+        let masked = config.parsed.to_prefs();
 
         let updated = {
             let mut prefs = inner.prefs.write().await;

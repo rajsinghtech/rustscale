@@ -19,6 +19,7 @@ mod serial_stub;
 use std::sync::Mutex;
 
 pub use hwaddr::get_hardware_addrs;
+pub use rustscale_syspolicy::PreferenceOption;
 pub use serial::{dedup_serials, get_serial_numbers, is_sentinel_serial};
 
 /// Maximum accepted size of one platform serial-number value.
@@ -55,47 +56,11 @@ impl From<std::io::Error> for PostureError {
     }
 }
 
-/// Managed preference semantics used by Tailscale system policy.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum PreferenceOption {
-    /// The persisted/user preference decides whether collection is enabled.
-    #[default]
-    UserDecides,
-    /// Collection is forced on by management policy.
-    Always,
-    /// Collection is forced off by management policy.
-    Never,
-}
-
-impl PreferenceOption {
-    /// Parse the Go-compatible policy strings. Unknown values fail closed to
-    /// the caller rather than silently forcing collection on.
-    pub fn parse(value: &str) -> Result<Self, PolicyError> {
-        match value {
-            "always" => Ok(Self::Always),
-            "never" => Ok(Self::Never),
-            "user-decides" => Ok(Self::UserDecides),
-            _ => Err(PolicyError::InvalidValue),
-        }
-    }
-
-    /// Resolve this policy against the user's persisted preference.
-    pub const fn should_enable(self, user_enabled: bool) -> bool {
-        match self {
-            Self::Always => true,
-            Self::Never => false,
-            Self::UserDecides => user_enabled,
-        }
-    }
-}
-
 /// Privacy-safe policy lookup failures.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum PolicyError {
     #[error("posture policy is unavailable")]
     Unavailable,
-    #[error("posture policy has an invalid value")]
-    InvalidValue,
 }
 
 /// Injectable policy source. It is queried for every request so policy
@@ -114,58 +79,55 @@ impl PosturePolicy for UserDecidesPolicy {
     }
 }
 
-/// Live OS-backed posture policy. Linux policy is re-read from the standard
-/// bounded JSON path; macOS and Windows use hardened platform stores. Missing
-/// policy means `user-decides`. Platforms without a trustworthy provider
-/// return an error, which [`IdentityService`] treats as disabled.
-#[derive(Debug, Default)]
-pub struct SystemPolicy;
+/// Live policy backed by the current syspolicy engine and immutable snapshots.
+/// Each posture request reloads non-subscribing platform providers; providers
+/// with subscriptions also update the same engine continuously. Missing policy
+/// means `user-decides`, while provider and conversion failures fail closed in
+/// [`IdentityService`].
+pub struct SystemPolicy {
+    engine: Option<rustscale_syspolicy::PolicyEngine>,
+}
+
+impl SystemPolicy {
+    /// Creates a posture policy from an existing engine, useful for embedding
+    /// and hermetic provider tests.
+    pub fn from_engine(engine: rustscale_syspolicy::PolicyEngine) -> Self {
+        Self {
+            engine: Some(engine),
+        }
+    }
+
+    fn snapshot_preference(
+        snapshot: &rustscale_syspolicy::Snapshot,
+    ) -> Result<PreferenceOption, PolicyError> {
+        use rustscale_syspolicy::{PolicyErrorKind, PolicyKey, PolicyValue};
+
+        match snapshot.get(PolicyKey::PostureChecking) {
+            Ok(PolicyValue::PreferenceOption(preference)) => Ok(preference),
+            Err(error) if error.kind == PolicyErrorKind::NotConfigured => {
+                Ok(PreferenceOption::UserDecides)
+            }
+            Err(_) | Ok(_) => Err(PolicyError::Unavailable),
+        }
+    }
+}
+
+impl Default for SystemPolicy {
+    fn default() -> Self {
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+        let engine =
+            rustscale_syspolicy::default_engine(rustscale_syspolicy::PolicyScope::Device).ok();
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+        let engine = None;
+        Self { engine }
+    }
+}
 
 impl PosturePolicy for SystemPolicy {
     fn preference(&self) -> Result<PreferenceOption, PolicyError> {
-        #[cfg(target_os = "linux")]
-        use rustscale_syspolicy::PolicyStore;
-        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-        use rustscale_syspolicy::{PolicyErrorKind, PolicyKey};
-
-        #[cfg(target_os = "linux")]
-        let store = {
-            use std::io::Read;
-
-            const MAX_POLICY_BYTES: u64 = 256 * 1024;
-            let file = match std::fs::File::open(rustscale_syspolicy::DEFAULT_POLICY_PATH) {
-                Ok(file) => file,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    return Ok(PreferenceOption::UserDecides);
-                }
-                Err(_) => return Err(PolicyError::Unavailable),
-            };
-            let mut bytes = Vec::new();
-            file.take(MAX_POLICY_BYTES + 1)
-                .read_to_end(&mut bytes)
-                .map_err(|_| PolicyError::Unavailable)?;
-            if bytes.len() as u64 > MAX_POLICY_BYTES {
-                return Err(PolicyError::Unavailable);
-            }
-            let json = std::str::from_utf8(&bytes).map_err(|_| PolicyError::Unavailable)?;
-            rustscale_syspolicy::LinuxPolicyStore::from_json(json)
-                .map_err(|_| PolicyError::Unavailable)?
-        };
-        #[cfg(any(target_os = "macos", target_os = "windows"))]
-        let store = rustscale_syspolicy::default_store();
-        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-        return Err(PolicyError::Unavailable);
-
-        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-        {
-            match store.get_string(PolicyKey::PostureChecking) {
-                Ok(value) => PreferenceOption::parse(&value),
-                Err(error) if error.kind == PolicyErrorKind::NotConfigured => {
-                    Ok(PreferenceOption::UserDecides)
-                }
-                Err(_) => Err(PolicyError::Unavailable),
-            }
-        }
+        let engine = self.engine.as_ref().ok_or(PolicyError::Unavailable)?;
+        let snapshot = engine.reload().map_err(|_| PolicyError::Unavailable)?;
+        Self::snapshot_preference(&snapshot)
     }
 }
 
@@ -290,7 +252,7 @@ impl IdentityService {
 
 impl Default for IdentityService {
     fn default() -> Self {
-        Self::new(Box::new(SystemCollector), Box::new(SystemPolicy))
+        Self::new(Box::new(SystemCollector), Box::new(SystemPolicy::default()))
     }
 }
 
@@ -323,6 +285,7 @@ fn normalize_hardware_addrs(mut values: Vec<String>) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -461,6 +424,33 @@ mod tests {
     }
 
     #[test]
+    fn system_policy_reads_live_typed_snapshots_and_fails_closed() {
+        use rustscale_syspolicy::{MemoryProvider, PolicyEngine, PolicyKey, PolicyScope, RawValue};
+
+        let provider = Arc::new(MemoryProvider::from_values(BTreeMap::from([(
+            PolicyKey::PostureChecking,
+            RawValue::String("never".into()),
+        )])));
+        let engine = PolicyEngine::well_known(PolicyScope::Device).unwrap();
+        engine
+            .add_provider("managed posture", PolicyScope::Device, provider.clone())
+            .unwrap();
+        let policy = SystemPolicy::from_engine(engine);
+
+        assert_eq!(policy.preference(), Ok(PreferenceOption::Never));
+        provider.set(
+            PolicyKey::PostureChecking,
+            RawValue::String("always".into()),
+        );
+        assert_eq!(policy.preference(), Ok(PreferenceOption::Always));
+        provider.set(
+            PolicyKey::PostureChecking,
+            RawValue::String("invalid".into()),
+        );
+        assert_eq!(policy.preference(), Err(PolicyError::Unavailable));
+    }
+
+    #[test]
     fn hardware_addresses_are_opt_in_and_stable() {
         let (service, _, hardware_calls) = service(PreferenceOption::Always);
         assert!(service
@@ -479,22 +469,10 @@ mod tests {
 
     #[test]
     fn preference_parser_is_exact() {
-        assert_eq!(
-            PreferenceOption::parse("always"),
-            Ok(PreferenceOption::Always)
-        );
-        assert_eq!(
-            PreferenceOption::parse("never"),
-            Ok(PreferenceOption::Never)
-        );
-        assert_eq!(
-            PreferenceOption::parse("user-decides"),
-            Ok(PreferenceOption::UserDecides)
-        );
-        assert_eq!(
-            PreferenceOption::parse("true"),
-            Err(PolicyError::InvalidValue)
-        );
+        assert_eq!("always".parse(), Ok(PreferenceOption::Always));
+        assert_eq!("never".parse(), Ok(PreferenceOption::Never));
+        assert_eq!("user-decides".parse(), Ok(PreferenceOption::UserDecides));
+        assert_eq!("true".parse::<PreferenceOption>(), Err(()));
     }
 
     #[test]

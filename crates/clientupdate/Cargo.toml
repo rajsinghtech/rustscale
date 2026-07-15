@@ -12,4 +12,11 @@ workspace = true
 [dependencies]
 rustscale-tailcfg = { path = "../tailcfg", version = "0.1.1" }
 thiserror.workspace = true
-log = "0.4"
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+semver = "1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+
+[dev-dependencies]
+tempfile = "3"

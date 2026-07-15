@@ -1,7 +1,7 @@
 //! G6: Property-based test for the IPN state machine.
 //!
 //! Generates random (State, StateMachineInputs) pairs and asserts
-//! invariants after every transition. See docs/regression-strategy.md G6.
+//! invariants after every transition.
 //!
 //! Invariants:
 //! 1. If result == Running, blocked must be false.

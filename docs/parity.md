@@ -1,17 +1,13 @@
 # rustscale ↔ tailscale parity tracker
 
-Tiered gap analysis vs the Go implementation (user-authored 2026-07-09).
+Tiered gap analysis against the Go implementation.
 Status legend: ✅ done · 🔶 partial · 🚧 in progress · ⬜ not started.
-Active execution order is in CLAUDE.md; this file is the full inventory —
-update statuses as phases land.
+Update statuses when implementation and tests land together.
 
 ## Verified gap audit (2026-07-12, re-verified 2026-07-13)
 
-An independent three-way codebase comparison (`docs/audit/*.md`) plus an
-adversarial verification pass (`docs/audit/verified.md`) found several rows
-were **overstated** or **understated**. A follow-up 12-agent code-source
-verification pass against the live codebase re-checked every item. Statuses
-below reflect actual source code (`crates/*`) as of 2026-07-13.
+Statuses below were checked against the source and tests in `crates/*` as of
+2026-07-13.
 
 ## Tier 1: Core compatibility (missing = incomplete client)
 
@@ -184,9 +180,8 @@ register, streaming map, Go-testcontrol-style test API); RequireAuth/CompleteAut
 AwaitAuthURL flows for interactive login testing. `crates/derp` server ✅
 in-process DERP relay (spawn_local + make_derp_map) for integration tests.
 tailcfg null-tolerance ✅ every wire field accepts Go nil + property test
-nullifying each field. Full plan: docs/testcontrol-plan.md
-(remaining: Phase B integration scenarios, Phase D UDP impairment shim,
-Go-testcontrol interop harness).
+nullifying each field. Remaining work includes more integration scenarios and
+a UDP impairment shim; Go-testcontrol interoperability is covered in CI.
 
 ## Release pipeline
 

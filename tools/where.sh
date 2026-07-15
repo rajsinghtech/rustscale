@@ -26,7 +26,6 @@ if [ ! -f "$FILE" ]; then
   echo "$0: not a file: $FILE" >&2
   exit 1
 fi
-
 # Prefer ripgrep (faster, ignores nothing by default here), fall back to grep.
 if command -v rg >/dev/null 2>&1; then
   rg -n --no-heading --color never "$@" "$PATTERN" "$FILE" || true

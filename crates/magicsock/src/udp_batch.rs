@@ -7,7 +7,7 @@ use std::mem;
 use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::fd::AsRawFd;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::Arc;
 
@@ -79,6 +79,7 @@ impl Drop for PooledPacket {
         };
         match self.recycler.sender.try_send(packet) {
             Ok(()) => {
+                self.recycler.free.fetch_add(1, Ordering::Relaxed);
                 self.recycler.recycled.fetch_add(1, Ordering::Relaxed);
             }
             Err(TrySendError::Disconnected(_)) => {
@@ -99,6 +100,7 @@ impl Drop for PooledPacket {
 /// clones this one Arc, rather than a sender plus several counter Arcs.
 struct RecyclerState {
     sender: SyncSender<Box<Packet>>,
+    free: AtomicUsize,
     recycled: AtomicU64,
     recycle_overflow: AtomicU64,
 }
@@ -136,6 +138,7 @@ impl ReceiveBufferPool {
         Self {
             recycler: Arc::new(RecyclerState {
                 sender,
+                free: AtomicUsize::new(RECEIVE_BUFFER_POOL_CAPACITY),
                 recycled: AtomicU64::new(0),
                 recycle_overflow: AtomicU64::new(0),
             }),
@@ -147,15 +150,21 @@ impl ReceiveBufferPool {
     }
 
     fn take_scratch(&self) -> Box<Packet> {
-        self.available
+        let packet = self
+            .available
             .recv()
-            .expect("new receive pool contains its 128 scratch buffers")
+            .expect("new receive pool contains its 128 scratch buffers");
+        self.recycler.free.fetch_sub(1, Ordering::Relaxed);
+        packet
     }
 
     fn replace_and_detach(&self, slot: &mut Box<Packet>, len: usize) -> PooledPacket {
         let replacement = match self.available.try_recv() {
-            Ok(packet) => packet,
-            Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => {
+            Ok(packet) => {
+                self.recycler.free.fetch_sub(1, Ordering::Relaxed);
+                packet
+            }
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => {
                 self.unavailable.fetch_add(1, Ordering::Relaxed);
                 panic!("receive buffer pool exhausted despite inventory reservation");
             }
@@ -173,7 +182,7 @@ impl ReceiveBufferPool {
     fn snapshot(&self) -> ReceiveBufferPoolSnapshot {
         ReceiveBufferPoolSnapshot {
             capacity: RECEIVE_BUFFER_POOL_CAPACITY,
-            free: self.available.len(),
+            free: self.recycler.free.load(Ordering::Relaxed),
             inventory: self.inventory.available_permits(),
             detached: self.detached.load(Ordering::Relaxed),
             recycled: self.recycler.recycled.load(Ordering::Relaxed),
@@ -679,6 +688,7 @@ pub(crate) struct ReceiveBatch {
     /// Boxed fixed slots keep the kernel target stable even while an ordinary
     /// direct packet is detached for the consumer. `detach_datagram` replaces
     /// a slot before the next syscall and refreshes its iovec.
+    #[allow(clippy::vec_box)]
     packets: Vec<Box<Packet>>,
     pool: ReceiveBufferPool,
     /// Present only while GRO is active. Dropping this after a permanent
@@ -709,11 +719,16 @@ impl ReceiveBatch {
     pub(crate) fn new(socket: &UdpSocket, disable_gro: bool) -> Self {
         let gro_enabled = !disable_gro && try_enable_udp_gro(socket);
         if disable_gro {
-            eprintln!("rustscale: Linux UDP GRO receive disabled by RUSTSCALE_DISABLE_UDP_GRO");
+            eprintln!(
+                "rustscale: Linux UDP GRO receive disabled (set RUSTSCALE_ENABLE_UDP_GRO=1 to opt in)"
+            );
         }
-        // Queue-overflow accounting is independent and remains useful after a
-        // GRO circuit break or when GRO was disabled by the startup knob.
-        let _ = enable_rxq_overflow(socket);
+        // Keep the default plain recvmmsg path identical to the last
+        // known-good implementation: no ancillary messages are requested.
+        // Queue-overflow accounting is part of the explicit GRO opt-in.
+        if gro_enabled {
+            let _ = enable_rxq_overflow(socket);
+        }
         Self::with_gro(gro_enabled)
     }
 
@@ -901,12 +916,10 @@ impl ReceiveBatch {
         hdr.msg_namelen = mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
         hdr.msg_iov = ptr::addr_of_mut!(self.iovecs[index]);
         hdr.msg_iovlen = 1;
-        // Keep RXQ ancillary capacity in the plain 128-slot reader too.
-        // SO_RXQ_OVFL stays enabled after a GRO circuit break, and without
-        // this buffer a nonzero loss notification could cause MSG_CTRUNC and
-        // turn a valid plain packet into a persistent drop loop.
-        hdr.msg_control = self.controls[index].as_mut_ptr();
-        hdr.msg_controllen = RECEIVE_CONTROL_SPACE as _;
+        if self.gro_enabled {
+            hdr.msg_control = self.controls[index].as_mut_ptr();
+            hdr.msg_controllen = RECEIVE_CONTROL_SPACE as _;
+        }
         self.headers[index] = libc::mmsghdr {
             msg_hdr: hdr,
             msg_len: 0,
@@ -917,7 +930,7 @@ impl ReceiveBatch {
         self.count = 0;
         for index in 0..received {
             self.validate_message(index, LOGICAL_PACKET_CAPACITY)?;
-            let control_len = self.headers[index].msg_hdr.msg_controllen as usize;
+            let control_len = normalize_control_len(self.headers[index].msg_hdr.msg_controllen)?;
             if control_len > RECEIVE_CONTROL_SPACE {
                 return invalid_data("kernel returned oversized ancillary data");
             }
@@ -945,7 +958,7 @@ impl ReceiveBatch {
             self.validate_message(index, GRO_PACKET_CAPACITY)?;
             let length = self.headers[index].msg_len as usize;
             let source = socket_addr(&self.names[index], self.headers[index].msg_hdr.msg_namelen)?;
-            let control_len = self.headers[index].msg_hdr.msg_controllen as usize;
+            let control_len = normalize_control_len(self.headers[index].msg_hdr.msg_controllen)?;
             if control_len > RECEIVE_CONTROL_SPACE {
                 return invalid_data("kernel returned oversized ancillary data");
             }
@@ -1215,6 +1228,13 @@ fn invalid_data<T>(message: &'static str) -> io::Result<T> {
     Err(io::Error::new(io::ErrorKind::InvalidData, message))
 }
 
+fn normalize_control_len<T: TryInto<usize>>(value: T) -> io::Result<usize> {
+    match value.try_into() {
+        Ok(value) => Ok(value),
+        Err(_) => invalid_data("kernel returned unrepresentable ancillary data length"),
+    }
+}
+
 /// Send an ordered batch with per-message UDP_SEGMENT control data.
 ///
 /// The successful prefix is returned in original datagram units, not planned
@@ -1363,6 +1383,7 @@ mod tests {
         batch.headers[index].msg_len = packet.len() as _;
         batch.headers[index].msg_hdr.msg_namelen = mem::size_of::<libc::sockaddr_in>() as _;
         batch.headers[index].msg_hdr.msg_flags = 0;
+        batch.headers[index].msg_hdr.msg_controllen = 0;
     }
 
     fn pooled_publication_parts(
@@ -2164,7 +2185,7 @@ mod tests {
         assert_eq!(batch.headers[index].msg_len, 0);
         assert_eq!(batch.headers[index].msg_hdr.msg_flags, 0);
         assert_eq!(
-            batch.headers[index].msg_hdr.msg_controllen as usize,
+            normalize_control_len(batch.headers[index].msg_hdr.msg_controllen).unwrap(),
             RECEIVE_CONTROL_SPACE
         );
         assert_eq!(batch.names[index].ss_family, 0);
@@ -2322,8 +2343,8 @@ mod tests {
             assert_eq!((*header).cmsg_level, libc::IPPROTO_UDP);
             assert_eq!((*header).cmsg_type, UDP_SEGMENT);
             assert_eq!(
-                (*header).cmsg_len as usize,
-                libc::CMSG_LEN(UDP_SEGMENT_DATA_LEN as _) as usize
+                normalize_control_len((*header).cmsg_len).unwrap(),
+                normalize_control_len(libc::CMSG_LEN(UDP_SEGMENT_DATA_LEN as _)).unwrap()
             );
             let payload = std::slice::from_raw_parts(libc::CMSG_DATA(header), UDP_SEGMENT_DATA_LEN);
             assert_eq!(payload, 1234u16.to_ne_bytes());

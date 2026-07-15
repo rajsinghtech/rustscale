@@ -215,7 +215,7 @@ pub(crate) fn spawn_map_update_task(
                             )
                             .await
                             {
-                                Ok(new_key) => {
+                                Ok(Some(new_key)) => {
                                     node_key = new_key.clone();
                                     node_pub = new_key.public();
                                     key_expired.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -261,6 +261,11 @@ pub(crate) fn spawn_map_update_task(
                                     map_rx = new_rx;
                                     log::info!(
                                         "tsnet: key rotation complete, map poll restarted with new node key"
+                                    );
+                                }
+                                Ok(None) => {
+                                    log::info!(
+                                        "tsnet: current key remains globally expired; waiting for control update"
                                     );
                                 }
                                 Err(e) => {
@@ -552,18 +557,20 @@ pub(crate) fn spawn_map_update_task(
     })
 }
 
-/// Re-register with the control server after a key expiry, using
-/// `OldNodeKey` (public of the old key) and a fresh `NodeKey`.
+/// Re-register with the control server after a key expiry.
 ///
 /// Mirrors Go's `doLogin` with `regen=true` (`direct.go:739-926`):
-/// 1. Save current key as `OldPrivateNodeKey`.
-/// 2. Generate a fresh node key.
+/// 1. Refresh the current key. If control reports it expired, regenerate it.
+/// 2. Save current key as `OldPrivateNodeKey` and generate a fresh node key.
 /// 3. Send `RegisterRequest` with `OldNodeKey` + `NodeKey`.
-/// 4. If `resp.NodeKeyExpired`, retry with another fresh key (max 2).
-/// 5. If `resp.AuthURL` is non-empty, send a followup and block until
+/// 4. If `resp.AuthURL` is non-empty, send a followup and block until
 ///    interactive auth completes.
-/// 6. On success, persist the new key, re-key magicsock, and clear WG
+/// 5. On success, persist the new key, re-key magicsock, and clear WG
 ///    tunnels so they are recreated with the new key.
+///
+/// `Ok(None)` means control also rejected the fresh replacement key, which
+/// indicates a global expiry policy. The current map stream remains active so
+/// an un-expire update can recover.
 async fn perform_key_rotation(
     ctx: &KeyRotationCtx,
     current_key: &NodePrivate,
@@ -571,14 +578,58 @@ async fn perform_key_rotation(
     wg_tunnels: &Arc<RwLock<HashMap<NodePublic, Arc<Mutex<WgTunn>>>>>,
     state_dir: Option<&std::path::Path>,
     ipn_backend: &Arc<IpnBackend>,
-) -> Result<NodePrivate, String> {
+) -> Result<Option<NodePrivate>, String> {
     let old_key = current_key.clone();
     let old_pub = old_key.public();
 
-    let mut trying_key = NodePrivate::generate();
-    let mut old_node_key = old_pub.clone();
+    // Match the upstream client's refresh-before-regenerate behavior. An
+    // expired current key requires regeneration; a replacement that is also
+    // expired indicates a global expiry policy and must not be promoted.
+    let refresh_req = RegisterRequest {
+        Version: ctx.capability_version,
+        NodeKey: old_pub.clone(),
+        Auth: if ctx.auth_key.is_empty() {
+            None
+        } else {
+            Some(rustscale_tailcfg::RegisterResponseAuth {
+                AuthKey: ctx.auth_key.clone(),
+            })
+        },
+        Hostinfo: Some(Hostinfo {
+            OS: std::env::consts::OS.to_string(),
+            Hostname: ctx.hostname.clone(),
+            RoutableIPs: ctx.advertise_routes.clone(),
+            PeerRelay: ctx.peer_relay_server,
+            ShieldsUp: ctx.shields_up,
+            ..Default::default()
+        }),
+        Ephemeral: ctx.ephemeral,
+        ..Default::default()
+    };
+    let refresh = ControlClient::new(
+        ctx.control_url.clone(),
+        ctx.machine_key.clone(),
+        ctx.server_pub_key.clone(),
+        ctx.protocol_version,
+    )
+    .register(&refresh_req)
+    .await
+    .map_err(|e| format!("refresh register: {e}"))?;
+    if !refresh.Error.is_empty() {
+        return Err(format!(
+            "control rejected refresh registration: {}",
+            refresh.Error
+        ));
+    }
+    if !refresh.NodeKeyExpired {
+        // The expiry was cleared between the map update and registration.
+        // Keep the current identity and let the caller restart its map poll.
+        return Ok(Some(old_key));
+    }
+    let trying_key = NodePrivate::generate();
+    let old_node_key = old_pub.clone();
 
-    for attempt in 0..=2u32 {
+    {
         let new_pub = trying_key.public();
 
         let reg_req = RegisterRequest {
@@ -621,12 +672,28 @@ async fn perform_key_rotation(
         }
 
         if resp.NodeKeyExpired {
-            log::info!(
-                "tsnet: key rotation attempt {attempt}: server says NodeKeyExpired, regenerating"
-            );
-            old_node_key = new_pub;
-            trying_key = NodePrivate::generate();
-            continue;
+            log::info!("tsnet: replacement key is also expired; retaining current map stream");
+
+            // Some control implementations transfer the node record to
+            // OldNodeKey's replacement before reporting global expiry. Roll
+            // that tentative transfer back so the current map stream can
+            // reconnect after the global policy is cleared.
+            let mut rollback_req = reg_req.clone();
+            rollback_req.NodeKey = old_pub.clone();
+            rollback_req.OldNodeKey = new_pub;
+            match cc.register(&rollback_req).await {
+                Ok(rollback) if !rollback.Error.is_empty() => {
+                    log::warn!(
+                        "tsnet: control rejected expired-key rollback: {}",
+                        rollback.Error
+                    );
+                }
+                Err(error) => {
+                    log::warn!("tsnet: expired-key rollback failed: {error}");
+                }
+                _ => {}
+            }
+            return Ok(None);
         }
 
         // If interactive auth is required, emit BrowseToURL and block on
@@ -672,10 +739,10 @@ async fn perform_key_rotation(
                 ));
             }
             if followup_resp.NodeKeyExpired {
-                log::info!("tsnet: followup returned NodeKeyExpired, regenerating");
-                old_node_key = new_pub;
-                trying_key = NodePrivate::generate();
-                continue;
+                log::info!(
+                    "tsnet: authenticated replacement key is expired; retaining current map stream"
+                );
+                return Ok(None);
             }
         }
 
@@ -704,10 +771,8 @@ async fn perform_key_rotation(
             old_pub,
             trying_key.public()
         );
-        return Ok(trying_key);
+        Ok(Some(trying_key))
     }
-
-    Err("key rotation exhausted retries (max 2)".into())
 }
 
 /// Apply an incremental [`PeerChange`] patch to an existing [`Node`].

@@ -23,7 +23,6 @@ if [ -n "$CRATE" ]; then
 else
   PKG=(); WS=(--workspace)
 fi
-
 # Run clippy once, capture all output, extract warning lines, deduplicate.
 TMP=$(mktemp)
 trap 'rm -f "$TMP"' EXIT

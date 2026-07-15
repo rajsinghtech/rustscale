@@ -30,7 +30,7 @@ fi
 TITLE="${1:?usage: codex-task.sh [--continue] <title> <prompt> [deadline-seconds]}"
 PROMPT="${2:?usage: codex-task.sh [--continue] <title> <prompt> [deadline-seconds]}"
 DEADLINE="${3:-2400}"
-MODEL="gpt-5.6-terra"
+MODEL="${CODEX_MODEL:-gpt-5.6-terra}"
 WT_DIR=""
 WT_BRANCH="agent/$TITLE"
 RUN_DIR=""
@@ -207,7 +207,7 @@ else
   BASE_SHA="$(read_metadata base_sha)"
   MODEL="$(read_metadata model)"
   SESSION_ID="$(read_metadata session_id)"
-  [[ "$MODEL" == gpt-5.6-terra ]] || fail "saved run does not use gpt-5.6-terra"
+  [[ -n "$MODEL" ]] || fail "saved run has no model ID"
   [[ -n "$WT_DIR" && -d "$WT_DIR" ]] || fail "saved worktree is unavailable: ${WT_DIR:-unknown}"
   [[ "$(git -C "$WT_DIR" branch --show-current)" == "$WT_BRANCH" ]] \
     || fail "saved worktree branch does not match metadata"

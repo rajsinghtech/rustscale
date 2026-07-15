@@ -8,16 +8,26 @@
 //! Deferred to later phases: session recording upload (PeerAPI stream),
 //! HoldAndDelegate, check/verification URLs, SFTP.
 
-use crate::incubator::{Incubator, IncubatorArgs, IncubatorError};
-use crate::recording::{CastHeader, RecordDir, RecordResult, RecordingConfig, SessionRecorder};
+use crate::incubator::IncubatorError;
+#[cfg(unix)]
+use crate::incubator::{Incubator, IncubatorArgs};
+use crate::recording::{CastHeader, RecordingConfig, SessionRecorder};
+#[cfg(unix)]
+use crate::recording::{RecordDir, RecordResult};
 use crate::recording_upload::DialFn;
-use crate::session::{Session, Window};
+use crate::session::Session;
+#[cfg(unix)]
+use crate::session::Window;
 
+#[cfg(unix)]
 use russh::{CryptoVec, Sig};
+#[cfg(unix)]
 use std::ffi::CString;
 use std::io;
 use std::net::IpAddr;
+#[cfg(unix)]
 use std::os::fd::{FromRawFd, RawFd};
+#[cfg(unix)]
 use tokio::io::AsyncReadExt;
 
 /// Initialize the recording backend before the shell is started.
@@ -84,6 +94,7 @@ fn recording_connect_failed(
 }
 
 /// Extended data type code for stderr (RFC 4254 section 5.2).
+#[cfg(unix)]
 const EXTENDED_DATA_STDERR: u32 = 1;
 
 /// Default PATH when the SSH client doesn't provide one.
@@ -184,6 +195,10 @@ pub fn get_local_user(username: &str) -> Result<LocalUser, SessionHandlerError> 
 /// Get the supplementary group list for a user via `getgrouplist`.
 #[cfg(unix)]
 fn get_group_list(cname: &CString, base_gid: libc::gid_t) -> Vec<u32> {
+    fn checked_gid<T: TryInto<u32>>(gid: T) -> Option<u32> {
+        gid.try_into().ok()
+    }
+
     // On macOS, getgrouplist takes c_int for groups; on Linux it takes gid_t.
     #[cfg(target_os = "macos")]
     type GidT = libc::c_int;
@@ -220,7 +235,8 @@ fn get_group_list(cname: &CString, base_gid: libc::gid_t) -> Vec<u32> {
 
     groups[..ngroups as usize]
         .iter()
-        .map(|&g| g as u32)
+        .copied()
+        .filter_map(checked_gid)
         .collect()
 }
 
@@ -370,6 +386,7 @@ fn set_winsize(fd: RawFd, win: &Window) -> Result<(), SessionHandlerError> {
 /// # Arguments
 /// * `session` — the accepted SSH session (from `SshListener::accept`)
 /// * `rec_config` — optional recording configuration (None = no recording)
+#[cfg(unix)]
 pub async fn run_session(
     mut session: Session,
     rec_config: Option<RecordingConfig>,
@@ -706,6 +723,17 @@ pub async fn run_session(
         }
     }
     Ok(exit_code)
+}
+
+/// Tailscale SSH sessions require Unix user, process, and PTY primitives.
+#[cfg(not(unix))]
+pub async fn run_session(
+    _session: Session,
+    _rec_config: Option<RecordingConfig>,
+) -> Result<i32, SessionHandlerError> {
+    Err(SessionHandlerError::LocalUser(
+        "SSH sessions are only supported on Unix".into(),
+    ))
 }
 
 #[cfg(test)]

@@ -2,9 +2,8 @@
 //!
 //! This is an in-memory result type (not a wire type), so it uses idiomatic
 //! `snake_case` Rust fields rather than Go's PascalCase. `MappingVariesByDestIP`
-//! and the other tri-state booleans are `Option<bool>`, matching the
-//! `tailcfg::OptBool` semantics documented in `docs/porting-notes.md` (`None` =
-//! unset, `Some(true)`/`Some(false)` = explicit).
+//! and the other tri-state booleans are `Option<bool>`: `None` is unset and
+//! `Some(true)`/`Some(false)` is explicit.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;

@@ -1,7 +1,7 @@
-# RustScale agent rules
+# RustScale agent guide
 
-RustScale exists to reach Tailscale/tsnet product parity while preserving or improving direct-path performance. Coding work uses `gpt-5.6-terra`; OpenCode DeepSeek is research-only.
+RustScale aims for Tailscale/tsnet compatibility while preserving or improving direct-path performance.
 
-Worktrees belong to their assigned task. Preserve unrelated dirty changes, never delete or overwrite another task's worktree, and inspect dirty trees before acting. Coding agents do not commit. Use the task-specific quiet gate (`tools/check.sh`, or `tools/bench/check.sh` for benchmark-only work), not ad-hoc Cargo acceptance commands.
+Keep changes scoped and preserve unrelated work, especially dirty worktrees. Use `tools/check.sh` for product changes, `tools/bench/check.sh` for benchmark-only changes, and `tools/agent/check.sh` for the agent harness. Do not claim compatibility or performance improvements without reproducible test or benchmark evidence.
 
-Direct-path benchmarks must keep identical CLI semantics, including `ping --until-direct`. Never claim performance without verified benchmark evidence.
+The optional agent harness under `tools/agent/` creates isolated worktrees and records run metadata. Its provider and model names are intentionally visible and configurable through the documented environment variables. See `docs/agent-harness.md`.

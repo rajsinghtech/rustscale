@@ -8,16 +8,21 @@
 # Usage:
 #   tools/gen-wire-fixtures.sh
 #
-# Requirements:
-#   - Go 1.26+ at /opt/homebrew/bin/go (or on $PATH)
-#   - The Tailscale Go repo at /Users/rajsingh/Documents/GitHub/tailscale
+# Requirements: Go 1.26+ on PATH.
 set -euo pipefail
 
-GO_REPO="${TAILSCALE_GO_REPO:-/Users/rajsingh/Documents/GitHub/tailscale}"
-GO_BIN="${GO_BIN:-/opt/homebrew/bin/go}"
+TAILSCALE_GO_VERSION="${TAILSCALE_GO_VERSION:-v1.100.0}"
+GO_BIN="${GO_BIN:-$(command -v go || true)}"
 OUT_DIR="$(cd "$(dirname "$0")/.." && pwd)/crates/wire-fixture/fixtures"
 
-GEN_FILE="/tmp/gen_wire_fixtures.go"
+if [ -z "$GO_BIN" ] || [ ! -x "$GO_BIN" ]; then
+  echo "Go 1.26+ is required; install Go or set GO_BIN" >&2
+  exit 1
+fi
+
+TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/rustscale-wire-fixtures.XXXXXX")"
+trap 'rm -rf "$TMP_DIR"' EXIT
+GEN_FILE="$TMP_DIR/main.go"
 
 cat > "$GEN_FILE" << 'GOEOF'
 package main
@@ -408,5 +413,9 @@ func mustAddrPort(s string) netip.AddrPort {
 }
 GOEOF
 
-echo "Running Go fixture generator from $GO_REPO ..."
-cd "$GO_REPO" && "$GO_BIN" run "$GEN_FILE" "$OUT_DIR"
+echo "Running Go fixture generator with tailscale.com@$TAILSCALE_GO_VERSION ..."
+cd "$TMP_DIR"
+"$GO_BIN" mod init rustscale-wire-fixture-generator >/dev/null
+"$GO_BIN" mod edit -require="tailscale.com@$TAILSCALE_GO_VERSION"
+"$GO_BIN" mod tidy
+"$GO_BIN" run . "$OUT_DIR"

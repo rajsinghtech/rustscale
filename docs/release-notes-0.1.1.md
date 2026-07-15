@@ -1,7 +1,7 @@
 # rustscale 0.1.1
 
 rustscale 0.1.1 is a large compatibility and production-readiness update. The
-workspace now contains 66 Rust crates and substantially expands client, CLI,
+workspace now contains 75 Rust crates and substantially expands client, CLI,
 LocalAPI, network-monitoring, routing, logging, and TKA coverage. Linux TUN and
 direct-UDP hot paths received extensive batching and allocation work.
 

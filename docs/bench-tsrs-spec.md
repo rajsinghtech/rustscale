@@ -132,7 +132,7 @@ description = "Throughput and latency benchmark harness for tailscale-rs"
 version = "0.1.0"
 edition = "2021"
 license = "BSD-3-Clause"
-repository = "https://github.com/rajsingh/rustscale"
+repository = "https://github.com/rajsinghtech/rustscale"
 
 [dependencies]
 tailscale = { git = "https://github.com/tailscale/tailscale-rs.git", tag = "v0.4.0" }

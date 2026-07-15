@@ -213,9 +213,24 @@ func handleAddFakeNode(control *testcontrol.Server) http.HandlerFunc {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
+		existing := make(map[key.NodePublic]bool)
+		for _, node := range control.AllNodes() {
+			existing[node.Key] = true
+		}
+
 		control.AddFakeNode()
-		log.Printf("AddFakeNode called")
-		w.WriteHeader(http.StatusNoContent)
+		for _, node := range control.AllNodes() {
+			if !existing[node.Key] {
+				// AddFakeNode updates the node map but intentionally does not notify
+				// streaming clients. UpdateNode publishes the new peer immediately.
+				control.UpdateNode(node)
+				log.Printf("AddFakeNode called and update published")
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+		}
+
+		http.Error(w, "fake node was not created", http.StatusInternalServerError)
 	}
 }
 
@@ -247,7 +262,7 @@ type nodeInfo struct {
 }
 
 type nodesResponse struct {
-	Count int       `json:"count"`
+	Count int        `json:"count"`
 	Nodes []nodeInfo `json:"nodes"`
 }
 
@@ -279,8 +294,8 @@ func handleNodes(control *testcontrol.Server) http.HandlerFunc {
 }
 
 type rawMapResponseRequest struct {
-	NodeKey          string          `json:"nodeKey"`
-	MapResponseJSON  json.RawMessage `json:"mapResponseJSON"`
+	NodeKey         string          `json:"nodeKey"`
+	MapResponseJSON json.RawMessage `json:"mapResponseJSON"`
 }
 
 func handleRawMapResponse(control *testcontrol.Server) http.HandlerFunc {

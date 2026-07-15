@@ -46,6 +46,7 @@ try {
         -Version '0.1.1' -NoPath *> $null
     if ($LASTEXITCODE -eq 0) { throw 'tampered Windows archive unexpectedly installed' }
     if (Test-Path $Installed) { throw 'failed Windows install left files behind' }
+    $global:LASTEXITCODE = 0
 
     Write-Host 'Windows packaging installer tests: ok'
 } finally {

@@ -16,7 +16,7 @@ use crate::types::{ConflictKind, Severity};
 pub fn check_ip_forwarding(routes: &[IpPrefix]) -> Vec<Conflict> {
     #[cfg(target_os = "linux")]
     {
-        return check_ip_forwarding_from_reader(routes, |path| std::fs::read_to_string(path).ok());
+        check_ip_forwarding_from_reader(routes, |path| std::fs::read_to_string(path).ok())
     }
 
     #[cfg(not(target_os = "linux"))]

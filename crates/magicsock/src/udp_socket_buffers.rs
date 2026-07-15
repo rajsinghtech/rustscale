@@ -13,6 +13,7 @@ use tokio::net::UdpSocket;
 pub(crate) const SOCKET_BUFFER_SIZE: usize = 7 << 20;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(clippy::enum_variant_names)]
 enum BufferOutcome {
     #[cfg(target_os = "linux")]
     ForceSucceeded,

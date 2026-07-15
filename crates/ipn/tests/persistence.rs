@@ -2,8 +2,6 @@
 //! process restart by dropping all in-memory state and re-loading from disk,
 //! then assert every field roundtrips.
 //!
-//! See docs/regression-strategy.md G4.
-
 #![allow(non_snake_case)]
 
 use rustscale_ipn::{AppConnectorPrefs, LoginProfile, NetworkProfile, Prefs, UserProfile};

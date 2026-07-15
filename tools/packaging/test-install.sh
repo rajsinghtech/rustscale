@@ -6,7 +6,7 @@ set -eu
 unset GH_TOKEN GITHUB_TOKEN || true
 
 ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
-TMP=$(mktemp -d -t rustscale-packaging-test)
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/rustscale-packaging-test.XXXXXX")
 trap 'rm -rf "$TMP"' EXIT
 
 VERSION=v0.1.1

@@ -378,7 +378,7 @@ impl TunDevice {
                 }
                 let error = io::Error::last_os_error();
                 match classify_write_error(&error) {
-                    WriteRetry::Immediate => continue,
+                    WriteRetry::Immediate => {}
                     WriteRetry::WaitWritable | WriteRetry::Terminal => return Err(error),
                 }
             }) {
@@ -433,7 +433,7 @@ impl TunDevice {
 
 /// Descriptor failures cannot make progress by polling a later frame.
 fn terminal_write_error(error: &io::Error) -> bool {
-    matches!(error.raw_os_error(), Some(libc::EBADF) | Some(libc::EBADFD))
+    matches!(error.raw_os_error(), Some(libc::EBADF | libc::EBADFD))
 }
 
 /// Return the allocation size for one TUN packet read.
@@ -789,7 +789,7 @@ mod tests {
             (libc::IFF_TUN | libc::IFF_NO_PI) as libc::c_short | 0x4000
         );
         assert_eq!(TUN_F_CSUM | TUN_F_TSO4 | TUN_F_TSO6, 0x07);
-        assert_eq!(libc::TUNSETOFFLOAD as u64, 0x4004_54d0);
+        assert_eq!(libc::TUNSETOFFLOAD, 0x4004_54d0);
         assert_eq!(VNET_READ_LEN, offload::VIRTIO_NET_HDR_LEN + 65_535);
     }
 

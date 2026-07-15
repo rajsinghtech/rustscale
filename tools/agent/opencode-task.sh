@@ -49,9 +49,8 @@ PROMPT="${2:?prompt text}"
 DEADLINE="${3:-2400}"
 [[ "$DEADLINE" =~ ^[1-9][0-9]*$ ]] || fail "deadline must be a positive integer"
 
-if [[ "$MODEL" != "deepseek/deepseek-v4-flash" && "${OPENCODE_ALLOW_NON_DEEPSEEK_DIAGNOSTICS:-}" != "1" ]]; then
-  fail "refusing model '$MODEL'; only deepseek/deepseek-v4-flash is permitted (set OPENCODE_ALLOW_NON_DEEPSEEK_DIAGNOSTICS=1 for diagnostics)"
-fi
+[[ -n "$PROVIDER" ]] || fail "provider ID must not be empty"
+[[ -n "$MODEL" ]] || fail "model ID must not be empty"
 
 # A research session must leave the repository byte-for-byte unchanged. Compare
 # porcelain-v2 snapshots at every exit, including watchdog and API failures.

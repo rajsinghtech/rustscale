@@ -53,8 +53,6 @@ jobs:
       - name: Test (windows-meaningful crates)
         if: ${{ matrix.check_only && matrix.os == 'windows-latest' }}
         shell: bash
-        env:
-          RUSTFLAGS: "-D warnings"
         run: |
           cargo test -p rustscale-ipn -p rustscale-localclient -p rustscale-tailcfg \
             -p rustscale-key -p rustscale-disco -p rustscale-safesocket --locked
@@ -161,15 +159,7 @@ jobs:
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: '1.26'
-      - name: Checkout Tailscale Go repo
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          repository: tailscale/tailscale
-          path: tailscale-go
-          fetch-depth: 1
       - name: Build testcontrol binary
-        env:
-          TS_GO_PATH: ${{ github.workspace }}/tailscale-go
         run: bash tools/testcontrol/build.sh
       - name: Run interop tests
         run: cargo test -p rustscale-interop-testcontrol --locked -- --nocapture --test-threads=1

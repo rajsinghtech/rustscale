@@ -606,7 +606,7 @@ fn realistic_map_response_fixture_with_nulls() {
       "UserProfiles": [
         {
           "ID": 42,
-          "LoginName": "rajsinghtech@",
+          "LoginName": "user@example.com",
           "DisplayName": "Raj",
           "ProfilePicURL": ""
         }

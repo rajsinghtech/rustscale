@@ -3,7 +3,8 @@
 # pattern. Prevents agents from reading full Go files just to locate a struct
 # definition or function signature.
 #
-# The Go reference tree is read-only at /Users/rajsingh/Documents/GitHub/tailscale.
+# The Go reference tree is read-only. By default this uses the pinned canonical
+# Go module; set TAILSCALE_GO_REPO to search a full clone instead.
 # This script searches it with ripgrep (or grep) and prints file:line:matched
 # lines with the function/type context header.
 #
@@ -21,7 +22,20 @@
 #   tools/go-find.sh -f magicsock      # find all top-level funcs in magicsock
 set -euo pipefail
 
-GO_TREE="/Users/rajsingh/Documents/GitHub/tailscale"
+if [[ -n "${TAILSCALE_GO_REPO:-}" ]]; then
+  GO_TREE="$TAILSCALE_GO_REPO"
+else
+  command -v go >/dev/null 2>&1 || {
+    echo "$0: go is required unless TAILSCALE_GO_REPO is set" >&2
+    exit 1
+  }
+  GO_TREE="$(go mod download -json tailscale.com@v1.100.0 |
+    sed -n 's/^[[:space:]]*"Dir": "\([^"]*\)",/\1/p')"
+fi
+[[ -n "$GO_TREE" ]] || {
+  echo "$0: could not locate tailscale.com@v1.100.0" >&2
+  exit 1
+}
 PATTERN=""
 SUBDIR=""
 MODE="grep"
@@ -45,10 +59,9 @@ fi
 
 PATTERN="$1"
 SUBDIR="${2:-}"
-SEARCH_DIR="$GO_TREE"
-[ -n "$SUBDIR" ] && SEARCH_DIR="$GO_TREE/$SUBDIR"
+SEARCH_DIR="${SUBDIR:-.}"
 
-if [ ! -d "$SEARCH_DIR" ]; then
+if [ ! -d "$GO_TREE/$SEARCH_DIR" ]; then
   echo "$0: not found: $SEARCH_DIR" >&2
   exit 1
 fi
@@ -73,7 +86,7 @@ case "$MODE" in
 esac
 
 if command -v rg >/dev/null 2>&1; then
-  rg "${RG_OPTS[@]}" -i "$PATTERN" "$SEARCH_DIR" 2>/dev/null || true
+  (cd "$GO_TREE" && rg "${RG_OPTS[@]}" -i "$PATTERN" "$SEARCH_DIR" 2>/dev/null) || true
 else
-  find "$SEARCH_DIR" -name '*.go' -exec grep -n -i "$PATTERN" {} + 2>/dev/null || true
+  (cd "$GO_TREE" && find "$SEARCH_DIR" -name '*.go' -exec grep -n -i "$PATTERN" {} + 2>/dev/null) || true
 fi

@@ -1,5 +1,6 @@
 [package]
 name = "rustscale-speedtest"
+description = "TCP throughput test protocol for rustscale"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

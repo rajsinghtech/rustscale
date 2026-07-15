@@ -82,16 +82,27 @@ test_check_failure_runs_once() {
 }
 
 # shellcheck disable=SC2016 # The temporary curl stub must retain its variables.
-test_model_rejection() {
-  new_repo model-rejection
+test_model_override() {
+  new_repo model-override
   mkdir "$REPO/bin"
-  printf '%s\n' '#!/usr/bin/env bash' 'echo curl-called >>"$CURL_LOG"; exit 1' >"$REPO/bin/curl"
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'set -eu' \
+    'args="$*"' \
+    'printf "%s\\n" "$args" >>"$CURL_LOG"' \
+    'case "$args" in' \
+    '  *api/health*) exit 0 ;;' \
+    '  *"/session?"*) printf "%s\\n" "{\"id\":\"ses_test\"}" ;;' \
+    '  *prompt_async*) exit 0 ;;' \
+    '  *session/status*) printf "%s\\n" "{}" ;;' \
+    '  *"/message?"*) printf "%s\\n" "[{\"info\":{\"role\":\"assistant\"},\"parts\":[{\"type\":\"text\",\"text\":\"research complete\"}]}]" ;;' \
+    '  *) exit 1 ;;' \
+    'esac' >"$REPO/bin/curl"
   chmod +x "$REPO/bin/curl"
   : >"$REPO/curl.log"
-  output=$(expect_failure env PATH="$REPO/bin:$PATH" CURL_LOG="$REPO/curl.log" OPENCODE_MODEL=not-deepseek \
+  output=$(env PATH="$REPO/bin:$PATH" CURL_LOG="$REPO/curl.log" OPENCODE_MODEL=example/model \
     "$REPO/tools/agent/opencode-task.sh" research prompt)
-  assert_contains "$output" 'refusing model'
-  [[ ! -s "$REPO/curl.log" ]] || fail 'rejected model contacted the server'
+  [[ "$output" == 'research complete' ]] || fail 'OpenCode model override did not return its result'
+  assert_contains "$(cat "$REPO/curl.log")" 'example/model'
 }
 
 # shellcheck disable=SC2016 # The temporary curl stub must retain its variables.
@@ -148,11 +159,11 @@ test_codex_arguments_and_dirty_main() {
     'printf "%s\\n" "final answer" >"$out"' \
     'printf "%s\\n" "$CODEX_JSON"' >"$REPO/bin/codex"
   chmod +x "$REPO/bin/codex"
-  PATH="$REPO/bin:$PATH" CODEX_ARGS="$REPO/args" CODEX_JSON='{"type":"thread.started","thread_id":"thread_exact"}' \
+  PATH="$REPO/bin:$PATH" CODEX_MODEL=example-model CODEX_ARGS="$REPO/args" CODEX_JSON='{"type":"thread.started","thread_id":"thread_exact"}' \
     "$REPO/tools/agent/codex-task.sh" exact 'implement this'
   assert_contains "$(cat "$REPO/args")" 'exec'
   assert_contains "$(cat "$REPO/args")" '--json'
-  assert_contains "$(cat "$REPO/args")" 'gpt-5.6-terra'
+  assert_contains "$(cat "$REPO/args")" 'example-model'
   assert_contains "$(cat "$REPO/args")" 'Do not commit changes and do not spawn agents.'
   assert_contains "$(cat "$REPO/args")" 'implement this'
   assert_contains "$(cat "$REPO/.agent-runs/codex/exact/metadata.json")" 'thread_exact'
@@ -621,7 +632,7 @@ test_final_gate_preserves_worktree() {
 
 test_production_wrappers_are_executable
 test_check_failure_runs_once
-test_model_rejection
+test_model_override
 test_opencode_default_model
 test_opencode_continue_rejected
 test_codex_arguments_and_dirty_main

@@ -36,7 +36,6 @@ if [[ "$MASTER_SHA" != "$ORIGIN_MASTER_SHA" ]]; then
   echo "NEXT: reconcile local master with origin/master, then rerun tools/agent/agent-review.sh $TITLE" >&2
   exit 1
 fi
-
 BASE="$(git -C "$WT_DIR" merge-base "$MASTER_SHA" HEAD)"
 HEAD="$(git -C "$WT_DIR" rev-parse HEAD)"
 ahead="$(git -C "$WT_DIR" rev-list --count master..HEAD)"

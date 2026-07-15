@@ -7,11 +7,9 @@
 
 #![forbid(unsafe_code)]
 
-use std::{
-    fmt,
-    net::IpAddr,
-    process::{Command, Stdio},
-};
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use std::process::{Command, Stdio};
+use std::{fmt, net::IpAddr};
 
 use rustscale_tsaddr::IpPrefix;
 
@@ -171,6 +169,7 @@ pub enum RouterError {
 }
 
 impl RouterError {
+    #[cfg(any(target_os = "macos", target_os = "linux", test))]
     fn non_fatal(&self) -> bool {
         let Self::Command {
             program,
@@ -257,13 +256,16 @@ pub trait Router: Send + Sync {
     fn close(&mut self) -> Result<(), RouterError>;
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 trait CommandRunner: Send + Sync {
     fn run(&mut self, program: &str, args: &[String]) -> Result<(), RouterError>;
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[derive(Default)]
 struct SystemCommandRunner;
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 impl CommandRunner for SystemCommandRunner {
     fn run(&mut self, program: &str, args: &[String]) -> Result<(), RouterError> {
         let output = Command::new(program)
@@ -285,8 +287,10 @@ impl CommandRunner for SystemCommandRunner {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 type CommandSpec = (String, Vec<String>);
 
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 trait Platform: Send + Sync {
     fn commands(&self, operation: &RouterOperation) -> Vec<CommandSpec>;
 
@@ -296,6 +300,7 @@ trait Platform: Send + Sync {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 struct StatefulRouter<P, R> {
     platform: P,
     runner: R,
@@ -303,6 +308,7 @@ struct StatefulRouter<P, R> {
     is_up: bool,
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 impl<P: Platform, R: CommandRunner> StatefulRouter<P, R> {
     fn new(platform: P, runner: R) -> Self {
         Self {
@@ -344,6 +350,7 @@ impl<P: Platform, R: CommandRunner> StatefulRouter<P, R> {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 impl<P: Platform, R: CommandRunner> Router for StatefulRouter<P, R> {
     fn up(&mut self) -> Result<(), RouterError> {
         if self.is_up {
@@ -514,7 +521,7 @@ impl LinuxPlatform {
         ("ip".into(), args)
     }
 
-    fn policy_rules(&self, add: bool) -> Vec<(String, Vec<String>)> {
+    fn policy_rules(add: bool) -> Vec<(String, Vec<String>)> {
         let verb = if add { "add" } else { "del" };
         let rules = [
             (5210, Some("main")),
@@ -524,7 +531,16 @@ impl LinuxPlatform {
         ];
         let mut commands = Vec::with_capacity(8);
         for family in ["-4", "-6"] {
-            for (pref, table) in rules {
+            for offset in 0..rules.len() {
+                // Remove each family's rules in the reverse order from
+                // installation, without reversing the IPv4/IPv6 family
+                // order itself.
+                let index = if add {
+                    offset
+                } else {
+                    rules.len() - 1 - offset
+                };
+                let (pref, table) = rules[index];
                 let mut args = vec![
                     family.into(),
                     "rule".into(),
@@ -562,7 +578,7 @@ impl Platform for LinuxPlatform {
                         "down".into(),
                     ],
                 )];
-                commands.extend(self.policy_rules(false));
+                commands.extend(Self::policy_rules(false));
                 commands
             }
             RouterOperation::AddAddr(address) => vec![("ip".into(), {
@@ -641,8 +657,8 @@ impl Platform for LinuxPlatform {
         // priorities first, then add the current rules. The unmarked deletes
         // also remove stale fwmark variants after a crash or an upgrade.
         vec![
-            self.policy_rules(false),
-            self.policy_rules(true),
+            Self::policy_rules(false),
+            Self::policy_rules(true),
             vec![(
                 "ip".into(),
                 vec![
@@ -1079,8 +1095,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_policy_rules_match_tailscale_base_chain() {
-        let platform = LinuxPlatform::new("tailscale0");
-        let commands = platform.policy_rules(true);
+        let commands = LinuxPlatform::policy_rules(true);
         assert_eq!(
             &commands[..],
             [
@@ -1195,7 +1210,7 @@ mod tests {
             ]
         );
 
-        let down: Vec<_> = platform.policy_rules(false).into_iter().rev().collect();
+        let down = LinuxPlatform::policy_rules(false);
         assert_eq!(
             &down[..8],
             [
@@ -1424,14 +1439,14 @@ mod tests {
         assert_eq!(
             actual,
             [
-                "ip -4 rule del pref 5210 table main",
-                "ip -4 rule del pref 5230 table default",
-                "ip -4 rule del pref 5250 type unreachable",
                 "ip -4 rule del pref 5270 table 52",
-                "ip -6 rule del pref 5210 table main",
-                "ip -6 rule del pref 5230 table default",
-                "ip -6 rule del pref 5250 type unreachable",
+                "ip -4 rule del pref 5250 type unreachable",
+                "ip -4 rule del pref 5230 table default",
+                "ip -4 rule del pref 5210 table main",
                 "ip -6 rule del pref 5270 table 52",
+                "ip -6 rule del pref 5250 type unreachable",
+                "ip -6 rule del pref 5230 table default",
+                "ip -6 rule del pref 5210 table main",
                 "ip -4 rule add pref 5210 fwmark 0x80000/0xff0000 table main",
                 "ip -4 rule add pref 5230 fwmark 0x80000/0xff0000 table default",
                 "ip -4 rule add pref 5250 fwmark 0x80000/0xff0000 type unreachable",

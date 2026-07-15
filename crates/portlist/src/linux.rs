@@ -106,6 +106,8 @@ fn is_localhost(ip: IpAddr) -> bool {
 
 /// Scan `/proc/net/{tcp,tcp6,udp,udp6}` for listening ports, then walk
 /// `/proc/*/fd/` to resolve process names.
+// Keep the same async API as the other platform implementations and callers.
+#[allow(clippy::unused_async)]
 pub async fn scan_ports(include_localhost: bool) -> Vec<Port> {
     let mut raw: Vec<(String, u16, u64)> = Vec::new();
 
@@ -215,7 +217,7 @@ fn resolve_pids(inodes: &[u64]) -> HashMap<u64, (String, u32)> {
 
 /// Minimal hex decoder (avoids pulling in a hex crate dependency).
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     let bytes = s.as_bytes();

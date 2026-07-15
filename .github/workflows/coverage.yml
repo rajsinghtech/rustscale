@@ -1,7 +1,6 @@
 name: Coverage
 
-# Informational coverage baseline. Once baseline is established, add a
-# threshold check (fail if overall < N%). See docs/regression-strategy.md G1.
+# Generate an informational coverage artifact for each push and pull request.
 
 on:
   push:

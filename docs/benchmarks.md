@@ -1,5 +1,9 @@
 # Benchmarks — rustscale vs tailscaled (Go)
 
+The maintained TUN comparison, optimized runtime profile, raw samples, and
+footprint summary live in [`PERFORMANCE.md`](../PERFORMANCE.md). This document
+describes the broader benchmark methodology and harnesses.
+
 Hard, comparable throughput and latency numbers for rustscale's userspace
 netstack against Go's tailscaled in userspace-networking mode. Both sides use
 in-process TCP/IP stacks (smoltcp vs gVisor/netstack) over the same WireGuard
@@ -66,7 +70,8 @@ UDP. The harness reports whatever path was actually used.
 # Local: source OAuth creds for ephemeral tailnet creation
 source .secrets/tailscale.env
 
-# CI: GitHub OIDC WIF (automatic, no secret needed)
+# CI runs credential-free harness self-tests only. Paid benchmark runs require
+# local credentials and are never started by pull-request CI.
 
 # Required tools (local):
 #   cargo, tailscaled, tailscale, iperf3, socat, ncat (nmap), python3, jq, curl
@@ -112,11 +117,10 @@ target/release/rustscale-bench latency --authkey tskey-... --target 100.64.0.1:5
 
 ### CI (GitHub Actions)
 
-```yaml
-# .github/workflows/bench.yml — workflow_dispatch only
-# Runs on Linux with iperf3 via apt, WIF auth for ephemeral tailnet.
-# Uploads bench-results/ as an artifact.
-```
+`.github/workflows/bench.yml` runs the credential-free `tools/bench/check.sh`
+self-tests on pull requests and manual dispatch. It does not authenticate to
+GCP or Tailscale, create paid resources, execute the production benchmark, or
+upload `bench-results/`. Production runs are explicit local operator actions.
 
 ## Results
 

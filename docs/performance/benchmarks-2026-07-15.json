@@ -1,0 +1,408 @@
+{
+  "description": "Curated source data for PERFORMANCE.md; source artifact hashes refer to the complete credential-free result JSON retained by project maintainers.",
+  "runs": [
+    {
+      "client_zone": "us-central1-b",
+      "cpu_platform": "Intel Haswell",
+      "daemon_binary_sha256": "72a5240d384973583194163ab4774941b02ff68376037214c4b4bb58e1d9e374",
+      "daemon_path": "/opt/rustscale/target/release/rustscaled",
+      "footprint": {
+        "binary_size_bytes": 16593136,
+        "cpu_avg_pct": 76.0,
+        "cpu_peak_pct": 123.0,
+        "rss_avg_kb": 18213.71,
+        "rss_peak_kb": 18304,
+        "samples": 129
+      },
+      "kernel_release": "6.8.0-1063-gcp",
+      "latency": {
+        "count": 50,
+        "loss": 0.0,
+        "p50_us": 976,
+        "p95_us": 1110,
+        "p99_us": 1160,
+        "received": 50,
+        "requested": 50,
+        "transmitted": 50
+      },
+      "machine_type": "n1-standard-4",
+      "path": "direct",
+      "path_class_reported": "direct",
+      "product": "rustscale",
+      "product_version": "rustscaled 0.1.1",
+      "repeat": 3,
+      "resolved_image": "https://www.googleapis.com/compute/v1/projects/ubuntu-os-cloud/global/images/ubuntu-2204-jammy-v20260713",
+      "run_id": "gcp-20260715-083739-35bbc8e50f",
+      "runtime": {
+        "linux_udp_batch": true,
+        "linux_udp_gro": true,
+        "rs_tun_inbound_pipeline": false,
+        "rs_tun_outbound_send_pipeline": false
+      },
+      "server_zone": "us-central1-a",
+      "source_artifact_sha256": "f97da08272d54621e39c2adc8d376f7a5a7ef5e0298efb980b94d5feafa65ebf",
+      "source_clean": true,
+      "source_commit": "ca56c1d0583249e97a3c68ca3ad00a48a0b95553",
+      "started_at_utc": "2026-07-15T08:37:39Z",
+      "throughput": [
+        {
+          "duration_s": 10,
+          "mbps": 1940.5615681932634,
+          "parallel": 1,
+          "samples_mbps": [
+            1940.5615681932634,
+            1859.1530589021927,
+            1995.557847983208
+          ],
+          "statistic": "median"
+        },
+        {
+          "duration_s": 10,
+          "mbps": 1904.5807520907517,
+          "parallel": 10,
+          "samples_mbps": [
+            1891.5257460159469,
+            1950.6557608272444,
+            1904.5807520907517
+          ],
+          "statistic": "median"
+        },
+        {
+          "duration_s": 10,
+          "mbps": 1650.5258321874112,
+          "parallel": 100,
+          "samples_mbps": [
+            1650.5258321874112,
+            1681.84265124275,
+            1564.3947177610683
+          ],
+          "statistic": "median"
+        }
+      ],
+      "topology_harness_label": "same-zone"
+    },
+    {
+      "client_zone": "us-central1-b",
+      "cpu_platform": "Intel Haswell",
+      "daemon_binary_sha256": "72a5240d384973583194163ab4774941b02ff68376037214c4b4bb58e1d9e374",
+      "daemon_path": "/opt/rustscale/target/release/rustscaled",
+      "footprint": {
+        "binary_size_bytes": 16593136,
+        "cpu_avg_pct": 97.3,
+        "cpu_peak_pct": 152.0,
+        "rss_avg_kb": 18344.68,
+        "rss_peak_kb": 18432,
+        "samples": 129
+      },
+      "kernel_release": "6.8.0-1063-gcp",
+      "latency": {
+        "count": 50,
+        "loss": 0.0,
+        "p50_us": 1080,
+        "p95_us": 1180,
+        "p99_us": 4000,
+        "received": 50,
+        "requested": 50,
+        "transmitted": 50
+      },
+      "machine_type": "n1-standard-4",
+      "path": "direct",
+      "path_class_reported": "direct",
+      "product": "rustscale",
+      "product_version": "rustscaled 0.1.1",
+      "repeat": 3,
+      "resolved_image": "https://www.googleapis.com/compute/v1/projects/ubuntu-os-cloud/global/images/ubuntu-2204-jammy-v20260713",
+      "run_id": "gcp-20260715-085022-076e87bd41",
+      "runtime": {
+        "linux_udp_batch": true,
+        "linux_udp_gro": true,
+        "rs_tun_inbound_pipeline": false,
+        "rs_tun_outbound_send_pipeline": true
+      },
+      "server_zone": "us-central1-a",
+      "source_artifact_sha256": "224739280fb1ffd77c41f3b4c5ee0d026397cebe93f923a84d587dd66805970e",
+      "source_clean": true,
+      "source_commit": "ca56c1d0583249e97a3c68ca3ad00a48a0b95553",
+      "started_at_utc": "2026-07-15T08:50:22Z",
+      "throughput": [
+        {
+          "duration_s": 10,
+          "mbps": 2152.120459422542,
+          "parallel": 1,
+          "samples_mbps": [
+            2177.4189216107443,
+            2152.120459422542,
+            2105.0803390414226
+          ],
+          "statistic": "median"
+        },
+        {
+          "duration_s": 10,
+          "mbps": 2237.541923015503,
+          "parallel": 10,
+          "samples_mbps": [
+            2237.541923015503,
+            2191.066345347091,
+            2252.4165548066685
+          ],
+          "statistic": "median"
+        },
+        {
+          "duration_s": 10,
+          "mbps": 1818.268492608393,
+          "parallel": 100,
+          "samples_mbps": [
+            1723.86301255051,
+            1896.5111080572674,
+            1818.268492608393
+          ],
+          "statistic": "median"
+        }
+      ],
+      "topology_harness_label": "same-zone"
+    },
+    {
+      "client_zone": "us-central1-b",
+      "cpu_platform": "Intel Haswell",
+      "daemon_binary_sha256": "8da02a9f8fde1847982d28cfc2f1d77849b26633f2250e26f5316c3617e4db18",
+      "daemon_path": "/usr/sbin/tailscaled",
+      "footprint": {
+        "binary_size_bytes": 41129586,
+        "cpu_avg_pct": 152.43,
+        "cpu_peak_pct": 248.0,
+        "rss_avg_kb": 52774.4,
+        "rss_peak_kb": 59136,
+        "samples": 130
+      },
+      "kernel_release": "6.8.0-1063-gcp",
+      "latency": {
+        "count": 50,
+        "loss": 0.0,
+        "p50_us": 1990,
+        "p95_us": 2160,
+        "p99_us": 2260,
+        "received": 50,
+        "requested": 50,
+        "transmitted": 50
+      },
+      "machine_type": "n1-standard-4",
+      "path": "direct",
+      "path_class_reported": "direct",
+      "product": "tailscaled",
+      "product_version": "1.98.9",
+      "repeat": 3,
+      "resolved_image": "https://www.googleapis.com/compute/v1/projects/ubuntu-os-cloud/global/images/ubuntu-2204-jammy-v20260713",
+      "run_id": "gcp-20260715-090601-02788a10b4",
+      "runtime": {
+        "linux_udp_batch": true,
+        "linux_udp_gro": true,
+        "rs_tun_inbound_pipeline": false,
+        "rs_tun_outbound_send_pipeline": true
+      },
+      "server_zone": "us-central1-a",
+      "source_artifact_sha256": "57c182afaf33cbf3469baa6199f8d701d88e0908ea25d418f3e97ae139cef9dd",
+      "source_clean": true,
+      "source_commit": "ca56c1d0583249e97a3c68ca3ad00a48a0b95553",
+      "started_at_utc": "2026-07-15T09:06:01Z",
+      "throughput": [
+        {
+          "duration_s": 10,
+          "mbps": 2071.445279168735,
+          "parallel": 1,
+          "samples_mbps": [
+            2071.445279168735,
+            2151.9720810652298,
+            1993.0519673462495
+          ],
+          "statistic": "median"
+        },
+        {
+          "duration_s": 10,
+          "mbps": 2355.811270758138,
+          "parallel": 10,
+          "samples_mbps": [
+            2345.591329550518,
+            2355.811270758138,
+            2400.140512536941
+          ],
+          "statistic": "median"
+        },
+        {
+          "duration_s": 10,
+          "mbps": 1602.3001992138354,
+          "parallel": 100,
+          "samples_mbps": [
+            1618.650411039844,
+            1577.879867983632,
+            1602.3001992138354
+          ],
+          "statistic": "median"
+        }
+      ],
+      "topology_harness_label": "same-zone"
+    },
+    {
+      "client_zone": "us-central1-b",
+      "cpu_platform": "Intel Cascade Lake",
+      "daemon_binary_sha256": "e3d59ba6ae67f92b6365d655a0bdd41d70c6d24295e34ca35ab9fc4b2eb146c2",
+      "daemon_path": "/opt/rustscale/target/release/rustscaled",
+      "footprint": {
+        "binary_size_bytes": 17781208,
+        "cpu_avg_pct": 93.86,
+        "cpu_peak_pct": 147.0,
+        "rss_avg_kb": 20857.05,
+        "rss_peak_kb": 20864,
+        "samples": 129
+      },
+      "kernel_release": "6.8.0-1063-gcp",
+      "latency": {
+        "count": 50,
+        "loss": 0.0,
+        "p50_us": 1300,
+        "p95_us": 1360,
+        "p99_us": 1380,
+        "received": 50,
+        "requested": 50,
+        "transmitted": 50
+      },
+      "machine_type": "n2-standard-4",
+      "path": "direct",
+      "path_class_reported": "direct",
+      "product": "rustscale",
+      "product_version": "rustscaled 0.1.1",
+      "repeat": 3,
+      "resolved_image": "https://www.googleapis.com/compute/v1/projects/ubuntu-os-cloud/global/images/ubuntu-2204-jammy-v20260713",
+      "run_id": "gcp-20260715-155001-291b2f8199",
+      "runtime": {
+        "linux_udp_batch": true,
+        "linux_udp_gro": true,
+        "linux_udp_gso": true,
+        "rs_tun_inbound_pipeline": false,
+        "rs_tun_outbound_send_pipeline": true
+      },
+      "server_zone": "us-central1-a",
+      "source_artifact_sha256": "065cabaa4457e02ba82e3b68356a3a2c0a07ec3eebff511eb657a659120080ac",
+      "source_clean": true,
+      "source_commit": "aa0a2d480f50c619d4668098ef789633357fb48f",
+      "started_at_utc": "2026-07-15T15:50:01Z",
+      "throughput": [
+        {
+          "duration_s": 10,
+          "mbps": 2512.441448550305,
+          "parallel": 1,
+          "samples_mbps": [
+            2512.441448550305,
+            2482.8419214691676,
+            2554.6545113903717
+          ],
+          "statistic": "median"
+        },
+        {
+          "duration_s": 10,
+          "mbps": 2793.0584924046257,
+          "parallel": 10,
+          "samples_mbps": [
+            2755.845216221048,
+            2793.0584924046257,
+            2850.8010974896674
+          ],
+          "statistic": "median"
+        },
+        {
+          "duration_s": 10,
+          "mbps": 2235.617496714968,
+          "parallel": 100,
+          "samples_mbps": [
+            2196.251988049313,
+            2283.181157445199,
+            2235.617496714968
+          ],
+          "statistic": "median"
+        }
+      ],
+      "topology_harness_label": "same-zone"
+    },
+    {
+      "client_zone": "us-central1-b",
+      "cpu_platform": "Intel Cascade Lake",
+      "daemon_binary_sha256": "e3d59ba6ae67f92b6365d655a0bdd41d70c6d24295e34ca35ab9fc4b2eb146c2",
+      "daemon_path": "/opt/rustscale/target/release/rustscaled",
+      "footprint": {
+        "binary_size_bytes": 17781208,
+        "cpu_avg_pct": 105.49,
+        "cpu_peak_pct": 161.0,
+        "rss_avg_kb": 21168.62,
+        "rss_peak_kb": 21248,
+        "samples": 129
+      },
+      "kernel_release": "6.8.0-1063-gcp",
+      "latency": {
+        "count": 50,
+        "loss": 0.0,
+        "p50_us": 1360,
+        "p95_us": 1440,
+        "p99_us": 1460,
+        "received": 50,
+        "requested": 50,
+        "transmitted": 50
+      },
+      "machine_type": "n2-standard-4",
+      "path": "direct",
+      "path_class_reported": "direct",
+      "product": "rustscale",
+      "product_version": "rustscaled 0.1.1",
+      "repeat": 3,
+      "resolved_image": "https://www.googleapis.com/compute/v1/projects/ubuntu-os-cloud/global/images/ubuntu-2204-jammy-v20260713",
+      "run_id": "gcp-20260715-160228-3c2ea81f80",
+      "runtime": {
+        "linux_udp_batch": true,
+        "linux_udp_gro": true,
+        "linux_udp_gso": false,
+        "rs_tun_inbound_pipeline": false,
+        "rs_tun_outbound_send_pipeline": true
+      },
+      "server_zone": "us-central1-a",
+      "source_artifact_sha256": "477e05a10e5a1b0b18b0304558d702fae55455125be5d76c01b671055b2aba5a",
+      "source_clean": true,
+      "source_commit": "aa0a2d480f50c619d4668098ef789633357fb48f",
+      "started_at_utc": "2026-07-15T16:02:28Z",
+      "throughput": [
+        {
+          "duration_s": 10,
+          "mbps": 2150.289998313102,
+          "parallel": 1,
+          "samples_mbps": [
+            2150.289998313102,
+            2160.93615828977,
+            2139.8819016697894
+          ],
+          "statistic": "median"
+        },
+        {
+          "duration_s": 10,
+          "mbps": 2310.4949684538255,
+          "parallel": 10,
+          "samples_mbps": [
+            2308.954734045387,
+            2314.238677513324,
+            2310.4949684538255
+          ],
+          "statistic": "median"
+        },
+        {
+          "duration_s": 10,
+          "mbps": 1783.8545827462524,
+          "parallel": 100,
+          "samples_mbps": [
+            1804.9650277323979,
+            1773.849965060083,
+            1783.8545827462524
+          ],
+          "statistic": "median"
+        }
+      ],
+      "topology_harness_label": "same-zone"
+    }
+  ],
+  "schema_version": 1
+}

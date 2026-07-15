@@ -434,6 +434,7 @@ impl Server {
             b.backend_log_id.clone(),
             b.ssh_host_keys.clone(),
             self.config.posture_checking,
+            self.config.preference_policy.clone(),
         );
         tasks.push(hostinfo_loop);
 
@@ -534,11 +535,17 @@ impl Server {
                 config_path: self.config.config_path.clone(),
                 client_updater: client_updater.clone(),
                 audit_logger: Some(audit_logger.clone()),
+                preference_policy: self.config.preference_policy.clone(),
+                policy_subscription: std::sync::Mutex::new(None),
             };
             // Publish the live filter so `PATCH /prefs` can toggle
             // shields-up mode without a full rebuild.
             let _ = state.filter.set(b.filter.clone());
-            if let Some(h) = localapi::spawn_localapi(Arc::new(state), path.clone()) {
+            let state = Arc::new(state);
+            localapi::activate_preference_policy(&state)
+                .await
+                .map_err(TsnetError::Builder)?;
+            if let Some(h) = localapi::spawn_localapi(state, path.clone()) {
                 tasks.push(h.task);
                 if let Some(ref ps) = self.pre_started {
                     if let Some(ref handle) = ps.handle {
@@ -920,6 +927,7 @@ impl Server {
             b.backend_log_id.clone(),
             b.ssh_host_keys.clone(),
             self.config.posture_checking,
+            self.config.preference_policy.clone(),
         );
 
         let mut tasks = vec![
@@ -1030,11 +1038,17 @@ impl Server {
                 config_path: self.config.config_path.clone(),
                 client_updater: client_updater.clone(),
                 audit_logger: Some(audit_logger.clone()),
+                preference_policy: self.config.preference_policy.clone(),
+                policy_subscription: std::sync::Mutex::new(None),
             };
             // Publish the live filter so `PATCH /prefs` can toggle
             // shields-up mode without a full rebuild.
             let _ = state.filter.set(b.filter.clone());
-            if let Some(h) = localapi::spawn_localapi(Arc::new(state), path.clone()) {
+            let state = Arc::new(state);
+            localapi::activate_preference_policy(&state)
+                .await
+                .map_err(TsnetError::Builder)?;
+            if let Some(h) = localapi::spawn_localapi(state, path.clone()) {
                 tasks.push(h.task);
                 if let Some(ref ps) = self.pre_started {
                     if let Some(ref handle) = ps.handle {
@@ -1188,11 +1202,22 @@ impl Server {
 
     /// Load prefs from the state directory, or return default if not found.
     pub(crate) fn load_prefs(&self) -> Result<rustscale_ipn::Prefs, TsnetError> {
-        if let Some(ref dir) = self.config.state_dir {
-            rustscale_ipn::Prefs::load(dir).map_err(|e| TsnetError::Builder(e.to_string()))
+        let mut prefs = if let Some(ref dir) = self.config.state_dir {
+            rustscale_ipn::Prefs::load(dir).map_err(|e| TsnetError::Builder(e.to_string()))?
         } else {
-            Ok(rustscale_ipn::Prefs::default())
+            rustscale_ipn::Prefs::default()
+        };
+        if let Some(policy) = &self.config.preference_policy {
+            let changed = policy.reconcile(&mut prefs).map_err(TsnetError::Builder)?;
+            if changed {
+                if let Some(ref dir) = self.config.state_dir {
+                    prefs
+                        .save(dir)
+                        .map_err(|error| TsnetError::Builder(error.to_string()))?;
+                }
+            }
         }
+        Ok(prefs)
     }
 
     /// Set the auth key after construction (used by the daemon when the CLI
@@ -1328,7 +1353,12 @@ impl Server {
                 rustscale_clientupdate::ClientUpdater::new(env!("CARGO_PKG_VERSION")),
             )),
             audit_logger: None,
+            preference_policy: self.config.preference_policy.clone(),
+            policy_subscription: std::sync::Mutex::new(None),
         });
+        localapi::activate_preference_policy(&api_state)
+            .await
+            .map_err(TsnetError::Builder)?;
 
         let handle = localapi::spawn_localapi(api_state.clone(), socket_path.clone());
         if handle.is_some() {

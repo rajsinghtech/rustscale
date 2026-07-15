@@ -1,148 +1,143 @@
-//! Enterprise and MDM policy readers for Rustscale clients.
+//! System-policy resolution for RustScale clients.
 //!
-//! This crate reads one OS-backed policy source at a time. Layered policy
-//! resolution and change monitoring are intentionally left to callers.
+//! The crate mirrors the production foundation of Tailscale's `util/syspolicy`:
+//! typed definitions, scoped source precedence, immutable snapshots, change
+//! callbacks, strict typed accessors, and concurrency-safe providers. Policy
+//! values are never logged by this crate.
 
-mod json_store;
+#![forbid(unsafe_code)]
+
+mod engine;
 mod keys;
-mod linux;
-mod macos;
-mod stub;
+mod provider;
+mod value;
 
-pub use json_store::JsonFileStore;
-pub use keys::{PolicyKey, ValueType};
-pub use linux::{LinuxPolicyStore, DEFAULT_POLICY_PATH};
-#[cfg(all(feature = "macos", target_os = "macos"))]
-pub use macos::MacOsDefaultsStore;
-pub use stub::StubPolicyStore;
+pub use engine::{
+    CallbackRegistration, Origin, PolicyChange, PolicyEngine, PolicyItem, ProviderId,
+    ProviderPrecedence, Snapshot, TestOverride,
+};
+pub use keys::{
+    well_known_definitions, PolicyKey, PolicyScope, Scope, SettingDefinition, ValueType,
+};
+pub use provider::{
+    environment_variable_name, EnvironmentProvider, JsonFileProvider, MemoryProvider,
+    PolicyProvider, ProviderSubscription, ProviderValues, StubPolicyProvider, MAX_ENV_VALUE_SIZE,
+    MAX_POLICY_FILE_SIZE,
+};
+pub use value::{
+    parse_go_duration, DurationParseError, PolicyValue, PreferenceOption, RawValue, Visibility,
+};
 
-/// Kinds of errors produced while reading policy values.
-#[derive(Debug, Clone, PartialEq, Eq)]
+use serde::{Deserialize, Serialize};
+#[cfg(not(windows))]
+use std::sync::Arc;
+
+/// Conventional Unix policy file path.
+pub const DEFAULT_POLICY_PATH: &str = "/etc/tailscale/policy.json";
+
+/// Kinds of policy read and conversion failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PolicyErrorKind {
     /// The key is known but has no configured value.
     NotConfigured,
-    /// The key name is not known to this crate.
+    /// The key does not have a registered definition.
     NoSuchKey,
-    /// A configured value has a different type than requested.
+    /// A value's raw or requested type does not match its definition.
     TypeMismatch,
-    /// The backing store could not be read.
+    /// A backing source could not be read.
     Io,
-    /// A configured value could not be parsed.
+    /// A value or document could not be parsed.
     Parse,
+    /// A bounded source exceeded its configured limit.
+    TooLarge,
+    /// Definitions conflict.
+    InvalidDefinition,
+    /// A provider failed or panicked without a more specific error.
+    Provider,
+    /// A provider returned a key outside its requested scope/key allowlist.
+    ProviderViolation,
+    /// Managed policy is unavailable on this platform and cannot be bypassed.
+    Unsupported,
 }
 
-/// An error associated with a policy key.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("policy error for {key}: {kind:?}")]
+/// A policy failure. It deliberately excludes raw values and filesystem paths
+/// so callers can safely report it without disclosing policy secrets.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+#[error("system policy {kind:?}{key_suffix}", key_suffix = .key.map_or(String::new(), |key| format!(" for {key}")))]
 pub struct PolicyError {
-    /// The category of failure.
+    /// Failure category.
     pub kind: PolicyErrorKind,
-    /// The policy key involved in the failure.
-    pub key: PolicyKey,
+    /// Setting involved, when this is an item-level failure.
+    pub key: Option<PolicyKey>,
 }
 
 impl PolicyError {
-    /// Builds a missing-policy error.
-    pub const fn not_configured(key: PolicyKey) -> Self {
+    /// Creates a provider-wide error.
+    pub const fn new(kind: PolicyErrorKind) -> Self {
+        Self { kind, key: None }
+    }
+
+    /// Creates an item-level error.
+    pub const fn for_key(kind: PolicyErrorKind, key: PolicyKey) -> Self {
         Self {
-            kind: PolicyErrorKind::NotConfigured,
-            key,
-        }
-    }
-
-    const fn type_mismatch(key: PolicyKey) -> Self {
-        Self {
-            kind: PolicyErrorKind::TypeMismatch,
-            key,
-        }
-    }
-
-    const fn io() -> Self {
-        Self {
-            kind: PolicyErrorKind::Io,
-            key: PolicyKey::ControlURL,
+            kind,
+            key: Some(key),
         }
     }
 }
 
-/// Typed access to an OS-backed policy source.
-pub trait PolicyStore: Send + Sync {
-    /// Reads a string policy value.
-    fn get_string(&self, key: PolicyKey) -> Result<String, PolicyError>;
-
-    /// Reads a boolean policy value.
-    fn get_bool(&self, key: PolicyKey) -> Result<bool, PolicyError>;
-
-    /// Reads a string-list policy value.
-    fn get_string_list(&self, key: PolicyKey) -> Result<Vec<String>, PolicyError>;
-
-    /// Reads an arbitrary string value by wire name.
-    fn get_raw(&self, key: &str) -> Result<String, PolicyError> {
-        Err(PolicyError {
-            kind: PolicyErrorKind::NoSuchKey,
-            key: PolicyKey::from_name(key).unwrap_or(PolicyKey::ControlURL),
-        })
-    }
-}
-
-/// An ordered collection of stores, returning the first configured value.
-pub struct PolicyStoreSet {
-    stores: Vec<Box<dyn PolicyStore>>,
-}
-
-impl PolicyStoreSet {
-    /// Creates a layered store set in priority order.
-    pub fn new(stores: Vec<Box<dyn PolicyStore>>) -> Self {
-        Self { stores }
-    }
-}
-
-impl PolicyStore for PolicyStoreSet {
-    fn get_string(&self, key: PolicyKey) -> Result<String, PolicyError> {
-        for store in &self.stores {
-            match store.get_string(key) {
-                Ok(value) => return Ok(value),
-                Err(error) if error.kind == PolicyErrorKind::NotConfigured => {}
-                Err(error) => return Err(error),
-            }
-        }
-        Err(PolicyError::not_configured(key))
-    }
-
-    fn get_bool(&self, key: PolicyKey) -> Result<bool, PolicyError> {
-        for store in &self.stores {
-            match store.get_bool(key) {
-                Ok(value) => return Ok(value),
-                Err(error) if error.kind == PolicyErrorKind::NotConfigured => {}
-                Err(error) => return Err(error),
-            }
-        }
-        Err(PolicyError::not_configured(key))
-    }
-
-    fn get_string_list(&self, key: PolicyKey) -> Result<Vec<String>, PolicyError> {
-        for store in &self.stores {
-            match store.get_string_list(key) {
-                Ok(value) => return Ok(value),
-                Err(error) if error.kind == PolicyErrorKind::NotConfigured => {}
-                Err(error) => return Err(error),
-            }
-        }
-        Err(PolicyError::not_configured(key))
-    }
-}
-
-/// Creates the current platform's default policy store.
-pub fn default_store() -> Box<dyn PolicyStore> {
-    #[cfg(all(feature = "macos", target_os = "macos"))]
+/// Creates a platform-default engine.
+///
+/// Unix uses an optional bounded JSON file followed by environment policy, so
+/// environment settings win same-scope conflicts. Windows currently uses a
+/// cfg-safe empty provider until a registry implementation can be added without
+/// introducing unsafe code or a new platform dependency.
+pub fn default_engine(scope: PolicyScope) -> Result<PolicyEngine, PolicyError> {
+    #[cfg(windows)]
     {
-        Box::new(MacOsDefaultsStore::new("io.tailscale.ipn.macsys"))
+        // Until a safe registry backend is available, do not start with an
+        // empty policy and silently permit settings that HKLM/HKCU might deny.
+        let _ = scope;
+        Err(PolicyError::new(PolicyErrorKind::Unsupported))
     }
-    #[cfg(not(all(feature = "macos", target_os = "macos")))]
+
+    #[cfg(not(windows))]
     {
-        Box::new(StubPolicyStore::new())
+        let engine = PolicyEngine::well_known(scope)?;
+        #[cfg(unix)]
+        {
+            engine.add_provider_with_precedence(
+                "system policy file",
+                PolicyScope::Device,
+                ProviderPrecedence::Managed,
+                Arc::new(JsonFileProvider::optional(DEFAULT_POLICY_PATH)),
+            )?;
+            engine.add_provider_with_precedence(
+                "debug environment",
+                PolicyScope::Device,
+                ProviderPrecedence::Debug,
+                Arc::new(EnvironmentProvider::new()),
+            )?;
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            engine.add_provider_with_precedence(
+                "platform policy (unsupported)",
+                PolicyScope::Device,
+                ProviderPrecedence::Platform,
+                Arc::new(StubPolicyProvider::new()),
+            )?;
+        }
+        Ok(engine)
     }
 }
+
+/// Backwards-compatible names for the original single-store skeleton.
+pub type JsonFileStore = JsonFileProvider;
+/// Linux uses the bounded JSON provider.
+pub type LinuxPolicyStore = JsonFileProvider;
+/// Empty fallback provider.
+pub type StubPolicyStore = StubPolicyProvider;
 
 #[cfg(test)]
 mod tests;

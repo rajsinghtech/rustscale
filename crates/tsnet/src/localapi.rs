@@ -236,6 +236,82 @@ pub(crate) struct LocalApiState {
     pub client_updater: Arc<std::sync::Mutex<rustscale_clientupdate::ClientUpdater>>,
     /// Persistent audit logger for intentional disconnect events.
     pub audit_logger: Option<Arc<rustscale_auditlog::Logger>>,
+    /// Optional daemon policy reconciler and its live change subscription.
+    pub preference_policy: Option<Arc<dyn crate::PreferencePolicy>>,
+    pub policy_subscription: std::sync::Mutex<Option<Box<dyn crate::PreferencePolicySubscription>>>,
+}
+
+pub(crate) async fn activate_preference_policy(state: &Arc<LocalApiState>) -> Result<(), String> {
+    let Some(policy) = state.preference_policy.clone() else {
+        return Ok(());
+    };
+    let weak = Arc::downgrade(state);
+    let runtime = tokio::runtime::Handle::current();
+    // Subscribe before reading a generation or reconciling. A change before
+    // subscription is observed by the handshake below; a change afterwards is
+    // either included in that handshake or schedules another reconciliation.
+    let subscription = policy.subscribe(Arc::new(move || {
+        let weak = weak.clone();
+        runtime.spawn(async move {
+            let Some(state) = weak.upgrade() else {
+                return;
+            };
+            if let Err(error) = reconcile_preference_policy_until_stable(&state).await {
+                log::warn!("syspolicy: live preference reconciliation failed: {error}");
+            }
+        });
+    }));
+    let old_subscription = state
+        .policy_subscription
+        .lock()
+        .expect("policy subscription lock poisoned")
+        .replace(subscription);
+    drop(old_subscription);
+
+    reconcile_preference_policy_until_stable(state).await
+}
+
+async fn reconcile_preference_policy_until_stable(
+    state: &Arc<LocalApiState>,
+) -> Result<(), String> {
+    let Some(policy) = state.preference_policy.as_ref() else {
+        return Ok(());
+    };
+    loop {
+        let before = policy.generation();
+        let (updated, changed) = commit_prefs_update(state, |_| {}).await?;
+        if changed {
+            state.ipn_backend.bus().send(rustscale_ipn::Notify {
+                Prefs: Some(updated),
+                ..Default::default()
+            });
+        }
+        if before == policy.generation() {
+            return Ok(());
+        }
+    }
+}
+
+async fn commit_prefs_update(
+    state: &Arc<LocalApiState>,
+    mutate: impl FnOnce(&mut Prefs),
+) -> Result<(serde_json::Value, bool), String> {
+    let mut prefs = state.prefs.write().await;
+    let mut candidate = prefs.clone();
+    mutate(&mut candidate);
+    if let Some(policy) = &state.preference_policy {
+        policy.reconcile(&mut candidate)?;
+    }
+    let changed = candidate != *prefs;
+    if changed {
+        if let Some(ref dir) = state.state_dir {
+            candidate
+                .save(dir)
+                .map_err(|error| format!("saving preferences: {error}"))?;
+        }
+        *prefs = candidate;
+    }
+    Ok((serde_json::to_value(&*prefs).unwrap_or_default(), changed))
 }
 
 pub struct LocalApiHandle {
@@ -489,13 +565,21 @@ async fn handle_start<W: AsyncWrite + Unpin>(
     };
 
     if let Some(ref mask) = opts.UpdatePrefs {
-        let mut prefs = state.prefs.write().await;
-        mask.apply_to(&mut prefs);
-        if let Some(ref dir) = state.state_dir {
-            let _ = prefs.save(dir);
-        }
+        let updated = match commit_prefs_update(state, |prefs| mask.apply_to(prefs)).await {
+            Ok((updated, _)) => updated,
+            Err(error) => {
+                write_json_response(
+                    conn,
+                    500,
+                    "Internal Server Error",
+                    &serde_json::json!({"error": error}),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
         state.ipn_backend.bus().send(rustscale_ipn::Notify {
-            Prefs: Some(serde_json::to_value(&*prefs).unwrap_or_default()),
+            Prefs: Some(updated),
             ..Default::default()
         });
     }
@@ -517,19 +601,29 @@ async fn handle_logout<W: AsyncWrite + Unpin>(
     conn: &mut W,
     state: &Arc<LocalApiState>,
 ) -> Result<(), std::io::Error> {
-    {
-        let mut prefs = state.prefs.write().await;
+    let (updated, _) = match commit_prefs_update(state, |prefs| {
         prefs.LoggedOut = true;
         prefs.WantRunning = false;
-        if let Some(ref dir) = state.state_dir {
-            let _ = prefs.save(dir);
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            write_json_response(
+                conn,
+                500,
+                "Internal Server Error",
+                &serde_json::json!({"error": error}),
+            )
+            .await?;
+            return Ok(());
         }
-    }
+    };
     state.ipn_backend.set_auth_cant_continue(true);
     state.ipn_backend.set_logged_out(true);
     state.ipn_backend.set_blocked(true);
     state.ipn_backend.bus().send(rustscale_ipn::Notify {
-        Prefs: Some(serde_json::to_value(&*state.prefs.read().await).unwrap_or_default()),
+        Prefs: Some(updated),
         ..Default::default()
     });
     if let Some(ref tx) = state.command_tx {
@@ -564,13 +658,18 @@ async fn handle_reload_config<W: AsyncWrite + Unpin>(
     };
 
     let masked = config.parsed.to_prefs();
-    let updated = {
-        let mut prefs = state.prefs.write().await;
-        masked.apply_to(&mut prefs);
-        if let Some(ref dir) = state.state_dir {
-            let _ = prefs.save(dir);
+    let updated = match commit_prefs_update(state, |prefs| masked.apply_to(prefs)).await {
+        Ok((updated, _)) => updated,
+        Err(error) => {
+            write_json_response(
+                conn,
+                500,
+                "Internal Server Error",
+                &serde_json::json!({"error": error}),
+            )
+            .await?;
+            return Ok(());
         }
-        serde_json::to_value(&*prefs).unwrap_or_default()
     };
 
     if masked.ExitNodeAllowLANAccessSet || masked.ExitNodeIDSet || masked.ExitNodeIPSet {
@@ -729,13 +828,18 @@ async fn handle_patch_prefs<W: AsyncWrite + Unpin>(
         masked.ExitNodeIDSet || masked.ExitNodeIPSet || masked.ExitNodeAllowLANAccessSet;
     let disconnect_requested = masked.WantRunningSet && !masked.Prefs.WantRunning;
 
-    let updated = {
-        let mut prefs = state.prefs.write().await;
-        masked.apply_to(&mut prefs);
-        if let Some(ref dir) = state.state_dir {
-            let _ = prefs.save(dir);
+    let updated = match commit_prefs_update(state, |prefs| masked.apply_to(prefs)).await {
+        Ok((updated, _)) => updated,
+        Err(error) => {
+            write_json_response(
+                conn,
+                500,
+                "Internal Server Error",
+                &serde_json::json!({"error": error}),
+            )
+            .await?;
+            return Ok(());
         }
-        serde_json::to_value(&*prefs).unwrap_or_default()
     };
 
     // Apply shields-up changes to the live filter without a full rebuild.
@@ -3438,6 +3542,8 @@ mod tests {
                 rustscale_clientupdate::ClientUpdater::new("0.1.0"),
             )),
             audit_logger: None,
+            preference_policy: None,
+            policy_subscription: std::sync::Mutex::new(None),
         })
     }
 
@@ -3521,6 +3627,122 @@ mod tests {
             prober.clone(),
         ));
         (client, prober)
+    }
+
+    struct ForceAutoUpdatePolicy;
+    struct NoopPolicySubscription;
+
+    impl crate::PreferencePolicySubscription for NoopPolicySubscription {}
+
+    impl crate::PreferencePolicy for ForceAutoUpdatePolicy {
+        fn reconcile(&self, prefs: &mut Prefs) -> Result<bool, String> {
+            if prefs.AutoUpdate == Some(true) {
+                return Ok(false);
+            }
+            prefs.AutoUpdate = Some(true);
+            Ok(true)
+        }
+
+        fn subscribe(
+            &self,
+            _callback: Arc<dyn Fn() + Send + Sync>,
+        ) -> Box<dyn crate::PreferencePolicySubscription> {
+            Box::new(NoopPolicySubscription)
+        }
+    }
+
+    async fn make_policy_test_state_with(
+        policy: Arc<dyn crate::PreferencePolicy>,
+    ) -> Arc<LocalApiState> {
+        let mut state = Arc::into_inner(make_test_state().await).expect("unique test state");
+        state.preference_policy = Some(policy);
+        let state = Arc::new(state);
+        activate_preference_policy(&state).await.unwrap();
+        state
+    }
+
+    async fn make_policy_test_state() -> Arc<LocalApiState> {
+        make_policy_test_state_with(Arc::new(ForceAutoUpdatePolicy)).await
+    }
+
+    struct MutableAutoUpdatePolicy {
+        desired: std::sync::atomic::AtomicBool,
+        generation: std::sync::atomic::AtomicU64,
+        callback: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    }
+
+    impl MutableAutoUpdatePolicy {
+        fn new(desired: bool) -> Self {
+            Self {
+                desired: std::sync::atomic::AtomicBool::new(desired),
+                generation: std::sync::atomic::AtomicU64::new(0),
+                callback: std::sync::Mutex::new(None),
+            }
+        }
+
+        fn set(&self, desired: bool) {
+            self.desired
+                .store(desired, std::sync::atomic::Ordering::SeqCst);
+            self.generation
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(callback) = self.callback.lock().unwrap().clone() {
+                callback();
+            }
+        }
+    }
+
+    impl crate::PreferencePolicy for MutableAutoUpdatePolicy {
+        fn reconcile(&self, prefs: &mut Prefs) -> Result<bool, String> {
+            let desired = self.desired.load(std::sync::atomic::Ordering::SeqCst);
+            if prefs.AutoUpdate == Some(desired) {
+                return Ok(false);
+            }
+            prefs.AutoUpdate = Some(desired);
+            Ok(true)
+        }
+
+        fn generation(&self) -> u64 {
+            self.generation.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn subscribe(
+            &self,
+            callback: Arc<dyn Fn() + Send + Sync>,
+        ) -> Box<dyn crate::PreferencePolicySubscription> {
+            *self.callback.lock().unwrap() = Some(callback);
+            Box::new(NoopPolicySubscription)
+        }
+    }
+
+    struct SubscribeRacePolicy {
+        generation: std::sync::atomic::AtomicU64,
+    }
+
+    impl crate::PreferencePolicy for SubscribeRacePolicy {
+        fn reconcile(&self, prefs: &mut Prefs) -> Result<bool, String> {
+            let generation = self.generation();
+            let desired = generation > 0;
+            let changed = prefs.AutoUpdate != Some(desired);
+            prefs.AutoUpdate = Some(desired);
+            if generation == 0 {
+                // Simulate a provider change during the first reconciliation,
+                // without delivering a callback. The handshake must retry.
+                self.generation
+                    .store(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(changed)
+        }
+
+        fn generation(&self) -> u64 {
+            self.generation.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn subscribe(
+            &self,
+            _callback: Arc<dyn Fn() + Send + Sync>,
+        ) -> Box<dyn crate::PreferencePolicySubscription> {
+            Box::new(NoopPolicySubscription)
+        }
     }
 
     // --- HTTP parsing tests ---
@@ -4452,6 +4674,8 @@ mod tests {
                 rustscale_clientupdate::ClientUpdater::new("0.1.0"),
             )),
             audit_logger: None,
+            preference_policy: None,
+            policy_subscription: std::sync::Mutex::new(None),
         });
 
         let config = r#"{"TCP":{"8080":{"HTTP":true}}}"#;
@@ -4690,6 +4914,8 @@ mod tests {
                 rustscale_clientupdate::ClientUpdater::new("0.1.0"),
             )),
             audit_logger: None,
+            preference_policy: None,
+            policy_subscription: std::sync::Mutex::new(None),
         })
     }
 
@@ -5119,6 +5345,52 @@ mod tests {
             resp.contains("200 OK") || resp.contains("204"),
             "read-write peer should patch prefs: {resp}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_patch_prefs_cannot_bypass_preference_policy() {
+        let state = make_policy_test_state().await;
+        let body = r#"{"AutoUpdate":false,"AutoUpdateSet":true}"#;
+        let req = format!(
+            "PATCH /localapi/v0/prefs HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let resp = send_request_with_identity(req.as_bytes(), &state, test_rw_identity()).await;
+        assert!(resp.contains("200 OK"), "response: {resp}");
+        assert_eq!(state.prefs.read().await.AutoUpdate, Some(true));
+        assert!(resp.contains("\"AutoUpdate\":true"), "response: {resp}");
+    }
+
+    #[tokio::test]
+    async fn test_live_policy_change_reconciles_prefs_without_callback_loop() {
+        let policy = Arc::new(MutableAutoUpdatePolicy::new(false));
+        let state = make_policy_test_state_with(policy.clone()).await;
+        policy.set(true);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if state.prefs.read().await.AutoUpdate == Some(true) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "policy callback timed out"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        // A reconciliation does not notify the policy source, so no callback
+        // loop is created and the enforced value remains stable.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(state.prefs.read().await.AutoUpdate, Some(true));
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_generation_handshake_closes_initial_reconcile_race() {
+        let policy = Arc::new(SubscribeRacePolicy {
+            generation: std::sync::atomic::AtomicU64::new(0),
+        });
+        let state = make_policy_test_state_with(policy).await;
+        assert_eq!(state.prefs.read().await.AutoUpdate, Some(true));
     }
 
     #[tokio::test]

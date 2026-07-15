@@ -321,12 +321,45 @@ pub struct ServerBuilder {
     /// Enable collection of device posture serial numbers and hardware
     /// addresses through the C2N posture identity endpoint. Default: false.
     pub(crate) posture_checking: bool,
+    /// Optional daemon policy reconciler applied to every persisted preference
+    /// mutation. Embedding users leave this unset.
+    pub(crate) preference_policy: Option<Arc<dyn PreferencePolicy>>,
 }
 
 /// A pluggable logger callback for diagnostic messages. Implementations
 /// must be `Send + Sync`; the closure receives a pre-formatted message
 /// string. When unset, messages fall through to `eprintln!`.
 pub type Logger = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// Keeps a preference-policy change subscription alive.
+pub trait PreferencePolicySubscription: Send + Sync {}
+
+/// Daemon-supplied policy enforcement for persisted preferences.
+///
+/// This indirection keeps the tsnet embedding API independent of any concrete
+/// system-policy implementation while allowing rustscaled to enforce managed
+/// preferences at every mutation boundary.
+pub trait PreferencePolicy: Send + Sync {
+    /// Reconciles managed settings into `prefs`, returning whether it changed.
+    fn reconcile(&self, prefs: &mut rustscale_ipn::Prefs) -> Result<bool, String>;
+
+    /// Returns the effective policy generation used for startup handshakes.
+    fn generation(&self) -> u64 {
+        0
+    }
+
+    /// Applies managed update policy to lower-precedence user/environment
+    /// permission. A managed denial must return `false`.
+    fn allows_update(&self, lower_precedence_choice: bool) -> Result<bool, String> {
+        Ok(lower_precedence_choice)
+    }
+
+    /// Registers a non-blocking policy-change callback.
+    fn subscribe(
+        &self,
+        callback: Arc<dyn Fn() + Send + Sync>,
+    ) -> Box<dyn PreferencePolicySubscription>;
+}
 
 #[allow(clippy::missing_fields_in_debug)]
 impl std::fmt::Debug for ServerBuilder {
@@ -359,6 +392,10 @@ impl std::fmt::Debug for ServerBuilder {
             .field("port", &self.port)
             .field("advertise_tags", &self.advertise_tags)
             .field("posture_checking", &self.posture_checking)
+            .field(
+                "preference_policy",
+                &self.preference_policy.as_ref().map(|_| "<policy>"),
+            )
             .field("logger", &self.logger.as_ref().map(|_| "<logger>"))
             .field("logtail", &self.logtail.as_ref().map(|_| "<logtail>"))
             .field("netlog", &self.netlog.as_ref().map(|_| "<netlog>"))
@@ -447,6 +484,12 @@ impl ServerBuilder {
     /// instead of forwarding onward.
     pub fn advertise_routes(mut self, routes: Vec<String>) -> Self {
         self.advertise_routes = routes;
+        self
+    }
+
+    /// Installs a daemon preference-policy reconciler.
+    pub fn preference_policy(mut self, policy: Arc<dyn PreferencePolicy>) -> Self {
+        self.preference_policy = Some(policy);
         self
     }
 
@@ -1101,9 +1144,18 @@ impl Server {
         let masked = config.parsed.to_prefs();
         let updated = {
             let mut prefs = inner.prefs.write().await;
-            masked.apply_to(&mut prefs);
-            if let Some(ref dir) = self.config.state_dir {
-                let _ = prefs.save(dir);
+            let mut candidate = prefs.clone();
+            masked.apply_to(&mut candidate);
+            if let Some(policy) = &self.config.preference_policy {
+                policy.reconcile(&mut candidate)?;
+            }
+            if candidate != *prefs {
+                if let Some(ref dir) = self.config.state_dir {
+                    candidate
+                        .save(dir)
+                        .map_err(|error| format!("saving preferences: {error}"))?;
+                }
+                *prefs = candidate;
             }
             serde_json::to_value(&*prefs).unwrap_or_default()
         };

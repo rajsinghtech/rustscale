@@ -385,7 +385,9 @@ impl Server {
         // Build the LocalAPI state for the loopback HTTP handler. We reuse
         // the same state as the Unix-socket LocalAPI if it's running;
         // otherwise we build a minimal one from the running state.
-        let api_state = self.build_loopback_api_state(&proxy_cred, &localapi_cred);
+        let api_state = self
+            .build_loopback_api_state(&proxy_cred, &localapi_cred)
+            .await?;
 
         let dialer = ServerSocksDialer::new(netstack, inner.resolver.clone(), inner.peers.clone());
 
@@ -424,19 +426,19 @@ impl Server {
     /// changes are immediately visible to both.
     pub async fn local_client(&mut self) -> Result<InMemoryLocalClient, TsnetError> {
         Box::pin(self.ensure_up()).await?;
-        let state = self.build_loopback_api_state("", "");
+        let state = self.build_loopback_api_state("", "").await?;
         Ok(InMemoryLocalClient::new(state))
     }
 
     /// Build a `LocalApiState` for the loopback / in-memory LocalClient.
     /// Reuses the running state's shared resources (peers, health, etc.).
-    fn build_loopback_api_state(
+    async fn build_loopback_api_state(
         &self,
         _proxy_cred: &str,
         _localapi_cred: &str,
-    ) -> Arc<LocalApiState> {
+    ) -> Result<Arc<LocalApiState>, TsnetError> {
         let inner = self.inner.as_ref().expect("server must be up");
-        Arc::new(LocalApiState {
+        let state = Arc::new(LocalApiState {
             peers: inner.peers.clone(),
             routecheck: Some(inner.routecheck.clone()),
             user_profiles: inner.user_profiles.clone(),
@@ -515,7 +517,13 @@ impl Server {
             config_path: None,
             client_updater: inner.client_updater.clone(),
             audit_logger: Some(inner.audit_logger.clone()),
-        })
+            preference_policy: self.config.preference_policy.clone(),
+            policy_subscription: std::sync::Mutex::new(None),
+        });
+        localapi::activate_preference_policy(&state)
+            .await
+            .map_err(TsnetError::Builder)?;
+        Ok(state)
     }
 }
 

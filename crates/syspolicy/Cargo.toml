@@ -1,15 +1,10 @@
 [package]
 name = "rustscale-syspolicy"
-description = "Enterprise/MDM policy source for Tailscale client behavior gating"
+description = "Typed, scoped system-policy resolution for RustScale clients"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-
-[features]
-default = []
-macos = []
-linux = []
 
 [lints]
 workspace = true
@@ -18,7 +13,6 @@ workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-log = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

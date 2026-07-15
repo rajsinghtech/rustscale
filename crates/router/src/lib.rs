@@ -651,8 +651,10 @@ impl<P: Platform, R: CommandRunner> Router for StatefulRouter<P, R> {
     }
 
     fn block_direct(&mut self) -> Result<(), RouterError> {
+        let replacements = self.platform.commands(&RouterOperation::EnableDirectBlock);
         if self.direct_blocked {
             if self.verify_direct_block(true).is_ok() {
+                self.forget_superseded_cleanup(&replacements);
                 return Ok(());
             }
             // An uncertain/partial unblock invalidates prior verification.
@@ -660,7 +662,6 @@ impl<P: Platform, R: CommandRunner> Router for StatefulRouter<P, R> {
             self.apply(&[RouterOperation::DisableDirectBlock])?;
             self.direct_blocked = false;
         }
-        let replacements = self.platform.commands(&RouterOperation::EnableDirectBlock);
         self.apply(&[RouterOperation::EnableDirectBlock])?;
         self.direct_blocked = true;
         self.verify_direct_block(true)?;

@@ -18,7 +18,7 @@
 #   GCP_DRY_RUN                              — set by --dry-run; propagated to lib.sh
 #   SKIP_VM_DELETE=1                         — keep VMs at the end (debugging)
 #   MATRIX_RESULTS_DIR                        — parent/root for the run-ID directory override
-#   RS_TUN_INBOUND_PIPELINE                   — rs-tun inbound pipeline toggle: 0 (default) or 1
+#   RS_TUN_INBOUND_PIPELINE / RS_TUN_OUTBOUND_SEND_PIPELINE — rs-tun pipeline toggles: 0 (default) or 1
 #   RS_LINUX_UDP_BATCH / RS_LINUX_UDP_GRO     — Linux receive modes: 0 (disabled) or 1 (default)
 
 set -euo pipefail
@@ -351,7 +351,7 @@ run = {"id":"gcp-20260714-000000-dirtytest", "started_at_utc":"2026-07-14T00:00:
        "source":{"commit":"a"*40,"delivery":"git-archive-head","includes_uncommitted_changes":False,"launch_worktree_dirty":True},
        "cloud":{"provider":"gcp","project":"dry-run","requested_image_project":"ubuntu-os-cloud","requested_image_family":"ubuntu-2204-lts","requested_machine_type":"n1-standard-4","network":"default","disk_type":"pd-standard","disk_gb":200},
        "build":{"command":"","rustflags":"","cargo_profile_release_lto":"","cargo_profile_release_codegen_units":""},
-       "runtime":{"rs_tun_inbound_pipeline":False,"linux_udp_batch":True,"linux_udp_gro":True}}
+       "runtime":{"rs_tun_inbound_pipeline":False,"rs_tun_outbound_send_pipeline":False,"linux_udp_batch":True,"linux_udp_gro":True}}
 provenance.validate_run(run)
 PYEOF
 }
@@ -529,7 +529,7 @@ matrix_write_manifest() {
     --image-family "$GCP_IMAGE" --machine "$GCP_MACHINE" --network "$GCP_NETWORK" --disk-type pd-standard \
     --disk-gb "$GCP_DISK_GB" --build-command "${RUST_BUILD_COMMAND:-}" --rustflags "${RUSTFLAGS:-}" \
     --lto "${CARGO_PROFILE_RELEASE_LTO:-}" --codegen-units "${CARGO_PROFILE_RELEASE_CODEGEN_UNITS:-}" \
-    --rs-tun-inbound-pipeline "$RS_TUN_INBOUND_PIPELINE" \
+    --rs-tun-inbound-pipeline "$RS_TUN_INBOUND_PIPELINE" --rs-tun-outbound-send-pipeline "$RS_TUN_OUTBOUND_SEND_PIPELINE" \
     --linux-udp-batch "$RS_LINUX_UDP_BATCH" --linux-udp-gro "$RS_LINUX_UDP_GRO" \
     "${dry_flag[@]}" --topologies "${topologies[@]}" --paths "${paths[@]}" \
     --configs "${configs[@]}" --parallelism "${parallelism[@]}" --repeat "$repeat"
@@ -675,9 +675,9 @@ matrix_manifest_self_test() {
   invalid_manifest="$temp_dir/invalid.json"
   matrix_write_manifest "$manifest" 3 same-zone -- direct -- rs-tun -- 1 10 100 || { rm -rf "$temp_dir"; return 1; }
   python3 tools/bench/gcp/provenance.py validate --manifest "$manifest" || { rm -rf "$temp_dir"; return 1; }
-  python3 - "$manifest" "$RS_TUN_INBOUND_PIPELINE" "$RS_LINUX_UDP_BATCH" "$RS_LINUX_UDP_GRO" <<'PYEOF' || { rm -rf "$temp_dir"; return 1; }
+  python3 - "$manifest" "$RS_TUN_INBOUND_PIPELINE" "$RS_TUN_OUTBOUND_SEND_PIPELINE" "$RS_LINUX_UDP_BATCH" "$RS_LINUX_UDP_GRO" <<'PYEOF' || { rm -rf "$temp_dir"; return 1; }
 import json, sys
-data=json.load(open(sys.argv[1])); runtime=data["run"]["runtime"]; assert data["schema_version"] == 2 and data["parallelism"] == [1,10,100] and data["run"]["cloud"]["disk_gb"] == 200 and runtime == {"rs_tun_inbound_pipeline": sys.argv[2] == "1", "linux_udp_batch": sys.argv[3] == "1", "linux_udp_gro": sys.argv[4] == "1"}
+data=json.load(open(sys.argv[1])); runtime=data["run"]["runtime"]; assert data["schema_version"] == 2 and data["parallelism"] == [1,10,100] and data["run"]["cloud"]["disk_gb"] == 200 and runtime == {"rs_tun_inbound_pipeline": sys.argv[2] == "1", "rs_tun_outbound_send_pipeline": sys.argv[3] == "1", "linux_udp_batch": sys.argv[4] == "1", "linux_udp_gro": sys.argv[5] == "1"}
 PYEOF
   if matrix_write_manifest "$invalid_manifest" 3 same-zone -- direct -- rs-tun -- 0 >/dev/null 2>&1 || [[ -e "$invalid_manifest" ]]; then
     rm -rf "$temp_dir"; return 1
@@ -705,6 +705,16 @@ matrix_inbound_pipeline_self_test() {
   (( status == 2 ))
 }
 
+matrix_outbound_send_pipeline_self_test() {
+  local actual status
+  actual=$(export RS_TUN_OUTBOUND_SEND_PIPELINE=1; configure_rs_tun_outbound_send_pipeline; printf '%s' "$RS_TUN_OUTBOUND_SEND_PIPELINE") || return 1
+  [[ "$actual" == 1 ]] || return 1
+  actual=$(unset RS_TUN_OUTBOUND_SEND_PIPELINE; configure_rs_tun_outbound_send_pipeline; printf '%s' "$RS_TUN_OUTBOUND_SEND_PIPELINE") || return 1
+  [[ "$actual" == 0 ]] || return 1
+  if ( export RS_TUN_OUTBOUND_SEND_PIPELINE=invalid; configure_rs_tun_outbound_send_pipeline ) >/dev/null 2>&1; then return 1; else status=$?; fi
+  (( status == 2 ))
+}
+
 matrix_linux_udp_receive_modes_self_test() {
   local actual status
   for actual in 0/0 1/0 1/1; do
@@ -720,6 +730,7 @@ matrix_linux_udp_receive_modes_self_test() {
 }
 
 configure_rs_tun_inbound_pipeline || exit $?
+configure_rs_tun_outbound_send_pipeline || exit $?
 configure_linux_udp_receive_modes || exit $?
 
 matrix_command_shape_self_test
@@ -734,6 +745,7 @@ matrix_atomic_capture_self_test
 matrix_instance_metadata_capture_self_test
 matrix_manifest_self_test
 matrix_inbound_pipeline_self_test
+matrix_outbound_send_pipeline_self_test
 matrix_linux_udp_receive_modes_self_test
 matrix_finalization_self_test
 

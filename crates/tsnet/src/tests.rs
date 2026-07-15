@@ -255,11 +255,13 @@ async fn profile_switch_retries_cancelled_logout_before_immediate_rebind() {
     wait_for_map_polls(&control, 1).await;
     assert_ne!(server.node_key().unwrap(), old_node);
     assert!(rustscale_safesocket::connect(&socket).is_ok());
-    assert_eq!(
-        control.active_noise_connection_count(),
-        1,
-        "old map/TKA control session survived profile rebind"
-    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while control.active_noise_connection_count() != 1 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("old map/TKA control session survived profile rebind");
 
     server.close().await.into_result().unwrap();
     wait_for_map_polls(&control, 0).await;

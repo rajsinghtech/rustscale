@@ -89,6 +89,7 @@ impl Server {
         }
 
         ensure_ring_provider();
+        self.resolve_configured_auth_key().await?;
 
         let b = self.bootstrap().await?;
         let prefs = Arc::new(RwLock::new(self.load_prefs().unwrap_or_default()));
@@ -591,6 +592,7 @@ impl Server {
         }
 
         ensure_ring_provider();
+        self.resolve_configured_auth_key().await?;
 
         let b = self.bootstrap().await?;
         let prefs = Arc::new(RwLock::new(self.load_prefs().unwrap_or_default()));
@@ -1306,6 +1308,69 @@ impl Server {
             .command_rx
             .take()
             .unwrap())
+    }
+
+    /// Resolve configured workload identity credentials before registration.
+    pub(crate) async fn resolve_configured_auth_key(&mut self) -> Result<(), TsnetError> {
+        if self
+            .config
+            .auth_key
+            .as_deref()
+            .is_some_and(|key| !key.is_empty())
+        {
+            return Ok(());
+        }
+
+        #[cfg(feature = "identity-federation")]
+        rustscale_identityfederation::install()
+            .map_err(|error| TsnetError::IdentityFederation(error.to_string()))?;
+
+        let Some(resolve) = rustscale_feature::RESOLVE_AUTH_KEY_VIA_WIF.try_get() else {
+            return Ok(());
+        };
+        let client_id = &self.config.client_id;
+        let id_token = &self.config.id_token;
+        let audience = &self.config.audience;
+        if !client_id.is_empty() && id_token.is_empty() && audience.is_empty() {
+            return Err(TsnetError::IdentityFederation(
+                "client ID for workload identity federation found, but ID token and audience are empty"
+                    .into(),
+            ));
+        }
+        if !id_token.is_empty() && !audience.is_empty() {
+            return Err(TsnetError::IdentityFederation(
+                "only one of ID token and audience should be for workload identity federation"
+                    .into(),
+            ));
+        }
+        if client_id.is_empty() {
+            if !id_token.is_empty() {
+                return Err(TsnetError::IdentityFederation(
+                    "ID token for workload identity federation found, but client ID is empty"
+                        .into(),
+                ));
+            }
+            if !audience.is_empty() {
+                return Err(TsnetError::IdentityFederation(
+                    "audience for workload identity federation found, but client ID is empty"
+                        .into(),
+                ));
+            }
+        }
+
+        let auth_key = resolve(rustscale_feature::IdentityFederationRequest {
+            base_url: self.config.control_url.clone(),
+            client_id: client_id.clone(),
+            id_token: id_token.clone(),
+            audience: audience.clone(),
+            tags: self.config.advertise_tags.clone(),
+        })
+        .await
+        .map_err(|error| TsnetError::IdentityFederation(error.to_string()))?;
+        if !auth_key.is_empty() {
+            self.config.auth_key = Some(auth_key);
+        }
+        Ok(())
     }
 
     /// Shared bootstrapping for `up()` and `up_tun()`: load state, register

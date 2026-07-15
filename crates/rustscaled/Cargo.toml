@@ -14,7 +14,7 @@ name = "rustscaled"
 path = "src/main.rs"
 
 [dependencies]
-rustscale-tsnet = { path = "../tsnet", version = "0.1.1" }
+rustscale-tsnet = { path = "../tsnet", version = "0.1.1", features = ["identity-federation"] }
 rustscale-safesocket = { path = "../safesocket", version = "0.1.1" }
 rustscale-conffile = { path = "../conffile", version = "0.1.1" }
 rustscale-ipn = { path = "../ipn", version = "0.1.1" }

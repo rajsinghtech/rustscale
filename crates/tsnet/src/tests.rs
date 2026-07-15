@@ -63,6 +63,96 @@ fn builder_sets_ephemeral_flag() {
     assert!(server.config.ephemeral);
 }
 
+#[cfg(feature = "identity-federation")]
+#[tokio::test]
+async fn workload_identity_hook_resolves_builder_config() {
+    rustscale_identityfederation::install().unwrap();
+    let observed = Arc::new(Mutex::new(None));
+    let hook_observed = observed.clone();
+    let resolver: rustscale_feature::IdentityFederationResolver = Arc::new(move |request| {
+        *hook_observed.lock().unwrap() = Some((
+            request.base_url,
+            request.client_id,
+            request.id_token,
+            request.audience,
+            request.tags,
+        ));
+        Box::pin(async { Ok("tskey-auth-federated".to_owned()) })
+    });
+    let _override = rustscale_feature::RESOLVE_AUTH_KEY_VIA_WIF.override_for_test(resolver);
+
+    let mut server = Server::builder()
+        .hostname("workload")
+        .control_url("https://control.example.com")
+        .client_id("client-123")
+        .id_token("secret-id-token")
+        .advertise_tags(vec!["tag:workload".into()])
+        .build()
+        .unwrap();
+    server.resolve_configured_auth_key().await.unwrap();
+
+    assert_eq!(
+        server.config.auth_key.as_deref(),
+        Some("tskey-auth-federated")
+    );
+    assert_eq!(
+        observed.lock().unwrap().take().unwrap(),
+        (
+            "https://control.example.com".into(),
+            "client-123".into(),
+            "secret-id-token".into(),
+            String::new(),
+            vec!["tag:workload".into()],
+        )
+    );
+    assert!(!format!("{:?}", server.config).contains("secret-id-token"));
+}
+
+#[cfg(feature = "identity-federation")]
+#[tokio::test]
+async fn workload_identity_builder_config_is_validated_before_hook() {
+    rustscale_identityfederation::install().unwrap();
+    let resolver: rustscale_feature::IdentityFederationResolver = Arc::new(|_| {
+        Box::pin(async {
+            Err(Box::<dyn std::error::Error + Send + Sync>::from(
+                "hook should not run",
+            ))
+        })
+    });
+    let _override = rustscale_feature::RESOLVE_AUTH_KEY_VIA_WIF.override_for_test(resolver);
+
+    let cases = [
+        (
+            Server::builder().client_id("client").build().unwrap(),
+            "ID token and audience are empty",
+        ),
+        (
+            Server::builder()
+                .id_token("token")
+                .audience("audience")
+                .build()
+                .unwrap(),
+            "only one of ID token and audience",
+        ),
+        (
+            Server::builder().id_token("token").build().unwrap(),
+            "client ID is empty",
+        ),
+        (
+            Server::builder().audience("audience").build().unwrap(),
+            "client ID is empty",
+        ),
+    ];
+    for (mut server, expected) in cases {
+        let error = server
+            .resolve_configured_auth_key()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(expected), "{error:?}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Gap 1: Port builder method (#54)
 // ---------------------------------------------------------------------------

@@ -10,9 +10,11 @@
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
+use std::future::Future;
 use std::marker::PhantomData;
+use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::{Condvar, OnceLock, RwLock};
+use std::sync::{Arc, Condvar, OnceLock, RwLock};
 use std::thread::{self, ThreadId};
 use std::{sync::Mutex, vec::Vec};
 
@@ -133,6 +135,49 @@ pub fn registered() -> Vec<String> {
 pub fn is_registered(name: &str) -> bool {
     global_registry().contains(name)
 }
+
+/// Boxed error returned across optional feature hook boundaries.
+pub type BoxError = Box<dyn Error + Send + Sync + 'static>;
+
+/// Owned, sendable future returned by asynchronous feature hooks.
+pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
+
+/// Parameters for resolving a one-use auth key through workload identity
+/// federation. The type intentionally does not implement `Debug`: it contains
+/// an identity token.
+pub struct IdentityFederationRequest {
+    pub base_url: String,
+    pub client_id: String,
+    pub id_token: String,
+    pub audience: String,
+    pub tags: Vec<String>,
+}
+
+/// Parameters for exchanging an identity JWT for a Tailscale access token.
+/// The type intentionally does not implement `Debug`: it contains a JWT.
+pub struct JwtExchangeRequest {
+    pub base_url: String,
+    pub client_id: String,
+    pub id_token: String,
+}
+
+/// Workload identity auth-key resolver hook.
+pub type IdentityFederationResolver = Arc<
+    dyn Fn(IdentityFederationRequest) -> BoxFuture<Result<String, BoxError>>
+        + Send
+        + Sync
+        + 'static,
+>;
+
+/// Workload identity JWT exchange hook.
+pub type JwtExchanger =
+    Arc<dyn Fn(JwtExchangeRequest) -> BoxFuture<Result<String, BoxError>> + Send + Sync + 'static>;
+
+/// Resolver installed by the workload identity federation package.
+pub static RESOLVE_AUTH_KEY_VIA_WIF: Hook<IdentityFederationResolver> = Hook::new();
+
+/// JWT exchanger installed by the workload identity federation package.
+pub static EXCHANGE_JWT_FOR_TOKEN_VIA_WIF: Hook<JwtExchanger> = Hook::new();
 
 #[derive(Debug)]
 struct HookValue<F> {

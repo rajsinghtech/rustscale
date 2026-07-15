@@ -40,13 +40,19 @@ pub(crate) const MAX_NESTING: usize = 16;
 // ---------------------------------------------------------------------------
 
 /// BLAKE2s-256 digest of an AUM. 32 bytes.
-/// Display/FromStr use lowercase base32 without padding (matching Go).
+/// Display/FromStr use RFC 4648 base32 without padding (matching Go).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct AumHash(pub [u8; 32]);
 
 impl AumHash {
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
+    }
+
+    /// Construct a hash from an exact 32-byte slice.
+    pub fn from_slice(bytes: &[u8]) -> Option<Self> {
+        let bytes: &[u8; 32] = bytes.try_into().ok()?;
+        Some(Self(*bytes))
     }
 }
 
@@ -66,7 +72,7 @@ impl FromStr for AumHash {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let bytes = base32_nopad()
-            .decode(s.to_ascii_lowercase().as_bytes())
+            .decode(s.to_ascii_uppercase().as_bytes())
             .map_err(|e| format!("invalid base32: {e}"))?;
         if bytes.len() != 32 {
             return Err(format!("expected 32 bytes, got {}", bytes.len()));
@@ -94,7 +100,7 @@ fn base32_nopad() -> &'static data_encoding::Encoding {
     static ENC: OnceLock<data_encoding::Encoding> = OnceLock::new();
     ENC.get_or_init(|| {
         let mut spec = data_encoding::Specification::new();
-        spec.symbols.push_str("abcdefghijklmnopqrstuvwxyz234567");
+        spec.symbols.push_str("ABCDEFGHIJKLMNOPQRSTUVWXYZ234567");
         spec.encoding().expect("valid base32 specification")
     })
 }
@@ -134,7 +140,7 @@ impl AumKind {
         self as u8
     }
 
-    fn from_u8(v: u8) -> Option<Self> {
+    fn from_u64(v: u64) -> Option<Self> {
         match v {
             0 => Some(Self::Invalid),
             1 => Some(Self::AddKey),
@@ -301,7 +307,7 @@ impl Aum {
                     let n = expect_uint(v)?;
                     set_unique(
                         &mut message_kind,
-                        AumKind::from_u8(n as u8).ok_or(DecodeError::InvalidAumKind(n))?,
+                        AumKind::from_u64(n).ok_or(DecodeError::InvalidAumKind(n))?,
                     )?;
                 }
                 2 => {
@@ -352,6 +358,86 @@ impl Aum {
             meta,
             signatures: signatures.unwrap_or_default(),
         })
+    }
+
+    /// Return the parent hash, if it has the required 32-byte representation.
+    pub fn parent(&self) -> Option<AumHash> {
+        self.prev_aum_hash.as_deref().and_then(AumHash::from_slice)
+    }
+
+    /// Validate the structure and bounded fields of this AUM.
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(parent) = &self.prev_aum_hash {
+            if parent.len() != 32 {
+                return Err(format!("parent hash has length {}, want 32", parent.len()));
+            }
+        }
+        for (index, signature) in self.signatures.iter().enumerate() {
+            if signature.key_id.len() != 32 || signature.signature.len() != 64 {
+                return Err(format!(
+                    "signature {index} has malformed key ID or signature"
+                ));
+            }
+        }
+        if let Some(key) = &self.key {
+            key.validate()?;
+        }
+        if let Some(state) = &self.state {
+            state.validate_checkpoint()?;
+        }
+
+        match self.message_kind {
+            AumKind::AddKey => {
+                if self.key.is_none() {
+                    return Err("AddKey AUM must contain a key".into());
+                }
+                if self.key_id.is_some()
+                    || self.state.is_some()
+                    || self.votes.is_some()
+                    || self.meta.is_some()
+                {
+                    return Err("AddKey AUM may only specify a key".into());
+                }
+            }
+            AumKind::RemoveKey => {
+                if self.key_id.as_ref().is_none_or(Vec::is_empty) {
+                    return Err("RemoveKey AUM must specify a key ID".into());
+                }
+                if self.key.is_some()
+                    || self.state.is_some()
+                    || self.votes.is_some()
+                    || self.meta.is_some()
+                {
+                    return Err("RemoveKey AUM may only specify a key ID".into());
+                }
+            }
+            AumKind::UpdateKey => {
+                if self.key_id.as_ref().is_none_or(Vec::is_empty) {
+                    return Err("UpdateKey AUM must specify a key ID".into());
+                }
+                if self.votes.is_none() && self.meta.is_none() {
+                    return Err("UpdateKey AUM must update votes or metadata".into());
+                }
+                if self.key.is_some() || self.state.is_some() {
+                    return Err("UpdateKey AUM may only specify key ID, votes, and metadata".into());
+                }
+            }
+            AumKind::Checkpoint => {
+                if self.state.is_none() {
+                    return Err("Checkpoint AUM must specify state".into());
+                }
+                if self.key.is_some()
+                    || self.key_id.is_some()
+                    || self.votes.is_some()
+                    || self.meta.is_some()
+                {
+                    return Err("Checkpoint AUM may only specify state".into());
+                }
+            }
+            AumKind::NoOp => {}
+            AumKind::Invalid => return Err("invalid AUM kind".into()),
+        }
+        Ok(())
     }
 
     /// BLAKE2s-256 of the full CBOR encoding (all fields including signatures).
@@ -487,7 +573,6 @@ pub(crate) fn expect_array(v: Value) -> Result<Vec<Value>, DecodeError> {
 pub(crate) fn expect_bytes(v: Value) -> Result<Vec<u8>, DecodeError> {
     match v {
         Value::Bytes(b) => Ok(b),
-        Value::Text(s) => Ok(s.into_bytes()),
         _ => Err(DecodeError::NotBytes),
     }
 }
@@ -759,11 +844,11 @@ mod tests {
     }
 
     #[test]
-    fn aum_hash_display_is_lowercase() {
+    fn aum_hash_display_matches_go_uppercase_base32() {
         let hash = AumHash([0xFF; 32]);
         let s = hash.to_string();
         assert!(s
             .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()));
     }
 }

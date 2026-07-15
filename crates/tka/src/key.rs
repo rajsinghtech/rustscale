@@ -36,7 +36,7 @@ impl KeyKind {
         self as u8
     }
 
-    fn from_u8(v: u8) -> Option<Self> {
+    fn from_u64(v: u64) -> Option<Self> {
         match v {
             0 => Some(Self::Invalid),
             1 => Some(Self::Key25519),
@@ -59,6 +59,38 @@ pub struct Key {
 }
 
 impl Key {
+    /// Return the key ID. Key25519 IDs are their 32-byte public keys.
+    pub fn id(&self) -> Result<&[u8], String> {
+        match self.kind {
+            KeyKind::Key25519 => Ok(&self.public),
+            KeyKind::Invalid => Err("invalid key kind".into()),
+        }
+    }
+
+    /// Validate key material and resource bounds.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.kind != KeyKind::Key25519 {
+            return Err("unrecognized key kind".into());
+        }
+        if self.public.len() != 32 {
+            return Err(format!(
+                "ed25519 public key has length {}, want 32",
+                self.public.len()
+            ));
+        }
+        if self.votes == 0 || self.votes > 4096 {
+            return Err(format!("key votes {} outside 1..=4096", self.votes));
+        }
+        let meta_bytes = self
+            .meta
+            .as_ref()
+            .map_or(0, |meta| meta.iter().map(|(k, v)| k.len() + v.len()).sum());
+        if meta_bytes > 512 {
+            return Err(format!("key metadata too large ({meta_bytes} > 512)"));
+        }
+        Ok(())
+    }
+
     /// Encode to CTAP2 canonical CBOR bytes.
     pub fn encode(&self) -> Vec<u8> {
         encode_value(&self.to_value())
@@ -107,7 +139,7 @@ impl Key {
                     let n = expect_uint(v)?;
                     set_unique(
                         &mut kind,
-                        KeyKind::from_u8(n as u8).ok_or(DecodeError::InvalidKeyKind(n))?,
+                        KeyKind::from_u64(n).ok_or(DecodeError::InvalidKeyKind(n))?,
                     )?;
                 }
                 2 => set_unique(&mut votes, expect_uint(v)?)?,

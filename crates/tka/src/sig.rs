@@ -39,7 +39,7 @@ impl SigKind {
         self as u8
     }
 
-    fn from_u8(v: u8) -> Option<Self> {
+    fn from_u64(v: u64) -> Option<Self> {
         match v {
             0 => Some(Self::Invalid),
             1 => Some(Self::Direct),
@@ -173,7 +173,7 @@ impl NodeKeySignature {
                     let n = expect_uint(v)?;
                     set_unique(
                         &mut sig_kind,
-                        SigKind::from_u8(n as u8).ok_or(DecodeError::InvalidSigKind(n))?,
+                        SigKind::from_u64(n).ok_or(DecodeError::InvalidSigKind(n))?,
                     )?;
                 }
                 2 => set_unique(&mut pubkey, expect_bytes(v)?)?,

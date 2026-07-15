@@ -89,7 +89,34 @@ pub(crate) struct TailnetLock {
     params: TailnetLockParams,
     path: Option<PathBuf>,
     operation: tokio::sync::Mutex<()>,
+    peer_authority: Mutex<Option<Arc<crate::map_update::PeerAuthorityRuntime>>>,
     inner: Mutex<Inner>,
+}
+
+/// Holds the one ordered TKA operation across a control-state decision,
+/// synchronization, and the peer-map commit derived from that decision.
+pub(crate) struct Operation<'a> {
+    lock: &'a TailnetLock,
+    _guard: tokio::sync::MutexGuard<'a, ()>,
+}
+
+impl Operation<'_> {
+    pub(crate) fn control_change_requires_revocation(
+        &self,
+        info: Option<&TKAInfo>,
+        initial: bool,
+    ) -> bool {
+        self.lock
+            .control_change_requires_revocation_inner(info, initial)
+    }
+
+    pub(crate) async fn apply_control_info(
+        &self,
+        info: Option<&TKAInfo>,
+        initial: bool,
+    ) -> Result<(), TailnetLockError> {
+        self.lock.apply_control_info_inner(info, initial).await
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -197,6 +224,7 @@ impl TailnetLock {
             params,
             path,
             operation: tokio::sync::Mutex::new(()),
+            peer_authority: Mutex::new(None),
             inner: Mutex::new(Inner {
                 authority,
                 storage,
@@ -255,11 +283,43 @@ impl TailnetLock {
         control
     }
 
+    pub(crate) fn attach_peer_authority(
+        &self,
+        runtime: Arc<crate::map_update::PeerAuthorityRuntime>,
+    ) -> Result<(), TailnetLockError> {
+        let mut attached = self
+            .peer_authority
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if attached.is_some() {
+            return Err(TailnetLockError::StateUnavailable);
+        }
+        *attached = Some(runtime);
+        Ok(())
+    }
+
+    pub(crate) fn peer_authority(
+        &self,
+    ) -> Result<Arc<crate::map_update::PeerAuthorityRuntime>, TailnetLockError> {
+        self.peer_authority
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .ok_or(TailnetLockError::StateUnavailable)
+    }
+
+    pub(crate) async fn operation(&self) -> Operation<'_> {
+        Operation {
+            lock: self,
+            _guard: self.operation.lock().await,
+        }
+    }
+
     /// Whether applying this control state can change peer authorization.
-    /// Callers use this before any network await to revoke the currently
-    /// published data plane. Repeated ready advertisements at the same head
+    /// This is called only while holding [`Operation`] through the subsequent
+    /// apply and peer commit. Repeated ready advertisements at the same head
     /// deliberately return false.
-    pub(crate) fn control_change_requires_revocation(
+    fn control_change_requires_revocation_inner(
         &self,
         info: Option<&TKAInfo>,
         initial: bool,
@@ -303,7 +363,15 @@ impl TailnetLock {
         info: Option<&TKAInfo>,
         initial: bool,
     ) -> Result<(), TailnetLockError> {
-        let _operation = self.operation.lock().await;
+        let operation = self.operation().await;
+        operation.apply_control_info(info, initial).await
+    }
+
+    async fn apply_control_info_inner(
+        &self,
+        info: Option<&TKAInfo>,
+        initial: bool,
+    ) -> Result<(), TailnetLockError> {
         let desired_enabled = match info {
             Some(info) => !info.Disabled,
             None if initial => false,
@@ -615,7 +683,7 @@ impl TailnetLock {
         &self,
         request: InitRequest,
     ) -> Result<Vec<Vec<u8>>, TailnetLockError> {
-        let _operation = self.operation.lock().await;
+        let _operation = self.operation().await;
         if self.path.is_none() {
             return Err(TailnetLockError::NoStateDirectory);
         }
@@ -698,6 +766,21 @@ impl TailnetLock {
             receipt
         };
 
+        // From this point initialization is locally valid and may commit at
+        // control. Close enforcement before the first RPC, drain every peer
+        // publication generation, and keep map commits behind the operation
+        // lock until the outcome is known. Only a later fresh map carrying a
+        // successfully validated enabled head may set ready again.
+        {
+            let mut inner = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            inner.required = true;
+            inner.ready = false;
+        }
+        self.peer_authority()?.withdraw().await;
+
         if self.authority_snapshot().is_some() {
             receipt.phase = InitReceiptPhase::LocalCommitted;
             self.save_init_receipt(&receipt)?;
@@ -729,7 +812,7 @@ impl TailnetLock {
                     inner.authority = Some(authority);
                     inner.storage = Some(storage);
                     inner.required = true;
-                    inner.ready = true;
+                    inner.ready = false;
                     drop(inner);
                     receipt.phase = InitReceiptPhase::LocalCommitted;
                     self.save_init_receipt(&receipt)?;
@@ -789,7 +872,7 @@ impl TailnetLock {
         inner.authority = Some(authority);
         inner.storage = Some(storage);
         inner.required = true;
-        inner.ready = true;
+        inner.ready = false;
         drop(inner);
         receipt.phase = InitReceiptPhase::LocalCommitted;
         self.save_init_receipt(&receipt)?;
@@ -866,7 +949,7 @@ impl TailnetLock {
     /// Ask control to disable the tailnet. Local enforcement remains active
     /// until a later map update carries a matching disablement proof.
     pub(crate) async fn disable(&self, secret: Vec<u8>) -> Result<(), TailnetLockError> {
-        let _operation = self.operation.lock().await;
+        let _operation = self.operation().await;
         if secret.len() > MAX_DISABLEMENT_SECRET {
             return Err(TailnetLockError::InvalidRequest(
                 "disablement secret is too large".into(),
@@ -880,6 +963,10 @@ impl TailnetLock {
                 "disablement secret is invalid".into(),
             ));
         }
+        // Join the same commit/revocation barrier used by map transitions.
+        // Local enforcement remains closed under the existing authority until
+        // a later map supplies and validates the disablement proof.
+        self.peer_authority()?.synchronize().await;
         let control = self.control();
         TkaClient::new(&control)
             .disable(&TKADisableRequest {
@@ -1072,28 +1159,30 @@ mod tests {
         .unwrap()
     }
 
-    #[test]
-    fn control_change_revocation_predicate_is_fail_closed_without_churn() {
+    #[tokio::test]
+    async fn control_change_revocation_predicate_is_fail_closed_without_churn() {
         let lock = unlocked_runtime();
-        assert!(!lock.control_change_requires_revocation(None, false));
-        assert!(!lock.control_change_requires_revocation(None, true));
-        assert!(!lock.control_change_requires_revocation(
+        let operation = lock.operation().await;
+        assert!(!operation.control_change_requires_revocation(None, false));
+        assert!(!operation.control_change_requires_revocation(None, true));
+        assert!(!operation.control_change_requires_revocation(
             Some(&TKAInfo {
                 Disabled: true,
                 ..Default::default()
             }),
             false,
         ));
-        assert!(lock.control_change_requires_revocation(
+        assert!(operation.control_change_requires_revocation(
             Some(&TKAInfo {
                 Head: "malformed-new-head".into(),
                 Disabled: false,
             }),
             false,
         ));
+        drop(operation);
 
         lock.require_fresh_control_state();
-        assert!(lock.control_change_requires_revocation(
+        assert!(lock.operation().await.control_change_requires_revocation(
             Some(&TKAInfo {
                 Disabled: true,
                 ..Default::default()

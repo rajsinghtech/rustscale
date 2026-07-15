@@ -294,6 +294,24 @@ impl Server {
             protocol_version: PROTOCOL_VERSION,
             shields_up: prefs.read().await.ShieldsUp,
         };
+        b.tailnet_lock
+            .attach_peer_authority(crate::map_update::PeerAuthorityRuntime::new(
+                b.exit_map_gate.clone(),
+                b.peer_map.clone(),
+                self.drive.clone(),
+                b.magicsock.clone(),
+                b.filter.clone(),
+                b.peers.clone(),
+                b.wg_tunnels.clone(),
+                b.resolver.clone(),
+                prefs.clone(),
+                b.route_table.clone(),
+                None,
+                b.tailscale_ips.clone(),
+                b.control_url.clone(),
+                self.config.accept_routes,
+            ))
+            .map_err(|error| TsnetError::TailnetLock(error.to_string()))?;
         let map_update = spawn_map_update_task(
             b.map_rx,
             b.magicsock.clone(),
@@ -888,6 +906,24 @@ impl Server {
             protocol_version: PROTOCOL_VERSION,
             shields_up: prefs.read().await.ShieldsUp,
         };
+        b.tailnet_lock
+            .attach_peer_authority(crate::map_update::PeerAuthorityRuntime::new(
+                b.exit_map_gate.clone(),
+                b.peer_map.clone(),
+                self.drive.clone(),
+                b.magicsock.clone(),
+                b.filter.clone(),
+                b.peers.clone(),
+                b.wg_tunnels.clone(),
+                b.resolver.clone(),
+                prefs.clone(),
+                b.route_table.clone(),
+                router.clone(),
+                b.tailscale_ips.clone(),
+                b.control_url.clone(),
+                self.config.accept_routes,
+            ))
+            .map_err(|error| TsnetError::TailnetLock(error.to_string()))?;
         let map_update = spawn_map_update_task(
             b.map_rx,
             b.magicsock.clone(),

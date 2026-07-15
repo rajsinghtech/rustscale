@@ -8,9 +8,11 @@ use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use rustscale_key::NodePrivate;
 use rustscale_tailcfg::Node;
+use rustscale_testcontrol::Server as TestControlServer;
 use rustscale_wg::WgTunn;
 
 use super::*;
@@ -61,6 +63,208 @@ fn builder_sets_ephemeral_flag() {
         .build()
         .unwrap();
     assert!(server.config.ephemeral);
+}
+
+async fn wait_for_map_polls(control: &TestControlServer, expected: i32) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while control.in_serve_map() != expected {
+        assert!(
+            Instant::now() < deadline,
+            "map poll count did not reach {expected}; current={}",
+            control.in_serve_map()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn cancel_logout_at(
+    server: &mut Server,
+    hook: &Arc<LogoutTestHook>,
+    point: LogoutAwaitPoint,
+) {
+    hook.pause_at(point);
+    let mut logout = Box::pin(server.logout());
+    tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::select! {
+            result = &mut logout => panic!("logout completed before {point:?}: {result:?}"),
+            () = hook.wait_reached() => {}
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("logout did not reach {point:?}"));
+    drop(logout);
+    hook.clear();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn logout_cancellation_retains_every_await_owner_and_allows_clean_rebind() {
+    let mut control = TestControlServer::new();
+    control.start().await.unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let sockets = tempfile::tempdir().unwrap();
+    let socket = sockets.path().join("logout-cancel.sock");
+    let mut server = Server::builder()
+        .hostname("logout-cancel")
+        .control_url(control.base_url())
+        .state_dir(state.path())
+        .localapi_path(&socket)
+        .disable_direct_paths(true)
+        .disable_portmapping(true)
+        .build()
+        .unwrap();
+
+    let commands = server.start_localapi_only().await.unwrap();
+    drop(commands);
+    server.set_auth_key("tskey-test");
+    Box::pin(tokio::time::timeout(Duration::from_secs(60), server.up()))
+        .await
+        .unwrap()
+        .unwrap();
+    wait_for_map_polls(&control, 1).await;
+    let persisted_node = server.load_or_create_state().unwrap().node_key.public();
+
+    let hook = LogoutTestHook::new();
+    server.logout_test_hook = Some(hook.clone());
+    let points = [
+        LogoutAwaitPoint::DriveDisable,
+        LogoutAwaitPoint::PreLocalApi,
+        LogoutAwaitPoint::RunningLocalApi,
+        LogoutAwaitPoint::Serve,
+        LogoutAwaitPoint::Monitor,
+        LogoutAwaitPoint::Tasks,
+        LogoutAwaitPoint::Netlog,
+        LogoutAwaitPoint::Audit,
+        LogoutAwaitPoint::ControlLogout,
+        LogoutAwaitPoint::PrePortmapper,
+        LogoutAwaitPoint::PreMagicsock,
+        LogoutAwaitPoint::RunningPortmapper,
+        LogoutAwaitPoint::RunningMagicsock,
+    ];
+
+    for point in points {
+        cancel_logout_at(&mut server, &hook, point).await;
+        assert!(server.inner.is_some(), "{point:?} removed RunningState");
+        assert!(
+            server.pre_started.is_some(),
+            "{point:?} removed pre-login cleanup ownership"
+        );
+        assert!(matches!(
+            server.start_localapi_only().await,
+            Err(TsnetError::AlreadyUp)
+        ));
+        assert_eq!(
+            server.load_or_create_state().unwrap().node_key.public(),
+            persisted_node,
+            "{point:?} crossed the durable logout commit point"
+        );
+        assert!(!server.load_prefs().unwrap().LoggedOut);
+
+        let noise_connections = control.noise_connection_count();
+        assert!(matches!(
+            Box::pin(server.up()).await,
+            Err(TsnetError::AlreadyUp)
+        ));
+        assert_eq!(
+            control.noise_connection_count(),
+            noise_connections,
+            "{point:?} started a replacement control/map consumer"
+        );
+
+        if point as u8 > LogoutAwaitPoint::Tasks as u8 {
+            let inner = server.inner.as_ref().unwrap();
+            assert!(
+                inner.tasks.lock().await.is_empty(),
+                "{point:?} retained an unjoined TKA/outer task"
+            );
+            assert!(
+                inner.map_tasks.is_empty().await,
+                "{point:?} retained an unjoined map session"
+            );
+            assert!(
+                inner
+                    .localapi_handle
+                    .as_ref()
+                    .and_then(|handle| handle.task.as_ref())
+                    .is_none(),
+                "{point:?} retained an unjoined LocalAPI task"
+            );
+        }
+    }
+
+    server.logout().await.unwrap();
+    assert!(server.inner.is_none());
+    assert!(server.pre_started.is_none());
+    assert_ne!(
+        server.load_or_create_state().unwrap().node_key.public(),
+        persisted_node
+    );
+    assert!(server.load_prefs().unwrap().LoggedOut);
+    wait_for_map_polls(&control, 0).await;
+
+    let commands = server.start_localapi_only().await.unwrap();
+    assert!(
+        rustscale_safesocket::connect(&socket).is_ok(),
+        "NeedsLogin LocalAPI did not immediately rebind"
+    );
+    drop(commands);
+    server.close().await.into_result().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn profile_switch_retries_cancelled_logout_before_immediate_rebind() {
+    let mut control = TestControlServer::new();
+    control.start().await.unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let sockets = tempfile::tempdir().unwrap();
+    let socket = sockets.path().join("profile-cancel.sock");
+
+    let mut profiles = rustscale_ipn::ProfileManager::new(state.path()).unwrap();
+    let profile_a = profiles.new_profile("profile-a").unwrap().profile;
+    let profile_b = profiles.new_profile("profile-b").unwrap().profile;
+    profiles.switch_profile(&profile_a.ID).unwrap();
+
+    let mut server = Server::builder()
+        .hostname("profile-cancel")
+        .auth_key("tskey-test")
+        .control_url(control.base_url())
+        .ephemeral(true)
+        .state_dir(state.path())
+        .localapi_path(&socket)
+        .disable_direct_paths(true)
+        .disable_portmapping(true)
+        .build()
+        .unwrap();
+    Box::pin(tokio::time::timeout(Duration::from_secs(60), server.up()))
+        .await
+        .unwrap()
+        .unwrap();
+    wait_for_map_polls(&control, 1).await;
+    let old_node = server.node_key().unwrap();
+
+    let hook = LogoutTestHook::new();
+    server.logout_test_hook = Some(hook.clone());
+    cancel_logout_at(&mut server, &hook, LogoutAwaitPoint::Tasks).await;
+
+    Box::pin(tokio::time::timeout(
+        Duration::from_secs(60),
+        server.switch_profile(&profile_b.ID),
+    ))
+    .await
+    .expect("profile switch timed out")
+    .expect("profile switch failed");
+    wait_for_map_polls(&control, 1).await;
+    assert_ne!(server.node_key().unwrap(), old_node);
+    assert!(rustscale_safesocket::connect(&socket).is_ok());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while control.active_noise_connection_count() != 1 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("old map/TKA control session survived profile rebind");
+
+    server.close().await.into_result().unwrap();
+    wait_for_map_polls(&control, 0).await;
 }
 
 #[cfg(feature = "identity-federation")]

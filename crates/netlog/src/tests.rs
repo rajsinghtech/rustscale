@@ -91,6 +91,35 @@ async fn test_logger_start_stop() {
 }
 
 #[tokio::test]
+async fn stop_cancellation_retains_worker_for_retry() {
+    let source: Arc<dyn crate::NodeSource> = Arc::new(MockNodeSource::new(Some(Node {
+        node_id: "nABC".to_string(),
+        ..Default::default()
+    })));
+    let logger = crate::Logger::new();
+    logger.start(source, test_logtail()).await.unwrap();
+
+    // Poll through handle lookup and shutdown signalling, then cancel while
+    // stop is awaiting the worker. The runtime cannot run the worker during
+    // this poll, so the immediately-ready branch deterministically wins.
+    {
+        let mut stop = Box::pin(logger.stop());
+        tokio::select! {
+            biased;
+            result = &mut stop => panic!("stop completed before cancellation: {result:?}"),
+            () = std::future::ready(()) => {}
+        }
+    }
+
+    assert!(
+        logger.running().await,
+        "cancelled stop lost worker ownership"
+    );
+    logger.stop().await.unwrap();
+    assert!(!logger.running().await);
+}
+
+#[tokio::test]
 async fn test_logger_counter_sends_events() {
     let source: Arc<dyn crate::NodeSource> = Arc::new(
         MockNodeSource::new(Some(Node {

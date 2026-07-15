@@ -17,7 +17,13 @@ const MAX_BODY: usize = 256 * 1024;
 pub(crate) async fn http_get(url: &str, deadline: Duration) -> Result<String, std::io::Error> {
     let (host, port, path) = parse_url(url)?;
     let req = format!("GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n");
-    let body = do_request(&host, port, &req, deadline).await?;
+    let response = do_request(&host, port, &req, deadline).await?;
+    let (status, body) = split_response(&response)?;
+    if status != 200 {
+        return Err(std::io::Error::other(format!(
+            "HTTP GET failed (status={status})"
+        )));
+    }
     String::from_utf8(body).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
@@ -35,7 +41,7 @@ pub(crate) async fn http_post_soap(
         body.len()
     );
     let resp = do_request(&host, port, &req, deadline).await?;
-    let (status, body_text) = split_response(&resp);
+    let (status, body_text) = split_response(&resp)?;
     Ok((
         status,
         String::from_utf8(body_text)
@@ -76,36 +82,129 @@ async fn do_request(
     .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timeout"))??;
     stream.write_all(req.as_bytes()).await?;
     let mut buf = Vec::with_capacity(4096);
-    let mut limited = stream.take(MAX_BODY as u64);
+    let mut limited = stream.take((MAX_BODY + 1) as u64);
     timeout(deadline, limited.read_to_end(&mut buf))
         .await
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "read timeout"))??;
     if buf.len() > MAX_BODY {
         return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "response too large",
+            std::io::ErrorKind::FileTooLarge,
+            "HTTP response exceeds size limit",
         ));
     }
     Ok(buf)
 }
 
-/// Split a raw HTTP response into (status_code, body_bytes).
-fn split_response(raw: &[u8]) -> (u16, Vec<u8>) {
-    // Find the end of headers (\r\n\r\n).
-    let header_end = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap_or(0);
-    let header_str = String::from_utf8_lossy(&raw[..header_end]);
-    let status = header_str
-        .lines()
+/// Strictly split a raw HTTP/1.x response into status and body.
+fn split_response(raw: &[u8]) -> Result<(u16, Vec<u8>), std::io::Error> {
+    let invalid =
+        |message: &'static str| std::io::Error::new(std::io::ErrorKind::InvalidData, message);
+    let header_end = raw
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(|| invalid("missing HTTP header terminator"))?;
+    let header = std::str::from_utf8(&raw[..header_end])
+        .map_err(|_| invalid("HTTP headers are not UTF-8"))?;
+    let mut lines = header.split("\r\n");
+    let status_line = lines
         .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(500);
-    let body = if header_end > 0 {
-        raw[header_end + 4..].to_vec()
-    } else {
-        Vec::new()
-    };
-    (status, body)
+        .ok_or_else(|| invalid("missing HTTP status line"))?;
+    let mut status_parts = status_line.splitn(3, ' ');
+    let version = status_parts.next().unwrap_or_default();
+    let code = status_parts.next().unwrap_or_default();
+    let reason = status_parts
+        .next()
+        .ok_or_else(|| invalid("malformed HTTP status line"))?;
+    let version_bytes = version.as_bytes();
+    if version_bytes.len() != 8
+        || &version_bytes[..7] != b"HTTP/1."
+        || !version_bytes[7].is_ascii_digit()
+        || code.len() != 3
+        || !code.bytes().all(|byte| byte.is_ascii_digit())
+        || code.starts_with('0')
+        || !reason
+            .bytes()
+            .all(|byte| byte == b'\t' || (byte >= b' ' && byte != 0x7f))
+    {
+        return Err(invalid("malformed HTTP status line"));
+    }
+    let status = code
+        .parse::<u16>()
+        .map_err(|_| invalid("invalid HTTP status code"))?;
+    if !(100..=599).contains(&status) {
+        return Err(invalid("HTTP status code out of range"));
+    }
+
+    let mut content_length = None;
+    for line in lines {
+        if line.is_empty() || line.starts_with([' ', '\t']) {
+            return Err(invalid("malformed HTTP header"));
+        }
+        let (name, value) = line
+            .split_once(':')
+            .ok_or_else(|| invalid("malformed HTTP header"))?;
+        if name.is_empty() || !name.bytes().all(is_http_token_byte) {
+            return Err(invalid("invalid HTTP header name"));
+        }
+        if !value
+            .bytes()
+            .all(|byte| byte == b'\t' || (byte >= b' ' && byte != 0x7f))
+        {
+            return Err(invalid("invalid HTTP header value"));
+        }
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            return Err(invalid("unsupported Transfer-Encoding"));
+        }
+        if name.eq_ignore_ascii_case("content-length") {
+            let value = value.trim_matches([' ', '\t']);
+            if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(invalid("invalid Content-Length"));
+            }
+            let length = value
+                .parse::<usize>()
+                .map_err(|_| invalid("invalid Content-Length"))?;
+            if content_length.replace(length).is_some() {
+                return Err(invalid("duplicate Content-Length"));
+            }
+        }
+    }
+    let body = raw[header_end + 4..].to_vec();
+    if body.len() > MAX_BODY {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::FileTooLarge,
+            "HTTP response body exceeds size limit",
+        ));
+    }
+    if content_length.is_some_and(|length| length != body.len()) {
+        return Err(invalid("Content-Length mismatch"));
+    }
+    if ((100..200).contains(&status) || matches!(status, 204 | 205 | 304))
+        && (content_length.is_some() || !body.is_empty())
+    {
+        return Err(invalid("HTTP status forbids body framing"));
+    }
+    Ok((status, body))
+}
+
+fn is_http_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
 }
 
 #[cfg(test)]
@@ -139,8 +238,78 @@ mod tests {
     #[test]
     fn split_response_extracts_status_and_body() {
         let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
-        let (status, body) = split_response(raw);
+        let (status, body) = split_response(raw).unwrap();
         assert_eq!(status, 200);
         assert_eq!(&body, b"hello");
+    }
+
+    #[tokio::test]
+    async fn reader_detects_oversized_close_framed_response() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).await;
+            let mut response = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n<s:Envelope>".to_vec();
+            response.resize(MAX_BODY + 1, b'x');
+            stream.write_all(&response).await.unwrap();
+        });
+        let error = http_post_soap(
+            &format!("http://{address}/control"),
+            "urn:test#AddPortMapping",
+            "text/xml",
+            "<request/>",
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::FileTooLarge);
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn split_response_enforces_body_framing_and_limits() {
+        let visible_fault_prefix = b"<s:Envelope><s:Body><s:Fault>";
+        let mut oversized = b"HTTP/1.1 200 OK\r\n\r\n".to_vec();
+        oversized.extend_from_slice(visible_fault_prefix);
+        oversized.resize(oversized.len() + MAX_BODY, b'x');
+        assert_eq!(
+            split_response(&oversized).unwrap_err().kind(),
+            std::io::ErrorKind::FileTooLarge
+        );
+
+        assert!(split_response(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhell").is_err());
+        assert!(
+            split_response(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello-trailing").is_err()
+        );
+        for raw in [
+            &b"HTTP/1.1 100 Continue\r\n\r\nx"[..],
+            &b"HTTP/1.1 204 No Content\r\n\r\nx"[..],
+            &b"HTTP/1.1 304 Not Modified\r\nContent-Length: 1\r\n\r\nx"[..],
+            &b"HTTP/1.1 205 Reset Content\r\nContent-Length: 0\r\n\r\n"[..],
+            &b"HTTP/1.1 205 Reset Content\r\n\r\n<s:Envelope/>"[..],
+        ] {
+            assert!(split_response(raw).is_err(), "accepted {raw:?}");
+        }
+        assert!(split_response(b"HTTP/1.1 204 No Content\r\n\r\n").is_ok());
+    }
+
+    #[test]
+    fn split_response_rejects_malformed_status_and_headers() {
+        for raw in [
+            &b"BROKEN 200 OK\r\nContent-Length: 0\r\n\r\n"[..],
+            &b"HTTP/2 200 OK\r\nContent-Length: 0\r\n\r\n"[..],
+            &b"HTTP/1.1 20 OK\r\nContent-Length: 0\r\n\r\n"[..],
+            &b"HTTP/1.1 abc OK\r\nContent-Length: 0\r\n\r\n"[..],
+            &b"HTTP/1.1 600 Out Of Range\r\n\r\n<s:Envelope/>"[..],
+            &b"HTTP/1.1 999 Out Of Range\r\n\r\n<s:Envelope/>"[..],
+            &b"HTTP/1.1 200 OK\nContent-Length: 0\n\n"[..],
+            &b"HTTP/1.1 200 OK\r\nBad Header: x\r\n\r\n"[..],
+            &b"HTTP/1.1 200 OK\r\n folded: x\r\n\r\n"[..],
+            &b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n"[..],
+        ] {
+            assert!(split_response(raw).is_err(), "accepted {raw:?}");
+        }
     }
 }

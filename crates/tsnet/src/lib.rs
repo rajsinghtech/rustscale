@@ -109,6 +109,7 @@ pub(crate) use link_monitor::{
 };
 pub(crate) use map_update::{
     exit_node_pref, set_exit_node_pref, spawn_map_update_task, ExitNodeSelection, KeyRotationCtx,
+    MapSessionTasks,
 };
 #[cfg(test)]
 pub(crate) use netstack_pump::collect_tun_inbound;
@@ -237,6 +238,24 @@ pub enum TsnetError {
     Service(#[from] ServiceError),
 }
 
+/// Explicit outcome of [`Server::close`].
+#[derive(Debug)]
+pub struct CloseResult(pub(crate) Result<(), TsnetError>);
+
+impl CloseResult {
+    pub fn is_ok(&self) -> bool {
+        self.0.is_ok()
+    }
+
+    pub fn is_err(&self) -> bool {
+        self.0.is_err()
+    }
+
+    pub fn into_result(self) -> Result<(), TsnetError> {
+        self.0
+    }
+}
+
 /// A builder for configuring a [`Server`].
 #[derive(Clone, Default)]
 pub struct ServerBuilder {
@@ -275,6 +294,9 @@ pub struct ServerBuilder {
     /// [`MagicsockConfig::disable_direct_paths`]. Production code should
     /// leave this false.
     pub(crate) disable_direct_paths: bool,
+    /// Whether NAT-PMP/PCP/UPnP endpoint discovery is disabled. Production
+    /// defaults to false; hermetic tests can opt out of host gateway state.
+    pub(crate) disable_portmapping: bool,
     /// Runtime Hostinfo field overrides (mirror Go's
     /// `hostinfo.SetDeviceModel`/`SetApp`/`SetOSVersion`/`SetPackage`).
     /// Applied before platform detection so they win over auto-detected
@@ -392,6 +414,7 @@ impl std::fmt::Debug for ServerBuilder {
             .field("accept_routes", &self.accept_routes)
             .field("advertise_exit_node", &self.advertise_exit_node)
             .field("disable_direct_paths", &self.disable_direct_paths)
+            .field("disable_portmapping", &self.disable_portmapping)
             .field("localapi", &self.localapi)
             .field("localapi_path", &self.localapi_path)
             .field("configure_os_dns", &self.configure_os_dns)
@@ -532,6 +555,14 @@ impl ServerBuilder {
     /// connectivity in isolation. See [`MagicsockConfig::disable_direct_paths`].
     pub fn disable_direct_paths(mut self, on: bool) -> Self {
         self.disable_direct_paths = on;
+        self
+    }
+
+    /// Disable NAT-PMP, PCP, and UPnP endpoint discovery. This is primarily
+    /// useful for hermetic tests that must not inspect or modify the host's
+    /// gateway. Production callers should leave port mapping enabled.
+    pub fn disable_portmapping(mut self, on: bool) -> Self {
+        self.disable_portmapping = on;
         self
     }
 
@@ -739,6 +770,8 @@ impl ServerBuilder {
             drive: drive::Runtime::new(),
             inner: None,
             pre_started: None,
+            #[cfg(test)]
+            logout_test_hook: None,
         })
     }
 }
@@ -761,6 +794,13 @@ pub(crate) struct RunningState {
     pub(crate) router: Option<SharedRouter>,
     pub(crate) cancel: Arc<CancelToken>,
     pub(crate) tasks: Mutex<Vec<JoinHandle<()>>>,
+    /// Dynamically rebound map stream task, retained separately so every key
+    /// rotation generation is cancelled and joined under profile ownership.
+    pub(crate) map_tasks: Arc<MapSessionTasks>,
+    /// Synchronously usable cancellation handles for every task in `tasks`.
+    /// Teardown aborts these before its first await, while `tasks` retains the
+    /// join ownership needed for cancellation-safe cleanup retries.
+    pub(crate) task_aborts: std::sync::Mutex<Vec<tokio::task::AbortHandle>>,
     pub(crate) packet_drops: Arc<AtomicU64>,
     /// Optional packet-capture sink. Disabled capture costs pumps one cheap
     /// read-lock/Option check per observed packet.
@@ -810,8 +850,12 @@ pub(crate) struct RunningState {
     pub(crate) peerapi_port: Option<u16>,
     /// Runtime Hostinfo field overrides (shared with the update loop).
     pub(crate) overrides: SharedOverrides,
-    /// LocalAPI socket path (if the server was spawned). Used for cleanup on
-    /// close().
+    /// LocalAPI accept-loop ownership. Kept separate from the generic task
+    /// set so shutdown can revoke publication and join every connection before
+    /// releasing profile identity and magicsock ownership.
+    pub(crate) localapi_handle: Option<localapi::LocalApiHandle>,
+    /// LocalAPI socket path (if the server was spawned). Used for diagnostics
+    /// and cleanup on close().
     pub(crate) localapi_socket: Option<PathBuf>,
     /// Node key expired flag — set when the control server signals
     /// `NodeKeyExpired` in a MapResponse. The client should transition to
@@ -858,6 +902,9 @@ pub(crate) struct RunningState {
     pub(crate) client_updater: Arc<std::sync::Mutex<rustscale_clientupdate::ClientUpdater>>,
     /// Persistent client audit logger for this profile/control client.
     pub(crate) audit_logger: Arc<rustscale_auditlog::Logger>,
+    /// Prevents cancellation/retry from enqueueing duplicate logout audit
+    /// records after teardown has started.
+    pub(crate) logout_audit_enqueued: bool,
     /// Tailnet Lock authority shared by map filtering and LocalAPI.
     pub(crate) tailnet_lock: Arc<tailnet_lock::TailnetLock>,
 }
@@ -902,7 +949,7 @@ pub(crate) struct Bootstrap {
     pub(crate) route_table: Arc<RwLock<RouteTable>>,
     pub(crate) cancel: Arc<CancelToken>,
     pub(crate) map_rx: mpsc::Receiver<Result<MapResponse, StreamMapError>>,
-    pub(crate) map_task: JoinHandle<()>,
+    pub(crate) map_tasks: Arc<MapSessionTasks>,
     pub(crate) node_key: NodePrivate,
     pub(crate) filter: Arc<std::sync::Mutex<Filter>>,
     /// Last successfully received named ACL fragments, including the initial
@@ -983,6 +1030,63 @@ pub struct Server {
     pub(crate) drive: Arc<drive::Runtime>,
     pub(crate) inner: Option<RunningState>,
     pub(crate) pre_started: Option<PreStartedLocalApi>,
+    #[cfg(test)]
+    pub(crate) logout_test_hook: Option<Arc<LogoutTestHook>>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(crate) enum LogoutAwaitPoint {
+    DriveDisable = 1,
+    PreLocalApi = 2,
+    RunningLocalApi = 3,
+    Serve = 4,
+    Monitor = 5,
+    Tasks = 6,
+    Netlog = 7,
+    Audit = 8,
+    ControlLogout = 9,
+    PrePortmapper = 10,
+    PreMagicsock = 11,
+    RunningPortmapper = 12,
+    RunningMagicsock = 13,
+}
+
+#[cfg(test)]
+pub(crate) struct LogoutTestHook {
+    pause_at: std::sync::atomic::AtomicU8,
+    reached: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl LogoutTestHook {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            pause_at: std::sync::atomic::AtomicU8::new(0),
+            reached: tokio::sync::Notify::new(),
+        })
+    }
+
+    pub(crate) fn pause_at(&self, point: LogoutAwaitPoint) {
+        self.pause_at
+            .store(point as u8, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn clear(&self) {
+        self.pause_at.store(0, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) async fn wait_reached(&self) {
+        self.reached.notified().await;
+    }
+
+    pub(crate) async fn checkpoint(&self, point: LogoutAwaitPoint) {
+        if self.pause_at.load(std::sync::atomic::Ordering::Acquire) == point as u8 {
+            self.reached.notify_one();
+            std::future::pending::<()>().await;
+        }
+    }
 }
 
 /// State from `start_localapi_only()` — used by `up()` to reuse the
@@ -990,6 +1094,9 @@ pub struct Server {
 /// pre-started LocalAPI server.
 pub(crate) struct PreStartedLocalApi {
     pub(crate) backend: Arc<IpnBackend>,
+    /// Pre-login magicsock ownership, retained for future IPNext startup
+    /// paths and explicit close/shutdown.
+    pub(crate) magicsock: Arc<Magicsock>,
     pub(crate) handle: Option<localapi::LocalApiHandle>,
     pub(crate) login_trigger: Arc<tokio::sync::Notify>,
     #[allow(dead_code)]

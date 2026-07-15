@@ -244,9 +244,15 @@ impl Logger {
     /// left unsent remain in the store.
     pub async fn flush_and_stop(&self, timeout: Duration) {
         self.cancel.cancel();
-        if let Some(worker) = self.worker.lock().await.take() {
-            let _ = worker.await;
+        let mut worker_guard = self.worker.lock().await;
+        if let Some(worker) = worker_guard.as_mut() {
+            // Retain join ownership until the await completes. Cancellation
+            // of this shutdown future leaves the same worker available for a
+            // later retry instead of detaching it.
+            let _ = (&mut *worker).await;
+            worker_guard.take();
         }
+        drop(worker_guard);
         let _ = tokio::time::timeout(timeout, self.flush_once(None)).await;
     }
 
@@ -536,6 +542,31 @@ mod tests {
         logger.enqueue(AUDIT_NODE_DISCONNECT, "cli").unwrap();
         logger.flush_and_stop(Duration::from_secs(1)).await;
 
+        assert_eq!(transport.sent_count(), 1);
+        assert!(log_store.load("profile").unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancellation_retains_worker_for_retry() {
+        let store: Arc<dyn Store> = Arc::new(MemStore::new());
+        let (logger, log_store) = logger(store, 3);
+        let transport = Arc::new(MockTransport::scripted([]));
+        logger.start(transport.clone()).await.unwrap();
+        logger.enqueue(AUDIT_NODE_DISCONNECT, "cli").unwrap();
+
+        // Cancel after flush_and_stop has retained and started awaiting the
+        // worker. The worker cannot run during this poll, making cancellation
+        // at the join deterministic.
+        {
+            let mut shutdown = Box::pin(logger.flush_and_stop(Duration::from_secs(1)));
+            tokio::select! {
+                biased;
+                () = &mut shutdown => panic!("shutdown completed before cancellation"),
+                () = std::future::ready(()) => {}
+            }
+        }
+
+        logger.flush_and_stop(Duration::from_secs(1)).await;
         assert_eq!(transport.sent_count(), 1);
         assert!(log_store.load("profile").unwrap().is_empty());
     }

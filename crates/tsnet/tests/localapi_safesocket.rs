@@ -69,6 +69,48 @@ fn wait_for_socket(path: &std::path::Path, timeout: Duration) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn close_prestarted_localapi_allows_immediate_rebind() {
+    let state_tmp = tempfile::tempdir().expect("state tempdir");
+    let sock_tmp = tempfile::tempdir().expect("socket tempdir");
+    let socket_path = sock_tmp.path().join("prestarted.sock");
+    let mut server = Server::builder()
+        .hostname("prestarted-close-test")
+        .state_dir(state_tmp.path().to_path_buf())
+        .localapi_path(&socket_path)
+        .build()
+        .expect("tsnet build");
+
+    let first_commands = server
+        .start_localapi_only()
+        .await
+        .expect("start pre-login LocalAPI");
+    let live_connection = connect(&socket_path).expect("connect pre-login LocalAPI");
+    drop(first_commands);
+    server
+        .close()
+        .await
+        .into_result()
+        .expect("close pre-login state");
+    drop(live_connection);
+    assert!(connect(&socket_path).is_err());
+
+    for attempt in 0..3 {
+        let commands = server
+            .start_localapi_only()
+            .await
+            .unwrap_or_else(|error| panic!("NeedsLogin rebind {attempt}: {error}"));
+        assert!(connect(&socket_path).is_ok());
+        drop(commands);
+        server
+            .close()
+            .await
+            .into_result()
+            .unwrap_or_else(|error| panic!("NeedsLogin close {attempt}: {error}"));
+        assert!(connect(&socket_path).is_err());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn localapi_status_and_health_over_safesocket() {
     // 1. Start testcontrol.
     let mut tc = TestControlServer::new();

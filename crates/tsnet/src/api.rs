@@ -364,6 +364,11 @@ impl Server {
             .map_err(TsnetError::Io)?;
         // Register the task in the server's set so close() aborts it.
         if let Some(task) = handle.take_task() {
+            inner
+                .task_aborts
+                .lock()
+                .expect("server task abort lock poisoned")
+                .push(task.abort_handle());
             inner.tasks.lock().await.push(task);
         }
         Ok(handle)

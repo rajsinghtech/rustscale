@@ -103,6 +103,8 @@ pub fn parse_response(pkt: &[u8]) -> Option<PmpResponse> {
         } else {
             resp.public_addr = Some(addr);
         }
+    } else {
+        return None;
     }
 
     Some(resp)
@@ -171,6 +173,13 @@ mod tests {
     #[test]
     fn parse_rejects_wrong_version() {
         let pkt = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert!(parse_response(&pkt).is_none());
+    }
+
+    #[test]
+    fn parse_rejects_unknown_opcode() {
+        let mut pkt = [0_u8; 12];
+        pkt[1] = PMP_OP_REPLY | 7;
         assert!(parse_response(&pkt).is_none());
     }
 

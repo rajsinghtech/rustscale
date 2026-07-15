@@ -78,7 +78,8 @@ impl Server {
             mac_secret_rotation_interval: config.mac_secret_rotation_interval,
             min_vni: config.min_vni,
             max_vni: config.max_vni,
-            udp4: Arc::new(udp4),
+            udp4: Mutex::new(Some(Arc::new(udp4))),
+            local_addr: advertised_addr,
             closed: AtomicBool::new(false),
             delivery_gate: tokio::sync::RwLock::new(()),
             state: Mutex::new(ServerState {
@@ -114,8 +115,7 @@ impl Server {
 
     /// The advertised IPv4 address of the server (loopback with bound port).
     pub fn local_addr_v4(&self) -> SocketAddr {
-        let port = self.inner.udp4.local_addr().expect("socket bound").port();
-        SocketAddr::from(([127, 0, 0, 1], port))
+        self.inner.local_addr
     }
 
     /// The server's disco public key (used by clients to seal/open disco
@@ -202,9 +202,20 @@ impl Server {
         state.endpoints_by_disco.clear();
         state.mac_secrets.clear();
         drop(state);
+        self.inner.udp4.lock().unwrap().take();
         let tasks = self.tasks.lock().unwrap();
         for task in tasks.iter() {
             task.abort();
+        }
+    }
+
+    /// Close and join both relay-server background tasks. The method is
+    /// idempotent; concurrent/repeated callers drain at most one task set.
+    pub async fn shutdown(&self) {
+        self.close();
+        let tasks = std::mem::take(&mut *self.tasks.lock().unwrap());
+        for task in tasks {
+            let _ = task.await;
         }
     }
 
@@ -235,7 +246,8 @@ struct ServerInner {
     mac_secret_rotation_interval: Duration,
     min_vni: u32,
     max_vni: u32,
-    udp4: Arc<UdpSocket>,
+    udp4: Mutex<Option<Arc<UdpSocket>>>,
+    local_addr: SocketAddr,
     closed: AtomicBool,
     delivery_gate: tokio::sync::RwLock<()>,
     state: Mutex<ServerState>,
@@ -395,12 +407,15 @@ impl ServerInner {
     }
 
     async fn read_loop(self: Arc<Self>) {
+        let Some(udp4) = self.udp4.lock().unwrap().clone() else {
+            return;
+        };
         let mut buf = vec![0u8; 65535];
         loop {
             if self.closed.load(Ordering::Relaxed) {
                 return;
             }
-            match self.udp4.recv_from(&mut buf).await {
+            match udp4.recv_from(&mut buf).await {
                 Ok((n, from)) => {
                     if n == 0 {
                         continue;
@@ -410,7 +425,7 @@ impl ServerInner {
                         continue;
                     }
                     if let Some((reply, to)) = self.handle_packet(from, &buf[..n]) {
-                        let _ = self.udp4.send_to(&reply, to).await;
+                        let _ = udp4.send_to(&reply, to).await;
                     }
                 }
                 Err(_) => return,

@@ -493,6 +493,73 @@ impl rustscale_routecheck::ProbeProvider for CliPingProbeProvider {
     }
 }
 
+#[tokio::test]
+async fn shutdown_is_owned_idempotent_and_releases_all_sockets() {
+    let direct_reservation = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let direct_addr = direct_reservation.local_addr().unwrap();
+    drop(direct_reservation);
+    let relay_reservation = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let relay_port = relay_reservation.local_addr().unwrap().port();
+    drop(relay_reservation);
+
+    let (magicsock, _rx) = Magicsock::new(MagicsockConfig {
+        private_key: NodePrivate::generate(),
+        disco_key: DiscoPrivate::generate(),
+        derp_client: None,
+        derp_map: Some(DERPMap::default()),
+        home_derp_region: 0,
+        udp_bind: Some(direct_addr),
+        udp_socket: None,
+        portmapper: None,
+        health: None,
+        disable_direct_paths: false,
+        peer_relay_server: true,
+        relay_server_config: Some(rustscale_udprelay::ServerConfig {
+            port: relay_port,
+            ..Default::default()
+        }),
+        sockstats: None,
+        control_knobs: None,
+    })
+    .await
+    .expect("magicsock");
+    let magicsock = Arc::new(magicsock);
+    let inner = Arc::downgrade(&magicsock.inner);
+    assert!(magicsock.tasks.task_count() >= 3);
+
+    // Abort the first waiter after it starts. The owned flight must continue.
+    let first = {
+        let magicsock = magicsock.clone();
+        tokio::spawn(async move { magicsock.shutdown(Duration::from_secs(5)).await })
+    };
+    while *magicsock.shutdown.phase.lock().unwrap() == ShutdownPhase::Running {
+        tokio::task::yield_now().await;
+    }
+    first.abort();
+    let _ = first.await;
+
+    magicsock
+        .shutdown(Duration::from_secs(5))
+        .await
+        .expect("join shutdown flight");
+    magicsock
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("idempotent shutdown");
+    assert_eq!(magicsock.tasks.task_count(), 0);
+    assert!(magicsock.bound_udp_addr().is_none());
+    let rebound_direct = std::net::UdpSocket::bind(direct_addr).expect("rebind direct UDP");
+    let rebound_relay =
+        std::net::UdpSocket::bind(("127.0.0.1", relay_port)).expect("rebind relay UDP");
+    drop((rebound_direct, rebound_relay));
+
+    drop(magicsock);
+    assert!(
+        inner.upgrade().is_none(),
+        "shutdown must break all Arc cycles"
+    );
+}
+
 async fn magicsock_with_idle_peer() -> (Magicsock, NodePublic) {
     let private_key = NodePrivate::generate();
     let peer_key = NodePrivate::generate().public();
@@ -2477,7 +2544,7 @@ async fn multi_region_derp_routing() {
             .connections
             .write()
             .expect("derp connections lock poisoned");
-        let io2 = Arc::new(DerpIo::spawn(a_derp_r2));
+        let io2 = Arc::new(DerpIo::spawn(a_derp_r2, &a.inner.tasks));
         // The DerpManager needs to spawn a recv consumer for this connection.
         // We can't do that from here, but the DerpIo's internal reader task
         // feeds a channel. We need to also spawn a consumer.
@@ -2523,7 +2590,7 @@ async fn multi_region_derp_routing() {
             .connections
             .write()
             .expect("derp connections lock poisoned");
-        let io1 = Arc::new(DerpIo::spawn(b_derp_r1));
+        let io1 = Arc::new(DerpIo::spawn(b_derp_r1, &b.inner.tasks));
         let tx = b.inner.derp.derp_recv_tx.clone();
         let reconnect_tx = b.inner.derp.reconnect_tx.clone();
         let io1_clone = io1.clone();

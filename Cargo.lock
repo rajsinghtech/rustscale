@@ -3619,6 +3619,9 @@ name = "rustscale-tsp"
 version = "0.1.1"
 dependencies = [
  "bytes",
+ "http",
+ "httparse",
+ "rustscale-atomicfile",
  "rustscale-controlclient",
  "rustscale-key",
  "rustscale-tailcfg",

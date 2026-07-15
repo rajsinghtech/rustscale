@@ -1,5 +1,3 @@
-use std::fs::OpenOptions;
-use std::io::Write as _;
 use std::path::Path;
 
 use rustscale_key::{MachinePrivate, MachinePublic, NodePrivate};
@@ -104,27 +102,16 @@ impl NodeFile {
         })
     }
 
-    /// Validate and write a node file, creating it with mode 0600 on Unix.
+    /// Validate and atomically write a node file with mode 0600 on Unix.
+    /// Replacing an existing file also repairs overly broad permissions.
     pub fn write(&self, path: impl AsRef<Path>) -> Result<(), NodeFileError> {
         self.check()?;
         let path = path.as_ref();
         let display = path.display().to_string();
-        let mut options = OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
-        }
-        let mut file = options.open(path).map_err(|source| NodeFileError::Write {
-            path: display.clone(),
+        rustscale_atomicfile::write(path, &self.as_json()).map_err(|source| NodeFileError::Write {
+            path: display,
             source,
-        })?;
-        file.write_all(&self.as_json())
-            .map_err(|source| NodeFileError::Write {
-                path: display,
-                source,
-            })
+        })
     }
 }
 
@@ -181,6 +168,23 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn overwrite_repairs_unsafe_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("node.json");
+        std::fs::write(&path, b"old secret").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        valid_file().write(&path).unwrap();
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]

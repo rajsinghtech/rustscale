@@ -108,6 +108,27 @@ pub struct MapRequest {
     pub MapSessionSeq: i64,
 }
 
+/// A control-plane ping request, including C2N HTTP callbacks.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PingRequest {
+    #[serde(default, skip_serializing_if = "skip_default")]
+    pub URL: String,
+    #[serde(default, skip_serializing_if = "skip_default")]
+    pub URLIsNoise: bool,
+    #[serde(default, skip_serializing_if = "skip_default")]
+    pub Log: bool,
+    #[serde(default, skip_serializing_if = "skip_default")]
+    pub Types: String,
+    #[serde(default, skip_serializing_if = "skip_default")]
+    pub IP: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        with = "crate::base64_vec"
+    )]
+    pub Payload: Vec<u8>,
+}
+
 /// Returned by the control server, either as a single response or as a stream
 /// of delta updates (subset of Go's `tailcfg.MapResponse`).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -202,6 +223,9 @@ pub struct MapResponse {
     /// it should recover. Matches Go's `MapResponse.NodeKeyExpired`.
     #[serde(default, skip_serializing_if = "skip_default")]
     pub NodeKeyExpired: bool,
+    /// Control-to-node ping or C2N callback request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub PingRequest: Option<PingRequest>,
     /// ControlTime from the server (usually only in the first map response).
     #[serde(default, skip_serializing_if = "skip_default")]
     pub ControlTime: Option<chrono::DateTime<chrono::Utc>>,
@@ -501,6 +525,25 @@ mod tests {
         assert!(j.contains("\"RunningLatest\":true"));
         let back: MapResponse = serde_json::from_str(&j).unwrap();
         assert_eq!(back, resp);
+    }
+
+    #[test]
+    fn c2n_ping_request_payload_uses_go_base64_format() {
+        let response = MapResponse {
+            PingRequest: Some(PingRequest {
+                URL: "https://control.example/c2n/1".into(),
+                Types: "c2n".into(),
+                Payload: b"GET /echo HTTP/1.1\r\n\r\n".to_vec(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"Payload\":\"R0VUIC9lY2hvIEhUVFAvMS4xDQoNCg==\""));
+        assert_eq!(
+            serde_json::from_str::<MapResponse>(&json).unwrap(),
+            response
+        );
     }
 
     #[test]

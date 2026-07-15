@@ -10,10 +10,13 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+rustscale-atomicfile = { path = "../atomicfile", version = "0.1.1" }
 rustscale-controlclient = { path = "../controlclient", version = "0.1.1" }
 rustscale-key = { path = "../key", version = "0.1.1" }
 rustscale-tailcfg = { path = "../tailcfg", version = "0.1.1" }
 bytes.workspace = true
+http = "1"
+httparse = "1"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

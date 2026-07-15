@@ -70,6 +70,14 @@ struct ServerInner {
     suppress_auto: HashSet<NodePublic>,
     in_serve_map: i32,
     next_node_id: i64,
+    next_connection_id: u64,
+    noise_connection_count: u64,
+    active_noise_connections: HashSet<u64>,
+    map_connection_by_node: HashMap<NodePublic, u64>,
+    c2n_callbacks: HashMap<String, NodePublic>,
+    c2n_replies: HashMap<String, Vec<u8>>,
+    rejected_c2n_callbacks: u64,
+    map_update_response_size: usize,
     require_auth: bool,
     auth_paths: HashMap<String, Arc<Notify>>,
     auth_path_nodes: HashMap<String, NodePublic>,
@@ -128,6 +136,14 @@ impl Server {
                 suppress_auto: HashSet::new(),
                 in_serve_map: 0,
                 next_node_id: 1,
+                next_connection_id: 1,
+                noise_connection_count: 0,
+                active_noise_connections: HashSet::new(),
+                map_connection_by_node: HashMap::new(),
+                c2n_callbacks: HashMap::new(),
+                c2n_replies: HashMap::new(),
+                rejected_c2n_callbacks: 0,
+                map_update_response_size: 0,
                 require_auth: false,
                 auth_paths: HashMap::new(),
                 auth_path_nodes: HashMap::new(),
@@ -329,6 +345,33 @@ impl Server {
         true
     }
 
+    /// Inject several map responses in one HTTP/2 DATA chunk. This is useful
+    /// for testing client cancellation with already-buffered frames.
+    pub fn add_raw_map_responses(
+        &self,
+        node_key: &NodePublic,
+        responses: impl IntoIterator<Item = MapResponse>,
+    ) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        let node = match inner.nodes.get(node_key) {
+            Some(node) => node.clone(),
+            None => return false,
+        };
+        if !inner.updates.contains_key(&node.ID) {
+            return false;
+        }
+        inner.suppress_auto.insert(node_key.clone());
+        inner
+            .msg_to_send
+            .entry(node_key.clone())
+            .or_default()
+            .extend(responses);
+        if let Some(tx) = inner.updates.get(&node.ID) {
+            let _ = tx.try_send(UpdateType::DebugInjection);
+        }
+        true
+    }
+
     /// Wait until the given node key has an active streaming map poll, or
     /// timeout. Mirrors Go's `AwaitNodeInMapRequest`.
     pub async fn await_node_in_map_request(
@@ -360,6 +403,42 @@ impl Server {
     /// Number of clients currently in a streaming map poll.
     pub fn in_serve_map(&self) -> i32 {
         self.inner.lock().unwrap().in_serve_map
+    }
+
+    /// Number of Noise connections accepted since server start.
+    pub fn noise_connection_count(&self) -> u64 {
+        self.inner.lock().unwrap().noise_connection_count
+    }
+
+    /// Number of currently active Noise connections.
+    pub fn active_noise_connection_count(&self) -> usize {
+        self.inner.lock().unwrap().active_noise_connections.len()
+    }
+
+    /// Create a callback URL that accepts a C2N reply only on this node's
+    /// active map connection.
+    pub fn c2n_callback_url(&self, node_key: &NodePublic) -> String {
+        let mut inner = self.inner.lock().unwrap();
+        let path = format!("/c2n/{}", inner.c2n_callbacks.len() + 1);
+        inner.c2n_callbacks.insert(path.clone(), node_key.clone());
+        format!("{}{}", inner.base_url, path)
+    }
+
+    /// Return a C2N reply body accepted by the callback endpoint.
+    pub fn c2n_reply(&self, callback_url: &str) -> Option<Vec<u8>> {
+        let path = callback_url
+            .find("/c2n/")
+            .map_or(callback_url, |index| &callback_url[index..]);
+        self.inner.lock().unwrap().c2n_replies.get(path).cloned()
+    }
+
+    pub fn rejected_c2n_callbacks(&self) -> u64 {
+        self.inner.lock().unwrap().rejected_c2n_callbacks
+    }
+
+    /// Configure a large successful response body for lite map updates.
+    pub fn set_map_update_response_size(&self, size: usize) {
+        self.inner.lock().unwrap().map_update_response_size = size;
     }
 
     /// Enable or disable interactive auth requirement. When enabled, new
@@ -582,8 +661,30 @@ async fn serve_noise_upgrade(
         Ok(c) => c,
         Err(_) => return,
     };
+    let connection_id = {
+        let mut state = inner.lock().unwrap();
+        let id = state.next_connection_id;
+        state.next_connection_id += 1;
+        state.noise_connection_count += 1;
+        state.active_noise_connections.insert(id);
+        id
+    };
+    notify.notify_waiters();
 
-    handle_h2_connection(h2_conn, peer_machine_key, inner.clone(), notify).await;
+    handle_h2_connection(
+        h2_conn,
+        peer_machine_key,
+        connection_id,
+        inner.clone(),
+        notify.clone(),
+    )
+    .await;
+    inner
+        .lock()
+        .unwrap()
+        .active_noise_connections
+        .remove(&connection_id);
+    notify.notify_waiters();
 }
 
 // -----------------------------------------------------------------
@@ -594,6 +695,7 @@ async fn serve_noise_upgrade(
 async fn handle_h2_connection(
     mut h2_conn: h2::server::Connection<NoiseIo, bytes::Bytes>,
     peer_machine_key: MachinePublic,
+    connection_id: u64,
     inner: Arc<Mutex<ServerInner>>,
     notify: Arc<Notify>,
 ) {
@@ -609,8 +711,17 @@ async fn handle_h2_connection(
         let peer = peer_machine_key.clone();
         tokio::spawn(async move {
             let req_body = request.into_body();
-            if let Err(()) =
-                handle_h2_request(&method, &path, req_body, respond, &inner, &peer, &notify).await
+            if let Err(()) = handle_h2_request(
+                &method,
+                &path,
+                req_body,
+                respond,
+                &inner,
+                &peer,
+                connection_id,
+                &notify,
+            )
+            .await
             {
                 // Error already handled inside; nothing to do here.
             }
@@ -637,6 +748,7 @@ async fn handle_h2_request(
     mut respond: h2::server::SendResponse<bytes::Bytes>,
     inner: &Arc<Mutex<ServerInner>>,
     peer_machine_key: &MachinePublic,
+    connection_id: u64,
     notify: &Arc<Notify>,
 ) -> Result<(), ()> {
     if method != "POST" {
@@ -660,7 +772,15 @@ async fn handle_h2_request(
         }
         "/machine/map" => {
             let body = read_h2_body(&mut req_body).await.map_err(|_| ())?;
-            serve_map(&body, peer_machine_key, inner, notify, respond).await;
+            serve_map(
+                &body,
+                peer_machine_key,
+                connection_id,
+                inner,
+                notify,
+                respond,
+            )
+            .await;
         }
         "/machine/update-health" => {
             // Drain body, respond 204.
@@ -697,6 +817,28 @@ async fn handle_h2_request(
             let mut send = respond.send_response(resp, false).map_err(|_| ())?;
             send.send_data(bytes::Bytes::from(response), true)
                 .map_err(|_| ())?;
+        }
+        path if path.starts_with("/c2n/") => {
+            let body = read_h2_body(&mut req_body).await.map_err(|_| ())?;
+            let accepted = {
+                let mut state = inner.lock().unwrap();
+                let node_key = state.c2n_callbacks.get(path).cloned();
+                let accepted = node_key.as_ref().is_some_and(|node_key| {
+                    state.map_connection_by_node.get(node_key) == Some(&connection_id)
+                });
+                if accepted {
+                    state.c2n_replies.insert(path.to_string(), body);
+                } else {
+                    state.rejected_c2n_callbacks += 1;
+                }
+                accepted
+            };
+            notify.notify_waiters();
+            let resp = http::Response::builder()
+                .status(if accepted { 200 } else { 409 })
+                .body(())
+                .unwrap();
+            let _ = respond.send_response(resp, true);
         }
         _ => {
             let resp = http::Response::builder().status(404).body(()).unwrap();
@@ -961,6 +1103,7 @@ fn get_or_create_user(inner: &mut ServerInner, nk: &NodePublic) -> (User, Login)
 async fn serve_map(
     body: &[u8],
     peer_machine_key: &MachinePublic,
+    connection_id: u64,
     inner: &Arc<Mutex<ServerInner>>,
     notify: &Arc<Notify>,
     mut respond: h2::server::SendResponse<bytes::Bytes>,
@@ -993,6 +1136,11 @@ async fn serve_map(
             return;
         }
         node_id = node.ID;
+        if req.Stream {
+            inner
+                .map_connection_by_node
+                .insert(nk.clone(), connection_id);
+        }
 
         // Update node state from the request (unless this is a streaming
         // non-update: Stream=true && Version>=68, which omits endpoint info).
@@ -1029,10 +1177,34 @@ async fn serve_map(
         s
     } else {
         if streaming {
-            cleanup_map_registration(inner, node_id, notify);
+            cleanup_map_registration(inner, node_id, &nk, connection_id, notify);
         }
         return;
     };
+
+    let large_update_body = {
+        let state = inner.lock().unwrap();
+        (!streaming && req.OmitPeers && state.map_update_response_size > 0)
+            .then_some(state.map_update_response_size)
+    };
+    if let Some(size) = large_update_body {
+        let chunk = vec![b'x'; 64 * 1024];
+        let mut remaining = size;
+        while remaining > 0 {
+            let count = remaining.min(chunk.len());
+            if send_stream
+                .send_data(
+                    bytes::Bytes::copy_from_slice(&chunk[..count]),
+                    count == remaining,
+                )
+                .is_err()
+            {
+                break;
+            }
+            remaining -= count;
+        }
+        return;
+    }
 
     // Main loop: send map responses, wait for updates/keepalives.
     let keepalive = std::time::Duration::from_secs(50);
@@ -1042,7 +1214,11 @@ async fn serve_map(
         // Check for injected raw map responses first.
         if streaming {
             if let Some(frame) = take_injected_message(inner, &nk) {
-                if send_map_frame(&mut send_stream, &frame, compress_zstd).is_err() {
+                let mut frames = vec![frame];
+                while let Some(frame) = take_injected_message(inner, &nk) {
+                    frames.push(frame);
+                }
+                if send_map_frames(&mut send_stream, &frames, compress_zstd).is_err() {
                     break;
                 }
                 continue;
@@ -1090,13 +1266,14 @@ async fn serve_map(
                     break;
                 }
             }
+            _ = std::future::poll_fn(|cx| send_stream.poll_reset(cx)) => break,
         }
     }
 
     // Close the h2 stream (sends an empty DATA frame with END_STREAM).
     let _ = send_stream.send_data(bytes::Bytes::new(), true);
     if streaming {
-        cleanup_map_registration(inner, node_id, notify);
+        cleanup_map_registration(inner, node_id, &nk, connection_id, notify);
     }
 }
 
@@ -1104,11 +1281,16 @@ async fn serve_map(
 fn cleanup_map_registration(
     inner: &Arc<Mutex<ServerInner>>,
     node_id: NodeID,
+    node_key: &NodePublic,
+    connection_id: u64,
     notify: &Arc<Notify>,
 ) {
     {
         let mut g = inner.lock().unwrap();
         g.updates.remove(&node_id);
+        if g.map_connection_by_node.get(node_key) == Some(&connection_id) {
+            g.map_connection_by_node.remove(node_key);
+        }
         g.in_serve_map -= 1;
     }
     notify.notify_waiters();
@@ -1220,13 +1402,24 @@ fn build_map_response(
 }
 
 /// Encode a MapResponse as a 4-byte LE length-prefixed JSON frame and send it.
-fn send_map_frame(
+fn send_map_frames(
     send: &mut h2::SendStream<bytes::Bytes>,
-    mr: &MapResponse,
+    responses: &[MapResponse],
     compress_zstd: bool,
 ) -> Result<(), ()> {
-    let json = serde_json::to_vec(mr).map_err(|_| ())?;
-    send_map_frame_raw(send, &json, false, compress_zstd)
+    let mut batch = Vec::new();
+    for response in responses {
+        let json = serde_json::to_vec(response).map_err(|_| ())?;
+        let payload = if compress_zstd {
+            zstd::bulk::compress(&json, 1).map_err(|_| ())?
+        } else {
+            json
+        };
+        batch.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        batch.extend_from_slice(&payload);
+    }
+    send.send_data(bytes::Bytes::from(batch), false)
+        .map_err(|_| ())
 }
 
 /// Send raw bytes as a 4-byte LE length-prefixed frame, honoring the map

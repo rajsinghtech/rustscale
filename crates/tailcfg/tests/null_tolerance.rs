@@ -396,6 +396,7 @@ fn sample_map_response() -> MapResponse {
             ("*".to_string(), None),
         ])),
         NodeKeyExpired: false,
+        PingRequest: None,
         ControlTime: None,
         CollectServices: rustscale_tailcfg::OptBool::Unset,
         SSHPolicy: None,

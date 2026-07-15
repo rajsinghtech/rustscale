@@ -18,8 +18,8 @@ pub mod login_flags;
 
 pub use c2n::{C2nHandler, C2nRequest, C2nResponse, C2nRouter};
 pub use client::{
-    ControlClient, MapSessionState, NoiseRequestError, NoiseResponse, NoiseResponseBody,
-    RegisterError, StreamMapError,
+    ControlClient, MapSessionState, NoiseHttpClient, NoiseRequestError, NoiseResponse,
+    NoiseResponseBody, RegisterError, StreamMapError,
 };
 pub use controlbase::{NoiseConn, NoiseError, NoiseIo, ProtocolVersion};
 pub use controlhttp::{dial_control, fetch_server_pub_key, DialError, NoiseStream};

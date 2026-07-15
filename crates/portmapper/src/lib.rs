@@ -75,3 +75,16 @@ pub enum PortMapError {
     #[error("protocol error: {0}")]
     Protocol(String),
 }
+
+impl Clone for PortMapError {
+    fn clone(&self) -> Self {
+        match self {
+            Self::NoServices => Self::NoServices,
+            Self::GatewayRange => Self::GatewayRange,
+            Self::GatewayIPv6 => Self::GatewayIPv6,
+            Self::Disabled => Self::Disabled,
+            Self::Io(error) => Self::Io(std::io::Error::new(error.kind(), error.to_string())),
+            Self::Protocol(error) => Self::Protocol(error.clone()),
+        }
+    }
+}

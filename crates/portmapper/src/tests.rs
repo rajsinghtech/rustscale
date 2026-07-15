@@ -319,7 +319,7 @@ impl FakeIgd {
                     if req.contains("<NewLeaseDuration>0</NewLeaseDuration>") {
                         write_soap_response(stream, "").await;
                     } else {
-                        write_soap_response(stream, "<s:Envelope><s:Body><s:Fault><errorCode>725</errorCode></s:Fault></s:Body></s:Envelope>").await;
+                        write_soap_response(stream, r#"<s:Envelope xmlns:s="urn:soap"><s:Body><s:Fault><errorCode>725</errorCode></s:Fault></s:Body></s:Envelope>"#).await;
                     }
                 } else {
                     write_soap_response(stream, TEST_ADD_PORT_MAPPING_RESPONSE).await;
@@ -338,10 +338,10 @@ impl FakeIgd {
             if action.contains("DeletePortMapping") {
                 self.upnp_delete_count.fetch_add(1, Ordering::Relaxed);
                 if self.upnp_delete_fault {
-                    write_soap_response(stream, "<s:Envelope><s:Body><s:Fault><errorCode>501</errorCode></s:Fault></s:Body></s:Envelope>").await;
+                    write_soap_response(stream, r#"<s:Envelope xmlns:s="urn:soap"><s:Body><s:Fault><errorCode>501</errorCode></s:Fault></s:Body></s:Envelope>"#).await;
                     return;
                 }
-                write_soap_response(stream, "<?xml version=\"1.0\"?><s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body><u:DeletePortMappingResponse/></s:Body></s:Envelope>").await;
+                write_soap_response(stream, r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:DeletePortMappingResponse xmlns:u="urn:upnp"/></s:Body></s:Envelope>"#).await;
                 return;
             }
         }
@@ -638,6 +638,45 @@ async fn dropped_upnp_caller_is_supervised_through_external_ip_commit() {
 }
 
 #[tokio::test]
+async fn thousands_of_aborted_waiters_share_one_blocked_allocation() {
+    let igd = FakeIgd::start(IgdOpts {
+        upnp: true,
+        ..Default::default()
+    })
+    .await;
+    let gate = AsyncGate::new();
+    igd.gate_external_ip(Some(gate.clone()));
+    let client = make_test_client(&igd);
+    let primary_client = client.clone();
+    let primary = tokio::spawn(async move { primary_client.create_or_get_mapping().await });
+    gate.reached.wait().await;
+
+    let mut waiters = Vec::new();
+    for _ in 0..2_000 {
+        let waiter_client = client.clone();
+        waiters.push(tokio::spawn(async move {
+            waiter_client.create_or_get_mapping().await
+        }));
+    }
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(client.owned_task_counts().0, 1);
+    for waiter in waiters {
+        waiter.abort();
+    }
+    tokio::task::yield_now().await;
+    assert_eq!(client.owned_task_counts().0, 1);
+
+    gate.resume.wait().await;
+    assert_eq!(primary.await.unwrap().unwrap().kind, MappingKind::Upnp);
+    let _ = client.cached_mapping();
+    assert_eq!(client.owned_task_counts().0, 0);
+    assert_eq!(igd.upnp_add_count.load(Ordering::SeqCst), 1);
+    igd.close();
+}
+
+#[tokio::test]
 async fn ambiguous_upnp_add_is_compensated_before_key_reuse() {
     let igd = FakeIgd::start(IgdOpts {
         upnp: true,
@@ -725,7 +764,20 @@ async fn shutdown_cancels_blocked_supervisor_without_late_commit() {
     let operation = tokio::spawn(async move { operation_client.create_or_get_mapping().await });
     gate.reached.wait().await;
 
-    assert!(client.shutdown(Duration::from_millis(50)).await.is_err());
+    let first_client = client.clone();
+    let first_shutdown =
+        tokio::spawn(async move { first_client.shutdown(Duration::from_millis(50)).await });
+    tokio::task::yield_now().await;
+    let second_client = client.clone();
+    let second_shutdown =
+        tokio::spawn(async move { second_client.shutdown(Duration::from_millis(50)).await });
+    let third_client = client.clone();
+    let third_shutdown =
+        tokio::spawn(async move { third_client.shutdown(Duration::from_millis(50)).await });
+    first_shutdown.abort();
+    let second_error = second_shutdown.await.unwrap().unwrap_err().to_string();
+    let third_error = third_shutdown.await.unwrap().unwrap_err().to_string();
+    assert_eq!(second_error, third_error);
     gate.resume.wait().await;
     igd.gate_external_ip(None);
     let _ = operation.await;

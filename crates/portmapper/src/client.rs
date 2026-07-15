@@ -174,7 +174,6 @@ struct ClientInner {
     next_gateway_observation: AtomicU64,
     next_ownership_id: AtomicU64,
     running_create: AtomicBool,
-    create_lock: tokio::sync::Mutex<()>,
     work: Mutex<WorkGate>,
     release_progress_tx: tokio::sync::watch::Sender<ReleaseProgress>,
     #[cfg(test)]
@@ -186,9 +185,21 @@ struct WorkGate {
     closing: bool,
     pending_releases: u64,
     generation: u64,
+    allocation: Option<AllocationFlight>,
+    shutdown: Option<ShutdownFlight>,
     allocation_tasks: JoinSet<()>,
     release_tasks: JoinSet<()>,
     launcher_tasks: JoinSet<()>,
+    shutdown_tasks: JoinSet<()>,
+}
+
+struct AllocationFlight {
+    generation: u64,
+    result: tokio::sync::watch::Sender<Option<Result<Mapping, crate::PortMapError>>>,
+}
+
+struct ShutdownFlight {
+    result: tokio::sync::watch::Sender<Option<Result<(), crate::PortMapError>>>,
 }
 
 impl Default for WorkGate {
@@ -197,9 +208,12 @@ impl Default for WorkGate {
             closing: false,
             pending_releases: 0,
             generation: 0,
+            allocation: None,
+            shutdown: None,
             allocation_tasks: JoinSet::new(),
             release_tasks: JoinSet::new(),
             launcher_tasks: JoinSet::new(),
+            shutdown_tasks: JoinSet::new(),
         }
     }
 }
@@ -280,7 +294,6 @@ impl Client {
                 next_gateway_observation: AtomicU64::new(0),
                 next_ownership_id: AtomicU64::new(1),
                 running_create: AtomicBool::new(false),
-                create_lock: tokio::sync::Mutex::new(()),
                 work: Mutex::new(WorkGate::default()),
                 release_progress_tx,
                 #[cfg(test)]
@@ -661,11 +674,45 @@ impl Client {
 
     /// Stop new mapping work and await active allocation/release supervisors.
     pub async fn shutdown(&self, deadline: Duration) -> Result<(), crate::PortMapError> {
-        {
+        let mut result = {
             let mut work = self.inner.work.lock().expect("work gate lock");
-            work.closing = true;
-            self.inner.closed.store(true, Ordering::SeqCst);
+            Self::reap_join_set(&mut work.shutdown_tasks);
+            let completed = work
+                .shutdown
+                .as_ref()
+                .is_some_and(|flight| flight.result.borrow().is_some())
+                && work.shutdown_tasks.is_empty();
+            if completed {
+                work.shutdown = None;
+            }
+            if let Some(flight) = &work.shutdown {
+                flight.result.subscribe()
+            } else {
+                work.closing = true;
+                self.inner.closed.store(true, Ordering::SeqCst);
+                let (result_tx, result_rx) = tokio::sync::watch::channel(None);
+                work.shutdown = Some(ShutdownFlight {
+                    result: result_tx.clone(),
+                });
+                let client = self.clone();
+                work.shutdown_tasks.spawn(async move {
+                    let outcome = client.shutdown_owner(deadline).await;
+                    result_tx.send_replace(Some(outcome));
+                });
+                result_rx
+            }
+        };
+        loop {
+            if let Some(outcome) = result.borrow_and_update().clone() {
+                return outcome;
+            }
+            result.changed().await.map_err(|_| {
+                crate::PortMapError::Protocol("portmapper shutdown supervisor terminated".into())
+            })?;
         }
+    }
+
+    async fn shutdown_owner(&self, deadline: Duration) -> Result<(), crate::PortMapError> {
         // Taking the state lock after closing is the invalidation barrier: any
         // earlier invalidator has already reserved its cleanup operation while
         // holding this lock, and later public work is rejected by the gate.
@@ -673,6 +720,7 @@ impl Client {
 
         let (allocations, launchers) = {
             let mut work = self.inner.work.lock().expect("work gate lock");
+            work.allocation = None;
             (
                 std::mem::take(&mut work.allocation_tasks),
                 std::mem::take(&mut work.launcher_tasks),
@@ -685,8 +733,8 @@ impl Client {
         }
 
         // Allocation supervisors are gone, so no new release can now be
-        // reserved. Every prior reservation either has a registered task or
-        // was made synchronously before the invalidation barrier above.
+        // reserved. Every prior reservation was synchronously registered
+        // before its invalidation lock was released.
         let releases = {
             let mut work = self.inner.work.lock().expect("work gate lock");
             std::mem::take(&mut work.release_tasks)
@@ -706,8 +754,6 @@ impl Client {
             return Err(error);
         }
 
-        // Retry uncertain cleanup, including pre-send requests and permanent
-        // UPnP leases. Failed identities remain retained for owner retry.
         let uncertain = self
             .inner
             .state
@@ -749,10 +795,11 @@ impl Client {
         Self::reap_join_set(&mut work.allocation_tasks);
         Self::reap_join_set(&mut work.release_tasks);
         Self::reap_join_set(&mut work.launcher_tasks);
+        Self::reap_join_set(&mut work.shutdown_tasks);
     }
 
     #[cfg(test)]
-    fn owned_task_counts(&self) -> (usize, usize, usize) {
+    pub(crate) fn owned_task_counts(&self) -> (usize, usize, usize) {
         self.reap_completed_tasks();
         let work = self.inner.work.lock().expect("work gate lock");
         (
@@ -1024,28 +1071,52 @@ impl Client {
     /// Create or renew a port mapping. Returns the external endpoint if
     /// successful.
     pub async fn create_or_get_mapping(&self) -> Result<Mapping, crate::PortMapError> {
-        // The supervisor owns all allocation identity and outlives the caller.
-        // Dropping this future only drops the receiver; the operation still
-        // commits a validated mapping or releases any allocation it obtained.
-        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-        let client = self.clone();
-        {
+        // Register or join the one allocation flight while holding the state
+        // generation and work gate together. Caller cancellation only drops
+        // this receiver; the owned supervisor and all cleanup identity remain.
+        let mut result = {
+            let state = self.inner.state.lock().expect("state lock");
+            let generation = state.gateway_generation;
             let mut work = self.inner.work.lock().expect("work gate lock");
             Self::reap_join_set(&mut work.allocation_tasks);
             if work.closing {
                 return Err(crate::PortMapError::Disabled);
             }
-            work.allocation_tasks.spawn(async move {
-                let _create_guard = client.inner.create_lock.lock().await;
-                let result = client.create_or_get_mapping_serialized().await;
-                let _ = result_tx.send(result);
-            });
+            let completed = work
+                .allocation
+                .as_ref()
+                .is_some_and(|flight| flight.result.borrow().is_some())
+                && work.allocation_tasks.is_empty();
+            if completed {
+                work.allocation = None;
+            }
+            if let Some(flight) = &work.allocation {
+                // A stale-generation flight still owns router work and must
+                // finish before a replacement generation can start.
+                debug_assert!(flight.generation <= generation);
+                flight.result.subscribe()
+            } else {
+                let (result_tx, result_rx) = tokio::sync::watch::channel(None);
+                work.allocation = Some(AllocationFlight {
+                    generation,
+                    result: result_tx.clone(),
+                });
+                let client = self.clone();
+                work.allocation_tasks.spawn(async move {
+                    let outcome = client.create_or_get_mapping_serialized().await;
+                    result_tx.send_replace(Some(outcome));
+                });
+                result_rx
+            }
+        };
+        loop {
+            if let Some(outcome) = result.borrow_and_update().clone() {
+                return outcome;
+            }
+            result.changed().await.map_err(|_| {
+                crate::PortMapError::Protocol("mapping supervisor terminated".into())
+            })?;
         }
-        result_rx.await.unwrap_or_else(|_| {
-            Err(crate::PortMapError::Protocol(
-                "mapping supervisor terminated".into(),
-            ))
-        })
     }
 
     async fn create_or_get_mapping_serialized(&self) -> Result<Mapping, crate::PortMapError> {

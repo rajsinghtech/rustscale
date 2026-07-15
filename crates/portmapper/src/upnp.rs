@@ -7,6 +7,7 @@
 //! from the LOCATION URL, find the best WAN connection service, and make SOAP
 //! calls to create/delete mappings and get the external IP.
 
+use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::time::Duration;
 
@@ -331,39 +332,67 @@ fn soap_response_is_success(body: &str, response_element: &str) -> bool {
         .is_some_and(|elements| has_strict_soap_body(&elements, response_element))
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct XmlName {
+    prefix: Option<String>,
+    local: String,
+    namespace: Option<String>,
+}
+
 #[derive(Debug)]
 struct XmlElement {
-    name: String,
-    parent: Option<String>,
+    name: XmlName,
+    parent: Option<XmlName>,
+}
+
+struct XmlFrame {
+    name: XmlName,
+    namespaces: HashMap<String, String>,
 }
 
 fn has_strict_soap_body(elements: &[XmlElement], expected: &str) -> bool {
-    if expected != "Fault" && elements.iter().any(|element| element.name == "Fault") {
+    if expected != "Fault" && elements.iter().any(|element| element.name.local == "Fault") {
         return false;
     }
     let roots: Vec<_> = elements
         .iter()
         .filter(|element| element.parent.is_none())
         .collect();
-    if roots.len() != 1 || roots[0].name != "Envelope" {
+    if roots.len() != 1 || roots[0].name.local != "Envelope" {
         return false;
     }
     let envelope_children: Vec<_> = elements
         .iter()
-        .filter(|element| element.parent.as_deref() == Some("Envelope"))
+        .filter(|element| {
+            element
+                .parent
+                .as_ref()
+                .is_some_and(|parent| parent.local == "Envelope")
+        })
         .collect();
-    if envelope_children.len() != 1 || envelope_children[0].name != "Body" {
+    if envelope_children.len() != 1
+        || envelope_children[0].name.local != "Body"
+        || envelope_children[0].name.namespace != roots[0].name.namespace
+    {
         return false;
     }
     let body_children: Vec<_> = elements
         .iter()
-        .filter(|element| element.parent.as_deref() == Some("Body"))
+        .filter(|element| {
+            element
+                .parent
+                .as_ref()
+                .is_some_and(|parent| parent.local == "Body")
+        })
         .collect();
-    body_children.len() == 1 && body_children[0].name == expected
+    body_children.len() == 1
+        && body_children[0].name.local == expected
+        && (expected != "Fault"
+            || body_children[0].name.namespace == envelope_children[0].name.namespace)
 }
 
 fn parse_xml_elements(xml: &str) -> Option<Vec<XmlElement>> {
-    let mut stack = Vec::<String>::new();
+    let mut stack = Vec::<XmlFrame>::new();
     let mut elements = Vec::new();
     let mut rest = xml;
     while let Some(start) = rest.find('<') {
@@ -371,35 +400,153 @@ fn parse_xml_elements(xml: &str) -> Option<Vec<XmlElement>> {
             return None;
         }
         rest = &rest[start + 1..];
-        let end = rest.find('>')?;
+        let end = find_xml_tag_end(rest)?;
         let mut token = rest[..end].trim();
         rest = &rest[end + 1..];
-        if token.starts_with('?') || token.starts_with('!') {
-            continue;
-        }
-        let closing = token.starts_with('/');
-        if closing {
-            token = token[1..].trim();
-        }
-        let self_closing = token.ends_with('/');
-        token = token.trim_end_matches('/').trim();
-        let qualified = token.split_whitespace().next()?;
-        let local = qualified.rsplit(':').next()?.to_string();
-        if closing {
-            if stack.pop().as_deref() != Some(local.as_str()) {
+        if token.starts_with('?') {
+            if !stack.is_empty() || !token.ends_with('?') {
                 return None;
             }
-        } else {
-            elements.push(XmlElement {
-                name: local.clone(),
-                parent: stack.last().cloned(),
-            });
-            if !self_closing {
-                stack.push(local);
+            continue;
+        }
+        // SOAP responses do not need DTDs or comments. Rejecting declarations
+        // keeps this small parser fail-closed rather than partially parsing
+        // namespace-affecting XML syntax.
+        if token.starts_with('!') {
+            return None;
+        }
+        if let Some(close) = token.strip_prefix('/') {
+            let qualified = close.trim();
+            if qualified.is_empty() || qualified.chars().any(char::is_whitespace) {
+                return None;
             }
+            let frame = stack.pop()?;
+            let closing = resolve_xml_name(qualified, &frame.namespaces)?;
+            // XML end tags must use the same qualified prefix, local name,
+            // and in-scope binding as their opening tag.
+            if closing != frame.name {
+                return None;
+            }
+            continue;
+        }
+
+        let self_closing = token.ends_with('/');
+        if self_closing {
+            token = token[..token.len() - 1].trim_end();
+        }
+        let (qualified, attributes) = split_xml_name(token)?;
+        let mut namespaces = stack
+            .last()
+            .map_or_else(default_xml_namespaces, |frame| frame.namespaces.clone());
+        let parsed_attributes = parse_xml_attributes(attributes)?;
+        for (name, value) in &parsed_attributes {
+            if name == "xmlns" {
+                namespaces.insert(String::new(), value.clone());
+            } else if let Some(prefix) = name.strip_prefix("xmlns:") {
+                if prefix.is_empty()
+                    || prefix == "xmlns"
+                    || value.is_empty()
+                    || (prefix == "xml" && value != "http://www.w3.org/XML/1998/namespace")
+                {
+                    return None;
+                }
+                namespaces.insert(prefix.to_string(), value.clone());
+            }
+        }
+        for (name, _) in &parsed_attributes {
+            if name == "xmlns" || name.starts_with("xmlns:") {
+                continue;
+            }
+            if let Some((prefix, _)) = name.split_once(':') {
+                if !namespaces.contains_key(prefix) {
+                    return None;
+                }
+            }
+        }
+        let name = resolve_xml_name(qualified, &namespaces)?;
+        elements.push(XmlElement {
+            name: name.clone(),
+            parent: stack.last().map(|frame| frame.name.clone()),
+        });
+        if !self_closing {
+            stack.push(XmlFrame { name, namespaces });
         }
     }
     (stack.is_empty() && !elements.is_empty() && rest.trim().is_empty()).then_some(elements)
+}
+
+fn find_xml_tag_end(token: &str) -> Option<usize> {
+    let mut quote = None;
+    for (index, ch) in token.char_indices() {
+        match (quote, ch) {
+            (Some(open), close) if open == close => quote = None,
+            (None, '\'' | '"') => quote = Some(ch),
+            (None, '>') => return Some(index),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn split_xml_name(token: &str) -> Option<(&str, &str)> {
+    let end = token.find(char::is_whitespace).unwrap_or(token.len());
+    let name = &token[..end];
+    (!name.is_empty()).then_some((name, token[end..].trim_start()))
+}
+
+fn parse_xml_attributes(mut attributes: &str) -> Option<Vec<(String, String)>> {
+    let mut parsed = Vec::new();
+    let mut seen = HashSet::new();
+    while !attributes.is_empty() {
+        let name_end = attributes
+            .find(|ch: char| ch.is_whitespace() || ch == '=')
+            .unwrap_or(attributes.len());
+        let name = &attributes[..name_end];
+        if name.is_empty() || !seen.insert(name.to_string()) {
+            return None;
+        }
+        attributes = attributes[name_end..].trim_start();
+        attributes = attributes.strip_prefix('=')?.trim_start();
+        let quote = attributes.chars().next()?;
+        if quote != '\'' && quote != '"' {
+            return None;
+        }
+        attributes = &attributes[quote.len_utf8()..];
+        let value_end = attributes.find(quote)?;
+        parsed.push((name.to_string(), attributes[..value_end].to_string()));
+        attributes = attributes[value_end + quote.len_utf8()..].trim_start();
+    }
+    Some(parsed)
+}
+
+fn default_xml_namespaces() -> HashMap<String, String> {
+    HashMap::from([(
+        "xml".to_string(),
+        "http://www.w3.org/XML/1998/namespace".to_string(),
+    )])
+}
+
+fn resolve_xml_name(qualified: &str, namespaces: &HashMap<String, String>) -> Option<XmlName> {
+    let (prefix, local) = if let Some((prefix, local)) = qualified.split_once(':') {
+        if prefix.is_empty() || local.is_empty() || local.contains(':') {
+            return None;
+        }
+        (Some(prefix), local)
+    } else {
+        (None, qualified)
+    };
+    if local.is_empty() {
+        return None;
+    }
+    let namespace = match prefix {
+        Some(prefix) => Some(namespaces.get(prefix)?.clone()),
+        None => namespaces.get("").cloned(),
+    };
+    Some(XmlName {
+        prefix: prefix.map(str::to_string),
+        local: local.to_string(),
+        namespace,
+    })
 }
 
 /// Get the external IP address via SOAP GetExternalIPAddress.
@@ -446,9 +593,14 @@ fn parse_external_ip_response(resp: &str) -> Result<Ipv4Addr, std::io::Error> {
     }
     let response_children: Vec<_> = elements
         .iter()
-        .filter(|element| element.parent.as_deref() == Some("GetExternalIPAddressResponse"))
+        .filter(|element| {
+            element
+                .parent
+                .as_ref()
+                .is_some_and(|parent| parent.local == "GetExternalIPAddressResponse")
+        })
         .collect();
-    if response_children.len() != 1 || response_children[0].name != "NewExternalIPAddress" {
+    if response_children.len() != 1 || response_children[0].name.local != "NewExternalIPAddress" {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "invalid GetExternalIPAddress response fields",
@@ -644,11 +796,11 @@ mod tests {
     fn delete_requires_success_or_not_found() {
         assert!(delete_response_is_success(
             200,
-            "<x:Envelope><x:Body><m:DeletePortMappingResponse/></x:Body></x:Envelope>"
+            r#"<x:Envelope xmlns:x="urn:soap" xmlns:m="urn:upnp"><x:Body><m:DeletePortMappingResponse/></x:Body></x:Envelope>"#
         ));
         assert!(delete_response_is_success(
             500,
-            "<s:Envelope><s:Body><s:Fault><x:errorCode>714</x:errorCode></s:Fault></s:Body></s:Envelope>"
+            r#"<s:Envelope xmlns:s="urn:soap" xmlns:x="urn:error"><s:Body><s:Fault><x:errorCode>714</x:errorCode></s:Fault></s:Body></s:Envelope>"#
         ));
         assert!(!delete_response_is_success(
             200,
@@ -661,7 +813,7 @@ mod tests {
             "<Envelope><Body><DeletePortMappingResponse></Body></Envelope>"
         ));
         assert!(soap_response_is_success(
-            "<soap:Envelope><soap:Body><z:AddPortMappingResponse/></soap:Body></soap:Envelope>",
+            r#"<soap:Envelope xmlns:soap="urn:soap" xmlns:z="urn:upnp"><soap:Body><z:AddPortMappingResponse/></soap:Body></soap:Envelope>"#,
             "AddPortMappingResponse"
         ));
         assert!(!soap_response_is_success(
@@ -683,8 +835,30 @@ mod tests {
     }
 
     #[test]
+    fn xml_qnames_require_bound_and_matching_prefixes() {
+        for invalid in [
+            "<s:Envelope><s:Body/></s:Envelope>",
+            "<s:Envelope xmlns:s=\"urn:soap\"><s:Body></x:Body></s:Envelope>",
+            "<s:Envelope xmlns:s=\"urn:soap\" xmlns:x=\"urn:soap\"><s:Body></x:Body></s:Envelope>",
+            "<s:Envelope xmlns:s=\"urn:soap\"><x:Body/></s:Envelope>",
+            "<s:Envelope xmlns:s=\"urn:soap\"><s:Body><u:Response/></s:Body></s:Envelope>",
+            "<s:Envelope xmlns:s=\"urn:soap\"><s:Body></s:Envelope></s:Body>",
+        ] {
+            assert!(parse_xml_elements(invalid).is_none(), "accepted {invalid}");
+        }
+        assert!(parse_xml_elements(
+            "<a:Envelope xmlns:a=\"urn:soap\"><b:Body xmlns:b=\"urn:soap\"/></a:Envelope>"
+        )
+        .is_some());
+        assert!(!soap_response_is_success(
+            "<s:Envelope xmlns:s=\"urn:soap\"><s:Body xmlns:s=\"urn:other\"><Response/></s:Body></s:Envelope>",
+            "Response"
+        ));
+    }
+
+    #[test]
     fn external_ip_requires_exact_soap_structure() {
-        let valid = "<x:Envelope><x:Body><u:GetExternalIPAddressResponse><z:NewExternalIPAddress>198.51.100.7</z:NewExternalIPAddress></u:GetExternalIPAddressResponse></x:Body></x:Envelope>";
+        let valid = "<x:Envelope xmlns:x=\"urn:soap\" xmlns:u=\"urn:upnp\" xmlns:z=\"urn:field\"><x:Body><u:GetExternalIPAddressResponse><z:NewExternalIPAddress>198.51.100.7</z:NewExternalIPAddress></u:GetExternalIPAddressResponse></x:Body></x:Envelope>";
         assert_eq!(
             parse_external_ip_response(valid).unwrap(),
             Ipv4Addr::new(198, 51, 100, 7)
@@ -703,15 +877,15 @@ mod tests {
     #[test]
     fn fallback_fault_requires_direct_soap_structure() {
         assert_eq!(
-            soap_fault_code("<s:Envelope><s:Body><s:Fault><errorCode>725</errorCode></s:Fault></s:Body></s:Envelope>"),
+            soap_fault_code("<s:Envelope xmlns:s=\"urn:soap\"><s:Body><s:Fault><errorCode>725</errorCode></s:Fault></s:Body></s:Envelope>"),
             Some(725)
         );
         assert_eq!(
-            soap_fault_code("<s:Envelope><s:Body><wrapper><s:Fault><errorCode>725</errorCode></s:Fault></wrapper></s:Body></s:Envelope>"),
+            soap_fault_code("<s:Envelope xmlns:s=\"urn:soap\"><s:Body><wrapper><s:Fault><errorCode>725</errorCode></s:Fault></wrapper></s:Body></s:Envelope>"),
             None
         );
         assert_eq!(
-            soap_fault_code("<s:Envelope><s:Body><s:Fault/><extra><errorCode>725</errorCode></extra></s:Body></s:Envelope>"),
+            soap_fault_code("<s:Envelope xmlns:s=\"urn:soap\"><s:Body><s:Fault/><extra><errorCode>725</errorCode></extra></s:Body></s:Envelope>"),
             None
         );
     }
@@ -719,10 +893,10 @@ mod tests {
     #[test]
     fn is_soap_fault_detects_fault() {
         let fault = r#"<?xml version="1.0"?>
-<s:Envelope><s:Body><s:Fault><faultCode>s:Client</faultCode></s:Fault></s:Body></s:Envelope>"#;
+<s:Envelope xmlns:s="urn:soap"><s:Body><s:Fault><faultCode>s:Client</faultCode></s:Fault></s:Body></s:Envelope>"#;
         assert!(is_soap_fault(fault));
         let ok = r#"<?xml version="1.0"?>
-<s:Envelope><s:Body><u:AddPortMappingResponse/></s:Body></s:Envelope>"#;
+<s:Envelope xmlns:s="urn:soap" xmlns:u="urn:upnp"><s:Body><u:AddPortMappingResponse/></s:Body></s:Envelope>"#;
         assert!(!is_soap_fault(ok));
     }
 

@@ -17,6 +17,7 @@ blake2.workspace = true
 ed25519-dalek.workspace = true
 argon2.workspace = true
 data-encoding.workspace = true
+libc.workspace = true
 rustscale-atomicfile = { path = "../atomicfile", version = "0.1.1" }
 
 [dev-dependencies]

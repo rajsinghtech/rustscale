@@ -247,14 +247,19 @@ fn path_to_root(storage: &dyn Chonk, head: Aum) -> Result<Vec<Aum>, AuthorityErr
             return Err(AuthorityError::InvalidState("cycle in AUM chain".into()));
         }
         let parent = current.parent();
+        let is_checkpoint = current.message_kind == AumKind::Checkpoint;
         path.push(current);
         let Some(parent) = parent else {
             return Ok(path);
         };
         current = match storage.aum(&parent) {
             Ok(aum) => aum,
+            Err(error) if error.is_not_found() && is_checkpoint => {
+                // Compaction may retain a checkpoint while purging its parent.
+                return Ok(path);
+            }
             Err(error) if error.is_not_found() => {
-                return Err(AuthorityError::MissingParent(parent))
+                return Err(AuthorityError::MissingParent(parent));
             }
             Err(error) => return Err(error.into()),
         };
@@ -271,15 +276,27 @@ pub(crate) fn state_at(storage: &dyn Chonk, wanted: AumHash) -> Result<State, Au
         .ok_or_else(|| AuthorityError::InvalidState("empty AUM path".into()))?;
     if genesis.message_kind != AumKind::Checkpoint {
         return Err(AuthorityError::InvalidState(
-            "genesis AUM must be a checkpoint".into(),
+            "oldest retained AUM must be a checkpoint".into(),
         ));
     }
     let mut state = genesis
         .state
         .as_ref()
-        .ok_or_else(|| AuthorityError::InvalidState("genesis checkpoint has no state".into()))?
+        .ok_or_else(|| AuthorityError::InvalidState("retained checkpoint has no state".into()))?
         .clone();
-    verify_aum(genesis, &state, true)?;
+    if genesis.parent().is_some() {
+        // A compacted anchor was verified before its ancestry was purged. Its
+        // signatures cannot be rechecked because they are authorized by the
+        // pre-checkpoint state, which may differ from the checkpoint state.
+        genesis.validate().map_err(AuthorityError::InvalidAum)?;
+        if genesis.signatures.is_empty() {
+            return Err(AuthorityError::InvalidAum(
+                "unsigned retained checkpoint".into(),
+            ));
+        }
+    } else {
+        verify_aum(genesis, &state, true)?;
+    }
     state = state.with_last_aum(genesis);
 
     for update in path.iter().skip(1) {
@@ -360,10 +377,6 @@ fn verify_aum(aum: &Aum, state: &State, genesis: bool) -> Result<(), AuthorityEr
                 "parent does not match state head {expected}"
             )));
         }
-    } else if aum.prev_aum_hash.is_some() {
-        return Err(AuthorityError::InvalidAum(
-            "genesis AUM cannot have a parent".into(),
-        ));
     }
     if aum.signatures.is_empty() {
         return Err(AuthorityError::InvalidAum("unsigned AUM".into()));
@@ -520,7 +533,8 @@ mod tests {
         let signer = signing_key(1);
         let root = trusted_key(&signer, 1);
         let root_id = root.public.clone();
-        let storage = crate::chonk::MemChonk::new();
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FsChonk::open(dir.path()).unwrap();
         let (mut authority, _) =
             Authority::create(&storage, initial_state(vec![root]), &signer).unwrap();
 
@@ -529,15 +543,93 @@ mod tests {
         builder
             .set_key_meta(
                 &root_id,
-                std::collections::BTreeMap::from([("name".into(), "root".into())]),
+                std::collections::BTreeMap::from([
+                    ("aa".into(), "longer".into()),
+                    ("z".into(), "short".into()),
+                ]),
             )
             .unwrap();
         let updates = builder.finalize(&storage).unwrap();
         authority.inform(&storage, &updates).unwrap();
 
+        let expected_head = authority.head();
         let key = authority.keys().pop().unwrap();
         assert_eq!(key.votes, 7);
-        assert_eq!(key.meta.unwrap().get("name").unwrap(), "root");
+        assert_eq!(
+            key.meta.unwrap(),
+            std::collections::BTreeMap::from([
+                ("aa".into(), "longer".into()),
+                ("z".into(), "short".into()),
+            ])
+        );
+        drop(storage);
+
+        let reopened_storage = FsChonk::open(dir.path()).unwrap();
+        let reopened = Authority::open(&reopened_storage).unwrap();
+        assert_eq!(reopened.head(), expected_head);
+        let reopened_key = reopened.keys().pop().unwrap();
+        assert_eq!(reopened_key.votes, 7);
+        assert_eq!(
+            reopened_key.meta.unwrap(),
+            std::collections::BTreeMap::from([
+                ("aa".into(), "longer".into()),
+                ("z".into(), "short".into()),
+            ])
+        );
+    }
+
+    #[test]
+    fn compacted_checkpoint_anchor_reopens_without_parent() {
+        let signer = signing_key(1);
+        let retained_signer = signing_key(2);
+        let root = trusted_key(&signer, 1);
+        let retained_key = trusted_key(&retained_signer, 1);
+        let full_storage = crate::chonk::MemChonk::new();
+        let (mut authority, _) = Authority::create(
+            &full_storage,
+            initial_state(vec![root, retained_key.clone()]),
+            &signer,
+        )
+        .unwrap();
+
+        let parent = authority.head();
+        let mut checkpoint_state = authority.state.clone();
+        checkpoint_state.last_aum_hash = None;
+        // A valid checkpoint may remove the key that signed it. Reopening a
+        // compacted chain therefore cannot self-verify the anchor signature.
+        checkpoint_state.keys = vec![retained_key];
+        let checkpoint = sign_update(
+            Aum {
+                message_kind: AumKind::Checkpoint,
+                prev_aum_hash: Some(parent.0.to_vec()),
+                key: None,
+                key_id: None,
+                state: Some(checkpoint_state),
+                votes: None,
+                meta: None,
+                signatures: Vec::new(),
+            },
+            &signer,
+        );
+        let child = noop(checkpoint.hash(), &retained_signer);
+        authority
+            .inform(&full_storage, &[checkpoint.clone(), child.clone()])
+            .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let compacted = FsChonk::open(dir.path()).unwrap();
+            compacted
+                .store_verified_aums(&[checkpoint.clone(), child.clone()])
+                .unwrap();
+            compacted
+                .set_last_active_ancestor(checkpoint.hash())
+                .unwrap();
+        }
+        let compacted = FsChonk::open(dir.path()).unwrap();
+        let reopened = Authority::open(&compacted).unwrap();
+        assert_eq!(reopened.head(), child.hash());
+        assert_eq!(reopened.oldest_ancestor.hash(), checkpoint.hash());
     }
 
     #[test]

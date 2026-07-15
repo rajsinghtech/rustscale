@@ -114,10 +114,11 @@ impl Key {
 
         if let Some(meta) = &self.meta {
             if !meta.is_empty() {
-                let entries: Vec<(Value, Value)> = meta
+                let mut entries: Vec<(Value, Value)> = meta
                     .iter()
                     .map(|(k, v)| (Value::Text(k.clone()), Value::Text(v.clone())))
                     .collect();
+                entries.sort_by(|left, right| canonical_key_cmp(&left.0, &right.0));
                 map.push((Value::Integer(12.into()), Value::Map(entries)));
             }
         }
@@ -204,6 +205,23 @@ mod tests {
         let enc = key.encode();
         let dec = Key::decode(&enc).unwrap();
         assert_eq!(key, dec);
+    }
+
+    #[test]
+    fn key_metadata_uses_ctap2_encoded_key_order() {
+        let key = Key {
+            kind: KeyKind::Key25519,
+            votes: 1,
+            public: vec![0; 32],
+            meta: Some(BTreeMap::from([
+                ("aa".into(), "2".into()),
+                ("z".into(), "1".into()),
+            ])),
+        };
+        let expected = data_encoding::HEXLOWER
+            .decode(b"a40101020103582000000000000000000000000000000000000000000000000000000000000000000ca2617a61316261616132")
+            .unwrap();
+        assert_eq!(key.encode(), expected);
     }
 
     #[test]

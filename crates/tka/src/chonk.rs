@@ -7,15 +7,44 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ciborium::value::Value;
 
-use crate::aum::{decode_value, encode_value, expect_key, expect_map, expect_uint, Aum, AumHash};
+use crate::aum::{
+    decode_value, encode_value, expect_key, expect_map, expect_uint, Aum, AumHash, MAX_CBOR_BYTES,
+};
+
+const MAX_RECORD_BYTES: usize = MAX_CBOR_BYTES + 1024;
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RootIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(unix)]
+fn root_identity(metadata: &fs::Metadata) -> RootIdentity {
+    use std::os::unix::fs::MetadataExt;
+    RootIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    }
+}
+
+#[cfg(not(unix))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RootIdentity;
+
+#[cfg(not(unix))]
+fn root_identity(_metadata: &fs::Metadata) -> RootIdentity {
+    RootIdentity
+}
 
 /// Storage failures. Corruption is distinct from absence so callers fail
 /// closed instead of treating malformed durable state as missing state.
@@ -48,6 +77,20 @@ fn io_error(path: &Path, source: io::Error) -> ChonkError {
         path: path.to_path_buf(),
         source,
     }
+}
+
+#[cfg(unix)]
+fn open_read_no_follow(path: &Path) -> io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_read_no_follow(path: &Path) -> io::Result<fs::File> {
+    fs::OpenOptions::new().read(true).open(path)
 }
 
 /// Storage backend for verified AUMs.
@@ -158,8 +201,17 @@ impl Chonk for MemChonk {
 /// AUMs are stored in Tailscale's integer-keyed CBOR record envelope at
 /// `<root>/<first-two-base32>/<hash>`. The ancestor hint is the raw 32-byte
 /// hash at `last_active_ancestor`.
+///
+/// Writes use same-directory fsync+rename replacement. Each operation checks
+/// that the root and hash-prefix are real directories; Unix additionally
+/// checks the root device/inode to detect replacement. Previously observed
+/// AUMs disappearing is corruption. These checks provide crash durability and
+/// fail-closed handling, not integrity against a privileged process racing
+/// between individual filesystem syscalls.
 pub struct FsChonk {
     root: PathBuf,
+    root_identity: RootIdentity,
+    observed: Mutex<HashSet<AumHash>>,
     lock: RwLock<()>,
 }
 
@@ -193,8 +245,12 @@ impl FsChonk {
                 reason: "created root is not a real directory".into(),
             });
         }
+        let root = fs::canonicalize(&root).map_err(|error| io_error(&root, error))?;
+        let metadata = fs::symlink_metadata(&root).map_err(|error| io_error(&root, error))?;
         Ok(Self {
             root,
+            root_identity: root_identity(&metadata),
+            observed: Mutex::new(HashSet::new()),
             lock: RwLock::new(()),
         })
     }
@@ -204,7 +260,24 @@ impl FsChonk {
         self.root.join(&name[..2]).join(name)
     }
 
-    fn checked_read(path: &Path) -> Result<Vec<u8>, ChonkError> {
+    fn verify_root(&self) -> Result<(), ChonkError> {
+        let metadata = fs::symlink_metadata(&self.root).map_err(|error| ChonkError::Corrupt {
+            path: self.root.clone(),
+            reason: format!("storage root disappeared: {error}"),
+        })?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+            || root_identity(&metadata) != self.root_identity
+        {
+            return Err(ChonkError::Corrupt {
+                path: self.root.clone(),
+                reason: "storage root was replaced or is not a real directory".into(),
+            });
+        }
+        Ok(())
+    }
+
+    fn checked_read(path: &Path, max_bytes: usize) -> Result<Vec<u8>, ChonkError> {
         let metadata = fs::symlink_metadata(path).map_err(|error| {
             if error.kind() == io::ErrorKind::NotFound {
                 ChonkError::Io {
@@ -221,13 +294,42 @@ impl FsChonk {
                 reason: "expected a regular, non-symlink file".into(),
             });
         }
-        fs::read(path).map_err(|error| io_error(path, error))
+        let mut file = open_read_no_follow(path).map_err(|error| io_error(path, error))?;
+        let opened_metadata = file.metadata().map_err(|error| io_error(path, error))?;
+        if !opened_metadata.is_file() || opened_metadata.len() > max_bytes as u64 {
+            return Err(ChonkError::Corrupt {
+                path: path.to_path_buf(),
+                reason: format!(
+                    "file is too large or not regular: {} bytes",
+                    opened_metadata.len()
+                ),
+            });
+        }
+        let mut bytes = Vec::with_capacity(opened_metadata.len() as usize);
+        file.by_ref()
+            .take(max_bytes as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| io_error(path, error))?;
+        if bytes.len() > max_bytes {
+            return Err(ChonkError::Corrupt {
+                path: path.to_path_buf(),
+                reason: format!("file grew beyond {max_bytes} bytes while reading"),
+            });
+        }
+        Ok(bytes)
     }
 
     fn read_aum_unlocked(&self, hash: &AumHash) -> Result<Aum, ChonkError> {
         let path = self.aum_path(hash);
-        let bytes = match Self::checked_read(&path) {
+        let bytes = match Self::checked_read(&path, MAX_RECORD_BYTES) {
             Err(ChonkError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
+                let observed = self.observed.lock().map_err(|_| ChonkError::LockPoisoned)?;
+                if observed.contains(hash) {
+                    return Err(ChonkError::Corrupt {
+                        path,
+                        reason: "previously observed AUM disappeared".into(),
+                    });
+                }
                 return Err(ChonkError::NotFound(*hash));
             }
             result => result?,
@@ -272,6 +374,17 @@ impl FsChonk {
             }
         }
         if purged {
+            if self
+                .observed
+                .lock()
+                .map_err(|_| ChonkError::LockPoisoned)?
+                .contains(hash)
+            {
+                return Err(ChonkError::Corrupt {
+                    path,
+                    reason: "previously observed AUM was marked purged".into(),
+                });
+            }
             return Err(ChonkError::NotFound(*hash));
         }
         let aum_value = aum_value.ok_or_else(|| ChonkError::Corrupt {
@@ -279,6 +392,17 @@ impl FsChonk {
             reason: "record has no AUM".into(),
         })?;
         if matches!(aum_value, Value::Null) {
+            if self
+                .observed
+                .lock()
+                .map_err(|_| ChonkError::LockPoisoned)?
+                .contains(hash)
+            {
+                return Err(ChonkError::Corrupt {
+                    path,
+                    reason: "previously observed AUM content disappeared".into(),
+                });
+            }
             return Err(ChonkError::NotFound(*hash));
         }
         let aum = Aum::decode(&encode_value(&aum_value)).map_err(|error| ChonkError::Corrupt {
@@ -292,6 +416,10 @@ impl FsChonk {
                 reason: format!("content hash is {actual}, filename is {hash}"),
             });
         }
+        self.observed
+            .lock()
+            .map_err(|_| ChonkError::LockPoisoned)?
+            .insert(*hash);
         Ok(aum)
     }
 
@@ -308,6 +436,7 @@ impl FsChonk {
     }
 
     fn all_hashes_unlocked(&self) -> Result<Vec<AumHash>, ChonkError> {
+        self.verify_root()?;
         let mut hashes = Vec::new();
         let prefixes = fs::read_dir(&self.root).map_err(|error| io_error(&self.root, error))?;
         for prefix in prefixes {
@@ -315,16 +444,41 @@ impl FsChonk {
             let file_type = prefix
                 .file_type()
                 .map_err(|error| io_error(&prefix.path(), error))?;
-            if !file_type.is_dir() || file_type.is_symlink() {
-                continue;
-            }
             let prefix_name = prefix.file_name();
             let prefix_name = prefix_name.to_string_lossy();
-            if prefix_name.len() != 2 {
+            let valid_prefix = prefix_name.len() == 2
+                && prefix_name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_uppercase() || (b'2'..=b'7').contains(&byte));
+            if file_type.is_symlink() {
+                return Err(ChonkError::Corrupt {
+                    path: prefix.path(),
+                    reason: "symlink entry in Chonk root".into(),
+                });
+            }
+            if !file_type.is_dir() {
+                if valid_prefix {
+                    return Err(ChonkError::Corrupt {
+                        path: prefix.path(),
+                        reason: "valid AUM prefix is not a directory".into(),
+                    });
+                }
                 continue;
             }
             let entries =
                 fs::read_dir(prefix.path()).map_err(|error| io_error(&prefix.path(), error))?;
+            if !valid_prefix {
+                for entry in entries {
+                    let entry = entry.map_err(|error| io_error(&prefix.path(), error))?;
+                    if AumHash::from_str(&entry.file_name().to_string_lossy()).is_ok() {
+                        return Err(ChonkError::Corrupt {
+                            path: entry.path(),
+                            reason: "AUM hash file is hidden in a non-prefix directory".into(),
+                        });
+                    }
+                }
+                continue;
+            }
             for entry in entries {
                 let entry = entry.map_err(|error| io_error(&prefix.path(), error))?;
                 let name = entry.file_name();
@@ -348,10 +502,19 @@ impl FsChonk {
         }
         hashes.sort();
         hashes.dedup();
+        let current: HashSet<_> = hashes.iter().copied().collect();
+        let observed = self.observed.lock().map_err(|_| ChonkError::LockPoisoned)?;
+        if let Some(missing) = observed.iter().find(|hash| !current.contains(hash)) {
+            return Err(ChonkError::Corrupt {
+                path: self.aum_path(missing),
+                reason: "previously observed AUM disappeared from storage".into(),
+            });
+        }
         Ok(hashes)
     }
 
-    fn ensure_prefix_dir(path: &Path) -> Result<(), ChonkError> {
+    fn ensure_prefix_dir(&self, path: &Path) -> Result<(), ChonkError> {
+        self.verify_root()?;
         match fs::symlink_metadata(path) {
             Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
                 return Err(ChonkError::Corrupt {
@@ -359,16 +522,24 @@ impl FsChonk {
                     reason: "AUM prefix is not a real directory".into(),
                 });
             }
-            Ok(_) => return Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                fs::create_dir(path).map_err(|error| io_error(path, error))?;
+            }
             Err(error) => return Err(io_error(path, error)),
         }
-        fs::create_dir(path).map_err(|error| io_error(path, error))?;
         let metadata = fs::symlink_metadata(path).map_err(|error| io_error(path, error))?;
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
             return Err(ChonkError::Corrupt {
                 path: path.to_path_buf(),
                 reason: "created AUM prefix is not a real directory".into(),
+            });
+        }
+        let canonical = fs::canonicalize(path).map_err(|error| io_error(path, error))?;
+        if canonical.parent() != Some(self.root.as_path()) {
+            return Err(ChonkError::Corrupt {
+                path: path.to_path_buf(),
+                reason: "AUM prefix escapes the storage root".into(),
             });
         }
         Ok(())
@@ -378,6 +549,7 @@ impl FsChonk {
 impl Chonk for FsChonk {
     fn aum(&self, hash: &AumHash) -> Result<Aum, ChonkError> {
         let _guard = self.lock.read().map_err(|_| ChonkError::LockPoisoned)?;
+        self.verify_root()?;
         self.read_aum_unlocked(hash)
     }
 
@@ -413,8 +585,9 @@ impl Chonk for FsChonk {
 
     fn last_active_ancestor(&self) -> Result<Option<AumHash>, ChonkError> {
         let _guard = self.lock.read().map_err(|_| ChonkError::LockPoisoned)?;
+        self.verify_root()?;
         let path = self.root.join("last_active_ancestor");
-        let bytes = match Self::checked_read(&path) {
+        let bytes = match Self::checked_read(&path, 32) {
             Err(ChonkError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
                 return Ok(None);
             }
@@ -430,6 +603,7 @@ impl Chonk for FsChonk {
 
     fn set_last_active_ancestor(&self, hash: AumHash) -> Result<(), ChonkError> {
         let _guard = self.lock.write().map_err(|_| ChonkError::LockPoisoned)?;
+        self.verify_root()?;
         let path = self.root.join("last_active_ancestor");
         rustscale_atomicfile::write(&path, hash.as_bytes()).map_err(|error| io_error(&path, error))
     }
@@ -452,7 +626,7 @@ impl Chonk for FsChonk {
                 Err(error) => return Err(error),
             }
             let parent = path.parent().expect("hash path always has a parent");
-            Self::ensure_prefix_dir(parent)?;
+            self.ensure_prefix_dir(parent)?;
             rustscale_atomicfile::write(&path, &Self::encode_record(aum))
                 .map_err(|error| io_error(&path, error))?;
             // Read-after-write catches storage corruption before returning.
@@ -544,6 +718,79 @@ mod tests {
                 Err(ChonkError::InvalidRoot { .. })
             ));
         }
+    }
+
+    #[test]
+    fn oversized_record_is_rejected_before_reading() {
+        let dir = tempfile::tempdir().unwrap();
+        let chonk = FsChonk::open(dir.path()).unwrap();
+        let update = aum(AumKind::NoOp, None);
+        let hash = update.hash();
+        chonk.store_verified_aums(&[update]).unwrap();
+        fs::write(chonk.aum_path(&hash), vec![0; MAX_RECORD_BYTES + 1]).unwrap();
+        assert!(matches!(chonk.aum(&hash), Err(ChonkError::Corrupt { .. })));
+    }
+
+    #[test]
+    fn disappeared_head_is_corruption_not_rollback() {
+        let dir = tempfile::tempdir().unwrap();
+        let chonk = FsChonk::open(dir.path()).unwrap();
+        let parent = aum(AumKind::NoOp, None);
+        let child = aum(AumKind::NoOp, Some(parent.hash()));
+        chonk
+            .store_verified_aums(&[parent.clone(), child.clone()])
+            .unwrap();
+        assert_eq!(chonk.heads().unwrap(), vec![child.clone()]);
+        fs::remove_file(chonk.aum_path(&child.hash())).unwrap();
+        assert!(matches!(chonk.heads(), Err(ChonkError::Corrupt { .. })));
+    }
+
+    #[test]
+    fn renamed_prefix_cannot_hide_a_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let chonk = FsChonk::open(dir.path()).unwrap();
+        let update = aum(AumKind::NoOp, None);
+        let hash = update.hash();
+        chonk.store_verified_aums(&[update]).unwrap();
+        let prefix = chonk.aum_path(&hash).parent().unwrap().to_path_buf();
+        fs::rename(&prefix, dir.path().join("hidden-prefix")).unwrap();
+        assert!(matches!(chonk.heads(), Err(ChonkError::Corrupt { .. })));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn valid_prefix_symlink_and_hash_symlink_fail_closed() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let chonk = FsChonk::open(dir.path()).unwrap();
+        let update = aum(AumKind::NoOp, None);
+        let hash = update.hash();
+        chonk.store_verified_aums(&[update]).unwrap();
+        let path = chonk.aum_path(&hash);
+        let prefix = path.parent().unwrap().to_path_buf();
+
+        fs::remove_file(&path).unwrap();
+        symlink(dir.path().join("missing-target"), &path).unwrap();
+        assert!(matches!(chonk.aum(&hash), Err(ChonkError::Corrupt { .. })));
+        fs::remove_file(&path).unwrap();
+        fs::remove_dir(&prefix).unwrap();
+        let target = dir.path().join("elsewhere");
+        fs::create_dir(&target).unwrap();
+        symlink(&target, &prefix).unwrap();
+        assert!(matches!(chonk.heads(), Err(ChonkError::Corrupt { .. })));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_replacement_is_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let old_root = dir.path().join("old-root");
+        let chonk = FsChonk::open(&root).unwrap();
+        fs::rename(&root, &old_root).unwrap();
+        fs::create_dir(&root).unwrap();
+        assert!(matches!(chonk.heads(), Err(ChonkError::Corrupt { .. })));
     }
 
     #[test]

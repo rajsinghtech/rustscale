@@ -34,6 +34,9 @@ use crate::state::State;
 
 /// Maximum CBOR nesting depth (CTAP2 canonical limit).
 pub(crate) const MAX_NESTING: usize = 16;
+pub(crate) const MAX_CBOR_BYTES: usize = 1024 * 1024;
+const MAX_ARRAY_ELEMENTS: usize = 4096;
+const MAX_MAP_PAIRS: usize = 1024;
 
 // ---------------------------------------------------------------------------
 // AumHash
@@ -71,6 +74,9 @@ impl fmt::Debug for AumHash {
 impl FromStr for AumHash {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.len() != 52 {
+            return Err(format!("expected 52 base32 characters, got {}", s.len()));
+        }
         let bytes = base32_nopad()
             .decode(s.to_ascii_uppercase().as_bytes())
             .map_err(|e| format!("invalid base32: {e}"))?;
@@ -270,10 +276,11 @@ impl Aum {
         // Key 7 — meta (omit if None or empty).
         if let Some(meta) = &self.meta {
             if !meta.is_empty() {
-                let entries: Vec<(Value, Value)> = meta
+                let mut entries: Vec<(Value, Value)> = meta
                     .iter()
                     .map(|(k, v)| (Value::Text(k.clone()), Value::Text(v.clone())))
                     .collect();
+                entries.sort_by(|left, right| canonical_key_cmp(&left.0, &right.0));
                 map.push((Value::Integer(7.into()), Value::Map(entries)));
             }
         }
@@ -415,6 +422,9 @@ impl Aum {
                 if self.key_id.as_ref().is_none_or(Vec::is_empty) {
                     return Err("UpdateKey AUM must specify a key ID".into());
                 }
+                if self.meta.as_ref().is_some_and(BTreeMap::is_empty) {
+                    return Err("UpdateKey AUM cannot contain empty metadata".into());
+                }
                 if self.votes.is_none() && self.meta.is_none() {
                     return Err("UpdateKey AUM must update votes or metadata".into());
                 }
@@ -495,6 +505,12 @@ impl Signature {
 pub enum DecodeError {
     #[error("CBOR deserialization failed: {0}")]
     Cbor(String),
+    #[error("CBOR input is too large: {0} bytes")]
+    InputTooLarge(usize),
+    #[error("CBOR array exceeds {0} elements")]
+    TooManyArrayElements(usize),
+    #[error("CBOR map exceeds {0} pairs")]
+    TooManyMapPairs(usize),
     #[error("expected map")]
     NotAMap,
     #[error("expected array")]
@@ -523,9 +539,96 @@ pub enum DecodeError {
 
 /// Decode CBOR bytes into a `Value`, rejecting nesting > `MAX_NESTING`.
 pub(crate) fn decode_value(data: &[u8]) -> Result<Value, DecodeError> {
+    if data.len() > MAX_CBOR_BYTES {
+        return Err(DecodeError::InputTooLarge(data.len()));
+    }
+    let consumed = scan_cbor_item(data, 0, 0)?;
+    if consumed != data.len() {
+        return Err(DecodeError::Cbor("trailing data".into()));
+    }
     let val: Value = ciborium::from_reader(data).map_err(|e| DecodeError::Cbor(e.to_string()))?;
     check_nesting(&val, 0)?;
     Ok(val)
+}
+
+/// Validate definite-length CBOR before handing it to an allocating decoder.
+/// This rejects oversized declared lengths, tags, indefinite values, and
+/// excessive containers while only indexing the bounded input slice.
+fn scan_cbor_item(data: &[u8], start: usize, depth: usize) -> Result<usize, DecodeError> {
+    if depth > MAX_NESTING {
+        return Err(DecodeError::NestingTooDeep(MAX_NESTING));
+    }
+    let initial = *data
+        .get(start)
+        .ok_or_else(|| DecodeError::Cbor("truncated item".into()))?;
+    let major = initial >> 5;
+    let additional = initial & 0x1f;
+    let (argument, mut cursor) = match additional {
+        value @ 0..=23 => (u64::from(value), start + 1),
+        24 => (u64::from(read_fixed::<1>(data, start + 1)?[0]), start + 2),
+        25 => (
+            u64::from(u16::from_be_bytes(read_fixed(data, start + 1)?)),
+            start + 3,
+        ),
+        26 => (
+            u64::from(u32::from_be_bytes(read_fixed(data, start + 1)?)),
+            start + 5,
+        ),
+        27 => (u64::from_be_bytes(read_fixed(data, start + 1)?), start + 9),
+        31 => {
+            return Err(DecodeError::Cbor(
+                "indefinite-length CBOR is forbidden".into(),
+            ))
+        }
+        _ => return Err(DecodeError::Cbor("invalid additional information".into())),
+    };
+
+    match major {
+        0 | 1 | 7 => Ok(cursor),
+        2 | 3 => {
+            let length = usize::try_from(argument)
+                .map_err(|_| DecodeError::Cbor("declared string length overflows usize".into()))?;
+            cursor
+                .checked_add(length)
+                .filter(|end| *end <= data.len())
+                .ok_or_else(|| DecodeError::Cbor("declared string exceeds input".into()))
+        }
+        4 => {
+            let length = usize::try_from(argument)
+                .map_err(|_| DecodeError::TooManyArrayElements(MAX_ARRAY_ELEMENTS))?;
+            if length > MAX_ARRAY_ELEMENTS {
+                return Err(DecodeError::TooManyArrayElements(MAX_ARRAY_ELEMENTS));
+            }
+            for _ in 0..length {
+                cursor = scan_cbor_item(data, cursor, depth + 1)?;
+            }
+            Ok(cursor)
+        }
+        5 => {
+            let length = usize::try_from(argument)
+                .map_err(|_| DecodeError::TooManyMapPairs(MAX_MAP_PAIRS))?;
+            if length > MAX_MAP_PAIRS {
+                return Err(DecodeError::TooManyMapPairs(MAX_MAP_PAIRS));
+            }
+            for _ in 0..length {
+                cursor = scan_cbor_item(data, cursor, depth + 1)?;
+                cursor = scan_cbor_item(data, cursor, depth + 1)?;
+            }
+            Ok(cursor)
+        }
+        6 => Err(DecodeError::Cbor("CBOR tags are forbidden".into())),
+        _ => Err(DecodeError::Cbor("invalid CBOR major type".into())),
+    }
+}
+
+fn read_fixed<const N: usize>(data: &[u8], start: usize) -> Result<[u8; N], DecodeError> {
+    let end = start
+        .checked_add(N)
+        .ok_or_else(|| DecodeError::Cbor("length overflow".into()))?;
+    data.get(start..end)
+        .ok_or_else(|| DecodeError::Cbor("truncated argument".into()))?
+        .try_into()
+        .map_err(|_| DecodeError::Cbor("truncated argument".into()))
 }
 
 /// Encode a `Value` to CTAP2 canonical CBOR bytes.
@@ -654,7 +757,10 @@ pub(crate) fn canonical_key_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
 
 #[cfg(test)]
 mod tests {
-    use super::{encode_value, Aum, AumHash, AumKind, DecodeError, Signature};
+    use super::{
+        decode_value, encode_value, Aum, AumHash, AumKind, DecodeError, Signature,
+        MAX_ARRAY_ELEMENTS, MAX_CBOR_BYTES, MAX_MAP_PAIRS,
+    };
     use crate::key::{Key, KeyKind};
     use ciborium::value::Value;
     use std::collections::BTreeMap;
@@ -841,6 +947,70 @@ mod tests {
         assert_eq!(s.len(), 52); // 32 bytes -> 52 base32 chars (no pad)
         let parsed = AumHash::from_str(&s).unwrap();
         assert_eq!(hash, parsed);
+    }
+
+    #[test]
+    fn metadata_uses_ctap2_encoded_key_order_and_stable_hash() {
+        let aum = Aum {
+            message_kind: AumKind::UpdateKey,
+            prev_aum_hash: Some(vec![0x11; 32]),
+            key: None,
+            key_id: Some(vec![0x22; 32]),
+            state: None,
+            votes: None,
+            meta: Some(BTreeMap::from([
+                ("aa".into(), "2".into()),
+                ("z".into(), "1".into()),
+            ])),
+            signatures: Vec::new(),
+        };
+        let expected = data_encoding::HEXLOWER
+            .decode(b"a401040258201111111111111111111111111111111111111111111111111111111111111111045820222222222222222222222222222222222222222222222222222222222222222207a2617a61316261616132")
+            .unwrap();
+        assert_eq!(aum.encode(), expected);
+        assert_eq!(
+            aum.hash().0,
+            [
+                0xec, 0x1a, 0x24, 0x23, 0x58, 0xd8, 0x5f, 0x56, 0x03, 0xd3, 0x65, 0x6a, 0x1b, 0x35,
+                0x80, 0xa1, 0xe6, 0xf2, 0x38, 0x42, 0xe0, 0xb5, 0x0b, 0x34, 0x38, 0x2a, 0x61, 0x7a,
+                0x41, 0x68, 0x54, 0x3c,
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_metadata_update_is_rejected_before_omission() {
+        let aum = Aum {
+            message_kind: AumKind::UpdateKey,
+            prev_aum_hash: Some(vec![0x11; 32]),
+            key: None,
+            key_id: Some(vec![0x22; 32]),
+            state: None,
+            votes: None,
+            meta: Some(BTreeMap::new()),
+            signatures: Vec::new(),
+        };
+        assert!(aum.validate().is_err());
+    }
+
+    #[test]
+    fn decode_limits_are_enforced_before_allocation() {
+        assert_eq!(
+            Aum::decode(&vec![0; MAX_CBOR_BYTES + 1]).unwrap_err(),
+            DecodeError::InputTooLarge(MAX_CBOR_BYTES + 1)
+        );
+        assert_eq!(
+            decode_value(&[0x99, 0x10, 0x01]).unwrap_err(),
+            DecodeError::TooManyArrayElements(MAX_ARRAY_ELEMENTS)
+        );
+        assert_eq!(
+            decode_value(&[0xb9, 0x04, 0x01]).unwrap_err(),
+            DecodeError::TooManyMapPairs(MAX_MAP_PAIRS)
+        );
+        assert!(matches!(
+            decode_value(&[0x5b, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]),
+            Err(DecodeError::Cbor(_))
+        ));
     }
 
     #[test]

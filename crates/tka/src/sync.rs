@@ -1,5 +1,6 @@
 //! Bounded, untrusted-peer AUM synchronization offers.
 
+use std::collections::HashMap;
 use std::str::FromStr;
 
 use crate::aum::{Aum, AumHash};
@@ -9,6 +10,7 @@ use crate::chonk::Chonk;
 const ANCESTORS_SKIP_START: usize = 4;
 const ANCESTORS_SKIP_SHIFT: usize = 2;
 const MAX_SYNC_HEAD_ITERATIONS: usize = 400;
+const MAX_SYNC_ANCESTORS: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncOffer {
@@ -19,6 +21,12 @@ pub struct SyncOffer {
 
 impl SyncOffer {
     pub fn from_strings(head: &str, ancestors: &[String]) -> Result<Self, String> {
+        if ancestors.len() > MAX_SYNC_ANCESTORS {
+            return Err(format!(
+                "too many sync ancestors: {} > {MAX_SYNC_ANCESTORS}",
+                ancestors.len()
+            ));
+        }
         let head = AumHash::from_str(head).map_err(|error| format!("head: {error}"))?;
         let ancestors = ancestors
             .iter()
@@ -46,6 +54,8 @@ pub enum SyncError {
     NoIntersection,
     #[error("active AUM chain did not reach its oldest ancestor")]
     BrokenActiveChain,
+    #[error("sync offer has too many ancestors: {0} > {MAX_SYNC_ANCESTORS}")]
+    TooManyAncestors(usize),
 }
 
 impl Authority {
@@ -77,15 +87,23 @@ impl Authority {
         storage: &dyn Chonk,
         remote: &SyncOffer,
     ) -> Result<Vec<Aum>, SyncError> {
+        if remote.ancestors.len() > MAX_SYNC_ANCESTORS {
+            return Err(SyncError::TooManyAncestors(remote.ancestors.len()));
+        }
         if remote.head == self.head() {
             return Ok(Vec::new());
         }
         let path = active_path(self, storage)?;
-        if let Some(index) = path.iter().position(|aum| aum.hash() == remote.head) {
+        let positions: HashMap<_, _> = path
+            .iter()
+            .enumerate()
+            .map(|(index, aum)| (aum.hash(), index))
+            .collect();
+        if let Some(index) = positions.get(&remote.head).copied() {
             return Ok(path[index + 1..].to_vec());
         }
         for ancestor in &remote.ancestors {
-            if let Some(index) = path.iter().position(|aum| aum.hash() == *ancestor) {
+            if let Some(index) = positions.get(ancestor).copied() {
                 return Ok(path[index + 1..].to_vec());
             }
         }
@@ -167,5 +185,16 @@ mod tests {
 
         let (head, ancestors) = offer.to_strings();
         assert_eq!(SyncOffer::from_strings(&head, &ancestors).unwrap(), offer);
+
+        let excessive = vec![chain[0].hash().to_string(); MAX_SYNC_ANCESTORS + 1];
+        assert!(SyncOffer::from_strings(&head, &excessive).is_err());
+        let remote = SyncOffer {
+            head: AumHash([0x99; 32]),
+            ancestors: vec![chain[0].hash(); MAX_SYNC_ANCESTORS + 1],
+        };
+        assert!(matches!(
+            authority.missing_aums(&storage, &remote),
+            Err(SyncError::TooManyAncestors(length)) if length == MAX_SYNC_ANCESTORS + 1
+        ));
     }
 }

@@ -7,11 +7,20 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
+#[cfg(unix)]
+use std::io::Write;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+#[cfg(unix)]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+#[cfg(unix)]
+use rustix::fd::OwnedFd;
+#[cfg(unix)]
+use rustix::fs::{AtFlags, Mode, OFlags};
 
 use ciborium::value::Value;
 
@@ -20,6 +29,8 @@ use crate::aum::{
 };
 
 const MAX_RECORD_BYTES: usize = MAX_CBOR_BYTES + 1024;
+#[cfg(unix)]
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,12 +91,8 @@ fn io_error(path: &Path, source: io::Error) -> ChonkError {
 }
 
 #[cfg(unix)]
-fn open_read_no_follow(path: &Path) -> io::Result<fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
+fn rustix_error(path: &Path, source: rustix::io::Errno) -> ChonkError {
+    io_error(path, io::Error::from(source))
 }
 
 #[cfg(not(unix))]
@@ -202,14 +209,17 @@ impl Chonk for MemChonk {
 /// `<root>/<first-two-base32>/<hash>`. The ancestor hint is the raw 32-byte
 /// hash at `last_active_ancestor`.
 ///
-/// Writes use same-directory fsync+rename replacement. Each operation checks
-/// that the root and hash-prefix are real directories; Unix additionally
-/// checks the root device/inode to detect replacement. Previously observed
-/// AUMs disappearing is corruption. These checks provide crash durability and
-/// fail-closed handling, not integrity against a privileged process racing
-/// between individual filesystem syscalls.
+/// Writes use same-directory fsync+rename replacement. On Unix, a held root
+/// descriptor plus descriptor-relative no-follow opens and renames prevent
+/// substituted path components from escaping record and marker I/O; root and
+/// prefix identities are rechecked around those operations. Other platforms
+/// use the strongest available path/symlink validation, but cannot exclude a privileged process
+/// racing between individual filesystem calls. Previously observed AUMs
+/// disappearing is corruption on all platforms.
 pub struct FsChonk {
     root: PathBuf,
+    #[cfg(unix)]
+    root_fd: OwnedFd,
     root_identity: RootIdentity,
     observed: Mutex<HashSet<AumHash>>,
     lock: RwLock<()>,
@@ -247,8 +257,17 @@ impl FsChonk {
         }
         let root = fs::canonicalize(&root).map_err(|error| io_error(&root, error))?;
         let metadata = fs::symlink_metadata(&root).map_err(|error| io_error(&root, error))?;
+        #[cfg(unix)]
+        let root_fd = rustix::fs::open(
+            &root,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| rustix_error(&root, error))?;
         Ok(Self {
             root,
+            #[cfg(unix)]
+            root_fd,
             root_identity: root_identity(&metadata),
             observed: Mutex::new(HashSet::new()),
             lock: RwLock::new(()),
@@ -277,7 +296,34 @@ impl FsChonk {
         Ok(())
     }
 
-    fn checked_read(path: &Path, max_bytes: usize) -> Result<Vec<u8>, ChonkError> {
+    fn checked_open_file(
+        mut file: fs::File,
+        path: &Path,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, ChonkError> {
+        let metadata = file.metadata().map_err(|error| io_error(path, error))?;
+        if !metadata.is_file() || metadata.len() > max_bytes as u64 {
+            return Err(ChonkError::Corrupt {
+                path: path.to_path_buf(),
+                reason: format!("file is too large or not regular: {} bytes", metadata.len()),
+            });
+        }
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        Read::by_ref(&mut file)
+            .take(max_bytes as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| io_error(path, error))?;
+        if bytes.len() > max_bytes {
+            return Err(ChonkError::Corrupt {
+                path: path.to_path_buf(),
+                reason: format!("file grew beyond {max_bytes} bytes while reading"),
+            });
+        }
+        Ok(bytes)
+    }
+
+    #[cfg(not(unix))]
+    fn checked_path_read(path: &Path, max_bytes: usize) -> Result<Vec<u8>, ChonkError> {
         let metadata = fs::symlink_metadata(path).map_err(|error| {
             if error.kind() == io::ErrorKind::NotFound {
                 ChonkError::Io {
@@ -294,34 +340,109 @@ impl FsChonk {
                 reason: "expected a regular, non-symlink file".into(),
             });
         }
-        let mut file = open_read_no_follow(path).map_err(|error| io_error(path, error))?;
-        let opened_metadata = file.metadata().map_err(|error| io_error(path, error))?;
-        if !opened_metadata.is_file() || opened_metadata.len() > max_bytes as u64 {
+        let file = open_read_no_follow(path).map_err(|error| io_error(path, error))?;
+        Self::checked_open_file(file, path, max_bytes)
+    }
+
+    #[cfg(unix)]
+    fn open_prefix_fd(&self, prefix: &str, create: bool) -> Result<OwnedFd, ChonkError> {
+        self.verify_root()?;
+        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let open = || rustix::fs::openat(&self.root_fd, prefix, flags, Mode::empty());
+        let fd = match open() {
+            Ok(fd) => fd,
+            Err(rustix::io::Errno::NOENT) if create => {
+                match rustix::fs::mkdirat(&self.root_fd, prefix, Mode::RWXU) {
+                    Ok(()) => rustix::fs::fsync(&self.root_fd)
+                        .map_err(|error| rustix_error(&self.root, error))?,
+                    Err(rustix::io::Errno::EXIST) => {}
+                    Err(error) => return Err(rustix_error(&self.root.join(prefix), error)),
+                }
+                open().map_err(|error| ChonkError::Corrupt {
+                    path: self.root.join(prefix),
+                    reason: format!("cannot open newly-created prefix without following: {error}"),
+                })?
+            }
+            Err(rustix::io::Errno::NOENT) => {
+                return Err(io_error(
+                    &self.root.join(prefix),
+                    io::Error::from(io::ErrorKind::NotFound),
+                ));
+            }
+            Err(error) => {
+                return Err(ChonkError::Corrupt {
+                    path: self.root.join(prefix),
+                    reason: format!("cannot open prefix without following: {error}"),
+                });
+            }
+        };
+        self.verify_prefix_fd(prefix, &fd)?;
+        Ok(fd)
+    }
+
+    #[cfg(unix)]
+    fn verify_prefix_fd(&self, prefix: &str, opened: &OwnedFd) -> Result<(), ChonkError> {
+        self.verify_root()?;
+        let current = rustix::fs::openat(
+            &self.root_fd,
+            prefix,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| ChonkError::Corrupt {
+            path: self.root.join(prefix),
+            reason: format!("prefix was substituted: {error}"),
+        })?;
+        let opened_stat = rustix::fs::fstat(opened)
+            .map_err(|error| rustix_error(&self.root.join(prefix), error))?;
+        let current_stat = rustix::fs::fstat(&current)
+            .map_err(|error| rustix_error(&self.root.join(prefix), error))?;
+        if opened_stat.st_dev != current_stat.st_dev || opened_stat.st_ino != current_stat.st_ino {
             return Err(ChonkError::Corrupt {
-                path: path.to_path_buf(),
-                reason: format!(
-                    "file is too large or not regular: {} bytes",
-                    opened_metadata.len()
-                ),
+                path: self.root.join(prefix),
+                reason: "prefix directory was substituted during operation".into(),
             });
         }
-        let mut bytes = Vec::with_capacity(opened_metadata.len() as usize);
-        file.by_ref()
-            .take(max_bytes as u64 + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|error| io_error(path, error))?;
-        if bytes.len() > max_bytes {
-            return Err(ChonkError::Corrupt {
-                path: path.to_path_buf(),
-                reason: format!("file grew beyond {max_bytes} bytes while reading"),
-            });
-        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn checked_hash_read(&self, hash: &AumHash, max_bytes: usize) -> Result<Vec<u8>, ChonkError> {
+        let name = hash.to_string();
+        let prefix = &name[..2];
+        let path = self.aum_path(hash);
+        let prefix_fd = self.open_prefix_fd(prefix, false)?;
+        let fd = match rustix::fs::openat(
+            &prefix_fd,
+            &name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(rustix::io::Errno::NOENT) => {
+                return Err(io_error(&path, io::Error::from(io::ErrorKind::NotFound)));
+            }
+            Err(error) => {
+                return Err(ChonkError::Corrupt {
+                    path,
+                    reason: format!("cannot open AUM without following: {error}"),
+                });
+            }
+        };
+        self.verify_prefix_fd(prefix, &prefix_fd)?;
+        let bytes = Self::checked_open_file(fs::File::from(fd), &path, max_bytes)?;
+        self.verify_prefix_fd(prefix, &prefix_fd)?;
         Ok(bytes)
+    }
+
+    #[cfg(not(unix))]
+    fn checked_hash_read(&self, hash: &AumHash, max_bytes: usize) -> Result<Vec<u8>, ChonkError> {
+        Self::checked_path_read(&self.aum_path(hash), max_bytes)
     }
 
     fn read_aum_unlocked(&self, hash: &AumHash) -> Result<Aum, ChonkError> {
         let path = self.aum_path(hash);
-        let bytes = match Self::checked_read(&path, MAX_RECORD_BYTES) {
+        let bytes = match self.checked_hash_read(hash, MAX_RECORD_BYTES) {
             Err(ChonkError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
                 let observed = self.observed.lock().map_err(|_| ChonkError::LockPoisoned)?;
                 if observed.contains(hash) {
@@ -435,6 +556,92 @@ impl FsChonk {
         ]))
     }
 
+    #[cfg(unix)]
+    fn checked_root_read(&self, base: &str, max_bytes: usize) -> Result<Vec<u8>, ChonkError> {
+        self.verify_root()?;
+        let path = self.root.join(base);
+        let fd = match rustix::fs::openat(
+            &self.root_fd,
+            base,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(rustix::io::Errno::NOENT) => {
+                return Err(io_error(&path, io::Error::from(io::ErrorKind::NotFound)));
+            }
+            Err(error) => {
+                return Err(ChonkError::Corrupt {
+                    path,
+                    reason: format!("cannot open root file without following: {error}"),
+                });
+            }
+        };
+        let bytes = Self::checked_open_file(fs::File::from(fd), &path, max_bytes)?;
+        self.verify_root()?;
+        Ok(bytes)
+    }
+
+    #[cfg(unix)]
+    fn atomic_write_at(
+        &self,
+        dir_fd: &OwnedFd,
+        prefix: Option<&str>,
+        base: &str,
+        data: &[u8],
+        path: &Path,
+    ) -> Result<(), ChonkError> {
+        let validate_parent = || match prefix {
+            Some(prefix) => self.verify_prefix_fd(prefix, dir_fd),
+            None => self.verify_root(),
+        };
+        validate_parent()?;
+        let mut temp_name = None;
+        let mut temp_file = None;
+        for _ in 0..16 {
+            let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let candidate = format!("{base}.tmp.{:x}.{:x}", std::process::id(), counter);
+            match rustix::fs::openat(
+                dir_fd,
+                &candidate,
+                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::RUSR | Mode::WUSR,
+            ) {
+                Ok(fd) => {
+                    temp_name = Some(candidate);
+                    temp_file = Some(fs::File::from(fd));
+                    break;
+                }
+                Err(rustix::io::Errno::EXIST) => {}
+                Err(error) => return Err(rustix_error(path, error)),
+            }
+        }
+        let temp_name = temp_name.ok_or_else(|| ChonkError::Io {
+            path: path.to_path_buf(),
+            source: io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "could not create a unique temporary file",
+            ),
+        })?;
+        let mut file = temp_file.expect("temporary name and file are set together");
+        let result = (|| {
+            file.write_all(data)
+                .map_err(|error| io_error(path, error))?;
+            file.sync_all().map_err(|error| io_error(path, error))?;
+            drop(file);
+            validate_parent()?;
+            rustix::fs::renameat(dir_fd, &temp_name, dir_fd, base)
+                .map_err(|error| rustix_error(path, error))?;
+            rustix::fs::fsync(dir_fd).map_err(|error| rustix_error(path, error))?;
+            validate_parent()?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = rustix::fs::unlinkat(dir_fd, &temp_name, AtFlags::empty());
+        }
+        result
+    }
+
     fn all_hashes_unlocked(&self) -> Result<Vec<AumHash>, ChonkError> {
         self.verify_root()?;
         let mut hashes = Vec::new();
@@ -513,6 +720,7 @@ impl FsChonk {
         Ok(hashes)
     }
 
+    #[cfg(not(unix))]
     fn ensure_prefix_dir(&self, path: &Path) -> Result<(), ChonkError> {
         self.verify_root()?;
         match fs::symlink_metadata(path) {
@@ -587,7 +795,15 @@ impl Chonk for FsChonk {
         let _guard = self.lock.read().map_err(|_| ChonkError::LockPoisoned)?;
         self.verify_root()?;
         let path = self.root.join("last_active_ancestor");
-        let bytes = match Self::checked_read(&path, 32) {
+        #[cfg(unix)]
+        let bytes = match self.checked_root_read("last_active_ancestor", 32) {
+            Err(ChonkError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            result => result?,
+        };
+        #[cfg(not(unix))]
+        let bytes = match Self::checked_path_read(&path, 32) {
             Err(ChonkError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
                 return Ok(None);
             }
@@ -605,7 +821,21 @@ impl Chonk for FsChonk {
         let _guard = self.lock.write().map_err(|_| ChonkError::LockPoisoned)?;
         self.verify_root()?;
         let path = self.root.join("last_active_ancestor");
-        rustscale_atomicfile::write(&path, hash.as_bytes()).map_err(|error| io_error(&path, error))
+        #[cfg(unix)]
+        {
+            self.atomic_write_at(
+                &self.root_fd,
+                None,
+                "last_active_ancestor",
+                hash.as_bytes(),
+                &path,
+            )
+        }
+        #[cfg(not(unix))]
+        {
+            rustscale_atomicfile::write(&path, hash.as_bytes())
+                .map_err(|error| io_error(&path, error))
+        }
     }
 
     fn store_verified_aums(&self, aums: &[Aum]) -> Result<usize, ChonkError> {
@@ -625,11 +855,23 @@ impl Chonk for FsChonk {
                 Err(error) if error.is_not_found() => {}
                 Err(error) => return Err(error),
             }
-            let parent = path.parent().expect("hash path always has a parent");
-            self.ensure_prefix_dir(parent)?;
-            rustscale_atomicfile::write(&path, &Self::encode_record(aum))
-                .map_err(|error| io_error(&path, error))?;
-            // Read-after-write catches storage corruption before returning.
+            let encoded = Self::encode_record(aum);
+            #[cfg(unix)]
+            {
+                let name = hash.to_string();
+                let prefix = &name[..2];
+                let prefix_fd = self.open_prefix_fd(prefix, true)?;
+                self.atomic_write_at(&prefix_fd, Some(prefix), &name, &encoded, &path)?;
+            }
+            #[cfg(not(unix))]
+            {
+                let parent = path.parent().expect("hash path always has a parent");
+                self.ensure_prefix_dir(parent)?;
+                rustscale_atomicfile::write(&path, &encoded)
+                    .map_err(|error| io_error(&path, error))?;
+            }
+            // Descriptor-relative read-after-write catches substitution and
+            // storage corruption before returning.
             self.read_aum_unlocked(&hash)?;
             inserted += 1;
         }
@@ -783,14 +1025,48 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn substituted_prefix_cannot_be_followed_by_direct_read_or_store() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let chonk = FsChonk::open(dir.path()).unwrap();
+        let update = aum(AumKind::NoOp, None);
+        let hash = update.hash();
+        chonk
+            .store_verified_aums(std::slice::from_ref(&update))
+            .unwrap();
+        let prefix = chonk.aum_path(&hash).parent().unwrap().to_path_buf();
+        let moved = dir.path().join("moved-valid-prefix");
+        fs::rename(&prefix, &moved).unwrap();
+        symlink(&moved, &prefix).unwrap();
+
+        assert!(matches!(chonk.aum(&hash), Err(ChonkError::Corrupt { .. })));
+        assert!(matches!(
+            chonk.store_verified_aums(&[update]),
+            Err(ChonkError::Corrupt { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn root_replacement_is_detected() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("root");
         let old_root = dir.path().join("old-root");
         let chonk = FsChonk::open(&root).unwrap();
+        let update = aum(AumKind::NoOp, None);
+        let hash = update.hash();
+        chonk
+            .store_verified_aums(std::slice::from_ref(&update))
+            .unwrap();
         fs::rename(&root, &old_root).unwrap();
         fs::create_dir(&root).unwrap();
         assert!(matches!(chonk.heads(), Err(ChonkError::Corrupt { .. })));
+        assert!(matches!(chonk.aum(&hash), Err(ChonkError::Corrupt { .. })));
+        assert!(matches!(
+            chonk.store_verified_aums(&[update]),
+            Err(ChonkError::Corrupt { .. })
+        ));
     }
 
     #[test]

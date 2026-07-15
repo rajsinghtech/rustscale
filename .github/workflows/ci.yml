@@ -43,6 +43,8 @@ jobs:
         run: cargo build --workspace --all-targets --locked
       - name: Test
         if: ${{ !matrix.check_only }}
+        env:
+          RUSTSCALE_DEBUG: ${{ matrix.os == 'ubuntu-latest' && '1' || '0' }}
         run: cargo test --workspace --locked
       - name: Clippy
         if: ${{ !matrix.check_only || matrix.os == 'windows-latest' }}

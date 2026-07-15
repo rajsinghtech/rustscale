@@ -7,7 +7,7 @@
 
 #![forbid(unsafe_code)]
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::process::{Command, Stdio};
 use std::{fmt, net::IpAddr};
 
@@ -261,11 +261,11 @@ trait CommandRunner: Send + Sync {
     fn run(&mut self, program: &str, args: &[String]) -> Result<(), RouterError>;
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[derive(Default)]
 struct SystemCommandRunner;
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 impl CommandRunner for SystemCommandRunner {
     fn run(&mut self, program: &str, args: &[String]) -> Result<(), RouterError> {
         let output = Command::new(program)

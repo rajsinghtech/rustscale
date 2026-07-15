@@ -1928,6 +1928,7 @@ mod tests {
                 support_disablement: Vec::new(),
                 resume: false,
             })
+            .await
             .unwrap();
         tokio::task::yield_now().await;
         stale_operation
@@ -2132,8 +2133,28 @@ mod tests {
                 "operation lock escaped at withdrawal await {point:?}"
             );
 
+            // Cancelling shutdown at the init join must not detach its
+            // JoinHandle. A retry observes the same task before router/profile
+            // teardown can proceed.
+            {
+                let mut join = Box::pin(lock.join_init_flight());
+                tokio::select! {
+                    biased;
+                    () = &mut join => panic!("init join completed while paused at {point:?}"),
+                    () = std::future::ready(()) => {}
+                }
+            }
+            assert!(
+                lock.init_flight_retained().await,
+                "cancelled shutdown lost init owner at {point:?}"
+            );
+
             pause.release.add_permits(1);
             lock.join_init_flight().await;
+            assert!(
+                !lock.init_flight_retained().await,
+                "completed init owner survived join at {point:?}"
+            );
             assert!(
                 stale_map.await.unwrap(),
                 "stale disabled map could republish after EOF at {point:?}"

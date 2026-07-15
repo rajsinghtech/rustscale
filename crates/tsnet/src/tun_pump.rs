@@ -1968,13 +1968,24 @@ fn clear_managed_security_block_reason(
         })?;
         managed.security_block_verified = true;
     }
-    // Verification is invalid the instant unblock starts. Any command error
-    // leaves attempted=true, verified=false, and the reason latched, forcing
-    // the next LAN-denied apply to re-block and re-verify before route work.
+    // Verification is invalid the instant unblock starts. A command,
+    // verification, or token-persistence error can be partial, so immediately
+    // restore and verify the emergency block before returning. The reason and
+    // attempted state stay latched for the caller's transactional rollback.
     managed.security_block_verified = false;
-    managed.router.unblock_direct().map_err(|error| {
-        TsnetError::Builder(format!("remove kernel direct-traffic block: {error}"))
-    })?;
+    if let Err(unblock_error) = managed.router.unblock_direct() {
+        return match managed.router.block_direct() {
+            Ok(()) => {
+                managed.security_block_verified = true;
+                Err(TsnetError::Builder(format!(
+                    "remove kernel direct-traffic block: {unblock_error}; emergency block restored and verified"
+                )))
+            }
+            Err(reblock_error) => Err(TsnetError::Builder(format!(
+                "fatal: remove kernel direct-traffic block: {unblock_error}; failed to restore emergency block: {reblock_error}"
+            ))),
+        };
+    }
     managed.security_block_attempted = false;
     managed.clear_security_reason(reason);
     Ok(false)
@@ -2159,8 +2170,14 @@ fn apply_managed_router_config(
             "route configuration failed: {error}"
         )));
     }
-    managed.exit_node = config.exit_node;
+    // Once catch-all installation succeeds, this owner must retain the
+    // underlay bypass even if emergency unblock fails. Conversely, removal
+    // keeps the old ownership until teardown and unblock have both completed.
+    if config.exit_node {
+        managed.exit_node = true;
+    }
     clear_managed_security_block_reason(managed, SecurityBlockReason::Transition)?;
+    managed.exit_node = config.exit_node;
     Ok(())
 }
 
@@ -2525,6 +2542,48 @@ mod tests {
         }
     }
 
+    struct FailedRecoveryRouter {
+        events: Arc<std::sync::Mutex<Vec<&'static str>>>,
+        block_calls: usize,
+    }
+
+    impl rustscale_router::Router for FailedRecoveryRouter {
+        fn up(&mut self) -> Result<(), rustscale_router::RouterError> {
+            Ok(())
+        }
+
+        fn set(
+            &mut self,
+            _config: &rustscale_router::RouterConfig,
+        ) -> Result<(), rustscale_router::RouterError> {
+            self.events.lock().unwrap().push("set");
+            Ok(())
+        }
+
+        fn block_direct(&mut self) -> Result<(), rustscale_router::RouterError> {
+            self.events.lock().unwrap().push("block");
+            self.block_calls += 1;
+            if self.block_calls > 1 {
+                Err(rustscale_router::RouterError::InvalidConfig(
+                    "injected reblock failure".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn unblock_direct(&mut self) -> Result<(), rustscale_router::RouterError> {
+            self.events.lock().unwrap().push("unblock");
+            Err(rustscale_router::RouterError::InvalidConfig(
+                "injected uncertain unblock".into(),
+            ))
+        }
+
+        fn close(&mut self) -> Result<(), rustscale_router::RouterError> {
+            Ok(())
+        }
+    }
+
     struct PendingProbe {
         replies_seen: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         polled: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<usize>>>,
@@ -2693,12 +2752,93 @@ mod tests {
             ..Default::default()
         };
         assert!(apply_managed_router_config(&mut managed, &config, true, false, true).is_err());
-        assert_eq!(*events.lock().unwrap(), ["block", "set", "unblock"]);
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["block", "set", "unblock", "block"]
+        );
         assert!(managed.security_block_attempted);
-        assert!(!managed.security_block_verified);
+        assert!(managed.security_block_verified);
         assert!(managed.has_security_reasons());
 
         apply_managed_router_config(&mut managed, &config, false, false, true).unwrap();
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["block", "set", "unblock", "block", "set", "unblock"]
+        );
+    }
+
+    #[test]
+    fn partial_unblock_and_failed_reblock_return_compound_fatal_latched() {
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut managed = ManagedRouter {
+            router: Box::new(FailedRecoveryRouter {
+                events: events.clone(),
+                block_calls: 0,
+            }),
+            tun_name: "rustscale-test0".into(),
+            exit_node: true,
+            security_block_attempted: false,
+            security_block_verified: false,
+            security_block_reasons: 0,
+        };
+        let exit = NodePrivate::generate().public();
+        let mut routes = RouteTable::default();
+        routes.set_exit_node(exit.clone());
+        let old_state = routes.exit_route_state();
+        routes.clear_exit_node();
+        let error = apply_managed_router_config(
+            &mut managed,
+            &rustscale_router::RouterConfig::default(),
+            false,
+            true,
+            false,
+        )
+        .expect_err("uncertain unblock and failed recovery must be fatal");
+        routes.restore_exit_route_state(old_state);
+        if managed.has_security_reasons() {
+            routes.block_exit_traffic();
+        }
+
+        assert!(error.to_string().contains("fatal:"));
+        assert!(error.to_string().contains("injected uncertain unblock"));
+        assert!(error.to_string().contains("injected reblock failure"));
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["block", "set", "unblock", "block"]
+        );
+        assert!(managed.exit_node, "underlay ownership escaped");
+        assert!(managed.security_block_attempted);
+        assert!(!managed.security_block_verified);
+        assert!(managed.has_security_reasons());
+        assert!(routes.exit_traffic_blocked());
+        assert_eq!(routes.exit_node(), Some(&exit));
+        assert!(routes.lookup("8.8.8.8".parse().unwrap()).is_none());
+    }
+
+    #[test]
+    fn exit_removal_partial_unblock_retains_owned_state_until_retry() {
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut managed = ManagedRouter {
+            router: Box::new(RetryUnblockRouter {
+                events: events.clone(),
+                fail_unblock_once: true,
+            }),
+            tun_name: "rustscale-test0".into(),
+            exit_node: true,
+            security_block_attempted: false,
+            security_block_verified: false,
+            security_block_reasons: 0,
+        };
+        let config = rustscale_router::RouterConfig::default();
+
+        assert!(apply_managed_router_config(&mut managed, &config, false, true, false).is_err());
+        assert!(managed.exit_node, "underlay ownership escaped");
+        assert!(managed.security_block_verified);
+        assert!(managed.has_security_reasons());
+
+        apply_managed_router_config(&mut managed, &config, false, true, false).unwrap();
+        assert!(!managed.exit_node);
+        assert!(!managed.has_security_reasons());
         assert_eq!(
             *events.lock().unwrap(),
             ["block", "set", "unblock", "block", "set", "unblock"]
@@ -2741,7 +2881,10 @@ mod tests {
     fn route_or_unblock_failure_retains_emergency_block() {
         for (failure, expected) in [
             (RouterFailure::Set, vec!["block", "set"]),
-            (RouterFailure::Unblock, vec!["block", "set", "unblock"]),
+            (
+                RouterFailure::Unblock,
+                vec!["block", "set", "unblock", "block"],
+            ),
         ] {
             let (mut managed, events) = ordered_managed_router(failure);
             let config = rustscale_router::RouterConfig {
@@ -2752,10 +2895,7 @@ mod tests {
             assert_eq!(*events.lock().unwrap(), expected);
             assert!(managed.exit_node);
             assert!(managed.security_block_attempted);
-            assert_eq!(
-                managed.security_block_verified,
-                matches!(failure, RouterFailure::Set)
-            );
+            assert!(managed.security_block_verified);
         }
     }
 

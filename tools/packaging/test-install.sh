@@ -26,8 +26,8 @@ make_unix_archive() {
     extension="$2"
     stage="$TMP/stage-$archive"
     mkdir -p "$stage"
-    printf '#!/bin/sh\necho rustscale-test\n' > "$stage/rustscale"
-    printf '#!/bin/sh\necho rustscaled-test\n' > "$stage/rustscaled"
+    printf '#!/bin/sh\necho %s\n' "$archive" > "$stage/rustscale"
+    printf '#!/bin/sh\necho rustscaled-%s\n' "$archive" > "$stage/rustscaled"
     chmod +x "$stage/rustscale" "$stage/rustscaled"
     printf 'shared library\n' > "$stage/librustscale.$extension"
     printf 'static library\n' > "$stage/librustscale.a"
@@ -58,12 +58,16 @@ run_case() {
     name="$1"
     uname_s="$2"
     uname_m="$3"
+    libc="$4"
+    expected_archive="$5"
     prefix="$TMP/prefix-$name"
     INSTALL_SERVICE=0 PREFIX="$prefix" RUSTSCALE_RELEASE_BASE="$RELEASE_BASE" \
         RUSTSCALE_UNAME_S="$uname_s" RUSTSCALE_UNAME_M="$uname_m" \
+        RUSTSCALE_LIBC="$libc" \
         sh "$ROOT/scripts/install.sh" --version 0.1.1 --tailscale-compatible >/dev/null
 
     test -x "$prefix/bin/rustscale"
+    test "$("$prefix/bin/rustscale")" = "$expected_archive"
     test -x "$prefix/bin/rustscaled"
     test -f "$prefix/bin/.rustscale-install-receipt-v1"
     grep -q '^installer=scripts/install.sh$' "$prefix/bin/.rustscale-install-receipt-v1"
@@ -75,21 +79,63 @@ run_case() {
     test -f "$prefix/include/rustscale.h"
 
     INSTALL_SERVICE=0 PREFIX="$prefix" RUSTSCALE_UNAME_S="$uname_s" \
-        RUSTSCALE_UNAME_M="$uname_m" sh "$ROOT/scripts/install.sh" --uninstall >/dev/null
+        RUSTSCALE_UNAME_M="$uname_m" RUSTSCALE_LIBC="$libc" \
+        sh "$ROOT/scripts/install.sh" --uninstall >/dev/null
     test ! -e "$prefix/bin/rustscale"
     test ! -e "$prefix/bin/.rustscale-install-receipt-v1"
     test ! -e "$prefix/bin/tailscale"
 }
 
-run_case darwin-amd64 Darwin x86_64
-run_case darwin-arm64 Darwin arm64
-run_case linux-amd64 Linux x86_64
-run_case linux-arm64 Linux aarch64
+run_case darwin-amd64 Darwin x86_64 ignored rustscale-universal-apple-darwin.tar.gz
+run_case darwin-arm64 Darwin arm64 ignored rustscale-universal-apple-darwin.tar.gz
+run_case linux-amd64-gnu Linux x86_64 gnu rustscale-x86_64-unknown-linux-gnu.tar.gz
+run_case linux-amd64-musl Linux x86_64 musl rustscale-x86_64-unknown-linux-musl.tar.gz
+run_case linux-arm64-gnu Linux aarch64 gnu rustscale-aarch64-unknown-linux-gnu.tar.gz
+
+# Exercise libc auto-detection deterministically through getconf and ldd.
+mkdir -p "$TMP/fake-libc-bin"
+cat > "$TMP/fake-libc-bin/getconf" <<'EOF'
+#!/bin/sh
+if [ "${TEST_LIBC:-}" = gnu ] && [ "$1" = GNU_LIBC_VERSION ]; then
+    echo 'glibc 2.39'
+    exit 0
+fi
+exit 1
+EOF
+cat > "$TMP/fake-libc-bin/ldd" <<'EOF'
+#!/bin/sh
+if [ "${TEST_LIBC:-}" = musl ]; then
+    echo 'musl libc (x86_64)' >&2
+    exit 1
+fi
+echo 'ldd (GNU libc) 2.39'
+EOF
+chmod +x "$TMP/fake-libc-bin/getconf" "$TMP/fake-libc-bin/ldd"
+for libc in gnu musl; do
+    prefix="$TMP/prefix-detected-$libc"
+    PATH="$TMP/fake-libc-bin:$PATH" TEST_LIBC="$libc" \
+        INSTALL_SERVICE=0 PREFIX="$prefix" RUSTSCALE_RELEASE_BASE="$RELEASE_BASE" \
+        RUSTSCALE_UNAME_S=Linux RUSTSCALE_UNAME_M=x86_64 \
+        sh "$ROOT/scripts/install.sh" --version 0.1.1 >/dev/null
+    test "$("$prefix/bin/rustscale")" = "rustscale-x86_64-unknown-linux-$libc.tar.gz"
+done
+
+# No aarch64-musl release is published; reject it before selecting an HTTP client.
+prefix="$TMP/prefix-linux-arm64-musl"
+if INSTALL_SERVICE=0 PREFIX="$prefix" RUSTSCALE_RELEASE_BASE="$TMP/does-not-exist" \
+    RUSTSCALE_UNAME_S=Linux RUSTSCALE_UNAME_M=aarch64 RUSTSCALE_LIBC=musl \
+    RUSTSCALE_HTTP_CLIENT=not-a-client \
+    sh "$ROOT/scripts/install.sh" --version 0.1.1 >"$TMP/aarch64-musl.out" 2>&1; then
+    echo "aarch64 musl unexpectedly selected a release archive" >&2
+    exit 1
+fi
+grep -q 'no published release archive for linux-aarch64-musl' "$TMP/aarch64-musl.out"
+test ! -e "$prefix/bin/rustscale"
 
 # Exercise the no-version latest-release path.
 prefix="$TMP/prefix-latest"
 INSTALL_SERVICE=0 PREFIX="$prefix" RUSTSCALE_RELEASE_BASE="$RELEASE_BASE" \
-    RUSTSCALE_UNAME_S=Linux RUSTSCALE_UNAME_M=x86_64 \
+    RUSTSCALE_UNAME_S=Linux RUSTSCALE_UNAME_M=x86_64 RUSTSCALE_LIBC=gnu \
     sh "$ROOT/scripts/install.sh" >/dev/null
 test -x "$prefix/bin/rustscale"
 
@@ -100,10 +146,11 @@ mkdir -p "$prefix/bin"
 printf 'official tailscale\n' > "$prefix/bin/tailscale"
 ln -s /opt/tailscale/tailscaled "$prefix/bin/tailscaled"
 INSTALL_SERVICE=0 PREFIX="$prefix" RUSTSCALE_RELEASE_BASE="$RELEASE_BASE" \
-    RUSTSCALE_UNAME_S=Linux RUSTSCALE_UNAME_M=x86_64 \
+    RUSTSCALE_UNAME_S=Linux RUSTSCALE_UNAME_M=x86_64 RUSTSCALE_LIBC=gnu \
     sh "$ROOT/scripts/install.sh" --version "$VERSION" >/dev/null
 INSTALL_SERVICE=0 PREFIX="$prefix" RUSTSCALE_UNAME_S=Linux \
-    RUSTSCALE_UNAME_M=x86_64 sh "$ROOT/scripts/install.sh" --uninstall >/dev/null
+    RUSTSCALE_UNAME_M=x86_64 RUSTSCALE_LIBC=gnu \
+    sh "$ROOT/scripts/install.sh" --uninstall >/dev/null
 grep -q 'official tailscale' "$prefix/bin/tailscale"
 test "$(readlink "$prefix/bin/tailscaled")" = /opt/tailscale/tailscaled
 
@@ -121,7 +168,7 @@ chmod +x "$TMP/fakebin/wget"
 prefix="$TMP/prefix-wget"
 PATH="$TMP/fakebin:$PATH" INSTALL_SERVICE=0 PREFIX="$prefix" \
     RUSTSCALE_HTTP_CLIENT=wget RUSTSCALE_RELEASE_BASE="$RELEASE_BASE" \
-    RUSTSCALE_UNAME_S=Linux RUSTSCALE_UNAME_M=x86_64 \
+    RUSTSCALE_UNAME_S=Linux RUSTSCALE_UNAME_M=x86_64 RUSTSCALE_LIBC=gnu \
     sh "$ROOT/scripts/install.sh" --version "$VERSION" >/dev/null
 test -x "$prefix/bin/rustscale"
 
@@ -129,7 +176,7 @@ test -x "$prefix/bin/rustscale"
 printf 'tamper\n' >> "$RELEASE_DIR/rustscale-x86_64-unknown-linux-gnu.tar.gz"
 prefix="$TMP/prefix-tampered"
 if INSTALL_SERVICE=0 PREFIX="$prefix" RUSTSCALE_RELEASE_BASE="$RELEASE_BASE" \
-    RUSTSCALE_UNAME_S=Linux RUSTSCALE_UNAME_M=x86_64 \
+    RUSTSCALE_UNAME_S=Linux RUSTSCALE_UNAME_M=x86_64 RUSTSCALE_LIBC=gnu \
     sh "$ROOT/scripts/install.sh" --version "$VERSION" >/dev/null 2>&1; then
     echo "tampered archive unexpectedly installed" >&2
     exit 1

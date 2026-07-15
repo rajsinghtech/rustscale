@@ -21,6 +21,8 @@
 #             auto for /usr/local or /usr; set to 0 to disable).
 #   GH_TOKEN / GITHUB_TOKEN
 #             GitHub token used to download assets from a private repository.
+#   RUSTSCALE_LIBC
+#             Override Linux libc detection: "gnu" or "musl".
 #
 # Flags:
 #   --uninstall       Remove installed files.
@@ -62,6 +64,8 @@ Environment variables:
             Install and start the system daemon when possible (default: auto).
   GH_TOKEN / GITHUB_TOKEN
             GitHub token for private release assets.
+  RUSTSCALE_LIBC
+            Override Linux libc detection: "gnu" or "musl".
 
 Flags:
   --uninstall       Remove installed files.
@@ -135,6 +139,7 @@ detect_platform() {
     ARCH=
     ARCHIVE=
     DYEXT=
+    LIBC=
 
     uname_s="${RUSTSCALE_UNAME_S:-$(uname -s)}"
     uname_m="${RUSTSCALE_UNAME_M:-$(uname -m)}"
@@ -157,17 +162,76 @@ detect_platform() {
             ;;
     esac
 
+    if [ "$OS" = linux ]; then
+        if [ "${UNINSTALL:-0}" = 1 ]; then
+            LIBC=uninstall
+        else
+            detect_linux_libc
+        fi
+    fi
+
     # Map to the release archive naming convention from .github/workflows/release.yml.
-    case "$OS-$ARCH" in
-        darwin-x86_64)  ARCHIVE="rustscale-universal-apple-darwin.tar.gz" ;;
-        darwin-aarch64) ARCHIVE="rustscale-universal-apple-darwin.tar.gz" ;;
-        linux-x86_64)   ARCHIVE="rustscale-x86_64-unknown-linux-gnu.tar.gz" ;;
-        linux-aarch64)  ARCHIVE="rustscale-aarch64-unknown-linux-gnu.tar.gz" ;;
+    case "$OS-$ARCH-${LIBC:-none}" in
+        darwin-x86_64-none) ARCHIVE="rustscale-universal-apple-darwin.tar.gz" ;;
+        darwin-aarch64-none) ARCHIVE="rustscale-universal-apple-darwin.tar.gz" ;;
+        linux-x86_64-gnu) ARCHIVE="rustscale-x86_64-unknown-linux-gnu.tar.gz" ;;
+        linux-x86_64-musl) ARCHIVE="rustscale-x86_64-unknown-linux-musl.tar.gz" ;;
+        linux-aarch64-gnu) ARCHIVE="rustscale-aarch64-unknown-linux-gnu.tar.gz" ;;
+        linux-aarch64-musl)
+            echo "rustscale: no published release archive for linux-aarch64-musl" >&2
+            exit 1
+            ;;
+        linux-x86_64-uninstall|linux-aarch64-uninstall) ;;
         *)
-            echo "rustscale: no release archive for $OS-$ARCH" >&2
+            echo "rustscale: no release archive for $OS-$ARCH-${LIBC:-unknown}" >&2
             exit 1
             ;;
     esac
+}
+
+# Detect the Linux C library without executing a downloaded binary. The
+# override mirrors the existing uname test hooks and makes installer fixtures
+# deterministic. Unknown libc implementations fail closed.
+detect_linux_libc() {
+    case "${RUSTSCALE_LIBC:-}" in
+        gnu|musl) LIBC="$RUSTSCALE_LIBC"; return ;;
+        "") ;;
+        *)
+            echo "rustscale: unsupported RUSTSCALE_LIBC '${RUSTSCALE_LIBC}' (expected gnu or musl)" >&2
+            exit 1
+            ;;
+    esac
+
+    if command -v getconf >/dev/null 2>&1 \
+        && getconf GNU_LIBC_VERSION >/dev/null 2>&1; then
+        LIBC=gnu
+        return
+    fi
+
+    if command -v ldd >/dev/null 2>&1; then
+        ldd_version=$(LC_ALL=C ldd --version 2>&1 || true)
+        ldd_lower=$(printf '%s\n' "$ldd_version" | tr '[:upper:]' '[:lower:]')
+        case "$ldd_lower" in
+            *musl*) LIBC=musl; return ;;
+            *glibc*|*"gnu libc"*|*"free software foundation"*) LIBC=gnu; return ;;
+        esac
+    fi
+
+    for loader in /lib/ld-musl-*.so.1 /lib64/ld-musl-*.so.1 /usr/lib/ld-musl-*.so.1; do
+        if [ -e "$loader" ]; then
+            LIBC=musl
+            return
+        fi
+    done
+    for loader in /lib64/ld-linux-*.so.* /lib/ld-linux-*.so.* /lib/*-linux-gnu/ld-linux-*.so.*; do
+        if [ -e "$loader" ]; then
+            LIBC=gnu
+            return
+        fi
+    done
+
+    echo "rustscale: could not determine Linux libc (gnu or musl); set RUSTSCALE_LIBC explicitly" >&2
+    exit 1
 }
 
 # Decide how to escalate for the install copy. The download itself never

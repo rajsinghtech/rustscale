@@ -93,7 +93,7 @@ async fn dial_addr(addr: &str) -> std::io::Result<TcpStream> {
     // skips the is_localhost check, which causes interface-binding failures
     // when connecting to 127.0.0.1 with netns enabled.
     if let Some((host, port)) = split_host_port(addr) {
-        return rustscale_netns::dial_tcp(&host, port).await;
+        return rustscale_netns::dial_system_tcp(&host, port).await;
     }
     // Fallback: let tokio resolve it directly.
     tokio::net::TcpStream::connect(addr).await

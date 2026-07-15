@@ -13,6 +13,15 @@ use std::{fmt, net::IpAddr};
 
 use rustscale_tsaddr::IpPrefix;
 
+/// Physical interface used by host routes that must stay outside a full tunnel.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnderlayRoute {
+    /// Interface name from the OS default-route snapshot.
+    pub interface: String,
+    /// Gateway for that default route, when the platform reports one.
+    pub gateway: Option<IpAddr>,
+}
+
 /// The subset of Tailscale's router configuration needed by rustscale.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RouterConfig {
@@ -22,6 +31,9 @@ pub struct RouterConfig {
     pub routes: Vec<IpPrefix>,
     /// Prefixes that bypass the TUN interface (Linux throw routes in table 52).
     pub local_routes: Vec<IpPrefix>,
+    /// Physical interface for bypass routes. Required by macOS; Linux throw
+    /// routes only use it as desired-state identity for interface churn.
+    pub underlay: Option<UnderlayRoute>,
     /// Whether default-route overrides for a selected exit node are installed.
     pub exit_node: bool,
 }
@@ -35,10 +47,41 @@ pub enum RouterOperation {
     RemoveAddr(IpAddr),
     AddRoute(IpPrefix),
     RemoveRoute(IpPrefix),
-    AddLocalRoute(IpPrefix),
-    RemoveLocalRoute(IpPrefix),
+    AddLocalRoute(IpPrefix, Option<UnderlayRoute>),
+    RemoveLocalRoute(IpPrefix, Option<UnderlayRoute>),
+    ChangeLocalRoute {
+        prefix: IpPrefix,
+        from: Option<UnderlayRoute>,
+        to: Option<UnderlayRoute>,
+    },
     AddExitRoutes,
     RemoveExitRoutes,
+}
+
+impl RouterOperation {
+    fn inverse(&self) -> Self {
+        match self {
+            Self::Up => Self::Down,
+            Self::Down => Self::Up,
+            Self::AddAddr(address) => Self::RemoveAddr(*address),
+            Self::RemoveAddr(address) => Self::AddAddr(*address),
+            Self::AddRoute(prefix) => Self::RemoveRoute(*prefix),
+            Self::RemoveRoute(prefix) => Self::AddRoute(*prefix),
+            Self::AddLocalRoute(prefix, underlay) => {
+                Self::RemoveLocalRoute(*prefix, underlay.clone())
+            }
+            Self::RemoveLocalRoute(prefix, underlay) => {
+                Self::AddLocalRoute(*prefix, underlay.clone())
+            }
+            Self::ChangeLocalRoute { prefix, from, to } => Self::ChangeLocalRoute {
+                prefix: *prefix,
+                from: to.clone(),
+                to: from.clone(),
+            },
+            Self::AddExitRoutes => Self::RemoveExitRoutes,
+            Self::RemoveExitRoutes => Self::AddExitRoutes,
+        }
+    }
 }
 
 /// The pure delta between two router configurations.
@@ -48,8 +91,9 @@ pub struct RouterDiff {
     pub add_addrs: Vec<IpAddr>,
     pub remove_routes: Vec<IpPrefix>,
     pub add_routes: Vec<IpPrefix>,
-    pub remove_local_routes: Vec<IpPrefix>,
-    pub add_local_routes: Vec<IpPrefix>,
+    pub remove_local_routes: Vec<(IpPrefix, Option<UnderlayRoute>)>,
+    pub add_local_routes: Vec<(IpPrefix, Option<UnderlayRoute>)>,
+    pub change_local_routes: Vec<(IpPrefix, Option<UnderlayRoute>, Option<UnderlayRoute>)>,
     pub remove_exit_routes: bool,
     pub add_exit_routes: bool,
 }
@@ -61,17 +105,31 @@ impl RouterDiff {
         if self.remove_exit_routes {
             operations.push(RouterOperation::RemoveExitRoutes);
         }
+        // Add or retarget bypasses before removing stale ones. In exit-node
+        // mode this avoids a transient route loop while destinations churn.
+        operations.extend(
+            self.add_local_routes
+                .iter()
+                .cloned()
+                .map(|(prefix, underlay)| RouterOperation::AddLocalRoute(prefix, underlay)),
+        );
+        operations.extend(
+            self.change_local_routes
+                .iter()
+                .cloned()
+                .map(|(prefix, from, to)| RouterOperation::ChangeLocalRoute { prefix, from, to }),
+        );
+        operations.extend(
+            self.remove_local_routes
+                .iter()
+                .cloned()
+                .map(|(prefix, underlay)| RouterOperation::RemoveLocalRoute(prefix, underlay)),
+        );
         operations.extend(
             self.remove_routes
                 .iter()
                 .copied()
                 .map(RouterOperation::RemoveRoute),
-        );
-        operations.extend(
-            self.remove_local_routes
-                .iter()
-                .copied()
-                .map(RouterOperation::RemoveLocalRoute),
         );
         operations.extend(
             self.remove_addrs
@@ -86,13 +144,8 @@ impl RouterDiff {
                 .copied()
                 .map(RouterOperation::AddRoute),
         );
-        operations.extend(
-            self.add_local_routes
-                .iter()
-                .copied()
-                .map(RouterOperation::AddLocalRoute),
-        );
         if self.add_exit_routes {
+            // Catch-all routes are always last, after every required bypass.
             operations.push(RouterOperation::AddExitRoutes);
         }
         operations
@@ -112,8 +165,8 @@ impl RouterDiff {
         operations.extend(
             self.remove_local_routes
                 .iter()
-                .copied()
-                .map(RouterOperation::RemoveLocalRoute),
+                .cloned()
+                .map(|(prefix, underlay)| RouterOperation::RemoveLocalRoute(prefix, underlay)),
         );
         operations.extend(
             self.remove_addrs
@@ -126,16 +179,115 @@ impl RouterDiff {
     }
 }
 
+impl RouterConfig {
+    fn normalized(&self) -> Result<Self, RouterError> {
+        let mut local_addrs: Vec<_> = self.local_addrs.iter().copied().map(normalize_ip).collect();
+        local_addrs.sort_unstable();
+        local_addrs.dedup();
+
+        let mut routes = normalize_prefixes(&self.routes)?;
+        let mut local_routes = normalize_prefixes(&self.local_routes)?;
+        rustscale_tsaddr::sort_prefixes(&mut routes);
+        rustscale_tsaddr::sort_prefixes(&mut local_routes);
+        routes.dedup();
+        local_routes.dedup();
+
+        let underlay = self.underlay.as_ref().map(|underlay| UnderlayRoute {
+            interface: underlay.interface.trim().to_owned(),
+            gateway: underlay.gateway.map(normalize_ip),
+        });
+        if underlay
+            .as_ref()
+            .is_some_and(|underlay| underlay.interface.is_empty())
+        {
+            return Err(RouterError::InvalidConfig(
+                "underlay interface must not be empty".into(),
+            ));
+        }
+
+        Ok(Self {
+            local_addrs,
+            routes,
+            local_routes,
+            underlay,
+            exit_node: self.exit_node,
+        })
+    }
+}
+
+fn normalize_prefixes(prefixes: &[IpPrefix]) -> Result<Vec<IpPrefix>, RouterError> {
+    prefixes
+        .iter()
+        .copied()
+        .map(|prefix| {
+            let ip = normalize_ip(prefix.ip);
+            let max = if ip.is_ipv4() { 32 } else { 128 };
+            if prefix.bits > max {
+                return Err(RouterError::InvalidConfig(format!(
+                    "invalid prefix length in {ip}/{}",
+                    prefix.bits
+                )));
+            }
+            let ip = match ip {
+                IpAddr::V4(ip) => {
+                    let mask = u32::MAX
+                        .checked_shl(u32::from(32 - prefix.bits))
+                        .unwrap_or(0);
+                    IpAddr::V4((u32::from(ip) & mask).into())
+                }
+                IpAddr::V6(ip) => {
+                    let mask = u128::MAX
+                        .checked_shl(u32::from(128 - prefix.bits))
+                        .unwrap_or(0);
+                    IpAddr::V6((u128::from(ip) & mask).into())
+                }
+            };
+            Ok(IpPrefix {
+                ip,
+                bits: prefix.bits,
+            })
+        })
+        .collect()
+}
+
+fn normalize_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(ip) => ip.to_ipv4_mapped().map_or(IpAddr::V6(ip), IpAddr::V4),
+        ip => ip,
+    }
+}
+
 /// Compute the configuration delta without performing any OS operation.
+/// Callers that apply the result first normalize with [`RouterConfig::normalized`].
 pub fn diff(previous: Option<&RouterConfig>, next: &RouterConfig) -> RouterDiff {
     let previous = previous.cloned().unwrap_or_default();
+    let removed_local = prefix_difference(&previous.local_routes, &next.local_routes);
+    let added_local = prefix_difference(&next.local_routes, &previous.local_routes);
+    let underlay_changed = previous.underlay != next.underlay;
+    let change_local_routes = if underlay_changed {
+        previous
+            .local_routes
+            .iter()
+            .filter(|prefix| next.local_routes.contains(prefix))
+            .map(|prefix| (*prefix, previous.underlay.clone(), next.underlay.clone()))
+            .collect()
+    } else {
+        Vec::new()
+    };
     RouterDiff {
         remove_addrs: vec_difference(&previous.local_addrs, &next.local_addrs),
         add_addrs: vec_difference(&next.local_addrs, &previous.local_addrs),
         remove_routes: prefix_difference(&previous.routes, &next.routes),
         add_routes: prefix_difference(&next.routes, &previous.routes),
-        remove_local_routes: prefix_difference(&previous.local_routes, &next.local_routes),
-        add_local_routes: prefix_difference(&next.local_routes, &previous.local_routes),
+        remove_local_routes: removed_local
+            .into_iter()
+            .map(|prefix| (prefix, previous.underlay.clone()))
+            .collect(),
+        add_local_routes: added_local
+            .into_iter()
+            .map(|prefix| (prefix, next.underlay.clone()))
+            .collect(),
+        change_local_routes,
         remove_exit_routes: previous.exit_node && !next.exit_node,
         add_exit_routes: !previous.exit_node && next.exit_node,
     }
@@ -158,6 +310,7 @@ fn prefix_difference(left: &[IpPrefix], right: &[IpPrefix]) -> Vec<IpPrefix> {
 /// An error returned while applying a route operation.
 #[derive(Debug)]
 pub enum RouterError {
+    InvalidConfig(String),
     Command {
         program: String,
         args: Vec<String>,
@@ -232,6 +385,7 @@ impl RouterError {
 impl fmt::Display for RouterError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidConfig(error) => write!(f, "invalid router configuration: {error}"),
             Self::Command {
                 program,
                 args,
@@ -335,6 +489,30 @@ impl<P: Platform, R: CommandRunner> StatefulRouter<P, R> {
     }
 
     fn apply(&mut self, operations: &[RouterOperation]) -> Result<(), RouterError> {
+        let mut rollback = Vec::new();
+        for operation in operations {
+            let commands = self.platform.commands(operation);
+            let inverse = self.platform.commands(&operation.inverse());
+            debug_assert_eq!(commands.len(), inverse.len());
+            for (index, (program, args)) in commands.into_iter().enumerate() {
+                match self.runner.run(&program, &args) {
+                    Ok(()) => rollback.push(inverse[index].clone()),
+                    Err(error) if error.non_fatal() => {}
+                    Err(error) => {
+                        // Restore every command that this transaction changed,
+                        // including an earlier command from the same operation.
+                        for (program, args) in rollback.into_iter().rev() {
+                            let _ = self.runner.run(&program, &args);
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_teardown(&mut self, operations: &[RouterOperation]) -> Result<(), RouterError> {
         let commands: Vec<_> = operations
             .iter()
             .flat_map(|operation| self.platform.commands(operation))
@@ -362,9 +540,10 @@ impl<P: Platform, R: CommandRunner> Router for StatefulRouter<P, R> {
     }
 
     fn set(&mut self, config: &RouterConfig) -> Result<(), RouterError> {
-        let delta = diff(self.config.as_ref(), config);
+        let config = config.normalized()?;
+        let delta = diff(self.config.as_ref(), &config);
         self.apply(&delta.operations())?;
-        self.config = Some(config.clone());
+        self.config = Some(config);
         Ok(())
     }
 
@@ -374,9 +553,11 @@ impl<P: Platform, R: CommandRunner> Router for StatefulRouter<P, R> {
         }
         let empty = RouterConfig::default();
         let delta = diff(self.config.as_ref(), &empty);
-        let result = self.apply(&delta.teardown_operations());
-        self.config = None;
-        self.is_up = false;
+        let result = self.apply_teardown(&delta.teardown_operations());
+        if result.is_ok() {
+            self.config = None;
+            self.is_up = false;
+        }
         result
     }
 }
@@ -414,6 +595,35 @@ impl DarwinPlatform {
         )
     }
 
+    fn local_route(
+        verb: &str,
+        prefix: IpPrefix,
+        underlay: Option<&UnderlayRoute>,
+    ) -> Option<(String, Vec<String>)> {
+        let underlay = underlay?;
+        let family = if prefix.ip.is_ipv4() {
+            "-inet"
+        } else {
+            "-inet6"
+        };
+        let mut args = vec![
+            "-q".into(),
+            "-n".into(),
+            verb.into(),
+            family.into(),
+            prefix.to_string(),
+        ];
+        if underlay
+            .gateway
+            .is_some_and(|gateway| gateway.is_ipv4() == prefix.ip.is_ipv4())
+        {
+            args.push(underlay.gateway.expect("checked gateway").to_string());
+        } else {
+            args.extend(["-iface".into(), underlay.interface.clone()]);
+        }
+        Some(("route".into(), args))
+    }
+
     fn address(&self, add: bool, address: IpAddr) -> (String, Vec<String>) {
         let family = if address.is_ipv4() { "inet" } else { "inet6" };
         let bits = if address.is_ipv4() { 32 } else { 128 };
@@ -445,8 +655,24 @@ impl Platform for DarwinPlatform {
             RouterOperation::RemoveAddr(address) => vec![self.address(false, *address)],
             RouterOperation::AddRoute(prefix) => vec![self.route("add", *prefix)],
             RouterOperation::RemoveRoute(prefix) => vec![self.route("delete", *prefix)],
-            // macOS has no phase-1 equivalent of Linux throw routes.
-            RouterOperation::AddLocalRoute(_) | RouterOperation::RemoveLocalRoute(_) => vec![],
+            RouterOperation::AddLocalRoute(prefix, underlay) => {
+                Self::local_route("add", *prefix, underlay.as_ref())
+                    .into_iter()
+                    .collect()
+            }
+            RouterOperation::RemoveLocalRoute(prefix, underlay) => {
+                Self::local_route("delete", *prefix, underlay.as_ref())
+                    .into_iter()
+                    .collect()
+            }
+            RouterOperation::ChangeLocalRoute { prefix, from, to } => match (from, to) {
+                (Some(_), Some(to)) => Self::local_route("change", *prefix, Some(to)),
+                (None, Some(to)) => Self::local_route("add", *prefix, Some(to)),
+                (Some(from), None) => Self::local_route("delete", *prefix, Some(from)),
+                (None, None) => None,
+            }
+            .into_iter()
+            .collect(),
             RouterOperation::AddExitRoutes => self.exit_routes("add"),
             RouterOperation::RemoveExitRoutes => self.exit_routes("delete"),
         }
@@ -611,7 +837,7 @@ impl Platform for LinuxPlatform {
             })],
             RouterOperation::AddRoute(prefix) => vec![self.route("add", *prefix)],
             RouterOperation::RemoveRoute(prefix) => vec![self.route("del", *prefix)],
-            RouterOperation::AddLocalRoute(prefix) => vec![("ip".into(), {
+            RouterOperation::AddLocalRoute(prefix, _) => vec![("ip".into(), {
                 let mut args = Vec::new();
                 if prefix.ip.is_ipv6() {
                     args.push("-6".into());
@@ -626,7 +852,7 @@ impl Platform for LinuxPlatform {
                 ]);
                 args
             })],
-            RouterOperation::RemoveLocalRoute(prefix) => vec![("ip".into(), {
+            RouterOperation::RemoveLocalRoute(prefix, _) => vec![("ip".into(), {
                 let mut args = Vec::new();
                 if prefix.ip.is_ipv6() {
                     args.push("-6".into());
@@ -641,6 +867,7 @@ impl Platform for LinuxPlatform {
                 ]);
                 args
             })],
+            RouterOperation::ChangeLocalRoute { .. } => vec![],
             RouterOperation::AddExitRoutes => vec![
                 self.route("add", rustscale_tsaddr::all_ipv4()),
                 self.route("add", rustscale_tsaddr::all_ipv6()),
@@ -759,9 +986,10 @@ impl Router for FakeRouter {
     }
 
     fn set(&mut self, config: &RouterConfig) -> Result<(), RouterError> {
+        let config = config.normalized()?;
         self.operations
-            .extend(diff(self.config.as_ref(), config).operations());
-        self.config = Some(config.clone());
+            .extend(diff(self.config.as_ref(), &config).operations());
+        self.config = Some(config);
         Ok(())
     }
 
@@ -791,6 +1019,7 @@ mod tests {
             local_addrs: vec![IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1))],
             routes: vec![prefix("100.64.0.0/10")],
             local_routes: vec![],
+            underlay: None,
             exit_node: false,
         }
     }
@@ -1015,15 +1244,15 @@ mod tests {
         assert_eq!(
             router.operations(),
             [
+                RouterOperation::AddLocalRoute(prefix("192.168.0.0/16"), None),
                 RouterOperation::RemoveRoute(prefix("100.64.0.0/10")),
                 RouterOperation::AddRoute(prefix("10.0.0.0/8")),
-                RouterOperation::AddLocalRoute(prefix("192.168.0.0/16")),
             ]
         );
     }
 
     #[test]
-    fn local_route_diff_removes_before_adding_replacements() {
+    fn local_route_diff_adds_before_removing_replacements() {
         let mut previous = config();
         previous.local_routes = vec![prefix("192.168.0.0/16")];
         let mut next = config();
@@ -1032,8 +1261,8 @@ mod tests {
         assert_eq!(
             diff(Some(&previous), &next).operations(),
             [
-                RouterOperation::RemoveLocalRoute(prefix("192.168.0.0/16")),
-                RouterOperation::AddLocalRoute(prefix("10.0.0.0/8")),
+                RouterOperation::AddLocalRoute(prefix("10.0.0.0/8"), None),
+                RouterOperation::RemoveLocalRoute(prefix("192.168.0.0/16"), None),
             ]
         );
     }
@@ -1475,6 +1704,214 @@ mod tests {
         assert_eq!(router.operations(), [RouterOperation::RemoveExitRoutes]);
     }
 
+    #[derive(Default)]
+    struct TransactionRunner {
+        commands: Vec<String>,
+        fail_at: Option<usize>,
+    }
+
+    impl CommandRunner for TransactionRunner {
+        fn run(&mut self, _program: &str, args: &[String]) -> Result<(), RouterError> {
+            let index = self.commands.len();
+            self.commands.push(args.join(" "));
+            if self.fail_at == Some(index) {
+                return Err(RouterError::Command {
+                    program: "route-test".into(),
+                    args: args.to_vec(),
+                    exit_code: Some(1),
+                    stderr: "injected failure".into(),
+                });
+            }
+            Ok(())
+        }
+    }
+
+    struct TransactionPlatform;
+
+    impl Platform for TransactionPlatform {
+        fn commands(&self, operation: &RouterOperation) -> Vec<CommandSpec> {
+            let command = match operation {
+                RouterOperation::AddLocalRoute(prefix, _) => format!("add {prefix}"),
+                RouterOperation::RemoveLocalRoute(prefix, _) => format!("remove {prefix}"),
+                RouterOperation::ChangeLocalRoute { prefix, to, .. } => format!(
+                    "change {prefix} {}",
+                    to.as_ref().map_or("none", |to| to.interface.as_str())
+                ),
+                _ => return Vec::new(),
+            };
+            vec![("route-test".into(), vec![command])]
+        }
+    }
+
+    #[test]
+    fn endpoint_churn_adds_new_bypass_before_removing_stale() {
+        let mut previous = RouterConfig {
+            local_routes: vec![prefix("192.0.2.10/32")],
+            ..Default::default()
+        };
+        previous.exit_node = true;
+        let mut next = previous.clone();
+        next.local_routes = vec![prefix("192.0.2.20/32")];
+
+        assert_eq!(
+            diff(Some(&previous), &next).operations(),
+            [
+                RouterOperation::AddLocalRoute(prefix("192.0.2.20/32"), None),
+                RouterOperation::RemoveLocalRoute(prefix("192.0.2.10/32"), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn partial_endpoint_churn_rolls_back_and_retains_previous_state() {
+        let mut router = StatefulRouter::new(TransactionPlatform, TransactionRunner::default());
+        let previous = RouterConfig {
+            local_routes: vec![prefix("192.0.2.10/32")],
+            exit_node: true,
+            ..Default::default()
+        };
+        router.set(&previous).unwrap();
+        let start = router.runner.commands.len();
+        router.runner.fail_at = Some(start + 1);
+        let next = RouterConfig {
+            local_routes: vec![prefix("192.0.2.20/32")],
+            exit_node: true,
+            ..Default::default()
+        };
+
+        assert!(router.set(&next).is_err());
+        assert_eq!(router.config, Some(previous));
+        assert_eq!(
+            &router.runner.commands[start..],
+            [
+                "add 192.0.2.20/32",
+                "remove 192.0.2.10/32",
+                "remove 192.0.2.20/32",
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_teardown_retains_state_for_retry() {
+        let mut router = StatefulRouter::new(TransactionPlatform, TransactionRunner::default());
+        let installed = RouterConfig {
+            local_routes: vec![prefix("192.0.2.10/32")],
+            exit_node: true,
+            ..Default::default()
+        };
+        router.is_up = true;
+        router.set(&installed).unwrap();
+        router.runner.fail_at = Some(router.runner.commands.len());
+
+        assert!(router.close().is_err());
+        assert_eq!(router.config, Some(installed));
+        assert!(router.is_up);
+        router.runner.fail_at = None;
+        router.close().unwrap();
+        assert!(router.config.is_none());
+        assert!(!router.is_up);
+    }
+
+    #[test]
+    fn interface_churn_retargets_existing_bypasses() {
+        let prefix = prefix("2001:db8::1/128");
+        let previous = RouterConfig {
+            local_routes: vec![prefix],
+            underlay: Some(UnderlayRoute {
+                interface: "en0".into(),
+                gateway: Some("192.0.2.1".parse().unwrap()),
+            }),
+            exit_node: true,
+            ..Default::default()
+        };
+        let next = RouterConfig {
+            underlay: Some(UnderlayRoute {
+                interface: "en1".into(),
+                gateway: Some("192.0.2.254".parse().unwrap()),
+            }),
+            ..previous.clone()
+        };
+        assert_eq!(
+            diff(Some(&previous), &next).operations(),
+            [RouterOperation::ChangeLocalRoute {
+                prefix,
+                from: Some(UnderlayRoute {
+                    interface: "en0".into(),
+                    gateway: Some("192.0.2.1".parse().unwrap()),
+                }),
+                to: Some(UnderlayRoute {
+                    interface: "en1".into(),
+                    gateway: Some("192.0.2.254".parse().unwrap()),
+                }),
+            }]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_bypass_uses_gateway_for_matching_family_and_interface_otherwise() {
+        let platform = DarwinPlatform::new("utun9");
+        let underlay = UnderlayRoute {
+            interface: "en0".into(),
+            gateway: Some("192.0.2.1".parse().unwrap()),
+        };
+        assert_eq!(
+            platform.commands(&RouterOperation::AddLocalRoute(
+                prefix("198.51.100.10/32"),
+                Some(underlay.clone()),
+            )),
+            [(
+                "route".into(),
+                vec![
+                    "-q".into(),
+                    "-n".into(),
+                    "add".into(),
+                    "-inet".into(),
+                    "198.51.100.10/32".into(),
+                    "192.0.2.1".into(),
+                ]
+            )]
+        );
+        assert_eq!(
+            platform.commands(&RouterOperation::AddLocalRoute(
+                prefix("2001:db8::10/128"),
+                Some(underlay),
+            )),
+            [(
+                "route".into(),
+                vec![
+                    "-q".into(),
+                    "-n".into(),
+                    "add".into(),
+                    "-inet6".into(),
+                    "2001:db8::10/128".into(),
+                    "-iface".into(),
+                    "en0".into(),
+                ]
+            )]
+        );
+    }
+
+    #[test]
+    fn normalization_masks_sorts_deduplicates_and_unmaps_v4() {
+        let mut router = FakeRouter::default();
+        router
+            .set(&RouterConfig {
+                local_addrs: vec!["::ffff:192.0.2.1".parse().unwrap()],
+                local_routes: vec![prefix("192.168.1.99/24"), prefix("192.168.1.0/24")],
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            router.config.unwrap(),
+            RouterConfig {
+                local_addrs: vec!["192.0.2.1".parse().unwrap()],
+                local_routes: vec![prefix("192.168.1.0/24")],
+                ..Default::default()
+            }
+        );
+    }
+
     #[test]
     fn close_removes_everything_and_is_idempotent() {
         let mut router = FakeRouter::default();
@@ -1490,7 +1927,7 @@ mod tests {
             [
                 RouterOperation::RemoveExitRoutes,
                 RouterOperation::RemoveRoute(prefix("100.64.0.0/10")),
-                RouterOperation::RemoveLocalRoute(prefix("192.168.0.0/16")),
+                RouterOperation::RemoveLocalRoute(prefix("192.168.0.0/16"), None),
                 RouterOperation::RemoveAddr(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1))),
                 RouterOperation::Down,
             ]

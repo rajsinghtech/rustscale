@@ -15,6 +15,7 @@ rustscale-neterror = { path = "../neterror", version = "0.1.1" }
 rustscale-tsaddr = { path = "../tsaddr", version = "0.1.1" }
 rustscale-bakedroots = { path = "../bakedroots", version = "0.1.1" }
 rustscale-tsdial = { path = "../tsdial", version = "0.1.1" }
+rustscale-netns.workspace = true
 rustscale-envknob = { path = "../envknob", version = "0.1.1" }
 rustscale-dnsname = { path = "../dnsname", version = "0.1.1" }
 thiserror.workspace = true

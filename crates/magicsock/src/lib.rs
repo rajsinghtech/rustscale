@@ -1734,6 +1734,16 @@ impl Magicsock {
         ))
     }
 
+    /// Reapply the process underlay policy to the long-lived UDP socket.
+    /// Used when exit-node mode starts or the physical default interface
+    /// changes after the socket was created.
+    pub fn refresh_underlay_binding(&self) -> std::io::Result<()> {
+        if let Some(socket) = self.inner.udp.as_deref() {
+            rustscale_netns::configure_udp_socket(socket)?;
+        }
+        Ok(())
+    }
+
     /// Our node public key.
     pub fn node_public(&self) -> NodePublic {
         self.inner

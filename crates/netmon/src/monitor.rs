@@ -283,6 +283,25 @@ impl MonitorHandle {
             .clone()
     }
 
+    /// Register a callback for the lifetime of this monitor handle.
+    ///
+    /// This is intended for owner components whose callback and monitor share
+    /// exactly the same lifecycle and therefore do not need an unregister
+    /// token.
+    pub fn register_owned_change_callback<F, Fut>(&self, callback: F)
+    where
+        F: Fn(ChangeDelta) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let id = self.shared.next_callback_id.fetch_add(1, Ordering::SeqCst);
+        let boxed: ChangeFunc = Arc::new(move |delta| Box::pin(callback(delta)));
+        self.shared
+            .callbacks
+            .write()
+            .expect("callback lock poisoned")
+            .insert(id, boxed);
+    }
+
     /// Register a change callback. The callback is invoked (fire-and-forget,
     /// in its own task) for each detected change. Returns a
     /// [`ChangeCallbackHandle`] that unregisters the callback when dropped.

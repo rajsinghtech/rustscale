@@ -105,7 +105,7 @@ pub(crate) use filter_build::{
 };
 pub(crate) use link_monitor::{
     connect_home_derp, spawn_hostinfo_update_loop, spawn_link_monitor,
-    spawn_periodic_endpoint_updates,
+    spawn_periodic_endpoint_updates, LinkRouteSync,
 };
 pub(crate) use map_update::{
     exit_node_pref, set_exit_node_pref, spawn_map_update_task, ExitNodeSelection, KeyRotationCtx,
@@ -1349,7 +1349,6 @@ impl Server {
             }
             drop(selection);
             if let Some(router) = inner.router.as_ref() {
-                let derp_map = inner.magicsock.get_derp_map();
                 let control_url = if prefs.ControlURL.is_empty() {
                     DEFAULT_CONTROL_URL
                 } else {
@@ -1359,7 +1358,7 @@ impl Server {
                     router,
                     &inner.tailscale_ips,
                     &routes,
-                    derp_map.as_ref(),
+                    &inner.magicsock,
                     control_url,
                     prefs.ExitNodeAllowLANAccess,
                 )

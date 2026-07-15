@@ -436,13 +436,12 @@ impl Server {
         let mut routes = inner.route_table.write().await;
         routes.set_exit_node(peer_key);
         if let Some(router) = inner.router.as_ref() {
-            let derp_map = inner.magicsock.get_derp_map();
             let exit_node_allow_lan_access = inner.prefs.read().await.ExitNodeAllowLANAccess;
             sync_router(
                 router,
                 &inner.tailscale_ips,
                 &routes,
-                derp_map.as_ref(),
+                &inner.magicsock,
                 &self.config.control_url,
                 exit_node_allow_lan_access,
             )?;
@@ -478,13 +477,12 @@ impl Server {
         let mut routes = inner.route_table.write().await;
         routes.clear_exit_node();
         if let Some(router) = inner.router.as_ref() {
-            let derp_map = inner.magicsock.get_derp_map();
             let exit_node_allow_lan_access = inner.prefs.read().await.ExitNodeAllowLANAccess;
             sync_router(
                 router,
                 &inner.tailscale_ips,
                 &routes,
-                derp_map.as_ref(),
+                &inner.magicsock,
                 &self.config.control_url,
                 exit_node_allow_lan_access,
             )?;

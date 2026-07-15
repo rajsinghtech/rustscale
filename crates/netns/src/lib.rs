@@ -7,24 +7,34 @@ mod other;
 mod socks;
 
 #[cfg(target_os = "linux")]
-use linux::{configure_udp_socket as configure_platform_udp_socket, control_and_connect};
+use linux::{
+    configure_udp_socket as configure_platform_udp_socket, control_and_connect,
+    system_control_and_connect,
+};
 #[cfg(target_os = "macos")]
-use macos::{configure_udp_socket as configure_platform_udp_socket, control_and_connect};
+use macos::{
+    configure_udp_socket as configure_platform_udp_socket, control_and_connect,
+    system_control_and_connect,
+};
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-use other::{configure_udp_socket as configure_platform_udp_socket, control_and_connect};
+use other::{
+    configure_udp_socket as configure_platform_udp_socket, control_and_connect,
+    system_control_and_connect,
+};
 
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 static ENABLED: AtomicBool = AtomicBool::new(true);
+static PHYSICAL_UNDERLAY_USERS: AtomicUsize = AtomicUsize::new(0);
 static BIND_TO_INTERFACE_BY_ROUTE: AtomicBool = AtomicBool::new(false);
 // Binding magicsock's own UDP sockets to the default physical interface is a
 // route-loop bypass that is only needed when the OS route table sends the
 // node's traffic back through our tunnel (TUN full-tunnel / exit-node mode).
 // In userspace tsnet mode it is actively harmful: pinning to the physical
 // interface breaks loopback and same-machine direct UDP (rustscale's
-// localhost-direct path). Default to disabled; TUN/exit-node mode opts in via
-// `set_disable_bind_conn_to_interface(false)`.
+// localhost-direct path). Default to disabled; TUN/exit-node owners opt in via
+// `acquire_physical_underlay_bypass`.
 static DISABLE_BIND_CONN_TO_INTERFACE: AtomicBool = AtomicBool::new(true);
 
 pub fn set_enabled(on: bool) {
@@ -41,6 +51,26 @@ pub fn set_bind_to_interface_by_route(v: bool) {
 
 pub fn set_disable_bind_conn_to_interface(v: bool) {
     DISABLE_BIND_CONN_TO_INTERFACE.store(v, Ordering::Relaxed);
+}
+
+/// Acquire process-wide UDP physical-underlay binding for one full-tunnel
+/// owner. Calls are reference-counted so multiple embedded TUN servers cannot
+/// disable each other's bypass policy.
+pub fn acquire_physical_underlay_bypass() {
+    PHYSICAL_UNDERLAY_USERS.fetch_add(1, Ordering::AcqRel);
+    set_disable_bind_conn_to_interface(false);
+}
+
+/// Release one full-tunnel owner's UDP physical-underlay binding.
+pub fn release_physical_underlay_bypass() {
+    let released_last = PHYSICAL_UNDERLAY_USERS
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |users| {
+            users.checked_sub(1)
+        })
+        .is_ok_and(|previous| previous == 1);
+    if released_last {
+        set_disable_bind_conn_to_interface(true);
+    }
 }
 
 pub fn is_localhost(addr: &str) -> bool {
@@ -97,6 +127,30 @@ pub async fn dial_tcp(host: &str, port: u16) -> Result<tokio::net::TcpStream, st
         match control_and_connect(addr).await {
             Ok(stream) => return Ok(stream),
             Err(e) => last_err = e,
+        }
+    }
+    Err(last_err)
+}
+
+/// Dial infrastructure TCP with an unconditional physical-underlay bypass.
+/// Control, DERP, and bootstrap callers use this even before exit-node routes
+/// are installed, matching upstream's `netns.NewDialer` call sites.
+pub async fn dial_system_tcp(
+    host: &str,
+    port: u16,
+) -> Result<tokio::net::TcpStream, std::io::Error> {
+    if !is_enabled() || is_localhost(host) {
+        return dial_tcp(host, port).await;
+    }
+    if let Some(proxy) = socks::all_proxy() {
+        return socks::dial_sock5_system(&proxy, host, port).await;
+    }
+    let addrs = tokio::net::lookup_host(format!("{host}:{port}")).await?;
+    let mut last_err = std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "no addresses");
+    for addr in addrs {
+        match system_control_and_connect(addr).await {
+            Ok(stream) => return Ok(stream),
+            Err(error) => last_err = error,
         }
     }
     Err(last_err)

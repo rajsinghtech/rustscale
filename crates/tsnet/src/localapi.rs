@@ -856,7 +856,6 @@ async fn apply_exit_node_prefs_locked(state: &Arc<LocalApiState>) {
         let mut routes = rt.write().await;
         routes.clear_exit_node();
         if let Some(router) = state.router.as_ref() {
-            let derp_map = state.magicsock.get_derp_map();
             let control_url = state.prefs.read().await.ControlURL.clone();
             let control_url = if control_url.is_empty() {
                 crate::DEFAULT_CONTROL_URL
@@ -867,7 +866,7 @@ async fn apply_exit_node_prefs_locked(state: &Arc<LocalApiState>) {
                 router,
                 &state.tailscale_ips,
                 &routes,
-                derp_map.as_ref(),
+                &state.magicsock,
                 control_url,
                 prefs.ExitNodeAllowLANAccess,
             ) {
@@ -893,7 +892,6 @@ async fn apply_exit_node_prefs_locked(state: &Arc<LocalApiState>) {
     }
     drop(selection);
     if let Some(router) = state.router.as_ref() {
-        let derp_map = state.magicsock.get_derp_map();
         let control_url = state.prefs.read().await.ControlURL.clone();
         let control_url = if control_url.is_empty() {
             crate::DEFAULT_CONTROL_URL
@@ -904,7 +902,7 @@ async fn apply_exit_node_prefs_locked(state: &Arc<LocalApiState>) {
             router,
             &state.tailscale_ips,
             &routes,
-            derp_map.as_ref(),
+            &state.magicsock,
             control_url,
             prefs.ExitNodeAllowLANAccess,
         ) {

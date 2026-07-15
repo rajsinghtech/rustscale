@@ -303,7 +303,7 @@ async fn test_multi_callback_register_unregister() {
     };
 
     let _h1 = handle.register_change_callback(cb1);
-    let _h2 = handle.register_change_callback(cb2);
+    handle.register_owned_change_callback(cb2);
     let h3 = handle.register_change_callback(cb3);
     h3.unregister();
 

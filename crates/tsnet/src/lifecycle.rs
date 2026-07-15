@@ -2444,13 +2444,25 @@ impl Server {
     fn finish_profile_shutdown(&mut self) {
         if let Some(inner) = self.inner.as_mut() {
             if let Some(router) = inner.router.take() {
-                match router.lock() {
-                    Ok(mut router) => {
-                        if let Err(error) = router.close() {
-                            eprintln!("tsnet: route cleanup failed (non-fatal): {error}");
-                        }
-                    }
-                    Err(_) => eprintln!("tsnet: route cleanup skipped (router lock poisoned)"),
+                let (cleaned, used_exit_node) = if let Ok(mut router) = router.lock() {
+                    let used_exit_node = router.exit_node;
+                    let cleaned = match router.router.close() {
+                        Ok(()) => true,
+                        Err(_) => match router.router.close() {
+                            Ok(()) => true,
+                            Err(error) => {
+                                eprintln!("tsnet: route cleanup failed (non-fatal): {error}");
+                                false
+                            }
+                        },
+                    };
+                    (cleaned, used_exit_node)
+                } else {
+                    eprintln!("tsnet: route cleanup skipped (router lock poisoned)");
+                    (false, false)
+                };
+                if cleaned && used_exit_node {
+                    rustscale_netns::release_physical_underlay_bypass();
                 }
             }
             crate::capture::clear(&inner.capture);

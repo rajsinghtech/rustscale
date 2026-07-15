@@ -7,13 +7,23 @@ const IP_BOUND_IF: u32 = 25;
 const IPV6_BOUND_IF: u32 = 125;
 
 pub async fn control_and_connect(addr: SocketAddr) -> Result<TcpStream, std::io::Error> {
+    connect(addr, false).await
+}
+
+pub async fn system_control_and_connect(addr: SocketAddr) -> Result<TcpStream, std::io::Error> {
+    connect(addr, true).await
+}
+
+async fn connect(addr: SocketAddr, force_bypass: bool) -> Result<TcpStream, std::io::Error> {
     let socket = if addr.is_ipv4() {
         TcpSocket::new_v4()?
     } else {
         TcpSocket::new_v6()?
     };
     let fd = socket.as_raw_fd();
-    if !super::DISABLE_BIND_CONN_TO_INTERFACE.load(std::sync::atomic::Ordering::Relaxed) {
+    if force_bypass
+        || !super::DISABLE_BIND_CONN_TO_INTERFACE.load(std::sync::atomic::Ordering::Relaxed)
+    {
         if let Some(idx) = get_interface_index(addr) {
             let (level, opt) = if addr.is_ipv4() {
                 (libc::IPPROTO_IP, IP_BOUND_IF)

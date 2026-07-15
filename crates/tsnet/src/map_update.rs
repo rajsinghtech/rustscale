@@ -291,14 +291,13 @@ pub(crate) fn spawn_map_update_task(
                         if let Some(router) = router.as_ref() {
                             let routes = route_table.read().await;
                             if routes.exit_node().is_some() {
-                                let derp_map = magicsock.get_derp_map();
                                 let exit_node_allow_lan_access =
                                     prefs.read().await.ExitNodeAllowLANAccess;
                                 if let Err(error) = sync_router(
                                     router,
                                     &tailscale_ips,
                                     &routes,
-                                    derp_map.as_ref(),
+                                    &magicsock,
                                     &control_url,
                                     exit_node_allow_lan_access,
                                 ) {
@@ -675,13 +674,12 @@ pub(crate) fn spawn_map_update_task(
                     // cannot stall data-plane readers.
                     let live_prefs = prefs.read().await.clone();
                     if let Some(router) = router.as_ref() {
-                        let derp_map = magicsock.get_derp_map();
                         let routes = route_table.read().await;
                         if let Err(error) = sync_router(
                             router,
                             &tailscale_ips,
                             &routes,
-                            derp_map.as_ref(),
+                            &magicsock,
                             &control_url,
                             live_prefs.ExitNodeAllowLANAccess,
                         ) {

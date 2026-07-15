@@ -1,6 +1,14 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
+#[derive(Clone)]
+pub(crate) struct LinkRouteSync {
+    pub router: SharedRouter,
+    pub route_table: Arc<RwLock<RouteTable>>,
+    pub tailscale_ips: Vec<IpAddr>,
+    pub prefs: Arc<RwLock<rustscale_ipn::Prefs>>,
+}
+
 /// Spawn the network change monitor. On a major link change (interface IP
 /// change, up/down transition, or wall-clock time jump), re-gathers local
 /// endpoints, resets peer direct paths, closes DERP connections, re-STUNs,
@@ -19,11 +27,12 @@ pub(crate) fn spawn_link_monitor(
     derp_map: DERPMap,
     home_derp: i32,
     health: Tracker,
+    route_sync: Option<LinkRouteSync>,
 ) -> Option<rustscale_netmon::MonitorHandle> {
     let monitor = rustscale_netmon::Monitor::new().ok()?;
 
     let handle = monitor.start();
-    handle.register_change_callback(move |delta| {
+    handle.register_owned_change_callback(move |delta| {
         let magicsock = magicsock.clone();
         let cancel = cancel.clone();
         let control_url = control_url.clone();
@@ -35,8 +44,27 @@ pub(crate) fn spawn_link_monitor(
         let advertise_routes = advertise_routes.clone();
         let derp_map = derp_map.clone();
         let health = health.clone();
+        let route_sync = route_sync.clone();
         let home_derp = home_derp;
         async move {
+            // Route notifications include default-interface-only changes that
+            // are intentionally classified as minor. Refresh bypass host
+            // routes and the long-lived magicsock binding on every delta.
+            if let Some(route_sync) = route_sync {
+                let routes = route_sync.route_table.read().await;
+                let exit_node_allow_lan_access =
+                    route_sync.prefs.read().await.ExitNodeAllowLANAccess;
+                if let Err(error) = sync_router(
+                    &route_sync.router,
+                    &route_sync.tailscale_ips,
+                    &routes,
+                    &magicsock,
+                    &control_url,
+                    exit_node_allow_lan_access,
+                ) {
+                    log::warn!("tsnet: interface bypass-route refresh failed: {error}");
+                }
+            }
             if !delta.major {
                 return;
             }

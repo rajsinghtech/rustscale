@@ -22,17 +22,43 @@ pub async fn dial_sock5(
     target_host: &str,
     target_port: u16,
 ) -> Result<TcpStream, std::io::Error> {
+    let sa = proxy_addr(proxy)?;
+    let stream = TcpStream::connect(sa).await?;
+    handshake(stream, target_host, target_port).await
+}
+
+pub async fn dial_sock5_system(
+    proxy: &str,
+    target_host: &str,
+    target_port: u16,
+) -> Result<TcpStream, std::io::Error> {
+    let sa = proxy_addr(proxy)?;
+    let stream = if sa.ip().is_loopback() {
+        TcpStream::connect(sa).await?
+    } else {
+        super::system_control_and_connect(sa).await?
+    };
+    handshake(stream, target_host, target_port).await
+}
+
+fn proxy_addr(proxy: &str) -> Result<SocketAddr, std::io::Error> {
     let proxy_addr = if proxy.contains(':') {
         proxy.to_string()
     } else {
         format!("{proxy}:1080")
     };
-    let sa: SocketAddr = proxy_addr
+    proxy_addr
         .to_socket_addrs()
         .ok()
         .and_then(|mut it| it.next())
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid proxy"))?;
-    let mut stream = TcpStream::connect(sa).await?;
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid proxy"))
+}
+
+async fn handshake(
+    mut stream: TcpStream,
+    target_host: &str,
+    target_port: u16,
+) -> Result<TcpStream, std::io::Error> {
     stream.set_nodelay(true).ok();
     stream.write_all(&[0x05, 0x01, 0x00]).await?;
     let mut resp = [0u8; 2];

@@ -1733,7 +1733,12 @@ pub(crate) fn filtered_outbound_packets<'a>(
 }
 
 /// A router shared by the TUN lifecycle, API calls, and map-update task.
-pub(crate) type SharedRouter = Arc<std::sync::Mutex<Box<dyn rustscale_router::Router>>>;
+pub(crate) type SharedRouter = Arc<std::sync::Mutex<ManagedRouter>>;
+
+pub(crate) struct ManagedRouter {
+    pub(crate) router: Box<dyn rustscale_router::Router>,
+    pub(crate) exit_node: bool,
+}
 
 /// Build the one OS-level routing configuration from current TUN state.
 pub(crate) fn build_router_config(
@@ -1761,35 +1766,38 @@ fn build_router_config_with_local_routes(
     exit_node_allow_lan_access: bool,
     local_interface_prefixes: Vec<rustscale_tsaddr::IpPrefix>,
 ) -> rustscale_router::RouterConfig {
+    let physical_nameservers = physical_nameservers();
     let mut local_routes = Vec::new();
     if route_table.exit_node().is_some() {
+        // Only trusted infrastructure contributes bypasses, and every remote
+        // destination is reduced to a single normalized host route. Peer
+        // Endpoints are deliberately excluded: they are peer-controlled and
+        // magicsock's socket-level netns binding handles direct UDP instead.
+        let mut infrastructure_maps = Vec::with_capacity(2);
         if let Some(derp_map) = derp_map {
+            infrastructure_maps.push(derp_map.clone());
+        }
+        infrastructure_maps.push(rustscale_dnsfallback::get_static_derp_map());
+        for derp_map in &infrastructure_maps {
             for region in derp_map.Regions.values() {
                 for node in region.Nodes.iter().flatten() {
-                    if node.STUNOnly {
-                        continue;
-                    }
                     for address in [&node.IPv4, &node.IPv6] {
                         if let Ok(ip) = address.parse::<IpAddr>() {
-                            if !ip.is_unspecified() {
-                                local_routes.push(rustscale_tsaddr::IpPrefix {
-                                    ip,
-                                    bits: if ip.is_ipv4() { 32 } else { 128 },
-                                });
-                            }
+                            push_host_bypass(&mut local_routes, ip);
                         }
                     }
                 }
             }
         }
-        local_routes.extend(
-            resolve_control_server_ips(control_url)
-                .into_iter()
-                .map(|ip| rustscale_tsaddr::IpPrefix {
-                    ip,
-                    bits: if ip.is_ipv4() { 32 } else { 128 },
-                }),
-        );
+        for ip in resolve_control_server_ips(control_url) {
+            push_host_bypass(&mut local_routes, ip);
+        }
+        // Capture physical resolvers before the MagicDNS OS configuration can
+        // point resolv.conf back at this process. This prevents bootstrap DNS
+        // from recursively following the exit route.
+        for ip in physical_nameservers {
+            push_host_bypass(&mut local_routes, ip);
+        }
         if exit_node_allow_lan_access {
             local_routes.extend(local_interface_prefixes);
         }
@@ -1803,7 +1811,7 @@ fn build_router_config_with_local_routes(
                 bits: 128,
             },
         ]);
-        local_routes.sort_by_key(|prefix| (prefix.ip, prefix.bits));
+        rustscale_tsaddr::sort_prefixes(&mut local_routes);
         local_routes.dedup();
     }
 
@@ -1815,11 +1823,58 @@ fn build_router_config_with_local_routes(
             routes.push(rustscale_tsaddr::IpPrefix { ip: net, bits });
         }
     }
+    let default_route = rustscale_netmon::default_route();
+    let underlay = (!default_route.interface_name.is_empty()
+        && !default_route.interface_name.starts_with("utun")
+        && !default_route.interface_name.starts_with("tailscale"))
+    .then_some(rustscale_router::UnderlayRoute {
+        interface: default_route.interface_name,
+        gateway: default_route.gateway.map(normalize_ip),
+    });
     rustscale_router::RouterConfig {
-        local_addrs: local_addrs.to_vec(),
+        local_addrs: local_addrs.iter().copied().map(normalize_ip).collect(),
         routes,
         local_routes,
+        underlay,
         exit_node: route_table.exit_node().is_some(),
+    }
+}
+
+fn physical_nameservers() -> Vec<IpAddr> {
+    static PHYSICAL_NAMESERVERS: std::sync::OnceLock<std::sync::Mutex<Vec<IpAddr>>> =
+        std::sync::OnceLock::new();
+    let cache = PHYSICAL_NAMESERVERS.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+    let mut current: Vec<_> = rustscale_dns::system_nameservers()
+        .into_iter()
+        .map(|server| normalize_ip(server.ip()))
+        .filter(|ip| !rustscale_tsaddr::is_tailscale_ip(*ip))
+        .collect();
+    current.sort_unstable();
+    current.dedup();
+    let mut cached = cache.lock().expect("physical DNS cache lock poisoned");
+    // Once the OS points at MagicDNS, an empty filtered result means "keep the
+    // last physical snapshot", not "delete every DNS bypass".
+    if !current.is_empty() {
+        *cached = current;
+    }
+    cached.clone()
+}
+
+fn push_host_bypass(routes: &mut Vec<rustscale_tsaddr::IpPrefix>, ip: IpAddr) {
+    let ip = normalize_ip(ip);
+    if ip.is_unspecified() || ip.is_multicast() || rustscale_tsaddr::is_tailscale_ip(ip) {
+        return;
+    }
+    routes.push(rustscale_tsaddr::IpPrefix {
+        ip,
+        bits: if ip.is_ipv4() { 32 } else { 128 },
+    });
+}
+
+fn normalize_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(ip) => ip.to_ipv4_mapped().map_or(IpAddr::V6(ip), IpAddr::V4),
+        ip => ip,
     }
 }
 
@@ -1828,22 +1883,63 @@ pub(crate) fn sync_router(
     router: &SharedRouter,
     local_addrs: &[IpAddr],
     route_table: &RouteTable,
-    derp_map: Option<&DERPMap>,
+    magicsock: &Magicsock,
     control_url: &str,
     exit_node_allow_lan_access: bool,
 ) -> Result<(), TsnetError> {
+    // Serialize source snapshots with application. This prevents an older map
+    // or interface callback from building before the mutex and then replacing
+    // a newer desired state after it.
+    let mut managed = router
+        .lock()
+        .map_err(|_| TsnetError::Builder("router lock poisoned".into()))?;
+    let exit_node = route_table.exit_node().is_some();
+    let entering_exit_node = exit_node && !managed.exit_node;
+    let leaving_exit_node = !exit_node && managed.exit_node;
+    if exit_node {
+        // Match upstream netns call sites: control/DERP TCP and magicsock UDP
+        // bypass the tunnel at the socket layer. Reapply to the existing UDP
+        // socket before installing a catch-all route.
+        if entering_exit_node {
+            rustscale_netns::acquire_physical_underlay_bypass();
+        }
+        if let Err(error) = magicsock.refresh_underlay_binding() {
+            if entering_exit_node {
+                rustscale_netns::release_physical_underlay_bypass();
+            }
+            return Err(TsnetError::Builder(format!(
+                "configure underlay UDP socket: {error}"
+            )));
+        }
+        if entering_exit_node {
+            // Existing DERP TCP sockets predate the netns policy and cannot be
+            // marked retroactively. Reconnect them before the catch-all lands.
+            magicsock.link_changed();
+        }
+    }
+    let derp_map = magicsock.get_derp_map();
     let config = build_router_config(
         local_addrs,
         route_table,
-        derp_map,
+        derp_map.as_ref(),
         control_url,
         exit_node_allow_lan_access,
     );
-    router
-        .lock()
-        .map_err(|_| TsnetError::Builder("router lock poisoned".into()))?
-        .set(&config)
-        .map_err(|error| TsnetError::Builder(format!("route configuration failed: {error}")))
+    if let Err(error) = managed.router.set(&config) {
+        if entering_exit_node {
+            rustscale_netns::release_physical_underlay_bypass();
+        }
+        return Err(TsnetError::Builder(format!(
+            "route configuration failed: {error}"
+        )));
+    }
+    managed.exit_node = exit_node;
+    if leaving_exit_node {
+        // Release only after catch-all teardown, so no underlay packet can
+        // briefly recurse through the TUN during the transition.
+        rustscale_netns::release_physical_underlay_bypass();
+    }
+    Ok(())
 }
 
 /// Create a TUN device and optionally apply OS routes.
@@ -1864,6 +1960,17 @@ pub(crate) async fn create_tun_device(
             .map_err(|error| TsnetError::Builder(format!("bring TUN interface up: {error}")))?;
         let route_config = {
             let route_table = b.route_table.read().await;
+            if route_table.exit_node().is_some() {
+                rustscale_netns::acquire_physical_underlay_bypass();
+                if let Err(error) = b.magicsock.refresh_underlay_binding() {
+                    rustscale_netns::release_physical_underlay_bypass();
+                    let _ = router.close();
+                    return Err(TsnetError::Builder(format!(
+                        "configure underlay UDP socket: {error}"
+                    )));
+                }
+                b.magicsock.link_changed();
+            }
             build_router_config(
                 &b.tailscale_ips,
                 &route_table,
@@ -1874,9 +1981,15 @@ pub(crate) async fn create_tun_device(
         };
         if let Err(error) = router.set(&route_config) {
             let _ = router.close();
+            if route_config.exit_node {
+                rustscale_netns::release_physical_underlay_bypass();
+            }
             return Err(TsnetError::Builder(format!("install TUN routes: {error}")));
         }
-        Some(Arc::new(std::sync::Mutex::new(router)))
+        Some(Arc::new(std::sync::Mutex::new(ManagedRouter {
+            router,
+            exit_node: route_config.exit_node,
+        })))
     } else {
         None
     };
@@ -2013,6 +2126,43 @@ mod tests {
                 "missing bypass route {prefix}",
             );
         }
+    }
+
+    #[test]
+    fn infrastructure_bypasses_are_host_only_and_reject_tunnel_or_special_ips() {
+        let mut routes = RouteTable::default();
+        routes.set_exit_node(NodePrivate::generate().public());
+        let mut derp_map = DERPMap::default();
+        derp_map.Regions.insert(
+            1,
+            DERPRegion {
+                Nodes: Some(vec![DERPNode {
+                    IPv4: "100.64.0.9".into(),
+                    IPv6: "ff02::1".into(),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            },
+        );
+        let config = build_router_config_with_local_routes(
+            &[],
+            &routes,
+            Some(&derp_map),
+            "https://127.0.0.1",
+            false,
+            vec![],
+        );
+        assert!(!config
+            .local_routes
+            .contains(&rustscale_tsaddr::IpPrefix::parse("100.64.0.9/32").unwrap()));
+        assert!(!config
+            .local_routes
+            .contains(&rustscale_tsaddr::IpPrefix::parse("ff02::1/128").unwrap()));
+        assert!(config.local_routes.iter().all(|prefix| {
+            prefix.bits == 32
+                || prefix.bits == 128
+                || *prefix == rustscale_tsaddr::IpPrefix::parse("127.0.0.0/8").unwrap()
+        }));
     }
 
     #[test]

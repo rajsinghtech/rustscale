@@ -1148,6 +1148,7 @@ fn authorize_tun_inbound_batch(
     inbound: &mut InboundBatchScratch,
 ) {
     debug_assert_eq!(inbound.plaintext.len(), inbound.plaintext_peers.len());
+    debug_assert_eq!(inbound.plaintext.len(), inbound.plaintext_generations.len());
     let mut source = 0;
     let mut retained = 0;
     inbound.plaintext.retain_mut(|packet| {
@@ -1157,6 +1158,7 @@ fn authorize_tun_inbound_batch(
             peer_map.record_packet(peer, packet);
             if retained != source {
                 inbound.plaintext_peers[retained] = peer.clone();
+                inbound.plaintext_generations[retained] = inbound.plaintext_generations[source];
             }
             retained += 1;
         } else {
@@ -1166,6 +1168,7 @@ fn authorize_tun_inbound_batch(
         keep
     });
     inbound.plaintext_peers.truncate(retained);
+    inbound.plaintext_generations.truncate(retained);
 }
 
 /// Filter and stably compact plaintext after every tunnel lock has been
@@ -3901,7 +3904,7 @@ mod tests {
         let mut reply = InboundBatchScratch::default();
         reply
             .replies
-            .push((NodePrivate::generate().public(), vec![1]));
+            .push((NodePrivate::generate().public(), 0, vec![1]));
         {
             let barrier = flush_outbound_before_replies(Some(&mut pipeline), &reply);
             tokio::pin!(barrier);

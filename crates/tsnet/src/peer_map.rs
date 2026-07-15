@@ -306,6 +306,22 @@ mod tests {
     }
 
     #[test]
+    fn absent_full_snapshot_preserves_and_present_empty_revokes() {
+        let key = NodePrivate::generate().public();
+        let current = vec![node(7, &key, "100.64.0.7")];
+        assert_eq!(
+            reconcile(&current, &MapResponse::default()).unwrap(),
+            current,
+            "an omitted Peers field is a delta omission"
+        );
+        let empty = MapResponse {
+            Peers: Some(Vec::new()),
+            ..Default::default()
+        };
+        assert!(reconcile(&current, &empty).unwrap().is_empty());
+    }
+
+    #[test]
     fn malformed_address_prefix_is_rejected() {
         let key = NodePrivate::generate().public();
         let response = MapResponse {

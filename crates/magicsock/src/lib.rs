@@ -1745,7 +1745,12 @@ impl Magicsock {
             .disco_to_peer
             .write()
             .expect("disco_to_peer lock poisoned")
-            .retain(|_, peer| desired.contains(peer) && !refreshed.contains(peer));
+            .retain(|disco, peer| {
+                !refreshed.contains(peer)
+                    && desired_disco
+                        .get(peer)
+                        .is_some_and(|current| !current.is_zero() && current == disco)
+            });
         self.inner
             .addr_to_peer
             .write()

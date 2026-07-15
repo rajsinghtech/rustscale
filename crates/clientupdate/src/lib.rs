@@ -221,7 +221,8 @@ pub fn select_release(
                     !release.prerelease && version.pre.is_empty()
                 }
                 VersionSelector::Track(Track::ReleaseCandidate) => {
-                    release.prerelease && is_release_candidate(&pre)
+                    (!release.prerelease && version.pre.is_empty())
+                        || (release.prerelease && is_release_candidate(&pre))
                 }
                 VersionSelector::Track(Track::Unstable) => {
                     release.prerelease && !version.pre.is_empty() && !is_release_candidate(&pre)
@@ -305,10 +306,10 @@ pub fn asset_name(platform: Platform) -> Result<&'static str, UpdateError> {
         (OperatingSystem::Linux, Architecture::X86_64, Libc::Musl) => {
             Ok("rustscale-x86_64-unknown-linux-musl.tar.gz")
         }
-        (OperatingSystem::Linux, Architecture::X86_64, _) => {
+        (OperatingSystem::Linux, Architecture::X86_64, Libc::Gnu) => {
             Ok("rustscale-x86_64-unknown-linux-gnu.tar.gz")
         }
-        (OperatingSystem::Linux, Architecture::Aarch64, _) => {
+        (OperatingSystem::Linux, Architecture::Aarch64, Libc::Gnu) => {
             Ok("rustscale-aarch64-unknown-linux-gnu.tar.gz")
         }
         (OperatingSystem::Windows, Architecture::X86_64, _) => {
@@ -526,9 +527,15 @@ impl<'a> ReleaseUpdater<'a> {
             VersionSelector::Version(_) => version_to_track(&release.tag_name)
                 .ok_or_else(|| UpdateError::InvalidVersion(release.tag_name.clone()))?,
         };
-        let same_track = version_to_track(&self.current_version) == Some(track);
+        let current_track = version_to_track(&self.current_version);
+        let current_is_on_selected_track = match track {
+            Track::ReleaseCandidate => {
+                matches!(current_track, Some(Track::Stable | Track::ReleaseCandidate))
+            }
+            _ => current_track == Some(track),
+        };
         let already_current = target == current;
-        let local_is_newer = !explicit_version && same_track && target < current;
+        let local_is_newer = !explicit_version && current_is_on_selected_track && target < current;
 
         let apply = if already_current || local_is_newer {
             ApplyPlan::Unsupported("no replacement is needed".into())
@@ -780,7 +787,7 @@ mod tests {
     }
 
     #[test]
-    fn mixed_tracks_are_disjoint() {
+    fn mixed_tracks_select_expected_release_sets() {
         let releases = vec![
             release("v2.0.0", false),
             release("v2.1.0-rc.2", true),
@@ -809,6 +816,41 @@ mod tests {
             &VersionSelector::Track(Track::Unstable)
         )
         .is_err());
+    }
+
+    #[test]
+    fn release_candidate_track_chooses_newest_stable_or_rc_semantically() {
+        assert_eq!(
+            select_release(
+                &[
+                    release("v2.1.0-rc.3", true),
+                    release("v2.1.0", false),
+                    release("v2.0.9", false),
+                ],
+                &VersionSelector::Track(Track::ReleaseCandidate),
+            )
+            .unwrap()
+            .tag_name,
+            "v2.1.0"
+        );
+        assert_eq!(
+            select_release(
+                &[release("v2.2.0", false), release("v2.3.0-rc.1", true)],
+                &VersionSelector::Track(Track::ReleaseCandidate),
+            )
+            .unwrap()
+            .tag_name,
+            "v2.3.0-rc.1"
+        );
+        assert_eq!(
+            select_release(
+                &[release("v2.2.0", false)],
+                &VersionSelector::Track(Track::ReleaseCandidate),
+            )
+            .unwrap()
+            .tag_name,
+            "v2.2.0"
+        );
     }
 
     #[test]
@@ -907,6 +949,35 @@ mod tests {
     }
 
     #[test]
+    fn aarch64_musl_is_unsupported_during_planning() {
+        let lookup = lookup();
+        let downloads = NoDownloads(AtomicUsize::new(0));
+        let filesystem = SystemFileSystem;
+        let updater = ReleaseUpdater::new(
+            "1.0.0",
+            Platform {
+                os: OperatingSystem::Linux,
+                arch: Architecture::Aarch64,
+                libc: Libc::Musl,
+            },
+            InstallMethod::Archive {
+                rustscale: "/prefix/bin/rustscale".into(),
+                rustscaled: "/prefix/bin/rustscaled".into(),
+                receipt: "/prefix/bin/.rustscale-install-receipt-v1".into(),
+            },
+            &lookup,
+            &downloads,
+            &NoCommands,
+            &filesystem,
+        );
+        assert!(matches!(
+            updater.plan(VersionSelector::Track(Track::Stable)),
+            Err(UpdateError::Unsupported(_))
+        ));
+        assert_eq!(downloads.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
     fn dry_run_and_confirmation_do_not_mutate() {
         let lookup = lookup();
         let downloads = NoDownloads(AtomicUsize::new(0));
@@ -970,6 +1041,40 @@ mod tests {
     }
 
     #[test]
+    fn release_candidate_track_does_not_downgrade_newer_stable_client() {
+        let lookup = FakeLookup {
+            releases: vec![release("v2.0.0", false), release("v2.1.0-rc.1", true)],
+            tags: HashMap::new(),
+            list_calls: Arc::default(),
+            tag_calls: Arc::default(),
+        };
+        let downloads = NoDownloads(AtomicUsize::new(0));
+        let filesystem = SystemFileSystem;
+        let updater = ReleaseUpdater::new(
+            "2.2.0",
+            linux(),
+            InstallMethod::Unsupported {
+                reason: "test".into(),
+            },
+            &lookup,
+            &downloads,
+            &NoCommands,
+            &filesystem,
+        );
+        let (plan, outcome) = updater
+            .execute(
+                VersionSelector::Track(Track::ReleaseCandidate),
+                true,
+                |_| true,
+            )
+            .unwrap();
+        assert_eq!(plan.target_version, "2.1.0-rc.1");
+        assert!(plan.local_is_newer);
+        assert_eq!(outcome, UpdateOutcome::NewerLocal);
+        assert_eq!(downloads.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
     fn checksum_integrity_verification_rejects_duplicates_and_mismatch() {
         let data = b"archive";
         let digest = format!("{:x}", sha2::Sha256::digest(data));
@@ -1015,6 +1120,14 @@ mod tests {
             .unwrap(),
             "rustscale-aarch64-unknown-linux-gnu.tar.gz"
         );
+        assert!(matches!(
+            asset_name(Platform {
+                os: OperatingSystem::Linux,
+                arch: Architecture::Aarch64,
+                libc: Libc::Musl,
+            }),
+            Err(UpdateError::Unsupported(_))
+        ));
         assert_eq!(
             asset_name(Platform {
                 os: OperatingSystem::MacOs,

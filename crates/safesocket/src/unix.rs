@@ -13,7 +13,7 @@
 
 use std::fs;
 use std::io;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener as StdUnixListener, UnixStream as StdUnixStream};
 use std::path::Path;
 use std::thread;
@@ -50,7 +50,20 @@ pub fn listen(path: &Path) -> io::Result<Listener> {
         ));
     }
 
-    let _ = fs::remove_file(path);
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_socket() => fs::remove_file(path)?,
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                format!(
+                    "{}: refusing to replace a non-socket filesystem entry",
+                    path.display()
+                ),
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
 
     let perm = socket_permissions();
 
@@ -75,6 +88,22 @@ pub fn listen(path: &Path) -> io::Result<Listener> {
     Ok(Listener {
         inner: tokio_listener,
     })
+}
+
+/// Remove `path` only when it is still a Unix socket.
+///
+/// This protects shutdown/cleanup from deleting a regular file or symlink
+/// that replaced the listener pathname after bind.
+pub fn remove_socket_file(path: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_socket() => {
+            fs::remove_file(path)?;
+            Ok(true)
+        }
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 /// Dial a Unix socket at `path`.

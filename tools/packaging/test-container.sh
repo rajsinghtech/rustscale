@@ -17,6 +17,7 @@ mkdir -p "$TMP/bin" "$TMP/state"
 cat > "$TMP/bin/rustscaled" <<'EOF'
 #!/bin/sh
 printf '%s\n' "$*" > "$FAKE_DAEMON_ARGS"
+printf '%s\n' "${TS_AUTHKEY-unset}" > "$FAKE_DAEMON_AUTHKEY"
 socket=
 previous=
 for arg in "$@"; do
@@ -56,7 +57,8 @@ run_entrypoint() {
     output="$1"
     shift
     env PATH="$TMP/bin:$PATH" \
-        FAKE_DAEMON_ARGS="$TMP/daemon.args" FAKE_CLI_ARGS="$TMP/cli.args" \
+        FAKE_DAEMON_ARGS="$TMP/daemon.args" FAKE_DAEMON_AUTHKEY="$TMP/daemon.authkey" \
+        FAKE_CLI_ARGS="$TMP/cli.args" \
         TS_STATE_DIR="$TMP/state" TS_SOCKET="$TMP/rustscaled.sock" \
         "$@" sh "$ROOT/container/entrypoint.sh" > "$output" 2>&1 &
     ENTRYPOINT_PID=$!
@@ -97,17 +99,26 @@ grep -q -- '--accept-dns' "$TMP/cli.args"
 grep -q -- '--accept-routes' "$TMP/cli.args"
 grep -q -- '--exit-node 100.64.0.1' "$TMP/cli.args"
 grep -q -- '--shields-up' "$TMP/cli.args"
+grep -Fxq 'unset' "$TMP/daemon.authkey"
 if grep -q 'tskey-from-file' "$TMP/first.out"; then
     echo "container entrypoint leaked its auth key to output" >&2
     exit 1
 fi
 
-# TS_AUTH_ONCE=true preserves an already-running login and skips `up`.
+# TS_AUTH_ONCE=true preserves login but still reapplies preferences.
 : > "$TMP/cli.args"
-run_entrypoint "$TMP/second.out" FAKE_RUNNING=1 TS_AUTH_ONCE=true
-if grep -q ' up ' "$TMP/cli.args"; then
-    echo "TS_AUTH_ONCE=true unexpectedly reauthenticated" >&2
+run_entrypoint "$TMP/second.out" FAKE_RUNNING=1 TS_AUTH_ONCE=true TS_ROUTES=10.1.0.0/24
+up_args=$(grep ' up ' "$TMP/cli.args")
+printf '%s\n' "$up_args" | grep -q -- '--advertise-routes 10.1.0.0/24'
+if printf '%s\n' "$up_args" | grep -q -- '--force-reauth'; then
+    echo "TS_AUTH_ONCE=true unexpectedly requested reauthentication" >&2
     exit 1
 fi
+
+# The default AUTH_ONCE=0 explicitly reauthenticates an existing node.
+: > "$TMP/cli.args"
+run_entrypoint "$TMP/third.out" FAKE_RUNNING=1 TS_AUTHKEY=tskey-reusable
+up_args=$(grep ' up ' "$TMP/cli.args")
+printf '%s\n' "$up_args" | grep -q -- '--force-reauth'
 
 echo "container entrypoint tests: ok"

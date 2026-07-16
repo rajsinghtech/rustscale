@@ -13,10 +13,11 @@
 //!
 //! Unix peer credentials (SO_PEERCRED/LOCAL_PEERCRED) — the kernel stamps
 //! each accepted connection with the peer's real UID. Connections from root
-//! (uid 0) or the daemon's own UID are granted read-write access; all others
-//! are read-only (mutating endpoints return 403). On platforms without peer
-//! credentials (Windows named pipes), the pipe ACL handles access control
-//! and all connections are read-write. See
+//! (uid 0), the daemon's own UID, or persisted `Prefs.OperatorUser` are
+//! granted read-write access. Other peers may use ordinary status endpoints,
+//! while mutations and sensitive diagnostics/profile/file reads return 403.
+//! On platforms without peer credentials (Windows named pipes), the pipe ACL
+//! handles access control and all connections are read-write. See
 //! [`rustscale_safesocket::peercred::ConnIdentity`].
 //!
 //! # Wire shapes
@@ -555,7 +556,7 @@ impl LocalApiHandle {
             let _ = task.await;
         }
         if self.unlink_on_drop {
-            let _ = std::fs::remove_file(&self.socket_path);
+            let _ = rustscale_safesocket::remove_socket_file(&self.socket_path);
         }
     }
 
@@ -574,7 +575,7 @@ impl Drop for LocalApiHandle {
             task.abort();
         }
         if self.unlink_on_drop {
-            let _ = std::fs::remove_file(&self.socket_path);
+            let _ = rustscale_safesocket::remove_socket_file(&self.socket_path);
         }
     }
 }
@@ -1004,10 +1005,20 @@ async fn handle_logout<W: AsyncWrite + Unpin>(
     // transaction cannot race the HTTP waiter. Preferences, identity, and
     // cache are committed only by Server::logout's resumable transaction.
     let completion = state.logout_completion.register();
-    if let Some(ref tx) = state.command_tx {
-        let _ = tx.send(DaemonCommand::Logout);
+    let delivered = if let Some(ref tx) = state.command_tx {
+        tx.send(DaemonCommand::Logout).is_ok()
+    } else {
+        // Direct/auth-key daemons do not consume the LocalAPI command channel.
+        // `notify_one` retains a permit if logout arrives before their select
+        // installs its waiter; `notify_waiters` would lose that edge.
+        state.logout_trigger.notify_one();
+        true
+    };
+    if !delivered {
+        state
+            .logout_completion
+            .complete(Err("daemon command owner stopped".into()));
     }
-    state.logout_trigger.notify_waiters();
     match completion.await {
         Ok(Ok(())) => write_no_content_response(conn, 204, "No Content").await?,
         Ok(Err(error)) => {
@@ -1708,6 +1719,20 @@ fn is_mutating_request(method: &str, endpoint: &str) -> bool {
         || (endpoint.starts_with("file-put/") && method == "PUT")
 }
 
+/// Upstream requires write permission for sensitive diagnostics and local
+/// profile/file contents even though these requests do not mutate state. Keep
+/// this separate from mutation fencing so long-running reads never hold the
+/// generation handoff gate.
+fn requires_write_permission(method: &str, endpoint: &str) -> bool {
+    matches!(
+        (method, endpoint),
+        (
+            "GET",
+            "metrics" | "dns-query" | "debug" | "id-token" | "profiles" | "files"
+        ) | ("POST", "check-prefs")
+    ) || (method == "GET" && (endpoint.starts_with("profiles/") || endpoint.starts_with("files/")))
+}
+
 pub(crate) async fn dispatch<W: AsyncRead + AsyncWrite + Unpin>(
     conn: &mut W,
     req: &HttpRequest,
@@ -1788,6 +1813,12 @@ pub(crate) async fn dispatch<W: AsyncRead + AsyncWrite + Unpin>(
         }
         Some(permit)
     } else {
+        if requires_write_permission(method, endpoint)
+            && !require_readwrite(peer_identity, state).await
+        {
+            write_access_denied(conn).await?;
+            return Ok(());
+        }
         None
     };
 
@@ -2004,10 +2035,6 @@ pub(crate) async fn dispatch<W: AsyncRead + AsyncWrite + Unpin>(
 
         // --- GET /localapi/v0/id-token ---
         "id-token" if method == "GET" => {
-            if !require_readwrite(peer_identity, state).await {
-                write_access_denied(conn).await?;
-                return Ok(());
-            }
             handle_id_token(conn, &req.query, state).await?;
         }
 
@@ -6710,7 +6737,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_readonly_identity_can_read_metrics() {
+    async fn test_readonly_identity_is_blocked_from_metrics() {
         let state = make_test_state().await;
         let resp = send_request_with_identity(
             b"GET /localapi/v0/metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
@@ -6718,7 +6745,34 @@ mod tests {
             test_ro_identity(),
         )
         .await;
-        assert!(resp.contains("200 OK"));
+        assert!(resp.contains("403 Forbidden"));
+    }
+
+    #[test]
+    fn sensitive_reads_require_write_permission_without_mutation_fencing() {
+        for (method, endpoint) in [
+            ("GET", "metrics"),
+            ("GET", "dns-query"),
+            ("GET", "debug"),
+            ("GET", "id-token"),
+            ("POST", "check-prefs"),
+            ("GET", "profiles"),
+            ("GET", "profiles/current"),
+            ("GET", "files"),
+            ("GET", "files/report.txt"),
+        ] {
+            assert!(
+                requires_write_permission(method, endpoint),
+                "{method} {endpoint} should require write permission"
+            );
+            assert!(
+                !is_mutating_request(method, endpoint),
+                "{method} {endpoint} must not hold the mutation fence"
+            );
+        }
+        for endpoint in ["status", "health", "whois", "prefs", "netmap"] {
+            assert!(!requires_write_permission("GET", endpoint), "{endpoint}");
+        }
     }
 
     #[tokio::test]
@@ -6816,6 +6870,37 @@ mod tests {
             .expect("logout response did not resume after commit")
             .unwrap();
         assert!(response.contains("204 No Content"), "response: {response}");
+    }
+
+    #[tokio::test]
+    async fn logout_request_before_daemon_waiter_is_retained() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let state = make_test_state().await;
+        let (_client, mut server) = tokio::io::duplex(1024);
+        let mut response = Box::pin(handle_logout(&mut server, &state));
+
+        // Poll the handler through registration and notification before the
+        // simulated daemon creates its waiter.
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+        assert!(matches!(
+            response.as_mut().poll(&mut context),
+            Poll::Pending
+        ));
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            state.logout_trigger.notified(),
+        )
+        .await
+        .expect("an early logout notification must leave a retained permit");
+
+        state.logout_completion.complete(Ok(()));
+        tokio::time::timeout(std::time::Duration::from_secs(1), response)
+            .await
+            .expect("logout response did not resume")
+            .expect("write logout response");
     }
 
     #[tokio::test]

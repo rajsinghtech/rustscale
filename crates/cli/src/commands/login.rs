@@ -81,9 +81,13 @@ pub async fn run(args: Vec<String>, socket: &Path, json: bool) -> Result<(), Cli
         if let Some(state) = msg.State {
             if state == rustscale_ipn::State::Running {
                 if json {
+                    // The pre-login snapshot is necessarily NeedsLogin and may
+                    // contain stale node data. Fetch after the Running event so
+                    // machine-readable output describes the completed login.
+                    let running_status = lc.status().await?;
                     println!(
                         "{}",
-                        serde_json::to_string_pretty(&status).unwrap_or_default()
+                        serde_json::to_string_pretty(&running_status).unwrap_or_default()
                     );
                 } else {
                     println!("Tailscale is running.");

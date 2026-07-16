@@ -24,23 +24,6 @@ pub async fn run(args: Vec<String>, socket: &Path, json: bool) -> Result<(), Cli
         .get("BackendState")
         .and_then(|v| v.as_str())
         .unwrap_or("Unknown");
-    let have_node_key = status
-        .get("HaveNodeKey")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-
-    if backend_state == "Running" && !force_reauth {
-        if json {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&status).unwrap_or_default()
-            );
-        } else {
-            println!("Tailscale is already running.");
-        }
-        return Ok(());
-    }
-
     let mut update = MaskedPrefs::default();
     update.Prefs.WantRunning = true;
     update.WantRunningSet = true;
@@ -91,6 +74,23 @@ pub async fn run(args: Vec<String>, socket: &Path, json: bool) -> Result<(), Cli
         update.CorpDNSSet = true;
     }
 
+    if backend_state == "Running" && !force_reauth {
+        // `up` is also the declarative container entrypoint surface. Apply
+        // supplied preferences even when the node is already online instead
+        // of returning with stale routes/DNS/hostname settings.
+        lc.edit_prefs(&update).await?;
+        if json {
+            let updated_status = lc.status().await?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&updated_status).unwrap_or_default()
+            );
+        } else {
+            println!("Tailscale is already running; preferences updated.");
+        }
+        return Ok(());
+    }
+
     let mut watch = lc.watch_ipn_bus(NOTIFY_INITIAL_STATE).await?;
 
     let opts = StartOptions {
@@ -100,8 +100,12 @@ pub async fn run(args: Vec<String>, socket: &Path, json: bool) -> Result<(), Cli
     };
     lc.start(&opts).await?;
 
-    let needs_login = !have_node_key || force_reauth || auth_key.is_none();
-    if needs_login {
+    // An auth key is itself the non-interactive login mechanism. Do not queue
+    // a browser login behind it; that can race a successful key registration
+    // and leave container bootstrap waiting on an unrelated auth URL.
+    let needs_interactive_login =
+        should_start_interactive_login(backend_state, force_reauth, auth_key.as_deref());
+    if needs_interactive_login {
         lc.login_interactive().await?;
     }
 
@@ -169,5 +173,30 @@ pub async fn run(args: Vec<String>, socket: &Path, json: bool) -> Result<(), Cli
                 println!("State: {state}");
             }
         }
+    }
+}
+
+fn should_start_interactive_login(
+    backend_state: &str,
+    force_reauth: bool,
+    auth_key: Option<&str>,
+) -> bool {
+    auth_key.is_none() && (backend_state == "NeedsLogin" || force_reauth)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_start_interactive_login;
+
+    #[test]
+    fn needs_login_uses_browser_even_when_generated_node_key_exists() {
+        assert!(should_start_interactive_login("NeedsLogin", false, None));
+        assert!(!should_start_interactive_login(
+            "NeedsLogin",
+            false,
+            Some("tskey-test")
+        ));
+        assert!(!should_start_interactive_login("Stopped", false, None));
+        assert!(should_start_interactive_login("Running", true, None));
     }
 }

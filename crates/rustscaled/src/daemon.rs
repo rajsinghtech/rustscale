@@ -319,9 +319,34 @@ async fn run_interactive(
     let mut command_rx = server.start_localapi_only().await?;
     log::info!("rustscaled: waiting for login (no TS_AUTHKEY set; use 'rustscale up' or 'rustscale login')");
 
-    // Phase 1: wait for Start/LoginInteractive to bring the server up.
+    // Resume an installed node without requiring another `rustscale up` after
+    // every service restart. Fresh/default and explicitly logged-out profiles
+    // remain in NeedsLogin with LocalAPI available.
+    let persisted_prefs = rustscale_ipn::Prefs::load(state_dir).unwrap_or_default();
     let mut is_up = false;
-    while let Some(cmd) = command_rx.recv().await {
+    if should_resume_persisted_node(&persisted_prefs) {
+        if tun {
+            let config = TunModeConfig {
+                apply_routes: true,
+                ..Default::default()
+            };
+            Box::pin(server.up_tun(config)).await?;
+            log::info!("rustscaled: restored TUN mode (hostname={hostname})");
+        } else {
+            Box::pin(server.up()).await?;
+            log::info!("rustscaled: restored node (hostname={hostname})");
+        }
+        print_status(&server, socket_path);
+        is_up = true;
+    }
+
+    // Phase 1: wait for Start/LoginInteractive to bring a fresh or logged-out
+    // profile up. The loop form also handles a closed command channel after
+    // the automatic-resume decision above.
+    while !is_up {
+        let Some(cmd) = command_rx.recv().await else {
+            break;
+        };
         match cmd {
             DaemonCommand::Start { auth_key } => {
                 if let Some(key) = auth_key {
@@ -461,6 +486,10 @@ async fn run_interactive(
     Ok(())
 }
 
+fn should_resume_persisted_node(prefs: &rustscale_ipn::Prefs) -> bool {
+    prefs.WantRunning && !prefs.LoggedOut
+}
+
 /// Apply config-file prefs to the on-disk prefs file so that `Server::up()`
 /// picks them up via `load_prefs()`. This handles fields that don't have
 /// direct `ServerBuilder` equivalents (e.g. `ShieldsUp`, `CorpDNS`,
@@ -582,17 +611,16 @@ fn print_status(server: &Server, socket_path: &Path) {
 fn cleanup_state(state_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     // Remove the LocalAPI socket file if it exists.
     let socket = state_dir.join("rustscaled.sock");
-    if socket.exists() {
-        std::fs::remove_file(&socket)?;
+    if rustscale_safesocket::remove_socket_file(&socket)? {
         log::debug!("rustscaled: removed {}", socket.display());
     }
 
-    // Remove the primary socket path if it exists.
+    // Remove the primary socket path only if it is still a socket. A path in
+    // a caller-controlled directory may have been replaced after shutdown.
     #[cfg(unix)]
     {
         let primary = rustscale_safesocket::default_socket_path();
-        if primary.exists() {
-            let _ = std::fs::remove_file(&primary);
+        if rustscale_safesocket::remove_socket_file(&primary)? {
             log::debug!("rustscaled: removed {}", primary.display());
         }
     }
@@ -695,7 +723,22 @@ mod tests {
     };
     use rustscale_tsnet::PreferencePolicy;
 
-    use super::{retry_logout_until_shutdown, InstallUpdatesPolicy, LogoutRunner};
+    use super::{
+        retry_logout_until_shutdown, should_resume_persisted_node, InstallUpdatesPolicy,
+        LogoutRunner,
+    };
+
+    #[test]
+    fn daemon_resumes_only_wanted_non_logged_out_profiles() {
+        let mut prefs = rustscale_ipn::Prefs::default();
+        assert!(!should_resume_persisted_node(&prefs));
+
+        prefs.WantRunning = true;
+        assert!(should_resume_persisted_node(&prefs));
+
+        prefs.LoggedOut = true;
+        assert!(!should_resume_persisted_node(&prefs));
+    }
 
     struct TransientLogout {
         remaining_failures: usize,

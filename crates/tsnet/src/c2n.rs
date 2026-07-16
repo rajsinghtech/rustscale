@@ -712,15 +712,123 @@ pub(crate) fn register_c2n_handlers(router: &mut C2nRouter, backend: Arc<TsnetC2
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{mpsc, Arc};
     use std::time::Duration;
 
     use rustscale_controlclient::C2nPublicationValidator;
     use rustscale_posture::{PublicationBarrier, SystemPolicy};
-    use rustscale_syspolicy::{MemoryProvider, PolicyEngine, PolicyKey, PolicyScope, RawValue};
+    use rustscale_syspolicy::{
+        MemoryProvider, PolicyEngine, PolicyError, PolicyErrorKind, PolicyKey, PolicyProvider,
+        PolicyScope, ProviderValues, RawValue, SettingDefinition,
+    };
 
     use super::{C2nReplyError, PosturePublicationValidator};
+
+    struct FailingPostureProvider {
+        fail: AtomicBool,
+    }
+
+    impl PolicyProvider for FailingPostureProvider {
+        fn load(&self, definitions: &[SettingDefinition]) -> Result<ProviderValues, PolicyError> {
+            if self.fail.load(Ordering::Acquire) {
+                return Err(PolicyError::new(PolicyErrorKind::Provider));
+            }
+            Ok(definitions
+                .iter()
+                .filter(|definition| definition.key == PolicyKey::PostureChecking)
+                .map(|definition| (definition.key, Ok(RawValue::String("always".into()))))
+                .collect())
+        }
+    }
+
+    fn validator(preference: Arc<crate::LivePosturePreference>) -> PosturePublicationValidator {
+        let (_, publication_generation, policy_generation) = preference.snapshot();
+        PosturePublicationValidator {
+            preference,
+            expected_publication_generation: publication_generation,
+            expected_policy_generation: policy_generation,
+            include_hardware_addrs: true,
+            response_has_hardware_addrs: true,
+        }
+    }
+
+    #[test]
+    fn unchanged_always_refresh_keeps_generation_and_allows_publication() {
+        let provider = Arc::new(MemoryProvider::from_values(BTreeMap::from([(
+            PolicyKey::PostureChecking,
+            RawValue::String("always".into()),
+        )])));
+        let engine = PolicyEngine::well_known(PolicyScope::Device).unwrap();
+        engine
+            .add_provider("managed posture", PolicyScope::Device, provider)
+            .unwrap();
+        let barrier = Arc::new(PublicationBarrier::new());
+        let policy =
+            SystemPolicy::from_engine_with_publication_barrier(engine.clone(), barrier.clone());
+        let preference = Arc::new(crate::LivePosturePreference::with_publication_barrier(
+            false, barrier,
+        ));
+        let validator = validator(preference.clone());
+        let before = preference.snapshot();
+
+        assert_eq!(
+            rustscale_posture::PosturePolicy::preference(&policy),
+            Ok(rustscale_posture::PreferenceOption::Always)
+        );
+        engine.reload().unwrap();
+        assert_eq!(preference.snapshot(), before);
+        let published = AtomicUsize::new(0);
+        assert_eq!(
+            validator.validate_and_publish(&mut || {
+                published.fetch_add(1, Ordering::Release);
+                Ok(())
+            }),
+            Ok(())
+        );
+        assert_eq!(published.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn provider_failure_after_collection_commits_unavailable_and_publishes_zero_bytes() {
+        let provider = Arc::new(FailingPostureProvider {
+            fail: AtomicBool::new(false),
+        });
+        let engine = PolicyEngine::well_known(PolicyScope::Device).unwrap();
+        engine
+            .add_provider("failing posture", PolicyScope::Device, provider.clone())
+            .unwrap();
+        let barrier = Arc::new(PublicationBarrier::new());
+        let _policy =
+            SystemPolicy::from_engine_with_publication_barrier(engine.clone(), barrier.clone());
+        let preference = Arc::new(crate::LivePosturePreference::with_publication_barrier(
+            false,
+            barrier.clone(),
+        ));
+        let validator = validator(preference.clone());
+        let before = preference.snapshot();
+
+        provider.fail.store(true, Ordering::Release);
+        assert!(engine.reload().is_err());
+        let after = preference.snapshot();
+        assert!(after.1 > before.1);
+        assert!(after.2 > before.2);
+        let (_, unavailable) = barrier.snapshot_with(|policy| policy.preference);
+        assert_eq!(
+            unavailable,
+            Err(rustscale_posture::PolicyError::Unavailable)
+        );
+
+        let published = AtomicUsize::new(0);
+        assert_eq!(
+            validator.validate_and_publish(&mut || {
+                published.fetch_add(1, Ordering::Release);
+                Ok(())
+            }),
+            Err(C2nReplyError::PublicationRevoked)
+        );
+        assert_eq!(published.load(Ordering::Acquire), 0);
+    }
 
     #[test]
     fn managed_never_after_handler_check_blocks_sensitive_h2_publication() {
@@ -739,14 +847,7 @@ mod tests {
             false,
             barrier.clone(),
         ));
-        let (_, publication_generation, policy_generation) = preference.snapshot();
-        let validator = PosturePublicationValidator {
-            preference,
-            expected_publication_generation: publication_generation,
-            expected_policy_generation: policy_generation,
-            include_hardware_addrs: true,
-            response_has_hardware_addrs: true,
-        };
+        let validator = validator(preference);
 
         let (checked_tx, checked_rx) = mpsc::sync_channel(1);
         let (release_tx, release_rx) = mpsc::sync_channel(1);

@@ -62,7 +62,7 @@ impl Snapshot {
         &self.scope
     }
 
-    /// Monotonically increasing reload generation.
+    /// Monotonically increasing effective snapshot-commit generation.
     pub const fn generation(&self) -> u64 {
         self.generation
     }
@@ -123,6 +123,30 @@ impl PolicyChange {
     }
 }
 
+/// A provider refresh result delivered inside the snapshot commit transaction.
+#[derive(Debug, Clone)]
+pub enum SnapshotCommit {
+    /// An effective snapshot change, before it becomes visible to readers.
+    Applied(Arc<Snapshot>),
+    /// A provider refresh failure; the previous snapshot remains installed.
+    Failed {
+        /// Monotonic commit-attempt generation allocated to this failure.
+        generation: u64,
+        /// Privacy-safe provider failure.
+        error: PolicyError,
+    },
+}
+
+impl SnapshotCommit {
+    /// Monotonic generation for this applied change or failed refresh.
+    pub fn generation(&self) -> u64 {
+        match self {
+            Self::Applied(snapshot) => snapshot.generation(),
+            Self::Failed { generation, .. } => *generation,
+        }
+    }
+}
+
 /// Stable identifier for a registered provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProviderId(u64);
@@ -161,7 +185,7 @@ struct ReadSource {
 }
 
 type ChangeCallback = Arc<dyn Fn(PolicyChange) + Send + Sync>;
-type SnapshotCommitCallback = Arc<dyn Fn(Arc<Snapshot>) + Send + Sync>;
+type SnapshotCommitCallback = Arc<dyn Fn(SnapshotCommit) + Send + Sync>;
 
 struct EngineInner {
     scope: PolicyScope,
@@ -173,6 +197,7 @@ struct EngineInner {
     snapshot_commit_callbacks: Mutex<BTreeMap<u64, SnapshotCommitCallback>>,
     next_source: AtomicU64,
     next_callback: AtomicU64,
+    next_generation: AtomicU64,
     notification_tx: SyncSender<()>,
     last_reload_error: RwLock<Option<PolicyError>>,
     provider_errors: RwLock<BTreeMap<ProviderId, PolicyError>>,
@@ -220,6 +245,7 @@ impl PolicyEngine {
             snapshot_commit_callbacks: Mutex::new(BTreeMap::new()),
             next_source: AtomicU64::new(0),
             next_callback: AtomicU64::new(0),
+            next_generation: AtomicU64::new(0),
             notification_tx,
             last_reload_error: RwLock::new(None),
             provider_errors: RwLock::new(BTreeMap::new()),
@@ -388,10 +414,12 @@ impl PolicyEngine {
             .clone()
     }
 
-    /// Concurrently reloads providers and atomically installs the merged snapshot.
+    /// Concurrently reloads providers and atomically installs a changed merged
+    /// snapshot. An unchanged successful refresh retains the current generation.
     ///
-    /// If a provider-wide read fails, the old snapshot remains current. Errors
-    /// for individual settings are retained in the new snapshot instead.
+    /// If a provider-wide read fails, the old snapshot remains current and a
+    /// synchronous failed commit event is emitted before return. Errors for
+    /// individual settings are retained in a changed new snapshot instead.
     pub fn reload(&self) -> Result<Arc<Snapshot>, PolicyError> {
         let reload_guard = self
             .inner
@@ -399,6 +427,17 @@ impl PolicyEngine {
             .lock()
             .expect("policy reload lock poisoned");
         let result = self.refresh_locked(false);
+        if let Err(error) = &result {
+            let generation = self
+                .inner
+                .next_generation
+                .fetch_add(1, Ordering::AcqRel)
+                .saturating_add(1);
+            self.invoke_snapshot_commit(SnapshotCommit::Failed {
+                generation,
+                error: error.clone(),
+            });
+        }
         drop(reload_guard);
         match result {
             Ok((snapshot, change)) => {
@@ -414,6 +453,12 @@ impl PolicyEngine {
         recover_provider_errors: bool,
     ) -> Result<(Arc<Snapshot>, Option<PolicyChange>), PolicyError> {
         self.inner.reload_attempts.fetch_add(1, Ordering::Relaxed);
+        let had_reload_error = self
+            .inner
+            .last_reload_error
+            .read()
+            .expect("policy error lock poisoned")
+            .is_some();
         if recover_provider_errors {
             *self
                 .inner
@@ -586,15 +631,21 @@ impl PolicyEngine {
             let _ = self.inner.notification_tx.try_send(());
         }
         let old = self.snapshot();
+        let effective_change = old.settings != settings;
+        if !effective_change && !had_reload_error {
+            return Ok((old, None));
+        }
+        let generation = self
+            .inner
+            .next_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
         let new = Arc::new(Snapshot {
             scope: self.inner.scope.clone(),
-            generation: old.generation.saturating_add(1),
+            generation,
             settings,
         });
-        let effective_change = old.settings != new.settings;
-        if effective_change {
-            self.invoke_snapshot_commit(new.clone());
-        }
+        self.invoke_snapshot_commit(SnapshotCommit::Applied(new.clone()));
         *self
             .inner
             .snapshot
@@ -607,7 +658,7 @@ impl PolicyEngine {
         Ok((new, change))
     }
 
-    fn invoke_snapshot_commit(&self, snapshot: Arc<Snapshot>) {
+    fn invoke_snapshot_commit(&self, commit: SnapshotCommit) {
         let callbacks: Vec<_> = self
             .inner
             .snapshot_commit_callbacks
@@ -617,7 +668,7 @@ impl PolicyEngine {
             .cloned()
             .collect();
         for callback in callbacks {
-            if catch_unwind(AssertUnwindSafe(|| callback(snapshot.clone()))).is_err() {
+            if catch_unwind(AssertUnwindSafe(|| callback(commit.clone()))).is_err() {
                 self.inner.callback_panics.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -693,7 +744,7 @@ impl PolicyEngine {
     /// the reload transaction is held and must not call back into this engine.
     pub fn register_snapshot_commit_callback(
         &self,
-        callback: impl Fn(Arc<Snapshot>) + Send + Sync + 'static,
+        callback: impl Fn(SnapshotCommit) + Send + Sync + 'static,
     ) -> SnapshotCommitRegistration {
         let id = self.inner.next_callback.fetch_add(1, Ordering::Relaxed);
         self.inner

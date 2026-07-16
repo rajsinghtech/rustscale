@@ -194,11 +194,11 @@ impl PosturePolicy for UserDecidesPolicy {
     }
 }
 
-/// Live policy backed by the current syspolicy engine and immutable snapshots.
-/// Each posture request reloads non-subscribing platform providers; providers
-/// with subscriptions also update the same engine continuously. Missing policy
-/// means `user-decides`, while provider and conversion failures fail closed in
-/// [`IdentityService`].
+/// Live policy backed by the current subscribed syspolicy snapshot. Request
+/// and publication checks perform no provider I/O or reload. Effective watcher
+/// commits update the shared publication generation, while provider refresh
+/// failures synchronously install fail-closed unavailable state before reload
+/// returns. Missing policy means `user-decides`.
 pub struct SystemPolicy {
     engine: Option<rustscale_syspolicy::PolicyEngine>,
     _publication_subscription: Option<rustscale_syspolicy::SnapshotCommitRegistration>,
@@ -238,13 +238,32 @@ impl SystemPolicy {
         };
 
         let callback_barrier = publication_barrier.clone();
-        let registration = engine.register_snapshot_commit_callback(move |snapshot| {
-            callback_barrier.update_policy(Self::publication_state_from_snapshot(&snapshot));
+        let registration = engine.register_snapshot_commit_callback(move |commit| {
+            let state = match commit {
+                rustscale_syspolicy::SnapshotCommit::Applied(snapshot) => {
+                    Self::publication_state_from_snapshot(&snapshot)
+                }
+                rustscale_syspolicy::SnapshotCommit::Failed { generation, .. } => {
+                    PublicationPolicyState {
+                        policy_generation: generation,
+                        preference: Err(PolicyError::Unavailable),
+                    }
+                }
+            };
+            callback_barrier.update_policy(state);
         });
         // Register before sampling, then reject stale generations in the
         // barrier. This closes the subscribe/snapshot race in both orders.
         let snapshot = engine.snapshot();
-        publication_barrier.update_policy(Self::publication_state_from_snapshot(&snapshot));
+        let initial_state = if engine.last_reload_error().is_some() {
+            PublicationPolicyState {
+                policy_generation: snapshot.generation(),
+                preference: Err(PolicyError::Unavailable),
+            }
+        } else {
+            Self::publication_state_from_snapshot(&snapshot)
+        };
+        publication_barrier.update_policy(initial_state);
         Self {
             engine: Some(engine),
             _publication_subscription: Some(registration),
@@ -295,21 +314,16 @@ impl Default for SystemPolicy {
 
 impl PosturePolicy for SystemPolicy {
     fn preference(&self) -> Result<PreferenceOption, PolicyError> {
-        let engine = self.engine.as_ref().ok_or(PolicyError::Unavailable)?;
-        let snapshot = engine.reload().map_err(|_| PolicyError::Unavailable)?;
-        let state = Self::publication_state_from_snapshot(&snapshot);
-        self.publication_barrier.update_policy(state.clone());
-        state.preference
+        if self.engine.is_none() {
+            return Err(PolicyError::Unavailable);
+        }
+        self.publication_barrier
+            .snapshot_with(|policy| policy.preference)
+            .1
     }
 
     fn publication_state(&self) -> PublicationPolicyState {
-        self.engine.as_ref().map_or(
-            PublicationPolicyState {
-                policy_generation: 0,
-                preference: Err(PolicyError::Unavailable),
-            },
-            |engine| Self::publication_state_from_snapshot(&engine.snapshot()),
-        )
+        self.publication_barrier.snapshot_with(Clone::clone).1
     }
 }
 
@@ -837,18 +851,20 @@ mod tests {
         engine
             .add_provider("managed posture", PolicyScope::Device, provider.clone())
             .unwrap();
-        let policy = SystemPolicy::from_engine(engine);
+        let policy = SystemPolicy::from_engine(engine.clone());
 
         assert_eq!(policy.preference(), Ok(PreferenceOption::Never));
         provider.set(
             PolicyKey::PostureChecking,
             RawValue::String("always".into()),
         );
+        engine.reload().unwrap();
         assert_eq!(policy.preference(), Ok(PreferenceOption::Always));
         provider.set(
             PolicyKey::PostureChecking,
             RawValue::String("invalid".into()),
         );
+        engine.reload().unwrap();
         assert_eq!(policy.preference(), Err(PolicyError::Unavailable));
     }
 

@@ -687,7 +687,7 @@ fn pending_notification_retries_without_stale_generation() {
 
     provider.change_with_failures("new", 2);
     wait_until(|| engine.get_string(PolicyKey::Tailnet, "").unwrap() == "new");
-    assert_eq!(engine.snapshot().generation(), initial_generation + 1);
+    assert!(engine.snapshot().generation() > initial_generation);
     assert!(engine.reload_attempt_count() >= initial_attempts + 3);
     assert_eq!(provider.loads.load(Ordering::SeqCst), 4);
     assert!(engine.last_reload_error().is_none());
@@ -727,12 +727,18 @@ fn notifications_are_nonblocking_coalesced_and_subscription_drop_is_reentrant_sa
         .unwrap();
     assert_eq!(provider.loads.load(Ordering::SeqCst), 1);
 
+    let generation = engine.snapshot().generation();
     provider.notify_many(100);
-    wait_until(|| engine.snapshot().generation() >= 2);
+    wait_until(|| provider.loads.load(Ordering::SeqCst) >= 2);
     thread::sleep(Duration::from_millis(80));
     assert!(
         provider.loads.load(Ordering::SeqCst) < 10,
         "notifications were not coalesced"
+    );
+    assert_eq!(
+        engine.snapshot().generation(),
+        generation,
+        "unchanged provider refresh advanced snapshot generation"
     );
 
     // Dropping the subscription invokes its callback. remove_provider must
@@ -953,7 +959,7 @@ fn watched_json_retries_pending_error_with_bounded_backoff_until_recovery() {
     // watcher event.
     fs::write(&path, r#"{"Tailnet":"recovered"}"#).unwrap();
     wait_until(|| engine.get_string(PolicyKey::Tailnet, "").unwrap() == "recovered");
-    assert_eq!(engine.snapshot().generation(), generation + 1);
+    assert!(engine.snapshot().generation() > generation);
     assert!(engine.last_reload_error().is_none());
     engine.remove_provider(id).unwrap();
 }

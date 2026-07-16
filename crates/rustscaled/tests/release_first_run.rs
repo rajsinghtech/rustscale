@@ -24,6 +24,10 @@ const ARCHIVE: &str = "rustscale-x86_64-unknown-linux-gnu.tar.gz";
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Linux, passwordless sudo, and exclusive /var/run/rustscaled.sock"]
 async fn installed_first_run_journey() {
+    if !release_harness_enabled() {
+        eprintln!("installed first-run gate skipped: use tools/packaging/test-first-run.sh");
+        return;
+    }
     require_sudo_and_exclusive_socket();
     if let Some(path) = std::env::var_os("RUSTSCALE_SOCKET_OWNERSHIP_FILE") {
         fs::write(path, b"owned\n").expect("record exclusive test socket ownership");
@@ -416,6 +420,16 @@ fn terminate_daemon_group(child: &mut Child) {
             .status();
         let _ = child.wait();
     }
+}
+
+fn release_harness_enabled() -> bool {
+    let cli = std::env::var_os("RUSTSCALE_RELEASE_CLI").is_some();
+    let daemon = std::env::var_os("RUSTSCALE_RELEASE_DAEMON").is_some();
+    assert_eq!(
+        cli, daemon,
+        "release harness must provide both release binary paths"
+    );
+    cli
 }
 
 fn require_sudo_and_exclusive_socket() {

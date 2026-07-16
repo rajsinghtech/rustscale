@@ -669,12 +669,23 @@ mod unix_store {
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(super) enum ClearGap {
-        BeforeFinalValidation,
+        BeforeJournalTombstone,
+        AfterJournalTombstone,
+        BeforeJournalUnlink,
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(super) enum RepairGap {
-        BeforeFinalValidation,
+        BeforeJournalTombstone,
+        AfterJournalTombstone,
+        BeforeJournalUnlink,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum TargetValidationStage {
+        BeforeTombstone,
+        AfterTombstone,
+        BeforeUnlink,
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -686,6 +697,11 @@ mod unix_store {
     pub(super) struct JournalMutation {
         pub(super) phase: JournalPhase,
         pub(super) prior: Option<JournalSnapshot>,
+    }
+
+    enum ExactTargetSnapshot {
+        Missing,
+        Regular(RawSnapshot),
     }
 
     impl JournalPhase {
@@ -870,6 +886,22 @@ mod unix_store {
             Self::open_owned_dir(&systemd, "user", create)
         }
 
+        fn has_journal_repair_tombstone(
+            directory: &OwnedFd,
+            unit_name: &str,
+        ) -> Result<bool, UnitStoreError> {
+            let prefix = format!("..{unit_name}.operation.");
+            let directory =
+                rustix::fs::Dir::read_from(directory).map_err(|_| UnitStoreError::Io)?;
+            for entry in directory {
+                let entry = entry.map_err(|_| UnitStoreError::Io)?;
+                if entry.file_name().to_bytes().starts_with(prefix.as_bytes()) {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+
         pub(super) fn inspect_at(
             directory: &OwnedFd,
             name: &str,
@@ -1003,6 +1035,46 @@ mod unix_store {
                 && final_name.st_ino as u64 == snapshot.identity.inode
                 && final_name.st_size >= 0
                 && final_name.st_size as usize == snapshot.bytes.len())
+        }
+
+        fn capture_expected_target(
+            directory: &OwnedFd,
+            unit_name: &str,
+            expected_identity: &str,
+            expected_hash: &str,
+        ) -> Result<ExactTargetSnapshot, UnitStoreError> {
+            if expected_identity == "missing" && expected_hash == "missing" {
+                return matches!(
+                    Self::inspect_at(directory, unit_name),
+                    Ok((StoredUnit::Missing, None))
+                )
+                .then_some(ExactTargetSnapshot::Missing)
+                .ok_or(UnitStoreError::RepairRequired);
+            }
+            let snapshot = Self::open_raw_snapshot(directory, unit_name)?
+                .ok_or(UnitStoreError::RepairRequired)?;
+            if identity_text(Some(snapshot.identity)) != expected_identity
+                || snapshot.hash != expected_hash
+            {
+                return Err(UnitStoreError::RepairRequired);
+            }
+            Ok(ExactTargetSnapshot::Regular(snapshot))
+        }
+
+        fn exact_target_still_named(
+            directory: &OwnedFd,
+            unit_name: &str,
+            snapshot: &ExactTargetSnapshot,
+        ) -> Result<bool, UnitStoreError> {
+            match snapshot {
+                ExactTargetSnapshot::Missing => Ok(matches!(
+                    Self::inspect_at(directory, unit_name),
+                    Ok((StoredUnit::Missing, None))
+                )),
+                ExactTargetSnapshot::Regular(snapshot) => {
+                    Self::raw_snapshot_still_named(directory, unit_name, snapshot)
+                }
+            }
         }
 
         pub(super) fn open_journal_snapshot(
@@ -1297,20 +1369,25 @@ mod unix_store {
             )
         }
 
-        pub(super) fn remove_exact_with_hook<F>(
+        fn remove_exact_validated_with_hook<F, V>(
             directory: &OwnedFd,
             name: &str,
             expected: &[u8],
             expected_identity: FileIdentity,
             tag: &str,
+            mut validate_target: V,
             mut hook: F,
         ) -> Result<(), UnitStoreError>
         where
             F: FnMut(CasGap, &OwnedFd, &str, &str),
+            V: FnMut(TargetValidationStage) -> Result<bool, UnitStoreError>,
         {
             let (current, identity) = Self::inspect_at(directory, name)?;
             if !Self::exact_regular(&current, identity, expected, expected_identity) {
                 return Err(UnitStoreError::Conflict);
+            }
+            if !validate_target(TargetValidationStage::BeforeTombstone)? {
+                return Err(UnitStoreError::RepairRequired);
             }
             let sequence = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
             let tombstone = format!(".{name}.{tag}.{sequence:x}");
@@ -1328,13 +1405,61 @@ mod unix_store {
             if !Self::exact_regular(&displaced, displaced_identity, expected, expected_identity) {
                 return Err(UnitStoreError::RepairRequired);
             }
+            if !validate_target(TargetValidationStage::AfterTombstone)? {
+                // Restore the journal name only if the target raced back to the
+                // exact captured state and the tombstone is still exact.
+                if validate_target(TargetValidationStage::AfterTombstone)? {
+                    let _ = Self::rename_noreplace_exact(
+                        directory,
+                        &tombstone,
+                        expected,
+                        expected_identity,
+                        name,
+                    );
+                }
+                return Err(UnitStoreError::RepairRequired);
+            }
             hook(CasGap::BeforeFinalize, directory, name, &tombstone);
             let (final_file, final_identity) = Self::inspect_at(directory, &tombstone)?;
             if !Self::exact_regular(&final_file, final_identity, expected, expected_identity) {
                 return Err(UnitStoreError::RepairRequired);
             }
+            if !validate_target(TargetValidationStage::BeforeUnlink)? {
+                if validate_target(TargetValidationStage::BeforeUnlink)? {
+                    let _ = Self::rename_noreplace_exact(
+                        directory,
+                        &tombstone,
+                        expected,
+                        expected_identity,
+                        name,
+                    );
+                }
+                return Err(UnitStoreError::RepairRequired);
+            }
             rustix::fs::unlinkat(directory, &tombstone, AtFlags::empty())
                 .map_err(|_| UnitStoreError::Io)
+        }
+
+        pub(super) fn remove_exact_with_hook<F>(
+            directory: &OwnedFd,
+            name: &str,
+            expected: &[u8],
+            expected_identity: FileIdentity,
+            tag: &str,
+            hook: F,
+        ) -> Result<(), UnitStoreError>
+        where
+            F: FnMut(CasGap, &OwnedFd, &str, &str),
+        {
+            Self::remove_exact_validated_with_hook(
+                directory,
+                name,
+                expected,
+                expected_identity,
+                tag,
+                |_| Ok(true),
+                hook,
+            )
         }
 
         fn remove_exact(
@@ -1359,10 +1484,13 @@ mod unix_store {
             unit_name: &str,
         ) -> Result<JournalMutation, UnitStoreError> {
             match Self::open_journal_snapshot(directory, unit_name)? {
-                None => Ok(JournalMutation {
-                    phase: JournalPhase::Forward,
-                    prior: None,
-                }),
+                None if !Self::has_journal_repair_tombstone(directory, unit_name)? => {
+                    Ok(JournalMutation {
+                        phase: JournalPhase::Forward,
+                        prior: None,
+                    })
+                }
+                None => Err(UnitStoreError::RepairRequired),
                 Some(snapshot) if snapshot.parsed.phase == JournalPhase::Forward => {
                     Ok(JournalMutation {
                         phase: JournalPhase::Rollback,
@@ -1723,34 +1851,33 @@ mod unix_store {
             {
                 return Err(UnitStoreError::RepairRequired);
             }
-            let (target, target_identity) = Self::inspect_at(&directory, unit_name)?;
-            if !snapshot_matches(
-                &target,
-                target_identity,
+            let target = Self::capture_expected_target(
+                &directory,
+                unit_name,
                 &snapshot.expected_target_identity,
                 &snapshot.expected_target_hash,
-            ) {
-                return Err(UnitStoreError::RepairRequired);
-            }
-            hook(ClearGap::BeforeFinalValidation, &directory, unit_name);
-            if !Self::snapshot_still_named(&directory, unit_name, snapshot)? {
-                return Err(UnitStoreError::RepairRequired);
-            }
-            let (target, target_identity) = Self::inspect_at(&directory, unit_name)?;
-            if !snapshot_matches(
-                &target,
-                target_identity,
-                &snapshot.expected_target_identity,
-                &snapshot.expected_target_hash,
-            ) {
-                return Err(UnitStoreError::RepairRequired);
-            }
-            Self::remove_exact(
+            )?;
+            Self::remove_exact_validated_with_hook(
                 &directory,
                 &journal,
                 &snapshot.bytes,
                 snapshot.identity,
                 "journal-clear",
+                |stage| {
+                    let gap = match stage {
+                        TargetValidationStage::BeforeTombstone => ClearGap::BeforeJournalTombstone,
+                        TargetValidationStage::AfterTombstone => ClearGap::AfterJournalTombstone,
+                        TargetValidationStage::BeforeUnlink => ClearGap::BeforeJournalUnlink,
+                    };
+                    hook(gap, &directory, unit_name);
+                    if stage == TargetValidationStage::BeforeTombstone
+                        && !Self::snapshot_still_named(&directory, unit_name, snapshot)?
+                    {
+                        return Ok(false);
+                    }
+                    Self::exact_target_still_named(&directory, unit_name, &target)
+                },
+                |_, _, _, _| {},
             )
             .map_err(|error| match error {
                 UnitStoreError::Conflict | UnitStoreError::RepairRequired => {
@@ -1788,7 +1915,7 @@ mod unix_store {
                 if snapshot.bytes != expected {
                     return Err(UnitStoreError::Conflict);
                 }
-                Some(snapshot)
+                ExactTargetSnapshot::Regular(snapshot)
             } else {
                 if !matches!(
                     Self::inspect_at(&directory, unit_name),
@@ -1796,26 +1923,29 @@ mod unix_store {
                 ) {
                     return Err(UnitStoreError::Conflict);
                 }
-                None
+                ExactTargetSnapshot::Missing
             };
-            hook(RepairGap::BeforeFinalValidation, &directory, unit_name);
-            if !Self::raw_snapshot_still_named(&directory, &journal_name, &journal)? {
-                return Err(UnitStoreError::RepairRequired);
-            }
-            match &target {
-                Some(target) if Self::raw_snapshot_still_named(&directory, unit_name, target)? => {}
-                None if matches!(
-                    Self::inspect_at(&directory, unit_name),
-                    Ok((StoredUnit::Missing, None))
-                ) => {}
-                _ => return Err(UnitStoreError::RepairRequired),
-            }
-            Self::remove_exact(
+            Self::remove_exact_validated_with_hook(
                 &directory,
                 &journal_name,
                 &journal.bytes,
                 journal.identity,
                 "malformed-repair",
+                |stage| {
+                    let gap = match stage {
+                        TargetValidationStage::BeforeTombstone => RepairGap::BeforeJournalTombstone,
+                        TargetValidationStage::AfterTombstone => RepairGap::AfterJournalTombstone,
+                        TargetValidationStage::BeforeUnlink => RepairGap::BeforeJournalUnlink,
+                    };
+                    hook(gap, &directory, unit_name);
+                    if stage == TargetValidationStage::BeforeTombstone
+                        && !Self::raw_snapshot_still_named(&directory, &journal_name, &journal)?
+                    {
+                        return Ok(false);
+                    }
+                    Self::exact_target_still_named(&directory, unit_name, &target)
+                },
+                |_, _, _, _| {},
             )?;
             rustix::fs::fsync(&directory).map_err(|_| UnitStoreError::Io)
         }
@@ -1909,7 +2039,11 @@ mod unix_store {
                 return Ok(false);
             };
             let Some(snapshot) = Self::open_journal_snapshot(&directory, unit_name)? else {
-                return Ok(false);
+                return if Self::has_journal_repair_tombstone(&directory, unit_name)? {
+                    Err(UnitStoreError::RepairRequired)
+                } else {
+                    Ok(false)
+                };
             };
             let phase = snapshot.parsed.phase;
             let kind = snapshot.parsed.kind.clone();
@@ -4546,7 +4680,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             store.clear_reload_required_with_hook("rustscale-tray.service", |gap, _, unit_name| {
-                if gap == unix_store::ClearGap::BeforeFinalValidation {
+                if gap == unix_store::ClearGap::BeforeJournalTombstone {
                     let path = store.unit_directory().join(unit_name);
                     replace_path(&path, b"clear-racer");
                 }
@@ -4571,7 +4705,7 @@ mod tests {
                 "rustscale-tray.service",
                 Some(&bytes),
                 |gap, _, _| {
-                    if gap == unix_store::RepairGap::BeforeFinalValidation {
+                    if gap == unix_store::RepairGap::BeforeJournalTombstone {
                         replace_path(&target, b"repair-racer");
                     }
                 },
@@ -4580,6 +4714,108 @@ mod tests {
         );
         assert!(journal_path.exists());
         assert_eq!(std::fs::read(target).unwrap(), b"repair-racer");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn target_races_at_each_journal_removal_stage_preserve_journal_inode() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        fn replace_path(path: &Path, bytes: &[u8]) {
+            let temporary = path.with_extension("race-new");
+            std::fs::write(&temporary, bytes).unwrap();
+            std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600)).unwrap();
+            std::fs::rename(temporary, path).unwrap();
+        }
+
+        fn inode_survives(directory: &Path, inode: u64) -> bool {
+            std::fs::read_dir(directory)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter_map(|entry| entry.metadata().ok())
+                .any(|metadata| metadata.ino() == inode)
+        }
+
+        for raced_gap in [
+            unix_store::ClearGap::BeforeJournalTombstone,
+            unix_store::ClearGap::AfterJournalTombstone,
+            unix_store::ClearGap::BeforeJournalUnlink,
+        ] {
+            let temporary = tempfile::tempdir().unwrap();
+            let config = temporary.path().join("config");
+            std::fs::create_dir(&config).unwrap();
+            let store = SystemUserUnitStore::new(&config).unwrap();
+            let bytes = unit(&[]).render().unwrap();
+            store
+                .atomic_replace(
+                    "rustscale-tray.service",
+                    None,
+                    &bytes,
+                    &CancellationToken::new(),
+                )
+                .unwrap();
+            let root = store.unit_directory();
+            let journal = root.join(".rustscale-tray.service.operation");
+            let journal_inode = std::fs::metadata(&journal).unwrap().ino();
+            assert_eq!(
+                store.clear_reload_required_with_hook(
+                    "rustscale-tray.service",
+                    |gap, _, unit_name| {
+                        if gap == raced_gap {
+                            replace_path(&root.join(unit_name), b"clear-stage-racer");
+                        }
+                    },
+                ),
+                Err(UnitStoreError::RepairRequired)
+            );
+            assert!(inode_survives(&root, journal_inode));
+            if raced_gap != unix_store::ClearGap::BeforeJournalTombstone {
+                assert_eq!(
+                    store.reload_required("rustscale-tray.service"),
+                    Err(UnitStoreError::RepairRequired)
+                );
+            }
+        }
+
+        for raced_gap in [
+            unix_store::RepairGap::BeforeJournalTombstone,
+            unix_store::RepairGap::AfterJournalTombstone,
+            unix_store::RepairGap::BeforeJournalUnlink,
+        ] {
+            let temporary = tempfile::tempdir().unwrap();
+            let config = temporary.path().join("config");
+            std::fs::create_dir(&config).unwrap();
+            let store = SystemUserUnitStore::new(&config).unwrap();
+            let root = store.unit_directory();
+            std::fs::create_dir_all(&root).unwrap();
+            let target = root.join("rustscale-tray.service");
+            let bytes = unit(&[]).render().unwrap();
+            std::fs::write(&target, &bytes).unwrap();
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let journal = root.join(".rustscale-tray.service.operation");
+            std::fs::write(&journal, b"malformed-stage-journal").unwrap();
+            std::fs::set_permissions(&journal, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let journal_inode = std::fs::metadata(&journal).unwrap().ino();
+            assert_eq!(
+                store.repair_precommit_journal_with_hook(
+                    "rustscale-tray.service",
+                    Some(&bytes),
+                    |gap, _, _| {
+                        if gap == raced_gap {
+                            replace_path(&target, b"repair-stage-racer");
+                        }
+                    },
+                ),
+                Err(UnitStoreError::RepairRequired)
+            );
+            assert!(inode_survives(&root, journal_inode));
+            if raced_gap != unix_store::RepairGap::BeforeJournalTombstone {
+                assert_eq!(
+                    store.reload_required("rustscale-tray.service"),
+                    Err(UnitStoreError::RepairRequired)
+                );
+            }
+        }
     }
 
     #[cfg(target_os = "linux")]

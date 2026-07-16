@@ -3,20 +3,23 @@
 //! Linux snapshots parse `/proc/net/tcp` and `/proc/net/tcp6` and can perform
 //! a bounded, best-effort `/proc/<pid>/fd` symlink walk to associate socket
 //! inodes with processes. macOS uses the numeric output of the system
-//! `netstat` command with a hard output cap and deadline. Windows is
-//! explicitly unsupported until a safe implementation can be provided without
-//! weakening this workspace's `unsafe_code` policy.
+//! `netstat` command with a hard output cap and deadline. Windows directly
+//! invokes the system PowerShell executable with a fixed, encoded command that
+//! emits a bounded numeric protocol around `Get-NetTCPConnection`; no
+//! intermediary shell, profile, interpolation, or localized table formatting
+//! is used.
 //!
 //! Snapshotting never closes, duplicates, or calls socket operations on a
-//! process file descriptor. PID metadata is observational only and is emitted
-//! only after validating a stable Linux process start time; it must never be
-//! used to select a destructive action. Process races make association metadata
-//! partial without invalidating connection rows already read from the OS.
+//! process file descriptor. PID metadata is observational only and must never
+//! be used to select a destructive action. Linux PID metadata is emitted only
+//! after validating a stable process start time; Windows PIDs come from the
+//! same diagnostic table row but can still race with process exit or PID reuse.
 
 #![forbid(unsafe_code)]
 
 mod linux;
 mod macos;
+mod windows;
 
 use std::fmt;
 use std::io;
@@ -33,6 +36,7 @@ pub use linux::{
     ProcAddressDecoder, ProcEndian, SystemLinuxReader,
 };
 pub use macos::{parse_netstat, snapshot_macos_with_reader, NetstatReader};
+pub use windows::{parse_windows_tcp_table, snapshot_windows_with_reader, WindowsTcpTableReader};
 
 /// Default whole-snapshot deadline.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -144,6 +148,7 @@ impl fmt::Display for State {
 pub enum OsMetadata {
     Linux { inode: u64, uid: u32 },
     Macos,
+    Windows,
 }
 
 /// One TCP connection table row.
@@ -160,7 +165,7 @@ pub struct Entry {
     pub os_metadata: OsMetadata,
 }
 
-/// Completeness of optional inode-to-process association.
+/// Completeness of optional diagnostic process association.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProcessAssociation {
     NotRequested,
@@ -192,6 +197,7 @@ pub struct Limits {
     pub max_table_bytes: usize,
     pub max_netstat_bytes: usize,
     pub max_line_bytes: usize,
+    pub max_windows_token_bytes: usize,
     pub max_entries: usize,
     pub max_processes: usize,
     pub max_fds_per_process: usize,
@@ -206,6 +212,7 @@ impl Default for Limits {
             max_table_bytes: 8 * 1024 * 1024,
             max_netstat_bytes: 8 * 1024 * 1024,
             max_line_bytes: 4096,
+            max_windows_token_bytes: 256,
             max_entries: 65_536,
             max_processes: 4096,
             max_fds_per_process: 4096,
@@ -335,6 +342,8 @@ pub enum Error {
     },
     #[error("netstat exited unsuccessfully: {0}")]
     NetstatFailed(String),
+    #[error("Windows TCP table command exited unsuccessfully: {0}")]
+    WindowsCommandFailed(String),
     #[error("TCP table snapshot worker capacity exhausted")]
     WorkerCapacity,
     #[error("TCP table snapshot worker terminated without a result")]
@@ -477,8 +486,16 @@ pub fn get(options: &SnapshotOptions, cancellation: &CancellationToken) -> Resul
     snapshot_macos_with_reader(macos::SystemNetstatReader, options, cancellation)
 }
 
+/// Take a host TCP connection table snapshot.
+#[cfg(target_os = "windows")]
+pub fn get(options: &SnapshotOptions, cancellation: &CancellationToken) -> Result<Table, Error> {
+    let context = SnapshotContext::new(options.deadline, cancellation.clone());
+    context.check()?;
+    snapshot_windows_with_reader(windows::SystemWindowsTcpTableReader, options, cancellation)
+}
+
 /// Return an explicit unsupported error on platforms without a safe reader.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 pub fn get(options: &SnapshotOptions, cancellation: &CancellationToken) -> Result<Table, Error> {
     let context = SnapshotContext::new(options.deadline, cancellation.clone());
     context.check()?;

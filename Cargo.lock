@@ -3569,6 +3569,7 @@ dependencies = [
 name = "rustscale-netstat"
 version = "0.1.1"
 dependencies = [
+ "base64",
  "thiserror 1.0.69",
 ]
 

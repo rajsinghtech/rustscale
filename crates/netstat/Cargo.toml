@@ -11,3 +11,6 @@ workspace = true
 
 [dependencies]
 thiserror.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+base64.workspace = true

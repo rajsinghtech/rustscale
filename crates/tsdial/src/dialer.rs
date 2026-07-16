@@ -37,7 +37,7 @@ pub struct Dialer {
     dns_map: RwLock<DnsMap>,
     active_sys_conns: ActiveConns,
     exit_dns_doh: RwLock<Option<String>>,
-    tun_name: RwLock<String>,
+    tun_name: StdRwLock<String>,
     // Netstack integration stubs (V1: unused — wired when netstack lands).
     use_netstack_for_ip: RwLock<Option<Arc<dyn Fn(IpAddr) -> bool + Send + Sync>>>,
     netstack_dial_tcp: RwLock<
@@ -63,7 +63,7 @@ impl Dialer {
             dns_map: RwLock::new(DnsMap::default()),
             active_sys_conns: ActiveConns::new(),
             exit_dns_doh: RwLock::new(None),
-            tun_name: RwLock::new(String::new()),
+            tun_name: StdRwLock::new(String::new()),
             use_netstack_for_ip: RwLock::new(None),
             netstack_dial_tcp: RwLock::new(None),
             link_change_cb: Mutex::new(None),
@@ -123,9 +123,21 @@ impl Dialer {
     }
 
     /// Set the tun interface name (used for route decisions in user_dial).
-    pub async fn set_tun_name(&self, name: String) {
-        let mut guard = self.tun_name.write().await;
-        *guard = name;
+    pub fn set_tun_name(&self, name: String) {
+        *self.tun_name.write().expect("tun name lock") = name;
+    }
+
+    /// Create a TCP socket protected to this generation's exact TUN. Socket
+    /// creation is synchronous so a caller can revalidate its route epoch and
+    /// bind the socket without an intervening await.
+    pub fn create_tun_user_socket(
+        &self,
+        network: &str,
+        addr: SocketAddr,
+    ) -> std::io::Result<tokio::net::TcpSocket> {
+        validate_user_network(network)?;
+        let tun_name = self.tun_name.read().expect("tun name lock");
+        rustscale_netns::create_tun_tcp_socket(addr, &tun_name)
     }
 
     /// System dial — outbound-to-internet. Uses `netns::dial_tcp` (proxy,

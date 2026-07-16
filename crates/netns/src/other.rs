@@ -10,6 +10,16 @@ pub async fn system_control_and_connect(addr: SocketAddr) -> Result<TcpStream, s
     control_and_connect(addr).await
 }
 
+pub fn create_tun_tcp_socket(
+    _addr: SocketAddr,
+    _tun_name: &str,
+) -> Result<tokio::net::TcpSocket, std::io::Error> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "protected TUN TCP binding is unsupported on this platform",
+    ))
+}
+
 pub fn configure_udp_socket(_socket: &UdpSocket) -> Result<(), std::io::Error> {
     Ok(())
 }

@@ -47,6 +47,9 @@ pub struct RouteTable {
     /// finish applying. LocalAPI TUN proxying stays fail-closed until that
     /// apply succeeds.
     localapi_dial_blocked: bool,
+    local_interface_addrs: Vec<IpAddr>,
+    connected_interface_prefixes: Vec<rustscale_tsaddr::IpPrefix>,
+    exit_node_allow_lan_access: bool,
 }
 
 #[derive(Clone)]
@@ -108,6 +111,9 @@ impl RouteTable {
             exit_capture: false,
             exit_blocked: false,
             localapi_dial_blocked: false,
+            local_interface_addrs: Vec::new(),
+            connected_interface_prefixes: Vec::new(),
+            exit_node_allow_lan_access: false,
         }
     }
 
@@ -119,12 +125,62 @@ impl RouteTable {
     /// IPs and accepted subnet routes (more specific than `0.0.0.0/0`) always
     /// win over the exit fallback.
     pub fn lookup(&self, ip: IpAddr) -> Option<NodePublic> {
-        let peer = self.index.get(ip).cloned();
+        let peer = self.lookup_explicit(ip);
         if self.exit_blocked {
             peer
         } else {
             peer.or_else(|| self.exit_node.clone())
         }
+    }
+
+    pub(crate) fn lookup_explicit(&self, ip: IpAddr) -> Option<NodePublic> {
+        self.index.get(ip).cloned()
+    }
+
+    pub(crate) fn localapi_target_via_tailnet(&self, ip: IpAddr) -> bool {
+        if self.localapi_dial_blocked || unsafe_local_target(ip) {
+            return false;
+        }
+        if self.local_interface_addrs.contains(&ip) {
+            return false;
+        }
+        if self.lookup_explicit(ip).is_some() {
+            return true;
+        }
+        if self.exit_node.is_none() || self.exit_blocked {
+            return false;
+        }
+        !(self.exit_node_allow_lan_access
+            && self
+                .connected_interface_prefixes
+                .iter()
+                .any(|prefix| prefix.contains(ip)))
+    }
+
+    pub(crate) fn set_local_interface_routes(
+        &mut self,
+        mut addrs: Vec<IpAddr>,
+        mut prefixes: Vec<rustscale_tsaddr::IpPrefix>,
+        exit_node_allow_lan_access: bool,
+    ) {
+        addrs.sort();
+        addrs.dedup();
+        rustscale_tsaddr::sort_prefixes(&mut prefixes);
+        prefixes.dedup();
+        self.local_interface_addrs = addrs;
+        self.connected_interface_prefixes = prefixes;
+        self.exit_node_allow_lan_access = exit_node_allow_lan_access;
+        self.localapi_dial_blocked = false;
+    }
+
+    pub(crate) fn local_interface_routes(
+        &self,
+    ) -> (&[IpAddr], &[rustscale_tsaddr::IpPrefix], bool) {
+        (
+            &self.local_interface_addrs,
+            &self.connected_interface_prefixes,
+            self.exit_node_allow_lan_access,
+        )
     }
 
     /// Rebuild the table from a new peer list (e.g. on a map-stream delta).
@@ -136,11 +192,17 @@ impl RouteTable {
         let capture = self.exit_capture;
         let blocked = self.exit_blocked;
         let localapi_dial_blocked = self.localapi_dial_blocked;
+        let local_interface_addrs = self.local_interface_addrs.clone();
+        let connected_interface_prefixes = self.connected_interface_prefixes.clone();
+        let exit_node_allow_lan_access = self.exit_node_allow_lan_access;
         *self = Self::from_peers_with_opts(peers, accept);
         self.exit_node = exit;
         self.exit_capture = capture;
         self.exit_blocked = blocked;
         self.localapi_dial_blocked = localapi_dial_blocked;
+        self.local_interface_addrs = local_interface_addrs;
+        self.connected_interface_prefixes = connected_interface_prefixes;
+        self.exit_node_allow_lan_access = exit_node_allow_lan_access;
     }
 
     /// Rebuild the table from a new peer list with an explicit `accept_routes`
@@ -150,11 +212,17 @@ impl RouteTable {
         let capture = self.exit_capture;
         let blocked = self.exit_blocked;
         let localapi_dial_blocked = self.localapi_dial_blocked;
+        let local_interface_addrs = self.local_interface_addrs.clone();
+        let connected_interface_prefixes = self.connected_interface_prefixes.clone();
+        let exit_node_allow_lan_access = self.exit_node_allow_lan_access;
         *self = Self::from_peers_with_opts(peers, accept_routes);
         self.exit_node = exit;
         self.exit_capture = capture;
         self.exit_blocked = blocked;
         self.localapi_dial_blocked = localapi_dial_blocked;
+        self.local_interface_addrs = local_interface_addrs;
+        self.connected_interface_prefixes = connected_interface_prefixes;
+        self.exit_node_allow_lan_access = exit_node_allow_lan_access;
     }
 
     /// Number of distinct normalized route entries (for diagnostics/testing).
@@ -271,6 +339,24 @@ impl RouteTable {
 
     pub(crate) fn localapi_dial_blocked(&self) -> bool {
         self.localapi_dial_blocked
+    }
+}
+
+fn unsafe_local_target(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_broadcast()
+                || ip.is_link_local()
+                || ip.is_multicast()
+        }
+        IpAddr::V6(ip) => {
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_unicast_link_local()
+                || ip.is_multicast()
+        }
     }
 }
 

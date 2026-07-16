@@ -238,7 +238,7 @@ async fn clear_exit_routes_for_identity_mismatch(
         match sync_router(
             router,
             tailscale_ips,
-            &routes,
+            &mut routes,
             magicsock,
             control_url,
             exit_node_allow_lan_access,
@@ -404,7 +404,7 @@ impl PeerAuthorityRuntime {
             if let Err(error) = sync_router(
                 router,
                 &self.tailscale_ips,
-                &routes,
+                &mut routes,
                 &self.magicsock,
                 &self.control_url,
                 live_prefs.ExitNodeAllowLANAccess,
@@ -620,15 +620,17 @@ pub(crate) fn spawn_map_update_task(
                     if resp.KeepAlive {
                         if let Some(router) = router.as_ref() {
                             let _exit_map_guard = exit_map_gate.lock().await;
+                            let _peer_gate = peer_map.gate.write().await;
                             let exit_node_allow_lan_access =
                                 prefs.read().await.ExitNodeAllowLANAccess;
                             let mut routes = route_table.write().await;
                             let security_critical =
                                 routes.exit_node_requested() && !exit_node_allow_lan_access;
+                            let localapi_was_blocked = routes.localapi_dial_blocked();
                             match sync_router(
                                 router,
                                 &tailscale_ips,
-                                &routes,
+                                &mut routes,
                                 &magicsock,
                                 &control_url,
                                 exit_node_allow_lan_access,
@@ -648,6 +650,9 @@ pub(crate) fn spawn_map_update_task(
                                     routes.unblock_localapi_dial();
                                 }
                                 Err(error) if security_critical => {
+                                    if !localapi_was_blocked {
+                                        peer_map.advance_dial_epoch_locked();
+                                    }
                                     routes.block_localapi_dial();
                                     routes.block_exit_traffic();
                                     let kernel = engage_kernel_security_block(
@@ -664,6 +669,9 @@ pub(crate) fn spawn_map_update_task(
                                     send_health_notify(&health, &ipn_backend);
                                 }
                                 Err(error) => {
+                                    if !localapi_was_blocked {
+                                        peer_map.advance_dial_epoch_locked();
+                                    }
                                     routes.block_localapi_dial();
                                     log::warn!("tsnet: map route refresh failed: {error}");
                                 }
@@ -979,7 +987,16 @@ pub(crate) fn spawn_map_update_task(
                     // Taildrive publication epochs all use the TKA-verified
                     // stable-ID intersection.
                     let map_commit = peer_map.gate.write().await;
-                    let current_exit_state = route_table.read().await.exit_route_state();
+                    let routes_snapshot = route_table.read().await;
+                    let current_exit_state = routes_snapshot.exit_route_state();
+                    let (local_addrs, connected_prefixes, allow_lan) =
+                        routes_snapshot.local_interface_routes();
+                    next_routes.set_local_interface_routes(
+                        local_addrs.to_vec(),
+                        connected_prefixes.to_vec(),
+                        allow_lan,
+                    );
+                    drop(routes_snapshot);
                     restore_exit_state_for_map(
                         &mut next_routes,
                         current_exit_state,
@@ -1114,7 +1131,7 @@ pub(crate) fn spawn_map_update_task(
                         sync_router(
                             router,
                             &tailscale_ips,
-                            &routes,
+                            &mut routes,
                             &magicsock,
                             &control_url,
                             live_prefs.ExitNodeAllowLANAccess,

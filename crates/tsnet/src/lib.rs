@@ -873,10 +873,10 @@ impl ServerBuilder {
 /// Internal running state.
 /// Serializes every map-driven and explicit exit-route mutation.
 ///
-/// Lock order is `exit_map_gate` -> prefs/peer snapshots -> `peer_map.gate`
-/// -> route table -> synchronous router. Map code releases `peer_map.gate`
-/// before taking the route-table/router locks. No caller may acquire
-/// `exit_map_gate` while holding any of those inner locks.
+/// Lock order is `exit_map_gate` -> `peer_map.gate` -> prefs/snapshots ->
+/// route table -> synchronous router. A router-only apply may run after the
+/// peer gate is released, but no caller may acquire the peer gate while
+/// holding the route table, or acquire `exit_map_gate` from an inner lock.
 pub(crate) type ExitMapGate = Arc<tokio::sync::Mutex<()>>;
 
 pub(crate) struct RunningState {
@@ -1666,7 +1666,7 @@ impl Server {
                     if let Err(error) = sync_router(
                         router,
                         &inner.tailscale_ips,
-                        &routes,
+                        &mut routes,
                         &inner.magicsock,
                         control_url,
                         next_prefs.ExitNodeAllowLANAccess,
@@ -1689,6 +1689,7 @@ impl Server {
                     committed_peer,
                     requested,
                 );
+                inner.peer_map.advance_dial_epoch_locked();
                 if pending {
                     selection.replace_from_prefs(&next_prefs);
                 } else {

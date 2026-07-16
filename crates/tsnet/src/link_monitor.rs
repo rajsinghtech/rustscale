@@ -4,6 +4,7 @@ use super::*;
 #[derive(Clone)]
 pub(crate) struct LinkRouteSync {
     pub exit_map_gate: crate::ExitMapGate,
+    pub peer_map: Arc<crate::peer_map::Runtime>,
     pub router: SharedRouter,
     pub route_table: Arc<RwLock<RouteTable>>,
     pub tailscale_ips: Vec<IpAddr>,
@@ -22,20 +23,34 @@ fn block_and_report_exit_route_failure(
     );
 }
 
-fn connected_prefixes_from_state(
+#[derive(Clone, Default)]
+pub(crate) struct InterfaceRouteSnapshot {
+    pub addrs: Vec<IpAddr>,
+    pub prefixes: Vec<rustscale_tsaddr::IpPrefix>,
+}
+
+/// Snapshot every non-TUN interface address plus prefixes connected on active
+/// interfaces. Exact addresses are denied even when an interface is down;
+/// connected prefixes describe routes the kernel can preserve directly.
+pub(crate) fn connected_prefixes_from_state(
     state: &rustscale_netmon::State,
     rustscale_tun_name: &str,
-) -> Result<Vec<rustscale_tsaddr::IpPrefix>, String> {
+) -> Result<InterfaceRouteSnapshot, String> {
+    let mut addrs = Vec::new();
     let mut prefixes = Vec::new();
     for (name, addresses) in &state.interface_ips {
         let Some(meta) = state.interface_meta.get(name) else {
             return Err(format!("missing metadata for connected interface {name}"));
         };
-        if !meta.is_up || meta.is_loopback || name == rustscale_tun_name {
+        if meta.is_loopback || name == rustscale_tun_name {
             continue;
         }
         for prefix in addresses {
             if prefix.bits == 0 {
+                continue;
+            }
+            addrs.push(prefix.ip);
+            if !meta.is_up {
                 continue;
             }
             let ip = match prefix.ip {
@@ -64,9 +79,11 @@ fn connected_prefixes_from_state(
             });
         }
     }
+    addrs.sort();
+    addrs.dedup();
     rustscale_tsaddr::sort_prefixes(&mut prefixes);
     prefixes.dedup();
-    Ok(prefixes)
+    Ok(InterfaceRouteSnapshot { addrs, prefixes })
 }
 
 #[cfg(target_os = "macos")]
@@ -98,18 +115,18 @@ fn append_darwin_route_prefixes(
 fn security_prefixes_from_state(
     state: &rustscale_netmon::State,
     rustscale_tun_name: &str,
-) -> Result<Vec<rustscale_tsaddr::IpPrefix>, String> {
+) -> Result<InterfaceRouteSnapshot, String> {
     #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
-    let mut prefixes = connected_prefixes_from_state(state, rustscale_tun_name)?;
+    let mut snapshot = connected_prefixes_from_state(state, rustscale_tun_name)?;
     #[cfg(target_os = "macos")]
     {
         let routes = rustscale_routetable::get_route_table(100_000)
             .map_err(|error| format!("Darwin route-table enumeration failed: {error}"))?;
-        append_darwin_route_prefixes(&mut prefixes, routes, rustscale_tun_name);
-        rustscale_tsaddr::sort_prefixes(&mut prefixes);
-        prefixes.dedup();
+        append_darwin_route_prefixes(&mut snapshot.prefixes, routes, rustscale_tun_name);
+        rustscale_tsaddr::sort_prefixes(&mut snapshot.prefixes);
+        snapshot.prefixes.dedup();
     }
-    Ok(prefixes)
+    Ok(snapshot)
 }
 
 /// Spawn the network change monitor. On a major link change (interface IP
@@ -136,8 +153,10 @@ pub(crate) async fn spawn_link_monitor(
     if initial_enumeration_failed {
         if let Some(route_sync) = route_sync.as_ref() {
             let _exit_map_guard = route_sync.exit_map_gate.lock().await;
-            let security_required = route_sync.route_table.read().await.exit_node_requested()
-                && !route_sync.prefs.read().await.ExitNodeAllowLANAccess;
+            let _peer_gate = route_sync.peer_map.gate.write().await;
+            let allow_lan = route_sync.prefs.read().await.ExitNodeAllowLANAccess;
+            let security_required =
+                route_sync.route_table.read().await.exit_node_requested() && !allow_lan;
             if security_required {
                 let kernel_error = engage_kernel_security_block(
                     &route_sync.router,
@@ -147,6 +166,7 @@ pub(crate) async fn spawn_link_monitor(
                 .map(|error| format!("; kernel block: {error}"))
                 .unwrap_or_default();
                 route_sync.route_table.write().await.block_exit_traffic();
+                route_sync.peer_map.advance_dial_epoch_locked();
                 health.set_unhealthy(
                     WARN_EXIT_ROUTE_SECURITY,
                     format!("initial connected-interface enumeration failed{kernel_error}"),
@@ -181,9 +201,9 @@ pub(crate) async fn spawn_link_monitor(
             // contains the successfully enumerated connected-prefix snapshot,
             // so security refresh does not perform a second fallible scan.
             if let Some(route_sync) = route_sync {
-                // Global lock order: exit_map_gate -> prefs/snapshots -> route
-                // table -> router. Hold the gate through the complete link
-                // route commit so API/map mutations cannot be overwritten.
+                // Global lock order: exit_map_gate -> peer gate -> prefs ->
+                // route table -> router. Hold both gates through the complete
+                // link-route commit so plans cannot invert peer/route locks.
                 let _exit_map_guard = route_sync.exit_map_gate.lock().await;
                 let tun_name = {
                     match route_sync.router.lock() {
@@ -192,6 +212,7 @@ pub(crate) async fn spawn_link_monitor(
                     }
                 };
                 let Some(tun_name) = tun_name else {
+                    let _peer_gate = route_sync.peer_map.gate.write().await;
                     let allow_lan = route_sync.prefs.read().await.ExitNodeAllowLANAccess;
                     let mut routes = route_sync.route_table.write().await;
                     if routes.exit_node_requested() && !allow_lan {
@@ -201,6 +222,7 @@ pub(crate) async fn spawn_link_monitor(
                             "router lock poisoned",
                         );
                     }
+                    route_sync.peer_map.advance_dial_epoch_locked();
                     return;
                 };
                 let mut prefix_snapshot = if delta.enumeration_failed {
@@ -212,13 +234,14 @@ pub(crate) async fn spawn_link_monitor(
                     if cancel.is_cancelled() {
                         return;
                     }
+                    let peer_gate = route_sync.peer_map.gate.write().await;
                     let exit_node_allow_lan_access =
                         route_sync.prefs.read().await.ExitNodeAllowLANAccess;
                     let mut routes = route_sync.route_table.write().await;
                     let security_critical =
                         routes.exit_node_requested() && !exit_node_allow_lan_access;
-                    let connected_prefixes = match &prefix_snapshot {
-                        Ok(prefixes) => prefixes.clone(),
+                    let interface_routes = match &prefix_snapshot {
+                        Ok(snapshot) => snapshot.clone(),
                         Err(error) if security_critical => {
                             let kernel_error = engage_kernel_security_block(
                                 &route_sync.router,
@@ -232,7 +255,9 @@ pub(crate) async fn spawn_link_monitor(
                                 &health,
                                 kernel_error,
                             );
+                            route_sync.peer_map.advance_dial_epoch_locked();
                             drop(routes);
+                            drop(peer_gate);
                             tokio::select! {
                                 () = cancel.cancelled() => return,
                                 () = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
@@ -257,7 +282,9 @@ pub(crate) async fn spawn_link_monitor(
                             SecurityBlockReason::LinkRefresh,
                         ) {
                             block_and_report_exit_route_failure(&mut routes, &health, error);
+                            route_sync.peer_map.advance_dial_epoch_locked();
                             drop(routes);
+                            drop(peer_gate);
                             tokio::select! {
                                 () = cancel.cancelled() => return,
                                 () = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
@@ -273,13 +300,20 @@ pub(crate) async fn spawn_link_monitor(
                     match sync_router_with_connected_prefixes(
                         &route_sync.router,
                         &route_sync.tailscale_ips,
-                        &routes,
+                        &mut routes,
                         &magicsock,
                         &control_url,
                         exit_node_allow_lan_access,
-                        connected_prefixes,
+                        interface_routes.prefixes.clone(),
                     ) {
                         Ok(()) => {
+                            let mut local_addrs = interface_routes.addrs;
+                            local_addrs.extend_from_slice(&route_sync.tailscale_ips);
+                            routes.set_local_interface_routes(
+                                local_addrs,
+                                interface_routes.prefixes,
+                                exit_node_allow_lan_access,
+                            );
                             let enumeration_latched = clear_kernel_security_block_reason(
                                 &route_sync.router,
                                 SecurityBlockReason::Enumeration,
@@ -299,11 +333,14 @@ pub(crate) async fn spawn_link_monitor(
                                 routes.unblock_exit_traffic();
                                 health.set_healthy(WARN_EXIT_ROUTE_SECURITY);
                             }
+                            route_sync.peer_map.advance_dial_epoch_locked();
                             break;
                         }
                         Err(error) if security_critical => {
+                            route_sync.peer_map.advance_dial_epoch_locked();
                             block_and_report_exit_route_failure(&mut routes, &health, error);
                             drop(routes);
+                            drop(peer_gate);
                             tokio::select! {
                                 () = cancel.cancelled() => return,
                                 () = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
@@ -313,6 +350,7 @@ pub(crate) async fn spawn_link_monitor(
                                 .and_then(|state| security_prefixes_from_state(&state, &tun_name));
                         }
                         Err(error) => {
+                            route_sync.peer_map.advance_dial_epoch_locked();
                             log::warn!("tsnet: interface route refresh failed: {error}");
                             break;
                         }
@@ -841,15 +879,20 @@ mod tests {
             Err(std::io::Error::other("injected enumeration failure"));
         assert!(injected_enumeration.is_err());
         let connected = connected_prefixes_from_state(&state, "rustscale0").unwrap();
+        assert_eq!(connected.addrs, ["100.100.2.99".parse::<IpAddr>().unwrap()]);
         assert_eq!(
-            connected,
+            connected.prefixes,
             [rustscale_tsaddr::IpPrefix::parse("100.100.2.0/24").unwrap()]
         );
 
         let mut routes = RouteTable::default();
         routes.set_exit_node(NodePrivate::generate().public());
-        let config =
-            crate::tun_pump::build_router_config_with_local_routes(&[], &routes, false, connected);
+        let config = crate::tun_pump::build_router_config_with_local_routes(
+            &[],
+            &routes,
+            false,
+            connected.prefixes,
+        );
         assert!(config
             .routes
             .contains(&rustscale_tsaddr::IpPrefix::parse("100.100.2.0/25").unwrap()));

@@ -30,6 +30,8 @@ pub(crate) struct Runtime {
     pub(crate) gate: tokio::sync::RwLock<()>,
     identity: RwLock<Arc<IdentitySnapshot>>,
     authorization_epoch: AtomicU64,
+    dial_epoch: AtomicU64,
+    dial_changes: tokio::sync::watch::Sender<u64>,
     flows: Mutex<HashMap<Flow, FlowIdentity>>,
 }
 
@@ -40,6 +42,8 @@ impl Runtime {
             gate: tokio::sync::RwLock::new(()),
             identity: RwLock::new(Arc::new(identity)),
             authorization_epoch: AtomicU64::new(1),
+            dial_epoch: AtomicU64::new(1),
+            dial_changes: tokio::sync::watch::channel(1).0,
             flows: Mutex::new(HashMap::new()),
         }))
     }
@@ -55,11 +59,28 @@ impl Runtime {
         self.authorization_epoch.load(Ordering::Acquire)
     }
 
+    pub(crate) fn dial_epoch(&self) -> u64 {
+        self.dial_epoch.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn subscribe_dial_epoch(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.dial_changes.subscribe()
+    }
+
+    /// Publish a TUN route/policy generation change while holding
+    /// `gate.write()`. Pending protected dials subscribe to this epoch without
+    /// invalidating unrelated packet-flow provenance.
+    pub(crate) fn advance_dial_epoch_locked(&self) {
+        let epoch = self.dial_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        self.dial_changes.send_replace(epoch);
+    }
+
     /// Publish a non-identity authorization change (for example ShieldsUp)
     /// while the caller holds `gate.write()`. Final plaintext delivery rejects
     /// work staged against the preceding epoch.
     pub(crate) fn advance_authorization_epoch_locked(&self) {
         self.authorization_epoch.fetch_add(1, Ordering::AcqRel);
+        self.advance_dial_epoch_locked();
         self.flows.lock().expect("peer flow lock poisoned").clear();
     }
 

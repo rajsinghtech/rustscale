@@ -1962,7 +1962,7 @@ impl Server {
             self.config.state_dir.as_deref(),
         )
         .await?;
-        b.user_dialer.set_tun_name(tun.name().to_owned()).await;
+        b.user_dialer.set_tun_name(tun.name().to_owned());
         // Transfer OS-route ownership before the next cancellable await.
         rollback.router.clone_from(&router);
 
@@ -1982,6 +1982,7 @@ impl Server {
             b.health.clone(),
             router.as_ref().map(|router| LinkRouteSync {
                 exit_map_gate: b.exit_map_gate.clone(),
+                peer_map: b.peer_map.clone(),
                 router: router.clone(),
                 route_table: b.route_table.clone(),
                 tailscale_ips: b.tailscale_ips.clone(),
@@ -2351,6 +2352,7 @@ impl Server {
                 netstack: None, // TUN mode uses the generation's UserDialer
                 dial_backend: Some(localapi::tun_dial_backend(
                     b.user_dialer.clone(),
+                    b.peer_map.clone(),
                     b.route_table.clone(),
                 )),
                 dial_admission: localapi::global_dial_admission(),

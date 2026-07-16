@@ -25,19 +25,43 @@ pub struct ConnIdentity {
     pub uid: Option<u32>,
     pub pid: Option<u32>,
     pub is_unix_sock: bool,
+    /// True only when `uid` came from trusted kernel peer credentials or the
+    /// explicitly trusted in-process transport. Credential-authenticated TCP
+    /// must leave this false even when it has ordinary LocalAPI write access.
+    pub trusted_os_uid: bool,
 }
 
 impl ConnIdentity {
-    /// Returns an identity that is always granted read-write access (uid 0).
-    /// Used on transports where peer credentials are not available but the
-    /// connection is already authenticated by other means (named-pipe ACL,
-    /// in-process loopback, HTTP basic-auth).
+    /// Returns an identity that is always granted ordinary read-write access.
+    /// This is for credential-authenticated transports such as loopback TCP;
+    /// it deliberately carries no trusted local-system identity.
     pub fn readwrite() -> Self {
         Self {
             uid: Some(0),
             pid: None,
             is_unix_sock: false,
+            trusted_os_uid: false,
         }
+    }
+
+    /// Trusted authority established by the local system, such as a named-pipe
+    /// ACL on Windows. Platforms without numeric UIDs represent it as uid 0.
+    pub fn trusted_local_system() -> Self {
+        Self {
+            uid: Some(0),
+            pid: None,
+            is_unix_sock: false,
+            trusted_os_uid: true,
+        }
+    }
+
+    /// Trusted authority for calls originating inside the owning process.
+    pub fn trusted_in_process() -> Self {
+        Self::trusted_local_system()
+    }
+
+    pub fn has_trusted_os_uid(&self) -> bool {
+        self.trusted_os_uid && self.uid.is_some()
     }
 
     /// Whether this connection should be granted full read-write access.
@@ -114,6 +138,7 @@ impl ConnIdentity {
             uid: creds.as_ref().map(|c| c.uid),
             pid: creds.as_ref().map(|c| c.pid),
             is_unix_sock: true,
+            trusted_os_uid: creds.is_some(),
         }
     }
 }
@@ -231,6 +256,8 @@ mod tests {
         assert!(id.is_readwrite(0, None));
         assert!(id.is_readwrite(1000, None));
         assert!(id.is_readwrite(501, Some(42)));
+        assert!(!id.has_trusted_os_uid());
+        assert!(ConnIdentity::trusted_in_process().has_trusted_os_uid());
     }
 
     #[test]
@@ -239,9 +266,11 @@ mod tests {
             uid: Some(0),
             pid: Some(123),
             is_unix_sock: true,
+            trusted_os_uid: true,
         };
         assert!(id.is_readwrite(501, None));
         assert!(id.is_readwrite(1000, None));
+        assert!(id.has_trusted_os_uid());
     }
 
     #[test]
@@ -250,9 +279,11 @@ mod tests {
             uid: Some(501),
             pid: Some(123),
             is_unix_sock: true,
+            trusted_os_uid: true,
         };
         assert!(id.is_readwrite(501, None));
         assert!(!id.is_readwrite(502, None));
+        assert!(id.has_trusted_os_uid());
     }
 
     #[test]
@@ -261,9 +292,11 @@ mod tests {
             uid: Some(42),
             pid: None,
             is_unix_sock: true,
+            trusted_os_uid: true,
         };
         assert!(id.is_readwrite(501, Some(42)));
         assert!(!id.is_readwrite(501, None));
+        assert!(id.has_trusted_os_uid());
     }
 
     #[test]
@@ -271,6 +304,7 @@ mod tests {
         let id = ConnIdentity::default();
         assert!(!id.is_readwrite(0, None));
         assert!(!id.is_readwrite(501, None));
+        assert!(!id.has_trusted_os_uid());
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
@@ -328,6 +362,7 @@ mod tests {
         assert!(identity.uid.is_some());
         let self_uid = unsafe { libc::getuid() };
         assert_eq!(identity.uid, Some(self_uid));
+        assert!(identity.has_trusted_os_uid());
         // Same-uid peer should be read-write.
         assert!(identity.is_readwrite(self_uid, None));
     }

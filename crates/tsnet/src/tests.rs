@@ -934,6 +934,95 @@ async fn retained_in_memory_client_cannot_mutate_routes_after_close() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn loopback_credential_never_grants_drive_root_authority_or_debug_disclosure() {
+    use base64::Engine as _;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    async fn request(
+        addr: std::net::SocketAddr,
+        credential: &str,
+        method: &str,
+        path: &str,
+        body: &[u8],
+        extra_headers: &str,
+    ) -> String {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let basic = base64::engine::general_purpose::STANDARD.encode(format!("tsnet:{credential}"));
+        let head = format!(
+            "{method} {path} HTTP/1.1\r\nHost: localhost\r\nSec-Tailscale: localapi\r\nAuthorization: Basic {basic}\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(head.as_bytes()).await.unwrap();
+        stream.write_all(body).await.unwrap();
+        let mut bytes = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            match stream.read(&mut chunk).await {
+                Ok(0) => break,
+                Ok(count) => bytes.extend_from_slice(&chunk[..count]),
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => break,
+                Err(error) => panic!("loopback response read failed: {error}"),
+            }
+        }
+        String::from_utf8(bytes).unwrap()
+    }
+
+    let mut control = rustscale_testcontrol::Server::new();
+    control.start().await.unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let mut server = Server::builder()
+        .hostname("loopback-drive-authority")
+        .auth_key("tskey-test")
+        .control_url(control.base_url())
+        .state_dir(temp.path())
+        .disable_portmapping(true)
+        .build()
+        .unwrap();
+    Box::pin(server.up()).await.unwrap();
+    let handle = server
+        .loopback("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let debug = format!("{handle:?}");
+    assert!(!debug.contains(&handle.localapi_cred));
+    assert!(!debug.contains(&handle.proxy_cred));
+    assert_eq!(debug.matches("<redacted>").count(), 2);
+
+    let read = request(
+        handle.addr,
+        &handle.localapi_cred,
+        "GET",
+        "/localapi/v0/drive/config",
+        &[],
+        "",
+    )
+    .await;
+    assert!(read.starts_with("HTTP/1.1 200 OK"), "response: {read}");
+    let etag = read
+        .lines()
+        .find_map(|line| line.strip_prefix("ETag: \"")?.strip_suffix('\"'))
+        .unwrap();
+    let mutation = request(
+        handle.addr,
+        &handle.localapi_cred,
+        "PUT",
+        "/localapi/v0/drive/config",
+        &[],
+        &format!("If-Match: \"{etag}\"\r\n"),
+    )
+    .await;
+    assert!(
+        mutation.starts_with("HTTP/1.1 403 Forbidden"),
+        "response: {mutation}"
+    );
+    assert!(!mutation.contains(&handle.localapi_cred));
+    assert!(!mutation.contains(&handle.proxy_cred));
+
+    handle.shutdown().await;
+    server.close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dropped_loopback_handle_is_joined_by_central_close() {
     let mut control = rustscale_testcontrol::Server::new();
     control.start().await.unwrap();

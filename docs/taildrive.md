@@ -84,9 +84,14 @@ surface. It was compared with Tailscale's `drive/`, `feature/drive`,
   filesystem pool; a full-body clone is never made. Uploads use same-directory
   temporary files, `sync_all`, a final cancellation check, and rename. PUT,
   DELETE, MOVE, and COPY accept only regular files/directories as each method
-  permits. They re-stat no-follow under the publication barrier immediately
-  before replace, unlink, or rename, so a raced-in FIFO, socket, device, or
-  symlink remains untouched.
+  permits. On supported Unix targets, PUT/COPY/DELETE/MOVE first use atomic
+  no-replace staging or exchange, then pin and inspect the exact displaced or
+  source inode through a no-follow file descriptor before any unlink. A safe
+  failure atomically restores the exact inode; if a concurrent pathname race
+  makes restoration unsafe, all recoverable objects are retained in a hidden
+  owner-only quarantine and the request returns a repair-required error.
+  Special objects are never unlinked. Platforms without the required atomic
+  rename primitives fail these mutations closed.
   Configuration root opening, upload/copy I/O, and sync happen outside the
   commit barrier; only the final publication is guarded. Cancellation after
   sync cannot publish the destination, and failed or truncated uploads remove
@@ -107,9 +112,14 @@ The local, peer-credential-authorized API exposes:
   A concurrent mutation returns 412 without changing the newer snapshot.
 
 The status/config reads require ordinary LocalAPI read-write identity. Config
-mutation is stricter: only root or the daemon UID may change roots on Unix;
-`OperatorUser` is denied until user switching or per-caller filesystem
-capabilities exist. Bodies and responses are limited to 1 MiB. These endpoints
+mutation is stricter: only root or the daemon UID reported by trusted kernel
+peer credentials, or the owning process through its in-memory client, may
+change roots on Unix. An authenticated loopback/TCP credential has no trusted
+OS UID and cannot mutate Drive configuration;
+`OperatorUser` is also denied until user switching or per-caller filesystem
+capabilities exist. Loopback credentials are redacted from Debug output and
+request types carrying authorization headers have no Debug representation.
+Bodies and responses are limited to 1 MiB. These endpoints
 intentionally provide no platform mount, remote composition, security-scoped
 bookmark, or automatic persistence behavior.
 
@@ -150,8 +160,9 @@ explicitly rather than claiming support.
 
 Hermetic core, LocalAPI, localclient, and CLI tests cover
 compare-and-swap concurrent mutations, restart-unique ETags, daemon/root versus
-operator authorization (including raw pre-body denial), phased LocalAPI body
-admission, cancellation/deadlines, bounded JSON responses, CLI completion and text/JSON
+operator and credential-only authorization (including raw pre-body denial),
+credential redaction, phased LocalAPI body admission, cancellation/deadlines,
+bounded JSON responses, CLI completion and text/JSON
 shapes, malicious names, traversal, symlink and special-file roots, explicit
 remote/bookmark rejection, browse/read/write/move/delete, unauthorized peers,
 signed grant narrowing from read-write to read-only,

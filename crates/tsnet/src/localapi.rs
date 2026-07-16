@@ -913,8 +913,8 @@ fn spawn_localapi_inner(
 }
 
 /// Extract a [`ConnIdentity`] from a server-side stream. On Unix this reads
-/// peer credentials (SO_PEERCRED/LOCAL_PEERCRED); on other platforms all
-/// connections are treated as read-write (pipe ACL handles access control).
+/// peer credentials (SO_PEERCRED/LOCAL_PEERCRED); on other platforms the
+/// local-system identity is trusted because the pipe ACL handles access control.
 #[cfg(unix)]
 fn peer_identity_from_stream(stream: &ServerStream) -> ConnIdentity {
     ConnIdentity::from_stream(stream)
@@ -922,14 +922,13 @@ fn peer_identity_from_stream(stream: &ServerStream) -> ConnIdentity {
 
 #[cfg(not(unix))]
 fn peer_identity_from_stream(_stream: &ServerStream) -> ConnIdentity {
-    ConnIdentity::readwrite()
+    ConnIdentity::trusted_local_system()
 }
 
 // ---------------------------------------------------------------------------
 // HTTP request parsing (same pattern as crates/c2n)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
 pub(crate) struct HttpRequest {
     pub(crate) method: String,
     pub(crate) path: String,
@@ -940,7 +939,6 @@ pub(crate) struct HttpRequest {
     pub(crate) body: Vec<u8>,
 }
 
-#[derive(Debug)]
 pub(crate) struct HttpRequestHead {
     pub(crate) method: String,
     pub(crate) path: String,
@@ -2082,14 +2080,18 @@ async fn require_readwrite(_identity: &ConnIdentity, _state: &LocalApiState) -> 
 /// Taildrive roots are opened with the daemon's filesystem authority. Until
 /// per-caller/user-switching authority exists, only root or the daemon UID may
 /// alter them; OperatorUser remains sufficient for ordinary LocalAPI writes.
-#[cfg(unix)]
 fn require_drive_config_owner(identity: &ConnIdentity) -> bool {
-    identity.is_readwrite(rustix::process::getuid().as_raw(), None)
-}
-
-#[cfg(not(unix))]
-fn require_drive_config_owner(_identity: &ConnIdentity) -> bool {
-    true
+    if !identity.has_trusted_os_uid() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        identity.is_readwrite(rustix::process::getuid().as_raw(), None)
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 /// Write a 403 Forbidden response for read-only peers attempting mutations.
@@ -5454,7 +5456,8 @@ mod tests {
         let mut short = std::io::Cursor::new(b"x");
         let error = read_request_body(&mut short, disconnected, 2)
             .await
-            .unwrap_err();
+            .err()
+            .expect("disconnected body must fail");
         assert!(error.contains("disconnected"));
 
         let waiting =
@@ -5464,7 +5467,7 @@ mod tests {
         let body = tokio::spawn(async move { read_request_body(&mut server, waiting, 1).await });
         tokio::task::yield_now().await;
         tokio::time::advance(LOCALAPI_BODY_BASE_TIMEOUT + Duration::from_secs(2)).await;
-        let error = body.await.unwrap().unwrap_err();
+        let error = body.await.unwrap().err().expect("timed out body must fail");
         assert!(error.contains("minimum rate"));
     }
 
@@ -5475,11 +5478,13 @@ mod tests {
             uid: Some(1001),
             pid: None,
             is_unix_sock: true,
+            trusted_os_uid: true,
         };
         let second = ConnIdentity {
             uid: Some(1002),
             pid: None,
             is_unix_sock: true,
+            trusted_os_uid: true,
         };
         let mut permits = (0..MAX_LOCALAPI_REQUESTS_PER_IDENTITY)
             .map(|_| admission.try_admit(&first, 0).unwrap())
@@ -5510,6 +5515,7 @@ mod tests {
             uid: Some(1003),
             pid: None,
             is_unix_sock: true,
+            trusted_os_uid: true,
         };
         let mut global_overflow = admission.try_admit(&third, 0).unwrap();
         assert!(global_overflow.reserve_body(1).is_err());
@@ -5529,6 +5535,7 @@ mod tests {
             uid: Some(OPERATOR_UID),
             pid: None,
             is_unix_sock: true,
+            trusted_os_uid: true,
         };
         assert!(require_readwrite(&identity, &state).await);
         let head = parse_request_head(
@@ -5588,6 +5595,7 @@ mod tests {
             uid: Some(unsafe { libc::getuid() }),
             pid: Some(std::process::id()),
             is_unix_sock: true,
+            trusted_os_uid: true,
         }
     }
 
@@ -5606,6 +5614,7 @@ mod tests {
             uid: Some(65534),
             pid: Some(99999),
             is_unix_sock: true,
+            trusted_os_uid: true,
         }
     }
 
@@ -5640,6 +5649,7 @@ mod tests {
             uid: None,
             pid: None,
             is_unix_sock: true,
+            trusted_os_uid: false,
         };
         let resp = send_request_with_identity(
             b"POST /localapi/v0/routecheck?probe=true HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
@@ -7260,6 +7270,7 @@ mod tests {
             uid: None,
             pid: None,
             is_unix_sock: true,
+            trusted_os_uid: false,
         };
         for query in ["", "?type=pair", "?type=key", "?type=cert"] {
             let request = format!(
@@ -7444,6 +7455,7 @@ mod tests {
             uid: None,
             pid: None,
             is_unix_sock: true,
+            trusted_os_uid: false,
         };
         let denied = send_request_with_identity(request.as_bytes(), &state, read_only).await;
         assert!(denied.contains("403 Forbidden"), "response: {denied}");
@@ -7468,6 +7480,7 @@ mod tests {
             uid: Some(OPERATOR_UID),
             pid: None,
             is_unix_sock: true,
+            trusted_os_uid: true,
         };
         assert!(require_readwrite(&operator, &state).await);
         let operator_denied =
@@ -7822,6 +7835,7 @@ mod tests {
             uid: Some(uid),
             pid: None,
             is_unix_sock: true,
+            trusted_os_uid: true,
         };
         assert!(require_readwrite(&identity(0), &state).await, "root");
         assert!(

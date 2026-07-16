@@ -100,6 +100,9 @@ fn hex(byte: u8) -> Option<u8> {
 }
 
 fn validate_component(component: &str) -> Result<(), PathError> {
+    if component.starts_with(".rustscale-taildrive-") {
+        return Err(PathError::UnsafeComponent);
+    }
     if component.is_empty() {
         return Err(PathError::EmptyComponent);
     }

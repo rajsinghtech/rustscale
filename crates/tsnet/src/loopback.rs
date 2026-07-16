@@ -88,8 +88,8 @@ impl std::fmt::Debug for LoopbackHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LoopbackHandle")
             .field("addr", &self.addr)
-            .field("proxy_cred", &self.proxy_cred)
-            .field("localapi_cred", &self.localapi_cred)
+            .field("proxy_cred", &"<redacted>")
+            .field("localapi_cred", &"<redacted>")
             .finish()
     }
 }
@@ -257,8 +257,13 @@ impl InMemoryLocalClient {
                     Ok(r) => r,
                     Err(_) => return,
                 };
-                let _ =
-                    localapi::dispatch(&mut server, &req, &state, &ConnIdentity::readwrite()).await;
+                let _ = localapi::dispatch(
+                    &mut server,
+                    &req,
+                    &state,
+                    &ConnIdentity::trusted_in_process(),
+                )
+                .await;
             }));
         }
 

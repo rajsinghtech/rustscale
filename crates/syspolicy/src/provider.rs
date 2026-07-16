@@ -1,18 +1,22 @@
 use std::{
     collections::BTreeMap,
-    env,
-    fs::File,
+    env, fmt,
+    fs::{self, File},
     io::{self, Read},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex, Weak,
     },
+    time::UNIX_EPOCH,
 };
 
 use serde_json::Value;
 
-use crate::{PolicyError, PolicyErrorKind, PolicyKey, RawValue, SettingDefinition, ValueType};
+use crate::{
+    watch::{PollingSubscription, SystemWatchClock, WatchClock},
+    PolicyError, PolicyErrorKind, PolicyKey, RawValue, SettingDefinition, ValueType, WatchOptions,
+};
 
 /// Maximum accepted JSON policy file size (1 MiB).
 pub const MAX_POLICY_FILE_SIZE: u64 = 1024 * 1024;
@@ -40,11 +44,29 @@ pub trait PolicyProvider: Send + Sync {
 }
 
 /// A provider backed by a bounded JSON object file.
-#[derive(Debug, Clone)]
+///
+/// Watching is disabled unless [`Self::with_watching`] or
+/// [`Self::with_watch_options`] is used. Each subscription then owns one
+/// bounded polling worker and joins it during cancellation.
+#[derive(Clone)]
 pub struct JsonFileProvider {
     path: PathBuf,
     missing_is_empty: bool,
     max_size: u64,
+    watch_options: Option<WatchOptions>,
+    watch_clock: Arc<dyn WatchClock>,
+}
+
+impl fmt::Debug for JsonFileProvider {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("JsonFileProvider")
+            .field("path", &self.path)
+            .field("missing_is_empty", &self.missing_is_empty)
+            .field("max_size", &self.max_size)
+            .field("watch_options", &self.watch_options)
+            .finish_non_exhaustive()
+    }
 }
 
 impl JsonFileProvider {
@@ -54,6 +76,8 @@ impl JsonFileProvider {
             path: path.as_ref().to_owned(),
             missing_is_empty: false,
             max_size: MAX_POLICY_FILE_SIZE,
+            watch_options: None,
+            watch_clock: Arc::new(SystemWatchClock),
         }
     }
 
@@ -63,12 +87,32 @@ impl JsonFileProvider {
             path: path.as_ref().to_owned(),
             missing_is_empty: true,
             max_size: MAX_POLICY_FILE_SIZE,
+            watch_options: None,
+            watch_clock: Arc::new(SystemWatchClock),
         }
     }
 
     /// Overrides the byte limit. Primarily useful for tests.
     pub fn with_max_size(mut self, max_size: u64) -> Self {
         self.max_size = max_size;
+        self
+    }
+
+    /// Enables polling with bounded default intervals.
+    pub fn with_watching(mut self) -> Self {
+        self.watch_options = Some(WatchOptions::default());
+        self
+    }
+
+    /// Enables polling with validated caller-provided intervals.
+    pub fn with_watch_options(mut self, options: WatchOptions) -> Self {
+        self.watch_options = Some(options);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_watch_clock(mut self, clock: Arc<dyn WatchClock>) -> Self {
+        self.watch_clock = clock;
         self
     }
 
@@ -121,6 +165,105 @@ impl PolicyProvider for JsonFileProvider {
         }
         Ok(result)
     }
+
+    fn subscribe(
+        &self,
+        callback: Arc<dyn Fn() + Send + Sync>,
+    ) -> Result<Option<Box<dyn ProviderSubscription>>, PolicyError> {
+        let Some(options) = self.watch_options else {
+            return Ok(None);
+        };
+        let path = self.path.clone();
+        let max_size = self.max_size;
+        PollingSubscription::start(
+            "syspolicy-file-watch",
+            options,
+            self.watch_clock.clone(),
+            move || file_observation(&path, max_size),
+            callback,
+        )
+        .map(Some)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileObservation {
+    Missing,
+    TooLarge,
+    Unavailable,
+    Present {
+        identity: u128,
+        modified_nanos: u128,
+        len: u64,
+        hash: u64,
+    },
+}
+
+fn file_observation(path: &Path, max_size: u64) -> FileObservation {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return FileObservation::Missing,
+        Err(_) => return FileObservation::Unavailable,
+    };
+    let metadata = match file.metadata() {
+        Ok(metadata) => metadata,
+        Err(_) => return FileObservation::Unavailable,
+    };
+    if metadata.len() > max_size {
+        return FileObservation::TooLarge;
+    }
+    let capacity = usize::try_from(max_size.min(64 * 1024)).unwrap_or(64 * 1024);
+    let mut bytes = Vec::with_capacity(capacity);
+    if file
+        .by_ref()
+        .take(max_size.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .is_err()
+    {
+        return FileObservation::Unavailable;
+    }
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_size {
+        return FileObservation::TooLarge;
+    }
+    let modified_nanos = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |duration| duration.as_nanos());
+    FileObservation::Present {
+        identity: file_identity(&metadata),
+        modified_nanos,
+        len: metadata.len(),
+        hash: bounded_hash(&bytes),
+    }
+}
+
+#[cfg(unix)]
+fn file_identity(metadata: &fs::Metadata) -> u128 {
+    use std::os::unix::fs::MetadataExt;
+    (u128::from(metadata.dev()) << 64) | u128::from(metadata.ino())
+}
+
+#[cfg(windows)]
+fn file_identity(metadata: &fs::Metadata) -> u128 {
+    use std::os::windows::fs::MetadataExt;
+    u128::from(metadata.creation_time())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn file_identity(_metadata: &fs::Metadata) -> u128 {
+    0
+}
+
+fn bounded_hash(bytes: &[u8]) -> u64 {
+    // FNV-1a is sufficient for change detection and avoids retaining policy
+    // bytes or introducing an unbounded parser into the polling path.
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 fn raw_from_json(

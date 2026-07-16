@@ -9,7 +9,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use tempfile::NamedTempFile;
+use tempfile::{tempdir, NamedTempFile};
+
+use crate::watch::test_clock::FakeWatchClock;
 
 use crate::*;
 
@@ -648,4 +650,184 @@ fn windows_machine_posture_policy_is_managed() {
         super::NATIVE_POSTURE_PRECEDENCE,
         ProviderPrecedence::Managed
     );
+}
+
+#[test]
+fn watcher_intervals_are_bounded() {
+    assert!(WatchOptions::new(Duration::ZERO, Duration::ZERO).is_err());
+    assert!(
+        WatchOptions::new(MAX_WATCH_INTERVAL + Duration::from_nanos(1), Duration::ZERO).is_err()
+    );
+    assert!(WatchOptions::new(
+        MIN_WATCH_INTERVAL,
+        MAX_WATCH_DEBOUNCE + Duration::from_nanos(1)
+    )
+    .is_err());
+    assert!(WatchOptions::new(MIN_WATCH_INTERVAL, MAX_WATCH_DEBOUNCE).is_ok());
+}
+
+fn wait_for_watch(clock: &FakeWatchClock, previous_waits: usize) {
+    wait_until(|| clock.waits_started() > previous_waits && clock.active_waiters() == 1);
+}
+
+fn advance_watch(clock: &FakeWatchClock) {
+    let previous_waits = clock.waits_started();
+    clock.tick(1);
+    wait_for_watch(clock, previous_waits);
+}
+
+#[test]
+fn watched_json_coalesces_atomic_replacement_deletion_and_recreation() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("policy.json");
+    fs::write(&path, r#"{"Tailnet":"old"}"#).unwrap();
+    let clock = Arc::new(FakeWatchClock::default());
+    let provider = Arc::new(
+        JsonFileProvider::optional(&path)
+            .with_watch_options(
+                WatchOptions::new(Duration::from_millis(20), Duration::from_millis(10)).unwrap(),
+            )
+            .with_watch_clock(clock.clone()),
+    );
+    let engine = PolicyEngine::well_known(PolicyScope::Device).unwrap();
+    let id = engine
+        .add_provider("file", PolicyScope::Device, provider.clone())
+        .unwrap();
+    wait_until(|| clock.active_waiters() == 1);
+
+    let changes = Arc::new(Mutex::new(Vec::new()));
+    let callback_changes = changes.clone();
+    let registration = engine.register_change_callback(move |change| {
+        callback_changes.lock().unwrap().push(change);
+    });
+
+    // Replacement and two more writes all land in one fake debounce window.
+    let replacement = directory.path().join("replacement.json");
+    fs::write(&replacement, r#"{"Tailnet":"replacement"}"#).unwrap();
+    fs::rename(&replacement, &path).unwrap();
+    advance_watch(&clock); // polling observation; now waiting to debounce
+    fs::write(&path, r#"{"Tailnet":"burst-a"}"#).unwrap();
+    fs::write(&path, r#"{"Tailnet":"burst-final"}"#).unwrap();
+    advance_watch(&clock); // debounce expires and emits exactly one notification
+    wait_until(|| engine.get_string(PolicyKey::Tailnet, "").unwrap() == "burst-final");
+    assert_eq!(changes.lock().unwrap().len(), 1);
+
+    fs::remove_file(&path).unwrap();
+    advance_watch(&clock);
+    advance_watch(&clock);
+    wait_until(|| engine.snapshot().item(PolicyKey::Tailnet).is_none());
+    assert_eq!(changes.lock().unwrap().len(), 2);
+
+    fs::write(&path, r#"{"Tailnet":"recreated"}"#).unwrap();
+    advance_watch(&clock);
+    advance_watch(&clock);
+    wait_until(|| engine.get_string(PolicyKey::Tailnet, "").unwrap() == "recreated");
+    assert_eq!(changes.lock().unwrap().len(), 3);
+
+    engine.remove_provider(id).unwrap();
+    assert_eq!(clock.active_waiters(), 0, "watch worker was not joined");
+    drop(registration);
+
+    // The same opt-in provider can own a fresh watcher after shutdown.
+    let restarted = engine
+        .add_provider("file-restarted", PolicyScope::Device, provider)
+        .unwrap();
+    wait_until(|| clock.active_waiters() == 1);
+    fs::write(&path, r#"{"Tailnet":"after-restart"}"#).unwrap();
+    advance_watch(&clock);
+    advance_watch(&clock);
+    wait_until(|| engine.get_string(PolicyKey::Tailnet, "").unwrap() == "after-restart");
+    engine.remove_provider(restarted).unwrap();
+    assert_eq!(clock.active_waiters(), 0);
+}
+
+#[test]
+fn watched_json_fails_closed_once_and_recovers_without_spinning() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("policy.json");
+    fs::write(&path, r#"{"Tailnet":"safe"}"#).unwrap();
+    let clock = Arc::new(FakeWatchClock::default());
+    let provider = Arc::new(
+        JsonFileProvider::new(&path)
+            .with_max_size(64)
+            .with_watch_options(
+                WatchOptions::new(Duration::from_millis(20), Duration::from_millis(10)).unwrap(),
+            )
+            .with_watch_clock(clock.clone()),
+    );
+    let engine = PolicyEngine::well_known(PolicyScope::Device).unwrap();
+    let id = engine
+        .add_provider("file", PolicyScope::Device, provider)
+        .unwrap();
+    wait_until(|| clock.active_waiters() == 1);
+
+    fs::write(&path, vec![b'x'; 65]).unwrap();
+    advance_watch(&clock);
+    advance_watch(&clock);
+    wait_until(|| {
+        engine
+            .last_reload_error()
+            .is_some_and(|error| error.kind == PolicyErrorKind::TooLarge)
+    });
+    assert_eq!(engine.get_string(PolicyKey::Tailnet, ""), Ok("safe".into()));
+    let generation = engine.snapshot().generation();
+
+    // An unchanged error state is polled but does not enqueue repeated parses.
+    for _ in 0..4 {
+        advance_watch(&clock);
+    }
+    assert_eq!(engine.snapshot().generation(), generation);
+
+    fs::write(&path, r#"{"Tailnet":"recovered"}"#).unwrap();
+    advance_watch(&clock);
+    advance_watch(&clock);
+    wait_until(|| engine.get_string(PolicyKey::Tailnet, "").unwrap() == "recovered");
+    assert!(engine.last_reload_error().is_none());
+    engine.remove_provider(id).unwrap();
+}
+
+#[test]
+fn watched_callback_can_mutate_callbacks_and_remove_provider() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("policy.json");
+    fs::write(&path, r#"{"Tailnet":"old"}"#).unwrap();
+    let clock = Arc::new(FakeWatchClock::default());
+    let provider = Arc::new(
+        JsonFileProvider::new(&path)
+            .with_watch_options(
+                WatchOptions::new(Duration::from_millis(20), Duration::from_millis(10)).unwrap(),
+            )
+            .with_watch_clock(clock.clone()),
+    );
+    let engine = PolicyEngine::well_known(PolicyScope::Device).unwrap();
+    let id = engine
+        .add_provider("file", PolicyScope::Device, provider)
+        .unwrap();
+    wait_until(|| clock.active_waiters() == 1);
+
+    let victim_calls = Arc::new(AtomicUsize::new(0));
+    let victim_calls_for_callback = victim_calls.clone();
+    let victim = engine.register_change_callback(move |_| {
+        victim_calls_for_callback.fetch_add(1, Ordering::SeqCst);
+    });
+    let victim = Arc::new(Mutex::new(Some(victim)));
+    let provider_id = Arc::new(Mutex::new(Some(id)));
+    let callback_engine = engine.clone();
+    let callback_victim = victim.clone();
+    let callback_provider_id = provider_id.clone();
+    let mutation = engine.register_change_callback(move |_| {
+        callback_victim.lock().unwrap().take();
+        let id = callback_provider_id.lock().unwrap().take();
+        if let Some(id) = id {
+            callback_engine.remove_provider(id).unwrap();
+        }
+    });
+
+    fs::write(&path, r#"{"Tailnet":"new"}"#).unwrap();
+    advance_watch(&clock);
+    clock.tick(1); // callback removes and joins the worker after this debounce tick
+    wait_until(|| engine.snapshot().item(PolicyKey::Tailnet).is_none());
+    assert_eq!(clock.active_waiters(), 0);
+    assert_eq!(victim_calls.load(Ordering::SeqCst), 1);
+    drop(mutation);
 }

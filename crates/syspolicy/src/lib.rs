@@ -15,6 +15,7 @@ mod keys;
 mod platform;
 mod provider;
 mod value;
+mod watch;
 
 pub use engine::{
     CallbackRegistration, Origin, PolicyChange, PolicyEngine, PolicyItem, ProviderId,
@@ -24,7 +25,7 @@ pub use keys::{
     well_known_definitions, PolicyKey, PolicyScope, Scope, SettingDefinition, ValueType,
 };
 #[cfg(any(target_os = "macos", target_os = "windows"))]
-pub use platform::NativePostureProvider;
+pub use platform::{NativePolicyProvider, NativePostureProvider};
 pub use provider::{
     environment_variable_name, EnvironmentProvider, JsonFileProvider, MemoryProvider,
     PolicyProvider, ProviderSubscription, ProviderValues, StubPolicyProvider, MAX_ENV_VALUE_SIZE,
@@ -33,6 +34,7 @@ pub use provider::{
 pub use value::{
     parse_go_duration, DurationParseError, PolicyValue, PreferenceOption, RawValue, Visibility,
 };
+pub use watch::{WatchOptions, MAX_WATCH_DEBOUNCE, MAX_WATCH_INTERVAL, MIN_WATCH_INTERVAL};
 
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -112,7 +114,7 @@ pub fn default_engine(scope: PolicyScope) -> Result<PolicyEngine, PolicyError> {
         "system policy file",
         PolicyScope::Device,
         ProviderPrecedence::Managed,
-        Arc::new(JsonFileProvider::optional(DEFAULT_POLICY_PATH)),
+        Arc::new(JsonFileProvider::optional(DEFAULT_POLICY_PATH).with_watching()),
     )?;
 
     #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -120,7 +122,7 @@ pub fn default_engine(scope: PolicyScope) -> Result<PolicyEngine, PolicyError> {
         "native posture policy",
         PolicyScope::Device,
         NATIVE_POSTURE_PRECEDENCE,
-        Arc::new(NativePostureProvider::new()),
+        Arc::new(NativePolicyProvider::new().with_watching()),
     )?;
 
     #[cfg(unix)]

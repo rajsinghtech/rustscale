@@ -7,7 +7,9 @@ use rustscale_conffile::Config;
 use rustscale_logpolicy::{Policy, DEFAULT_COLLECTION};
 use rustscale_logtail::{LogTail, LogtailLogger};
 use rustscale_tsnet::localapi::DaemonCommand;
-use rustscale_tsnet::{PreferencePolicy, PreferencePolicySubscription, Server, TunModeConfig};
+use rustscale_tsnet::{
+    PreferencePolicy, PreferencePolicySubscription, Server, TsnetError, TunModeConfig,
+};
 
 #[cfg(target_os = "macos")]
 const DEFAULT_STATE_DIR: &str = "/var/db/rustscale";
@@ -275,6 +277,31 @@ async fn run_with_auth_key(
     Ok(())
 }
 
+async fn bring_up_until_shutdown<S>(
+    server: &mut Server,
+    tun: bool,
+    mut shutdown: std::pin::Pin<&mut S>,
+) -> Result<bool, TsnetError>
+where
+    S: std::future::Future<Output = ()> + ?Sized,
+{
+    let startup = async {
+        if tun {
+            let config = TunModeConfig {
+                apply_routes: true,
+                ..Default::default()
+            };
+            Box::pin(server.up_tun(config)).await.map(|_| ())
+        } else {
+            Box::pin(server.up()).await.map(|_| ())
+        }
+    };
+    tokio::select! {
+        result = startup => result.map(|()| true),
+        () = shutdown.as_mut() => Ok(false),
+    }
+}
+
 async fn run_interactive(
     state_dir: &Path,
     hostname: &str,
@@ -318,6 +345,12 @@ async fn run_interactive(
 
     let mut command_rx = server.start_localapi_only().await?;
     log::info!("rustscaled: waiting for login (no TS_AUTHKEY set; use 'rustscale up' or 'rustscale login')");
+    // Install signal handling before any potentially long startup. A status
+    // watcher can observe Running before all startup resources commit, so an
+    // immediate service stop must cancel through Server's rollback owner
+    // rather than terminating the process mid-bootstrap.
+    let config_path_clone = config_path.clone();
+    let mut shutdown = Box::pin(wait_for_shutdown_signal(config_path_clone.as_ref()));
 
     // Resume an installed node without requiring another `rustscale up` after
     // every service restart. Fresh/default and explicitly logged-out profiles
@@ -325,15 +358,14 @@ async fn run_interactive(
     let persisted_prefs = rustscale_ipn::Prefs::load(state_dir).unwrap_or_default();
     let mut is_up = false;
     if should_resume_persisted_node(&persisted_prefs) {
+        if !bring_up_until_shutdown(&mut server, tun, shutdown.as_mut()).await? {
+            log::info!("rustscaled: shutdown interrupted persisted-node restore");
+            server.close().await?;
+            return Ok(());
+        }
         if tun {
-            let config = TunModeConfig {
-                apply_routes: true,
-                ..Default::default()
-            };
-            Box::pin(server.up_tun(config)).await?;
             log::info!("rustscaled: restored TUN mode (hostname={hostname})");
         } else {
-            Box::pin(server.up()).await?;
             log::info!("rustscaled: restored node (hostname={hostname})");
         }
         print_status(&server, socket_path);
@@ -344,7 +376,15 @@ async fn run_interactive(
     // profile up. The loop form also handles a closed command channel after
     // the automatic-resume decision above.
     while !is_up {
-        let Some(cmd) = command_rx.recv().await else {
+        let cmd = tokio::select! {
+            command = command_rx.recv() => command,
+            () = shutdown.as_mut() => {
+                log::info!("rustscaled: shutdown while waiting for login");
+                server.close().await?;
+                return Ok(());
+            }
+        };
+        let Some(cmd) = cmd else {
             break;
         };
         match cmd {
@@ -352,15 +392,14 @@ async fn run_interactive(
                 if let Some(key) = auth_key {
                     server.set_auth_key(key);
                 }
+                if !bring_up_until_shutdown(&mut server, tun, shutdown.as_mut()).await? {
+                    log::info!("rustscaled: shutdown interrupted startup");
+                    server.close().await?;
+                    return Ok(());
+                }
                 if tun {
-                    let config = TunModeConfig {
-                        apply_routes: true,
-                        ..Default::default()
-                    };
-                    Box::pin(server.up_tun(config)).await?;
                     log::info!("rustscaled: TUN mode up (hostname={hostname})");
                 } else {
-                    Box::pin(server.up()).await?;
                     log::info!("rustscaled: up (hostname={hostname})");
                 }
                 print_status(&server, socket_path);
@@ -368,15 +407,14 @@ async fn run_interactive(
                 break;
             }
             DaemonCommand::LoginInteractive => {
+                if !bring_up_until_shutdown(&mut server, tun, shutdown.as_mut()).await? {
+                    log::info!("rustscaled: shutdown interrupted interactive startup");
+                    server.close().await?;
+                    return Ok(());
+                }
                 if tun {
-                    let config = TunModeConfig {
-                        apply_routes: true,
-                        ..Default::default()
-                    };
-                    Box::pin(server.up_tun(config)).await?;
                     log::info!("rustscaled: TUN mode up (hostname={hostname})");
                 } else {
-                    Box::pin(server.up()).await?;
                     log::info!("rustscaled: up (hostname={hostname})");
                 }
                 print_status(&server, socket_path);
@@ -389,6 +427,7 @@ async fn run_interactive(
             }
             DaemonCommand::Shutdown => {
                 log::debug!("rustscaled: shutdown requested (server not up yet)");
+                server.close().await?;
                 return Ok(());
             }
             DaemonCommand::ReloadConfig => {
@@ -417,8 +456,6 @@ async fn run_interactive(
     // can be handled without exiting: after the teardown+restart the
     // daemon continues to wait for the next event.
     let logout_trigger = server.logout_trigger();
-    let config_path_clone = config_path.clone();
-    let mut shutdown = Box::pin(wait_for_shutdown_signal(config_path_clone.as_ref()));
     loop {
         tokio::select! {
             () = shutdown.as_mut() => break,

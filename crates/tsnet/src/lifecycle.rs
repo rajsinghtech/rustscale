@@ -1737,6 +1737,7 @@ impl Server {
         let tasks = rollback.commit_tasks();
         let task_aborts = tasks.iter().map(JoinHandle::abort_handle).collect();
 
+        let startup_backend = b.ipn_backend.clone();
         let running = RunningState {
             tailscale_ips: b.tailscale_ips,
             magicsock: b.magicsock,
@@ -1801,6 +1802,9 @@ impl Server {
         };
 
         self.inner = Some(running);
+        // Publish Running only after the complete runtime generation is owned
+        // by `self.inner`; cancellation before this point retains Starting.
+        startup_backend.set_blocked(false);
         if retire_prestarted {
             self.retire_prestarted_after_handoff();
         }
@@ -2402,6 +2406,7 @@ impl Server {
         let tasks = rollback.commit_tasks();
         let task_aborts = tasks.iter().map(JoinHandle::abort_handle).collect();
 
+        let startup_backend = b.ipn_backend.clone();
         self.inner = Some(RunningState {
             tailscale_ips: b.tailscale_ips,
             magicsock: b.magicsock,
@@ -2465,6 +2470,7 @@ impl Server {
             extension_subscription,
         });
 
+        startup_backend.set_blocked(false);
         if retire_prestarted {
             self.retire_prestarted_after_handoff();
         }
@@ -3076,7 +3082,9 @@ impl Server {
 
         if reg_resp.AuthURL.is_empty() {
             ipn_backend.set_machine_authorized(reg_resp.MachineAuthorized);
-            ipn_backend.set_blocked(false);
+            // A pre-started daemon keeps its startup block until all runtime
+            // resources and the LocalAPI handoff commit. Authentication alone
+            // must not publish Running while Server::up is still cancellable.
             ipn_backend.emit_login_finished();
             state.node_id = reg_resp.User.ID;
             state.enrolled = true;
@@ -3124,7 +3132,6 @@ impl Server {
 
                 if followup_resp.Error.is_empty() {
                     ipn_backend.set_machine_authorized(followup_resp.MachineAuthorized);
-                    ipn_backend.set_blocked(false);
                     ipn_backend.emit_login_finished();
                     state.node_id = followup_resp.User.ID;
                     state.enrolled = true;

@@ -5,11 +5,14 @@
 //! transports are injectable so callers can test policy without touching a real
 //! user manager.
 
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
+#[cfg(unix)]
+use std::os::fd::OwnedFd;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
@@ -29,6 +32,17 @@ const MAX_ARGUMENT_BYTES: usize = 4096;
 const MAX_ARGUMENTS: usize = 64;
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+static UNIT_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+
+fn process_unit_lock(name: &str) -> Arc<Mutex<()>> {
+    UNIT_LOCKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(name.to_owned())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
 
 /// Cooperative cancellation for user-unit operations.
 #[derive(Clone, Debug, Default)]
@@ -339,7 +353,7 @@ fn run_child(
     if cancellation.is_cancelled() {
         return Err(SystemctlError::Cancelled);
     }
-    let mut child = Command::new(&command.program)
+    let child = Command::new(&command.program)
         .args(&command.arguments)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -349,7 +363,10 @@ fn run_child(
             io::ErrorKind::NotFound => SystemctlError::Unavailable,
             _ => SystemctlError::Io,
         })?;
-    let mut stdout = child.stdout.take().ok_or(SystemctlError::Io)?;
+    // Install ownership immediately: every subsequent setup/pipe error kills
+    // and reaps the child before unwinding.
+    let mut child = ChildGuard::new(child);
+    let mut stdout = child.child_mut().stdout.take().ok_or(SystemctlError::Io)?;
     set_nonblocking(&stdout)?;
     let limit = command.max_output.min(MAX_OUTPUT_BYTES);
     let mut output = Vec::with_capacity(limit.min(4096));
@@ -368,7 +385,7 @@ fn run_child(
             break Err(SystemctlError::TimedOut);
         }
         let wait = POLL_INTERVAL.min(deadline.saturating_duration_since(now));
-        match child.wait_timeout(wait) {
+        match child.child_mut().wait_timeout(wait) {
             Ok(Some(status)) => {
                 let overflow = read_available(&mut stdout, &mut output, limit)?;
                 break if overflow {
@@ -382,15 +399,43 @@ fn run_child(
         }
     };
     if outcome.is_err() {
-        let _ = child.kill();
+        let _ = child.child_mut().kill();
     }
     // Always reap, including after wait_timeout I/O failures. stdout is
     // nonblocking, so descendants inheriting the pipe cannot extend the bound.
-    let _ = child.wait();
+    if child.child_mut().wait().is_err() {
+        return Err(SystemctlError::Io);
+    }
+    child.disarm();
     outcome.map(|success| SystemctlOutput {
         success,
         stdout: output,
     })
+}
+
+struct ChildGuard(Option<Child>);
+
+impl ChildGuard {
+    fn new(child: Child) -> Self {
+        Self(Some(child))
+    }
+
+    fn child_mut(&mut self) -> &mut Child {
+        self.0.as_mut().expect("child remains owned until disarm")
+    }
+
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -452,6 +497,8 @@ pub enum UnitStoreError {
     Conflict,
     #[error("unit filesystem operation was cancelled")]
     Cancelled,
+    #[error("unit mutation committed but its directory sync failed")]
+    CommittedNeedsReload,
     #[error("unit filesystem I/O failed")]
     Io,
 }
@@ -459,6 +506,10 @@ pub enum UnitStoreError {
 /// Injectable atomic unit-file storage.
 pub trait UserUnitStore: Send + Sync {
     fn inspect(&self, unit_name: &str) -> Result<StoredUnit, UnitStoreError>;
+
+    fn reload_required(&self, unit_name: &str) -> Result<bool, UnitStoreError>;
+
+    fn clear_reload_required(&self, unit_name: &str) -> Result<(), UnitStoreError>;
 
     /// Atomically replace `expected` with `contents`. `None` means the path must
     /// not exist. Implementations must not follow a final symlink.
@@ -479,9 +530,18 @@ pub trait UserUnitStore: Send + Sync {
 }
 
 /// Filesystem-backed `$XDG_CONFIG_HOME/systemd/user` store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct SystemUserUnitStore {
     config_home: PathBuf,
+    #[cfg(unix)]
+    config_directory: Arc<OwnedFd>,
+    observed: Arc<Mutex<HashMap<String, (FileIdentity, Vec<u8>)>>>,
 }
 
 impl SystemUserUnitStore {
@@ -494,7 +554,14 @@ impl SystemUserUnitStore {
         {
             return Err(UnitStoreError::Unavailable);
         }
-        Ok(Self { config_home })
+        #[cfg(unix)]
+        let config_directory = unix_store::bind_config_directory(&config_home)?;
+        Ok(Self {
+            config_home,
+            #[cfg(unix)]
+            config_directory: Arc::new(config_directory),
+            observed: Arc::new(Mutex::new(HashMap::new())),
+        })
     }
 
     pub fn unit_directory(&self) -> PathBuf {
@@ -504,43 +571,74 @@ impl SystemUserUnitStore {
 
 #[cfg(unix)]
 mod unix_store {
-    use std::fs::{self, File};
-    use std::os::fd::OwnedFd;
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::fs::File;
 
     use rustix::fs::{AtFlags, Mode, OFlags};
 
     use super::{
-        io, is_managed_unit_filename, CancellationToken, Ordering, Read, StoredUnit,
-        SystemUserUnitStore, UnitStoreError, UserUnitStore, Write, MAX_UNIT_BYTES, TEMP_COUNTER,
+        is_managed_unit_filename, CancellationToken, Component, FileIdentity, Ordering, OwnedFd,
+        Path, Read, StoredUnit, SystemUserUnitStore, UnitStoreError, UserUnitStore, Write,
+        MAX_UNIT_BYTES, TEMP_COUNTER,
     };
 
-    impl SystemUserUnitStore {
-        fn open_config_home(&self, create: bool) -> Result<OwnedFd, UnitStoreError> {
-            let metadata = match fs::symlink_metadata(&self.config_home) {
-                Ok(metadata) => metadata,
-                Err(error) if error.kind() == io::ErrorKind::NotFound && create => {
-                    fs::create_dir(&self.config_home).map_err(|_| UnitStoreError::Io)?;
-                    fs::set_permissions(&self.config_home, fs::Permissions::from_mode(0o700))
-                        .map_err(|_| UnitStoreError::Io)?;
-                    fs::symlink_metadata(&self.config_home).map_err(|_| UnitStoreError::Io)?
-                }
-                Err(_) => return Err(UnitStoreError::Io),
-            };
-            if metadata.file_type().is_symlink() || !metadata.is_dir() {
-                return Err(UnitStoreError::Unavailable);
-            }
-            if metadata.uid() != rustix::process::getuid().as_raw() {
-                return Err(UnitStoreError::WrongOwner);
-            }
-            rustix::fs::open(
-                &self.config_home,
-                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                Mode::empty(),
-            )
-            .map_err(|_| UnitStoreError::Io)
-        }
+    fn journal_name(unit_name: &str) -> String {
+        format!(".{unit_name}.reload-required")
+    }
 
+    pub(super) fn bind_config_directory(config_home: &Path) -> Result<OwnedFd, UnitStoreError> {
+        let basename = config_home
+            .file_name()
+            .filter(|name| !name.is_empty())
+            .ok_or(UnitStoreError::Unavailable)?
+            .to_os_string();
+        let parent = config_home.parent().ok_or(UnitStoreError::Unavailable)?;
+        let mut current = rustix::fs::open(
+            "/",
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|_| UnitStoreError::Io)?;
+        for component in parent.components() {
+            match component {
+                Component::RootDir => {}
+                Component::Normal(name) => {
+                    current = rustix::fs::openat(
+                        &current,
+                        name,
+                        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                        Mode::empty(),
+                    )
+                    .map_err(|_| UnitStoreError::Unavailable)?;
+                }
+                _ => return Err(UnitStoreError::Unavailable),
+            }
+        }
+        let stat = rustix::fs::fstat(&current).map_err(|_| UnitStoreError::Io)?;
+        if stat.st_uid != rustix::process::getuid().as_raw() {
+            return Err(UnitStoreError::WrongOwner);
+        }
+        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let open = || rustix::fs::openat(&current, &basename, flags, Mode::empty());
+        let config = match open() {
+            Ok(config) => config,
+            Err(rustix::io::Errno::NOENT) => {
+                match rustix::fs::mkdirat(&current, &basename, Mode::RWXU) {
+                    Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+                    Err(_) => return Err(UnitStoreError::Io),
+                }
+                open().map_err(|_| UnitStoreError::Unavailable)?
+            }
+            Err(_) => return Err(UnitStoreError::Unavailable),
+        };
+        let stat = rustix::fs::fstat(&config).map_err(|_| UnitStoreError::Io)?;
+        if stat.st_uid != rustix::process::getuid().as_raw() {
+            return Err(UnitStoreError::WrongOwner);
+        }
+        rustix::fs::fchmod(&config, Mode::RWXU).map_err(|_| UnitStoreError::Io)?;
+        Ok(config)
+    }
+
+    impl SystemUserUnitStore {
         fn open_owned_dir(
             parent: &OwnedFd,
             name: &str,
@@ -570,33 +668,28 @@ mod unix_store {
         }
 
         fn open_user_dir(&self, create: bool) -> Result<Option<OwnedFd>, UnitStoreError> {
-            if !create
-                && matches!(
-                    fs::symlink_metadata(&self.config_home),
-                    Err(error) if error.kind() == io::ErrorKind::NotFound
-                )
-            {
-                return Ok(None);
-            }
-            let config = self.open_config_home(create)?;
-            let Some(systemd) = Self::open_owned_dir(&config, "systemd", create)? else {
+            let Some(systemd) = Self::open_owned_dir(&self.config_directory, "systemd", create)?
+            else {
                 return Ok(None);
             };
             Self::open_owned_dir(&systemd, "user", create)
         }
 
-        fn inspect_at(directory: &OwnedFd, name: &str) -> Result<StoredUnit, UnitStoreError> {
+        fn inspect_at(
+            directory: &OwnedFd,
+            name: &str,
+        ) -> Result<(StoredUnit, Option<FileIdentity>), UnitStoreError> {
             let stat = match rustix::fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW) {
                 Ok(stat) => stat,
-                Err(rustix::io::Errno::NOENT) => return Ok(StoredUnit::Missing),
+                Err(rustix::io::Errno::NOENT) => return Ok((StoredUnit::Missing, None)),
                 Err(_) => return Err(UnitStoreError::Io),
             };
             let file_type = rustix::fs::FileType::from_raw_mode(stat.st_mode);
             if file_type == rustix::fs::FileType::Symlink {
-                return Ok(StoredUnit::Symlink);
+                return Ok((StoredUnit::Symlink, None));
             }
             if file_type != rustix::fs::FileType::RegularFile {
-                return Ok(StoredUnit::Other);
+                return Ok((StoredUnit::Other, None));
             }
             if stat.st_uid != rustix::process::getuid().as_raw() {
                 return Err(UnitStoreError::WrongOwner);
@@ -605,7 +698,7 @@ mod unix_store {
                 return Err(UnitStoreError::InsecurePermissions);
             }
             if stat.st_size < 0 || stat.st_size as usize > MAX_UNIT_BYTES {
-                return Ok(StoredUnit::Other);
+                return Ok((StoredUnit::Other, None));
             }
             let fd = rustix::fs::openat(
                 directory,
@@ -624,25 +717,66 @@ mod unix_store {
                 .read_to_end(&mut bytes)
                 .map_err(|_| UnitStoreError::Io)?;
             if bytes.len() > MAX_UNIT_BYTES {
-                return Ok(StoredUnit::Other);
+                return Ok((StoredUnit::Other, None));
             }
-            Ok(StoredUnit::Regular(bytes))
+            Ok((
+                StoredUnit::Regular(bytes),
+                Some(FileIdentity {
+                    device: opened.st_dev as u64,
+                    inode: opened.st_ino as u64,
+                }),
+            ))
+        }
+
+        fn mark_reload_required(
+            directory: &OwnedFd,
+            unit_name: &str,
+        ) -> Result<(), UnitStoreError> {
+            let journal = journal_name(unit_name);
+            match rustix::fs::openat(
+                directory,
+                &journal,
+                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::RUSR | Mode::WUSR,
+            ) {
+                Ok(fd) => {
+                    let mut file = File::from(fd);
+                    file.write_all(unit_name.as_bytes())
+                        .map_err(|_| UnitStoreError::Io)?;
+                    file.sync_all().map_err(|_| UnitStoreError::Io)?;
+                    rustix::fs::fsync(directory).map_err(|_| UnitStoreError::Io)
+                }
+                Err(rustix::io::Errno::EXIST) => {
+                    let (stored, _) = Self::inspect_at(directory, &journal)?;
+                    match stored {
+                        StoredUnit::Regular(bytes) if bytes == unit_name.as_bytes() => Ok(()),
+                        _ => Err(UnitStoreError::Conflict),
+                    }
+                }
+                Err(_) => Err(UnitStoreError::Io),
+            }
         }
 
         fn write_at(
             directory: &OwnedFd,
             name: &str,
             expected: Option<&[u8]>,
+            expected_identity: Option<FileIdentity>,
             contents: &[u8],
             cancellation: &CancellationToken,
         ) -> Result<(), UnitStoreError> {
             if cancellation.is_cancelled() {
                 return Err(UnitStoreError::Cancelled);
             }
-            let current = Self::inspect_at(directory, name)?;
-            match (expected, current) {
-                (None, StoredUnit::Missing) => {}
-                (Some(expected), StoredUnit::Regular(actual)) if expected == actual => {}
+            let (current, current_identity) = Self::inspect_at(directory, name)?;
+            match (expected, expected_identity, current, current_identity) {
+                (None, None, StoredUnit::Missing, None) => {}
+                (
+                    Some(expected),
+                    Some(expected_identity),
+                    StoredUnit::Regular(actual),
+                    Some(actual_identity),
+                ) if expected == actual && expected_identity == actual_identity => {}
                 _ => return Err(UnitStoreError::Conflict),
             }
             let mut temporary = None;
@@ -670,6 +804,11 @@ mod unix_store {
             let Some((temporary_name, mut file)) = temporary else {
                 return Err(UnitStoreError::Io);
             };
+            let new_stat = rustix::fs::fstat(&file).map_err(|_| UnitStoreError::Io)?;
+            let new_identity = FileIdentity {
+                device: new_stat.st_dev as u64,
+                inode: new_stat.st_ino as u64,
+            };
             let result = (|| {
                 file.write_all(contents).map_err(|_| UnitStoreError::Io)?;
                 file.sync_all().map_err(|_| UnitStoreError::Io)?;
@@ -677,22 +816,66 @@ mod unix_store {
                 if cancellation.is_cancelled() {
                     return Err(UnitStoreError::Cancelled);
                 }
-                // Recheck immediately before atomic publication. renameat never
-                // follows the destination even if it is swapped for a symlink.
-                let current = Self::inspect_at(directory, name)?;
-                match (expected, current) {
-                    (None, StoredUnit::Missing) => {}
-                    (Some(expected), StoredUnit::Regular(actual)) if expected == actual => {}
-                    _ => return Err(UnitStoreError::Conflict),
+                Self::mark_reload_required(directory, name)?;
+                match expected {
+                    None => rustix::fs::renameat_with(
+                        directory,
+                        &temporary_name,
+                        directory,
+                        name,
+                        rustix::fs::RenameFlags::NOREPLACE,
+                    )
+                    .map_err(|error| match error {
+                        rustix::io::Errno::EXIST => UnitStoreError::Conflict,
+                        _ => UnitStoreError::Io,
+                    })?,
+                    Some(expected) => {
+                        rustix::fs::renameat_with(
+                            directory,
+                            &temporary_name,
+                            directory,
+                            name,
+                            rustix::fs::RenameFlags::EXCHANGE,
+                        )
+                        .map_err(|_| UnitStoreError::Conflict)?;
+                        let (displaced, displaced_identity) =
+                            Self::inspect_at(directory, &temporary_name)?;
+                        if !matches!(
+                            (displaced, displaced_identity, expected_identity),
+                            (StoredUnit::Regular(actual), Some(actual_identity), Some(expected_identity))
+                                if actual == expected && actual_identity == expected_identity
+                        ) {
+                            // Exchange back rather than overwriting either name.
+                            rustix::fs::renameat_with(
+                                directory,
+                                &temporary_name,
+                                directory,
+                                name,
+                                rustix::fs::RenameFlags::EXCHANGE,
+                            )
+                            .map_err(|_| UnitStoreError::Conflict)?;
+                            return Err(UnitStoreError::Conflict);
+                        }
+                        rustix::fs::unlinkat(directory, &temporary_name, AtFlags::empty())
+                            .map_err(|_| UnitStoreError::Io)?;
+                    }
                 }
-                rustix::fs::renameat(directory, &temporary_name, directory, name)
-                    .map_err(|_| UnitStoreError::Io)?;
-                rustix::fs::fsync(directory).map_err(|_| UnitStoreError::Io)
+                Ok(())
             })();
-            if result.is_err() {
+            if result.is_err()
+                && matches!(
+                    Self::inspect_at(directory, &temporary_name),
+                    Ok((StoredUnit::Regular(_), Some(identity))) if identity == new_identity
+                )
+            {
                 let _ = rustix::fs::unlinkat(directory, &temporary_name, AtFlags::empty());
             }
-            result
+            match result {
+                Ok(()) => {
+                    rustix::fs::fsync(directory).map_err(|_| UnitStoreError::CommittedNeedsReload)
+                }
+                Err(error) => Err(error),
+            }
         }
     }
 
@@ -702,9 +885,85 @@ mod unix_store {
                 return Err(UnitStoreError::Unavailable);
             }
             let Some(directory) = self.open_user_dir(false)? else {
+                self.observed
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(unit_name);
                 return Ok(StoredUnit::Missing);
             };
-            Self::inspect_at(&directory, unit_name)
+            let (stored, identity) = Self::inspect_at(&directory, unit_name)?;
+            let mut observed = self
+                .observed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match (&stored, identity) {
+                (StoredUnit::Regular(bytes), Some(identity)) => {
+                    observed.insert(unit_name.to_owned(), (identity, bytes.clone()));
+                }
+                _ => {
+                    observed.remove(unit_name);
+                }
+            }
+            Ok(stored)
+        }
+
+        fn reload_required(&self, unit_name: &str) -> Result<bool, UnitStoreError> {
+            if !is_managed_unit_filename(unit_name) {
+                return Err(UnitStoreError::Unavailable);
+            }
+            let Some(directory) = self.open_user_dir(false)? else {
+                return Ok(false);
+            };
+            let (stored, _) = Self::inspect_at(&directory, &journal_name(unit_name))?;
+            match stored {
+                StoredUnit::Missing => Ok(false),
+                StoredUnit::Regular(bytes) if bytes == unit_name.as_bytes() => Ok(true),
+                _ => Err(UnitStoreError::Conflict),
+            }
+        }
+
+        fn clear_reload_required(&self, unit_name: &str) -> Result<(), UnitStoreError> {
+            if !is_managed_unit_filename(unit_name) {
+                return Err(UnitStoreError::Unavailable);
+            }
+            let Some(directory) = self.open_user_dir(false)? else {
+                return Ok(());
+            };
+            let journal = journal_name(unit_name);
+            let (stored, expected_identity) = Self::inspect_at(&directory, &journal)?;
+            match (&stored, expected_identity) {
+                (StoredUnit::Missing, None) => return Ok(()),
+                (StoredUnit::Regular(bytes), Some(_)) if bytes == unit_name.as_bytes() => {}
+                _ => return Err(UnitStoreError::Conflict),
+            }
+            let sequence = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let tombstone = format!(".{unit_name}.journal-clear.{sequence:x}");
+            rustix::fs::renameat_with(
+                &directory,
+                &journal,
+                &directory,
+                &tombstone,
+                rustix::fs::RenameFlags::NOREPLACE,
+            )
+            .map_err(|_| UnitStoreError::Conflict)?;
+            let (displaced, actual_identity) = Self::inspect_at(&directory, &tombstone)?;
+            if !matches!(
+                (&displaced, actual_identity, expected_identity),
+                (StoredUnit::Regular(bytes), Some(actual), Some(expected))
+                    if bytes == unit_name.as_bytes() && actual == expected
+            ) {
+                let _ = rustix::fs::renameat_with(
+                    &directory,
+                    &tombstone,
+                    &directory,
+                    &journal,
+                    rustix::fs::RenameFlags::NOREPLACE,
+                );
+                return Err(UnitStoreError::Conflict);
+            }
+            rustix::fs::unlinkat(&directory, &tombstone, AtFlags::empty())
+                .map_err(|_| UnitStoreError::Io)?;
+            rustix::fs::fsync(&directory).map_err(|_| UnitStoreError::Io)
         }
 
         fn atomic_replace(
@@ -720,7 +979,31 @@ mod unix_store {
             let directory = self
                 .open_user_dir(true)?
                 .ok_or(UnitStoreError::Unavailable)?;
-            Self::write_at(&directory, unit_name, expected, contents, cancellation)
+            let expected_identity = match expected {
+                Some(expected) => self
+                    .observed
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(unit_name)
+                    .filter(|(_, bytes)| bytes == expected)
+                    .map(|(identity, _)| *identity)
+                    .ok_or(UnitStoreError::Conflict)
+                    .map(Some)?,
+                None => None,
+            };
+            let result = Self::write_at(
+                &directory,
+                unit_name,
+                expected,
+                expected_identity,
+                contents,
+                cancellation,
+            );
+            self.observed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(unit_name);
+            result
         }
 
         fn atomic_remove(
@@ -736,13 +1019,48 @@ mod unix_store {
                 return Err(UnitStoreError::Cancelled);
             }
             let directory = self.open_user_dir(false)?.ok_or(UnitStoreError::Conflict)?;
-            match Self::inspect_at(&directory, unit_name)? {
-                StoredUnit::Regular(actual) if actual == expected => {}
-                _ => return Err(UnitStoreError::Conflict),
+            let expected_identity = self
+                .observed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(unit_name)
+                .filter(|(_, bytes)| bytes == expected)
+                .map(|(identity, _)| *identity)
+                .ok_or(UnitStoreError::Conflict)?;
+            let sequence = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let tombstone = format!(".{unit_name}.remove.{:x}.{sequence:x}", std::process::id());
+            Self::mark_reload_required(&directory, unit_name)?;
+            rustix::fs::renameat_with(
+                &directory,
+                unit_name,
+                &directory,
+                &tombstone,
+                rustix::fs::RenameFlags::NOREPLACE,
+            )
+            .map_err(|_| UnitStoreError::Conflict)?;
+            let (displaced, identity) = Self::inspect_at(&directory, &tombstone)?;
+            if !matches!(
+                (displaced, identity),
+                (StoredUnit::Regular(actual), Some(identity))
+                    if actual == expected && identity == expected_identity
+            ) {
+                // Restore only into an absent name; never overwrite a racer.
+                let _ = rustix::fs::renameat_with(
+                    &directory,
+                    &tombstone,
+                    &directory,
+                    unit_name,
+                    rustix::fs::RenameFlags::NOREPLACE,
+                );
+                return Err(UnitStoreError::Conflict);
             }
-            rustix::fs::unlinkat(&directory, unit_name, AtFlags::empty())
+            rustix::fs::unlinkat(&directory, &tombstone, AtFlags::empty())
                 .map_err(|_| UnitStoreError::Io)?;
-            rustix::fs::fsync(&directory).map_err(|_| UnitStoreError::Io)
+            self.observed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(unit_name);
+            rustix::fs::fsync(&directory).map_err(|_| UnitStoreError::CommittedNeedsReload)
         }
     }
 }
@@ -750,6 +1068,14 @@ mod unix_store {
 #[cfg(not(unix))]
 impl UserUnitStore for SystemUserUnitStore {
     fn inspect(&self, _unit_name: &str) -> Result<StoredUnit, UnitStoreError> {
+        Err(UnitStoreError::Unavailable)
+    }
+
+    fn reload_required(&self, _unit_name: &str) -> Result<bool, UnitStoreError> {
+        Err(UnitStoreError::Unavailable)
+    }
+
+    fn clear_reload_required(&self, _unit_name: &str) -> Result<(), UnitStoreError> {
         Err(UnitStoreError::Unavailable)
     }
 
@@ -780,6 +1106,7 @@ pub struct UserUnitStatus {
     pub unit_file_state: String,
     pub active_state: String,
     pub sub_state: String,
+    pub fragment_path: Option<PathBuf>,
 }
 
 impl UserUnitStatus {
@@ -846,6 +1173,15 @@ impl UserUnitManager<SystemUserUnitStore, SystemSystemctlTransport> {
     /// Detect through an injectable environment provider.
     pub fn detect_with(environment: &dyn Environment) -> Result<Self, UserUnitManagerError> {
         let session = UserSession::detect(environment);
+        match session {
+            UserSession::Supported => {}
+            UserSession::UnsupportedPlatform => {
+                return Err(UserUnitManagerError::UnsupportedPlatform);
+            }
+            UserSession::MissingRuntimeDirectory => {
+                return Err(UserUnitManagerError::UnsupportedSession);
+            }
+        }
         let config_home = if let Some(path) = environment.var("XDG_CONFIG_HOME") {
             if path.is_empty() {
                 return Err(UserUnitManagerError::UnsupportedSession);
@@ -886,7 +1222,12 @@ impl<S: UserUnitStore, C: SystemctlTransport> UserUnitManager<S, C> {
     ) -> Result<Change, UserUnitManagerError> {
         let name = unit.unit_name()?;
         let bytes = unit.render()?;
+        let unit_lock = process_unit_lock(&name);
+        let _unit_guard = unit_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.ensure_manager(cancellation)?;
+        self.recover_pending_reload(&name, cancellation)?;
         match self.checked_unit(&name)? {
             StoredUnit::Missing => self.replace_and_reload(&name, None, &bytes, cancellation),
             StoredUnit::Regular(existing) if existing == bytes => Ok(Change::Unchanged),
@@ -902,7 +1243,12 @@ impl<S: UserUnitStore, C: SystemctlTransport> UserUnitManager<S, C> {
     ) -> Result<Change, UserUnitManagerError> {
         let name = unit.unit_name()?;
         let bytes = unit.render()?;
+        let unit_lock = process_unit_lock(&name);
+        let _unit_guard = unit_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.ensure_manager(cancellation)?;
+        self.recover_pending_reload(&name, cancellation)?;
         match self.checked_unit(&name)? {
             StoredUnit::Missing => Err(UserUnitManagerError::NotInstalled),
             StoredUnit::Regular(existing) if existing == bytes => Ok(Change::Unchanged),
@@ -919,26 +1265,59 @@ impl<S: UserUnitStore, C: SystemctlTransport> UserUnitManager<S, C> {
         cancellation: &CancellationToken,
     ) -> Result<Change, UserUnitManagerError> {
         validate_name(name)?;
-        self.ensure_manager(cancellation)?;
         let unit_name = format!("rustscale-{name}.service");
+        let unit_lock = process_unit_lock(&unit_name);
+        let _unit_guard = unit_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.ensure_manager(cancellation)?;
+        self.recover_pending_reload(&unit_name, cancellation)?;
         let existing = match self.checked_unit(&unit_name)? {
-            StoredUnit::Missing => return Ok(Change::Unchanged),
+            StoredUnit::Missing => {
+                // Clean stale wants links even when the fragment disappeared.
+                self.disable_all(&unit_name, cancellation)?;
+                return Ok(Change::Unchanged);
+            }
             StoredUnit::Regular(existing) => existing,
             StoredUnit::Symlink | StoredUnit::Other => {
                 return Err(UserUnitManagerError::RefusedPath);
             }
         };
-        self.store
+        let enablement = self.query_status(&unit_name, cancellation)?;
+        let enablement_changed =
+            self.set_enabled_locked(&unit_name, &enablement, false, cancellation)?
+                == Change::Changed;
+        let remove_error = match self
+            .store
             .atomic_remove(&unit_name, &existing, cancellation)
-            .map_err(map_store_error)?;
-        if let Err(error) = self.reload(cancellation) {
-            let rollback =
-                self.store
-                    .atomic_replace(&unit_name, None, &existing, &CancellationToken::new());
-            if rollback.is_err() || self.reload(&CancellationToken::new()).is_err() {
+        {
+            Ok(()) | Err(UnitStoreError::CommittedNeedsReload) => None,
+            Err(error) => Some(error),
+        };
+        if let Some(error) = remove_error {
+            if enablement_changed && self.restore_enablement(&unit_name, &enablement).is_err() {
                 return Err(UserUnitManagerError::RollbackFailed);
             }
-            return Err(error);
+            return Err(map_store_error(error));
+        }
+        let finish = self.reload(cancellation).and_then(|()| {
+            self.store
+                .clear_reload_required(&unit_name)
+                .map_err(map_store_error)
+        });
+        if let Err(original) = finish {
+            let rollback = CancellationToken::new();
+            let restored = self
+                .store
+                .atomic_replace(&unit_name, None, &existing, &rollback);
+            if !matches!(restored, Ok(()) | Err(UnitStoreError::CommittedNeedsReload))
+                || self.reload(&rollback).is_err()
+                || self.store.clear_reload_required(&unit_name).is_err()
+                || (enablement_changed && self.restore_enablement(&unit_name, &enablement).is_err())
+            {
+                return Err(UserUnitManagerError::RollbackFailed);
+            }
+            return Err(original);
         }
         Ok(Change::Changed)
     }
@@ -965,22 +1344,43 @@ impl<S: UserUnitStore, C: SystemctlTransport> UserUnitManager<S, C> {
         cancellation: &CancellationToken,
     ) -> Result<UserUnitStatus, UserUnitManagerError> {
         validate_name(name)?;
-        self.ensure_manager(cancellation)?;
         let unit_name = format!("rustscale-{name}.service");
-        match self.checked_unit(&unit_name)? {
+        let unit_lock = process_unit_lock(&unit_name);
+        let _unit_guard = unit_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.status_locked(&unit_name, cancellation)
+    }
+
+    fn status_locked(
+        &self,
+        unit_name: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<UserUnitStatus, UserUnitManagerError> {
+        self.ensure_manager(cancellation)?;
+        self.recover_pending_reload(unit_name, cancellation)?;
+        match self.checked_unit(unit_name)? {
             StoredUnit::Regular(_) => {}
             StoredUnit::Missing => return Err(UserUnitManagerError::NotInstalled),
             StoredUnit::Symlink | StoredUnit::Other => {
                 return Err(UserUnitManagerError::RefusedPath);
             }
         }
+        self.query_status(unit_name, cancellation)
+    }
+
+    fn query_status(
+        &self,
+        unit_name: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<UserUnitStatus, UserUnitManagerError> {
         let output = self.command(
             vec![
                 "--user".into(),
                 "show".into(),
                 "--no-pager".into(),
-                "--property=LoadState,UnitFileState,ActiveState,SubState".into(),
-                unit_name,
+                "--property=LoadState,UnitFileState,ActiveState,SubState,FragmentPath".into(),
+                unit_name.to_owned(),
             ],
             cancellation,
         )?;
@@ -996,45 +1396,177 @@ impl<S: UserUnitStore, C: SystemctlTransport> UserUnitManager<S, C> {
         enabled: bool,
         cancellation: &CancellationToken,
     ) -> Result<Change, UserUnitManagerError> {
-        let status = self.status(name, cancellation)?;
-        if status.is_enabled() == enabled {
+        validate_name(name)?;
+        let unit_name = format!("rustscale-{name}.service");
+        let unit_lock = process_unit_lock(&unit_name);
+        let _unit_guard = unit_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let status = self.status_locked(&unit_name, cancellation)?;
+        self.set_enabled_locked(&unit_name, &status, enabled, cancellation)
+    }
+
+    fn set_enabled_locked(
+        &self,
+        unit_name: &str,
+        before: &UserUnitStatus,
+        enabled: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<Change, UserUnitManagerError> {
+        let already_desired = if enabled {
+            before.is_enabled()
+        } else {
+            before.unit_file_state == "disabled"
+        };
+        if already_desired {
             return Ok(Change::Unchanged);
         }
-        let unit_name = format!("rustscale-{name}.service");
-        let verb = if enabled { "enable" } else { "disable" };
-        let output = self.command(
-            vec!["--user".into(), verb.into(), "--".into(), unit_name.clone()],
-            cancellation,
-        );
-        if matches!(&output, Ok(output) if output.success) {
+        if !matches!(
+            before.unit_file_state.as_str(),
+            "disabled"
+                | "enabled"
+                | "enabled-runtime"
+                | "linked"
+                | "linked-runtime"
+                | "masked"
+                | "masked-runtime"
+        ) {
+            // Alias/static/generated states cannot be recreated by this narrow
+            // API, so refuse before mutating them.
+            return Err(UserUnitManagerError::Command);
+        }
+        let mutation = if enabled {
+            self.command_success(
+                vec![
+                    "--user".into(),
+                    "enable".into(),
+                    "--".into(),
+                    unit_name.to_owned(),
+                ],
+                cancellation,
+            )
+        } else {
+            self.disable_all(unit_name, cancellation)
+        };
+        let expected_state = if enabled { "enabled" } else { "disabled" };
+        let postcondition = mutation.is_ok()
+            && self
+                .query_status(unit_name, cancellation)
+                .is_ok_and(|status| {
+                    status.unit_file_state == expected_state
+                        && status.fragment_path == before.fragment_path
+                });
+        if postcondition {
             return Ok(Change::Changed);
         }
-        // systemctl can mutate links before reporting failure. Restore the
-        // previously observed state with an independent bounded command.
-        let rollback_verb = if enabled { "disable" } else { "enable" };
-        let rollback = self.command(
-            vec![
-                "--user".into(),
-                rollback_verb.into(),
-                "--".into(),
-                unit_name,
-            ],
-            &CancellationToken::new(),
-        );
-        if !matches!(rollback, Ok(output) if output.success) {
+        if self.restore_enablement(unit_name, before).is_err() {
             return Err(UserUnitManagerError::RollbackFailed);
         }
-        match output {
+        match mutation {
             Err(error) => Err(error),
-            Ok(_) => Err(UserUnitManagerError::Command),
+            Ok(()) => Err(UserUnitManagerError::Command),
         }
+    }
+
+    fn restore_enablement(
+        &self,
+        unit_name: &str,
+        snapshot: &UserUnitStatus,
+    ) -> Result<(), UserUnitManagerError> {
+        let rollback = CancellationToken::new();
+        if self
+            .query_status(unit_name, &rollback)
+            .is_ok_and(|current| enablement_matches(&current, snapshot))
+        {
+            return Ok(());
+        }
+        self.disable_all(unit_name, &rollback)?;
+        let mut command = vec!["--user".into()];
+        match snapshot.unit_file_state.as_str() {
+            "disabled" => {}
+            "enabled" => command.push("enable".into()),
+            "enabled-runtime" => {
+                command.push("enable".into());
+                command.push("--runtime".into());
+            }
+            "linked" | "linked-runtime" => {
+                command.push("link".into());
+                if snapshot.unit_file_state == "linked-runtime" {
+                    command.push("--runtime".into());
+                }
+                let fragment = snapshot
+                    .fragment_path
+                    .as_ref()
+                    .ok_or(UserUnitManagerError::RollbackFailed)?;
+                command.push("--".into());
+                command.push(fragment.to_string_lossy().into_owned());
+            }
+            "masked" | "masked-runtime" => {
+                command.push("mask".into());
+                if snapshot.unit_file_state == "masked-runtime" {
+                    command.push("--runtime".into());
+                }
+            }
+            _ => return Err(UserUnitManagerError::RollbackFailed),
+        }
+        if snapshot.unit_file_state != "disabled" {
+            if !matches!(
+                snapshot.unit_file_state.as_str(),
+                "linked" | "linked-runtime"
+            ) {
+                command.push("--".into());
+                command.push(unit_name.to_owned());
+            }
+            self.command_success(command, &rollback)?;
+        }
+        let restored = self.query_status(unit_name, &rollback)?;
+        enablement_matches(&restored, snapshot)
+            .then_some(())
+            .ok_or(UserUnitManagerError::RollbackFailed)
+    }
+
+    fn disable_all(
+        &self,
+        unit_name: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<(), UserUnitManagerError> {
+        self.command_success(
+            vec![
+                "--user".into(),
+                "disable".into(),
+                "--".into(),
+                unit_name.to_owned(),
+            ],
+            cancellation,
+        )?;
+        self.command_success(
+            vec![
+                "--user".into(),
+                "disable".into(),
+                "--runtime".into(),
+                "--".into(),
+                unit_name.to_owned(),
+            ],
+            cancellation,
+        )
+    }
+
+    fn command_success(
+        &self,
+        arguments: Vec<String>,
+        cancellation: &CancellationToken,
+    ) -> Result<(), UserUnitManagerError> {
+        let output = self.command(arguments, cancellation)?;
+        output
+            .success
+            .then_some(())
+            .ok_or(UserUnitManagerError::Command)
     }
 
     fn checked_unit(&self, name: &str) -> Result<StoredUnit, UserUnitManagerError> {
         let stored = self.store.inspect(name).map_err(map_store_error)?;
         if let StoredUnit::Regular(bytes) = &stored {
-            let expected_prefix = format!("{MANAGED_HEADER}\n# Unit: {name}\n");
-            if !bytes.starts_with(expected_prefix.as_bytes()) {
+            if !is_exact_generated_unit(name, bytes) {
                 return Err(UserUnitManagerError::ForeignUnit);
             }
         }
@@ -1048,15 +1580,22 @@ impl<S: UserUnitStore, C: SystemctlTransport> UserUnitManager<S, C> {
         bytes: &[u8],
         cancellation: &CancellationToken,
     ) -> Result<Change, UserUnitManagerError> {
-        self.store
+        match self
+            .store
             .atomic_replace(name, previous, bytes, cancellation)
-            .map_err(map_store_error)?;
+        {
+            Ok(()) | Err(UnitStoreError::CommittedNeedsReload) => {}
+            Err(error) => return Err(map_store_error(error)),
+        }
         if cancellation.is_cancelled() {
             return self.rollback_file(name, bytes, previous, UserUnitManagerError::Cancelled);
         }
         if let Err(error) = self.reload(cancellation) {
             return self.rollback_file(name, bytes, previous, error);
         }
+        self.store
+            .clear_reload_required(name)
+            .map_err(map_store_error)?;
         Ok(Change::Changed)
     }
 
@@ -1068,6 +1607,12 @@ impl<S: UserUnitStore, C: SystemctlTransport> UserUnitManager<S, C> {
         original: UserUnitManagerError,
     ) -> Result<Change, UserUnitManagerError> {
         let rollback_token = CancellationToken::new();
+        if !matches!(
+            self.checked_unit(name),
+            Ok(StoredUnit::Regular(actual)) if actual == current
+        ) {
+            return Err(UserUnitManagerError::RollbackFailed);
+        }
         let restored = match previous {
             Some(previous) => {
                 self.store
@@ -1075,11 +1620,28 @@ impl<S: UserUnitStore, C: SystemctlTransport> UserUnitManager<S, C> {
             }
             None => self.store.atomic_remove(name, current, &rollback_token),
         };
-        if restored.is_err() || self.reload(&rollback_token).is_err() {
+        if !matches!(restored, Ok(()) | Err(UnitStoreError::CommittedNeedsReload))
+            || self.reload(&rollback_token).is_err()
+            || self.store.clear_reload_required(name).is_err()
+        {
             Err(UserUnitManagerError::RollbackFailed)
         } else {
             Err(original)
         }
+    }
+
+    fn recover_pending_reload(
+        &self,
+        name: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<(), UserUnitManagerError> {
+        if !self.store.reload_required(name).map_err(map_store_error)? {
+            return Ok(());
+        }
+        self.reload(cancellation)?;
+        self.store
+            .clear_reload_required(name)
+            .map_err(map_store_error)
     }
 
     fn reload(&self, cancellation: &CancellationToken) -> Result<(), UserUnitManagerError> {
@@ -1159,10 +1721,88 @@ impl<S: UserUnitStore, C: SystemctlTransport> UserUnitManager<S, C> {
     }
 }
 
+fn is_exact_generated_unit(unit_name: &str, bytes: &[u8]) -> bool {
+    let Some(name) = unit_name
+        .strip_prefix("rustscale-")
+        .and_then(|name| name.strip_suffix(".service"))
+    else {
+        return false;
+    };
+    let prefix = format!(
+        "{MANAGED_HEADER}\n# Unit: {unit_name}\n[Unit]\nDescription=RustScale user service ({name})\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStart="
+    );
+    let suffix = "\nRestart=on-failure\nRestartSec=5s\nNoNewPrivileges=yes\nPrivateTmp=yes\nProtectSystem=strict\nProtectHome=read-only\n\n[Install]\nWantedBy=default.target\n";
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    let Some(exec) = text
+        .strip_prefix(&prefix)
+        .and_then(|text| text.strip_suffix(suffix))
+    else {
+        return false;
+    };
+    let Some(words) = decode_generated_exec(exec) else {
+        return false;
+    };
+    let Some((executable, arguments)) = words.split_first() else {
+        return false;
+    };
+    let unit = UserUnit {
+        name: name.to_owned(),
+        executable: PathBuf::from(executable),
+        arguments: arguments.to_vec(),
+    };
+    unit.render().is_ok_and(|rendered| rendered == bytes)
+}
+
+fn decode_generated_exec(mut input: &str) -> Option<Vec<String>> {
+    let mut words = Vec::new();
+    while !input.is_empty() {
+        input = input.strip_prefix('"')?;
+        let mut word = String::new();
+        let mut escaped = false;
+        let mut closed_at = None;
+        for (index, character) in input.char_indices() {
+            if escaped {
+                if !matches!(character, '"' | '\\') {
+                    return None;
+                }
+                word.push(character);
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                closed_at = Some(index + character.len_utf8());
+                break;
+            } else {
+                word.push(character);
+            }
+        }
+        let closed_at = closed_at?;
+        words.push(word);
+        input = &input[closed_at..];
+        if input.is_empty() {
+            break;
+        }
+        input = input.strip_prefix(' ')?;
+        if input.is_empty() {
+            return None;
+        }
+    }
+    Some(words)
+}
+
+fn enablement_matches(current: &UserUnitStatus, expected: &UserUnitStatus) -> bool {
+    current.unit_file_state == expected.unit_file_state
+        && current.fragment_path == expected.fragment_path
+}
+
 fn map_store_error(error: UnitStoreError) -> UserUnitManagerError {
     match error {
         UnitStoreError::Cancelled => UserUnitManagerError::Cancelled,
-        UnitStoreError::Conflict => UserUnitManagerError::Storage,
+        UnitStoreError::Conflict | UnitStoreError::CommittedNeedsReload => {
+            UserUnitManagerError::Storage
+        }
         UnitStoreError::Unavailable
         | UnitStoreError::InsecurePermissions
         | UnitStoreError::WrongOwner
@@ -1189,10 +1829,30 @@ fn parse_status(bytes: &[u8]) -> Result<UserUnitStatus, UserUnitManagerError> {
     let mut unit_file_state = None;
     let mut active_state = None;
     let mut sub_state = None;
+    let mut fragment_path = None;
+    let mut saw_fragment_path = false;
     for line in text.lines() {
         let Some((key, value)) = line.split_once('=') else {
             return Err(UserUnitManagerError::MalformedStatus);
         };
+        if key == "FragmentPath" {
+            if saw_fragment_path || value.len() > MAX_EXECUTABLE_BYTES || value.contains('\0') {
+                return Err(UserUnitManagerError::MalformedStatus);
+            }
+            saw_fragment_path = true;
+            if !value.is_empty() {
+                let path = PathBuf::from(value);
+                if !path.is_absolute()
+                    || path
+                        .components()
+                        .any(|part| matches!(part, Component::ParentDir | Component::CurDir))
+                {
+                    return Err(UserUnitManagerError::MalformedStatus);
+                }
+                fragment_path = Some(path);
+            }
+            continue;
+        }
         if value.is_empty()
             || value.len() > 64
             || !value
@@ -1217,6 +1877,9 @@ fn parse_status(bytes: &[u8]) -> Result<UserUnitStatus, UserUnitManagerError> {
         unit_file_state: unit_file_state.ok_or(UserUnitManagerError::MalformedStatus)?,
         active_state: active_state.ok_or(UserUnitManagerError::MalformedStatus)?,
         sub_state: sub_state.ok_or(UserUnitManagerError::MalformedStatus)?,
+        fragment_path: saw_fragment_path
+            .then_some(fragment_path)
+            .ok_or(UserUnitManagerError::MalformedStatus)?,
     })
 }
 
@@ -1235,6 +1898,8 @@ mod tests {
         cancel_after_write: AtomicBool,
         fail_rollback: AtomicBool,
         replace_calls: AtomicUsize,
+        reload_required: AtomicBool,
+        commit_needs_reload: AtomicBool,
     }
 
     impl MemoryStore {
@@ -1253,6 +1918,15 @@ mod tests {
     impl UserUnitStore for &MemoryStore {
         fn inspect(&self, _unit_name: &str) -> Result<StoredUnit, UnitStoreError> {
             Ok(self.value())
+        }
+
+        fn reload_required(&self, _unit_name: &str) -> Result<bool, UnitStoreError> {
+            Ok(self.reload_required.load(Ordering::Acquire))
+        }
+
+        fn clear_reload_required(&self, _unit_name: &str) -> Result<(), UnitStoreError> {
+            self.reload_required.store(false, Ordering::Release);
+            Ok(())
         }
 
         fn atomic_replace(
@@ -1276,10 +1950,15 @@ mod tests {
                 return Err(UnitStoreError::Io);
             }
             *value = StoredUnit::Regular(contents.to_vec());
+            self.reload_required.store(true, Ordering::Release);
             if self.cancel_after_write.load(Ordering::Acquire) && call == 1 {
                 cancellation.cancel();
             }
-            Ok(())
+            if self.commit_needs_reload.load(Ordering::Acquire) {
+                Err(UnitStoreError::CommittedNeedsReload)
+            } else {
+                Ok(())
+            }
         }
 
         fn atomic_remove(
@@ -1293,7 +1972,12 @@ mod tests {
                 return Err(UnitStoreError::Conflict);
             }
             *value = StoredUnit::Missing;
-            Ok(())
+            self.reload_required.store(true, Ordering::Release);
+            if self.commit_needs_reload.load(Ordering::Acquire) {
+                Err(UnitStoreError::CommittedNeedsReload)
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -1332,6 +2016,29 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct BlockingCommands {
+        active: AtomicUsize,
+        maximum: AtomicUsize,
+    }
+
+    impl SystemctlTransport for &BlockingCommands {
+        fn run(
+            &self,
+            _command: &SystemctlCommand,
+            _cancellation: &CancellationToken,
+        ) -> Result<SystemctlOutput, SystemctlError> {
+            let active = self.active.fetch_add(1, Ordering::AcqRel) + 1;
+            self.maximum.fetch_max(active, Ordering::AcqRel);
+            thread::sleep(Duration::from_millis(30));
+            self.active.fetch_sub(1, Ordering::AcqRel);
+            Ok(SystemctlOutput {
+                success: true,
+                stdout: b"252\n".to_vec(),
+            })
+        }
+    }
+
     fn ok(stdout: &[u8]) -> Result<SystemctlOutput, SystemctlError> {
         Ok(SystemctlOutput {
             success: true,
@@ -1344,6 +2051,13 @@ mod tests {
             success: false,
             stdout: Vec::new(),
         })
+    }
+
+    fn status(state: &str) -> Vec<u8> {
+        format!(
+            "LoadState=loaded\nUnitFileState={state}\nActiveState=inactive\nSubState=dead\nFragmentPath=/home/user/.config/systemd/user/rustscale-tray.service\n"
+        )
+        .into_bytes()
     }
 
     fn unit(arguments: &[&str]) -> UserUnit {
@@ -1371,6 +2085,7 @@ mod tests {
         let unit = unit(&["tray", "--socket=/home/me/a b;touch-pwned"]);
         let first = unit.render().unwrap();
         assert_eq!(first, unit.render().unwrap());
+        assert!(is_exact_generated_unit("rustscale-tray.service", &first));
         let text = String::from_utf8(first).unwrap();
         assert!(text.starts_with(MANAGED_HEADER));
         assert!(text.contains(
@@ -1415,6 +2130,12 @@ mod tests {
             StoredUnit::Symlink,
             StoredUnit::Other,
             StoredUnit::Regular(b"[Service]\nExecStart=/bin/false\n".to_vec()),
+            StoredUnit::Regular(
+                format!(
+                    "{MANAGED_HEADER}\n# Unit: rustscale-tray.service\n[Service]\nExecStart=\"/bin/false\"\n"
+                )
+                .into_bytes(),
+            ),
         ] {
             let store = MemoryStore::with(stored);
             let commands = FakeCommands::default();
@@ -1460,6 +2181,27 @@ mod tests {
     }
 
     #[test]
+    fn managers_serialize_the_same_unit_process_wide() {
+        let store = MemoryStore::default();
+        let commands = BlockingCommands::default();
+        thread::scope(|scope| {
+            for _ in 0..2 {
+                scope.spawn(|| {
+                    UserUnitManager::with_transports(
+                        &store,
+                        &commands,
+                        UserSession::Supported,
+                        Duration::from_secs(2),
+                    )
+                    .install(&unit(&[]), &CancellationToken::new())
+                    .unwrap();
+                });
+            }
+        });
+        assert_eq!(commands.maximum.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
     fn interrupted_update_does_not_publish() {
         let old = unit(&["old"]).render().unwrap();
         let store = MemoryStore::with(StoredUnit::Regular(old.clone()));
@@ -1470,6 +2212,69 @@ mod tests {
             .unwrap_err();
         assert_eq!(error, UserUnitManagerError::Cancelled);
         assert_eq!(store.value(), StoredUnit::Regular(old));
+    }
+
+    #[test]
+    fn concurrent_foreign_replacement_is_not_clobbered_or_rolled_back() {
+        struct RacingStore {
+            value: Mutex<StoredUnit>,
+            foreign: Vec<u8>,
+        }
+
+        impl UserUnitStore for &RacingStore {
+            fn inspect(&self, _unit_name: &str) -> Result<StoredUnit, UnitStoreError> {
+                Ok(self.value.lock().unwrap().clone())
+            }
+
+            fn reload_required(&self, _unit_name: &str) -> Result<bool, UnitStoreError> {
+                Ok(false)
+            }
+
+            fn clear_reload_required(&self, _unit_name: &str) -> Result<(), UnitStoreError> {
+                Ok(())
+            }
+
+            fn atomic_replace(
+                &self,
+                _unit_name: &str,
+                _expected: Option<&[u8]>,
+                _contents: &[u8],
+                _cancellation: &CancellationToken,
+            ) -> Result<(), UnitStoreError> {
+                *self.value.lock().unwrap() = StoredUnit::Regular(self.foreign.clone());
+                Err(UnitStoreError::Conflict)
+            }
+
+            fn atomic_remove(
+                &self,
+                _unit_name: &str,
+                _expected: &[u8],
+                _cancellation: &CancellationToken,
+            ) -> Result<(), UnitStoreError> {
+                Err(UnitStoreError::Conflict)
+            }
+        }
+
+        let old = unit(&["old"]).render().unwrap();
+        let foreign = b"foreign concurrent replacement".to_vec();
+        let store = RacingStore {
+            value: Mutex::new(StoredUnit::Regular(old)),
+            foreign: foreign.clone(),
+        };
+        let commands = FakeCommands::default();
+        assert_eq!(
+            UserUnitManager::with_transports(
+                &store,
+                &commands,
+                UserSession::Supported,
+                Duration::from_secs(2),
+            )
+            .update(&unit(&["new"]), &CancellationToken::new())
+            .unwrap_err(),
+            UserUnitManagerError::Storage
+        );
+        assert_eq!(*store.value.lock().unwrap(), StoredUnit::Regular(foreign));
+        assert_eq!(commands.commands().len(), 1);
     }
 
     #[test]
@@ -1503,7 +2308,22 @@ mod tests {
     fn remove_is_idempotent_and_reload_failure_restores_file() {
         let bytes = unit(&[]).render().unwrap();
         let store = MemoryStore::with(StoredUnit::Regular(bytes.clone()));
-        let commands = FakeCommands::with(vec![ok(b"252\n"), failed(), ok(b"")]);
+        let enabled = status("enabled");
+        let disabled = status("disabled");
+        let commands = FakeCommands::with(vec![
+            ok(b"252\n"),
+            ok(&enabled),
+            ok(b""),
+            ok(b""),
+            ok(&disabled),
+            failed(),
+            ok(b""),
+            ok(&disabled),
+            ok(b""),
+            ok(b""),
+            ok(b""),
+            ok(&enabled),
+        ]);
         let unit_manager = manager(&store, &commands);
         assert_eq!(
             unit_manager
@@ -1522,28 +2342,139 @@ mod tests {
     }
 
     #[test]
+    fn committed_sync_failure_reloads_and_clears_durable_journal() {
+        let store = MemoryStore::default();
+        store.commit_needs_reload.store(true, Ordering::Release);
+        let commands = FakeCommands::default();
+        assert_eq!(
+            manager(&store, &commands).install(&unit(&[]), &CancellationToken::new()),
+            Ok(Change::Changed)
+        );
+        assert!(!store.reload_required.load(Ordering::Acquire));
+        assert!(commands
+            .commands()
+            .iter()
+            .any(|command| command.arguments == ["--user", "daemon-reload"]));
+
+        // A journal surviving an interrupted caller is recovered before an
+        // idempotent retry inspects or mutates the unit.
+        store.reload_required.store(true, Ordering::Release);
+        let commands = FakeCommands::default();
+        assert_eq!(
+            manager(&store, &commands).install(&unit(&[]), &CancellationToken::new()),
+            Ok(Change::Unchanged)
+        );
+        assert!(!store.reload_required.load(Ordering::Acquire));
+        assert_eq!(
+            commands
+                .commands()
+                .iter()
+                .filter(|command| command.arguments == ["--user", "daemon-reload"])
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn failed_enable_is_compensated_with_disable() {
         let bytes = unit(&[]).render().unwrap();
         let store = MemoryStore::with(StoredUnit::Regular(bytes));
-        let status =
-            b"LoadState=loaded\nUnitFileState=disabled\nActiveState=inactive\nSubState=dead\n";
-        let commands = FakeCommands::with(vec![ok(b"252\n"), ok(status), failed(), ok(b"")]);
+        let disabled = status("disabled");
+        let enabled = status("enabled");
+        let commands = FakeCommands::with(vec![
+            ok(b"252\n"),
+            ok(&disabled),
+            failed(),
+            ok(&enabled),
+            ok(b""),
+            ok(b""),
+            ok(&disabled),
+        ]);
         let error = manager(&store, &commands)
             .enable("tray", &CancellationToken::new())
             .unwrap_err();
         assert_eq!(error, UserUnitManagerError::Command);
         let commands = commands.commands();
         assert_eq!(commands[2].arguments[1], "enable");
-        assert_eq!(commands[3].arguments[1], "disable");
+        assert_eq!(commands[4].arguments[1], "disable");
+        assert_eq!(commands[5].arguments[2], "--runtime");
+    }
+
+    #[test]
+    fn enablement_rollback_restores_runtime_state_and_refuses_alias_mutation() {
+        let bytes = unit(&[]).render().unwrap();
+        let store = MemoryStore::with(StoredUnit::Regular(bytes));
+        let runtime = status("enabled-runtime");
+        let disabled = status("disabled");
+        let commands = FakeCommands::with(vec![
+            ok(b"252\n"),
+            ok(&runtime),
+            failed(),
+            ok(&disabled),
+            ok(b""),
+            ok(b""),
+            ok(b""),
+            ok(&runtime),
+        ]);
+        assert_eq!(
+            manager(&store, &commands)
+                .disable("tray", &CancellationToken::new())
+                .unwrap_err(),
+            UserUnitManagerError::Command
+        );
+        let recorded = commands.commands();
+        assert!(recorded.iter().any(|command| {
+            command
+                .arguments
+                .get(1)
+                .is_some_and(|verb| verb == "enable")
+                && command
+                    .arguments
+                    .iter()
+                    .any(|argument| argument == "--runtime")
+        }));
+
+        let linked = status("linked");
+        let commands = FakeCommands::with(vec![
+            ok(b"252\n"),
+            ok(&linked),
+            failed(),
+            ok(&disabled),
+            ok(b""),
+            ok(b""),
+            ok(b""),
+            ok(&linked),
+        ]);
+        assert_eq!(
+            manager(&store, &commands)
+                .disable("tray", &CancellationToken::new())
+                .unwrap_err(),
+            UserUnitManagerError::Command
+        );
+        assert!(commands.commands().iter().any(|command| {
+            command.arguments.get(1).is_some_and(|verb| verb == "link")
+                && command.arguments.iter().any(|argument| {
+                    argument == "/home/user/.config/systemd/user/rustscale-tray.service"
+                })
+        }));
+
+        let alias = status("alias");
+        let commands = FakeCommands::with(vec![ok(b"252\n"), ok(&alias)]);
+        assert_eq!(
+            manager(&store, &commands)
+                .disable("tray", &CancellationToken::new())
+                .unwrap_err(),
+            UserUnitManagerError::Command
+        );
+        assert_eq!(commands.commands().len(), 2);
     }
 
     #[test]
     fn status_is_strict_and_bounded_by_transport() {
         let bytes = unit(&[]).render().unwrap();
         let store = MemoryStore::with(StoredUnit::Regular(bytes));
-        let status =
-            b"LoadState=loaded\nUnitFileState=enabled\nActiveState=active\nSubState=running\n";
-        let commands = FakeCommands::with(vec![ok(b"252\n"), ok(status)]);
+        let enabled = b"LoadState=loaded\nUnitFileState=enabled\nActiveState=active\nSubState=running\nFragmentPath=/home/user/.config/systemd/user/rustscale-tray.service\n";
+        let commands = FakeCommands::with(vec![ok(b"252\n"), ok(enabled)]);
         let status = manager(&store, &commands)
             .status("tray", &CancellationToken::new())
             .unwrap();
@@ -1595,6 +2526,19 @@ mod tests {
         let output_program = temporary.path().join("rustscale-systemd-output");
         symlink(&executable, &sleep_program).unwrap();
         symlink(&executable, &output_program).unwrap();
+
+        let setup_child = Command::new(&sleep_program)
+            .args([
+                "--exact",
+                "systemd_user::tests::command_child",
+                "--nocapture",
+            ])
+            .spawn()
+            .unwrap();
+        let started = Instant::now();
+        drop(ChildGuard::new(setup_child));
+        assert!(started.elapsed() < Duration::from_secs(1));
+
         let sleeping = SystemctlCommand {
             program: sleep_program.to_string_lossy().into_owned(),
             arguments: vec![
@@ -1644,7 +2588,7 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn real_store_refuses_symlink_and_foreign_file_and_uses_private_modes() {
         use std::os::unix::fs::{symlink, PermissionsExt};
@@ -1675,7 +2619,29 @@ mod tests {
         assert_eq!(directory_mode, 0o700);
         assert_eq!(file_mode, 0o600);
 
-        std::fs::remove_file(store.unit_directory().join("rustscale-tray.service")).unwrap();
+        let unit_path = store.unit_directory().join("rustscale-tray.service");
+        let displaced = store.unit_directory().join("displaced.service");
+        assert_eq!(
+            store.inspect("rustscale-tray.service").unwrap(),
+            StoredUnit::Regular(bytes.clone())
+        );
+        std::fs::rename(&unit_path, &displaced).unwrap();
+        std::fs::write(&unit_path, b"foreign-racer").unwrap();
+        std::fs::set_permissions(&unit_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            store.atomic_replace(
+                "rustscale-tray.service",
+                Some(&bytes),
+                &unit(&["new"]).render().unwrap(),
+                &token,
+            ),
+            Err(UnitStoreError::Conflict)
+        );
+        assert_eq!(std::fs::read(&unit_path).unwrap(), b"foreign-racer");
+        std::fs::remove_file(&unit_path).unwrap();
+        std::fs::rename(&displaced, &unit_path).unwrap();
+
+        std::fs::remove_file(&unit_path).unwrap();
         symlink(
             temporary.path().join("outside"),
             store.unit_directory().join("rustscale-tray.service"),
@@ -1689,5 +2655,37 @@ mod tests {
             store.atomic_replace("rustscale-tray.service", None, &bytes, &token),
             Err(UnitStoreError::Conflict)
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bound_config_fd_does_not_follow_substituted_config_path() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let config = temporary.path().join("config");
+        std::fs::create_dir(&config).unwrap();
+        let store = SystemUserUnitStore::new(&config).unwrap();
+        let bound = temporary.path().join("bound-config");
+        let outside = temporary.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::rename(&config, &bound).unwrap();
+        symlink(&outside, &config).unwrap();
+
+        let bytes = unit(&[]).render().unwrap();
+        store
+            .atomic_replace(
+                "rustscale-tray.service",
+                None,
+                &bytes,
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            store.inspect("rustscale-tray.service").unwrap(),
+            StoredUnit::Regular(bytes)
+        );
+        assert!(!outside.join("systemd/user/rustscale-tray.service").exists());
+        assert!(bound.join("systemd/user/rustscale-tray.service").exists());
     }
 }

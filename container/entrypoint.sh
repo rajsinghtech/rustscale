@@ -56,6 +56,10 @@ wait_for_socket() {
     socket="${1}"
     for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
         if [ -S "$socket" ]; then return 0; fi
+        if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
+            wait "$DAEMON_PID" 2>/dev/null || true
+            err "rustscaled exited before creating daemon socket $socket"
+        fi
         sleep 0.5
     done
     err "daemon socket $socket did not appear within 15s"

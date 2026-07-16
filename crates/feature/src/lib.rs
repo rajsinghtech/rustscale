@@ -153,6 +153,13 @@ pub struct IdentityFederationRequest {
     pub tags: Vec<String>,
 }
 
+/// Parameters for resolving an OAuth client secret into a one-use auth key.
+/// The type intentionally does not implement `Debug`: it contains a secret.
+pub struct OAuthAuthKeyRequest {
+    pub client_secret: String,
+    pub tags: Vec<String>,
+}
+
 /// Parameters for exchanging an identity JWT for a Tailscale access token.
 /// The type intentionally does not implement `Debug`: it contains a JWT.
 pub struct JwtExchangeRequest {
@@ -160,6 +167,10 @@ pub struct JwtExchangeRequest {
     pub client_id: String,
     pub id_token: String,
 }
+
+/// OAuth client-secret auth-key resolver hook.
+pub type OAuthAuthKeyResolver =
+    Arc<dyn Fn(OAuthAuthKeyRequest) -> BoxFuture<Result<String, BoxError>> + Send + Sync + 'static>;
 
 /// Workload identity auth-key resolver hook.
 pub type IdentityFederationResolver = Arc<
@@ -172,6 +183,9 @@ pub type IdentityFederationResolver = Arc<
 /// Workload identity JWT exchange hook.
 pub type JwtExchanger =
     Arc<dyn Fn(JwtExchangeRequest) -> BoxFuture<Result<String, BoxError>> + Send + Sync + 'static>;
+
+/// Resolver installed by the OAuth auth-key feature package.
+pub static RESOLVE_AUTH_KEY_VIA_OAUTH: Hook<OAuthAuthKeyResolver> = Hook::new();
 
 /// Resolver installed by the workload identity federation package.
 pub static RESOLVE_AUTH_KEY_VIA_WIF: Hook<IdentityFederationResolver> = Hook::new();

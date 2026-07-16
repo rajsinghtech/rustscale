@@ -136,6 +136,101 @@ fn parse_optional_attributes_matches_upstream() {
 }
 
 #[test]
+fn parse_oauth_secret_attributes_matches_upstream() {
+    assert_eq!(
+        parse_oauth_secret_attributes("tskey-client-abc").unwrap(),
+        OAuthSecretAttributes {
+            client_secret: "tskey-client-abc".into(),
+            ephemeral: true,
+            preauthorized: false,
+            base_url: DEFAULT_API_URL.into(),
+        }
+    );
+    assert_eq!(
+        parse_oauth_secret_attributes(
+            "tskey-client-abc?ephemeral=false&preauthorized=true&baseURL=http%3A%2F%2F127.0.0.1%3A1234"
+        )
+        .unwrap(),
+        OAuthSecretAttributes {
+            client_secret: "tskey-client-abc".into(),
+            ephemeral: false,
+            preauthorized: true,
+            base_url: "http://127.0.0.1:1234".into(),
+        }
+    );
+    assert_eq!(
+        parse_oauth_secret_attributes("tskey-client-abc?unknown=value").unwrap_err(),
+        ParseError::UnknownAttribute("unknown".into())
+    );
+}
+
+#[tokio::test]
+async fn oauth_client_secret_resolves_to_tagged_auth_key() {
+    let http = success_http();
+    let client = test_client(http.clone());
+    let key = client
+        .resolve_oauth_auth_key(
+            "tskey-client-secret?ephemeral=false&preauthorized=true&baseURL=http%3A%2F%2F127.0.0.1%3A1234",
+            &["tag:k8s".into(), "tag:ottawa".into()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(key, "tskey-auth-xyz");
+
+    let requests = http.take_requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[0].url.as_str(),
+        "http://127.0.0.1:1234/api/v2/oauth/token"
+    );
+    assert_eq!(requests[0].body, b"grant_type=client_credentials");
+    let expected_basic = format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode("some-client-id:tskey-client-secret")
+    );
+    assert!(requests[0]
+        .headers
+        .iter()
+        .any(|(name, value)| name == "Authorization" && value == &expected_basic));
+    assert!(requests[1]
+        .headers
+        .iter()
+        .any(|(name, value)| name == "Authorization" && value == "Bearer access-123"));
+    let create: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+    assert_eq!(
+        create["capabilities"]["devices"]["create"]["ephemeral"],
+        false
+    );
+    assert_eq!(
+        create["capabilities"]["devices"]["create"]["preauthorized"],
+        true
+    );
+    assert_eq!(
+        create["capabilities"]["devices"]["create"]["tags"],
+        serde_json::json!(["tag:k8s", "tag:ottawa"])
+    );
+}
+
+#[tokio::test]
+async fn oauth_client_secret_requires_tags_and_plain_auth_keys_pass_through() {
+    let client = test_client(FakeHttp::new(vec![]));
+    assert_eq!(
+        client
+            .resolve_oauth_auth_key("tskey-auth-plain", &[])
+            .await
+            .unwrap(),
+        "tskey-auth-plain"
+    );
+    assert_eq!(
+        client
+            .resolve_oauth_auth_key("tskey-client-secret", &[])
+            .await
+            .unwrap_err(),
+        Error::MissingOAuthTags
+    );
+}
+
+#[test]
 fn malformed_optional_attributes_fail_closed() {
     for client_id in [
         "client?ephemeral=%",

@@ -1529,14 +1529,34 @@ struct LinuxPlatform {
 }
 
 #[cfg(target_os = "linux")]
+fn linux_interface_index_from_sysfs(interface: &str) -> Option<u32> {
+    if interface.is_empty() || interface.contains('/') {
+        return None;
+    }
+    std::fs::read_to_string(format!("/sys/class/net/{interface}/ifindex"))
+        .ok()?
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|index| *index != 0)
+}
+
+#[cfg(target_os = "linux")]
 impl LinuxPlatform {
     fn new(tun_name: &str) -> Self {
-        let interface_index = if_addrs::get_if_addrs().ok().and_then(|interfaces| {
-            interfaces
-                .into_iter()
-                .find(|interface| interface.name == tun_name)
-                .and_then(|interface| interface.index)
-        });
+        let interface_index = if_addrs::get_if_addrs()
+            .ok()
+            .and_then(|interfaces| {
+                interfaces
+                    .into_iter()
+                    .find(|interface| interface.name == tun_name)
+                    .and_then(|interface| interface.index)
+            })
+            // Some libc/if-addrs combinations enumerate a freshly-created TUN
+            // interface but omit its index. Linux exposes the authoritative
+            // value in sysfs, so do not make TUN startup depend on that optional
+            // field being populated.
+            .or_else(|| linux_interface_index_from_sysfs(tun_name));
         Self {
             tun_name: tun_name.to_owned(),
             rule_base: interface_index.map(Self::rule_base_for_index),
@@ -2227,6 +2247,14 @@ mod tests {
             local_routes: vec![],
             exit_node: false,
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_sysfs_interface_index_fallback_is_authoritative() {
+        assert!(linux_interface_index_from_sysfs("lo").is_some_and(|index| index > 0));
+        assert_eq!(linux_interface_index_from_sysfs("../lo"), None);
+        assert_eq!(linux_interface_index_from_sysfs(""), None);
     }
 
     struct TestPlatform {

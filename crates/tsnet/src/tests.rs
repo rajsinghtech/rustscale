@@ -1263,6 +1263,110 @@ fn builder_sets_ephemeral_flag() {
     assert!(server.config.ephemeral);
 }
 
+#[tokio::test]
+async fn prelogin_localapi_preferences_feed_initial_registration_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut server = Server::builder()
+        .state_dir(dir.path())
+        .hostname("daemon-default")
+        .build()
+        .unwrap();
+    let command_rx = server.start_localapi_only().await.unwrap();
+    drop(command_rx);
+    rustscale_ipn::Prefs {
+        Hostname: "cli-hostname".into(),
+        AdvertiseRoutes: vec!["192.0.2.0/24".into()],
+        AdvertiseTags: vec!["tag:k8s".into(), "tag:ottawa".into()],
+        AcceptRoutes: true,
+        CorpDNS: true,
+        ..Default::default()
+    }
+    .save(dir.path())
+    .unwrap();
+
+    server.apply_persisted_startup_prefs();
+    assert_eq!(server.config.hostname, "cli-hostname");
+    assert_eq!(server.config.advertise_routes, ["192.0.2.0/24"]);
+    assert_eq!(server.config.advertise_tags, ["tag:k8s", "tag:ottawa"]);
+    assert!(server.config.accept_routes);
+    assert!(server.config.configure_os_dns);
+    server.close().await.unwrap();
+}
+
+#[test]
+fn wrapped_auth_key_is_stripped_and_signs_registration_node_key() {
+    use base64::Engine as _;
+    use ed25519_dalek::Signer as _;
+
+    let authority = ed25519_dalek::SigningKey::from_bytes(&[0x41; 32]);
+    let delegated = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
+    let mut credential = rustscale_tka::NodeKeySignature {
+        sig_kind: rustscale_tka::SigKind::Credential,
+        pubkey: None,
+        key_id: Some(authority.verifying_key().to_bytes().to_vec()),
+        signature: None,
+        nested: None,
+        wrapping_pubkey: Some(delegated.verifying_key().to_bytes().to_vec()),
+    };
+    credential.signature = Some(authority.sign(&credential.sig_hash()).to_bytes().to_vec());
+    let wrapped = format!(
+        "tskey-auth-one-use--TL{}-{}",
+        base64::engine::general_purpose::STANDARD_NO_PAD.encode(credential.encode()),
+        base64::engine::general_purpose::STANDARD_NO_PAD.encode(delegated.to_keypair_bytes())
+    );
+    let node_key = NodePrivate::generate().public();
+    let mut transient = Some(crate::lifecycle::TransientAuthKey::new(wrapped).unwrap());
+    let signature = transient
+        .as_ref()
+        .unwrap()
+        .node_key_signature(&node_key)
+        .unwrap()
+        .unwrap();
+    let auth = crate::lifecycle::take_initial_register_auth(&mut transient).unwrap();
+
+    assert_eq!(auth.AuthKey, "tskey-auth-one-use");
+    assert!(transient.is_none());
+    let signature = rustscale_tka::NodeKeySignature::decode(&signature).unwrap();
+    assert!(signature
+        .verify_signature(&node_key.raw32(), &authority.verifying_key().to_bytes())
+        .is_ok());
+}
+
+#[cfg(feature = "identity-federation")]
+#[tokio::test]
+async fn oauth_client_secret_auth_key_is_resolved_before_registration() {
+    rustscale_identityfederation::install().unwrap();
+    let observed = Arc::new(Mutex::new(None));
+    let hook_observed = observed.clone();
+    let resolver: rustscale_feature::OAuthAuthKeyResolver = Arc::new(move |request| {
+        *hook_observed.lock().unwrap() = Some((request.client_secret, request.tags));
+        Box::pin(async { Ok("tskey-auth-generated".to_owned()) })
+    });
+    let _override = rustscale_feature::RESOLVE_AUTH_KEY_VIA_OAUTH.override_for_test(resolver);
+
+    let mut server = Server::builder()
+        .auth_key("tskey-client-secret?ephemeral=true&preauthorized=true")
+        .advertise_tags(vec!["tag:k8s".into(), "tag:ottawa".into()])
+        .build()
+        .unwrap();
+    let transient = server
+        .initial_registration_auth(&PersistedState::default())
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(transient.as_str(), "tskey-auth-generated");
+    assert!(server.config.ephemeral);
+    assert_eq!(
+        observed.lock().unwrap().take().unwrap(),
+        (
+            "tskey-client-secret?ephemeral=true&preauthorized=true".into(),
+            vec!["tag:k8s".into(), "tag:ottawa".into()],
+        )
+    );
+    assert!(!format!("{:?}", server.config).contains("tskey-client-secret"));
+}
+
 #[cfg(feature = "identity-federation")]
 #[tokio::test]
 async fn workload_identity_hook_resolves_builder_config() {

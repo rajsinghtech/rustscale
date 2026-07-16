@@ -20,6 +20,8 @@ use zeroize::{Zeroize, Zeroizing};
 
 /// Default API/control base used when no URL is supplied.
 pub const DEFAULT_CONTROL_URL: &str = "https://controlplane.tailscale.com";
+/// Default API base used for OAuth client-secret auth-key creation.
+pub const DEFAULT_API_URL: &str = "https://api.tailscale.com";
 /// Tailscale's token exchange timeout.
 pub const DEFAULT_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Deadline for an injected provider token source.
@@ -194,11 +196,20 @@ pub struct ClientIdAttributes {
     pub preauthorized: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OAuthSecretAttributes {
+    client_secret: String,
+    ephemeral: bool,
+    preauthorized: bool,
+    base_url: String,
+}
+
 /// Workload identity federation failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Error {
     MissingTokenOrAudience,
     MissingTags,
+    MissingOAuthTags,
     InvalidOptionalAttributes(String),
     ProviderTokenRequired,
     UntrustedUrl,
@@ -226,6 +237,7 @@ impl fmt::Display for Error {
             Self::MissingTags => {
                 f.write_str("federated identity authkeys require --advertise-tags")
             }
+            Self::MissingOAuthTags => f.write_str("oauth authkeys require --advertise-tags"),
             Self::InvalidOptionalAttributes(error) => {
                 write!(f, "failed to parse optional config attributes: {error}")
             }
@@ -299,6 +311,67 @@ impl FederationClient {
         self
     }
 
+    /// Resolve a Tailscale OAuth client secret into a tagged, one-use auth key.
+    /// Non-client-secret values pass through unchanged, matching upstream.
+    pub async fn resolve_oauth_auth_key(
+        &self,
+        client_secret: &str,
+        tags: &[String],
+    ) -> Result<String, Error> {
+        if !client_secret.starts_with("tskey-client-") {
+            return Ok(client_secret.to_owned());
+        }
+        if tags.is_empty() {
+            return Err(Error::MissingOAuthTags);
+        }
+
+        let attributes = parse_oauth_secret_attributes(client_secret)
+            .map_err(|error| Error::InvalidOptionalAttributes(error.to_string()))?;
+        let secret = Zeroizing::new(attributes.client_secret);
+        let endpoint = endpoint_url(&attributes.base_url, "/api/v2/oauth/token", self.url_policy)?;
+        let authorization = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD
+                .encode(format!("some-client-id:{}", secret.as_str()))
+        );
+        let response = self
+            .send(
+                HttpRequest {
+                    method: "POST",
+                    url: endpoint,
+                    headers: vec![
+                        (
+                            "Content-Type".into(),
+                            "application/x-www-form-urlencoded".into(),
+                        ),
+                        ("Authorization".into(), authorization),
+                    ],
+                    body: form_encode(&[("grant_type", "client_credentials")]),
+                },
+                MAX_TOKEN_RESPONSE_SIZE,
+                "OAuth token exchange",
+            )
+            .await?;
+        let access_token = Zeroizing::new(parse_token_response(response)?);
+        if access_token.is_empty() {
+            return Err(Error::EmptyAccessToken);
+        }
+        let auth_key = self
+            .create_auth_key(
+                &attributes.base_url,
+                &access_token,
+                attributes.ephemeral,
+                attributes.preauthorized,
+                tags,
+                true,
+            )
+            .await?;
+        if auth_key.is_empty() {
+            return Err(Error::EmptyAuthKey);
+        }
+        Ok(auth_key)
+    }
+
     /// Resolve an ID token into a tagged, one-use auth key.
     pub async fn resolve_auth_key(
         &self,
@@ -353,6 +426,7 @@ impl FederationClient {
                 attributes.ephemeral,
                 attributes.preauthorized,
                 tags,
+                false,
             )
             .await
             .map_err(|error| Error::CreateAuthKey(error.to_string()))?;
@@ -431,6 +505,7 @@ impl FederationClient {
         ephemeral: bool,
         preauthorized: bool,
         tags: &[String],
+        bearer_auth: bool,
     ) -> Result<String, Error> {
         let endpoint = endpoint_url(base_url, "/api/v2/tailnet/-/keys", self.url_policy)?;
         let request = CreateKeyRequest {
@@ -447,10 +522,14 @@ impl FederationClient {
         };
         let body = serde_json::to_vec(&request)
             .map_err(|_| Error::MalformedResponse("auth key request"))?;
-        let authorization = format!(
-            "Basic {}",
-            base64::engine::general_purpose::STANDARD.encode(format!("{access_token}:"))
-        );
+        let authorization = if bearer_auth {
+            format!("Bearer {access_token}")
+        } else {
+            format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD.encode(format!("{access_token}:"))
+            )
+        };
         let response = self
             .send(
                 HttpRequest {
@@ -643,6 +722,39 @@ fn endpoint_url(base_url: &str, suffix: &str, policy: UrlPolicy) -> Result<Url, 
     Ok(url)
 }
 
+/// Return the ephemeral-node attribute carried by an OAuth client secret.
+/// The value defaults to true, matching Tailscale's OAuth auth-key feature.
+pub fn oauth_secret_is_ephemeral(client_secret: &str) -> Result<bool, ParseError> {
+    parse_oauth_secret_attributes(client_secret).map(|attributes| attributes.ephemeral)
+}
+
+fn parse_oauth_secret_attributes(client_secret: &str) -> Result<OAuthSecretAttributes, ParseError> {
+    let (stripped, query) = client_secret
+        .split_once('?')
+        .map_or((client_secret, ""), |(secret, query)| (secret, query));
+    let values = parse_query(query.as_bytes())?;
+    let mut ephemeral = true;
+    let mut preauthorized = false;
+    let mut base_url = DEFAULT_API_URL.to_owned();
+    for (key, value) in values {
+        match key.as_str() {
+            "ephemeral" if !value.is_empty() => ephemeral = parse_bool(&value)?,
+            "ephemeral" => {}
+            "preauthorized" if !value.is_empty() => preauthorized = parse_bool(&value)?,
+            "preauthorized" => {}
+            "baseURL" if !value.is_empty() => base_url = value,
+            "baseURL" => {}
+            _ => return Err(ParseError::UnknownAttribute(key)),
+        }
+    }
+    Ok(OAuthSecretAttributes {
+        client_secret: stripped.to_owned(),
+        ephemeral,
+        preauthorized,
+        base_url,
+    })
+}
+
 /// Parse `?ephemeral=` and `?preauthorized=` attributes from a client ID.
 /// Defaults and accepted boolean spellings match Go's implementation.
 pub fn parse_optional_attributes(client_id: &str) -> Result<ClientIdAttributes, ParseError> {
@@ -763,6 +875,7 @@ fn hex_value(byte: u8) -> Option<u8> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InstallError {
     DuplicateFeature,
+    OAuthResolverAlreadySet,
     ResolverAlreadySet,
     ExchangerAlreadySet,
 }
@@ -771,6 +884,7 @@ impl fmt::Display for InstallError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::DuplicateFeature => f.write_str("identityfederation feature already registered"),
+            Self::OAuthResolverAlreadySet => f.write_str("OAuth auth-key resolver already set"),
             Self::ResolverAlreadySet => f.write_str("identity federation resolver already set"),
             Self::ExchangerAlreadySet => f.write_str("identity federation exchanger already set"),
         }
@@ -798,6 +912,18 @@ pub fn install_with_client(client: FederationClient) -> Result<(), InstallError>
     *INSTALL_RESULT.get_or_init(move || {
         rustscale_feature::register("identityfederation")
             .map_err(|_| InstallError::DuplicateFeature)?;
+        let oauth_client = client.clone();
+        rustscale_feature::RESOLVE_AUTH_KEY_VIA_OAUTH
+            .set(Arc::new(move |request| {
+                let client = oauth_client.clone();
+                Box::pin(async move {
+                    client
+                        .resolve_oauth_auth_key(&request.client_secret, &request.tags)
+                        .await
+                        .map_err(|error| -> rustscale_feature::BoxError { Box::new(error) })
+                })
+            }))
+            .map_err(|_| InstallError::OAuthResolverAlreadySet)?;
         let resolver_client = client.clone();
         rustscale_feature::RESOLVE_AUTH_KEY_VIA_WIF
             .set(Arc::new(move |request| {

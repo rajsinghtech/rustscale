@@ -24,6 +24,9 @@ pub use builder::UpdateBuilder;
 pub use chonk::{Chonk, ChonkError, FsChonk, MemChonk};
 pub use disablement::{check_disablement, disablement_kdf};
 pub use key::{Key, KeyKind};
-pub use sig::{NodeKeySignature, RotationDetails, SigKind, VerifyError};
+pub use sig::{
+    decode_wrapped_auth_key, sign_by_credential, NodeKeySignature, RotationDetails, SigKind,
+    VerifyError, WrappedAuthKeyError,
+};
 pub use state::State;
 pub use sync::{SyncError, SyncOffer};

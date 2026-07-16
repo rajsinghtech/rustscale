@@ -12,8 +12,9 @@
 //! }
 //! ```
 
+use base64::Engine as _;
 use ciborium::value::Value;
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
 use crate::aum::{
@@ -358,6 +359,78 @@ impl NodeKeySignature {
 
 /// Maximum rotation chain depth (15 prev keys, to stay under CBOR nesting limit of 16).
 const MAX_ROTATION_DEPTH: usize = 15;
+
+/// Decode a Tailnet Lock-wrapped pre-auth key.
+///
+/// Returns `Ok(None)` for an ordinary auth key. Wrapped keys contain a
+/// credential signature and an ephemeral ed25519 key after the `--TL` marker.
+pub fn decode_wrapped_auth_key(
+    wrapped: &str,
+) -> Result<Option<(String, NodeKeySignature, SigningKey)>, WrappedAuthKeyError> {
+    let Some((auth_key, suffix)) = wrapped.split_once("--TL") else {
+        return Ok(None);
+    };
+    let (signature, private_key) = suffix
+        .split_once('-')
+        .ok_or(WrappedAuthKeyError::MissingDelimiter)?;
+    let signature = base64::engine::general_purpose::STANDARD_NO_PAD
+        .decode(signature)
+        .map_err(|_| WrappedAuthKeyError::InvalidSignatureEncoding)?;
+    let private_key = base64::engine::general_purpose::STANDARD_NO_PAD
+        .decode(private_key)
+        .map_err(|_| WrappedAuthKeyError::InvalidPrivateKeyEncoding)?;
+    let credential =
+        NodeKeySignature::decode(&signature).map_err(|_| WrappedAuthKeyError::InvalidCredential)?;
+    if credential.sig_kind != SigKind::Credential {
+        return Err(WrappedAuthKeyError::NotCredential);
+    }
+    let keypair: [u8; 64] = private_key
+        .try_into()
+        .map_err(|_| WrappedAuthKeyError::InvalidPrivateKeyLength)?;
+    let signing_key = SigningKey::from_keypair_bytes(&keypair)
+        .map_err(|_| WrappedAuthKeyError::InvalidPrivateKey)?;
+    Ok(Some((auth_key.to_owned(), credential, signing_key)))
+}
+
+/// Sign a node key using the delegated credential from a wrapped auth key.
+pub fn sign_by_credential(
+    credential: &NodeKeySignature,
+    signing_key: &SigningKey,
+    node_key: [u8; 32],
+) -> Result<Vec<u8>, WrappedAuthKeyError> {
+    if credential.sig_kind != SigKind::Credential {
+        return Err(WrappedAuthKeyError::NotCredential);
+    }
+    let mut signature = NodeKeySignature {
+        sig_kind: SigKind::Rotation,
+        pubkey: Some(node_key.to_vec()),
+        key_id: None,
+        signature: None,
+        nested: Some(Box::new(credential.clone())),
+        wrapping_pubkey: None,
+    };
+    signature.signature = Some(signing_key.sign(&signature.sig_hash()).to_bytes().to_vec());
+    Ok(signature.encode())
+}
+
+/// Tailnet Lock wrapped-auth-key failure. Values never include key material.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum WrappedAuthKeyError {
+    #[error("wrapped auth key is missing its credential delimiter")]
+    MissingDelimiter,
+    #[error("wrapped auth key has invalid signature encoding")]
+    InvalidSignatureEncoding,
+    #[error("wrapped auth key has invalid private-key encoding")]
+    InvalidPrivateKeyEncoding,
+    #[error("wrapped auth key contains an invalid credential")]
+    InvalidCredential,
+    #[error("wrapped auth key signature is not a credential")]
+    NotCredential,
+    #[error("wrapped auth key has an invalid private-key length")]
+    InvalidPrivateKeyLength,
+    #[error("wrapped auth key contains an invalid private key")]
+    InvalidPrivateKey,
+}
 
 /// Error returned by signature verification.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -766,6 +839,38 @@ mod tests {
             wrapped.verify_signature(&[0x99; 32], &authority_public.to_bytes()),
             Err(VerifyError::PubkeyMismatch)
         );
+    }
+
+    #[test]
+    fn wrapped_auth_key_decodes_and_signs_node_key() {
+        let authority = make_signing_key(0x31);
+        let delegated = make_signing_key(0x32);
+        let mut credential = NodeKeySignature {
+            sig_kind: SigKind::Credential,
+            pubkey: None,
+            key_id: Some(authority.verifying_key().to_bytes().to_vec()),
+            signature: None,
+            nested: None,
+            wrapping_pubkey: Some(delegated.verifying_key().to_bytes().to_vec()),
+        };
+        credential.signature = Some(authority.sign(&credential.sig_hash()).to_bytes().to_vec());
+        let wrapped = format!(
+            "tskey-auth-test--TL{}-{}",
+            base64::engine::general_purpose::STANDARD_NO_PAD.encode(credential.encode()),
+            base64::engine::general_purpose::STANDARD_NO_PAD.encode(delegated.to_keypair_bytes())
+        );
+
+        let (auth_key, decoded, private) = decode_wrapped_auth_key(&wrapped).unwrap().unwrap();
+        assert_eq!(auth_key, "tskey-auth-test");
+        assert_eq!(decoded, credential);
+        let node_key = [0x55; 32];
+        let signature =
+            NodeKeySignature::decode(&sign_by_credential(&decoded, &private, node_key).unwrap())
+                .unwrap();
+        assert!(signature
+            .verify_signature(&node_key, &authority.verifying_key().to_bytes())
+            .is_ok());
+        assert_eq!(decode_wrapped_auth_key("tskey-auth-plain").unwrap(), None);
     }
 
     #[test]

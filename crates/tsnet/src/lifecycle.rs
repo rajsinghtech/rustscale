@@ -7,20 +7,47 @@ use zeroize::{Zeroize, Zeroizing};
 
 /// One-attempt auth material. It cannot be cloned and its formatting is always
 /// redacted; dropping it zeroizes the allocation.
-pub(crate) struct TransientAuthKey(Zeroizing<String>);
+pub(crate) struct TransientAuthKey {
+    secret: Zeroizing<String>,
+    wrapped_credential: Option<(rustscale_tka::NodeKeySignature, ed25519_dalek::SigningKey)>,
+}
 
 impl TransientAuthKey {
-    fn new(secret: String) -> Self {
-        Self(Zeroizing::new(secret))
+    pub(crate) fn new(secret: String) -> Result<Self, TsnetError> {
+        let wrapped = rustscale_tka::decode_wrapped_auth_key(&secret)
+            .map_err(|error| TsnetError::Builder(format!("decode wrapped auth key: {error}")))?;
+        let (secret, wrapped_credential) = match wrapped {
+            Some((secret, credential, private_key)) => (secret, Some((credential, private_key))),
+            None => (secret, None),
+        };
+        Ok(Self {
+            secret: Zeroizing::new(secret),
+            wrapped_credential,
+        })
     }
 
     fn take(&mut self) -> String {
-        std::mem::take(&mut *self.0)
+        std::mem::take(&mut *self.secret)
+    }
+
+    pub(crate) fn node_key_signature(
+        &self,
+        node_key: &NodePublic,
+    ) -> Result<Option<Vec<u8>>, TsnetError> {
+        self.wrapped_credential
+            .as_ref()
+            .map(|(credential, private_key)| {
+                rustscale_tka::sign_by_credential(credential, private_key, node_key.raw32())
+                    .map_err(|error| {
+                        TsnetError::Builder(format!("sign wrapped auth key credential: {error}"))
+                    })
+            })
+            .transpose()
     }
 
     #[cfg(all(test, feature = "identity-federation"))]
     pub(crate) fn as_str(&self) -> &str {
-        self.0.as_str()
+        self.secret.as_str()
     }
 }
 
@@ -34,7 +61,7 @@ pub(crate) fn take_initial_register_auth(
     auth: &mut Option<TransientAuthKey>,
 ) -> Option<rustscale_tailcfg::RegisterResponseAuth> {
     let mut secret = auth.take()?;
-    if secret.0.is_empty() {
+    if secret.secret.is_empty() {
         return None;
     }
     Some(rustscale_tailcfg::RegisterResponseAuth {
@@ -1182,6 +1209,7 @@ impl Server {
         }
         Self::retry_pending_router_cleanup().await?;
         self.ensure_extension_host().await?;
+        self.apply_persisted_startup_prefs();
 
         ensure_ring_provider();
         let state = self.load_or_create_state()?;
@@ -1834,6 +1862,7 @@ impl Server {
         }
         Self::retry_pending_router_cleanup().await?;
         self.ensure_extension_host().await?;
+        self.apply_persisted_startup_prefs();
 
         ensure_ring_provider();
         let state = self.load_or_create_state()?;
@@ -2848,6 +2877,33 @@ impl Server {
             .unwrap())
     }
 
+    /// Apply preferences committed through the pre-login LocalAPI before the
+    /// first registration. This is how `tailscale up` supplies tags and routes
+    /// to a separately running daemon; registration must not race ahead using
+    /// only the daemon's original builder configuration.
+    pub(crate) fn apply_persisted_startup_prefs(&mut self) {
+        if self.pre_started.is_none() {
+            return;
+        }
+        let prefs = self.load_prefs().unwrap_or_default();
+        if !prefs.ControlURL.is_empty() {
+            self.config.control_url = prefs.ControlURL;
+        }
+        if !prefs.Hostname.is_empty() {
+            self.config.hostname = prefs.Hostname;
+        }
+        if !prefs.AdvertiseRoutes.is_empty() {
+            self.config.advertise_routes = prefs.AdvertiseRoutes;
+        }
+        if !prefs.AdvertiseTags.is_empty() {
+            self.config.advertise_tags = prefs.AdvertiseTags;
+        }
+        self.config.accept_routes = prefs.AcceptRoutes;
+        self.config.advertise_exit_node = prefs.AdvertiseExitNode;
+        self.config.ephemeral = prefs.Ephemeral;
+        self.config.configure_os_dns = prefs.CorpDNS;
+    }
+
     /// Select transient credentials for the initial register request.
     /// Persisted enrollments authenticate by node identity unless force-login
     /// was explicitly requested.
@@ -2858,18 +2914,36 @@ impl Server {
         if state.is_enrolled() && !self.config.force_login {
             return Ok(None);
         }
-        if self
-            .config
-            .auth_key
-            .as_deref()
-            .is_some_and(|key| !key.is_empty())
-        {
-            return Ok(self.config.auth_key.clone().map(TransientAuthKey::new));
-        }
-
         #[cfg(feature = "identity-federation")]
         rustscale_identityfederation::install()
             .map_err(|error| TsnetError::IdentityFederation(error.to_string()))?;
+
+        if let Some(auth_key) = self
+            .config
+            .auth_key
+            .as_deref()
+            .filter(|key| !key.is_empty())
+            .map(str::to_owned)
+        {
+            if auth_key.starts_with("tskey-client-") {
+                #[cfg(feature = "identity-federation")]
+                {
+                    self.config.ephemeral =
+                        rustscale_identityfederation::oauth_secret_is_ephemeral(&auth_key)
+                            .map_err(|error| TsnetError::IdentityFederation(error.to_string()))?;
+                }
+                if let Some(resolve) = rustscale_feature::RESOLVE_AUTH_KEY_VIA_OAUTH.try_get() {
+                    let auth_key = resolve(rustscale_feature::OAuthAuthKeyRequest {
+                        client_secret: auth_key,
+                        tags: self.config.advertise_tags.clone(),
+                    })
+                    .await
+                    .map_err(|error| TsnetError::IdentityFederation(error.to_string()))?;
+                    return Ok(Some(TransientAuthKey::new(auth_key)?));
+                }
+            }
+            return Ok(Some(TransientAuthKey::new(auth_key)?));
+        }
 
         let Some(resolve) = rustscale_feature::RESOLVE_AUTH_KEY_VIA_WIF.try_get() else {
             return Ok(None);
@@ -2919,7 +2993,7 @@ impl Server {
         if auth_key.is_empty() {
             Ok(None)
         } else {
-            Ok(Some(TransientAuthKey::new(auth_key)))
+            Ok(Some(TransientAuthKey::new(auth_key)?))
         }
     }
 
@@ -3031,13 +3105,20 @@ impl Server {
             cc.set_extra_root_certs(certs);
         }
 
+        let node_key_signature = initial_auth
+            .as_ref()
+            .map(|auth| auth.node_key_signature(&node_pub))
+            .transpose()?
+            .flatten();
         let mut reg_req = RegisterRequest {
             Version: CAPABILITY_VERSION,
             NodeKey: node_pub.clone(),
             Auth: take_initial_register_auth(&mut initial_auth),
+            NodeKeySignature: node_key_signature,
             Hostinfo: Some(Hostinfo {
                 OS: std::env::consts::OS.to_string(),
                 Hostname: self.config.hostname.clone(),
+                BackendLogID: backend_log_id.clone(),
                 RoutableIPs: advertise.clone(),
                 RequestTags: self.config.advertise_tags.clone(),
                 PeerRelay: self.config.peer_relay_server,

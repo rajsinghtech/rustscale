@@ -559,7 +559,7 @@ pub trait UserUnitStore: Send + Sync {
 
 /// Filesystem-backed `$XDG_CONFIG_HOME/systemd/user` store.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct FileIdentity {
+pub(super) struct FileIdentity {
     device: u64,
     inode: u64,
 }
@@ -610,6 +610,13 @@ mod unix_store {
         UnitStoreError, UserUnitStore, Write, MAX_TIMEOUT, MAX_UNIT_BYTES, POLL_INTERVAL,
         TEMP_COUNTER,
     };
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum CasGap {
+        AfterValidation,
+        AfterMutation,
+        BeforeFinalize,
+    }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(super) enum JournalPhase {
@@ -790,7 +797,7 @@ mod unix_store {
             Self::open_owned_dir(&systemd, "user", create)
         }
 
-        fn inspect_at(
+        pub(super) fn inspect_at(
             directory: &OwnedFd,
             name: &str,
         ) -> Result<(StoredUnit, Option<FileIdentity>), UnitStoreError> {
@@ -841,6 +848,245 @@ mod unix_store {
                     inode: opened.st_ino as u64,
                 }),
             ))
+        }
+
+        fn exact_regular(
+            stored: &StoredUnit,
+            identity: Option<FileIdentity>,
+            expected: &[u8],
+            expected_identity: FileIdentity,
+        ) -> bool {
+            matches!(
+                (stored, identity),
+                (StoredUnit::Regular(actual), Some(identity))
+                    if actual == expected && identity == expected_identity
+            )
+        }
+
+        pub(super) fn exchange_exact_with_hook<F>(
+            directory: &OwnedFd,
+            left: &str,
+            left_bytes: &[u8],
+            left_identity: FileIdentity,
+            right: &str,
+            right_bytes: &[u8],
+            right_identity: FileIdentity,
+            mut hook: F,
+        ) -> Result<(), UnitStoreError>
+        where
+            F: FnMut(CasGap, &OwnedFd, &str, &str),
+        {
+            let (left_now, left_now_identity) = Self::inspect_at(directory, left)?;
+            let (right_now, right_now_identity) = Self::inspect_at(directory, right)?;
+            if !Self::exact_regular(&left_now, left_now_identity, left_bytes, left_identity)
+                || !Self::exact_regular(&right_now, right_now_identity, right_bytes, right_identity)
+            {
+                return Err(UnitStoreError::Conflict);
+            }
+            hook(CasGap::AfterValidation, directory, left, right);
+            rustix::fs::renameat_with(
+                directory,
+                left,
+                directory,
+                right,
+                rustix::fs::RenameFlags::EXCHANGE,
+            )
+            .map_err(|_| UnitStoreError::Conflict)?;
+            hook(CasGap::AfterMutation, directory, left, right);
+            let left_after = Self::inspect_at(directory, left);
+            let right_after = Self::inspect_at(directory, right);
+            let valid = matches!(
+                (left_after, right_after),
+                (
+                    Ok((left_stored, left_observed)),
+                    Ok((right_stored, right_observed)),
+                ) if Self::exact_regular(
+                    &left_stored,
+                    left_observed,
+                    right_bytes,
+                    right_identity,
+                ) && Self::exact_regular(
+                    &right_stored,
+                    right_observed,
+                    left_bytes,
+                    left_identity,
+                )
+            );
+            if valid {
+                return Ok(());
+            }
+            // Exchange back instead of unlinking either raced name. Even a
+            // noncooperating same-UID racer remains represented by an inode.
+            let _ = rustix::fs::renameat_with(
+                directory,
+                left,
+                directory,
+                right,
+                rustix::fs::RenameFlags::EXCHANGE,
+            );
+            Err(UnitStoreError::Conflict)
+        }
+
+        fn exchange_exact(
+            directory: &OwnedFd,
+            left: &str,
+            left_bytes: &[u8],
+            left_identity: FileIdentity,
+            right: &str,
+            right_bytes: &[u8],
+            right_identity: FileIdentity,
+        ) -> Result<(), UnitStoreError> {
+            Self::exchange_exact_with_hook(
+                directory,
+                left,
+                left_bytes,
+                left_identity,
+                right,
+                right_bytes,
+                right_identity,
+                |_, _, _, _| {},
+            )
+        }
+
+        pub(super) fn rename_noreplace_exact_with_hook<F>(
+            directory: &OwnedFd,
+            source: &str,
+            expected: &[u8],
+            expected_identity: FileIdentity,
+            destination: &str,
+            mut hook: F,
+        ) -> Result<(), UnitStoreError>
+        where
+            F: FnMut(CasGap, &OwnedFd, &str, &str),
+        {
+            let (source_now, source_identity) = Self::inspect_at(directory, source)?;
+            let (destination_now, destination_identity) = Self::inspect_at(directory, destination)?;
+            if !Self::exact_regular(&source_now, source_identity, expected, expected_identity)
+                || !matches!(
+                    (destination_now, destination_identity),
+                    (StoredUnit::Missing, None)
+                )
+            {
+                return Err(UnitStoreError::Conflict);
+            }
+            hook(CasGap::AfterValidation, directory, source, destination);
+            rustix::fs::renameat_with(
+                directory,
+                source,
+                directory,
+                destination,
+                rustix::fs::RenameFlags::NOREPLACE,
+            )
+            .map_err(|_| UnitStoreError::Conflict)?;
+            hook(CasGap::AfterMutation, directory, source, destination);
+            let (published, published_identity) = Self::inspect_at(directory, destination)?;
+            let (source_after, source_after_identity) = Self::inspect_at(directory, source)?;
+            if Self::exact_regular(&published, published_identity, expected, expected_identity)
+                && matches!(
+                    (source_after, source_after_identity),
+                    (StoredUnit::Missing, None)
+                )
+            {
+                return Ok(());
+            }
+            Self::restore_moved_name(directory, destination, source);
+            Err(UnitStoreError::Conflict)
+        }
+
+        fn rename_noreplace_exact(
+            directory: &OwnedFd,
+            source: &str,
+            expected: &[u8],
+            expected_identity: FileIdentity,
+            destination: &str,
+        ) -> Result<(), UnitStoreError> {
+            Self::rename_noreplace_exact_with_hook(
+                directory,
+                source,
+                expected,
+                expected_identity,
+                destination,
+                |_, _, _, _| {},
+            )
+        }
+
+        fn restore_moved_name(directory: &OwnedFd, moved: &str, original: &str) {
+            if rustix::fs::renameat_with(
+                directory,
+                moved,
+                directory,
+                original,
+                rustix::fs::RenameFlags::NOREPLACE,
+            )
+            .is_err()
+            {
+                let _ = rustix::fs::renameat_with(
+                    directory,
+                    moved,
+                    directory,
+                    original,
+                    rustix::fs::RenameFlags::EXCHANGE,
+                );
+            }
+        }
+
+        pub(super) fn remove_exact_with_hook<F>(
+            directory: &OwnedFd,
+            name: &str,
+            expected: &[u8],
+            expected_identity: FileIdentity,
+            tag: &str,
+            mut hook: F,
+        ) -> Result<(), UnitStoreError>
+        where
+            F: FnMut(CasGap, &OwnedFd, &str, &str),
+        {
+            let (current, identity) = Self::inspect_at(directory, name)?;
+            if !Self::exact_regular(&current, identity, expected, expected_identity) {
+                return Err(UnitStoreError::Conflict);
+            }
+            let sequence = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let tombstone = format!(".{name}.{tag}.{sequence:x}");
+            hook(CasGap::AfterValidation, directory, name, &tombstone);
+            rustix::fs::renameat_with(
+                directory,
+                name,
+                directory,
+                &tombstone,
+                rustix::fs::RenameFlags::NOREPLACE,
+            )
+            .map_err(|_| UnitStoreError::Conflict)?;
+            hook(CasGap::AfterMutation, directory, name, &tombstone);
+            let (displaced, displaced_identity) = Self::inspect_at(directory, &tombstone)?;
+            if !Self::exact_regular(&displaced, displaced_identity, expected, expected_identity) {
+                Self::restore_moved_name(directory, &tombstone, name);
+                return Err(UnitStoreError::Conflict);
+            }
+            hook(CasGap::BeforeFinalize, directory, name, &tombstone);
+            let (final_file, final_identity) = Self::inspect_at(directory, &tombstone)?;
+            if !Self::exact_regular(&final_file, final_identity, expected, expected_identity) {
+                Self::restore_moved_name(directory, &tombstone, name);
+                return Err(UnitStoreError::Conflict);
+            }
+            rustix::fs::unlinkat(directory, &tombstone, AtFlags::empty())
+                .map_err(|_| UnitStoreError::Io)
+        }
+
+        fn remove_exact(
+            directory: &OwnedFd,
+            name: &str,
+            expected: &[u8],
+            expected_identity: FileIdentity,
+            tag: &str,
+        ) -> Result<(), UnitStoreError> {
+            Self::remove_exact_with_hook(
+                directory,
+                name,
+                expected,
+                expected_identity,
+                tag,
+                |_, _, _, _| {},
+            )
         }
 
         fn journal_phase_for_mutation(
@@ -931,55 +1177,34 @@ mod unix_store {
                         }
                         let expected_identity =
                             expected_identity.ok_or(UnitStoreError::Conflict)?;
-                        let (immediate, immediate_identity) =
-                            Self::inspect_at(directory, &journal)?;
-                        if !matches!(
-                            (immediate, immediate_identity),
-                            (StoredUnit::Regular(actual), Some(identity))
-                                if actual == expected_bytes && identity == expected_identity
-                        ) {
-                            return Err(UnitStoreError::Conflict);
-                        }
-                        rustix::fs::renameat_with(
+                        Self::exchange_exact(
                             directory,
                             &temporary,
-                            directory,
+                            record,
+                            new_identity,
                             &journal,
-                            rustix::fs::RenameFlags::EXCHANGE,
-                        )
-                        .map_err(|_| UnitStoreError::Conflict)?;
-                        let (displaced, displaced_identity) =
-                            Self::inspect_at(directory, &temporary)
-                                .map_err(|_| UnitStoreError::CommittedNeedsReload)?;
-                        if !matches!(
-                            (displaced, displaced_identity),
-                            (StoredUnit::Regular(actual), Some(identity))
-                                if actual == expected_bytes && identity == expected_identity
+                            &expected_bytes,
+                            expected_identity,
+                        )?;
+                        if let Err(error) = Self::remove_exact(
+                            directory,
+                            &temporary,
+                            &expected_bytes,
+                            expected_identity,
+                            "journal-displaced",
                         ) {
-                            if rustix::fs::renameat_with(
+                            if Self::exchange_exact(
                                 directory,
                                 &temporary,
-                                directory,
+                                &expected_bytes,
+                                expected_identity,
                                 &journal,
-                                rustix::fs::RenameFlags::EXCHANGE,
+                                record,
+                                new_identity,
                             )
                             .is_ok()
                             {
-                                return Err(UnitStoreError::Conflict);
-                            }
-                            return Err(UnitStoreError::CommittedNeedsReload);
-                        }
-                        if rustix::fs::unlinkat(directory, &temporary, AtFlags::empty()).is_err() {
-                            if rustix::fs::renameat_with(
-                                directory,
-                                &temporary,
-                                directory,
-                                &journal,
-                                rustix::fs::RenameFlags::EXCHANGE,
-                            )
-                            .is_ok()
-                            {
-                                return Err(UnitStoreError::Io);
+                                return Err(error);
                             }
                             return Err(UnitStoreError::CommittedNeedsReload);
                         }
@@ -987,13 +1212,14 @@ mod unix_store {
                 }
                 rustix::fs::fsync(directory).map_err(|_| UnitStoreError::CommittedNeedsReload)
             })();
-            if prepared.is_err()
-                && matches!(
-                    Self::inspect_at(directory, &temporary),
-                    Ok((StoredUnit::Regular(_), Some(identity))) if identity == new_identity
-                )
-            {
-                let _ = rustix::fs::unlinkat(directory, &temporary, AtFlags::empty());
+            if prepared.is_err() {
+                let _ = Self::remove_exact(
+                    directory,
+                    &temporary,
+                    record,
+                    new_identity,
+                    "journal-abort",
+                );
             }
             prepared
         }
@@ -1089,66 +1315,63 @@ mod unix_store {
 
                 match expected {
                     None => {
-                        rustix::fs::renameat_with(
+                        Self::rename_noreplace_exact(
                             directory,
                             &temporary_name,
-                            directory,
+                            contents,
+                            new_identity,
                             name,
-                            rustix::fs::RenameFlags::NOREPLACE,
-                        )
-                        .map_err(|error| match error {
-                            rustix::io::Errno::EXIST => UnitStoreError::Conflict,
-                            _ => UnitStoreError::Io,
-                        })?;
+                        )?;
                         committed = true;
                     }
                     Some(expected) => {
-                        rustix::fs::renameat_with(
+                        let expected_identity =
+                            expected_identity.ok_or(UnitStoreError::Conflict)?;
+                        Self::exchange_exact(
                             directory,
                             &temporary_name,
-                            directory,
+                            contents,
+                            new_identity,
                             name,
-                            rustix::fs::RenameFlags::EXCHANGE,
-                        )
-                        .map_err(|_| UnitStoreError::Conflict)?;
+                            expected,
+                            expected_identity,
+                        )?;
                         committed = true;
-                        match Self::inspect_at(directory, &temporary_name) {
-                            Ok((StoredUnit::Regular(actual), Some(actual_identity)))
-                                if actual == expected
-                                    && Some(actual_identity) == expected_identity => {}
-                            Ok(_) => {
-                                // The exchange captured an unexpected inode.
-                                // Roll back while both names remain locked.
-                                if rustix::fs::renameat_with(
-                                    directory,
-                                    &temporary_name,
-                                    directory,
-                                    name,
-                                    rustix::fs::RenameFlags::EXCHANGE,
-                                )
-                                .is_ok()
-                                {
-                                    committed = false;
-                                    return Err(UnitStoreError::Conflict);
-                                }
-                                return Err(UnitStoreError::CommittedNeedsReload);
+                        if let Err(error) = Self::remove_exact(
+                            directory,
+                            &temporary_name,
+                            expected,
+                            expected_identity,
+                            "data-displaced",
+                        ) {
+                            if Self::exchange_exact(
+                                directory,
+                                &temporary_name,
+                                expected,
+                                expected_identity,
+                                name,
+                                contents,
+                                new_identity,
+                            )
+                            .is_ok()
+                            {
+                                committed = false;
+                                return Err(error);
                             }
-                            Err(_) => return Err(UnitStoreError::CommittedNeedsReload),
+                            return Err(UnitStoreError::CommittedNeedsReload);
                         }
-                        rustix::fs::unlinkat(directory, &temporary_name, AtFlags::empty())
-                            .map_err(|_| UnitStoreError::CommittedNeedsReload)?;
                     }
                 }
                 Ok(())
             })();
-            if !committed
-                && !matches!(&result, Err(UnitStoreError::CommittedNeedsReload))
-                && matches!(
-                    Self::inspect_at(directory, &temporary_name),
-                    Ok((StoredUnit::Regular(_), Some(identity))) if identity == new_identity
-                )
-            {
-                let _ = rustix::fs::unlinkat(directory, &temporary_name, AtFlags::empty());
+            if !committed && !matches!(&result, Err(UnitStoreError::CommittedNeedsReload)) {
+                let _ = Self::remove_exact(
+                    directory,
+                    &temporary_name,
+                    contents,
+                    new_identity,
+                    "data-abort",
+                );
             }
             match result {
                 Ok(()) => {
@@ -1279,8 +1502,18 @@ mod unix_store {
                     if !snapshot_matches(&staged, staged_identity, before, before_hash) {
                         return Err(UnitStoreError::Conflict);
                     }
-                    rustix::fs::unlinkat(&directory, temporary, AtFlags::empty())
-                        .map_err(|_| UnitStoreError::CommittedNeedsReload)?;
+                    let (StoredUnit::Regular(staged_bytes), Some(staged_identity)) =
+                        (&staged, staged_identity)
+                    else {
+                        return Err(UnitStoreError::Conflict);
+                    };
+                    Self::remove_exact(
+                        &directory,
+                        temporary,
+                        staged_bytes,
+                        staged_identity,
+                        "recovery-committed",
+                    )?;
                     rustix::fs::fsync(&directory)
                         .map_err(|_| UnitStoreError::CommittedNeedsReload)?;
                 }
@@ -1293,8 +1526,18 @@ mod unix_store {
                         if !snapshot_matches(&staged, staged_identity, after, after_hash) {
                             return Err(UnitStoreError::Conflict);
                         }
-                        rustix::fs::unlinkat(&directory, temporary, AtFlags::empty())
-                            .map_err(|_| UnitStoreError::Io)?;
+                        let (StoredUnit::Regular(staged_bytes), Some(staged_identity)) =
+                            (&staged, staged_identity)
+                        else {
+                            return Err(UnitStoreError::Conflict);
+                        };
+                        Self::remove_exact(
+                            &directory,
+                            temporary,
+                            staged_bytes,
+                            staged_identity,
+                            "recovery-abort",
+                        )?;
                         rustix::fs::fsync(&directory).map_err(|_| UnitStoreError::Io)?;
                     }
                     self.clear_reload_required(unit_name)?;
@@ -1306,59 +1549,66 @@ mod unix_store {
                         if !snapshot_matches(&staged, staged_identity, after, after_hash) {
                             return Err(UnitStoreError::CommittedNeedsReload);
                         }
+                        let (StoredUnit::Regular(staged_bytes), Some(staged_identity)) =
+                            (&staged, staged_identity)
+                        else {
+                            return Err(UnitStoreError::CommittedNeedsReload);
+                        };
                         if before == "missing" {
-                            rustix::fs::renameat_with(
+                            Self::rename_noreplace_exact(
                                 &directory,
                                 temporary,
-                                &directory,
+                                staged_bytes,
+                                staged_identity,
                                 unit_name,
-                                rustix::fs::RenameFlags::NOREPLACE,
-                            )
-                            .map_err(|_| UnitStoreError::CommittedNeedsReload)?;
+                            )?;
                         } else {
-                            rustix::fs::renameat_with(
+                            let (StoredUnit::Regular(target_bytes), Some(target_identity)) =
+                                (&target, target_identity)
+                            else {
+                                return Err(UnitStoreError::Conflict);
+                            };
+                            Self::exchange_exact(
                                 &directory,
                                 temporary,
-                                &directory,
+                                staged_bytes,
+                                staged_identity,
                                 unit_name,
-                                rustix::fs::RenameFlags::EXCHANGE,
-                            )
-                            .map_err(|_| UnitStoreError::CommittedNeedsReload)?;
-                            let (displaced, displaced_identity) =
-                                Self::inspect_at(&directory, temporary)
-                                    .map_err(|_| UnitStoreError::CommittedNeedsReload)?;
-                            if !snapshot_matches(
-                                &displaced,
-                                displaced_identity,
-                                before,
-                                before_hash,
-                            ) {
-                                return Err(UnitStoreError::CommittedNeedsReload);
-                            }
-                            rustix::fs::unlinkat(&directory, temporary, AtFlags::empty())
-                                .map_err(|_| UnitStoreError::CommittedNeedsReload)?;
+                                target_bytes,
+                                target_identity,
+                            )?;
+                            Self::remove_exact(
+                                &directory,
+                                temporary,
+                                target_bytes,
+                                target_identity,
+                                "recovery-rollback",
+                            )?;
                         }
                     }
                     "remove" => {
                         if !matches!(&staged, StoredUnit::Missing) || after != "missing" {
                             return Err(UnitStoreError::CommittedNeedsReload);
                         }
-                        rustix::fs::renameat_with(
+                        let (StoredUnit::Regular(target_bytes), Some(target_identity)) =
+                            (&target, target_identity)
+                        else {
+                            return Err(UnitStoreError::Conflict);
+                        };
+                        Self::rename_noreplace_exact(
                             &directory,
                             unit_name,
+                            target_bytes,
+                            target_identity,
+                            temporary,
+                        )?;
+                        Self::remove_exact(
                             &directory,
                             temporary,
-                            rustix::fs::RenameFlags::NOREPLACE,
-                        )
-                        .map_err(|_| UnitStoreError::CommittedNeedsReload)?;
-                        let (displaced, displaced_identity) =
-                            Self::inspect_at(&directory, temporary)
-                                .map_err(|_| UnitStoreError::CommittedNeedsReload)?;
-                        if !snapshot_matches(&displaced, displaced_identity, before, before_hash) {
-                            return Err(UnitStoreError::CommittedNeedsReload);
-                        }
-                        rustix::fs::unlinkat(&directory, temporary, AtFlags::empty())
-                            .map_err(|_| UnitStoreError::CommittedNeedsReload)?;
+                            target_bytes,
+                            target_identity,
+                            "recovery-remove",
+                        )?;
                     }
                     _ => return Err(UnitStoreError::MalformedJournal),
                 }
@@ -1396,34 +1646,18 @@ mod unix_store {
             ) {
                 return Err(UnitStoreError::CommittedNeedsReload);
             }
-            let sequence = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let tombstone = format!(".{unit_name}.journal-clear.{sequence:x}");
-            rustix::fs::renameat_with(
+            let expected_identity = expected_identity.ok_or(UnitStoreError::Conflict)?;
+            Self::remove_exact(
                 &directory,
                 &journal,
-                &directory,
-                &tombstone,
-                rustix::fs::RenameFlags::NOREPLACE,
+                journal_bytes,
+                expected_identity,
+                "journal-clear",
             )
-            .map_err(|_| UnitStoreError::CommittedNeedsReload)?;
-            let (displaced, actual_identity) = Self::inspect_at(&directory, &tombstone)
-                .map_err(|_| UnitStoreError::CommittedNeedsReload)?;
-            if !matches!(
-                (&displaced, actual_identity, expected_identity),
-                (StoredUnit::Regular(bytes), Some(actual), Some(expected))
-                    if valid_journal(unit_name, bytes) && actual == expected
-            ) {
-                let _ = rustix::fs::renameat_with(
-                    &directory,
-                    &tombstone,
-                    &directory,
-                    &journal,
-                    rustix::fs::RenameFlags::NOREPLACE,
-                );
-                return Err(UnitStoreError::Conflict);
-            }
-            rustix::fs::unlinkat(&directory, &tombstone, AtFlags::empty())
-                .map_err(|_| UnitStoreError::CommittedNeedsReload)?;
+            .map_err(|error| match error {
+                UnitStoreError::Conflict => UnitStoreError::Conflict,
+                _ => UnitStoreError::CommittedNeedsReload,
+            })?;
             rustix::fs::fsync(&directory).map_err(|_| UnitStoreError::CommittedNeedsReload)
         }
 
@@ -1451,33 +1685,13 @@ mod unix_store {
                 _ => return Err(UnitStoreError::Conflict),
             }
             let journal_identity = journal_identity.ok_or(UnitStoreError::Conflict)?;
-            let sequence = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let tombstone = format!(".{unit_name}.malformed-repair.{sequence:x}");
-            rustix::fs::renameat_with(
+            Self::remove_exact(
                 &directory,
                 &journal,
-                &directory,
-                &tombstone,
-                rustix::fs::RenameFlags::NOREPLACE,
-            )
-            .map_err(|_| UnitStoreError::Conflict)?;
-            let (displaced, displaced_identity) = Self::inspect_at(&directory, &tombstone)?;
-            if !matches!(
-                (displaced, displaced_identity),
-                (StoredUnit::Regular(actual), Some(identity))
-                    if actual == journal_bytes && identity == journal_identity
-            ) {
-                let _ = rustix::fs::renameat_with(
-                    &directory,
-                    &tombstone,
-                    &directory,
-                    &journal,
-                    rustix::fs::RenameFlags::NOREPLACE,
-                );
-                return Err(UnitStoreError::Conflict);
-            }
-            rustix::fs::unlinkat(&directory, &tombstone, AtFlags::empty())
-                .map_err(|_| UnitStoreError::Io)?;
+                &journal_bytes,
+                journal_identity,
+                "malformed-repair",
+            )?;
             rustix::fs::fsync(&directory).map_err(|_| UnitStoreError::Io)
         }
 
@@ -1553,44 +1767,24 @@ mod unix_store {
                 expected.len(),
             );
             Self::publish_journal(&directory, unit_name, phase, operation.as_bytes())?;
-            let (immediate, immediate_identity) = Self::inspect_at(&directory, unit_name)?;
-            if !matches!(
-                (immediate, immediate_identity),
-                (StoredUnit::Regular(actual), Some(identity))
-                    if actual == expected && identity == expected_identity
-            ) {
-                return Err(UnitStoreError::Conflict);
-            }
-            rustix::fs::renameat_with(
+            Self::rename_noreplace_exact(
                 &directory,
                 unit_name,
+                expected,
+                expected_identity,
+                &tombstone,
+            )?;
+            if Self::remove_exact(
                 &directory,
                 &tombstone,
-                rustix::fs::RenameFlags::NOREPLACE,
+                expected,
+                expected_identity,
+                "remove-committed",
             )
-            .map_err(|_| UnitStoreError::Conflict)?;
-            let displaced = Self::inspect_at(&directory, &tombstone);
-            match displaced {
-                Ok((StoredUnit::Regular(actual), Some(identity)))
-                    if actual == expected && identity == expected_identity => {}
-                Ok(_) => {
-                    if rustix::fs::renameat_with(
-                        &directory,
-                        &tombstone,
-                        &directory,
-                        unit_name,
-                        rustix::fs::RenameFlags::NOREPLACE,
-                    )
-                    .is_ok()
-                    {
-                        return Err(UnitStoreError::Conflict);
-                    }
-                    return Err(UnitStoreError::CommittedNeedsReload);
-                }
-                Err(_) => return Err(UnitStoreError::CommittedNeedsReload),
+            .is_err()
+            {
+                return Err(UnitStoreError::CommittedNeedsReload);
             }
-            rustix::fs::unlinkat(&directory, &tombstone, AtFlags::empty())
-                .map_err(|_| UnitStoreError::CommittedNeedsReload)?;
             self.observed
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -3582,6 +3776,176 @@ mod tests {
             .unit_directory()
             .join(".rustscale-tray.service.operation")
             .exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn noncooperating_races_at_every_cas_gap_preserve_racer_and_avoid_reload() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use rustix::fs::{Mode, OFlags};
+
+        fn write_private(path: &Path, bytes: &[u8]) {
+            std::fs::write(path, bytes).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let commands = FakeCommands::default();
+
+        fn replace_at(directory: &OwnedFd, name: &str, bytes: &[u8]) {
+            let candidate = format!(".{name}.race-injection");
+            let fd = rustix::fs::openat(
+                directory,
+                &candidate,
+                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .unwrap();
+            let mut file = std::fs::File::from(fd);
+            file.write_all(bytes).unwrap();
+            file.sync_all().unwrap();
+            drop(file);
+            rustix::fs::renameat(directory, &candidate, directory, name).unwrap();
+        }
+
+        for gap in [
+            unix_store::CasGap::AfterValidation,
+            unix_store::CasGap::AfterMutation,
+        ] {
+            let temporary = tempfile::tempdir().unwrap();
+            let config = temporary.path().join("config");
+            std::fs::create_dir(&config).unwrap();
+            let store = SystemUserUnitStore::new(&config).unwrap();
+            let directory = store.open_user_dir(true).unwrap().unwrap();
+            let root = store.unit_directory();
+            write_private(&root.join("left"), b"owned-left");
+            write_private(&root.join("right"), b"owned-right");
+            let (_, Some(left_identity)) =
+                SystemUserUnitStore::inspect_at(&directory, "left").unwrap()
+            else {
+                panic!("left identity missing");
+            };
+            let (_, Some(right_identity)) =
+                SystemUserUnitStore::inspect_at(&directory, "right").unwrap()
+            else {
+                panic!("right identity missing");
+            };
+            assert_eq!(
+                SystemUserUnitStore::exchange_exact_with_hook(
+                    &directory,
+                    "left",
+                    b"owned-left",
+                    left_identity,
+                    "right",
+                    b"owned-right",
+                    right_identity,
+                    |at, directory, _, right| {
+                        if at == gap {
+                            replace_at(directory, right, b"same-uid-racer");
+                        }
+                    },
+                ),
+                Err(UnitStoreError::Conflict)
+            );
+            let survivors = [
+                std::fs::read(root.join("left")).unwrap(),
+                std::fs::read(root.join("right")).unwrap(),
+            ];
+            assert!(survivors.iter().any(|bytes| bytes == b"same-uid-racer"));
+            assert!(survivors
+                .iter()
+                .any(|bytes| bytes == b"owned-left" || bytes == b"owned-right"));
+
+            let source = root.join("source");
+            write_private(&source, b"rename-owned");
+            let (_, Some(source_identity)) =
+                SystemUserUnitStore::inspect_at(&directory, "source").unwrap()
+            else {
+                panic!("source identity missing");
+            };
+            assert_eq!(
+                SystemUserUnitStore::rename_noreplace_exact_with_hook(
+                    &directory,
+                    "source",
+                    b"rename-owned",
+                    source_identity,
+                    "destination",
+                    |at, directory, _, destination| {
+                        if at == gap {
+                            replace_at(directory, destination, b"same-uid-racer");
+                        }
+                    },
+                ),
+                Err(UnitStoreError::Conflict)
+            );
+            assert!(std::fs::read_dir(&root)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter_map(|entry| std::fs::read(entry.path()).ok())
+                .any(|bytes| bytes == b"same-uid-racer"));
+
+            write_private(&root.join("remove-owned"), b"remove-owned");
+            let (_, Some(remove_identity)) =
+                SystemUserUnitStore::inspect_at(&directory, "remove-owned").unwrap()
+            else {
+                panic!("remove identity missing");
+            };
+            assert_eq!(
+                SystemUserUnitStore::remove_exact_with_hook(
+                    &directory,
+                    "remove-owned",
+                    b"remove-owned",
+                    remove_identity,
+                    "test-remove",
+                    |at, directory, name, tombstone| {
+                        if at == gap {
+                            let raced = if at == unix_store::CasGap::AfterValidation {
+                                name
+                            } else {
+                                tombstone
+                            };
+                            replace_at(directory, raced, b"same-uid-racer");
+                        }
+                    },
+                ),
+                Err(UnitStoreError::Conflict)
+            );
+            assert!(std::fs::read_dir(&root)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter_map(|entry| std::fs::read(entry.path()).ok())
+                .any(|bytes| bytes == b"same-uid-racer"));
+
+            if gap == unix_store::CasGap::AfterMutation {
+                write_private(&root.join("remove-finalize"), b"remove-finalize");
+                let (_, Some(finalize_identity)) =
+                    SystemUserUnitStore::inspect_at(&directory, "remove-finalize").unwrap()
+                else {
+                    panic!("finalize identity missing");
+                };
+                assert_eq!(
+                    SystemUserUnitStore::remove_exact_with_hook(
+                        &directory,
+                        "remove-finalize",
+                        b"remove-finalize",
+                        finalize_identity,
+                        "test-finalize",
+                        |at, directory, _, tombstone| {
+                            if at == unix_store::CasGap::BeforeFinalize {
+                                replace_at(directory, tombstone, b"same-uid-final-racer");
+                            }
+                        },
+                    ),
+                    Err(UnitStoreError::Conflict)
+                );
+                assert!(std::fs::read_dir(&root)
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .filter_map(|entry| std::fs::read(entry.path()).ok())
+                    .any(|bytes| bytes == b"same-uid-final-racer"));
+            }
+        }
+        assert!(commands.commands().is_empty());
     }
 
     #[cfg(target_os = "linux")]

@@ -68,6 +68,18 @@ pub use windows::Listener;
 /// On Unix, creates a Unix domain socket with appropriate permissions. On
 /// Windows, creates a named pipe (path should be `\\.\pipe\...`).
 pub fn listen(path: &std::path::Path) -> std::io::Result<Listener> {
+    let handle = require_runtime()?;
+    listen_with_handle(&handle, path)
+}
+
+/// Listen using an explicit Tokio runtime handle.
+///
+/// This is the cross-thread form of [`listen`].
+pub fn listen_with_handle(
+    handle: &tokio::runtime::Handle,
+    path: &std::path::Path,
+) -> std::io::Result<Listener> {
+    let _enter = handle.enter();
     #[cfg(unix)]
     {
         unix::listen(path)
@@ -82,6 +94,16 @@ pub fn listen(path: &std::path::Path) -> std::io::Result<Listener> {
 ///
 /// On Unix, dials a Unix domain socket. On Windows, opens a named pipe.
 pub fn connect(path: &std::path::Path) -> std::io::Result<Connection> {
+    let handle = require_runtime()?;
+    connect_with_handle(&handle, path)
+}
+
+/// Connect using an explicit Tokio runtime handle.
+pub fn connect_with_handle(
+    handle: &tokio::runtime::Handle,
+    path: &std::path::Path,
+) -> std::io::Result<Connection> {
+    let _enter = handle.enter();
     #[cfg(unix)]
     {
         unix::connect(path)
@@ -99,6 +121,17 @@ pub fn connect_with_retries(
     path: &std::path::Path,
     timeout: std::time::Duration,
 ) -> std::io::Result<Connection> {
+    let handle = require_runtime()?;
+    connect_with_retries_with_handle(&handle, path, timeout)
+}
+
+/// Connect with retries using an explicit Tokio runtime handle.
+pub fn connect_with_retries_with_handle(
+    handle: &tokio::runtime::Handle,
+    path: &std::path::Path,
+    timeout: std::time::Duration,
+) -> std::io::Result<Connection> {
+    let _enter = handle.enter();
     #[cfg(unix)]
     {
         unix::connect_with_retries(path, timeout)
@@ -107,6 +140,20 @@ pub fn connect_with_retries(
     {
         windows::connect_with_retries(path, timeout)
     }
+}
+
+/// Return a typed error instead of letting Tokio's I/O registration panic.
+///
+/// The returned listener or connection is registered with the runtime that is
+/// current at this point, so a caller must invoke this API from an entered
+/// Tokio runtime.
+fn require_runtime() -> std::io::Result<tokio::runtime::Handle> {
+    tokio::runtime::Handle::try_current().map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotConnected,
+            "safesocket requires an entered Tokio runtime",
+        )
+    })
 }
 
 /// Reports whether the current platform authenticates IPC peers via

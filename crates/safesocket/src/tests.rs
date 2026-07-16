@@ -3,7 +3,20 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[cfg(unix)]
-use crate::{connect, connect_with_retries, listen};
+use crate::{connect, connect_with_retries_with_handle, listen};
+
+#[cfg(unix)]
+#[test]
+fn sync_apis_without_runtime_return_errors_without_panicking() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("no-runtime.sock");
+    let result = std::panic::catch_unwind(|| listen(&path));
+    let error = result
+        .expect("must not panic")
+        .expect_err("runtime is required");
+    assert_eq!(error.kind(), std::io::ErrorKind::NotConnected);
+    assert!(!path.exists(), "runtime check must precede socket creation");
+}
 
 #[cfg(unix)]
 #[tokio::test]
@@ -102,13 +115,18 @@ fn test_connect_nonexistent_path() {
 }
 
 #[cfg(unix)]
-#[test]
-fn test_connect_with_retries_timeout() {
+#[tokio::test]
+async fn test_connect_with_retries_timeout() {
     let dir = tempfile::tempdir().unwrap();
     let sock = dir.path().join("never.sock");
 
     let start = std::time::Instant::now();
-    let result = connect_with_retries(&sock, Duration::from_millis(600));
+    let handle = tokio::runtime::Handle::current();
+    let result = tokio::task::spawn_blocking(move || {
+        connect_with_retries_with_handle(&handle, &sock, Duration::from_millis(600))
+    })
+    .await
+    .unwrap();
     let elapsed = start.elapsed();
 
     assert!(result.is_err(), "should fail after timeout");
@@ -131,9 +149,10 @@ async fn test_connect_with_retries_succeeds() {
         tokio::time::sleep(Duration::from_secs(5)).await;
     });
 
+    let handle = tokio::runtime::Handle::current();
     let result = tokio::task::spawn_blocking({
         let sock = sock.clone();
-        move || connect_with_retries(&sock, Duration::from_secs(3))
+        move || connect_with_retries_with_handle(&handle, &sock, Duration::from_secs(3))
     })
     .await
     .unwrap();

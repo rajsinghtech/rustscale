@@ -100,7 +100,7 @@ pub async fn run(
     {
         log::set_max_level(log::LevelFilter::Info);
     }
-    let upload = policy.start_upload();
+    let upload = policy.start_upload()?;
 
     let result = if let Some(key) = auth_key {
         run_with_auth_key(

@@ -422,7 +422,7 @@ async fn run_icmp_probes(dm: &DERPMap, opts: &ProberOpts) -> Vec<(i32, Duration)
         handles.push(tokio::spawn(async move {
             // Each task opens its own ICMP socket — unprivileged datagram
             // ICMP allows multiple sockets; raw ICMP might fail for the 2nd.
-            let mut pinger = crate::icmp::Pinger::new_v4()?;
+            let mut pinger = crate::icmp::Pinger::new_v4().ok()??;
             let rtt = pinger.ping(ip, b"rustscale-netcheck").await?;
             Some((region_id, rtt))
         }));

@@ -199,16 +199,34 @@ impl LogTail {
         }
     }
 
-    pub fn start_upload(&self) -> UploadHandle {
+    /// Start uploads on the currently entered Tokio runtime.
+    pub fn start_upload(&self) -> std::io::Result<UploadHandle> {
+        let handle = tokio::runtime::Handle::try_current().map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "logtail upload requires an entered Tokio runtime",
+            )
+        })?;
+        self.start_upload_with_handle(&handle)
+    }
+
+    /// Start uploads on an explicit Tokio runtime handle.
+    pub fn start_upload_with_handle(
+        &self,
+        handle: &tokio::runtime::Handle,
+    ) -> std::io::Result<UploadHandle> {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let (done_tx, done_rx) = oneshot::channel();
+        let inner = Arc::clone(&self.inner);
+        let task = handle.spawn(upload_loop(inner, shutdown_rx, done_tx));
         *self.inner.shutdown_tx.lock().unwrap() = Some(shutdown_tx);
         *self.inner.done_rx.lock().unwrap() = Some(done_rx);
-        let inner = Arc::clone(&self.inner);
-        tokio::spawn(upload_loop(inner, shutdown_rx, done_tx));
-        UploadHandle {
+        // Keep spawning through the explicit handle, while retaining Tokio's
+        // cancellation-on-runtime-drop behavior.
+        drop(task);
+        Ok(UploadHandle {
             inner: Arc::clone(&self.inner),
-        }
+        })
     }
 
     pub fn flush(&self) {
@@ -545,6 +563,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn start_upload_without_runtime_is_typed_error() {
+        let logtail = LogTail::new(Config::default());
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| logtail.start_upload()));
+        let error = match result.expect("must not panic") {
+            Ok(_) => panic!("runtime is required"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::NotConnected);
+    }
+
+    #[test]
     fn buffer_and_count() {
         let lt = LogTail::new(Config::default());
         lt.write("hello");
@@ -734,7 +764,7 @@ mod tests {
         };
         let lt = LogTail::new(cfg);
         lt.write("hello logtail");
-        let handle = lt.start_upload();
+        let handle = lt.start_upload().unwrap();
 
         let (tx, rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
@@ -779,7 +809,7 @@ mod tests {
                 "log line number {i} with some padding text here aaa"
             ));
         }
-        let handle = lt.start_upload();
+        let handle = lt.start_upload().unwrap();
 
         let (tx, rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
@@ -824,7 +854,7 @@ mod tests {
         };
         let lt = LogTail::new(cfg);
         lt.write("retry me");
-        let handle = lt.start_upload();
+        let handle = lt.start_upload().unwrap();
 
         let (tx, rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
@@ -860,7 +890,7 @@ mod tests {
         };
         let lt = LogTail::new(cfg);
         lt.write("entry");
-        let handle = lt.start_upload();
+        let handle = lt.start_upload().unwrap();
         handle.shutdown().await;
     }
 }

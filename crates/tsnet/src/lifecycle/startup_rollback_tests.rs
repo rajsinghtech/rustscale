@@ -197,7 +197,8 @@ async fn dropped_bootstrap_transaction_joins_tasks_before_retry() {
         Severity::Low,
         "not stopped",
         std::time::Duration::from_secs(60),
-    );
+    )
+    .unwrap();
     let mut rollback = BootstrapRollback::new(Arc::clone(&supervisor), watchdog);
     rollback.set_map_task(task);
     drop(rollback);
@@ -231,7 +232,8 @@ async fn cancellation_after_each_spawn_is_joined_before_immediate_retry() {
             Severity::Low,
             "not stopped",
             std::time::Duration::from_secs(60),
-        );
+        )
+        .unwrap();
         let active = Arc::new(AtomicUsize::new(0));
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let temp = tempfile::tempdir().unwrap();
@@ -302,7 +304,8 @@ async fn committed_startup_tasks_transfer_to_running_ownership() {
         Severity::Low,
         "not stopped",
         std::time::Duration::from_secs(60),
-    );
+    )
+    .unwrap();
     let active = Arc::new(AtomicUsize::new(0));
     active.fetch_add(1, Ordering::SeqCst);
     let task_active = Arc::clone(&active);
@@ -345,7 +348,8 @@ async fn startup_rollback_joins_late_route_update_before_final_close() {
         Severity::Low,
         "not stopped",
         std::time::Duration::from_secs(60),
-    );
+    )
+    .unwrap();
     let events = Arc::new(std::sync::Mutex::new(Vec::new()));
     let router = shared_test_router(Box::new(OrderedRouter(Arc::clone(&events))));
     let map_task = tokio::spawn(std::future::pending::<()>());
@@ -487,7 +491,8 @@ async fn post_bootstrap_rollback_stops_and_joins_netlog() {
         Severity::Low,
         "not stopped",
         std::time::Duration::from_secs(60),
-    );
+    )
+    .unwrap();
     let map_task = tokio::spawn(std::future::pending::<()>());
     let rollback = StartupRollback::new(
         Arc::clone(&supervisor),
@@ -537,7 +542,8 @@ async fn startup_supervisor_waits_for_magicsock_socket_release() {
         Severity::Low,
         "not stopped",
         std::time::Duration::from_secs(60),
-    );
+    )
+    .unwrap();
     let map_task = tokio::spawn(std::future::pending::<()>());
     let mut rollback = StartupRollback::new(
         Arc::clone(&supervisor),
@@ -629,7 +635,8 @@ fn startup_rollback_dropped_after_runtime_destroys_polled_tun_task_and_routes() 
             Severity::Low,
             "not stopped",
             std::time::Duration::from_secs(60),
-        );
+        )
+        .unwrap();
         let map_task = tokio::spawn(std::future::pending::<()>());
         let task_dropped = Arc::clone(&dropped);
         let tun_task = tokio::spawn(async move {
@@ -766,7 +773,8 @@ async fn dropped_startup_transaction_rolls_back_owned_resources() {
         Severity::Low,
         "not stopped",
         std::time::Duration::from_secs(60),
-    );
+    )
+    .unwrap();
     let dropped = Arc::new(AtomicUsize::new(0));
     let map_drop = DropCount(Arc::clone(&dropped));
     let map_task = tokio::spawn(async move {

@@ -12,6 +12,7 @@
 //! If neither can be opened, ICMP probing is silently skipped (the report's
 //! `icmpv4` stays `false`), matching Go's EPERM handling.
 
+use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
@@ -37,12 +38,20 @@ pub struct Pinger {
 
 impl Pinger {
     /// Create a new ICMPv4 pinger. Tries unprivileged datagram ICMP first,
-    /// then raw ICMP. Returns `None` if neither can be opened (e.g. no
-    /// permissions).
-    pub fn new_v4() -> Option<Self> {
-        let sock = Self::open_icmp_socket()?;
+    /// then raw ICMP. Returns `Ok(None)` if neither can be opened (e.g. no
+    /// permissions), and a typed error if no Tokio runtime is entered.
+    pub fn new_v4() -> io::Result<Option<Self>> {
+        tokio::runtime::Handle::try_current().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "ICMP socket registration requires an entered Tokio runtime",
+            )
+        })?;
+        let Some(sock) = Self::open_icmp_socket() else {
+            return Ok(None);
+        };
         let id = rand::random::<u16>();
-        Some(Self { sock, id, seq: 0 })
+        Ok(Some(Self { sock, id, seq: 0 }))
     }
 
     fn open_icmp_socket() -> Option<UdpSocket> {
@@ -172,6 +181,16 @@ fn internet_checksum(data: &[u8]) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pinger_without_runtime_is_typed_error() {
+        let result = std::panic::catch_unwind(Pinger::new_v4);
+        let error = match result.expect("must not panic") {
+            Ok(_) => panic!("runtime is required"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+    }
 
     #[test]
     fn echo_request_checksum() {

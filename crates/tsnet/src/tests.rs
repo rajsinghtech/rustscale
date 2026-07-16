@@ -2317,8 +2317,8 @@ fn make_rig_with_capture(
     let a_pub = a_priv.public();
     let b_pub = b_priv.public();
 
-    let a_net = Arc::new(Netstack::new(Ipv4Addr::new(100, 64, 0, 1), DEFAULT_MTU));
-    let b_net = Arc::new(Netstack::new(Ipv4Addr::new(100, 64, 0, 2), DEFAULT_MTU));
+    let a_net = Arc::new(Netstack::new(Ipv4Addr::new(100, 64, 0, 1), DEFAULT_MTU).unwrap());
+    let b_net = Arc::new(Netstack::new(Ipv4Addr::new(100, 64, 0, 2), DEFAULT_MTU).unwrap());
 
     let a_tunn = Arc::new(Mutex::new(
         WgTunn::new(&a_priv, &b_pub, 1).expect("A tunnel"),

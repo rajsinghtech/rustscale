@@ -284,6 +284,13 @@ impl Incubator {
             &self.args.login_shell
         };
 
+        tokio::runtime::Handle::try_current().map_err(|_| {
+            IncubatorError::Io(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "SSH incubator spawn requires an entered Tokio runtime",
+            ))
+        })?;
+
         let args = self.shell_args();
         log::debug!(
             "incubator: spawning {shell} {args:?} for uid={} user={}",
@@ -538,6 +545,25 @@ mod tests {
         });
         let result = inc.spawn();
         assert!(matches!(result, Err(IncubatorError::NoShell(_))));
+    }
+
+    #[test]
+    fn spawn_without_runtime_is_typed_error() {
+        let result = std::panic::catch_unwind(|| {
+            Incubator::new(IncubatorArgs {
+                login_shell: "/bin/sh".into(),
+                cmd: "exit 0".into(),
+                ..Default::default()
+            })
+            .spawn()
+        });
+        let error = match result.expect("must not panic") {
+            Ok(_) => panic!("runtime is required"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, IncubatorError::Io(ref e) if e.kind() == io::ErrorKind::NotConnected)
+        );
     }
 
     #[cfg(unix)]

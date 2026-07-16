@@ -95,7 +95,7 @@ impl Policy {
     }
 
     /// Start the background upload task.
-    pub fn start_upload(&self) -> UploadHandle {
+    pub fn start_upload(&self) -> std::io::Result<UploadHandle> {
         self.logtail.start_upload()
     }
 }

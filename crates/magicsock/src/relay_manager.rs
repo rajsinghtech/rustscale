@@ -419,7 +419,15 @@ pub trait RelayManagerContext: Send + Sync + 'static {
 }
 
 /// Spawn the relay manager event loop.
-pub fn spawn_relay_manager<RM: RelayManagerContext>(ctx: std::sync::Arc<RM>) -> RelayManagerHandle {
+pub fn spawn_relay_manager<RM: RelayManagerContext>(
+    ctx: std::sync::Arc<RM>,
+) -> std::io::Result<RelayManagerHandle> {
+    tokio::runtime::Handle::try_current().map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotConnected,
+            "relay manager requires an entered Tokio runtime",
+        )
+    })?;
     let tasks = std::sync::Arc::new(TaskRegistry::default());
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let handle = RelayManagerHandle {
@@ -432,7 +440,7 @@ pub fn spawn_relay_manager<RM: RelayManagerContext>(ctx: std::sync::Arc<RM>) -> 
         ctx,
         std::sync::Arc::downgrade(&tasks),
     ));
-    handle
+    Ok(handle)
 }
 
 pub(crate) fn spawn_relay_manager_tracked<RM: RelayManagerContext>(

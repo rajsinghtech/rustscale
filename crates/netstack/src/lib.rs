@@ -366,7 +366,13 @@ impl Netstack {
     /// Create a new netstack bound to `addr` (the node's tailnet IPv4).
     ///
     /// Spawns a background poll-loop task that drives the smoltcp interface.
-    pub fn new(addr: Ipv4Addr, mtu: usize) -> Self {
+    pub fn new(addr: Ipv4Addr, mtu: usize) -> Result<Self, NetstackError> {
+        let handle = tokio::runtime::Handle::try_current().map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "netstack requires an entered Tokio runtime",
+            )
+        })?;
         let rx_queue = Arc::new(std::sync::Mutex::new(VecDeque::new()));
         let tx_queue = Arc::new(std::sync::Mutex::new(VecDeque::new()));
         let notify = Arc::new(Notify::new());
@@ -376,7 +382,7 @@ impl Netstack {
 
         let device =
             LoopbackDevice::new(rx_queue.clone(), tx_queue.clone(), mtu, tx_notify.clone());
-        tokio::spawn(poll_loop(
+        handle.spawn(poll_loop(
             addr,
             device,
             cmd_rx,
@@ -384,7 +390,7 @@ impl Netstack {
             inbound_flows.clone(),
         ));
 
-        Self {
+        Ok(Self {
             addr,
             rx_queue,
             tx_queue,
@@ -392,7 +398,7 @@ impl Netstack {
             cmd_tx,
             notify,
             tx_notify,
-        }
+        })
     }
 
     /// Feed a decapsulated plaintext IP packet without peer provenance.

@@ -13,6 +13,18 @@ use rustscale_wg::WgTunn;
 
 use crate::{Netstack, DEFAULT_MTU};
 
+#[test]
+fn constructor_without_runtime_is_typed_error() {
+    let result = std::panic::catch_unwind(|| Netstack::new(Ipv4Addr::LOCALHOST, DEFAULT_MTU));
+    let error = match result.expect("must not panic") {
+        Ok(_) => panic!("runtime is required"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(error, crate::NetstackError::Io(ref e) if e.kind() == std::io::ErrorKind::NotConnected)
+    );
+}
+
 /// Cross-feed a WG datagram from src to dst, recursively handling reply chains.
 fn cross_feed(
     datagram: &[u8],
@@ -103,8 +115,8 @@ async fn back_to_back_dial_and_echo() {
     let a_addr = Ipv4Addr::new(100, 64, 0, 1);
     let b_addr = Ipv4Addr::new(100, 64, 0, 2);
 
-    let a_net = Arc::new(Netstack::new(a_addr, DEFAULT_MTU));
-    let b_net = Arc::new(Netstack::new(b_addr, DEFAULT_MTU));
+    let a_net = Arc::new(Netstack::new(a_addr, DEFAULT_MTU).unwrap());
+    let b_net = Arc::new(Netstack::new(b_addr, DEFAULT_MTU).unwrap());
 
     let a_tunn = Arc::new(Mutex::new(
         WgTunn::new(&a_priv, &b_pub, 1).expect("A tunnel"),
@@ -185,7 +197,7 @@ async fn back_to_back_dial_and_echo() {
 #[tokio::test]
 async fn listen_rejects_duplicate_port() {
     let addr = Ipv4Addr::new(100, 64, 0, 1);
-    let net = Netstack::new(addr, DEFAULT_MTU);
+    let net = Netstack::new(addr, DEFAULT_MTU).unwrap();
 
     let _listener1 = net.listen(8080).await.expect("first listen");
     let result = net.listen(8080).await;
@@ -194,7 +206,7 @@ async fn listen_rejects_duplicate_port() {
 
 #[tokio::test]
 async fn tx_backlog_above_drain_batch_remains_observable() {
-    let net = Netstack::new(Ipv4Addr::new(100, 64, 0, 1), DEFAULT_MTU);
+    let net = Netstack::new(Ipv4Addr::new(100, 64, 0, 1), DEFAULT_MTU).unwrap();
     for i in 0..65 {
         net.push_tx_for_test(vec![i]);
     }
@@ -226,8 +238,8 @@ async fn backpressure_large_transfer_no_loss() {
     let a_addr = Ipv4Addr::new(100, 64, 0, 1);
     let b_addr = Ipv4Addr::new(100, 64, 0, 2);
 
-    let a_net = Arc::new(Netstack::new(a_addr, DEFAULT_MTU));
-    let b_net = Arc::new(Netstack::new(b_addr, DEFAULT_MTU));
+    let a_net = Arc::new(Netstack::new(a_addr, DEFAULT_MTU).unwrap());
+    let b_net = Arc::new(Netstack::new(b_addr, DEFAULT_MTU).unwrap());
 
     let a_tunn = Arc::new(Mutex::new(
         WgTunn::new(&a_priv, &b_pub, 1).expect("A tunnel"),
@@ -340,8 +352,8 @@ async fn latency_small_message_round_trip() {
     let a_addr = Ipv4Addr::new(100, 64, 0, 1);
     let b_addr = Ipv4Addr::new(100, 64, 0, 2);
 
-    let a_net = Arc::new(Netstack::new(a_addr, DEFAULT_MTU));
-    let b_net = Arc::new(Netstack::new(b_addr, DEFAULT_MTU));
+    let a_net = Arc::new(Netstack::new(a_addr, DEFAULT_MTU).unwrap());
+    let b_net = Arc::new(Netstack::new(b_addr, DEFAULT_MTU).unwrap());
 
     let a_tunn = Arc::new(Mutex::new(
         WgTunn::new(&a_priv, &b_pub, 1).expect("A tunnel"),
@@ -451,8 +463,8 @@ async fn concurrent_connections_all_succeed() {
     let a_addr = Ipv4Addr::new(100, 64, 0, 1);
     let b_addr = Ipv4Addr::new(100, 64, 0, 2);
 
-    let a_net = Arc::new(Netstack::new(a_addr, DEFAULT_MTU));
-    let b_net = Arc::new(Netstack::new(b_addr, DEFAULT_MTU));
+    let a_net = Arc::new(Netstack::new(a_addr, DEFAULT_MTU).unwrap());
+    let b_net = Arc::new(Netstack::new(b_addr, DEFAULT_MTU).unwrap());
 
     let a_tunn = Arc::new(Mutex::new(
         WgTunn::new(&a_priv, &b_pub, 1).expect("A tunnel"),
@@ -549,8 +561,8 @@ async fn listen_on_vip_addr() {
     let b_addr = Ipv4Addr::new(100, 64, 0, 2);
     let b_vip = IpAddr::V4(Ipv4Addr::new(100, 64, 0, 10));
 
-    let a_net = Arc::new(Netstack::new(a_addr, DEFAULT_MTU));
-    let b_net = Arc::new(Netstack::new(b_addr, DEFAULT_MTU));
+    let a_net = Arc::new(Netstack::new(a_addr, DEFAULT_MTU).unwrap());
+    let b_net = Arc::new(Netstack::new(b_addr, DEFAULT_MTU).unwrap());
 
     let a_tunn = Arc::new(Mutex::new(
         WgTunn::new(&a_priv, &b_pub, 1).expect("A tunnel"),
@@ -634,7 +646,7 @@ async fn listen_and_listen_on_same_port() {
 
     let addr = Ipv4Addr::new(100, 64, 0, 1);
     let vip = IpAddr::V4(Ipv4Addr::new(100, 64, 0, 50));
-    let net = Netstack::new(addr, DEFAULT_MTU);
+    let net = Netstack::new(addr, DEFAULT_MTU).unwrap();
 
     // Listen on the primary IP.
     let _listener1 = net.listen(8080).await.expect("listen on primary");
@@ -667,8 +679,8 @@ async fn udp_recv_and_echo() {
     let a_addr = Ipv4Addr::new(100, 64, 0, 1);
     let b_addr = Ipv4Addr::new(100, 64, 0, 2);
 
-    let a_net = Arc::new(Netstack::new(a_addr, DEFAULT_MTU));
-    let b_net = Arc::new(Netstack::new(b_addr, DEFAULT_MTU));
+    let a_net = Arc::new(Netstack::new(a_addr, DEFAULT_MTU).unwrap());
+    let b_net = Arc::new(Netstack::new(b_addr, DEFAULT_MTU).unwrap());
 
     let a_tunn = Arc::new(Mutex::new(
         WgTunn::new(&a_priv, &b_pub, 1).expect("A tunnel"),
@@ -754,7 +766,7 @@ async fn udp_listen_rejects_duplicate_port() {
     use std::net::IpAddr;
 
     let addr = Ipv4Addr::new(100, 64, 0, 1);
-    let net = Netstack::new(addr, DEFAULT_MTU);
+    let net = Netstack::new(addr, DEFAULT_MTU).unwrap();
 
     let _listener1 = net
         .listen_packet(IpAddr::V4(addr), 9090)
@@ -771,7 +783,7 @@ async fn udp_ephemeral_port_allocation() {
     use std::net::IpAddr;
 
     let addr = Ipv4Addr::new(100, 64, 0, 1);
-    let net = Netstack::new(addr, DEFAULT_MTU);
+    let net = Netstack::new(addr, DEFAULT_MTU).unwrap();
 
     let mut ports = Vec::new();
     for _ in 0..3 {
@@ -796,7 +808,7 @@ async fn udp_drop_releases_port() {
     use std::net::IpAddr;
 
     let addr = Ipv4Addr::new(100, 64, 0, 1);
-    let net = Netstack::new(addr, DEFAULT_MTU);
+    let net = Netstack::new(addr, DEFAULT_MTU).unwrap();
 
     {
         let _listener = net

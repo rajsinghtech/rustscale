@@ -30,6 +30,51 @@ fn shared_test_router(router: Box<dyn rustscale_router::Router>) -> SharedRouter
     }))
 }
 
+struct RuntimeCleanupRouter(Arc<AtomicBool>);
+
+impl Router for RuntimeCleanupRouter {
+    fn up(&mut self) -> Result<(), RouterError> {
+        Ok(())
+    }
+
+    fn set(&mut self, _: &RouterConfig) -> Result<(), RouterError> {
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<(), RouterError> {
+        self.0.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+struct RuntimeCleanupExtension {
+    entered: Option<Arc<tokio::sync::Barrier>>,
+    release: Option<Arc<tokio::sync::Barrier>>,
+    closed: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl Extension for RuntimeCleanupExtension {
+    fn name(&self) -> &'static str {
+        "runtime-cleanup"
+    }
+
+    async fn init(&self, _: Host) -> ExtensionResult {
+        Ok(())
+    }
+
+    async fn shutdown(&self) -> ExtensionResult {
+        if let Some(entered) = self.entered.as_ref() {
+            entered.wait().await;
+        }
+        if let Some(release) = self.release.as_ref() {
+            release.wait().await;
+        }
+        self.closed.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Builder validation tests (not ignored)
 // ---------------------------------------------------------------------------
@@ -347,6 +392,72 @@ async fn drop_retries_final_extension_owner_instead_of_discarding_it() {
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
 }
 
+#[test]
+fn close_owner_survives_caller_runtime_destruction() {
+    let first_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut control = rustscale_testcontrol::Server::new();
+    first_runtime.block_on(control.start()).unwrap();
+
+    let entered = Arc::new(tokio::sync::Barrier::new(2));
+    let release = Arc::new(tokio::sync::Barrier::new(2));
+    let extension_closed = Arc::new(AtomicBool::new(false));
+    let registry = Arc::new(ExtensionRegistry::new());
+    let factory_entered = Arc::clone(&entered);
+    let factory_release = Arc::clone(&release);
+    let factory_closed = Arc::clone(&extension_closed);
+    registry
+        .register(Definition::new("runtime-cleanup", move |_| {
+            Ok(Arc::new(RuntimeCleanupExtension {
+                entered: Some(Arc::clone(&factory_entered)),
+                release: Some(Arc::clone(&factory_release)),
+                closed: Arc::clone(&factory_closed),
+            }))
+        }))
+        .unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let mut server = Server::builder()
+        .hostname("close-runtime-destroy")
+        .auth_key("tskey-test")
+        .control_url(control.base_url())
+        .state_dir(temp.path())
+        .disable_portmapping(true)
+        .extension_registry(registry)
+        .build()
+        .unwrap();
+    first_runtime.block_on(Box::pin(server.up())).unwrap();
+
+    let router_closed = Arc::new(AtomicBool::new(false));
+    server.inner.as_mut().unwrap().router = Some(shared_test_router(Box::new(
+        RuntimeCleanupRouter(Arc::clone(&router_closed)),
+    )));
+    first_runtime.block_on(async {
+        let mut close = Box::pin(server.close());
+        tokio::select! {
+            result = &mut close => panic!("close finished before runtime destruction: {result:?}"),
+            _ = entered.wait() => {}
+        }
+    });
+    first_runtime.shutdown_background();
+
+    assert!(!extension_closed.load(Ordering::SeqCst));
+    assert!(!router_closed.load(Ordering::SeqCst));
+    let retry_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    retry_runtime.block_on(async {
+        release.wait().await;
+        server.close().await.unwrap();
+    });
+    assert!(extension_closed.load(Ordering::SeqCst));
+    assert!(router_closed.load(Ordering::SeqCst));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelled_close_finishes_prestarted_and_extension_cleanup() {
     struct BlockingShutdown {
@@ -572,6 +683,111 @@ async fn cancelled_logout_transaction_blocks_retry_until_owned_cleanup_finishes(
         }
     }
     server.close().await.unwrap();
+}
+
+#[test]
+fn logout_transaction_survives_caller_runtime_destruction_and_resumes_phase() {
+    let (url_tx, url_rx) = std::sync::mpsc::sync_channel(1);
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+    let control_worker = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let mut control = rustscale_testcontrol::Server::new();
+            control.start().await.unwrap();
+            url_tx.send(control.base_url()).unwrap();
+            let _ = stop_rx.await;
+        });
+    });
+    let control_url = url_rx.recv().unwrap();
+
+    let extension_closed = Arc::new(AtomicBool::new(false));
+    let registry = Arc::new(ExtensionRegistry::new());
+    let factory_closed = Arc::clone(&extension_closed);
+    registry
+        .register(Definition::new("runtime-cleanup", move |_| {
+            Ok(Arc::new(RuntimeCleanupExtension {
+                entered: None,
+                release: None,
+                closed: Arc::clone(&factory_closed),
+            }))
+        }))
+        .unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let mut server = Server::builder()
+        .hostname("logout-runtime-destroy")
+        .auth_key("tskey-test")
+        .control_url(control_url)
+        .state_dir(temp.path())
+        .disable_portmapping(true)
+        .extension_registry(registry)
+        .build()
+        .unwrap();
+    let first_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    first_runtime.block_on(Box::pin(server.up())).unwrap();
+
+    let router_closed = Arc::new(AtomicBool::new(false));
+    server.inner.as_mut().unwrap().router = Some(shared_test_router(Box::new(
+        RuntimeCleanupRouter(Arc::clone(&router_closed)),
+    )));
+    let scope = server.profile_state_scope().unwrap();
+    let state_path = scope.dir.join("tsnet-state.json");
+    let cache_path = scope.dir.join("netmap-cache.json");
+    let before = PersistedState::load(&state_path).unwrap();
+    std::fs::write(&cache_path, b"stale cache must be cleared").unwrap();
+
+    let entered = Arc::new(tokio::sync::Barrier::new(2));
+    let release = Arc::new(tokio::sync::Barrier::new(2));
+    server.logout_test_hook = Some((Arc::clone(&entered), Arc::clone(&release)));
+    server.logout_state_save_failures = 1;
+    first_runtime.block_on(async {
+        let mut logout = Box::pin(server.logout());
+        tokio::select! {
+            result = &mut logout => panic!("logout finished before runtime destruction: {result:?}"),
+            _ = entered.wait() => {}
+        }
+    });
+    first_runtime.shutdown_background();
+
+    let retry_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    retry_runtime.block_on(async {
+        release.wait().await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while server.shutdown_supervisor.retained_logout_phase()
+                != Some(LogoutPhase::RotateIdentity)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("destroyed-runtime worker did not retain the exact logout phase");
+        server.logout().await.unwrap();
+    });
+
+    let after = PersistedState::load(&state_path).unwrap();
+    assert_ne!(after.node_key, before.node_key);
+    assert_ne!(after.machine_key, before.machine_key);
+    assert_ne!(after.disco_key, before.disco_key);
+    assert!(!cache_path.exists());
+    let prefs = rustscale_ipn::Prefs::load(temp.path()).unwrap();
+    assert!(prefs.LoggedOut);
+    assert!(!prefs.WantRunning);
+    assert!(extension_closed.load(Ordering::SeqCst));
+    assert!(router_closed.load(Ordering::SeqCst));
+
+    let _ = stop_tx.send(());
+    control_worker.join().unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

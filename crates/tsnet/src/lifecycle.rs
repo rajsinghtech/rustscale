@@ -817,6 +817,18 @@ async fn finish_running_state(mut inner: RunningState) -> Result<(), (RunningSta
     Ok(())
 }
 
+fn lifecycle_cleanup_runtime() -> &'static tokio::runtime::Runtime {
+    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("rustscale-lifecycle-cleanup")
+            .enable_all()
+            .build()
+            .expect("build lifecycle cleanup supervisor runtime")
+    })
+}
+
 async fn cleanup_server_state(mut owner: CleanupOwner) -> Result<(), (CleanupOwner, String)> {
     // This owner closes only its own router below. Unrelated retained TUN
     // owners gate future startup globally, but must not make a userspace
@@ -3751,10 +3763,10 @@ impl Server {
 
     /// Shut down the server.
     ///
-    /// Resource ownership is transferred to an independent cleanup task
-    /// before the first await. Dropping this future therefore cannot strand
-    /// running tasks, sockets, routes, DNS state, serve listeners, or
-    /// extensions.
+    /// Resource ownership is transferred to a process-lifetime cleanup
+    /// supervisor before the first await. Dropping this future or destroying
+    /// its caller runtime therefore cannot strand running tasks, sockets,
+    /// routes, DNS state, serve listeners, or extensions.
     pub async fn close(&mut self) -> Result<(), TsnetError> {
         if self.shutdown_supervisor.has_retained_logout() {
             return Err(TsnetError::ShutdownIncomplete(
@@ -3787,9 +3799,12 @@ impl Server {
             owner = retained;
         }
 
+        // Initialize the process-lifetime runtime before moving the sole owner.
+        // Its JoinHandle is detached, not aborted, if this caller runtime dies.
+        let cleanup_runtime = lifecycle_cleanup_runtime();
         let completion = shutdown_supervisor.begin_cleanup();
         let cleanup_supervisor = Arc::clone(&shutdown_supervisor);
-        let cleanup = tokio::spawn(async move {
+        let cleanup = cleanup_runtime.spawn(async move {
             let _completion = completion;
             bootstrap_supervisor.wait().await;
             startup_supervisor.wait().await;
@@ -3877,11 +3892,13 @@ impl Server {
         let logout_test_hook = self.logout_test_hook.take();
 
         // Transfer the explicit transaction before the first cancellable
-        // await. A durable failure retains both its phase and all data needed
-        // to resume; it can never degrade into close-only success.
+        // await. The process-lifetime supervisor outlives the caller runtime;
+        // a durable failure retains both its phase and all data needed to
+        // resume, so it can never degrade into close-only success.
+        let cleanup_runtime = lifecycle_cleanup_runtime();
         let completion = self.shutdown_supervisor.begin_cleanup();
         let cleanup_supervisor = Arc::clone(&self.shutdown_supervisor);
-        let worker = tokio::spawn(async move {
+        let worker = cleanup_runtime.spawn(async move {
             let _completion = completion;
             #[cfg(test)]
             if let Some((entered, release)) = logout_test_hook {

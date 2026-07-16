@@ -17,6 +17,7 @@ required GitHub Actions workflow.
   shellcheck scripts/*.sh container/*.sh tools/packaging/*.sh
   tools/packaging/check-release.sh
   tools/packaging/test-install.sh
+  tools/packaging/test-first-run.sh
   tools/packaging/test-container.sh
   cargo package --workspace --no-verify --locked
   go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
@@ -24,6 +25,9 @@ required GitHub Actions workflow.
 
 - Let CI, Coverage, E2E, and Pages complete successfully on the release commit.
   The Windows installer contract runs only on the Windows CI leg.
+- Review `docs/release-first-run.md` and, only when explicitly approved, run
+  its protected real-control smoke gate with a disposable identity and its
+  mandatory teardown. This is never a CI prerequisite.
 
 ## Tag and verify
 

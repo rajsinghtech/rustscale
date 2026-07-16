@@ -66,6 +66,9 @@ grep -Fq 'pattern: rustscale-*' .github/workflows/release.yml
 grep -q 'SHA256SUMS' scripts/install.sh
 grep -q 'SHA256SUMS' scripts/install.ps1
 grep -q 'packaging/systemd/rustscaled.service' .github/workflows/release.yml
+grep -q 'tools/packaging/test-first-run.sh' .github/workflows/ci.yml
+test -s docs/release-first-run.md
+grep -q 'Protected real-control smoke gate' docs/release-first-run.md
 grep -Fq "rustscaled run --state /var/lib/rustscale --socket /var/run/rustscaled.sock --tun \$FLAGS" packaging/systemd/rustscaled.service
 grep -Fxq 'Restart=always' packaging/systemd/rustscaled.service
 if grep -Eq -- '--(state|statedir|socket)=' packaging/systemd/rustscaled.service; then

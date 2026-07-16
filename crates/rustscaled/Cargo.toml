@@ -24,3 +24,8 @@ rustscale-syspolicy.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 log.workspace = true
+
+[dev-dependencies]
+rustscale-testcontrol = { path = "../testcontrol", version = "0.1.1" }
+serde_json.workspace = true
+tempfile = "3"

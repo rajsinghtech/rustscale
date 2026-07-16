@@ -140,6 +140,42 @@ pub async fn run(
     result
 }
 
+trait CloseRunner {
+    type Error: std::fmt::Display;
+
+    fn attempt_close(
+        &mut self,
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send;
+}
+
+impl CloseRunner for Server {
+    type Error = TsnetError;
+
+    async fn attempt_close(&mut self) -> Result<(), Self::Error> {
+        Server::close(self).await
+    }
+}
+
+/// Server cleanup deliberately retains uncertain ownership for retry. Give
+/// daemon shutdown a bounded retry window so transient port-mapper or task
+/// cleanup uncertainty does not turn an otherwise successful service stop
+/// into a permanent failure.
+async fn retry_close<R: CloseRunner>(runner: &mut R) -> Result<(), R::Error> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut delay = std::time::Duration::from_millis(25);
+    loop {
+        match runner.attempt_close().await {
+            Ok(()) => return Ok(()),
+            Err(error) if tokio::time::Instant::now() < deadline => {
+                log::warn!("rustscaled: shutdown cleanup incomplete; retrying: {error}");
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(std::time::Duration::from_millis(500));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 trait LogoutRunner {
     type Error: std::fmt::Display;
 
@@ -273,7 +309,7 @@ async fn run_with_auth_key(
     }
 
     log::info!("rustscaled: shutting down...");
-    server.close().await?;
+    retry_close(&mut server).await?;
     Ok(())
 }
 
@@ -360,7 +396,7 @@ async fn run_interactive(
     if should_resume_persisted_node(&persisted_prefs) {
         if !bring_up_until_shutdown(&mut server, tun, shutdown.as_mut()).await? {
             log::info!("rustscaled: shutdown interrupted persisted-node restore");
-            server.close().await?;
+            retry_close(&mut server).await?;
             return Ok(());
         }
         if tun {
@@ -380,7 +416,7 @@ async fn run_interactive(
             command = command_rx.recv() => command,
             () = shutdown.as_mut() => {
                 log::info!("rustscaled: shutdown while waiting for login");
-                server.close().await?;
+                retry_close(&mut server).await?;
                 return Ok(());
             }
         };
@@ -394,7 +430,7 @@ async fn run_interactive(
                 }
                 if !bring_up_until_shutdown(&mut server, tun, shutdown.as_mut()).await? {
                     log::info!("rustscaled: shutdown interrupted startup");
-                    server.close().await?;
+                    retry_close(&mut server).await?;
                     return Ok(());
                 }
                 if tun {
@@ -409,7 +445,7 @@ async fn run_interactive(
             DaemonCommand::LoginInteractive => {
                 if !bring_up_until_shutdown(&mut server, tun, shutdown.as_mut()).await? {
                     log::info!("rustscaled: shutdown interrupted interactive startup");
-                    server.close().await?;
+                    retry_close(&mut server).await?;
                     return Ok(());
                 }
                 if tun {
@@ -427,7 +463,7 @@ async fn run_interactive(
             }
             DaemonCommand::Shutdown => {
                 log::debug!("rustscaled: shutdown requested (server not up yet)");
-                server.close().await?;
+                retry_close(&mut server).await?;
                 return Ok(());
             }
             DaemonCommand::ReloadConfig => {
@@ -519,7 +555,7 @@ async fn run_interactive(
     }
 
     log::info!("rustscaled: shutting down...");
-    server.close().await?;
+    retry_close(&mut server).await?;
     Ok(())
 }
 
@@ -761,9 +797,38 @@ mod tests {
     use rustscale_tsnet::PreferencePolicy;
 
     use super::{
-        retry_logout_until_shutdown, should_resume_persisted_node, InstallUpdatesPolicy,
-        LogoutRunner,
+        retry_close, retry_logout_until_shutdown, should_resume_persisted_node, CloseRunner,
+        InstallUpdatesPolicy, LogoutRunner,
     };
+
+    struct TransientClose {
+        remaining_failures: usize,
+        calls: usize,
+    }
+
+    impl CloseRunner for TransientClose {
+        type Error = std::io::Error;
+
+        async fn attempt_close(&mut self) -> Result<(), Self::Error> {
+            self.calls += 1;
+            if self.remaining_failures > 0 {
+                self.remaining_failures -= 1;
+                Err(std::io::Error::other("injected cleanup uncertainty"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn daemon_retries_retained_close_ownership() {
+        let mut close = TransientClose {
+            remaining_failures: 2,
+            calls: 0,
+        };
+        retry_close(&mut close).await.unwrap();
+        assert_eq!(close.calls, 3);
+    }
 
     #[test]
     fn daemon_resumes_only_wanted_non_logged_out_profiles() {

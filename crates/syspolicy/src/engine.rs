@@ -208,6 +208,37 @@ struct ReadSource {
 type ChangeCallback = Arc<dyn Fn(PolicyChange) + Send + Sync>;
 type SnapshotCommitCallback = Arc<dyn Fn(SnapshotCommit) + Send + Sync>;
 
+/// Releases an external transaction barrier acquired before a policy commit.
+/// The engine invokes releases in reverse acquisition order after installing
+/// commit state and capturing callbacks, and before invoking callbacks.
+pub type SnapshotCommitRelease = Box<dyn FnOnce() + Send + 'static>;
+
+type SnapshotPreCommitHook = Arc<dyn Fn(&SnapshotCommit) -> SnapshotCommitRelease + Send + Sync>;
+
+struct CommitHookReleases {
+    releases: Vec<SnapshotCommitRelease>,
+}
+
+impl CommitHookReleases {
+    fn release(mut self) -> u64 {
+        let mut panics = 0_u64;
+        while let Some(release) = self.releases.pop() {
+            if catch_unwind(AssertUnwindSafe(release)).is_err() {
+                panics = panics.saturating_add(1);
+            }
+        }
+        panics
+    }
+}
+
+impl Drop for CommitHookReleases {
+    fn drop(&mut self) {
+        while let Some(release) = self.releases.pop() {
+            let _ = catch_unwind(AssertUnwindSafe(release));
+        }
+    }
+}
+
 struct PendingSnapshotCommit {
     commit: SnapshotCommit,
     callbacks: Vec<SnapshotCommitCallback>,
@@ -232,6 +263,7 @@ struct EngineInner {
     reload: Mutex<()>,
     callbacks: Mutex<BTreeMap<u64, ChangeCallback>>,
     snapshot_commit_callbacks: Mutex<BTreeMap<u64, SnapshotCommitCallback>>,
+    snapshot_pre_commit_hooks: Mutex<BTreeMap<u64, SnapshotPreCommitHook>>,
     next_source: AtomicU64,
     next_callback: AtomicU64,
     next_generation: AtomicU64,
@@ -284,6 +316,7 @@ impl PolicyEngine {
             reload: Mutex::new(()),
             callbacks: Mutex::new(BTreeMap::new()),
             snapshot_commit_callbacks: Mutex::new(BTreeMap::new()),
+            snapshot_pre_commit_hooks: Mutex::new(BTreeMap::new()),
             next_source: AtomicU64::new(0),
             next_callback: AtomicU64::new(0),
             next_generation: AtomicU64::new(0),
@@ -388,7 +421,7 @@ impl PolicyEngine {
                 Ok(id)
             }
             Err(error) => {
-                let pending_commit = self.stage_failed_commit_locked(error.clone());
+                let pending_commit = self.stage_failed_commit_locked(error.clone()).ok();
                 let removed = self.take_source(id).map(|(_, source)| source);
                 self.inner
                     .provider_errors
@@ -396,7 +429,9 @@ impl PolicyEngine {
                     .expect("policy provider error lock poisoned")
                     .remove(&id);
                 drop(reload_guard);
-                self.invoke_snapshot_commit(pending_commit);
+                if let Some(pending_commit) = pending_commit {
+                    self.invoke_snapshot_commit(pending_commit);
+                }
                 drop(removed);
                 Err(error)
             }
@@ -419,14 +454,16 @@ impl PolicyEngine {
         let (_, change, pending_commit) = match self.refresh_locked(true) {
             Ok(result) => result,
             Err(error) => {
-                let pending_commit = self.stage_failed_commit_locked(error.clone());
+                let pending_commit = self.stage_failed_commit_locked(error.clone()).ok();
                 self.inner
                     .sources
                     .write()
                     .expect("policy sources lock poisoned")
                     .insert(index, removed);
                 drop(reload_guard);
-                self.invoke_snapshot_commit(pending_commit);
+                if let Some(pending_commit) = pending_commit {
+                    self.invoke_snapshot_commit(pending_commit);
+                }
                 return Err(error);
             }
         };
@@ -493,7 +530,7 @@ impl PolicyEngine {
         let failed_commit = result
             .as_ref()
             .err()
-            .map(|error| self.stage_failed_commit_locked(error.clone()));
+            .and_then(|error| self.stage_failed_commit_locked(error.clone()).ok());
         drop(reload_guard);
         match result {
             Ok((snapshot, change, pending_commit)) => {
@@ -504,7 +541,9 @@ impl PolicyEngine {
                 Ok(snapshot)
             }
             Err(error) => {
-                self.invoke_snapshot_commit(failed_commit.expect("failed refresh commit"));
+                if let Some(failed_commit) = failed_commit {
+                    self.invoke_snapshot_commit(failed_commit);
+                }
                 Err(error)
             }
         }
@@ -712,7 +751,17 @@ impl PolicyEngine {
                 error,
             },
         );
-        let pending_commit = self.stage_snapshot_commit_locked(commit);
+        let pending_commit = match self.stage_snapshot_commit_locked(commit) {
+            Ok(pending_commit) => pending_commit,
+            Err(error) => {
+                *self
+                    .inner
+                    .last_reload_error
+                    .write()
+                    .expect("policy error lock poisoned") = Some(error.clone());
+                return Err(error);
+            }
+        };
         let change = effective_change.then(|| PolicyChange {
             old,
             new: new.clone(),
@@ -720,7 +769,10 @@ impl PolicyEngine {
         Ok((new, change, Some(pending_commit)))
     }
 
-    fn stage_failed_commit_locked(&self, error: PolicyError) -> PendingSnapshotCommit {
+    fn stage_failed_commit_locked(
+        &self,
+        error: PolicyError,
+    ) -> Result<PendingSnapshotCommit, PolicyError> {
         let generation = self
             .inner
             .next_generation
@@ -733,7 +785,32 @@ impl PolicyEngine {
         })
     }
 
-    fn stage_snapshot_commit_locked(&self, commit: SnapshotCommit) -> PendingSnapshotCommit {
+    fn stage_snapshot_commit_locked(
+        &self,
+        commit: SnapshotCommit,
+    ) -> Result<PendingSnapshotCommit, PolicyError> {
+        let hooks: Vec<_> = self
+            .inner
+            .snapshot_pre_commit_hooks
+            .lock()
+            .expect("policy snapshot pre-commit hooks lock poisoned")
+            .values()
+            .cloned()
+            .collect();
+        let mut releases = CommitHookReleases {
+            releases: Vec::with_capacity(hooks.len()),
+        };
+        for hook in hooks {
+            let Ok(release) = catch_unwind(AssertUnwindSafe(|| hook(&commit))) else {
+                // Dropping `releases` invokes every barrier acquired before
+                // the panic. Keep reload synchronization usable and leave
+                // the previous commit installed.
+                self.inner.callback_panics.fetch_add(1, Ordering::Relaxed);
+                return Err(PolicyError::new(PolicyErrorKind::Provider));
+            };
+            releases.releases.push(release);
+        }
+
         let snapshot = commit.snapshot().clone();
         *self
             .inner
@@ -751,7 +828,17 @@ impl PolicyEngine {
             .values()
             .cloned()
             .collect();
-        PendingSnapshotCommit { commit, callbacks }
+
+        // External barriers remain exclusive through state installation and
+        // callback capture. Release before reload synchronization and callback
+        // invocation so callbacks can safely re-enter this engine.
+        let release_panics = releases.release();
+        if release_panics != 0 {
+            self.inner
+                .callback_panics
+                .fetch_add(release_panics, Ordering::Relaxed);
+        }
+        Ok(PendingSnapshotCommit { commit, callbacks })
     }
 
     fn invoke_snapshot_commit(&self, pending: PendingSnapshotCommit) {
@@ -827,12 +914,19 @@ impl PolicyEngine {
         }
     }
 
-    /// Atomically installs a commit callback and returns the current commit
-    /// status under the same reload synchronization. A concurrent commit is
-    /// therefore represented either by the returned status or by a callback,
-    /// never missed. Callbacks run after reload synchronization is released.
-    pub fn subscribe_snapshot_commits(
+    /// Atomically installs a transactional pre-commit hook and commit callback,
+    /// then returns the current commit under the same reload synchronization.
+    ///
+    /// `pre_commit` runs before applied, degraded, and failed status is
+    /// installed. It returns a release closure for an external write barrier.
+    /// The engine holds all such barriers through state installation and
+    /// callback capture, releases them in reverse order, then invokes callbacks
+    /// outside reload synchronization. A panicking hook releases every barrier
+    /// acquired earlier, leaves this commit uninstalled, and returns a provider
+    /// error without poisoning reload synchronization.
+    pub fn subscribe_snapshot_commits_transactional(
         &self,
+        pre_commit: impl Fn(&SnapshotCommit) -> SnapshotCommitRelease + Send + Sync + 'static,
         callback: impl Fn(SnapshotCommit) + Send + Sync + 'static,
     ) -> (SnapshotCommitRegistration, SnapshotCommit) {
         let _reload_guard = self
@@ -841,6 +935,11 @@ impl PolicyEngine {
             .lock()
             .expect("policy reload lock poisoned");
         let id = self.inner.next_callback.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .snapshot_pre_commit_hooks
+            .lock()
+            .expect("policy snapshot pre-commit hooks lock poisoned")
+            .insert(id, Arc::new(pre_commit));
         self.inner
             .snapshot_commit_callbacks
             .lock()
@@ -860,6 +959,14 @@ impl PolicyEngine {
             },
             current,
         )
+    }
+
+    /// Atomically installs a commit callback and returns current commit status.
+    pub fn subscribe_snapshot_commits(
+        &self,
+        callback: impl Fn(SnapshotCommit) + Send + Sync + 'static,
+    ) -> (SnapshotCommitRegistration, SnapshotCommit) {
+        self.subscribe_snapshot_commits_transactional(|_| Box::new(|| {}), callback)
     }
 
     /// Registers a commit callback without returning current status.
@@ -1016,7 +1123,7 @@ impl Drop for CallbackRegistration {
     }
 }
 
-/// Unregisters a snapshot commit callback when dropped.
+/// Unregisters a snapshot commit callback and pre-commit hook when dropped.
 pub struct SnapshotCommitRegistration {
     engine: Weak<EngineInner>,
     id: u64,
@@ -1025,11 +1132,17 @@ pub struct SnapshotCommitRegistration {
 impl Drop for SnapshotCommitRegistration {
     fn drop(&mut self) {
         if let Some(engine) = self.engine.upgrade() {
+            let hook = engine
+                .snapshot_pre_commit_hooks
+                .lock()
+                .expect("policy snapshot pre-commit hooks lock poisoned")
+                .remove(&self.id);
             let callback = engine
                 .snapshot_commit_callbacks
                 .lock()
                 .expect("policy snapshot commit callbacks lock poisoned")
                 .remove(&self.id);
+            drop(hook);
             drop(callback);
         }
     }

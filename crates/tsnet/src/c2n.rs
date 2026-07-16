@@ -717,14 +717,15 @@ pub(crate) fn register_c2n_handlers(router: &mut C2nRouter, backend: Arc<TsnetC2
 mod tests {
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{mpsc, Arc};
+    use std::sync::{mpsc, Arc, Mutex};
+    use std::thread;
     use std::time::Duration;
 
     use rustscale_controlclient::C2nPublicationValidator;
     use rustscale_posture::{IdentityService, PublicationBarrier};
     use rustscale_syspolicy::{
         MemoryProvider, PolicyEngine, PolicyError, PolicyErrorKind, PolicyKey, PolicyProvider,
-        PolicyScope, ProviderValues, RawValue, SettingDefinition,
+        PolicyScope, PolicyValue, ProviderValues, RawValue, SettingDefinition,
     };
 
     use super::{C2nReplyError, PosturePublicationValidator};
@@ -843,6 +844,96 @@ mod tests {
             Err(C2nReplyError::PublicationRevoked)
         );
         assert_eq!(published.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn policy_commit_write_barrier_blocks_h2_send_until_never_is_visible() {
+        let provider = Arc::new(MemoryProvider::from_values(BTreeMap::from([(
+            PolicyKey::PostureChecking,
+            RawValue::String("always".into()),
+        )])));
+        let engine = PolicyEngine::well_known(PolicyScope::Device).unwrap();
+        engine
+            .add_provider("managed posture", PolicyScope::Device, provider)
+            .unwrap();
+        let barrier = Arc::new(PublicationBarrier::new());
+        let posture_service = Arc::new(
+            IdentityService::from_system_engine_with_publication_barrier(
+                engine.clone(),
+                barrier.clone(),
+            ),
+        );
+        let preference = Arc::new(crate::LivePosturePreference::with_publication_barrier(
+            false, barrier,
+        ));
+        let stale_validator = validator(preference, posture_service);
+
+        let (installed_tx, installed_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let pause = Arc::new(Mutex::new(Some((installed_tx, release_rx))));
+        let hook_pause = pause.clone();
+        let callback_called = Arc::new(AtomicBool::new(false));
+        let callback_flag = callback_called.clone();
+        let (_transaction, _) = engine.subscribe_snapshot_commits_transactional(
+            move |_| -> rustscale_syspolicy::SnapshotCommitRelease {
+                let pause = hook_pause.lock().unwrap().take();
+                Box::new(move || {
+                    if let Some((installed, release)) = pause {
+                        installed.send(()).unwrap();
+                        release.recv().unwrap();
+                    }
+                })
+            },
+            move |_| {
+                callback_flag.store(true, Ordering::Release);
+            },
+        );
+
+        let change_engine = engine.clone();
+        let change = thread::spawn(move || {
+            change_engine.override_for_test(BTreeMap::from([(
+                PolicyKey::PostureChecking,
+                RawValue::String("never".into()),
+            )]))
+        });
+        installed_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(
+            engine.snapshot().get(PolicyKey::PostureChecking),
+            Ok(PolicyValue::PreferenceOption(
+                rustscale_syspolicy::PreferenceOption::Never
+            ))
+        );
+        assert!(!callback_called.load(Ordering::Acquire));
+
+        let published = Arc::new(AtomicUsize::new(0));
+        let publication_count = published.clone();
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let publication = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = stale_validator.validate_and_publish(&mut || {
+                publication_count.fetch_add(1, Ordering::Release);
+                Ok(())
+            });
+            result_tx.send(result).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(
+            result_rx.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert_eq!(published.load(Ordering::Acquire), 0);
+
+        release_tx.send(()).unwrap();
+        let policy_override = change.join().unwrap().unwrap();
+        assert_eq!(
+            result_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Err(C2nReplyError::PublicationRevoked)
+        );
+        publication.join().unwrap();
+        assert_eq!(published.load(Ordering::Acquire), 0);
+        assert!(callback_called.load(Ordering::Acquire));
+        drop(policy_override);
     }
 
     #[test]

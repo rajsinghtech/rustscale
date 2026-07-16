@@ -18,7 +18,7 @@ mod serial_stub;
 #[cfg(any(target_os = "windows", test))]
 mod serial_windows;
 
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 #[cfg(any(target_os = "windows", test))]
 use std::time::Duration;
 use std::time::Instant;
@@ -91,15 +91,98 @@ struct PublicationState {
     policy: PublicationPolicyState,
 }
 
+#[derive(Default)]
+struct PublicationGateState {
+    readers: usize,
+    writer: bool,
+    waiting_writers: usize,
+}
+
+#[derive(Default)]
+struct PublicationGate {
+    state: Mutex<PublicationGateState>,
+    changed: Condvar,
+}
+
+impl PublicationGate {
+    fn read(self: &Arc<Self>) -> PublicationReadGuard {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while state.writer || state.waiting_writers != 0 {
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        state.readers = state.readers.saturating_add(1);
+        PublicationReadGuard { gate: self.clone() }
+    }
+
+    fn write(self: &Arc<Self>) -> PublicationWriteGuard {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.waiting_writers = state.waiting_writers.saturating_add(1);
+        while state.writer || state.readers != 0 {
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        state.waiting_writers = state.waiting_writers.saturating_sub(1);
+        state.writer = true;
+        PublicationWriteGuard { gate: self.clone() }
+    }
+}
+
+struct PublicationReadGuard {
+    gate: Arc<PublicationGate>,
+}
+
+impl Drop for PublicationReadGuard {
+    fn drop(&mut self) {
+        let mut state = self
+            .gate
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.readers = state.readers.saturating_sub(1);
+        if state.readers == 0 {
+            self.gate.changed.notify_all();
+        }
+    }
+}
+
+struct PublicationWriteGuard {
+    gate: Arc<PublicationGate>,
+}
+
+impl Drop for PublicationWriteGuard {
+    fn drop(&mut self) {
+        let mut state = self
+            .gate
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.writer = false;
+        self.gate.changed.notify_all();
+    }
+}
+
 /// Shared generation and read/write barrier for posture policy and preference
 /// updates versus sensitive transport publication.
 pub struct PublicationBarrier {
+    gate: Arc<PublicationGate>,
     state: RwLock<PublicationState>,
 }
 
 impl PublicationBarrier {
     pub fn new() -> Self {
         Self {
+            gate: Arc::new(PublicationGate::default()),
             state: RwLock::new(PublicationState {
                 generation: 0,
                 policy: PublicationPolicyState {
@@ -110,10 +193,7 @@ impl PublicationBarrier {
         }
     }
 
-    /// Install a subscribed policy snapshot before its change callback
-    /// returns. A changed policy snapshot advances the shared publication
-    /// generation while holding the write barrier.
-    pub fn update_policy(&self, policy: PublicationPolicyState) {
+    fn update_policy_locked(&self, policy: PublicationPolicyState) {
         let mut state = self
             .state
             .write()
@@ -127,8 +207,26 @@ impl PublicationBarrier {
         }
     }
 
+    /// Acquire the sensitive publication write barrier, install policy state,
+    /// and return a closure that releases the barrier after engine commit.
+    fn begin_policy_commit(
+        self: &Arc<Self>,
+        policy: PublicationPolicyState,
+    ) -> rustscale_syspolicy::SnapshotCommitRelease {
+        let guard = self.gate.write();
+        self.update_policy_locked(policy);
+        Box::new(move || drop(guard))
+    }
+
+    /// Install subscribed policy state under the publication write barrier.
+    pub fn update_policy(&self, policy: PublicationPolicyState) {
+        let _guard = self.gate.write();
+        self.update_policy_locked(policy);
+    }
+
     /// Update user preference under the same publication write barrier.
     pub fn update_preference(&self, update: impl FnOnce() -> bool) {
+        let _guard = self.gate.write();
         let mut state = self
             .state
             .write()
@@ -143,6 +241,7 @@ impl PublicationBarrier {
         &self,
         snapshot: impl FnOnce(&PublicationPolicyState) -> R,
     ) -> (u64, R) {
+        let _guard = self.gate.read();
         let state = self
             .state
             .read()
@@ -157,6 +256,7 @@ impl PublicationBarrier {
         expected_generation: u64,
         operation: impl FnOnce(&PublicationPolicyState) -> R,
     ) -> Option<R> {
+        let _guard = self.gate.read();
         let state = self
             .state
             .read()
@@ -241,10 +341,18 @@ impl SystemPolicy {
             };
         };
 
+        let pre_commit_barrier = publication_barrier.clone();
         let callback_barrier = publication_barrier.clone();
-        let (registration, current) = engine.subscribe_snapshot_commits(move |commit| {
-            callback_barrier.update_policy(Self::publication_state_from_commit(&commit));
-        });
+        let (registration, current) = engine.subscribe_snapshot_commits_transactional(
+            move |commit| {
+                pre_commit_barrier.begin_policy_commit(Self::publication_state_from_commit(commit))
+            },
+            move |commit| {
+                // The transactional hook installed this state before commit.
+                // This idempotent update also rejects any stale callback order.
+                callback_barrier.update_policy(Self::publication_state_from_commit(&commit));
+            },
+        );
         publication_barrier.update_policy(Self::publication_state_from_commit(&current));
         Self {
             engine: Some(engine),

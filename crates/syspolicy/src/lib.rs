@@ -19,7 +19,8 @@ mod watch;
 
 pub use engine::{
     CallbackRegistration, Origin, PolicyChange, PolicyEngine, PolicyItem, ProviderId,
-    ProviderPrecedence, Snapshot, SnapshotCommit, SnapshotCommitRegistration, TestOverride,
+    ProviderPrecedence, Snapshot, SnapshotCommit, SnapshotCommitRegistration,
+    SnapshotCommitRelease, TestOverride,
 };
 pub use keys::{
     well_known_definitions, PolicyKey, PolicyScope, Scope, SettingDefinition, ValueType,

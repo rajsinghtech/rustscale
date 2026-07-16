@@ -756,6 +756,73 @@ fn windows_native_posture_provider_uses_current_provider_contract() {
 }
 
 #[test]
+fn panicking_pre_commit_hook_releases_prior_barriers_and_keeps_engine_usable() {
+    struct ManualProvider(Mutex<String>);
+
+    impl PolicyProvider for ManualProvider {
+        fn load(&self, definitions: &[SettingDefinition]) -> Result<ProviderValues, PolicyError> {
+            let value = self.0.lock().unwrap().clone();
+            Ok(definitions
+                .iter()
+                .filter(|definition| definition.key == PolicyKey::Tailnet)
+                .map(|definition| (definition.key, Ok(RawValue::String(value.clone()))))
+                .collect())
+        }
+    }
+
+    let provider = Arc::new(ManualProvider(Mutex::new("old".into())));
+    let engine = PolicyEngine::well_known(PolicyScope::Device).unwrap();
+    engine
+        .add_provider("manual", PolicyScope::Device, provider.clone())
+        .unwrap();
+
+    let barrier_held = Arc::new(AtomicBool::new(false));
+    let acquire_flag = barrier_held.clone();
+    let _barrier_hook = engine
+        .subscribe_snapshot_commits_transactional(
+            move |_| -> crate::SnapshotCommitRelease {
+                assert!(!acquire_flag.swap(true, Ordering::SeqCst));
+                let release_flag = acquire_flag.clone();
+                Box::new(move || {
+                    release_flag.store(false, Ordering::SeqCst);
+                })
+            },
+            |_| {},
+        )
+        .0;
+    let panic_once = Arc::new(AtomicBool::new(true));
+    let panic_flag = panic_once.clone();
+    let _panicking_hook = engine
+        .subscribe_snapshot_commits_transactional(
+            move |_| -> crate::SnapshotCommitRelease {
+                assert!(
+                    !panic_flag.swap(false, Ordering::SeqCst),
+                    "pre-commit panic"
+                );
+                Box::new(|| {})
+            },
+            |_| {},
+        )
+        .0;
+
+    *provider.0.lock().unwrap() = "new".into();
+    assert!(engine.reload().is_err());
+    assert!(!barrier_held.load(Ordering::SeqCst));
+    assert!(matches!(
+        engine.current_snapshot_commit(),
+        SnapshotCommit::Failed { .. }
+    ));
+    assert_eq!(engine.callback_panic_count(), 1);
+
+    engine.reload().unwrap();
+    assert!(!barrier_held.load(Ordering::SeqCst));
+    assert_eq!(
+        engine.snapshot().get(PolicyKey::Tailnet),
+        Ok(PolicyValue::String("new".into()))
+    );
+}
+
+#[test]
 fn snapshot_commit_subscription_cannot_miss_in_progress_commit() {
     struct BlockingProvider {
         value: Mutex<String>,

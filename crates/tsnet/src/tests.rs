@@ -3859,6 +3859,7 @@ fn interop_server(authkey: &str, suffix: &str) -> Server {
         .hostname(format!("rustscale-interop-{suffix}-{uid}"))
         .auth_key(authkey)
         .ephemeral(true)
+        .disable_portmapping(true)
         .build()
         .expect("build interop server")
 }
@@ -3870,6 +3871,7 @@ fn interop_server_derp_only(authkey: &str, suffix: &str) -> Server {
         .hostname(format!("rustscale-interop-{suffix}-{uid}"))
         .auth_key(authkey)
         .ephemeral(true)
+        .disable_portmapping(true)
         .disable_direct_paths(true)
         .build()
         .expect("build interop server (derp-only)")
@@ -4455,6 +4457,7 @@ async fn interop_subnet_routes() {
         .hostname(format!("rustscale-interop-subnet-{}", std::process::id()))
         .auth_key(ienv.authkey.clone())
         .ephemeral(true)
+        .disable_portmapping(true)
         .accept_routes(true)
         .build()
         .expect("build");

@@ -3,11 +3,13 @@
 //! Linux snapshots parse `/proc/net/tcp` and `/proc/net/tcp6` and can perform
 //! a bounded, best-effort `/proc/<pid>/fd` symlink walk to associate socket
 //! inodes with processes. macOS uses the numeric output of the system
-//! `netstat` command with a hard output cap and deadline. Windows directly
-//! invokes the system PowerShell executable with a fixed, encoded command that
-//! emits a bounded numeric protocol around `Get-NetTCPConnection`; no
-//! intermediary shell, profile, interpolation, or localized table formatting
-//! is used.
+//! `netstat` command with a hard output cap and deadline. Windows invokes only
+//! `C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe` and uses an
+//! embedded reflection-only P/Invoke wrapper around the fixed system
+//! `iphlpapi.dll`; it does not consult inherited `SystemRoot`, `PATH`, module
+//! resolution, profiles, or localized table formatting. This requires Windows
+//! PowerShell 5.1 and deliberately fails closed on installations that do not use the
+//! standard `C:\Windows` root or provide that runtime.
 //!
 //! Snapshotting never closes, duplicates, or calls socket operations on a
 //! process file descriptor. PID metadata is observational only and must never
@@ -344,6 +346,8 @@ pub enum Error {
     NetstatFailed(String),
     #[error("Windows TCP table command exited unsuccessfully: {0}")]
     WindowsCommandFailed(String),
+    #[error("Windows TCP table {family} enumeration failed with code {code}")]
+    WindowsFamilyFailed { family: &'static str, code: u32 },
     #[error("TCP table snapshot worker capacity exhausted")]
     WorkerCapacity,
     #[error("TCP table snapshot worker terminated without a result")]

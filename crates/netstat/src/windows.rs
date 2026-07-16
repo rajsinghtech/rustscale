@@ -1,8 +1,8 @@
-use std::net::{IpAddr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use crate::{
-    run_supervised, Endpoint, Entry, Error, OsMetadata, ProcessAssociation, SnapshotContext,
-    SnapshotOptions, State, Table,
+    parse_hex_array, run_supervised, Endpoint, Entry, Error, OsMetadata, ProcessAssociation,
+    SnapshotContext, SnapshotOptions, State, Table,
 };
 
 const SOURCE: &str = "Windows TCP table";
@@ -11,14 +11,15 @@ const PROTOCOL_HEADER: &str = "RUSTSCALE-NETSTAT\t1";
 /// Injectable source of bounded, numeric Windows TCP table output.
 ///
 /// The output protocol is intentionally strict and locale-independent. It
-/// starts with `RUSTSCALE-NETSTAT<TAB>1`, contains zero or more rows of the
-/// form `ROW<TAB>family<TAB>local-address<TAB>local-port<TAB>remote-address`
-/// followed by `<TAB>remote-port<TAB>numeric-state<TAB>pid`, and ends with
-/// `END<TAB>4<TAB>ipv4-count<TAB>6<TAB>ipv6-count`.
+/// starts with `RUSTSCALE-NETSTAT<TAB>1`. Each address family must then have
+/// an ordered `BEGIN<TAB>family`, zero or more numeric `ROW` records, and an
+/// `END-FAMILY<TAB>family<TAB>count` success record. A family can instead end
+/// with `ERROR<TAB>family<TAB>numeric-code`, which always fails the snapshot.
+/// A final `END` is required after successful IPv4 and IPv6 sections.
 ///
-/// Implementations must return at most `max_bytes + 1` bytes. A complete
-/// footer for both address families is required, so callers never receive a
-/// successful partial-family snapshot.
+/// Implementations must return at most `max_bytes + 1` bytes. Both family
+/// success records and the final footer are mandatory, so callers never
+/// receive a successful partial-family snapshot.
 pub trait WindowsTcpTableReader: Send + Sync {
     fn read_tcp_table(&self, context: &SnapshotContext, max_bytes: usize)
         -> Result<Vec<u8>, Error>;
@@ -86,8 +87,8 @@ pub fn parse_windows_tcp_table(
     }
 
     let mut entries = Vec::new();
-    let mut family_counts = [0_usize; 2];
-    let mut saw_footer = false;
+    let mut phase = ParsePhase::ExpectBegin(Family::V4);
+    let mut family_count = 0_usize;
     for (index, raw_line) in lines {
         context.check()?;
         let line_number = index + 1;
@@ -95,53 +96,101 @@ pub fn parse_windows_tcp_table(
         if line.is_empty() {
             return Err(malformed(line_number, "unexpected empty line"));
         }
-        if saw_footer {
+        if phase == ParsePhase::Complete {
             return Err(malformed(line_number, "output after protocol footer"));
         }
 
         let fields = checked_fields(line, line_number, options)?;
-        match fields.first().copied() {
-            Some("ROW") => {
-                if fields.len() != 8 {
-                    return Err(malformed(line_number, "invalid row field count"));
+        match phase {
+            ParsePhase::ExpectBegin(family) => {
+                if fields.as_slice() != ["BEGIN", family.token()] {
+                    return Err(malformed(line_number, family.missing_reason()));
                 }
-                if entries.len() == options.limits.max_entries {
-                    return Err(Error::LimitExceeded {
-                        resource: "TCP connection entries",
-                        limit: options.limits.max_entries,
+                family_count = 0;
+                phase = ParsePhase::Rows(family);
+            }
+            ParsePhase::Rows(family) => match fields.first().copied() {
+                Some("ROW") => {
+                    if fields.len() != 10 || fields[1] != family.token() {
+                        return Err(malformed(line_number, "invalid family row"));
+                    }
+                    if entries.len() == options.limits.max_entries {
+                        return Err(Error::LimitExceeded {
+                            resource: "TCP connection entries",
+                            limit: options.limits.max_entries,
+                        });
+                    }
+                    let entry = parse_row(&fields, line_number, family)?;
+                    family_count = family_count
+                        .checked_add(1)
+                        .ok_or_else(|| malformed(line_number, "family row count overflow"))?;
+                    entries.push(entry);
+                }
+                Some("END-FAMILY") => {
+                    if fields.len() != 3 || fields[1] != family.token() {
+                        return Err(malformed(line_number, "invalid family success footer"));
+                    }
+                    let reported = parse_usize(fields[2])
+                        .ok_or_else(|| malformed(line_number, "invalid family row count"))?;
+                    if reported != family_count {
+                        return Err(malformed(line_number, "family row count mismatch"));
+                    }
+                    phase = match family {
+                        Family::V4 => ParsePhase::ExpectBegin(Family::V6),
+                        Family::V6 => ParsePhase::ExpectFinal,
+                    };
+                }
+                Some("ERROR") => {
+                    if fields.len() != 3 || fields[1] != family.token() {
+                        return Err(malformed(line_number, "invalid family error record"));
+                    }
+                    let code = parse_u32(fields[2])
+                        .ok_or_else(|| malformed(line_number, "invalid family error code"))?;
+                    return Err(Error::WindowsFamilyFailed {
+                        family: family.name(),
+                        code,
                     });
                 }
-                let (entry, family_index) = parse_row(&fields, line_number)?;
-                family_counts[family_index] = family_counts[family_index]
-                    .checked_add(1)
-                    .ok_or_else(|| malformed(line_number, "family row count overflow"))?;
-                entries.push(entry);
-            }
-            Some("END") => {
-                if fields.len() != 5 || fields[1] != "4" || fields[3] != "6" {
-                    return Err(malformed(line_number, "invalid protocol footer"));
+                _ => return Err(malformed(line_number, "unknown family record")),
+            },
+            ParsePhase::ExpectFinal => {
+                if fields.as_slice() != ["END"] {
+                    return Err(malformed(line_number, "missing protocol footer"));
                 }
-                let ipv4_count = parse_usize(fields[2])
-                    .ok_or_else(|| malformed(line_number, "invalid IPv4 row count"))?;
-                let ipv6_count = parse_usize(fields[4])
-                    .ok_or_else(|| malformed(line_number, "invalid IPv6 row count"))?;
-                if [ipv4_count, ipv6_count] != family_counts {
-                    return Err(malformed(line_number, "family row count mismatch"));
-                }
-                saw_footer = true;
+                phase = ParsePhase::Complete;
             }
-            _ => return Err(malformed(line_number, "unknown protocol record")),
+            ParsePhase::Complete => unreachable!(),
         }
     }
-    if !saw_footer {
+    if phase != ParsePhase::Complete {
         return Err(malformed(
             text.split_terminator('\n').count().saturating_add(1),
-            "missing protocol footer",
+            phase.incomplete_reason(),
         ));
     }
 
     entries.sort_unstable();
     Ok(entries)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ParsePhase {
+    ExpectBegin(Family),
+    Rows(Family),
+    ExpectFinal,
+    Complete,
+}
+
+impl ParsePhase {
+    fn incomplete_reason(self) -> &'static str {
+        match self {
+            Self::ExpectBegin(family) => family.missing_reason(),
+            Self::Rows(Family::V4) => "missing IPv4 success footer",
+            Self::Rows(Family::V6) => "missing IPv6 success footer",
+            Self::ExpectFinal => "missing protocol footer",
+            Self::Complete => "output after protocol footer",
+        }
+    }
 }
 
 fn checked_line<'a>(
@@ -164,7 +213,7 @@ fn checked_fields<'a>(
     _line_number: usize,
     options: &SnapshotOptions,
 ) -> Result<Vec<&'a str>, Error> {
-    const MAX_FIELDS: usize = 8;
+    const MAX_FIELDS: usize = 10;
     let fields: Vec<_> = line.split('\t').take(MAX_FIELDS + 1).collect();
     if fields.len() > MAX_FIELDS {
         return Err(Error::LimitExceeded {
@@ -184,57 +233,67 @@ fn checked_fields<'a>(
     Ok(fields)
 }
 
-fn parse_row(fields: &[&str], line_number: usize) -> Result<(Entry, usize), Error> {
-    let (family, family_index) = match fields[1] {
-        "4" => (Family::V4, 0),
-        "6" => (Family::V6, 1),
-        _ => return Err(malformed(line_number, "invalid address family")),
-    };
-    let local = parse_endpoint(fields[2], fields[3], family)
+fn parse_row(fields: &[&str], line_number: usize, family: Family) -> Result<Entry, Error> {
+    let local = parse_endpoint(fields[2], fields[3], fields[4], family)
         .ok_or_else(|| malformed(line_number, "invalid local endpoint"))?;
-    let remote = parse_endpoint(fields[4], fields[5], family)
+    let remote = parse_endpoint(fields[5], fields[6], fields[7], family)
         .ok_or_else(|| malformed(line_number, "invalid remote endpoint"))?;
     let state_number =
-        parse_u32(fields[6]).ok_or_else(|| malformed(line_number, "invalid numeric TCP state"))?;
-    let pid = parse_u32(fields[7]).ok_or_else(|| malformed(line_number, "invalid PID"))?;
-    Ok((
-        Entry {
-            local,
-            remote,
-            pid: Some(pid),
-            process: None,
-            state: windows_state(state_number),
-            os_metadata: OsMetadata::Windows,
-        },
-        family_index,
-    ))
+        parse_u32(fields[8]).ok_or_else(|| malformed(line_number, "invalid numeric TCP state"))?;
+    let pid = parse_u32(fields[9]).ok_or_else(|| malformed(line_number, "invalid PID"))?;
+    Ok(Entry {
+        local,
+        remote,
+        pid: Some(pid),
+        process: None,
+        state: windows_state(state_number),
+        os_metadata: OsMetadata::Windows,
+    })
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Family {
     V4,
     V6,
 }
 
-fn parse_endpoint(address: &str, port: &str, family: Family) -> Option<Endpoint> {
+impl Family {
+    fn token(self) -> &'static str {
+        match self {
+            Self::V4 => "4",
+            Self::V6 => "6",
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::V4 => "IPv4",
+            Self::V6 => "IPv6",
+        }
+    }
+
+    fn missing_reason(self) -> &'static str {
+        match self {
+            Self::V4 => "missing IPv4 family section",
+            Self::V6 => "missing IPv6 family section",
+        }
+    }
+}
+
+fn parse_endpoint(address: &str, scope: &str, port: &str, family: Family) -> Option<Endpoint> {
     let port = parse_u16(port)?;
+    let scope = parse_u32(scope)?;
     match family {
-        Family::V4 => Some(Endpoint::new(IpAddr::V4(address.parse().ok()?), port)),
+        Family::V4 => {
+            if scope != 0 {
+                return None;
+            }
+            let address = Ipv4Addr::from(parse_hex_array::<4>(address)?);
+            Some(Endpoint::new(IpAddr::V4(address), port))
+        }
         Family::V6 => {
-            let (address, zone) = match address.rsplit_once('%') {
-                Some((address, zone)) => {
-                    if zone.is_empty()
-                        || zone.len() > 10
-                        || !zone.bytes().all(|byte| byte.is_ascii_digit())
-                        || parse_u32(zone)? == 0
-                    {
-                        return None;
-                    }
-                    (address, Some(zone.to_owned()))
-                }
-                None => (address, None),
-            };
-            let address: Ipv6Addr = address.parse().ok()?;
+            let address = Ipv6Addr::from(parse_hex_array::<16>(address)?);
+            let zone = (scope != 0).then(|| scope.to_string());
             Some(Endpoint::with_zone(IpAddr::V6(address), port, zone))
         }
     }
@@ -293,57 +352,267 @@ fn malformed(line: usize, reason: &'static str) -> Error {
     }
 }
 
-#[cfg(target_os = "windows")]
+// Deliberately do not derive either path from SystemRoot, PATH, PSModulePath,
+// or any other process environment. Standard-root Windows is the documented
+// compatibility boundary; spawning fails closed everywhere else.
+#[cfg(any(target_os = "windows", test))]
+const TRUSTED_POWERSHELL_PATH: &str = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
+
+// Reflection.Emit creates only an in-memory P/Invoke method. Unlike Add-Type,
+// this does not invoke a compiler or create a compiler cache/temp artifact.
+#[cfg(any(target_os = "windows", test))]
 const POWERSHELL_SCRIPT: &str = r#"
 $ErrorActionPreference = 'Stop'
 $WarningPreference = 'SilentlyContinue'
 $InformationPreference = 'SilentlyContinue'
 $culture = [System.Globalization.CultureInfo]::InvariantCulture
 $output = [System.Console]::Out
-$ipv4Count = [uint64]0
-$ipv6Count = [uint64]0
-$output.WriteLine("RUSTSCALE-NETSTAT`t1")
-$modulePath = [System.IO.Path]::Combine(
-    $env:SystemRoot,
-    'System32\WindowsPowerShell\v1.0\Modules\NetTCPIP\NetTCPIP.psd1'
+$maxNativeTableBytes = [uint32](8 * 1024 * 1024)
+$maxRows = [uint32]65536
+$errorInvalidSize = [uint32]4294967295
+$errorRetryLimit = [uint32]4294967294
+$errorMalformedTable = [uint32]4294967293
+$errorUnexpected = [uint32]4294967292
+
+$assemblyName = [System.Reflection.AssemblyName]::new('Rustscale.Netstat.Native')
+$assembly = [System.AppDomain]::CurrentDomain.DefineDynamicAssembly(
+    $assemblyName,
+    [System.Reflection.Emit.AssemblyBuilderAccess]::Run
 )
-Microsoft.PowerShell.Core\Import-Module -Name $modulePath -ErrorAction Stop
-NetTCPIP\Get-NetTCPConnection -ErrorAction Stop | ForEach-Object {
-    $local = [System.Net.IPAddress]::Parse([string]$_.LocalAddress)
-    $remote = [System.Net.IPAddress]::Parse([string]$_.RemoteAddress)
-    if ($local.AddressFamily -ne $remote.AddressFamily) {
-        throw 'mixed address families'
-    }
-    if ($local.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork) {
-        $family = 4
-        $ipv4Count++
-    } elseif ($local.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetworkV6) {
-        $family = 6
-        $ipv6Count++
-    } else {
-        throw 'unsupported address family'
-    }
-    $fields = [string[]]@(
-        'ROW',
-        $family.ToString($culture),
-        $local.ToString(),
-        ([uint32]$_.LocalPort).ToString($culture),
-        $remote.ToString(),
-        ([uint32]$_.RemotePort).ToString($culture),
-        ([uint32]$_.State).ToString($culture),
-        ([uint32]$_.OwningProcess).ToString($culture)
+$module = $assembly.DefineDynamicModule('Rustscale.Netstat.Native')
+$typeAttributes = [System.Reflection.TypeAttributes](
+    [System.Reflection.TypeAttributes]::Public -bor
+    [System.Reflection.TypeAttributes]::Abstract -bor
+    [System.Reflection.TypeAttributes]::Sealed
+)
+$typeBuilder = $module.DefineType('RustscaleNetstatNative', $typeAttributes)
+$methodAttributes = [System.Reflection.MethodAttributes](
+    [System.Reflection.MethodAttributes]::Public -bor
+    [System.Reflection.MethodAttributes]::Static -bor
+    [System.Reflection.MethodAttributes]::PinvokeImpl
+)
+$parameterTypes = [Type[]]@(
+    [IntPtr],
+    [uint32].MakeByRefType(),
+    [int32],
+    [uint32],
+    [int32],
+    [uint32]
+)
+$methodBuilder = $typeBuilder.DefinePInvokeMethod(
+    'GetExtendedTcpTable',
+    'C:\Windows\System32\iphlpapi.dll',
+    $methodAttributes,
+    [System.Reflection.CallingConventions]::Standard,
+    [uint32],
+    $parameterTypes,
+    [System.Runtime.InteropServices.CallingConvention]::Winapi,
+    [System.Runtime.InteropServices.CharSet]::None
+)
+$methodBuilder.SetImplementationFlags(
+    $methodBuilder.GetMethodImplementationFlags() -bor
+    [System.Reflection.MethodImplAttributes]::PreserveSig
+)
+$nativeType = $typeBuilder.CreateType()
+$getTcpTable = $nativeType.GetMethod('GetExtendedTcpTable')
+
+function Invoke-TcpTable {
+    param(
+        [IntPtr]$Buffer,
+        [uint32]$Size,
+        [uint32]$AddressFamily
     )
-    $output.WriteLine([string]::Join("`t", $fields))
+    [object[]]$arguments = @(
+        $Buffer,
+        $Size,
+        [int32]1,
+        $AddressFamily,
+        [int32]5,
+        [uint32]0
+    )
+    [uint32]$code = $script:getTcpTable.Invoke($null, $arguments)
+    [object[]]$result = @($code, [uint32]$arguments[1])
+    return ,$result
 }
-$footer = [string[]]@(
-    'END',
-    '4',
-    $ipv4Count.ToString($culture),
-    '6',
-    $ipv6Count.ToString($culture)
-)
-$output.WriteLine([string]::Join("`t", $footer))
+
+function Read-U32 {
+    param([IntPtr]$Buffer, [int32]$Offset)
+    [int64]$value = [System.Runtime.InteropServices.Marshal]::ReadInt32($Buffer, $Offset)
+    if ($value -lt 0) {
+        $value += [int64]4294967296
+    }
+    return [uint32]$value
+}
+
+function Read-NetworkPort {
+    param([IntPtr]$Buffer, [int32]$Offset)
+    [uint32]$high = [System.Runtime.InteropServices.Marshal]::ReadByte($Buffer, $Offset)
+    [uint32]$low = [System.Runtime.InteropServices.Marshal]::ReadByte($Buffer, $Offset + 1)
+    return [uint16](($high * 256) + $low)
+}
+
+function Read-Hex {
+    param([IntPtr]$Buffer, [int32]$Offset, [int32]$Length)
+    [byte[]]$bytes = [byte[]]::new($Length)
+    [System.Runtime.InteropServices.Marshal]::Copy(
+        [IntPtr]::Add($Buffer, $Offset),
+        $bytes,
+        0,
+        $Length
+    )
+    return [System.BitConverter]::ToString($bytes).Replace('-', '')
+}
+
+function Write-FamilyError {
+    param([uint32]$Family, [uint32]$Code)
+    [string[]]$fields = @(
+        'ERROR',
+        $Family.ToString($script:culture),
+        $Code.ToString($script:culture)
+    )
+    $script:output.WriteLine([string]::Join("`t", $fields))
+}
+
+function Write-Family {
+    param(
+        [uint32]$Family,
+        [uint32]$AddressFamily,
+        [uint32]$RowSize
+    )
+    $script:output.WriteLine(
+        [string]::Join("`t", [string[]]@('BEGIN', $Family.ToString($script:culture)))
+    )
+
+    try {
+        [object[]]$probe = Invoke-TcpTable ([IntPtr]::Zero) 0 $AddressFamily
+    } catch {
+        Write-FamilyError $Family $script:errorUnexpected
+        return $false
+    }
+    [uint32]$code = $probe[0]
+    [uint32]$nextSize = $probe[1]
+    if ($code -ne 122) {
+        Write-FamilyError $Family $code
+        return $false
+    }
+
+    for ([int32]$attempt = 0; $attempt -lt 3; $attempt++) {
+        if ($nextSize -lt 4 -or $nextSize -gt $script:maxNativeTableBytes) {
+            Write-FamilyError $Family $script:errorInvalidSize
+            return $false
+        }
+        [uint32]$capacity = $nextSize
+        [IntPtr]$buffer = [IntPtr]::Zero
+        try {
+            $buffer = [System.Runtime.InteropServices.Marshal]::AllocHGlobal([int32]$capacity)
+            [object[]]$result = Invoke-TcpTable $buffer $capacity $AddressFamily
+            $code = $result[0]
+            [uint32]$used = $result[1]
+            if ($code -eq 122) {
+                $nextSize = $used
+                continue
+            }
+            if ($code -ne 0) {
+                Write-FamilyError $Family $code
+                return $false
+            }
+            if ($used -lt 4 -or $used -gt $capacity) {
+                Write-FamilyError $Family $script:errorInvalidSize
+                return $false
+            }
+
+            [uint32]$rowCount = Read-U32 $buffer 0
+            [uint64]$required = [uint64]4 + ([uint64]$rowCount * [uint64]$RowSize)
+            if ($rowCount -gt $script:maxRows -or $required -gt [uint64]$used) {
+                Write-FamilyError $Family $script:errorMalformedTable
+                return $false
+            }
+
+            for ([uint32]$index = 0; $index -lt $rowCount; $index++) {
+                [int32]$row = [int32](4 + ([uint64]$index * [uint64]$RowSize))
+                if ($Family -eq 4) {
+                    [string]$localAddress = Read-Hex $buffer ($row + 4) 4
+                    [uint32]$localScope = 0
+                    [uint16]$localPort = Read-NetworkPort $buffer ($row + 8)
+                    [string]$remoteAddress = Read-Hex $buffer ($row + 12) 4
+                    [uint32]$remoteScope = 0
+                    [uint16]$remotePort = Read-NetworkPort $buffer ($row + 16)
+                    [uint32]$state = Read-U32 $buffer $row
+                    [uint32]$pid = Read-U32 $buffer ($row + 20)
+                } else {
+                    [string]$localAddress = Read-Hex $buffer $row 16
+                    [uint32]$localScope = Read-U32 $buffer ($row + 16)
+                    [uint16]$localPort = Read-NetworkPort $buffer ($row + 20)
+                    [string]$remoteAddress = Read-Hex $buffer ($row + 24) 16
+                    [uint32]$remoteScope = Read-U32 $buffer ($row + 40)
+                    [uint16]$remotePort = Read-NetworkPort $buffer ($row + 44)
+                    [uint32]$state = Read-U32 $buffer ($row + 48)
+                    [uint32]$pid = Read-U32 $buffer ($row + 52)
+                }
+                [string[]]$fields = @(
+                    'ROW',
+                    $Family.ToString($script:culture),
+                    $localAddress,
+                    $localScope.ToString($script:culture),
+                    $localPort.ToString($script:culture),
+                    $remoteAddress,
+                    $remoteScope.ToString($script:culture),
+                    $remotePort.ToString($script:culture),
+                    $state.ToString($script:culture),
+                    $pid.ToString($script:culture)
+                )
+                $script:output.WriteLine([string]::Join("`t", $fields))
+            }
+            [string[]]$footer = @(
+                'END-FAMILY',
+                $Family.ToString($script:culture),
+                $rowCount.ToString($script:culture)
+            )
+            $script:output.WriteLine([string]::Join("`t", $footer))
+            return $true
+        } catch {
+            Write-FamilyError $Family $script:errorUnexpected
+            return $false
+        } finally {
+            if ($buffer -ne [IntPtr]::Zero) {
+                [System.Runtime.InteropServices.Marshal]::FreeHGlobal($buffer)
+            }
+        }
+    }
+
+    Write-FamilyError $Family $script:errorRetryLimit
+    return $false
+}
+
+$output.WriteLine("RUSTSCALE-NETSTAT`t1")
+if (-not (Write-Family 4 2 24)) {
+    exit 0
+}
+if (-not (Write-Family 6 23 56)) {
+    exit 0
+}
+$output.WriteLine('END')
 "#;
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_command(encoded_script: &str) -> std::process::Command {
+    let mut command = std::process::Command::new(TRUSTED_POWERSHELL_PATH);
+    command
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-EncodedCommand",
+            encoded_script,
+        ])
+        // Do not inherit attacker-selected executable or module lookup paths.
+        // PowerShell still receives its fixed standard root for CLR internals.
+        .env("SystemRoot", r"C:\Windows")
+        .env("WINDIR", r"C:\Windows")
+        .env_remove("PATH")
+        .env_remove("PSModulePath");
+    command
+}
 
 #[cfg(target_os = "windows")]
 #[derive(Clone, Copy, Debug, Default)]
@@ -357,56 +626,20 @@ impl WindowsTcpTableReader for SystemWindowsTcpTableReader {
         max_bytes: usize,
     ) -> Result<Vec<u8>, Error> {
         use std::io::{self, Read};
-        use std::path::{Component, Path, PathBuf, Prefix};
-        use std::process::{Command, Stdio};
+        use std::process::Stdio;
         use std::thread;
         use std::time::Duration;
 
         use base64::Engine as _;
 
         context.check()?;
-        let system_root = std::env::var_os("SystemRoot").ok_or_else(|| {
-            Error::io(
-                "locating Windows PowerShell",
-                io::Error::new(io::ErrorKind::NotFound, "SystemRoot is not set"),
-            )
-        })?;
-        let system_root = Path::new(&system_root);
-        let mut components = system_root.components();
-        let trusted_drive_path = matches!(
-            components.next(),
-            Some(Component::Prefix(prefix))
-                if matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_))
-        ) && matches!(components.next(), Some(Component::RootDir))
-            && components.all(|component| matches!(component, Component::Normal(_)));
-        if !trusted_drive_path {
-            return Err(Error::io(
-                "locating Windows PowerShell",
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "SystemRoot is not an absolute local drive path",
-                ),
-            ));
-        }
-        let powershell: PathBuf = system_root
-            .join("System32")
-            .join("WindowsPowerShell")
-            .join("v1.0")
-            .join("powershell.exe");
         let encoded_script = base64::engine::general_purpose::STANDARD.encode(
             POWERSHELL_SCRIPT
                 .encode_utf16()
                 .flat_map(u16::to_le_bytes)
                 .collect::<Vec<_>>(),
         );
-        let mut child = Command::new(&powershell)
-            .args([
-                "-NoLogo",
-                "-NoProfile",
-                "-NonInteractive",
-                "-EncodedCommand",
-                &encoded_script,
-            ])
+        let mut child = windows_command(&encoded_script)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -487,7 +720,9 @@ mod tests {
     use super::*;
     use crate::{run_supervised_with_limiter, CancellationToken, Limits, WorkerLimiter};
 
-    const FIXTURE: &str = "RUSTSCALE-NETSTAT\t1\nROW\t4\t127.0.0.1\t8080\t10.0.0.2\t443\t5\t42\nROW\t6\tfe80::1%12\t22\t::\t0\t2\t9001\nEND\t4\t1\t6\t1\n";
+    const FIXTURE: &str = "RUSTSCALE-NETSTAT\t1\nBEGIN\t4\nROW\t4\t7F000001\t0\t8080\t0A000002\t0\t443\t5\t42\nEND-FAMILY\t4\t1\nBEGIN\t6\nROW\t6\tFE800000000000000000000000000001\t12\t22\t00000000000000000000000000000000\t0\t0\t2\t9001\nEND-FAMILY\t6\t1\nEND\n";
+    const EMPTY_FIXTURE: &str =
+        "RUSTSCALE-NETSTAT\t1\nBEGIN\t4\nEND-FAMILY\t4\t0\nBEGIN\t6\nEND-FAMILY\t6\t0\nEND\n";
 
     struct FixtureReader(Vec<u8>);
 
@@ -574,15 +809,17 @@ mod tests {
 
     #[test]
     fn rejects_malformed_rows_and_ambiguous_tokens() {
-        for output in [
-            "RUSTSCALE-NETSTAT\t1\nROW\t4\t127.0.0.1\t80\t0.0.0.0\t0\tLISTEN\t1\nEND\t4\t1\t6\t0\n",
-            "RUSTSCALE-NETSTAT\t1\nROW\t4\t127.0.0.1\t80\t::\t0\t2\t1\nEND\t4\t1\t6\t0\n",
-            "RUSTSCALE-NETSTAT\t1\nROW\t6\tfe80::1%eth0\t80\t::\t0\t2\t1\nEND\t4\t0\t6\t1\n",
-            "RUSTSCALE-NETSTAT\t1\nROW\t4\t127.0.0.1\t080\t0.0.0.0\t0\t2\t1\nEND\t4\t1\t6\t0\n",
-            "RUSTSCALE-NETSTAT\t1\nROW\t4\t127.0.0.1\t80\t0.0.0.0\t0\t2\t1\textra\nEND\t4\t1\t6\t0\n",
+        let suffix = "END-FAMILY\t4\t1\nBEGIN\t6\nEND-FAMILY\t6\t0\nEND\n";
+        for row in [
+            "ROW\t4\t7F000001\t0\t80\t00000000\t0\t0\tLISTEN\t1\n",
+            "ROW\t6\t7F000001\t0\t80\t00000000\t0\t0\t2\t1\n",
+            "ROW\t4\tnot-hex!\t0\t80\t00000000\t0\t0\t2\t1\n",
+            "ROW\t4\t7F000001\t0\t080\t00000000\t0\t0\t2\t1\n",
+            "ROW\t4\t7F000001\t0\t80\t00000000\t0\t0\t2\t1\textra\n",
         ] {
+            let output = format!("RUSTSCALE-NETSTAT\t1\nBEGIN\t4\n{row}{suffix}");
             assert!(matches!(
-                snapshot(output, &options()),
+                snapshot(&output, &options()),
                 Err(Error::Malformed { .. } | Error::LimitExceeded { .. })
             ));
         }
@@ -591,11 +828,12 @@ mod tests {
     #[test]
     fn rejects_truncation_and_all_partial_family_forms() {
         for output in [
-            "RUSTSCALE-NETSTAT\t1\nROW\t4\t127.0.0.1\t80\t0.0.0.0\t0\t2\t1\n",
-            "RUSTSCALE-NETSTAT\t1\nROW\t4\t127.0.0.1\t80\t0.0.0.0\t0\t2\t1\nEND\t4\t1\t6\t1\n",
-            "RUSTSCALE-NETSTAT\t1\nEND\t4\t0\t6\n",
-            "RUSTSCALE-NETSTAT\t1\nEND\t4\t0\t6\t0\nROW\t6\t::1\t80\t::\t0\t2\t1\n",
-            "RUSTSCALE-NETSTAT\t1\nRUSTSCALE-NETSTAT\t1\nEND\t4\t0\t6\t0\n",
+            "RUSTSCALE-NETSTAT\t1\n",
+            "RUSTSCALE-NETSTAT\t1\nBEGIN\t4\nROW\t4\t7F000001\t0\t80\t00000000\t0\t0\t2\t1\n",
+            // A successful IPv4 section never permits omission of IPv6.
+            "RUSTSCALE-NETSTAT\t1\nBEGIN\t4\nEND-FAMILY\t4\t0\nEND\n",
+            "RUSTSCALE-NETSTAT\t1\nBEGIN\t4\nEND-FAMILY\t4\t0\nBEGIN\t6\nEND-FAMILY\t6\t0\n",
+            "RUSTSCALE-NETSTAT\t1\nBEGIN\t4\nEND-FAMILY\t4\t0\nBEGIN\t6\nEND-FAMILY\t6\t1\nEND\n",
         ] {
             assert!(matches!(
                 snapshot(output, &options()),
@@ -650,7 +888,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .recv_timeout(Duration::from_secs(2));
-            Ok(b"RUSTSCALE-NETSTAT\t1\nEND\t4\t0\t6\t0\n".to_vec())
+            Ok(EMPTY_FIXTURE.as_bytes().to_vec())
         }
     }
 
@@ -727,12 +965,56 @@ mod tests {
         ));
     }
 
-    #[cfg(target_os = "windows")]
     #[test]
-    fn system_transport_is_fixed_numeric_and_has_no_intermediary_shell() {
-        assert!(POWERSHELL_SCRIPT.contains("Get-NetTCPConnection"));
-        assert!(POWERSHELL_SCRIPT.contains("InvariantCulture"));
-        assert!(POWERSHELL_SCRIPT.contains("([uint32]$_.State)"));
+    fn family_error_is_explicit_and_fatal() {
+        let output = "RUSTSCALE-NETSTAT\t1\nBEGIN\t4\nERROR\t4\t5\n";
+        assert!(matches!(
+            snapshot(output, &options()),
+            Err(Error::WindowsFamilyFailed {
+                family: "IPv4",
+                code: 5
+            })
+        ));
+    }
+
+    #[test]
+    fn system_transport_ignores_systemroot_path_and_module_resolution() {
+        assert_eq!(
+            TRUSTED_POWERSHELL_PATH,
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+        );
+        let command = windows_command("fixed-script");
+        assert_eq!(
+            command.get_program(),
+            std::ffi::OsStr::new(TRUSTED_POWERSHELL_PATH)
+        );
+        let environment: std::collections::HashMap<_, _> = command
+            .get_envs()
+            .map(|(name, value)| {
+                (
+                    name.to_string_lossy().to_ascii_uppercase(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            environment.get("SYSTEMROOT"),
+            Some(&Some(r"C:\Windows".into()))
+        );
+        assert_eq!(environment.get("WINDIR"), Some(&Some(r"C:\Windows".into())));
+        assert_eq!(environment.get("PATH"), Some(&None));
+        assert_eq!(environment.get("PSMODULEPATH"), Some(&None));
+        assert!(POWERSHELL_SCRIPT.contains("C:\\Windows\\System32\\iphlpapi.dll"));
+        assert!(POWERSHELL_SCRIPT.contains("GetExtendedTcpTable"));
+        assert!(POWERSHELL_SCRIPT.contains("Write-Family 4 2 24"));
+        assert!(POWERSHELL_SCRIPT.contains("Write-Family 6 23 56"));
+        assert!(POWERSHELL_SCRIPT.contains("BEGIN"));
+        assert!(POWERSHELL_SCRIPT.contains("END-FAMILY"));
+        assert!(!POWERSHELL_SCRIPT.contains("$env:"));
+        assert!(!POWERSHELL_SCRIPT.contains("Get-NetTCPConnection"));
+        assert!(!POWERSHELL_SCRIPT.contains("Import-Module"));
+        assert!(!POWERSHELL_SCRIPT.contains("Add-Type"));
+        assert!(!POWERSHELL_SCRIPT.contains("New-Object"));
         assert!(!POWERSHELL_SCRIPT.contains("cmd.exe"));
     }
 }

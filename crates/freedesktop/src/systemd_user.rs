@@ -4,6 +4,12 @@
 //! entries, command programs, or `systemctl` arguments. Filesystem and command
 //! transports are injectable so callers can test policy without touching a real
 //! user manager.
+//!
+//! Cooperating RustScale processes serialize through an owner-only advisory
+//! lock. A noncooperating process with the same UID can still rename files in
+//! the user's configuration directory: Linux has no rename operation
+//! conditional on a destination inode. Such interference is detected by exact
+//! inode-and-content checks; unvalidated bytes are never sent to daemon-reload.
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
@@ -503,8 +509,20 @@ pub enum UnitStoreError {
     Io,
 }
 
+/// Owned advisory lock held for the complete unit transaction.
+pub trait UnitOperationGuard: Send {}
+
+impl<T: Send> UnitOperationGuard for T {}
+
 /// Injectable atomic unit-file storage.
 pub trait UserUnitStore: Send + Sync {
+    fn lock_unit<'a>(
+        &'a self,
+        unit_name: &str,
+        cancellation: &CancellationToken,
+        timeout: Duration,
+    ) -> Result<Box<dyn UnitOperationGuard + 'a>, UnitStoreError>;
+
     fn inspect(&self, unit_name: &str) -> Result<StoredUnit, UnitStoreError>;
 
     fn reload_required(&self, unit_name: &str) -> Result<bool, UnitStoreError>;
@@ -574,15 +592,67 @@ mod unix_store {
     use std::fs::File;
 
     use rustix::fs::{AtFlags, Mode, OFlags};
+    use sha2::{Digest, Sha256};
 
     use super::{
-        is_managed_unit_filename, CancellationToken, Component, FileIdentity, Ordering, OwnedFd,
-        Path, Read, StoredUnit, SystemUserUnitStore, UnitStoreError, UserUnitStore, Write,
-        MAX_UNIT_BYTES, TEMP_COUNTER,
+        is_managed_unit_filename, CancellationToken, Component, Duration, FileIdentity, Instant,
+        Ordering, OwnedFd, Path, Read, StoredUnit, SystemUserUnitStore, UnitOperationGuard,
+        UnitStoreError, UserUnitStore, Write, MAX_TIMEOUT, MAX_UNIT_BYTES, POLL_INTERVAL,
+        TEMP_COUNTER,
     };
 
     fn journal_name(unit_name: &str) -> String {
-        format!(".{unit_name}.reload-required")
+        format!(".{unit_name}.operation")
+    }
+
+    fn valid_journal(unit_name: &str, bytes: &[u8]) -> bool {
+        let Ok(text) = std::str::from_utf8(bytes) else {
+            return false;
+        };
+        text.starts_with("version=1\n")
+            && text.lines().any(|line| line == format!("unit={unit_name}"))
+            && text.lines().any(|line| line.starts_with("operation="))
+            && text.lines().any(|line| line.starts_with("kind="))
+            && text.lines().any(|line| line.starts_with("temporary="))
+            && text.lines().any(|line| line.starts_with("before-hash="))
+            && text.lines().any(|line| line.starts_with("after-hash="))
+    }
+
+    fn content_hash(bytes: Option<&[u8]>) -> String {
+        bytes.map_or_else(
+            || "missing".to_owned(),
+            |bytes| format!("{:x}", Sha256::digest(bytes)),
+        )
+    }
+
+    fn journal_field<'a>(text: &'a str, field: &str) -> Option<&'a str> {
+        text.lines()
+            .find_map(|line| line.strip_prefix(&format!("{field}=")))
+    }
+
+    fn snapshot_matches(
+        stored: &StoredUnit,
+        identity: Option<FileIdentity>,
+        expected_identity: &str,
+        expected_hash: &str,
+    ) -> bool {
+        match (stored, identity) {
+            (StoredUnit::Missing, None) => {
+                expected_identity == "missing" && expected_hash == "missing"
+            }
+            (StoredUnit::Regular(bytes), Some(identity)) => {
+                identity_text(Some(identity)) == expected_identity
+                    && content_hash(Some(bytes)) == expected_hash
+            }
+            _ => false,
+        }
+    }
+
+    fn identity_text(identity: Option<FileIdentity>) -> String {
+        identity.map_or_else(
+            || "missing".to_owned(),
+            |identity| format!("{}:{}", identity.device, identity.inode),
+        )
     }
 
     pub(super) fn bind_config_directory(config_home: &Path) -> Result<OwnedFd, UnitStoreError> {
@@ -731,6 +801,7 @@ mod unix_store {
         fn mark_reload_required(
             directory: &OwnedFd,
             unit_name: &str,
+            record: &[u8],
         ) -> Result<(), UnitStoreError> {
             let journal = journal_name(unit_name);
             match rustix::fs::openat(
@@ -741,18 +812,11 @@ mod unix_store {
             ) {
                 Ok(fd) => {
                     let mut file = File::from(fd);
-                    file.write_all(unit_name.as_bytes())
-                        .map_err(|_| UnitStoreError::Io)?;
+                    file.write_all(record).map_err(|_| UnitStoreError::Io)?;
                     file.sync_all().map_err(|_| UnitStoreError::Io)?;
                     rustix::fs::fsync(directory).map_err(|_| UnitStoreError::Io)
                 }
-                Err(rustix::io::Errno::EXIST) => {
-                    let (stored, _) = Self::inspect_at(directory, &journal)?;
-                    match stored {
-                        StoredUnit::Regular(bytes) if bytes == unit_name.as_bytes() => Ok(()),
-                        _ => Err(UnitStoreError::Conflict),
-                    }
-                }
+                Err(rustix::io::Errno::EXIST) => Err(UnitStoreError::Conflict),
                 Err(_) => Err(UnitStoreError::Io),
             }
         }
@@ -809,6 +873,7 @@ mod unix_store {
                 device: new_stat.st_dev as u64,
                 inode: new_stat.st_ino as u64,
             };
+            let mut committed = false;
             let result = (|| {
                 file.write_all(contents).map_err(|_| UnitStoreError::Io)?;
                 file.sync_all().map_err(|_| UnitStoreError::Io)?;
@@ -816,19 +881,48 @@ mod unix_store {
                 if cancellation.is_cancelled() {
                     return Err(UnitStoreError::Cancelled);
                 }
-                Self::mark_reload_required(directory, name)?;
+                // Bind the intent to both exact inodes and the unique staging
+                // name before the CAS can become visible.
+                let operation = format!(
+                    "version=1\nunit={name}\noperation={temporary_name}\nkind=replace\ntemporary={temporary_name}\nbefore={}\nafter={}\nbefore-hash={}\nafter-hash={}\nbefore-bytes={}\nafter-bytes={}\n",
+                    identity_text(expected_identity),
+                    identity_text(Some(new_identity)),
+                    content_hash(expected),
+                    content_hash(Some(contents)),
+                    expected.map_or(0, <[u8]>::len),
+                    contents.len(),
+                );
+                Self::mark_reload_required(directory, name, operation.as_bytes())?;
+
+                // Re-open and validate immediately before publication. This is
+                // the last possible check on kernels without conditional rename.
+                let (immediate, immediate_identity) = Self::inspect_at(directory, name)?;
+                match (expected, expected_identity, immediate, immediate_identity) {
+                    (None, None, StoredUnit::Missing, None) => {}
+                    (
+                        Some(expected),
+                        Some(expected_identity),
+                        StoredUnit::Regular(actual),
+                        Some(actual_identity),
+                    ) if actual == expected && actual_identity == expected_identity => {}
+                    _ => return Err(UnitStoreError::Conflict),
+                }
+
                 match expected {
-                    None => rustix::fs::renameat_with(
-                        directory,
-                        &temporary_name,
-                        directory,
-                        name,
-                        rustix::fs::RenameFlags::NOREPLACE,
-                    )
-                    .map_err(|error| match error {
-                        rustix::io::Errno::EXIST => UnitStoreError::Conflict,
-                        _ => UnitStoreError::Io,
-                    })?,
+                    None => {
+                        rustix::fs::renameat_with(
+                            directory,
+                            &temporary_name,
+                            directory,
+                            name,
+                            rustix::fs::RenameFlags::NOREPLACE,
+                        )
+                        .map_err(|error| match error {
+                            rustix::io::Errno::EXIST => UnitStoreError::Conflict,
+                            _ => UnitStoreError::Io,
+                        })?;
+                        committed = true;
+                    }
                     Some(expected) => {
                         rustix::fs::renameat_with(
                             directory,
@@ -838,31 +932,37 @@ mod unix_store {
                             rustix::fs::RenameFlags::EXCHANGE,
                         )
                         .map_err(|_| UnitStoreError::Conflict)?;
-                        let (displaced, displaced_identity) =
-                            Self::inspect_at(directory, &temporary_name)?;
-                        if !matches!(
-                            (displaced, displaced_identity, expected_identity),
-                            (StoredUnit::Regular(actual), Some(actual_identity), Some(expected_identity))
-                                if actual == expected && actual_identity == expected_identity
-                        ) {
-                            // Exchange back rather than overwriting either name.
-                            rustix::fs::renameat_with(
-                                directory,
-                                &temporary_name,
-                                directory,
-                                name,
-                                rustix::fs::RenameFlags::EXCHANGE,
-                            )
-                            .map_err(|_| UnitStoreError::Conflict)?;
-                            return Err(UnitStoreError::Conflict);
+                        committed = true;
+                        match Self::inspect_at(directory, &temporary_name) {
+                            Ok((StoredUnit::Regular(actual), Some(actual_identity)))
+                                if actual == expected
+                                    && Some(actual_identity) == expected_identity => {}
+                            Ok(_) => {
+                                // The exchange captured an unexpected inode.
+                                // Roll back while both names remain locked.
+                                if rustix::fs::renameat_with(
+                                    directory,
+                                    &temporary_name,
+                                    directory,
+                                    name,
+                                    rustix::fs::RenameFlags::EXCHANGE,
+                                )
+                                .is_ok()
+                                {
+                                    committed = false;
+                                    return Err(UnitStoreError::Conflict);
+                                }
+                                return Err(UnitStoreError::CommittedNeedsReload);
+                            }
+                            Err(_) => return Err(UnitStoreError::CommittedNeedsReload),
                         }
                         rustix::fs::unlinkat(directory, &temporary_name, AtFlags::empty())
-                            .map_err(|_| UnitStoreError::Io)?;
+                            .map_err(|_| UnitStoreError::CommittedNeedsReload)?;
                     }
                 }
                 Ok(())
             })();
-            if result.is_err()
+            if !committed
                 && matches!(
                     Self::inspect_at(directory, &temporary_name),
                     Ok((StoredUnit::Regular(_), Some(identity))) if identity == new_identity
@@ -874,12 +974,65 @@ mod unix_store {
                 Ok(()) => {
                     rustix::fs::fsync(directory).map_err(|_| UnitStoreError::CommittedNeedsReload)
                 }
+                Err(_) if committed => Err(UnitStoreError::CommittedNeedsReload),
                 Err(error) => Err(error),
             }
         }
     }
 
     impl UserUnitStore for SystemUserUnitStore {
+        fn lock_unit<'a>(
+            &'a self,
+            unit_name: &str,
+            cancellation: &CancellationToken,
+            timeout: Duration,
+        ) -> Result<Box<dyn UnitOperationGuard + 'a>, UnitStoreError> {
+            if !is_managed_unit_filename(unit_name) {
+                return Err(UnitStoreError::Unavailable);
+            }
+            let directory = self
+                .open_user_dir(true)?
+                .ok_or(UnitStoreError::Unavailable)?;
+            let lock_name = format!(".{unit_name}.lock");
+            let fd = rustix::fs::openat(
+                &directory,
+                &lock_name,
+                OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .map_err(|_| UnitStoreError::Conflict)?;
+            let stat = rustix::fs::fstat(&fd).map_err(|_| UnitStoreError::Io)?;
+            if rustix::fs::FileType::from_raw_mode(stat.st_mode)
+                != rustix::fs::FileType::RegularFile
+            {
+                return Err(UnitStoreError::Conflict);
+            }
+            if stat.st_uid != rustix::process::getuid().as_raw() {
+                return Err(UnitStoreError::WrongOwner);
+            }
+            if stat.st_mode & 0o077 != 0 {
+                return Err(UnitStoreError::InsecurePermissions);
+            }
+            rustix::fs::fsync(&fd).map_err(|_| UnitStoreError::Io)?;
+            rustix::fs::fsync(&directory).map_err(|_| UnitStoreError::Io)?;
+            let deadline = Instant::now() + timeout.min(MAX_TIMEOUT);
+            loop {
+                if cancellation.is_cancelled() {
+                    return Err(UnitStoreError::Cancelled);
+                }
+                match rustix::fs::flock(&fd, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+                    Ok(()) => return Ok(Box::new(fd)),
+                    Err(rustix::io::Errno::WOULDBLOCK) if Instant::now() < deadline => {
+                        std::thread::sleep(POLL_INTERVAL);
+                    }
+                    Err(rustix::io::Errno::WOULDBLOCK) => {
+                        return Err(UnitStoreError::Conflict);
+                    }
+                    Err(_) => return Err(UnitStoreError::Io),
+                }
+            }
+        }
+
         fn inspect(&self, unit_name: &str) -> Result<StoredUnit, UnitStoreError> {
             if !is_managed_unit_filename(unit_name) {
                 return Err(UnitStoreError::Unavailable);
@@ -915,11 +1068,56 @@ mod unix_store {
                 return Ok(false);
             };
             let (stored, _) = Self::inspect_at(&directory, &journal_name(unit_name))?;
-            match stored {
-                StoredUnit::Missing => Ok(false),
-                StoredUnit::Regular(bytes) if bytes == unit_name.as_bytes() => Ok(true),
-                _ => Err(UnitStoreError::Conflict),
+            let StoredUnit::Regular(journal) = stored else {
+                return match stored {
+                    StoredUnit::Missing => Ok(false),
+                    _ => Err(UnitStoreError::Conflict),
+                };
+            };
+            if !valid_journal(unit_name, &journal) {
+                return Err(UnitStoreError::Conflict);
             }
+            let text = std::str::from_utf8(&journal).map_err(|_| UnitStoreError::Conflict)?;
+            let temporary = journal_field(text, "temporary").ok_or(UnitStoreError::Conflict)?;
+            if !temporary.starts_with(&format!(".{unit_name}.")) || temporary.contains(['/', '\0'])
+            {
+                return Err(UnitStoreError::Conflict);
+            }
+            let before = journal_field(text, "before").ok_or(UnitStoreError::Conflict)?;
+            let after = journal_field(text, "after").ok_or(UnitStoreError::Conflict)?;
+            let before_hash = journal_field(text, "before-hash").ok_or(UnitStoreError::Conflict)?;
+            let after_hash = journal_field(text, "after-hash").ok_or(UnitStoreError::Conflict)?;
+            let (target, target_identity) = Self::inspect_at(&directory, unit_name)
+                .map_err(|_| UnitStoreError::CommittedNeedsReload)?;
+            let (staged, staged_identity) = Self::inspect_at(&directory, temporary)
+                .map_err(|_| UnitStoreError::CommittedNeedsReload)?;
+
+            if snapshot_matches(&target, target_identity, after, after_hash) {
+                if !matches!(&staged, StoredUnit::Missing) {
+                    if !snapshot_matches(&staged, staged_identity, before, before_hash) {
+                        return Err(UnitStoreError::Conflict);
+                    }
+                    rustix::fs::unlinkat(&directory, temporary, AtFlags::empty())
+                        .map_err(|_| UnitStoreError::CommittedNeedsReload)?;
+                    rustix::fs::fsync(&directory)
+                        .map_err(|_| UnitStoreError::CommittedNeedsReload)?;
+                }
+                return Ok(true);
+            }
+
+            if snapshot_matches(&target, target_identity, before, before_hash) {
+                if !matches!(&staged, StoredUnit::Missing) {
+                    if !snapshot_matches(&staged, staged_identity, after, after_hash) {
+                        return Err(UnitStoreError::Conflict);
+                    }
+                    rustix::fs::unlinkat(&directory, temporary, AtFlags::empty())
+                        .map_err(|_| UnitStoreError::Io)?;
+                    rustix::fs::fsync(&directory).map_err(|_| UnitStoreError::Io)?;
+                }
+                self.clear_reload_required(unit_name)?;
+                return Ok(false);
+            }
+            Err(UnitStoreError::Conflict)
         }
 
         fn clear_reload_required(&self, unit_name: &str) -> Result<(), UnitStoreError> {
@@ -930,11 +1128,25 @@ mod unix_store {
                 return Ok(());
             };
             let journal = journal_name(unit_name);
-            let (stored, expected_identity) = Self::inspect_at(&directory, &journal)?;
+            let (stored, expected_identity) = Self::inspect_at(&directory, &journal)
+                .map_err(|_| UnitStoreError::CommittedNeedsReload)?;
             match (&stored, expected_identity) {
                 (StoredUnit::Missing, None) => return Ok(()),
-                (StoredUnit::Regular(bytes), Some(_)) if bytes == unit_name.as_bytes() => {}
+                (StoredUnit::Regular(bytes), Some(_)) if valid_journal(unit_name, bytes) => {}
                 _ => return Err(UnitStoreError::Conflict),
+            }
+            let StoredUnit::Regular(journal_bytes) = &stored else {
+                return Err(UnitStoreError::Conflict);
+            };
+            let journal_text =
+                std::str::from_utf8(journal_bytes).map_err(|_| UnitStoreError::Conflict)?;
+            let temporary =
+                journal_field(journal_text, "temporary").ok_or(UnitStoreError::Conflict)?;
+            if !matches!(
+                Self::inspect_at(&directory, temporary),
+                Ok((StoredUnit::Missing, None))
+            ) {
+                return Err(UnitStoreError::CommittedNeedsReload);
             }
             let sequence = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
             let tombstone = format!(".{unit_name}.journal-clear.{sequence:x}");
@@ -945,12 +1157,13 @@ mod unix_store {
                 &tombstone,
                 rustix::fs::RenameFlags::NOREPLACE,
             )
-            .map_err(|_| UnitStoreError::Conflict)?;
-            let (displaced, actual_identity) = Self::inspect_at(&directory, &tombstone)?;
+            .map_err(|_| UnitStoreError::CommittedNeedsReload)?;
+            let (displaced, actual_identity) = Self::inspect_at(&directory, &tombstone)
+                .map_err(|_| UnitStoreError::CommittedNeedsReload)?;
             if !matches!(
                 (&displaced, actual_identity, expected_identity),
                 (StoredUnit::Regular(bytes), Some(actual), Some(expected))
-                    if bytes == unit_name.as_bytes() && actual == expected
+                    if valid_journal(unit_name, bytes) && actual == expected
             ) {
                 let _ = rustix::fs::renameat_with(
                     &directory,
@@ -962,8 +1175,8 @@ mod unix_store {
                 return Err(UnitStoreError::Conflict);
             }
             rustix::fs::unlinkat(&directory, &tombstone, AtFlags::empty())
-                .map_err(|_| UnitStoreError::Io)?;
-            rustix::fs::fsync(&directory).map_err(|_| UnitStoreError::Io)
+                .map_err(|_| UnitStoreError::CommittedNeedsReload)?;
+            rustix::fs::fsync(&directory).map_err(|_| UnitStoreError::CommittedNeedsReload)
         }
 
         fn atomic_replace(
@@ -1029,7 +1242,21 @@ mod unix_store {
                 .ok_or(UnitStoreError::Conflict)?;
             let sequence = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
             let tombstone = format!(".{unit_name}.remove.{:x}.{sequence:x}", std::process::id());
-            Self::mark_reload_required(&directory, unit_name)?;
+            let operation = format!(
+                "version=1\nunit={unit_name}\noperation={tombstone}\nkind=remove\ntemporary={tombstone}\nbefore={}\nafter=missing\nbefore-hash={}\nafter-hash=missing\nbefore-bytes={}\nafter-bytes=0\n",
+                identity_text(Some(expected_identity)),
+                content_hash(Some(expected)),
+                expected.len(),
+            );
+            Self::mark_reload_required(&directory, unit_name, operation.as_bytes())?;
+            let (immediate, immediate_identity) = Self::inspect_at(&directory, unit_name)?;
+            if !matches!(
+                (immediate, immediate_identity),
+                (StoredUnit::Regular(actual), Some(identity))
+                    if actual == expected && identity == expected_identity
+            ) {
+                return Err(UnitStoreError::Conflict);
+            }
             rustix::fs::renameat_with(
                 &directory,
                 unit_name,
@@ -1038,24 +1265,28 @@ mod unix_store {
                 rustix::fs::RenameFlags::NOREPLACE,
             )
             .map_err(|_| UnitStoreError::Conflict)?;
-            let (displaced, identity) = Self::inspect_at(&directory, &tombstone)?;
-            if !matches!(
-                (displaced, identity),
-                (StoredUnit::Regular(actual), Some(identity))
-                    if actual == expected && identity == expected_identity
-            ) {
-                // Restore only into an absent name; never overwrite a racer.
-                let _ = rustix::fs::renameat_with(
-                    &directory,
-                    &tombstone,
-                    &directory,
-                    unit_name,
-                    rustix::fs::RenameFlags::NOREPLACE,
-                );
-                return Err(UnitStoreError::Conflict);
+            let displaced = Self::inspect_at(&directory, &tombstone);
+            match displaced {
+                Ok((StoredUnit::Regular(actual), Some(identity)))
+                    if actual == expected && identity == expected_identity => {}
+                Ok(_) => {
+                    if rustix::fs::renameat_with(
+                        &directory,
+                        &tombstone,
+                        &directory,
+                        unit_name,
+                        rustix::fs::RenameFlags::NOREPLACE,
+                    )
+                    .is_ok()
+                    {
+                        return Err(UnitStoreError::Conflict);
+                    }
+                    return Err(UnitStoreError::CommittedNeedsReload);
+                }
+                Err(_) => return Err(UnitStoreError::CommittedNeedsReload),
             }
             rustix::fs::unlinkat(&directory, &tombstone, AtFlags::empty())
-                .map_err(|_| UnitStoreError::Io)?;
+                .map_err(|_| UnitStoreError::CommittedNeedsReload)?;
             self.observed
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1067,6 +1298,15 @@ mod unix_store {
 
 #[cfg(not(unix))]
 impl UserUnitStore for SystemUserUnitStore {
+    fn lock_unit<'a>(
+        &'a self,
+        _unit_name: &str,
+        _cancellation: &CancellationToken,
+        _timeout: Duration,
+    ) -> Result<Box<dyn UnitOperationGuard + 'a>, UnitStoreError> {
+        Err(UnitStoreError::Unavailable)
+    }
+
     fn inspect(&self, _unit_name: &str) -> Result<StoredUnit, UnitStoreError> {
         Err(UnitStoreError::Unavailable)
     }
@@ -1146,6 +1386,10 @@ pub enum UserUnitManagerError {
     AlreadyExists,
     #[error("the unit is not installed")]
     NotInstalled,
+    #[error("the unit changed concurrently; no raced-in file was overwritten")]
+    ConcurrentMutation,
+    #[error("unit mutation committed and requires deterministic reload recovery")]
+    CommittedNeedsReload,
     #[error("secure unit storage failed")]
     Storage,
     #[error("systemctl failed")]
@@ -1226,6 +1470,10 @@ impl<S: UserUnitStore, C: SystemctlTransport> UserUnitManager<S, C> {
         let _unit_guard = unit_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _store_guard = self
+            .store
+            .lock_unit(&name, cancellation, self.timeout)
+            .map_err(map_store_error)?;
         self.ensure_manager(cancellation)?;
         self.recover_pending_reload(&name, cancellation)?;
         match self.checked_unit(&name)? {
@@ -1247,6 +1495,10 @@ impl<S: UserUnitStore, C: SystemctlTransport> UserUnitManager<S, C> {
         let _unit_guard = unit_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _store_guard = self
+            .store
+            .lock_unit(&name, cancellation, self.timeout)
+            .map_err(map_store_error)?;
         self.ensure_manager(cancellation)?;
         self.recover_pending_reload(&name, cancellation)?;
         match self.checked_unit(&name)? {
@@ -1270,6 +1522,10 @@ impl<S: UserUnitStore, C: SystemctlTransport> UserUnitManager<S, C> {
         let _unit_guard = unit_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _store_guard = self
+            .store
+            .lock_unit(&unit_name, cancellation, self.timeout)
+            .map_err(map_store_error)?;
         self.ensure_manager(cancellation)?;
         self.recover_pending_reload(&unit_name, cancellation)?;
         let existing = match self.checked_unit(&unit_name)? {
@@ -1300,6 +1556,13 @@ impl<S: UserUnitStore, C: SystemctlTransport> UserUnitManager<S, C> {
             }
             return Err(map_store_error(error));
         }
+        if !matches!(self.checked_unit(&unit_name), Ok(StoredUnit::Missing)) {
+            // Preserve the operation journal and do not reload a raced-in file.
+            if enablement_changed && self.restore_enablement(&unit_name, &enablement).is_err() {
+                return Err(UserUnitManagerError::RollbackFailed);
+            }
+            return Err(UserUnitManagerError::CommittedNeedsReload);
+        }
         let finish = self.reload(cancellation).and_then(|()| {
             self.store
                 .clear_reload_required(&unit_name)
@@ -1311,6 +1574,10 @@ impl<S: UserUnitStore, C: SystemctlTransport> UserUnitManager<S, C> {
                 .store
                 .atomic_replace(&unit_name, None, &existing, &rollback);
             if !matches!(restored, Ok(()) | Err(UnitStoreError::CommittedNeedsReload))
+                || !matches!(
+                    self.checked_unit(&unit_name),
+                    Ok(StoredUnit::Regular(actual)) if actual == existing
+                )
                 || self.reload(&rollback).is_err()
                 || self.store.clear_reload_required(&unit_name).is_err()
                 || (enablement_changed && self.restore_enablement(&unit_name, &enablement).is_err())
@@ -1349,6 +1616,10 @@ impl<S: UserUnitStore, C: SystemctlTransport> UserUnitManager<S, C> {
         let _unit_guard = unit_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _store_guard = self
+            .store
+            .lock_unit(&unit_name, cancellation, self.timeout)
+            .map_err(map_store_error)?;
         self.status_locked(&unit_name, cancellation)
     }
 
@@ -1402,6 +1673,10 @@ impl<S: UserUnitStore, C: SystemctlTransport> UserUnitManager<S, C> {
         let _unit_guard = unit_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _store_guard = self
+            .store
+            .lock_unit(&unit_name, cancellation, self.timeout)
+            .map_err(map_store_error)?;
         let status = self.status_locked(&unit_name, cancellation)?;
         self.set_enabled_locked(&unit_name, &status, enabled, cancellation)
     }
@@ -1587,6 +1862,14 @@ impl<S: UserUnitStore, C: SystemctlTransport> UserUnitManager<S, C> {
             Ok(()) | Err(UnitStoreError::CommittedNeedsReload) => {}
             Err(error) => return Err(map_store_error(error)),
         }
+        if !matches!(
+            self.checked_unit(name),
+            Ok(StoredUnit::Regular(actual)) if actual == bytes
+        ) {
+            // The committed journal remains for deterministic recovery; never
+            // reload a destination that is not exactly what we generated.
+            return Err(UserUnitManagerError::CommittedNeedsReload);
+        }
         if cancellation.is_cancelled() {
             return self.rollback_file(name, bytes, previous, UserUnitManagerError::Cancelled);
         }
@@ -1620,7 +1903,15 @@ impl<S: UserUnitStore, C: SystemctlTransport> UserUnitManager<S, C> {
             }
             None => self.store.atomic_remove(name, current, &rollback_token),
         };
+        let restored_exactly = match previous {
+            Some(previous) => matches!(
+                self.checked_unit(name),
+                Ok(StoredUnit::Regular(actual)) if actual == previous
+            ),
+            None => matches!(self.checked_unit(name), Ok(StoredUnit::Missing)),
+        };
         if !matches!(restored, Ok(()) | Err(UnitStoreError::CommittedNeedsReload))
+            || !restored_exactly
             || self.reload(&rollback_token).is_err()
             || self.store.clear_reload_required(name).is_err()
         {
@@ -1635,8 +1926,16 @@ impl<S: UserUnitStore, C: SystemctlTransport> UserUnitManager<S, C> {
         name: &str,
         cancellation: &CancellationToken,
     ) -> Result<(), UserUnitManagerError> {
-        if !self.store.reload_required(name).map_err(map_store_error)? {
-            return Ok(());
+        match self.store.reload_required(name) {
+            Ok(false) => return Ok(()),
+            Ok(true) | Err(UnitStoreError::CommittedNeedsReload) => {}
+            Err(error) => return Err(map_store_error(error)),
+        }
+        match self.checked_unit(name)? {
+            StoredUnit::Missing | StoredUnit::Regular(_) => {}
+            StoredUnit::Symlink | StoredUnit::Other => {
+                return Err(UserUnitManagerError::CommittedNeedsReload);
+            }
         }
         self.reload(cancellation)?;
         self.store
@@ -1800,9 +2099,8 @@ fn enablement_matches(current: &UserUnitStatus, expected: &UserUnitStatus) -> bo
 fn map_store_error(error: UnitStoreError) -> UserUnitManagerError {
     match error {
         UnitStoreError::Cancelled => UserUnitManagerError::Cancelled,
-        UnitStoreError::Conflict | UnitStoreError::CommittedNeedsReload => {
-            UserUnitManagerError::Storage
-        }
+        UnitStoreError::CommittedNeedsReload => UserUnitManagerError::CommittedNeedsReload,
+        UnitStoreError::Conflict => UserUnitManagerError::ConcurrentMutation,
         UnitStoreError::Unavailable
         | UnitStoreError::InsecurePermissions
         | UnitStoreError::WrongOwner
@@ -1900,6 +2198,7 @@ mod tests {
         replace_calls: AtomicUsize,
         reload_required: AtomicBool,
         commit_needs_reload: AtomicBool,
+        fail_clear_once: AtomicBool,
     }
 
     impl MemoryStore {
@@ -1916,6 +2215,15 @@ mod tests {
     }
 
     impl UserUnitStore for &MemoryStore {
+        fn lock_unit<'a>(
+            &'a self,
+            _unit_name: &str,
+            _cancellation: &CancellationToken,
+            _timeout: Duration,
+        ) -> Result<Box<dyn UnitOperationGuard + 'a>, UnitStoreError> {
+            Ok(Box::new(()))
+        }
+
         fn inspect(&self, _unit_name: &str) -> Result<StoredUnit, UnitStoreError> {
             Ok(self.value())
         }
@@ -1925,6 +2233,9 @@ mod tests {
         }
 
         fn clear_reload_required(&self, _unit_name: &str) -> Result<(), UnitStoreError> {
+            if self.fail_clear_once.swap(false, Ordering::AcqRel) {
+                return Err(UnitStoreError::CommittedNeedsReload);
+            }
             self.reload_required.store(false, Ordering::Release);
             Ok(())
         }
@@ -2201,6 +2512,51 @@ mod tests {
         assert_eq!(commands.maximum.load(Ordering::Acquire), 1);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn independent_stores_serialize_with_durable_advisory_lock() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let config = temporary.path().join("config");
+        let first = SystemUserUnitStore::new(&config).unwrap();
+        let second = SystemUserUnitStore::new(&config).unwrap();
+        let cancellation = CancellationToken::new();
+        let held = first
+            .lock_unit(
+                "rustscale-tray.service",
+                &cancellation,
+                Duration::from_secs(2),
+            )
+            .unwrap();
+        let acquired = Arc::new(AtomicBool::new(false));
+        let acquired_in_thread = acquired.clone();
+        let thread = thread::spawn(move || {
+            let cancellation = CancellationToken::new();
+            let _guard = second
+                .lock_unit(
+                    "rustscale-tray.service",
+                    &cancellation,
+                    Duration::from_secs(2),
+                )
+                .unwrap();
+            acquired_in_thread.store(true, Ordering::Release);
+        });
+        thread::sleep(Duration::from_millis(80));
+        assert!(!acquired.load(Ordering::Acquire));
+        drop(held);
+        thread.join().unwrap();
+        assert!(acquired.load(Ordering::Acquire));
+        assert_eq!(
+            std::fs::metadata(first.unit_directory().join(".rustscale-tray.service.lock"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
     #[test]
     fn interrupted_update_does_not_publish() {
         let old = unit(&["old"]).render().unwrap();
@@ -2222,6 +2578,15 @@ mod tests {
         }
 
         impl UserUnitStore for &RacingStore {
+            fn lock_unit<'a>(
+                &'a self,
+                _unit_name: &str,
+                _cancellation: &CancellationToken,
+                _timeout: Duration,
+            ) -> Result<Box<dyn UnitOperationGuard + 'a>, UnitStoreError> {
+                Ok(Box::new(()))
+            }
+
             fn inspect(&self, _unit_name: &str) -> Result<StoredUnit, UnitStoreError> {
                 Ok(self.value.lock().unwrap().clone())
             }
@@ -2271,10 +2636,104 @@ mod tests {
             )
             .update(&unit(&["new"]), &CancellationToken::new())
             .unwrap_err(),
-            UserUnitManagerError::Storage
+            UserUnitManagerError::ConcurrentMutation
         );
         assert_eq!(*store.value.lock().unwrap(), StoredUnit::Regular(foreign));
         assert_eq!(commands.commands().len(), 1);
+    }
+
+    #[test]
+    fn postcommit_inspection_failure_never_reloads_unvalidated_bytes() {
+        struct InspectionFaultStore {
+            value: Mutex<StoredUnit>,
+            pending: AtomicBool,
+            fail_inspection: AtomicBool,
+        }
+
+        impl UserUnitStore for &InspectionFaultStore {
+            fn lock_unit<'a>(
+                &'a self,
+                _unit_name: &str,
+                _cancellation: &CancellationToken,
+                _timeout: Duration,
+            ) -> Result<Box<dyn UnitOperationGuard + 'a>, UnitStoreError> {
+                Ok(Box::new(()))
+            }
+
+            fn inspect(&self, _unit_name: &str) -> Result<StoredUnit, UnitStoreError> {
+                if self.fail_inspection.swap(false, Ordering::AcqRel) {
+                    return Err(UnitStoreError::Io);
+                }
+                Ok(self.value.lock().unwrap().clone())
+            }
+
+            fn reload_required(&self, _unit_name: &str) -> Result<bool, UnitStoreError> {
+                Ok(self.pending.load(Ordering::Acquire))
+            }
+
+            fn clear_reload_required(&self, _unit_name: &str) -> Result<(), UnitStoreError> {
+                self.pending.store(false, Ordering::Release);
+                Ok(())
+            }
+
+            fn atomic_replace(
+                &self,
+                _unit_name: &str,
+                _expected: Option<&[u8]>,
+                contents: &[u8],
+                _cancellation: &CancellationToken,
+            ) -> Result<(), UnitStoreError> {
+                *self.value.lock().unwrap() = StoredUnit::Regular(contents.to_vec());
+                self.pending.store(true, Ordering::Release);
+                self.fail_inspection.store(true, Ordering::Release);
+                Err(UnitStoreError::CommittedNeedsReload)
+            }
+
+            fn atomic_remove(
+                &self,
+                _unit_name: &str,
+                _expected: &[u8],
+                _cancellation: &CancellationToken,
+            ) -> Result<(), UnitStoreError> {
+                Err(UnitStoreError::Conflict)
+            }
+        }
+
+        let store = InspectionFaultStore {
+            value: Mutex::new(StoredUnit::Missing),
+            pending: AtomicBool::new(false),
+            fail_inspection: AtomicBool::new(false),
+        };
+        let commands = FakeCommands::default();
+        assert_eq!(
+            UserUnitManager::with_transports(
+                &store,
+                &commands,
+                UserSession::Supported,
+                Duration::from_secs(2),
+            )
+            .install(&unit(&[]), &CancellationToken::new())
+            .unwrap_err(),
+            UserUnitManagerError::CommittedNeedsReload
+        );
+        assert!(store.pending.load(Ordering::Acquire));
+        assert!(!commands
+            .commands()
+            .iter()
+            .any(|command| command.arguments == ["--user", "daemon-reload"]));
+
+        let retry = FakeCommands::default();
+        assert_eq!(
+            UserUnitManager::with_transports(
+                &store,
+                &retry,
+                UserSession::Supported,
+                Duration::from_secs(2),
+            )
+            .install(&unit(&[]), &CancellationToken::new()),
+            Ok(Change::Unchanged)
+        );
+        assert!(!store.pending.load(Ordering::Acquire));
     }
 
     #[test]
@@ -2342,6 +2801,25 @@ mod tests {
     }
 
     #[test]
+    fn committed_remove_cleanup_failure_reloads_only_validated_absence() {
+        let bytes = unit(&[]).render().unwrap();
+        let store = MemoryStore::with(StoredUnit::Regular(bytes));
+        store.commit_needs_reload.store(true, Ordering::Release);
+        let disabled = status("disabled");
+        let commands = FakeCommands::with(vec![ok(b"252\n"), ok(&disabled), ok(b"")]);
+        assert_eq!(
+            manager(&store, &commands).remove("tray", &CancellationToken::new()),
+            Ok(Change::Changed)
+        );
+        assert_eq!(store.value(), StoredUnit::Missing);
+        assert!(!store.reload_required.load(Ordering::Acquire));
+        assert!(commands
+            .commands()
+            .iter()
+            .any(|command| command.arguments == ["--user", "daemon-reload"]));
+    }
+
+    #[test]
     fn committed_sync_failure_reloads_and_clears_durable_journal() {
         let store = MemoryStore::default();
         store.commit_needs_reload.store(true, Ordering::Release);
@@ -2367,6 +2845,44 @@ mod tests {
         assert!(!store.reload_required.load(Ordering::Acquire));
         assert_eq!(
             commands
+                .commands()
+                .iter()
+                .filter(|command| command.arguments == ["--user", "daemon-reload"])
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn postcommit_journal_clear_failure_is_retryable() {
+        let store = MemoryStore::default();
+        store.commit_needs_reload.store(true, Ordering::Release);
+        store.fail_clear_once.store(true, Ordering::Release);
+        let commands = FakeCommands::default();
+        assert_eq!(
+            manager(&store, &commands)
+                .install(&unit(&[]), &CancellationToken::new())
+                .unwrap_err(),
+            UserUnitManagerError::CommittedNeedsReload
+        );
+        assert!(store.reload_required.load(Ordering::Acquire));
+        assert_eq!(
+            commands
+                .commands()
+                .iter()
+                .filter(|command| command.arguments == ["--user", "daemon-reload"])
+                .count(),
+            1
+        );
+
+        let retry_commands = FakeCommands::default();
+        assert_eq!(
+            manager(&store, &retry_commands).install(&unit(&[]), &CancellationToken::new()),
+            Ok(Change::Unchanged)
+        );
+        assert!(!store.reload_required.load(Ordering::Acquire));
+        assert_eq!(
+            retry_commands
                 .commands()
                 .iter()
                 .filter(|command| command.arguments == ["--user", "daemon-reload"])
@@ -2606,6 +3122,16 @@ mod tests {
         store
             .atomic_replace("rustscale-tray.service", None, &bytes, &token)
             .unwrap();
+        let journal = std::fs::read_to_string(
+            store
+                .unit_directory()
+                .join(".rustscale-tray.service.operation"),
+        )
+        .unwrap();
+        assert!(journal.contains("version=1\nunit=rustscale-tray.service\n"));
+        assert!(journal.contains("operation=.rustscale-tray.service.tmp."));
+        assert!(journal.contains("before=missing\n"));
+        assert!(journal.contains("after-hash="));
         let directory_mode = std::fs::metadata(store.unit_directory())
             .unwrap()
             .permissions()

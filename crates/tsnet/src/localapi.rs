@@ -1132,7 +1132,7 @@ pub(crate) async fn handle_admitted_tka_init<W: AsyncRead + AsyncWrite + Unpin>(
     lock: &Arc<crate::tailnet_lock::TailnetLock>,
     request: crate::tailnet_lock::InitRequest,
 ) -> Result<(), std::io::Error> {
-    let flight = match lock.start_init(request) {
+    let flight = match lock.start_init(request).await {
         Ok(flight) => flight,
         Err(error) => {
             write_tka_error(conn, &error).await?;

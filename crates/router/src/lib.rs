@@ -566,6 +566,14 @@ impl<P: Platform, R: CommandRunner> StatefulRouter<P, R> {
         first_error.map_or(Ok(()), Err)
     }
 
+    fn forget_superseded_cleanup(&mut self, replacements: &[CommandSpec]) {
+        // A verified rebuild owns the exact replacement now. Retire only
+        // byte-for-byte matching inverses; nearby family, priority, protocol,
+        // or unrelated rollback commands still need their original retry.
+        self.pending_cleanup
+            .retain(|pending| !replacements.contains(pending));
+    }
+
     fn rollback_startup(&mut self, rollback: Vec<CommandSpec>) -> Vec<RouterError> {
         let mut errors = Vec::new();
         for (program, args) in rollback.into_iter().rev() {
@@ -643,8 +651,10 @@ impl<P: Platform, R: CommandRunner> Router for StatefulRouter<P, R> {
     }
 
     fn block_direct(&mut self) -> Result<(), RouterError> {
+        let replacements = self.platform.commands(&RouterOperation::EnableDirectBlock);
         if self.direct_blocked {
             if self.verify_direct_block(true).is_ok() {
+                self.forget_superseded_cleanup(&replacements);
                 return Ok(());
             }
             // An uncertain/partial unblock invalidates prior verification.
@@ -654,15 +664,30 @@ impl<P: Platform, R: CommandRunner> Router for StatefulRouter<P, R> {
         }
         self.apply(&[RouterOperation::EnableDirectBlock])?;
         self.direct_blocked = true;
-        self.verify_direct_block(true)
+        self.verify_direct_block(true)?;
+        self.forget_superseded_cleanup(&replacements);
+        Ok(())
     }
 
     fn unblock_direct(&mut self) -> Result<(), RouterError> {
         if !self.direct_blocked {
             return Ok(());
         }
-        self.apply(&[RouterOperation::DisableDirectBlock])?;
-        self.verify_direct_block(false)?;
+        let result = self
+            .apply(&[RouterOperation::DisableDirectBlock])
+            .and_then(|()| self.verify_direct_block(false));
+        if let Err(primary) = result {
+            // Disable commands and verification can fail after partially
+            // changing kernel state. Never return through that uncertainty:
+            // immediately reinstall and verify the exact owned block.
+            return match self.block_direct() {
+                Ok(()) => Err(primary),
+                Err(reblock) => Err(RouterError::Transaction {
+                    primary: Box::new(primary),
+                    rollback: vec![reblock],
+                }),
+            };
+        }
         self.direct_blocked = false;
         Ok(())
     }
@@ -711,6 +736,31 @@ impl<P: Platform, R: CommandRunner> Router for StatefulRouter<P, R> {
 }
 
 #[cfg(target_os = "macos")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DarwinPfTokenState {
+    None,
+    Active(String),
+    ReleasePending(String),
+}
+
+#[cfg(target_os = "macos")]
+impl DarwinPfTokenState {
+    fn token(&self) -> Option<&str> {
+        match self {
+            Self::None => None,
+            Self::Active(token) | Self::ReleasePending(token) => Some(token),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DarwinOwnerRecord {
+    pid: u32,
+    pf_token: DarwinPfTokenState,
+}
+
+#[cfg(target_os = "macos")]
 struct DarwinPlatform {
     tun_name: String,
     owner_token: String,
@@ -719,7 +769,9 @@ struct DarwinPlatform {
     block_file: std::path::PathBuf,
     block_file_error: Option<String>,
     adopted_stale_owner: std::sync::atomic::AtomicBool,
-    adopted_pf_token: std::sync::Mutex<Option<String>>,
+    adopted_pf_token: std::sync::Mutex<DarwinPfTokenState>,
+    #[cfg(test)]
+    fail_owner_writes: std::sync::atomic::AtomicUsize,
 }
 
 #[cfg(target_os = "macos")]
@@ -763,35 +815,58 @@ impl DarwinPlatform {
             block_file,
             block_file_error: create_result.err().map(|error| error.to_string()),
             adopted_stale_owner: std::sync::atomic::AtomicBool::new(false),
-            adopted_pf_token: std::sync::Mutex::new(None),
+            adopted_pf_token: std::sync::Mutex::new(DarwinPfTokenState::None),
+            #[cfg(test)]
+            fail_owner_writes: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
-    fn owner_record(&self, pf_token: Option<&str>) -> String {
+    fn owner_record(&self, pf_token: &DarwinPfTokenState) -> String {
+        let (state, token) = match pf_token {
+            DarwinPfTokenState::None => ("none", "-"),
+            DarwinPfTokenState::Active(token) => ("active", token.as_str()),
+            DarwinPfTokenState::ReleasePending(token) => ("release-pending", token.as_str()),
+        };
         format!(
-            "1 {} {} {} {} {}\n",
+            "2 {} {} {} {} {state} {token}\n",
             std::process::id(),
             self.owner_token,
             self.tun_name,
             self.block_anchor,
-            pf_token.unwrap_or("-")
         )
     }
 
     fn write_owner_record(
         &self,
-        pf_token: Option<&str>,
+        pf_token: &DarwinPfTokenState,
         create_new: bool,
     ) -> Result<(), RouterError> {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
+        #[cfg(test)]
+        if self
+            .fail_owner_writes
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |remaining| remaining.checked_sub(1),
+            )
+            .is_ok()
+        {
+            return Err(RouterError::Io(std::io::Error::other(
+                "injected Darwin owner-record write failure",
+            )));
+        }
+        static NEXT_REPLACEMENT: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
         let target = if create_new {
             self.owner_file.clone()
         } else {
             self.owner_file.with_extension(format!(
-                "replace-{}-{}",
+                "replace-{}-{}-{}",
                 std::process::id(),
-                self.owner_token
+                self.owner_token,
+                NEXT_REPLACEMENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             ))
         };
         let mut file = std::fs::OpenOptions::new()
@@ -813,17 +888,20 @@ impl DarwinPlatform {
                 return Err(RouterError::Io(error));
             }
         }
-        Ok(())
+        let parent = self.owner_file.parent().ok_or_else(|| {
+            RouterError::InvalidConfig("Darwin PF owner record has no parent".into())
+        })?;
+        std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(RouterError::Io)
     }
 
-    fn parse_owner_record(&self, record: &str) -> Result<(u32, Option<String>), RouterError> {
+    fn parse_owner_record(&self, record: &str) -> Result<DarwinOwnerRecord, RouterError> {
         let fields: Vec<_> = record.split_whitespace().collect();
-        if fields.len() != 6
-            || fields[0] != "1"
-            || fields[2] != self.owner_token
-            || fields[3] != self.tun_name
-            || fields[4] != self.block_anchor
-        {
+        let identity_matches = fields.get(2) == Some(&self.owner_token.as_str())
+            && fields.get(3) == Some(&self.tun_name.as_str())
+            && fields.get(4) == Some(&self.block_anchor.as_str());
+        if !identity_matches {
             return Err(RouterError::InvalidConfig(
                 "foreign or malformed Darwin PF ownership record".into(),
             ));
@@ -831,24 +909,31 @@ impl DarwinPlatform {
         let pid = fields[1].parse::<u32>().map_err(|_| {
             RouterError::InvalidConfig("malformed Darwin PF owner process ID".into())
         })?;
-        let pf_token = match fields[5] {
-            "-" => None,
-            token if token.bytes().all(|byte| byte.is_ascii_digit()) => Some(token.to_owned()),
+        let valid_token =
+            |token: &str| !token.is_empty() && token.bytes().all(|byte| byte.is_ascii_digit());
+        let pf_token = match fields.as_slice() {
+            // Version 1 records predate release-pending and are active tokens.
+            ["1", _, _, _, _, "-"] => DarwinPfTokenState::None,
+            ["1", _, _, _, _, token] if valid_token(token) => {
+                DarwinPfTokenState::Active((*token).to_owned())
+            }
+            ["2", _, _, _, _, "none", "-"] => DarwinPfTokenState::None,
+            ["2", _, _, _, _, "active", token] if valid_token(token) => {
+                DarwinPfTokenState::Active((*token).to_owned())
+            }
+            ["2", _, _, _, _, "release-pending", token] if valid_token(token) => {
+                DarwinPfTokenState::ReleasePending((*token).to_owned())
+            }
             _ => {
                 return Err(RouterError::InvalidConfig(
-                    "malformed Darwin PF enable token".into(),
+                    "malformed Darwin PF enable-token state".into(),
                 ));
             }
         };
-        Ok((pid, pf_token))
+        Ok(DarwinOwnerRecord { pid, pf_token })
     }
 
-    fn record_pf_token(&self, token: Option<&str>) -> Result<(), RouterError> {
-        if token.is_some_and(|token| !token.bytes().all(|byte| byte.is_ascii_digit())) {
-            return Err(RouterError::InvalidConfig(
-                "pfctl returned a non-numeric enable token".into(),
-            ));
-        }
+    fn owned_record(&self) -> Result<DarwinOwnerRecord, RouterError> {
         let metadata = std::fs::symlink_metadata(&self.owner_file).map_err(RouterError::Io)?;
         if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
             return Err(RouterError::InvalidConfig(
@@ -856,15 +941,26 @@ impl DarwinPlatform {
             ));
         }
         let record = std::fs::read_to_string(&self.owner_file).map_err(RouterError::Io)?;
-        if !self
-            .parse_owner_record(&record)
-            .is_ok_and(|(pid, _)| pid == std::process::id())
-        {
+        let record = self.parse_owner_record(&record)?;
+        if record.pid != std::process::id() {
             return Err(RouterError::InvalidConfig(
                 "Darwin PF owner record changed before token update".into(),
             ));
         }
-        self.write_owner_record(token, false)
+        Ok(record)
+    }
+
+    fn record_pf_token(&self, state: &DarwinPfTokenState) -> Result<(), RouterError> {
+        if state
+            .token()
+            .is_some_and(|token| !token.bytes().all(|byte| byte.is_ascii_digit()))
+        {
+            return Err(RouterError::InvalidConfig(
+                "pfctl returned a non-numeric enable token".into(),
+            ));
+        }
+        self.owned_record()?;
+        self.write_owner_record(state, false)
     }
 
     fn route(&self, verb: &str, prefix: IpPrefix) -> (String, Vec<String>) {
@@ -900,6 +996,34 @@ impl DarwinPlatform {
             args.push("-alias".into());
         }
         ("ifconfig".into(), args)
+    }
+
+    fn retire_pf_token(
+        &self,
+        runner: &mut dyn CommandRunner,
+        expected_token: &str,
+    ) -> Result<(), RouterError> {
+        let owner = self.owned_record()?;
+        match &owner.pf_token {
+            DarwinPfTokenState::Active(token) if token == expected_token => {
+                // This durable transition must precede pfctl -X. A crash or
+                // uncertain command can then retry exactly this token.
+                self.record_pf_token(&DarwinPfTokenState::ReleasePending(token.clone()))?;
+            }
+            DarwinPfTokenState::ReleasePending(token) if token == expected_token => {}
+            state => {
+                return Err(RouterError::InvalidConfig(format!(
+                    "Darwin PF token state changed before retirement: {state:?}"
+                )));
+            }
+        }
+
+        // Anchor state says nothing about whether PF consumed this enable
+        // reference. Keep release-pending on every uncertain failure. A retry
+        // may clear it only after -X succeeds or reports the exact token is no
+        // longer present.
+        release_pf_token_once(runner, expected_token)?;
+        self.record_pf_token(&DarwinPfTokenState::None)
     }
 }
 
@@ -938,7 +1062,7 @@ impl Platform for DarwinPlatform {
             ));
         }
 
-        match self.write_owner_record(None, true) {
+        match self.write_owner_record(&DarwinPfTokenState::None, true) {
             Ok(()) => Ok(()),
             Err(RouterError::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 let owner_metadata =
@@ -953,32 +1077,34 @@ impl Platform for DarwinPlatform {
                     ));
                 }
                 let record = std::fs::read_to_string(&self.owner_file).map_err(RouterError::Io)?;
-                let (pid, pf_token) = self.parse_owner_record(&record)?;
-                if pid == std::process::id() {
-                    return Ok(());
+                let owner = self.parse_owner_record(&record)?;
+                if owner.pid == std::process::id() {
+                    // A prior create may have reached the directory-sync
+                    // boundary before reporting failure. Rewrite and fsync the
+                    // same state before treating this claim as durable.
+                    return self.write_owner_record(&owner.pf_token, false);
                 }
                 let live = Command::new("kill")
-                    .args(["-0", &pid.to_string()])
+                    .args(["-0", &owner.pid.to_string()])
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
                     .status()
                     .is_ok_and(|status| status.success());
                 if live {
                     return Err(RouterError::InvalidConfig(format!(
-                        "Darwin PF owner {pid} is still active for {}",
-                        self.tun_name
+                        "Darwin PF owner {} is still active for {}",
+                        owner.pid, self.tun_name
                     )));
                 }
-                // Atomically replace the dead owner's record while
-                // carrying its PF token forward. A second crash before
-                // anchor recovery must still leave enough durable state
-                // for the next process to release that token.
-                self.write_owner_record(pf_token.as_deref(), false)?;
+                // Atomically replace the dead owner's record while carrying
+                // its active or release-pending token forward. A second crash
+                // before anchor recovery retains the same retirement state.
+                self.write_owner_record(&owner.pf_token, false)?;
                 self.adopted_stale_owner
                     .store(true, std::sync::atomic::Ordering::Release);
                 *self.adopted_pf_token.lock().map_err(|_| {
                     RouterError::InvalidConfig("Darwin PF token ownership lock poisoned".into())
-                })? = pf_token;
+                })? = owner.pf_token;
                 Ok(())
             }
             Err(error) => Err(error),
@@ -991,7 +1117,7 @@ impl Platform for DarwinPlatform {
         };
         if self
             .parse_owner_record(&record)
-            .is_ok_and(|(pid, _)| pid == std::process::id())
+            .is_ok_and(|record| record.pid == std::process::id())
         {
             let _ = std::fs::remove_file(&self.owner_file);
         }
@@ -1022,20 +1148,21 @@ impl Platform for DarwinPlatform {
                 ));
             }
         }
-        let token = self
+        let token_state = self
             .adopted_pf_token
             .lock()
             .map_err(|_| {
                 RouterError::InvalidConfig("Darwin PF token ownership lock poisoned".into())
             })?
             .clone();
-        if let Some(token) = token {
-            runner.run("pfctl", &["-X".into(), token])?;
+        if let Some(token) = token_state.token() {
+            self.retire_pf_token(runner, token)?;
+        } else {
+            self.record_pf_token(&DarwinPfTokenState::None)?;
         }
-        self.record_pf_token(None)?;
         *self.adopted_pf_token.lock().map_err(|_| {
             RouterError::InvalidConfig("Darwin PF token ownership lock poisoned".into())
-        })? = None;
+        })? = DarwinPfTokenState::None;
         self.adopted_stale_owner
             .store(false, std::sync::atomic::Ordering::Release);
         Ok(())
@@ -1122,6 +1249,43 @@ fn pf_enable_token(output: &str) -> Option<String> {
 }
 
 #[cfg(target_os = "macos")]
+fn pf_token_definitively_absent(error: &RouterError, expected_token: &str) -> bool {
+    let RouterError::Command {
+        program,
+        args,
+        stderr,
+        ..
+    } = error
+    else {
+        return false;
+    };
+    if program != "pfctl" || args.len() != 2 || args[0] != "-X" || args[1] != expected_token {
+        return false;
+    }
+    let stderr = stderr.trim().to_ascii_lowercase();
+    let outcome = stderr.strip_prefix("pfctl: ").unwrap_or(&stderr);
+    matches!(
+        outcome,
+        "pf: token invalid"
+            | "pf: token invalid: invalid argument"
+            | "pf not enabled"
+            | "no pf_enabled references"
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn release_pf_token_once(
+    runner: &mut dyn CommandRunner,
+    expected_token: &str,
+) -> Result<(), RouterError> {
+    match runner.run("pfctl", &["-X".into(), expected_token.into()]) {
+        Ok(()) => Ok(()),
+        Err(error) if pf_token_definitively_absent(&error, expected_token) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn pf_block_rules_exact(rules: &str, tun_name: &str) -> bool {
     let lines: Vec<_> = rules
         .lines()
@@ -1163,21 +1327,74 @@ impl DarwinRouter {
             .runner
             .output("pfctl", &["-s".into(), "info".into()])?;
         if pf_is_enabled(&status) {
+            // Recover an in-process uncertain persistence/command result. The
+            // owner record remains authoritative even when the previous call
+            // returned before updating the in-memory token slot.
+            if self.pf_enable_token.is_none() {
+                self.pf_enable_token = self
+                    .inner
+                    .platform
+                    .owned_record()?
+                    .pf_token
+                    .token()
+                    .map(str::to_owned);
+            }
             return Ok(());
         }
         let enabled = self.inner.runner.output("pfctl", &["-E".into()])?;
         let token = pf_enable_token(&enabled).ok_or_else(|| {
             RouterError::InvalidConfig("pfctl enabled PF without returning a teardown token".into())
         })?;
-        if let Err(error) = self.inner.platform.record_pf_token(Some(&token)) {
-            let _ = self.inner.runner.run("pfctl", &["-X".into(), token]);
-            return Err(error);
+        if let Err(record_error) = self
+            .inner
+            .platform
+            .record_pf_token(&DarwinPfTokenState::Active(token.clone()))
+        {
+            match release_pf_token_once(&mut self.inner.runner, &token) {
+                Ok(()) => {
+                    // The failed active write may have become visible before
+                    // its directory fsync failed. Clear that consumed token;
+                    // if clearing is also uncertain, retain it in memory so
+                    // close/retry cannot discard the durable record.
+                    if let Err(clear_error) = self
+                        .inner
+                        .platform
+                        .record_pf_token(&DarwinPfTokenState::None)
+                    {
+                        self.pf_enable_token = Some(token);
+                        return Err(RouterError::Transaction {
+                            primary: Box::new(record_error),
+                            rollback: vec![clear_error],
+                        });
+                    }
+                    return Err(record_error);
+                }
+                Err(release_error) => {
+                    // Compensation also failed. Make the token
+                    // release-pending if any subsequent owner-record write is
+                    // possible, preserving both in-process and crash recovery.
+                    let pending_error = self
+                        .inner
+                        .platform
+                        .record_pf_token(&DarwinPfTokenState::ReleasePending(token.clone()))
+                        .err();
+                    self.pf_enable_token = Some(token);
+                    let mut rollback = vec![release_error];
+                    if let Some(error) = pending_error {
+                        rollback.push(error);
+                    }
+                    return Err(RouterError::Transaction {
+                        primary: Box::new(record_error),
+                        rollback,
+                    });
+                }
+            }
         }
         self.pf_enable_token = Some(token);
         Ok(())
     }
 
-    fn verify_pf_block(&mut self, expected: bool) -> Result<(), RouterError> {
+    fn pf_block_state(&mut self) -> Result<bool, RouterError> {
         let rules = self.inner.runner.output(
             "pfctl",
             &[
@@ -1186,7 +1403,19 @@ impl DarwinRouter {
                 "-sr".into(),
             ],
         )?;
-        let active = pf_block_active(&rules, &self.inner.platform.tun_name);
+        if rules.trim().is_empty() {
+            Ok(false)
+        } else if pf_block_active(&rules, &self.inner.platform.tun_name) {
+            Ok(true)
+        } else {
+            Err(RouterError::InvalidConfig(
+                "foreign rules found in owned Darwin PF anchor".into(),
+            ))
+        }
+    }
+
+    fn verify_pf_block(&mut self, expected: bool) -> Result<(), RouterError> {
+        let active = self.pf_block_state()?;
         if active == expected {
             Ok(())
         } else {
@@ -1198,11 +1427,22 @@ impl DarwinRouter {
 
     fn release_pf_enable_token(&mut self) -> Result<(), RouterError> {
         if let Some(token) = self.pf_enable_token.clone() {
-            self.inner.runner.run("pfctl", &["-X".into(), token])?;
-            self.inner.platform.record_pf_token(None)?;
+            self.inner
+                .platform
+                .retire_pf_token(&mut self.inner.runner, &token)?;
             self.pf_enable_token = None;
         }
         Ok(())
+    }
+
+    fn restore_after_unblock_error(&mut self, primary: RouterError) -> RouterError {
+        match self.block_direct() {
+            Ok(()) => primary,
+            Err(reblock) => RouterError::Transaction {
+                primary: Box::new(primary),
+                rollback: vec![reblock],
+            },
+        }
     }
 }
 
@@ -1215,23 +1455,39 @@ impl Router for DarwinRouter {
         self.inner.set(config)
     }
     fn block_direct(&mut self) -> Result<(), RouterError> {
+        // Never flush or overwrite foreign rules, even while recovering an
+        // uncertain unblock. Inspect before enabling PF so a foreign anchor
+        // cannot make us acquire an enable token we are then unable to retire.
+        let already_active = self.pf_block_state()?;
         self.ensure_pf_enabled()?;
-        self.inner.block_direct()?;
-        if self.verify_pf_block(true).is_ok() {
+        if already_active {
+            self.inner.direct_blocked = true;
             return Ok(());
         }
+        self.inner.block_direct()?;
+        match self.pf_block_state() {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(foreign) => return Err(foreign),
+        }
         // A prior partial unblock may leave the inner state marked active
-        // while the evaluated anchor is incomplete. Flush and freshly load
-        // the exact anchor before authorizing route mutation.
+        // while the evaluated anchor is incomplete. Flush exact remnants and
+        // freshly load the full block before authorizing route mutation.
         self.inner.unblock_direct()?;
         self.ensure_pf_enabled()?;
         self.inner.block_direct()?;
         self.verify_pf_block(true)
     }
     fn unblock_direct(&mut self) -> Result<(), RouterError> {
-        self.inner.unblock_direct()?;
-        self.verify_pf_block(false)?;
-        self.release_pf_enable_token()
+        let result = self
+            .inner
+            .unblock_direct()
+            .and_then(|()| self.verify_pf_block(false))
+            .and_then(|()| self.release_pf_enable_token());
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => Err(self.restore_after_unblock_error(error)),
+        }
     }
     fn close(&mut self) -> Result<(), RouterError> {
         self.block_direct()?;
@@ -1250,14 +1506,18 @@ impl Router for DarwinRouter {
                 Err(error) => Err(RouterError::Io(error)),
             }
         })();
-        if result.is_ok() {
-            if owned {
-                self.inner.platform.release_ownership();
+        match result {
+            Ok(()) => {
+                if owned {
+                    self.inner.platform.release_ownership();
+                }
+                Ok(())
             }
-        } else {
-            self.inner.ownership_claimed = owned;
+            Err(error) => {
+                self.inner.ownership_claimed = owned;
+                Err(self.restore_after_unblock_error(error))
+            }
         }
-        result
     }
 }
 
@@ -2309,6 +2569,93 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
+    #[derive(Clone, Copy)]
+    enum PfReleaseFault {
+        Transient,
+        TokenAbsent,
+    }
+
+    #[cfg(target_os = "macos")]
+    struct PfFaultRunner {
+        rules: String,
+        fail_query_at: Option<usize>,
+        query_calls: usize,
+        fail_flush: bool,
+        release_fault: Option<PfReleaseFault>,
+        commands: Vec<CommandSpec>,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl CommandRunner for PfFaultRunner {
+        fn run(&mut self, program: &str, args: &[String]) -> Result<(), RouterError> {
+            self.commands.push((program.into(), args.to_vec()));
+            if args.first().is_some_and(|arg| arg == "-X") {
+                match self.release_fault {
+                    Some(PfReleaseFault::Transient) => {
+                        return Err(RouterError::Command {
+                            program: program.into(),
+                            args: args.to_vec(),
+                            exit_code: Some(1),
+                            stderr: "pfctl: /dev/pf: Device busy".into(),
+                        });
+                    }
+                    Some(PfReleaseFault::TokenAbsent) => {
+                        return Err(RouterError::Command {
+                            program: program.into(),
+                            args: args.to_vec(),
+                            exit_code: Some(1),
+                            stderr: "pfctl: pf: token invalid: Invalid argument".into(),
+                        });
+                    }
+                    None => {}
+                }
+            }
+            if args.windows(2).any(|pair| pair == ["-F", "rules"]) {
+                if self.fail_flush {
+                    return Err(RouterError::InvalidConfig(
+                        "injected PF anchor flush failure".into(),
+                    ));
+                }
+                self.rules.clear();
+            }
+            Ok(())
+        }
+
+        fn output(&mut self, program: &str, args: &[String]) -> Result<String, RouterError> {
+            self.commands.push((program.into(), args.to_vec()));
+            self.query_calls += 1;
+            if self.fail_query_at == Some(self.query_calls) {
+                return Err(RouterError::InvalidConfig(
+                    "injected PF anchor query failure".into(),
+                ));
+            }
+            Ok(self.rules.clone())
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn darwin_test_state(name: &str) -> std::path::PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "rustscale-router-{name}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn pf_fault_runner(rules: &str) -> PfFaultRunner {
+        PfFaultRunner {
+            rules: rules.into(),
+            fail_query_at: None,
+            query_calls: 0,
+            fail_flush: false,
+            release_fault: None,
+            commands: Vec::new(),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
     #[test]
     fn darwin_adopts_exact_stale_anchor_and_enable_token() {
         use std::io::Write as _;
@@ -2347,6 +2694,179 @@ mod tests {
             .commands
             .iter()
             .any(|(_, args)| args.windows(2).any(|pair| pair == ["-X", "12345"])));
+        platform.release_ownership();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_stale_recovery_retains_owner_at_each_command_failure() {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        for failure in ["query", "flush", "verify", "release"] {
+            let state_dir = darwin_test_state("pf-command-fault");
+            let platform = DarwinPlatform::new("utun-fault", Some(&state_dir));
+            let mut owner = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&platform.owner_file)
+                .unwrap();
+            writeln!(
+                owner,
+                "2 {} {} {} {} active 11223",
+                u32::MAX,
+                platform.owner_token,
+                platform.tun_name,
+                platform.block_anchor
+            )
+            .unwrap();
+            drop(owner);
+            platform.claim_ownership().unwrap();
+            let mut runner =
+                pf_fault_runner("block drop out quick on ! utun-fault all flags S/SA\n");
+            match failure {
+                "query" => runner.fail_query_at = Some(1),
+                "flush" => runner.fail_flush = true,
+                "verify" => runner.fail_query_at = Some(2),
+                "release" => runner.release_fault = Some(PfReleaseFault::Transient),
+                _ => unreachable!(),
+            }
+
+            assert!(
+                platform.recover_stale_state(&mut runner).is_err(),
+                "{failure} fault unexpectedly recovered"
+            );
+            assert!(platform.stale_recovery_pending());
+            let token = platform.owned_record().unwrap().pf_token;
+            if failure == "release" {
+                assert_eq!(token, DarwinPfTokenState::ReleasePending("11223".into()));
+            } else {
+                assert_eq!(token, DarwinPfTokenState::Active("11223".into()));
+            }
+            platform.release_ownership();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_pf_token_retirement_is_durable_and_crash_idempotent() {
+        use std::sync::atomic::Ordering;
+        let state_dir = darwin_test_state("pf-token");
+        let platform = DarwinPlatform::new("utun-token", Some(&state_dir));
+        platform.claim_ownership().unwrap();
+        let active = DarwinPfTokenState::Active("12345".into());
+        platform.record_pf_token(&active).unwrap();
+
+        // The release-pending write is mandatory before pfctl -X.
+        platform.fail_owner_writes.store(1, Ordering::SeqCst);
+        let mut runner = pf_fault_runner("");
+        assert!(platform.retire_pf_token(&mut runner, "12345").is_err());
+        assert!(runner.commands.is_empty());
+        assert_eq!(platform.owned_record().unwrap().pf_token, active);
+
+        // Transient command failures retain the durable release ownership,
+        // regardless of the empty anchor. A successful retry clears it.
+        runner.release_fault = Some(PfReleaseFault::Transient);
+        for _ in 0..2 {
+            assert!(platform.retire_pf_token(&mut runner, "12345").is_err());
+            assert_eq!(
+                platform.owned_record().unwrap().pf_token,
+                DarwinPfTokenState::ReleasePending("12345".into())
+            );
+        }
+        runner.release_fault = None;
+        platform.retire_pf_token(&mut runner, "12345").unwrap();
+        assert_eq!(
+            platform.owned_record().unwrap().pf_token,
+            DarwinPfTokenState::None
+        );
+        assert_eq!(
+            runner
+                .commands
+                .iter()
+                .filter(|(_, args)| args.first().is_some_and(|arg| arg == "-X"))
+                .count(),
+            3
+        );
+        assert!(runner
+            .commands
+            .iter()
+            .all(|(_, args)| !args.iter().any(|arg| arg == "-sr")));
+
+        platform.release_ownership();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_pf_token_clear_write_failure_retries_same_token() {
+        use std::sync::atomic::Ordering;
+        let state_dir = darwin_test_state("pf-clear");
+        let platform = DarwinPlatform::new("utun-clear", Some(&state_dir));
+        platform.claim_ownership().unwrap();
+        platform
+            .record_pf_token(&DarwinPfTokenState::ReleasePending("67890".into()))
+            .unwrap();
+        platform.fail_owner_writes.store(1, Ordering::SeqCst);
+        let mut runner = pf_fault_runner("");
+
+        assert!(platform.retire_pf_token(&mut runner, "67890").is_err());
+        assert_eq!(
+            platform.owned_record().unwrap().pf_token,
+            DarwinPfTokenState::ReleasePending("67890".into())
+        );
+        runner.release_fault = Some(PfReleaseFault::TokenAbsent);
+        platform.retire_pf_token(&mut runner, "67890").unwrap();
+        assert_eq!(
+            platform.owned_record().unwrap().pf_token,
+            DarwinPfTokenState::None
+        );
+        platform.release_ownership();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_only_definitive_token_absence_completes_pending_release() {
+        for stderr in [
+            "pfctl: pf: token invalid: Invalid argument",
+            "pfctl: pf not enabled",
+            "pfctl: No pf_enabled references",
+        ] {
+            let error = RouterError::Command {
+                program: "pfctl".into(),
+                args: vec!["-X".into(), "24680".into()],
+                exit_code: Some(1),
+                stderr: stderr.into(),
+            };
+            assert!(pf_token_definitively_absent(&error, "24680"));
+            assert!(!pf_token_definitively_absent(&error, "13579"));
+        }
+
+        for stderr in [
+            "pfctl: /dev/pf: Device busy",
+            "pfctl: pf: token invalid: retry interrupted",
+        ] {
+            let transient = RouterError::Command {
+                program: "pfctl".into(),
+                args: vec!["-X".into(), "24680".into()],
+                exit_code: Some(1),
+                stderr: stderr.into(),
+            };
+            assert!(!pf_token_definitively_absent(&transient, "24680"));
+        }
+
+        let state_dir = darwin_test_state("pf-absent");
+        let platform = DarwinPlatform::new("utun-proof", Some(&state_dir));
+        platform.claim_ownership().unwrap();
+        platform
+            .record_pf_token(&DarwinPfTokenState::ReleasePending("24680".into()))
+            .unwrap();
+        let mut runner = pf_fault_runner("");
+        runner.release_fault = Some(PfReleaseFault::TokenAbsent);
+        platform.retire_pf_token(&mut runner, "24680").unwrap();
+        assert_eq!(
+            platform.owned_record().unwrap().pf_token,
+            DarwinPfTokenState::None
+        );
         platform.release_ownership();
     }
 
@@ -2465,6 +2985,149 @@ mod tests {
                 .cloned()
                 .unwrap_or_default())
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[derive(Default)]
+    struct DirectBlockFaultRunner {
+        active_families: std::collections::HashSet<String>,
+        commands: Vec<CommandSpec>,
+        fail_next_v6_delete: bool,
+        fail_next_v4_add: bool,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl DirectBlockFaultRunner {
+        fn is_owned_block(args: &[String]) -> bool {
+            matches!(args.first().map(String::as_str), Some("-4" | "-6"))
+                && args.windows(2).any(|pair| pair == ["protocol", "201"])
+                && args.windows(2).any(|pair| pair == ["pref", "5200"])
+                && args.iter().any(|arg| arg == "not")
+                && args.iter().any(|arg| arg == "unreachable")
+        }
+
+        fn command_error(program: &str, args: &[String], stderr: &str) -> RouterError {
+            RouterError::Command {
+                program: program.into(),
+                args: args.to_vec(),
+                exit_code: Some(2),
+                stderr: stderr.into(),
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl CommandRunner for DirectBlockFaultRunner {
+        fn run(&mut self, program: &str, args: &[String]) -> Result<(), RouterError> {
+            self.commands.push((program.into(), args.to_vec()));
+            if !Self::is_owned_block(args) {
+                return Ok(());
+            }
+            let family = args.first().cloned().unwrap_or_default();
+            if args.iter().any(|arg| arg == "del") {
+                if family == "-6" && self.fail_next_v6_delete {
+                    self.fail_next_v6_delete = false;
+                    return Err(Self::command_error(
+                        program,
+                        args,
+                        "RTNETLINK answers: Operation not permitted",
+                    ));
+                }
+                if !self.active_families.remove(&family) {
+                    return Err(Self::command_error(
+                        program,
+                        args,
+                        "RTNETLINK answers: No such process",
+                    ));
+                }
+            } else if args.iter().any(|arg| arg == "add") {
+                if family == "-4" && self.fail_next_v4_add {
+                    self.fail_next_v4_add = false;
+                    return Err(Self::command_error(
+                        program,
+                        args,
+                        "RTNETLINK answers: Operation not permitted",
+                    ));
+                }
+                if !self.active_families.insert(family) {
+                    return Err(Self::command_error(
+                        program,
+                        args,
+                        "RTNETLINK answers: File exists",
+                    ));
+                }
+            }
+            Ok(())
+        }
+
+        fn output(&mut self, program: &str, args: &[String]) -> Result<String, RouterError> {
+            self.commands.push((program.into(), args.to_vec()));
+            let family = args.first().cloned().unwrap_or_default();
+            if self.active_families.contains(&family) {
+                let pref = args.get(4).map_or("5200", String::as_str);
+                Ok(format!(
+                    "{pref}: not from all fwmark 0x80000/0xff0000 unreachable proto {}\n",
+                    LinuxPlatform::RULE_PROTOCOL
+                ))
+            } else {
+                Ok(String::new())
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_verified_reblock_retires_only_exact_pending_enables() {
+        let platform = LinuxPlatform::new_with_interface_index("tailscale0", 2);
+        let enables = platform.commands(&RouterOperation::EnableDirectBlock);
+        let mut router = StatefulRouter::new(platform, DirectBlockFaultRunner::default());
+        router.block_direct().unwrap();
+
+        let mut wrong_family = enables[0].clone();
+        wrong_family.1[0] = "-5".into();
+        let mut wrong_pref = enables[0].clone();
+        wrong_pref.1[4] = "5251".into();
+        let mut wrong_protocol = enables[0].clone();
+        wrong_protocol.1[9] = "99".into();
+        let unrelated = (
+            "ip".into(),
+            vec!["route".into(), "del".into(), "192.0.2.0/24".into()],
+        );
+        let retained = vec![wrong_family, wrong_pref, wrong_protocol, unrelated];
+        router.pending_cleanup.extend(retained.clone());
+
+        router.runner.fail_next_v6_delete = true;
+        router.runner.fail_next_v4_add = true;
+        assert!(router.unblock_direct().is_err());
+        assert!(router.direct_blocked);
+        assert_eq!(router.pending_cleanup, retained);
+
+        let before_set = router.runner.commands.len();
+        router.set(&RouterConfig::default()).unwrap();
+        assert!(router.pending_cleanup.is_empty());
+        assert!(router.runner.commands[before_set..]
+            .iter()
+            .all(|command| !enables.contains(command)));
+
+        let adds_before_close = router
+            .runner
+            .commands
+            .iter()
+            .filter(|(_, args)| {
+                DirectBlockFaultRunner::is_owned_block(args) && args.iter().any(|arg| arg == "add")
+            })
+            .count();
+        router.close().unwrap();
+        let adds_after_close = router
+            .runner
+            .commands
+            .iter()
+            .filter(|(_, args)| {
+                DirectBlockFaultRunner::is_owned_block(args) && args.iter().any(|arg| arg == "add")
+            })
+            .count();
+        assert_eq!(adds_after_close, adds_before_close);
+        assert!(router.runner.active_families.is_empty());
     }
 
     #[cfg(target_os = "linux")]

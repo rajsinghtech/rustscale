@@ -245,6 +245,7 @@ async fn logout_clears_state_to_needs_login() {
         .auth_key("tskey-test")
         .control_url(&control_url)
         .ephemeral(true)
+        .disable_portmapping(true)
         .state_dir(state_dir.clone())
         .localapi_path(&socket_path)
         .build()

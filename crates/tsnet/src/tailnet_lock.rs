@@ -90,7 +90,7 @@ pub(crate) struct TailnetLock {
     params: TailnetLockParams,
     path: Option<PathBuf>,
     operation: tokio::sync::Mutex<()>,
-    init_flight: Mutex<Option<InitFlightState>>,
+    init_flight: tokio::sync::Mutex<Option<InitFlightState>>,
     peer_authority: Mutex<Option<Arc<crate::map_update::PeerAuthorityRuntime>>>,
     inner: Mutex<Inner>,
 }
@@ -254,7 +254,7 @@ impl TailnetLock {
             params,
             path,
             operation: tokio::sync::Mutex::new(()),
-            init_flight: Mutex::new(None),
+            init_flight: tokio::sync::Mutex::new(None),
             peer_authority: Mutex::new(None),
             inner: Mutex::new(Inner {
                 authority,
@@ -710,7 +710,7 @@ impl TailnetLock {
     /// request body is fingerprinted so concurrent retries can join only the
     /// exact same transaction; a disconnected waiter never owns cancellation
     /// of authority withdrawal or local commit.
-    pub(crate) fn start_init(
+    pub(crate) async fn start_init(
         self: &Arc<Self>,
         request: InitRequest,
     ) -> Result<InitFlight, TailnetLockError> {
@@ -720,22 +720,24 @@ impl TailnetLock {
             ))
         })?;
         let request_hash: [u8; 32] = Sha256::digest(encoded).into();
-        let mut retained = self
-            .init_flight
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(flight) = retained
-            .as_ref()
-            .filter(|flight| !flight.task.is_finished())
-        {
-            if flight.request_hash != request_hash {
-                return Err(TailnetLockError::InvalidRequest(
-                    "another Tailnet Lock initialization request is already running".into(),
-                ));
+        let mut retained = self.init_flight.lock().await;
+        if let Some(flight) = retained.as_mut() {
+            if !flight.task.is_finished() {
+                if flight.request_hash != request_hash {
+                    return Err(TailnetLockError::InvalidRequest(
+                        "another Tailnet Lock initialization request is already running".into(),
+                    ));
+                }
+                return Ok(InitFlight {
+                    result: flight.result.clone(),
+                });
             }
-            return Ok(InitFlight {
-                result: flight.result.clone(),
-            });
+
+            // A finished Tokio task still owns resources until its completion
+            // has been observed. Join it in place before admitting another
+            // generation; cancellation leaves the same handle retained here.
+            let _ = (&mut flight.task).await;
+            *retained = None;
         }
 
         let (result_tx, result) = tokio::sync::watch::channel(None);
@@ -753,17 +755,20 @@ impl TailnetLock {
     }
 
     /// Join a retained initialization during close/logout before tearing down
-    /// the peer-authority runtime it still owns. If this join future itself is
-    /// dropped, Tokio retains the spawned operation and it still completes.
+    /// the peer-authority runtime it still owns. The handle is cleared only
+    /// after completion is observed; cancelling shutdown leaves that same task
+    /// available for the next close/logout retry.
     pub(crate) async fn join_init_flight(&self) {
-        let flight = self
-            .init_flight
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        if let Some(flight) = flight {
-            let _ = flight.task.await;
+        let mut retained = self.init_flight.lock().await;
+        if let Some(flight) = retained.as_mut() {
+            let _ = (&mut flight.task).await;
+            *retained = None;
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn init_flight_retained(&self) -> bool {
+        self.init_flight.lock().await.is_some()
     }
 
     /// Persist the complete disablement receipt before contacting control,

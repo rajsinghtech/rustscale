@@ -569,6 +569,7 @@ pub trait UserUnitStore: Send + Sync {
 }
 
 /// Filesystem-backed `$XDG_CONFIG_HOME/systemd/user` store.
+#[cfg(unix)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct FileIdentity {
     device: u64,

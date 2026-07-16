@@ -13,13 +13,16 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"runtime/debug"
+	"strings"
 
 	"tailscale.com/net/speedtest"
 )
 
 const (
 	expectedModuleVersion = "v1.100.0"
+	expectedModuleSum     = "h1:nm/M/dEaW9RaRsGUjW2HsSDpsZ60Jwd9k4gNW9tTFiE="
 	readFragmentSize      = 1009
 	maxResults            = 64
 )
@@ -68,24 +71,80 @@ func (l fragmentedReadListener) Accept() (net.Conn, error) {
 	return fragmentedReadConn{Conn: conn}, nil
 }
 
+func verifyRuntimeEnvironment(lookup func(string) (string, bool)) error {
+	required := map[string]string{
+		"GOENV":   "off",
+		"GOFLAGS": "",
+		"GOWORK":  "off",
+		"GOPROXY": "off",
+	}
+	for name, expected := range required {
+		value, ok := lookup(name)
+		if !ok || value != expected {
+			return fmt.Errorf("untrusted runtime environment %s=%q", name, value)
+		}
+	}
+	for _, name := range []string{"GONOPROXY", "GONOSUMDB", "GOPRIVATE"} {
+		if value, ok := lookup(name); ok && value != "" {
+			return fmt.Errorf("untrusted runtime environment %s=%q", name, value)
+		}
+	}
+
+	var cacheParent string
+	for _, name := range []string{"HOME", "GOCACHE", "GOMODCACHE", "GOPATH"} {
+		value, ok := lookup(name)
+		if !ok || !filepath.IsAbs(value) || filepath.Clean(value) != value {
+			return fmt.Errorf("runtime %s must be a clean absolute path", name)
+		}
+		parent := filepath.Dir(value)
+		if cacheParent == "" {
+			cacheParent = parent
+		} else if parent != cacheParent {
+			return fmt.Errorf("runtime %s is outside the isolated root", name)
+		}
+	}
+	path, ok := lookup("PATH")
+	if !ok || !filepath.IsAbs(path) || strings.ContainsRune(path, os.PathListSeparator) {
+		return errors.New("runtime PATH must contain exactly one absolute toolchain directory")
+	}
+	return nil
+}
+
+func verifyModuleDependencies(dependencies []*debug.Module) (string, error) {
+	if expectedModuleSum == "" {
+		return "", errors.New("expected tailscale.com checksum is unavailable")
+	}
+	var matched *debug.Module
+	for _, dependency := range dependencies {
+		if dependency.Path != "tailscale.com" {
+			continue
+		}
+		if matched != nil {
+			return "", errors.New("multiple tailscale.com build dependencies")
+		}
+		matched = dependency
+	}
+	if matched == nil {
+		return "", errors.New("tailscale.com is absent from Go build information")
+	}
+	if matched.Replace != nil {
+		return "", errors.New("tailscale.com build replacements are forbidden")
+	}
+	if matched.Version != expectedModuleVersion {
+		return "", fmt.Errorf("unexpected tailscale.com version %q", matched.Version)
+	}
+	if matched.Sum == "" || matched.Sum != expectedModuleSum {
+		return "", fmt.Errorf("unexpected tailscale.com checksum %q", matched.Sum)
+	}
+	return "tailscale.com@" + matched.Version, nil
+}
+
 func moduleVersion() (string, error) {
 	info, ok := debug.ReadBuildInfo()
 	if !ok {
 		return "", errors.New("Go build information is unavailable")
 	}
-	for _, dependency := range info.Deps {
-		if dependency.Path == "tailscale.com" {
-			version := dependency.Version
-			if dependency.Replace != nil {
-				version = dependency.Replace.Version
-			}
-			if version != expectedModuleVersion {
-				return "", fmt.Errorf("unexpected tailscale.com version %q", version)
-			}
-			return "tailscale.com@" + version, nil
-		}
-	}
-	return "", errors.New("tailscale.com is absent from Go build information")
+	return verifyModuleDependencies(info.Deps)
 }
 
 func runServer(module string) error {
@@ -158,6 +217,9 @@ func runClient(module string, args []string) error {
 }
 
 func run() error {
+	if err := verifyRuntimeEnvironment(os.LookupEnv); err != nil {
+		return err
+	}
 	module, err := moduleVersion()
 	if err != nil {
 		return err

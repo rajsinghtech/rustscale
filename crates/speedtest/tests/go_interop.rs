@@ -3,7 +3,7 @@
 use std::future::Future;
 use std::io::{self, Read};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::task::{Context, Poll};
@@ -20,6 +20,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 
 const PEER_ENV: &str = "RUSTSCALE_SPEEDTEST_GO_PEER";
+const TOOLCHAIN_ENV: &str = "RUSTSCALE_SPEEDTEST_GO_TOOLCHAIN";
+const RUNTIME_ROOT_ENV: &str = "RUSTSCALE_SPEEDTEST_GO_RUNTIME_ROOT";
 const EXPECTED_MODULE: &str = "tailscale.com@v1.100.0";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const SESSION_TIMEOUT: Duration = Duration::from_secs(12);
@@ -28,18 +30,73 @@ const GLOBAL_TIMEOUT: Duration = Duration::from_secs(35);
 const MAX_CHILD_OUTPUT: usize = 16 * 1024;
 const IO_FRAGMENT_SIZE: usize = 1009;
 
-fn peer_path() -> Option<PathBuf> {
-    let path = std::env::var_os(PEER_ENV).map(PathBuf::from);
-    if path.is_none() {
-        eprintln!("skipping Go speedtest interop; run tools/speedtest-interop.sh");
-    }
-    path
+#[derive(Clone)]
+struct GoHarness {
+    peer: PathBuf,
+    toolchain_dir: PathBuf,
+    runtime_root: PathBuf,
 }
 
-fn command(peer: &Path) -> Command {
-    let mut command = Command::new(peer);
+fn canonical_env_path(name: &str) -> PathBuf {
+    let path = PathBuf::from(
+        std::env::var_os(name)
+            .unwrap_or_else(|| panic!("missing required harness variable {name}")),
+    );
+    assert!(path.is_absolute(), "{name} must be absolute");
+    path.canonicalize()
+        .unwrap_or_else(|error| panic!("cannot canonicalize {name}: {error}"))
+}
+
+fn harness() -> Option<GoHarness> {
+    if std::env::var_os(PEER_ENV).is_none() {
+        eprintln!("skipping Go speedtest interop; run tools/speedtest-interop.sh");
+        return None;
+    }
+    let peer = canonical_env_path(PEER_ENV);
+    assert!(peer.is_file(), "Go peer is not a regular file");
+    let toolchain = canonical_env_path(TOOLCHAIN_ENV);
+    assert!(toolchain.is_file(), "Go toolchain is not a regular file");
+    assert_eq!(
+        toolchain.file_name().and_then(|name| name.to_str()),
+        Some("go"),
+        "validated toolchain executable must be named go"
+    );
+    let toolchain_dir = toolchain
+        .parent()
+        .expect("Go toolchain has no parent directory")
+        .to_owned();
+    let runtime_root = canonical_env_path(RUNTIME_ROOT_ENV);
+    assert!(runtime_root.is_dir(), "runtime root is not a directory");
+    assert!(
+        runtime_root.starts_with(peer.parent().expect("Go peer has no parent")),
+        "runtime root is outside the speedtest interop target directory"
+    );
+    for name in ["home", "gocache", "gomodcache", "gopath"] {
+        assert!(
+            runtime_root.join(name).is_dir(),
+            "missing isolated runtime directory {name}"
+        );
+    }
+    Some(GoHarness {
+        peer,
+        toolchain_dir,
+        runtime_root,
+    })
+}
+
+fn command(harness: &GoHarness) -> Command {
+    let mut command = Command::new(&harness.peer);
     command
         .env_clear()
+        .env("HOME", harness.runtime_root.join("home"))
+        .env("GOCACHE", harness.runtime_root.join("gocache"))
+        .env("GOMODCACHE", harness.runtime_root.join("gomodcache"))
+        .env("GOPATH", harness.runtime_root.join("gopath"))
+        .env("PATH", &harness.toolchain_dir)
+        .env("GOENV", "off")
+        .env("GOFLAGS", "")
+        .env("GOWORK", "off")
+        .env("GOPROXY", "off")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -92,9 +149,19 @@ struct ManagedChild {
 }
 
 impl ManagedChild {
-    fn spawn(peer: &Path, arguments: &[&str]) -> Self {
-        let mut command = command(peer);
-        command.args(arguments);
+    fn spawn(harness: &GoHarness, arguments: &[&str]) -> Self {
+        let mut child_command = command(harness);
+        child_command.args(arguments);
+        Self::spawn_command(child_command)
+    }
+
+    fn spawn_poisoned(harness: &GoHarness, name: &str, value: &str) -> Self {
+        let mut child_command = command(harness);
+        child_command.arg("server").env(name, value);
+        Self::spawn_command(child_command)
+    }
+
+    fn spawn_command(mut command: Command) -> Self {
         let mut child = command
             .spawn()
             .unwrap_or_else(|error| panic!("failed to spawn Go peer: {error}"));
@@ -192,8 +259,8 @@ fn fail_server_start(
 }
 
 impl GoServer {
-    fn start(peer: &Path) -> Self {
-        let mut command = command(peer);
+    fn start(harness: &GoHarness) -> Self {
+        let mut command = command(harness);
         command.arg("server");
         let mut child = command
             .spawn()
@@ -460,9 +527,13 @@ async fn globally_bounded(future: impl Future<Output = ()>) {
         .unwrap_or_else(|_| panic!("interop test exceeded global deadline {GLOBAL_TIMEOUT:?}"));
 }
 
-async fn run_go_client(peer: PathBuf, address: SocketAddr, direction: Direction) -> ProcessOutput {
+async fn run_go_client(
+    harness: GoHarness,
+    address: SocketAddr,
+    direction: Direction,
+) -> ProcessOutput {
     ManagedChild::spawn(
-        &peer,
+        &harness,
         &[
             "client",
             "--address",
@@ -490,12 +561,37 @@ async fn read_control_line(stream: &mut TcpStream) -> Vec<u8> {
 }
 
 #[tokio::test]
-async fn rust_client_interoperates_with_go_server_in_both_directions() {
-    let Some(peer) = peer_path() else {
+async fn go_peer_rejects_poisoned_runtime_environment() {
+    let Some(harness) = harness() else {
         return;
     };
     globally_bounded(async move {
-        let mut server = GoServer::start(&peer);
+        for (name, value) in [
+            ("GOFLAGS", "-mod=mod"),
+            ("GOWORK", "/poisoned/workspace"),
+            ("GOPROXY", "https://poisoned.invalid"),
+        ] {
+            let output = ManagedChild::spawn_poisoned(&harness, name, value)
+                .wait(PROCESS_EXIT_TIMEOUT)
+                .await;
+            assert!(!output.status.success(), "Go peer accepted poisoned {name}");
+            assert!(output.stdout.is_empty(), "poisoned peer claimed startup");
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains(name),
+                "poison rejection did not identify {name}"
+            );
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn rust_client_interoperates_with_go_server_in_both_directions() {
+    let Some(harness) = harness() else {
+        return;
+    };
+    globally_bounded(async move {
+        let mut server = GoServer::start(&harness);
         for direction in [Direction::Upload, Direction::Download] {
             let stream = tokio::time::timeout(STARTUP_TIMEOUT, TcpStream::connect(server.address))
                 .await
@@ -516,7 +612,7 @@ async fn rust_client_interoperates_with_go_server_in_both_directions() {
 
 #[tokio::test]
 async fn go_client_interoperates_with_bounded_rust_server_and_is_cancelled() {
-    let Some(peer) = peer_path() else {
+    let Some(harness) = harness() else {
         return;
     };
     globally_bounded(async move {
@@ -528,12 +624,12 @@ async fn go_client_interoperates_with_bounded_rust_server_and_is_cancelled() {
         let mut server = RustServer::start(listener);
 
         for direction in [Direction::Upload, Direction::Download] {
-            let output = run_go_client(peer.clone(), address, direction).await;
+            let output = run_go_client(harness.clone(), address, direction).await;
             assert_go_results(&output, direction);
         }
 
         let mut cancelled = ManagedChild::spawn(
-            &peer,
+            &harness,
             &[
                 "client",
                 "--address",
@@ -564,12 +660,12 @@ async fn go_client_interoperates_with_bounded_rust_server_and_is_cancelled() {
 
 #[tokio::test]
 async fn go_server_newline_control_rejects_malformed_and_truncated_json() {
-    let Some(peer) = peer_path() else {
+    let Some(harness) = harness() else {
         return;
     };
     globally_bounded(async move {
         for wire in [&b"not-json\n"[..], &b"{\"version\":"[..]] {
-            let server = GoServer::start(&peer);
+            let server = GoServer::start(&harness);
             let mut stream =
                 tokio::time::timeout(STARTUP_TIMEOUT, TcpStream::connect(server.address))
                     .await
@@ -595,7 +691,7 @@ async fn go_server_newline_control_rejects_malformed_and_truncated_json() {
             );
         }
 
-        let server = GoServer::start(&peer);
+        let server = GoServer::start(&harness);
         let mut stream = TcpStream::connect(server.address)
             .await
             .expect("failed connecting for control vector");

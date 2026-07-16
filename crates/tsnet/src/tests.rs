@@ -2628,6 +2628,13 @@ fn dangerous_client_config() -> rustls::ClientConfig {
 // E2E tests (#[ignore] — require TS_E2E_AUTHKEY + TS_E2E_TAILNET)
 // ---------------------------------------------------------------------------
 
+fn e2e_server_builder() -> ServerBuilder {
+    // These scenarios exercise control/data-path behavior, not NAT mapping.
+    // Cloud routers may never acknowledge mapping deletion, which would make
+    // unrelated E2E assertions fail during strict Server cleanup.
+    Server::builder().disable_portmapping(true)
+}
+
 /// Single-node e2e: up() + status() sanity check.
 #[tokio::test]
 #[ignore = "requires TS_E2E_AUTHKEY + TS_E2E_TAILNET env vars (run via tools/e2e.sh)"]
@@ -2635,7 +2642,7 @@ async fn e2e_register_only() {
     let authkey = std::env::var("TS_E2E_AUTHKEY").expect("TS_E2E_AUTHKEY not set");
     let _tailnet = std::env::var("TS_E2E_TAILNET").expect("TS_E2E_TAILNET not set");
 
-    let mut server = Server::builder()
+    let mut server = e2e_server_builder()
         .hostname(format!("rustscale-e2e-register-{}", std::process::id()))
         .auth_key(authkey)
         .ephemeral(true)
@@ -2695,7 +2702,7 @@ async fn e2e_two_nodes() {
     let uid = std::process::id();
 
     // Start server A.
-    let mut server_a = Server::builder()
+    let mut server_a = e2e_server_builder()
         .hostname(format!("rustscale-e2e-a-{uid}"))
         .auth_key(authkey.clone())
         .ephemeral(true)
@@ -2713,7 +2720,7 @@ async fn e2e_two_nodes() {
         .expect("A should have an IPv4");
 
     // Start server B.
-    let mut server_b = Server::builder()
+    let mut server_b = e2e_server_builder()
         .hostname(format!("rustscale-e2e-b-{uid}"))
         .auth_key(authkey)
         .ephemeral(true)
@@ -2927,7 +2934,7 @@ async fn e2e_subnet_routes() {
     let subnet = "192.0.2.0/24";
 
     // Start node A — the subnet router (advertises 192.0.2.0/24).
-    let mut server_a = Server::builder()
+    let mut server_a = e2e_server_builder()
         .hostname(format!("rustscale-e2e-router-{uid}"))
         .auth_key(authkey.clone())
         .ephemeral(true)
@@ -2962,7 +2969,7 @@ async fn e2e_subnet_routes() {
     log::debug!("routes approved");
 
     // Start node B — accepts routes.
-    let mut server_b = Server::builder()
+    let mut server_b = e2e_server_builder()
         .hostname(format!("rustscale-e2e-client-{uid}"))
         .auth_key(authkey)
         .ephemeral(true)
@@ -3065,7 +3072,7 @@ async fn e2e_whois_and_magicdns_dial() {
     let _tailnet = std::env::var("TS_E2E_TAILNET").expect("TS_E2E_TAILNET not set");
     let uid = std::process::id();
 
-    let mut server_a = Server::builder()
+    let mut server_a = e2e_server_builder()
         .hostname(format!("rustscale-e2e-whois-a-{uid}"))
         .auth_key(authkey.clone())
         .ephemeral(true)
@@ -3073,7 +3080,7 @@ async fn e2e_whois_and_magicdns_dial() {
         .expect("build A");
     Box::pin(server_a.up()).await.expect("up A");
 
-    let mut server_b = Server::builder()
+    let mut server_b = e2e_server_builder()
         .hostname(format!("rustscale-e2e-whois-b-{uid}"))
         .auth_key(authkey)
         .ephemeral(true)
@@ -3181,7 +3188,7 @@ async fn e2e_control_cert_not_enabled() {
     let _ = std::fs::remove_dir_all(&state_dir);
     std::fs::create_dir_all(&state_dir).unwrap();
 
-    let mut server = Server::builder()
+    let mut server = e2e_server_builder()
         .hostname(format!("rustscale-e2e-cert-{uid}"))
         .auth_key(authkey)
         .ephemeral(true)
@@ -3248,7 +3255,7 @@ async fn e2e_acme_cert_issuance() {
     let _ = std::fs::remove_dir_all(&state_dir);
     std::fs::create_dir_all(&state_dir).unwrap();
 
-    let mut server = Server::builder()
+    let mut server = e2e_server_builder()
         .hostname(format!("rustscale-e2e-acme-{uid}"))
         .auth_key(authkey)
         .ephemeral(true)
@@ -3338,7 +3345,7 @@ async fn e2e_exit_node() {
     let uid = std::process::id();
 
     // --- Node B: advertises exit node ---
-    let mut server_b = Server::builder()
+    let mut server_b = e2e_server_builder()
         .hostname(format!("rustscale-e2e-exit-b-{uid}"))
         .auth_key(authkey.clone())
         .ephemeral(true)
@@ -3372,7 +3379,7 @@ async fn e2e_exit_node() {
     log::debug!("exit routes approved");
 
     // --- Node A: selects B as exit node ---
-    let mut server_a = Server::builder()
+    let mut server_a = e2e_server_builder()
         .hostname(format!("rustscale-e2e-exit-a-{uid}"))
         .auth_key(authkey)
         .ephemeral(true)
@@ -3499,7 +3506,7 @@ async fn e2e_serve_tcp_forward() {
     });
 
     // Start server B with a serve config forwarding port 8080.
-    let mut server_b = Server::builder()
+    let mut server_b = e2e_server_builder()
         .hostname(format!("rustscale-e2e-serve-b-{uid}"))
         .auth_key(authkey.clone())
         .ephemeral(true)
@@ -3534,7 +3541,7 @@ async fn e2e_serve_tcp_forward() {
     log::debug!("e2e_serve: B serving port 8080 → {started:?}");
 
     // Start server A.
-    let mut server_a = Server::builder()
+    let mut server_a = e2e_server_builder()
         .hostname(format!("rustscale-e2e-serve-a-{uid}"))
         .auth_key(authkey)
         .ephemeral(true)
@@ -3593,7 +3600,7 @@ async fn e2e_funnel_not_enabled() {
     let _tailnet = std::env::var("TS_E2E_TAILNET").expect("TS_E2E_TAILNET not set");
     let uid = std::process::id();
 
-    let mut server = Server::builder()
+    let mut server = e2e_server_builder()
         .hostname(format!("rustscale-e2e-funnel-{uid}"))
         .auth_key(authkey)
         .ephemeral(true)
@@ -3643,7 +3650,7 @@ async fn e2e_socks5_proxy() {
     let uid = std::process::id();
 
     // Node A — runs the SOCKS5 proxy.
-    let mut server_a = Server::builder()
+    let mut server_a = e2e_server_builder()
         .hostname(format!("rustscale-e2e-socks5-a-{uid}"))
         .auth_key(authkey.clone())
         .ephemeral(true)
@@ -3652,7 +3659,7 @@ async fn e2e_socks5_proxy() {
     Box::pin(server_a.up()).await.expect("up A");
 
     // Node B — runs the echo backend on its tailnet IP.
-    let mut server_b = Server::builder()
+    let mut server_b = e2e_server_builder()
         .hostname(format!("rustscale-e2e-socks5-b-{uid}"))
         .auth_key(authkey)
         .ephemeral(true)

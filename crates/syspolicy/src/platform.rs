@@ -1,8 +1,11 @@
 use std::collections::BTreeMap;
 #[cfg(any(test, target_os = "windows"))]
 use std::collections::BTreeSet;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::fmt;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::sync::Arc;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::time::Duration;
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]

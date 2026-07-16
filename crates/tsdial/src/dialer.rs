@@ -12,7 +12,7 @@ use tokio::sync::RwLock;
 use crate::dns_map::DnsMap;
 use crate::peer_dial::dial_peer_api;
 use crate::system_dial::{system_dial_tracked, system_dial_untracked, ActiveConns};
-use crate::user_dial::{is_tailscale_ip, race_dial, resolve_addr, user_dial_plan};
+use crate::user_dial::{race_dial, resolve_addr, user_dial_plan};
 
 /// Advisory plan for a user dial — the resolved address and whether it would
 /// go via Tailscale. Returned by [`Dialer::user_dial_plan`] so callers can
@@ -156,7 +156,6 @@ impl Dialer {
     /// Dial a single user address with netstack/route awareness.
     async fn dial_one_user(&self, addr: SocketAddr) -> std::io::Result<TcpStream> {
         let ip = addr.ip();
-        let port = addr.port();
         // Check netstack callback first.
         let ns_fn = self.use_netstack_for_ip.read().await.clone();
         if let Some(check) = ns_fn {
@@ -173,13 +172,10 @@ impl Dialer {
                 }
             }
         }
-        // If it's a tailnet IP, use plain connect (via netstack or peer dialer
-        // in the full implementation). For V1, use netns with localhost check.
-        if is_tailscale_ip(ip) {
-            return rustscale_netns::dial_tcp(&ip.to_string(), port).await;
-        }
-        // Non-tailnet: system dial (via netns with localhost check).
-        rustscale_netns::dial_tcp(&ip.to_string(), port).await
+        // User traffic follows ordinary OS routes. In TUN mode that includes
+        // peer, accepted subnet, and selected exit-node routes; unlike system
+        // dials it must never carry the physical-underlay bypass mark.
+        rustscale_netns::dial_user_tcp_addr(addr).await
     }
 
     /// Compute the [`UserDialPlan`] for an address without dialing.

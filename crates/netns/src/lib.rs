@@ -196,6 +196,16 @@ pub async fn dial_tcp_addr(addr: SocketAddr) -> Result<tokio::net::TcpStream, st
     control_and_connect(addr).await
 }
 
+/// Dial user traffic according to the ordinary OS route table, without the
+/// physical-underlay mark/interface binding reserved for control, DERP, and
+/// magicsock infrastructure. In TUN mode this is what sends a daemon-owned
+/// LocalAPI UserDial into the managed tunnel routes.
+pub async fn dial_user_tcp_addr(addr: SocketAddr) -> Result<tokio::net::TcpStream, std::io::Error> {
+    let stream = tokio::net::TcpStream::connect(addr).await?;
+    stream.set_nodelay(true).ok();
+    Ok(stream)
+}
+
 /// Apply this process's route-loop bypass policy to a UDP socket.
 ///
 /// On Linux this uses the Tailscale bypass mark (or the default physical

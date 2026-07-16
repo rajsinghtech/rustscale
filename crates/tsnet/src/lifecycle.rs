@@ -1370,6 +1370,8 @@ impl Server {
             self.config.accept_routes,
             b.advertise_routes.clone(),
             b.resolver.clone(),
+            b.user_dialer.clone(),
+            b.dial_self_node.clone(),
             b.dns_config.clone(),
             b.user_profiles.clone(),
             b.ssh_policy.clone(),
@@ -1676,6 +1678,12 @@ impl Server {
                 peer_map: b.peer_map.clone(),
                 tailnet_lock: Some(b.tailnet_lock.clone()),
                 netstack: Some(netstack.clone()),
+                dial_backend: Some(localapi::netstack_dial_backend(
+                    netstack.clone(),
+                    b.peers.clone(),
+                )),
+                dial_admission: localapi::global_dial_admission(),
+                dial_timeout: localapi::LOCALAPI_DIAL_TIMEOUT,
                 filter: std::sync::OnceLock::new(),
                 route_table: Some(b.route_table.clone()),
                 exit_map_gate: b.exit_map_gate.clone(),
@@ -1775,6 +1783,7 @@ impl Server {
             magicsock: b.magicsock,
             netlog: b.netlog,
             data_plane: DataPlane::Netstack(netstack),
+            user_dialer: b.user_dialer,
             peers: b.peers,
             peer_map: b.peer_map,
             routecheck: b.routecheck,
@@ -1953,6 +1962,7 @@ impl Server {
             self.config.state_dir.as_deref(),
         )
         .await?;
+        b.user_dialer.set_tun_name(tun.name().to_owned()).await;
         // Transfer OS-route ownership before the next cancellable await.
         rollback.router.clone_from(&router);
 
@@ -2071,6 +2081,8 @@ impl Server {
             self.config.accept_routes,
             b.advertise_routes.clone(),
             b.resolver.clone(),
+            b.user_dialer.clone(),
+            b.dial_self_node.clone(),
             b.dns_config.clone(),
             b.user_profiles.clone(),
             b.ssh_policy.clone(),
@@ -2336,7 +2348,10 @@ impl Server {
                 drive: self.drive.clone(),
                 peer_map: b.peer_map.clone(),
                 tailnet_lock: Some(b.tailnet_lock.clone()),
-                netstack: None, // TUN mode has no netstack
+                netstack: None, // TUN mode uses the generation's UserDialer
+                dial_backend: Some(localapi::tun_dial_backend(b.user_dialer.clone())),
+                dial_admission: localapi::global_dial_admission(),
+                dial_timeout: localapi::LOCALAPI_DIAL_TIMEOUT,
                 filter: std::sync::OnceLock::new(),
                 route_table: Some(b.route_table.clone()),
                 exit_map_gate: b.exit_map_gate.clone(),
@@ -2447,6 +2462,7 @@ impl Server {
             magicsock: b.magicsock,
             netlog: b.netlog,
             data_plane: DataPlane::Tun,
+            user_dialer: b.user_dialer,
             peers: b.peers,
             peer_map: b.peer_map,
             routecheck: b.routecheck,
@@ -2833,6 +2849,9 @@ impl Server {
             peer_map: crate::peer_map::Runtime::new(&[]).expect("empty localapi peer map"),
             tailnet_lock: None,
             netstack: None,
+            dial_backend: None,
+            dial_admission: localapi::global_dial_admission(),
+            dial_timeout: localapi::LOCALAPI_DIAL_TIMEOUT,
             filter: std::sync::OnceLock::new(),
             route_table: None,
             exit_map_gate: Arc::new(tokio::sync::Mutex::new(())),
@@ -3757,6 +3776,16 @@ impl Server {
             &domain,
             map_resp.DNSConfig.as_ref(),
         )));
+        let user_dialer = Arc::new(rustscale_tsdial::Dialer::new(None));
+        user_dialer
+            .set_net_map(&MapResponse {
+                Node: map_resp.Node.clone(),
+                Domain: domain.clone(),
+                Peers: Some(peers.clone()),
+                DNSConfig: map_resp.DNSConfig.clone(),
+                ..Default::default()
+            })
+            .await;
 
         let c2n_prefs = serde_json::json!({
             "hostname": self.config.hostname,
@@ -3844,6 +3873,8 @@ impl Server {
             named_filters,
             packet_drops,
             resolver,
+            user_dialer,
+            dial_self_node: map_resp.Node.clone(),
             our_fqdn,
             domain,
             dns_config,

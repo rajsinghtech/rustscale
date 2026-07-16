@@ -650,6 +650,14 @@ impl Server {
                 DataPlane::Netstack(ns) => Some(ns.clone()),
                 DataPlane::Tun => None,
             },
+            dial_backend: Some(match &inner.data_plane {
+                DataPlane::Netstack(ns) => {
+                    localapi::netstack_dial_backend(ns.clone(), inner.peers.clone())
+                }
+                DataPlane::Tun => localapi::tun_dial_backend(inner.user_dialer.clone()),
+            }),
+            dial_admission: localapi::global_dial_admission(),
+            dial_timeout: localapi::LOCALAPI_DIAL_TIMEOUT,
             filter: std::sync::OnceLock::new(),
             route_table: Some(inner.route_table.clone()),
             exit_map_gate: inner.exit_map_gate.clone(),

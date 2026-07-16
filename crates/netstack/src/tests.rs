@@ -11,7 +11,7 @@ use std::sync::Mutex;
 use rustscale_key::NodePrivate;
 use rustscale_wg::WgTunn;
 
-use crate::{Netstack, DEFAULT_MTU};
+use crate::{DialStats, Netstack, DEFAULT_MTU, TCP_BUF, TCP_DIAL_TIMEOUT};
 
 #[test]
 fn constructor_without_runtime_is_typed_error() {
@@ -447,6 +447,61 @@ async fn latency_small_message_round_trip() {
         p50 < std::time::Duration::from_millis(20),
         "p50 latency too high: {p50:?} (expected < 20ms)"
     );
+}
+
+#[tokio::test]
+async fn canceled_pending_dial_releases_socket_and_buffers_promptly() {
+    let net = Arc::new(
+        Netstack::new(Ipv4Addr::new(100, 64, 0, 1), DEFAULT_MTU).expect("create netstack"),
+    );
+    let dial_net = Arc::clone(&net);
+    let dial = tokio::spawn(async move {
+        dial_net
+            .dial(SocketAddr::from(([100, 64, 0, 254], 9)))
+            .await
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while net.dial_stats().pending_dials != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("pending dial was not registered");
+    assert_eq!(net.dial_stats().pending_buffer_bytes, TCP_BUF * 2);
+
+    dial.abort();
+    let _ = dial.await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while net.dial_stats() != DialStats::default() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("canceled dial retained pending socket buffers");
+}
+
+#[tokio::test(start_paused = true)]
+async fn pending_dial_has_an_internal_deadline() {
+    let net = Arc::new(
+        Netstack::new(Ipv4Addr::new(100, 64, 0, 1), DEFAULT_MTU).expect("create netstack"),
+    );
+    let dial_net = Arc::clone(&net);
+    let dial = tokio::spawn(async move {
+        dial_net
+            .dial(SocketAddr::from(([100, 64, 0, 254], 9)))
+            .await
+    });
+    while net.dial_stats().pending_dials != 1 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::advance(TCP_DIAL_TIMEOUT + std::time::Duration::from_millis(1)).await;
+    let error = match dial.await.unwrap() {
+        Ok(_) => panic!("pending dial unexpectedly connected"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("deadline exceeded"));
+    assert_eq!(net.dial_stats(), DialStats::default());
 }
 
 /// Verify that multiple peers can connect simultaneously. Before the backlog

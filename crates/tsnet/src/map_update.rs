@@ -538,6 +538,8 @@ pub(crate) fn spawn_map_update_task(
     accept_routes: bool,
     advertise_routes: Vec<String>,
     resolver: Arc<RwLock<MagicDnsResolver>>,
+    user_dialer: Arc<rustscale_tsdial::Dialer>,
+    mut dial_self_node: Option<Node>,
     dns_config: Arc<RwLock<Option<DNSConfig>>>,
     user_profiles: Arc<RwLock<BTreeMap<UserID, UserProfile>>>,
     ssh_policy: Arc<RwLock<Option<SSHPolicy>>>,
@@ -710,6 +712,13 @@ pub(crate) fn spawn_map_update_task(
                             );
                         }
                         resolver.write().await.set_peers(Vec::new());
+                        user_dialer
+                            .set_net_map(&MapResponse {
+                                Domain: tailnet_identity.clone(),
+                                Peers: Some(Vec::new()),
+                                ..Default::default()
+                            })
+                            .await;
                         drop(drive_epoch);
                         drop(map_commit);
                         ipn_backend.set_blocked(true);
@@ -1168,6 +1177,20 @@ pub(crate) fn spawn_map_update_task(
                         let new_config = config_from_dns(cfg, &domain, &peers);
                         r.set_config(new_config);
                     }
+                    // tsdial must see one complete, authorization-filtered
+                    // snapshot rather than the control delta; replacing its
+                    // map from PeersChanged alone would erase unchanged names.
+                    if resp.Node.is_some() {
+                        dial_self_node.clone_from(&resp.Node);
+                    }
+                    let complete_dial_map = MapResponse {
+                        Node: dial_self_node.clone(),
+                        Domain: tailnet_identity.clone(),
+                        Peers: Some(peers.clone()),
+                        DNSConfig: dns_config.read().await.clone(),
+                        ..Default::default()
+                    };
+                    user_dialer.set_net_map(&complete_dial_map).await;
 
                     // Merge UserProfiles delta (add/update; never removed).
                     if !resp.UserProfiles.is_empty() {

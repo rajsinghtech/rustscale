@@ -914,6 +914,8 @@ pub(crate) struct RunningState {
     pub(crate) capture_handles: std::sync::Mutex<Vec<capture::CaptureHandle>>,
     /// Shared MagicDNS resolver (dial path + DNS responder).
     pub(crate) resolver: Arc<RwLock<MagicDnsResolver>>,
+    /// Generation-bound TUN user dialer retained with LocalAPI ownership.
+    pub(crate) user_dialer: Arc<rustscale_tsdial::Dialer>,
     /// Our node's FQDN (with trailing dot), from the netmap.
     pub(crate) our_fqdn: String,
     /// Tailnet domain / MagicDNS suffix (e.g. "tailnet.ts.net").
@@ -1070,6 +1072,10 @@ pub(crate) struct Bootstrap {
     pub(crate) packet_drops: Arc<AtomicU64>,
     /// Shared MagicDNS resolver (dial path + DNS responder).
     pub(crate) resolver: Arc<RwLock<MagicDnsResolver>>,
+    /// Generation-bound user dialer initialized from this complete netmap.
+    pub(crate) user_dialer: Arc<rustscale_tsdial::Dialer>,
+    /// Last complete self node retained when control sends peer-only deltas.
+    pub(crate) dial_self_node: Option<Node>,
     /// Our node's FQDN (with trailing dot).
     pub(crate) our_fqdn: String,
     /// Tailnet domain / MagicDNS suffix (from `MapResponse.Domain`).

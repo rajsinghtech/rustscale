@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
-use std::io::{self, Read, Write};
+#[cfg(unix)]
+use std::io::Write;
+use std::io::{self, Read};
 use std::path::Path;
 #[cfg(test)]
 use std::path::PathBuf;
@@ -11,6 +13,9 @@ use std::time::{Duration, Instant};
 
 use cap_fs_ext::{DirExt, FileTypeExt, FollowSymlinks, OpenOptionsFollowExt, OpenOptionsSyncExt};
 use cap_std::fs::{Dir, File, OpenOptions};
+#[cfg(unix)]
+use cap_std::fs::{DirBuilder, DirBuilderExt};
+#[cfg(unix)]
 use rand_core::{OsRng, RngCore};
 use tokio::sync::mpsc as tokio_mpsc;
 use tokio_util::sync::CancellationToken;
@@ -20,6 +25,7 @@ use crate::config::{ConfigStore, Limits, ShareRoot, Snapshot};
 use crate::path::{href_for_components, parse_request_path, ParsedPath};
 
 const ALLOW: &str = "OPTIONS, GET, HEAD, PROPFIND, PUT, MKCOL, DELETE, MOVE, COPY";
+#[cfg(unix)]
 const QUARANTINE_DIRECTORY: &str = ".rustscale-taildrive-quarantine";
 
 pub type HeaderMap = BTreeMap<String, String>;
@@ -28,6 +34,7 @@ pub type HeaderMap = BTreeMap<String, String>;
 /// consumed only on Taildrive's blocking filesystem pool; the async producer
 /// applies backpressure through the bounded channel.
 pub struct StreamingBody {
+    #[cfg_attr(not(unix), allow(dead_code))]
     receiver: tokio_mpsc::Receiver<Vec<u8>>,
     expected_length: usize,
 }
@@ -189,14 +196,14 @@ impl RequestAuthority {
 pub struct RequestControl {
     authority: RequestAuthority,
     deadline: Instant,
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     after_sync: Option<Arc<dyn Fn() + Send + Sync>>,
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     before_commit: Option<Arc<dyn Fn() + Send + Sync>>,
-    #[cfg(test)]
-    after_transaction: Option<Arc<dyn Fn() + Send + Sync>>,
-    #[cfg(test)]
-    before_isolation: Option<Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(all(test, unix))]
+    after_transaction: Option<Arc<dyn Fn(&OsStr) + Send + Sync>>,
+    #[cfg(all(test, unix))]
+    before_isolation: Option<Arc<dyn Fn(&OsStr) + Send + Sync>>,
 }
 
 impl RequestControl {
@@ -204,13 +211,13 @@ impl RequestControl {
         Self {
             authority,
             deadline,
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             after_sync: None,
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             before_commit: None,
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             after_transaction: None,
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             before_isolation: None,
         }
     }
@@ -236,7 +243,7 @@ impl RequestControl {
         action: impl FnOnce() -> Result<T, OperationError>,
     ) -> Result<T, OperationError> {
         self.check()?;
-        #[cfg(test)]
+        #[cfg(all(test, unix))]
         if let Some(hook) = &self.before_commit {
             hook();
         }
@@ -253,53 +260,45 @@ impl RequestControl {
         action()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn with_after_sync(mut self, hook: Arc<dyn Fn() + Send + Sync>) -> Self {
         self.after_sync = Some(hook);
         self
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn with_before_commit(mut self, hook: Arc<dyn Fn() + Send + Sync>) -> Self {
         self.before_commit = Some(hook);
         self
     }
 
-    #[cfg(test)]
-    fn with_after_transaction(mut self, hook: Arc<dyn Fn() + Send + Sync>) -> Self {
+    #[cfg(all(test, unix))]
+    fn with_after_transaction(mut self, hook: Arc<dyn Fn(&OsStr) + Send + Sync>) -> Self {
         self.after_transaction = Some(hook);
         self
     }
 
-    #[cfg(test)]
-    fn notify_after_transaction(&self) {
+    #[cfg(all(test, unix))]
+    fn notify_after_transaction(&self, entry: &OsStr) {
         if let Some(hook) = &self.after_transaction {
-            hook();
+            hook(entry);
         }
     }
 
-    #[cfg(not(test))]
-    #[allow(clippy::unused_self)]
-    fn notify_after_transaction(&self) {}
-
-    #[cfg(test)]
-    fn with_before_isolation(mut self, hook: Arc<dyn Fn() + Send + Sync>) -> Self {
+    #[cfg(all(test, unix))]
+    fn with_before_isolation(mut self, hook: Arc<dyn Fn(&OsStr) + Send + Sync>) -> Self {
         self.before_isolation = Some(hook);
         self
     }
 
-    #[cfg(test)]
-    fn notify_before_isolation(&self) {
+    #[cfg(all(test, unix))]
+    fn notify_before_isolation(&self, entry: &OsStr) {
         if let Some(hook) = &self.before_isolation {
-            hook();
+            hook(entry);
         }
     }
 
-    #[cfg(not(test))]
-    #[allow(clippy::unused_self)]
-    fn notify_before_isolation(&self) {}
-
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn notify_after_sync(&self) {
         if let Some(hook) = &self.after_sync {
             hook();
@@ -684,8 +683,16 @@ impl Server {
             return Err(OperationError::Forbidden);
         }
         let (parent, leaf) = open_parent_nofollow(&root.dir, &parsed.relative)?;
-        control.commit(|| transactional_delete(&parent, &leaf, control))?;
-        Ok(Response::new(204).header("content-length", "0"))
+        #[cfg(not(unix))]
+        {
+            let _ = (parent, leaf, control);
+            Err(OperationError::TransactionalUnavailable)
+        }
+        #[cfg(unix)]
+        {
+            control.commit(|| transactional_delete(&parent, &leaf, control))?;
+            Ok(Response::new(204).header("content-length", "0"))
+        }
     }
 
     fn move_or_copy(
@@ -730,29 +737,43 @@ impl Server {
         let (destination_parent, destination_leaf) =
             open_parent_nofollow(&destination_root.dir, &destination.relative)?;
         if !copy {
-            if source.relative == destination.relative {
-                return Ok(Response::new(204).header("content-length", "0"));
-            }
-            if request.header("overwrite") == Some("F")
-                && destination_parent
-                    .symlink_metadata(&destination_leaf)
-                    .is_ok()
+            #[cfg(not(unix))]
             {
-                return Err(OperationError::PreconditionFailed);
-            }
-            let overwritten = control.commit(|| {
-                transactional_move(
-                    &source_parent,
-                    &source_leaf,
-                    &destination_parent,
-                    &destination_leaf,
-                    request.header("overwrite") != Some("F"),
+                let _ = (
+                    source_parent,
+                    source_leaf,
+                    destination_parent,
+                    destination_leaf,
+                    request,
                     control,
-                )
-            })?;
-            return Ok(
-                Response::new(if overwritten { 204 } else { 201 }).header("content-length", "0")
-            );
+                );
+                return Err(OperationError::TransactionalUnavailable);
+            }
+            #[cfg(unix)]
+            {
+                if source.relative == destination.relative {
+                    return Ok(Response::new(204).header("content-length", "0"));
+                }
+                if request.header("overwrite") == Some("F")
+                    && destination_parent
+                        .symlink_metadata(&destination_leaf)
+                        .is_ok()
+                {
+                    return Err(OperationError::PreconditionFailed);
+                }
+                let overwritten = control.commit(|| {
+                    transactional_move(
+                        &source_parent,
+                        &source_leaf,
+                        &destination_parent,
+                        &destination_leaf,
+                        request.header("overwrite") != Some("F"),
+                        control,
+                    )
+                })?;
+                return Ok(Response::new(if overwritten { 204 } else { 201 })
+                    .header("content-length", "0"));
+            }
         }
 
         let source_kind = supported_object_kind(&source_parent.symlink_metadata(&source_leaf)?)?;
@@ -894,6 +915,7 @@ fn optional_supported_object_kind(
     }
 }
 
+#[cfg(unix)]
 fn random_internal_name(label: &str) -> OsString {
     let mut random = [0u8; 16];
     OsRng.fill_bytes(&mut random);
@@ -905,6 +927,7 @@ fn random_internal_name(label: &str) -> OsString {
     name.into()
 }
 
+#[cfg(unix)]
 fn create_staging_file(parent: &Dir, label: &str) -> Result<(OsString, File), OperationError> {
     for _ in 0..8 {
         let name = random_internal_name(label);
@@ -1012,7 +1035,10 @@ fn rename_exchange(
     .map_err(|error| OperationError::Io(error.into()))
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+#[cfg(all(
+    unix,
+    not(any(target_os = "linux", target_os = "android", target_vendor = "apple"))
+))]
 fn rename_noreplace(
     _source_parent: &Dir,
     _source: &OsStr,
@@ -1022,7 +1048,10 @@ fn rename_noreplace(
     Err(OperationError::TransactionalUnavailable)
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+#[cfg(all(
+    unix,
+    not(any(target_os = "linux", target_os = "android", target_vendor = "apple"))
+))]
 fn rename_exchange(
     _left_parent: &Dir,
     _left: &OsStr,
@@ -1032,28 +1061,31 @@ fn rename_exchange(
     Err(OperationError::TransactionalUnavailable)
 }
 
-#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+#[cfg(unix)]
 fn owner_quarantine(parent: &Dir) -> Result<Dir, OperationError> {
-    match parent.create_dir(QUARANTINE_DIRECTORY) {
+    use cap_std::fs::MetadataExt as _;
+
+    let mut builder = DirBuilder::new();
+    builder.mode(0o700);
+    match parent.create_dir_with(QUARANTINE_DIRECTORY, &builder) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
         Err(error) => return Err(error.into()),
     }
+
+    // Pin the directory without following a replacement link, then validate
+    // both authority and access before moving any peer-controlled object into
+    // it. Creation uses 0700 directly because cap-std may represent a Linux
+    // directory with O_PATH, on which fchmod fails with EBADF.
     let directory = parent.open_dir_nofollow(QUARANTINE_DIRECTORY)?;
-    use cap_std::fs::MetadataExt as _;
-    if directory.dir_metadata()?.uid() != rustix::process::geteuid().as_raw() {
+    let metadata = directory.dir_metadata()?;
+    if metadata.uid() != rustix::process::geteuid().as_raw() || metadata.mode() & 0o7777 != 0o700 {
         return Err(OperationError::RepairRequired);
     }
-    rustix::fs::fchmod(&directory, rustix::fs::Mode::RWXU)
-        .map_err(|error| OperationError::Io(error.into()))?;
     Ok(directory)
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
-fn owner_quarantine(_parent: &Dir) -> Result<Dir, OperationError> {
-    Err(OperationError::TransactionalUnavailable)
-}
-
+#[cfg(unix)]
 fn rename_to_random_stage(
     source_parent: &Dir,
     source: &OsStr,
@@ -1071,12 +1103,14 @@ fn rename_to_random_stage(
     Err(OperationError::RepairRequired)
 }
 
+#[cfg(unix)]
 fn quarantine_entry(parent: &Dir, entry: &OsStr, quarantine: &Dir) -> Result<(), OperationError> {
     rename_to_random_stage(parent, entry, quarantine, "repair")
         .map(drop)
         .map_err(|_| OperationError::RepairRequired)
 }
 
+#[cfg(unix)]
 fn restore_or_quarantine(
     staging_parent: &Dir,
     staging: &OsStr,
@@ -1101,11 +1135,14 @@ fn remove_pinned(
     quarantine: &Dir,
     control: Option<&RequestControl>,
 ) -> Result<(), OperationError> {
+    #[cfg(not(test))]
+    let _ = control;
     // Atomically take the pathname out of the peer-writable share before the
     // final identity check. If a racer substituted anything, that object is
     // retained in the owner-only quarantine rather than unlinked.
+    #[cfg(test)]
     if let Some(control) = control {
-        control.notify_before_isolation();
+        control.notify_before_isolation(leaf);
     }
     let isolated = rename_to_random_stage(parent, leaf, quarantine, "discard")?;
     if !matches!(name_matches_pinned(quarantine, &isolated, pinned), Ok(true)) {
@@ -1119,18 +1156,13 @@ fn remove_pinned(
 }
 
 #[cfg(unix)]
-fn safe_cleanup_regular(parent: &Dir, leaf: &OsStr) {
-    if let (Ok(quarantine), Ok(pinned)) =
-        (owner_quarantine(parent), pin_supported_object(parent, leaf))
-    {
+fn safe_cleanup_regular(parent: &Dir, leaf: &OsStr, quarantine: &Dir) {
+    if let Ok(pinned) = pin_supported_object(parent, leaf) {
         if pinned.kind == SupportedObjectKind::RegularFile {
-            let _ = remove_pinned(parent, leaf, &pinned, &quarantine, None);
+            let _ = remove_pinned(parent, leaf, &pinned, quarantine, None);
         }
     }
 }
-
-#[cfg(not(unix))]
-fn safe_cleanup_regular(_parent: &Dir, _leaf: &OsStr) {}
 
 #[cfg(unix)]
 fn rollback_exchange_or_quarantine(
@@ -1159,9 +1191,9 @@ fn publish_regular_staging(
     parent: &Dir,
     staging: &OsStr,
     destination: &OsStr,
+    quarantine: &Dir,
     control: &RequestControl,
 ) -> Result<(), OperationError> {
-    let quarantine = owner_quarantine(parent)?;
     let published = pin_supported_object(parent, staging)?;
     if published.kind != SupportedObjectKind::RegularFile {
         return Err(OperationError::UnsupportedFileType);
@@ -1169,27 +1201,29 @@ fn publish_regular_staging(
     match parent.symlink_metadata(destination) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             rename_noreplace(parent, staging, parent, destination)?;
-            control.notify_after_transaction();
+            #[cfg(test)]
+            control.notify_after_transaction(destination);
             if matches!(
                 name_matches_pinned(parent, destination, &published),
                 Ok(true)
             ) {
                 Ok(())
             } else {
-                let _ = quarantine_entry(parent, destination, &quarantine);
+                let _ = quarantine_entry(parent, destination, quarantine);
                 Err(OperationError::RepairRequired)
             }
         }
         Err(error) => Err(error.into()),
         Ok(_) => {
             rename_exchange(parent, staging, parent, destination)?;
-            control.notify_after_transaction();
+            #[cfg(test)]
+            control.notify_after_transaction(destination);
             if !matches!(
                 name_matches_pinned(parent, destination, &published),
                 Ok(true)
             ) {
-                let _ = quarantine_entry(parent, staging, &quarantine);
-                let _ = quarantine_entry(parent, destination, &quarantine);
+                let _ = quarantine_entry(parent, staging, quarantine);
+                let _ = quarantine_entry(parent, destination, quarantine);
                 return Err(OperationError::RepairRequired);
             }
             let displaced = match pin_supported_object(parent, staging) {
@@ -1200,7 +1234,7 @@ fn publish_regular_staging(
                         staging,
                         destination,
                         &published,
-                        &quarantine,
+                        quarantine,
                         OperationError::UnsupportedFileType,
                     ));
                 }
@@ -1210,36 +1244,26 @@ fn publish_regular_staging(
                         staging,
                         destination,
                         &published,
-                        &quarantine,
+                        quarantine,
                         error,
                     ));
                 }
             };
             if let Err(error) =
-                remove_pinned(parent, staging, &displaced, &quarantine, Some(control))
+                remove_pinned(parent, staging, &displaced, quarantine, Some(control))
             {
                 return Err(rollback_exchange_or_quarantine(
                     parent,
                     staging,
                     destination,
                     &published,
-                    &quarantine,
+                    quarantine,
                     error,
                 ));
             }
             Ok(())
         }
     }
-}
-
-#[cfg(not(unix))]
-fn publish_regular_staging(
-    _parent: &Dir,
-    _staging: &OsStr,
-    _destination: &OsStr,
-    _control: &RequestControl,
-) -> Result<(), OperationError> {
-    Err(OperationError::TransactionalUnavailable)
 }
 
 #[cfg(unix)]
@@ -1250,7 +1274,8 @@ fn transactional_delete(
 ) -> Result<(), OperationError> {
     let quarantine = owner_quarantine(parent)?;
     let staging = rename_to_random_stage(parent, leaf, parent, "delete")?;
-    control.notify_after_transaction();
+    #[cfg(test)]
+    control.notify_after_transaction(&staging);
     let pinned = match pin_supported_object(parent, &staging) {
         Ok(pinned) => pinned,
         Err(error) => {
@@ -1281,15 +1306,6 @@ fn transactional_delete(
     }
 }
 
-#[cfg(not(unix))]
-fn transactional_delete(
-    _parent: &Dir,
-    _leaf: &OsStr,
-    _control: &RequestControl,
-) -> Result<(), OperationError> {
-    Err(OperationError::TransactionalUnavailable)
-}
-
 #[cfg(unix)]
 fn transactional_move(
     source_parent: &Dir,
@@ -1305,7 +1321,8 @@ fn transactional_move(
     // First isolate the exact source inode at an unpredictable internal name.
     // No destination path is touched until this inode is pinned and approved.
     let staging = rename_to_random_stage(source_parent, source, source_parent, "move")?;
-    control.notify_after_transaction();
+    #[cfg(test)]
+    control.notify_after_transaction(&staging);
     let moved = match pin_supported_object(source_parent, &staging) {
         Ok(moved) => moved,
         Err(error) => {
@@ -1446,18 +1463,6 @@ fn transactional_move(
     }
 }
 
-#[cfg(not(unix))]
-fn transactional_move(
-    _source_parent: &Dir,
-    _source: &OsStr,
-    _destination_parent: &Dir,
-    _destination: &OsStr,
-    _allow_overwrite: bool,
-    _control: &RequestControl,
-) -> Result<bool, OperationError> {
-    Err(OperationError::TransactionalUnavailable)
-}
-
 fn open_regular_nofollow_nonblocking(
     dir: &Dir,
     relative: &Path,
@@ -1500,58 +1505,83 @@ fn atomic_write(
     body: &[u8],
     control: &RequestControl,
 ) -> Result<(), OperationError> {
-    let (temp, mut file) = create_staging_file(parent, "upload")?;
-    let write_result = (|| {
-        for chunk in body.chunks(64 * 1024) {
-            control.check()?;
-            file.write_all(chunk)?;
-        }
-        file.sync_all()?;
-        #[cfg(test)]
-        control.notify_after_sync();
-        // Cancellation/deadline or epoch revocation after durable staging
-        // must not publish the destination.
-        drop(file);
-        control.commit(|| publish_regular_staging(parent, &temp, destination, control))?;
-        Ok(())
-    })();
-    if write_result.is_err() {
-        safe_cleanup_regular(parent, &temp);
+    #[cfg(not(unix))]
+    {
+        let _ = (parent, destination, body, control);
+        Err(OperationError::TransactionalUnavailable)
     }
-    write_result
+    #[cfg(unix)]
+    {
+        // Validate and pin cleanup authority before creating a temporary file,
+        // so a bad quarantine never turns a failed request into a staging leak.
+        let quarantine = owner_quarantine(parent)?;
+        let (temp, mut file) = create_staging_file(parent, "upload")?;
+        let write_result = (|| {
+            for chunk in body.chunks(64 * 1024) {
+                control.check()?;
+                file.write_all(chunk)?;
+            }
+            file.sync_all()?;
+            #[cfg(test)]
+            control.notify_after_sync();
+            // Cancellation/deadline or epoch revocation after durable staging
+            // must not publish the destination.
+            drop(file);
+            control.commit(|| {
+                publish_regular_staging(parent, &temp, destination, &quarantine, control)
+            })?;
+            Ok(())
+        })();
+        if write_result.is_err() {
+            safe_cleanup_regular(parent, &temp, &quarantine);
+        }
+        write_result
+    }
 }
 
 fn atomic_write_streaming(
     parent: &Dir,
     destination: &OsStr,
-    mut body: StreamingBody,
+    body: StreamingBody,
     control: &RequestControl,
 ) -> Result<(), OperationError> {
-    let (temp, mut file) = create_staging_file(parent, "stream")?;
-    let write_result = (|| {
-        let mut received = 0usize;
-        while let Some(chunk) = body.receiver.blocking_recv() {
-            control.check()?;
-            received = received
-                .checked_add(chunk.len())
-                .ok_or(OperationError::RequestTooLarge)?;
-            if received > body.expected_length {
-                return Err(OperationError::RequestTooLarge);
-            }
-            file.write_all(&chunk)?;
-        }
-        if received != body.expected_length {
-            return Err(OperationError::IncompleteBody);
-        }
-        file.sync_all()?;
-        drop(file);
-        control.commit(|| publish_regular_staging(parent, &temp, destination, control))?;
-        Ok(())
-    })();
-    if write_result.is_err() {
-        safe_cleanup_regular(parent, &temp);
+    #[cfg(not(unix))]
+    {
+        let _ = (parent, destination, body, control);
+        Err(OperationError::TransactionalUnavailable)
     }
-    write_result
+    #[cfg(unix)]
+    {
+        let mut body = body;
+        let quarantine = owner_quarantine(parent)?;
+        let (temp, mut file) = create_staging_file(parent, "stream")?;
+        let write_result = (|| {
+            let mut received = 0usize;
+            while let Some(chunk) = body.receiver.blocking_recv() {
+                control.check()?;
+                received = received
+                    .checked_add(chunk.len())
+                    .ok_or(OperationError::RequestTooLarge)?;
+                if received > body.expected_length {
+                    return Err(OperationError::RequestTooLarge);
+                }
+                file.write_all(&chunk)?;
+            }
+            if received != body.expected_length {
+                return Err(OperationError::IncompleteBody);
+            }
+            file.sync_all()?;
+            drop(file);
+            control.commit(|| {
+                publish_regular_staging(parent, &temp, destination, &quarantine, control)
+            })?;
+            Ok(())
+        })();
+        if write_result.is_err() {
+            safe_cleanup_regular(parent, &temp, &quarantine);
+        }
+        write_result
+    }
 }
 
 #[derive(Clone)]
@@ -1724,11 +1754,14 @@ enum OperationError {
         allow(dead_code)
     )]
     TransactionalUnavailable,
+    #[cfg_attr(not(unix), allow(dead_code))]
     RepairRequired,
     UnsupportedMediaType,
     PreconditionFailed,
     CrossShare,
+    #[cfg_attr(not(unix), allow(dead_code))]
     RequestTooLarge,
+    #[cfg_attr(not(unix), allow(dead_code))]
     IncompleteBody,
     ResponseTooLarge,
     TooManyEntries,
@@ -1846,6 +1879,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn hermetic_webdav_client_server_round_trip() {
         let harness = Harness::new();
@@ -1919,6 +1953,30 @@ mod tests {
         );
     }
 
+    #[cfg(not(unix))]
+    #[test]
+    fn transactional_mutations_fail_closed_without_staging() {
+        let harness = Harness::new();
+        for request in [
+            Request::new("PUT", "/docs/new").with_body(b"data"),
+            Request::new("COPY", "/docs/hello.txt").with_header("Destination", "/docs/copied"),
+            Request::new("DELETE", "/docs/hello.txt"),
+            Request::new("MOVE", "/docs/hello.txt").with_header("Destination", "/docs/moved"),
+        ] {
+            let response = harness.request(&harness.read_write, request);
+            assert_eq!(response.status, 501);
+        }
+        assert!(harness.root.join("hello.txt").exists());
+        assert!(!harness.root.join("new").exists());
+        assert!(!harness.root.join("copied").exists());
+        assert!(!harness.root.join("moved").exists());
+        assert!(!std::fs::read_dir(&harness.root).unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".rustscale-taildrive-")));
+    }
+
     #[cfg(unix)]
     #[test]
     fn traversal_and_symlink_escape_are_blocked() {
@@ -1987,6 +2045,7 @@ mod tests {
         assert!(!harness.root.join("expired").exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn cancellation_after_sync_never_publishes_temp_file() {
         let harness = Harness::new();
@@ -2001,15 +2060,19 @@ mod tests {
         );
         assert_eq!(response.status, 408);
         let deadline = Instant::now() + Duration::from_secs(1);
+        let quarantine = harness.root.join(QUARANTINE_DIRECTORY);
         loop {
             let entries = std::fs::read_dir(&harness.root)
                 .unwrap()
                 .map(|entry| entry.unwrap().file_name())
                 .collect::<Vec<_>>();
-            if !entries.iter().any(|name| {
+            let root_is_clean = !entries.iter().any(|name| {
                 let name = name.to_string_lossy();
                 name.starts_with(".rustscale-taildrive-") && name != QUARANTINE_DIRECTORY
-            }) {
+            });
+            let quarantine_is_clean =
+                !quarantine.exists() || std::fs::read_dir(&quarantine).unwrap().next().is_none();
+            if root_is_clean && quarantine_is_clean {
                 break;
             }
             assert!(
@@ -2018,11 +2081,84 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(5));
         }
-        let quarantine = harness.root.join(QUARANTINE_DIRECTORY);
-        if quarantine.exists() {
-            assert!(std::fs::read_dir(quarantine).unwrap().next().is_none());
-        }
         assert!(!harness.root.join("not-published").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quarantine_creation_is_parallel_idempotent_and_validates_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let harness = Harness::new();
+        let snapshot = harness.server.config.snapshot();
+        let share_root = snapshot.shares.get("docs").unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let mut workers = Vec::new();
+        for _ in 0..8 {
+            let parent = share_root.dir.try_clone().unwrap();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                owner_quarantine(&parent).unwrap();
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let quarantine = harness.root.join(QUARANTINE_DIRECTORY);
+        assert_eq!(
+            std::fs::metadata(&quarantine).unwrap().permissions().mode() & 0o7777,
+            0o700
+        );
+
+        let invalid = Harness::new();
+        let quarantine = invalid.root.join(QUARANTINE_DIRECTORY);
+        std::fs::create_dir(&quarantine).unwrap();
+        std::fs::set_permissions(&quarantine, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let response = invalid.request(
+            &invalid.read_write,
+            Request::new("PUT", "/docs/rejected").with_body(b"data"),
+        );
+        assert_eq!(response.status, 500);
+        assert!(String::from_utf8_lossy(&response.body).contains("owner repair"));
+        assert!(!invalid.root.join("rejected").exists());
+        assert!(!std::fs::read_dir(&invalid.root).unwrap().any(|entry| {
+            let name = entry.unwrap().file_name();
+            let name = name.to_string_lossy();
+            name.starts_with(".rustscale-taildrive-upload-")
+                || name.starts_with(".rustscale-taildrive-stream-")
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn incomplete_streaming_put_cleans_random_staging() {
+        let harness = Harness::new();
+        let (sender, body) = streaming_body_channel(4, 1);
+        sender.try_send(b"abc".to_vec()).unwrap();
+        drop(sender);
+        let response = harness.server.handle_streaming_put(
+            &harness.read_write,
+            Request::new("PUT", "/docs/incomplete"),
+            body,
+            &RequestControl::new(
+                harness.server.request_authority(),
+                Instant::now() + Duration::from_secs(2),
+            ),
+        );
+        assert_eq!(response.status, 400);
+        assert!(!harness.root.join("incomplete").exists());
+        assert!(!std::fs::read_dir(&harness.root).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".rustscale-taildrive-stream-")
+        }));
+        assert!(std::fs::read_dir(harness.root.join(QUARANTINE_DIRECTORY))
+            .unwrap()
+            .next()
+            .is_none());
     }
 
     #[cfg(unix)]
@@ -2166,17 +2302,8 @@ mod tests {
             harness.server.request_authority(),
             Instant::now() + Duration::from_secs(2),
         )
-        .with_after_transaction(Arc::new(move || {
-            let staging = std::fs::read_dir(&hook_root)
-                .unwrap()
-                .map(|entry| entry.unwrap().path())
-                .find(|path| {
-                    path.file_name()
-                        .unwrap()
-                        .to_string_lossy()
-                        .starts_with(".rustscale-taildrive-delete-")
-                })
-                .unwrap();
+        .with_after_transaction(Arc::new(move |staging| {
+            let staging = hook_root.join(staging);
             std::fs::remove_file(&staging).unwrap();
             assert!(Command::new("mkfifo")
                 .arg(&staging)
@@ -2214,17 +2341,8 @@ mod tests {
             harness.server.request_authority(),
             Instant::now() + Duration::from_secs(2),
         )
-        .with_before_isolation(Arc::new(move || {
-            let staging = std::fs::read_dir(&hook_root)
-                .unwrap()
-                .map(|entry| entry.unwrap().path())
-                .find(|path| {
-                    path.file_name()
-                        .unwrap()
-                        .to_string_lossy()
-                        .starts_with(".rustscale-taildrive-delete-")
-                })
-                .unwrap();
+        .with_before_isolation(Arc::new(move |staging| {
+            let staging = hook_root.join(staging);
             std::fs::remove_file(&staging).unwrap();
             assert!(Command::new("mkfifo")
                 .arg(&staging)
@@ -2268,7 +2386,7 @@ mod tests {
             harness.server.request_authority(),
             Instant::now() + Duration::from_secs(2),
         )
-        .with_after_transaction(Arc::new(move || {
+        .with_after_transaction(Arc::new(move |_| {
             *hook_replacement.lock().unwrap() = Some(UnixListener::bind(&hook_victim).unwrap());
         }));
 
@@ -2298,6 +2416,7 @@ mod tests {
         drop(original);
     }
 
+    #[cfg(unix)]
     fn paused_before_commit(
         server: &Server,
     ) -> (
@@ -2326,6 +2445,7 @@ mod tests {
         (control, entered_rx, release)
     }
 
+    #[cfg(unix)]
     fn revoke_then_release(
         server: &Server,
         entered: std::sync::mpsc::Receiver<()>,
@@ -2338,6 +2458,7 @@ mod tests {
         condition.notify_all();
     }
 
+    #[cfg(unix)]
     #[test]
     fn revocation_linearizes_every_webdav_publication() {
         let harness = Harness::new();
@@ -2492,6 +2613,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn many_max_sized_puts_stream_through_bounded_queues() {
         const REQUESTS: usize = 8;

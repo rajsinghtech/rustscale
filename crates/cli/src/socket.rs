@@ -25,16 +25,39 @@ pub fn resolve_socket_path(explicit: Option<PathBuf>) -> PathBuf {
 
     let primary = rustscale_safesocket::default_socket_path();
 
+    #[cfg(unix)]
+    {
+        let fallback = Some(std::path::Path::new(DEFAULT_STATE_DIR).join("rustscaled.sock"));
+        resolve_socket_candidates(primary, fallback)
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows has one canonical named-pipe path, so probing cannot change
+        // the result and would construct a Tokio pipe before runtime entry.
+        primary
+    }
+}
+
+/// Return the first live candidate. Kept separate so the exact default-socket
+/// behavior is testable without binding a machine-global `/var/run` path.
+#[cfg(unix)]
+fn resolve_socket_candidates(primary: PathBuf, fallback: Option<PathBuf>) -> PathBuf {
+    resolve_socket_candidates_with(primary, fallback, socket_is_live)
+}
+
+#[cfg(unix)]
+fn resolve_socket_candidates_with(
+    primary: PathBuf,
+    fallback: Option<PathBuf>,
+    is_live: impl Fn(&std::path::Path) -> bool,
+) -> PathBuf {
     // Try the primary path.
-    if rustscale_safesocket::connect(&primary).is_ok() {
+    if is_live(&primary) {
         return primary;
     }
 
-    // On Unix, try the state-dir fallback.
-    #[cfg(unix)]
-    {
-        let fallback = std::path::Path::new(DEFAULT_STATE_DIR).join("rustscaled.sock");
-        if rustscale_safesocket::connect(&fallback).is_ok() {
+    if let Some(fallback) = fallback {
+        if is_live(&fallback) {
             return fallback;
         }
     }
@@ -42,4 +65,36 @@ pub fn resolve_socket_path(explicit: Option<PathBuf>) -> PathBuf {
     // Neither is connectable — return the primary as the default so the
     // error message is informative.
     primary
+}
+
+/// Check for a Unix socket without connecting to it. A probe connection would
+/// be accepted by LocalAPI and then dropped without an HTTP request, producing
+/// a misleading `Broken pipe` warning on every CLI invocation.
+#[cfg(unix)]
+fn socket_is_live(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+
+    std::fs::metadata(path).is_ok_and(|metadata| metadata.file_type().is_socket())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_default_candidate_neither_requires_tokio_nor_connects() {
+        let temp = tempfile::tempdir().unwrap();
+        let primary = temp.path().join("rustscaled.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&primary).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let fallback = temp.path().join("fallback.sock");
+
+        let resolved = resolve_socket_candidates(primary.clone(), Some(fallback));
+        assert_eq!(resolved, primary);
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "socket discovery must not create a throwaway LocalAPI connection"
+        );
+    }
 }

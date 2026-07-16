@@ -77,6 +77,12 @@ pub async fn run(args: Vec<String>, socket: &Path, json: bool) -> Result<(), Cli
         update.Prefs.AdvertiseTags = tags.split(',').map(|s| s.trim().to_string()).collect();
         update.AdvertiseTagsSet = true;
     }
+    // Omitted preserves the persisted operator. `--operator ""` explicitly
+    // clears it, matching Tailscale's persisted Prefs.OperatorUser behavior.
+    if let Some(operator) = parse_str_flag(&args, "operator") {
+        update.Prefs.OperatorUser = operator;
+        update.OperatorUserSet = true;
+    }
     if parse_bool_flag(&args, "reset").unwrap_or(false) {
         update.Prefs = rustscale_ipn::Prefs::default();
         update.Prefs.WantRunning = true;

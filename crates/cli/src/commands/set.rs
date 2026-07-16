@@ -43,6 +43,12 @@ pub async fn run(args: Vec<String>, socket: &Path) -> Result<(), CliError> {
         mask.Prefs.AdvertiseTags = tags.split(',').map(|s| s.trim().to_string()).collect();
         mask.AdvertiseTagsSet = true;
     }
+    // An absent flag preserves the configured operator; an empty value clears
+    // it explicitly (`rustscale set --operator ""`).
+    if let Some(operator) = parse_str_flag(&args, "operator") {
+        mask.Prefs.OperatorUser = operator;
+        mask.OperatorUserSet = true;
+    }
     if parse_bool_flag(&args, "reset").unwrap_or(false) {
         mask.Prefs = rustscale_ipn::Prefs::default();
         mask.ControlURLSet = true;

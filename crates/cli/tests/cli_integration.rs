@@ -251,6 +251,58 @@ async fn cli_status_table_via_binary() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_set_operator_replaces_and_explicitly_clears_persisted_pref() {
+    let mut env = setup().await;
+    let bin = rustscale_bin();
+
+    let set_operator = |value: &str| {
+        std::process::Command::new(&bin)
+            .arg("--socket")
+            .arg(&env.socket_path)
+            .arg("set")
+            .arg("--operator")
+            .arg(value)
+            .output()
+            .expect("spawn rustscale set --operator")
+    };
+    let first = set_operator("operator-a");
+    assert!(
+        first.status.success(),
+        "set operator failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let client = LocalClient::new(&env.socket_path);
+    assert_eq!(client.prefs().await.unwrap()["OperatorUser"], "operator-a");
+
+    // A normal set operation does not include OperatorUser and therefore
+    // preserves it; only --operator (including an empty argument) changes it.
+    let preserve = std::process::Command::new(&bin)
+        .arg("--socket")
+        .arg(&env.socket_path)
+        .arg("set")
+        .arg("--hostname")
+        .arg("operator-flow")
+        .output()
+        .expect("spawn rustscale set --hostname");
+    assert!(preserve.status.success());
+    assert_eq!(client.prefs().await.unwrap()["OperatorUser"], "operator-a");
+
+    let clear = set_operator("");
+    assert!(
+        clear.status.success(),
+        "clear operator failed: {}",
+        String::from_utf8_lossy(&clear.stderr)
+    );
+    assert_eq!(
+        client.prefs().await.unwrap()["OperatorUser"]
+            .as_str()
+            .unwrap_or_default(),
+        ""
+    );
+    env.server.close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cli_ip_via_localclient() {
     let mut env = setup().await;
 

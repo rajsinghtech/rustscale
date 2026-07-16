@@ -29,6 +29,8 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+#[cfg(unix)]
+use std::time::Duration;
 
 use rustscale_clientmetric::Registry as MetricRegistry;
 use rustscale_filter::Filter;
@@ -287,6 +289,10 @@ pub(crate) struct LocalApiState {
     /// renders them via `to_prometheus_text()`.
     pub metrics: MetricRegistry,
     pub prefs: Arc<RwLock<Prefs>>,
+    /// Cached result for the persisted `Prefs.OperatorUser` lookup. The name
+    /// accompanies the uid so replacement and revocation cannot reuse a uid
+    /// resolved for an older preference value.
+    pub(crate) operator_access: std::sync::Mutex<OperatorAccess>,
     /// Serializes profile/preference commits and notification enqueue order.
     pub profile_mutations: Arc<tokio::sync::Mutex<()>>,
     /// Pending persisted exit-node selection, retried only until it resolves.
@@ -370,6 +376,71 @@ pub(crate) struct LocalApiState {
     pub policy_subscription: std::sync::Mutex<Option<Box<dyn crate::PreferencePolicySubscription>>>,
 }
 
+#[derive(Default)]
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) struct OperatorAccess {
+    username: String,
+    uid: Option<u32>,
+}
+
+#[cfg(unix)]
+const NSS_LOOKUP_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Resolve `Prefs.OperatorUser` without ever running NSS on a Tokio worker.
+/// A timeout, cancellation, malformed name, or NSS error is authorization
+/// failure. The blocking NSS call may outlive the timeout, but it is isolated
+/// to Tokio's blocking pool rather than pinning an async worker.
+#[cfg(unix)]
+async fn operator_uid(state: &LocalApiState) -> Option<u32> {
+    let username = state.prefs.read().await.OperatorUser.clone();
+    if username.is_empty() {
+        return None;
+    }
+    if let Ok(access) = state.operator_access.lock() {
+        if access.username == username {
+            // Successful lookups are stable until the preference changes. A
+            // failed NSS lookup is deliberately retried on a later request:
+            // directory services can recover without an operator-pref edit.
+            if let Some(uid) = access.uid {
+                return Some(uid);
+            }
+        }
+    } else {
+        return None;
+    }
+
+    let lookup_name = username.clone();
+    let resolved = match tokio::time::timeout(
+        NSS_LOOKUP_TIMEOUT,
+        tokio::task::spawn_blocking(move || {
+            rustscale_safesocket::peercred::lookup_uid_by_username(&lookup_name)
+        }),
+    )
+    .await
+    {
+        Ok(Ok(uid)) => uid,
+        Ok(Err(error)) => {
+            log::warn!("localapi: operator NSS lookup task failed: {error}");
+            None
+        }
+        Err(_) => {
+            log::warn!("localapi: operator NSS lookup timed out; denying access");
+            None
+        }
+    };
+
+    let still_current = state.prefs.read().await.OperatorUser == username;
+    if let Ok(mut access) = state.operator_access.lock() {
+        // A preference commit is serialized with mutation admission. Never
+        // let a delayed lookup overwrite a newer operator value.
+        if still_current {
+            access.username = username;
+            access.uid = resolved;
+        }
+    }
+    resolved
+}
+
 pub(crate) async fn activate_preference_policy(state: &Arc<LocalApiState>) -> Result<(), String> {
     let Some(policy) = state.preference_policy.clone() else {
         return Ok(());
@@ -428,6 +499,7 @@ async fn commit_prefs_update(
         policy.reconcile(&mut candidate)?;
     }
     let changed = candidate != *prefs;
+    let operator_changed = candidate.OperatorUser != prefs.OperatorUser;
     if changed {
         if let Some(ref dir) = state.state_dir {
             candidate
@@ -435,6 +507,16 @@ async fn commit_prefs_update(
                 .map_err(|error| format!("saving preferences: {error}"))?;
         }
         *prefs = candidate;
+        if operator_changed {
+            // Revoke any old uid before releasing the mutation fence. The
+            // replacement account is resolved lazily and fail-closed on its
+            // first request, so a failed NSS lookup cannot grant access.
+            *state
+                .operator_access
+                .lock()
+                .map_err(|_| "operator access lock poisoned".to_string())? =
+                OperatorAccess::default();
+        }
     }
     state
         .posture_checking
@@ -1559,22 +1641,23 @@ async fn handle_connection(
 /// Check whether the peer has read-write access. On Unix, compares the peer's
 /// uid against the daemon's uid (and root). On non-Unix platforms, always
 /// returns true (named-pipe ACL handles access control).
-fn require_readwrite(identity: &ConnIdentity) -> bool {
-    #[cfg(unix)]
-    {
-        let daemon_uid = unsafe { libc::getuid() };
-        identity.is_readwrite(daemon_uid, None)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = identity;
-        true
-    }
+#[cfg(unix)]
+async fn require_readwrite(identity: &ConnIdentity, state: &LocalApiState) -> bool {
+    let daemon_uid = unsafe { libc::getuid() };
+    identity.is_readwrite(daemon_uid, operator_uid(state).await)
+}
+
+#[cfg(not(unix))]
+#[allow(clippy::unused_async)]
+async fn require_readwrite(_identity: &ConnIdentity, _state: &LocalApiState) -> bool {
+    true
 }
 
 /// Write a 403 Forbidden response for read-only peers attempting mutations.
 async fn write_access_denied<W: AsyncWrite + Unpin>(conn: &mut W) -> Result<(), std::io::Error> {
-    let body = serde_json::json!({"error": "access denied"});
+    let body = serde_json::json!({
+        "error": "access denied; run as root/the daemon user or configure Prefs.OperatorUser"
+    });
     write_json_response(conn, 403, "Forbidden", &body).await
 }
 
@@ -1692,13 +1775,17 @@ pub(crate) async fn dispatch<W: AsyncRead + AsyncWrite + Unpin>(
     // before any mutating handler can observe or persist state. Holding the
     // permit through dispatch linearizes a mutation against listener handoff.
     let mut mutation = if is_mutating_request(method, endpoint) {
-        if !require_readwrite(peer_identity) {
-            write_access_denied(conn).await?;
-            return Ok(());
-        }
         let Some(permit) = admit_mutation(conn, state).await? else {
             return Ok(());
         };
+        // Keep authorization inside the mutation fence. This makes operator
+        // replacement/revocation take effect before another mutation can be
+        // admitted, while a failed NSS lookup remains fail-closed.
+        if !require_readwrite(peer_identity, state).await {
+            drop(permit);
+            write_access_denied(conn).await?;
+            return Ok(());
+        }
         Some(permit)
     } else {
         None
@@ -1735,7 +1822,16 @@ pub(crate) async fn dispatch<W: AsyncRead + AsyncWrite + Unpin>(
 
         // --- POST /localapi/v0/login-interactive ---
         "login-interactive" if method == "POST" => {
-            state.login_trigger.notify_waiters();
+            // `notify_one` retains one permit when bootstrap has not yet
+            // installed its waiter. Exactly one bootstrap follow-up consumes
+            // it; unlike notify_waiters an early POST cannot be lost.
+            state.login_trigger.notify_one();
+            // A standalone `rustscale login` arrives while the daemon is in
+            // NeedsLogin. It must start bootstrap, not merely signal the
+            // auth-url waiter that does not exist yet.
+            if let Some(tx) = &state.command_tx {
+                let _ = tx.send(DaemonCommand::LoginInteractive);
+            }
             write_no_content_response(conn, 204, "No Content").await?;
         }
 
@@ -1773,7 +1869,9 @@ pub(crate) async fn dispatch<W: AsyncRead + AsyncWrite + Unpin>(
 
         // --- POST /localapi/v0/routecheck?probe=true&timeout=5s ---
         "routecheck" if method == "POST" => {
-            if routecheck_probe_requested(&req.query) && !require_readwrite(peer_identity) {
+            if routecheck_probe_requested(&req.query)
+                && !require_readwrite(peer_identity, state).await
+            {
                 write_access_denied(conn).await?;
                 return Ok(());
             }
@@ -1906,7 +2004,7 @@ pub(crate) async fn dispatch<W: AsyncRead + AsyncWrite + Unpin>(
 
         // --- GET /localapi/v0/id-token ---
         "id-token" if method == "GET" => {
-            if !require_readwrite(peer_identity) {
+            if !require_readwrite(peer_identity, state).await {
                 write_access_denied(conn).await?;
                 return Ok(());
             }
@@ -4264,6 +4362,7 @@ mod tests {
                 WantRunning: true,
                 ..Default::default()
             })),
+            operator_access: std::sync::Mutex::default(),
             posture_checking: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             profile_mutations: Arc::new(tokio::sync::Mutex::new(())),
             exit_node_selection: Arc::new(RwLock::new(crate::ExitNodeSelection::default())),
@@ -5891,6 +5990,7 @@ mod tests {
             capture: state.capture.clone(),
             metrics: default_metric_registry(),
             prefs: state.prefs.clone(),
+            operator_access: std::sync::Mutex::default(),
             posture_checking: state.posture_checking.clone(),
             profile_mutations: state.profile_mutations.clone(),
             exit_node_selection: state.exit_node_selection.clone(),
@@ -6132,6 +6232,7 @@ mod tests {
             capture: base.capture.clone(),
             metrics: default_metric_registry(),
             prefs: base.prefs.clone(),
+            operator_access: std::sync::Mutex::default(),
             posture_checking: base.posture_checking.clone(),
             profile_mutations: base.profile_mutations.clone(),
             exit_node_selection: base.exit_node_selection.clone(),
@@ -6739,6 +6840,89 @@ mod tests {
         )
         .await;
         assert!(resp.contains("403 Forbidden"));
+    }
+
+    #[tokio::test]
+    async fn login_interactive_early_post_is_durable_and_starts_bootstrap() {
+        let mut state = make_test_state().await;
+        let (command_tx, mut command_rx) = mpsc::unbounded_channel();
+        Arc::get_mut(&mut state).unwrap().command_tx = Some(command_tx);
+
+        // No waiter has been installed yet. The POST must leave one durable
+        // permit for bootstrap and also wake the NeedsLogin daemon loop.
+        let resp = send_request_with_identity(
+            b"POST /localapi/v0/login-interactive HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            &state,
+            test_rw_identity(),
+        )
+        .await;
+        assert!(resp.contains("204 No Content"), "response: {resp}");
+        assert!(matches!(
+            command_rx.recv().await,
+            Some(DaemonCommand::LoginInteractive)
+        ));
+        tokio::time::timeout(Duration::from_millis(100), state.login_trigger.notified())
+            .await
+            .expect("early login POST was lost before bootstrap installed its waiter");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn operator_authorization_matrix_and_replacement_revocation() {
+        let state = make_test_state().await;
+        const OLD_OPERATOR: u32 = 4_242_421;
+        const NEW_OPERATOR: u32 = 4_242_422;
+        let daemon_uid = unsafe { libc::getuid() };
+        assert_ne!(daemon_uid, OLD_OPERATOR);
+        assert_ne!(daemon_uid, NEW_OPERATOR);
+
+        state.prefs.write().await.OperatorUser = "old-operator".into();
+        *state.operator_access.lock().unwrap() = OperatorAccess {
+            username: "old-operator".into(),
+            uid: Some(OLD_OPERATOR),
+        };
+        let identity = |uid| ConnIdentity {
+            uid: Some(uid),
+            pid: None,
+            is_unix_sock: true,
+        };
+        assert!(require_readwrite(&identity(0), &state).await, "root");
+        assert!(
+            require_readwrite(&identity(daemon_uid), &state).await,
+            "daemon"
+        );
+        assert!(
+            require_readwrite(&identity(OLD_OPERATOR), &state).await,
+            "operator"
+        );
+        assert!(
+            !require_readwrite(&identity(NEW_OPERATOR), &state).await,
+            "unrelated uid"
+        );
+
+        let mut replace = MaskedPrefs::default();
+        replace.Prefs.OperatorUser = "new-operator".into();
+        replace.OperatorUserSet = true;
+        commit_prefs_update(&state, |prefs| replace.apply_to(prefs))
+            .await
+            .unwrap();
+        assert!(state.operator_access.lock().unwrap().username.is_empty());
+        // Install the deterministic NSS result for the replacement. Old
+        // access was revoked by the preference commit before this point.
+        *state.operator_access.lock().unwrap() = OperatorAccess {
+            username: "new-operator".into(),
+            uid: Some(NEW_OPERATOR),
+        };
+        assert!(!require_readwrite(&identity(OLD_OPERATOR), &state).await);
+        assert!(require_readwrite(&identity(NEW_OPERATOR), &state).await);
+
+        let mut clear = MaskedPrefs::default();
+        clear.Prefs.OperatorUser = String::new();
+        clear.OperatorUserSet = true;
+        commit_prefs_update(&state, |prefs| clear.apply_to(prefs))
+            .await
+            .unwrap();
+        assert!(!require_readwrite(&identity(NEW_OPERATOR), &state).await);
     }
 
     #[tokio::test]

@@ -578,6 +578,7 @@ impl Server {
             capture: inner.capture.clone(),
             metrics: crate::localapi::default_metric_registry(),
             prefs: inner.prefs.clone(),
+            operator_access: std::sync::Mutex::default(),
             posture_checking: inner.posture_checking.clone(),
             profile_mutations: inner.profile_mutations.clone(),
             exit_node_selection: inner.exit_node_selection.clone(),

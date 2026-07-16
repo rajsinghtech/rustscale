@@ -562,12 +562,17 @@ post_install() {
     [ -f "$WORKDIR/rustscale.h" ]         && echo "  $PREFIX/include/rustscale.h"
     echo
     echo "Get started:"
-    echo "  sudo rustscaled run          # start the daemon"
+    if [ "${SERVICE_INSTALLED:-0}" = 1 ]; then
+        echo "  sudo rustscale set --operator \"\$USER\"  # one-time ordinary-user access"
+    else
+        echo "  sudo rustscaled run          # start the daemon"
+        echo "  sudo rustscale set --operator \"\$USER\"  # one-time ordinary-user access"
+    fi
     echo "  rustscale up                 # connect to a tailnet"
     echo "  rustscale status             # check state"
     if [ "${SERVICE_INSTALLED:-0}" = 1 ]; then
         echo
-        echo "The rustscaled system service is installed and running."
+        echo "The rustscaled system service is installed and running; do not start a second daemon."
     fi
     case "$PREFIX" in
         /usr/local|/usr) ;;

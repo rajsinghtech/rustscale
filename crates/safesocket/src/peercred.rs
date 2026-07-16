@@ -54,6 +54,53 @@ impl ConnIdentity {
     }
 }
 
+/// Resolve a local account name to its numeric uid using the platform's NSS
+/// path. A lookup failure is intentionally indistinguishable from an absent
+/// user to callers: authorization must fail closed.
+///
+/// This mirrors Tailscale's `osuser.LookupByUsername` used for
+/// `Prefs.OperatorUser`. Callers must run it off async worker threads because
+/// NSS modules are allowed to block on network directory services.
+#[cfg(unix)]
+pub fn lookup_uid_by_username(username: &str) -> Option<u32> {
+    use std::ffi::CString;
+    use std::ptr;
+
+    let username = CString::new(username).ok()?;
+    let mut buffer_len = unsafe { libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) };
+    if buffer_len < 0 {
+        buffer_len = 16 * 1024;
+    }
+    let mut buffer_len = usize::try_from(buffer_len).ok()?.max(1024);
+
+    loop {
+        let mut passwd = unsafe { std::mem::zeroed::<libc::passwd>() };
+        let mut result = ptr::null_mut();
+        let mut buffer = vec![0 as libc::c_char; buffer_len];
+        let status = unsafe {
+            libc::getpwnam_r(
+                username.as_ptr(),
+                &raw mut passwd,
+                buffer.as_mut_ptr(),
+                buffer.len(),
+                &raw mut result,
+            )
+        };
+        if status == 0 {
+            return (!result.is_null()).then_some(passwd.pw_uid);
+        }
+        if status != libc::ERANGE || buffer_len >= 1024 * 1024 {
+            return None;
+        }
+        buffer_len *= 2;
+    }
+}
+
+#[cfg(not(unix))]
+pub fn lookup_uid_by_username(_username: &str) -> Option<u32> {
+    None
+}
+
 // ---------------------------------------------------------------------------
 // Platform-specific peer-credential extraction (unix only)
 // ---------------------------------------------------------------------------

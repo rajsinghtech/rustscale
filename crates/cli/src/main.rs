@@ -112,13 +112,12 @@ fn main() {
         std::process::exit(1);
     };
 
-    let socket_path = socket::resolve_socket_path(socket);
-
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("failed to create tokio runtime");
 
+    let socket_path = socket::resolve_socket_path(socket);
     let result = rt.block_on(dispatch(&subcommand, sub_args, socket_path, json));
 
     if let Err(e) = result {
@@ -232,7 +231,12 @@ pub struct CliError(pub String);
 
 impl From<rustscale_localclient::LocalClientError> for CliError {
     fn from(e: rustscale_localclient::LocalClientError) -> Self {
-        CliError(e.to_string())
+        match e {
+            rustscale_localclient::LocalClientError::AccessDenied(message) => CliError(format!(
+                "access denied: {message}. Ask an administrator to run `sudo rustscale set --operator $USER` once, or run this command as root/the daemon user."
+            )),
+            other => CliError(other.to_string()),
+        }
     }
 }
 

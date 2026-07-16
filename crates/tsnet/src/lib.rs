@@ -799,6 +799,8 @@ impl ServerBuilder {
             bootstrap_supervisor: Arc::new(BootstrapSupervisor::default()),
             startup_supervisor: Arc::new(BootstrapSupervisor::default()),
             shutdown_supervisor: Arc::new(BootstrapSupervisor::default()),
+            logout_trigger: Arc::new(tokio::sync::Notify::new()),
+            logout_completion: localapi::LogoutCompletion::new(),
             #[cfg(test)]
             logout_test_hook: None,
             #[cfg(test)]
@@ -913,6 +915,7 @@ pub(crate) struct RunningState {
     /// and transition to NeedsLogin. Stored here so the daemon can select
     /// on it alongside shutdown signals.
     pub(crate) logout_trigger: Arc<tokio::sync::Notify>,
+    pub(crate) logout_completion: Arc<localapi::LogoutCompletion>,
     /// Registered fallback TCP handlers (called when no listener matches an
     /// incoming TCP flow). Each entry is a boxed callback keyed by a unique
     /// ID; `register_fallback_tcp_handler` returns a guard whose `Drop`
@@ -1076,6 +1079,7 @@ pub(crate) struct Bootstrap {
 pub(crate) struct BootstrapSupervisor {
     state: std::sync::Mutex<CleanupGenerationState>,
     changed: tokio::sync::Notify,
+    terminal: std::sync::atomic::AtomicBool,
 }
 
 pub(crate) struct CleanupOwner {
@@ -1106,6 +1110,7 @@ pub(crate) struct LogoutTransaction {
     state_scope: Option<state::StateScope>,
     tailnet_identity: String,
     prefs: rustscale_ipn::Prefs,
+    completion: Arc<localapi::LogoutCompletion>,
     phase: LogoutPhase,
     #[cfg(test)]
     state_save_failures: usize,
@@ -1215,11 +1220,20 @@ impl BootstrapSupervisor {
     }
 
     pub(crate) fn retain_logout(&self, transaction: LogoutTransaction) {
+        if self.terminal.load(std::sync::atomic::Ordering::Acquire) {
+            crate::lifecycle::retain_terminal_logout(transaction);
+            return;
+        }
         self.state
             .lock()
             .expect("cleanup generation lock poisoned")
             .retained_logouts
             .push(transaction);
+    }
+
+    pub(crate) fn mark_terminal(&self) {
+        self.terminal
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     pub(crate) fn take_retained_logout(&self) -> Option<LogoutTransaction> {
@@ -1297,6 +1311,9 @@ pub struct Server {
     pub(crate) bootstrap_supervisor: Arc<BootstrapSupervisor>,
     pub(crate) startup_supervisor: Arc<BootstrapSupervisor>,
     pub(crate) shutdown_supervisor: Arc<BootstrapSupervisor>,
+    /// One trigger shared by every LocalAPI generation and the daemon owner.
+    pub(crate) logout_trigger: Arc<tokio::sync::Notify>,
+    pub(crate) logout_completion: Arc<localapi::LogoutCompletion>,
     #[cfg(test)]
     pub(crate) logout_test_hook: Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>,
     #[cfg(test)]

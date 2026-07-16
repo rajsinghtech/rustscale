@@ -649,6 +649,7 @@ impl Server {
             exit_map_gate: inner.exit_map_gate.clone(),
             router: inner.router.clone(),
             logout_trigger: inner.logout_trigger.clone(),
+            logout_completion: Arc::clone(&inner.logout_completion),
             suggested_exit_node: Arc::new(RwLock::new(String::new())),
             config_path: None,
             client_updater: inner.client_updater.clone(),

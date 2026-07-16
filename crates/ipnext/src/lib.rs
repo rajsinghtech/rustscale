@@ -267,6 +267,71 @@ struct ManagedExtension {
     /// Callback registrations are staged per extension and become visible
     /// only when that extension completes initialization successfully.
     hooks: Arc<Hooks>,
+    /// One retained shutdown attempt. A synchronously blocking poll keeps one
+    /// globally capped worker, never an ambient Tokio worker or runtime drop.
+    shutdown_attempt: Arc<ShutdownAttempt>,
+}
+
+enum ShutdownAttemptStatus {
+    Idle,
+    Running,
+    Complete(Result<(), String>),
+}
+
+struct ShutdownAttempt {
+    status: Mutex<ShutdownAttemptStatus>,
+    changed: tokio::sync::Notify,
+}
+
+impl ShutdownAttempt {
+    fn new() -> Self {
+        Self {
+            status: Mutex::new(ShutdownAttemptStatus::Idle),
+            changed: tokio::sync::Notify::new(),
+        }
+    }
+}
+
+struct ShutdownJob {
+    extension: Arc<dyn Extension>,
+    attempt: Arc<ShutdownAttempt>,
+}
+
+const SHUTDOWN_WORKERS: usize = 8;
+const SHUTDOWN_QUEUE_CAPACITY: usize = 16;
+
+fn shutdown_worker_sender() -> &'static std::sync::mpsc::SyncSender<ShutdownJob> {
+    static SENDER: OnceLock<std::sync::mpsc::SyncSender<ShutdownJob>> = OnceLock::new();
+    SENDER.get_or_init(|| {
+        let (sender, receiver) =
+            std::sync::mpsc::sync_channel::<ShutdownJob>(SHUTDOWN_QUEUE_CAPACITY);
+        let receiver = Arc::new(Mutex::new(receiver));
+        for worker in 0..SHUTDOWN_WORKERS {
+            let receiver = Arc::clone(&receiver);
+            std::thread::Builder::new()
+                .name(format!("ipnext-shutdown-{worker}"))
+                .spawn(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("build extension shutdown runtime");
+                    loop {
+                        let job = match lock_unpoisoned(&receiver).recv() {
+                            Ok(job) => job,
+                            Err(_) => return,
+                        };
+                        let result = runtime
+                            .block_on(job.extension.shutdown())
+                            .map_err(|error| error.to_string());
+                        *lock_unpoisoned(&job.attempt.status) =
+                            ShutdownAttemptStatus::Complete(result);
+                        job.attempt.changed.notify_waiters();
+                    }
+                })
+                .expect("spawn extension shutdown worker");
+        }
+        sender
+    })
 }
 
 const CREATED: u8 = 0;
@@ -572,6 +637,7 @@ impl ExtensionHost {
                 name: registered_name,
                 extension,
                 hooks: Arc::new(Hooks::default()),
+                shutdown_attempt: Arc::new(ShutdownAttempt::new()),
             });
         }
 
@@ -1016,43 +1082,67 @@ async fn cleanup_partial_init(extension: ManagedExtension) -> Option<BoxError> {
     #[cfg(not(test))]
     const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-    let mut cleanup = tokio::spawn(async move { extension.extension.shutdown().await });
-    if let Ok(result) = tokio::time::timeout(TIMEOUT, &mut cleanup).await {
-        return result
-            .map_err(join_error)
-            .and_then(std::convert::identity)
-            .err();
+    match tokio::time::timeout(TIMEOUT, invoke_shutdown(extension)).await {
+        Ok(result) => result.err(),
+        Err(_) => Some(Box::new(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "partial extension cleanup timed out",
+        ))),
     }
-    cleanup.abort();
-    let _ = cleanup.await;
-    Some(Box::new(std::io::Error::new(
-        std::io::ErrorKind::TimedOut,
-        "partial extension cleanup timed out",
-    )))
+}
+
+fn start_shutdown_attempt(extension: &ManagedExtension) -> ExtensionResult {
+    let mut status = lock_unpoisoned(&extension.shutdown_attempt.status);
+    if !matches!(*status, ShutdownAttemptStatus::Idle) {
+        return Ok(());
+    }
+    *status = ShutdownAttemptStatus::Running;
+    let job = ShutdownJob {
+        extension: Arc::clone(&extension.extension),
+        attempt: Arc::clone(&extension.shutdown_attempt),
+    };
+    if let Err(error) = shutdown_worker_sender().try_send(job) {
+        *status = ShutdownAttemptStatus::Idle;
+        return Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            format!("extension shutdown worker queue unavailable: {error}"),
+        )));
+    }
+    Ok(())
 }
 
 async fn invoke_shutdown(extension: ManagedExtension) -> ExtensionResult {
-    // Poll user shutdown code on an independently owned runtime. A callback
-    // that blocks inside poll may leak this detached thread, but it cannot pin
-    // the caller's Tokio runtime or make runtime destruction wait forever.
-    let (result_tx, result_rx) = oneshot::channel();
-    let name = extension.name.to_string();
-    std::thread::Builder::new()
-        .name(format!("ipnext-shutdown-{name}"))
-        .spawn(move || {
-            let result = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|error| -> BoxError { Box::new(error) })
-                .and_then(|runtime| runtime.block_on(extension.extension.shutdown()));
-            let _ = result_tx.send(result);
-        })
-        .map_err(|error| -> BoxError { Box::new(error) })?;
-    result_rx.await.map_err(|_| {
-        Box::new(std::io::Error::other(
-            "extension shutdown worker stopped without a result",
-        )) as BoxError
-    })?
+    // A retained attempt is shared by partial-init compensation and every
+    // later host-shutdown retry. Timing out an API waiter therefore never
+    // aborts, awaits, forgets, or duplicates a synchronously blocked poll.
+    start_shutdown_attempt(&extension)?;
+    loop {
+        let changed = extension.shutdown_attempt.changed.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        let complete = {
+            let mut status = lock_unpoisoned(&extension.shutdown_attempt.status);
+            match &*status {
+                ShutdownAttemptStatus::Complete(Ok(())) => return Ok(()),
+                ShutdownAttemptStatus::Complete(Err(_)) => {
+                    match std::mem::replace(&mut *status, ShutdownAttemptStatus::Idle) {
+                        ShutdownAttemptStatus::Complete(Err(error)) => Some(error),
+                        _ => unreachable!("shutdown completion changed under lock"),
+                    }
+                }
+                ShutdownAttemptStatus::Idle => {
+                    drop(status);
+                    start_shutdown_attempt(&extension)?;
+                    None
+                }
+                ShutdownAttemptStatus::Running => None,
+            }
+        };
+        if let Some(error) = complete {
+            return Err(Box::new(std::io::Error::other(error)));
+        }
+        changed.await;
+    }
 }
 
 fn join_error(error: tokio::task::JoinError) -> BoxError {
@@ -1804,6 +1894,7 @@ mod tests {
             shutdowns: Arc<AtomicUsize>,
             block_cleanup: bool,
             cleanup_dropped: Arc<AtomicBool>,
+            release: Arc<Notify>,
         }
         struct DropFlag(Arc<AtomicBool>);
         impl Drop for DropFlag {
@@ -1823,7 +1914,7 @@ mod tests {
                 let call = self.shutdowns.fetch_add(1, Ordering::SeqCst);
                 if self.block_cleanup && call == 0 {
                     let _drop = DropFlag(Arc::clone(&self.cleanup_dropped));
-                    std::future::pending::<()>().await;
+                    self.release.notified().await;
                 }
                 Ok(())
             }
@@ -1832,15 +1923,18 @@ mod tests {
         for block_cleanup in [false, true] {
             let shutdowns = Arc::new(AtomicUsize::new(0));
             let cleanup_dropped = Arc::new(AtomicBool::new(false));
+            let release = Arc::new(Notify::new());
             let registry = ExtensionRegistry::new();
             let factory_shutdowns = Arc::clone(&shutdowns);
             let factory_dropped = Arc::clone(&cleanup_dropped);
+            let factory_release = Arc::clone(&release);
             registry
                 .register(Definition::new("failed-init", move |_| {
                     Ok(Arc::new(FailedInit {
                         shutdowns: Arc::clone(&factory_shutdowns),
                         block_cleanup,
                         cleanup_dropped: Arc::clone(&factory_dropped),
+                        release: Arc::clone(&factory_release),
                     }))
                 }))
                 .unwrap();
@@ -1853,14 +1947,90 @@ mod tests {
             assert_eq!(shutdowns.load(Ordering::SeqCst), 1);
             if block_cleanup {
                 assert!(report.failed[0].source.to_string().contains("timed out"));
-                assert!(cleanup_dropped.load(Ordering::SeqCst));
+                assert!(!cleanup_dropped.load(Ordering::SeqCst));
+                release.notify_one();
             }
             host.shutdown().await.unwrap();
-            assert_eq!(
-                shutdowns.load(Ordering::SeqCst),
-                if block_cleanup { 2 } else { 1 }
-            );
+            assert!(cleanup_dropped.load(Ordering::SeqCst) || !block_cleanup);
+            assert_eq!(shutdowns.load(Ordering::SeqCst), 1);
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn synchronously_blocked_failed_init_cleanup_is_isolated_and_retained() {
+        struct SyncBlockingCleanup {
+            entered: std::sync::mpsc::Sender<()>,
+            release: Arc<(Mutex<bool>, std::sync::Condvar)>,
+        }
+
+        #[async_trait]
+        impl Extension for SyncBlockingCleanup {
+            fn name(&self) -> &'static str {
+                "sync-blocked-failed-init"
+            }
+
+            async fn init(&self, _: Host) -> ExtensionResult {
+                Err(Box::new(std::io::Error::other("injected init failure")))
+            }
+
+            async fn shutdown(&self) -> ExtensionResult {
+                let _ = self.entered.send(());
+                let (lock, changed) = &*self.release;
+                let mut released = lock_unpoisoned(lock);
+                while !*released {
+                    released = changed
+                        .wait(released)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                }
+                Ok(())
+            }
+        }
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let registry = ExtensionRegistry::new();
+        let factory_release = Arc::clone(&release);
+        registry
+            .register(Definition::new("sync-blocked-failed-init", move |_| {
+                Ok(Arc::new(SyncBlockingCleanup {
+                    entered: entered_tx.clone(),
+                    release: Arc::clone(&factory_release),
+                }))
+            }))
+            .unwrap();
+        let host = ExtensionHost::new(&registry, Arc::new(System::new())).unwrap();
+
+        let started = std::time::Instant::now();
+        let report = tokio::time::timeout(Duration::from_secs(1), host.start())
+            .await
+            .expect("startup was pinned by a synchronous shutdown poll")
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(report.failed.len(), 1);
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("isolated cleanup worker did not enter shutdown");
+        assert_eq!(
+            host.shutdown().await.unwrap_err().lifecycle_error(),
+            Some(LifecycleError::Busy)
+        );
+
+        let (lock, changed) = &*release;
+        *lock_unpoisoned(lock) = true;
+        changed.notify_all();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                match host.shutdown().await {
+                    Ok(()) => break,
+                    Err(error) if error.lifecycle_error() == Some(LifecycleError::Busy) => {
+                        tokio::task::yield_now().await;
+                    }
+                    Err(error) => panic!("unexpected shutdown error: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("retained cleanup owner did not observe worker completion");
     }
 
     #[tokio::test]

@@ -138,6 +138,54 @@ pub async fn run(
     result
 }
 
+trait LogoutRunner {
+    type Error: std::fmt::Display;
+
+    fn attempt_logout(
+        &mut self,
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send;
+}
+
+impl LogoutRunner for Server {
+    type Error = rustscale_tsnet::TsnetError;
+
+    async fn attempt_logout(&mut self) -> Result<(), Self::Error> {
+        Server::logout(self).await
+    }
+}
+
+/// Retry a retained logout phase with bounded exponential backoff. Each
+/// attempt is cancellation-safe because Server transfers transaction ownership
+/// before awaiting; shutdown stops daemon retries and Drop continues ownership.
+async fn retry_logout_until_shutdown<R, S>(
+    runner: &mut R,
+    mut shutdown: std::pin::Pin<&mut S>,
+) -> bool
+where
+    R: LogoutRunner,
+    S: std::future::Future<Output = ()> + ?Sized,
+{
+    let mut delay = std::time::Duration::from_millis(25);
+    loop {
+        let result = tokio::select! {
+            result = runner.attempt_logout() => Some(result),
+            () = shutdown.as_mut() => None,
+        };
+        match result {
+            Some(Ok(())) => return true,
+            Some(Err(error)) => {
+                log::warn!("rustscaled: logout incomplete; retrying: {error}");
+            }
+            None => return false,
+        }
+        tokio::select! {
+            () = tokio::time::sleep(delay) => {}
+            () = shutdown.as_mut() => return false,
+        }
+        delay = (delay * 2).min(std::time::Duration::from_secs(5));
+    }
+}
+
 async fn run_with_auth_key(
     auth_key: &str,
     state_dir: &Path,
@@ -195,22 +243,31 @@ async fn run_with_auth_key(
 
     print_status(&server, socket_path);
 
-    // Wait for either shutdown or logout.
+    // Wait for either shutdown or logout. A transient register/disk/cleanup
+    // failure resumes the retained transaction rather than falling through to
+    // close and silently abandoning its remaining phases.
     let logout_trigger = server.logout_trigger();
     let config_path_clone = config_path.clone();
-    tokio::select! {
-        () = wait_for_shutdown_signal(config_path_clone.as_ref()) => {}
+    let mut shutdown = Box::pin(wait_for_shutdown_signal(config_path_clone.as_ref()));
+    let logout_requested = tokio::select! {
+        () = shutdown.as_mut() => false,
         () = async {
             if let Some(ref trigger) = logout_trigger {
                 trigger.notified().await;
             } else {
                 std::future::pending::<()>().await;
             }
-        } => {
-            log::info!("rustscaled: logout requested");
-            server.logout().await?;
-            log::info!("rustscaled: logged out, state cleared → NeedsLogin");
+        } => true,
+    };
+    if logout_requested {
+        log::info!("rustscaled: logout requested");
+        if !retry_logout_until_shutdown(&mut server, shutdown.as_mut()).await {
+            server.fail_pending_logout_requests("daemon shutdown interrupted logout completion");
+            log::info!("rustscaled: shutdown interrupted logout; Drop retained its transaction");
+            return Ok(());
         }
+        server.complete_pending_logout_requests();
+        log::info!("rustscaled: logged out, state cleared → NeedsLogin");
     }
 
     log::info!("rustscaled: shutting down...");
@@ -303,6 +360,7 @@ async fn run_interactive(
             }
             DaemonCommand::Logout => {
                 log::info!("rustscaled: logout requested (server not up yet)");
+                server.fail_pending_logout_requests("server is not logged in");
             }
             DaemonCommand::Shutdown => {
                 log::debug!("rustscaled: shutdown requested (server not up yet)");
@@ -335,9 +393,10 @@ async fn run_interactive(
     // daemon continues to wait for the next event.
     let logout_trigger = server.logout_trigger();
     let config_path_clone = config_path.clone();
+    let mut shutdown = Box::pin(wait_for_shutdown_signal(config_path_clone.as_ref()));
     loop {
         tokio::select! {
-            () = wait_for_shutdown_signal(config_path_clone.as_ref()) => break,
+            () = shutdown.as_mut() => break,
             () = async {
                 if let Some(ref trigger) = logout_trigger {
                     trigger.notified().await;
@@ -346,7 +405,16 @@ async fn run_interactive(
                 }
             } => {
                 log::info!("rustscaled: logout requested");
-                server.logout().await?;
+                if !retry_logout_until_shutdown(&mut server, shutdown.as_mut()).await {
+                    server.fail_pending_logout_requests(
+                        "daemon shutdown interrupted logout completion",
+                    );
+                    log::info!(
+                        "rustscaled: shutdown interrupted logout; Drop retained its transaction"
+                    );
+                    return Ok(());
+                }
+                server.complete_pending_logout_requests();
                 log::info!("rustscaled: logged out, state cleared → NeedsLogin");
                 break;
             }
@@ -354,6 +422,18 @@ async fn run_interactive(
                 match cmd {
                     DaemonCommand::Shutdown => {
                         log::debug!("rustscaled: shutdown requested via LocalAPI");
+                        break;
+                    }
+                    DaemonCommand::Logout => {
+                        log::info!("rustscaled: logout requested via LocalAPI command");
+                        if !retry_logout_until_shutdown(&mut server, shutdown.as_mut()).await {
+                            server.fail_pending_logout_requests(
+                                "daemon shutdown interrupted logout completion",
+                            );
+                            return Ok(());
+                        }
+                        server.complete_pending_logout_requests();
+                        log::info!("rustscaled: logged out, state cleared → NeedsLogin");
                         break;
                     }
                     DaemonCommand::ReloadConfig => {
@@ -615,7 +695,43 @@ mod tests {
     };
     use rustscale_tsnet::PreferencePolicy;
 
-    use super::InstallUpdatesPolicy;
+    use super::{retry_logout_until_shutdown, InstallUpdatesPolicy, LogoutRunner};
+
+    struct TransientLogout {
+        remaining_failures: usize,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl LogoutRunner for TransientLogout {
+        type Error = std::io::Error;
+
+        async fn attempt_logout(&mut self) -> Result<(), Self::Error> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.remaining_failures > 0 {
+                self.remaining_failures -= 1;
+                Err(std::io::Error::other("injected transient logout failure"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn daemon_retries_transient_logout_until_durable_success() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut logout = TransientLogout {
+            remaining_failures: 2,
+            calls: Arc::clone(&calls),
+        };
+        let mut shutdown = Box::pin(std::future::pending::<()>());
+        assert!(tokio::time::timeout(
+            Duration::from_secs(1),
+            retry_logout_until_shutdown(&mut logout, shutdown.as_mut()),
+        )
+        .await
+        .expect("logout retries exceeded their bounded backoff"));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
 
     #[test]
     fn install_updates_policy_forces_existing_preference() {

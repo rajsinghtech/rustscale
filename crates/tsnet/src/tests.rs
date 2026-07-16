@@ -275,7 +275,19 @@ async fn incomplete_close_preserves_router_dns_and_magicsock_until_retry() {
     })
     .await
     .expect("Drop did not finish the retained close owner");
-    let rebound = tokio::net::UdpSocket::bind(bound).await.unwrap();
+    let rebound = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            match tokio::net::UdpSocket::bind(bound).await {
+                Ok(socket) => break socket,
+                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                Err(error) => panic!("unexpected UDP rebind failure: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("Drop cleanup retained the magicsock UDP socket");
     drop(rebound);
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
 }
@@ -499,6 +511,7 @@ async fn cancelled_logout_transaction_blocks_retry_until_owned_cleanup_finishes(
         .control_url(control.base_url())
         .state_dir(temp.path())
         .localapi_path(&socket)
+        .disable_portmapping(true)
         .build()
         .unwrap();
     Box::pin(server.up()).await.unwrap();
@@ -535,19 +548,24 @@ async fn cancelled_logout_transaction_blocks_retry_until_owned_cleanup_finishes(
                 Some(LogoutPhase::Cleanup)
             );
             let mut completed = false;
-            for _ in 0..5 {
+            let mut retry_errors = Vec::new();
+            for attempt in 0..20 {
                 match server.logout().await {
                     Ok(()) => {
                         completed = true;
                         break;
                     }
-                    Err(TsnetError::ShutdownIncomplete(_)) => {}
+                    Err(error @ TsnetError::ShutdownIncomplete(_)) => {
+                        retry_errors.push(error.to_string());
+                        tokio::time::sleep(std::time::Duration::from_millis(5 * (attempt + 1)))
+                            .await;
+                    }
                     Err(error) => panic!("unexpected logout retry failure: {error}"),
                 }
             }
             assert!(
                 completed,
-                "logout cleanup did not complete after bounded retries"
+                "logout cleanup did not complete after bounded retries: {retry_errors:?}"
             );
             let commands = server.start_localapi_only().await.unwrap();
             drop(commands);

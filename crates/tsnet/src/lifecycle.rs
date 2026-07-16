@@ -244,6 +244,135 @@ impl Drop for BootstrapRollback {
 }
 
 const COMPONENT_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+#[cfg(test)]
+const ROUTER_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
+#[cfg(not(test))]
+const ROUTER_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const ROUTER_CLEANUP_WORKERS: usize = 2;
+const ROUTER_CLEANUP_QUEUE_CAPACITY: usize = 16;
+
+struct RouterCleanupAttempt {
+    result: std::sync::Mutex<Option<Result<(), String>>>,
+    changed: tokio::sync::Notify,
+}
+
+struct RouterCleanupJob {
+    router: SharedRouter,
+    attempt: Arc<RouterCleanupAttempt>,
+}
+
+struct RouterCleanupScheduler {
+    sender: std::sync::mpsc::SyncSender<RouterCleanupJob>,
+    attempts: std::sync::Mutex<std::collections::HashMap<usize, Arc<RouterCleanupAttempt>>>,
+}
+
+impl RouterCleanupScheduler {
+    fn global() -> &'static Self {
+        static SCHEDULER: std::sync::OnceLock<RouterCleanupScheduler> = std::sync::OnceLock::new();
+        SCHEDULER.get_or_init(|| {
+            let (sender, receiver) =
+                std::sync::mpsc::sync_channel::<RouterCleanupJob>(ROUTER_CLEANUP_QUEUE_CAPACITY);
+            let receiver = Arc::new(std::sync::Mutex::new(receiver));
+            for worker in 0..ROUTER_CLEANUP_WORKERS {
+                let receiver = Arc::clone(&receiver);
+                std::thread::Builder::new()
+                    .name(format!("rustscale-router-close-{worker}"))
+                    .spawn(move || loop {
+                        let job = match receiver
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .recv()
+                        {
+                            Ok(job) => job,
+                            Err(_) => return,
+                        };
+                        let result = cleanup_router_owner_blocking(&job.router)
+                            .map_err(|error| error.to_string());
+                        *job.attempt
+                            .result
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(result);
+                        job.attempt.changed.notify_waiters();
+                    })
+                    .expect("spawn bounded router cleanup worker");
+            }
+            Self {
+                sender,
+                attempts: std::sync::Mutex::new(std::collections::HashMap::new()),
+            }
+        })
+    }
+
+    fn attempt(&self, router: &SharedRouter) -> Result<Arc<RouterCleanupAttempt>, TsnetError> {
+        let key = Arc::as_ptr(router) as usize;
+        let mut attempts = self
+            .attempts
+            .lock()
+            .map_err(|_| TsnetError::Builder("router cleanup attempt lock poisoned".into()))?;
+        if let Some(attempt) = attempts.get(&key) {
+            return Ok(Arc::clone(attempt));
+        }
+        let attempt = Arc::new(RouterCleanupAttempt {
+            result: std::sync::Mutex::new(None),
+            changed: tokio::sync::Notify::new(),
+        });
+        attempts.insert(key, Arc::clone(&attempt));
+        if let Err(error) = self.sender.try_send(RouterCleanupJob {
+            router: Arc::clone(router),
+            attempt: Arc::clone(&attempt),
+        }) {
+            attempts.remove(&key);
+            return Err(TsnetError::ShutdownIncomplete(format!(
+                "router cleanup worker queue unavailable: {error}"
+            )));
+        }
+        Ok(attempt)
+    }
+
+    fn forget(&self, key: usize, attempt: &Arc<RouterCleanupAttempt>) {
+        let mut attempts = self
+            .attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if attempts
+            .get(&key)
+            .is_some_and(|current| Arc::ptr_eq(current, attempt))
+        {
+            attempts.remove(&key);
+        }
+    }
+}
+
+async fn wait_router_cleanup(router: &SharedRouter) -> Result<(), TsnetError> {
+    let scheduler = RouterCleanupScheduler::global();
+    let key = Arc::as_ptr(router) as usize;
+    let attempt = scheduler.attempt(router)?;
+    let wait = async {
+        loop {
+            let changed = attempt.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if let Some(result) = attempt
+                .result
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            {
+                return result;
+            }
+            changed.await;
+        }
+    };
+    match tokio::time::timeout(ROUTER_CLEANUP_TIMEOUT, wait).await {
+        Ok(result) => {
+            scheduler.forget(key, &attempt);
+            result.map_err(|error| TsnetError::Builder(format!("route cleanup failed: {error}")))
+        }
+        Err(_) => Err(TsnetError::ShutdownIncomplete(
+            "route cleanup exceeded its bounded worker deadline".into(),
+        )),
+    }
+}
 
 async fn shutdown_magicsock(magicsock: &Magicsock) -> Result<(), String> {
     let portmapper = magicsock
@@ -471,7 +600,7 @@ impl Drop for StartupRollback {
             // Every route-mutating owner is now joined. Router teardown is
             // deliberately last so no map/local/link callback can reinstall.
             if let Some(router) = router {
-                let _ = Server::cleanup_or_supervise(router);
+                let _ = Server::cleanup_or_supervise(router).await;
             }
             if let Some(configurator) = configurator.as_mut() {
                 let _ = configurator.close();
@@ -578,7 +707,7 @@ async fn shutdown_extension_host(
     }
 }
 
-async fn quiesce_running_state(inner: &mut RunningState) {
+async fn quiesce_running_state(inner: &mut RunningState, preserve_localapi: bool) {
     inner.cancel.cancel();
     inner.health_watchdog.stop();
     for abort in inner
@@ -620,8 +749,10 @@ async fn quiesce_running_state(inner: &mut RunningState) {
     inner.magicsock.set_connection_counter(None);
     inner.audit_logger.request_stop();
 
-    if let Some(localapi) = inner.localapi_handle.take() {
-        localapi.shutdown().await;
+    if !preserve_localapi {
+        if let Some(localapi) = inner.localapi_handle.take() {
+            localapi.shutdown().await;
+        }
     }
     if let Some(serve) = inner.serve.take() {
         serve.stop().await;
@@ -653,13 +784,13 @@ async fn quiesce_running_state(inner: &mut RunningState) {
     }
 }
 
-async fn finish_running_state(mut inner: RunningState) -> Result<(), RunningState> {
+async fn finish_running_state(mut inner: RunningState) -> Result<(), (RunningState, String)> {
     // Extension shutdown has succeeded, so dependencies owned by the router,
     // DNS configurator, and magicsock can now be released.
     if let Some(router) = inner.router.take() {
-        if let Err(error) = Server::cleanup_or_supervise(router) {
+        if let Err(error) = Server::cleanup_or_supervise(router).await {
             log::warn!("tsnet: retaining route cleanup owner: {error}");
-            return Err(inner);
+            return Err((inner, format!("route cleanup: {error}")));
         }
     }
     if let Some(configurator) = inner.os_dns_configurator.as_mut() {
@@ -670,7 +801,7 @@ async fn finish_running_state(mut inner: RunningState) -> Result<(), RunningStat
     inner.os_dns_configurator.take();
     if let Err(error) = shutdown_magicsock(&inner.magicsock).await {
         log::warn!("tsnet: retaining running cleanup owner: {error}");
-        return Err(inner);
+        return Err((inner, format!("magicsock cleanup: {error}")));
     }
     inner.health_watchdog.stop_and_wait().await;
 
@@ -686,13 +817,12 @@ async fn finish_running_state(mut inner: RunningState) -> Result<(), RunningStat
     Ok(())
 }
 
-async fn cleanup_server_state(mut owner: CleanupOwner) -> Result<(), CleanupOwner> {
-    if let Err(error) = Server::retry_pending_router_cleanup() {
-        log::warn!("tsnet: pending route cleanup remains incomplete: {error}");
-        return Err(owner);
-    }
+async fn cleanup_server_state(mut owner: CleanupOwner) -> Result<(), (CleanupOwner, String)> {
+    // This owner closes only its own router below. Unrelated retained TUN
+    // owners gate future startup globally, but must not make a userspace
+    // server's close/logout spuriously consume their retry budget.
     if let Some(inner) = owner.inner.as_mut() {
-        quiesce_running_state(inner).await;
+        quiesce_running_state(inner, false).await;
     }
     if let Some(pre_started) = owner.pre_started.as_mut() {
         // Stop external admission, but retain its magicsock until extensions
@@ -703,14 +833,14 @@ async fn cleanup_server_state(mut owner: CleanupOwner) -> Result<(), CleanupOwne
     if let Some(host) = owner.extension_host.take() {
         if let Err(host) = shutdown_extension_host(host).await {
             owner.extension_host = Some(host);
-            return Err(owner);
+            return Err((owner, "extension shutdown remains incomplete".into()));
         }
     }
 
     if let Some(inner) = owner.inner.take() {
-        if let Err(inner) = finish_running_state(inner).await {
+        if let Err((inner, reason)) = finish_running_state(inner).await {
             owner.inner = Some(inner);
-            return Err(owner);
+            return Err((owner, reason));
         }
     }
     if let Some(pre_started) = owner.pre_started.take() {
@@ -740,7 +870,7 @@ async fn logout_running_transaction(
                 // Revoke every runtime writer and join it before any durable
                 // logout phase can replace identity, cache, or preferences.
                 transaction.drive.disable().await;
-                quiesce_running_state(inner).await;
+                quiesce_running_state(inner, true).await;
                 transaction.drive.disable().await;
                 transaction.phase = LogoutPhase::ControlLogout;
             }
@@ -841,16 +971,22 @@ async fn logout_running_transaction(
                     Prefs: Some(serde_json::to_value(&transaction.prefs).unwrap_or_default()),
                     ..Default::default()
                 });
+                // Durable identity, cache, and preference state now agree.
+                // Unblock LocalAPI before final listener/component cleanup so
+                // its truthful 204 can drain through the listener being closed.
+                transaction.completion.complete(Ok(()));
                 transaction.phase = LogoutPhase::Cleanup;
             }
             LogoutPhase::Cleanup => {
                 let owner = std::mem::replace(&mut transaction.owner, CleanupOwner::empty());
                 return match cleanup_server_state(owner).await {
                     Ok(()) => Ok(()),
-                    Err(owner) => {
+                    Err((owner, reason)) => {
                         transaction.owner = owner;
                         Err((
-                            TsnetError::ShutdownIncomplete("logout cleanup requires retry".into()),
+                            TsnetError::ShutdownIncomplete(format!(
+                                "logout cleanup requires retry: {reason}"
+                            )),
                             transaction,
                         ))
                     }
@@ -926,29 +1062,34 @@ fn netlog_node(node: &Node) -> rustscale_netlogtype::Node {
     }
 }
 
-impl Server {
-    fn cleanup_router_owner(router: &SharedRouter) -> Result<(), TsnetError> {
-        let mut managed = router
-            .lock()
-            .map_err(|_| TsnetError::Builder("router cleanup lock poisoned".into()))?;
-        managed
-            .router
-            .close()
-            .map_err(|error| TsnetError::Builder(format!("route cleanup failed: {error}")))?;
-        managed.security_block_attempted = false;
-        managed.security_block_verified = false;
-        managed.security_block_reasons = 0;
-        if managed.exit_node {
-            rustscale_netns::release_physical_underlay_bypass(&managed.tun_name);
-            managed.exit_node = false;
-        }
-        Ok(())
+fn cleanup_router_owner_blocking(router: &SharedRouter) -> Result<(), TsnetError> {
+    let mut managed = router
+        .lock()
+        .map_err(|_| TsnetError::Builder("router cleanup lock poisoned".into()))?;
+    managed
+        .router
+        .close()
+        .map_err(|error| TsnetError::Builder(format!("route cleanup failed: {error}")))?;
+    managed.security_block_attempted = false;
+    managed.security_block_verified = false;
+    managed.security_block_reasons = 0;
+    if managed.exit_node {
+        rustscale_netns::release_physical_underlay_bypass(&managed.tun_name);
+        managed.exit_node = false;
     }
+    Ok(())
+}
 
+impl Server {
     fn router_cleanup_supervisor() -> &'static std::sync::Mutex<Vec<SharedRouter>> {
         static SUPERVISOR: std::sync::OnceLock<std::sync::Mutex<Vec<SharedRouter>>> =
             std::sync::OnceLock::new();
         SUPERVISOR.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+    }
+
+    fn router_cleanup_gate() -> &'static tokio::sync::Mutex<()> {
+        static GATE: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+        GATE.get_or_init(|| tokio::sync::Mutex::new(()))
     }
 
     fn supervise_router_cleanup(router: SharedRouter) {
@@ -958,8 +1099,9 @@ impl Server {
         }
     }
 
-    pub(crate) fn cleanup_or_supervise(router: SharedRouter) -> Result<(), TsnetError> {
-        match Self::cleanup_router_owner(&router) {
+    pub(crate) async fn cleanup_or_supervise(router: SharedRouter) -> Result<(), TsnetError> {
+        let _gate = Self::router_cleanup_gate().lock().await;
+        match wait_router_cleanup(&router).await {
             Ok(()) => Ok(()),
             Err(error) => {
                 Self::supervise_router_cleanup(router);
@@ -968,19 +1110,29 @@ impl Server {
         }
     }
 
-    fn retry_pending_router_cleanup() -> Result<(), TsnetError> {
-        // Hold the supervisor lock through cleanup so a concurrent close cannot
-        // enqueue a stale owner between the final check and startup admission.
-        let mut supervisor = Self::router_cleanup_supervisor()
-            .lock()
-            .map_err(|_| TsnetError::Builder("router cleanup supervisor poisoned".into()))?;
-        let pending = std::mem::take(&mut *supervisor);
+    async fn retry_pending_router_cleanup() -> Result<(), TsnetError> {
+        // Serialize draining with enqueue so successful restart admission can
+        // never race a newly retained owner.
+        let _gate = Self::router_cleanup_gate().lock().await;
+        let pending = {
+            let mut supervisor = Self::router_cleanup_supervisor()
+                .lock()
+                .map_err(|_| TsnetError::Builder("router cleanup supervisor poisoned".into()))?;
+            std::mem::take(&mut *supervisor)
+        };
+        let mut retained = Vec::new();
         let mut errors = Vec::new();
         for router in pending {
-            if let Err(error) = Self::cleanup_router_owner(&router) {
+            if let Err(error) = wait_router_cleanup(&router).await {
                 errors.push(error.to_string());
-                supervisor.push(router);
+                retained.push(router);
             }
+        }
+        if !retained.is_empty() {
+            Self::router_cleanup_supervisor()
+                .lock()
+                .map_err(|_| TsnetError::Builder("router cleanup supervisor poisoned".into()))?
+                .extend(retained);
         }
         if errors.is_empty() {
             Ok(())
@@ -1013,7 +1165,7 @@ impl Server {
         if self.inner.is_some() {
             return Ok(self.status());
         }
-        Self::retry_pending_router_cleanup()?;
+        Self::retry_pending_router_cleanup().await?;
         self.ensure_extension_host().await?;
 
         ensure_ring_provider();
@@ -1483,11 +1635,8 @@ impl Server {
                 route_table: Some(b.route_table.clone()),
                 exit_map_gate: b.exit_map_gate.clone(),
                 router: None,
-                logout_trigger: self
-                    .pre_started
-                    .as_ref()
-                    .map(|ps| ps.logout_trigger.clone())
-                    .unwrap_or_else(|| Arc::new(tokio::sync::Notify::new())),
+                logout_trigger: Arc::clone(&self.logout_trigger),
+                logout_completion: Arc::clone(&self.logout_completion),
                 suggested_exit_node: suggested_exit_node.clone(),
                 config_path: self.config.config_path.clone(),
                 client_updater: client_updater.clone(),
@@ -1620,11 +1769,8 @@ impl Server {
             key_expired: b.key_expired,
             os_dns_configurator: None,
             ipn_backend: b.ipn_backend,
-            logout_trigger: self
-                .pre_started
-                .as_ref()
-                .map(|ps| ps.logout_trigger.clone())
-                .unwrap_or_else(|| Arc::new(tokio::sync::Notify::new())),
+            logout_trigger: Arc::clone(&self.logout_trigger),
+            logout_completion: Arc::clone(&self.logout_completion),
             fallback_tcp_handlers: Arc::new(std::sync::Mutex::new(vec![])),
             fallback_next_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             prefs: prefs.clone(),
@@ -1664,7 +1810,7 @@ impl Server {
         if self.inner.is_some() {
             return Ok(self.status());
         }
-        Self::retry_pending_router_cleanup()?;
+        Self::retry_pending_router_cleanup().await?;
         self.ensure_extension_host().await?;
 
         ensure_ring_provider();
@@ -2142,11 +2288,8 @@ impl Server {
                 route_table: Some(b.route_table.clone()),
                 exit_map_gate: b.exit_map_gate.clone(),
                 router: router.clone(),
-                logout_trigger: self
-                    .pre_started
-                    .as_ref()
-                    .map(|ps| ps.logout_trigger.clone())
-                    .unwrap_or_else(|| Arc::new(tokio::sync::Notify::new())),
+                logout_trigger: Arc::clone(&self.logout_trigger),
+                logout_completion: Arc::clone(&self.logout_completion),
                 suggested_exit_node: suggested_exit_node.clone(),
                 config_path: self.config.config_path.clone(),
                 client_updater: client_updater.clone(),
@@ -2290,11 +2433,8 @@ impl Server {
             key_expired: b.key_expired,
             os_dns_configurator,
             ipn_backend: b.ipn_backend,
-            logout_trigger: self
-                .pre_started
-                .as_ref()
-                .map(|ps| ps.logout_trigger.clone())
-                .unwrap_or_else(|| Arc::new(tokio::sync::Notify::new())),
+            logout_trigger: Arc::clone(&self.logout_trigger),
+            logout_completion: Arc::clone(&self.logout_completion),
             fallback_tcp_handlers: Arc::new(std::sync::Mutex::new(vec![])),
             fallback_next_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             prefs: prefs.clone(),
@@ -2507,7 +2647,7 @@ impl Server {
             });
             self.shutdown_supervisor.wait().await;
         }
-        Self::retry_pending_router_cleanup()?;
+        Self::retry_pending_router_cleanup().await?;
 
         let ipn_backend = Arc::new(IpnBackend::new("rustscale"));
         ipn_backend.set_want_running();
@@ -2534,7 +2674,7 @@ impl Server {
         let command_tx_clone = command_tx.clone();
         let login_trigger = Arc::new(tokio::sync::Notify::new());
         let auth_url = Arc::new(std::sync::Mutex::new(None));
-        let logout_trigger = Arc::new(tokio::sync::Notify::new());
+        let logout_trigger = Arc::clone(&self.logout_trigger);
 
         let (magicsock, _wg_rx) = Magicsock::new(MagicsockConfig {
             private_key: state.node_key.clone(),
@@ -2633,6 +2773,7 @@ impl Server {
             exit_map_gate: Arc::new(tokio::sync::Mutex::new(())),
             router: None,
             logout_trigger: logout_trigger.clone(),
+            logout_completion: Arc::clone(&self.logout_completion),
             suggested_exit_node: Arc::new(RwLock::new(String::new())),
             config_path: self.config.config_path.clone(),
             client_updater: Arc::new(std::sync::Mutex::new(
@@ -3656,11 +3797,11 @@ impl Server {
             drive.disable().await;
             match cleanup_server_state(owner).await {
                 Ok(()) => Ok(()),
-                Err(owner) => {
+                Err((owner, reason)) => {
                     cleanup_supervisor.retain_owner(owner);
-                    Err(TsnetError::ShutdownIncomplete(
-                        "extension shutdown is busy or failed; retry close".into(),
-                    ))
+                    Err(TsnetError::ShutdownIncomplete(format!(
+                        "server cleanup is busy or failed; retry close: {reason}"
+                    )))
                 }
             }
         });
@@ -3681,6 +3822,16 @@ impl Server {
                     .as_ref()
                     .map(|ps| ps.logout_trigger.clone())
             })
+    }
+
+    /// Fail any LocalAPI logout request still waiting when daemon shutdown
+    /// intentionally stops durable transaction retries.
+    pub fn complete_pending_logout_requests(&self) {
+        self.logout_completion.complete(Ok(()));
+    }
+
+    pub fn fail_pending_logout_requests(&self, reason: impl Into<String>) {
+        self.logout_completion.complete(Err(reason.into()));
     }
 
     /// Log out: send a logout register request to the control plane
@@ -3711,6 +3862,7 @@ impl Server {
                 state_scope: self.profile_state_scope(),
                 tailnet_identity: String::new(),
                 prefs: self.load_prefs().unwrap_or_default(),
+                completion: Arc::clone(&self.logout_completion),
                 phase: LogoutPhase::Quiesce,
                 #[cfg(test)]
                 state_save_failures: std::mem::take(&mut self.logout_state_save_failures),
@@ -3770,7 +3922,7 @@ impl Server {
     pub async fn switch_profile(&mut self, profile_id: &str) -> Result<(), TsnetError> {
         // 1. Stop the running engine (like close() but keep the config).
         self.close().await?;
-        Self::retry_pending_router_cleanup()?;
+        Self::retry_pending_router_cleanup().await?;
 
         // 2. Update current profile + prefs from the ProfileManager.
         //    (ProfileManager lives in state_dir on disk; reload it.)
@@ -3970,6 +4122,49 @@ fn revoke_owner_authority_terminal(owner: &mut CleanupOwner, drive: &crate::driv
     }
 }
 
+pub(crate) fn retain_terminal_logout(transaction: LogoutTransaction) {
+    static SENDER: std::sync::OnceLock<std::sync::mpsc::Sender<LogoutTransaction>> =
+        std::sync::OnceLock::new();
+    let sender = SENDER.get_or_init(|| {
+        let (sender, receiver) = std::sync::mpsc::channel::<LogoutTransaction>();
+        std::thread::Builder::new()
+            .name("rustscale-logout-continuation".into())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build terminal logout continuation runtime");
+                while let Ok(mut transaction) = receiver.recv() {
+                    let mut delay = std::time::Duration::from_millis(25);
+                    loop {
+                        revoke_owner_authority_terminal(&mut transaction.owner, &transaction.drive);
+                        match runtime.block_on(logout_running_transaction(transaction)) {
+                            Ok(()) => break,
+                            Err((error, retained)) => {
+                                transaction = retained;
+                                log::warn!(
+                                    "tsnet: terminal logout continuation retrying {:?}: {error}",
+                                    transaction.phase
+                                );
+                                std::thread::sleep(delay);
+                                delay = (delay * 2).min(std::time::Duration::from_secs(5));
+                            }
+                        }
+                    }
+                }
+            })
+            .expect("spawn terminal logout continuation worker");
+        sender
+    });
+    if let Err(error) = sender.send(transaction) {
+        // The worker can stop only after all senders disappear, which the
+        // process-global sender prevents. Preserve ownership even after an
+        // unexpected panic rather than silently degrading logout into close.
+        log::error!("tsnet: terminal logout continuation stopped; retaining leaked transaction");
+        std::mem::forget(Box::new(error.0));
+    }
+}
+
 async fn wait_cleanup_supervisor_until(
     supervisor: &BootstrapSupervisor,
     deadline: tokio::time::Instant,
@@ -3988,6 +4183,14 @@ async fn finish_dropped_cleanup(
 ) {
     let deadline = tokio::time::Instant::now() + DROP_CLEANUP_DEADLINE;
     revoke_owner_authority_terminal(&mut owner, &drive);
+    // Any in-flight logout worker that finishes after this point transfers its
+    // complete phase owner to the process-wide continuation. Move already
+    // retained transactions there before a bounded supervisor wait can expire.
+    shutdown_supervisor.mark_terminal();
+    while let Some(mut transaction) = shutdown_supervisor.take_retained_logout() {
+        revoke_owner_authority_terminal(&mut transaction.owner, &transaction.drive);
+        retain_terminal_logout(transaction);
+    }
 
     for (name, supervisor) in [
         ("bootstrap", &bootstrap_supervisor),
@@ -4013,7 +4216,7 @@ async fn finish_dropped_cleanup(
     }
     while let Some(mut transaction) = shutdown_supervisor.take_retained_logout() {
         revoke_owner_authority_terminal(&mut transaction.owner, &transaction.drive);
-        owners.push(transaction.owner);
+        retain_terminal_logout(transaction);
     }
 
     for mut owner in owners {
@@ -4023,7 +4226,8 @@ async fn finish_dropped_cleanup(
             drive.disable().await;
             match tokio::time::timeout_at(deadline, cleanup_server_state(owner)).await {
                 Ok(Ok(())) => break,
-                Ok(Err(mut retained)) => {
+                Ok(Err((mut retained, reason))) => {
+                    log::warn!("tsnet: terminal cleanup retry required: {reason}");
                     revoke_owner_authority_terminal(&mut retained, &drive);
                     owner = retained;
                     if attempt == DROP_CLEANUP_ATTEMPTS {
@@ -4112,6 +4316,38 @@ mod exit_cleanup_tests {
         closes: Arc<AtomicUsize>,
     }
 
+    struct BlockingCleanupRouter {
+        entered: std::sync::mpsc::Sender<()>,
+        release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    impl rustscale_router::Router for BlockingCleanupRouter {
+        fn up(&mut self) -> Result<(), rustscale_router::RouterError> {
+            Ok(())
+        }
+
+        fn set(
+            &mut self,
+            _config: &rustscale_router::RouterConfig,
+        ) -> Result<(), rustscale_router::RouterError> {
+            Ok(())
+        }
+
+        fn close(&mut self) -> Result<(), rustscale_router::RouterError> {
+            let _ = self.entered.send(());
+            let (lock, changed) = &*self.release;
+            let mut released = lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            while !*released {
+                released = changed
+                    .wait(released)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            Ok(())
+        }
+    }
+
     impl rustscale_router::Router for RetryCleanupRouter {
         fn up(&mut self) -> Result<(), rustscale_router::RouterError> {
             Ok(())
@@ -4135,8 +4371,51 @@ mod exit_cleanup_tests {
         }
     }
 
-    #[test]
-    fn cleanup_owner_survives_failure_and_blocks_until_retry_succeeds() {
+    #[tokio::test]
+    async fn blocking_router_close_times_out_off_runtime_and_remains_retryable() {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let owner = Arc::new(std::sync::Mutex::new(ManagedRouter {
+            router: Box::new(BlockingCleanupRouter {
+                entered: entered_tx,
+                release: Arc::clone(&release),
+            }),
+            tun_name: "rustscale-blocked0".into(),
+            exit_node: false,
+            security_block_attempted: false,
+            security_block_verified: false,
+            security_block_reasons: 0,
+        }));
+
+        let heartbeat = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            true
+        });
+        let started = tokio::time::Instant::now();
+        let error = wait_router_cleanup(&owner).await.unwrap_err();
+        assert!(error.to_string().contains("bounded worker deadline"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(heartbeat.await.unwrap(), "router close blocked the runtime");
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("router worker did not enter close");
+
+        let (lock, changed) = &*release;
+        *lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        changed.notify_all();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            wait_router_cleanup(&owner),
+        )
+        .await
+        .expect("router cleanup retry remained blocked")
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cleanup_owner_survives_failure_and_blocks_until_retry_succeeds() {
         let closes = Arc::new(AtomicUsize::new(0));
         let owner = Arc::new(std::sync::Mutex::new(ManagedRouter {
             router: Box::new(RetryCleanupRouter {
@@ -4149,13 +4428,13 @@ mod exit_cleanup_tests {
             security_block_reasons: 0,
         }));
         Server::router_cleanup_supervisor().lock().unwrap().clear();
-        assert!(Server::cleanup_or_supervise(owner).is_err());
+        assert!(Server::cleanup_or_supervise(owner).await.is_err());
         assert_eq!(Server::router_cleanup_supervisor().lock().unwrap().len(), 1);
 
         // Restart admission remains blocked while cleanup is still dirty.
-        assert!(Server::retry_pending_router_cleanup().is_err());
+        assert!(Server::retry_pending_router_cleanup().await.is_err());
         assert_eq!(Server::router_cleanup_supervisor().lock().unwrap().len(), 1);
-        Server::retry_pending_router_cleanup().unwrap();
+        Server::retry_pending_router_cleanup().await.unwrap();
         assert!(Server::router_cleanup_supervisor()
             .lock()
             .unwrap()

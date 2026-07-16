@@ -72,6 +72,39 @@ pub enum DaemonCommand {
     SwitchProfile(String),
 }
 
+pub(crate) struct LogoutCompletion {
+    waiters: std::sync::Mutex<Vec<tokio::sync::oneshot::Sender<Result<(), String>>>>,
+}
+
+impl LogoutCompletion {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            waiters: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    fn register(&self) -> tokio::sync::oneshot::Receiver<Result<(), String>> {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        self.waiters
+            .lock()
+            .expect("logout completion lock poisoned")
+            .push(sender);
+        receiver
+    }
+
+    pub(crate) fn complete(&self, result: Result<(), String>) {
+        let waiters = std::mem::take(
+            &mut *self
+                .waiters
+                .lock()
+                .expect("logout completion lock poisoned"),
+        );
+        for waiter in waiters {
+            let _ = waiter.send(result.clone());
+        }
+    }
+}
+
 /// Credentials needed to build an [`AcmeCertFetcher`] on demand for the
 /// `GET /localapi/v0/cert/<domain>` endpoint. The cert domains themselves
 /// are read live from `dns_config` (shared with the map-update task) so the
@@ -315,6 +348,9 @@ pub(crate) struct LocalApiState {
     /// and transition to NeedsLogin. The daemon selects on this alongside
     /// shutdown signals.
     pub logout_trigger: Arc<tokio::sync::Notify>,
+    /// Completion channel for LocalAPI logout requests. A response is emitted
+    /// only after the resumable logout transaction reaches durable commit.
+    pub(crate) logout_completion: Arc<LogoutCompletion>,
     /// Control-suggested exit node (StableNodeID). Set by the map_update
     /// task from `MapResponse.SuggestedExitNode`.
     #[allow(dead_code)]
@@ -881,32 +917,35 @@ async fn handle_logout<W: AsyncWrite + Unpin>(
     conn: &mut W,
     state: &Arc<LocalApiState>,
 ) -> Result<(), std::io::Error> {
-    match commit_prefs_update(state, |prefs| {
-        prefs.LoggedOut = true;
-        prefs.WantRunning = false;
-    })
-    .await
-    {
-        Ok(_) => {}
-        Err(error) => {
-            write_json_response(
-                conn,
-                500,
-                "Internal Server Error",
-                &serde_json::json!({"error": error}),
-            )
-            .await?;
-            return Ok(());
-        }
-    }
-    state.ipn_backend.set_auth_cant_continue(true);
-    state.ipn_backend.set_logged_out(true);
-    state.ipn_backend.set_blocked(true);
+    // Register before notifying so even an immediately completing daemon
+    // transaction cannot race the HTTP waiter. Preferences, identity, and
+    // cache are committed only by Server::logout's resumable transaction.
+    let completion = state.logout_completion.register();
     if let Some(ref tx) = state.command_tx {
         let _ = tx.send(DaemonCommand::Logout);
     }
     state.logout_trigger.notify_waiters();
-    write_no_content_response(conn, 204, "No Content").await?;
+    match completion.await {
+        Ok(Ok(())) => write_no_content_response(conn, 204, "No Content").await?,
+        Ok(Err(error)) => {
+            write_json_response(
+                conn,
+                503,
+                "Service Unavailable",
+                &serde_json::json!({"error": error}),
+            )
+            .await?;
+        }
+        Err(_) => {
+            write_json_response(
+                conn,
+                503,
+                "Service Unavailable",
+                &serde_json::json!({"error": "logout completion owner stopped"}),
+            )
+            .await?;
+        }
+    }
     Ok(())
 }
 
@@ -1579,7 +1618,8 @@ fn is_mutating_request(method: &str, endpoint: &str) -> bool {
                     | "debug"
             )
             | ("PUT", "drive/config" | "profiles")
-    ) || (endpoint.starts_with("profiles/") && matches!(method, "POST" | "DELETE"))
+    ) || (method == "GET" && endpoint.starts_with("cert/"))
+        || (endpoint.starts_with("profiles/") && matches!(method, "POST" | "DELETE"))
         || ((endpoint == "files" || endpoint.starts_with("files/")) && method == "DELETE")
         || (endpoint.starts_with("file-put/") && method == "PUT")
 }
@@ -1650,7 +1690,7 @@ pub(crate) async fn dispatch<W: AsyncRead + AsyncWrite + Unpin>(
     // Generation and peer-identity admission is one route-level decision made
     // before any mutating handler can observe or persist state. Holding the
     // permit through dispatch linearizes a mutation against listener handoff.
-    let _mutation = if is_mutating_request(method, endpoint) {
+    let mut mutation = if is_mutating_request(method, endpoint) {
         if !require_readwrite(peer_identity) {
             write_access_denied(conn).await?;
             return Ok(());
@@ -1769,7 +1809,14 @@ pub(crate) async fn dispatch<W: AsyncRead + AsyncWrite + Unpin>(
 
         // --- POST /localapi/v0/debug-capture ---
         "debug-capture" if method == "POST" => {
-            handle_debug_capture(conn, state).await?;
+            handle_debug_capture(
+                conn,
+                state,
+                mutation
+                    .take()
+                    .expect("debug capture dispatched without mutation admission"),
+            )
+            .await?;
         }
 
         // --- GET /localapi/v0/watch-ipn-bus?mask=<u64> ---
@@ -1966,17 +2013,23 @@ async fn handle_put_drive_config<W: AsyncWrite + Unpin>(
 async fn handle_debug_capture<W: AsyncWrite + Unpin>(
     conn: &mut W,
     state: &Arc<LocalApiState>,
+    mutation: tokio::sync::MutexGuard<'_, ()>,
 ) -> Result<(), std::io::Error> {
+    // Generation admission and publication are one short transaction. Never
+    // retain the listener-generation permit while streaming to a potentially
+    // slow client. A distinct sink makes the eventual old-handler cleanup
+    // incapable of mutating a replacement generation's capture session.
+    let sink = crate::capture::replace(&state.capture);
+    let (tx, mut rx) = mpsc::channel(64);
+    let handle = sink.register_output(crate::capture::ChannelOutput::new(tx))?;
+    drop(mutation);
+
     conn.write_all(
         b"HTTP/1.1 200 OK\r\nContent-Type: application/vnd.tcpdump.pcap\r\n\
           Connection: close\r\n\r\n",
     )
     .await?;
     conn.flush().await?;
-
-    let sink = crate::capture::get_or_set(&state.capture);
-    let (tx, mut rx) = mpsc::channel(64);
-    let handle = sink.register_output(crate::capture::ChannelOutput::new(tx))?;
 
     loop {
         tokio::select! {
@@ -1993,7 +2046,7 @@ async fn handle_debug_capture<W: AsyncWrite + Unpin>(
     }
 
     handle.unregister();
-    crate::capture::clear(&state.capture);
+    crate::capture::clear_if_same(&state.capture, &sink);
     Ok(())
 }
 
@@ -4247,6 +4300,7 @@ mod tests {
             exit_map_gate: Arc::new(tokio::sync::Mutex::new(())),
             router: None,
             logout_trigger: Arc::new(tokio::sync::Notify::new()),
+            logout_completion: LogoutCompletion::new(),
             suggested_exit_node: Arc::new(RwLock::new(String::new())),
             config_path: None,
             client_updater: Arc::new(std::sync::Mutex::new(
@@ -5288,6 +5342,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn capture_releases_generation_permit_after_registration_and_cannot_clear_successor() {
+        let state = make_test_state().await;
+        let (mut client, mut server_io) = tokio::io::duplex(4096);
+        let request = HttpRequest {
+            method: "POST".into(),
+            path: "/localapi/v0/debug-capture".into(),
+            query: String::new(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+        let dispatch_state = Arc::clone(&state);
+        let handler = tokio::spawn(async move {
+            dispatch(
+                &mut server_io,
+                &request,
+                &dispatch_state,
+                &test_rw_identity(),
+            )
+            .await
+        });
+
+        let mut response = [0u8; 256];
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            tokio::io::AsyncReadExt::read(&mut client, &mut response),
+        )
+        .await
+        .expect("capture response did not start")
+        .unwrap();
+        assert!(
+            String::from_utf8_lossy(&response[..read]).contains("200 OK"),
+            "capture did not publish its stream"
+        );
+
+        let handoff = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            state.mutation_fence.advance(state.mutation_generation),
+        )
+        .await
+        .expect("capture retained the generation permit while streaming")
+        .unwrap();
+        handoff.commit();
+        let successor = crate::capture::replace(&state.capture);
+        drop(client);
+        tokio::time::timeout(std::time::Duration::from_secs(1), handler)
+            .await
+            .expect("stale capture handler did not exit")
+            .unwrap()
+            .unwrap();
+        let current = state.capture.read().unwrap().clone().unwrap();
+        assert!(Arc::ptr_eq(&current, &successor));
+    }
+
+    #[tokio::test]
     async fn stale_listener_generation_fences_every_mutating_route_but_allows_reads() {
         let state = make_test_state().await;
         let old_prefs = state.prefs.read().await.clone();
@@ -5308,6 +5416,7 @@ mod tests {
             ("POST", "tka/sign"),
             ("POST", "tka/disable"),
             ("POST", "debug-capture"),
+            ("GET", "cert/test.ts.net"),
             ("POST", "serve-config"),
             ("PUT", "drive/config"),
             ("PUT", "profiles"),
@@ -5812,6 +5921,7 @@ mod tests {
             exit_map_gate: Arc::new(tokio::sync::Mutex::new(())),
             router: None,
             logout_trigger: Arc::new(tokio::sync::Notify::new()),
+            logout_completion: LogoutCompletion::new(),
             suggested_exit_node: Arc::new(RwLock::new(String::new())),
             config_path: None,
             client_updater: Arc::new(std::sync::Mutex::new(
@@ -6060,6 +6170,7 @@ mod tests {
             exit_map_gate: Arc::new(tokio::sync::Mutex::new(())),
             router: None,
             logout_trigger: Arc::new(tokio::sync::Notify::new()),
+            logout_completion: LogoutCompletion::new(),
             suggested_exit_node: Arc::new(RwLock::new(String::new())),
             config_path: None,
             client_updater: Arc::new(std::sync::Mutex::new(
@@ -6258,6 +6369,29 @@ mod tests {
         // Default type=pair → both key and cert.
         assert!(body.contains("BEGIN PRIVATE KEY"));
         assert!(body.contains("BEGIN CERTIFICATE"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_cross_user_identity_cannot_read_or_provision_cert_material() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = make_cert_test_state(vec!["test.ts.net".into()], tmp.path()).await;
+        write_cert_cache(tmp.path(), "test.ts.net");
+        let cross_user = ConnIdentity {
+            uid: None,
+            pid: None,
+            is_unix_sock: true,
+        };
+        for query in ["", "?type=pair", "?type=key", "?type=cert"] {
+            let request = format!(
+                "GET /localapi/v0/cert/test.ts.net{query} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+            );
+            let response =
+                send_request_with_identity(request.as_bytes(), &state, cross_user.clone()).await;
+            assert!(response.contains("403 Forbidden"), "response: {response}");
+            assert!(!response.contains("BEGIN PRIVATE KEY"));
+            assert!(!response.contains("BEGIN CERTIFICATE"));
+        }
     }
 
     #[tokio::test]
@@ -6547,6 +6681,39 @@ mod tests {
         )
         .await;
         assert!(resp.contains("403 Forbidden"));
+    }
+
+    #[tokio::test]
+    async fn logout_response_waits_for_durable_transaction_completion() {
+        let state = make_test_state().await;
+        let notified = state.logout_trigger.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let request_state = Arc::clone(&state);
+        let response = tokio::spawn(async move {
+            send_request_with_identity(
+                b"POST /localapi/v0/logout HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                &request_state,
+                test_rw_identity(),
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), notified)
+            .await
+            .expect("logout handler did not notify the daemon");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            !response.is_finished(),
+            "logout returned before durable commit"
+        );
+        assert!(!state.prefs.read().await.LoggedOut);
+
+        state.logout_completion.complete(Ok(()));
+        let response = tokio::time::timeout(std::time::Duration::from_secs(1), response)
+            .await
+            .expect("logout response did not resume after commit")
+            .unwrap();
+        assert!(response.contains("204 No Content"), "response: {response}");
     }
 
     #[tokio::test]

@@ -2204,7 +2204,7 @@ pub(crate) async fn create_tun_device(
                 security_block_verified: false,
                 security_block_reasons: 0,
             }));
-            let cleanup = Server::cleanup_or_supervise(owner).err();
+            let cleanup = Server::cleanup_or_supervise(owner).await.err();
             return Err(TsnetError::Builder(match cleanup {
                 Some(cleanup) => {
                     format!("bring TUN interface up: {error}; startup cleanup retained: {cleanup}")
@@ -2228,7 +2228,7 @@ pub(crate) async fn create_tun_device(
                     security_block_verified: false,
                     security_block_reasons: SecurityBlockReason::Transition.bit(),
                 }));
-                let cleanup = Server::cleanup_or_supervise(owner).err();
+                let cleanup = Server::cleanup_or_supervise(owner).await.err();
                 return Err(TsnetError::Builder(match cleanup {
                     Some(cleanup) => format!(
                         "install startup direct-traffic block: {error}; cleanup retained: {cleanup}"
@@ -2261,7 +2261,7 @@ pub(crate) async fn create_tun_device(
                             0
                         },
                     }));
-                    let cleanup = Server::cleanup_or_supervise(owner).err();
+                    let cleanup = Server::cleanup_or_supervise(owner).await.err();
                     return Err(TsnetError::Builder(match cleanup {
                         Some(cleanup) => format!("{error}; startup cleanup retained: {cleanup}"),
                         None => error.to_string(),
@@ -2283,7 +2283,7 @@ pub(crate) async fn create_tun_device(
                         0
                     },
                 }));
-                let cleanup = Server::cleanup_or_supervise(owner).err();
+                let cleanup = Server::cleanup_or_supervise(owner).await.err();
                 return Err(TsnetError::Builder(match cleanup {
                     Some(cleanup) => format!(
                         "underlay bypass unavailable: {error}; startup cleanup retained: {cleanup}"
@@ -2305,7 +2305,7 @@ pub(crate) async fn create_tun_device(
                         0
                     },
                 }));
-                let cleanup = Server::cleanup_or_supervise(owner).err();
+                let cleanup = Server::cleanup_or_supervise(owner).await.err();
                 return Err(TsnetError::Builder(match cleanup {
                     Some(cleanup) => format!(
                         "configure underlay UDP socket: {error}; startup cleanup retained: {cleanup}"
@@ -2328,7 +2328,7 @@ pub(crate) async fn create_tun_device(
                     0
                 },
             }));
-            let cleanup = Server::cleanup_or_supervise(owner).err();
+            let cleanup = Server::cleanup_or_supervise(owner).await.err();
             return Err(TsnetError::Builder(match cleanup {
                 Some(cleanup) => {
                     format!("install TUN routes: {error}; startup cleanup retained: {cleanup}")
@@ -2346,7 +2346,7 @@ pub(crate) async fn create_tun_device(
                     security_block_verified: true,
                     security_block_reasons: SecurityBlockReason::Transition.bit(),
                 }));
-                let cleanup = Server::cleanup_or_supervise(owner).err();
+                let cleanup = Server::cleanup_or_supervise(owner).await.err();
                 return Err(TsnetError::Builder(match cleanup {
                     Some(cleanup) => format!(
                         "remove startup direct-traffic block: {error}; cleanup retained: {cleanup}"

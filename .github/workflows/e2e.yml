@@ -82,7 +82,12 @@ jobs:
       # the Tailscale signing key and apt source, then installs tailscale.
       - name: Install Go tailscale client
         run: |
-          curl -fsSL https://tailscale.com/install.sh | sh
+          installer=$(mktemp)
+          trap 'rm -f "$installer"' EXIT
+          curl --proto '=https' --tlsv1.2 -fsSL \
+            --retry 5 --retry-all-errors --retry-delay 2 \
+            -o "$installer" https://tailscale.com/install.sh
+          sh "$installer"
           tailscale version
 
       - name: Mint Tailscale org token via GitHub OIDC (WIF)
@@ -132,7 +137,12 @@ jobs:
 
       - name: Install Go tailscale client
         run: |
-          curl -fsSL https://tailscale.com/install.sh | sh
+          installer=$(mktemp)
+          trap 'rm -f "$installer"' EXIT
+          curl --proto '=https' --tlsv1.2 -fsSL \
+            --retry 5 --retry-all-errors --retry-delay 2 \
+            -o "$installer" https://tailscale.com/install.sh
+          sh "$installer"
           tailscale version
 
       - name: Mint Tailscale org token via GitHub OIDC (WIF)

@@ -775,6 +775,16 @@ pub(crate) fn spawn_map_update_task(
                             .as_ref()
                             .and_then(|n| n.KeyExpiry)
                             .is_some_and(|expiry| expiry < chrono::Utc::now());
+                    if expired {
+                        // This is the first action after detecting expiry.
+                        // Revoke callback admission synchronously before any
+                        // state publication, refresh, registration, rollback,
+                        // or interactive-auth await. Ok(None) and Err paths
+                        // deliberately leave it revoked; only a newly
+                        // authenticated map generation can publish callback
+                        // authority again.
+                        ssh_callbacks.revoke_current();
+                    }
                     key_expired.store(expired, std::sync::atomic::Ordering::Relaxed);
                     ipn_backend.set_key_expired(expired);
                     if expired {
@@ -838,9 +848,6 @@ pub(crate) fn spawn_map_update_task(
                                     let ss = map_session.clone();
                                     let router = c2n_router.clone();
                                     let callbacks = ssh_callbacks.clone();
-                                    // Revoke admission synchronously before
-                                    // aborting and joining the old map transport.
-                                    ssh_callbacks.revoke_current();
                                     if !Box::pin(map_tasks.rebind(async move {
                                         cc_new
                                             .stream_map_loop_with_c2n_and_ssh_callbacks(

@@ -128,7 +128,6 @@ pub struct SshCallbackDispatcher {
 
 #[derive(Default)]
 struct DispatcherInner {
-    next_generation: AtomicU64,
     current: Mutex<Option<Arc<Generation>>>,
     metrics: Arc<SshNotifyMetrics>,
 }
@@ -172,9 +171,8 @@ impl SshCallbackDispatcher {
     }
 
     pub(crate) fn activate(&self, node_key: NodePublic) -> GenerationLease {
-        let token = self
-            .inner
-            .next_generation
+        static NEXT_GENERATION: AtomicU64 = AtomicU64::new(0);
+        let token = NEXT_GENERATION
             .fetch_add(1, Ordering::Relaxed)
             .wrapping_add(1);
         let generation = Arc::new(Generation::new(
@@ -386,7 +384,7 @@ struct Generation {
     node_key: NodePublic,
     revoked: AtomicBool,
     queue: Mutex<FairQueue>,
-    wake: tokio::sync::Notify,
+    wake: Arc<tokio::sync::Notify>,
     next_task: AtomicU64,
     in_flight: Mutex<HashMap<u64, tokio::task::AbortHandle>>,
     metrics: Arc<SshNotifyMetrics>,
@@ -399,7 +397,7 @@ impl Generation {
             node_key,
             revoked: AtomicBool::new(false),
             queue: Mutex::new(FairQueue::new()),
-            wake: tokio::sync::Notify::new(),
+            wake: Arc::new(tokio::sync::Notify::new()),
             next_task: AtomicU64::new(0),
             in_flight: Mutex::new(HashMap::new()),
             metrics,
@@ -460,6 +458,16 @@ impl Generation {
         }
     }
 
+    fn has_work(&self) -> bool {
+        !self.revoked.load(Ordering::Acquire)
+            && self
+                .queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .total
+                > 0
+    }
+
     fn pop(&self) -> Option<NotifyJob> {
         if self.revoked.load(Ordering::Acquire) {
             return None;
@@ -474,6 +482,7 @@ impl Generation {
         if self.revoked.swap(true, Ordering::AcqRel) {
             return;
         }
+        global_worker_scheduler().cancel(self.token);
         let dropped = self
             .queue
             .lock()
@@ -529,43 +538,124 @@ impl Drop for InFlightGuard {
     }
 }
 
-struct GlobalWorkerBudget {
-    permits: Arc<tokio::sync::Semaphore>,
-    changed: tokio::sync::Notify,
+struct GlobalWorkerScheduler {
+    state: Mutex<GlobalWorkerState>,
 }
 
-fn global_worker_budget() -> &'static Arc<GlobalWorkerBudget> {
-    static BUDGET: OnceLock<Arc<GlobalWorkerBudget>> = OnceLock::new();
-    BUDGET.get_or_init(|| {
-        Arc::new(GlobalWorkerBudget {
-            permits: Arc::new(tokio::sync::Semaphore::new(GLOBAL_WORKERS)),
-            changed: tokio::sync::Notify::new(),
-        })
-    })
+struct GlobalWorkerState {
+    available: usize,
+    order: VecDeque<u64>,
+    waiting: HashMap<u64, Arc<tokio::sync::Notify>>,
+    granted: HashMap<u64, usize>,
 }
 
-struct GlobalWorkerPermit {
-    budget: Arc<GlobalWorkerBudget>,
-    _permit: tokio::sync::OwnedSemaphorePermit,
-    notify_on_drop: bool,
-}
+impl GlobalWorkerScheduler {
+    fn try_acquire(
+        &'static self,
+        generation: u64,
+        wake: Arc<tokio::sync::Notify>,
+    ) -> Option<GlobalWorkerPermit> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(granted) = state.granted.get_mut(&generation) {
+            *granted -= 1;
+            if *granted == 0 {
+                state.granted.remove(&generation);
+            }
+            return Some(GlobalWorkerPermit {
+                scheduler: self,
+                generation,
+            });
+        }
+        if state.available > 0 && state.order.is_empty() {
+            state.available -= 1;
+            return Some(GlobalWorkerPermit {
+                scheduler: self,
+                generation,
+            });
+        }
+        if !state.waiting.contains_key(&generation) {
+            state.order.push_back(generation);
+            state.waiting.insert(generation, wake);
+        }
+        None
+    }
 
-impl Drop for GlobalWorkerPermit {
-    fn drop(&mut self) {
-        if self.notify_on_drop {
-            self.budget.changed.notify_one();
+    fn release(&self, _generation: u64) {
+        let wake = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.available = state.available.saturating_add(1).min(GLOBAL_WORKERS);
+            grant_next_worker(&mut state)
+        };
+        if let Some(wake) = wake {
+            wake.notify_one();
+        }
+    }
+
+    fn cancel(&self, generation: u64) {
+        let wakes = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.waiting.remove(&generation);
+            state.order.retain(|waiting| *waiting != generation);
+            if let Some(granted) = state.granted.remove(&generation) {
+                state.available = state.available.saturating_add(granted).min(GLOBAL_WORKERS);
+            }
+            let mut wakes = Vec::new();
+            while state.available > 0 {
+                let Some(wake) = grant_next_worker(&mut state) else {
+                    break;
+                };
+                wakes.push(wake);
+            }
+            wakes
+        };
+        for wake in wakes {
+            wake.notify_one();
         }
     }
 }
 
-fn try_global_worker() -> Option<GlobalWorkerPermit> {
-    let budget = Arc::clone(global_worker_budget());
-    let permit = Arc::clone(&budget.permits).try_acquire_owned().ok()?;
-    Some(GlobalWorkerPermit {
-        budget,
-        _permit: permit,
-        notify_on_drop: false,
+fn grant_next_worker(state: &mut GlobalWorkerState) -> Option<Arc<tokio::sync::Notify>> {
+    while let Some(generation) = state.order.pop_front() {
+        let Some(wake) = state.waiting.remove(&generation) else {
+            continue;
+        };
+        state.available = state.available.saturating_sub(1);
+        *state.granted.entry(generation).or_default() += 1;
+        return Some(wake);
+    }
+    None
+}
+
+fn global_worker_scheduler() -> &'static GlobalWorkerScheduler {
+    static SCHEDULER: OnceLock<GlobalWorkerScheduler> = OnceLock::new();
+    SCHEDULER.get_or_init(|| GlobalWorkerScheduler {
+        state: Mutex::new(GlobalWorkerState {
+            available: GLOBAL_WORKERS,
+            order: VecDeque::new(),
+            waiting: HashMap::new(),
+            granted: HashMap::new(),
+        }),
     })
+}
+
+struct GlobalWorkerPermit {
+    scheduler: &'static GlobalWorkerScheduler,
+    generation: u64,
+}
+
+impl Drop for GlobalWorkerPermit {
+    fn drop(&mut self) {
+        self.scheduler.release(self.generation);
+    }
 }
 
 /// Runtime attached to exactly one authenticated map Noise/H2 generation.
@@ -590,14 +680,16 @@ impl CallbackGeneration {
 
     fn dispatch_ready(&mut self) {
         while self.tasks.try_join_next().is_some() {}
-        while self.tasks.len() < GENERATION_WORKERS {
-            let Some(mut worker_permit) = try_global_worker() else {
+        while self.tasks.len() < GENERATION_WORKERS && self.lease.generation.has_work() {
+            let Some(worker_permit) = global_worker_scheduler().try_acquire(
+                self.lease.generation.token,
+                Arc::clone(&self.lease.generation.wake),
+            ) else {
                 break;
             };
             let Some(job) = self.lease.generation.pop() else {
                 break;
             };
-            worker_permit.notify_on_drop = true;
             if job.generation != self.lease.generation.token {
                 self.lease
                     .generation
@@ -656,8 +748,7 @@ impl CallbackGeneration {
             if self.tasks.is_empty() {
                 tokio::select! {
                     data = body.data() => return data,
-                    () = self.lease.generation.wake.notified() => {},
-                    () = global_worker_budget().changed.notified() => {}
+                    () = self.lease.generation.wake.notified() => {}
                 }
             } else if self.tasks.len() >= GENERATION_WORKERS {
                 tokio::select! {
@@ -668,8 +759,7 @@ impl CallbackGeneration {
                 tokio::select! {
                     data = body.data() => return data,
                     () = self.lease.generation.wake.notified() => {},
-                    _ = self.tasks.join_next() => {},
-                    () = global_worker_budget().changed.notified() => {}
+                    _ = self.tasks.join_next() => {}
                 }
             }
         }
@@ -960,6 +1050,32 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn blocked_and_failed_rotation_leave_callback_generation_revoked() {
+        let dispatcher = SshCallbackDispatcher::new();
+        let generation = dispatcher.activate(NodePublic::default());
+        let notifier = dispatcher.notifier();
+        dispatcher.revoke_current();
+
+        let _ = tokio::time::timeout(
+            Duration::from_millis(10),
+            std::future::pending::<Result<(), ()>>(),
+        )
+        .await;
+        assert!(generation.generation.revoked.load(Ordering::Acquire));
+        assert_eq!(
+            notifier.enqueue("https://any.invalid/blocked", &request(1)),
+            Err(SshNotifyEnqueueError::NoGeneration)
+        );
+
+        let rotation: Result<(), ()> = Err(());
+        assert!(rotation.is_err());
+        assert_eq!(
+            notifier.enqueue("https://any.invalid/failed", &request(1)),
+            Err(SshNotifyEnqueueError::NoGeneration)
+        );
+    }
+
     #[test]
     fn fair_queue_reserves_capacity_per_principal_and_expires_truthfully() {
         let metrics = SshNotifyMetrics::default();
@@ -1199,6 +1315,61 @@ mod tests {
         let _ = server.await;
         driver.abort();
         let _ = driver.await;
+    }
+
+    #[tokio::test]
+    async fn idle_generation_cannot_steal_wakeup_or_expire_queued_work() {
+        let scheduler = Box::leak(Box::new(GlobalWorkerScheduler {
+            state: Mutex::new(GlobalWorkerState {
+                available: GLOBAL_WORKERS,
+                order: VecDeque::new(),
+                waiting: HashMap::new(),
+                granted: HashMap::new(),
+            }),
+        }));
+        let mut busy = (0..GLOBAL_WORKERS)
+            .map(|index| {
+                scheduler
+                    .try_acquire(1_000 + index as u64, Arc::new(tokio::sync::Notify::new()))
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        let metrics = Arc::new(SshNotifyMetrics::default());
+        let queued = Arc::new(Generation::new(
+            2_000,
+            NodePublic::default(),
+            Arc::clone(&metrics),
+        ));
+        queued.enqueue("/queued".into(), Vec::new(), 1).unwrap();
+        let idle = Generation::new(2_001, NodePublic::default(), Arc::clone(&metrics));
+        assert!(!idle.has_work());
+        assert!(queued.has_work());
+        assert!(scheduler
+            .try_acquire(queued.token, Arc::clone(&queued.wake))
+            .is_none());
+        // Queue-aware admission means the idle generation never registers.
+        assert!(!scheduler
+            .state
+            .lock()
+            .unwrap()
+            .waiting
+            .contains_key(&idle.token));
+
+        let notified = queued.wake.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        drop(busy.pop().unwrap());
+        tokio::time::timeout(Duration::from_millis(100), notified)
+            .await
+            .expect("queued generation was stranded by an idle wakeup");
+        let permit = scheduler
+            .try_acquire(queued.token, Arc::clone(&queued.wake))
+            .expect("round-robin grant was not reserved for queued generation");
+        assert!(queued.pop().is_some());
+        assert_eq!(metrics.snapshot().queue_expired, 0);
+        drop(permit);
+        drop(busy);
     }
 
     #[derive(Default)]

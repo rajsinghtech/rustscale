@@ -453,7 +453,7 @@ async fn commit_prefs_update(
 pub struct LocalApiHandle {
     task: Option<JoinHandle<()>>,
     cancel: Arc<crate::CancelToken>,
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     accepted: Arc<tokio::sync::Notify>,
     pub socket_path: PathBuf,
     unlink_on_drop: bool,
@@ -462,7 +462,7 @@ pub struct LocalApiHandle {
 impl LocalApiHandle {
     /// Stop accepting, then give active requests a bounded drain window before
     /// aborting and joining any blocked handlers.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     async fn wait_for_accept(&self) {
         self.accepted.notified().await;
     }
@@ -609,10 +609,10 @@ fn spawn_localapi_inner(
 
     let path = socket_path.clone();
     let cancel = Arc::new(crate::CancelToken::new());
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     let accepted = Arc::new(tokio::sync::Notify::new());
     let task_cancel = Arc::clone(&cancel);
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     let task_accepted = Arc::clone(&accepted);
     let task = tokio::spawn(async move {
         if let Some(start_rx) = start_rx {
@@ -626,7 +626,7 @@ fn spawn_localapi_inner(
                 () = task_cancel.cancelled() => break,
                 accepted = listener.accept() => match accepted {
                     Ok(stream) => {
-                        #[cfg(test)]
+                        #[cfg(all(test, unix))]
                         task_accepted.notify_one();
                         let peer_identity = peer_identity_from_stream(&stream);
                         let state = state.clone();
@@ -654,7 +654,7 @@ fn spawn_localapi_inner(
     Some(LocalApiHandle {
         task: Some(task),
         cancel,
-        #[cfg(test)]
+        #[cfg(all(test, unix))]
         accepted,
         socket_path: path,
         unlink_on_drop: true,

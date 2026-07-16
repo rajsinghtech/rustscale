@@ -262,7 +262,7 @@ state-dir fallback probing), `--json`.
 | `nc` | `cli/nc.go` | 🔶 stub (not-yet-supported) |
 | `id-token` | `cli/id-token.go` | ✅ OIDC machine ID token via LocalAPI and Noise `POST /machine/id-token`; raw JWT and `--json` output |
 | `update` | `cli/update.go` | 🔶 `--yes`, `--dry-run`, `--track`, and `--version`; Linux/macOS archive apply is limited to intact `scripts/install.sh` ownership receipts with checksum integrity, bounded parsing, post-install version verification, and journaled rollback. Homebrew is dry-run planning only; other layouts fail explicitly without elevation. |
-| `drive` | `cli/drive.go` | 🔶 first truthful local-share slice: owner-only `status`/`list`, upstream-named `share` (add or replace) and `unshare`, text/JSON output, static completion, strict no-follow canonical root/name validation, bounded/cancellable LocalAPI calls, and mandatory generation ETag CAS for concurrent mutations. Remote mounts/composition, rename/share-as, bookmarks, and persistence remain deferred and are rejected explicitly. |
+| `drive` | `cli/drive.go` | 🔶 first truthful local-share slice: read-write-authorized `status`/`list`; daemon/root-only `share` (add or replace) and `unshare` until per-caller filesystem authority exists; text/JSON output, static completion, strict no-follow canonical root/name validation, bounded/cancellable LocalAPI calls, and mandatory restart-unique nonce+generation+config-hash ETag CAS. PUT/DELETE/MOVE/COPY reject and publication-barrier re-stat every special object. Remote mounts/composition, rename/share-as, bookmarks, and persistence remain deferred and are rejected explicitly. |
 | `lock` | `cli/lock.go` | 🔶 status, self-safe confirmed init with owner-only pre-RPC disablement receipts and `--resume`, node sign, and disable are wired through authorized LocalAPI; add/remove, re-sign, local-disable, pre-auth wrapping, log, and revoke-keys remain deferred |
 | completion/man | `cli/ffcomplete/` | ✅ bash, zsh, and fish script generation plus hidden, side-effect-free runtime completion protocol; man pages are not provided upstream |
 
@@ -282,7 +282,10 @@ errors (AccessDenied 403, PreconditionsFailed 412, Timeout, HttpStatus, PeerNotF
 `watch_ipn_bus()` streaming method for newline-delimited JSON `Notify`
 messages, with bounded HTTP headers/frames/chunks/trailers, fragmented HTTP/1.1
 chunked and connection-close framing, strict status/JSON validation, and
-explicit EOF handling. Methods: start(), login_interactive(), logout(), edit_prefs(),
+explicit EOF handling. The server-side LocalAPI reads bounded/deadlined headers
+without consuming bodies, then performs route/identity authorization and
+bounded global/per-identity admission before strict rate/deadline/size-limited
+body reads. Methods: start(), login_interactive(), logout(), edit_prefs(),
 get_prefs(), status(), whois(), health(), metrics(), ping(), get_serve_config(),
 set_serve_config(), drive_status(), get_drive_config(), set_drive_config(), cert_pair(), tailnet_lock_status(), tailnet_lock_init(),
 tailnet_lock_ack_init(), tailnet_lock_sign(), tailnet_lock_disable(), list_profiles(), current_profile(),

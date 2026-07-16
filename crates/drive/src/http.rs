@@ -585,10 +585,12 @@ impl Server {
         }
         let (parent, leaf) = open_parent_nofollow(&root.dir, &parsed.relative)?;
         let existed = match parent.symlink_metadata(&leaf) {
-            Ok(metadata) if metadata.file_type().is_symlink() || metadata.is_dir() => {
-                return Err(OperationError::Forbidden)
+            Ok(metadata) => {
+                if supported_object_kind(&metadata)? != SupportedObjectKind::RegularFile {
+                    return Err(OperationError::UnsupportedFileType);
+                }
+                true
             }
-            Ok(_) => true,
             Err(error) if error.kind() == io::ErrorKind::NotFound => false,
             Err(error) => return Err(error.into()),
         };
@@ -607,10 +609,12 @@ impl Server {
         }
         let (parent, leaf) = open_parent_nofollow(&root.dir, &parsed.relative)?;
         let existed = match parent.symlink_metadata(&leaf) {
-            Ok(metadata) if metadata.file_type().is_symlink() || metadata.is_dir() => {
-                return Err(OperationError::Forbidden)
+            Ok(metadata) => {
+                if supported_object_kind(&metadata)? != SupportedObjectKind::RegularFile {
+                    return Err(OperationError::UnsupportedFileType);
+                }
+                true
             }
-            Ok(_) => true,
             Err(error) if error.kind() == io::ErrorKind::NotFound => false,
             Err(error) => return Err(error.into()),
         };
@@ -647,16 +651,21 @@ impl Server {
             return Err(OperationError::Forbidden);
         }
         let (parent, leaf) = open_parent_nofollow(&root.dir, &parsed.relative)?;
-        let metadata = parent.symlink_metadata(&leaf)?;
-        if metadata.file_type().is_symlink() {
-            return Err(OperationError::Forbidden);
-        }
+        let expected_kind = supported_object_kind(&parent.symlink_metadata(&leaf)?)?;
         control.commit(|| {
-            if metadata.is_dir() {
-                // Deliberately avoid recursive deletion in this bounded slice.
-                parent.remove_dir(&leaf)?;
-            } else {
-                parent.remove_file(&leaf)?;
+            // Re-stat under the publication barrier. A local swap to a link,
+            // FIFO, socket, device, or the other supported kind must leave the
+            // replacement untouched.
+            let current_kind = supported_object_kind(&parent.symlink_metadata(&leaf)?)?;
+            if current_kind != expected_kind {
+                return Err(OperationError::UnsupportedFileType);
+            }
+            match current_kind {
+                SupportedObjectKind::Directory => {
+                    // Deliberately avoid recursive deletion in this bounded slice.
+                    parent.remove_dir(&leaf)?;
+                }
+                SupportedObjectKind::RegularFile => parent.remove_file(&leaf)?,
             }
             Ok(())
         })?;
@@ -704,28 +713,16 @@ impl Server {
             open_parent_nofollow(&source_root.dir, &source.relative)?;
         let (destination_parent, destination_leaf) =
             open_parent_nofollow(&destination_root.dir, &destination.relative)?;
-        let source_metadata = source_parent.symlink_metadata(&source_leaf)?;
-        if source_metadata.file_type().is_symlink() {
-            return Err(OperationError::Forbidden);
+        let source_kind = supported_object_kind(&source_parent.symlink_metadata(&source_leaf)?)?;
+        if copy && source_kind != SupportedObjectKind::RegularFile {
+            return Err(OperationError::UnsupportedFileType);
         }
-        let destination_exists = destination_parent
-            .symlink_metadata(&destination_leaf)
-            .map_or_else(
-                |error| {
-                    if error.kind() == io::ErrorKind::NotFound {
-                        Ok(false)
-                    } else {
-                        Err(error.into())
-                    }
-                },
-                |metadata| {
-                    if metadata.file_type().is_symlink() {
-                        Err(OperationError::Forbidden)
-                    } else {
-                        Ok(true)
-                    }
-                },
-            )?;
+        let destination_kind =
+            optional_supported_object_kind(&destination_parent, &destination_leaf)?;
+        if destination_kind.is_some_and(|kind| kind != source_kind) {
+            return Err(OperationError::UnsupportedFileType);
+        }
+        let destination_exists = destination_kind.is_some();
         if destination_exists && request.header("overwrite") == Some("F") {
             return Err(OperationError::PreconditionFailed);
         }
@@ -754,6 +751,16 @@ impl Server {
             atomic_write(&destination_parent, &destination_leaf, &bytes, control)?;
         } else {
             control.commit(|| {
+                let current_source =
+                    supported_object_kind(&source_parent.symlink_metadata(&source_leaf)?)?;
+                if current_source != source_kind {
+                    return Err(OperationError::UnsupportedFileType);
+                }
+                let current_destination =
+                    optional_supported_object_kind(&destination_parent, &destination_leaf)?;
+                if current_destination.is_some_and(|kind| kind != source_kind) {
+                    return Err(OperationError::UnsupportedFileType);
+                }
                 source_parent.rename(&source_leaf, &destination_parent, &destination_leaf)?;
                 Ok(())
             })?;
@@ -826,6 +833,53 @@ fn open_parent_nofollow(dir: &Dir, relative: &Path) -> Result<(Dir, OsString), O
     Ok((parent, leaf))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SupportedObjectKind {
+    RegularFile,
+    Directory,
+}
+
+fn supported_object_kind(
+    metadata: &cap_std::fs::Metadata,
+) -> Result<SupportedObjectKind, OperationError> {
+    let file_type = metadata.file_type();
+    if file_type.is_symlink()
+        || file_type.is_fifo()
+        || file_type.is_socket()
+        || file_type.is_block_device()
+        || file_type.is_char_device()
+    {
+        return Err(OperationError::UnsupportedFileType);
+    }
+    if metadata.is_file() {
+        Ok(SupportedObjectKind::RegularFile)
+    } else if metadata.is_dir() {
+        Ok(SupportedObjectKind::Directory)
+    } else {
+        Err(OperationError::UnsupportedFileType)
+    }
+}
+
+fn optional_supported_object_kind(
+    parent: &Dir,
+    leaf: &OsStr,
+) -> Result<Option<SupportedObjectKind>, OperationError> {
+    match parent.symlink_metadata(leaf) {
+        Ok(metadata) => supported_object_kind(&metadata).map(Some),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn ensure_regular_destination(parent: &Dir, leaf: &OsStr) -> Result<(), OperationError> {
+    if optional_supported_object_kind(parent, leaf)?
+        .is_some_and(|kind| kind != SupportedObjectKind::RegularFile)
+    {
+        return Err(OperationError::UnsupportedFileType);
+    }
+    Ok(())
+}
+
 fn open_regular_nofollow_nonblocking(
     dir: &Dir,
     relative: &Path,
@@ -891,6 +945,7 @@ fn atomic_write(
         // must not publish the destination.
         drop(file);
         control.commit(|| {
+            ensure_regular_destination(parent, destination)?;
             parent.rename(&temp, parent, destination)?;
             Ok(())
         })?;
@@ -937,6 +992,7 @@ fn atomic_write_streaming(
         file.sync_all()?;
         drop(file);
         control.commit(|| {
+            ensure_regular_destination(parent, destination)?;
             parent.rename(&temp, parent, destination)?;
             Ok(())
         })?;
@@ -1424,8 +1480,104 @@ mod tests {
                     .with_header("Destination", format!("/docs/{name}-copy")),
             );
             assert_eq!(copy.status, 403);
+            let put = harness.request(
+                &harness.read_write,
+                Request::new("PUT", format!("/docs/{name}")).with_body(b"replacement"),
+            );
+            assert_eq!(put.status, 403);
+            let delete = harness.request(
+                &harness.read_write,
+                Request::new("DELETE", format!("/docs/{name}")),
+            );
+            assert_eq!(delete.status, 403);
+            let move_source = harness.request(
+                &harness.read_write,
+                Request::new("MOVE", format!("/docs/{name}"))
+                    .with_header("Destination", format!("/docs/{name}-moved")),
+            );
+            assert_eq!(move_source.status, 403);
+            let move_destination = harness.request(
+                &harness.read_write,
+                Request::new("MOVE", "/docs/hello.txt")
+                    .with_header("Destination", format!("/docs/{name}")),
+            );
+            assert_eq!(move_destination.status, 403);
+            assert!(harness.root.join(name).exists());
+            assert!(harness.root.join("hello.txt").exists());
+            assert!(!harness.root.join(format!("{name}-copy")).exists());
+            assert!(!harness.root.join(format!("{name}-moved")).exists());
             assert!(started.elapsed() < Duration::from_secs(1));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn special_object_swaps_at_publication_are_rejected_untouched() {
+        use std::os::unix::net::UnixListener;
+
+        let harness = Harness::new();
+        let swap_to_socket = |name: &'static str| {
+            let path = harness.root.join(name);
+            std::fs::write(&path, b"ordinary").unwrap();
+            let held = Arc::new(Mutex::new(None));
+            let hook_held = held.clone();
+            let hook_path = path.clone();
+            let control = RequestControl::new(
+                harness.server.request_authority(),
+                Instant::now() + Duration::from_secs(2),
+            )
+            .with_before_commit(Arc::new(move || {
+                std::fs::remove_file(&hook_path).unwrap();
+                *hook_held.lock().unwrap() = Some(UnixListener::bind(&hook_path).unwrap());
+            }));
+            (path, held, control)
+        };
+
+        let (put_path, put_socket, put_control) = swap_to_socket("race-put");
+        let put = harness.server.handle(
+            &harness.read_write,
+            Request::new("PUT", "/docs/race-put").with_body(b"replacement"),
+            &put_control,
+        );
+        assert_eq!(put.status, 403);
+        assert!(put_socket.lock().unwrap().is_some());
+        assert!(put_path.exists());
+
+        let (delete_path, delete_socket, delete_control) = swap_to_socket("race-delete");
+        let delete = harness.server.handle(
+            &harness.read_write,
+            Request::new("DELETE", "/docs/race-delete"),
+            &delete_control,
+        );
+        assert_eq!(delete.status, 403);
+        assert!(delete_socket.lock().unwrap().is_some());
+        assert!(delete_path.exists());
+
+        std::fs::write(harness.root.join("race-move-source"), b"source").unwrap();
+        let (destination_path, destination_socket, destination_control) =
+            swap_to_socket("race-move-destination");
+        let move_destination = harness.server.handle(
+            &harness.read_write,
+            Request::new("MOVE", "/docs/race-move-source")
+                .with_header("Destination", "/docs/race-move-destination"),
+            &destination_control,
+        );
+        assert_eq!(move_destination.status, 403);
+        assert!(destination_socket.lock().unwrap().is_some());
+        assert!(destination_path.exists());
+        assert!(harness.root.join("race-move-source").exists());
+
+        let (source_path, source_socket, source_control) = swap_to_socket("race-source-swap");
+        let move_source = harness.server.handle(
+            &harness.read_write,
+            Request::new("MOVE", "/docs/race-source-swap")
+                .with_header("Destination", "/docs/race-source-destination"),
+            &source_control,
+        );
+        assert_eq!(move_source.status, 403);
+        assert!(source_socket.lock().unwrap().is_some());
+        assert!(source_path.exists());
+        assert!(!harness.root.join("race-source-destination").exists());
     }
 
     fn paused_before_commit(

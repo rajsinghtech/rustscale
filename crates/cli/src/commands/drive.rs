@@ -165,6 +165,13 @@ fn mutation_result(
                 "Taildrive mutation outcome is unknown ({error}); run `rustscale drive list` before retrying"
             ),
         )),
+        Err(LocalClientError::AccessDenied(message))
+            if message.contains("Taildrive configuration requires") =>
+        {
+            Err(CliError(format!(
+                "access denied: {message}; OperatorUser cannot mutate Taildrive roots until per-user filesystem authority is implemented"
+            )))
+        }
         Err(error) => Err(error.into()),
     }
 }

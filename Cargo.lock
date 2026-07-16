@@ -3919,6 +3919,7 @@ dependencies = [
  "rand_core 0.6.4",
  "rcgen",
  "russh",
+ "rustix",
  "rustls",
  "rustscale-appc",
  "rustscale-art",

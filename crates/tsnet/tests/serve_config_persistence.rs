@@ -48,7 +48,7 @@ async fn http_put(socket_path: &std::path::Path, path: &str) -> String {
 async fn http_delete(socket_path: &std::path::Path, path: &str) -> String {
     let mut conn = connect(socket_path).expect("connect");
     let req = format!(
-        "DELETE {path} HTTP/1.1\r\nHost: localhost\rContent-Length: 0\r\nConnection: close\r\n\r\n"
+        "DELETE {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
     );
     conn.write_all(req.as_bytes()).await.expect("write");
     conn.flush().await.expect("flush");

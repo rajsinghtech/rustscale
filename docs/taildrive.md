@@ -82,7 +82,11 @@ surface. It was compared with Tailscale's `drive/`, `feature/drive`,
   FIFOs, devices, sockets, reparse points, and symlink sources are rejected.
 - PUT bodies stream in 64 KiB chunks through a two-slot channel to the bounded
   filesystem pool; a full-body clone is never made. Uploads use same-directory
-  temporary files, `sync_all`, a final cancellation check, and rename.
+  temporary files, `sync_all`, a final cancellation check, and rename. PUT,
+  DELETE, MOVE, and COPY accept only regular files/directories as each method
+  permits. They re-stat no-follow under the publication barrier immediately
+  before replace, unlink, or rename, so a raced-in FIFO, socket, device, or
+  symlink remains untouched.
   Configuration root opening, upload/copy I/O, and sync happen outside the
   commit barrier; only the final publication is guarded. Cancellation after
   sync cannot publish the destination, and failed or truncated uploads remove
@@ -95,16 +99,28 @@ The local, peer-credential-authorized API exposes:
 - `GET /localapi/v0/drive/status` — enabled state, signed `sharingAllowed`
   state, generation, and configured shares.
 - `GET /localapi/v0/drive/config` — current `{ "enabled", "shares" }` runtime
-  configuration and a generation-derived `ETag`.
+  configuration and a strong opaque `ETag`. It hashes the generation and exact
+  config with a fresh cryptographic per-runtime nonce, preventing restart ABA
+  without including persisted secrets or key material.
 - `PUT /localapi/v0/drive/config` — bounded, all-or-nothing replacement using
   the same object shape and a mandatory `If-Match` from the preceding GET.
   A concurrent mutation returns 412 without changing the newer snapshot.
 
-All three operations expose local host paths and are therefore owner-only:
-root, the daemon UID, or the configured operator on Unix. Read-only local
-identities receive 403. Bodies and responses are limited to 1 MiB. These
-endpoints intentionally provide no platform mount, remote composition,
-security-scoped bookmark, or automatic persistence behavior.
+The status/config reads require ordinary LocalAPI read-write identity. Config
+mutation is stricter: only root or the daemon UID may change roots on Unix;
+`OperatorUser` is denied until user switching or per-caller filesystem
+capabilities exist. Bodies and responses are limited to 1 MiB. These endpoints
+intentionally provide no platform mount, remote composition, security-scoped
+bookmark, or automatic persistence behavior.
+
+All socket and authenticated loopback LocalAPI routes now use the same phased
+reader: a 64 KiB/deadline-bounded header is read without consuming body bytes;
+peer identity, route permission, stale-listener checks, and global/per-identity
+request admission happen before body reads. Content-Length is unique and
+strict, transfer encoding is rejected, route-specific/global/identity byte
+limits apply, and body reads have an overall minimum-rate deadline. Early EOF
+or disconnect cancels the request before dispatch. This protects zero-body and
+non-Drive endpoints as well as Drive configuration.
 
 ### CLI
 
@@ -133,15 +149,17 @@ explicitly rather than claiming support.
 ## Tested
 
 Hermetic core, LocalAPI, localclient, and CLI tests cover
-compare-and-swap concurrent mutations, owner/read-only authorization,
-cancellation/deadlines, bounded JSON responses, CLI completion and text/JSON
+compare-and-swap concurrent mutations, restart-unique ETags, daemon/root versus
+operator authorization (including raw pre-body denial), phased LocalAPI body
+admission, cancellation/deadlines, bounded JSON responses, CLI completion and text/JSON
 shapes, malicious names, traversal, symlink and special-file roots, explicit
 remote/bookmark rejection, browse/read/write/move/delete, unauthorized peers,
 signed grant narrowing from read-write to read-only,
 complete capability revocation, forged grant headers, disabled startup,
 read-only LocalAPI mutation denial, failed-config atomicity, bounded parsing,
 request cancellation, deterministic root replacement, FIFO/socket rejection,
-worker saturation, post-sync cancellation, traversal, symlink escape,
+worker saturation, post-sync cancellation, publication-time special-object
+swaps that remain untouched, traversal, symlink escape,
 oversized requests, malicious `Destination` values, body-before-authorization
 framing, aggregate byte admission, old-key denial/new-key success, tunnel/send
 path removal on rotation, duplicate address ownership, eight concurrent 16 MiB

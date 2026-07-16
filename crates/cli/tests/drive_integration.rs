@@ -7,6 +7,9 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
+const ETAG_ZERO: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+const ETAG_ONE: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+
 fn rustscale_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_rustscale"))
 }
@@ -92,7 +95,7 @@ async fn drive_list_matches_upstream_text_and_json_shapes() {
         for _ in 0..2 {
             let (mut stream, request, _) = accept_request(&listener).await;
             assert!(request.starts_with("GET /localapi/v0/drive/config HTTP/1.1\r\n"));
-            respond_json(&mut stream, "200 OK", Some("drive-7"), &body).await;
+            respond_json(&mut stream, "200 OK", Some(ETAG_ONE), &body).await;
         }
         let (mut stream, request, _) = accept_request(&listener).await;
         assert!(request.starts_with("GET /localapi/v0/drive/status HTTP/1.1\r\n"));
@@ -169,18 +172,18 @@ async fn concurrent_share_commands_use_one_etag_and_cannot_lose_an_update() {
     let (mut get_two, request_two, _) = accept_request(&listener).await;
     assert!(request_one.starts_with("GET /localapi/v0/drive/config "));
     assert!(request_two.starts_with("GET /localapi/v0/drive/config "));
-    respond_json(&mut get_one, "200 OK", Some("drive-0"), empty).await;
-    respond_json(&mut get_two, "200 OK", Some("drive-0"), empty).await;
+    respond_json(&mut get_one, "200 OK", Some(ETAG_ZERO), empty).await;
+    respond_json(&mut get_two, "200 OK", Some(ETAG_ZERO), empty).await;
 
     let success_body = br#"{"enabled":true,"sharingAllowed":true,"generation":1,"shares":[]}"#;
     let (mut put_one, first_head, first_body) = accept_request(&listener).await;
     assert!(first_head.starts_with("PUT /localapi/v0/drive/config "));
-    assert!(first_head.contains("If-Match: \"drive-0\""));
-    respond_json(&mut put_one, "200 OK", Some("drive-1"), success_body).await;
+    assert!(first_head.contains(&format!("If-Match: \"{ETAG_ZERO}\"")));
+    respond_json(&mut put_one, "200 OK", Some(ETAG_ONE), success_body).await;
 
     let (mut put_two, second_head, second_body) = accept_request(&listener).await;
     assert!(second_head.starts_with("PUT /localapi/v0/drive/config "));
-    assert!(second_head.contains("If-Match: \"drive-0\""));
+    assert!(second_head.contains(&format!("If-Match: \"{ETAG_ZERO}\"")));
     respond_json(
         &mut put_two,
         "412 Precondition Failed",
@@ -240,13 +243,44 @@ async fn drive_owner_denial_and_response_bounds_are_truthful() {
     assert_failed(&denied, "access denied: owner-only Taildrive configuration");
     denied_server.await.unwrap();
 
+    let mutation_socket = dir.path().join("mutation-denied.sock");
+    let mutation_listener = UnixListener::bind(&mutation_socket).unwrap();
+    let mutation_server = tokio::spawn(async move {
+        let (mut get, request, _) = accept_request(&mutation_listener).await;
+        assert!(request.starts_with("GET /localapi/v0/drive/config "));
+        respond_json(
+            &mut get,
+            "200 OK",
+            Some(ETAG_ZERO),
+            br#"{"enabled":false,"shares":[]}"#,
+        )
+        .await;
+        let (mut put, request, _) = accept_request(&mutation_listener).await;
+        assert!(request.starts_with("PUT /localapi/v0/drive/config "));
+        respond_json(
+            &mut put,
+            "403 Forbidden",
+            None,
+            br#"{"error":"Taildrive configuration requires root or the daemon user"}"#,
+        )
+        .await;
+    });
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let mutation_denied =
+        run_drive(&mutation_socket, &["share", "docs", root.to_str().unwrap()]).await;
+    assert_failed(
+        &mutation_denied,
+        "OperatorUser cannot mutate Taildrive roots",
+    );
+    mutation_server.await.unwrap();
+
     let large_socket = dir.path().join("large.sock");
     let large_listener = UnixListener::bind(&large_socket).unwrap();
     let large_server = tokio::spawn(async move {
         let (mut stream, _, _) = accept_request(&large_listener).await;
         stream
             .write_all(
-                b"HTTP/1.1 200 OK\r\nETag: \"drive-0\"\r\nContent-Length: 1048577\r\nConnection: close\r\n\r\n",
+                format!("HTTP/1.1 200 OK\r\nETag: \"{ETAG_ZERO}\"\r\nContent-Length: 1048577\r\nConnection: close\r\n\r\n").as_bytes(),
             )
             .await
             .unwrap();

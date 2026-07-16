@@ -19,6 +19,8 @@ use crate::{PolicyError, PolicyErrorKind, PolicyKey, RawValue, SettingDefinition
 const MAX_OUTPUT: usize = 64 * 1024;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(target_os = "windows")]
+const REGISTRY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(target_os = "macos")]
 const MACOS_DOMAIN: &str = "io.tailscale.ipn.macsys";
 #[cfg(any(test, target_os = "windows"))]
@@ -435,10 +437,9 @@ fn query_registry_dump(root: &str) -> Result<RegistryDump, PolicyError> {
             .map_err(|_| PolicyError::new(PolicyErrorKind::Parse))?;
         return Ok(RegistryDump::parse(text, root));
     }
-    if registry_key_missing(&output) {
-        Ok(RegistryDump::default())
-    } else {
-        Err(PolicyError::new(PolicyErrorKind::Provider))
+    match probe_registry_key(root)? {
+        RegistryKeyState::Missing => Ok(RegistryDump::default()),
+        RegistryKeyState::Present => Err(PolicyError::new(PolicyErrorKind::Provider)),
     }
 }
 
@@ -453,16 +454,52 @@ fn run_registry_query(root: &str) -> Result<crate::command::BoundedOutput, Polic
     .map_err(|_| PolicyError::new(PolicyErrorKind::Provider))
 }
 
+#[cfg(any(test, target_os = "windows"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegistryKeyState {
+    Present,
+    Missing,
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn registry_probe_state(status: Option<i32>) -> Result<RegistryKeyState, PolicyError> {
+    match status {
+        Some(0) => Ok(RegistryKeyState::Present),
+        Some(3) => Ok(RegistryKeyState::Missing),
+        // The fixed probe maps access denied and all other exceptions to
+        // distinct non-missing exit codes. Never infer absence from text.
+        _ => Err(PolicyError::new(PolicyErrorKind::Provider)),
+    }
+}
+
 #[cfg(target_os = "windows")]
-fn registry_key_missing(output: &crate::command::BoundedOutput) -> bool {
-    output.status_code == Some(1)
-        && [output.stdout.as_slice(), output.stderr.as_slice()]
-            .into_iter()
-            .filter_map(|bytes| std::str::from_utf8(bytes).ok())
-            .any(|text| {
-                let text = text.to_ascii_lowercase();
-                text.contains("unable to find") || text.contains("cannot find")
-            })
+fn probe_registry_key(root: &str) -> Result<RegistryKeyState, PolicyError> {
+    const SCRIPT: &str = concat!(
+        "$p=$args[0] -replace '^HKLM\\\\','';",
+        "try {",
+        "$b=[Microsoft.Win32.RegistryKey]::OpenBaseKey(",
+        "[Microsoft.Win32.RegistryHive]::LocalMachine,",
+        "[Microsoft.Win32.RegistryView]::Registry64);",
+        "$k=$b.OpenSubKey($p,$false);",
+        "if($null -eq $k){exit 3};$k.Dispose();$b.Dispose();exit 0",
+        "} catch [System.UnauthorizedAccessException] { exit 5 } ",
+        "catch { exit 6 }"
+    );
+    let output = crate::command::run_bounded(
+        Path::new(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"),
+        &[
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            SCRIPT,
+            root,
+        ],
+        REGISTRY_PROBE_TIMEOUT,
+        MAX_OUTPUT,
+    )
+    .map_err(|_| PolicyError::new(PolicyErrorKind::Provider))?;
+    registry_probe_state(output.status_code)
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -477,7 +514,7 @@ fn start_native_watcher(
         "syspolicy-native-watch",
         options,
         provider.watch_clock.clone(),
-        native_observation,
+        |_| native_observation(),
         callback,
     )
     .map(Some)
@@ -622,6 +659,20 @@ mod tests {
                 &legacy
             ),
             Some(Ok(RawValue::StringList(Vec::new())))
+        );
+    }
+
+    #[test]
+    fn registry_missing_probe_is_locale_independent_and_distinguishes_access() {
+        assert_eq!(registry_probe_state(Some(0)), Ok(RegistryKeyState::Present));
+        assert_eq!(registry_probe_state(Some(3)), Ok(RegistryKeyState::Missing));
+        assert_eq!(
+            registry_probe_state(Some(5)).unwrap_err().kind,
+            PolicyErrorKind::Provider
+        );
+        assert_eq!(
+            registry_probe_state(Some(6)).unwrap_err().kind,
+            PolicyErrorKind::Provider
         );
     }
 

@@ -15,6 +15,10 @@ use crate::watch::test_clock::FakeWatchClock;
 
 use crate::*;
 
+fn test_file_trust() -> Arc<dyn FileTrustPolicy> {
+    Arc::new(|metadata: &fs::Metadata| metadata.is_file())
+}
+
 fn memory(values: impl IntoIterator<Item = (PolicyKey, RawValue)>) -> Arc<MemoryProvider> {
     Arc::new(MemoryProvider::from_values(values.into_iter().collect()))
 }
@@ -88,6 +92,60 @@ impl Drop for StoredCallbackSubscription {
                 callback();
             }
         }
+    }
+}
+
+struct RetryProvider {
+    callback: Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>,
+    value: Mutex<String>,
+    failures: AtomicUsize,
+    loads: AtomicUsize,
+}
+
+impl RetryProvider {
+    fn new(value: &str) -> Self {
+        Self {
+            callback: Arc::new(Mutex::new(None)),
+            value: Mutex::new(value.into()),
+            failures: AtomicUsize::new(0),
+            loads: AtomicUsize::new(0),
+        }
+    }
+
+    fn change_with_failures(&self, value: &str, failures: usize) {
+        *self.value.lock().unwrap() = value.into();
+        self.failures.store(failures, Ordering::SeqCst);
+        self.callback.lock().unwrap().clone().unwrap()();
+    }
+}
+
+impl PolicyProvider for RetryProvider {
+    fn load(&self, _definitions: &[SettingDefinition]) -> Result<ProviderValues, PolicyError> {
+        self.loads.fetch_add(1, Ordering::SeqCst);
+        if self
+            .failures
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                (remaining != 0).then(|| remaining - 1)
+            })
+            .is_ok()
+        {
+            return Err(PolicyError::new(PolicyErrorKind::Provider));
+        }
+        Ok(BTreeMap::from([(
+            PolicyKey::Tailnet,
+            Ok(RawValue::String(self.value.lock().unwrap().clone())),
+        )]))
+    }
+
+    fn subscribe(
+        &self,
+        callback: Arc<dyn Fn() + Send + Sync>,
+    ) -> Result<Option<Box<dyn ProviderSubscription>>, PolicyError> {
+        *self.callback.lock().unwrap() = Some(callback);
+        Ok(Some(Box::new(StoredCallbackSubscription {
+            callback: self.callback.clone(),
+            notify_on_drop: false,
+        })))
     }
 }
 
@@ -212,7 +270,7 @@ fn json_provider_is_bounded_and_preserves_item_errors() {
         r#"{"Tailnet":"example.ts.net","LogSCMInteractions":"yes"}"#,
     )
     .unwrap();
-    let provider = JsonFileProvider::new(file.path());
+    let provider = JsonFileProvider::new(file.path()).with_file_trust(test_file_trust());
     let values = provider
         .load(&[
             PolicyKey::Tailnet.definition(),
@@ -232,6 +290,7 @@ fn json_provider_is_bounded_and_preserves_item_errors() {
     );
 
     let error = JsonFileProvider::new(file.path())
+        .with_file_trust(test_file_trust())
         .with_max_size(8)
         .load(&[PolicyKey::Tailnet.definition()])
         .unwrap_err();
@@ -239,11 +298,64 @@ fn json_provider_is_bounded_and_preserves_item_errors() {
     assert_eq!(error.key, None);
 }
 
+#[cfg(unix)]
+#[test]
+fn managed_json_rejects_untrusted_modes_symlinks_and_fifos() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    use std::process::Command;
+
+    let directory = tempdir().unwrap();
+    let regular = directory.path().join("policy.json");
+    fs::write(&regular, r#"{"Tailnet":"managed"}"#).unwrap();
+    fs::set_permissions(&regular, fs::Permissions::from_mode(0o666)).unwrap();
+    let error = JsonFileProvider::new(&regular)
+        .load(&[PolicyKey::Tailnet.definition()])
+        .unwrap_err();
+    assert_eq!(error.kind, PolicyErrorKind::Untrusted);
+
+    let link = directory.path().join("policy-link.json");
+    symlink(&regular, &link).unwrap();
+    let error = JsonFileProvider::new(&link)
+        .with_file_trust(test_file_trust())
+        .load(&[PolicyKey::Tailnet.definition()])
+        .unwrap_err();
+    assert_eq!(error.kind, PolicyErrorKind::Io);
+
+    let fifo = directory.path().join("policy.fifo");
+    assert!(Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap()
+        .success());
+    let started = Instant::now();
+    let error = JsonFileProvider::new(&fifo)
+        .with_file_trust(test_file_trust())
+        .load(&[PolicyKey::Tailnet.definition()])
+        .unwrap_err();
+    assert_eq!(error.kind, PolicyErrorKind::Untrusted);
+    assert!(started.elapsed() < MAX_POLICY_READ_TIME);
+}
+
+#[test]
+fn managed_json_trust_is_injectable_for_tests() {
+    let file = NamedTempFile::new().unwrap();
+    fs::write(file.path(), r#"{"Tailnet":"trusted-for-test"}"#).unwrap();
+    let values = JsonFileProvider::new(file.path())
+        .with_file_trust(test_file_trust())
+        .load(&[PolicyKey::Tailnet.definition()])
+        .unwrap();
+    assert_eq!(
+        values[&PolicyKey::Tailnet],
+        Ok(RawValue::String("trusted-for-test".into()))
+    );
+}
+
 #[test]
 fn invalid_json_does_not_echo_contents_in_error() {
     let file = NamedTempFile::new().unwrap();
     fs::write(file.path(), r#"{"AuthKey":"tskey-secret-value""#).unwrap();
     let error = JsonFileProvider::new(file.path())
+        .with_file_trust(test_file_trust())
         .load(&[PolicyKey::AuthKey.definition()])
         .unwrap_err();
     assert_eq!(error.kind, PolicyErrorKind::Parse);
@@ -504,7 +616,7 @@ fn provider_cannot_return_key_outside_requested_scope_allowlist() {
 }
 
 #[test]
-fn removal_recovers_from_other_provider_error_without_ghost_items() {
+fn removal_retains_failed_provider_cache_without_removed_ghost_items() {
     let engine = PolicyEngine::well_known(PolicyScope::Device).unwrap();
     let base = engine
         .add_provider(
@@ -517,22 +629,29 @@ fn removal_recovers_from_other_provider_error_without_ghost_items() {
         PolicyKey::LogTarget,
         RawValue::String("log.example".into()),
     ));
-    engine
+    let flaky_id = engine
         .add_provider("flaky", PolicyScope::Device, flaky.clone())
         .unwrap();
     flaky.fail.store(true, Ordering::SeqCst);
 
     engine.remove_provider(base).unwrap();
     assert!(engine.snapshot().item(PolicyKey::Tailnet).is_none());
-    assert!(engine.snapshot().item(PolicyKey::LogTarget).is_none());
+    assert_eq!(
+        engine.get_string(PolicyKey::LogTarget, ""),
+        Ok("log.example".into())
+    );
     assert_eq!(
         engine.last_reload_error().unwrap().kind,
+        PolicyErrorKind::Provider
+    );
+    assert_eq!(
+        engine.provider_error(flaky_id).unwrap().kind,
         PolicyErrorKind::Provider
     );
 }
 
 #[test]
-fn override_drop_cannot_leak_when_remaining_provider_fails() {
+fn override_drop_restores_cached_managed_value_when_provider_fails() {
     let engine = PolicyEngine::well_known(PolicyScope::Device).unwrap();
     let flaky = Arc::new(ToggleProvider::new(
         PolicyKey::Tailnet,
@@ -549,7 +668,54 @@ fn override_drop_cannot_leak_when_remaining_provider_fails() {
         .unwrap();
     flaky.fail.store(true, Ordering::SeqCst);
     drop(policy_override);
-    assert!(engine.snapshot().item(PolicyKey::Tailnet).is_none());
+    assert_eq!(engine.get_string(PolicyKey::Tailnet, ""), Ok("base".into()));
+    assert_eq!(
+        engine.last_reload_error().unwrap().kind,
+        PolicyErrorKind::Provider
+    );
+}
+
+#[test]
+fn pending_notification_retries_without_stale_generation() {
+    let engine = PolicyEngine::well_known(PolicyScope::Device).unwrap();
+    let provider = Arc::new(RetryProvider::new("old"));
+    let provider_id = engine
+        .add_provider("retry", PolicyScope::Device, provider.clone())
+        .unwrap();
+    let initial_generation = engine.snapshot().generation();
+    let initial_attempts = engine.reload_attempt_count();
+
+    provider.change_with_failures("new", 2);
+    wait_until(|| engine.get_string(PolicyKey::Tailnet, "").unwrap() == "new");
+    assert_eq!(engine.snapshot().generation(), initial_generation + 1);
+    assert!(engine.reload_attempt_count() >= initial_attempts + 3);
+    assert_eq!(provider.loads.load(Ordering::SeqCst), 4);
+    assert!(engine.last_reload_error().is_none());
+    assert!(engine.provider_error(provider_id).is_none());
+}
+
+#[test]
+fn callback_panics_are_isolated_and_reload_worker_survives() {
+    let engine = PolicyEngine::well_known(PolicyScope::Device).unwrap();
+    let provider = memory([(PolicyKey::Tailnet, RawValue::String("old".into()))]);
+    engine
+        .add_provider("memory", PolicyScope::Device, provider.clone())
+        .unwrap();
+    let panicking = engine.register_change_callback(|_| panic!("isolated callback panic"));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let callback_calls = calls.clone();
+    let healthy = engine.register_change_callback(move |_| {
+        callback_calls.fetch_add(1, Ordering::SeqCst);
+    });
+
+    provider.set(PolicyKey::Tailnet, RawValue::String("one".into()));
+    wait_until(|| calls.load(Ordering::SeqCst) == 1);
+    assert_eq!(engine.callback_panic_count(), 1);
+    provider.set(PolicyKey::Tailnet, RawValue::String("two".into()));
+    wait_until(|| calls.load(Ordering::SeqCst) == 2);
+    assert_eq!(engine.callback_panic_count(), 2);
+    assert_eq!(engine.get_string(PolicyKey::Tailnet, ""), Ok("two".into()));
+    drop((panicking, healthy));
 }
 
 #[test]
@@ -684,6 +850,7 @@ fn watched_json_coalesces_atomic_replacement_deletion_and_recreation() {
     let clock = Arc::new(FakeWatchClock::default());
     let provider = Arc::new(
         JsonFileProvider::optional(&path)
+            .with_file_trust(test_file_trust())
             .with_watch_options(
                 WatchOptions::new(Duration::from_millis(20), Duration::from_millis(10)).unwrap(),
             )
@@ -742,13 +909,14 @@ fn watched_json_coalesces_atomic_replacement_deletion_and_recreation() {
 }
 
 #[test]
-fn watched_json_fails_closed_once_and_recovers_without_spinning() {
+fn watched_json_retries_pending_error_with_bounded_backoff_until_recovery() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("policy.json");
     fs::write(&path, r#"{"Tailnet":"safe"}"#).unwrap();
     let clock = Arc::new(FakeWatchClock::default());
     let provider = Arc::new(
         JsonFileProvider::new(&path)
+            .with_file_trust(test_file_trust())
             .with_max_size(64)
             .with_watch_options(
                 WatchOptions::new(Duration::from_millis(20), Duration::from_millis(10)).unwrap(),
@@ -771,19 +939,52 @@ fn watched_json_fails_closed_once_and_recovers_without_spinning() {
     });
     assert_eq!(engine.get_string(PolicyKey::Tailnet, ""), Ok("safe".into()));
     let generation = engine.snapshot().generation();
+    let attempts = engine.reload_attempt_count();
 
-    // An unchanged error state is polled but does not enqueue repeated parses.
-    for _ in 0..4 {
-        advance_watch(&clock);
-    }
+    // The failed observation remains pending, but exponential backoff bounds
+    // retries and failed attempts never publish a stale generation.
+    thread::sleep(Duration::from_millis(80));
+    let retried_attempts = engine.reload_attempt_count();
+    assert!(retried_attempts > attempts);
+    assert!(retried_attempts <= attempts + 5);
     assert_eq!(engine.snapshot().generation(), generation);
 
+    // Recovery succeeds from the pending retry without requiring another
+    // watcher event.
     fs::write(&path, r#"{"Tailnet":"recovered"}"#).unwrap();
-    advance_watch(&clock);
-    advance_watch(&clock);
     wait_until(|| engine.get_string(PolicyKey::Tailnet, "").unwrap() == "recovered");
+    assert_eq!(engine.snapshot().generation(), generation + 1);
     assert!(engine.last_reload_error().is_none());
     engine.remove_provider(id).unwrap();
+}
+
+#[test]
+fn watcher_reentrant_self_cancellation_is_bounded_and_reaped() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("policy.json");
+    fs::write(&path, r#"{"Tailnet":"old"}"#).unwrap();
+    let clock = Arc::new(FakeWatchClock::default());
+    let provider = JsonFileProvider::new(&path)
+        .with_file_trust(test_file_trust())
+        .with_watch_options(
+            WatchOptions::new(Duration::from_millis(20), Duration::from_millis(10)).unwrap(),
+        )
+        .with_watch_clock(clock.clone());
+    let holder: Arc<Mutex<Option<Box<dyn ProviderSubscription>>>> = Arc::new(Mutex::new(None));
+    let callback_holder = holder.clone();
+    let subscription = provider
+        .subscribe(Arc::new(move || {
+            callback_holder.lock().unwrap().take();
+        }))
+        .unwrap()
+        .unwrap();
+    *holder.lock().unwrap() = Some(subscription);
+    wait_until(|| clock.active_waiters() == 1);
+
+    fs::write(&path, r#"{"Tailnet":"new"}"#).unwrap();
+    advance_watch(&clock);
+    clock.tick(1);
+    wait_until(|| holder.lock().unwrap().is_none() && clock.active_waiters() == 0);
 }
 
 #[test]
@@ -794,6 +995,7 @@ fn watched_callback_can_mutate_callbacks_and_remove_provider() {
     let clock = Arc::new(FakeWatchClock::default());
     let provider = Arc::new(
         JsonFileProvider::new(&path)
+            .with_file_trust(test_file_trust())
             .with_watch_options(
                 WatchOptions::new(Duration::from_millis(20), Duration::from_millis(10)).unwrap(),
             )

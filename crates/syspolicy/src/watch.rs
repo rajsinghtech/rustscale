@@ -1,7 +1,8 @@
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Condvar, Mutex,
+        mpsc::{self, Sender},
+        Arc, Condvar, Mutex, OnceLock,
     },
     thread::{self, JoinHandle},
     time::Duration,
@@ -64,7 +65,7 @@ pub(crate) struct WatchControl {
 }
 
 impl WatchControl {
-    fn cancel(&self) {
+    pub(crate) fn cancel(&self) {
         let _wait = self.wait_lock.lock().expect("watch control lock poisoned");
         self.cancelled.store(true, Ordering::Release);
         self.changed.notify_all();
@@ -116,25 +117,26 @@ impl PollingSubscription {
         name: &str,
         options: WatchOptions,
         clock: Arc<dyn WatchClock>,
-        probe: impl Fn() -> State + Send + 'static,
+        probe: impl Fn(&WatchControl) -> State + Send + 'static,
         callback: Arc<dyn Fn() + Send + Sync>,
     ) -> Result<Box<dyn ProviderSubscription>, PolicyError>
     where
         State: Eq + Send + 'static,
     {
+        let _ = worker_reaper()?;
         let control = Arc::new(WatchControl::default());
         let worker_control = control.clone();
         let worker_clock = clock.clone();
         let worker = thread::Builder::new()
             .name(name.to_owned())
             .spawn(move || {
-                let mut previous = probe();
+                let mut previous = probe(&worker_control);
                 let mut first_poll = true;
                 loop {
                     if worker_clock.wait(&worker_control, options.poll_interval()) {
                         break;
                     }
-                    let observed = probe();
+                    let observed = probe(&worker_control);
                     if !first_poll && observed == previous {
                         continue;
                     }
@@ -150,7 +152,7 @@ impl PollingSubscription {
                     }
                     // Re-sample after the debounce window. Any number of
                     // replacements in the burst produce one bounded event.
-                    previous = probe();
+                    previous = probe(&worker_control);
                     if worker_control.is_cancelled() {
                         break;
                     }
@@ -178,14 +180,42 @@ impl Drop for PollingSubscription {
             .expect("watch worker lock poisoned")
             .take();
         if let Some(worker) = worker {
-            // Provider callbacks are deliberately tiny notification enqueues in
-            // PolicyEngine, so engine-owned subscriptions are never dropped by
-            // their own polling worker.
-            if worker.thread().id() != thread::current().id() {
+            if worker.thread().id() == thread::current().id() {
+                // A reentrant callback cannot join its own thread. Transfer
+                // ownership to one bounded-lifetime reaper, which joins after
+                // this callback returns and the cancelled worker exits.
+                reap_worker(worker);
+            } else {
                 let _ = worker.join();
             }
         }
     }
+}
+
+fn worker_reaper() -> Result<&'static Sender<JoinHandle<()>>, PolicyError> {
+    static REAPER: OnceLock<Option<Sender<JoinHandle<()>>>> = OnceLock::new();
+    REAPER
+        .get_or_init(|| {
+            let (sender, receiver) = mpsc::channel::<JoinHandle<()>>();
+            thread::Builder::new()
+                .name("syspolicy-watch-reaper".into())
+                .spawn(move || {
+                    while let Ok(worker) = receiver.recv() {
+                        let _ = worker.join();
+                    }
+                })
+                .ok()
+                .map(|_| sender)
+        })
+        .as_ref()
+        .ok_or_else(|| PolicyError::new(PolicyErrorKind::Provider))
+}
+
+fn reap_worker(worker: JoinHandle<()>) {
+    worker_reaper()
+        .expect("watch reaper was created before watcher")
+        .send(worker)
+        .expect("watch reaper retains a static sender");
 }
 
 #[cfg(test)]

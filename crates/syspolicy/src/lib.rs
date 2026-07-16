@@ -27,9 +27,9 @@ pub use keys::{
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub use platform::{NativePolicyProvider, NativePostureProvider};
 pub use provider::{
-    environment_variable_name, EnvironmentProvider, JsonFileProvider, MemoryProvider,
-    PolicyProvider, ProviderSubscription, ProviderValues, StubPolicyProvider, MAX_ENV_VALUE_SIZE,
-    MAX_POLICY_FILE_SIZE,
+    environment_variable_name, EnvironmentProvider, FileTrustPolicy, JsonFileProvider,
+    MemoryProvider, PolicyProvider, ProductionFileTrust, ProviderSubscription, ProviderValues,
+    StubPolicyProvider, MAX_ENV_VALUE_SIZE, MAX_POLICY_FILE_SIZE, MAX_POLICY_READ_TIME,
 };
 pub use value::{
     parse_go_duration, DurationParseError, PolicyValue, PreferenceOption, RawValue, Visibility,
@@ -70,6 +70,8 @@ pub enum PolicyErrorKind {
     ProviderViolation,
     /// Managed policy is unavailable on this platform and cannot be bypassed.
     Unsupported,
+    /// A managed file failed ownership, mode, or regular-file trust checks.
+    Untrusted,
 }
 
 /// A policy failure. It deliberately excludes raw values and filesystem paths

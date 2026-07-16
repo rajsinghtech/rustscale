@@ -1,20 +1,20 @@
 use std::{
     collections::BTreeMap,
     env, fmt,
-    fs::{self, File},
+    fs::{self, File, Metadata, OpenOptions},
     io::{self, Read},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex, Weak,
     },
-    time::UNIX_EPOCH,
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 
 use serde_json::Value;
 
 use crate::{
-    watch::{PollingSubscription, SystemWatchClock, WatchClock},
+    watch::{PollingSubscription, SystemWatchClock, WatchClock, WatchControl},
     PolicyError, PolicyErrorKind, PolicyKey, RawValue, SettingDefinition, ValueType, WatchOptions,
 };
 
@@ -22,6 +22,8 @@ use crate::{
 pub const MAX_POLICY_FILE_SIZE: u64 = 1024 * 1024;
 /// Maximum accepted value length in the environment provider (64 KiB).
 pub const MAX_ENV_VALUE_SIZE: usize = 64 * 1024;
+/// Maximum wall-clock time spent reading one managed JSON snapshot.
+pub const MAX_POLICY_READ_TIME: Duration = Duration::from_secs(2);
 
 /// Values returned by one provider load.
 pub type ProviderValues = BTreeMap<PolicyKey, Result<RawValue, PolicyError>>;
@@ -43,6 +45,45 @@ pub trait PolicyProvider: Send + Sync {
     }
 }
 
+/// Decides whether metadata for an already-open regular policy file is trusted.
+pub trait FileTrustPolicy: Send + Sync {
+    /// Returns true only when the opened file is trusted as managed policy.
+    fn is_trusted(&self, metadata: &Metadata) -> bool;
+}
+
+impl<F> FileTrustPolicy for F
+where
+    F: Fn(&Metadata) -> bool + Send + Sync,
+{
+    fn is_trusted(&self, metadata: &Metadata) -> bool {
+        self(metadata)
+    }
+}
+
+/// Production trust policy for managed JSON files.
+#[derive(Debug, Default)]
+pub struct ProductionFileTrust;
+
+impl FileTrustPolicy for ProductionFileTrust {
+    fn is_trusted(&self, metadata: &Metadata) -> bool {
+        if !metadata.is_file() {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            metadata.uid() == 0 && metadata.mode() & 0o022 == 0
+        }
+        #[cfg(not(unix))]
+        {
+            // No ownership/mode proof is available through safe std APIs.
+            // Platforms without that proof fail closed unless the embedding
+            // application supplies an explicit trust policy.
+            false
+        }
+    }
+}
+
 /// A provider backed by a bounded JSON object file.
 ///
 /// Watching is disabled unless [`Self::with_watching`] or
@@ -55,6 +96,7 @@ pub struct JsonFileProvider {
     max_size: u64,
     watch_options: Option<WatchOptions>,
     watch_clock: Arc<dyn WatchClock>,
+    trust: Arc<dyn FileTrustPolicy>,
 }
 
 impl fmt::Debug for JsonFileProvider {
@@ -65,6 +107,7 @@ impl fmt::Debug for JsonFileProvider {
             .field("missing_is_empty", &self.missing_is_empty)
             .field("max_size", &self.max_size)
             .field("watch_options", &self.watch_options)
+            .field("trust", &"configured")
             .finish_non_exhaustive()
     }
 }
@@ -78,6 +121,7 @@ impl JsonFileProvider {
             max_size: MAX_POLICY_FILE_SIZE,
             watch_options: None,
             watch_clock: Arc::new(SystemWatchClock),
+            trust: Arc::new(ProductionFileTrust),
         }
     }
 
@@ -89,12 +133,21 @@ impl JsonFileProvider {
             max_size: MAX_POLICY_FILE_SIZE,
             watch_options: None,
             watch_clock: Arc::new(SystemWatchClock),
+            trust: Arc::new(ProductionFileTrust),
         }
     }
 
-    /// Overrides the byte limit. Primarily useful for tests.
+    /// Lowers the byte limit. Primarily useful for tests.
     pub fn with_max_size(mut self, max_size: u64) -> Self {
-        self.max_size = max_size;
+        self.max_size = max_size.min(MAX_POLICY_FILE_SIZE);
+        self
+    }
+
+    /// Replaces the production root-ownership trust policy.
+    ///
+    /// Callers must not weaken this for production managed policy.
+    pub fn with_file_trust(mut self, trust: Arc<dyn FileTrustPolicy>) -> Self {
+        self.trust = trust;
         self
     }
 
@@ -117,30 +170,18 @@ impl JsonFileProvider {
     }
 
     fn read_object(&self) -> Result<serde_json::Map<String, Value>, PolicyError> {
-        let mut file = match File::open(&self.path) {
-            Ok(file) => file,
-            Err(error) if self.missing_is_empty && error.kind() == io::ErrorKind::NotFound => {
-                return Ok(serde_json::Map::new());
-            }
-            Err(_) => return Err(PolicyError::new(PolicyErrorKind::Io)),
+        let Some((mut file, metadata)) =
+            open_managed_file(&self.path, self.missing_is_empty, self.trust.as_ref())?
+        else {
+            return Ok(serde_json::Map::new());
         };
-        if file
-            .metadata()
-            .ok()
-            .is_some_and(|metadata| metadata.len() > self.max_size)
-        {
-            return Err(PolicyError::new(PolicyErrorKind::TooLarge));
-        }
-
-        let capacity = usize::try_from(self.max_size.min(64 * 1024)).unwrap_or(64 * 1024);
-        let mut contents = Vec::with_capacity(capacity);
-        file.by_ref()
-            .take(self.max_size.saturating_add(1))
-            .read_to_end(&mut contents)
-            .map_err(|_| PolicyError::new(PolicyErrorKind::Io))?;
-        if u64::try_from(contents.len()).unwrap_or(u64::MAX) > self.max_size {
-            return Err(PolicyError::new(PolicyErrorKind::TooLarge));
-        }
+        let contents = read_bounded(
+            &mut file,
+            metadata.len(),
+            self.max_size,
+            Instant::now() + MAX_POLICY_READ_TIME,
+            None,
+        )?;
         let value: Value = serde_json::from_slice(&contents)
             .map_err(|_| PolicyError::new(PolicyErrorKind::Parse))?;
         value
@@ -148,6 +189,81 @@ impl JsonFileProvider {
             .cloned()
             .ok_or_else(|| PolicyError::new(PolicyErrorKind::Parse))
     }
+}
+
+fn open_managed_file(
+    path: &Path,
+    missing_is_empty: bool,
+    trust: &dyn FileTrustPolicy,
+) -> Result<Option<(File, Metadata)>, PolicyError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_FLAG_OPEN_REPARSE_POINT prevents following the final reparse
+        // point. The opened metadata is then required to be a regular file.
+        options.custom_flags(0x0020_0000);
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if missing_is_empty && error.kind() == io::ErrorKind::NotFound => {
+            return Ok(None);
+        }
+        Err(_) => return Err(PolicyError::new(PolicyErrorKind::Io)),
+    };
+    let metadata = file
+        .metadata()
+        .map_err(|_| PolicyError::new(PolicyErrorKind::Io))?;
+    if !metadata.is_file() || !trust.is_trusted(&metadata) {
+        return Err(PolicyError::new(PolicyErrorKind::Untrusted));
+    }
+    Ok(Some((file, metadata)))
+}
+
+fn read_bounded(
+    reader: &mut impl Read,
+    declared_size: u64,
+    max_size: u64,
+    deadline: Instant,
+    control: Option<&WatchControl>,
+) -> Result<Vec<u8>, PolicyError> {
+    if declared_size > max_size {
+        return Err(PolicyError::new(PolicyErrorKind::TooLarge));
+    }
+    let capacity = usize::try_from(max_size.min(64 * 1024)).unwrap_or(64 * 1024);
+    let mut contents = Vec::with_capacity(capacity);
+    let mut chunk = [0_u8; 16 * 1024];
+    loop {
+        if Instant::now() >= deadline || control.is_some_and(WatchControl::is_cancelled) {
+            return Err(PolicyError::new(PolicyErrorKind::Io));
+        }
+        let remaining = max_size
+            .saturating_add(1)
+            .saturating_sub(u64::try_from(contents.len()).unwrap_or(u64::MAX));
+        if remaining == 0 {
+            return Err(PolicyError::new(PolicyErrorKind::TooLarge));
+        }
+        let read_limit = usize::try_from(remaining)
+            .unwrap_or(usize::MAX)
+            .min(chunk.len());
+        let count = reader
+            .read(&mut chunk[..read_limit])
+            .map_err(|_| PolicyError::new(PolicyErrorKind::Io))?;
+        if count == 0 {
+            break;
+        }
+        contents.extend_from_slice(&chunk[..count]);
+    }
+    if u64::try_from(contents.len()).unwrap_or(u64::MAX) > max_size {
+        return Err(PolicyError::new(PolicyErrorKind::TooLarge));
+    }
+    Ok(contents)
 }
 
 impl PolicyProvider for JsonFileProvider {
@@ -175,11 +291,12 @@ impl PolicyProvider for JsonFileProvider {
         };
         let path = self.path.clone();
         let max_size = self.max_size;
+        let trust = self.trust.clone();
         PollingSubscription::start(
             "syspolicy-file-watch",
             options,
             self.watch_clock.clone(),
-            move || file_observation(&path, max_size),
+            move |control| file_observation(&path, max_size, trust.as_ref(), control),
             callback,
         )
         .map(Some)
@@ -189,8 +306,7 @@ impl PolicyProvider for JsonFileProvider {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FileObservation {
     Missing,
-    TooLarge,
-    Unavailable,
+    Error(PolicyErrorKind),
     Present {
         identity: u128,
         modified_nanos: u128,
@@ -199,32 +315,27 @@ enum FileObservation {
     },
 }
 
-fn file_observation(path: &Path, max_size: u64) -> FileObservation {
-    let mut file = match File::open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return FileObservation::Missing,
-        Err(_) => return FileObservation::Unavailable,
+fn file_observation(
+    path: &Path,
+    max_size: u64,
+    trust: &dyn FileTrustPolicy,
+    control: &WatchControl,
+) -> FileObservation {
+    let (mut file, metadata) = match open_managed_file(path, true, trust) {
+        Ok(Some(opened)) => opened,
+        Ok(None) => return FileObservation::Missing,
+        Err(error) => return FileObservation::Error(error.kind),
     };
-    let metadata = match file.metadata() {
-        Ok(metadata) => metadata,
-        Err(_) => return FileObservation::Unavailable,
+    let bytes = match read_bounded(
+        &mut file,
+        metadata.len(),
+        max_size,
+        Instant::now() + MAX_POLICY_READ_TIME,
+        Some(control),
+    ) {
+        Ok(bytes) => bytes,
+        Err(error) => return FileObservation::Error(error.kind),
     };
-    if metadata.len() > max_size {
-        return FileObservation::TooLarge;
-    }
-    let capacity = usize::try_from(max_size.min(64 * 1024)).unwrap_or(64 * 1024);
-    let mut bytes = Vec::with_capacity(capacity);
-    if file
-        .by_ref()
-        .take(max_size.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .is_err()
-    {
-        return FileObservation::Unavailable;
-    }
-    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_size {
-        return FileObservation::TooLarge;
-    }
     let modified_nanos = metadata
         .modified()
         .ok()
@@ -290,6 +401,70 @@ fn raw_from_json(
                 .collect::<Result<Vec<_>, _>>()
                 .map(RawValue::StringList)
         }
+    }
+}
+
+#[cfg(test)]
+mod file_security_tests {
+    use super::*;
+    use std::thread;
+
+    struct CancellingReader<'a> {
+        control: &'a WatchControl,
+        reads: usize,
+    }
+
+    impl Read for CancellingReader<'_> {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            self.reads += 1;
+            output[0] = b'{';
+            self.control.cancel();
+            Ok(1)
+        }
+    }
+
+    struct SlowReader {
+        reads: usize,
+    }
+
+    impl Read for SlowReader {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            self.reads += 1;
+            thread::sleep(Duration::from_millis(5));
+            output[0] = b'{';
+            Ok(1)
+        }
+    }
+
+    #[test]
+    fn bounded_read_honors_deadline_and_cancellation_between_chunks() {
+        let control = WatchControl::default();
+        let mut cancelling = CancellingReader {
+            control: &control,
+            reads: 0,
+        };
+        let error = read_bounded(
+            &mut cancelling,
+            2,
+            MAX_POLICY_FILE_SIZE,
+            Instant::now() + MAX_POLICY_READ_TIME,
+            Some(&control),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind, PolicyErrorKind::Io);
+        assert_eq!(cancelling.reads, 1);
+
+        let mut slow = SlowReader { reads: 0 };
+        let error = read_bounded(
+            &mut slow,
+            2,
+            MAX_POLICY_FILE_SIZE,
+            Instant::now() + Duration::from_millis(1),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind, PolicyErrorKind::Io);
+        assert_eq!(slow.reads, 1);
     }
 }
 

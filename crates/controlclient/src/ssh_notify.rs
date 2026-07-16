@@ -136,6 +136,7 @@ struct DispatcherInner {
 struct DispatcherState {
     current: Option<Arc<Generation>>,
     revoked_keys: HashSet<NodePublic>,
+    admission_blocked: bool,
 }
 
 impl std::fmt::Debug for SshCallbackDispatcher {
@@ -175,6 +176,33 @@ impl SshCallbackDispatcher {
         if let Some(generation) = generation {
             generation.revoke();
         }
+    }
+
+    /// Atomically block all future admission, read and remove the actual
+    /// active generation, and latch that generation's key before synchronously
+    /// draining its queue, tasks, and scheduler permits. This is the lifecycle
+    /// shutdown/logout boundary and does not trust a startup key snapshot.
+    pub fn revoke_current_and_latch(&self) -> Option<NodePublic> {
+        let (generation, node_key) = {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.admission_blocked = true;
+            let generation = state.current.take();
+            let node_key = generation
+                .as_ref()
+                .map(|generation| generation.node_key.clone());
+            if let Some(node_key) = node_key.as_ref() {
+                state.revoked_keys.insert(node_key.clone());
+            }
+            (generation, node_key)
+        };
+        if let Some(generation) = generation {
+            generation.revoke();
+        }
+        node_key
     }
 
     /// Permanently latch one request key as callback-revoked. Reconnects using
@@ -235,7 +263,7 @@ impl SshCallbackDispatcher {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if state.revoked_keys.contains(&node_key) {
+            if state.admission_blocked || state.revoked_keys.contains(&node_key) {
                 return None;
             }
             let generation = Arc::new(Generation::new(
@@ -1175,6 +1203,42 @@ mod tests {
         dispatcher.revoke_current();
         assert!(generation.generation.revoked.load(Ordering::Acquire));
         assert!(generation.generation.pop().is_none());
+        assert_eq!(dispatcher.metrics().revoked_queued, 1);
+        assert_eq!(
+            notifier.enqueue("https://any.invalid/late", &request(1)),
+            Err(SshNotifyEnqueueError::NoGeneration)
+        );
+    }
+
+    #[test]
+    fn rotated_paused_map_logout_latches_actual_replacement_generation() {
+        let dispatcher = SshCallbackDispatcher::new();
+        let startup_key = NodePublic::from_raw32([3; 32]);
+        let startup = dispatcher.activate(startup_key.clone()).unwrap();
+        dispatcher.latch_key_revoked(&startup_key);
+        assert!(startup.generation.revoked.load(Ordering::Acquire));
+
+        let replacement_key = NodePublic::from_raw32([4; 32]);
+        dispatcher.install_authenticated_replacement(&replacement_key);
+        // Retaining this lease models a rotated map task paused before it can
+        // observe lifecycle cancellation.
+        let replacement = dispatcher.activate(replacement_key.clone()).unwrap();
+        let notifier = dispatcher.notifier();
+        notifier
+            .enqueue("https://any.invalid/queued-after-rotation", &request(1))
+            .unwrap();
+
+        assert_eq!(
+            dispatcher.revoke_current_and_latch(),
+            Some(replacement_key.clone())
+        );
+        assert!(replacement.generation.revoked.load(Ordering::Acquire));
+        assert!(dispatcher.is_key_revoked(&replacement_key));
+        assert!(dispatcher.activate(replacement_key.clone()).is_none());
+        // Even an accidental post-shutdown install cannot clear the global
+        // lifecycle admission block.
+        dispatcher.install_authenticated_replacement(&replacement_key);
+        assert!(dispatcher.activate(replacement_key).is_none());
         assert_eq!(dispatcher.metrics().revoked_queued, 1);
         assert_eq!(
             notifier.enqueue("https://any.invalid/late", &request(1)),

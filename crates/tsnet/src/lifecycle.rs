@@ -708,6 +708,9 @@ async fn shutdown_extension_host(
 }
 
 async fn quiesce_running_state(inner: &mut RunningState, preserve_localapi: bool) {
+    // Block callback admission and latch the actual active map-generation key
+    // before any task, control transport, or profile authority is canceled.
+    let _ = inner.ssh_callbacks.revoke_current_and_latch();
     inner.cancel.cancel();
     inner.health_watchdog.stop();
     for abort in inner
@@ -718,9 +721,6 @@ async fn quiesce_running_state(inner: &mut RunningState, preserve_localapi: bool
     {
         abort.abort();
     }
-    inner
-        .ssh_callbacks
-        .latch_key_revoked(&inner.node_key.public());
     inner.map_tasks.begin_shutdown();
     inner.extension_subscription.take();
     inner.hostinfo_hooks.clear();
@@ -4123,13 +4123,14 @@ fn revoke_owner_authority_terminal(owner: &mut CleanupOwner, drive: &crate::driv
         }
     }
     if let Some(inner) = owner.inner.as_mut() {
+        // This synchronous call uses the actual active generation key, not
+        // RunningState's startup key, and completes scheduler cleanup before
+        // map/control teardown begins.
+        let _ = inner.ssh_callbacks.revoke_current_and_latch();
         inner.cancel.cancel();
         inner.health_watchdog.stop();
         inner.extension_subscription.take();
         inner.hostinfo_hooks.clear();
-        inner
-            .ssh_callbacks
-            .latch_key_revoked(&inner.node_key.public());
         inner.map_tasks.begin_shutdown();
         for abort in inner
             .task_aborts

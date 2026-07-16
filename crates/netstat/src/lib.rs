@@ -6,10 +6,12 @@
 //! `netstat` command with a hard output cap and deadline. Windows invokes only
 //! `C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe` and uses an
 //! embedded reflection-only P/Invoke wrapper around the fixed system
-//! `iphlpapi.dll`; it does not consult inherited `SystemRoot`, `PATH`, module
-//! resolution, profiles, or localized table formatting. This requires Windows
-//! PowerShell 5.1 and deliberately fails closed on installations that do not use the
-//! standard `C:\Windows` root or provide that runtime.
+//! `iphlpapi.dll`. Its child environment is cleared before fixed `SystemRoot`
+//! and `WINDIR` values are restored, its working directory is fixed to system32,
+//! and it cannot inherit `PATH`, module, CLR profiler, COMPlus, DOTNET startup,
+//! profile, or localized-formatting controls. This requires Windows
+//! PowerShell 5.1 and deliberately fails closed on installations that do not
+//! use the standard `C:\Windows` root or provide that runtime.
 //!
 //! Snapshotting never closes, duplicates, or calls socket operations on a
 //! process file descriptor. PID metadata is observational only and must never

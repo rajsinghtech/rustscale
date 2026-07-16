@@ -595,8 +595,35 @@ $output.WriteLine('END')
 "#;
 
 #[cfg(any(target_os = "windows", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WindowsCommandSpec {
+    program: &'static str,
+    current_dir: &'static str,
+    clear_environment: bool,
+    environment: &'static [(&'static str, &'static str)],
+}
+
+#[cfg(any(target_os = "windows", test))]
+const WINDOWS_COMMAND_ENVIRONMENT: &[(&str, &str)] =
+    &[("SystemRoot", r"C:\Windows"), ("WINDIR", r"C:\Windows")];
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_command_spec() -> WindowsCommandSpec {
+    WindowsCommandSpec {
+        program: TRUSTED_POWERSHELL_PATH,
+        current_dir: r"C:\Windows\System32",
+        clear_environment: true,
+        environment: WINDOWS_COMMAND_ENVIRONMENT,
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
 fn windows_command(encoded_script: &str) -> std::process::Command {
-    let mut command = std::process::Command::new(TRUSTED_POWERSHELL_PATH);
+    let spec = windows_command_spec();
+    let mut command = std::process::Command::new(spec.program);
+    if spec.clear_environment {
+        command.env_clear();
+    }
     command
         .args([
             "-NoLogo",
@@ -605,12 +632,11 @@ fn windows_command(encoded_script: &str) -> std::process::Command {
             "-EncodedCommand",
             encoded_script,
         ])
-        // Do not inherit attacker-selected executable or module lookup paths.
-        // PowerShell still receives its fixed standard root for CLR internals.
-        .env("SystemRoot", r"C:\Windows")
-        .env("WINDIR", r"C:\Windows")
-        .env_remove("PATH")
-        .env_remove("PSModulePath");
+        // The cleared environment prevents inherited CLR/COMPlus/DOTNET
+        // profiler and startup hooks. Only fixed standard-root values needed
+        // by Windows PowerShell/.NET are restored.
+        .envs(spec.environment.iter().copied())
+        .current_dir(spec.current_dir);
     command
 }
 
@@ -978,15 +1004,36 @@ mod tests {
     }
 
     #[test]
-    fn system_transport_ignores_systemroot_path_and_module_resolution() {
+    fn system_transport_ignores_environment_and_profiler_hooks() {
+        let spec = windows_command_spec();
         assert_eq!(
-            TRUSTED_POWERSHELL_PATH,
+            spec.program,
             r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
         );
-        let command = windows_command("fixed-script");
+        assert_eq!(spec.current_dir, r"C:\Windows\System32");
+        assert!(spec.clear_environment);
         assert_eq!(
-            command.get_program(),
-            std::ffi::OsStr::new(TRUSTED_POWERSHELL_PATH)
+            spec.environment,
+            &[("SystemRoot", r"C:\Windows"), ("WINDIR", r"C:\Windows")]
+        );
+        for (poisoned_name, poisoned_value) in [
+            ("PATH", r"C:\attacker"),
+            ("PSModulePath", r"C:\attacker\modules"),
+            ("COR_ENABLE_PROFILING", "1"),
+            ("COR_PROFILER_PATH", r"C:\attacker\profiler.dll"),
+            ("COMPlus_Version", "attacker-clr"),
+            ("DOTNET_STARTUP_HOOKS", r"C:\attacker\hook.dll"),
+        ] {
+            assert!(!spec.environment.iter().any(|(safe_name, safe_value)| {
+                safe_name.eq_ignore_ascii_case(poisoned_name) || *safe_value == poisoned_value
+            }));
+        }
+
+        let command = windows_command("fixed-script");
+        assert_eq!(command.get_program(), std::ffi::OsStr::new(spec.program));
+        assert_eq!(
+            command.get_current_dir(),
+            Some(std::path::Path::new(spec.current_dir))
         );
         let environment: std::collections::HashMap<_, _> = command
             .get_envs()
@@ -1002,8 +1049,17 @@ mod tests {
             Some(&Some(r"C:\Windows".into()))
         );
         assert_eq!(environment.get("WINDIR"), Some(&Some(r"C:\Windows".into())));
-        assert_eq!(environment.get("PATH"), Some(&None));
-        assert_eq!(environment.get("PSMODULEPATH"), Some(&None));
+        assert_eq!(environment.len(), 2);
+        for poisoned_name in [
+            "PATH",
+            "PSMODULEPATH",
+            "COR_ENABLE_PROFILING",
+            "COR_PROFILER_PATH",
+            "COMPLUS_VERSION",
+            "DOTNET_STARTUP_HOOKS",
+        ] {
+            assert!(!environment.contains_key(poisoned_name));
+        }
         assert!(POWERSHELL_SCRIPT.contains("C:\\Windows\\System32\\iphlpapi.dll"));
         assert!(POWERSHELL_SCRIPT.contains("GetExtendedTcpTable"));
         assert!(POWERSHELL_SCRIPT.contains("Write-Family 4 2 24"));

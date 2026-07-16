@@ -4440,7 +4440,16 @@ async fn handle_tcp_dial<W: AsyncRead + AsyncWrite + Unpin>(
         write_json_response(conn, 404, "Not Found", &body).await?;
         return Ok(());
     };
-    let mut tailnet_stream = match netstack.dial(socket_addr).await {
+    // A LocalAPI caller owns this dial only while its authenticated IPC
+    // connection remains open. Race the potentially long netstack dial with
+    // disconnect so cancellation cannot leave an orphaned dial attempt.
+    let dial = netstack.dial(socket_addr);
+    tokio::pin!(dial);
+    let mut disconnected = [0u8; 1];
+    let mut tailnet_stream = match tokio::select! {
+        result = &mut dial => result,
+        _ = conn.read(&mut disconnected) => return Ok(()),
+    } {
         Ok(stream) => stream,
         Err(error) => {
             let body =

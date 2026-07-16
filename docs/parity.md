@@ -259,7 +259,7 @@ state-dir fallback probing), `--json`.
 | `exit-node` | `cli/exitnode.go` | ✅ lists exit-node-capable peers; `--suggest` for SuggestedExitNode; cannot select exit node via CLI |
 | `dns` | `cli/dns.go` | 🔶 explicit `dns status [--json]` and `dns query [--json] <name> [A\|AAAA]`; query forwards the requested name/type and filters the LocalAPI address list by family |
 | `bugreport` | `cli/bugreport.go` | ✅ prints version/state/health summary |
-| `nc` | `cli/nc.go` | 🔶 stub (not-yet-supported) |
+| `nc` | `cli/nc.go` | ✅ `nc <hostname-or-IP> <port>` uses only the authorized LocalAPI `ts-dial` upgrade; strict target/HTTP validation, binary-safe bounded duplex pumps, stdin half-close with remote drain, Ctrl-C cancellation, bounded peer-DNS completion, command help, and hermetic process/duplex coverage |
 | `id-token` | `cli/id-token.go` | ✅ OIDC machine ID token via LocalAPI and Noise `POST /machine/id-token`; raw JWT and `--json` output |
 | `update` | `cli/update.go` | 🔶 `--yes`, `--dry-run`, `--track`, and `--version`; Linux/macOS archive apply is limited to intact `scripts/install.sh` ownership receipts with checksum integrity, bounded parsing, post-install version verification, and journaled rollback. Homebrew is dry-run planning only; other layouts fail explicitly without elevation. |
 | `drive` | `cli/drive.go` | 🔶 first truthful local-share slice: read-write-authorized `status`/`list`; daemon/root-only `share` (add or replace) and `unshare` until per-caller filesystem authority exists; text/JSON output, static completion, strict no-follow canonical root/name validation, bounded/cancellable LocalAPI calls, and mandatory restart-unique nonce+generation+config-hash ETag CAS. PUT/DELETE/MOVE/COPY reject and publication-barrier re-stat every special object. Remote mounts/composition, rename/share-as, bookmarks, and persistence remain deferred and are rejected explicitly. |
@@ -290,9 +290,12 @@ get_prefs(), status(), whois(), health(), metrics(), ping(), get_serve_config(),
 set_serve_config(), drive_status(), get_drive_config(), set_drive_config(), cert_pair(), tailnet_lock_status(), tailnet_lock_init(),
 tailnet_lock_ack_init(), tailnet_lock_sign(), tailnet_lock_disable(), list_profiles(), current_profile(),
 switch_profile(), delete_profile(), push_file(), waiting_files(),
-get_waiting_file(), delete_waiting_file(), debug(), dial(), dns_query(),
-check_ip_forwarding(). Integration tests: testcontrol + daemon over temp
-socket, interactive auth flow.
+get_waiting_file(), delete_waiting_file(), debug(), dial(), dial_tcp_stream(),
+dns_query(), check_ip_forwarding(). The streaming dial path directly uses the
+configured safesocket (never proxy environment or a raw destination socket),
+strictly bounds and validates the HTTP/1.1 upgrade, and rejects `Dial-Self`
+bypass responses. Integration tests: testcontrol + daemon over temp socket,
+interactive auth flow, plus hermetic `nc` duplex/error/cancellation cases.
 
 ## Windows port (x86_64-pc-windows-msvc)
 

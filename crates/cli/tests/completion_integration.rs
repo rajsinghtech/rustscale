@@ -50,6 +50,8 @@ fn hidden_command_completes_top_level_and_nested_contexts() {
         ["cp", "get"]
     );
     assert_eq!(stdout_lines(&["__complete", "--", "wa"]), ["wait"]);
+    assert_eq!(stdout_lines(&["__complete", "--", "n"]), ["netcheck", "nc"]);
+    assert!(stdout_lines(&["__complete", "--", "nc", "peer", ""]).is_empty());
     assert_eq!(
         stdout_lines(&["__complete", "--", "wait", "--time"]),
         ["--timeout"]

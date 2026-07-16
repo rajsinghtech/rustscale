@@ -1,8 +1,10 @@
 //! Static shell completion support for the hand-written CLI parser.
 //!
-//! The hidden completion protocol only walks this command description. It must
-//! never contact the daemon or invoke a command while an interactive shell is
-//! completing input.
+//! The hidden completion protocol normally only walks this command
+//! description. `nc` host completion may perform one bounded, read-only status
+//! lookup; it never invokes a mutating command and silently ignores failures.
+
+use std::path::PathBuf;
 
 use crate::CliError;
 
@@ -262,6 +264,63 @@ const COMMANDS: &[CommandSpec] = &[
     command("completion", &[], COMPLETION_SUBCOMMANDS),
 ];
 
+/// If completion is requesting the first `nc` positional, return its prefix
+/// and any explicitly typed socket path. The caller may perform one bounded,
+/// read-only status lookup; all other completion remains static.
+pub fn nc_host_request(args: &[String]) -> Option<(Option<PathBuf>, String)> {
+    let (current, completed) = args.split_last()?;
+    if current.starts_with('-') {
+        return None;
+    }
+
+    let mut socket = None;
+    let mut saw_nc = false;
+    let mut index = 0;
+    while index < completed.len() {
+        let token = completed[index].as_str();
+        if token == "--socket" {
+            let value = completed.get(index + 1)?;
+            socket = Some(PathBuf::from(value));
+            index += 2;
+            continue;
+        }
+        if let Some(value) = token.strip_prefix("--socket=") {
+            socket = Some(PathBuf::from(value));
+            index += 1;
+            continue;
+        }
+        if token == "--json" {
+            index += 1;
+            continue;
+        }
+        if !saw_nc && token == "nc" {
+            saw_nc = true;
+            index += 1;
+            continue;
+        }
+        // A prior positional is the host, so the current word is the port.
+        // Unknown flags and commands must never trigger daemon I/O.
+        return None;
+    }
+    saw_nc.then(|| (socket, current.clone()))
+}
+
+/// Extract upstream-compatible `nc` host completion candidates from status.
+pub fn nc_hosts_from_status(status: &serde_json::Value, prefix: &str) -> Vec<String> {
+    let mut hosts = status
+        .get("Peer")
+        .and_then(serde_json::Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter_map(|(_, peer)| peer.get("DNSName").and_then(serde_json::Value::as_str))
+        .map(|name| name.trim_end_matches('.').to_owned())
+        .filter(|name| !name.is_empty() && name.starts_with(prefix))
+        .collect::<Vec<_>>();
+    hosts.sort();
+    hosts.dedup();
+    hosts
+}
+
 /// Print a completion script for a supported shell.
 pub fn run_script(args: &[String]) -> Result<(), CliError> {
     let script = match args {
@@ -480,6 +539,28 @@ mod tests {
         assert!(complete(&words(&[""]))
             .iter()
             .any(|word| word == "completion"));
+    }
+
+    #[test]
+    fn requests_only_the_first_nc_positional_and_extracts_peer_names() {
+        assert_eq!(
+            nc_host_request(&words(&["--socket", "/tmp/test.sock", "nc", "pe"])),
+            Some((Some(PathBuf::from("/tmp/test.sock")), "pe".into()))
+        );
+        assert!(nc_host_request(&words(&["nc", "peer", ""])).is_none());
+        assert!(nc_host_request(&words(&["status", ""])).is_none());
+
+        let status = serde_json::json!({
+            "Peer": {
+                "1": {"DNSName": "zebra.example.ts.net."},
+                "2": {"DNSName": "peer.example.ts.net."},
+                "3": {"DNSName": "peer-two.example.ts.net."}
+            }
+        });
+        assert_eq!(
+            nc_hosts_from_status(&status, "peer"),
+            ["peer-two.example.ts.net", "peer.example.ts.net"]
+        );
     }
 
     #[test]

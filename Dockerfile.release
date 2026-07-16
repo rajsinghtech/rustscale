@@ -1,0 +1,38 @@
+# Release-only container assembly. The workflow supplies GNU/Linux binaries
+# produced by the release matrix in container-binaries/{amd64,arm64}.
+FROM ubuntu:24.04@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90
+
+ARG TARGETARCH
+ARG RUSTSCALE_VERSION=dev
+ARG RUSTSCALE_REVISION=unknown
+LABEL org.opencontainers.image.title="rustscale" \
+      org.opencontainers.image.description="Rust implementation of Tailscale's client stack" \
+      org.opencontainers.image.source="https://github.com/rajsinghtech/rustscale" \
+      org.opencontainers.image.licenses="BSD-3-Clause" \
+      org.opencontainers.image.version="$RUSTSCALE_VERSION" \
+      org.opencontainers.image.revision="$RUSTSCALE_REVISION"
+
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+       ca-certificates iproute2 iptables iputils-ping libgcc-s1 \
+    && rm -rf /var/lib/apt/lists/* \
+    && if [ -x /usr/sbin/iptables-legacy ]; then \
+         ln -sf /usr/sbin/iptables-legacy /usr/sbin/iptables; \
+       fi \
+    && if [ -x /usr/sbin/ip6tables-legacy ]; then \
+         ln -sf /usr/sbin/ip6tables-legacy /usr/sbin/ip6tables; \
+       fi
+
+COPY container-binaries/${TARGETARCH}/rustscale /usr/local/bin/rustscale
+COPY container-binaries/${TARGETARCH}/rustscaled /usr/local/bin/rustscaled
+COPY container/entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY LICENSE /usr/share/licenses/rustscale/LICENSE
+RUN chmod +x /usr/local/bin/entrypoint.sh \
+    && ln -s rustscale /usr/local/bin/tailscale \
+    && ln -s rustscaled /usr/local/bin/tailscaled \
+    && mkdir -p /var/lib/rustscale
+
+VOLUME ["/var/lib/rustscale"]
+ENV TS_USERSPACE=1
+ENV TS_STATE_DIR=/var/lib/rustscale
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

@@ -539,7 +539,7 @@ async fn cancelled_close_finishes_prestarted_and_extension_cleanup() {
 }
 
 #[cfg(unix)]
-async fn assert_localapi_reachable(path: &std::path::Path) {
+async fn localapi_status_response(path: &std::path::Path) -> Vec<u8> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let mut client = rustscale_safesocket::connect(path).expect("connect LocalAPI");
@@ -557,6 +557,12 @@ async fn assert_localapi_reachable(path: &std::path::Path) {
     .await
     .expect("LocalAPI listener did not answer")
     .unwrap();
+    response
+}
+
+#[cfg(unix)]
+async fn assert_localapi_reachable(path: &std::path::Path) {
+    let response = localapi_status_response(path).await;
     assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
 }
 
@@ -589,6 +595,9 @@ async fn localapi_handoff_rolls_back_on_cancellation_and_failure_then_retries() 
             _ = entered.wait() => {}
             result = &mut up => panic!("startup finished before handoff hook: {result:?}"),
         }
+        let status = String::from_utf8(localapi_status_response(&socket).await).unwrap();
+        assert!(status.contains("\"BackendState\":\"Starting\""), "{status}");
+        assert!(!status.contains("\"BackendState\":\"Running\""), "{status}");
         if inject_failure {
             release.wait().await;
             assert!(up.await.is_err());

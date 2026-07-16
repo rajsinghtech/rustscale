@@ -501,6 +501,8 @@ pub enum UnitStoreError {
     WrongOwner,
     #[error("unit path changed during the operation")]
     Conflict,
+    #[error("operation journal is malformed; explicit precommit repair is required")]
+    MalformedJournal,
     #[error("unit filesystem operation was cancelled")]
     Cancelled,
     #[error("unit mutation committed but its directory sync failed")]
@@ -528,6 +530,14 @@ pub trait UserUnitStore: Send + Sync {
     fn reload_required(&self, unit_name: &str) -> Result<bool, UnitStoreError>;
 
     fn clear_reload_required(&self, unit_name: &str) -> Result<(), UnitStoreError>;
+
+    /// Remove a malformed final journal only after proving the destination is
+    /// still the caller-attested precommit state.
+    fn repair_precommit_journal(
+        &self,
+        unit_name: &str,
+        expected: Option<&[u8]>,
+    ) -> Result<(), UnitStoreError>;
 
     /// Atomically replace `expected` with `contents`. `None` means the path must
     /// not exist. Implementations must not follow a final symlink.
@@ -601,8 +611,32 @@ mod unix_store {
         TEMP_COUNTER,
     };
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum JournalPhase {
+        Forward,
+        Rollback,
+    }
+
+    impl JournalPhase {
+        fn text(self) -> &'static str {
+            match self {
+                Self::Forward => "forward",
+                Self::Rollback => "rollback",
+            }
+        }
+    }
+
     fn journal_name(unit_name: &str) -> String {
         format!(".{unit_name}.operation")
+    }
+
+    fn journal_phase(bytes: &[u8]) -> Option<JournalPhase> {
+        let text = std::str::from_utf8(bytes).ok()?;
+        match journal_field(text, "phase")? {
+            "forward" => Some(JournalPhase::Forward),
+            "rollback" => Some(JournalPhase::Rollback),
+            _ => None,
+        }
     }
 
     fn valid_journal(unit_name: &str, bytes: &[u8]) -> bool {
@@ -612,6 +646,7 @@ mod unix_store {
         text.starts_with("version=1\n")
             && text.lines().any(|line| line == format!("unit={unit_name}"))
             && text.lines().any(|line| line.starts_with("operation="))
+            && journal_phase(bytes).is_some()
             && text.lines().any(|line| line.starts_with("kind="))
             && text.lines().any(|line| line.starts_with("temporary="))
             && text.lines().any(|line| line.starts_with("before-hash="))
@@ -646,6 +681,13 @@ mod unix_store {
             }
             _ => false,
         }
+    }
+
+    pub(super) fn write_journal_bytes<W: Write>(
+        writer: &mut W,
+        record: &[u8],
+    ) -> std::io::Result<()> {
+        writer.write_all(record)
     }
 
     fn identity_text(identity: Option<FileIdentity>) -> String {
@@ -737,7 +779,10 @@ mod unix_store {
             Ok(Some(directory))
         }
 
-        fn open_user_dir(&self, create: bool) -> Result<Option<OwnedFd>, UnitStoreError> {
+        pub(super) fn open_user_dir(
+            &self,
+            create: bool,
+        ) -> Result<Option<OwnedFd>, UnitStoreError> {
             let Some(systemd) = Self::open_owned_dir(&self.config_directory, "systemd", create)?
             else {
                 return Ok(None);
@@ -798,27 +843,159 @@ mod unix_store {
             ))
         }
 
-        fn mark_reload_required(
+        fn journal_phase_for_mutation(
             directory: &OwnedFd,
             unit_name: &str,
+        ) -> Result<JournalPhase, UnitStoreError> {
+            let (stored, _) = Self::inspect_at(directory, &journal_name(unit_name))?;
+            match stored {
+                StoredUnit::Missing => Ok(JournalPhase::Forward),
+                StoredUnit::Regular(bytes) if valid_journal(unit_name, &bytes) => {
+                    match journal_phase(&bytes) {
+                        Some(JournalPhase::Forward) => Ok(JournalPhase::Rollback),
+                        Some(JournalPhase::Rollback) => Err(UnitStoreError::Conflict),
+                        None => Err(UnitStoreError::MalformedJournal),
+                    }
+                }
+                StoredUnit::Regular(_) => Err(UnitStoreError::MalformedJournal),
+                StoredUnit::Symlink | StoredUnit::Other => Err(UnitStoreError::Conflict),
+            }
+        }
+
+        pub(super) fn publish_journal(
+            directory: &OwnedFd,
+            unit_name: &str,
+            phase: JournalPhase,
             record: &[u8],
         ) -> Result<(), UnitStoreError> {
             let journal = journal_name(unit_name);
-            match rustix::fs::openat(
-                directory,
-                &journal,
-                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                Mode::RUSR | Mode::WUSR,
-            ) {
-                Ok(fd) => {
-                    let mut file = File::from(fd);
-                    file.write_all(record).map_err(|_| UnitStoreError::Io)?;
-                    file.sync_all().map_err(|_| UnitStoreError::Io)?;
-                    rustix::fs::fsync(directory).map_err(|_| UnitStoreError::Io)
+            let mut staging = None;
+            for _ in 0..16 {
+                let sequence = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+                let candidate = format!(
+                    ".{unit_name}.operation-write.{:x}.{sequence:x}",
+                    std::process::id()
+                );
+                match rustix::fs::openat(
+                    directory,
+                    &candidate,
+                    OFlags::WRONLY
+                        | OFlags::CREATE
+                        | OFlags::EXCL
+                        | OFlags::NOFOLLOW
+                        | OFlags::CLOEXEC,
+                    Mode::RUSR | Mode::WUSR,
+                ) {
+                    Ok(fd) => {
+                        staging = Some((candidate, fd));
+                        break;
+                    }
+                    Err(rustix::io::Errno::EXIST) => {}
+                    Err(_) => return Err(UnitStoreError::Io),
                 }
-                Err(rustix::io::Errno::EXIST) => Err(UnitStoreError::Conflict),
-                Err(_) => Err(UnitStoreError::Io),
             }
+            let (temporary, fd) = staging.ok_or(UnitStoreError::Io)?;
+            let new_stat = rustix::fs::fstat(&fd).map_err(|_| UnitStoreError::Io)?;
+            let new_identity = FileIdentity {
+                device: new_stat.st_dev as u64,
+                inode: new_stat.st_ino as u64,
+            };
+            let mut file = File::from(fd);
+            let prepared = (|| {
+                write_journal_bytes(&mut file, record).map_err(|_| UnitStoreError::Io)?;
+                file.sync_all().map_err(|_| UnitStoreError::Io)?;
+                drop(file);
+                match phase {
+                    JournalPhase::Forward => {
+                        rustix::fs::renameat_with(
+                            directory,
+                            &temporary,
+                            directory,
+                            &journal,
+                            rustix::fs::RenameFlags::NOREPLACE,
+                        )
+                        .map_err(|error| match error {
+                            rustix::io::Errno::EXIST => UnitStoreError::Conflict,
+                            _ => UnitStoreError::Io,
+                        })?;
+                    }
+                    JournalPhase::Rollback => {
+                        let (expected, expected_identity) = Self::inspect_at(directory, &journal)?;
+                        let StoredUnit::Regular(expected_bytes) = expected else {
+                            return Err(UnitStoreError::Conflict);
+                        };
+                        if !valid_journal(unit_name, &expected_bytes)
+                            || journal_phase(&expected_bytes) != Some(JournalPhase::Forward)
+                        {
+                            return Err(UnitStoreError::MalformedJournal);
+                        }
+                        let expected_identity =
+                            expected_identity.ok_or(UnitStoreError::Conflict)?;
+                        let (immediate, immediate_identity) =
+                            Self::inspect_at(directory, &journal)?;
+                        if !matches!(
+                            (immediate, immediate_identity),
+                            (StoredUnit::Regular(actual), Some(identity))
+                                if actual == expected_bytes && identity == expected_identity
+                        ) {
+                            return Err(UnitStoreError::Conflict);
+                        }
+                        rustix::fs::renameat_with(
+                            directory,
+                            &temporary,
+                            directory,
+                            &journal,
+                            rustix::fs::RenameFlags::EXCHANGE,
+                        )
+                        .map_err(|_| UnitStoreError::Conflict)?;
+                        let (displaced, displaced_identity) =
+                            Self::inspect_at(directory, &temporary)
+                                .map_err(|_| UnitStoreError::CommittedNeedsReload)?;
+                        if !matches!(
+                            (displaced, displaced_identity),
+                            (StoredUnit::Regular(actual), Some(identity))
+                                if actual == expected_bytes && identity == expected_identity
+                        ) {
+                            if rustix::fs::renameat_with(
+                                directory,
+                                &temporary,
+                                directory,
+                                &journal,
+                                rustix::fs::RenameFlags::EXCHANGE,
+                            )
+                            .is_ok()
+                            {
+                                return Err(UnitStoreError::Conflict);
+                            }
+                            return Err(UnitStoreError::CommittedNeedsReload);
+                        }
+                        if rustix::fs::unlinkat(directory, &temporary, AtFlags::empty()).is_err() {
+                            if rustix::fs::renameat_with(
+                                directory,
+                                &temporary,
+                                directory,
+                                &journal,
+                                rustix::fs::RenameFlags::EXCHANGE,
+                            )
+                            .is_ok()
+                            {
+                                return Err(UnitStoreError::Io);
+                            }
+                            return Err(UnitStoreError::CommittedNeedsReload);
+                        }
+                    }
+                }
+                rustix::fs::fsync(directory).map_err(|_| UnitStoreError::CommittedNeedsReload)
+            })();
+            if prepared.is_err()
+                && matches!(
+                    Self::inspect_at(directory, &temporary),
+                    Ok((StoredUnit::Regular(_), Some(identity))) if identity == new_identity
+                )
+            {
+                let _ = rustix::fs::unlinkat(directory, &temporary, AtFlags::empty());
+            }
+            prepared
         }
 
         fn write_at(
@@ -883,8 +1060,10 @@ mod unix_store {
                 }
                 // Bind the intent to both exact inodes and the unique staging
                 // name before the CAS can become visible.
+                let phase = Self::journal_phase_for_mutation(directory, name)?;
                 let operation = format!(
-                    "version=1\nunit={name}\noperation={temporary_name}\nkind=replace\ntemporary={temporary_name}\nbefore={}\nafter={}\nbefore-hash={}\nafter-hash={}\nbefore-bytes={}\nafter-bytes={}\n",
+                    "version=1\nunit={name}\noperation={temporary_name}\nphase={}\nkind=replace\ntemporary={temporary_name}\nbefore={}\nafter={}\nbefore-hash={}\nafter-hash={}\nbefore-bytes={}\nafter-bytes={}\n",
+                    phase.text(),
                     identity_text(expected_identity),
                     identity_text(Some(new_identity)),
                     content_hash(expected),
@@ -892,7 +1071,7 @@ mod unix_store {
                     expected.map_or(0, <[u8]>::len),
                     contents.len(),
                 );
-                Self::mark_reload_required(directory, name, operation.as_bytes())?;
+                Self::publish_journal(directory, name, phase, operation.as_bytes())?;
 
                 // Re-open and validate immediately before publication. This is
                 // the last possible check on kernels without conditional rename.
@@ -963,6 +1142,7 @@ mod unix_store {
                 Ok(())
             })();
             if !committed
+                && !matches!(&result, Err(UnitStoreError::CommittedNeedsReload))
                 && matches!(
                     Self::inspect_at(directory, &temporary_name),
                     Ok((StoredUnit::Regular(_), Some(identity))) if identity == new_identity
@@ -1083,6 +1263,8 @@ mod unix_store {
             {
                 return Err(UnitStoreError::Conflict);
             }
+            let phase = journal_phase(&journal).ok_or(UnitStoreError::MalformedJournal)?;
+            let kind = journal_field(text, "kind").ok_or(UnitStoreError::MalformedJournal)?;
             let before = journal_field(text, "before").ok_or(UnitStoreError::Conflict)?;
             let after = journal_field(text, "after").ok_or(UnitStoreError::Conflict)?;
             let before_hash = journal_field(text, "before-hash").ok_or(UnitStoreError::Conflict)?;
@@ -1106,16 +1288,82 @@ mod unix_store {
             }
 
             if snapshot_matches(&target, target_identity, before, before_hash) {
-                if !matches!(&staged, StoredUnit::Missing) {
-                    if !snapshot_matches(&staged, staged_identity, after, after_hash) {
-                        return Err(UnitStoreError::Conflict);
+                if phase == JournalPhase::Forward {
+                    if !matches!(&staged, StoredUnit::Missing) {
+                        if !snapshot_matches(&staged, staged_identity, after, after_hash) {
+                            return Err(UnitStoreError::Conflict);
+                        }
+                        rustix::fs::unlinkat(&directory, temporary, AtFlags::empty())
+                            .map_err(|_| UnitStoreError::Io)?;
+                        rustix::fs::fsync(&directory).map_err(|_| UnitStoreError::Io)?;
                     }
-                    rustix::fs::unlinkat(&directory, temporary, AtFlags::empty())
-                        .map_err(|_| UnitStoreError::Io)?;
-                    rustix::fs::fsync(&directory).map_err(|_| UnitStoreError::Io)?;
+                    self.clear_reload_required(unit_name)?;
+                    return Ok(false);
                 }
-                self.clear_reload_required(unit_name)?;
-                return Ok(false);
+
+                match kind {
+                    "replace" => {
+                        if !snapshot_matches(&staged, staged_identity, after, after_hash) {
+                            return Err(UnitStoreError::CommittedNeedsReload);
+                        }
+                        if before == "missing" {
+                            rustix::fs::renameat_with(
+                                &directory,
+                                temporary,
+                                &directory,
+                                unit_name,
+                                rustix::fs::RenameFlags::NOREPLACE,
+                            )
+                            .map_err(|_| UnitStoreError::CommittedNeedsReload)?;
+                        } else {
+                            rustix::fs::renameat_with(
+                                &directory,
+                                temporary,
+                                &directory,
+                                unit_name,
+                                rustix::fs::RenameFlags::EXCHANGE,
+                            )
+                            .map_err(|_| UnitStoreError::CommittedNeedsReload)?;
+                            let (displaced, displaced_identity) =
+                                Self::inspect_at(&directory, temporary)
+                                    .map_err(|_| UnitStoreError::CommittedNeedsReload)?;
+                            if !snapshot_matches(
+                                &displaced,
+                                displaced_identity,
+                                before,
+                                before_hash,
+                            ) {
+                                return Err(UnitStoreError::CommittedNeedsReload);
+                            }
+                            rustix::fs::unlinkat(&directory, temporary, AtFlags::empty())
+                                .map_err(|_| UnitStoreError::CommittedNeedsReload)?;
+                        }
+                    }
+                    "remove" => {
+                        if !matches!(&staged, StoredUnit::Missing) || after != "missing" {
+                            return Err(UnitStoreError::CommittedNeedsReload);
+                        }
+                        rustix::fs::renameat_with(
+                            &directory,
+                            unit_name,
+                            &directory,
+                            temporary,
+                            rustix::fs::RenameFlags::NOREPLACE,
+                        )
+                        .map_err(|_| UnitStoreError::CommittedNeedsReload)?;
+                        let (displaced, displaced_identity) =
+                            Self::inspect_at(&directory, temporary)
+                                .map_err(|_| UnitStoreError::CommittedNeedsReload)?;
+                        if !snapshot_matches(&displaced, displaced_identity, before, before_hash) {
+                            return Err(UnitStoreError::CommittedNeedsReload);
+                        }
+                        rustix::fs::unlinkat(&directory, temporary, AtFlags::empty())
+                            .map_err(|_| UnitStoreError::CommittedNeedsReload)?;
+                    }
+                    _ => return Err(UnitStoreError::MalformedJournal),
+                }
+                rustix::fs::fsync(&directory).map_err(|_| UnitStoreError::CommittedNeedsReload)?;
+                return Ok(true);
             }
             Err(UnitStoreError::Conflict)
         }
@@ -1177,6 +1425,60 @@ mod unix_store {
             rustix::fs::unlinkat(&directory, &tombstone, AtFlags::empty())
                 .map_err(|_| UnitStoreError::CommittedNeedsReload)?;
             rustix::fs::fsync(&directory).map_err(|_| UnitStoreError::CommittedNeedsReload)
+        }
+
+        fn repair_precommit_journal(
+            &self,
+            unit_name: &str,
+            expected: Option<&[u8]>,
+        ) -> Result<(), UnitStoreError> {
+            if !is_managed_unit_filename(unit_name) {
+                return Err(UnitStoreError::Unavailable);
+            }
+            let directory = self.open_user_dir(false)?.ok_or(UnitStoreError::Conflict)?;
+            let journal = journal_name(unit_name);
+            let (stored, journal_identity) = Self::inspect_at(&directory, &journal)?;
+            let StoredUnit::Regular(journal_bytes) = stored else {
+                return Err(UnitStoreError::Conflict);
+            };
+            if valid_journal(unit_name, &journal_bytes) {
+                return Err(UnitStoreError::Conflict);
+            }
+            let (target, _) = Self::inspect_at(&directory, unit_name)?;
+            match (expected, target) {
+                (None, StoredUnit::Missing) => {}
+                (Some(expected), StoredUnit::Regular(actual)) if actual == expected => {}
+                _ => return Err(UnitStoreError::Conflict),
+            }
+            let journal_identity = journal_identity.ok_or(UnitStoreError::Conflict)?;
+            let sequence = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let tombstone = format!(".{unit_name}.malformed-repair.{sequence:x}");
+            rustix::fs::renameat_with(
+                &directory,
+                &journal,
+                &directory,
+                &tombstone,
+                rustix::fs::RenameFlags::NOREPLACE,
+            )
+            .map_err(|_| UnitStoreError::Conflict)?;
+            let (displaced, displaced_identity) = Self::inspect_at(&directory, &tombstone)?;
+            if !matches!(
+                (displaced, displaced_identity),
+                (StoredUnit::Regular(actual), Some(identity))
+                    if actual == journal_bytes && identity == journal_identity
+            ) {
+                let _ = rustix::fs::renameat_with(
+                    &directory,
+                    &tombstone,
+                    &directory,
+                    &journal,
+                    rustix::fs::RenameFlags::NOREPLACE,
+                );
+                return Err(UnitStoreError::Conflict);
+            }
+            rustix::fs::unlinkat(&directory, &tombstone, AtFlags::empty())
+                .map_err(|_| UnitStoreError::Io)?;
+            rustix::fs::fsync(&directory).map_err(|_| UnitStoreError::Io)
         }
 
         fn atomic_replace(
@@ -1242,13 +1544,15 @@ mod unix_store {
                 .ok_or(UnitStoreError::Conflict)?;
             let sequence = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
             let tombstone = format!(".{unit_name}.remove.{:x}.{sequence:x}", std::process::id());
+            let phase = Self::journal_phase_for_mutation(&directory, unit_name)?;
             let operation = format!(
-                "version=1\nunit={unit_name}\noperation={tombstone}\nkind=remove\ntemporary={tombstone}\nbefore={}\nafter=missing\nbefore-hash={}\nafter-hash=missing\nbefore-bytes={}\nafter-bytes=0\n",
+                "version=1\nunit={unit_name}\noperation={tombstone}\nphase={}\nkind=remove\ntemporary={tombstone}\nbefore={}\nafter=missing\nbefore-hash={}\nafter-hash=missing\nbefore-bytes={}\nafter-bytes=0\n",
+                phase.text(),
                 identity_text(Some(expected_identity)),
                 content_hash(Some(expected)),
                 expected.len(),
             );
-            Self::mark_reload_required(&directory, unit_name, operation.as_bytes())?;
+            Self::publish_journal(&directory, unit_name, phase, operation.as_bytes())?;
             let (immediate, immediate_identity) = Self::inspect_at(&directory, unit_name)?;
             if !matches!(
                 (immediate, immediate_identity),
@@ -1316,6 +1620,14 @@ impl UserUnitStore for SystemUserUnitStore {
     }
 
     fn clear_reload_required(&self, _unit_name: &str) -> Result<(), UnitStoreError> {
+        Err(UnitStoreError::Unavailable)
+    }
+
+    fn repair_precommit_journal(
+        &self,
+        _unit_name: &str,
+        _expected: Option<&[u8]>,
+    ) -> Result<(), UnitStoreError> {
         Err(UnitStoreError::Unavailable)
     }
 
@@ -1388,6 +1700,8 @@ pub enum UserUnitManagerError {
     NotInstalled,
     #[error("the unit changed concurrently; no raced-in file was overwritten")]
     ConcurrentMutation,
+    #[error("operation journal is malformed; use the explicit precommit repair API")]
+    MalformedJournalNeedsRepair,
     #[error("unit mutation committed and requires deterministic reload recovery")]
     CommittedNeedsReload,
     #[error("secure unit storage failed")]
@@ -1603,6 +1917,42 @@ impl<S: UserUnitStore, C: SystemctlTransport> UserUnitManager<S, C> {
         cancellation: &CancellationToken,
     ) -> Result<Change, UserUnitManagerError> {
         self.set_enabled(name, false, cancellation)
+    }
+
+    /// Explicitly clear a malformed final journal after attesting the exact
+    /// precommit destination. `None` attests that the unit was absent; `Some`
+    /// must render to the currently installed unit. No reload is performed.
+    pub fn repair_precommit_journal(
+        &self,
+        name: &str,
+        expected: Option<&UserUnit>,
+        cancellation: &CancellationToken,
+    ) -> Result<(), UserUnitManagerError> {
+        validate_name(name)?;
+        let unit_name = format!("rustscale-{name}.service");
+        let expected_bytes = match expected {
+            Some(expected) if expected.unit_name()? == unit_name => Some(expected.render()?),
+            Some(_) => return Err(UserUnitError::InvalidName("repair unit name mismatch").into()),
+            None => None,
+        };
+        let unit_lock = process_unit_lock(&unit_name);
+        let _unit_guard = unit_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _store_guard = self
+            .store
+            .lock_unit(&unit_name, cancellation, self.timeout)
+            .map_err(map_store_error)?;
+        self.ensure_manager(cancellation)?;
+        let current = self.store.inspect(&unit_name).map_err(map_store_error)?;
+        match (&expected_bytes, current) {
+            (None, StoredUnit::Missing) => {}
+            (Some(expected), StoredUnit::Regular(actual)) if *expected == actual => {}
+            _ => return Err(UserUnitManagerError::ConcurrentMutation),
+        }
+        self.store
+            .repair_precommit_journal(&unit_name, expected_bytes.as_deref())
+            .map_err(map_store_error)
     }
 
     pub fn status(
@@ -2101,6 +2451,7 @@ fn map_store_error(error: UnitStoreError) -> UserUnitManagerError {
         UnitStoreError::Cancelled => UserUnitManagerError::Cancelled,
         UnitStoreError::CommittedNeedsReload => UserUnitManagerError::CommittedNeedsReload,
         UnitStoreError::Conflict => UserUnitManagerError::ConcurrentMutation,
+        UnitStoreError::MalformedJournal => UserUnitManagerError::MalformedJournalNeedsRepair,
         UnitStoreError::Unavailable
         | UnitStoreError::InsecurePermissions
         | UnitStoreError::WrongOwner
@@ -2236,6 +2587,15 @@ mod tests {
             if self.fail_clear_once.swap(false, Ordering::AcqRel) {
                 return Err(UnitStoreError::CommittedNeedsReload);
             }
+            self.reload_required.store(false, Ordering::Release);
+            Ok(())
+        }
+
+        fn repair_precommit_journal(
+            &self,
+            _unit_name: &str,
+            _expected: Option<&[u8]>,
+        ) -> Result<(), UnitStoreError> {
             self.reload_required.store(false, Ordering::Release);
             Ok(())
         }
@@ -2435,6 +2795,48 @@ mod tests {
         assert!(sensitive_path.render().is_err());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn journal_write_faults_at_every_byte_leave_only_partial_staging() {
+        use std::io::{self, Write};
+
+        struct FailAfter {
+            limit: usize,
+            bytes: Vec<u8>,
+        }
+
+        impl Write for FailAfter {
+            fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+                if self.bytes.len() == self.limit {
+                    return Err(io::Error::other("injected write fault"));
+                }
+                let count = input.len().min(self.limit - self.bytes.len());
+                self.bytes.extend_from_slice(&input[..count]);
+                Ok(count)
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let record = b"version=1\nunit=rustscale-tray.service\nphase=forward\n";
+        for limit in 0..record.len() {
+            let mut writer = FailAfter {
+                limit,
+                bytes: Vec::new(),
+            };
+            assert!(unix_store::write_journal_bytes(&mut writer, record).is_err());
+            assert_eq!(writer.bytes, record[..limit]);
+        }
+        let mut complete = FailAfter {
+            limit: record.len(),
+            bytes: Vec::new(),
+        };
+        unix_store::write_journal_bytes(&mut complete, record).unwrap();
+        assert_eq!(complete.bytes, record);
+    }
+
     #[test]
     fn symlink_and_foreign_files_are_refused_without_commands() {
         for stored in [
@@ -2599,6 +3001,14 @@ mod tests {
                 Ok(())
             }
 
+            fn repair_precommit_journal(
+                &self,
+                _unit_name: &str,
+                _expected: Option<&[u8]>,
+            ) -> Result<(), UnitStoreError> {
+                Ok(())
+            }
+
             fn atomic_replace(
                 &self,
                 _unit_name: &str,
@@ -2672,6 +3082,15 @@ mod tests {
             }
 
             fn clear_reload_required(&self, _unit_name: &str) -> Result<(), UnitStoreError> {
+                self.pending.store(false, Ordering::Release);
+                Ok(())
+            }
+
+            fn repair_precommit_journal(
+                &self,
+                _unit_name: &str,
+                _expected: Option<&[u8]>,
+            ) -> Result<(), UnitStoreError> {
                 self.pending.store(false, Ordering::Release);
                 Ok(())
             }
@@ -3106,6 +3525,194 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn real_filesystem_reload_failures_reuse_journal_and_rollback_exactly() {
+        let temporary = tempfile::tempdir().unwrap();
+        let config = temporary.path().join("config");
+        std::fs::create_dir(&config).unwrap();
+
+        let store = SystemUserUnitStore::new(&config).unwrap();
+        let commands = FakeCommands::with(vec![ok(b"252\n"), failed(), ok(b"")]);
+        assert_eq!(
+            UserUnitManager::with_transports(
+                store.clone(),
+                &commands,
+                UserSession::Supported,
+                Duration::from_secs(2),
+            )
+            .install(&unit(&["first"]), &CancellationToken::new())
+            .unwrap_err(),
+            UserUnitManagerError::Command
+        );
+        assert_eq!(
+            store.inspect("rustscale-tray.service").unwrap(),
+            StoredUnit::Missing
+        );
+        assert!(!store
+            .unit_directory()
+            .join(".rustscale-tray.service.operation")
+            .exists());
+
+        let setup_commands = FakeCommands::default();
+        UserUnitManager::with_transports(
+            store.clone(),
+            &setup_commands,
+            UserSession::Supported,
+            Duration::from_secs(2),
+        )
+        .install(&unit(&["old"]), &CancellationToken::new())
+        .unwrap();
+        let old = unit(&["old"]).render().unwrap();
+        let commands = FakeCommands::with(vec![ok(b"252\n"), failed(), ok(b"")]);
+        assert_eq!(
+            UserUnitManager::with_transports(
+                store.clone(),
+                &commands,
+                UserSession::Supported,
+                Duration::from_secs(2),
+            )
+            .update(&unit(&["new"]), &CancellationToken::new())
+            .unwrap_err(),
+            UserUnitManagerError::Command
+        );
+        assert_eq!(
+            store.inspect("rustscale-tray.service").unwrap(),
+            StoredUnit::Regular(old)
+        );
+        assert!(!store
+            .unit_directory()
+            .join(".rustscale-tray.service.operation")
+            .exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn journal_noreplace_rename_fault_preserves_existing_final() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let config = temporary.path().join("config");
+        std::fs::create_dir(&config).unwrap();
+        let store = SystemUserUnitStore::new(&config).unwrap();
+        let directory = store.open_user_dir(true).unwrap().unwrap();
+        let journal_path = store
+            .unit_directory()
+            .join(".rustscale-tray.service.operation");
+        std::fs::write(&journal_path, b"raced-final").unwrap();
+        std::fs::set_permissions(&journal_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let record = b"version=1\nunit=rustscale-tray.service\noperation=test\nphase=forward\nkind=replace\ntemporary=.rustscale-tray.service.tmp.test\nbefore=missing\nafter=missing\nbefore-hash=missing\nafter-hash=missing\n";
+        assert_eq!(
+            SystemUserUnitStore::publish_journal(
+                &directory,
+                "rustscale-tray.service",
+                unix_store::JournalPhase::Forward,
+                record,
+            ),
+            Err(UnitStoreError::Conflict)
+        );
+        assert_eq!(std::fs::read(&journal_path).unwrap(), b"raced-final");
+        assert!(!std::fs::read_dir(store.unit_directory())
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .contains("operation-write")));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn malformed_final_journal_requires_proven_precommit_repair() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let config = temporary.path().join("config");
+        std::fs::create_dir(&config).unwrap();
+        let store = SystemUserUnitStore::new(&config).unwrap();
+        let setup = FakeCommands::default();
+        UserUnitManager::with_transports(
+            store.clone(),
+            &setup,
+            UserSession::Supported,
+            Duration::from_secs(2),
+        )
+        .install(&unit(&["old"]), &CancellationToken::new())
+        .unwrap();
+
+        let journal = store
+            .unit_directory()
+            .join(".rustscale-tray.service.operation");
+        std::fs::write(&journal, b"partial-final").unwrap();
+        std::fs::set_permissions(&journal, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let commands = FakeCommands::default();
+        assert_eq!(
+            UserUnitManager::with_transports(
+                store.clone(),
+                &commands,
+                UserSession::Supported,
+                Duration::from_secs(2),
+            )
+            .update(&unit(&["new"]), &CancellationToken::new())
+            .unwrap_err(),
+            UserUnitManagerError::MalformedJournalNeedsRepair
+        );
+        assert!(!commands
+            .commands()
+            .iter()
+            .any(|command| command.arguments == ["--user", "daemon-reload"]));
+
+        let repair = FakeCommands::default();
+        UserUnitManager::with_transports(
+            store.clone(),
+            &repair,
+            UserSession::Supported,
+            Duration::from_secs(2),
+        )
+        .repair_precommit_journal("tray", Some(&unit(&["old"])), &CancellationToken::new())
+        .unwrap();
+        assert!(!journal.exists());
+
+        // A crash-partial journal staging file is not a final intent and cannot
+        // wedge the next operation.
+        let partial = store
+            .unit_directory()
+            .join(".rustscale-tray.service.operation-write.deadbeef.1");
+        std::fs::write(&partial, b"version=1\nunit=").unwrap();
+        std::fs::set_permissions(&partial, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let update = FakeCommands::default();
+        UserUnitManager::with_transports(
+            store.clone(),
+            &update,
+            UserSession::Supported,
+            Duration::from_secs(2),
+        )
+        .update(&unit(&["new"]), &CancellationToken::new())
+        .unwrap();
+        assert!(partial.exists());
+
+        std::fs::write(&journal, b"corrupt-again").unwrap();
+        std::fs::set_permissions(&journal, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(
+            store.unit_directory().join("rustscale-tray.service"),
+            b"foreign-racer",
+        )
+        .unwrap();
+        let repair = FakeCommands::default();
+        assert_eq!(
+            UserUnitManager::with_transports(
+                store,
+                &repair,
+                UserSession::Supported,
+                Duration::from_secs(2),
+            )
+            .repair_precommit_journal("tray", Some(&unit(&["new"])), &CancellationToken::new())
+            .unwrap_err(),
+            UserUnitManagerError::ConcurrentMutation
+        );
+        assert!(journal.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn real_store_refuses_symlink_and_foreign_file_and_uses_private_modes() {
         use std::os::unix::fs::{symlink, PermissionsExt};
 
@@ -3130,6 +3737,7 @@ mod tests {
         .unwrap();
         assert!(journal.contains("version=1\nunit=rustscale-tray.service\n"));
         assert!(journal.contains("operation=.rustscale-tray.service.tmp."));
+        assert!(journal.contains("phase=forward\n"));
         assert!(journal.contains("before=missing\n"));
         assert!(journal.contains("after-hash="));
         let directory_mode = std::fs::metadata(store.unit_directory())

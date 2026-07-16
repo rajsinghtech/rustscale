@@ -1555,6 +1555,35 @@ async fn admit_mutation<'a, W: AsyncWrite + Unpin>(
     Ok(permit)
 }
 
+/// Classify the complete LocalAPI mutation surface before route dispatch.
+/// Diagnostic/read operations remain available to a draining stale listener,
+/// including POST-shaped reads such as ping, dial, check-prefs, and routecheck.
+fn is_mutating_request(method: &str, endpoint: &str) -> bool {
+    matches!(
+        (method, endpoint),
+        ("PATCH", "prefs")
+            | (
+                "POST",
+                "start"
+                    | "login-interactive"
+                    | "logout"
+                    | "tka/init"
+                    | "tka/init/ack"
+                    | "tka/sign"
+                    | "tka/disable"
+                    | "debug-capture"
+                    | "serve-config"
+                    | "set-expiry-sooner"
+                    | "shutdown"
+                    | "reload-config"
+                    | "debug"
+            )
+            | ("PUT", "drive/config" | "profiles")
+    ) || (endpoint.starts_with("profiles/") && matches!(method, "POST" | "DELETE"))
+        || ((endpoint == "files" || endpoint.starts_with("files/")) && method == "DELETE")
+        || (endpoint.starts_with("file-put/") && method == "PUT")
+}
+
 pub(crate) async fn dispatch<W: AsyncRead + AsyncWrite + Unpin>(
     conn: &mut W,
     req: &HttpRequest,
@@ -1618,6 +1647,22 @@ pub(crate) async fn dispatch<W: AsyncRead + AsyncWrite + Unpin>(
 
     let endpoint = &path[API_PREFIX.len()..];
 
+    // Generation and peer-identity admission is one route-level decision made
+    // before any mutating handler can observe or persist state. Holding the
+    // permit through dispatch linearizes a mutation against listener handoff.
+    let _mutation = if is_mutating_request(method, endpoint) {
+        if !require_readwrite(peer_identity) {
+            write_access_denied(conn).await?;
+            return Ok(());
+        }
+        let Some(permit) = admit_mutation(conn, state).await? else {
+            return Ok(());
+        };
+        Some(permit)
+    } else {
+        None
+    };
+
     match endpoint {
         // --- GET /localapi/v0/status ---
         "status" if method == "GET" => {
@@ -1639,47 +1684,22 @@ pub(crate) async fn dispatch<W: AsyncRead + AsyncWrite + Unpin>(
 
         // --- PATCH /localapi/v0/prefs ---
         "prefs" if method == "PATCH" => {
-            if !require_readwrite(peer_identity) {
-                write_access_denied(conn).await?;
-                return Ok(());
-            }
-            let Some(_mutation) = admit_mutation(conn, state).await? else {
-                return Ok(());
-            };
             handle_patch_prefs(conn, &req.body, state).await?;
         }
 
         // --- POST /localapi/v0/start ---
         "start" if method == "POST" => {
-            if !require_readwrite(peer_identity) {
-                write_access_denied(conn).await?;
-                return Ok(());
-            }
-            let Some(_mutation) = admit_mutation(conn, state).await? else {
-                return Ok(());
-            };
             handle_start(conn, &req.body, state).await?;
         }
 
         // --- POST /localapi/v0/login-interactive ---
         "login-interactive" if method == "POST" => {
-            if !require_readwrite(peer_identity) {
-                write_access_denied(conn).await?;
-                return Ok(());
-            }
             state.login_trigger.notify_waiters();
             write_no_content_response(conn, 204, "No Content").await?;
         }
 
         // --- POST /localapi/v0/logout ---
         "logout" if method == "POST" => {
-            if !require_readwrite(peer_identity) {
-                write_access_denied(conn).await?;
-                return Ok(());
-            }
-            let Some(_mutation) = admit_mutation(conn, state).await? else {
-                return Ok(());
-            };
             handle_logout(conn, state).await?;
         }
 
@@ -1688,31 +1708,15 @@ pub(crate) async fn dispatch<W: AsyncRead + AsyncWrite + Unpin>(
             handle_tka_status(conn, state).await?;
         }
         "tka/init" if method == "POST" => {
-            if !require_readwrite(peer_identity) {
-                write_access_denied(conn).await?;
-                return Ok(());
-            }
             handle_tka_init(conn, &req.body, state).await?;
         }
         "tka/init/ack" if method == "POST" => {
-            if !require_readwrite(peer_identity) {
-                write_access_denied(conn).await?;
-                return Ok(());
-            }
             handle_tka_init_ack(conn, &req.body, state).await?;
         }
         "tka/sign" if method == "POST" => {
-            if !require_readwrite(peer_identity) {
-                write_access_denied(conn).await?;
-                return Ok(());
-            }
             handle_tka_sign(conn, &req.body, state).await?;
         }
         "tka/disable" if method == "POST" => {
-            if !require_readwrite(peer_identity) {
-                write_access_denied(conn).await?;
-                return Ok(());
-            }
             handle_tka_disable(conn, &req.body, state).await?;
         }
         endpoint if endpoint.starts_with("tka/") => {
@@ -1765,10 +1769,6 @@ pub(crate) async fn dispatch<W: AsyncRead + AsyncWrite + Unpin>(
 
         // --- POST /localapi/v0/debug-capture ---
         "debug-capture" if method == "POST" => {
-            if !require_readwrite(peer_identity) {
-                write_access_denied(conn).await?;
-                return Ok(());
-            }
             handle_debug_capture(conn, state).await?;
         }
 
@@ -1782,10 +1782,6 @@ pub(crate) async fn dispatch<W: AsyncRead + AsyncWrite + Unpin>(
             handle_get_serve_config(conn, state).await?;
         }
         "serve-config" if method == "POST" => {
-            if !require_readwrite(peer_identity) {
-                write_access_denied(conn).await?;
-                return Ok(());
-            }
             handle_post_serve_config(conn, req, state).await?;
         }
 
@@ -1799,10 +1795,6 @@ pub(crate) async fn dispatch<W: AsyncRead + AsyncWrite + Unpin>(
             handle_get_drive_config(conn, state).await?;
         }
         "drive/config" if method == "PUT" => {
-            if !require_readwrite(peer_identity) {
-                write_access_denied(conn).await?;
-                return Ok(());
-            }
             handle_put_drive_config(conn, &req.body, state).await?;
         }
         "drive/config" | "drive/status" => {
@@ -1816,10 +1808,6 @@ pub(crate) async fn dispatch<W: AsyncRead + AsyncWrite + Unpin>(
         }
         // --- PUT /localapi/v0/profiles ---
         "profiles" if method == "PUT" => {
-            if !require_readwrite(peer_identity) {
-                write_access_denied(conn).await?;
-                return Ok(());
-            }
             handle_new_profile(conn, state).await?;
         }
         // --- GET /localapi/v0/file-targets ---
@@ -1860,19 +1848,11 @@ pub(crate) async fn dispatch<W: AsyncRead + AsyncWrite + Unpin>(
 
         // --- POST /localapi/v0/set-expiry-sooner ---
         "set-expiry-sooner" if method == "POST" => {
-            if !require_readwrite(peer_identity) {
-                write_access_denied(conn).await?;
-                return Ok(());
-            }
             handle_set_expiry_sooner(conn, &req.body, &req.query).await?;
         }
 
         // --- POST /localapi/v0/shutdown ---
         "shutdown" if method == "POST" => {
-            if !require_readwrite(peer_identity) {
-                write_access_denied(conn).await?;
-                return Ok(());
-            }
             handle_shutdown(conn, state).await?;
         }
 
@@ -1887,19 +1867,11 @@ pub(crate) async fn dispatch<W: AsyncRead + AsyncWrite + Unpin>(
 
         // --- POST /localapi/v0/reload-config ---
         "reload-config" if method == "POST" => {
-            if !require_readwrite(peer_identity) {
-                write_access_denied(conn).await?;
-                return Ok(());
-            }
             handle_reload_config(conn, state).await?;
         }
 
         // --- POST /localapi/v0/debug (action dispatcher) ---
         "debug" if method == "POST" => {
-            if !require_readwrite(peer_identity) {
-                write_access_denied(conn).await?;
-                return Ok(());
-            }
             handle_debug_action(conn, &req.body, &req.query, state).await?;
         }
 
@@ -1911,28 +1883,16 @@ pub(crate) async fn dispatch<W: AsyncRead + AsyncWrite + Unpin>(
             }
             // Check for profiles/<id> or profiles/current sub-paths.
             if let Some(suffix) = endpoint.strip_prefix("profiles/") {
-                if (method == "POST" || method == "DELETE") && !require_readwrite(peer_identity) {
-                    write_access_denied(conn).await?;
-                    return Ok(());
-                }
                 handle_profile_subpath(conn, method, suffix, state).await?;
                 return Ok(());
             }
             // Check for files/<name> or files/ (Taildrop).
             if endpoint == "files" || endpoint.starts_with("files/") {
-                if method == "DELETE" && !require_readwrite(peer_identity) {
-                    write_access_denied(conn).await?;
-                    return Ok(());
-                }
                 handle_files(conn, method, endpoint, &req.query, req, state).await?;
                 return Ok(());
             }
             // Check for file-put/<stableID>/<filename> (Taildrop upload proxy).
             if let Some(suffix) = endpoint.strip_prefix("file-put/") {
-                if !require_readwrite(peer_identity) {
-                    write_access_denied(conn).await?;
-                    return Ok(());
-                }
                 handle_file_put(conn, method, suffix, req, state).await?;
                 return Ok(());
             }
@@ -5328,7 +5288,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_listener_generation_cannot_persist_start_prefs_or_logout() {
+    async fn stale_listener_generation_fences_every_mutating_route_but_allows_reads() {
         let state = make_test_state().await;
         let old_prefs = state.prefs.read().await.clone();
         let handoff = state
@@ -5338,14 +5298,45 @@ mod tests {
             .unwrap();
         handoff.commit();
 
-        let requests: [&[u8]; 3] = [
-            b"PATCH /localapi/v0/prefs HTTP/1.1\r\nHost: localhost\r\nContent-Length: 49\r\nConnection: close\r\n\r\n{\"Prefs\":{\"Hostname\":\"stale\"},\"HostnameSet\":true}",
-            b"POST /localapi/v0/start HTTP/1.1\r\nHost: localhost\r\nContent-Length: 65\r\nConnection: close\r\n\r\n{\"UpdatePrefs\":{\"Prefs\":{\"Hostname\":\"stale\"},\"HostnameSet\":true}}",
-            b"POST /localapi/v0/logout HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        let routes = [
+            ("PATCH", "prefs"),
+            ("POST", "start"),
+            ("POST", "login-interactive"),
+            ("POST", "logout"),
+            ("POST", "tka/init"),
+            ("POST", "tka/init/ack"),
+            ("POST", "tka/sign"),
+            ("POST", "tka/disable"),
+            ("POST", "debug-capture"),
+            ("POST", "serve-config"),
+            ("PUT", "drive/config"),
+            ("PUT", "profiles"),
+            ("POST", "profiles/profile-id"),
+            ("DELETE", "profiles/profile-id"),
+            ("POST", "set-expiry-sooner"),
+            ("POST", "shutdown"),
+            ("POST", "reload-config"),
+            ("POST", "debug"),
+            ("DELETE", "files/example.txt"),
+            ("PUT", "file-put/node-id/example.txt"),
         ];
-        for request in requests {
+        for (method, endpoint) in routes {
+            let request = format!(
+                "{method} /localapi/v0/{endpoint} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let response = send_request_to_state(request.as_bytes(), &state).await;
+            assert!(
+                response.contains("409 Conflict"),
+                "stale {method} {endpoint} was dispatched: {response}"
+            );
+        }
+
+        for request in [
+            &b"GET /localapi/v0/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"[..],
+            &b"POST /localapi/v0/check-prefs HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"[..],
+        ] {
             let response = send_request_to_state(request, &state).await;
-            assert!(response.contains("409 Conflict"), "{response}");
+            assert!(!response.contains("409 Conflict"), "read was fenced: {response}");
         }
         assert_eq!(*state.prefs.read().await, old_prefs);
         assert!(!state.ipn_backend.logged_out());

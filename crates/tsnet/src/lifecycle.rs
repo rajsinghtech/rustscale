@@ -137,6 +137,44 @@ impl StartupDelivery {
     }
 }
 
+const ROLLBACK_CLEANUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Transfer rollback ownership off the ambient Tokio runtime. Futures can be
+/// dropped while a runtime is being destroyed (or with no runtime entered at
+/// all); a dedicated owner must still join tasks and remove OS state.
+fn spawn_rollback_cleanup<F>(name: &'static str, cleanup: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    if let Err(error) = std::thread::Builder::new()
+        .name(name.into())
+        .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    log::error!("tsnet: failed to build {name} runtime: {error}");
+                    return;
+                }
+            };
+            if runtime
+                .block_on(
+                    async move { tokio::time::timeout(ROLLBACK_CLEANUP_DEADLINE, cleanup).await },
+                )
+                .is_err()
+            {
+                log::error!(
+                    "tsnet: {name} exceeded its bounded cleanup deadline; revoked resources leaked"
+                );
+            }
+        })
+    {
+        log::error!("tsnet: failed to spawn {name}: {error}");
+    }
+}
+
 struct BootstrapRollback {
     supervisor: Arc<BootstrapSupervisor>,
     watchdog: Watchdog,
@@ -189,23 +227,19 @@ impl Drop for BootstrapRollback {
         let watchdog = self.watchdog.clone();
         watchdog.stop();
         let completion = self.supervisor.begin_cleanup();
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                let _completion = completion;
-                watchdog.stop_and_wait().await;
-                if let Some(tasks) = map_tasks {
-                    tasks.join().await;
-                }
-                if let Some(logger) = netlog {
-                    let _ = logger.stop().await;
-                }
-                if let Some(magicsock) = magicsock {
-                    let _ = shutdown_magicsock(&magicsock).await;
-                }
-            });
-        } else {
-            drop(completion);
-        }
+        spawn_rollback_cleanup("rustscale-bootstrap-rollback", async move {
+            let _completion = completion;
+            watchdog.stop_and_wait().await;
+            if let Some(tasks) = map_tasks {
+                tasks.join().await;
+            }
+            if let Some(logger) = netlog {
+                let _ = logger.stop().await;
+            }
+            if let Some(magicsock) = magicsock {
+                let _ = shutdown_magicsock(&magicsock).await;
+            }
+        });
     }
 }
 
@@ -249,16 +283,12 @@ impl Drop for PrestartedMagicsockRollback {
             return;
         };
         let completion = self.supervisor.begin_cleanup();
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                let _completion = completion;
-                if let Err(error) = shutdown_magicsock(&magicsock).await {
-                    log::warn!("tsnet: pre-started magicsock rollback: {error}");
-                }
-            });
-        } else {
-            drop(completion);
-        }
+        spawn_rollback_cleanup("rustscale-prestarted-rollback", async move {
+            let _completion = completion;
+            if let Err(error) = shutdown_magicsock(&magicsock).await {
+                log::warn!("tsnet: pre-started magicsock rollback: {error}");
+            }
+        });
     }
 }
 
@@ -420,53 +450,49 @@ impl Drop for StartupRollback {
         }
         let watchdog = self.watchdog.clone();
         let completion = self.supervisor.begin_cleanup();
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                let _completion = completion;
-                if let Some(localapi) = localapi {
-                    // A prepared handoff still owns only its private staging
-                    // pathname, so ordinary shutdown removes exactly that.
-                    localapi.shutdown().await;
+        spawn_rollback_cleanup("rustscale-startup-rollback", async move {
+            let _completion = completion;
+            if let Some(localapi) = localapi {
+                // A prepared handoff still owns only its private staging
+                // pathname, so ordinary shutdown removes exactly that.
+                localapi.shutdown().await;
+            }
+            // A rolled-back handoff never changed the old advertised
+            // generation, while a non-handoff path was removed above.
+            drop(localapi_socket);
+            if let Some(serve) = serve {
+                serve.stop().await;
+            }
+            drain_generation_tasks(tasks).await;
+            map_tasks.join().await;
+            if let Some(mut monitor) = monitor {
+                monitor.shutdown_and_wait().await;
+            }
+            // Every route-mutating owner is now joined. Router teardown is
+            // deliberately last so no map/local/link callback can reinstall.
+            if let Some(router) = router {
+                let _ = Server::cleanup_or_supervise(router);
+            }
+            if let Some(configurator) = configurator.as_mut() {
+                let _ = configurator.close();
+            }
+            if let Some(magicsock) = magicsock {
+                if let Err(error) = shutdown_magicsock(&magicsock).await {
+                    log::warn!("tsnet: startup rollback magicsock shutdown: {error}");
                 }
-                // A rolled-back handoff never changed the old advertised
-                // generation, while a non-handoff path was removed above.
-                drop(localapi_socket);
-                if let Some(serve) = serve {
-                    serve.stop().await;
+            }
+            watchdog.stop_and_wait().await;
+            if let Some(logger) = netlog {
+                if let Err(error) = logger.stop().await {
+                    log::warn!("tsnet: startup rollback netlog shutdown: {error}");
                 }
-                drain_generation_tasks(tasks).await;
-                map_tasks.join().await;
-                if let Some(mut monitor) = monitor {
-                    monitor.shutdown_and_wait().await;
-                }
-                // Every route-mutating owner is now joined. Router teardown is
-                // deliberately last so no map/local/link callback can reinstall.
-                if let Some(router) = router {
-                    let _ = Server::cleanup_or_supervise(router);
-                }
-                if let Some(configurator) = configurator.as_mut() {
-                    let _ = configurator.close();
-                }
-                if let Some(magicsock) = magicsock {
-                    if let Err(error) = shutdown_magicsock(&magicsock).await {
-                        log::warn!("tsnet: startup rollback magicsock shutdown: {error}");
-                    }
-                }
-                watchdog.stop_and_wait().await;
-                if let Some(logger) = netlog {
-                    if let Err(error) = logger.stop().await {
-                        log::warn!("tsnet: startup rollback netlog shutdown: {error}");
-                    }
-                }
-                if let Some(logger) = audit_logger {
-                    logger
-                        .flush_and_stop(std::time::Duration::from_secs(5))
-                        .await;
-                }
-            });
-        } else {
-            drop(completion);
-        }
+            }
+            if let Some(logger) = audit_logger {
+                logger
+                    .flush_and_stop(std::time::Duration::from_secs(5))
+                    .await;
+            }
+        });
     }
 }
 
@@ -694,95 +720,144 @@ async fn cleanup_server_state(mut owner: CleanupOwner) -> Result<(), CleanupOwne
 }
 
 async fn logout_running_transaction(
-    mut owner: CleanupOwner,
-    drive: Arc<crate::drive::Runtime>,
-    control_url: String,
-    hostname: String,
-    state_dir: Option<PathBuf>,
-    state_scope: Option<crate::state::StateScope>,
-    mut prefs: rustscale_ipn::Prefs,
-) -> Result<(), (TsnetError, CleanupOwner)> {
-    let inner = owner.inner.as_mut().expect("logout missing running state");
-    if let Err(error) = inner
-        .audit_logger
-        .enqueue(rustscale_tailcfg::AuditNodeDisconnect, "logout")
-    {
-        log::warn!("tsnet: failed to persist audit log (non-fatal): {error}");
-    }
+    mut transaction: LogoutTransaction,
+) -> Result<(), (TsnetError, LogoutTransaction)> {
+    loop {
+        match transaction.phase {
+            LogoutPhase::Quiesce => {
+                let inner = transaction
+                    .owner
+                    .inner
+                    .as_mut()
+                    .expect("logout missing running state");
+                if let Err(error) = inner
+                    .audit_logger
+                    .enqueue(rustscale_tailcfg::AuditNodeDisconnect, "logout")
+                {
+                    log::warn!("tsnet: failed to persist audit log (non-fatal): {error}");
+                }
 
-    let machine_key = inner.machine_key.clone();
-    let server_pub_key = inner.server_pub_key.clone();
-    let node_pub = inner.node_key.public();
-    let backend = Arc::clone(&inner.ipn_backend);
-
-    // Revoke runtime publication authority, cancel the complete running map
-    // generation, and join it before replacing any durable identity or cache.
-    // A second revoke after the join closes the window where an already-polled
-    // map update could have republished Taildrive authority while cancelling.
-    drive.disable().await;
-    quiesce_running_state(inner).await;
-    drive.disable().await;
-
-    prefs.LoggedOut = true;
-    prefs.WantRunning = false;
-    if let Some(scope) = state_scope.as_ref() {
-        let path = scope.dir.join("tsnet-state.json");
-        let persisted = match PersistedState::load(&path) {
-            Ok(state) => state,
-            Err(error) => return Err((TsnetError::State(error), owner)),
-        };
-        let rotated = persisted.rotated_for_logout();
-        if let Err(error) = rotated.save(&path) {
-            return Err((TsnetError::State(error), owner));
+                // Revoke every runtime writer and join it before any durable
+                // logout phase can replace identity, cache, or preferences.
+                transaction.drive.disable().await;
+                quiesce_running_state(inner).await;
+                transaction.drive.disable().await;
+                transaction.phase = LogoutPhase::ControlLogout;
+            }
+            LogoutPhase::ControlLogout => {
+                let inner = transaction
+                    .owner
+                    .inner
+                    .as_ref()
+                    .expect("logout control phase missing running state");
+                let cc = ControlClient::new(
+                    transaction.control_url.clone(),
+                    inner.machine_key.clone(),
+                    inner.server_pub_key.clone(),
+                    PROTOCOL_VERSION,
+                );
+                let request = RegisterRequest {
+                    Version: CAPABILITY_VERSION,
+                    NodeKey: inner.node_key.public(),
+                    Expiry: Some(
+                        chrono::DateTime::parse_from_rfc3339("1970-01-01T00:00:00Z")
+                            .unwrap()
+                            .with_timezone(&chrono::Utc),
+                    ),
+                    Hostinfo: Some(Hostinfo {
+                        OS: std::env::consts::OS.to_string(),
+                        Hostname: transaction.hostname.clone(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+                if let Err(error) = cc.register(&request).await {
+                    return Err((TsnetError::Register(error), transaction));
+                }
+                transaction.phase = LogoutPhase::RotateIdentity;
+            }
+            LogoutPhase::RotateIdentity => {
+                if let Some(scope) = transaction.state_scope.as_ref() {
+                    let path = scope.dir.join("tsnet-state.json");
+                    let persisted = match PersistedState::load(&path) {
+                        Ok(state) => state,
+                        Err(error) => return Err((TsnetError::State(error), transaction)),
+                    };
+                    transaction
+                        .tailnet_identity
+                        .clone_from(&persisted.tailnet_identity);
+                    let rotated = persisted.rotated_for_logout();
+                    #[cfg(test)]
+                    if transaction.state_save_failures > 0 {
+                        transaction.state_save_failures -= 1;
+                        return Err((
+                            TsnetError::State(crate::StateError::Io(std::io::Error::other(
+                                "injected logout state save failure",
+                            ))),
+                            transaction,
+                        ));
+                    }
+                    if let Err(error) = rotated.save(&path) {
+                        return Err((TsnetError::State(error), transaction));
+                    }
+                }
+                transaction.phase = LogoutPhase::ClearCache;
+            }
+            LogoutPhase::ClearCache => {
+                if let Some(scope) = transaction.state_scope.as_ref() {
+                    // Identity rotation has committed, so no old-key cache may
+                    // survive even if preference persistence needs a retry.
+                    NetMapCache::new_scoped(scope, &transaction.tailnet_identity).clear();
+                }
+                transaction.phase = LogoutPhase::SavePrefs;
+            }
+            LogoutPhase::SavePrefs => {
+                transaction.prefs.LoggedOut = true;
+                transaction.prefs.WantRunning = false;
+                if let Some(dir) = transaction.state_dir.as_ref() {
+                    if let Err(error) = transaction.prefs.save(dir) {
+                        return Err((TsnetError::Io(error), transaction));
+                    }
+                }
+                transaction.phase = LogoutPhase::PublishLoggedOut;
+            }
+            LogoutPhase::PublishLoggedOut => {
+                let inner = transaction
+                    .owner
+                    .inner
+                    .as_ref()
+                    .expect("logout publish phase missing running state");
+                let backend = &inner.ipn_backend;
+                backend.set_logged_out(true);
+                backend.set_blocked(true);
+                backend.update_inputs(|inputs| {
+                    inputs.want_running = false;
+                    inputs.has_node_key = false;
+                    inputs.auth_cant_continue = true;
+                    inputs.netmap_present = false;
+                });
+                backend.bus().send(rustscale_ipn::Notify {
+                    State: Some(rustscale_ipn::State::NeedsLogin),
+                    Prefs: Some(serde_json::to_value(&transaction.prefs).unwrap_or_default()),
+                    ..Default::default()
+                });
+                transaction.phase = LogoutPhase::Cleanup;
+            }
+            LogoutPhase::Cleanup => {
+                let owner = std::mem::replace(&mut transaction.owner, CleanupOwner::empty());
+                return match cleanup_server_state(owner).await {
+                    Ok(()) => Ok(()),
+                    Err(owner) => {
+                        transaction.owner = owner;
+                        Err((
+                            TsnetError::ShutdownIncomplete("logout cleanup requires retry".into()),
+                            transaction,
+                        ))
+                    }
+                };
+            }
         }
-        NetMapCache::new_scoped(scope, &persisted.tailnet_identity).clear();
     }
-    if let Some(ref dir) = state_dir {
-        if let Err(error) = prefs.save(dir) {
-            log::warn!("tsnet: failed to persist logged-out preferences: {error}");
-        }
-    }
-
-    backend.set_logged_out(true);
-    backend.set_blocked(true);
-    backend.update_inputs(|inputs| {
-        inputs.want_running = false;
-        inputs.has_node_key = false;
-        inputs.auth_cant_continue = true;
-        inputs.netmap_present = false;
-    });
-    backend.bus().send(rustscale_ipn::Notify {
-        State: Some(rustscale_ipn::State::NeedsLogin),
-        Prefs: Some(serde_json::to_value(&prefs).unwrap_or_default()),
-        ..Default::default()
-    });
-
-    let cc = ControlClient::new(control_url, machine_key, server_pub_key, PROTOCOL_VERSION);
-    let request = RegisterRequest {
-        Version: CAPABILITY_VERSION,
-        NodeKey: node_pub,
-        Expiry: Some(
-            chrono::DateTime::parse_from_rfc3339("1970-01-01T00:00:00Z")
-                .unwrap()
-                .with_timezone(&chrono::Utc),
-        ),
-        Hostinfo: Some(Hostinfo {
-            OS: std::env::consts::OS.to_string(),
-            Hostname: hostname,
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
-    if let Err(error) = cc.register(&request).await {
-        log::warn!("tsnet: logout register failed (non-fatal): {error}");
-    }
-
-    cleanup_server_state(owner).await.map_err(|owner| {
-        (
-            TsnetError::ShutdownIncomplete("extension shutdown requires retry".into()),
-            owner,
-        )
-    })
 }
 
 /// Nonblocking node lookup view used by the netlog aggregation task.
@@ -1681,6 +1756,8 @@ impl Server {
             self.config.state_dir.as_deref(),
         )
         .await?;
+        // Transfer OS-route ownership before the next cancellable await.
+        rollback.router.clone_from(&router);
 
         let monitor = spawn_link_monitor(
             b.magicsock.clone(),
@@ -1706,7 +1783,6 @@ impl Server {
         )
         .await;
         rollback.monitor = monitor;
-        rollback.router.clone_from(&router);
 
         let capture = crate::capture::new_slot();
 
@@ -2248,7 +2324,7 @@ impl Server {
             return;
         };
         let completion = self.startup_supervisor.begin_cleanup();
-        tokio::spawn(async move {
+        spawn_rollback_cleanup("rustscale-prestarted-retire", async move {
             let _completion = completion;
             // The replacement now owns the advertised pathname. Retiring the
             // old generation must not unlink it.
@@ -2257,7 +2333,9 @@ impl Server {
     }
 
     pub(crate) async fn ensure_extension_host(&mut self) -> Result<(), TsnetError> {
-        if self.shutdown_supervisor.has_retained_owner() {
+        if self.shutdown_supervisor.has_retained_owner()
+            || self.shutdown_supervisor.has_retained_logout()
+        {
             return Err(TsnetError::ShutdownIncomplete(
                 "previous server owner still requires shutdown retry".into(),
             ));
@@ -2414,9 +2492,16 @@ impl Server {
     ) -> Result<mpsc::UnboundedReceiver<localapi::DaemonCommand>, TsnetError> {
         self.shutdown_supervisor.wait().await;
         self.startup_supervisor.wait().await;
+        if self.shutdown_supervisor.has_retained_logout()
+            || self.shutdown_supervisor.has_retained_owner()
+        {
+            return Err(TsnetError::ShutdownIncomplete(
+                "previous server owner still requires shutdown retry".into(),
+            ));
+        }
         if let Some(pre_started) = self.pre_started.take() {
             let completion = self.shutdown_supervisor.begin_cleanup();
-            tokio::spawn(async move {
+            spawn_rollback_cleanup("rustscale-prestarted-restart", async move {
                 let _completion = completion;
                 cleanup_pre_started(pre_started, true).await;
             });
@@ -3530,6 +3615,11 @@ impl Server {
     /// running tasks, sockets, routes, DNS state, serve listeners, or
     /// extensions.
     pub async fn close(&mut self) -> Result<(), TsnetError> {
+        if self.shutdown_supervisor.has_retained_logout() {
+            return Err(TsnetError::ShutdownIncomplete(
+                "logout transaction is incomplete; retry logout before close".into(),
+            ));
+        }
         // Move every Server-owned generation before the first await. Rollback
         // tasks from a cancelled up/bootstrap are already retained by their
         // supervisors; clone those gates into the same independent cleanup.
@@ -3545,6 +3635,11 @@ impl Server {
             shutdown_supervisor.wait().await;
             startup_supervisor.wait().await;
             bootstrap_supervisor.wait().await;
+            if shutdown_supervisor.has_retained_logout() {
+                return Err(TsnetError::ShutdownIncomplete(
+                    "logout transaction is incomplete; retry logout before close".into(),
+                ));
+            }
             let Some(retained) = shutdown_supervisor.take_retained_owner() else {
                 return Ok(());
             };
@@ -3602,52 +3697,58 @@ impl Server {
     pub async fn logout(&mut self) -> Result<(), TsnetError> {
         self.shutdown_supervisor.wait().await;
         self.startup_supervisor.wait().await;
-        if self.inner.is_none() {
+
+        let transaction = if let Some(transaction) = self.shutdown_supervisor.take_retained_logout()
+        {
+            transaction
+        } else if self.inner.is_some() {
+            LogoutTransaction {
+                owner: CleanupOwner::take_from(self),
+                drive: Arc::clone(&self.drive),
+                control_url: self.config.control_url.clone(),
+                hostname: self.config.hostname.clone(),
+                state_dir: self.config.state_dir.clone(),
+                state_scope: self.profile_state_scope(),
+                tailnet_identity: String::new(),
+                prefs: self.load_prefs().unwrap_or_default(),
+                phase: LogoutPhase::Quiesce,
+                #[cfg(test)]
+                state_save_failures: std::mem::take(&mut self.logout_state_save_failures),
+            }
+        } else {
             if self.shutdown_supervisor.has_retained_owner() {
                 return self.close().await;
             }
             return Ok(());
-        }
-        let owner = CleanupOwner::take_from(self);
-        let drive = Arc::clone(&self.drive);
-        let control_url = self.config.control_url.clone();
-        let hostname = self.config.hostname.clone();
-        let state_dir = self.config.state_dir.clone();
-        let state_scope = self.profile_state_scope();
-        let prefs = self.load_prefs().unwrap_or_default();
+        };
         #[cfg(test)]
         let logout_test_hook = self.logout_test_hook.take();
 
-        // Transfer ownership before the first cancellable await. Immediate
-        // retries wait on the same supervisor even if this caller is dropped.
+        // Transfer the explicit transaction before the first cancellable
+        // await. A durable failure retains both its phase and all data needed
+        // to resume; it can never degrade into close-only success.
         let completion = self.shutdown_supervisor.begin_cleanup();
         let cleanup_supervisor = Arc::clone(&self.shutdown_supervisor);
-        let transaction = tokio::spawn(async move {
+        let worker = tokio::spawn(async move {
             let _completion = completion;
             #[cfg(test)]
             if let Some((entered, release)) = logout_test_hook {
                 entered.wait().await;
                 release.wait().await;
             }
-            match logout_running_transaction(
-                owner,
-                drive,
-                control_url,
-                hostname,
-                state_dir,
-                state_scope,
-                prefs,
-            )
-            .await
-            {
+            match logout_running_transaction(transaction).await {
                 Ok(()) => Ok(()),
-                Err((error, owner)) => {
-                    cleanup_supervisor.retain_owner(owner);
+                Err((error, transaction)) => {
+                    log::warn!(
+                        "tsnet: logout paused at {:?} and was retained for retry: {error}",
+                        transaction.phase
+                    );
+                    cleanup_supervisor.retain_logout(transaction);
                     Err(error)
                 }
             }
         });
-        transaction.await.map_err(|error| {
+        worker.await.map_err(|error| {
             TsnetError::ShutdownIncomplete(format!("logout worker stopped: {error}"))
         })?
     }
@@ -3910,6 +4011,10 @@ async fn finish_dropped_cleanup(
         revoke_owner_authority_terminal(&mut retained, &drive);
         owners.push(retained);
     }
+    while let Some(mut transaction) = shutdown_supervisor.take_retained_logout() {
+        revoke_owner_authority_terminal(&mut transaction.owner, &transaction.drive);
+        owners.push(transaction.owner);
+    }
 
     for mut owner in owners {
         let _completion = shutdown_supervisor.begin_cleanup();
@@ -3961,6 +4066,7 @@ impl Drop for Server {
         if owner.is_empty()
             && !self.shutdown_supervisor.has_active_cleanup()
             && !self.shutdown_supervisor.has_retained_owner()
+            && !self.shutdown_supervisor.has_retained_logout()
         {
             return;
         }

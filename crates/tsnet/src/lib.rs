@@ -802,6 +802,8 @@ impl ServerBuilder {
             #[cfg(test)]
             logout_test_hook: None,
             #[cfg(test)]
+            logout_state_save_failures: 0,
+            #[cfg(test)]
             startup_localapi_test_hook: None,
         })
     }
@@ -1082,12 +1084,47 @@ pub(crate) struct CleanupOwner {
     pre_started: Option<PreStartedLocalApi>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LogoutPhase {
+    Quiesce,
+    ControlLogout,
+    RotateIdentity,
+    ClearCache,
+    SavePrefs,
+    PublishLoggedOut,
+    Cleanup,
+}
+
+/// Durable continuation for logout. Generic close cleanup must never consume
+/// this owner because doing so would silently skip unfinished logout phases.
+pub(crate) struct LogoutTransaction {
+    owner: CleanupOwner,
+    drive: Arc<drive::Runtime>,
+    control_url: String,
+    hostname: String,
+    state_dir: Option<PathBuf>,
+    state_scope: Option<state::StateScope>,
+    tailnet_identity: String,
+    prefs: rustscale_ipn::Prefs,
+    phase: LogoutPhase,
+    #[cfg(test)]
+    state_save_failures: usize,
+}
+
 impl CleanupOwner {
     fn take_from(server: &mut Server) -> Self {
         Self {
             extension_host: server.extension_host.take(),
             inner: server.inner.take(),
             pre_started: server.pre_started.take(),
+        }
+    }
+
+    fn empty() -> Self {
+        Self {
+            extension_host: None,
+            inner: None,
+            pre_started: None,
         }
     }
 
@@ -1101,6 +1138,7 @@ struct CleanupGenerationState {
     active: usize,
     epoch: u64,
     retained_owners: Vec<CleanupOwner>,
+    retained_logouts: Vec<LogoutTransaction>,
 }
 
 pub(crate) struct CleanupCompletion(Arc<BootstrapSupervisor>);
@@ -1176,6 +1214,31 @@ impl BootstrapSupervisor {
             .pop()
     }
 
+    pub(crate) fn retain_logout(&self, transaction: LogoutTransaction) {
+        self.state
+            .lock()
+            .expect("cleanup generation lock poisoned")
+            .retained_logouts
+            .push(transaction);
+    }
+
+    pub(crate) fn take_retained_logout(&self) -> Option<LogoutTransaction> {
+        self.state
+            .lock()
+            .expect("cleanup generation lock poisoned")
+            .retained_logouts
+            .pop()
+    }
+
+    pub(crate) fn has_retained_logout(&self) -> bool {
+        !self
+            .state
+            .lock()
+            .expect("cleanup generation lock poisoned")
+            .retained_logouts
+            .is_empty()
+    }
+
     pub(crate) fn has_retained_owner(&self) -> bool {
         !self
             .state
@@ -1191,6 +1254,16 @@ impl BootstrapSupervisor {
             .expect("cleanup generation lock poisoned")
             .active
             > 0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_logout_phase(&self) -> Option<LogoutPhase> {
+        self.state
+            .lock()
+            .expect("cleanup generation lock poisoned")
+            .retained_logouts
+            .last()
+            .map(|transaction| transaction.phase)
     }
 
     #[cfg(test)]
@@ -1226,6 +1299,8 @@ pub struct Server {
     pub(crate) shutdown_supervisor: Arc<BootstrapSupervisor>,
     #[cfg(test)]
     pub(crate) logout_test_hook: Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>,
+    #[cfg(test)]
+    pub(crate) logout_state_save_failures: usize,
     #[cfg(test)]
     pub(crate) startup_localapi_test_hook:
         Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>, bool)>,

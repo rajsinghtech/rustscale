@@ -513,6 +513,7 @@ async fn cancelled_logout_transaction_blocks_retry_until_owned_cleanup_finishes(
     }
     drop(logout);
 
+    let logout_supervisor = Arc::clone(&server.shutdown_supervisor);
     let mut retry = Box::pin(server.start_localapi_only());
     assert!(
         tokio::time::timeout(std::time::Duration::from_millis(50), &mut retry)
@@ -521,12 +522,78 @@ async fn cancelled_logout_transaction_blocks_retry_until_owned_cleanup_finishes(
         "retry overlapped cancelled logout transaction"
     );
     release.wait().await;
-    let commands = tokio::time::timeout(std::time::Duration::from_secs(5), &mut retry)
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), &mut retry)
         .await
-        .expect("retry did not resume after logout cleanup")
-        .unwrap();
-    drop((commands, retry));
+        .expect("retry did not resume after logout cleanup");
+    drop(retry);
+    match result {
+        Ok(commands) => drop(commands),
+        Err(error) => {
+            assert!(matches!(error, TsnetError::ShutdownIncomplete(_)));
+            assert_eq!(
+                logout_supervisor.retained_logout_phase(),
+                Some(LogoutPhase::Cleanup)
+            );
+            let mut completed = false;
+            for _ in 0..5 {
+                match server.logout().await {
+                    Ok(()) => {
+                        completed = true;
+                        break;
+                    }
+                    Err(TsnetError::ShutdownIncomplete(_)) => {}
+                    Err(error) => panic!("unexpected logout retry failure: {error}"),
+                }
+            }
+            assert!(
+                completed,
+                "logout cleanup did not complete after bounded retries"
+            );
+            let commands = server.start_localapi_only().await.unwrap();
+            drop(commands);
+        }
+    }
     server.close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn logout_state_save_failure_retains_transaction_for_retry() {
+    let mut control = rustscale_testcontrol::Server::new();
+    control.start().await.unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let mut server = Server::builder()
+        .hostname("logout-save-retry")
+        .auth_key("tskey-test")
+        .control_url(control.base_url())
+        .state_dir(temp.path())
+        .disable_portmapping(true)
+        .build()
+        .unwrap();
+    Box::pin(server.up()).await.unwrap();
+
+    let state_path = server
+        .profile_state_scope()
+        .unwrap()
+        .dir
+        .join("tsnet-state.json");
+    let before = PersistedState::load(&state_path).unwrap();
+    server.logout_state_save_failures = 1;
+    assert!(matches!(server.logout().await, Err(TsnetError::State(_))));
+    assert!(server.shutdown_supervisor.has_retained_logout());
+    assert_eq!(PersistedState::load(&state_path).unwrap(), before);
+    assert!(matches!(
+        server.close().await,
+        Err(TsnetError::ShutdownIncomplete(_))
+    ));
+
+    server.logout().await.unwrap();
+    assert!(!server.shutdown_supervisor.has_retained_logout());
+    let after = PersistedState::load(&state_path).unwrap();
+    assert_ne!(after.node_key, before.node_key);
+    assert_ne!(after.machine_key, before.machine_key);
+    let prefs = rustscale_ipn::Prefs::load(temp.path()).unwrap();
+    assert!(prefs.LoggedOut);
+    assert!(!prefs.WantRunning);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

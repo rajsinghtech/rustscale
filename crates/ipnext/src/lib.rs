@@ -12,7 +12,7 @@ use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 
 use async_trait::async_trait;
 use rustscale_feature::{Hooks as FeatureHooks, Unavailable};
@@ -264,6 +264,9 @@ struct ProfileSnapshot {
 struct ManagedExtension {
     name: Arc<str>,
     extension: Arc<dyn Extension>,
+    /// Callback registrations are staged per extension and become visible
+    /// only when that extension completes initialization successfully.
+    hooks: Arc<Hooks>,
 }
 
 const CREATED: u8 = 0;
@@ -288,7 +291,7 @@ struct PublicationState {
 
 struct PublicationQueue {
     state: Mutex<PublicationState>,
-    idle: Condvar,
+    idle: tokio::sync::Notify,
 }
 
 impl PublicationQueue {
@@ -299,7 +302,7 @@ impl PublicationQueue {
                 draining: false,
                 queue: VecDeque::new(),
             }),
-            idle: Condvar::new(),
+            idle: tokio::sync::Notify::new(),
         }
     }
 
@@ -347,7 +350,7 @@ impl PublicationQueue {
                     publication
                 } else {
                     state.draining = false;
-                    self.idle.notify_all();
+                    self.idle.notify_waiters();
                     break;
                 }
             };
@@ -371,14 +374,19 @@ impl PublicationQueue {
         state.draining
     }
 
-    fn stop_and_wait(&self) {
-        let mut state = lock_unpoisoned(&self.state);
-        state.accepting = false;
-        while state.draining {
-            state = self
-                .idle
-                .wait(state)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+    async fn stop_and_wait(&self) {
+        loop {
+            let notified = self.idle.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let mut state = lock_unpoisoned(&self.state);
+                state.accepting = false;
+                if !state.draining {
+                    return;
+                }
+            }
+            notified.await;
         }
     }
 }
@@ -387,17 +395,30 @@ struct HostCore {
     system: Arc<System>,
     hooks: Arc<Hooks>,
     profile: Mutex<ProfileSnapshot>,
+    /// Fully initialized extensions, and the only registry visible to
+    /// dependency lookup and publication dispatch.
     active: Mutex<Vec<ManagedExtension>>,
+    /// Failed/aborted initializations whose compensation did not finish.
+    /// These are cleanup owners, never active dependencies.
+    cleanup_failed: Mutex<Vec<ManagedExtension>>,
     publications: PublicationQueue,
     lifecycle_state: AtomicU8,
 }
 
 impl HostCore {
     fn invoke_publication(&self, publication: Publication) {
+        // Snapshot only fully initialized extensions. User callbacks run with
+        // no host registry lock held.
+        let active = lock_unpoisoned(&self.active).clone();
         match publication {
             Publication::Backend(state) => {
                 for callback in self.hooks.backend_state_change.snapshot() {
                     callback(state);
+                }
+                for extension in active {
+                    for callback in extension.hooks.backend_state_change.snapshot() {
+                        callback(state);
+                    }
                 }
             }
             Publication::Profile(profile_state) => {
@@ -408,6 +429,11 @@ impl HostCore {
                 };
                 for callback in self.hooks.profile_state_change.snapshot() {
                     callback(profile.clone(), prefs.clone(), same_node);
+                }
+                for extension in active {
+                    for callback in extension.hooks.profile_state_change.snapshot() {
+                        callback(profile.clone(), prefs.clone(), same_node);
+                    }
                 }
             }
         }
@@ -425,6 +451,7 @@ impl HostCore {
 #[derive(Clone)]
 pub struct Host {
     core: Weak<HostCore>,
+    hooks: Arc<Hooks>,
 }
 
 impl Host {
@@ -439,7 +466,8 @@ impl Host {
 
     /// Returns extension hooks.
     pub fn hooks(&self) -> Result<Arc<Hooks>, Unavailable> {
-        Ok(Arc::clone(&self.core()?.hooks))
+        self.core()?;
+        Ok(Arc::clone(&self.hooks))
     }
 
     /// Returns a snapshot of the current profile and preferences.
@@ -495,7 +523,7 @@ impl fmt::Debug for Host {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Host")
             .field("available", &self.core.strong_count().gt(&0))
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -543,6 +571,7 @@ impl ExtensionHost {
             all_extensions.push(ManagedExtension {
                 name: registered_name,
                 extension,
+                hooks: Arc::new(Hooks::default()),
             });
         }
 
@@ -552,6 +581,7 @@ impl ExtensionHost {
                 hooks: Arc::new(Hooks::default()),
                 profile: Mutex::new(ProfileSnapshot::default()),
                 active: Mutex::new(Vec::new()),
+                cleanup_failed: Mutex::new(Vec::new()),
                 publications: PublicationQueue::new(),
                 lifecycle_state: AtomicU8::new(CREATED),
             }),
@@ -582,6 +612,7 @@ impl ExtensionHost {
     pub fn host(&self) -> Host {
         Host {
             core: Arc::downgrade(&self.core),
+            hooks: Arc::clone(&self.core.hooks),
         }
     }
 
@@ -729,15 +760,11 @@ impl ExtensionHost {
         self.core.publications.stop_now()
     }
 
-    /// Stop accepting publications and wait for the active publication
-    /// callback/queue to drain. The blocking waiter is independently owned,
-    /// so cancelling this future does not re-enable or detach publication work.
+    /// Stop accepting publications and asynchronously wait for the active
+    /// callback/queue to drain. Cancellation never re-enables publication and
+    /// no blocking-pool waiter can pin runtime destruction.
     pub async fn stop_publications_and_wait(&self) {
-        let core = Arc::clone(&self.core);
-        let _ = tokio::task::spawn_blocking(move || {
-            core.publications.stop_and_wait();
-        })
-        .await;
+        self.core.publications.stop_and_wait().await;
     }
 
     /// Shuts down initialized extensions once, in reverse init order.
@@ -746,6 +773,17 @@ impl ExtensionHost {
     /// begin. The operation continues if its caller is cancelled. Calls made
     /// while another lifecycle transition is active return a busy error.
     pub async fn shutdown(&self) -> Result<(), ShutdownError> {
+        #[cfg(test)]
+        const WAIT: std::time::Duration = std::time::Duration::from_millis(100);
+        #[cfg(not(test))]
+        const WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+        self.shutdown_timeout(WAIT).await
+    }
+
+    /// Shut down with a bounded API wait. User callbacks are polled on
+    /// independently owned runtimes, so a timed-out or synchronously blocked
+    /// callback cannot pin the caller's runtime during destruction.
+    pub async fn shutdown_timeout(&self, wait: std::time::Duration) -> Result<(), ShutdownError> {
         loop {
             match self.core.lifecycle_state.load(Ordering::Acquire) {
                 CREATED => {
@@ -755,7 +793,7 @@ impl ExtensionHost {
                         .compare_exchange(CREATED, STOPPED, Ordering::AcqRel, Ordering::Acquire)
                         .is_ok()
                     {
-                        self.core.publications.stop_and_wait();
+                        self.core.publications.stop_and_wait().await;
                         return Ok(());
                     }
                 }
@@ -778,11 +816,7 @@ impl ExtensionHost {
                     let (result_tx, result_rx) = oneshot::channel();
                     let core = Arc::clone(&self.core);
                     tokio::spawn(async move {
-                        let publications = Arc::clone(&core);
-                        let _ = tokio::task::spawn_blocking(move || {
-                            publications.publications.stop_and_wait();
-                        })
-                        .await;
+                        core.publications.stop_and_wait().await;
                         let failures = shutdown_active(&core).await;
                         let result = if failures.is_empty() {
                             Ok(())
@@ -791,11 +825,7 @@ impl ExtensionHost {
                         };
                         let _ = result_tx.send(result);
                     });
-                    #[cfg(test)]
-                    const WAIT: std::time::Duration = std::time::Duration::from_millis(100);
-                    #[cfg(not(test))]
-                    const WAIT: std::time::Duration = std::time::Duration::from_secs(5);
-                    return match tokio::time::timeout(WAIT, result_rx).await {
+                    return match tokio::time::timeout(wait, result_rx).await {
                         Ok(Ok(result)) => result,
                         Ok(Err(_)) => Err(ShutdownError::worker_stopped()),
                         Err(_) => Err(ShutdownError::busy()),
@@ -834,11 +864,7 @@ async fn send_start_result<T>(
         .compare_exchange(RUNNING, SHUTTING_DOWN, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
     {
-        let publications = Arc::clone(core);
-        let _ = tokio::task::spawn_blocking(move || {
-            publications.publications.stop_and_wait();
-        })
-        .await;
+        core.publications.stop_and_wait().await;
         let _ = shutdown_active(core).await;
     }
 }
@@ -850,28 +876,32 @@ async fn run_start<T>(
     strict: bool,
     result_tx: &mut oneshot::Sender<T>,
 ) -> Result<StartupReport, StrictStartupError> {
-    let host = Host {
+    let base_host = Host {
         core: Arc::downgrade(&core),
+        hooks: Arc::clone(&core.hooks),
     };
     let mut report = StartupReport {
         skipped: construction_skips.as_ref().clone(),
         ..StartupReport::default()
     };
     for extension in extensions.iter() {
-        let init_result = match invoke_init(extension.clone(), host.clone(), result_tx).await {
+        let host = Host {
+            core: base_host.core.clone(),
+            hooks: Arc::clone(&extension.hooks),
+        };
+        let init_result = match invoke_init(extension.clone(), host, result_tx).await {
             InitOutcome::Completed { result, retain } => {
                 if retain {
-                    // A failed init may still have acquired resources. If its
-                    // compensating shutdown failed or timed out, retain it in
-                    // the same ordered registry as successful predecessors so
-                    // every later shutdown retries it before its dependencies.
-                    lock_unpoisoned(&core.active).push(extension.clone());
+                    // A failed init may still have acquired resources. Keep
+                    // that cleanup owner separate: it must not be published or
+                    // satisfy another extension's dependency lookup.
+                    lock_unpoisoned(&core.cleanup_failed).push(extension.clone());
                 }
                 result
             }
             InitOutcome::CallerCancelled { retain } => {
                 if retain {
-                    lock_unpoisoned(&core.active).push(extension.clone());
+                    lock_unpoisoned(&core.cleanup_failed).push(extension.clone());
                 }
                 core.set_lifecycle_state(SHUTTING_DOWN);
                 let _ = shutdown_active(&core).await;
@@ -1002,13 +1032,27 @@ async fn cleanup_partial_init(extension: ManagedExtension) -> Option<BoxError> {
 }
 
 async fn invoke_shutdown(extension: ManagedExtension) -> ExtensionResult {
-    // The lifecycle worker, not an API waiter, owns this task. A bounded API
-    // timeout must never abort and forget an extension that may still own
-    // children or sockets. The host reaches STOPPED only after this join proves
-    // the callback quiescent.
-    tokio::spawn(async move { extension.extension.shutdown().await })
-        .await
-        .map_err(join_error)?
+    // Poll user shutdown code on an independently owned runtime. A callback
+    // that blocks inside poll may leak this detached thread, but it cannot pin
+    // the caller's Tokio runtime or make runtime destruction wait forever.
+    let (result_tx, result_rx) = oneshot::channel();
+    let name = extension.name.to_string();
+    std::thread::Builder::new()
+        .name(format!("ipnext-shutdown-{name}"))
+        .spawn(move || {
+            let result = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| -> BoxError { Box::new(error) })
+                .and_then(|runtime| runtime.block_on(extension.extension.shutdown()));
+            let _ = result_tx.send(result);
+        })
+        .map_err(|error| -> BoxError { Box::new(error) })?;
+    result_rx.await.map_err(|_| {
+        Box::new(std::io::Error::other(
+            "extension shutdown worker stopped without a result",
+        )) as BoxError
+    })?
 }
 
 fn join_error(error: tokio::task::JoinError) -> BoxError {
@@ -1018,6 +1062,28 @@ fn join_error(error: tokio::task::JoinError) -> BoxError {
 }
 
 async fn shutdown_active(core: &HostCore) -> Vec<ExtensionFailure> {
+    // Retry failed partial-init compensation before touching active
+    // dependencies. These entries were never published and cannot be a
+    // dependency of a later extension, while they may still depend on an
+    // earlier active entry.
+    loop {
+        let extension = lock_unpoisoned(&core.cleanup_failed).last().cloned();
+        let Some(extension) = extension else {
+            break;
+        };
+        if let Err(source) = invoke_shutdown(extension.clone()).await {
+            core.set_lifecycle_state(SHUTDOWN_FAILED);
+            return vec![ExtensionFailure {
+                name: extension.name.to_string(),
+                source,
+            }];
+        }
+        let removed = lock_unpoisoned(&core.cleanup_failed)
+            .pop()
+            .expect("partial-init cleanup owner disappeared");
+        debug_assert_eq!(removed.name, extension.name);
+    }
+
     loop {
         // Keep the complete active registry visible while user shutdown code
         // runs. A dependent may need to resolve one of its dependencies in
@@ -1059,6 +1125,13 @@ impl fmt::Debug for ExtensionHost {
                     .collect::<Vec<_>>(),
             )
             .field("active", &self.active_names())
+            .field(
+                "cleanup_failed",
+                &lock_unpoisoned(&self.core.cleanup_failed)
+                    .iter()
+                    .map(|extension| extension.name.as_ref())
+                    .collect::<Vec<_>>(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -1803,12 +1876,16 @@ mod tests {
             fn name(&self) -> &str {
                 self.name
             }
-            async fn init(&self, _: Host) -> ExtensionResult {
+            async fn init(&self, host: Host) -> ExtensionResult {
                 self.events
                     .lock()
                     .unwrap()
                     .push(format!("init:{}", self.name));
                 if self.fail_init {
+                    let events = Arc::clone(&self.events);
+                    host.hooks()?.backend_state_change.add(Arc::new(move |_| {
+                        events.lock().unwrap().push("callback:partial".into());
+                    }));
                     Err(Box::new(std::io::Error::other("injected init failure")))
                 } else {
                     Ok(())
@@ -1855,7 +1932,18 @@ mod tests {
         let host = ExtensionHost::new(&registry, Arc::new(System::new())).unwrap();
         let report = host.start().await.unwrap();
         assert_eq!(report.failed.len(), 1);
-        assert_eq!(host.active_names(), ["dependency", "partial", "dependent"]);
+        assert_eq!(host.active_names(), ["dependency", "dependent"]);
+        assert!(host
+            .host()
+            .find_extension_by_name("partial")
+            .unwrap()
+            .is_none());
+        host.host().publish_backend_state(State::Running).unwrap();
+        assert!(!events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event == "callback:partial"));
         host.shutdown().await.unwrap();
         assert_eq!(
             *events.lock().unwrap(),
@@ -1864,8 +1952,8 @@ mod tests {
                 "init:partial",
                 "shutdown:partial:0",
                 "init:dependent",
-                "shutdown:dependent:0",
                 "shutdown:partial:1",
+                "shutdown:dependent:0",
                 "shutdown:dependency:0",
             ]
         );
@@ -1944,7 +2032,13 @@ mod tests {
             })
             .await
             .expect("cancelled startup did not clean partial and active extensions");
-            assert!(host.active_names().is_empty());
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !host.active_names().is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("cancelled startup registry did not finish cleanup");
             host.shutdown().await.unwrap();
             assert_eq!(shutdowns.load(Ordering::SeqCst), 2);
         }

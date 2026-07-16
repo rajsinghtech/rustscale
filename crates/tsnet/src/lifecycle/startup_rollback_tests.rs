@@ -610,6 +610,151 @@ async fn terminal_drop_cleanup_has_global_attempt_bound() {
     assert_eq!(calls.load(Ordering::SeqCst), DROP_CLEANUP_ATTEMPTS);
 }
 
+#[test]
+fn startup_rollback_dropped_after_runtime_destroys_polled_tun_task_and_routes() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let supervisor = Arc::new(BootstrapSupervisor::default());
+    let cancel = Arc::new(CancelToken::new());
+    let router_closed = Arc::new(AtomicBool::new(false));
+    let dropped = Arc::new(AtomicUsize::new(0));
+
+    let rollback = runtime.block_on(async {
+        let watchdog = Watchdog::new(
+            Tracker::new(),
+            "outside-runtime-tun-rollback",
+            "outside runtime TUN rollback",
+            Severity::Low,
+            "not stopped",
+            std::time::Duration::from_secs(60),
+        );
+        let map_task = tokio::spawn(std::future::pending::<()>());
+        let task_dropped = Arc::clone(&dropped);
+        let tun_task = tokio::spawn(async move {
+            let _polled_tun_future = DropCount(task_dropped);
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+        let mut rollback = StartupRollback::new(
+            Arc::clone(&supervisor),
+            Arc::clone(&cancel),
+            watchdog,
+            MapSessionTasks::new(map_task),
+            None,
+        );
+        rollback.track(tun_task);
+        rollback.router = Some(shared_test_router(Box::new(CloseRouter(Arc::clone(
+            &router_closed,
+        )))));
+        rollback
+    });
+
+    // Model a polled up_tun future escaping block_on and being dropped only
+    // after its original runtime owner is gone.
+    drop(runtime);
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    drop(rollback);
+    assert!(cancel.is_cancelled());
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while supervisor.active_count() != 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(supervisor.active_count(), 0);
+    assert!(router_closed.load(Ordering::SeqCst));
+}
+
+#[test]
+fn terminal_drop_is_bounded_with_blocked_publication_callback_and_dead_runtime() {
+    struct BlockingPublication {
+        entered: std::sync::mpsc::Sender<()>,
+        release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+        shutdown: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl rustscale_ipnext::Extension for BlockingPublication {
+        fn name(&self) -> &'static str {
+            "blocked-terminal-publication"
+        }
+
+        async fn init(&self, host: rustscale_ipnext::Host) -> rustscale_ipnext::ExtensionResult {
+            let entered = self.entered.clone();
+            let release = Arc::clone(&self.release);
+            host.hooks()?.backend_state_change.add(Arc::new(move |_| {
+                let _ = entered.send(());
+                let (lock, changed) = &*release;
+                let mut ready = lock.lock().unwrap();
+                while !*ready {
+                    ready = changed.wait(ready).unwrap();
+                }
+            }));
+            Ok(())
+        }
+
+        async fn shutdown(&self) -> rustscale_ipnext::ExtensionResult {
+            self.shutdown.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let registry = Arc::new(rustscale_ipnext::ExtensionRegistry::new());
+    let factory_release = Arc::clone(&release);
+    let factory_shutdown = Arc::clone(&shutdown);
+    registry
+        .register(rustscale_ipnext::Definition::new(
+            "blocked-terminal-publication",
+            move |_| {
+                Ok(Arc::new(BlockingPublication {
+                    entered: entered_tx.clone(),
+                    release: Arc::clone(&factory_release),
+                    shutdown: Arc::clone(&factory_shutdown),
+                }))
+            },
+        ))
+        .unwrap();
+    let server = Server::builder()
+        .extension_registry(registry)
+        .build()
+        .unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime
+        .block_on(server.extension_host.as_ref().unwrap().start())
+        .unwrap();
+    let publisher = server.extension_host().unwrap();
+    let publication = std::thread::spawn(move || {
+        publisher
+            .publish_backend_state(rustscale_ipn::State::Running)
+            .unwrap();
+    });
+    entered_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("publication callback did not block");
+
+    let started = std::time::Instant::now();
+    drop(runtime);
+    drop(server);
+    assert!(started.elapsed() < std::time::Duration::from_millis(200));
+
+    let (lock, changed) = &*release;
+    *lock.lock().unwrap() = true;
+    changed.notify_all();
+    publication.join().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !shutdown.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(shutdown.load(Ordering::SeqCst));
+}
+
 #[tokio::test]
 async fn dropped_startup_transaction_rolls_back_owned_resources() {
     let cancel = Arc::new(CancelToken::new());

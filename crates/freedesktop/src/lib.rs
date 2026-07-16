@@ -8,6 +8,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod systemd_user;
+
 use std::ffi::OsString;
 use std::process::{Command, Stdio};
 use std::time::Duration;

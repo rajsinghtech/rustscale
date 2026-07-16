@@ -1,8 +1,9 @@
 use std::{
     collections::BTreeMap,
+    panic::{catch_unwind, AssertUnwindSafe},
     sync::{
         atomic::{AtomicU64, Ordering},
-        mpsc::{self, SyncSender, TrySendError},
+        mpsc::{self, RecvTimeoutError, SyncSender, TrySendError},
         Arc, Mutex, RwLock, Weak,
     },
     thread,
@@ -13,8 +14,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     well_known_definitions, PolicyError, PolicyErrorKind, PolicyKey, PolicyProvider, PolicyScope,
-    PolicyValue, PreferenceOption, ProviderSubscription, RawValue, SettingDefinition, ValueType,
-    Visibility,
+    PolicyValue, PreferenceOption, ProviderSubscription, ProviderValues, RawValue,
+    SettingDefinition, ValueType, Visibility,
 };
 
 /// The source and management scope of an effective setting.
@@ -145,6 +146,7 @@ struct SourceEntry {
     scope: PolicyScope,
     precedence: ProviderPrecedence,
     provider: Arc<dyn PolicyProvider>,
+    cached_values: Option<ProviderValues>,
     _subscription: Option<Box<dyn ProviderSubscription>>,
 }
 
@@ -155,6 +157,7 @@ struct ReadSource {
     scope: PolicyScope,
     precedence: ProviderPrecedence,
     provider: Arc<dyn PolicyProvider>,
+    cached_values: Option<ProviderValues>,
 }
 
 type ChangeCallback = Arc<dyn Fn(PolicyChange) + Send + Sync>;
@@ -170,6 +173,9 @@ struct EngineInner {
     next_callback: AtomicU64,
     notification_tx: SyncSender<()>,
     last_reload_error: RwLock<Option<PolicyError>>,
+    provider_errors: RwLock<BTreeMap<ProviderId, PolicyError>>,
+    reload_attempts: AtomicU64,
+    callback_panics: AtomicU64,
 }
 
 /// Concurrent effective-policy engine.
@@ -213,17 +219,41 @@ impl PolicyEngine {
             next_callback: AtomicU64::new(0),
             notification_tx,
             last_reload_error: RwLock::new(None),
+            provider_errors: RwLock::new(BTreeMap::new()),
+            reload_attempts: AtomicU64::new(0),
+            callback_panics: AtomicU64::new(0),
         });
         let weak = Arc::downgrade(&inner);
         thread::Builder::new()
             .name("syspolicy-reload".into())
             .spawn(move || {
+                const INITIAL_RETRY: Duration = Duration::from_millis(10);
+                const MAX_RETRY: Duration = Duration::from_secs(1);
                 while notification_rx.recv().is_ok() {
                     while notification_rx.try_recv().is_ok() {}
-                    let Some(inner) = weak.upgrade() else {
-                        break;
-                    };
-                    let _ = PolicyEngine { inner }.reload();
+                    let mut retry = INITIAL_RETRY;
+                    loop {
+                        let Some(inner) = weak.upgrade() else {
+                            return;
+                        };
+                        let result = PolicyEngine { inner }.reload();
+                        if result.is_ok() {
+                            break;
+                        }
+                        // Keep the observation pending. A new observation
+                        // coalesces into this retry loop and resets backoff;
+                        // disconnect/cancellation exits without spinning.
+                        match notification_rx.recv_timeout(retry) {
+                            Ok(()) => {
+                                while notification_rx.try_recv().is_ok() {}
+                                retry = INITIAL_RETRY;
+                            }
+                            Err(RecvTimeoutError::Timeout) => {
+                                retry = retry.saturating_mul(2).min(MAX_RETRY);
+                            }
+                            Err(RecvTimeoutError::Disconnected) => return,
+                        }
+                    }
                 }
             })
             .map_err(|_| PolicyError::new(PolicyErrorKind::Provider))?;
@@ -275,6 +305,7 @@ impl PolicyEngine {
                 scope,
                 precedence,
                 provider,
+                cached_values: None,
                 _subscription: subscription,
             });
         match self.refresh_locked(false) {
@@ -284,7 +315,12 @@ impl PolicyEngine {
                 Ok(id)
             }
             Err(error) => {
-                let removed = self.take_source(id);
+                let removed = self.take_source(id).map(|(_, source)| source);
+                self.inner
+                    .provider_errors
+                    .write()
+                    .expect("policy provider error lock poisoned")
+                    .remove(&id);
                 drop(reload_guard);
                 drop(removed);
                 Err(error)
@@ -293,36 +329,51 @@ impl PolicyEngine {
     }
 
     /// Unregisters a provider and transactionally removes its effective items.
-    /// Remaining provider-wide failures are skipped so a removed provider can
-    /// never survive as a ghost in the current snapshot.
+    /// A failing remaining provider contributes its last successful values and
+    /// leaves a diagnostic rather than disappearing from effective policy.
     pub fn remove_provider(&self, id: ProviderId) -> Result<(), PolicyError> {
         let reload_guard = self
             .inner
             .reload
             .lock()
             .expect("policy reload lock poisoned");
-        let Some(removed) = self.take_source(id) else {
+        let Some((index, removed)) = self.take_source(id) else {
             drop(reload_guard);
             return Ok(());
         };
-        let result = self.refresh_locked(true);
+        let (_, change) = match self.refresh_locked(true) {
+            Ok(result) => result,
+            Err(error) => {
+                self.inner
+                    .sources
+                    .write()
+                    .expect("policy sources lock poisoned")
+                    .insert(index, removed);
+                drop(reload_guard);
+                return Err(error);
+            }
+        };
         drop(reload_guard);
         // Provider subscriptions may call back while being dropped. Never drop
         // them while either the source-list or reload mutex is held.
         drop(removed);
-        let (_, change) = result?;
+        self.inner
+            .provider_errors
+            .write()
+            .expect("policy provider error lock poisoned")
+            .remove(&id);
         self.invoke_change(change);
         Ok(())
     }
 
-    fn take_source(&self, id: ProviderId) -> Option<SourceEntry> {
+    fn take_source(&self, id: ProviderId) -> Option<(usize, SourceEntry)> {
         let mut sources = self
             .inner
             .sources
             .write()
             .expect("policy sources lock poisoned");
         let index = sources.iter().position(|source| source.id == id)?;
-        Some(sources.remove(index))
+        Some((index, sources.remove(index)))
     }
 
     /// Returns the current immutable snapshot without provider I/O.
@@ -359,6 +410,7 @@ impl PolicyEngine {
         &self,
         recover_provider_errors: bool,
     ) -> Result<(Arc<Snapshot>, Option<PolicyChange>), PolicyError> {
+        self.inner.reload_attempts.fetch_add(1, Ordering::Relaxed);
         if recover_provider_errors {
             *self
                 .inner
@@ -378,6 +430,7 @@ impl PolicyEngine {
                 scope: source.scope.clone(),
                 precedence: source.precedence,
                 provider: source.provider.clone(),
+                cached_values: source.cached_values.clone(),
             })
             .filter(|source| source.scope.contains(&self.inner.scope))
             .collect();
@@ -427,17 +480,44 @@ impl PolicyEngine {
                 .collect::<Vec<_>>()
         });
 
-        let mut settings = BTreeMap::new();
+        {
+            let mut diagnostics = self
+                .inner
+                .provider_errors
+                .write()
+                .expect("policy provider error lock poisoned");
+            for (source, result) in sources.iter().zip(&loaded) {
+                match result {
+                    Ok(_) => {
+                        diagnostics.remove(&source.id);
+                    }
+                    Err(error) => {
+                        diagnostics.insert(source.id, error.clone());
+                    }
+                }
+            }
+        }
+
+        let mut first_error = None;
+        let mut staged_caches = Vec::new();
+        let mut effective_values = Vec::with_capacity(sources.len());
         for (source, values) in sources.iter().zip(loaded) {
-            let values = match values {
-                Ok(values) => values,
+            match values {
+                Ok(values) => {
+                    staged_caches.push((source.id, values.clone()));
+                    effective_values.push(values);
+                }
                 Err(error) if recover_provider_errors => {
-                    *self
-                        .inner
-                        .last_reload_error
-                        .write()
-                        .expect("policy error lock poisoned") = Some(error);
-                    continue;
+                    let Some(cached) = source.cached_values.clone() else {
+                        *self
+                            .inner
+                            .last_reload_error
+                            .write()
+                            .expect("policy error lock poisoned") = Some(error.clone());
+                        return Err(error);
+                    };
+                    first_error.get_or_insert(error);
+                    effective_values.push(cached);
                 }
                 Err(error) => {
                     *self
@@ -447,7 +527,11 @@ impl PolicyEngine {
                         .expect("policy error lock poisoned") = Some(error.clone());
                     return Err(error);
                 }
-            };
+            }
+        }
+
+        let mut settings = BTreeMap::new();
+        for (source, values) in sources.iter().zip(effective_values) {
             let origin = Origin {
                 name: source.name.clone(),
                 scope: source.scope.clone(),
@@ -477,12 +561,26 @@ impl PolicyEngine {
             }
         }
 
-        if !recover_provider_errors {
-            *self
+        {
+            let mut entries = self
                 .inner
-                .last_reload_error
+                .sources
                 .write()
-                .expect("policy error lock poisoned") = None;
+                .expect("policy sources lock poisoned");
+            for (id, values) in staged_caches {
+                if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
+                    entry.cached_values = Some(values);
+                }
+            }
+        }
+        let retry_failed_provider = first_error.is_some();
+        *self
+            .inner
+            .last_reload_error
+            .write()
+            .expect("policy error lock poisoned") = first_error;
+        if retry_failed_provider {
+            let _ = self.inner.notification_tx.try_send(());
         }
         let old = self.snapshot();
         let new = Arc::new(Snapshot {
@@ -515,8 +613,30 @@ impl PolicyEngine {
             .cloned()
             .collect();
         for callback in callbacks {
-            callback(change.clone());
+            if catch_unwind(AssertUnwindSafe(|| callback(change.clone()))).is_err() {
+                self.inner.callback_panics.fetch_add(1, Ordering::Relaxed);
+            }
         }
+    }
+
+    /// Returns the number of provider refresh attempts, including failed ones.
+    pub fn reload_attempt_count(&self) -> u64 {
+        self.inner.reload_attempts.load(Ordering::Relaxed)
+    }
+
+    /// Returns the number of isolated change-callback panics.
+    pub fn callback_panic_count(&self) -> u64 {
+        self.inner.callback_panics.load(Ordering::Relaxed)
+    }
+
+    /// Returns the current provider-wide diagnostic for `id`, if any.
+    pub fn provider_error(&self, id: ProviderId) -> Option<PolicyError> {
+        self.inner
+            .provider_errors
+            .read()
+            .expect("policy provider error lock poisoned")
+            .get(&id)
+            .cloned()
     }
 
     /// Returns the last provider-wide reload diagnostic, if any.

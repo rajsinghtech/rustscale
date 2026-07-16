@@ -258,12 +258,24 @@ impl TaildropManager {
         &self,
         timeout: std::time::Duration,
     ) -> Result<Vec<WaitingFile>, TaildropError> {
-        let files = self.waiting_files()?;
-        if !files.is_empty() {
-            return Ok(files);
-        }
-        let _ = tokio::time::timeout(timeout, self.file_arrived.notified()).await;
-        self.waiting_files()
+        let wait = async {
+            loop {
+                // `Notify::notify_waiters` does not retain a permit. Enable
+                // the waiter before scanning so a file committed immediately
+                // before the scan cannot be missed.
+                let notified = self.file_arrived.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                let files = self.waiting_files()?;
+                if !files.is_empty() {
+                    return Ok(files);
+                }
+                notified.await;
+            }
+        };
+        tokio::time::timeout(timeout, wait)
+            .await
+            .unwrap_or_else(|_| self.waiting_files())
     }
 
     /// Get a handle to the file-arrived notify (for the long-poll endpoint).

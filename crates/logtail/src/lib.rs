@@ -97,6 +97,7 @@ struct LogTailInner {
     proc_seq: Mutex<u64>,
     flush_notify: Notify,
     enabled: AtomicBool,
+    shutting_down: AtomicBool,
     environment_disabled: bool,
     drop_count: AtomicU64,
     metrics: Metrics,
@@ -131,6 +132,7 @@ impl LogTail {
                 proc_id: proc_id(),
                 proc_seq: Mutex::new(0),
                 flush_notify: Notify::new(),
+                shutting_down: AtomicBool::new(false),
                 drop_count: AtomicU64::new(0),
                 metrics: Metrics::default(),
                 shutdown_tx: Mutex::new(None),
@@ -168,7 +170,7 @@ impl LogTail {
     }
 
     fn write_entry(&self, entry: LogEntry) {
-        if self.disabled() {
+        if self.disabled() || self.inner.shutting_down.load(Ordering::Acquire) {
             return;
         }
         let mut buf = self.inner.buffer.lock().unwrap();
@@ -228,6 +230,7 @@ impl LogTail {
     }
 
     pub async fn shutdown(&self) {
+        self.inner.shutting_down.store(true, Ordering::Release);
         let tx_opt = self.inner.shutdown_tx.lock().unwrap().take();
         if let Some(tx) = tx_opt {
             let _ = tx.send(());
@@ -283,6 +286,7 @@ pub struct UploadHandle {
 
 impl UploadHandle {
     pub async fn shutdown(self) {
+        self.inner.shutting_down.store(true, Ordering::Release);
         let tx_opt = self.inner.shutdown_tx.lock().unwrap().take();
         if let Some(tx) = tx_opt {
             let _ = tx.send(());
@@ -296,6 +300,7 @@ impl UploadHandle {
 
 impl Drop for UploadHandle {
     fn drop(&mut self) {
+        self.inner.shutting_down.store(true, Ordering::Release);
         if let Some(tx) = self.inner.shutdown_tx.lock().unwrap().take() {
             let _ = tx.send(());
         }
@@ -316,8 +321,22 @@ fn upload_url_for(config: &Config) -> String {
     url
 }
 
-fn drain_buffer(buffer: &Mutex<VecDeque<LogEntry>>) -> Vec<LogEntry> {
-    buffer.lock().unwrap().drain(..).collect()
+fn drain_buffer(buffer: &Mutex<VecDeque<LogEntry>>, max_len: usize) -> Vec<LogEntry> {
+    let mut buffer = buffer.lock().unwrap();
+    let mut entries = Vec::new();
+    // Account for '[' and ']'. Keep the first entry even if it alone exceeds
+    // the configured limit, matching the prior serialization behavior.
+    let mut encoded_len = 2;
+    while let Some(entry) = buffer.front() {
+        let entry_len = serde_json::to_vec(entry).map_or(0, |entry| entry.len());
+        let separator = usize::from(!entries.is_empty());
+        if !entries.is_empty() && encoded_len + separator + entry_len > max_len {
+            break;
+        }
+        encoded_len += separator + entry_len;
+        entries.push(buffer.pop_front().expect("front checked"));
+    }
+    entries
 }
 
 fn maybe_compress(body: &[u8], compress_logs: bool) -> (Vec<u8>, Option<usize>) {
@@ -341,20 +360,37 @@ async fn upload_loop(
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
 
+    let max_len = if inner.config.max_upload_size > 0 {
+        inner.config.max_upload_size
+    } else {
+        MAX_UPLOAD_SIZE
+    };
+    let mut shutdown_requested = false;
+
     loop {
-        let entries = drain_buffer(&inner.buffer);
+        let entries = drain_buffer(&inner.buffer, max_len);
         if entries.is_empty() {
+            if shutdown_requested {
+                break;
+            }
+            // `notify_waiters` intentionally does not save a permit. Register
+            // first, then recheck the queue, so a write in this gap is not
+            // stranded until another write happens.
+            let notified = inner.flush_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if !inner.buffer.lock().unwrap().is_empty() {
+                continue;
+            }
             tokio::select! {
-                () = inner.flush_notify.notified() => continue,
-                _ = &mut shutdown_rx => break,
+                () = &mut notified => continue,
+                _ = &mut shutdown_rx => {
+                    shutdown_requested = true;
+                    continue;
+                }
             }
         }
 
-        let max_len = if inner.config.max_upload_size > 0 {
-            inner.config.max_upload_size
-        } else {
-            MAX_UPLOAD_SIZE
-        };
         let body = serialize_bounded(&entries, max_len);
         let (body, origlen) = maybe_compress(&body, inner.config.compress_logs);
 
@@ -362,7 +398,7 @@ async fn upload_loop(
         let mut failures: u32 = 0;
         let mut first_failure: Option<Instant> = None;
 
-        loop {
+        'retry: loop {
             inner.metrics.upload_calls.fetch_add(1, Ordering::Relaxed);
             match upload_single(&client, &inner.config, &body, origlen).await {
                 Ok(n) => {
@@ -391,16 +427,39 @@ async fn upload_loop(
                         Duration::from_secs(30 + (rand::random::<u64>() % 31))
                     };
 
-                    tokio::select! {
-                        () = tokio::time::sleep(delay) => {}
-                        _ = &mut shutdown_rx => break,
+                    let interrupted = tokio::select! {
+                        () = tokio::time::sleep(delay) => false,
+                        _ = &mut shutdown_rx => {
+                            // Preserve the failed batch for callers that
+                            // inspect/restart the logger; shutdown must stay
+                            // bounded rather than retrying indefinitely.
+                            let mut buffer = inner.buffer.lock().unwrap();
+                            for entry in entries.iter().rev() {
+                                buffer.push_front(entry.clone());
+                            }
+                            shutdown_requested = true;
+                            true
+                        }
+                    };
+                    if interrupted {
+                        break 'retry;
                     }
                 }
             }
         }
 
+        if shutdown_requested {
+            break;
+        }
+
         match shutdown_rx.try_recv() {
-            Ok(()) | Err(oneshot::error::TryRecvError::Closed) => break,
+            Ok(()) | Err(oneshot::error::TryRecvError::Closed) => {
+                // No new writes are accepted after shutdown is requested.
+                // Continue until every already-buffered bounded batch has had
+                // its normal upload attempt, rather than dropping a batch
+                // appended while an earlier upload was in flight.
+                shutdown_requested = true;
+            }
             Err(oneshot::error::TryRecvError::Empty) => {}
         }
     }
@@ -634,6 +693,31 @@ mod tests {
         }
         assert_eq!(lt.buffered_count(), MAX_BUFFER_ENTRIES);
         assert_eq!(lt.dropped_count(), 10);
+    }
+
+    #[test]
+    fn bounded_drain_keeps_entries_for_later_uploads() {
+        let buffer = Mutex::new(VecDeque::from([
+            LogEntry {
+                logtail: None,
+                text: "first".into(),
+                v: 0,
+            },
+            LogEntry {
+                logtail: None,
+                text: "second".into(),
+                v: 0,
+            },
+        ]));
+        let first_len = serde_json::to_vec(buffer.lock().unwrap().front().unwrap())
+            .unwrap()
+            .len();
+        let batch = drain_buffer(&buffer, first_len + 2);
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].text, "first");
+        let remaining = buffer.lock().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].text, "second");
     }
 
     #[tokio::test]

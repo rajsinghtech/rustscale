@@ -434,6 +434,23 @@ impl Netstack {
         self.tx_queue.lock().ok()?.pop_front()
     }
 
+    /// Whether outbound packets remain after a bounded pump drain.
+    ///
+    /// This is a predicate, not a wakeup mechanism: callers use it to avoid
+    /// sleeping after a `Notify` permit has already been consumed.
+    pub fn has_tx_packets(&self) -> bool {
+        self.tx_queue.lock().is_ok_and(|queue| !queue.is_empty())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn push_tx_for_test(&self, packet: Vec<u8>) {
+        self.tx_queue
+            .lock()
+            .expect("netstack tx queue lock")
+            .push_back(packet);
+        self.tx_notify.notify_one();
+    }
+
     /// Start listening for incoming TCP connections on `port` bound to the
     /// netstack's primary tailnet IPv4 address.
     pub async fn listen(&self, port: u16) -> Result<Listener, NetstackError> {

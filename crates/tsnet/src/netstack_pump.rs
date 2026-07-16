@@ -31,28 +31,48 @@ pub(crate) async fn run_netstack_pump(
             break;
         }
 
-        tokio::select! {
-            () = tx_notify.notified() => {}
-            _ = wg_timer.tick() => {}
-            result = wg_recv.recv() => {
-                if let Some(batch) = result {
-                    handle_inbound_wg_batch(
-                        &magicsock, &wg_tunnels, batch, &netstack, &filter,
-                        &packet_drops, &capture, &peer_map,
-                    ).await;
-
-                    // Preserve the former scheduler-turn burst drain, now in
-                    // receive-batch units. Each batch retains scalar packet
-                    // handling and ordering internally.
-                    while let Ok(more) = wg_recv.try_recv() {
+        // A Notify retains at most one permit. After a bounded outbound
+        // drain, more than one batch can remain even though its notification
+        // was consumed, so do not sleep while the queue is still non-empty.
+        if netstack.has_tx_packets() {
+            if let Ok(batch) = wg_recv.try_recv() {
+                handle_inbound_wg_batch(
+                    &magicsock,
+                    &wg_tunnels,
+                    batch,
+                    &netstack,
+                    &filter,
+                    &packet_drops,
+                    &capture,
+                    &peer_map,
+                )
+                .await;
+            }
+            tokio::task::yield_now().await;
+        } else {
+            tokio::select! {
+                () = tx_notify.notified() => {}
+                _ = wg_timer.tick() => {}
+                result = wg_recv.recv() => {
+                    if let Some(batch) = result {
                         handle_inbound_wg_batch(
-                            &magicsock, &wg_tunnels, more, &netstack, &filter,
+                            &magicsock, &wg_tunnels, batch, &netstack, &filter,
                             &packet_drops, &capture, &peer_map,
                         ).await;
+
+                        // Preserve the former scheduler-turn burst drain, now in
+                        // receive-batch units. Each batch retains scalar packet
+                        // handling and ordering internally.
+                        while let Ok(more) = wg_recv.try_recv() {
+                            handle_inbound_wg_batch(
+                                &magicsock, &wg_tunnels, more, &netstack, &filter,
+                                &packet_drops, &capture, &peer_map,
+                            ).await;
+                        }
+                    } else {
+                        log::warn!("tsnet: magicsock wg channel closed");
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     }
-                } else {
-                    log::warn!("tsnet: magicsock wg channel closed");
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
             }
         }

@@ -115,7 +115,10 @@ struct LoggerInner {
     /// captured clone and never touches this mutex.
     counter_tx: Mutex<mpsc::UnboundedSender<CountEvent>>,
     state: Mutex<LoggerState>,
-    shutdown: Notify,
+    /// Shutdown signal for the currently running generation. It is replaced
+    /// on every start so a retained Notify permit from an old run cannot stop
+    /// a later one.
+    shutdown: std::sync::Mutex<Option<Arc<Notify>>>,
 }
 
 /// Network flow logger. Mirrors Go's `netlog.Logger`.
@@ -146,7 +149,7 @@ impl Logger {
             inner: Arc::new(LoggerInner {
                 counter_tx: Mutex::new(tx),
                 state: Mutex::new(LoggerState::default()),
-                shutdown: Notify::new(),
+                shutdown: std::sync::Mutex::new(None),
             }),
             handle: Mutex::new(None),
         }
@@ -179,16 +182,30 @@ impl Logger {
             state.logtail = Some(Arc::new(logtail));
         }
 
+        // Each worker owns a fresh stop signal. `Notify::notify_one` can
+        // retain one permit, so sharing it across start generations would let
+        // an old stop request immediately stop a new worker.
+        let shutdown = Arc::new(Notify::new());
+        *self.inner.shutdown.lock().expect("netlog shutdown lock") = Some(shutdown.clone());
+
         // Spawn the aggregation + upload task.
         let inner = Arc::clone(&self.inner);
-        let join = tokio::spawn(aggregation_task(inner, rx));
+        let join = tokio::spawn(aggregation_task(inner, rx, shutdown));
         *handle_guard = Some(join);
         Ok(())
     }
 
     /// Request shutdown without relinquishing the retained worker handle.
     pub fn request_stop(&self) {
-        self.inner.shutdown.notify_one();
+        if let Some(shutdown) = self
+            .inner
+            .shutdown
+            .lock()
+            .expect("netlog shutdown lock")
+            .clone()
+        {
+            shutdown.notify_one();
+        }
     }
 
     /// Stop the logger, flush pending records, and wait for the
@@ -212,6 +229,7 @@ impl Logger {
         state.source = None;
         state.logtail = None;
         handle_guard.take();
+        *self.inner.shutdown.lock().expect("netlog shutdown lock") = None;
         Ok(())
     }
 
@@ -270,7 +288,11 @@ impl Default for Logger {
 /// flushes every `POLL_PERIOD` (5s) or when the record would exceed
 /// `MAX_LOG_SIZE`. On shutdown, does a final flush.
 #[allow(clippy::single_match, clippy::ignored_unit_patterns)]
-async fn aggregation_task(inner: Arc<LoggerInner>, mut rx: mpsc::UnboundedReceiver<CountEvent>) {
+async fn aggregation_task(
+    inner: Arc<LoggerInner>,
+    mut rx: mpsc::UnboundedReceiver<CountEvent>,
+    shutdown: Arc<Notify>,
+) {
     let mut record = Record {
         self_node: None,
         start: chrono::Utc::now(),
@@ -285,7 +307,7 @@ async fn aggregation_task(inner: Arc<LoggerInner>, mut rx: mpsc::UnboundedReceiv
     loop {
         tokio::select! {
             biased; // check shutdown first
-            _ = inner.shutdown.notified() => {
+            _ = shutdown.notified() => {
                 // Drain callbacks that completed before shutdown so the final
                 // record is deterministic even though hot-path accounting is
                 // queued asynchronously.

@@ -155,7 +155,7 @@ pub(crate) async fn spawn_link_monitor(
         }
     }
 
-    let handle = monitor.start();
+    let handle = monitor.start().ok()?;
     handle.register_owned_change_callback(move |delta| {
         let magicsock = magicsock.clone();
         let cancel = cancel.clone();

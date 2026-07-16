@@ -185,7 +185,13 @@ impl Monitor {
     /// Returns a [`MonitorHandle`] that stops the monitor when dropped.
     /// Register callbacks via
     /// [`MonitorHandle::register_change_callback`].
-    pub fn start(self) -> MonitorHandle {
+    pub fn start(self) -> Result<MonitorHandle, NetmonError> {
+        tokio::runtime::Handle::try_current().map_err(|_| {
+            NetmonError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "network monitor requires an entered Tokio runtime",
+            ))
+        })?;
         let shared = Arc::new(MonitorShared {
             current: RwLock::new(self.initial_state),
             callbacks: RwLock::new(BTreeMap::new()),
@@ -306,13 +312,13 @@ impl Monitor {
 
         crate::os::spawn_os_source(signal_tx, stopped.clone(), self.poll_interval);
 
-        MonitorHandle {
+        Ok(MonitorHandle {
             shared,
             shutdown,
             stopped,
             debounce_task: Some(debounce_task),
             callback_tasks,
-        }
+        })
     }
 }
 

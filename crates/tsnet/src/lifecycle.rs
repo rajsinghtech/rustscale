@@ -1244,7 +1244,7 @@ impl Server {
         .await;
 
         // Userspace netstack bound to our tailnet IPv4.
-        let netstack = Arc::new(Netstack::new(b.our_v4, DEFAULT_MTU));
+        let netstack = Arc::new(Netstack::new(b.our_v4, DEFAULT_MTU)?);
 
         // Periodic endpoint update (Bug 4): pushes a non-streaming
         // MapRequest with OmitPeers=true every 5 minutes so the control
@@ -2940,7 +2940,7 @@ impl Server {
             Severity::High,
             "control connection lost: no map activity for over 3 minutes",
             std::time::Duration::from_mins(3),
-        );
+        )?;
         let mut bootstrap_rollback = BootstrapRollback::new(
             Arc::clone(&self.bootstrap_supervisor),
             health_watchdog.clone(),

@@ -2695,7 +2695,7 @@ async fn handle_icmp_ping<W: AsyncWrite + Unpin>(
     state: &Arc<LocalApiState>,
 ) -> Result<(), std::io::Error> {
     let _ = state;
-    let Some(mut pinger) = rustscale_netcheck::icmp::Pinger::new_v4() else {
+    let Ok(Some(mut pinger)) = rustscale_netcheck::icmp::Pinger::new_v4() else {
         let body = serde_json::json!({
             "error": "ICMP not available (need root or ping_group_range)"
         });

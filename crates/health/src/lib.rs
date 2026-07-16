@@ -715,7 +715,27 @@ impl Watchdog {
         severity: Severity,
         warn_text: impl Into<String>,
         interval: Duration,
-    ) -> Self {
+    ) -> std::io::Result<Self> {
+        let handle = tokio::runtime::Handle::try_current().map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "health watchdog requires an entered Tokio runtime",
+            )
+        })?;
+        Self::new_with_handle(handle, tracker, id, title, severity, warn_text, interval)
+    }
+
+    /// Create and start a watchdog on an explicit Tokio runtime handle.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_handle(
+        handle: tokio::runtime::Handle,
+        tracker: Tracker,
+        id: &str,
+        title: &str,
+        severity: Severity,
+        warn_text: impl Into<String>,
+        interval: Duration,
+    ) -> std::io::Result<Self> {
         tracker.register(Warnable {
             id: id.into(),
             severity,
@@ -734,7 +754,7 @@ impl Watchdog {
         let chrono_interval =
             chrono::Duration::from_std(interval).unwrap_or(chrono::Duration::seconds(180));
 
-        let task = tokio::spawn(async move {
+        let task = handle.spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_millis(250));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
@@ -750,7 +770,7 @@ impl Watchdog {
         });
 
         let abort = task.abort_handle();
-        Self {
+        Ok(Self {
             tracker,
             id: id.to_string(),
             last_fed,
@@ -758,7 +778,7 @@ impl Watchdog {
             owners: Arc::new(()),
             task: Arc::new(tokio::sync::Mutex::new(Some(task))),
             abort,
-        }
+        })
     }
 
     /// Reset the watchdog timer and clear any active warning for this warnable.
@@ -797,6 +817,25 @@ impl Drop for Watchdog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn watchdog_without_runtime_is_typed_error() {
+        let result = std::panic::catch_unwind(|| {
+            Watchdog::new(
+                Tracker::new(),
+                "no-runtime",
+                "No runtime",
+                Severity::Low,
+                "stale",
+                Duration::ZERO,
+            )
+        });
+        let error = match result.expect("must not panic") {
+            Ok(_) => panic!("runtime is required"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::NotConnected);
+    }
 
     #[test]
     fn set_and_clear() {
@@ -865,7 +904,8 @@ mod tests {
             Severity::Medium,
             "stale",
             Duration::from_millis(300),
-        );
+        )
+        .unwrap();
         // Initially healthy.
         assert!(!t.is_unhealthy("test-watchdog"));
         // Wait past the interval without feeding (250ms poll → needs >500ms).
@@ -892,7 +932,8 @@ mod tests {
                 Severity::Low,
                 "stale",
                 Duration::from_millis(300),
-            );
+            )
+            .unwrap();
             assert!(!t.is_unhealthy("ephemeral-wd"));
         }
         // After drop the task should stop; even past the interval the
@@ -911,7 +952,8 @@ mod tests {
             Severity::Medium,
             "stale",
             Duration::from_millis(400),
-        );
+        )
+        .unwrap();
         // Before the interval: healthy.
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(!t.is_unhealthy("delayed-wd"));

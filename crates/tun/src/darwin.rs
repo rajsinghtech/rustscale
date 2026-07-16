@@ -39,6 +39,7 @@ impl TunDevice {
     /// Create a utun device. `config.name` is `"utun"` (auto-select a unit) or
     /// `"utunN"` for a specific unit index. Requires root.
     pub fn create(config: &TunConfig) -> Result<Self, TunError> {
+        require_runtime()?;
         // Parse the requested unit index. "utun" -> auto (-1, becomes unit 0).
         let unit: i32 = if config.name == "utun" {
             -1
@@ -56,8 +57,7 @@ impl TunDevice {
         // SAFETY: `fd` is a freshly opened, owned file descriptor that nothing
         // else holds. `from_raw_fd` takes sole ownership.
         let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-        let afd = AsyncFd::new(owned)
-            .map_err(|e| TunError::Create(format!("AsyncFd registration: {e}")))?;
+        let afd = register_async_fd(owned, AsyncFd::new)?;
 
         let name = interface_name(&afd)?;
 
@@ -67,6 +67,27 @@ impl TunDevice {
             mtu: config.mtu,
         })
     }
+}
+
+/// The registration boundary is kept separate from privileged utun setup so
+/// tests can exercise it with an ordinary pipe rather than opening a device.
+fn register_async_fd<F>(owned: OwnedFd, register: F) -> Result<AsyncFd<OwnedFd>, TunError>
+where
+    F: FnOnce(OwnedFd) -> io::Result<AsyncFd<OwnedFd>>,
+{
+    require_runtime()?;
+    register(owned).map_err(|e| TunError::Create(format!("AsyncFd registration: {e}")))
+}
+
+fn require_runtime() -> Result<(), TunError> {
+    tokio::runtime::Handle::try_current()
+        .map(|_| ())
+        .map_err(|_| {
+            TunError::Io(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "TUN creation requires an entered Tokio runtime",
+            ))
+        })
 }
 
 #[async_trait]
@@ -284,6 +305,33 @@ fn strip_packet_in_place(packet: &mut Vec<u8>) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::fd::FromRawFd;
+
+    #[test]
+    fn registration_boundary_without_runtime_returns_an_error() {
+        let mut fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: pipe returned a newly owned descriptor.
+        let owned = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        // SAFETY: the other pipe end is not used by this test.
+        unsafe { libc::close(fds[1]) };
+        let result = std::panic::catch_unwind(|| register_async_fd(owned, AsyncFd::new));
+        let error = result
+            .expect("must not panic")
+            .expect_err("runtime is required");
+        assert!(error.to_string().contains("entered Tokio runtime"));
+    }
+
+    #[tokio::test]
+    async fn registration_boundary_accepts_an_unprivileged_pipe() {
+        let mut fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: pipe returned a newly owned descriptor.
+        let owned = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        // SAFETY: the other pipe end is not used by this test.
+        unsafe { libc::close(fds[1]) };
+        assert!(register_async_fd(owned, AsyncFd::new).is_ok());
+    }
 
     #[test]
     fn strip_packet_compacts_a_valid_frame_in_place() {

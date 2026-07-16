@@ -2130,7 +2130,7 @@ mod tests {
     #[tokio::test]
     async fn netstack_listener_handle_is_real_and_fixed_port_retries() {
         let ip: Ipv4Addr = "100.64.0.55".parse().unwrap();
-        let netstack = Arc::new(Netstack::new(ip, 1280));
+        let netstack = Arc::new(Netstack::new(ip, 1280).expect("test runtime"));
         let spawn = |netstack: Arc<Netstack>| async move {
             spawn_peerapi_netstack(
                 netstack,

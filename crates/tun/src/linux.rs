@@ -142,6 +142,7 @@ impl TunDevice {
     /// Create a tun device. `config.name` is the requested interface name (≤ 15
     /// bytes). Requires root or `CAP_NET_ADMIN`.
     pub fn create(config: &TunConfig) -> Result<Self, TunError> {
+        require_runtime()?;
         let mtu = read_buffer_len(config.mtu)
             .map_err(|e| TunError::Create(format!("invalid MTU {}: {e}", config.mtu)))?;
 
@@ -158,8 +159,7 @@ impl TunDevice {
         // packets admitted by the interface.
         set_interface_mtu(&name, mtu)
             .map_err(|e| TunError::Create(format!("set MTU {mtu} on interface {name}: {e}")))?;
-        let afd = AsyncFd::new(owned)
-            .map_err(|e| TunError::Create(format!("AsyncFd registration: {e}")))?;
+        let afd = register_async_fd(owned, AsyncFd::new)?;
 
         Ok(Self {
             afd,
@@ -170,6 +170,27 @@ impl TunDevice {
             write_op: Mutex::new(WriteScratch::default()),
         })
     }
+}
+
+/// The registration boundary is kept separate from privileged TUN setup so
+/// tests can exercise it with an ordinary pipe rather than opening a device.
+fn register_async_fd<F>(owned: OwnedFd, register: F) -> Result<AsyncFd<OwnedFd>, TunError>
+where
+    F: FnOnce(OwnedFd) -> io::Result<AsyncFd<OwnedFd>>,
+{
+    require_runtime()?;
+    register(owned).map_err(|e| TunError::Create(format!("AsyncFd registration: {e}")))
+}
+
+fn require_runtime() -> Result<(), TunError> {
+    tokio::runtime::Handle::try_current()
+        .map(|_| ())
+        .map_err(|_| {
+            TunError::Io(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "TUN creation requires an entered Tokio runtime",
+            ))
+        })
 }
 
 fn open_configured_tun(requested: &str, vnet_hdr: bool) -> Result<(OwnedFd, String), TunError> {
@@ -707,6 +728,7 @@ fn is_unsupported(error: &TunError) -> bool {
 mod tests {
     use super::*;
     use std::mem::{offset_of, size_of};
+    use std::os::fd::FromRawFd;
 
     #[test]
     fn ifreq_matches_linux_abi_size_and_union_offset() {
@@ -724,6 +746,33 @@ mod tests {
         assert_eq!(size_of::<IfreqData>(), expected_union_size);
         assert_eq!(offset_of!(Ifreq, data), IFNAMSIZ);
         assert_eq!(size_of::<Ifreq>(), expected_ifreq_size);
+    }
+
+    #[test]
+    fn registration_boundary_accepts_an_unprivileged_pipe() {
+        let mut fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: pipe returned a newly owned descriptor.
+        let owned = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        // SAFETY: the other pipe end is not used by this test.
+        unsafe { libc::close(fds[1]) };
+        let result = std::panic::catch_unwind(|| register_async_fd(owned, |fd| AsyncFd::new(fd)));
+        let error = result
+            .expect("must not panic")
+            .expect_err("runtime is required");
+        assert!(error.to_string().contains("entered Tokio runtime"));
+    }
+
+    #[tokio::test]
+    async fn registration_boundary_succeeds_with_an_unprivileged_pipe() {
+        let mut fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: pipe returned a newly owned descriptor.
+        let owned = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        // SAFETY: the other pipe end is not used by this test.
+        unsafe { libc::close(fds[1]) };
+        let registration = register_async_fd(owned, AsyncFd::new);
+        assert!(registration.is_ok());
     }
 
     #[test]

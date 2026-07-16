@@ -274,7 +274,7 @@ async fn test_multi_callback_register_unregister() {
         .unwrap()
         .with_poll_interval(Duration::from_millis(50));
 
-    let mut handle = monitor.start();
+    let mut handle = monitor.start().unwrap();
 
     let calls1 = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let calls2 = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -366,7 +366,7 @@ async fn test_monitor_detects_change_with_fake_provider() {
     let deltas: Arc<Mutex<Vec<super::monitor::ChangeDelta>>> = Arc::new(Mutex::new(Vec::new()));
     let deltas_clone = deltas.clone();
 
-    let mut handle = monitor.start();
+    let mut handle = monitor.start().unwrap();
     let _cb_handle = handle.register_change_callback(move |delta| {
         let d = deltas_clone.clone();
         async move {
@@ -408,7 +408,7 @@ async fn enumeration_failure_is_dispatched_not_silently_skipped() {
     let monitor = Monitor::with_state_provider(provider)
         .unwrap()
         .with_poll_interval(Duration::from_millis(10));
-    let mut handle = monitor.start();
+    let mut handle = monitor.start().unwrap();
     let failed = Arc::new(tokio::sync::Notify::new());
     handle.register_owned_change_callback({
         let failed = failed.clone();
@@ -450,7 +450,7 @@ async fn shutdown_cancels_and_joins_inflight_callbacks() {
     let monitor = Monitor::with_state_provider(provider)
         .unwrap()
         .with_poll_interval(Duration::from_millis(10));
-    let mut handle = monitor.start();
+    let mut handle = monitor.start().unwrap();
     let started = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
     let completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));

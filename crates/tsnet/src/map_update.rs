@@ -573,7 +573,8 @@ pub(crate) fn spawn_map_update_task(
         Severity::Medium,
         "no map response for over 2 minutes",
         std::time::Duration::from_secs(125),
-    );
+    )
+    .expect("map update task is spawned from Tokio runtime");
     let peer_authority = tailnet_lock
         .peer_authority()
         .expect("peer authority runtime attached before map updates start");

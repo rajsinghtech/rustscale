@@ -12,12 +12,16 @@
 //! inode-and-content checks; unvalidated bytes are never sent to daemon-reload.
 
 use std::collections::HashMap;
-use std::io::{self, Read, Write};
+#[cfg(unix)]
+use std::io::Write;
+use std::io::{self, Read};
 #[cfg(unix)]
 use std::os::fd::OwnedFd;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(unix)]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -37,6 +41,7 @@ const MAX_EXECUTABLE_BYTES: usize = 4096;
 const MAX_ARGUMENT_BYTES: usize = 4096;
 const MAX_ARGUMENTS: usize = 64;
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
+#[cfg(unix)]
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 static UNIT_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
 
@@ -253,6 +258,7 @@ fn quote_exec_word(value: &str) -> String {
     output
 }
 
+#[cfg(unix)]
 fn is_managed_unit_filename(name: &str) -> bool {
     name.strip_prefix("rustscale-")
         .and_then(|name| name.strip_suffix(".service"))
@@ -607,6 +613,7 @@ pub struct SystemUserUnitStore {
     config_home: PathBuf,
     #[cfg(unix)]
     config_directory: Arc<OwnedFd>,
+    #[cfg(unix)]
     observed: Arc<Mutex<HashMap<String, (FileIdentity, Vec<u8>)>>>,
     #[cfg(unix)]
     journals: Arc<Mutex<HashMap<String, JournalSnapshot>>>,
@@ -628,6 +635,7 @@ impl SystemUserUnitStore {
             config_home,
             #[cfg(unix)]
             config_directory: Arc::new(config_directory),
+            #[cfg(unix)]
             observed: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(unix)]
             journals: Arc::new(Mutex::new(HashMap::new())),

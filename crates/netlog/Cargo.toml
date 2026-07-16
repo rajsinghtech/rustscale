@@ -10,10 +10,10 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-rustscale-netlogtype = { path = "../netlogtype", version = "0.1.2" }
-rustscale-tailcfg = { path = "../tailcfg", version = "0.1.2" }
-rustscale-tsaddr = { path = "../tsaddr", version = "0.1.2" }
-rustscale-logtail = { path = "../logtail", version = "0.1.2" }
+rustscale-netlogtype = { path = "../netlogtype", version = "0.1.3" }
+rustscale-tailcfg = { path = "../tailcfg", version = "0.1.3" }
+rustscale-tsaddr = { path = "../tsaddr", version = "0.1.3" }
+rustscale-logtail = { path = "../logtail", version = "0.1.3" }
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true }

@@ -21,7 +21,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-22.04
             name: Build, test, clippy (linux)
             check_only: false
           - os: macos-latest
@@ -57,10 +57,10 @@ jobs:
           cargo test -p rustscale-ipn -p rustscale-localclient -p rustscale-tailcfg \
             -p rustscale-key -p rustscale-disco -p rustscale-safesocket --locked
       - name: Format check
-        if: ${{ matrix.os == 'ubuntu-latest' }}
+        if: ${{ matrix.os == 'ubuntu-22.04' }}
         run: cargo fmt --all --check
       - name: Release and installer contract
-        if: ${{ matrix.os == 'ubuntu-latest' }}
+        if: ${{ matrix.os == 'ubuntu-22.04' }}
         run: |
           go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
           shellcheck scripts/*.sh container/*.sh tools/packaging/*.sh
@@ -73,10 +73,10 @@ jobs:
         shell: pwsh
         run: tools/packaging/test-install.ps1
       - name: Dirty-tree guard (tracked files)
-        if: ${{ matrix.os == 'ubuntu-latest' }}
+        if: ${{ matrix.os == 'ubuntu-22.04' }}
         run: git diff --no-ext-diff --name-only --exit-code || (echo "Build/test modified tracked files above."; exit 1)
       - name: Dirty-tree guard (untracked files)
-        if: ${{ matrix.os == 'ubuntu-latest' }}
+        if: ${{ matrix.os == 'ubuntu-22.04' }}
         run: |
           if git ls-files --others --exclude-standard --directory --no-empty-directory --error-unmatch -- ':/*'
           then

@@ -1,12 +1,16 @@
 //! SSH session recording in asciicast v2 format.
 
 use crate::recording_upload::UploadAbort;
-use rustscale_tailcfg::{SSHRecorderFailureAction, StableNodeID, UserID};
+use rustscale_tailcfg::{
+    SSHEventNotifyRequest, SSHEventType, SSHRecorderFailureAction, SSHRecordingAttempt,
+    StableNodeID, UserID,
+};
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_EVENT_DATA: usize = 64 * 1024;
@@ -28,6 +32,113 @@ impl RecordDir {
     }
 }
 
+/// Non-blocking handoff to the authenticated control callback owner.
+pub type RecordingNotifyCallback = Arc<dyn Fn(&str, SSHEventNotifyRequest) + Send + Sync + 'static>;
+
+/// Per-session recording-failure notification state.
+///
+/// Clones share one delivery bit and one recorder-attempt list, so concurrent
+/// writer/result/teardown observations enqueue at most one callback.
+#[derive(Clone)]
+pub struct RecordingFailureNotify {
+    inner: Arc<RecordingFailureNotifyInner>,
+}
+
+struct RecordingFailureNotifyInner {
+    callback: RecordingNotifyCallback,
+    notify_url: String,
+    request: SSHEventNotifyRequest,
+    attempts: Mutex<Vec<SSHRecordingAttempt>>,
+    delivered: AtomicBool,
+}
+
+impl std::fmt::Debug for RecordingFailureNotify {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The URL may carry opaque control-plane authorization material.
+        formatter
+            .debug_struct("RecordingFailureNotify")
+            .field("notify_url", &"<redacted>")
+            .field("request", &"<redacted>")
+            .finish()
+    }
+}
+
+impl RecordingFailureNotify {
+    pub fn new(
+        callback: RecordingNotifyCallback,
+        notify_url: String,
+        request: SSHEventNotifyRequest,
+    ) -> Self {
+        Self {
+            inner: Arc::new(RecordingFailureNotifyInner {
+                callback,
+                notify_url,
+                request,
+                attempts: Mutex::new(Vec::new()),
+                delivered: AtomicBool::new(false),
+            }),
+        }
+    }
+
+    pub(crate) fn set_attempts(&self, attempts: &[SSHRecordingAttempt]) {
+        *self
+            .inner
+            .attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = attempts.to_vec();
+    }
+
+    pub(crate) fn connection_failed(&self, attempts: &[SSHRecordingAttempt], rejected: bool) {
+        self.set_attempts(attempts);
+        self.deliver(if rejected {
+            SSHEventType::SessionRecordingRejected
+        } else {
+            SSHEventType::SessionRecordingFailed
+        });
+    }
+
+    pub(crate) fn upload_failed(&self, failure_message: &str, terminated: bool) {
+        {
+            let mut attempts = self
+                .inner
+                .attempts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(last) = attempts.last_mut() else {
+                // Upstream sends no event when no recorder was attempted.
+                return;
+            };
+            last.FailureMessage = failure_message.to_string();
+        }
+        self.deliver(if terminated {
+            SSHEventType::SessionRecordingTerminated
+        } else {
+            SSHEventType::SessionRecordingFailed
+        });
+    }
+
+    fn deliver(&self, event_type: SSHEventType) {
+        if self
+            .inner
+            .delivered
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let mut request = self.inner.request.clone();
+        request.EventType = event_type;
+        request.RecordingAttempts.clone_from(
+            &self
+                .inner
+                .attempts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        (self.inner.callback)(&self.inner.notify_url, request);
+    }
+}
+
 /// Configuration derived from a matched SSH action.
 #[derive(Clone, Debug, Default)]
 pub struct RecordingConfig {
@@ -35,6 +146,7 @@ pub struct RecordingConfig {
     pub on_failure: Option<SSHRecorderFailureAction>,
     pub local_path: Option<PathBuf>,
     pub fail_open: bool,
+    pub notify: Option<RecordingFailureNotify>,
 }
 
 /// The first line of a recording upload.
@@ -406,6 +518,82 @@ mod tests {
         assert!(content.contains("\"o\",\"hello world\\r\\n\""));
         assert!(!content.contains("aGVsbG8="));
         let _ = std::fs::remove_file(tmp);
+    }
+
+    #[test]
+    fn recording_failure_notify_matches_policy_and_deduplicates() {
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        let callback: RecordingNotifyCallback = {
+            let delivered = Arc::clone(&delivered);
+            Arc::new(move |url, request| {
+                delivered.lock().unwrap().push((url.to_string(), request));
+            })
+        };
+        let notify = RecordingFailureNotify::new(
+            callback,
+            "/machine/ssh/notify?opaque=secret".into(),
+            SSHEventNotifyRequest {
+                ConnectionID: "connection".into(),
+                SSHUser: "alice".into(),
+                LocalUser: "operator".into(),
+                ..Default::default()
+            },
+        );
+        let attempts = vec![SSHRecordingAttempt {
+            Recorder: "100.64.0.8:80".parse().unwrap(),
+            FailureMessage: String::new(),
+        }];
+        notify.set_attempts(&attempts);
+        notify.upload_failed("upload closed", true);
+        notify.upload_failed("duplicate writer failure", true);
+
+        let delivered = delivered.lock().unwrap();
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(
+            delivered[0].1.EventType,
+            SSHEventType::SessionRecordingTerminated
+        );
+        assert_eq!(
+            delivered[0].1.RecordingAttempts[0].FailureMessage,
+            "upload closed"
+        );
+    }
+
+    #[test]
+    fn recording_notify_follows_start_failure_and_fail_open_semantics() {
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        let callback: RecordingNotifyCallback = {
+            let delivered = Arc::clone(&delivered);
+            Arc::new(move |_url, request| delivered.lock().unwrap().push(request))
+        };
+        let make_notify = || {
+            RecordingFailureNotify::new(
+                callback.clone(),
+                "/machine/ssh/notify".into(),
+                SSHEventNotifyRequest::default(),
+            )
+        };
+        let attempts = [SSHRecordingAttempt {
+            Recorder: "100.64.0.9:80".parse().unwrap(),
+            FailureMessage: "unavailable".into(),
+        }];
+
+        // Merely configuring or successfully starting a recorder emits
+        // nothing. A fail-open start failure is nevertheless an upstream
+        // SessionRecordingFailed event.
+        let success = make_notify();
+        success.set_attempts(&attempts);
+        assert!(delivered.lock().unwrap().is_empty());
+        make_notify().connection_failed(&attempts, false);
+        make_notify().connection_failed(&attempts, true);
+
+        let delivered = delivered.lock().unwrap();
+        assert_eq!(delivered.len(), 2);
+        assert_eq!(delivered[0].EventType, SSHEventType::SessionRecordingFailed);
+        assert_eq!(
+            delivered[1].EventType,
+            SSHEventType::SessionRecordingRejected
+        );
     }
 
     #[test]

@@ -15,7 +15,7 @@ use crate::session_handler::{
 use crate::{Session, SshServer, SshServerConfig};
 use russh::server::Server as _;
 use russh::{ChannelMsg, MethodSet};
-use rustscale_key::NodePrivate;
+use rustscale_key::{NodePrivate, NodePublic};
 use rustscale_tailcfg::{
     Node, SSHAction, SSHPolicy, SSHPrincipal, SSHRule, StableNodeID, UserProfile,
 };
@@ -127,6 +127,9 @@ async fn run_pipeline_custom(
         policy,
         state_dir: None,
         dial_fn: None,
+        recording_notify: None,
+        node_key: NodePublic::default(),
+        capability_version: 0,
     };
     let mut server = SshServer::new(config);
     let russh_config = Arc::new(russh::server::Config {
@@ -224,6 +227,9 @@ async fn data_before_start_and_eof_are_drained_as_an_input_half_close() {
         policy: policy_allow_any(),
         state_dir: None,
         dial_fn: None,
+        recording_notify: None,
+        node_key: NodePublic::default(),
+        capability_version: 0,
     };
     let mut server = SshServer::new(config);
     let server_config = server.russh_config();
@@ -329,6 +335,9 @@ async fn local_recording_path_failure_exits_closes_and_removes_channel_state() {
         policy: policy_allow_any(),
         state_dir: Some(blocked_root.clone()),
         dial_fn: None,
+        recording_notify: None,
+        node_key: NodePublic::default(),
+        capability_version: 0,
     };
     let mut server = SshServer::new(config);
     let server_config = server.russh_config();
@@ -389,6 +398,9 @@ async fn dropping_unfinished_session_reports_failure_and_closes_channel() {
         policy: policy_allow_any(),
         state_dir: None,
         dial_fn: None,
+        recording_notify: None,
+        node_key: NodePublic::default(),
+        capability_version: 0,
     };
     let mut server = SshServer::new(config);
     let server_config = server.russh_config();
@@ -444,6 +456,9 @@ async fn stalled_stdin_overflow_does_not_block_other_multiplexed_channel_state()
         policy: Arc::new(move || Some(policy.clone())),
         state_dir: None,
         dial_fn: None,
+        recording_notify: None,
+        node_key: NodePublic::default(),
+        capability_version: 0,
     };
     let mut server = SshServer::new(config);
     let server_config = server.russh_config();
@@ -1948,13 +1963,54 @@ async fn live_policy_revocation_terminates_existing_session() {
             *current_policy.lock().unwrap() = Some(SSHPolicy::default());
         })
     };
+    let recording_events = Arc::new(Mutex::new(Vec::new()));
+    let inject_recorder = {
+        let recording_events = recording_events.clone();
+        move |init: &mut crate::session::SessionInit| {
+            let callback: crate::RecordingNotifyCallback = {
+                let recording_events = recording_events.clone();
+                Arc::new(move |_url, request| recording_events.lock().unwrap().push(request))
+            };
+            let notify = crate::RecordingFailureNotify::new(
+                callback,
+                "/machine/ssh/notify".into(),
+                rustscale_tailcfg::SSHEventNotifyRequest::default(),
+            );
+            notify.set_attempts(&[rustscale_tailcfg::SSHRecordingAttempt {
+                Recorder: "100.64.0.9:80".parse().unwrap(),
+                FailureMessage: String::new(),
+            }]);
+            let header = crate::CastHeader::new(
+                (0, 0),
+                "ignored".into(),
+                std::collections::HashMap::new(),
+                "requested".into(),
+                "mapped".into(),
+                "connection".into(),
+            );
+            init.recorder = Some(
+                crate::SessionRecorder::with_test_writer(Box::new(Vec::<u8>::new()), header, true)
+                    .unwrap(),
+            );
+            init.recording_config = Some(crate::RecordingConfig {
+                recorders: vec!["100.64.0.9:80".parse().unwrap()],
+                on_failure: Some(rustscale_tailcfg::SSHRecorderFailureAction {
+                    NotifyURL: "/machine/ssh/notify".into(),
+                    ..Default::default()
+                }),
+                fail_open: true,
+                notify: Some(notify),
+                ..Default::default()
+            });
+        }
+    };
 
     let (code, output) = run_pipeline_custom(
         "ignored",
         "requested",
         policy,
         Some((resolver.clone(), launcher.clone())),
-        None,
+        Some(&inject_recorder),
         false,
         false,
     )
@@ -1962,6 +2018,10 @@ async fn live_policy_revocation_terminates_existing_session() {
     revoke.await.unwrap();
     assert_eq!(code, 1);
     assert!(String::from_utf8_lossy(&output).contains("Access revoked"));
+    assert!(
+        recording_events.lock().unwrap().is_empty(),
+        "policy revocation is not a recorder failure"
+    );
     assert_eq!(
         &*launcher.control.signals.lock().unwrap(),
         &[libc::SIGTERM, libc::SIGKILL]

@@ -2,13 +2,17 @@
 
 use crate::auth::{eval_ssh_policy, ConnInfo, EvalResult};
 use crate::env::accept_env_name;
-use crate::recording::{default_recording_path, CastHeader, RecordingConfig};
+use crate::recording::{
+    default_recording_path, CastHeader, RecordingConfig, RecordingFailureNotify,
+    RecordingNotifyCallback,
+};
 use crate::recording_upload::DialFn;
 use crate::session::{PeerIdentity, Pty, RevalidateCallback, SessionInit, Window};
 use russh::keys::PrivateKey;
 use russh::server::{Auth, Msg, Server as RusshServer, Session};
 use russh::{Channel, ChannelId, MethodSet};
-use rustscale_tailcfg::{Node, SSHPolicy, UserProfile};
+use rustscale_key::NodePublic;
+use rustscale_tailcfg::{Node, SSHEventNotifyRequest, SSHPolicy, UserProfile};
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -38,6 +42,12 @@ pub struct SshServerConfig {
     pub state_dir: Option<PathBuf>,
     /// Tailnet TCP dialer for recorder nodes.
     pub dial_fn: Option<DialFn>,
+    /// Non-blocking handoff to an authenticated control callback owner.
+    pub recording_notify: Option<RecordingNotifyCallback>,
+    /// Current node identity included in recording-failure events.
+    pub node_key: NodePublic,
+    /// Capability version included in recording-failure events.
+    pub capability_version: i32,
 }
 
 pub struct SshServer {
@@ -249,12 +259,6 @@ impl SshHandler {
                 // policy from an earlier/delegating action.
                 let recorders = action.Recorders.clone();
                 let on_failure = action.OnRecordingFailure.clone();
-                if on_failure
-                    .as_ref()
-                    .is_some_and(|failure| !failure.NotifyURL.is_empty())
-                {
-                    log::warn!("SSH recording NotifyURL is not implemented yet");
-                }
                 // Keep the root only as a local-recording marker here. A
                 // unique path is allocated per SSH session below, including
                 // multiplexed sessions on one connection.
@@ -276,6 +280,9 @@ impl SshHandler {
                             }),
                         on_failure,
                         local_path,
+                        // Session identity and exactly-once state are added
+                        // below when a channel starts.
+                        notify: None,
                     })
                 };
                 Auth::Accept
@@ -351,6 +358,27 @@ impl SshHandler {
 
         let mut recording_config = self.recording_config.clone();
         if let Some(config) = recording_config.as_mut() {
+            if !config.recorders.is_empty() {
+                if let (Some(callback), Some(action)) =
+                    (&self.config.recording_notify, config.on_failure.as_ref())
+                {
+                    if !action.NotifyURL.is_empty() {
+                        config.notify = Some(RecordingFailureNotify::new(
+                            callback.clone(),
+                            action.NotifyURL.clone(),
+                            SSHEventNotifyRequest {
+                                ConnectionID: self.connection_id.clone(),
+                                CapVersion: self.config.capability_version,
+                                NodeKey: self.config.node_key.clone(),
+                                SrcNode: peer.node.ID,
+                                SSHUser: self.ssh_user.clone(),
+                                LocalUser: self.local_user.clone(),
+                                ..Default::default()
+                            },
+                        ));
+                    }
+                }
+            }
             if config.recorders.is_empty() && config.local_path.is_some() {
                 if let Ok(path) = self
                     .config
@@ -762,6 +790,9 @@ mod tests {
             policy,
             state_dir: None,
             dial_fn: None,
+            recording_notify: None,
+            node_key: NodePublic::default(),
+            capability_version: 0,
         };
         let mut server = SshServer::new(config);
         <SshServer as RusshServer>::new_client(&mut server, Some(SocketAddr::new(peer_ip(), 22)))

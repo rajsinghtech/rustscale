@@ -21,7 +21,8 @@ pub use env::{accept_env_pair, filter_env};
 pub use hostkeys::{host_key_from_node_key, host_key_public_string};
 pub use incubator::{Incubator, IncubatorArgs, IncubatorError, SpawnedProcess};
 pub use recording::{
-    default_recording_path, CastHeader, RecordDir, RecordResult, RecordingConfig, SessionRecorder,
+    default_recording_path, CastHeader, RecordDir, RecordResult, RecordingConfig,
+    RecordingFailureNotify, RecordingNotifyCallback, SessionRecorder,
 };
 pub use recording_upload::{connect_to_recorder, BoxedIo, DialFn, RecordingConnection};
 pub use server::{PolicyCallback, SshHandler, SshServer, SshServerConfig, WhoIsCallback};

@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use rustscale_key::NodePublic;
 use serde::{Deserialize, Serialize};
 
 use crate::{deserialize_null_to_default, skip_default, NodeID, StableNodeID};
@@ -125,51 +126,66 @@ pub struct SSHRecorderFailureAction {
 }
 
 /// A single attempt to start recording at a recorder node.
+///
+/// These fields intentionally use Go's exported field names on the wire.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SSHRecordingAttempt {
-    #[serde(rename = "recorder")]
     pub Recorder: SocketAddr,
-    #[serde(
-        rename = "failureMessage",
-        default,
-        skip_serializing_if = "String::is_empty"
-    )]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub FailureMessage: String,
 }
 
 /// The type of SSH recording event reported to control.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
 pub enum SSHEventType {
     #[default]
-    #[serde(rename = "0")]
     Unspecified = 0,
-    #[serde(rename = "1")]
     SessionRecordingRejected = 1,
-    #[serde(rename = "2")]
     SessionRecordingTerminated = 2,
-    #[serde(rename = "3")]
     SessionRecordingFailed = 3,
 }
 
+impl Serialize for SSHEventType {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_u8(*self as u8)
+    }
+}
+
+impl<'de> Deserialize<'de> for SSHEventType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        match u8::deserialize(deserializer)? {
+            0 => Ok(Self::Unspecified),
+            1 => Ok(Self::SessionRecordingRejected),
+            2 => Ok(Self::SessionRecordingTerminated),
+            3 => Ok(Self::SessionRecordingFailed),
+            value => Err(serde::de::Error::custom(format!(
+                "unknown SSH event type {value}"
+            ))),
+        }
+    }
+}
+
 /// SSH recording event payload for the control-plane Noise transport.
+///
+/// Go has no JSON tags on this struct, so its PascalCase field names are part
+/// of the protocol. In particular, `EventType` is a JSON number rather than a
+/// quoted enum name.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SSHEventNotifyRequest {
-    #[serde(rename = "eventType")]
     pub EventType: SSHEventType,
-    #[serde(rename = "connectionID")]
     pub ConnectionID: String,
-    #[serde(rename = "capVersion")]
     pub CapVersion: i32,
-    #[serde(rename = "nodeKey")]
-    pub NodeKey: String,
-    #[serde(rename = "srcNode")]
+    pub NodeKey: NodePublic,
     pub SrcNode: NodeID,
-    #[serde(rename = "sshUser")]
     pub SSHUser: String,
-    #[serde(rename = "localUser")]
     pub LocalUser: String,
-    #[serde(rename = "recordingAttempts")]
     pub RecordingAttempts: Vec<SSHRecordingAttempt>,
 }
 
@@ -243,6 +259,36 @@ mod tests {
         let value = serde_json::to_value(action).unwrap();
         assert_eq!(value["recorders"][0], "100.64.0.8:80");
         assert_eq!(value["recorders"][1], "[fd7a:115c:a1e0::8]:443");
+    }
+
+    #[test]
+    fn ssh_event_notify_matches_go_wire_fixture() {
+        let request = SSHEventNotifyRequest {
+            EventType: SSHEventType::SessionRecordingRejected,
+            ConnectionID: "018f-test-session".into(),
+            CapVersion: 62,
+            NodeKey: NodePublic::from_raw32([0x11; 32]),
+            SrcNode: 1234,
+            SSHUser: "alice".into(),
+            LocalUser: "operator".into(),
+            RecordingAttempts: vec![SSHRecordingAttempt {
+                Recorder: "100.64.0.8:80".parse().unwrap(),
+                FailureMessage: "recorder unavailable".into(),
+            }],
+        };
+        let encoded = serde_json::to_string(&request).unwrap();
+        assert_eq!(
+            encoded,
+            concat!(
+                r#"{"EventType":1,"ConnectionID":"018f-test-session","CapVersion":62,"NodeKey":"nodekey:"#,
+                "1111111111111111111111111111111111111111111111111111111111111111",
+                r#"","SrcNode":1234,"SSHUser":"alice","LocalUser":"operator","RecordingAttempts":[{"Recorder":"100.64.0.8:80","FailureMessage":"recorder unavailable"}]}"#
+            )
+        );
+        assert_eq!(
+            serde_json::from_str::<SSHEventNotifyRequest>(&encoded).unwrap(),
+            request
+        );
     }
 
     #[test]

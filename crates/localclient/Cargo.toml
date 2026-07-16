@@ -10,11 +10,11 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-rustscale-safesocket = { path = "../safesocket", version = "0.1.1" }
-rustscale-ipn = { path = "../ipn", version = "0.1.1" }
-rustscale-tailcfg = { path = "../tailcfg", version = "0.1.1" }
-rustscale-tsnet = { path = "../tsnet", version = "0.1.1" }
-rustscale-ipnstate = { path = "../ipnstate", version = "0.1.1" }
+rustscale-safesocket = { path = "../safesocket", version = "0.1.2" }
+rustscale-ipn = { path = "../ipn", version = "0.1.2" }
+rustscale-tailcfg = { path = "../tailcfg", version = "0.1.2" }
+rustscale-tsnet = { path = "../tsnet", version = "0.1.2" }
+rustscale-ipnstate = { path = "../ipnstate", version = "0.1.2" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
@@ -22,5 +22,5 @@ thiserror.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
-rustscale-tsnet = { path = "../tsnet", version = "0.1.1" }
-rustscale-testcontrol = { path = "../testcontrol", version = "0.1.1" }
+rustscale-tsnet = { path = "../tsnet", version = "0.1.2" }
+rustscale-testcontrol = { path = "../testcontrol", version = "0.1.2" }

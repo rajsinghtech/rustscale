@@ -10,12 +10,12 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-rustscale-deephash = { path = "../deephash", version = "0.1.1" }
-rustscale-flowtrack = { path = "../flowtrack", version = "0.1.1" }
-rustscale-ipset = { path = "../ipset", version = "0.1.1" }
-rustscale-packet = { path = "../packet", version = "0.1.1" }
-rustscale-tailcfg = { path = "../tailcfg", version = "0.1.1" }
+rustscale-deephash = { path = "../deephash", version = "0.1.2" }
+rustscale-flowtrack = { path = "../flowtrack", version = "0.1.2" }
+rustscale-ipset = { path = "../ipset", version = "0.1.2" }
+rustscale-packet = { path = "../packet", version = "0.1.2" }
+rustscale-tailcfg = { path = "../tailcfg", version = "0.1.2" }
 thiserror.workspace = true
 
 [dev-dependencies]
-rustscale-tailcfg = { path = "../tailcfg", version = "0.1.1" }
+rustscale-tailcfg = { path = "../tailcfg", version = "0.1.2" }

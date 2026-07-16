@@ -10,9 +10,9 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-rustscale-deephash = { path = "../deephash", version = "0.1.1" }
-rustscale-neterror = { path = "../neterror", version = "0.1.1" }
-rustscale-tsdial = { path = "../tsdial", version = "0.1.1" }
+rustscale-deephash = { path = "../deephash", version = "0.1.2" }
+rustscale-neterror = { path = "../neterror", version = "0.1.2" }
+rustscale-tsdial = { path = "../tsdial", version = "0.1.2" }
 rustscale-netns.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

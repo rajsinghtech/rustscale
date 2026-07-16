@@ -2999,7 +2999,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     impl DirectBlockFaultRunner {
         fn is_owned_block(args: &[String]) -> bool {
-            args.windows(2).any(|pair| pair == ["protocol", "201"])
+            matches!(args.first().map(String::as_str), Some("-4" | "-6"))
+                && args.windows(2).any(|pair| pair == ["protocol", "201"])
                 && args.windows(2).any(|pair| pair == ["pref", "5200"])
                 && args.iter().any(|arg| arg == "not")
                 && args.iter().any(|arg| arg == "unreachable")

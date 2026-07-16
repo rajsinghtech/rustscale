@@ -62,6 +62,7 @@ for target in \
 done
 
 grep -q 'body_path:.*needs.metadata.outputs.notes' .github/workflows/release.yml
+grep -Fq 'pattern: rustscale-*' .github/workflows/release.yml
 grep -q 'SHA256SUMS' scripts/install.sh
 grep -q 'SHA256SUMS' scripts/install.ps1
 grep -q 'packaging/systemd/rustscaled.service' .github/workflows/release.yml

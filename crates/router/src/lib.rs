@@ -3106,7 +3106,7 @@ mod tests {
         assert!(router.pending_cleanup.is_empty());
         assert!(router.runner.commands[before_set..]
             .iter()
-            .all(|(_, args)| !DirectBlockFaultRunner::is_owned_block(args)));
+            .all(|command| !enables.contains(command)));
 
         let adds_before_close = router
             .runner

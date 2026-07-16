@@ -538,6 +538,8 @@ pub struct LocalApiHandle {
     cancel: Arc<crate::CancelToken>,
     #[cfg(all(test, unix))]
     accepted: Arc<tokio::sync::Notify>,
+    #[cfg(all(test, unix))]
+    child_tasks: Arc<std::sync::atomic::AtomicUsize>,
     pub socket_path: PathBuf,
     unlink_on_drop: bool,
 }
@@ -548,6 +550,11 @@ impl LocalApiHandle {
     #[cfg(all(test, unix))]
     async fn wait_for_accept(&self) {
         self.accepted.notified().await;
+    }
+
+    #[cfg(all(test, unix))]
+    fn child_task_count(&self) -> usize {
+        self.child_tasks.load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub async fn shutdown(mut self) {
@@ -694,9 +701,13 @@ fn spawn_localapi_inner(
     let cancel = Arc::new(crate::CancelToken::new());
     #[cfg(all(test, unix))]
     let accepted = Arc::new(tokio::sync::Notify::new());
+    #[cfg(all(test, unix))]
+    let child_tasks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let task_cancel = Arc::clone(&cancel);
     #[cfg(all(test, unix))]
     let task_accepted = Arc::clone(&accepted);
+    #[cfg(all(test, unix))]
+    let task_child_tasks = Arc::clone(&child_tasks);
     let task = tokio::spawn(async move {
         if let Some(start_rx) = start_rx {
             if start_rx.await.is_err() {
@@ -713,6 +724,8 @@ fn spawn_localapi_inner(
                         task_accepted.notify_one();
                         let peer_identity = peer_identity_from_stream(&stream);
                         let state = state.clone();
+                        #[cfg(all(test, unix))]
+                        task_child_tasks.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                         children.spawn(async move {
                             if let Err(e) = handle_connection(stream, &state, peer_identity).await {
                                 log::warn!("localapi: connection error: {e}");
@@ -721,16 +734,27 @@ fn spawn_localapi_inner(
                     }
                     Err(e) => log::warn!("localapi: accept error: {e}"),
                 },
-                Some(_) = children.join_next(), if !children.is_empty() => {}
+                Some(_) = children.join_next(), if !children.is_empty() => {
+                    #[cfg(all(test, unix))]
+                    task_child_tasks.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                }
             }
         }
-        let drain = async { while children.join_next().await.is_some() {} };
+        let drain = async {
+            while children.join_next().await.is_some() {
+                #[cfg(all(test, unix))]
+                task_child_tasks.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            }
+        };
         if tokio::time::timeout(std::time::Duration::from_secs(1), drain)
             .await
             .is_err()
         {
             children.abort_all();
-            while children.join_next().await.is_some() {}
+            while children.join_next().await.is_some() {
+                #[cfg(all(test, unix))]
+                task_child_tasks.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            }
         }
     });
 
@@ -739,6 +763,8 @@ fn spawn_localapi_inner(
         cancel,
         #[cfg(all(test, unix))]
         accepted,
+        #[cfg(all(test, unix))]
+        child_tasks,
         socket_path: path,
         unlink_on_drop: true,
     })
@@ -811,11 +837,16 @@ pub(crate) async fn read_request<R: AsyncRead + Unpin>(
                     .await
                     .map_err(|e| format!("read body: {e}"))?;
                 if n == 0 {
-                    break;
+                    return Err("connection closed before complete request body".into());
                 }
                 body.extend_from_slice(&tmp[..n]);
             }
-            body.truncate(cl);
+            if body.len() > cl {
+                // LocalAPI serves one request per connection. Reject bytes
+                // beyond the declared body rather than silently consuming a
+                // pipelined request before a streaming handler monitors EOF.
+                return Err("bytes after request body are not supported".into());
+            }
             return parse_request_head(head, body);
         }
         if buf.len() > 256 * 1024 {
@@ -1825,7 +1856,16 @@ pub(crate) async fn dispatch<W: AsyncRead + AsyncWrite + Unpin>(
     match endpoint {
         // --- GET /localapi/v0/status ---
         "status" if method == "GET" => {
-            let st = build_status_json(state).await;
+            let mut st = build_status_json(state).await;
+            if parse_query(&req.query)
+                .get("peers")
+                .is_some_and(|value| value == "false")
+            {
+                if let Some(status) = st.as_object_mut() {
+                    status.remove("Peer");
+                    status.remove("User");
+                }
+            }
             write_json_response(conn, 200, "OK", &st).await?;
         }
 
@@ -2807,7 +2847,7 @@ async fn handle_peerapi_ping<W: AsyncWrite + Unpin>(
 /// - `NotifyInitialPrefs`: includes Prefs in the first message.
 /// - `NotifyInitialStatus`: includes InitialStatus (status JSON) in the
 ///   first message.
-async fn handle_watch_ipn_bus<W: AsyncWrite + Unpin>(
+async fn handle_watch_ipn_bus<W: AsyncRead + AsyncWrite + Unpin>(
     conn: &mut W,
     query: &str,
     state: &Arc<LocalApiState>,
@@ -2851,57 +2891,83 @@ async fn handle_watch_ipn_bus<W: AsyncWrite + Unpin>(
     let has_initial =
         mask & (NOTIFY_INITIAL_STATE | NOTIFY_INITIAL_PREFS | NOTIFY_INITIAL_STATUS) != 0;
 
-    // Write the HTTP response header (streaming, connection-close delimited).
-    let header = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n";
-    conn.write_all(header.as_bytes()).await?;
-    conn.flush().await?;
-
-    if has_initial {
-        // Build initial status if requested.
-        let initial_status = if mask & NOTIFY_INITIAL_STATUS != 0 {
-            Some(build_status_json(state).await)
-        } else {
-            None
-        };
-
-        // Build initial prefs if requested.
-        let initial_prefs = if mask & NOTIFY_INITIAL_PREFS != 0 {
-            Some(serde_json::to_value(&*state.prefs.read().await).unwrap_or_default())
-        } else {
-            None
-        };
-
-        let notify = state.ipn_backend.build_initial_notify(
+    // Build non-state snapshots first, then atomically subscribe and capture
+    // state. A transition can therefore never fall between the initial state
+    // snapshot and bus registration.
+    let initial_status = if mask & NOTIFY_INITIAL_STATUS != 0 {
+        Some(build_status_json(state).await)
+    } else {
+        None
+    };
+    let initial_prefs = if mask & NOTIFY_INITIAL_PREFS != 0 {
+        Some(serde_json::to_value(&*state.prefs.read().await).unwrap_or_default())
+    } else {
+        None
+    };
+    let (mut rx, initial_notify) = if has_initial {
+        let (receiver, notify) = state.ipn_backend.subscribe_with_initial_notify(
             mask,
             &session_id,
             initial_status,
             initial_prefs,
         );
+        (receiver, Some(notify))
+    } else {
+        (state.ipn_backend.bus().subscribe(), None)
+    };
 
+    // Write the HTTP response header (streaming, connection-close delimited).
+    let header = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n";
+    conn.write_all(header.as_bytes()).await?;
+    conn.flush().await?;
+
+    if let Some(notify) = initial_notify {
         let line = serde_json::to_vec(&notify).unwrap_or_default();
         conn.write_all(&line).await?;
         conn.write_all(b"\n").await?;
         conn.flush().await?;
     }
 
-    // Subscribe to the bus and stream subsequent messages.
-    let mut rx = state.ipn_backend.bus().subscribe();
-
+    // `read_request` has consumed exactly the declared request body before
+    // dispatch. A watch client has no post-request protocol bytes, so one
+    // post-body read can only report EOF or a protocol violation. Selecting it
+    // with bus receive unregisters the receiver immediately on disconnect,
+    // without waiting for another notification or spawning a detached task.
+    let mut post_body_probe = [0u8; 1];
     loop {
-        match rx.recv().await {
-            Some(Ok(notify)) => {
-                let line = serde_json::to_vec(&notify).unwrap_or_default();
-                conn.write_all(&line).await?;
-                conn.write_all(b"\n").await?;
-                conn.flush().await?;
-            }
-            Some(Err(_)) => {
-                // Subscriber fell behind (Lagged); skip and continue.
-                continue;
-            }
-            None => {
-                // Bus shut down (all senders dropped). End the stream.
-                break;
+        tokio::select! {
+            biased;
+            read = conn.read(&mut post_body_probe) => match read {
+                Ok(0) => break,
+                Ok(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "unexpected bytes after watch request body",
+                    ));
+                }
+                Err(error) if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::UnexpectedEof
+                ) => break,
+                Err(error) => return Err(error),
+            },
+            message = rx.recv() => match message {
+                Some(Ok(notify)) => {
+                    let line = serde_json::to_vec(&notify).unwrap_or_default();
+                    conn.write_all(&line).await?;
+                    conn.write_all(b"\n").await?;
+                    conn.flush().await?;
+                }
+                Some(Err(_)) => {
+                    // Subscriber fell behind (Lagged); skip and continue.
+                    continue;
+                }
+                None => {
+                    // Bus shut down (all senders dropped). End the stream.
+                    break;
+                }
             }
         }
     }
@@ -4871,6 +4937,17 @@ mod tests {
         assert_eq!(req.query, "ip=100.64.0.1&type=disco");
     }
 
+    #[tokio::test]
+    async fn request_parser_rejects_truncation_and_bytes_after_declared_body() {
+        for raw in [
+            b"POST /localapi/v0/start HTTP/1.1\r\nContent-Length: 2\r\n\r\nx".as_slice(),
+            b"GET /localapi/v0/watch-ipn-bus HTTP/1.1\r\nContent-Length: 0\r\n\r\nx".as_slice(),
+        ] {
+            let mut cursor = std::io::Cursor::new(raw);
+            assert!(read_request(&mut cursor).await.is_err(), "accepted {raw:?}");
+        }
+    }
+
     // --- Dispatch tests (using tokio::io::duplex) ---
 
     async fn send_request_to_state(raw: &[u8], state: &Arc<LocalApiState>) -> String {
@@ -5104,6 +5181,21 @@ mod tests {
         assert!(resp.contains("Self"));
         assert!(resp.contains("Peer"));
         assert!(resp.contains("peer1"));
+    }
+
+    #[tokio::test]
+    async fn test_status_without_peers_omits_peer_and_user_maps() {
+        let state = make_test_state().await;
+        let resp = send_request_to_state(
+            b"GET /localapi/v0/status?peers=false HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            &state,
+        )
+        .await;
+        let body = resp.split("\r\n\r\n").nth(1).expect("status body");
+        let status: serde_json::Value = serde_json::from_str(body).expect("status JSON");
+        assert_eq!(status["BackendState"], "Running");
+        assert!(status.get("Peer").is_none());
+        assert!(status.get("User").is_none());
     }
 
     #[tokio::test]
@@ -5883,6 +5975,72 @@ mod tests {
             h.shutdown().await;
         }
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropped_watch_clients_unregister_without_another_notification() {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::UnixStream;
+
+        const CLIENTS: usize = 24;
+        let state = make_test_state().await;
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("dropped-watchers.sock");
+        let handle = spawn_localapi(Arc::clone(&state), socket.clone()).expect("spawn LocalAPI");
+
+        for _ in 0..CLIENTS {
+            let mut stream = UnixStream::connect(&socket).await.expect("connect");
+            stream
+                .write_all(
+                    b"GET /localapi/v0/watch-ipn-bus?mask=2 HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+
+            let mut response = Vec::new();
+            let mut bytes = [0u8; 512];
+            loop {
+                let count = tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    stream.read(&mut bytes),
+                )
+                .await
+                .expect("initial watch response timed out")
+                .unwrap();
+                assert_ne!(count, 0, "watch closed before initial state");
+                response.extend_from_slice(&bytes[..count]);
+                if response
+                    .split(|byte| *byte == b'\n')
+                    .any(|line| line.starts_with(b"{\"Version\""))
+                {
+                    break;
+                }
+            }
+
+            // Model a caller whose wait for the next state times out and then
+            // drops its authenticated LocalAPI stream.
+            assert!(tokio::time::timeout(
+                std::time::Duration::from_millis(2),
+                stream.read(&mut bytes),
+            )
+            .await
+            .is_err());
+            drop(stream);
+        }
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if state.ipn_backend.bus().receiver_count() == 0 && handle.child_task_count() == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropped watch clients retained receivers or child tasks");
+
+        handle.shutdown().await;
     }
 
     #[tokio::test]

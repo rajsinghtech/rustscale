@@ -49,6 +49,11 @@ fn hidden_command_completes_top_level_and_nested_contexts() {
         stdout_lines(&["__complete", "--", "file", ""]),
         ["cp", "get"]
     );
+    assert_eq!(stdout_lines(&["__complete", "--", "wa"]), ["wait"]);
+    assert_eq!(
+        stdout_lines(&["__complete", "--", "wait", "--time"]),
+        ["--timeout"]
+    );
     assert_eq!(
         stdout_lines(&["__complete", "--", "drive", "sh"]),
         ["share"]

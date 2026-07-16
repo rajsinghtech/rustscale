@@ -3003,6 +3003,7 @@ dependencies = [
  "qrcode",
  "rand 0.8.7",
  "rustscale-clientupdate",
+ "rustscale-drive",
  "rustscale-freedesktop",
  "rustscale-ipn",
  "rustscale-ipnstate",
@@ -3392,6 +3393,7 @@ version = "0.1.3"
 name = "rustscale-localclient"
 version = "0.1.3"
 dependencies = [
+ "rustscale-drive",
  "rustscale-ipn",
  "rustscale-ipnstate",
  "rustscale-safesocket",

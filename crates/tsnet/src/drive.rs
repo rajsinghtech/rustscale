@@ -117,14 +117,22 @@ impl Runtime {
         self.server.revoke_authority();
     }
 
-    /// Replace the complete runtime configuration. Validation and root opening
-    /// happen before ConfigStore's atomic commit. The authorization writer lock
-    /// serializes this with map revocation and prevents a request from being
-    /// authorized between the commit and cancellation of the old snapshot.
-    pub(crate) async fn replace(
+    /// Compare-and-swap the complete runtime configuration for a LocalAPI
+    /// read/modify/write client. Root validation remains outside the short
+    /// authorization barrier. The writer lock serializes publication with map
+    /// revocation, and the generation comparison prevents lost updates.
+    pub(crate) async fn replace_if_generation(
         self: &Arc<Self>,
         config: RuntimeConfig,
+        expected_generation: u64,
     ) -> Result<u64, ReplaceError> {
+        let actual = self.config.snapshot().generation();
+        if actual != expected_generation {
+            return Err(ReplaceError::GenerationMismatch {
+                expected: expected_generation,
+                actual,
+            });
+        }
         let store = self.config.clone();
         let enabled = config.enabled;
         let prepared = tokio::task::spawn_blocking(move || store.prepare(enabled, config.shares))
@@ -135,8 +143,17 @@ impl Runtime {
         if enabled && !self.sharing_allowed() {
             return Err(ReplaceError::SharingNotAllowed);
         }
+        let actual = self.config.snapshot().generation();
+        if actual != expected_generation {
+            return Err(ReplaceError::GenerationMismatch {
+                expected: expected_generation,
+                actual,
+            });
+        }
         self.rotate_authorization_locked(&mut epoch);
-        Ok(self.config.commit(prepared))
+        self.config
+            .commit_if_generation(prepared, expected_generation)
+            .map_err(ReplaceError::from)
     }
 
     /// Synchronously revoke all request authority for terminal Drop cleanup.
@@ -190,10 +207,25 @@ impl Runtime {
 pub(crate) enum ReplaceError {
     #[error("the signed netmap does not allow this node to share Taildrive folders")]
     SharingNotAllowed,
+    #[error(
+        "Taildrive configuration changed concurrently (expected generation {expected}, current generation {actual})"
+    )]
+    GenerationMismatch { expected: u64, actual: u64 },
     #[error(transparent)]
-    Config(#[from] ConfigError),
+    Config(ConfigError),
     #[error("Taildrive configuration worker failed: {0}")]
     Worker(String),
+}
+
+impl From<ConfigError> for ReplaceError {
+    fn from(error: ConfigError) -> Self {
+        match error {
+            ConfigError::GenerationMismatch { expected, actual } => {
+                Self::GenerationMismatch { expected, actual }
+            }
+            other => Self::Config(other),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -234,13 +266,16 @@ mod tests {
         }
         let temp = tempfile::tempdir().unwrap();
         runtime
-            .replace(RuntimeConfig {
-                enabled: true,
-                shares: vec![Share::new(
-                    "docs",
-                    std::fs::canonicalize(temp.path()).unwrap(),
-                )],
-            })
+            .replace_if_generation(
+                RuntimeConfig {
+                    enabled: true,
+                    shares: vec![Share::new(
+                        "docs",
+                        std::fs::canonicalize(temp.path()).unwrap(),
+                    )],
+                },
+                runtime.status().generation,
+            )
             .await
             .unwrap();
         let active = {

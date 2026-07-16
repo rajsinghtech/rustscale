@@ -2106,10 +2106,13 @@ mod tests {
         std::fs::write(root.join("hello.txt"), b"hello").unwrap();
         state
             .drive
-            .replace(crate::drive::RuntimeConfig {
-                enabled: true,
-                shares: vec![rustscale_drive::Share::new("docs", root)],
-            })
+            .replace_if_generation(
+                crate::drive::RuntimeConfig {
+                    enabled: true,
+                    shares: vec![rustscale_drive::Share::new("docs", root)],
+                },
+                state.drive.status().generation,
+            )
             .await
             .unwrap();
         install_taildrive_filter(&state, src, dst, grant).await;

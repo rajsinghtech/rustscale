@@ -63,6 +63,10 @@ fn hidden_command_completes_top_level_and_nested_contexts() {
         ["status", "query"]
     );
     assert_eq!(stdout_lines(&["__complete", "--", "dns", "q"]), ["query"]);
+    assert_eq!(
+        stdout_lines(&["__complete", "--", "drive", "st"]),
+        ["status"]
+    );
 }
 
 #[test]

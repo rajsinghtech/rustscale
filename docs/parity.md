@@ -262,7 +262,7 @@ state-dir fallback probing), `--json`.
 | `nc` | `cli/nc.go` | 🔶 stub (not-yet-supported) |
 | `id-token` | `cli/id-token.go` | ✅ OIDC machine ID token via LocalAPI and Noise `POST /machine/id-token`; raw JWT and `--json` output |
 | `update` | `cli/update.go` | 🔶 `--yes`, `--dry-run`, `--track`, and `--version`; Linux/macOS archive apply is limited to intact `scripts/install.sh` ownership receipts with checksum integrity, bounded parsing, post-install version verification, and journaled rollback. Homebrew is dry-run planning only; other layouts fail explicitly without elevation. |
-| `drive` | `cli/drive.go` | ⬜ |
+| `drive` | `cli/drive.go` | 🔶 first truthful local-share slice: owner-only `status`/`list`, upstream-named `share` (add or replace) and `unshare`, text/JSON output, static completion, strict no-follow canonical root/name validation, bounded/cancellable LocalAPI calls, and mandatory generation ETag CAS for concurrent mutations. Remote mounts/composition, rename/share-as, bookmarks, and persistence remain deferred and are rejected explicitly. |
 | `lock` | `cli/lock.go` | 🔶 status, self-safe confirmed init with owner-only pre-RPC disablement receipts and `--resume`, node sign, and disable are wired through authorized LocalAPI; add/remove, re-sign, local-disable, pre-auth wrapping, log, and revoke-keys remain deferred |
 | completion/man | `cli/ffcomplete/` | ✅ bash, zsh, and fish script generation plus hidden, side-effect-free runtime completion protocol; man pages are not provided upstream |
 
@@ -278,13 +278,13 @@ hostnames; use the explicit subcommands above.
 
 `crates/localclient`: async LocalAPI HTTP client over `safesocket::connect`,
 hand-rolled HTTP/1.1 (no hyper), fake Host `local-rustscaled.sock`, typed
-errors (AccessDenied 403, PreconditionsFailed 412, HttpStatus, PeerNotFound),
+errors (AccessDenied 403, PreconditionsFailed 412, Timeout, HttpStatus, PeerNotFound),
 `watch_ipn_bus()` streaming method for newline-delimited JSON `Notify`
 messages, with bounded HTTP headers/frames/chunks/trailers, fragmented HTTP/1.1
 chunked and connection-close framing, strict status/JSON validation, and
 explicit EOF handling. Methods: start(), login_interactive(), logout(), edit_prefs(),
 get_prefs(), status(), whois(), health(), metrics(), ping(), get_serve_config(),
-set_serve_config(), cert_pair(), tailnet_lock_status(), tailnet_lock_init(),
+set_serve_config(), drive_status(), get_drive_config(), set_drive_config(), cert_pair(), tailnet_lock_status(), tailnet_lock_init(),
 tailnet_lock_ack_init(), tailnet_lock_sign(), tailnet_lock_disable(), list_profiles(), current_profile(),
 switch_profile(), delete_profile(), push_file(), waiting_files(),
 get_waiting_file(), delete_waiting_file(), debug(), dial(), dns_query(),

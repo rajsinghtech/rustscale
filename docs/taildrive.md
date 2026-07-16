@@ -95,18 +95,49 @@ The local, peer-credential-authorized API exposes:
 - `GET /localapi/v0/drive/status` — enabled state, signed `sharingAllowed`
   state, generation, and configured shares.
 - `GET /localapi/v0/drive/config` — current `{ "enabled", "shares" }` runtime
-  configuration.
+  configuration and a generation-derived `ETag`.
 - `PUT /localapi/v0/drive/config` — bounded, all-or-nothing replacement using
-  the same object shape. This mutation requires LocalAPI read-write identity
-  (root or the daemon UID on Unix); read-only local identities receive 403.
+  the same object shape and a mandatory `If-Match` from the preceding GET.
+  A concurrent mutation returns 412 without changing the newer snapshot.
 
-These endpoints intentionally provide no platform mount, remote composition,
-or automatic persistence behavior.
+All three operations expose local host paths and are therefore owner-only:
+root, the daemon UID, or the configured operator on Unix. Read-only local
+identities receive 403. Bodies and responses are limited to 1 MiB. These
+endpoints intentionally provide no platform mount, remote composition,
+security-scoped bookmark, or automatic persistence behavior.
+
+### CLI
+
+The first production CLI slice intentionally follows the upstream local-share
+names where they apply:
+
+- `rustscale drive status [--json]` reports runtime/capability state,
+  generation, and configured shares.
+- `rustscale drive list [--json]` prints upstream-style `name`, `path`, and
+  `as` columns, or the share array as JSON.
+- `rustscale drive share <name> <path>` adds a share or replaces the path for
+  an existing normalized name through one ETag-guarded complete replacement.
+- `rustscale drive unshare <name>` removes one share through the same CAS. The
+  last removal returns the runtime to disabled.
+
+CLI and LocalAPI operations have bounded response sizes and a ten-second
+request deadline; Ctrl-C drops the in-flight request. Cancellation or a
+transport/response failure during mutation reports that commit may be
+ambiguous and directs the operator to re-read the list. Share names use
+upstream lowercasing/character rules. Paths are made absolute and then opened
+component-by-component without following links before LocalAPI is contacted;
+the daemon repeats the authoritative capability open before publication.
+Remote mounts/composition, rename, share-as, and macOS bookmark commands fail
+explicitly rather than claiming support.
 
 ## Tested
 
-Hermetic core and wiring tests cover browse/read/write/move/delete,
-unauthorized peers, signed grant narrowing from read-write to read-only,
+Hermetic core, LocalAPI, localclient, and CLI tests cover
+compare-and-swap concurrent mutations, owner/read-only authorization,
+cancellation/deadlines, bounded JSON responses, CLI completion and text/JSON
+shapes, malicious names, traversal, symlink and special-file roots, explicit
+remote/bookmark rejection, browse/read/write/move/delete, unauthorized peers,
+signed grant narrowing from read-write to read-only,
 complete capability revocation, forged grant headers, disabled startup,
 read-only LocalAPI mutation denial, failed-config atomicity, bounded parsing,
 request cancellation, deterministic root replacement, FIFO/socket rejection,
@@ -120,8 +151,9 @@ WebDAV publication followed by successful new-epoch retries.
 ## Deferred
 
 Platform filesystem mounts, local composition of remote nodes, Finder/Explorer
-integration, GUI/CLI share management, persistent profile-scoped share
-configuration, subprocess user switching, macOS bookmarks, WebDAV locking,
+integration, GUI share management, CLI rename/share-as, persistent
+profile-scoped share configuration, subprocess user switching, macOS
+bookmarks, WebDAV locking,
 recursive collection copy/delete, range responses, metadata caching, and
 availability probing remain deferred. The current work is a secure server and
 configuration parity layer, not complete Taildrive product parity.

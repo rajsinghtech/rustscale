@@ -19,12 +19,14 @@ mod http;
 mod path;
 
 pub use auth::{AuthError, AuthenticatedPeer, Permission, Permissions};
-pub use config::{ConfigError, ConfigStore, Limits, PreparedConfig, Share, Snapshot};
+pub use config::{
+    validate_share_root, ConfigError, ConfigStore, Limits, PreparedConfig, Share, Snapshot,
+};
 pub use http::{
     streaming_body_channel, HeaderMap, Request, RequestAuthority, RequestControl, Response, Server,
     StreamingBody,
 };
-pub use path::{encode_path_component, PathError};
+pub use path::{encode_path_component, normalize_share_name, PathError};
 
 /// Peer capability carrying Taildrive share grants.
 pub const CAPABILITY_TAILDRIVE: &str = "tailscale.com/cap/drive";

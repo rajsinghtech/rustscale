@@ -1789,7 +1789,14 @@ fn requires_write_permission(method: &str, endpoint: &str) -> bool {
         (method, endpoint),
         (
             "GET",
-            "metrics" | "dns-query" | "debug" | "id-token" | "profiles" | "files"
+            "metrics"
+                | "dns-query"
+                | "debug"
+                | "id-token"
+                | "profiles"
+                | "files"
+                | "drive/status"
+                | "drive/config"
         ) | ("POST", "check-prefs")
     ) || (method == "GET" && (endpoint.starts_with("profiles/") || endpoint.starts_with("files/")))
 }
@@ -2054,7 +2061,7 @@ pub(crate) async fn dispatch<W: AsyncRead + AsyncWrite + Unpin>(
             handle_get_drive_config(conn, state).await?;
         }
         "drive/config" if method == "PUT" => {
-            handle_put_drive_config(conn, &req.body, state).await?;
+            handle_put_drive_config(conn, req, state).await?;
         }
         "drive/config" | "drive/status" => {
             let body = serde_json::json!({"error": "method not allowed"});
@@ -2176,23 +2183,67 @@ async fn handle_get_drive_config<W: AsyncWrite + Unpin>(
     state: &Arc<LocalApiState>,
 ) -> Result<(), std::io::Error> {
     let status = state.drive.status();
+    let etag = drive_config_etag(status.generation);
     let config = serde_json::json!({
         "enabled": status.enabled,
         "shares": status.shares,
     });
-    write_json_response(conn, 200, "OK", &config).await
+    let body = serde_json::to_vec(&config).unwrap_or_default();
+    write_json_with_etag(conn, 200, "OK", &etag, &body).await
+}
+
+fn drive_config_etag(generation: u64) -> String {
+    format!("drive-{generation}")
+}
+
+fn drive_if_match(req: &HttpRequest) -> Result<u64, &'static str> {
+    let mut values = req
+        .headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("if-match"))
+        .map(|(_, value)| value.trim());
+    let value = values
+        .next()
+        .ok_or("If-Match is required for Taildrive configuration replacement")?;
+    if values.next().is_some() {
+        return Err("multiple If-Match headers are not allowed");
+    }
+    let quoted = value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .ok_or("If-Match must contain one quoted Taildrive ETag")?;
+    quoted
+        .strip_prefix("drive-")
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or("If-Match does not contain a valid Taildrive ETag")
 }
 
 async fn handle_put_drive_config<W: AsyncWrite + Unpin>(
     conn: &mut W,
-    body: &[u8],
+    req: &HttpRequest,
     state: &Arc<LocalApiState>,
 ) -> Result<(), std::io::Error> {
-    if body.len() > crate::drive::MAX_CONFIG_BODY {
+    if req.body.len() > crate::drive::MAX_CONFIG_BODY {
         let error = serde_json::json!({"error": "Taildrive configuration body too large"});
         return write_json_response(conn, 413, "Content Too Large", &error).await;
     }
-    let config: crate::drive::RuntimeConfig = match serde_json::from_slice(body) {
+    let expected_generation = match drive_if_match(req) {
+        Ok(generation) => generation,
+        Err(error) => {
+            let body = serde_json::json!({"error": error});
+            let (status, reason) = if req
+                .headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("if-match"))
+            {
+                (400, "Bad Request")
+            } else {
+                (428, "Precondition Required")
+            };
+            return write_json_response(conn, status, reason, &body).await;
+        }
+    };
+    let config: crate::drive::RuntimeConfig = match serde_json::from_slice(&req.body) {
         Ok(config) => config,
         Err(error) => {
             let body =
@@ -2200,11 +2251,24 @@ async fn handle_put_drive_config<W: AsyncWrite + Unpin>(
             return write_json_response(conn, 400, "Bad Request", &body).await;
         }
     };
-    match state.drive.replace(config).await {
-        Ok(_) => handle_drive_status(conn, state).await,
+    match state
+        .drive
+        .replace_if_generation(config, expected_generation)
+        .await
+    {
+        Ok(generation) => {
+            let status = serde_json::to_vec(&state.drive.status()).unwrap_or_default();
+            write_json_with_etag(conn, 200, "OK", &drive_config_etag(generation), &status).await
+        }
         Err(crate::drive::ReplaceError::SharingNotAllowed) => {
             let body = serde_json::json!({"error": "Taildrive sharing is not allowed by the signed netmap"});
             write_json_response(conn, 403, "Forbidden", &body).await
+        }
+        Err(crate::drive::ReplaceError::GenerationMismatch { .. }) => {
+            let body = serde_json::json!({
+                "error": "Taildrive configuration changed concurrently; read it again before retrying"
+            });
+            write_json_response(conn, 412, "Precondition Failed", &body).await
         }
         Err(error) => {
             let body = serde_json::json!({"error": error.to_string()});
@@ -6832,12 +6896,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn taildrive_localapi_reports_disabled_startup() {
+    async fn taildrive_localapi_reports_disabled_startup_to_owner_only() {
         let state = make_test_state().await;
+        #[cfg(unix)]
+        {
+            let denied = send_request_with_identity(
+                b"GET /localapi/v0/drive/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                &state,
+                test_ro_identity(),
+            )
+            .await;
+            assert!(denied.contains("403 Forbidden"), "response: {denied}");
+        }
+
         let status = send_request_with_identity(
             b"GET /localapi/v0/drive/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
             &state,
-            test_ro_identity(),
+            test_rw_identity(),
         )
         .await;
         assert!(status.contains("200 OK"), "response: {status}");
@@ -6865,7 +6940,7 @@ mod tests {
         })
         .unwrap();
         let request = format!(
-            "PUT /localapi/v0/drive/config HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            "PUT /localapi/v0/drive/config HTTP/1.1\r\nHost: localhost\r\nIf-Match: \"drive-0\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             body.len(),
             String::from_utf8(body).unwrap()
         );
@@ -6878,6 +6953,15 @@ mod tests {
         assert!(denied.contains("403 Forbidden"), "response: {denied}");
         assert!(!state.drive.status().enabled);
 
+        let missing_cas = request.replace("If-Match: \"drive-0\"\r\n", "");
+        let precondition =
+            send_request_with_identity(missing_cas.as_bytes(), &state, test_rw_identity()).await;
+        assert!(
+            precondition.contains("428 Precondition Required"),
+            "response: {precondition}"
+        );
+        assert!(!state.drive.status().enabled);
+
         let accepted =
             send_request_with_identity(request.as_bytes(), &state, test_rw_identity()).await;
         assert!(accepted.contains("200 OK"), "response: {accepted}");
@@ -6887,7 +6971,7 @@ mod tests {
 
         let bad_body = br#"{"enabled":true,"shares":[{"name":"bad","path":"relative"}]}"#;
         let bad_request = format!(
-            "PUT /localapi/v0/drive/config HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            "PUT /localapi/v0/drive/config HTTP/1.1\r\nHost: localhost\r\nIf-Match: \"drive-1\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             bad_body.len(),
             String::from_utf8_lossy(bad_body)
         );
@@ -6899,13 +6983,32 @@ mod tests {
         assert_eq!(after.generation, status.generation);
         assert_eq!(after.shares[0].name, "docs");
 
-        let readable = send_request_with_identity(
+        let stale =
+            send_request_with_identity(request.as_bytes(), &state, test_rw_identity()).await;
+        assert!(
+            stale.contains("412 Precondition Failed"),
+            "response: {stale}"
+        );
+        assert_eq!(state.drive.status().generation, status.generation);
+
+        let denied_read = send_request_with_identity(
             b"GET /localapi/v0/drive/config HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
             &state,
             test_ro_identity(),
         )
         .await;
+        assert!(
+            denied_read.contains("403 Forbidden"),
+            "response: {denied_read}"
+        );
+        let readable = send_request_with_identity(
+            b"GET /localapi/v0/drive/config HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            &state,
+            test_rw_identity(),
+        )
+        .await;
         assert!(readable.contains("200 OK"), "response: {readable}");
+        assert!(readable.contains("ETag: \"drive-1\""));
         assert!(readable.contains("\"name\":\"docs\""));
     }
 
@@ -6960,6 +7063,8 @@ mod tests {
             ("GET", "profiles/current"),
             ("GET", "files"),
             ("GET", "files/report.txt"),
+            ("GET", "drive/status"),
+            ("GET", "drive/config"),
         ] {
             assert!(
                 requires_write_permission(method, endpoint),

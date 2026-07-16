@@ -28,9 +28,12 @@ mod stream;
 pub use error::LocalClientError;
 pub use stream::{DebugCapture, WatchIpnBus};
 
+use std::future::Future;
 use std::net::IpAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 
+pub use rustscale_drive::Share as DriveShare;
 use rustscale_ipn::{LoginProfile, MaskedPrefs, NotifyWatchOpt, Prefs, StartOptions, WaitingFile};
 use rustscale_ipnstate::PingResult;
 use rustscale_tailcfg::{DERPMap, TokenResponse};
@@ -42,6 +45,28 @@ use rustscale_safesocket::Connection;
 /// The fake Host header value, analogous to Go's `apitype.LocalAPIHost`.
 const LOCAL_API_HOST: &str = "local-rustscaled.sock";
 const MAX_STATUS_BODY_BYTES: usize = 4 * 1024 * 1024;
+const MAX_DRIVE_BODY_BYTES: usize = 1024 * 1024;
+const DRIVE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Complete local Taildrive configuration replaced by one CAS mutation.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DriveConfig {
+    pub enabled: bool,
+    #[serde(default)]
+    pub shares: Vec<DriveShare>,
+}
+
+/// Taildrive runtime status returned by the owner-authorized LocalAPI.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DriveStatus {
+    pub enabled: bool,
+    pub sharing_allowed: bool,
+    pub generation: u64,
+    #[serde(default)]
+    pub shares: Vec<DriveShare>,
+}
 
 /// A client for the rustscale daemon's LocalAPI over a Unix domain socket.
 ///
@@ -157,6 +182,69 @@ impl LocalClient {
         self.send_request_with_body("POST", "/localapi/v0/tka/disable", secret)
             .await?;
         Ok(())
+    }
+
+    /// GET /localapi/v0/drive/status — return bounded owner-only status.
+    pub async fn drive_status(&self) -> Result<DriveStatus, LocalClientError> {
+        let raw = drive_request_timeout(self.send_request_raw_with_limit(
+            "GET",
+            "/localapi/v0/drive/status",
+            &[],
+            &[],
+            Some(MAX_DRIVE_BODY_BYTES),
+        ))
+        .await?;
+        serde_json::from_slice(&raw.body).map_err(|error| LocalClientError::Json(error.to_string()))
+    }
+
+    /// GET /localapi/v0/drive/config — return the complete configuration and
+    /// its opaque ETag for a later compare-and-swap replacement.
+    pub async fn get_drive_config(&self) -> Result<(DriveConfig, String), LocalClientError> {
+        let raw = drive_request_timeout(self.send_request_raw_with_limit(
+            "GET",
+            "/localapi/v0/drive/config",
+            &[],
+            &[],
+            Some(MAX_DRIVE_BODY_BYTES),
+        ))
+        .await?;
+        if raw.etag.is_empty() {
+            return Err(LocalClientError::Io(
+                "Taildrive configuration response is missing an ETag".into(),
+            ));
+        }
+        let config = serde_json::from_slice(&raw.body)
+            .map_err(|error| LocalClientError::Json(error.to_string()))?;
+        Ok((config, raw.etag))
+    }
+
+    /// PUT /localapi/v0/drive/config — atomically replace all local shares if
+    /// `etag` still identifies the configuration read by the caller.
+    pub async fn set_drive_config(
+        &self,
+        config: &DriveConfig,
+        etag: &str,
+    ) -> Result<DriveStatus, LocalClientError> {
+        if etag.is_empty() || etag.contains(['\r', '\n', '"']) {
+            return Err(LocalClientError::Io("invalid Taildrive ETag".into()));
+        }
+        let body = serde_json::to_vec(config)
+            .map_err(|error| LocalClientError::Json(error.to_string()))?;
+        if body.len() > MAX_DRIVE_BODY_BYTES {
+            return Err(LocalClientError::Io(
+                "Taildrive configuration body too large".into(),
+            ));
+        }
+        let headers = [("If-Match".to_owned(), format!("\"{etag}\""))];
+        let raw = drive_request_timeout(self.send_request_raw_with_limit(
+            "PUT",
+            "/localapi/v0/drive/config",
+            &body,
+            &headers,
+            Some(MAX_DRIVE_BODY_BYTES),
+        ))
+        .await?;
+        serde_json::from_slice(&raw.body).map_err(|error| LocalClientError::Json(error.to_string()))
     }
 
     /// GET /localapi/v0/netmap — returns the netmap JSON (including DERPMap).
@@ -713,6 +801,15 @@ fn ping_path(ip: IpAddr, ping_type: &str, size: usize) -> String {
     )
 }
 
+async fn drive_request_timeout<T, F>(future: F) -> Result<T, LocalClientError>
+where
+    F: Future<Output = Result<T, LocalClientError>>,
+{
+    tokio::time::timeout(DRIVE_REQUEST_TIMEOUT, future)
+        .await
+        .map_err(|_| LocalClientError::Timeout("Taildrive LocalAPI request timed out".into()))?
+}
+
 // ---------------------------------------------------------------------------
 // Response parsing
 // ---------------------------------------------------------------------------
@@ -1065,5 +1162,34 @@ mod tests {
     #[test]
     fn test_split_pair_pem_missing_end_returns_none() {
         assert!(split_pair_pem(b"not pem at all").is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drive_requests_have_a_bounded_deadline() {
+        let request = tokio::spawn(drive_request_timeout::<(), _>(std::future::pending()));
+        tokio::time::advance(DRIVE_REQUEST_TIMEOUT + Duration::from_millis(1)).await;
+        let error = request.await.unwrap().unwrap_err();
+        assert!(matches!(error, LocalClientError::Timeout(_)));
+    }
+
+    #[tokio::test]
+    async fn cancelling_drive_request_drops_inflight_work() {
+        struct DropSignal(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let signal = DropSignal(dropped.clone());
+        let request = tokio::spawn(drive_request_timeout::<(), _>(async move {
+            let _signal = signal;
+            std::future::pending::<Result<(), LocalClientError>>().await
+        }));
+        tokio::task::yield_now().await;
+        request.abort();
+        let _ = request.await;
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
     }
 }

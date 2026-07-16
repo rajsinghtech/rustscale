@@ -222,7 +222,7 @@ fn usage(bin: &str) {
     eprintln!("  update [--yes|--dry-run] [flags]   update from RustScale GitHub releases");
     eprintln!("  wait [--timeout <duration>]          wait for backend to reach Running state");
     eprintln!("  lock [status|init|sign|disable]       manage the supported Tailnet Lock flows");
-    eprintln!("  drive [list|share|unshare]           manage Taildrive shares (not yet supported)");
+    eprintln!("  drive [status|list|share|unshare]    manage local Taildrive shares");
     eprintln!("  completion <bash|zsh|fish>           generate shell completion script");
 }
 

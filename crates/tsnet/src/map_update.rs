@@ -645,8 +645,10 @@ pub(crate) fn spawn_map_update_task(
                                         routes.unblock_exit_traffic();
                                         health.set_healthy(WARN_EXIT_ROUTE_SECURITY);
                                     }
+                                    routes.unblock_localapi_dial();
                                 }
                                 Err(error) if security_critical => {
+                                    routes.block_localapi_dial();
                                     routes.block_exit_traffic();
                                     let kernel = engage_kernel_security_block(
                                         router,
@@ -662,6 +664,7 @@ pub(crate) fn spawn_map_update_task(
                                     send_health_notify(&health, &ipn_backend);
                                 }
                                 Err(error) => {
+                                    routes.block_localapi_dial();
                                     log::warn!("tsnet: map route refresh failed: {error}");
                                 }
                             }
@@ -1035,6 +1038,11 @@ pub(crate) fn spawn_map_update_task(
                     }
                     peers_arc.write().await.clone_from(&next_peers);
                     *wg_tunnels.write().await = next_tunnels;
+                    // The peer/map generation becomes visible before native
+                    // router work below. Keep LocalAPI TUN dialing closed over
+                    // that publication gap; otherwise a newly approved route
+                    // could fall through the host routing table.
+                    next_routes.block_localapi_dial();
                     *route_table.write().await = next_routes;
                     peer_map
                         .install_locked(&next_peers)
@@ -1152,6 +1160,7 @@ pub(crate) fn spawn_map_update_task(
                             routes.unblock_exit_traffic();
                             health.set_healthy(WARN_EXIT_ROUTE_SECURITY);
                         }
+                        routes.unblock_localapi_dial();
                     }
                     drop(routes);
                     drop(exit_map_guard);

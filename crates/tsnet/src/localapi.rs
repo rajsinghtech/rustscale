@@ -128,8 +128,35 @@ impl LocalApiDialBackend for NetstackDialBackend {
     }
 }
 
+type TunConnectFuture = Pin<Box<dyn Future<Output = std::io::Result<Box<dyn DialIo>>> + Send>>;
+type TunConnectHook =
+    Arc<dyn Fn(String, SocketAddr, CancellationToken) -> TunConnectFuture + Send + Sync>;
+
 struct TunDialBackend {
     dialer: Arc<rustscale_tsdial::Dialer>,
+    route_table: Arc<RwLock<crate::routing::RouteTable>>,
+    connect_hook: Option<TunConnectHook>,
+}
+
+#[derive(Debug)]
+struct NotTailnetTarget;
+
+impl std::fmt::Display for NotTailnetTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("target is not routed through Tailscale")
+    }
+}
+
+impl std::error::Error for NotTailnetTarget {}
+
+fn not_tailnet_target() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::PermissionDenied, NotTailnetTarget)
+}
+
+fn is_not_tailnet_target(error: &std::io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|source| source.downcast_ref::<NotTailnetTarget>().is_some())
 }
 
 impl LocalApiDialBackend for TunDialBackend {
@@ -137,18 +164,42 @@ impl LocalApiDialBackend for TunDialBackend {
         let network = network.to_owned();
         let addr = join_dial_host_port(host, port);
         let dialer = Arc::clone(&self.dialer);
+        let route_table = Arc::clone(&self.route_table);
+        let connect_hook = self.connect_hook.clone();
         Box::pin(async move {
-            let resolved = dialer
-                .user_dial_plan(&network, &addr)
-                .ok()
-                .map(|plan| plan.addr);
-            let stream = tokio::select! {
+            // Resolve once, then classify and connect that exact IP. Holding
+            // the generation's route read guard through connect prevents a
+            // route withdrawal/exit change from invalidating an approved plan
+            // between classification and the daemon-owned socket connect.
+            let addrs = tokio::select! {
                 () = cancel.cancelled() => return Err(dial_canceled()),
-                result = dialer.user_dial(&network, &addr) => result?,
+                result = dialer.resolve_user_dial(&network, &addr) => result?,
             };
+            let resolved = normalize_dial_addr(*addrs.first().ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "no resolved address")
+            })?);
+            let routes = route_table.read().await;
+            let plan =
+                dialer.user_dial_plan_resolved(resolved, |ip| tun_target_via_tailnet(&routes, ip));
+            if !plan.via_tailscale {
+                return Err(not_tailnet_target());
+            }
+            let stream = if let Some(connect) = connect_hook {
+                tokio::select! {
+                    () = cancel.cancelled() => return Err(dial_canceled()),
+                    result = connect(network, plan.addr, cancel.clone()) => result?,
+                }
+            } else {
+                let stream = tokio::select! {
+                    () = cancel.cancelled() => return Err(dial_canceled()),
+                    result = dialer.dial_resolved_user(&network, plan.addr) => result?,
+                };
+                Box::new(stream) as Box<dyn DialIo>
+            };
+            drop(routes);
             Ok(DialConnection {
-                stream: Box::new(stream),
-                resolved,
+                stream,
+                resolved: Some(plan.addr),
                 via: "tun-user-dial",
             })
         })
@@ -164,8 +215,50 @@ pub(crate) fn netstack_dial_backend(
 
 pub(crate) fn tun_dial_backend(
     dialer: Arc<rustscale_tsdial::Dialer>,
+    route_table: Arc<RwLock<crate::routing::RouteTable>>,
 ) -> Arc<dyn LocalApiDialBackend> {
-    Arc::new(TunDialBackend { dialer })
+    Arc::new(TunDialBackend {
+        dialer,
+        route_table,
+        connect_hook: None,
+    })
+}
+
+fn normalize_dial_addr(addr: SocketAddr) -> SocketAddr {
+    match addr {
+        SocketAddr::V6(addr) => addr
+            .ip()
+            .to_ipv4_mapped()
+            .map(|ip| SocketAddr::new(IpAddr::V4(ip), addr.port()))
+            .unwrap_or(SocketAddr::V6(addr)),
+        addr => addr,
+    }
+}
+
+fn tun_target_via_tailnet(routes: &crate::routing::RouteTable, ip: IpAddr) -> bool {
+    if routes.localapi_dial_blocked() {
+        return false;
+    }
+    match ip {
+        IpAddr::V4(ip)
+            if ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_broadcast()
+                || ip.is_link_local()
+                || ip.is_multicast() =>
+        {
+            false
+        }
+        IpAddr::V6(ip)
+            if ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_unicast_link_local()
+                || ip.is_multicast() =>
+        {
+            false
+        }
+        _ => routes.lookup(ip).is_some(),
+    }
 }
 
 fn join_dial_host_port(host: &str, port: u16) -> String {
@@ -4556,6 +4649,7 @@ enum DialAttemptError {
     Unavailable,
     Admission(DialAdmissionError),
     Timeout,
+    NotTailnet,
     Backend(std::io::Error),
 }
 
@@ -4582,7 +4676,13 @@ async fn dial_with_owner<W: AsyncRead + Unpin>(
     tokio::pin!(deadline);
     let mut disconnected = [0u8; 1];
     let connection = tokio::select! {
-        result = &mut dial => result.map_err(DialAttemptError::Backend)?,
+        result = &mut dial => result.map_err(|error| {
+            if is_not_tailnet_target(&error) {
+                DialAttemptError::NotTailnet
+            } else {
+                DialAttemptError::Backend(error)
+            }
+        })?,
         () = &mut deadline => {
             cancel.cancel();
             return Err(DialAttemptError::Timeout);
@@ -4624,6 +4724,11 @@ async fn write_dial_attempt_error<W: AsyncWrite + Unpin>(
             504,
             "Gateway Timeout",
             "tailnet dial deadline exceeded".to_owned(),
+        ),
+        DialAttemptError::NotTailnet => (
+            403,
+            "Forbidden",
+            "target is not routed through Tailscale; direct dialing is not permitted".to_owned(),
         ),
         DialAttemptError::Backend(error) => {
             (502, "Bad Gateway", format!("tailnet dial failed: {error}"))
@@ -5145,7 +5250,7 @@ mod tests {
     use rustscale_key::{DiscoPrivate, NodePrivate};
     use rustscale_magicsock::{Magicsock, MagicsockConfig};
     use rustscale_router::{Router, RouterConfig, RouterError};
-    use rustscale_tailcfg::{Node, UserProfile};
+    use rustscale_tailcfg::{MapResponse, Node, UserProfile};
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
     use tokio::io::AsyncWriteExt;
@@ -6034,6 +6139,231 @@ mod tests {
             *backend.target.lock().unwrap(),
             Some(("tcp".into(), "peer".into(), 8080))
         );
+    }
+
+    async fn classified_tun_state(
+        mut peers: Vec<Node>,
+        accept_routes: bool,
+        select_exit: bool,
+        connects: Arc<std::sync::Mutex<Vec<SocketAddr>>>,
+    ) -> Arc<LocalApiState> {
+        if peers.is_empty() {
+            peers = make_test_state().await.peers.read().await.clone();
+        }
+        let mut routes = crate::routing::RouteTable::from_peers_with_opts(&peers, accept_routes);
+        if select_exit {
+            routes.set_exit_node(peers[0].Key.clone());
+        }
+        let routes = Arc::new(RwLock::new(routes));
+        let dialer = Arc::new(rustscale_tsdial::Dialer::new(None));
+        dialer
+            .set_net_map(&MapResponse {
+                Domain: "tailnet.ts.net".into(),
+                Peers: Some(peers.clone()),
+                ..Default::default()
+            })
+            .await;
+        let hook: TunConnectHook = Arc::new(move |_network, addr, _cancel| {
+            let connects = Arc::clone(&connects);
+            Box::pin(async move {
+                connects.lock().unwrap().push(addr);
+                let (stream, peer) = tokio::io::duplex(64);
+                drop(peer);
+                Ok(Box::new(stream) as Box<dyn DialIo>)
+            })
+        });
+        let mut state = make_test_state().await;
+        let state_mut = Arc::get_mut(&mut state).unwrap();
+        *state_mut.peers.write().await = peers;
+        state_mut.tun_mode = true;
+        state_mut.netstack = None;
+        state_mut.route_table = Some(Arc::clone(&routes));
+        state_mut.dial_backend = Some(Arc::new(TunDialBackend {
+            dialer,
+            route_table: routes,
+            connect_hook: Some(hook),
+        }));
+        state_mut.dial_admission = DialAdmission::new(8, 8);
+        state
+    }
+
+    fn legacy_dial_request(addr: &str) -> HttpRequest {
+        HttpRequest {
+            method: "POST".into(),
+            path: "/localapi/v0/dial".into(),
+            query: format!("addr={addr}"),
+            headers: vec![],
+            body: vec![],
+        }
+    }
+
+    async fn raw_operator_legacy_dial(state: &Arc<LocalApiState>, addr: &str) -> Vec<u8> {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        dispatch(
+            &mut server,
+            &legacy_dial_request(addr),
+            state,
+            &test_rw_identity(),
+        )
+        .await
+        .unwrap();
+        server.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        response
+    }
+
+    #[tokio::test]
+    async fn tun_raw_operator_only_connects_tailnet_classified_targets() {
+        let base = make_test_state().await;
+        let mut peers = base.peers.read().await.clone();
+        peers[0].AllowedIPs = vec!["100.64.0.2/32".into(), "10.20.0.0/16".into()];
+        let connects = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let state = Box::pin(classified_tun_state(
+            peers,
+            true,
+            false,
+            Arc::clone(&connects),
+        ))
+        .await;
+
+        for denied in [
+            "127.0.0.1:80",
+            "[::1]:80",
+            "[::ffff:127.0.0.1]:80",
+            "192.168.1.20:80",
+            "8.8.8.8:53",
+        ] {
+            let response = raw_operator_legacy_dial(&state, denied).await;
+            assert!(
+                response.starts_with(b"HTTP/1.1 403 "),
+                "{denied}: {response:?}"
+            );
+        }
+        assert!(connects.lock().unwrap().is_empty());
+
+        for allowed in ["100.64.0.2:22", "peer1:22", "10.20.30.40:443"] {
+            let response = raw_operator_legacy_dial(&state, allowed).await;
+            assert!(
+                response.starts_with(b"HTTP/1.1 200 "),
+                "{allowed}: {response:?}"
+            );
+        }
+        assert_eq!(
+            *connects.lock().unwrap(),
+            [
+                SocketAddr::from(([100, 64, 0, 2], 22)),
+                SocketAddr::from(([100, 64, 0, 2], 22)),
+                SocketAddr::from(([10, 20, 30, 40], 443)),
+            ]
+        );
+
+        let routes = state.route_table.as_ref().unwrap();
+        routes.write().await.block_localapi_dial();
+        let changing = raw_operator_legacy_dial(&state, "100.64.0.2:22").await;
+        assert!(changing.starts_with(b"HTTP/1.1 403 "));
+        assert_eq!(connects.lock().unwrap().len(), 3);
+        routes.write().await.unblock_localapi_dial();
+    }
+
+    #[tokio::test]
+    async fn tun_selected_exit_classifies_public_and_lan_but_never_loopback() {
+        let base = make_test_state().await;
+        let peers = base.peers.read().await.clone();
+        let connects = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let state = Box::pin(classified_tun_state(
+            peers,
+            false,
+            true,
+            Arc::clone(&connects),
+        ))
+        .await;
+
+        for allowed in ["8.8.8.8:53", "192.168.1.20:443"] {
+            let response = raw_operator_legacy_dial(&state, allowed).await;
+            assert!(
+                response.starts_with(b"HTTP/1.1 200 "),
+                "{allowed}: {response:?}"
+            );
+        }
+        for denied in ["127.0.0.1:80", "[::1]:80", "[::ffff:127.0.0.1]:80"] {
+            let response = raw_operator_legacy_dial(&state, denied).await;
+            assert!(
+                response.starts_with(b"HTTP/1.1 403 "),
+                "{denied}: {response:?}"
+            );
+        }
+        assert_eq!(connects.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn tun_route_generation_cannot_change_between_plan_and_connect() {
+        let base = make_test_state().await;
+        let peers = base.peers.read().await.clone();
+        let placeholder = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut state = Box::pin(classified_tun_state(
+            peers.clone(),
+            false,
+            false,
+            placeholder,
+        ))
+        .await;
+        let routes = state.route_table.as_ref().unwrap().clone();
+        let dialer = Arc::new(rustscale_tsdial::Dialer::new(None));
+        dialer
+            .set_net_map(&MapResponse {
+                Domain: "tailnet.ts.net".into(),
+                Peers: Some(peers),
+                ..Default::default()
+            })
+            .await;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let hook: TunConnectHook = Arc::new({
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            move |_network, _addr, _cancel| {
+                let entered = Arc::clone(&entered);
+                let release = Arc::clone(&release);
+                Box::pin(async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    let (stream, peer) = tokio::io::duplex(64);
+                    drop(peer);
+                    Ok(Box::new(stream) as Box<dyn DialIo>)
+                })
+            }
+        });
+        Arc::get_mut(&mut state).unwrap().dial_backend = Some(Arc::new(TunDialBackend {
+            dialer,
+            route_table: Arc::clone(&routes),
+            connect_hook: Some(hook),
+        }));
+
+        let dial_state = Arc::clone(&state);
+        let dial =
+            tokio::spawn(
+                async move { raw_operator_legacy_dial(&dial_state, "100.64.0.2:22").await },
+            );
+        entered.notified().await;
+        let update_routes = Arc::clone(&routes);
+        let update = tokio::spawn(async move {
+            update_routes.write().await.rebuild_with_opts(&[], false);
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !update.is_finished(),
+            "route generation changed while an approved connect was pending"
+        );
+        release.notify_one();
+        let response = dial.await.unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 200 "));
+        update.await.unwrap();
+        assert!(routes
+            .read()
+            .await
+            .lookup("100.64.0.2".parse().unwrap())
+            .is_none());
     }
 
     #[tokio::test]

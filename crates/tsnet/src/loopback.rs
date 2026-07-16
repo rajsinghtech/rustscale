@@ -654,7 +654,9 @@ impl Server {
                 DataPlane::Netstack(ns) => {
                     localapi::netstack_dial_backend(ns.clone(), inner.peers.clone())
                 }
-                DataPlane::Tun => localapi::tun_dial_backend(inner.user_dialer.clone()),
+                DataPlane::Tun => {
+                    localapi::tun_dial_backend(inner.user_dialer.clone(), inner.route_table.clone())
+                }
             }),
             dial_admission: localapi::global_dial_admission(),
             dial_timeout: localapi::LOCALAPI_DIAL_TIMEOUT,

@@ -134,23 +134,39 @@ impl Dialer {
         system_dial_tracked(&self.active_sys_conns, network, addr).await
     }
 
+    /// Resolve a user target through the generation's MagicDNS map and the
+    /// ordinary resolver. Callers enforcing tailnet-only policy must classify
+    /// one returned address and subsequently dial that exact address.
+    pub async fn resolve_user_dial(
+        &self,
+        network: &str,
+        addr: &str,
+    ) -> std::io::Result<Vec<SocketAddr>> {
+        validate_user_network(network)?;
+        let dns_map = self.dns_map.read().await.clone();
+        let doh = self.exit_dns_doh.read().await.clone();
+        resolve_addr(&dns_map, addr, doh.as_deref()).await
+    }
+
     /// User dial — user-initiated traffic. Resolves via MagicDNS → system DNS
     /// → exit DoH, then happy-eyeballs dials the results. Not tracked.
     pub async fn user_dial(&self, network: &str, addr: &str) -> std::io::Result<TcpStream> {
-        if network != "tcp" && network != "tcp4" && network != "tcp6" {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("unsupported network: {network}"),
-            ));
-        }
-        let dns_map = self.dns_map.read().await.clone();
-        let doh = self.exit_dns_doh.read().await.clone();
-        let addrs = resolve_addr(&dns_map, addr, doh.as_deref()).await?;
+        let addrs = self.resolve_user_dial(network, addr).await?;
         if addrs.len() == 1 {
-            // Single result — check netstack/route decision.
-            return self.dial_one_user(addrs[0]).await;
+            return self.dial_resolved_user(network, addrs[0]).await;
         }
         race_dial(&addrs).await
+    }
+
+    /// Dial an already-resolved user address without performing DNS again.
+    /// This closes UserDialPlan's DNS TOCTOU window for LocalAPI proxying.
+    pub async fn dial_resolved_user(
+        &self,
+        network: &str,
+        addr: SocketAddr,
+    ) -> std::io::Result<TcpStream> {
+        validate_user_network(network)?;
+        self.dial_one_user(addr).await
     }
 
     /// Dial a single user address with netstack/route awareness.
@@ -178,7 +194,23 @@ impl Dialer {
         rustscale_netns::dial_user_tcp_addr(addr).await
     }
 
-    /// Compute the [`UserDialPlan`] for an address without dialing.
+    /// Classify one already-resolved address against the caller's current
+    /// route generation. Keeping this operation separate from DNS lets a
+    /// tailnet-only caller dial `plan.addr` exactly and avoid re-resolution.
+    pub fn user_dial_plan_resolved(
+        &self,
+        addr: SocketAddr,
+        via_tailscale: impl FnOnce(IpAddr) -> bool,
+    ) -> UserDialPlan {
+        UserDialPlan {
+            addr,
+            via_tailscale: via_tailscale(addr.ip()),
+        }
+    }
+
+    /// Compute the legacy DNS-map-only [`UserDialPlan`] for an address without
+    /// dialing. Route-aware callers should resolve asynchronously and use
+    /// [`Self::user_dial_plan_resolved`] with their generation-bound routes.
     pub fn user_dial_plan(&self, network: &str, addr: &str) -> std::io::Result<UserDialPlan> {
         let _ = network;
         // Try_read to avoid blocking; if contended, use empty map.
@@ -204,6 +236,17 @@ impl Dialer {
     /// Number of currently tracked system connections.
     pub fn active_sys_conn_count(&self) -> usize {
         self.active_sys_conns.len()
+    }
+}
+
+fn validate_user_network(network: &str) -> std::io::Result<()> {
+    if matches!(network, "tcp" | "tcp4" | "tcp6") {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("unsupported network: {network}"),
+        ))
     }
 }
 

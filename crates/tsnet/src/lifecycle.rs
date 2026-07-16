@@ -2349,7 +2349,10 @@ impl Server {
                 peer_map: b.peer_map.clone(),
                 tailnet_lock: Some(b.tailnet_lock.clone()),
                 netstack: None, // TUN mode uses the generation's UserDialer
-                dial_backend: Some(localapi::tun_dial_backend(b.user_dialer.clone())),
+                dial_backend: Some(localapi::tun_dial_backend(
+                    b.user_dialer.clone(),
+                    b.route_table.clone(),
+                )),
                 dial_admission: localapi::global_dial_admission(),
                 dial_timeout: localapi::LOCALAPI_DIAL_TIMEOUT,
                 filter: std::sync::OnceLock::new(),

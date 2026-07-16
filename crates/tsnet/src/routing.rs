@@ -43,6 +43,10 @@ pub struct RouteTable {
     /// refresh fails. The selected peer is retained for retry, but ordinary
     /// fallback traffic is dropped until the refresh succeeds.
     exit_blocked: bool,
+    /// A snapshot can be published before its corresponding kernel routes
+    /// finish applying. LocalAPI TUN proxying stays fail-closed until that
+    /// apply succeeds.
+    localapi_dial_blocked: bool,
 }
 
 #[derive(Clone)]
@@ -103,6 +107,7 @@ impl RouteTable {
             exit_node: None,
             exit_capture: false,
             exit_blocked: false,
+            localapi_dial_blocked: false,
         }
     }
 
@@ -130,10 +135,12 @@ impl RouteTable {
         let exit = self.exit_node.clone();
         let capture = self.exit_capture;
         let blocked = self.exit_blocked;
+        let localapi_dial_blocked = self.localapi_dial_blocked;
         *self = Self::from_peers_with_opts(peers, accept);
         self.exit_node = exit;
         self.exit_capture = capture;
         self.exit_blocked = blocked;
+        self.localapi_dial_blocked = localapi_dial_blocked;
     }
 
     /// Rebuild the table from a new peer list with an explicit `accept_routes`
@@ -142,10 +149,12 @@ impl RouteTable {
         let exit = self.exit_node.clone();
         let capture = self.exit_capture;
         let blocked = self.exit_blocked;
+        let localapi_dial_blocked = self.localapi_dial_blocked;
         *self = Self::from_peers_with_opts(peers, accept_routes);
         self.exit_node = exit;
         self.exit_capture = capture;
         self.exit_blocked = blocked;
+        self.localapi_dial_blocked = localapi_dial_blocked;
     }
 
     /// Number of distinct normalized route entries (for diagnostics/testing).
@@ -250,6 +259,18 @@ impl RouteTable {
 
     pub(crate) fn exit_traffic_blocked(&self) -> bool {
         self.exit_blocked
+    }
+
+    pub(crate) fn block_localapi_dial(&mut self) {
+        self.localapi_dial_blocked = true;
+    }
+
+    pub(crate) fn unblock_localapi_dial(&mut self) {
+        self.localapi_dial_blocked = false;
+    }
+
+    pub(crate) fn localapi_dial_blocked(&self) -> bool {
+        self.localapi_dial_blocked
     }
 }
 

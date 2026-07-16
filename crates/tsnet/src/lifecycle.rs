@@ -718,7 +718,9 @@ async fn quiesce_running_state(inner: &mut RunningState, preserve_localapi: bool
     {
         abort.abort();
     }
-    inner.ssh_callbacks.revoke_current();
+    inner
+        .ssh_callbacks
+        .latch_key_revoked(&inner.node_key.public());
     inner.map_tasks.begin_shutdown();
     inner.extension_subscription.take();
     inner.hostinfo_hooks.clear();
@@ -4125,7 +4127,9 @@ fn revoke_owner_authority_terminal(owner: &mut CleanupOwner, drive: &crate::driv
         inner.health_watchdog.stop();
         inner.extension_subscription.take();
         inner.hostinfo_hooks.clear();
-        inner.ssh_callbacks.revoke_current();
+        inner
+            .ssh_callbacks
+            .latch_key_revoked(&inner.node_key.public());
         inner.map_tasks.begin_shutdown();
         for abort in inner
             .task_aborts

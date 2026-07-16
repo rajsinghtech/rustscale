@@ -384,11 +384,37 @@ impl C2nTaskSet {
     }
 }
 
+fn map_response_expires_request_key(response: &MapResponse) -> bool {
+    if response.NodeKeyExpired {
+        return true;
+    }
+    let now_millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| {
+            i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+        });
+    response
+        .Node
+        .as_ref()
+        .and_then(|node| node.KeyExpiry)
+        .is_some_and(|expiry| expiry.timestamp_millis() < now_millis)
+}
+
 async fn forward_map_response(
     updates: &mpsc::Sender<Result<MapResponse, StreamMapError>>,
     response: MapResponse,
     c2n_tasks: Option<&mut C2nTaskSet>,
+    ssh_callbacks: Option<&crate::SshCallbackDispatcher>,
+    request_key: &NodePublic,
 ) -> bool {
+    // This boundary runs before the potentially blocking buffered channel
+    // send. Latch the request key first so TKA/map consumers cannot delay
+    // callback revocation and reconnect cannot republish the expired key.
+    if map_response_expires_request_key(&response) {
+        if let Some(callbacks) = ssh_callbacks {
+            callbacks.latch_key_revoked(request_key);
+        }
+    }
     let c2n_ping = response
         .PingRequest
         .as_ref()
@@ -738,7 +764,8 @@ impl ControlClient {
                 ));
             }
 
-            let mut callback_generation = ssh_callbacks.map(|dispatcher| {
+            let boundary_callbacks = ssh_callbacks.clone();
+            let mut callback_generation = ssh_callbacks.and_then(|dispatcher| {
                 crate::ssh_notify::CallbackGeneration::new(
                     dispatcher,
                     h2_send.clone(),
@@ -820,7 +847,15 @@ impl ControlClient {
                     let msg: Vec<u8> = read_buf.drain(..size).collect();
                     match serde_json::from_slice::<MapResponse>(&msg) {
                         Ok(mr) => {
-                            if !forward_map_response(&updates, mr, c2n_tasks.as_mut()).await {
+                            if !forward_map_response(
+                                &updates,
+                                mr,
+                                c2n_tasks.as_mut(),
+                                boundary_callbacks.as_ref(),
+                                &req.NodeKey,
+                            )
+                            .await
+                            {
                                 break;
                             }
                         }

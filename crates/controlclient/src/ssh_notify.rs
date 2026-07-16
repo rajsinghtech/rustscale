@@ -128,8 +128,14 @@ pub struct SshCallbackDispatcher {
 
 #[derive(Default)]
 struct DispatcherInner {
-    current: Mutex<Option<Arc<Generation>>>,
+    state: Mutex<DispatcherState>,
     metrics: Arc<SshNotifyMetrics>,
+}
+
+#[derive(Default)]
+struct DispatcherState {
+    current: Option<Arc<Generation>>,
+    revoked_keys: HashSet<NodePublic>,
 }
 
 impl std::fmt::Debug for SshCallbackDispatcher {
@@ -161,52 +167,107 @@ impl SshCallbackDispatcher {
     pub fn revoke_current(&self) {
         let generation = self
             .inner
-            .current
+            .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .current
             .take();
         if let Some(generation) = generation {
             generation.revoke();
         }
     }
 
-    pub(crate) fn activate(&self, node_key: NodePublic) -> GenerationLease {
+    /// Permanently latch one request key as callback-revoked. Reconnects using
+    /// this key cannot publish a generation, even if an old map task is still
+    /// running or reconnecting.
+    pub fn latch_key_revoked(&self, node_key: &NodePublic) {
+        let generation = {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.revoked_keys.insert(node_key.clone());
+            if state
+                .current
+                .as_ref()
+                .is_some_and(|generation| generation.node_key == *node_key)
+            {
+                state.current.take()
+            } else {
+                None
+            }
+        };
+        if let Some(generation) = generation {
+            generation.revoke();
+        }
+    }
+
+    pub fn is_key_revoked(&self, node_key: &NodePublic) -> bool {
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .revoked_keys
+            .contains(node_key)
+    }
+
+    /// Clear a key-revocation latch only after registration has authenticated
+    /// the replacement identity. Generation publication still waits for the
+    /// replacement map request to receive an accepted HTTP response.
+    pub fn install_authenticated_replacement(&self, node_key: &NodePublic) {
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .revoked_keys
+            .remove(node_key);
+    }
+
+    pub(crate) fn activate(&self, node_key: NodePublic) -> Option<GenerationLease> {
         static NEXT_GENERATION: AtomicU64 = AtomicU64::new(0);
         let token = NEXT_GENERATION
             .fetch_add(1, Ordering::Relaxed)
             .wrapping_add(1);
-        let generation = Arc::new(Generation::new(
-            token,
-            node_key,
-            Arc::clone(&self.inner.metrics),
-        ));
-        let previous = self
-            .inner
-            .current
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .replace(Arc::clone(&generation));
+        let (generation, previous) = {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.revoked_keys.contains(&node_key) {
+                return None;
+            }
+            let generation = Arc::new(Generation::new(
+                token,
+                node_key,
+                Arc::clone(&self.inner.metrics),
+            ));
+            let previous = state.current.replace(Arc::clone(&generation));
+            (generation, previous)
+        };
         if let Some(previous) = previous {
             previous.revoke();
         }
-        GenerationLease {
+        Some(GenerationLease {
             dispatcher: self.clone(),
             generation,
-        }
+        })
     }
 
     fn deactivate(&self, token: u64) {
         let generation = {
-            let mut current = self
+            let mut state = self
                 .inner
-                .current
+                .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if current
+            if state
+                .current
                 .as_ref()
                 .is_some_and(|current| current.token == token)
             {
-                current.take()
+                state.current.take()
             } else {
                 None
             }
@@ -223,9 +284,10 @@ impl SshCallbackDispatcher {
     ) -> Result<(), SshNotifyEnqueueError> {
         let generation = self
             .inner
-            .current
+            .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .current
             .clone();
         let Some(generation) = generation else {
             self.inner
@@ -482,7 +544,6 @@ impl Generation {
         if self.revoked.swap(true, Ordering::AcqRel) {
             return;
         }
-        global_worker_scheduler().cancel(self.token);
         let dropped = self
             .queue
             .lock()
@@ -504,6 +565,9 @@ impl Generation {
         for abort in in_flight {
             abort.abort();
         }
+        // Tombstone and return every waiting, granted, and active permit only
+        // after all generation-owned dispatch tasks have been told to stop.
+        global_worker_scheduler().cancel(self.token);
         self.wake.notify_waiters();
     }
 
@@ -512,6 +576,12 @@ impl Generation {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&task);
+    }
+}
+
+impl Drop for Generation {
+    fn drop(&mut self) {
+        global_worker_scheduler().retire(self.token);
     }
 }
 
@@ -547,6 +617,8 @@ struct GlobalWorkerState {
     order: VecDeque<u64>,
     waiting: HashMap<u64, Arc<tokio::sync::Notify>>,
     granted: HashMap<u64, usize>,
+    active: HashMap<u64, Vec<Arc<AtomicBool>>>,
+    tombstones: HashSet<u64>,
 }
 
 impl GlobalWorkerScheduler {
@@ -559,22 +631,19 @@ impl GlobalWorkerScheduler {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.tombstones.contains(&generation) {
+            return None;
+        }
         if let Some(granted) = state.granted.get_mut(&generation) {
             *granted -= 1;
             if *granted == 0 {
                 state.granted.remove(&generation);
             }
-            return Some(GlobalWorkerPermit {
-                scheduler: self,
-                generation,
-            });
+            return Some(issue_worker_permit(self, &mut state, generation));
         }
         if state.available > 0 && state.order.is_empty() {
             state.available -= 1;
-            return Some(GlobalWorkerPermit {
-                scheduler: self,
-                generation,
-            });
+            return Some(issue_worker_permit(self, &mut state, generation));
         }
         if !state.waiting.contains_key(&generation) {
             state.order.push_back(generation);
@@ -583,13 +652,21 @@ impl GlobalWorkerScheduler {
         None
     }
 
-    fn release(&self, _generation: u64) {
+    fn release(&self, generation: u64, returned: &Arc<AtomicBool>) {
         let wake = {
             let mut state = self
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            state.available = state.available.saturating_add(1).min(GLOBAL_WORKERS);
+            if let Some(active) = state.active.get_mut(&generation) {
+                active.retain(|permit| !Arc::ptr_eq(permit, returned));
+                if active.is_empty() {
+                    state.active.remove(&generation);
+                }
+            }
+            if !returned.swap(true, Ordering::AcqRel) {
+                state.available = state.available.saturating_add(1).min(GLOBAL_WORKERS);
+            }
             grant_next_worker(&mut state)
         };
         if let Some(wake) = wake {
@@ -603,10 +680,18 @@ impl GlobalWorkerScheduler {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.tombstones.insert(generation);
             state.waiting.remove(&generation);
             state.order.retain(|waiting| *waiting != generation);
             if let Some(granted) = state.granted.remove(&generation) {
                 state.available = state.available.saturating_add(granted).min(GLOBAL_WORKERS);
+            }
+            if let Some(active) = state.active.remove(&generation) {
+                let returned = active
+                    .into_iter()
+                    .filter(|permit| !permit.swap(true, Ordering::AcqRel))
+                    .count();
+                state.available = state.available.saturating_add(returned).min(GLOBAL_WORKERS);
             }
             let mut wakes = Vec::new();
             while state.available > 0 {
@@ -620,6 +705,32 @@ impl GlobalWorkerScheduler {
         for wake in wakes {
             wake.notify_one();
         }
+    }
+
+    fn retire(&self, generation: u64) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .tombstones
+            .remove(&generation);
+    }
+}
+
+fn issue_worker_permit(
+    scheduler: &'static GlobalWorkerScheduler,
+    state: &mut GlobalWorkerState,
+    generation: u64,
+) -> GlobalWorkerPermit {
+    let returned = Arc::new(AtomicBool::new(false));
+    state
+        .active
+        .entry(generation)
+        .or_default()
+        .push(Arc::clone(&returned));
+    GlobalWorkerPermit {
+        scheduler,
+        generation,
+        returned,
     }
 }
 
@@ -643,6 +754,8 @@ fn global_worker_scheduler() -> &'static GlobalWorkerScheduler {
             order: VecDeque::new(),
             waiting: HashMap::new(),
             granted: HashMap::new(),
+            active: HashMap::new(),
+            tombstones: HashSet::new(),
         }),
     })
 }
@@ -650,12 +763,18 @@ fn global_worker_scheduler() -> &'static GlobalWorkerScheduler {
 struct GlobalWorkerPermit {
     scheduler: &'static GlobalWorkerScheduler,
     generation: u64,
+    returned: Arc<AtomicBool>,
 }
 
 impl Drop for GlobalWorkerPermit {
     fn drop(&mut self) {
-        self.scheduler.release(self.generation);
+        self.scheduler.release(self.generation, &self.returned);
     }
+}
+
+struct DispatchStart {
+    worker_permit: GlobalWorkerPermit,
+    job: NotifyJob,
 }
 
 /// Runtime attached to exactly one authenticated map Noise/H2 generation.
@@ -670,12 +789,12 @@ impl CallbackGeneration {
         dispatcher: SshCallbackDispatcher,
         sender: h2::client::SendRequest<bytes::Bytes>,
         node_key: NodePublic,
-    ) -> Self {
-        Self {
-            lease: dispatcher.activate(node_key),
+    ) -> Option<Self> {
+        Some(Self {
+            lease: dispatcher.activate(node_key)?,
             transport: Arc::new(H2CallbackTransport { sender }),
             tasks: JoinSet::new(),
-        }
+        })
     }
 
     fn dispatch_ready(&mut self) {
@@ -702,15 +821,15 @@ impl CallbackGeneration {
             let generation = Arc::clone(&self.lease.generation);
             let metrics = Arc::clone(&generation.metrics);
             let task = generation.next_task.fetch_add(1, Ordering::Relaxed);
-            let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+            let (start_tx, start_rx) = tokio::sync::oneshot::channel::<DispatchStart>();
             let abort = self.tasks.spawn(async move {
-                if start_rx.await.is_err() {
+                let Ok(start) = start_rx.await else {
                     return;
-                }
-                let _worker_permit = worker_permit;
+                };
+                let _worker_permit = start.worker_permit;
                 let _guard = InFlightGuard { generation, task };
                 let deadline = tokio::time::Instant::now() + DISPATCH_TIMEOUT;
-                deliver_callback(transport.as_ref(), job, deadline, &metrics).await;
+                deliver_callback(transport.as_ref(), start.job, deadline, &metrics).await;
             });
             let admitted = {
                 let mut in_flight = self
@@ -726,14 +845,20 @@ impl CallbackGeneration {
                     true
                 }
             };
+            let start = DispatchStart { worker_permit, job };
             if admitted {
-                let _ = start_tx.send(());
+                if let Err(start) = start_tx.send(start) {
+                    self.lease.generation.unregister(task);
+                    drop(start);
+                    abort.abort();
+                }
             } else {
                 self.lease
                     .generation
                     .metrics
                     .revoked_in_flight
                     .fetch_add(1, Ordering::Relaxed);
+                drop(start);
                 abort.abort();
             }
         }
@@ -745,6 +870,9 @@ impl CallbackGeneration {
     ) -> Option<Result<bytes::Bytes, h2::Error>> {
         loop {
             self.dispatch_ready();
+            if self.lease.generation.revoked.load(Ordering::Acquire) {
+                return body.data().await;
+            }
             if self.tasks.is_empty() {
                 tokio::select! {
                     data = body.data() => return data,
@@ -1010,12 +1138,16 @@ mod tests {
     #[test]
     fn key_rotation_generation_replacement_revokes_and_drains_old_jobs() {
         let dispatcher = SshCallbackDispatcher::new();
-        let first = dispatcher.activate(NodePublic::from_raw32([1; 32]));
+        let first = dispatcher
+            .activate(NodePublic::from_raw32([1; 32]))
+            .unwrap();
         let notifier = dispatcher.notifier();
         notifier
             .enqueue("https://any.invalid/one", &request(1))
             .unwrap();
-        let second = dispatcher.activate(NodePublic::from_raw32([2; 32]));
+        let second = dispatcher
+            .activate(NodePublic::from_raw32([2; 32]))
+            .unwrap();
         assert!(first.generation.revoked.load(Ordering::Acquire));
         assert!(first.generation.pop().is_none());
         assert_eq!(dispatcher.metrics().revoked_queued, 1);
@@ -1035,7 +1167,7 @@ mod tests {
     #[test]
     fn profile_logout_revokes_admission_before_transport_teardown() {
         let dispatcher = SshCallbackDispatcher::new();
-        let generation = dispatcher.activate(NodePublic::default());
+        let generation = dispatcher.activate(NodePublic::default()).unwrap();
         let notifier = dispatcher.notifier();
         notifier
             .enqueue("https://any.invalid/queued", &request(1))
@@ -1053,9 +1185,10 @@ mod tests {
     #[tokio::test]
     async fn blocked_and_failed_rotation_leave_callback_generation_revoked() {
         let dispatcher = SshCallbackDispatcher::new();
-        let generation = dispatcher.activate(NodePublic::default());
+        let expired_key = NodePublic::from_raw32([7; 32]);
+        let generation = dispatcher.activate(expired_key.clone()).unwrap();
         let notifier = dispatcher.notifier();
-        dispatcher.revoke_current();
+        dispatcher.latch_key_revoked(&expired_key);
 
         let _ = tokio::time::timeout(
             Duration::from_millis(10),
@@ -1063,6 +1196,7 @@ mod tests {
         )
         .await;
         assert!(generation.generation.revoked.load(Ordering::Acquire));
+        assert!(dispatcher.activate(expired_key.clone()).is_none());
         assert_eq!(
             notifier.enqueue("https://any.invalid/blocked", &request(1)),
             Err(SshNotifyEnqueueError::NoGeneration)
@@ -1070,10 +1204,18 @@ mod tests {
 
         let rotation: Result<(), ()> = Err(());
         assert!(rotation.is_err());
+        assert!(dispatcher.activate(expired_key.clone()).is_none());
         assert_eq!(
             notifier.enqueue("https://any.invalid/failed", &request(1)),
             Err(SshNotifyEnqueueError::NoGeneration)
         );
+
+        let replacement = NodePublic::from_raw32([8; 32]);
+        dispatcher.latch_key_revoked(&replacement);
+        assert!(dispatcher.activate(replacement.clone()).is_none());
+        dispatcher.install_authenticated_replacement(&replacement);
+        assert!(dispatcher.activate(replacement).is_some());
+        assert!(dispatcher.activate(expired_key).is_none());
     }
 
     #[test]
@@ -1228,7 +1370,8 @@ mod tests {
 
         let dispatcher = SshCallbackDispatcher::new();
         let mut generation =
-            CallbackGeneration::new(dispatcher.clone(), sender.clone(), NodePublic::default());
+            CallbackGeneration::new(dispatcher.clone(), sender.clone(), NodePublic::default())
+                .unwrap();
         dispatcher
             .notifier()
             .enqueue("https://arbitrary.invalid/ssh/event?q=1", &request(7))
@@ -1285,7 +1428,7 @@ mod tests {
 
         let dispatcher = SshCallbackDispatcher::new();
         let mut generation =
-            CallbackGeneration::new(dispatcher.clone(), sender, NodePublic::default());
+            CallbackGeneration::new(dispatcher.clone(), sender, NodePublic::default()).unwrap();
         dispatcher
             .notifier()
             .enqueue("https://unused.invalid/blocked", &request(7))
@@ -1325,6 +1468,8 @@ mod tests {
                 order: VecDeque::new(),
                 waiting: HashMap::new(),
                 granted: HashMap::new(),
+                active: HashMap::new(),
+                tombstones: HashSet::new(),
             }),
         }));
         let mut busy = (0..GLOBAL_WORKERS)
@@ -1370,6 +1515,50 @@ mod tests {
         assert_eq!(metrics.snapshot().queue_expired, 0);
         drop(permit);
         drop(busy);
+    }
+
+    #[test]
+    fn thousands_of_revoke_between_has_work_and_acquire_return_all_permits() {
+        let scheduler = Box::leak(Box::new(GlobalWorkerScheduler {
+            state: Mutex::new(GlobalWorkerState {
+                available: GLOBAL_WORKERS,
+                order: VecDeque::new(),
+                waiting: HashMap::new(),
+                granted: HashMap::new(),
+                active: HashMap::new(),
+                tombstones: HashSet::new(),
+            }),
+        }));
+        let active = (0..GLOBAL_WORKERS)
+            .map(|_| {
+                scheduler
+                    .try_acquire(9_999, Arc::new(tokio::sync::Notify::new()))
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        scheduler.cancel(9_999);
+        assert_eq!(scheduler.state.lock().unwrap().available, GLOBAL_WORKERS);
+        drop(active);
+        assert_eq!(scheduler.state.lock().unwrap().available, GLOBAL_WORKERS);
+        scheduler.retire(9_999);
+
+        let metrics = Arc::new(SshNotifyMetrics::default());
+        for token in 10_000..15_000 {
+            let generation = Generation::new(token, NodePublic::default(), Arc::clone(&metrics));
+            generation.enqueue("/queued".into(), Vec::new(), 1).unwrap();
+            assert!(generation.has_work());
+            scheduler.cancel(token);
+            assert!(scheduler
+                .try_acquire(token, Arc::clone(&generation.wake))
+                .is_none());
+            scheduler.retire(token);
+        }
+        let state = scheduler.state.lock().unwrap();
+        assert_eq!(state.available, GLOBAL_WORKERS);
+        assert!(state.waiting.is_empty());
+        assert!(state.granted.is_empty());
+        assert!(state.active.is_empty());
+        assert!(state.tombstones.is_empty());
     }
 
     #[derive(Default)]

@@ -77,6 +77,67 @@ fn map_response_frame_decode() {
     assert_eq!(decoded, mr);
 }
 
+#[tokio::test]
+async fn expired_map_latches_callbacks_before_buffered_channel_and_tka_consumers() {
+    let node_key = NodePrivate::generate().public();
+    let dispatcher = crate::SshCallbackDispatcher::new();
+    let _generation = dispatcher.activate(node_key.clone()).unwrap();
+    let (updates, mut receiver) = tokio::sync::mpsc::channel(1);
+    updates.send(Ok(MapResponse::default())).await.unwrap();
+
+    let forwarding = {
+        let dispatcher = dispatcher.clone();
+        let node_key = node_key.clone();
+        tokio::spawn(async move {
+            forward_map_response(
+                &updates,
+                MapResponse {
+                    NodeKeyExpired: true,
+                    ..Default::default()
+                },
+                None,
+                Some(&dispatcher),
+                &node_key,
+            )
+            .await
+        })
+    };
+    tokio::task::yield_now().await;
+
+    assert!(dispatcher.activate(node_key.clone()).is_none());
+    assert_eq!(
+        dispatcher.notifier().enqueue(
+            "https://arbitrary.invalid/ssh/notify",
+            &rustscale_tailcfg::SSHEventNotifyRequest {
+                SrcNode: 1,
+                ..Default::default()
+            },
+        ),
+        Err(crate::SshNotifyEnqueueError::NoGeneration)
+    );
+    // Unblock forwarding only after observing revocation. A downstream TKA
+    // consumer cannot run before this channel handoff either.
+    assert!(receiver.recv().await.is_some());
+    assert!(forwarding.await.unwrap());
+
+    let tka_pause = Arc::new(tokio::sync::Semaphore::new(0));
+    let (tka_entered_tx, tka_entered_rx) = tokio::sync::oneshot::channel();
+    let tka_consumer = {
+        let tka_pause = Arc::clone(&tka_pause);
+        tokio::spawn(async move {
+            let expired = receiver.recv().await.unwrap().unwrap();
+            assert!(expired.NodeKeyExpired);
+            let _ = tka_entered_tx.send(());
+            let _permit = tka_pause.acquire().await.unwrap();
+        })
+    };
+    tka_entered_rx.await.unwrap();
+    assert!(dispatcher.is_key_revoked(&node_key));
+    assert!(dispatcher.activate(node_key).is_none());
+    tka_pause.add_permits(1);
+    tka_consumer.await.unwrap();
+}
+
 /// Register request serialization: verify the JSON wire format matches
 /// what Go's control server expects (PascalCase field names, nodekey prefix).
 #[test]
@@ -254,7 +315,8 @@ async fn map_delivery_precedes_never_completing_c2n() {
         ..Default::default()
     };
 
-    assert!(forward_map_response(&tx, response, Some(&mut tasks)).await);
+    let request_key = NodePrivate::generate().public();
+    assert!(forward_map_response(&tx, response, Some(&mut tasks), None, &request_key).await);
     let delivered = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
         .await
         .expect("map delivery was blocked by C2N")

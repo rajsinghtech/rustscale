@@ -783,7 +783,7 @@ pub(crate) fn spawn_map_update_task(
                         // deliberately leave it revoked; only a newly
                         // authenticated map generation can publish callback
                         // authority again.
-                        ssh_callbacks.revoke_current();
+                        ssh_callbacks.latch_key_revoked(&node_pub);
                     }
                     key_expired.store(expired, std::sync::atomic::Ordering::Relaxed);
                     ipn_backend.set_key_expired(expired);
@@ -848,7 +848,13 @@ pub(crate) fn spawn_map_update_task(
                                     let ss = map_session.clone();
                                     let router = c2n_router.clone();
                                     let callbacks = ssh_callbacks.clone();
+                                    let replacement_key = node_pub.clone();
                                     if !Box::pin(map_tasks.rebind(async move {
+                                        // The old map task is now joined, so
+                                        // explicitly install the identity that
+                                        // registration just authenticated.
+                                        callbacks
+                                            .install_authenticated_replacement(&replacement_key);
                                         cc_new
                                             .stream_map_loop_with_c2n_and_ssh_callbacks(
                                                 &new_map_req,

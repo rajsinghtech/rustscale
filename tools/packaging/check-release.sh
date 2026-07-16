@@ -73,14 +73,22 @@ fi
 grep -Fq 'COPY vendor/boringtun/ ./vendor/boringtun/' Dockerfile
 grep -Fq 'ARG RUSTSCALE_LTO=thin' Dockerfile
 grep -Fq "CARGO_PROFILE_RELEASE_LTO=\$RUSTSCALE_LTO cargo build" Dockerfile
-awk '
+docker_job=$(awk '
     /^  docker:/ { docker = 1; next }
     docker && /^  [A-Za-z0-9_-]+:/ { exit }
     docker { print }
-' .github/workflows/release.yml | grep -Fq 'timeout-minutes: 90'
+' .github/workflows/release.yml)
+printf '%s\n' "$docker_job" | grep -Fq 'needs: [metadata, linux]'
+printf '%s\n' "$docker_job" | grep -Fq 'timeout-minutes: 20'
+printf '%s\n' "$docker_job" | grep -Fq 'pattern: rustscale-*-unknown-linux-gnu'
+printf '%s\n' "$docker_job" | grep -Fq 'file: ./Dockerfile.release'
 grep -q 'ln -s rustscale /usr/local/bin/tailscale' Dockerfile
 grep -q 'org.opencontainers.image.version' Dockerfile
 test "$(grep -c '^FROM .*@sha256:[0-9a-f]\{64\}' Dockerfile)" -eq 2
+grep -Fq "COPY container-binaries/\${TARGETARCH}/rustscale " Dockerfile.release
+grep -Fq "COPY container-binaries/\${TARGETARCH}/rustscaled " Dockerfile.release
+grep -q 'org.opencontainers.image.version' Dockerfile.release
+test "$(grep -c '^FROM .*@sha256:[0-9a-f]\{64\}' Dockerfile.release)" -eq 1
 grep -q "v$version" site/index.html
 python3 tools/packaging/check-pages-performance.py
 

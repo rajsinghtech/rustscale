@@ -1,10 +1,22 @@
 use std::collections::HashSet;
 
-use crate::PostureError;
+use crate::{CollectionContext, PostureError};
 
 /// Collect serial numbers exposed by the current platform.
 pub fn get_serial_numbers() -> Result<Vec<String>, PostureError> {
-    get_serial_numbers_impl()
+    get_serial_numbers_cancellable(&CollectionContext::unbounded())
+}
+
+pub(crate) fn get_serial_numbers_cancellable(
+    context: &CollectionContext,
+) -> Result<Vec<String>, PostureError> {
+    context.check()?;
+    #[cfg(target_os = "windows")]
+    let result = crate::serial_windows::get_serial_numbers_impl(context);
+    #[cfg(not(target_os = "windows"))]
+    let result = get_serial_numbers_impl();
+    context.check()?;
+    result
 }
 
 #[cfg(target_os = "linux")]
@@ -13,8 +25,6 @@ use crate::serial_linux::get_serial_numbers_impl;
 use crate::serial_macos::get_serial_numbers_impl;
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 use crate::serial_stub::get_serial_numbers_impl;
-#[cfg(target_os = "windows")]
-use crate::serial_windows::get_serial_numbers_impl;
 
 /// Whether a DMI serial is an empty or known placeholder value.
 pub fn is_sentinel_serial(serial: &str) -> bool {

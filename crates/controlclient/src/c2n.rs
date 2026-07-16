@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use rustscale_tailcfg::PingRequest;
+use tokio_util::sync::CancellationToken;
 
 /// Maximum HTTP-formatted C2N request payload accepted from control.
 pub const MAX_C2N_REQUEST_BYTES: usize = 256 * 1024;
@@ -72,6 +73,17 @@ impl C2nResponse {
 #[async_trait]
 pub trait C2nHandler: Send + Sync {
     async fn handle(&self, req: C2nRequest) -> C2nResponse;
+
+    /// Handle a request with same-session cancellation. Implementations that
+    /// start non-async work should override this method and propagate the
+    /// token. The default remains source-compatible for ordinary handlers.
+    async fn handle_cancellable(
+        &self,
+        req: C2nRequest,
+        _cancellation: CancellationToken,
+    ) -> C2nResponse {
+        self.handle(req).await
+    }
 }
 
 /// Routes incoming C2N requests to registered handlers by URL path.
@@ -96,15 +108,23 @@ impl C2nRouter {
     }
 
     pub async fn route(&self, req: C2nRequest) -> C2nResponse {
+        self.route_cancellable(req, CancellationToken::new()).await
+    }
+
+    pub async fn route_cancellable(
+        &self,
+        req: C2nRequest,
+        cancellation: CancellationToken,
+    ) -> C2nResponse {
         let route_path = req.path.split_once('?').map_or(req.path.as_str(), |v| v.0);
         if let Some(handler) = self
             .exact
             .get(&(req.method.clone(), route_path.to_string()))
         {
-            return handler.handle(req).await;
+            return handler.handle_cancellable(req, cancellation).await;
         }
         if let Some(handler) = self.fallback.get(route_path) {
-            return handler.handle(req).await;
+            return handler.handle_cancellable(req, cancellation).await;
         }
         let known = self.exact.keys().any(|(_, path)| path == route_path)
             || self.fallback.contains_key(route_path);
@@ -151,19 +171,32 @@ pub async fn answer_c2n_ping(
     transport: &dyn C2nReplyTransport,
     ping: &PingRequest,
 ) -> Result<(), C2nReplyError> {
+    let cancellation = CancellationToken::new();
+    let _cancel_on_drop = CancelOnDrop(cancellation.clone());
     if ping.Types != "c2n" || ping.URL.is_empty() {
         return Err(C2nReplyError::InvalidRequest);
     }
     let callback_path = callback_path(&ping.URL)?;
     let parsed = parse_http_request(&ping.Payload)?;
-    let response = tokio::time::timeout(parsed.timeout, router.route(parsed.request))
-        .await
-        .map_err(|_| C2nReplyError::HandlerTimeout)?;
+    let response = tokio::time::timeout(
+        parsed.timeout,
+        router.route_cancellable(parsed.request, cancellation),
+    )
+    .await
+    .map_err(|_| C2nReplyError::HandlerTimeout)?;
     let response = serialize_http_response(response)?;
     tokio::time::timeout(REPLY_TIMEOUT, transport.send(&callback_path, response))
         .await
         .map_err(|_| C2nReplyError::ReplyTimeout)??;
     Ok(())
+}
+
+struct CancelOnDrop(CancellationToken);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
 }
 
 struct ParsedRequest {
@@ -387,6 +420,71 @@ mod tests {
         assert_eq!(sent[0].0, "/callback?id=1");
         assert!(sent[0].1.starts_with(b"HTTP/1.1 200 OK\r\n"));
         assert!(sent[0].1.ends_with(b"\r\n\r\nsecret"));
+    }
+
+    #[tokio::test]
+    async fn dropping_c2n_answer_propagates_session_cancellation() {
+        struct CancellableHandler {
+            entered: Arc<tokio::sync::Notify>,
+            worker_cancelled: Arc<std::sync::atomic::AtomicBool>,
+        }
+
+        #[async_trait]
+        impl C2nHandler for CancellableHandler {
+            async fn handle(&self, _req: C2nRequest) -> C2nResponse {
+                std::future::pending().await
+            }
+
+            async fn handle_cancellable(
+                &self,
+                _req: C2nRequest,
+                cancellation: CancellationToken,
+            ) -> C2nResponse {
+                let worker_cancelled = self.worker_cancelled.clone();
+                tokio::spawn(async move {
+                    cancellation.cancelled().await;
+                    worker_cancelled.store(true, std::sync::atomic::Ordering::Release);
+                });
+                self.entered.notify_one();
+                std::future::pending().await
+            }
+        }
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let worker_cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut router = C2nRouter::new();
+        router.register(
+            "POST /cancel",
+            Arc::new(CancellableHandler {
+                entered: entered.clone(),
+                worker_cancelled: worker_cancelled.clone(),
+            }),
+        );
+        let router = Arc::new(router);
+        let task_router = router.clone();
+        let task = tokio::spawn(async move {
+            answer_c2n_ping(
+                task_router.as_ref(),
+                &FakeTransport::default(),
+                &PingRequest {
+                    URL: "https://control.example/callback".into(),
+                    Types: "c2n".into(),
+                    Payload: request("/cancel", b""),
+                    ..PingRequest::default()
+                },
+            )
+            .await
+        });
+        entered.notified().await;
+        task.abort();
+        let _ = task.await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !worker_cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("session cancellation did not reach handler worker");
     }
 
     #[test]

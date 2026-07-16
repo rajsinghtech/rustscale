@@ -81,27 +81,85 @@ impl TsnetC2nBackend {
     async fn collect_posture(
         &self,
         include_hardware_addrs: bool,
+        session_cancellation: tokio_util::sync::CancellationToken,
     ) -> Option<C2NPostureIdentityResponse> {
+        const POSTURE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
         let service = self.posture_service.clone();
-        let user_enabled = self.posture_checking.load(Ordering::Acquire);
-        let collection = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            tokio::task::spawn_blocking(move || {
-                service.collect(user_enabled, include_hardware_addrs)
-            }),
-        )
-        .await;
-        let collection = match collection {
-            Ok(Ok(collection)) => collection,
-            Ok(Err(_)) => {
-                log::warn!("posture: collector task failed");
+        let worker_service = service.clone();
+        let preference = self.posture_checking.clone();
+        let worker_preference = preference.clone();
+        let cancellation = session_cancellation.child_token();
+        let worker_cancellation = cancellation.clone();
+        let deadline = std::time::Instant::now() + POSTURE_DEADLINE;
+        let collection = tokio::task::spawn_blocking(move || {
+            let context =
+                rustscale_posture::CollectionContext::new(Some(deadline), worker_cancellation);
+            worker_service.collect_cancellable(
+                || worker_preference.load(Ordering::Acquire),
+                include_hardware_addrs,
+                &context,
+            )
+        });
+        let collection = tokio::select! {
+            result = collection => match result {
+                Ok(Ok(collection)) => collection,
+                Ok(Err(rustscale_posture::PostureError::Cancelled)) => return None,
+                Ok(Err(rustscale_posture::PostureError::Timeout)) => {
+                    log::warn!("posture: collection deadline exceeded");
+                    return None;
+                }
+                Ok(Err(error)) => {
+                    log::warn!("posture: collection failed: {error}");
+                    return None;
+                }
+                Err(_) => {
+                    log::warn!("posture: collector task failed");
+                    return None;
+                }
+            },
+            () = session_cancellation.cancelled() => {
+                cancellation.cancel();
                 return None;
             }
-            Err(_) => {
+            () = tokio::time::sleep(POSTURE_DEADLINE) => {
+                cancellation.cancel();
                 log::warn!("posture: collection deadline exceeded");
                 return None;
             }
         };
+        if session_cancellation.is_cancelled() {
+            return None;
+        }
+        let revalidation_service = service.clone();
+        let revalidation_preference = preference.clone();
+        let revalidation = tokio::task::spawn_blocking(move || {
+            revalidation_service.revalidate_for_publication(
+                revalidation_preference.load(Ordering::Acquire),
+                collection,
+            )
+        });
+        let collection = tokio::select! {
+            result = revalidation => {
+                let Ok(collection) = result else {
+                    log::warn!("posture: policy revalidation task failed");
+                    return None;
+                };
+                collection
+            },
+            () = session_cancellation.cancelled() => {
+                cancellation.cancel();
+                return None;
+            }
+            () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                cancellation.cancel();
+                log::warn!("posture: policy revalidation deadline exceeded");
+                return None;
+            }
+        };
+        if session_cancellation.is_cancelled() {
+            return None;
+        }
         if let Some(error) = collection.policy_error {
             log::warn!("posture: policy lookup failed: {error}");
         }
@@ -273,7 +331,8 @@ impl C2nBackend for TsnetC2nBackend {
     }
 
     async fn posture_identity(&self) -> Option<C2NPostureIdentityResponse> {
-        self.collect_posture(false).await
+        self.collect_posture(false, tokio_util::sync::CancellationToken::new())
+            .await
     }
 }
 
@@ -409,6 +468,15 @@ struct PostureIdentityHandler {
 #[async_trait]
 impl C2nHandler for PostureIdentityHandler {
     async fn handle(&self, req: C2nRequest) -> C2nResponse {
+        self.handle_cancellable(req, tokio_util::sync::CancellationToken::new())
+            .await
+    }
+
+    async fn handle_cancellable(
+        &self,
+        req: C2nRequest,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> C2nResponse {
         let include_hardware_addrs = req
             .path
             .split_once('?')
@@ -419,7 +487,11 @@ impl C2nHandler for PostureIdentityHandler {
                     .any(|(key, value)| key == "hwaddrs" && value == "true")
             })
             .unwrap_or(false);
-        match self.backend.collect_posture(include_hardware_addrs).await {
+        match self
+            .backend
+            .collect_posture(include_hardware_addrs, cancellation)
+            .await
+        {
             Some(response) => {
                 let body = serde_json::to_value(response).unwrap_or(serde_json::Value::Null);
                 C2nResponse::json(200, &body)

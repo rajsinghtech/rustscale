@@ -19,6 +19,11 @@ mod serial_stub;
 mod serial_windows;
 
 use std::sync::Mutex;
+#[cfg(any(target_os = "windows", test))]
+use std::time::Duration;
+use std::time::Instant;
+
+pub use tokio_util::sync::CancellationToken;
 
 pub use hwaddr::get_hardware_addrs;
 pub use rustscale_syspolicy::PreferenceOption;
@@ -47,6 +52,12 @@ pub enum PostureError {
     /// A bounded platform operation was cancelled.
     #[error("platform collection was cancelled")]
     Cancelled,
+    /// The globally bounded platform worker pool is occupied.
+    #[error("platform collection worker capacity is unavailable")]
+    WorkerCapacity,
+    /// A platform worker terminated without returning a result.
+    #[error("platform collection worker terminated")]
+    WorkerTerminated,
     /// An operating-system operation failed.
     #[error("platform collection failed ({0:?})")]
     Io(std::io::ErrorKind),
@@ -136,10 +147,91 @@ impl PosturePolicy for SystemPolicy {
     }
 }
 
+/// Deadline and cancellation authority for one posture collection.
+#[derive(Clone, Debug)]
+pub struct CollectionContext {
+    deadline: Option<Instant>,
+    cancellation: CancellationToken,
+}
+
+impl CollectionContext {
+    /// Create a cancellable context with an optional monotonic deadline.
+    pub fn new(deadline: Option<Instant>, cancellation: CancellationToken) -> Self {
+        Self {
+            deadline,
+            cancellation,
+        }
+    }
+
+    /// Create a fresh context that has no caller deadline.
+    pub fn unbounded() -> Self {
+        Self::new(None, CancellationToken::new())
+    }
+
+    /// Return a context no later than `timeout` from now.
+    #[cfg(target_os = "windows")]
+    pub(crate) fn bounded(&self, timeout: Duration) -> Self {
+        let platform_deadline = Instant::now() + timeout;
+        Self {
+            deadline: Some(self.deadline.map_or(platform_deadline, |deadline| {
+                deadline.min(platform_deadline)
+            })),
+            cancellation: self.cancellation.clone(),
+        }
+    }
+
+    pub(crate) fn check(&self) -> Result<(), PostureError> {
+        if self.cancellation.is_cancelled() {
+            return Err(PostureError::Cancelled);
+        }
+        if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return Err(PostureError::Timeout);
+        }
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "windows", test))]
+    pub(crate) fn wait_slice(&self, maximum: Duration) -> Result<Duration, PostureError> {
+        self.check()?;
+        Ok(self.deadline.map_or(maximum, |deadline| {
+            maximum.min(deadline.saturating_duration_since(Instant::now()))
+        }))
+    }
+}
+
+impl Default for CollectionContext {
+    fn default() -> Self {
+        Self::unbounded()
+    }
+}
+
 /// Injectable source of platform posture attributes.
 pub trait PostureCollector: Send + Sync {
     fn serial_numbers(&self) -> Result<Vec<String>, PostureError>;
     fn hardware_addrs(&self) -> Result<Vec<String>, PostureError>;
+
+    fn serial_numbers_cancellable(
+        &self,
+        context: &CollectionContext,
+    ) -> Result<Vec<String>, PostureError> {
+        context.check()?;
+        let result = self.serial_numbers();
+        context.check()?;
+        result
+    }
+
+    fn hardware_addrs_cancellable(
+        &self,
+        context: &CollectionContext,
+    ) -> Result<Vec<String>, PostureError> {
+        context.check()?;
+        let result = self.hardware_addrs();
+        context.check()?;
+        result
+    }
 }
 
 /// Collector backed by RustScale's native platform readers.
@@ -153,6 +245,13 @@ impl PostureCollector for SystemCollector {
 
     fn hardware_addrs(&self) -> Result<Vec<String>, PostureError> {
         Ok(get_hardware_addrs())
+    }
+
+    fn serial_numbers_cancellable(
+        &self,
+        context: &CollectionContext,
+    ) -> Result<Vec<String>, PostureError> {
+        serial::get_serial_numbers_cancellable(context)
     }
 }
 
@@ -197,42 +296,64 @@ impl IdentityService {
     /// Collect identity according to the latest policy and user preference.
     /// Hardware addresses are only touched when requested by control.
     pub fn collect(&self, user_enabled: bool, include_hardware_addrs: bool) -> CollectionResult {
-        let (preference, policy_error) = match self.policy.preference() {
-            Ok(preference) => (preference, None),
-            Err(error) => (PreferenceOption::Never, Some(error)),
-        };
-        if !preference.should_enable(user_enabled) {
-            return CollectionResult {
-                identity: IdentityData {
-                    posture_disabled: true,
-                    ..IdentityData::default()
-                },
-                policy_error,
-                ..CollectionResult::default()
-            };
+        self.collect_cancellable(
+            || user_enabled,
+            include_hardware_addrs,
+            &CollectionContext::unbounded(),
+        )
+        .unwrap_or_else(|error| CollectionResult {
+            serial_error: Some(error),
+            ..CollectionResult::default()
+        })
+    }
+
+    /// Cancellable collection with a live user-preference reader.
+    ///
+    /// The management policy and `user_enabled` reader are checked both before
+    /// collection and immediately before the result can be published. A late
+    /// opt-out clears all collected identity and does not update last-known
+    /// hardware addresses.
+    pub fn collect_cancellable<F>(
+        &self,
+        user_enabled: F,
+        include_hardware_addrs: bool,
+        context: &CollectionContext,
+    ) -> Result<CollectionResult, PostureError>
+    where
+        F: Fn() -> bool,
+    {
+        context.check()?;
+        if let Some(disabled) = self.disabled_result(user_enabled()) {
+            return Ok(disabled);
         }
 
-        let (serial_numbers, serial_error) = match self.collector.serial_numbers() {
-            Ok(values) => (sanitize_serials(values), None),
-            Err(error) => (Vec::new(), Some(error)),
-        };
+        let (serial_numbers, serial_error) =
+            match self.collector.serial_numbers_cancellable(context) {
+                Ok(values) => (sanitize_serials(values), None),
+                Err(PostureError::Cancelled) => return Err(PostureError::Cancelled),
+                Err(PostureError::Timeout) => return Err(PostureError::Timeout),
+                Err(error) => (Vec::new(), Some(error)),
+            };
 
+        context.check()?;
         let mut hardware_addr_error = None;
+        let mut fresh_hardware_addrs = None;
         let iface_hardware_addrs = if include_hardware_addrs {
-            match self.collector.hardware_addrs() {
+            match self.collector.hardware_addrs_cancellable(context) {
                 Ok(values) => {
                     let values = normalize_hardware_addrs(values);
-                    let mut previous = self
-                        .last_hardware_addrs
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     if values.is_empty() {
-                        previous.clone()
+                        self.last_hardware_addrs
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .clone()
                     } else {
-                        previous.clone_from(&values);
+                        fresh_hardware_addrs = Some(values.clone());
                         values
                     }
                 }
+                Err(PostureError::Cancelled) => return Err(PostureError::Cancelled),
+                Err(PostureError::Timeout) => return Err(PostureError::Timeout),
                 Err(error) => {
                     hardware_addr_error = Some(error);
                     Vec::new()
@@ -242,16 +363,52 @@ impl IdentityService {
             Vec::new()
         };
 
-        CollectionResult {
+        context.check()?;
+        if let Some(disabled) = self.disabled_result(user_enabled()) {
+            return Ok(disabled);
+        }
+        if let Some(values) = fresh_hardware_addrs {
+            self.last_hardware_addrs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone_from(&values);
+        }
+
+        Ok(CollectionResult {
             identity: IdentityData {
                 serial_numbers,
                 iface_hardware_addrs,
                 posture_disabled: false,
             },
-            policy_error,
+            policy_error: None,
             serial_error,
             hardware_addr_error,
-        }
+        })
+    }
+
+    /// Re-check live policy immediately before a caller publishes a completed
+    /// result. Revocation replaces any stale identity with a disabled result.
+    pub fn revalidate_for_publication(
+        &self,
+        user_enabled: bool,
+        result: CollectionResult,
+    ) -> CollectionResult {
+        self.disabled_result(user_enabled).unwrap_or(result)
+    }
+
+    fn disabled_result(&self, user_enabled: bool) -> Option<CollectionResult> {
+        let (preference, policy_error) = match self.policy.preference() {
+            Ok(preference) => (preference, None),
+            Err(error) => (PreferenceOption::Never, Some(error)),
+        };
+        (!preference.should_enable(user_enabled)).then(|| CollectionResult {
+            identity: IdentityData {
+                posture_disabled: true,
+                ..IdentityData::default()
+            },
+            policy_error,
+            ..CollectionResult::default()
+        })
     }
 }
 
@@ -293,6 +450,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
     use super::*;
 
@@ -426,6 +584,51 @@ mod tests {
         assert!(service.collect(true, false).identity.posture_disabled);
         policy.store(1, Ordering::Relaxed);
         assert!(!service.collect(false, false).identity.posture_disabled);
+    }
+
+    #[test]
+    fn preference_revoked_during_collection_suppresses_stale_identity() {
+        struct RevokingCollector {
+            policy: Arc<AtomicU8>,
+            hardware_calls: Arc<AtomicUsize>,
+        }
+
+        impl PostureCollector for RevokingCollector {
+            fn serial_numbers(&self) -> Result<Vec<String>, PostureError> {
+                self.policy.store(2, Ordering::Release);
+                Ok(vec!["stale-serial".into()])
+            }
+
+            fn hardware_addrs(&self) -> Result<Vec<String>, PostureError> {
+                self.hardware_calls.fetch_add(1, Ordering::Relaxed);
+                Ok(vec!["aa:bb:cc:dd:ee:ff".into()])
+            }
+        }
+
+        let policy = Arc::new(AtomicU8::new(1));
+        let hardware_calls = Arc::new(AtomicUsize::new(0));
+        let service = IdentityService::new(
+            Box::new(RevokingCollector {
+                policy: policy.clone(),
+                hardware_calls: hardware_calls.clone(),
+            }),
+            Box::new(MutablePolicy(policy)),
+        );
+        let result = service
+            .collect_cancellable(
+                || false,
+                true,
+                &CollectionContext::new(
+                    Some(Instant::now() + Duration::from_secs(1)),
+                    CancellationToken::new(),
+                ),
+            )
+            .unwrap();
+        assert!(result.identity.posture_disabled);
+        assert!(result.identity.serial_numbers.is_empty());
+        assert!(result.identity.iface_hardware_addrs.is_empty());
+        assert_eq!(hardware_calls.load(Ordering::Relaxed), 1);
+        assert!(service.last_hardware_addrs.lock().unwrap().is_empty());
     }
 
     #[test]

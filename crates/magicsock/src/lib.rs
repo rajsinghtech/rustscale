@@ -1902,17 +1902,7 @@ impl Magicsock {
     /// Later callers join the same flight, making shutdown idempotent.
     pub async fn shutdown(&self, deadline: Duration) -> Result<(), MagicsockError> {
         self.start_shutdown();
-        let wait = async {
-            loop {
-                let notified = self.shutdown.complete.notified();
-                if *self.shutdown.phase.lock().expect("magicsock shutdown lock")
-                    == ShutdownPhase::Complete
-                {
-                    return;
-                }
-                notified.await;
-            }
-        };
+        let wait = wait_for_shutdown_complete(&self.shutdown);
         tokio::time::timeout(deadline, wait)
             .await
             .map_err(|_| MagicsockError::Timeout)
@@ -3160,6 +3150,21 @@ impl Magicsock {
             }
         }
         Ok(accounting_region)
+    }
+}
+
+/// Wait for the durable shutdown phase to reach completion. The notification
+/// is only a wakeup hint: register it before checking the predicate so a
+/// completion between those two operations cannot strand a waiter.
+async fn wait_for_shutdown_complete(shutdown: &MagicsockShutdown) {
+    loop {
+        let notified = shutdown.complete.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if *shutdown.phase.lock().expect("magicsock shutdown lock") == ShutdownPhase::Complete {
+            return;
+        }
+        notified.await;
     }
 }
 

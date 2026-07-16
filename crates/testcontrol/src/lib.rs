@@ -1347,13 +1347,7 @@ async fn serve_register(
     // If this is a followup request, block until auth is completed.
     if !req.Followup.is_empty() {
         let path = extract_auth_path(&req.Followup);
-        let auth_notify = {
-            let g = inner.lock().unwrap();
-            g.auth_paths.get(&path).cloned()
-        };
-        if let Some(an) = auth_notify {
-            an.notified().await;
-        }
+        wait_for_auth_completion(inner, &path, &nk).await;
         let mut g = inner.lock().unwrap();
         let (user, login) = get_or_create_user(&mut g, &nk);
         ensure_node_exists(&mut g, &nk, peer_machine_key, &req);
@@ -1420,6 +1414,39 @@ async fn serve_register(
         Error: String::new(),
     };
     serde_json::to_vec(&resp).unwrap_or_default()
+}
+
+/// Wait until `complete_auth` has durably authorized `node_key`.
+///
+/// Auth completion removes its path entry and records the node in
+/// `authed_nodes`; the latter is the predicate. The `Notify` merely wakes a
+/// concurrent followup, so it must be enabled before the predicate recheck.
+async fn wait_for_auth_completion(
+    inner: &Arc<Mutex<ServerInner>>,
+    path: &str,
+    node_key: &NodePublic,
+) {
+    loop {
+        let notify = {
+            let state = inner.lock().unwrap();
+            if state.authed_nodes.contains(node_key) {
+                return;
+            }
+            state.auth_paths.get(path).cloned()
+        };
+        let Some(notify) = notify else {
+            // Unknown or already-retired paths retain the historical
+            // followup behavior; a completed path was handled above.
+            return;
+        };
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if inner.lock().unwrap().authed_nodes.contains(node_key) {
+            return;
+        }
+        notified.await;
+    }
 }
 
 /// Ensure a node exists in the server's node map. Creates it if not present.

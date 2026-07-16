@@ -192,6 +192,23 @@ async fn listen_rejects_duplicate_port() {
     assert!(result.is_err(), "duplicate port should fail");
 }
 
+#[tokio::test]
+async fn tx_backlog_above_drain_batch_remains_observable() {
+    let net = Netstack::new(Ipv4Addr::new(100, 64, 0, 1), DEFAULT_MTU);
+    for i in 0..65 {
+        net.push_tx_for_test(vec![i]);
+    }
+
+    for _ in 0..64 {
+        assert!(net.pop_tx().is_some());
+    }
+    assert!(
+        net.has_tx_packets(),
+        "a bounded pump drain must not treat its 65th packet as idle"
+    );
+    assert_eq!(net.pop_tx(), Some(vec![64]));
+}
+
 /// Push a payload much larger than the TCP send buffer (65 KB) through the
 /// back-to-back rig and verify zero data loss with correct byte ordering.
 /// This exercises the backpressure fix in `pump_connection`: when the

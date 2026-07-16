@@ -120,6 +120,42 @@ async fn stop_cancellation_retains_worker_for_retry() {
 }
 
 #[tokio::test]
+async fn stale_stop_before_start_does_not_stop_new_generation() {
+    let source: Arc<dyn crate::NodeSource> = Arc::new(MockNodeSource::new(Some(Node {
+        node_id: "nABC".to_string(),
+        ..Default::default()
+    })));
+    let logger = crate::Logger::new();
+
+    // This used to leave a permit on the one shared Notify. The next worker
+    // consumed it immediately and exited even though it belonged to no run.
+    logger.request_stop();
+    let logtail = test_logtail();
+    let observed_logtail = logtail.clone();
+    logger.start(source, logtail).await.unwrap();
+    tokio::task::yield_now().await;
+    assert!(
+        logger.running().await,
+        "old stop leaked into new generation"
+    );
+    let counter = logger.make_counter(true).await;
+    counter(
+        6,
+        (ip("100.64.0.1"), 1234),
+        (ip("100.64.0.2"), 443),
+        1,
+        100,
+        false,
+    );
+    logger.stop().await.unwrap();
+    assert_eq!(
+        observed_logtail.buffered_count(),
+        1,
+        "the new generation must process its counter before final flush"
+    );
+}
+
+#[tokio::test]
 async fn test_logger_counter_sends_events() {
     let source: Arc<dyn crate::NodeSource> = Arc::new(
         MockNodeSource::new(Some(Node {

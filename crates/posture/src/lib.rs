@@ -13,8 +13,10 @@ mod serial;
 mod serial_linux;
 #[cfg(target_os = "macos")]
 mod serial_macos;
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 mod serial_stub;
+#[cfg(any(target_os = "windows", test))]
+mod serial_windows;
 
 use std::sync::Mutex;
 
@@ -42,6 +44,9 @@ pub enum PostureError {
     /// A bounded platform operation timed out.
     #[error("platform collection timed out")]
     Timeout,
+    /// A bounded platform operation was cancelled.
+    #[error("platform collection was cancelled")]
+    Cancelled,
     /// An operating-system operation failed.
     #[error("platform collection failed ({0:?})")]
     Io(std::io::ErrorKind),

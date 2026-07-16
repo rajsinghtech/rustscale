@@ -3764,8 +3764,10 @@ impl Server {
             .load_prefs()
             .map(|prefs| prefs.PostureChecking)
             .unwrap_or(false);
-        let posture_checking = Arc::new(crate::LivePosturePreference::new(
+        let posture_service = Arc::new(rustscale_posture::IdentityService::default());
+        let posture_checking = Arc::new(crate::LivePosturePreference::with_publication_barrier(
             self.config.posture_checking || persisted_posture,
+            posture_service.publication_barrier(),
         ));
         let c2n_log_level = rustscale_c2n::LogLevelState::new();
         let c2n_backend = Arc::new(c2n::TsnetC2nBackend::new(
@@ -3782,7 +3784,7 @@ impl Server {
                 sockstats: sockstats.clone(),
                 logtail: self.config.logtail.clone(),
                 posture_checking: posture_checking.clone(),
-                posture_service: Arc::new(rustscale_posture::IdentityService::default()),
+                posture_service,
             },
             c2n_log_level,
         ));

@@ -130,6 +130,7 @@ rustscale-safesocket = { path = "../safesocket", version = "0.1.3" }
 # test-only back-edge must not enter the published dependency graph.
 rustscale-localclient = { path = "../localclient" }
 rustscale-ipn = { path = "../ipn", version = "0.1.3" }
+rustscale-syspolicy.workspace = true
 tempfile = "3"
 
 [features]

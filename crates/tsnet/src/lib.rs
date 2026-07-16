@@ -182,16 +182,24 @@ const PROTOCOL_VERSION: u16 = 141;
 /// preference revocation against sensitive C2N transport writes.
 pub(crate) struct LivePosturePreference {
     value: AtomicBool,
-    generation: AtomicU64,
-    publication: std::sync::RwLock<()>,
+    publication: Arc<rustscale_posture::PublicationBarrier>,
 }
 
 impl LivePosturePreference {
-    pub(crate) const fn new(value: bool) -> Self {
+    pub(crate) fn new(value: bool) -> Self {
+        Self::with_publication_barrier(
+            value,
+            Arc::new(rustscale_posture::PublicationBarrier::new()),
+        )
+    }
+
+    pub(crate) fn with_publication_barrier(
+        value: bool,
+        publication: Arc<rustscale_posture::PublicationBarrier>,
+    ) -> Self {
         Self {
             value: AtomicBool::new(value),
-            generation: AtomicU64::new(0),
-            publication: std::sync::RwLock::new(()),
+            publication,
         }
     }
 
@@ -200,38 +208,32 @@ impl LivePosturePreference {
     }
 
     pub(crate) fn store(&self, value: bool, ordering: std::sync::atomic::Ordering) {
-        let _publication = self
-            .publication
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if self.value.swap(value, ordering) != value {
-            self.generation
-                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        }
+        self.publication
+            .update_preference(|| self.value.swap(value, ordering) != value);
     }
 
-    pub(crate) fn snapshot(&self) -> (bool, u64) {
-        let _publication = self
-            .publication
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        (
-            self.value.load(std::sync::atomic::Ordering::Acquire),
-            self.generation.load(std::sync::atomic::Ordering::Acquire),
-        )
+    pub(crate) fn snapshot(&self) -> (bool, u64, u64) {
+        let (generation, (value, policy_generation)) = self.publication.snapshot_with(|policy| {
+            (
+                self.value.load(std::sync::atomic::Ordering::Acquire),
+                policy.policy_generation,
+            )
+        });
+        (value, generation, policy_generation)
     }
 
     pub(crate) fn with_generation<R>(
         &self,
         expected_generation: u64,
-        operation: impl FnOnce(bool) -> R,
+        operation: impl FnOnce(bool, &rustscale_posture::PublicationPolicyState) -> R,
     ) -> Option<R> {
-        let _publication = self
-            .publication
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        (self.generation.load(std::sync::atomic::Ordering::Acquire) == expected_generation)
-            .then(|| operation(self.value.load(std::sync::atomic::Ordering::Acquire)))
+        self.publication
+            .with_generation(expected_generation, |policy| {
+                operation(
+                    self.value.load(std::sync::atomic::Ordering::Acquire),
+                    policy,
+                )
+            })
     }
 }
 

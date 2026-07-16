@@ -18,7 +18,7 @@ mod serial_stub;
 #[cfg(any(target_os = "windows", test))]
 mod serial_windows;
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, RwLock};
 #[cfg(any(target_os = "windows", test))]
 use std::time::Duration;
 use std::time::Instant;
@@ -79,10 +79,109 @@ pub enum PolicyError {
     Unavailable,
 }
 
+/// Policy state bound to the sensitive-publication generation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PublicationPolicyState {
+    pub policy_generation: u64,
+    pub preference: Result<PreferenceOption, PolicyError>,
+}
+
+struct PublicationState {
+    generation: u64,
+    policy: PublicationPolicyState,
+}
+
+/// Shared generation and read/write barrier for posture policy and preference
+/// updates versus sensitive transport publication.
+pub struct PublicationBarrier {
+    state: RwLock<PublicationState>,
+}
+
+impl PublicationBarrier {
+    pub fn new() -> Self {
+        Self {
+            state: RwLock::new(PublicationState {
+                generation: 0,
+                policy: PublicationPolicyState {
+                    policy_generation: 0,
+                    preference: Err(PolicyError::Unavailable),
+                },
+            }),
+        }
+    }
+
+    /// Install a subscribed policy snapshot before its change callback
+    /// returns. A changed policy snapshot advances the shared publication
+    /// generation while holding the write barrier.
+    pub fn update_policy(&self, policy: PublicationPolicyState) {
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if policy.policy_generation < state.policy.policy_generation {
+            return;
+        }
+        if state.policy != policy {
+            state.policy = policy;
+            state.generation = state.generation.saturating_add(1);
+        }
+    }
+
+    /// Update user preference under the same publication write barrier.
+    pub fn update_preference(&self, update: impl FnOnce() -> bool) {
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if update() {
+            state.generation = state.generation.saturating_add(1);
+        }
+    }
+
+    /// Snapshot the shared publication generation while holding its read lock.
+    pub fn snapshot_with<R>(
+        &self,
+        snapshot: impl FnOnce(&PublicationPolicyState) -> R,
+    ) -> (u64, R) {
+        let state = self
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (state.generation, snapshot(&state.policy))
+    }
+
+    /// Validate and run one operation under the shared publication read
+    /// barrier. Preference and policy writers cannot cross this operation.
+    pub fn with_generation<R>(
+        &self,
+        expected_generation: u64,
+        operation: impl FnOnce(&PublicationPolicyState) -> R,
+    ) -> Option<R> {
+        let state = self
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (state.generation == expected_generation).then(|| operation(&state.policy))
+    }
+}
+
+impl Default for PublicationBarrier {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Injectable policy source. It is queried for every request so policy
 /// changes take effect without reconstructing the posture service.
 pub trait PosturePolicy: Send + Sync {
     fn preference(&self) -> Result<PreferenceOption, PolicyError>;
+
+    fn publication_state(&self) -> PublicationPolicyState {
+        PublicationPolicyState {
+            policy_generation: 0,
+            preference: self.preference(),
+        }
+    }
 }
 
 /// Default policy: leave the choice to the persisted user preference.
@@ -102,14 +201,74 @@ impl PosturePolicy for UserDecidesPolicy {
 /// [`IdentityService`].
 pub struct SystemPolicy {
     engine: Option<rustscale_syspolicy::PolicyEngine>,
+    _publication_subscription: Option<rustscale_syspolicy::SnapshotCommitRegistration>,
+    publication_barrier: Arc<PublicationBarrier>,
 }
 
 impl SystemPolicy {
     /// Creates a posture policy from an existing engine, useful for embedding
     /// and hermetic provider tests.
     pub fn from_engine(engine: rustscale_syspolicy::PolicyEngine) -> Self {
+        Self::with_engine(Some(engine), Arc::new(PublicationBarrier::new()))
+    }
+
+    /// Creates a live policy whose snapshot subscription updates `barrier`
+    /// before each effective posture-policy callback returns.
+    pub fn from_engine_with_publication_barrier(
+        engine: rustscale_syspolicy::PolicyEngine,
+        barrier: Arc<PublicationBarrier>,
+    ) -> Self {
+        Self::with_engine(Some(engine), barrier)
+    }
+
+    fn with_engine(
+        engine: Option<rustscale_syspolicy::PolicyEngine>,
+        publication_barrier: Arc<PublicationBarrier>,
+    ) -> Self {
+        let Some(engine) = engine else {
+            publication_barrier.update_policy(PublicationPolicyState {
+                policy_generation: 0,
+                preference: Err(PolicyError::Unavailable),
+            });
+            return Self {
+                engine: None,
+                _publication_subscription: None,
+                publication_barrier,
+            };
+        };
+
+        let callback_barrier = publication_barrier.clone();
+        let registration = engine.register_snapshot_commit_callback(move |snapshot| {
+            callback_barrier.update_policy(Self::publication_state_from_snapshot(&snapshot));
+        });
+        // Register before sampling, then reject stale generations in the
+        // barrier. This closes the subscribe/snapshot race in both orders.
+        let snapshot = engine.snapshot();
+        publication_barrier.update_policy(Self::publication_state_from_snapshot(&snapshot));
         Self {
             engine: Some(engine),
+            _publication_subscription: Some(registration),
+            publication_barrier,
+        }
+    }
+
+    fn platform_engine() -> Option<rustscale_syspolicy::PolicyEngine> {
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+        {
+            rustscale_syspolicy::default_engine(rustscale_syspolicy::PolicyScope::Device).ok()
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+        {
+            None
+        }
+    }
+
+    fn publication_state_from_snapshot(
+        snapshot: &rustscale_syspolicy::Snapshot,
+    ) -> PublicationPolicyState {
+        PublicationPolicyState {
+            policy_generation: snapshot.generation(),
+            preference: Self::snapshot_preference(snapshot),
         }
     }
 
@@ -130,12 +289,7 @@ impl SystemPolicy {
 
 impl Default for SystemPolicy {
     fn default() -> Self {
-        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-        let engine =
-            rustscale_syspolicy::default_engine(rustscale_syspolicy::PolicyScope::Device).ok();
-        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-        let engine = None;
-        Self { engine }
+        Self::with_engine(Self::platform_engine(), Arc::new(PublicationBarrier::new()))
     }
 }
 
@@ -143,7 +297,19 @@ impl PosturePolicy for SystemPolicy {
     fn preference(&self) -> Result<PreferenceOption, PolicyError> {
         let engine = self.engine.as_ref().ok_or(PolicyError::Unavailable)?;
         let snapshot = engine.reload().map_err(|_| PolicyError::Unavailable)?;
-        Self::snapshot_preference(&snapshot)
+        let state = Self::publication_state_from_snapshot(&snapshot);
+        self.publication_barrier.update_policy(state.clone());
+        state.preference
+    }
+
+    fn publication_state(&self) -> PublicationPolicyState {
+        self.engine.as_ref().map_or(
+            PublicationPolicyState {
+                policy_generation: 0,
+                preference: Err(PolicyError::Unavailable),
+            },
+            |engine| Self::publication_state_from_snapshot(&engine.snapshot()),
+        )
     }
 }
 
@@ -281,16 +447,34 @@ pub struct CollectionResult {
 pub struct IdentityService {
     collector: Box<dyn PostureCollector>,
     policy: Box<dyn PosturePolicy>,
+    publication_barrier: Arc<PublicationBarrier>,
     last_hardware_addrs: Mutex<Vec<String>>,
 }
 
 impl IdentityService {
     pub fn new(collector: Box<dyn PostureCollector>, policy: Box<dyn PosturePolicy>) -> Self {
+        let publication_barrier = Arc::new(PublicationBarrier::new());
+        publication_barrier.update_policy(policy.publication_state());
+        Self::new_with_barrier(collector, policy, publication_barrier)
+    }
+
+    fn new_with_barrier(
+        collector: Box<dyn PostureCollector>,
+        policy: Box<dyn PosturePolicy>,
+        publication_barrier: Arc<PublicationBarrier>,
+    ) -> Self {
         Self {
             collector,
             policy,
+            publication_barrier,
             last_hardware_addrs: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Shared barrier used to bind live preference and management policy to a
+    /// sensitive transport publication generation.
+    pub fn publication_barrier(&self) -> Arc<PublicationBarrier> {
+        self.publication_barrier.clone()
     }
 
     /// Collect identity according to the latest policy and user preference.
@@ -386,12 +570,6 @@ impl IdentityService {
         })
     }
 
-    /// Whether live management policy and user preference still authorize
-    /// publication. Policy lookup failure is denial.
-    pub fn publication_allowed(&self, user_enabled: bool) -> bool {
-        self.disabled_result(user_enabled).is_none()
-    }
-
     /// Re-check live policy immediately before a caller publishes a completed
     /// result. Revocation replaces any stale identity with a disabled result.
     pub fn revalidate_for_publication(
@@ -403,7 +581,10 @@ impl IdentityService {
     }
 
     fn disabled_result(&self, user_enabled: bool) -> Option<CollectionResult> {
-        let (preference, policy_error) = match self.policy.preference() {
+        let preference_result = self.policy.preference();
+        self.publication_barrier
+            .update_policy(self.policy.publication_state());
+        let (preference, policy_error) = match preference_result {
             Ok(preference) => (preference, None),
             Err(error) => (PreferenceOption::Never, Some(error)),
         };
@@ -420,7 +601,14 @@ impl IdentityService {
 
 impl Default for IdentityService {
     fn default() -> Self {
-        Self::new(Box::new(SystemCollector), Box::new(SystemPolicy::default()))
+        let publication_barrier = Arc::new(PublicationBarrier::new());
+        let policy =
+            SystemPolicy::with_engine(SystemPolicy::platform_engine(), publication_barrier.clone());
+        Self::new_with_barrier(
+            Box::new(SystemCollector),
+            Box::new(policy),
+            publication_barrier,
+        )
     }
 }
 

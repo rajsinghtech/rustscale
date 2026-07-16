@@ -3962,6 +3962,7 @@ dependencies = [
  "rustscale-safesocket",
  "rustscale-sockstats",
  "rustscale-ssh",
+ "rustscale-syspolicy",
  "rustscale-tailcfg",
  "rustscale-tcpinfo",
  "rustscale-testcontrol",

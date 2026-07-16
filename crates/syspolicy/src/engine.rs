@@ -161,6 +161,7 @@ struct ReadSource {
 }
 
 type ChangeCallback = Arc<dyn Fn(PolicyChange) + Send + Sync>;
+type SnapshotCommitCallback = Arc<dyn Fn(Arc<Snapshot>) + Send + Sync>;
 
 struct EngineInner {
     scope: PolicyScope,
@@ -169,6 +170,7 @@ struct EngineInner {
     snapshot: RwLock<Arc<Snapshot>>,
     reload: Mutex<()>,
     callbacks: Mutex<BTreeMap<u64, ChangeCallback>>,
+    snapshot_commit_callbacks: Mutex<BTreeMap<u64, SnapshotCommitCallback>>,
     next_source: AtomicU64,
     next_callback: AtomicU64,
     notification_tx: SyncSender<()>,
@@ -215,6 +217,7 @@ impl PolicyEngine {
             snapshot: RwLock::new(snapshot),
             reload: Mutex::new(()),
             callbacks: Mutex::new(BTreeMap::new()),
+            snapshot_commit_callbacks: Mutex::new(BTreeMap::new()),
             next_source: AtomicU64::new(0),
             next_callback: AtomicU64::new(0),
             notification_tx,
@@ -588,16 +591,36 @@ impl PolicyEngine {
             generation: old.generation.saturating_add(1),
             settings,
         });
+        let effective_change = old.settings != new.settings;
+        if effective_change {
+            self.invoke_snapshot_commit(new.clone());
+        }
         *self
             .inner
             .snapshot
             .write()
             .expect("policy snapshot lock poisoned") = new.clone();
-        let change = (old.settings != new.settings).then(|| PolicyChange {
+        let change = effective_change.then(|| PolicyChange {
             old,
             new: new.clone(),
         });
         Ok((new, change))
+    }
+
+    fn invoke_snapshot_commit(&self, snapshot: Arc<Snapshot>) {
+        let callbacks: Vec<_> = self
+            .inner
+            .snapshot_commit_callbacks
+            .lock()
+            .expect("policy snapshot commit callbacks lock poisoned")
+            .values()
+            .cloned()
+            .collect();
+        for callback in callbacks {
+            if catch_unwind(AssertUnwindSafe(|| callback(snapshot.clone()))).is_err() {
+                self.inner.callback_panics.fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
 
     fn invoke_change(&self, change: Option<PolicyChange>) {
@@ -660,6 +683,25 @@ impl PolicyEngine {
             .expect("policy callbacks lock poisoned")
             .insert(id, Arc::new(callback));
         CallbackRegistration {
+            engine: Arc::downgrade(&self.inner),
+            id,
+        }
+    }
+
+    /// Registers a callback run for each effective change immediately before
+    /// its immutable snapshot becomes visible. Commit callbacks execute while
+    /// the reload transaction is held and must not call back into this engine.
+    pub fn register_snapshot_commit_callback(
+        &self,
+        callback: impl Fn(Arc<Snapshot>) + Send + Sync + 'static,
+    ) -> SnapshotCommitRegistration {
+        let id = self.inner.next_callback.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .snapshot_commit_callbacks
+            .lock()
+            .expect("policy snapshot commit callbacks lock poisoned")
+            .insert(id, Arc::new(callback));
+        SnapshotCommitRegistration {
             engine: Arc::downgrade(&self.inner),
             id,
         }
@@ -806,6 +848,25 @@ impl Drop for CallbackRegistration {
                 .remove(&self.id);
             // The callback may own another registration whose Drop re-enters
             // this map. Release the mutex before dropping the closure.
+            drop(callback);
+        }
+    }
+}
+
+/// Unregisters a snapshot commit callback when dropped.
+pub struct SnapshotCommitRegistration {
+    engine: Weak<EngineInner>,
+    id: u64,
+}
+
+impl Drop for SnapshotCommitRegistration {
+    fn drop(&mut self) {
+        if let Some(engine) = self.engine.upgrade() {
+            let callback = engine
+                .snapshot_commit_callbacks
+                .lock()
+                .expect("policy snapshot commit callbacks lock poisoned")
+                .remove(&self.id);
             drop(callback);
         }
     }

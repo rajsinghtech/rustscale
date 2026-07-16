@@ -45,14 +45,15 @@ pub(crate) struct C2nBackendData {
 
 struct CollectedPosture {
     response: C2NPostureIdentityResponse,
-    preference_generation: u64,
+    publication_generation: u64,
+    policy_generation: u64,
     include_hardware_addrs: bool,
 }
 
 struct PosturePublicationValidator {
     preference: Arc<crate::LivePosturePreference>,
-    posture_service: Arc<rustscale_posture::IdentityService>,
-    expected_generation: u64,
+    expected_publication_generation: u64,
+    expected_policy_generation: u64,
     include_hardware_addrs: bool,
     response_has_hardware_addrs: bool,
 }
@@ -63,14 +64,23 @@ impl C2nPublicationValidator for PosturePublicationValidator {
         publish: &mut dyn FnMut() -> Result<(), C2nReplyError>,
     ) -> Result<(), C2nReplyError> {
         self.preference
-            .with_generation(self.expected_generation, |user_enabled| {
-                if (self.response_has_hardware_addrs && !self.include_hardware_addrs)
-                    || !self.posture_service.publication_allowed(user_enabled)
-                {
-                    return Err(C2nReplyError::PublicationRevoked);
-                }
-                publish()
-            })
+            .with_generation(
+                self.expected_publication_generation,
+                |user_enabled, policy| {
+                    let posture_allowed = policy.policy_generation
+                        == self.expected_policy_generation
+                        && policy
+                            .preference
+                            .unwrap_or(rustscale_posture::PreferenceOption::Never)
+                            .should_enable(user_enabled);
+                    if (self.response_has_hardware_addrs && !self.include_hardware_addrs)
+                        || !posture_allowed
+                    {
+                        return Err(C2nReplyError::PublicationRevoked);
+                    }
+                    publish()
+                },
+            )
             .ok_or(C2nReplyError::PublicationRevoked)?
     }
 }
@@ -119,7 +129,7 @@ impl TsnetC2nBackend {
     ) -> Option<CollectedPosture> {
         const POSTURE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
-        let (_, preference_generation) = self.posture_checking.snapshot();
+        let (_, publication_generation, policy_generation) = self.posture_checking.snapshot();
         let service = self.posture_service.clone();
         let worker_service = service.clone();
         let preference = self.posture_checking.clone();
@@ -217,7 +227,8 @@ impl TsnetC2nBackend {
                 iface_hardware_addrs: identity.iface_hardware_addrs,
                 posture_disabled: identity.posture_disabled,
             },
-            preference_generation,
+            publication_generation,
+            policy_generation,
             include_hardware_addrs,
         })
     }
@@ -543,8 +554,8 @@ impl C2nHandler for PostureIdentityHandler {
                 if response_is_sensitive {
                     response.with_publication_validator(Arc::new(PosturePublicationValidator {
                         preference: self.backend.posture_checking.clone(),
-                        posture_service: self.backend.posture_service.clone(),
-                        expected_generation: collected.preference_generation,
+                        expected_publication_generation: collected.publication_generation,
+                        expected_policy_generation: collected.policy_generation,
                         include_hardware_addrs: collected.include_hardware_addrs,
                         response_has_hardware_addrs,
                     }))
@@ -696,4 +707,77 @@ pub(crate) fn register_c2n_handlers(router: &mut C2nRouter, backend: Arc<TsnetC2
             backend: backend.clone(),
         }),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{mpsc, Arc};
+    use std::time::Duration;
+
+    use rustscale_controlclient::C2nPublicationValidator;
+    use rustscale_posture::{PublicationBarrier, SystemPolicy};
+    use rustscale_syspolicy::{MemoryProvider, PolicyEngine, PolicyKey, PolicyScope, RawValue};
+
+    use super::{C2nReplyError, PosturePublicationValidator};
+
+    #[test]
+    fn managed_never_after_handler_check_blocks_sensitive_h2_publication() {
+        let provider = Arc::new(MemoryProvider::from_values(BTreeMap::from([(
+            PolicyKey::PostureChecking,
+            RawValue::String("always".into()),
+        )])));
+        let engine = PolicyEngine::well_known(PolicyScope::Device).unwrap();
+        engine
+            .add_provider("managed posture", PolicyScope::Device, provider.clone())
+            .unwrap();
+        let barrier = Arc::new(PublicationBarrier::new());
+        let _policy =
+            SystemPolicy::from_engine_with_publication_barrier(engine.clone(), barrier.clone());
+        let preference = Arc::new(crate::LivePosturePreference::with_publication_barrier(
+            false,
+            barrier.clone(),
+        ));
+        let (_, publication_generation, policy_generation) = preference.snapshot();
+        let validator = PosturePublicationValidator {
+            preference,
+            expected_publication_generation: publication_generation,
+            expected_policy_generation: policy_generation,
+            include_hardware_addrs: true,
+            response_has_hardware_addrs: true,
+        };
+
+        let (checked_tx, checked_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let published = Arc::new(AtomicUsize::new(0));
+        let worker_published = published.clone();
+        let worker_barrier = barrier.clone();
+        let worker = std::thread::spawn(move || {
+            // Models the handler's completed policy check while H2 readiness
+            // remains blocked before the transport publication validator.
+            let (_, checked_policy) = worker_barrier.snapshot_with(|policy| policy.preference);
+            assert_eq!(
+                checked_policy,
+                Ok(rustscale_posture::PreferenceOption::Always)
+            );
+            checked_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            validator.validate_and_publish(&mut || {
+                worker_published.fetch_add(1, Ordering::Release);
+                Ok(())
+            })
+        });
+
+        checked_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        provider.set(PolicyKey::PostureChecking, RawValue::String("never".into()));
+        engine.reload().unwrap();
+        release_tx.send(()).unwrap();
+
+        assert_eq!(
+            worker.join().unwrap(),
+            Err(C2nReplyError::PublicationRevoked)
+        );
+        assert_eq!(published.load(Ordering::Acquire), 0);
+    }
 }

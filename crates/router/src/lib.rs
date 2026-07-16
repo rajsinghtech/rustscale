@@ -1531,12 +1531,20 @@ struct LinuxPlatform {
 #[cfg(target_os = "linux")]
 impl LinuxPlatform {
     fn new(tun_name: &str) -> Self {
-        let interface_index = if_addrs::get_if_addrs().ok().and_then(|interfaces| {
-            interfaces
-                .into_iter()
-                .find(|interface| interface.name == tun_name)
-                .and_then(|interface| interface.index)
-        });
+        // Read the kernel interface index directly. Address enumeration can
+        // omit a newly-created TUN before it has addresses or has been brought
+        // administratively up. Compare directory entries before joining paths
+        // so a caller-controlled interface name cannot traverse sysfs.
+        let interface_index = std::fs::read_dir("/sys/class/net")
+            .ok()
+            .and_then(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .find(|entry| entry.file_name() == std::ffi::OsStr::new(tun_name))
+            })
+            .and_then(|entry| std::fs::read_to_string(entry.path().join("ifindex")).ok())
+            .and_then(|index| index.trim().parse::<u32>().ok())
+            .filter(|index| *index != 0);
         Self {
             tun_name: tun_name.to_owned(),
             rule_base: interface_index.map(Self::rule_base_for_index),
@@ -2928,6 +2936,16 @@ mod tests {
         symlink("/etc/passwd", &platform.block_file).unwrap();
         assert!(platform.claim_ownership().is_err());
         std::fs::remove_file(&platform.block_file).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_platform_resolves_interfaces_without_assigned_addresses() {
+        let platform = LinuxPlatform::new("lo");
+        assert!(platform.rule_base.is_some());
+        assert!(LinuxPlatform::new("definitely-not-a-rustscale-interface")
+            .rule_base
+            .is_none());
     }
 
     #[cfg(target_os = "linux")]

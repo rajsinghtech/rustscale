@@ -583,7 +583,18 @@ struct ParsedJournal {
 
 #[cfg(unix)]
 #[derive(Debug)]
+struct RawSnapshot {
+    bytes: Vec<u8>,
+    hash: String,
+    identity: FileIdentity,
+    fd: OwnedFd,
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
 struct JournalSnapshot {
+    expected_target_identity: String,
+    expected_target_hash: String,
     parsed: ParsedJournal,
     bytes: Vec<u8>,
     hash: String,
@@ -638,7 +649,7 @@ mod unix_store {
 
     use super::{
         is_managed_unit_filename, CancellationToken, Component, Duration, FileIdentity, Instant,
-        JournalSnapshot, Ordering, OwnedFd, ParsedJournal, Path, Read, StoredUnit,
+        JournalSnapshot, Ordering, OwnedFd, ParsedJournal, Path, RawSnapshot, Read, StoredUnit,
         SystemUserUnitStore, UnitOperationGuard, UnitStoreError, UserUnitStore, Write, MAX_TIMEOUT,
         MAX_UNIT_BYTES, POLL_INTERVAL, TEMP_COUNTER,
     };
@@ -648,6 +659,22 @@ mod unix_store {
         AfterValidation,
         AfterMutation,
         BeforeFinalize,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum SnapshotGap {
+        AfterInitialStat,
+        BeforeFinalStat,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum ClearGap {
+        BeforeFinalValidation,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum RepairGap {
+        BeforeFinalValidation,
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -896,7 +923,89 @@ mod unix_store {
             ))
         }
 
-        fn open_journal_snapshot(
+        fn open_raw_snapshot(
+            directory: &OwnedFd,
+            name: &str,
+        ) -> Result<Option<RawSnapshot>, UnitStoreError> {
+            let (stored, identity) = Self::inspect_at(directory, name)?;
+            let StoredUnit::Regular(bytes) = stored else {
+                return match stored {
+                    StoredUnit::Missing => Ok(None),
+                    _ => Err(UnitStoreError::Conflict),
+                };
+            };
+            let identity = identity.ok_or(UnitStoreError::Conflict)?;
+            let fd = rustix::fs::openat(
+                directory,
+                name,
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(|_| UnitStoreError::Conflict)?;
+            let stat = rustix::fs::fstat(&fd).map_err(|_| UnitStoreError::Io)?;
+            if stat.st_dev as u64 != identity.device || stat.st_ino as u64 != identity.inode {
+                return Err(UnitStoreError::Conflict);
+            }
+            Ok(Some(RawSnapshot {
+                hash: content_hash(Some(&bytes)),
+                bytes,
+                identity,
+                fd,
+            }))
+        }
+
+        fn raw_snapshot_still_named(
+            directory: &OwnedFd,
+            name: &str,
+            snapshot: &RawSnapshot,
+        ) -> Result<bool, UnitStoreError> {
+            let fd_stat = rustix::fs::fstat(&snapshot.fd).map_err(|_| UnitStoreError::Io)?;
+            let name_stat = match rustix::fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(stat) => stat,
+                Err(rustix::io::Errno::NOENT) => return Ok(false),
+                Err(_) => return Err(UnitStoreError::Io),
+            };
+            if fd_stat.st_dev as u64 != snapshot.identity.device
+                || fd_stat.st_ino as u64 != snapshot.identity.inode
+                || name_stat.st_dev as u64 != snapshot.identity.device
+                || name_stat.st_ino as u64 != snapshot.identity.inode
+            {
+                return Ok(false);
+            }
+            let duplicate = rustix::io::dup(&snapshot.fd).map_err(|_| UnitStoreError::Io)?;
+            let file = File::from(duplicate);
+            let mut current = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            let mut offset = 0_u64;
+            loop {
+                let count = file
+                    .read_at(&mut buffer, offset)
+                    .map_err(|_| UnitStoreError::Io)?;
+                if count == 0 {
+                    break;
+                }
+                if current.len() + count > MAX_UNIT_BYTES {
+                    return Ok(false);
+                }
+                current.extend_from_slice(&buffer[..count]);
+                offset += count as u64;
+            }
+            let final_fd = rustix::fs::fstat(&snapshot.fd).map_err(|_| UnitStoreError::Io)?;
+            let final_name = rustix::fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(|_| UnitStoreError::Conflict)?;
+            Ok(current == snapshot.bytes
+                && content_hash(Some(&current)) == snapshot.hash
+                && final_fd.st_dev as u64 == snapshot.identity.device
+                && final_fd.st_ino as u64 == snapshot.identity.inode
+                && final_fd.st_size >= 0
+                && final_fd.st_size as usize == snapshot.bytes.len()
+                && final_name.st_dev as u64 == snapshot.identity.device
+                && final_name.st_ino as u64 == snapshot.identity.inode
+                && final_name.st_size >= 0
+                && final_name.st_size as usize == snapshot.bytes.len())
+        }
+
+        pub(super) fn open_journal_snapshot(
             directory: &OwnedFd,
             unit_name: &str,
         ) -> Result<Option<JournalSnapshot>, UnitStoreError> {
@@ -948,6 +1057,8 @@ mod unix_store {
             let parsed =
                 parse_journal(unit_name, &bytes).ok_or(UnitStoreError::MalformedJournal)?;
             Ok(Some(JournalSnapshot {
+                expected_target_identity: parsed.after.clone(),
+                expected_target_hash: parsed.after_hash.clone(),
                 parsed,
                 hash: content_hash(Some(&bytes)),
                 bytes,
@@ -956,18 +1067,17 @@ mod unix_store {
             }))
         }
 
-        fn snapshot_still_named(
+        pub(super) fn snapshot_still_named_with_hook<F>(
             directory: &OwnedFd,
             unit_name: &str,
             snapshot: &JournalSnapshot,
-        ) -> Result<bool, UnitStoreError> {
-            let fd_stat = rustix::fs::fstat(&snapshot.fd).map_err(|_| UnitStoreError::Io)?;
-            if fd_stat.st_dev as u64 != snapshot.identity.device
-                || fd_stat.st_ino as u64 != snapshot.identity.inode
-            {
-                return Ok(false);
-            }
-            let stat = match rustix::fs::statat(
+            mut hook: F,
+        ) -> Result<bool, UnitStoreError>
+        where
+            F: FnMut(SnapshotGap, &OwnedFd, &str),
+        {
+            let initial_fd = rustix::fs::fstat(&snapshot.fd).map_err(|_| UnitStoreError::Io)?;
+            let initial_name = match rustix::fs::statat(
                 directory,
                 journal_name(unit_name),
                 AtFlags::SYMLINK_NOFOLLOW,
@@ -976,27 +1086,63 @@ mod unix_store {
                 Err(rustix::io::Errno::NOENT) => return Ok(false),
                 Err(_) => return Err(UnitStoreError::Io),
             };
-            if stat.st_dev as u64 != snapshot.identity.device
-                || stat.st_ino as u64 != snapshot.identity.inode
-                || fd_stat.st_size < 0
-                || fd_stat.st_size as usize != snapshot.bytes.len()
+            if initial_fd.st_dev as u64 != snapshot.identity.device
+                || initial_fd.st_ino as u64 != snapshot.identity.inode
+                || initial_name.st_dev as u64 != snapshot.identity.device
+                || initial_name.st_ino as u64 != snapshot.identity.inode
             {
                 return Ok(false);
             }
+            hook(SnapshotGap::AfterInitialStat, directory, unit_name);
+
             let duplicate = rustix::io::dup(&snapshot.fd).map_err(|_| UnitStoreError::Io)?;
             let file = File::from(duplicate);
-            let mut current = vec![0_u8; snapshot.bytes.len()];
-            let mut offset = 0;
-            while offset < current.len() {
+            let mut current = Vec::with_capacity(snapshot.bytes.len().min(4096));
+            let mut buffer = [0_u8; 4096];
+            let mut offset = 0_u64;
+            loop {
                 let count = file
-                    .read_at(&mut current[offset..], offset as u64)
+                    .read_at(&mut buffer, offset)
                     .map_err(|_| UnitStoreError::Io)?;
                 if count == 0 {
+                    break;
+                }
+                if current.len() + count > MAX_UNIT_BYTES {
                     return Ok(false);
                 }
-                offset += count;
+                current.extend_from_slice(&buffer[..count]);
+                offset += count as u64;
             }
-            Ok(current == snapshot.bytes && content_hash(Some(&current)) == snapshot.hash)
+            if current != snapshot.bytes || content_hash(Some(&current)) != snapshot.hash {
+                return Ok(false);
+            }
+            hook(SnapshotGap::BeforeFinalStat, directory, unit_name);
+            let final_fd = rustix::fs::fstat(&snapshot.fd).map_err(|_| UnitStoreError::Io)?;
+            let final_name = match rustix::fs::statat(
+                directory,
+                journal_name(unit_name),
+                AtFlags::SYMLINK_NOFOLLOW,
+            ) {
+                Ok(stat) => stat,
+                Err(rustix::io::Errno::NOENT) => return Ok(false),
+                Err(_) => return Err(UnitStoreError::Io),
+            };
+            Ok(final_fd.st_dev as u64 == snapshot.identity.device
+                && final_fd.st_ino as u64 == snapshot.identity.inode
+                && final_fd.st_size >= 0
+                && final_fd.st_size as usize == snapshot.bytes.len()
+                && final_name.st_dev as u64 == snapshot.identity.device
+                && final_name.st_ino as u64 == snapshot.identity.inode
+                && final_name.st_size >= 0
+                && final_name.st_size as usize == snapshot.bytes.len())
+        }
+
+        fn snapshot_still_named(
+            directory: &OwnedFd,
+            unit_name: &str,
+            snapshot: &JournalSnapshot,
+        ) -> Result<bool, UnitStoreError> {
+            Self::snapshot_still_named_with_hook(directory, unit_name, snapshot, |_, _, _| {})
         }
 
         fn exact_regular(
@@ -1352,6 +1498,24 @@ mod unix_store {
                 .insert(unit_name.to_owned(), snapshot);
         }
 
+        fn set_cached_expected_target(
+            &self,
+            unit_name: &str,
+            identity: &str,
+            hash: &str,
+        ) -> Result<(), UnitStoreError> {
+            let mut snapshots = self
+                .journals
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let snapshot = snapshots
+                .get_mut(unit_name)
+                .ok_or(UnitStoreError::RepairRequired)?;
+            identity.clone_into(&mut snapshot.expected_target_identity);
+            hash.clone_into(&mut snapshot.expected_target_hash);
+            Ok(())
+        }
+
         fn revalidate_cached_journal(
             &self,
             directory: &OwnedFd,
@@ -1528,6 +1692,133 @@ mod unix_store {
                 Err(error) => Err(error),
             }
         }
+
+        pub(super) fn clear_reload_required_with_hook<F>(
+            &self,
+            unit_name: &str,
+            mut hook: F,
+        ) -> Result<(), UnitStoreError>
+        where
+            F: FnMut(ClearGap, &OwnedFd, &str),
+        {
+            if !is_managed_unit_filename(unit_name) {
+                return Err(UnitStoreError::Unavailable);
+            }
+            let Some(directory) = self.open_user_dir(false)? else {
+                return Ok(());
+            };
+            let journal = journal_name(unit_name);
+            let mut snapshots = self
+                .journals
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let snapshot = snapshots
+                .get(unit_name)
+                .ok_or(UnitStoreError::RepairRequired)?;
+            if !Self::snapshot_still_named(&directory, unit_name, snapshot)?
+                || !matches!(
+                    Self::inspect_at(&directory, &snapshot.parsed.temporary),
+                    Ok((StoredUnit::Missing, None))
+                )
+            {
+                return Err(UnitStoreError::RepairRequired);
+            }
+            let (target, target_identity) = Self::inspect_at(&directory, unit_name)?;
+            if !snapshot_matches(
+                &target,
+                target_identity,
+                &snapshot.expected_target_identity,
+                &snapshot.expected_target_hash,
+            ) {
+                return Err(UnitStoreError::RepairRequired);
+            }
+            hook(ClearGap::BeforeFinalValidation, &directory, unit_name);
+            if !Self::snapshot_still_named(&directory, unit_name, snapshot)? {
+                return Err(UnitStoreError::RepairRequired);
+            }
+            let (target, target_identity) = Self::inspect_at(&directory, unit_name)?;
+            if !snapshot_matches(
+                &target,
+                target_identity,
+                &snapshot.expected_target_identity,
+                &snapshot.expected_target_hash,
+            ) {
+                return Err(UnitStoreError::RepairRequired);
+            }
+            Self::remove_exact(
+                &directory,
+                &journal,
+                &snapshot.bytes,
+                snapshot.identity,
+                "journal-clear",
+            )
+            .map_err(|error| match error {
+                UnitStoreError::Conflict | UnitStoreError::RepairRequired => {
+                    UnitStoreError::RepairRequired
+                }
+                _ => UnitStoreError::CommittedNeedsReload,
+            })?;
+            rustix::fs::fsync(&directory).map_err(|_| UnitStoreError::CommittedNeedsReload)?;
+            snapshots.remove(unit_name);
+            Ok(())
+        }
+
+        pub(super) fn repair_precommit_journal_with_hook<F>(
+            &self,
+            unit_name: &str,
+            expected: Option<&[u8]>,
+            mut hook: F,
+        ) -> Result<(), UnitStoreError>
+        where
+            F: FnMut(RepairGap, &OwnedFd, &str),
+        {
+            if !is_managed_unit_filename(unit_name) {
+                return Err(UnitStoreError::Unavailable);
+            }
+            let directory = self.open_user_dir(false)?.ok_or(UnitStoreError::Conflict)?;
+            let journal_name = journal_name(unit_name);
+            let journal = Self::open_raw_snapshot(&directory, &journal_name)?
+                .ok_or(UnitStoreError::Conflict)?;
+            if valid_journal(unit_name, &journal.bytes) {
+                return Err(UnitStoreError::Conflict);
+            }
+            let target = if let Some(expected) = expected {
+                let snapshot = Self::open_raw_snapshot(&directory, unit_name)?
+                    .ok_or(UnitStoreError::Conflict)?;
+                if snapshot.bytes != expected {
+                    return Err(UnitStoreError::Conflict);
+                }
+                Some(snapshot)
+            } else {
+                if !matches!(
+                    Self::inspect_at(&directory, unit_name),
+                    Ok((StoredUnit::Missing, None))
+                ) {
+                    return Err(UnitStoreError::Conflict);
+                }
+                None
+            };
+            hook(RepairGap::BeforeFinalValidation, &directory, unit_name);
+            if !Self::raw_snapshot_still_named(&directory, &journal_name, &journal)? {
+                return Err(UnitStoreError::RepairRequired);
+            }
+            match &target {
+                Some(target) if Self::raw_snapshot_still_named(&directory, unit_name, target)? => {}
+                None if matches!(
+                    Self::inspect_at(&directory, unit_name),
+                    Ok((StoredUnit::Missing, None))
+                ) => {}
+                _ => return Err(UnitStoreError::RepairRequired),
+            }
+            Self::remove_exact(
+                &directory,
+                &journal_name,
+                &journal.bytes,
+                journal.identity,
+                "malformed-repair",
+            )?;
+            rustix::fs::fsync(&directory).map_err(|_| UnitStoreError::Io)
+        }
     }
 
     impl UserUnitStore for SystemUserUnitStore {
@@ -1671,6 +1962,7 @@ mod unix_store {
 
             if snapshot_matches(&target, target_identity, before, before_hash) {
                 if phase == JournalPhase::Forward {
+                    self.set_cached_expected_target(unit_name, before, before_hash)?;
                     if !matches!(&staged, StoredUnit::Missing) {
                         if !snapshot_matches(&staged, staged_identity, after, after_hash) {
                             return Err(UnitStoreError::Conflict);
@@ -1785,53 +2077,15 @@ mod unix_store {
             snapshot_matches(
                 &target,
                 target_identity,
-                &snapshot.parsed.after,
-                &snapshot.parsed.after_hash,
+                &snapshot.expected_target_identity,
+                &snapshot.expected_target_hash,
             )
             .then_some(())
             .ok_or(UnitStoreError::RepairRequired)
         }
 
         fn clear_reload_required(&self, unit_name: &str) -> Result<(), UnitStoreError> {
-            if !is_managed_unit_filename(unit_name) {
-                return Err(UnitStoreError::Unavailable);
-            }
-            let Some(directory) = self.open_user_dir(false)? else {
-                return Ok(());
-            };
-            let journal = journal_name(unit_name);
-            let mut snapshots = self
-                .journals
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let snapshot = snapshots
-                .get(unit_name)
-                .ok_or(UnitStoreError::RepairRequired)?;
-            if !Self::snapshot_still_named(&directory, unit_name, snapshot)? {
-                return Err(UnitStoreError::RepairRequired);
-            }
-            if !matches!(
-                Self::inspect_at(&directory, &snapshot.parsed.temporary),
-                Ok((StoredUnit::Missing, None))
-            ) {
-                return Err(UnitStoreError::CommittedNeedsReload);
-            }
-            Self::remove_exact(
-                &directory,
-                &journal,
-                &snapshot.bytes,
-                snapshot.identity,
-                "journal-clear",
-            )
-            .map_err(|error| match error {
-                UnitStoreError::Conflict | UnitStoreError::RepairRequired => {
-                    UnitStoreError::RepairRequired
-                }
-                _ => UnitStoreError::CommittedNeedsReload,
-            })?;
-            rustix::fs::fsync(&directory).map_err(|_| UnitStoreError::CommittedNeedsReload)?;
-            snapshots.remove(unit_name);
-            Ok(())
+            self.clear_reload_required_with_hook(unit_name, |_, _, _| {})
         }
 
         fn repair_precommit_journal(
@@ -1839,33 +2093,7 @@ mod unix_store {
             unit_name: &str,
             expected: Option<&[u8]>,
         ) -> Result<(), UnitStoreError> {
-            if !is_managed_unit_filename(unit_name) {
-                return Err(UnitStoreError::Unavailable);
-            }
-            let directory = self.open_user_dir(false)?.ok_or(UnitStoreError::Conflict)?;
-            let journal = journal_name(unit_name);
-            let (stored, journal_identity) = Self::inspect_at(&directory, &journal)?;
-            let StoredUnit::Regular(journal_bytes) = stored else {
-                return Err(UnitStoreError::Conflict);
-            };
-            if valid_journal(unit_name, &journal_bytes) {
-                return Err(UnitStoreError::Conflict);
-            }
-            let (target, _) = Self::inspect_at(&directory, unit_name)?;
-            match (expected, target) {
-                (None, StoredUnit::Missing) => {}
-                (Some(expected), StoredUnit::Regular(actual)) if actual == expected => {}
-                _ => return Err(UnitStoreError::Conflict),
-            }
-            let journal_identity = journal_identity.ok_or(UnitStoreError::Conflict)?;
-            Self::remove_exact(
-                &directory,
-                &journal,
-                &journal_bytes,
-                journal_identity,
-                "malformed-repair",
-            )?;
-            rustix::fs::fsync(&directory).map_err(|_| UnitStoreError::Io)
+            self.repair_precommit_journal_with_hook(unit_name, expected, |_, _, _| {})
         }
 
         fn atomic_replace(
@@ -4250,6 +4478,108 @@ mod tests {
             }
         }
         assert!(commands.commands().is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn snapshot_append_target_clear_and_repair_races_fail_closed() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt;
+
+        fn replace_path(path: &Path, bytes: &[u8]) {
+            let temporary = path.with_extension("race-new");
+            std::fs::write(&temporary, bytes).unwrap();
+            std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600)).unwrap();
+            std::fs::rename(temporary, path).unwrap();
+        }
+
+        let temporary = tempfile::tempdir().unwrap();
+        let config = temporary.path().join("config");
+        std::fs::create_dir(&config).unwrap();
+        let store = SystemUserUnitStore::new(&config).unwrap();
+        let directory = store.open_user_dir(true).unwrap().unwrap();
+        let bytes = unit(&[]).render().unwrap();
+        store
+            .atomic_replace(
+                "rustscale-tray.service",
+                None,
+                &bytes,
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        let snapshot =
+            SystemUserUnitStore::open_journal_snapshot(&directory, "rustscale-tray.service")
+                .unwrap()
+                .unwrap();
+        let journal_path = store
+            .unit_directory()
+            .join(".rustscale-tray.service.operation");
+        assert!(!SystemUserUnitStore::snapshot_still_named_with_hook(
+            &directory,
+            "rustscale-tray.service",
+            &snapshot,
+            |gap, _, _| {
+                if gap == unix_store::SnapshotGap::AfterInitialStat {
+                    let mut file = std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(&journal_path)
+                        .unwrap();
+                    file.write_all(b"appended-after-stat").unwrap();
+                    file.sync_all().unwrap();
+                }
+            },
+        )
+        .unwrap());
+
+        // Recreate a clean operation and substitute the target immediately
+        // before clear's final journal+target validation.
+        std::fs::remove_file(&journal_path).unwrap();
+        store.journals.lock().unwrap().clear();
+        std::fs::remove_file(store.unit_directory().join("rustscale-tray.service")).unwrap();
+        store
+            .atomic_replace(
+                "rustscale-tray.service",
+                None,
+                &bytes,
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            store.clear_reload_required_with_hook("rustscale-tray.service", |gap, _, unit_name| {
+                if gap == unix_store::ClearGap::BeforeFinalValidation {
+                    let path = store.unit_directory().join(unit_name);
+                    replace_path(&path, b"clear-racer");
+                }
+            },),
+            Err(UnitStoreError::RepairRequired)
+        );
+        assert!(journal_path.exists());
+        assert_eq!(
+            std::fs::read(store.unit_directory().join("rustscale-tray.service")).unwrap(),
+            b"clear-racer"
+        );
+
+        // A malformed-journal repair similarly preserves both the journal and
+        // a target raced after the exact target snapshot was opened.
+        std::fs::write(&journal_path, b"malformed-repair-journal").unwrap();
+        std::fs::set_permissions(&journal_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let target = store.unit_directory().join("rustscale-tray.service");
+        std::fs::write(&target, &bytes).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            store.repair_precommit_journal_with_hook(
+                "rustscale-tray.service",
+                Some(&bytes),
+                |gap, _, _| {
+                    if gap == unix_store::RepairGap::BeforeFinalValidation {
+                        replace_path(&target, b"repair-racer");
+                    }
+                },
+            ),
+            Err(UnitStoreError::RepairRequired)
+        );
+        assert!(journal_path.exists());
+        assert_eq!(std::fs::read(target).unwrap(), b"repair-racer");
     }
 
     #[cfg(target_os = "linux")]

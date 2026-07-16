@@ -34,8 +34,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// Initialize the recording backend before the shell is started.
 ///
 /// Remote recorder failures reject only when the policy supplies a rejection
-/// message; otherwise they deliberately fail open. NotifyURL requires the
-/// control-plane Noise client and is deferred for now.
+/// message; otherwise they deliberately fail open. Recording-failure control
+/// callbacks are handed off synchronously and never delay this decision.
 pub async fn init_recording(
     config: &RecordingConfig,
     cast_header: CastHeader,
@@ -45,23 +45,28 @@ pub async fn init_recording(
         return match &config.local_path {
             Some(path) => match SessionRecorder::with_file(path, cast_header, config.fail_open) {
                 Ok(recorder) => Ok(Some(recorder)),
-                Err(_) => recording_connect_failed(config, "local recording could not start"),
+                Err(_) => recording_connect_failed(config, "local recording could not start", None),
             },
             None => Ok(None),
         };
     }
     let Some(dial) = dial else {
-        return recording_connect_failed(config, "no recorder dialer configured");
+        return recording_connect_failed(config, "no recorder dialer configured", None);
     };
     match crate::recording_upload::connect_to_recorder(&config.recorders, dial).await {
-        Ok(connection) => initialize_upload_recording(config, cast_header, connection),
+        Ok(connection) => {
+            if let Some(notify) = &config.notify {
+                notify.set_attempts(&connection.attempts);
+            }
+            initialize_upload_recording(config, cast_header, connection)
+        }
         Err((attempts, error)) => {
             let _ = error;
             log::warn!(
                 "SSH recording could not start after {} recorder attempt(s)",
                 attempts.len()
             );
-            recording_connect_failed(config, "recorder connection failed")
+            recording_connect_failed(config, "recorder connection failed", Some(&attempts))
         }
     }
 }
@@ -85,17 +90,21 @@ fn initialize_upload_recording(
         // Abort the partial upload before applying the same fail-open/
         // fail-closed policy as connect failures.
         abort.abort();
-        recording_connect_failed(config, "remote recording could not start")
+        notify_upload_failure(config, "recording initialization failed");
+        recording_connect_failed(config, "remote recording could not start", None)
     }
 }
 
 fn recording_connect_failed(
     config: &RecordingConfig,
     error: &str,
+    attempts: Option<&[rustscale_tailcfg::SSHRecordingAttempt]>,
 ) -> Result<Option<SessionRecorder>, String> {
     if let Some(action) = &config.on_failure {
-        if !action.NotifyURL.is_empty() {
-            log::warn!("SSH recording NotifyURL is not implemented yet");
+        if let (Some(notify), Some(attempts)) = (&config.notify, attempts) {
+            if !attempts.is_empty() {
+                notify.connection_failed(attempts, !action.RejectSessionWithMessage.is_empty());
+            }
         }
         if !action.RejectSessionWithMessage.is_empty() {
             return Err(action.RejectSessionWithMessage.clone());
@@ -112,6 +121,16 @@ fn recording_connect_failed(
             .map(|action| action.TerminateSessionWithMessage.clone())
             .filter(|message| !message.is_empty())
             .unwrap_or_else(|| "recording required".into()))
+    }
+}
+
+fn notify_upload_failure(config: &RecordingConfig, failure_message: &str) {
+    let terminated = config
+        .on_failure
+        .as_ref()
+        .is_some_and(|action| !action.TerminateSessionWithMessage.is_empty());
+    if let Some(notify) = &config.notify {
+        notify.upload_failed(failure_message, terminated);
     }
 }
 
@@ -1244,6 +1263,9 @@ pub(crate) async fn run_session_with(
                             if matches!(recorder.write(RecordDir::Output, &stdout_buf[..count]), RecordResult::Failed) {
                                 upload_result_rx = None;
                                 recorder.abort_upload();
+                                if let Some(config) = effective_recording_config.as_ref() {
+                                    notify_upload_failure(config, "recorder upload failed");
+                                }
                                 if recording_fail_closed {
                                     deliver = false;
                                     forced_failure = true;
@@ -1275,6 +1297,9 @@ pub(crate) async fn run_session_with(
                             if matches!(recorder.write(RecordDir::Output, &stderr_buf[..count]), RecordResult::Failed) {
                                 upload_result_rx = None;
                                 recorder.abort_upload();
+                                if let Some(config) = effective_recording_config.as_ref() {
+                                    notify_upload_failure(config, "recorder upload failed");
+                                }
                                 if recording_fail_closed {
                                     deliver = false;
                                     forced_failure = true;
@@ -1318,6 +1343,9 @@ pub(crate) async fn run_session_with(
                 upload_result_rx = None;
                 if let Some(recorder) = recorder.as_ref() {
                     let _ = recorder.close();
+                }
+                if let Some(config) = effective_recording_config.as_ref() {
+                    notify_upload_failure(config, "recorder upload ended before the SSH session");
                 }
                 if recording_fail_closed {
                     forced_failure = true;
@@ -1410,6 +1438,9 @@ pub(crate) async fn run_session_with(
         }
     }
     if final_recording_failed {
+        if let Some(config) = effective_recording_config.as_ref() {
+            notify_upload_failure(config, "recorder upload failed during session teardown");
+        }
         if recording_fail_closed {
             forced_failure = true;
             send_recording_termination(terminate_message.as_deref(), &handle, channel_id).await;
@@ -1719,6 +1750,60 @@ mod tests {
             after <= baseline + 3,
             "PTY descriptors grew across recorder failures: {baseline} -> {after}"
         );
+    }
+
+    #[tokio::test]
+    async fn recorder_start_failure_notifies_once_with_upstream_event_semantics() {
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let callback: crate::RecordingNotifyCallback = {
+            let events = events.clone();
+            std::sync::Arc::new(move |_url, request| events.lock().unwrap().push(request))
+        };
+        let notify = crate::RecordingFailureNotify::new(
+            callback,
+            "/machine/ssh/notify".into(),
+            rustscale_tailcfg::SSHEventNotifyRequest::default(),
+        );
+        let config = RecordingConfig {
+            recorders: vec!["100.64.0.9:80".parse().unwrap()],
+            on_failure: Some(rustscale_tailcfg::SSHRecorderFailureAction {
+                RejectSessionWithMessage: "recording required".into(),
+                NotifyURL: "/machine/ssh/notify".into(),
+                ..Default::default()
+            }),
+            notify: Some(notify),
+            ..Default::default()
+        };
+        let dial: DialFn = std::sync::Arc::new(|_| {
+            Box::pin(async { Err(io::Error::other("injected recorder rejection")) })
+        });
+        let header = || {
+            CastHeader::new(
+                (0, 0),
+                "command".into(),
+                std::collections::HashMap::new(),
+                "requested".into(),
+                "mapped".into(),
+                "connection".into(),
+            )
+        };
+        assert!(matches!(
+            init_recording(&config, header(), Some(dial.clone())).await,
+            Err(message) if message == "recording required"
+        ));
+        // A second observation cannot enqueue a duplicate for this session.
+        assert!(matches!(
+            init_recording(&config, header(), Some(dial)).await,
+            Err(message) if message == "recording required"
+        ));
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].EventType,
+            rustscale_tailcfg::SSHEventType::SessionRecordingRejected
+        );
+        assert_eq!(events[0].RecordingAttempts.len(), 1);
+        assert!(!events[0].RecordingAttempts[0].FailureMessage.is_empty());
     }
 
     #[tokio::test]

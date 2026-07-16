@@ -117,6 +117,20 @@ impl Server {
             })
         });
 
+        // Admission is bound to the currently published map Noise generation.
+        // This producer contains no machine/control credentials and cannot
+        // establish a fresh transport.
+        let control_notifier = inner.ssh_callbacks.notifier();
+        let recording_notify: rustscale_ssh::RecordingNotifyCallback =
+            Arc::new(move |notify_url, request| {
+                if control_notifier.enqueue(notify_url, &request).is_err() {
+                    // Do not log callback URLs, identities, recorder attempts,
+                    // or control-generation details.
+                    log::warn!("SSH recording callback could not be queued");
+                }
+            });
+        let node_key = inner.node_key.public();
+
         let (session_tx, init_rx) = mpsc::channel::<SessionInit>(16);
         let session_tx = Arc::new(session_tx);
 
@@ -136,6 +150,7 @@ impl Server {
         let host_keys_clone = host_keys.clone();
         let dial_fn_clone = dial_fn.clone();
         let state_dir_clone = state_dir.clone();
+        let recording_notify_clone = recording_notify.clone();
 
         let task = tokio::spawn(async move {
             let mut tcp_listener = tcp_listener;
@@ -150,6 +165,8 @@ impl Server {
                         let hk = host_keys_clone.clone();
                         let dial_fn = dial_fn_clone.clone();
                         let state_dir = state_dir_clone.clone();
+                        let recording_notify = recording_notify_clone.clone();
+                        let node_key = node_key.clone();
 
                         tokio::spawn(async move {
                             let ssh_config = SshServerConfig {
@@ -159,6 +176,9 @@ impl Server {
                                 policy,
                                 state_dir,
                                 dial_fn: Some(dial_fn),
+                                recording_notify: Some(recording_notify),
+                                node_key,
+                                capability_version: crate::CAPABILITY_VERSION,
                             };
                             let mut server = SshServer::new(ssh_config);
                             let _ = handle_ssh_conn(config, &mut server, stream, peer_addr).await;

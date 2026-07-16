@@ -872,6 +872,8 @@ pub(crate) struct RunningState {
     /// SSH host keys currently advertised through Hostinfo.
     #[cfg_attr(not(feature = "ssh"), allow(dead_code))]
     pub(crate) ssh_host_keys: Arc<RwLock<Vec<String>>>,
+    /// Generation-bound SSH callback admission owned by the current map Noise session.
+    pub(crate) ssh_callbacks: rustscale_controlclient::SshCallbackDispatcher,
     /// Network change monitor handle (None if the monitor couldn't start).
     pub(crate) monitor: Option<rustscale_netmon::MonitorHandle>,
     /// Machine private key (for control-plane set-dns during cert issuance).
@@ -1021,6 +1023,8 @@ pub(crate) struct Bootstrap {
     pub(crate) ssh_policy: Arc<RwLock<Option<SSHPolicy>>>,
     /// SSH host keys currently advertised through Hostinfo.
     pub(crate) ssh_host_keys: Arc<RwLock<Vec<String>>>,
+    /// Generation-bound SSH callback admission shared with map polling.
+    pub(crate) ssh_callbacks: rustscale_controlclient::SshCallbackDispatcher,
     /// Machine private key (for link-change endpoint updates).
     pub(crate) machine_key: MachinePrivate,
     /// Server (control) public key (for link-change endpoint updates).

@@ -3319,12 +3319,24 @@ name = "rustscale-ipn"
 version = "0.1.1"
 dependencies = [
  "proptest",
+ "rustscale-feature",
  "rustscale-health",
  "rustscale-netcheck",
  "rustscale-tailcfg",
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "rustscale-ipnext"
+version = "0.1.1"
+dependencies = [
+ "async-trait",
+ "rustscale-feature",
+ "rustscale-ipn",
+ "rustscale-tsd",
  "tokio",
 ]
 
@@ -3843,6 +3855,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustscale-tsd"
+version = "0.1.1"
+
+[[package]]
 name = "rustscale-tsdial"
 version = "0.1.1"
 dependencies = [
@@ -3908,6 +3924,7 @@ dependencies = [
  "rustscale-health",
  "rustscale-identityfederation",
  "rustscale-ipn",
+ "rustscale-ipnext",
  "rustscale-ipnstate",
  "rustscale-key",
  "rustscale-localclient",
@@ -3936,6 +3953,7 @@ dependencies = [
  "rustscale-testcontrol",
  "rustscale-tka",
  "rustscale-tsaddr",
+ "rustscale-tsd",
  "rustscale-tsdial",
  "rustscale-tun",
  "rustscale-udprelay",

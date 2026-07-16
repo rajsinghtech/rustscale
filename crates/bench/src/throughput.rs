@@ -173,7 +173,7 @@ pub async fn run(
     let up_mbps = bytes_to_mbps(up_bytes, duration as f64);
     let down_mbps = bytes_to_mbps(down_bytes, duration as f64);
 
-    server.close().await;
+    server.close().await.unwrap();
 
     Ok(ThroughputResult {
         direction: direction.to_string(),

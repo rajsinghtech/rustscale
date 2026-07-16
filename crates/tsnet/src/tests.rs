@@ -5,21 +5,1209 @@
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
+use rustscale_ipnext::{Definition, Extension, ExtensionRegistry, ExtensionResult, Host};
 use rustscale_key::NodePrivate;
+use rustscale_router::{Router, RouterConfig, RouterError};
 use rustscale_tailcfg::Node;
-use rustscale_testcontrol::Server as TestControlServer;
 use rustscale_wg::WgTunn;
 
 use super::*;
+use crate::tun_pump::ManagedRouter;
+
+fn shared_test_router(router: Box<dyn rustscale_router::Router>) -> SharedRouter {
+    Arc::new(std::sync::Mutex::new(ManagedRouter {
+        router,
+        tun_name: "rustscale-test0".into(),
+        exit_node: false,
+        security_block_attempted: false,
+        security_block_verified: false,
+        security_block_reasons: 0,
+    }))
+}
+
+struct RuntimeCleanupRouter(Arc<AtomicBool>);
+
+impl Router for RuntimeCleanupRouter {
+    fn up(&mut self) -> Result<(), RouterError> {
+        Ok(())
+    }
+
+    fn set(&mut self, _: &RouterConfig) -> Result<(), RouterError> {
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<(), RouterError> {
+        self.0.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+struct RuntimeCleanupExtension {
+    entered: Option<Arc<tokio::sync::Barrier>>,
+    release: Option<Arc<tokio::sync::Barrier>>,
+    closed: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl Extension for RuntimeCleanupExtension {
+    fn name(&self) -> &'static str {
+        "runtime-cleanup"
+    }
+
+    async fn init(&self, _: Host) -> ExtensionResult {
+        Ok(())
+    }
+
+    async fn shutdown(&self) -> ExtensionResult {
+        if let Some(entered) = self.entered.as_ref() {
+            entered.wait().await;
+        }
+        if let Some(release) = self.release.as_ref() {
+            release.wait().await;
+        }
+        self.closed.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Builder validation tests (not ignored)
 // ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn mock_extension_integrates_with_server_container_and_close() {
+    struct Marker(&'static str);
+    struct MockExtension {
+        events: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl Extension for MockExtension {
+        fn name(&self) -> &'static str {
+            "mock"
+        }
+
+        async fn init(&self, host: Host) -> ExtensionResult {
+            let marker = host.system()?.get::<Marker>()?;
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("init:{}", marker.0));
+            Ok(())
+        }
+
+        async fn shutdown(&self) -> ExtensionResult {
+            self.events.lock().unwrap().push("shutdown".into());
+            Ok(())
+        }
+    }
+
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let registry = Arc::new(ExtensionRegistry::new());
+    let factory_events = Arc::clone(&events);
+    registry
+        .register(Definition::new("mock", move |_| {
+            Ok(Arc::new(MockExtension {
+                events: Arc::clone(&factory_events),
+            }))
+        }))
+        .unwrap();
+    let system = Arc::new(rustscale_tsd::System::new());
+    system.set_value(Marker("dependency")).unwrap();
+
+    let mut server = Server::builder()
+        .extension_registry(registry)
+        .system(system)
+        .build()
+        .unwrap();
+    server
+        .extension_host
+        .as_ref()
+        .unwrap()
+        .start()
+        .await
+        .unwrap();
+    server.close().await.unwrap();
+
+    assert_eq!(*events.lock().unwrap(), ["init:dependency", "shutdown"]);
+    assert!(server.extension_host().is_none());
+}
+
+#[tokio::test]
+async fn close_retry_retains_extension_child_after_transient_shutdown_error() {
+    struct ChildResource(Arc<AtomicBool>);
+    impl Drop for ChildResource {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    struct TransientShutdown {
+        attempts: Arc<AtomicUsize>,
+        child: Mutex<Option<ChildResource>>,
+    }
+    #[async_trait]
+    impl Extension for TransientShutdown {
+        fn name(&self) -> &'static str {
+            "transient-close"
+        }
+
+        async fn init(&self, _: Host) -> ExtensionResult {
+            Ok(())
+        }
+
+        async fn shutdown(&self) -> ExtensionResult {
+            if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(Box::new(std::io::Error::other("transient close failure")));
+            }
+            self.child.lock().unwrap().take();
+            Ok(())
+        }
+    }
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let child_dropped = Arc::new(AtomicBool::new(false));
+    let registry = Arc::new(ExtensionRegistry::new());
+    let factory_attempts = Arc::clone(&attempts);
+    let factory_child_dropped = Arc::clone(&child_dropped);
+    registry
+        .register(Definition::new("transient-close", move |_| {
+            Ok(Arc::new(TransientShutdown {
+                attempts: Arc::clone(&factory_attempts),
+                child: Mutex::new(Some(ChildResource(Arc::clone(&factory_child_dropped)))),
+            }))
+        }))
+        .unwrap();
+    let mut server = Server::builder()
+        .extension_registry(registry)
+        .build()
+        .unwrap();
+    server
+        .extension_host
+        .as_ref()
+        .unwrap()
+        .start()
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        server.close().await,
+        Err(TsnetError::ShutdownIncomplete(_))
+    ));
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert!(!child_dropped.load(Ordering::SeqCst));
+    assert_eq!(
+        server.shutdown_supervisor.retained_extension_host_count(),
+        1
+    );
+
+    server.close().await.unwrap();
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert!(child_dropped.load(Ordering::SeqCst));
+    assert_eq!(
+        server.shutdown_supervisor.retained_extension_host_count(),
+        0
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn incomplete_close_preserves_router_dns_and_magicsock_until_retry() {
+    struct FailOnce(Arc<AtomicUsize>);
+    #[async_trait]
+    impl Extension for FailOnce {
+        fn name(&self) -> &'static str {
+            "close-barrier"
+        }
+        async fn init(&self, _: Host) -> ExtensionResult {
+            Ok(())
+        }
+        async fn shutdown(&self) -> ExtensionResult {
+            if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(Box::new(std::io::Error::other("retry close")))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    struct FlagRouter(Arc<AtomicBool>);
+    impl Router for FlagRouter {
+        fn up(&mut self) -> Result<(), RouterError> {
+            Ok(())
+        }
+        fn set(&mut self, _: &RouterConfig) -> Result<(), RouterError> {
+            Ok(())
+        }
+        fn close(&mut self) -> Result<(), RouterError> {
+            self.0.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    struct FlagDns(Arc<AtomicBool>);
+    impl rustscale_dns::OsConfigurator for FlagDns {
+        fn set_dns(&mut self, _: &rustscale_dns::OsConfig) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn close(&mut self) -> std::io::Result<()> {
+            self.0.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        fn supports_split_dns(&self) -> bool {
+            true
+        }
+    }
+
+    let mut control = rustscale_testcontrol::Server::new();
+    control.start().await.unwrap();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let registry = Arc::new(ExtensionRegistry::new());
+    let factory_attempts = Arc::clone(&attempts);
+    registry
+        .register(Definition::new("close-barrier", move |_| {
+            Ok(Arc::new(FailOnce(Arc::clone(&factory_attempts))))
+        }))
+        .unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let mut server = Server::builder()
+        .hostname("close-barrier")
+        .auth_key("tskey-test")
+        .control_url(control.base_url())
+        .state_dir(state.path())
+        .disable_portmapping(true)
+        .extension_registry(registry)
+        .build()
+        .unwrap();
+    Box::pin(server.up()).await.unwrap();
+
+    let router_closed = Arc::new(AtomicBool::new(false));
+    let dns_closed = Arc::new(AtomicBool::new(false));
+    let bound = server
+        .inner
+        .as_ref()
+        .unwrap()
+        .magicsock
+        .bound_udp_addr()
+        .unwrap();
+    let inner = server.inner.as_mut().unwrap();
+    inner.router = Some(shared_test_router(Box::new(FlagRouter(Arc::clone(
+        &router_closed,
+    )))));
+    inner.os_dns_configurator = Some(Box::new(FlagDns(Arc::clone(&dns_closed))));
+
+    assert!(matches!(
+        server.close().await,
+        Err(TsnetError::ShutdownIncomplete(_))
+    ));
+    assert!(!router_closed.load(Ordering::SeqCst));
+    assert!(!dns_closed.load(Ordering::SeqCst));
+    assert!(tokio::net::UdpSocket::bind(bound).await.is_err());
+    assert_eq!(
+        server.shutdown_supervisor.retained_extension_host_count(),
+        1
+    );
+
+    drop(server);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !router_closed.load(Ordering::SeqCst) || !dns_closed.load(Ordering::SeqCst) {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("Drop did not finish the retained close owner");
+    let rebound = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            match tokio::net::UdpSocket::bind(bound).await {
+                Ok(socket) => break socket,
+                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                Err(error) => panic!("unexpected UDP rebind failure: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("Drop cleanup retained the magicsock UDP socket");
+    drop(rebound);
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drop_retries_final_extension_owner_instead_of_discarding_it() {
+    struct FailOnce {
+        attempts: Arc<AtomicUsize>,
+        done: Arc<tokio::sync::Notify>,
+    }
+    #[async_trait]
+    impl Extension for FailOnce {
+        fn name(&self) -> &'static str {
+            "drop-retry"
+        }
+        async fn init(&self, _: Host) -> ExtensionResult {
+            Ok(())
+        }
+        async fn shutdown(&self) -> ExtensionResult {
+            if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(Box::new(std::io::Error::other("retry from Drop")));
+            }
+            self.done.notify_one();
+            Ok(())
+        }
+    }
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let done = Arc::new(tokio::sync::Notify::new());
+    let registry = Arc::new(ExtensionRegistry::new());
+    let factory_attempts = Arc::clone(&attempts);
+    let factory_done = Arc::clone(&done);
+    registry
+        .register(Definition::new("drop-retry", move |_| {
+            Ok(Arc::new(FailOnce {
+                attempts: Arc::clone(&factory_attempts),
+                done: Arc::clone(&factory_done),
+            }))
+        }))
+        .unwrap();
+    let server = Server::builder()
+        .extension_registry(registry)
+        .build()
+        .unwrap();
+    server
+        .extension_host
+        .as_ref()
+        .unwrap()
+        .start()
+        .await
+        .unwrap();
+
+    drop(server);
+    tokio::time::timeout(std::time::Duration::from_secs(2), done.notified())
+        .await
+        .expect("Drop did not retain and retry the extension owner");
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn close_owner_survives_caller_runtime_destruction() {
+    let first_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut control = rustscale_testcontrol::Server::new();
+    first_runtime.block_on(control.start()).unwrap();
+
+    let entered = Arc::new(tokio::sync::Barrier::new(2));
+    let release = Arc::new(tokio::sync::Barrier::new(2));
+    let extension_closed = Arc::new(AtomicBool::new(false));
+    let registry = Arc::new(ExtensionRegistry::new());
+    let factory_entered = Arc::clone(&entered);
+    let factory_release = Arc::clone(&release);
+    let factory_closed = Arc::clone(&extension_closed);
+    registry
+        .register(Definition::new("runtime-cleanup", move |_| {
+            Ok(Arc::new(RuntimeCleanupExtension {
+                entered: Some(Arc::clone(&factory_entered)),
+                release: Some(Arc::clone(&factory_release)),
+                closed: Arc::clone(&factory_closed),
+            }))
+        }))
+        .unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let mut server = Server::builder()
+        .hostname("close-runtime-destroy")
+        .auth_key("tskey-test")
+        .control_url(control.base_url())
+        .state_dir(temp.path())
+        .disable_portmapping(true)
+        .extension_registry(registry)
+        .build()
+        .unwrap();
+    first_runtime.block_on(Box::pin(server.up())).unwrap();
+
+    let router_closed = Arc::new(AtomicBool::new(false));
+    server.inner.as_mut().unwrap().router = Some(shared_test_router(Box::new(
+        RuntimeCleanupRouter(Arc::clone(&router_closed)),
+    )));
+    first_runtime.block_on(async {
+        let mut close = Box::pin(server.close());
+        tokio::select! {
+            result = &mut close => panic!("close finished before runtime destruction: {result:?}"),
+            _ = entered.wait() => {}
+        }
+    });
+    first_runtime.shutdown_background();
+
+    assert!(!extension_closed.load(Ordering::SeqCst));
+    assert!(!router_closed.load(Ordering::SeqCst));
+    let retry_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    retry_runtime.block_on(async {
+        release.wait().await;
+        server.close().await.unwrap();
+    });
+    assert!(extension_closed.load(Ordering::SeqCst));
+    assert!(router_closed.load(Ordering::SeqCst));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_close_finishes_prestarted_and_extension_cleanup() {
+    struct BlockingShutdown {
+        entered: Arc<tokio::sync::Barrier>,
+        release: Arc<tokio::sync::Barrier>,
+        done: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl Extension for BlockingShutdown {
+        fn name(&self) -> &'static str {
+            "close-cancellation"
+        }
+
+        async fn init(&self, _: Host) -> ExtensionResult {
+            Ok(())
+        }
+
+        async fn shutdown(&self) -> ExtensionResult {
+            self.entered.wait().await;
+            self.release.wait().await;
+            self.done.notify_one();
+            Ok(())
+        }
+    }
+
+    let entered = Arc::new(tokio::sync::Barrier::new(2));
+    let release = Arc::new(tokio::sync::Barrier::new(2));
+    let done = Arc::new(tokio::sync::Notify::new());
+    let registry = Arc::new(ExtensionRegistry::new());
+    let factory_entered = Arc::clone(&entered);
+    let factory_release = Arc::clone(&release);
+    let factory_done = Arc::clone(&done);
+    registry
+        .register(Definition::new("close-cancellation", move |_| {
+            Ok(Arc::new(BlockingShutdown {
+                entered: Arc::clone(&factory_entered),
+                release: Arc::clone(&factory_release),
+                done: Arc::clone(&factory_done),
+            }))
+        }))
+        .unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("localapi.sock");
+    let mut server = Server::builder()
+        .state_dir(temp.path())
+        .localapi_path(&socket)
+        .extension_registry(registry)
+        .build()
+        .unwrap();
+    let _commands = server.start_localapi_only().await.unwrap();
+    server
+        .extension_host
+        .as_ref()
+        .unwrap()
+        .start()
+        .await
+        .unwrap();
+    assert!(socket.exists());
+
+    let close = tokio::spawn(async move { server.close().await });
+    tokio::time::timeout(std::time::Duration::from_secs(1), entered.wait())
+        .await
+        .expect("extension shutdown did not start");
+    assert!(!socket.exists(), "pre-started LocalAPI socket leaked");
+    close.abort();
+    let _ = close.await;
+    release.wait().await;
+    tokio::time::timeout(std::time::Duration::from_secs(1), done.notified())
+        .await
+        .expect("owned shutdown stopped after close cancellation");
+    #[cfg(unix)]
+    {
+        let retry = std::os::unix::net::UnixListener::bind(&socket)
+            .expect("needs-login fixed socket was retained after cleanup");
+        drop(retry);
+        let _ = std::fs::remove_file(&socket);
+    }
+}
+
+#[cfg(unix)]
+async fn assert_localapi_reachable(path: &std::path::Path) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut client = rustscale_safesocket::connect(path).expect("connect LocalAPI");
+    client
+        .write_all(
+            b"GET /localapi/v0/status HTTP/1.1\r\nHost: local-tailscaled.sock\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+    let mut response = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        client.read_to_end(&mut response),
+    )
+    .await
+    .expect("LocalAPI listener did not answer")
+    .unwrap();
+    assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn localapi_handoff_rolls_back_on_cancellation_and_failure_then_retries() {
+    for inject_failure in [false, true] {
+        let mut control = rustscale_testcontrol::Server::new();
+        control.start().await.unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join(format!("handoff-{inject_failure}.sock"));
+        let mut server = Server::builder()
+            .hostname("handoff-rollback")
+            .control_url(control.base_url())
+            .state_dir(temp.path())
+            .disable_portmapping(true)
+            .localapi_path(&socket)
+            .build()
+            .unwrap();
+        let _commands = server.start_localapi_only().await.unwrap();
+        server.set_auth_key("tskey-test");
+        assert_localapi_reachable(&socket).await;
+
+        let entered = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Barrier::new(2));
+        server.startup_localapi_test_hook =
+            Some((Arc::clone(&entered), Arc::clone(&release), inject_failure));
+        let mut up = Box::pin(server.up());
+        tokio::select! {
+            _ = entered.wait() => {}
+            result = &mut up => panic!("startup finished before handoff hook: {result:?}"),
+        }
+        if inject_failure {
+            release.wait().await;
+            assert!(up.await.is_err());
+        } else {
+            drop(up);
+        }
+
+        // Rollback atomically republishes the still-running needs-login
+        // generation; neither cancellation nor a later startup failure can
+        // leave the advertised path owned by the discarded replacement.
+        assert_localapi_reachable(&socket).await;
+        server.startup_localapi_test_hook = None;
+        tokio::time::timeout(std::time::Duration::from_secs(10), Box::pin(server.up()))
+            .await
+            .expect("clean handoff retry timed out")
+            .unwrap();
+        assert_localapi_reachable(&socket).await;
+        server.close().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_logout_transaction_blocks_retry_until_owned_cleanup_finishes() {
+    let mut control = rustscale_testcontrol::Server::new();
+    control.start().await.unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("logout-cancel.sock");
+    let mut server = Server::builder()
+        .hostname("logout-cancel")
+        .auth_key("tskey-test")
+        .control_url(control.base_url())
+        .state_dir(temp.path())
+        .localapi_path(&socket)
+        .disable_portmapping(true)
+        .build()
+        .unwrap();
+    Box::pin(server.up()).await.unwrap();
+
+    let entered = Arc::new(tokio::sync::Barrier::new(2));
+    let release = Arc::new(tokio::sync::Barrier::new(2));
+    server.logout_test_hook = Some((Arc::clone(&entered), Arc::clone(&release)));
+    let mut logout = Box::pin(server.logout());
+    tokio::select! {
+        _ = entered.wait() => {}
+        result = &mut logout => panic!("logout finished before cancellation barrier: {result:?}"),
+    }
+    drop(logout);
+
+    let logout_supervisor = Arc::clone(&server.shutdown_supervisor);
+    let mut retry = Box::pin(server.start_localapi_only());
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut retry)
+            .await
+            .is_err(),
+        "retry overlapped cancelled logout transaction"
+    );
+    release.wait().await;
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), &mut retry)
+        .await
+        .expect("retry did not resume after logout cleanup");
+    drop(retry);
+    match result {
+        Ok(commands) => drop(commands),
+        Err(error) => {
+            assert!(matches!(error, TsnetError::ShutdownIncomplete(_)));
+            assert_eq!(
+                logout_supervisor.retained_logout_phase(),
+                Some(LogoutPhase::Cleanup)
+            );
+            let mut completed = false;
+            let mut retry_errors = Vec::new();
+            for attempt in 0..20 {
+                match server.logout().await {
+                    Ok(()) => {
+                        completed = true;
+                        break;
+                    }
+                    Err(error @ TsnetError::ShutdownIncomplete(_)) => {
+                        retry_errors.push(error.to_string());
+                        tokio::time::sleep(std::time::Duration::from_millis(5 * (attempt + 1)))
+                            .await;
+                    }
+                    Err(error) => panic!("unexpected logout retry failure: {error}"),
+                }
+            }
+            assert!(
+                completed,
+                "logout cleanup did not complete after bounded retries: {retry_errors:?}"
+            );
+            let commands = server.start_localapi_only().await.unwrap();
+            drop(commands);
+        }
+    }
+    server.close().await.unwrap();
+}
+
+#[test]
+fn logout_transaction_survives_caller_runtime_destruction_and_resumes_phase() {
+    let (url_tx, url_rx) = std::sync::mpsc::sync_channel(1);
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+    let control_worker = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let mut control = rustscale_testcontrol::Server::new();
+            control.start().await.unwrap();
+            url_tx.send(control.base_url()).unwrap();
+            let _ = stop_rx.await;
+        });
+    });
+    let control_url = url_rx.recv().unwrap();
+
+    let extension_closed = Arc::new(AtomicBool::new(false));
+    let registry = Arc::new(ExtensionRegistry::new());
+    let factory_closed = Arc::clone(&extension_closed);
+    registry
+        .register(Definition::new("runtime-cleanup", move |_| {
+            Ok(Arc::new(RuntimeCleanupExtension {
+                entered: None,
+                release: None,
+                closed: Arc::clone(&factory_closed),
+            }))
+        }))
+        .unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let mut server = Server::builder()
+        .hostname("logout-runtime-destroy")
+        .auth_key("tskey-test")
+        .control_url(control_url)
+        .state_dir(temp.path())
+        .disable_portmapping(true)
+        .extension_registry(registry)
+        .build()
+        .unwrap();
+    let first_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    first_runtime.block_on(Box::pin(server.up())).unwrap();
+
+    let router_closed = Arc::new(AtomicBool::new(false));
+    server.inner.as_mut().unwrap().router = Some(shared_test_router(Box::new(
+        RuntimeCleanupRouter(Arc::clone(&router_closed)),
+    )));
+    let scope = server.profile_state_scope().unwrap();
+    let state_path = scope.dir.join("tsnet-state.json");
+    let cache_path = scope.dir.join("netmap-cache.json");
+    let before = PersistedState::load(&state_path).unwrap();
+    std::fs::write(&cache_path, b"stale cache must be cleared").unwrap();
+
+    let entered = Arc::new(tokio::sync::Barrier::new(2));
+    let release = Arc::new(tokio::sync::Barrier::new(2));
+    server.logout_test_hook = Some((Arc::clone(&entered), Arc::clone(&release)));
+    server.logout_state_save_failures = 1;
+    first_runtime.block_on(async {
+        let mut logout = Box::pin(server.logout());
+        tokio::select! {
+            result = &mut logout => panic!("logout finished before runtime destruction: {result:?}"),
+            _ = entered.wait() => {}
+        }
+    });
+    first_runtime.shutdown_background();
+
+    let retry_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    retry_runtime.block_on(async {
+        release.wait().await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while server.shutdown_supervisor.retained_logout_phase()
+                != Some(LogoutPhase::RotateIdentity)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("destroyed-runtime worker did not retain the exact logout phase");
+        server.logout().await.unwrap();
+    });
+
+    let after = PersistedState::load(&state_path).unwrap();
+    assert_ne!(after.node_key, before.node_key);
+    assert_ne!(after.machine_key, before.machine_key);
+    assert_ne!(after.disco_key, before.disco_key);
+    assert!(!cache_path.exists());
+    let prefs = rustscale_ipn::Prefs::load(temp.path()).unwrap();
+    assert!(prefs.LoggedOut);
+    assert!(!prefs.WantRunning);
+    assert!(extension_closed.load(Ordering::SeqCst));
+    assert!(router_closed.load(Ordering::SeqCst));
+
+    let _ = stop_tx.send(());
+    control_worker.join().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn logout_state_save_failure_retains_transaction_for_retry() {
+    let mut control = rustscale_testcontrol::Server::new();
+    control.start().await.unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let mut server = Server::builder()
+        .hostname("logout-save-retry")
+        .auth_key("tskey-test")
+        .control_url(control.base_url())
+        .state_dir(temp.path())
+        .disable_portmapping(true)
+        .build()
+        .unwrap();
+    Box::pin(server.up()).await.unwrap();
+
+    let state_path = server
+        .profile_state_scope()
+        .unwrap()
+        .dir
+        .join("tsnet-state.json");
+    let before = PersistedState::load(&state_path).unwrap();
+    server.logout_state_save_failures = 1;
+    assert!(matches!(server.logout().await, Err(TsnetError::State(_))));
+    assert!(server.shutdown_supervisor.has_retained_logout());
+    assert_eq!(PersistedState::load(&state_path).unwrap(), before);
+    assert!(matches!(
+        server.close().await,
+        Err(TsnetError::ShutdownIncomplete(_))
+    ));
+
+    server.logout().await.unwrap();
+    assert!(!server.shutdown_supervisor.has_retained_logout());
+    let after = PersistedState::load(&state_path).unwrap();
+    assert_ne!(after.node_key, before.node_key);
+    assert_ne!(after.machine_key, before.machine_key);
+    let prefs = rustscale_ipn::Prefs::load(temp.path()).unwrap();
+    assert!(prefs.LoggedOut);
+    assert!(!prefs.WantRunning);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn logout_joins_stale_map_writer_before_rotating_durable_identity() {
+    let mut control = rustscale_testcontrol::Server::new();
+    control.start().await.unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let mut server = Server::builder()
+        .hostname("logout-state-race")
+        .auth_key("tskey-test")
+        .control_url(control.base_url())
+        .state_dir(temp.path())
+        .disable_portmapping(true)
+        .build()
+        .unwrap();
+    Box::pin(server.up()).await.unwrap();
+
+    let scope = server.profile_state_scope().unwrap();
+    let state_path = scope.dir.join("tsnet-state.json");
+    let old = PersistedState::load(&state_path).unwrap();
+    let stale_response = rustscale_tailcfg::MapResponse {
+        Domain: old.tailnet_identity.clone(),
+        ..Default::default()
+    };
+    let cancel = Arc::clone(&server.inner.as_ref().unwrap().cancel);
+    let stale_path = state_path.clone();
+    let stale_scope = scope.clone();
+    let stale_state = old.clone();
+    let stale_written = Arc::new(AtomicBool::new(false));
+    let task_written = Arc::clone(&stale_written);
+    let stale_task = tokio::spawn(async move {
+        cancel.cancelled().await;
+        stale_state.save(&stale_path).unwrap();
+        NetMapCache::new_scoped(&stale_scope, &stale_state.tailnet_identity)
+            .save_if_changed(&stale_state.node_key.public(), &stale_response)
+            .unwrap();
+        task_written.store(true, Ordering::SeqCst);
+    });
+    server
+        .inner
+        .as_ref()
+        .unwrap()
+        .tasks
+        .lock()
+        .await
+        .push(stale_task);
+
+    server.logout().await.unwrap();
+    assert!(stale_written.load(Ordering::SeqCst));
+    let rotated = PersistedState::load(&state_path).unwrap();
+    assert_ne!(rotated.node_key, old.node_key);
+    assert_ne!(rotated.machine_key, old.machine_key);
+    assert_ne!(rotated.disco_key, old.disco_key);
+    assert_eq!(rotated.network_lock_key, old.network_lock_key);
+    assert_eq!(rotated.tailnet_identity, old.tailnet_identity);
+    assert!(
+        !scope.dir.join("netmap-cache.json").exists(),
+        "joined stale map writer recreated the cache after logout"
+    );
+    server.close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retained_in_memory_client_cannot_mutate_routes_after_close() {
+    let mut control = rustscale_testcontrol::Server::new();
+    control.start().await.unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let mut server = Server::builder()
+        .hostname("retained-local-client")
+        .auth_key("tskey-test")
+        .control_url(control.base_url())
+        .state_dir(temp.path())
+        .build()
+        .unwrap();
+    Box::pin(server.up()).await.unwrap();
+    let client = server.local_client().await.unwrap();
+    server.close().await.unwrap();
+
+    let update = rustscale_ipn::MaskedPrefs {
+        ExitNodeIPSet: true,
+        Prefs: rustscale_ipn::Prefs {
+            ExitNodeIP: "100.64.0.99".into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    assert!(
+        matches!(
+            client.edit_prefs(&update).await,
+            Err(InMemoryClientError::Connect(_))
+        ),
+        "retained in-memory client dispatched a route mutation after close"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropped_loopback_handle_is_joined_by_central_close() {
+    let mut control = rustscale_testcontrol::Server::new();
+    control.start().await.unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let mut server = Server::builder()
+        .hostname("dropped-loopback")
+        .auth_key("tskey-test")
+        .control_url(control.base_url())
+        .state_dir(temp.path())
+        .disable_portmapping(true)
+        .build()
+        .unwrap();
+    Box::pin(server.up()).await.unwrap();
+    let handle = server
+        .loopback("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let addr = handle.local_addr();
+    let idle = tokio::net::TcpStream::connect(addr).await.unwrap();
+    drop(handle);
+    server.close().await.unwrap();
+    drop(idle);
+    let retry = tokio::net::TcpListener::bind(addr)
+        .await
+        .expect("dropped loopback handle escaped central lifecycle drain");
+    drop(retry);
+}
+
+#[tokio::test]
+async fn needs_login_generation_restarts_on_same_socket_without_overlap() {
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("needs-login-retry.sock");
+    let mut server = Server::builder()
+        .state_dir(temp.path())
+        .localapi_path(&socket)
+        .build()
+        .unwrap();
+    let first = server.start_localapi_only().await.unwrap();
+    drop(first);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        server.start_localapi_only(),
+    )
+    .await
+    .expect("old needs-login Magicsock/LocalAPI generation was not joined")
+    .unwrap();
+    assert!(socket.exists());
+    server.close().await.unwrap();
+    assert!(!socket.exists());
+}
+
+#[tokio::test]
+async fn failed_extension_start_leaves_server_uncommitted_and_retry_is_clean() {
+    struct CountExtension(Arc<AtomicU64>);
+
+    #[async_trait]
+    impl Extension for CountExtension {
+        fn name(&self) -> &'static str {
+            "netstack-retry"
+        }
+
+        async fn init(&self, _: Host) -> ExtensionResult {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn shutdown(&self) -> ExtensionResult {
+            Ok(())
+        }
+    }
+
+    let initialized = Arc::new(AtomicU64::new(0));
+    let registry = Arc::new(ExtensionRegistry::new());
+    let factory_initialized = Arc::clone(&initialized);
+    registry
+        .register(Definition::new("netstack-retry", move |_| {
+            Ok(Arc::new(CountExtension(Arc::clone(&factory_initialized))))
+        }))
+        .unwrap();
+    let mut server = Server::builder()
+        .extension_registry(registry)
+        .build()
+        .unwrap();
+    server
+        .extension_host
+        .as_ref()
+        .unwrap()
+        .shutdown()
+        .await
+        .unwrap();
+
+    let backend = Arc::new(IpnBackend::new("test"));
+    let prefs = Arc::new(RwLock::new(rustscale_ipn::Prefs::default()));
+    assert!(server
+        .start_extensions_with(Arc::clone(&backend), Arc::clone(&prefs))
+        .await
+        .is_err());
+    assert!(!server.is_up());
+    assert_eq!(initialized.load(Ordering::SeqCst), 0);
+
+    server.ensure_extension_host().await.unwrap();
+    server.start_extensions_with(backend, prefs).await.unwrap();
+    assert!(
+        !server.is_up(),
+        "extensions alone must not commit RunningState"
+    );
+    assert_eq!(initialized.load(Ordering::SeqCst), 1);
+    server.close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn extension_subscription_delivers_atomic_snapshot_then_init_race_updates() {
+    #[derive(Default)]
+    struct DeliveryEvents {
+        profiles: Mutex<Vec<(String, bool)>>,
+        states: Mutex<Vec<rustscale_ipn::State>>,
+        init_profile: Mutex<Option<String>>,
+    }
+    struct SnapshotExtension {
+        entered: Arc<tokio::sync::Barrier>,
+        release: Arc<tokio::sync::Barrier>,
+        events: Arc<DeliveryEvents>,
+    }
+    #[async_trait]
+    impl Extension for SnapshotExtension {
+        fn name(&self) -> &'static str {
+            "snapshot-race"
+        }
+        async fn init(&self, host: Host) -> ExtensionResult {
+            let (_, prefs) = host.current_profile_state()?;
+            *self.events.init_profile.lock().unwrap() = Some(prefs.Hostname);
+            let profile_events = Arc::clone(&self.events);
+            host.hooks()?
+                .profile_state_change
+                .add(Arc::new(move |_, prefs, same_node| {
+                    profile_events
+                        .profiles
+                        .lock()
+                        .unwrap()
+                        .push((prefs.Hostname, same_node));
+                }));
+            let state_events = Arc::clone(&self.events);
+            host.hooks()?
+                .backend_state_change
+                .add(Arc::new(move |state| {
+                    state_events.states.lock().unwrap().push(state);
+                }));
+            self.entered.wait().await;
+            self.release.wait().await;
+            Ok(())
+        }
+        async fn shutdown(&self) -> ExtensionResult {
+            Ok(())
+        }
+    }
+
+    let entered = Arc::new(tokio::sync::Barrier::new(2));
+    let release = Arc::new(tokio::sync::Barrier::new(2));
+    let events = Arc::new(DeliveryEvents::default());
+    let registry = Arc::new(ExtensionRegistry::new());
+    let factory_entered = Arc::clone(&entered);
+    let factory_release = Arc::clone(&release);
+    let factory_events = Arc::clone(&events);
+    registry
+        .register(Definition::new("snapshot-race", move |_| {
+            Ok(Arc::new(SnapshotExtension {
+                entered: Arc::clone(&factory_entered),
+                release: Arc::clone(&factory_release),
+                events: Arc::clone(&factory_events),
+            }))
+        }))
+        .unwrap();
+    let mut server = Server::builder()
+        .extension_registry(registry)
+        .build()
+        .unwrap();
+    let backend = Arc::new(IpnBackend::new("test"));
+    backend.set_want_running();
+    backend.set_has_node_key(true);
+    backend.set_machine_authorized(true);
+    backend.set_netmap_present(true);
+    assert_eq!(backend.state(), rustscale_ipn::State::Starting);
+    let prefs = Arc::new(RwLock::new(rustscale_ipn::Prefs {
+        Hostname: "initial".into(),
+        ..Default::default()
+    }));
+    let task_backend = Arc::clone(&backend);
+    let task_prefs = Arc::clone(&prefs);
+    let startup = tokio::spawn(async move {
+        let subscription = server
+            .start_extensions_with(task_backend, task_prefs)
+            .await
+            .unwrap();
+        (server, subscription)
+    });
+    entered.wait().await;
+
+    backend.notify_profile_state(
+        rustscale_ipn::LoginProfile::default(),
+        rustscale_ipn::Prefs {
+            Hostname: "during-init".into(),
+            ..Default::default()
+        },
+        true,
+    );
+    backend.set_engine_status(1, 0);
+    let final_state = backend.state();
+    release.wait().await;
+    let (mut server, subscription) = startup.await.unwrap();
+
+    assert_eq!(*events.init_profile.lock().unwrap(), Some("initial".into()));
+    assert_eq!(
+        *events.profiles.lock().unwrap(),
+        [("initial".into(), false), ("during-init".into(), true)]
+    );
+    assert_eq!(
+        *events.states.lock().unwrap(),
+        [rustscale_ipn::State::Starting, final_state]
+    );
+    drop(subscription);
+    server.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn tun_router_failure_does_not_initialize_extensions_and_retry_is_clean() {
+    struct FailOnceRouter(bool);
+    impl Router for FailOnceRouter {
+        fn up(&mut self) -> Result<(), RouterError> {
+            Ok(())
+        }
+        fn set(&mut self, _: &RouterConfig) -> Result<(), RouterError> {
+            if self.0 {
+                self.0 = false;
+                Err(RouterError::Unsupported)
+            } else {
+                Ok(())
+            }
+        }
+        fn close(&mut self) -> Result<(), RouterError> {
+            Ok(())
+        }
+    }
+
+    struct CountExtension(Arc<AtomicU64>);
+    #[async_trait]
+    impl Extension for CountExtension {
+        fn name(&self) -> &'static str {
+            "tun-retry"
+        }
+        async fn init(&self, _: Host) -> ExtensionResult {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn shutdown(&self) -> ExtensionResult {
+            Ok(())
+        }
+    }
+
+    let initialized = Arc::new(AtomicU64::new(0));
+    let registry = Arc::new(ExtensionRegistry::new());
+    let factory_initialized = Arc::clone(&initialized);
+    registry
+        .register(Definition::new("tun-retry", move |_| {
+            Ok(Arc::new(CountExtension(Arc::clone(&factory_initialized))))
+        }))
+        .unwrap();
+    let mut server = Server::builder()
+        .extension_registry(registry)
+        .build()
+        .unwrap();
+    let router = shared_test_router(Box::new(FailOnceRouter(true)));
+    let config = RouterConfig::default();
+    let backend = Arc::new(IpnBackend::new("test"));
+    let prefs = Arc::new(RwLock::new(rustscale_ipn::Prefs::default()));
+
+    assert!(router.lock().unwrap().router.set(&config).is_err());
+    assert!(!server.is_up());
+    assert_eq!(initialized.load(Ordering::SeqCst), 0);
+
+    router.lock().unwrap().router.set(&config).unwrap();
+    server.finish_tun_startup(backend, prefs).await.unwrap();
+    assert_eq!(initialized.load(Ordering::SeqCst), 1);
+    server.close().await.unwrap();
+}
 
 #[test]
 fn builder_rejects_empty_hostname() {
@@ -63,208 +1251,6 @@ fn builder_sets_ephemeral_flag() {
         .build()
         .unwrap();
     assert!(server.config.ephemeral);
-}
-
-async fn wait_for_map_polls(control: &TestControlServer, expected: i32) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while control.in_serve_map() != expected {
-        assert!(
-            Instant::now() < deadline,
-            "map poll count did not reach {expected}; current={}",
-            control.in_serve_map()
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-}
-
-async fn cancel_logout_at(
-    server: &mut Server,
-    hook: &Arc<LogoutTestHook>,
-    point: LogoutAwaitPoint,
-) {
-    hook.pause_at(point);
-    let mut logout = Box::pin(server.logout());
-    tokio::time::timeout(Duration::from_secs(10), async {
-        tokio::select! {
-            result = &mut logout => panic!("logout completed before {point:?}: {result:?}"),
-            () = hook.wait_reached() => {}
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("logout did not reach {point:?}"));
-    drop(logout);
-    hook.clear();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn logout_cancellation_retains_every_await_owner_and_allows_clean_rebind() {
-    let mut control = TestControlServer::new();
-    control.start().await.unwrap();
-    let state = tempfile::tempdir().unwrap();
-    let sockets = tempfile::tempdir().unwrap();
-    let socket = sockets.path().join("logout-cancel.sock");
-    let mut server = Server::builder()
-        .hostname("logout-cancel")
-        .control_url(control.base_url())
-        .state_dir(state.path())
-        .localapi_path(&socket)
-        .disable_direct_paths(true)
-        .disable_portmapping(true)
-        .build()
-        .unwrap();
-
-    let commands = server.start_localapi_only().await.unwrap();
-    drop(commands);
-    server.set_auth_key("tskey-test");
-    Box::pin(tokio::time::timeout(Duration::from_secs(60), server.up()))
-        .await
-        .unwrap()
-        .unwrap();
-    wait_for_map_polls(&control, 1).await;
-    let persisted_node = server.load_or_create_state().unwrap().node_key.public();
-
-    let hook = LogoutTestHook::new();
-    server.logout_test_hook = Some(hook.clone());
-    let points = [
-        LogoutAwaitPoint::DriveDisable,
-        LogoutAwaitPoint::PreLocalApi,
-        LogoutAwaitPoint::RunningLocalApi,
-        LogoutAwaitPoint::Serve,
-        LogoutAwaitPoint::Monitor,
-        LogoutAwaitPoint::Tasks,
-        LogoutAwaitPoint::Netlog,
-        LogoutAwaitPoint::Audit,
-        LogoutAwaitPoint::ControlLogout,
-        LogoutAwaitPoint::PrePortmapper,
-        LogoutAwaitPoint::PreMagicsock,
-        LogoutAwaitPoint::RunningPortmapper,
-        LogoutAwaitPoint::RunningMagicsock,
-    ];
-
-    for point in points {
-        cancel_logout_at(&mut server, &hook, point).await;
-        assert!(server.inner.is_some(), "{point:?} removed RunningState");
-        assert!(
-            server.pre_started.is_some(),
-            "{point:?} removed pre-login cleanup ownership"
-        );
-        assert!(matches!(
-            server.start_localapi_only().await,
-            Err(TsnetError::AlreadyUp)
-        ));
-        assert_eq!(
-            server.load_or_create_state().unwrap().node_key.public(),
-            persisted_node,
-            "{point:?} crossed the durable logout commit point"
-        );
-        assert!(!server.load_prefs().unwrap().LoggedOut);
-
-        let noise_connections = control.noise_connection_count();
-        assert!(matches!(
-            Box::pin(server.up()).await,
-            Err(TsnetError::AlreadyUp)
-        ));
-        assert_eq!(
-            control.noise_connection_count(),
-            noise_connections,
-            "{point:?} started a replacement control/map consumer"
-        );
-
-        if point as u8 > LogoutAwaitPoint::Tasks as u8 {
-            let inner = server.inner.as_ref().unwrap();
-            assert!(
-                inner.tasks.lock().await.is_empty(),
-                "{point:?} retained an unjoined TKA/outer task"
-            );
-            assert!(
-                inner.map_tasks.is_empty().await,
-                "{point:?} retained an unjoined map session"
-            );
-            assert!(
-                inner
-                    .localapi_handle
-                    .as_ref()
-                    .and_then(|handle| handle.task.as_ref())
-                    .is_none(),
-                "{point:?} retained an unjoined LocalAPI task"
-            );
-        }
-    }
-
-    server.logout().await.unwrap();
-    assert!(server.inner.is_none());
-    assert!(server.pre_started.is_none());
-    assert_ne!(
-        server.load_or_create_state().unwrap().node_key.public(),
-        persisted_node
-    );
-    assert!(server.load_prefs().unwrap().LoggedOut);
-    wait_for_map_polls(&control, 0).await;
-
-    let commands = server.start_localapi_only().await.unwrap();
-    assert!(
-        rustscale_safesocket::connect(&socket).is_ok(),
-        "NeedsLogin LocalAPI did not immediately rebind"
-    );
-    drop(commands);
-    server.close().await.into_result().unwrap();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn profile_switch_retries_cancelled_logout_before_immediate_rebind() {
-    let mut control = TestControlServer::new();
-    control.start().await.unwrap();
-    let state = tempfile::tempdir().unwrap();
-    let sockets = tempfile::tempdir().unwrap();
-    let socket = sockets.path().join("profile-cancel.sock");
-
-    let mut profiles = rustscale_ipn::ProfileManager::new(state.path()).unwrap();
-    let profile_a = profiles.new_profile("profile-a").unwrap().profile;
-    let profile_b = profiles.new_profile("profile-b").unwrap().profile;
-    profiles.switch_profile(&profile_a.ID).unwrap();
-
-    let mut server = Server::builder()
-        .hostname("profile-cancel")
-        .auth_key("tskey-test")
-        .control_url(control.base_url())
-        .ephemeral(true)
-        .state_dir(state.path())
-        .localapi_path(&socket)
-        .disable_direct_paths(true)
-        .disable_portmapping(true)
-        .build()
-        .unwrap();
-    Box::pin(tokio::time::timeout(Duration::from_secs(60), server.up()))
-        .await
-        .unwrap()
-        .unwrap();
-    wait_for_map_polls(&control, 1).await;
-    let old_node = server.node_key().unwrap();
-
-    let hook = LogoutTestHook::new();
-    server.logout_test_hook = Some(hook.clone());
-    cancel_logout_at(&mut server, &hook, LogoutAwaitPoint::Tasks).await;
-
-    Box::pin(tokio::time::timeout(
-        Duration::from_secs(60),
-        server.switch_profile(&profile_b.ID),
-    ))
-    .await
-    .expect("profile switch timed out")
-    .expect("profile switch failed");
-    wait_for_map_polls(&control, 1).await;
-    assert_ne!(server.node_key().unwrap(), old_node);
-    assert!(rustscale_safesocket::connect(&socket).is_ok());
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while control.active_noise_connection_count() != 1 {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("old map/TKA control session survived profile rebind");
-
-    server.close().await.into_result().unwrap();
-    wait_for_map_polls(&control, 0).await;
 }
 
 #[cfg(feature = "identity-federation")]
@@ -1656,7 +2642,7 @@ async fn e2e_register_only() {
     );
 
     // Clean up.
-    server.close().await;
+    server.close().await.unwrap();
 }
 
 /// Helper: wait for a specific peer IP to appear in a server's netmap.
@@ -1836,8 +2822,8 @@ async fn e2e_two_nodes() {
 
     // Clean up.
     tokio::io::AsyncWriteExt::shutdown(&mut stream_a).await.ok();
-    server_a.close().await;
-    server_b.close().await;
+    server_a.close().await.unwrap();
+    server_b.close().await.unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -2012,8 +2998,8 @@ async fn e2e_subnet_routes() {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 
-    server_a.close().await;
-    server_b.close().await;
+    server_a.close().await.unwrap();
+    server_b.close().await.unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -2165,8 +3151,8 @@ async fn e2e_whois_and_magicdns_dial() {
     assert_eq!(&buf[..n], b"magicdns-ok");
 
     tokio::io::AsyncWriteExt::shutdown(&mut stream_a).await.ok();
-    server_a.close().await;
-    server_b.close().await;
+    server_a.close().await.unwrap();
+    server_b.close().await.unwrap();
 }
 
 /// E2E: control cert provider on an ephemeral API-only tailnet. These
@@ -2223,7 +3209,7 @@ async fn e2e_control_cert_not_enabled() {
         .expect("listen_tls should fall back");
     log::debug!("listen_tls fell back to self-signed OK");
     drop(tls_listener);
-    server.close().await;
+    server.close().await.unwrap();
     std::fs::remove_dir_all(&state_dir).ok();
 }
 
@@ -2279,7 +3265,7 @@ async fn e2e_acme_cert_issuance() {
         log::debug!(
             "e2e_acme_cert_issuance: CertDomains empty (HTTPS not enabled on tailnet); skipping"
         );
-        server.close().await;
+        server.close().await.unwrap();
         return;
     }
     log::debug!("e2e_acme_cert_issuance: CertDomains = {cert_domains:?}");
@@ -2291,7 +3277,7 @@ async fn e2e_acme_cert_issuance() {
     )
     .await;
 
-    server.close().await;
+    server.close().await.unwrap();
 
     let provider = match result {
         Ok(Ok(p)) => p,
@@ -2460,8 +3446,8 @@ async fn e2e_exit_node() {
         "exit_node should be None after clear"
     );
 
-    server_a.close().await;
-    server_b.close().await;
+    server_a.close().await.unwrap();
+    server_b.close().await.unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -2583,8 +3569,8 @@ async fn e2e_serve_tcp_forward() {
     assert_eq!(&buf[..n], b"serve-echo-test");
     log::debug!("e2e_serve: echo verified through serve TCP forward");
 
-    server_a.close().await;
-    server_b.close().await;
+    server_a.close().await.unwrap();
+    server_b.close().await.unwrap();
 }
 
 /// E2e: funnel listen_funnel returns a typed FunnelError::NotEnabled on
@@ -2630,7 +3616,7 @@ async fn e2e_funnel_not_enabled() {
         }
     }
 
-    server.close().await;
+    server.close().await.unwrap();
 }
 
 /// E2e: SOCKS5 proxy. Node B runs an echo listener on its tailnet IP; node A
@@ -2787,8 +3773,8 @@ async fn e2e_socks5_proxy() {
     let _ = tokio::time::timeout(std::time::Duration::from_secs(15), echo_task)
         .await
         .expect("echo task did not exit in 15s");
-    server_a.close().await;
-    server_b.close().await;
+    server_a.close().await.unwrap();
+    server_b.close().await.unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -2962,7 +3948,7 @@ async fn interop_rust_dials_go() {
     log_go_path(&server, go_ip, "rust_dials_go");
 
     tokio::io::AsyncWriteExt::shutdown(&mut stream).await.ok();
-    server.close().await;
+    server.close().await.unwrap();
 }
 
 /// Interop: the Go node dials the rustscale node through its SOCKS5 proxy.
@@ -3101,7 +4087,7 @@ async fn interop_go_dials_rust() {
     let _ = tokio::time::timeout(std::time::Duration::from_secs(15), echo_task)
         .await
         .expect("echo task did not exit");
-    server.close().await;
+    server.close().await.unwrap();
 }
 
 /// Interop: rustscale dials the Go node by its MagicDNS FQDN. Proves the
@@ -3144,7 +4130,7 @@ async fn interop_magicdns_name() {
     log_go_path(&server, ienv.go_ip, "magicdns_name");
 
     tokio::io::AsyncWriteExt::shutdown(&mut stream).await.ok();
-    server.close().await;
+    server.close().await.unwrap();
 }
 
 /// Interop: rustscale whois(go_ip) returns the Go node's FQDN.
@@ -3193,7 +4179,7 @@ async fn interop_whois_go_peer() {
         info.display_name
     );
 
-    server.close().await;
+    server.close().await.unwrap();
 }
 
 /// Interop: assert the path to the Go peer settles to Direct after echo
@@ -3266,7 +4252,7 @@ async fn interop_direct_path() {
     }
 
     log::debug!("interop_direct_path: SUCCESS — path settled to Direct");
-    server.close().await;
+    server.close().await.unwrap();
 }
 
 /// Interop: assert relayed (DERP) connectivity works with Go by pinning
@@ -3310,7 +4296,7 @@ async fn interop_derp_path() {
     );
 
     tokio::io::AsyncWriteExt::shutdown(&mut stream).await.ok();
-    server.close().await;
+    server.close().await.unwrap();
 }
 
 /// Interop: start on DERP, assert upgrade to Direct without connection
@@ -3429,7 +4415,7 @@ async fn interop_direct_after_derp() {
         "no echo roundtrips succeeded — connection was interrupted during path upgrade"
     );
 
-    server.close().await;
+    server.close().await.unwrap();
 }
 
 /// Interop: Go node advertises a subnet route; rustscale with accept_routes
@@ -3511,7 +4497,7 @@ async fn interop_subnet_routes() {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 
-    server.close().await;
+    server.close().await.unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -4236,7 +5222,7 @@ async fn interop_tun_rust_dials_go() {
     assert_eq!(&got, payload, "echo mismatch through TUN");
 
     log_go_path(&server, ienv.go_ip, "tun_rust_dials_go");
-    server.close().await;
+    server.close().await.unwrap();
 }
 
 /// Interop TUN: Go dials the rustscale node through its SOCKS5 proxy.
@@ -4351,7 +5337,7 @@ async fn interop_tun_go_dials_rust() {
     let _ = tokio::time::timeout(std::time::Duration::from_secs(15), echo_task)
         .await
         .expect("echo task did not exit");
-    server.close().await;
+    server.close().await.unwrap();
 }
 
 /// Interop TUN: verify OS routes were installed — `100.64.0.0/10` should
@@ -4406,7 +5392,7 @@ async fn interop_tun_os_routes() {
     }
 
     log_go_path(&server, ienv.go_ip, "tun_os_routes");
-    server.close().await;
+    server.close().await.unwrap();
 }
 
 /// Interop TUN: Go advertises a subnet route, rustscale in TUN mode with
@@ -4500,7 +5486,7 @@ async fn interop_tun_subnet_forward() {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 
-    server.close().await;
+    server.close().await.unwrap();
 }
 
 // ---------------------------------------------------------------------------

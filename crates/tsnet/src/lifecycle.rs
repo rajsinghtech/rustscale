@@ -1,3 +1,6 @@
+#[cfg(test)]
+mod startup_rollback_tests;
+
 #[allow(clippy::wildcard_imports)]
 use super::*;
 use zeroize::{Zeroize, Zeroizing};
@@ -44,6 +47,965 @@ pub(crate) fn clear_register_auth(request: &mut RegisterRequest) {
         auth.AuthKey.zeroize();
     }
     request.Auth = None;
+}
+
+#[derive(Clone)]
+enum StartupDeliveryEvent {
+    Backend(rustscale_ipn::State),
+    Profile(Box<(rustscale_ipn::LoginProfile, rustscale_ipn::Prefs, bool)>),
+}
+
+struct StartupDeliveryState {
+    active: bool,
+    draining: bool,
+    queue: std::collections::VecDeque<StartupDeliveryEvent>,
+}
+
+struct StartupDelivery {
+    host: rustscale_ipnext::Host,
+    state: std::sync::Mutex<StartupDeliveryState>,
+}
+
+impl StartupDelivery {
+    fn new(host: rustscale_ipnext::Host) -> Self {
+        Self {
+            host,
+            state: std::sync::Mutex::new(StartupDeliveryState {
+                active: false,
+                draining: false,
+                queue: std::collections::VecDeque::new(),
+            }),
+        }
+    }
+
+    fn enqueue(&self, event: StartupDeliveryEvent) {
+        let should_drain = {
+            let mut state = self.state.lock().unwrap();
+            state.queue.push_back(event);
+            if !state.active || state.draining {
+                false
+            } else {
+                state.draining = true;
+                true
+            }
+        };
+        if should_drain {
+            self.drain();
+        }
+    }
+
+    fn activate(&self, initial: Vec<StartupDeliveryEvent>) {
+        let should_drain = {
+            let mut state = self.state.lock().unwrap();
+            for event in initial.into_iter().rev() {
+                state.queue.push_front(event);
+            }
+            state.active = true;
+            if state.draining {
+                false
+            } else {
+                state.draining = true;
+                true
+            }
+        };
+        if should_drain {
+            self.drain();
+        }
+    }
+
+    fn drain(&self) {
+        loop {
+            let event = {
+                let mut state = self.state.lock().unwrap();
+                if let Some(event) = state.queue.pop_front() {
+                    event
+                } else {
+                    state.draining = false;
+                    return;
+                }
+            };
+            match event {
+                StartupDeliveryEvent::Backend(state) => {
+                    let _ = self.host.publish_backend_state(state);
+                }
+                StartupDeliveryEvent::Profile(snapshot) => {
+                    let (profile, prefs, same_node) = *snapshot;
+                    let _ = self.host.publish_profile_state(profile, prefs, same_node);
+                }
+            }
+        }
+    }
+}
+
+const ROLLBACK_CLEANUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Transfer rollback ownership off the ambient Tokio runtime. Futures can be
+/// dropped while a runtime is being destroyed (or with no runtime entered at
+/// all); a dedicated owner must still join tasks and remove OS state.
+fn spawn_rollback_cleanup<F>(name: &'static str, cleanup: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    if let Err(error) = std::thread::Builder::new()
+        .name(name.into())
+        .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    log::error!("tsnet: failed to build {name} runtime: {error}");
+                    return;
+                }
+            };
+            if runtime
+                .block_on(
+                    async move { tokio::time::timeout(ROLLBACK_CLEANUP_DEADLINE, cleanup).await },
+                )
+                .is_err()
+            {
+                log::error!(
+                    "tsnet: {name} exceeded its bounded cleanup deadline; revoked resources leaked"
+                );
+            }
+        })
+    {
+        log::error!("tsnet: failed to spawn {name}: {error}");
+    }
+}
+
+struct BootstrapRollback {
+    supervisor: Arc<BootstrapSupervisor>,
+    watchdog: Watchdog,
+    map_tasks: Option<Arc<MapSessionTasks>>,
+    netlog: Option<Arc<rustscale_netlog::Logger>>,
+    magicsock: Option<Arc<Magicsock>>,
+    armed: bool,
+}
+
+impl BootstrapRollback {
+    fn new(supervisor: Arc<BootstrapSupervisor>, watchdog: Watchdog) -> Self {
+        Self {
+            supervisor,
+            watchdog,
+            map_tasks: None,
+            netlog: None,
+            magicsock: None,
+            armed: true,
+        }
+    }
+
+    fn set_map_task(&mut self, map_task: JoinHandle<()>) {
+        self.map_tasks = Some(MapSessionTasks::new(map_task));
+    }
+
+    fn commit(mut self) -> (Arc<MapSessionTasks>, Option<Arc<rustscale_netlog::Logger>>) {
+        self.armed = false;
+        let map_tasks = self
+            .map_tasks
+            .take()
+            .expect("bootstrap map task ownership missing");
+        (map_tasks, self.netlog.take())
+    }
+}
+
+impl Drop for BootstrapRollback {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let map_tasks = self.map_tasks.take();
+        if let Some(tasks) = map_tasks.as_ref() {
+            tasks.begin_shutdown();
+        }
+        let netlog = self.netlog.take();
+        let magicsock = self.magicsock.take();
+        if let Some(logger) = netlog.as_ref() {
+            logger.request_stop();
+        }
+        let watchdog = self.watchdog.clone();
+        watchdog.stop();
+        let completion = self.supervisor.begin_cleanup();
+        spawn_rollback_cleanup("rustscale-bootstrap-rollback", async move {
+            let _completion = completion;
+            watchdog.stop_and_wait().await;
+            if let Some(tasks) = map_tasks {
+                tasks.join().await;
+            }
+            if let Some(logger) = netlog {
+                let _ = logger.stop().await;
+            }
+            if let Some(magicsock) = magicsock {
+                let _ = shutdown_magicsock(&magicsock).await;
+            }
+        });
+    }
+}
+
+const COMPONENT_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+#[cfg(test)]
+const ROUTER_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
+#[cfg(not(test))]
+const ROUTER_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const ROUTER_CLEANUP_WORKERS: usize = 2;
+const ROUTER_CLEANUP_QUEUE_CAPACITY: usize = 16;
+
+struct RouterCleanupAttempt {
+    result: std::sync::Mutex<Option<Result<(), String>>>,
+    changed: tokio::sync::Notify,
+}
+
+struct RouterCleanupJob {
+    router: SharedRouter,
+    attempt: Arc<RouterCleanupAttempt>,
+}
+
+struct RouterCleanupScheduler {
+    sender: std::sync::mpsc::SyncSender<RouterCleanupJob>,
+    attempts: std::sync::Mutex<std::collections::HashMap<usize, Arc<RouterCleanupAttempt>>>,
+}
+
+impl RouterCleanupScheduler {
+    fn global() -> &'static Self {
+        static SCHEDULER: std::sync::OnceLock<RouterCleanupScheduler> = std::sync::OnceLock::new();
+        SCHEDULER.get_or_init(|| {
+            let (sender, receiver) =
+                std::sync::mpsc::sync_channel::<RouterCleanupJob>(ROUTER_CLEANUP_QUEUE_CAPACITY);
+            let receiver = Arc::new(std::sync::Mutex::new(receiver));
+            for worker in 0..ROUTER_CLEANUP_WORKERS {
+                let receiver = Arc::clone(&receiver);
+                std::thread::Builder::new()
+                    .name(format!("rustscale-router-close-{worker}"))
+                    .spawn(move || loop {
+                        let job = match receiver
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .recv()
+                        {
+                            Ok(job) => job,
+                            Err(_) => return,
+                        };
+                        let result = cleanup_router_owner_blocking(&job.router)
+                            .map_err(|error| error.to_string());
+                        *job.attempt
+                            .result
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(result);
+                        job.attempt.changed.notify_waiters();
+                    })
+                    .expect("spawn bounded router cleanup worker");
+            }
+            Self {
+                sender,
+                attempts: std::sync::Mutex::new(std::collections::HashMap::new()),
+            }
+        })
+    }
+
+    fn attempt(&self, router: &SharedRouter) -> Result<Arc<RouterCleanupAttempt>, TsnetError> {
+        let key = Arc::as_ptr(router) as usize;
+        let mut attempts = self
+            .attempts
+            .lock()
+            .map_err(|_| TsnetError::Builder("router cleanup attempt lock poisoned".into()))?;
+        if let Some(attempt) = attempts.get(&key) {
+            return Ok(Arc::clone(attempt));
+        }
+        let attempt = Arc::new(RouterCleanupAttempt {
+            result: std::sync::Mutex::new(None),
+            changed: tokio::sync::Notify::new(),
+        });
+        attempts.insert(key, Arc::clone(&attempt));
+        if let Err(error) = self.sender.try_send(RouterCleanupJob {
+            router: Arc::clone(router),
+            attempt: Arc::clone(&attempt),
+        }) {
+            attempts.remove(&key);
+            return Err(TsnetError::ShutdownIncomplete(format!(
+                "router cleanup worker queue unavailable: {error}"
+            )));
+        }
+        Ok(attempt)
+    }
+
+    fn forget(&self, key: usize, attempt: &Arc<RouterCleanupAttempt>) {
+        let mut attempts = self
+            .attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if attempts
+            .get(&key)
+            .is_some_and(|current| Arc::ptr_eq(current, attempt))
+        {
+            attempts.remove(&key);
+        }
+    }
+}
+
+async fn wait_router_cleanup(router: &SharedRouter) -> Result<(), TsnetError> {
+    let scheduler = RouterCleanupScheduler::global();
+    let key = Arc::as_ptr(router) as usize;
+    let attempt = scheduler.attempt(router)?;
+    let wait = async {
+        loop {
+            let changed = attempt.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if let Some(result) = attempt
+                .result
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            {
+                return result;
+            }
+            changed.await;
+        }
+    };
+    match tokio::time::timeout(ROUTER_CLEANUP_TIMEOUT, wait).await {
+        Ok(result) => {
+            scheduler.forget(key, &attempt);
+            result.map_err(|error| TsnetError::Builder(format!("route cleanup failed: {error}")))
+        }
+        Err(_) => Err(TsnetError::ShutdownIncomplete(
+            "route cleanup exceeded its bounded worker deadline".into(),
+        )),
+    }
+}
+
+async fn shutdown_magicsock(magicsock: &Magicsock) -> Result<(), String> {
+    let portmapper = magicsock
+        .shutdown_portmapper(COMPONENT_SHUTDOWN_TIMEOUT)
+        .await
+        .map_err(|error| format!("portmapper cleanup incomplete: {error}"));
+    let runtime = magicsock
+        .shutdown(COMPONENT_SHUTDOWN_TIMEOUT)
+        .await
+        .map_err(|error| format!("magicsock cleanup incomplete: {error}"));
+    portmapper.and(runtime)
+}
+
+struct PrestartedMagicsockRollback {
+    supervisor: Arc<BootstrapSupervisor>,
+    magicsock: Option<Arc<Magicsock>>,
+}
+
+impl PrestartedMagicsockRollback {
+    fn new(supervisor: Arc<BootstrapSupervisor>, magicsock: Arc<Magicsock>) -> Self {
+        Self {
+            supervisor,
+            magicsock: Some(magicsock),
+        }
+    }
+
+    fn commit(&mut self) -> Arc<Magicsock> {
+        self.magicsock
+            .take()
+            .expect("pre-started Magicsock missing")
+    }
+}
+
+impl Drop for PrestartedMagicsockRollback {
+    fn drop(&mut self) {
+        let Some(magicsock) = self.magicsock.take() else {
+            return;
+        };
+        let completion = self.supervisor.begin_cleanup();
+        spawn_rollback_cleanup("rustscale-prestarted-rollback", async move {
+            let _completion = completion;
+            if let Err(error) = shutdown_magicsock(&magicsock).await {
+                log::warn!("tsnet: pre-started magicsock rollback: {error}");
+            }
+        });
+    }
+}
+
+struct StartupRollback {
+    armed: bool,
+    supervisor: Arc<BootstrapSupervisor>,
+    cancel: Arc<CancelToken>,
+    watchdog: Watchdog,
+    tasks: Vec<JoinHandle<()>>,
+    map_tasks: Arc<MapSessionTasks>,
+    audit_logger: Option<Arc<rustscale_auditlog::Logger>>,
+    netlog: Option<Arc<rustscale_netlog::Logger>>,
+    monitor: Option<rustscale_netmon::MonitorHandle>,
+    magicsock: Option<Arc<Magicsock>>,
+    router: Option<SharedRouter>,
+    localapi: Option<localapi::LocalApiHandle>,
+    localapi_start: Option<tokio::sync::oneshot::Sender<()>>,
+    localapi_handoff: Option<localapi::LocalApiPathHandoff>,
+    localapi_generation_handoff: Option<localapi::LocalApiGenerationHandoff>,
+    serve: Option<Arc<serve::ServeRunner>>,
+    localapi_socket: Option<PathBuf>,
+    os_dns_configurator: Option<Box<dyn OsConfigurator + Send>>,
+    hostinfo_hooks: Vec<hostinfo::HostinfoHookHandle>,
+}
+
+impl StartupRollback {
+    fn new(
+        supervisor: Arc<BootstrapSupervisor>,
+        cancel: Arc<CancelToken>,
+        watchdog: Watchdog,
+        map_tasks: Arc<MapSessionTasks>,
+        netlog: Option<Arc<rustscale_netlog::Logger>>,
+    ) -> Self {
+        Self {
+            armed: true,
+            supervisor,
+            cancel,
+            watchdog,
+            tasks: Vec::new(),
+            map_tasks,
+            audit_logger: None,
+            netlog,
+            monitor: None,
+            magicsock: None,
+            router: None,
+            localapi: None,
+            localapi_start: None,
+            localapi_handoff: None,
+            localapi_generation_handoff: None,
+            serve: None,
+            localapi_socket: None,
+            os_dns_configurator: None,
+            hostinfo_hooks: Vec::new(),
+        }
+    }
+
+    fn track(&mut self, task: JoinHandle<()>) {
+        self.tasks.push(task);
+    }
+
+    fn take_monitor(&mut self) -> Option<rustscale_netmon::MonitorHandle> {
+        self.monitor.take()
+    }
+
+    fn take_localapi(&mut self) -> Option<localapi::LocalApiHandle> {
+        self.localapi.take()
+    }
+
+    /// Activate and commit a prepared LocalAPI path transaction. This method
+    /// contains no await point: once the old path becomes irreversible, the
+    /// replacement and all startup resources transfer to RunningState in the
+    /// same poll.
+    fn commit_localapi_handoff(&mut self) -> Result<(), TsnetError> {
+        let Some(start) = self.localapi_start.take() else {
+            if let Some(handoff) = self.localapi_generation_handoff.take() {
+                handoff.commit();
+            }
+            return Ok(());
+        };
+        // This is the final synchronous commit section. Acceptance may begin
+        // on the private pathname, then one rename publishes the replacement;
+        // no advertised-path operation occurs during preparation.
+        start.send(()).map_err(|()| {
+            TsnetError::Builder("LocalAPI replacement stopped before activation".into())
+        })?;
+        let handoff = self
+            .localapi_handoff
+            .as_mut()
+            .expect("LocalAPI activation missing path handoff");
+        let handle = self
+            .localapi
+            .as_mut()
+            .expect("LocalAPI activation missing listener handle");
+        handoff
+            .commit(handle)
+            .map_err(|error| TsnetError::Builder(format!("publishing LocalAPI: {error}")))?;
+        self.localapi_handoff.take();
+        self.localapi_generation_handoff
+            .take()
+            .expect("LocalAPI activation missing mutation handoff")
+            .commit();
+        Ok(())
+    }
+
+    fn take_serve(&mut self) -> Option<Arc<serve::ServeRunner>> {
+        self.serve.take()
+    }
+
+    fn take_os_dns_configurator(&mut self) -> Option<Box<dyn OsConfigurator + Send>> {
+        self.os_dns_configurator.take()
+    }
+
+    fn take_hostinfo_hooks(&mut self) -> Vec<hostinfo::HostinfoHookHandle> {
+        std::mem::take(&mut self.hostinfo_hooks)
+    }
+
+    fn commit_tasks(&mut self) -> Vec<JoinHandle<()>> {
+        self.armed = false;
+        std::mem::take(&mut self.tasks)
+    }
+}
+
+impl Drop for StartupRollback {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.cancel.cancel();
+        self.watchdog.stop();
+        self.map_tasks.begin_shutdown();
+        let map_tasks = Arc::clone(&self.map_tasks);
+        let tasks = std::mem::take(&mut self.tasks);
+        let router = self.router.take();
+        // Neither prepared transaction has touched the advertised pathname.
+        // Dropping the generation handoff re-admits the old listener before
+        // the private replacement is stopped asynchronously.
+        let had_localapi_handoff = self.localapi_handoff.is_some();
+        drop(self.localapi_generation_handoff.take());
+        drop(self.localapi_handoff.take());
+        self.localapi_start.take();
+        let localapi_socket = self.localapi_socket.take();
+        if !had_localapi_handoff {
+            if let Some(path) = localapi_socket.as_ref() {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+        let mut configurator = self.os_dns_configurator.take();
+        let audit_logger = self.audit_logger.take();
+        let netlog = self.netlog.take();
+        let monitor = self.monitor.take();
+        let magicsock = self.magicsock.take();
+        let localapi = self.localapi.take();
+        let serve = self.serve.take();
+        if let Some(logger) = audit_logger.as_ref() {
+            logger.request_stop();
+        }
+        if let Some(logger) = netlog.as_ref() {
+            logger.request_stop();
+        }
+        let watchdog = self.watchdog.clone();
+        let completion = self.supervisor.begin_cleanup();
+        spawn_rollback_cleanup("rustscale-startup-rollback", async move {
+            let _completion = completion;
+            if let Some(localapi) = localapi {
+                // A prepared handoff still owns only its private staging
+                // pathname, so ordinary shutdown removes exactly that.
+                localapi.shutdown().await;
+            }
+            // A rolled-back handoff never changed the old advertised
+            // generation, while a non-handoff path was removed above.
+            drop(localapi_socket);
+            if let Some(serve) = serve {
+                serve.stop().await;
+            }
+            drain_generation_tasks(tasks).await;
+            map_tasks.join().await;
+            if let Some(mut monitor) = monitor {
+                monitor.shutdown_and_wait().await;
+            }
+            // Every route-mutating owner is now joined. Router teardown is
+            // deliberately last so no map/local/link callback can reinstall.
+            if let Some(router) = router {
+                let _ = Server::cleanup_or_supervise(router).await;
+            }
+            if let Some(configurator) = configurator.as_mut() {
+                let _ = configurator.close();
+            }
+            if let Some(magicsock) = magicsock {
+                if let Err(error) = shutdown_magicsock(&magicsock).await {
+                    log::warn!("tsnet: startup rollback magicsock shutdown: {error}");
+                }
+            }
+            watchdog.stop_and_wait().await;
+            if let Some(logger) = netlog {
+                if let Err(error) = logger.stop().await {
+                    log::warn!("tsnet: startup rollback netlog shutdown: {error}");
+                }
+            }
+            if let Some(logger) = audit_logger {
+                logger
+                    .flush_and_stop(std::time::Duration::from_secs(5))
+                    .await;
+            }
+        });
+    }
+}
+
+async fn drain_generation_tasks(tasks: Vec<JoinHandle<()>>) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+    while tasks.iter().any(|task| !task.is_finished()) && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    for task in &tasks {
+        if !task.is_finished() {
+            task.abort();
+        }
+    }
+    for task in tasks {
+        let _ = task.await;
+    }
+}
+
+async fn quiesce_pre_started(pre_started: &mut PreStartedLocalApi) {
+    if let Some(handle) = pre_started.handle.take() {
+        let path = handle.socket_path.clone();
+        handle.shutdown().await;
+        let _ = std::fs::remove_file(path);
+    }
+    let _ = std::fs::remove_file(&pre_started.socket_path);
+}
+
+async fn cleanup_pre_started(mut pre_started: PreStartedLocalApi, remove_advertised_path: bool) {
+    if remove_advertised_path {
+        quiesce_pre_started(&mut pre_started).await;
+    } else if let Some(handle) = pre_started.handle.take() {
+        // A committed handoff has moved the replacement listener onto this
+        // path, so retiring the old listener must not unlink its successor.
+        handle.shutdown_preserving_path().await;
+    }
+    if let Some(magicsock) = pre_started.magicsock.take() {
+        if let Err(error) = shutdown_magicsock(&magicsock).await {
+            log::warn!("tsnet: pre-login magicsock shutdown: {error}");
+        }
+    }
+}
+
+async fn shutdown_extension_host(
+    host: rustscale_ipnext::ExtensionHost,
+) -> Result<(), rustscale_ipnext::ExtensionHost> {
+    #[cfg(test)]
+    const DEADLINE: std::time::Duration = std::time::Duration::from_millis(100);
+    #[cfg(not(test))]
+    const DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+    // Stop publication admission first. The drain owns its blocking waiter, so
+    // timing out this API wait is cancellation-safe. Keep the host for a later
+    // close retry if the drain or the owned shutdown worker remains busy.
+    if tokio::time::timeout(DEADLINE, host.stop_publications_and_wait())
+        .await
+        .is_err()
+    {
+        log::warn!("tsnet: extension publication drain exceeded shutdown deadline");
+    }
+
+    let retry_deadline = tokio::time::Instant::now() + DEADLINE;
+    loop {
+        match host.shutdown().await {
+            Ok(()) => return Ok(()),
+            Err(error) if error.lifecycle_error().is_none() => {
+                for failure in error.failures {
+                    log::warn!(
+                        "tsnet: extension {:?} shutdown failed (retained for retry): {}",
+                        failure.name,
+                        failure.source
+                    );
+                }
+                return Err(host);
+            }
+            Err(error) => {
+                log::warn!("tsnet: extension shutdown still busy: {error}");
+                if tokio::time::Instant::now() >= retry_deadline {
+                    return Err(host);
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+async fn quiesce_running_state(inner: &mut RunningState, preserve_localapi: bool) {
+    inner.cancel.cancel();
+    inner.health_watchdog.stop();
+    for abort in inner
+        .task_aborts
+        .lock()
+        .expect("server task abort lock poisoned")
+        .iter()
+    {
+        abort.abort();
+    }
+    inner.map_tasks.begin_shutdown();
+    inner.extension_subscription.take();
+    inner.hostinfo_hooks.clear();
+    let loopback_controls = inner
+        .loopback_controls
+        .lock()
+        .expect("loopback registry lock poisoned")
+        .drain(..)
+        .collect::<Vec<_>>();
+    let in_memory_clients = inner
+        .in_memory_clients
+        .lock()
+        .expect("in-memory registry lock poisoned")
+        .drain(..)
+        .collect::<Vec<_>>();
+    for control in &loopback_controls {
+        control.invalidate();
+    }
+    for control in &in_memory_clients {
+        control.invalidate();
+    }
+    if let Some(path) = inner.localapi_socket.take() {
+        let _ = std::fs::remove_file(path);
+    }
+    crate::capture::clear(&inner.capture);
+    if let Ok(mut handles) = inner.capture_handles.lock() {
+        handles.clear();
+    }
+    inner.magicsock.set_connection_counter(None);
+    inner.audit_logger.request_stop();
+
+    if !preserve_localapi {
+        if let Some(localapi) = inner.localapi_handle.take() {
+            localapi.shutdown().await;
+        }
+    }
+    if let Some(serve) = inner.serve.take() {
+        serve.stop().await;
+    }
+    for control in loopback_controls {
+        control.shutdown().await;
+    }
+    for control in in_memory_clients {
+        control.shutdown().await;
+    }
+
+    let tasks = {
+        let mut tasks = inner.tasks.lock().await;
+        tasks.drain(..).collect::<Vec<_>>()
+    };
+    drain_generation_tasks(tasks).await;
+    inner.map_tasks.join().await;
+    // LocalAPI cancellation does not cancel an admitted Tailnet Lock init.
+    // Join the retained flight before durable identity or route ownership can
+    // be rotated or released.
+    inner.tailnet_lock.join_init_flight().await;
+    inner
+        .task_aborts
+        .lock()
+        .expect("server task abort lock poisoned")
+        .clear();
+    if let Some(mut monitor) = inner.monitor.take() {
+        monitor.shutdown_and_wait().await;
+    }
+}
+
+async fn finish_running_state(mut inner: RunningState) -> Result<(), (RunningState, String)> {
+    // Extension shutdown has succeeded, so dependencies owned by the router,
+    // DNS configurator, and magicsock can now be released.
+    if let Some(router) = inner.router.take() {
+        if let Err(error) = Server::cleanup_or_supervise(router).await {
+            log::warn!("tsnet: retaining route cleanup owner: {error}");
+            return Err((inner, format!("route cleanup: {error}")));
+        }
+    }
+    if let Some(configurator) = inner.os_dns_configurator.as_mut() {
+        if let Err(error) = configurator.close() {
+            log::warn!("tsnet: OS DNS cleanup failed (non-fatal): {error}");
+        }
+    }
+    inner.os_dns_configurator.take();
+    if let Err(error) = shutdown_magicsock(&inner.magicsock).await {
+        log::warn!("tsnet: retaining running cleanup owner: {error}");
+        return Err((inner, format!("magicsock cleanup: {error}")));
+    }
+    inner.health_watchdog.stop_and_wait().await;
+
+    if let Some(netlog) = inner.netlog.take() {
+        if let Err(error) = netlog.stop().await {
+            log::warn!("tsnet: netlog shutdown failed (non-fatal): {error}");
+        }
+    }
+    inner
+        .audit_logger
+        .flush_and_stop(std::time::Duration::from_secs(5))
+        .await;
+    Ok(())
+}
+
+fn lifecycle_cleanup_runtime() -> &'static tokio::runtime::Runtime {
+    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("rustscale-lifecycle-cleanup")
+            .enable_all()
+            .build()
+            .expect("build lifecycle cleanup supervisor runtime")
+    })
+}
+
+async fn cleanup_server_state(mut owner: CleanupOwner) -> Result<(), (CleanupOwner, String)> {
+    // This owner closes only its own router below. Unrelated retained TUN
+    // owners gate future startup globally, but must not make a userspace
+    // server's close/logout spuriously consume their retry budget.
+    if let Some(inner) = owner.inner.as_mut() {
+        quiesce_running_state(inner, false).await;
+    }
+    if let Some(pre_started) = owner.pre_started.as_mut() {
+        // Stop external admission, but retain its magicsock until extensions
+        // have released every dependency successfully.
+        quiesce_pre_started(pre_started).await;
+    }
+
+    if let Some(host) = owner.extension_host.take() {
+        if let Err(host) = shutdown_extension_host(host).await {
+            owner.extension_host = Some(host);
+            return Err((owner, "extension shutdown remains incomplete".into()));
+        }
+    }
+
+    if let Some(inner) = owner.inner.take() {
+        if let Err((inner, reason)) = finish_running_state(inner).await {
+            owner.inner = Some(inner);
+            return Err((owner, reason));
+        }
+    }
+    if let Some(pre_started) = owner.pre_started.take() {
+        cleanup_pre_started(pre_started, true).await;
+    }
+    Ok(())
+}
+
+async fn logout_running_transaction(
+    mut transaction: LogoutTransaction,
+) -> Result<(), (TsnetError, LogoutTransaction)> {
+    loop {
+        match transaction.phase {
+            LogoutPhase::Quiesce => {
+                let inner = transaction
+                    .owner
+                    .inner
+                    .as_mut()
+                    .expect("logout missing running state");
+                if let Err(error) = inner
+                    .audit_logger
+                    .enqueue(rustscale_tailcfg::AuditNodeDisconnect, "logout")
+                {
+                    log::warn!("tsnet: failed to persist audit log (non-fatal): {error}");
+                }
+
+                // Revoke every runtime writer and join it before any durable
+                // logout phase can replace identity, cache, or preferences.
+                transaction.drive.disable().await;
+                quiesce_running_state(inner, true).await;
+                transaction.drive.disable().await;
+                transaction.phase = LogoutPhase::ControlLogout;
+            }
+            LogoutPhase::ControlLogout => {
+                let inner = transaction
+                    .owner
+                    .inner
+                    .as_ref()
+                    .expect("logout control phase missing running state");
+                let cc = ControlClient::new(
+                    transaction.control_url.clone(),
+                    inner.machine_key.clone(),
+                    inner.server_pub_key.clone(),
+                    PROTOCOL_VERSION,
+                );
+                let request = RegisterRequest {
+                    Version: CAPABILITY_VERSION,
+                    NodeKey: inner.node_key.public(),
+                    Expiry: Some(
+                        chrono::DateTime::parse_from_rfc3339("1970-01-01T00:00:00Z")
+                            .unwrap()
+                            .with_timezone(&chrono::Utc),
+                    ),
+                    Hostinfo: Some(Hostinfo {
+                        OS: std::env::consts::OS.to_string(),
+                        Hostname: transaction.hostname.clone(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+                if let Err(error) = cc.register(&request).await {
+                    return Err((TsnetError::Register(error), transaction));
+                }
+                transaction.phase = LogoutPhase::RotateIdentity;
+            }
+            LogoutPhase::RotateIdentity => {
+                if let Some(scope) = transaction.state_scope.as_ref() {
+                    let path = scope.dir.join("tsnet-state.json");
+                    let persisted = match PersistedState::load(&path) {
+                        Ok(state) => state,
+                        Err(error) => return Err((TsnetError::State(error), transaction)),
+                    };
+                    transaction
+                        .tailnet_identity
+                        .clone_from(&persisted.tailnet_identity);
+                    let rotated = persisted.rotated_for_logout();
+                    #[cfg(test)]
+                    if transaction.state_save_failures > 0 {
+                        transaction.state_save_failures -= 1;
+                        return Err((
+                            TsnetError::State(crate::StateError::Io(std::io::Error::other(
+                                "injected logout state save failure",
+                            ))),
+                            transaction,
+                        ));
+                    }
+                    if let Err(error) = rotated.save(&path) {
+                        return Err((TsnetError::State(error), transaction));
+                    }
+                }
+                transaction.phase = LogoutPhase::ClearCache;
+            }
+            LogoutPhase::ClearCache => {
+                if let Some(scope) = transaction.state_scope.as_ref() {
+                    // Identity rotation has committed, so no old-key cache may
+                    // survive even if preference persistence needs a retry.
+                    NetMapCache::new_scoped(scope, &transaction.tailnet_identity).clear();
+                }
+                transaction.phase = LogoutPhase::SavePrefs;
+            }
+            LogoutPhase::SavePrefs => {
+                transaction.prefs.LoggedOut = true;
+                transaction.prefs.WantRunning = false;
+                if let Some(dir) = transaction.state_dir.as_ref() {
+                    if let Err(error) = transaction.prefs.save(dir) {
+                        return Err((TsnetError::Io(error), transaction));
+                    }
+                }
+                transaction.phase = LogoutPhase::PublishLoggedOut;
+            }
+            LogoutPhase::PublishLoggedOut => {
+                let inner = transaction
+                    .owner
+                    .inner
+                    .as_ref()
+                    .expect("logout publish phase missing running state");
+                let backend = &inner.ipn_backend;
+                backend.set_logged_out(true);
+                backend.set_blocked(true);
+                backend.update_inputs(|inputs| {
+                    inputs.want_running = false;
+                    inputs.has_node_key = false;
+                    inputs.auth_cant_continue = true;
+                    inputs.netmap_present = false;
+                });
+                backend.bus().send(rustscale_ipn::Notify {
+                    State: Some(rustscale_ipn::State::NeedsLogin),
+                    Prefs: Some(serde_json::to_value(&transaction.prefs).unwrap_or_default()),
+                    ..Default::default()
+                });
+                // Durable identity, cache, and preference state now agree.
+                // Unblock LocalAPI before final listener/component cleanup so
+                // its truthful 204 can drain through the listener being closed.
+                transaction.completion.complete(Ok(()));
+                transaction.phase = LogoutPhase::Cleanup;
+            }
+            LogoutPhase::Cleanup => {
+                let owner = std::mem::replace(&mut transaction.owner, CleanupOwner::empty());
+                return match cleanup_server_state(owner).await {
+                    Ok(()) => Ok(()),
+                    Err((owner, reason)) => {
+                        transaction.owner = owner;
+                        Err((
+                            TsnetError::ShutdownIncomplete(format!(
+                                "logout cleanup requires retry: {reason}"
+                            )),
+                            transaction,
+                        ))
+                    }
+                };
+            }
+        }
+    }
 }
 
 /// Nonblocking node lookup view used by the netlog aggregation task.
@@ -112,29 +1074,34 @@ fn netlog_node(node: &Node) -> rustscale_netlogtype::Node {
     }
 }
 
-impl Server {
-    fn cleanup_router_owner(router: &SharedRouter) -> Result<(), TsnetError> {
-        let mut managed = router
-            .lock()
-            .map_err(|_| TsnetError::Builder("router cleanup lock poisoned".into()))?;
-        managed
-            .router
-            .close()
-            .map_err(|error| TsnetError::Builder(format!("route cleanup failed: {error}")))?;
-        managed.security_block_attempted = false;
-        managed.security_block_verified = false;
-        managed.security_block_reasons = 0;
-        if managed.exit_node {
-            rustscale_netns::release_physical_underlay_bypass(&managed.tun_name);
-            managed.exit_node = false;
-        }
-        Ok(())
+fn cleanup_router_owner_blocking(router: &SharedRouter) -> Result<(), TsnetError> {
+    let mut managed = router
+        .lock()
+        .map_err(|_| TsnetError::Builder("router cleanup lock poisoned".into()))?;
+    managed
+        .router
+        .close()
+        .map_err(|error| TsnetError::Builder(format!("route cleanup failed: {error}")))?;
+    managed.security_block_attempted = false;
+    managed.security_block_verified = false;
+    managed.security_block_reasons = 0;
+    if managed.exit_node {
+        rustscale_netns::release_physical_underlay_bypass(&managed.tun_name);
+        managed.exit_node = false;
     }
+    Ok(())
+}
 
+impl Server {
     fn router_cleanup_supervisor() -> &'static std::sync::Mutex<Vec<SharedRouter>> {
         static SUPERVISOR: std::sync::OnceLock<std::sync::Mutex<Vec<SharedRouter>>> =
             std::sync::OnceLock::new();
         SUPERVISOR.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+    }
+
+    fn router_cleanup_gate() -> &'static tokio::sync::Mutex<()> {
+        static GATE: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+        GATE.get_or_init(|| tokio::sync::Mutex::new(()))
     }
 
     fn supervise_router_cleanup(router: SharedRouter) {
@@ -144,8 +1111,9 @@ impl Server {
         }
     }
 
-    pub(crate) fn cleanup_or_supervise(router: SharedRouter) -> Result<(), TsnetError> {
-        match Self::cleanup_router_owner(&router) {
+    pub(crate) async fn cleanup_or_supervise(router: SharedRouter) -> Result<(), TsnetError> {
+        let _gate = Self::router_cleanup_gate().lock().await;
+        match wait_router_cleanup(&router).await {
             Ok(()) => Ok(()),
             Err(error) => {
                 Self::supervise_router_cleanup(router);
@@ -154,19 +1122,29 @@ impl Server {
         }
     }
 
-    fn retry_pending_router_cleanup() -> Result<(), TsnetError> {
-        // Hold the supervisor lock through cleanup so a concurrent close cannot
-        // enqueue a stale owner between the final check and startup admission.
-        let mut supervisor = Self::router_cleanup_supervisor()
-            .lock()
-            .map_err(|_| TsnetError::Builder("router cleanup supervisor poisoned".into()))?;
-        let pending = std::mem::take(&mut *supervisor);
+    async fn retry_pending_router_cleanup() -> Result<(), TsnetError> {
+        // Serialize draining with enqueue so successful restart admission can
+        // never race a newly retained owner.
+        let _gate = Self::router_cleanup_gate().lock().await;
+        let pending = {
+            let mut supervisor = Self::router_cleanup_supervisor()
+                .lock()
+                .map_err(|_| TsnetError::Builder("router cleanup supervisor poisoned".into()))?;
+            std::mem::take(&mut *supervisor)
+        };
+        let mut retained = Vec::new();
         let mut errors = Vec::new();
         for router in pending {
-            if let Err(error) = Self::cleanup_router_owner(&router) {
+            if let Err(error) = wait_router_cleanup(&router).await {
                 errors.push(error.to_string());
-                supervisor.push(router);
+                retained.push(router);
             }
+        }
+        if !retained.is_empty() {
+            Self::router_cleanup_supervisor()
+                .lock()
+                .map_err(|_| TsnetError::Builder("router cleanup supervisor poisoned".into()))?
+                .extend(retained);
         }
         if errors.is_empty() {
             Ok(())
@@ -186,29 +1164,54 @@ impl Server {
     #[allow(clippy::large_futures)]
     ///
     /// **Idempotent**: calling `up()` on an already-running server returns
-    /// `Ok(ServerStatus)` immediately without re-starting. A retained state
-    /// whose teardown has begun returns [`TsnetError::AlreadyUp`] until close
-    /// or logout is retried. Mirrors Go's `sync.Once`-guarded `Start()`.
+    /// `Ok(ServerStatus)` immediately without re-starting. Mirrors Go's
+    /// `sync.Once`-guarded `Start()`.
     ///
     /// Returns the current [`ServerStatus`] after startup (or the existing
     /// status if already up). Mirrors Go's `Up()` which returns
     /// `(*ipnstate.Status, error)`.
     #[allow(clippy::large_futures)]
     pub async fn up(&mut self) -> Result<ServerStatus, TsnetError> {
-        if let Some(inner) = self.inner.as_ref() {
-            if inner.cancel.is_cancelled() {
-                return Err(TsnetError::AlreadyUp);
-            }
+        self.shutdown_supervisor.wait().await;
+        self.startup_supervisor.wait().await;
+        if self.inner.is_some() {
             return Ok(self.status());
         }
-        Self::retry_pending_router_cleanup()?;
+        Self::retry_pending_router_cleanup().await?;
+        self.ensure_extension_host().await?;
 
         ensure_ring_provider();
         let state = self.load_or_create_state()?;
         let initial_auth = self.initial_registration_auth(&state).await?;
 
         let b = self.bootstrap(state, initial_auth).await?;
+        let mut rollback = StartupRollback::new(
+            Arc::clone(&self.startup_supervisor),
+            b.cancel.clone(),
+            b.health_watchdog.clone(),
+            Arc::clone(&b.map_tasks),
+            b.netlog.clone(),
+        );
+        rollback.magicsock = Some(Arc::clone(&b.magicsock));
+        let (localapi_mutation_fence, localapi_mutation_generation) =
+            if let Some(pre_started) = self.pre_started.as_ref() {
+                let fence = Arc::clone(&pre_started.mutation_fence);
+                let handoff = fence
+                    .advance(pre_started.mutation_generation)
+                    .await
+                    .map_err(TsnetError::Builder)?;
+                let generation = handoff.replacement();
+                rollback.localapi_generation_handoff = Some(handoff);
+                (fence, generation)
+            } else {
+                let fence = localapi::LocalApiMutationFence::new();
+                let generation = fence.generation();
+                (fence, generation)
+            };
+        // Advance the old listener's mutation gate before this snapshot. An
+        // accepted stale handler either completed first or now gets conflict.
         let prefs = Arc::new(RwLock::new(self.load_prefs().unwrap_or_default()));
+        let profile_mutations = Arc::new(tokio::sync::Mutex::new(()));
         let exit_node_selection = Arc::new(RwLock::new(ExitNodeSelection::from_prefs(
             &*prefs.read().await,
         )));
@@ -220,8 +1223,9 @@ impl Server {
             b.node_key.clone(),
         )
         .await;
+        rollback.audit_logger = Some(audit_logger.clone());
 
-        let monitor = spawn_link_monitor(
+        rollback.monitor = spawn_link_monitor(
             b.magicsock.clone(),
             b.cancel.clone(),
             b.control_url.clone(),
@@ -259,6 +1263,7 @@ impl Server {
             b.home_derp,
             self.config.peer_relay_server,
         );
+        rollback.track(periodic_ep);
 
         let capture = crate::capture::new_slot();
 
@@ -275,6 +1280,7 @@ impl Server {
             capture.clone(),
             b.peer_map.clone(),
         ));
+        rollback.track(pump);
 
         // Map-stream update task (peer/route deltas).
         let suggested_exit_node: Arc<RwLock<String>> = Arc::new(RwLock::new(String::new()));
@@ -346,7 +1352,7 @@ impl Server {
             b.ipn_backend.clone(),
             Some(key_rotation_ctx),
             b.map_session.clone(),
-            b.map_tasks.clone(),
+            Arc::clone(&b.map_tasks),
             b.c2n_router.clone(),
             suggested_exit_node.clone(),
             client_updater.clone(),
@@ -354,6 +1360,7 @@ impl Server {
             b.domain.clone(),
             b.peer_snapshot_fresh,
         );
+        rollback.track(map_update);
 
         // MagicDNS responder: best-effort UDP server at 100.100.100.100:53.
         // Binding to :53 typically requires root and the MagicDNS VIP to be
@@ -362,7 +1369,6 @@ impl Server {
         // hostnames, handles split-DNS routes, ExtraRecords, .onion NXDOMAIN,
         // 4via6 synthesis, and forwards the rest upstream (with TCP fallback
         // and DoH support).
-        let mut tasks = vec![pump, map_update, periodic_ep];
         let dns_cfg_snapshot = b.dns_config.read().await.clone();
         let forwarder = Arc::new(Forwarder::from_dns_config(dns_cfg_snapshot.as_ref()));
         let responder = DnsResponder::with_forwarder(
@@ -371,7 +1377,9 @@ impl Server {
             forwarder,
         );
         match responder.spawn().await {
-            Ok(handle) => tasks.push(handle),
+            Ok(handle) => {
+                rollback.track(handle);
+            }
             Err(e) => log::warn!(
                 "tsnet: MagicDNS responder not started ({e}); dial still resolves via netmap"
             ),
@@ -385,6 +1393,7 @@ impl Server {
             b.our_fqdn.clone(),
             b.magicsock.self_cap_map_arc(),
         )));
+        rollback.serve.clone_from(&serve);
 
         // Taildrop file manager (shared between PeerAPI receive handler
         // and LocalAPI endpoints). Created from the state directory; if
@@ -397,7 +1406,7 @@ impl Server {
         // PeerAPI server (netstack mode): listens on a deterministic port on
         // the node's tailnet IP, serving DoH DNS + debug endpoints to peers.
         let offering_exit_node = self.config.advertise_exit_node;
-        let (peerapi_task, peerapi_port) = peerapi::spawn_peerapi_netstack(
+        let (peerapi_tasks, peerapi_port) = peerapi::spawn_peerapi_netstack(
             netstack.clone(),
             b.peers.clone(),
             b.user_profiles.clone(),
@@ -412,7 +1421,9 @@ impl Server {
             b.peer_map.clone(),
         )
         .await;
-        tasks.push(peerapi_task);
+        for task in peerapi_tasks {
+            rollback.track(task);
+        }
 
         // Advertise peerapi4/peerapi6 services to the control plane so peers
         // can discover our PeerAPI port.
@@ -468,31 +1479,33 @@ impl Server {
         let pl_ports_hook = portlist_ports.clone();
         let hp_port = peerapi_port;
         let has_v6_hook = b.tailscale_ips.iter().any(|ip| matches!(ip, IpAddr::V6(_)));
-        hostinfo::register_hostinfo_hook(move |hi| {
-            let mut services = Vec::new();
-            if let Some(port) = hp_port {
-                if port > 0 {
-                    services.push(rustscale_tailcfg::Service {
-                        Proto: "peerapi4".into(),
-                        Port: port,
-                        Description: String::new(),
-                    });
-                    if has_v6_hook {
+        rollback
+            .hostinfo_hooks
+            .push(hostinfo::register_hostinfo_hook(move |hi| {
+                let mut services = Vec::new();
+                if let Some(port) = hp_port {
+                    if port > 0 {
                         services.push(rustscale_tailcfg::Service {
-                            Proto: "peerapi6".into(),
+                            Proto: "peerapi4".into(),
                             Port: port,
                             Description: String::new(),
                         });
+                        if has_v6_hook {
+                            services.push(rustscale_tailcfg::Service {
+                                Proto: "peerapi6".into(),
+                                Port: port,
+                                Description: String::new(),
+                            });
+                        }
                     }
                 }
-            }
-            if let Ok(ports) = pl_ports_hook.lock() {
-                services.extend(rustscale_portlist::to_services(&ports));
-            }
-            if !services.is_empty() {
-                hi.Services = services;
-            }
-        });
+                if let Ok(ports) = pl_ports_hook.lock() {
+                    services.extend(rustscale_portlist::to_services(&ports));
+                }
+                if !services.is_empty() {
+                    hi.Services = services;
+                }
+            }));
 
         // Spawn the portlist poller background task.
         let pl_ports_task = portlist_ports.clone();
@@ -513,7 +1526,7 @@ impl Server {
                 tokio::time::sleep(pl_interval).await;
             }
         });
-        tasks.push(portlist_task);
+        rollback.track(portlist_task);
 
         // Periodic Hostinfo refresh (every 10 min, dedup by content hash).
         let hostinfo_loop = spawn_hostinfo_update_loop(
@@ -536,10 +1549,10 @@ impl Server {
             self.config.posture_checking,
             self.config.preference_policy.clone(),
         );
-        tasks.push(hostinfo_loop);
+        rollback.track(hostinfo_loop);
 
         // LocalAPI Unix-domain-socket server (optional, default OFF).
-        let (localapi_handle, localapi_socket) = if self.config.localapi {
+        let localapi_socket = if self.config.localapi {
             let path = self.config.localapi_path.clone().unwrap_or_else(|| {
                 let dir = self
                     .config
@@ -549,6 +1562,8 @@ impl Server {
                 localapi::default_socket_path(&dir)
             });
             let state = localapi::LocalApiState {
+                mutation_fence: Arc::clone(&localapi_mutation_fence),
+                mutation_generation: localapi_mutation_generation,
                 peers: b.peers.clone(),
                 user_profiles: b.user_profiles.clone(),
                 health: b.health.clone(),
@@ -558,6 +1573,7 @@ impl Server {
                 metrics: localapi::default_metric_registry(),
                 prefs: prefs.clone(),
                 posture_checking: b.posture_checking.clone(),
+                profile_mutations: profile_mutations.clone(),
                 exit_node_selection: exit_node_selection.clone(),
                 tailscale_ips: b.tailscale_ips.clone(),
                 our_fqdn: b.our_fqdn.clone(),
@@ -631,11 +1647,8 @@ impl Server {
                 route_table: Some(b.route_table.clone()),
                 exit_map_gate: b.exit_map_gate.clone(),
                 router: None,
-                logout_trigger: self
-                    .pre_started
-                    .as_ref()
-                    .map(|ps| ps.logout_trigger.clone())
-                    .unwrap_or_else(|| Arc::new(tokio::sync::Notify::new())),
+                logout_trigger: Arc::clone(&self.logout_trigger),
+                logout_completion: Arc::clone(&self.logout_completion),
                 suggested_exit_node: suggested_exit_node.clone(),
                 config_path: self.config.config_path.clone(),
                 client_updater: client_updater.clone(),
@@ -650,27 +1663,80 @@ impl Server {
             localapi::activate_preference_policy(&state)
                 .await
                 .map_err(TsnetError::Builder)?;
-            if let Some(pre_started) = self.pre_started.as_mut() {
-                if let Some(handle) = pre_started.handle.as_mut() {
-                    handle.shutdown().await;
-                }
-            }
-            if let Some(h) = localapi::spawn_localapi(state, path.clone()) {
-                log::info!("tsnet: LocalAPI listening at {}", path.display());
-                (Some(h), Some(path))
+            let replacing_prestarted = self
+                .pre_started
+                .as_ref()
+                .and_then(|pre_started| pre_started.handle.as_ref())
+                .is_some();
+            let handle = if replacing_prestarted {
+                localapi::spawn_localapi_paused(state, path.clone()).map(
+                    |(handle, start, handoff)| {
+                        rollback.localapi_start = Some(start);
+                        rollback.localapi_handoff = Some(handoff);
+                        handle
+                    },
+                )
             } else {
+                localapi::spawn_localapi(state, path.clone())
+            };
+            if let Some(handle) = handle {
+                let socket_path = if replacing_prestarted {
+                    path.clone()
+                } else {
+                    handle.socket_path.clone()
+                };
+                rollback.localapi = Some(handle);
+                log::info!("tsnet: LocalAPI prepared at {}", path.display());
+                Some(socket_path)
+            } else {
+                // A failed transactional bind leaves the old needs-login
+                // listener advertised and owned by self.pre_started. Fail the
+                // startup rather than later retiring that reachable listener.
+                if replacing_prestarted {
+                    return Err(TsnetError::Builder(format!(
+                        "failed to prepare LocalAPI replacement at {}",
+                        path.display()
+                    )));
+                }
                 log::warn!(
                     "tsnet: LocalAPI failed to bind socket at {}",
                     path.display()
                 );
-                (None, None)
+                None
             }
         } else {
-            (None, None)
+            None
         };
+        rollback.localapi_socket.clone_from(&localapi_socket);
 
+        // A persisted selection retries only while it is unresolved. Once it
+        // resolves, later map rebuilds retain the route-table owner.
+        {
+            let _map_commit = b.peer_map.gate.write().await;
+            let peers = b.peers.read().await;
+            let mut selection = exit_node_selection.write().await;
+            let mut routes = b.route_table.write().await;
+            selection.retry_transactional(&peers, &mut routes, |_| Ok::<(), TsnetError>(()))?;
+        }
+        let extension_subscription = self
+            .start_extensions_with(b.ipn_backend.clone(), prefs.clone())
+            .await?;
+        #[cfg(test)]
+        if let Some((entered, release, fail)) = self.startup_localapi_test_hook.clone() {
+            entered.wait().await;
+            release.wait().await;
+            if fail {
+                return Err(TsnetError::Builder(
+                    "injected failure after extension startup".into(),
+                ));
+            }
+        }
+        rollback.commit_localapi_handoff()?;
+        let retire_prestarted = self.pre_started.is_some();
+        let tasks = rollback.commit_tasks();
         let task_aborts = tasks.iter().map(JoinHandle::abort_handle).collect();
-        self.inner = Some(RunningState {
+
+        let running = RunningState {
             tailscale_ips: b.tailscale_ips,
             magicsock: b.magicsock,
             netlog: b.netlog,
@@ -686,6 +1752,8 @@ impl Server {
             tasks: Mutex::new(tasks),
             map_tasks: b.map_tasks,
             task_aborts: std::sync::Mutex::new(task_aborts),
+            loopback_controls: std::sync::Mutex::new(Vec::new()),
+            in_memory_clients: std::sync::Mutex::new(Vec::new()),
             packet_drops: b.packet_drops,
             capture,
             capture_handles: std::sync::Mutex::new(vec![]),
@@ -696,11 +1764,11 @@ impl Server {
             user_profiles: b.user_profiles,
             ssh_policy: b.ssh_policy,
             ssh_host_keys: b.ssh_host_keys,
-            monitor,
+            monitor: rollback.take_monitor(),
             machine_key: b.machine_key,
             server_pub_key: b.server_pub_key,
             node_key: b.node_key,
-            serve,
+            serve: rollback.take_serve(),
             health: b.health,
             health_watchdog: b.health_watchdog,
             c2n_router: b.c2n_router,
@@ -708,46 +1776,33 @@ impl Server {
             control_knobs: b.control_knobs,
             peerapi_port,
             overrides: b.overrides,
-            localapi_handle,
             localapi_socket,
+            localapi_handle: rollback.take_localapi(),
             key_expired: b.key_expired,
             os_dns_configurator: None,
             ipn_backend: b.ipn_backend,
-            logout_trigger: self
-                .pre_started
-                .as_ref()
-                .map(|ps| ps.logout_trigger.clone())
-                .unwrap_or_else(|| Arc::new(tokio::sync::Notify::new())),
+            logout_trigger: Arc::clone(&self.logout_trigger),
+            logout_completion: Arc::clone(&self.logout_completion),
             fallback_tcp_handlers: Arc::new(std::sync::Mutex::new(vec![])),
             fallback_next_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             prefs: prefs.clone(),
+            profile_mutations,
+            localapi_mutation_fence,
+            localapi_mutation_generation,
             exit_node_selection: exit_node_selection.clone(),
             proxy_mapper,
             portlist_ports,
             client_updater: client_updater.clone(),
             audit_logger,
-            logout_audit_enqueued: false,
             tailnet_lock: b.tailnet_lock.clone(),
-        });
-
-        // A persisted selection retries only while it is unresolved. Once it
-        // resolves, later map rebuilds retain the route-table owner.
-        let (peers, route_table, exit_map_gate, peer_map) = match self.inner.as_ref() {
-            Some(inner) => (
-                inner.peers.clone(),
-                inner.route_table.clone(),
-                inner.exit_map_gate.clone(),
-                inner.peer_map.clone(),
-            ),
-            None => return Ok(self.status()),
+            hostinfo_hooks: rollback.take_hostinfo_hooks(),
+            extension_subscription,
         };
-        let _exit_map_guard = exit_map_gate.lock().await;
-        let _map_commit = peer_map.gate.write().await;
-        let peers = peers.read().await;
-        let mut selection = exit_node_selection.write().await;
-        let mut routes = route_table.write().await;
-        selection.retry(&peers, &mut routes);
 
+        self.inner = Some(running);
+        if retire_prestarted {
+            self.retire_prestarted_after_handoff();
+        }
         Ok(self.status())
     }
 
@@ -762,20 +1817,46 @@ impl Server {
     /// requiring root.
     #[allow(clippy::large_futures)]
     pub async fn up_tun(&mut self, config: TunModeConfig) -> Result<ServerStatus, TsnetError> {
-        if let Some(inner) = self.inner.as_ref() {
-            if inner.cancel.is_cancelled() {
-                return Err(TsnetError::AlreadyUp);
-            }
+        self.shutdown_supervisor.wait().await;
+        self.startup_supervisor.wait().await;
+        if self.inner.is_some() {
             return Ok(self.status());
         }
-        Self::retry_pending_router_cleanup()?;
+        Self::retry_pending_router_cleanup().await?;
+        self.ensure_extension_host().await?;
 
         ensure_ring_provider();
         let state = self.load_or_create_state()?;
         let initial_auth = self.initial_registration_auth(&state).await?;
 
         let b = self.bootstrap(state, initial_auth).await?;
+        let mut rollback = StartupRollback::new(
+            Arc::clone(&self.startup_supervisor),
+            b.cancel.clone(),
+            b.health_watchdog.clone(),
+            Arc::clone(&b.map_tasks),
+            b.netlog.clone(),
+        );
+        rollback.magicsock = Some(Arc::clone(&b.magicsock));
+        let (localapi_mutation_fence, localapi_mutation_generation) =
+            if let Some(pre_started) = self.pre_started.as_ref() {
+                let fence = Arc::clone(&pre_started.mutation_fence);
+                let handoff = fence
+                    .advance(pre_started.mutation_generation)
+                    .await
+                    .map_err(TsnetError::Builder)?;
+                let generation = handoff.replacement();
+                rollback.localapi_generation_handoff = Some(handoff);
+                (fence, generation)
+            } else {
+                let fence = localapi::LocalApiMutationFence::new();
+                let generation = fence.generation();
+                (fence, generation)
+            };
+        // Advance the old listener's mutation gate before this snapshot. An
+        // accepted stale handler either completed first or now gets conflict.
         let prefs = Arc::new(RwLock::new(self.load_prefs().unwrap_or_default()));
+        let profile_mutations = Arc::new(tokio::sync::Mutex::new(()));
         let exit_node_selection = Arc::new(RwLock::new(ExitNodeSelection::from_prefs(
             &*prefs.read().await,
         )));
@@ -787,6 +1868,7 @@ impl Server {
             b.node_key.clone(),
         )
         .await;
+        rollback.audit_logger = Some(audit_logger.clone());
 
         // Serialize startup selection with the same mutation domain used once
         // the map task starts.
@@ -832,6 +1914,8 @@ impl Server {
             self.config.state_dir.as_deref(),
         )
         .await?;
+        // Transfer OS-route ownership before the next cancellable await.
+        rollback.router.clone_from(&router);
 
         let monitor = spawn_link_monitor(
             b.magicsock.clone(),
@@ -856,6 +1940,7 @@ impl Server {
             }),
         )
         .await;
+        rollback.monitor = monitor;
 
         let capture = crate::capture::new_slot();
 
@@ -872,6 +1957,7 @@ impl Server {
             capture.clone(),
             b.peer_map.clone(),
         ));
+        rollback.track(pump);
 
         // Periodic endpoint update (Bug 4).
         let periodic_ep = spawn_periodic_endpoint_updates(
@@ -888,6 +1974,7 @@ impl Server {
             b.home_derp,
             self.config.peer_relay_server,
         );
+        rollback.track(periodic_ep);
 
         let suggested_exit_node: Arc<RwLock<String>> = Arc::new(RwLock::new(String::new()));
         let client_updater = Arc::new(std::sync::Mutex::new(
@@ -958,7 +2045,7 @@ impl Server {
             b.ipn_backend.clone(),
             Some(key_rotation_ctx),
             b.map_session.clone(),
-            b.map_tasks.clone(),
+            Arc::clone(&b.map_tasks),
             b.c2n_router.clone(),
             suggested_exit_node.clone(),
             client_updater.clone(),
@@ -966,6 +2053,7 @@ impl Server {
             b.domain.clone(),
             b.peer_snapshot_fresh,
         );
+        rollback.track(map_update);
 
         // Taildrop file manager (shared between PeerAPI receive handler
         // and LocalAPI endpoints). Created from the state directory.
@@ -977,7 +2065,7 @@ impl Server {
         // PeerAPI server (TUN mode): binds TCP listeners on the node's
         // tailnet IPs (v4 + v6) on the deterministic port.
         let offering_exit_node = self.config.advertise_exit_node;
-        let (peerapi_task, peerapi_port) = peerapi::spawn_peerapi_tun(
+        let (peerapi_tasks, peerapi_port) = peerapi::spawn_peerapi_tun(
             b.peers.clone(),
             b.user_profiles.clone(),
             b.resolver.clone(),
@@ -991,6 +2079,9 @@ impl Server {
             b.peer_map.clone(),
         )
         .await;
+        for task in peerapi_tasks {
+            rollback.track(task);
+        }
 
         // Advertise peerapi4/peerapi6 services to the control plane.
         if let Some(port) = peerapi_port {
@@ -1041,31 +2132,33 @@ impl Server {
         let pl_ports_hook = portlist_ports.clone();
         let hp_port = peerapi_port;
         let has_v6_hook = b.tailscale_ips.iter().any(|ip| matches!(ip, IpAddr::V6(_)));
-        hostinfo::register_hostinfo_hook(move |hi| {
-            let mut services = Vec::new();
-            if let Some(port) = hp_port {
-                if port > 0 {
-                    services.push(rustscale_tailcfg::Service {
-                        Proto: "peerapi4".into(),
-                        Port: port,
-                        Description: String::new(),
-                    });
-                    if has_v6_hook {
+        rollback
+            .hostinfo_hooks
+            .push(hostinfo::register_hostinfo_hook(move |hi| {
+                let mut services = Vec::new();
+                if let Some(port) = hp_port {
+                    if port > 0 {
                         services.push(rustscale_tailcfg::Service {
-                            Proto: "peerapi6".into(),
+                            Proto: "peerapi4".into(),
                             Port: port,
                             Description: String::new(),
                         });
+                        if has_v6_hook {
+                            services.push(rustscale_tailcfg::Service {
+                                Proto: "peerapi6".into(),
+                                Port: port,
+                                Description: String::new(),
+                            });
+                        }
                     }
                 }
-            }
-            if let Ok(ports) = pl_ports_hook.lock() {
-                services.extend(rustscale_portlist::to_services(&ports));
-            }
-            if !services.is_empty() {
-                hi.Services = services;
-            }
-        });
+                if let Ok(ports) = pl_ports_hook.lock() {
+                    services.extend(rustscale_portlist::to_services(&ports));
+                }
+                if !services.is_empty() {
+                    hi.Services = services;
+                }
+            }));
 
         let pl_ports_task = portlist_ports.clone();
         let pl_cancel = b.cancel.clone();
@@ -1085,6 +2178,7 @@ impl Server {
                 tokio::time::sleep(pl_interval).await;
             }
         });
+        rollback.track(portlist_task);
 
         // Periodic Hostinfo refresh (every 10 min, dedup by content hash).
         // In TUN mode, serve/funnel is not available so pass None.
@@ -1108,18 +2202,10 @@ impl Server {
             self.config.posture_checking,
             self.config.preference_policy.clone(),
         );
-
-        let tasks = vec![
-            pump,
-            map_update,
-            periodic_ep,
-            peerapi_task,
-            hostinfo_loop,
-            portlist_task,
-        ];
+        rollback.track(hostinfo_loop);
 
         // LocalAPI Unix-domain-socket server (optional, default OFF).
-        let (localapi_handle, localapi_socket) = if self.config.localapi {
+        let localapi_socket = if self.config.localapi {
             let path = self.config.localapi_path.clone().unwrap_or_else(|| {
                 let dir = self
                     .config
@@ -1129,6 +2215,8 @@ impl Server {
                 localapi::default_socket_path(&dir)
             });
             let state = localapi::LocalApiState {
+                mutation_fence: Arc::clone(&localapi_mutation_fence),
+                mutation_generation: localapi_mutation_generation,
                 peers: b.peers.clone(),
                 user_profiles: b.user_profiles.clone(),
                 health: b.health.clone(),
@@ -1138,6 +2226,7 @@ impl Server {
                 metrics: localapi::default_metric_registry(),
                 prefs: prefs.clone(),
                 posture_checking: b.posture_checking.clone(),
+                profile_mutations: profile_mutations.clone(),
                 exit_node_selection: exit_node_selection.clone(),
                 tailscale_ips: b.tailscale_ips.clone(),
                 our_fqdn: b.our_fqdn.clone(),
@@ -1211,11 +2300,8 @@ impl Server {
                 route_table: Some(b.route_table.clone()),
                 exit_map_gate: b.exit_map_gate.clone(),
                 router: router.clone(),
-                logout_trigger: self
-                    .pre_started
-                    .as_ref()
-                    .map(|ps| ps.logout_trigger.clone())
-                    .unwrap_or_else(|| Arc::new(tokio::sync::Notify::new())),
+                logout_trigger: Arc::clone(&self.logout_trigger),
+                logout_completion: Arc::clone(&self.logout_completion),
                 suggested_exit_node: suggested_exit_node.clone(),
                 config_path: self.config.config_path.clone(),
                 client_updater: client_updater.clone(),
@@ -1230,30 +2316,54 @@ impl Server {
             localapi::activate_preference_policy(&state)
                 .await
                 .map_err(TsnetError::Builder)?;
-            if let Some(pre_started) = self.pre_started.as_mut() {
-                if let Some(handle) = pre_started.handle.as_mut() {
-                    handle.shutdown().await;
-                }
-            }
-            if let Some(h) = localapi::spawn_localapi(state, path.clone()) {
-                log::info!("tsnet: LocalAPI listening at {}", path.display());
-                (Some(h), Some(path))
+            let replacing_prestarted = self
+                .pre_started
+                .as_ref()
+                .and_then(|pre_started| pre_started.handle.as_ref())
+                .is_some();
+            let handle = if replacing_prestarted {
+                localapi::spawn_localapi_paused(state, path.clone()).map(
+                    |(handle, start, handoff)| {
+                        rollback.localapi_start = Some(start);
+                        rollback.localapi_handoff = Some(handoff);
+                        handle
+                    },
+                )
             } else {
+                localapi::spawn_localapi(state, path.clone())
+            };
+            if let Some(handle) = handle {
+                let socket_path = if replacing_prestarted {
+                    path.clone()
+                } else {
+                    handle.socket_path.clone()
+                };
+                rollback.localapi = Some(handle);
+                log::info!("tsnet: LocalAPI prepared at {}", path.display());
+                Some(socket_path)
+            } else {
+                if replacing_prestarted {
+                    return Err(TsnetError::Builder(format!(
+                        "failed to prepare LocalAPI replacement at {}",
+                        path.display()
+                    )));
+                }
                 log::warn!(
                     "tsnet: LocalAPI failed to bind socket at {}",
                     path.display()
                 );
-                (None, None)
+                None
             }
         } else {
-            (None, None)
+            None
         };
+        rollback.localapi_socket.clone_from(&localapi_socket);
 
         // OS DNS configuration (macOS: /etc/resolver entries pointing at
         // 100.100.100.100). Opt-in via `configure_os_dns(true)` — requires
         // root. Best-effort: permission errors are logged and do not prevent
         // up_tun from completing.
-        let os_dns_configurator = if self.config.configure_os_dns {
+        rollback.os_dns_configurator = if self.config.configure_os_dns {
             let dns_cfg_snapshot = b.dns_config.read().await.clone();
             let os_cfg = if let Some(ref dc) = dns_cfg_snapshot {
                 build_os_dns_config(dc, &b.domain)
@@ -1281,8 +2391,15 @@ impl Server {
         } else {
             None
         };
-
+        let extension_subscription = self
+            .finish_tun_startup(b.ipn_backend.clone(), prefs.clone())
+            .await?;
+        rollback.commit_localapi_handoff()?;
+        let retire_prestarted = self.pre_started.is_some();
+        let os_dns_configurator = rollback.take_os_dns_configurator();
+        let tasks = rollback.commit_tasks();
         let task_aborts = tasks.iter().map(JoinHandle::abort_handle).collect();
+
         self.inner = Some(RunningState {
             tailscale_ips: b.tailscale_ips,
             magicsock: b.magicsock,
@@ -1299,6 +2416,8 @@ impl Server {
             tasks: Mutex::new(tasks),
             map_tasks: b.map_tasks,
             task_aborts: std::sync::Mutex::new(task_aborts),
+            loopback_controls: std::sync::Mutex::new(Vec::new()),
+            in_memory_clients: std::sync::Mutex::new(Vec::new()),
             packet_drops: b.packet_drops,
             capture,
             capture_handles: std::sync::Mutex::new(vec![]),
@@ -1309,7 +2428,7 @@ impl Server {
             user_profiles: b.user_profiles,
             ssh_policy: b.ssh_policy,
             ssh_host_keys: b.ssh_host_keys,
-            monitor,
+            monitor: rollback.take_monitor(),
             machine_key: b.machine_key,
             server_pub_key: b.server_pub_key,
             node_key: b.node_key,
@@ -1321,89 +2440,165 @@ impl Server {
             control_knobs: b.control_knobs,
             peerapi_port,
             overrides: b.overrides,
-            localapi_handle,
             localapi_socket,
+            localapi_handle: rollback.take_localapi(),
             key_expired: b.key_expired,
             os_dns_configurator,
             ipn_backend: b.ipn_backend,
-            logout_trigger: self
-                .pre_started
-                .as_ref()
-                .map(|ps| ps.logout_trigger.clone())
-                .unwrap_or_else(|| Arc::new(tokio::sync::Notify::new())),
+            logout_trigger: Arc::clone(&self.logout_trigger),
+            logout_completion: Arc::clone(&self.logout_completion),
             fallback_tcp_handlers: Arc::new(std::sync::Mutex::new(vec![])),
             fallback_next_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             prefs: prefs.clone(),
+            profile_mutations,
+            localapi_mutation_fence,
+            localapi_mutation_generation,
             exit_node_selection: exit_node_selection.clone(),
             proxy_mapper,
             portlist_ports,
             client_updater: client_updater.clone(),
             audit_logger,
-            logout_audit_enqueued: false,
             tailnet_lock: b.tailnet_lock.clone(),
+            hostinfo_hooks: rollback.take_hostinfo_hooks(),
+            extension_subscription,
         });
 
-        // TUN config owns a selection made above; otherwise retry only an
-        // unresolved persisted selection.
-        let (
-            peers,
-            route_table,
-            router,
-            tailscale_ips,
-            magicsock,
-            live_prefs,
-            exit_map_gate,
-            peer_map,
-        ) = match self.inner.as_ref() {
-            Some(inner) => (
-                inner.peers.clone(),
-                inner.route_table.clone(),
-                inner.router.clone(),
-                inner.tailscale_ips.clone(),
-                inner.magicsock.clone(),
-                inner.prefs.clone(),
-                inner.exit_map_gate.clone(),
-                inner.peer_map.clone(),
-            ),
-            None => return Ok(self.status()),
-        };
-        let _exit_map_guard = exit_map_gate.lock().await;
-        let _map_commit = peer_map.gate.write().await;
-        let peers = peers.read().await;
-        let exit_node_allow_lan_access = live_prefs.read().await.ExitNodeAllowLANAccess;
-        let mut selection = exit_node_selection.write().await;
-        let mut routes = route_table.write().await;
-        selection.retry_transactional(&peers, &mut routes, |routes| {
-            if let Some(router) = router.as_ref() {
-                sync_router(
-                    router,
-                    &tailscale_ips,
-                    routes,
-                    &magicsock,
-                    &self.config.control_url,
-                    exit_node_allow_lan_access,
-                )?;
-            }
-            Ok::<(), TsnetError>(())
-        })?;
-
+        if retire_prestarted {
+            self.retire_prestarted_after_handoff();
+        }
         Ok(self.status())
     }
 
     // --- shared control-plane bootstrap ---
+
+    fn retire_prestarted_after_handoff(&mut self) {
+        let Some(pre_started) = self.pre_started.take() else {
+            return;
+        };
+        let completion = self.startup_supervisor.begin_cleanup();
+        spawn_rollback_cleanup("rustscale-prestarted-retire", async move {
+            let _completion = completion;
+            // The replacement now owns the advertised pathname. Retiring the
+            // old generation must not unlink it.
+            cleanup_pre_started(pre_started, false).await;
+        });
+    }
+
+    pub(crate) async fn ensure_extension_host(&mut self) -> Result<(), TsnetError> {
+        if self.shutdown_supervisor.has_retained_owner()
+            || self.shutdown_supervisor.has_retained_logout()
+        {
+            return Err(TsnetError::ShutdownIncomplete(
+                "previous server owner still requires shutdown retry".into(),
+            ));
+        }
+
+        if self
+            .extension_host
+            .as_ref()
+            .is_some_and(rustscale_ipnext::ExtensionHost::is_created)
+        {
+            return Ok(());
+        }
+
+        if let Some(host) = self.extension_host.take() {
+            match shutdown_extension_host(host).await {
+                Ok(()) => {}
+                Err(host) => {
+                    self.extension_host = Some(host);
+                    return Err(TsnetError::Extension(
+                        "previous extension host shutdown remains incomplete".into(),
+                    ));
+                }
+            }
+        }
+
+        let host = match self.config.extension_registry.as_deref() {
+            Some(registry) => {
+                rustscale_ipnext::ExtensionHost::new(registry, Arc::clone(&self.system))
+            }
+            None => rustscale_ipnext::ExtensionHost::new(
+                rustscale_ipnext::global_registry(),
+                Arc::clone(&self.system),
+            ),
+        }
+        .map_err(|error| TsnetError::Extension(error.to_string()))?;
+        self.extension_host = Some(host);
+        Ok(())
+    }
+
+    pub(crate) async fn finish_tun_startup(
+        &mut self,
+        ipn_backend: Arc<IpnBackend>,
+        live_prefs: Arc<RwLock<rustscale_ipn::Prefs>>,
+    ) -> Result<Option<rustscale_ipn::CallbackSubscription>, TsnetError> {
+        self.start_extensions_with(ipn_backend, live_prefs).await
+    }
+
+    pub(crate) async fn start_extensions_with(
+        &mut self,
+        ipn_backend: Arc<IpnBackend>,
+        live_prefs: Arc<RwLock<rustscale_ipn::Prefs>>,
+    ) -> Result<Option<rustscale_ipn::CallbackSubscription>, TsnetError> {
+        let Some(host) = self.extension_host.as_ref() else {
+            return Ok(None);
+        };
+        let state_dir = self.config.state_dir.clone();
+
+        let prefs = live_prefs.read().await.clone();
+        let profile = state_dir
+            .as_ref()
+            .and_then(|dir| {
+                let current = rustscale_ipn::LoginProfile::load_current_id(dir).ok()??;
+                rustscale_ipn::LoginProfile::load_all(dir)
+                    .ok()?
+                    .into_iter()
+                    .find(|profile| profile.ID == current)
+            })
+            .unwrap_or_default();
+        ipn_backend.seed_profile_state(profile.clone(), prefs.clone());
+        let handle = host.host();
+        let delivery = Arc::new(StartupDelivery::new(handle));
+        let state_delivery = Arc::clone(&delivery);
+        let profile_delivery = Arc::clone(&delivery);
+        let (backend_state, profile_snapshot, subscription) = ipn_backend.subscribe_with_snapshot(
+            Arc::new(move |state| {
+                state_delivery.enqueue(StartupDeliveryEvent::Backend(state));
+            }),
+            Arc::new(move |profile, prefs, same_node| {
+                profile_delivery.enqueue(StartupDeliveryEvent::Profile(Box::new((
+                    profile, prefs, same_node,
+                ))));
+            }),
+        );
+        let (profile, prefs, _) = profile_snapshot.unwrap_or((profile, prefs, false));
+        host.seed_profile_state(profile.clone(), prefs.clone())
+            .map_err(|error| TsnetError::Extension(error.to_string()))?;
+
+        let report = host
+            .start()
+            .await
+            .map_err(|error| TsnetError::Extension(error.to_string()))?;
+        for failure in report.failed {
+            log::warn!(
+                "tsnet: extension {:?} init failed (non-fatal): {}",
+                failure.name,
+                failure.source
+            );
+        }
+
+        delivery.activate(vec![
+            StartupDeliveryEvent::Profile(Box::new((profile, prefs, false))),
+            StartupDeliveryEvent::Backend(backend_state),
+        ]);
+        Ok(Some(subscription))
+    }
 
     /// Ensure the server is up, starting it if needed. Called by `listen()`
     /// and `dial()` for lazy auto-start. Mirrors Go's `Server.Start()` being
     /// called by `Dial`/`Listen`. If the server is already up, this is a
     /// no-op (idempotent).
     pub async fn ensure_up(&mut self) -> Result<ServerStatus, TsnetError> {
-        if self
-            .inner
-            .as_ref()
-            .is_some_and(|inner| inner.cancel.is_cancelled())
-        {
-            return Err(TsnetError::AlreadyUp);
-        }
         if self.inner.is_none() {
             Box::pin(self.up()).await?;
         }
@@ -1447,13 +2642,24 @@ impl Server {
     pub async fn start_localapi_only(
         &mut self,
     ) -> Result<mpsc::UnboundedReceiver<localapi::DaemonCommand>, TsnetError> {
-        // Retained running/pre-login ownership means a close or logout was
-        // cancelled or failed and must be retried before anything can publish
-        // a replacement LocalAPI socket or profile identity.
-        if self.inner.is_some() || self.pre_started.is_some() {
-            return Err(TsnetError::AlreadyUp);
+        self.shutdown_supervisor.wait().await;
+        self.startup_supervisor.wait().await;
+        if self.shutdown_supervisor.has_retained_logout()
+            || self.shutdown_supervisor.has_retained_owner()
+        {
+            return Err(TsnetError::ShutdownIncomplete(
+                "previous server owner still requires shutdown retry".into(),
+            ));
         }
-        Self::retry_pending_router_cleanup()?;
+        if let Some(pre_started) = self.pre_started.take() {
+            let completion = self.shutdown_supervisor.begin_cleanup();
+            spawn_rollback_cleanup("rustscale-prestarted-restart", async move {
+                let _completion = completion;
+                cleanup_pre_started(pre_started, true).await;
+            });
+            self.shutdown_supervisor.wait().await;
+        }
+        Self::retry_pending_router_cleanup().await?;
 
         let ipn_backend = Arc::new(IpnBackend::new("rustscale"));
         ipn_backend.set_want_running();
@@ -1480,7 +2686,7 @@ impl Server {
         let command_tx_clone = command_tx.clone();
         let login_trigger = Arc::new(tokio::sync::Notify::new());
         let auth_url = Arc::new(std::sync::Mutex::new(None));
-        let logout_trigger = Arc::new(tokio::sync::Notify::new());
+        let logout_trigger = Arc::clone(&self.logout_trigger);
 
         let (magicsock, _wg_rx) = Magicsock::new(MagicsockConfig {
             private_key: state.node_key.clone(),
@@ -1501,6 +2707,10 @@ impl Server {
         .await
         .map_err(TsnetError::Magicsock)?;
         let magicsock = Arc::new(magicsock);
+        let mut magicsock_rollback = PrestartedMagicsockRollback::new(
+            Arc::clone(&self.shutdown_supervisor),
+            Arc::clone(&magicsock),
+        );
 
         let socket_path = if let Some(ref p) = self.config.localapi_path {
             p.clone()
@@ -1510,7 +2720,11 @@ impl Server {
             localapi::default_socket_path(&std::env::temp_dir().join("rustscale"))
         };
 
+        let mutation_fence = localapi::LocalApiMutationFence::new();
+        let mutation_generation = mutation_fence.generation();
         let api_state = Arc::new(localapi::LocalApiState {
+            mutation_fence: Arc::clone(&mutation_fence),
+            mutation_generation,
             peers: Arc::new(RwLock::new(vec![])),
             routecheck: None,
             user_profiles: Arc::new(RwLock::new(BTreeMap::new())),
@@ -1521,6 +2735,7 @@ impl Server {
             metrics: localapi::default_metric_registry(),
             prefs: prefs.clone(),
             posture_checking: Arc::new(AtomicBool::new(prefs.read().await.PostureChecking)),
+            profile_mutations: Arc::new(tokio::sync::Mutex::new(())),
             exit_node_selection: Arc::new(RwLock::new(ExitNodeSelection::from_prefs(
                 &*prefs.read().await,
             ))),
@@ -1570,6 +2785,7 @@ impl Server {
             exit_map_gate: Arc::new(tokio::sync::Mutex::new(())),
             router: None,
             logout_trigger: logout_trigger.clone(),
+            logout_completion: Arc::clone(&self.logout_completion),
             suggested_exit_node: Arc::new(RwLock::new(String::new())),
             config_path: self.config.config_path.clone(),
             client_updater: Arc::new(std::sync::Mutex::new(
@@ -1595,13 +2811,15 @@ impl Server {
 
         self.pre_started = Some(PreStartedLocalApi {
             backend: ipn_backend,
-            magicsock,
             handle,
+            magicsock: Some(magicsock_rollback.commit()),
             login_trigger,
             auth_url,
             command_rx: Some(command_rx),
             command_tx: Some(command_tx_clone),
             logout_trigger,
+            mutation_fence,
+            mutation_generation,
             socket_path,
         });
 
@@ -1699,6 +2917,9 @@ impl Server {
         mut state: PersistedState,
         mut initial_auth: Option<TransientAuthKey>,
     ) -> Result<Bootstrap, TsnetError> {
+        // A cancelled prior bootstrap owns its spawned tasks until they have
+        // been aborted and joined. Never overlap a retry with that cleanup.
+        self.bootstrap_supervisor.wait().await;
         // Effective advertised routes: user-specified subnet routes plus the
         // exit-node default routes (0.0.0.0/0, ::/0) when advertise_exit_node
         // is enabled. Used for Hostinfo.RoutableIPs, the filter's localNets,
@@ -1716,6 +2937,10 @@ impl Server {
             Severity::High,
             "control connection lost: no map activity for over 3 minutes",
             std::time::Duration::from_mins(3),
+        );
+        let mut bootstrap_rollback = BootstrapRollback::new(
+            Arc::clone(&self.bootstrap_supervisor),
+            health_watchdog.clone(),
         );
 
         // Socket-statistics registry (per-label TX/RX byte counters).
@@ -2294,13 +3519,12 @@ impl Server {
         })
         .await?;
         let magicsock = Arc::new(magicsock_inner);
+        bootstrap_rollback.magicsock = Some(Arc::clone(&magicsock));
 
         // Start a background port-mapping probe + creation (best-effort, 2s
         // timeout). The cached mapping will be picked up by subsequent
         // `all_endpoints()` calls and published to the control plane.
-        if !self.config.disable_portmapping {
-            magicsock.start_portmap();
-        }
+        magicsock.start_portmap();
 
         // The server may send peers via Peers (full list) or PeersChanged
         // (delta). The first response often uses PeersChanged.
@@ -2388,6 +3612,7 @@ impl Server {
                 peers: peers_arc.clone(),
             });
             logger.start(source, logtail).await?;
+            bootstrap_rollback.netlog = Some(Arc::clone(&logger));
             let virtual_counter = logger.make_counter(true).await;
             if let Ok(mut filter) = filter.lock() {
                 filter.set_connection_counter(Some(virtual_counter));
@@ -2465,22 +3690,28 @@ impl Server {
             c2n::register_c2n_handlers(&mut r, c2n_backend.clone());
             Arc::new(r)
         };
-        let map_tasks = MapSessionTasks::new(tokio::spawn({
+        let map_task = tokio::spawn({
             let ss = map_session.clone();
             let router = c2n_router.clone();
             async move {
                 cc2.stream_map_loop_with_c2n(&map_req, map_tx, Some(ss), router)
                     .await;
             }
-        }));
+        });
+        bootstrap_rollback.set_map_task(map_task);
 
         // Control knobs created earlier (before magicsock construction).
+        // Transfer the logger and map task out of bootstrap compensation as
+        // one ownership commit. Every subsequent await is covered by
+        // StartupRollback, which requests and joins netlog shutdown.
+        let (map_tasks, bootstrap_netlog) = bootstrap_rollback.commit();
+        debug_assert_eq!(bootstrap_netlog.is_some(), netlog.is_some());
 
         Ok(Bootstrap {
             tailscale_ips: tailscale_ips.clone(),
             our_v4,
             magicsock,
-            netlog,
+            netlog: bootstrap_netlog,
             wg_recv,
             wg_tunnels,
             raw_peers,
@@ -2530,195 +3761,68 @@ impl Server {
         })
     }
 
-    /// Revoke all externally visible profile work synchronously. Join handles
-    /// remain in `self`, so cancelling any later await cannot detach cleanup.
-    fn begin_profile_shutdown(&mut self) {
-        if let Some(pre_started) = self.pre_started.as_mut() {
-            if let Some(handle) = pre_started.handle.as_mut() {
-                handle.begin_shutdown();
-            }
-            let _ = std::fs::remove_file(&pre_started.socket_path);
-        }
-        if let Some(inner) = self.inner.as_mut() {
-            if let Some(handle) = inner.localapi_handle.as_mut() {
-                handle.begin_shutdown();
-            }
-            if let Some(path) = inner.localapi_socket.as_ref() {
-                let _ = std::fs::remove_file(path);
-            }
-            if let Some(serve) = inner.serve.as_ref() {
-                serve.begin_stop();
-            }
-            inner.cancel.cancel();
-            inner.health_watchdog.stop();
-            if let Some(monitor) = inner.monitor.as_ref() {
-                monitor.shutdown();
-            }
-            for abort in inner
-                .task_aborts
-                .lock()
-                .expect("server task abort lock poisoned")
-                .iter()
-            {
-                abort.abort();
-            }
-            inner.map_tasks.begin_shutdown();
-        }
-    }
-
-    async fn join_running_tasks(inner: &mut RunningState) -> Result<(), TsnetError> {
-        let join_result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            let mut tasks = inner.tasks.lock().await;
-            while let Some(task) = tasks.first_mut() {
-                let _ = (&mut *task).await;
-                tasks.swap_remove(0);
-            }
-            drop(tasks);
-            inner.map_tasks.join().await;
-        })
-        .await;
-        if join_result.is_err() {
-            return Err(TsnetError::Io(std::io::Error::other(
-                "server task cleanup incomplete",
-            )));
-        }
-        inner
-            .task_aborts
-            .lock()
-            .expect("server task abort lock poisoned")
-            .clear();
-        Ok(())
-    }
-
-    /// Release profile ownership only after all asynchronous cleanup has
-    /// completed. This method deliberately contains no await points.
-    fn finish_profile_shutdown(&mut self) -> Result<(), TsnetError> {
-        if let Some(inner) = self.inner.as_mut() {
-            crate::capture::clear(&inner.capture);
-            inner
-                .capture_handles
-                .lock()
-                .expect("capture handles lock poisoned")
-                .clear();
-            if let Some(mut cfg) = inner.os_dns_configurator.take() {
-                if let Err(e) = cfg.close() {
-                    log::warn!("tsnet: OS DNS cleanup failed (non-fatal): {e}");
-                }
-            }
-            // Route cleanup is last, after every task capable of reapplying a
-            // map/interface diff has stopped. Failed ownership moves to the
-            // global supervisor before profile state is released.
-            if let Some(router) = inner.router.take() {
-                Self::cleanup_or_supervise(router)?;
-            }
-        }
-        if let Some(pre_started) = self.pre_started.as_mut() {
-            pre_started.command_tx.take();
-            pre_started.command_rx.take();
-        }
-        self.inner.take();
-        self.pre_started.take();
-        Ok(())
-    }
-
-    #[cfg(test)]
-    async fn logout_checkpoint(&self, point: LogoutAwaitPoint) {
-        if let Some(hook) = self.logout_test_hook.as_ref() {
-            hook.checkpoint(point).await;
-        }
-    }
-
     /// Shut down the server.
-    pub async fn close(&mut self) -> CloseResult {
-        self.begin_profile_shutdown();
+    ///
+    /// Resource ownership is transferred to a process-lifetime cleanup
+    /// supervisor before the first await. Dropping this future or destroying
+    /// its caller runtime therefore cannot strand running tasks, sockets,
+    /// routes, DNS state, serve listeners, or extensions.
+    pub async fn close(&mut self) -> Result<(), TsnetError> {
+        if self.shutdown_supervisor.has_retained_logout() {
+            return Err(TsnetError::ShutdownIncomplete(
+                "logout transaction is incomplete; retry logout before close".into(),
+            ));
+        }
+        // Move every Server-owned generation before the first await. Rollback
+        // tasks from a cancelled up/bootstrap are already retained by their
+        // supervisors; clone those gates into the same independent cleanup.
+        let mut owner = CleanupOwner::take_from(self);
+        let drive = Arc::clone(&self.drive);
+        let bootstrap_supervisor = Arc::clone(&self.bootstrap_supervisor);
+        let startup_supervisor = Arc::clone(&self.startup_supervisor);
+        let shutdown_supervisor = Arc::clone(&self.shutdown_supervisor);
 
-        // Runtime shares are intentionally not persisted across shutdown or
-        // profile changes. This is also the Taildrive publication barrier:
-        // revoke grants and wait for active requests before stopping pumps.
-        self.drive.disable().await;
-
-        if let Some(pre_started) = self.pre_started.as_mut() {
-            if let Some(handle) = pre_started.handle.as_mut() {
-                handle.shutdown().await;
+        if owner.is_empty() {
+            // A cancelled earlier close/logout can own everything already.
+            // Join it and claim the complete retained owner for one retry.
+            shutdown_supervisor.wait().await;
+            startup_supervisor.wait().await;
+            bootstrap_supervisor.wait().await;
+            if shutdown_supervisor.has_retained_logout() {
+                return Err(TsnetError::ShutdownIncomplete(
+                    "logout transaction is incomplete; retry logout before close".into(),
+                ));
             }
+            let Some(retained) = shutdown_supervisor.take_retained_owner() else {
+                return Ok(());
+            };
+            owner = retained;
         }
 
-        // Cancel and join all server-owned consumers before asking magicsock
-        // to join its internal DERP/relay/UDP tasks. The task vector remains
-        // behind RunningState's mutex at every await, so timeout or caller
-        // cancellation retains ownership for a later close retry.
-        if let Some(inner) = self.inner.as_mut() {
-            if let Some(handle) = inner.localapi_handle.as_mut() {
-                handle.shutdown().await;
-            }
-            if let Some(serve) = inner.serve.as_ref() {
-                serve.stop().await;
-            }
-            if let Some(monitor) = inner.monitor.as_mut() {
-                monitor.shutdown_and_wait().await;
-            }
-            if let Err(error) = Self::join_running_tasks(inner).await {
-                return CloseResult(Err(error));
-            }
-            // LocalAPI EOF or connection-task cancellation never owns an
-            // admitted TKA init. Join its retained flight while every peer
-            // authority surface and route owner are still alive.
-            inner.tailnet_lock.join_init_flight().await;
-
-            inner.magicsock.set_connection_counter(None);
-            if let Some(netlog) = inner.netlog.as_ref() {
-                if let Err(error) = netlog.stop().await {
-                    log::warn!("tsnet: netlog shutdown failed (non-fatal): {error}");
+        // Initialize the process-lifetime runtime before moving the sole owner.
+        // Its JoinHandle is detached, not aborted, if this caller runtime dies.
+        let cleanup_runtime = lifecycle_cleanup_runtime();
+        let completion = shutdown_supervisor.begin_cleanup();
+        let cleanup_supervisor = Arc::clone(&shutdown_supervisor);
+        let cleanup = cleanup_runtime.spawn(async move {
+            let _completion = completion;
+            bootstrap_supervisor.wait().await;
+            startup_supervisor.wait().await;
+            shutdown_supervisor.wait_for_at_most(1).await;
+            drive.disable().await;
+            match cleanup_server_state(owner).await {
+                Ok(()) => Ok(()),
+                Err((owner, reason)) => {
+                    cleanup_supervisor.retain_owner(owner);
+                    Err(TsnetError::ShutdownIncomplete(format!(
+                        "server cleanup is busy or failed; retry close: {reason}"
+                    )))
                 }
             }
-            inner
-                .audit_logger
-                .flush_and_stop(std::time::Duration::from_secs(5))
-                .await;
-        }
-
-        let pre_started_magicsock = self
-            .pre_started
-            .as_ref()
-            .map(|pre_started| pre_started.magicsock.clone());
-        if let Some(magicsock) = pre_started_magicsock {
-            if let Err(error) = magicsock
-                .shutdown_portmapper(std::time::Duration::from_secs(5))
-                .await
-            {
-                return CloseResult(Err(TsnetError::Io(std::io::Error::other(format!(
-                    "pre-login portmapper cleanup incomplete: {error}"
-                )))));
-            }
-            if let Err(error) = magicsock.shutdown(std::time::Duration::from_secs(5)).await {
-                return CloseResult(Err(TsnetError::Io(std::io::Error::other(format!(
-                    "pre-login magicsock cleanup incomplete: {error}"
-                )))));
-            }
-        }
-
-        let magicsock = self.inner.as_ref().map(|inner| inner.magicsock.clone());
-        if let Some(magicsock) = magicsock {
-            if let Err(error) = magicsock
-                .shutdown_portmapper(std::time::Duration::from_secs(5))
-                .await
-            {
-                log::warn!("tsnet: retaining running state for portmapper cleanup retry: {error}");
-                return CloseResult(Err(TsnetError::Io(std::io::Error::other(format!(
-                    "portmapper cleanup incomplete: {error}"
-                )))));
-            }
-            if let Err(error) = magicsock.shutdown(std::time::Duration::from_secs(5)).await {
-                log::warn!("tsnet: retaining running state for magicsock cleanup retry: {error}");
-                return CloseResult(Err(TsnetError::Io(std::io::Error::other(format!(
-                    "magicsock cleanup incomplete: {error}"
-                )))));
-            }
-        }
-
-        // No awaits after this point: release fully stopped state atomically
-        // with respect to cancellation.
-        CloseResult(self.finish_profile_shutdown())
+        });
+        cleanup.await.map_err(|error| {
+            TsnetError::ShutdownIncomplete(format!("shutdown worker stopped: {error}"))
+        })?
     }
 
     /// Returns the logout trigger Notify, if the server is running.
@@ -2735,6 +3839,16 @@ impl Server {
             })
     }
 
+    /// Fail any LocalAPI logout request still waiting when daemon shutdown
+    /// intentionally stops durable transaction retries.
+    pub fn complete_pending_logout_requests(&self) {
+        self.logout_completion.complete(Ok(()));
+    }
+
+    pub fn fail_pending_logout_requests(&self, reason: impl Into<String>) {
+        self.logout_completion.complete(Err(reason.into()));
+    }
+
     /// Log out: send a logout register request to the control plane
     /// (expiring the node key), clear persisted state, transition the IPN
     /// backend to NeedsLogin, and tear down the running state.
@@ -2747,221 +3861,65 @@ impl Server {
     /// After logout, the server is in a `NeedsLogin` state. The daemon
     /// should call `start_localapi_only()` again to accept a new login.
     pub async fn logout(&mut self) -> Result<(), TsnetError> {
-        if self.inner.is_none() {
+        self.shutdown_supervisor.wait().await;
+        self.startup_supervisor.wait().await;
+
+        let transaction = if let Some(transaction) = self.shutdown_supervisor.take_retained_logout()
+        {
+            transaction
+        } else if self.inner.is_some() {
+            LogoutTransaction {
+                owner: CleanupOwner::take_from(self),
+                drive: Arc::clone(&self.drive),
+                control_url: self.config.control_url.clone(),
+                hostname: self.config.hostname.clone(),
+                state_dir: self.config.state_dir.clone(),
+                state_scope: self.profile_state_scope(),
+                tailnet_identity: String::new(),
+                prefs: self.load_prefs().unwrap_or_default(),
+                completion: Arc::clone(&self.logout_completion),
+                phase: LogoutPhase::Quiesce,
+                #[cfg(test)]
+                state_save_failures: std::mem::take(&mut self.logout_state_save_failures),
+            }
+        } else {
+            if self.shutdown_supervisor.has_retained_owner() {
+                return self.close().await;
+            }
             return Ok(());
-        }
-
-        // Revoke publication and synchronously abort map/control/TKA and all
-        // other outer consumers before the first await. Their join ownership
-        // stays in RunningState until the final no-await commit below.
-        self.begin_profile_shutdown();
-        if let Some(inner) = self.inner.as_mut() {
-            if !inner.logout_audit_enqueued {
-                if let Err(error) = inner
-                    .audit_logger
-                    .enqueue(rustscale_tailcfg::AuditNodeDisconnect, "logout")
-                {
-                    log::warn!("tsnet: failed to persist audit log (non-fatal): {error}");
-                }
-                inner.logout_audit_enqueued = true;
-            }
-        }
-
-        #[cfg(test)]
-        self.logout_checkpoint(LogoutAwaitPoint::DriveDisable).await;
-        self.drive.disable().await;
-
-        #[cfg(test)]
-        self.logout_checkpoint(LogoutAwaitPoint::PreLocalApi).await;
-        if let Some(pre_started) = self.pre_started.as_mut() {
-            if let Some(handle) = pre_started.handle.as_mut() {
-                handle.shutdown().await;
-            }
-        }
-
-        #[cfg(test)]
-        self.logout_checkpoint(LogoutAwaitPoint::RunningLocalApi)
-            .await;
-        if let Some(inner) = self.inner.as_mut() {
-            if let Some(handle) = inner.localapi_handle.as_mut() {
-                handle.shutdown().await;
-            }
-        }
-
-        #[cfg(test)]
-        self.logout_checkpoint(LogoutAwaitPoint::Serve).await;
-        if let Some(serve) = self.inner.as_ref().and_then(|inner| inner.serve.as_ref()) {
-            serve.stop().await;
-        }
-
-        #[cfg(test)]
-        self.logout_checkpoint(LogoutAwaitPoint::Monitor).await;
-        if let Some(inner) = self.inner.as_mut() {
-            if let Some(monitor) = inner.monitor.as_mut() {
-                monitor.shutdown_and_wait().await;
-            }
-        }
-
-        #[cfg(test)]
-        self.logout_checkpoint(LogoutAwaitPoint::Tasks).await;
-        if let Some(inner) = self.inner.as_mut() {
-            Self::join_running_tasks(inner).await?;
-            // Complete any admitted init before logout removes identity or
-            // route ownership. Its operation and publication barriers remain
-            // intact while the retained flight is joined.
-            inner.tailnet_lock.join_init_flight().await;
-            inner.magicsock.set_connection_counter(None);
-        }
-
-        #[cfg(test)]
-        self.logout_checkpoint(LogoutAwaitPoint::Netlog).await;
-        if let Some(netlog) = self.inner.as_ref().and_then(|inner| inner.netlog.as_ref()) {
-            if let Err(error) = netlog.stop().await {
-                log::warn!("tsnet: netlog shutdown failed (non-fatal): {error}");
-            }
-        }
-
-        #[cfg(test)]
-        self.logout_checkpoint(LogoutAwaitPoint::Audit).await;
-        if let Some(inner) = self.inner.as_ref() {
-            inner
-                .audit_logger
-                .flush_and_stop(std::time::Duration::from_secs(5))
-                .await;
-        }
-
-        // Expire the old node only after its map/TKA/control consumers have
-        // been joined. This standalone request is best effort and does not
-        // own any profile background task.
-        let (cc, logout_req) = {
-            let inner = self.inner.as_ref().expect("running state retained");
-            let cc = ControlClient::new(
-                &self.config.control_url,
-                inner.machine_key.clone(),
-                inner.server_pub_key.clone(),
-                PROTOCOL_VERSION,
-            );
-            let request = RegisterRequest {
-                Version: CAPABILITY_VERSION,
-                NodeKey: inner.node_key.public(),
-                Expiry: Some(
-                    chrono::DateTime::parse_from_rfc3339("1970-01-01T00:00:00Z")
-                        .unwrap()
-                        .with_timezone(&chrono::Utc),
-                ),
-                Hostinfo: Some(Hostinfo {
-                    OS: std::env::consts::OS.to_string(),
-                    Hostname: self.config.hostname.clone(),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            };
-            (cc, request)
         };
         #[cfg(test)]
-        self.logout_checkpoint(LogoutAwaitPoint::ControlLogout)
-            .await;
-        if let Err(e) = cc.register(&logout_req).await {
-            log::warn!("tsnet: logout register failed (non-fatal): {e}");
-        }
+        let logout_test_hook = self.logout_test_hook.take();
 
-        let pre_started_magicsock = self
-            .pre_started
-            .as_ref()
-            .map(|pre_started| pre_started.magicsock.clone());
-        #[cfg(test)]
-        self.logout_checkpoint(LogoutAwaitPoint::PrePortmapper)
-            .await;
-        if let Some(magicsock) = pre_started_magicsock.as_ref() {
-            magicsock
-                .shutdown_portmapper(std::time::Duration::from_secs(5))
-                .await
-                .map_err(|error| {
-                    TsnetError::Io(std::io::Error::other(format!(
-                        "pre-login portmapper cleanup incomplete: {error}"
-                    )))
-                })?;
-        }
-        #[cfg(test)]
-        self.logout_checkpoint(LogoutAwaitPoint::PreMagicsock).await;
-        if let Some(magicsock) = pre_started_magicsock {
-            magicsock
-                .shutdown(std::time::Duration::from_secs(5))
-                .await
-                .map_err(|error| {
-                    TsnetError::Io(std::io::Error::other(format!(
-                        "pre-login magicsock cleanup incomplete: {error}"
-                    )))
-                })?;
-        }
-
-        let magicsock = self
-            .inner
-            .as_ref()
-            .expect("running state retained")
-            .magicsock
-            .clone();
-        #[cfg(test)]
-        self.logout_checkpoint(LogoutAwaitPoint::RunningPortmapper)
-            .await;
-        magicsock
-            .shutdown_portmapper(std::time::Duration::from_secs(5))
-            .await
-            .map_err(|error| {
-                TsnetError::Io(std::io::Error::other(format!(
-                    "portmapper cleanup incomplete: {error}"
-                )))
-            })?;
-        #[cfg(test)]
-        self.logout_checkpoint(LogoutAwaitPoint::RunningMagicsock)
-            .await;
-        magicsock
-            .shutdown(std::time::Duration::from_secs(5))
-            .await
-            .map_err(|error| {
-                TsnetError::Io(std::io::Error::other(format!(
-                    "magicsock cleanup incomplete: {error}"
-                )))
-            })?;
-
-        // Durable local commit point. There are intentionally no awaits from
-        // the LoggedOut marker through key/cache clearing, backend transition,
-        // and RunningState removal. Any persistence failure retains the fully
-        // stopped state, blocking startup until logout or close is retried.
-        let mut prefs = self.load_prefs()?;
-        prefs.LoggedOut = true;
-        prefs.WantRunning = false;
-        if let Some(ref dir) = self.config.state_dir {
-            prefs
-                .save(dir)
-                .map_err(|error| TsnetError::Builder(error.to_string()))?;
-            self.save_state(&PersistedState::generate())?;
-            if let Some(scope) = self.profile_state_scope() {
-                NetMapCache::new_scoped(&scope, "").clear();
+        // Transfer the explicit transaction before the first cancellable
+        // await. The process-lifetime supervisor outlives the caller runtime;
+        // a durable failure retains both its phase and all data needed to
+        // resume, so it can never degrade into close-only success.
+        let cleanup_runtime = lifecycle_cleanup_runtime();
+        let completion = self.shutdown_supervisor.begin_cleanup();
+        let cleanup_supervisor = Arc::clone(&self.shutdown_supervisor);
+        let worker = cleanup_runtime.spawn(async move {
+            let _completion = completion;
+            #[cfg(test)]
+            if let Some((entered, release)) = logout_test_hook {
+                entered.wait().await;
+                release.wait().await;
             }
-        }
-
-        let backend = self
-            .inner
-            .as_ref()
-            .expect("running state retained")
-            .ipn_backend
-            .clone();
-        backend.set_logged_out(true);
-        backend.set_blocked(true);
-        backend.update_inputs(|inputs| {
-            inputs.want_running = false;
-            inputs.has_node_key = false;
-            inputs.auth_cant_continue = true;
-            inputs.netmap_present = false;
+            match logout_running_transaction(transaction).await {
+                Ok(()) => Ok(()),
+                Err((error, transaction)) => {
+                    log::warn!(
+                        "tsnet: logout paused at {:?} and was retained for retry: {error}",
+                        transaction.phase
+                    );
+                    cleanup_supervisor.retain_logout(transaction);
+                    Err(error)
+                }
+            }
         });
-        backend.bus().send(rustscale_ipn::Notify {
-            State: Some(rustscale_ipn::State::NeedsLogin),
-            Prefs: Some(serde_json::to_value(&prefs).unwrap_or_default()),
-            ..Default::default()
-        });
-
-        self.finish_profile_shutdown()
+        worker.await.map_err(|error| {
+            TsnetError::ShutdownIncomplete(format!("logout worker stopped: {error}"))
+        })?
     }
 
     /// Switch to profile `profile_id`, tearing down the running backend and
@@ -2980,8 +3938,8 @@ impl Server {
     /// 4. `up()` — re-bootstrap the engine, control client, and netstack.
     pub async fn switch_profile(&mut self, profile_id: &str) -> Result<(), TsnetError> {
         // 1. Stop the running engine (like close() but keep the config).
-        self.close().await.into_result()?;
-        Self::retry_pending_router_cleanup()?;
+        self.close().await?;
+        Self::retry_pending_router_cleanup().await?;
 
         // 2. Update current profile + prefs from the ProfileManager.
         //    (ProfileManager lives in state_dir on disk; reload it.)
@@ -3118,6 +4076,254 @@ impl Server {
 }
 
 #[cfg(test)]
+const DROP_CLEANUP_DEADLINE: std::time::Duration = std::time::Duration::from_millis(500);
+#[cfg(not(test))]
+const DROP_CLEANUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
+const DROP_CLEANUP_ATTEMPTS: usize = 3;
+
+/// Fail closed without awaiting user code. Graceful cleanup still gets bounded
+/// attempts afterwards, but no LocalAPI, map task, Taildrive grant, magicsock
+/// transport, or extension publication authority remains live while Drop
+/// waits. A router or user callback that ignores cancellation can only survive
+/// as a logged OS/user-code leak; the Drop cleanup thread never waits forever.
+fn revoke_owner_authority_terminal(owner: &mut CleanupOwner, drive: &crate::drive::Runtime) {
+    drive.disable_terminal();
+    if let Some(host) = owner.extension_host.as_ref() {
+        if host.revoke_publications_now() {
+            log::error!(
+                "tsnet: terminal cleanup: extension publication callback still executing; \
+                 callback is leaked rather than waited forever"
+            );
+        }
+    }
+    if let Some(inner) = owner.inner.as_mut() {
+        inner.cancel.cancel();
+        inner.health_watchdog.stop();
+        inner.extension_subscription.take();
+        inner.hostinfo_hooks.clear();
+        inner.map_tasks.begin_shutdown();
+        for abort in inner
+            .task_aborts
+            .lock()
+            .expect("server task abort lock poisoned")
+            .iter()
+        {
+            abort.abort();
+        }
+        if let Some(path) = inner.localapi_socket.take() {
+            let _ = std::fs::remove_file(path);
+        }
+        // Drop aborts the accept task and every child; no user handler is
+        // called from this terminal path.
+        inner.localapi_handle.take();
+        inner.magicsock.set_connection_counter(None);
+        inner.magicsock.request_shutdown();
+        inner.audit_logger.request_stop();
+        if let Some(netlog) = inner.netlog.as_ref() {
+            netlog.request_stop();
+        }
+    }
+    if let Some(pre_started) = owner.pre_started.as_mut() {
+        if let Some(path) = pre_started
+            .handle
+            .as_ref()
+            .map(|handle| handle.socket_path.clone())
+        {
+            let _ = std::fs::remove_file(path);
+        }
+        pre_started.handle.take();
+        let _ = std::fs::remove_file(&pre_started.socket_path);
+        if let Some(magicsock) = pre_started.magicsock.as_ref() {
+            magicsock.request_shutdown();
+        }
+    }
+}
+
+pub(crate) fn retain_terminal_logout(transaction: LogoutTransaction) {
+    static SENDER: std::sync::OnceLock<std::sync::mpsc::Sender<LogoutTransaction>> =
+        std::sync::OnceLock::new();
+    let sender = SENDER.get_or_init(|| {
+        let (sender, receiver) = std::sync::mpsc::channel::<LogoutTransaction>();
+        std::thread::Builder::new()
+            .name("rustscale-logout-continuation".into())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build terminal logout continuation runtime");
+                while let Ok(mut transaction) = receiver.recv() {
+                    let mut delay = std::time::Duration::from_millis(25);
+                    loop {
+                        revoke_owner_authority_terminal(&mut transaction.owner, &transaction.drive);
+                        match runtime.block_on(logout_running_transaction(transaction)) {
+                            Ok(()) => break,
+                            Err((error, retained)) => {
+                                transaction = retained;
+                                log::warn!(
+                                    "tsnet: terminal logout continuation retrying {:?}: {error}",
+                                    transaction.phase
+                                );
+                                std::thread::sleep(delay);
+                                delay = (delay * 2).min(std::time::Duration::from_secs(5));
+                            }
+                        }
+                    }
+                }
+            })
+            .expect("spawn terminal logout continuation worker");
+        sender
+    });
+    if let Err(error) = sender.send(transaction) {
+        // The worker can stop only after all senders disappear, which the
+        // process-global sender prevents. Preserve ownership even after an
+        // unexpected panic rather than silently degrading logout into close.
+        log::error!("tsnet: terminal logout continuation stopped; retaining leaked transaction");
+        std::mem::forget(Box::new(error.0));
+    }
+}
+
+async fn wait_cleanup_supervisor_until(
+    supervisor: &BootstrapSupervisor,
+    deadline: tokio::time::Instant,
+) -> bool {
+    tokio::time::timeout_at(deadline, supervisor.wait())
+        .await
+        .is_ok()
+}
+
+async fn finish_dropped_cleanup(
+    mut owner: CleanupOwner,
+    drive: Arc<crate::drive::Runtime>,
+    bootstrap_supervisor: Arc<BootstrapSupervisor>,
+    startup_supervisor: Arc<BootstrapSupervisor>,
+    shutdown_supervisor: Arc<BootstrapSupervisor>,
+) {
+    let deadline = tokio::time::Instant::now() + DROP_CLEANUP_DEADLINE;
+    revoke_owner_authority_terminal(&mut owner, &drive);
+    // Any in-flight logout worker that finishes after this point transfers its
+    // complete phase owner to the process-wide continuation. Move already
+    // retained transactions there before a bounded supervisor wait can expire.
+    shutdown_supervisor.mark_terminal();
+    while let Some(mut transaction) = shutdown_supervisor.take_retained_logout() {
+        revoke_owner_authority_terminal(&mut transaction.owner, &transaction.drive);
+        retain_terminal_logout(transaction);
+    }
+
+    for (name, supervisor) in [
+        ("bootstrap", &bootstrap_supervisor),
+        ("startup", &startup_supervisor),
+        ("shutdown", &shutdown_supervisor),
+    ] {
+        if !wait_cleanup_supervisor_until(supervisor, deadline).await {
+            log::error!(
+                "tsnet: terminal cleanup deadline waiting for {name} owner; \
+                 authority was revoked, remaining resources are intentionally leaked"
+            );
+            return;
+        }
+    }
+
+    let mut owners = Vec::new();
+    if !owner.is_empty() {
+        owners.push(owner);
+    }
+    while let Some(mut retained) = shutdown_supervisor.take_retained_owner() {
+        revoke_owner_authority_terminal(&mut retained, &drive);
+        owners.push(retained);
+    }
+    while let Some(mut transaction) = shutdown_supervisor.take_retained_logout() {
+        revoke_owner_authority_terminal(&mut transaction.owner, &transaction.drive);
+        retain_terminal_logout(transaction);
+    }
+
+    for mut owner in owners {
+        let _completion = shutdown_supervisor.begin_cleanup();
+        for attempt in 1..=DROP_CLEANUP_ATTEMPTS {
+            revoke_owner_authority_terminal(&mut owner, &drive);
+            drive.disable().await;
+            match tokio::time::timeout_at(deadline, cleanup_server_state(owner)).await {
+                Ok(Ok(())) => break,
+                Ok(Err((mut retained, reason))) => {
+                    log::warn!("tsnet: terminal cleanup retry required: {reason}");
+                    revoke_owner_authority_terminal(&mut retained, &drive);
+                    owner = retained;
+                    if attempt == DROP_CLEANUP_ATTEMPTS {
+                        log::error!(
+                            "tsnet: terminal cleanup exhausted {DROP_CLEANUP_ATTEMPTS} attempts; \
+                             leaking only revoked resources (router/extension cleanup incomplete)"
+                        );
+                        break;
+                    }
+                    let backoff = std::time::Duration::from_millis(25 * (1 << (attempt - 1)));
+                    if tokio::time::timeout_at(deadline, tokio::time::sleep(backoff))
+                        .await
+                        .is_err()
+                    {
+                        log::error!(
+                            "tsnet: terminal cleanup global deadline reached during backoff; \
+                             leaking only revoked resources"
+                        );
+                        break;
+                    }
+                }
+                Err(_) => {
+                    // The cleanup future (and its owner) is dropped here. All
+                    // admission was synchronously revoked before it started;
+                    // dropping this runtime aborts remaining cooperative tasks.
+                    log::error!(
+                        "tsnet: terminal cleanup global deadline reached; aborted joinable work \
+                         and leaked any non-cooperative user callback/router cleanup"
+                    );
+                    break;
+                }
+            }
+        }
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        let mut owner = CleanupOwner::take_from(self);
+        if owner.is_empty()
+            && !self.shutdown_supervisor.has_active_cleanup()
+            && !self.shutdown_supervisor.has_retained_owner()
+            && !self.shutdown_supervisor.has_retained_logout()
+        {
+            return;
+        }
+
+        let drive = Arc::clone(&self.drive);
+        // Revoke synchronously before relying on thread creation. Even an OS
+        // refusal to spawn the bounded worker cannot leave network authority.
+        revoke_owner_authority_terminal(&mut owner, &drive);
+        let bootstrap_supervisor = Arc::clone(&self.bootstrap_supervisor);
+        let startup_supervisor = Arc::clone(&self.startup_supervisor);
+        let shutdown_supervisor = Arc::clone(&self.shutdown_supervisor);
+        if let Err(error) = std::thread::Builder::new()
+            .name("rustscale-server-drop".into())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build server drop cleanup runtime");
+                runtime.block_on(finish_dropped_cleanup(
+                    owner,
+                    drive,
+                    bootstrap_supervisor,
+                    startup_supervisor,
+                    shutdown_supervisor,
+                ));
+            })
+        {
+            log::error!(
+                "tsnet: failed to spawn bounded Drop cleanup worker: {error}; \
+                 resources were revoked and are terminally leaked"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod exit_cleanup_tests {
     use super::*;
     use crate::tun_pump::ManagedRouter;
@@ -3125,6 +4331,38 @@ mod exit_cleanup_tests {
 
     struct RetryCleanupRouter {
         closes: Arc<AtomicUsize>,
+    }
+
+    struct BlockingCleanupRouter {
+        entered: std::sync::mpsc::Sender<()>,
+        release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    impl rustscale_router::Router for BlockingCleanupRouter {
+        fn up(&mut self) -> Result<(), rustscale_router::RouterError> {
+            Ok(())
+        }
+
+        fn set(
+            &mut self,
+            _config: &rustscale_router::RouterConfig,
+        ) -> Result<(), rustscale_router::RouterError> {
+            Ok(())
+        }
+
+        fn close(&mut self) -> Result<(), rustscale_router::RouterError> {
+            let _ = self.entered.send(());
+            let (lock, changed) = &*self.release;
+            let mut released = lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            while !*released {
+                released = changed
+                    .wait(released)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            Ok(())
+        }
     }
 
     impl rustscale_router::Router for RetryCleanupRouter {
@@ -3150,8 +4388,51 @@ mod exit_cleanup_tests {
         }
     }
 
-    #[test]
-    fn cleanup_owner_survives_failure_and_blocks_until_retry_succeeds() {
+    #[tokio::test]
+    async fn blocking_router_close_times_out_off_runtime_and_remains_retryable() {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let owner = Arc::new(std::sync::Mutex::new(ManagedRouter {
+            router: Box::new(BlockingCleanupRouter {
+                entered: entered_tx,
+                release: Arc::clone(&release),
+            }),
+            tun_name: "rustscale-blocked0".into(),
+            exit_node: false,
+            security_block_attempted: false,
+            security_block_verified: false,
+            security_block_reasons: 0,
+        }));
+
+        let heartbeat = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            true
+        });
+        let started = tokio::time::Instant::now();
+        let error = wait_router_cleanup(&owner).await.unwrap_err();
+        assert!(error.to_string().contains("bounded worker deadline"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(heartbeat.await.unwrap(), "router close blocked the runtime");
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("router worker did not enter close");
+
+        let (lock, changed) = &*release;
+        *lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        changed.notify_all();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            wait_router_cleanup(&owner),
+        )
+        .await
+        .expect("router cleanup retry remained blocked")
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cleanup_owner_survives_failure_and_blocks_until_retry_succeeds() {
         let closes = Arc::new(AtomicUsize::new(0));
         let owner = Arc::new(std::sync::Mutex::new(ManagedRouter {
             router: Box::new(RetryCleanupRouter {
@@ -3164,13 +4445,13 @@ mod exit_cleanup_tests {
             security_block_reasons: 0,
         }));
         Server::router_cleanup_supervisor().lock().unwrap().clear();
-        assert!(Server::cleanup_or_supervise(owner).is_err());
+        assert!(Server::cleanup_or_supervise(owner).await.is_err());
         assert_eq!(Server::router_cleanup_supervisor().lock().unwrap().len(), 1);
 
         // Restart admission remains blocked while cleanup is still dirty.
-        assert!(Server::retry_pending_router_cleanup().is_err());
+        assert!(Server::retry_pending_router_cleanup().await.is_err());
         assert_eq!(Server::router_cleanup_supervisor().lock().unwrap().len(), 1);
-        Server::retry_pending_router_cleanup().unwrap();
+        Server::retry_pending_router_cleanup().await.unwrap();
         assert!(Server::router_cleanup_supervisor()
             .lock()
             .unwrap()

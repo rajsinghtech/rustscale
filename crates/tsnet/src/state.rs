@@ -137,6 +137,17 @@ impl PersistedState {
         }
     }
 
+    /// Rotate enrollment identity for logout while preserving the durable
+    /// profile/control/tailnet binding and Tailnet Lock signing identity.
+    pub(crate) fn rotated_for_logout(&self) -> Self {
+        let mut rotated = Self::generate();
+        rotated.profile_id.clone_from(&self.profile_id);
+        rotated.control_identity.clone_from(&self.control_identity);
+        rotated.tailnet_identity.clone_from(&self.tailnet_identity);
+        rotated.network_lock_key.clone_from(&self.network_lock_key);
+        rotated
+    }
+
     /// Whether all keys are zero (uninitialized).
     pub fn is_zero(&self) -> bool {
         self.node_key.is_zero() && self.machine_key.is_zero() && self.disco_key.is_zero()
@@ -429,6 +440,33 @@ mod tests {
         assert_eq!(loaded.node_id, 12345);
         assert_eq!(loaded.stable_node_id, "nodeABC");
         assert!(loaded.is_enrolled());
+    }
+
+    #[test]
+    fn logout_rotates_enrollment_but_preserves_lock_identity_and_binding() {
+        let state = PersistedState {
+            profile_id: "profile".into(),
+            control_identity: "control".into(),
+            tailnet_identity: "tailnet".into(),
+            node_id: 42,
+            stable_node_id: "stable".into(),
+            enrolled: true,
+            old_node_key: Some(NodePrivate::generate()),
+            ..PersistedState::generate()
+        };
+        let rotated = state.rotated_for_logout();
+
+        assert_ne!(rotated.node_key, state.node_key);
+        assert_ne!(rotated.machine_key, state.machine_key);
+        assert_ne!(rotated.disco_key, state.disco_key);
+        assert_eq!(rotated.network_lock_key, state.network_lock_key);
+        assert_eq!(rotated.profile_id, state.profile_id);
+        assert_eq!(rotated.control_identity, state.control_identity);
+        assert_eq!(rotated.tailnet_identity, state.tailnet_identity);
+        assert_eq!(rotated.node_id, 0);
+        assert!(rotated.stable_node_id.is_empty());
+        assert!(!rotated.enrolled);
+        assert!(rotated.old_node_key.is_none());
     }
 
     #[test]

@@ -12,9 +12,10 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
 #[cfg(target_os = "linux")]
-use std::{os::fd::AsRawFd, time::Duration};
+use std::os::fd::AsRawFd;
+use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -124,10 +125,13 @@ impl ServerShared {
 pub struct DerpServerHandle {
     /// Shared state (kept alive so client tasks can finish).
     shared: Arc<ServerShared>,
-    /// Join handle for the accept loop.
-    accept_task: JoinHandle<()>,
+    /// Cancellation and owned join handle for accept + connection children.
+    shutdown: tokio::sync::watch::Sender<bool>,
+    accept_task: Option<JoinHandle<()>>,
     /// The address the server is listening on.
     addr: SocketAddr,
+    #[cfg(test)]
+    accepted: Arc<tokio::sync::Notify>,
 }
 
 impl DerpServerHandle {
@@ -141,9 +145,39 @@ impl DerpServerHandle {
         self.shared.public_key.clone()
     }
 
-    /// Stop the server gracefully: drop the accept loop and close the listener.
+    #[cfg(test)]
+    async fn wait_for_accept(&self) {
+        self.accepted.notified().await;
+    }
+
+    /// Stop accepting, then abort and join blocked connection children after
+    /// a bounded drain period.
+    pub async fn shutdown_and_wait(mut self) {
+        let _ = self.shutdown.send(true);
+        if let Some(task) = self.accept_task.take() {
+            let _ = task.await;
+        }
+    }
+
+    /// Request shutdown. Cleanup ownership transfers to an independent waiter;
+    /// use [`shutdown_and_wait`](Self::shutdown_and_wait) when completion is required.
     pub fn shutdown(self) {
-        self.accept_task.abort();
+        drop(self);
+    }
+}
+
+impl Drop for DerpServerHandle {
+    fn drop(&mut self) {
+        let _ = self.shutdown.send(true);
+        if let Some(task) = self.accept_task.take() {
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(async move {
+                    let _ = task.await;
+                });
+            } else {
+                task.abort();
+            }
+        }
     }
 }
 
@@ -177,10 +211,22 @@ impl DerpServer {
         });
 
         let shared_clone = shared.clone();
+        let (shutdown, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        #[cfg(test)]
+        let accepted = Arc::new(tokio::sync::Notify::new());
+        #[cfg(test)]
+        let task_accepted = Arc::clone(&accepted);
         let accept_task = tokio::spawn(async move {
+            let mut children = tokio::task::JoinSet::new();
             loop {
-                match listener.accept().await {
+                tokio::select! {
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_err() || *shutdown_rx.borrow() { break; }
+                    },
+                    accepted = listener.accept() => match accepted {
                     Ok((stream, _peer)) => {
+                        #[cfg(test)]
+                        task_accepted.notify_one();
                         #[cfg(target_os = "linux")]
                         if let Err(error) = rustscale_ktimeout::set_user_timeout(
                             stream.as_raw_fd(),
@@ -189,17 +235,30 @@ impl DerpServer {
                             eprintln!("derp: unable to set TCP_USER_TIMEOUT: {error}");
                         }
                         let s = shared_clone.clone();
-                        tokio::spawn(handle_connection(s, stream));
+                        children.spawn(handle_connection(s, stream));
                     }
                     Err(_) => break,
+                },
+                    Some(_) = children.join_next(), if !children.is_empty() => {}
                 }
+            }
+            let drain = async { while children.join_next().await.is_some() {} };
+            if tokio::time::timeout(Duration::from_secs(1), drain)
+                .await
+                .is_err()
+            {
+                children.abort_all();
+                while children.join_next().await.is_some() {}
             }
         });
 
         let handle = DerpServerHandle {
             shared,
-            accept_task,
+            shutdown,
+            accept_task: Some(accept_task),
             addr,
+            #[cfg(test)]
+            accepted,
         };
         Ok((addr, handle))
     }
@@ -388,25 +447,23 @@ async fn serve_client(
         }
     }
 
-    // Start the send loop with the writer.
-    let send_task = tokio::spawn(async move {
-        send_loop(write_half, &mut send_rx).await;
-    });
-
     // 4. Register the client.
     let close_notify = shared
         .register_client(client_key.clone(), send_tx.clone())
         .await;
 
-    // 5. Run the read loop.
-    run_read_loop(
-        &shared,
-        &mut read_half,
-        &client_key,
-        &send_tx,
-        &close_notify,
-    )
-    .await;
+    // 5. Run read/write in this owned connection future. No nested task can
+    // outlive the accept loop's JoinSet entry.
+    tokio::select! {
+        () = run_read_loop(
+            &shared,
+            &mut read_half,
+            &client_key,
+            &send_tx,
+            &close_notify,
+        ) => {}
+        () = send_loop(write_half, &mut send_rx) => {}
+    }
 
     // 6. Unregister and broadcast PeerGone (only if we're still the active
     //    client for this key — a replacement connection may have taken over).
@@ -417,9 +474,8 @@ async fn serve_client(
             .await;
     }
 
-    // 7. Signal send loop to finish and wait.
+    // 7. Dropping the sender/receiver state closes the connection.
     drop(send_tx);
-    let _ = send_task.await;
 }
 
 /// Receive and parse the ClientInfo frame.
@@ -680,6 +736,21 @@ mod tests {
             .await
             .expect("recv timeout")
             .expect("recv error")
+    }
+
+    #[tokio::test]
+    async fn shutdown_joins_blocked_connection_and_releases_listener() {
+        let (addr, handle) = DerpServer::with_random_key().spawn_local().await.unwrap();
+        let blocked = TcpStream::connect(addr).await.unwrap();
+        handle.wait_for_accept().await;
+        tokio::time::timeout(Duration::from_secs(2), handle.shutdown_and_wait())
+            .await
+            .expect("DERP blocked connection was not aborted and joined");
+        drop(blocked);
+        let rebound = TcpListener::bind(addr)
+            .await
+            .expect("DERP listener remained bound after joined shutdown");
+        drop(rebound);
     }
 
     /// Two clients connect to the local server and exchange packets both

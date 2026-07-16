@@ -45,7 +45,7 @@ use rustscale_safesocket::ServerStream;
 use rustscale_tailcfg::{DERPMap, DNSConfig, Node, UserID, UserProfile};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, RwLock};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 
 use crate::serve::ServeConfig;
 use crate::tls::{AcmeCertFetcher, ControlCertProvider};
@@ -70,6 +70,39 @@ pub enum DaemonCommand {
     /// Fired by `POST /localapi/v0/profiles/<id>`. Mirrors Go's
     /// `LocalBackend.SwitchProfile` → `resetForProfileChangeLocked`.
     SwitchProfile(String),
+}
+
+pub(crate) struct LogoutCompletion {
+    waiters: std::sync::Mutex<Vec<tokio::sync::oneshot::Sender<Result<(), String>>>>,
+}
+
+impl LogoutCompletion {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            waiters: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    fn register(&self) -> tokio::sync::oneshot::Receiver<Result<(), String>> {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        self.waiters
+            .lock()
+            .expect("logout completion lock poisoned")
+            .push(sender);
+        receiver
+    }
+
+    pub(crate) fn complete(&self, result: Result<(), String>) {
+        let waiters = std::mem::take(
+            &mut *self
+                .waiters
+                .lock()
+                .expect("logout completion lock poisoned"),
+        );
+        for waiter in waiters {
+            let _ = waiter.send(result.clone());
+        }
+    }
 }
 
 /// Credentials needed to build an [`AcmeCertFetcher`] on demand for the
@@ -155,10 +188,91 @@ pub(crate) fn new_routecheck_client(
     ))
 }
 
+/// Serializes mutation admission across LocalAPI listener generations.
+///
+/// A handoff advances `epoch` while holding `gate`, before the replacement
+/// snapshots preferences. Accepted handlers from the old listener must obtain
+/// the same gate and match their generation before persisting any mutation.
+#[derive(Debug)]
+pub(crate) struct LocalApiMutationFence {
+    epoch: std::sync::atomic::AtomicU64,
+    gate: tokio::sync::Mutex<()>,
+}
+
+impl LocalApiMutationFence {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            epoch: std::sync::atomic::AtomicU64::new(1),
+            gate: tokio::sync::Mutex::new(()),
+        })
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.epoch.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) async fn advance(
+        self: &Arc<Self>,
+        expected: u64,
+    ) -> Result<LocalApiGenerationHandoff, String> {
+        let _gate = self.gate.lock().await;
+        if self.generation() != expected {
+            return Err("LocalAPI mutation generation changed during handoff".into());
+        }
+        let replacement = expected.checked_add(1).unwrap_or(1);
+        self.epoch
+            .store(replacement, std::sync::atomic::Ordering::Release);
+        Ok(LocalApiGenerationHandoff {
+            fence: Arc::clone(self),
+            previous: expected,
+            replacement,
+            committed: false,
+        })
+    }
+
+    async fn admit(&self, expected: u64) -> Option<tokio::sync::MutexGuard<'_, ()>> {
+        let gate = self.gate.lock().await;
+        (self.generation() == expected).then_some(gate)
+    }
+}
+
+/// Rollback owner for a prepared mutation-generation transition.
+pub(crate) struct LocalApiGenerationHandoff {
+    fence: Arc<LocalApiMutationFence>,
+    previous: u64,
+    replacement: u64,
+    committed: bool,
+}
+
+impl LocalApiGenerationHandoff {
+    pub(crate) fn replacement(&self) -> u64 {
+        self.replacement
+    }
+
+    pub(crate) fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for LocalApiGenerationHandoff {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = self.fence.epoch.compare_exchange(
+                self.replacement,
+                self.previous,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            );
+        }
+    }
+}
+
 /// Shared state for the LocalAPI server — all fields are Arc clones of the
 /// same state held by [`crate::RunningState`], so the API always sees live
 /// data without explicit refresh.
 pub(crate) struct LocalApiState {
+    pub mutation_fence: Arc<LocalApiMutationFence>,
+    pub mutation_generation: u64,
     pub peers: Arc<RwLock<Vec<Node>>>,
     /// HA subnet-router reachability checker. Unavailable before the first netmap.
     pub routecheck: Option<Arc<rustscale_routecheck::Client>>,
@@ -173,6 +287,8 @@ pub(crate) struct LocalApiState {
     /// renders them via `to_prometheus_text()`.
     pub metrics: MetricRegistry,
     pub prefs: Arc<RwLock<Prefs>>,
+    /// Serializes profile/preference commits and notification enqueue order.
+    pub profile_mutations: Arc<tokio::sync::Mutex<()>>,
     /// Pending persisted exit-node selection, retried only until it resolves.
     pub exit_node_selection: Arc<RwLock<crate::ExitNodeSelection>>,
     pub tailscale_ips: Vec<IpAddr>,
@@ -232,6 +348,9 @@ pub(crate) struct LocalApiState {
     /// and transition to NeedsLogin. The daemon selects on this alongside
     /// shutdown signals.
     pub logout_trigger: Arc<tokio::sync::Notify>,
+    /// Completion channel for LocalAPI logout requests. A response is emitted
+    /// only after the resumable logout transaction reaches durable commit.
+    pub(crate) logout_completion: Arc<LogoutCompletion>,
     /// Control-suggested exit node (StableNodeID). Set by the map_update
     /// task from `MapResponse.SuggestedExitNode`.
     #[allow(dead_code)]
@@ -289,13 +408,7 @@ async fn reconcile_preference_policy_until_stable(
     };
     loop {
         let before = policy.generation();
-        let (updated, changed) = commit_prefs_update(state, |_| {}).await?;
-        if changed {
-            state.ipn_backend.bus().send(rustscale_ipn::Notify {
-                Prefs: Some(updated),
-                ..Default::default()
-            });
-        }
+        let _ = commit_prefs_update(state, |_| {}).await?;
         if before == policy.generation() {
             return Ok(());
         }
@@ -306,6 +419,8 @@ async fn commit_prefs_update(
     state: &Arc<LocalApiState>,
     mutate: impl FnOnce(&mut Prefs),
 ) -> Result<(serde_json::Value, bool), String> {
+    let commit = state.profile_mutations.lock().await;
+    let profile = current_login_profile(state).await;
     let mut prefs = state.prefs.write().await;
     let mut candidate = prefs.clone();
     mutate(&mut candidate);
@@ -324,51 +439,61 @@ async fn commit_prefs_update(
     state
         .posture_checking
         .store(prefs.PostureChecking, std::sync::atomic::Ordering::Release);
-    Ok((serde_json::to_value(&*prefs).unwrap_or_default(), changed))
+    let snapshot = prefs.clone();
+    let updated = serde_json::to_value(&snapshot).unwrap_or_default();
+    let notification = state
+        .ipn_backend
+        .queue_profile_state(profile, snapshot, true);
+    drop(prefs);
+    drop(commit);
+    state.ipn_backend.dispatch_profile_state(notification);
+    Ok((updated, changed))
 }
 
 pub struct LocalApiHandle {
-    pub task: Option<JoinHandle<()>>,
+    task: Option<JoinHandle<()>>,
+    cancel: Arc<crate::CancelToken>,
+    #[cfg(all(test, unix))]
+    accepted: Arc<tokio::sync::Notify>,
     pub socket_path: PathBuf,
-    shutdown_tx: tokio::sync::watch::Sender<bool>,
-    armed: bool,
+    unlink_on_drop: bool,
 }
 
 impl LocalApiHandle {
-    /// Revoke the published socket before any asynchronous shutdown work.
-    /// The task handle remains owned here so a cancelled caller can retry and
-    /// still join the accept loop and all connection tasks.
-    pub(crate) fn begin_shutdown(&mut self) {
-        self.shutdown_tx.send_replace(true);
-        let _ = std::fs::remove_file(&self.socket_path);
+    /// Stop accepting, then give active requests a bounded drain window before
+    /// aborting and joining any blocked handlers.
+    #[cfg(all(test, unix))]
+    async fn wait_for_accept(&self) {
+        self.accepted.notified().await;
     }
 
-    pub(crate) async fn shutdown(&mut self) {
-        self.begin_shutdown();
-        if let Some(task) = self.task.as_mut() {
-            if tokio::time::timeout(std::time::Duration::from_secs(5), &mut *task)
-                .await
-                .is_err()
-            {
-                task.abort();
-                let _ = (&mut *task).await;
-            }
+    pub async fn shutdown(mut self) {
+        self.cancel.cancel();
+        if let Some(task) = self.task.take() {
+            let _ = task.await;
         }
-        self.task.take();
-        self.armed = false;
+        if self.unlink_on_drop {
+            let _ = std::fs::remove_file(&self.socket_path);
+        }
+    }
+
+    /// Join this listener without unlinking its recorded path. Used only when
+    /// an atomic handoff has already republished another listener there.
+    pub(crate) async fn shutdown_preserving_path(mut self) {
+        self.unlink_on_drop = false;
+        self.shutdown().await;
     }
 }
 
 impl Drop for LocalApiHandle {
     fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        self.shutdown_tx.send_replace(true);
-        if let Some(task) = &self.task {
+        self.cancel.cancel();
+        if let Some(task) = self.task.as_ref() {
             task.abort();
         }
-        let _ = std::fs::remove_file(&self.socket_path);
+        if self.unlink_on_drop {
+            let _ = std::fs::remove_file(&self.socket_path);
+        }
     }
 }
 
@@ -385,70 +510,154 @@ pub(crate) fn spawn_localapi(
     state: Arc<LocalApiState>,
     socket_path: PathBuf,
 ) -> Option<LocalApiHandle> {
-    #[cfg(unix)]
-    let (listener, path) = {
-        static NEXT_SOCKET: AtomicU64 = AtomicU64::new(0);
-        let sequence = NEXT_SOCKET.fetch_add(1, Ordering::Relaxed);
-        let file_name = socket_path.file_name()?.to_string_lossy();
-        let bind_path = socket_path.with_file_name(format!(
-            ".{file_name}.swap-{}-{sequence}",
-            std::process::id()
-        ));
-        let listener = rustscale_safesocket::listen(&bind_path).ok()?;
-        if std::fs::rename(&bind_path, &socket_path).is_err() {
-            drop(listener);
-            let _ = std::fs::remove_file(bind_path);
-            return None;
-        }
-        (listener, socket_path.clone())
-    };
-    #[cfg(not(unix))]
-    let (listener, path) = (
-        rustscale_safesocket::listen(&socket_path).ok()?,
-        socket_path.clone(),
-    );
+    spawn_localapi_inner(state, socket_path, None)
+}
 
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
-    let task_shutdown_tx = shutdown_tx.clone();
+/// Transactionally publish a bound replacement while deferring acceptance
+/// until all remaining startup work commits.
+pub(crate) struct LocalApiPathHandoff {
+    #[cfg(unix)]
+    advertised_path: PathBuf,
+    #[cfg(unix)]
+    staging_path: PathBuf,
+}
+
+impl LocalApiPathHandoff {
+    /// Atomically publish the already-bound paused listener. Preparation never
+    /// renames, unlinks, or hard-links the advertised endpoint; therefore any
+    /// error leaves the old listener published and rollback only removes the
+    /// private staging socket.
+    #[cfg_attr(not(unix), allow(clippy::unused_self))]
+    pub(crate) fn commit(&mut self, handle: &mut LocalApiHandle) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            std::fs::rename(&self.staging_path, &self.advertised_path)?;
+            handle.socket_path.clone_from(&self.advertised_path);
+        }
+        #[cfg(not(unix))]
+        let _ = handle;
+        Ok(())
+    }
+}
+
+/// Bind a paused replacement without modifying the live advertised endpoint.
+///
+/// On Unix the replacement remains at a private sibling path until final
+/// synchronous commit atomically renames it over the old pathname. Dropping a
+/// prepared transaction leaves the old pathname untouched. Windows named
+/// pipes support multiple server instances under one name, so a second paused
+/// instance can be created directly without changing a path.
+pub(crate) fn spawn_localapi_paused(
+    state: Arc<LocalApiState>,
+    socket_path: PathBuf,
+) -> Option<(
+    LocalApiHandle,
+    tokio::sync::oneshot::Sender<()>,
+    LocalApiPathHandoff,
+)> {
+    #[cfg(unix)]
+    {
+        static NEXT_HANDOFF: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let nonce = NEXT_HANDOFF.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let staging_name = format!(".rustscale-handoff-{}-{nonce}.sock", std::process::id());
+        let staging_path = socket_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join(staging_name);
+        spawn_localapi_paused_at_paths(state, socket_path, staging_path)
+    }
+
+    #[cfg(not(unix))]
+    {
+        let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+        let handle = spawn_localapi_inner(state, socket_path, Some(start_rx))?;
+        Some((handle, start_tx, LocalApiPathHandoff {}))
+    }
+}
+
+#[cfg(unix)]
+fn spawn_localapi_paused_at_paths(
+    state: Arc<LocalApiState>,
+    socket_path: PathBuf,
+    staging_path: PathBuf,
+) -> Option<(
+    LocalApiHandle,
+    tokio::sync::oneshot::Sender<()>,
+    LocalApiPathHandoff,
+)> {
+    let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+
+    // Only the private staging pathname is created during preparation. The
+    // advertised live path remains byte-for-byte untouched until commit.
+    let handle = spawn_localapi_inner(state, staging_path.clone(), Some(start_rx))?;
+    Some((
+        handle,
+        start_tx,
+        LocalApiPathHandoff {
+            advertised_path: socket_path,
+            staging_path,
+        },
+    ))
+}
+
+fn spawn_localapi_inner(
+    state: Arc<LocalApiState>,
+    socket_path: PathBuf,
+    start_rx: Option<tokio::sync::oneshot::Receiver<()>>,
+) -> Option<LocalApiHandle> {
+    let listener = rustscale_safesocket::listen(&socket_path).ok()?;
+
+    let path = socket_path.clone();
+    let cancel = Arc::new(crate::CancelToken::new());
+    #[cfg(all(test, unix))]
+    let accepted = Arc::new(tokio::sync::Notify::new());
+    let task_cancel = Arc::clone(&cancel);
+    #[cfg(all(test, unix))]
+    let task_accepted = Arc::clone(&accepted);
     let task = tokio::spawn(async move {
-        // Keep the channel open when ownership is transferred into the normal
-        // RunningState task list, which intentionally drops LocalApiHandle.
-        let _task_shutdown_tx = task_shutdown_tx;
-        let mut connections = tokio::task::JoinSet::new();
-        loop {
-            tokio::select! {
-                biased;
-                changed = shutdown_rx.changed() => {
-                    if changed.is_err() || *shutdown_rx.borrow() {
-                        break;
-                    }
-                }
-                result = listener.accept() => {
-                    match result {
-                        Ok(stream) => {
-                            let peer_identity = peer_identity_from_stream(&stream);
-                            let state = state.clone();
-                            connections.spawn(async move {
-                                if let Err(e) = handle_connection(stream, &state, peer_identity).await {
-                                    log::warn!("localapi: connection error: {e}");
-                                }
-                            });
-                        }
-                        Err(e) => log::warn!("localapi: accept error: {e}"),
-                    }
-                }
-                _ = connections.join_next(), if !connections.is_empty() => {}
+        if let Some(start_rx) = start_rx {
+            if start_rx.await.is_err() {
+                return;
             }
         }
-        connections.abort_all();
-        while connections.join_next().await.is_some() {}
+        let mut children = JoinSet::new();
+        loop {
+            tokio::select! {
+                () = task_cancel.cancelled() => break,
+                accepted = listener.accept() => match accepted {
+                    Ok(stream) => {
+                        #[cfg(all(test, unix))]
+                        task_accepted.notify_one();
+                        let peer_identity = peer_identity_from_stream(&stream);
+                        let state = state.clone();
+                        children.spawn(async move {
+                            if let Err(e) = handle_connection(stream, &state, peer_identity).await {
+                                log::warn!("localapi: connection error: {e}");
+                            }
+                        });
+                    }
+                    Err(e) => log::warn!("localapi: accept error: {e}"),
+                },
+                Some(_) = children.join_next(), if !children.is_empty() => {}
+            }
+        }
+        let drain = async { while children.join_next().await.is_some() {} };
+        if tokio::time::timeout(std::time::Duration::from_secs(1), drain)
+            .await
+            .is_err()
+        {
+            children.abort_all();
+            while children.join_next().await.is_some() {}
+        }
     });
 
     Some(LocalApiHandle {
         task: Some(task),
+        cancel,
+        #[cfg(all(test, unix))]
+        accepted,
         socket_path: path,
-        shutdown_tx,
-        armed: true,
+        unlink_on_drop: true,
     })
 }
 
@@ -650,6 +859,14 @@ async fn write_no_content_response<W: AsyncWrite + Unpin>(
 // Start / login-interactive / logout / prefs handlers
 // ---------------------------------------------------------------------------
 
+async fn current_login_profile(state: &LocalApiState) -> LoginProfile {
+    let current_id = state.current_profile.read().await.clone();
+    let profiles = state.profiles.read().await;
+    current_id
+        .and_then(|id| profiles.iter().find(|profile| profile.ID == id).cloned())
+        .unwrap_or_default()
+}
+
 async fn handle_start<W: AsyncWrite + Unpin>(
     conn: &mut W,
     body: &[u8],
@@ -669,8 +886,8 @@ async fn handle_start<W: AsyncWrite + Unpin>(
     };
 
     if let Some(ref mask) = opts.UpdatePrefs {
-        let updated = match commit_prefs_update(state, |prefs| mask.apply_to(prefs)).await {
-            Ok((updated, _)) => updated,
+        match commit_prefs_update(state, |prefs| mask.apply_to(prefs)).await {
+            Ok(_) => {}
             Err(error) => {
                 write_json_response(
                     conn,
@@ -681,11 +898,7 @@ async fn handle_start<W: AsyncWrite + Unpin>(
                 .await?;
                 return Ok(());
             }
-        };
-        state.ipn_backend.bus().send(rustscale_ipn::Notify {
-            Prefs: Some(updated),
-            ..Default::default()
-        });
+        }
     }
 
     if let Some(ref tx) = state.command_tx {
@@ -705,36 +918,35 @@ async fn handle_logout<W: AsyncWrite + Unpin>(
     conn: &mut W,
     state: &Arc<LocalApiState>,
 ) -> Result<(), std::io::Error> {
-    let (updated, _) = match commit_prefs_update(state, |prefs| {
-        prefs.LoggedOut = true;
-        prefs.WantRunning = false;
-    })
-    .await
-    {
-        Ok(result) => result,
-        Err(error) => {
-            write_json_response(
-                conn,
-                500,
-                "Internal Server Error",
-                &serde_json::json!({"error": error}),
-            )
-            .await?;
-            return Ok(());
-        }
-    };
-    state.ipn_backend.set_auth_cant_continue(true);
-    state.ipn_backend.set_logged_out(true);
-    state.ipn_backend.set_blocked(true);
-    state.ipn_backend.bus().send(rustscale_ipn::Notify {
-        Prefs: Some(updated),
-        ..Default::default()
-    });
+    // Register before notifying so even an immediately completing daemon
+    // transaction cannot race the HTTP waiter. Preferences, identity, and
+    // cache are committed only by Server::logout's resumable transaction.
+    let completion = state.logout_completion.register();
     if let Some(ref tx) = state.command_tx {
         let _ = tx.send(DaemonCommand::Logout);
     }
     state.logout_trigger.notify_waiters();
-    write_no_content_response(conn, 204, "No Content").await?;
+    match completion.await {
+        Ok(Ok(())) => write_no_content_response(conn, 204, "No Content").await?,
+        Ok(Err(error)) => {
+            write_json_response(
+                conn,
+                503,
+                "Service Unavailable",
+                &serde_json::json!({"error": error}),
+            )
+            .await?;
+        }
+        Err(_) => {
+            write_json_response(
+                conn,
+                503,
+                "Service Unavailable",
+                &serde_json::json!({"error": "logout completion owner stopped"}),
+            )
+            .await?;
+        }
+    }
     Ok(())
 }
 
@@ -762,16 +974,21 @@ async fn handle_reload_config<W: AsyncWrite + Unpin>(
     };
 
     let masked = config.parsed.to_prefs();
-    let _exit_map_guard = state.exit_map_gate.lock().await;
-    let authorization_changed = masked.ShieldsUpSet
-        || masked.ExitNodeAllowLANAccessSet
-        || masked.ExitNodeIDSet
-        || masked.ExitNodeIPSet;
+    let exit_node_changed =
+        masked.ExitNodeAllowLANAccessSet || masked.ExitNodeIDSet || masked.ExitNodeIPSet;
+    let exit_map_guard = if exit_node_changed {
+        Some(state.exit_map_gate.lock().await)
+    } else {
+        None
+    };
+    let authorization_changed = masked.ShieldsUpSet || exit_node_changed;
     let map_commit = if authorization_changed {
         Some(state.peer_map.gate.write().await)
     } else {
         None
     };
+    let profile_commit = state.profile_mutations.lock().await;
+    let profile = current_login_profile(state).await;
     let mut prefs_guard = state.prefs.write().await;
     let old_prefs = prefs_guard.clone();
     let mut next_prefs = old_prefs.clone();
@@ -788,8 +1005,6 @@ async fn handle_reload_config<W: AsyncWrite + Unpin>(
             return Ok(());
         }
     }
-    let exit_node_changed =
-        masked.ExitNodeAllowLANAccessSet || masked.ExitNodeIDSet || masked.ExitNodeIPSet;
     if let Some(ref dir) = state.state_dir {
         if let Err(error) = next_prefs.save(dir) {
             let error = serde_json::json!({"error": format!("prefs save failed: {error}")});
@@ -822,19 +1037,17 @@ async fn handle_reload_config<W: AsyncWrite + Unpin>(
 
     if masked.ShieldsUpSet {
         if let Some(filter) = state.filter.get() {
-            filter
-                .lock()
-                .unwrap()
-                .set_shields_up(masked.Prefs.ShieldsUp);
+            filter.lock().unwrap().set_shields_up(next_prefs.ShieldsUp);
             state.peer_map.advance_authorization_epoch_locked();
         }
     }
+    let notification = state
+        .ipn_backend
+        .queue_profile_state(profile, next_prefs, true);
+    drop(profile_commit);
     drop(map_commit);
-
-    state.ipn_backend.bus().send(rustscale_ipn::Notify {
-        Prefs: Some(updated.clone()),
-        ..Default::default()
-    });
+    drop(exit_map_guard);
+    state.ipn_backend.dispatch_profile_state(notification);
 
     log::info!("rustscaled: config reloaded from {path_str}");
     write_json_response(conn, 200, "OK", &updated).await?;
@@ -1001,12 +1214,18 @@ async fn handle_patch_prefs<W: AsyncWrite + Unpin>(
         masked.ExitNodeIDSet || masked.ExitNodeIPSet || masked.ExitNodeAllowLANAccessSet;
     let disconnect_requested = masked.WantRunningSet && !masked.Prefs.WantRunning;
     let authorization_changed = exit_node_changed || masked.ShieldsUpSet;
-    let _exit_map_guard = state.exit_map_gate.lock().await;
+    let exit_map_guard = if exit_node_changed {
+        Some(state.exit_map_gate.lock().await)
+    } else {
+        None
+    };
     let map_commit = if authorization_changed {
         Some(state.peer_map.gate.write().await)
     } else {
         None
     };
+    let profile_commit = state.profile_mutations.lock().await;
+    let profile = current_login_profile(state).await;
     let mut prefs_guard = state.prefs.write().await;
     let old_prefs = prefs_guard.clone();
     let mut next_prefs = old_prefs.clone();
@@ -1061,15 +1280,18 @@ async fn handle_patch_prefs<W: AsyncWrite + Unpin>(
     // inbound flow admission; established flows are preserved.
     if masked.ShieldsUpSet {
         if let Some(filter) = state.filter.get() {
-            filter
-                .lock()
-                .unwrap()
-                .set_shields_up(masked.Prefs.ShieldsUp);
+            filter.lock().unwrap().set_shields_up(next_prefs.ShieldsUp);
             state.peer_map.advance_authorization_epoch_locked();
         }
     }
 
+    let notification = state
+        .ipn_backend
+        .queue_profile_state(profile, next_prefs, true);
+    drop(profile_commit);
     drop(map_commit);
+    drop(exit_map_guard);
+    state.ipn_backend.dispatch_profile_state(notification);
 
     if disconnect_requested {
         if let Some(logger) = &state.audit_logger {
@@ -1082,10 +1304,6 @@ async fn handle_patch_prefs<W: AsyncWrite + Unpin>(
         }
     }
 
-    state.ipn_backend.bus().send(rustscale_ipn::Notify {
-        Prefs: Some(updated.clone()),
-        ..Default::default()
-    });
     write_json_response(conn, 200, "OK", &updated).await?;
     Ok(())
 }
@@ -1360,6 +1578,53 @@ async fn write_access_denied<W: AsyncWrite + Unpin>(conn: &mut W) -> Result<(), 
     write_json_response(conn, 403, "Forbidden", &body).await
 }
 
+async fn admit_mutation<'a, W: AsyncWrite + Unpin>(
+    conn: &mut W,
+    state: &'a LocalApiState,
+) -> Result<Option<tokio::sync::MutexGuard<'a, ()>>, std::io::Error> {
+    let permit = state.mutation_fence.admit(state.mutation_generation).await;
+    if permit.is_none() {
+        write_json_response(
+            conn,
+            409,
+            "Conflict",
+            &serde_json::json!({"error": "stale LocalAPI listener generation"}),
+        )
+        .await?;
+    }
+    Ok(permit)
+}
+
+/// Classify the complete LocalAPI mutation surface before route dispatch.
+/// Diagnostic/read operations remain available to a draining stale listener,
+/// including POST-shaped reads such as ping, dial, check-prefs, and routecheck.
+fn is_mutating_request(method: &str, endpoint: &str) -> bool {
+    matches!(
+        (method, endpoint),
+        ("PATCH", "prefs")
+            | (
+                "POST",
+                "start"
+                    | "login-interactive"
+                    | "logout"
+                    | "tka/init"
+                    | "tka/init/ack"
+                    | "tka/sign"
+                    | "tka/disable"
+                    | "debug-capture"
+                    | "serve-config"
+                    | "set-expiry-sooner"
+                    | "shutdown"
+                    | "reload-config"
+                    | "debug"
+            )
+            | ("PUT", "drive/config" | "profiles")
+    ) || (method == "GET" && endpoint.starts_with("cert/"))
+        || (endpoint.starts_with("profiles/") && matches!(method, "POST" | "DELETE"))
+        || ((endpoint == "files" || endpoint.starts_with("files/")) && method == "DELETE")
+        || (endpoint.starts_with("file-put/") && method == "PUT")
+}
+
 pub(crate) async fn dispatch<W: AsyncRead + AsyncWrite + Unpin>(
     conn: &mut W,
     req: &HttpRequest,
@@ -1423,6 +1688,22 @@ pub(crate) async fn dispatch<W: AsyncRead + AsyncWrite + Unpin>(
 
     let endpoint = &path[API_PREFIX.len()..];
 
+    // Generation and peer-identity admission is one route-level decision made
+    // before any mutating handler can observe or persist state. Holding the
+    // permit through dispatch linearizes a mutation against listener handoff.
+    let mut mutation = if is_mutating_request(method, endpoint) {
+        if !require_readwrite(peer_identity) {
+            write_access_denied(conn).await?;
+            return Ok(());
+        }
+        let Some(permit) = admit_mutation(conn, state).await? else {
+            return Ok(());
+        };
+        Some(permit)
+    } else {
+        None
+    };
+
     match endpoint {
         // --- GET /localapi/v0/status ---
         "status" if method == "GET" => {
@@ -1444,38 +1725,22 @@ pub(crate) async fn dispatch<W: AsyncRead + AsyncWrite + Unpin>(
 
         // --- PATCH /localapi/v0/prefs ---
         "prefs" if method == "PATCH" => {
-            if !require_readwrite(peer_identity) {
-                write_access_denied(conn).await?;
-                return Ok(());
-            }
             handle_patch_prefs(conn, &req.body, state).await?;
         }
 
         // --- POST /localapi/v0/start ---
         "start" if method == "POST" => {
-            if !require_readwrite(peer_identity) {
-                write_access_denied(conn).await?;
-                return Ok(());
-            }
             handle_start(conn, &req.body, state).await?;
         }
 
         // --- POST /localapi/v0/login-interactive ---
         "login-interactive" if method == "POST" => {
-            if !require_readwrite(peer_identity) {
-                write_access_denied(conn).await?;
-                return Ok(());
-            }
             state.login_trigger.notify_waiters();
             write_no_content_response(conn, 204, "No Content").await?;
         }
 
         // --- POST /localapi/v0/logout ---
         "logout" if method == "POST" => {
-            if !require_readwrite(peer_identity) {
-                write_access_denied(conn).await?;
-                return Ok(());
-            }
             handle_logout(conn, state).await?;
         }
 
@@ -1484,31 +1749,15 @@ pub(crate) async fn dispatch<W: AsyncRead + AsyncWrite + Unpin>(
             handle_tka_status(conn, state).await?;
         }
         "tka/init" if method == "POST" => {
-            if !require_readwrite(peer_identity) {
-                write_access_denied(conn).await?;
-                return Ok(());
-            }
             handle_tka_init(conn, &req.body, state).await?;
         }
         "tka/init/ack" if method == "POST" => {
-            if !require_readwrite(peer_identity) {
-                write_access_denied(conn).await?;
-                return Ok(());
-            }
             handle_tka_init_ack(conn, &req.body, state).await?;
         }
         "tka/sign" if method == "POST" => {
-            if !require_readwrite(peer_identity) {
-                write_access_denied(conn).await?;
-                return Ok(());
-            }
             handle_tka_sign(conn, &req.body, state).await?;
         }
         "tka/disable" if method == "POST" => {
-            if !require_readwrite(peer_identity) {
-                write_access_denied(conn).await?;
-                return Ok(());
-            }
             handle_tka_disable(conn, &req.body, state).await?;
         }
         endpoint if endpoint.starts_with("tka/") => {
@@ -1561,11 +1810,14 @@ pub(crate) async fn dispatch<W: AsyncRead + AsyncWrite + Unpin>(
 
         // --- POST /localapi/v0/debug-capture ---
         "debug-capture" if method == "POST" => {
-            if !require_readwrite(peer_identity) {
-                write_access_denied(conn).await?;
-                return Ok(());
-            }
-            handle_debug_capture(conn, state).await?;
+            handle_debug_capture(
+                conn,
+                state,
+                mutation
+                    .take()
+                    .expect("debug capture dispatched without mutation admission"),
+            )
+            .await?;
         }
 
         // --- GET /localapi/v0/watch-ipn-bus?mask=<u64> ---
@@ -1578,10 +1830,6 @@ pub(crate) async fn dispatch<W: AsyncRead + AsyncWrite + Unpin>(
             handle_get_serve_config(conn, state).await?;
         }
         "serve-config" if method == "POST" => {
-            if !require_readwrite(peer_identity) {
-                write_access_denied(conn).await?;
-                return Ok(());
-            }
             handle_post_serve_config(conn, req, state).await?;
         }
 
@@ -1595,10 +1843,6 @@ pub(crate) async fn dispatch<W: AsyncRead + AsyncWrite + Unpin>(
             handle_get_drive_config(conn, state).await?;
         }
         "drive/config" if method == "PUT" => {
-            if !require_readwrite(peer_identity) {
-                write_access_denied(conn).await?;
-                return Ok(());
-            }
             handle_put_drive_config(conn, &req.body, state).await?;
         }
         "drive/config" | "drive/status" => {
@@ -1612,10 +1856,6 @@ pub(crate) async fn dispatch<W: AsyncRead + AsyncWrite + Unpin>(
         }
         // --- PUT /localapi/v0/profiles ---
         "profiles" if method == "PUT" => {
-            if !require_readwrite(peer_identity) {
-                write_access_denied(conn).await?;
-                return Ok(());
-            }
             handle_new_profile(conn, state).await?;
         }
         // --- GET /localapi/v0/file-targets ---
@@ -1656,19 +1896,11 @@ pub(crate) async fn dispatch<W: AsyncRead + AsyncWrite + Unpin>(
 
         // --- POST /localapi/v0/set-expiry-sooner ---
         "set-expiry-sooner" if method == "POST" => {
-            if !require_readwrite(peer_identity) {
-                write_access_denied(conn).await?;
-                return Ok(());
-            }
             handle_set_expiry_sooner(conn, &req.body, &req.query).await?;
         }
 
         // --- POST /localapi/v0/shutdown ---
         "shutdown" if method == "POST" => {
-            if !require_readwrite(peer_identity) {
-                write_access_denied(conn).await?;
-                return Ok(());
-            }
             handle_shutdown(conn, state).await?;
         }
 
@@ -1683,19 +1915,11 @@ pub(crate) async fn dispatch<W: AsyncRead + AsyncWrite + Unpin>(
 
         // --- POST /localapi/v0/reload-config ---
         "reload-config" if method == "POST" => {
-            if !require_readwrite(peer_identity) {
-                write_access_denied(conn).await?;
-                return Ok(());
-            }
             handle_reload_config(conn, state).await?;
         }
 
         // --- POST /localapi/v0/debug (action dispatcher) ---
         "debug" if method == "POST" => {
-            if !require_readwrite(peer_identity) {
-                write_access_denied(conn).await?;
-                return Ok(());
-            }
             handle_debug_action(conn, &req.body, &req.query, state).await?;
         }
 
@@ -1707,28 +1931,16 @@ pub(crate) async fn dispatch<W: AsyncRead + AsyncWrite + Unpin>(
             }
             // Check for profiles/<id> or profiles/current sub-paths.
             if let Some(suffix) = endpoint.strip_prefix("profiles/") {
-                if (method == "POST" || method == "DELETE") && !require_readwrite(peer_identity) {
-                    write_access_denied(conn).await?;
-                    return Ok(());
-                }
                 handle_profile_subpath(conn, method, suffix, state).await?;
                 return Ok(());
             }
             // Check for files/<name> or files/ (Taildrop).
             if endpoint == "files" || endpoint.starts_with("files/") {
-                if method == "DELETE" && !require_readwrite(peer_identity) {
-                    write_access_denied(conn).await?;
-                    return Ok(());
-                }
                 handle_files(conn, method, endpoint, &req.query, req, state).await?;
                 return Ok(());
             }
             // Check for file-put/<stableID>/<filename> (Taildrop upload proxy).
             if let Some(suffix) = endpoint.strip_prefix("file-put/") {
-                if !require_readwrite(peer_identity) {
-                    write_access_denied(conn).await?;
-                    return Ok(());
-                }
                 handle_file_put(conn, method, suffix, req, state).await?;
                 return Ok(());
             }
@@ -1802,17 +2014,23 @@ async fn handle_put_drive_config<W: AsyncWrite + Unpin>(
 async fn handle_debug_capture<W: AsyncWrite + Unpin>(
     conn: &mut W,
     state: &Arc<LocalApiState>,
+    mutation: tokio::sync::MutexGuard<'_, ()>,
 ) -> Result<(), std::io::Error> {
+    // Generation admission and publication are one short transaction. Never
+    // retain the listener-generation permit while streaming to a potentially
+    // slow client. A distinct sink makes the eventual old-handler cleanup
+    // incapable of mutating a replacement generation's capture session.
+    let sink = crate::capture::replace(&state.capture);
+    let (tx, mut rx) = mpsc::channel(64);
+    let handle = sink.register_output(crate::capture::ChannelOutput::new(tx))?;
+    drop(mutation);
+
     conn.write_all(
         b"HTTP/1.1 200 OK\r\nContent-Type: application/vnd.tcpdump.pcap\r\n\
           Connection: close\r\n\r\n",
     )
     .await?;
     conn.flush().await?;
-
-    let sink = crate::capture::get_or_set(&state.capture);
-    let (tx, mut rx) = mpsc::channel(64);
-    let handle = sink.register_output(crate::capture::ChannelOutput::new(tx))?;
 
     loop {
         tokio::select! {
@@ -1829,7 +2047,7 @@ async fn handle_debug_capture<W: AsyncWrite + Unpin>(
     }
 
     handle.unregister();
-    crate::capture::clear(&state.capture);
+    crate::capture::clear_if_same(&state.capture, &sink);
     Ok(())
 }
 
@@ -2904,22 +3122,26 @@ async fn handle_new_profile<W: AsyncWrite + Unpin>(
         ..Default::default()
     };
 
-    {
-        let mut profiles = state.profiles.write().await;
-        profiles.push(profile);
-        if let Some(ref dir) = state.state_dir {
-            let _ = LoginProfile::save_all(dir, &profiles);
+    let notification = {
+        let _commit = state.profile_mutations.lock().await;
+        {
+            let mut profiles = state.profiles.write().await;
+            profiles.push(profile.clone());
+            if let Some(ref dir) = state.state_dir {
+                let _ = LoginProfile::save_all(dir, &profiles);
+            }
         }
-    }
-
-    // Switch to the new profile.
-    {
-        let mut current = state.current_profile.write().await;
-        *current = Some(id.clone());
-        if let Some(ref dir) = state.state_dir {
-            let _ = LoginProfile::save_current_id(dir, &id);
+        {
+            let mut current = state.current_profile.write().await;
+            *current = Some(id.clone());
+            if let Some(ref dir) = state.state_dir {
+                let _ = LoginProfile::save_current_id(dir, &id);
+            }
         }
-    }
+        let prefs = state.prefs.read().await.clone();
+        state.ipn_backend.queue_profile_state(profile, prefs, false)
+    };
+    state.ipn_backend.dispatch_profile_state(notification);
 
     write_no_content_response(conn, 201, "Created").await?;
     Ok(())
@@ -2971,56 +3193,74 @@ async fn handle_profile_subpath<W: AsyncWrite + Unpin>(
             // reloads the ProfileManager from disk, applies the new
             // profile's prefs, and re-bootstraps with `up()`. Mirrors
             // Go's `LocalBackend.SwitchProfile` → `resetForProfileChangeLocked`.
-            let profiles = state.profiles.read().await;
-            if !profiles.iter().any(|p| p.ID == profile_id) {
-                let body = serde_json::json!({"error": "profile not found"});
-                write_json_response(conn, 404, "Not Found", &body).await?;
-                return Ok(());
-            }
-            drop(profiles);
-
+            let notification = {
+                let commit_guard = state.profile_mutations.lock().await;
+                let profile = {
+                    let profiles = state.profiles.read().await;
+                    profiles
+                        .iter()
+                        .find(|profile| profile.ID == profile_id)
+                        .cloned()
+                };
+                let Some(profile) = profile else {
+                    drop(commit_guard);
+                    let body = serde_json::json!({"error": "profile not found"});
+                    write_json_response(conn, 404, "Not Found", &body).await?;
+                    return Ok(());
+                };
+                if let Some(ref dir) = state.state_dir {
+                    let _ = LoginProfile::save_current_id(dir, &profile_id);
+                }
+                *state.current_profile.write().await = Some(profile_id.clone());
+                let prefs = state.prefs.read().await.clone();
+                state.ipn_backend.queue_profile_state(profile, prefs, false)
+            };
+            state.ipn_backend.dispatch_profile_state(notification);
             if let Some(ref tx) = state.command_tx {
                 let _ = tx.send(DaemonCommand::SwitchProfile(profile_id.clone()));
-            }
-            // Save the current-profile ID immediately so a crash during
-            // teardown doesn't lose the switch intent.
-            if let Some(ref dir) = state.state_dir {
-                let _ = LoginProfile::save_current_id(dir, &profile_id);
-            }
-            // Update the in-memory current-profile pointer so concurrent
-            // `GET /profiles/current` requests see the switch right away.
-            {
-                let mut current = state.current_profile.write().await;
-                *current = Some(profile_id.clone());
             }
 
             write_no_content_response(conn, 204, "No Content").await?;
         }
         "DELETE" => {
-            let mut profiles = state.profiles.write().await;
-            let len_before = profiles.len();
-            profiles.retain(|p| p.ID != profile_id);
-            if profiles.len() == len_before {
-                let body = serde_json::json!({"error": "profile not found"});
-                write_json_response(conn, 404, "Not Found", &body).await?;
-                return Ok(());
-            }
-            if let Some(ref dir) = state.state_dir {
-                let _ = LoginProfile::save_all(dir, &profiles);
-            }
-
-            // If we deleted the current profile, clear or pick a new one.
-            let mut current = state.current_profile.write().await;
-            if current.as_deref() == Some(profile_id.as_str()) {
-                *current = profiles.first().map(|p| p.ID.clone());
-                if let Some(ref dir) = state.state_dir {
-                    if let Some(ref id) = *current {
-                        let _ = LoginProfile::save_current_id(dir, id);
-                    }
+            let notification = {
+                let commit_guard = state.profile_mutations.lock().await;
+                let mut profiles = state.profiles.write().await;
+                let len_before = profiles.len();
+                profiles.retain(|profile| profile.ID != profile_id);
+                if profiles.len() == len_before {
+                    drop(profiles);
+                    drop(commit_guard);
+                    let body = serde_json::json!({"error": "profile not found"});
+                    write_json_response(conn, 404, "Not Found", &body).await?;
+                    return Ok(());
                 }
+                if let Some(ref dir) = state.state_dir {
+                    let _ = LoginProfile::save_all(dir, &profiles);
+                }
+
+                let mut current = state.current_profile.write().await;
+                if current.as_deref() == Some(profile_id.as_str()) {
+                    *current = profiles.first().map(|profile| profile.ID.clone());
+                    if let Some(ref dir) = state.state_dir {
+                        if let Some(ref id) = *current {
+                            let _ = LoginProfile::save_current_id(dir, id);
+                        }
+                    }
+                    let profile = current
+                        .as_ref()
+                        .and_then(|id| profiles.iter().find(|profile| &profile.ID == id))
+                        .cloned()
+                        .unwrap_or_default();
+                    let prefs = state.prefs.read().await.clone();
+                    Some(state.ipn_backend.queue_profile_state(profile, prefs, false))
+                } else {
+                    None
+                }
+            };
+            if let Some(notification) = notification {
+                state.ipn_backend.dispatch_profile_state(notification);
             }
-            drop(current);
-            drop(profiles);
 
             write_no_content_response(conn, 204, "No Content").await?;
         }
@@ -4006,7 +4246,10 @@ mod tests {
         ipn_backend.set_engine_status(1, 1);
         assert_eq!(ipn_backend.state(), rustscale_ipn::State::Running);
 
+        let mutation_fence = LocalApiMutationFence::new();
         Arc::new(LocalApiState {
+            mutation_generation: mutation_fence.generation(),
+            mutation_fence,
             peers,
             routecheck: None,
             user_profiles: Arc::new(RwLock::new(profiles)),
@@ -4022,6 +4265,7 @@ mod tests {
                 ..Default::default()
             })),
             posture_checking: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            profile_mutations: Arc::new(tokio::sync::Mutex::new(())),
             exit_node_selection: Arc::new(RwLock::new(crate::ExitNodeSelection::default())),
             tailscale_ips: vec!["100.64.0.1".parse().unwrap()],
             our_fqdn: "test.tailnet.ts.net.".into(),
@@ -4057,6 +4301,7 @@ mod tests {
             exit_map_gate: Arc::new(tokio::sync::Mutex::new(())),
             router: None,
             logout_trigger: Arc::new(tokio::sync::Notify::new()),
+            logout_completion: LogoutCompletion::new(),
             suggested_exit_node: Arc::new(RwLock::new(String::new())),
             config_path: None,
             client_updater: Arc::new(std::sync::Mutex::new(
@@ -4297,6 +4542,159 @@ mod tests {
         ) -> Box<dyn crate::PreferencePolicySubscription> {
             Box::new(NoopPolicySubscription)
         }
+    }
+
+    #[tokio::test]
+    async fn localapi_pref_mutations_notify_extensions_once() {
+        let mut state = make_test_state().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.json");
+        std::fs::write(
+            &config_path,
+            r#"{"Version":"alpha0","Hostname":"from-reload"}"#,
+        )
+        .unwrap();
+        Arc::get_mut(&mut state).unwrap().config_path = Some(config_path);
+        *state.profiles.write().await = vec![LoginProfile {
+            ID: "persisted".into(),
+            ..Default::default()
+        }];
+        *state.current_profile.write().await = Some("persisted".into());
+
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let callback_observed = Arc::clone(&observed);
+        state
+            .ipn_backend
+            .add_profile_state_callback(Arc::new(move |profile, prefs, same_node| {
+                callback_observed
+                    .lock()
+                    .unwrap()
+                    .push((profile.ID, prefs.Hostname, same_node));
+            }));
+
+        let start = StartOptions {
+            UpdatePrefs: Some(MaskedPrefs {
+                Prefs: Prefs {
+                    Hostname: "from-start".into(),
+                    ..Default::default()
+                },
+                HostnameSet: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let (mut start_conn, _start_peer) = tokio::io::duplex(4096);
+        handle_start(
+            &mut start_conn,
+            &serde_json::to_vec(&start).unwrap(),
+            &state,
+        )
+        .await
+        .unwrap();
+
+        let patch = MaskedPrefs {
+            Prefs: Prefs {
+                Hostname: "from-patch".into(),
+                ..Default::default()
+            },
+            HostnameSet: true,
+            ..Default::default()
+        };
+        let (mut patch_conn, _patch_peer) = tokio::io::duplex(4096);
+        handle_patch_prefs(
+            &mut patch_conn,
+            &serde_json::to_vec(&patch).unwrap(),
+            &state,
+        )
+        .await
+        .unwrap();
+
+        let (mut reload_conn, _reload_peer) = tokio::io::duplex(4096);
+        handle_reload_config(&mut reload_conn, &state)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *observed.lock().unwrap(),
+            [
+                ("persisted".into(), "from-start".into(), true),
+                ("persisted".into(), "from-patch".into(), true),
+                ("persisted".into(), "from-reload".into(), true),
+            ]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_pref_mutations_preserve_exact_callback_order() {
+        let state = make_test_state().await;
+        let mut bus = state.ipn_backend.bus().subscribe();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let callback_entered = Arc::clone(&entered);
+        let callback_release = Arc::clone(&release_rx);
+        let callback_observed = Arc::clone(&observed);
+        state
+            .ipn_backend
+            .add_profile_state_callback(Arc::new(move |_, prefs, _| {
+                callback_observed
+                    .lock()
+                    .unwrap()
+                    .push(prefs.Hostname.clone());
+                if prefs.Hostname == "first" {
+                    callback_entered.notify_one();
+                    callback_release.lock().unwrap().recv().unwrap();
+                }
+            }));
+
+        let patch = |hostname: &str| {
+            serde_json::to_vec(&MaskedPrefs {
+                Prefs: Prefs {
+                    Hostname: hostname.into(),
+                    ..Default::default()
+                },
+                HostnameSet: true,
+                ..Default::default()
+            })
+            .unwrap()
+        };
+        let first_state = Arc::clone(&state);
+        let first_body = patch("first");
+        let first = tokio::spawn(async move {
+            let (mut conn, _peer) = tokio::io::duplex(4096);
+            handle_patch_prefs(&mut conn, &first_body, &first_state)
+                .await
+                .unwrap();
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), entered.notified())
+            .await
+            .expect("first callback did not start");
+
+        let second_state = Arc::clone(&state);
+        let second_body = patch("second");
+        let second = tokio::spawn(async move {
+            let (mut conn, _peer) = tokio::io::duplex(4096);
+            handle_patch_prefs(&mut conn, &second_body, &second_state)
+                .await
+                .unwrap();
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), second)
+            .await
+            .expect("second mutation waited on the active callback")
+            .unwrap();
+        assert_eq!(*observed.lock().unwrap(), ["first"]);
+        let first_bus = bus.recv().await.unwrap().unwrap().Prefs.unwrap();
+        let second_bus = bus.recv().await.unwrap().unwrap().Prefs.unwrap();
+        assert_eq!(first_bus["Hostname"], "first");
+        assert_eq!(second_bus["Hostname"], "second");
+        release_tx.send(()).unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), first)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(*observed.lock().unwrap(), ["first", "second"]);
     }
 
     // --- HTTP parsing tests ---
@@ -4759,7 +5157,300 @@ mod tests {
         assert!(resp.contains("404 Not Found"));
     }
 
-    // --- Socket permission test ---
+    // --- Socket lifecycle tests ---
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_joins_blocked_child_before_immediate_rebind() {
+        use tokio::net::UnixStream;
+
+        let state = make_test_state().await;
+        let path = std::env::temp_dir().join(format!(
+            "rustscale-localapi-drain-{}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let handle = spawn_localapi(Arc::clone(&state), path.clone()).expect("first bind");
+        let idle = UnixStream::connect(&path).await.expect("idle connection");
+        handle.wait_for_accept().await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle.shutdown())
+            .await
+            .expect("blocked LocalAPI child was not aborted and joined");
+        drop(idle);
+        let replacement = spawn_localapi(state, path.clone()).expect("immediate replacement bind");
+        replacement.shutdown().await;
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn paused_replacement_does_not_accept_before_old_generation_drains() {
+        use tokio::net::UnixStream;
+
+        let state = make_test_state().await;
+        let path = std::env::temp_dir().join(format!(
+            "rustscale-localapi-handoff-{}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let old = spawn_localapi(Arc::clone(&state), path.clone()).expect("old bind");
+        let old_idle = UnixStream::connect(&path).await.expect("old connection");
+        old.wait_for_accept().await;
+        use std::os::unix::fs::MetadataExt;
+        let advertised_inode = std::fs::metadata(&path).unwrap().ino();
+
+        let (mut replacement, start, mut handoff) =
+            spawn_localapi_paused(state, path.clone()).expect("replacement bind");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().ino(),
+            advertised_inode,
+            "handoff preparation changed the advertised endpoint"
+        );
+        let replacement_idle = UnixStream::connect(&replacement.socket_path)
+            .await
+            .expect("replacement backlog connection");
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                replacement.wait_for_accept(),
+            )
+            .await
+            .is_err(),
+            "replacement accepted before the old generation drained"
+        );
+
+        start.send(()).unwrap();
+        handoff.commit(&mut replacement).unwrap();
+        old.shutdown_preserving_path().await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            replacement.wait_for_accept(),
+        )
+        .await
+        .expect("replacement did not accept after activation");
+        drop((old_idle, replacement_idle));
+        replacement.shutdown().await;
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn replacement_bind_failure_never_unlinks_live_listener() {
+        use std::os::unix::net::UnixListener;
+        use tokio::net::UnixStream;
+
+        let state = make_test_state().await;
+        let path = std::env::temp_dir().join(format!(
+            "rustscale-localapi-bind-rollback-{}.sock",
+            std::process::id()
+        ));
+        let staging = path.with_extension("forced-stage");
+        for candidate in [&path, &staging] {
+            let _ = std::fs::remove_file(candidate);
+        }
+        let old = spawn_localapi(Arc::clone(&state), path.clone()).expect("old bind");
+        let blocker = UnixListener::bind(&staging).expect("staging blocker");
+
+        assert!(
+            spawn_localapi_paused_at_paths(state, path.clone(), staging.clone()).is_none(),
+            "replacement unexpectedly replaced a live staging bind"
+        );
+        let client = UnixStream::connect(&path)
+            .await
+            .expect("old advertised listener");
+        tokio::time::timeout(std::time::Duration::from_secs(1), old.wait_for_accept())
+            .await
+            .expect("old listener stopped accepting after replacement bind failure");
+
+        drop((client, blocker));
+        old.shutdown().await;
+        for candidate in [&path, &staging] {
+            let _ = std::fs::remove_file(candidate);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn final_publish_failure_leaves_advertised_listener_untouched() {
+        use tokio::net::UnixStream;
+
+        let state = make_test_state().await;
+        let path =
+            std::env::temp_dir().join(format!("rs-localapi-pubfail-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let old = spawn_localapi(Arc::clone(&state), path.clone()).expect("old bind");
+        let (mut replacement, start, mut handoff) =
+            spawn_localapi_paused(state, path.clone()).expect("replacement bind");
+        // Unlink only the hidden socket to deterministically make final rename
+        // fail. The bound listener remains owned by its handle.
+        std::fs::remove_file(&replacement.socket_path).unwrap();
+        start.send(()).unwrap();
+        assert!(handoff.commit(&mut replacement).is_err());
+
+        let client = UnixStream::connect(&path)
+            .await
+            .expect("old advertised listener was removed on publish failure");
+        tokio::time::timeout(std::time::Duration::from_secs(1), old.wait_for_accept())
+            .await
+            .expect("old listener stopped accepting on publish failure");
+        drop(client);
+        replacement.shutdown().await;
+        old.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropped_handoff_atomically_restores_old_listener() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::UnixStream;
+
+        let state = make_test_state().await;
+        let path = std::env::temp_dir().join(format!(
+            "rustscale-localapi-rollback-{}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let old = spawn_localapi(Arc::clone(&state), path.clone()).expect("old bind");
+        let (replacement, start, handoff) =
+            spawn_localapi_paused(state, path.clone()).expect("replacement bind");
+
+        // Model cancellation/failure during preparation. The advertised path
+        // was never modified, so rollback only removes the staging listener.
+        drop(start);
+        drop(handoff);
+        replacement.shutdown().await;
+
+        let mut client = UnixStream::connect(&path).await.expect("restored old path");
+        client
+            .write_all(
+                b"GET /localapi/v0/status HTTP/1.1\r\nHost: local-tailscaled.sock\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.read_to_end(&mut response),
+        )
+        .await
+        .expect("restored listener did not answer")
+        .unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 200"));
+
+        old.shutdown().await;
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn capture_releases_generation_permit_after_registration_and_cannot_clear_successor() {
+        let state = make_test_state().await;
+        let (mut client, mut server_io) = tokio::io::duplex(4096);
+        let request = HttpRequest {
+            method: "POST".into(),
+            path: "/localapi/v0/debug-capture".into(),
+            query: String::new(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+        let dispatch_state = Arc::clone(&state);
+        let handler = tokio::spawn(async move {
+            dispatch(
+                &mut server_io,
+                &request,
+                &dispatch_state,
+                &test_rw_identity(),
+            )
+            .await
+        });
+
+        let mut response = [0u8; 256];
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            tokio::io::AsyncReadExt::read(&mut client, &mut response),
+        )
+        .await
+        .expect("capture response did not start")
+        .unwrap();
+        assert!(
+            String::from_utf8_lossy(&response[..read]).contains("200 OK"),
+            "capture did not publish its stream"
+        );
+
+        let handoff = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            state.mutation_fence.advance(state.mutation_generation),
+        )
+        .await
+        .expect("capture retained the generation permit while streaming")
+        .unwrap();
+        handoff.commit();
+        let successor = crate::capture::replace(&state.capture);
+        drop(client);
+        tokio::time::timeout(std::time::Duration::from_secs(1), handler)
+            .await
+            .expect("stale capture handler did not exit")
+            .unwrap()
+            .unwrap();
+        let current = state.capture.read().unwrap().clone().unwrap();
+        assert!(Arc::ptr_eq(&current, &successor));
+    }
+
+    #[tokio::test]
+    async fn stale_listener_generation_fences_every_mutating_route_but_allows_reads() {
+        let state = make_test_state().await;
+        let old_prefs = state.prefs.read().await.clone();
+        let handoff = state
+            .mutation_fence
+            .advance(state.mutation_generation)
+            .await
+            .unwrap();
+        handoff.commit();
+
+        let routes = [
+            ("PATCH", "prefs"),
+            ("POST", "start"),
+            ("POST", "login-interactive"),
+            ("POST", "logout"),
+            ("POST", "tka/init"),
+            ("POST", "tka/init/ack"),
+            ("POST", "tka/sign"),
+            ("POST", "tka/disable"),
+            ("POST", "debug-capture"),
+            ("GET", "cert/test.ts.net"),
+            ("POST", "serve-config"),
+            ("PUT", "drive/config"),
+            ("PUT", "profiles"),
+            ("POST", "profiles/profile-id"),
+            ("DELETE", "profiles/profile-id"),
+            ("POST", "set-expiry-sooner"),
+            ("POST", "shutdown"),
+            ("POST", "reload-config"),
+            ("POST", "debug"),
+            ("DELETE", "files/example.txt"),
+            ("PUT", "file-put/node-id/example.txt"),
+        ];
+        for (method, endpoint) in routes {
+            let request = format!(
+                "{method} /localapi/v0/{endpoint} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let response = send_request_to_state(request.as_bytes(), &state).await;
+            assert!(
+                response.contains("409 Conflict"),
+                "stale {method} {endpoint} was dispatched: {response}"
+            );
+        }
+
+        for request in [
+            &b"GET /localapi/v0/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"[..],
+            &b"POST /localapi/v0/check-prefs HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"[..],
+        ] {
+            let response = send_request_to_state(request, &state).await;
+            assert!(!response.contains("409 Conflict"), "read was fenced: {response}");
+        }
+        assert_eq!(*state.prefs.read().await, old_prefs);
+        assert!(!state.ipn_backend.logged_out());
+    }
 
     #[cfg(unix)]
     #[tokio::test]
@@ -4788,8 +5479,8 @@ mod tests {
             "socket permissions should be {expected:o}, got {mode:o}"
         );
 
-        // Clean up: stop the task and remove the socket.
-        if let Some(mut h) = handle {
+        // Clean up and join the accept generation.
+        if let Some(h) = handle {
             h.shutdown().await;
         }
         let _ = std::fs::remove_file(&tmp);
@@ -4923,7 +5614,7 @@ mod tests {
         assert_eq!(notify["State"], 6); // Running
 
         // Clean up.
-        if let Some(mut h) = handle {
+        if let Some(h) = handle {
             h.shutdown().await;
         }
         let _ = std::fs::remove_file(&tmp);
@@ -4992,7 +5683,7 @@ mod tests {
                 || transition_notify["SessionID"].is_null()
         );
 
-        if let Some(mut h) = handle {
+        if let Some(h) = handle {
             h.shutdown().await;
         }
         let _ = std::fs::remove_file(&tmp);
@@ -5062,7 +5753,7 @@ mod tests {
         // No State field (no initial state notify was sent).
         assert!(notify.get("State").is_none() || notify["State"].is_null());
 
-        if let Some(mut h) = handle {
+        if let Some(h) = handle {
             h.shutdown().await;
         }
         let _ = std::fs::remove_file(&tmp);
@@ -5189,6 +5880,8 @@ mod tests {
         // We need to modify the state — but it's Arc. So instead, create
         // a state with state_dir set.
         let state2 = Arc::new(LocalApiState {
+            mutation_fence: Arc::clone(&state.mutation_fence),
+            mutation_generation: state.mutation_generation,
             peers: state.peers.clone(),
             routecheck: state.routecheck.clone(),
             user_profiles: state.user_profiles.clone(),
@@ -5199,6 +5892,7 @@ mod tests {
             metrics: default_metric_registry(),
             prefs: state.prefs.clone(),
             posture_checking: state.posture_checking.clone(),
+            profile_mutations: state.profile_mutations.clone(),
             exit_node_selection: state.exit_node_selection.clone(),
             tailscale_ips: state.tailscale_ips.clone(),
             our_fqdn: state.our_fqdn.clone(),
@@ -5228,6 +5922,7 @@ mod tests {
             exit_map_gate: Arc::new(tokio::sync::Mutex::new(())),
             router: None,
             logout_trigger: Arc::new(tokio::sync::Notify::new()),
+            logout_completion: LogoutCompletion::new(),
             suggested_exit_node: Arc::new(RwLock::new(String::new())),
             config_path: None,
             client_updater: Arc::new(std::sync::Mutex::new(
@@ -5423,6 +6118,8 @@ mod tests {
         let mk_pub = mk.public();
         let nk = rustscale_key::NodePrivate::generate();
         Arc::new(LocalApiState {
+            mutation_fence: Arc::clone(&base.mutation_fence),
+            mutation_generation: base.mutation_generation,
             peers: base.peers.clone(),
             routecheck: base.routecheck.clone(),
             user_profiles: base.user_profiles.clone(),
@@ -5436,6 +6133,7 @@ mod tests {
             metrics: default_metric_registry(),
             prefs: base.prefs.clone(),
             posture_checking: base.posture_checking.clone(),
+            profile_mutations: base.profile_mutations.clone(),
             exit_node_selection: base.exit_node_selection.clone(),
             tailscale_ips: base.tailscale_ips.clone(),
             our_fqdn: base.our_fqdn.clone(),
@@ -5473,6 +6171,7 @@ mod tests {
             exit_map_gate: Arc::new(tokio::sync::Mutex::new(())),
             router: None,
             logout_trigger: Arc::new(tokio::sync::Notify::new()),
+            logout_completion: LogoutCompletion::new(),
             suggested_exit_node: Arc::new(RwLock::new(String::new())),
             config_path: None,
             client_updater: Arc::new(std::sync::Mutex::new(
@@ -5671,6 +6370,29 @@ mod tests {
         // Default type=pair → both key and cert.
         assert!(body.contains("BEGIN PRIVATE KEY"));
         assert!(body.contains("BEGIN CERTIFICATE"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_cross_user_identity_cannot_read_or_provision_cert_material() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = make_cert_test_state(vec!["test.ts.net".into()], tmp.path()).await;
+        write_cert_cache(tmp.path(), "test.ts.net");
+        let cross_user = ConnIdentity {
+            uid: None,
+            pid: None,
+            is_unix_sock: true,
+        };
+        for query in ["", "?type=pair", "?type=key", "?type=cert"] {
+            let request = format!(
+                "GET /localapi/v0/cert/test.ts.net{query} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+            );
+            let response =
+                send_request_with_identity(request.as_bytes(), &state, cross_user.clone()).await;
+            assert!(response.contains("403 Forbidden"), "response: {response}");
+            assert!(!response.contains("BEGIN PRIVATE KEY"));
+            assert!(!response.contains("BEGIN CERTIFICATE"));
+        }
     }
 
     #[tokio::test]
@@ -5960,6 +6682,39 @@ mod tests {
         )
         .await;
         assert!(resp.contains("403 Forbidden"));
+    }
+
+    #[tokio::test]
+    async fn logout_response_waits_for_durable_transaction_completion() {
+        let state = make_test_state().await;
+        let notified = state.logout_trigger.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let request_state = Arc::clone(&state);
+        let response = tokio::spawn(async move {
+            send_request_with_identity(
+                b"POST /localapi/v0/logout HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                &request_state,
+                test_rw_identity(),
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), notified)
+            .await
+            .expect("logout handler did not notify the daemon");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            !response.is_finished(),
+            "logout returned before durable commit"
+        );
+        assert!(!state.prefs.read().await.LoggedOut);
+
+        state.logout_completion.complete(Ok(()));
+        let response = tokio::time::timeout(std::time::Duration::from_secs(1), response)
+            .await
+            .expect("logout response did not resume after commit")
+            .unwrap();
+        assert!(response.contains("204 No Content"), "response: {response}");
     }
 
     #[tokio::test]

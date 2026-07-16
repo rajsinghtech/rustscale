@@ -80,7 +80,7 @@ let mut listener = server.listen(8080).await?;
 // loop { let stream = listener.accept().await?; ... }
 
 let stream = server.dial("100.64.0.2:443").await?;
-server.close().await;
+server.close().await?;
 ```
 
 ### TUN mode

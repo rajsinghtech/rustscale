@@ -103,6 +103,7 @@ async fn exit_node_prefs_apply_routing() {
     let _ = std::fs::remove_file(&socket_path);
 
     let mut server = Server::builder()
+        .disable_portmapping(true)
         .hostname("exitnode-prefs-test")
         .auth_key("tskey-test")
         .control_url(&control_url)
@@ -173,7 +174,7 @@ async fn exit_node_prefs_apply_routing() {
         "ExitNodeIP should be cleared"
     );
 
-    server.close().await;
+    server.close().await.unwrap();
 }
 
 /// Gap 1: ExitNodeAllowLANAccess pref field roundtrips through PATCH/prefs.
@@ -189,6 +190,7 @@ async fn exit_node_allow_lan_access_pref() {
     let _ = std::fs::remove_file(&socket_path);
 
     let mut server = Server::builder()
+        .disable_portmapping(true)
         .hostname("allowlan-test")
         .auth_key("tskey-test")
         .control_url(&control_url)
@@ -223,7 +225,7 @@ async fn exit_node_allow_lan_access_pref() {
         "ExitNodeAllowLANAccess should be saved"
     );
 
-    server.close().await;
+    server.close().await.unwrap();
 }
 
 /// Gap 2: Logout clears state → NeedsLogin, control server sees logout.
@@ -241,6 +243,7 @@ async fn logout_clears_state_to_needs_login() {
     let state_dir = state_tmp.path().to_path_buf();
 
     let mut server = Server::builder()
+        .disable_portmapping(true)
         .hostname("logout-test")
         .auth_key("tskey-test")
         .control_url(&control_url)
@@ -302,7 +305,7 @@ async fn logout_clears_state_to_needs_login() {
         "netmap cache should be cleared after logout"
     );
 
-    server.close().await;
+    server.close().await.unwrap();
 }
 
 fn find_named_file(root: &std::path::Path, name: &str) -> Option<PathBuf> {
@@ -335,6 +338,7 @@ async fn localapi_post_logout_triggers_needs_login() {
     let _ = std::fs::remove_file(&socket_path);
 
     let mut server = Server::builder()
+        .disable_portmapping(true)
         .hostname("post-logout-test")
         .auth_key("tskey-test")
         .control_url(&control_url)
@@ -352,30 +356,37 @@ async fn localapi_post_logout_triggers_needs_login() {
     wait_for_socket(&socket_path, Duration::from_secs(5));
     wait_for_state(&socket_path, State::Running, Duration::from_secs(30)).await;
 
-    // POST /logout
-    let resp = unix_http(&socket_path, "POST", "/localapi/v0/logout", "").await;
+    // LocalAPI requests only return 204 after their owner completes the durable
+    // logout transaction. This test embeds Server directly, so drive the same
+    // trigger/transaction handshake that rustscaled owns in production.
+    let trigger = server.logout_trigger().expect("running logout trigger");
+    let notified = trigger.notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
+    let request_socket = socket_path.clone();
+    let request =
+        tokio::spawn(
+            async move { unix_http(&request_socket, "POST", "/localapi/v0/logout", "").await },
+        );
+    tokio::time::timeout(Duration::from_secs(5), notified)
+        .await
+        .expect("LocalAPI logout did not notify its owner");
+    server.logout().await.expect("logout transaction");
+    let resp = tokio::time::timeout(Duration::from_secs(5), request)
+        .await
+        .expect("LocalAPI logout did not return after durable completion")
+        .expect("LocalAPI request task");
     assert_eq!(status_code(&resp), 204, "POST /logout should return 204");
 
-    // The logout_trigger should fire. Give the daemon a moment to process.
-    // Since we're calling directly (not through the daemon), we verify
-    // that the prefs were updated (LoggedOut=true, WantRunning=false).
-    let resp = unix_http(&socket_path, "GET", "/localapi/v0/prefs", "").await;
-    let body = json_body(&resp);
-    let prefs: serde_json::Value = serde_json::from_str(body).expect("prefs JSON");
-    assert_eq!(
-        prefs["LoggedOut"].as_bool(),
-        Some(true),
+    let prefs = rustscale_ipn::Prefs::load(state_tmp.path()).expect("load logout prefs");
+    assert!(
+        prefs.LoggedOut,
         "LoggedOut should be true after POST /logout"
     );
-    // WantRunning is omitted from JSON when false (skip_serializing_if = "is_false").
-    let want_running = prefs
-        .get("WantRunning")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
     assert!(
-        !want_running,
+        !prefs.WantRunning,
         "WantRunning should be false after POST /logout"
     );
 
-    server.close().await;
+    server.close().await.unwrap();
 }

@@ -21,6 +21,7 @@ async fn key_rotation_reregisters_with_old_node_key() {
 
     // Start the server.
     let mut server = Server::builder()
+        .disable_portmapping(true)
         .hostname("key-rot-test")
         .auth_key("tskey-test")
         .control_url(&control_url)
@@ -98,7 +99,7 @@ async fn key_rotation_reregisters_with_old_node_key() {
         "persisted state should contain old_node_key: {state_json}"
     );
 
-    server.close().await;
+    server.close().await.unwrap();
     eprintln!("key rotation integration test passed");
 }
 

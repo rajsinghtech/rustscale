@@ -25,7 +25,7 @@ pub mod prefs;
 mod profiles;
 pub mod store;
 
-pub use backend::{BackendInputs, IpnBackend};
+pub use backend::{BackendInputs, CallbackSubscription, IpnBackend};
 pub use bus::{NotifyBus, NotifyBusReceiver};
 pub use captiveportal::CaptivePortalWatcher;
 pub use machine::{next_state, StateMachineInputs};

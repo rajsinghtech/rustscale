@@ -1,0 +1,21 @@
+[package]
+name = "rustscale-ipnext"
+description = "Ordered IPN extension registration and lifecycle host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait.workspace = true
+rustscale-feature = { path = "../feature", version = "0.1.1" }
+rustscale-ipn = { path = "../ipn", version = "0.1.1" }
+rustscale-tsd = { path = "../tsd", version = "0.1.1" }
+tokio.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

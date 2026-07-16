@@ -26,6 +26,7 @@ async fn federated_auth_is_reminted_after_drop_and_omitted_when_enrolled() {
     let state_dir = tempfile::tempdir().unwrap();
 
     let mut first = Server::builder()
+        .disable_portmapping(true)
         .hostname("federated-retry")
         .control_url(control.base_url())
         .state_dir(state_dir.path())
@@ -55,11 +56,12 @@ async fn federated_auth_is_reminted_after_drop_and_omitted_when_enrolled() {
     assert!(fingerprints[0].is_some());
     assert!(fingerprints[1].is_some());
     assert_ne!(fingerprints[0], fingerprints[1]);
-    first.close().await;
+    first.close().await.unwrap();
 
     // Once the successful response has persisted enrollment, a restart uses
     // node identity only and does not invoke WIF or send RegisterRequest.Auth.
     let mut persisted = Server::builder()
+        .disable_portmapping(true)
         .hostname("federated-retry")
         .control_url(control.base_url())
         .state_dir(state_dir.path())
@@ -78,11 +80,12 @@ async fn federated_auth_is_reminted_after_drop_and_omitted_when_enrolled() {
     assert_eq!(resolver_calls.load(Ordering::SeqCst), 2);
     assert_eq!(control.register_auth_presence(), [true, true, false]);
     assert_eq!(control.register_auth_fingerprints()[2], None);
-    persisted.close().await;
+    persisted.close().await.unwrap();
 
     // Explicit force-login is the only persisted path that mints and sends a
     // new federated auth key.
     let mut forced = Server::builder()
+        .disable_portmapping(true)
         .hostname("federated-retry")
         .control_url(control.base_url())
         .state_dir(state_dir.path())
@@ -98,5 +101,5 @@ async fn federated_auth_is_reminted_after_drop_and_omitted_when_enrolled() {
         .expect("force-login startup failed");
     assert_eq!(resolver_calls.load(Ordering::SeqCst), 3);
     assert_eq!(control.register_auth_presence(), [true, true, false, true]);
-    forced.close().await;
+    forced.close().await.unwrap();
 }

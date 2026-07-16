@@ -96,6 +96,33 @@ pub(crate) fn get_or_set(slot: &CaptureSlot) -> Arc<Sink> {
     sink
 }
 
+/// Install a capture session with distinct ownership. Replacing the sink
+/// ensures cleanup from an older LocalAPI generation cannot close outputs
+/// registered by its successor.
+pub(crate) fn replace(slot: &CaptureSlot) -> Arc<Sink> {
+    let sink = Arc::new(Sink::new());
+    let previous = slot
+        .write()
+        .expect("capture slot lock poisoned")
+        .replace(Arc::clone(&sink));
+    if let Some(previous) = previous {
+        previous.close();
+    }
+    sink
+}
+
+/// Clear only the session installed by the caller.
+pub(crate) fn clear_if_same(slot: &CaptureSlot, expected: &Arc<Sink>) {
+    let mut guard = slot.write().expect("capture slot lock poisoned");
+    if guard
+        .as_ref()
+        .is_some_and(|current| Arc::ptr_eq(current, expected))
+    {
+        let sink = guard.take().expect("capture sink disappeared");
+        sink.close();
+    }
+}
+
 pub(crate) fn clear(slot: &CaptureSlot) {
     if let Some(sink) = slot.write().expect("capture slot lock poisoned").take() {
         sink.close();
@@ -187,7 +214,7 @@ impl Sink {
     }
 
     #[cfg(test)]
-    fn output_count(&self) -> usize {
+    pub(crate) fn output_count(&self) -> usize {
         self.outputs.lock().unwrap().len()
     }
 

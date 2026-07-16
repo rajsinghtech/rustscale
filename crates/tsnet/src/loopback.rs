@@ -53,9 +53,34 @@ pub struct LoopbackHandle {
     /// LocalAPI basic-auth password (requires `Sec-Tailscale: localapi`
     /// header as well).
     pub localapi_cred: String,
-    /// Cancel + task handle for graceful shutdown.
-    pub(crate) cancel: Arc<socks5::CancelToken>,
-    pub(crate) task: Option<JoinHandle<()>>,
+    control: Arc<LoopbackControl>,
+}
+
+pub(crate) struct LoopbackControl {
+    active: std::sync::atomic::AtomicBool,
+    cancel: Arc<socks5::CancelToken>,
+    task: tokio::sync::Mutex<Option<JoinHandle<()>>>,
+}
+
+impl LoopbackControl {
+    pub(crate) fn invalidate(&self) {
+        self.active
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.cancel.cancel();
+    }
+
+    pub(crate) async fn shutdown(&self) {
+        self.invalidate();
+        if let Some(mut task) = self.task.lock().await.take() {
+            if tokio::time::timeout(Duration::from_secs(2), &mut task)
+                .await
+                .is_err()
+            {
+                task.abort();
+                let _ = task.await;
+            }
+        }
+    }
 }
 
 #[allow(clippy::missing_fields_in_debug)]
@@ -75,12 +100,23 @@ impl LoopbackHandle {
         self.addr
     }
 
-    /// Gracefully stop the loopback listener.
+    /// Cancel and join the listener and every accepted connection.
+    pub async fn shutdown(self) {
+        self.control.shutdown().await;
+    }
+
+    /// Request graceful shutdown without waiting. Prefer [`shutdown`](Self::shutdown)
+    /// when immediate resource release is required.
     pub fn stop(&mut self) {
-        self.cancel.cancel();
-        if let Some(task) = self.task.take() {
-            task.abort();
-        }
+        self.control.invalidate();
+    }
+}
+
+impl Drop for LoopbackHandle {
+    fn drop(&mut self) {
+        // RunningState retains the strong control and task ownership until
+        // central lifecycle cleanup joins it.
+        self.control.invalidate();
     }
 }
 
@@ -95,12 +131,62 @@ impl LoopbackHandle {
 /// [`rustscale_localclient::LocalClient`] without requiring the Unix socket
 /// server to be running.
 pub struct InMemoryLocalClient {
+    control: Arc<InMemoryClientControl>,
+}
+
+pub(crate) struct InMemoryClientControl {
+    active: std::sync::atomic::AtomicBool,
     state: Arc<LocalApiState>,
+    tasks: std::sync::Mutex<Vec<JoinHandle<()>>>,
+}
+
+impl InMemoryClientControl {
+    pub(crate) fn invalidate(&self) {
+        self.active
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) async fn shutdown(&self) {
+        let tasks = {
+            let mut tasks = self.tasks.lock().expect("in-memory task lock poisoned");
+            self.invalidate();
+            std::mem::take(&mut *tasks)
+        };
+        for task in &tasks {
+            task.abort();
+        }
+        for task in tasks {
+            let _ = task.await;
+        }
+    }
+}
+
+impl Drop for InMemoryLocalClient {
+    fn drop(&mut self) {
+        // RunningState retains the strong control and dispatch handles until
+        // central lifecycle cleanup joins them.
+        self.control.invalidate();
+    }
 }
 
 impl InMemoryLocalClient {
     pub(crate) fn new(state: Arc<LocalApiState>) -> Self {
-        Self { state }
+        Self {
+            control: Arc::new(InMemoryClientControl {
+                active: std::sync::atomic::AtomicBool::new(true),
+                state,
+                tasks: std::sync::Mutex::new(Vec::new()),
+            }),
+        }
+    }
+
+    pub(crate) fn control(&self) -> &Arc<InMemoryClientControl> {
+        &self.control
+    }
+
+    /// Invalidate route-capable state and join all in-flight dispatches.
+    pub async fn shutdown(self) {
+        self.control.shutdown().await;
     }
 
     /// Send a request with no body and return (status, body bytes).
@@ -149,15 +235,32 @@ impl InMemoryLocalClient {
         // in-process LocalAPI handler, and writes the response to the same
         // end. The client then reads the response back.
         let (mut client, mut server) = tokio::io::duplex(64 * 1024);
-        let state = self.state.clone();
+        let state = Arc::clone(&self.control.state);
 
-        let dispatch_task = tokio::spawn(async move {
-            let req = match localapi::read_request(&mut server).await {
-                Ok(r) => r,
-                Err(_) => return,
-            };
-            let _ = localapi::dispatch(&mut server, &req, &state, &ConnIdentity::readwrite()).await;
-        });
+        {
+            let mut tasks = self
+                .control
+                .tasks
+                .lock()
+                .expect("in-memory task lock poisoned");
+            if !self
+                .control
+                .active
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return Err(InMemoryClientError::Connect(
+                    "server lifecycle is closed".into(),
+                ));
+            }
+            tasks.push(tokio::spawn(async move {
+                let req = match localapi::read_request(&mut server).await {
+                    Ok(r) => r,
+                    Err(_) => return,
+                };
+                let _ =
+                    localapi::dispatch(&mut server, &req, &state, &ConnIdentity::readwrite()).await;
+            }));
+        }
 
         // Write the request to the client end of the pipe.
         client
@@ -171,8 +274,6 @@ impl InMemoryLocalClient {
 
         // Read the response from the client end.
         let response = read_full_response(&mut client).await;
-        // Wait for the dispatch task to finish.
-        let _ = dispatch_task.await;
 
         let (status, resp_body) = response?;
         check_status(status, &resp_body)?;
@@ -417,12 +518,22 @@ impl Server {
             .await;
         });
 
+        let control = Arc::new(LoopbackControl {
+            active: std::sync::atomic::AtomicBool::new(true),
+            cancel,
+            task: tokio::sync::Mutex::new(Some(task)),
+        });
+        inner
+            .loopback_controls
+            .lock()
+            .expect("loopback registry lock poisoned")
+            .push(Arc::clone(&control));
+
         Ok(LoopbackHandle {
             addr: bound_addr,
             proxy_cred,
             localapi_cred,
-            cancel,
-            task: Some(task),
+            control,
         })
     }
 
@@ -436,7 +547,15 @@ impl Server {
     pub async fn local_client(&mut self) -> Result<InMemoryLocalClient, TsnetError> {
         Box::pin(self.ensure_up()).await?;
         let state = self.build_loopback_api_state("", "").await?;
-        Ok(InMemoryLocalClient::new(state))
+        let client = InMemoryLocalClient::new(state);
+        self.inner
+            .as_ref()
+            .expect("ensure_up guarantees inner")
+            .in_memory_clients
+            .lock()
+            .expect("in-memory registry lock poisoned")
+            .push(Arc::clone(client.control()));
+        Ok(client)
     }
 
     /// Build a `LocalApiState` for the loopback / in-memory LocalClient.
@@ -448,6 +567,8 @@ impl Server {
     ) -> Result<Arc<LocalApiState>, TsnetError> {
         let inner = self.inner.as_ref().expect("server must be up");
         let state = Arc::new(LocalApiState {
+            mutation_fence: Arc::clone(&inner.localapi_mutation_fence),
+            mutation_generation: inner.localapi_mutation_generation,
             peers: inner.peers.clone(),
             routecheck: Some(inner.routecheck.clone()),
             user_profiles: inner.user_profiles.clone(),
@@ -458,6 +579,7 @@ impl Server {
             metrics: crate::localapi::default_metric_registry(),
             prefs: inner.prefs.clone(),
             posture_checking: inner.posture_checking.clone(),
+            profile_mutations: inner.profile_mutations.clone(),
             exit_node_selection: inner.exit_node_selection.clone(),
             tailscale_ips: inner.tailscale_ips.clone(),
             our_fqdn: inner.our_fqdn.clone(),
@@ -527,6 +649,7 @@ impl Server {
             exit_map_gate: inner.exit_map_gate.clone(),
             router: inner.router.clone(),
             logout_trigger: inner.logout_trigger.clone(),
+            logout_completion: Arc::clone(&inner.logout_completion),
             suggested_exit_node: Arc::new(RwLock::new(String::new())),
             config_path: None,
             client_updater: inner.client_updater.clone(),
@@ -555,6 +678,7 @@ async fn serve_loopback<D: super::socks5::SocksDialer + 'static>(
     cancel: Arc<socks5::CancelToken>,
 ) {
     let dialer = Arc::new(dialer);
+    let mut children = tokio::task::JoinSet::new();
     loop {
         if cancel.is_cancelled() {
             break;
@@ -569,38 +693,43 @@ async fn serve_loopback<D: super::socks5::SocksDialer + 'static>(
             Err(_) => continue,
         };
 
-        // Peek at the first byte to detect SOCKS5 vs HTTP.
-        let mut peek_buf = [0u8; 1];
-        let n = match stream.read(&mut peek_buf).await {
-            Ok(n) => n,
-            Err(_) => continue,
-        };
-        if n == 0 {
-            continue;
-        }
-
-        let is_socks5 = peek_buf[0] == super::socks5::SOCKS5_VERSION;
-
-        if is_socks5 {
-            let d = dialer.clone();
-            let cred = proxy_cred.clone();
-            tokio::spawn(async move {
+        let d = Arc::clone(&dialer);
+        let state = Arc::clone(&api_state);
+        let proxy_cred = proxy_cred.clone();
+        let localapi_cred = localapi_cred.clone();
+        children.spawn(async move {
+            // Sniff inside the owned child so an idle connection cannot block
+            // acceptance or lifecycle cancellation.
+            let mut peek_buf = [0u8; 1];
+            let n = match stream.read(&mut peek_buf).await {
+                Ok(n) => n,
+                Err(_) => return,
+            };
+            if n == 0 {
+                return;
+            }
+            if peek_buf[0] == super::socks5::SOCKS5_VERSION {
                 let prefixed = PrefixedStream::new(peek_buf[0], stream);
-                let auth = Some(("tsnet", &cred[..]));
+                let auth = Some(("tsnet", &proxy_cred[..]));
                 if let Err(e) = super::socks5::handle_conn_generic(prefixed, d, auth).await {
                     log::debug!("loopback: socks5 connection ended: {e}");
                 }
-            });
-        } else {
-            let state = api_state.clone();
-            let cred = localapi_cred.clone();
-            tokio::spawn(async move {
+            } else {
                 let prefixed = PrefixedStream::new(peek_buf[0], stream);
-                if let Err(e) = handle_localapi_http(prefixed, state, &cred).await {
+                if let Err(e) = handle_localapi_http(prefixed, state, &localapi_cred).await {
                     log::debug!("loopback: localapi connection ended: {e}");
                 }
-            });
-        }
+            }
+        });
+        while children.try_join_next().is_some() {}
+    }
+    let drain = async { while children.join_next().await.is_some() {} };
+    if tokio::time::timeout(Duration::from_secs(1), drain)
+        .await
+        .is_err()
+    {
+        children.abort_all();
+        while children.join_next().await.is_some() {}
     }
 }
 

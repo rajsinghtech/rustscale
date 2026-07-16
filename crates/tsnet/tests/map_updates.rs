@@ -21,6 +21,7 @@ async fn present_empty_peer_snapshot_revokes_all_but_omission_does_not_replace_i
 
     let state = tempfile::tempdir().unwrap();
     let mut server = Server::builder()
+        .disable_portmapping(true)
         .hostname("empty-snapshot")
         .auth_key("tskey-test")
         .control_url(control.base_url())
@@ -60,5 +61,5 @@ async fn present_empty_peer_snapshot_revokes_all_but_omission_does_not_replace_i
         "an omitted Peers field is a delta/keepalive omission, not a replacement"
     );
 
-    server.close().await;
+    server.close().await.unwrap();
 }

@@ -205,7 +205,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    server.close().await;
+    server.close().await.unwrap();
     eprintln!("shutdown complete");
     Ok(())
 }

@@ -161,32 +161,77 @@ enum C2nError {
 struct C2NServer {
     backend: Arc<dyn C2nBackend>,
     log_id: String,
+    accepted_hook: Option<Arc<tokio::sync::Notify>>,
 }
 
 #[cfg(test)]
 impl C2NServer {
-    fn new(backend: Arc<dyn C2nBackend>, log_id: String) -> Self {
-        Self { backend, log_id }
+    pub fn new(backend: Arc<dyn C2nBackend>, log_id: String) -> Self {
+        Self {
+            backend,
+            log_id,
+            accepted_hook: None,
+        }
+    }
+
+    fn with_accepted_hook(mut self, hook: Arc<tokio::sync::Notify>) -> Self {
+        self.accepted_hook = Some(hook);
+        self
     }
 
     pub async fn serve(self, listener: TcpListener) -> Result<(), C2nError> {
-        loop {
-            let (mut stream, peer_addr) = match listener.accept().await {
-                Ok(v) => v,
-                Err(e) => {
-                    eprintln!("c2n[{}]: accept error: {e}", self.log_id);
-                    continue;
-                }
-            };
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        self.serve_until(listener, shutdown_rx).await
+    }
 
-            let backend = self.backend.clone();
-            let log_id = self.log_id.clone();
-            tokio::spawn(async move {
-                if let Err(e) = handle_connection(&mut stream, peer_addr, &backend, &log_id).await {
-                    eprintln!("c2n[{log_id}]: connection error: {e}");
+    /// Serve until shutdown is requested. Acceptance stops first; active
+    /// handlers then receive a bounded drain window before abort and join.
+    pub async fn serve_until(
+        self,
+        listener: TcpListener,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<(), C2nError> {
+        let mut children = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        break;
+                    }
                 }
-            });
+                accepted = listener.accept() => {
+                    let (mut stream, peer_addr) = match accepted {
+                        Ok(value) => value,
+                        Err(error) => {
+                            eprintln!("c2n[{}]: accept error: {error}", self.log_id);
+                            continue;
+                        }
+                    };
+                    #[cfg(test)]
+                    if let Some(hook) = self.accepted_hook.as_ref() {
+                        hook.notify_one();
+                    }
+                    let backend = Arc::clone(&self.backend);
+                    let log_id = self.log_id.clone();
+                    children.spawn(async move {
+                        if let Err(error) = handle_connection(&mut stream, peer_addr, &backend, &log_id).await {
+                            eprintln!("c2n[{log_id}]: connection error: {error}");
+                        }
+                    });
+                }
+                Some(_) = children.join_next(), if !children.is_empty() => {}
+            }
         }
+
+        let drain = async { while children.join_next().await.is_some() {} };
+        if tokio::time::timeout(std::time::Duration::from_secs(1), drain)
+            .await
+            .is_err()
+        {
+            children.abort_all();
+            while children.join_next().await.is_some() {}
+        }
+        Ok(())
     }
 }
 
@@ -732,6 +777,30 @@ mod tests {
         async fn try_flush_logs(&self) -> bool {
             true
         }
+    }
+
+    #[tokio::test]
+    async fn shutdown_joins_idle_handler_before_fixed_port_rebind() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(tokio::sync::Notify::new());
+        let server = C2NServer::new(Arc::new(FakeBackend), "drain-test".into())
+            .with_accepted_hook(Arc::clone(&accepted));
+        let (shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(server.serve_until(listener, shutdown_rx));
+        let idle = TcpStream::connect(addr).await.unwrap();
+        accepted.notified().await;
+        shutdown.send(true).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("blocked C2N child was not aborted and joined")
+            .unwrap()
+            .unwrap();
+        drop(idle);
+        let retry = TcpListener::bind(addr)
+            .await
+            .expect("C2N listener survived shutdown");
+        drop(retry);
     }
 
     /// Mock backend that returns data for all trait methods.

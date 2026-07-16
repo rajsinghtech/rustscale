@@ -25,7 +25,7 @@ pub use client::{
     ControlClient, MapSessionState, NoiseHttpClient, NoiseRequestError, NoiseResponse,
     NoiseResponseBody, RegisterError, StreamMapError,
 };
-pub use controlbase::{NoiseConn, NoiseError, NoiseIo, ProtocolVersion};
+pub use controlbase::{NoiseConn, NoiseError, NoiseIo, NoiseIoHandle, ProtocolVersion};
 pub use controlhttp::{dial_control, fetch_server_pub_key, DialError, NoiseStream};
 pub use login_flags::{LoginFlags, LOGIN_DEFAULT, LOGIN_EPHEMERAL, LOGIN_INTERACTIVE};
 pub use tka::{TkaClient, TkaRpcError, TkaSession};

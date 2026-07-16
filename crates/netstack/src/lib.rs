@@ -113,6 +113,7 @@ pub enum NetstackError {
 
 /// A userspace TCP/IP stack bridging WireGuard plaintext to smoltcp.
 pub struct Netstack {
+    addr: Ipv4Addr,
     rx_queue: Arc<std::sync::Mutex<VecDeque<Vec<u8>>>>,
     tx_queue: Arc<std::sync::Mutex<VecDeque<Vec<u8>>>>,
     inbound_flows: Arc<std::sync::Mutex<HashMap<TcpFlow, NodePublic>>>,
@@ -124,6 +125,9 @@ pub struct Netstack {
 /// A TCP listener accepting incoming tailnet connections.
 pub struct Listener {
     accept_rx: mpsc::Receiver<Result<NetstackStream, NetstackError>>,
+    cmd_tx: mpsc::Sender<Command>,
+    key: (IpAddr, u16),
+    close_on_drop: bool,
 }
 
 impl Listener {
@@ -138,8 +142,18 @@ impl Listener {
     /// Consume the listener and return the underlying accept channel
     /// receiver. Used by [`ServiceListener`](crate::service::ServiceListener)
     /// to merge multiple VIP listeners into a single accept stream.
-    pub fn into_receiver(self) -> mpsc::Receiver<Result<NetstackStream, NetstackError>> {
-        self.accept_rx
+    pub fn into_receiver(mut self) -> mpsc::Receiver<Result<NetstackStream, NetstackError>> {
+        self.close_on_drop = false;
+        let (_tx, rx) = mpsc::channel(1);
+        std::mem::replace(&mut self.accept_rx, rx)
+    }
+}
+
+impl Drop for Listener {
+    fn drop(&mut self) {
+        if self.close_on_drop {
+            let _ = self.cmd_tx.try_send(Command::CloseTcp { key: self.key });
+        }
     }
 }
 
@@ -371,6 +385,7 @@ impl Netstack {
         ));
 
         Self {
+            addr,
             rx_queue,
             tx_queue,
             inbound_flows,
@@ -431,7 +446,12 @@ impl Netstack {
             .await
             .map_err(|_| NetstackError::ShuttingDown)?;
         let accept_rx = reply_rx.await.map_err(|_| NetstackError::ShuttingDown)??;
-        Ok(Listener { accept_rx })
+        Ok(Listener {
+            accept_rx,
+            cmd_tx: self.cmd_tx.clone(),
+            key: (IpAddr::V4(self.addr), port),
+            close_on_drop: true,
+        })
     }
 
     /// Start listening for incoming TCP connections on a specific local `addr`
@@ -449,7 +469,12 @@ impl Netstack {
             .await
             .map_err(|_| NetstackError::ShuttingDown)?;
         let accept_rx = reply_rx.await.map_err(|_| NetstackError::ShuttingDown)??;
-        Ok(Listener { accept_rx })
+        Ok(Listener {
+            accept_rx,
+            cmd_tx: self.cmd_tx.clone(),
+            key: (addr, port),
+            close_on_drop: true,
+        })
     }
 
     /// Add an additional IP address to the smoltcp interface. Required before
@@ -554,6 +579,9 @@ enum Command {
         reply: oneshot::Sender<Result<UdpListenerParts, NetstackError>>,
     },
     CloseUdp {
+        key: (IpAddr, u16),
+    },
+    CloseTcp {
         key: (IpAddr, u16),
     },
 }
@@ -762,6 +790,13 @@ async fn poll_loop(
                             let _ = sockets.remove(state.handle);
                         }
                         udp_allocated_ports.remove(&key.1);
+                    }
+                    Some(Command::CloseTcp { key }) => {
+                        if let Some(entry) = listeners.remove(&key) {
+                            for handle in entry.handles {
+                                let _ = sockets.remove(handle);
+                            }
+                        }
                     }
                     None => break,
                 }

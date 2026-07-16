@@ -3,6 +3,33 @@
 use super::*;
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+#[tokio::test]
+async fn blocked_serve_child_is_aborted_and_joined_at_deadline() {
+    struct Dropped(Arc<AtomicBool>);
+    impl Drop for Dropped {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    let dropped = Arc::new(AtomicBool::new(false));
+    let child_dropped = Arc::clone(&dropped);
+    let task = tokio::spawn(async move {
+        let _guard = Dropped(child_dropped);
+        std::future::pending::<()>().await;
+    });
+    let mut tasks = vec![task];
+    tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        drain_listener_tasks(&mut tasks),
+    )
+    .await
+    .expect("serve child drain exceeded its deadline");
+    assert!(dropped.load(Ordering::SeqCst));
+}
 
 // ---------------------------------------------------------------------------
 // ServeConfig serde

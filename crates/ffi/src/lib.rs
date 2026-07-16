@@ -397,16 +397,29 @@ pub extern "C" fn ts_up(handle: c_int) -> c_int {
 #[no_mangle]
 pub extern "C" fn ts_close(handle: c_int) -> c_int {
     catch("ts_close", || {
-        // Remove from the table, close outside the lock.
+        // Close outside the table lock, but retain the handle and complete
+        // owner when shutdown reports that an extension requires a retry.
         let server_arc = {
-            let mut t = table().lock().expect("table poisoned");
-            t.servers.remove(&handle).and_then(|e| e.server)
+            let t = table().lock().expect("table poisoned");
+            let Some(entry) = t.servers.get(&handle) else {
+                return RS_OK;
+            };
+            entry.server.clone()
         };
 
         if let Some(arc) = server_arc {
             let mut server = arc.lock().expect("server mutex poisoned");
-            runtime().block_on(server.close());
+            if let Err(error) = runtime().block_on(server.close()) {
+                let mut t = table().lock().expect("table poisoned");
+                set_server_error(&mut t, handle, error.to_string());
+                return RS_ERR_UNKNOWN;
+            }
         }
+        table()
+            .lock()
+            .expect("table poisoned")
+            .servers
+            .remove(&handle);
         RS_OK
     })
 }

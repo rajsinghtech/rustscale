@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.3
+
+Linux artifact compatibility hotfix. GNU/Linux release binaries are built on
+Ubuntu 22.04 and executed in Debian 12 before publication, avoiding the glibc
+2.39 requirement present in v0.1.2. Also includes pinned Go speedtest
+interoperability, complete CLI `wait` behavior, and transactional systemd user
+units.
+
 ## 0.1.2
 
 First-run reliability and daemon lifecycle hotfix.

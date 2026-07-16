@@ -62,6 +62,9 @@ for target in \
 done
 
 grep -q 'body_path:.*needs.metadata.outputs.notes' .github/workflows/release.yml
+grep -q 'runs-on: ubuntu-22.04' .github/workflows/release.yml
+grep -q 'name: Linux glibc compatibility' .github/workflows/release.yml
+grep -q 'debian:12-slim' .github/workflows/release.yml
 grep -Fq 'pattern: rustscale-*' .github/workflows/release.yml
 grep -q 'SHA256SUMS' scripts/install.sh
 grep -q 'SHA256SUMS' scripts/install.ps1
@@ -83,7 +86,7 @@ docker_job=$(awk '
     docker && /^  [A-Za-z0-9_-]+:/ { exit }
     docker { print }
 ' .github/workflows/release.yml)
-printf '%s\n' "$docker_job" | grep -Fq 'needs: [metadata, linux]'
+printf '%s\n' "$docker_job" | grep -Fq 'needs: [metadata, linux, linux-compat]'
 printf '%s\n' "$docker_job" | grep -Fq 'timeout-minutes: 20'
 printf '%s\n' "$docker_job" | grep -Fq 'pattern: rustscale-*-unknown-linux-gnu'
 printf '%s\n' "$docker_job" | grep -Fq 'file: ./Dockerfile.release'

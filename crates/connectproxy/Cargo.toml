@@ -13,4 +13,4 @@ workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 log = "0.4"
-rustscale-tsdial = { path = "../tsdial", version = "0.1.2" }
+rustscale-tsdial = { path = "../tsdial", version = "0.1.3" }

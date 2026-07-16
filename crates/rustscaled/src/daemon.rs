@@ -176,6 +176,29 @@ async fn retry_close<R: CloseRunner>(runner: &mut R) -> Result<(), R::Error> {
     }
 }
 
+const UNCONFIRMED_EXTERNAL_PORTMAP_RELEASE: &str = "server cleanup is busy or failed; retry close: magicsock cleanup: portmapper cleanup incomplete: protocol error: portmapper cleanup remains uncertain";
+
+fn is_only_unconfirmed_external_portmap_release(error: &TsnetError) -> bool {
+    matches!(error, TsnetError::ShutdownIncomplete(detail) if detail == UNCONFIRMED_EXTERNAL_PORTMAP_RELEASE)
+}
+
+async fn close_server(server: &mut Server) -> Result<(), TsnetError> {
+    match retry_close(server).await {
+        Ok(()) => Ok(()),
+        Err(error) if is_only_unconfirmed_external_portmap_release(&error) => {
+            // NAT-PMP/PCP/UPnP deletion has no reliable acknowledgement on
+            // every router. After bounded retries all local tasks and send
+            // ownership are already closed; an external lease can only age
+            // out. Do not make systemd treat that sole uncertainty as a crash.
+            log::warn!(
+                "rustscaled: shutdown complete with unconfirmed external port mapping release"
+            );
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
 trait LogoutRunner {
     type Error: std::fmt::Display;
 
@@ -309,7 +332,7 @@ async fn run_with_auth_key(
     }
 
     log::info!("rustscaled: shutting down...");
-    retry_close(&mut server).await?;
+    close_server(&mut server).await?;
     Ok(())
 }
 
@@ -396,7 +419,7 @@ async fn run_interactive(
     if should_resume_persisted_node(&persisted_prefs) {
         if !bring_up_until_shutdown(&mut server, tun, shutdown.as_mut()).await? {
             log::info!("rustscaled: shutdown interrupted persisted-node restore");
-            retry_close(&mut server).await?;
+            close_server(&mut server).await?;
             return Ok(());
         }
         if tun {
@@ -416,7 +439,7 @@ async fn run_interactive(
             command = command_rx.recv() => command,
             () = shutdown.as_mut() => {
                 log::info!("rustscaled: shutdown while waiting for login");
-                retry_close(&mut server).await?;
+                close_server(&mut server).await?;
                 return Ok(());
             }
         };
@@ -430,7 +453,7 @@ async fn run_interactive(
                 }
                 if !bring_up_until_shutdown(&mut server, tun, shutdown.as_mut()).await? {
                     log::info!("rustscaled: shutdown interrupted startup");
-                    retry_close(&mut server).await?;
+                    close_server(&mut server).await?;
                     return Ok(());
                 }
                 if tun {
@@ -445,7 +468,7 @@ async fn run_interactive(
             DaemonCommand::LoginInteractive => {
                 if !bring_up_until_shutdown(&mut server, tun, shutdown.as_mut()).await? {
                     log::info!("rustscaled: shutdown interrupted interactive startup");
-                    retry_close(&mut server).await?;
+                    close_server(&mut server).await?;
                     return Ok(());
                 }
                 if tun {
@@ -463,7 +486,7 @@ async fn run_interactive(
             }
             DaemonCommand::Shutdown => {
                 log::debug!("rustscaled: shutdown requested (server not up yet)");
-                retry_close(&mut server).await?;
+                close_server(&mut server).await?;
                 return Ok(());
             }
             DaemonCommand::ReloadConfig => {
@@ -555,7 +578,7 @@ async fn run_interactive(
     }
 
     log::info!("rustscaled: shutting down...");
-    retry_close(&mut server).await?;
+    close_server(&mut server).await?;
     Ok(())
 }
 
@@ -797,8 +820,9 @@ mod tests {
     use rustscale_tsnet::PreferencePolicy;
 
     use super::{
-        retry_close, retry_logout_until_shutdown, should_resume_persisted_node, CloseRunner,
-        InstallUpdatesPolicy, LogoutRunner,
+        is_only_unconfirmed_external_portmap_release, retry_close, retry_logout_until_shutdown,
+        should_resume_persisted_node, CloseRunner, InstallUpdatesPolicy, LogoutRunner,
+        UNCONFIRMED_EXTERNAL_PORTMAP_RELEASE,
     };
 
     struct TransientClose {
@@ -818,6 +842,17 @@ mod tests {
                 Ok(())
             }
         }
+    }
+
+    #[test]
+    fn daemon_accepts_only_exact_external_portmap_release_uncertainty() {
+        let accepted = rustscale_tsnet::TsnetError::ShutdownIncomplete(
+            UNCONFIRMED_EXTERNAL_PORTMAP_RELEASE.into(),
+        );
+        assert!(is_only_unconfirmed_external_portmap_release(&accepted));
+        let rejected =
+            rustscale_tsnet::TsnetError::ShutdownIncomplete("router cleanup incomplete".into());
+        assert!(!is_only_unconfirmed_external_portmap_release(&rejected));
     }
 
     #[tokio::test]

@@ -1572,6 +1572,7 @@ impl Server {
                 capture: capture.clone(),
                 metrics: localapi::default_metric_registry(),
                 prefs: prefs.clone(),
+                operator_access: std::sync::Mutex::default(),
                 posture_checking: b.posture_checking.clone(),
                 profile_mutations: profile_mutations.clone(),
                 exit_node_selection: exit_node_selection.clone(),
@@ -2225,6 +2226,7 @@ impl Server {
                 capture: capture.clone(),
                 metrics: localapi::default_metric_registry(),
                 prefs: prefs.clone(),
+                operator_access: std::sync::Mutex::default(),
                 posture_checking: b.posture_checking.clone(),
                 profile_mutations: profile_mutations.clone(),
                 exit_node_selection: exit_node_selection.clone(),
@@ -2734,6 +2736,7 @@ impl Server {
             capture: crate::capture::new_slot(),
             metrics: localapi::default_metric_registry(),
             prefs: prefs.clone(),
+            operator_access: std::sync::Mutex::default(),
             posture_checking: Arc::new(AtomicBool::new(prefs.read().await.PostureChecking)),
             profile_mutations: Arc::new(tokio::sync::Mutex::new(())),
             exit_node_selection: Arc::new(RwLock::new(ExitNodeSelection::from_prefs(

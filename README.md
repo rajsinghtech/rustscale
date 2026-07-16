@@ -26,7 +26,16 @@ or endorsed by Tailscale Inc.
 
 ### CLI + daemon
 
-Start the daemon (root needed for TUN mode):
+The Linux package starts the systemd daemon automatically. Before using the
+CLI as an ordinary user, perform this one-time privileged setup (replace
+`$USER` with the intended local operator):
+
+```
+sudo rustscale set --operator "$USER"
+```
+
+For a source/manual install without systemd, start the daemon once (root is
+needed for TUN mode) and then configure an operator as above:
 
 ```
 sudo rustscaled run
@@ -160,7 +169,7 @@ also installs the `rustscale-tun` CLI; `--uninstall` removes everything.
 ## Getting started
 
 ```sh
-sudo rustscaled run              # start the daemon (root needed for TUN mode)
+sudo rustscale set --operator "$USER" # one-time, after the systemd service is running
 rustscale up                     # interactive auth (QR code)
 rustscale up --auth-key tskey-...  # headless auth
 rustscale status                 # daemon state and connections

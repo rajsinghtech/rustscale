@@ -29,21 +29,37 @@ pub struct C2nRequest {
 }
 
 /// A C2N response sent back over the Noise control channel.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct C2nResponse {
     pub status: u16,
     pub body: Vec<u8>,
+    publication_validator: Option<Arc<dyn C2nPublicationValidator>>,
+}
+
+impl std::fmt::Debug for C2nResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("C2nResponse")
+            .field("status", &self.status)
+            .field("body", &self.body)
+            .finish_non_exhaustive()
+    }
 }
 
 impl C2nResponse {
     pub fn ok(body: Vec<u8>) -> Self {
-        Self { status: 200, body }
+        Self {
+            status: 200,
+            body,
+            publication_validator: None,
+        }
     }
 
     pub fn error(status: u16, msg: impl Into<String>) -> Self {
         Self {
             status,
             body: msg.into().into_bytes(),
+            publication_validator: None,
         }
     }
 
@@ -51,6 +67,7 @@ impl C2nResponse {
         Self {
             status: 204,
             body: vec![],
+            publication_validator: None,
         }
     }
 
@@ -58,6 +75,7 @@ impl C2nResponse {
         Self {
             status,
             body: msg.into().into_bytes(),
+            publication_validator: None,
         }
     }
 
@@ -65,8 +83,26 @@ impl C2nResponse {
         Self {
             status,
             body: serde_json::to_vec(value).unwrap_or_default(),
+            publication_validator: None,
         }
     }
+
+    /// Bind this response to validation at the transport publication point.
+    pub fn with_publication_validator(
+        mut self,
+        validator: Arc<dyn C2nPublicationValidator>,
+    ) -> Self {
+        self.publication_validator = Some(validator);
+        self
+    }
+}
+
+/// Synchronizes validation with publication of a sensitive C2N response.
+pub trait C2nPublicationValidator: Send + Sync {
+    fn validate_and_publish(
+        &self,
+        publish: &mut dyn FnMut() -> Result<(), C2nReplyError>,
+    ) -> Result<(), C2nReplyError>;
 }
 
 /// A C2N handler processes a single request and returns a response.
@@ -136,10 +172,32 @@ impl C2nRouter {
     }
 }
 
+/// A serialized C2N response plus its optional publication validator.
+pub struct C2nReply {
+    bytes: Vec<u8>,
+    publication_validator: Option<Arc<dyn C2nPublicationValidator>>,
+}
+
+impl C2nReply {
+    /// Validate and synchronously publish bytes while the validator's policy
+    /// synchronization barrier remains held.
+    pub fn publish(
+        &self,
+        mut publish: impl FnMut(&[u8]) -> Result<(), C2nReplyError>,
+    ) -> Result<(), C2nReplyError> {
+        let mut publish_bytes = || publish(&self.bytes);
+        if let Some(validator) = &self.publication_validator {
+            validator.validate_and_publish(&mut publish_bytes)
+        } else {
+            publish_bytes()
+        }
+    }
+}
+
 /// Injectable same-session transport for a serialized C2N HTTP response.
 #[async_trait]
 pub trait C2nReplyTransport: Send + Sync {
-    async fn send(&self, callback_path: &str, response: Vec<u8>) -> Result<(), C2nReplyError>;
+    async fn send(&self, callback_path: &str, response: C2nReply) -> Result<(), C2nReplyError>;
 }
 
 /// Privacy-safe C2N handling failures. Values supplied by control and posture
@@ -160,6 +218,8 @@ pub enum C2nReplyError {
     Transport,
     #[error("C2N callback timed out")]
     ReplyTimeout,
+    #[error("C2N sensitive publication authorization changed")]
+    PublicationRevoked,
 }
 
 /// Parse, route, and return one `Types == "c2n"` ping request.
@@ -327,7 +387,7 @@ fn callback_path(value: &str) -> Result<String, C2nReplyError> {
     Ok(path.to_owned())
 }
 
-fn serialize_http_response(response: C2nResponse) -> Result<Vec<u8>, C2nReplyError> {
+fn serialize_http_response(response: C2nResponse) -> Result<C2nReply, C2nReplyError> {
     if response.body.len() > MAX_C2N_RESPONSE_BYTES {
         return Err(C2nReplyError::ResponseTooLarge);
     }
@@ -347,7 +407,10 @@ fn serialize_http_response(response: C2nResponse) -> Result<Vec<u8>, C2nReplyErr
     if bytes.len() > MAX_C2N_RESPONSE_BYTES {
         return Err(C2nReplyError::ResponseTooLarge);
     }
-    Ok(bytes)
+    Ok(C2nReply {
+        bytes,
+        publication_validator: response.publication_validator,
+    })
 }
 
 fn is_token_byte(byte: u8) -> bool {
@@ -372,9 +435,14 @@ mod tests {
     struct FakeTransport(Mutex<Vec<(String, Vec<u8>)>>);
     #[async_trait]
     impl C2nReplyTransport for FakeTransport {
-        async fn send(&self, path: &str, response: Vec<u8>) -> Result<(), C2nReplyError> {
-            self.0.lock().unwrap().push((path.to_owned(), response));
-            Ok(())
+        async fn send(&self, path: &str, response: C2nReply) -> Result<(), C2nReplyError> {
+            response.publish(|bytes| {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((path.to_owned(), bytes.to_vec()));
+                Ok(())
+            })
         }
     }
 
@@ -485,6 +553,101 @@ mod tests {
         })
         .await
         .expect("session cancellation did not reach handler worker");
+    }
+
+    #[tokio::test]
+    async fn pre_send_generation_barrier_discards_sensitive_bytes_after_opt_out() {
+        struct SensitiveHandler {
+            generation: Arc<std::sync::atomic::AtomicU64>,
+        }
+
+        struct GenerationValidator {
+            generation: Arc<std::sync::atomic::AtomicU64>,
+            expected: u64,
+        }
+
+        impl C2nPublicationValidator for GenerationValidator {
+            fn validate_and_publish(
+                &self,
+                publish: &mut dyn FnMut() -> Result<(), C2nReplyError>,
+            ) -> Result<(), C2nReplyError> {
+                if self.generation.load(std::sync::atomic::Ordering::Acquire) != self.expected {
+                    return Err(C2nReplyError::PublicationRevoked);
+                }
+                publish()
+            }
+        }
+
+        #[async_trait]
+        impl C2nHandler for SensitiveHandler {
+            async fn handle(&self, _req: C2nRequest) -> C2nResponse {
+                let expected = self.generation.load(std::sync::atomic::Ordering::Acquire);
+                C2nResponse::json(200, &serde_json::json!({"SerialNumbers":["secret-serial"]}))
+                    .with_publication_validator(Arc::new(GenerationValidator {
+                        generation: self.generation.clone(),
+                        expected,
+                    }))
+            }
+        }
+
+        struct BlockedTransport {
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+            published: Arc<Mutex<Vec<u8>>>,
+        }
+
+        #[async_trait]
+        impl C2nReplyTransport for BlockedTransport {
+            async fn send(
+                &self,
+                _callback_path: &str,
+                response: C2nReply,
+            ) -> Result<(), C2nReplyError> {
+                self.entered.notify_one();
+                self.release.notified().await;
+                response.publish(|bytes| {
+                    self.published.lock().unwrap().extend_from_slice(bytes);
+                    Ok(())
+                })
+            }
+        }
+
+        let generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut router = C2nRouter::new();
+        router.register(
+            "POST /posture",
+            Arc::new(SensitiveHandler {
+                generation: generation.clone(),
+            }),
+        );
+        let router = Arc::new(router);
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let published = Arc::new(Mutex::new(Vec::new()));
+        let transport = Arc::new(BlockedTransport {
+            entered: entered.clone(),
+            release: release.clone(),
+            published: published.clone(),
+        });
+        let task = tokio::spawn(async move {
+            answer_c2n_ping(
+                router.as_ref(),
+                transport.as_ref(),
+                &PingRequest {
+                    URL: "https://control.example/callback".into(),
+                    Types: "c2n".into(),
+                    Payload: request("/posture", b""),
+                    ..PingRequest::default()
+                },
+            )
+            .await
+        });
+
+        entered.notified().await;
+        generation.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        release.notify_one();
+        assert_eq!(task.await.unwrap(), Err(C2nReplyError::PublicationRevoked));
+        assert!(published.lock().unwrap().is_empty());
     }
 
     #[test]

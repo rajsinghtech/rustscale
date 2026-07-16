@@ -178,6 +178,63 @@ const CAPABILITY_VERSION: i32 = 141;
 /// `cmp.Or(nc.opts.ProtocolVersion, uint16(tailcfg.CurrentCapabilityVersion))`.
 const PROTOCOL_VERSION: u16 = 141;
 
+/// Live posture preference plus the publication barrier that linearizes
+/// preference revocation against sensitive C2N transport writes.
+pub(crate) struct LivePosturePreference {
+    value: AtomicBool,
+    generation: AtomicU64,
+    publication: std::sync::RwLock<()>,
+}
+
+impl LivePosturePreference {
+    pub(crate) const fn new(value: bool) -> Self {
+        Self {
+            value: AtomicBool::new(value),
+            generation: AtomicU64::new(0),
+            publication: std::sync::RwLock::new(()),
+        }
+    }
+
+    pub(crate) fn load(&self, ordering: std::sync::atomic::Ordering) -> bool {
+        self.value.load(ordering)
+    }
+
+    pub(crate) fn store(&self, value: bool, ordering: std::sync::atomic::Ordering) {
+        let _publication = self
+            .publication
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.value.swap(value, ordering) != value {
+            self.generation
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> (bool, u64) {
+        let _publication = self
+            .publication
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (
+            self.value.load(std::sync::atomic::Ordering::Acquire),
+            self.generation.load(std::sync::atomic::Ordering::Acquire),
+        )
+    }
+
+    pub(crate) fn with_generation<R>(
+        &self,
+        expected_generation: u64,
+        operation: impl FnOnce(bool) -> R,
+    ) -> Option<R> {
+        let _publication = self
+            .publication
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (self.generation.load(std::sync::atomic::Ordering::Acquire) == expected_generation)
+            .then(|| operation(self.value.load(std::sync::atomic::Ordering::Acquire)))
+    }
+}
+
 /// Errors from tsnet operations.
 #[derive(Debug, thiserror::Error)]
 pub enum TsnetError {
@@ -891,7 +948,7 @@ pub(crate) struct RunningState {
     /// C2N request router (control-to-node handler dispatch).
     pub(crate) c2n_router: Arc<C2nRouter>,
     /// Live posture preference shared with LocalAPI and C2N.
-    pub(crate) posture_checking: Arc<AtomicBool>,
+    pub(crate) posture_checking: Arc<LivePosturePreference>,
     /// Control-plane feature flags extracted from netmap updates.
     pub(crate) control_knobs: Arc<ControlKnobs>,
     /// PeerAPI listen port (deterministic, from tailscale IPs).
@@ -1050,7 +1107,7 @@ pub(crate) struct Bootstrap {
     /// C2N request router (control-to-node handler dispatch).
     pub(crate) c2n_router: Arc<C2nRouter>,
     /// Live persisted posture preference used by C2N collection.
-    pub(crate) posture_checking: Arc<AtomicBool>,
+    pub(crate) posture_checking: Arc<LivePosturePreference>,
     /// Control-plane feature flags extracted from netmap updates.
     pub(crate) control_knobs: Arc<ControlKnobs>,
     /// Runtime Hostinfo field overrides (shared with the update loop).

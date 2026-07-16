@@ -1,12 +1,14 @@
 use std::collections::BTreeMap;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
 
 use async_trait::async_trait;
 use rustscale_c2n::{C2nBackend, LogLevelState, WhoIsResult};
-use rustscale_controlclient::c2n::{C2nHandler, C2nRequest, C2nResponse, C2nRouter};
+use rustscale_controlclient::c2n::{
+    C2nHandler, C2nPublicationValidator, C2nReplyError, C2nRequest, C2nResponse, C2nRouter,
+};
 use rustscale_health::{Severity, Tracker};
 use rustscale_magicsock::Magicsock;
 use rustscale_tailcfg::{C2NPostureIdentityResponse, DNSConfig, Node, UserID, UserProfile};
@@ -37,8 +39,40 @@ pub(crate) struct C2nBackendData {
     pub magicsock: Arc<Magicsock>,
     pub sockstats: Arc<rustscale_sockstats::SockStats>,
     pub logtail: Option<rustscale_logtail::LogTail>,
-    pub posture_checking: Arc<AtomicBool>,
+    pub posture_checking: Arc<crate::LivePosturePreference>,
     pub posture_service: Arc<rustscale_posture::IdentityService>,
+}
+
+struct CollectedPosture {
+    response: C2NPostureIdentityResponse,
+    preference_generation: u64,
+    include_hardware_addrs: bool,
+}
+
+struct PosturePublicationValidator {
+    preference: Arc<crate::LivePosturePreference>,
+    posture_service: Arc<rustscale_posture::IdentityService>,
+    expected_generation: u64,
+    include_hardware_addrs: bool,
+    response_has_hardware_addrs: bool,
+}
+
+impl C2nPublicationValidator for PosturePublicationValidator {
+    fn validate_and_publish(
+        &self,
+        publish: &mut dyn FnMut() -> Result<(), C2nReplyError>,
+    ) -> Result<(), C2nReplyError> {
+        self.preference
+            .with_generation(self.expected_generation, |user_enabled| {
+                if (self.response_has_hardware_addrs && !self.include_hardware_addrs)
+                    || !self.posture_service.publication_allowed(user_enabled)
+                {
+                    return Err(C2nReplyError::PublicationRevoked);
+                }
+                publish()
+            })
+            .ok_or(C2nReplyError::PublicationRevoked)?
+    }
 }
 
 pub struct TsnetC2nBackend {
@@ -53,7 +87,7 @@ pub struct TsnetC2nBackend {
     magicsock: Arc<Magicsock>,
     sockstats: Arc<rustscale_sockstats::SockStats>,
     logtail: Option<rustscale_logtail::LogTail>,
-    posture_checking: Arc<AtomicBool>,
+    posture_checking: Arc<crate::LivePosturePreference>,
     posture_service: Arc<rustscale_posture::IdentityService>,
     log_level: LogLevelState,
 }
@@ -82,9 +116,10 @@ impl TsnetC2nBackend {
         &self,
         include_hardware_addrs: bool,
         session_cancellation: tokio_util::sync::CancellationToken,
-    ) -> Option<C2NPostureIdentityResponse> {
+    ) -> Option<CollectedPosture> {
         const POSTURE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
+        let (_, preference_generation) = self.posture_checking.snapshot();
         let service = self.posture_service.clone();
         let worker_service = service.clone();
         let preference = self.posture_checking.clone();
@@ -176,10 +211,14 @@ impl TsnetC2nBackend {
             identity.serial_numbers.len(),
             identity.iface_hardware_addrs.len()
         );
-        Some(C2NPostureIdentityResponse {
-            serial_numbers: identity.serial_numbers,
-            iface_hardware_addrs: identity.iface_hardware_addrs,
-            posture_disabled: identity.posture_disabled,
+        Some(CollectedPosture {
+            response: C2NPostureIdentityResponse {
+                serial_numbers: identity.serial_numbers,
+                iface_hardware_addrs: identity.iface_hardware_addrs,
+                posture_disabled: identity.posture_disabled,
+            },
+            preference_generation,
+            include_hardware_addrs,
         })
     }
 }
@@ -333,6 +372,7 @@ impl C2nBackend for TsnetC2nBackend {
     async fn posture_identity(&self) -> Option<C2NPostureIdentityResponse> {
         self.collect_posture(false, tokio_util::sync::CancellationToken::new())
             .await
+            .map(|collected| collected.response)
     }
 }
 
@@ -492,9 +532,25 @@ impl C2nHandler for PostureIdentityHandler {
             .collect_posture(include_hardware_addrs, cancellation)
             .await
         {
-            Some(response) => {
-                let body = serde_json::to_value(response).unwrap_or(serde_json::Value::Null);
-                C2nResponse::json(200, &body)
+            Some(collected) => {
+                let response_has_hardware_addrs =
+                    !collected.response.iface_hardware_addrs.is_empty();
+                let response_is_sensitive =
+                    response_has_hardware_addrs || !collected.response.serial_numbers.is_empty();
+                let body =
+                    serde_json::to_value(&collected.response).unwrap_or(serde_json::Value::Null);
+                let response = C2nResponse::json(200, &body);
+                if response_is_sensitive {
+                    response.with_publication_validator(Arc::new(PosturePublicationValidator {
+                        preference: self.backend.posture_checking.clone(),
+                        posture_service: self.backend.posture_service.clone(),
+                        expected_generation: collected.preference_generation,
+                        include_hardware_addrs: collected.include_hardware_addrs,
+                        response_has_hardware_addrs,
+                    }))
+                } else {
+                    response
+                }
             }
             None => C2nResponse::error(501, "posture identity not available"),
         }

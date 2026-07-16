@@ -274,7 +274,7 @@ impl crate::C2nReplyTransport for NoopC2nTransport {
     async fn send(
         &self,
         _callback_path: &str,
-        _response: Vec<u8>,
+        _response: crate::C2nReply,
     ) -> Result<(), crate::C2nReplyError> {
         Ok(())
     }

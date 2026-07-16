@@ -386,6 +386,12 @@ impl IdentityService {
         })
     }
 
+    /// Whether live management policy and user preference still authorize
+    /// publication. Policy lookup failure is denial.
+    pub fn publication_allowed(&self, user_enabled: bool) -> bool {
+        self.disabled_result(user_enabled).is_none()
+    }
+
     /// Re-check live policy immediately before a caller publishes a completed
     /// result. Revocation replaces any stale identity with a disabled result.
     pub fn revalidate_for_publication(

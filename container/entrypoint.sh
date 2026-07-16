@@ -77,6 +77,10 @@ if [ -n "${TS_AUTHKEY:-}" ]; then
 elif [ -n "${TS_AUTH_KEY:-}" ]; then
     AUTH_KEY=$(maybe_read_file "$TS_AUTH_KEY")
 fi
+# rustscaled also understands TS_AUTHKEY. Do not let it race the entrypoint's
+# LocalAPI-driven bootstrap (especially for file: secrets); only `rustscale up`
+# below owns container authentication and preference application.
+unset TS_AUTHKEY TS_AUTH_KEY
 
 mkdir -p "$STATE_DIR"
 
@@ -129,47 +133,42 @@ case "$STATUS" in
     *"Running"*) ALREADY_UP=true; log "already running" ;;
 esac
 
-# Determine if we should login.
-SHOULD_LOGIN=true
+# Always run `up`: on an online node it applies current environment-derived
+# preferences without re-registering. AUTH_ONCE=0 additionally requests the
+# documented reauthentication behavior.
+UP_ARGS=""
 if [ "$ALREADY_UP" = true ] && bool_false "${AUTH_ONCE:-0}"; then
-    # AUTH_ONCE=0 means always re-auth.
-    SHOULD_LOGIN=true
-elif [ "$ALREADY_UP" = true ]; then
-    SHOULD_LOGIN=false
+    UP_ARGS="$UP_ARGS --force-reauth"
 fi
 
-if [ "$SHOULD_LOGIN" = true ]; then
-    UP_ARGS=""
-
-    if [ -n "$AUTH_KEY" ]; then
-        UP_ARGS="$UP_ARGS --auth-key $AUTH_KEY"
-    fi
-    if [ -n "${TS_HOSTNAME:-}" ]; then
-        UP_ARGS="$UP_ARGS --hostname $TS_HOSTNAME"
-    fi
-    if [ -n "${TS_ROUTES:-}" ]; then
-        UP_ARGS="$UP_ARGS --advertise-routes $TS_ROUTES"
-    fi
-    if [ -n "${TS_EXIT_NODE:-}" ]; then
-        UP_ARGS="$UP_ARGS --exit-node $TS_EXIT_NODE"
-    fi
-    if ! bool_false "${TS_ACCEPT_DNS:-0}"; then
-        UP_ARGS="$UP_ARGS --accept-dns"
-    fi
-    if ! bool_false "${TS_ACCEPT_ROUTES:-0}"; then
-        UP_ARGS="$UP_ARGS --accept-routes"
-    fi
-    if [ -n "${TS_EXTRA_ARGS:-}" ]; then
-        UP_ARGS="$UP_ARGS $TS_EXTRA_ARGS"
-    fi
-
-    log "running rustscale up"
-    # shellcheck disable=SC2086 # intentional word splitting for args
-    if ! rustscale --socket "$SOCKET" up $UP_ARGS; then
-        err "rustscale up failed"
-    fi
-    log "login complete"
+if [ -n "$AUTH_KEY" ]; then
+    UP_ARGS="$UP_ARGS --auth-key $AUTH_KEY"
 fi
+if [ -n "${TS_HOSTNAME:-}" ]; then
+    UP_ARGS="$UP_ARGS --hostname $TS_HOSTNAME"
+fi
+if [ -n "${TS_ROUTES:-}" ]; then
+    UP_ARGS="$UP_ARGS --advertise-routes $TS_ROUTES"
+fi
+if [ -n "${TS_EXIT_NODE:-}" ]; then
+    UP_ARGS="$UP_ARGS --exit-node $TS_EXIT_NODE"
+fi
+if ! bool_false "${TS_ACCEPT_DNS:-0}"; then
+    UP_ARGS="$UP_ARGS --accept-dns"
+fi
+if ! bool_false "${TS_ACCEPT_ROUTES:-0}"; then
+    UP_ARGS="$UP_ARGS --accept-routes"
+fi
+if [ -n "${TS_EXTRA_ARGS:-}" ]; then
+    UP_ARGS="$UP_ARGS $TS_EXTRA_ARGS"
+fi
+
+log "running rustscale up"
+# shellcheck disable=SC2086 # intentional word splitting for args
+if ! rustscale --socket "$SOCKET" up $UP_ARGS; then
+    err "rustscale up failed"
+fi
+log "login and preference application complete"
 
 # ---------------------------------------------------------------------------
 # Keep the container alive

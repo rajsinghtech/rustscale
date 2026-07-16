@@ -67,6 +67,7 @@ grep -q 'SHA256SUMS' scripts/install.sh
 grep -q 'SHA256SUMS' scripts/install.ps1
 grep -q 'packaging/systemd/rustscaled.service' .github/workflows/release.yml
 grep -Fq "rustscaled run --state /var/lib/rustscale --socket /var/run/rustscaled.sock --tun \$FLAGS" packaging/systemd/rustscaled.service
+grep -Fxq 'Restart=always' packaging/systemd/rustscaled.service
 if grep -Eq -- '--(state|statedir|socket)=' packaging/systemd/rustscaled.service; then
     echo "systemd unit uses unsupported --flag=value daemon syntax" >&2
     exit 1

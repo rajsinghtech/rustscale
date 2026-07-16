@@ -63,6 +63,20 @@ pub use windows::Listener;
 // Cross-platform functions
 // ---------------------------------------------------------------------------
 
+/// Remove a stale listener pathname without deleting non-socket entries.
+/// Named pipes have no filesystem entry to remove.
+pub fn remove_socket_file(path: &std::path::Path) -> std::io::Result<bool> {
+    #[cfg(unix)]
+    {
+        unix::remove_socket_file(path)
+    }
+    #[cfg(windows)]
+    {
+        let _ = path;
+        Ok(false)
+    }
+}
+
 /// Listen at the given path.
 ///
 /// On Unix, creates a Unix domain socket with appropriate permissions. On

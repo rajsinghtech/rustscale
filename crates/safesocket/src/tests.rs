@@ -3,7 +3,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[cfg(unix)]
-use crate::{connect, connect_with_retries_with_handle, listen};
+use crate::{connect, connect_with_retries_with_handle, listen, remove_socket_file};
 
 #[cfg(unix)]
 #[test]
@@ -55,8 +55,11 @@ async fn test_stale_socket_replaced() {
     let dir = tempfile::tempdir().unwrap();
     let sock = dir.path().join("stale.sock");
 
-    std::fs::write(&sock, b"stale").unwrap();
-    assert!(sock.exists(), "stale file should exist");
+    // A datagram socket is definitively not a live stream listener while
+    // retaining the filesystem socket type used by stale daemon sockets.
+    let stale = std::os::unix::net::UnixDatagram::bind(&sock).unwrap();
+    drop(stale);
+    assert!(sock.exists(), "stale socket should exist");
 
     let listener = listen(&sock).unwrap();
     assert!(sock.exists(), "socket file should exist after re-listen");
@@ -65,6 +68,21 @@ async fn test_stale_socket_replaced() {
     assert!(conn.is_ok(), "should be able to connect to new listener");
 
     drop(listener);
+    assert!(remove_socket_file(&sock).unwrap());
+    assert!(!sock.exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_listen_preserves_regular_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    std::fs::write(&path, b"do not delete").unwrap();
+
+    let error = listen(&path).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+    assert!(!remove_socket_file(&path).unwrap());
+    assert_eq!(std::fs::read(&path).unwrap(), b"do not delete");
 }
 
 #[cfg(unix)]

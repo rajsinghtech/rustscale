@@ -96,6 +96,37 @@ async fn setup() -> TestEnv {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_up_applies_preferences_when_already_running() {
+    let mut env = setup().await;
+    let output = std::process::Command::new(rustscale_bin())
+        .arg("--socket")
+        .arg(&env.socket_path)
+        .args([
+            "up",
+            "--accept-routes",
+            "--advertise-routes=10.23.0.0/16",
+            "--hostname=updated-online-node",
+        ])
+        .output()
+        .expect("run rustscale up against an online node");
+    assert!(
+        output.status.success(),
+        "up failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let prefs = LocalClient::new(&env.socket_path)
+        .get_prefs()
+        .await
+        .expect("read updated prefs");
+    assert!(prefs.AcceptRoutes);
+    assert_eq!(prefs.AdvertiseRoutes, ["10.23.0.0/16"]);
+    assert_eq!(prefs.Hostname, "updated-online-node");
+
+    env.server.close().await.expect("close server");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cli_id_token_via_noise_control() {
     let mut env = setup().await;
     let audience = "https://service.example/resource?tenant=rustscale";

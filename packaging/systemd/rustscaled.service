@@ -8,7 +8,10 @@ After=network-pre.target NetworkManager.service systemd-resolved.service
 EnvironmentFile=-/etc/default/rustscaled
 ExecStart=/usr/bin/env rustscaled run --state /var/lib/rustscale --socket /var/run/rustscaled.sock --tun $FLAGS
 ExecStopPost=/usr/bin/env rustscaled run --state /var/lib/rustscale --cleanup
-Restart=on-failure
+# A successful LocalAPI logout transitions the process back to NeedsLogin.
+# Keep the installed daemon available for the next unprivileged login.
+Restart=always
+RestartSec=1s
 RuntimeDirectory=rustscale
 RuntimeDirectoryMode=0755
 StateDirectory=rustscale

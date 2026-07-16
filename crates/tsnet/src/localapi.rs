@@ -527,6 +527,7 @@ impl LocalApiPathHandoff {
     /// renames, unlinks, or hard-links the advertised endpoint; therefore any
     /// error leaves the old listener published and rollback only removes the
     /// private staging socket.
+    #[cfg_attr(not(unix), allow(clippy::unused_self))]
     pub(crate) fn commit(&mut self, handle: &mut LocalApiHandle) -> std::io::Result<()> {
         #[cfg(unix)]
         {

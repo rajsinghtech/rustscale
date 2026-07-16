@@ -840,6 +840,7 @@ async fn logout_joins_stale_map_writer_before_rotating_durable_identity() {
         .auth_key("tskey-test")
         .control_url(control.base_url())
         .state_dir(temp.path())
+        .disable_portmapping(true)
         .build()
         .unwrap();
     Box::pin(server.up()).await.unwrap();

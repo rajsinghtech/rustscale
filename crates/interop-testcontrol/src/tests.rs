@@ -363,6 +363,7 @@ fn make_server_with_ephemeral(tc: &TestControl, hostname: &str, ephemeral: bool)
         .auth_key(AUTH_KEY)
         .ephemeral(ephemeral)
         .disable_direct_paths(true)
+        .disable_portmapping(true)
         .build()
         .expect("failed to build server")
 }

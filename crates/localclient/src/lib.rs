@@ -40,6 +40,7 @@ use rustscale_safesocket::Connection;
 
 /// The fake Host header value, analogous to Go's `apitype.LocalAPIHost`.
 const LOCAL_API_HOST: &str = "local-rustscaled.sock";
+const MAX_STATUS_BODY_BYTES: usize = 4 * 1024 * 1024;
 
 /// A client for the rustscale daemon's LocalAPI over a Unix domain socket.
 ///
@@ -71,6 +72,22 @@ impl LocalClient {
     pub async fn status(&self) -> Result<serde_json::Value, LocalClientError> {
         let body = self.get_json("/localapi/v0/status").await?;
         Ok(body)
+    }
+
+    /// GET /localapi/v0/status?peers=false with a strict response-body bound.
+    /// This is intended for control-flow commands such as `wait`, which need
+    /// only the backend state, addresses, and TUN mode.
+    pub async fn status_without_peers(&self) -> Result<serde_json::Value, LocalClientError> {
+        let raw = self
+            .send_request_raw_with_limit(
+                "GET",
+                "/localapi/v0/status?peers=false",
+                &[],
+                &[],
+                Some(MAX_STATUS_BODY_BYTES),
+            )
+            .await?;
+        serde_json::from_slice(&raw.body).map_err(|error| LocalClientError::Json(error.to_string()))
     }
 
     /// GET /localapi/v0/whois?addr=<addr> — returns the whois JSON.
@@ -606,6 +623,18 @@ impl LocalClient {
         body: &[u8],
         extra_headers: &[(String, String)],
     ) -> Result<RawResponseWithHeaders, LocalClientError> {
+        self.send_request_raw_with_limit(method, path, body, extra_headers, None)
+            .await
+    }
+
+    async fn send_request_raw_with_limit(
+        &self,
+        method: &str,
+        path: &str,
+        body: &[u8],
+        extra_headers: &[(String, String)],
+        max_response_body: Option<usize>,
+    ) -> Result<RawResponseWithHeaders, LocalClientError> {
         let mut stream = rustscale_safesocket::connect(&self.socket_path)
             .map_err(|e| LocalClientError::Connect(e.to_string()))?;
 
@@ -625,7 +654,7 @@ impl LocalClient {
         }
         stream.flush().await?;
 
-        let response = read_full_response_with_headers(&mut stream).await?;
+        let response = read_full_response_with_headers(&mut stream, max_response_body).await?;
         drop(stream);
 
         check_status(response.status, &response.body)?;
@@ -693,6 +722,7 @@ struct RawResponseWithHeaders {
 /// Read a complete HTTP/1.1 response including the ETag header.
 async fn read_full_response_with_headers(
     stream: &mut Connection,
+    max_body: Option<usize>,
 ) -> Result<RawResponseWithHeaders, LocalClientError> {
     let mut buf = Vec::with_capacity(8192);
     let mut tmp = [0u8; 4096];
@@ -744,24 +774,38 @@ async fn read_full_response_with_headers(
 
     let body_start = header_end_pos + 4;
     let body = if let Some(cl) = content_length {
+        if max_body.is_some_and(|limit| cl > limit) {
+            return Err(LocalClientError::Io("response body too large".into()));
+        }
         let mut body = buf[body_start..].to_vec();
         while body.len() < cl {
             let n = stream.read(&mut tmp).await?;
             if n == 0 {
-                break;
+                return Err(LocalClientError::Io(
+                    "connection closed before complete response body".into(),
+                ));
             }
             body.extend_from_slice(&tmp[..n]);
+            if max_body.is_some_and(|limit| body.len() > limit) {
+                return Err(LocalClientError::Io("response body too large".into()));
+            }
         }
         body.truncate(cl);
         body
     } else {
         let mut body = buf[body_start..].to_vec();
+        if max_body.is_some_and(|limit| body.len() > limit) {
+            return Err(LocalClientError::Io("response body too large".into()));
+        }
         loop {
             let n = stream.read(&mut tmp).await?;
             if n == 0 {
                 break;
             }
             body.extend_from_slice(&tmp[..n]);
+            if max_body.is_some_and(|limit| body.len() > limit) {
+                return Err(LocalClientError::Io("response body too large".into()));
+            }
         }
         body
     };

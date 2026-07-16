@@ -1825,7 +1825,16 @@ pub(crate) async fn dispatch<W: AsyncRead + AsyncWrite + Unpin>(
     match endpoint {
         // --- GET /localapi/v0/status ---
         "status" if method == "GET" => {
-            let st = build_status_json(state).await;
+            let mut st = build_status_json(state).await;
+            if parse_query(&req.query)
+                .get("peers")
+                .is_some_and(|value| value == "false")
+            {
+                if let Some(status) = st.as_object_mut() {
+                    status.remove("Peer");
+                    status.remove("User");
+                }
+            }
             write_json_response(conn, 200, "OK", &st).await?;
         }
 
@@ -2851,41 +2860,42 @@ async fn handle_watch_ipn_bus<W: AsyncWrite + Unpin>(
     let has_initial =
         mask & (NOTIFY_INITIAL_STATE | NOTIFY_INITIAL_PREFS | NOTIFY_INITIAL_STATUS) != 0;
 
-    // Write the HTTP response header (streaming, connection-close delimited).
-    let header = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n";
-    conn.write_all(header.as_bytes()).await?;
-    conn.flush().await?;
-
-    if has_initial {
-        // Build initial status if requested.
-        let initial_status = if mask & NOTIFY_INITIAL_STATUS != 0 {
-            Some(build_status_json(state).await)
-        } else {
-            None
-        };
-
-        // Build initial prefs if requested.
-        let initial_prefs = if mask & NOTIFY_INITIAL_PREFS != 0 {
-            Some(serde_json::to_value(&*state.prefs.read().await).unwrap_or_default())
-        } else {
-            None
-        };
-
-        let notify = state.ipn_backend.build_initial_notify(
+    // Build non-state snapshots first, then atomically subscribe and capture
+    // state. A transition can therefore never fall between the initial state
+    // snapshot and bus registration.
+    let initial_status = if mask & NOTIFY_INITIAL_STATUS != 0 {
+        Some(build_status_json(state).await)
+    } else {
+        None
+    };
+    let initial_prefs = if mask & NOTIFY_INITIAL_PREFS != 0 {
+        Some(serde_json::to_value(&*state.prefs.read().await).unwrap_or_default())
+    } else {
+        None
+    };
+    let (mut rx, initial_notify) = if has_initial {
+        let (receiver, notify) = state.ipn_backend.subscribe_with_initial_notify(
             mask,
             &session_id,
             initial_status,
             initial_prefs,
         );
+        (receiver, Some(notify))
+    } else {
+        (state.ipn_backend.bus().subscribe(), None)
+    };
 
+    // Write the HTTP response header (streaming, connection-close delimited).
+    let header = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n";
+    conn.write_all(header.as_bytes()).await?;
+    conn.flush().await?;
+
+    if let Some(notify) = initial_notify {
         let line = serde_json::to_vec(&notify).unwrap_or_default();
         conn.write_all(&line).await?;
         conn.write_all(b"\n").await?;
         conn.flush().await?;
     }
-
-    // Subscribe to the bus and stream subsequent messages.
-    let mut rx = state.ipn_backend.bus().subscribe();
 
     loop {
         match rx.recv().await {
@@ -5104,6 +5114,21 @@ mod tests {
         assert!(resp.contains("Self"));
         assert!(resp.contains("Peer"));
         assert!(resp.contains("peer1"));
+    }
+
+    #[tokio::test]
+    async fn test_status_without_peers_omits_peer_and_user_maps() {
+        let state = make_test_state().await;
+        let resp = send_request_to_state(
+            b"GET /localapi/v0/status?peers=false HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            &state,
+        )
+        .await;
+        let body = resp.split("\r\n\r\n").nth(1).expect("status body");
+        let status: serde_json::Value = serde_json::from_str(body).expect("status JSON");
+        assert_eq!(status["BackendState"], "Running");
+        assert!(status.get("Peer").is_none());
+        assert!(status.get("User").is_none());
     }
 
     #[tokio::test]

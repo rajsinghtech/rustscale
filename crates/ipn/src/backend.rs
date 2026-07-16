@@ -14,7 +14,7 @@ use tokio::sync::watch;
 
 use crate::captiveportal::CaptivePortalWatcher;
 use crate::machine::StateMachineInputs;
-use crate::{next_state, LoginProfile, Notify, NotifyBus, Prefs, State};
+use crate::{next_state, LoginProfile, Notify, NotifyBus, NotifyBusReceiver, Prefs, State};
 
 fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
@@ -196,6 +196,29 @@ impl IpnBackend {
         self.bus.clone()
     }
 
+    /// Atomically subscribe to state transitions and snapshot the initial
+    /// notification. Holding the backend state lock while registering the
+    /// receiver closes the snapshot/subscribe race: every transition is
+    /// represented either by the initial state or by a queued bus message.
+    pub fn subscribe_with_initial_notify(
+        &self,
+        mask: crate::NotifyWatchOpt,
+        session_id: &str,
+        initial_status: Option<serde_json::Value>,
+        initial_prefs: Option<serde_json::Value>,
+    ) -> (NotifyBusReceiver, Notify) {
+        let inner = lock_unpoisoned(&self.inner);
+        let receiver = self.bus.subscribe();
+        let notify = self.build_initial_notify_locked(
+            &inner,
+            mask,
+            session_id,
+            initial_status,
+            initial_prefs,
+        );
+        (receiver, notify)
+    }
+
     /// Register a callback invoked after each backend state transition.
     ///
     /// Callbacks run in registration order without the backend mutex held.
@@ -292,6 +315,11 @@ impl IpnBackend {
         let mut state = lock_unpoisoned(&self.notification_queue.state);
         let notification = match pending {
             PendingNotification::State(value) => {
+                // Publish while the backend state lock is still held by the
+                // committing caller. Atomic initial-state subscriptions take
+                // that same lock, so a transition is unambiguously before the
+                // snapshot or after receiver registration, never in between.
+                self.bus.send(Notify::state(value));
                 BackendNotification::State(value, self.state_change_callbacks.snapshot())
             }
             PendingNotification::Profile(snapshot) => {
@@ -335,7 +363,7 @@ impl IpnBackend {
                 }
             };
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                self.invoke_notification(notification);
+                Self::invoke_notification(notification);
             }));
             if first_panic.is_none() {
                 first_panic = result.err();
@@ -346,10 +374,9 @@ impl IpnBackend {
         }
     }
 
-    fn invoke_notification(&self, notification: BackendNotification) {
+    fn invoke_notification(notification: BackendNotification) {
         match notification {
             BackendNotification::State(state, callbacks) => {
-                self.bus.send(Notify::state(state));
                 for callback in callbacks {
                     callback(state);
                 }
@@ -550,9 +577,19 @@ impl IpnBackend {
         initial_status: Option<serde_json::Value>,
         initial_prefs: Option<serde_json::Value>,
     ) -> Notify {
-        use crate::{NOTIFY_INITIAL_PREFS, NOTIFY_INITIAL_STATE, NOTIFY_INITIAL_STATUS};
+        let inner = lock_unpoisoned(&self.inner);
+        self.build_initial_notify_locked(&inner, mask, session_id, initial_status, initial_prefs)
+    }
 
-        let inner = self.inner.lock().unwrap();
+    fn build_initial_notify_locked(
+        &self,
+        inner: &BackendInner,
+        mask: crate::NotifyWatchOpt,
+        session_id: &str,
+        initial_status: Option<serde_json::Value>,
+        initial_prefs: Option<serde_json::Value>,
+    ) -> Notify {
+        use crate::{NOTIFY_INITIAL_PREFS, NOTIFY_INITIAL_STATE, NOTIFY_INITIAL_STATUS};
 
         let mut notify = Notify {
             Version: Some(self.version.clone()),
@@ -829,6 +866,24 @@ mod tests {
         assert_eq!(notify.State, Some(State::Running));
         assert_eq!(notify.Prefs, None);
         assert_eq!(notify.InitialStatus, None);
+    }
+
+    #[tokio::test]
+    async fn atomic_initial_subscription_delivers_the_next_transition() {
+        let backend = IpnBackend::new("v1.0");
+        backend.set_want_running();
+        backend.set_has_node_key(true);
+        backend.set_machine_authorized(true);
+        backend.set_netmap_present(true);
+        assert_eq!(backend.state(), State::Starting);
+
+        let (mut receiver, initial) =
+            backend.subscribe_with_initial_notify(NOTIFY_INITIAL_STATE, "session", None, None);
+        assert_eq!(initial.State, Some(State::Starting));
+
+        backend.set_engine_status(1, 0);
+        let transition = receiver.recv().await.unwrap().unwrap();
+        assert_eq!(transition.State, Some(State::Running));
     }
 
     #[tokio::test]

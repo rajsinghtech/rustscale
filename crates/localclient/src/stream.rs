@@ -13,6 +13,11 @@ use tokio::io::AsyncReadExt;
 
 use crate::LocalClientError;
 
+/// Keep LocalAPI streaming responses bounded even if a compromised or buggy
+/// daemon never terminates an HTTP header or JSON frame.
+const MAX_STREAM_HEADER_BYTES: usize = 64 * 1024;
+const MAX_NOTIFY_FRAME_BYTES: usize = 16 * 1024 * 1024;
+
 /// Raw pcap byte stream returned by `POST /localapi/v0/debug-capture`.
 pub struct DebugCapture {
     stream: Connection,
@@ -79,6 +84,13 @@ impl DebugCapture {
                 ));
             }
             self.buffered.extend_from_slice(&tmp[..count]);
+            if self.buffered.len() > MAX_STREAM_HEADER_BYTES
+                && !self.buffered.windows(4).any(|bytes| bytes == b"\r\n\r\n")
+            {
+                return Err(LocalClientError::Io(
+                    "capture response header too large".into(),
+                ));
+            }
         }
         Ok(())
     }
@@ -121,8 +133,9 @@ impl WatchIpnBus {
     /// Receive the next `Notify` message. Returns `Ok(None)` when the
     /// daemon has closed the connection (graceful shutdown).
     ///
-    /// If a line cannot be parsed as JSON, it is skipped (with the error
-    /// surfaced via `Err` so the caller can decide whether to continue).
+    /// A malformed HTTP response or JSON frame is returned as an error. Frames
+    /// are never silently skipped: doing so could hide the state transition a
+    /// caller is waiting for.
     pub async fn next(&mut self) -> Result<Option<Notify>, LocalClientError> {
         // Return any pending decoded messages first.
         if let Some(n) = self.pending.pop_front() {
@@ -130,11 +143,6 @@ impl WatchIpnBus {
         }
 
         loop {
-            // If we've hit EOF and have no more complete lines, we're done.
-            if self.eof && self.buf.is_empty() {
-                return Ok(None);
-            }
-
             // Try to extract complete lines from the buffer.
             if self.try_extract_lines()? {
                 if let Some(n) = self.pending.pop_front() {
@@ -143,8 +151,21 @@ impl WatchIpnBus {
             }
 
             if self.eof {
-                // EOF with no complete lines remaining.
-                return Ok(None);
+                if !self.header_consumed {
+                    return Err(LocalClientError::Io(
+                        "watch stream closed before HTTP response".into(),
+                    ));
+                }
+                if self.buf.is_empty() {
+                    return Ok(None);
+                }
+                if self.buf.len() > MAX_NOTIFY_FRAME_BYTES {
+                    return Err(LocalClientError::Io(
+                        "watch notification frame too large".into(),
+                    ));
+                }
+                let line = std::mem::take(&mut self.buf);
+                return decode_notify(&line).map(Some);
             }
 
             // Read more data from the socket.
@@ -168,14 +189,30 @@ impl WatchIpnBus {
     ///
     /// Returns `true` if at least one complete line was extracted.
     fn try_extract_lines(&mut self) -> Result<bool, LocalClientError> {
-        // Strip the HTTP header on the first call.
+        // Strip and validate the HTTP header on the first call.
         if !self.header_consumed {
             let Some(pos) = self.buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                if self.buf.len() > MAX_STREAM_HEADER_BYTES {
+                    return Err(LocalClientError::Io(
+                        "watch response header too large".into(),
+                    ));
+                }
                 return Ok(false);
             };
-            // Remove the header (including the \r\n\r\n separator).
+            if pos + 4 > MAX_STREAM_HEADER_BYTES {
+                return Err(LocalClientError::Io(
+                    "watch response header too large".into(),
+                ));
+            }
+            validate_watch_header(&self.buf[..pos])?;
             self.buf.drain(..pos + 4);
             self.header_consumed = true;
+        }
+
+        if self.buf.len() > MAX_NOTIFY_FRAME_BYTES && !self.buf.contains(&b'\n') {
+            return Err(LocalClientError::Io(
+                "watch notification frame too large".into(),
+            ));
         }
 
         let mut found = false;
@@ -183,21 +220,21 @@ impl WatchIpnBus {
             let Some(pos) = self.buf.iter().position(|&b| b == b'\n') else {
                 break;
             };
-            let line_bytes = self.buf.drain(..=pos).collect::<Vec<u8>>();
-            // Trim trailing \r and \n.
-            let line = line_bytes
-                .iter()
-                .copied()
-                .filter(|&b| b != b'\r' && b != b'\n')
-                .collect::<Vec<u8>>();
+            if pos > MAX_NOTIFY_FRAME_BYTES {
+                return Err(LocalClientError::Io(
+                    "watch notification frame too large".into(),
+                ));
+            }
+            let mut line = self.buf.drain(..=pos).collect::<Vec<u8>>();
+            line.pop(); // newline
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
             if line.is_empty() {
                 continue;
             }
-            if let Ok(notify) = serde_json::from_slice::<Notify>(&line) {
-                self.pending.push_back(notify);
-                found = true;
-            }
-            // Skip unparseable lines (could be a partial or keepalive).
+            self.pending.push_back(decode_notify(&line)?);
+            found = true;
         }
         Ok(found)
     }
@@ -209,5 +246,67 @@ impl WatchIpnBus {
             .shutdown()
             .await
             .map_err(|e| LocalClientError::Io(e.to_string()))
+    }
+}
+
+fn validate_watch_header(header: &[u8]) -> Result<(), LocalClientError> {
+    let text = std::str::from_utf8(header)
+        .map_err(|_| LocalClientError::Io("non-UTF-8 watch response header".into()))?;
+    let status_line = text
+        .split("\r\n")
+        .next()
+        .ok_or_else(|| LocalClientError::Io("missing watch response status".into()))?;
+    let mut parts = status_line.split_whitespace();
+    let version = parts.next().unwrap_or_default();
+    let status = parts
+        .next()
+        .and_then(|value| value.parse::<u16>().ok())
+        .ok_or_else(|| LocalClientError::Io("invalid watch response status".into()))?;
+    if !version.starts_with("HTTP/1.") {
+        return Err(LocalClientError::Io(
+            "invalid watch response HTTP version".into(),
+        ));
+    }
+    if !(200..300).contains(&status) {
+        // Do not reflect a LocalAPI response body. Besides keeping error
+        // handling bounded, this prevents accidental disclosure if a daemon
+        // includes sensitive details in an error response.
+        if status == 403 {
+            return Err(LocalClientError::AccessDenied(
+                "watch-ipn-bus request denied".into(),
+            ));
+        }
+        return Err(LocalClientError::HttpStatus {
+            status,
+            message: "watch-ipn-bus request failed".into(),
+        });
+    }
+    Ok(())
+}
+
+fn decode_notify(line: &[u8]) -> Result<Notify, LocalClientError> {
+    serde_json::from_slice(line)
+        .map_err(|error| LocalClientError::Json(format!("invalid watch notification: {error}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn watch_header_requires_successful_http_status() {
+        validate_watch_header(b"HTTP/1.1 200 OK\r\nContent-Type: application/json").unwrap();
+        assert!(matches!(
+            validate_watch_header(b"HTTP/1.1 403 Forbidden"),
+            Err(LocalClientError::AccessDenied(_))
+        ));
+        assert!(validate_watch_header(b"not HTTP").is_err());
+    }
+
+    #[test]
+    fn notify_decoder_rejects_malformed_and_invalid_states() {
+        assert!(decode_notify(br#"{"State":6}"#).is_ok());
+        assert!(decode_notify(b"not-json").is_err());
+        assert!(decode_notify(br#"{"State":99}"#).is_err());
     }
 }

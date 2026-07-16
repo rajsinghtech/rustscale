@@ -52,6 +52,7 @@ struct CollectedPosture {
 
 struct PosturePublicationValidator {
     preference: Arc<crate::LivePosturePreference>,
+    posture_service: Arc<rustscale_posture::IdentityService>,
     expected_publication_generation: u64,
     expected_policy_generation: u64,
     include_hardware_addrs: bool,
@@ -69,6 +70,8 @@ impl C2nPublicationValidator for PosturePublicationValidator {
                 |user_enabled, policy| {
                     let posture_allowed = policy.policy_generation
                         == self.expected_policy_generation
+                        && self.posture_service.current_policy_generation()
+                            == self.expected_policy_generation
                         && policy
                             .preference
                             .unwrap_or(rustscale_posture::PreferenceOption::Never)
@@ -554,6 +557,7 @@ impl C2nHandler for PostureIdentityHandler {
                 if response_is_sensitive {
                     response.with_publication_validator(Arc::new(PosturePublicationValidator {
                         preference: self.backend.posture_checking.clone(),
+                        posture_service: self.backend.posture_service.clone(),
                         expected_publication_generation: collected.publication_generation,
                         expected_policy_generation: collected.policy_generation,
                         include_hardware_addrs: collected.include_hardware_addrs,
@@ -717,7 +721,7 @@ mod tests {
     use std::time::Duration;
 
     use rustscale_controlclient::C2nPublicationValidator;
-    use rustscale_posture::{PublicationBarrier, SystemPolicy};
+    use rustscale_posture::{IdentityService, PublicationBarrier};
     use rustscale_syspolicy::{
         MemoryProvider, PolicyEngine, PolicyError, PolicyErrorKind, PolicyKey, PolicyProvider,
         PolicyScope, ProviderValues, RawValue, SettingDefinition,
@@ -742,10 +746,14 @@ mod tests {
         }
     }
 
-    fn validator(preference: Arc<crate::LivePosturePreference>) -> PosturePublicationValidator {
+    fn validator(
+        preference: Arc<crate::LivePosturePreference>,
+        posture_service: Arc<IdentityService>,
+    ) -> PosturePublicationValidator {
         let (_, publication_generation, policy_generation) = preference.snapshot();
         PosturePublicationValidator {
             preference,
+            posture_service,
             expected_publication_generation: publication_generation,
             expected_policy_generation: policy_generation,
             include_hardware_addrs: true,
@@ -764,18 +772,21 @@ mod tests {
             .add_provider("managed posture", PolicyScope::Device, provider)
             .unwrap();
         let barrier = Arc::new(PublicationBarrier::new());
-        let policy =
-            SystemPolicy::from_engine_with_publication_barrier(engine.clone(), barrier.clone());
+        let posture_service = Arc::new(
+            IdentityService::from_system_engine_with_publication_barrier(
+                engine.clone(),
+                barrier.clone(),
+            ),
+        );
         let preference = Arc::new(crate::LivePosturePreference::with_publication_barrier(
-            false, barrier,
+            false,
+            barrier.clone(),
         ));
-        let validator = validator(preference.clone());
+        let validator = validator(preference.clone(), posture_service);
         let before = preference.snapshot();
 
-        assert_eq!(
-            rustscale_posture::PosturePolicy::preference(&policy),
-            Ok(rustscale_posture::PreferenceOption::Always)
-        );
+        let (_, policy) = barrier.snapshot_with(|policy| policy.preference);
+        assert_eq!(policy, Ok(rustscale_posture::PreferenceOption::Always));
         engine.reload().unwrap();
         assert_eq!(preference.snapshot(), before);
         let published = AtomicUsize::new(0);
@@ -799,13 +810,17 @@ mod tests {
             .add_provider("failing posture", PolicyScope::Device, provider.clone())
             .unwrap();
         let barrier = Arc::new(PublicationBarrier::new());
-        let _policy =
-            SystemPolicy::from_engine_with_publication_barrier(engine.clone(), barrier.clone());
+        let posture_service = Arc::new(
+            IdentityService::from_system_engine_with_publication_barrier(
+                engine.clone(),
+                barrier.clone(),
+            ),
+        );
         let preference = Arc::new(crate::LivePosturePreference::with_publication_barrier(
             false,
             barrier.clone(),
         ));
-        let validator = validator(preference.clone());
+        let validator = validator(preference.clone(), posture_service);
         let before = preference.snapshot();
 
         provider.fail.store(true, Ordering::Release);
@@ -831,6 +846,76 @@ mod tests {
     }
 
     #[test]
+    fn removing_override_while_posture_provider_fails_stays_degraded_until_fresh_load() {
+        let provider = Arc::new(FailingPostureProvider {
+            fail: AtomicBool::new(false),
+        });
+        let engine = PolicyEngine::well_known(PolicyScope::Device).unwrap();
+        engine
+            .add_provider("failing posture", PolicyScope::Device, provider.clone())
+            .unwrap();
+        let policy_override = engine
+            .override_for_test(BTreeMap::from([(
+                PolicyKey::PostureChecking,
+                RawValue::String("always".into()),
+            )]))
+            .unwrap();
+        let barrier = Arc::new(PublicationBarrier::new());
+        let posture_service = Arc::new(
+            IdentityService::from_system_engine_with_publication_barrier(
+                engine.clone(),
+                barrier.clone(),
+            ),
+        );
+        let preference = Arc::new(crate::LivePosturePreference::with_publication_barrier(
+            false,
+            barrier.clone(),
+        ));
+        let stale_validator = validator(preference.clone(), posture_service.clone());
+        let commits = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let callback_commits = commits.clone();
+        let (_commit_subscription, _) = engine.subscribe_snapshot_commits(move |commit| {
+            callback_commits.lock().unwrap().push(commit);
+        });
+
+        provider.fail.store(true, Ordering::Release);
+        drop(policy_override);
+        assert!(engine.current_snapshot_commit().is_degraded());
+        assert!(commits
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|commit| matches!(commit, rustscale_syspolicy::SnapshotCommit::Degraded { .. })));
+        let (_, unavailable) = barrier.snapshot_with(|policy| policy.preference);
+        assert_eq!(
+            unavailable,
+            Err(rustscale_posture::PolicyError::Unavailable)
+        );
+        let published = AtomicUsize::new(0);
+        assert_eq!(
+            stale_validator.validate_and_publish(&mut || {
+                published.fetch_add(1, Ordering::Release);
+                Ok(())
+            }),
+            Err(C2nReplyError::PublicationRevoked)
+        );
+        assert_eq!(published.load(Ordering::Acquire), 0);
+
+        provider.fail.store(false, Ordering::Release);
+        engine.reload().unwrap();
+        assert!(matches!(
+            engine.current_snapshot_commit(),
+            rustscale_syspolicy::SnapshotCommit::Applied(_)
+        ));
+        let (_, recovered) = barrier.snapshot_with(|policy| policy.preference);
+        assert_eq!(recovered, Ok(rustscale_posture::PreferenceOption::Always));
+        assert_eq!(
+            validator(preference, posture_service).validate_and_publish(&mut || Ok(())),
+            Ok(())
+        );
+    }
+
+    #[test]
     fn managed_never_after_handler_check_blocks_sensitive_h2_publication() {
         let provider = Arc::new(MemoryProvider::from_values(BTreeMap::from([(
             PolicyKey::PostureChecking,
@@ -841,13 +926,17 @@ mod tests {
             .add_provider("managed posture", PolicyScope::Device, provider.clone())
             .unwrap();
         let barrier = Arc::new(PublicationBarrier::new());
-        let _policy =
-            SystemPolicy::from_engine_with_publication_barrier(engine.clone(), barrier.clone());
+        let posture_service = Arc::new(
+            IdentityService::from_system_engine_with_publication_barrier(
+                engine.clone(),
+                barrier.clone(),
+            ),
+        );
         let preference = Arc::new(crate::LivePosturePreference::with_publication_barrier(
             false,
             barrier.clone(),
         ));
-        let validator = validator(preference);
+        let validator = validator(preference, posture_service);
 
         let (checked_tx, checked_rx) = mpsc::sync_channel(1);
         let (release_tx, release_rx) = mpsc::sync_channel(1);

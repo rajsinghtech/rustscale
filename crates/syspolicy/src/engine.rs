@@ -126,10 +126,17 @@ impl PolicyChange {
 /// A provider refresh result delivered inside the snapshot commit transaction.
 #[derive(Debug, Clone)]
 pub enum SnapshotCommit {
-    /// An effective snapshot change, before it becomes visible to readers.
+    /// A fully loaded effective snapshot.
     Applied(Arc<Snapshot>),
+    /// A snapshot containing cached values because at least one provider load
+    /// failed during a recovery operation.
+    Degraded {
+        snapshot: Arc<Snapshot>,
+        error: PolicyError,
+    },
     /// A provider refresh failure; the previous snapshot remains installed.
     Failed {
+        snapshot: Arc<Snapshot>,
         /// Monotonic commit-attempt generation allocated to this failure.
         generation: u64,
         /// Privacy-safe provider failure.
@@ -141,9 +148,23 @@ impl SnapshotCommit {
     /// Monotonic generation for this applied change or failed refresh.
     pub fn generation(&self) -> u64 {
         match self {
-            Self::Applied(snapshot) => snapshot.generation(),
+            Self::Applied(snapshot) | Self::Degraded { snapshot, .. } => snapshot.generation(),
             Self::Failed { generation, .. } => *generation,
         }
+    }
+
+    /// Snapshot installed for this status, or retained by a failed refresh.
+    pub fn snapshot(&self) -> &Arc<Snapshot> {
+        match self {
+            Self::Applied(snapshot)
+            | Self::Degraded { snapshot, .. }
+            | Self::Failed { snapshot, .. } => snapshot,
+        }
+    }
+
+    /// Whether this status includes stale cached values or a failed refresh.
+    pub fn is_degraded(&self) -> bool {
+        !matches!(self, Self::Applied(_))
     }
 }
 
@@ -187,11 +208,27 @@ struct ReadSource {
 type ChangeCallback = Arc<dyn Fn(PolicyChange) + Send + Sync>;
 type SnapshotCommitCallback = Arc<dyn Fn(SnapshotCommit) + Send + Sync>;
 
+struct PendingSnapshotCommit {
+    commit: SnapshotCommit,
+    callbacks: Vec<SnapshotCommitCallback>,
+}
+
+type RefreshResult = (
+    Arc<Snapshot>,
+    Option<PolicyChange>,
+    Option<PendingSnapshotCommit>,
+);
+
+struct EngineCommitState {
+    snapshot: Arc<Snapshot>,
+    commit: SnapshotCommit,
+}
+
 struct EngineInner {
     scope: PolicyScope,
     definitions: BTreeMap<PolicyKey, SettingDefinition>,
     sources: RwLock<Vec<SourceEntry>>,
-    snapshot: RwLock<Arc<Snapshot>>,
+    commit_state: RwLock<EngineCommitState>,
     reload: Mutex<()>,
     callbacks: Mutex<BTreeMap<u64, ChangeCallback>>,
     snapshot_commit_callbacks: Mutex<BTreeMap<u64, SnapshotCommitCallback>>,
@@ -234,12 +271,16 @@ impl PolicyEngine {
             }
         }
         let snapshot = Arc::new(Snapshot::empty(scope.clone()));
+        let current_commit = SnapshotCommit::Applied(snapshot.clone());
         let (notification_tx, notification_rx) = mpsc::sync_channel(1);
         let inner = Arc::new(EngineInner {
             scope,
             definitions: definition_map,
             sources: RwLock::new(Vec::new()),
-            snapshot: RwLock::new(snapshot),
+            commit_state: RwLock::new(EngineCommitState {
+                snapshot,
+                commit: current_commit,
+            }),
             reload: Mutex::new(()),
             callbacks: Mutex::new(BTreeMap::new()),
             snapshot_commit_callbacks: Mutex::new(BTreeMap::new()),
@@ -338,12 +379,16 @@ impl PolicyEngine {
                 _subscription: subscription,
             });
         match self.refresh_locked(false) {
-            Ok((_, change)) => {
+            Ok((_, change, pending_commit)) => {
                 drop(reload_guard);
+                if let Some(pending_commit) = pending_commit {
+                    self.invoke_snapshot_commit(pending_commit);
+                }
                 self.invoke_change(change);
                 Ok(id)
             }
             Err(error) => {
+                let pending_commit = self.stage_failed_commit_locked(error.clone());
                 let removed = self.take_source(id).map(|(_, source)| source);
                 self.inner
                     .provider_errors
@@ -351,6 +396,7 @@ impl PolicyEngine {
                     .expect("policy provider error lock poisoned")
                     .remove(&id);
                 drop(reload_guard);
+                self.invoke_snapshot_commit(pending_commit);
                 drop(removed);
                 Err(error)
             }
@@ -370,19 +416,24 @@ impl PolicyEngine {
             drop(reload_guard);
             return Ok(());
         };
-        let (_, change) = match self.refresh_locked(true) {
+        let (_, change, pending_commit) = match self.refresh_locked(true) {
             Ok(result) => result,
             Err(error) => {
+                let pending_commit = self.stage_failed_commit_locked(error.clone());
                 self.inner
                     .sources
                     .write()
                     .expect("policy sources lock poisoned")
                     .insert(index, removed);
                 drop(reload_guard);
+                self.invoke_snapshot_commit(pending_commit);
                 return Err(error);
             }
         };
         drop(reload_guard);
+        if let Some(pending_commit) = pending_commit {
+            self.invoke_snapshot_commit(pending_commit);
+        }
         // Provider subscriptions may call back while being dropped. Never drop
         // them while either the source-list or reload mutex is held.
         drop(removed);
@@ -408,9 +459,21 @@ impl PolicyEngine {
     /// Returns the current immutable snapshot without provider I/O.
     pub fn snapshot(&self) -> Arc<Snapshot> {
         self.inner
-            .snapshot
+            .commit_state
             .read()
-            .expect("policy snapshot lock poisoned")
+            .expect("policy commit state lock poisoned")
+            .snapshot
+            .clone()
+    }
+
+    /// Returns the current applied, degraded, or failed commit status without
+    /// provider I/O.
+    pub fn current_snapshot_commit(&self) -> SnapshotCommit {
+        self.inner
+            .commit_state
+            .read()
+            .expect("policy commit state lock poisoned")
+            .commit
             .clone()
     }
 
@@ -427,31 +490,27 @@ impl PolicyEngine {
             .lock()
             .expect("policy reload lock poisoned");
         let result = self.refresh_locked(false);
-        if let Err(error) = &result {
-            let generation = self
-                .inner
-                .next_generation
-                .fetch_add(1, Ordering::AcqRel)
-                .saturating_add(1);
-            self.invoke_snapshot_commit(SnapshotCommit::Failed {
-                generation,
-                error: error.clone(),
-            });
-        }
+        let failed_commit = result
+            .as_ref()
+            .err()
+            .map(|error| self.stage_failed_commit_locked(error.clone()));
         drop(reload_guard);
         match result {
-            Ok((snapshot, change)) => {
+            Ok((snapshot, change, pending_commit)) => {
+                if let Some(pending_commit) = pending_commit {
+                    self.invoke_snapshot_commit(pending_commit);
+                }
                 self.invoke_change(change);
                 Ok(snapshot)
             }
-            Err(error) => Err(error),
+            Err(error) => {
+                self.invoke_snapshot_commit(failed_commit.expect("failed refresh commit"));
+                Err(error)
+            }
         }
     }
 
-    fn refresh_locked(
-        &self,
-        recover_provider_errors: bool,
-    ) -> Result<(Arc<Snapshot>, Option<PolicyChange>), PolicyError> {
+    fn refresh_locked(&self, recover_provider_errors: bool) -> Result<RefreshResult, PolicyError> {
         self.inner.reload_attempts.fetch_add(1, Ordering::Relaxed);
         let had_reload_error = self
             .inner
@@ -621,6 +680,7 @@ impl PolicyEngine {
                 }
             }
         }
+        let degraded_error = first_error.clone();
         let retry_failed_provider = first_error.is_some();
         *self
             .inner
@@ -632,8 +692,8 @@ impl PolicyEngine {
         }
         let old = self.snapshot();
         let effective_change = old.settings != settings;
-        if !effective_change && !had_reload_error {
-            return Ok((old, None));
+        if !effective_change && !had_reload_error && degraded_error.is_none() {
+            return Ok((old, None, None));
         }
         let generation = self
             .inner
@@ -645,21 +705,45 @@ impl PolicyEngine {
             generation,
             settings,
         });
-        self.invoke_snapshot_commit(SnapshotCommit::Applied(new.clone()));
-        *self
-            .inner
-            .snapshot
-            .write()
-            .expect("policy snapshot lock poisoned") = new.clone();
+        let commit = degraded_error.map_or_else(
+            || SnapshotCommit::Applied(new.clone()),
+            |error| SnapshotCommit::Degraded {
+                snapshot: new.clone(),
+                error,
+            },
+        );
+        let pending_commit = self.stage_snapshot_commit_locked(commit);
         let change = effective_change.then(|| PolicyChange {
             old,
             new: new.clone(),
         });
-        Ok((new, change))
+        Ok((new, change, Some(pending_commit)))
     }
 
-    fn invoke_snapshot_commit(&self, commit: SnapshotCommit) {
-        let callbacks: Vec<_> = self
+    fn stage_failed_commit_locked(&self, error: PolicyError) -> PendingSnapshotCommit {
+        let generation = self
+            .inner
+            .next_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
+        self.stage_snapshot_commit_locked(SnapshotCommit::Failed {
+            snapshot: self.snapshot(),
+            generation,
+            error,
+        })
+    }
+
+    fn stage_snapshot_commit_locked(&self, commit: SnapshotCommit) -> PendingSnapshotCommit {
+        let snapshot = commit.snapshot().clone();
+        *self
+            .inner
+            .commit_state
+            .write()
+            .expect("policy commit state lock poisoned") = EngineCommitState {
+            snapshot,
+            commit: commit.clone(),
+        };
+        let callbacks = self
             .inner
             .snapshot_commit_callbacks
             .lock()
@@ -667,8 +751,12 @@ impl PolicyEngine {
             .values()
             .cloned()
             .collect();
-        for callback in callbacks {
-            if catch_unwind(AssertUnwindSafe(|| callback(commit.clone()))).is_err() {
+        PendingSnapshotCommit { commit, callbacks }
+    }
+
+    fn invoke_snapshot_commit(&self, pending: PendingSnapshotCommit) {
+        for callback in pending.callbacks {
+            if catch_unwind(AssertUnwindSafe(|| callback(pending.commit.clone()))).is_err() {
                 self.inner.callback_panics.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -739,23 +827,47 @@ impl PolicyEngine {
         }
     }
 
-    /// Registers a callback run for each effective change immediately before
-    /// its immutable snapshot becomes visible. Commit callbacks execute while
-    /// the reload transaction is held and must not call back into this engine.
-    pub fn register_snapshot_commit_callback(
+    /// Atomically installs a commit callback and returns the current commit
+    /// status under the same reload synchronization. A concurrent commit is
+    /// therefore represented either by the returned status or by a callback,
+    /// never missed. Callbacks run after reload synchronization is released.
+    pub fn subscribe_snapshot_commits(
         &self,
         callback: impl Fn(SnapshotCommit) + Send + Sync + 'static,
-    ) -> SnapshotCommitRegistration {
+    ) -> (SnapshotCommitRegistration, SnapshotCommit) {
+        let _reload_guard = self
+            .inner
+            .reload
+            .lock()
+            .expect("policy reload lock poisoned");
         let id = self.inner.next_callback.fetch_add(1, Ordering::Relaxed);
         self.inner
             .snapshot_commit_callbacks
             .lock()
             .expect("policy snapshot commit callbacks lock poisoned")
             .insert(id, Arc::new(callback));
-        SnapshotCommitRegistration {
-            engine: Arc::downgrade(&self.inner),
-            id,
-        }
+        let current = self
+            .inner
+            .commit_state
+            .read()
+            .expect("policy commit state lock poisoned")
+            .commit
+            .clone();
+        (
+            SnapshotCommitRegistration {
+                engine: Arc::downgrade(&self.inner),
+                id,
+            },
+            current,
+        )
+    }
+
+    /// Registers a commit callback without returning current status.
+    pub fn register_snapshot_commit_callback(
+        &self,
+        callback: impl Fn(SnapshotCommit) + Send + Sync + 'static,
+    ) -> SnapshotCommitRegistration {
+        self.subscribe_snapshot_commits(callback).0
     }
 
     /// Installs a scoped, last-registered device policy override for tests.

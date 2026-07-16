@@ -176,6 +176,10 @@ impl Default for PublicationBarrier {
 pub trait PosturePolicy: Send + Sync {
     fn preference(&self) -> Result<PreferenceOption, PolicyError>;
 
+    fn current_commit_generation(&self) -> u64 {
+        self.publication_state().policy_generation
+    }
+
     fn publication_state(&self) -> PublicationPolicyState {
         PublicationPolicyState {
             policy_generation: 0,
@@ -238,32 +242,10 @@ impl SystemPolicy {
         };
 
         let callback_barrier = publication_barrier.clone();
-        let registration = engine.register_snapshot_commit_callback(move |commit| {
-            let state = match commit {
-                rustscale_syspolicy::SnapshotCommit::Applied(snapshot) => {
-                    Self::publication_state_from_snapshot(&snapshot)
-                }
-                rustscale_syspolicy::SnapshotCommit::Failed { generation, .. } => {
-                    PublicationPolicyState {
-                        policy_generation: generation,
-                        preference: Err(PolicyError::Unavailable),
-                    }
-                }
-            };
-            callback_barrier.update_policy(state);
+        let (registration, current) = engine.subscribe_snapshot_commits(move |commit| {
+            callback_barrier.update_policy(Self::publication_state_from_commit(&commit));
         });
-        // Register before sampling, then reject stale generations in the
-        // barrier. This closes the subscribe/snapshot race in both orders.
-        let snapshot = engine.snapshot();
-        let initial_state = if engine.last_reload_error().is_some() {
-            PublicationPolicyState {
-                policy_generation: snapshot.generation(),
-                preference: Err(PolicyError::Unavailable),
-            }
-        } else {
-            Self::publication_state_from_snapshot(&snapshot)
-        };
-        publication_barrier.update_policy(initial_state);
+        publication_barrier.update_policy(Self::publication_state_from_commit(&current));
         Self {
             engine: Some(engine),
             _publication_subscription: Some(registration),
@@ -279,6 +261,21 @@ impl SystemPolicy {
         #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
         {
             None
+        }
+    }
+
+    fn publication_state_from_commit(
+        commit: &rustscale_syspolicy::SnapshotCommit,
+    ) -> PublicationPolicyState {
+        match commit {
+            rustscale_syspolicy::SnapshotCommit::Applied(snapshot) => {
+                Self::publication_state_from_snapshot(snapshot)
+            }
+            rustscale_syspolicy::SnapshotCommit::Degraded { .. }
+            | rustscale_syspolicy::SnapshotCommit::Failed { .. } => PublicationPolicyState {
+                policy_generation: commit.generation(),
+                preference: Err(PolicyError::Unavailable),
+            },
         }
     }
 
@@ -320,6 +317,12 @@ impl PosturePolicy for SystemPolicy {
         self.publication_barrier
             .snapshot_with(|policy| policy.preference)
             .1
+    }
+
+    fn current_commit_generation(&self) -> u64 {
+        self.engine
+            .as_ref()
+            .map_or(0, |engine| engine.current_snapshot_commit().generation())
     }
 
     fn publication_state(&self) -> PublicationPolicyState {
@@ -466,6 +469,21 @@ pub struct IdentityService {
 }
 
 impl IdentityService {
+    /// Creates a system collector with an injected policy engine and shared
+    /// publication barrier, useful for hermetic publication tests.
+    pub fn from_system_engine_with_publication_barrier(
+        engine: rustscale_syspolicy::PolicyEngine,
+        publication_barrier: Arc<PublicationBarrier>,
+    ) -> Self {
+        let policy =
+            SystemPolicy::from_engine_with_publication_barrier(engine, publication_barrier.clone());
+        Self::new_with_barrier(
+            Box::new(SystemCollector),
+            Box::new(policy),
+            publication_barrier,
+        )
+    }
+
     pub fn new(collector: Box<dyn PostureCollector>, policy: Box<dyn PosturePolicy>) -> Self {
         let publication_barrier = Arc::new(PublicationBarrier::new());
         publication_barrier.update_policy(policy.publication_state());
@@ -489,6 +507,12 @@ impl IdentityService {
     /// sensitive transport publication generation.
     pub fn publication_barrier(&self) -> Arc<PublicationBarrier> {
         self.publication_barrier.clone()
+    }
+
+    /// Current engine commit generation without provider I/O. This closes the
+    /// interval between atomic snapshot installation and deferred callbacks.
+    pub fn current_policy_generation(&self) -> u64 {
+        self.policy.current_commit_generation()
     }
 
     /// Collect identity according to the latest policy and user preference.

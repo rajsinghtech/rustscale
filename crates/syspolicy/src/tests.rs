@@ -756,6 +756,134 @@ fn windows_native_posture_provider_uses_current_provider_contract() {
 }
 
 #[test]
+fn snapshot_commit_subscription_cannot_miss_in_progress_commit() {
+    struct BlockingProvider {
+        value: Mutex<String>,
+        gate: Mutex<
+            Option<(
+                std::sync::mpsc::SyncSender<()>,
+                std::sync::mpsc::Receiver<()>,
+            )>,
+        >,
+    }
+
+    impl PolicyProvider for BlockingProvider {
+        fn load(&self, definitions: &[SettingDefinition]) -> Result<ProviderValues, PolicyError> {
+            let value = self.value.lock().unwrap().clone();
+            if let Some((entered, release)) = self.gate.lock().unwrap().take() {
+                entered.send(()).unwrap();
+                release.recv().unwrap();
+            }
+            Ok(definitions
+                .iter()
+                .filter(|definition| definition.key == PolicyKey::Tailnet)
+                .map(|definition| (definition.key, Ok(RawValue::String(value.clone()))))
+                .collect())
+        }
+    }
+
+    let provider = Arc::new(BlockingProvider {
+        value: Mutex::new("old".into()),
+        gate: Mutex::new(None),
+    });
+    let engine = PolicyEngine::well_known(PolicyScope::Device).unwrap();
+    engine
+        .add_provider("blocking", PolicyScope::Device, provider.clone())
+        .unwrap();
+    let old_generation = engine.snapshot().generation();
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    *provider.value.lock().unwrap() = "new".into();
+    *provider.gate.lock().unwrap() = Some((entered_tx, release_rx));
+
+    let reload_engine = engine.clone();
+    let reload = thread::spawn(move || reload_engine.reload());
+    entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let callback_calls = calls.clone();
+    let subscribe_engine = engine.clone();
+    let (subscribed_tx, subscribed_rx) = std::sync::mpsc::sync_channel(1);
+    let subscribe = thread::spawn(move || {
+        let (_registration, current) = subscribe_engine.subscribe_snapshot_commits(move |_| {
+            callback_calls.fetch_add(1, Ordering::SeqCst);
+        });
+        subscribed_tx
+            .send((
+                current.generation(),
+                current.snapshot().get(PolicyKey::Tailnet),
+            ))
+            .unwrap();
+    });
+    assert!(matches!(
+        subscribed_rx.recv_timeout(Duration::from_millis(50)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    ));
+
+    release_tx.send(()).unwrap();
+    reload.join().unwrap().unwrap();
+    let (generation, tailnet) = subscribed_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    subscribe.join().unwrap();
+    assert!(generation > old_generation);
+    assert_eq!(tailnet, Ok(PolicyValue::String("new".into())));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn snapshot_commit_callbacks_are_reentrant_and_late_subscription_sees_current() {
+    struct ManualProvider(Mutex<String>);
+
+    impl PolicyProvider for ManualProvider {
+        fn load(&self, definitions: &[SettingDefinition]) -> Result<ProviderValues, PolicyError> {
+            let value = self.0.lock().unwrap().clone();
+            Ok(definitions
+                .iter()
+                .filter(|definition| definition.key == PolicyKey::Tailnet)
+                .map(|definition| (definition.key, Ok(RawValue::String(value.clone()))))
+                .collect())
+        }
+    }
+
+    let provider = Arc::new(ManualProvider(Mutex::new("old".into())));
+    let engine = PolicyEngine::well_known(PolicyScope::Device).unwrap();
+    engine
+        .add_provider("manual", PolicyScope::Device, provider.clone())
+        .unwrap();
+    let old_generation = engine.snapshot().generation();
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    let release_rx = Mutex::new(release_rx);
+    let reentrant_engine = engine.clone();
+    let _blocker = engine.register_snapshot_commit_callback(move |_| {
+        // Commit callbacks run after reload synchronization is released.
+        reentrant_engine.reload().unwrap();
+        entered_tx.send(()).unwrap();
+        release_rx.lock().unwrap().recv().unwrap();
+    });
+
+    *provider.0.lock().unwrap() = "new".into();
+    let reload_engine = engine.clone();
+    let reload = thread::spawn(move || reload_engine.reload());
+    entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+    let late_calls = Arc::new(AtomicUsize::new(0));
+    let callback_calls = late_calls.clone();
+    let (_late_subscription, current) = engine.subscribe_snapshot_commits(move |_| {
+        callback_calls.fetch_add(1, Ordering::SeqCst);
+    });
+    assert!(current.generation() > old_generation);
+    assert_eq!(
+        current.snapshot().get(PolicyKey::Tailnet),
+        Ok(PolicyValue::String("new".into()))
+    );
+    assert_eq!(late_calls.load(Ordering::SeqCst), 0);
+
+    release_tx.send(()).unwrap();
+    reload.join().unwrap().unwrap();
+    assert_eq!(late_calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
 fn callback_and_memory_subscription_drop_can_reenter_without_deadlock() {
     let engine = PolicyEngine::well_known(PolicyScope::Device).unwrap();
     let inner_registration = engine.register_change_callback(|_| {});

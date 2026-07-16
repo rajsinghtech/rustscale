@@ -117,22 +117,15 @@ impl Server {
             })
         });
 
-        // The notifier only submits to the process-owned bounded control
-        // worker pool. Policy URLs are validated against this configured
-        // control origin and are never dialed directly.
-        let control_notifier = rustscale_controlclient::SshEventNotifier::new(
-            self.config.control_url.clone(),
-            inner.machine_key.clone(),
-            inner.server_pub_key.clone(),
-            crate::PROTOCOL_VERSION,
-            self.config.extra_root_certs.clone().unwrap_or_default(),
-            inner.node_key.public(),
-        );
+        // Admission is bound to the currently published map Noise generation.
+        // This producer contains no machine/control credentials and cannot
+        // establish a fresh transport.
+        let control_notifier = inner.ssh_callbacks.notifier();
         let recording_notify: rustscale_ssh::RecordingNotifyCallback =
             Arc::new(move |notify_url, request| {
                 if control_notifier.enqueue(notify_url, &request).is_err() {
                     // Do not log callback URLs, identities, recorder attempts,
-                    // or credential-bearing transport details.
+                    // or control-generation details.
                     log::warn!("SSH recording callback could not be queued");
                 }
             });

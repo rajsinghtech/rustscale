@@ -425,6 +425,16 @@ impl From<H2SetupError> for StreamMapError {
     }
 }
 
+async fn next_map_or_callback_data(
+    body: &mut h2::RecvStream,
+    callbacks: Option<&mut crate::ssh_notify::CallbackGeneration>,
+) -> Option<Result<bytes::Bytes, h2::Error>> {
+    match callbacks {
+        Some(callbacks) => callbacks.recv_map_data(body).await,
+        None => body.data().await,
+    }
+}
+
 struct H2Runtime {
     connection: Option<tokio::task::JoinHandle<()>>,
     bridge: Option<tokio::task::JoinHandle<()>>,
@@ -663,20 +673,7 @@ impl ControlClient {
         req: &MapRequest,
         updates: mpsc::Sender<Result<MapResponse, StreamMapError>>,
     ) -> Result<(), StreamMapError> {
-        self.stream_map_inner(req, updates, None, None).await
-    }
-
-    /// Stream map updates and answer control-to-node callbacks over the same
-    /// Noise/H2 session.
-    async fn stream_map_with_c2n(
-        &self,
-        req: &MapRequest,
-        updates: mpsc::Sender<Result<MapResponse, StreamMapError>>,
-        router: Arc<C2nRouter>,
-        last_c2n_url: Arc<Mutex<String>>,
-    ) -> Result<(), StreamMapError> {
-        self.stream_map_inner(req, updates, Some(router), Some(last_c2n_url))
-            .await
+        self.stream_map_inner(req, updates, None, None, None).await
     }
 
     async fn stream_map_inner(
@@ -685,6 +682,7 @@ impl ControlClient {
         updates: mpsc::Sender<Result<MapResponse, StreamMapError>>,
         c2n_router: Option<Arc<C2nRouter>>,
         last_c2n_url: Option<Arc<Mutex<String>>>,
+        ssh_callbacks: Option<crate::SshCallbackDispatcher>,
     ) -> Result<(), StreamMapError> {
         let noise_stream = dial_control(
             &self.host,
@@ -740,79 +738,105 @@ impl ControlClient {
                 ));
             }
 
+            let mut callback_generation = ssh_callbacks.map(|dispatcher| {
+                crate::ssh_notify::CallbackGeneration::new(
+                    dispatcher,
+                    h2_send.clone(),
+                    req.NodeKey.clone(),
+                )
+            });
             // Read 4-byte LE size-prefixed MapResponse messages from the body.
             // h2::RecvStream doesn't impl AsyncRead, so we read frames and
-            // buffer them.
-            let mut read_buf: Vec<u8> = Vec::new();
-            loop {
-                // Ensure we have at least 4 bytes for the size header.
-                while read_buf.len() < 4 {
-                    match resp_body.data().await {
-                        Some(Ok(frame)) => {
-                            let _ = resp_body.flow_control().release_capacity(frame.len());
-                            read_buf.extend_from_slice(&frame);
-                        }
-                        Some(Err(e)) => {
-                            let _ = updates.send(Err(StreamMapError::H2(e))).await;
-                            return Ok(());
-                        }
-                        None => {
-                            // Stream ended.
-                            if read_buf.is_empty() {
+            // buffer them. Callback work is selected alongside map reads on
+            // this same authenticated H2 generation.
+            let stream_result = async {
+                let mut read_buf: Vec<u8> = Vec::new();
+                loop {
+                    // Ensure we have at least 4 bytes for the size header.
+                    while read_buf.len() < 4 {
+                        match next_map_or_callback_data(
+                            &mut resp_body,
+                            callback_generation.as_mut(),
+                        )
+                        .await
+                        {
+                            Some(Ok(frame)) => {
+                                let _ = resp_body.flow_control().release_capacity(frame.len());
+                                read_buf.extend_from_slice(&frame);
+                            }
+                            Some(Err(e)) => {
+                                let _ = updates.send(Err(StreamMapError::H2(e))).await;
                                 return Ok(());
                             }
-                            // Partial data — treat as EOF.
-                            return Ok(());
+                            None => {
+                                // Stream ended.
+                                if read_buf.is_empty() {
+                                    return Ok(());
+                                }
+                                // Partial data — treat as EOF.
+                                return Ok(());
+                            }
                         }
                     }
-                }
 
-                let size = u32::from_le_bytes([read_buf[0], read_buf[1], read_buf[2], read_buf[3]])
-                    as usize;
-                read_buf.drain(..4);
+                    let size =
+                        u32::from_le_bytes([read_buf[0], read_buf[1], read_buf[2], read_buf[3]])
+                            as usize;
+                    read_buf.drain(..4);
 
-                if size > 4 * 1024 * 1024 {
-                    let _ = updates
-                        .send(Err(StreamMapError::Io(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "map response too large",
-                        ))))
-                        .await;
-                    return Ok(());
-                }
+                    if size > 4 * 1024 * 1024 {
+                        let _ = updates
+                            .send(Err(StreamMapError::Io(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "map response too large",
+                            ))))
+                            .await;
+                        return Ok(());
+                    }
 
-                // Read until we have `size` bytes.
-                while read_buf.len() < size {
-                    match resp_body.data().await {
-                        Some(Ok(frame)) => {
-                            let _ = resp_body.flow_control().release_capacity(frame.len());
-                            read_buf.extend_from_slice(&frame);
-                        }
-                        Some(Err(e)) => {
-                            let _ = updates.send(Err(StreamMapError::H2(e))).await;
-                            return Ok(());
-                        }
-                        None => {
-                            // Stream ended prematurely.
-                            return Ok(());
+                    // Read until we have `size` bytes.
+                    while read_buf.len() < size {
+                        match next_map_or_callback_data(
+                            &mut resp_body,
+                            callback_generation.as_mut(),
+                        )
+                        .await
+                        {
+                            Some(Ok(frame)) => {
+                                let _ = resp_body.flow_control().release_capacity(frame.len());
+                                read_buf.extend_from_slice(&frame);
+                            }
+                            Some(Err(e)) => {
+                                let _ = updates.send(Err(StreamMapError::H2(e))).await;
+                                return Ok(());
+                            }
+                            None => {
+                                // Stream ended prematurely.
+                                return Ok(());
+                            }
                         }
                     }
-                }
 
-                let msg: Vec<u8> = read_buf.drain(..size).collect();
-                match serde_json::from_slice::<MapResponse>(&msg) {
-                    Ok(mr) => {
-                        if !forward_map_response(&updates, mr, c2n_tasks.as_mut()).await {
+                    let msg: Vec<u8> = read_buf.drain(..size).collect();
+                    match serde_json::from_slice::<MapResponse>(&msg) {
+                        Ok(mr) => {
+                            if !forward_map_response(&updates, mr, c2n_tasks.as_mut()).await {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            let _ = updates.send(Err(StreamMapError::Json(e))).await;
                             break;
                         }
                     }
-                    Err(e) => {
-                        let _ = updates.send(Err(StreamMapError::Json(e))).await;
-                        break;
-                    }
                 }
+                Ok(())
             }
-            Ok(())
+            .await;
+            if let Some(callback_generation) = callback_generation {
+                callback_generation.shutdown().await;
+            }
+            stream_result
         }
         .await;
         runtime.close().await;
@@ -838,7 +862,7 @@ impl ControlClient {
         updates: mpsc::Sender<Result<MapResponse, StreamMapError>>,
         session: Option<Arc<MapSessionState>>,
     ) {
-        self.stream_map_loop_inner(req, updates, session, None)
+        self.stream_map_loop_inner(req, updates, session, None, None)
             .await;
     }
 
@@ -850,7 +874,22 @@ impl ControlClient {
         session: Option<Arc<MapSessionState>>,
         router: Arc<C2nRouter>,
     ) {
-        self.stream_map_loop_inner(req, updates, session, Some(router))
+        self.stream_map_loop_inner(req, updates, session, Some(router), None)
+            .await;
+    }
+
+    /// Stream map updates, C2N, and SSH callbacks over each generation's exact
+    /// authenticated Noise/H2 session. A generation is revoked before its
+    /// transport runtime is closed or replaced.
+    pub async fn stream_map_loop_with_c2n_and_ssh_callbacks(
+        &self,
+        req: &MapRequest,
+        updates: mpsc::Sender<Result<MapResponse, StreamMapError>>,
+        session: Option<Arc<MapSessionState>>,
+        router: Arc<C2nRouter>,
+        ssh_callbacks: crate::SshCallbackDispatcher,
+    ) {
+        self.stream_map_loop_inner(req, updates, session, Some(router), Some(ssh_callbacks))
             .await;
     }
 
@@ -860,6 +899,7 @@ impl ControlClient {
         updates: mpsc::Sender<Result<MapResponse, StreamMapError>>,
         session: Option<Arc<MapSessionState>>,
         c2n_router: Option<Arc<C2nRouter>>,
+        ssh_callbacks: Option<crate::SshCallbackDispatcher>,
     ) {
         let mut backoff = std::time::Duration::from_secs(2);
         let last_c2n_url = Arc::new(Mutex::new(String::new()));
@@ -878,11 +918,12 @@ impl ControlClient {
                 req.clone()
             };
             let result = if let Some(router) = c2n_router.as_ref() {
-                self.stream_map_with_c2n(
+                self.stream_map_inner(
                     &req_for_iter,
                     updates.clone(),
-                    router.clone(),
-                    last_c2n_url.clone(),
+                    Some(router.clone()),
+                    Some(last_c2n_url.clone()),
+                    ssh_callbacks.clone(),
                 )
                 .await
             } else {

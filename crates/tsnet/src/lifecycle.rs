@@ -718,6 +718,7 @@ async fn quiesce_running_state(inner: &mut RunningState, preserve_localapi: bool
     {
         abort.abort();
     }
+    inner.ssh_callbacks.revoke_current();
     inner.map_tasks.begin_shutdown();
     inner.extension_subscription.take();
     inner.hostinfo_hooks.clear();
@@ -1354,6 +1355,7 @@ impl Server {
             b.map_session.clone(),
             Arc::clone(&b.map_tasks),
             b.c2n_router.clone(),
+            b.ssh_callbacks.clone(),
             suggested_exit_node.clone(),
             client_updater.clone(),
             b.tailnet_lock.clone(),
@@ -1766,6 +1768,7 @@ impl Server {
             user_profiles: b.user_profiles,
             ssh_policy: b.ssh_policy,
             ssh_host_keys: b.ssh_host_keys,
+            ssh_callbacks: b.ssh_callbacks,
             monitor: rollback.take_monitor(),
             machine_key: b.machine_key,
             server_pub_key: b.server_pub_key,
@@ -2052,6 +2055,7 @@ impl Server {
             b.map_session.clone(),
             Arc::clone(&b.map_tasks),
             b.c2n_router.clone(),
+            b.ssh_callbacks.clone(),
             suggested_exit_node.clone(),
             client_updater.clone(),
             b.tailnet_lock.clone(),
@@ -2435,6 +2439,7 @@ impl Server {
             user_profiles: b.user_profiles,
             ssh_policy: b.ssh_policy,
             ssh_host_keys: b.ssh_host_keys,
+            ssh_callbacks: b.ssh_callbacks,
             monitor: rollback.take_monitor(),
             machine_key: b.machine_key,
             server_pub_key: b.server_pub_key,
@@ -3490,6 +3495,7 @@ impl Server {
         let (map_tx, map_rx) = mpsc::channel(32);
         let map_session = Arc::new(MapSessionState::new());
         map_session.set_tka_head(tailnet_lock.head());
+        let ssh_callbacks = rustscale_controlclient::SshCallbackDispatcher::new();
         let cc2 = ControlClient::new(
             self.config.control_url.clone(),
             state.machine_key.clone(),
@@ -3703,9 +3709,16 @@ impl Server {
         let map_task = tokio::spawn({
             let ss = map_session.clone();
             let router = c2n_router.clone();
+            let callbacks = ssh_callbacks.clone();
             async move {
-                cc2.stream_map_loop_with_c2n(&map_req, map_tx, Some(ss), router)
-                    .await;
+                cc2.stream_map_loop_with_c2n_and_ssh_callbacks(
+                    &map_req,
+                    map_tx,
+                    Some(ss),
+                    router,
+                    callbacks,
+                )
+                .await;
             }
         });
         bootstrap_rollback.set_map_task(map_task);
@@ -3744,6 +3757,7 @@ impl Server {
             user_profiles,
             ssh_policy,
             ssh_host_keys,
+            ssh_callbacks,
             machine_key: state.machine_key.clone(),
             server_pub_key,
             disco_key: state.disco_key.clone(),
@@ -4111,6 +4125,7 @@ fn revoke_owner_authority_terminal(owner: &mut CleanupOwner, drive: &crate::driv
         inner.health_watchdog.stop();
         inner.extension_subscription.take();
         inner.hostinfo_hooks.clear();
+        inner.ssh_callbacks.revoke_current();
         inner.map_tasks.begin_shutdown();
         for abort in inner
             .task_aborts

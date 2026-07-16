@@ -553,6 +553,7 @@ pub(crate) fn spawn_map_update_task(
     map_session: Arc<MapSessionState>,
     map_tasks: Arc<MapSessionTasks>,
     c2n_router: Arc<C2nRouter>,
+    ssh_callbacks: rustscale_controlclient::SshCallbackDispatcher,
     suggested_exit_node: Arc<RwLock<String>>,
     client_updater: Arc<std::sync::Mutex<rustscale_clientupdate::ClientUpdater>>,
     tailnet_lock: Arc<crate::tailnet_lock::TailnetLock>,
@@ -836,13 +837,18 @@ pub(crate) fn spawn_map_update_task(
                                     };
                                     let ss = map_session.clone();
                                     let router = c2n_router.clone();
+                                    let callbacks = ssh_callbacks.clone();
+                                    // Revoke admission synchronously before
+                                    // aborting and joining the old map transport.
+                                    ssh_callbacks.revoke_current();
                                     if !Box::pin(map_tasks.rebind(async move {
                                         cc_new
-                                            .stream_map_loop_with_c2n(
+                                            .stream_map_loop_with_c2n_and_ssh_callbacks(
                                                 &new_map_req,
                                                 new_tx,
                                                 Some(ss),
                                                 router,
+                                                callbacks,
                                             )
                                             .await;
                                     }))

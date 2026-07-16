@@ -29,7 +29,9 @@ pub use client::{
 pub use controlbase::{NoiseConn, NoiseError, NoiseIo, NoiseIoHandle, ProtocolVersion};
 pub use controlhttp::{dial_control, fetch_server_pub_key, DialError, NoiseStream};
 pub use login_flags::{LoginFlags, LOGIN_DEFAULT, LOGIN_EPHEMERAL, LOGIN_INTERACTIVE};
-pub use ssh_notify::{SshEventNotifier, SshNotifyEnqueueError};
+pub use ssh_notify::{
+    SshCallbackDispatcher, SshEventNotifier, SshNotifyEnqueueError, SshNotifyMetricsSnapshot,
+};
 pub use tka::{TkaClient, TkaRpcError, TkaSession};
 
 use std::collections::HashMap;

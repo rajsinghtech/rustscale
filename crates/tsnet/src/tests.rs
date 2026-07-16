@@ -909,6 +909,7 @@ async fn retained_in_memory_client_cannot_mutate_routes_after_close() {
         .auth_key("tskey-test")
         .control_url(control.base_url())
         .state_dir(temp.path())
+        .disable_portmapping(true)
         .build()
         .unwrap();
     Box::pin(server.up()).await.unwrap();

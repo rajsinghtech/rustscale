@@ -3678,7 +3678,10 @@ dependencies = [
  "rustscale-logtail",
  "rustscale-safesocket",
  "rustscale-syspolicy",
+ "rustscale-testcontrol",
  "rustscale-tsnet",
+ "serde_json",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
 ]

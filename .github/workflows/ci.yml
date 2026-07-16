@@ -66,6 +66,7 @@ jobs:
           shellcheck scripts/*.sh container/*.sh tools/packaging/*.sh
           tools/packaging/check-release.sh
           tools/packaging/test-install.sh
+          tools/packaging/test-first-run.sh
           tools/packaging/test-container.sh
       - name: Windows installer contract
         if: ${{ matrix.os == 'windows-latest' }}

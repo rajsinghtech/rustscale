@@ -245,7 +245,7 @@ state-dir fallback probing), `--json`.
 | `set` | `cli/set.go` | ✅ EditPrefs via PATCH /prefs; flags: hostname, accept-routes, accept-dns, shields-up, advertise-routes, advertise-exit-node, exit-node, route-all, advertise-tags, reset |
 | `get` | `cli/prefs.go` | ✅ GET /prefs, JSON or human-readable |
 | `switch` | `cli/switch.go` | ✅ `switch [--list] [--json] [<profile>]` |
-| `wait` | `cli/wait.go` | ✅ subscribe-first authenticated LocalAPI state watch with `NotifyInitialState`; waits for Running, a Tailscale IP, and the configured TUN interface; `--timeout`, cancellation, bounded fail-closed stream parsing, and disconnect handling |
+| `wait` | `cli/wait.go` | ✅ subscribe-first authenticated LocalAPI state watch with `NotifyInitialState`; waits for Running, a Tailscale IP, and the configured TUN interface; `--timeout`, cancellation, bounded fail-closed connection-close/HTTP chunked parsing, and immediate disconnect unregistration |
 | `serve`/`funnel` | `cli/serve.go` | ✅ serve/funnel status, reset, set with --bg/--https/--http/--tcp/--tls-terminated-tcp; foreground mode not yet supported |
 | `cert` | `cli/cert.go` | ✅ `cert [--cert-file] [--key-file] [--min-validity] <domain>`; writes files, `-`=stdout; no-domain prints cert domains from status |
 | `file` | `cli/file.go` | ✅ `file cp [--name] [--verbose] [--targets] <files...> <target>:`; `file get [--wait] [--conflict=skip\|overwrite\|rename] [--verbose] <dir>` |
@@ -266,7 +266,8 @@ state-dir fallback probing), `--json`.
 hand-rolled HTTP/1.1 (no hyper), fake Host `local-rustscaled.sock`, typed
 errors (AccessDenied 403, PreconditionsFailed 412, HttpStatus, PeerNotFound),
 `watch_ipn_bus()` streaming method for newline-delimited JSON `Notify`
-messages, with bounded HTTP headers/frames, strict status/JSON validation, and
+messages, with bounded HTTP headers/frames/chunks/trailers, fragmented HTTP/1.1
+chunked and connection-close framing, strict status/JSON validation, and
 explicit EOF handling. Methods: start(), login_interactive(), logout(), edit_prefs(),
 get_prefs(), status(), whois(), health(), metrics(), ping(), get_serve_config(),
 set_serve_config(), cert_pair(), tailnet_lock_status(), tailnet_lock_init(),

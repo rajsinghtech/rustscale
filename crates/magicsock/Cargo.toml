@@ -50,17 +50,17 @@ drop_non_drop = "allow"
 duration_suboptimal_units = "allow"
 
 [dependencies]
-rustscale-key = { path = "../key", version = "0.1.1" }
-rustscale-tailcfg = { path = "../tailcfg", version = "0.1.1" }
-rustscale-disco = { path = "../disco", version = "0.1.1" }
-rustscale-derp = { path = "../derp", version = "0.1.1" }
-rustscale-portmapper = { path = "../portmapper", version = "0.1.1" }
-rustscale-health = { path = "../health", version = "0.1.1" }
-rustscale-udprelay = { path = "../udprelay", version = "0.1.1" }
-rustscale-neterror = { path = "../neterror", version = "0.1.1" }
-rustscale-sockstats = { path = "../sockstats", version = "0.1.1" }
-rustscale-ipnstate = { path = "../ipnstate", version = "0.1.1" }
-rustscale-controlknobs = { path = "../controlknobs", version = "0.1.1" }
+rustscale-key = { path = "../key", version = "0.1.2" }
+rustscale-tailcfg = { path = "../tailcfg", version = "0.1.2" }
+rustscale-disco = { path = "../disco", version = "0.1.2" }
+rustscale-derp = { path = "../derp", version = "0.1.2" }
+rustscale-portmapper = { path = "../portmapper", version = "0.1.2" }
+rustscale-health = { path = "../health", version = "0.1.2" }
+rustscale-udprelay = { path = "../udprelay", version = "0.1.2" }
+rustscale-neterror = { path = "../neterror", version = "0.1.2" }
+rustscale-sockstats = { path = "../sockstats", version = "0.1.2" }
+rustscale-ipnstate = { path = "../ipnstate", version = "0.1.2" }
+rustscale-controlknobs = { path = "../controlknobs", version = "0.1.2" }
 rustscale-netns.workspace = true
 thiserror.workspace = true
 log = "0.4"
@@ -75,5 +75,5 @@ socket2.workspace = true
 [dev-dependencies]
 async-trait.workspace = true
 tokio.workspace = true
-rustscale-key = { path = "../key", version = "0.1.1" }
+rustscale-key = { path = "../key", version = "0.1.2" }
 rustscale-routecheck.workspace = true

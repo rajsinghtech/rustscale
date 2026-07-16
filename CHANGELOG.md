@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.1.2
+
+First-run reliability and daemon lifecycle hotfix.
+
+- Fixed pre-runtime default-socket discovery and replaced runtime-affinity
+  panics with typed errors.
+- Made interactive login, logout, shutdown, LocalAPI handoff, and subsystem
+  wakeups durable and cancellation-safe.
+- Persisted and enforced the configured Unix operator while preserving
+  read-only LocalAPI access for unrelated users.
+- Restored wanted profiles after service restart, applied online preference
+  updates, and made container authentication ownership deterministic.
+- Hardened Unix socket replacement/cleanup and bounded daemon shutdown cleanup.
+- Added a credential-free installed Linux gate covering real release binaries,
+  root daemon startup, operator setup, delayed interactive login, restart,
+  logout, root-state cleanup, and uninstall.
+- Added bounded Windows TCP table snapshots and safe managed-policy watching.
+
 ## 0.1.1
 
 Large compatibility, performance, and production-readiness update following

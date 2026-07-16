@@ -10,9 +10,9 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-rustscale-key = { path = "../key", version = "0.1.1" }
-rustscale-tsaddr = { path = "../tsaddr", version = "0.1.1" }
-rustscale-dnsname = { path = "../dnsname", version = "0.1.1" }
+rustscale-key = { path = "../key", version = "0.1.2" }
+rustscale-tsaddr = { path = "../tsaddr", version = "0.1.2" }
+rustscale-dnsname = { path = "../dnsname", version = "0.1.2" }
 serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true

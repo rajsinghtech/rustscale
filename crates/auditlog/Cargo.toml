@@ -10,8 +10,8 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-rustscale-ipn = { path = "../ipn", version = "0.1.1" }
-rustscale-tailcfg = { path = "../tailcfg", version = "0.1.1" }
+rustscale-ipn = { path = "../ipn", version = "0.1.2" }
+rustscale-tailcfg = { path = "../tailcfg", version = "0.1.2" }
 async-trait.workspace = true
 chrono.workspace = true
 hex.workspace = true

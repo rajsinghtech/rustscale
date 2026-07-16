@@ -13,9 +13,9 @@ workspace = true
 chrono.workspace = true
 rand.workspace = true
 sha2.workspace = true
-rustscale-ipn = { path = "../ipn", version = "0.1.1" }
-rustscale-key = { path = "../key", version = "0.1.1" }
-rustscale-tailcfg = { path = "../tailcfg", version = "0.1.1" }
+rustscale-ipn = { path = "../ipn", version = "0.1.2" }
+rustscale-key = { path = "../key", version = "0.1.2" }
+rustscale-tailcfg = { path = "../tailcfg", version = "0.1.2" }
 
 [dev-dependencies]
 proptest = "1"

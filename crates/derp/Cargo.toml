@@ -13,22 +13,22 @@ workspace = true
 test-utils = ["dep:rustscale-tailcfg"]
 
 [dependencies]
-rustscale-key = { path = "../key", version = "0.1.1" }
-rustscale-tailcfg = { path = "../tailcfg", version = "0.1.1", optional = true }
+rustscale-key = { path = "../key", version = "0.1.2" }
+rustscale-tailcfg = { path = "../tailcfg", version = "0.1.2", optional = true }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 hex.workspace = true
 rustscale-netns.workspace = true
-rustscale-tshttpproxy = { path = "../tshttpproxy", version = "0.1.1" }
-rustscale-tlsdial = { path = "../tlsdial", version = "0.1.1" }
-rustscale-tsdial = { path = "../tsdial", version = "0.1.1" }
-rustscale-envknob = { path = "../envknob", version = "0.1.1" }
-rustscale-ktimeout = { path = "../ktimeout", version = "0.1.1" }
+rustscale-tshttpproxy = { path = "../tshttpproxy", version = "0.1.2" }
+rustscale-tlsdial = { path = "../tlsdial", version = "0.1.2" }
+rustscale-tsdial = { path = "../tsdial", version = "0.1.2" }
+rustscale-envknob = { path = "../envknob", version = "0.1.2" }
+rustscale-ktimeout = { path = "../ktimeout", version = "0.1.2" }
 rustscale-limiter.workspace = true
 url = "2"
 
 [dev-dependencies]
 tokio.workspace = true
-rustscale-tailcfg = { path = "../tailcfg", version = "0.1.1" }
+rustscale-tailcfg = { path = "../tailcfg", version = "0.1.2" }

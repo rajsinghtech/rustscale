@@ -12,9 +12,9 @@ workspace = true
 
 [dependencies]
 async-trait.workspace = true
-rustscale-feature = { path = "../feature", version = "0.1.1" }
-rustscale-ipn = { path = "../ipn", version = "0.1.1" }
-rustscale-tsd = { path = "../tsd", version = "0.1.1" }
+rustscale-feature = { path = "../feature", version = "0.1.2" }
+rustscale-ipn = { path = "../ipn", version = "0.1.2" }
+rustscale-tsd = { path = "../tsd", version = "0.1.2" }
 tokio.workspace = true
 
 [dev-dependencies]

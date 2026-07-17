@@ -73,7 +73,7 @@ pub async fn run_userspace(
     let stream = connected.ok_or("failed to dial after 3 attempts")?;
     let path = super::throughput::extract_path_class(&server.status(), &target);
     let result = measure(stream, "userspace-tsnet", target, count, path, my_ip).await?;
-    server.close().await?;
+    super::throughput::close_userspace(&mut server).await?;
     Ok(result)
 }
 

@@ -104,8 +104,28 @@ pub async fn run_userspace(
         my_ip,
     )
     .await?;
-    server.close().await?;
+    close_userspace(&mut server).await?;
     Ok(result)
+}
+
+pub(crate) async fn close_userspace(server: &mut Server) -> Result<(), Box<dyn Error>> {
+    let mut last_error = None;
+    for attempt in 1..=5 {
+        match server.close().await {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                eprintln!("userspace shutdown attempt {attempt}/5 failed: {error}");
+                last_error = Some(error);
+                if attempt < 5 {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+            }
+        }
+    }
+    Err(last_error
+        .map(|error| format!("userspace shutdown incomplete after 5 attempts: {error}"))
+        .unwrap_or_else(|| "userspace shutdown incomplete".into())
+        .into())
 }
 
 pub async fn run_kernel(

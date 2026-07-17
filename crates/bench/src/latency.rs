@@ -1,33 +1,38 @@
-//! Latency client: measure RTT of small ping-pong messages over the tailnet.
+//! RSB1 TCP ping-pong latency over userspace tsnet or kernel TCP/TUN.
 
-use std::time::{Duration, Instant};
-
+use crate::protocol::{read_ack, write_go, write_header, Header, MODE_LATENCY, PING_SIZE};
 use rustscale_tsnet::Server;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-use crate::protocol::{read_ack, write_header, Header, MODE_LATENCY, PING_SIZE};
+use std::error::Error;
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpStream;
 
 pub struct LatencyResult {
-    pub count: usize,
+    pub transport: &'static str,
+    pub requested: usize,
+    pub successful: usize,
+    pub timed_out: usize,
+    pub malformed: usize,
     pub path_class: String,
     pub tailscale_ip: String,
     pub target: String,
-    pub min_us: u64,
-    pub max_us: u64,
-    pub mean_us: f64,
-    pub p50_us: u64,
-    pub p95_us: u64,
-    pub p99_us: u64,
+    pub min_ns: u64,
+    pub max_ns: u64,
+    pub mean_ns: f64,
+    pub p50_ns: u64,
+    pub p95_ns: u64,
+    pub p99_ns: u64,
+    pub samples_ns: Vec<u64>,
 }
 
-pub async fn run(
+pub async fn run_userspace(
     authkey: String,
     target: String,
     count: usize,
     hostname: String,
     control_url: String,
     state_dir: Option<std::path::PathBuf>,
-) -> Result<LatencyResult, Box<dyn std::error::Error>> {
+) -> Result<LatencyResult, Box<dyn Error>> {
     let mut builder = Server::builder()
         .hostname(hostname)
         .auth_key(authkey)
@@ -38,9 +43,8 @@ pub async fn run(
     }
     let mut server = builder.build()?;
     Box::pin(server.up()).await?;
-
-    let status = server.status();
-    let my_ip = status
+    let my_ip = server
+        .status()
         .tailscale_ips
         .iter()
         .find_map(|ip| match ip {
@@ -48,96 +52,129 @@ pub async fn run(
             _ => None,
         })
         .unwrap_or_default();
-    eprintln!("latency client up: ip={my_ip}, waiting for peer {target}");
-
     if let Some(ip) = super::throughput::extract_target_ip(&target) {
         super::throughput::wait_for_peer(&server, ip, Duration::from_secs(90)).await;
     }
     tokio::time::sleep(Duration::from_secs(3)).await;
-
-    // Dial the server.
-    let mut stream = {
-        let mut connected = None;
-        for attempt in 1..=3u32 {
-            eprintln!("dial attempt {attempt}");
-            match tokio::time::timeout(Duration::from_secs(45), server.dial(&target)).await {
-                Ok(Ok(s)) => {
-                    connected = Some(s);
-                    break;
-                }
-                Ok(Err(e)) => eprintln!("dial attempt {attempt} failed: {e}"),
-                Err(_) => eprintln!("dial attempt {attempt} timed out"),
+    let mut connected = None;
+    for attempt in 1..=3 {
+        match tokio::time::timeout(Duration::from_secs(45), server.dial(&target)).await {
+            Ok(Ok(stream)) => {
+                connected = Some(stream);
+                break;
             }
-            if attempt < 3 {
-                tokio::time::sleep(Duration::from_secs(2)).await;
-            }
+            Ok(Err(error)) => eprintln!("dial attempt {attempt} failed: {error}"),
+            Err(_) => eprintln!("dial attempt {attempt} timed out"),
         }
-        connected.ok_or("failed to dial after 3 attempts")?
-    };
-
-    // Exchange header + ack.
-    let hdr = Header {
-        mode: MODE_LATENCY,
-        direction: 0,
-        duration_secs: 0,
-        count: count as u32,
-    };
-    write_header(&mut stream, &hdr).await?;
-    read_ack(&mut stream).await?;
-    eprintln!("latency test: {count} ping-pong rounds");
-
-    // Run ping-pong.
-    let mut rtts_us: Vec<u64> = Vec::with_capacity(count);
-    let mut ping_buf = [0u8; PING_SIZE];
-    let mut pong_buf = [0u8; PING_SIZE];
-
-    for i in 0..count {
-        // Encode sequence number in the ping.
-        ping_buf[..4].copy_from_slice(b"PING");
-        ping_buf[4..8].copy_from_slice(&(i as u32).to_be_bytes());
-
-        let start = Instant::now();
-        stream.write_all(&ping_buf).await?;
-        stream.read_exact(&mut pong_buf).await?;
-        let rtt = start.elapsed().as_micros() as u64;
-        rtts_us.push(rtt);
+        if attempt < 3 {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
     }
+    let stream = connected.ok_or("failed to dial after 3 attempts")?;
+    let path = super::throughput::extract_path_class(&server.status(), &target);
+    let result = measure(stream, "userspace-tsnet", target, count, path, my_ip).await?;
+    server.close().await?;
+    Ok(result)
+}
 
-    let _ = stream.shutdown().await;
-
-    // Compute percentiles.
-    rtts_us.sort_unstable();
-    let len = rtts_us.len();
-    let pct = |p: f64| -> u64 {
-        if len == 0 {
-            return 0;
-        }
-        let idx = ((len as f64 - 1.0) * p).round() as usize;
-        rtts_us[idx.min(len - 1)]
-    };
-    let min_us = *rtts_us.first().unwrap_or(&0);
-    let max_us = *rtts_us.last().unwrap_or(&0);
-    let mean_us = rtts_us.iter().map(|&v| v as f64).sum::<f64>() / len as f64;
-    let p50_us = pct(0.50);
-    let p95_us = pct(0.95);
-    let p99_us = pct(0.99);
-
-    // Final path class.
-    let final_status = server.status();
-    let path_class = super::throughput::extract_path_class(&final_status, &target);
-
-    server.close().await.unwrap();
-
-    Ok(LatencyResult {
-        count,
-        path_class,
-        tailscale_ip: my_ip,
+pub async fn run_kernel(target: String, count: usize) -> Result<LatencyResult, Box<dyn Error>> {
+    let stream =
+        tokio::time::timeout(Duration::from_secs(45), TcpStream::connect(&target)).await??;
+    stream.set_nodelay(true)?;
+    measure(
+        stream,
+        "kernel-tcp",
         target,
-        min_us,
-        max_us,
-        mean_us,
-        p50_us,
-        p95_us,
-        p99_us,
+        count,
+        "externally-gated".into(),
+        String::new(),
+    )
+    .await
+}
+
+async fn measure<S>(
+    mut stream: S,
+    transport: &'static str,
+    target: String,
+    count: usize,
+    path_class: String,
+    tailscale_ip: String,
+) -> Result<LatencyResult, Box<dyn Error>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let wire_count = u32::try_from(count)?;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        write_header(
+            &mut stream,
+            &Header {
+                mode: MODE_LATENCY,
+                direction: 0,
+                duration_secs: 0,
+                count: wire_count,
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        read_ack(&mut stream)
+            .await
+            .map_err(|error| error.to_string())?;
+        write_go(&mut stream)
+            .await
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|_| "RSB1 latency setup timeout")??;
+    // Connection and RSB1 setup are complete before the latency clock starts.
+    let mut samples = Vec::with_capacity(count);
+    let mut timed_out = 0;
+    let mut malformed = 0;
+    for sequence in 0..count {
+        let mut ping = [0; PING_SIZE];
+        ping[..4].copy_from_slice(b"PING");
+        ping[4..].copy_from_slice(&(sequence as u32).to_be_bytes());
+        let start = Instant::now();
+        let exchange = async {
+            stream.write_all(&ping).await?;
+            let mut pong = [0; PING_SIZE];
+            stream.read_exact(&mut pong).await?;
+            Ok::<_, std::io::Error>(pong)
+        };
+        match tokio::time::timeout(Duration::from_secs(5), exchange).await {
+            Ok(Ok(pong)) if pong == ping => {
+                samples.push(start.elapsed().as_nanos().try_into().unwrap_or(u64::MAX));
+            }
+            Ok(Ok(_)) => malformed += 1,
+            Ok(Err(error)) => return Err(error.into()),
+            Err(_) => {
+                timed_out += 1;
+                break;
+            }
+        }
+    }
+    let _ = stream.shutdown().await;
+    if samples.len() != count {
+        return Err(format!("incomplete latency sample: requested={count} successful={} timed_out={timed_out} malformed={malformed}", samples.len()).into());
+    }
+    let mut ordered = samples.clone();
+    ordered.sort_unstable();
+    let len = ordered.len();
+    let pct = |p: f64| ordered[((len as f64 - 1.0) * p).round() as usize];
+    Ok(LatencyResult {
+        transport,
+        requested: count,
+        successful: len,
+        timed_out,
+        malformed,
+        path_class,
+        tailscale_ip,
+        target,
+        min_ns: ordered[0],
+        max_ns: ordered[len - 1],
+        mean_ns: ordered.iter().map(|&v| v as f64).sum::<f64>() / len as f64,
+        p50_ns: pct(0.50),
+        p95_ns: pct(0.95),
+        p99_ns: pct(0.99),
+        samples_ns: samples,
     })
 }

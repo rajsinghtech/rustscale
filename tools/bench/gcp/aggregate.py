@@ -19,7 +19,8 @@ TOPO_ORDER = {"same-zone": 0, "cross-region": 1}
 DEFAULT_PARALLELISM = [1, 10, 100]
 DEFAULT_MATRIX = {"topologies": list(TOPO_ORDER), "paths": list(PATH_ORDER), "configs": list(CONFIG_ORDER),
                   "parallelism": DEFAULT_PARALLELISM}
-RESULT_SCHEMA_VERSION = 3
+RESULT_SCHEMA_VERSION = 4
+HISTORICAL_RESULT_SCHEMA_VERSION = 3
 CONFIG_MODE = {"rs-userspace": "userspace", "rs-tun": "tun",
                "ts-userspace": "userspace", "ts-tun": "tun"}
 # Results are written by Python JSON and retain full binary64 precision.  This
@@ -43,7 +44,10 @@ def selected_matrix(root: Path, allow_partial: bool) -> dict:
         provenance.validate_manifest(data)
         if root.name != data["run"]["id"]:
             raise ValueError("current run directory basename must equal matrix run.id")
-        return {key: data[key] for key in ("topologies", "paths", "configs", "parallelism", "repeat", "dry_run", "run")}
+        matrix = {key: data[key] for key in ("topologies", "paths", "configs", "parallelism", "repeat", "dry_run", "run")}
+        for key in ("duration_s", "sample_cadence_s", "peer_count_requested"):
+            if key in data: matrix[key] = data[key]
+        return matrix
     if data.get("schema_version") != 1 or not allow_partial:
         raise ValueError("matrix schema_version must be 2 for strict aggregation")
     matrix = {key: data[key] for key in ("topologies", "paths", "configs")}
@@ -86,14 +90,16 @@ def median(values: list[float]) -> float:
 def validate_ok(obj: dict, key: tuple[str, str, str], matrix: dict) -> list[str]:
     topo, path, config = key
     errors = []
-    if obj.get("schema_version") != RESULT_SCHEMA_VERSION:
-        errors.append(f"schema_version must be {RESULT_SCHEMA_VERSION}")
+    schema_version = obj.get("schema_version")
+    if schema_version not in (HISTORICAL_RESULT_SCHEMA_VERSION, RESULT_SCHEMA_VERSION):
+        errors.append(f"schema_version must be {HISTORICAL_RESULT_SCHEMA_VERSION} or {RESULT_SCHEMA_VERSION}")
+    current = schema_version == RESULT_SCHEMA_VERSION
     if "run" in matrix:
         if obj.get("run") != matrix["run"]:
             errors.append("result run must exactly equal matrix run")
         try:
             zones = provenance.TOPOLOGY_ZONES[topo]
-            provenance.validate_observed(obj.get("observed"), config, matrix["dry_run"], topo, *zones, matrix["run"]["cloud"]["requested_machine_type"])
+            provenance.validate_observed(obj.get("observed"), config, matrix["dry_run"], topo, *zones, matrix["run"]["cloud"]["requested_machine_type"], current=current)
         except (ValueError, TypeError) as exc:
             errors.append(str(exc))
     if obj.get("status") != "ok":
@@ -121,6 +127,12 @@ def validate_ok(obj: dict, key: tuple[str, str, str], matrix: dict) -> list[str]
         requested = []
     elif requested != matrix["parallelism"]:
         errors.append(f"parallelism_requested={requested!r}, expected matrix parallelism {matrix['parallelism']!r}")
+    if "duration_s" in matrix and obj.get("duration_s_requested") != matrix["duration_s"]:
+        errors.append("duration_s_requested must exactly match matrix duration_s")
+    if "sample_cadence_s" in matrix and obj.get("sample_cadence_s") != matrix["sample_cadence_s"]:
+        errors.append("sample_cadence_s must exactly match matrix sample_cadence_s")
+    if "peer_count_requested" in matrix and obj.get("peer_count_requested") != matrix["peer_count_requested"]:
+        errors.append("peer_count_requested must exactly match matrix peer_count_requested")
     rows = obj.get("throughput")
     if not isinstance(rows, list):
         errors.append("throughput must be a list")
@@ -138,6 +150,8 @@ def validate_ok(obj: dict, key: tuple[str, str, str], matrix: dict) -> list[str]
             errors.append(f"parallel {parallel}: mbps must be finite and positive")
         if not finite_positive(row.get("duration_s")):
             errors.append(f"parallel {parallel}: duration_s must be positive")
+        elif "duration_s" in matrix and row.get("duration_s") != matrix["duration_s"]:
+            errors.append(f"parallel {parallel}: duration_s must equal matrix duration_s")
         if row.get("statistic") != "median":
             errors.append(f"parallel {parallel}: statistic must be median")
         samples = row.get("samples_mbps")
@@ -154,7 +168,16 @@ def validate_ok(obj: dict, key: tuple[str, str, str], matrix: dict) -> list[str]
         percentiles = [latency.get(name) for name in ("p50_us", "p95_us", "p99_us")]
         if not all(finite_positive(value) for value in percentiles) or percentiles != sorted(percentiles):
             errors.append("latency percentiles must be finite, positive, and ordered")
-        if expected_mode == "tun":
+        if current:
+            expected = 50
+            if (latency.get("protocol") != "RSB1-tcp-pingpong" or latency.get("requested") != expected
+                    or latency.get("successful") != expected or latency.get("timed_out") != 0
+                    or latency.get("malformed") != 0 or latency.get("count") != expected):
+                errors.append("schema-v4 latency must contain all 50 RSB1 ping-pong replies")
+            raw = latency.get("samples_ns")
+            if not isinstance(raw, list) or len(raw) != expected or not all(positive_int(value) for value in raw):
+                errors.append("schema-v4 latency samples_ns must contain every positive RTT")
+        elif expected_mode == "tun":
             expected = 50
             complete_fields = ("requested", "transmitted", "received", "count")
             if any(latency.get(name) != expected for name in complete_fields):
@@ -173,19 +196,74 @@ def validate_ok(obj: dict, key: tuple[str, str, str], matrix: dict) -> list[str]
             value = footprint.get(name)
             if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) or value < 0:
                 errors.append(f"footprint {name} must be finite and nonnegative")
+        # Raw monotonic process-set series are a schema-v4 contract. Historical
+        # schema-v3 cells remain valid aggregate-only records; do not fabricate
+        # timing, process scope, or samples when rendering old runs.
+        if current:
+            series = footprint.get("series")
+            truncated = footprint.get("series_truncated")
+            samples = footprint.get("samples")
+            expected_retained = min(samples, 3600) if positive_int(samples) else None
+            if not isinstance(series, list) or not series or len(series) > 3600:
+                errors.append("footprint series must contain 1..=3600 samples")
+            elif expected_retained is not None and len(series) != expected_retained:
+                errors.append("footprint series length must equal min(samples, 3600)")
+            else:
+                elapsed = [sample.get("offset_ms") for sample in series if isinstance(sample, dict)]
+                if (len(elapsed) != len(series) or any(not isinstance(value, int) or isinstance(value, bool) or value < 0 for value in elapsed)
+                        or elapsed != sorted(elapsed) or len(elapsed) != len(set(elapsed))):
+                    errors.append("footprint series offset_ms must be unique and monotonic")
+                if footprint.get("clock") != "monotonic": errors.append("schema-v4 footprint clock must be monotonic")
+                for sample in series:
+                    for name in ("rss_kb", "cpu_pct"):
+                        value = sample.get(name) if isinstance(sample, dict) else None
+                        if value is not None and (not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) or value < 0):
+                            errors.append(f"footprint series {name} must be finite, nonnegative, or null")
+                            break
+                if footprint.get("sample_cadence_s") != matrix.get("sample_cadence_s", 1):
+                    errors.append("footprint sample cadence must match matrix")
+            if type(truncated) is not bool:
+                errors.append("footprint series_truncated must be boolean")
+            elif expected_retained is not None and truncated != (samples > 3600):
+                errors.append("footprint series_truncated must equal samples > 3600")
+    if current:
+        expected_transport = "userspace-tsnet" if config == "rs-userspace" else "kernel-tcp" if config == "rs-tun" else None
+        if expected_transport is not None:
+            if obj.get("transport") != expected_transport: errors.append(f"transport must be {expected_transport}")
+            workload = obj.get("workload")
+            if (not isinstance(workload, dict) or workload.get("implementation") != "rustscale-bench"
+                    or workload.get("protocol") != "RSB1" or workload.get("direction") != "down"
+                    or workload.get("payload_bytes") != 1280 or workload.get("latency_protocol") != "RSB1-tcp-pingpong"
+                    or workload.get("latency_payload_bytes") != 8 or workload.get("client_lifecycle") != "new_process_per_trial"):
+                errors.append("invalid RustScale parity workload identity")
+            resources = obj.get("resources")
+            if not isinstance(resources, dict) or resources.get("sample_cadence_ms") != 1000:
+                errors.append("schema-v4 resources must declare 1000 ms cadence")
+            else:
+                for endpoint in ("server", "client"):
+                    measured = resources.get(endpoint)
+                    scope = measured.get("scope") if isinstance(measured, dict) else None
+                    expected_subjects = ["rustscale-bench"] if config == "rs-userspace" else ["rustscaled", "rustscale-bench"]
+                    if (not isinstance(measured, dict) or measured.get("endpoint") != endpoint
+                            or measured.get("subjects") != expected_subjects
+                            or scope != {"kind":"dynamic_process_set","includes_descendants":False,"includes_kernel":False}
+                            or not isinstance(measured.get("series"), list) or not measured["series"]):
+                        errors.append(f"invalid {endpoint} resource process-set scope")
+        elif obj.get("transport") == "kernel-tcp":
+            errors.append("Tailscale comparator must not claim RustScale parity transport")
     return errors
 
 
 def validate_failed(obj: dict, key: tuple[str, str, str], matrix: dict) -> list[str]:
     errors = []
-    if obj.get("schema_version") != RESULT_SCHEMA_VERSION:
-        errors.append(f"schema_version must be {RESULT_SCHEMA_VERSION}")
+    if obj.get("schema_version") not in (HISTORICAL_RESULT_SCHEMA_VERSION, RESULT_SCHEMA_VERSION):
+        errors.append(f"schema_version must be {HISTORICAL_RESULT_SCHEMA_VERSION} or {RESULT_SCHEMA_VERSION}")
     if "run" in matrix:
         if obj.get("run") != matrix["run"]:
             errors.append("result run must exactly equal matrix run")
         try:
             zones = provenance.TOPOLOGY_ZONES[key[0]]
-            provenance.validate_observed(obj.get("observed"), key[2], matrix["dry_run"], key[0], *zones, matrix["run"]["cloud"]["requested_machine_type"])
+            provenance.validate_observed(obj.get("observed"), key[2], matrix["dry_run"], key[0], *zones, matrix["run"]["cloud"]["requested_machine_type"], current=obj.get("schema_version") == RESULT_SCHEMA_VERSION)
         except (ValueError, TypeError) as exc:
             errors.append(str(exc))
     for field, expected in zip(("topology", "path", "config"), key):
@@ -195,6 +273,9 @@ def validate_failed(obj: dict, key: tuple[str, str, str], matrix: dict) -> list[
         errors.append(f"repeat={obj.get('repeat')!r}, expected matrix repeat {matrix['repeat']!r}")
     if obj.get("parallelism_requested") != matrix["parallelism"]:
         errors.append("parallelism_requested must exactly match matrix parallelism")
+    for result_key, matrix_key in (("duration_s_requested", "duration_s"), ("sample_cadence_s", "sample_cadence_s"), ("peer_count_requested", "peer_count_requested")):
+        if matrix_key in matrix and obj.get(result_key) != matrix[matrix_key]:
+            errors.append(f"{result_key} must exactly match matrix {matrix_key}")
     if not isinstance(obj.get("error"), str) or not obj["error"]:
         errors.append("failed cell must have an actionable error")
     if any(obj.get(field) is not None for field in ("throughput", "latency", "footprint")):
@@ -305,7 +386,7 @@ def main() -> int:
         if run_image is None: run_image = observed.get("resolved_image")
         elif run_image != observed.get("resolved_image"):
             problems.append((key, f"PROVENANCE {'/'.join(key)}: mixed resolved image within run"))
-        fingerprint = json.dumps({field: observed.get(field) for field in ("resolved_image", "server", "client", "toolchain")}, sort_keys=True, separators=(",", ":"))
+        fingerprint = json.dumps({field: observed.get(field) for field in ("resolved_image", "server", "client", "toolchain", "measurement_tools")}, sort_keys=True, separators=(",", ":"))
         prior = topology_provenance.setdefault(key[0], fingerprint)
         if prior != fingerprint:
             problems.append((key, f"PROVENANCE {'/'.join(key)}: mixed observed identity within topology"))
@@ -339,7 +420,7 @@ def main() -> int:
             else:
                 output.append(failed_cell(obj, key, reason))
             continue
-        if obj.get("schema_version") != RESULT_SCHEMA_VERSION and allow_partial:
+        if obj.get("schema_version") not in (HISTORICAL_RESULT_SCHEMA_VERSION, RESULT_SCHEMA_VERSION) and allow_partial:
             normalized, legacy_error = normalize_legacy_success(obj, key, matrix)
             if normalized is not None:
                 output.append(normalized)

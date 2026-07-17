@@ -60,11 +60,25 @@ cpu_vals = []
 # column layout matches the header.
 time_re = re.compile(r'^\d{1,2}:\d{2}:\d{2}')
 
+set_series = []
 try:
     with open(path) as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith(("UID", "Linux", "#")):
+                continue
+            if line.startswith("RSSET "):
+                # RSSET monotonic_ms rss_kb cpu_pct comma-separated-pid:comm
+                parts = line.split(maxsplit=4)
+                try:
+                    observed = parts[2] != "null" and parts[3] != "null"
+                    set_series.append({"offset_ms": int(parts[1]),
+                                       "rss_kb": int(parts[2]) if observed else None,
+                                       "cpu_pct": float(parts[3]) if observed else None,
+                                       "included_processes": parts[4].split(",") if len(parts) == 5 and parts[4] else [],
+                                       "status": "observed" if observed else "missed"})
+                except (ValueError, IndexError):
+                    pass
                 continue
             parts = line.split()
             # Strip timestamp prefix (sysstat 12.x+).
@@ -99,8 +113,8 @@ try:
                 cpu_vals.append(cpu)
             except ValueError:
                 pass
-except FileNotFoundError:
-    pass
+except FileNotFoundError as exc:
+    raise SystemExit(f"footprint source missing: {exc}")
 
 def agg(vals):
     if not vals:
@@ -110,6 +124,25 @@ def agg(vals):
         "avg": round(sum(vals) / len(vals), 2),
     }
 
+if set_series:
+    # Normalize real monotonic timestamps to a per-workload offset. A gap larger
+    # than the requested cadence remains visible rather than being invented as
+    # a zero sample.
+    origin = set_series[0]["offset_ms"]
+    series = [dict(sample, offset_ms=sample["offset_ms"] - origin) for sample in set_series[:3600]]
+    # Summaries cover the complete source, not merely the retained dashboard
+    # prefix. The original count drives the truncation disclosure.
+    rss_vals = [sample["rss_kb"] for sample in set_series if sample["rss_kb"] is not None]
+    cpu_vals = [sample["cpu_pct"] for sample in set_series if sample["cpu_pct"] is not None]
+else:
+    series = [{"offset_ms": (i + 1) * 1000,
+               "rss_kb": rss_vals[i] if i < len(rss_vals) else None,
+               "cpu_pct": cpu_vals[i] if i < len(cpu_vals) else None,
+               "included_processes": [], "status": "observed"}
+              for i in range(min(max(len(rss_vals), len(cpu_vals)), 3600))]
+sample_count = len(set_series) if set_series else max(len(rss_vals), len(cpu_vals))
+if sample_count == 0:
+    raise SystemExit("footprint source contained no samples")
 rss = agg(rss_vals)
 cpu = agg(cpu_vals)
 out = {
@@ -117,7 +150,13 @@ out = {
     "rss_avg_kb": rss["avg"],
     "cpu_peak_pct": cpu["peak"],
     "cpu_avg_pct": cpu["avg"],
-    "samples": max(len(rss_vals), len(cpu_vals)),
+    "samples": sample_count,
+    "missing_samples": sum(1 for sample in (set_series or series) if sample["status"] != "observed"),
+    "sample_cadence_s": 1,
+    "clock": "monotonic",
+    "scope": {"kind": "dynamic_process_set", "includes_descendants": False, "includes_kernel": False},
+    "series": series,
+    "series_truncated": sample_count > len(series),
 }
 print(json.dumps(out))
 PYEOF
@@ -141,6 +180,42 @@ remote_start_footprint() {
 # Kills the remote sampler (using the handle), fetches OUTFILE, parses it,
 # emits JSON on stdout.
 # ---------------------------------------------------------------------------
+# Sample the sum of every exact-name process in a declared endpoint set. This
+# catches short-lived benchmark clients while retaining each observed PID/name.
+# Args: NAME ZONE OUTFILE EXACT_NAME...
+remote_start_footprint_set() {
+  local name="$1" zone="$2" outfile="$3"; shift 3
+  local encoded
+  encoded=$(python3 - <<'PYEOF'
+import base64
+program = r'''import os, sys, time
+names=set(sys.argv[1:]); previous={}; previous_at=time.monotonic()
+while True:
+    now=time.monotonic(); current={}; rss=0; included=[]
+    for entry in os.scandir('/proc'):
+        if not entry.name.isdigit(): continue
+        try:
+            stat=open(entry.path+'/stat').read().split(); comm=stat[1][1:-1]
+            if comm not in names: continue
+            pid=int(entry.name); ticks=int(stat[13])+int(stat[14])
+            pages=int(open(entry.path+'/statm').read().split()[1])
+            current[pid]=ticks; rss += pages*os.sysconf('SC_PAGE_SIZE')//1024
+            included.append(f'{pid}:{comm}')
+        except (FileNotFoundError, ProcessLookupError, PermissionError, ValueError, IndexError): pass
+    shared=set(current)&set(previous); elapsed=now-previous_at
+    cpu=(sum(current[p]-previous[p] for p in shared)/os.sysconf('SC_CLK_TCK')/elapsed*100) if shared and elapsed>0 else None
+    observed=bool(current)
+    print('RSSET', round(now*1000), rss if observed else 'null', f'{cpu:.2f}' if cpu is not None else 'null', ','.join(sorted(included)), flush=True)
+    previous=current; previous_at=now; time.sleep(1)
+'''
+print(base64.b64encode(program.encode()).decode())
+PYEOF
+)
+  local quoted_names=""
+  printf -v quoted_names ' %q' "$@"
+  ssh_cmd "$name" "$zone" "echo $encoded | base64 -d >/tmp/rs-footprint-set.py; nohup python3 -u /tmp/rs-footprint-set.py$quoted_names >$outfile 2>&1 & echo \$! >$outfile.handle; cat $outfile.handle"
+}
+
 remote_stop_footprint() {
   local name="$1" zone="$2" outfile="$3"
   local handle
@@ -152,6 +227,8 @@ remote_stop_footprint() {
   local local_copy
   local_copy=$(mktemp /tmp/footprint.XXXXXX)
   ssh_cmd "$name" "$zone" "cat $outfile 2>/dev/null" > "$local_copy" 2>/dev/null || true
-  stop_footprint 0 "$local_copy"
+  local status=0
+  stop_footprint 0 "$local_copy" || status=$?
   rm -f "$local_copy"
+  return "$status"
 }

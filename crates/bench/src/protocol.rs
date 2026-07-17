@@ -1,4 +1,4 @@
-//! Wire protocol between rustscale-bench client and server.
+//! Wire protocol shared by the userspace-tsnet and kernel-TCP transports.
 //!
 //! Header (client -> server, 14 bytes):
 //!   magic [4]          = b"RSB1"
@@ -7,38 +7,25 @@
 //!   duration_secs u32  = BE (throughput only)
 //!   count u32          = BE (latency only)
 //!
-//! Ack (server -> client, 4 bytes):
-//!   magic [4]          = b"RSB1"
+//! Ready (server -> client, 4 bytes): magic [4] = b"RSB1"
+//! Go (client -> server, 1 byte): b'G'. Throughput workers send this only
+//! after every stream is ready, so connection setup is outside the trial.
 
 pub const MAGIC: [u8; 4] = *b"RSB1";
 pub const HEADER_LEN: usize = 14;
 pub const ACK_LEN: usize = 4;
-
+pub const GO: u8 = b'G';
 pub const MODE_THROUGHPUT: u8 = 0;
 pub const MODE_LATENCY: u8 = 1;
-
 pub const DIR_UP: u8 = 0;
 pub const DIR_DOWN: u8 = 1;
 pub const DIR_BIDIR: u8 = 2;
-
-/// Buffer size for firehose writes — kept at MTU (1280) to avoid overflowing
-/// the netstack's per-connection channel (64 items × 1280 < 128KB send window).
-/// The netstack's pump_connection drains the channel in one pass and drops
-/// data that doesn't fit in the smoltcp send buffer; smaller chunks mean
-/// more of each drain batch reaches the socket.
 pub const FIREHOSE_BUF_SIZE: usize = 1280;
-
-/// Read buffer size — can be large since the netstack delivers whole TCP
-/// segments into the app channel.
 pub const READ_BUF_SIZE: usize = 65_535;
-
-/// Ping message size for latency mode.
 pub const PING_SIZE: usize = 8;
 
 use std::error::Error;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-use rustscale_netstack::NetstackStream;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub struct Header {
     pub mode: u8,
@@ -71,27 +58,79 @@ impl Header {
     }
 }
 
-pub async fn write_header(stream: &mut NetstackStream, hdr: &Header) -> Result<(), Box<dyn Error>> {
+pub async fn write_header<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    hdr: &Header,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     stream.write_all(&hdr.encode()).await?;
     Ok(())
 }
 
-pub async fn read_header(stream: &mut NetstackStream) -> Result<Header, Box<dyn Error>> {
+pub async fn read_header<S: AsyncRead + Unpin>(
+    stream: &mut S,
+) -> Result<Header, Box<dyn Error + Send + Sync>> {
     let mut buf = [0u8; HEADER_LEN];
     stream.read_exact(&mut buf).await?;
     Header::decode(&buf).map_err(Into::into)
 }
 
-pub async fn write_ack(stream: &mut NetstackStream) -> Result<(), Box<dyn Error>> {
+pub async fn write_ack<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     stream.write_all(&MAGIC).await?;
     Ok(())
 }
 
-pub async fn read_ack(stream: &mut NetstackStream) -> Result<(), Box<dyn Error>> {
+pub async fn read_ack<S: AsyncRead + Unpin>(
+    stream: &mut S,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut buf = [0u8; ACK_LEN];
     stream.read_exact(&mut buf).await?;
     if buf != MAGIC {
         return Err("bad ack magic".into());
     }
     Ok(())
+}
+
+pub async fn write_go<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    stream.write_all(&[GO]).await?;
+    Ok(())
+}
+
+pub async fn read_go<S: AsyncRead + Unpin>(
+    stream: &mut S,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let mut byte = [0];
+    stream.read_exact(&mut byte).await?;
+    if byte[0] != GO {
+        return Err("bad go byte".into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn header_round_trip_is_transport_independent() {
+        let header = Header {
+            mode: MODE_THROUGHPUT,
+            direction: DIR_DOWN,
+            duration_secs: 10,
+            count: 0,
+        };
+        let decoded = Header::decode(&header.encode()).unwrap();
+        assert_eq!(
+            (
+                decoded.mode,
+                decoded.direction,
+                decoded.duration_secs,
+                decoded.count
+            ),
+            (MODE_THROUGHPUT, DIR_DOWN, 10, 0)
+        );
+    }
 }

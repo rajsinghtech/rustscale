@@ -56,6 +56,8 @@ def valid_matrix(data: dict) -> dict | None:
         if not isinstance(data.get("dry_run", False), bool):
             return None
         matrix["dry_run"] = data.get("dry_run", False)
+        for key in ("parallelism", "duration_s", "sample_cadence_s", "peer_count_requested"):
+            if key in data: matrix[key] = data[key]
         if data.get("schema_version") == 2 and isinstance(data.get("run"), dict):
             matrix["run"] = data["run"]
         return matrix
@@ -147,13 +149,14 @@ def throughput_chart_data(runs_idx: dict, parallels: list[int], topo: str, path:
             if run.get("status") == "failed" or err:
                 failed[cfg] = True
                 errors[cfg] = err
-            tp = {t["parallel"]: t.get("mbps", 0) for t in (run.get("throughput") or [])}
+            tp = {t["parallel"]: t.get("mbps") for t in (run.get("throughput") or [])}
             for p in parallels:
-                vals.append(float(tp.get(p, 0)))
+                value = tp.get(p)
+                vals.append(float(value) if isinstance(value, (int, float)) else None)
         else:
             failed[cfg] = True
             errors[cfg] = "missing (no JSON)"
-            vals = [0.0] * len(parallels)
+            vals = [None] * len(parallels)
         series[cfg] = vals
     return {
         "parallels": parallels,
@@ -165,25 +168,18 @@ def throughput_chart_data(runs_idx: dict, parallels: list[int], topo: str, path:
 
 
 def latency_chart_data(runs_idx: dict, matrix: dict) -> dict:
-    """Return {topos_paths: [...], series: {config: {p50,p95,p99 per combo}}}."""
-    combos = []
+    """One cluster per config/cell; protocols are labeled, never averaged."""
+    groups, rows = [], []
     for topo in matrix["topologies"]:
         for path in matrix["paths"]:
-            combos.append(f"{topo} / {path}")
-    series = {}
-    for cfg in matrix["configs"]:
-        rows = []
-        for topo in matrix["topologies"]:
-            for path in matrix["paths"]:
+            for cfg in matrix["configs"]:
                 run = runs_idx.get((topo, path, cfg))
-                lat = (run.get("latency") or {}) if run else {}
-                rows.append({
-                    "p50": float(lat.get("p50_us", 0)),
-                    "p95": float(lat.get("p95_us", 0)),
-                    "p99": float(lat.get("p99_us", 0)),
-                })
-        series[cfg] = rows
-    return {"combos": combos, "configs": matrix["configs"], "series": series}
+                lat = (run.get("latency") or {}) if run and run.get("status") == "ok" else {}
+                protocol = lat.get("protocol") or (run.get("workload") or {}).get("latency_protocol") if run else None
+                groups.append(f"{topo}/{path}/{cfg} [{protocol or 'legacy/unscoped'}]")
+                rows.append({name: float(lat[name + "_us"]) if isinstance(lat.get(name + "_us"), (int, float)) else None
+                             for name in ("p50", "p95", "p99")})
+    return {"groups": groups, "rows": rows}
 
 
 def footprint_rows(runs_idx: dict, matrix: dict) -> list:
@@ -195,19 +191,24 @@ def footprint_rows(runs_idx: dict, matrix: dict) -> list:
                 run = runs_idx.get((topo, path, cfg))
                 if not run:
                     continue
-                foot = run.get("footprint") or {}
-                rows.append({
-                    "topo": topo,
-                    "path": path,
-                    "config": cfg,
-                    "error": run.get("error", "") or ("failed" if run.get("status") == "failed" else ""),
-                    "binary_bytes": int(foot.get("binary_size_bytes", 0)),
-                    "rss_peak_kb": int(foot.get("rss_peak_kb", 0)),
-                    "rss_avg_kb": int(foot.get("rss_avg_kb", 0)),
-                    "cpu_peak_pct": float(foot.get("cpu_peak_pct", 0)),
-                    "cpu_avg_pct": float(foot.get("cpu_avg_pct", 0)),
-                    "samples": int(foot.get("samples", 0)),
-                })
+                resources = run.get("resources") if isinstance(run.get("resources"), dict) else None
+                endpoints = [(name, resources.get(name) or {}) for name in ("server", "client")] if resources else [("legacy/unscoped", run.get("footprint") or {})]
+                for endpoint, foot in endpoints:
+                    scope = foot.get("scope") if isinstance(foot.get("scope"), dict) else None
+                    subjects = ",".join(foot.get("subjects") or [])
+                    scope_label = (f'{scope.get("kind")}; subjects={subjects or "unspecified"}; descendants={scope.get("includes_descendants")}; kernel={scope.get("includes_kernel")}'
+                                   if scope else "legacy/unscoped")
+                    rows.append({
+                        "topo": topo, "path": path, "config": cfg, "endpoint": endpoint,
+                        "scope": scope_label,
+                        "error": run.get("error", "") or ("failed" if run.get("status") == "failed" else ""),
+                        "binary_bytes": int(foot["binary_size_bytes"]) if isinstance(foot.get("binary_size_bytes"), (int, float)) else None,
+                        "rss_peak_kb": int(foot["rss_peak_kb"]) if isinstance(foot.get("rss_peak_kb"), (int, float)) else None,
+                        "rss_avg_kb": int(foot["rss_avg_kb"]) if isinstance(foot.get("rss_avg_kb"), (int, float)) else None,
+                        "cpu_peak_pct": float(foot["cpu_peak_pct"]) if isinstance(foot.get("cpu_peak_pct"), (int, float)) else None,
+                        "cpu_avg_pct": float(foot["cpu_avg_pct"]) if isinstance(foot.get("cpu_avg_pct"), (int, float)) else None,
+                        "samples": int(foot["samples"]) if isinstance(foot.get("samples"), (int, float)) else None,
+                    })
     return rows
 
 
@@ -389,40 +390,41 @@ def render_chart_js_block(canvas_id: str, data: dict, kind: str) -> str:
 </script>"""
 
 
+def throughput_groups(configs: list[str], runs_idx: dict, topo: str, path: str) -> list[tuple[str, list[str]]]:
+    grouped = {}
+    for cfg in configs:
+        run = runs_idx.get((topo, path, cfg)) or {}
+        workload = run.get("workload") if isinstance(run.get("workload"), dict) else {}
+        if workload.get("implementation") == "rustscale-bench" and workload.get("protocol") == "RSB1":
+            label = "RustScale RSB1 parity"
+        elif cfg.startswith("ts-"):
+            label = "Tailscale iperf3 comparator (not parity-ranked)"
+        else:
+            label = "Historical/unscoped workload (not parity-ranked)"
+        grouped.setdefault(label, []).append(cfg)
+    return list(grouped.items())
+
+
 def emit_throughput_charts(runs_idx: dict, parallels: list[int], matrix: dict) -> str:
     parts = ['<div class="chart-grid" id="throughput-grid">']
-    for topo in matrix["topologies"]:
-        for path in matrix["paths"]:
-            cid = f"tp-{topo}-{path}"
-            data = throughput_chart_data(runs_idx, parallels, topo, path, matrix["configs"])
-            data["title"] = f"{topo} / {path}"
-            n_failed = len(data["failed"])
-            fail_badge = ""
-            card_class = "chart-card throughput-card"
-            if n_failed:
-                fail_badge = f'<span class="fail-badge">{n_failed} failed</span>'
-                card_class += " has-failures"
-            parts.append(f"""<div class="{card_class}" data-topo="{topo}" data-path="{path}">
-  <h3>{html.escape(data["title"])} — throughput (Mbps){fail_badge}</h3>
-  <canvas id="{cid}"></canvas>
-</div>""")
-    parts.append("</div>")
-    # Legend.
-    parts.append('<div class="legend">')
-    for cfg in matrix["configs"]:
-        parts.append(
-            f'<div class="item"><span class="swatch" style="background:{CONFIG_COLORS[cfg]}"></span>'
-            f'{html.escape(CONFIG_LABELS[cfg])}</div>'
-        )
-    parts.append("</div>")
-    # Scripts (after DOM — but we emit them inline; the draw fn is defined
-    # later in the global script).
     scripts = []
     for topo in matrix["topologies"]:
         for path in matrix["paths"]:
-            cid = f"tp-{topo}-{path}"
-            data = throughput_chart_data(runs_idx, parallels, topo, path, matrix["configs"])
-            scripts.append(render_chart_js_block(cid, data, "throughput"))
+            for group_index, (group_label, configs) in enumerate(throughput_groups(matrix["configs"], runs_idx, topo, path)):
+                cid = f"tp-{topo}-{path}-{group_index}"
+                data = throughput_chart_data(runs_idx, parallels, topo, path, configs)
+                n_failed = len(data["failed"])
+                fail_badge = f'<span class="fail-badge">{n_failed} failed</span>' if n_failed else ""
+                card_class = "chart-card throughput-card" + (" has-failures" if n_failed else "")
+                parts.append(f"""<div class="{card_class}" data-topo="{topo}" data-path="{path}">
+  <h3>{html.escape(topo)} / {html.escape(path)} — {html.escape(group_label)} (Mbps){fail_badge}</h3>
+  <canvas id="{cid}"></canvas>
+</div>""")
+                scripts.append(render_chart_js_block(cid, data, "throughput"))
+    parts.append("</div><div class=\"legend\">")
+    for cfg in matrix["configs"]:
+        parts.append(f'<div class="item"><span class="swatch" style="background:{CONFIG_COLORS[cfg]}"></span>{html.escape(CONFIG_LABELS[cfg])}</div>')
+    parts.append("</div>")
     return "".join(parts) + "".join(scripts)
 
 
@@ -430,7 +432,7 @@ def emit_latency_chart(runs_idx: dict, matrix: dict) -> str:
     data = latency_chart_data(runs_idx, matrix)
     parts = [
         '<div class="chart-card">',
-        '  <h3>Latency p50 / p95 / p99 (µs) — grouped by topology / path</h3>',
+        '  <h3>Latency p50 / p95 / p99 (µs) — per config; protocol-scoped, never averaged</h3>',
         '  <canvas id="latency-chart"></canvas>',
         '</div>',
         '<div class="legend">',
@@ -448,32 +450,18 @@ def emit_footprint_table(runs_idx: dict, matrix: dict) -> str:
     rows = footprint_rows(runs_idx, matrix)
     if not rows:
         return '<div class="empty">No footprint data.</div>'
-    # Compute best (min) per metric within each (topo, path) group.
-    groups = {}
-    for r in rows:
-        groups.setdefault((r["topo"], r["path"]), []).append(r)
-    best = {}
-    for key, grp in groups.items():
-        best[key] = {
-            "binary_bytes": min((g["binary_bytes"] for g in grp if g["binary_bytes"]), default=0),
-            "rss_peak_kb": min((g["rss_peak_kb"] for g in grp if g["rss_peak_kb"]), default=0),
-            "rss_avg_kb": min((g["rss_avg_kb"] for g in grp if g["rss_avg_kb"]), default=0),
-            "cpu_peak_pct": min((g["cpu_peak_pct"] for g in grp if g["cpu_peak_pct"]), default=0),
-            "cpu_avg_pct": min((g["cpu_avg_pct"] for g in grp if g["cpu_avg_pct"]), default=0),
-        }
+    # Scope-dependent footprint values are descriptive only; never rank them.
     out = [
         '<table class="footprint" id="footprint-table">',
         '<thead><tr><th class="label">topology / path</th><th class="label">config</th>'
-        '<th>status</th>',
+        '<th>endpoint</th><th>process scope</th><th>status</th>',
         '<th>binary size</th><th>RSS peak</th><th>RSS avg</th>',
         '<th>CPU peak %</th><th>CPU avg %</th><th>samples</th></tr></thead>',
         '<tbody>',
     ]
     for r in rows:
-        key = (r["topo"], r["path"])
-        b = best[key]
         def cls(metric, val):
-            return "best" if val == b[metric] and val > 0 else ""
+            return ""
         if r["error"]:
             status_cls = "status-failed"
             status_text = f"FAILED: {html.escape(r['error'])}"
@@ -485,16 +473,79 @@ def emit_footprint_table(runs_idx: dict, matrix: dict) -> str:
             f'data-config="{r["config"]}" data-mode="{"tun" if r["config"].endswith("tun") else "userspace"}">'
             f'<td class="label">{r["topo"]} / {r["path"]}</td>'
             f'<td class="label" style="color:{CONFIG_COLORS[r["config"]]}">{html.escape(CONFIG_LABELS[r["config"]])}</td>'
+            f'<td>{html.escape(r["endpoint"])}</td><td>{html.escape(r["scope"])}</td>'
             f'<td class="{status_cls}">{status_text}</td>'
-            f'<td class="{cls("binary_bytes", r["binary_bytes"])}">{fmt_bytes(r["binary_bytes"])}</td>'
-            f'<td class="{cls("rss_peak_kb", r["rss_peak_kb"])}">{fmt_kb(r["rss_peak_kb"])}</td>'
-            f'<td class="{cls("rss_avg_kb", r["rss_avg_kb"])}">{fmt_kb(r["rss_avg_kb"])}</td>'
-            f'<td class="{cls("cpu_peak_pct", r["cpu_peak_pct"])}">{r["cpu_peak_pct"]:.1f}</td>'
-            f'<td class="{cls("cpu_avg_pct", r["cpu_avg_pct"])}">{r["cpu_avg_pct"]:.1f}</td>'
-            f'<td>{r["samples"]}</td></tr>'
+            f'<td>{"—" if r["binary_bytes"] is None else fmt_bytes(r["binary_bytes"])}</td>'
+            f'<td>{"—" if r["rss_peak_kb"] is None else fmt_kb(r["rss_peak_kb"])}</td>'
+            f'<td>{"—" if r["rss_avg_kb"] is None else fmt_kb(r["rss_avg_kb"])}</td>'
+            f'<td>{"—" if r["cpu_peak_pct"] is None else format(r["cpu_peak_pct"], ".1f")}</td>'
+            f'<td>{"—" if r["cpu_avg_pct"] is None else format(r["cpu_avg_pct"], ".1f")}</td>'
+            f'<td>{"—" if r["samples"] is None else r["samples"]}</td></tr>'
         )
     out.append("</tbody></table>")
     return "".join(out)
+
+
+def emit_scale_context(matrix: dict) -> str:
+    streams = matrix.get("parallelism", [])
+    return (
+        '<div class="filters">'
+        f'<div class="group"><label>streams</label><strong>{html.escape(", ".join(map(str, streams)) or "historical/unspecified")}</strong></div>'
+        f'<div class="group"><label>duration</label><strong>{html.escape(str(matrix.get("duration_s", "historical/unspecified")))} s</strong></div>'
+        f'<div class="group"><label>configured peer load</label><strong>{html.escape(str(matrix.get("peer_count_requested", "historical/unspecified")))}</strong></div>'
+        f'<div class="group"><label>resource cadence</label><strong>{html.escape(str(matrix.get("sample_cadence_s", "historical/unspecified")))} s</strong></div>'
+        '</div>'
+    )
+
+
+def emit_resource_trends(runs: list) -> str:
+    # Bound every cell independently so a long first cell cannot hide all
+    # later configurations. Keep endpoints when downsampling.
+    per_cell_limit = 200
+    cells = []
+    for run in runs:
+        if run.get("status") != "ok" or run.get("error"):
+            continue
+        resources = run.get("resources") if isinstance(run.get("resources"), dict) else None
+        endpoints = [(name, resources.get(name) or {}) for name in ("server", "client")] if resources else [("legacy/unscoped", run.get("footprint") or {})]
+        for endpoint, footprint in endpoints:
+            retained = footprint.get("series") or []
+            if not retained:
+                continue
+            if len(retained) <= per_cell_limit:
+                displayed = retained
+            else:
+                indexes = [round(i * (len(retained) - 1) / (per_cell_limit - 1)) for i in range(per_cell_limit)]
+                displayed = [retained[i] for i in indexes]
+            cells.append((run, endpoint, footprint, displayed))
+    if not cells:
+        return '<div class="empty">No resource series in this (possibly historical) result set.</div>'
+    out = ['<p class="empty">Samples cover the complete ordered workload, including throughput points, gaps, and latency; they are not attributed to an individual stream count or peer effect.</p>',
+           '<table class="footprint"><thead><tr><th class="label">cell</th><th>configured peer load</th><th>sample coverage</th><th>elapsed</th><th>CPU %</th><th>RSS</th></tr></thead><tbody>']
+    for run, endpoint, footprint, displayed in cells:
+        topo, path, config = (run.get("topology", "?"), run.get("path", "?"), run.get("config", "?"))
+        mode = "tun" if str(config).endswith("tun") else "userspace"
+        retained_count = len(footprint.get("series") or [])
+        total_count = footprint.get("samples", retained_count)
+        truncated = footprint.get("series_truncated") is True
+        coverage = f'{len(displayed)} displayed / {retained_count} retained / {total_count} total'
+        if truncated:
+            coverage += " (source truncated)"
+        scope = footprint.get("scope") or {}
+        subjects = ",".join(footprint.get("subjects") or [])
+        scope_label = (f'{scope.get("kind")}; subjects={subjects or "unspecified"}; descendants={scope.get("includes_descendants")}; kernel={scope.get("includes_kernel")}'
+                       if scope else "legacy/unscoped")
+        cell = f'{topo} / {path} / {config} / {endpoint} / {scope_label}'
+        for sample in displayed:
+            cpu, rss = sample.get("cpu_pct"), sample.get("rss_kb")
+            out.append(
+                f'<tr class="resource-row" data-topo="{html.escape(str(topo))}" data-path="{html.escape(str(path))}" '
+                f'data-config="{html.escape(str(config))}" data-mode="{mode}">'
+                f'<td class="label">{html.escape(cell)}</td><td>{html.escape(str(run.get("peer_count_requested", "—")))}</td>'
+                f'<td>{html.escape(coverage)}</td><td>{html.escape(str(sample.get("offset_ms", sample.get("elapsed_s", "—"))))} {"ms" if "offset_ms" in sample else "s"}</td>'
+                f'<td>{"—" if cpu is None else f"{cpu:.1f}"}</td><td>{"—" if rss is None else fmt_kb(rss)}</td></tr>')
+    out.append('</tbody></table>')
+    return ''.join(out)
 
 
 def emit_detail_cards(runs: list) -> str:
@@ -747,23 +798,9 @@ function drawGroupedBars(canvas, data, kind) {
       { key: "p95", vals: [], color: LAT_COLORS.p95, field: "p95" },
       { key: "p99", vals: [], color: LAT_COLORS.p99, field: "p99" }
     ];
-    // Fill each series from each config? No — latency chart groups by config,
-    // not by combo. Re-interpret: one cluster per combo, 3 bars (p50/p95/p99)
-    // summed across configs? Simpler: cluster per config, 3 bars per cluster,
-    // averaged across combos. We'll cluster per config with p50/p95/p99 from
-    // the first combo, OR cluster per combo with 3 bars. Use per-combo cluster.
-    // series already set to 3 pct series. For each combo, take the mean across
-    // configs of each percentile.
+    groups = data.groups;
     series = series.map(s => {
-      s.vals = groups.map((_, gi) => {
-        const vals = (data.configs || CONFIGS).map(c => {
-          const arr = (data.series[c] || []);
-          const row = arr[gi] || {};
-          return row[s.field] || 0;
-        });
-        // mean across configs
-        return vals.reduce((a,b)=>a+b,0) / (vals.length||1);
-      });
+      s.vals = data.rows.map(row => row[s.field]);
       return s;
     });
     colorFor = (i) => series[i].color;
@@ -776,7 +813,7 @@ function drawGroupedBars(canvas, data, kind) {
 
   // Y scale.
   let maxVal = 0;
-  series.forEach(s => s.vals.forEach(v => { if (v > maxVal) maxVal = v; }));
+  series.forEach(s => s.vals.forEach(v => { if (v != null && v > maxVal) maxVal = v; }));
   if (maxVal === 0) maxVal = 1;
   const yMax = niceMax(maxVal);
   const yScale = plotH / yMax;
@@ -815,6 +852,7 @@ function drawGroupedBars(canvas, data, kind) {
     }
     ctx.fillStyle = s.color;
     s.vals.forEach((v, gi) => {
+      if (v == null) return;
       const x = padL + gi * groupW + gap + si * barW;
       const h = v * yScale;
       const y = padT + plotH - h;
@@ -883,7 +921,7 @@ function applyFilters() {
     const okP = f.path === "all" || card.dataset.path === f.path;
     card.classList.toggle("hidden", !(okT && okP));
   });
-  document.querySelectorAll(".footprint-row, .detail-row").forEach(row => {
+  document.querySelectorAll(".footprint-row, .resource-row, .detail-row").forEach(row => {
     const okT = f.topo === "all" || row.dataset.topo === f.topo;
     const okP = f.path === "all" || row.dataset.path === f.path;
     const okM = f.mode === "all" || row.dataset.mode === f.mode;
@@ -920,8 +958,9 @@ def emit_chart_data_registry(runs_idx: dict, parallels: list[int], matrix: dict)
     entries = {}
     for topo in matrix["topologies"]:
         for path in matrix["paths"]:
-            cid = f"tp-{topo}-{path}"
-            entries[cid] = throughput_chart_data(runs_idx, parallels, topo, path, matrix["configs"])
+            for group_index, (_, configs) in enumerate(throughput_groups(matrix["configs"], runs_idx, topo, path)):
+                cid = f"tp-{topo}-{path}-{group_index}"
+                entries[cid] = throughput_chart_data(runs_idx, parallels, topo, path, configs)
     entries["latency-chart"] = latency_chart_data(runs_idx, matrix)
     return f'<script>window.__chartData = {json.dumps(entries)};</script>'
 
@@ -940,13 +979,14 @@ def main() -> int:
     out.append(emit_filters(matrix))
 
     out.append(emit_dry_run_notice(matrix))
+    out.append(emit_scale_context(matrix))
 
     # Failed-runs banner (only if any runs have errors).
     out.append(emit_failed_runs(runs))
 
     # Throughput.
     out.append('<section class="block" id="throughput">')
-    out.append("<h2>Throughput — iperf3 TCP sweep (download)</h2>")
+    out.append("<h2>Throughput — per-configuration TCP workload (download)</h2>")
     out.append(emit_throughput_charts(runs_idx, parallels, matrix))
     out.append("</section>")
 
@@ -958,8 +998,13 @@ def main() -> int:
 
     # Footprint.
     out.append('<section class="block" id="footprint">')
-    out.append("<h2>Footprint — binary size, RSS, CPU (green = best in group)</h2>")
+    out.append("<h2>Footprint — descriptive only; scope-mismatched values are never ranked</h2>")
     out.append(emit_footprint_table(runs_idx, matrix))
+    out.append("</section>")
+
+    out.append('<section class="block" id="resource-trends">')
+    out.append("<h2>CPU and RSS samples over the complete workload (successful cells only)</h2>")
+    out.append(emit_resource_trends(runs))
     out.append("</section>")
 
     # Detail cards.

@@ -45,6 +45,9 @@ MATRIX_WORKTREE_DIRTY=0
 MATRIX_PROJECT="dry-run"
 MATRIX_MANIFEST_PATH="/dev/null"
 MATRIX_OBSERVED_PATH="/dev/null"
+DURATION=10
+PEER_COUNT=1
+PARALLELISM_CSV="1,10,100"
 
 MATRIX_SELF_TEST=0
 if [[ "${1:-}" == "--self-test" ]]; then
@@ -63,7 +66,7 @@ rust_build_command() {
   for config in "${CONFIGS[@]}"; do
     case "$config" in
       rs-userspace) requested=(rustscale-bench) ;;
-      rs-tun) requested=(rustscale-cli rustscale-rustscaled) ;;
+      rs-tun) requested=(rustscale-bench rustscale-cli rustscale-rustscaled) ;;
       *) continue ;;
     esac
     for candidate in "${requested[@]}"; do
@@ -93,7 +96,7 @@ matrix_command_shape_self_test() {
   [[ "$actual" == 'export RUSTUP_HOME=/opt/rust CARGO_HOME=/opt/rust/cargo; cd /opt/rustscale && cargo build --release -p rustscale-bench' ]] || return 1
   CONFIGS=(rs-tun)
   actual=$(rust_build_command)
-  [[ "$actual" == 'export RUSTUP_HOME=/opt/rust CARGO_HOME=/opt/rust/cargo; cd /opt/rustscale && cargo build --release -p rustscale-cli -p rustscale-rustscaled' ]] || return 1
+  [[ "$actual" == 'export RUSTUP_HOME=/opt/rust CARGO_HOME=/opt/rust/cargo; cd /opt/rustscale && cargo build --release -p rustscale-bench -p rustscale-cli -p rustscale-rustscaled' ]] || return 1
   CONFIGS=(rs-userspace rs-tun)
   actual=$(rust_build_command)
   [[ "$actual" == 'export RUSTUP_HOME=/opt/rust CARGO_HOME=/opt/rust/cargo; cd /opt/rustscale && cargo build --release -p rustscale-bench -p rustscale-cli -p rustscale-rustscaled' ]] || return 1
@@ -186,6 +189,9 @@ matrix_profile_self_test() {
   local config
   local -a calls=()
   REPEAT=4
+  PARALLELISM_CSV="1,10,100"
+  DURATION=10
+  PEER_COUNT=1
   PROFILE=1
   matrix_test_record_run_config() { calls+=("$1|${*:4}"); }
   matrix_test_record_profile() { calls+=("profile|$*"); }
@@ -199,9 +205,9 @@ matrix_profile_self_test() {
   unset -f matrix_test_record_run_config matrix_test_record_profile
 
   [[ ${#calls[@]} -eq 3 ]] || return 1
-  [[ "${calls[0]}" == 'rs-tun|rs-tun s c sz cz key dir host client --repeat 4 --manifest /dev/null --observed /dev/null' ]] || return 1
-  [[ "${calls[1]}" == 'ts-tun|ts-tun s c sz cz key dir host client --repeat 4 --manifest /dev/null --observed /dev/null' ]] || return 1
-  [[ "${calls[2]}" == 'profile|rs-tun s c sz cz profile-key dir host client --repeat 4 --profile-only --manifest /dev/null --observed /dev/null' ]] || return 1
+  [[ "${calls[0]}" == 'rs-tun|rs-tun s c sz cz key dir host client --repeat 4 --parallelism 1,10,100 --duration 10 --peer-count 1 --manifest /dev/null --observed /dev/null' ]] || return 1
+  [[ "${calls[1]}" == 'ts-tun|ts-tun s c sz cz key dir host client --repeat 4 --parallelism 1,10,100 --duration 10 --peer-count 1 --manifest /dev/null --observed /dev/null' ]] || return 1
+  [[ "${calls[2]}" == 'profile|rs-tun s c sz cz profile-key dir host client --repeat 4 --parallelism 1,10,100 --duration 10 --peer-count 1 --profile-only --manifest /dev/null --observed /dev/null' ]] || return 1
 }
 
 # Build the directly invocable run-config command shape used by each cell.
@@ -211,6 +217,7 @@ matrix_build_run_config_args() {
   local config="$1"
   RUN_CONFIG_ARGS=(
     "$config" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" --repeat "$REPEAT" \
+    --parallelism "$PARALLELISM_CSV" --duration "$DURATION" --peer-count "$PEER_COUNT" \
     --manifest "$MATRIX_MANIFEST_PATH" --observed "$MATRIX_OBSERVED_PATH"
   )
 }
@@ -237,7 +244,8 @@ matrix_run_profile_diagnostic() {
   local runner="${9:-tools/bench/gcp/run-config.sh}"
   "$runner" rs-tun "$server_vm" "$client_vm" "$server_zone" "$client_zone" \
     "$authkey" "$results_dir" "$server_hostname" "$client_hostname" \
-    --repeat "$REPEAT" --profile-only --manifest "$MATRIX_MANIFEST_PATH" --observed "$MATRIX_OBSERVED_PATH"
+    --repeat "$REPEAT" --parallelism "$PARALLELISM_CSV" --duration "$DURATION" --peer-count "$PEER_COUNT" \
+    --profile-only --manifest "$MATRIX_MANIFEST_PATH" --observed "$MATRIX_OBSERVED_PATH"
 }
 
 # Parse command-line options without contacting GCP.  Keeping this separate
@@ -246,12 +254,16 @@ matrix_parse_args() {
   DRY_RUN=0
   PROFILE=0
   REPEAT=3
+  PARALLELISM_CSV="1,10,100"
+  DURATION=10
+  PEER_COUNT=1
+  SCALE_STREAMS=0
   SHOW_HELP=0
   TOPOLOGY_FILTER=""
   PATH_FILTER=""
   CONFIG_FILTER=""
   FULL=0
-  local seen_dry_run=0 seen_profile=0 seen_repeat=0 seen_full=0
+  local seen_dry_run=0 seen_profile=0 seen_repeat=0 seen_parallelism=0 seen_duration=0 seen_peer_count=0 seen_scale=0 seen_full=0
   local seen_topology=0 seen_path=0 seen_config=0
 
   while [[ $# -gt 0 ]]; do
@@ -291,6 +303,22 @@ matrix_parse_args() {
         [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || { echo "--repeat requires a value" >&2; return 2; }
         [[ "$2" =~ ^[1-9]$ ]] || { echo "--repeat must be an integer in 1..=9" >&2; return 2; }
         REPEAT="$2"; seen_repeat=1; shift 2 ;;
+      --parallelism)
+        (( seen_parallelism == 0 && seen_scale == 0 )) || { echo "--parallelism conflicts with a duplicate or --scale-streams" >&2; return 2; }
+        [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || { echo "--parallelism requires a value" >&2; return 2; }
+        validate_matrix_parallelism_csv "$2" || return 2
+        PARALLELISM_CSV="$2"; seen_parallelism=1; shift 2 ;;
+      --scale-streams)
+        (( seen_scale == 0 && seen_parallelism == 0 )) || { echo "--scale-streams conflicts with a duplicate or --parallelism" >&2; return 2; }
+        PARALLELISM_CSV="1,2,4,8,16,32,64,100,200,500,1000"; SCALE_STREAMS=1; seen_scale=1; shift ;;
+      --duration)
+        (( seen_duration == 0 )) || { echo "duplicate option: --duration" >&2; return 2; }
+        [[ $# -ge 2 && "$2" =~ ^[0-9]+$ && "$2" -ge 3 && "$2" -le 120 ]] || { echo "--duration must be an integer in 3..=120" >&2; return 2; }
+        DURATION="$2"; seen_duration=1; shift 2 ;;
+      --peer-count)
+        (( seen_peer_count == 0 )) || { echo "duplicate option: --peer-count" >&2; return 2; }
+        [[ $# -ge 2 && "$2" =~ ^[0-9]+$ && "$2" -ge 1 && "$2" -le 1000 ]] || { echo "--peer-count must be an integer in 1..=1000" >&2; return 2; }
+        PEER_COUNT="$2"; seen_peer_count=1; shift 2 ;;
       --profile)
         (( seen_profile == 0 )) || { echo "duplicate option: --profile" >&2; return 2; }
         PROFILE=1; seen_profile=1; shift ;;
@@ -306,6 +334,18 @@ matrix_parse_args() {
   done
 }
 
+validate_matrix_parallelism_csv() {
+  local csv="$1" item seen=","
+  [[ -n "$csv" && "$csv" != *, && "$csv" != ,* && "$csv" != *,,* ]] || { echo "invalid --parallelism list" >&2; return 1; }
+  local -a values
+  IFS=, read -r -a values <<<"$csv"
+  for item in "${values[@]}"; do
+    [[ "$item" =~ ^[1-9][0-9]*$ && "$item" -le 1000 ]] || { echo "--parallelism values must be integers in 1..=1000" >&2; return 1; }
+    [[ "$seen" != *",$item,"* ]] || { echo "duplicate --parallelism value: $item" >&2; return 1; }
+    seen+="$item,"
+  done
+}
+
 matrix_option_parsing_self_test() {
   local actual status
   actual=$(matrix_parse_args; printf '%s/%s/%s/%s/%s/%s/%s\n' "$REPEAT" "$PROFILE" "$DRY_RUN" "$FULL" "$TOPOLOGY_FILTER" "$PATH_FILTER" "$CONFIG_FILTER") || return 1
@@ -314,8 +354,12 @@ matrix_option_parsing_self_test() {
   [[ "$actual" == '1/1/0/1/same-zone/direct/rs-tun,ts-tun' ]] || return 1
   actual=$(matrix_parse_args --dry-run --help --not-an-error; printf '%s/%s/%s\n' "$DRY_RUN" "$SHOW_HELP" "$REPEAT") || return 1
   [[ "$actual" == '1/1/3' ]] || return 1
+  actual=$(matrix_parse_args --parallelism 1,10,100,1000 --duration 20 --peer-count 250; printf '%s/%s/%s\n' "$PARALLELISM_CSV" "$DURATION" "$PEER_COUNT") || return 1
+  [[ "$actual" == '1,10,100,1000/20/250' ]] || return 1
+  actual=$(matrix_parse_args --scale-streams; printf '%s' "$PARALLELISM_CSV") || return 1
+  [[ "$actual" == '1,2,4,8,16,32,64,100,200,500,1000' ]] || return 1
   local -a case_args=()
-  for args in '--repeat' '--repeat 0' '--repeat 10' '--repeat 1.5' '--repeat 1 --repeat 2' '--profile --profile' '--full --full'; do
+  for args in '--repeat' '--repeat 0' '--repeat 10' '--repeat 1.5' '--repeat 1 --repeat 2' '--profile --profile' '--full --full' '--parallelism 1,1' '--parallelism 0' '--parallelism 1001' '--parallelism 1 --parallelism 2' '--scale-streams --scale-streams' '--scale-streams --parallelism 1' '--duration 2' '--duration 121' '--peer-count 0' '--peer-count 1001'; do
     read -r -a case_args <<< "$args"
     if ( matrix_parse_args "${case_args[@]}" ) >/dev/null 2>&1; then
       return 1
@@ -394,11 +438,18 @@ matrix_vm_name_self_test() {
 matrix_remote_observation_program() {
   cat <<'PYEOF'
 python3 - <<'PY'
-import hashlib, json, os, platform, subprocess
+import hashlib, json, os, platform, shutil, subprocess
 toolchain_env = {**os.environ, "RUSTUP_HOME": "/opt/rust", "CARGO_HOME": "/opt/rust/cargo"}
 def output(argv, env=None):
     return subprocess.check_output(argv, text=True, stderr=subprocess.STDOUT, timeout=15, env=env).strip()
 products=[]
+def utility(name, version_args):
+    path = shutil.which(name)
+    if not path:
+        return None
+    try: version = output([path, *version_args])
+    except Exception: version = "version probe failed"
+    return {"path": path, "version": version, "sha256": hashlib.sha256(open(path,"rb").read()).hexdigest()}
 for name, explicit in (
     ("rustscale-bench", "/opt/rustscale/target/release/rustscale-bench"),
     ("rustscale", "/opt/rustscale/target/release/rustscale"),
@@ -415,7 +466,8 @@ for line in open("/etc/os-release", encoding="utf-8"):
 cpu=output(["lscpu", "-J"])
 try: cpu_model=next(x["data"] for x in json.loads(cpu)["lscpu"] if x["field"].strip()=="Model name:")
 except Exception: raise SystemExit("unable to determine CPU model")
-print(json.dumps({"cpu_model":cpu_model,"logical_cpus":os.cpu_count(),"kernel_release":platform.release(),"os_pretty_name":os_name,"cargo":output(["/opt/rust/cargo/bin/cargo","--version"], env=toolchain_env),"rustc_verbose":output(["/opt/rust/cargo/bin/rustc","-Vv"], env=toolchain_env),"product":products}))
+utilities = [entry for entry in (utility("iperf3", ["--version"]), utility("socat", ["-V"]), utility("ncat", ["--version"]), utility("pidstat", ["-V"]), utility("python3", ["--version"])) if entry]
+print(json.dumps({"cpu_model":cpu_model,"logical_cpus":os.cpu_count(),"kernel_release":platform.release(),"os_pretty_name":os_name,"cargo":output(["/opt/rust/cargo/bin/cargo","--version"], env=toolchain_env),"rustc_verbose":output(["/opt/rust/cargo/bin/rustc","-Vv"], env=toolchain_env),"product":products,"measurement_tools":utilities}))
 PY
 PYEOF
 }
@@ -427,6 +479,7 @@ matrix_product_observation_self_test() {
   [[ "$program" == *'("rustscale", "/opt/rustscale/target/release/rustscale")'* ]] || return 1
   [[ "$program" == *'("rustscaled", "/opt/rustscale/target/release/rustscaled")'* ]] || return 1
   [[ "$program" == *'output(["timeout", "15", explicit, "--version"])'* ]] || return 1
+  [[ "$program" == *'utility("iperf3", ["--version"])'* && "$program" == *'utility("pidstat", ["-V"])'* ]] || return 1
   # On a fresh VM /usr/local/bin/cargo is a rustup shim and the SSH user's
   # default rustup home is empty. Observation must use the provisioned
   # toolchain and preserve its homes just as the remote build does.
@@ -440,7 +493,7 @@ matrix_product_observation_self_test() {
   # contract is checked here; remote production still probes delivered release
   # binaries with --version above.
   sed -n '/#\[command(/,/)]/p' crates/bench/src/main.rs | grep -Fxq '    version' || return 1
-  grep -Fq 'fn clap_metadata_exposes_package_version()' crates/bench/src/main.rs || return 1
+  grep -Fq 'fn metadata_version()' crates/bench/src/main.rs || return 1
   grep -Fq 'matches!(args[1].as_str(), "--version" | "-V")' crates/cli/src/main.rs || return 1
   grep -Fq 'matches!(arg.as_str(), "--version" | "-V")' crates/rustscaled/src/main.rs || return 1
 }
@@ -533,7 +586,8 @@ matrix_write_manifest() {
     --rs-tun-inbound-pipeline "$RS_TUN_INBOUND_PIPELINE" --rs-tun-outbound-send-pipeline "$RS_TUN_OUTBOUND_SEND_PIPELINE" \
     --linux-udp-batch "$RS_LINUX_UDP_BATCH" --linux-udp-gro "$RS_LINUX_UDP_GRO" --linux-udp-gso "$RS_LINUX_UDP_GSO" \
     "${dry_flag[@]}" --topologies "${topologies[@]}" --paths "${paths[@]}" \
-    --configs "${configs[@]}" --parallelism "${parallelism[@]}" --repeat "$repeat"
+    --configs "${configs[@]}" --parallelism "${parallelism[@]}" --repeat "$repeat" \
+    --duration "$DURATION" --peer-count "$PEER_COUNT"
 }
 
 # Render into a sibling temporary file and publish only a complete document.
@@ -631,14 +685,18 @@ def result(root, status):
     run=json.loads((root/"matrix.json").read_text())["run"]
     common={"schema_version":3,"run":run,"observed":observed(status=="failed"),"status":status,"tool":"rustscale","mode":"tun",
           "topology": "same-zone", "path": "direct", "config": "rs-tun", "repeat": 1,
-          "parallelism_requested": [1], "error": "dry-run", "log_tail": "",
+          "parallelism_requested": [1], "duration_s_requested": 10, "sample_cadence_s": 1,
+          "peer_count_requested": 1, "error": "dry-run", "log_tail": "",
           "throughput": None, "latency": None, "footprint": None, "path_class_reported": "unknown"}
-    if status=="ok": common.update({"error":"","throughput":[{"parallel": 1, "mbps": 1.0, "duration_s": 1.0,
+    if status=="ok": common.update({"error":"","throughput":[{"parallel": 1, "mbps": 1.0, "duration_s": 10.0,
                       "samples_mbps": [1.0], "statistic": "median"}],
       "latency": {"requested": 50, "transmitted": 50, "received": 50, "loss": 0,
                   "p50_us": 1, "p95_us": 2, "p99_us": 3, "count": 50},
       "footprint": {"binary_size_bytes": 1, "rss_peak_kb": 1, "rss_avg_kb": 1,
-                  "cpu_peak_pct": 0, "cpu_avg_pct": 0, "samples": 1},
+                  "cpu_peak_pct": 0, "cpu_avg_pct": 0, "samples": 1,
+                  "sample_cadence_s": 1,
+                  "series": [{"elapsed_s": 1, "rss_kb": 1, "cpu_pct": 0}],
+                  "series_truncated": False},
       "path_class_reported": "direct"})
     return common
 (dry / "same-zone/direct/rs-tun.json").write_text(json.dumps(result(dry,"failed")))
@@ -784,14 +842,18 @@ fi
 # ---------------------------------------------------------------------------
 matrix_usage() {
   cat <<EOF
-usage: $0 [--dry-run] [--full] [--profile] [--repeat N] [--topology LIST] [--path LIST] [--config LIST]
+usage: $0 [--dry-run] [--full] [--profile] [--repeat N] [--parallelism LIST] [--scale-streams] [--duration N] [--peer-count N] [--topology LIST] [--path LIST] [--config LIST]
 Runs the focused same-zone/direct rs-tun,ts-tun GCP bench matrix.
   --dry-run  validate args + script structure without gcloud or API calls.
   --full     restore the historical two-topology, two-path, four-config matrix.
   --topology comma-separated subset: same-zone,cross-region
   --path     comma-separated subset: direct,derp
   --config   comma-separated subset: rs-userspace,rs-tun,ts-userspace,ts-tun
-  --repeat N run each production TUN throughput parallelism N times (1..=9; default 3)
+  --repeat N run each throughput point N times (1..=9; default 3)
+  --parallelism LIST ordered unique stream counts in 1..=1000 (default 1,10,100)
+  --scale-streams opt in to 1,2,4,8,16,32,64,100,200,500,1000 streams
+  --duration N measured throughput seconds (3..=120; default 10)
+  --peer-count N record configured remote-peer load (1..=1000; default 1)
   --profile  profile only the selected rs-tun cell after normal metrics
 EOF
 }
@@ -826,7 +888,7 @@ else
 fi
 # This is serialized into matrix.json and must exactly match every result's
 # parallelism_requested list; changing the sweep is therefore self-describing.
-PARALLELS=(1 10 100)
+IFS=, read -r -a PARALLELS <<<"$PARALLELISM_CSV"
 select_values() {
   local filter="$1"; shift
   local -a available=("$@") selected=() seen_items=()
@@ -852,6 +914,21 @@ select_values() {
 select_values "$TOPOLOGY_FILTER" "${ALL_TOPOLOGIES[@]}"; [[ -n "$TOPOLOGY_FILTER" ]] && TOPOLOGIES=("${SELECTED[@]}")
 select_values "$PATH_FILTER" "${ALL_PATHS[@]}"; [[ -n "$PATH_FILTER" ]] && PATHS=("${SELECTED[@]}")
 select_values "$CONFIG_FILTER" "${ALL_CONFIGS[@]}"; [[ -n "$CONFIG_FILTER" ]] && CONFIGS=("${SELECTED[@]}")
+# Tailscale comparator cells retain iperf3 and its conservative per-process
+# ceiling. Both RustScale cells use rustscale-bench and may attempt the full
+# opt-in range; capacity errors fail the cell rather than reducing concurrency.
+if (( ! DRY_RUN )); then
+  for parallel in "${PARALLELS[@]}"; do
+    if (( parallel > 128 )); then
+      for cfg in "${CONFIGS[@]}"; do
+        if [[ "$cfg" == ts-userspace || "$cfg" == ts-tun ]]; then
+          echo "--parallelism $parallel exceeds the safe iperf3 per-process limit (128) for $cfg; select a RustScale parity cell or use counts <=128" >&2
+          exit 2
+        fi
+      done
+    fi
+  done
+fi
 if (( PROFILE )); then
   found=0
   for cfg in "${CONFIGS[@]}"; do [[ "$cfg" == rs-tun ]] && found=1; done

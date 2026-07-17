@@ -35,7 +35,10 @@ AUTHKEY RESULTS_DIR SERVER_HOSTNAME CLIENT_HOSTNAME
 CONFIG: rs-userspace | rs-tun | ts-userspace | ts-tun
 --profile: rs-tun only; collect a Linux perf profile after normal metrics
 --profile-only: rs-tun only; collect a Linux perf diagnostic without writing metrics
---repeat N: production TUN samples per parallelism (1..=9; default 3)
+--repeat N: measured samples per parallelism (1..=9; default 3)
+--parallelism LIST: ordered unique stream counts, each in 1..=1000
+--duration N: measured throughput duration in seconds (3..=120)
+--peer-count N: configured remote-peer load, including the benchmark peer (1..=1000)
 --manifest FILE and --observed FILE: current-run immutable provenance inputs
 EOF
   exit 2
@@ -47,9 +50,12 @@ parse_run_config_options() {
   PROFILE=0
   PROFILE_ONLY=0
   REPEAT=3
+  PARALLELISM_CSV="1,10,100"
+  DURATION=10
+  PEER_COUNT=1
   RESULT_MANIFEST=""
   OBSERVED_METADATA=""
-  local seen_profile=0 seen_profile_only=0 seen_repeat=0 seen_manifest=0 seen_observed=0
+  local seen_profile=0 seen_profile_only=0 seen_repeat=0 seen_parallelism=0 seen_duration=0 seen_peer_count=0 seen_manifest=0 seen_observed=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --profile)
@@ -63,6 +69,19 @@ parse_run_config_options() {
         [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || { echo "--repeat requires a value" >&2; return 2; }
         [[ "$2" =~ ^[1-9]$ ]] || { echo "--repeat must be an integer in 1..=9" >&2; return 2; }
         REPEAT="$2"; seen_repeat=1; shift 2 ;;
+      --parallelism)
+        (( seen_parallelism == 0 )) || { echo "duplicate option: --parallelism" >&2; return 2; }
+        [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || { echo "--parallelism requires a value" >&2; return 2; }
+        validate_parallelism_csv "$2" || return 2
+        PARALLELISM_CSV="$2"; seen_parallelism=1; shift 2 ;;
+      --duration)
+        (( seen_duration == 0 )) || { echo "duplicate option: --duration" >&2; return 2; }
+        [[ $# -ge 2 && "$2" =~ ^[0-9]+$ && "$2" -ge 3 && "$2" -le 120 ]] || { echo "--duration must be an integer in 3..=120" >&2; return 2; }
+        DURATION="$2"; seen_duration=1; shift 2 ;;
+      --peer-count)
+        (( seen_peer_count == 0 )) || { echo "duplicate option: --peer-count" >&2; return 2; }
+        [[ $# -ge 2 && "$2" =~ ^[0-9]+$ && "$2" -ge 1 && "$2" -le 1000 ]] || { echo "--peer-count must be an integer in 1..=1000" >&2; return 2; }
+        PEER_COUNT="$2"; seen_peer_count=1; shift 2 ;;
       --manifest)
         (( seen_manifest == 0 )) || { echo "duplicate option: --manifest" >&2; return 2; }
         [[ $# -ge 2 && -n "$2" ]] || { echo "--manifest requires a file" >&2; return 2; }
@@ -77,6 +96,18 @@ parse_run_config_options() {
   (( !(PROFILE && PROFILE_ONLY) )) || { echo "--profile and --profile-only are mutually exclusive" >&2; return 2; }
 }
 
+validate_parallelism_csv() {
+  local csv="$1" item seen=","
+  [[ -n "$csv" && "$csv" != *, && "$csv" != ,* && "$csv" != *,,* ]] || { echo "invalid --parallelism list" >&2; return 1; }
+  local -a values
+  IFS=, read -r -a values <<<"$csv"
+  for item in "${values[@]}"; do
+    [[ "$item" =~ ^[1-9][0-9]*$ && "$item" -le 1000 ]] || { echo "--parallelism values must be integers in 1..=1000" >&2; return 1; }
+    [[ "$seen" != *",$item,"* ]] || { echo "duplicate --parallelism value: $item" >&2; return 1; }
+    seen+="$item,"
+  done
+}
+
 run_config_option_parsing_self_test() {
   local actual status
   actual=$(parse_run_config_options --profile --repeat 1; printf '%s/%s/%s\n' "$PROFILE" "$PROFILE_ONLY" "$REPEAT") || return 1
@@ -87,8 +118,10 @@ run_config_option_parsing_self_test() {
   [[ "$actual" == '1/0/9' ]] || return 1
   actual=$(parse_run_config_options; printf '%s/%s/%s\n' "$PROFILE" "$PROFILE_ONLY" "$REPEAT") || return 1
   [[ "$actual" == '0/0/3' ]] || return 1
+  actual=$(parse_run_config_options --parallelism 1,10,100,1000 --duration 20 --peer-count 250; printf '%s/%s/%s\n' "$PARALLELISM_CSV" "$DURATION" "$PEER_COUNT") || return 1
+  [[ "$actual" == '1,10,100,1000/20/250' ]] || return 1
   local -a case_args=()
-  for args in '--repeat' '--repeat 0' '--repeat 10' '--repeat 1.5' '--repeat 1 --repeat 2' '--profile --profile' '--profile-only --profile-only' '--profile --profile-only' '--unknown'; do
+  for args in '--repeat' '--repeat 0' '--repeat 10' '--repeat 1.5' '--repeat 1 --repeat 2' '--parallelism' '--parallelism 1,1' '--parallelism 0' '--parallelism 1001' '--parallelism 1,a' '--parallelism 1 --parallelism 2' '--duration 2' '--duration 121' '--peer-count 0' '--peer-count 1001' '--profile --profile' '--profile-only --profile-only' '--profile --profile-only' '--unknown'; do
     read -r -a case_args <<< "$args"
     if ( parse_run_config_options "${case_args[@]}" ) >/dev/null 2>&1; then
       return 1
@@ -211,6 +244,9 @@ if (( SELF_TEST )); then
   PROFILE=1
   PROFILE_ONLY=0
   REPEAT=3
+  PARALLELISM_CSV="1,10,100"
+  DURATION=10
+  PEER_COUNT=1
 else
   [[ $# -ge 9 ]] || usage
   CONFIG="$1"
@@ -237,8 +273,7 @@ if [[ "$CONFIG" == rs-tun ]]; then
   validate_rs_tun_daemon_inputs || exit $?
 fi
 
-PARALLELS=(1 10 100)
-DURATION=10
+IFS=, read -r -a PARALLELS <<<"$PARALLELISM_CSV"
 LATENCY_COUNT=50
 LATENCY_INTERVAL=0.1
 PORT=5201
@@ -285,7 +320,8 @@ preflight_current_metadata() {
   [[ -n "$RESULT_MANIFEST" && -n "$OBSERVED_METADATA" ]] || return 1
   python3 "$PROVENANCE_HELPER" preflight --manifest "$RESULT_MANIFEST" --observed "$OBSERVED_METADATA" \
     --config "$CONFIG" --topology "$TOPOLOGY" --path "$PATH_TAG" --server-zone "$SZONE" --client-zone "$CZONE" \
-    --rs-tun-inbound-pipeline "$RS_TUN_INBOUND_PIPELINE" --rs-tun-outbound-send-pipeline "$RS_TUN_OUTBOUND_SEND_PIPELINE" --linux-udp-batch "$RS_LINUX_UDP_BATCH" --linux-udp-gro "$RS_LINUX_UDP_GRO" --linux-udp-gso "$RS_LINUX_UDP_GSO"
+    --rs-tun-inbound-pipeline "$RS_TUN_INBOUND_PIPELINE" --rs-tun-outbound-send-pipeline "$RS_TUN_OUTBOUND_SEND_PIPELINE" --linux-udp-batch "$RS_LINUX_UDP_BATCH" --linux-udp-gro "$RS_LINUX_UDP_GRO" --linux-udp-gso "$RS_LINUX_UDP_GSO" \
+    --parallelism "${PARALLELS[@]}" --duration "$DURATION" --peer-count "$PEER_COUNT"
 }
 
 if ! preflight_current_metadata; then
@@ -653,6 +689,8 @@ path_gate_self_test() {
 
 cleanup_rs_tun() {
   local status=0
+  remote_stop_footprint "$SVM" "$SZONE" /tmp/rs-parity-server.footprint >/dev/null || true
+  remote_stop_footprint "$CVM" "$CZONE" /tmp/rs-parity-client.footprint >/dev/null || true
   remote_stop_footprint "$SVM" "$SZONE" /tmp/rs-tun-srv.footprint >/dev/null || true
   # This runs as root because rs-tun may have left root-owned benchmark files.
   # It is deliberately idempotent: an already-absent optional iperf3 server
@@ -802,6 +840,8 @@ cleanup_ts_tun() {
 # deliberately broad and idempotent: it stops the sampler first, then removes
 # every benchmark/tunnel helper and temporary state on both endpoints.
 cleanup_rs_userspace() {
+  remote_stop_footprint "$SVM" "$SZONE" /tmp/rs-parity-server.footprint >/dev/null || true
+  remote_stop_footprint "$CVM" "$CZONE" /tmp/rs-parity-client.footprint >/dev/null || true
   remote_stop_footprint "$SVM" "$SZONE" /tmp/rs-srv.footprint >/dev/null || true
   ssh_cmd "$SVM" "$SZONE" \
     "kill \$(cat /tmp/rs-srv.pid 2>/dev/null) 2>/dev/null || true; pkill -f rustscale-bench 2>/dev/null || true; pkill -x tailscaled 2>/dev/null || true; pkill -x socat 2>/dev/null || true; pkill -x iperf3 2>/dev/null || true; rm -rf /tmp/rs-srv /tmp/rs-cli-* /tmp/ts-srv /tmp/ts-cli; rm -f /tmp/rs-srv.{pid,log,footprint} /tmp/ts-{srv,cli}.{pid,log,sock} /tmp/{socat,iperf3-srv,ncat}.{pid,log}" || true
@@ -1842,6 +1882,67 @@ PYEOF
   unset -f ssh_sudo run_tun_command scp_from
 }
 
+# Run the exact same RSB1 application workload for both RustScale transports.
+# The explicit warmup finishes before sampling. Endpoint resource sampling
+# then covers each fresh measured client process lifecycle (including its own
+# transport setup) with the same boundary definition for both transports.
+# Args: userspace-tsnet|kernel-tcp SERVER_IP externally-gated|unknown
+rs_parity_measure() {
+  local transport="$1" server_ip="$2" gated_path="$3"
+  local auth_args="" identity path_class warmup_json tp_json="[]" lat_json server_foot client_foot bin_size
+  local server_names=(rustscale-bench) client_names=(rustscale-bench)
+  [[ "$transport" == userspace-tsnet ]] && auth_args="--authkey $AUTHKEY"
+  if [[ "$transport" == kernel-tcp ]]; then
+    server_names=(rustscaled rustscale-bench); client_names=(rustscaled rustscale-bench)
+    ssh_cmd "$SVM" "$SZONE" "nohup /opt/rustscale/target/release/rustscale-bench server --transport kernel-tcp --port $PORT >/tmp/rs-parity-server.log 2>&1 & echo \$! >/tmp/rs-parity-server.pid"
+    for _ in {1..30}; do ssh_cmd "$SVM" "$SZONE" 'grep -q "BENCH_READY 1" /tmp/rs-parity-server.log' 2>/dev/null && break; sleep 1; done
+    ssh_cmd "$SVM" "$SZONE" 'grep -q "BENCH_READY 1" /tmp/rs-parity-server.log' || return 1
+  fi
+  identity=$([[ "$transport" == kernel-tcp ]] && echo kernel-tcp || echo userspace)
+  warmup_json=$(ssh_cmd "$CVM" "$CZONE" "/opt/rustscale/target/release/rustscale-bench client --transport $identity $auth_args --target $server_ip:$PORT --duration 3 --parallel 1 --direction down --hostname $CHOST-warmup --state-dir /tmp/rs-parity-warmup --json 2>/tmp/rs-parity-warmup.log") || return 1
+  path_class=$(printf '%s' "$warmup_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["transport"]==sys.argv[1] and d["protocol"]=="RSB1" and d["direction"]=="down" and d["parallel"]==1; print(d["path_class"])' "$transport") || return 1
+  [[ "$transport" == kernel-tcp ]] && path_class="$gated_path"
+  [[ "$PATH_TAG" == direct && "$path_class" == direct || "$PATH_TAG" == derp && "$path_class" == derp ]] || { echo "[gcp] parity warmup observed wrong path: $path_class" >&2; return 1; }
+
+  remote_start_footprint_set "$SVM" "$SZONE" /tmp/rs-parity-server.footprint "${server_names[@]}" >/dev/null
+  remote_start_footprint_set "$CVM" "$CZONE" /tmp/rs-parity-client.footprint "${client_names[@]}" >/dev/null
+  local sample_number=0 total_samples=$((${#PARALLELS[@]} * REPEAT)) N sample_index sample_json mbps
+  for N in "${PARALLELS[@]}"; do
+    local -a samples=()
+    for ((sample_index=1; sample_index<=REPEAT; sample_index++)); do
+      sample_json=$(ssh_cmd "$CVM" "$CZONE" "/opt/rustscale/target/release/rustscale-bench client --transport $identity $auth_args --target $server_ip:$PORT --duration $DURATION --parallel $N --direction down --hostname $CHOST-$N-$sample_index --state-dir /tmp/rs-parity-$N-$sample_index --json 2>/tmp/rs-parity-$N-$sample_index.log") || return 1
+      mbps=$(printf '%s' "$sample_json" | python3 -c 'import json,math,sys; d=json.load(sys.stdin); transport,parallel,expected=sys.argv[1],int(sys.argv[2]),sys.argv[3]; assert d["transport"]==transport and d["protocol"]=="RSB1" and d["direction"]=="down" and d["parallel"]==parallel and d["established"]==parallel and d["handshaken"]==parallel and d["completed"]==parallel; assert transport=="kernel-tcp" or d["path_class"]==expected; v=float(d["total_mbps"]); assert math.isfinite(v) and v>0; print(repr(v))' "$transport" "$N" "$PATH_TAG") || return 1
+      samples+=("$mbps"); sample_number=$((sample_number+1)); (( sample_number == total_samples )) || sleep 3
+    done
+    tp_json=$(append_tun_throughput_row "$tp_json" "$N" "$DURATION" "${samples[@]}") || return 1
+  done
+  lat_json=$(ssh_cmd "$CVM" "$CZONE" "/opt/rustscale/target/release/rustscale-bench latency --transport $identity $auth_args --target $server_ip:$PORT --count $LATENCY_COUNT --hostname $CHOST-lat --state-dir /tmp/rs-parity-lat --json 2>/tmp/rs-parity-lat.log") || return 1
+  lat_json=$(printf '%s' "$lat_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); transport,n,expected=sys.argv[1],int(sys.argv[2]),sys.argv[3]; assert d["transport"]==transport and d["protocol"]=="RSB1-tcp-pingpong" and d["requested"]==n and d["successful"]==n and d["timed_out"]==0 and d["malformed"]==0 and len(d["samples_ns"])==n; assert transport=="kernel-tcp" or d["path_class"]==expected; print(json.dumps(d))' "$transport" "$LATENCY_COUNT" "$PATH_TAG") || return 1
+  server_foot=$(remote_stop_footprint "$SVM" "$SZONE" /tmp/rs-parity-server.footprint)
+  client_foot=$(remote_stop_footprint "$CVM" "$CZONE" /tmp/rs-parity-client.footprint)
+  bin_size=$(ssh_cmd "$SVM" "$SZONE" 'stat -c %s /opt/rustscale/target/release/rustscale-bench')
+  python3 - "$CONFIG" "$TOPOLOGY" "$PATH_TAG" "$path_class" "$transport" "$bin_size" "$tp_json" "$lat_json" "$server_foot" "$client_foot" "$REPEAT" "${PARALLELS[@]}" >"$OUT" <<'PYEOF'
+import json, sys
+config, topo, requested_path, observed_path, transport, size, tp, lat, server, client, repeat, *parallels = sys.argv[1:]
+server, client = json.loads(server), json.loads(client)
+subjects = ["rustscale-bench"] if transport == "userspace-tsnet" else ["rustscaled", "rustscale-bench"]
+for endpoint in (server, client):
+    assert endpoint["samples"] > 0 and endpoint["samples"] > endpoint["missing_samples"]
+    assert endpoint["rss_peak_kb"] > 0 and endpoint["series"]
+scope = {"kind":"dynamic_process_set","includes_descendants":False,"includes_kernel":False}
+obj={"schema_version":4,"status":"ok","tool":"rustscale","mode":"userspace" if config=="rs-userspace" else "tun",
+ "topology":topo,"path":requested_path,"config":config,"repeat":int(repeat),"parallelism_requested":[int(x) for x in parallels],
+ "error":"","log_tail":"","path_class_reported":observed_path,"transport":transport,
+ "workload":{"implementation":"rustscale-bench","protocol":"RSB1","direction":"down","payload_bytes":1280,"warmup":{"parallel":1,"duration_s":3},"client_lifecycle":"new_process_per_trial","latency_protocol":"RSB1-tcp-pingpong","latency_payload_bytes":8},
+ "throughput":json.loads(tp),"latency":json.loads(lat),
+ "resources":{"phase_set":["measured_client_process_lifecycle","inter_trial_gap"],"sample_cadence_ms":1000,"server":dict(server,endpoint="server",subjects=subjects,scope=scope),"client":dict(client,endpoint="client",subjects=subjects,scope=scope)},
+ "footprint":dict(server,binary_size_bytes=int(size),subject="rustscale-bench",endpoint="server",scope=scope),
+ "binary":{"subject":"rustscale-bench","size_bytes":int(size)}}
+print(json.dumps(obj,indent=2))
+PYEOF
+  finalize_result_metadata
+}
+
 # ===========================================================================
 # Config: rs-userspace — rustscale-bench server + client
 # ===========================================================================
@@ -1876,77 +1977,18 @@ run_rs_userspace() {
   server_ip=$(ssh_cmd "$SVM" "$SZONE" "grep '^BENCH_IP ' /tmp/rs-srv.log | awk '{print \$2}'")
   echo "[gcp] rs-userspace: server IP=$server_ip" >&2
 
-  # Footprint sampler for the server PID.
-  local srv_pid
-  srv_pid=$(ssh_cmd "$SVM" "$SZONE" 'cat /tmp/rs-srv.pid')
-  remote_start_footprint "$SVM" "$SZONE" "$srv_pid" /tmp/rs-srv.footprint
+  if rs_parity_measure userspace-tsnet "$server_ip" unknown; then
+    cleanup_rs_userspace
+    echo "[gcp] rs-userspace: wrote parity result $OUT" >&2
+    return 0
+  fi
+  fail_userspace_config cleanup_rs_userspace "rs-userspace-parity-measure-failed" "$(capture_log_tail "$CVM" "$CZONE" /tmp/rs-parity-lat.log)"
+  return 1
 
-  # Throughput sweep on client.
-  local tp_json="[]"
-  for N in "${PARALLELS[@]}"; do
-    local -a samples=()
-    for ((sample_index = 1; sample_index <= REPEAT; sample_index++)); do
-      echo "[gcp] rs-userspace: throughput N=$N sample=$sample_index/$REPEAT" >&2
-      local mbps
-      mbps=$(ssh_cmd "$CVM" "$CZONE" \
-        "$(rs_userspace_client_command "$RS_LINUX_UDP_BATCH" "$RS_LINUX_UDP_GRO" "$RS_LINUX_UDP_GSO" "$AUTHKEY" "$server_ip:$PORT" "$DURATION" "$N" "$CHOST-$N-$sample_index" "/tmp/rs-cli-$N-$sample_index" "/tmp/rs-cli-$N-$sample_index.log")" \
-        | tun_iperf3_mbps 2>/dev/null) || { fail_userspace_config cleanup_rs_userspace "rs-userspace-throughput-failed" "$(capture_log_tail "$CVM" "$CZONE" /tmp/rs-cli-$N-$sample_index.log)"; return 1; }
-      samples+=("$mbps")
-    done
-    tp_json=$(append_tun_throughput_row "$tp_json" "$N" "$DURATION" "${samples[@]}") || { fail_userspace_config cleanup_rs_userspace "rs-userspace-throughput-invalid"; return 1; }
-    sleep 3
-  done
-
-  # Latency.
-  echo "[gcp] rs-userspace: latency" >&2
-  local lat_json
-  lat_json=$(ssh_cmd "$CVM" "$CZONE" \
-    "${receive_environment}/opt/rustscale/target/release/rustscale-bench latency \
-       --authkey $AUTHKEY --target $server_ip:$PORT --count $LATENCY_COUNT \
-       --hostname $CHOST-lat --state-dir /tmp/rs-cli-lat --json 2>/tmp/rs-cli-lat.log" || echo '{}')
-
-  local path_class
-  path_class=$(echo "$lat_json" | python3 -c "import json,sys; print(json.load(sys.stdin).get('path_class','unknown'))" 2>/dev/null || echo unknown)
-
-  # Stop footprint, parse.
-  local foot_json
-  foot_json=$(remote_stop_footprint "$SVM" "$SZONE" /tmp/rs-srv.footprint)
-
-  # Binary size.
-  local bin_size
-  bin_size=$(ssh_cmd "$SVM" "$SZONE" 'stat -c %s /opt/rustscale/target/release/rustscale-bench 2>/dev/null || echo 0')
-
-  cleanup_rs_userspace
-
-  # Emit result JSON.
-  python3 - "$CONFIG" "$TOPOLOGY" "$PATH_TAG" "$path_class" "$bin_size" "$tp_json" "$lat_json" "$foot_json" "$REPEAT" "${PARALLELS[@]}" >"$OUT" <<'PYEOF'
-import json, sys
-config, topo, path_tag, path_class, bin_size, tp, lat, foot, repeat, *parallel_values = sys.argv[1:]
-obj = {
-    "schema_version": 2,
-    "status": "ok",
-    "tool": "rustscale",
-    "mode": "userspace",
-    "topology": topo,
-    "path": path_tag,
-    "config": config,
-    "repeat": int(repeat),
-    "parallelism_requested": [int(value) for value in parallel_values],
-    "error": "",
-    "log_tail": "",
-    "throughput": json.loads(tp),
-    "latency": json.loads(lat) if lat and lat != "{}" else {"p50_us":0,"p95_us":0,"p99_us":0,"count":0},
-    "footprint": dict(json.loads(foot), binary_size_bytes=int(bin_size)),
-    "path_class_reported": path_class,
-}
-print(json.dumps(obj, indent=2))
-PYEOF
-  finalize_result_metadata
-  echo "[gcp] rs-userspace: wrote $OUT" >&2
 }
 
 # ===========================================================================
-# Config: rs-tun — production rustscaled + rustscale CLIs + kernel iperf3
+# Config: rs-tun — production rustscaled path + kernel-TCP RSB1 workload
 # ===========================================================================
 run_rs_tun() {
   echo "[gcp] rs-tun: starting production rustscaled daemons" >&2
@@ -1999,27 +2041,24 @@ run_rs_tun() {
     return 0
   fi
 
-  if ! rs_tun_measurement_preflight; then
-    echo "[gcp] ERROR: could not clear rs-tun iperf3 leftovers on $SVM" >&2
-    emit_stub "rs-tun-iperf-preflight-failed" "$(capture_log_tail "$SVM" "$SZONE" "$(tun_iperf_server_log_path rs-tun)")"
-    if ! cleanup_rs_tun; then return "$FATAL_HANDOFF_STATUS"; fi
-    return 1
+  if rs_parity_measure kernel-tcp "$server_ip" "$path_class"; then
+    if (( PROFILE )) && ! profile_rs_tun; then
+      emit_stub "rs-tun-profile-failed" "$(capture_log_tail "$SVM" "$SZONE" /tmp/rs-tun-perf-server.log)"
+      cleanup_rs_tun || return "$FATAL_HANDOFF_STATUS"
+      return 1
+    fi
+    if ! cleanup_rs_tun; then
+      emit_stub "rs-tun-cleanup-failed"
+      return "$FATAL_HANDOFF_STATUS"
+    fi
+    echo "[gcp] rs-tun: wrote parity result $OUT" >&2
+    return 0
   fi
+  emit_stub "rs-tun-parity-measure-failed" "$(capture_log_tail "$CVM" "$CZONE" /tmp/rs-parity-lat.log)"
+  cleanup_rs_tun || return "$FATAL_HANDOFF_STATUS"
+  return 1
 
-  if ! tun_measure rs-tun 0 "$server_ip" /tmp/rs-tun-srv.pid \
-    /tmp/rs-tun-srv.footprint /opt/rustscale/target/release/rustscaled; then
-    emit_stub "rs-tun-measure-failed" "$(tun_measure_failure_tail rs-tun "$TUN_MEASURE_FAILURE_STAGE")"
-    if ! cleanup_rs_tun; then return "$FATAL_HANDOFF_STATUS"; fi
-    return 1
-  fi
 
-  if (( PROFILE )) && ! profile_rs_tun; then
-    emit_stub "rs-tun-profile-failed" "$(capture_log_tail "$SVM" "$SZONE" /tmp/rs-tun-perf-server.log)"
-    cleanup_rs_tun || return "$FATAL_HANDOFF_STATUS"
-    return 1
-  fi
-
-  finalize_rs_tun_measurement "$path_class"
 }
 
 # ===========================================================================

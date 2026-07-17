@@ -126,6 +126,43 @@ expect_status 2 env RS_LINUX_UDP_BATCH=0 RS_LINUX_UDP_GSO=1 tools/bench/gcp/run-
 expect_status 2 env RS_LINUX_UDP_BATCH=0 RS_LINUX_UDP_GSO=1 tools/bench/gcp/run-config.sh --self-test
 expect_status 2 env RS_LINUX_UDP_BATCH=0 RS_LINUX_UDP_GRO=1 tools/bench/gcp/run-matrix.sh --dry-run
 expect_status 2 env RS_LINUX_UDP_BATCH=0 RS_LINUX_UDP_GRO=1 tools/bench/gcp/run-config.sh --self-test
+run env MATRIX_SKIP_COLLECT=1 MATRIX_RESULTS_DIR="$tmp/scale" tools/bench/gcp/run-matrix.sh --dry-run \
+  --config rs-userspace,rs-tun,ts-userspace,ts-tun --scale-streams --duration 20 --peer-count 250
+run python3 - "$tmp/scale" <<'PYEOF'
+import json, pathlib, sys
+root = next(pathlib.Path(sys.argv[1]).glob("gcp-*/matrix.json")).parent
+m = json.load(open(root / "matrix.json"))
+assert m["parallelism"] == [1,2,4,8,16,32,64,100,200,500,1000]
+assert m["duration_s"] == 20 and m["sample_cadence_s"] == 1
+assert m["peer_count_requested"] == 250
+assert m["configs"] == ["rs-userspace", "rs-tun", "ts-userspace", "ts-tun"]
+for cell in (root / "same-zone" / "direct").glob("*.json"):
+    r = json.load(open(cell))
+    assert r["parallelism_requested"] == m["parallelism"]
+    assert r["duration_s_requested"] == 20 and r["sample_cadence_s"] == 1
+    assert r["peer_count_requested"] == 250
+html = (root / "dashboard.html").read_text()
+assert "configured peer load" in html and ">250<" in html
+PYEOF
+expect_status 2 tools/bench/gcp/run-matrix.sh --dry-run --parallelism 1,1001
+expect_status 2 tools/bench/gcp/run-matrix.sh --dry-run --parallelism 1,1
+expect_status 2 tools/bench/gcp/run-matrix.sh --dry-run --scale-streams --parallelism 1
+cat >"$tmp/pidstat.fixture" <<'EOF'
+Linux 5.15 fixture
+12:00:01 AM UID PID minflt/s majflt/s VSZ RSS %MEM Command
+12:00:01 AM 0 42 1.00 0.00 10000 2048 0.10 daemon
+12:00:01 AM 0 42 1.00 2.00 0.00 0.00 3.00 1 daemon
+12:00:02 AM 0 42 1.00 0.00 10000 3072 0.10 daemon
+12:00:02 AM 0 42 2.00 3.00 0.00 0.00 5.00 1 daemon
+EOF
+run bash -c 'source tools/bench/gcp/footprint.sh; stop_footprint 0 "$1" >"$2"' _ "$tmp/pidstat.fixture" "$tmp/footprint.json"
+run python3 - "$tmp/footprint.json" <<'PYEOF'
+import json, sys
+f=json.load(open(sys.argv[1]))
+assert f["samples"] == 2 and f["series_truncated"] is False
+assert f["clock"] == "monotonic"
+assert f["series"] == [{"offset_ms":1000,"rss_kb":2048,"cpu_pct":3.0,"included_processes":[],"status":"observed"},{"offset_ms":2000,"rss_kb":3072,"cpu_pct":5.0,"included_processes":[],"status":"observed"}]
+PYEOF
 run env MATRIX_SKIP_COLLECT=1 MATRIX_RESULTS_DIR="$tmp/full" tools/bench/gcp/run-matrix.sh --full --dry-run
 run python3 - "$tmp/full" <<'PYEOF'
 import json, pathlib, sys

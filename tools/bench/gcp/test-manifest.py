@@ -30,12 +30,14 @@ def run_identity():
             "runtime": {"rs_tun_inbound_pipeline": False, "rs_tun_outbound_send_pipeline": False, "linux_udp_batch": True, "linux_udp_gro": True, "linux_udp_gso": True}}
 
 
-def observed():
+def observed(include_bench=True):
     server = {"zone": "us-central1-a", "machine_type": "n1-standard-4", "cpu_platform": "Intel Skylake",
                 "cpu_model": "Intel(R) Xeon", "logical_cpus": 4, "kernel_release": "6.8.0", "os_pretty_name": "Ubuntu 22.04"}
     client = {**server, "zone": "us-central1-b"}
     products = [{"path": "/opt/rustscale/target/release/rustscale", "version": "rustscale 1.2.0", "version_source": "executable --version", "sha256": "b" * 64},
                 {"path": "/opt/rustscale/target/release/rustscaled", "version": "rustscaled 1.2.0", "version_source": "executable --version", "sha256": "c" * 64}]
+    if include_bench:
+        products.append({"path": "/opt/rustscale/target/release/rustscale-bench", "version": "rustscale-bench 1.2.0", "version_source": "executable --version", "sha256": "f" * 64})
     return {"resolved_image": "https://www.googleapis.com/compute/v1/projects/ubuntu-os-cloud/global/images/ubuntu-2204-immutable",
             "server": server, "client": client,
             "toolchain": {"server_cargo": "cargo 1.80", "server_rustc_verbose": "rustc 1.80\ncommit-hash: 'abc'",
@@ -64,8 +66,11 @@ def valid(*, repeat=2, config="rs-tun", path="direct", parallels=PARALLELS, iden
             "throughput": rows, "latency": {"requested": 50, "transmitted": 50, "received": 50,
                                                 "loss": 0, "p50_us": 10, "p95_us": 20, "p99_us": 30, "count": 50},
             "footprint": {"binary_size_bytes": 1, "rss_peak_kb": 2, "rss_avg_kb": 1,
-                          "cpu_peak_pct": 0, "cpu_avg_pct": 0, "samples": 1},
-            "path_class_reported": path, "run": identity or run_identity(), "observed": observed()}
+                          "cpu_peak_pct": 0, "cpu_avg_pct": 0, "samples": 1,
+                          "sample_cadence_s": 1,
+                          "series": [{"elapsed_s": 1, "rss_kb": 2, "cpu_pct": 0}],
+                          "series_truncated": False},
+            "path_class_reported": path, "run": identity or run_identity(), "observed": observed(False)}
 
 
 def valid_ts_tun():
@@ -214,6 +219,10 @@ with tempfile.TemporaryDirectory() as tmp:
         partial_latency["latency"][field] = 1
     write_cell(root, partial_latency)
     assert "all 50 requested replies" in run("python3", GCP / "aggregate.py", root, ok=False).stderr
+    # Schema-v3 history is aggregate-only. Raw-series fields, when present,
+    # are not reinterpreted as a modern monotonic process-set contract.
+    historical_series = valid(); historical_series["footprint"].pop("series"); historical_series["footprint"].pop("series_truncated"); historical_series["footprint"].pop("sample_cadence_s"); write_cell(root, historical_series)
+    run("python3", GCP / "aggregate.py", root)
 
     write_cell(root, valid()); write_cell(root, valid(), "duplicate.json")
     assert "DUPLICATE" in run("python3", GCP / "aggregate.py", root, ok=False).stderr
@@ -228,9 +237,9 @@ with tempfile.TemporaryDirectory() as tmp:
     base.write_text(json.dumps(valid_ts_tun()["observed"]))
     run("python3", GCP / "provenance.py", "select-observed", selected, "--input", base, "--config", "ts-tun", "--topology", "same-zone", "--server-zone", "us-central1-a", "--client-zone", "us-central1-b", "--machine", "n1-standard-4")
     assert {Path(x["path"]).name for x in json.loads(selected.read_text())["product"]["server"]} == {"tailscaled", "tailscale"}
-    base.write_text(json.dumps(valid()["observed"]))
+    base.write_text(json.dumps(observed()))
     run("python3", GCP / "provenance.py", "select-observed", selected, "--input", base, "--config", "rs-tun", "--topology", "same-zone", "--server-zone", "us-central1-a", "--client-zone", "us-central1-b", "--machine", "n1-standard-4")
-    assert {Path(x["path"]).name for x in json.loads(selected.read_text())["product"]["server"]} == {"rustscale", "rustscaled"}
+    assert {Path(x["path"]).name for x in json.loads(selected.read_text())["product"]["server"]} == {"rustscale", "rustscaled", "rustscale-bench"}
     assert {x["version_source"] for x in observed()["product"]["server"]} == {"executable --version"}
 
     # Machine type is an exact, per-run provenance constraint. Keep the
@@ -301,6 +310,16 @@ with tempfile.TemporaryDirectory() as tmp:
                      "rustscaled [/opt/rustscale/target/release/rustscaled] rustscaled 1.2.0",
                      "tailscaled [/usr/sbin/tailscaled] 1.2.0", "tailscale [/usr/bin/tailscale] 1.2.0"):
         assert expected in mixed_html
+    assert "CPU and RSS samples over the complete workload" in mixed_html
+    assert "Historical/unscoped workload (not parity-ranked)" in mixed_html and "Tailscale iperf3 comparator (not parity-ranked)" in mixed_html
+    assert "RustScale RSB1 parity" not in mixed_html
+    assert "protocol-scoped, never averaged" in mixed_html
+    assert "descriptive only; scope-mismatched values are never ranked" in mixed_html
+    assert 'class="best"' not in mixed_html
+    assert "1 displayed / 1 retained / 1 total" in mixed_html
+    assert 'class="resource-row"' in mixed_html
+    assert "not attributed to an individual stream count or peer effect" in mixed_html
+    assert "2 KiB" in mixed_html
     summary_path.unlink()
     for mutate in (
         lambda o: o["observed"].__setitem__("resolved_image", "another-image"),

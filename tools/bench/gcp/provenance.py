@@ -20,7 +20,7 @@ RUN_ID = re.compile(r"gcp-[0-9]{8}-[0-9]{6}-[a-z0-9_-]+\Z")
 TIME = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\Z")
 SHA = re.compile(r"[0-9a-f]{64}\Z")
 CONFIG_PRODUCTS = {
-    "rs-tun": ("rustscaled", "rustscale"),
+    "rs-tun": ("rustscaled", "rustscale", "rustscale-bench"),
     "ts-tun": ("tailscaled", "tailscale"),
     "rs-userspace": ("rustscale-bench",),
     "ts-userspace": ("tailscaled", "tailscale"),
@@ -116,16 +116,20 @@ def validate_manifest(manifest):
         values = manifest.get(key)
         if not isinstance(values, list) or not values or len(values) != len(set(values)) or any(v not in choices for v in values): raise ValueError(f"invalid {key}")
     if type(manifest.get("repeat")) is not int or manifest["repeat"] <= 0: raise ValueError("invalid repeat")
-    if not isinstance(manifest.get("parallelism"), list) or not manifest["parallelism"] or len(manifest["parallelism"]) != len(set(manifest["parallelism"])) or any(type(v) is not int or v <= 0 for v in manifest["parallelism"]): raise ValueError("invalid parallelism")
+    if not isinstance(manifest.get("parallelism"), list) or not manifest["parallelism"] or len(manifest["parallelism"]) != len(set(manifest["parallelism"])) or any(type(v) is not int or v <= 0 or v > 1000 for v in manifest["parallelism"]): raise ValueError("invalid parallelism")
+    if "duration_s" in manifest and (type(manifest["duration_s"]) is not int or not 3 <= manifest["duration_s"] <= 120): raise ValueError("invalid duration_s")
+    if "sample_cadence_s" in manifest and (type(manifest["sample_cadence_s"]) is not int or manifest["sample_cadence_s"] != 1): raise ValueError("invalid sample_cadence_s")
+    if "peer_count_requested" in manifest and (type(manifest["peer_count_requested"]) is not int or not 1 <= manifest["peer_count_requested"] <= 1000): raise ValueError("invalid peer_count_requested")
     if type(manifest.get("dry_run")) is not bool: raise ValueError("invalid dry_run")
     if not manifest["dry_run"] and has_reserved(manifest.get("run")): raise ValueError("reserved sentinel in production run metadata")
     if manifest.get("warmup") != {"parallel": 1, "duration_s": 3, "reverse": True}: raise ValueError("invalid warmup")
     validate_run(manifest.get("run"))
 
 
-def validate_product(products, config, endpoint):
+def validate_product(products, config, endpoint, current=True):
     if dry(products): return
     required = set(CONFIG_PRODUCTS[config])
+    if not current and config == "rs-tun": required.discard("rustscale-bench")
     if not isinstance(products, list) or len(products) != len(required): raise ValueError(f"invalid {endpoint} product")
     names = set()
     for entry in products:
@@ -144,7 +148,7 @@ def validate_endpoint(value, config, name):
     if any(not is_string(value.get(k)) for k in required) or type(value.get("logical_cpus")) is not int or value["logical_cpus"] <= 0: raise ValueError(f"invalid {name} environment")
 
 
-def validate_observed(observed, config, dry_run, topology=None, server_zone=None, client_zone=None, requested_machine=None):
+def validate_observed(observed, config, dry_run, topology=None, server_zone=None, client_zone=None, requested_machine=None, current=True):
     if not isinstance(observed, dict): raise ValueError("observed must be an object")
     values = [observed.get("resolved_image"), observed.get("server"), observed.get("client"), observed.get("toolchain"), observed.get("product")]
     all_dry = all(dry(x) for x in values)
@@ -161,9 +165,18 @@ def validate_observed(observed, config, dry_run, topology=None, server_zone=None
         if requested_machine and (observed["server"]["machine_type"] != requested_machine or observed["client"]["machine_type"] != requested_machine): raise ValueError("observed machine type does not match request")
     toolchain = observed.get("toolchain")
     if not isinstance(toolchain, dict) or any(not is_string(toolchain.get(k)) for k in ("server_cargo", "server_rustc_verbose", "client_cargo", "client_rustc_verbose")): raise ValueError("invalid toolchain")
+    measurement_tools = observed.get("measurement_tools")
+    if measurement_tools is not None:
+        if not isinstance(measurement_tools, dict) or set(measurement_tools) != {"server", "client"}: raise ValueError("invalid measurement_tools")
+        for endpoint, entries in measurement_tools.items():
+            if not isinstance(entries, list): raise ValueError(f"invalid {endpoint} measurement_tools")
+            for entry in entries:
+                if (not isinstance(entry, dict) or not is_string(entry.get("path")) or not entry["path"].startswith("/")
+                        or not is_string(entry.get("version")) or not isinstance(entry.get("sha256"), str)
+                        or not SHA.fullmatch(entry["sha256"])): raise ValueError(f"invalid {endpoint} measurement tool")
     product = observed.get("product")
     if not isinstance(product, dict): raise ValueError("invalid product")
-    validate_product(product.get("server"), config, "server"); validate_product(product.get("client"), config, "client")
+    validate_product(product.get("server"), config, "server", current); validate_product(product.get("client"), config, "client", current)
 
 
 def command_manifest(args):
@@ -177,7 +190,7 @@ def command_manifest(args):
                        "linux_udp_batch": args.linux_udp_batch == "1",
                        "linux_udp_gro": args.linux_udp_gro == "1",
                        "linux_udp_gso": args.linux_udp_gso == "1"}}
-    data = {"schema_version": 2, "topologies": args.topologies, "paths": args.paths, "configs": args.configs, "parallelism": args.parallelism, "repeat": args.repeat, "dry_run": args.dry_run, "warmup": {"parallel": 1, "duration_s": 3, "reverse": True}, "run": run}
+    data = {"schema_version": 2, "topologies": args.topologies, "paths": args.paths, "configs": args.configs, "parallelism": args.parallelism, "repeat": args.repeat, "duration_s": args.duration, "sample_cadence_s": 1, "peer_count_requested": args.peer_count, "dry_run": args.dry_run, "warmup": {"parallel": 1, "duration_s": 3, "reverse": True}, "run": run}
     validate_manifest(data); atomic(args.output, data)
 
 
@@ -206,6 +219,7 @@ def command_observed_real(args):
     observed = {"resolved_image": server_image,
                 "server": endpoint(server_instance, server_raw), "client": endpoint(client_instance, client_raw),
                 "toolchain": {"server_cargo": server_raw.get("cargo"), "server_rustc_verbose": server_raw.get("rustc_verbose"), "client_cargo": client_raw.get("cargo"), "client_rustc_verbose": client_raw.get("rustc_verbose")},
+                "measurement_tools": {"server": server_raw.get("measurement_tools", []), "client": client_raw.get("measurement_tools", [])},
                 "product": {"server": server_raw.get("product"), "client": client_raw.get("product")}}
     # Validate against every selected config: a topology snapshot must be
     # adequate for any cell that receives it, but need not name binaries for
@@ -236,7 +250,13 @@ def command_attach(args):
     zones = TOPOLOGY_ZONES.get(topology)
     if zones is None: raise ValueError("invalid result topology")
     validate_observed(observed, config, manifest["dry_run"], topology, *zones, manifest["run"]["cloud"]["requested_machine_type"])
-    result["schema_version"] = 3
+    source_schema = result.get("schema_version")
+    if source_schema not in (2, 4): raise ValueError("producer result schema_version must be 2 or 4")
+    result["schema_version"] = 4 if source_schema == 4 else 3
+    for key, result_key in (("duration_s", "duration_s_requested"),
+                            ("sample_cadence_s", "sample_cadence_s"),
+                            ("peer_count_requested", "peer_count_requested")):
+        if key in manifest: result[result_key] = manifest[key]
     result["run"] = copy.deepcopy(manifest["run"])
     result["observed"] = observed
     atomic(args.result, result)
@@ -246,10 +266,10 @@ def command_validate(args):
     manifest = read(args.manifest); validate_manifest(manifest)
     if args.result:
         result = read(args.result)
-        if result.get("schema_version") != 3 or result.get("run") != manifest["run"]: raise ValueError("result run does not exactly equal matrix run")
+        if result.get("schema_version") not in (3, 4) or result.get("run") != manifest["run"]: raise ValueError("result run does not exactly equal matrix run")
         topology = result.get("topology"); zones = TOPOLOGY_ZONES.get(topology)
         if result.get("config") not in manifest["configs"] or topology not in manifest["topologies"] or result.get("path") not in manifest["paths"] or zones is None: raise ValueError("result identity is not selected by manifest")
-        validate_observed(result.get("observed"), result.get("config"), manifest["dry_run"], topology, *zones, manifest["run"]["cloud"]["requested_machine_type"])
+        validate_observed(result.get("observed"), result.get("config"), manifest["dry_run"], topology, *zones, manifest["run"]["cloud"]["requested_machine_type"], current=result.get("schema_version") == 4)
 
 
 def command_preflight(args):
@@ -266,6 +286,9 @@ def command_preflight(args):
     if (args.config not in manifest["configs"] or args.topology not in manifest["topologies"]
             or args.path not in manifest["paths"]):
         raise ValueError("preflight identity is not selected by manifest")
+    if args.parallelism is not None and args.parallelism != manifest["parallelism"]: raise ValueError("parallelism does not match immutable run metadata")
+    if args.duration is not None and args.duration != manifest.get("duration_s", 10): raise ValueError("duration does not match immutable run metadata")
+    if args.peer_count is not None and args.peer_count != manifest.get("peer_count_requested", 1): raise ValueError("peer count does not match immutable run metadata")
     validate_observed(observed, args.config, manifest["dry_run"], args.topology, args.server_zone, args.client_zone, manifest["run"]["cloud"]["requested_machine_type"])
 
 
@@ -286,13 +309,13 @@ def command_profile(args):
 
 def main():
     p = argparse.ArgumentParser(); sub = p.add_subparsers(dest="command", required=True)
-    m = sub.add_parser("manifest"); m.add_argument("output"); m.add_argument("--run-id", required=True); m.add_argument("--started-at-utc", required=True); m.add_argument("--commit", required=True); m.add_argument("--dirty", choices=("0", "1"), required=True); m.add_argument("--project", required=True); m.add_argument("--image-project", required=True); m.add_argument("--image-family", required=True); m.add_argument("--machine", required=True); m.add_argument("--network", required=True); m.add_argument("--disk-type", required=True); m.add_argument("--disk-gb", type=int, required=True); m.add_argument("--build-command", default=""); m.add_argument("--rustflags", default=""); m.add_argument("--lto", default=""); m.add_argument("--codegen-units", default=""); m.add_argument("--rs-tun-inbound-pipeline", choices=("0", "1"), default="0"); m.add_argument("--rs-tun-outbound-send-pipeline", choices=("0", "1"), default="0"); m.add_argument("--linux-udp-batch", choices=("0", "1"), default="1"); m.add_argument("--linux-udp-gro", choices=("0", "1"), default="1"); m.add_argument("--linux-udp-gso", choices=("0", "1"), default="1"); m.add_argument("--dry-run", action="store_true"); m.add_argument("--topologies", nargs="+", required=True); m.add_argument("--paths", nargs="+", required=True); m.add_argument("--configs", nargs="+", required=True); m.add_argument("--parallelism", type=int, nargs="+", required=True); m.add_argument("--repeat", type=int, required=True); m.set_defaults(func=command_manifest)
+    m = sub.add_parser("manifest"); m.add_argument("output"); m.add_argument("--run-id", required=True); m.add_argument("--started-at-utc", required=True); m.add_argument("--commit", required=True); m.add_argument("--dirty", choices=("0", "1"), required=True); m.add_argument("--project", required=True); m.add_argument("--image-project", required=True); m.add_argument("--image-family", required=True); m.add_argument("--machine", required=True); m.add_argument("--network", required=True); m.add_argument("--disk-type", required=True); m.add_argument("--disk-gb", type=int, required=True); m.add_argument("--build-command", default=""); m.add_argument("--rustflags", default=""); m.add_argument("--lto", default=""); m.add_argument("--codegen-units", default=""); m.add_argument("--rs-tun-inbound-pipeline", choices=("0", "1"), default="0"); m.add_argument("--rs-tun-outbound-send-pipeline", choices=("0", "1"), default="0"); m.add_argument("--linux-udp-batch", choices=("0", "1"), default="1"); m.add_argument("--linux-udp-gro", choices=("0", "1"), default="1"); m.add_argument("--linux-udp-gso", choices=("0", "1"), default="1"); m.add_argument("--dry-run", action="store_true"); m.add_argument("--topologies", nargs="+", required=True); m.add_argument("--paths", nargs="+", required=True); m.add_argument("--configs", nargs="+", required=True); m.add_argument("--parallelism", type=int, nargs="+", required=True); m.add_argument("--repeat", type=int, required=True); m.add_argument("--duration", type=int, default=10); m.add_argument("--peer-count", type=int, default=1); m.set_defaults(func=command_manifest)
     d = sub.add_parser("dry-observed"); d.add_argument("output"); d.set_defaults(func=command_dry_observed)
     o = sub.add_parser("observed-real"); o.add_argument("output"); o.add_argument("--server-instance", required=True); o.add_argument("--client-instance", required=True); o.add_argument("--server-boot-disk", required=True); o.add_argument("--client-boot-disk", required=True); o.add_argument("--server-endpoint", required=True); o.add_argument("--client-endpoint", required=True); o.set_defaults(func=command_observed_real)
     s = sub.add_parser("select-observed"); s.add_argument("output"); s.add_argument("--input", required=True); s.add_argument("--config", required=True, choices=CONFIG_PRODUCTS); s.add_argument("--topology", required=True); s.add_argument("--server-zone", required=True); s.add_argument("--client-zone", required=True); s.add_argument("--machine", required=True); s.add_argument("--dry-run", action="store_true"); s.set_defaults(func=command_select_observed)
     a = sub.add_parser("attach"); a.add_argument("--manifest", required=True); a.add_argument("--observed", required=True); a.add_argument("result"); a.set_defaults(func=command_attach)
     v = sub.add_parser("validate"); v.add_argument("--manifest", required=True); v.add_argument("--result"); v.set_defaults(func=command_validate)
-    f = sub.add_parser("preflight"); f.add_argument("--manifest", required=True); f.add_argument("--observed", required=True); f.add_argument("--config", required=True); f.add_argument("--topology", required=True); f.add_argument("--path", required=True); f.add_argument("--server-zone", required=True); f.add_argument("--client-zone", required=True); f.add_argument("--rs-tun-inbound-pipeline", choices=("0", "1"), required=True); f.add_argument("--rs-tun-outbound-send-pipeline", choices=("0", "1"), required=True); f.add_argument("--linux-udp-batch", choices=("0", "1"), required=True); f.add_argument("--linux-udp-gro", choices=("0", "1"), required=True); f.add_argument("--linux-udp-gso", choices=("0", "1"), required=True); f.set_defaults(func=command_preflight)
+    f = sub.add_parser("preflight"); f.add_argument("--manifest", required=True); f.add_argument("--observed", required=True); f.add_argument("--config", required=True); f.add_argument("--topology", required=True); f.add_argument("--path", required=True); f.add_argument("--server-zone", required=True); f.add_argument("--client-zone", required=True); f.add_argument("--rs-tun-inbound-pipeline", choices=("0", "1"), required=True); f.add_argument("--rs-tun-outbound-send-pipeline", choices=("0", "1"), required=True); f.add_argument("--linux-udp-batch", choices=("0", "1"), required=True); f.add_argument("--linux-udp-gro", choices=("0", "1"), required=True); f.add_argument("--linux-udp-gso", choices=("0", "1"), required=True); f.add_argument("--parallelism", type=int, nargs="+"); f.add_argument("--duration", type=int); f.add_argument("--peer-count", type=int); f.set_defaults(func=command_preflight)
     q = sub.add_parser("profile"); q.add_argument("--manifest", required=True); q.add_argument("--observed", required=True); q.add_argument("--config", required=True); q.add_argument("profile"); q.set_defaults(func=command_profile)
     args = p.parse_args()
     try: args.func(args)

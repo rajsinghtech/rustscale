@@ -115,6 +115,76 @@ target/release/rustscale-bench latency --authkey tskey-... --target 100.64.0.1:5
   --count 1000 --json
 ```
 
+### GCP matrix and opt-in scale runs
+
+The paid GCP runner keeps its routine default at TUN mode with 1, 10, and 100
+streams. Userspace and scale points are explicit selections, so pull requests
+and ordinary operator runs do not accidentally expand cost:
+
+```bash
+# Credential-free command/provenance/dashboard validation only.
+MATRIX_SKIP_COLLECT=1 tools/bench/gcp/run-matrix.sh --dry-run \
+  --config rs-userspace,rs-tun,ts-userspace,ts-tun \
+  --scale-streams --duration 20 --peer-count 1
+
+# Native userspace scale run (maximum supported requested count is 1000).
+tools/bench/gcp/run-matrix.sh \
+  --config rs-userspace \
+  --parallelism 1,10,100,500,1000 --duration 20 --repeat 7
+```
+
+`--parallelism` preserves order, rejects duplicates, and accepts only 1–1000.
+`--scale-streams` expands to `1,2,4,8,16,32,64,100,200,500,1000` and conflicts
+with an explicit list. Duration is bounded to 3–120 seconds. The manifest and
+each attached result record the exact stream list, duration, configured peer
+load, and 1 Hz resource cadence. Endpoint provenance also records paths,
+versions, and hashes for available iperf3, socat, ncat, pidstat, and Python
+utilities. CPU/RSS raw samples are bounded to one hour
+per cell and retained alongside the existing average/peak summaries; Pages
+shows both userspace and TUN stream curves, peer-load context, and successful
+resource sample tables. CPU is derived from per-PID `/proc` tick deltas over
+each interval, not lifetime-averaged `ps %CPU`. Each cell is downsampled
+independently for display, while summaries cover the full source; displayed,
+retained, and total counts plus source truncation are disclosed. Sampling uses
+the same measured-client-process-lifecycle boundary for both RustScale modes,
+including transport setup inherent in each fresh client command and the common
+inter-trial gaps. Samples are not attributed to a particular stream point or
+peer effect. Missing files, empty series, or no observed process sample fail
+the cell rather than becoming zero. Failed cells remain null and are never
+resource rows.
+
+Both `rs-userspace` and `rs-tun` use the same `rustscale-bench` RSB1 download
+and TCP ping-pong workload. They share payload sizes, warmup, duration, repeat
+lifecycle, stream counts, raw samples, median calculation, and latency count.
+`rs-userspace` selects `userspace-tsnet`; `rs-tun` selects `kernel-tcp` after
+the RustScale CLI has proved the requested direct/DERP path. Counts through
+1000 are accepted for both RustScale modes and fail honestly if all requested
+connections cannot be established.
+
+Tailscale comparator cells remain a separate iperf3 series. Ubuntu's packaged
+iperf3 is conservatively capped at 128 streams, so paid `ts-userspace` and
+`ts-tun` runs above that point are rejected before provisioning.
+
+`--peer-count` is a **configured-load label**, not a peer generator or an
+observed-count claim. Use values above one only with a separately controlled
+loader deployment, exact endpoint peer-count checks, and cleanup evidence.
+This focused change deliberately does not fabricate observed peer membership;
+the dashboard therefore says “configured peer load” and does not attribute
+resource samples to peer effects. Publication-quality peer-load conclusions
+still require real GCP runs and recorded loader/control-plane evidence. A
+1000-stream dry-run proves command and schema support only, not socket capacity
+or throughput.
+
+RustScale userspace-to-TUN comparisons are RSB1 workload-parity comparisons.
+Tailscale iperf3 comparator values are labeled separately and are not ranked
+against the RustScale parity series. Resource values declare endpoint,
+dynamic process-set scope, included PID/name observations, monotonic offsets,
+cadence, and workload phase coverage; unlike or legacy scopes are descriptive
+only and cannot receive “best” highlighting.
+The historical `same-zone` label currently selects two zones in one region;
+report its observed zones as same-region/cross-zone rather than silently
+reinterpreting old data.
+
 ### CI (GitHub Actions)
 
 `.github/workflows/bench.yml` runs the credential-free `tools/bench/check.sh`

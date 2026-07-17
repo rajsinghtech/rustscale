@@ -759,8 +759,61 @@ rsb1_workload_cleanup_command() {
 '! pgrep -x rustscale-bench >/dev/null 2>&1 && ! ss -H -ltn | grep -Eq ":(5201|5300)[[:space:]]"'
 }
 
+rs_tun_transport_cleanup_path() {
+  local role="$1" suffix="$2"
+  [[ "$role" == srv || "$role" == cli ]] || return 2
+  [[ "$suffix" == sh || "$suffix" == log || "$suffix" == status ]] || return 2
+  printf '/tmp/rs-tun-%s-cleanup.%s' "$role" "$suffix"
+}
+
+# Build a detached root-side cleanup program. Stopping the TUN owner can
+# temporarily invalidate the SSH flow that requested the stop, so the worker
+# records its own result after that requesting session has already exited.
+rs_tun_transport_cleanup_program() {
+  local role="$1" status_file
+  status_file=$(rs_tun_transport_cleanup_path "$role" status) || return $?
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    "status_file=$status_file" \
+    "trap 'status=\$?; printf \"%s\\n\" \"\$status\" >\"\$status_file\"' EXIT" \
+    'sleep 2'
+  rs_tun_cleanup_command "$role"
+}
+
+start_rs_tun_transport_cleanup() {
+  local vm="$1" zone="$2" role="$3" script log status_file program encoded
+  script=$(rs_tun_transport_cleanup_path "$role" sh) || return $?
+  log=$(rs_tun_transport_cleanup_path "$role" log) || return $?
+  status_file=$(rs_tun_transport_cleanup_path "$role" status) || return $?
+  program=$(rs_tun_transport_cleanup_program "$role") || return $?
+  encoded=$(printf '%s\n' "$program" | base64 | tr -d '\n')
+  [[ "$encoded" =~ ^[A-Za-z0-9+/]+={0,2}$ ]] || return 1
+  ssh_sudo "$vm" "$zone" \
+    "rm -f $script $log $status_file; echo $encoded | base64 -d >$script; chmod 0700 $script; nohup bash $script >$log 2>&1 </dev/null &"
+}
+
+wait_rs_tun_transport_cleanup() {
+  local vm="$1" zone="$2" role="$3" script log status_file result="" elapsed=0
+  script=$(rs_tun_transport_cleanup_path "$role" sh) || return $?
+  log=$(rs_tun_transport_cleanup_path "$role" log) || return $?
+  status_file=$(rs_tun_transport_cleanup_path "$role" status) || return $?
+  while (( elapsed < 90 )); do
+    if result=$(ssh_sudo "$vm" "$zone" "test -f $status_file && cat $status_file" 2>/dev/null); then
+      break
+    fi
+    sleep 2
+    elapsed=$((elapsed + 2))
+  done
+  if [[ "$result" != 0 ]]; then
+    echo "[gcp] rs-tun detached cleanup did not verify for $vm (status=${result:-unavailable})" >&2
+    ssh_sudo "$vm" "$zone" "tail -n 80 $log 2>/dev/null" >&2 || true
+    return 1
+  fi
+  ssh_sudo "$vm" "$zone" "rm -f $script $log $status_file"
+}
+
 cleanup_rs_tun() {
-  local status=0
+  local status=0 server_transport_started=0 client_transport_started=0
   remote_stop_footprint "$SVM" "$SZONE" /tmp/rsb1-server.footprint >/dev/null || true
   remote_stop_footprint "$CVM" "$CZONE" /tmp/rsb1-client.footprint >/dev/null || true
   remote_stop_footprint "$SVM" "$SZONE" /tmp/rs-tun-srv.footprint >/dev/null || true
@@ -786,13 +839,26 @@ cleanup_rs_tun() {
     status=1; reset_vm "$CVM" "$CZONE" || true
   fi
 
-  # Run both transport endpoints even if one remains dirty.
-  if ! ssh_sudo "$SVM" "$SZONE" "$(rs_tun_cleanup_command srv)"; then
-    echo "[gcp] WARN: in-guest rs-tun cleanup failed on server $SVM; forcing VM reset" >&2
+  # Launch both route-mutating workers before waiting for either endpoint.
+  # Their status files make a later fresh SSH session the handoff proof.
+  if start_rs_tun_transport_cleanup "$SVM" "$SZONE" srv; then
+    server_transport_started=1
+  else
+    echo "[gcp] WARN: failed to launch detached rs-tun cleanup on server $SVM; forcing VM reset" >&2
     status=1; reset_vm "$SVM" "$SZONE" || true
   fi
-  if ! ssh_sudo "$CVM" "$CZONE" "$(rs_tun_cleanup_command cli)"; then
-    echo "[gcp] WARN: in-guest rs-tun cleanup failed on client $CVM; forcing VM reset" >&2
+  if start_rs_tun_transport_cleanup "$CVM" "$CZONE" cli; then
+    client_transport_started=1
+  else
+    echo "[gcp] WARN: failed to launch detached rs-tun cleanup on client $CVM; forcing VM reset" >&2
+    status=1; reset_vm "$CVM" "$CZONE" || true
+  fi
+  if (( server_transport_started )) && ! wait_rs_tun_transport_cleanup "$SVM" "$SZONE" srv; then
+    echo "[gcp] WARN: detached rs-tun cleanup failed on server $SVM; forcing VM reset" >&2
+    status=1; reset_vm "$SVM" "$SZONE" || true
+  fi
+  if (( client_transport_started )) && ! wait_rs_tun_transport_cleanup "$CVM" "$CZONE" cli; then
+    echo "[gcp] WARN: detached rs-tun cleanup failed on client $CVM; forcing VM reset" >&2
     status=1; reset_vm "$CVM" "$CZONE" || true
   fi
   (( status == 0 )) && CELL_CLEANED=1
@@ -1065,7 +1131,8 @@ PYEOF
 }
 
 cleanup_self_test() {
-  local state result events command iperf_events preflight_call preflight_expected ts_preflight cleanup_failure
+  local state result events command detached_program detached_launch encoded decoded wait_count_file wait_log_file
+  local iperf_events preflight_call preflight_expected ts_preflight cleanup_failure cleanup_handoff_failure
   local -a cases=(absent graceful forced failure)
 
   # These mocks exercise the remote cleanup program's transitions without a
@@ -1116,6 +1183,51 @@ cleanup_self_test() {
     esac
   done
 
+  # The route-mutating transport cleanup runs only after its requesting SSH
+  # session exits. Its detached program must preserve the strict cleanup
+  # command and record an independently observable status.
+  detached_program=$(rs_tun_transport_cleanup_program srv) || return 1
+  bash -n <<<"$detached_program" || return 1
+  [[ "$detached_program" == *'status_file=/tmp/rs-tun-srv-cleanup.status'* \
+    && "$detached_program" == *'trap '\''status=$?; printf "%s\n" "$status" >"$status_file"'\'' EXIT'* \
+    && "$detached_program" == *$'sleep 2\npidfile=/tmp/rs-tun-srv.pid'* \
+    && "$detached_program" == *'ip link delete dev tailscale0'* ]] || return 1
+  if rs_tun_transport_cleanup_program invalid >/dev/null 2>&1; then return 1; fi
+  detached_launch=$(
+    ssh_sudo() { printf '%s|%s|%s\n' "$1" "$2" "$3"; }
+    start_rs_tun_transport_cleanup "$SVM" "$SZONE" srv
+  ) || return 1
+  [[ "$detached_launch" == "$SVM|$SZONE|"*'/tmp/rs-tun-srv-cleanup.sh'* \
+    && "$detached_launch" == *'nohup bash /tmp/rs-tun-srv-cleanup.sh'* ]] || return 1
+  encoded=${detached_launch#*echo }
+  encoded=${encoded%% | base64*}
+  decoded=$(printf '%s' "$encoded" | base64 -d) || return 1
+  [[ "$decoded" == "$detached_program" ]] || return 1
+
+  # Polling must tolerate a running worker, accept only an explicit zero
+  # status, and remove the status/program/log through a fresh SSH session.
+  wait_count_file=$(mktemp "$RDIR/rs-tun-wait-count.XXXXXX") || return 1
+  wait_log_file=$(mktemp "$RDIR/rs-tun-wait-log.XXXXXX") || return 1
+  printf '0\n' >"$wait_count_file"
+  ssh_sudo() {
+    local count
+    printf ' %s:%s' "$1" "$3" >>"$wait_log_file"
+    if [[ "$3" == test\ -f* ]]; then
+      count=$(<"$wait_count_file")
+      count=$((count + 1))
+      printf '%s\n' "$count" >"$wait_count_file"
+      (( count >= 3 )) || return 1
+      printf '0\n'
+    fi
+    return 0
+  }
+  wait_rs_tun_transport_cleanup "$SVM" "$SZONE" srv || return 1
+  [[ "$(<"$wait_count_file")" == 3 \
+    && "$(<"$wait_log_file")" == *'test -f /tmp/rs-tun-srv-cleanup.status'* \
+    && "$(<"$wait_log_file")" == *'rm -f /tmp/rs-tun-srv-cleanup.sh /tmp/rs-tun-srv-cleanup.log /tmp/rs-tun-srv-cleanup.status'* ]] || return 1
+  rm -f "$wait_count_file" "$wait_log_file"
+  unset -f ssh_sudo
+
   # The optional iperf3 process can already be absent.  Its cleanup must still
   # succeed and remove files that were created by the root-run rs-tun benchmark
   # before a later non-root configuration attempts to create them.
@@ -1153,24 +1265,36 @@ cleanup_self_test() {
   [[ "$ts_preflight" == *"$CVM|$CZONE|rm -f /tmp/ts-tun-iperf3-warmup.json /tmp/ts-tun-iperf3-current.json"* ]] || return 1
 
   # An iperf3 cleanup failure makes the handoff unsafe, but must not skip
-  # either daemon endpoint cleanup.
+  # launching or verifying either detached transport cleanup.
   cleanup_failure=$(
-    CLEANUP_TEST_SSH_CALLS=""
+    CLEANUP_TEST_EVENTS=""
     remote_stop_footprint() { :; }
-    reset_vm() { return 0; }
+    reset_vm() { CLEANUP_TEST_EVENTS+=" reset:$1"; return 0; }
     ssh_sudo() {
-      CLEANUP_TEST_SSH_CALLS+=" $1:$2"
+      CLEANUP_TEST_EVENTS+=" ssh:$1"
       [[ "$3" == "$(rs_tun_iperf_cleanup_command server)" ]] && return 1
       return 0
     }
-    if cleanup_rs_tun; then
-      result=0
-    else
-      result=$?
-    fi
-    printf '%s|%s\n' "$result" "$CLEANUP_TEST_SSH_CALLS"
+    start_rs_tun_transport_cleanup() { CLEANUP_TEST_EVENTS+=" start:$1:$3"; }
+    wait_rs_tun_transport_cleanup() { CLEANUP_TEST_EVENTS+=" wait:$1:$3"; }
+    if cleanup_rs_tun; then result=0; else result=$?; fi
+    printf '%s|%s\n' "$result" "$CLEANUP_TEST_EVENTS"
   ) || return 1
-  [[ "$cleanup_failure" == "1| $SVM:$SZONE $CVM:$CZONE $SVM:$SZONE $CVM:$CZONE $SVM:$SZONE $CVM:$CZONE" ]] || return 1
+  [[ "$cleanup_failure" == "1| ssh:$SVM ssh:$CVM ssh:$SVM reset:$SVM ssh:$CVM start:$SVM:srv start:$CVM:cli wait:$SVM:srv wait:$CVM:cli" ]] || return 1
+
+  # A failed server handoff still verifies the client before returning fatal;
+  # only the failed endpoint is reset.
+  cleanup_handoff_failure=$(
+    CLEANUP_TEST_EVENTS=""
+    remote_stop_footprint() { :; }
+    ssh_sudo() { :; }
+    reset_vm() { CLEANUP_TEST_EVENTS+=" reset:$1"; return 0; }
+    start_rs_tun_transport_cleanup() { CLEANUP_TEST_EVENTS+=" start:$1:$3"; }
+    wait_rs_tun_transport_cleanup() { CLEANUP_TEST_EVENTS+=" wait:$1:$3"; [[ "$3" != srv ]]; }
+    if cleanup_rs_tun; then result=0; else result=$?; fi
+    printf '%s|%s\n' "$result" "$CLEANUP_TEST_EVENTS"
+  ) || return 1
+  [[ "$cleanup_handoff_failure" == "1| start:$SVM:srv start:$CVM:cli wait:$SVM:srv reset:$SVM wait:$CVM:cli" ]] || return 1
 
   # Failure injection uses the same helper as the post-start userspace
   # throughput exits.  Cleanup must finish before a later matrix cell starts.

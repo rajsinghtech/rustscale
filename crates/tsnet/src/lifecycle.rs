@@ -2675,6 +2675,12 @@ impl Server {
         self.config.auth_key = Some(key.into());
     }
 
+    /// Clear a previously supplied one-shot auth key before starting an
+    /// interactive or no-auth daemon generation.
+    pub fn clear_auth_key(&mut self) {
+        self.config.auth_key = None;
+    }
+
     /// Start only the LocalAPI server without full bootstrap. Used by the
     /// daemon when no auth key is available — the server enters NeedsLogin
     /// state and waits for CLI-driven `up()` via `POST /start` or

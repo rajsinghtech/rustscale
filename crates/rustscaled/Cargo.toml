@@ -26,6 +26,7 @@ thiserror.workspace = true
 log.workspace = true
 
 [dev-dependencies]
+rustscale-localclient = { path = "../localclient", version = "0.1.3" }
 rustscale-testcontrol = { path = "../testcontrol", version = "0.1.3" }
 serde_json.workspace = true
 tempfile = "3"

@@ -57,7 +57,7 @@ const API_PREFIX: &str = "/localapi/v0/";
 
 /// Commands sent from LocalAPI handlers to the daemon for actions that
 /// require server-level operations (start, login, logout).
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum DaemonCommand {
     Start {
         auth_key: Option<String>,
@@ -73,6 +73,25 @@ pub enum DaemonCommand {
     /// Fired by `POST /localapi/v0/profiles/<id>`. Mirrors Go's
     /// `LocalBackend.SwitchProfile` → `resetForProfileChangeLocked`.
     SwitchProfile(String),
+}
+
+impl std::fmt::Debug for DaemonCommand {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Start { auth_key } => formatter
+                .debug_struct("Start")
+                .field("auth_key", &auth_key.as_ref().map(|_| "<redacted>"))
+                .finish(),
+            Self::LoginInteractive => formatter.write_str("LoginInteractive"),
+            Self::Logout => formatter.write_str("Logout"),
+            Self::Shutdown => formatter.write_str("Shutdown"),
+            Self::ReloadConfig => formatter.write_str("ReloadConfig"),
+            Self::SwitchProfile(profile) => formatter
+                .debug_tuple("SwitchProfile")
+                .field(profile)
+                .finish(),
+        }
+    }
 }
 
 pub(crate) struct LogoutCompletion {
@@ -1015,14 +1034,25 @@ async fn handle_start<W: AsyncWrite + Unpin>(
         }
     }
 
-    if let Some(ref tx) = state.command_tx {
-        let _ = tx.send(DaemonCommand::Start {
+    let admitted = state.command_tx.as_ref().is_some_and(|tx| {
+        tx.send(DaemonCommand::Start {
             auth_key: if opts.AuthKey.is_empty() {
                 None
             } else {
                 Some(opts.AuthKey.clone())
             },
-        });
+        })
+        .is_ok()
+    });
+    if !admitted {
+        write_json_response(
+            conn,
+            503,
+            "Service Unavailable",
+            &serde_json::json!({"error": "daemon command owner stopped"}),
+        )
+        .await?;
+        return Ok(());
     }
     write_no_content_response(conn, 204, "No Content").await?;
     Ok(())
@@ -1893,16 +1923,28 @@ pub(crate) async fn dispatch<W: AsyncRead + AsyncWrite + Unpin>(
 
         // --- POST /localapi/v0/login-interactive ---
         "login-interactive" if method == "POST" => {
-            // `notify_one` retains one permit when bootstrap has not yet
-            // installed its waiter. Exactly one bootstrap follow-up consumes
-            // it; unlike notify_waiters an early POST cannot be lost.
-            state.login_trigger.notify_one();
             // A standalone `rustscale login` arrives while the daemon is in
             // NeedsLogin. It must start bootstrap, not merely signal the
             // auth-url waiter that does not exist yet.
-            if let Some(tx) = &state.command_tx {
-                let _ = tx.send(DaemonCommand::LoginInteractive);
+            let admitted = state
+                .command_tx
+                .as_ref()
+                .is_some_and(|tx| tx.send(DaemonCommand::LoginInteractive).is_ok());
+            if !admitted {
+                write_json_response(
+                    conn,
+                    503,
+                    "Service Unavailable",
+                    &serde_json::json!({"error": "daemon command owner stopped"}),
+                )
+                .await?;
+                return Ok(());
             }
+            // `notify_one` retains one permit when bootstrap has not yet
+            // installed its waiter. Exactly one bootstrap follow-up consumes
+            // it; unlike notify_waiters an early POST cannot be lost. Notify
+            // only after the daemon command has been admitted.
+            state.login_trigger.notify_one();
             write_no_content_response(conn, 204, "No Content").await?;
         }
 
@@ -7083,6 +7125,33 @@ mod tests {
         )
         .await;
         assert!(resp.contains("403 Forbidden"));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_commands_error_when_daemon_owner_is_gone() {
+        for request in [
+            b"POST /localapi/v0/start HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".as_slice(),
+            b"POST /localapi/v0/login-interactive HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice(),
+        ] {
+            let mut state = make_test_state().await;
+            let (command_tx, command_rx) = mpsc::unbounded_channel();
+            drop(command_rx);
+            Arc::get_mut(&mut state).unwrap().command_tx = Some(command_tx);
+
+            let response = send_request_with_identity(request, &state, test_rw_identity()).await;
+            assert!(response.contains("503 Service Unavailable"), "{response}");
+            assert!(response.contains("daemon command owner stopped"), "{response}");
+        }
+    }
+
+    #[test]
+    fn daemon_command_debug_redacts_auth_keys() {
+        let command = DaemonCommand::Start {
+            auth_key: Some("tskey-plaintext-must-not-escape".into()),
+        };
+        let debug = format!("{command:?}");
+        assert!(debug.contains("<redacted>"), "{debug}");
+        assert!(!debug.contains("tskey-plaintext"), "{debug}");
     }
 
     #[tokio::test]

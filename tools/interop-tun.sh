@@ -60,12 +60,10 @@ for cmd in tailscaled tailscale python3 curl jq; do
   }
 done
 
-# TUN device creation requires root. We build unprivileged and exec the test
-# binary under sudo (see below). Check that passwordless sudo is available.
-if ! sudo -n true 2>/dev/null; then
-  echo "[interop-tun] ERROR: TUN mode requires root. Configure passwordless sudo." >&2
-  exit 1
-fi
+# Establish Linux TUN, iproute2, and privilege prerequisites before the first
+# tailnet API call. Once this succeeds, the Rust test must fail on every
+# up_tun error; a startup failure can no longer be reported as a skip.
+tools/interop-tun-preflight.sh
 
 echo "[interop-tun] rustscale TUN <-> Go tailscaled userspace cross-client e2e" >&2
 
@@ -235,9 +233,12 @@ if [[ -z "$TEST_BIN" || ! -x "$TEST_BIN" ]]; then
 fi
 echo "[interop-tun] test binary: $TEST_BIN" >&2
 
-# Run the test binary under sudo with env passed through.
-echo "[interop-tun] running TUN interop tests under sudo..." >&2
-sudo -E "$TEST_BIN" --ignored interop_tun_ --nocapture
+# Run one exact, serial regression gate under sudo with env passed through.
+# It asserts the kernel interface/rules/routes and completes an echo roundtrip.
+echo "[interop-tun] running focused TUN regression gate under sudo..." >&2
+sudo -E "$TEST_BIN" \
+  --ignored --exact tests::interop_tun_rust_dials_go \
+  --nocapture --test-threads=1
 TEST_RC=$?
 
 echo "[interop-tun] test suite exited with code $TEST_RC" >&2

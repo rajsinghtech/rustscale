@@ -5252,23 +5252,121 @@ fn require_tun_interop(test_name: &str) -> Option<InteropEnv> {
     Some(ienv)
 }
 
-/// Call `up_tun` and skip the test cleanly if TUN device creation fails
-/// (permission denied, platform not supported, etc.). Returns the server
-/// on success; returns None and logs a skip message on failure.
-async fn up_tun_or_skip(server: &mut Server, test_name: &str) -> Option<()> {
-    match Box::pin(server.up_tun(TunModeConfig {
-        tun: rustscale_tun::TunConfig::default(),
+/// Call `up_tun` after the harness has established its real-TUN prerequisites.
+/// At this point every startup error is a regression, never a reason to skip.
+async fn up_tun_required(server: &mut Server, test_name: &str) -> rustscale_tun::TunConfig {
+    let tun = rustscale_tun::TunConfig::default();
+    Box::pin(server.up_tun(TunModeConfig {
+        tun: tun.clone(),
         apply_routes: true,
         exit_node: None,
     }))
     .await
-    {
-        Ok(_) => Some(()),
-        Err(e) => {
-            log::warn!("{test_name}: skipping — up_tun failed: {e}");
-            None
-        }
+    .unwrap_or_else(|error| {
+        panic!("{test_name}: up_tun failed after privileged TUN prerequisites were established: {error}")
+    });
+    tun
+}
+
+#[cfg(target_os = "linux")]
+fn required_command_output(program: &str, args: &[&str], assertion: &str) -> String {
+    let output = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .unwrap_or_else(|error| panic!("{assertion}: failed to run {program} {args:?}: {error}"));
+    assert!(
+        output.status.success(),
+        "{assertion}: {program} {args:?} failed with {:?}: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .unwrap_or_else(|error| panic!("{assertion}: command output was not UTF-8: {error}"))
+}
+
+#[cfg(target_os = "linux")]
+fn assert_linux_tun_kernel_state(tun: &rustscale_tun::TunConfig) {
+    let sysfs = std::path::Path::new("/sys/class/net").join(&tun.name);
+    let read_sysfs = |field: &str| {
+        std::fs::read_to_string(sysfs.join(field)).unwrap_or_else(|error| {
+            panic!(
+                "real TUN gate: failed to read {} {field}: {error}",
+                tun.name
+            )
+        })
+    };
+
+    let ifindex = read_sysfs("ifindex")
+        .trim()
+        .parse::<u32>()
+        .expect("real TUN gate: interface index must be numeric");
+    assert_ne!(ifindex, 0, "real TUN gate: interface index must be nonzero");
+
+    let flags_text = read_sysfs("flags");
+    let flags = u32::from_str_radix(flags_text.trim().trim_start_matches("0x"), 16)
+        .expect("real TUN gate: interface flags must be hexadecimal");
+    assert_ne!(
+        flags & 1,
+        0,
+        "real TUN gate: {} must have IFF_UP set (flags={flags_text:?})",
+        tun.name
+    );
+
+    let mtu = read_sysfs("mtu")
+        .trim()
+        .parse::<usize>()
+        .expect("real TUN gate: interface MTU must be numeric");
+    assert_eq!(
+        mtu, tun.mtu,
+        "real TUN gate: kernel MTU for {} does not match the configured MTU",
+        tun.name
+    );
+
+    let rules = required_command_output(
+        "ip",
+        &["-4", "-details", "rule", "show"],
+        "real TUN gate policy rules",
+    );
+    let base = 5_000 + (ifindex % 200) * 100;
+    for (preference, target) in [
+        (base + 10, "lookup main"),
+        (base + 30, "lookup default"),
+        (base + 50, "unreachable"),
+        (base + 70, "lookup 52"),
+    ] {
+        let prefix = format!("{preference}:");
+        let rule = rules
+            .lines()
+            .find(|line| line.split_whitespace().next() == Some(prefix.as_str()))
+            .unwrap_or_else(|| {
+                panic!(
+                    "real TUN gate: missing IPv4 policy rule at preference {preference}\n{rules}"
+                )
+            });
+        assert!(
+            rule.contains("proto 201"),
+            "real TUN gate: rule {preference} is not protocol 201: {rule}"
+        );
+        assert!(
+            rule.contains(target),
+            "real TUN gate: rule {preference} does not select {target}: {rule}"
+        );
     }
+
+    let routes = required_command_output(
+        "ip",
+        &["-4", "route", "show", "table", "52"],
+        "real TUN gate table 52 routes",
+    );
+    let tailnet_route = routes.lines().find(|line| {
+        line.split_whitespace().next() == Some("100.64.0.0/10")
+            && line.contains(&format!("dev {}", tun.name))
+    });
+    assert!(
+        tailnet_route.is_some(),
+        "real TUN gate: table 52 is missing 100.64.0.0/10 via {}\n{routes}",
+        tun.name
+    );
 }
 
 /// Interop TUN: rustscale in TUN mode dials the Go node's serve echo via
@@ -5288,15 +5386,16 @@ async fn interop_tun_rust_dials_go() {
         .hostname(format!("rustscale-tun-dial-{uid}"))
         .auth_key(ienv.authkey.clone())
         .ephemeral(true)
+        .disable_portmapping(true)
         .build()
         .expect("build");
 
-    if Box::pin(up_tun_or_skip(&mut server, "interop_tun_rust_dials_go"))
-        .await
-        .is_none()
-    {
-        return;
-    }
+    let tun = Box::pin(up_tun_required(&mut server, "interop_tun_rust_dials_go")).await;
+
+    #[cfg(target_os = "linux")]
+    assert_linux_tun_kernel_state(&tun);
+    #[cfg(not(target_os = "linux"))]
+    let _ = tun;
 
     let status = server.status();
     log::debug!(
@@ -5370,12 +5469,7 @@ async fn interop_tun_go_dials_rust() {
         .build()
         .expect("build");
 
-    if Box::pin(up_tun_or_skip(&mut server, "interop_tun_go_dials_rust"))
-        .await
-        .is_none()
-    {
-        return;
-    }
+    Box::pin(up_tun_required(&mut server, "interop_tun_go_dials_rust")).await;
 
     let status = server.status();
     let rust_ip = status
@@ -5482,12 +5576,7 @@ async fn interop_tun_os_routes() {
         .build()
         .expect("build");
 
-    if Box::pin(up_tun_or_skip(&mut server, "interop_tun_os_routes"))
-        .await
-        .is_none()
-    {
-        return;
-    }
+    Box::pin(up_tun_required(&mut server, "interop_tun_os_routes")).await;
 
     let status = server.status();
     assert!(!status.tailscale_ips.is_empty(), "should have tailnet IPs");
@@ -5543,12 +5632,7 @@ async fn interop_tun_subnet_forward() {
         .build()
         .expect("build");
 
-    if Box::pin(up_tun_or_skip(&mut server, "interop_tun_subnet_forward"))
-        .await
-        .is_none()
-    {
-        return;
-    }
+    Box::pin(up_tun_required(&mut server, "interop_tun_subnet_forward")).await;
 
     wait_for_peer(
         &server,

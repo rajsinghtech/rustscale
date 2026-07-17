@@ -212,12 +212,16 @@ crates deferred.
 
 ## Cross-client interop verification
 
-`tools/interop.sh` runs 8 userspace e2e tests + `tools/interop-tun.sh` runs
-4 TUN-mode e2e tests against real Go tailscaled (1.98.8) on ephemeral
-tailnets: dial both directions, MagicDNS name resolution, WhoIs identity,
-direct path (disco vs Go magicsock), pinned-DERP relay, DERP→direct upgrade
-without byte loss, subnet route accept, OS routes, subnet forwarding. All
-green. CI: interop + interop-tun jobs in e2e.yml.
+`tools/interop.sh` runs 8 userspace e2e tests against real Go tailscaled
+(1.98.8) on ephemeral tailnets: dial both directions, MagicDNS name
+resolution, WhoIs identity, direct path (disco vs Go magicsock), pinned-DERP
+relay, DERP→direct upgrade without byte loss, and subnet route accept. The
+separate `tools/interop-tun.sh` CI path runs one exact serial Linux privileged
+regression test: fail-closed `up_tun`, real interface/rule/table-52 assertions,
+and an OS-socket echo roundtrip through the packet pump. Additional ignored TUN
+tests retain inbound and subnet-forwarding coverage for explicit manual runs.
+CI: interop + interop-tun jobs in e2e.yml. Installed systemd/artifact TUN
+acceptance remains deferred as documented in `docs/release-first-run.md`.
 
 ## CLI (`cmd/tailscale` equivalent)
 

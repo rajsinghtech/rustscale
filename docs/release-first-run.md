@@ -29,6 +29,48 @@ The gate intentionally depends on these product contracts and does not implement
 - `LoginInteractive` acknowledgement must be retained when it arrives before bootstrap begins waiting for it, so the deliberately early acknowledgement in the harness cannot be lost.
 - A daemon restart with persisted authorized state must restore the profile to `Running` without requiring another `up` or interactive login.
 
+## Real Linux TUN regression gate
+
+The installed-first-run gate above remains credential-free and does not open a
+TUN device. Separately, the trusted-repository `interop-tun` job in
+`.github/workflows/e2e.yml` runs on master pushes or an explicit manual
+dispatch. It is the narrow privileged regression gate for real Linux TUN
+startup.
+
+Before minting a Tailscale OIDC token or provisioning an ephemeral tailnet, the
+job runs `tools/interop-tun-preflight.sh`. That credential-free preflight proves
+the runner has passwordless root, `/dev/net/tun`, iproute2, and permission to
+create, set the MTU on, and bring up a temporary TUN interface. The supported
+harness repeats the preflight before its first tailnet API call, so local runs
+also fail before consuming credentials when the host cannot exercise the gate.
+
+After those prerequisites are established, the harness runs exactly
+`tests::interop_tun_rust_dials_go` serially. `up_tun` errors are fatal at that
+point. On Linux the test requires the Rust-created `tun0` to have a nonzero
+ifindex, `IFF_UP`, MTU 1280, the four interface-derived IPv4 policy rules with
+protocol 201 (including the table-52 rule), and the `100.64.0.0/10` route in
+table 52 through `tun0`. A TCP echo roundtrip to Go tailscaled then proves an OS
+socket packet traverses the kernel TUN, RustScale's packet pump and WireGuard
+path, and returns.
+
+This credentialed job is deliberately not part of ordinary local or pull
+request validation. It uses only short-lived OIDC and an ephemeral tailnet with
+unconditional teardown; run it locally only when explicitly supplying the
+documented disposable tailnet credentials.
+
+### Remaining systemd and artifact gaps
+
+This narrow gate invokes `Server::up_tun` from a source-built Rust test binary.
+It does not install a release archive, start `packaging/systemd/rustscaled.service`
+as PID 1 would, exercise systemd restart/ordering in a private network
+namespace, or prove that a published archive or container preserves the same
+TUN behavior. The credential-free first-run gate covers installed CLI/daemon,
+operator, persistence, restart, logout, and uninstall contracts, but starts the
+daemon without `--tun`. A future release gate should combine the exact packaged
+artifacts with a systemd-capable Linux namespace or disposable VM and repeat the
+kernel assertions and packet proof without weakening either gate's credential
+boundary.
+
 
 ## Protected real-control smoke gate (manual only)
 

@@ -1904,7 +1904,15 @@ rs_parity_measure() {
   fi
   identity=$([[ "$transport" == kernel-tcp ]] && echo kernel-tcp || echo userspace)
   RS_PARITY_FAILURE_LOG=/tmp/rs-parity-warmup.log
-  warmup_json=$(ssh_cmd "$CVM" "$CZONE" "prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscale-bench client --transport $identity $auth_args --target $server_ip:$PORT --duration 3 --parallel 1 --direction down --hostname $CHOST-warmup --state-dir /tmp/rs-parity-warmup --json 2>/tmp/rs-parity-warmup.log") || return 1
+  local trial_attempt
+  warmup_json=""
+  for trial_attempt in 1 2 3; do
+    warmup_json=$(ssh_cmd "$CVM" "$CZONE" "prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscale-bench client --transport $identity $auth_args --target $server_ip:$PORT --duration 3 --parallel 1 --direction down --hostname $CHOST-warmup-$trial_attempt --state-dir /tmp/rs-parity-warmup-$trial_attempt --json 2>/tmp/rs-parity-warmup.log") && break
+    echo "[gcp] parity warmup retry $trial_attempt/3" >&2
+    sleep 5
+    warmup_json=""
+  done
+  [[ -n "$warmup_json" ]] || return 1
   path_class=$(printf '%s' "$warmup_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["transport"]==sys.argv[1] and d["protocol"]=="RSB1" and d["direction"]=="down" and d["parallel"]==1; print(d["path_class"])' "$transport") || return 1
   [[ "$transport" == kernel-tcp ]] && path_class="$gated_path"
   [[ "$PATH_TAG" == direct && "$path_class" == direct || "$PATH_TAG" == derp && "$path_class" == derp ]] || { echo "[gcp] parity warmup observed wrong path: $path_class" >&2; return 1; }
@@ -1919,14 +1927,28 @@ rs_parity_measure() {
     local -a samples=()
     for ((sample_index=1; sample_index<=REPEAT; sample_index++)); do
       RS_PARITY_FAILURE_LOG=/tmp/rs-parity-$N-$sample_index.log
-      sample_json=$(ssh_cmd "$CVM" "$CZONE" "prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscale-bench client --transport $identity $auth_args --target $server_ip:$PORT --duration $DURATION --parallel $N --direction down --hostname $CHOST-$N-$sample_index --state-dir /tmp/rs-parity-$N-$sample_index --json 2>/tmp/rs-parity-$N-$sample_index.log") || return 1
+      sample_json=""
+      for trial_attempt in 1 2 3; do
+        sample_json=$(ssh_cmd "$CVM" "$CZONE" "prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscale-bench client --transport $identity $auth_args --target $server_ip:$PORT --duration $DURATION --parallel $N --direction down --hostname $CHOST-$N-$sample_index-$trial_attempt --state-dir /tmp/rs-parity-$N-$sample_index-$trial_attempt --json 2>/tmp/rs-parity-$N-$sample_index.log") && break
+        echo "[gcp] parity N=$N sample=$sample_index retry $trial_attempt/3" >&2
+        sleep 5
+        sample_json=""
+      done
+      [[ -n "$sample_json" ]] || return 1
       mbps=$(printf '%s' "$sample_json" | python3 -c 'import json,math,sys; d=json.load(sys.stdin); transport,parallel,expected=sys.argv[1],int(sys.argv[2]),sys.argv[3]; assert d["transport"]==transport and d["protocol"]=="RSB1" and d["direction"]=="down" and d["parallel"]==parallel and d["established"]==parallel and d["handshaken"]==parallel and d["completed"]==parallel; assert transport=="kernel-tcp" or d["path_class"]==expected; v=float(d["total_mbps"]); assert math.isfinite(v) and v>0; print(repr(v))' "$transport" "$N" "$PATH_TAG") || return 1
       samples+=("$mbps"); sample_number=$((sample_number+1)); (( sample_number == total_samples )) || sleep 3
     done
     tp_json=$(append_tun_throughput_row "$tp_json" "$N" "$DURATION" "${samples[@]}") || return 1
   done
   RS_PARITY_FAILURE_LOG=/tmp/rs-parity-lat.log
-  lat_json=$(ssh_cmd "$CVM" "$CZONE" "prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscale-bench latency --transport $identity $auth_args --target $server_ip:$PORT --count $LATENCY_COUNT --hostname $CHOST-lat --state-dir /tmp/rs-parity-lat --json 2>/tmp/rs-parity-lat.log") || return 1
+  lat_json=""
+  for trial_attempt in 1 2 3; do
+    lat_json=$(ssh_cmd "$CVM" "$CZONE" "prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscale-bench latency --transport $identity $auth_args --target $server_ip:$PORT --count $LATENCY_COUNT --hostname $CHOST-lat-$trial_attempt --state-dir /tmp/rs-parity-lat-$trial_attempt --json 2>/tmp/rs-parity-lat.log") && break
+    echo "[gcp] parity latency retry $trial_attempt/3" >&2
+    sleep 5
+    lat_json=""
+  done
+  [[ -n "$lat_json" ]] || return 1
   lat_json=$(printf '%s' "$lat_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); transport,n,expected=sys.argv[1],int(sys.argv[2]),sys.argv[3]; assert d["transport"]==transport and d["protocol"]=="RSB1-tcp-pingpong" and d["requested"]==n and d["successful"]==n and d["timed_out"]==0 and d["malformed"]==0 and len(d["samples_ns"])==n; assert transport=="kernel-tcp" or d["path_class"]==expected; print(json.dumps(d))' "$transport" "$LATENCY_COUNT" "$PATH_TAG") || return 1
   server_foot=$(remote_stop_footprint "$SVM" "$SZONE" /tmp/rs-parity-server.footprint)
   client_foot=$(remote_stop_footprint "$CVM" "$CZONE" /tmp/rs-parity-client.footprint)
@@ -1943,7 +1965,7 @@ scope = {"kind":"dynamic_process_set","includes_descendants":False,"includes_ker
 obj={"schema_version":4,"status":"ok","tool":"rustscale","mode":"userspace" if config=="rs-userspace" else "tun",
  "topology":topo,"path":requested_path,"config":config,"repeat":int(repeat),"parallelism_requested":[int(x) for x in parallels],
  "error":"","log_tail":"","path_class_reported":observed_path,"transport":transport,
- "workload":{"implementation":"rustscale-bench","protocol":"RSB1","direction":"down","payload_bytes":1280,"warmup":{"parallel":1,"duration_s":3},"client_lifecycle":"new_ephemeral_identity_per_trial","latency_protocol":"RSB1-tcp-pingpong","latency_payload_bytes":8,"userspace_portmapping":"disabled"},
+ "workload":{"implementation":"rustscale-bench","protocol":"RSB1","direction":"down","payload_bytes":1280,"warmup":{"parallel":1,"duration_s":3},"client_lifecycle":"new_ephemeral_identity_per_trial","trial_max_attempts":3,"latency_protocol":"RSB1-tcp-pingpong","latency_payload_bytes":8,"userspace_portmapping":"disabled"},
  "throughput":json.loads(tp),"latency":json.loads(lat),
  "resources":{"phase_set":["measured_client_process_lifecycle","inter_trial_gap"],"sample_cadence_ms":1000,"server":dict(server,endpoint="server",subjects=subjects,scope=scope),"client":dict(client,endpoint="client",subjects=subjects,scope=scope)},
  "footprint":dict(server,binary_size_bytes=int(size),subject="rustscale-bench",endpoint="server",scope=scope),

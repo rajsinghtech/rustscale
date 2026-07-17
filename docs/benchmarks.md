@@ -150,7 +150,9 @@ the same measured-client-process-lifecycle boundary for both RustScale modes,
 including transport setup inherent in each fresh client command and the common
 inter-trial gaps. Userspace commands use a fresh ephemeral identity per trial;
 this avoids reusing a closed tsnet engine while ensuring the control plane can
-remove each trial node after disconnect. Samples are not attributed to a
+remove each trial node after disconnect. Each requested sample has at most three
+transport attempts; only the first complete positive sample is retained, and a
+sample with three failed attempts fails the whole cell. Samples are not attributed to a
 particular stream point or peer effect. Missing files, empty series, or no observed process sample fail
 the cell rather than becoming zero. Failed cells remain null and are never
 resource rows.

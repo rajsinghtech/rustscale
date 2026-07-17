@@ -3677,6 +3677,7 @@ dependencies = [
  "log",
  "rustscale-conffile",
  "rustscale-ipn",
+ "rustscale-localclient",
  "rustscale-logpolicy",
  "rustscale-logtail",
  "rustscale-safesocket",

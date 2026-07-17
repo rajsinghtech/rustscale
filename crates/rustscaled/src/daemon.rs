@@ -361,6 +361,121 @@ where
     }
 }
 
+enum BringUpEvent {
+    Running,
+    Command(Option<DaemonCommand>),
+    Shutdown,
+}
+
+/// Poll one startup generation while retaining the sole mutable `Server`
+/// owner in this task. Returning `Command` drops the in-flight `up*` future,
+/// which transfers partial bootstrap/startup ownership to tsnet's rollback
+/// supervisors. The next `up*` joins those supervisors before bootstrapping.
+async fn bring_up_until_event<S>(
+    server: &mut Server,
+    tun: bool,
+    command_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DaemonCommand>,
+    mut shutdown: std::pin::Pin<&mut S>,
+) -> Result<BringUpEvent, TsnetError>
+where
+    S: std::future::Future<Output = ()> + ?Sized,
+{
+    let startup = async {
+        if tun {
+            let config = TunModeConfig {
+                apply_routes: true,
+                ..Default::default()
+            };
+            Box::pin(server.up_tun(config)).await.map(|_| ())
+        } else {
+            Box::pin(server.up()).await.map(|_| ())
+        }
+    };
+    tokio::select! {
+        result = startup => result.map(|()| BringUpEvent::Running),
+        command = command_rx.recv() => Ok(BringUpEvent::Command(command)),
+        () = shutdown.as_mut() => Ok(BringUpEvent::Shutdown),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LoginLoopOutcome {
+    Running,
+    Shutdown,
+    CommandsClosed,
+}
+
+/// Admit pre-login lifecycle commands and let the newest Start or interactive
+/// login supersede an older pending startup. Each supersession drops exactly
+/// one borrowed startup future; `Server` itself never leaves this owner.
+async fn drive_login_until_running<S>(
+    server: &mut Server,
+    command_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DaemonCommand>,
+    tun: bool,
+    config_path: Option<&PathBuf>,
+    mut shutdown: std::pin::Pin<&mut S>,
+) -> Result<LoginLoopOutcome, TsnetError>
+where
+    S: std::future::Future<Output = ()> + ?Sized,
+{
+    let mut pending_command = None;
+    loop {
+        let command = if let Some(command) = pending_command.take() {
+            Some(command)
+        } else {
+            tokio::select! {
+                command = command_rx.recv() => command,
+                () = shutdown.as_mut() => return Ok(LoginLoopOutcome::Shutdown),
+            }
+        };
+        let Some(command) = command else {
+            return Ok(LoginLoopOutcome::CommandsClosed);
+        };
+
+        match command {
+            DaemonCommand::Start { auth_key } => {
+                // StartOptions.AuthKey is an intent for this generation, not
+                // sticky daemon configuration. Clearing on None also prevents
+                // a cancelled auth-key generation from winning a later
+                // interactive/no-auth request.
+                server.clear_auth_key();
+                if let Some(key) = auth_key {
+                    server.set_auth_key(key);
+                }
+            }
+            DaemonCommand::LoginInteractive => {
+                server.clear_auth_key();
+            }
+            DaemonCommand::Logout => {
+                server.fail_pending_logout_requests("server is not logged in");
+                continue;
+            }
+            DaemonCommand::Shutdown => return Ok(LoginLoopOutcome::Shutdown),
+            DaemonCommand::ReloadConfig => {
+                if let Some(path) = config_path {
+                    if let Err(error) = server.reload_config(path.to_str().unwrap_or("")).await {
+                        log::warn!("rustscaled: config reload failed: {error}");
+                    }
+                }
+                continue;
+            }
+            DaemonCommand::SwitchProfile(id) => {
+                if let Err(error) = server.switch_profile(&id).await {
+                    log::warn!("rustscaled: profile switch failed: {error}");
+                    continue;
+                }
+                return Ok(LoginLoopOutcome::Running);
+            }
+        }
+
+        match bring_up_until_event(server, tun, command_rx, shutdown.as_mut()).await? {
+            BringUpEvent::Running => return Ok(LoginLoopOutcome::Running),
+            BringUpEvent::Command(command) => pending_command = command,
+            BringUpEvent::Shutdown => return Ok(LoginLoopOutcome::Shutdown),
+        }
+    }
+}
+
 async fn run_interactive(
     state_dir: &Path,
     hostname: &str,
@@ -432,77 +547,33 @@ async fn run_interactive(
     }
 
     // Phase 1: wait for Start/LoginInteractive to bring a fresh or logged-out
-    // profile up. The loop form also handles a closed command channel after
-    // the automatic-resume decision above.
-    while !is_up {
-        let cmd = tokio::select! {
-            command = command_rx.recv() => command,
-            () = shutdown.as_mut() => {
+    // profile up. A newer lifecycle intent cancels and supersedes an admitted
+    // startup without moving the sole mutable Server into a detached task.
+    if !is_up {
+        match drive_login_until_running(
+            &mut server,
+            &mut command_rx,
+            tun,
+            config_path.as_ref(),
+            shutdown.as_mut(),
+        )
+        .await?
+        {
+            LoginLoopOutcome::Running => {
+                if tun {
+                    log::info!("rustscaled: TUN mode up (hostname={hostname})");
+                } else {
+                    log::info!("rustscaled: up (hostname={hostname})");
+                }
+                print_status(&server, socket_path);
+                is_up = true;
+            }
+            LoginLoopOutcome::Shutdown => {
                 log::info!("rustscaled: shutdown while waiting for login");
                 close_server(&mut server).await?;
                 return Ok(());
             }
-        };
-        let Some(cmd) = cmd else {
-            break;
-        };
-        match cmd {
-            DaemonCommand::Start { auth_key } => {
-                if let Some(key) = auth_key {
-                    server.set_auth_key(key);
-                }
-                if !bring_up_until_shutdown(&mut server, tun, shutdown.as_mut()).await? {
-                    log::info!("rustscaled: shutdown interrupted startup");
-                    close_server(&mut server).await?;
-                    return Ok(());
-                }
-                if tun {
-                    log::info!("rustscaled: TUN mode up (hostname={hostname})");
-                } else {
-                    log::info!("rustscaled: up (hostname={hostname})");
-                }
-                print_status(&server, socket_path);
-                is_up = true;
-                break;
-            }
-            DaemonCommand::LoginInteractive => {
-                if !bring_up_until_shutdown(&mut server, tun, shutdown.as_mut()).await? {
-                    log::info!("rustscaled: shutdown interrupted interactive startup");
-                    close_server(&mut server).await?;
-                    return Ok(());
-                }
-                if tun {
-                    log::info!("rustscaled: TUN mode up (hostname={hostname})");
-                } else {
-                    log::info!("rustscaled: up (hostname={hostname})");
-                }
-                print_status(&server, socket_path);
-                is_up = true;
-                break;
-            }
-            DaemonCommand::Logout => {
-                log::info!("rustscaled: logout requested (server not up yet)");
-                server.fail_pending_logout_requests("server is not logged in");
-            }
-            DaemonCommand::Shutdown => {
-                log::debug!("rustscaled: shutdown requested (server not up yet)");
-                close_server(&mut server).await?;
-                return Ok(());
-            }
-            DaemonCommand::ReloadConfig => {
-                log::debug!("rustscaled: reload-config requested (server not up yet)");
-            }
-            DaemonCommand::SwitchProfile(id) => {
-                log::info!("rustscaled: switching to profile {id}");
-                if let Err(e) = server.switch_profile(&id).await {
-                    log::warn!("rustscaled: profile switch failed: {e}");
-                } else {
-                    log::info!("rustscaled: up (hostname={hostname})");
-                    print_status(&server, socket_path);
-                    is_up = true;
-                    break;
-                }
-            }
+            LoginLoopOutcome::CommandsClosed => {}
         }
     }
 
@@ -820,10 +891,76 @@ mod tests {
     use rustscale_tsnet::PreferencePolicy;
 
     use super::{
-        is_only_unconfirmed_external_portmap_release, retry_close, retry_logout_until_shutdown,
-        should_resume_persisted_node, CloseRunner, InstallUpdatesPolicy, LogoutRunner,
-        UNCONFIRMED_EXTERNAL_PORTMAP_RELEASE,
+        drive_login_until_running, is_only_unconfirmed_external_portmap_release, retry_close,
+        retry_logout_until_shutdown, should_resume_persisted_node, CloseRunner,
+        InstallUpdatesPolicy, LoginLoopOutcome, LogoutRunner, UNCONFIRMED_EXTERNAL_PORTMAP_RELEASE,
     };
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn auth_key_start_supersedes_abandoned_no_auth_generation() {
+        let mut control = rustscale_testcontrol::Server::new();
+        control.set_require_auth(true);
+        control.start().await.unwrap();
+
+        let state_dir = tempfile::tempdir().unwrap();
+        let socket = state_dir.path().join("supersede.sock");
+        let mut server = rustscale_tsnet::Server::builder()
+            .hostname("start-supersession")
+            .control_url(control.base_url())
+            .state_dir(state_dir.path())
+            .localapi_path(&socket)
+            .disable_portmapping(true)
+            .build()
+            .unwrap();
+        let mut commands = server.start_localapi_only().await.unwrap();
+        let client = rustscale_localclient::LocalClient::new(&socket);
+        let mut shutdown = Box::pin(std::future::pending::<()>());
+
+        let requests = async {
+            client
+                .start(&rustscale_ipn::StartOptions::default())
+                .await
+                .expect("admit no-auth Start");
+            let stale_auth_url = control
+                .await_auth_url(Duration::from_secs(5))
+                .await
+                .expect("no-auth generation did not reach interactive auth");
+
+            // Leave the interactive URL abandoned. The newer auth-key intent
+            // must cancel that generation and reach Running without it.
+            control.set_require_auth(false);
+            client
+                .start(&rustscale_ipn::StartOptions {
+                    AuthKey: "tskey-test-superseding-secret".into(),
+                    ..Default::default()
+                })
+                .await
+                .expect("admit auth-key Start");
+            stale_auth_url
+        };
+        let drive =
+            drive_login_until_running(&mut server, &mut commands, false, None, shutdown.as_mut());
+        let (outcome, stale_auth_url) = tokio::time::timeout(Duration::from_secs(15), async {
+            tokio::join!(drive, requests)
+        })
+        .await
+        .expect("auth-key supersession timed out");
+
+        assert_eq!(outcome.unwrap(), LoginLoopOutcome::Running);
+        assert!(server.status().up);
+        assert_eq!(
+            server.ipn_status().await.unwrap().BackendState,
+            "Running",
+            "abandoned interactive generation became authoritative"
+        );
+        assert_eq!(control.register_auth_presence(), [false, true]);
+        assert!(
+            !stale_auth_url.is_empty(),
+            "test did not retain the abandoned generation's intent"
+        );
+        server.close().await.unwrap();
+    }
 
     struct TransientClose {
         remaining_failures: usize,

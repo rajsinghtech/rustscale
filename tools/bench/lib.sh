@@ -127,10 +127,13 @@ bench_mint_authkey() {
       | jq -r .access_token)
   fi
   local key
+  # A full 5-point, 3-repeat userspace cell can exceed 15 minutes because each
+  # ephemeral identity performs control/path setup. Keep the key valid for the
+  # bounded matrix while retaining ephemeral nodes and deleting the tailnet.
   key=$(curl -fsS --retry 3 --retry-delay 3 --retry-all-errors \
     -X POST "$BENCH_API/api/v2/tailnet/$BENCH_DNS/keys" \
     -H "Authorization: Bearer $BENCH_CHILD_TOKEN" -H 'Content-Type: application/json' \
-    -d '{"capabilities":{"devices":{"create":{"reusable":true,"ephemeral":true,"preauthorized":true,"tags":["tag:e2e"]}}},"expirySeconds":900}' \
+    -d '{"capabilities":{"devices":{"create":{"reusable":true,"ephemeral":true,"preauthorized":true,"tags":["tag:e2e"]}}},"expirySeconds":7200}' \
     | jq -r .key)
   [[ -n "$key" && "$key" != null ]] || { echo "[bench] authkey mint failed" >&2; return 1; }
   echo "$key"

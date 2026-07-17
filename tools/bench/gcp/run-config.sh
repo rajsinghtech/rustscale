@@ -615,15 +615,23 @@ verify_ts_serve_rsb1() {
     "tailscale --socket=/tmp/ts-srv.sock serve status --json 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); tcp=d.get(\"TCP\",{}); entry=tcp.get(\"$PORT\", tcp.get($PORT, {})); text=json.dumps(entry,sort_keys=True); raise SystemExit(0 if \"127.0.0.1:$PORT\" in text else 1)'"
 }
 
+nofile_limit_gate_command() {
+  local pidfile="$1"
+  [[ "$pidfile" =~ ^/tmp/[A-Za-z0-9.-]+\.pid$ ]] || return 2
+  printf 'pid=$(cat %s); set -- $(grep "^Max open files" /proc/$pid/limits); [[ "$4" =~ ^[0-9]+$ && "$5" =~ ^[0-9]+$ && "$4" -ge 65535 && "$5" -ge 65535 ]]' "$pidfile"
+}
+
 # Start and verify the loopback-only SOCKS5 bridge. Every forked socat child is
 # included by exact process name in the client resource process set.
 start_ts_userspace_bridge() {
+  local server_ip="$1"
+  [[ "$server_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 2
   ssh_cmd "$CVM" "$CZONE" \
-    "pkill -x socat 2>/dev/null || true; rm -f /tmp/socat.{pid,log}; nohup prlimit --nofile=65535:65535 -- socat TCP4-LISTEN:5300,bind=127.0.0.1,reuseaddr,fork,nodelay SOCKS5-CONNECT:127.0.0.1:$1:$PORT,socksport=11080,nodelay >/tmp/socat.log 2>&1 & echo \$! >/tmp/socat.pid" || return 1
+    "pkill -x socat 2>/dev/null || true; rm -f /tmp/socat.{pid,log}; nohup prlimit --nofile=65535:65535 -- socat TCP4-LISTEN:5300,bind=127.0.0.1,reuseaddr,fork,nodelay SOCKS5-CONNECT:127.0.0.1:11080:$server_ip:$PORT,nodelay >/tmp/socat.log 2>&1 & echo \$! >/tmp/socat.pid" || return 1
   local elapsed=0
   while (( elapsed < 30 )); do
     if ssh_cmd "$CVM" "$CZONE" \
-      'pid=$(cat /tmp/socat.pid 2>/dev/null); kill -0 "$pid" 2>/dev/null && awk '\''/Max open files/ {exit !($4 >= 65535 && $5 >= 65535)}'\'' /proc/$pid/limits && ss -H -ltn '\''sport = :5300'\'' | grep -Eq '\''^[^ ]+[[:space:]]+[^ ]+[[:space:]]+127\.0\.0\.1:5300([[:space:]]|$)'\'' && ! ss -H -ltn '\''sport = :5300'\'' | grep -Eq '\''(0\.0\.0\.0|\[::\]):5300'\''' \
+      'pid=$(cat /tmp/socat.pid 2>/dev/null); kill -0 "$pid" 2>/dev/null && awk '\''/Max open files/ {exit !($4 >= 65535 && $5 >= 65535)}'\'' /proc/$pid/limits && ss -H -ltn '\''sport = :5300'\'' | grep -Eq '\''^[^ ]+[[:space:]]+[^ ]+[[:space:]]+[^ ]+[[:space:]]+127\.0\.0\.1:5300([[:space:]]|$)'\'' && ! ss -H -ltn '\''sport = :5300'\'' | grep -Eq '\''(0\.0\.0\.0|\[::\]):5300'\''' \
       >/dev/null 2>&1; then
       return 0
     fi
@@ -634,7 +642,8 @@ start_ts_userspace_bridge() {
 }
 
 command_shape_self_test() {
-  local ts_direct rs_direct ts_derp rs_derp rs_server_off rs_client_off rs_server_on rs_client_on rs_server_outbound rs_server_scalar rs_server_plain rs_server_gso_off rs_userspace_server rs_userspace_client
+  local ts_direct rs_direct ts_derp rs_derp nofile_gate bridge_calls bridge_definition
+  local rs_server_off rs_client_off rs_server_on rs_client_on rs_server_outbound rs_server_scalar rs_server_plain rs_server_gso_off rs_userspace_server rs_userspace_client
   ts_direct=$(tun_ping_invocation tailscale /tmp/ts.sock direct 100.64.0.1)
   rs_direct=$(tun_ping_invocation /opt/rustscale/target/release/rustscale /tmp/rs.sock direct 100.64.0.1)
   ts_derp=$(tun_ping_invocation tailscale /tmp/ts.sock derp 100.64.0.1)
@@ -647,6 +656,21 @@ command_shape_self_test() {
   [[ "${ts_derp#* ping }" == "${rs_derp#* ping }" ]] || return 1
   [[ "$(tun_path_gate_command "$ts_direct" direct)" == "timeout --kill-after=5s 180s $ts_direct" ]] || return 1
   [[ "$(tun_path_gate_command "$rs_direct" direct)" == "timeout --kill-after=5s 180s $rs_direct" ]] || return 1
+  nofile_gate=$(nofile_limit_gate_command /tmp/ts-tun-srv.pid) || return 1
+  [[ "$nofile_gate" == *'/proc/$pid/limits'* && "$nofile_gate" == *'"$4" -ge 65535'* \
+    && "$nofile_gate" != *"'"* ]] || return 1
+  bash -n <<<"$(ssh_sudo_remote_command "$nofile_gate")" || return 1
+  if nofile_limit_gate_command '/tmp/bad;id.pid' >/dev/null 2>&1; then return 1; fi
+  bridge_calls=$(
+    ssh_cmd() { printf '%s\n' "$3"; }
+    sleep() { :; }
+    start_ts_userspace_bridge 100.64.0.1
+  ) || return 1
+  bridge_definition=$(declare -f start_ts_userspace_bridge)
+  [[ "$bridge_calls" == *'SOCKS5-CONNECT:127.0.0.1:11080:100.64.0.1:5201,nodelay'* \
+    && "$bridge_calls" != *'socksport='* \
+    && "$bridge_definition" == *'[^ ]+[[:space:]]+[^ ]+[[:space:]]+[^ ]+[[:space:]]+127\.0\.0\.1:5300'* ]] || return 1
+  if start_ts_userspace_bridge '100.64.0.1;id' >/dev/null 2>&1; then return 1; fi
   rs_server_off=$(rs_tun_daemon_start_command 0 1 1 tskey-auth-selftest /tmp/srv /tmp/srv.sock srv /tmp/srv.log /tmp/srv.pid)
   rs_client_off=$(rs_tun_daemon_start_command 0 1 1 tskey-auth-selftest /tmp/cli /tmp/cli.sock cli /tmp/cli.log /tmp/cli.pid)
   [[ "$rs_server_off" != *RUSTSCALE_TUN_INBOUND_PIPELINE* && "$rs_client_off" != *RUSTSCALE_TUN_INBOUND_PIPELINE* ]] || return 1
@@ -2590,8 +2614,8 @@ run_ts_userspace() {
     fail_userspace_config cleanup_ts_userspace "ts-specific-peer-not-online" "$(capture_log_tail "$CVM" "$CZONE" /tmp/ts-cli.log)"
     return 1
   fi
-  if ! ssh_cmd "$SVM" "$SZONE" 'pid=$(cat /tmp/ts-srv.pid); awk '\''/Max open files/ {exit !($4 >= 65535 && $5 >= 65535)}'\'' /proc/$pid/limits' \
-      || ! ssh_cmd "$CVM" "$CZONE" 'pid=$(cat /tmp/ts-cli.pid); awk '\''/Max open files/ {exit !($4 >= 65535 && $5 >= 65535)}'\'' /proc/$pid/limits'; then
+  if ! ssh_cmd "$SVM" "$SZONE" "$(nofile_limit_gate_command /tmp/ts-srv.pid)" \
+      || ! ssh_cmd "$CVM" "$CZONE" "$(nofile_limit_gate_command /tmp/ts-cli.pid)"; then
     fail_userspace_config cleanup_ts_userspace "ts-userspace-nofile-limit-too-low"
     return 1
   fi
@@ -2715,8 +2739,8 @@ run_ts_tun() {
     cleanup_ts_tun
     return 1
   fi
-  if ! ssh_sudo "$SVM" "$SZONE" 'pid=$(cat /tmp/ts-tun-srv.pid); awk '\''/Max open files/ {exit !($4 >= 65535 && $5 >= 65535)}'\'' /proc/$pid/limits' \
-      || ! ssh_sudo "$CVM" "$CZONE" 'pid=$(cat /tmp/ts-tun-cli.pid); awk '\''/Max open files/ {exit !($4 >= 65535 && $5 >= 65535)}'\'' /proc/$pid/limits'; then
+  if ! ssh_sudo "$SVM" "$SZONE" "$(nofile_limit_gate_command /tmp/ts-tun-srv.pid)" \
+      || ! ssh_sudo "$CVM" "$CZONE" "$(nofile_limit_gate_command /tmp/ts-tun-cli.pid)"; then
     emit_stub "ts-tun-nofile-limit-too-low"
     cleanup_ts_tun
     return 1

@@ -793,16 +793,17 @@ start_rs_tun_transport_cleanup() {
 }
 
 wait_rs_tun_transport_cleanup() {
-  local vm="$1" zone="$2" role="$3" script log status_file result="" elapsed=0
+  local vm="$1" zone="$2" role="$3" script log status_file result="" attempt
   script=$(rs_tun_transport_cleanup_path "$role" sh) || return $?
   log=$(rs_tun_transport_cleanup_path "$role" log) || return $?
   status_file=$(rs_tun_transport_cleanup_path "$role" status) || return $?
-  while (( elapsed < 90 )); do
+  # ssh_cmd already makes three bounded transport attempts. Cap this outer
+  # handoff loop as well so a stale policy rule cannot multiply into hours.
+  for attempt in 1 2 3; do
     if result=$(ssh_sudo "$vm" "$zone" "test -f $status_file && cat $status_file" 2>/dev/null); then
       break
     fi
     sleep 2
-    elapsed=$((elapsed + 2))
   done
   if [[ "$result" != 0 ]]; then
     echo "[gcp] rs-tun detached cleanup did not verify for $vm (status=${result:-unavailable})" >&2
@@ -923,11 +924,14 @@ profile_only_rs_tun_workload() {
 rs_tun_cleanup_command() {
   local role="$1"
   printf '%s\n' "pidfile=/tmp/rs-tun-${role}.pid" \
+'network_state_clear() {' \
+'  ! ip -4 rule show | grep -Eq "(^|[[:space:]])proto 201([[:space:]]|$)" && ! ip -6 rule show | grep -Eq "(^|[[:space:]])proto 201([[:space:]]|$)" && ! ip -4 route show table 52 2>/dev/null | grep -q . && ! ip -6 route show table 52 2>/dev/null | grep -q .' \
+'}' \
 'is_clear() {' \
-'  ! pgrep -x rustscaled >/dev/null 2>&1 && ! ip link show dev tailscale0 >/dev/null 2>&1' \
+'  ! pgrep -x rustscaled >/dev/null 2>&1 && ! ip link show dev tailscale0 >/dev/null 2>&1 && network_state_clear' \
 '}' \
 'wait_for_clear() {' \
-'  local elapsed=0 timeout=10' \
+'  local elapsed=0 timeout=30' \
 '  while (( elapsed < timeout )); do' \
 '    is_clear && return 0' \
 '    sleep 1' \
@@ -936,10 +940,14 @@ rs_tun_cleanup_command() {
 '  is_clear' \
 '}' \
 'diagnose() {' \
-'  echo "[gcp] rs-tun cleanup diagnostics: rustscaled processes and tailscale0 ownership" >&2' \
+'  echo "[gcp] rs-tun cleanup diagnostics: rustscaled processes, tailscale0, and protocol-201 routing" >&2' \
 '  pgrep -a -x rustscaled >&2 || true' \
 '  ps -eo pid,ppid,user,stat,comm,args | grep "[r]ustscaled" >&2 || true' \
 '  ip -d link show dev tailscale0 >&2 || true' \
+'  ip -4 rule show >&2 || true' \
+'  ip -6 rule show >&2 || true' \
+'  ip -4 route show table 52 >&2 || true' \
+'  ip -6 route show table 52 >&2 || true' \
 '  ls -l /sys/class/net/tailscale0 >&2 || true' \
 '  fuser -v /dev/net/tun >&2 || true' \
 '}' \
@@ -958,12 +966,19 @@ rs_tun_cleanup_command() {
 'if wait_for_clear; then exit 0; fi' \
 'diagnose' \
 'signal_daemons KILL' \
-'# A crashed daemon can leave a persistent TUN link. Once every daemon has' \
-'# been signaled, explicitly remove that benchmark-owned interface.' \
+'# A killed daemon cannot retire its emergency unreachable rule. These VMs' \
+'# are dedicated to this benchmark, and protocol 201 plus table 52 are the' \
+'# exact RustScale routing state installed above. Remove all of it before the' \
+'# fresh-SSH postcondition is allowed to succeed.' \
 'ip link delete dev tailscale0 2>/dev/null || true' \
+'while ip -4 rule del protocol 201 2>/dev/null; do :; done' \
+'while ip -6 rule del protocol 201 2>/dev/null; do :; done' \
+'ip -4 route flush table 52 2>/dev/null || true' \
+'ip -6 route flush table 52 2>/dev/null || true' \
+'rm -rf /run/rustscale/rule-owners' \
 'if wait_for_clear; then exit 0; fi' \
 'diagnose' \
-'echo "[gcp] ERROR: rs-tun cleanup left rustscaled or tailscale0 behind" >&2' \
+'echo "[gcp] ERROR: rs-tun cleanup left daemon, TUN, or owned routing state behind" >&2' \
 'exit 1'
 }
 
@@ -1139,17 +1154,58 @@ cleanup_self_test() {
   # TUN device or GCP: TERM clears one state, KILL clears another, and the
   # final state must return failure.  `sleep` is a no-op to keep it fast.
   pgrep() {
-    [[ "$CLEANUP_TEST_PRESENT" == 1 ]]
+    [[ "$CLEANUP_TEST_DAEMON" == 1 ]]
   }
   ip() {
-    [[ "$CLEANUP_TEST_PRESENT" == 1 ]]
+    case "$*" in
+      'link show dev tailscale0'|'-d link show dev tailscale0')
+        [[ "$CLEANUP_TEST_LINK" == 1 ]] ;;
+      'link delete dev tailscale0')
+        CLEANUP_TEST_EVENTS+=' ip:link-delete'; CLEANUP_TEST_LINK=0 ;;
+      '-4 rule show')
+        [[ "$CLEANUP_TEST_RULES4" == 1 ]] && printf '5250: not from all fwmark 0x80000/0xff0000 unreachable proto 201\n'
+        return 0 ;;
+      '-6 rule show')
+        [[ "$CLEANUP_TEST_RULES6" == 1 ]] && printf '5250: not from all fwmark 0x80000/0xff0000 unreachable proto 201\n'
+        return 0 ;;
+      '-4 rule del protocol 201')
+        CLEANUP_TEST_EVENTS+=' ip:-4-rule-del'
+        [[ "$CLEANUP_TEST_RULES4" == 1 ]] || return 2
+        CLEANUP_TEST_RULES4=0 ;;
+      '-6 rule del protocol 201')
+        CLEANUP_TEST_EVENTS+=' ip:-6-rule-del'
+        [[ "$CLEANUP_TEST_RULES6" == 1 ]] || return 2
+        CLEANUP_TEST_RULES6=0 ;;
+      '-4 route show table 52')
+        [[ "$CLEANUP_TEST_ROUTES4" == 1 ]] && printf '100.64.0.0/10 dev tailscale0\n'
+        return 0 ;;
+      '-6 route show table 52')
+        [[ "$CLEANUP_TEST_ROUTES6" == 1 ]] && printf 'fd7a:115c:a1e0::/48 dev tailscale0\n'
+        return 0 ;;
+      '-4 route flush table 52')
+        CLEANUP_TEST_EVENTS+=' ip:-4-route-flush'; CLEANUP_TEST_ROUTES4=0 ;;
+      '-6 route flush table 52')
+        CLEANUP_TEST_EVENTS+=' ip:-6-route-flush'; CLEANUP_TEST_ROUTES6=0 ;;
+      *) return 0 ;;
+    esac
   }
   pkill() {
     CLEANUP_TEST_EVENTS+=" pkill:$1"
     case "$CLEANUP_TEST_STATE:$1" in
-      graceful:-TERM|forced:-KILL) CLEANUP_TEST_PRESENT=0 ;;
+      graceful:-TERM)
+        CLEANUP_TEST_DAEMON=0; CLEANUP_TEST_LINK=0
+        CLEANUP_TEST_RULES4=0; CLEANUP_TEST_RULES6=0
+        CLEANUP_TEST_ROUTES4=0; CLEANUP_TEST_ROUTES6=0 ;;
+      forced:-KILL) CLEANUP_TEST_DAEMON=0 ;;
     esac
     return 0
+  }
+  rm() {
+    if [[ "$*" == '-rf /run/rustscale/rule-owners' ]]; then
+      CLEANUP_TEST_EVENTS+=' rm:owner-state'
+      return 0
+    fi
+    command rm "$@"
   }
   sleep() { :; }
   ps() { :; }
@@ -1158,9 +1214,15 @@ cleanup_self_test() {
 
   for state in "${cases[@]}"; do
     CLEANUP_TEST_STATE="$state"
-    CLEANUP_TEST_PRESENT=1
+    CLEANUP_TEST_DAEMON=1; CLEANUP_TEST_LINK=1
+    CLEANUP_TEST_RULES4=1; CLEANUP_TEST_RULES6=1
+    CLEANUP_TEST_ROUTES4=1; CLEANUP_TEST_ROUTES6=1
     CLEANUP_TEST_EVENTS=""
-    [[ "$state" == absent ]] && CLEANUP_TEST_PRESENT=0
+    if [[ "$state" == absent ]]; then
+      CLEANUP_TEST_DAEMON=0; CLEANUP_TEST_LINK=0
+      CLEANUP_TEST_RULES4=0; CLEANUP_TEST_RULES6=0
+      CLEANUP_TEST_ROUTES4=0; CLEANUP_TEST_ROUTES6=0
+    fi
     command=$(rs_tun_cleanup_command self-test)
     command=${command//$'exit 0'/$'return 0'}
     command=${command//$'exit 1'/$'return 1'}
@@ -1175,10 +1237,14 @@ cleanup_self_test() {
         [[ "$result" == 0 && "$events" != *"pkill:-KILL"* ]] || return 1
         ;;
       forced)
-        [[ "$result" == 0 && "$events" == *"pkill:-KILL"* ]] || return 1
+        [[ "$result" == 0 && "$events" == *"pkill:-KILL"* \
+          && "$events" == *'ip:-4-rule-del'* && "$events" == *'ip:-6-rule-del'* \
+          && "$events" == *'ip:-4-route-flush'* && "$events" == *'ip:-6-route-flush'* \
+          && "$events" == *'rm:owner-state'* ]] || return 1
         ;;
       failure)
-        [[ "$result" == 1 && "$events" == *"pkill:-KILL"* ]] || return 1
+        [[ "$result" == 1 && "$events" == *"pkill:-KILL"* \
+          && "$events" == *'ip:-4-rule-del'* && "$events" == *'ip:-6-rule-del'* ]] || return 1
         ;;
     esac
   done
@@ -1191,7 +1257,9 @@ cleanup_self_test() {
   [[ "$detached_program" == *'status_file=/tmp/rs-tun-srv-cleanup.status'* \
     && "$detached_program" == *'trap '\''status=$?; printf "%s\n" "$status" >"$status_file"'\'' EXIT'* \
     && "$detached_program" == *$'sleep 2\npidfile=/tmp/rs-tun-srv.pid'* \
-    && "$detached_program" == *'ip link delete dev tailscale0'* ]] || return 1
+    && "$detached_program" == *'ip link delete dev tailscale0'* \
+    && "$detached_program" == *'while ip -4 rule del protocol 201'* \
+    && "$detached_program" == *'ip -6 route flush table 52'* ]] || return 1
   if rs_tun_transport_cleanup_program invalid >/dev/null 2>&1; then return 1; fi
   detached_launch=$(
     ssh_sudo() { printf '%s|%s|%s\n' "$1" "$2" "$3"; }
@@ -1311,7 +1379,7 @@ cleanup_self_test() {
   [[ "$(<"$injection_events")" == $'stub:injected-throughput-failure\ncleanup:rs-userspace\nnext-cell' ]] || return 1
   rm -f "$injection_events"
 
-  unset -f pgrep ip pkill sleep ps fuser test_remote_cleanup
+  unset -f pgrep ip pkill rm sleep ps fuser test_remote_cleanup
 }
 
 result_shape_self_test() {

@@ -1159,7 +1159,7 @@ impl TailnetLock {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) async fn local_disable_flight_retained(&self) -> bool {
         self.local_disable_flight.lock().await.is_some()
     }

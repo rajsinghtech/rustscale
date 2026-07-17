@@ -1598,7 +1598,9 @@ mod tests {
     use rustscale_ipn::Prefs;
     use rustscale_key::{DiscoPrivate, MachinePrivate, NLPrivate, NodePrivate};
     use rustscale_tailcfg::{PeerChange, TKAInfo};
-    use rustscale_tka::{disablement_kdf, Authority, FsChonk, Key, KeyKind, State};
+    use rustscale_tka::{disablement_kdf, Key, KeyKind};
+    #[cfg(unix)]
+    use rustscale_tka::{Authority, FsChonk, State};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct BlockRouter(Arc<AtomicUsize>);

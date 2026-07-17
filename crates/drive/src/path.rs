@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 /// Normalize a Taildrive share name using the upstream-compatible character
 /// set: ASCII letters/digits, `_`, spaces, and parentheses.
-pub(crate) fn normalize_share_name(name: &str) -> Result<String, PathError> {
+pub fn normalize_share_name(name: &str) -> Result<String, PathError> {
     let name = name.trim().to_ascii_lowercase();
     if name.is_empty() || name.len() > 255 {
         return Err(PathError::InvalidShareName);
@@ -100,6 +100,9 @@ fn hex(byte: u8) -> Option<u8> {
 }
 
 fn validate_component(component: &str) -> Result<(), PathError> {
+    if component.starts_with(".rustscale-taildrive-") {
+        return Err(PathError::UnsafeComponent);
+    }
     if component.is_empty() {
         return Err(PathError::EmptyComponent);
     }

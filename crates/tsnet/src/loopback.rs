@@ -88,8 +88,8 @@ impl std::fmt::Debug for LoopbackHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LoopbackHandle")
             .field("addr", &self.addr)
-            .field("proxy_cred", &self.proxy_cred)
-            .field("localapi_cred", &self.localapi_cred)
+            .field("proxy_cred", &"<redacted>")
+            .field("localapi_cred", &"<redacted>")
             .finish()
     }
 }
@@ -257,8 +257,13 @@ impl InMemoryLocalClient {
                     Ok(r) => r,
                     Err(_) => return,
                 };
-                let _ =
-                    localapi::dispatch(&mut server, &req, &state, &ConnIdentity::readwrite()).await;
+                let _ = localapi::dispatch(
+                    &mut server,
+                    &req,
+                    &state,
+                    &ConnIdentity::trusted_in_process(),
+                )
+                .await;
             }));
         }
 
@@ -679,6 +684,8 @@ async fn serve_loopback<D: super::socks5::SocksDialer + 'static>(
     cancel: Arc<socks5::CancelToken>,
 ) {
     let dialer = Arc::new(dialer);
+    let connection_admission = Arc::new(tokio::sync::Semaphore::new(64));
+    let localapi_admission = Arc::new(localapi::LocalApiAdmission::default());
     let mut children = tokio::task::JoinSet::new();
     loop {
         if cancel.is_cancelled() {
@@ -694,17 +701,25 @@ async fn serve_loopback<D: super::socks5::SocksDialer + 'static>(
             Err(_) => continue,
         };
 
+        let Ok(connection_permit) = connection_admission.clone().try_acquire_owned() else {
+            drop(stream);
+            continue;
+        };
         let d = Arc::clone(&dialer);
         let state = Arc::clone(&api_state);
         let proxy_cred = proxy_cred.clone();
         let localapi_cred = localapi_cred.clone();
+        let localapi_admission = localapi_admission.clone();
         children.spawn(async move {
+            let _connection_permit = connection_permit;
             // Sniff inside the owned child so an idle connection cannot block
             // acceptance or lifecycle cancellation.
             let mut peek_buf = [0u8; 1];
-            let n = match stream.read(&mut peek_buf).await {
-                Ok(n) => n,
-                Err(_) => return,
+            let n = match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut peek_buf))
+                .await
+            {
+                Ok(Ok(n)) => n,
+                Ok(Err(_)) | Err(_) => return,
             };
             if n == 0 {
                 return;
@@ -716,8 +731,24 @@ async fn serve_loopback<D: super::socks5::SocksDialer + 'static>(
                     log::debug!("loopback: socks5 connection ended: {e}");
                 }
             } else {
-                let prefixed = PrefixedStream::new(peek_buf[0], stream);
-                if let Err(e) = handle_localapi_http(prefixed, state, &localapi_cred).await {
+                let mut prefixed = PrefixedStream::new(peek_buf[0], stream);
+                let identity = ConnIdentity::readwrite();
+                let permit = match localapi_admission.try_admit(&identity, 0) {
+                    Ok(permit) => permit,
+                    Err(error) => {
+                        let _ = localapi::write_json_response(
+                            &mut prefixed,
+                            429,
+                            "Too Many Requests",
+                            &serde_json::json!({"error": error}),
+                        )
+                        .await;
+                        return;
+                    }
+                };
+                if let Err(e) =
+                    handle_localapi_http(prefixed, state, &localapi_cred, identity, permit).await
+                {
                     log::debug!("loopback: localapi connection ended: {e}");
                 }
             }
@@ -741,11 +772,13 @@ async fn handle_localapi_http(
     mut stream: PrefixedStream,
     state: Arc<LocalApiState>,
     expected_cred: &str,
+    identity: ConnIdentity,
+    mut admission: localapi::LocalApiAdmissionPermit,
 ) -> std::io::Result<()> {
-    // Read the full HTTP request. The first byte has already been
-    // consumed and is in the PrefixedStream.
-    let req = match localapi::read_request(&mut stream).await {
-        Ok(r) => r,
+    // Read only the bounded header. Authentication, route authorization, and
+    // body admission all happen before the first body byte is consumed.
+    let head = match localapi::read_request_head(&mut stream).await {
+        Ok(head) => head,
         Err(e) => {
             let body = serde_json::json!({"error": "bad request", "reason": e});
             let _ = localapi::write_json_response(&mut stream, 400, "Bad Request", &body).await;
@@ -754,7 +787,7 @@ async fn handle_localapi_http(
     };
 
     // Validate the Sec-Tailscale header.
-    let has_sec_header = req
+    let has_sec_header = head
         .headers
         .iter()
         .any(|(k, v)| k.eq_ignore_ascii_case("Sec-Tailscale") && v == "localapi");
@@ -763,7 +796,7 @@ async fn handle_localapi_http(
     let auth_ok = if expected_cred.is_empty() {
         true
     } else {
-        req.headers.iter().any(|(k, v)| {
+        head.headers.iter().any(|(k, v)| {
             if k.eq_ignore_ascii_case("Authorization") {
                 if let Some(encoded) = v.strip_prefix("Basic ") {
                     use base64::Engine;
@@ -784,7 +817,45 @@ async fn handle_localapi_http(
         return Ok(());
     }
 
-    localapi::dispatch(&mut stream, &req, &state, &ConnIdentity::readwrite())
+    let Some(max_body) =
+        localapi::authorize_request_head(&mut stream, &head, &state, &identity).await?
+    else {
+        return Ok(());
+    };
+    if head.content_length > max_body {
+        localapi::write_json_response(
+            &mut stream,
+            413,
+            "Content Too Large",
+            &serde_json::json!({"error": "LocalAPI request body too large"}),
+        )
+        .await?;
+        return Ok(());
+    }
+    if let Err(error) = admission.reserve_body(head.content_length) {
+        localapi::write_json_response(
+            &mut stream,
+            429,
+            "Too Many Requests",
+            &serde_json::json!({"error": error}),
+        )
+        .await?;
+        return Ok(());
+    }
+    let req = match localapi::read_request_body(&mut stream, head, max_body).await {
+        Ok(request) => request,
+        Err(error) => {
+            localapi::write_json_response(
+                &mut stream,
+                408,
+                "Request Timeout",
+                &serde_json::json!({"error": "request body rejected", "reason": error}),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    localapi::dispatch(&mut stream, &req, &state, &identity)
         .await
         .map_err(std::io::Error::other)
 }

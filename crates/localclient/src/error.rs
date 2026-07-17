@@ -31,6 +31,10 @@ pub enum LocalClientError {
     #[error("JSON decode error: {0}")]
     Json(String),
 
+    /// A bounded LocalAPI operation exceeded its command deadline.
+    #[error("Timeout: {0}")]
+    Timeout(String),
+
     /// I/O error (read/write on the socket).
     #[error("I/O error: {0}")]
     Io(String),

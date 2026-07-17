@@ -12,6 +12,8 @@ workspace = true
 [dependencies]
 cap-std = "4.0.2"
 cap-fs-ext = "4.0.2"
+rand_core = { workspace = true, features = ["getrandom"] }
+rustix = { version = "1", features = ["fs"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

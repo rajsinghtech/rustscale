@@ -98,6 +98,7 @@ const LOCK_SUBCOMMANDS: &[CommandSpec] = &[
     command("disable", &[], NONE),
 ];
 const DRIVE_SUBCOMMANDS: &[CommandSpec] = &[
+    command("status", &[], NONE),
     command("list", &[], NONE),
     command("share", &[], NONE),
     command("unshare", &[], NONE),

@@ -30,7 +30,6 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-#[cfg(unix)]
 use std::time::Duration;
 
 use rustscale_clientmetric::Registry as MetricRegistry;
@@ -54,6 +53,18 @@ use crate::serve::ServeConfig;
 use crate::tls::{AcmeCertFetcher, ControlCertProvider};
 
 const API_PREFIX: &str = "/localapi/v0/";
+const MAX_LOCALAPI_HEADER_BYTES: usize = 64 * 1024;
+// Preserve Taildrop's existing 1 GiB endpoint contract while bounding the
+// previously unlimited generic LocalAPI parser. Other routes use lower limits.
+const MAX_LOCALAPI_BODY_BYTES: usize = 1 << 30;
+const MAX_LOCALAPI_DEFAULT_BODY_BYTES: usize = 4 * 1024 * 1024;
+const MAX_LOCALAPI_GLOBAL_BODY_BYTES: usize = 1 << 30;
+const MAX_LOCALAPI_IDENTITY_BODY_BYTES: usize = 1 << 30;
+const MAX_LOCALAPI_REQUESTS: usize = 64;
+const MAX_LOCALAPI_REQUESTS_PER_IDENTITY: usize = 8;
+const LOCALAPI_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
+const LOCALAPI_BODY_BASE_TIMEOUT: Duration = Duration::from_secs(5);
+const LOCALAPI_MIN_BODY_BYTES_PER_SECOND: usize = 256 * 1024;
 
 /// Commands sent from LocalAPI handlers to the daemon for actions that
 /// require server-level operations (start, login, logout).
@@ -709,6 +720,112 @@ fn spawn_localapi_paused_at_paths(
     ))
 }
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct LocalApiIdentityKey {
+    uid: Option<u32>,
+    is_unix_sock: bool,
+}
+
+#[derive(Default)]
+struct LocalApiAdmissionState {
+    requests: usize,
+    body_bytes: usize,
+    identities: BTreeMap<LocalApiIdentityKey, (usize, usize)>,
+}
+
+#[derive(Default)]
+pub(crate) struct LocalApiAdmission {
+    state: std::sync::Mutex<LocalApiAdmissionState>,
+}
+
+impl LocalApiAdmission {
+    pub(crate) fn try_admit(
+        self: &Arc<Self>,
+        identity: &ConnIdentity,
+        body_bytes: usize,
+    ) -> Result<LocalApiAdmissionPermit, &'static str> {
+        let key = LocalApiIdentityKey {
+            uid: identity.uid,
+            is_unix_sock: identity.is_unix_sock,
+        };
+        let mut state = self.state.lock().map_err(|_| "admission unavailable")?;
+        let (identity_requests, identity_bytes) =
+            state.identities.get(&key).copied().unwrap_or_default();
+        if state.requests >= MAX_LOCALAPI_REQUESTS
+            || identity_requests >= MAX_LOCALAPI_REQUESTS_PER_IDENTITY
+        {
+            return Err("too many concurrent LocalAPI requests");
+        }
+        if state.body_bytes.saturating_add(body_bytes) > MAX_LOCALAPI_GLOBAL_BODY_BYTES
+            || identity_bytes.saturating_add(body_bytes) > MAX_LOCALAPI_IDENTITY_BODY_BYTES
+        {
+            return Err("too many in-flight LocalAPI body bytes");
+        }
+        state.requests += 1;
+        state.body_bytes += body_bytes;
+        state.identities.insert(
+            key.clone(),
+            (identity_requests + 1, identity_bytes + body_bytes),
+        );
+        drop(state);
+        Ok(LocalApiAdmissionPermit {
+            admission: self.clone(),
+            key,
+            body_bytes,
+        })
+    }
+}
+
+pub(crate) struct LocalApiAdmissionPermit {
+    admission: Arc<LocalApiAdmission>,
+    key: LocalApiIdentityKey,
+    body_bytes: usize,
+}
+
+impl LocalApiAdmissionPermit {
+    pub(crate) fn reserve_body(&mut self, body_bytes: usize) -> Result<(), &'static str> {
+        if self.body_bytes != 0 {
+            return Err("LocalAPI body admission already reserved");
+        }
+        let mut state = self
+            .admission
+            .state
+            .lock()
+            .map_err(|_| "admission unavailable")?;
+        let Some((_, identity_bytes)) = state.identities.get(&self.key).copied() else {
+            return Err("LocalAPI identity admission disappeared");
+        };
+        if state.body_bytes.saturating_add(body_bytes) > MAX_LOCALAPI_GLOBAL_BODY_BYTES
+            || identity_bytes.saturating_add(body_bytes) > MAX_LOCALAPI_IDENTITY_BODY_BYTES
+        {
+            return Err("too many in-flight LocalAPI body bytes");
+        }
+        state.body_bytes += body_bytes;
+        if let Some((_, bytes)) = state.identities.get_mut(&self.key) {
+            *bytes += body_bytes;
+        }
+        self.body_bytes = body_bytes;
+        Ok(())
+    }
+}
+
+impl Drop for LocalApiAdmissionPermit {
+    fn drop(&mut self) {
+        let Ok(mut state) = self.admission.state.lock() else {
+            return;
+        };
+        state.requests = state.requests.saturating_sub(1);
+        state.body_bytes = state.body_bytes.saturating_sub(self.body_bytes);
+        if let Some((requests, bytes)) = state.identities.get_mut(&self.key) {
+            *requests = requests.saturating_sub(1);
+            *bytes = bytes.saturating_sub(self.body_bytes);
+            if *requests == 0 {
+                state.identities.remove(&self.key);
+            }
+        }
+    }
+}
+
 fn spawn_localapi_inner(
     state: Arc<LocalApiState>,
     socket_path: PathBuf,
@@ -718,6 +835,7 @@ fn spawn_localapi_inner(
 
     let path = socket_path.clone();
     let cancel = Arc::new(crate::CancelToken::new());
+    let admission = Arc::new(LocalApiAdmission::default());
     #[cfg(all(test, unix))]
     let accepted = Arc::new(tokio::sync::Notify::new());
     #[cfg(all(test, unix))]
@@ -743,11 +861,16 @@ fn spawn_localapi_inner(
                         task_accepted.notify_one();
                         let peer_identity = peer_identity_from_stream(&stream);
                         let state = state.clone();
+                        let permit = admission.try_admit(&peer_identity, 0);
                         #[cfg(all(test, unix))]
                         task_child_tasks.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                         children.spawn(async move {
-                            if let Err(e) = handle_connection(stream, &state, peer_identity).await {
-                                log::warn!("localapi: connection error: {e}");
+                            let result = match permit {
+                                Ok(permit) => handle_connection(stream, &state, peer_identity, permit).await,
+                                Err(error) => reject_admission(stream, error).await,
+                            };
+                            if let Err(error) = result {
+                                log::warn!("localapi: connection error: {error}");
                             }
                         });
                     }
@@ -790,8 +913,8 @@ fn spawn_localapi_inner(
 }
 
 /// Extract a [`ConnIdentity`] from a server-side stream. On Unix this reads
-/// peer credentials (SO_PEERCRED/LOCAL_PEERCRED); on other platforms all
-/// connections are treated as read-write (pipe ACL handles access control).
+/// peer credentials (SO_PEERCRED/LOCAL_PEERCRED); on other platforms the
+/// local-system identity is trusted because the pipe ACL handles access control.
 #[cfg(unix)]
 fn peer_identity_from_stream(stream: &ServerStream) -> ConnIdentity {
     ConnIdentity::from_stream(stream)
@@ -799,7 +922,7 @@ fn peer_identity_from_stream(stream: &ServerStream) -> ConnIdentity {
 
 #[cfg(not(unix))]
 fn peer_identity_from_stream(_stream: &ServerStream) -> ConnIdentity {
-    ConnIdentity::readwrite()
+    ConnIdentity::trusted_local_system()
 }
 
 // ---------------------------------------------------------------------------
@@ -816,122 +939,167 @@ pub(crate) struct HttpRequest {
     pub(crate) body: Vec<u8>,
 }
 
+pub(crate) struct HttpRequestHead {
+    pub(crate) method: String,
+    pub(crate) path: String,
+    pub(crate) query: String,
+    pub(crate) headers: Vec<(String, String)>,
+    pub(crate) content_length: usize,
+}
+
+/// Compatibility helper for in-memory parser tests. Production connection
+/// handling calls the head and body phases separately so authorization and
+/// admission always happen before any body byte is read.
 pub(crate) async fn read_request<R: AsyncRead + Unpin>(
     conn: &mut R,
 ) -> Result<HttpRequest, String> {
-    let mut buf = Vec::with_capacity(4096);
-    let mut tmp = [0u8; 4096];
-    loop {
-        let n = conn
-            .read(&mut tmp)
+    let head = read_request_head(conn).await?;
+    read_request_body(conn, head, MAX_LOCALAPI_BODY_BYTES).await
+}
+
+pub(crate) async fn read_request_head<R: AsyncRead + Unpin>(
+    conn: &mut R,
+) -> Result<HttpRequestHead, String> {
+    let deadline = tokio::time::Instant::now() + LOCALAPI_HEADER_TIMEOUT;
+    let mut head = Vec::with_capacity(1024);
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        let count = tokio::time::timeout_at(deadline, conn.read(&mut byte))
             .await
-            .map_err(|e| format!("read: {e}"))?;
-        if n == 0 {
+            .map_err(|_| "request header timed out".to_string())?
+            .map_err(|error| format!("read header: {error}"))?;
+        if count == 0 {
             return Err("connection closed before headers".into());
         }
-        buf.extend_from_slice(&tmp[..n]);
-        if let Some(end) = find_header_end(&buf) {
-            let head = &buf[..end + 4];
-            let mut body = buf[end + 4..].to_vec();
-            // Read the full Content-Length body if the preview is short.
-            let header_text =
-                std::str::from_utf8(head).map_err(|_| "non-utf8 header".to_string())?;
-            let cl = extract_content_length(header_text);
-            let request_target = header_text
-                .lines()
-                .next()
-                .and_then(|line| line.split_whitespace().nth(1))
-                .unwrap_or_default();
-            if request_target.starts_with("/localapi/v0/drive/config")
-                && cl > crate::drive::MAX_CONFIG_BODY
-            {
-                return Err("Taildrive configuration body too large".into());
-            }
-            if request_target.starts_with("/localapi/v0/tka/") && cl > 1024 * 1024 {
-                return Err("Tailnet Lock request body too large".into());
-            }
-            while body.len() < cl {
-                let n = conn
-                    .read(&mut tmp)
-                    .await
-                    .map_err(|e| format!("read body: {e}"))?;
-                if n == 0 {
-                    return Err("connection closed before complete request body".into());
-                }
-                body.extend_from_slice(&tmp[..n]);
-            }
-            if body.len() > cl {
-                // LocalAPI serves one request per connection. Reject bytes
-                // beyond the declared body rather than silently consuming a
-                // pipelined request before a streaming handler monitors EOF.
-                return Err("bytes after request body are not supported".into());
-            }
-            return parse_request_head(head, body);
-        }
-        if buf.len() > 256 * 1024 {
+        head.push(byte[0]);
+        if head.len() > MAX_LOCALAPI_HEADER_BYTES {
             return Err("header too large".into());
         }
     }
+    parse_request_head(&head)
 }
 
-/// Extract the Content-Length value from an HTTP header block. Returns 0
-/// if the header is absent or unparseable.
-fn extract_content_length(header_text: &str) -> usize {
-    for line in header_text.split("\r\n") {
-        if let Some((k, v)) = line.split_once(':') {
-            if k.trim().eq_ignore_ascii_case("content-length") {
-                return v.trim().parse().unwrap_or(0);
-            }
-        }
+pub(crate) async fn read_request_body<R: AsyncRead + Unpin>(
+    conn: &mut R,
+    head: HttpRequestHead,
+    max_body: usize,
+) -> Result<HttpRequest, String> {
+    if head.content_length > max_body {
+        return Err("request body too large".into());
     }
-    0
+    let rate_seconds = head
+        .content_length
+        .div_ceil(LOCALAPI_MIN_BODY_BYTES_PER_SECOND);
+    let rate_seconds = u64::try_from(rate_seconds).unwrap_or(u64::MAX);
+    let deadline = tokio::time::Instant::now()
+        + LOCALAPI_BODY_BASE_TIMEOUT.saturating_add(Duration::from_secs(rate_seconds));
+    let mut body = Vec::with_capacity(head.content_length.min(64 * 1024));
+    let mut chunk = vec![0u8; 64 * 1024].into_boxed_slice();
+    while body.len() < head.content_length {
+        let remaining = head.content_length - body.len();
+        let read_len = remaining.min(chunk.len());
+        let count = tokio::time::timeout_at(deadline, conn.read(&mut chunk[..read_len]))
+            .await
+            .map_err(|_| "request body deadline or minimum rate exceeded".to_string())?
+            .map_err(|error| format!("read body: {error}"))?;
+        if count == 0 {
+            return Err("client disconnected before complete request body".into());
+        }
+        body.extend_from_slice(&chunk[..count]);
+    }
+    Ok(HttpRequest {
+        method: head.method,
+        path: head.path,
+        query: head.query,
+        headers: head.headers,
+        body,
+    })
 }
 
-fn find_header_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(4).position(|w| w == b"\r\n\r\n")
+#[cfg(test)]
+fn find_header_end(bytes: &[u8]) -> Option<usize> {
+    bytes.windows(4).position(|window| window == b"\r\n\r\n")
 }
 
-fn parse_request_head(head: &[u8], body_preview: Vec<u8>) -> Result<HttpRequest, String> {
+fn is_http_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
+}
+
+fn parse_request_head(head: &[u8]) -> Result<HttpRequestHead, String> {
     let text = std::str::from_utf8(head).map_err(|_| "non-utf8 header".to_string())?;
     let mut lines = text.split("\r\n");
     let request_line = lines.next().ok_or("no request line")?;
     let mut parts = request_line.split_whitespace();
     let method = parts.next().ok_or("no method")?.to_string();
     let raw_path = parts.next().ok_or("no path")?.to_string();
+    if parts.next() != Some("HTTP/1.1") || parts.next().is_some() {
+        return Err("request must use HTTP/1.1".into());
+    }
+    if !raw_path.starts_with('/') {
+        return Err("request target must be origin-form".into());
+    }
     let (path, query) = match raw_path.split_once('?') {
-        Some((p, q)) => (p.to_string(), q.to_string()),
+        Some((path, query)) => (path.to_string(), query.to_string()),
         None => (raw_path, String::new()),
     };
     let mut headers = Vec::new();
+    let mut content_length = None;
     for line in lines {
         if line.is_empty() {
             continue;
         }
-        if let Some((k, v)) = line.split_once(':') {
-            headers.push((k.trim().to_string(), v.trim().to_string()));
+        let (name, value) = line
+            .split_once(':')
+            .ok_or_else(|| "malformed request header".to_string())?;
+        if name.is_empty()
+            || name.bytes().any(|byte| !is_http_token_byte(byte))
+            || value
+                .bytes()
+                .any(|byte| byte.is_ascii_control() && byte != b'\t')
+        {
+            return Err("malformed request header".into());
         }
+        let value = value.trim();
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            return Err("Transfer-Encoding is not supported".into());
+        }
+        if name.eq_ignore_ascii_case("content-length") {
+            if content_length.is_some()
+                || value.is_empty()
+                || !value.bytes().all(|byte| byte.is_ascii_digit())
+            {
+                return Err("invalid or duplicate Content-Length".into());
+            }
+            content_length = Some(
+                value
+                    .parse::<usize>()
+                    .map_err(|_| "invalid Content-Length".to_string())?,
+            );
+        }
+        headers.push((name.to_string(), value.to_string()));
     }
-
-    let cl_header = headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("content-length"));
-
-    let body = if let Some((_, v)) = cl_header {
-        let cl: usize = v.parse().unwrap_or(0);
-        if body_preview.len() >= cl {
-            body_preview[..cl].to_vec()
-        } else {
-            body_preview
-        }
-    } else {
-        body_preview
-    };
-
-    Ok(HttpRequest {
+    Ok(HttpRequestHead {
         method,
         path,
         query,
         headers,
+        content_length: content_length.unwrap_or(0),
+    })
+}
+
+#[cfg(test)]
+fn parse_complete_test_request(raw: &[u8]) -> Result<HttpRequest, String> {
+    let end = find_header_end(raw).ok_or_else(|| "incomplete header".to_string())? + 4;
+    let head = parse_request_head(&raw[..end])?;
+    let body = raw[end..].to_vec();
+    if body.len() != head.content_length {
+        return Err("request body does not match Content-Length".into());
+    }
+    Ok(HttpRequest {
+        method: head.method,
+        path: head.path,
+        query: head.query,
+        headers: head.headers,
         body,
     })
 }
@@ -1689,16 +1857,200 @@ fn percent_decode_query(value: &str) -> String {
 // Connection handling
 // ---------------------------------------------------------------------------
 
+fn known_localapi_route(method: &str, endpoint: &str) -> bool {
+    matches!(
+        (method, endpoint),
+        (
+            "GET",
+            "status"
+                | "whois"
+                | "prefs"
+                | "netmap"
+                | "metrics"
+                | "health"
+                | "watch-ipn-bus"
+                | "serve-config"
+                | "drive/status"
+                | "drive/config"
+                | "profiles"
+                | "file-targets"
+                | "debug"
+                | "dns-query"
+                | "check-ip-forwarding"
+                | "id-token"
+                | "tka/status"
+        ) | ("PATCH", "prefs")
+            | (
+                "POST",
+                "start"
+                    | "login-interactive"
+                    | "logout"
+                    | "routecheck"
+                    | "ping"
+                    | "debug-capture"
+                    | "serve-config"
+                    | "dial"
+                    | "check-prefs"
+                    | "set-expiry-sooner"
+                    | "shutdown"
+                    | "reload-config"
+                    | "debug"
+                    | "tka/init"
+                    | "tka/init/ack"
+                    | "tka/sign"
+                    | "tka/disable"
+            )
+            | ("PUT", "drive/config" | "profiles")
+    ) || (method == "GET" && endpoint.starts_with("cert/"))
+        || (endpoint.starts_with("profiles/") && matches!(method, "GET" | "POST" | "DELETE"))
+        || ((endpoint == "files" || endpoint.starts_with("files/"))
+            && matches!(method, "GET" | "DELETE"))
+        || (endpoint.starts_with("file-put/") && method == "PUT")
+}
+
+pub(crate) fn route_body_limit(head: &HttpRequestHead) -> Option<usize> {
+    if head.path == "/" {
+        return (head.method == "GET").then_some(MAX_LOCALAPI_DEFAULT_BODY_BYTES);
+    }
+    let endpoint = head.path.strip_prefix(API_PREFIX)?;
+    if !known_localapi_route(&head.method, endpoint) {
+        return None;
+    }
+    if endpoint == "drive/config" {
+        Some(crate::drive::MAX_CONFIG_BODY)
+    } else if endpoint.starts_with("tka/") {
+        Some(1024 * 1024)
+    } else if endpoint.starts_with("file-put/") {
+        Some(MAX_LOCALAPI_BODY_BYTES)
+    } else {
+        Some(MAX_LOCALAPI_DEFAULT_BODY_BYTES)
+    }
+}
+
+pub(crate) async fn authorize_request_head<W: AsyncWrite + Unpin>(
+    conn: &mut W,
+    head: &HttpRequestHead,
+    state: &Arc<LocalApiState>,
+    peer_identity: &ConnIdentity,
+) -> Result<Option<usize>, std::io::Error> {
+    let Some(max_body) = route_body_limit(head) else {
+        write_json_response(
+            conn,
+            404,
+            "Not Found",
+            &serde_json::json!({"error": "unknown path or method"}),
+        )
+        .await?;
+        return Ok(None);
+    };
+    let Some(endpoint) = head.path.strip_prefix(API_PREFIX) else {
+        return Ok(Some(max_body));
+    };
+
+    if is_mutating_request(&head.method, endpoint)
+        && state.mutation_fence.generation() != state.mutation_generation
+    {
+        write_json_response(
+            conn,
+            409,
+            "Conflict",
+            &serde_json::json!({"error": "stale LocalAPI listener generation"}),
+        )
+        .await?;
+        return Ok(None);
+    }
+    if head.method == "PUT" && endpoint == "drive/config" {
+        if !require_drive_config_owner(peer_identity) {
+            write_drive_owner_denied(conn).await?;
+            return Ok(None);
+        }
+    } else if (is_mutating_request(&head.method, endpoint)
+        || requires_write_permission(&head.method, endpoint))
+        && !require_readwrite(peer_identity, state).await
+    {
+        write_access_denied(conn).await?;
+        return Ok(None);
+    }
+    if head.method == "POST"
+        && endpoint == "routecheck"
+        && routecheck_probe_requested(&head.query)
+        && !require_readwrite(peer_identity, state).await
+    {
+        write_access_denied(conn).await?;
+        return Ok(None);
+    }
+    Ok(Some(max_body))
+}
+
+async fn reject_admission(mut stream: ServerStream, error: &str) -> Result<(), std::io::Error> {
+    write_json_response(
+        &mut stream,
+        429,
+        "Too Many Requests",
+        &serde_json::json!({"error": error}),
+    )
+    .await
+}
+
 async fn handle_connection(
     mut stream: ServerStream,
     state: &Arc<LocalApiState>,
     peer_identity: ConnIdentity,
+    mut admission: LocalApiAdmissionPermit,
 ) -> Result<(), std::io::Error> {
-    let req = match read_request(&mut stream).await {
-        Ok(r) => r,
-        Err(e) => {
-            let body = serde_json::json!({"error": "bad request", "reason": e});
-            write_json_response(&mut stream, 400, "Bad Request", &body).await?;
+    let head = match read_request_head(&mut stream).await {
+        Ok(head) => head,
+        Err(error) => {
+            let timed_out = error.contains("timed out");
+            let (status, reason) = if timed_out {
+                (408, "Request Timeout")
+            } else {
+                (400, "Bad Request")
+            };
+            write_json_response(
+                &mut stream,
+                status,
+                reason,
+                &serde_json::json!({"error": "bad request", "reason": error}),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    let Some(max_body) = authorize_request_head(&mut stream, &head, state, &peer_identity).await?
+    else {
+        return Ok(());
+    };
+    if head.content_length > max_body {
+        write_json_response(
+            &mut stream,
+            413,
+            "Content Too Large",
+            &serde_json::json!({"error": "LocalAPI request body too large"}),
+        )
+        .await?;
+        return Ok(());
+    }
+    if let Err(error) = admission.reserve_body(head.content_length) {
+        write_json_response(
+            &mut stream,
+            429,
+            "Too Many Requests",
+            &serde_json::json!({"error": error}),
+        )
+        .await?;
+        return Ok(());
+    }
+    let req = match read_request_body(&mut stream, head, max_body).await {
+        Ok(request) => request,
+        Err(error) => {
+            write_json_response(
+                &mut stream,
+                408,
+                "Request Timeout",
+                &serde_json::json!({"error": "request body rejected", "reason": error}),
+            )
+            .await?;
             return Ok(());
         }
     };
@@ -1715,7 +2067,7 @@ async fn handle_connection(
 /// returns true (named-pipe ACL handles access control).
 #[cfg(unix)]
 async fn require_readwrite(identity: &ConnIdentity, state: &LocalApiState) -> bool {
-    let daemon_uid = unsafe { libc::getuid() };
+    let daemon_uid = rustix::process::getuid().as_raw();
     identity.is_readwrite(daemon_uid, operator_uid(state).await)
 }
 
@@ -1725,10 +2077,36 @@ async fn require_readwrite(_identity: &ConnIdentity, _state: &LocalApiState) -> 
     true
 }
 
+/// Taildrive roots are opened with the daemon's filesystem authority. Until
+/// per-caller/user-switching authority exists, only root or the daemon UID may
+/// alter them; OperatorUser remains sufficient for ordinary LocalAPI writes.
+fn require_drive_config_owner(identity: &ConnIdentity) -> bool {
+    if !identity.has_trusted_os_uid() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        identity.is_readwrite(rustix::process::getuid().as_raw(), None)
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
 /// Write a 403 Forbidden response for read-only peers attempting mutations.
 async fn write_access_denied<W: AsyncWrite + Unpin>(conn: &mut W) -> Result<(), std::io::Error> {
     let body = serde_json::json!({
         "error": "access denied; run as root/the daemon user or configure Prefs.OperatorUser"
+    });
+    write_json_response(conn, 403, "Forbidden", &body).await
+}
+
+async fn write_drive_owner_denied<W: AsyncWrite + Unpin>(
+    conn: &mut W,
+) -> Result<(), std::io::Error> {
+    let body = serde_json::json!({
+        "error": "Taildrive configuration requires root or the daemon user"
     });
     write_json_response(conn, 403, "Forbidden", &body).await
 }
@@ -1789,7 +2167,14 @@ fn requires_write_permission(method: &str, endpoint: &str) -> bool {
         (method, endpoint),
         (
             "GET",
-            "metrics" | "dns-query" | "debug" | "id-token" | "profiles" | "files"
+            "metrics"
+                | "dns-query"
+                | "debug"
+                | "id-token"
+                | "profiles"
+                | "files"
+                | "drive/status"
+                | "drive/config"
         ) | ("POST", "check-prefs")
     ) || (method == "GET" && (endpoint.starts_with("profiles/") || endpoint.starts_with("files/")))
 }
@@ -1867,7 +2252,13 @@ pub(crate) async fn dispatch<W: AsyncRead + AsyncWrite + Unpin>(
         // Keep authorization inside the mutation fence. This makes operator
         // replacement/revocation take effect before another mutation can be
         // admitted, while a failed NSS lookup remains fail-closed.
-        if !require_readwrite(peer_identity, state).await {
+        if method == "PUT" && endpoint == "drive/config" {
+            if !require_drive_config_owner(peer_identity) {
+                drop(permit);
+                write_drive_owner_denied(conn).await?;
+                return Ok(());
+            }
+        } else if !require_readwrite(peer_identity, state).await {
             drop(permit);
             write_access_denied(conn).await?;
             return Ok(());
@@ -2054,7 +2445,7 @@ pub(crate) async fn dispatch<W: AsyncRead + AsyncWrite + Unpin>(
             handle_get_drive_config(conn, state).await?;
         }
         "drive/config" if method == "PUT" => {
-            handle_put_drive_config(conn, &req.body, state).await?;
+            handle_put_drive_config(conn, req, state).await?;
         }
         "drive/config" | "drive/status" => {
             let body = serde_json::json!({"error": "method not allowed"});
@@ -2175,24 +2566,63 @@ async fn handle_get_drive_config<W: AsyncWrite + Unpin>(
     conn: &mut W,
     state: &Arc<LocalApiState>,
 ) -> Result<(), std::io::Error> {
-    let status = state.drive.status();
+    let (status, etag) = state.drive.status_and_etag();
     let config = serde_json::json!({
         "enabled": status.enabled,
         "shares": status.shares,
     });
-    write_json_response(conn, 200, "OK", &config).await
+    let body = serde_json::to_vec(&config).unwrap_or_default();
+    write_json_with_etag(conn, 200, "OK", &etag, &body).await
+}
+
+fn drive_if_match(req: &HttpRequest) -> Result<&str, &'static str> {
+    let mut values = req
+        .headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("if-match"))
+        .map(|(_, value)| value.trim());
+    let value = values
+        .next()
+        .ok_or("If-Match is required for Taildrive configuration replacement")?;
+    if values.next().is_some() {
+        return Err("multiple If-Match headers are not allowed");
+    }
+    let quoted = value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .ok_or("If-Match must contain one quoted Taildrive ETag")?;
+    if quoted.len() != 64 || !quoted.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("If-Match does not contain a valid Taildrive ETag");
+    }
+    Ok(quoted)
 }
 
 async fn handle_put_drive_config<W: AsyncWrite + Unpin>(
     conn: &mut W,
-    body: &[u8],
+    req: &HttpRequest,
     state: &Arc<LocalApiState>,
 ) -> Result<(), std::io::Error> {
-    if body.len() > crate::drive::MAX_CONFIG_BODY {
+    if req.body.len() > crate::drive::MAX_CONFIG_BODY {
         let error = serde_json::json!({"error": "Taildrive configuration body too large"});
         return write_json_response(conn, 413, "Content Too Large", &error).await;
     }
-    let config: crate::drive::RuntimeConfig = match serde_json::from_slice(body) {
+    let expected_etag = match drive_if_match(req) {
+        Ok(etag) => etag,
+        Err(error) => {
+            let body = serde_json::json!({"error": error});
+            let (status, reason) = if req
+                .headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("if-match"))
+            {
+                (400, "Bad Request")
+            } else {
+                (428, "Precondition Required")
+            };
+            return write_json_response(conn, status, reason, &body).await;
+        }
+    };
+    let config: crate::drive::RuntimeConfig = match serde_json::from_slice(&req.body) {
         Ok(config) => config,
         Err(error) => {
             let body =
@@ -2200,11 +2630,21 @@ async fn handle_put_drive_config<W: AsyncWrite + Unpin>(
             return write_json_response(conn, 400, "Bad Request", &body).await;
         }
     };
-    match state.drive.replace(config).await {
-        Ok(_) => handle_drive_status(conn, state).await,
+    match state.drive.replace_if_etag(config, expected_etag).await {
+        Ok(_) => {
+            let (status, etag) = state.drive.status_and_etag();
+            let status = serde_json::to_vec(&status).unwrap_or_default();
+            write_json_with_etag(conn, 200, "OK", &etag, &status).await
+        }
         Err(crate::drive::ReplaceError::SharingNotAllowed) => {
             let body = serde_json::json!({"error": "Taildrive sharing is not allowed by the signed netmap"});
             write_json_response(conn, 403, "Forbidden", &body).await
+        }
+        Err(crate::drive::ReplaceError::EtagMismatch) => {
+            let body = serde_json::json!({
+                "error": "Taildrive configuration changed concurrently; read it again before retrying"
+            });
+            write_json_response(conn, 412, "Precondition Failed", &body).await
         }
         Err(error) => {
             let body = serde_json::json!({"error": error.to_string()});
@@ -4980,14 +5420,138 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn request_parser_rejects_truncation_and_bytes_after_declared_body() {
+    async fn request_parser_rejects_truncation_and_ambiguous_framing() {
         for raw in [
             b"POST /localapi/v0/start HTTP/1.1\r\nContent-Length: 2\r\n\r\nx".as_slice(),
-            b"GET /localapi/v0/watch-ipn-bus HTTP/1.1\r\nContent-Length: 0\r\n\r\nx".as_slice(),
+            b"POST /localapi/v0/start HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\nx"
+                .as_slice(),
+            b"POST /localapi/v0/start HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"
+                .as_slice(),
+            b"POST /localapi/v0/start HTTP/1.1\r\nContent-Length: nope\r\n\r\n".as_slice(),
         ] {
             let mut cursor = std::io::Cursor::new(raw);
             assert!(read_request(&mut cursor).await.is_err(), "accepted {raw:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn header_phase_never_consumes_a_body_byte() {
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        client
+            .write_all(b"POST /localapi/v0/start HTTP/1.1\r\nContent-Length: 1\r\n\r\nx")
+            .await
+            .unwrap();
+        let head = read_request_head(&mut server).await.unwrap();
+        assert_eq!(head.content_length, 1);
+        let mut body = [0u8; 1];
+        server.read_exact(&mut body).await.unwrap();
+        assert_eq!(&body, b"x");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn body_phase_enforces_deadline_and_disconnect_cancellation() {
+        let disconnected =
+            parse_request_head(b"POST /localapi/v0/start HTTP/1.1\r\nContent-Length: 2\r\n\r\n")
+                .unwrap();
+        let mut short = std::io::Cursor::new(b"x");
+        let error = read_request_body(&mut short, disconnected, 2)
+            .await
+            .err()
+            .expect("disconnected body must fail");
+        assert!(error.contains("disconnected"));
+
+        let waiting =
+            parse_request_head(b"POST /localapi/v0/start HTTP/1.1\r\nContent-Length: 1\r\n\r\n")
+                .unwrap();
+        let (_client, mut server) = tokio::io::duplex(64);
+        let body = tokio::spawn(async move { read_request_body(&mut server, waiting, 1).await });
+        tokio::task::yield_now().await;
+        tokio::time::advance(LOCALAPI_BODY_BASE_TIMEOUT + Duration::from_secs(2)).await;
+        let error = body.await.unwrap().err().expect("timed out body must fail");
+        assert!(error.contains("minimum rate"));
+    }
+
+    #[test]
+    fn global_and_per_identity_admission_is_bounded_and_released() {
+        let admission = Arc::new(LocalApiAdmission::default());
+        let first = ConnIdentity {
+            uid: Some(1001),
+            pid: None,
+            is_unix_sock: true,
+            trusted_os_uid: true,
+        };
+        let second = ConnIdentity {
+            uid: Some(1002),
+            pid: None,
+            is_unix_sock: true,
+            trusted_os_uid: true,
+        };
+        let mut permits = (0..MAX_LOCALAPI_REQUESTS_PER_IDENTITY)
+            .map(|_| admission.try_admit(&first, 0).unwrap())
+            .collect::<Vec<_>>();
+        assert!(admission.try_admit(&first, 0).is_err());
+        let other = admission.try_admit(&second, 0).unwrap();
+        permits.pop();
+        assert!(admission.try_admit(&first, 0).is_ok());
+        drop(permits);
+        drop(other);
+        assert!(admission.state.lock().unwrap().identities.is_empty());
+
+        let mut first_bytes = admission.try_admit(&first, 0).unwrap();
+        first_bytes
+            .reserve_body(MAX_LOCALAPI_IDENTITY_BODY_BYTES)
+            .unwrap();
+        let mut same_identity = admission.try_admit(&first, 0).unwrap();
+        assert!(same_identity.reserve_body(1).is_err());
+        drop(first_bytes);
+        drop(same_identity);
+
+        let half = MAX_LOCALAPI_GLOBAL_BODY_BYTES / 2;
+        let mut first_half = admission.try_admit(&first, 0).unwrap();
+        first_half.reserve_body(half).unwrap();
+        let mut second_half = admission.try_admit(&second, 0).unwrap();
+        second_half.reserve_body(half).unwrap();
+        let third = ConnIdentity {
+            uid: Some(1003),
+            pid: None,
+            is_unix_sock: true,
+            trusted_os_uid: true,
+        };
+        let mut global_overflow = admission.try_admit(&third, 0).unwrap();
+        assert!(global_overflow.reserve_body(1).is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn raw_drive_operator_request_is_denied_before_body_read() {
+        let state = make_test_state().await;
+        const OPERATOR_UID: u32 = 4_242_432;
+        state.prefs.write().await.OperatorUser = "drive-head-operator".into();
+        *state.operator_access.lock().unwrap() = OperatorAccess {
+            username: "drive-head-operator".into(),
+            uid: Some(OPERATOR_UID),
+        };
+        let identity = ConnIdentity {
+            uid: Some(OPERATOR_UID),
+            pid: None,
+            is_unix_sock: true,
+            trusted_os_uid: true,
+        };
+        assert!(require_readwrite(&identity, &state).await);
+        let head = parse_request_head(
+            b"PUT /localapi/v0/drive/config HTTP/1.1\r\nContent-Length: 1048576\r\n\r\n",
+        )
+        .unwrap();
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let result = authorize_request_head(&mut server, &head, &state, &identity)
+            .await
+            .unwrap();
+        assert!(result.is_none());
+        server.shutdown().await.unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).await.unwrap();
+        assert!(response.contains("403 Forbidden"), "response: {response}");
+        assert!(response.contains("root or the daemon user"));
     }
 
     // --- Dispatch tests (using tokio::io::duplex) ---
@@ -5005,14 +5569,7 @@ mod tests {
             .unwrap_or(0);
         if n > 0 {
             let req_raw = &buf[..n];
-            // Split header/body at \r\n\r\n for proper body extraction.
-            let body_preview = if let Some(pos) = req_raw.windows(4).position(|w| w == b"\r\n\r\n")
-            {
-                req_raw[pos + 4..].to_vec()
-            } else {
-                Vec::new()
-            };
-            if let Ok(req) = parse_request_head(req_raw, body_preview) {
+            if let Ok(req) = parse_complete_test_request(req_raw) {
                 // Tests run as the same user as the daemon → read-write.
                 let identity = test_rw_identity();
                 dispatch(&mut server, &req, state, &identity).await.ok();
@@ -5038,6 +5595,7 @@ mod tests {
             uid: Some(unsafe { libc::getuid() }),
             pid: Some(std::process::id()),
             is_unix_sock: true,
+            trusted_os_uid: true,
         }
     }
 
@@ -5056,6 +5614,7 @@ mod tests {
             uid: Some(65534),
             pid: Some(99999),
             is_unix_sock: true,
+            trusted_os_uid: true,
         }
     }
 
@@ -5090,6 +5649,7 @@ mod tests {
             uid: None,
             pid: None,
             is_unix_sock: true,
+            trusted_os_uid: false,
         };
         let resp = send_request_with_identity(
             b"POST /localapi/v0/routecheck?probe=true HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
@@ -6710,6 +7270,7 @@ mod tests {
             uid: None,
             pid: None,
             is_unix_sock: true,
+            trusted_os_uid: false,
         };
         for query in ["", "?type=pair", "?type=key", "?type=cert"] {
             let request = format!(
@@ -6810,13 +7371,7 @@ mod tests {
             .unwrap_or(0);
         if n > 0 {
             let req_raw = &buf[..n];
-            let body_preview = if let Some(pos) = req_raw.windows(4).position(|w| w == b"\r\n\r\n")
-            {
-                req_raw[pos + 4..].to_vec()
-            } else {
-                Vec::new()
-            };
-            if let Ok(req) = parse_request_head(req_raw, body_preview) {
+            if let Ok(req) = parse_complete_test_request(req_raw) {
                 dispatch(&mut server, &req, state, &identity).await.ok();
             }
         }
@@ -6832,12 +7387,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn taildrive_localapi_reports_disabled_startup() {
+    async fn taildrive_localapi_reports_disabled_startup_to_owner_only() {
         let state = make_test_state().await;
+        #[cfg(unix)]
+        {
+            let denied = send_request_with_identity(
+                b"GET /localapi/v0/drive/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                &state,
+                test_ro_identity(),
+            )
+            .await;
+            assert!(denied.contains("403 Forbidden"), "response: {denied}");
+        }
+
         let status = send_request_with_identity(
             b"GET /localapi/v0/drive/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
             &state,
-            test_ro_identity(),
+            test_rw_identity(),
         )
         .await;
         assert!(status.contains("200 OK"), "response: {status}");
@@ -6849,8 +7415,17 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn response_etag(response: &str) -> String {
+        response
+            .lines()
+            .find_map(|line| line.strip_prefix("ETag: \"")?.strip_suffix('\"'))
+            .expect("response ETag")
+            .to_owned()
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
-    async fn taildrive_localapi_mutation_requires_readwrite_and_is_atomic() {
+    async fn taildrive_localapi_mutation_requires_daemon_or_root_and_is_atomic() {
         let state = make_test_state().await;
         {
             let mut epoch = state.drive.authorization_write().await;
@@ -6859,13 +7434,21 @@ mod tests {
         }
         let temp = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(temp.path()).unwrap();
+        let initial = send_request_with_identity(
+            b"GET /localapi/v0/drive/config HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            &state,
+            test_rw_identity(),
+        )
+        .await;
+        let initial_etag = response_etag(&initial);
         let body = serde_json::to_vec(&crate::drive::RuntimeConfig {
             enabled: true,
             shares: vec![rustscale_drive::Share::new("docs", root)],
         })
         .unwrap();
         let request = format!(
-            "PUT /localapi/v0/drive/config HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            "PUT /localapi/v0/drive/config HTTP/1.1\r\nHost: localhost\r\nIf-Match: \"{}\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            initial_etag,
             body.len(),
             String::from_utf8(body).unwrap()
         );
@@ -6873,21 +7456,56 @@ mod tests {
             uid: None,
             pid: None,
             is_unix_sock: true,
+            trusted_os_uid: false,
         };
         let denied = send_request_with_identity(request.as_bytes(), &state, read_only).await;
         assert!(denied.contains("403 Forbidden"), "response: {denied}");
         assert!(!state.drive.status().enabled);
 
+        let missing_cas = request.replace(&format!("If-Match: \"{initial_etag}\"\r\n"), "");
+        let precondition =
+            send_request_with_identity(missing_cas.as_bytes(), &state, test_rw_identity()).await;
+        assert!(
+            precondition.contains("428 Precondition Required"),
+            "response: {precondition}"
+        );
+        assert!(!state.drive.status().enabled);
+
+        const OPERATOR_UID: u32 = 4_242_431;
+        state.prefs.write().await.OperatorUser = "drive-operator".into();
+        *state.operator_access.lock().unwrap() = OperatorAccess {
+            username: "drive-operator".into(),
+            uid: Some(OPERATOR_UID),
+        };
+        let operator = ConnIdentity {
+            uid: Some(OPERATOR_UID),
+            pid: None,
+            is_unix_sock: true,
+            trusted_os_uid: true,
+        };
+        assert!(require_readwrite(&operator, &state).await);
+        let operator_denied =
+            send_request_with_identity(request.as_bytes(), &state, operator).await;
+        assert!(
+            operator_denied.contains("403 Forbidden"),
+            "response: {operator_denied}"
+        );
+        assert!(operator_denied.contains("root or the daemon user"));
+        assert!(!state.drive.status().enabled);
+
         let accepted =
             send_request_with_identity(request.as_bytes(), &state, test_rw_identity()).await;
         assert!(accepted.contains("200 OK"), "response: {accepted}");
+        let updated_etag = response_etag(&accepted);
+        assert_ne!(initial_etag, updated_etag);
         let status = state.drive.status();
         assert!(status.enabled);
         assert_eq!(status.shares.len(), 1);
 
         let bad_body = br#"{"enabled":true,"shares":[{"name":"bad","path":"relative"}]}"#;
         let bad_request = format!(
-            "PUT /localapi/v0/drive/config HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            "PUT /localapi/v0/drive/config HTTP/1.1\r\nHost: localhost\r\nIf-Match: \"{}\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            updated_etag,
             bad_body.len(),
             String::from_utf8_lossy(bad_body)
         );
@@ -6899,13 +7517,32 @@ mod tests {
         assert_eq!(after.generation, status.generation);
         assert_eq!(after.shares[0].name, "docs");
 
-        let readable = send_request_with_identity(
+        let stale =
+            send_request_with_identity(request.as_bytes(), &state, test_rw_identity()).await;
+        assert!(
+            stale.contains("412 Precondition Failed"),
+            "response: {stale}"
+        );
+        assert_eq!(state.drive.status().generation, status.generation);
+
+        let denied_read = send_request_with_identity(
             b"GET /localapi/v0/drive/config HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
             &state,
             test_ro_identity(),
         )
         .await;
+        assert!(
+            denied_read.contains("403 Forbidden"),
+            "response: {denied_read}"
+        );
+        let readable = send_request_with_identity(
+            b"GET /localapi/v0/drive/config HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            &state,
+            test_rw_identity(),
+        )
+        .await;
         assert!(readable.contains("200 OK"), "response: {readable}");
+        assert_eq!(response_etag(&readable), updated_etag);
         assert!(readable.contains("\"name\":\"docs\""));
     }
 
@@ -6960,6 +7597,8 @@ mod tests {
             ("GET", "profiles/current"),
             ("GET", "files"),
             ("GET", "files/report.txt"),
+            ("GET", "drive/status"),
+            ("GET", "drive/config"),
         ] {
             assert!(
                 requires_write_permission(method, endpoint),
@@ -7197,6 +7836,7 @@ mod tests {
             uid: Some(uid),
             pid: None,
             is_unix_sock: true,
+            trusted_os_uid: true,
         };
         assert!(require_readwrite(&identity(0), &state).await, "root");
         assert!(

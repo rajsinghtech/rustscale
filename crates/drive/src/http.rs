@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
-use std::io::{self, Read, Write};
+#[cfg(unix)]
+use std::io::Write;
+use std::io::{self, Read};
 use std::path::Path;
 #[cfg(test)]
 use std::path::PathBuf;
@@ -11,6 +13,10 @@ use std::time::{Duration, Instant};
 
 use cap_fs_ext::{DirExt, FileTypeExt, FollowSymlinks, OpenOptionsFollowExt, OpenOptionsSyncExt};
 use cap_std::fs::{Dir, File, OpenOptions};
+#[cfg(unix)]
+use cap_std::fs::{DirBuilder, DirBuilderExt};
+#[cfg(unix)]
+use rand_core::{OsRng, RngCore};
 use tokio::sync::mpsc as tokio_mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -19,7 +25,8 @@ use crate::config::{ConfigStore, Limits, ShareRoot, Snapshot};
 use crate::path::{href_for_components, parse_request_path, ParsedPath};
 
 const ALLOW: &str = "OPTIONS, GET, HEAD, PROPFIND, PUT, MKCOL, DELETE, MOVE, COPY";
-static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+#[cfg(unix)]
+const QUARANTINE_DIRECTORY: &str = ".rustscale-taildrive-quarantine";
 
 pub type HeaderMap = BTreeMap<String, String>;
 
@@ -27,6 +34,7 @@ pub type HeaderMap = BTreeMap<String, String>;
 /// consumed only on Taildrive's blocking filesystem pool; the async producer
 /// applies backpressure through the bounded channel.
 pub struct StreamingBody {
+    #[cfg_attr(not(unix), allow(dead_code))]
     receiver: tokio_mpsc::Receiver<Vec<u8>>,
     expected_length: usize,
 }
@@ -188,10 +196,14 @@ impl RequestAuthority {
 pub struct RequestControl {
     authority: RequestAuthority,
     deadline: Instant,
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     after_sync: Option<Arc<dyn Fn() + Send + Sync>>,
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     before_commit: Option<Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(all(test, unix))]
+    after_transaction: Option<Arc<dyn Fn(&OsStr) + Send + Sync>>,
+    #[cfg(all(test, unix))]
+    before_isolation: Option<Arc<dyn Fn(&OsStr) + Send + Sync>>,
 }
 
 impl RequestControl {
@@ -199,10 +211,14 @@ impl RequestControl {
         Self {
             authority,
             deadline,
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             after_sync: None,
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             before_commit: None,
+            #[cfg(all(test, unix))]
+            after_transaction: None,
+            #[cfg(all(test, unix))]
+            before_isolation: None,
         }
     }
 
@@ -227,7 +243,7 @@ impl RequestControl {
         action: impl FnOnce() -> Result<T, OperationError>,
     ) -> Result<T, OperationError> {
         self.check()?;
-        #[cfg(test)]
+        #[cfg(all(test, unix))]
         if let Some(hook) = &self.before_commit {
             hook();
         }
@@ -244,19 +260,45 @@ impl RequestControl {
         action()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn with_after_sync(mut self, hook: Arc<dyn Fn() + Send + Sync>) -> Self {
         self.after_sync = Some(hook);
         self
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn with_before_commit(mut self, hook: Arc<dyn Fn() + Send + Sync>) -> Self {
         self.before_commit = Some(hook);
         self
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
+    fn with_after_transaction(mut self, hook: Arc<dyn Fn(&OsStr) + Send + Sync>) -> Self {
+        self.after_transaction = Some(hook);
+        self
+    }
+
+    #[cfg(all(test, unix))]
+    fn notify_after_transaction(&self, entry: &OsStr) {
+        if let Some(hook) = &self.after_transaction {
+            hook(entry);
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    fn with_before_isolation(mut self, hook: Arc<dyn Fn(&OsStr) + Send + Sync>) -> Self {
+        self.before_isolation = Some(hook);
+        self
+    }
+
+    #[cfg(all(test, unix))]
+    fn notify_before_isolation(&self, entry: &OsStr) {
+        if let Some(hook) = &self.before_isolation {
+            hook(entry);
+        }
+    }
+
+    #[cfg(all(test, unix))]
     fn notify_after_sync(&self) {
         if let Some(hook) = &self.after_sync {
             hook();
@@ -585,9 +627,6 @@ impl Server {
         }
         let (parent, leaf) = open_parent_nofollow(&root.dir, &parsed.relative)?;
         let existed = match parent.symlink_metadata(&leaf) {
-            Ok(metadata) if metadata.file_type().is_symlink() || metadata.is_dir() => {
-                return Err(OperationError::Forbidden)
-            }
             Ok(_) => true,
             Err(error) if error.kind() == io::ErrorKind::NotFound => false,
             Err(error) => return Err(error.into()),
@@ -607,9 +646,6 @@ impl Server {
         }
         let (parent, leaf) = open_parent_nofollow(&root.dir, &parsed.relative)?;
         let existed = match parent.symlink_metadata(&leaf) {
-            Ok(metadata) if metadata.file_type().is_symlink() || metadata.is_dir() => {
-                return Err(OperationError::Forbidden)
-            }
             Ok(_) => true,
             Err(error) if error.kind() == io::ErrorKind::NotFound => false,
             Err(error) => return Err(error.into()),
@@ -647,20 +683,16 @@ impl Server {
             return Err(OperationError::Forbidden);
         }
         let (parent, leaf) = open_parent_nofollow(&root.dir, &parsed.relative)?;
-        let metadata = parent.symlink_metadata(&leaf)?;
-        if metadata.file_type().is_symlink() {
-            return Err(OperationError::Forbidden);
+        #[cfg(not(unix))]
+        {
+            let _ = (parent, leaf, control);
+            Err(OperationError::TransactionalUnavailable)
         }
-        control.commit(|| {
-            if metadata.is_dir() {
-                // Deliberately avoid recursive deletion in this bounded slice.
-                parent.remove_dir(&leaf)?;
-            } else {
-                parent.remove_file(&leaf)?;
-            }
-            Ok(())
-        })?;
-        Ok(Response::new(204).header("content-length", "0"))
+        #[cfg(unix)]
+        {
+            control.commit(|| transactional_delete(&parent, &leaf, control))?;
+            Ok(Response::new(204).header("content-length", "0"))
+        }
     }
 
     fn move_or_copy(
@@ -704,60 +736,79 @@ impl Server {
             open_parent_nofollow(&source_root.dir, &source.relative)?;
         let (destination_parent, destination_leaf) =
             open_parent_nofollow(&destination_root.dir, &destination.relative)?;
-        let source_metadata = source_parent.symlink_metadata(&source_leaf)?;
-        if source_metadata.file_type().is_symlink() {
-            return Err(OperationError::Forbidden);
+        if !copy {
+            #[cfg(not(unix))]
+            {
+                let _ = (
+                    source_parent,
+                    source_leaf,
+                    destination_parent,
+                    destination_leaf,
+                    request,
+                    control,
+                );
+                return Err(OperationError::TransactionalUnavailable);
+            }
+            #[cfg(unix)]
+            {
+                if source.relative == destination.relative {
+                    return Ok(Response::new(204).header("content-length", "0"));
+                }
+                if request.header("overwrite") == Some("F")
+                    && destination_parent
+                        .symlink_metadata(&destination_leaf)
+                        .is_ok()
+                {
+                    return Err(OperationError::PreconditionFailed);
+                }
+                let overwritten = control.commit(|| {
+                    transactional_move(
+                        &source_parent,
+                        &source_leaf,
+                        &destination_parent,
+                        &destination_leaf,
+                        request.header("overwrite") != Some("F"),
+                        control,
+                    )
+                })?;
+                return Ok(Response::new(if overwritten { 204 } else { 201 })
+                    .header("content-length", "0"));
+            }
         }
-        let destination_exists = destination_parent
-            .symlink_metadata(&destination_leaf)
-            .map_or_else(
-                |error| {
-                    if error.kind() == io::ErrorKind::NotFound {
-                        Ok(false)
-                    } else {
-                        Err(error.into())
-                    }
-                },
-                |metadata| {
-                    if metadata.file_type().is_symlink() {
-                        Err(OperationError::Forbidden)
-                    } else {
-                        Ok(true)
-                    }
-                },
-            )?;
+
+        let source_kind = supported_object_kind(&source_parent.symlink_metadata(&source_leaf)?)?;
+        if source_kind != SupportedObjectKind::RegularFile {
+            return Err(OperationError::UnsupportedFileType);
+        }
+        let destination_kind =
+            optional_supported_object_kind(&destination_parent, &destination_leaf)?;
+        if destination_kind.is_some_and(|kind| kind != SupportedObjectKind::RegularFile) {
+            return Err(OperationError::UnsupportedFileType);
+        }
+        let destination_exists = destination_kind.is_some();
         if destination_exists && request.header("overwrite") == Some("F") {
             return Err(OperationError::PreconditionFailed);
         }
-
-        if copy {
-            let (mut source_file, metadata) =
-                open_regular_at_nofollow_nonblocking(&source_parent, &source_leaf)?;
-            let size =
-                usize::try_from(metadata.len()).map_err(|_| OperationError::ResponseTooLarge)?;
-            if size > self.config.limits().max_response_body {
+        let (mut source_file, metadata) =
+            open_regular_at_nofollow_nonblocking(&source_parent, &source_leaf)?;
+        let size = usize::try_from(metadata.len()).map_err(|_| OperationError::ResponseTooLarge)?;
+        if size > self.config.limits().max_response_body {
+            return Err(OperationError::ResponseTooLarge);
+        }
+        let mut bytes = Vec::with_capacity(size);
+        let mut chunk = vec![0u8; 64 * 1024].into_boxed_slice();
+        loop {
+            control.check()?;
+            let count = source_file.read(&mut chunk)?;
+            if count == 0 {
+                break;
+            }
+            if bytes.len().saturating_add(count) > self.config.limits().max_response_body {
                 return Err(OperationError::ResponseTooLarge);
             }
-            let mut bytes = Vec::with_capacity(size);
-            let mut chunk = vec![0u8; 64 * 1024].into_boxed_slice();
-            loop {
-                control.check()?;
-                let count = source_file.read(&mut chunk)?;
-                if count == 0 {
-                    break;
-                }
-                if bytes.len().saturating_add(count) > self.config.limits().max_response_body {
-                    return Err(OperationError::ResponseTooLarge);
-                }
-                bytes.extend_from_slice(&chunk[..count]);
-            }
-            atomic_write(&destination_parent, &destination_leaf, &bytes, control)?;
-        } else {
-            control.commit(|| {
-                source_parent.rename(&source_leaf, &destination_parent, &destination_leaf)?;
-                Ok(())
-            })?;
+            bytes.extend_from_slice(&chunk[..count]);
         }
+        atomic_write(&destination_parent, &destination_leaf, &bytes, control)?;
         Ok(Response::new(if destination_exists { 204 } else { 201 }).header("content-length", "0"))
     }
 
@@ -826,6 +877,592 @@ fn open_parent_nofollow(dir: &Dir, relative: &Path) -> Result<(Dir, OsString), O
     Ok((parent, leaf))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SupportedObjectKind {
+    RegularFile,
+    Directory,
+}
+
+fn supported_object_kind(
+    metadata: &cap_std::fs::Metadata,
+) -> Result<SupportedObjectKind, OperationError> {
+    let file_type = metadata.file_type();
+    if file_type.is_symlink()
+        || file_type.is_fifo()
+        || file_type.is_socket()
+        || file_type.is_block_device()
+        || file_type.is_char_device()
+    {
+        return Err(OperationError::UnsupportedFileType);
+    }
+    if metadata.is_file() {
+        Ok(SupportedObjectKind::RegularFile)
+    } else if metadata.is_dir() {
+        Ok(SupportedObjectKind::Directory)
+    } else {
+        Err(OperationError::UnsupportedFileType)
+    }
+}
+
+fn optional_supported_object_kind(
+    parent: &Dir,
+    leaf: &OsStr,
+) -> Result<Option<SupportedObjectKind>, OperationError> {
+    match parent.symlink_metadata(leaf) {
+        Ok(metadata) => supported_object_kind(&metadata).map(Some),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(unix)]
+fn random_internal_name(label: &str) -> OsString {
+    let mut random = [0u8; 16];
+    OsRng.fill_bytes(&mut random);
+    let mut name = format!(".rustscale-taildrive-{label}-");
+    for byte in random {
+        use std::fmt::Write as _;
+        let _ = write!(name, "{byte:02x}");
+    }
+    name.into()
+}
+
+#[cfg(unix)]
+fn create_staging_file(parent: &Dir, label: &str) -> Result<(OsString, File), OperationError> {
+    for _ in 0..8 {
+        let name = random_internal_name(label);
+        let mut options = OpenOptions::new();
+        options
+            .write(true)
+            .create_new(true)
+            .follow(FollowSymlinks::No);
+        match parent.open_with(&name, &options) {
+            Ok(file) => return Ok((name, file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(OperationError::RepairRequired)
+}
+
+#[cfg(unix)]
+struct PinnedObject {
+    kind: SupportedObjectKind,
+    dev: u64,
+    ino: u64,
+    _file: Option<File>,
+    _directory: Option<Dir>,
+}
+
+#[cfg(unix)]
+fn pin_supported_object(parent: &Dir, leaf: &OsStr) -> Result<PinnedObject, OperationError> {
+    use cap_std::fs::MetadataExt as _;
+
+    let metadata = parent.symlink_metadata(leaf)?;
+    match supported_object_kind(&metadata)? {
+        SupportedObjectKind::RegularFile => {
+            let (file, metadata) = open_regular_at_nofollow_nonblocking(parent, leaf)?;
+            Ok(PinnedObject {
+                kind: SupportedObjectKind::RegularFile,
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+                _file: Some(file),
+                _directory: None,
+            })
+        }
+        SupportedObjectKind::Directory => {
+            let directory = parent.open_dir_nofollow(leaf)?;
+            let metadata = directory.dir_metadata()?;
+            if supported_object_kind(&metadata)? != SupportedObjectKind::Directory {
+                return Err(OperationError::UnsupportedFileType);
+            }
+            Ok(PinnedObject {
+                kind: SupportedObjectKind::Directory,
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+                _file: None,
+                _directory: Some(directory),
+            })
+        }
+    }
+}
+
+#[cfg(unix)]
+fn name_matches_pinned(
+    parent: &Dir,
+    leaf: &OsStr,
+    pinned: &PinnedObject,
+) -> Result<bool, OperationError> {
+    use cap_std::fs::MetadataExt as _;
+
+    let metadata = parent.symlink_metadata(leaf)?;
+    Ok(supported_object_kind(&metadata)? == pinned.kind
+        && metadata.dev() == pinned.dev
+        && metadata.ino() == pinned.ino)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn rename_noreplace(
+    source_parent: &Dir,
+    source: &OsStr,
+    destination_parent: &Dir,
+    destination: &OsStr,
+) -> Result<(), OperationError> {
+    rustix::fs::renameat_with(
+        source_parent,
+        source,
+        destination_parent,
+        destination,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )
+    .map_err(|error| OperationError::Io(error.into()))
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn rename_exchange(
+    left_parent: &Dir,
+    left: &OsStr,
+    right_parent: &Dir,
+    right: &OsStr,
+) -> Result<(), OperationError> {
+    rustix::fs::renameat_with(
+        left_parent,
+        left,
+        right_parent,
+        right,
+        rustix::fs::RenameFlags::EXCHANGE,
+    )
+    .map_err(|error| OperationError::Io(error.into()))
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "linux", target_os = "android", target_vendor = "apple"))
+))]
+fn rename_noreplace(
+    _source_parent: &Dir,
+    _source: &OsStr,
+    _destination_parent: &Dir,
+    _destination: &OsStr,
+) -> Result<(), OperationError> {
+    Err(OperationError::TransactionalUnavailable)
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "linux", target_os = "android", target_vendor = "apple"))
+))]
+fn rename_exchange(
+    _left_parent: &Dir,
+    _left: &OsStr,
+    _right_parent: &Dir,
+    _right: &OsStr,
+) -> Result<(), OperationError> {
+    Err(OperationError::TransactionalUnavailable)
+}
+
+#[cfg(unix)]
+fn owner_quarantine(parent: &Dir) -> Result<Dir, OperationError> {
+    use cap_std::fs::MetadataExt as _;
+
+    let mut builder = DirBuilder::new();
+    builder.mode(0o700);
+    match parent.create_dir_with(QUARANTINE_DIRECTORY, &builder) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    // Pin the directory without following a replacement link, then validate
+    // both authority and access before moving any peer-controlled object into
+    // it. Creation uses 0700 directly because cap-std may represent a Linux
+    // directory with O_PATH, on which fchmod fails with EBADF.
+    let directory = parent.open_dir_nofollow(QUARANTINE_DIRECTORY)?;
+    let metadata = directory.dir_metadata()?;
+    if metadata.uid() != rustix::process::geteuid().as_raw() || metadata.mode() & 0o7777 != 0o700 {
+        return Err(OperationError::RepairRequired);
+    }
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn rename_to_random_stage(
+    source_parent: &Dir,
+    source: &OsStr,
+    destination_parent: &Dir,
+    label: &str,
+) -> Result<OsString, OperationError> {
+    for _ in 0..8 {
+        let staging = random_internal_name(label);
+        match rename_noreplace(source_parent, source, destination_parent, &staging) {
+            Ok(()) => return Ok(staging),
+            Err(OperationError::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(OperationError::RepairRequired)
+}
+
+#[cfg(unix)]
+fn quarantine_entry(parent: &Dir, entry: &OsStr, quarantine: &Dir) -> Result<(), OperationError> {
+    rename_to_random_stage(parent, entry, quarantine, "repair")
+        .map(drop)
+        .map_err(|_| OperationError::RepairRequired)
+}
+
+#[cfg(unix)]
+fn restore_or_quarantine(
+    staging_parent: &Dir,
+    staging: &OsStr,
+    original_parent: &Dir,
+    original: &OsStr,
+    quarantine: &Dir,
+    restored_error: OperationError,
+) -> OperationError {
+    if rename_noreplace(staging_parent, staging, original_parent, original).is_ok() {
+        restored_error
+    } else {
+        let _ = quarantine_entry(staging_parent, staging, quarantine);
+        OperationError::RepairRequired
+    }
+}
+
+#[cfg(unix)]
+fn remove_pinned(
+    parent: &Dir,
+    leaf: &OsStr,
+    pinned: &PinnedObject,
+    quarantine: &Dir,
+    control: Option<&RequestControl>,
+) -> Result<(), OperationError> {
+    #[cfg(not(test))]
+    let _ = control;
+    // Atomically take the pathname out of the peer-writable share before the
+    // final identity check. If a racer substituted anything, that object is
+    // retained in the owner-only quarantine rather than unlinked.
+    #[cfg(test)]
+    if let Some(control) = control {
+        control.notify_before_isolation(leaf);
+    }
+    let isolated = rename_to_random_stage(parent, leaf, quarantine, "discard")?;
+    if !matches!(name_matches_pinned(quarantine, &isolated, pinned), Ok(true)) {
+        return Err(OperationError::RepairRequired);
+    }
+    let result = match pinned.kind {
+        SupportedObjectKind::RegularFile => quarantine.remove_file(&isolated),
+        SupportedObjectKind::Directory => quarantine.remove_dir(&isolated),
+    };
+    result.map_err(|_| OperationError::RepairRequired)
+}
+
+#[cfg(unix)]
+fn safe_cleanup_regular(parent: &Dir, leaf: &OsStr, quarantine: &Dir) {
+    if let Ok(pinned) = pin_supported_object(parent, leaf) {
+        if pinned.kind == SupportedObjectKind::RegularFile {
+            let _ = remove_pinned(parent, leaf, &pinned, quarantine, None);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn rollback_exchange_or_quarantine(
+    parent: &Dir,
+    staging: &OsStr,
+    destination: &OsStr,
+    published: &PinnedObject,
+    quarantine: &Dir,
+    restored_error: OperationError,
+) -> OperationError {
+    if matches!(
+        name_matches_pinned(parent, destination, published),
+        Ok(true)
+    ) && rename_exchange(parent, staging, parent, destination).is_ok()
+    {
+        restored_error
+    } else {
+        let _ = quarantine_entry(parent, staging, quarantine);
+        let _ = quarantine_entry(parent, destination, quarantine);
+        OperationError::RepairRequired
+    }
+}
+
+#[cfg(unix)]
+fn publish_regular_staging(
+    parent: &Dir,
+    staging: &OsStr,
+    destination: &OsStr,
+    quarantine: &Dir,
+    control: &RequestControl,
+) -> Result<(), OperationError> {
+    let published = pin_supported_object(parent, staging)?;
+    if published.kind != SupportedObjectKind::RegularFile {
+        return Err(OperationError::UnsupportedFileType);
+    }
+    match parent.symlink_metadata(destination) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            rename_noreplace(parent, staging, parent, destination)?;
+            #[cfg(test)]
+            control.notify_after_transaction(destination);
+            if matches!(
+                name_matches_pinned(parent, destination, &published),
+                Ok(true)
+            ) {
+                Ok(())
+            } else {
+                let _ = quarantine_entry(parent, destination, quarantine);
+                Err(OperationError::RepairRequired)
+            }
+        }
+        Err(error) => Err(error.into()),
+        Ok(_) => {
+            rename_exchange(parent, staging, parent, destination)?;
+            #[cfg(test)]
+            control.notify_after_transaction(destination);
+            if !matches!(
+                name_matches_pinned(parent, destination, &published),
+                Ok(true)
+            ) {
+                let _ = quarantine_entry(parent, staging, quarantine);
+                let _ = quarantine_entry(parent, destination, quarantine);
+                return Err(OperationError::RepairRequired);
+            }
+            let displaced = match pin_supported_object(parent, staging) {
+                Ok(pinned) if pinned.kind == SupportedObjectKind::RegularFile => pinned,
+                Ok(_) => {
+                    return Err(rollback_exchange_or_quarantine(
+                        parent,
+                        staging,
+                        destination,
+                        &published,
+                        quarantine,
+                        OperationError::UnsupportedFileType,
+                    ));
+                }
+                Err(error) => {
+                    return Err(rollback_exchange_or_quarantine(
+                        parent,
+                        staging,
+                        destination,
+                        &published,
+                        quarantine,
+                        error,
+                    ));
+                }
+            };
+            if let Err(error) =
+                remove_pinned(parent, staging, &displaced, quarantine, Some(control))
+            {
+                return Err(rollback_exchange_or_quarantine(
+                    parent,
+                    staging,
+                    destination,
+                    &published,
+                    quarantine,
+                    error,
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
+#[cfg(unix)]
+fn transactional_delete(
+    parent: &Dir,
+    leaf: &OsStr,
+    control: &RequestControl,
+) -> Result<(), OperationError> {
+    let quarantine = owner_quarantine(parent)?;
+    let staging = rename_to_random_stage(parent, leaf, parent, "delete")?;
+    #[cfg(test)]
+    control.notify_after_transaction(&staging);
+    let pinned = match pin_supported_object(parent, &staging) {
+        Ok(pinned) => pinned,
+        Err(error) => {
+            return Err(restore_or_quarantine(
+                parent,
+                &staging,
+                parent,
+                leaf,
+                &quarantine,
+                error,
+            ));
+        }
+    };
+    match remove_pinned(parent, &staging, &pinned, &quarantine, Some(control)) {
+        Ok(()) => Ok(()),
+        Err(OperationError::RepairRequired) => {
+            let _ = quarantine_entry(parent, &staging, &quarantine);
+            Err(OperationError::RepairRequired)
+        }
+        Err(error) => Err(restore_or_quarantine(
+            parent,
+            &staging,
+            parent,
+            leaf,
+            &quarantine,
+            error,
+        )),
+    }
+}
+
+#[cfg(unix)]
+fn transactional_move(
+    source_parent: &Dir,
+    source: &OsStr,
+    destination_parent: &Dir,
+    destination: &OsStr,
+    allow_overwrite: bool,
+    control: &RequestControl,
+) -> Result<bool, OperationError> {
+    let source_quarantine = owner_quarantine(source_parent)?;
+    let destination_quarantine = owner_quarantine(destination_parent)?;
+
+    // First isolate the exact source inode at an unpredictable internal name.
+    // No destination path is touched until this inode is pinned and approved.
+    let staging = rename_to_random_stage(source_parent, source, source_parent, "move")?;
+    #[cfg(test)]
+    control.notify_after_transaction(&staging);
+    let moved = match pin_supported_object(source_parent, &staging) {
+        Ok(moved) => moved,
+        Err(error) => {
+            return Err(restore_or_quarantine(
+                source_parent,
+                &staging,
+                source_parent,
+                source,
+                &source_quarantine,
+                error,
+            ));
+        }
+    };
+    if source_parent.symlink_metadata(source).is_ok() {
+        let _ = quarantine_entry(source_parent, &staging, &source_quarantine);
+        return Err(OperationError::RepairRequired);
+    }
+
+    match destination_parent.symlink_metadata(destination) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if let Err(error) =
+                rename_noreplace(source_parent, &staging, destination_parent, destination)
+            {
+                return Err(restore_or_quarantine(
+                    source_parent,
+                    &staging,
+                    source_parent,
+                    source,
+                    &source_quarantine,
+                    error,
+                ));
+            }
+            if matches!(
+                name_matches_pinned(destination_parent, destination, &moved),
+                Ok(true)
+            ) {
+                Ok(false)
+            } else {
+                let _ = quarantine_entry(destination_parent, destination, &destination_quarantine);
+                Err(OperationError::RepairRequired)
+            }
+        }
+        Err(error) => Err(restore_or_quarantine(
+            source_parent,
+            &staging,
+            source_parent,
+            source,
+            &source_quarantine,
+            error.into(),
+        )),
+        Ok(_) if !allow_overwrite => Err(restore_or_quarantine(
+            source_parent,
+            &staging,
+            source_parent,
+            source,
+            &source_quarantine,
+            OperationError::PreconditionFailed,
+        )),
+        Ok(_) => {
+            if let Err(error) =
+                rename_exchange(source_parent, &staging, destination_parent, destination)
+            {
+                return Err(restore_or_quarantine(
+                    source_parent,
+                    &staging,
+                    source_parent,
+                    source,
+                    &source_quarantine,
+                    error,
+                ));
+            }
+            if !matches!(
+                name_matches_pinned(destination_parent, destination, &moved),
+                Ok(true)
+            ) {
+                let _ = quarantine_entry(source_parent, &staging, &source_quarantine);
+                let _ = quarantine_entry(destination_parent, destination, &destination_quarantine);
+                return Err(OperationError::RepairRequired);
+            }
+            let displaced = match pin_supported_object(source_parent, &staging) {
+                Ok(displaced) if displaced.kind == moved.kind => displaced,
+                displaced => {
+                    let error = displaced
+                        .err()
+                        .unwrap_or(OperationError::UnsupportedFileType);
+                    if rename_exchange(source_parent, &staging, destination_parent, destination)
+                        .is_err()
+                    {
+                        let _ = quarantine_entry(source_parent, &staging, &source_quarantine);
+                        let _ = quarantine_entry(
+                            destination_parent,
+                            destination,
+                            &destination_quarantine,
+                        );
+                        return Err(OperationError::RepairRequired);
+                    }
+                    return Err(restore_or_quarantine(
+                        source_parent,
+                        &staging,
+                        source_parent,
+                        source,
+                        &source_quarantine,
+                        error,
+                    ));
+                }
+            };
+            match remove_pinned(
+                source_parent,
+                &staging,
+                &displaced,
+                &source_quarantine,
+                Some(control),
+            ) {
+                Ok(()) => Ok(true),
+                Err(error) => {
+                    if rename_exchange(source_parent, &staging, destination_parent, destination)
+                        .is_err()
+                    {
+                        let _ = quarantine_entry(source_parent, &staging, &source_quarantine);
+                        let _ = quarantine_entry(
+                            destination_parent,
+                            destination,
+                            &destination_quarantine,
+                        );
+                        return Err(OperationError::RepairRequired);
+                    }
+                    Err(restore_or_quarantine(
+                        source_parent,
+                        &staging,
+                        source_parent,
+                        source,
+                        &source_quarantine,
+                        error,
+                    ))
+                }
+            }
+        }
+    }
+}
+
 fn open_regular_nofollow_nonblocking(
     dir: &Dir,
     relative: &Path,
@@ -868,84 +1505,83 @@ fn atomic_write(
     body: &[u8],
     control: &RequestControl,
 ) -> Result<(), OperationError> {
-    let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let temp = OsString::from(format!(
-        ".rustscale-taildrive-{}-{sequence}.tmp",
-        std::process::id()
-    ));
-    let mut options = OpenOptions::new();
-    options
-        .write(true)
-        .create_new(true)
-        .follow(FollowSymlinks::No);
-    let mut file = parent.open_with(&temp, &options)?;
-    let write_result = (|| {
-        for chunk in body.chunks(64 * 1024) {
-            control.check()?;
-            file.write_all(chunk)?;
-        }
-        file.sync_all()?;
-        #[cfg(test)]
-        control.notify_after_sync();
-        // Cancellation/deadline or epoch revocation after durable staging
-        // must not publish the destination.
-        drop(file);
-        control.commit(|| {
-            parent.rename(&temp, parent, destination)?;
-            Ok(())
-        })?;
-        Ok(())
-    })();
-    if write_result.is_err() {
-        let _ = parent.remove_file(&temp);
+    #[cfg(not(unix))]
+    {
+        let _ = (parent, destination, body, control);
+        Err(OperationError::TransactionalUnavailable)
     }
-    write_result
+    #[cfg(unix)]
+    {
+        // Validate and pin cleanup authority before creating a temporary file,
+        // so a bad quarantine never turns a failed request into a staging leak.
+        let quarantine = owner_quarantine(parent)?;
+        let (temp, mut file) = create_staging_file(parent, "upload")?;
+        let write_result = (|| {
+            for chunk in body.chunks(64 * 1024) {
+                control.check()?;
+                file.write_all(chunk)?;
+            }
+            file.sync_all()?;
+            #[cfg(test)]
+            control.notify_after_sync();
+            // Cancellation/deadline or epoch revocation after durable staging
+            // must not publish the destination.
+            drop(file);
+            control.commit(|| {
+                publish_regular_staging(parent, &temp, destination, &quarantine, control)
+            })?;
+            Ok(())
+        })();
+        if write_result.is_err() {
+            safe_cleanup_regular(parent, &temp, &quarantine);
+        }
+        write_result
+    }
 }
 
 fn atomic_write_streaming(
     parent: &Dir,
     destination: &OsStr,
-    mut body: StreamingBody,
+    body: StreamingBody,
     control: &RequestControl,
 ) -> Result<(), OperationError> {
-    let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let temp = OsString::from(format!(
-        ".rustscale-taildrive-{}-{sequence}.tmp",
-        std::process::id()
-    ));
-    let mut options = OpenOptions::new();
-    options
-        .write(true)
-        .create_new(true)
-        .follow(FollowSymlinks::No);
-    let mut file = parent.open_with(&temp, &options)?;
-    let write_result = (|| {
-        let mut received = 0usize;
-        while let Some(chunk) = body.receiver.blocking_recv() {
-            control.check()?;
-            received = received
-                .checked_add(chunk.len())
-                .ok_or(OperationError::RequestTooLarge)?;
-            if received > body.expected_length {
-                return Err(OperationError::RequestTooLarge);
-            }
-            file.write_all(&chunk)?;
-        }
-        if received != body.expected_length {
-            return Err(OperationError::IncompleteBody);
-        }
-        file.sync_all()?;
-        drop(file);
-        control.commit(|| {
-            parent.rename(&temp, parent, destination)?;
-            Ok(())
-        })?;
-        Ok(())
-    })();
-    if write_result.is_err() {
-        let _ = parent.remove_file(&temp);
+    #[cfg(not(unix))]
+    {
+        let _ = (parent, destination, body, control);
+        Err(OperationError::TransactionalUnavailable)
     }
-    write_result
+    #[cfg(unix)]
+    {
+        let mut body = body;
+        let quarantine = owner_quarantine(parent)?;
+        let (temp, mut file) = create_staging_file(parent, "stream")?;
+        let write_result = (|| {
+            let mut received = 0usize;
+            while let Some(chunk) = body.receiver.blocking_recv() {
+                control.check()?;
+                received = received
+                    .checked_add(chunk.len())
+                    .ok_or(OperationError::RequestTooLarge)?;
+                if received > body.expected_length {
+                    return Err(OperationError::RequestTooLarge);
+                }
+                file.write_all(&chunk)?;
+            }
+            if received != body.expected_length {
+                return Err(OperationError::IncompleteBody);
+            }
+            file.sync_all()?;
+            drop(file);
+            control.commit(|| {
+                publish_regular_staging(parent, &temp, destination, &quarantine, control)
+            })?;
+            Ok(())
+        })();
+        if write_result.is_err() {
+            safe_cleanup_regular(parent, &temp, &quarantine);
+        }
+        write_result
+    }
 }
 
 #[derive(Clone)]
@@ -1035,6 +1671,9 @@ fn propfind_share(
             let Ok(name) = entry.file_name().into_string() else {
                 continue;
             };
+            if name.starts_with(".rustscale-taildrive-") {
+                continue;
+            }
             let metadata = entry.metadata()?;
             if !metadata.is_dir() && !metadata.is_file() {
                 continue;
@@ -1110,10 +1749,19 @@ enum OperationError {
     NotFound,
     MethodNotAllowed,
     UnsupportedFileType,
+    #[cfg_attr(
+        any(target_os = "linux", target_os = "android", target_vendor = "apple"),
+        allow(dead_code)
+    )]
+    TransactionalUnavailable,
+    #[cfg_attr(not(unix), allow(dead_code))]
+    RepairRequired,
     UnsupportedMediaType,
     PreconditionFailed,
     CrossShare,
+    #[cfg_attr(not(unix), allow(dead_code))]
     RequestTooLarge,
+    #[cfg_attr(not(unix), allow(dead_code))]
     IncompleteBody,
     ResponseTooLarge,
     TooManyEntries,
@@ -1142,6 +1790,14 @@ impl OperationError {
                 Response::text(405, "method not allowed").header("allow", ALLOW)
             }
             Self::UnsupportedFileType => Response::text(403, "unsupported filesystem object"),
+            Self::TransactionalUnavailable => Response::text(
+                501,
+                "safe conditional filesystem mutation is unavailable on this platform",
+            ),
+            Self::RepairRequired => Response::text(
+                500,
+                "filesystem race quarantined an object; owner repair is required",
+            ),
             Self::UnsupportedMediaType => Response::text(415, "MKCOL body is not supported"),
             Self::PreconditionFailed => Response::text(412, "destination exists"),
             Self::CrossShare => Response::text(502, "cross-share operation is forbidden"),
@@ -1223,6 +1879,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn hermetic_webdav_client_server_round_trip() {
         let harness = Harness::new();
@@ -1296,6 +1953,30 @@ mod tests {
         );
     }
 
+    #[cfg(not(unix))]
+    #[test]
+    fn transactional_mutations_fail_closed_without_staging() {
+        let harness = Harness::new();
+        for request in [
+            Request::new("PUT", "/docs/new").with_body(b"data"),
+            Request::new("COPY", "/docs/hello.txt").with_header("Destination", "/docs/copied"),
+            Request::new("DELETE", "/docs/hello.txt"),
+            Request::new("MOVE", "/docs/hello.txt").with_header("Destination", "/docs/moved"),
+        ] {
+            let response = harness.request(&harness.read_write, request);
+            assert_eq!(response.status, 501);
+        }
+        assert!(harness.root.join("hello.txt").exists());
+        assert!(!harness.root.join("new").exists());
+        assert!(!harness.root.join("copied").exists());
+        assert!(!harness.root.join("moved").exists());
+        assert!(!std::fs::read_dir(&harness.root).unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".rustscale-taildrive-")));
+    }
+
     #[cfg(unix)]
     #[test]
     fn traversal_and_symlink_escape_are_blocked() {
@@ -1364,6 +2045,7 @@ mod tests {
         assert!(!harness.root.join("expired").exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn cancellation_after_sync_never_publishes_temp_file() {
         let harness = Harness::new();
@@ -1378,15 +2060,19 @@ mod tests {
         );
         assert_eq!(response.status, 408);
         let deadline = Instant::now() + Duration::from_secs(1);
+        let quarantine = harness.root.join(QUARANTINE_DIRECTORY);
         loop {
             let entries = std::fs::read_dir(&harness.root)
                 .unwrap()
                 .map(|entry| entry.unwrap().file_name())
                 .collect::<Vec<_>>();
-            if !entries
-                .iter()
-                .any(|name| name.to_string_lossy().starts_with(".rustscale-taildrive-"))
-            {
+            let root_is_clean = !entries.iter().any(|name| {
+                let name = name.to_string_lossy();
+                name.starts_with(".rustscale-taildrive-") && name != QUARANTINE_DIRECTORY
+            });
+            let quarantine_is_clean =
+                !quarantine.exists() || std::fs::read_dir(&quarantine).unwrap().next().is_none();
+            if root_is_clean && quarantine_is_clean {
                 break;
             }
             assert!(
@@ -1396,6 +2082,83 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(!harness.root.join("not-published").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quarantine_creation_is_parallel_idempotent_and_validates_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let harness = Harness::new();
+        let snapshot = harness.server.config.snapshot();
+        let share_root = snapshot.shares.get("docs").unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let mut workers = Vec::new();
+        for _ in 0..8 {
+            let parent = share_root.dir.try_clone().unwrap();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                owner_quarantine(&parent).unwrap();
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let quarantine = harness.root.join(QUARANTINE_DIRECTORY);
+        assert_eq!(
+            std::fs::metadata(&quarantine).unwrap().permissions().mode() & 0o7777,
+            0o700
+        );
+
+        let invalid = Harness::new();
+        let quarantine = invalid.root.join(QUARANTINE_DIRECTORY);
+        std::fs::create_dir(&quarantine).unwrap();
+        std::fs::set_permissions(&quarantine, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let response = invalid.request(
+            &invalid.read_write,
+            Request::new("PUT", "/docs/rejected").with_body(b"data"),
+        );
+        assert_eq!(response.status, 500);
+        assert!(String::from_utf8_lossy(&response.body).contains("owner repair"));
+        assert!(!invalid.root.join("rejected").exists());
+        assert!(!std::fs::read_dir(&invalid.root).unwrap().any(|entry| {
+            let name = entry.unwrap().file_name();
+            let name = name.to_string_lossy();
+            name.starts_with(".rustscale-taildrive-upload-")
+                || name.starts_with(".rustscale-taildrive-stream-")
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn incomplete_streaming_put_cleans_random_staging() {
+        let harness = Harness::new();
+        let (sender, body) = streaming_body_channel(4, 1);
+        sender.try_send(b"abc".to_vec()).unwrap();
+        drop(sender);
+        let response = harness.server.handle_streaming_put(
+            &harness.read_write,
+            Request::new("PUT", "/docs/incomplete"),
+            body,
+            &RequestControl::new(
+                harness.server.request_authority(),
+                Instant::now() + Duration::from_secs(2),
+            ),
+        );
+        assert_eq!(response.status, 400);
+        assert!(!harness.root.join("incomplete").exists());
+        assert!(!std::fs::read_dir(&harness.root).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".rustscale-taildrive-stream-")
+        }));
+        assert!(std::fs::read_dir(harness.root.join(QUARANTINE_DIRECTORY))
+            .unwrap()
+            .next()
+            .is_none());
     }
 
     #[cfg(unix)]
@@ -1424,10 +2187,236 @@ mod tests {
                     .with_header("Destination", format!("/docs/{name}-copy")),
             );
             assert_eq!(copy.status, 403);
+            let put = harness.request(
+                &harness.read_write,
+                Request::new("PUT", format!("/docs/{name}")).with_body(b"replacement"),
+            );
+            assert_eq!(put.status, 403);
+            let delete = harness.request(
+                &harness.read_write,
+                Request::new("DELETE", format!("/docs/{name}")),
+            );
+            assert_eq!(delete.status, 403);
+            let move_source = harness.request(
+                &harness.read_write,
+                Request::new("MOVE", format!("/docs/{name}"))
+                    .with_header("Destination", format!("/docs/{name}-moved")),
+            );
+            assert_eq!(move_source.status, 403);
+            let move_destination = harness.request(
+                &harness.read_write,
+                Request::new("MOVE", "/docs/hello.txt")
+                    .with_header("Destination", format!("/docs/{name}")),
+            );
+            assert_eq!(move_destination.status, 403);
+            assert!(harness.root.join(name).exists());
+            assert!(harness.root.join("hello.txt").exists());
+            assert!(!harness.root.join(format!("{name}-copy")).exists());
+            assert!(!harness.root.join(format!("{name}-moved")).exists());
             assert!(started.elapsed() < Duration::from_secs(1));
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn special_object_swaps_at_publication_are_rejected_untouched() {
+        use std::os::unix::net::UnixListener;
+
+        let harness = Harness::new();
+        let swap_to_socket = |name: &'static str| {
+            let path = harness.root.join(name);
+            std::fs::write(&path, b"ordinary").unwrap();
+            let held = Arc::new(Mutex::new(None));
+            let hook_held = held.clone();
+            let hook_path = path.clone();
+            let control = RequestControl::new(
+                harness.server.request_authority(),
+                Instant::now() + Duration::from_secs(2),
+            )
+            .with_before_commit(Arc::new(move || {
+                std::fs::remove_file(&hook_path).unwrap();
+                *hook_held.lock().unwrap() = Some(UnixListener::bind(&hook_path).unwrap());
+            }));
+            (path, held, control)
+        };
+
+        let (put_path, put_socket, put_control) = swap_to_socket("race-put");
+        let put = harness.server.handle(
+            &harness.read_write,
+            Request::new("PUT", "/docs/race-put").with_body(b"replacement"),
+            &put_control,
+        );
+        assert_eq!(put.status, 403);
+        assert!(put_socket.lock().unwrap().is_some());
+        assert!(put_path.exists());
+
+        let (delete_path, delete_socket, delete_control) = swap_to_socket("race-delete");
+        let delete = harness.server.handle(
+            &harness.read_write,
+            Request::new("DELETE", "/docs/race-delete"),
+            &delete_control,
+        );
+        assert_eq!(delete.status, 403);
+        assert!(delete_socket.lock().unwrap().is_some());
+        assert!(delete_path.exists());
+
+        std::fs::write(harness.root.join("race-move-source"), b"source").unwrap();
+        let (destination_path, destination_socket, destination_control) =
+            swap_to_socket("race-move-destination");
+        let move_destination = harness.server.handle(
+            &harness.read_write,
+            Request::new("MOVE", "/docs/race-move-source")
+                .with_header("Destination", "/docs/race-move-destination"),
+            &destination_control,
+        );
+        assert_eq!(move_destination.status, 403);
+        assert!(destination_socket.lock().unwrap().is_some());
+        assert!(destination_path.exists());
+        assert!(harness.root.join("race-move-source").exists());
+
+        let (source_path, source_socket, source_control) = swap_to_socket("race-source-swap");
+        let move_source = harness.server.handle(
+            &harness.read_write,
+            Request::new("MOVE", "/docs/race-source-swap")
+                .with_header("Destination", "/docs/race-source-destination"),
+            &source_control,
+        );
+        assert_eq!(move_source.status, 403);
+        assert!(source_socket.lock().unwrap().is_some());
+        assert!(source_path.exists());
+        assert!(!harness.root.join("race-source-destination").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_post_rename_special_swap_is_restored_without_unlink() {
+        use std::os::unix::fs::MetadataExt as _;
+        use std::process::Command;
+
+        let harness = Harness::new();
+        std::fs::write(harness.root.join("exact-race"), b"regular").unwrap();
+        let raced = Arc::new(Mutex::new(None));
+        let hook_raced = raced.clone();
+        let hook_root = harness.root.clone();
+        let control = RequestControl::new(
+            harness.server.request_authority(),
+            Instant::now() + Duration::from_secs(2),
+        )
+        .with_after_transaction(Arc::new(move |staging| {
+            let staging = hook_root.join(staging);
+            std::fs::remove_file(&staging).unwrap();
+            assert!(Command::new("mkfifo")
+                .arg(&staging)
+                .status()
+                .unwrap()
+                .success());
+            let inode = std::fs::symlink_metadata(&staging).unwrap().ino();
+            *hook_raced.lock().unwrap() = Some(inode);
+        }));
+
+        let response = harness.server.handle(
+            &harness.read_write,
+            Request::new("DELETE", "/docs/exact-race"),
+            &control,
+        );
+        assert_eq!(response.status, 403);
+        let victim = harness.root.join("exact-race");
+        let metadata = std::fs::symlink_metadata(&victim).unwrap();
+        assert!(metadata.file_type().is_fifo());
+        assert_eq!(metadata.ino(), raced.lock().unwrap().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_post_inspection_swap_is_quarantined_without_unlink() {
+        use std::os::unix::fs::MetadataExt as _;
+        use std::process::Command;
+
+        let harness = Harness::new();
+        std::fs::write(harness.root.join("isolation-race"), b"regular").unwrap();
+        let raced_inode = Arc::new(Mutex::new(None));
+        let hook_inode = raced_inode.clone();
+        let hook_root = harness.root.clone();
+        let control = RequestControl::new(
+            harness.server.request_authority(),
+            Instant::now() + Duration::from_secs(2),
+        )
+        .with_before_isolation(Arc::new(move |staging| {
+            let staging = hook_root.join(staging);
+            std::fs::remove_file(&staging).unwrap();
+            assert!(Command::new("mkfifo")
+                .arg(&staging)
+                .status()
+                .unwrap()
+                .success());
+            *hook_inode.lock().unwrap() = Some(std::fs::symlink_metadata(staging).unwrap().ino());
+        }));
+
+        let response = harness.server.handle(
+            &harness.read_write,
+            Request::new("DELETE", "/docs/isolation-race"),
+            &control,
+        );
+        assert_eq!(response.status, 500);
+        assert!(!harness.root.join("isolation-race").exists());
+        let entries = std::fs::read_dir(harness.root.join(QUARANTINE_DIRECTORY))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 1);
+        let metadata = std::fs::symlink_metadata(&entries[0]).unwrap();
+        assert!(metadata.file_type().is_fifo());
+        assert_eq!(metadata.ino(), raced_inode.lock().unwrap().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unrestorable_special_object_is_retained_in_owner_quarantine() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        use std::os::unix::net::UnixListener;
+
+        let harness = Harness::new();
+        let victim = harness.root.join("quarantine-race");
+        let original = UnixListener::bind(&victim).unwrap();
+        let original_inode = std::fs::symlink_metadata(&victim).unwrap().ino();
+        let replacement = Arc::new(Mutex::new(None));
+        let hook_replacement = replacement.clone();
+        let hook_victim = victim.clone();
+        let control = RequestControl::new(
+            harness.server.request_authority(),
+            Instant::now() + Duration::from_secs(2),
+        )
+        .with_after_transaction(Arc::new(move |_| {
+            *hook_replacement.lock().unwrap() = Some(UnixListener::bind(&hook_victim).unwrap());
+        }));
+
+        let response = harness.server.handle(
+            &harness.read_write,
+            Request::new("DELETE", "/docs/quarantine-race"),
+            &control,
+        );
+        assert_eq!(response.status, 500);
+        assert!(String::from_utf8_lossy(&response.body).contains("owner repair"));
+        assert!(replacement.lock().unwrap().is_some());
+        assert!(victim.exists(), "raced-in replacement was altered");
+
+        let quarantine = harness.root.join(QUARANTINE_DIRECTORY);
+        assert_eq!(
+            std::fs::metadata(&quarantine).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let entries = std::fs::read_dir(&quarantine)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 1);
+        let quarantined = std::fs::symlink_metadata(&entries[0]).unwrap();
+        assert_eq!(quarantined.ino(), original_inode);
+        assert!(quarantined.file_type().is_socket());
+        drop(original);
+    }
+
+    #[cfg(unix)]
     fn paused_before_commit(
         server: &Server,
     ) -> (
@@ -1456,6 +2445,7 @@ mod tests {
         (control, entered_rx, release)
     }
 
+    #[cfg(unix)]
     fn revoke_then_release(
         server: &Server,
         entered: std::sync::mpsc::Receiver<()>,
@@ -1468,6 +2458,7 @@ mod tests {
         condition.notify_all();
     }
 
+    #[cfg(unix)]
     #[test]
     fn revocation_linearizes_every_webdav_publication() {
         let harness = Harness::new();
@@ -1612,14 +2603,17 @@ mod tests {
             b"copy"
         );
         assert!(!std::fs::read_dir(&harness.root).unwrap().any(|entry| {
-            entry
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".rustscale-taildrive-")
+            let name = entry.unwrap().file_name();
+            let name = name.to_string_lossy();
+            name.starts_with(".rustscale-taildrive-") && name != QUARANTINE_DIRECTORY
         }));
+        let quarantine = harness.root.join(QUARANTINE_DIRECTORY);
+        if quarantine.exists() {
+            assert!(std::fs::read_dir(quarantine).unwrap().next().is_none());
+        }
     }
 
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn many_max_sized_puts_stream_through_bounded_queues() {
         const REQUESTS: usize = 8;

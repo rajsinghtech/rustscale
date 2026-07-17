@@ -82,7 +82,16 @@ surface. It was compared with Tailscale's `drive/`, `feature/drive`,
   FIFOs, devices, sockets, reparse points, and symlink sources are rejected.
 - PUT bodies stream in 64 KiB chunks through a two-slot channel to the bounded
   filesystem pool; a full-body clone is never made. Uploads use same-directory
-  temporary files, `sync_all`, a final cancellation check, and rename.
+  temporary files, `sync_all`, a final cancellation check, and rename. PUT,
+  DELETE, MOVE, and COPY accept only regular files/directories as each method
+  permits. On supported Unix targets, PUT/COPY/DELETE/MOVE first use atomic
+  no-replace staging or exchange, then pin and inspect the exact displaced or
+  source inode through a no-follow file descriptor before any unlink. A safe
+  failure atomically restores the exact inode; if a concurrent pathname race
+  makes restoration unsafe, all recoverable objects are retained in a hidden
+  owner-only quarantine and the request returns a repair-required error.
+  Special objects are never unlinked. Platforms without the required atomic
+  rename primitives fail these mutations closed.
   Configuration root opening, upload/copy I/O, and sync happen outside the
   commit barrier; only the final publication is guarded. Cancellation after
   sync cannot publish the destination, and failed or truncated uploads remove
@@ -95,22 +104,73 @@ The local, peer-credential-authorized API exposes:
 - `GET /localapi/v0/drive/status` — enabled state, signed `sharingAllowed`
   state, generation, and configured shares.
 - `GET /localapi/v0/drive/config` — current `{ "enabled", "shares" }` runtime
-  configuration.
+  configuration and a strong opaque `ETag`. It hashes the generation and exact
+  config with a fresh cryptographic per-runtime nonce, preventing restart ABA
+  without including persisted secrets or key material.
 - `PUT /localapi/v0/drive/config` — bounded, all-or-nothing replacement using
-  the same object shape. This mutation requires LocalAPI read-write identity
-  (root or the daemon UID on Unix); read-only local identities receive 403.
+  the same object shape and a mandatory `If-Match` from the preceding GET.
+  A concurrent mutation returns 412 without changing the newer snapshot.
 
-These endpoints intentionally provide no platform mount, remote composition,
-or automatic persistence behavior.
+The status/config reads require ordinary LocalAPI read-write identity. Config
+mutation is stricter: only root or the daemon UID reported by trusted kernel
+peer credentials, or the owning process through its in-memory client, may
+change roots on Unix. An authenticated loopback/TCP credential has no trusted
+OS UID and cannot mutate Drive configuration;
+`OperatorUser` is also denied until user switching or per-caller filesystem
+capabilities exist. Loopback credentials are redacted from Debug output and
+request types carrying authorization headers have no Debug representation.
+Bodies and responses are limited to 1 MiB. These endpoints
+intentionally provide no platform mount, remote composition, security-scoped
+bookmark, or automatic persistence behavior.
+
+All socket and authenticated loopback LocalAPI routes now use the same phased
+reader: a 64 KiB/deadline-bounded header is read without consuming body bytes;
+peer identity, route permission, stale-listener checks, and global/per-identity
+request admission happen before body reads. Content-Length is unique and
+strict, transfer encoding is rejected, route-specific/global/identity byte
+limits apply, and body reads have an overall minimum-rate deadline. Early EOF
+or disconnect cancels the request before dispatch. This protects zero-body and
+non-Drive endpoints as well as Drive configuration.
+
+### CLI
+
+The first production CLI slice intentionally follows the upstream local-share
+names where they apply:
+
+- `rustscale drive status [--json]` reports runtime/capability state,
+  generation, and configured shares.
+- `rustscale drive list [--json]` prints upstream-style `name`, `path`, and
+  `as` columns, or the share array as JSON.
+- `rustscale drive share <name> <path>` adds a share or replaces the path for
+  an existing normalized name through one ETag-guarded complete replacement.
+- `rustscale drive unshare <name>` removes one share through the same CAS. The
+  last removal returns the runtime to disabled.
+
+CLI and LocalAPI operations have bounded response sizes and a ten-second
+request deadline; Ctrl-C drops the in-flight request. Cancellation or a
+transport/response failure during mutation reports that commit may be
+ambiguous and directs the operator to re-read the list. Share names use
+upstream lowercasing/character rules. Paths are made absolute and then opened
+component-by-component without following links before LocalAPI is contacted;
+the daemon repeats the authoritative capability open before publication.
+Remote mounts/composition, rename, share-as, and macOS bookmark commands fail
+explicitly rather than claiming support.
 
 ## Tested
 
-Hermetic core and wiring tests cover browse/read/write/move/delete,
-unauthorized peers, signed grant narrowing from read-write to read-only,
+Hermetic core, LocalAPI, localclient, and CLI tests cover
+compare-and-swap concurrent mutations, restart-unique ETags, daemon/root versus
+operator and credential-only authorization (including raw pre-body denial),
+credential redaction, phased LocalAPI body admission, cancellation/deadlines,
+bounded JSON responses, CLI completion and text/JSON
+shapes, malicious names, traversal, symlink and special-file roots, explicit
+remote/bookmark rejection, browse/read/write/move/delete, unauthorized peers,
+signed grant narrowing from read-write to read-only,
 complete capability revocation, forged grant headers, disabled startup,
 read-only LocalAPI mutation denial, failed-config atomicity, bounded parsing,
 request cancellation, deterministic root replacement, FIFO/socket rejection,
-worker saturation, post-sync cancellation, traversal, symlink escape,
+worker saturation, post-sync cancellation, publication-time special-object
+swaps that remain untouched, traversal, symlink escape,
 oversized requests, malicious `Destination` values, body-before-authorization
 framing, aggregate byte admission, old-key denial/new-key success, tunnel/send
 path removal on rotation, duplicate address ownership, eight concurrent 16 MiB
@@ -120,8 +180,9 @@ WebDAV publication followed by successful new-epoch retries.
 ## Deferred
 
 Platform filesystem mounts, local composition of remote nodes, Finder/Explorer
-integration, GUI/CLI share management, persistent profile-scoped share
-configuration, subprocess user switching, macOS bookmarks, WebDAV locking,
+integration, GUI share management, CLI rename/share-as, persistent
+profile-scoped share configuration, subprocess user switching, macOS
+bookmarks, WebDAV locking,
 recursive collection copy/delete, range responses, metadata caching, and
 availability probing remain deferred. The current work is a secure server and
 configuration parity layer, not complete Taildrive product parity.

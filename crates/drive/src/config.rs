@@ -12,6 +12,7 @@ use crate::path::normalize_share_name;
 
 /// A configured local directory exposed as a Taildrive share.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Share {
     pub name: String,
     pub path: PathBuf,
@@ -181,6 +182,31 @@ impl ConfigStore {
             Ok(current) => current,
             Err(poisoned) => poisoned.into_inner(),
         };
+        Self::commit_locked(&mut current, prepared)
+    }
+
+    /// Publish a prepared replacement only if the caller observed
+    /// `expected_generation`. This compare-and-swap prevents read/modify/write
+    /// clients from silently overwriting a concurrent share update.
+    pub fn commit_if_generation(
+        &self,
+        prepared: PreparedConfig,
+        expected_generation: u64,
+    ) -> Result<u64, ConfigError> {
+        let mut current = match self.current.write() {
+            Ok(current) => current,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if current.generation != expected_generation {
+            return Err(ConfigError::GenerationMismatch {
+                expected: expected_generation,
+                actual: current.generation,
+            });
+        }
+        Ok(Self::commit_locked(&mut current, prepared))
+    }
+
+    fn commit_locked(current: &mut Arc<Snapshot>, prepared: PreparedConfig) -> u64 {
         let generation = current.generation.saturating_add(1);
         *current = Arc::new(Snapshot {
             generation,
@@ -204,8 +230,13 @@ impl ConfigStore {
     }
 }
 
-/// Open an absolute share root exactly once, walking every user-controlled
-/// component relative to a pinned parent handle without following links.
+/// Validate an absolute share root by opening every user-controlled component
+/// relative to a pinned parent handle without following links.
+pub fn validate_share_root(path: &Path) -> Result<(), ConfigError> {
+    open_validated_root(path).map(drop)
+}
+
+/// Open and retain the capability used by a configured share snapshot.
 fn open_validated_root(path: &Path) -> Result<Dir, ConfigError> {
     if !path.is_absolute() {
         return Err(ConfigError::RootNotAbsolute(path.to_path_buf()));
@@ -281,6 +312,10 @@ pub enum ConfigError {
     DisabledWithShares,
     #[error("duplicate Taildrive share {0:?}")]
     DuplicateShare(String),
+    #[error(
+        "Taildrive configuration changed concurrently (expected generation {expected}, current generation {actual})"
+    )]
+    GenerationMismatch { expected: u64, actual: u64 },
     #[error("Taildrive share root must be absolute: {0}")]
     RootNotAbsolute(PathBuf),
     #[error("Taildrive share root is not a directory: {0}")]
@@ -376,6 +411,30 @@ mod tests {
         assert!(store
             .replace(true, vec![Share::new("docs", final_link)])
             .is_err());
+    }
+
+    #[test]
+    fn stale_generation_cannot_replace_a_newer_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let store = ConfigStore::new(Limits::default());
+        let first = store
+            .prepare(true, vec![Share::new("first", &root)])
+            .unwrap();
+        let stale = store
+            .prepare(true, vec![Share::new("stale", &root)])
+            .unwrap();
+        assert_eq!(store.commit_if_generation(first, 0).unwrap(), 1);
+        assert!(matches!(
+            store.commit_if_generation(stale, 0),
+            Err(ConfigError::GenerationMismatch {
+                expected: 0,
+                actual: 1
+            })
+        ));
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.generation(), 1);
+        assert_eq!(snapshot.shares().next().unwrap().name, "first");
     }
 
     #[test]

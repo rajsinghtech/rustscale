@@ -58,6 +58,11 @@ fn hidden_command_completes_top_level_and_nested_contexts() {
         stdout_lines(&["__complete", "--", "drive", "sh"]),
         ["share"]
     );
+    assert_eq!(
+        stdout_lines(&["__complete", "--", "dns", ""]),
+        ["status", "query"]
+    );
+    assert_eq!(stdout_lines(&["__complete", "--", "dns", "q"]), ["query"]);
 }
 
 #[test]

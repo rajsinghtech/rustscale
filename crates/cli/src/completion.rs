@@ -102,6 +102,8 @@ const DRIVE_SUBCOMMANDS: &[CommandSpec] = &[
     command("share", &[], NONE),
     command("unshare", &[], NONE),
 ];
+const DNS_SUBCOMMANDS: &[CommandSpec] =
+    &[command("status", &[], NONE), command("query", &[], NONE)];
 const COMPLETION_SUBCOMMANDS: &[CommandSpec] = &[
     command("bash", &[], NONE),
     command("zsh", &[], NONE),
@@ -249,14 +251,7 @@ const COMMANDS: &[CommandSpec] = &[
         ],
         NONE,
     ),
-    command(
-        "dns",
-        &[flag(
-            "--type",
-            FlagValue::OneOf(&["A", "AAAA", "CNAME", "MX", "PTR", "TXT"]),
-        )],
-        NONE,
-    ),
+    command("dns", &[], DNS_SUBCOMMANDS),
     command("nc", &[], NONE),
     command("id-token", &[], NONE),
     command("update", &[], NONE),
@@ -498,6 +493,8 @@ mod tests {
             vec!["status", "ipconfig", "metrics", "capture"]
         );
         assert_eq!(complete(&words(&["file", "--json", "g"])), vec!["get"]);
+        assert_eq!(complete(&words(&["dns", ""])), vec!["status", "query"]);
+        assert_eq!(complete(&words(&["dns", "q"])), vec!["query"]);
         assert!(complete(&words(&["serve", "--bg", "st"])).is_empty());
     }
 

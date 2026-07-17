@@ -215,7 +215,8 @@ fn usage(bin: &str) {
     eprintln!("  debug [status|ipconfig|metrics|capture] call daemon debug endpoints");
     eprintln!("  bugreport                            print diagnostic summary for bug reports");
     eprintln!("  exit-node [--list] [--suggest]       list or select exit nodes");
-    eprintln!("  dns [name] [--type <type>]           query the daemon DNS resolver");
+    eprintln!("  dns status [--json]                  print MagicDNS status");
+    eprintln!("  dns query [--json] <name> [A|AAAA]   query the daemon DNS resolver");
     eprintln!("  nc <host:port>                       netcat via tailnet (not yet supported)");
     eprintln!("  id-token <audience>                  fetch an OIDC ID token for this machine");
     eprintln!("  update [--yes|--dry-run] [flags]   update from RustScale GitHub releases");

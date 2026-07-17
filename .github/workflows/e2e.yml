@@ -135,6 +135,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
 
+      # No token or external tailnet exists yet. Fail before credential minting
+      # if this runner cannot create and configure a real Linux TUN device.
+      - name: Establish Linux TUN prerequisites (credential-free)
+        run: tools/interop-tun-preflight.sh
+
       - name: Install Go tailscale client
         run: |
           installer=$(mktemp)

@@ -63,7 +63,7 @@ jobs:
         if: ${{ matrix.os == 'ubuntu-22.04' }}
         run: |
           go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
-          shellcheck scripts/*.sh container/*.sh tools/packaging/*.sh
+          shellcheck scripts/*.sh container/*.sh tools/packaging/*.sh tools/interop-tun*.sh
           tools/packaging/check-release.sh
           tools/packaging/test-install.sh
           tools/packaging/test-first-run.sh

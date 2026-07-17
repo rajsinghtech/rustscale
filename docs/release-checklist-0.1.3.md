@@ -13,7 +13,7 @@ required GitHub Actions workflow.
 
   ```sh
   tools/check.sh
-  shellcheck scripts/*.sh container/*.sh tools/packaging/*.sh
+  shellcheck scripts/*.sh container/*.sh tools/packaging/*.sh tools/interop-tun*.sh
   tools/packaging/check-release.sh
   tools/packaging/test-install.sh
   tools/packaging/test-first-run.sh
@@ -24,6 +24,11 @@ required GitHub Actions workflow.
 
 - Require a clean Linux installed-first-run acceptance run and Linux glibc
   compatibility execution from the exact release commit.
+- Require the trusted-repository `interop-tun` job from the exact release
+  commit. Its credential-free preflight must complete before OIDC minting, and
+  its focused privileged test must prove Linux TUN kernel state plus a packet
+  roundtrip. Do not run the credentialed harness as part of local release
+  validation.
 - Review `docs/release-first-run.md`. The protected real-control smoke gate is
   manual and requires explicit approval, a disposable identity, and mandatory
   teardown.
@@ -61,3 +66,7 @@ GHCR multi-architecture manifest and verify `rustscale`, `rustscaled`,
 
 Publishing individual workspace crates to crates.io remains a separate
 operation.
+
+The current TUN gate is source-level. Installed systemd service behavior in a
+private network namespace and TUN startup from the exact published archive or
+container remain explicit release gaps; see `docs/release-first-run.md`.

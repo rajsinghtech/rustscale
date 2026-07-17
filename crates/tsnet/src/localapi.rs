@@ -6206,7 +6206,14 @@ mod tests {
             b"POST /localapi/v0/dial?addr=peer%3A8080 HTTP/1.1\r\nContent-Length: 0\r\n\r\n"
                 .as_slice()
         };
-        parse_request_head(raw, Vec::new()).unwrap()
+        let head = parse_request_head(raw).unwrap();
+        HttpRequest {
+            method: head.method,
+            path: head.path,
+            query: head.query,
+            headers: head.headers,
+            body: Vec::new(),
+        }
     }
 
     async fn read_test_header(stream: &mut tokio::io::DuplexStream) -> Vec<u8> {

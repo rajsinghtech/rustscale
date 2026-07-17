@@ -2785,7 +2785,9 @@ impl Server {
             metrics: localapi::default_metric_registry(),
             prefs: prefs.clone(),
             operator_access: std::sync::Mutex::default(),
-            posture_checking: Arc::new(AtomicBool::new(prefs.read().await.PostureChecking)),
+            posture_checking: Arc::new(crate::LivePosturePreference::new(
+                prefs.read().await.PostureChecking,
+            )),
             profile_mutations: Arc::new(tokio::sync::Mutex::new(())),
             exit_node_selection: Arc::new(RwLock::new(ExitNodeSelection::from_prefs(
                 &*prefs.read().await,
@@ -3768,8 +3770,10 @@ impl Server {
             .load_prefs()
             .map(|prefs| prefs.PostureChecking)
             .unwrap_or(false);
-        let posture_checking = Arc::new(AtomicBool::new(
+        let posture_service = Arc::new(rustscale_posture::IdentityService::default());
+        let posture_checking = Arc::new(crate::LivePosturePreference::with_publication_barrier(
             self.config.posture_checking || persisted_posture,
+            posture_service.publication_barrier(),
         ));
         let c2n_log_level = rustscale_c2n::LogLevelState::new();
         let c2n_backend = Arc::new(c2n::TsnetC2nBackend::new(
@@ -3786,7 +3790,7 @@ impl Server {
                 sockstats: sockstats.clone(),
                 logtail: self.config.logtail.clone(),
                 posture_checking: posture_checking.clone(),
-                posture_service: Arc::new(rustscale_posture::IdentityService::default()),
+                posture_service,
             },
             c2n_log_level,
         ));

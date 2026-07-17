@@ -178,6 +178,65 @@ const CAPABILITY_VERSION: i32 = 141;
 /// `cmp.Or(nc.opts.ProtocolVersion, uint16(tailcfg.CurrentCapabilityVersion))`.
 const PROTOCOL_VERSION: u16 = 141;
 
+/// Live posture preference plus the publication barrier that linearizes
+/// preference revocation against sensitive C2N transport writes.
+pub(crate) struct LivePosturePreference {
+    value: AtomicBool,
+    publication: Arc<rustscale_posture::PublicationBarrier>,
+}
+
+impl LivePosturePreference {
+    pub(crate) fn new(value: bool) -> Self {
+        Self::with_publication_barrier(
+            value,
+            Arc::new(rustscale_posture::PublicationBarrier::new()),
+        )
+    }
+
+    pub(crate) fn with_publication_barrier(
+        value: bool,
+        publication: Arc<rustscale_posture::PublicationBarrier>,
+    ) -> Self {
+        Self {
+            value: AtomicBool::new(value),
+            publication,
+        }
+    }
+
+    pub(crate) fn load(&self, ordering: std::sync::atomic::Ordering) -> bool {
+        self.value.load(ordering)
+    }
+
+    pub(crate) fn store(&self, value: bool, ordering: std::sync::atomic::Ordering) {
+        self.publication
+            .update_preference(|| self.value.swap(value, ordering) != value);
+    }
+
+    pub(crate) fn snapshot(&self) -> (bool, u64, u64) {
+        let (generation, (value, policy_generation)) = self.publication.snapshot_with(|policy| {
+            (
+                self.value.load(std::sync::atomic::Ordering::Acquire),
+                policy.policy_generation,
+            )
+        });
+        (value, generation, policy_generation)
+    }
+
+    pub(crate) fn with_generation<R>(
+        &self,
+        expected_generation: u64,
+        operation: impl FnOnce(bool, &rustscale_posture::PublicationPolicyState) -> R,
+    ) -> Option<R> {
+        self.publication
+            .with_generation(expected_generation, |policy| {
+                operation(
+                    self.value.load(std::sync::atomic::Ordering::Acquire),
+                    policy,
+                )
+            })
+    }
+}
+
 /// Errors from tsnet operations.
 #[derive(Debug, thiserror::Error)]
 pub enum TsnetError {
@@ -891,7 +950,7 @@ pub(crate) struct RunningState {
     /// C2N request router (control-to-node handler dispatch).
     pub(crate) c2n_router: Arc<C2nRouter>,
     /// Live posture preference shared with LocalAPI and C2N.
-    pub(crate) posture_checking: Arc<AtomicBool>,
+    pub(crate) posture_checking: Arc<LivePosturePreference>,
     /// Control-plane feature flags extracted from netmap updates.
     pub(crate) control_knobs: Arc<ControlKnobs>,
     /// PeerAPI listen port (deterministic, from tailscale IPs).
@@ -1050,7 +1109,7 @@ pub(crate) struct Bootstrap {
     /// C2N request router (control-to-node handler dispatch).
     pub(crate) c2n_router: Arc<C2nRouter>,
     /// Live persisted posture preference used by C2N collection.
-    pub(crate) posture_checking: Arc<AtomicBool>,
+    pub(crate) posture_checking: Arc<LivePosturePreference>,
     /// Control-plane feature flags extracted from netmap updates.
     pub(crate) control_knobs: Arc<ControlKnobs>,
     /// Runtime Hostinfo field overrides (shared with the update loop).

@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
-use crate::c2n::{answer_c2n_ping, C2nReplyError, C2nReplyTransport, C2nRouter};
+use crate::c2n::{answer_c2n_ping, C2nReply, C2nReplyError, C2nReplyTransport, C2nRouter};
 use crate::controlbase::{NoiseIo, NoiseIoHandle, ProtocolVersion};
 use crate::controlhttp::dial_control;
 
@@ -287,7 +287,7 @@ struct H2C2nReplyTransport {
 
 #[async_trait::async_trait]
 impl C2nReplyTransport for H2C2nReplyTransport {
-    async fn send(&self, callback_path: &str, response: Vec<u8>) -> Result<(), C2nReplyError> {
+    async fn send(&self, callback_path: &str, response: C2nReply) -> Result<(), C2nReplyError> {
         let request = http::Request::builder()
             .method("POST")
             .uri(callback_path)
@@ -303,9 +303,11 @@ impl C2nReplyTransport for H2C2nReplyTransport {
         let (response_future, mut stream) = sender
             .send_request(request, false)
             .map_err(|_| C2nReplyError::Transport)?;
-        stream
-            .send_data(bytes::Bytes::from(response), true)
-            .map_err(|_| C2nReplyError::Transport)?;
+        response.publish(|bytes| {
+            stream
+                .send_data(bytes::Bytes::copy_from_slice(bytes), true)
+                .map_err(|_| C2nReplyError::Transport)
+        })?;
         let response = response_future
             .await
             .map_err(|_| C2nReplyError::Transport)?;

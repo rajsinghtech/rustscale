@@ -1,12 +1,14 @@
 use std::collections::BTreeMap;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
 
 use async_trait::async_trait;
 use rustscale_c2n::{C2nBackend, LogLevelState, WhoIsResult};
-use rustscale_controlclient::c2n::{C2nHandler, C2nRequest, C2nResponse, C2nRouter};
+use rustscale_controlclient::c2n::{
+    C2nHandler, C2nPublicationValidator, C2nReplyError, C2nRequest, C2nResponse, C2nRouter,
+};
 use rustscale_health::{Severity, Tracker};
 use rustscale_magicsock::Magicsock;
 use rustscale_tailcfg::{C2NPostureIdentityResponse, DNSConfig, Node, UserID, UserProfile};
@@ -37,8 +39,53 @@ pub(crate) struct C2nBackendData {
     pub magicsock: Arc<Magicsock>,
     pub sockstats: Arc<rustscale_sockstats::SockStats>,
     pub logtail: Option<rustscale_logtail::LogTail>,
-    pub posture_checking: Arc<AtomicBool>,
+    pub posture_checking: Arc<crate::LivePosturePreference>,
     pub posture_service: Arc<rustscale_posture::IdentityService>,
+}
+
+struct CollectedPosture {
+    response: C2NPostureIdentityResponse,
+    publication_generation: u64,
+    policy_generation: u64,
+    include_hardware_addrs: bool,
+}
+
+struct PosturePublicationValidator {
+    preference: Arc<crate::LivePosturePreference>,
+    posture_service: Arc<rustscale_posture::IdentityService>,
+    expected_publication_generation: u64,
+    expected_policy_generation: u64,
+    include_hardware_addrs: bool,
+    response_has_hardware_addrs: bool,
+}
+
+impl C2nPublicationValidator for PosturePublicationValidator {
+    fn validate_and_publish(
+        &self,
+        publish: &mut dyn FnMut() -> Result<(), C2nReplyError>,
+    ) -> Result<(), C2nReplyError> {
+        self.preference
+            .with_generation(
+                self.expected_publication_generation,
+                |user_enabled, policy| {
+                    let posture_allowed = policy.policy_generation
+                        == self.expected_policy_generation
+                        && self.posture_service.current_policy_generation()
+                            == self.expected_policy_generation
+                        && policy
+                            .preference
+                            .unwrap_or(rustscale_posture::PreferenceOption::Never)
+                            .should_enable(user_enabled);
+                    if (self.response_has_hardware_addrs && !self.include_hardware_addrs)
+                        || !posture_allowed
+                    {
+                        return Err(C2nReplyError::PublicationRevoked);
+                    }
+                    publish()
+                },
+            )
+            .ok_or(C2nReplyError::PublicationRevoked)?
+    }
 }
 
 pub struct TsnetC2nBackend {
@@ -53,7 +100,7 @@ pub struct TsnetC2nBackend {
     magicsock: Arc<Magicsock>,
     sockstats: Arc<rustscale_sockstats::SockStats>,
     logtail: Option<rustscale_logtail::LogTail>,
-    posture_checking: Arc<AtomicBool>,
+    posture_checking: Arc<crate::LivePosturePreference>,
     posture_service: Arc<rustscale_posture::IdentityService>,
     log_level: LogLevelState,
 }
@@ -81,27 +128,86 @@ impl TsnetC2nBackend {
     async fn collect_posture(
         &self,
         include_hardware_addrs: bool,
-    ) -> Option<C2NPostureIdentityResponse> {
+        session_cancellation: tokio_util::sync::CancellationToken,
+    ) -> Option<CollectedPosture> {
+        const POSTURE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+        let (_, publication_generation, policy_generation) = self.posture_checking.snapshot();
         let service = self.posture_service.clone();
-        let user_enabled = self.posture_checking.load(Ordering::Acquire);
-        let collection = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            tokio::task::spawn_blocking(move || {
-                service.collect(user_enabled, include_hardware_addrs)
-            }),
-        )
-        .await;
-        let collection = match collection {
-            Ok(Ok(collection)) => collection,
-            Ok(Err(_)) => {
-                log::warn!("posture: collector task failed");
+        let worker_service = service.clone();
+        let preference = self.posture_checking.clone();
+        let worker_preference = preference.clone();
+        let cancellation = session_cancellation.child_token();
+        let worker_cancellation = cancellation.clone();
+        let deadline = std::time::Instant::now() + POSTURE_DEADLINE;
+        let collection = tokio::task::spawn_blocking(move || {
+            let context =
+                rustscale_posture::CollectionContext::new(Some(deadline), worker_cancellation);
+            worker_service.collect_cancellable(
+                || worker_preference.load(Ordering::Acquire),
+                include_hardware_addrs,
+                &context,
+            )
+        });
+        let collection = tokio::select! {
+            result = collection => match result {
+                Ok(Ok(collection)) => collection,
+                Ok(Err(rustscale_posture::PostureError::Cancelled)) => return None,
+                Ok(Err(rustscale_posture::PostureError::Timeout)) => {
+                    log::warn!("posture: collection deadline exceeded");
+                    return None;
+                }
+                Ok(Err(error)) => {
+                    log::warn!("posture: collection failed: {error}");
+                    return None;
+                }
+                Err(_) => {
+                    log::warn!("posture: collector task failed");
+                    return None;
+                }
+            },
+            () = session_cancellation.cancelled() => {
+                cancellation.cancel();
                 return None;
             }
-            Err(_) => {
+            () = tokio::time::sleep(POSTURE_DEADLINE) => {
+                cancellation.cancel();
                 log::warn!("posture: collection deadline exceeded");
                 return None;
             }
         };
+        if session_cancellation.is_cancelled() {
+            return None;
+        }
+        let revalidation_service = service.clone();
+        let revalidation_preference = preference.clone();
+        let revalidation = tokio::task::spawn_blocking(move || {
+            revalidation_service.revalidate_for_publication(
+                revalidation_preference.load(Ordering::Acquire),
+                collection,
+            )
+        });
+        let collection = tokio::select! {
+            result = revalidation => {
+                let Ok(collection) = result else {
+                    log::warn!("posture: policy revalidation task failed");
+                    return None;
+                };
+                collection
+            },
+            () = session_cancellation.cancelled() => {
+                cancellation.cancel();
+                return None;
+            }
+            () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                cancellation.cancel();
+                log::warn!("posture: policy revalidation deadline exceeded");
+                return None;
+            }
+        };
+        if session_cancellation.is_cancelled() {
+            return None;
+        }
         if let Some(error) = collection.policy_error {
             log::warn!("posture: policy lookup failed: {error}");
         }
@@ -118,10 +224,15 @@ impl TsnetC2nBackend {
             identity.serial_numbers.len(),
             identity.iface_hardware_addrs.len()
         );
-        Some(C2NPostureIdentityResponse {
-            serial_numbers: identity.serial_numbers,
-            iface_hardware_addrs: identity.iface_hardware_addrs,
-            posture_disabled: identity.posture_disabled,
+        Some(CollectedPosture {
+            response: C2NPostureIdentityResponse {
+                serial_numbers: identity.serial_numbers,
+                iface_hardware_addrs: identity.iface_hardware_addrs,
+                posture_disabled: identity.posture_disabled,
+            },
+            publication_generation,
+            policy_generation,
+            include_hardware_addrs,
         })
     }
 }
@@ -273,7 +384,9 @@ impl C2nBackend for TsnetC2nBackend {
     }
 
     async fn posture_identity(&self) -> Option<C2NPostureIdentityResponse> {
-        self.collect_posture(false).await
+        self.collect_posture(false, tokio_util::sync::CancellationToken::new())
+            .await
+            .map(|collected| collected.response)
     }
 }
 
@@ -409,6 +522,15 @@ struct PostureIdentityHandler {
 #[async_trait]
 impl C2nHandler for PostureIdentityHandler {
     async fn handle(&self, req: C2nRequest) -> C2nResponse {
+        self.handle_cancellable(req, tokio_util::sync::CancellationToken::new())
+            .await
+    }
+
+    async fn handle_cancellable(
+        &self,
+        req: C2nRequest,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> C2nResponse {
         let include_hardware_addrs = req
             .path
             .split_once('?')
@@ -419,10 +541,31 @@ impl C2nHandler for PostureIdentityHandler {
                     .any(|(key, value)| key == "hwaddrs" && value == "true")
             })
             .unwrap_or(false);
-        match self.backend.collect_posture(include_hardware_addrs).await {
-            Some(response) => {
-                let body = serde_json::to_value(response).unwrap_or(serde_json::Value::Null);
-                C2nResponse::json(200, &body)
+        match self
+            .backend
+            .collect_posture(include_hardware_addrs, cancellation)
+            .await
+        {
+            Some(collected) => {
+                let response_has_hardware_addrs =
+                    !collected.response.iface_hardware_addrs.is_empty();
+                let response_is_sensitive =
+                    response_has_hardware_addrs || !collected.response.serial_numbers.is_empty();
+                let body =
+                    serde_json::to_value(&collected.response).unwrap_or(serde_json::Value::Null);
+                let response = C2nResponse::json(200, &body);
+                if response_is_sensitive {
+                    response.with_publication_validator(Arc::new(PosturePublicationValidator {
+                        preference: self.backend.posture_checking.clone(),
+                        posture_service: self.backend.posture_service.clone(),
+                        expected_publication_generation: collected.publication_generation,
+                        expected_policy_generation: collected.policy_generation,
+                        include_hardware_addrs: collected.include_hardware_addrs,
+                        response_has_hardware_addrs,
+                    }))
+                } else {
+                    response
+                }
             }
             None => C2nResponse::error(501, "posture identity not available"),
         }
@@ -568,4 +711,354 @@ pub(crate) fn register_c2n_handlers(router: &mut C2nRouter, backend: Arc<TsnetC2
             backend: backend.clone(),
         }),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{mpsc, Arc, Mutex};
+    use std::thread;
+    use std::time::Duration;
+
+    use rustscale_controlclient::C2nPublicationValidator;
+    use rustscale_posture::{IdentityService, PublicationBarrier};
+    use rustscale_syspolicy::{
+        MemoryProvider, PolicyEngine, PolicyError, PolicyErrorKind, PolicyKey, PolicyProvider,
+        PolicyScope, PolicyValue, ProviderValues, RawValue, SettingDefinition,
+    };
+
+    use super::{C2nReplyError, PosturePublicationValidator};
+
+    struct FailingPostureProvider {
+        fail: AtomicBool,
+    }
+
+    impl PolicyProvider for FailingPostureProvider {
+        fn load(&self, definitions: &[SettingDefinition]) -> Result<ProviderValues, PolicyError> {
+            if self.fail.load(Ordering::Acquire) {
+                return Err(PolicyError::new(PolicyErrorKind::Provider));
+            }
+            Ok(definitions
+                .iter()
+                .filter(|definition| definition.key == PolicyKey::PostureChecking)
+                .map(|definition| (definition.key, Ok(RawValue::String("always".into()))))
+                .collect())
+        }
+    }
+
+    fn validator(
+        preference: Arc<crate::LivePosturePreference>,
+        posture_service: Arc<IdentityService>,
+    ) -> PosturePublicationValidator {
+        let (_, publication_generation, policy_generation) = preference.snapshot();
+        PosturePublicationValidator {
+            preference,
+            posture_service,
+            expected_publication_generation: publication_generation,
+            expected_policy_generation: policy_generation,
+            include_hardware_addrs: true,
+            response_has_hardware_addrs: true,
+        }
+    }
+
+    #[test]
+    fn unchanged_always_refresh_keeps_generation_and_allows_publication() {
+        let provider = Arc::new(MemoryProvider::from_values(BTreeMap::from([(
+            PolicyKey::PostureChecking,
+            RawValue::String("always".into()),
+        )])));
+        let engine = PolicyEngine::well_known(PolicyScope::Device).unwrap();
+        engine
+            .add_provider("managed posture", PolicyScope::Device, provider)
+            .unwrap();
+        let barrier = Arc::new(PublicationBarrier::new());
+        let posture_service = Arc::new(
+            IdentityService::from_system_engine_with_publication_barrier(
+                engine.clone(),
+                barrier.clone(),
+            ),
+        );
+        let preference = Arc::new(crate::LivePosturePreference::with_publication_barrier(
+            false,
+            barrier.clone(),
+        ));
+        let validator = validator(preference.clone(), posture_service);
+        let before = preference.snapshot();
+
+        let (_, policy) = barrier.snapshot_with(|policy| policy.preference);
+        assert_eq!(policy, Ok(rustscale_posture::PreferenceOption::Always));
+        engine.reload().unwrap();
+        assert_eq!(preference.snapshot(), before);
+        let published = AtomicUsize::new(0);
+        assert_eq!(
+            validator.validate_and_publish(&mut || {
+                published.fetch_add(1, Ordering::Release);
+                Ok(())
+            }),
+            Ok(())
+        );
+        assert_eq!(published.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn provider_failure_after_collection_commits_unavailable_and_publishes_zero_bytes() {
+        let provider = Arc::new(FailingPostureProvider {
+            fail: AtomicBool::new(false),
+        });
+        let engine = PolicyEngine::well_known(PolicyScope::Device).unwrap();
+        engine
+            .add_provider("failing posture", PolicyScope::Device, provider.clone())
+            .unwrap();
+        let barrier = Arc::new(PublicationBarrier::new());
+        let posture_service = Arc::new(
+            IdentityService::from_system_engine_with_publication_barrier(
+                engine.clone(),
+                barrier.clone(),
+            ),
+        );
+        let preference = Arc::new(crate::LivePosturePreference::with_publication_barrier(
+            false,
+            barrier.clone(),
+        ));
+        let validator = validator(preference.clone(), posture_service);
+        let before = preference.snapshot();
+
+        provider.fail.store(true, Ordering::Release);
+        assert!(engine.reload().is_err());
+        let after = preference.snapshot();
+        assert!(after.1 > before.1);
+        assert!(after.2 > before.2);
+        let (_, unavailable) = barrier.snapshot_with(|policy| policy.preference);
+        assert_eq!(
+            unavailable,
+            Err(rustscale_posture::PolicyError::Unavailable)
+        );
+
+        let published = AtomicUsize::new(0);
+        assert_eq!(
+            validator.validate_and_publish(&mut || {
+                published.fetch_add(1, Ordering::Release);
+                Ok(())
+            }),
+            Err(C2nReplyError::PublicationRevoked)
+        );
+        assert_eq!(published.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn policy_commit_write_barrier_blocks_h2_send_until_never_is_visible() {
+        let provider = Arc::new(MemoryProvider::from_values(BTreeMap::from([(
+            PolicyKey::PostureChecking,
+            RawValue::String("always".into()),
+        )])));
+        let engine = PolicyEngine::well_known(PolicyScope::Device).unwrap();
+        engine
+            .add_provider("managed posture", PolicyScope::Device, provider)
+            .unwrap();
+        let barrier = Arc::new(PublicationBarrier::new());
+        let posture_service = Arc::new(
+            IdentityService::from_system_engine_with_publication_barrier(
+                engine.clone(),
+                barrier.clone(),
+            ),
+        );
+        let preference = Arc::new(crate::LivePosturePreference::with_publication_barrier(
+            false, barrier,
+        ));
+        let stale_validator = validator(preference, posture_service);
+
+        let (installed_tx, installed_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let pause = Arc::new(Mutex::new(Some((installed_tx, release_rx))));
+        let hook_pause = pause.clone();
+        let callback_called = Arc::new(AtomicBool::new(false));
+        let callback_flag = callback_called.clone();
+        let (_transaction, _) = engine.subscribe_snapshot_commits_transactional(
+            move |_| -> rustscale_syspolicy::SnapshotCommitRelease {
+                let pause = hook_pause.lock().unwrap().take();
+                Box::new(move || {
+                    if let Some((installed, release)) = pause {
+                        installed.send(()).unwrap();
+                        release.recv().unwrap();
+                    }
+                })
+            },
+            move |_| {
+                callback_flag.store(true, Ordering::Release);
+            },
+        );
+
+        let change_engine = engine.clone();
+        let change = thread::spawn(move || {
+            change_engine.override_for_test(BTreeMap::from([(
+                PolicyKey::PostureChecking,
+                RawValue::String("never".into()),
+            )]))
+        });
+        installed_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(
+            engine.snapshot().get(PolicyKey::PostureChecking),
+            Ok(PolicyValue::PreferenceOption(
+                rustscale_syspolicy::PreferenceOption::Never
+            ))
+        );
+        assert!(!callback_called.load(Ordering::Acquire));
+
+        let published = Arc::new(AtomicUsize::new(0));
+        let publication_count = published.clone();
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let publication = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = stale_validator.validate_and_publish(&mut || {
+                publication_count.fetch_add(1, Ordering::Release);
+                Ok(())
+            });
+            result_tx.send(result).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(
+            result_rx.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert_eq!(published.load(Ordering::Acquire), 0);
+
+        release_tx.send(()).unwrap();
+        let policy_override = change.join().unwrap().unwrap();
+        assert_eq!(
+            result_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Err(C2nReplyError::PublicationRevoked)
+        );
+        publication.join().unwrap();
+        assert_eq!(published.load(Ordering::Acquire), 0);
+        assert!(callback_called.load(Ordering::Acquire));
+        drop(policy_override);
+    }
+
+    #[test]
+    fn removing_override_while_posture_provider_fails_stays_degraded_until_fresh_load() {
+        let provider = Arc::new(FailingPostureProvider {
+            fail: AtomicBool::new(false),
+        });
+        let engine = PolicyEngine::well_known(PolicyScope::Device).unwrap();
+        engine
+            .add_provider("failing posture", PolicyScope::Device, provider.clone())
+            .unwrap();
+        let policy_override = engine
+            .override_for_test(BTreeMap::from([(
+                PolicyKey::PostureChecking,
+                RawValue::String("always".into()),
+            )]))
+            .unwrap();
+        let barrier = Arc::new(PublicationBarrier::new());
+        let posture_service = Arc::new(
+            IdentityService::from_system_engine_with_publication_barrier(
+                engine.clone(),
+                barrier.clone(),
+            ),
+        );
+        let preference = Arc::new(crate::LivePosturePreference::with_publication_barrier(
+            false,
+            barrier.clone(),
+        ));
+        let stale_validator = validator(preference.clone(), posture_service.clone());
+        let commits = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let callback_commits = commits.clone();
+        let (_commit_subscription, _) = engine.subscribe_snapshot_commits(move |commit| {
+            callback_commits.lock().unwrap().push(commit);
+        });
+
+        provider.fail.store(true, Ordering::Release);
+        drop(policy_override);
+        assert!(engine.current_snapshot_commit().is_degraded());
+        assert!(commits
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|commit| matches!(commit, rustscale_syspolicy::SnapshotCommit::Degraded { .. })));
+        let (_, unavailable) = barrier.snapshot_with(|policy| policy.preference);
+        assert_eq!(
+            unavailable,
+            Err(rustscale_posture::PolicyError::Unavailable)
+        );
+        let published = AtomicUsize::new(0);
+        assert_eq!(
+            stale_validator.validate_and_publish(&mut || {
+                published.fetch_add(1, Ordering::Release);
+                Ok(())
+            }),
+            Err(C2nReplyError::PublicationRevoked)
+        );
+        assert_eq!(published.load(Ordering::Acquire), 0);
+
+        provider.fail.store(false, Ordering::Release);
+        engine.reload().unwrap();
+        assert!(matches!(
+            engine.current_snapshot_commit(),
+            rustscale_syspolicy::SnapshotCommit::Applied(_)
+        ));
+        let (_, recovered) = barrier.snapshot_with(|policy| policy.preference);
+        assert_eq!(recovered, Ok(rustscale_posture::PreferenceOption::Always));
+        assert_eq!(
+            validator(preference, posture_service).validate_and_publish(&mut || Ok(())),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn managed_never_after_handler_check_blocks_sensitive_h2_publication() {
+        let provider = Arc::new(MemoryProvider::from_values(BTreeMap::from([(
+            PolicyKey::PostureChecking,
+            RawValue::String("always".into()),
+        )])));
+        let engine = PolicyEngine::well_known(PolicyScope::Device).unwrap();
+        engine
+            .add_provider("managed posture", PolicyScope::Device, provider.clone())
+            .unwrap();
+        let barrier = Arc::new(PublicationBarrier::new());
+        let posture_service = Arc::new(
+            IdentityService::from_system_engine_with_publication_barrier(
+                engine.clone(),
+                barrier.clone(),
+            ),
+        );
+        let preference = Arc::new(crate::LivePosturePreference::with_publication_barrier(
+            false,
+            barrier.clone(),
+        ));
+        let validator = validator(preference, posture_service);
+
+        let (checked_tx, checked_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let published = Arc::new(AtomicUsize::new(0));
+        let worker_published = published.clone();
+        let worker_barrier = barrier.clone();
+        let worker = std::thread::spawn(move || {
+            // Models the handler's completed policy check while H2 readiness
+            // remains blocked before the transport publication validator.
+            let (_, checked_policy) = worker_barrier.snapshot_with(|policy| policy.preference);
+            assert_eq!(
+                checked_policy,
+                Ok(rustscale_posture::PreferenceOption::Always)
+            );
+            checked_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            validator.validate_and_publish(&mut || {
+                worker_published.fetch_add(1, Ordering::Release);
+                Ok(())
+            })
+        });
+
+        checked_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        provider.set(PolicyKey::PostureChecking, RawValue::String("never".into()));
+        engine.reload().unwrap();
+        release_tx.send(()).unwrap();
+
+        assert_eq!(
+            worker.join().unwrap(),
+            Err(C2nReplyError::PublicationRevoked)
+        );
+        assert_eq!(published.load(Ordering::Acquire), 0);
+    }
 }

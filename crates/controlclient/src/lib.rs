@@ -19,8 +19,8 @@ pub mod ssh_notify;
 pub mod tka;
 
 pub use c2n::{
-    answer_c2n_ping, C2nHandler, C2nReplyError, C2nReplyTransport, C2nRequest, C2nResponse,
-    C2nRouter,
+    answer_c2n_ping, C2nHandler, C2nPublicationValidator, C2nReply, C2nReplyError,
+    C2nReplyTransport, C2nRequest, C2nResponse, C2nRouter,
 };
 pub use client::{
     ControlClient, MapSessionState, NoiseHttpClient, NoiseRequestError, NoiseResponse,

@@ -362,7 +362,7 @@ pub(crate) struct LocalApiState {
     /// mode changes from `PATCH /prefs` without a full filter rebuild.
     pub filter: std::sync::OnceLock<Arc<std::sync::Mutex<Filter>>>,
     /// Live posture preference mirrored into the C2N posture service.
-    pub posture_checking: Arc<std::sync::atomic::AtomicBool>,
+    pub posture_checking: Arc<crate::LivePosturePreference>,
     /// Shared route table (for applying exit-node pref changes directly).
     /// None when the server is not fully up (e.g. start_localapi_only).
     pub route_table: Option<Arc<RwLock<crate::routing::RouteTable>>>,
@@ -4498,7 +4498,7 @@ mod tests {
                 ..Default::default()
             })),
             operator_access: std::sync::Mutex::default(),
-            posture_checking: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            posture_checking: Arc::new(crate::LivePosturePreference::new(false)),
             profile_mutations: Arc::new(tokio::sync::Mutex::new(())),
             exit_node_selection: Arc::new(RwLock::new(crate::ExitNodeSelection::default())),
             tailscale_ips: vec!["100.64.0.1".parse().unwrap()],

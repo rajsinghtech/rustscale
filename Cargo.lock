@@ -3102,6 +3102,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tokio-rustls",
+ "tokio-util",
  "url",
 ]
 
@@ -3614,7 +3615,10 @@ dependencies = [
  "log",
  "rustscale-netmon",
  "rustscale-syspolicy",
+ "serde",
  "thiserror 1.0.69",
+ "tokio-util",
+ "wmi",
 ]
 
 [[package]]
@@ -3959,6 +3963,7 @@ dependencies = [
  "rustscale-safesocket",
  "rustscale-sockstats",
  "rustscale-ssh",
+ "rustscale-syspolicy",
  "rustscale-tailcfg",
  "rustscale-tcpinfo",
  "rustscale-testcontrol",
@@ -5204,6 +5209,20 @@ name = "wit-bindgen"
 version = "0.57.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
+
+[[package]]
+name = "wmi"
+version = "0.18.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7c81b85c57a57500e56669586496bf2abd5cf082b9d32995251185d105208b64"
+dependencies = [
+ "futures",
+ "log",
+ "serde",
+ "thiserror 2.0.18",
+ "windows",
+ "windows-core",
+]
 
 [[package]]
 name = "wnaf"
